@@ -1,27 +1,60 @@
 <p align="center">
-  <img src="web/public/icon.svg" width="96" alt="Quasar logo" />
+  <img src="web/public/icon.svg" width="88" alt="" />
 </p>
 
-# Quasar
+<h1 align="center">Quasar</h1>
 
-Quasar is a self-hostable, multi-host cloud-gaming platform: run games on your own GPU servers and play them from a browser, aiming for a GeForce Now-like experience.
+<p align="center">
+  Self-hosted cloud gaming. Run games on your own GPU box, play them in a browser.
+</p>
 
-Quasar stands on the shoulders of giants. The [Wolf](https://github.com/games-on-whales/wolf) project (MIT) started the container based game streaming, and Quasar reuses its strongest components: the `gst-wayland-display` Wayland compositor and `inputtino` virtual input. Quasar takes a different direction from Wolf rather than replacing it: no Moonlight/GameStream protocol, WebRTC to the browser as the first transport, and multi-host / multi-user support built in from the start (with the architecture kept Kubernetes-ready for later).
+<p align="center">
+  <img src="site/src/assets/shots/library.png" width="820" alt="The Quasar library: installed apps, ready to launch." />
+</p>
 
-In practice: a user registers, logs in, picks an app from the library, and plays it in the browser. The app runs in a container on a GPU host, streamed over WebRTC with hardware encode (AMD/Intel VA, NVIDIA NVENC, opt-in Vulkan), adaptive bitrate, virtual input, and per-user persistent storage. An admin area manages the app catalog, hosts, GPUs, sessions, and users.
+Your hardware, your games, no subscription and no third party in the middle. Quasar
+runs each app in a container on a GPU host you own and streams it over WebRTC to a
+browser tab. Point a laptop, a tablet or an old desktop at it and play.
 
-> **Quasar** is a working placeholder name. Pick a final name and trademark/domain-check before any public launch.
+## What you get
+
+- **Nothing to install on the client.** Any modern browser, any OS. No launcher, no
+  agent, no client build to keep in step with the server.
+- **Real multi-user.** Accounts, invite-only registration, admin and user roles, and
+  per-user storage so saves and config follow the person, not the machine.
+- **A web console.** Manage the app catalog, hosts and GPUs, live sessions, users and
+  invites from the browser. No config files to hand-edit to add a game.
+- **Library management.** Install apps from a catalog of digest-pinned images, or point
+  it at your own.
+- **Adaptive bitrate.** Tracks congestion and moves bitrate, resolution and frame rate
+  mid-session, so a busy network degrades gracefully instead of stuttering.
+- **Latency you can measure.** Glass-to-glass timing, per-session traces and a
+  smoothness verdict, because "feels laggy" is not a bug report.
+- **Hardware encode on NVIDIA, AMD and Intel**, with H.264, HEVC and AV1 chosen per
+  session from what the GPU and the browser both support.
+- **Microphone passthrough** into the app, for games and voice chat that expect one.
+
+## What you need
+
+- A **Linux host with a GPU** (NVIDIA, AMD or Intel). Not macOS or Windows: the node
+  agent needs `network_mode: host`, which only Linux provides.
+- **Docker Engine and Compose v2.20+.**
+- The browser and the GPU host **on the same network** — a LAN, or a VPN that behaves
+  like one. Media is a direct UDP connection between the two; the control plane being
+  reachable does not make the GPU host reachable.
+
+The host firewall has to accept inbound UDP on its ephemeral port range and UDP/5353
+for mDNS. The agent detects a block at startup and logs the exact rule to add.
+[Network requirements](https://accreleus.github.io/quasar/network/remote-access/) covers the detail,
+including reverse proxies and playing from outside the house.
 
 ## Quick start
 
-You need a **Linux host with a GPU**, Docker Engine and Compose v2.20+, and a browser on the same network. (Not macOS or Windows: the node agent needs `network_mode: host`.)
-
 ```bash
-git clone --depth 1 --branch v0.1.0 https://github.com/accreleus/quasar.git
+git clone --depth 1 https://github.com/accreleus/quasar.git
 cd quasar
 
-# 1. Configure — generates the secrets and pins the release images.
-#    Full block (copy-paste ready): deploy/README.md, Quick start step 2.
+# 1. Configure. Generates the secrets; pin the release images per deploy/README.md.
 cp deploy/.env.example deploy/.env && $EDITOR deploy/.env
 
 # 2. Name this host in the TLS certificate, and create the home directory root.
@@ -32,103 +65,61 @@ sudo install -d -m 0755 /var/lib/quasar/homes
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
-Then open **`https://<host-ip>:8443`**, accept the self-signed certificate warning, and claim the admin account with the one-time token:
+Open **`https://<host-ip>:8443`**, accept the self-signed certificate warning, and claim
+the admin account with the one-time token:
 
 ```bash
 docker compose -f deploy/docker-compose.yml exec quasar-control-plane cat /run/quasar/setup-token
 ```
 
-**Full instructions, with the expected output after every command: [`deploy/README.md`](deploy/README.md).** That is also where the build-from-source path, GPU setup, HTTPS options and the firewall gotcha live. Releases are on the [releases page](https://github.com/accreleus/quasar/releases); upgrading is [`docs/upgrading.md`](docs/upgrading.md).
+Full walkthrough, including pinning a release and the certificate options:
+**[Install guide](https://accreleus.github.io/quasar/install/install/)**.
 
-## Network requirements
+<p align="center">
+  <img src="site/src/assets/shots/admin-overview.png" width="820" alt="The admin console: hosts, GPUs and live sessions." />
+</p>
 
-Read this before deciding where to run Quasar. The UI, the API and WebRTC signaling are TCP and work through any reverse proxy. **The video, audio and input are different. They ride a direct connection between the browser and the GPU host, normally UDP.** The control plane being reachable does not make the GPU host reachable, and it is the GPU host that carries your stream.
+## How it fits together
 
-**A LAN, or a VPN that acts like one, is the supported shape.** Put the browser and the GPU host on the same network segment and it works with no extra configuration. To play from somewhere else, join both ends to one private network first. Tailscale or an ordinary VPN both do this, and either is the recommended way to play from outside the house. The host needs to accept inbound UDP from your client devices on its ephemeral port range (`cat /proc/sys/net/ipv4/ip_local_port_range`, Linux default `32768-60999`) and on UDP/5353 for mDNS, because Chrome sends `.local` hostnames as its ICE candidates. The node agent runs with host networking, so those are ordinary host ports and a default-deny firewall will block them; the agent detects this at startup and logs the exact rule to add. Full writeup, including the per-firewall commands: [`deploy/README.md`](deploy/README.md#host-firewall-blocking-webrtc-media).
+A **control plane** (Go) owns accounts, the API, signaling and scheduling, and holds no
+per-host GPU state. A **node agent** (Rust) on each GPU host runs sessions: it drives the
+GStreamer compositor and encoder and pushes the stream over a pluggable transport, with
+WebRTC as the first one. That split is there from the first commit so the design has room
+for more than one GPU host, though a supported install path for a second host is still
+ahead of us.
 
-**Once you run more than one GPU host, a relay starts to earn its place.** Every host registers to the same control plane, and the scheduler places a session on whichever host has capacity. So a client can reach the control plane, see its library, launch fine, and still have no route to the machine that got the session, because that is a different machine on a different network. A relay is the standard answer to that case, and it is on the roadmap alongside multi-host setup. Until it lands, join both ends to one private network.
+Quasar stands on the shoulders of giants. The [Wolf](https://github.com/games-on-whales/wolf)
+project (MIT) started container-based game streaming, and Quasar reuses its strongest
+components: the `gst-wayland-display` Wayland compositor and `inputtino` virtual input.
 
-**Exposing the GPU host to the public internet works, and it is not what we recommend.** You would need the HTTPS port (8443 by default) reachable for the UI, the API and signaling, plus that whole inbound UDP range reachable from wherever you play. That is a wide open range on a machine whose job is to run games as containers with a GPU attached. Use a VPN instead. If you do it anyway, put a reverse proxy in front of it first — [`deploy/README.md`](deploy/README.md#advanced-fronting-quasar-with-your-own-reverse-proxy) covers pointing your own at the stack, and the bundled Caddy option for anyone without one. CGNAT on the player's side is one more case with no direct route.
+## Documentation
 
-**Docker Desktop on macOS or Windows cannot host Quasar at all.** The node agent needs `network_mode: host`, which only Linux provides. This is about the machine running the GPU host, not the machine you play from: any modern browser on any OS can be the client.
+**[accreleus.github.io/quasar](https://accreleus.github.io/quasar/)** is the place to
+start: install, configure, operate, troubleshoot.
+
+For working on Quasar itself: [`AGENTS.md`](AGENTS.md) is the operating contract,
+[`docs/`](docs/README.md) holds the design record, [`docs/configuration.md`](docs/configuration.md)
+documents every environment variable, and [`deploy/README.md`](deploy/README.md) is the
+full deployment reference. The site source lives in [`site/`](site/README.md).
 
 ## Developing
 
-The developer interface is the root Makefile — `make help` lists everything. Common flow:
+The developer interface is the root Makefile — `make help` lists everything.
 
 ```bash
 make init      # idempotent setup (submodule, devtools image, environment check)
 make doctor    # is this machine ready?
 make verify    # fmt + lint + build across all components
 make test-db   # Go integration tests against a fresh ephemeral Postgres
-make up        # local agentless stack (postgres + control-plane + web) for UI/API work
-make diagnose  # one-page state; make diagnose-bundle for a sanitized shareable bundle
+make up        # local agentless stack for UI/API work
 ```
 
-Each git worktree gets an isolated instance (own ports, containers, test database), so
-parallel checkouts never collide. `AGENTS.md` documents the full operating contract,
-including which verification level each kind of change requires; the complete tooling
-catalogue (targets, scripts, harnesses, skills) is
-[`docs/developer-tooling.md`](docs/developer-tooling.md). GPU/streaming work runs on a GPU
-host — see [`deploy/README.md`](deploy/README.md) and the repo skills.
+Each git worktree gets an isolated instance with its own ports, containers and test
+database, so parallel checkouts never collide. GPU and streaming work needs a real GPU
+host. [`docs/developer-tooling.md`](docs/developer-tooling.md) is the full catalogue.
 
-## Architecture in one breath
-
-A **control plane** (Go) handles accounts, API, signaling, and scheduling, and holds no per-host GPU state. A **node agent** (Rust) on each GPU host runs sessions: it drives the GStreamer compositor + encoder and pushes the stream over a pluggable transport (WebRTC first, native UDP later). Multi-host scheduling already works because of that split; Kubernetes support is planned and should be packaging rather than re-architecture, but no manifests exist yet (deployment today is Docker Compose).
-
-```mermaid
-flowchart LR
-    subgraph player [Player's machine]
-        B["Browser (/app, /admin)"]
-    end
-    subgraph cp [Control plane]
-        API["Go service: API, auth,<br/>scheduler, signaling relay"]
-        PG[(Postgres)]
-    end
-    subgraph host [GPU host 1..N]
-        NA["Node agent (Rust):<br/>compositor + encoder"]
-        GC["Game container"]
-    end
-    B -->|"HTTPS API + signaling WS"| API
-    API --- PG
-    API <-->|"agent WS"| NA
-    NA -->|launches| GC
-    GC -->|"Wayland frames + audio"| NA
-    B <-.->|"WebRTC media + input (direct UDP)"| NA
-```
-
-Control traffic (login, launch, signaling) flows through the control plane; once a session is negotiated, video, audio, and input travel directly between the browser and the GPU host over WebRTC.
-
-| Path | What |
-|---|---|
-| `control-plane/` | (Go) accounts, API, scheduler |
-| `node-agent/` | (Rust) per-host agent: compositor, encode, sessions |
-| `web/` | Unified web client (`/app` user area, `/admin` admin area) |
-| `protocol/` | Frozen wire contracts (a `quasar-protocol` submodule) |
-| `deploy/` | Compose stacks, images, dev tooling |
-| `docs/` | All detailed documentation, starting at [`docs/README.md`](docs/README.md) |
-
-## Documentation
-
-Everything detailed lives under [`docs/`](docs/README.md):
-
-- [`docs/README.md`](docs/README.md): documentation map, what works today, phase records, workstreams
-- [`docs/architecture-and-plan.md`](docs/architecture-and-plan.md): the master rationale + roadmap
-- [`deploy/README.md`](deploy/README.md): full deployment guide (GPU encode, services, dev workflow)
-- [`docs/configuration.md`](docs/configuration.md): every env var, default, and accepted value
-- [`docs/upgrading.md`](docs/upgrading.md): backing up before an upgrade, and recovering from a rolled-back control-plane binary
-
-User-facing documentation (the public site) lives in [`site/`](site/README.md) and is
-built with Astro Starlight. Run it locally with `npm install && npm run dev` in that
-directory. It publishes to <https://accreleus.github.io/quasar/> via the `pages`
-workflow, which is manual-dispatch only like the rest of this repo's CI.
-
-**Status:** the foundational phases (0–5) and the optimization/adaptive-streaming workstreams are complete; current work follows the roadmap-spec-v2 wave ladder (see [`docs/README.md`](docs/README.md)).
-
-## Working with AI agents
-
-Read `CLAUDE.md` first (architecture invariants, frozen interfaces, conventions, model tiering), then `AGENTS.md` — the operational contract: canonical commands, verification levels per change type, instance isolation, and which operations require explicit authorization.
+Contributions welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## License
 
-MIT; see `LICENSE`. Update the copyright holder line to your name/org.
+MIT. See [`LICENSE`](LICENSE).
