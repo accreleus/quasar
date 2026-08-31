@@ -1,0 +1,22 @@
+# Every PR requests a review from the owner. Branch protection on main makes that
+# review required; on develop it is advisory.
+*                       @salty2011
+
+# Frozen interfaces. protocol/ is a submodule of quasar-protocol and changes there
+# need explicit sign-off, so a PR that moves the pin must never merge unreviewed.
+/protocol               @salty2011
+/.gitmodules            @salty2011
+
+# The image contract is the durable form of every image defect that reached
+# production. Relaxing an assertion to make a build green is the failure mode it
+# exists to prevent.
+/deploy/image-contract.json  @salty2011
+
+# Anything that can publish, deploy, or reach a host.
+/.github/workflows/     @salty2011
+/deploy/                @salty2011
+/scripts/release/       @salty2011
+
+# Database migrations are one-way at deploy time: a binary must never roll back
+# below the DB's applied version.
+/control-plane/migrations/   @salty2011
