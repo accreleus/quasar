@@ -571,7 +571,10 @@ func TestReconnectHostBlipDoesNotCountAsRestart(t *testing.T) {
 	s := &agentStore{pool: pool}
 
 	hostID := seedHostWithSecret(t, pool, "blip-host", "secret-1")
-	processStart := time.Now().Add(-time.Hour) // long-running process, well before this blip
+	// Truncate to microseconds: timestamptz stores microseconds, so a
+	// nanosecond-resolution time.Now() never round-trips Equal. Only shows up
+	// on Linux — darwin's time.Now() is already microsecond-aligned.
+	processStart := time.Now().Add(-time.Hour).Truncate(time.Microsecond) // long-running process, well before this blip
 	setAgentProcessStartedAt(t, pool, hostID, &processStart)
 	disconnectedAt := time.Now().Add(-100 * time.Millisecond) // well under the 2s threshold
 	setAgentDisconnectedAt(t, pool, hostID, &disconnectedAt)
@@ -608,7 +611,10 @@ func TestReconnectHostGenuineRestartIsCounted(t *testing.T) {
 	s := &agentStore{pool: pool}
 
 	hostID := seedHostWithSecret(t, pool, "restart-host", "secret-2")
-	processStart := time.Now().Add(-time.Hour) // the OLD (pre-restart) process instance
+	// Truncation matters for the NEGATIVE assertion too: an untruncated
+	// expectation can never Equal the round-tripped value, so this test would
+	// pass even if the reset never happened.
+	processStart := time.Now().Add(-time.Hour).Truncate(time.Microsecond) // the OLD (pre-restart) process instance
 	setAgentProcessStartedAt(t, pool, hostID, &processStart)
 	disconnectedAt := time.Now().Add(-5 * time.Second) // well over the 200ms threshold
 	setAgentDisconnectedAt(t, pool, hostID, &disconnectedAt)
@@ -663,7 +669,8 @@ func TestReconnectHostNullDisconnectedAtNeverCountsAsRestart(t *testing.T) {
 	s := &agentStore{pool: pool}
 
 	hostID := seedHostWithSecret(t, pool, "cp-restart-host", "secret-3")
-	processStart := time.Now().Add(-24 * time.Hour) // been running a day
+	// Microsecond truncation as above — timestamptz has no nanoseconds.
+	processStart := time.Now().Add(-24 * time.Hour).Truncate(time.Microsecond) // been running a day
 	setAgentProcessStartedAt(t, pool, hostID, &processStart)
 	// agent_disconnected_at left NULL — simulates a control-plane restart:
 	// the old CP process died before its handleConn defer (markOffline)
