@@ -109,6 +109,14 @@ name: Images
 #   is a promotion decision; a build job that knew the final tags would be one
 #   `push: true` away from applying them.
 #
+# BUILD CACHE LIVES IN ITS OWN PACKAGES (2026-09-01). cache-to writes a BuildKit
+# cache manifest, not a runnable image. Written into the artifact's own package it
+# appears as a `:buildcache` tag beside the real tags, and on a PUBLIC package a
+# self-hoster can pull it and get something broken. Each artifact's cache therefore
+# goes to `<artifact>-cache`, so the published packages carry release tags only.
+# Keep the two refs for one artifact pointing at the SAME package or every build
+# is a cold build.
+#
 # NO TRANSITION ALIASES. The pre-2026-08-26 package names (quasar-control,
 # quasar-vulkan, quasar-toolchain) are owned by the PRIVATE quasar-internal repo
 # and this repository's GITHUB_TOKEN cannot write to them: a push is refused with
@@ -359,8 +367,8 @@ jobs:
             QUASAR_BASE_IMAGE=${{ needs.inputs.outputs.base_ref }}
             SOURCE_COMMIT=${{ github.sha }}
             BUILT_AT=${{ needs.inputs.outputs.built_at }}
-          cache-from: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-gst-toolchain:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-gst-toolchain:buildcache,mode=max
+          cache-from: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-gst-toolchain-cache:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-gst-toolchain-cache:buildcache,mode=max
 
       # Whether it was reused, adopted or freshly built, the toolchain leaves this
       # job as a DIGEST. The agent build then compiles against an immutable input
@@ -419,8 +427,8 @@ jobs:
           sbom: false
           build-args: |
             QUASAR_BASE_IMAGE=${{ needs.inputs.outputs.base_ref }}
-          cache-from: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-control-plane:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-control-plane:buildcache,mode=max
+          cache-from: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-control-plane-cache:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-control-plane-cache:buildcache,mode=max
 
   build-node-agent:
     name: build quasar-node-agent (digest only)
@@ -489,8 +497,8 @@ jobs:
           # and is capped at 10 GB per repo, which is why the two scopes this
           # replaces hold 0 caches today. A registry cache does not expire and is
           # shared with the dev boxes.
-          cache-from: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-node-agent:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-node-agent:buildcache,mode=max
+          cache-from: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-node-agent-cache:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-node-agent-cache:buildcache,mode=max
 
   # ── Phase 2: the repo's own contract, run against the exact pushed digest ──
   #
