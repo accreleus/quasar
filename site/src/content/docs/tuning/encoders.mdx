@@ -1,0 +1,127 @@
+---
+title: Encoders
+description: Which encoder runs on a host, how to change it, and the tuning knobs worth touching.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The encoder turns compositor output into a video stream. It is a per-host
+setting, and it decides which codecs that host can offer at all. Which codec a
+given session ends up using is a separate question, covered in
+[Codecs](/quasar/tuning/codecs/).
+
+## What you get by default
+
+Vulkan Video, on both AMD and NVIDIA. It is the validated path on each and there
+is no reason to pick anything else unless something specific pushes you off it.
+
+On NVIDIA it also avoids an NVENC teardown fault that no driver version escapes.
+Vulkan is immune to it, which is why NVENC is no longer the default there.
+
+`QUASAR_ENCODER` is read from the environment; nothing is auto-detected at
+runtime. Change it in your `.env`:
+
+```bash
+QUASAR_ENCODER=vulkan
+```
+
+Or override one machine from Admin, Fleet, Hosts, by opening that host and using
+its Settings page. Either way the agent restarts and live sessions on that host
+drop.
+
+The four values are `vulkan`, `va`, `nvenc` and `openh264`.
+
+## Vulkan
+
+The default. The node-agent image carries patched GStreamer Vulkan elements, so
+H.264, HEVC and AV1 all encode on this path.
+
+Three switches let you turn a codec off. All default on, and you only touch them
+to disable something:
+
+```bash
+QUASAR_VULKAN_H264=1
+QUASAR_VULKAN_HEVC=1
+QUASAR_VULKAN_AV1=1
+```
+
+Set one to `0` and that codec moves to the vendor hardware encoder for the
+session instead, if the host has one. The same fallback happens by itself when
+the Vulkan element is missing from the image. H.264 is the exception: it is the
+floor and stays on Vulkan regardless, with an error in the log.
+
+HEVC pins the compositor ring to two slots automatically, which works around a
+tiling defect on affected NVIDIA hardware. AV1 needs no such override.
+
+<Aside type="caution" title="Vulkan does not work on a driver-volume NVIDIA host">
+If your NVIDIA host uses automatic driver-volume provisioning rather than a full
+driver install, some driver versions cannot supply a Vulkan ICD the compositor
+can use. Set `QUASAR_ENCODER=nvenc` there. Admin, Fleet, Hosts reports the gap
+rather than claiming Vulkan works.
+</Aside>
+
+## VA-API
+
+Mature, and the path where zero-copy is most thoroughly worked out. Reach for it
+on AMD if you hit a Vulkan problem, and on Intel, where it is the better-trodden
+of the two options. `QUASAR_ZEROCOPY=1` enables an additional full zero-copy
+variant that exists only here.
+
+## NVENC
+
+NVIDIA's own encoder. Faster to reach for historically, but the driver fault
+above is why it is no longer the default. Set `QUASAR_ENCODER=nvenc` if you want
+it, or if you are on a driver-volume host where Vulkan cannot work.
+
+## openh264
+
+Software encoding, used when there is no hardware encoder. It proves an install
+on a machine with no GPU and that is all it is good for. Quality and throughput
+are both poor, and adaptive bitrate barely functions, because a software encoder
+cannot saturate a 1080p stream at 8 Mbps so the congestion controller never sees
+anything to react to.
+
+## Zero-copy
+
+Compositor output stays on the GPU all the way to the encoder. Vulkan keeps it
+as Vulkan images, VA uses DMABuf, NVENC uses CUDA memory with a shared context.
+
+This is how the pipeline is built rather than something you enable. It is worth
+knowing because it explains why CPU usage stays low during a session, and why
+the encoder is so sensitive to being pointed at the right GPU.
+
+## Picking a GPU on a multi-GPU host
+
+`QUASAR_RENDER_NODE` selects the DRM render node.
+
+```bash
+ls -l /dev/dri/by-path/
+```
+
+Use a `/dev/dri/by-path/` path rather than `/dev/dri/renderD128`. The numbered
+names are assigned in probe order and can move between reboots. By-path names
+follow the PCI address and do not.
+
+For NVENC, `QUASAR_CUDA_DEVICE` picks the CUDA device index as well. It defaults
+to 0.
+
+## Tuning knobs
+
+You should rarely need these. The defaults come from measurement.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `QUASAR_GOP` | 60 | Frames between keyframes, at a 60 fps reference. Lower recovers from loss faster and costs bitrate. |
+| `QUASAR_SLICES` | 8 | H.264 slices per frame. Quasar's patched Vulkan encoder supports this; a stock upstream element does not. |
+| `QUASAR_TARGET_USAGE` | 6 | VA speed against quality, 1 slowest and best, 7 fastest. Adaptive bitrate moves this under load. |
+| `QUASAR_QUEUE_BUFFERS` | 3 | Encode queue depth. More absorbs jitter and adds latency. |
+
+## Checking what you actually got
+
+Admin, Fleet, Hosts shows the encoder each GPU reported, which is what the agent
+found rather than what you configured. A host set to `va` that reports no
+encoder has a problem. See
+[Install and startup problems](/quasar/troubleshooting/install/).
+
+Per session, Admin, Sessions shows the encoder time series. Above roughly 16
+milliseconds per frame at 60 fps, the encoder is your bottleneck.

@@ -1,0 +1,50 @@
+{
+  "name": "kde",
+  "description": "KDE Plasma desktop image (quasar-kde family): full desktop session, panel + context menus.",
+  "app": "KDE",
+  "session_profile_id": "1080p60",
+  "runs": 2,
+  "session_container_match": "kde",
+  "gates": {
+    "launch": {
+      "min_fps": 55,
+      "min_luma": 20,
+      "first_content_s": [5, 45]
+    },
+    "oracle": {
+      "label": "plasma-desktop",
+      "expect": "Plasma desktop with the panel drawn and no crash/session-restore dialog",
+      "rules_out": "a bare X/Wayland grey root window, or plasmashell failing to start",
+      "matcher": null
+    },
+    "input": {
+      "settle": { "frames": 3, "tolerance_pct": 1.0, "timeout_s": 90 },
+      "delta_threshold_pct": 3.0,
+      "region": [0.2, 0.2, 0.6, 0.6],
+      "devices": {
+        "mouse": {
+          "stimuli": [
+            { "t": "ma", "x": 0.5, "y": 0.5 },
+            { "t": "mb", "button": 273 }
+          ],
+          "settle_ms": 900
+        },
+        "keyboard": {
+          "stimuli": [
+            { "t": "k", "code": 1 }
+          ],
+          "settle_ms": 900
+        }
+      }
+    },
+    "shutdown": {
+      "budget_s": 10.0,
+      "expect_exit": 143,
+      "require_logs": ["shutdown requested"],
+      "forbid_logs": ["SIGKILL backstop"]
+    }
+  },
+  "notes": [
+    "The mouse oracle is a right-click context menu on the desktop root; the keyboard stimulus is Escape (evdev 1), which dismisses it. A desktop that draws no menu fails the mouse gate even if the pointer moved."
+  ]
+}

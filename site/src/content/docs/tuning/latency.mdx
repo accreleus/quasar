@@ -1,0 +1,114 @@
+---
+title: Latency and smoothness
+description: Where the milliseconds go, why smoothness matters more than the average, and the small number of things that genuinely help.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Smoothness beats the average
+
+The instinct is to chase the lowest average latency. It is the wrong target.
+
+A stream at 45 ms that arrives evenly feels better than a stream at 38 ms that
+arrives unevenly. Human perception is very good at spotting irregularity in
+motion and quite forgiving of a constant delay.
+
+The number that matches this is **presentation interval variation**: the standard
+deviation of the gap between displayed frames. It is in the in-session
+performance overlay and in the admin session detail.
+
+| Value | What it means |
+| --- | --- |
+| Below 12 ms | Healthy. |
+| 12 to 18 ms | Noticeable if you are looking for it. |
+| Above 18 ms | Visible stutter. |
+
+<Aside type="caution" title="Frame drop counters from the browser are unreliable">
+A backgrounded or occluded browser tab throttles presentation, which inflates
+dropped-frame counts that have nothing to do with your network or your encoder.
+Judge delivery from the host-side frame rate and encode time. Judge smoothness
+from presentation interval variation, in a tab that is actually visible.
+</Aside>
+
+## Where the time goes
+
+Roughly, in order:
+
+1. **The game renders a frame.** Yours to control, through game settings.
+2. **The compositor captures it.** Small, and not the bottleneck.
+3. **The encoder compresses it.** Typically 7 to 19 ms depending on encoder,
+   resolution and GPU. Above roughly 16 ms at 60 fps this is your bottleneck.
+4. **The network carries it.** Whatever your path costs.
+5. **The client buffers it.** A jitter buffer, adaptive, sized to how uneven
+   arrival is.
+6. **The browser decodes and presents it.** Small with hardware decode, a few ms
+   more with AV1 software decode.
+
+Steps 4 and 5 interact. An uneven network forces a larger buffer, and the buffer
+is latency. Making the network path more consistent is worth more than making it
+faster.
+
+## The client playout buffer
+
+Quasar adapts the buffer to observed jitter, starting from a baseline that
+depends on the tier and shrinking toward a 30 ms floor when arrival is
+consistent.
+
+This is client-side and automatic. There is no server setting for it.
+
+## Things that actually help
+
+**Wired, on both ends.** The single biggest improvement available to most
+people. WiFi jitter is the most common cause of a stream that feels bad on a
+connection that measures fine.
+
+**The socket buffer sysctl.** If you skipped it during install, do it now. See
+[Requirements](/quasar/start/requirements/). Without it, keyframe bursts overflow
+the send buffer and the drops get misread as congestion.
+
+**A frame rate your GPU can genuinely hold.** A steady 60 beats an unsteady 90.
+Encode time rises with resolution and frame rate, and past the point where the
+encoder cannot keep up, everything gets worse at once.
+
+**Leaving adaptive bitrate on `smooth`.** It is specifically tuned for this.
+
+**A codec your client decodes in hardware, where possible.** AV1 software decode
+is fine but not free.
+
+## Things that mostly do not help
+
+**Chasing a lower GOP.** More frequent keyframes cost bitrate and produce
+periodic spikes that hurt smoothness. The default of 60 is reasonable.
+
+**Reducing the encode queue depth.** `QUASAR_QUEUE_BUFFERS` below 3 trades jitter
+absorption for a couple of milliseconds. Usually a bad trade.
+
+**Forward error correction.** Do not enable it for browser clients. See
+[Experimental options](/quasar/tuning/experimental/).
+
+## A specific trap on macOS clients
+
+If a Mac on WiFi shows periodic sawtooth latency spikes, check whether the AWDL
+interface is up. It is used by AirDrop and Handoff, and its channel hopping
+produces exactly that pattern.
+
+```bash
+ifconfig awdl0
+```
+
+Bringing it down has produced a drop from 68 ms at the 95th percentile to
+around 4 ms. It comes back up whenever AirDrop or Handoff is used, so check its
+state before drawing conclusions from a Mac on WiFi.
+
+## Measuring properly
+
+For a real answer rather than an impression, take a diagnostic bundle. It
+correlates encoder, network and client signals over the same window and gives a
+verdict on which of the three is responsible. See
+[Diagnostics](/quasar/operations/diagnostics/).
+
+<Aside type="note" title="Glass-to-glass latency cannot be measured from a browser">
+Chrome does not expose the capture timestamp that would let the client compute
+true end-to-end latency, even though Quasar puts it on the wire correctly. Do not
+go looking for a bug in the host when that number is missing.
+</Aside>

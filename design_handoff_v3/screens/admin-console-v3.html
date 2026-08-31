@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Quasar — Admin Console v3</title>
+<link rel="stylesheet" href="assets/console-v3.css">
+<template id="__bundler_thumbnail"><svg viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg"><rect width="256" height="256" fill="oklch(0.1449 0.0115 266.85)"/><g transform="translate(38 38) scale(0.7)"><path d="M183 185A86 86 0 1 1 211 128" fill="none" stroke="oklch(0.5998 0.2179 273.21)" stroke-width="28" stroke-linecap="round"/><path d="M158 158c20 19 37 32 72 56l-16 16c-24-35-37-52-56-72Z" fill="oklch(0.5998 0.2179 273.21)"/><circle cx="128" cy="128" r="45" fill="oklch(0.105 0.01 267)" stroke="oklch(0.9618 0.0086 247.91)" stroke-width="6"/></g></svg></template>
+</head>
+<body data-density="comfortable" data-rail="expanded">
+<div class="app">
+ <header class="topbar">
+  <div class="brand">
+   <svg class="mark" viewBox="0 0 32 32" fill="none"><defs><linearGradient id="qg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6A45F5"/><stop offset=".5" stop-color="#5B6BFF"/><stop offset="1" stop-color="#00C0FF"/></linearGradient></defs><ellipse cx="16" cy="16" rx="14.2" ry="5.4" transform="rotate(-30 16 16)" stroke="url(#qg)" stroke-width="1.6" opacity=".75"/><circle cx="16" cy="16" r="6.2" fill="url(#qg)"/><circle cx="16" cy="16" r="2.1" fill="#fff"/></svg>
+   <span class="wordmark">Quasar</span>
+  </div>
+  <button class="cmdk" onclick="openPalette()"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" style="width:14px;height:14px"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4L14 14" stroke-linecap="round"/></svg>Search hosts, sessions, apps, users…<kbd>⌘K</kbd></button>
+  <div class="tb-right">
+   <div class="menu-wrap">
+    <button class="user-btn" onclick="toggleMenu(event,'userpop')"><span class="u-ava">SA</span><span class="u-nm">salty2011</span><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" style="width:13px;height:13px;color:var(--text-3)"><path d="M4 6l4 4 4-4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+    <div class="menu user-pop" id="userpop" role="menu" aria-label="User menu" onclick="event.stopPropagation()">
+     <div class="up-head"><span class="u-ava" style="width:38px;height:38px;font-size:1rem">SA</span><div><div class="up-name">salty2011</div></div></div>
+     <button class="up-item" role="menuitem" onclick="location.href='home.html'"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2.2" y="2.2" width="5" height="5" rx="1.2"/><rect x="8.8" y="2.2" width="5" height="5" rx="1.2"/><rect x="2.2" y="8.8" width="5" height="5" rx="1.2"/><rect x="8.8" y="8.8" width="5" height="5" rx="1.2"/></svg>Game library</button>
+     <div class="up-div"></div>
+     <button class="up-item" role="menuitem" onclick="toggleTheme()" id="upTheme"></button>
+     <button class="up-item" role="menuitem" onclick="toggleDensity()" id="upDensity"></button>
+     <div class="up-div"></div>
+     <button class="up-item" role="menuitem" onclick="go('#/account')"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="5.5" r="3"/><path d="M2 13c0-3.3 2.7-5.5 6-5.5s6 2.2 6 5.5" stroke-linecap="round"/></svg>Account</button>
+     <div class="up-div"></div>
+     <button class="up-item danger" role="menuitem"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M6 2H3a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3M10.5 11l3.5-3-3.5-3M14 8H6.5" stroke-linecap="round" stroke-linejoin="round"/></svg>Sign out</button>
+    </div>
+   </div>
+  </div>
+ </header>
+ <nav class="rail" id="rail"></nav>
+ <main class="main" id="main"></main>
+</div>
+<div id="drawer"></div>
+<div id="palette"></div>
+<script src="assets/data.js"></script>
+<script src="assets/ui.js"></script>
+<script src="assets/pages-activity.js"></script>
+<script src="assets/pages-fleet.js"></script>
+<script src="assets/pages-library.js"></script>
+<script src="assets/pages-app-editor.js"></script>
+<script src="assets/pages-people.js"></script>
+<script src="assets/pages-account.js"></script>
+<script>
+const QD=window.QDATA;
+const NAV=[
+ {id:'overview',label:'Overview',ic:'overview',go:'#/overview'},
+ {id:'sessions',label:'Sessions',ic:'sessions',go:'#/sessions',mk:'live',mkv:String(QD.SESSIONS.filter(s=>s.state==='streaming'||s.state==='degraded').length)},
+ {id:'fleet',label:'Fleet',ic:'fleet',go:'#/fleet/hosts',mk:'fault',mkv:'2'},
+ {id:'library',label:'Library',ic:'library',go:'#/library/apps'},
+ {id:'streaming',label:'Streaming',ic:'streaming',go:'#/streaming/launch'},
+ {id:'people',label:'People',ic:'people',go:'#/people/users'},
+ {id:'audit',label:'Audit log',ic:'audit',go:'#/audit'}];
+function renderRail(section){
+ if(section==='account')return; /* the account routes render their own sub-nav */
+ const item=n=>`<button class="rail-item${n.id===section?' active':''}" onclick="go('${n.go}')" title="${n.label}">${icon(n.ic)}<span class="lbl">${n.label}</span>${n.mk?`<span class="mk mk-${n.mk}">${n.mkv}</span>`:''}</button>`;
+ document.getElementById('rail').innerHTML=
+  NAV.map(item).join('')+
+  item({id:'settings',label:'Settings',ic:'settings',go:'#/settings'})+
+  `<div class="rail-foot">
+    <button class="rail-item" onclick="toggleRail()" title="Collapse sidebar">${icon('collapse')}<span class="lbl">Collapse</span></button>
+   </div>`;
+}
+const ROUTES=[
+ [/^#\/overview$/,'overview',()=>pageOverview()],
+ [/^#\/sessions$/,'sessions',()=>pageSessions()],
+ [/^#\/sessions\/(.+)$/,'sessions',m=>pageSessionDetail(m[1])],
+ [/^#\/fleet\/hosts$/,'fleet',()=>pageHosts()],
+ [/^#\/fleet\/hosts\/([^/]+)\/console$/,'fleet',m=>pageHostConsole(m[1])],
+ [/^#\/fleet\/hosts\/([^/]+)\/settings$/,'fleet',m=>pageHostSettings(m[1])],
+ [/^#\/fleet\/hosts\/(.+)$/,'fleet',m=>pageHostDetail(m[1])],
+ [/^#\/fleet\/storage$/,'fleet',()=>pageStorage()],
+ [/^#\/fleet\/images$/,'library',()=>pageImages()],
+ [/^#\/library\/apps$/,'library',()=>pageApps()],
+ [/^#\/library\/apps\?(.*)$/,'library',m=>pageApps(m[1])],
+ [/^#\/library\/apps\/(.+)$/,'library',m=>pageAppEditor(m[1])],
+ [/^#\/library\/presets$/,'library',()=>pagePresets()],
+ [/^#\/library\/images$/,'library',()=>pageImages()],
+ [/^#\/library\/images\/(.+)$/,'library',m=>pageImageDetail(m[1])],
+ [/^#\/library\/sources$/,'library',()=>pageSources()],
+ [/^#\/streaming\/launch$/,'streaming',()=>pageLaunch()],
+ [/^#\/streaming\/profiles$/,'streaming',()=>pageStreamProfiles()],
+ [/^#\/people\/users$/,'people',()=>pageUsers()],
+ [/^#\/people\/invites$/,'people',()=>pageInvites()],
+ [/^#\/audit$/,'audit',()=>pageAudit()],
+ [/^#\/settings$/,'settings',()=>pageSettings()],
+ [/^#\/account$/,'account',()=>pageAccount('profile')],
+ [/^#\/account\/(.+)$/,'account',m=>pageAccount(m[1])]];
+function render(){
+ const h=location.hash||'#/overview';
+ const r=ROUTES.find(([re])=>re.test(h))||ROUTES[0];
+ const m=h.match(r[0]);
+ document.getElementById('main').innerHTML=r[2](m);
+ document.getElementById('main').scrollTop=0;
+ renderRail(r[1]);
+ try{localStorage.setItem('quasar-v2-route',h)}catch(e){}
+}
+function go(h){if(location.hash===h)render();else location.hash=h;closePalette();}
+function toggleRail(){const b=document.body;const v=b.dataset.rail==='collapsed'?'expanded':'collapsed';b.dataset.rail=v;try{localStorage.setItem('quasar-v2-rail',v)}catch(e){}}
+function setTheme(t){document.documentElement.dataset.theme=t;try{localStorage.setItem('quasar-v3-theme',t)}catch(e){}
+ syncPrefs();render();}
+function toggleTheme(){setTheme(document.documentElement.dataset.theme==='dark'?'light':'dark');}
+function setDensity(d){document.body.dataset.density=d;try{localStorage.setItem('quasar-v2-density',d)}catch(e){}
+ syncPrefs();render();}
+function toggleDensity(){setDensity(document.body.dataset.density==='dense'?'comfortable':'dense');}
+function syncPrefs(){const t=document.documentElement.dataset.theme,d=document.body.dataset.density;
+ const th=document.getElementById('upTheme');
+ if(th)th.innerHTML=`<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">${t==='dark'?I.sun:I.moon}</svg>${t==='dark'?'Light mode':'Dark mode'}<span class="up-val">${t==='dark'?'\u2600':'\u263e'}</span>`;
+ const dn=document.getElementById('upDensity');
+ if(dn)dn.innerHTML=`<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="${d==='dense'?'M2 2.8h12M2 6.3h12M2 9.7h12M2 13.2h12':'M2 3.5h12M2 8h12M2 12.5h12'}" stroke-linecap="round"/></svg>${d==='dense'?'Comfortable mode':'Dense mode'}`;}
+/* ---- command palette ---- */
+const ACTIONS=[
+ {k:'Go to Overview',m:'g o',go:'#/overview',ic:'overview'},{k:'Go to Sessions',m:'g s',go:'#/sessions',ic:'sessions'},
+ {k:'Go to Fleet',m:'g f',go:'#/fleet/hosts',ic:'fleet'},{k:'Go to Storage',m:'',go:'#/fleet/storage',ic:'storage'},
+ {k:'Go to Images',m:'',go:'#/fleet/images',ic:'image'},{k:'Go to Library',m:'g l',go:'#/library/apps',ic:'library'},
+ {k:'Go to Runtime presets',m:'',go:'#/library/presets',ic:'library'},{k:'Go to Sources',m:'',go:'#/library/sources',ic:'library'},
+ {k:'Go to Launch profiles',m:'',go:'#/streaming/launch',ic:'streaming'},{k:'Go to Stream profiles',m:'',go:'#/streaming/profiles',ic:'streaming'},
+ {k:'Go to Users',m:'g u',go:'#/people/users',ic:'people'},{k:'Go to Invites',m:'',go:'#/people/invites',ic:'people'},
+ {k:'Go to Audit log',m:'g a',go:'#/audit',ic:'audit'},{k:'Go to Settings',m:'',go:'#/settings',ic:'settings'},
+ {k:'Go to Account',m:'',go:'#/account',ic:'profile'},{k:'Toggle appearance',m:'',fn:'toggleTheme()',ic:'sun'},{k:'Enroll a host',m:'',go:'#/fleet/hosts',ic:'plus'},{k:'Mint an invite',m:'',go:'#/people/invites',ic:'plus'}];
+function palResults(q){
+ const t=q.trim().toLowerCase();const groups=[];
+ const acts=ACTIONS.filter(a=>!t||a.k.toLowerCase().includes(t)).slice(0,t?5:6);
+ if(acts.length)groups.push(['Actions',acts.map(a=>({ic:a.ic,k:a.k,m:a.m,go:a.go,fn:a.fn}))]);
+ if(t){
+  const hs=QD.HOSTS.filter(h=>h.name.includes(t)||h.id.includes(t)).slice(0,4).map(h=>({ic:'fleet',k:h.name,m:h.state,go:'#/fleet/hosts/'+h.id}));
+  if(hs.length)groups.push(['Hosts',hs]);
+  const ss=QD.SESSIONS.filter(s=>(s.app+s.user+s.id).toLowerCase().includes(t)).slice(0,4).map(s=>({ic:'sessions',k:s.app+' · '+s.user,m:s.id,go:'#/sessions/'+s.id}));
+  if(ss.length)groups.push(['Sessions',ss]);
+  const as=QD.APPS.filter(a=>a.name.toLowerCase().includes(t)).slice(0,4).map(a=>({ic:'library',k:a.name,m:a.kind,go:'#/library/apps/'+a.id}));
+  if(as.length)groups.push(['Apps',as]);
+  const us=QD.USERS.filter(u=>(u.name+u.mail).toLowerCase().includes(t)).slice(0,4).map(u=>({ic:'people',k:u.name,m:u.mail,go:'#/people/users'}));
+  if(us.length)groups.push(['Users',us]);
+ }
+ return groups;
+}
+let palSel=0,palFlat=[];
+function drawPal(q){
+ const groups=palResults(q);palFlat=[];
+ let html='';
+ groups.forEach(([name,items])=>{html+=`<div class="pal-sec">${name}</div>`;
+  items.forEach(it=>{const i=palFlat.length;palFlat.push(it);
+   html+=`<button class="pal-item${i===palSel?' sel':''}" data-i="${i}" onmouseenter="palSel=${i};drawPal(document.getElementById('palIn').value)" onclick="palRun(${i})">${icon(it.ic)}<span class="k">${esc(it.k)}</span><span class="m">${esc(it.m||'')}</span></button>`;});});
+ if(!palFlat.length)html='<div class="pal-sec">No matches</div>';
+ document.querySelector('.pal-list').innerHTML=html;
+}
+function palRun(i){const it=palFlat[i];if(!it)return;closePalette();if(it.fn)eval(it.fn);else go(it.go);}
+function openPalette(){
+ palSel=0;
+ document.getElementById('palette').innerHTML=`<div class="scrim" onclick="if(event.target===this)closePalette()"><div class="pal">
+  <div class="pal-in">${icon('search')}<input id="palIn" placeholder="Search hosts, sessions, apps, users or jump to a page" autocomplete="off"></div>
+  <div class="pal-list"></div>
+  <div class="pal-foot"><span>↑↓ navigate</span><span>↵ open</span><span>esc close</span></div></div></div>`;
+ const inp=document.getElementById('palIn');
+ inp.addEventListener('input',()=>{palSel=0;drawPal(inp.value)});
+ inp.addEventListener('keydown',e=>{
+  if(e.key==='ArrowDown'){e.preventDefault();palSel=Math.min(palSel+1,palFlat.length-1);drawPal(inp.value)}
+  else if(e.key==='ArrowUp'){e.preventDefault();palSel=Math.max(palSel-1,0);drawPal(inp.value)}
+  else if(e.key==='Enter'){e.preventDefault();palRun(palSel)}
+  else if(e.key==='Escape'){closePalette()}});
+ drawPal('');inp.focus();
+}
+function closePalette(){document.getElementById('palette').innerHTML='';}
+document.addEventListener('keydown',e=>{
+ if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){e.preventDefault();openPalette();}
+ else if(e.key==='Escape'){closePalette();if(window.closeDrawer)closeDrawer();}
+ else if(e.key==='/'&&!/input|textarea/i.test(e.target.tagName)){e.preventDefault();openPalette();}
+});
+/* ---- boot ---- */
+try{
+ const t=localStorage.getItem('quasar-v3-theme');if(t)document.documentElement.dataset.theme=t;
+ const d=localStorage.getItem('quasar-v2-density');if(d)document.body.dataset.density=d;
+ const r=localStorage.getItem('quasar-v2-rail');if(r)document.body.dataset.rail=r;
+ if(!location.hash){const h=localStorage.getItem('quasar-v2-route');if(h&&h.indexOf('#/account')!==0)location.hash=h;}
+}catch(e){}
+document.getElementById('themeBtn')&&0;
+syncPrefs();
+syncPrefs();
+window.addEventListener('hashchange',render);
+render();
+</script>
+</body>
+</html>

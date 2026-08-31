@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# pre-push — refuse to push operator infrastructure fingerprints.
+#
+# Install it once, per clone, by COPYING it out of the worktree:
+#
+#     cp scripts/dev/hooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+#
+# NOT `git config core.hooksPath scripts/dev/hooks`. That points git at a
+# directory INSIDE the worktree, so the hook it runs is whichever version the
+# checked-out branch carries: reviewing an untrusted branch and then pushing
+# executes that branch's copy of this file, and of leak-scan.sh, as you. A
+# checkout must not be able to change which code your own git runs.
+#
+# This is a local convenience that fails fast, at the last moment where the
+# mistake is still free. The authority is .github/workflows/leak-scan.yml, which
+# runs the same script on push and pull_request and cannot be skipped — and,
+# unlike anything in the worktree, cannot be rewritten by a contributor branch.
+#
+# To push anyway (you had better be certain): git push --no-verify
+
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+scan="$root/scripts/dev/leak-scan.sh"
+
+[ -x "$scan" ] || exit 0 # branch predates the guard; CI still catches it.
+
+if ! "$scan"; then
+  echo >&2
+  echo "pre-push: refusing to push — see the fingerprints above." >&2
+  exit 1
+fi

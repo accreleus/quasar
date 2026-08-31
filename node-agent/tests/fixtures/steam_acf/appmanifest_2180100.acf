@@ -1,0 +1,43 @@
+"AppState"
+{
+	"appid"		"2180100"
+	"Universe"		"1"
+	"name"		"Proton Hotfix"
+	"StateFlags"		"4"
+	"installdir"		"Proton Hotfix"
+	"LastUpdated"		"1785188623"
+	"LastPlayed"		"0"
+	"SizeOnDisk"		"1514918119"
+	"StagingSize"		"0"
+	"buildid"		"24415271"
+	"LastOwner"		"76561190000000000"
+	"DownloadType"		"1"
+	"UpdateResult"		"0"
+	"BytesToDownload"		"1674032"
+	"BytesDownloaded"		"1674032"
+	"BytesToStage"		"759190051"
+	"BytesStaged"		"759190051"
+	"TargetBuildID"		"24415271"
+	"AutoUpdateBehavior"		"0"
+	"AllowOtherDownloadsWhileRunning"		"0"
+	"ScheduledAutoUpdate"		"0"
+	"InstalledDepots"
+	{
+		"2180101"
+		{
+			"manifest"		"6565736321017410416"
+			"size"		"1449260511"
+		}
+		"4862111"
+		{
+			"manifest"		"917133174890760973"
+			"size"		"65657608"
+		}
+	}
+	"UserConfig"
+	{
+	}
+	"MountedConfig"
+	{
+	}
+}

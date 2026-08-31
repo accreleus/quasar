@@ -1,0 +1,36 @@
+{
+  "$comment": "Route manifest for scripts/dx/uiaudit — surfaces extracted from the 2026-08-08 manual UI audit (#459). widths are WxH strings; the first entry is the default viewport. dynamic=true routes contain a {id} placeholder resolved at runtime by scraping /admin/hosts for the first host link.",
+  "defaultWidths": ["1440x900"],
+  "routes": [
+    { "id": "admin-overview", "path": "/admin", "role": "admin", "widths": ["1440x900"], "notes": "Admin landing / GPU+capacity overview" },
+    { "id": "admin-settings", "path": "/admin/settings", "role": "admin", "widths": ["1440x900"], "notes": "Instance settings, master key, SteamGridDB key" },
+    { "id": "admin-sessions", "path": "/admin/sessions", "role": "admin", "widths": ["1440x900"], "notes": "Session oversight list (designed empty state when none live)" },
+    { "id": "admin-audit", "path": "/admin/activity", "role": "admin", "widths": ["1440x900"], "notes": "Audit log (designed empty state when no events)" },
+    { "id": "admin-hosts", "path": "/admin/hosts", "role": "admin", "widths": ["1440x900"], "notes": "Host list — source of the {id} used by the dynamic host-detail routes" },
+    { "id": "admin-host-settings", "path": "/admin/hosts/{id}/settings", "role": "admin", "widths": ["1440x900"], "dynamic": true, "notes": "Host detail — settings tab; {id} resolved from /admin/hosts" },
+    { "id": "admin-host-console", "path": "/admin/hosts/{id}/console", "role": "admin", "widths": ["1440x900"], "dynamic": true, "notes": "Host detail — console tab; {id} resolved from /admin/hosts" },
+    { "id": "admin-storage", "path": "/admin/storage", "role": "admin", "widths": ["1440x900"], "notes": "Storage overview (designed empty state)" },
+    { "id": "admin-images", "path": "/admin/images", "role": "admin", "widths": ["1440x900"], "notes": "Image management (ensure/install/pin/update)" },
+    { "id": "admin-apps", "path": "/admin/apps", "role": "admin", "widths": ["1440x900"], "notes": "App catalog configuration" },
+    { "id": "admin-presets", "path": "/admin/runtime-presets", "role": "admin", "widths": ["1440x900"], "notes": "Runtime presets" },
+    { "id": "admin-steam", "path": "/admin/libraries/steam", "role": "admin", "widths": ["1440x900"], "notes": "Steam library provider (designed empty state)" },
+    { "id": "admin-launch-profiles", "path": "/admin/launch-profiles", "role": "admin", "widths": ["1440x900"], "notes": "Launch profiles — dense grouped table" },
+    { "id": "admin-stream-profiles", "path": "/admin/stream-profiles", "role": "admin", "widths": ["1440x900", "1280x900"], "notes": "Stream profiles — known Name-column wrap finding (F-02)" },
+    { "id": "admin-users", "path": "/admin/users", "role": "admin", "widths": ["1440x900", "1280x900"], "notes": "Users table — known Actions-column clip finding at 1280px (F-03)" },
+    { "id": "admin-invites", "path": "/admin/invites", "role": "admin", "widths": ["1440x900"], "notes": "Invites — known unstyled datetime-local input finding (F-04)" },
+
+    { "id": "app-home", "path": "/app", "role": "user", "widths": ["1440x900"], "notes": "User library / home; hero band only renders with >=1 entitled app" },
+    { "id": "app-library", "path": "/app/library", "role": "user", "widths": ["1440x900", "375x812"], "notes": "Library tab (designed empty state); mobile spot-check" },
+    { "id": "app-account", "path": "/app/account", "role": "user", "widths": ["1440x900"], "notes": "Account / profile" },
+    { "id": "app-account-overlay", "path": "/app/account/overlay", "role": "user", "widths": ["1440x900"], "notes": "In-session overlay settings" },
+    { "id": "app-account-streaming", "path": "/app/account/streaming", "role": "user", "widths": ["1440x900"], "notes": "Stream quality settings" },
+    { "id": "app-account-storage", "path": "/app/account/storage", "role": "user", "widths": ["1440x900"], "notes": "Storage (designed empty state)" },
+    { "id": "app-account-security", "path": "/app/account/security", "role": "user", "widths": ["1440x900"], "notes": "Security settings" },
+    { "id": "app-account-devices", "path": "/app/account/devices", "role": "user", "widths": ["1440x900"], "notes": "Devices" },
+    { "id": "app-account-sessions", "path": "/app/account/sessions", "role": "user", "widths": ["1440x900"], "notes": "My sessions (designed empty state)" },
+
+    { "id": "login", "path": "/login", "role": "none", "widths": ["1440x900", "375x812"], "notes": "Unauthenticated login; mobile spot-check" },
+    { "id": "register", "path": "/register", "role": "none", "widths": ["1440x900"], "notes": "Registration — known no-policy-messaging finding (F-06)" },
+    { "id": "notfound", "path": "/this-route-does-not-exist", "role": "none", "widths": ["1440x900"], "notes": "Unmatched-route 404 fallback — known overlap finding (F-01)" }
+  ]
+}

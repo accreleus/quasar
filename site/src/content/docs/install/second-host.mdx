@@ -1,0 +1,42 @@
+---
+title: Add a second GPU host
+description: Multi-host is built into the control plane, but there is no supported way to install a second host yet.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Coming soon.
+
+<Aside type="caution" title="Not tested, not supported yet">
+Multi-host is in the architecture from the beginning. The control plane holds no
+GPU state, the scheduler places sessions across hosts, and the admin UI is built
+around a fleet rather than one machine. None of that is speculative.
+
+What does not exist yet is a tested way to install the second machine. There is
+no agent-only Compose file, no installer, and no verification run behind it. Any
+recipe published today would be guesswork.
+</Aside>
+
+## What already works
+
+Each host runs one node agent. It reports its GPUs, capacity and readiness to
+the control plane, and receives sessions from it. The pieces are in place; the
+packaging and the testing are not.
+
+Hosts can use different local storage roots. If you want saves to follow a user
+between machines, back those roots with shared storage. Otherwise set the
+`locality` placement policy so Quasar prefers the host that already holds that
+user's home directory.
+
+## If you want to help
+
+The repository has a multi-agent Compose overlay used for scheduler testing. It
+runs several agents on one machine and is not a second-host installer.
+
+If you want to work on real agent-only packaging, start with
+[GPU and remote workflows](/quasar/developer/gpu-workflows/). The thing to get
+right is the runtime contract the base node-agent service carries: host
+networking, GPU and `/dev/uinput` access, the PulseAudio sidecar, the managed-home
+root mounted at the same path inside and outside the container, and the enrollment
+flow that issues a per-node secret on first contact. Copying five environment
+variables across is not enough, which is most of why this is not shipped.

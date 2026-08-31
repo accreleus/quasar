@@ -1,0 +1,623 @@
+---
+/**
+ * Landing page sections.
+ *
+ * Design direction and section spec came from the design review against the
+ * design handoff and web/src/styles/tokens.css, re-mirrored against v3 on
+ * 2026-08-31. Rules that are easy to
+ * break by accident, so they are written down here:
+ *
+ *  - The brand gradient appears at most once per viewport height. It is on the
+ *    nav wordmark, one word of the hero headline, and the WebRTC edge of the
+ *    diagram. Buttons are flat violet, never gradient. Since the v3 re-mirror
+ *    that gradient is single-hue: v3 collapsed --violet and --cyan onto one
+ *    accent and says no surviving rule should paint violet-to-cyan.
+ *  - No icon card grids, no Fast/Secure/Scalable triads, no status pills.
+ *  - No em-dashes in prose.
+ *  - The hero does not depend on a screenshot. The screenshot slot below it
+ *    holds the one product shot on this page.
+ */
+import { Image } from 'astro:assets';
+import libraryShot from '../assets/shots/library-home.png';
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+---
+
+<div class="q-landing">
+	<div class="q-ambient" aria-hidden="true"></div>
+
+	<!-- Hero -->
+	<section class="q-hero">
+		<svg class="q-sweep" viewBox="0 0 1200 400" preserveAspectRatio="none" aria-hidden="true">
+			<defs>
+				<linearGradient id="sweepline" x1="0" y1="0" x2="1" y2="0">
+					<stop offset="0" stop-color="rgba(255,255,255,0)"></stop>
+					<stop offset=".5" stop-color="rgba(255,255,255,.10)"></stop>
+					<stop offset="1" stop-color="rgba(255,255,255,0)"></stop>
+				</linearGradient>
+			</defs>
+			<ellipse cx="600" cy="-320" rx="900" ry="700" fill="none" stroke="url(#sweepline)" stroke-width="1"
+			></ellipse>
+		</svg>
+
+		<div class="q-hero-copy">
+			<h1>
+				Your GPUs.<br />
+				<span class="q-grad">Any browser.</span>
+			</h1>
+			<p class="q-lede">
+				Quasar is a self-hostable cloud gaming platform. Games run in containers on GPU
+				machines you own, and you play them in a browser tab. Multi-host, multi-user,
+				hardware encoded, no client to install.
+			</p>
+			<div class="q-cta">
+				<a class="q-btn q-btn-primary" href={`${base}/start/quickstart/`}>Quick start</a>
+				<a class="q-btn q-btn-ghost" href="#how">How it works</a>
+			</div>
+		</div>
+
+		<div class="q-term" aria-label="Example install commands">
+			<div class="q-term-bar">
+				<span class="q-dot"></span><span class="q-dot"></span><span class="q-dot"></span>
+				<span class="q-term-name">install</span>
+			</div>
+			<pre><code><span class="q-c"># the quick start writes these two files for you</span>
+<span class="q-p">$</span> docker compose -f deploy/docker-compose.yml up -d
+<span class="q-ok">quasar-postgres      healthy</span>
+<span class="q-ok">quasar-control-plane healthy</span>
+<span class="q-ok">quasar-node-agent    started</span>
+<span class="q-c">→ https://192.168.1.50:8443</span></code></pre>
+		</div>
+	</section>
+
+	<!-- The one product shot on this page. -->
+	<section class="q-shotslot">
+		<Image
+			class="q-shotslot-img"
+			src={libraryShot}
+			alt="The Quasar library, showing a running session and a grid of cover tiles"
+			loading="eager"
+		/>
+	</section>
+
+	<!-- What it is -->
+	<section class="q-prose">
+		<h2>What it is</h2>
+		<p>
+			If you own a machine with a decent GPU that spends most of the day idle, Quasar turns it
+			into something you can play from a laptop, a tablet or a TV anywhere on your network.
+			No subscription, no client install, no moving hardware between rooms. Your saves live on
+			storage you control.
+		</p>
+		<p>
+			Quasar reuses two components from the
+			<a href="https://github.com/games-on-whales/wolf" rel="noopener">Wolf</a> project: the
+			<code>gst-wayland-display</code> Wayland compositor and <code>inputtino</code> virtual
+			input. Both are excellent and there was no reason to rewrite them. Quasar goes a
+			different direction from Wolf rather than replacing it, starting from multi-host and
+			multi-user and streaming to browsers over WebRTC instead of speaking Moonlight. If
+			Moonlight compatibility is what you need, Wolf is the better answer.
+		</p>
+	</section>
+
+	<!-- How a session works -->
+	<section class="q-how" id="how">
+		<h2>How a session works</h2>
+		<div class="q-how-grid">
+			<svg class="q-diagram" viewBox="0 0 560 260" role="img" aria-label="Browser talks to the control plane over HTTPS. The control plane directs a node agent over a WebSocket. The node agent sends media directly to the browser over WebRTC.">
+				<defs>
+					<linearGradient id="media" x1="0" y1="0" x2="1" y2="0">
+						<stop offset="0" stop-color="oklch(0.5998 0.2179 273.21)"></stop>
+						<stop offset="1" stop-color="oklch(0.5 0.19 273.21)"></stop>
+					</linearGradient>
+				</defs>
+
+				<rect x="8" y="22" width="150" height="62" rx="11" class="q-node"></rect>
+				<text x="83" y="49" class="q-nlabel">Browser</text>
+				<text x="83" y="68" class="q-nsub">CLIENT</text>
+
+				<rect x="205" y="22" width="150" height="62" rx="11" class="q-node"></rect>
+				<text x="280" y="49" class="q-nlabel">Control plane</text>
+				<text x="280" y="68" class="q-nsub">GO</text>
+
+				<rect x="402" y="22" width="150" height="62" rx="11" class="q-node"></rect>
+				<text x="477" y="49" class="q-nlabel">Node agent</text>
+				<text x="477" y="68" class="q-nsub">RUST</text>
+
+				<rect x="402" y="150" width="150" height="56" rx="11" class="q-node"></rect>
+				<text x="477" y="175" class="q-nlabel">Game container</text>
+				<text x="477" y="193" class="q-nsub">GPU</text>
+
+				<line x1="158" y1="53" x2="205" y2="53" class="q-edge"></line>
+				<line x1="355" y1="53" x2="402" y2="53" class="q-edge"></line>
+				<line x1="477" y1="84" x2="477" y2="150" class="q-edge"></line>
+
+				<text x="181" y="43" class="q-elabel">API</text>
+				<text x="378" y="43" class="q-elabel">WS</text>
+
+				<path d="M 460 206 L 460 236 L 83 236 L 83 84" class="q-media"></path>
+				<text x="272" y="228" class="q-mlabel">WEBRTC MEDIA AND INPUT</text>
+			</svg>
+
+			<ol class="q-steps">
+				<li>
+					<span class="q-num">01</span>
+					<p>You pick something from your library. The browser asks the control plane for a session.</p>
+				</li>
+				<li>
+					<span class="q-num">02</span>
+					<p>The control plane picks a host with capacity and resolves your quality tier into one codec, resolution and bitrate the host can encode and your browser can decode.</p>
+				</li>
+				<li>
+					<span class="q-num">03</span>
+					<p>That host's agent starts the game container, brings up a compositor for it, and builds the encode pipeline.</p>
+				</li>
+				<li>
+					<span class="q-num">04</span>
+					<p>Browser and host connect directly. Video, audio and input travel between them, and the control plane drops out of the path.</p>
+				</li>
+			</ol>
+		</div>
+	</section>
+
+	<!-- What works today -->
+	<section class="q-facts">
+		<h2>What works today</h2>
+		<dl>
+			<dt>Multiple GPU hosts</dt>
+			<dd>Add a machine and it joins the pool. Sessions are placed by spread, load or storage locality.</dd>
+
+			<dt>Multiple users</dt>
+			<dd>Per-user persistent home directories, per-app entitlements, and registration that can be closed, invite-only or open.</dd>
+
+			<dt>Hardware encoding</dt>
+				<dd>Vulkan Video on AMD and NVIDIA, VA-API on Intel, with vendor encoders available as explicit choices or per-codec fallbacks.</dd>
+
+			<dt>Three codecs</dt>
+			<dd>H.264, HEVC and AV1, resolved per session against what the host can encode and the client can decode. HEVC in a browser depends on the client operating system, so Linux clients get AV1 or H.264 instead.</dd>
+
+			<dt>Adaptive bitrate</dt>
+			<dd>On by default, tuned for smoothness rather than peak bitrate. Under induced congestion it cut presentation jitter at the 95th percentile from roughly 69 ms to 19 ms.</dd>
+
+			<dt>Real input</dt>
+			<dd>Keyboard, mouse, touch and gamepads over the data channel, with optional microphone capture. Escape reaches the game through Keyboard Lock, which needs Chromium and HTTPS.</dd>
+
+			<dt>An admin area</dt>
+			<dd>Apps, container images, quality tiers, hosts, GPUs, storage, sessions and users. Admin is a server-enforced role, never a client-side flag.</dd>
+
+			<dt>Diagnostics that answer the question</dt>
+			<dd>Per-session bundles correlate encoder, network and client signals and say which of the three caused the stutter, or refuse to guess when the browser tab was hidden.</dd>
+
+			<dt>One Compose deployment</dt>
+			<dd>Postgres, the control plane and an agent. One script builds and brings it up.</dd>
+		</dl>
+	</section>
+
+	<!-- Status -->
+	<section class="q-prose">
+		<h2>Where it is</h2>
+		<p>
+			Quasar works and is used daily, and it is not a finished product. The parts covered by
+			this documentation are built and running. Two limits are worth knowing before you
+			invest an evening in it.
+		</p>
+		<p>
+				Media takes a direct route between the browser and the GPU host, so a LAN or a
+				VPN is the shape Quasar is built for. There is also no native client yet, so the
+				browser is the only way in, and browser decoding constrains what the stream can be.
+			</p>
+	</section>
+
+	<!-- Footer CTA -->
+	<section class="q-endcta">
+		<svg class="q-endmark" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+			<defs>
+				<linearGradient id="qend" x1="0" y1="0" x2="1" y2="1">
+					<stop offset="0" stop-color="#6A45F5"></stop>
+					<stop offset=".5" stop-color="#5B6BFF"></stop>
+					<stop offset="1" stop-color="#00C0FF"></stop>
+				</linearGradient>
+			</defs>
+			<ellipse cx="16" cy="16" rx="14.2" ry="5.4" transform="rotate(-30 16 16)" stroke="url(#qend)" stroke-width="1.6" opacity=".75"></ellipse>
+			<circle cx="16" cy="16" r="6.2" fill="url(#qend)"></circle>
+			<circle cx="16" cy="16" r="2.1" fill="#fff"></circle>
+		</svg>
+		<h2>Run it on your own hardware</h2>
+		<p>A Linux host, Docker, and a GPU you already own.</p>
+		<div class="q-cta">
+			<a class="q-btn q-btn-primary" href={`${base}/start/quickstart/`}>Quick start</a>
+			<a class="q-btn q-btn-ghost" href={`${base}/start/requirements/`}>Requirements</a>
+			<a class="q-btn q-btn-ghost" href="https://github.com/accreleus/quasar" rel="noopener">GitHub</a>
+		</div>
+	</section>
+</div>
+
+<style>
+	/* The splash template still renders the page title in its own content panel
+	   above the body. This page provides its own hero, so hide it. Scoped by
+	   :has() so it only ever affects a page that renders <Landing />. */
+	:global(body:has(.q-landing) .content-panel:first-of-type) {
+		display: none;
+	}
+
+	:global(body:has(.q-landing) .content-panel) {
+		border-top: 0;
+		padding-block: 0;
+	}
+
+	.q-landing {
+		--gutter: 24px;
+		max-width: 1120px;
+		margin-inline: auto;
+		padding-inline: var(--gutter);
+		position: relative;
+	}
+
+	.q-ambient {
+		position: fixed;
+		inset: 0;
+		z-index: -1;
+		pointer-events: none;
+		background-image:
+			radial-gradient(1400px 800px at 70% -20%, rgba(106, 69, 245, 0.14), transparent 60%),
+			radial-gradient(1000px 600px at -10% 30%, rgba(0, 192, 255, 0.05), transparent 55%);
+	}
+
+	:global([data-theme='light']) .q-ambient {
+		background-image:
+			radial-gradient(1400px 800px at 70% -20%, rgba(106, 69, 245, 0.08), transparent 60%),
+			radial-gradient(1000px 600px at -10% 30%, rgba(0, 192, 255, 0.04), transparent 55%);
+	}
+
+	.q-landing > section {
+		margin-block: 96px;
+	}
+
+	.q-landing > section:first-of-type {
+		margin-block-start: 56px;
+	}
+
+	/* ---------- Hero ---------- */
+	.q-hero {
+		position: relative;
+		display: grid;
+		grid-template-columns: 1.1fr 0.9fr;
+		gap: 64px;
+		align-items: start;
+	}
+
+	.q-sweep {
+		position: absolute;
+		inset-inline: -20%;
+		inset-block-start: -140px;
+		height: 400px;
+		z-index: -1;
+		pointer-events: none;
+	}
+
+	.q-hero h1 {
+		font-family: var(--q-font-display);
+		font-weight: 700;
+		font-size: clamp(2.6rem, 6vw, 3.6rem);
+		letter-spacing: -0.03em;
+		line-height: 1.05;
+		margin: 0 0 20px;
+		color: var(--q-text);
+	}
+
+	.q-grad {
+		background: var(--q-brand-grad);
+		-webkit-background-clip: text;
+		background-clip: text;
+		color: transparent;
+	}
+
+	.q-lede {
+		font-size: 1.0625rem;
+		line-height: 1.6;
+		color: var(--q-text-2);
+		max-width: 52ch;
+		margin: 0 0 28px;
+	}
+
+	.q-cta {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 12px;
+	}
+
+	.q-btn {
+		display: inline-flex;
+		align-items: center;
+		height: 42px;
+		padding-inline: 20px;
+		border-radius: var(--q-r-md);
+		font-family: var(--q-font-ui);
+		font-weight: 600;
+		font-size: 0.9375rem;
+		text-decoration: none;
+		border: 1px solid transparent;
+		transition: background-color 0.15s ease, border-color 0.15s ease;
+	}
+
+	.q-btn-primary {
+		background: var(--q-violet);
+		color: #fff;
+	}
+
+	.q-btn-primary:hover {
+		background: var(--q-accent-hover);
+	}
+
+	.q-btn-ghost {
+		border-color: var(--q-line-2);
+		color: var(--q-text-2);
+	}
+
+	.q-btn-ghost:hover {
+		border-color: var(--q-line-3);
+		color: var(--q-text);
+	}
+
+	/* ---------- Terminal card ---------- */
+	.q-term {
+		background: var(--q-ink-2);
+		border: 1px solid var(--q-line-2);
+		border-radius: var(--q-r-lg);
+		box-shadow: var(--q-shadow-md);
+		overflow: hidden;
+	}
+
+	.q-term-bar {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding: 10px 14px;
+		background: var(--q-ink-3);
+		border-bottom: 1px solid var(--q-line);
+	}
+
+	.q-dot {
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		background: var(--q-text-4);
+	}
+
+	.q-term-name {
+		margin-inline-start: 8px;
+		font-family: var(--q-font-mono);
+		font-size: 0.6875rem;
+		letter-spacing: 0.08em;
+		color: var(--q-text-4);
+	}
+
+	.q-term pre {
+		margin: 0;
+		padding: 16px;
+		overflow-x: auto;
+		background: transparent;
+	}
+
+	.q-term code {
+		font-family: var(--q-font-mono);
+		font-size: 0.8125rem;
+		line-height: 1.9;
+		color: var(--q-text);
+		background: none;
+		/* Wrap rather than clip. A half-visible command on the hero reads as
+		   broken, and horizontal scroll in a hero card is worse. */
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+	}
+
+	.q-p {
+		color: var(--q-text-4);
+	}
+
+	.q-ok {
+		color: var(--q-success-text);
+	}
+
+	.q-c {
+		color: var(--q-text-3);
+	}
+
+	/* ---------- Screenshot slot ---------- */
+	/* Same frame the docs pages use for a <Shot>, so the product reads the same
+	   whichever page you land on first. */
+	.q-shotslot-img {
+		display: block;
+		width: 100%;
+		height: auto;
+		border-radius: var(--q-r-lg);
+		border: 1px solid var(--q-line-2);
+		box-shadow: var(--q-shadow-md);
+	}
+
+	/* ---------- Prose sections ---------- */
+	.q-prose {
+		max-width: 68ch;
+	}
+
+	.q-landing h2 {
+		font-family: var(--q-font-display);
+		font-weight: 700;
+		font-size: 1.45rem;
+		letter-spacing: -0.02em;
+		color: var(--q-text);
+		margin: 0 0 16px;
+	}
+
+	.q-prose p {
+		color: var(--q-text-2);
+		line-height: 1.7;
+		margin: 0 0 16px;
+	}
+
+	.q-prose a {
+		color: var(--q-accent-text);
+	}
+
+	.q-prose code {
+		font-family: var(--q-font-mono);
+		font-size: 0.875em;
+	}
+
+	/* ---------- Diagram and steps ---------- */
+	.q-how-grid {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 48px;
+		align-items: center;
+	}
+
+	.q-diagram {
+		width: 100%;
+		height: auto;
+	}
+
+	.q-node {
+		fill: var(--q-ink-3);
+		stroke: var(--q-line-2);
+		stroke-width: 1;
+	}
+
+	.q-nlabel {
+		fill: var(--q-text);
+		font-family: var(--q-font-ui);
+		font-weight: 600;
+		font-size: 13px;
+		text-anchor: middle;
+	}
+
+	.q-nsub {
+		fill: var(--q-text-3);
+		font-family: var(--q-font-mono);
+		font-size: 9px;
+		letter-spacing: 0.14em;
+		text-anchor: middle;
+	}
+
+	.q-edge {
+		stroke: var(--q-text-4);
+		stroke-width: 1;
+	}
+
+	.q-elabel,
+	.q-mlabel {
+		fill: var(--q-text-3);
+		font-family: var(--q-font-mono);
+		font-size: 9px;
+		letter-spacing: 0.14em;
+		text-anchor: middle;
+	}
+
+	.q-media {
+		fill: none;
+		stroke: url(#media);
+		stroke-width: 1.5;
+	}
+
+	.q-steps {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 20px;
+	}
+
+	.q-steps li {
+		display: grid;
+		grid-template-columns: 36px 1fr;
+		gap: 12px;
+		align-items: start;
+	}
+
+	.q-num {
+		font-family: var(--q-font-mono);
+		font-size: 0.75rem;
+		font-weight: 500;
+		color: var(--q-accent-text);
+		padding-block-start: 3px;
+	}
+
+	.q-steps p {
+		margin: 0;
+		color: var(--q-text-2);
+		line-height: 1.6;
+		font-size: 0.9375rem;
+	}
+
+	/* ---------- Definition list ---------- */
+	.q-facts dl {
+		display: grid;
+		grid-template-columns: 260px 1fr;
+		gap: 0;
+		margin: 0;
+	}
+
+	.q-facts dt,
+	.q-facts dd {
+		border-top: 1px solid var(--q-line);
+		padding-block: 16px;
+		margin: 0;
+	}
+
+	.q-facts dt {
+		font-family: var(--q-font-ui);
+		font-weight: 600;
+		color: var(--q-text);
+		padding-inline-end: 24px;
+	}
+
+	.q-facts dd {
+		color: var(--q-text-2);
+		line-height: 1.6;
+	}
+
+	/* ---------- End CTA ---------- */
+	.q-endcta {
+		text-align: center;
+		padding-block: 32px 0;
+		border-top: 1px solid var(--q-line);
+	}
+
+	.q-endmark {
+		width: 40px;
+		height: 40px;
+		margin-block-end: 16px;
+	}
+
+	.q-endcta p {
+		color: var(--q-text-2);
+		margin: 0 0 24px;
+	}
+
+	.q-endcta .q-cta {
+		justify-content: center;
+	}
+
+	/* ---------- Narrow ---------- */
+	@media (max-width: 960px) {
+		.q-hero,
+		.q-how-grid {
+			grid-template-columns: 1fr;
+			gap: 40px;
+		}
+
+		.q-facts dl {
+			grid-template-columns: 1fr;
+		}
+
+		.q-facts dd {
+			border-top: 0;
+			padding-block-start: 0;
+		}
+
+		.q-landing > section {
+			margin-block: 64px;
+		}
+	}
+</style>

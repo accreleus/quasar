@@ -1,0 +1,46 @@
+---
+title: Jobs and schedules
+description: Inspect background work, run a job immediately, change a schedule, and read bounded job history.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Admin, Fleet, Jobs is the central view of background work. It includes
+instance-wide jobs, work that runs once per host, and older unmanaged jobs that
+are visible but not yet controllable through the common scheduler.
+
+## What the table shows
+
+For each job you can see its scope, whether it is enabled, its schedule, last and
+next run, current state, and latest result. Expand a host-scoped job to see the
+state of each host independently.
+
+Schedules may be periodic, limited to a time window and selected days, event
+driven, or manual only.
+
+## Run now
+
+Use the actions menu and choose **Run now**. A disabled job cannot run, and a job
+that is already active refuses a second overlapping run rather than queuing one
+silently. Host-scoped jobs ask which host should receive the run.
+
+## Edit a schedule
+
+Managed schedules can be enabled or disabled and their interval or execution
+window changed from the page. Some schedules are locked by an environment
+variable; the UI names that variable and disables the fields it controls. Remove
+the environment override and restart before expecting an admin change to win.
+
+Unmanaged jobs are listed for visibility but have no editable common schedule.
+
+## Run history
+
+Open a job to see bounded, newest-first run history. The result distinguishes a
+successful run, a failure, a skipped run, and an active run. Use the recorded
+message and timestamps before searching raw container logs.
+
+<Aside type="caution" title="Run now can change external state">
+Jobs do real work: they can scan libraries, install or inspect images, remove old
+telemetry, or perform host maintenance. Read the job name and target before
+starting it manually.
+</Aside>

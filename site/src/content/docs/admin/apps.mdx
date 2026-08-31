@@ -1,0 +1,114 @@
+---
+title: Apps and runtime presets
+description: Creating catalog entries, sharing container specs between them, granting access, and the settings that most often stop an app working.
+---
+
+import Shot from '../../../components/Shot.astro';
+import admin_apps from '../../../assets/shots/admin-apps.png';
+import { Aside } from '@astrojs/starlight/components';
+
+An **app** is a catalog entry a user can launch. It is content plus a container
+specification plus a launch command, not one monolithic image.
+
+A **runtime preset** is a container specification several apps can share, so
+that a change to the base setup does not mean editing ten apps.
+
+<Shot
+	label="Admin apps"
+	sublabel="The app catalog: kind, source, runtime preset, launch profile and whether each app is enabled."
+	src={admin_apps}
+	alt="The admin app catalog"
+/>
+
+## Creating an app
+
+1. Install the image first, under [Images](/quasar/admin/images/). Installing it
+   creates the runtime preset.
+2. Create the app and point it at that preset.
+3. Set the kind: **game**, **desktop** or **launcher**. This drives the filters
+   users see.
+4. Choose which quality tiers it may launch at, if you want to restrict them.
+5. Grant access.
+
+## Access
+
+An app is visible to a user only if they are entitled to it. Grant to everyone,
+or to named users.
+
+This is enforced on the server, on both listing and launching. A user who is not
+entitled cannot see the app and cannot launch it with a direct identifier.
+
+Library discovery creates an everyone grant automatically when it adds an app,
+so that discovered games are launchable without further work.
+
+## Runtime preset settings that actually matter
+
+Most defaults are fine. These four are the ones that cause problems.
+
+### Network
+
+App containers get **no network** by default. That is the right default for a
+local game.
+
+It is wrong for anything that needs to reach the internet. Steam is the obvious
+case: on first launch it downloads part of its own interface, and without
+network it exits cleanly and the session dies with an unhelpful message about
+the media path.
+
+Set `network: bridge` on the preset for apps that need it. Set it per app, not
+globally.
+
+### GPU access
+
+The preset declares whether the container gets the GPU. Games need it. A trivial
+tool might not.
+
+### Environment
+
+Environment variables passed into the container.
+
+Quasar injects the session's resolution and frame rate automatically as
+`QUASAR_STREAM_WIDTH`, `QUASAR_STREAM_HEIGHT` and `QUASAR_STREAM_FPS`, plus
+`GAMESCOPE_*` equivalents for images that bake gamescope defaults. Without this,
+an image built for 1080p60 renders at 1080p60 even when the session is 1440p120,
+and the result gets upscaled into the stream, spending your bitrate on
+interpolated detail.
+
+A value you set explicitly wins over the injected one.
+
+### Exit policy
+
+What happens when the app process exits.
+
+`fail` is the default and it is usually right: the app is gone, so the session
+should end rather than stream a frozen frame at somebody.
+
+`keep` holds the session open. Only useful for apps that legitimately come and
+go.
+
+## Shared storage
+
+Each user gets a persistent home directory per app, mounted in as the app's
+home. Only one session per user per app can run at a time, because two writers
+on the same save directory corrupts save files.
+
+## Quality tiers per app
+
+You can restrict which tiers an app is allowed to launch at, which is worth
+doing for something that has no business running at 4K120.
+
+The tier a session actually gets is still resolved at launch against what the
+host can encode and the client can decode. Restricting the list narrows the
+options, it does not force an outcome.
+
+<Aside type="caution" title="Images must come from the Quasar family">
+An app image has to derive from the project's graphics base layer. That is what
+provides GPU access, Wayland and audio plumbing. An arbitrary image from a
+public registry will not launch, and the failure will not be obvious.
+</Aside>
+
+## Artwork
+
+If you set a SteamGridDB key under Admin, Settings, Quasar fetches artwork for
+catalog entries. Without one, tiles render as gradient panels. It is entirely
+cosmetic.

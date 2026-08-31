@@ -1,0 +1,48 @@
+# Local-display (console mode) overlay — apply on top of the base stack, and the
+# vendor overlay when there is one:
+#
+#   docker compose -f deploy/docker-compose.yml \
+#                  -f deploy/docker-compose.nvidia.yml \
+#                  -f deploy/overlays/docker-compose.console.yml up -d
+#
+# Console mode drives the host's own display and speakers directly (weston on
+# DRM/KMS) instead of, or alongside, streaming to a browser. It needs three things
+# a stream-only deployment has no reason to grant, which is why they live here and
+# not in the base file: DRM master, the DRM/i2c device classes, and host audio.
+#
+# A stream-only deployment omits this file entirely.
+
+services:
+  quasar-node-agent:
+    # CM-09: weston must open the DRM device and become DRM master (KMS). Instead
+    # of `privileged` (all caps, all devices, kernel access), grant only
+    # CAP_SYS_ADMIN — the node-agent runs a VT-unbound `seatd` (session/console.rs)
+    # that performs the privileged DRM open on weston's behalf, so this single cap
+    # plus the device cgroup rules below replace full privileged.
+    # See docs/design/plans/cm-09-privileged-research.md.
+    #
+    # NO seccomp exception is granted here. Docker's default profile has been
+    # sufficient for DRM master on every host tested. If drmSetMaster fails on a
+    # host whose profile blocks it, grant the exception for THAT host only, with a
+    # local overlay file, rather than weakening every console deployment:
+    #   services: {quasar-node-agent: {security_opt: [seccomp:unconfined]}}
+    # Replacing that blunt exception with a narrow custom profile is the open half
+    # of CM-09.
+    cap_add:
+      - SYS_ADMIN
+    volumes:
+      # Host audio for the local speakers / HDMI-DP output. The whole directory is
+      # bound because the ALSA card and PCM device numbers are host-specific (an
+      # NVIDIA HDMI/DP controller is typically hw:0,3; an onboard codec is not) and
+      # a shipped file must not encode one box's numbering. A deployment that wants
+      # to pin exact nodes adds a local overlay with the two device paths and a
+      # narrower `c 116:<minor> rmw` rule in place of the wildcard below.
+      - /dev/snd:/dev/snd
+      # Docker forbids a bind into a container's own /proc, so the agent reads this
+      # host procfs view to advertise the exact ALSA hw:C,D selector.
+      - /proc/asound:/host-proc/asound:ro
+    device_cgroup_rules:
+      - 'c 116:* rmw'  # ALSA (major 116): control + PCM playback nodes
+      - 'c 226:* rmw'  # DRM devices (card/render, major 226) — weston console KMS
+      - 'c 89:* rmw'   # i2c-dev (major 89) — DDC/CI monitor power detection (VCP 0xd6).
+                       # Host must `modprobe i2c-dev`; the agent mknod's /dev/i2c-N itself.

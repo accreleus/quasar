@@ -1,0 +1,6 @@
+BEGIN;
+
+ALTER TABLE sessions
+    DROP COLUMN IF EXISTS profile_id;
+
+COMMIT;

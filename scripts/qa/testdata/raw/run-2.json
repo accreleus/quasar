@@ -1,0 +1,32 @@
+{
+  "run": 2,
+  "session_id": "22222222-2222-2222-2222-222222222222",
+  "decode_s": 4.8,
+  "first_content_s": 37.9,
+  "settle": "settled",
+  "settle_s": 45.0,
+  "luma": { "mean": 37.1, "sd": 0.7, "samples": 42 },
+  "stats": { "fps": 60, "frames_decoded": 3550, "resolution": "1920x1080", "rtt_ms": 20 },
+  "oracle_png_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+  "devices": {
+    "mouse": {
+      "delta_pct": 11.5,
+      "threshold_pct": 4.0,
+      "passed": true,
+      "messages_sent": 11,
+      "stimuli": [{ "t": "ma", "x": 0.5, "y": 0.62 }],
+      "before_png_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      "after_png_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    },
+    "gamepad": {
+      "delta_pct": 9.1,
+      "threshold_pct": 4.0,
+      "passed": true,
+      "messages_sent": 2,
+      "stimuli": [{ "t": "gp", "button": 12 }],
+      "before_png_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      "after_png_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    },
+    "keyboard": { "skipped": true, "reason": "QA_SKIP_DEVICES" }
+  }
+}

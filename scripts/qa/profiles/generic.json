@@ -1,0 +1,42 @@
+{
+  "name": "generic",
+  "description": "Fallback profile for an image with no family-specific gates: proves it launches, streams real content, takes input at all, and stops cleanly.",
+  "app": "",
+  "session_profile_id": "1080p60",
+  "runs": 2,
+  "gates": {
+    "launch": {
+      "min_fps": 45,
+      "min_luma": 15,
+      "first_content_s": [0, 90]
+    },
+    "oracle": {
+      "label": "first-screen",
+      "expect": "whatever this image draws on first paint",
+      "rules_out": "a black or never-painting surface",
+      "matcher": null
+    },
+    "input": {
+      "settle": { "frames": 3, "tolerance_pct": 1.5, "timeout_s": 120 },
+      "delta_threshold_pct": 3.0,
+      "region": [0.0, 0.0, 1.0, 1.0],
+      "devices": {
+        "mouse": {
+          "stimuli": [
+            { "t": "ma", "x": 0.5, "y": 0.5 },
+            { "t": "mm", "dx": 20, "dy": 12, "repeat": 10 }
+          ]
+        }
+      }
+    },
+    "shutdown": {
+      "budget_s": 10.0,
+      "expect_exit": 143,
+      "require_logs": [],
+      "forbid_logs": []
+    }
+  },
+  "notes": [
+    "Generic profile: the oracle has no expectation beyond \"something painted\", and only the mouse is exercised. Write a family profile before trusting this for a release gate."
+  ]
+}

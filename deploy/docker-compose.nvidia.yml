@@ -1,0 +1,135 @@
+# NVIDIA runtime overlay — apply on top of docker-compose.yml on a CUDA host.
+#
+#   docker compose -f deploy/docker-compose.yml \
+#                  -f deploy/docker-compose.nvidia.yml up -d
+#
+# Everything else (ports, env passthroughs, mounts, devices, volumes) comes from
+# the base file. This overlay carries ONLY what is specific to running on NVIDIA:
+# the CDI device exposure, the driver capability set, and the
+# runtime-provisioning wiring.
+#
+# Image lineage: THE SAME quasar-node-agent as every other host (#545). There is
+# no NVIDIA image any more. Every lineage is built CUDA_ENABLE=1 — the default
+# since 2026-07-26 — so the CUDA gst plugins (cudaconvert & co) and the
+# `--features cuda` agent (N-A full zero-copy: it FFI-links libgstcuda-1.0 to
+# share one GstCudaContext across the source/encode interpipe) are in the
+# universal image.
+#
+# What used to justify a second lineage was ONE library. `libnvrtc` is CUDA
+# toolkit userspace, not driver userspace, so the driver-volume provisioner
+# cannot fetch it — and without it the four cuda* elements never register and an
+# NVENC-fallback session dies with "cudaconvert not found". The agent now fetches
+# the pinned NVIDIA redistributable at run time into the driver volume
+# (node-agent/src/cuda_runtime.rs). Soft everywhere: on a host that refuses it
+# (driver older than r580) or cannot reach NVIDIA, the cuda* elements are simply
+# absent and Vulkan encode — the default below — is unaffected.
+#
+# Encoder: this overlay sets no QUASAR_ENCODER — the agent auto-detects the GPU
+# vendor when the var is unset and picks **vulkan** on NVIDIA itself (the base
+# compose passes any operator value through). `vulkanh264enc` +
+# `waylanddisplaysrc vulkan=true` (shared VkDevice) is the default H.264/HEVC
+# path on NVIDIA. Why: Vulkan is immune to the #489 NVENC teardown UAF in the
+# NVIDIA driver (which spans 595.91.07 and 610.x), so the default path is off
+# the affected library entirely.
+#
+# All three codecs run on the Vulkan encoder by default (2026-08-22):
+# QUASAR_VULKAN_H264 / _HEVC / _AV1 are ON unless an operator sets one to 0. While
+# HEVC is enabled the agent auto-pins WOLF_VULKAN_RING=2 (5090 ring-slot tiling
+# defect at RING=4). h265 is still admin-opt-in per profile, so a default
+# deployment streams h264 regardless.
+#
+# NVENC is NOT gone — it is the per-session fallback and the explicit opt-out:
+#   * Any codec whose Vulkan knob is disabled, or whose Vulkan element is absent
+#     from the image (e.g. vulkanav1enc needs the vendored patch), falls back per
+#     session to nvcuda<codec>enc. That fallback is resolved in
+#     `pipeline::effective_encoder`, and the #489 deferred-teardown guard keys on
+#     the session's EFFECTIVE encoder, so those sessions stay protected. It needs
+#     the runtime-provisioned NVRTC described above; without it the fallback
+#     cannot build a pipeline.
+#   * An operator who wants NVENC back sets QUASAR_ENCODER=nvenc in deploy/.env.
+#
+# A single host can be flipped at runtime via the admin host override
+# (PATCH /v1/admin/hosts/{id}/settings, {"overrides":{"encoder":"nvenc"},
+# "restart_confirm":true}).
+services:
+  quasar-node-agent:
+    image: ${QUASAR_AGENT_IMAGE:-${QUASAR_NODE_IMAGE:-quasar-node-agent:latest}}
+    # `gpus: all` = the CDI `--gpus all` invocation. This is REQUIRED over the legacy
+    # `runtime: nvidia` + NVIDIA_VISIBLE_DEVICES: the legacy hook sets up CUDA/NVENC but
+    # NOT the EGL/GBM DMA-buf interop the compositor needs — with it the compositor's
+    # memory:CUDAMemory output panics at "Failed to create DMA buffer" (verified). CDI
+    # exposes the full graphics device set so GsCUDABuf/DMA-buf creation works.
+    gpus: all
+    environment:
+      # caps=all includes graphics/display/compute/video — the compositor needs the
+      # graphics + display caps (gpus: all exposes the devices; this enables the caps).
+      NVIDIA_DRIVER_CAPABILITIES: all
+      # The sidecar follows the agent image, same as in the base file. Restated
+      # here so the two cannot drift apart in an overlay: a sidecar from the
+      # wrong lineage may have no `pulseaudio` binary and silently mutes every
+      # session (which is exactly what happened for days in 2026-07).
+      QUASAR_PULSE_IMAGE: ${QUASAR_PULSE_IMAGE:-${QUASAR_AGENT_IMAGE:-${QUASAR_NODE_IMAGE:-quasar-node-agent:latest}}}
+      # Tenant app containers need the NVIDIA runtime as well as /dev/dri:
+      # Chromium/EGL otherwise sees the render node but not the driver stack.
+      QUASAR_GPU_NVIDIA: "1"
+      QUASAR_CUDA_DEVICE: ${QUASAR_CUDA_DEVICE:-0}
+      # Which render node is the NVIDIA card. On a box with more than one GPU this
+      # MUST be set explicitly in deploy/.env — renderD128 is not guaranteed to be
+      # the discrete card. A stable /dev/dri/by-path/... selector survives reboots
+      # and PCI reordering; a bare renderDNNN does not.
+      QUASAR_RENDER_NODE: ${QUASAR_RENDER_NODE:-/dev/dri/renderD128}
+      # First-run S1: Wolf-style NVIDIA driver-volume auto-provisioning. On a
+      # host whose NVIDIA install is CUDA-only (no EGL userspace, no 32-bit GL —
+      # the #462 chain), the agent downloads the .run installer matching the
+      # LOADED kernel module, extracts (never installs) its userspace into
+      # quasar-nvidia-driver, and points its own and the app containers'
+      # EGL/Vulkan/loader discovery at it. A host with a working graphics driver
+      # never provisions — CDI injection wins and the volume stays empty and
+      # inert. Set to 0 to keep the manual (copy-a-dnf-line) remediation path
+      # instead; see docs/configuration.md.
+      QUASAR_NVIDIA_DRIVER_VOLUME: ${QUASAR_NVIDIA_DRIVER_VOLUME:-1}
+      # #545: the CUDA half of the same volume. The agent fetches the pinned
+      # NVIDIA NVRTC redistributable into <volume>/cuda/lib64 at launch, which
+      # is what registers cudaconvert/cudaconvertscale/cudascale/cudacompositor
+      # — i.e. the per-session NVENC fallback. Set to 0 to keep this host on
+      # Vulkan-only encode with no download; QUASAR_CUDA_RUNTIME_DIR=<dir> stages
+      # the libraries from a local directory instead (air-gapped hosts). Both are
+      # documented in docs/configuration.md.
+      QUASAR_CUDA_RUNTIME: ${QUASAR_CUDA_RUNTIME:-1}
+      # The dynamic loader latches LD_LIBRARY_PATH at execve, so it CANNOT be
+      # set by the agent process at runtime — it has to be here, and it has to be
+      # unconditional. That is safe: a directory that does not exist (or is
+      # empty) in LD_LIBRARY_PATH is inert — the loader simply finds nothing
+      # there and falls through to its normal search. On a healthy host these
+      # entries therefore change nothing. The image itself sets no
+      # LD_LIBRARY_PATH, so nothing is being overwritten; the trailing
+      # ${LD_LIBRARY_PATH:-} preserves an operator-set value from .env.
+      #
+      # BOTH halves of the volume are listed: lib64 is the driver userspace,
+      # cuda/lib64 is the runtime-provisioned NVRTC. Adding the second is what
+      # lets the loader find libnvrtc.so at plugin-registration time; the agent
+      # warns (token="cudart-ld-library-path-missing") if it is absent, because
+      # the symptom otherwise is mystifying — the library is visibly there and
+      # cudaconvert still does not register.
+      LD_LIBRARY_PATH: /opt/quasar/nvidia-driver/lib64:/opt/quasar/nvidia-driver/cuda/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
+      # #496 F7: GStreamer's `va` plugin probes every /dev/dri render node at
+      # registry-scan time (agent startup, and after any registry rescan) —
+      # on this NVIDIA-only lineage that node backs no VA-API driver, so
+      # libva prints its own "vaGetDriverName() failed with unknown libva
+      # error, driver_name = (null)" noise to stderr on every scan. It reads
+      # as a failure but nothing here ever selects the `va` encoder path
+      # (the auto-detect picks vulkan on NVIDIA; opt-outs use nvenc). Scoped to THIS
+      # overlay only — AMD/Intel hosts keep libva's default messaging level
+      # so a real VA problem there still surfaces.
+      LIBVA_MESSAGING_LEVEL: "0"
+    volumes:
+      # The driver volume itself. Mounted UNCONDITIONALLY and read-write: empty
+      # on a normal host (inert — nothing reads it), and the agent's own write
+      # target when it has to provision. The agent resolves this mount to find
+      # both the volume's name and its host path, which is also how it discovers
+      # that the overlay was applied at all.
+      - quasar-nvidia-driver:/opt/quasar/nvidia-driver
+
+volumes:
+  # No `name:` override (#448 — Compose v5 rejects an empty `name:` outright).
+  quasar-nvidia-driver:

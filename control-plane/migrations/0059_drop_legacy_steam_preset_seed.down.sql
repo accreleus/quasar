@@ -1,0 +1,18 @@
+-- 0059_drop_legacy_steam_preset_seed.down.sql — INTENTIONALLY A NO-OP.
+--
+-- The up migration deletes the 0047 default-Steam-preset seed only when it is
+-- both unedited and unreferenced (#457). Re-creating that row on a rollback
+-- would be WRONG in every direction:
+--
+--   * the row it would recreate is broken on any box that never had the
+--     local-only `quasar-steam:latest` tag — recreating it re-introduces exactly
+--     the defect this migration removed;
+--   * P5 has by then materialized the authoritative managed preset, so a
+--     recreated seed is a duplicate with a colliding name, not a restoration;
+--   * nothing references the deleted row by definition (the up migration refuses
+--     to delete a referenced one), so there is no dangling pointer for a
+--     rollback to repair.
+--
+-- Migrations are forward-only at deploy time (CLAUDE.md); this file exists so
+-- golang-migrate has a version to step down through, not to undo anything.
+SELECT 1;

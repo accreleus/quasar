@@ -1,0 +1,44 @@
+# Opt-in core-dump capture for the node-agent (issue #429).
+#
+# NOT part of any normal stack. Add it explicitly for a crash hunt:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.nvidia.yml \
+#                  -f docker-compose.cores.yml up -d --force-recreate quasar-node-agent
+#
+# and drop the -f again (with another --force-recreate) when the hunt is over.
+#
+# THREE things must all be true or no core is ever written, and every one of
+# them fails SILENTLY on its own:
+#
+#  1. this file's `ulimits: core: -1` — the container's RLIMIT_CORE defaults to
+#     0, so the kernel writes nothing however core_pattern is set;
+#
+#  2. the HOST's /proc/sys/kernel/core_pattern must name a path:
+#       sysctl -w kernel.core_pattern='/cores/core.%e.%p.%t'
+#     An absolute core_pattern is resolved in the CRASHING PROCESS's mount
+#     namespace, not the host's — /cores is this file's bind mount below.
+#     core_pattern is host-GLOBAL; restore it afterwards:
+#       sysctl -w kernel.core_pattern='core'
+#
+#  3. QUASAR_CORE_DIR must be on a REAL filesystem. **The kernel cannot write a
+#     core dump to FUSE.** On an unraid box a repo under /mnt/user is `fuse.shfs`,
+#     and an otherwise perfectly armed capture there produced zero cores — from
+#     three real agent crashes AND from a deliberate `kill -SEGV`, with no error
+#     anywhere. Point QUASAR_CORE_DIR at a backing pool (btrfs/xfs/ext4), not at
+#     a share. Check before trusting a capture:  df -T "$QUASAR_CORE_DIR"
+#
+# Create the host directory first — the kernel silently drops the core if it
+# does not exist:  mkdir -p "$QUASAR_CORE_DIR"
+#
+# Size: NVIDIA device mappings are VM_IO/VM_PFNMAP, which the kernel never
+# dumps, so a core here is roughly the agent's RSS (~0.6-1 GB), not the GPU
+# aperture.
+services:
+  quasar-node-agent:
+    ulimits:
+      core: -1
+    volumes:
+      # No default: the right directory is host-specific (it must be on a real
+      # filesystem, see point 3 above), and silently binding a wrong one produces
+      # an armed capture that writes nothing.
+      - ${QUASAR_CORE_DIR:?Set QUASAR_CORE_DIR to a host dir on a real filesystem (not FUSE)}:/cores

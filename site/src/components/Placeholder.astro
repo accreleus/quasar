@@ -1,0 +1,129 @@
+---
+/**
+ * Screenshot placeholder.
+ *
+ * The product already has a no-artwork visual language: the library's cover
+ * fallback is a gradient panel with the mark blended over it. This is that
+ * pattern promoted to 16:9. It is meant to look like a deliberate technical
+ * surface, not a broken image.
+ *
+ * When a real screenshot exists, pass `src` to <MediaFrame> instead. The frame
+ * is identical either way, so swapping one in changes no layout.
+ *
+ * Every use of this component must be listed in site/SCREENSHOTS.md.
+ */
+interface Props {
+	/** Short uppercase label naming the surface, e.g. "LIBRARY". */
+	label: string;
+	/** One plain sentence under the label. Optional. */
+	sublabel?: string;
+}
+
+const { label, sublabel } = Astro.props;
+---
+
+<div class="q-ph">
+	<div class="q-ph-wash"></div>
+	<div class="q-ph-grid"></div>
+	<svg class="q-ph-mark" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+		<defs>
+			<linearGradient id="qph" x1="0" y1="0" x2="1" y2="1">
+				<stop offset="0" stop-color="#6A45F5"></stop>
+				<stop offset=".5" stop-color="#5B6BFF"></stop>
+				<stop offset="1" stop-color="#00C0FF"></stop>
+			</linearGradient>
+		</defs>
+		<ellipse
+			cx="16"
+			cy="16"
+			rx="14.2"
+			ry="5.4"
+			transform="rotate(-30 16 16)"
+			stroke="url(#qph)"
+			stroke-width="1.6"
+			opacity=".75"></ellipse>
+		<circle cx="16" cy="16" r="6.2" fill="url(#qph)"></circle>
+		<circle cx="16" cy="16" r="2.1" fill="#fff"></circle>
+	</svg>
+	<div class="q-ph-caption">
+		<span class="q-ph-label">{label}</span>
+		{sublabel && <span class="q-ph-sub">{sublabel}</span>}
+	</div>
+</div>
+
+<style>
+	.q-ph {
+		position: relative;
+		aspect-ratio: 16 / 9;
+		border-radius: var(--q-r-lg, 12px);
+		overflow: hidden;
+		background: var(--q-ink-2, oklch(0.163 0.018 268));
+		border: 1px solid var(--q-line-2, rgba(255, 255, 255, 0.12));
+		box-shadow: var(--q-inset-top, inset 0 1px 0 rgba(255, 255, 255, 0.05));
+	}
+
+	.q-ph-wash,
+	.q-ph-grid {
+		position: absolute;
+		inset: 0;
+	}
+
+	.q-ph-wash {
+		background:
+			radial-gradient(120% 140% at 75% -10%, rgba(106, 69, 245, 0.2), transparent 55%),
+			radial-gradient(90% 120% at -5% 105%, rgba(0, 192, 255, 0.1), transparent 55%);
+	}
+
+	.q-ph-grid {
+		background-image: radial-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px);
+		background-size: 22px 22px;
+	}
+
+	.q-ph-mark {
+		position: absolute;
+		inset: 0;
+		margin: auto;
+		width: 64px;
+		height: 64px;
+		opacity: 0.5;
+	}
+
+	.q-ph-caption {
+		position: absolute;
+		inset-inline-start: 16px;
+		inset-block-end: 16px;
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+
+	.q-ph-label {
+		font-family: var(--q-font-mono, ui-monospace, monospace);
+		font-weight: 500;
+		font-size: 0.6875rem;
+		text-transform: uppercase;
+		letter-spacing: 0.14em;
+		color: var(--q-text-3, oklch(0.6605 0.0265 259.81));
+	}
+
+	.q-ph-sub {
+		font-family: var(--q-font-ui, sans-serif);
+		font-size: 0.8125rem;
+		color: var(--q-text-4, oklch(0.56 0.024 259));
+	}
+
+	/* Light mode gets a flatter wash rather than an invented light gradient. */
+	:global([data-theme='light']) .q-ph {
+		background: #ffffff;
+	}
+
+	:global([data-theme='light']) .q-ph-wash {
+		background:
+			radial-gradient(120% 140% at 75% -10%, rgba(106, 69, 245, 0.12), transparent 55%),
+			radial-gradient(90% 120% at -5% 105%, rgba(0, 192, 255, 0.07), transparent 55%);
+	}
+
+	:global([data-theme='light']) .q-ph-grid {
+		background-image: radial-gradient(rgba(18, 20, 40, 0.07) 1px, transparent 1px);
+	}
+</style>

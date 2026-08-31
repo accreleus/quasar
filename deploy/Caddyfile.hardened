@@ -1,0 +1,32 @@
+{
+  admin off
+  auto_https disable_redirects
+}
+
+{$QUASAR_PUBLIC_HOST:localhost} {
+  tls {$QUASAR_TLS_CERT:/certs/fullchain.pem} {$QUASAR_TLS_KEY:/certs/privkey.pem}
+  encode zstd gzip
+  header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+  reverse_proxy quasar-control-plane:8080 {
+    # #438: OVERWRITE X-Forwarded-For with the address Caddy actually saw, so a
+    # client-supplied value can never survive into the chain. Caddy's built-in
+    # behaviour is to APPEND, which the control plane's right-to-left walk also
+    # handles correctly — but this edge terminates the public internet, there is
+    # no upstream proxy whose chain is worth preserving, and overwriting means
+    # the rate limiters cannot be misled even if that walk is ever changed.
+    #
+    # X-Forwarded-For is the ONLY forwarded address header this deployment
+    # sends. X-Real-IP is deliberately not set, and the control plane never
+    # reads it (internal/ratelimit.ClientIP).
+    #
+    # Rate limiting stays per-proxy (one shared budget for everyone) until
+    # QUASAR_TRUSTED_PROXIES names this container's network — see
+    # docs/configuration.md and docker-compose.hardened.yml.
+    header_up X-Forwarded-For {remote_host}
+    header_up -X-Real-IP
+  }
+  log {
+    output stdout
+    format json
+  }
+}

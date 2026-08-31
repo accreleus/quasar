@@ -1,0 +1,34 @@
+# Opt-in overlay: adopt pre-existing named volumes under different names.
+#
+# Apply this ONLY when a stack is migrating off a forked compose file (its
+# volumes were named e.g. quasar-nv-postgres-data instead of this repo's
+# quasar-postgres-data) and must keep its data instead of starting against an
+# empty database. A normal deploy — new or upgrading in place on the base file
+# — never needs this: leave it out and Compose names volumes
+# <project>_<key> as usual.
+#
+# All three variables below are REQUIRED once this overlay is applied — each
+# uses Compose's `:?` required-variable syntax, so an unset one fails `up`
+# immediately with a message naming it, rather than silently pinning only two
+# of the three. Get the exact current names from scripts/dev/migrate-compose-volumes.sh
+# (it inspects `docker volume ls` and prints the values below ready to paste).
+#
+#   scripts/dev/migrate-compose-volumes.sh
+#   # then, with those values in deploy/.env:
+#   docker compose -f deploy/docker-compose.yml \
+#                  -f deploy/overlays/docker-compose.adopt-volumes.yml up -d
+#
+# (Docker's #448: this used to be a `name: ${VAR:-}` default in the base
+# file's volumes block, but Compose v5 rejects an empty `name:` at `up` —
+# "invalid volume name or ID: value is empty" — for EVERY service, since the
+# volume is a project-level definition. `docker compose config` silently
+# drops the empty key instead of erroring, so it never caught this. Splitting
+# the override into its own opt-in overlay means the base file carries no
+# `name:` at all, so a normal deploy is unaffected by Compose version.)
+volumes:
+  quasar-postgres-data:
+    name: ${QUASAR_POSTGRES_VOLUME:?set to the existing postgres volume name, see scripts/dev/migrate-compose-volumes.sh}
+  quasar-agent-data:
+    name: ${QUASAR_AGENT_VOLUME:?set to the existing agent volume name, see scripts/dev/migrate-compose-volumes.sh}
+  quasar-control-tls:
+    name: ${QUASAR_CONTROL_VOLUME:?set to the existing control-tls volume name, see scripts/dev/migrate-compose-volumes.sh}

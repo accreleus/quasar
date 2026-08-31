@@ -1,0 +1,49 @@
+# Dockerfile.control — multi-stage build for the Quasar control-plane.
+#
+# Stage 1: compile the Go binary with the official golang image.
+# Stage 2: minimal Debian runtime (no Go toolchain, no build deps).
+#
+# Build from the repo root (the COPY paths are relative to the build context):
+#   docker build -f deploy/Dockerfile.control -t quasar-control-plane:latest .
+#
+# The control-plane self-migrates on startup (embedded golang-migrate FS).
+# No separate migration runner is needed in the image.
+
+# ── Build stage ───────────────────────────────────────────────────────────────
+FROM golang:1.24-alpine AS builder
+
+WORKDIR /src
+
+# Cache module download separately from the compile step.
+COPY control-plane/go.mod control-plane/go.sum ./
+RUN go mod download
+
+COPY control-plane/ .
+# CGO_ENABLED=0 → fully static binary (no libc deps in the runtime image).
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath -ldflags="-s -w" \
+    -o /quasar-control ./cmd/quasar-control
+
+# ── Runtime stage ─────────────────────────────────────────────────────────────
+FROM debian:bookworm-slim
+
+# ca-certificates: needed for TLS outbound (DB connections, future HTTPS).
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates wget && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /quasar-control /usr/local/bin/quasar-control
+
+# Parity with Dockerfile.control.prod: the dev-agent-auth key file (#399) lives
+# at /run/quasar/dev-agent-key. This image runs as ROOT, so the control plane
+# could create the directory itself at boot — the explicit mkdir just keeps the
+# two images' filesystem contract identical, which is what `make agent-creds`
+# and the docs describe.
+RUN mkdir -p /run/quasar && chmod 0700 /run/quasar
+
+# The SPA is mounted at runtime via QUASAR_WEB_ROOT (see docker-compose.yml).
+# Nothing to COPY here — the SPA is built separately with `pnpm build`.
+
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/quasar-control"]

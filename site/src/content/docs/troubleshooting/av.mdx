@@ -1,0 +1,108 @@
+---
+title: Picture, sound and input
+description: Black screens, silence, mouse and keyboard problems, and the Escape key.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Black screen, session says running
+
+The server marks a session running once the pipeline is up and media is being
+sent. It does not know whether your browser could decode any of it.
+
+**Check the browser can decode what was sent.** Open the session detail in Admin,
+Sessions and look at the resolved codec. Quasar gates codecs on a decode
+measurement taken at login, so this should not happen, but a stale measurement
+can produce it. Log out and back in on that device to re-measure.
+
+**Check the app actually started.** A container that exits immediately leaves you
+looking at a bare compositor. Session detail carries the exit reason. See
+[Launching a game](/quasar/troubleshooting/launching/).
+
+**Check the host frame rate.** In the session detail. Zero means nothing is being
+produced and the problem is host-side, not client-side.
+
+## The picture is corrupt or full of artefacts
+
+**Packet loss.** Look at the loss series in the session detail. If it is rising,
+the network is the problem, not the encoder.
+
+**A Vulkan host with HEVC armed.** If one frame in four is black or torn, the
+compositor's encode ring depth is wrong. Arming `QUASAR_VULKAN_HEVC=1` pins it
+correctly. If you overrode the ring depth by hand, undo that.
+
+## No sound
+
+**Check the session detail** for degraded audio and the reason it gives.
+
+**Check the audio sidecar image matches the agent image lineage.** A mismatched
+image can be missing the PulseAudio binary entirely, and the session then runs
+silently with only a warning logged. This has muted a whole host for days.
+
+**Make failures loud** so it does not happen again:
+
+```bash
+QUASAR_AUDIO_REQUIRED=1
+```
+
+The session then fails rather than degrading to silence.
+
+**Sound in some apps and not others** is the application picking a different
+output device. That is inside the container and is the app's own configuration.
+
+## The microphone toggle is missing or does nothing
+
+Missing: the instance setting is off. Admin, Settings.
+
+Present but nothing happens: browser permission was denied, or the page is not on
+HTTPS. Microphone capture needs a secure context.
+
+A live microphone always shows an indicator that cannot be hidden. If you cannot
+see the indicator, it is not capturing.
+
+## The mouse does not move, or moves wrongly
+
+**Capture input first.** Until you do, the mouse belongs to the browser. The
+drawer's first item is the capture toggle.
+
+**Check `/dev/uinput`** on the host is present and writable by the agent. Read
+access succeeds even on a broken setup, which makes this easy to misdiagnose. The
+host readiness check tests writing.
+
+**Pointer offset in a desktop session** was a compositor focus problem that has
+been fixed. If you see it, you are on an older version.
+
+## Escape leaves fullscreen instead of reaching the game
+
+Escape needs three things at once: a Chromium-based browser, fullscreen, and a
+secure context.
+
+The drawer tells you which one is missing. In practice it is almost always HTTPS.
+
+## Keyboard input goes to the browser
+
+Capture input. Without capture, the browser keeps the keyboard.
+
+If capture is on and keys still do not reach the game, check `/dev/uinput` as
+above.
+
+## Controllers not detected
+
+Press a button first. Browsers do not reveal a gamepad until it sends input.
+
+Then HTTPS, then `/dev/uinput`.
+
+## Touch input on a tablet
+
+Touch is forwarded. The session drawer is reached with an on-screen button rather
+than the keyboard chord, because there is no keyboard.
+
+Whether a given game is playable by touch is a separate question and usually the
+answer is no without a controller.
+
+<Aside type="note" title="Frame drop counters in a hidden tab are meaningless">
+A backgrounded or occluded browser tab throttles presentation and inflates
+dropped-frame counts that have nothing to do with the stream. Judge picture
+problems from a visible tab, and judge delivery from the host-side numbers in the
+session detail.
+</Aside>

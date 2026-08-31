@@ -1,0 +1,45 @@
+"AppState"
+{
+	"appid"		"517710"
+	"Universe"		"1"
+	"name"		"Redout: Enhanced Edition"
+	"StateFlags"		"4"
+	"installdir"		"Redout"
+	"LastUpdated"		"1784368872"
+	"LastPlayed"		"1785296713"
+	"SizeOnDisk"		"4895251090"
+	"StagingSize"		"0"
+	"buildid"		"10049559"
+	"LastOwner"		"76561190000000000"
+	"DownloadType"		"3"
+	"UpdateResult"		"0"
+	"BytesToDownload"		"86442000"
+	"BytesDownloaded"		"86442000"
+	"BytesToStage"		"91941000"
+	"BytesStaged"		"91941000"
+	"TargetBuildID"		"0"
+	"AutoUpdateBehavior"		"0"
+	"AllowOtherDownloadsWhileRunning"		"0"
+	"ScheduledAutoUpdate"		"0"
+	"InstalledDepots"
+	{
+		"517711"
+		{
+			"manifest"		"8693019661519667711"
+			"size"		"4895251090"
+		}
+	}
+	"SharedDepots"
+	{
+		"228988"		"228980"
+		"228990"		"228980"
+	}
+	"UserConfig"
+	{
+		"language"		"english"
+	}
+	"MountedConfig"
+	{
+		"language"		"english"
+	}
+}

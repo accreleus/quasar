@@ -1,0 +1,249 @@
+# vulkan-enc-output-state-on-resize.patch
+#
+# What: makes vulkanh264enc and vulkanh265enc refresh their SRC CAPS (and their
+# coded extent, driver-limit check and DPB pool) when a mid-stream input size
+# change re-runs new_sequence(), plus one defensive line in the shared encoder
+# library that makes the resulting session restart fail-safe. Three files:
+# ext/vulkan/vkh264enc.c, ext/vulkan/vkh265enc.c and
+# gst-libs/gst/vulkan/gstvkencoder-private.c. Applies NINTH (last), after
+# vulkanav1enc.patch.
+#
+# Why: with a live scaler in front of the encoder (accreleus/quasar#501's
+# `vulkanscale`, a gst-wayland-display-fork element that rescales
+# memory:VulkanImage frames on the GPU), a downstream capsfilter write changes
+# the encoder's sink caps mid-stream. GstVideoEncoder then calls set_format(),
+# the base class sets need_configure, and gst_h26x_encoder_configure() runs
+# negotiate() -> new_sequence() -> new_parameters().
+#
+# Both element new_sequence() implementations early-returned when the *profile*
+# was unchanged -- which a pure resolution change always is. That early return
+# skipped everything size-derived:
+#
+#   * vulkanh264enc: self->in_state was refreshed only in the tail of the
+#     function, so new_parameters() -- which builds the src caps width/height
+#     from self->in_state->info -- kept publishing the LAUNCH size. The level
+#     was re-derived correctly (it comes from the base class's freshly
+#     initialised SPS), so downstream saw caps like
+#     "level=3.2, width=1920, height=1080" for a 1280x720 stream. gsth264parse.c
+#     lets upstream caps override the SPS it parses, so the lie propagated: the
+#     bitstream carried the new resolution and the caps did not.
+#   * vulkanh265enc: in_state was already hoisted above the early return (for a
+#     colorimetry-only change), but self->coded_width/coded_height were not --
+#     so the caps followed the new size while the emitted SPS
+#     pic_width_in_luma_samples / pic_height_in_luma_samples, and the
+#     GstVideoInfo handed to gst_vulkan_encoder_encode(), stayed at the launch
+#     size. Same class of defect, opposite half.
+#
+#   * In both cases the vulkan video session and its DPB pool were also left at
+#     the launch size (gst_vulkan_encoder_create_dpb_pool() early-returns TRUE
+#     when a pool already exists), so a step back UP to a larger size would have
+#     encoded into undersized DPB images.
+#
+# Fix: key the early return on the input size as well as the profile, so a
+# coded-size change takes the same path a profile change takes -- stop and
+# restart the vulkan session. gst_vulkan_encoder_stop() clears the DPB pool, so
+# the restart re-runs the whole first-start path: the coded-extent driver-limit
+# check, the coded_width/coded_height recompute, the DPB pool creation at the
+# new size, and (through the new_parameters() call the base class makes right
+# after) gst_video_encoder_set_output_state() with the new width/height and the
+# re-derived level/profile caps. vulkanh264enc additionally hoists its in_state
+# refresh above the early return, matching vulkanh265enc, so a renegotiation
+# that keeps the resolution (framerate, colorimetry) also updates the state the
+# encode path reads.
+#
+# Library half: gst_vulkan_encoder_stop() now wipes priv->slots[]. That table
+# holds BORROWED pointers to pictures whose DPB images come from the pool the
+# same function destroys. The h26x/AV1 base classes drain before they
+# reconfigure, so every picture should already have gone through
+# gst_vulkan_encoder_picture_clear() (which is what NULLs its slot); the wipe
+# only matters if one survived, in which case it would otherwise keep a slot
+# index occupied across the restart and hand the new video session a reference
+# backed by an image from the destroyed pool (device-lost). It owns nothing, so
+# it frees nothing and leaks nothing. Codec-neutral, so it also covers
+# vulkanav1enc, whose restart path this patch does not otherwise touch.
+#
+# Note (pre-existing upstream quirk, unchanged by this patch): the profile half
+# of both early-return tests is DEAD. self->profile is assigned from the freshly
+# computed chroma subsampling / bit depths / std profile idc in the block
+# immediately above, so the comparison compares those values with themselves and
+# is always true. The restart is therefore keyed on the input size alone, and a
+# mid-stream bit-depth or chroma-subsampling change still would not restart the
+# session. Fixing that is a separate concern and is deliberately out of scope
+# here: it is not reachable from the #501 lever, which only ever changes W x H.
+#
+# This makes both elements behave like the sibling vulkanav1enc element added by
+# vulkanav1enc.patch, which already keys its early return on the input size
+# ("trap 6") and publishes its output state on both paths. vulkanav1enc
+# therefore needs NO change and is deliberately not touched by this patch --
+# verified live, see below.
+#
+# Evidence (quasar-devbox, RTX 5090, NVIDIA 610.57.04, rebuilt libgstvulkan.so
+# mounted over the image's, probe pipeline
+#   videotestsrc NV12 1080p60 ! videoscale ! capsfilter(name=sizefilter)
+#     ! vulkanupload ! <enc> ! <parse> ! fakesink
+# with the capsfilter flipped 1920x1080 -> 1280x720 -> 1920x1080 at frames
+# 90/180 and caps probes on the encoder src pad and the parser src pad):
+#
+#   vulkanh264enc BEFORE: frame 90 request 1280x720 -> enc:src and parse:src
+#     both "level=3.2, width=1920, height=1080" (level followed, size did not).
+#   vulkanh264enc AFTER:  frame 90 -> "level=3.2, width=1280, height=720";
+#     frame 180 back up -> "level=4.2, width=1920, height=1080". 270 frames, no
+#     bus error, both directions.
+#   vulkanav1enc (unpatched): already correct in both directions -- confirms it
+#     needs no change.
+#   vulkanh265enc: COMPILE-PROVEN ONLY. The element fails to start on this host
+#     with "Video profile format not supported ...
+#     vkGetPhysicalDeviceVideoCapabilitiesKHR" (pre-existing on driver
+#     610.57.04, unrelated to this patch), so its runtime behaviour is unverified.
+#
+# Authored against: GStreamer 1.28.4 with the eight earlier patches in
+# deploy/patches/vulkan/ applied in order (it shares new_sequence() with the
+# dpb-pool, rc-fix, num-slices and intra-refresh patches for h264 and with the
+# vulkanh265enc patch for h265). Regenerate against every GStreamer re-pin.
+#
+# Upstream status: unreported as of 2026-08-22. Both fixes are upstreamable as
+# written (no Quasar-specific behaviour); the offer target is the same bundle as
+# vulkanav1enc.patch (games-on-whales/gst-wayland-display patches/), gated on
+# operator sign-off.
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
+index 3115a97..f7b003c 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
++++ b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
+@@ -722,6 +722,7 @@ gst_vulkan_h264_encoder_new_sequence (GstH264Encoder * encoder,
+   GstVulkanVideoCapabilities vk_caps;
+   VkVideoEncodeH264CapabilitiesKHR *vk_h264_caps;
+   GstVulkanEncoderQualityProperties quality_props;
++  gboolean size_changed;
+ 
+   if (!self->encoder) {
+     GST_ELEMENT_ERROR (self, RESOURCE, NOT_FOUND,
+@@ -773,8 +774,41 @@ gst_vulkan_h264_encoder_new_sequence (GstH264Encoder * encoder,
+     /* *INDENT-ON* */
+   }
+ 
++  /* PATCH (output-state-on-resize): a mid-stream input size change reaches this
++   * vfunc with an UNCHANGED profile, so the same-profile early-return below used
++   * to keep the launch-size session alive: self->coded_width/height were never
++   * recomputed, the driver coded-extent limits were never re-checked, and the
++   * DPB pool kept its launch-size images. gst_h264_encoder_configure() calls
++   * new_parameters() immediately after this vfunc, and new_parameters() builds
++   * the src caps width/height from self->in_state -- so downstream caps stayed
++   * at the launch size while the emitted SPS carried the new one, and
++   * gsth264parse.c lets upstream caps override the SPS, making downstream caps
++   * lie about the resolution.
++   *
++   * Treating a coded-size change like a profile change (stop + restart the
++   * vulkan session) re-runs the whole first-start path, which is what
++   * re-derives the coded extent, re-creates the DPB pool at the new size, and
++   * -- through new_parameters() -- re-runs gst_video_encoder_set_output_state()
++   * with the new width/height and the re-derived level/profile caps. This
++   * mirrors what the sibling vulkanav1enc element already does ("trap 6": AV1
++   * session parameters cannot be updated, so it keys its early-return on the
++   * input size and not only on the profile). */
++  size_changed = (self->in_state == NULL)
++      || GST_VIDEO_INFO_WIDTH (&self->in_state->info) !=
++      GST_VIDEO_INFO_WIDTH (in_info)
++      || GST_VIDEO_INFO_HEIGHT (&self->in_state->info) !=
++      GST_VIDEO_INFO_HEIGHT (in_info);
++
++  /* Refresh in_state BEFORE the early-return below, so a renegotiation that
++   * keeps the resolution (framerate, colorimetry) still updates the state the
++   * encode path and new_parameters() read. */
++  if (self->in_state)
++    gst_video_codec_state_unref (self->in_state);
++  self->in_state = gst_video_codec_state_ref (in_state);
++
+   if (gst_vulkan_encoder_is_started (self->encoder)) {
+-    if (self->profile.profile.chromaSubsampling == chroma_subsampling
++    if (!size_changed
++        && self->profile.profile.chromaSubsampling == chroma_subsampling
+         && self->profile.profile.chromaBitDepth == bit_depth_chroma
+         && self->profile.profile.lumaBitDepth == bit_depth_luma
+         && self->profile.codec.h264enc.stdProfileIdc == vk_profile) {
+@@ -1006,9 +1040,8 @@ gst_vulkan_h264_encoder_new_sequence (GstH264Encoder * encoder,
+     gst_h264_encoder_set_preferred_output_delay (encoder, 4);
+   }
+ 
+-  if (self->in_state)
+-    gst_video_codec_state_unref (self->in_state);
+-  self->in_state = gst_video_codec_state_ref (in_state);
++  /* (in_state refresh hoisted above the early-return -- see the
++   * output-state-on-resize note there.) */
+ 
+   self->coded_width = GST_ROUND_UP_N (GST_VIDEO_INFO_WIDTH (in_info),
+       vk_caps.encoder.caps.encodeInputPictureGranularity.width);
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
+index 8c8367f..16832ab 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
++++ b/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
+@@ -841,6 +841,7 @@ gst_vulkan_h265_encoder_new_sequence (GstH265Encoder * encoder,
+   GstVulkanVideoCapabilities vk_caps;
+   VkVideoEncodeH265CapabilitiesKHR *vk_h265_caps;
+   GstVulkanEncoderQualityProperties quality_props;
++  gboolean size_changed;
+ 
+   if (!self->encoder) {
+     GST_ELEMENT_ERROR (self, RESOURCE, NOT_FOUND,
+@@ -892,6 +893,31 @@ gst_vulkan_h265_encoder_new_sequence (GstH265Encoder * encoder,
+     /* *INDENT-ON* */
+   }
+ 
++  /* PATCH (output-state-on-resize): a mid-stream input size change reaches this
++   * vfunc with an UNCHANGED profile, so the same-profile early-return below used
++   * to keep the launch-size session alive: self->coded_width/height were never
++   * recomputed, the driver coded-extent limits were never re-checked, and the
++   * DPB pool kept its launch-size images. gst_h265_encoder_configure() calls
++   * new_parameters() immediately after this vfunc, and new_parameters() builds
++   * the src caps width/height from self->in_state -- so downstream caps stayed
++   * at the launch size while the emitted SPS carried the new one, and
++   * gsth265parse.c lets upstream caps override the SPS, making downstream caps
++   * lie about the resolution.
++   *
++   * Treating a coded-size change like a profile change (stop + restart the
++   * vulkan session) re-runs the whole first-start path, which is what
++   * re-derives the coded extent, re-creates the DPB pool at the new size, and
++   * -- through new_parameters() -- re-runs gst_video_encoder_set_output_state()
++   * with the new width/height and the re-derived level/profile caps. This
++   * mirrors what the sibling vulkanav1enc element already does ("trap 6": AV1
++   * session parameters cannot be updated, so it keys its early-return on the
++   * input size and not only on the profile). */
++  size_changed = (self->in_state == NULL)
++      || GST_VIDEO_INFO_WIDTH (&self->in_state->info) !=
++      GST_VIDEO_INFO_WIDTH (in_info)
++      || GST_VIDEO_INFO_HEIGHT (&self->in_state->info) !=
++      GST_VIDEO_INFO_HEIGHT (in_info);
++
+   /* Refresh in_state up-front, BEFORE the same-profile early-return below, so a
+    * colorimetry-only mid-stream change (dynamic SDR<->HDR: bt709 <-> bt2100-pq, plus
+    * the mastering/CLL caps fields) updates the source the VUI + HDR SEI are built from
+@@ -903,7 +929,8 @@ gst_vulkan_h265_encoder_new_sequence (GstH265Encoder * encoder,
+   self->in_state = gst_video_codec_state_ref (in_state);
+ 
+   if (gst_vulkan_encoder_is_started (self->encoder)) {
+-    if (self->profile.profile.chromaSubsampling == chroma_subsampling
++    if (!size_changed
++        && self->profile.profile.chromaSubsampling == chroma_subsampling
+         && self->profile.profile.chromaBitDepth == bit_depth_chroma
+         && self->profile.profile.lumaBitDepth == bit_depth_luma
+         && self->profile.codec.h265enc.stdProfileIdc == vk_profile) {
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
+index 13705f5..26bde60 100644
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
+@@ -467,6 +467,16 @@ gst_vulkan_encoder_stop (GstVulkanEncoder * self)
+   gst_clear_buffer (&priv->layered_buffer);
+   gst_clear_object (&priv->dpb_pool);
+ 
++  /* PATCH (output-state-on-resize): priv->slots[] holds BORROWED pointers to
++   * pictures whose DPB images come from the pool just destroyed above. Every
++   * picture should already have been released through
++   * gst_vulkan_encoder_picture_clear() (the h26x/AV1 base classes drain before
++   * they reconfigure), but a survivor would keep its slot index occupied
++   * across the restart and hand the new video session a reference backed by an
++   * image from the destroyed pool. Wipe the table so a restart is fail-safe:
++   * the slots are not owned here, so this frees nothing and leaks nothing. */
++  memset (priv->slots, 0, sizeof (priv->slots));
++
+   gst_clear_object (&priv->exec);
+ 
+   priv->started = FALSE;

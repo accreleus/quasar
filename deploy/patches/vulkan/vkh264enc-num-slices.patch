@@ -1,0 +1,250 @@
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
+index 1f0bf06..4892e64 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
++++ b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
+@@ -36,12 +36,6 @@
+  * Since: 1.28
+  */
+ 
+-/*
+- * TODO:
+- *
+- * + support multi-slices
+- */
+-
+ /**
+  * GstVulkanEncoderRateControlMode:
+  *
+@@ -79,11 +73,18 @@ enum
+   PROP_QP_B,
+   PROP_MAX_QP,
+   PROP_MIN_QP,
++  PROP_NUM_SLICES,
+   N_PROPERTIES
+ };
+ 
+ static GParamSpec *properties[N_PROPERTIES];
+ 
++/* Upper bound on the per-frame slice-info arrays carried in the frame struct.
++ * The runtime num-slices property is additionally clamped to the driver's
++ * VkVideoEncodeH264CapabilitiesKHR.maxSliceCount and to the number of MB rows
++ * in _setup_slice. 1080p is 68 MB rows; 128 covers a slice-per-MB-row past 4K. */
++#define GST_VULKAN_H264_MAX_SLICES 128
++
+ struct _GstVulkanH264Encoder
+ {
+   /*< private > */
+@@ -124,6 +125,7 @@ struct _GstVulkanH264Encoder
+     guint32 qp_b;
+     guint32 max_qp;
+     guint32 min_qp;
++    guint num_slices;
+   } prop;
+ 
+   gboolean update_props;
+@@ -141,6 +143,10 @@ struct _GstVulkanH264Encoder
+     guint32 qp_p;
+     guint32 qp_b;
+   } rc;
++
++  /* Driver VkVideoEncodeH264CapabilitiesKHR.maxSliceCount, cached in
++   * new_sequence so the per-frame slice split can clamp to it. 0 until known. */
++  guint max_slice_count;
+ };
+ 
+ struct _GstVulkanH264EncoderClass
+@@ -159,8 +165,11 @@ struct _GstVulkanH264EncoderFrame
+   VkVideoEncodeH264RateControlLayerInfoKHR vkrc_layer_info;
+ 
+   /* StdVideoEncodeH264WeightTable slice_wt; *//* UNUSED */
+-  StdVideoEncodeH264SliceHeader slice_hdr;
+-  VkVideoEncodeH264NaluSliceInfoKHR vkslice_info;
++  /* Multi-slice: one slice header + nalu-slice-info entry per slice. The used
++   * count is num_slices (filled in _setup_slice, read in _setup_codec_pic). */
++  StdVideoEncodeH264SliceHeader slice_hdr[GST_VULKAN_H264_MAX_SLICES];
++  VkVideoEncodeH264NaluSliceInfoKHR vkslice_info[GST_VULKAN_H264_MAX_SLICES];
++  guint32 num_slices;
+ 
+   StdVideoEncodeH264PictureInfo h264pic_info;
+   VkVideoEncodeH264PictureInfoKHR vkh264pic_info;
+@@ -784,6 +793,22 @@ gst_vulkan_h264_encoder_new_sequence (GstH264Encoder * encoder,
+   gst_vulkan_encoder_caps (self->encoder, &vk_caps);
+   vk_h264_caps = &vk_caps.encoder.codec.h264;
+ 
++  /* Cache the driver's max slice count so the per-frame slice split (_setup_slice)
++   * can clamp num-slices to it; warn if the requested value exceeds it. */
++  self->max_slice_count = vk_h264_caps->maxSliceCount;
++  {
++    guint req_slices;
++    GST_OBJECT_LOCK (self);
++    req_slices = self->prop.num_slices;
++    GST_OBJECT_UNLOCK (self);
++    GST_INFO_OBJECT (self, "driver maxSliceCount=%u, requested num-slices=%u",
++        self->max_slice_count, req_slices);
++    if (self->max_slice_count > 0 && req_slices > self->max_slice_count)
++      GST_WARNING_OBJECT (self, "num-slices=%u exceeds driver maxSliceCount=%u; "
++          "clamping to %u", req_slices, self->max_slice_count,
++          self->max_slice_count);
++  }
++
+   GST_LOG_OBJECT (self, "H264 encoder capabilities:\n"
+       "    Standard capability flags:\n"
+       "        separate_color_plane: %i\n"
+@@ -1370,8 +1395,8 @@ _setup_codec_pic (GstVulkanEncoderPicture * pic, VkVideoEncodeInfoKHR * info,
+   vk_frame->vkh264pic_info = (VkVideoEncodeH264PictureInfoKHR) {
+     .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_PICTURE_INFO_KHR,
+     .pNext = NULL,
+-    .naluSliceEntryCount = 1,
+-    .pNaluSliceEntries = &vk_frame->vkslice_info, /* filled in _setup_slice() */
++    .naluSliceEntryCount = vk_frame->num_slices, /* filled in _setup_slice() */
++    .pNaluSliceEntries = vk_frame->vkslice_info, /* filled in _setup_slice() */
+     .pStdPictureInfo = &vk_frame->h264pic_info,   /* filled in encode_frame() */
+     .generatePrefixNalu = VK_FALSE,
+   };
+@@ -1492,36 +1517,65 @@ _setup_slice (GstVulkanH264Encoder * self, GstH264EncoderFrame * h264_frame,
+ {
+   GstVulkanH264EncoderFrame *vk_frame = _GET_FRAME (h264_frame);
+   GstH264SliceType slice_type = h264_frame->type.slice_type;
++  gint32 constant_qp = slice_type == GST_H264_P_SLICE ? self->rc.qp_p :
++      slice_type == GST_H264_B_SLICE ? self->rc.qp_b : self->rc.qp_i;
++  gint32 qp_delta = constant_qp -
++      (self->params.pps.pic_init_qp_minus26 + 26);
++  guint mb_width, mb_height, num_slices, i;
++  guint requested;
+ 
+-  /* *INDENT-OFF* */
+-  vk_frame->slice_hdr = (StdVideoEncodeH264SliceHeader) {
+-    .flags = (StdVideoEncodeH264SliceHeaderFlags) {
+-      .direct_spatial_mv_pred_flag = slice_hdr->direct_spatial_mv_pred_flag,
+-      .num_ref_idx_active_override_flag =
+-          slice_hdr->num_ref_idx_active_override_flag,
+-    },
+-    .first_mb_in_slice = slice_hdr->first_mb_in_slice, /* 0 */
+-    .slice_type = gst_vulkan_h264_slice_type(h264_frame->type.slice_type),
+-    .cabac_init_idc = slice_hdr->cabac_init_idc,
+-    .disable_deblocking_filter_idc = slice_hdr->disable_deblocking_filter_idc,
+-    .slice_qp_delta = slice_hdr->slice_qp_delta,
+-    .slice_alpha_c0_offset_div2 = slice_hdr->slice_alpha_c0_offset_div2,
+-    .slice_beta_offset_div2 = slice_hdr->slice_beta_offset_div2,
+-    .pWeightTable = NULL,
+-  };
++  /* H.264 slices are macroblock-row aligned; coded_{width,height} are already
++   * rounded up to the MB granularity in new_sequence. */
++  mb_width = MAX (1, self->coded_width / 16);
++  mb_height = MAX (1, self->coded_height / 16);
+ 
+-  vk_frame->vkslice_info = (VkVideoEncodeH264NaluSliceInfoKHR) {
+-    .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_NALU_SLICE_INFO_KHR,
+-    .pNext = NULL,
+-    .constantQp = slice_type == GST_H264_P_SLICE ? self->rc.qp_p :
+-        slice_type == GST_H264_B_SLICE ? self->rc.qp_b :
+-        self->rc.qp_i,
+-    .pStdSliceHeader = &vk_frame->slice_hdr,
+-  };
+-  /* *INDENT-ON* */
++  GST_OBJECT_LOCK (self);
++  requested = MAX (1, self->prop.num_slices);
++  GST_OBJECT_UNLOCK (self);
+ 
+-  vk_frame->slice_hdr.slice_qp_delta = vk_frame->vkslice_info.constantQp -
+-      (self->params.pps.pic_init_qp_minus26 + 26);
++  /* Clamp: never more slices than MB rows (each slice needs >=1 whole row), the
++   * driver's cap, or the frame-struct array bound. */
++  num_slices = MIN (requested, mb_height);
++  if (self->max_slice_count > 0)
++    num_slices = MIN (num_slices, self->max_slice_count);
++  num_slices = MIN (num_slices, GST_VULKAN_H264_MAX_SLICES);
++  num_slices = MAX (1, num_slices);
++
++  vk_frame->num_slices = num_slices;
++
++  for (i = 0; i < num_slices; i++) {
++    /* Distribute mb_height rows across num_slices as evenly as possible; the
++     * first (mb_height % num_slices) slices carry one extra row. */
++    guint base = mb_height / num_slices;
++    guint rem = mb_height % num_slices;
++    guint start_row = i * base + MIN (i, rem);
++    guint first_mb = start_row * mb_width;
++
++    /* *INDENT-OFF* */
++    vk_frame->slice_hdr[i] = (StdVideoEncodeH264SliceHeader) {
++      .flags = (StdVideoEncodeH264SliceHeaderFlags) {
++        .direct_spatial_mv_pred_flag = slice_hdr->direct_spatial_mv_pred_flag,
++        .num_ref_idx_active_override_flag =
++            slice_hdr->num_ref_idx_active_override_flag,
++      },
++      .first_mb_in_slice = first_mb,
++      .slice_type = gst_vulkan_h264_slice_type(h264_frame->type.slice_type),
++      .cabac_init_idc = slice_hdr->cabac_init_idc,
++      .disable_deblocking_filter_idc = slice_hdr->disable_deblocking_filter_idc,
++      .slice_qp_delta = qp_delta,
++      .slice_alpha_c0_offset_div2 = slice_hdr->slice_alpha_c0_offset_div2,
++      .slice_beta_offset_div2 = slice_hdr->slice_beta_offset_div2,
++      .pWeightTable = NULL,
++    };
++
++    vk_frame->vkslice_info[i] = (VkVideoEncodeH264NaluSliceInfoKHR) {
++      .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_NALU_SLICE_INFO_KHR,
++      .pNext = NULL,
++      .constantQp = constant_qp,
++      .pStdSliceHeader = &vk_frame->slice_hdr[i],
++    };
++    /* *INDENT-ON* */
++  }
+ }
+ 
+ static void
+@@ -1956,6 +2010,7 @@ gst_vulkan_h264_encoder_init (GTypeInstance * instance, gpointer g_class)
+   self->prop.min_qp = 0;
+   self->prop.ratecontrol = VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR;
+   self->prop.quality = 2;
++  self->prop.num_slices = 1;
+ }
+ 
+ static void
+@@ -1993,6 +2048,9 @@ gst_vulkan_h264_encoder_get_property (GObject * object, guint property_id,
+     case PROP_MIN_QP:
+       g_value_set_uint (value, self->prop.min_qp);
+       break;
++    case PROP_NUM_SLICES:
++      g_value_set_uint (value, self->prop.num_slices);
++      break;
+     default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+       break;
+@@ -2045,6 +2103,9 @@ gst_vulkan_h264_encoder_set_property (GObject * object, guint property_id,
+       self->prop.min_qp = g_value_get_uint (value);
+       self->update_props = TRUE;
+       break;
++    case PROP_NUM_SLICES:
++      self->prop.num_slices = g_value_get_uint (value);
++      break;
+     default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+       break;
+@@ -2274,6 +2335,25 @@ gst_vulkan_h264_encoder_class_init (gpointer g_klass, gpointer class_data)
+   properties[PROP_QUALITY] = g_param_spec_uint ("quality", "quality level",
+       "Video encoding quality level", 0, 10, 2, param_flags);
+ 
++  /**
++   * GstVulkanH264Encoder:num-slices:
++   *
++   * Number of H.264 slices to split each encoded frame into. Slice boundaries
++   * are macroblock-row aligned and the rows are distributed as evenly as
++   * possible across the slices. More slices shrink the blast radius of a lost
++   * packet (a lost packet damages one slice instead of the whole frame), at a
++   * small coding-efficiency cost. The value is clamped at encode time to the
++   * number of macroblock rows and to the driver's
++   * VkVideoEncodeH264CapabilitiesKHR.maxSliceCount (a warning is logged when
++   * clamping). Default 1 preserves the historical single-slice behaviour.
++   *
++   * Since: 1.28
++   */
++  properties[PROP_NUM_SLICES] = g_param_spec_uint ("num-slices", "Number of slices",
++      "Number of slices per frame (clamped to MB rows and driver maxSliceCount)",
++      1, G_MAXUINT, 1,
++      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
++
+   g_object_class_install_properties (gobject_class, N_PROPERTIES, properties);
+ 
+   /* since GstVulkanEncoder is private API */

@@ -1,0 +1,170 @@
+---
+title: Environment variables
+description: The settings a self-hoster is likely to touch, grouped by what they do, with defaults.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Deployment and process settings are supplied through environment variables in
+`deploy/.env`. Instance settings and many host settings are persisted and
+editable through the admin UI; where both exist, the table notes whether the
+environment is a seed, fallback, or authoritative override.
+
+Many node agent settings can also be overridden per host from Admin, Fleet, Hosts,
+Settings, which is usually easier than editing a file on every machine.
+Precedence runs: per-host override, then agent environment, then catalog default.
+
+<Aside type="note" title="This is the practical subset">
+The full catalogue including debug and development settings lives in
+`docs/configuration.md` in the repository. Anything not listed here is either
+internal or something you should not change without a measurement.
+</Aside>
+
+## Required
+
+| Variable | Notes |
+| --- | --- |
+| `DATABASE_URL` | Postgres connection string. |
+| `ENROLLMENT_TOKEN` | Shared secret agents present on first contact. Must match on control plane and every agent. |
+| `CONTROL_PLANE_URL` | Agent side. WebSocket URL of the control plane. |
+| `POSTGRES_PASSWORD` | Compose. Generated on a fresh install. |
+
+The release install has you generate these values before first boot. The
+source-build `redeploy.sh` path generates missing secrets and never overwrites
+existing ones.
+
+## Setup and identity
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `BOOTSTRAP_ADMIN_EMAIL` | unset | Provisions the first admin at boot. Idempotent. |
+| `BOOTSTRAP_ADMIN_USERNAME` | unset | With the above. |
+| `BOOTSTRAP_ADMIN_PASSWORD` | unset | With the above. Set all three or none. |
+| `REGISTRATION_MODE` | `closed` | Seeds the registration mode on first boot of a fresh database only. The admin UI is authoritative afterwards. |
+| `PUBLIC_BASE_URL` | unset | Canonical public URL for invite links and proxied signaling. Set it when a proxy rewrites `Host`; otherwise the public host can be derived from forwarded or request headers. |
+| `NODE_NAME` | hostname | Agent side. A stable identity for this host. |
+
+## Secrets
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QUASAR_SECRET_KEY` | unset | Base64 of 32 bytes. Encrypts credentials stored through the admin UI. **Back this up. It is not recoverable.** |
+
+## TLS and access
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QUASAR_TLS` | `auto` | `auto` or `off`. |
+| `QUASAR_TLS_ADDR` | `:8443` | HTTPS listener. |
+| `QUASAR_TLS_HOSTS` | unset | Comma-separated names and IPs the generated certificate should cover. **Required for LAN access.** |
+| `QUASAR_TLS_CERT` | unset | Your own certificate. Set with the key or not at all. |
+| `QUASAR_TLS_KEY` | unset | Your own key. |
+| `QUASAR_TLS_DIR` | `/var/lib/quasar-control/tls` | Where the generated certificate is kept. |
+| `QUASAR_HTTP_REDIRECT` | `auto` | HTTP to HTTPS redirect for browser routes. |
+| `QUASAR_ALLOWED_ORIGINS` | unset | Authoritative override for signaling WebSocket origins. Leave unset to manage them in Admin, Settings; with neither source set, same-origin is allowed. `*` is rejected. |
+| `QUASAR_TRUSTED_PROXIES` | unset | Proxy IPs or CIDRs whose forwarded client-address headers are trusted. Empty ignores forwarded addresses. |
+| `LISTEN_ADDR` | `:8080` | HTTP listener. |
+| `CONTROL_PORT` | `8080` | Compose. Host port for HTTP. |
+| `QUASAR_TLS_PORT` | `8443` | Compose. Host port for HTTPS. |
+
+## Storage
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QUASAR_HOME_ROOT` | unset | Lowest-priority managed-home root fallback. A host with no effective root cannot launch a managed-home app. Fresh `redeploy.sh` installs seed `/var/lib/quasar/homes`. |
+| `QUASAR_STORAGE_PROVIDER` | `auto` | `auto` or `local`, which both select mount-path storage. `volume` was removed and is rejected. |
+| `QUASAR_ARTWORK_DIR` | `/var/lib/quasar-control/artwork` | Artwork cache. Needs a persistent volume. |
+| `QUASAR_ARTWORK_PROVIDER` | `steamgriddb` | `steamgriddb` or `none`. |
+| `QUASAR_STEAMGRIDDB_API_KEY` | unset | Or set it through the admin UI, which takes precedence. |
+
+## Encoding
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QUASAR_ENCODER` | unset, auto-detect | AMD and NVIDIA default to `vulkan`, Intel to `va`, and no GPU to `openh264`. Explicit `va`, `nvenc`, `vulkan`, or `openh264` wins. |
+| `QUASAR_RENDER_NODE` | unset | Optional DRM render-node pin. Prefer a `/dev/dri/by-path/` path when pinning a multi-GPU host. |
+| `QUASAR_CUDA_DEVICE` | `0` | NVENC device index on a multi-GPU host. |
+| `QUASAR_ZEROCOPY` | off | Full zero-copy on the VA path. |
+| `QUASAR_GOP` | `60` | Frames between keyframes. |
+| `QUASAR_SLICES` | `8` | H.264 slices per frame. Supported by Quasar's patched Vulkan H.264 encoder as well as applicable vendor paths. |
+| `QUASAR_TARGET_USAGE` | `6` | VA speed against quality, 1 to 7. |
+| `QUASAR_QUEUE_BUFFERS` | `3` | Encode queue depth. |
+| `QUASAR_VULKAN_H264` | on | Set `0` to move H.264 off Vulkan when a vendor fallback exists. |
+| `QUASAR_VULKAN_HEVC` | on | Set `0` to move HEVC off Vulkan when a vendor fallback exists. |
+| `QUASAR_VULKAN_AV1` | on | Set `0` to move AV1 off Vulkan when a vendor fallback exists. |
+| `QUASAR_VULKAN_MAX_SESSIONS` | `2` | Concurrent Vulkan encode sessions per GPU. |
+| `QUASAR_REQUIRE_HW_RENDER` | `1` | Fail a session that falls back to software rendering. |
+
+## Adaptive bitrate
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QUASAR_ABR_MODE` | `smooth` | `smooth`, `protective` or `off`. |
+| `QUASAR_ABR` | `1` | Legacy on and off. `0` maps to `off`. |
+| `QUASAR_ABR_FLOOR_KBPS` | unset | Explicit floor. |
+| `QUASAR_ABR_FLOOR_RATIO` | `0.3` | Floor as a fraction of the tier bitrate. |
+| `QUASAR_ABR_LADDER` | on in `smooth` | Encoder speed escalation under saturation. |
+| `QUASAR_ABR_LADDER_RESOLUTION` | off | Opt-in external-resolution rung. Requires `smooth`; applies to the next session. |
+| `QUASAR_ABR_LADDER_FPS` | off | Opt-in 120-to-60 FPS rung. Requires `smooth`; applies to the next session. |
+
+Roughly fifteen further hysteresis settings exist. Every default matches the
+value that used to be hardcoded. Do not change them without a measurement.
+
+## Capacity and placement
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QUASAR_VRAM_MIN_FREE_MB` | `1024` | Free GPU memory floor for admission. `0` disables the veto. |
+| `QUASAR_VRAM_INFLIGHT_ESTIMATE_MB` | the floor | Memory debited for very recent launches. |
+| `QUASAR_VRAM_STALENESS_SECS` | `20` | How fresh a memory sample has to be. |
+| `QUASAR_PLACEMENT_POLICY` | `spread` | `spread`, `least-loaded` or `locality`. |
+
+## Apps and containers
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QUASAR_APP_DISPLAY_ENV` | on | Inject session resolution and frame rate into app containers. |
+| `QUASAR_APP_GAMESCOPE_ENV` | on | Also emit the gamescope compatibility variables. |
+| `QUASAR_APP_SHM_SIZE` | `1g` | Shared memory for app containers. |
+| `QUASAR_APP_STOP_TIMEOUT_SECS` | `10` | Graceful stop window. |
+| `QUASAR_APP_PUID` | unset | Run apps as this user ID. |
+| `QUASAR_APP_PGID` | unset | Run apps as this group ID. |
+| `QUASAR_APP_PIDS_LIMIT` | `8192` | Process limit backstop. |
+| `QUASAR_IDLE_TIMEOUT_SECS` | `120` | Reap idle sessions after this long. |
+
+## Audio and microphone
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QUASAR_AUDIO_REQUIRED` | off | Fail the session rather than run silently. Worth setting. |
+| `QUASAR_MIC_DISABLED` | off | Host-level microphone kill switch. |
+
+## Libraries and images
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QUASAR_LIBRARY_SCAN_INTERVAL` | 360 minutes | Library discovery interval. `0` disables scheduled scans. |
+| `QUASAR_LIBRARY_PROVIDERS` | `steam` | Allowlisted providers. |
+| `QUASAR_IMAGE_REGISTRY_HOSTS` | `ghcr.io` | Registries Quasar will resolve digests and artwork from. |
+| `QUASAR_ARTWORK_MAX_BYTES` | `8388608` | Cap on fetched artwork, 8 MiB. |
+
+## Experimental
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `QUASAR_FEC_MODE` | derived | `off`, `fixed` or `auto`. Not recommended for browsers. |
+| `QUASAR_FEC_PERCENTAGE` | `0` | Redundancy percentage. |
+| `QUASAR_INTRA_REFRESH` | `0` | Vulkan only, patched image only. |
+| `QUASAR_INTRA_REFRESH_PERIOD` | `0` | `60` is the validated value. |
+
+See [Experimental options](/quasar/tuning/experimental/) before enabling any of
+these.
+
+## The host sysctl
+
+Not an environment variable, but required on every host that serves media:
+
+```bash
+sudo sysctl -w net.core.wmem_default=2097152
+echo 'net.core.wmem_default=2097152' | sudo tee /etc/sysctl.d/99-quasar.conf
+```

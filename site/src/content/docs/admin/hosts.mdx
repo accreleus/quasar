@@ -1,0 +1,148 @@
+---
+title: Hosts and GPUs
+description: Reading host readiness, GPU capacity, admission control, per-host settings, and draining a machine.
+---
+
+import Shot from '../../../components/Shot.astro';
+import admin_hosts from '../../../assets/shots/admin-hosts.png';
+import { Aside } from '@astrojs/starlight/components';
+
+Admin, Fleet, Hosts lists every machine running a node agent, with its GPUs.
+
+<Shot
+	label="Admin hosts"
+	sublabel="The fleet host list, with per-GPU slot use and VRAM, RAM and disk bars."
+	src={admin_hosts}
+	alt="The admin fleet page listing hosts and their GPUs"
+/>
+
+## Reading a host
+
+Each host shows its status, when it last sent a heartbeat, its CPU, its storage,
+and a set of readiness checks.
+
+The readiness checks are the useful part, because they report what the agent
+**found**, not what the configuration claims. The distinction matters. A host can
+be configured for NVENC and still have no working encoder.
+
+Checks cover the render node, `/dev/uinput` write access, the managed home root,
+media reachability through the host firewall, and on NVIDIA the presence of the
+EGL and 32-bit GL components that a CUDA-only driver install leaves out.
+
+A `media_reachability` warning names the scoped firewall rule the host is
+missing. See [Ports and endpoints](/quasar/reference/ports/#firewall).
+
+<Aside type="note" title="Readiness checks warn, they do not block">
+A failing check does not stop the host registering or accepting sessions. It
+tells you why something will probably not work. The exception is a host with no
+usable encoder, which will fail sessions rather than pretend.
+</Aside>
+
+## GPU capacity and admission
+
+Each GPU shows its encode slots and its VRAM, used and free.
+
+A session is admitted to a GPU when two conditions hold.
+
+**Encode slots.** This is the real reservation, and it is race-safe. A GPU has a
+finite number of concurrent encodes it can sustain.
+
+**Free VRAM.** A veto, not a reservation. If the GPU's most recent memory sample
+shows less free than `QUASAR_VRAM_MIN_FREE_MB` (1024 MB by default), the GPU is
+skipped. Very recent launches the sample has not caught up with are debited from
+the figure.
+
+The veto abstains rather than blocking when the telemetry is missing, stale or
+structurally implausible. An integrated GPU whose entire memory carve-out sits
+below the floor would otherwise reject everything. Unknown telemetry is never
+allowed to reduce availability.
+
+Set `QUASAR_VRAM_MIN_FREE_MB=0` to turn the veto off and admit on slots alone.
+
+<Aside type="note" title="Declared per-app VRAM is gone">
+Apps used to carry a declared VRAM figure. It was never enforceable, because
+there is no VRAM cgroup controller to enforce it with, and in practice it was an
+admin-typed guess nothing reconciled. Live telemetry replaced it.
+</Aside>
+
+### The two capacity errors
+
+`no_host_available` means nothing in the fleet could ever serve the request.
+Usually every host is offline. Retrying does not help.
+
+`capacity_exhausted` means hosts are up but currently full. Retrying does help,
+once something ends.
+
+## Per-host settings
+
+Each host has a Settings page that overrides its environment configuration
+without editing `.env` and restarting anything by hand. Precedence runs: per-host
+override, then agent environment, then catalog default.
+
+Settings come in two classes.
+
+**Live** settings apply to the next session on that host. ABR mode, container
+knobs and most tuning are live.
+
+**Restart** settings need the agent to restart, which drops any live sessions on
+that host. The encoder, the render node and the CUDA device are in this class.
+Quasar tells you before it does it.
+
+## Render node selection
+
+On a machine with more than one GPU, `QUASAR_RENDER_NODE` picks which one the
+compositor and encoder use.
+
+Prefer a `/dev/dri/by-path/` path over `/dev/dri/renderD128`. The numbered names
+are assigned in probe order and can move between reboots. The by-path names are
+tied to the PCI address and do not.
+
+For NVENC on a multi-GPU box, `QUASAR_CUDA_DEVICE` selects the CUDA device index
+as well.
+
+<Aside type="caution" title="Per-session GPU routing does not exist yet">
+Placement chooses a host, and the host's configuration chooses a GPU. You cannot
+currently route a specific session to a specific GPU on a multi-GPU host.
+</Aside>
+
+## Placement across hosts
+
+`QUASAR_PLACEMENT_POLICY` on the control plane:
+
+| Value | Behaviour |
+| --- | --- |
+| `spread` | Default. Distributes sessions across hosts. |
+| `least-loaded` | Prefers the host with the most free capacity. |
+| `locality` | Prefers the host that already holds the user's home directory. |
+
+Use `locality` if home directories are host-local rather than on shared storage.
+Otherwise a user's saves are on whichever host happened to run the session.
+
+## Draining and removing
+
+Drain stops a host accepting new sessions while letting existing ones finish.
+Do this before maintenance.
+
+Once it is empty, stop the agent on that machine and forget the host here.
+
+## The console
+
+Each host has a console page for local-display mode, where the host renders to a
+physically attached screen rather than to a browser. It needs additional
+privileges and a separate compose overlay, and it is not part of the default
+deployment.
+
+## Storage
+
+Admin, Fleet, Storage shows the managed home directories across your fleet.
+
+Each host can have its own managed-home root. It must be genuinely shared storage
+if you want saves to follow users between machines; otherwise use locality
+placement to keep a user near the host holding their files. The readiness check
+reports whether the root is visible and writable from the agent's namespace.
+
+<Aside type="danger" title="Changing a storage root does not migrate data">
+Pointing a host at a different directory makes new launches use that directory.
+Existing homes remain at the old path until you move them deliberately. To a
+user, changing the root without migrating data looks like their saves vanished.
+</Aside>

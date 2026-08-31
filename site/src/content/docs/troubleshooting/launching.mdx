@@ -1,0 +1,122 @@
+---
+title: Launching a game
+description: Launch refusals, capacity errors, containers that exit immediately, and Steam specifically.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## The launch is refused outright
+
+| Message | Cause | What to do |
+| --- | --- | --- |
+| No host available | Nothing in the fleet is online, or no host could ever serve the request. | Check Admin, Fleet, Hosts. Retrying will not help. |
+| Capacity exhausted | Hosts are up but currently full on encode slots or GPU memory. | Retry once something ends. |
+| Session quota exceeded | The user is at their concurrent session limit. | End one, or raise the limit in Admin, People, Users. Note that a limit of zero blocks everything. |
+| Home in use | The user already has this app running elsewhere. The response names the session. | End that session. One session per user per app, because two writers corrupt save files. |
+| Not entitled | No grant for this user and app. | Grant it in Admin, Library, Apps. |
+
+## Capacity looks free but launches are refused
+
+Admission needs both a free encode slot and enough free GPU memory. The memory
+check is a veto against the most recent telemetry sample, defaulting to 1024 MB
+free.
+
+On a machine with a small GPU memory carve-out, particularly an integrated GPU,
+that floor can be more than the GPU ever has free. The veto is designed to
+abstain when the telemetry is structurally implausible, but if you are seeing
+refusals on a host with capacity, lower the floor:
+
+```bash
+QUASAR_VRAM_MIN_FREE_MB=512
+```
+
+Or disable the veto and admit on slots alone:
+
+```bash
+QUASAR_VRAM_MIN_FREE_MB=0
+```
+
+## The session starts, then fails immediately
+
+The app container exited. The agent watches for this now rather than leaving you
+streaming a frozen frame.
+
+Check the session detail in Admin, Sessions for the exit reason, and check the
+app container's own logs.
+
+Common causes:
+
+**The app needs network access and does not have it.** App containers get no
+network by default. Anything that phones home on first launch exits cleanly and
+you get an unhelpful message about the media path. Set `network: bridge` on the
+runtime preset for that app.
+
+**The image is not from the Quasar image family.** An app image must derive from
+the project's graphics base layer, which is what provides GPU access and the
+Wayland and audio plumbing. An arbitrary public image will not work.
+
+**The app genuinely crashed.** Its own logs.
+
+## The session stays running but shows a frozen frame
+
+This used to happen when a container exited without the agent noticing. Liveness
+monitoring now catches it and fails the session.
+
+If you are seeing it, check the app's exit policy. `keep` deliberately holds the
+session open when the app exits. `fail` is the default and usually what you want.
+
+## Steam will not start
+
+**"Steam needs to be" in the agent log** means Steam could not launch. Almost
+always no network. Steam downloads part of its own interface on first launch.
+Set `network: bridge` on the Steam runtime preset.
+
+**Steam starts but no games are discovered.** Discovery scans the filesystem for
+installed games. It does not sync what you own. Install something through the
+Steam launcher app first, then wait for the next scan or trigger one from Admin,
+Steam.
+
+Discovery needs a managed-home root on the selected host. If the host has no
+effective storage root, set one under Admin, Fleet, Hosts. A root that exists only
+inside the agent container is also wrong: it must be the bind-mounted host path.
+
+**The Steam image will not install.** The published package is public, so
+inspect the install job under Admin, Fleet, Jobs. Common causes are registry
+reachability, a registry outside `QUASAR_IMAGE_REGISTRY_HOSTS`, or an image
+contract failure.
+
+## The game runs at the wrong resolution
+
+Quasar injects the session's resolution and frame rate into the container as
+`QUASAR_STREAM_WIDTH`, `QUASAR_STREAM_HEIGHT` and `QUASAR_STREAM_FPS`, plus
+`GAMESCOPE_*` equivalents for images that bake in gamescope defaults.
+
+If an app is ignoring them, check whether its runtime preset sets those variables
+explicitly. An explicit value wins over the injected one.
+
+Without this, an image built for 1080p60 renders at 1080p60 even in a 1440p120
+session, and the result is upscaled into the stream, spending your bitrate on
+interpolated detail.
+
+## Nothing is in the library
+
+Check entitlements first. A user only sees apps they are granted. Library
+discovery grants to everyone automatically, apps you create by hand do not.
+
+Then check the app exists in Admin, Library, Apps at all.
+
+## Controllers are not detected
+
+Press a button. Browsers do not reveal a gamepad until it has sent input.
+
+Then confirm the page is on HTTPS, since the Gamepad API needs a secure context.
+
+Then check `/dev/uinput` on the host is present and writable by the agent. A
+read-only open succeeds even when it is broken, which makes this easy to
+misdiagnose. The host readiness check tests writing.
+
+<Aside type="note" title="Big Picture mode and the first controller event">
+Steam's Big Picture interface can start without keyboard or controller focus. The
+agent nudges focus on the first gamepad event to work around it. If the interface
+seems unresponsive on entry, press a button.
+</Aside>

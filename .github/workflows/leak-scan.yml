@@ -1,0 +1,45 @@
+name: leak-scan
+
+# THE ONE EXCEPTION TO THE MANUAL-ONLY CI RULE.
+#
+# Every other workflow in this repo is `workflow_dispatch` only (operator
+# directive 2026-07-06: automatic triggers exhausted the account's Actions
+# minutes). This one runs automatically, on purpose, for two reasons:
+#
+#   1. COST. It is a checkout plus one `git grep` — seconds on the smallest
+#      runner, no toolchain, no services, no cache. The minutes it spends are
+#      negligible against the ones the manual-only rule was protecting.
+#   2. IT CANNOT WORK MANUALLY. This repository is mirrored to a public repo,
+#      so a committed LAN address, ssh key name or personal domain is
+#      published and permanently archived the moment it lands. A guard that
+#      only runs when somebody remembers to press a button guards nothing —
+#      the whole failure mode is forgetting. Manual-only is right for
+#      expensive gates that catch broken code; this is a cheap gate that
+#      catches irreversible disclosure.
+#
+# Do not add triggers to the other workflows on the strength of this one.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: leak-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: operator fingerprints
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth 0: the scan reads tracked content through `git grep`, which
+      # needs a real repository rather than an export.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Scan tracked content
+        run: bash scripts/dev/leak-scan.sh

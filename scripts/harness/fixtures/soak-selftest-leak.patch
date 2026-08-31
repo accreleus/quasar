@@ -1,0 +1,66 @@
+# PROF-03 soak-harness self-test fixture — scripts/harness/fixtures/soak-selftest-leak.patch
+#
+# WHAT THIS IS: a planted, deliberate control-plane leak. It makes every
+# session launch that reaches dispatchAssignStartWithTopology (the function
+# every successful launch passes through, control-plane/internal/session/
+# launcher.go) retain 1MiB of heap and leak one goroutine that never exits.
+#
+# WHY IT EXISTS: scripts/harness/run-soak-profile.sh + scripts/harness/lib/soak_report.py are a
+# leak DETECTOR — the only way to trust a detector is to prove it fires on a
+# known-bad input. This patch is that known-bad input: apply it, rebuild the
+# control-plane image, run a short soak, and confirm cp_goroutines and
+# cp_heap_inuse_bytes both come back LEAK in the report. See
+# docs/profiling-soak.md "Self-test procedure" for the exact steps.
+#
+# THIS MUST NEVER LAND APPLIED ON develop OR main. It exists ONLY as this
+# fixture file, applied transiently on a throwaway branch, then reverted
+# (`git checkout -- control-plane/internal/session/launcher.go`) before that
+# branch is discarded. Do not open a PR with this patch applied.
+#
+# Verified 2026-07-31 in the profiling-campaign-milestone-16 worktree:
+#   git apply --check scripts/harness/fixtures/soak-selftest-leak.patch   # clean
+#   git apply scripts/harness/fixtures/soak-selftest-leak.patch
+#   (cd control-plane && go build ./...)                              # succeeds
+#   git checkout -- control-plane/internal/session/launcher.go        # revert
+#
+diff --git a/control-plane/internal/session/launcher.go b/control-plane/internal/session/launcher.go
+index 72173d8..20bdefe 100644
+--- a/control-plane/internal/session/launcher.go
++++ b/control-plane/internal/session/launcher.go
+@@ -5,6 +5,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"sync"
+ 	"time"
+
+ 	"github.com/accreleus/quasar/control-plane/internal/agentws"
+@@ -12,6 +13,14 @@ import (
+ 	"github.com/accreleus/quasar/control-plane/internal/tier"
+ )
+
++// soakSelftestRetained/soakSelftestMu: PROF-03 soak-harness self-test fixture
++// ONLY. Deliberately retains 1MiB per launch and leaks one goroutine per
++// launch so scripts/harness/run-soak-profile.sh has a known-bad control to validate
++// its LEAK classifier against. This must NEVER land applied on develop/main —
++// see scripts/harness/fixtures/soak-selftest-leak.patch.
++var soakSelftestRetained [][]byte
++var soakSelftestMu sync.Mutex
++
+ // LaunchByProfile is the AS10-03 launch path, restructured by UI-P4: it resolves
+ // the selected LAUNCH PROFILE (or the legacy tier) to concrete stream
+ // parameters, gates eligibility, persists the selected launch profile id, then
+@@ -679,6 +688,13 @@ func (c *Coordinator) dispatchAssignStart(sess Session, runtimeSpec []byte) {
+ }
+
+ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec []byte, videoTopology string) {
++	// PROF-03 soak-selftest fixture (see scripts/harness/fixtures/soak-selftest-leak.patch):
++	// retain 1MiB and leak one goroutine per launch that reaches this point.
++	soakSelftestMu.Lock()
++	soakSelftestRetained = append(soakSelftestRetained, make([]byte, 1<<20))
++	soakSelftestMu.Unlock()
++	go func() { select {} }()
++
+ 	if sess.HostID == nil || sess.GPUIndex == nil {
+ 		c.failSession(sess.ID, "session missing host/gpu placement")
+ 		return

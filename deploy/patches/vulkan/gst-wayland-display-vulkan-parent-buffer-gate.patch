@@ -1,0 +1,198 @@
+diff --git a/wayland-display-core/src/utils/vulkan_nv12.rs b/wayland-display-core/src/utils/vulkan_nv12.rs
+index 516e92b..40e264a 100644
+--- a/wayland-display-core/src/utils/vulkan_nv12.rs
++++ b/wayland-display-core/src/utils/vulkan_nv12.rs
+@@ -466,6 +466,12 @@ pub struct VulkanNv12 {
+     outputs: Vec<Nv12Out>,
+     next: usize, // next ring slot to write
+     cur: usize,  // last slot written (the one to_gst_buffer returns)
++    /// True once at least one frame has completed conversion, so a busy-drop (G1 gate)
++    /// has a previous output to safely re-emit rather than reusing a referenced slot.
++    have_output: bool,
++    /// Count of frames dropped because the target encode-src slot was still referenced by
++    /// the encoder at reuse time (G1 gate); drives rate-limited logging only.
++    busy_drops: u64,
+     width: u32,
+     height: u32,
+     /// Target output format (NV12 8-bit or P010 10-bit); selects the compute shader, image
+@@ -722,6 +728,8 @@ impl VulkanNv12 {
+             outputs,
+             next: 0,
+             cur: 0,
++            have_output: false,
++            busy_drops: 0,
+             width,
+             height,
+             fmt,
+@@ -877,6 +885,8 @@ impl VulkanNv12 {
+             outputs,
+             next: 0,
+             cur: 0,
++            have_output: false,
++            busy_drops: 0,
+             width,
+             height,
+             fmt,
+@@ -915,10 +925,28 @@ impl VulkanNv12 {
+             let mut waited = 0u32;
+             while self.outputs[idx].buffer.get_mut().is_none() {
+                 if waited >= 10_000 {
+-                    tracing::warn!(
+-                        "VulkanNv12: encode-src slot {idx} still referenced after 1s; reusing anyway"
+-                    );
+-                    break;
++                    // G1 buffer-reuse gate (multi-session Vulkan spec 2c): NEVER overwrite an
++                    // encode-src slot the encoder still references. Under WOLF_VULKAN_RING=1
++                    // (auto-pinned when HEVC is armed) there is exactly ONE slot, so the old
++                    // "reuse anyway" would write the image the encoder is still reading -- the
++                    // GPU data hazard this gate exists to prevent (green-bars / device-loss
++                    // family). Drop the freshly-rendered frame and re-emit the last completed
++                    // output (to_gst_buffer returns `cur`, left unchanged by this early return)
++                    // instead. If nothing has completed yet there is no safe frame to emit.
++                    if !self.have_output {
++                        return Err(
++                            "VulkanNv12: encode-src ring busy before first completed frame".into(),
++                        );
++                    }
++                    self.busy_drops = self.busy_drops.saturating_add(1);
++                    if self.busy_drops == 1 || self.busy_drops % 60 == 0 {
++                        tracing::warn!(
++                            slot = idx,
++                            busy_drops = self.busy_drops,
++                            "VulkanNv12: encode-src slot still referenced after 1s; dropping new frame, re-emitting previous output"
++                        );
++                    }
++                    return Ok(());
+                 }
+                 std::thread::sleep(std::time::Duration::from_micros(100));
+                 waited += 1;
+@@ -1232,6 +1260,7 @@ impl VulkanNv12 {
+         }
+ 
+         self.cur = idx;
++        self.have_output = true;
+         Ok(())
+     }
+ 
+@@ -1470,33 +1499,98 @@ impl VulkanNv12 {
+         }
+     }
+ 
+-    /// The just-converted NV12 export slot as a gst buffer. Returns the slot's cached
+-    /// buffer (ref-counted) so the VA encoder reuses one stable surface per slot.
++    /// The just-converted NV12 export slot as a gst buffer.
+     ///
+-    /// The slot's `GstBuffer` is allocated once and reused every `RING` frames, so a
+-    /// bare `.clone()` also carries the timestamps stamped onto it on its *previous* use.
+-    /// `waylanddisplaysrc` runs `set_do_timestamp(true)`, which only stamps a buffer whose
+-    /// PTS is `NONE`; a recycled buffer whose PTS is already set is left untouched — so the
+-    /// exported timestamps degenerate to the ring's ~4 recurring values (non-monotonic,
+-    /// duplicated across frames), which a downstream RTP payloader turns into RTP timestamps
+-    /// that libwebrtc's PacketBuffer cannot assemble (VULKAN-WORKLOG 2026-07-06 root cause).
+-    /// The RGBx/DMABuf output paths never hit this because they build a *fresh* `GstBuffer`
+-    /// (PTS `NONE`) every frame. Clear the recycled buffer's timing metadata so BaseSrc's
+-    /// `do_timestamp` re-stamps it with the current running-time each frame, exactly like
+-    /// those paths. Only touches PTS/DTS/duration — the memory and video meta are untouched.
++    /// **VA / RGBx / DMABuf path (`encode_src == false`):** returns the slot's cached buffer
++    /// (ref-counted) so the encoder reuses one stable surface per slot — byte-identical to the
++    /// historical behavior.
+     ///
+-    /// Scoped to the `encode_src` (Vulkan `memory:VulkanImage` → `vulkanh264enc`) path only.
+-    /// The VA compositor-NV12 dmabuf path (`encode_src == false`, GW-02) is left byte-identical
+-    /// as it rides clean today; only the vulkan output path's timestamping changes.
++    /// **Vulkan encode path (`encode_src == true`) — G1 buffer-reuse gate (multi-session
++    /// Vulkan spec 2c):** hand out a fresh CHILD header over the last completed slot, carrying
++    /// `GstParentBufferMeta` that references the cached slot buffer. The meta's COPY transform
++    /// propagates that parent ref across BaseSrc's `do_timestamp` make-writable AND every later
++    /// shallow header copy, so the cached slot buffer stays non-writable (refcount > 1 — the
++    /// `buffer.get_mut().is_none()` reuse gate in `convert_inner` above) until the encoder
++    /// releases the last child. This is what makes single-slot (`WOLF_VULKAN_RING=1`) safe under
++    /// an encoder that holds its input buffer until its GstVulkanOperation completes.
++    ///
++    /// A bare `.clone()` (the pre-gate behavior) is defeated by BaseSrc's copy-on-write: a
++    /// shallow header copy releases the cached-header ref while the underlying MEMORY is still
++    /// in use, so the slot looks free and gets recycled under the encoder (the green-bars /
++    /// device-loss family, VULKAN-WORKLOG 2026-07-06 timestamp root cause is the same ring).
++    /// PTS/DTS/duration are cleared on the FRESH child only — the cached slot buffer is never
++    /// mutated — so `waylanddisplaysrc`'s `do_timestamp` re-stamps each frame with the current
++    /// running-time (fixing the non-monotonic recurring-timestamp defect the same way the old
++    /// in-place clear did, without a make-writable on the shared cached buffer).
+     pub fn to_gst_buffer(&self) -> Result<GstBuffer, Err> {
+-        let mut buffer = self.outputs[self.cur].buffer.clone();
+-        if self.encode_src {
+-            let b = buffer.make_mut();
+-            b.set_pts(gst::ClockTime::NONE);
+-            b.set_dts(gst::ClockTime::NONE);
+-            b.set_duration(gst::ClockTime::NONE);
++        let parent = &self.outputs[self.cur].buffer;
++        if !self.encode_src {
++            return Ok(parent.clone());
++        }
++        let mut child = parent.copy();
++        let child_ref = child
++            .get_mut()
++            .ok_or("VulkanNv12: fresh output child unexpectedly shared")?;
++        child_ref.set_pts(gst::ClockTime::NONE);
++        child_ref.set_dts(gst::ClockTime::NONE);
++        child_ref.set_duration(gst::ClockTime::NONE);
++        gst::ParentBufferMeta::add(child_ref, parent);
++        Ok(child)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use gst::prelude::*;
++
++    /// ParentBufferMeta turns the cached slot header into a completion sentinel that
++    /// survives BaseSrc/downstream shallow header copies. No GPU required (spec 2c rung-1).
++    #[test]
++    fn parent_meta_tracks_shallow_header_copies_until_last_release() {
++        gst::init().unwrap();
++        let mut parent = gst::Buffer::with_size(16).unwrap();
++        parent
++            .get_mut()
++            .unwrap()
++            .set_pts(gst::ClockTime::from_seconds(7));
++        let parent_memory = parent.peek_memory(0).as_ptr();
++
++        let mut child = parent.copy();
++        {
++            let child_ref = child.get_mut().unwrap();
++            child_ref.set_pts(gst::ClockTime::NONE);
++            gst::ParentBufferMeta::add(child_ref, &parent);
+         }
+-        Ok(buffer)
++        // Child shares the parent's memory (no deep copy) ...
++        assert_eq!(child.peek_memory(0).as_ptr(), parent_memory);
++        // ... and its ParentBufferMeta points back at the cached parent header.
++        assert_eq!(
++            child
++                .meta::<gst::ParentBufferMeta>()
++                .unwrap()
++                .parent()
++                .as_ptr(),
++            parent.as_ptr()
++        );
++        // Cached metadata is never mutated by the hand-out; only the child is retimed.
++        assert_eq!(parent.pts(), Some(gst::ClockTime::from_seconds(7)));
++        assert!(parent.get_mut().is_none());
++
++        // Force BaseSrc DISCONT's shallow COW shape. The parent meta's COPY transform must
++        // retain the cached parent after the old child header is released.
++        let old_child = child.clone();
++        child.make_mut().set_flags(gst::BufferFlags::DISCONT);
++        assert!(child.meta::<gst::ParentBufferMeta>().is_some());
++        drop(old_child);
++        assert!(parent.get_mut().is_none());
++
++        let copied = child.copy();
++        assert!(copied.meta::<gst::ParentBufferMeta>().is_some());
++        drop(child);
++        assert!(parent.get_mut().is_none());
++        drop(copied);
++        // Last child header gone -> cached slot buffer is writable again: reuse is now safe.
++        assert!(parent.get_mut().is_some());
+     }
+ }
+ 

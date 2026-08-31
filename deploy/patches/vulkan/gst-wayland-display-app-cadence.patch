@@ -1,0 +1,243 @@
+diff --git a/gst-plugin-wayland-display/src/waylandsrc/imp.rs b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+index 5dc48de..2b57d4b 100644
+--- a/gst-plugin-wayland-display/src/waylandsrc/imp.rs
++++ b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+@@ -329,6 +329,15 @@ impl ObjectImpl for WaylandDisplaySrc {
+                     )
+                     .default_value(false)
+                     .build(),
++                glib::ParamSpecUInt64::builder("app-surface-commits")
++                    .nick("Application surface buffer commits")
++                    .blurb(
++                        "Lifetime count of new buffers committed by the mapped fullscreen \
++                         top-level application surface; excludes cursor, popup and \
++                         configure-only commits.",
++                    )
++                    .read_only()
++                    .build(),
+             ]
+         });
+ 
+@@ -450,6 +459,14 @@ impl ObjectImpl for WaylandDisplaySrc {
+                 let settings = self.settings.lock().unwrap();
+                 settings.hdr.to_value()
+             }
++            "app-surface-commits" => self
++                .state
++                .lock()
++                .unwrap()
++                .as_ref()
++                .map(|state| state.display.app_surface_commits())
++                .unwrap_or(0)
++                .to_value(),
+             _ => unreachable!(),
+         }
+     }
+@@ -1771,6 +1788,23 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn app_surface_commit_counter_is_read_only_and_starts_zero() {
++        use gst::prelude::*;
++
++        test_init();
++        crate::plugin_register_static().expect("register plugin");
++        let source = gst::ElementFactory::make("waylanddisplaysrc")
++            .build()
++            .expect("make waylanddisplaysrc");
++        let pspec = source
++            .find_property("app-surface-commits")
++            .expect("counter property");
++        assert!(pspec.flags().contains(glib::ParamFlags::READABLE));
++        assert!(!pspec.flags().contains(glib::ParamFlags::WRITABLE));
++        assert_eq!(source.property::<u64>("app-surface-commits"), 0);
++    }
++
+     /// Run a gst-launch description to EOS, failing on any bus ERROR. Reusable
+     /// integration harness: a negotiation, import, or encode failure surfaces as a
+     /// bus ERROR, so treating ERROR as fatal makes any pipeline a real regression
+diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
+index b2b6fd3..7e259c3 100644
+--- a/wayland-display-core/src/comp/mod.rs
++++ b/wayland-display-core/src/comp/mod.rs
+@@ -66,6 +66,7 @@ use smithay::{
+ };
+ use std::os::fd::OwnedFd;
+ use std::sync::Mutex;
++use std::sync::atomic::AtomicU64;
+ use std::{
+     collections::HashSet,
+     ffi::CString,
+@@ -172,6 +173,9 @@ pub struct State {
+     /// Last OUTPUT HDR state signalled. The stored-bool compare is the debounce: we only
+     /// log + signal on an actual change. Defaults to `false` (SDR).
+     last_hdr_state: bool,
++    /// Shared lifetime counter exported by waylanddisplaysrc. Only mapped
++    /// top-level application buffer commits increment it.
++    pub(crate) app_surface_commits: Arc<AtomicU64>,
+     /// When the current candidate HDR<->SDR flip was first observed; the flip is only
+     /// committed (TV switched) once it has held for [`HDR_DEBOUNCE`]. `None` = no pending
+     /// flip. See [`State::update_hdr_state`].
+@@ -437,6 +441,7 @@ impl State {
+             frog_color_mgmt_global,
+             hdr_state_tx: None,
+             last_hdr_state: false,
++            app_surface_commits: Arc::new(AtomicU64::new(0)),
+             hdr_candidate_since: None,
+         }
+     }
+@@ -752,6 +757,7 @@ pub(crate) fn init(
+     devices_tx: Sender<Vec<CString>>,
+     envs_tx: Sender<Vec<CString>>,
+     hdr_state_tx: Sender<Command>,
++    app_surface_commits: Arc<AtomicU64>,
+ ) {
+     let render_target = render.into();
+     let _ = devices_tx.send(render_target.clone().as_devices());
+@@ -768,6 +774,7 @@ pub(crate) fn init(
+     let libinput_backend = LibinputInputBackend::new(libinput_context);
+ 
+     let mut state = State::new(&render_target, &dh, &input_context, event_loop.handle());
++    state.app_surface_commits = app_surface_commits;
+ 
+     // Wire the compositor -> element HDR-state reverse channel only under WOLF_HDR_CM;
+     // unset leaves `hdr_state_tx` as `None`, making the per-frame HDR check a no-op.
+diff --git a/wayland-display-core/src/lib.rs b/wayland-display-core/src/lib.rs
+index 820cd5d..11def2f 100644
+--- a/wayland-display-core/src/lib.rs
++++ b/wayland-display-core/src/lib.rs
+@@ -12,6 +12,7 @@ pub use smithay::backend::input::{ButtonState, KeyState};
+ use smithay::utils::{Logical, Point};
+ use std::ffi::{CString, c_char, c_void};
+ use std::str::FromStr;
++use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::mpsc::{self, Receiver, SyncSender};
+ use std::sync::{Arc, Mutex};
+ use std::thread::JoinHandle;
+@@ -109,6 +110,7 @@ pub struct WaylandDisplay {
+     /// OUTPUT HDR state changes. Empty unless `WOLF_HDR_CM` is set; drained by
+     /// [`WaylandDisplay::poll_hdr_state`].
+     hdr_state_rx: Receiver<Command>,
++    app_surface_commits: Arc<AtomicU64>,
+ 
+     pub tracer: Option<Tracer>,
+     pub devices: MaybeRecv<Vec<CString>>,
+@@ -140,6 +142,8 @@ impl WaylandDisplay {
+         let (envs_tx, envs_rx) = std::sync::mpsc::channel();
+         // Reverse channel (compositor -> element) for HDR-state notifications.
+         let (hdr_state_tx, hdr_state_rx) = std::sync::mpsc::channel();
++        let app_surface_commits = Arc::new(AtomicU64::new(0));
++        let compositor_commits = Arc::clone(&app_surface_commits);
+         let render_target = RenderTarget::from_str(
+             &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
+         )?;
+@@ -155,6 +159,7 @@ impl WaylandDisplay {
+                     devices_tx,
+                     envs_tx,
+                     hdr_state_tx,
++                    compositor_commits,
+                 );
+             }) {
+                 tracing::error!(?err, "Compositor thread panic'ed!");
+@@ -166,6 +171,7 @@ impl WaylandDisplay {
+             thread_handle: Some(thread_handle),
+             command_tx,
+             hdr_state_rx,
++            app_surface_commits,
+             tracer: None,
+             devices: MaybeRecv::Rx(devices_rx),
+             envs: MaybeRecv::Rx(envs_rx),
+@@ -181,6 +187,8 @@ impl WaylandDisplay {
+         let (envs_tx, envs_rx) = std::sync::mpsc::channel();
+         // Reverse channel (compositor -> element) for HDR-state notifications.
+         let (hdr_state_tx, hdr_state_rx) = std::sync::mpsc::channel();
++        let app_surface_commits = Arc::new(AtomicU64::new(0));
++        let compositor_commits = Arc::clone(&app_surface_commits);
+         let render_target = RenderTarget::from_str(
+             &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
+         )?;
+@@ -192,6 +200,7 @@ impl WaylandDisplay {
+                 devices_tx,
+                 envs_tx,
+                 hdr_state_tx,
++                compositor_commits,
+             );
+         });
+ 
+@@ -199,6 +208,7 @@ impl WaylandDisplay {
+             thread_handle: Some(thread_handle),
+             command_tx,
+             hdr_state_rx,
++            app_surface_commits,
+             tracer: None,
+             devices: MaybeRecv::Rx(devices_rx),
+             envs: MaybeRecv::Rx(envs_rx),
+@@ -219,6 +229,11 @@ impl WaylandDisplay {
+             .map(|string| string.to_str().unwrap())
+     }
+ 
++    /// Lifetime count of new buffers committed by mapped top-level app surfaces.
++    pub fn app_surface_commits(&self) -> u64 {
++        self.app_surface_commits.load(Ordering::Relaxed)
++    }
++
+     pub fn add_input_device(&self, path: impl Into<String>) {
+         let _ = self.command_tx.send(Command::InputDevice(path.into()));
+     }
+diff --git a/wayland-display-core/src/wayland/handlers/compositor.rs b/wayland-display-core/src/wayland/handlers/compositor.rs
+index 41ef70b..002a8cb 100644
+--- a/wayland-display-core/src/wayland/handlers/compositor.rs
++++ b/wayland-display-core/src/wayland/handlers/compositor.rs
+@@ -17,6 +17,6 @@ use smithay::{
+         compositor::{
+             BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
+-            SurfaceAttributes, add_blocker, add_pre_commit_hook, with_states,
++            SurfaceAttributes, add_blocker, add_pre_commit_hook, get_parent, with_states,
+         },
+         dmabuf::get_dmabuf,
+         drm_syncobj::DrmSyncobjCachedState,
+@@ -26,6 +26,7 @@ use smithay::{
+ };
+ 
+ use crate::comp::{ClientState, FocusTarget, State};
++use std::sync::atomic::Ordering;
+ 
+ /// Whether `WOLF_HDR_CM` is set (read once). Gates the per-surface client-buffer-format
+ /// logging below, which would otherwise be hot in the commit path.
+@@ -165,6 +166,35 @@ impl CompositorHandler for State {
+     fn commit(&mut self, surface: &WlSurface) {
++        // Snapshot before Smithay's renderer handler consumes current().buffer.
++        // The handler still runs before any compositor state is mutated below.
++        let attached_new_buffer = with_states(surface, |states| {
++            let mut attrs = states.cached_state.get::<SurfaceAttributes>();
++            matches!(
++                &attrs.current().buffer,
++                Some(BufferAssignment::NewBuffer(_))
++            )
++        });
+         on_commit_buffer_handler::<Self>(surface);
+ 
++        // Attribute commits from an app surface tree to its xdg-toplevel root.
++        // This includes a video child surface but excludes cursor/popup trees.
++        // Pending toplevels cover first commits before initial configure maps them.
++        let mut app_root = surface.clone();
++        while let Some(parent) = get_parent(&app_root) {
++            app_root = parent;
++        }
++        // Membership is read before window.on_commit() advances compositor state.
++        let app_toplevel = self
++            .space
++            .elements()
++            .any(|w| w.wl_surface().map(|s| &*s == &app_root).unwrap_or(false))
++            || self
++                .pending_windows
++                .iter()
++                .any(|w| w.wl_surface().map(|s| &*s == &app_root).unwrap_or(false));
++        if app_toplevel && attached_new_buffer {
++            self.app_surface_commits.fetch_add(1, Ordering::Relaxed);
++        }
++
+         // WOLF_HDR_CM: read the just-committed dmabuf fourcc ONCE, here, BEFORE the
+         // window/popup commits below advance the surface's double-buffered state (which would
+         // consume current().buffer and make a later read return None -- that was the bug). One

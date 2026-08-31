@@ -1,0 +1,671 @@
+/* ============================================================
+   SessionLoader — the launch scene and the stream handoff.
+   Source: design_handoff_v3/screens/loading-v3.html +
+   loading-to-stream-v3.html (§D of the handoff spec). Geometry,
+   keyframes and timings are the mock's; only the class names are
+   scoped (`sl-`) and the colours re-pointed onto the v3 tokens.
+   ============================================================ */
+
+.sl-root {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  min-height: 30rem;
+  place-items: center;
+  isolation: isolate;
+  background:
+    radial-gradient(circle at 50% 44%, var(--accent-soft), transparent 32%),
+    radial-gradient(circle at 84% 12%, oklch(0.5998 0.2179 273.21 / 7%), transparent 30%),
+    linear-gradient(150deg, var(--bg), oklch(0.13 0.012 267) 58%, var(--core));
+  transition: opacity 220ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* ---- Lockup ---- */
+.sl-lockup {
+  position: absolute;
+  top: clamp(1.5rem, 4vw, 2.5rem);
+  left: clamp(1.5rem, 4vw, 3rem);
+  display: flex;
+  gap: 0.85rem;
+  align-items: center;
+}
+
+.sl-lockup .sl-mark {
+  flex: none;
+  width: 2.35rem;
+  height: 2.35rem;
+}
+
+.sl-wordmark {
+  font-family: var(--font-brand);
+  font-size: 0.72rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+
+/* ---- Accretion visual ---- */
+.sl-quasar {
+  position: relative;
+  width: min(58vw, 620px);
+  aspect-ratio: 1.9;
+  transform: translateY(-6%);
+}
+
+.sl-quasar .jet {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 70%;
+  height: 6px;
+  border-radius: 50%;
+  opacity: 0;
+  background: linear-gradient(
+    90deg,
+    #fff,
+    oklch(0.78 0.16 273) 9%,
+    oklch(0.5998 0.2179 273.21 / 60%) 38%,
+    transparent 100%
+  );
+  filter: blur(1px);
+  transform-origin: left center;
+  animation: sl-jet-pulse 4.8s cubic-bezier(0.6, 0, 0.25, 1) infinite;
+}
+
+.sl-quasar .jet::after {
+  position: absolute;
+  inset: -24px 0;
+  content: "";
+  opacity: 0.4;
+  background: inherit;
+  filter: blur(18px);
+}
+
+.sl-quasar .jet-right {
+  transform: rotate(-8deg);
+}
+
+.sl-quasar .jet-left {
+  transform: rotate(172deg);
+}
+
+.sl-quasar .orbit {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  border: 1px solid oklch(0.5998 0.2179 273.21 / 34%);
+  border-radius: 50%;
+  transform: translate(-50%, -50%) rotate(-9deg);
+}
+
+.sl-quasar .orbit-a {
+  width: 49%;
+  height: 29%;
+  animation: sl-breathe 4.8s ease-in-out infinite;
+}
+
+.sl-quasar .orbit-b {
+  width: 67%;
+  height: 38%;
+  border-color: oklch(0.72 0.12 273 / 16%);
+  animation: sl-breathe 4.8s 0.18s ease-in-out infinite reverse;
+}
+
+.sl-quasar .disc {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 45%;
+  height: 19%;
+  border-radius: 50%;
+  background: radial-gradient(
+    ellipse,
+    transparent 0 19%,
+    #fff 20% 21%,
+    oklch(0.82 0.14 273) 23%,
+    var(--accent) 42%,
+    oklch(0.42 0.19 273) 60%,
+    transparent 72%
+  );
+  filter: blur(1.5px);
+  transform: translate(-50%, -50%) rotate(-8deg);
+  animation: sl-disc-spin 4.8s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+.sl-quasar .disc::before,
+.sl-quasar .disc::after {
+  position: absolute;
+  inset: 13% -8%;
+  content: "";
+  border-top: 2px solid oklch(1 0 0 / 70%);
+  border-bottom: 1px solid oklch(0.78 0.14 273 / 30%);
+  border-radius: 50%;
+  filter: blur(0.5px);
+}
+
+.sl-quasar .disc::after {
+  inset: -20% -20%;
+  border-width: 1px;
+  opacity: 0.34;
+}
+
+.sl-quasar .core {
+  position: absolute;
+  z-index: 2;
+  top: 50%;
+  left: 50%;
+  width: 8.5%;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow:
+    0 0 7px 2px #fff,
+    0 0 20px 7px oklch(0.78 0.16 273),
+    0 0 52px 17px var(--accent),
+    0 0 100px 30px oklch(0.5998 0.2179 273.21 / 30%);
+  transform: translate(-50%, -50%);
+  animation: sl-core-pulse 4.8s ease-in-out infinite;
+}
+
+.sl-quasar .scanline {
+  position: absolute;
+  z-index: 3;
+  top: 50%;
+  left: 50%;
+  width: 68%;
+  height: 1px;
+  opacity: 0;
+  background: linear-gradient(90deg, transparent, var(--accent), #fff, var(--accent), transparent);
+  transform: translate(-50%, -50%) rotate(-8deg);
+  animation: sl-scan 4.8s ease-out infinite;
+}
+
+/* ---- Status block ----
+   No backing panel: the scene behind it is empty, so a card only drew a box
+   around nothing. It centres on the same axis as the quasar. */
+.sl-status {
+  position: absolute;
+  bottom: clamp(2.25rem, 7vh, 4.5rem);
+  left: 50%;
+  width: min(90vw, 34rem);
+  text-align: center;
+  transform: translateX(-50%);
+}
+
+.sl-status h1 {
+  margin: 0;
+  color: var(--text);
+  font-size: clamp(1.5rem, 2.6vw, 2rem);
+  font-weight: 500;
+  line-height: 1.15;
+  letter-spacing: -0.03em;
+}
+
+.sl-verb {
+  display: block;
+}
+
+/* The phase sits on its own line: as an inline sibling every word swap moved
+   the static verb. */
+.sl-stage {
+  display: block;
+  color: var(--accent);
+  transition:
+    opacity 140ms cubic-bezier(0.2, 0, 0, 1),
+    transform 140ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.sl-stage.changing {
+  opacity: 0;
+  transform: translateY(0.4rem);
+}
+
+.sl-status-foot {
+  display: flex;
+  justify-content: center;
+  margin-top: 1.6rem;
+}
+
+/* ---- Glyph rail ---- */
+.sl-rail {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  width: min(28rem, 100%);
+  margin: 0 auto;
+  padding: 0;
+  list-style: none;
+}
+
+.sl-step {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 3.1rem;
+  height: 3.1rem;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  opacity: 0.38;
+  color: var(--text-3);
+  transition:
+    color 150ms ease,
+    opacity 150ms ease,
+    border-color 150ms ease,
+    background 150ms ease;
+}
+
+.sl-step svg {
+  display: block;
+  width: 2rem;
+  height: 2rem;
+  fill: none;
+  stroke: currentcolor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.sl-step[data-state="active"] {
+  opacity: 1;
+  color: var(--accent);
+}
+
+/* A completed phase keeps its own glyph and gains a ring — a row of identical
+   ticks would erase which phase finished. */
+.sl-step[data-state="done"] {
+  border-color: oklch(0.76 0.15 164 / 45%);
+  background: oklch(0.76 0.15 164 / 8%);
+  opacity: 1;
+  color: var(--success);
+}
+
+.sl-link {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0.75rem;
+  height: 1px;
+  overflow: hidden;
+  background: var(--surf-control);
+}
+
+.sl-link[data-state="done"] {
+  background: oklch(0.76 0.15 164 / 50%);
+}
+
+.sl-link[data-state="active"]::after {
+  position: absolute;
+  inset: 0;
+  content: "";
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: sl-link-scan 1.25s ease-in-out infinite;
+}
+
+.sl-step[data-state="active"] .arc {
+  animation: sl-wave 1.5s ease-in-out infinite;
+}
+
+.sl-step[data-state="active"] .arc:nth-child(2) {
+  animation-delay: 160ms;
+}
+
+.sl-step[data-state="active"] .arc:nth-child(3) {
+  animation-delay: 320ms;
+}
+
+.sl-step[data-state="active"] .shackle {
+  animation: sl-latch 1.5s ease-in-out infinite;
+}
+
+.sl-step[data-state="active"] .play {
+  transform-origin: 12px 12px;
+  animation: sl-beat 1.5s ease-in-out infinite;
+}
+
+.sl-step[data-state="active"] .key {
+  animation: sl-press 1.2s ease-in-out infinite;
+}
+
+.sl-step[data-state="active"] .key-b {
+  animation-delay: 300ms;
+}
+
+/* ---- Stall ----
+   Small print under the phase word: the launch is still running, this only
+   names what has stopped moving. */
+.sl-stall {
+  margin-top: 1.75rem;
+  color: var(--text-3);
+  font-size: var(--t-sm);
+  line-height: 1.5;
+}
+
+.sl-stall-title {
+  margin: 0 0 0.25rem;
+  color: var(--text-2);
+  font-weight: 500;
+}
+
+.sl-stall-msg {
+  margin: 0;
+  text-wrap: pretty;
+}
+
+.sl-actions {
+  display: flex;
+  gap: var(--s2);
+  justify-content: center;
+  margin-top: var(--s5);
+}
+
+/* ---- Failure ----
+   Terminal: no quasar, no rail, and the block leaves the bottom rail for the
+   centre of the scene — nothing on screen may still read as progress. */
+.sl-root.is-failed .sl-status {
+  position: static;
+  width: min(90vw, 38rem);
+  transform: none;
+}
+
+.sl-fail-msg {
+  margin: var(--s4) 0 0;
+  color: var(--text-2);
+  text-wrap: pretty;
+}
+
+.sl-fail-detail {
+  margin: var(--s2) 0 0;
+  color: var(--text-3);
+  font-size: var(--t-sm);
+  text-wrap: pretty;
+}
+
+.sl-fail-log {
+  margin-top: var(--s4);
+  text-align: left;
+}
+
+/* ---- Handoff ---- */
+.sl-aperture {
+  position: fixed;
+  z-index: 20;
+  top: 50%;
+  left: 50%;
+  width: 10px;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  opacity: 0;
+  background: #fff;
+  box-shadow:
+    0 0 30px 12px oklch(0.82 0.14 273),
+    0 0 100px 35px var(--accent);
+  transform: translate(-50%, -56%) scale(0);
+  pointer-events: none;
+}
+
+.sl-root.is-locking .sl-status {
+  animation: sl-status-lock 400ms cubic-bezier(0.2, 0, 0, 1) forwards;
+}
+
+.sl-root.is-locking .sl-quasar {
+  animation: sl-quasar-lock 900ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+.sl-root.is-locking .sl-aperture {
+  animation: sl-aperture 1.65s cubic-bezier(0.5, 0, 0.15, 1) forwards;
+}
+
+.sl-root.is-streaming {
+  opacity: 0;
+  pointer-events: none;
+}
+
+@keyframes sl-core-pulse {
+  0%,
+  100% {
+    transform: translate(-50%, -50%) scale(0.78);
+  }
+
+  28% {
+    transform: translate(-50%, -50%) scale(1.15);
+  }
+
+  55% {
+    transform: translate(-50%, -50%) scale(0.93);
+  }
+
+  73% {
+    transform: translate(-50%, -50%) scale(1.3);
+  }
+}
+
+@keyframes sl-disc-spin {
+  0% {
+    opacity: 0.2;
+    transform: translate(-50%, -50%) rotate(-8deg) scale(0.55);
+  }
+
+  24% {
+    opacity: 1;
+    transform: translate(-50%, -50%) rotate(5deg) scale(1);
+  }
+
+  68% {
+    opacity: 0.9;
+    transform: translate(-50%, -50%) rotate(-14deg) scale(1.04);
+  }
+
+  88%,
+  100% {
+    opacity: 0.18;
+    transform: translate(-50%, -50%) rotate(-8deg) scale(0.58);
+  }
+}
+
+@keyframes sl-jet-pulse {
+  0%,
+  14%,
+  100% {
+    width: 1%;
+    opacity: 0;
+  }
+
+  32% {
+    width: 52%;
+    opacity: 0.75;
+  }
+
+  58% {
+    width: 70%;
+    opacity: 0.4;
+  }
+
+  76% {
+    width: 82%;
+    opacity: 1;
+  }
+
+  88% {
+    width: 94%;
+    opacity: 0;
+  }
+}
+
+@keyframes sl-breathe {
+  0%,
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) rotate(-9deg) scale(0.55);
+  }
+
+  30%,
+  70% {
+    opacity: 1;
+    transform: translate(-50%, -50%) rotate(2deg) scale(1);
+  }
+
+  88% {
+    opacity: 0.1;
+    transform: translate(-50%, -50%) rotate(10deg) scale(1.25);
+  }
+}
+
+@keyframes sl-scan {
+  0%,
+  50%,
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) rotate(-8deg) scaleX(0.2);
+  }
+
+  65% {
+    opacity: 0.15;
+  }
+
+  75% {
+    opacity: 1;
+    transform: translate(-50%, -50%) rotate(-8deg) scaleX(1.2);
+  }
+
+  82% {
+    opacity: 0;
+    transform: translate(-50%, -50%) rotate(-8deg) scaleX(1.5);
+  }
+}
+
+@keyframes sl-link-scan {
+  from {
+    transform: translateX(-100%);
+  }
+
+  to {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes sl-wave {
+  0%,
+  100% {
+    opacity: 0.22;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes sl-latch {
+  0%,
+  100% {
+    transform: translateY(-0.75px);
+  }
+
+  55% {
+    transform: translateY(0);
+  }
+}
+
+@keyframes sl-beat {
+  0%,
+  100% {
+    transform: scale(0.84);
+  }
+
+  50% {
+    transform: scale(1.08);
+  }
+}
+
+@keyframes sl-press {
+  0%,
+  100% {
+    opacity: 0.28;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes sl-status-lock {
+  0% {
+    opacity: 1;
+    transform: translateX(-50%) scale(1);
+  }
+
+  100% {
+    opacity: 0;
+    transform: translateX(-50%) translateY(1.25rem) scale(0.98);
+  }
+}
+
+@keyframes sl-quasar-lock {
+  0% {
+    transform: translateY(-6%) scale(1);
+  }
+
+  55% {
+    transform: translateY(-6%) scale(0.32);
+    filter: brightness(2.5);
+  }
+
+  100% {
+    opacity: 0;
+    transform: translateY(-6%) scale(0.02);
+    filter: brightness(6);
+  }
+}
+
+@keyframes sl-aperture {
+  0%,
+  20% {
+    opacity: 0;
+    transform: translate(-50%, -56%) scale(0);
+  }
+
+  37% {
+    opacity: 1;
+    transform: translate(-50%, -56%) scale(2);
+  }
+
+  62% {
+    opacity: 1;
+    transform: translate(-50%, -56%) scale(180);
+  }
+
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -56%) scale(230);
+  }
+}
+
+@media (max-width: 650px) {
+  .sl-quasar {
+    width: 94vw;
+  }
+
+  .sl-status {
+    width: calc(100% - 2rem);
+  }
+
+  .sl-rail {
+    width: 100%;
+  }
+}
+
+/* base.css collapses every animation and transition to 0s, but its `*` rule does
+   not reach pseudo-elements. Two layers also read as nothing at their base
+   state, so they get a static frame here. */
+@media (prefers-reduced-motion: reduce) {
+  .sl-quasar .jet {
+    width: 60%;
+    opacity: 0.45;
+  }
+
+  .sl-quasar .disc {
+    opacity: 1;
+  }
+
+  .sl-link[data-state="active"]::after {
+    animation: none;
+  }
+}

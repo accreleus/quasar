@@ -1,0 +1,3 @@
+BEGIN;
+ALTER TABLE gpus DROP COLUMN device_path;
+COMMIT;

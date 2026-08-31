@@ -1,0 +1,319 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 1800fa0..d0a2bcf 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1860,0 +1861 @@ dependencies = [
++ "cc",
+diff --git a/wayland-display-core/Cargo.toml b/wayland-display-core/Cargo.toml
+index c8c5377..8cceabb 100644
+--- a/wayland-display-core/Cargo.toml
++++ b/wayland-display-core/Cargo.toml
+@@ -47,0 +48 @@ pkg-config = "0.3"
++cc = "1"
+diff --git a/wayland-display-core/build.rs b/wayland-display-core/build.rs
+index 552696f..6d3f3db 100644
+--- a/wayland-display-core/build.rs
++++ b/wayland-display-core/build.rs
+@@ -1,2 +0,0 @@
+-use pkg_config;
+-
+@@ -3,0 +2,16 @@ fn main() {
++    // Compile a tiny, header-checked bridge for Vulkan handle/barrier fields that bindgen
++    // intentionally truncates because Vulkan handles are platform-dependent typedefs.
++    // This avoids guessing private struct offsets in Rust and makes any GStreamer ABI drift
++    // a compile-time failure against the exact headers used by the plugin.
++    let vulkan = pkg_config::Config::new()
++        .atleast_version("1.28")
++        .probe("gstreamer-vulkan-1.0")
++        .expect("gstreamer-vulkan-1.0 >= 1.28 is required");
++    let mut bridge = cc::Build::new();
++    bridge.file("src/utils/vulkan_bridge.c");
++    for include in vulkan.include_paths {
++        bridge.include(include);
++    }
++    bridge.compile("wayland_display_vulkan_bridge");
++    println!("cargo:rustc-link-lib=vulkan");
++
+@@ -20,0 +35 @@ fn main() {
++    println!("cargo:rerun-if-changed=src/utils/vulkan_bridge.c");
+diff --git a/wayland-display-core/src/utils/vulkan_bridge.c b/wayland-display-core/src/utils/vulkan_bridge.c
+new file mode 100644
+index 0000000..a548216
+--- /dev/null
++++ b/wayland-display-core/src/utils/vulkan_bridge.c
+@@ -0,0 +1,57 @@
++#include <gst/vulkan/vulkan.h>
++
++VkInstance
++wayland_display_vk_instance (GstVulkanDevice *device)
++{
++  return device->instance->instance;
++}
++
++VkInstance
++wayland_display_vk_instance_handle (GstVulkanInstance *instance)
++{
++  return instance->instance;
++}
++
++VkDevice
++wayland_display_vk_device (GstVulkanDevice *device)
++{
++  return device->device;
++}
++
++VkQueue
++wayland_display_vk_queue (GstVulkanQueue *queue)
++{
++  return queue->queue;
++}
++
++guint32
++wayland_display_vk_queue_family (GstVulkanQueue *queue)
++{
++  return queue->family;
++}
++
++VkImage
++wayland_display_vk_image (GstMemory *memory)
++{
++  g_return_val_if_fail (gst_is_vulkan_image_memory (memory), VK_NULL_HANDLE);
++  return ((GstVulkanImageMemory *) memory)->image;
++}
++
++void
++wayland_display_vk_prepare_encode_image (GstMemory *memory)
++{
++  GstVulkanImageMemory *image;
++
++  g_return_if_fail (gst_is_vulkan_image_memory (memory));
++  image = (GstVulkanImageMemory *) memory;
++  /* Preserve PR #37's fan-out contract, but make it header-checked rather than
++   * writing guessed Rust byte offsets. The producer CPU-waits its write fence and
++   * vulkanh26x synchronously waits encode completion before dropping the buffer. */
++  if (image->barrier.parent.semaphore != VK_NULL_HANDLE)
++    vkDestroySemaphore (image->device->device,
++        image->barrier.parent.semaphore, NULL);
++  image->barrier.parent.queue = NULL;
++  image->barrier.parent.semaphore = VK_NULL_HANDLE;
++  image->barrier.parent.semaphore_value = 0;
++  image->barrier.image_layout = VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR;
++}
+diff --git a/wayland-display-core/src/utils/vulkan_nv12.rs b/wayland-display-core/src/utils/vulkan_nv12.rs
+index caafa6e..4c15944 100644
+--- a/wayland-display-core/src/utils/vulkan_nv12.rs
++++ b/wayland-display-core/src/utils/vulkan_nv12.rs
+@@ -67,0 +68 @@ use gstreamer_allocators::{DmaBufAllocator, DmaBufAllocatorExtManual, FdMemoryFl
++use gstreamer_vulkan::prelude::VulkanQueueExtManual;
+@@ -461,0 +463,3 @@ pub struct VulkanNv12 {
++    /// The exact GStreamer graphics queue used by `queue`; retained so every custom
++    /// `vkQueueSubmit` participates in GStreamer's external-submit lock.
++    shared_queue: Option<gstreamer_vulkan::VulkanQueue>,
+@@ -716,0 +721 @@ impl VulkanNv12 {
++            shared_queue: None,
+@@ -773 +778 @@ impl VulkanNv12 {
+-        let queue = device.get_device_queue(raw.gfx_queue_family, 0);
++        let queue = raw.queue;
+@@ -870,0 +876 @@ impl VulkanNv12 {
++            shared_queue: Some(raw.gfx_queue),
+@@ -906,7 +912,2 @@ impl VulkanNv12 {
+-        // Fan-out safety (encode-src path): one produced buffer can be referenced by several
+-        // downstream encoders at once (interpipe delivers it to every consumer). Our own
+-        // graphics fence above only proves *our* last write to this slot finished -- it says
+-        // nothing about the consumers' encode *reads*, which run on the encode queue with no
+-        // shared sync to us. Overwriting the slot's image while an encode still reads it is a
+-        // GPU data hazard that wedges the encoder. Block until every consumer has dropped its
+-        // ref (the buffer is writable again, refcount back to 1) before reusing the slot.
++        // vulkanh26x waits its GstVulkanOperation before returning from encode, and retains
++        // the input buffer until then. Writability is therefore the PR #37 completion gate.
+@@ -916 +916,0 @@ impl VulkanNv12 {
+-                // ~1s cap so a paused/stalled consumer can't deadlock the producer forever.
+@@ -1175 +1175,6 @@ impl VulkanNv12 {
+-        self.device.queue_submit(self.queue, &[submit], fence)?;
++        // VkQueue is externally synchronized. Participate in the same submit lock used by
++        // GstVulkanOperation instead of racing GStreamer on the shared graphics queue.
++        {
++            let _queue_guard = self.shared_queue.as_ref().map(|q| q.submit_lock());
++            self.device.queue_submit(self.queue, &[submit], fence)?;
++        }
+@@ -1361,11 +1372,16 @@ impl VulkanNv12 {
+             .device
+             .create_fence(&vk::FenceCreateInfo::default(), None)?;
+         let cbs = [cmd];
+-        self.device.queue_submit(
+-            self.queue,
+-            &[vk::SubmitInfo::default().command_buffers(&cbs)],
+-            fence,
+-        )?;
++        // The diagnostic dump is normally disabled, but its raw ash submit must still join
++        // the exact same external-synchronization domain as the converter and encoder.
++        {
++            let _queue_guard = self.shared_queue.as_ref().map(|q| q.submit_lock());
++            self.device.queue_submit(
++                self.queue,
++                &[vk::SubmitInfo::default().command_buffers(&cbs)],
++                fence,
++            )?;
++        }
+         self.device.wait_for_fences(&[fence], true, u64::MAX)?;
+ 
+         let ptr = self
+diff --git a/wayland-display-core/src/utils/vulkan_share.rs b/wayland-display-core/src/utils/vulkan_share.rs
+index b8b9db0..ee98939 100644
+--- a/wayland-display-core/src/utils/vulkan_share.rs
++++ b/wayland-display-core/src/utils/vulkan_share.rs
+@@ -29 +29 @@ use gstreamer_vulkan::prelude::*;
+-use gstreamer_vulkan::{VulkanDevice, VulkanInstance, VulkanPhysicalDevice};
++use gstreamer_vulkan::{VulkanDevice, VulkanInstance, VulkanPhysicalDevice, VulkanQueue};
+@@ -31 +30,0 @@ use gstreamer_vulkan_sys as gstvk;
+-use std::os::raw::c_void;
+@@ -39,37 +38,8 @@ const VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR: i32 = 1_000_299_001;
+-// --- repr(C) overlays of the public gst-vulkan structs (fields the -sys crate omits). ---
+-
+-/// `struct _GstVulkanDevice { GstObject parent; GstVulkanInstance *instance;
+-/// GstVulkanPhysicalDevice *physical_device; VkDevice device; ... }`
+-#[repr(C)]
+-struct GstVulkanDeviceOverlay {
+-    parent: gst::ffi::GstObject,
+-    instance: *mut c_void,        // GstVulkanInstance*
+-    physical_device: *mut c_void, // GstVulkanPhysicalDevice*
+-    device: vk::Device,           // ABI: a dispatchable handle (pointer)
+-}
+-
+-/// `struct _GstVulkanInstance { GstObject parent; VkInstance instance; ... }`
+-#[repr(C)]
+-struct GstVulkanInstanceOverlay {
+-    parent: gst::ffi::GstObject,
+-    instance: vk::Instance,
+-}
+-
+-/// `struct _GstVulkanQueue { GstObject parent; GstVulkanDevice *device; VkQueue queue;
+-/// guint32 family; guint32 index; }`
+-#[repr(C)]
+-struct GstVulkanQueueOverlay {
+-    parent: gst::ffi::GstObject,
+-    device: *mut c_void,
+-    queue: vk::Queue,
+-    family: u32,
+-    index: u32,
+-}
+-
+-/// `struct _GstVulkanImageMemory { GstMemory parent; GstVulkanDevice *device;
+-/// VkImage image; ... }`
+-#[repr(C)]
+-struct GstVulkanImageMemoryOverlay {
+-    parent: gst::ffi::GstMemory,
+-    device: *mut c_void,
+-    image: vk::Image,
++unsafe extern "C" {
++    fn wayland_display_vk_instance(device: *mut gstvk::GstVulkanDevice) -> vk::Instance;
++    fn wayland_display_vk_instance_handle(instance: *mut gstvk::GstVulkanInstance) -> vk::Instance;
++    fn wayland_display_vk_device(device: *mut gstvk::GstVulkanDevice) -> vk::Device;
++    fn wayland_display_vk_queue(queue: *mut gstvk::GstVulkanQueue) -> vk::Queue;
++    fn wayland_display_vk_queue_family(queue: *mut gstvk::GstVulkanQueue) -> u32;
++    fn wayland_display_vk_image(memory: *mut gst::ffi::GstMemory) -> vk::Image;
++    fn wayland_display_vk_prepare_encode_image(memory: *mut gst::ffi::GstMemory);
+@@ -80 +50 @@ struct GstVulkanImageMemoryOverlay {
+-#[derive(Clone, Copy, Debug)]
++#[derive(Clone, Debug)]
+@@ -85,0 +56,2 @@ pub struct RawVk {
++    pub queue: vk::Queue,
++    pub gfx_queue: VulkanQueue,
+@@ -215 +187 @@ pub fn ensure_owned_device(target_minor: Option<u32>) -> Option<VulkanDevice> {
+-    let vk_instance = unsafe { (*(instance.as_ptr() as *const GstVulkanInstanceOverlay)).instance };
++    let vk_instance = unsafe { wayland_display_vk_instance_handle(instance.as_ptr()) };
+@@ -300,2 +272,3 @@ pub fn raw_handles(device: &VulkanDevice) -> Option<RawVk> {
+-        let overlay = &*(dev_ptr as *const GstVulkanDeviceOverlay);
+-        if overlay.device == vk::Device::null() || overlay.instance.is_null() {
++        let vk_device = wayland_display_vk_device(dev_ptr);
++        let vk_instance = wayland_display_vk_instance(dev_ptr);
++        if vk_device == vk::Device::null() || vk_instance == vk::Instance::null() {
+@@ -304 +276,0 @@ pub fn raw_handles(device: &VulkanDevice) -> Option<RawVk> {
+-        let vk_instance = (*(overlay.instance as *const GstVulkanInstanceOverlay)).instance;
+@@ -309,8 +281,27 @@ pub fn raw_handles(device: &VulkanDevice) -> Option<RawVk> {
+-        // A queue that can run our compute + copy (the encoder owns its own encode queue).
+-        let queue =
+-            gstvk::gst_vulkan_device_select_queue(dev_ptr, vk::QueueFlags::GRAPHICS.as_raw());
+-        let gfx_queue_family = if queue.is_null() {
+-            0
+-        } else {
+-            (*(queue as *const GstVulkanQueueOverlay)).family
+-        };
++        // Keep the actual GStreamer queue object: VkQueue submission is externally
++        // synchronized, so the producer must use the same submit lock as GStreamer.
++        let gfx_ptr = gstvk::gst_vulkan_device_select_queue(
++            dev_ptr,
++            (vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE).as_raw(),
++        );
++        if gfx_ptr.is_null() {
++            return None;
++        }
++        let gfx_queue_family = wayland_display_vk_queue_family(gfx_ptr);
++        let entry = ash::Entry::load().ok()?;
++        let instance = ash::Instance::load(entry.static_fn(), vk_instance);
++        let families = instance.get_physical_device_queue_family_properties(vk_physical);
++        let required = vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE;
++        if families
++            .get(gfx_queue_family as usize)
++            .is_none_or(|family| !family.queue_flags.contains(required))
++        {
++            drop(from_glib_full::<_, VulkanQueue>(gfx_ptr));
++            tracing::error!(
++                gfx_queue_family,
++                "vulkan_share: selected producer queue is not graphics+compute capable"
++            );
++            return None;
++        }
++        let queue = wayland_display_vk_queue(gfx_ptr);
++        let gfx_queue: VulkanQueue = from_glib_full(gfx_ptr);
+@@ -320 +311 @@ pub fn raw_handles(device: &VulkanDevice) -> Option<RawVk> {
+-            device: overlay.device,
++            device: vk_device,
+@@ -321,0 +313,2 @@ pub fn raw_handles(device: &VulkanDevice) -> Option<RawVk> {
++            queue,
++            gfx_queue,
+@@ -495,37 +488,3 @@ pub fn alloc_encode_src_buffer(
+-
+-        // Our converter always leaves this image in VIDEO_ENCODE_SRC layout (it CPU-waits the
+-        // copy fence before handing the buffer downstream). Seed gst's *tracked* layout to match.
+-        // Otherwise `gst_vulkan_operation_add_frame_barrier` reads the stale alloc-time layout
+-        // (UNDEFINED) and records an UNDEFINED->VIDEO_ENCODE_SRC layout *write* transition for the
+-        // input image on every encode. With one encoder that's merely wasteful; with the interpipe
+-        // fan-out (one buffer -> N encoders) two such concurrent layout writes on the shared image,
+-        // on the video-encode queue with no semaphore between them, deadlock the GPU at frame 2.
+-        // With the tracked layout already SRC, each encoder's barrier is old==new == a pure read
+-        // barrier (VIDEO_ENCODE_READ), which is safe to issue concurrently from multiple encoders.
+-        //
+-        // `barrier.image_layout` offset in GstVulkanImageMemory (public struct, ABI-stable since
+-        // 1.18); verified against the running gst headers (sizeof=472, image@120, barrier@288,
+-        // barrier.image_layout@368).
+-        // GstVulkanImageMemory.barrier field offsets, verified against the running gst headers
+-        // (sizeof=472, image@120, barrier@288) and cross-checked against the gst 1.28.4 tag
+-        // (deploy target): _GstVulkanImageMemory and _GstVulkanBarrierMemoryInfo have identical
+-        // field order in 1.28.4 and 1.29.1, so these offsets hold for both. The struct is public
+-        // and ABI-stable since 1.18; re-run the /tmp/off.c offsetof probe if targeting a newer gst.
+-        const BARRIER_QUEUE_OFFSET: usize = 296; // barrier.parent.queue (GstVulkanQueue*)
+-        const BARRIER_SEMAPHORE_OFFSET: usize = 320; // barrier.parent.semaphore (VkSemaphore)
+-        const BARRIER_SEMAPHORE_VALUE_OFFSET: usize = 328; // barrier.parent.semaphore_value
+-        const BARRIER_IMAGE_LAYOUT_OFFSET: usize = 368; // barrier.image_layout (VkImageLayout)
+-        let base = mem_ptr as *mut u8;
+-        *(base.add(BARRIER_IMAGE_LAYOUT_OFFSET) as *mut i32) = VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR;
+-        // Null the per-memory cross-queue dependency so gst's encoder adds no timeline-semaphore
+-        // wait/signal nor queue-ownership transfer against our image. gst's normal flow uses this
+-        // per-memory timeline semaphore to order one consumer after the previous producer op; but
+-        // (a) our converter already CPU-waits its write fence before handing the buffer downstream,
+-        // so the write is GPU-complete, and (b) the encoders only READ the image. With the interpipe
+-        // fan-out, leaving the semaphore set makes two encoders race the shared timeline value
+-        // (each does add_dependency=read-value, encode=signal value+1, end=increment) -> two
+-        // submissions signal the same value -> timeline corruption -> GPU hang. Read-only access by
+-        // N encoders needs no cross-dependency, so clear it.
+-        *(base.add(BARRIER_QUEUE_OFFSET) as *mut usize) = 0;
+-        *(base.add(BARRIER_SEMAPHORE_OFFSET) as *mut u64) = 0;
+-        *(base.add(BARRIER_SEMAPHORE_VALUE_OFFSET) as *mut u64) = 0;
++        // PR #37 intentionally seeds the encode layout and disables the per-memory
++        // timeline for safe read-only fan-out. Do it through target headers, not ABI offsets.
++        wayland_display_vk_prepare_encode_image(mem_ptr);
+@@ -564 +523,2 @@ pub fn recover_vk_image(buffer: &gst::Buffer) -> Option<vk::Image> {
+-        Some((*(mem_ptr as *const GstVulkanImageMemoryOverlay)).image)
++        let image = wayland_display_vk_image(mem_ptr);
++        (image != vk::Image::null()).then_some(image)

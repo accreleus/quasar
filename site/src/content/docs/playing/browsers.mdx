@@ -1,0 +1,89 @@
+---
+title: Browser support
+description: Which browsers work, which are untested, and why HTTPS is not optional.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## The short answer
+
+Use Chrome, or a Chromium-based browser such as Edge or Brave, on a desktop
+operating system, over HTTPS.
+
+## Why Chrome
+
+Chrome is what Quasar is developed and validated against. Three things depend on
+it specifically:
+
+- **Keyboard Lock**, which routes Escape to the game rather than to the browser,
+  is Chromium-only.
+- **Codec behaviour** is measured against Chrome's decoders. The rules Quasar
+  applies about what your device can decode are derived from Chrome's actual
+  behaviour.
+- **The Gamepad API** implementation differences matter for controller support.
+
+Firefox and Safari are not tested. Parts may work. Nothing is promised, and
+problems on them are not going to be diagnosable against any known-good
+baseline.
+
+## HTTPS is not optional
+
+Three features require a secure context, which in practice means HTTPS:
+
+| Feature | Without HTTPS |
+| --- | --- |
+| Gamepad support | Controllers are not detected. |
+| Keyboard Lock | Escape leaves fullscreen instead of reaching the game. |
+| Microphone | Cannot be enabled. |
+
+The default deployment generates a self-signed certificate and serves HTTPS on
+port 8443. Accepting the browser warning once is enough to get a secure context.
+See [HTTPS and certificates](/quasar/network/https/).
+
+## Codecs, and what your browser can actually decode
+
+Quasar measures your browser's decode capability when you log in and stores it
+against that device. It will not send you something you cannot play.
+
+The rules that come out of this:
+
+**H.264** works everywhere. It is the guaranteed floor, and every quality tier
+ends in an H.264 rung.
+
+**AV1** works everywhere Chrome runs, because Chrome ships a software decoder
+(dav1d) as a fallback. It costs a few milliseconds of extra decode time without
+hardware support, which is usually a good trade for the bandwidth it saves.
+
+**HEVC** is the awkward one. Chrome only decodes HEVC when the operating system
+provides hardware decode for it, and it has no software fallback. In practice
+that means:
+
+| Client OS | HEVC |
+| --- | --- |
+| macOS | Almost always works. |
+| Windows | Usually works, depending on the GPU. |
+| Linux | Effectively never. |
+
+This is Chrome's own gating, not something Quasar can work around. If HEVC is
+unavailable to you, Quasar skips it and uses the next rung down. You do not get
+a black screen, you get a different codec.
+
+<Aside type="note" title="H.264 High profile does not decode in any browser">
+Browser sessions are clamped to constrained-baseline H.264 regardless of which
+GPU encoded it. This is a browser limitation on both AMD and NVIDIA and it is
+handled automatically. It is one of the reasons a native client is on the
+roadmap.
+</Aside>
+
+## Mobile and tablets
+
+A touch device gets an on-screen menu button in place of the keyboard shortcut,
+and touch input is forwarded. It works. Whether a given game is playable with
+touch input is a different question, and mostly the answer is no unless you pair
+a controller.
+
+## Nothing to install
+
+There is no launcher, no browser extension and no client binary. A native client
+is planned for the latency the browser's jitter buffer costs, but the browser is
+the only client today.

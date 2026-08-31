@@ -1,0 +1,17 @@
+{
+  "attempts": [
+    {
+      "run": 1,
+      "stop_seconds": 2.33,
+      "exit_code": 143,
+      "log": "quasar-steam: shutdown requested; relaying to launched processes\nquasar-steam: sending SIGTERM to steam (pid 1468, budget 8s)\nquasar-steam: terminating gamescope (pid 147)"
+    },
+    {
+      "run": 2,
+      "stop_seconds": 2.57,
+      "exit_code": 143,
+      "log": "quasar-steam: shutdown requested; relaying to launched processes\nquasar-steam: sending SIGTERM to steam (pid 1500, budget 8s)\nquasar-steam: terminating gamescope (pid 200)"
+    }
+  ],
+  "container": "quasar-steam-session-abc"
+}

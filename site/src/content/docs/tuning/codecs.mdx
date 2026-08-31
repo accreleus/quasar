@@ -1,0 +1,111 @@
+---
+title: Codecs
+description: H.264, HEVC and AV1, how the server picks one per session, and the browser limits that constrain the choice.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Quasar supports H.264, HEVC and AV1. One per session, chosen by the server at
+launch. You do not pick a codec; you pick a quality tier, and the server resolves
+it against what your host can encode and your browser can decode.
+
+Which codecs a host can produce is decided by its encoder. See
+[Encoders](/quasar/tuning/encoders/).
+
+## What each one buys you
+
+| Codec | Catalog bitrate target | Decodes in Chrome |
+| --- | --- | --- |
+| H.264 | The baseline everything else is measured against | Everywhere |
+| HEVC | 30 to 40 percent lower | Only with operating system hardware decode |
+| AV1 | 40 to 50 percent lower | Everywhere, with a software fallback |
+
+Those are the shipped catalog's target bitrates, not a promise of equal picture
+quality on every game and encoder.
+
+What you are buying is bandwidth headroom, not latency. On a clean LAN with
+bandwidth to spare, the codec barely changes how the stream feels. On a
+constrained link it changes a lot, because more of a smaller budget goes to
+picture instead of overhead.
+
+## How the server picks
+
+A quality tier is an ordered list of encode rungs. The server walks it and takes
+the first rung that survives four checks:
+
+1. **The host can encode it**, as reported by its node agent.
+2. **The client can decode it.** Measured when the user logged in and stored
+   against that device. HEVC and AV1 are hard-gated on a positive result,
+   because sending a codec the browser cannot decode gives a black screen rather
+   than a worse picture. A missing or stale measurement means no HEVC and no
+   AV1.
+3. **It has not failed for this client before.** A codec that failed once is
+   skipped afterwards.
+4. **Hardware encode is available**, where the rung demands it.
+
+Every tier ends in an H.264 rung and the server rejects a tier that has none, so
+there is always something that works. Within a tier the default order is AV1,
+then HEVC, then H.264.
+
+## HEVC in Chrome
+
+Chrome decodes HEVC only when the operating system provides hardware decode. It
+has no software fallback.
+
+| Client | HEVC |
+| --- | --- |
+| macOS | Almost always works |
+| Windows | Usually, depending on the GPU |
+| Linux | Effectively never |
+
+This is Chrome's gating and Quasar cannot do anything about it. HEVC is a macOS
+and Windows optimisation. Linux clients quietly get the next rung down.
+
+<Aside type="note" title="Which also means HEVC cannot be tested headlessly">
+Headless Chrome on Linux never offers HEVC decode, so automated validation of an
+HEVC path is really validating the fallback. Checking HEVC takes a real browser
+on macOS or Windows.
+</Aside>
+
+## AV1
+
+AV1 decodes everywhere Chrome runs, because Chrome ships the dav1d software
+decoder. Without hardware decode it costs a few milliseconds per frame on a
+desktop CPU, which is usually a good trade for what it saves on the wire.
+
+Encoder support is thinner than decoder support, so AV1 is more often limited by
+your host than by your client.
+
+## H.264 and the profile you get
+
+H.264 always works, with one wrinkle worth knowing.
+
+Browser sessions are clamped to constrained-baseline profile, because Chrome's
+WebRTC receiver fails to decode High profile H.264 from both AMD and NVIDIA
+hardware. Quasar handles this for you and there is nothing to configure, but it
+does explain why browser H.264 at a given bitrate looks worse than the same
+bitrate would look elsewhere.
+
+Main and High are reachable only from a native client, which is one of the
+reasons a native client is on the roadmap.
+
+## Turning codecs on
+
+Codecs are enabled per tier, under Admin, Streaming, Launch profiles. The shipped
+tiers already carry HEVC and AV1 rungs, so most deployments have nothing to do.
+
+The list is a preference order and the server takes the first survivor, so order
+matters. H.264 cannot be removed; saving a tier without an H.264 rung is
+rejected.
+
+## One naming quirk
+
+The catalog says `hevc`. The wire and the session records say `h265`. Same
+thing, translated in exactly one place in the code. If you are reading a session
+record and wondering where `hevc` went, that is why.
+
+## Checking what a session used
+
+Admin, Sessions, session detail shows the resolved codec. When it is not what you
+expected, the reason is one of the four checks above, and it is usually the
+client's decode measurement.

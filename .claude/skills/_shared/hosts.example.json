@@ -1,0 +1,88 @@
+{
+  "_comment": "SCHEMA REFERENCE + starting template for _shared/hosts.json. Copy to hosts.json and fill in. This is the ONLY place host-specific facts (addresses, users, key paths, hardware, platform quirks) belong — skill SKILL.md prose and script defaults must stay host-agnostic and speak in ROLES.",
+  "_schema": "quasar-skills/hosts@2",
+
+  "_roles_vocabulary": {
+    "gpu-test": "Primary GPU / streaming test host. DEFAULT target of every host-taking verb. Judge stream quality here.",
+    "aux-infra": "Sanctioned infrastructure host: network-impairment shaping (netem/IFB) and the headless browser peer. May also host the container build/test runner. Never the box you judge Quasar's own quality on unless it is also gpu-test.",
+    "deploy-only": "Production/staging deployment target. Read-only verbs only — skills refuse destructive or experiment verbs against it.",
+    "_note": "A role maps to exactly one host name. A host may hold several roles. Roles a deployment does not have are simply absent; skills that need a missing role say so instead of guessing. A single-box install can point every role at the same host."
+  },
+
+  "roles": {
+    "gpu-test": "my-gpu-box",
+    "aux-infra": "my-aux-box"
+  },
+
+  "_local_loopback_pattern": "A stack host that also needs to drive ITSELF unattended (e.g. a cron job — scripts/dx/nightly_budget.sh) hits a real gap: qses/bench_run.sh always ssh out to whatever --stack names, even when that IS the caller's own machine — there is no 'skip the hop, we're already here' path. Fix (devbox, 2026-08-19): add a hosts{} entry with ssh_host 127.0.0.1, keyed by a DEDICATED keypair (e.g. ~/.ssh/id_ed25519_loopback) added to that box's own authorized_keys — never reuse an interactive/1Password-backed key for this. DO NOT name this entry 'local': common.sh's DX_HOST=local sentinel means something else entirely ('skip remote resolution, this is the ephemeral docker-compose.local.yml dev stack on its own DX_CP_PORT') and bench_run.sh's own admin-API calls (host_curl) fall back to that port whenever DX_HOST=local — a same-named hosts.json entry does NOT override that, so every admin API call silently targets the wrong stack while qses/session launch still (confusingly) works, because qses resolves purely from hosts.json and never consults DX_HOST at all. Use a distinct, real host name instead (e.g. 'devbox-self') so bench_run.sh's normal dx_resolve_remote -> DX_REMOTE_API path takes over correctly. See docs/testing-bench-mode.md 'A nightly budget run'.",
+
+  "hosts": {
+    "my-gpu-box": {
+      "_comment": "Connect EITHER by ssh_alias (a ~/.ssh/config entry that works headlessly) OR by ssh_host + ssh_user + ssh_key. If ssh_key is given, lib.sh adds IdentityAgent=none / IdentitiesOnly=yes so an interactive agent (1Password etc.) never blocks a headless run.",
+      "ssh_host": "192.0.2.10",
+      "ssh_user": "root",
+      "ssh_key": "~/.ssh/my-gpu-box",
+      "ip": "192.0.2.10",
+      "dir": "/srv/quasar",
+      "api": "https://localhost:8443",
+      "api_external": "https://192.0.2.10:8443",
+      "agent_api": "http://192.0.2.10:8080",
+      "gpu": "nvidia",
+      "platform": "linux",
+      "runtime_image": "quasar-nv:latest",
+      "bench_app": "Quasar Bench: Ball",
+      "compose_files": ["deploy/docker-compose.yml", "deploy/docker-compose.nvidia.yml"],
+      "redeploy_label": "nvidia",
+      "notes": [
+        "Free-form operational facts about THIS box — driver quirks, disk layout, reboot-volatile paths, working-directory rules. Skills surface these instead of hardcoding gear specifics in their prose."
+      ]
+    },
+    "my-aux-box": {
+      "ssh_alias": "my-aux-box",
+      "ip": "192.0.2.20",
+      "dir": "/home/me/code/quasar",
+      "api": "https://localhost:8443",
+      "api_external": "https://192.0.2.20:8443",
+      "agent_api": "http://192.0.2.20:8080",
+      "gpu": "amd",
+      "platform": "linux",
+      "runtime_image": "quasar-node-agent:latest",
+      "bench_app": "Quasar Bench: Ball",
+      "notes": []
+    }
+  },
+
+  "_field_reference": {
+    "ssh_alias": "string — ~/.ssh/config host alias. Mutually exclusive with ssh_host/ssh_user/ssh_key.",
+    "ssh_host": "string — address or DNS name.",
+    "ssh_user": "string — remote user.",
+    "ssh_key": "string — path to a private key; '~' is expanded. Presence switches lib.sh to agent-less key auth.",
+    "ip": "string — address used when a peer must name this host on the wire (netem src-ip filters, route lookups).",
+    "dir": "string — the Quasar checkout / working directory on that host. REQUIRED.",
+    "api": "string — control-plane API base URL as seen FROM that host (usually localhost).",
+    "api_external": "string — control-plane API base URL as seen from other hosts.",
+    "agent_api": "string — plain-HTTP agent/health listener (distinct from the HTTPS browser listener in `api`).",
+    "gpu": "one of nvidia | amd | intel | none. Drives GPU-gated image assertions. REQUIRED.",
+    "platform": "string — free-form OS/appliance label (linux, unraid, ...). Skills may cite it when a note is platform-specific.",
+    "runtime_image": "string — node-agent runtime image tag for this host.",
+    "bench_app": "string — default benchmark app name the live-session harness launches here.",
+    "compose_files": "array of repo-relative paths — the docker compose file(s) this host's stack is composed from: always deploy/docker-compose.yml, plus the overlays this host needs (docker-compose.nvidia.yml on a CUDA box, overlays/docker-compose.console.yml for local display). Defaults to [deploy/docker-compose.yml].",
+    "compose_files_multiagent": "array — optional overlay set for the multi-agent (N>1) stack. Absent means the host does not run one.",
+    "redeploy_label": "string — the HARDWARE PROFILE deploy/redeploy.sh expects as its first argument: `va` (AMD/Intel) or `nvidia`. Not a host name — the script has no per-box branch.",
+    "notes": "array of strings — operator knowledge about this host. Skills print these rather than embedding gear specifics in shipped prose."
+  },
+
+  "harness": {
+    "_comment": "Non-admin user the live-session harness registers/logs in as. Use a throwaway credential; it is created on the target stack.",
+    "email": "harness@example.invalid",
+    "password": "change-me",
+    "username": "harness"
+  },
+
+  "netem": {
+    "_comment": "Named impairment levels, passed verbatim to `tc ... netem`. Add or rename freely; skills accept a level name or a literal args string.",
+    "mild": "delay 20ms 2ms loss 0.5% rate 5000kbit",
+    "moderate": "delay 40ms 10ms loss 1% rate 3500kbit",
+    "severe": "delay 60ms 15ms loss 2% rate 2400kbit"
+  }
+}

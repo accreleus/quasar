@@ -1,0 +1,349 @@
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
+@@ -64,6 +64,10 @@
+   gboolean started;
+   gboolean session_reset;
+ 
++  /* Quasar #507: recycled bitstream scratch buffers. */
++  GstBufferPool *bitstream_pool;
++  gsize bitstream_size;
++
+   /* PATCH (intra-refresh): request set before start via
+    * gst_vulkan_encoder_set_intra_refresh(); mode/cycle negotiated in start(). */
+   gboolean intra_refresh_requested;
+@@ -125,6 +129,7 @@
+     priv->callbacks_notify = NULL;
+   }
+ 
++  gst_clear_object (&priv->bitstream_pool);
+   gst_clear_object (&self->queue);
+ 
+   G_OBJECT_CLASS (parent_class)->finalize (object);
+@@ -209,6 +214,227 @@
+       priv->vk.DestroyVideoSessionParameters);
+ }
+ 
++
++/* --- Bitstream scratch-buffer pool (Quasar, issue #507) ---
++ *
++ * gst_vulkan_encoder_picture_init() used to call
++ * gst_vulkan_video_codec_buffer_new() for every single frame: a vkCreateBuffer
++ * + vkAllocateMemory + vkBindBufferMemory of a host-visible bitstream buffer
++ * (at least 1 MiB, and gst_h26x_calculate_coded_size() a good deal more at high
++ * resolutions), with the matching vkFreeMemory in
++ * gst_vulkan_encoder_picture_clear(). Both run on the streaming thread, so they
++ * serialise with the encode engine rather than overlapping it. Measured on an
++ * RTX 5090 at 2560x1440: 0.70 ms to allocate plus 0.53 ms to free, per frame,
++ * for HEVC - the whole of the non-encode per-frame cost.
++ *
++ * The allocation is amortised with a minimal GstBufferPool subclass. The pooled
++ * buffer is encoder-internal scratch and never leaves: once the encode
++ * completes, gst_vulkan_encoder_encode() copies the bytes the encoder actually
++ * wrote into a plain buffer and hands the Vulkan one straight back. That is
++ * deliberate. Downstream parsers keep incoming buffers (and therefore their
++ * GstMemory) in an adapter well past the point where the encoder is done with
++ * the picture, so recycling the buffer that was pushed downstream let a later
++ * frame scribble over memory GstBaseParse was still describing - a reproducible
++ * SIGSEGV in gst_base_parse_chain() on the first live resolution change. The
++ * copy is a few kilobytes of the encoded frame, against a device-memory
++ * allocation of megabytes, and it also gives downstream plain system memory to
++ * map instead of host-visible device memory.
++ */
++
++#define GST_TYPE_VULKAN_ENCODER_BITSTREAM_POOL \
++    (gst_vulkan_encoder_bitstream_pool_get_type ())
++
++/* gst_vulkan_video_codec_buffer_new() floors its allocation at 1 MiB. The pool
++ * has to be configured with the size the buffers actually come back as, not the
++ * size we asked for: GstBufferPool's default_reset_buffer() resizes every
++ * recycled buffer down to the configured pool size, so a smaller configured
++ * size would give frame 1 a different dstBufferRange from frames 2+ at any rung
++ * whose coded size is below the floor. alloc_buffer() asserts the two agree, so
++ * the mirrored constant can never silently drift from the helper. */
++#define GST_VULKAN_ENCODER_BITSTREAM_MIN_SIZE (1024 * 1024)
++
++/* Lower bound on how much of a recycled buffer must be zeroed, independent of
++ * how much the previous frame wrote. The elements' _write_headers() emit at
++ * most AUD + VPS + SPS + PPS + one SEI, each bit-written into a 4096-byte
++ * scratch NAL and then start-code and emulation-prevention expanded (worst case
++ * 3/2), plus a filler NAL padding to minBitstreamBufferOffsetAlignment: about
++ * 31 KiB in the worst case. 64 KiB is double that, and it also covers any
++ * padding a driver might write past the byte count its query reports. */
++#define GST_VULKAN_ENCODER_BITSTREAM_ZERO_FLOOR (64 * 1024)
++
++typedef struct _GstVulkanEncoderBitstreamPool
++{
++  GstBufferPool parent;
++
++  GstVulkanDevice *device;
++  GstVulkanVideoProfile profile;
++  VkBufferUsageFlags usage;
++  gsize size;
++} GstVulkanEncoderBitstreamPool;
++
++typedef struct _GstVulkanEncoderBitstreamPoolClass
++{
++  GstBufferPoolClass parent_class;
++} GstVulkanEncoderBitstreamPoolClass;
++
++G_DEFINE_TYPE (GstVulkanEncoderBitstreamPool,
++    gst_vulkan_encoder_bitstream_pool, GST_TYPE_BUFFER_POOL);
++
++static GstFlowReturn
++gst_vulkan_encoder_bitstream_pool_alloc_buffer (GstBufferPool * pool,
++    GstBuffer ** buffer, GstBufferPoolAcquireParams * params)
++{
++  GstVulkanEncoderBitstreamPool *self = (GstVulkanEncoderBitstreamPool *) pool;
++  GstBuffer *buf;
++
++  buf = gst_vulkan_video_codec_buffer_new (self->device, &self->profile,
++      self->usage, self->size);
++  if (!buf)
++    return GST_FLOW_ERROR;
++
++  /* If the helper ever stops handing back exactly what the pool is configured
++   * for, default_reset_buffer() would resize recycled buffers to a different
++   * size than freshly allocated ones. Refuse to pool in that case rather than
++   * let frame 1 and frame 2 see different dstBufferRanges. */
++  if (gst_buffer_get_size (buf) != self->size) {
++    GST_ERROR_OBJECT (pool, "bitstream buffer is %" G_GSIZE_FORMAT " bytes but "
++        "the pool is configured for %" G_GSIZE_FORMAT "; not pooling it",
++        gst_buffer_get_size (buf), self->size);
++    GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_TAG_MEMORY);
++  }
++
++  *buffer = buf;
++  return GST_FLOW_OK;
++}
++
++/* A freshly allocated Vulkan bitstream buffer reads back as zeroes, and the
++ * codec elements' _write_headers() rely on that: they advance their write
++ * cursor past each NAL by "size + 1", so a byte between NALs is never written,
++ * and the filler NAL only pads up to the alignment the encoder needs. On a
++ * recycled buffer those untouched bytes would hold the previous frame's
++ * bitstream, which lands inside the parameter-set region of the next IDR and
++ * breaks the stream from that point on (observed: an H.264 capture decoded 240
++ * of 300 frames, stopping exactly at the second IDR). Zero the buffer on the
++ * way back into the pool so a recycled buffer is indistinguishable from a fresh
++ * one.
++ *
++ * Only a prefix has to be cleared, not the whole (multi-megabyte) allocation.
++ * gst_vulkan_encoder_encode() stamps the byte count it produced on
++ * GST_BUFFER_OFFSET_END before handing the buffer back, and by induction every
++ * byte at or above that offset is still zero: the buffer starts out zeroed, the
++ * headers are written below pic->offset and the encoder writes up to
++ * pic->offset + data_size, which is exactly the stamped value. The floor covers
++ * the case where the next frame's header region is longer than the previous
++ * frame's whole bitstream, and any driver padding written past the reported
++ * byte count. A buffer released without that stamp (an encode that failed part
++ * way) is cleared in full.
++ *
++ * Returns: whether the buffer is clean and may be recycled. */
++static gboolean
++gst_vulkan_encoder_bitstream_pool_zero (GstBufferPool * pool,
++    GstBuffer * buffer)
++{
++  GstMapInfo map;
++  gsize used, zero_len;
++
++  if (!gst_buffer_map (buffer, &map, GST_MAP_WRITE)) {
++    GST_ERROR_OBJECT (pool, "failed to map the bitstream buffer to clear it");
++    return FALSE;
++  }
++
++  used = GST_BUFFER_OFFSET_END_IS_VALID (buffer) ?
++      GST_BUFFER_OFFSET_END (buffer) : map.size;
++  zero_len = MAX (used, GST_VULKAN_ENCODER_BITSTREAM_ZERO_FLOOR);
++  zero_len = MIN (zero_len, map.size);
++
++  memset (map.data, 0, zero_len);
++  gst_buffer_unmap (buffer, &map);
++
++  return TRUE;
++}
++
++static void
++gst_vulkan_encoder_bitstream_pool_reset_buffer (GstBufferPool * pool,
++    GstBuffer * buffer)
++{
++  gboolean clean = gst_vulkan_encoder_bitstream_pool_zero (pool, buffer);
++
++  GST_BUFFER_POOL_CLASS (gst_vulkan_encoder_bitstream_pool_parent_class)
++      ->reset_buffer (pool, buffer);
++
++  /* Recycling a buffer we could not clear would reintroduce exactly the
++   * stale-byte corruption the clearing exists to prevent, so drop it instead:
++   * GstBufferPool frees a buffer whose memory is tagged, and the next
++   * acquire simply allocates a fresh (zeroed) one. */
++  if (!clean)
++    GST_BUFFER_FLAG_SET (buffer, GST_BUFFER_FLAG_TAG_MEMORY);
++}
++
++static void
++gst_vulkan_encoder_bitstream_pool_finalize (GObject * object)
++{
++  GstVulkanEncoderBitstreamPool *self =
++      (GstVulkanEncoderBitstreamPool *) object;
++
++  gst_clear_object (&self->device);
++
++  G_OBJECT_CLASS (gst_vulkan_encoder_bitstream_pool_parent_class)
++      ->finalize (object);
++}
++
++static void
++gst_vulkan_encoder_bitstream_pool_init (GstVulkanEncoderBitstreamPool * self)
++{
++}
++
++static void
++gst_vulkan_encoder_bitstream_pool_class_init (GstVulkanEncoderBitstreamPoolClass
++    * klass)
++{
++  GObjectClass *gobject_class = G_OBJECT_CLASS (klass);
++  GstBufferPoolClass *pool_class = GST_BUFFER_POOL_CLASS (klass);
++
++  gobject_class->finalize = gst_vulkan_encoder_bitstream_pool_finalize;
++  pool_class->alloc_buffer = gst_vulkan_encoder_bitstream_pool_alloc_buffer;
++  pool_class->reset_buffer = gst_vulkan_encoder_bitstream_pool_reset_buffer;
++}
++
++static GstBufferPool *
++gst_vulkan_encoder_bitstream_pool_new (GstVulkanDevice * device,
++    const GstVulkanVideoProfile * profile, VkBufferUsageFlags usage,
++    gsize size)
++{
++  GstVulkanEncoderBitstreamPool *self;
++  GstStructure *config;
++
++  self = g_object_new (GST_TYPE_VULKAN_ENCODER_BITSTREAM_POOL, NULL);
++  gst_object_ref_sink (self);
++
++  self->device = gst_object_ref (device);
++  self->profile = *profile;
++  self->usage = usage;
++  self->size = MAX (size, GST_VULKAN_ENCODER_BITSTREAM_MIN_SIZE);
++
++  /* Re-chain pNext into the pool's own copy. GstVulkanVideoProfile is a
++   * self-referential struct, so a plain assignment leaves the copy's chain
++   * pointing at the encoder's private profile - and this pool is explicitly
++   * allowed to outlive the encoder (buffers still on loan keep it alive across
++   * gst_vulkan_encoder_stop()), so those pointers must not leave the copy.
++   * Same chain-up as gst_vulkan_encoder_start(). */
++  self->profile.usage.encode.pNext = &self->profile.codec;
++  self->profile.profile.pNext = &self->profile.usage.encode;
++
++  config = gst_buffer_pool_get_config (GST_BUFFER_POOL (self));
++  gst_buffer_pool_config_set_params (config, NULL, self->size, 0, 0);
++  if (!gst_buffer_pool_set_config (GST_BUFFER_POOL (self), config)
++      || !gst_buffer_pool_set_active (GST_BUFFER_POOL (self), TRUE)) {
++    gst_object_unref (self);
++    return NULL;
++  }
++
++  return GST_BUFFER_POOL (self);
++}
++
+ /**
+  * gst_vulkan_encode_picture_init:
+  * @pic: the #GstVulkanEncoderPicture to initialize
+@@ -249,10 +475,33 @@
+       return FALSE;
+   }
+   pic->in_buffer = gst_buffer_ref (in_buffer);
+-  pic->out_buffer =
+-      gst_vulkan_video_codec_buffer_new (self->queue->device, &priv->profile,
+-      VK_BUFFER_USAGE_VIDEO_ENCODE_DST_BIT_KHR, size_aligned);
++
++  /* Quasar #507: take the bitstream scratch buffer from a recycling pool
++   * instead of allocating (and freeing) Vulkan device memory on every frame.
++   * The pool is rebuilt whenever the required size changes, which is what a
++   * live resolution change looks like from here. */
++  if (priv->bitstream_pool && priv->bitstream_size != size_aligned)
++    gst_clear_object (&priv->bitstream_pool);
++
++  if (!priv->bitstream_pool) {
++    priv->bitstream_pool =
++        gst_vulkan_encoder_bitstream_pool_new (self->queue->device,
++        &priv->profile, VK_BUFFER_USAGE_VIDEO_ENCODE_DST_BIT_KHR,
++        size_aligned);
++    if (!priv->bitstream_pool) {
++      gst_clear_buffer (&pic->in_buffer);
++      gst_clear_buffer (&pic->dpb_buffer);
++      return FALSE;
++    }
++    priv->bitstream_size = size_aligned;
++  }
++
++  if (gst_buffer_pool_acquire_buffer (priv->bitstream_pool, &pic->out_buffer,
++          NULL) != GST_FLOW_OK)
++    pic->out_buffer = NULL;
++
+   if (!pic->out_buffer) {
++    gst_clear_buffer (&pic->in_buffer);
+     gst_clear_buffer (&pic->dpb_buffer);
+     return FALSE;
+   }
+@@ -467,6 +716,13 @@
+   gst_clear_buffer (&priv->layered_buffer);
+   gst_clear_object (&priv->dpb_pool);
+ 
++  /* Quasar #507: drop our reference to the bitstream pool. It is deliberately
++   * NOT deactivated here: any buffer still out on loan keeps it alive and is
++   * freed when it is released, so a restart (a live resolution change) cannot
++   * pull memory out from under a picture still in flight. */
++  gst_clear_object (&priv->bitstream_pool);
++  priv->bitstream_size = 0;
++
+   /* PATCH (output-state-on-resize): priv->slots[] holds BORROWED pointers to
+    * pictures whose DPB images come from the pool just destroyed above. Every
+    * picture should already have been released through
+@@ -1421,9 +1677,45 @@
+     goto bail;
+   }
+   if (encode_res->status == VK_QUERY_RESULT_STATUS_COMPLETE_KHR) {
++    gsize out_size = encode_res->data_size + pic->offset;
++    GstBuffer *out;
++    GstMapInfo map;
++
+     GST_INFO_OBJECT (self, "The frame %p has been encoded with size %"
+-        G_GUINT64_FORMAT, pic, encode_res->data_size + pic->offset);
+-    gst_buffer_set_size (pic->out_buffer, encode_res->data_size + pic->offset);
++        G_GSIZE_FORMAT, pic, out_size);
++
++    /* Quasar #507: hand downstream a plain copy and give the pooled Vulkan
++     * buffer straight back. It is encoder-internal scratch: downstream parsers
++     * keep the buffers they receive (and their GstMemory) in an adapter long
++     * after the picture is cleared, so a recycled buffer that had been pushed
++     * downstream would be overwritten under GstBaseParse. The copy is the
++     * encoded frame, kilobytes against a megabyte-scale device allocation. */
++    if (!gst_buffer_map (pic->out_buffer, &map, GST_MAP_READ)) {
++      GST_ERROR_OBJECT (self, "Failed to map the bitstream buffer");
++      goto bail;
++    }
++    /* Never hand on a short read: fail loudly rather than truncate the frame. */
++    if (map.size < out_size) {
++      GST_ERROR_OBJECT (self, "Bitstream buffer is %" G_GSIZE_FORMAT " bytes, "
++          "the encoder reported %" G_GSIZE_FORMAT, map.size, out_size);
++      gst_buffer_unmap (pic->out_buffer, &map);
++      goto bail;
++    }
++
++    out = gst_buffer_new_allocate (NULL, out_size, NULL);
++    if (!out) {
++      GST_ERROR_OBJECT (self, "Failed to allocate the output buffer");
++      gst_buffer_unmap (pic->out_buffer, &map);
++      goto bail;
++    }
++    gst_buffer_fill (out, 0, map.data, out_size);
++    gst_buffer_unmap (pic->out_buffer, &map);
++
++    /* Tell the pool how far into the buffer this frame wrote, so recycling only
++     * has to clear that prefix instead of the whole allocation. */
++    GST_BUFFER_OFFSET_END (pic->out_buffer) = out_size;
++    gst_buffer_unref (pic->out_buffer);
++    pic->out_buffer = out;
+   } else {
+     GST_ERROR_OBJECT (self,
+         "The operation did not complete properly, query status = %d",

@@ -1,0 +1,90 @@
+---
+title: The Steam library
+description: What Steam library discovery does, what it deliberately does not do, and how to set it up.
+---
+
+import Shot from '../../../components/Shot.astro';
+import admin_sources from '../../../assets/shots/admin-sources.png';
+import { Aside } from '@astrojs/starlight/components';
+
+Steam library discovery turns games already installed inside your Steam
+container into their own launchable tiles, so a user does not have to open Steam
+and navigate it every time.
+
+<Shot
+	label="Admin Steam library"
+	sublabel="The Steam source with its scan controls and discovery state, alongside the artwork provider."
+	src={admin_sources}
+	alt="The admin library sources page"
+/>
+
+## Be clear about what this is
+
+It is **filesystem discovery of what is installed**. Quasar looks inside the
+Steam container's library folder, finds installed games, and creates catalog
+entries for them.
+
+It is **not** a sync of everything you own. A game you own but have not installed
+does not appear. Install it once through the Steam launcher app, and it shows up
+on the next scan.
+
+Other things it deliberately does not do:
+
+- It does not verify that a launch got past Steam's own interface.
+- It does not find games on a second Steam library disk.
+- It does not support more than one Steam account per user.
+- It does not switch games inside a live session.
+
+Account-based ownership sync is future work, not a current feature.
+
+## Turning it on
+
+Admin, Settings has the master switch, or the first-run wizard offers it as step
+four.
+
+Enabling it does several things at once: installs the Steam container image on
+your hosts, creates a runtime preset from the manifest, adds a launcher app to
+the catalog, and creates an entitlement so the launcher is usable.
+
+The Steam source is listed under Admin, Library, Sources either way. Until you
+turn discovery on it sits there switched off, saying so, and pointing you at the
+setting.
+
+## Requirements
+
+**The container needs network access.** Steam downloads part of its own interface
+on first launch. Without `network: bridge` on the runtime preset it exits
+cleanly, and the session fails with a message about the media path that tells
+you nothing useful. The shipped preset sets this. If you built your own, check
+it.
+
+**Each usable host needs a managed-home root.** Discovery scans the mounted host
+path. Set or confirm it under Admin, Fleet, Hosts; a container-local directory
+does not provide persistent storage.
+
+**Games have to be installed.** Open the Steam launcher app, log in, install
+something, wait for the next scan.
+
+## Scanning
+
+Discovery runs on an interval, 360 minutes by default. Change it with
+`QUASAR_LIBRARY_SCAN_INTERVAL`, in minutes. Setting it to `0` disables scheduled
+scans.
+
+You can also trigger a scan from Admin, Library, Sources rather than waiting.
+
+## Steam-derived apps
+
+Each discovered game becomes a normal catalog app that inherits the Steam
+container image and gets its launch command pointed at that title.
+
+They behave like any other app from there: entitlements, quality tier
+restrictions, artwork. Every one of them shares the parent Steam image, so
+updating that image affects all of them together.
+
+## Only Steam, for now
+
+The design anticipates other library providers, and specs discuss them, but
+Steam is the only one that exists. Quasar does not currently support Heroic,
+RomM or any other source as a provider. Anything else has to be added as an app
+by hand.

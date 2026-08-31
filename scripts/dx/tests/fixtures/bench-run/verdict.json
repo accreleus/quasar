@@ -1,0 +1,10 @@
+{
+  "verdict": "nominal",
+  "evidence": ["no congestion, encoder-saturation, or presentation-judder signal in the window — healthy"],
+  "reason": "nominal over a 300 s window (12 host, 11 client samples).",
+  "window": {"from_ms": 1786940000000, "to_ms": 1786940300000, "n_host": 12, "n_client": 11, "warmup_excluded_ms": 20000},
+  "clock": {"quality": "measured", "offset_ms": -3.2, "uncertainty_ms": 1.8, "applied": true, "age_ms": 45000},
+  "evidence_tier": "full",
+  "falsifiers": [],
+  "thresholds_version": "2026-08-23.3"
+}

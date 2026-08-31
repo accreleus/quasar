@@ -1,0 +1,503 @@
+<!doctype html>
+<html lang="en" data-design-system="quasar-v2">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0b0b12">
+<title>Quasar | Sign in</title>
+<script src="https://unpkg.com/d3@7.9.0/dist/d3.min.js" integrity="sha384-CjloA8y00+1SDAUkjs099PVfnY2KmDC2BZnws9kh8D/lX1s46w6EPhpXdqMfjK6i" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/topojson-client@3.1.0/dist/topojson-client.min.js" integrity="sha384-Ukv1p/xTma6P4/2bY5KzWBw+ydSpXmhCMtyciIQVDJ1RmOxtCYNMF1uXT9T63H67" crossorigin="anonymous"></script>
+<style>
+@import url("https://fonts.googleapis.com/css2?family=Michroma&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap");
+
+/* Quasar V2 reference token contract — source: quasar-component-library.html */
+:root{color-scheme:dark;
+--bg:oklch(0.1449 0.0115 266.85);--surface:oklch(0.1869 0.0151 266.77);--surface-raised:oklch(0.224 0.018 263);--surface-active:oklch(0.272 0.022 260);
+--fg:oklch(0.9618 0.0086 247.91);--fg-strong:oklch(0.985 0.004 247);--muted:oklch(0.6605 0.0265 259.81);--muted-strong:oklch(0.76 0.022 258);
+--border:oklch(0.6605 0.0265 259.81/0.28);--border-strong:oklch(0.6605 0.0265 259.81/0.46);
+--accent:oklch(0.5998 0.2179 273.21);--accent-soft:oklch(0.5998 0.2179 273.21/0.16);
+--action:oklch(0.5 0.19 273.21);--action-hover:oklch(0.54 0.19 273.21);--action-pressed:oklch(0.46 0.19 273.21);--core:oklch(0.105 0.01 267);
+--success:oklch(0.76 0.15 164);--warning:oklch(0.82 0.14 85);--danger:oklch(0.69 0.19 27);
+--glass:oklch(0.1869 0.0151 266.77/0.46);--glass-strong:oklch(0.224 0.018 263/0.62);--glass-control:oklch(0.272 0.022 260/0.66);
+--glass-border:oklch(0.9618 0.0086 247.91/0.12);--glass-highlight:oklch(0.9618 0.0086 247.91/0.14);
+--display:"Michroma","Eurostile Extended",Microgramma,ui-sans-serif,sans-serif;
+--body:"IBM Plex Sans",Inter,ui-sans-serif,system-ui,sans-serif;
+--mono:"IBM Plex Mono","SFMono-Regular",Consolas,monospace;
+--control-h:2.75rem;--space-panel:clamp(1rem,2vw,1.5rem);
+--r-control:0.25rem;--r-panel:0.5rem;--r-feature:0.75rem;
+--panel-shadow:inset 0 1px 0 var(--glass-highlight),0 14px 36px -32px oklch(0.05 0.01 267/0.68);
+--glass-shadow:inset 0 1px 0 var(--glass-highlight),0 22px 58px -32px oklch(0.05 0.01 267/0.82);}
+
+*{box-sizing:border-box}
+html,body{min-height:100%;margin:0;background:var(--bg)}
+body{color:var(--fg);font-family:var(--body);font-size:0.94rem;line-height:1.55;-webkit-font-smoothing:antialiased}
+button,input{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+a{color:var(--accent);text-decoration:none}
+a:hover{color:var(--fg-strong)}
+code,.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+/* The sign-in page borrows the loading scene's field: one accent bloom behind
+   the card, nothing else competing for attention. */
+.scene{position:relative;display:grid;min-height:100svh;place-items:center;overflow:clip;padding:clamp(1.5rem,5vw,3rem);isolation:isolate;
+  background:radial-gradient(circle at 50% 34%,var(--accent-soft),transparent 34%),
+    radial-gradient(circle at 84% 8%,oklch(0.5998 0.2179 273.21/0.07),transparent 32%),
+    linear-gradient(150deg,var(--bg),oklch(0.13 0.012 267) 58%,var(--core))}
+.stack{position:relative;z-index:1;display:grid;justify-items:center;width:min(24.5rem,100%)}
+
+/* Optional backdrop: a slowly rotating Natural Earth map (real geometry via
+   d3-geo + world-atlas TopoJSON, never hand-drawn coastlines) with host→client
+   signals travelling great circles across it. Same background colour — the map
+   is line work at low alpha, masked at the edges. body[data-backdrop="plain"]
+   drops it. */
+.globe{position:absolute;inset:0;z-index:0;width:100%;height:100%;pointer-events:none;opacity:0;transition:opacity 900ms ease;
+  mask-image:radial-gradient(135% 108% at 50% 50%,black 50%,transparent 92%);
+  -webkit-mask-image:radial-gradient(135% 108% at 50% 50%,black 50%,transparent 92%)}
+body[data-backdrop="globe"] #globe{opacity:1}
+body[data-backdrop="runner"] #runner{opacity:1}
+
+/* The lockup IS the heading: a wordmark plus a greeting gave the card two
+   titles competing for the same job. */
+.lockup{display:grid;justify-items:center;gap:0.85rem;margin-bottom:1.6rem}
+.lockup .mark{width:3.25rem;height:3.25rem}
+.wordmark{margin:0;font-family:var(--display);font-size:0.9rem;font-weight:400;letter-spacing:0.2em;text-transform:uppercase;color:var(--fg-strong)}
+
+/* Thinner glass than the library default so the map reads through it — the
+   blur does the legibility work, not opacity. */
+.card{width:100%;padding:clamp(1.4rem,3vw,1.85rem);border:1px solid oklch(0.9618 0.0086 247.91/0.16);border-radius:var(--r-feature);
+  background:oklch(0.224 0.018 263/0.34);box-shadow:var(--glass-shadow);
+  backdrop-filter:blur(14px) saturate(130%);-webkit-backdrop-filter:blur(14px) saturate(130%)}
+
+form{display:grid;gap:1.05rem}
+.field{display:grid;gap:0.45rem}
+.field label{color:var(--muted-strong);font-size:0.75rem;font-weight:500}
+.field .row{display:flex;align-items:baseline;justify-content:space-between;gap:0.75rem}
+.input{width:100%;min-height:var(--control-h);padding:0 0.8rem;border:1px solid var(--border-strong);border-radius:var(--r-control);
+  background:oklch(0.105 0.01 267/0.56);color:var(--fg);outline:none;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  transition:border-color 150ms ease,box-shadow 150ms ease}
+.input::placeholder{color:oklch(0.6605 0.0265 259.81/0.7)}
+.input:hover{border-color:var(--muted-strong)}
+.input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.input[aria-invalid="true"]{border-color:var(--danger)}
+.pw{position:relative}
+.pw .input{padding-right:4.1rem}
+.reveal{position:absolute;top:50%;right:0.35rem;transform:translateY(-50%);padding:0.3rem 0.5rem;border:0;border-radius:var(--r-control);
+  background:none;color:var(--muted);cursor:pointer;font-size:0.72rem;font-weight:600;transition:color 150ms ease,background 150ms ease}
+.reveal:hover{color:var(--fg);background:var(--glass-control)}
+.field .error{min-height:0;color:oklch(0.82 0.12 27);font-size:0.7rem}
+.field .error:empty{display:none}
+.link-quiet{color:var(--muted);font-size:0.72rem}
+.link-quiet:hover{color:var(--fg-strong)}
+/* MOCK-ONLY: lets the backdrop be judged with and without. Not part of the design. */
+.backdrop-toggle{position:fixed;right:1rem;bottom:1rem;z-index:2;padding:0.35rem 0.6rem;border:1px dashed var(--border);
+  border-radius:var(--r-control);background:oklch(0.105 0.01 267/0.5);color:var(--muted);cursor:pointer;
+  font:0.66rem var(--mono);letter-spacing:0.08em;text-transform:uppercase}
+.backdrop-toggle:hover{color:var(--fg);border-color:var(--border-strong)}
+
+.check{display:flex;min-height:2.75rem;align-items:center;gap:0.75rem;color:var(--muted-strong);cursor:pointer;font-size:0.8rem}
+.check input{appearance:none;display:grid;width:1.15rem;height:1.15rem;flex:none;place-content:center;border:1px solid var(--border-strong);
+  border-radius:var(--r-control);background:var(--glass-control);cursor:pointer}
+.check input::after{content:"";width:0.55rem;height:0.55rem;border-right:2px solid var(--fg);border-bottom:2px solid var(--fg);
+  transform:rotate(45deg) scale(0);translate:0 -0.08rem;transition:transform 140ms ease}
+.check input:checked{border-color:var(--accent);background:var(--action)}
+.check input:checked::after{transform:rotate(45deg) scale(1)}
+
+.button{display:inline-flex;min-height:var(--control-h);align-items:center;justify-content:center;gap:0.5rem;padding:0 1rem;
+  border:1px solid var(--border-strong);border-radius:var(--r-control);background:var(--glass-control);color:var(--fg);cursor:pointer;
+  font-weight:600;font-size:0.88rem;box-shadow:inset 0 1px 0 oklch(0.9618 0.0086 247.91/0.12),0 1px 2px oklch(0.05 0.01 267/0.38);
+  backdrop-filter:blur(14px) saturate(115%);transition:background 150ms ease,border-color 150ms ease,box-shadow 150ms ease,transform 150ms ease}
+.button.primary{width:100%;border-color:oklch(0.72 0.15 273.21/0.68);background:var(--action);text-shadow:0 1px 1px oklch(0.05 0.01 267/0.5);
+  box-shadow:inset 0 1px 0 oklch(0.9618 0.0086 247.91/0.2),inset 0 -1px 0 oklch(0.22 0.1 273.21/0.72),0 2px 4px oklch(0.05 0.01 267/0.45),
+    0 10px 24px -12px oklch(0.46 0.19 273.21/0.8)}
+.button.primary:hover:not(:disabled){border-color:oklch(0.78 0.13 273.21/0.76);background:var(--action-hover);transform:translateY(-1px)}
+.button.primary:active{background:var(--action-pressed);transform:translateY(1px)}
+.button:disabled{opacity:0.62;cursor:progress;transform:none}
+.spin{width:0.95rem;height:0.95rem;border-radius:50%;border:2px solid oklch(1 0 0/0.35);border-top-color:#fff;animation:spin 700ms linear infinite}
+
+
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:1ms!important;transition-duration:1ms!important}}
+</style>
+</head>
+<body data-backdrop="plain">
+<main class="scene">
+  <canvas class="globe" id="globe" aria-hidden="true"></canvas>
+  <canvas class="globe runner" id="runner" aria-hidden="true"></canvas>
+  <div class="stack">
+    <section class="card">
+      <header class="lockup">
+        <svg class="mark" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+        <defs>
+          <linearGradient id="quasar-gradient" x1="2" y1="2" x2="30" y2="30">
+            <stop offset="0" stop-color="#6A45F5"/>
+            <stop offset=".5" stop-color="#5B6BFF"/>
+            <stop offset="1" stop-color="#00C0FF"/>
+          </linearGradient>
+        </defs>
+        <ellipse cx="16" cy="16" rx="14.2" ry="5.4" transform="rotate(-30 16 16)" stroke="url(#quasar-gradient)" stroke-width="1.6" opacity=".75"/>
+        <circle cx="16" cy="16" r="6.2" fill="url(#quasar-gradient)"/>
+        <circle cx="16" cy="16" r="2.1" fill="#fff"/>
+      </svg>
+        <h1 class="wordmark">Quasar</h1>
+      </header>
+
+      <form id="signin" novalidate>
+        <div class="field">
+          <label for="email">Email</label>
+          <input class="input" id="email" name="email" type="email" inputmode="email" autocomplete="username"
+            placeholder="you@example.com" required aria-describedby="email-error">
+          <span class="error" id="email-error" role="alert"></span>
+        </div>
+
+        <div class="field">
+          <div class="row">
+            <label for="password">Password</label>
+            <a class="link-quiet" href="#">Forgot password?</a>
+          </div>
+          <div class="pw">
+            <input class="input" id="password" name="password" type="password" autocomplete="current-password"
+              placeholder="Your password" required aria-describedby="password-error">
+            <button class="reveal" type="button" id="reveal" aria-pressed="false">Show</button>
+          </div>
+          <span class="error" id="password-error" role="alert"></span>
+        </div>
+
+        <label class="check"><input type="checkbox" name="remember" checked>Keep me signed in on this device</label>
+
+        <button class="button primary" type="submit" id="submit">Sign in</button>
+      </form>
+    </section>
+  </div>
+  <button class="backdrop-toggle" type="button" id="backdrop">Backdrop: none</button>
+</main>
+
+<script>
+/* MOCK-ONLY: cycles the three backdrop candidates so they can be compared. */
+/* ── backdrop option 2 ───────────────────────────────────────────────────────
+   An original side-scrolling play loop in the same wireframe language: parallax
+   ridges and clouds, a scrolling ground rule, and a runner that hops the blocks
+   it meets. The world repeats on a fixed period, so the loop is seamless. */
+(function(){
+  const canvas=document.getElementById("runner");
+  if(!canvas)return;
+  const ctx=canvas.getContext("2d");
+  const calm=window.matchMedia("(prefers-reduced-motion: reduce)");
+  const PERIOD=1040,SPEED=76;
+  const BLOCKS=[130,210,480,560,860];              /* world x of raised blocks */
+  const STEPS=[[300,1],[352,2],[404,3],[700,1],[752,2]]; /* x, height in units */
+  const PRIZES=[210,560,860];
+  /* Original creatures, not anyone else's: a low walker and a domed slider.
+     Each is stomped as the runner descends onto it, squashes, pops, and returns
+     on the next lap of the world. */
+  const FOES=[{x:236,kind:0},{x:470,kind:1},{x:604,kind:0},{x:884,kind:1}];
+  const SQUASH=44;
+  let w=0,h=0,dpr=1,running=false;
+
+  function size(){
+    dpr=Math.min(window.devicePixelRatio||1,2);
+    w=canvas.clientWidth;h=canvas.clientHeight;
+    canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+  }
+  const A=a=>"oklch(0.5998 0.2179 273.21/"+a+")";
+  const L=a=>"oklch(0.74 0.16 273/"+a+")";
+  function box(x,y,s,stroke,glow){
+    ctx.beginPath();ctx.rect(x,y,s,s);
+    ctx.strokeStyle=stroke;ctx.lineWidth=0.9;
+    ctx.shadowBlur=glow||0;ctx.shadowColor=glow?stroke:"transparent";
+    ctx.stroke();ctx.shadowBlur=0;
+  }
+  /* The runner's arc is derived from the world, not stored state: for each
+     block it computes a sine hop over the approach window, so the loop is
+     deterministic and never drifts out of sync with the scroll. */
+  function hop(worldX){
+    let lift=0;
+    BLOCKS.concat(STEPS.map(s=>s[0]),FOES.map(f=>f.x)).forEach(bx=>{
+      for(let k=-1;k<=1;k++){
+        const d=worldX-(bx+k*PERIOD-104);
+        if(d>0&&d<150)lift=Math.max(lift,Math.sin(Math.PI*(d/150))*118);
+      }
+    });
+    return lift;
+  }
+  /* Signed distance from the runner to a foe on the nearest lap: negative while
+     it is still ahead, 0..SQUASH during the stomp, beyond that it is gone. */
+  function foeState(worldX,fx){
+    let d=(worldX-fx)%PERIOD;
+    if(d>PERIOD/2)d-=PERIOD;
+    if(d<-PERIOD/2)d+=PERIOD;
+    return d;
+  }
+  function drawFoe(x,ground,kind,squash,t,i){
+    const s=Math.max(0,Math.min(1,squash));
+    const hgt=(kind?15:18)*(1-s*0.86),wid=(kind?20:17)*(1+s*0.5);
+    const a=(1-s*0.9).toFixed(3);
+    ctx.strokeStyle="oklch(0.78 0.15 273/"+(0.55*a)+")";ctx.lineWidth=1.1;
+    ctx.shadowBlur=6;ctx.shadowColor="oklch(0.5998 0.2179 273.21/0.6)";
+    ctx.beginPath();
+    if(kind){ /* domed slider */
+      ctx.moveTo(x-wid/2,ground);ctx.lineTo(x+wid/2,ground);
+      ctx.moveTo(x-wid/2,ground);ctx.quadraticCurveTo(x,ground-hgt*2,x+wid/2,ground);
+    }else{    /* low walker */
+      ctx.rect(x-wid/2,ground-hgt,wid,hgt);
+      const step=s?0:Math.sin(t/140+i)*3;
+      ctx.moveTo(x-4,ground);ctx.lineTo(x-4-step,ground+5);
+      ctx.moveTo(x+4,ground);ctx.lineTo(x+4+step,ground+5);
+    }
+    ctx.stroke();ctx.shadowBlur=0;
+    if(s>0.05&&s<0.95){ /* pop mark on the kill */
+      const r=5+s*16;
+      ctx.beginPath();ctx.arc(x,ground-hgt,r,0,Math.PI*2);
+      ctx.strokeStyle="oklch(0.9 0.12 273/"+(0.4*(1-s)).toFixed(3)+")";ctx.lineWidth=0.9;ctx.stroke();
+    }
+  }
+  function draw(t){
+    const scroll=t/1000*SPEED,ground=h*0.72,unit=26;
+    ctx.clearRect(0,0,w,h);ctx.lineJoin="round";
+
+    /* parallax ridges */
+    for(let layer=0;layer<2;layer++){
+      const k=layer?0.34:0.16,amp=layer?46:74,base=ground-(layer?12:34);
+      ctx.beginPath();
+      for(let x=0;x<=w;x+=8){
+        const wx=(x+scroll*k)/(layer?150:260);
+        const y=base-Math.abs(Math.sin(wx))*amp;
+        x?ctx.lineTo(x,y):ctx.moveTo(x,y);
+      }
+      ctx.strokeStyle=A(layer?0.22:0.13);ctx.lineWidth=0.8;ctx.stroke();
+    }
+    /* clouds */
+    for(let i=0;i<5;i++){
+      const x=((i*370-scroll*0.1)%(w+320)+w+320)%(w+320)-160,y=h*0.2+((i*53)%70);
+      ctx.beginPath();ctx.ellipse(x,y,26,9,0,0,Math.PI*2);
+      ctx.strokeStyle=A(0.1);ctx.lineWidth=0.7;ctx.stroke();
+    }
+    /* ground rule with scrolling ticks */
+    ctx.beginPath();ctx.moveTo(0,ground);ctx.lineTo(w,ground);
+    ctx.strokeStyle=L(0.34);ctx.lineWidth=0.9;ctx.stroke();
+    ctx.beginPath();
+    for(let x=-(scroll%unit);x<w;x+=unit){ctx.moveTo(x,ground);ctx.lineTo(x-9,ground+16);}
+    ctx.strokeStyle=A(0.18);ctx.lineWidth=0.7;ctx.stroke();
+
+    const at=wx=>((wx-scroll)%PERIOD+PERIOD)%PERIOD-160;
+    STEPS.forEach(([bx,n])=>{const x=at(bx);if(x<-60||x>w+60)return;
+      for(let i=0;i<n;i++)box(x,ground-unit*(i+1),unit,A(0.28));});
+    BLOCKS.forEach(bx=>{const x=at(bx);if(x<-60||x>w+60)return;
+      box(x,ground-unit*3.6,unit,L(0.42));});
+    PRIZES.forEach((bx,i)=>{const x=at(bx);if(x<-40||x>w+40)return;
+      const blink=0.4+0.45*Math.abs(Math.sin(t/420+i));
+      ctx.save();ctx.translate(x+unit/2,ground-unit*5.4);ctx.rotate(Math.PI/4);
+      box(-5,-5,10,L(blink),7);ctx.restore();});
+
+    /* the runner: a wireframe capsule, feet ticking as it goes */
+    const rx=w*0.13,worldX=scroll+rx;
+
+    FOES.forEach((f,i)=>{
+      const x=at(f.x);if(x<-60||x>w+60)return;
+      const d=foeState(worldX,f.x);
+      if(d>SQUASH)return;
+      const wobble=d<0?Math.sin(t/300+i)*7:0;
+      drawFoe(x+unit/2+wobble,ground,f.kind,d<0?0:d/SQUASH,t,i);
+    });
+
+    /* a stomp kicks the runner back up — the bounce sells the kill */
+    let lift=hop(worldX);
+    FOES.forEach(f=>{const d=foeState(worldX,f.x);
+      if(d>=0&&d<SQUASH)lift=Math.max(lift,26*Math.sin(Math.PI*(d/SQUASH)));});
+    const ry=ground-lift;
+    ctx.beginPath();ctx.roundRect?ctx.roundRect(rx-12,ry-34,24,34,8):ctx.rect(rx-12,ry-34,24,34);
+    ctx.strokeStyle="oklch(0.88 0.17 273/0.95)";ctx.lineWidth=1.5;
+    ctx.shadowBlur=13;ctx.shadowColor="oklch(0.5998 0.2179 273.21/0.9)";ctx.stroke();ctx.shadowBlur=0;
+    ctx.beginPath();ctx.arc(rx,ry-24,2.6,0,Math.PI*2);ctx.fillStyle="oklch(0.97 0.04 273/0.95)";
+    ctx.shadowBlur=8;ctx.shadowColor="oklch(0.88 0.17 273/0.9)";ctx.fill();ctx.shadowBlur=0;
+    const stride=lift?6:Math.sin(t/90)*6;
+    ctx.beginPath();ctx.moveTo(rx-4,ry);ctx.lineTo(rx-4-stride,ry+9);
+    ctx.moveTo(rx+4,ry);ctx.lineTo(rx+4+stride,ry+9);
+    ctx.strokeStyle="oklch(0.88 0.17 273/0.7)";ctx.lineWidth=1.2;ctx.stroke();
+  }
+  function frame(t){draw(t);if(running)requestAnimationFrame(frame);}
+  function apply(){
+    const on=document.body.dataset.backdrop==="runner";
+    if(!on){running=false;ctx.clearRect(0,0,w,h);return;}
+    if(calm.matches){running=false;draw(3200);return;}
+    if(!running){running=true;requestAnimationFrame(frame);}
+  }
+  size();
+  addEventListener("resize",()=>{size();apply();if(!running)draw(3200);});
+  calm.addEventListener("change",apply);
+  document.addEventListener("backdropchange",apply);
+  apply();
+})();
+
+const backdrop=document.getElementById("backdrop");
+const MODES=[["plain","none"],["globe","map"],["runner","side-scroller"]];
+backdrop.addEventListener("click",()=>{
+  const i=MODES.findIndex(m=>m[0]===document.body.dataset.backdrop);
+  const next=MODES[(i+1)%MODES.length];
+  document.body.dataset.backdrop=next[0];
+  backdrop.textContent="Backdrop: "+next[1];
+  document.dispatchEvent(new Event("backdropchange"));
+});
+
+const form=document.getElementById("signin");
+const email=document.getElementById("email");
+const password=document.getElementById("password");
+const submit=document.getElementById("submit");
+const reveal=document.getElementById("reveal");
+
+/* Reveal is a text toggle rather than an eye glyph: the system sprite has no
+   eye, and the word states its own state. */
+reveal.addEventListener("click",()=>{
+  const shown=password.type==="text";
+  password.type=shown?"password":"text";
+  reveal.textContent=shown?"Show":"Hide";
+  reveal.setAttribute("aria-pressed",String(!shown));
+  password.focus();
+});
+
+function setError(input,message){
+  const box=document.getElementById(input.id+"-error");
+  box.textContent=message||"";
+  input.setAttribute("aria-invalid",message?"true":"false");
+  return !message;
+}
+/* Validate only on submit, then clear per field as it is corrected — errors
+   that appear while someone is still typing read as nagging. */
+[email,password].forEach(i=>i.addEventListener("input",()=>{
+  if(i.getAttribute("aria-invalid")==="true")setError(i,"");
+}));
+
+/* ── backdrop ───────────────────────────────────────────────────────────────
+   Real Natural Earth geometry (world-atlas 110m TopoJSON) on an equirectangular
+   projection, rotated a fraction of a degree per frame so the continents drift
+   past. Signals ride great circles between fixed host and client coordinates:
+   each frame draws the arc's faint full path plus a short lit segment at the
+   current phase. Canvas, because the whole scene redraws every frame. */
+(function(){
+  const canvas=document.getElementById("globe");
+  if(!canvas||!window.d3||!window.topojson)return;
+  const ctx=canvas.getContext("2d");
+  const HOSTS=[
+    {name:"Frankfurt",at:[8.7,50.1]},
+    {name:"Ashburn",at:[-77.5,39.0]},
+    {name:"Singapore",at:[103.8,1.35]}
+  ];
+  const LINKS=[
+    {from:0,to:[3.4,6.5],speed:9.5,phase:0},      /* Lagos */
+    {from:0,to:[72.9,19.1],speed:11,phase:0.35},  /* Mumbai */
+    {from:1,to:[-46.6,-23.5],speed:12,phase:0.6}, /* Sao Paulo */
+    {from:1,to:[-118.2,34.1],speed:10,phase:0.15},/* Los Angeles */
+    {from:2,to:[139.7,35.7],speed:9,phase:0.8},   /* Tokyo */
+    {from:2,to:[151.2,-33.9],speed:11.5,phase:0.45} /* Sydney */
+  ].map(l=>({...l,path:d3.geoInterpolate(HOSTS[l.from].at,l.to)}));
+
+  const projection=d3.geoEquirectangular();
+  const path=d3.geoPath(projection,ctx);
+  const graticule=d3.geoGraticule10();
+  const calm=window.matchMedia("(prefers-reduced-motion: reduce)");
+  let land=null,w=0,h=0,dpr=1,lambda=0,running=false;
+
+  function size(){
+    dpr=Math.min(window.devicePixelRatio||1,2);
+    w=canvas.clientWidth;h=canvas.clientHeight;
+    canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+    /* Scale to FILL: fit first, then scale up by whichever axis is short and
+       recentre, so the map covers the viewport instead of letterboxing. */
+    projection.fitExtent([[0,0],[w,h]],{type:"Sphere"});
+    const b=d3.geoPath(projection).bounds({type:"Sphere"});
+    const cover=Math.max(w/(b[1][0]-b[0][0]),h/(b[1][1]-b[0][1]));
+    projection.scale(projection.scale()*cover).translate([w/2,h/2]);
+  }
+
+  function strokePath(feature,stroke,width,glow){
+    ctx.beginPath();path(feature);
+    ctx.strokeStyle=stroke;ctx.lineWidth=width;
+    ctx.shadowBlur=glow||0;ctx.shadowColor=glow?stroke:"transparent";
+    ctx.stroke();ctx.shadowBlur=0;
+  }
+  function dot(point,r,fill,glow){
+    const p=projection(point);if(!p)return null;
+    ctx.beginPath();ctx.arc(p[0],p[1],r,0,Math.PI*2);
+    ctx.fillStyle=fill;ctx.shadowBlur=glow;ctx.shadowColor=fill;
+    ctx.fill();ctx.shadowBlur=0;return p;
+  }
+  function arc(interp,from,to){
+    const pts=[];for(let i=0;i<=48;i++)pts.push(interp(from+(to-from)*(i/48)));
+    return {type:"LineString",coordinates:pts};
+  }
+
+  function frame(t){
+    if(!land){if(running)requestAnimationFrame(frame);return;}
+    draw(t);
+    if(running)requestAnimationFrame(frame);
+  }
+  /* A rAF loop ignores the CSS reduced-motion block, so the preference is read
+     here: one static frame instead of a rotating map, re-checked on change. */
+  function apply(){
+    const on=document.body.dataset.backdrop==="globe";
+    if(!on){running=false;ctx.clearRect(0,0,w,h);return;}
+    if(calm.matches){running=false;if(land)draw(6000);return;}
+    if(!running){running=true;requestAnimationFrame(frame);}
+  }
+  function draw(t){
+    lambda=(t/1000*1.6)%360;
+    projection.rotate([-lambda,0]);
+    ctx.clearRect(0,0,w,h);
+    ctx.lineJoin="round";
+
+    strokePath(graticule,"oklch(0.6605 0.0265 259.81/0.09)",0.6);
+    ctx.beginPath();path(land);
+    ctx.fillStyle="oklch(0.5998 0.2179 273.21/0.12)";ctx.fill();
+    strokePath(land,"oklch(0.74 0.16 273/0.62)",0.8,9);
+
+    LINKS.forEach(l=>{
+      const phase=((t/1000)/l.speed+l.phase)%1;
+      strokePath(arc(l.path,0,1),"oklch(0.5998 0.2179 273.21/0.2)",0.6);
+      const head=Math.min(1,phase*1.25),tail=Math.max(0,head-0.14);
+      if(head>0.02&&head<1){
+        strokePath(arc(l.path,tail,head),"oklch(0.78 0.17 273/0.85)",1.3,8);
+        dot(l.path(head),1.5,"oklch(0.95 0.05 273/0.9)",7);
+      }
+      if(phase>0.78)dot(l.to,1.8,"oklch(0.76 0.15 164/0.85)",6);
+      else dot(l.to,1.4,"oklch(0.6605 0.0265 259.81/0.5)",0);
+    });
+
+    HOSTS.forEach((host,i)=>{
+      const beat=(t/1000/4+i*0.33)%1;
+      const p=dot(host.at,2.4,"oklch(0.72 0.19 273/0.95)",9);
+      if(p&&beat<0.5){
+        ctx.beginPath();ctx.arc(p[0],p[1],3+beat*22,0,Math.PI*2);
+        ctx.strokeStyle="oklch(0.5998 0.2179 273.21/"+(0.32*(1-beat*2)).toFixed(3)+")";
+        ctx.lineWidth=0.8;ctx.stroke();
+      }
+    });
+  }
+
+  size();addEventListener("resize",()=>{size();if(calm.matches&&land)draw(6000);});
+  calm.addEventListener("change",apply);
+  document.addEventListener("backdropchange",apply);
+  fetch("https://cdn.jsdelivr.net/npm/world-atlas@2.0.2/countries-110m.json")
+    .then(r=>r.json())
+    .then(topo=>{land=topojson.feature(topo,topo.objects.countries);if(calm.matches)draw(6000);})
+    .catch(()=>{document.body.dataset.backdrop="plain";});
+  apply();
+})();
+
+form.addEventListener("submit",e=>{
+  e.preventDefault();
+  const value=email.value.trim();
+  const okEmail=setError(email,!value?"Enter your email address.":!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)?"That does not look like an email address.":"");
+  const okPassword=setError(password,password.value?"":"Enter your password.");
+  if(!okEmail){email.focus();return;}
+  if(!okPassword){password.focus();return;}
+  submit.disabled=true;
+  submit.innerHTML='<span class="spin"></span>Signing in';
+  window.setTimeout(()=>{
+    submit.disabled=false;
+    submit.textContent="Sign in";
+  },1800);
+});
+</script>
+</body>
+</html>

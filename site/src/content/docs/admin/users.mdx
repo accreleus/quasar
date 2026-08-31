@@ -1,0 +1,88 @@
+---
+title: Users and invites
+description: Registration modes, invite codes, roles, session limits, device binding and the audit log.
+---
+
+import Shot from '../../../components/Shot.astro';
+import admin_invites from '../../../assets/shots/admin-invites.png';
+import { Aside } from '@astrojs/starlight/components';
+
+## Registration modes
+
+Set under Admin, People, Invites.
+
+| Mode | Behaviour |
+| --- | --- |
+| `closed` | Nobody can register. The default. |
+| `invite_only` | Registration requires a valid invite code. |
+| `open` | Anyone who can reach the page can create an account. |
+
+`REGISTRATION_MODE` in `deploy/.env` seeds this value on the first boot of a
+fresh database and is ignored afterwards. The setting in the admin UI is the
+authority from then on. If you change the environment variable on a running
+instance and nothing happens, that is why.
+
+<Aside type="caution" title="Think before setting `open`">
+Remember that the media path only works for clients that can already reach your
+GPU host directly. `open` on an instance exposed to the internet gives strangers
+accounts and the ability to occupy scheduling capacity, without giving them
+anything playable.
+</Aside>
+
+## Invites
+
+Mint an invite and you get a code and a link, shown **once**. Copy it then. It is
+not retrievable afterwards.
+
+The link carries the code as a query parameter, so the person you send it to
+never types anything. You can list outstanding invites and revoke any that have
+not been used.
+
+<Shot
+	label="Admin invites"
+	sublabel="The invites page: the registration mode control, and outstanding invites with their state and remaining uses."
+	src={admin_invites}
+	alt="The admin invites page"
+/>
+
+## Users
+
+Under Admin, People, Users you can see accounts, change roles, and set per-user
+concurrent session limits.
+
+**Roles** are `user` and `admin`. There is nothing in between. An admin can do
+everything in this documentation.
+
+**Concurrent session limit** caps how many sessions one account can have running
+at once. Note that a limit of zero blocks that user from launching anything at
+all, which is occasionally what you want and more often a misconfiguration
+someone is confused by.
+
+## Devices
+
+Every browser a user logs in from is recorded as a device, along with what
+Quasar measured it can decode. That measurement is what stops the server sending
+a codec the client cannot play.
+
+Users manage their own devices from their account page: rename, trust, revoke.
+Revoking invalidates that device's login.
+
+Login tokens can be bound to a device, which means a stolen token is not useful
+from somewhere else.
+
+## The audit log
+
+Admin, Audit log records admin actions. Check it when something changed and
+nobody remembers changing it.
+
+## Entitlements: who sees what
+
+Access to an app is a separate thing from having an account. An app is either
+granted to everyone or granted to named users, and a user's library only shows
+what they have been granted.
+
+Grants are managed on the app itself, under Admin, Library, Apps. See
+[Apps and runtime presets](/quasar/admin/apps/).
+
+A user who is not entitled to an app cannot see it and cannot launch it, even
+with the app's identifier in hand. The check is on the server.

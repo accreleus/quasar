@@ -1,0 +1,44 @@
+ARG GO_IMAGE=golang:1.24.13-bookworm
+ARG NODE_IMAGE=node:22.22.0-bookworm
+ARG RUST_IMAGE=rust:1.88.0-bookworm
+ARG POSTGRES_IMAGE=postgres:16.4-bookworm
+
+FROM ${GO_IMAGE} AS go
+FROM ${NODE_IMAGE} AS node
+FROM ${POSTGRES_IMAGE} AS postgres-client
+FROM ${RUST_IMAGE}
+
+ARG DEVTOOLS_BUILD_DATE=unknown
+ARG DEBIAN_FRONTEND=noninteractive
+LABEL org.opencontainers.image.title="quasar-devtools" \
+      org.opencontainers.image.created="${DEVTOOLS_BUILD_DATE}"
+
+COPY --from=go /usr/local/go /usr/local/go
+COPY --from=node /usr/local/ /usr/local/
+# Debian bookworm's apt `postgresql-client` is PostgreSQL 15, while Quasar's
+# supported database is 16. pg_dump refuses newer servers, so use matching
+# client binaries for backup/restore rehearsals and DB diagnostics.
+COPY --from=postgres-client /usr/lib/postgresql/16/bin/ /usr/local/bin/
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bash ca-certificates curl git jq make pkg-config postgresql-client \
+      shellcheck yamllint \
+      libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+      libgstreamer-plugins-bad1.0-dev gstreamer1.0-tools \
+      gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+      gstreamer1.0-plugins-bad gstreamer1.0-nice \
+      libasound2-dev libglib2.0-dev libssl-dev && \
+    rm -rf /var/lib/apt/lists/* && \
+    rustup component add rustfmt clippy
+
+ENV PATH="/usr/local/go/bin:${PATH}" \
+    CARGO_HOME=/cache/cargo \
+    CARGO_TARGET_DIR=/cache/cargo-target \
+    GOCACHE=/cache/go-build \
+    GOMODCACHE=/cache/go-mod \
+    npm_config_cache=/cache/npm
+
+RUN printf '%s\n' "${DEVTOOLS_BUILD_DATE}" > /etc/quasar-devtools-build-date
+
+WORKDIR /workspace
+CMD ["bash"]

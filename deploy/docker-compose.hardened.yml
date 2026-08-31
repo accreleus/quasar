@@ -1,0 +1,55 @@
+# Production TLS ingress overlay. The control-plane is bridge-only; Caddy is the
+# sole public listener and preserves WebSocket upgrades for /v1/signal.
+services:
+  quasar-control-plane:
+    ports: !reset []
+    expose: ["8080"]
+    environment:
+      PUBLIC_BASE_URL: https://${QUASAR_PUBLIC_HOST:?Set QUASAR_PUBLIC_HOST}
+      QUASAR_ALLOWED_ORIGINS: https://${QUASAR_PUBLIC_HOST:?Set QUASAR_PUBLIC_HOST}
+      # This overlay IS the production deployment. Declaring it makes the
+      # dev-only agent-auth refusal real: the control plane hard-fails at boot if
+      # QUASAR_DEV_AGENT_AUTH=1 ever reaches a stack running this file (#399).
+      QUASAR_ENV: production
+      # #438: every request now arrives from the quasar-edge container, so
+      # without this the login, signaling, agent-enrollment and first-run
+      # setup-claim rate limiters all key on ONE address and every client
+      # shares a single failure budget. The worst case is a pre-auth lockout
+      # DoS on POST /v1/setup/claim: an attacker burns the shared budget with
+      # bad tokens and the operator can never create the first admin.
+      #
+      # Set QUASAR_TRUSTED_PROXIES to the /16 this compose project's own bridge
+      # allocates — read it off `docker network inspect <project>_default`, e.g.
+      # 172.18.0.0/16 — and the control plane will key on the address Caddy
+      # actually saw. Name that /16, NOT the enclosing 172.16.0.0/12: the /12
+      # spans every Docker bridge on the box including the default bridge and
+      # the host gateway, so it would trust unrelated stacks' containers as if
+      # they were this deployment's edge.
+      # LEFT EMPTY IT IS SAFE, JUST COARSE — the header is
+      # never consulted, so nobody can spoof a limiter key; the shared budget
+      # is the cost. Never widen this to a network you do not operate.
+      QUASAR_TRUSTED_PROXIES: ${QUASAR_TRUSTED_PROXIES:-}
+
+  quasar-edge:
+    image: caddy@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c
+    ports:
+      - "${QUASAR_HTTPS_PORT:-443}:443"
+    environment:
+      QUASAR_PUBLIC_HOST: ${QUASAR_PUBLIC_HOST:?Set QUASAR_PUBLIC_HOST}
+      QUASAR_TLS_CERT: /certs/fullchain.pem
+      QUASAR_TLS_KEY: /certs/privkey.pem
+    volumes:
+      - ./Caddyfile.hardened:/etc/caddy/Caddyfile:ro
+      - ${QUASAR_TLS_DIR:?Set QUASAR_TLS_DIR}:/certs:ro
+    depends_on:
+      quasar-control-plane:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /config
+      - /data
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped

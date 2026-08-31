@@ -1,0 +1,15 @@
+node_modules
+dist
+dist-ssr
+*.local
+.vite
+*.tsbuildinfo
+
+# Playwright MCP scratch (test runs)
+.playwright-mcp
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store

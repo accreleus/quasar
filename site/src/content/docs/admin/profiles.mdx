@@ -1,0 +1,104 @@
+---
+title: Quality profiles
+description: Launch profiles are what users pick. Stream profiles are the rungs underneath. How the two fit together and when to change them.
+---
+
+import Shot from '../../../components/Shot.astro';
+import admin_profiles from '../../../assets/shots/admin-profiles.png';
+import { Aside } from '@astrojs/starlight/components';
+
+There are two objects here and the distinction matters.
+
+A **stream profile** is one concrete encode rung: one codec, one resolution, one
+frame rate, one bitrate, plus the thresholds that decide whether a given client
+qualifies for it. Users never see these.
+
+A **launch profile** is an ordered list of stream profiles, best first. This is
+what a user picks, and it is what "1080p60" means in the interface.
+
+## How a session resolves
+
+At launch, the server walks the chosen launch profile's rungs in order and takes
+the first one that survives four checks:
+
+1. **The host can encode it.** The placed GPU has to have that codec.
+2. **The client can decode it.** Measured when the user logged in. HEVC and AV1
+   are hard-gated on a positive result, because sending an undecodable codec is
+   a black screen, not a quality drop.
+3. **It has not failed for this client before.** A codec that failed gets
+   skipped on later launches.
+4. **Hardware encode is available**, if the rung requires it.
+
+Every launch profile must contain at least one H.264 rung. The server rejects a
+profile that does not. H.264 decodes everywhere, so there is always a rung that
+works and a launch never fails because nothing was playable.
+
+<Shot
+	label="Admin launch profiles"
+	sublabel="Launch profiles, each showing the ordered stream profile rungs it falls through."
+	src={admin_profiles}
+	alt="The admin launch profiles page"
+/>
+
+## What ships by default
+
+Twelve launch profiles, covering 720p, 1080p, 1440p and 4K at 60, 90 and 120
+frames per second. **1080p60 is the recommended default.**
+
+Within each tier the rungs are ordered AV1 first, then HEVC, then H.264. That
+order is deliberate:
+
+- **AV1** saves roughly 40 to 50 percent of the bitrate of H.264 at equivalent
+  quality, and Chrome can decode it everywhere thanks to its software fallback.
+- **HEVC** saves roughly 30 to 40 percent, but Chrome only decodes it with
+  operating system hardware support, so macOS and Windows clients usually get it
+  and Linux clients never do.
+- **H.264** works everywhere and is the floor.
+
+The saving is bandwidth headroom, not latency. On a clean LAN with plenty of
+bandwidth, the codec makes very little difference to how the stream feels. On a
+constrained link it makes a great deal.
+
+## When to change any of this
+
+Mostly you should not. The defaults are a reasonable ladder for common hardware.
+
+Reasons you might:
+
+**Your GPU cannot encode something in the list.** Not a problem in itself,
+because unsupported rungs are skipped. It is only worth editing if you want the
+list to reflect reality for your own clarity.
+
+**You want to cap quality.** Removing high tiers or restricting apps to specific
+tiers is the way to stop one user occupying a whole GPU at 4K120.
+
+**Your bitrates do not suit your network.** The default bitrates target a
+reasonable LAN. If you are streaming over a constrained link, lowering them may
+give better results than letting adaptive bitrate discover the ceiling on every
+launch.
+
+<Aside type="caution" title="4K120 does not work in a browser">
+The default catalog includes it, but browser decode does not keep up in
+practice. Treat it as a tier waiting on the native client.
+</Aside>
+
+## Instance default and user override
+
+Under Admin you can set the instance-wide default launch profile, and whether
+users are allowed to override it.
+
+If overrides are on, a user's own default from their account page wins. If they
+are off, everyone gets the instance default.
+
+## What the user sees
+
+A tier name and an indication of whether it suits their device. Not the codec,
+not the bitrate, not the rung list. If someone asks why they got HEVC instead of
+AV1, the answer is in the session detail under Admin, Sessions.
+
+## Related tuning
+
+Codec behaviour and encoder selection are covered separately in
+[Codecs](/quasar/tuning/codecs/) and [Encoders](/quasar/tuning/encoders/). What
+the stream does with bitrate once a session is running is
+[Adaptive bitrate](/quasar/tuning/adaptive-bitrate/).

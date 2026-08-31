@@ -1,0 +1,58 @@
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkdevice.c b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkdevice.c
+index afd4c59..2bdb5cf 100644
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkdevice.c
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkdevice.c
+@@ -674,6 +674,12 @@ gst_vulkan_device_get_queue (GstVulkanDevice * device, guint32 queue_family,
+ 
+   vkGetDeviceQueue (device->device, queue_family, queue_i, &ret->queue);
+ 
++  GST_INFO_OBJECT (device,
++      "submit-lock diagnostic wrapper=%" GST_PTR_FORMAT
++      " VkDevice=%p VkQueue=%p"
++      " family=%u index=%u global-lock=enabled", ret,
++      (gpointer) device->device, (gpointer) ret->queue, queue_family, queue_i);
++
+   return ret;
+ }
+ 
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkqueue.c b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkqueue.c
+index 10359bb..fe882cf 100644
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkqueue.c
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkqueue.c
+@@ -54,6 +54,14 @@ struct _GstVulkanQueuePrivate
+   GMutex submit_lock;
+ };
+ 
++/* Diagnostic serialization domain: Vulkan queue submission is externally
++ * synchronized, but separate GstVulkanQueue wrappers can refer to the same
++ * VkQueue.  A per-wrapper mutex cannot serialize those callers.  Use one
++ * process-wide lock so every GStreamer Vulkan submit wrapper participates in
++ * the same domain while Tower's stochastic session-start Xid 32 is isolated.
++ * Keep the private mutex and object layout unchanged for ABI stability. */
++G_LOCK_DEFINE_STATIC (vulkan_queue_submit);
++
+ #define parent_class gst_vulkan_queue_parent_class
+ G_DEFINE_TYPE_WITH_CODE (GstVulkanQueue, gst_vulkan_queue, GST_TYPE_OBJECT,
+     G_ADD_PRIVATE (GstVulkanQueue); _init_debug ());
+@@ -317,9 +325,9 @@ gst_vulkan_queue_run_context_query (GstElement * element,
+ void
+ gst_vulkan_queue_submit_lock (GstVulkanQueue * queue)
+ {
+-  GstVulkanQueuePrivate *priv = GET_PRIV (queue);
++  g_return_if_fail (GST_IS_VULKAN_QUEUE (queue));
+ 
+-  g_mutex_lock (&priv->submit_lock);
++  G_LOCK (vulkan_queue_submit);
+ }
+ 
+ /**
+@@ -335,7 +343,7 @@ gst_vulkan_queue_submit_lock (GstVulkanQueue * queue)
+ void
+ gst_vulkan_queue_submit_unlock (GstVulkanQueue * queue)
+ {
+-  GstVulkanQueuePrivate *priv = GET_PRIV (queue);
++  g_return_if_fail (GST_IS_VULKAN_QUEUE (queue));
+ 
+-  g_mutex_unlock (&priv->submit_lock);
++  G_UNLOCK (vulkan_queue_submit);
+ }

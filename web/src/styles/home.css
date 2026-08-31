@@ -1,0 +1,1486 @@
+/* ============================================================
+   home — the logged-in landing page (AppHomeNext + pages/app/home/*)
+
+   Source of truth: design_handoff_v3/screens/home.html, read as the
+   browser COMPUTES it — home-v3.css's token layer over quasar.css,
+   not the two-file cascade. Tokens come from styles/tokens.css, which
+   already carries the v3 ramp, so nothing here re-declares a colour
+   ramp and there is no hex.
+
+   SCOPE: the hero, the featured rail, the library head, the grid and
+   its tiles, plus the inline detail band inherited from library.css
+   (retired here — Task 12 replaces the band itself). The shared cover
+   primitive (`.cover` / `.cover-img` / `.cv-*` / `.glyph`) lives in
+   primitives.css: the session quick-switch rail and the admin artwork
+   panel render it too.
+
+   NAMING: `home-`/`lib-` prefixes where the mock's own class would
+   collide with something global — the mock's `.rail`, `.hero`,
+   `.tile`, `.detail` and `.count` are all generic enough to meet a
+   primitive. Where there is no collision the mock's name is kept
+   (`.feat`-side classes carry `home-`, but `.lib-head`, `.src-head`,
+   `.fnm`, `.fav-marker`, `.playov`-equivalents keep theirs).
+   ============================================================ */
+
+/* ---- page frame -------------------------------------------------------- */
+
+/* `.main-home` (shell.css) has no padding: the hero bleeds full width and each
+   surface below owns its own gutter.
+
+   `.home` is both the content wrapper (AppHomeNext) and the shell's
+   `.topbar.home`, so a custom property set here reaches the whole surface. */
+.home {
+  --home-max: 1400px;
+
+  /* Ink that sits ON artwork, so it does not follow the theme: a scrim, a
+     keyline and a caption are dark-on-bright or bright-on-dark against a poster,
+     never against the page surface. */
+  --home-scrim: oklch(0.12 0.01 285 / 0.35);
+  --home-keyline: oklch(0.1365 0.009 285 / 0.92);
+  --home-on-accent: oklch(1 0 0);
+  --home-fnm: oklch(1 0 0 / 0.85);
+
+  /* Home runs a wider gutter than the console: 40px (quasar.css) against
+     console-v3.css's 32. Each tier is restated because a custom property set
+     here shadows tokens.css's :root declarations for everything inside. */
+  --page-pad: 40px;
+}
+[data-density="dense"] .home {
+  --page-pad: 28px;
+}
+@media (max-width: 720px) {
+  .home,
+  [data-density="dense"] .home {
+    --page-pad: 16px;
+  }
+}
+
+/* The post-session summary (styles.css) sits above the hero and outside every
+   surface that owns a gutter, so it takes the page's own. */
+.home > .session-summary {
+  max-width: var(--home-max);
+  margin: var(--s6) auto 0;
+  width: calc(100% - 2 * var(--page-pad));
+}
+
+/* The two views are the same component at two routes, so the swap used to be a
+   hard cut. `.home-view` is keyed by the view in AppHomeNext, which means React
+   mounts a fresh element per navigation and the one-shot animation below runs
+   exactly once, on the arriving view. DIRECTION follows the topbar nav order
+   (Home, then Library): forward enters from the right, back from the left.
+
+   TRANSFORM + OPACITY ONLY, so nothing reflows and the head below cannot jump.
+   `overflow-x: clip`, NOT `hidden`: `hidden` would make this a scroll container,
+   swallowing `position: sticky` inside it and giving the page a scroll-anchoring
+   seam. Without either, the 28px of travel briefly widens the document and a
+   horizontal scrollbar flashes mid-animation. */
+.home-view {
+  overflow-x: clip;
+}
+.home-view[data-enter="right"] {
+  animation: home-view-in-right 0.22s cubic-bezier(0.3, 0.8, 0.3, 1);
+}
+.home-view[data-enter="left"] {
+  animation: home-view-in-left 0.22s cubic-bezier(0.3, 0.8, 0.3, 1);
+}
+@keyframes home-view-in-right {
+  from {
+    transform: translate3d(28px, 0, 0);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+@keyframes home-view-in-left {
+  from {
+    transform: translate3d(-28px, 0, 0);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+/* ---- hero band -------------------------------------------------------- */
+
+.home-hero-wrap {
+  position: relative;
+  overflow: hidden;
+}
+
+/* The mock's elliptical horizon glow above the fold. Decorative: pointer-events
+   off, aria-hidden in the markup. */
+.home-sweep {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 0;
+}
+.home-sweep::before {
+  content: "";
+  position: absolute;
+  left: -20%;
+  right: -20%;
+  top: -780px;
+  height: 1200px;
+  border-radius: 50%;
+  background: linear-gradient(
+    180deg,
+    transparent 82%,
+    oklch(0.5443 0.2453 284.39 / 0.1) 94%,
+    oklch(0.7577 0.1529 231.09 / 0.06)
+  );
+  border-bottom: 1px solid var(--line);
+}
+
+/* THE HERO IS SIZED BY THE VIEWPORT'S HEIGHT, NOT ITS WIDTH (UX assessment
+   §2.4). Everything that decides how tall this band is — the copy column, the
+   headline, the rail card, the padding above and below — is a custom property
+   set here and re-set by the ladder at the foot of this file. Hard-coded values
+   would have to be overridden one selector at a time, which is how the band
+   ended up 839px tall at 1024x768: taller than the viewport, with the first tile
+   at y=1064 and not one game visible without scrolling. */
+.home-hero {
+  --home-copy-w: 280px;
+  --home-feat-w: 280px;
+  --home-h1: 3.4rem;
+  --home-copy-pad: 56px;
+  --home-rail-gutter: 22px;
+
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: var(--home-copy-w) minmax(0, 1fr);
+  gap: var(--s8);
+  align-items: start;
+  max-width: var(--home-max);
+  margin: 0 auto;
+  padding: var(--s9) var(--page-pad) var(--s7);
+}
+/* No rail (no live session, no history, no favourites) — the copy takes the
+   full width instead of leaving a dead right half. */
+.home-hero[data-rail="false"] {
+  grid-template-columns: minmax(0, 1fr);
+  --home-copy-pad: 0px;
+}
+
+.home-hero-copy {
+  padding-top: var(--home-copy-pad);
+}
+.home-hero-copy h1 {
+  font-family: var(--font-display);
+  font-size: var(--home-h1);
+  letter-spacing: -0.03em;
+  line-height: 1.02;
+  font-weight: 700;
+}
+/* The gradient word. `em` is the mock's own hook; it is not italic here. */
+.home-hero-copy h1 em {
+  font-style: normal;
+  background: var(--brand-grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.home-hero-sub {
+  color: var(--text-2);
+  margin-top: 18px;
+  font-size: var(--t-lg);
+  line-height: 1.55;
+  max-width: 220px;
+}
+
+/* ---- featured rail ---------------------------------------------------- */
+
+.home-rail {
+  position: relative;
+  min-width: 0;
+}
+/* Negative margin + matching padding so a card's hover lift and focus ring are
+   not clipped by the scroll container. */
+.home-rail-track {
+  display: flex;
+  gap: var(--s5);
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;
+  padding: 6px 6px var(--home-rail-gutter, 22px);
+  margin: -6px;
+  scrollbar-width: none;
+  /* Clearance for the sticky topbar: arrowing up from the grid scrolls the rail
+     into view, and `nearest` scrolls the minimum — which parks the rail's top
+     edge under the 64px topbar. */
+  scroll-margin-top: calc(64px + var(--s4));
+}
+.home-rail-track::-webkit-scrollbar {
+  display: none;
+}
+
+.home-feat {
+  position: relative;
+  /* `min(…, 100%)` so a viewport narrower than one card shows a WHOLE card
+     rather than a permanently clipped one. Above ~380px this is the mock's
+     280px, until the ladder shrinks `--home-feat-w`: the poster is 2:3, so the
+     card's WIDTH is the only honest control over the band's HEIGHT that does not
+     crop artwork. */
+  flex: 0 0 min(var(--home-feat-w, 280px), 100%);
+  scroll-snap-align: start;
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--r-xl);
+  overflow: hidden;
+  background: var(--ink-3);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-md);
+  transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+}
+.home-feat:hover,
+.home-feat:focus-within {
+  transform: translateY(-6px);
+  box-shadow: var(--shadow-lg);
+  border-color: var(--line-3);
+}
+
+.home-feat-poster {
+  position: relative;
+  background: var(--ink-4);
+}
+.home-feat-poster .glyph {
+  font-size: 3rem;
+}
+/* The mock's `.playov` scrim, over the poster only. */
+.home-feat-poster::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  background: var(--home-scrim);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease;
+}
+.home-feat:hover .home-feat-poster::after,
+.home-feat:focus-within .home-feat-poster::after {
+  opacity: 1;
+}
+
+/* One full-bleed surface button is the tab stop; the play control sits above it
+   and is pointer-inert until the card is hovered or focused, so an invisible
+   centre button cannot launch a session on a stray tap. */
+.home-feat-surface {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+}
+/* The focus ring has to survive the artwork (UX assessment §2.5). A soft violet
+   tint over violet-and-blue covers was invisible, leaving the 6px lift as the
+   only focus cue — and `prefers-reduced-motion` turns that off. An opaque band
+   flanked by two near-black keylines supplies its own contrast against both the
+   page behind it and the artwork in front of it. `border-radius` is explicit
+   because the surface is an absolutely positioned rectangle: without it the
+   inset ring is drawn square and the card's `overflow: hidden` slices its
+   corners. Not motion, so reduced-motion leaves it alone. */
+.home-feat-surface:focus-visible {
+  outline: none;
+  border-radius: var(--r-xl);
+  box-shadow:
+    inset 0 0 0 2px var(--home-keyline),
+    inset 0 0 0 5px var(--teal),
+    inset 0 0 0 7px var(--home-keyline);
+}
+.home-feat:focus-within {
+  border-color: var(--teal);
+}
+
+/* The mock's 64px `.pb` inside `.playov`. */
+.home-feat-play {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%) scale(0.9);
+  z-index: 4;
+  display: grid;
+  place-content: center;
+  width: 64px;
+  height: 64px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--home-on-accent);
+  box-shadow:
+    0 8px 28px -6px oklch(0.5998 0.2179 273.21 / 0.8),
+    0 0 0 6px var(--accent-soft-2);
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease, transform 0.18s ease, background-color 0.15s ease;
+}
+.home-feat:hover .home-feat-play,
+.home-feat:focus-within .home-feat-play {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translate(-50%, -50%) scale(1);
+}
+/* `:hover` and `:focus-visible` styled identically (§3.5): a mouse yields hover,
+   touch yields neither, a gamepad can only yield focus. */
+.home-feat-play:hover:not(:disabled),
+.home-feat-play:focus-visible:not(:disabled) {
+  background: var(--accent-hover);
+}
+.home-feat-play:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.home-feat-play:focus-visible {
+  outline: 3px solid var(--teal);
+  outline-offset: 2px;
+}
+.home-feat-play svg {
+  width: 24px;
+  height: 24px;
+  margin-left: 3px;
+}
+
+/* Kicker → action → name, the mock's hierarchy: why the card is here, what
+   pressing it does, and which game — the name muted at the foot. */
+.home-feat-body {
+  position: relative;
+  z-index: 1;
+  padding: 15px 17px 17px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+}
+.home-feat-kicker {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  font-size: var(--t-sm);
+  font-weight: 700;
+}
+.home-feat-kicker.live {
+  color: var(--success-text);
+}
+.home-feat-kicker.info {
+  color: var(--info-text);
+}
+.home-feat-kicker.accent {
+  color: var(--accent-text);
+}
+/* Not in the mock: the fall-through for a `HighlightReason` added by a later
+   contract amendment, which this client version cannot style meaningfully.
+   `--text-2`, not `--text-3`, so it does not render identically to the name
+   below it and read as one line printed twice. */
+.home-feat-kicker.neutral {
+  color: var(--text-2);
+}
+.home-feat-action {
+  font-family: var(--font-display);
+  font-size: 1.2rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+  color: var(--text);
+}
+.home-feat-name {
+  color: var(--text-3);
+  font-size: var(--t-sm);
+  margin-top: auto;
+  padding-top: 8px;
+  overflow-wrap: anywhere;
+}
+
+/* Right-edge fade — a hint that the rail continues, rendered only while there is
+   more rail to the right (FeaturedRail). `right: -6px` is not a nudge: the
+   track's -6px margin puts the card clip edge 6px beyond `.home-rail`, and a
+   fade stopping at 0 left a bright vertical sliver of artwork at the clip. */
+.home-rail-fade {
+  position: absolute;
+  top: 0;
+  bottom: 16px;
+  right: -6px;
+  width: 76px;
+  background: linear-gradient(90deg, transparent, var(--ink-1));
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Prev/next, removed from the DOM (not merely faded) at the ends so they are
+   never dead tab stops. z-index 5 has to beat the CARD's internals, not just the
+   track: `.home-feat` creates no stacking context, so its children participate
+   in this one and were painting above the button wherever a card overlapped it.
+   Any new z-index inside `.home-feat` must stay below this. */
+.home-rail-btn {
+  position: absolute;
+  top: calc(50% - 60px);
+  right: -8px;
+  z-index: 5;
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  background: var(--ink-4);
+  border: 1px solid var(--line-2);
+  color: var(--text);
+  display: grid;
+  place-content: center;
+  cursor: pointer;
+  box-shadow: var(--shadow-lg);
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+.home-rail-btn.prev {
+  left: -8px;
+  right: auto;
+}
+.home-rail-btn:hover,
+.home-rail-btn:focus-visible {
+  background: var(--ink-5);
+  border-color: var(--line-3);
+}
+.home-rail-btn:focus-visible {
+  outline: 3px solid var(--teal);
+  outline-offset: 2px;
+}
+.home-rail-btn svg {
+  width: 20px;
+  height: 20px;
+}
+
+/* ---- library section -------------------------------------------------- */
+
+.home-lib {
+  position: relative;
+  z-index: 1;
+  max-width: var(--home-max);
+  margin: 0 auto;
+  padding: 0 var(--page-pad) 96px;
+}
+
+.lib-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: var(--s7) 0 var(--s5);
+  flex-wrap: wrap;
+}
+.lib-head h2 {
+  font-size: var(--t-h2);
+}
+.lib-head .count {
+  color: var(--text-3);
+  font-size: var(--t-lg);
+  font-weight: 500;
+}
+.lib-head .segmented {
+  margin-left: 6px;
+  /* The five-segment filter must scroll inside itself on a phone rather than
+     widen the page. */
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.lib-head .segmented::-webkit-scrollbar {
+  display: none;
+}
+/* The home surface fills the active segment with the accent (quasar.css);
+   the neutral glass chip in primitives.css is the console's form. */
+.home .segmented button {
+  height: auto;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: var(--t-sm);
+}
+.home .segmented button[aria-selected="true"] {
+  background: var(--accent);
+  border-color: transparent;
+  color: var(--home-on-accent);
+  box-shadow: var(--shadow-sm);
+}
+.lib-open {
+  color: var(--text-2);
+  font-size: var(--t-sm);
+  font-weight: 600;
+  text-decoration: none;
+}
+.lib-open:hover {
+  color: var(--text);
+}
+
+/* Per-source heading in the Library view. The count is a fact, not a badge — it
+   is the only way to see at a glance that a provider stopped contributing. */
+.src-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin: var(--s7) 0 var(--s4);
+}
+.src-head h3 {
+  font-size: var(--t-h3);
+}
+.src-head .count {
+  font-size: var(--t-sm);
+  color: var(--text-3);
+  background: var(--ink-3);
+  border: 1px solid var(--line);
+  padding: 2px 9px;
+  border-radius: var(--r-pill);
+}
+.src-head .s-sub {
+  font-size: var(--t-sm);
+  color: var(--text-3);
+}
+/* The first group sits directly under the head. */
+.home-lib section:first-of-type .src-head {
+  margin-top: var(--s2);
+}
+
+.lib-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: var(--s4);
+}
+
+/* ---- tile --------------------------------------------------------------
+   One 2:3 box: the gradient fallback (with glyph and name) underneath, the
+   cover over it, markers on top, and two layered controls (LibraryTile.tsx). */
+.lib-tile {
+  position: relative;
+  aspect-ratio: 2 / 3;
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: var(--ink-4);
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+.lib-tile:hover {
+  transform: translateY(-4px);
+  box-shadow: var(--shadow-lg);
+  border-color: var(--line-3);
+}
+.lib-tile > .cover {
+  position: absolute;
+  inset: 0;
+  aspect-ratio: auto;
+}
+.lib-tile .glyph {
+  font-size: 2rem;
+}
+/* The name, on the fallback: visible on the product's default artwork-less
+   catalogue and covered by the box art when there is any. */
+.lib-tile .fnm {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 14px;
+  text-align: center;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: var(--t-sm);
+  color: var(--home-fnm);
+  padding: 0 10px;
+}
+/* The mock's `.playov` scrim. `::before`, since `::after` is the open tile's
+   caret. */
+.lib-tile::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  background: var(--home-scrim);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease;
+}
+.lib-tile:hover::before,
+.lib-tile:focus-within::before {
+  opacity: 1;
+}
+
+.lib-tile-surface {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+}
+/* Same ring as the rail card, and for the same reason — see there. */
+.lib-tile-surface:focus-visible {
+  outline: none;
+  border-radius: var(--r-lg);
+  box-shadow:
+    inset 0 0 0 2px var(--home-keyline),
+    inset 0 0 0 5px var(--teal),
+    inset 0 0 0 7px var(--home-keyline);
+}
+
+.lib-tile-play {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%) scale(0.9);
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: center;
+  width: 54px;
+  height: 54px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--home-on-accent);
+  box-shadow:
+    0 8px 28px -6px oklch(0.5998 0.2179 273.21 / 0.8),
+    0 0 0 6px var(--accent-soft-2);
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease, transform 0.18s ease, background-color 0.15s ease;
+}
+.lib-tile:hover .lib-tile-play,
+.lib-tile:focus-within .lib-tile-play,
+.lib-tile[data-open="true"] .lib-tile-play {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translate(-50%, -50%) scale(1);
+}
+.lib-tile-play svg {
+  width: 20px;
+  height: 20px;
+  margin-left: 2px;
+}
+/* Resume is a labelled pill, not a bare glyph (UX §3.3): the press navigates to
+   a live session instead of launching one, and says so before it is pressed. */
+.lib-tile-play[data-action="resume"] {
+  width: auto;
+  height: 38px;
+  border-radius: var(--r-pill);
+  padding: 0 16px 0 13px;
+}
+.lib-tile-play[data-action="resume"] svg {
+  width: 15px;
+  height: 15px;
+  margin-left: 0;
+}
+.lib-tile-play-label {
+  font-family: var(--font-ui);
+  font-size: var(--t-sm);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+.lib-tile-play:hover:not(:disabled),
+.lib-tile-play:focus-visible:not(:disabled) {
+  background: var(--accent-hover);
+}
+.lib-tile-play:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Markers, not controls: always visible, never clickable. `.blocked`
+   (steam-library-discovery spec §2.2) shares `.running`'s slot rather than
+   getting its own — a tile is never both at once: the single-writer lock's own
+   tile is `.running`, every OTHER tile sharing its home is `.blocked`
+   (libraryGrid.blockedFamilyIds). PRESENTATION ONLY; the gate is the server's
+   409 home_in_use (CLAUDE.md invariant #6). */
+.lib-tile .running,
+.lib-tile .blocked {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 6;
+  pointer-events: none;
+}
+.lib-tile .running .chip,
+.lib-tile .blocked .chip {
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+.lib-tile .fav-marker {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 6;
+  pointer-events: none;
+  display: grid;
+  place-content: center;
+  color: var(--lavender);
+  filter: drop-shadow(0 1px 4px var(--home-keyline));
+}
+.lib-tile .fav-marker svg {
+  width: 18px;
+  height: 18px;
+}
+
+/* The open tile: violet edge, ring, and the mock's 8px caret notch pointing at
+   the band below it. */
+.lib-tile[data-open="true"] {
+  border-color: var(--accent-soft-2);
+  box-shadow: 0 0 0 1px var(--accent-soft-2), var(--shadow-lg);
+}
+.lib-tile[data-open="true"]:hover {
+  transform: none;
+}
+.lib-tile[data-open="true"]::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -2px;
+  z-index: 6;
+  transform: translateX(-50%);
+  border: 8px solid transparent;
+  border-bottom-color: var(--accent);
+}
+
+/* ---- the not-a-library states ------------------------------------------
+   A failed catalogue, an empty catalogue and a filter that matched nothing all
+   render through ONE panel (home/panels.tsx). Centred and boxed rather than a
+   left-aligned line, because it stands in for the grid, not for a caption above
+   one. */
+.home-loading {
+  padding: var(--s7) 0;
+}
+.home-state {
+  margin: var(--s7) auto var(--s9);
+  max-width: 620px;
+  padding: var(--s8) var(--s7);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--ink-2);
+  box-shadow: var(--inset-top);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s3);
+  text-align: center;
+}
+.home-state h3 {
+  font-family: var(--font-display);
+  font-size: var(--t-h2);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.home-state p {
+  color: var(--text-2);
+  max-width: 46ch;
+  line-height: 1.55;
+}
+.home-state-actions {
+  margin-top: var(--s2);
+  display: flex;
+  gap: var(--s3);
+}
+/* A failure is not a mood — it borrows the `.note.warn` idiom the admin area
+   already uses so both areas answer a dead fetch the same way. */
+.home-state[data-tone="error"] {
+  border-color: var(--danger-line);
+  background: var(--danger-bg);
+}
+.home-state[data-tone="error"] h3 {
+  color: var(--danger-text);
+}
+
+/* ---- responsive: WIDTH -------------------------------------------------- */
+
+@media (max-width: 1080px) {
+  /* The arrows are a pointer convenience, and there is no room for them to
+     overhang once the rail reaches the page padding. */
+  .home-rail-btn {
+    display: none;
+  }
+}
+
+/* Below this the copy column cannot hold "Game / on" beside a card, so the band
+   stacks. THIS USED TO HAPPEN AT 1080px, and stacking makes the hero TALLER —
+   the direct cause of the 839px hero at 1024x768. */
+@media (max-width: 780px) {
+  .home-hero,
+  .home-hero[data-rail="true"] {
+    grid-template-columns: minmax(0, 1fr);
+    --home-copy-pad: 0px;
+    gap: var(--s5);
+  }
+  .home-hero-sub {
+    max-width: 46ch;
+  }
+}
+
+/* ---- responsive: THE HERO LADDER ---------------------------------------
+   THE REAL CONSTRAINT (§2.4). At 1280x800 the first tile sat at y=818 and at
+   1024x768 at y=1064 — on the two commonest laptop sizes you had to scroll
+   before seeing a single game, on a page whose entire job is to get you back
+   into one.
+
+   EACH RUNG FIRES ON EITHER AXIS (`,` is OR). Height alone caught laptops and
+   missed every tablet: an iPad Pro 12.9 landscape is 1366x1024, taller than
+   900px, so it was served the full 280px desktop hero on a viewport 1.4x
+   narrower than the monitor that hero was proportioned for. Width is not a
+   competing ladder — it is the same rung reached from the other side, which is
+   why both conditions set the SAME values. Rung 1's 1500px sits just above the
+   widest tablet and just below the desktop widths that must not change.
+
+   These rungs come AFTER the width block on purpose: where both apply, the
+   shorter/narrower viewport wins, because room is what has run out. */
+
+@media (max-height: 900px), (max-width: 1500px) {
+  .home-hero {
+    --home-copy-w: 240px;
+    --home-feat-w: 240px;
+    --home-h1: 2.9rem;
+    --home-copy-pad: 28px;
+    --home-rail-gutter: 18px;
+    padding-top: var(--s7);
+    padding-bottom: var(--s6);
+  }
+  .lib-head {
+    margin-top: var(--s6);
+  }
+}
+
+@media (max-height: 820px), (max-width: 1240px) {
+  .home-hero {
+    --home-copy-w: 208px;
+    --home-feat-w: 208px;
+    --home-h1: 2.5rem;
+    --home-copy-pad: 0px;
+    --home-rail-gutter: 14px;
+    padding-top: var(--s6);
+    padding-bottom: var(--s5);
+  }
+  .home-hero-sub {
+    margin-top: var(--s3);
+    font-size: var(--t-base);
+  }
+  .lib-head {
+    margin-top: var(--s5);
+  }
+}
+
+/* Laptops in landscape with a browser toolbar, 720p displays — and, by width, a
+   tablet in PORTRAIT (1024x1366), where there is height to spare but a 280px
+   card left room for only two of them across the rail. */
+@media (max-height: 700px), (max-width: 1060px) {
+  .home-hero {
+    --home-copy-w: 176px;
+    --home-feat-w: 176px;
+    --home-h1: 2.1rem;
+    padding-bottom: var(--s4);
+  }
+  .lib-head {
+    margin-top: var(--s4);
+  }
+}
+
+/* ---- responsive: INPUT MODALITY ----------------------------------------
+   A COARSE POINTER MEANS NO HOVER, AT ANY SCREEN SIZE. The play controls are
+   `opacity: 0; pointer-events: none` at rest and revealed by `:hover`, which is
+   correct for a mouse and leaves a touch device with an invisible, inert play
+   control. Gated on the INPUT MODALITY rather than a viewport width that only
+   correlates with one: an iPad is 1024-1366 wide and cleared every width
+   breakpoint, so there was NO one-tap launch anywhere on a tablet.
+
+   `:disabled` keeps its 0.5 opacity through this — the `:disabled` rules are
+   (0,2,0) against this block's (0,1,0), so specificity settles it and an
+   ineligible app still reads as ineligible. */
+@media (hover: none) and (pointer: coarse) {
+  .home-feat-play,
+  .lib-tile-play {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translate(-50%, -50%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .home-view[data-enter] {
+    animation: none;
+  }
+  .home-feat,
+  .home-feat-play,
+  .home-rail-btn,
+  .lib-tile,
+  .lib-tile-play {
+    transition: none;
+  }
+  .home-feat:hover,
+  .home-feat:focus-within,
+  .lib-tile:hover {
+    transform: none;
+  }
+  .home-feat-play,
+  .home-feat:hover .home-feat-play,
+  .home-feat:focus-within .home-feat-play,
+  .lib-tile-play,
+  .lib-tile:hover .lib-tile-play,
+  .lib-tile:focus-within .lib-tile-play {
+    transform: translate(-50%, -50%);
+  }
+}
+
+
+/* ============================================================
+   DETAIL BAND + LAUNCH OPTIONS (home/DetailBand, home/LaunchOptions)
+   design_handoff_v3/screens/home.html §B "Detail view" and
+   "Launch options", as the browser computes it.
+
+   The card's interior sits on ARTWORK, not on a theme surface, so
+   its ink and its controls are pinned light in both themes and its
+   buttons are glass rather than chrome. The scrim colour itself is
+   sampled per band from the art (heroPalette.ts sets --scrim-rgb).
+   ============================================================ */
+
+.detail {
+  /* Rendered as a sibling of the tiles, inside `.lib-grid`. */
+  grid-column: 1 / -1;
+  position: relative;
+  border-radius: var(--r-xl);
+  overflow: hidden;
+  border: 1px solid var(--line-2);
+  background: var(--ink-2);
+  box-shadow: var(--shadow-lg);
+  min-height: 442px;
+  display: none;
+
+  /* Ink on artwork: fixed in both themes, since the scrim behind it is. */
+  --d-ink: oklch(0.97 0.006 268);
+  --d-ink-strong: oklch(0.99 0.004 268);
+  --d-ink-2: oklch(0.86 0.012 268);
+  --d-ink-3: oklch(0.74 0.02 268);
+  --d-glass: oklch(1 0 0 / 0.1);
+  --d-glass-hover: oklch(1 0 0 / 0.17);
+  --d-glass-line: oklch(1 0 0 / 0.18);
+  --d-glass-line-hover: oklch(1 0 0 / 0.3);
+}
+.detail.show {
+  display: block;
+  animation: d-in 0.25s ease;
+}
+@keyframes d-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.detail .hero-art {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  background: var(--brand-grad);
+}
+.detail .hero-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  /* The subject of a wide hero crop is on the right; the copy sits left. */
+  object-position: center right;
+  display: block;
+}
+.detail .hero-art .glyph {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 5rem;
+  color: oklch(1 0 0 / 0.22);
+}
+/* The mock stacks TWO `.hero-art` layers over an app with artwork, so its
+   .97/.72/.15 scrim composites twice; these are the resulting alphas. Ported
+   as one layer, the copy column reads as the panel surface instead of the art
+   (D-08) — the single .97 stop let the wash through. */
+.detail .hero-art::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    rgba(var(--scrim-rgb, 17, 17, 26), 0.999) 30%,
+    rgba(var(--scrim-rgb, 17, 17, 26), 0.922) 55%,
+    rgba(var(--scrim-rgb, 17, 17, 26), 0.278)
+  );
+}
+
+.detail .d-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 3;
+}
+
+.detail .d-inner {
+  position: relative;
+  z-index: 2;
+  padding: 38px 42px;
+  max-width: 560px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-height: 420px;
+  color: var(--d-ink);
+}
+.detail .d-inner h2 {
+  font-size: 2.1rem;
+  letter-spacing: -0.02em;
+  color: var(--d-ink-strong);
+}
+.detail .d-kind {
+  font-size: var(--t-xs);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--d-ink-3);
+  font-weight: 700;
+}
+.detail .d-desc {
+  color: var(--d-ink-2);
+  line-height: 1.55;
+  max-width: 440px;
+}
+
+.d-specs {
+  display: inline-flex;
+  align-items: stretch;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-md);
+  background: oklch(0.16 0.012 285 / 0.55);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  overflow: hidden;
+  align-self: flex-start;
+}
+.d-specs .sp {
+  padding: 10px 16px;
+  border-right: 1px solid var(--line);
+}
+.d-specs .sp:last-child {
+  border-right: 0;
+}
+.d-specs .sp .l {
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--d-ink-3);
+  font-weight: 700;
+}
+.d-specs .sp .v {
+  font-family: var(--font-mono);
+  font-size: var(--t-base);
+  margin-top: 3px;
+  color: var(--d-ink);
+}
+
+.d-rec {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: var(--t-sm);
+  color: var(--d-ink-2);
+}
+.d-rec .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--success);
+  flex: none;
+}
+/* The line reports the committed selection's verdict, so the dot carries the
+   same three tones the panel's does. */
+.d-rec[data-tone="risky"] .dot {
+  background: var(--warning);
+}
+.d-rec[data-tone="off"] .dot {
+  background: var(--danger);
+}
+.d-rec .btn {
+  margin-left: 10px;
+}
+
+.d-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: auto;
+  padding-top: 14px;
+}
+.d-actions .heart {
+  width: 46px;
+  height: 46px;
+  border-radius: var(--r-md);
+}
+
+/* The band's notes sit on the scrim as well, so they take its ink. */
+.detail .note {
+  color: var(--d-ink-2);
+  background: oklch(0.16 0.012 285 / 0.55);
+  border-color: var(--d-glass-line);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+.detail .note b {
+  color: var(--d-ink);
+}
+.detail .lib-why ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.detail .lib-why p {
+  margin: 7px 0 0;
+  color: var(--d-ink-3);
+}
+.detail .lib-why .btn {
+  margin-top: 10px;
+}
+.detail .lm-cap-fatal {
+  color: var(--danger-text);
+  font-size: var(--t-sm);
+}
+
+/* Controls ON artwork are glass, not theme chrome — a surface-coloured button
+   over a poster reads as a hole in the picture. */
+.detail .d-rec .btn,
+.detail .lib-why .btn,
+.detail .d-actions .icon-btn,
+.detail .d-close {
+  background: var(--d-glass);
+  border: 1px solid var(--d-glass-line);
+  color: var(--d-ink-strong);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  box-shadow: none;
+}
+.detail .d-rec .btn:hover:not(:disabled),
+.detail .lib-why .btn:hover:not(:disabled),
+.detail .d-actions .icon-btn:hover,
+.detail .d-close:hover {
+  background: var(--d-glass-hover);
+  border-color: var(--d-glass-line-hover);
+  color: var(--d-ink-strong);
+}
+/* Play keeps the accent: it is the one action the band exists for. */
+.detail .d-actions .btn-primary {
+  background: var(--action);
+  border-color: oklch(0.72 0.15 273.21 / 0.68);
+  color: var(--home-on-accent);
+  backdrop-filter: none;
+}
+.detail .d-actions .heart svg {
+  color: var(--d-ink-strong);
+}
+.detail .d-actions .icon-btn[aria-pressed="true"] svg {
+  color: var(--danger-text);
+}
+
+/* ---- launch options overlay ------------------------------------------- */
+
+.lo {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  background: color-mix(in oklch, var(--surf-panel) 93%, transparent);
+  backdrop-filter: blur(26px) saturate(1.15);
+  -webkit-backdrop-filter: blur(26px) saturate(1.15);
+  opacity: 0;
+  /* `visibility`, not `display`: it keeps the panel out of the tab order while
+     closed AND leaves something for `.show` to transition from. */
+  visibility: hidden;
+  transition: opacity 0.2s ease, visibility 0s 0.2s;
+}
+.lo.show {
+  opacity: 1;
+  visibility: visible;
+  transition-delay: 0s;
+}
+
+.qp-head {
+  display: flex;
+  align-items: flex-end;
+  gap: 26px;
+  padding: 20px 26px 15px;
+  border-bottom: 1px solid var(--line-2);
+  flex: none;
+}
+.qp-eyebrow {
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  font-weight: 700;
+}
+.qp-game {
+  font-size: var(--t-h3);
+  font-weight: 700;
+  line-height: 1.15;
+  margin-top: 4px;
+}
+.qp-spec {
+  display: flex;
+  gap: 24px;
+  margin-left: auto;
+  padding-right: 44px;
+}
+.qp-spec .sp .l {
+  display: block;
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  font-weight: 700;
+}
+.qp-spec .sp .v {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: var(--t-sm);
+  margin-top: 3px;
+}
+/* The panel's own close sits where the band's does, over the panel. */
+.lo .d-close {
+  background: var(--glass-control);
+  border: 1px solid var(--glass-border);
+  color: var(--text);
+  backdrop-filter: none;
+}
+
+.qp-cols {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr 1.6fr;
+}
+.qp-col {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 14px 18px;
+  min-height: 0;
+  overflow: auto;
+}
+.qp-col + .qp-col {
+  border-left: 1px solid var(--line-2);
+}
+.qp-section {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  flex: none;
+}
+
+.qp-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  text-align: left;
+  padding: 7px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-ui);
+  cursor: pointer;
+  flex: none;
+  transition: border-color 0.15s, background-color 0.15s, opacity 0.15s;
+}
+.qp-row:hover:not(:disabled) {
+  border-color: color-mix(in oklch, var(--accent) 60%, transparent);
+}
+.qp-row[aria-checked="true"] {
+  border-color: var(--accent);
+  background: color-mix(in oklch, var(--accent) 14%, transparent);
+}
+.qp-row:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+}
+.qp-row .qr-label {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 14px;
+}
+.qp-row .qr-sub {
+  display: block;
+  font-size: 11.5px;
+  color: var(--text-3);
+  margin-top: 3px;
+}
+.qp-row .qr-why {
+  display: block;
+  font-size: 11.5px;
+  color: var(--warning-text);
+  margin-top: 3px;
+}
+.qp-row .qr-side {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+.qp-tag {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  border-radius: var(--r-xs);
+  padding: 3px 8px;
+  white-space: nowrap;
+}
+.qp-tag.risky {
+  color: var(--warning-text);
+  background: var(--warning-bg);
+}
+.qp-check {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1.5px solid var(--line-3);
+  font-size: 11px;
+  color: transparent;
+  flex: none;
+}
+.qp-row[aria-checked="true"] .qp-check {
+  background: var(--accent);
+  border-color: transparent;
+  color: var(--home-on-accent);
+}
+
+.seg-hint {
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--text-3);
+  margin-top: 2px;
+}
+.seg-hint + .seg-hint {
+  margin-top: 4px;
+  opacity: 0.72;
+}
+
+.qp-foot {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 14px 26px;
+  border-top: 1px solid var(--line-2);
+}
+.qp-verdict {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--text-2);
+  max-width: 62ch;
+}
+.qp-verdict .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--success);
+  flex: none;
+  margin-top: 5px;
+}
+.qp-verdict.risky {
+  color: var(--warning-text);
+}
+.qp-verdict.risky .dot {
+  background: var(--warning-text);
+}
+.qp-verdict.off {
+  color: var(--danger-text);
+}
+.qp-verdict.off .dot {
+  background: var(--danger-text);
+}
+.qp-acts {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+}
+
+/* ---- detail band: narrow viewports -------------------------------------
+   The three columns cannot hold their rows side by side, and the band's copy
+   column stops being a column. Auto height, since nothing is overlaid on
+   artwork any more. */
+@media (max-width: 900px) {
+  .detail {
+    min-height: 0;
+  }
+  .detail .d-inner {
+    max-width: none;
+    min-height: 0;
+    padding: 26px 20px;
+  }
+  .detail .hero-art::after {
+    background: linear-gradient(
+      180deg,
+      rgba(var(--scrim-rgb, 17, 17, 26), 0.922) 20%,
+      rgba(var(--scrim-rgb, 17, 17, 26), 0.999)
+    );
+  }
+  .d-specs {
+    align-self: stretch;
+    flex-wrap: wrap;
+  }
+  .qp-cols {
+    grid-template-columns: 1fr;
+  }
+  .qp-col + .qp-col {
+    border-left: 0;
+    border-top: 1px solid var(--line-2);
+  }
+  .qp-head {
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .qp-spec {
+    margin-left: 0;
+    padding-right: 0;
+    flex-wrap: wrap;
+    gap: 14px;
+  }
+  .qp-foot {
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .detail.show {
+    animation: none;
+  }
+  .lo,
+  .qp-row {
+    transition: none;
+  }
+}

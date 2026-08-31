@@ -1,0 +1,191 @@
+---
+title: Ports and endpoints
+description: What listens where, what needs to be reachable from where, and the endpoints worth knowing.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Ports
+
+| Port | Protocol | Who connects | Purpose |
+| --- | --- | --- | --- |
+| 8443 | TCP, HTTPS | Browsers | The web app and the API. This is the one people visit. |
+| 8080 | TCP, HTTP | Node agents, healthchecks | Agent enrollment, `/health`. Browser routes redirect to HTTPS. |
+| 9091 | TCP, HTTP | Localhost only | The node agent's own health endpoint. |
+| ephemeral | UDP | Browsers, direct to the GPU host | WebRTC media and input. Not proxied. |
+
+Set the published HTTP and HTTPS ports with `CONTROL_PORT` and
+`QUASAR_TLS_PORT`.
+
+The hardened Compose overlay changes this: Caddy takes 443 and the control plane
+stops publishing ports at all, reachable only on the Docker bridge.
+
+## What has to reach what
+
+**Browser to control plane**, on 8443. Proxies fine.
+
+**Browser to GPU host**, on the ephemeral UDP range, directly. Does not proxy.
+This is the constraint that makes remote access hard. See
+[Reaching Quasar remotely](/quasar/network/remote-access/).
+
+**Node agent to control plane**, on 8080. Same machine or the same trusted
+network is fine.
+
+## Firewall
+
+The answer splits by container, and getting it wrong is the most common cause of
+a session that launches but never shows video.
+
+**The control plane needs no rules.** Its ports are published through Docker,
+which DNATs them past the host firewall. That cuts both ways: opening those
+ports is unnecessary and closing them will not block anything.
+
+**The node agent does.** It runs with `network_mode: host`, which WebRTC ICE
+requires, so its UDP media is ordinary host traffic filtered by the host
+firewall's INPUT policy like any other process. A server distro that ships a
+default-deny firewall drops it silently, and nothing else complains: the UI, the
+API and session launch all keep working, because none of them travel that path.
+
+### What has to be open
+
+Two things, both inbound to the GPU host from client devices on your LAN or VPN.
+
+| What | Why |
+| --- | --- |
+| UDP, the ephemeral port range (Linux default `32768-60999`) | ICE and RTP both ride on it. Read your host's actual range with `cat /proc/sys/net/ipv4/ip_local_port_range`. |
+| UDP/5353, mDNS | Chrome sends `.local` hostnames as ICE candidates rather than IP addresses. Without mDNS there is no fallback. |
+
+<Aside type="danger" title="Scope the rule to your subnet">
+Use the client LAN or VPN subnet, never `0.0.0.0/0`. Clients and GPU hosts need
+reachability to each other, not the host's entire ephemeral range exposed to the
+internet. A scoped rule preserves the rest of the host firewall policy.
+</Aside>
+
+### How Quasar tells you
+
+The node agent's `media_reachability` readiness check probes the host firewall at
+startup and on reconnect. When it finds a filtering posture it logs a warning
+naming the exact scoped rule for the firewall tool it detected, and that warning
+surfaces in **Admin, Fleet, Hosts**.
+
+Detection degrades to no finding, not a failure, when no firewall client tool is
+reachable from inside the agent container. This is common on a stock image. Its
+silence is not proof the host is open.
+
+### Adding the rule
+
+Substitute `<lan-subnet>` (for example `192.168.1.0/24`) and `<port-range>` with
+your host's actual ephemeral range if it differs from `32768-60999`.
+
+**firewalld**, the Fedora, RHEL and CentOS default:
+
+```bash
+sudo firewall-cmd --get-default-zone   # confirm <zone>
+sudo firewall-cmd --permanent --zone=<zone> \
+  --add-rich-rule='rule family=ipv4 source address=<lan-subnet> port port=<port-range> protocol=udp accept'
+sudo firewall-cmd --permanent --zone=<zone> --add-service=mdns
+sudo firewall-cmd --reload
+```
+
+On Fedora Server the default `FedoraServer` zone allows only ssh, cockpit and
+dhcpv6, so this is very likely the cause if you have not touched the firewall
+since install.
+
+**ufw**, the Debian and Ubuntu default when installed:
+
+```bash
+sudo ufw allow proto udp from <lan-subnet> to any port <port-range>
+sudo ufw allow from <lan-subnet> to any port 5353 proto udp
+sudo ufw reload
+```
+
+**iptables**:
+
+```bash
+sudo iptables -I INPUT -p udp -s <lan-subnet> --dport <port-range> -j ACCEPT
+sudo iptables -I INPUT -p udp -s <lan-subnet> --dport 5353 -j ACCEPT
+```
+
+Insert both ahead of your existing default-deny rule, then persist them however
+your distro expects.
+
+**nftables**, with no firewalld or ufw layer on top: add INPUT accept rules for
+UDP `<port-range>` and `5353/udp`, scoped to `<lan-subnet>`, ahead of the
+default-deny or reject rule in your base input chain.
+
+## Endpoints worth knowing
+
+### Health
+
+```bash
+curl http://localhost:8080/health
+```
+
+```json
+{"status":"ok","db":"ok"}
+```
+
+Deliberately exempt from the HTTPS redirect.
+
+```bash
+curl http://127.0.0.1:9091/health
+```
+
+```json
+{"status":"ok","sessions":0,"connected":true}
+```
+
+The node agent, on the host it runs on. `connected` is whether its link to the
+control plane is up.
+
+### The web app
+
+| Path | What |
+| --- | --- |
+| `/app` | The library and everything a player uses. |
+| `/app/account` | Profile, quality default, devices, sessions, storage. |
+| `/app/session/:id` | A live session. |
+| `/admin` | The admin area. Requires the admin role, enforced on the server. |
+| `/setup` | The first-run wizard. Only reachable before the instance is claimed. |
+| `/login`, `/register` | Authentication. |
+
+### API
+
+Everything under `/v1`. Bearer token authentication. Admin endpoints reject
+non-admin tokens regardless of which client is asking.
+
+A few that come up:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /v1/hosts` | Registered hosts and their status. |
+| `GET /v1/hosts/{id}/gpus` | GPU inventory and memory for a host. |
+| `GET /v1/admin/sessions/{id}/diagnostic-bundle` | The diagnostic bundle. |
+| `GET /v1/admin/sessions/{id}/metrics` | Raw metrics for a session. |
+| `POST /v1/sessions` | Launch a session. |
+
+Every endpoint is listed in the [Control-plane API](/quasar/developer/api/)
+reference, generated from the OpenAPI contract in the repository.
+
+### WebSockets
+
+| Path | Who | Purpose |
+| --- | --- | --- |
+| `/v1/signal` | Browsers | WebRTC signaling. Gated by `QUASAR_ALLOWED_ORIGINS`. |
+| `/agent/ws` | Node agents | Registration, capacity, session commands, heartbeat. |
+
+<Aside type="caution" title="Both need upgrade forwarding and a long read timeout">
+A proxy that does not forward WebSocket upgrades breaks signaling entirely. A
+proxy that closes idle connections after a minute cuts sessions and drops agents.
+</Aside>
+
+## Volumes
+
+| Volume | Contents |
+| --- | --- |
+| `quasar-postgres-data` | The database. |
+| `quasar-control-tls` | TLS certificate and artwork cache. |
+| `quasar-agent-data` | The agent's per-node enrollment secret. |
+| The managed home root | A host bind mount, not a Compose volume. User saves and installed content. |
+
+`docker compose down -v` destroys the first three and never touches the fourth.

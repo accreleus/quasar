@@ -1,0 +1,144 @@
+/* Audit log (Task 28, handoff-v3-spec §A.20). Loaded only by Audit.tsx —
+   AdminLayout (the always-mounted parent route) already loaded admin.css, so
+   this file's rules land after it regardless of chunk load order; the few
+   selectors that must win over a `.chip` variant still double up the class
+   (`.chip.aud-action`) rather than depend on that ordering. */
+
+/* The mock pins true black for the expanded console readout in both
+   appearances — the one sanctioned hex on this page, behind a token so no
+   other rule needs its own literal. */
+:root,
+[data-theme="dark"],
+[data-theme="light"] {
+  --audit-readout-bg: #000;
+}
+
+/* ---------- table shape ---------- */
+/* Fixed layout so the unset (Detail) column actually gets the remaining
+   width — required for its ellipsis truncation to take effect at all. */
+.qtable.audit {
+  table-layout: fixed;
+}
+.qtable.audit th:nth-child(1),
+.qtable.audit td:nth-child(1) { width: 36px; text-align: center; }
+.qtable.audit th:nth-child(2),
+.qtable.audit td:nth-child(2) { width: 88px; }
+.qtable.audit th:nth-child(3),
+.qtable.audit td:nth-child(3) { width: 150px; }
+.qtable.audit th:nth-child(4),
+.qtable.audit td:nth-child(4) { width: 190px; }
+.qtable.audit th:nth-child(5),
+.qtable.audit td:nth-child(5) { width: 200px; }
+.qtable.audit th:nth-child(7),
+.qtable.audit td:nth-child(7) { width: 1%; }
+
+/* ---------- caret ---------- */
+/* A real <button> now (a11y fix) — reset its native chrome back to the
+   plain icon look the span had. */
+.aud-caret {
+  display: inline-grid;
+  place-content: center;
+  width: 18px;
+  height: 18px;
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--text-4);
+  cursor: pointer;
+  transition: transform .16s;
+}
+.aud-caret svg { width: 12px; height: 12px; }
+.aud-caret.open { transform: rotate(90deg); color: var(--accent-text); }
+
+/* ---------- actor avatar ---------- */
+/* .u-ava is the 26px default (shell.css); the audit row wants a 20px one,
+   with the system actor reading as a neutral "S" tile rather than the
+   brand-gradient one a real user gets. */
+.aud-ava {
+  width: 20px;
+  height: 20px;
+  font-size: 9px;
+}
+.aud-ava-system {
+  background: var(--ink-5);
+  color: var(--text-3);
+}
+
+/* ---------- action chip ---------- */
+/* .chip defaults to an uppercase, letter-spaced pill; the action string is a
+   literal dotted identifier (`host.drain`), so it renders as-typed instead. */
+.chip.aud-action {
+  font-family: var(--font-mono);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+/* ---------- detail column ---------- */
+.aud-summary {
+  color: var(--text-3);
+  font-size: var(--t-xs);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------- expanded row: true-black console readout ---------- */
+/* The whole row goes black, including the 36px caret-column gutter (not just
+   the colspan cell) — matching the mock's `tbody tr.aud-detail>td{background:
+   #000}` — so `.aud-det`'s zero left padding reads as one continuous black
+   bar starting under the caret, with no seam of the row's normal surface
+   colour showing through on the left. */
+.qtable.audit tbody tr.aud-detail:hover {
+  background: none;
+}
+.qtable.audit tbody tr.aud-detail > td {
+  background: var(--audit-readout-bg);
+  border-bottom: 0;
+  height: auto;
+}
+.qtable.audit .aud-cell {
+  padding: 0;
+}
+.qtable.audit tbody tr.aud-detail > td.aud-cell {
+  box-shadow:
+    inset 0 1px 0 oklch(0.9618 0.0086 247.91/.1),
+    inset 0 -1px 0 oklch(0.9618 0.0086 247.91/.1),
+    inset 0 14px 26px -20px oklch(0 0 0/.95);
+}
+
+.aud-det {
+  padding: var(--s5) var(--s6) var(--s6) 0;
+}
+.aud-det-head {
+  margin-bottom: var(--s4);
+}
+.aud-det-head .eyebrow {
+  color: var(--text-3);
+}
+.aud-pre {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--t-sm);
+  line-height: 1.8;
+  color: oklch(0.985 0.004 247);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* The readout is a console in both appearances: its controls stay
+   light-on-black regardless of theme. */
+.aud-det .btn-ghost {
+  color: oklch(0.9 0.008 250);
+  border-color: transparent;
+}
+.aud-det .btn-ghost:hover {
+  background: oklch(1 0 0/.1);
+  color: oklch(1 0 0);
+  border-color: oklch(1 0 0/.18);
+}
+
+.audit-more {
+  display: flex;
+  justify-content: center;
+  margin-top: var(--s5);
+}

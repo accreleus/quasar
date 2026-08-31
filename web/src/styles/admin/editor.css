@@ -1,0 +1,209 @@
+/* App editor (handoff §A.10, design_handoff_v3/screens/assets/console-v3.css
+   `.ae-*`). The tab bar, the sections and the fields are shared primitives;
+   what is local to this page is the panel padding, the artwork frames, the
+   candidate grid, the fact rows and the rail.
+
+   Imported by AppEditorPage.tsx, not main.tsx, so it ships in that lazy chunk
+   (#386, the reason admin.css loads from AdminLayout). */
+
+/* The tab bar sits flush with the card's top edge, so the card supplies side
+   and bottom padding only. */
+.ae-panel {
+  padding: 0 var(--card-pad) var(--s5);
+}
+
+.ae-panel .fsec:first-of-type {
+  padding-top: var(--s5);
+}
+
+.ae-panel .fs-fields .kv-row {
+  width: 100%;
+}
+
+/* Links inside the editor panel read as links. Tabs are anchors too, so
+   they are excluded: an inactive tab keeps the tab bar's own colour. The
+   rail's links get the same treatment from primitives.css. */
+.ae-panel a:not(.tab) {
+  color: var(--accent-text);
+  text-decoration: none;
+}
+
+.ae-panel a:not(.tab):hover {
+  text-decoration: underline;
+}
+
+/* The gradient stands in for missing art, in both crops and in the rail. It is
+   a design, not a broken image, so it carries the app's monogram. */
+.ae-frame {
+  position: relative;
+  overflow: hidden;
+  background: linear-gradient(150deg, oklch(0.5443 0.2453 284.39), oklch(0.3727 0.1878 282.05));
+  display: grid;
+  place-content: center;
+  font-family: var(--font-display);
+  font-weight: 600;
+  color: oklch(1 0 0 / 0.82);
+  letter-spacing: 0.03em;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line-2);
+}
+
+.ae-frame.tile {
+  aspect-ratio: 2 / 3;
+  font-size: 26px;
+}
+
+.ae-frame.hero {
+  aspect-ratio: 32 / 13;
+  font-size: 30px;
+}
+
+/* Full-bleed at the top of the rail card. */
+.ae-frame.flush {
+  border: 0;
+  border-radius: 0;
+}
+
+.ae-crops {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  gap: var(--s5);
+  align-items: start;
+  max-width: 560px;
+}
+
+.ae-crop {
+  margin: 0;
+  min-width: 0;
+}
+
+.ae-crop figcaption {
+  margin-top: 7px;
+  font-size: var(--t-xs);
+  color: var(--text-3);
+}
+
+.ae-cands {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(82px, 1fr));
+  gap: 9px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-width: 560px;
+}
+
+.ae-cand {
+  width: 100%;
+  border: 1px solid var(--line-2);
+  background: var(--ink-3);
+  border-radius: var(--r-sm);
+  padding: 6px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  text-align: left;
+}
+
+.ae-cand:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.ae-cand i {
+  position: relative;
+  overflow: hidden;
+  display: grid;
+  place-content: center;
+  aspect-ratio: 2 / 3;
+  border-radius: var(--r-xs);
+  background: linear-gradient(160deg, oklch(0.4600 0.1600 285), oklch(0.5443 0.2453 284.39));
+  font-style: normal;
+  font-family: var(--font-display);
+  font-size: 15px;
+  color: oklch(1 0 0 / 0.85);
+}
+
+.ae-cand i img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.ae-cand b {
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--text-2);
+}
+
+.ae-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.ae-item {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: 9px 0;
+  border-top: 1px solid var(--line);
+}
+
+.ae-item:first-child {
+  border-top: 0;
+}
+
+.ae-item .btn {
+  margin-left: auto;
+  flex: none;
+}
+
+.ae-item-t {
+  font-size: var(--t-sm);
+  font-weight: 600;
+}
+
+.ae-item-m {
+  font-size: var(--t-xs);
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+/* Inside a section body the fact block is a field-width column, not the rail's
+   full width. */
+.fs-fields .ae-facts,
+.fs-fields .ae-crops {
+  max-width: 560px;
+}
+
+/* One numbered rung of the selected launch profile. */
+.ae-rung {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s3);
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: var(--t-sm);
+}
+
+.ae-rung .num {
+  color: var(--text-4);
+  font-size: var(--t-xs);
+}
+
+/* A segmented control is a pill group, not a field: in the section's field
+   column it must size to its labels rather than stretch. */
+.ae-panel .fs-fields > .segmented {
+  align-self: flex-start;
+}
+
+/* The launch-option allow-list is one list, so the rows sit against each other
+   rather than taking the field column's gap. Row height stays the `.check`
+   primitive's touch target. */
+.ae-checks {
+  display: flex;
+  flex-direction: column;
+}

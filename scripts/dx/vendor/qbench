@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""qbench — publish completion reports and evidence to quasar-bench.
+
+Stdlib only; it imports `bench.py` from the same directory, so the pair can be
+vendored together into any repo that wants to publish.
+
+    export BENCH_URL=http://bench.example.internal:9400 BENCH_KEY=…
+
+The publish flow, end to end, at land time:
+
+    # 1. publish the write-up against the merge commit (idempotent — re-running
+    #    replaces it in place and keeps the same URL)
+    URL=$(qbench report put \\
+            --repo accreleus/quasar \\
+            --commit "$(git rev-parse HEAD)" \\
+            --title "C11: reports and evidence" \\
+            --body docs/reports/c11.md \\
+            --summary "Reports live in quasar-bench; evidence has a home." \\
+            --issue 512 --run "$BEFORE_RUN" --run "$AFTER_RUN")
+
+    # 2. attach the evidence already gathered
+    qbench report attach --repo accreleus/quasar --commit "$(git rev-parse HEAD)" \\
+            --file after.png --role screenshot --caption "ladder at 720p"
+
+    # 3. paste $URL into the commit body, the issue, and memory
+    echo "$URL"
+
+Two linked runs make the report page draw a direction-aware before/after table
+from the same aggregates the compare page uses. `--pin` keeps the attachments
+out of the retention job's reach for good.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from bench import Bench, BenchError  # noqa: E402
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="qbench", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--url", default=None, help="base URL (default $BENCH_URL)")
+    p.add_argument("--key", default=None, help="API key (default $BENCH_KEY)")
+    top = p.add_subparsers(dest="group", required=True)
+
+    reports = top.add_parser("report", help="publish and read completion reports")
+    sub = reports.add_subparsers(dest="cmd", required=True)
+
+    def key_args(sp, commit_help="full sha to publish, unique prefix to read"):
+        sp.add_argument("--repo", required=True, metavar="OWNER/NAME")
+        sp.add_argument("--commit", required=True, help=commit_help)
+
+    put = sub.add_parser("put", help="create or replace a report; prints its URL")
+    key_args(put, "full merge sha (short shas are for reading)")
+    put.add_argument("--title", required=True)
+    put.add_argument("--branch", default="")
+    put.add_argument("--summary", default="", help="one plain-text paragraph for lists")
+    put.add_argument("--body", default=None, metavar="FILE",
+                     help="narrative file; .html/.md/.txt sets the mime")
+    put.add_argument("--body-mime", default=None, choices=["text/html", "text/markdown", "text/plain"])
+    put.add_argument("--issue", action="append", type=int, default=[], metavar="N")
+    put.add_argument("--pr", action="append", type=int, default=[], metavar="N")
+    put.add_argument("--run", action="append", default=[], metavar="RUN_ID",
+                     help="link a bench run; exactly two gives a before/after table")
+    put.add_argument("--tag", action="append", default=[], metavar="K=V")
+    put.add_argument("--pin", action="store_true", help="exempt attachments from pruning")
+    put.add_argument("--json", action="store_true", help="print the report JSON instead of the URL")
+
+    get = sub.add_parser("get", help="one report with artifacts, linked runs and deltas")
+    key_args(get)
+    get.add_argument("--agg", default="", help="statistic for the delta table (default p50)")
+
+    ls = sub.add_parser("list", help="list reports, newest first")
+    ls.add_argument("--repo", default="")
+    ls.add_argument("--branch", default="")
+    ls.add_argument("--issue", default="")
+    ls.add_argument("--tag", default="", metavar="K=V")
+    ls.add_argument("--since", default="", metavar="30d")
+    ls.add_argument("--limit", default="50")
+
+    at = sub.add_parser("attach", help="attach evidence to a report")
+    key_args(at)
+    at.add_argument("--file", required=True)
+    at.add_argument("--role", default="",
+                    choices=["", "screenshot", "video", "log", "bundle", "other"],
+                    help="drives prune order; inferred from the file when omitted")
+    at.add_argument("--caption", default="")
+    at.add_argument("--name", default=None, help="stored name (default the filename)")
+
+    pin = sub.add_parser("pin", help="pin a report so its attachments are never pruned")
+    key_args(pin)
+    pin.add_argument("--off", action="store_true", help="unpin instead")
+
+    url = sub.add_parser("url", help="print the stable page URL (no request made)")
+    key_args(url)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    # `url` is pure string work, so it must not need a key.
+    if args.cmd == "url":
+        base = (args.url or os.environ.get("BENCH_URL") or "http://localhost:9400").rstrip("/")
+        from bench import _report_page
+        print(base + _report_page(args.repo, args.commit))
+        return 0
+
+    b = Bench(args.url, args.key)
+
+    if args.cmd == "put":
+        tags = dict(t.split("=", 1) for t in args.tag) if args.tag else None
+        rep = b.report_put(
+            args.repo, args.commit, args.title, branch=args.branch, summary=args.summary,
+            body_path=args.body, body_mime=args.body_mime,
+            issues=args.issue or None, prs=args.pr or None, runs=args.run or None,
+            tags=tags, pinned=True if args.pin else None)
+        print(json.dumps(rep, indent=2) if args.json else b.report_url(args.repo, rep["commit"]))
+    elif args.cmd == "get":
+        print(json.dumps(b.report_get(args.repo, args.commit, args.agg), indent=2))
+    elif args.cmd == "list":
+        print(json.dumps(b.report_list(repo=args.repo, branch=args.branch, issue=args.issue,
+                                       tag=args.tag, since=args.since, limit=args.limit), indent=2))
+    elif args.cmd == "attach":
+        print(json.dumps(b.report_attach(args.repo, args.commit, args.file,
+                                         role=args.role, caption=args.caption,
+                                         name=args.name), indent=2))
+    elif args.cmd == "pin":
+        rep = b.report_pin(args.repo, args.commit, not args.off)
+        print(json.dumps({"pinned": rep["pinned"], "url": b.report_url(args.repo, rep["commit"])}))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BenchError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)

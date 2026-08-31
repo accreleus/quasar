@@ -1,0 +1,288 @@
+/* ============================================================
+   QUASAR docs site theme.
+
+   Every value here is lifted from web/src/styles/tokens.css, which is
+   itself generated from design_handoff_v3/screens/assets/console-v3.css.
+   Do not invent colours, radii or shadows. If a value is missing, add it
+   to the product tokens first and mirror it here.
+
+   Re-mirrored against v3 on 2026-08-31. Three things changed shape rather
+   than value: the type moved to IBM Plex, the radii tightened to 4/8/12,
+   and the violet-to-cyan gradient was retired. v3 reserves violet for
+   action and selection and says plainly that no surviving rule should
+   paint violet-to-cyan, so the brand gradient here is single-hue too.
+
+   Two deliberate deviations from the product tokens, both noted inline:
+   long-form body text is 16px rather than the app's dense 15px, and the
+   screenshot placeholder uses a dot grid that has no app equivalent.
+   ============================================================ */
+
+/* Self-hosted fonts, same @fontsource packages the product uses. No CDN. */
+@import '@fontsource/ibm-plex-sans/400.css';
+@import '@fontsource/ibm-plex-sans/500.css';
+@import '@fontsource/ibm-plex-sans/600.css';
+@import '@fontsource/ibm-plex-sans/700.css';
+@import '@fontsource/ibm-plex-mono/400.css';
+@import '@fontsource/ibm-plex-mono/500.css';
+@import '@fontsource/michroma/400.css';
+
+/* ---------- Product tokens, available to the landing page ---------- */
+:root {
+	/* Surfaces: the v3 named ramp, one hue family, ~0.045 lightness a step. */
+	--q-ink-0: oklch(0.105 0.01 267); /* --core       */
+	--q-ink-1: oklch(0.115 0.012 267); /* --surf-canvas */
+	--q-ink-2: oklch(0.163 0.018 268); /* --surf-chrome */
+	--q-ink-3: oklch(0.208 0.02 268); /* --surf-panel  */
+	--q-ink-4: oklch(0.252 0.022 267); /* --surf-raised */
+	--q-ink-5: oklch(0.292 0.022 265); /* --surf-control */
+	--q-inset: oklch(0.088 0.012 267); /* --surf-inset, inputs and wells */
+
+	--q-line: oklch(0.9618 0.0086 247.91 / 0.09);
+	--q-line-2: oklch(0.9618 0.0086 247.91 / 0.12);
+	--q-line-3: oklch(0.6605 0.0265 259.81 / 0.46);
+
+	--q-text: oklch(0.9618 0.0086 247.91);
+	--q-text-2: oklch(0.76 0.022 258);
+	--q-text-3: oklch(0.6605 0.0265 259.81);
+	--q-text-4: oklch(0.56 0.024 259);
+
+	/* Accent: single-hue violet. v3 collapsed --violet and --cyan onto it. */
+	--q-violet: oklch(0.5998 0.2179 273.21);
+	--q-action: oklch(0.5 0.19 273.21);
+	--q-accent-hover: oklch(0.54 0.19 273.21);
+	--q-accent-text: oklch(0.78 0.13 273.21);
+	--q-accent-soft: oklch(0.5998 0.2179 273.21 / 0.16);
+	--q-brand-grad: linear-gradient(118deg, var(--q-violet), var(--q-action));
+	/* The one second hue v3 kept, for charts and capacity. */
+	--q-teal: oklch(0.78 0.11 196);
+
+	--q-success-text: oklch(0.82 0.13 164);
+	--q-warning-text: oklch(0.87 0.12 85);
+	--q-danger-text: oklch(0.82 0.12 27);
+
+	--q-font-brand: 'Michroma', ui-sans-serif, sans-serif;
+	--q-font-display: 'IBM Plex Sans', Inter, ui-sans-serif, system-ui, sans-serif;
+	--q-font-ui: var(--q-font-display);
+	--q-font-mono: 'IBM Plex Mono', 'SFMono-Regular', Consolas, monospace;
+
+	/* v3 radii: 4 for controls, 8 for panels, 12 for features. */
+	--q-r-sm: 4px;
+	--q-r-md: 8px;
+	--q-r-lg: 12px;
+	--q-r-xl: 16px;
+
+	--q-shadow-md: 0 6px 20px -6px rgba(0, 0, 0, 0.55);
+	--q-shadow-lg: 0 20px 56px -16px rgba(0, 0, 0, 0.68);
+	--q-inset-top: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+
+	/* Starlight globals */
+	--sl-font: var(--q-font-ui);
+	--sl-font-mono: var(--q-font-mono);
+
+	--sl-text-h1: 1.9rem;
+	--sl-text-h2: 1.45rem;
+	--sl-text-h3: 1.15rem;
+	--sl-text-h4: 1.0625rem;
+
+	--sl-content-width: 50rem;
+	--sl-nav-height: 3.75rem;
+}
+
+/* ---------- Dark (default) ---------- */
+:root[data-theme='dark'] {
+	--sl-color-accent-low: oklch(0.5998 0.2179 273.21 / 0.26);
+	--sl-color-accent: var(--q-violet);
+	--sl-color-accent-high: var(--q-accent-text);
+
+	--sl-color-white: var(--q-text);
+	--sl-color-gray-1: oklch(0.88 0.014 253);
+	--sl-color-gray-2: var(--q-text-2);
+	--sl-color-gray-3: var(--q-text-3);
+	--sl-color-gray-4: var(--q-text-4);
+	--sl-color-gray-5: var(--q-ink-5);
+	--sl-color-gray-6: var(--q-ink-3);
+	--sl-color-gray-7: var(--q-ink-2);
+	--sl-color-black: var(--q-ink-1);
+
+	--sl-color-bg: var(--q-ink-1);
+	--sl-color-bg-nav: oklch(0.163 0.018 268 / 0.72);
+	--sl-color-bg-sidebar: var(--q-ink-0);
+	--sl-color-bg-inline-code: var(--q-ink-4);
+	--sl-color-hairline: var(--q-line-2);
+	--sl-color-hairline-light: var(--q-line);
+	--sl-color-hairline-shade: var(--q-line);
+
+	--sl-color-text: var(--q-text-2);
+	--sl-color-text-accent: var(--q-accent-text);
+	--sl-color-text-invert: var(--q-ink-1);
+}
+
+/* ---------- Light ----------
+   Values come straight from the product's [data-theme="light"] block.
+   The landing page's ambient wash and sweep arc are dark-only; light mode
+   gets a flat surface rather than an invented light-mode gradient. */
+:root[data-theme='light'] {
+	/* Mirrors the v3 [data-theme="light"] block in web/src/styles/tokens.css. */
+	--q-ink-0: oklch(0.9 0.008 268);
+	--q-ink-1: oklch(0.958 0.006 268); /* --surf-canvas */
+	--q-ink-2: oklch(0.928 0.011 268); /* --surf-chrome */
+	--q-ink-3: oklch(0.998 0.002 268); /* --surf-panel  */
+	--q-ink-4: oklch(0.972 0.006 268); /* --surf-raised */
+	--q-ink-5: oklch(0.988 0.004 268); /* --surf-control */
+	--q-inset: oklch(0.935 0.007 268);
+
+	--q-text: oklch(0.24 0.022 268);
+	--q-text-2: oklch(0.42 0.018 268);
+	--q-text-3: oklch(0.53 0.016 268);
+	--q-text-4: oklch(0.64 0.014 268);
+
+	--q-line: oklch(0.24 0.022 268 / 0.09);
+	--q-line-2: oklch(0.24 0.022 268 / 0.14);
+	--q-line-3: oklch(0.24 0.022 268 / 0.24);
+
+	--q-accent-text: oklch(0.5 0.19 273.21);
+	--q-accent-soft: oklch(0.5998 0.2179 273.21 / 0.12);
+	--q-success-text: oklch(0.5 0.13 164);
+	--q-warning-text: oklch(0.52 0.12 78);
+	--q-danger-text: oklch(0.52 0.2 27);
+	--q-teal: oklch(0.62 0.11 196);
+
+	--q-shadow-md: 0 1px 2px oklch(0.24 0.022 268 / 0.06),
+		0 14px 34px -26px oklch(0.24 0.022 268 / 0.3);
+	--q-shadow-lg: 0 22px 58px -30px oklch(0.24 0.022 268 / 0.34);
+	--q-inset-top: inset 0 1px 0 oklch(1 0 0 / 0.75);
+
+	/* Starlight globals, pointed at the same ramp. */
+	--sl-color-accent-low: oklch(0.5998 0.2179 273.21 / 0.2);
+	--sl-color-accent: var(--q-violet);
+	--sl-color-accent-high: oklch(0.36 0.15 273.21);
+
+	--sl-color-white: var(--q-text);
+	--sl-color-gray-1: oklch(0.32 0.02 268);
+	--sl-color-gray-2: var(--q-text-2);
+	--sl-color-gray-3: var(--q-text-3);
+	--sl-color-gray-4: var(--q-text-4);
+	--sl-color-gray-5: oklch(0.87 0.009 268);
+	--sl-color-gray-6: var(--q-ink-4);
+	--sl-color-gray-7: var(--q-ink-1);
+	--sl-color-black: var(--q-ink-3);
+
+	--sl-color-bg: var(--q-ink-1);
+	--sl-color-bg-nav: oklch(0.998 0.002 268 / 0.82);
+	--sl-color-bg-sidebar: var(--q-ink-2);
+	--sl-color-bg-inline-code: var(--q-inset);
+	--sl-color-hairline: var(--q-line-2);
+	--sl-color-hairline-light: var(--q-line);
+	--sl-color-hairline-shade: var(--q-line);
+
+	--sl-color-text: var(--q-text-2);
+	--sl-color-text-accent: var(--q-accent-text);
+	--sl-color-text-invert: var(--q-ink-3);
+}
+
+/* ---------- Display face for headings ---------- */
+.sl-markdown-content :is(h1, h2, h3, h4) {
+	font-family: var(--q-font-display);
+	letter-spacing: -0.02em;
+}
+
+.sl-markdown-content :is(h1, h2) {
+	font-weight: 700;
+}
+
+.sl-markdown-content :is(h3, h4) {
+	font-weight: 600;
+}
+
+/* Long-form prose reads better at 16px than the app's dense 15px token. */
+.sl-markdown-content {
+	font-size: 1rem;
+	line-height: 1.65;
+}
+
+/* ---------- Chrome ---------- */
+header.header {
+	backdrop-filter: blur(10px);
+	border-bottom: 1px solid var(--sl-color-hairline-light);
+}
+
+.sidebar-pane {
+	border-inline-end: 1px solid var(--sl-color-hairline-light);
+}
+
+/* ---------- Tables ---------- */
+.sl-markdown-content table {
+	font-size: 0.9375rem;
+}
+
+.sl-markdown-content :is(th, td) {
+	border-color: var(--sl-color-hairline-light);
+	/* Starlight's default table is `display: block; overflow: auto;`, which
+	   scrolls locally once content can't fit. Without a floor, though, the
+	   browser prefers to crush a wrapping description column down to one
+	   word per line rather than let the (unbreakable) code-identifier
+	   column force a scrollbar. Give cells a minimum so descriptions stay
+	   readable; the table's own overflow-x takes over on narrow viewports
+	   instead of the crush, and never the page. */
+	min-width: 8em;
+}
+
+.sl-markdown-content th {
+	font-family: var(--q-font-ui);
+	font-weight: 600;
+	color: var(--sl-color-white);
+}
+
+/* ---------- Asides keep the product's hairline language ---------- */
+.sl-markdown-content .starlight-aside {
+	border-radius: var(--q-r-md);
+	border-inline-start-width: 2px;
+}
+
+/* ---------- Inline code ---------- */
+.sl-markdown-content :not(pre) > code {
+	font-size: 0.875em;
+	border-radius: 5px;
+	padding: 0.15em 0.4em;
+}
+
+/* ---------- Brand wordmark ----------
+   Lifted from the product's own `.wordmark` rule in web/src/styles/shell.css.
+   Plain text colour, not the brand gradient: v3 dropped the gradient wordmark
+   and the docs header sits directly above a screenshot of the real one, so any
+   difference is visible side by side. Slightly larger than the app's 0.72rem
+   because the docs header is taller. */
+.site-title,
+.site-title span:not(.sr-only) {
+	font-family: var(--q-font-brand);
+	font-weight: 400;
+	font-size: 0.8125rem;
+	letter-spacing: 0.2em;
+	text-transform: uppercase;
+	color: var(--q-text);
+	background: none;
+	-webkit-text-fill-color: currentColor;
+}
+
+/* ---------- Generated API reference ----------
+   These pages come from protocol/openapi.yaml via starlight-openapi. Their
+   headings are the spec's operation summaries, which are written as sentences
+   of prose rather than as titles — half of ours run past sixty characters, and
+   the longest is a hundred and twenty. At the site's normal h1 size a summary
+   that long fills four lines before the reader reaches the endpoint. Scaling
+   the heading down turns it into a lede, which is what it actually is: the
+   method and path follow immediately below it in their own bar.
+
+   The marker meta tag is set by src/route-data.ts. It is the only way to reach
+   these pages from CSS, because the plugin renders them through StarlightPage
+   and emits no stable class of its own. */
+html:has(meta[name='quasar:page-kind'][content='api-reference']) {
+	--sl-text-h1: 1.5rem;
+}
+
+/* The generated pages set their own section headings from spec structure, so
+   they land closer together than authored prose does. */
+html:has(meta[name='quasar:page-kind'][content='api-reference']) h1 {
+	line-height: 1.35;
+	text-wrap: pretty;
+}

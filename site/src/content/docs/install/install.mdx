@@ -1,0 +1,148 @@
+---
+title: Install Quasar
+description: A Compose file, an .env file, and docker compose up. Nothing is built on your machine.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+import { Code } from 'astro-expressive-code/components';
+import { DEFAULTS, generate } from '../../../data/stack-template.js';
+
+export const files = generate({ ...DEFAULTS, tlsHosts: '192.168.1.50,quasar.lan' });
+export const nvidiaFiles = generate({ ...DEFAULTS, gpu: 'nvidia', tlsHosts: '192.168.1.50,quasar.lan' });
+
+Read [Requirements](/quasar/start/requirements/) first, particularly the sysctl
+and, on NVIDIA, the container toolkit. Nothing here compiles Quasar. It pulls
+published images, which is about 20 GB.
+
+<Steps>
+
+1. **Make a directory and the two paths Quasar writes to.**
+
+   ```bash
+   mkdir -p quasar/deploy && cd quasar
+   sudo install -d -m 0755 -o 1000 -g 1000 /var/lib/quasar/homes
+   sudo install -d -m 0755 -o 1000 -g 1000 /var/lib/quasar/control
+   ```
+
+   Both paths are owned by uid 1000 because that is the user inside the
+   containers. The first holds save data, the second holds the certificate and
+   the artwork cache.
+
+   The `deploy/` subdirectory is not cosmetic. Every other page here writes
+   `deploy/docker-compose.yml` and `deploy/.env`, so matching that layout keeps
+   the commands elsewhere in this documentation correct as written.
+
+2. **Save this as `deploy/docker-compose.yml`.**
+
+   <Code code={files.compose} lang="yaml" />
+
+3. **Save this as `deploy/.env`**, beside it, with your own secrets.
+
+   ```bash
+   # Generate each of these. Do not reuse anything from a guide.
+   #   openssl rand -hex 24     -> POSTGRES_PASSWORD
+   #   openssl rand -hex 32     -> ENROLLMENT_TOKEN
+   #   openssl rand -base64 32  -> QUASAR_SECRET_KEY
+   POSTGRES_PASSWORD=
+   ENROLLMENT_TOKEN=
+   QUASAR_SECRET_KEY=
+
+   # The two paths you created in step 1.
+   QUASAR_HOME_ROOT=/var/lib/quasar/homes
+   QUASAR_STATE_DIR=/var/lib/quasar/control
+
+   # Every IP and hostname anyone will type into a browser. The certificate
+   # names these and it is generated once, on first boot.
+   QUASAR_TLS_HOSTS=192.168.1.50,quasar.lan
+   ```
+
+4. **On NVIDIA only**, add this second file as `deploy/docker-compose.nvidia.yml`.
+
+   <Code code={nvidiaFiles.nvidia} lang="yaml" />
+
+5. **Start it.**
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml up -d
+   ```
+
+   On NVIDIA:
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml \
+                  -f deploy/docker-compose.nvidia.yml up -d
+   ```
+
+   Keep using the same `-f` list for every later command. Compose merges only
+   the files you name.
+
+6. **Check it came up.**
+
+   ```bash
+   curl http://localhost:8080/health
+   ```
+
+   You want `{"status":"ok","db":"ok"}`.
+
+7. **Open Quasar** at `https://<host-ip>:8443` in Chrome. It will warn about the
+   self-signed certificate once. Accept it and continue with
+   [First-run setup](/quasar/install/first-run/).
+
+</Steps>
+
+<Aside type="caution" title="Back up .env">
+`QUASAR_SECRET_KEY` encrypts credentials saved through the admin UI and cannot
+be reconstructed. Lose it and every stored secret has to be entered again. Keep
+a copy off the host.
+</Aside>
+
+## Updating
+
+```bash
+docker compose -f deploy/docker-compose.yml pull
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+`:latest` is what the image variables default to, so this is the whole upgrade.
+Read [Upgrading](/quasar/operations/upgrading/) before doing it on anything you
+care about, because database migrations only go forward.
+
+### Pinning a version instead
+
+If you would rather decide when to move, set both image variables to digests in
+`deploy/.env`:
+
+```bash
+QUASAR_CONTROL_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@sha256:...
+QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@sha256:...
+```
+
+Read a digest with `docker buildx imagetools inspect <image>:latest`. A tag can
+move underneath you and a digest cannot, which is the whole trade: you stop
+getting surprises and you start doing upgrades by hand.
+
+## Building from source
+
+For contributors, and for hosts tracking a development branch. Roughly 25
+minutes and 25 GB of build storage on 8 vCPU. Start at
+[Set up a checkout](/quasar/developer/getting-started/) and use the Makefile
+rather than adapting anything above.
+
+## Ports
+
+| Port | Purpose |
+| --- | --- |
+| 8443 | HTTPS web app and API. Change with `QUASAR_TLS_PORT`. |
+| 8080 | Agent enrollment and `/health`. Browser routes redirect to HTTPS. Change with `CONTROL_PORT`. |
+
+There is no reverse proxy in the default deployment. For Caddy or an existing
+ingress, see [Behind a reverse proxy](/quasar/network/reverse-proxy/).
+
+## Stopping without losing data
+
+```bash
+docker compose -f deploy/docker-compose.yml down
+```
+
+Leave `-v` off unless you mean to delete the database and the agent state. Save
+data and the certificate are on host paths and Compose never touches them.

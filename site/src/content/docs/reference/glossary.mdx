@@ -1,0 +1,127 @@
+---
+title: Glossary
+description: The terms Quasar uses, defined once.
+---
+
+**ABR.** Adaptive bitrate. The controller that moves the encoder's target
+bitrate to match what the connection can carry. On by default in `smooth` mode.
+
+**Admission.** The check that decides whether a GPU can take a new session. Needs
+a free encode slot and enough free GPU memory.
+
+**Agent.** See node agent.
+
+**App.** A catalog entry a user can launch: content, a container specification and
+a launch command. Classified as a game, a desktop or a launcher.
+
+**AV1.** A modern video codec. Saves 40 to 50 percent of H.264's bitrate at
+equivalent quality, and Chrome can decode it everywhere thanks to a software
+fallback.
+
+**Constrained baseline.** The H.264 profile browser sessions are clamped to,
+because Chrome's WebRTC receiver cannot decode High profile from any encoder.
+
+**Control plane.** The Go service holding accounts, the API, signaling and the
+scheduler. Backed by Postgres. Holds no per-host GPU state.
+
+**Device.** A browser Quasar has seen a user log in from, along with the decode
+capabilities it measured. Used to avoid sending a codec the client cannot play.
+
+**Diagnostic bundle.** A bounded window of a session's metrics, events, clock
+alignment and an automated verdict. The thing to attach to a bug report.
+
+**DMABuf.** The Linux mechanism that lets the compositor hand a frame to the
+VA-API encoder without copying it through system memory.
+
+**Encode slot.** A unit of concurrent encoding capacity on a GPU. The real
+reservation in admission control.
+
+**Entitlement.** The grant that decides whether an app appears in a user's
+library. Granted to everyone or to named users.
+
+**Enrollment token.** The shared secret a node agent presents on first contact.
+After a successful enrollment the agent uses its own stored node secret instead.
+
+**FEC.** Forward error correction. Adds redundancy so lost packets can be
+reconstructed. Off by default and not recommended for browser clients.
+
+**GOP.** Group of pictures. The interval between keyframes. Defaults to 60
+frames.
+
+**H.264.** The baseline video codec. Decodes everywhere. Every quality tier ends
+in an H.264 rung.
+
+**HEVC.** Also called H.265. Saves 30 to 40 percent over H.264, but Chrome only
+decodes it with operating system hardware support, so effectively macOS and
+Windows only. The catalog calls it `hevc` and the wire calls it `h265`.
+
+**Home root.** The directory on a host where managed home directories live. Must
+be the same path on every host, and genuinely shared storage if saves are to
+follow users between machines.
+
+**Host.** A machine running the node agent. Owns GPUs and runs sessions.
+
+**ICE.** The WebRTC mechanism for discovering a network path between two peers.
+A session stuck at "checking" means ICE found no working path.
+
+**Intra refresh.** Replacing periodic keyframes with a rolling wave of
+intra-coded blocks. Vulkan encoder only, and needs a patched image.
+
+**Launch profile.** An ordered list of stream profiles, best first. This is what
+a user picks, and what "1080p60" means in the interface.
+
+**Library provider.** A source of games that can be discovered automatically.
+Steam is the only one that exists today.
+
+**Managed home.** A user's persistent directory for one app. Single writer, which
+is why only one session per user per app can run at a time.
+
+**Node agent.** The Rust program on every GPU host. Owns the GPUs, runs the
+compositor and encoder, launches app containers.
+
+**NVENC.** NVIDIA's hardware encoder.
+
+**Placement.** Choosing which host runs a session. Governed by
+`QUASAR_PLACEMENT_POLICY`.
+
+**Playout buffer.** The client-side jitter buffer. Adapts to how evenly frames
+arrive. Uneven arrival forces a bigger buffer, and the buffer is latency.
+
+**Presentation interval variation.** The standard deviation of the gap between
+displayed frames. The number that matches perceived stutter. Below 12 ms is
+healthy, above 18 ms is visible.
+
+**Render node.** The DRM device the compositor and encoder use, under `/dev/dri`.
+Prefer a `/dev/dri/by-path/` name, because the numbered names can move between
+reboots.
+
+**Rung.** One stream profile inside a launch profile.
+
+**Runtime preset.** A reusable container specification several apps can share.
+
+**Session.** One user, one app, one host, one connection.
+
+**Signaling.** The exchange over `/v1/signal` that lets a browser and a node
+agent find each other before they connect directly.
+
+**STUN and TURN.** Standard WebRTC mechanisms for NAT traversal and relaying. A
+normal Quasar install uses neither: media takes a direct route between the
+browser and the GPU host, which means a LAN or a VPN.
+
+**Stream profile.** One concrete encode rung: codec, resolution, frame rate,
+bitrate and eligibility thresholds. Users never see these.
+
+**VA-API.** The video acceleration interface used for AMD and Intel encoding.
+
+**Vulkan encoder.** The Vulkan Video encode path. Auto-detection selects it by
+default on AMD and NVIDIA; Quasar's universal agent image carries its patched
+H.264, HEVC, and AV1 elements.
+
+**Wayland compositor.** The `gst-wayland-display` element that gives a game
+something to render into and produces the frames that get encoded.
+
+**WebRTC.** The browser technology carrying video, audio and input between the
+client and the GPU host.
+
+**Zero copy.** Moving a frame from the compositor to the encoder without a trip
+through system memory. How the VA and NVENC paths are built.

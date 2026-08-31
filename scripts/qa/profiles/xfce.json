@@ -1,0 +1,50 @@
+{
+  "name": "xfce",
+  "description": "XFCE desktop image: lightweight desktop session, panel + root-window context menu.",
+  "app": "XFCE",
+  "session_profile_id": "1080p60",
+  "runs": 2,
+  "session_container_match": "xfce",
+  "gates": {
+    "launch": {
+      "min_fps": 55,
+      "min_luma": 20,
+      "first_content_s": [3, 40]
+    },
+    "oracle": {
+      "label": "xfce-desktop",
+      "expect": "XFCE desktop with the panel drawn",
+      "rules_out": "a bare root window with no panel (xfdesktop/xfce4-panel failing to start)",
+      "matcher": null
+    },
+    "input": {
+      "settle": { "frames": 3, "tolerance_pct": 1.0, "timeout_s": 90 },
+      "delta_threshold_pct": 3.0,
+      "region": [0.2, 0.2, 0.6, 0.6],
+      "devices": {
+        "mouse": {
+          "stimuli": [
+            { "t": "ma", "x": 0.5, "y": 0.5 },
+            { "t": "mb", "button": 273 }
+          ],
+          "settle_ms": 900
+        },
+        "keyboard": {
+          "stimuli": [
+            { "t": "k", "code": 1 }
+          ],
+          "settle_ms": 900
+        }
+      }
+    },
+    "shutdown": {
+      "budget_s": 10.0,
+      "expect_exit": 143,
+      "require_logs": ["shutdown requested"],
+      "forbid_logs": ["SIGKILL backstop"]
+    }
+  },
+  "notes": [
+    "XFCE is the surface behind #432 (smithay GetPointer race: no retroactive pointer-enter). A mouse gate that fails here with a healthy-looking desktop is that class of bug, not necessarily an image defect — check the agent log for the pointer-enter path before reporting."
+  ]
+}

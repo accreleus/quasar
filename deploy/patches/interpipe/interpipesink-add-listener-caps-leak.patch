@@ -1,0 +1,34 @@
+Quasar-authored. Issue #418 — one GstCaps leaked per session.
+
+gst_inter_pipe_sink_add_listener() takes a FULL ref on the listener's caps
+(gst_inter_pipe_ilistener_get_caps() is transfer-full) and releases it on the
+common tail (`if (srccaps) gst_caps_unref (srccaps);`). The
+`if (!sinkcaps) goto add_to_list;` shortcut — taken whenever a listener attaches
+before this sink has negotiated caps — jumps PAST that tail and leaks exactly one
+GstCaps per attach.
+
+Quasar always loses that race on the encode side: `build_encode_pipeline` sets
+`caps` on `interpipesrc` as a construct property with `allow-renegotiation=false`,
+so gst_inter_pipe_src_get_caps() reports negotiated and hands back the appsrc's
+OWN private caps object (the copy gst_app_src_set_caps() made). The stray ref
+therefore outlives the whole pipeline: after teardown the caps survives at
+ref-count 1 with no live GstObject holding it — invisible to a GstObject-filtered
+leaks tracer, and unbounded across sessions.
+
+Reproduced standalone on Tower (two-pipeline interpipe topology, listener attach
+before sink caps): 8 leaks / 8 cycles unpatched, 0 / 8 patched.
+
+--- a/gst/interpipe/gstinterpipesink.c
++++ b/gst/interpipe/gstinterpipesink.c
+@@ -980,8 +980,10 @@ gst_inter_pipe_sink_add_listener (GstInterPipeINode * iface,
+   if (src_negotiated) {
+     gboolean has_listeners;
+
+-    if (!sinkcaps)
++    if (!sinkcaps) {
++      gst_caps_unref (srccaps);
+       goto add_to_list;
++    }
+
+     has_listeners = 0 != g_hash_table_size (listeners);
+

@@ -1,0 +1,68 @@
+---
+title: Files and saves
+description: Where your save games live, why only one session per app at a time, and what your account pages control.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Where your saves live
+
+Every user gets a persistent home directory per app. When you launch a game, that
+directory is mounted into the container as the app's home. Save files, settings
+and Steam installs land there and are still there next time.
+
+The directory belongs to the pair of you and the app. Two different games do not
+share one, and two different users never share one.
+
+Your administrator chooses the managed-home root on each host. Quasar supports
+mount-path storage: the directory is a real path on the GPU host, which makes
+backing up saves a matter of backing up that directory. The older Docker-volume
+home driver has been removed.
+
+## One session per app at a time
+
+If you try to launch a game you already have running somewhere, Quasar refuses
+and tells you which session is holding it.
+
+This is not a licensing restriction. Two containers writing the same save
+directory at the same time corrupts save files, so the home directory has a
+single writer by design.
+
+You can run different apps at the same time, up to whatever concurrent session
+limit your account has.
+
+## Multiple GPU hosts
+
+If your instance has more than one GPU machine, whether your files follow you
+between them depends on how your administrator set up storage. Hosts may use
+different roots. On shared storage, files follow you. On per-machine local
+storage, they do not, and a save made on one host is not visible from the other.
+
+If your instance is like that, your administrator can set placement to prefer the
+host that already holds your files.
+
+## Your account pages
+
+Under `/app/account`:
+
+**Profile** is your name, email and password.
+
+**Stream quality** sets your default quality tier so you are not choosing on
+every launch. Your administrator may have set an instance default and may have
+prevented you overriding it.
+
+**Overlay** controls what the in-session overlay shows.
+
+**Devices** lists every browser you have logged in from, along with what Quasar
+measured that it can decode. You can rename them, mark them trusted, or revoke
+one. Revoking invalidates that device's login.
+
+**Sessions** shows your active sessions and lets you end one. Useful when you
+left something running on another machine and now cannot launch it.
+
+**Storage** shows your home directories and their sizes.
+
+<Aside type="caution" title="Deleting a home directory deletes the saves in it">
+There is no undo and no recycle bin. If your instance does not have backups
+configured, deleted means gone.
+</Aside>

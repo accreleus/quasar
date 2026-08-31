@@ -1,0 +1,49 @@
+---
+title: Developer overview
+description: Where development documentation begins, how it differs from operator documentation, and how the repository is organised.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+This section is for people changing Quasar itself. If you are installing,
+administering, or tuning an instance, use the other sections of this knowledge
+base. You should not need a Go, Rust, or Node toolchain to operate Quasar.
+
+The repository is the authority for developer workflows. Start at the root:
+
+```bash
+make help
+```
+
+Then read `CLAUDE.md` for architecture, invariants, frozen contracts, and current
+phase context, followed by `AGENTS.md` for the operating and verification rules.
+The complete command catalogue is in `docs/developer-tooling.md`.
+
+<Aside type="caution" title="These pages are an entry point, not a second runbook">
+Commands and contracts change with the code. The repository's `CLAUDE.md`,
+`AGENTS.md`, root `Makefile`, and component documentation remain canonical when
+this public site and a checkout disagree.
+</Aside>
+
+## Repository map
+
+| Path | Responsibility |
+| --- | --- |
+| `control-plane/` | Go API, authentication, scheduling, signaling, and persistence. |
+| `node-agent/` | Rust GPU-host agent, session lifecycle, media pipeline, and app containers. |
+| `web/` | React web client and administration interface. |
+| `protocol/` | Frozen wire contracts, maintained as a submodule. Generates the [Control-plane API](/quasar/developer/api/) reference. |
+| `deploy/` | Compose stacks, image builds, deployment scripts, and validation harnesses. |
+| `scripts/dx/` | Canonical developer and diagnostic commands behind the Makefile. |
+| `docs/` | Design records, configuration reference, plans, and developer tooling. |
+| `site/` | This Astro/Starlight public knowledge base. |
+
+## The main development loop
+
+1. Initialise and inspect the checkout.
+2. Make one bounded change.
+3. Run the verification level required for the files you touched.
+4. Validate GPU or streaming changes on a real GPU host.
+5. Keep commits scoped to one coherent unit of work.
+
+Continue with [Set up a checkout](/quasar/developer/getting-started/).

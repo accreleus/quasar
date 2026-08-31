@@ -1,0 +1,135 @@
+"AppState"
+{
+	"appid"		"2536520"
+	"Universe"		"1"
+	"name"		"Diablo II: Resurrected – Infernal Edition"
+	"StateFlags"		"4"
+	"installdir"		"Diablo II Resurrected"
+	"LastUpdated"		"1784942007"
+	"LastPlayed"		"1784942833"
+	"SizeOnDisk"		"42861407018"
+	"StagingSize"		"0"
+	"buildid"		"23826097"
+	"LastOwner"		"76561190000000000"
+	"DownloadType"		"3"
+	"UpdateResult"		"0"
+	"BytesToDownload"		"3200"
+	"BytesDownloaded"		"3200"
+	"BytesToStage"		"3269"
+	"BytesStaged"		"3269"
+	"TargetBuildID"		"0"
+	"AutoUpdateBehavior"		"0"
+	"AllowOtherDownloadsWhileRunning"		"0"
+	"ScheduledAutoUpdate"		"0"
+	"InstalledDepots"
+	{
+		"2536521"
+		{
+			"manifest"		"6005476026828512137"
+			"size"		"0"
+		}
+		"2536522"
+		{
+			"manifest"		"3626229480965108818"
+			"size"		"86951645"
+		}
+		"2536523"
+		{
+			"manifest"		"6006260417246845294"
+			"size"		"13894421239"
+		}
+		"2536524"
+		{
+			"manifest"		"6717605448741417232"
+			"size"		"3362822109"
+		}
+		"2536525"
+		{
+			"manifest"		"2996382599628992015"
+			"size"		"3783995006"
+		}
+		"2536526"
+		{
+			"manifest"		"6662220931055406647"
+			"size"		"2869069205"
+		}
+		"2536527"
+		{
+			"manifest"		"4418389495819081931"
+			"size"		"1453145862"
+		}
+		"2536528"
+		{
+			"manifest"		"5132499999511471442"
+			"size"		"4642422928"
+		}
+		"2536529"
+		{
+			"manifest"		"7316298511329335555"
+			"size"		"926709650"
+		}
+		"4780090"
+		{
+			"manifest"		"303204011246683726"
+			"size"		"921312859"
+		}
+		"4780091"
+		{
+			"manifest"		"8167181829828311426"
+			"size"		"923421927"
+		}
+		"4780092"
+		{
+			"manifest"		"3357064804835197393"
+			"size"		"990064513"
+		}
+		"4780093"
+		{
+			"manifest"		"5451105238158066338"
+			"size"		"1022670733"
+		}
+		"4780094"
+		{
+			"manifest"		"2035686500758360597"
+			"size"		"902969968"
+		}
+		"4780095"
+		{
+			"manifest"		"5696039388617120774"
+			"size"		"1487088464"
+		}
+		"4780096"
+		{
+			"manifest"		"315478447494399835"
+			"size"		"920629707"
+		}
+		"4780097"
+		{
+			"manifest"		"6532020096658608108"
+			"size"		"1772474631"
+		}
+		"4780098"
+		{
+			"manifest"		"4528143508823186728"
+			"size"		"960978116"
+		}
+		"4780099"
+		{
+			"manifest"		"6122995256617865122"
+			"size"		"992908321"
+		}
+		"4780100"
+		{
+			"manifest"		"7599119235556967771"
+			"size"		"947350135"
+		}
+	}
+	"UserConfig"
+	{
+		"language"		"english"
+	}
+	"MountedConfig"
+	{
+		"language"		"english"
+	}
+}

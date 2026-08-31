@@ -1,0 +1,3 @@
+BEGIN;
+ALTER TABLE gpus ADD COLUMN device_path TEXT;
+COMMIT;

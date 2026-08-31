@@ -1,0 +1,61 @@
+# Quasar multi-agent compose overlay — brings up two extra node-agent containers
+# (quasar-node-agent-1 and quasar-node-agent-2) alongside the base stack.
+#
+# Each agent has its own:
+#   - NODE_NAME (distinct identity, maps to a separate `hosts` row)
+#   - NODE_SECRET_PATH (under its own named volume; no secret collision)
+#   - XDG_RUNTIME_DIR (separate Wayland / PulseAudio socket dir on the host)
+#   - GST_REGISTRY (prevents simultaneous writes to the shared registry cache)
+#
+# Usage:
+#   docker compose -f deploy/docker-compose.yml \
+#                  -f deploy/overlays/docker-compose.multiagent.yml up -d
+#
+# Or via qstack:
+#   qstack multiup         # bring up base stack + both extra agents
+#   qstack multidown       # tear down everything
+#   qstack multiagent      # recompile node-agent + restart all three agents
+#
+# Encoder: software (openh264) so both agents can run without GPU contention.
+# Flip QUASAR_ENCODER and QUASAR_RENDER_NODE in deploy/.env if the host has
+# enough GPUs and VA entrypoints to support multiple hardware encoders.
+
+services:
+
+  # Extra agents use node names prefixed with "a" to avoid colliding with the
+  # base `quasar-node-agent` service which defaults to NODE_NAME=quasar-node-1.
+  quasar-node-agent-1:
+    extends:
+      file: docker-compose.yml
+      service: quasar-node-agent
+    environment:
+      NODE_NAME: quasar-node-a1
+      NODE_SECRET_PATH: /var/lib/quasar-agent-1/node-secret
+      XDG_RUNTIME_DIR: /run/quasar-agent-1
+      GST_REGISTRY: /var/lib/quasar-agent-1/.cache/gstreamer-1.0/registry.bin
+    volumes:
+      - /run/quasar-agent-1:/run/quasar-agent-1
+      - quasar-agent-1-data:/var/lib/quasar-agent-1
+    depends_on:
+      quasar-control-plane:
+        condition: service_healthy
+
+  quasar-node-agent-2:
+    extends:
+      file: docker-compose.yml
+      service: quasar-node-agent
+    environment:
+      NODE_NAME: quasar-node-a2
+      NODE_SECRET_PATH: /var/lib/quasar-agent-2/node-secret
+      XDG_RUNTIME_DIR: /run/quasar-agent-2
+      GST_REGISTRY: /var/lib/quasar-agent-2/.cache/gstreamer-1.0/registry.bin
+    volumes:
+      - /run/quasar-agent-2:/run/quasar-agent-2
+      - quasar-agent-2-data:/var/lib/quasar-agent-2
+    depends_on:
+      quasar-control-plane:
+        condition: service_healthy
+
+volumes:
+  quasar-agent-1-data:
+  quasar-agent-2-data:

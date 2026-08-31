@@ -1,0 +1,14 @@
+{
+  "image": { "tag": "quasar-steam:dev", "digest": "sha256:testdigest", "base": null },
+  "replaced_pin": { "image_ref": "ghcr.io/accretion-io/quasar-steam@sha256:009ad46", "restored": true },
+  "host": "devbox",
+  "stack_api": "https://gpu-test.example.internal:9443",
+  "profile": "steam-bpm",
+  "runs": 3,
+  "commit": "abc1234",
+  "generated_at": "2026-08-13T12:00:00Z",
+  "duration_ms": 600000,
+  "skip_input": ["keyboard"],
+  "repointed": true,
+  "environment_restored": { "pin": true, "stray_containers": 0, "sessions_deleted": 3 }
+}

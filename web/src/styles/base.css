@@ -1,0 +1,124 @@
+/* ============================================================
+   QUASAR — Base stylesheet (v3)
+   Fonts, reset, the body background field, headings, links, button
+   inheritance, focus, selection, the .mono/.num utilities and the
+   reduced-motion contract. Everything here is token-driven; values
+   come from design_handoff_v3/screens/assets/console-v3.css.
+   Imported immediately after tokens.css — see main.tsx.
+
+   NOTE: components.css is imported after this file and still carries
+   its own reset, body, heading and .mono rules, so those three groups
+   are shadowed until Task 2 retires it. The tokens they read are
+   already v3, so the colours are right either way.
+   ============================================================ */
+
+/* ---------- FONTS (self-hosted via @fontsource, no CDN) ----------
+   Michroma is the wordmark only (400). IBM Plex Sans carries headings and
+   body (400/500/600/700); IBM Plex Mono carries metrics, ids, kbd, chips,
+   eyebrows and table headers (400/500/600). */
+@import "@fontsource/michroma/400.css";
+@import "@fontsource/ibm-plex-sans/400.css";
+@import "@fontsource/ibm-plex-sans/500.css";
+@import "@fontsource/ibm-plex-sans/600.css";
+@import "@fontsource/ibm-plex-sans/700.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+@import "@fontsource/ibm-plex-mono/600.css";
+
+/* ---------- RESET ---------- */
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--surf-canvas);
+  color: var(--text);
+  font: 400 var(--t-base)/1.5 var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------- BACKGROUND FIELD ----------
+   Two fixed accent blooms behind everything, non-interactive so they never
+   eat a click. z-index -1, not 0: a positioned pseudo-element at 0 paints
+   ABOVE non-positioned page content, so it would veil the app the moment
+   components.css stops overriding it. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: -1;
+  background:
+    radial-gradient(56% 42% at 88% -10%, oklch(0.5998 0.2179 273.21/.11), transparent 72%),
+    radial-gradient(42% 32% at 2% -4%, oklch(0.5 0.19 273.21/.07), transparent 72%);
+}
+
+[data-theme="light"] body::before {
+  background:
+    radial-gradient(56% 42% at 88% -10%, oklch(0.5998 0.2179 273.21/.09), transparent 72%),
+    radial-gradient(42% 32% at 2% -4%, oklch(0.5 0.19 273.21/.05), transparent 72%);
+}
+
+/* ---------- TYPE ---------- */
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  line-height: 1.14;
+  letter-spacing: -.02em;
+  margin: 0;
+}
+
+a {
+  color: var(--accent-text);
+  text-decoration: none;
+}
+
+a:hover {
+  color: var(--accent-hover);
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+/* ---------- FOCUS & SELECTION ---------- */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+/* ---------- UTILITIES ---------- */
+.mono {
+  font-family: var(--font-mono);
+}
+
+/* Counts and metrics in tables and the account pages — `class="num"` in the
+   mock's pages-people.js / pages-account.js. */
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- REDUCED MOTION ---------- */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition-duration: 0s !important;
+    animation-duration: 0s !important;
+  }
+}

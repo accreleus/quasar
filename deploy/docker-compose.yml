@@ -1,0 +1,600 @@
+# Quasar single-host stack — THE base compose file, and a complete deployment.
+#
+# This file IS the production deployment. It pulls published images, bakes in no
+# development bind mounts, and needs exactly one overlay, on NVIDIA hosts only:
+#
+#   AMD / Intel (VA-API), the default:
+#     docker compose -f deploy/docker-compose.yml up -d
+#
+#   NVIDIA (NVENC / Vulkan on a CUDA host):
+#     docker compose -f deploy/docker-compose.yml \
+#                    -f deploy/docker-compose.nvidia.yml up -d
+#
+# INSTALLING A RELEASE IS TWO ENV VARS, NOT AN OVERLAY. Set QUASAR_CONTROL_IMAGE
+# and QUASAR_AGENT_IMAGE in deploy/.env to the digests from the release body and
+# this file is digest-pinned. That replaced docker-compose.release.yml, which
+# existed only to substitute those two image refs and strip a development mount
+# this file no longer carries — and which had to rewrite the control-plane's
+# volume list to do it, a rewrite that twice dropped the load-bearing TLS volume.
+#
+# Contributors building from source add deploy/overlays/docker-compose.dev.yml
+# (the `build:` keys, the web/dist bind mount, the wget healthcheck).
+# deploy/redeploy.sh adds it automatically — you do not type it.
+#
+# Other overlays: hardened.yml (Caddy TLS ingress, an optional managed-cert
+# path), plus everything situational in overlays/ (console, local, multiagent,
+# profiling, cores, adopt-volumes). deploy/README.md Part 2 has the rule; every
+# knob below is documented in docs/configuration.md.
+#
+# Prerequisites (Linux host with a GPU + Docker):
+#   cp deploy/.env.example deploy/.env  and fill it in. Nothing is built.
+#
+# ──────────────────────────────────────────────────────────────────────────────
+# Network topology note (WebRTC ICE requirement):
+#   The node-agent uses network_mode: host. Docker's bridge/overlay networks
+#   cannot carry WebRTC ICE UDP, and Docker Desktop (macOS/Windows) does not
+#   support host networking — Linux is the only supported deployment target.
+#   The agent reaches the control-plane via localhost (the CP maps CONTROL_PORT).
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# THE AGENT RUNS ITS BAKED BINARY. There is deliberately no /workspace mount and
+# no `command:` override here: the node-agent binary is part of the image
+# identity, so the image tag alone says what is running. Building the agent
+# inside the deployed container (the pre-2026-07-26 arrangement) is a documented
+# regression — see CLAUDE.md "Runtime image ≠ build image". Iterate by rebuilding
+# the image (deploy/build-images.sh) and recreating the service.
+
+services:
+
+  # ── Postgres ─────────────────────────────────────────────────────────────────
+  quasar-postgres:
+    # Overridable so a release install can pin the digest it was validated
+    # against, the same way the two Quasar images are pinned.
+    image: ${QUASAR_POSTGRES_IMAGE:-postgres:16-alpine}
+    environment:
+      POSTGRES_DB: quasar
+      POSTGRES_USER: ${POSTGRES_USER:-quasar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in deploy/.env}
+    volumes:
+      - quasar-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-quasar} -d quasar"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  # ── Control-plane ─────────────────────────────────────────────────────────────
+  # Builds from Dockerfile.control; self-migrates the DB at startup.
+  # Serves the API (/v1/*) and the built SPA (QUASAR_WEB_ROOT).
+  quasar-control-plane:
+    # The published control-plane image. Pin a digest in deploy/.env to install a
+    # release (QUASAR_CONTROL_IMAGE + QUASAR_AGENT_IMAGE are the only two vars a
+    # pinned install needs). There is deliberately NO `build:` here: this file is
+    # the production deployment, and a `build:` key makes `docker compose up`
+    # willing to build a "release" locally. Contributors get the build back via
+    # deploy/overlays/docker-compose.dev.yml, which redeploy.sh applies.
+    image: ${QUASAR_CONTROL_IMAGE:-quasar-control-plane:latest}
+    ports:
+      # Both host ports are parameterized: a box whose low ports are already
+      # taken sets CONTROL_PORT / QUASAR_TLS_PORT in deploy/.env rather than
+      # keeping a forked compose file (e.g. 18080/18443).
+      - "${CONTROL_PORT:-8080}:8080"
+      # HTTPS listener (#376): self-signed by default so the browser gets a
+      # secure context (Keyboard Lock Esc capture / Gamepad API). First visit
+      # shows a one-time cert warning — accept the exception. Set QUASAR_TLS=off
+      # to skip, or QUASAR_TLS_CERT/KEY for an operator cert. The hardened
+      # overlay (docker-compose.hardened.yml + Caddy) remains the real-cert path.
+      - "${QUASAR_TLS_PORT:-8443}:8443"
+    environment:
+      DATABASE_URL: >-
+        postgres://${POSTGRES_USER:-quasar}:${POSTGRES_PASSWORD:?}@quasar-postgres:5432/quasar?sslmode=disable
+      LISTEN_ADDR: ":8080"
+      # TLS (#376). auto (default) = self-signed persisted under QUASAR_TLS_DIR;
+      # off = HTTP only. QUASAR_TLS_HOSTS carries the cert's SAN hosts/IPs (comma
+      # list) and is REQUIRED for LAN access: this container can only enumerate
+      # its own bridge address, so a generated cert never covers the HOST's LAN
+      # IP by itself and the browser rejects the name. deploy/seed-tls-hosts.sh
+      # seeds it from the host's primary LAN address. See deploy/.env.example.
+      QUASAR_TLS: ${QUASAR_TLS:-auto}
+      QUASAR_TLS_ADDR: ":8443"
+      # Browser routes on plain HTTP 308-redirect to this EXTERNAL HTTPS port
+      # (agent enrollment + /health stay HTTP), so it must track QUASAR_TLS_PORT.
+      # QUASAR_HTTP_REDIRECT=off serves everything on both listeners (dev escape
+      # hatch).
+      QUASAR_TLS_REDIRECT_PORT: ${QUASAR_TLS_PORT:-8443}
+      QUASAR_HTTP_REDIRECT: ${QUASAR_HTTP_REDIRECT:-auto}
+      QUASAR_TLS_HOSTS: ${QUASAR_TLS_HOSTS:-}
+      # Added as an extra SAN on the generated cert, which is what .env.example
+      # promises. The hardened overlay reads the same var for Caddy's vhost.
+      QUASAR_PUBLIC_HOST: ${QUASAR_PUBLIC_HOST:-}
+      QUASAR_TLS_CERT: ${QUASAR_TLS_CERT:-}
+      QUASAR_TLS_KEY: ${QUASAR_TLS_KEY:-}
+      ENROLLMENT_TOKEN: ${ENROLLMENT_TOKEN:?Set ENROLLMENT_TOKEN in deploy/.env}
+      # P5-02 storage provider: local | volume; unset = auto (local when
+      # QUASAR_HOME_ROOT is set, volume otherwise). local needs QUASAR_HOME_ROOT
+      # to be the same host path on the control-plane and every node-agent host.
+      # The default stays empty HERE on purpose — flipping an existing volume-
+      # backed deployment to local would strand its homes. redeploy.sh seeds
+      # QUASAR_HOME_ROOT on FRESH installs instead, so new deployments get
+      # host-path homes (the volume driver cannot be scanned by library
+      # discovery — see #472).
+      QUASAR_STORAGE_PROVIDER: ${QUASAR_STORAGE_PROVIDER:-}
+      QUASAR_HOME_ROOT: ${QUASAR_HOME_ROOT:-}
+      # Image management P5: comma-separated allowlist of library-provider names
+      # whose catalog image is auto-installed when discovery is enabled. Empty =
+      # the code default ("steam"). A trusted, operator-local decision — never
+      # catalog-controlled (a compromised catalog cannot self-nominate a provider).
+      QUASAR_LIBRARY_PROVIDERS: ${QUASAR_LIBRARY_PROVIDERS:-}
+      # P5-07 placement policy: spread (default) | locality.
+      QUASAR_PLACEMENT_POLICY: ${QUASAR_PLACEMENT_POLICY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Browser origins allowed to open /v1/signal. UNSET (the default) means
+      # same-origin only, which is exactly right for the direct-to-control-plane
+      # deployments this file describes. Set it — comma-separated, exact
+      # scheme://host[:port] — when a reverse proxy fronts the stack, because the
+      # browser's Origin is then the proxy's name and no longer matches. Include
+      # every origin that must keep working: dropping the LAN entries when you add
+      # a public name is what breaks direct https://<lan-ip>:<tls-port> access.
+      # The hardened Caddy overlay sets this itself from QUASAR_PUBLIC_HOST.
+      QUASAR_ALLOWED_ORIGINS: ${QUASAR_ALLOWED_ORIGINS:-}
+      # Networks whose X-Forwarded-For is honoured; unset is right for a direct
+      # deployment. Behind a proxy it MUST name that proxy's network, or every
+      # rate limiter keys on the proxy and all clients share one failure budget —
+      # a pre-auth lockout on POST /v1/setup/claim leaves the first admin
+      # uncreatable. Must be passed here: an .env entry with no passthrough is
+      # silently inert. Asserted by scripts/dev/test-compose-overlays.sh.
+      QUASAR_TRUSTED_PROXIES: ${QUASAR_TRUSTED_PROXIES:-}
+      # STUN/TURN servers handed to the browser with every session's signaling
+      # coordinates (#509). UNSET (the default) means none, so the browser
+      # gathers host candidates only — correct for the LAN/VPN deployments this
+      # file describes, and identical to the behaviour before the knob existed.
+      # Set it in deploy/.env (JSON array, see .env.example) when the player and
+      # the GPU host are on different networks; Quasar ships no TURN server, so
+      # the value points at one you run. Plumbed here for the same reason as
+      # QUASAR_ALLOWED_ORIGINS above: an .env entry with no passthrough is
+      # silently inert.
+      QUASAR_ICE_SERVERS: ${QUASAR_ICE_SERVERS:-}
+      # Dev-only agent auth (#399): off unless the operator sets exactly "1" in
+      # deploy/.env. Must be plumbed here or an .env entry is silently inert
+      # (the QUASAR_ALLOWED_ORIGINS lesson). The control plane refuses to boot
+      # with this set when QUASAR_ENV=production (the hardened overlay sets that).
+      QUASAR_DEV_AGENT_AUTH: ${QUASAR_DEV_AGENT_AUTH:-}
+      QUASAR_ENV: ${QUASAR_ENV:-}
+      # The external base URL users type. Supplies the invite magic link, and is
+      # authoritative for the signaling address handed to a PROXIED client — set
+      # it whenever a reverse proxy fronts the stack, because a proxy that
+      # rewrites Host would otherwise make us advertise this container's own
+      # listener and the browser would dial that instead of the proxy. Unset and
+      # direct deployments are unaffected either way. Same overlay note as above.
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      AUTH_TOKEN_TTL: ${AUTH_TOKEN_TTL:-24h}
+      # First-admin bootstrap — set all three to seed an admin on a fresh DB.
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+      BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+      # SPA: mount web/dist at QUASAR_WEB_ROOT so the CP serves it from /.
+      QUASAR_WEB_ROOT: /app/web
+      # Cover artwork (UI-P7). SHIPS OFF: with no API key nothing is fetched,
+      # no third party is contacted, and every app renders its gradient tile.
+      # The default QUASAR_ARTWORK_DIR (/var/lib/quasar-control/artwork) already
+      # sits under the persisted control volume below, so cached art survives a
+      # redeploy without any extra mount. Read the provider's terms first —
+      # docs/configuration.md §"Cover artwork".
+      # --- Encrypted secrets (internal/secrets) -------------------------------
+      # Master key for credentials set from the ADMIN UI (the artwork key today,
+      # more later). Base64 of exactly 32 bytes: openssl rand -base64 32.
+      # UNSET IS SUPPORTED AND IS THE DEFAULT — the control plane boots, every
+      # env-var credential keeps working, and the admin UI simply reports that
+      # storing credentials is unavailable. It is deliberately not generated on
+      # first boot (a generated key would diverge across nodes and make a backup
+      # unrestorable). BACK IT UP: losing it makes UI-stored secrets
+      # unrecoverable. See docs/configuration.md §"Encrypted secrets".
+      QUASAR_SECRET_KEY: ${QUASAR_SECRET_KEY:-}
+      QUASAR_SECRET_KEY_PREVIOUS: ${QUASAR_SECRET_KEY_PREVIOUS:-}
+      QUASAR_STEAMGRIDDB_API_KEY: ${QUASAR_STEAMGRIDDB_API_KEY:-}
+      QUASAR_ARTWORK_PROVIDER: ${QUASAR_ARTWORK_PROVIDER:-steamgriddb}
+      QUASAR_ARTWORK_DIR: ${QUASAR_ARTWORK_DIR:-/var/lib/quasar-control/artwork}
+      QUASAR_ARTWORK_MAX_BYTES: ${QUASAR_ARTWORK_MAX_BYTES:-}
+      QUASAR_ARTWORK_SWEEP_INTERVAL: ${QUASAR_ARTWORK_SWEEP_INTERVAL:-}
+      # --- Debug / profiling listener (PROF-01, #388) -------------------------
+      # SHIPS ENABLED, ON LOOPBACK. Diagnosing a box that has been up for three
+      # weeks on somebody else's hardware is the whole point. 6060 is DELIBERATELY
+      # ABSENT from the `ports:` block above and must stay that way — the bind
+      # address plus the missing port publish are together what keeps the
+      # profiler unreachable from anywhere but a shell on the host:
+      #   docker exec quasar-control-plane wget -qO- 127.0.0.1:6060/debug/pprof/heap > heap.pb.gz
+      # Set to "off" to run no debug listener at all. docs/configuration.md.
+      QUASAR_PPROF_ADDR: ${QUASAR_PPROF_ADDR:-127.0.0.1:6060}
+      # Soft heap ceiling. Above it the GC works harder rather than letting RSS
+      # drift up toward a container memory cap — the failure mode this campaign
+      # exists to catch. Soft, so exceeding it costs CPU, never an OOM kill.
+      # Raise it if the box legitimately needs more; it is not a quota.
+      GOMEMLIMIT: ${GOMEMLIMIT:-1GiB}
+    volumes:
+      # Persist the self-signed TLS pair (#376) so the browser's accepted cert
+      # exception survives restarts (QUASAR_TLS_DIR defaults to
+      # /var/lib/quasar-control/tls under this mount), plus the artwork cache.
+      #
+      # THIS MOUNT IS LOAD-BEARING AND MUST NEVER BE DROPPED. The control plane
+      # creates its TLS pair under /var/lib/quasar-control and EXITS AT BOOT when
+      # that path is not writable. The retired release overlay once did
+      # `volumes: !reset []` here to strip a development bind mount and took this
+      # with it, which made every pull-based install crash-loop at first start
+      # with `tls: create TLS dir ... permission denied`. The production shape
+      # now lives in this file precisely so no overlay has to rewrite the list.
+      #
+      # The SPA is not here: the production control-plane image BAKES it
+      # (Dockerfile.control.prod). The dev overlay bind-mounts ../web/dist for the
+      # source path, where Dockerfile.control does not bake it.
+      - quasar-control-tls:/var/lib/quasar-control
+    depends_on:
+      quasar-postgres:
+        condition: service_healthy
+    healthcheck:
+      # curl, not wget: the production image (Dockerfile.control.prod, on the
+      # quasar-base family) ships curl and no wget. Getting this wrong is not a
+      # cosmetic failure — the container stays `unhealthy` forever and the node
+      # agent, which waits on `condition: service_healthy`, never starts at all.
+      # The dev overlay swaps this back to wget for Dockerfile.control's
+      # debian-slim runtime, which ships wget and no curl.
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    restart: unless-stopped
+
+  # ── Node-agent ────────────────────────────────────────────────────────────────
+  # network_mode: host — REQUIRED for WebRTC ICE (UDP hole-punching). The agent
+  # reaches the control-plane via localhost:${CONTROL_PORT}.
+  quasar-node-agent:
+    # The runtime image, with the agent binary baked in. Set QUASAR_AGENT_IMAGE
+    # in deploy/.env to a digest to pin a release.
+    #
+    # QUASAR_NODE_IMAGE is the older name for the same thing and is still
+    # honoured, so a host, report, or harness that sets it keeps working; new
+    # configuration should use QUASAR_AGENT_IMAGE, which is what the install
+    # docs name alongside QUASAR_CONTROL_IMAGE.
+    image: ${QUASAR_AGENT_IMAGE:-${QUASAR_NODE_IMAGE:-quasar-node-agent:latest}}
+    # The image's entrypoint does the XDG_RUNTIME_DIR setup, the empty-but-set
+    # Mesa-var guard (issue #71) and the avahi start, then execs the baked
+    # /usr/local/bin/quasar-node-agent.
+    #
+    # NAMED EXPLICITLY, not inherited: some image stages end on `ENTRYPOINT []`,
+    # and an overlay that clears `command:` on top of that leaves the container
+    # with neither an entrypoint nor a command — `docker compose up` then fails
+    # with "no command specified", which is how a redeploy left a stack
+    # agent-less on 2026-07-26.
+    entrypoint: ["/usr/local/bin/quasar-node-agent-entrypoint"]
+    network_mode: host
+    # #483 readiness firewall-posture probe (node-agent/src/readiness.rs
+    # media_reachability check) reads `nft list ruleset` / `iptables -S INPUT`
+    # to detect a default-deny host firewall that would silently drop the
+    # agent's WebRTC ICE UDP. Reading netfilter rule state needs
+    # CAP_NET_ADMIN even for the container's root user; without it both
+    # tools fail `Operation not permitted` and the check degrades to `skip`
+    # (never a false negative, but it can never detect anything either).
+    # This grants READ of the existing ruleset only — it adds no new network
+    # reach: the container already sees the host's real netfilter state
+    # because of `network_mode: host` above (shared network namespace), this
+    # capability only lets it ask for it.
+    cap_add: [NET_ADMIN]
+    # tini as pid 1: weston's orphaned helper processes (reparented when a
+    # console session's process group is SIGKILL'd, see session/console.rs) are
+    # reaped instead of accumulating as zombies under the node-agent.
+    init: true
+    environment:
+      # The agent connects to the CP via localhost because both share host network.
+      CONTROL_PLANE_URL: ws://localhost:${CONTROL_PORT:-8080}
+      ENROLLMENT_TOKEN: ${ENROLLMENT_TOKEN:?}
+      NODE_NAME: ${NODE_NAME:-quasar-node-1}
+      NODE_SECRET_PATH: /var/lib/quasar-agent/node-secret
+      RUST_LOG: ${RUST_LOG:-info}
+      # Wayland compositor socket directory — must match the bind-mount below.
+      XDG_RUNTIME_DIR: /run/quasar-agent
+      # Encoder: unset = the agent auto-detects the GPU vendor and picks the
+      # default itself (nvidia/amd -> vulkan, intel -> va, none -> openh264).
+      # Explicit values (va | vulkan | nvenc | openh264) win. docs/configuration.md.
+      QUASAR_ENCODER: ${QUASAR_ENCODER:-}
+      QUASAR_RENDER_NODE: ${QUASAR_RENDER_NODE:-}
+      # P5-03 local-driver home root: when set, the agent pre-creates bind-mount
+      # dirs under it and reports per-home bytes_used. Must be a path that is
+      # the SAME on host and in this container.
+      QUASAR_HOME_ROOT: ${QUASAR_HOME_ROOT:-}
+      # #500 throwaway-home GC: deletes `agent-<8hex>-<8hex>` managed homes (the
+      # ephemeral/harness identities) that nothing has mounted and that are past
+      # the retention window. ON by default — the failure it prevents is a full
+      # disk. Real users' homes are never candidates. docs/configuration.md.
+      QUASAR_HOMES_GC: ${QUASAR_HOMES_GC:-}
+      QUASAR_HOMES_GC_RETENTION_HOURS: ${QUASAR_HOMES_GC_RETENTION_HOURS:-}
+      QUASAR_HOMES_GC_DRY_RUN: ${QUASAR_HOMES_GC_DRY_RUN:-}
+      # #488 golden-home templates. All SHIP-DARK (off unless set), and all
+      # host-local: QUASAR_HOME_TEMPLATES gates CONSUMPTION (seeding a cold home
+      # from a template), QUASAR_TEMPLATE_WARMUP gates PRODUCTION (building one).
+      # QUASAR_TEMPLATE_ROOT must be the path bind-mounted below — the agent
+      # writes templates there and later reflink-clones them into home root, so
+      # the container must see the HOST's directory at the SAME path or every
+      # build lands in the container overlay (and warm-up refuses; see
+      # QUASAR_TEMPLATE_ALLOW_CROSSFS in docs/configuration.md).
+      QUASAR_HOME_TEMPLATES: ${QUASAR_HOME_TEMPLATES:-}
+      QUASAR_TEMPLATE_WARMUP: ${QUASAR_TEMPLATE_WARMUP:-}
+      QUASAR_TEMPLATE_ROOT: ${QUASAR_TEMPLATE_ROOT:-}
+      QUASAR_TEMPLATE_CLONE_MODE: ${QUASAR_TEMPLATE_CLONE_MODE:-}
+      QUASAR_TEMPLATE_ALLOW_CROSSFS: ${QUASAR_TEMPLATE_ALLOW_CROSSFS:-}
+      QUASAR_TEMPLATE_SETTLE_SECS: ${QUASAR_TEMPLATE_SETTLE_SECS:-}
+      QUASAR_TEMPLATE_WARMUP_TIMEOUT_SECS: ${QUASAR_TEMPLATE_WARMUP_TIMEOUT_SECS:-}
+      QUASAR_TEMPLATE_MIN_FREE_BYTES: ${QUASAR_TEMPLATE_MIN_FREE_BYTES:-}
+      # ZC-03 full zero-copy VA: compositor emits memory:DMABuf in a vapostproc-importable
+      # modifier (no system hop). Needs QUASAR_ENCODER=va + a non-deep session; negotiates
+      # the modifier from vapostproc's caps and falls back to the ZC-01 system path if none
+      # is compatible. Default 0.
+      QUASAR_ZEROCOPY: ${QUASAR_ZEROCOPY:-0}
+      # Host-stage latency probe (default off) — see docs/configuration.md.
+      QUASAR_LATENCY_PROBE: ${QUASAR_LATENCY_PROBE:-0}
+      # Instrumentation passthroughs (empty = off). VULKAN_GST_DEBUG is the retired
+      # name of GST_DEBUG from the old per-image overlays; still honoured.
+      QUASAR_CAPTURE_H264: ${QUASAR_CAPTURE_H264:-}
+      LIBVA_TRACE: ${LIBVA_TRACE:-}
+      GST_DEBUG: ${GST_DEBUG:-${VULKAN_GST_DEBUG:-}}
+      # SO-02 encoder tuning knobs (VA path). Defaults match the node-agent code
+      # defaults; expose them so the measured low-latency values can be set per
+      # deployment (and swept) without a rebuild. target-usage 1=quality…7=speed;
+      # queue-buffers is the interpipe→encoder leaky-queue depth (≈16ms/buffer@60).
+      QUASAR_TARGET_USAGE: ${QUASAR_TARGET_USAGE:-6}
+      QUASAR_QUEUE_BUFFERS: ${QUASAR_QUEUE_BUFFERS:-3}
+      # H.264 slices per frame (loss-resilience knob; also sets the vulkan
+      # intra-refresh cycle length in per-picture-partition mode — keep > 1
+      # when QUASAR_INTRA_REFRESH=1).
+      QUASAR_SLICES: ${QUASAR_SLICES:-8}
+      # ULPFEC/RED send-side FEC on the video transceiver: proactive burst-loss repair
+      # for lossy client links (WiFi) — loss no longer waits on RTX round-trips or the
+      # next keyframe. QUASAR_FEC_MODE selects off | fixed | auto (default off):
+      #   fixed → static ulp-red at QUASAR_FEC_PERCENTAGE% for the whole session;
+      #   auto  → negotiate ulp-red at 0% and ramp 0→N→0 on the agent-local loss signal
+      #           (N = QUASAR_FEC_PERCENTAGE if set, else 20). Zero overhead on clean links.
+      # Unset FEC_MODE is derived from FEC_PERCENTAGE (0 ⇒ off, >0 ⇒ fixed) for back-compat.
+      # Redundancy adds ~N% to the video bitrate while armed (GCC/ABR sees the total).
+      QUASAR_FEC_MODE: ${QUASAR_FEC_MODE:-}
+      QUASAR_FEC_PERCENTAGE: ${QUASAR_FEC_PERCENTAGE:-0}
+      # Auto-mode controller hysteresis (only used when QUASAR_FEC_MODE=auto). Defaults
+      # match the agent's built-in: arm at ≥0.5% loss for 2×5s windows, disarm after
+      # 6×5s clean, latch armed after 4 flap cycles. See docs/configuration.md.
+      QUASAR_FEC_ARM_LOSS_PCT: ${QUASAR_FEC_ARM_LOSS_PCT:-}
+      QUASAR_FEC_WINDOW_S: ${QUASAR_FEC_WINDOW_S:-}
+      QUASAR_FEC_ARM_WINDOWS: ${QUASAR_FEC_ARM_WINDOWS:-}
+      QUASAR_FEC_DISARM_WINDOWS: ${QUASAR_FEC_DISARM_WINDOWS:-}
+      QUASAR_FEC_MAX_FLAPS: ${QUASAR_FEC_MAX_FLAPS:-}
+      # #227 A2: rolling intra refresh — Vulkan encoder only (needs the vendored
+      # vkh264enc-intra-refresh.patch that the runtime image's gst carries; a stock
+      # gst-plugins-bad build has no intra-refresh property and no-ops with a warning).
+      # Default 0 (off). Period 0 = continuous back-to-back cycles. Recommend
+      # QUASAR_SLICES > 1 alongside it. See docs/configuration.md.
+      QUASAR_INTRA_REFRESH: ${QUASAR_INTRA_REFRESH:-0}
+      QUASAR_INTRA_REFRESH_PERIOD: ${QUASAR_INTRA_REFRESH_PERIOD:-0}
+      # Per-codec Vulkan encoder knobs (docs/configuration.md). ALL THREE DEFAULT ON
+      # (2026-08-22): empty/unset means enabled. Set one to 0/false/off ONLY to stop
+      # producing that codec with the Vulkan encoder — the node-agent then borrows the
+      # vendor HW encoder for it per session (and the codec stays advertised), or drops
+      # the codec if the host has no vendor element. h264 can never be dropped.
+      QUASAR_VULKAN_H264: ${QUASAR_VULKAN_H264:-}
+      QUASAR_VULKAN_HEVC: ${QUASAR_VULKAN_HEVC:-}
+      QUASAR_VULKAN_AV1: ${QUASAR_VULKAN_AV1:-}
+      # gst-wayland-display export-ring depth. Empty keeps its default (4), BUT while
+      # HEVC is enabled on the Vulkan encoder (the default) the node-agent auto-pins this
+      # to 2 (empty is treated as unset) to dodge NVIDIA's per-slot h265 encode-src tiling
+      # defect that blacks 1-in-4 frames — see docs/configuration.md and the multi-codec
+      # spec §7 item 4. Set a non-empty value only to override that auto-pin (A/B).
+      WOLF_VULKAN_RING: ${WOLF_VULKAN_RING:-}
+      # VK diagnostics (2026-07-06): per-AU RTP timestamp/seqnum continuity trace
+      # (probes::attach_rtp_ts_trace, target quasar.rtp.ts) and the encoder sink/src
+      # PTS trace (probes::attach_encoder_pts_trace, target quasar.enc.pts). Off unless set.
+      QUASAR_TRACE_RTP_TS: ${QUASAR_TRACE_RTP_TS:-}
+      QUASAR_TRACE_RTP_MARKER: ${QUASAR_TRACE_RTP_MARKER:-}
+      QUASAR_TRACE_ENC_PTS: ${QUASAR_TRACE_ENC_PTS:-}
+      # AS-03 in-session ABR governor (rtpgccbwe → CBR setpoint). Floor is
+      # agent-derived: explicit QUASAR_ABR_FLOOR_KBPS, else ceiling ×
+      # QUASAR_ABR_FLOOR_RATIO (default 0.3). See docs/configuration.md.
+      #
+      # 2026-08-18 flip (#495): this line was `${QUASAR_ABR:-0}`, silently overriding
+      # the hostcfg catalog default (abr_enabled: true) and CLAUDE.md's standing
+      # "ABR is ON by default" claim on every compose-deployed host since d49a069a
+      # (2026-06-10, predates SPT-10 making smooth the default). Baseline v2 showed
+      # smooth is a no-op-or-better on a clean path and a large win under congestion
+      # (docs/reports/2026-08-17-bench-baselines/README.md,
+      # docs/reports/2026-08-18-overnight-optimisation/t3-ladder-step-recovery.md) —
+      # now compose matches the documented default. Revert per-host with
+      # QUASAR_ABR_MODE=protective, or disable with QUASAR_ABR=0.
+      QUASAR_ABR: ${QUASAR_ABR:-1}
+      QUASAR_ABR_MODE: ${QUASAR_ABR_MODE:-smooth}
+      QUASAR_ABR_FLOOR_KBPS: ${QUASAR_ABR_FLOOR_KBPS:-}
+      QUASAR_ABR_FLOOR_RATIO: ${QUASAR_ABR_FLOOR_RATIO:-0.3}
+      # SPT-04 governor hysteresis knobs (docs/configuration.md). Documented as
+      # Live-class/operator-settable but never wired into this passthrough, so
+      # setting them in deploy/.env silently did nothing
+      # (docs/reports/2026-08-18-overnight-optimisation/t3-ladder-step-recovery.md).
+      # Empty keeps the agent's built-in default (AbrConfig::DEFAULT_*); each is
+      # also settable live via Host Settings (hostcfg catalog: abr_ewma_alpha,
+      # abr_deadband, abr_max_up_step, abr_min_interval_ms, abr_max_down_step,
+      # abr_down_dwell_ms, abr_cliff_guard_frac).
+      QUASAR_ABR_EWMA_ALPHA: ${QUASAR_ABR_EWMA_ALPHA:-}
+      QUASAR_ABR_DEADBAND: ${QUASAR_ABR_DEADBAND:-}
+      QUASAR_ABR_MAX_UP_STEP: ${QUASAR_ABR_MAX_UP_STEP:-}
+      QUASAR_ABR_MIN_INTERVAL_MS: ${QUASAR_ABR_MIN_INTERVAL_MS:-}
+      QUASAR_ABR_MAX_DOWN_STEP: ${QUASAR_ABR_MAX_DOWN_STEP:-}
+      QUASAR_ABR_DOWN_DWELL_MS: ${QUASAR_ABR_DOWN_DWELL_MS:-}
+      QUASAR_ABR_CLIFF_GUARD_FRAC: ${QUASAR_ABR_CLIFF_GUARD_FRAC:-}
+      # #419 allocator A/B levers. ALL DEFAULT UNSET → glibc's own defaults, i.e. the
+      # shipping behaviour is unchanged; these exist so a soak can flip an arm with
+      # `docker compose up -d` and no image rebuild.
+      #
+      # The agent runs 50+ threads. glibc hands a thread that contends on the main arena
+      # its own arena (up to 8 x ncores), an arena is recycled but never unmapped when its
+      # threads exit, and each keeps its own high-water mark of touched pages. That is one
+      # of the two shapes that produce #419's signature: RSS climbing ~1-4 MB per session
+      # cycle with zero growth in fds, threads, live GstObjects or VRAM.
+      #
+      #   MALLOC_ARENA_MAX=1        collapse to a single arena (the A/B arm)
+      #   MALLOC_TRIM_THRESHOLD_=131072  trim the heap top aggressively instead of letting
+      #                             glibc's dynamic threshold grow without bound
+      #   MALLOC_MMAP_THRESHOLD_=65536   push mid-sized blocks to mmap so their free
+      #                             returns pages to the kernel directly
+      #   QUASAR_MALLOC_TRIM=1      agent-side malloc_trim(0) at each session teardown
+      #                             (src/memstat.rs) — the discriminator between
+      #                             reclaimable free heap and genuine retention
+      #
+      # The agent logs the active combination at startup under target `quasar.mem`.
+      MALLOC_ARENA_MAX: ${MALLOC_ARENA_MAX:-}
+      MALLOC_TRIM_THRESHOLD_: ${MALLOC_TRIM_THRESHOLD_:-}
+      MALLOC_MMAP_THRESHOLD_: ${MALLOC_MMAP_THRESHOLD_:-}
+      QUASAR_MALLOC_TRIM: ${QUASAR_MALLOC_TRIM:-}
+      # Issue #304 Phase 0 validation: strip audio m-line / decouple pulsesrc clock.
+      # QUASAR_AUDIO_DISABLED=1 → video-only offer (no audio track). QUASAR_AUDIO_NO_CLOCK=1
+      # → pulsesrc provide-clock=false + do-timestamp=false. Both default off.
+      QUASAR_AUDIO_DISABLED: ${QUASAR_AUDIO_DISABLED:-}
+      QUASAR_AUDIO_NO_CLOCK: ${QUASAR_AUDIO_NO_CLOCK:-}
+      # QUASAR_AUDIO_REQUIRED=1 → an unavailable PulseAudio sidecar FAILS the session
+      # instead of silently degrading it to silence (2026-07-26: a sidecar image with no
+      # `pulseaudio` binary muted every session — streamed AND console-local — with only
+      # a WARN in the log). Default off so a host with no audio stack still runs; release
+      # deployments should set it.
+      QUASAR_AUDIO_REQUIRED: ${QUASAR_AUDIO_REQUIRED:-}
+      # IL-0 input-latency A/B knobs (2026-06 input-jitter investigation).
+      # QUASAR_INPUT_TRACE=1 turns on per-`mm` {seq,tc,recv_ms,inject_ms,dwell_ms}
+      # debug! logging under target quasar.input.trace — also needs RUST_LOG to
+      # include that target at debug (e.g. RUST_LOG=info,quasar.input.trace=debug),
+      # since the emitter is tracing::debug! not info!. QUASAR_INPUT_CHANNEL_MODE=legacy
+      # reverts the DataChannel to unreliable+unordered (default: reliable+ordered).
+      # QUASAR_INPUT_BATCH_MS default 1 (0 disables the rel-flush batching thread).
+      QUASAR_INPUT_TRACE: ${QUASAR_INPUT_TRACE:-}
+      QUASAR_INPUT_CHANNEL_MODE: ${QUASAR_INPUT_CHANNEL_MODE:-}
+      QUASAR_INPUT_BATCH_MS: ${QUASAR_INPUT_BATCH_MS:-}
+      # Controller-first pointer nudge (BPM controller-focus heal). Default ON;
+      # set to 0/false to disable the one-shot ±1px net-zero jiggle injected on the
+      # first gamepad event of a mouse-untouched session.
+      QUASAR_INPUT_CONTROLLER_NUDGE: ${QUASAR_INPUT_CONTROLLER_NUDGE:-}
+      # Do not override the image's GST_PLUGIN_PATH. The runtime image owns
+      # /opt/gst/lib64/gstreamer-1.0; legacy /usr/local paths can load an older
+      # waylanddisplaysrc and hide its runtime cadence properties.
+      #
+      # Mesa: UNSET by default, which is the hardware path. Forcing
+      # MESA_LOADER_DRIVER_OVERRIDE=softpipe loads the software gallium driver even
+      # for a real DRM node, so the va plugin probes a software device, registers no
+      # vah264enc, and hardware encode fails with "no VA H264 encoder found" — set
+      # both to 1/softpipe only for a deliberately software-only host.
+      #
+      # NOTE the single-dash `${VAR-default}` (not `:-`): the default applies only
+      # when the var is UNSET, so an *empty* value in deploy/.env still means empty
+      # (issue #68). The image entrypoint unsets empty-but-set values, because an
+      # empty MESA_LOADER_DRIVER_OVERRIDE makes Mesa try to load a driver literally
+      # named "" → vaInitialize error 2 / EGL DRI2 failure (issue #71).
+      LIBGL_ALWAYS_SOFTWARE: ${LIBGL_ALWAYS_SOFTWARE-}
+      MESA_LOADER_DRIVER_OVERRIDE: ${MESA_LOADER_DRIVER_OVERRIDE-}
+      # PulseAudio sidecar image. Follows the agent image by default — the sidecar
+      # must come from the same runtime lineage or sessions run silent (2026-07-26:
+      # a sidecar image with no `pulseaudio` binary muted every session).
+      QUASAR_PULSE_IMAGE: ${QUASAR_PULSE_IMAGE:-${QUASAR_AGENT_IMAGE:-${QUASAR_NODE_IMAGE:-quasar-node-agent:latest}}}
+      # --shm-size for app containers (tmpfs, allocated on use; Chromium/Steam
+      # need >64MB, and big Steam titles benefit from more).
+      QUASAR_APP_SHM_SIZE: ${QUASAR_APP_SHM_SIZE:-1g}
+      # Graceful-stop window (docker stop -t N) before the rm -f backstop on
+      # session teardown; 0 = kill-only. See docs/configuration.md.
+      QUASAR_APP_STOP_TIMEOUT_SECS: ${QUASAR_APP_STOP_TIMEOUT_SECS:-10}
+      # App-container network mode (docker `--network`). Default `none` keeps
+      # tenant apps isolated; set `bridge` in deploy/.env for titles that need
+      # outbound access (e.g. Steam sign-in/downloads).
+      QUASAR_CONTAINER_NETWORK: ${QUASAR_CONTAINER_NETWORK:-none}
+      # App-container run-as user, forwarded as PUID/PGID to the quasar-images
+      # entrypoint (NOT docker --user — the images init as root then drop). Unset
+      # ⇒ image default.
+      QUASAR_APP_PUID: ${QUASAR_APP_PUID:-}
+      QUASAR_APP_PGID: ${QUASAR_APP_PGID:-}
+    volumes:
+      # Docker socket: required for sibling-container launches (game containers,
+      # PulseAudio sidecar). The agent never dials Docker on the network;
+      # it shells out to the docker CLI via this socket.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # XDG_RUNTIME_DIR: Wayland compositor + PulseAudio sockets land here.
+      # MUST be a host bind-mount (not a named volume) so that docker-out-of-docker
+      # bind mounts from the agent's sibling containers resolve on the host.
+      - /run/quasar-agent:/run/quasar-agent
+      # Bind the evdev DIRECTORY, not only the nodes present at container start:
+      # controllers hot-plugged mid-session otherwise exist on the host but are
+      # invisible in Docker's private /dev. Access stays constrained to input
+      # major 13 by device_cgroup_rules below.
+      - /dev/input:/dev/input
+      # Managed-home root (P5-03): the agent provisions and measures homes on
+      # its OWN filesystem, so the host's home root must be visible inside the
+      # agent at the SAME path. Harmless self-mapped tmp path when unset.
+      - ${QUASAR_HOME_ROOT:-/tmp/quasar-homes-unset}:${QUASAR_HOME_ROOT:-/tmp/quasar-homes-unset}
+      # Golden-home template root (#488), self-mapped for the SAME reason the
+      # home root above is: the agent reflink-clones from here into a home, and
+      # a template written to a path that only exists inside the container is
+      # invisible on the host, orphaned by the next redeploy, and cannot be
+      # cloned at all. Defaults to the SIBLING of the default home root, which is
+      # what the agent computes when QUASAR_TEMPLATE_ROOT is unset
+      # (/var/lib/quasar/homes -> /var/lib/quasar/templates). If you move
+      # QUASAR_HOME_ROOT, set QUASAR_TEMPLATE_ROOT to its sibling as well or the
+      # agent's default and this mount will not agree — the agent then refuses
+      # warm-up builds (cross-filesystem guard), which is the intended, loud
+      # failure rather than a silent overlay write.
+      - ${QUASAR_TEMPLATE_ROOT:-/var/lib/quasar/templates}:${QUASAR_TEMPLATE_ROOT:-/var/lib/quasar/templates}
+      # First-run readiness (S1): the HOST's os-release, read-only, used only to
+      # pick distro-aware remediation wording ("dnf install …" vs "pacman -S …").
+      # The container's own /etc/os-release describes the IMAGE, not the box, so
+      # without this the operator gets generic instructions on every host. Purely
+      # cosmetic — an absent mount degrades to generic wording, never to a failed
+      # check — and read-only, so it grants the agent nothing.
+      - /etc/os-release:/host/etc/os-release:ro
+      # The HOST's /dev, read-only, purely so the agent can ask what device
+      # nodes the box actually has before passing one through to an app
+      # container (today: /dev/fuse for the xdg document portal). Docker gives
+      # this container a private, minimal /dev, so probing our own /dev/fuse
+      # answers for the image, not the host — it is always absent and the
+      # pass-through silently never happened. Read-only, and the container's
+      # device cgroup still gates any actual access, so this grants nothing
+      # beyond visibility (and the agent already holds the docker socket).
+      - /dev:/host/dev:ro
+      # Persistent agent state: the per-node secret issued at enrollment.
+      - quasar-agent-data:/var/lib/quasar-agent
+    # Docker's default seccomp profile is intentional and deliberately NOT
+    # overridden here: a disposable AMD VA driver initialization and a 720p60
+    # vah264enc run both passed under it on 2026-07-13, superseding the historical
+    # issue #71 workaround. Overlays that genuinely need an exception (profiling)
+    # state it themselves.
+    devices:
+      # GPU render node for hardware encode. COMMENT THIS LINE OUT on a host with
+      # no GPU — Docker refuses to start a container whose device is absent.
+      # Software encode (QUASAR_ENCODER=openh264) does not need it; the node-agent
+      # exits at startup with a clear error if a hardware encoder is selected
+      # without the device present.
+      - /dev/dri
+      # uinput: virtual keyboard/mouse/gamepad for Wayland input injection.
+      # Comment out if uinput is unavailable; virtual input self-test will fail.
+      - /dev/uinput
+    device_cgroup_rules:
+      # Allow r/w/mknod for Linux input event devices (char major 13).
+      # uinput creates /dev/input/eventN nodes on the host at session start;
+      # the fake-udev mknod mirrors them inside the container, but without this
+      # rule the container's cgroup blocks reads — libinput silently fails to
+      # open the keyboard/mouse paths and the compositor receives no events.
+      - 'c 13:* rmw'
+    depends_on:
+      quasar-control-plane:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  # No `name:` override here (#448). Compose v5 rejects an empty `name:` value
+  # outright at `up` — "invalid volume name or ID: value is empty" — for EVERY
+  # service, because the volume is a project-level definition; older Compose
+  # (Tower/hermes at the time) treated it as a no-op, which is why this never
+  # showed up before v5. Worse, `docker compose config` silently DROPS the
+  # empty key instead of erroring, so config-based validation cannot catch it.
+  # Volume-name overrides (to adopt a pre-existing volume under a different
+  # name — e.g. a stack migrating off a forked compose file) now live in the
+  # opt-in overlay deploy/overlays/docker-compose.adopt-volumes.yml. Normal deploys
+  # never apply it, so Compose falls back to its usual <project>_<key> naming.
+  quasar-postgres-data:
+  quasar-agent-data:
+  quasar-control-tls: # #376 TLS pair + UI-P7 artwork cache (/var/lib/quasar-control)

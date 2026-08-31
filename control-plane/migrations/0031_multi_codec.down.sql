@@ -1,0 +1,12 @@
+BEGIN;
+
+ALTER TABLE hosts
+    DROP COLUMN IF EXISTS codecs;
+
+ALTER TABLE stream_profiles
+    DROP COLUMN IF EXISTS codecs;
+
+ALTER TABLE sessions
+    DROP COLUMN IF EXISTS codec;
+
+COMMIT;

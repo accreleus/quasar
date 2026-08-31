@@ -1,0 +1,127 @@
+---
+title: In a session
+description: Capturing input, the session drawer, gamepads, the Escape key, microphone, quick switch, and what the health banners mean.
+---
+
+import Shot from '../../../components/Shot.astro';
+import session_drawer from '../../../assets/shots/session-drawer.png';
+import { Aside } from '@astrojs/starlight/components';
+
+Once the stream starts you are looking at a full-bleed video of the game with no
+chrome around it. Everything you need is behind one keyboard shortcut.
+
+<Shot
+	label="Session"
+	sublabel="A live session with the menu open on Controller and input: the capture toggle, the release combination, and the readout along the bar."
+	src={session_drawer}
+	alt="A live Quasar session with the session menu open"
+/>
+
+## Opening the drawer
+
+**Ctrl+Alt+Shift+Q** opens and closes the session drawer. **Escape** closes it.
+
+On a touch device there is a visible menu button instead, because the chord does
+not exist without a keyboard.
+
+## Capturing input
+
+The first thing in the drawer is Capture input. Until you capture, your mouse
+belongs to the browser. Once you capture, it belongs to the game and the pointer
+is locked.
+
+Release it with the release combination shown in the drawer.
+
+### The Escape key
+
+Escape is awkward, because the browser wants it for leaving fullscreen and the
+game wants it for the pause menu.
+
+Quasar uses the Keyboard Lock API to route Escape to the game. That needs three
+things at once: a Chromium-based browser, fullscreen, and a secure context
+(HTTPS). If any of those is missing, the drawer says so, and Escape leaves
+fullscreen instead of reaching the game.
+
+If Escape is not working, check whether the page is on HTTPS first. That is
+almost always the reason.
+
+## Gamepads
+
+Controllers work through the browser's Gamepad API, and the input travels over
+the same data channel as everything else.
+
+Browsers only reveal a gamepad after it has sent an input, so press a button
+after connecting one. The drawer lists what it currently sees.
+
+## Microphone
+
+If your administrator has enabled microphone capture, the drawer has a toggle
+for it. Three things have to line up: the instance setting has to be on, you
+have to turn it on, and your browser has to grant permission.
+
+A live microphone always shows a persistent indicator. It cannot be hidden. If
+the microphone is on, you can see that it is on.
+
+Microphone capture needs a secure context, so it does not work over plain HTTP.
+
+## Quick switch
+
+Swap to a different app without ending the session. The stream stays up while
+the new app comes in behind it. Useful for moving between a game and a desktop.
+
+## Scaling and fullscreen
+
+Scaling controls how the stream fits your window. Fullscreen is a toggle, and it
+is also a precondition for Escape reaching the game.
+
+The launch tier sets the maximum size and frame rate. During a session you can
+change stream resolution and render resolution independently, and adjust the
+interface-scale hint. Each resolution is bounded by the launch size. Returning
+stream resolution to the launch size releases the manual pin so an enabled ABR
+resolution rung can resume.
+
+There is no manual frame-rate control. An optional ABR FPS rung can step a 120
+fps session down to 60 and restore it; it is disabled by default.
+
+## Performance stats
+
+Turning on performance stats opens a diagnostics overlay and closes the drawer,
+so the numbers stay visible while you play.
+
+Two of them are worth understanding.
+
+**Frame rate** is what the host is producing. If this is well below your tier,
+the bottleneck is the host, not your network.
+
+**Presentation interval variation** is how consistent the gaps between displayed
+frames are. This is the number that matches what stutter actually feels like. A
+high frame rate with high variation looks worse than a slightly lower frame rate
+with low variation.
+
+See [Stream quality problems](/quasar/troubleshooting/quality/) for reading
+these properly.
+
+## Health banners
+
+Quasar tells you when it thinks the stream is in trouble, then waits for you to
+decide. It does not silently end sessions and it does not silently retry.
+
+| Banner | Meaning |
+| --- | --- |
+| Degrading | Quality is dropping. Usually the network. |
+| Unsustainable | The stream cannot hold at this level. Consider a lower tier. |
+| Not supported on your device | Your browser could not decode what was sent. |
+| Reconnecting | The connection dropped and Quasar is trying to recover it. |
+
+## Not available yet
+
+**Screenshot** and **Save last 30 seconds** appear in the drawer but are
+disabled. They are placeholders for work that has not landed.
+
+## Ending the session
+
+Exit session in the drawer, or close the tab. Either way the container stops and
+your save data is written to your persistent home directory.
+
+You get a summary afterwards: how long you played, frame rate and latency
+figures, and a plain-language note on how the session went.

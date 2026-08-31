@@ -1,0 +1,202 @@
+{
+  "schema_version": 1,
+  "_purpose": "Declarative, machine-checked contract for every Quasar image role. Consumed by deploy/validate-image.sh and enforced by deploy/build-images.sh before any :latest promotion or push. Spec: docs/design/plans/2026-07-26-image-lineage-consolidation-spec.md",
+  "_why_this_file_exists": "On 2026-07-26 the production quasar-nv image was found to be 7.33GB (84% build toolchain) AND missing the pulseaudio daemon, so every Tower session ran with silent audio. Nothing detected either problem: the nv stage was a hand-copy of the runtime stage's package list, kept in step by discipline alone. Issues #111 and #272 had both been CLOSED as having solved exactly these problems. A closed issue is not a guarantee. Every lesson below is a line here so it is re-checked on every build, forever.",
+  "_maintenance": "Adding a lesson means adding an assertion here, not a paragraph in a doc. Never relax an assertion to make a build pass -- fix the image.",
+
+  "roles": {
+
+    "runtime": {
+      "_role": "Vendor-neutral node-agent runtime (quasar-node-agent tag; quasar-vulkan before the 2026-08-26 role rename, still written as a transition alias). AMD/Intel VA + Vulkan encode. Also serves as the per-session PulseAudio sidecar image and the default app image on some stacks.",
+      "size_max_mb": 2000,
+      "_size_note": "quasar-nv:prev (the same lineage built --target runtime) measured 1.57GB on 2026-07-26. 2000MB leaves headroom for the docker CLI + entrypoint moving into this stage per spec 5.3. If a legitimate addition breaks the ceiling, raise it deliberately in a commit that says why -- do not raise it to make a red build green.",
+
+      "packages": {
+        "required": [
+          "ca-certificates", "curl", "openssl-libs",
+          "glib2", "libdrm", "mesa-libgbm",
+          "libwayland-server", "libwayland-client", "libxkbcommon", "libseat", "libinput",
+          "systemd-libs", "libX11",
+          "vulkan-loader", "vulkan-tools",
+          "mesa-va-drivers", "libva",
+          "mesa-vulkan-drivers-freeworld", "mesa-va-drivers-freeworld",
+          "libglvnd", "mesa-libEGL", "mesa-libGLES", "mesa-libGL", "mesa-dri-drivers",
+          "alsa-lib", "pulseaudio-libs", "pulseaudio", "pulseaudio-utils",
+          "pciutils-libs", "libsrtp",
+          "weston", "seatd", "ddcutil", "procps-ng", "iproute",
+          "hwdata",
+          "avahi", "nss-mdns",
+          "openh264",
+          "nftables"
+        ],
+        "_required_notes": {
+          "pulseaudio": "THE DAEMON, not just pulseaudio-libs/-utils. QUASAR_PULSE_IMAGE points at this image; without the daemon binary the agent logs 'silent audio fallback' and every session is mute. This exact package was the 2026-07-26 Tower audio outage.",
+          "mesa-vulkan-drivers-freeworld": "Stock Fedora Mesa strips the patent-encumbered encode entrypoints. Without freeworld, RADV has NO Vulkan encode queue and vulkanh264enc registers but cannot encode.",
+          "mesa-va-drivers-freeworld": "Same, for the VA encode entrypoints (vah264enc/vah264lpenc).",
+          "ddcutil": "Console local-output mode (CM-08).",
+          "hwdata": "Ships /usr/share/hwdata/pci.ids -- the vendor/device id database host-observability GPU model detection falls back to.",
+          "avahi": "Chrome sends .local mDNS ICE candidates; libnice resolves them via getaddrinfo INSIDE this container. The resolver stack is container-local even under network_mode:host, so a host-side avahi never reaches the agent.",
+          "vulkan-tools": "vulkaninfo -- the first diagnostic run on any 'no encoder found' report.",
+          "nftables": "#527: provides the `nft` client the #483 media-reachability readiness check (readiness.rs detect_firewall_posture) uses to read the HOST's firewall posture over the shared (network_mode:host) netlink socket. Without it the runtime image had no firewalld/nft/iptables client at all and the check could only report FirewallPosture::Unknown, never the WARN a filtering host should produce."
+        },
+        "forbidden": [
+          "gcc", "gcc-c++", "cmake", "meson", "ninja-build",
+          "clang", "clang-devel", "llvm-devel",
+          "glib2-devel", "libdrm-devel", "wayland-devel", "libva-devel",
+          "vulkan-headers", "vulkan-loader-devel",
+          "cuda-nvcc", "cuda-cudart-devel", "cuda-nvrtc-devel", "libnpp-devel",
+          "dnf-plugins-core"
+        ],
+        "_forbidden_notes": "The build toolchain must never reach a deployed image. 6.15GB of exactly this list was in production on 2026-07-26 because the build stage forgot --features cuda and the deployment compiled the agent in-container to compensate. dnf-plugins-core is listed because 'dnf builddep' is how the 4.23GB layer got in."
+      },
+
+      "binaries": {
+        "required": [
+          "curl", "gst-inspect-1.0", "gst-launch-1.0",
+          "pulseaudio", "pactl",
+          "avahi-daemon", "weston", "seatd",
+          "docker", "nft",
+          "quasar-node-agent", "quasar-node-agent-entrypoint"
+        ],
+        "_required_notes": {
+          "docker": "Static docker CLI -- the agent launches sibling app containers over the mounted socket.",
+          "nft": "#527: the nftables client readiness.rs's detect_firewall_posture shells out to. See the nftables package note above.",
+          "quasar-node-agent": "The BAKED binary. Its presence is what lets the deployment stop compiling the agent inside the container."
+        },
+        "forbidden": ["cargo", "rustc", "rustup", "cc", "gcc", "meson", "ninja"]
+      },
+
+      "paths": {
+        "required": [
+          "/opt/gst/lib64/gstreamer-1.0",
+          "/opt/gst/lib64/gstreamer-1.0/libgstnvcodec.so",
+          "/usr/local/bin/quasar-node-agent",
+          "/usr/local/bin/quasar-node-agent-entrypoint",
+          "/etc/ld.so.conf.d/gst-vulkan.conf"
+        ],
+        "_required_notes": {
+          "libgstnvcodec.so": "Present in EVERY image on this lineage -- the whole point of the single build graph. On a non-NVIDIA host it loads, warns once about libcuda.so.1, and registers 0 features (asserted below). Its ABSENCE means the builder was run with CUDA_ENABLE=0, which produces an image that cannot serve an NVIDIA host and must not be shipped."
+        },
+        "forbidden": [
+          "/opt/cargo",
+          "/opt/rustup",
+          "/opt/gstreamer-src",
+          "/src/node-agent",
+          "/root/.cache/gstreamer-1.0",
+          "/home/quasar/.cache/gstreamer-1.0"
+        ],
+        "_forbidden_notes": {
+          "/opt/cargo": "1.32GB. Was in production 2026-07-26.",
+          "/opt/rustup": "597MB. Was in production 2026-07-26.",
+          "/root/.cache/gstreamer-1.0": "The stale-registry trap: a registry baked at build time with no GPU makes ElementFactory::find blind to the VA/NV encoder at run time, even though gst-inspect (which force-rescans) shows it. Must be dropped in the final layer."
+        }
+      },
+
+      "env": {
+        "required": [
+          "GST_PLUGIN_PATH=/opt/gst/lib64/gstreamer-1.0",
+          "QUASAR_HEALTH_ADDR",
+          "VK_LOADER_DRIVERS_DISABLE"
+        ],
+        "_required_notes": {
+          "VK_LOADER_DRIVERS_DISABLE": "Must exclude lvp_icd (lavapipe). Without it the Vulkan loader can select the software ICD and the encoder silently disappears."
+        }
+      },
+
+      "gst_elements": {
+        "required": [
+          "waylanddisplaysrc", "kmssink",
+          "interpipesrc", "interpipesink",
+          "webrtcbin", "rtpgccbwe",
+          "rtpbin", "rtprtxsend", "rtpulpfecenc",
+          "nicesrc", "dtlssrtpenc", "sctpenc",
+          "h264parse", "h265parse",
+          "openh264enc",
+          "videotestsrc", "audiotestsrc",
+          "opusenc", "audioconvert", "audioresample",
+          "pulsesrc", "pulsesink", "alsasink",
+          "rtph264pay", "rtpopuspay",
+          "rtpopusdepay", "opusdec"
+        ],
+        "_required_notes": "Device-free elements only -- everything here must register with no GPU attached. rtpgccbwe comes from gst-plugins-rs and is the element most often lost to a wrong 0.13/0.14/0.15 pin. interpipesrc/sink come from the gow gst-interpipe fork. The webrtc transport chain (rtpbin/nicesrc/dtlssrtpenc/sctpenc/rtprtxsend/rtpulpfecenc) is asserted because the published games-on-whales gst-wayland-display images build with -Dauto_features=disabled and lack all of it -- that is why they cannot be used as a base here.",
+        "_audio_note": "pulsesrc/audioconvert/audioresample/alsasink are the CONSOLE local-audio pipeline (node-agent/src/session/pipeline.rs build_local_audio_pipeline), and pulsesrc/opusenc feed the streamed audio PeerConnection. Note that console local audio reads from pulsesrc too -- so the PulseAudio sidecar daemon (the `pulseaudio` package above) is load-bearing for BOTH audio paths, not just streaming. When quasar-nv shipped without the daemon on 2026-07-26, both went silent. rtpopusdepay/opusdec are the microphone RECEIVE path (mic_branch.rs) -- client mic -> pulsesink device=quasar_mic in the sidecar.",
+        "required_with_gpu": ["vulkanh264enc", "vulkanscale"],
+        "_required_with_gpu_notes": "vah264enc/vah264lpenc are NOT asserted here: AMD VCN exposes the regular VAEntrypointEncSlice (vah264enc) while Intel exposes the low-power one (vah264lpenc), so the element name is host-dependent. Assert those per-host with --require-element instead. vulkanscale (added for #501) is the GPU scaler for memory:VulkanImage NV12/P010 frames, built in the Quasar gst-wayland-display fork alongside waylanddisplaysrc -- it is what gives a Vulkan host the external-resolution lever (ScaleStage::supported becomes true only when this factory registers). THIS ASSERTION WILL FAIL until GST_WAYLAND_DISPLAY_REF in deploy/pins.env is bumped to a fork commit that carries the element -- do not relax it to make a build green; bump the pin instead.",
+        "forbidden_without_gpu": ["cudaconvert", "cudascale", "nvh264enc", "nvautogpuh264enc", "nvav1enc"],
+        "_forbidden_without_gpu_notes": "Verified 2026-07-26: with no libcuda.so.1 the nvcodec plugin loads, prints one warning, and registers 0 features. This assertion locks in that graceful degradation -- it is the property that makes ONE build graph safe for both vendors. If this ever fails, an NVIDIA-only element is leaking into vendor-neutral encoder auto-selection."
+      },
+
+      "agent_binary": {
+        "path": "/usr/local/bin/quasar-node-agent",
+        "no_dt_needed": ["libcuda", "libgstcuda", "libnvidia"],
+        "no_unresolved_libs": true,
+        "must_start": true,
+        "_notes": "Verified 2026-07-26 on the live CUDA-built binary: readelf -d shows DT_NEEDED for glib/gst/asound/libc only. libgstcuda-1.0.so itself carries no libcuda DT_NEEDED -- it dlopens. So a --features cuda binary links and starts cleanly on a driver-less host, which is what lets ONE binary serve both vendors. must_start accepts the config-validation exit ('CONTROL_PLANE_URL is required') as success: reaching config validation proves process start and dynamic linking both succeeded."
+      },
+
+      "image_config": {
+        "entrypoint_or_cmd_contains": "quasar-node-agent",
+        "healthcheck_required": true
+      },
+
+      "labels": {
+        "required": [
+          "org.quasar.image.role",
+          "org.quasar.pins.gwd",
+          "org.quasar.pins.gst",
+          "org.quasar.pins.plugins-rs",
+          "org.quasar.pins.base",
+          "org.quasar.source.commit",
+          "org.quasar.built.at"
+        ],
+        "_notes": "Provenance. Without these, an image pulled from GHCR or built on another box is opaque and `qimg status` cannot say which pins produced it — which is how Tower and hermes drifted under one tag undetected (2026-07-26). The build report is the richer local record; these labels are what make ANY image self-describing."
+      }
+    },
+
+    "_retired_nv_role": "The 'nv' role (quasar-nv) was removed on 2026-08-26 by #545, which retired the separate NVIDIA lineage rather than renaming it. quasar-node-agent (role 'runtime') is now the universal agent image and is what an NVIDIA host runs; the CUDA userspace that lineage existed to carry is fetched at run time into the driver volume (node-agent/src/cuda_runtime.rs). This is a role REMOVAL, not a relaxed assertion: nothing the runtime role promises was weakened, and the runtime role has always been validated on NVIDIA hardware too. Four lessons that lived in the deleted role are recorded here so they are not re-learned. (1) THE UNVERSIONED SYMLINK: gst-cuda dlopens libnvrtc.so by unversioned name and NVIDIA ships only .so.<ver>; without that link NVRTC silently fails to load, cudaconvert is skipped at plugin registration, and an AV1/NVENC session dies with 'cudaconvert not found' (the trap Dockerfile.nv documented and #384 rediscovered). The link is now made by cuda_runtime::link_unversioned and is asserted by its unit tests, since no image contains the library any more. (2) LIBNPP WAS NEVER NEEDED: this role required libnpp-13-2 (161MB, its largest package) on the stated belief that cudaconvert uses NPP for colour conversion. Measured false on 2026-08-20 -- no libnpp string, no NPP API symbol and no NPP DT_NEEDED anywhere in /opt/gst or the agent binary; upstream gst-plugins-bad compiles those kernels with NVRTC and the NPP converters are DeepStream. libcudart was the same kind of dead weight and went with it. Neither is fetched at run time either. (3) NEVER A PARALLEL PACKAGE LIST: this role inherited every runtime assertion, which is the structural fix for the 2026-07-26 divergence where a hand-copied package list silently lost pulseaudio and every Tower session ran with silent audio. With one lineage there is nothing left to diverge. (4) NVIDIA-ONLY ELEMENT ASSERTIONS (nvautogpuh264enc, nvav1enc, cudaconvert, cudascale) are host-dependent, not role-dependent -- the runtime role is validated on AMD and Intel hosts too, where they are correctly absent. Assert them on an NVIDIA host with `deploy/validate-image.sh --gpu --require-element nvav1enc ...`, the same way vah264enc/vah264lpenc are already handled. nvav1enc in particular is the AV1 path whenever the Vulkan AV1 encoder is unavailable, and its absence is exactly how Tower lost AV1 (#384). NOTE that cudaconvert/cudascale now register only once the agent has provisioned NVRTC into the driver volume, so a freshly-built image on a fresh host does not have them until the first agent start completes.",
+
+    "dev": {
+      "_role": "Build/test environment ONLY. Never deployed as a node-agent. Carries the full toolchain by design.",
+      "size_max_mb": 11500,
+      "_size_note": "Measured 8.73GB on Tower 2026-07-26 when built with CUDA_ENABLE=0. Once the builder is always CUDA-enabled (spec 4.3) this stage inherits the CUDA toolkit too, so the ceiling allows for that. Re-measure on the first build-images.sh run and tighten.",
+      "packages": {
+        "required": ["gcc", "cmake", "meson", "ninja-build", "clang", "weston"],
+        "forbidden": []
+      },
+      "binaries": {
+        "required": ["cargo", "rustc", "gst-inspect-1.0", "gst-launch-1.0", "weston-terminal"],
+        "forbidden": []
+      },
+      "paths": {
+        "required": ["/opt/cargo", "/opt/rustup", "/opt/gst/lib64/gstreamer-1.0"],
+        "forbidden": []
+      },
+      "gst_elements": {
+        "required": ["waylanddisplaysrc", "kmssink", "interpipesrc", "webrtcbin", "rtpgccbwe", "videotestsrc", "waylandsink"]
+      },
+      "_deployment_ban": "not_a_runtime_role",
+      "_deployment_ban_note": "build-images.sh refuses to write the quasar-node-agent or quasar-nv tag from this role."
+    },
+
+    "control": {
+      "_role": "Control-plane production image (Dockerfile.control.prod). Static Go binary + embedded web SPA on quasar-base.",
+      "size_max_mb": 400,
+      "_size_note": "PROVISIONAL -- measure on first run of build-images.sh and tighten. Node and Go are build-only stages and must not ship.",
+      "packages": {
+        "required": ["ca-certificates", "curl"],
+        "forbidden": ["golang", "nodejs", "npm", "gcc"]
+      },
+      "binaries": {
+        "required": ["curl"],
+        "forbidden": ["go", "node", "npm", "cargo", "gcc"]
+      },
+      "paths": {
+        "forbidden": ["/root/.npm", "/go", "/usr/local/go"]
+      },
+      "image_config": {
+        "healthcheck_required": true,
+        "must_not_run_as_root": true
+      }
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "session": {
+    "id": "defecc13-a690-4687-95dd-3c7ddc0b1d69",
+    "state": "running",
+    "app_id": "e808ef43-0000-0000-0000-000000000001",
+    "host_id": "741dc00a-0000-0000-0000-000000000002",
+    "stream": {
+      "width": 1920,
+      "height": 1080,
+      "fps": 60,
+      "bitrate_kbps": 15000,
+      "codec": "h264",
+      "h264_profile": "main",
+      "external_width": 1920,
+      "external_height": 1080,
+      "external_resize_supported": true,
+      "rungs": [
+        [
+          1920,
+          1080
+        ],
+        [
+          1600,
+          900
+        ],
+        [
+          1280,
+          720
+        ]
+      ]
+    }
+  }
+}

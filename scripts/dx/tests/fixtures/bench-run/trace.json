@@ -1,0 +1,56 @@
+{
+  "clock": {
+    "client_offset_ms": 2,
+    "uncertainty_ms": 1
+  },
+  "events": [
+    {
+      "payload": {
+        "from": 120,
+        "reason": "engage",
+        "rung": "fps",
+        "setpoint_kbps": 4400,
+        "to": 60
+      },
+      "source": "agent",
+      "ts_unix_ms": 1786940042000,
+      "type": "abr.ladder.step"
+    },
+    {
+      "payload": {
+        "from": 0,
+        "reason": "engage",
+        "rung": "resolution",
+        "setpoint_kbps": 2520,
+        "to": 1
+      },
+      "source": "agent",
+      "ts_unix_ms": 1786940055000,
+      "type": "abr.ladder.step"
+    },
+    {
+      "payload": {
+        "from": 1,
+        "reason": "recover",
+        "rung": "resolution",
+        "setpoint_kbps": 11500,
+        "to": 0
+      },
+      "source": "agent",
+      "ts_unix_ms": 1786940150000,
+      "type": "abr.ladder.step"
+    },
+    {
+      "payload": {},
+      "source": "browser",
+      "ts_unix_ms": 1786940090000,
+      "type": "client.freeze_detected"
+    }
+  ],
+  "series": {},
+  "session_id": "11111111-2222-3333-4444-555555555555",
+  "window": {
+    "from_ms": 1786940000000,
+    "to_ms": 1786940180000
+  }
+}

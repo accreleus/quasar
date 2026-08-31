@@ -1,0 +1,121 @@
+---
+title: Behind a reverse proxy
+description: Running the control plane behind Caddy or your own proxy, and the two settings that make signaling work.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+You might want a proxy for a real certificate on a public name, to put Quasar on
+port 443 alongside other services, or to bring it under an existing ingress.
+
+The control plane proxies fine. The media path does not go through the proxy at
+all, so read
+[Reaching Quasar remotely](/quasar/network/remote-access/) before assuming this
+gets you internet play.
+
+## The shipped option
+
+There is a hardened Compose overlay that puts Caddy in front and handles the
+whole arrangement:
+
+```bash
+docker compose -f deploy/docker-compose.yml \
+               -f deploy/docker-compose.hardened.yml up -d
+```
+
+Add `-f deploy/docker-compose.nvidia.yml` before the hardened overlay on an
+NVIDIA host. Set `QUASAR_PUBLIC_HOST` in `deploy/.env`; the overlay requires it
+and derives the public URL and origin configuration from that hostname.
+
+That overlay does several things together. Caddy listens on 443 and gets
+certificates automatically through ACME. The control plane stops publishing its
+own ports and is reachable only on the Docker bridge. `QUASAR_ALLOWED_ORIGINS`
+and `PUBLIC_BASE_URL` are derived from the public hostname you configure. The
+deployment is marked as production, which makes the control plane refuse to boot
+if a development authentication bypass is enabled.
+
+Set your public hostname and let the overlay do the rest.
+
+## Your own proxy
+
+If you are using an existing nginx, Traefik or Caddy, the public URL, origin
+policy, and trusted-proxy boundary need to be right.
+
+### PUBLIC_BASE_URL
+
+```bash
+PUBLIC_BASE_URL=https://quasar.example.com
+```
+
+Without this, Quasar builds URLs from what its own listener sees. Invite links
+point at an internal address, and the signaling address handed to the browser
+points at a listener the browser cannot reach.
+
+### Allowed origins
+
+```bash
+QUASAR_ALLOWED_ORIGINS=https://quasar.example.com
+```
+
+This gates the signaling WebSocket. Manage the list under Admin, Settings and
+leave `QUASAR_ALLOWED_ORIGINS` unset, or set the environment variable as an
+authoritative override. Unset with no saved list means same-origin only, which
+is correct for a direct deployment and for a proxy that preserves the public
+host consistently.
+
+A proxy that rewrites `Host`, or users who reach the same instance through
+several names, may need an explicit list. Admin's access check reports which
+source is active.
+
+The failure mode is unhelpful: the browser cannot tell the difference between
+this and any other connection failure, so you get a session that never starts and
+no clear reason.
+
+Rules for the value:
+
+- Comma-separated, exact `scheme://host[:port]` entries.
+- No path, no query, no credentials.
+- `*` is rejected outright.
+- A malformed entry stops the control plane from starting.
+
+### QUASAR_TRUSTED_PROXIES
+
+Only trust forwarded client-address headers from proxies you operate. Set
+`QUASAR_TRUSTED_PROXIES` to the proxy network or address. With the bundled Caddy
+stack, use that Compose project's specific bridge subnet, not the broad Docker
+private-address range. Empty is safe: forwarded addresses are ignored and the
+direct peer is used for rate limiting and logs.
+
+<Aside type="caution" title="Keep your LAN origins in the list">
+Adding a public name and replacing the list rather than extending it breaks
+direct access at `https://<lan-ip>:8443`. List every origin people actually use.
+</Aside>
+
+## Proxy requirements
+
+**WebSocket upgrade.** Both `/v1/signal` and `/agent/ws` are WebSockets. A proxy
+that does not forward upgrade headers breaks signaling entirely.
+
+**No aggressive buffering** on those paths.
+
+**A generous read timeout.** These connections are long-lived. A proxy that
+closes idle connections after 60 seconds will cut sessions.
+
+**Forwarded protocol headers.** Send `X-Forwarded-Proto` so Quasar can tell it is
+being fronted and does not try to redirect a request that already arrived over
+HTTPS.
+
+## What not to proxy
+
+Node agents connect to the control plane over `/agent/ws` on plain HTTP, and
+`/health` is deliberately exempt from the HTTPS redirect so healthchecks work.
+
+If the agents are on the same machine or the same trusted network, point them at
+the control plane's direct address rather than through the proxy. Fewer moving
+parts in the path that keeps your fleet registered is a good thing.
+
+## Checking it worked
+
+Log in from outside, open the library, launch something. If login works and the
+session never starts, the origin setting is the first thing to check, then
+whether the client can route directly to the GPU host.

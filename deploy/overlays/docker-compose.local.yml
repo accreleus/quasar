@@ -1,0 +1,100 @@
+# deploy/overlays/docker-compose.local.yml — AGENTLESS local stack for UI / API loops.
+#
+#   make up          (scripts/dx/stack.sh, which supplies -p $QUASAR_INSTANCE
+#                     and the DX_*_PORT values derived from the worktree path)
+#
+# What this is FOR: iterating on web/ and control-plane/ on a laptop. Postgres +
+# control-plane + the built SPA, nothing else.
+#
+# What this is NOT: a streaming stack. There is deliberately NO node-agent here.
+# The agent needs network_mode: host for WebRTC ICE, which Docker Desktop on
+# macOS/Windows cannot provide, plus a GPU. Sessions are exercised on Tower.
+# For the real single-host stack use deploy/docker-compose.yml; for the fleet
+# use docker-compose.yml + docker-compose.nvidia.yml.
+#
+# Ports are parameterized, never fixed: two worktrees run this simultaneously
+# and must not collide (the generalized fix for #398). Defaults below are only
+# a fallback for a hand-typed `docker compose -f` invocation.
+#
+# The project name (-p) scopes the container names AND the named volumes, so a
+# `make reset CONFIRM=reset-data` in one worktree cannot touch another's data.
+
+services:
+
+  # ── Postgres ────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: quasar
+      POSTGRES_USER: ${POSTGRES_USER:-quasar}
+      # Local-only placeholder. This stack is bound to 127.0.0.1 and holds no
+      # real data; override in the environment if you care.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quasar-local-dev}
+    ports:
+      - "127.0.0.1:${DX_PG_PORT:-25432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-quasar} -d quasar"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  # ── Control-plane ───────────────────────────────────────────────────────────
+  # Same Dockerfile as the production stack (deploy/Dockerfile.control): a
+  # golang build stage plus a slim runtime. The binary embeds its migrations and
+  # self-migrates on boot, so wiring DATABASE_URL is all that is required.
+  control-plane:
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile.control
+    ports:
+      - "127.0.0.1:${DX_CP_PORT:-28080}:8080"
+      - "127.0.0.1:${DX_CP_TLS_PORT:-28443}:8443"
+    environment:
+      DATABASE_URL: >-
+        postgres://${POSTGRES_USER:-quasar}:${POSTGRES_PASSWORD:-quasar-local-dev}@postgres:5432/quasar?sslmode=disable
+      LISTEN_ADDR: ":8080"
+      # TLS defaults OFF here (the production stack defaults to auto/self-signed).
+      # http://localhost is already a secure browser context, so Keyboard Lock and
+      # the Gamepad API work without a cert warning on every fresh worktree.
+      QUASAR_TLS: ${QUASAR_TLS:-off}
+      QUASAR_HTTP_REDIRECT: ${QUASAR_HTTP_REDIRECT:-off}
+      # No node-agent enrolls against this stack; the value is inert.
+      ENROLLMENT_TOKEN: ${ENROLLMENT_TOKEN:-local-dev-no-agent}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      AUTH_TOKEN_TTL: ${AUTH_TOKEN_TTL:-24h}
+      # Dev-only agent auth (#399) — same passthrough as docker-compose.yml:
+      # without it an ambient QUASAR_DEV_AGENT_AUTH=1 is silently inert and
+      # `make ui-audit`/`make agent-creds` cannot mint against a local stack.
+      QUASAR_DEV_AGENT_AUTH: ${QUASAR_DEV_AGENT_AUTH:-}
+      # First-admin bootstrap: idempotent, no-op once an admin exists. Set these
+      # so a fresh local DB is immediately usable in the admin UI.
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@local.test}
+      BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-admin}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-local-dev-admin}
+      # The SPA is served by the control-plane from this path.
+      QUASAR_WEB_ROOT: /app/web
+      GOMEMLIMIT: ${GOMEMLIMIT:-1GiB}
+    volumes:
+      # Pre-build with: cd web && npm install && npm run build
+      # NOTE (#131): a from-scratch `rm -rf dist` rebuild swaps the directory
+      # inode and this container serves 404 for / until it is restarted —
+      # `make restart` after a scratch web rebuild.
+      - ../../web/dist:/app/web:ro
+      - control-data:/var/lib/quasar-control
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO /dev/null http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  control-data:

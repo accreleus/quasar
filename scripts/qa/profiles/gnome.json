@@ -1,0 +1,50 @@
+{
+  "name": "gnome",
+  "description": "GNOME desktop image: Shell session, top bar + Activities overview.",
+  "app": "GNOME",
+  "session_profile_id": "1080p60",
+  "runs": 2,
+  "session_container_match": "gnome",
+  "gates": {
+    "launch": {
+      "min_fps": 55,
+      "min_luma": 20,
+      "first_content_s": [5, 60]
+    },
+    "oracle": {
+      "label": "gnome-shell",
+      "expect": "GNOME Shell with the top bar drawn",
+      "rules_out": "gnome-shell falling back to a blank/failsafe session",
+      "matcher": null
+    },
+    "input": {
+      "settle": { "frames": 3, "tolerance_pct": 1.0, "timeout_s": 120 },
+      "delta_threshold_pct": 3.0,
+      "region": [0.0, 0.0, 1.0, 1.0],
+      "devices": {
+        "mouse": {
+          "stimuli": [
+            { "t": "ma", "x": 0.5, "y": 0.5 },
+            { "t": "mm", "dx": 20, "dy": 12, "repeat": 10 }
+          ],
+          "settle_ms": 900
+        },
+        "keyboard": {
+          "stimuli": [
+            { "t": "k", "code": 125 }
+          ],
+          "settle_ms": 1200
+        }
+      }
+    },
+    "shutdown": {
+      "budget_s": 12.0,
+      "expect_exit": 143,
+      "require_logs": ["shutdown requested"],
+      "forbid_logs": ["SIGKILL backstop"]
+    }
+  },
+  "notes": [
+    "The keyboard stimulus is Super (evdev 125), which opens the Activities overview — a whole-screen change, hence the full-frame region. GNOME's shutdown budget is deliberately looser than XFCE's."
+  ]
+}

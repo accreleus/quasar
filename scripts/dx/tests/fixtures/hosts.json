@@ -1,0 +1,23 @@
+{
+  "_comment": "Test fixture ONLY — scripts/dx/tests/run.sh points DX_HOSTS_JSON here so the DX self-suite never depends on the real operator config. Schema mirrors .claude/skills/_shared/hosts.example.json.",
+  "_schema": "quasar-skills/hosts@2",
+
+  "roles": {
+    "gpu-test": "keybox",
+    "aux-infra": "aliasbox"
+  },
+
+  "hosts": {
+    "keybox": {
+      "ssh_host": "203.0.113.5",
+      "ssh_user": "root",
+      "ssh_key": "~/.ssh/keybox_test",
+      "dir": "/srv/quasar-keybox",
+      "compose_files": ["deploy/docker-compose.yml", "deploy/docker-compose.nvidia.yml"]
+    },
+    "aliasbox": {
+      "ssh_alias": "aliasbox-ssh",
+      "dir": "/srv/quasar-aliasbox"
+    }
+  }
+}

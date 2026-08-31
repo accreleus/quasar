@@ -1,0 +1,96 @@
+---
+title: Experimental options
+description: Forward error correction, intra refresh, and opt-in ABR resolution and frame-rate rungs.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Everything on this page changes a path that is off by default. Read its limits
+before turning it on.
+
+## Forward error correction
+
+FEC adds redundancy so a receiver can reconstruct lost packets without asking for
+a retransmission. On a lossy wireless link this sounds exactly like what you
+want.
+
+<Aside type="danger" title="Do not enable FEC for browser clients">
+Chrome's H.264 decoder needs contiguous RTP sequence numbers. The FEC scheme
+available here shares the sequence number space with media, which produces gaps
+the decoder reacts to by demanding keyframes, repeatedly. The result is a
+keyframe storm that is far worse than the packet loss it was meant to fix.
+
+This is an upstream Chromium behaviour. The alternative scheme that would avoid
+it is not viable here. The conclusion from the investigation was: no FEC for
+browser clients, and revisit it for a native client.
+</Aside>
+
+The settings exist and are documented for completeness:
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `QUASAR_FEC_MODE` | derived | `off`, `fixed` or `auto`. |
+| `QUASAR_FEC_PERCENTAGE` | `0` | Redundancy percentage in fixed mode. |
+
+An `auto` mode exists that negotiates FEC at zero percent up front and ramps it
+only when it observes loss, then unwinds when the link is clean again. It is the
+least bad way to use FEC if you are going to. It is still not recommended for
+browsers.
+
+FEC also competes with your video for bitrate, because the congestion controller
+sees the combined total.
+
+## Intra refresh
+
+Instead of periodic full keyframes, intra refresh sends a rolling wave of
+intra-coded blocks. Recovery from packet loss is then bounded by one refresh
+cycle rather than by waiting for the next keyframe, and the periodic bitrate
+spike that a keyframe causes goes away.
+
+```bash
+QUASAR_INTRA_REFRESH=1
+QUASAR_INTRA_REFRESH_PERIOD=60
+```
+
+A period of 60 is the validated setting. It matched continuous refresh for loss
+recovery at lower bandwidth cost. `0` means continuous.
+
+Constraints:
+
+- **Vulkan encoder only.** `QUASAR_ENCODER=vulkan` is required.
+- **A patched image is required.** On stock GStreamer the property does not exist
+  and the agent silently does nothing.
+- **H.264 only.** HEVC and AV1 ignore it, with a warning.
+- Pair it with more than one slice. The refresh cycle length follows the
+  effective slice count.
+
+Measured behaviour on an impaired link: zero visible hitches across the tested
+network shapes, where the same test with refresh off produced stalls under loss.
+
+## Resolution and frame-rate ABR rungs
+
+`QUASAR_ABR_LADDER_RESOLUTION` and `QUASAR_ABR_LADDER_FPS` are shipped and
+actuated, but default off while they accumulate broader hardware validation.
+They require `QUASAR_ABR_MODE=smooth` and apply to the next session. See
+[Adaptive bitrate](/quasar/tuning/adaptive-bitrate/) for the codec and launch
+rate limits.
+
+## Things that look like knobs and are not
+
+**`apps.default_vram_mb`** is deprecated. It was never enforceable, because there
+is no VRAM cgroup controller, and live telemetry replaced it.
+
+**The in-compositor NV12 mode** was removed. It was an alternative to the current
+zero-copy path, it was not a win, and it blocked a compositor upgrade.
+
+**A native client** does not exist in a usable form. Work is under way in a
+separate repository.
+
+## Before you change anything
+
+Take a measurement first, change one thing, measure again. Every default here
+came from a measured comparison, and the differences involved are frequently
+smaller than the run-to-run variation you get from not controlling the test.
+
+[Diagnostics](/quasar/operations/diagnostics/) covers how to take a comparable
+measurement.

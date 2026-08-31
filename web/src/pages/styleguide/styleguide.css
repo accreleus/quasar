@@ -1,0 +1,184 @@
+/*
+ * /styleguide — page-scoped layout styles. These classes are ONLY used by
+ * StyleguidePage.tsx and its styleguide/*.tsx sections; every visible
+ * component's own look comes from primitives.css, not from here.
+ */
+
+/* ── Page shell ─────────────────────────────────────────── */
+.sg-page {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: var(--page-pad);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--t-base);
+}
+
+/* ── Hero ───────────────────────────────────────────────── */
+.sg-hero {
+  position: relative;
+  border-radius: var(--r-feature);
+  overflow: hidden;
+  border: 1px solid var(--line-2);
+  background:
+    radial-gradient(120% 140% at 85% -20%, var(--accent-soft), transparent 55%),
+    var(--surf-chrome);
+  padding: 52px 44px;
+  margin-bottom: var(--s9);
+}
+.sg-hero .sg-qmark {
+  width: 72px;
+  height: 72px;
+  margin-bottom: 22px;
+  display: block;
+}
+.sg-hero h1 {
+  font-size: 3.2rem;
+  letter-spacing: -0.03em;
+  margin: 0;
+}
+.sg-hero .sg-lede {
+  color: var(--text-2);
+  max-width: 560px;
+  margin-top: 12px;
+  font-size: var(--t-lg);
+  margin-bottom: 0;
+}
+
+/* ── Density / theme toggles bar ───────────────────────── */
+.sg-controls {
+  display: flex;
+  gap: var(--s4);
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: var(--s10);
+}
+.sg-controls-label {
+  font-size: var(--t-xs);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-4);
+  font-weight: 700;
+  margin-right: var(--s2);
+}
+
+/* ── Block (top-level section) ──────────────────────────── */
+.sg-block {
+  margin-bottom: var(--s10);
+}
+.sg-block > h2 {
+  margin-bottom: 6px;
+}
+.sg-block > .sg-desc {
+  color: var(--text-3);
+  margin-bottom: var(--s6);
+  max-width: 640px;
+}
+
+/* ── Comp-label (sub-section eyebrow) ───────────────────── */
+.sg-comp-label {
+  font-size: var(--t-xs);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-4);
+  font-weight: 700;
+  margin-bottom: 14px;
+}
+
+/* ── Comp-block (sub-section group) ─────────────────────── */
+.sg-comp-block {
+  margin-bottom: var(--s7);
+}
+
+/* ── Specimen card ───────────────────────────────────────── */
+.sg-specimen {
+  border: 1px solid var(--line);
+  border-radius: var(--r-panel);
+  background: var(--surf-chrome);
+  padding: var(--s6);
+}
+
+/* ── Specimen row ────────────────────────────────────────── */
+.sg-specimen-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s4);
+  align-items: center;
+}
+
+/* ── Color/token swatches ────────────────────────────────── */
+.sg-sw {
+  border: 1px solid var(--line);
+  border-radius: var(--r-panel);
+  overflow: hidden;
+  background: var(--surf-panel);
+}
+.sg-sw .sg-chip-color {
+  height: 74px;
+}
+.sg-sw .sg-meta {
+  padding: 10px 12px;
+}
+.sg-sw .sg-nm {
+  font-weight: 600;
+  font-size: var(--t-sm);
+}
+.sg-sw .sg-tok {
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  color: var(--text-3);
+  margin-top: 2px;
+}
+.sg-sw .sg-hex {
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  color: var(--text-4);
+  margin-top: 2px;
+  overflow-wrap: break-word;
+}
+
+/* ── Typography specimen ─────────────────────────────────── */
+.sg-type-row {
+  display: flex;
+  align-items: baseline;
+  gap: 20px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--line);
+}
+.sg-type-row:last-child {
+  border-bottom: 0;
+}
+.sg-type-row .sg-tag {
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  color: var(--text-3);
+  width: 130px;
+  flex: none;
+}
+
+/* ── Spacing scale ───────────────────────────────────────── */
+.sg-scale-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+.sg-scale-box {
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-soft-2);
+  border-radius: var(--r-control);
+}
+
+/* ── Misc small label ────────────────────────────────────── */
+.sg-lbl-sm {
+  font-size: var(--t-xs);
+  color: var(--text-3);
+  margin-top: 10px;
+  font-family: var(--font-mono);
+}
+
+/* ── Auto grid ───────────────────────────────────────────── */
+.sg-grid {
+  display: grid;
+  gap: var(--s4);
+}

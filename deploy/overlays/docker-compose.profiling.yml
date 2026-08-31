@@ -1,0 +1,52 @@
+# PROF-02 (#389) — node-agent profiling overlay.
+#
+# Swaps the node-agent for the quasar-profiling image (the agent rebuilt under
+# [profile.profiling]: release codegen + line tables + frame pointers, plus samply)
+# and grants the two permissions perf_event_open needs. Apply it LAST, on top of
+# whichever stack the host normally runs:
+#
+#   Tower (NVENC/Vulkan):
+#     QUASAR_PROFILING_IMAGE=quasar-profiling:<tag> \
+#     docker compose -f docker-compose.yml -f docker-compose.nvidia.yml \
+#                    -f docker-compose.profiling.yml up -d quasar-node-agent
+#
+#   hermes (AMD/VA):
+#     QUASAR_PROFILING_IMAGE=quasar-profiling:<tag> \
+#     docker compose -f docker-compose.yml -f docker-compose.profiling.yml up -d quasar-node-agent
+#
+# THIS IS NOT A DEPLOYMENT OVERLAY. The image it selects is unvalidated by
+# deploy/image-contract.json by design and is never promoted to :latest. Put the host
+# back on its normal stack when the capture is done — `docker compose -f <normal chain>
+# up -d --force-recreate quasar-node-agent`.
+#
+# Capture recipe, including what to do when perf_event_open still fails:
+# docs/profiling-rust.md
+#
+# MEMORY (#419), not CPU: this overlay inherits the base compose's environment, so the
+# allocator A/B knobs (MALLOC_ARENA_MAX, MALLOC_TRIM_THRESHOLD_, MALLOC_MMAP_THRESHOLD_,
+# QUASAR_MALLOC_TRIM) are already passed through here — no addition needed, just set them
+# in the shell or deploy/.env. Attaching gdb for a live `malloc_info` dump additionally
+# needs `cap_add: [SYS_PTRACE]`; it is deliberately NOT added by default because the CPU
+# capture this overlay exists for does not need it. See the "#419" section of
+# docs/profiling-rust.md.
+services:
+  quasar-node-agent:
+    # No default: an operator who forgets the tag gets told, rather than silently
+    # profiling whatever `quasar-profiling` happened to resolve to. There is no
+    # :latest for this image on purpose.
+    image: ${QUASAR_PROFILING_IMAGE:?Set QUASAR_PROFILING_IMAGE=quasar-profiling:<dated-tag> — this image is never tagged :latest}
+
+    # BOTH of these are required, and the seccomp one is the non-obvious half.
+    #
+    # Docker's DEFAULT seccomp profile denies the perf_event_open syscall outright, at
+    # the syscall filter, BEFORE any capability check runs. So a container can hold
+    # CAP_SYS_ADMIN (Tower's agent already does) and every profiler in it will still
+    # fail with EPERM. Capabilities cannot buy their way past a seccomp deny.
+    #
+    # CAP_PERFMON is then what satisfies the kernel's own perf_event_paranoid gate:
+    # perfmon_capable() short-circuits it, so the host sysctl stops mattering. Prefer
+    # PERFMON over SYS_ADMIN — it is the narrow capability that exists for exactly this.
+    security_opt:
+      - seccomp:unconfined
+    cap_add:
+      - PERFMON

@@ -1,0 +1,1 @@
+{"kind": "step", "idx": 1, "total": 1, "profile": "observe", "target": [1920, 1080], "label": "observe (no patches)", "observed_only": true, "t0_unix_ms": 1786940000000, "dwell_s": 180.0}

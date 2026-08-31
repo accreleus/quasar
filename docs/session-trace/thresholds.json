@@ -1,0 +1,265 @@
+{
+  "version": "2026-08-23.4",
+  "_readme": [
+    "The one golden threshold file. Every number below was hard-coded in exactly one",
+    "consumer before ST-09; the same number now lives here once and each consumer is",
+    "checked against it by a drift test (Go: control-plane/internal/session/",
+    "verdict_thresholds_test.go; web: web/src/webrtc/thresholds.test.ts).",
+    "",
+    "This file is the SPEC, the code is the copy. Changing a number here without",
+    "changing the consumer fails the drift test, which is the point: a threshold that",
+    "moves silently is how five vocabularies of 'is this healthy' drifted apart.",
+    "",
+    "`version` is what a Verdict reports as `thresholds_version`. Bump it whenever any",
+    "value changes, so a stored verdict can be read against the thresholds it was",
+    "computed under."
+  ],
+  "thresholds": {
+    "classifier.hitch_sd_ms": {
+      "value": 18,
+      "unit": "ms",
+      "why": "Present-interval sigma at or above this is a hitch. AS-04: clean paths sit at 2-10 ms and the 0.5% loss condition drove sigma to 27-32 ms, so 18 sits above clean and below loss.",
+      "consumer": "control-plane/internal/session/verdict_thresholds.go (computeDerivedWindows hitches)"
+    },
+    "classifier.encoder_ceiling_ms": {
+      "value": 16,
+      "unit": "ms",
+      "why": "One frame at 60 fps is 16.7 ms; an encode p95 at or above 16 ms means the encoder has no headroom left at the reference frame rate.",
+      "consumer": "control-plane/internal/session/verdict_thresholds.go (encoder_saturation window)"
+    },
+    "classifier.congestion_loss_delta": {
+      "value": 5,
+      "unit": "count",
+      "why": "Packets lost across the window must climb by more than a handful before loss is called congestion rather than noise.",
+      "consumer": "control-plane/internal/session/verdict_thresholds.go (likely_network_congestion window)"
+    },
+    "classifier.congestion_rtt_p95_ms": {
+      "value": 50,
+      "unit": "ms",
+      "why": "Loss alone can be a lossy-but-short link; congestion is loss AND a queue, and a p95 RTT over 50 ms on the paths this serves means a queue.",
+      "consumer": "control-plane/internal/session/verdict_thresholds.go (likely_network_congestion window)"
+    },
+    "classifier.min_host_fps": {
+      "value": 50,
+      "unit": "fps",
+      "why": "p10 of host encoder fps at or above this is 'steady'. Below it the host is the suspect, so the client-presentation and nominal verdicts both refuse to fire.",
+      "consumer": "control-plane/internal/session/verdict_thresholds.go (classify)"
+    },
+    "classifier.hitch_min_samples": {
+      "value": 2,
+      "unit": "count",
+      "why": "How many present-interval sigma samples must reach hitch_sd_ms before the window is a hitch. The rule used to be a MAX: on 2026-08-23 a healthy 300 s session flipped to likely_client_presentation_limit on ONE sample of 18.058 out of 54. Two is the smallest number that makes the claim about the window rather than about one sample.",
+      "consumer": "control-plane/internal/session/verdict_thresholds.go (computeDerivedWindows hitches, count_ge_threshold falsifier)"
+    },
+    "classifier.warmup_exclude_s": {
+      "value": 20,
+      "unit": "s",
+      "why": "Seconds after a session reaches RUNNING whose samples are excluded from hitch detection and the encoder.fps floor. The first seconds judder and under-run by construction (pipeline filling, receiver buffer inflating, encoder ramping); inside a 300 s window they otherwise sit as permanent unsatisfied falsifiers for the rest of the session. Reported as window.warmup_excluded_ms so the exclusion is visible.",
+      "consumer": "control-plane/internal/session/verdict_thresholds.go (aligned.go warmupFor)"
+    },
+    "agent.encoder_stall_ms": {
+      "value": 1000,
+      "unit": "ms",
+      "why": "Encoder OUTPUT silence at or above this, while INPUT keeps arriving, is a stall. One second is ~60 frames at 60 fps and ~17x the drop-timeout's per-frame reasoning (500 ms, which asks 'did THIS frame produce output') — this asks 'has the encoder stopped'. Before candidate 8 there was no encoder.stall event, metric or counter at all: interpipe_queue_level_max was the nearest signal, and a 2026-08-22 investigation read a peer-rejected HEVC m-line as a ring stall for hours.",
+      "consumer": "node-agent/src/session/encoder_stall.rs (ENCODER_STALL_MS; drift test encoder_stall::tests::constant_matches_the_threshold_manifest)"
+    },
+    "health.network_degrading_after_s": {
+      "value": 30,
+      "unit": "s",
+      "why": "How long ABR must sit at or below the profile floor before the session's health state says the network is degrading, rather than reacting to one bad window.",
+      "consumer": "control-plane/internal/session/health.go (Evaluate)"
+    },
+    "health.abr_at_floor_after_s": {
+      "value": 90,
+      "unit": "s",
+      "why": "Sustained at the floor: quality cannot drop further within this profile, so say so rather than keep promising improvement.",
+      "consumer": "control-plane/internal/session/health.go (Evaluate)"
+    },
+    "health.unsustainable_after_s": {
+      "value": 180,
+      "unit": "s",
+      "why": "Three minutes pinned at the floor is a profile the network cannot carry; this is the only health threshold that fails a session.",
+      "consumer": "control-plane/internal/session/health.go (Evaluate)"
+    },
+    "client_health.degrade_sustain_s": {
+      "value": 20,
+      "unit": "s",
+      "why": "A client-reported degradation must persist this long before it moves the session's health state \u2014 one bad 1 s sample is not a device verdict.",
+      "consumer": "control-plane/internal/session/client_health.go (evaluateClientHealthSample)"
+    },
+    "client_health.smooth_sustain_s": {
+      "value": 30,
+      "unit": "s",
+      "why": "Recovery is slower to believe than degradation (30 s vs 20 s): clearing back to healthy on a brief calm patch would flap the banner.",
+      "consumer": "control-plane/internal/session/client_health.go (evaluateClientHealthSample)"
+    },
+    "web.client_health.present_sd_degraded_ms": {
+      "value": 28,
+      "unit": "ms",
+      "why": "Deliberately well over the AS-05 controller's DEGRADED_SD_MS (18): the playout controller reacts at 18, the CLIENT HEALTH class only blames the device once the buffer's own remedy has demonstrably failed.",
+      "consumer": "web/src/webrtc/thresholds.ts -> clientHealth.ts"
+    },
+    "web.client_health.present_p95_degraded_ms": {
+      "value": 45,
+      "unit": "ms",
+      "why": "A sustained long-frame tail; sigma can stay modest while p95 shows repeated doubled frames.",
+      "consumer": "web/src/webrtc/thresholds.ts -> clientHealth.ts"
+    },
+    "web.client_health.freeze_degraded_count": {
+      "value": 2,
+      "unit": "count",
+      "why": "One freeze in a window is a blip; two is a pattern.",
+      "consumer": "web/src/webrtc/thresholds.ts -> clientHealth.ts"
+    },
+    "web.client_health.decode_budget_fraction": {
+      "value": 0.85,
+      "unit": "fraction",
+      "why": "Decode time at 85% of the per-frame budget leaves no room for compositing and present, so the device is already the limit even though frames still land.",
+      "consumer": "web/src/webrtc/thresholds.ts -> clientHealth.ts"
+    },
+    "web.client_health.decode_abs_ceiling_ms": {
+      "value": 25,
+      "unit": "ms",
+      "why": "Fallback ceiling when the profile frame budget is unknown (0).",
+      "consumer": "web/src/webrtc/thresholds.ts -> clientHealth.ts"
+    },
+    "web.present_cadence.min_samples": {
+      "value": 5,
+      "unit": "count",
+      "why": "Fewer intervals than this in a 1 s window is not a cadence, it is a fragment (a hidden tab, or a window the RVFC loop barely filled). Every present_* summary is null below it rather than confidently wrong. Web-only consumer.",
+      "consumer": "web/src/webrtc/thresholds.ts -> presentCadence.ts (summarizePresentWindow)"
+    },
+    "web.present_cadence.doubled_band": {
+      "value": 0.2,
+      "unit": "fraction",
+      "why": "An interval counts as 'doubled' when it lands within +/-20% of exactly 2x the median. Wide enough to catch a missed vsync under normal scheduling noise, narrow enough that a 2.5x stall falls outside it and is counted as a long frame instead. Web-only consumer.",
+      "consumer": "web/src/webrtc/thresholds.ts -> presentCadence.ts (doubledFraction)"
+    },
+    "web.present_cadence.long_frame_factor": {
+      "value": 2.5,
+      "unit": "factor",
+      "why": "An interval longer than 2.5x the median is not the vsync beat: it sits above the top of the doubled band, so it is a genuine stall and must never be excused as inherent. Web-only consumer.",
+      "consumer": "web/src/webrtc/thresholds.ts -> presentCadence.ts (longFrames)"
+    },
+    "web.present_cadence.beat_doubled_max": {
+      "value": 0.25,
+      "unit": "fraction",
+      "why": "At source fps == display Hz a beat of up to a quarter of the window is the expected consequence of two free-running clocks (the 2026-08-22 1440p120 session sat near 12%). Above this the pattern is too dense to be the beat, so inherentBeat refuses to fire and the reader is not told the window is fine. Web-only consumer.",
+      "consumer": "web/src/webrtc/thresholds.ts -> presentCadence.ts (inherentBeat)"
+    },
+    "web.playout.default_ms": {
+      "value": 100,
+      "unit": "ms",
+      "why": "#108: the measured smoothness knee \u2014 present sigma plateaus at a buttery 2-3 ms from ~100 ms of receiver buffer onward.",
+      "consumer": "web/src/webrtc/thresholds.ts -> playout.ts (DEFAULT_PLAYOUT_MS)"
+    },
+    "web.playout.floor_ms": {
+      "value": 50,
+      "unit": "ms",
+      "why": "T2 (2026-08-18) playout knee: 50 ms buys 4.7x fewer client-present drops than 30 ms for +24 ms glass-to-glass, and removes a bimodal 9% drop failure mode.",
+      "consumer": "web/src/webrtc/thresholds.ts -> playout.ts (PLAYOUT_FLOOR_MS)"
+    },
+    "web.playout.cap_ms": {
+      "value": 150,
+      "unit": "ms",
+      "why": "Hard ceiling on the buffer (AS-00 Component 4) \u2014 past this the latency cost exceeds any smoothness left to buy.",
+      "consumer": "web/src/webrtc/thresholds.ts -> playout.ts"
+    },
+    "web.playout.step_down_ms": {
+      "value": 10,
+      "unit": "ms",
+      "why": "Conservative descent per healthy 5 s window, before a healthy streak earns the faster step.",
+      "consumer": "web/src/webrtc/thresholds.ts -> playout.ts"
+    },
+    "web.playout.step_up_factor": {
+      "value": 1.5,
+      "unit": "factor",
+      "why": "Fast up / gated down: a single degraded window multiplies the buffer, because re-inflating late costs a visible hitch and re-inflating early costs milliseconds.",
+      "consumer": "web/src/webrtc/thresholds.ts -> playout.ts"
+    },
+    "web.playout.hold_ms": {
+      "value": 30000,
+      "unit": "ms",
+      "why": "Default dwell after any step-up before descending again \u2014 slower than ABR's retarget cadence, so this loop never chases an ABR transient.",
+      "consumer": "web/src/webrtc/thresholds.ts -> playout.ts"
+    },
+    "web.playout.hold_fast_ms": {
+      "value": 10000,
+      "unit": "ms",
+      "why": "IL-1: shortened dwell once the path is confirmed locally healthy, so a clean LAN reaches the floor in seconds.",
+      "consumer": "web/src/webrtc/thresholds.ts -> playout.ts"
+    },
+    "web.playout.step_down_fast_ms": {
+      "value": 15,
+      "unit": "ms",
+      "why": "IL-1 accelerated descent step, paired with hold_fast_ms.",
+      "consumer": "web/src/webrtc/thresholds.ts -> playout.ts"
+    },
+    "web.playout.healthy_sd_ms": {
+      "value": 12,
+      "unit": "ms",
+      "why": "AS-04 used sigma < 12 ms as the healthy line everywhere; at or below this the controller may trim the buffer.",
+      "consumer": "web/src/webrtc/thresholds.ts -> playout.ts"
+    },
+    "web.playout.degraded_sd_ms": {
+      "value": 18,
+      "unit": "ms",
+      "why": "At or above this the controller re-inflates. The 12-18 ms hysteresis band holds (no change), so the loop cannot chatter around one threshold.",
+      "consumer": "web/src/webrtc/thresholds.ts -> playout.ts"
+    },
+    "web.playout.healthy_streak_for_fast": {
+      "value": 3,
+      "unit": "count",
+      "why": "Three consecutive healthy 5 s evaluations = 15 s of confirmed local health before fast descent is trusted; long enough to ride out an ABR retarget wiggle.",
+      "consumer": "web/src/webrtc/thresholds.ts -> playout.ts"
+    },
+    "web.playout.eval_interval_ms": {
+      "value": 5000,
+      "unit": "ms",
+      "why": "The design's 5 s evaluation window (AS-00 Component 4).",
+      "consumer": "web/src/webrtc/thresholds.ts -> playout.ts"
+    },
+    "web.signal.sd_poor_ms": {
+      "value": 18,
+      "unit": "ms",
+      "why": "Connection glyph: AS-04 'degraded'. Same number as web.playout.degraded_sd_ms on purpose \u2014 the glyph must not disagree with the controller acting on the same sigma.",
+      "consumer": "web/src/webrtc/thresholds.ts -> pages/app/streamHealth.ts (signalQuality)"
+    },
+    "web.signal.sd_fair_ms": {
+      "value": 12,
+      "unit": "ms",
+      "why": "Connection glyph: AS-04 'watch'. Same number as web.playout.healthy_sd_ms.",
+      "consumer": "web/src/webrtc/thresholds.ts -> pages/app/streamHealth.ts (signalQuality)"
+    },
+    "web.signal.sd_excellent_ms": {
+      "value": 6,
+      "unit": "ms",
+      "why": "Below this and clean, the stream is at the #108 knee \u2014 the only reading that earns four bars.",
+      "consumer": "web/src/webrtc/thresholds.ts -> pages/app/streamHealth.ts (signalQuality)"
+    },
+    "web.signal.packets_lost_poor": {
+      "value": 15,
+      "unit": "count",
+      "why": "Packets lost in one 1 s poll window at or above this is heavy loss regardless of how smooth presentation still looks.",
+      "consumer": "web/src/webrtc/thresholds.ts -> pages/app/streamHealth.ts (signalQuality)"
+    },
+    "web.signal.packets_lost_fair": {
+      "value": 3,
+      "unit": "count",
+      "why": "Some loss \u2014 enough to knock the glyph down one rung, not enough to call the connection poor.",
+      "consumer": "web/src/webrtc/thresholds.ts -> pages/app/streamHealth.ts (signalQuality)"
+    },
+    "web.clock.repost_interval_s": {
+      "value": 60,
+      "unit": "s",
+      "why": "How often the client re-posts its clock-offset estimate while connected. The offset was posted ONCE per session and latched, so a drifting clock silently invalidated every aligned series for the rest of the session while bench mode read a different, live estimate. One minute is far slower than any measurement cost and far faster than observed drift.",
+      "consumer": "web/src/webrtc/thresholds.ts -> telemetry.ts (maybePostClock)"
+    },
+    "web.clock.repost_delta_ms": {
+      "value": 5,
+      "unit": "ms",
+      "why": "Only re-post when the new estimate moved more than this from the last posted one. Below it the change is inside the min-RTT estimator's own noise, and re-posting would churn measured_at without improving the offset.",
+      "consumer": "web/src/webrtc/thresholds.ts -> telemetry.ts (maybePostClock)"
+    }
+  }
+}

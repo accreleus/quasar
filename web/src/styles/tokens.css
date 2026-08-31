@@ -1,0 +1,263 @@
+/* ============================================================
+   QUASAR — Design tokens (v3)
+   Source of truth: design_handoff_v3/screens/assets/console-v3.css
+   — the "palette pass" block, i.e. the values that actually ship,
+   not the earlier block it overrides — plus home-v3.css for the
+   brand gradient. Fonts are loaded by base.css, not from here.
+
+   Every name a stylesheet still references resolves from this
+   file: the v3 names, the --ink-* scale they re-point, and the
+   legacy aliases (--bg/--surface/--surface-2/--border/--muted/
+   --violet/--cyan/--brand-grad/--t-display/--tabbar-h ...).
+   tokens.test.ts fails the build if a var() in web/src stops
+   resolving, so an alias only leaves here once its last use does.
+   ============================================================ */
+
+:root {
+  color-scheme: dark;
+
+  /* ---------- SURFACES ----------
+     Named ramp, ~0.045 lightness per step, one hue family (265-268).
+     Chrome is its own material; panels carry the cast a step higher. */
+  --surf-canvas: oklch(0.115 0.012 267);   /* body background        */
+  --surf-chrome: oklch(0.163 0.018 268);   /* topbar, rail           */
+  --surf-panel: oklch(0.208 0.020 268);    /* cards, drawer          */
+  --surf-raised: oklch(0.252 0.022 267);   /* menus, palette, thead  */
+  --surf-control: oklch(0.292 0.022 265);  /* buttons                */
+  --surf-inset: oklch(0.088 0.012 267);    /* inputs, notes, wells   */
+  --core: oklch(0.105 0.01 267);           /* deepest                */
+
+  /* Legacy surface aliases — same material, older names. */
+  --bg: var(--surf-canvas);
+  --surface: var(--surf-chrome);
+  --surface-2: var(--surf-panel);
+
+  --ink-0: var(--core);
+  --ink-1: var(--surf-canvas);
+  --ink-2: var(--surf-chrome);
+  --ink-3: var(--surf-panel);
+  --ink-4: var(--surf-raised);
+  --ink-5: var(--surf-control);
+
+  /* ---------- TEXT ---------- */
+  --text: oklch(0.9618 0.0086 247.91);
+  --text-2: oklch(0.76 0.022 258);
+  --text-3: oklch(0.6605 0.0265 259.81);
+  --text-4: oklch(0.56 0.024 259);
+  --muted: var(--text-3);
+
+  /* ---------- LINES ---------- */
+  --line: oklch(0.9618 0.0086 247.91/.09);
+  --line-2: oklch(0.9618 0.0086 247.91/.12);
+  --line-3: oklch(0.6605 0.0265 259.81/.46);
+  --border: var(--line-2);
+
+  /* ---------- ACCENT (single-hue violet) ----------
+     Violet is reserved for action and selection; capacity reads teal. */
+  --accent: oklch(0.5998 0.2179 273.21);
+  --action: oklch(0.5 0.19 273.21);
+  --accent-hover: oklch(0.54 0.19 273.21);
+  --accent-press: oklch(0.46 0.19 273.21);
+  --accent-text: oklch(0.78 0.13 273.21);
+  --accent-soft: oklch(0.5998 0.2179 273.21/.16);
+  --accent-soft-2: oklch(0.5998 0.2179 273.21/.26);
+
+  --teal: oklch(0.78 0.11 196);
+  --teal-soft: oklch(0.78 0.11 196/.16);
+
+  /* Retired v1 spectrum, collapsed onto the accent so no surviving
+     rule paints violet-to-cyan. */
+  --violet: var(--accent);
+  --cyan: var(--accent);
+  /* Survived the collapse: a chart needs a second hue the accent cannot
+     supply (SessionCharts, DiagnosticsDisclosure, home.css). */
+  --lavender: oklch(0.74 0.14 285);
+  --brand-grad: linear-gradient(118deg, var(--accent), var(--action));
+
+  /* ---------- STATE ---------- */
+  --success: oklch(0.76 0.15 164);
+  --success-text: oklch(0.82 0.13 164);
+  --success-bg: oklch(0.76 0.15 164/.12);
+  --success-line: oklch(0.76 0.15 164/.34);
+
+  --warning: oklch(0.82 0.14 85);
+  --warning-text: oklch(0.87 0.12 85);
+  --warning-bg: oklch(0.82 0.14 85/.12);
+  --warning-line: oklch(0.82 0.14 85/.34);
+
+  --danger: oklch(0.69 0.19 27);
+  --danger-text: oklch(0.82 0.12 27);
+  --danger-bg: oklch(0.69 0.19 27/.13);
+  --danger-line: oklch(0.69 0.19 27/.4);
+
+  --info: var(--teal);
+  --info-text: oklch(0.84 0.09 196);
+  --info-bg: var(--teal-soft);
+  --info-line: oklch(0.78 0.11 196/.32);
+
+  /* ---------- GLASS ---------- */
+  --glass-panel: oklch(0.1869 0.0151 266.77/.46);
+  --glass-strong: oklch(0.224 0.018 263/.62);
+  --glass-control: oklch(0.272 0.022 260/.66);
+  --glass-border: oklch(0.9618 0.0086 247.91/.12);
+  --glass-highlight: oklch(0.9618 0.0086 247.91/.14);
+  --glass: oklch(0.1449 0.0115 266.85/.72);
+  --pop-bg: var(--surf-raised);
+
+  /* ---------- TYPE ---------- */
+  --font-brand: 'Michroma', 'Eurostile Extended', Microgramma, ui-sans-serif, sans-serif;
+  --font-display: 'IBM Plex Sans', Inter, ui-sans-serif, system-ui, sans-serif;
+  --font-ui: var(--font-display);
+  --font-mono: 'IBM Plex Mono', 'SFMono-Regular', Consolas, monospace;
+
+  --t-display: 2.6rem;
+  --t-h1: 1.9rem;
+  --t-h2: 1.45rem;
+  --t-h3: 1.15rem;
+  --t-lg: 1.0625rem;
+  --t-base: .9375rem;
+  --t-sm: .8125rem;
+  --t-xs: .6875rem;
+
+  /* ---------- SPACING ---------- */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 20px;
+  --s6: 24px;
+  --s7: 32px;
+  --s8: 40px;
+  --s9: 48px;
+  --s10: 64px;
+
+  /* ---------- RADII ---------- */
+  --r-control: 4px;
+  --r-panel: 8px;
+  --r-feature: 12px;
+  --r-xs: var(--r-control);
+  --r-sm: var(--r-control);
+  --r-md: var(--r-panel);
+  --r-lg: var(--r-panel);
+  --r-xl: var(--r-feature);
+  --r-pill: 999px;
+
+  /* ---------- ELEVATION ---------- */
+  --shadow-sm: 0 1px 2px oklch(0.05 0.01 267/.38);
+  /* .card takes the heavier depth-pass stack in primitives.css (Task 2). */
+  --shadow-md: inset 0 1px 0 var(--glass-highlight), 0 14px 36px -32px oklch(0.05 0.01 267/.68);
+  --shadow-lg: inset 0 1px 0 var(--glass-highlight), 0 22px 58px -32px oklch(0.05 0.01 267/.82);
+  --glow-accent: 0 0 0 3px var(--accent-soft);
+  --inset-top: inset 0 1px 0 var(--glass-highlight);
+
+  /* ---------- LAYOUT RHYTHM ---------- */
+  --row-h: 44px;
+  --control-h: 34px;
+  --page-pad: 32px;
+  --card-pad: 20px;
+  --rail-w: 216px;
+  --topbar-h: 56px;
+  /* Small-screen bottom tab bar. Fixed at 56px in both densities: it is a
+     touch target, and dense mode is a desk setting with no business shrinking
+     a thumb target below the 44px floor. */
+  --tabbar-h: 56px;
+}
+
+/* ---------- DENSITY ----------
+   Set on <body> by ThemeContext; custom properties inherit, so the values
+   below shadow the :root ones for everything inside the app. There is
+   deliberately no "comfortable" block — comfortable is :root, and declaring
+   it on <body> would shadow the narrow-viewport override further down. */
+[data-density="dense"] {
+  --row-h: 34px;
+  --control-h: 30px;
+  --page-pad: 24px;
+  --card-pad: 16px;
+  --t-h1: 1.55rem;
+  --t-h2: 1.2rem;
+  --t-base: .875rem;
+  --t-sm: .78125rem;
+}
+
+/* ---------- RAIL ----------
+   A layout setting alongside density: persisted, set on <body>, consumed by
+   the console shell's grid. Collapsed keeps the icons. */
+[data-rail="collapsed"] {
+  --rail-w: 60px;
+}
+
+/* ---------- NARROW VIEWPORTS ----------
+   --page-pad is a desktop rhythm; a phone should not spend a fifth of the
+   viewport on gutters. Both selectors are listed because `data-density` sits
+   on <body> and `:root` is <html>: the body-level declaration shadows the
+   html-level one, so overriding only :root would leave dense phones at 24px.
+   This block must stay AFTER the density block — it wins on source order. */
+@media (max-width: 720px) {
+  :root,
+  [data-density="dense"] {
+    --page-pad: 16px;
+  }
+}
+
+/* ---------- LIGHT APPEARANCE ----------
+   Mirrors the dark ramp at the same hue (267-268) and step size rather than
+   inventing a second palette: chrome is still a distinct tinted material,
+   panels are still the brightest surface, insets are still recessed. Violet
+   stays with action, teal with capacity. Copied from console-v3.css.
+   Aliases above are var()-based, so they follow these automatically. */
+[data-theme="light"] {
+  color-scheme: light;
+
+  --surf-canvas: oklch(0.958 0.006 268);
+  --surf-chrome: oklch(0.928 0.011 268);
+  --surf-panel: oklch(0.998 0.002 268);
+  --surf-raised: oklch(0.972 0.006 268);
+  --surf-control: oklch(0.988 0.004 268);
+  --surf-inset: oklch(0.935 0.007 268);
+
+  /* Only the two steps that genuinely differ: everything else above is a
+     var() alias and follows the re-pointed ramp on its own. */
+  --core: var(--surf-inset);
+  --ink-0: oklch(0.90 0.008 268);
+
+  --text: oklch(0.24 0.022 268);
+  --text-2: oklch(0.42 0.018 268);
+  --text-3: oklch(0.53 0.016 268);
+  --text-4: oklch(0.64 0.014 268);
+
+  --line: oklch(0.24 0.022 268/.09);
+  --line-2: oklch(0.24 0.022 268/.14);
+  --line-3: oklch(0.24 0.022 268/.24);
+
+  --glass-border: oklch(0.24 0.022 268/.12);
+  --glass-highlight: oklch(1 0 0/.7);
+  --glass-panel: oklch(0.998 0.002 268/.82);
+  --glass-strong: oklch(0.998 0.002 268/.9);
+  --glass-control: oklch(0.998 0.002 268/.86);
+  --glass: oklch(0.958 0.006 268/.78);
+  --pop-bg: var(--surf-panel);
+
+  --accent-text: oklch(0.5 0.19 273.21);
+  --accent-soft: oklch(0.5998 0.2179 273.21/.12);
+  --accent-soft-2: oklch(0.5998 0.2179 273.21/.2);
+
+  --success-text: oklch(0.5 0.13 164);
+  --success-bg: oklch(0.76 0.15 164/.15);
+  --success-line: oklch(0.6 0.14 164/.34);
+  --warning-text: oklch(0.52 0.12 78);
+  --warning-bg: oklch(0.82 0.14 85/.2);
+  --warning-line: oklch(0.68 0.13 82/.36);
+  --danger-text: oklch(0.52 0.2 27);
+  --danger-bg: oklch(0.69 0.19 27/.14);
+  --danger-line: oklch(0.6 0.19 27/.34);
+
+  --teal: oklch(0.62 0.11 196);
+  --teal-soft: oklch(0.62 0.11 196/.16);
+  --info-text: oklch(0.48 0.1 210);
+  --info-line: oklch(0.62 0.11 196/.32);
+
+  --shadow-sm: 0 1px 2px oklch(0.24 0.022 268/.1);
+  --shadow-md: 0 1px 2px oklch(0.24 0.022 268/.06), 0 14px 34px -26px oklch(0.24 0.022 268/.3);
+  --shadow-lg: 0 22px 58px -30px oklch(0.24 0.022 268/.34);
+  --inset-top: inset 0 1px 0 oklch(1 0 0/.75);
+}

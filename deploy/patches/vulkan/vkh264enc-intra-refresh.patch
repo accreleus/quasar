@@ -1,0 +1,624 @@
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
+index 4892e64..af3d3be 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
++++ b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
+@@ -74,6 +74,8 @@ enum
+   PROP_MAX_QP,
+   PROP_MIN_QP,
+   PROP_NUM_SLICES,
++  PROP_INTRA_REFRESH,
++  PROP_INTRA_REFRESH_PERIOD,
+   N_PROPERTIES
+ };
+ 
+@@ -126,6 +128,8 @@ struct _GstVulkanH264Encoder
+     guint32 max_qp;
+     guint32 min_qp;
+     guint num_slices;
++    gboolean intra_refresh;
++    guint intra_refresh_period;
+   } prop;
+ 
+   gboolean update_props;
+@@ -147,6 +151,17 @@ struct _GstVulkanH264Encoder
+   /* Driver VkVideoEncodeH264CapabilitiesKHR.maxSliceCount, cached in
+    * new_sequence so the per-frame slice split can clamp to it. 0 until known. */
+   guint max_slice_count;
++
++  /* Intra refresh state, negotiated with the shared encoder in new_sequence.
++   * intra_refresh_mode is a VkVideoEncodeIntraRefreshModeFlagBitsKHR (0 == off);
++   * intra_refresh_cycle is the cycle length in frames; ir_counter is the running
++   * position within the current period, reset at every IDR and session start. */
++  guint intra_refresh_mode;
++  guint32 intra_refresh_cycle;
++  guint ir_counter;
++  /* One-shot latch so the per-frame cycle-vs-slice-count mismatch warning
++   * (per-picture-partition mode) does not spam every frame. Reset per session. */
++  gboolean ir_slice_mismatch_warned;
+ };
+ 
+ struct _GstVulkanH264EncoderClass
+@@ -177,6 +192,15 @@ struct _GstVulkanH264EncoderFrame
+   StdVideoEncodeH264ReferenceInfo ref_info;
+   VkVideoEncodeH264DpbSlotInfoKHR vkref_info;
+ 
++  /* Intra refresh (per-frame). intra_refresh_active marks a frame inside an
++   * active refresh wave. intra_refresh_info is chained into VkVideoEncodeInfoKHR
++   * (with the INTRA_REFRESH flag). ref_intra_refresh_info carries this frame's
++   * dirty-region count for when it is later used as a reference; its pNext
++   * continues to vkref_info so the reference slot's codec info is preserved. */
++  gboolean intra_refresh_active;
++  VkVideoEncodeIntraRefreshInfoKHR intra_refresh_info;
++  VkVideoReferenceIntraRefreshInfoKHR ref_intra_refresh_info;
++
+   StdVideoEncodeH264RefListModEntry mods[2][STD_VIDEO_H264_MAX_NUM_LIST_REF +
+       1];
+   StdVideoEncodeH264RefPicMarkingEntry mmco[STD_VIDEO_H264_MAX_NUM_LIST_REF +
+@@ -250,6 +274,11 @@ gst_vulkan_h264_encoder_frame_new (GstVulkanH264Encoder * self,
+ 
+   vkframe = g_new (GstVulkanH264EncoderFrame, 1);
+   vkframe->encoder = gst_object_ref (self->encoder);
++  /* g_new does not zero: default the slice count so the per-frame intra-refresh
++   * guard (which compares the negotiated cycle against num_slices) reads a sane
++   * value even if _setup_slice has not run yet. Same rationale as picture_init's
++   * reference_intra_refresh_info NULL-init. */
++  vkframe->num_slices = 1;
+   if (!gst_vulkan_encoder_picture_init (&vkframe->picture, self->encoder,
+           frame->input_buffer, self->coded_buffer_size)) {
+     gst_object_unref (vkframe->encoder);
+@@ -762,6 +791,27 @@ gst_vulkan_h264_encoder_new_sequence (GstH264Encoder * encoder,
+     }
+   }
+ 
++  /* Intra refresh: request it before start() so the session is created with the
++   * negotiated mode. region_count == the requested slice count (the H.264
++   * per-picture-partition cycle length); the shared encoder clamps it and falls
++   * back per driver caps, or disables intra refresh when unsupported. */
++  {
++    gboolean want_ir;
++    guint region, mb_rows;
++    /* Per-picture-partition mode requires the cycle duration to equal the coded
++     * slice count, which _setup_slice caps at the macroblock-row count. Clamp the
++     * requested region hint to mb_rows here so the negotiated cycle matches the
++     * slices the encoder will actually emit; the per-frame guard in encode_frame
++     * catches any residual divergence (e.g. a driver maxSliceCount below mb_rows). */
++    mb_rows = MAX (1, (GST_VIDEO_INFO_HEIGHT (in_info) + 15) / 16);
++    GST_OBJECT_LOCK (self);
++    want_ir = self->prop.intra_refresh;
++    region = MAX (1, self->prop.num_slices);
++    GST_OBJECT_UNLOCK (self);
++    region = MIN (region, mb_rows);
++    gst_vulkan_encoder_set_intra_refresh (self->encoder, want_ir, region);
++  }
++
+   if (!gst_vulkan_encoder_start (self->encoder, &self->profile, &quality_props,
+           &err)) {
+     GST_ELEMENT_ERROR (self, RESOURCE, NOT_FOUND,
+@@ -809,6 +859,23 @@ gst_vulkan_h264_encoder_new_sequence (GstH264Encoder * encoder,
+           self->max_slice_count);
+   }
+ 
++  /* Cache the negotiated intra refresh configuration for the per-frame wave and
++   * rebase the cycle position. Fail-open: mode 0 means the driver/build has no
++   * usable intra refresh and encoding proceeds unchanged. */
++  self->intra_refresh_mode =
++      gst_vulkan_encoder_intra_refresh_mode (self->encoder);
++  self->intra_refresh_cycle =
++      gst_vulkan_encoder_intra_refresh_cycle_duration (self->encoder);
++  self->ir_counter = 0;
++  self->ir_slice_mismatch_warned = FALSE;
++  if (self->prop.intra_refresh && self->intra_refresh_mode == 0)
++    GST_WARNING_OBJECT (self, "intra-refresh requested but unsupported by the "
++        "driver/build; running without intra refresh");
++  else if (self->intra_refresh_mode)
++    GST_INFO_OBJECT (self, "intra refresh active: mode=0x%08x, cycle=%u frames, "
++        "period=%u", self->intra_refresh_mode, self->intra_refresh_cycle,
++        self->prop.intra_refresh_period);
++
+   GST_LOG_OBJECT (self, "H264 encoder capabilities:\n"
+       "    Standard capability flags:\n"
+       "        separate_color_plane: %i\n"
+@@ -1388,7 +1455,16 @@ _setup_codec_pic (GstVulkanEncoderPicture * pic, VkVideoEncodeInfoKHR * info,
+ {
+   GstVulkanH264EncoderFrame *vk_frame = (GstVulkanH264EncoderFrame *) pic;
+ 
+-  info->pNext = &vk_frame->vkh264pic_info;
++  /* Intra refresh: prepend VkVideoEncodeIntraRefreshInfoKHR to the encode info
++   * chain and set the per-frame flag. intra_refresh_info was filled (and its
++   * pNext left NULL) in encode_frame; chain the codec picture info after it. */
++  if (vk_frame->intra_refresh_active) {
++    vk_frame->intra_refresh_info.pNext = &vk_frame->vkh264pic_info;
++    info->pNext = &vk_frame->intra_refresh_info;
++    info->flags |= VK_VIDEO_ENCODE_INTRA_REFRESH_BIT_KHR;
++  } else {
++    info->pNext = &vk_frame->vkh264pic_info;
++  }
+   pic->dpb_slot.pNext = &vk_frame->vkref_info;
+ 
+   /* *INDENT-OFF* */
+@@ -1734,6 +1810,86 @@ gst_vulkan_h264_encoder_encode_frame (GstH264Encoder * base,
+     ref_pics[i++] = &_GET_FRAME (pic)->picture;
+   }
+ 
++  /* Intra refresh: decide this frame's role in the rolling wave. Only P frames
++   * carry refreshed regions; I/IDR frames fully refresh the picture and restart
++   * the cycle; B frames (unused by the low-latency pipeline) are left untouched.
++   * vk_frame->picture.reference_intra_refresh_info defaults to NULL (set in
++   * gst_vulkan_encoder_picture_init) and is only pointed at this frame's dirty
++   * info while it is an active-cycle frame. */
++  vk_frame->intra_refresh_active = FALSE;
++  vk_frame->picture.reference_intra_refresh_info = NULL;
++  if (self->intra_refresh_mode) {
++    GstH264SliceType st = h264_frame->type.slice_type;
++
++    if (st == GST_H264_I_SLICE) {
++      /* IDR (or a rare non-IDR I): the whole picture is intra, so the refresh
++       * cycle rebases to the next frame. */
++      self->ir_counter = 0;
++    } else if (st == GST_H264_P_SLICE) {
++      guint32 cycle = self->intra_refresh_cycle;
++      /* Frames between wave starts. 0 (property default) or any value below the
++       * cycle length means back-to-back (continuous) refresh. */
++      guint period;
++      guint phase;
++
++      GST_OBJECT_LOCK (self);
++      period = self->prop.intra_refresh_period;
++      GST_OBJECT_UNLOCK (self);
++      if (period < cycle)
++        period = cycle;
++      phase = self->ir_counter % period;
++
++      if (phase < cycle) {
++        guint32 max_refs =
++            gst_vulkan_encoder_intra_refresh_max_active_references (self->encoder);
++        gboolean per_partition = (self->intra_refresh_mode ==
++            VK_VIDEO_ENCODE_INTRA_REFRESH_MODE_PER_PICTURE_PARTITION_BIT_KHR);
++
++        if ((guint) i > max_refs) {
++          /* maxIntraRefreshActiveReferencePictures caps active references while
++           * refreshing (0 == none allowed); the low-latency pipeline runs
++           * ref-frames=1 so this should not fire. Degrade to a plain P frame. */
++          GST_WARNING_OBJECT (self, "intra refresh frame has %d active refs > "
++              "driver max %u; not marking this frame as intra refresh", i,
++              max_refs);
++        } else if (per_partition && cycle != vk_frame->num_slices) {
++          /* Per-picture-partition mode requires cycleDuration == the coded slice
++           * count; a mismatch would make the driver reject the encode. Skip
++           * marking (fail-open) and warn once per session. */
++          if (!self->ir_slice_mismatch_warned) {
++            GST_WARNING_OBJECT (self, "intra refresh cycle=%u != coded slices=%u "
++                "in per-picture-partition mode; not marking intra refresh frames "
++                "(set num-slices to match, and <= macroblock rows)", cycle,
++                vk_frame->num_slices);
++            self->ir_slice_mismatch_warned = TRUE;
++          }
++        } else {
++          vk_frame->intra_refresh_active = TRUE;
++          /* *INDENT-OFF* */
++          vk_frame->intra_refresh_info = (VkVideoEncodeIntraRefreshInfoKHR) {
++            .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_INTRA_REFRESH_INFO_KHR,
++            .pNext = NULL, /* chained to the h264 picture info in _setup_codec_pic */
++            .intraRefreshCycleDuration = cycle,
++            .intraRefreshIndex = phase,
++          };
++          /* Regions still dirty once this frame is coded, used when it later
++           * serves as a reference: cycleDuration - index - 1. pNext continues to
++           * the codec dpb-slot info so the reference slot stays well-formed. */
++          vk_frame->ref_intra_refresh_info =
++              (VkVideoReferenceIntraRefreshInfoKHR) {
++            .sType = VK_STRUCTURE_TYPE_VIDEO_REFERENCE_INTRA_REFRESH_INFO_KHR,
++            .pNext = &vk_frame->vkref_info,
++            .dirtyIntraRefreshRegions = cycle - phase - 1,
++          };
++          /* *INDENT-ON* */
++          vk_frame->picture.reference_intra_refresh_info =
++              &vk_frame->ref_intra_refresh_info;
++        }
++      }
++      self->ir_counter++;
++    }
++  }
++
+   if (!_write_headers (self, vk_frame))
+     return GST_FLOW_ERROR;
+ 
+@@ -1773,6 +1929,8 @@ gst_vulkan_h264_encoder_reset (GstH264Encoder * base)
+   _reset_rc_props (self);
+ 
+   self->coded_buffer_size = 0;
++  self->ir_counter = 0;
++  self->ir_slice_mismatch_warned = FALSE;
+ }
+ 
+ static gboolean
+@@ -2011,6 +2169,8 @@ gst_vulkan_h264_encoder_init (GTypeInstance * instance, gpointer g_class)
+   self->prop.ratecontrol = VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR;
+   self->prop.quality = 2;
+   self->prop.num_slices = 1;
++  self->prop.intra_refresh = FALSE;
++  self->prop.intra_refresh_period = 0;
+ }
+ 
+ static void
+@@ -2051,6 +2211,12 @@ gst_vulkan_h264_encoder_get_property (GObject * object, guint property_id,
+     case PROP_NUM_SLICES:
+       g_value_set_uint (value, self->prop.num_slices);
+       break;
++    case PROP_INTRA_REFRESH:
++      g_value_set_boolean (value, self->prop.intra_refresh);
++      break;
++    case PROP_INTRA_REFRESH_PERIOD:
++      g_value_set_uint (value, self->prop.intra_refresh_period);
++      break;
+     default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+       break;
+@@ -2106,6 +2272,12 @@ gst_vulkan_h264_encoder_set_property (GObject * object, guint property_id,
+     case PROP_NUM_SLICES:
+       self->prop.num_slices = g_value_get_uint (value);
+       break;
++    case PROP_INTRA_REFRESH:
++      self->prop.intra_refresh = g_value_get_boolean (value);
++      break;
++    case PROP_INTRA_REFRESH_PERIOD:
++      self->prop.intra_refresh_period = g_value_get_uint (value);
++      break;
+     default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+       break;
+@@ -2354,6 +2526,44 @@ gst_vulkan_h264_encoder_class_init (gpointer g_klass, gpointer class_data)
+       1, G_MAXUINT, 1,
+       G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
+ 
++  /**
++   * GstVulkanH264Encoder:intra-refresh:
++   *
++   * Enable rolling periodic intra refresh: instead of a periodic full IDR, each
++   * frame carries one region's worth of intra macroblocks and a full sweep of
++   * the picture completes every cycle, bounding loss recovery without an IDR
++   * bandwidth spike. Requires VK_KHR_video_encode_intra_refresh; the concrete
++   * mode is chosen against driver caps (per-picture-partition preferred, with a
++   * block-row-based fallback), and the feature silently disables (running
++   * exactly as today) when the driver/build does not support it. IDR cadence
++   * (idr-period) and forced key units are unaffected. Default %FALSE preserves
++   * byte-identical output.
++   *
++   * Since: 1.28
++   */
++  properties[PROP_INTRA_REFRESH] = g_param_spec_boolean ("intra-refresh",
++      "Intra refresh",
++      "Enable rolling periodic intra refresh (needs "
++      "VK_KHR_video_encode_intra_refresh; silently off when unsupported)",
++      FALSE,
++      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
++
++  /**
++   * GstVulkanH264Encoder:intra-refresh-period:
++   *
++   * Number of frames between the start of one intra refresh wave and the next.
++   * 0 (the default) means continuous, back-to-back refresh cycles. A value below
++   * the cycle length is treated as continuous. Only meaningful when
++   * #GstVulkanH264Encoder:intra-refresh is enabled.
++   *
++   * Since: 1.28
++   */
++  properties[PROP_INTRA_REFRESH_PERIOD] =
++      g_param_spec_uint ("intra-refresh-period", "Intra refresh period",
++      "Frames between the start of consecutive intra refresh waves "
++      "(0 = continuous)", 0, G_MAXUINT, 0,
++      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_CONSTRUCT);
++
+   g_object_class_install_properties (gobject_class, N_PROPERTIES, properties);
+ 
+   /* since GstVulkanEncoder is private API */
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkdevice.c b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkdevice.c
+index 2931032..44a84f9 100644
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkdevice.c
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkdevice.c
+@@ -300,6 +300,13 @@ static const struct extension optional_extensions[] = {
+   OPTIONAL_VIDEO_EXTENSION (VK_KHR_VIDEO_ENCODE_H265_EXTENSION_NAME,
+       VK_KHR_VIDEO_ENCODE_QUEUE_EXTENSION_NAME, none),
+ # endif
++# if defined(VK_KHR_video_encode_intra_refresh)
++  /* PATCH (intra-refresh): enable VK_KHR_video_encode_intra_refresh when the
++   * device advertises it. Additive: absent on a driver -> enable is skipped and
++   * the encoder falls back to no intra refresh. Depends on the encode queue. */
++  OPTIONAL_VIDEO_EXTENSION (VK_KHR_VIDEO_ENCODE_INTRA_REFRESH_EXTENSION_NAME,
++      VK_KHR_VIDEO_ENCODE_QUEUE_EXTENSION_NAME, none),
++# endif
+ # if defined(VK_KHR_video_maintenance1)
+   OPTIONAL_VIDEO_EXTENSION (VK_KHR_VIDEO_MAINTENANCE_1_EXTENSION_NAME,
+       VK_KHR_VIDEO_QUEUE_EXTENSION_NAME, video_maintenance1),
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
+index 11715f0..5b7f27d 100644
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
+@@ -58,6 +58,14 @@ struct _GstVulkanEncoderPrivate
+   gboolean started;
+   gboolean session_reset;
+ 
++  /* PATCH (intra-refresh): request set before start via
++   * gst_vulkan_encoder_set_intra_refresh(); mode/cycle negotiated in start(). */
++  gboolean intra_refresh_requested;
++  guint32 intra_refresh_region_count;
++  VkVideoEncodeIntraRefreshModeFlagBitsKHR intra_refresh_mode; /* 0 == disabled */
++  guint32 intra_refresh_cycle_duration;
++  guint32 intra_refresh_max_active_refs;
++
+   gboolean layered_dpb;
+   GstBufferPool *dpb_pool;
+   GstBuffer *layered_buffer;
+@@ -244,6 +252,11 @@ gst_vulkan_encoder_picture_init (GstVulkanEncoderPicture * pic,
+   }
+   pic->offset = 0;
+ 
++  /* PATCH (intra-refresh): g_new (not g_new0) frames leave this uninitialized;
++   * default to NULL so a picture carries no reference intra-refresh info until
++   * the codec element sets it. */
++  pic->reference_intra_refresh_info = NULL;
++
+   pic->img_view = gst_vulkan_video_image_create_view (pic->in_buffer,
+       priv->layered_dpb, TRUE, NULL);
+ 
+@@ -734,6 +747,99 @@ gst_vulkan_encoder_start (GstVulkanEncoder * self,
+       != VK_SUCCESS)
+     goto failed;
+ 
++  /* PATCH (intra-refresh): negotiate the intra refresh mode against driver caps
++   * before creating the session (the chosen mode is chained into the session
++   * create info). Fail-open: any unsupported case leaves mode == 0 (disabled)
++   * and the session is created exactly as before. */
++  priv->intra_refresh_mode = 0;
++  priv->intra_refresh_cycle_duration = 0;
++  priv->intra_refresh_max_active_refs = 0;
++#if defined(VK_KHR_video_encode_intra_refresh)
++  VkVideoEncodeSessionIntraRefreshCreateInfoKHR intra_refresh_session = {
++    .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_SESSION_INTRA_REFRESH_CREATE_INFO_KHR,
++  };
++  if (priv->intra_refresh_requested) {
++    if (!gst_vulkan_device_is_extension_enabled (self->queue->device,
++            VK_KHR_VIDEO_ENCODE_INTRA_REFRESH_EXTENSION_NAME)) {
++      GST_WARNING_OBJECT (self, "intra refresh requested but "
++          VK_KHR_VIDEO_ENCODE_INTRA_REFRESH_EXTENSION_NAME
++          " is not enabled on the device; disabling intra refresh");
++    } else {
++      VkVideoEncodeIntraRefreshCapabilitiesKHR ir_caps = {
++        .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_INTRA_REFRESH_CAPABILITIES_KHR,
++      };
++      VkVideoEncodeH264CapabilitiesKHR h264_ir = {
++        .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_CAPABILITIES_KHR,
++        .pNext = &ir_caps,
++      };
++      VkVideoEncodeH265CapabilitiesKHR h265_ir = {
++        .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_CAPABILITIES_KHR,
++        .pNext = &ir_caps,
++      };
++      VkVideoEncodeCapabilitiesKHR enc_ir = {
++        .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_CAPABILITIES_KHR,
++        .pNext = (self->codec == VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR)
++            ? (void *) &h265_ir : (void *) &h264_ir,
++      };
++      VkVideoCapabilitiesKHR vid_ir = {
++        .sType = VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR,
++        .pNext = &enc_ir,
++      };
++      GError *ir_err = NULL;
++
++      if (!gst_vulkan_physical_device_get_video_capabilities (phy_dev,
++              &priv->profile.profile, &vid_ir, &ir_err)) {
++        GST_WARNING_OBJECT (self, "could not query intra refresh caps (%s); "
++            "disabling intra refresh", ir_err ? ir_err->message : "unknown");
++        g_clear_error (&ir_err);
++      } else {
++        guint32 rc = MAX (1, priv->intra_refresh_region_count);
++
++        priv->intra_refresh_max_active_refs =
++            ir_caps.maxIntraRefreshActiveReferencePictures;
++
++        if (ir_caps.intraRefreshModes &
++            VK_VIDEO_ENCODE_INTRA_REFRESH_MODE_PER_PICTURE_PARTITION_BIT_KHR) {
++          /* Primary mode: one refreshed partition (slice) per frame, cycle
++           * length == region (slice) count. */
++          priv->intra_refresh_mode =
++              VK_VIDEO_ENCODE_INTRA_REFRESH_MODE_PER_PICTURE_PARTITION_BIT_KHR;
++          priv->intra_refresh_cycle_duration =
++              MIN (rc, ir_caps.maxIntraRefreshCycleDuration);
++        } else if ((ir_caps.intraRefreshModes &
++                VK_VIDEO_ENCODE_INTRA_REFRESH_MODE_BLOCK_ROW_BASED_BIT_KHR)
++            && (rc <= 1 || ir_caps.partitionIndependentIntraRefreshRegions)) {
++          /* Fallback: row-based sweep. Legal alongside multi-slice only when the
++           * driver reports partition-independent regions. Cycle length defaults
++           * to the region count, or 8 frames when a single region was asked. */
++          guint32 cyc = rc > 1 ? rc : 8;
++          priv->intra_refresh_mode =
++              VK_VIDEO_ENCODE_INTRA_REFRESH_MODE_BLOCK_ROW_BASED_BIT_KHR;
++          priv->intra_refresh_cycle_duration =
++              MIN (cyc, ir_caps.maxIntraRefreshCycleDuration);
++        } else {
++          GST_WARNING_OBJECT (self, "no usable intra refresh mode "
++              "(driver modes=0x%08x, region_count=%u, partition_independent=%d); "
++              "disabling intra refresh", ir_caps.intraRefreshModes, rc,
++              ir_caps.partitionIndependentIntraRefreshRegions);
++        }
++
++        if (priv->intra_refresh_mode) {
++          if (priv->intra_refresh_cycle_duration < 1)
++            priv->intra_refresh_cycle_duration = 1;
++          GST_INFO_OBJECT (self, "intra refresh enabled: mode=0x%08x, "
++              "cycleDuration=%u frames, maxActiveRefs=%u (driver modes=0x%08x, "
++              "maxCycle=%u)", priv->intra_refresh_mode,
++              priv->intra_refresh_cycle_duration,
++              priv->intra_refresh_max_active_refs, ir_caps.intraRefreshModes,
++              ir_caps.maxIntraRefreshCycleDuration);
++          intra_refresh_session.intraRefreshMode = priv->intra_refresh_mode;
++        }
++      }
++    }
++  }
++#endif
++
+   /* *INDENT-OFF* */
+   session_create = (VkVideoSessionCreateInfoKHR) {
+     .sType = VK_STRUCTURE_TYPE_VIDEO_SESSION_CREATE_INFO_KHR,
+@@ -748,6 +854,11 @@ gst_vulkan_encoder_start (GstVulkanEncoder * self,
+   };
+   /* *INDENT-ON* */
+ 
++#if defined(VK_KHR_video_encode_intra_refresh)
++  if (priv->intra_refresh_mode)
++    session_create.pNext = &intra_refresh_session;
++#endif
++
+   if (!gst_vulkan_video_session_create (&priv->session, self->queue->device,
+           &priv->vk, &session_create, error))
+     goto failed;
+@@ -1138,8 +1249,16 @@ gst_vulkan_encoder_encode (GstVulkanEncoder * self, GstVideoInfo * info,
+   };
+   /* *INDENT-ON* */
+ 
+-  for (i = 0; i < nb_refs; i++)
++  for (i = 0; i < nb_refs; i++) {
+     ref_slots[i] = ref_pics[i]->dpb_slot;
++    /* PATCH (intra-refresh): chain the reference picture's
++     * VkVideoReferenceIntraRefreshInfoKHR (which already continues to the codec
++     * dpb-slot info via its own pNext) onto the ACTIVE reference slot only. The
++     * setup slot (built below with slotIndex -1) is intentionally left alone,
++     * matching the extension's usage example. */
++    if (ref_pics[i]->reference_intra_refresh_info)
++      ref_slots[i].pNext = ref_pics[i]->reference_intra_refresh_info;
++  }
+ 
+   ref_slots[nb_refs] = pic->dpb_slot;
+   ref_slots[nb_refs].slotIndex = -1;
+@@ -1433,6 +1552,86 @@ gst_vulkan_encoder_request_rc_reset (GstVulkanEncoder * self)
+     priv->session_reset = TRUE;
+ }
+ 
++/**
++ * gst_vulkan_encoder_set_intra_refresh:
++ * @self: a #GstVulkanEncoder
++ * @enabled: whether to request rolling intra refresh
++ * @region_count: number of intra-refresh regions per cycle the caller wants
++ *
++ * Request rolling intra refresh. Must be called before
++ * gst_vulkan_encoder_start(); the concrete mode and cycle duration are chosen at
++ * start() against the driver's VkVideoEncodeIntraRefreshCapabilitiesKHR and read
++ * back with gst_vulkan_encoder_intra_refresh_mode() /
++ * gst_vulkan_encoder_intra_refresh_cycle_duration().
++ */
++void
++gst_vulkan_encoder_set_intra_refresh (GstVulkanEncoder * self,
++    gboolean enabled, guint32 region_count)
++{
++  GstVulkanEncoderPrivate *priv;
++
++  g_return_if_fail (GST_IS_VULKAN_ENCODER (self));
++
++  priv = gst_vulkan_encoder_get_instance_private (self);
++
++  priv->intra_refresh_requested = enabled;
++  priv->intra_refresh_region_count = region_count;
++}
++
++/**
++ * gst_vulkan_encoder_intra_refresh_mode:
++ * @self: a #GstVulkanEncoder
++ *
++ * Returns: the negotiated VkVideoEncodeIntraRefreshModeFlagBitsKHR after
++ *     gst_vulkan_encoder_start(); 0 when intra refresh is disabled/unsupported.
++ */
++guint32
++gst_vulkan_encoder_intra_refresh_mode (GstVulkanEncoder * self)
++{
++  GstVulkanEncoderPrivate *priv;
++
++  g_return_val_if_fail (GST_IS_VULKAN_ENCODER (self), 0);
++
++  priv = gst_vulkan_encoder_get_instance_private (self);
++  return priv->intra_refresh_mode;
++}
++
++/**
++ * gst_vulkan_encoder_intra_refresh_cycle_duration:
++ * @self: a #GstVulkanEncoder
++ *
++ * Returns: the negotiated intra refresh cycle duration in frames (0 when
++ *     disabled).
++ */
++guint32
++gst_vulkan_encoder_intra_refresh_cycle_duration (GstVulkanEncoder * self)
++{
++  GstVulkanEncoderPrivate *priv;
++
++  g_return_val_if_fail (GST_IS_VULKAN_ENCODER (self), 0);
++
++  priv = gst_vulkan_encoder_get_instance_private (self);
++  return priv->intra_refresh_cycle_duration;
++}
++
++/**
++ * gst_vulkan_encoder_intra_refresh_max_active_references:
++ * @self: a #GstVulkanEncoder
++ *
++ * Returns: the driver's maxIntraRefreshActiveReferencePictures (0 when intra
++ *     refresh was not negotiated).
++ */
++guint32
++gst_vulkan_encoder_intra_refresh_max_active_references (GstVulkanEncoder * self)
++{
++  GstVulkanEncoderPrivate *priv;
++
++  g_return_val_if_fail (GST_IS_VULKAN_ENCODER (self), 0);
++
++  priv = gst_vulkan_encoder_get_instance_private (self);
++  return priv->intra_refresh_max_active_refs;
++}
++
+ GType
+ gst_vulkan_encoder_rate_control_mode_get_type (void)
+ {
+diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.h b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.h
+index 13661e4..f784f72 100644
+--- a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.h
++++ b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.h
+@@ -93,6 +93,14 @@ struct _GstVulkanEncoderPicture
+   VkVideoReferenceSlotInfoKHR dpb_slot;
+ 
+   gpointer codec_rc_info;
++
++  /* PATCH (intra-refresh): when non-NULL, points at a codec-filled
++   * VkVideoReferenceIntraRefreshInfoKHR (whose own pNext continues this slot's
++   * normal reference chain). gst_vulkan_encoder_encode() chains it into the
++   * pNext of this picture's entry in VkVideoEncodeInfoKHR::pReferenceSlots when
++   * the picture is used as an ACTIVE reference (never on the setup slot). Set by
++   * the codec element per frame; must be initialized to NULL. */
++  const void *reference_intra_refresh_info;
+ };
+ 
+ /**
+@@ -177,6 +185,24 @@ void                    gst_vulkan_encoder_set_rc_mode          (GstVulkanEncode
+ GST_VULKAN_API
+ void                    gst_vulkan_encoder_request_rc_reset     (GstVulkanEncoder * self);
+ 
++/* PATCH (intra-refresh): request rolling intra refresh (must be called before
++ * gst_vulkan_encoder_start()). @region_count is the number of intra-refresh
++ * regions the caller wants per cycle (for H.264 per-picture-partition mode this
++ * is the slice count). The concrete mode and cycle duration are negotiated in
++ * gst_vulkan_encoder_start() against the driver's
++ * VkVideoEncodeIntraRefreshCapabilitiesKHR and read back with the accessors
++ * below (mode 0 == unsupported/disabled -> fail open to no intra refresh). */
++GST_VULKAN_API
++void                    gst_vulkan_encoder_set_intra_refresh    (GstVulkanEncoder * self,
++                                                                 gboolean enabled,
++                                                                 guint32 region_count);
++GST_VULKAN_API
++guint32                 gst_vulkan_encoder_intra_refresh_mode    (GstVulkanEncoder * self);
++GST_VULKAN_API
++guint32                 gst_vulkan_encoder_intra_refresh_cycle_duration (GstVulkanEncoder * self);
++GST_VULKAN_API
++guint32                 gst_vulkan_encoder_intra_refresh_max_active_references (GstVulkanEncoder * self);
++
+ GST_VULKAN_API
+ gboolean                gst_vulkan_encoder_start                (GstVulkanEncoder * self,
+                                                                  GstVulkanVideoProfile * profile,

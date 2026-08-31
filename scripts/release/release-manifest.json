@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "purpose": "Canonical release inputs for a supported Quasar deployment. Targets are named by GPU profile and ingress shape, never after a particular operator's host. This file describes inputs; scripts/release/release-preflight.sh records the exact identities for a candidate.",
+  "supported_targets": [
+    {
+      "name": "private-lan-va",
+      "gpu_profile": "va",
+      "compose": ["deploy/docker-compose.yml"],
+      "artifacts": ["quasar-control", "quasar-agent", "postgres"],
+      "ingress": "private LAN HTTP/WS only; TLS/WSS is not applicable until a public or cross-trust-boundary ingress exists"
+    },
+    {
+      "name": "private-lan-nvidia",
+      "gpu_profile": "nvidia",
+      "compose": ["deploy/docker-compose.yml", "deploy/docker-compose.nvidia.yml"],
+      "artifacts": ["quasar-control", "quasar-agent", "postgres"],
+      "ingress": "private LAN HTTP/WS only; TLS/WSS is not applicable until a public or cross-trust-boundary ingress exists"
+    },
+    {
+      "name": "public-edge-va",
+      "gpu_profile": "va",
+      "compose": ["deploy/docker-compose.yml", "deploy/docker-compose.hardened.yml"],
+      "artifacts": ["quasar-control", "quasar-agent", "caddy", "postgres"],
+      "ingress": "operator-supplied certificate and hostname required; this target is not accepted by private-LAN evidence"
+    },
+    {
+      "name": "public-edge-nvidia",
+      "gpu_profile": "nvidia",
+      "compose": ["deploy/docker-compose.yml", "deploy/docker-compose.nvidia.yml", "deploy/docker-compose.hardened.yml"],
+      "artifacts": ["quasar-control", "quasar-agent", "caddy", "postgres"],
+      "ingress": "operator-supplied certificate and hostname required; this target is not accepted by private-LAN evidence"
+    }
+  ],
+  "artifacts": [
+    {
+      "name": "quasar-control",
+      "image": "operator release tag required",
+      "dockerfile": "deploy/Dockerfile.control.prod",
+      "target": "default",
+      "required": true
+    },
+    {
+      "name": "quasar-agent",
+      "image": "operator release tag required",
+      "dockerfile": "deploy/Dockerfile.vulkan",
+      "target": "runtime on a va host; nv on an nvidia host (the CUDA lineage is FROM runtime)",
+      "required": true
+    },
+    {
+      "name": "postgres",
+      "image": "postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777",
+      "external": true,
+      "required": true
+    },
+    {
+      "name": "caddy",
+      "image": "caddy@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c",
+      "external": true,
+      "required": false
+    }
+  ],
+  "upstream_pins": [
+    {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "GST_INTERPIPE_REF", "value": "0c454917"},
+    {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "GST_PLUGINS_RS_REF", "value": "cee45224cb2d10e1523af4f256d0dd64c8b29491"},
+    {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "GST_WAYLAND_DISPLAY_REF", "value": "310c03eca4b90b653885def4e3348034067c8c72"},
+    {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "CARGO_C_VERSION", "value": "0.10.23"},
+    {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "RUST_VERSION", "value": "1.94.0"},
+    {"dockerfile": "deploy/Dockerfile.vulkan", "arg": "DOCKER_VERSION", "value": "27.5.1"}
+  ],
+  "patches": [
+    "deploy/patches/vulkan/vkh264enc-dpb-pool-in-new-sequence.patch",
+    "deploy/patches/vulkan/vulkanh265enc.patch",
+    "deploy/patches/vulkan/vkh264enc-rc-fix.patch",
+    "deploy/patches/vulkan/vkh264enc-num-slices.patch",
+    "deploy/patches/vulkan/gstreamer-vulkan-global-submit-lock.patch",
+    "deploy/patches/vulkan/vkh264enc-intra-refresh.patch",
+    "deploy/patches/vulkan/gstreamer-vulkan-rc-retarget-no-reset.patch",
+    "deploy/patches/vulkan/vulkanav1enc.patch",
+    "deploy/patches/vulkan/vulkan-enc-output-state-on-resize.patch",
+    "deploy/patches/vulkan/vkenc-bitstream-buffer-pool.patch"
+  ],
+  "fork_carried_provenance": {
+    "purpose": "Compositor modifications are no longer applied as a patch stack: since 2026-07-26 Dockerfile.vulkan builds the Quasar fork's develop branch (GST_WAYLAND_DISPLAY_REF above), which carries each former gst-wayland-display-*.patch as a commit. The patch files remain in deploy/patches/vulkan/ as the authored record for upstream submission (see its README and docs/third-party-pins.md); they are provenance, not build inputs, so they are deliberately NOT in the patches list below. That list is only an inventory: release-preflight.sh checks that each listed file exists and records its sha256. It does NOT verify that the list matches the Dockerfile's git apply sequence, cover every patch the build applies, or check apply order -- keeping those in step is a manual step when a patch is added or reordered.",
+    "carried_by": "GST_WAYLAND_DISPLAY_REF"
+  },
+  "legacy_non_release_dockerfiles_purpose": "Dockerfiles that exist in the tree but are deliberately NOT release inputs. release-preflight.sh stats every entry and FAILS on a missing one, so a file deleted from the tree must be removed from this list in the same commit -- the list cannot rot into naming phantoms again (Dockerfile.dev, Dockerfile.nv and Dockerfile.agent.prod were listed here long after deletion).",
+  "legacy_non_release_dockerfiles": [
+    "deploy/Dockerfile.control"
+  ],
+  "required_release_evidence": [
+    "preflight JSON attached to the candidate",
+    "image digest for each published artifact",
+    "SBOM for each published artifact",
+    "vulnerability scan for each published artifact",
+    "signature verification for each published artifact",
+    "backup/restore and supported-version upgrade rehearsal"
+  ],
+  "release_scanners": [
+    {
+      "name": "syft",
+      "purpose": "CycloneDX SBOM generation from local Docker archive",
+      "image": "anchore/syft@sha256:046f0c3b14e4451a1d0cd2f367ce3ba3bd653cbd23a7749556f46592d0281a0d",
+      "verified_at_utc": "2026-07-13T00:00:00Z",
+      "verification": "docker buildx imagetools inspect anchore/syft:v1.41.0"
+    },
+    {
+      "name": "trivy",
+      "purpose": "offline vulnerability scan from local Docker archive",
+      "image": "aquasec/trivy@sha256:bcc376de8d77cfe086a917230e818dc9f8528e3c852f7b1aff648949b6258d1c",
+      "verified_at_utc": "2026-07-13T00:00:00Z",
+      "verification": "docker buildx imagetools inspect aquasec/trivy:0.69.3"
+    }
+  ]
+}

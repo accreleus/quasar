@@ -1,0 +1,290 @@
+/* ============================================================
+   QUASAR — Shell and page-level styles (what is not a primitive)
+
+   Everything the v3 primitives own — buttons, cards, chips, inputs,
+   the table, menus, overlays, bars and gauges — lives in
+   primitives.css. One owner per class: if a selector appears there,
+   it must not appear here.
+
+   The v3 shell (`.app`, `.topbar`, `.brand`, `.nav`, `.rail`, `.main`,
+   `.tabbar`) moved to shell.css when Task 3 replaced it — nothing
+   shell-shaped may come back here.
+
+   What is left: the host-settings rows, the layout utilities, the chart
+   card, and a handful of page-level surfaces that are not primitives.
+   ============================================================ */
+
+/* EVERY `backdrop-filter` IN THIS TREE MUST BE WRITTEN TWICE — canonical note,
+   referenced by the other stylesheets.
+   `web/` has no autoprefixer and no browserslist (check `package.json` and
+   `vite.config.ts` before assuming otherwise): Vite's esbuild transform does
+   not add vendor prefixes, so what is typed here is exactly what ships. The
+   unprefixed property only reached Safari in 18.0, and Quasar's own target
+   device class runs behind that — an iPad on iPadOS 17 is current hardware.
+   Unpaired, a scrim silently loses its blur, which is not cosmetic where the
+   scrim exists to keep text legible over artwork or over live video.
+   `-webkit-backdrop-filter` has shipped in Safari since 9, so the pair covers
+   everything; a browser that understands both simply takes the later one.
+   Order is irrelevant, presence is not. 22 declarations, all paired
+   (2026-08-07); the previous 20 unpaired ones were a decade of Safari blur
+   quietly missing. */
+
+
+/* ---------- HOST SETTINGS PAGE ---------- */
+/* These back ReadinessCard.tsx (host settings + the setup wizard's Host & GPU
+   step) and KnobRow.tsx's stale-effective notice. The page shell around them
+   is the v3 `.split`/`.cset` layout in primitives.css. */
+.host-setting-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(240px, 0.9fr);
+  gap: var(--s5);
+  padding: var(--s5) var(--s6);
+  border-top: 1px solid var(--line);
+  background: var(--ink-3);
+}
+
+/* Readiness checks as tiles (ReadinessCard layout="grid"): auto-fill so the
+   column count follows the viewport, never a fixed sidebar. */
+.readiness-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: var(--s3);
+}
+
+/* Status glyph: an 18 px ring with a tick / cross / exclamation / dash, in
+   place of a labelled pill. The word is the element's accessible name. */
+.rdy-glyph {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1.5px solid currentColor;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.rdy-glyph svg {
+  width: 11px;
+  height: 11px;
+  stroke-width: 2.2;
+}
+
+.rdy-ok { color: var(--success); background: var(--success-bg); }
+.rdy-bad { color: var(--danger); background: var(--danger-bg); }
+.rdy-warn { color: var(--warning); background: var(--warning-bg); }
+.rdy-off { color: var(--text-3); border-style: dashed; }
+
+.readiness-check {
+  display: flex;
+  gap: var(--s3);
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-control);
+  background: var(--surf-inset);
+  min-width: 0;
+}
+
+.readiness-check .host-setting-copy {
+  min-width: 0;
+}
+
+.host-setting-copy h3 {
+  margin: 0;
+  font-size: var(--t-base);
+}
+
+.host-setting-copy p {
+  margin: var(--s2) 0;
+  color: var(--text-2);
+  font-size: var(--t-sm);
+}
+
+.host-setting-copy code {
+  color: var(--text-3);
+  font-size: var(--t-xs);
+}
+
+/* Restart-class knob whose agent-reported `effective` value disagrees with the
+   catalog-resolved display (e.g. resolved shows "software" while the agent is
+   actually running a real render device). */
+.host-setting-effective {
+  margin: 0;
+  padding: var(--s2) var(--s3);
+  border-radius: var(--r-xs);
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-line);
+  color: var(--warning-text);
+  font-size: var(--t-xs);
+}
+
+.host-setting-effective strong {
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+
+@media (max-width: 900px) {
+  .host-setting-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+
+/* ---------- UTILITIES ---------- */
+.row { display: flex; align-items: center; gap: var(--s3); }
+.col { display: flex; flex-direction: column; }
+.between { justify-content: space-between; }
+.wrap { flex-wrap: wrap; }
+.grow { flex: 1; }
+.center { align-items: center; }
+.gap2 { gap: var(--s2); } .gap3 { gap: var(--s3); } .gap4 { gap: var(--s4); }
+.gap5 { gap: var(--s5); } .gap6 { gap: var(--s6); }
+.mt2 { margin-top: var(--s2); } .mt3 { margin-top: var(--s3); } .mt4 { margin-top: var(--s4); }
+.mt5 { margin-top: var(--s5); }
+.mb3 { margin-bottom: var(--s3); } .mb4 { margin-bottom: var(--s4); }
+.mb5 { margin-bottom: var(--s5); } .mb6 { margin-bottom: var(--s6); }
+.nowrap { white-space: nowrap; }
+.right { text-align: right; }
+.muted { color: var(--text-3); }
+.sec { color: var(--text-2); }
+
+
+/* ---------- CHART / SPARKLINE ---------- */
+.legend { display: flex; gap: 14px; font-size: var(--t-xs); color: var(--text-3); }
+.legend i { display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 5px; }
+
+
+
+
+/* Library tiles: a touch more lift so the grid reads on white (home.css
+   defines .lib-tile itself; this is the same UI-16 readability hardening
+   that used to target the retired .game tile). */
+[data-theme="light"] .lib-tile {
+  box-shadow: var(--shadow-sm);
+}
+
+
+/* ---------- A11Y UTILITY ----------
+   Visually hidden but available to assistive tech. Used where a chip or glyph
+   carries meaning visually that its text alone does not state (e.g. a codec
+   capability chip whose colour says supported/not supported). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Two-column password/secret form grid (people/InvitesTab.tsx). */
+.pw-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: var(--s4);
+  max-width: 560px;
+}
+
+/* ── Overlay preview (account settings, OverlayPreview.tsx) ───────────────
+   Session-screen stand-in the real SessionStrip renders onto, so a user can
+   see stripPosition (top/bottom) without launching a session. The v3 mock
+   has it (design_handoff_v3/screens/assets/console-v3.css `.ovprev-stage`,
+   rendered by pages-account.js) as a small centred stage; ours is a
+   full-width letterbox because it embeds the live strip at its real
+   content-driven width rather than a redrawn one.
+
+   `contain: layout paint` is load-bearing: SessionStrip's own CSS
+   (session.css) is `position: fixed`, so during a live session it floats
+   over the whole viewport. Layout containment makes this element the
+   containing block for that fixed descendant instead, so the embedded strip
+   renders inside the stage; paint containment clips it to the rounded
+   corners and gives it its own stacking context. */
+.ovprev-stage {
+  position: relative;
+  contain: layout paint;
+  /* Full width, letterbox height. not 16/9 with a max-width: the strip's
+     width is content-driven (766px at "Full" on a wide page), so a 480px
+     frame painted-clipped it at both ends — the preview showed the middle of
+     a strip with the actions cut off. Width now comes from the card and the
+     height is a band deep enough to read as a screen edge, which is all the
+     top/bottom setting needs to be legible. .ovprev-scale handles whatever
+     still does not fit. */
+  width: 100%;
+  height: clamp(190px, 18vw, 280px);
+  border-radius: var(--r-lg);
+  border: 1px solid var(--line);
+  background: linear-gradient(160deg, var(--ink-1), oklch(0 0 0) 130%);
+  box-shadow: var(--shadow-md), var(--inset-top);
+  /* Everything inside is illustrative only (OverlayPreview.tsx sweeps
+     aria-hidden + tabindex="-1" onto the embedded strip) — pointer-events:
+     none is the belt to that suspenders, so a stray click cannot reach a
+     handler either, and the cursor does not invite one. */
+  pointer-events: none;
+}
+
+/* Shrink-to-fit layer. --ovprev-k is measured and set by OverlayPreview.tsx
+   (never above 1 — a strip narrower than the stage keeps its true size, since
+   how large the strip looks against a screen is part of what is previewed).
+   The transform also makes this the containing block for the strip's
+   position:fixed, the same job `contain: layout` does on the stage. */
+.ovprev-scale {
+  position: absolute;
+  inset: 0;
+  transform: scale(var(--ovprev-k, 1));
+  transform-origin: 50% 50%;
+}
+
+.ovprev-stage.ovprev-off {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--s6);
+}
+.ovprev-stage.ovprev-off p {
+  margin: 0;
+  max-width: 34ch;
+  text-align: center;
+  color: var(--text-3);
+  font-size: var(--t-sm);
+  line-height: 1.5;
+}
+
+/* Launch capability the host cannot meet at all (home/BandNotes.tsx); the
+   detail band tightens it in home.css. */
+.lm-cap-fatal {
+  margin: var(--s2) 0 0;
+  font-size: var(--t-xs);
+  color: var(--danger-text);
+}
+
+/* Inline validation message below a field (SecretField). */
+.apps-field-err {
+  font-size: var(--t-xs);
+  color: var(--danger-text);
+  margin-top: 3px;
+  line-height: 1.3;
+}
+
+/* ── Shared failure log-tail (first-run-experience §S5) ──
+   components/SessionFailureDetail.tsx's CollapsibleLogTail — the app
+   container's captured log tail, shown by both the stream-client's terminal
+   loader card and the admin session drill-down. One box style so the two
+   surfaces can't visually drift the way their pre-extraction duplicates did. */
+.failure-log-tail-pre {
+  max-height: 240px;
+  padding: 10px 12px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: rgb(0 0 0 / 22%);
+  color: var(--text-3);
+  font-size: var(--t-xs);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

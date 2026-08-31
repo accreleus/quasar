@@ -1,0 +1,58 @@
+Quasar-authored. Issue #428 — one GstCaps leaked per caps-compatibility check.
+
+gst_inter_pipe_sink_are_caps_compatible() computes
+`renegotiated_caps = gst_caps_intersect (listener_caps, sinkcaps)` and returns on
+BOTH paths without unreffing it. gst_caps_intersect() is (transfer full), so every
+call leaks exactly one GstCaps.
+
+Reached from gst_inter_pipe_sink_add_listener() only when the sink has already
+negotiated caps, other listeners are attached, and the listener's caps differ from
+the sink's — rare in Quasar's single-format topology, which is why it is low
+priority — but unbounded where it does fire, and invisible to a
+`leaks(filters=GstObject)` census (a GstCaps is a GstMiniObject, and after teardown
+no live GstObject holds it), exactly like the #418 leak.
+
+Restructured so the function has one exit: the compatible/incompatible decision and
+its log line both happen before the unref, and the unref happens on the way out.
+
+Applies to the ${GST_INTERPIPE_REF} checkout alongside
+interpipesink-add-listener-caps-leak.patch; the two touch different functions
+(~line 345 vs ~line 980) and are order-independent. Verified in the dev container:
+meson build clean, full suite 15/15 green (gst_test_caps_renegotiation and
+gst_test_invalid_caps exercise this path).
+
+diff --git a/gst/interpipe/gstinterpipesink.c b/gst/interpipe/gstinterpipesink.c
+index 4e0acfc..c2500b1 100644
+--- a/gst/interpipe/gstinterpipesink.c
++++ b/gst/interpipe/gstinterpipesink.c
+@@ -346,18 +346,24 @@ gst_inter_pipe_sink_are_caps_compatible (GstInterPipeSink * sink,
+     GstCaps * listener_caps, GstCaps * sinkcaps)
+ {
+   GstCaps *renegotiated_caps = NULL;
++  gboolean compatible;
+ 
++  /* gst_caps_intersect() is (transfer full): the result is ours to release on
++   * BOTH exit paths. It used to be released on neither, leaking one GstCaps per
++   * call whenever the listener and the sink negotiated different caps. */
+   renegotiated_caps = gst_caps_intersect (listener_caps, sinkcaps);
+ 
+-  if (gst_caps_is_empty (renegotiated_caps)) {
++  compatible = !gst_caps_is_empty (renegotiated_caps);
++  if (compatible) {
++    GST_INFO_OBJECT (sink, "Renegotiated caps: %" GST_PTR_FORMAT,
++        renegotiated_caps);
++  } else {
+     GST_ERROR_OBJECT (sink, "No caps intersection between listener and sink");
+-    return FALSE;
+   }
+ 
+-  GST_INFO_OBJECT (sink, "Renegotiated caps: %" GST_PTR_FORMAT,
+-      renegotiated_caps);
++  gst_caps_unref (renegotiated_caps);
+ 
+-  return TRUE;
++  return compatible;
+ }
+ 
+ static GstCaps *
+

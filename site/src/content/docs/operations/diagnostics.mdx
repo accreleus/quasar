@@ -1,0 +1,114 @@
+---
+title: Diagnostics
+description: Taking a diagnostic bundle, what is in one, and how to read the verdict.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+When a session was bad, the diagnostic bundle is the thing to reach for. It
+correlates what the encoder, the network and the client were each doing over the
+same window, and offers a verdict on which of the three was responsible.
+
+## Taking one
+
+From Admin, Sessions, open the session and take a bundle.
+
+Or over the API, with an admin token:
+
+```bash
+curl -s "https://<host>:8443/v1/admin/sessions/<session-id>/diagnostic-bundle" \
+  -H "Authorization: Bearer $TOKEN" > bundle.json
+```
+
+The window defaults to five minutes and is clamped between two and ten.
+
+<Aside type="caution" title="Take it while the session is recent">
+While a session is running, telemetry uses a rolling one-hour window. When the
+session ends, that telemetry is frozen and retained for 24 hours by default, so
+you can investigate a failure later the same day. Diagnostic capture results are
+not removed by either rolling-window rule.
+</Aside>
+
+## What is in one
+
+**Metrics**, sampled over the window. Encoder time, frame rate, ABR setpoint,
+round trip time, packet loss, client presentation interval variation.
+
+**Events**, discrete moments. Bitrate retargets, freeze detections, WebRTC state
+changes, playout buffer changes.
+
+**Clock alignment** between the host and the browser, so browser-clock and
+host-clock series can be compared honestly. If the clocks were never
+synchronised, this says so rather than assuming a zero offset. An unmeasured
+clock means any end-to-end latency figure in the bundle is not trustworthy.
+
+**Derived windows**, where the analysis found hitches, bitrate downshifts,
+encoder saturation, or likely congestion.
+
+**A verdict.**
+
+## Reading the verdict
+
+| Verdict | Meaning |
+| --- | --- |
+| `nominal` | Nothing wrong was found and the browser tab was visible. |
+| `likely_network_congestion` | Loss and round trip time rose together with a bitrate downshift. |
+| `likely_encoder_saturation` | Encode time was at or above the ceiling while frame rate was steady. |
+| `likely_client_presentation_limit` | The client presented frames unevenly while encode and network looked clean. |
+| `indeterminate_client_hidden` | The browser tab was hidden. No verdict is possible. |
+| `unknown` | Reserved for a result that does not fit the classified cases. |
+
+Alongside it is a short list of evidence in plain language, such as a bitrate
+downshift coinciding with a rise in loss and a 60 ms round trip at the 95th
+percentile.
+
+<Aside type="note" title="`indeterminate_client_hidden` is not a failure to diagnose">
+A backgrounded or occluded browser tab throttles presentation, which inflates
+every client-side smoothness number. Rather than guess, the classifier refuses.
+Reproduce the problem with the tab visible and take another bundle.
+</Aside>
+
+The verdict is observational. Nothing acts on it automatically, and new verdict
+values may appear as the control plane's classifier evolves.
+
+## The thresholds it uses
+
+Useful if you are reading the raw numbers yourself.
+
+| Signal | Threshold |
+| --- | --- |
+| Encode time, 95th percentile | 16 ms and above is saturation |
+| Presentation interval variation | 18 ms and above contributes to a hitch after warm-up and repeated samples |
+| Round trip time, 95th percentile | above 50 ms contributes to congestion |
+| Cumulative packet loss rise | above 5 packets contributes to congestion |
+| Host frame rate, 10th percentile | below 50 fps means the encoder is not steady |
+
+## Annotations
+
+You can drop a marker with a note onto a session's timeline. When you are
+changing a setting mid-session, annotate the change so it appears next to its
+effect in the bundle. This is the difference between a comparison and a guess.
+
+## Comparing two runs
+
+There is no built-in comparison. Take a bundle for each, change exactly one
+thing between them, and keep everything else identical: same app, same tier,
+same client, same network, similar content.
+
+The differences involved in most tuning are smaller than the variation you get
+from not controlling the test.
+
+## What to attach to a bug report
+
+The diagnostic bundle. It contains the metrics, the events, the clock state and
+the verdict, which is most of what anyone would ask you for.
+
+For install and startup problems rather than session problems, a sanitised
+state dump is more useful:
+
+```bash
+make diagnose-bundle
+```
+
+That collects container states, health endpoints, versions and recent errors,
+with secrets redacted.

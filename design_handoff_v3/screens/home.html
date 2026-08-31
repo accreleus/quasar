@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en" data-density="comfortable">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Quasar — Home</title>
+<link rel="stylesheet" href="assets/quasar.css">
+<link rel="stylesheet" href="assets/home-v3.css">
+<style>
+  /* quasar.css hardcodes the scrollbar to dark ink — retint it from the v3 tokens (thumb darker than canvas in both themes) */
+  html{scrollbar-color:var(--line-3) transparent;}
+  html::-webkit-scrollbar,body::-webkit-scrollbar{width:11px;height:11px;background:transparent;}
+  html::-webkit-scrollbar-track,body::-webkit-scrollbar-track{background:transparent;}
+  html::-webkit-scrollbar-thumb,body::-webkit-scrollbar-thumb{background:var(--line-3);border:3px solid transparent;background-clip:content-box;border-radius:var(--r-pill);}
+  html::-webkit-scrollbar-thumb:hover,body::-webkit-scrollbar-thumb:hover{background:var(--text-3);background-clip:content-box;}
+  /* home-v3.css puts the ambient wash on `html body`, whose background box stops at the content edge — the
+   * scrollbar gutter is only ever painted by the ROOT, so the two met in a hard seam. One source of truth:
+   * body's wash off (selector must outrank `html body`), same gradients moved onto html. */
+  html body,html[data-theme="light"] body{background-image:none;}
+  html{background-color:var(--surf-canvas);background-repeat:no-repeat;background-size:100vw 100vh;
+    background-image:radial-gradient(1400px 800px at 74% -20%,oklch(0.5998 0.2179 273.21/.12),transparent 62%),radial-gradient(1000px 600px at -8% 26%,oklch(0.5 0.19 273.21/.07),transparent 58%);}
+  html[data-theme="light"]{background-image:radial-gradient(1400px 800px at 74% -20%,oklch(0.5998 0.2179 273.21/.1),transparent 62%),radial-gradient(1000px 600px at -8% 26%,oklch(0.5 0.19 273.21/.06),transparent 58%);}
+  .sweep{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:0;}
+  .sweep::before{content:"";position:absolute;left:-20%;right:-20%;top:-780px;height:1200px;border-radius:50%;
+    background:linear-gradient(180deg,transparent 82%,rgba(106,69,245,.10) 94%,rgba(0,192,255,.06));
+    border-bottom:1px solid rgba(255,255,255,.05);}
+  .hero-wrap{position:relative;max-height:860px;transition:max-height .55s cubic-bezier(.3,.8,.3,1),opacity .38s ease;overflow:hidden;}
+  body.view-lib .hero-wrap{max-height:0;opacity:0;pointer-events:none;}
+  .src-head{display:flex;align-items:baseline;gap:12px;margin:var(--s7) 0 var(--s4);}
+  .src-head h3{font-size:var(--t-h3);}
+  .src-head .count{font-size:var(--t-sm);color:var(--text-3);background:var(--ink-3);border:1px solid var(--line);padding:2px 9px;border-radius:var(--r-pill);}
+  .src-head .s-sub{font-size:var(--t-sm);color:var(--text-3);}
+  #libGroups{animation:d-in .3s ease;}
+  .hero{position:relative;z-index:1;display:grid;grid-template-columns:280px 1fr;gap:var(--s8);align-items:start;
+    max-width:1400px;margin:0 auto;padding:var(--s9) var(--page-pad) var(--s7);}
+  .hero-copy{padding-top:56px;}
+  .hero-copy h1{font-size:3.4rem;letter-spacing:-.03em;line-height:1.02;font-weight:700;}
+  .hero-copy h1 em{font-style:normal;background:var(--brand-grad);-webkit-background-clip:text;background-clip:text;color:transparent;}
+  .hero-copy .sub{color:var(--text-2);margin-top:18px;font-size:var(--t-lg);line-height:1.55;max-width:220px;}
+
+  /* featured rail */
+  .rail{position:relative;min-width:0;}
+  .rail-track{display:flex;gap:var(--s5);overflow-x:auto;scroll-snap-type:x mandatory;padding:6px 6px 22px;margin:-6px;scrollbar-width:none;}
+  .rail-track::-webkit-scrollbar{display:none;}
+  .feat{flex:0 0 280px;scroll-snap-align:start;display:flex;flex-direction:column;border-radius:var(--r-xl);overflow:hidden;
+    background:var(--ink-3);border:1px solid var(--line);box-shadow:var(--shadow-md);transition:transform .2s ease,box-shadow .2s ease,border-color .2s;cursor:pointer;}
+  .feat:hover{transform:translateY(-6px);box-shadow:var(--shadow-lg);border-color:var(--line-3);}
+  .poster{position:relative;aspect-ratio:2/3;overflow:hidden;background:var(--ink-4);}
+  .poster img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;}
+  .poster .fb{position:absolute;inset:0;display:grid;place-content:center;}
+  .poster .fb .glyph{font-family:var(--font-display);font-weight:700;font-size:3rem;color:rgba(255,255,255,.92);letter-spacing:-.03em;mix-blend-mode:overlay;}
+  .poster .tier{position:absolute;top:12px;left:12px;background:rgba(8,8,12,.55);backdrop-filter:blur(8px);z-index:1;}
+  .playov{position:absolute;inset:0;z-index:2;display:grid;place-content:center;background:rgba(6,6,10,.35);opacity:0;transition:opacity .18s ease;border:0;cursor:pointer;padding:0;pointer-events:none;}
+  .playov .pb{pointer-events:none;}
+  .poster:hover .playov .pb,.tile:hover .playov .pb{pointer-events:auto;}
+  .poster:hover .playov,.tile:hover .playov,.playov:focus-visible{opacity:1;}
+  .playov .pb{width:64px;height:64px;border-radius:50%;background:var(--accent);display:grid;place-content:center;color:#fff;box-shadow:0 8px 28px -6px rgba(106,69,245,.8),0 0 0 6px rgba(106,69,245,.22);transition:transform .18s ease,background .15s;transform:scale(.9);}
+  .playov:hover .pb{background:var(--accent-hover);transform:scale(1);}
+  .playov .pb svg{width:24px;height:24px;margin-left:3px;}
+  .tile .playov .pb{width:54px;height:54px;}
+  .tile .playov .pb svg{width:20px;height:20px;}
+  .feat-body{padding:15px 17px 17px;display:flex;flex-direction:column;gap:8px;flex:1;}
+  .feat-kicker{font-size:var(--t-sm);font-weight:700;}
+  .feat-kicker.live{color:var(--success-text);display:flex;align-items:center;gap:8px;}
+  .feat-kicker.info{color:var(--info-text);}
+  .feat-kicker.accent{color:var(--accent-text);}
+  .feat-action{font-family:var(--font-display);font-size:1.2rem;font-weight:600;letter-spacing:-.01em;line-height:1.2;}
+  .feat-name{color:var(--text-3);font-size:var(--t-sm);margin-top:auto;padding-top:8px;}
+  .rail-btn{position:absolute;top:calc(50% - 60px);right:-8px;z-index:2;width:52px;height:52px;border-radius:50%;
+    background:var(--ink-4);border:1px solid var(--line-2);color:var(--text);display:grid;place-content:center;cursor:pointer;
+    box-shadow:var(--shadow-lg);transition:.15s;}
+  .rail-btn:hover{background:var(--ink-5);border-color:var(--line-3);}
+  .rail-btn svg{width:20px;height:20px;}
+  .rail-btn.prev{left:-8px;right:auto;}
+  .rail-fade{position:absolute;top:0;bottom:16px;right:0;width:70px;background:linear-gradient(90deg,transparent,var(--ink-1));pointer-events:none;z-index:1;}
+
+  /* library */
+  .lib{max-width:1400px;margin:0 auto;padding:0 var(--page-pad) 96px;position:relative;z-index:1;}
+  .lib-head{display:flex;align-items:center;gap:14px;margin:var(--s7) 0 var(--s5);}
+  .lib-head h2{font-size:var(--t-h2);}
+  .lib-head .count{color:var(--text-3);font-size:var(--t-lg);font-weight:500;}
+  .lib-head .segmented{margin-left:6px;}
+  .lib-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:var(--s4);}
+  .tile{position:relative;border-radius:var(--r-lg);overflow:hidden;border:1px solid var(--line);background:var(--ink-4);
+    aspect-ratio:2/3;cursor:pointer;transition:transform .18s ease,box-shadow .18s,border-color .18s;padding:0;display:block;width:100%;text-align:left;}
+  .tile:hover{transform:translateY(-4px);box-shadow:var(--shadow-lg);border-color:var(--line-3);}
+  .tile img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;}
+  .tile .fb{position:absolute;inset:0;display:grid;place-content:center;}
+  .tile .fb .glyph{font-family:var(--font-display);font-weight:700;font-size:2rem;color:rgba(255,255,255,.9);mix-blend-mode:overlay;}
+  .tile .fb .fnm{position:absolute;left:0;right:0;bottom:14px;text-align:center;font-family:var(--font-display);font-weight:600;font-size:var(--t-sm);color:rgba(255,255,255,.85);padding:0 10px;}
+  .tile .fav{position:absolute;top:10px;right:10px;color:var(--lavender);filter:drop-shadow(0 1px 4px rgba(0,0,0,.6));z-index:1;}
+  .tile .running{position:absolute;top:10px;left:10px;z-index:1;background:rgba(8,8,12,.6);backdrop-filter:blur(8px);}
+  .tile.open{border-color:rgba(106,69,245,.55);box-shadow:0 0 0 1px rgba(106,69,245,.4),var(--shadow-lg);}
+  .tile.open::after{content:"";position:absolute;left:50%;bottom:-2px;transform:translateX(-50%);border:8px solid transparent;border-bottom-color:var(--accent);}
+
+  /* detail expander */
+  .detail{grid-column:1/-1;position:relative;border-radius:var(--r-xl);overflow:hidden;border:1px solid var(--line-2);
+    background:var(--ink-2);box-shadow:var(--shadow-lg);min-height:442px;display:none;}
+  .detail.show{display:block;animation:d-in .25s ease;}
+  @keyframes d-in{from{opacity:0;transform:translateY(-8px);}to{opacity:1;transform:none;}}
+  .detail .hero-art{position:absolute;inset:0;}
+  .detail .hero-art img{width:100%;height:100%;object-fit:cover;object-position:center right;display:block;}
+  .detail .hero-art::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,rgba(10,10,16,.97) 30%,rgba(10,10,16,.72) 55%,rgba(10,10,16,.15));}
+  .detail .d-close{position:absolute;top:16px;right:16px;z-index:3;}
+  .detail .d-inner{position:relative;z-index:2;padding:38px 42px;max-width:560px;display:flex;flex-direction:column;gap:16px;min-height:420px;}
+  .detail .d-kind{font-size:var(--t-xs);letter-spacing:.14em;text-transform:uppercase;color:var(--text-3);font-weight:700;}
+  .detail h2{font-size:2.1rem;letter-spacing:-.02em;}
+  .detail .d-desc{color:var(--text-2);line-height:1.55;max-width:440px;}
+  .d-specs{display:inline-flex;align-items:stretch;border:1px solid var(--line-2);border-radius:var(--r-md);background:rgba(12,12,18,.55);backdrop-filter:blur(10px);overflow:hidden;align-self:flex-start;}
+  .d-specs .sp{padding:10px 16px;border-right:1px solid var(--line);}
+  .d-specs .sp:last-child{border-right:0;}
+  .d-specs .sp .l{font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-3);font-weight:700;}
+  .d-specs .sp .v{font-family:var(--font-mono);font-size:var(--t-base);margin-top:3px;}
+  .d-rec{display:flex;align-items:center;gap:9px;font-size:var(--t-sm);color:var(--text-2);}
+  .d-rec .dot{width:7px;height:7px;border-radius:50%;background:var(--success);flex:none;}
+  .d-rec .btn{margin-left:10px;}
+  .d-actions{display:flex;align-items:center;gap:12px;margin-top:auto;padding-top:14px;}
+  .d-actions .heart{color:var(--danger-text);}
+  /* the card interior sits on the artwork scrim in BOTH themes, so its ink is pinned light */
+  .detail .d-inner{color:oklch(0.97 0.006 268);}
+  .detail .d-inner h2{color:oklch(0.99 0.004 268);}
+  .detail .d-kind,.detail .d-specs .sp .l{color:oklch(0.74 0.02 268);}
+  .detail .d-desc,.detail .d-rec{color:oklch(0.86 0.012 268);}
+  .detail .d-specs .sp .v{color:oklch(0.97 0.006 268);}
+  /* controls sit on artwork, not on the theme surface — glass, not chrome */
+  .detail .d-rec .btn-sm,.detail .d-actions .icon-btn,.detail .d-close{background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.18);color:#fff;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);box-shadow:none;}
+  .detail .d-rec .btn-sm:hover,.detail .d-actions .icon-btn:hover,.detail .d-close:hover{background:rgba(255,255,255,.17);border-color:rgba(255,255,255,.3);color:#fff;}
+  .detail .d-actions .heart svg{color:#fff;}
+  /* launch options: fills the detail card, three columns (codec -> frame rate -> resolution) */
+  .lo{position:absolute;inset:0;z-index:4;display:flex;flex-direction:column;background:color-mix(in oklch,var(--surf-panel) 93%,transparent);backdrop-filter:blur(26px) saturate(1.15);-webkit-backdrop-filter:blur(26px) saturate(1.15);
+    opacity:0;visibility:hidden;transition:opacity .2s ease,visibility 0s .2s;}
+  .lo.show{opacity:1;visibility:visible;transition-delay:0s;}
+  .qp-head{display:flex;align-items:flex-end;gap:26px;padding:20px 26px 15px;border-bottom:1px solid var(--line-2);flex:none;}
+  .qp-eyebrow{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--text-3);font-weight:700;}
+  .qp-game{font-size:var(--t-h3);font-weight:700;line-height:1.15;margin-top:4px;}
+  .qp-spec{display:flex;gap:24px;margin-left:auto;padding-right:44px;}
+  .qp-spec .sp .l{display:block;font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-3);font-weight:700;}
+  .qp-spec .sp .v{font-family:var(--font-mono);font-size:var(--t-sm);margin-top:3px;}
+  .qp-cols{flex:1;min-height:0;display:grid;grid-template-columns:1fr 1fr 1.6fr;}
+  .qp-col{display:flex;flex-direction:column;gap:7px;padding:14px 18px;min-height:0;overflow:auto;}
+  .qp-col+.qp-col{border-left:1px solid var(--line-2);}
+  .qp-section{font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--text-3);flex:none;}
+  .qp-row{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;text-align:left;padding:7px 12px;border:1px solid var(--line-2);border-radius:var(--r-md);
+    background:transparent;color:var(--text);font-family:var(--font-ui);cursor:pointer;flex:none;transition:border-color .15s,background-color .15s,opacity .15s;}
+  .qp-row:hover:not(:disabled){border-color:color-mix(in oklch,var(--accent) 60%,transparent);}
+  .qp-row[aria-checked="true"]{border-color:var(--accent);background:color-mix(in oklch,var(--accent) 14%,transparent);}
+  .qp-row:disabled{opacity:.38;cursor:not-allowed;}
+  .qp-row .qr-label{font-family:var(--font-mono);font-size:14px;}
+  .qp-row .qr-sub{font-size:11.5px;color:var(--text-3);margin-top:3px;}
+  .qp-row .qr-side{display:flex;align-items:center;gap:8px;flex:none;}
+  .qp-tag{font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--accent-text);background:var(--accent-soft);border-radius:var(--r-xs);padding:3px 8px;white-space:nowrap;}
+  .qp-tag.risky{color:var(--warning-text);background:var(--warning-bg);}
+  .qp-check{width:20px;height:20px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;border:1.5px solid var(--line-3);font-size:11px;color:transparent;flex:none;}
+  .qp-row[aria-checked="true"] .qp-check{background:var(--accent);border-color:transparent;color:#fff;}
+  .seg-hint{font-size:11.5px;line-height:1.4;color:var(--text-3);margin-top:2px;}
+  .seg-hint+.seg-hint{margin-top:4px;opacity:.72;}
+  .qp-foot{flex:none;display:flex;align-items:center;justify-content:space-between;gap:24px;padding:14px 26px;border-top:1px solid var(--line-2);}
+  .qp-verdict{display:flex;align-items:flex-start;gap:9px;font-size:12.5px;line-height:1.4;color:var(--text-2);max-width:62ch;}
+  .qp-verdict .dot{width:7px;height:7px;border-radius:50%;background:var(--success);flex:none;margin-top:5px;}
+  .qp-verdict.risky{color:var(--warning-text);}
+  .qp-verdict.risky .dot{background:var(--warning-text);}
+  .qp-verdict.off{color:var(--danger-text);}
+  .qp-verdict.off .dot{background:var(--danger-text);}
+  .qp-acts{display:flex;align-items:center;gap:10px;flex:none;}
+  .topbar .search{position:absolute;left:50%;transform:translateX(-50%);}
+  @media (max-width:1080px){.hero{grid-template-columns:1fr;}.hero-copy{padding-top:0;}}
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <svg class="mark" viewBox="0 0 32 32" fill="none"><defs><linearGradient id="qg" x1="2" y1="2" x2="30" y2="30"><stop offset="0" stop-color="#6A45F5"/><stop offset=".5" stop-color="#5B6BFF"/><stop offset="1" stop-color="#00C0FF"/></linearGradient></defs><ellipse cx="16" cy="16" rx="14.2" ry="5.4" transform="rotate(-30 16 16)" stroke="url(#qg)" stroke-width="1.6" opacity=".75"/><circle cx="16" cy="16" r="6.2" fill="url(#qg)"/><circle cx="16" cy="16" r="2.1" fill="#fff"/></svg>
+      <span class="wordmark">Quasar</span>
+    </div>
+    <nav class="nav">
+      <a href="#" id="navHome" class="active">Home</a>
+      <a href="#library" id="navLib">Library</a>
+    </nav>
+    <div class="spacer"></div>
+    <div class="search">
+      <svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="5"/><path d="M11 11l3 3" stroke-linecap="round"/></svg>
+      <input placeholder="Search games and hosts…">
+    </div>
+    <div class="usermenu">
+      <button class="user-btn" aria-expanded="false" aria-haspopup="true" onclick="toggleUserMenu(event)">
+        <span class="u-ava">A</span><span class="u-nm">admin</span>
+        <svg class="u-chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 6l4 4 4-4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <div class="user-pop">
+        <div class="up-head"><span class="u-ava">A</span><div><div class="up-name">admin</div><div class="up-mail mono">admin@quasar.local</div></div></div>
+        <a class="up-item" href="Quasar%20Admin%20Console%20v3.html#/account/profile"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="5.5" r="2.6"/><path d="M3 13.5a5 5 0 0 1 10 0" stroke-linecap="round"/></svg>Account</a>
+        <a class="up-item" href="Quasar%20Admin%20Console%20v3.html"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8l5.2 2v3.4c0 3-2.2 5.3-5.2 6.4-3-1.1-5.2-3.4-5.2-6.4V3.8z" stroke-linejoin="round"/></svg>Admin console<span class="chip chip-accent up-val" style="height:18px">Admin</span></a>
+        <div class="up-div"></div>
+        <button class="up-item" onclick="toggleTheme(event)"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="3.3"/><path d="M8 1v1.6M8 13.4V15M1 8h1.6M13.4 8H15M3.2 3.2l1.1 1.1M11.7 11.7l1.1 1.1M12.8 3.2l-1.1 1.1M4.3 11.7l-1.1 1.1" stroke-linecap="round"/></svg>Theme<span class="up-val" data-theme-label>Dark</span></button>
+        <div class="up-div"></div>
+        <a class="up-item danger" href="#"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M6 2.5H3.5v11H6M10 4.5L13.5 8 10 11.5M13.5 8H6.5" stroke-linecap="round" stroke-linejoin="round"/></svg>Sign out</a>
+      </div>
+    </div>
+  </header>
+
+  <div class="hero-wrap">
+    <div class="sweep"></div>
+    <section class="hero">
+      <div class="hero-copy">
+        <h1>Game<br><em>on</em></h1>
+        <p class="sub">Resume where you left off, or launch anything from your hosts.</p>
+      </div>
+      <div class="rail">
+        <div class="rail-track" id="railTrack">
+          <article class="feat" onclick="openDetail('injustice2',true)">
+            <div class="poster"><div class="fb cv-violet"><span class="glyph">I2</span></div><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/627270/library_600x900.jpg" alt="Injustice 2" onerror="this.remove()"><button class="playov" onclick="launch(event,'Injustice 2')" aria-label="Resume Injustice 2"><span class="pb"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M3 3h1.8v10H3z"/><path d="M6.5 3l7 5-7 5z"/></svg></span></button></div>
+            <div class="feat-body">
+              <div class="feat-kicker live"><span class="live-dot"></span>Session live · 24:18 on host-01</div>
+              <div class="feat-action">Hover to resume</div>
+              <div class="feat-name">Injustice 2</div>
+            </div>
+          </article>
+          <article class="feat" onclick="openDetail('diablo4',true)">
+            <div class="poster"><div class="fb cv-rose"><span class="glyph">D4</span></div><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/2344520/library_600x900.jpg" alt="Diablo IV" onerror="this.remove()"><button class="playov" onclick="launch(event,'Diablo IV')" aria-label="Play Diablo IV"><span class="pb"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M4.5 2.8l8.4 5.2-8.4 5.2z"/></svg></span></button></div>
+            <div class="feat-body">
+              <div class="feat-kicker accent">Most played this week</div>
+              <div class="feat-action">11 h on your server</div>
+              <div class="feat-name">Diablo IV</div>
+            </div>
+          </article>
+          <article class="feat" onclick="openDetail('hades2',true)">
+            <div class="poster"><div class="fb cv-nebula"><span class="glyph">H2</span></div><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1145350/library_600x900.jpg" alt="Hades II" onerror="this.remove()"><button class="playov" onclick="launch(event,'Hades II')" aria-label="Play Hades II"><span class="pb"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M4.5 2.8l8.4 5.2-8.4 5.2z"/></svg></span></button></div>
+            <div class="feat-body">
+              <div class="feat-kicker info">Newly added</div>
+              <div class="feat-action">Ready on host-02</div>
+              <div class="feat-name">Hades II</div>
+            </div>
+          </article>
+          <article class="feat" onclick="openDetail('dyinglight',true)">
+            <div class="poster"><div class="fb cv-horizon"><span class="glyph">DL</span></div><img src="https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/239140/library_600x900.jpg" alt="Dying Light" onerror="this.remove()"><button class="playov" onclick="launch(event,'Dying Light')" aria-label="Play Dying Light"><span class="pb"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M4.5 2.8l8.4 5.2-8.4 5.2z"/></svg></span></button></div>
+            <div class="feat-body">
+              <div class="feat-kicker accent">Pick up where you left off</div>
+              <div class="feat-action">2 h since last session</div>
+              <div class="feat-name">Dying Light</div>
+            </div>
+          </article>
+          <article class="feat" onclick="openDetail('xfce',true)">
+            <div class="poster"><div class="fb" style="background:linear-gradient(160deg,#1b2c4f,#0d1526)"><span class="glyph">XFCE</span><span class="fnm" style="position:absolute;left:0;right:0;bottom:16px;text-align:center;font-size:.75rem;color:var(--text-3);letter-spacing:.1em">DESKTOP</span></div><button class="playov" onclick="launch(event,'GOW XFCE Desktop')" aria-label="Play GOW XFCE Desktop"><span class="pb"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M4.5 2.8l8.4 5.2-8.4 5.2z"/></svg></span></button></div>
+            <div class="feat-body">
+              <div class="feat-kicker live"><span class="live-dot"></span>Running on host-01</div>
+              <div class="feat-action">Jump to your desktop</div>
+              <div class="feat-name">GOW XFCE Desktop</div>
+            </div>
+          </article>
+        </div>
+        <div class="rail-fade"></div>
+        <button class="rail-btn prev" onclick="scrollRail(-1)" aria-label="Previous" style="display:none"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M10 3L5 8l5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <button class="rail-btn next" onclick="scrollRail(1)" aria-label="Next"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 3l5 5-5 5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      </div>
+    </section>
+  </div>
+
+  <section class="lib">
+    <div class="lib-head">
+      <h2 id="libTitle">Your library</h2><span class="count" id="libCount"></span>
+      <div class="segmented" id="libFilter">
+        <button aria-selected="true" data-f="all">All</button>
+        <button data-f="fav">Favourites</button>
+        <button data-f="game">Games</button>
+        <button data-f="desktop">Desktops</button>
+      </div>
+      <span class="grow"></span>
+      <a href="#library" id="manageLink">Open full library</a>
+    </div>
+    <div class="lib-grid" id="libGrid"></div>
+    <div id="libGroups" style="display:none"></div>
+  </section>
+</div>
+<script src="assets/quasar.js"></script>
+<script>
+const GAMES=[
+ {id:'injustice2',src:'steam',app:627270,name:'Injustice™ 2',kind:'game',fav:true,desc:'Build and power up the ultimate version of your favourite DC legends in INJUSTICE 2. This is your Legend. Your Journey. Your Injustice.',res:'2560×1440',resKey:'1440p',fps:'120 fps',bitrate:'10 Mbps',codec:'Auto'},
+ {id:'diablo4',src:'steam',app:2344520,name:'Diablo® IV',kind:'game',fav:false,desc:'Join the fight for Sanctuary in Diablo IV, the ultimate action RPG adventure. Experience the campaign solo or with friends.',res:'2560×1440',resKey:'1440p',fps:'90 fps',bitrate:'12 Mbps',codec:'HEVC'},
+ {id:'hades2',src:'steam',app:1145350,name:'Hades II',kind:'game',fav:true,desc:'Battle beyond the Underworld using dark sorcery to take on the Titan of Time in this bewitching sequel to the award-winning rogue-like dungeon crawler.',res:'1920×1080',resKey:'1080p',fps:'120 fps',bitrate:'8 Mbps',codec:'Auto'},
+ {id:'dyinglight',src:'steam',app:239140,name:'Dying Light',kind:'game',fav:false,desc:'First-person survival horror in a vast open world. Scavenge by day, survive the infected by night.',res:'1920×1080',resKey:'1080p',fps:'60 fps',bitrate:'8 Mbps',codec:'Auto'},
+ {id:'diablo2',src:'battlenet',app:0,name:'Diablo II: Resurrected',kind:'game',fav:true,glyph:'D2',cv:'cv-rose',desc:'The definitive remastering of Diablo II and its Lord of Destruction expansion. Battle.net launcher app.',res:'1920×1080',resKey:'1080p',fps:'60 fps',bitrate:'8 Mbps',codec:'H.264'},
+ {id:'mk11',src:'steam',app:976310,name:'Mortal Kombat 11 Ultimate',kind:'game',fav:false,desc:'The definitive MK11 experience: every fighter, every skin, Aftermath expansion included.',res:'1920×1080',resKey:'1080p',fps:'60 fps',bitrate:'10 Mbps',codec:'Auto'},
+ {id:'nms',src:'steam',app:275850,name:"No Man's Sky",kind:'game',fav:false,desc:'An infinite procedurally-generated universe. Explore, trade, fight and survive — alone or with friends.',res:'2560×1440',resKey:'1440p',fps:'60 fps',bitrate:'12 Mbps',codec:'HEVC'},
+ {id:'redout',src:'steam',app:517710,name:'Redout: Solar Challenge Edition',kind:'game',fav:true,desc:'Blistering anti-gravity racing. The fastest game ever made by human beings.',res:'2560×1440',resKey:'1440p',fps:'120 fps',bitrate:'14 Mbps',codec:'AV1'},
+ {id:'ascent',src:'steam',app:979690,name:'The Ascent',kind:'game',fav:false,desc:'A solo and co-op action-shooter RPG set in a cyberpunk world owned by a mega corporation.',res:'1920×1080',resKey:'1080p',fps:'60 fps',bitrate:'10 Mbps',codec:'Auto'},
+ {id:'spacemarine2',src:'steam',app:2183900,name:'Warhammer 40,000: Space Marine 2',kind:'game',fav:false,desc:'Embody the superhuman skill and brutality of a Space Marine against the Tyranid swarms.',res:'2560×1440',resKey:'1440p',fps:'60 fps',bitrate:'14 Mbps',codec:'HEVC'},
+ {id:'ets2',src:'steam',app:227300,name:'Euro Truck Simulator 2',kind:'game',fav:false,desc:'Travel across Europe as king of the road, delivering cargo in the most complete trucking sim.',res:'1920×1080',resKey:'1080p',fps:'60 fps',bitrate:'6 Mbps',codec:'H.264'},
+ {id:'xfce',src:'desktop',app:0,name:'GOW XFCE Desktop',kind:'desktop',fav:false,glyph:'XFCE',cv:'',cvStyle:'background:linear-gradient(160deg,#1b2c4f,#0d1526)',running:true,desc:'Full XFCE desktop environment streamed from host-01. Browser, files and launchers included.',res:'1920×1080',resKey:'1080p',fps:'60 fps',bitrate:'6 Mbps',codec:'H.264'},
+ {id:'supermetroid',src:'romm',app:0,name:'Super Metroid',kind:'game',fav:false,glyph:'SM',cv:'cv-plasma',desc:'SNES classic served from your RomM collection, played through RetroArch.',res:'1440×1080',resKey:'1080p',fps:'60 fps',bitrate:'4 Mbps',codec:'H.264'},
+ {id:'ff7',src:'romm',app:0,name:'Final Fantasy VII',kind:'game',fav:false,glyph:'VII',cv:'cv-horizon',desc:'PS1 original from your RomM collection, played through RetroArch.',res:'1280×960',resKey:'1080p',fps:'60 fps',bitrate:'4 Mbps',codec:'H.264'}
+];
+const SOURCES=[{id:'steam',name:'Steam',sub:'via Steam launcher on host-01'},{id:'battlenet',name:'Battle.net',sub:'via Battle.net launcher on host-01'},{id:'romm',name:'RomM',sub:'retro collection · RetroArch on host-02'},{id:'desktop',name:'Desktops',sub:'full desktop environments'}];
+const art=a=>'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/'+a+'/library_600x900.jpg';
+const heroArt=a=>'https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/'+a+'/library_hero.jpg';
+const CVS=['cv-violet','cv-cyan','cv-horizon','cv-nebula','cv-plasma','cv-rose'];
+let filter='all', openId=null;
+
+let view='home';
+function catFilter(g){return filter==='all'||(filter==='fav'&&g.fav)||(filter==='game'&&g.kind==='game')||(filter==='desktop'&&g.kind==='desktop');}
+function makeTile(g,i){
+  const b=document.createElement('button');
+  b.className='tile'+(g.id===openId?' open':'');b.dataset.id=g.id;
+  b.onclick=()=>openDetail(g.id);
+  const cv=g.cv!==undefined?g.cv:CVS[i%CVS.length];
+  b.innerHTML='<span class="fb '+cv+'"'+(g.cvStyle?' style="'+g.cvStyle+'"':'')+'><span class="glyph">'+(g.glyph||g.name[0])+'</span><span class="fnm">'+g.name+'</span></span>'
+    +(g.app?'<img loading="lazy" src="'+art(g.app)+'" alt="" onerror="this.remove()">':'')
+    +(g.fav?'<span class="fav"><svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor"><path d="M8 13.8S2.2 10.3 2.2 6.4C2.2 4.4 3.8 3 5.5 3c1 0 2 .5 2.5 1.4C8.5 3.5 9.5 3 10.5 3c1.7 0 3.3 1.4 3.3 3.4 0 3.9-5.8 7.4-5.8 7.4z"/></svg></span>':'')
+    +(g.running?'<span class="chip chip-success running"><span class="dot"></span>Running</span>':'')
+    +'<span class="playov" role="button" tabindex="0" aria-label="Play '+g.name+'" onclick="launch(event,\''+g.name.replace(/'/g,"\\'")+'\')"><span class="pb"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M4.5 2.8l8.4 5.2-8.4 5.2z"/></svg></span></span>';
+  return b;
+}
+function fillGrid(grid,list){
+  grid.innerHTML='';
+  list.forEach((g,i)=>grid.appendChild(makeTile(g,i)));
+  const idx=list.findIndex(g=>g.id===openId);
+  if(idx>-1){
+    const d=document.createElement('div');d.className='detail show';d.id='detail';
+    const cols=getComputedStyle(grid).gridTemplateColumns.split(' ').length||1;
+    const after=Math.min(list.length,(Math.floor(idx/cols)+1)*cols);
+    grid.insertBefore(d,grid.children[after]||null);
+    fillDetail();
+  }
+}
+function renderLib(){
+  const list=GAMES.filter(catFilter);
+  document.getElementById('libCount').textContent=list.length+' apps';
+  const home=document.getElementById('libGrid'),groups=document.getElementById('libGroups');
+  if(view==='home'){
+    home.style.display='';groups.style.display='none';
+    fillGrid(home,list);
+  }else{
+    home.style.display='none';groups.style.display='';groups.innerHTML='';
+    SOURCES.forEach(s=>{
+      const sl=list.filter(g=>g.src===s.id);
+      if(!sl.length)return;
+      const h=document.createElement('div');h.className='src-head';
+      h.innerHTML='<h3>'+s.name+'</h3><span class="count">'+sl.length+'</span><span class="s-sub">'+s.sub+'</span>';
+      const grid=document.createElement('div');grid.className='lib-grid';
+      groups.appendChild(h);groups.appendChild(grid);
+      fillGrid(grid,sl);
+    });
+  }
+}
+function switchView(v){
+  view=v;
+  document.body.classList.toggle('view-lib',v==='library');
+  document.getElementById('navHome').classList.toggle('active',v==='home');
+  document.getElementById('navLib').classList.toggle('active',v==='library');
+  document.getElementById('libTitle').textContent=v==='library'?'Library':'Your library';
+  document.getElementById('manageLink').style.display=v==='library'?'none':'';
+  renderLib();
+}
+window.addEventListener('hashchange',()=>switchView(location.hash==='#library'?'library':'home'));
+function openDetail(id,scroll){
+  openId=(openId===id&&!scroll)?null:id;
+  renderLib();
+  if(openId&&scroll){const el=document.getElementById('detail');const y=el.getBoundingClientRect().top+window.scrollY-90;window.scrollTo({top:y,behavior:'smooth'});}
+}
+function fillDetail(){
+  const g=GAMES.find(x=>x.id===openId);
+  const d=document.getElementById('detail');
+  d.innerHTML=(g.app?'<div class="hero-art"><img src="'+heroArt(g.app)+'" alt="" onerror="this.parentElement.remove()"></div><div class="hero-art" style="background:none;pointer-events:none"></div>':'<div class="hero-art" style="'+(g.cvStyle||'background:var(--brand-grad)')+'"></div>')
+   +'<button class="icon-btn d-close" onclick="openDetail(null)" aria-label="Close"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 4l8 8M12 4l-8 8" stroke-linecap="round"/></svg></button>'
+   +'<div class="d-inner">'
+   +'<div class="d-kind">'+(g.kind==='desktop'?'Desktop':'Game')+'</div>'
+   +'<h2>'+g.name+'</h2>'
+   +'<p class="d-desc">'+g.desc+'</p>'
+   +'<div class="d-specs">'
+     +'<span class="sp"><span class="l">Resolution</span><div class="v">'+g.res+'</div></span>'
+     +'<span class="sp"><span class="l">Frame rate</span><div class="v">'+g.fps+'</div></span>'
+     +'<span class="sp"><span class="l">Bitrate</span><div class="v">'+g.bitrate+'</div></span>'
+     +'<span class="sp"><span class="l">Codec</span><div class="v">'+g.codec+'</div></span>'
+   +'</div>'
+   +'<div class="d-rec"><span class="dot"></span>Recommended for this device.<button class="btn btn-sm" onclick="toggleLO(true)"><svg class="ic" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" style="width:13px;height:13px"><path d="M2 5h8M12 5h2M2 11h2M6 11h8" stroke-linecap="round"/><circle cx="10" cy="5" r="1.6"/><circle cx="4" cy="11" r="1.6"/></svg>Adjust</button></div>'
+   +'<div class="d-actions">'
+     +'<button class="btn btn-primary btn-lg"><svg class="ic" viewBox="0 0 16 16" fill="currentColor"><path d="M4.5 2.8l8.4 5.2-8.4 5.2z"/></svg>Play</button>'
+     +'<button class="icon-btn heart" style="width:46px;height:46px;border-radius:var(--r-md)" aria-label="Favourite"><svg viewBox="0 0 16 16" fill="'+(g.fav?'currentColor':'none')+'" stroke="currentColor" stroke-width="1.4"><path d="M8 13.8S2.2 10.3 2.2 6.4C2.2 4.4 3.8 3 5.5 3c1 0 2 .5 2.5 1.4C8.5 3.5 9.5 3 10.5 3c1.7 0 3.3 1.4 3.3 3.4 0 3.9-5.8 7.4-5.8 7.4z"/></svg></button>'
+   +'</div></div>'
+   +'<div class="lo" id="lo" aria-label="Launch options"></div>';
+}
+var CODEC_BASIS={'Auto':'Your host picks the codec, best first, and falls back to one this device can decode.','H.264':'H.264 plays on every device and needs the most bandwidth of the three.','HEVC':'HEVC gives you the same picture as H.264 for noticeably less bandwidth.','AV1':'AV1 is the most efficient of the three, and the newest — decoding it can work this device harder.'};
+var RES_PX={'2160p':'3840×2160','1440p':'2560×1440','1080p':'1920×1080','720p':'1280×720'};
+var RES_BASE={'2160p':18,'1440p':10,'1080p':6.5,'720p':4};
+var DRAFT=null;
+function mbps(res,fps){var f=fps===120?1:fps===90?.85:.72;var v=Math.round(RES_BASE[res]*f*10)/10;return v;}
+function fpsOk(fps,codec){return !(fps===120&&codec==='H.264');}
+function resOk(res,codec,fps){return !(res==='2160p'&&fps===120);}
+function verdict(d){
+  if(!resOk(d.res,d.codec,d.fps))return{k:'off',t:RES_PX[d.res]+' is not available with '+d.codec+' at '+d.fps+' fps. Pick a lower resolution or frame rate.'};
+  if(d.res==='2160p')return{k:'risky',t:'Your connection has little room to spare here, so the picture may wobble when the network dips. A lower resolution or frame rate holds steadier.'};
+  if(d.res==='1440p')return{k:'',t:'Recommended for this device. Your measured network carries '+d.res+' at '+d.fps+' fps with room to spare.'};
+  return{k:'',t:d.res+' at '+d.fps+' fps needs '+mbps(d.res,d.fps)+' Mbps — comfortable on your measured network.'};
+}
+function renderLO(){
+  var g=GAMES.find(x=>x.id===openId),d=DRAFT,lo=document.getElementById('lo');
+  if(!g||!d||!lo)return;
+  var v=verdict(d);
+  var spec=[['Resolution',RES_PX[d.res]],['Frame rate',d.fps+' fps'],['Bitrate',mbps(d.res,d.fps)+' Mbps'],['Codec',d.codec]];
+  lo.innerHTML='<div class="qp-head">'
+    +'<div><div class="qp-eyebrow">Launch options</div><div class="qp-game">'+g.name+'</div></div>'
+    +'<div class="qp-spec">'+spec.map(s=>'<span class="sp"><span class="l">'+s[0]+'</span><span class="v">'+s[1]+'</span></span>').join('')+'</div>'
+    +'<button class="icon-btn d-close" onclick="toggleLO(false)" aria-label="Close options"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 4l8 8M12 4l-8 8" stroke-linecap="round"/></svg></button>'
+  +'</div>'
+  +'<div class="qp-cols">'
+    +'<div class="qp-col" role="radiogroup" aria-label="Codec"><div class="qp-section" title="Only codecs this device can decode are listed.">Codec</div>'
+      +['Auto','H.264','HEVC','AV1'].map(c=>optRow(c,'',d.codec===c,{},"setDraft('codec','"+c+"')")).join('')
+      +'<div class="seg-hint">'+CODEC_BASIS[d.codec]+'</div>'
+    +'</div>'
+    +'<div class="qp-col" role="radiogroup" aria-label="Frame rate"><div class="qp-section">Frame rate</div>'
+      +[60,90,120].map(f=>{var ok=fpsOk(f,d.codec);return optRow(f+' fps',ok?mbps(d.res,f)+' Mbps at '+d.res:'Not available with '+d.codec,d.fps===f,{off:!ok,title:ok?'':'Not available with '+d.codec+' on this device'},"setDraft('fps',"+f+")");}).join('')
+      +'<div class="seg-hint">A rate your device cannot decode is shown but cannot be picked.</div>'
+    +'</div>'
+    +'<div class="qp-col" role="radiogroup" aria-label="Resolution"><div class="qp-section">Resolution</div>'
+      +['2160p','1440p','1080p','720p'].map(r=>{
+        var ok=resOk(r,d.codec,d.fps);
+        var sub=ok?RES_PX[r]+' · '+mbps(r,d.fps)+' Mbps at '+d.fps+' fps':RES_PX[r]+' · not available with '+d.codec+' at '+d.fps+' fps';
+        return optRow(r,sub,d.res===r,{off:!ok,risky:ok&&r==='2160p',rec:r==='1440p',title:ok?'':'Not available with '+d.codec+' at '+d.fps+' fps'},"setDraft('res','"+r+"')");
+      }).join('')
+    +'</div>'
+  +'</div>'
+  +'<div class="qp-foot">'
+    +'<div class="qp-verdict'+(v.k?' '+v.k:'')+'"><span class="dot"></span><span>'+v.t+'</span></div>'
+    +'<div class="qp-acts"><button type="button" class="btn btn-ghost" onclick="toggleLO(false)">Cancel</button>'
+    +'<button type="button" class="btn btn-primary"'+(v.k==='off'?' disabled':'')+' onclick="launch(event,\''+g.name.replace(/'/g,"")+'\')"><svg class="ic" viewBox="0 0 16 16" fill="currentColor"><path d="M4.5 2.8l8.4 5.2-8.4 5.2z"/></svg>Play now</button></div>'
+  +'</div>';
+}
+function optRow(label,sub,sel,o,act){
+  return '<button type="button" class="qp-row" role="radio" aria-checked="'+!!sel+'"'+(o.off?' disabled':'')+(o.title?' title="'+o.title+'"':'')+' onclick="'+act+'">'
+    +'<span><span class="qr-label">'+label+'</span>'+(sub?'<div class="qr-sub">'+sub+'</div>':'')+'</span>'
+    +'<span class="qr-side">'+(o.rec?'<span class="qp-tag">Recommended</span>':'')+(o.risky?'<span class="qp-tag risky">Risky</span>':'')+'<span class="qp-check">✓</span></span>'
+  +'</button>';
+}
+function setDraft(k,v){
+  DRAFT[k]=v;
+  if(!fpsOk(DRAFT.fps,DRAFT.codec))DRAFT.fps=90;
+  if(!resOk(DRAFT.res,DRAFT.codec,DRAFT.fps))DRAFT.res=k==='res'?DRAFT.res:'1440p';
+  renderLO();
+}
+function toggleLO(open){
+  var g=GAMES.find(x=>x.id===openId);
+  if(open&&g){DRAFT={codec:(g.codec in CODEC_BASIS)?g.codec:'Auto',fps:parseInt(g.fps,10)||60,res:(g.resKey==='4K'?'2160p':g.resKey)||'1080p'};renderLO();}
+  document.getElementById('lo').classList.toggle('show',open);
+}
+document.addEventListener('keydown',e=>{if(e.key==='Escape'){var l=document.getElementById('lo');if(l&&l.classList.contains('show'))toggleLO(false);}});
+document.getElementById('libFilter').addEventListener('click',e=>{
+  const b=e.target.closest('button');if(!b)return;
+  filter=b.dataset.f;
+  document.querySelectorAll('#libFilter button').forEach(x=>x.setAttribute('aria-selected',x===b));
+  renderLib();
+});
+function launch(e,name){e.stopPropagation();window.location.href='loading-to-stream.html';}
+function scrollRail(dir){document.getElementById('railTrack').scrollBy({left:dir*600,behavior:'smooth'});}
+document.getElementById('railTrack').addEventListener('scroll',function(){
+  const prev=document.querySelector('.rail-btn.prev'),next=document.querySelector('.rail-btn.next');
+  prev.style.display=this.scrollLeft>20?'grid':'none';
+  next.style.display=this.scrollLeft<this.scrollWidth-this.clientWidth-20?'grid':'none';
+});
+switchView(location.hash==='#library'?'library':'home');
+let rzT;window.addEventListener('resize',()=>{if(!openId)return;clearTimeout(rzT);rzT=setTimeout(renderLib,150);});
+</script>
+<style>
+  .cv-violet{background:linear-gradient(150deg,#6A45F5,#3a1f9e);}
+  .cv-cyan{background:linear-gradient(150deg,#00C0FF,#0b5a8f);}
+  .cv-horizon{background:linear-gradient(150deg,#5B6BFF,#2a2f8c);}
+  .cv-nebula{background:linear-gradient(150deg,#8A5CF7,#b084ff);}
+  .cv-plasma{background:linear-gradient(150deg,#2E8BFF,#123a7a);}
+  .cv-rose{background:linear-gradient(150deg,#FF5470,#7a2540);}
+</style>
+</body>
+</html>

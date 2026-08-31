@@ -1,0 +1,51 @@
+name: Bug report
+description: Something isn't working as expected
+labels: ["needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security vulnerabilities should NOT be reported here. See `SECURITY.md`
+        for private disclosure instructions.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected instead, and what actually happened.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: As minimal a repro as you can manage.
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - control-plane (Go)
+        - node-agent (Rust)
+        - web (TypeScript/React)
+        - deploy (compose / images)
+        - protocol (contracts)
+        - other / not sure
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, GPU vendor, encoder in use (VA/NVENC/Vulkan), browser, and the commit/branch you're on.
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Redact anything sensitive (tokens, IPs, hostnames if that matters to you).
+      render: shell
+    validations:
+      required: false

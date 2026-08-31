@@ -1,0 +1,32 @@
+# class 1a — environment assignments
+POSTGRES_PASSWORD=hunter2-super-secret
+ENROLLMENT_TOKEN="tok-abc-123"
+QUASAR_SECRET_KEY=aGVsbG8td29ybGQtMzJieXRlcw==
+api_secret='shhh-do-not-tell'
+# class 1b — compose/yaml shape
+  POSTGRES_PASSWORD: hunter2-super-secret
+  QUASAR_STEAMGRIDDB_API_KEY: sgdb-live-4444
+  LOG_LEVEL: info
+# class 2 — url credentials
+DATABASE_URL: postgres://quasar:pgpw123@db:5432/quasar?sslmode=disable
+mirror https://ci-user:ci-pass-9@registry.example.com/v2/
+# class 4 — jwt
+session jwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.QWxpY2VXYXNIZXJl
+raw eyJhbGciOiJSUzI1NiJ9.eyJhZG1pbiI6dHJ1ZX0.c2lnbmF0dXJl here
+# class 5 — bearer
+Authorization: Bearer abc.def.ghi
+curl -H "authorization: Bearer sk-live-9999" http://localhost:8080/v1/apps
+plain Bearer xyz123 in prose
+# class 3 — pem
+-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQ
+DhIsIsNotARealKeyItIsAFixtureForTheRedactionTest12
+-----END PRIVATE KEY-----
+-----BEGIN CERTIFICATE-----
+MIIDazCCAlOgAwIBAgIUFixtureCertificateBodyGoesHere
+-----END CERTIFICATE-----
+# control — nothing below should change
+a normal line with no secrets at all
+LISTEN_ADDR=:8080
+GOMEMLIMIT=1GiB
+quasar-control-plane  Up 3 minutes (healthy)

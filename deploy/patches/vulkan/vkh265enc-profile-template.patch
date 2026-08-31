@@ -1,0 +1,42 @@
+--- a/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
++++ b/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
+@@ -2833,6 +2833,39 @@
+     return FALSE;
+   }
+ 
++  /* PATCH (profile-template): the caps just queried describe what the DRIVER
++   * supports, but this element can only translate the profiles listed in
++   * H265ProfileMap[] into a StdVideoH265ProfileIdc. NVIDIA reports "main-444"
++   * (STD_VIDEO_H265_PROFILE_IDC_FORMAT_RANGE_EXTENSIONS), which is not in that
++   * table, so with downstream caps left free the negotiation settles on it,
++   * gst_vulkan_h265_profile_type() returns STD_VIDEO_H265_PROFILE_IDC_INVALID,
++   * and gst_vulkan_encoder_start() fails with
++   * VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR (-1000023003) out of
++   * vkGetPhysicalDeviceVideoCapabilitiesKHR. Never advertise a profile this
++   * element cannot map. */
++  {
++    GstCaps *mappable = gst_caps_new_empty ();
++    GstCaps *filtered;
++    guint i;
++
++    for (i = 0; i < G_N_ELEMENTS (H265ProfileMap); i++) {
++      gst_caps_append_structure (mappable,
++          gst_structure_new ("video/x-h265", "profile", G_TYPE_STRING,
++              H265ProfileMap[i].name, NULL));
++    }
++    filtered =
++        gst_caps_intersect_full (codec, mappable, GST_CAPS_INTERSECT_FIRST);
++    gst_caps_unref (mappable);
++    /* Fail open: if the driver reports nothing this element can map, keep the
++     * original caps rather than registering an element with empty src caps. */
++    if (gst_caps_is_empty (filtered)) {
++      gst_caps_unref (filtered);
++    } else {
++      gst_caps_unref (codec);
++      codec = filtered;
++    }
++  }
++
+   cdata = g_new (struct CData, 1);
+   cdata->description = NULL;
+   cdata->device_index = device->physical_device->device_index;

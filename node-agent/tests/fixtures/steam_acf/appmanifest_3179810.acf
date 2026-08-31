@@ -1,0 +1,40 @@
+"AppState"
+{
+	"appid"		"3179810"
+	"Universe"		"1"
+	"name"		"Tiny Dangerous Dungeons Remake"
+	"StateFlags"		"4"
+	"installdir"		"Tiny Dangerous Dungeons Remake"
+	"LastUpdated"		"1784942506"
+	"LastPlayed"		"0"
+	"SizeOnDisk"		"62245910"
+	"StagingSize"		"0"
+	"buildid"		"17905177"
+	"LastOwner"		"76561190000000000"
+	"DownloadType"		"1"
+	"UpdateResult"		"0"
+	"BytesToDownload"		"22772336"
+	"BytesDownloaded"		"22772336"
+	"BytesToStage"		"62245910"
+	"BytesStaged"		"62245910"
+	"TargetBuildID"		"17905177"
+	"AutoUpdateBehavior"		"0"
+	"AllowOtherDownloadsWhileRunning"		"0"
+	"ScheduledAutoUpdate"		"0"
+	"InstalledDepots"
+	{
+		"3179811"
+		{
+			"manifest"		"5144336534146210225"
+			"size"		"62245910"
+		}
+	}
+	"UserConfig"
+	{
+		"language"		"english"
+	}
+	"MountedConfig"
+	{
+		"language"		"english"
+	}
+}

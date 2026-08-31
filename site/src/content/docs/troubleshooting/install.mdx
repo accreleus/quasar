@@ -1,0 +1,172 @@
+---
+title: Install and startup problems
+description: The build, the containers, the GPU, and the agent registration. Symptoms with causes and fixes.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## The build fails part way through
+
+**Out of disk.** The most common cause. The build needs around 25 GB and you want
+40 GB free.
+
+```bash
+df -h /var/lib/docker
+```
+
+On Fedora, the default 15 GB root logical volume is not enough. Grow it with
+`lvextend` and `xfs_growfs`.
+
+**Compose too old.** You need v2.20 or newer.
+
+```bash
+docker compose version
+```
+
+## The control plane will not start
+
+```bash
+docker compose -f deploy/docker-compose.yml logs quasar-control-plane
+```
+
+**`no migration found for version N`.** The database is ahead of the binary. You
+rolled back to an older version. See [Upgrading](/quasar/operations/upgrading/).
+The fix is to redeploy the version that has the migration.
+
+**Cannot connect to the database.** Postgres has not come up yet, or
+`POSTGRES_PASSWORD` does not match what the database was created with. If you
+have exported that variable in your shell, Compose uses the shell value over
+`deploy/.env` and they drift apart. Unset it.
+
+**Malformed allowed origins.** A bad entry in `QUASAR_ALLOWED_ORIGINS` stops
+startup on purpose. Entries must be exact `scheme://host[:port]` with no path.
+
+## A container reports "no command specified"
+
+An overlay cleared the container's command on an image whose entrypoint is
+already empty, leaving nothing to run. Check which Compose overlays you have
+stacked and in what order.
+
+## The node agent starts but never registers
+
+Check its own health endpoint on the host it runs on:
+
+```bash
+curl http://127.0.0.1:9091/health
+```
+
+`"connected": false` means it is alive but cannot reach the control plane.
+
+- Is `CONTROL_PLANE_URL` right, and reachable from that machine?
+- Does `ENROLLMENT_TOKEN` match the control plane's?
+- Is the control plane's HTTP port reachable? Enrollment uses plain HTTP on 8080
+  and is exempt from the HTTPS redirect for exactly this reason.
+
+If the agent previously enrolled and now cannot, its stored node secret may be
+gone. Enrollment then needs the token again, and the token has to still be valid.
+
+## The GPU is not detected
+
+```bash
+ls -l /dev/dri
+```
+
+No `renderD128` means no GPU is available to containers at all. Check the driver
+is loaded on the host first.
+
+If the nodes exist but the agent cannot open them, check group and mode, and
+confirm the device is declared in the Compose file.
+
+On NVIDIA:
+
+```bash
+nvidia-smi
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+```
+
+## The GPU is detected but there is no encoder
+
+This is a different problem and it is common.
+
+**`no VA H264 encoder found` while `vainfo` works.** Two usual causes.
+
+The GStreamer plugin registry was built when no GPU was present, so it cached
+the conclusion that there is no encoder. The agent forces a rescan for VA, but a
+stale registry from a strange build can survive. Recreating the container is the
+blunt fix.
+
+Or software rendering is being forced by an environment variable that should not
+be set. `MESA_LOADER_DRIVER_OVERRIDE` and `LIBGL_ALWAYS_SOFTWARE` must be
+genuinely **unset**, not set to an empty string. The `.env.example` file contains
+a software-only configuration block and a hardware block, and copying both is an
+easy mistake.
+
+## NVIDIA host with a CUDA-only driver install
+
+Installing only the CUDA packages leaves out EGL and 32-bit GL. The compositor
+needs EGL. Native 32-bit game binaries need the 32-bit libraries.
+
+The host readiness checks in Admin, Fleet, Hosts report exactly which components
+are missing, with the command for your distribution.
+
+Quasar can work around it automatically by provisioning a driver volume from the
+running kernel module, which is on by default. It closes the gap without
+installing anything on the host.
+
+<Aside type="caution" title="A driver-volume host cannot use the Vulkan encoder">
+The Vulkan driver interface in that volume is unusable on some driver versions.
+NVENC and VA are unaffected. Use NVENC on such a host.
+</Aside>
+
+Fedora, installing the full stack properly:
+
+```bash
+sudo dnf install nvidia-driver-libs nvidia-driver-libs.i686 egl-wayland
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+```
+
+## Input devices are not working
+
+```bash
+ls -l /dev/uinput
+```
+
+Missing:
+
+```bash
+sudo modprobe uinput
+echo uinput | sudo tee /etc/modules-load.d/uinput.conf
+```
+
+Present but the agent cannot use it: the agent needs to open it for **writing**.
+A read-only open succeeds even on a broken setup, which is why this is easy to
+misdiagnose. The agent's readiness check tests writing, and reports on the host
+detail page.
+
+## A GPU-less host will not start
+
+Comment out the `/dev/dri` device line in `deploy/docker-compose.yml`. Docker
+refuses to start a container that declares a device which does not exist.
+
+## The web app is blank after a redeploy
+
+The browser has cached an index page pointing at a bundle that no longer exists.
+Hard refresh.
+
+If a hard refresh does not fix it, the control plane is serving a stale directory
+and needs restarting:
+
+```bash
+docker compose -f deploy/docker-compose.yml restart quasar-control-plane
+```
+
+`redeploy.sh` checks for this and warns.
+
+## Still stuck
+
+```bash
+make diagnose
+```
+
+That collects container states, health endpoints, versions and recent errors in
+one pass, with secrets redacted.

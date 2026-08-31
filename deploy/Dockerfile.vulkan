@@ -1,0 +1,1345 @@
+# Dockerfile.vulkan — VK-01: unified-pipeline Vulkan-encode node-agent image, multi-stage.
+#
+# Spec: docs/research/vulkan-encode-unified-pipeline-adoption-spec.md (§8 addendum carries the
+# 2026-07-05 deltas this Dockerfile implements). This is a SEPARATE image (`quasar-node-agent`) from
+# Dockerfile.agent.prod (AMD VA) and Dockerfile.nv (NVENC) — it does not replace either; it is the
+# vehicle for adopting `vulkanh264enc` as a GPU-vendor-agnostic encode path (Wolf version parity).
+#
+# Why Fedora, not Ubuntu (unlike every other Quasar image): the Vulkan video-encode extension
+# needs `vulkan-headers` >= 1.4.317 and a GStreamer built against them; Fedora 43 ships both
+# current-enough Wayland (>= 1.23, so no from-source wayland build like Dockerfile.dev/.nv) and
+# current Mesa/Vulkan userspace out of the box, plus RPM Fusion freeworld for the patent-encumbered
+# VA/Vulkan H.264 encode entrypoints. Matching that on Ubuntu 24.04 would mean hand-rolling both.
+#
+# Why source GStreamer 1.28.4, not the apt/dnf package: `vulkanh264enc` only exists from gst 1.28,
+# and it needs two carried patches (deploy/patches/vulkan/, vendored verbatim from
+# games-on-whales/gst-wayland-display@43d4c25, PR #37) — see deploy/patches/vulkan/README.md.
+# The DPB-pool patch is MANDATORY: without it, vulkanh264enc asserts the first time an allocation
+# query arrives before new_sequence, which is exactly the ordering interpipesrc produces at our
+# launcher<->game swap boundary (CLAUDE.md gst-interpipe notes).
+#
+# The ghcr.io/games-on-whales/gst-wayland-display base-image trap (same warning as
+# Dockerfile.agent.prod / Dockerfile.nv, restated because it bites Vulkan doubly hard): the
+# published `:vulkan` tag of that image is built with `-Dauto_features=disabled` AND
+# `-Drs=disabled` — no webrtcbin, no nice/dtls/srtp/sctp/rtpmanager, and no gst-plugins-rs (no
+# rtpgccbwe). It cannot be used as a base here; this Dockerfile builds GStreamer itself with a
+# widened enable-set (see the meson invocation below) so every element the node-agent pipeline
+# actually calls `ElementFactory::make`/`find` on on this branch is present in the final image.
+#
+# Build host note: built on hermes (the AMD/VA dev box) and `docker save`/`docker load`d to Tower
+# for NVENC-path testing — this Dockerfile is GPU-vendor-agnostic at build time (no toolkit stage
+# split like Dockerfile.nv needs for its from-source nvcodec build); GPU choice is a runtime
+# concern (which encode element registers depends on what's plugged in and the stale-registry
+# rescan below).
+#
+# DO NOT `docker build` this file by hand. Use:
+#   deploy/build-images.sh toolchain|runtime|nv|dev|profiling|all
+# It always passes an explicit `--target`, rejects a `--build-arg` for an ARG this file does
+# not declare (Docker ignores those silently, which is how a pin can look applied when it
+# never was), and validates the result against deploy/image-contract.json BEFORE promoting
+# :latest or pushing. A bare `docker build` with no `--target` builds the LAST stage in the
+# file regardless of what you passed to -t — that mis-tagging hit a 2026-07-12 Tower deploy
+# live and was caught only by reading `docker history`.
+#
+# IMAGE NAMES (2026-08-26 role rename): runtime → quasar-node-agent, dev → quasar-agent-dev,
+# toolchain → quasar-gst-toolchain, control plane → quasar-control-plane. `nv` keeps its name;
+# it is DEPRECATED PENDING #545, which retires the lineage rather than renaming it.
+# THREE COMMENTS INSIDE THE `toolchain` STAGE STILL SAY quasar-vulkan / quasar-toolchain ON
+# PURPOSE: deploy/toolchain-hash.sh hashes that stage's text byte for byte, so editing a
+# comment there invalidates a published 40-minute artefact. They get fixed on the next pin
+# bump, which pays for the rebuild anyway.
+#
+# Stage graph (2026-08-20 — `build` is now split off `toolchain`):
+#
+#   quasar-base ──┬── toolchain ── build ──┬── dev ─── profiling   NEVER deployed
+#                 │       │                └── (artifacts)         the node-agent binary
+#                 │       └── PUBLISHED as quasar-gst-toolchain:<pins-hash>
+#                 └── runtime ─── nv        runtime = AMD/Intel + Vulkan (quasar-node-agent)
+#                                           nv      = runtime + CUDA runtime libs only
+#
+# `toolchain` holds everything pin-keyed and expensive (~40 min): patched GStreamer
+# 1.28.4, gst-interpipe, gst-plugins-rs, gst-wayland-display, Rust, CUDA. `build`
+# holds only the node-agent compile (~5 min). Set TOOLCHAIN_IMAGE to a published
+# quasar-gst-toolchain tag and the toolchain stage is never instantiated — see the
+# TOOLCHAIN SELECTION block below.
+#
+# `profiling` (PROF-02, #389) is an ON-DEMAND, NEVER-PROMOTED variant: the agent rebuilt under
+# [profile.profiling] (release codegen + line tables + frame pointers) plus samply. It is
+# outside deploy/image-contract.json on purpose and build-images.sh refuses to tag it :latest
+# or push it. Recipe: docs/profiling-rust.md.
+#
+# `build` is always instantiated with CUDA_ENABLE=1, so ONE /opt/gst and ONE agent binary
+# serve both vendors; `nv` adds ~275 MB of NVIDIA runtime libraries and nothing else. See
+# docs/design/plans/2026-07-26-image-lineage-consolidation-spec.md for why, and for the
+# outage that came from `nv` having previously been a hand-copied sibling of `runtime`.
+#
+# Runtime requirements mirror Dockerfile.agent.prod: --device /dev/dri, --device /dev/uinput,
+# device_cgroup_rules 'c 13:* rmw', seccomp:unconfined (issue #71), /var/run/docker.sock, root.
+
+# All stages build on the shared quasar-base (Fedora 43) from quasar-images —
+# the Fedora pin is owned there, not here. quasar-base is Fedora 43 because F42
+# ships vulkan-headers 1.4.313 (< the 1.4.317 floor for the Vulkan video-encode
+# extension; the fail-fast check below caught this live on the first build
+# attempt). F43 ships 1.4.341, the exact header set upstream PR #37 validates.
+# NOTE: quasar-images publishes :latest from its `stable` branch (its default
+# branch — there is no `main`), plus an immutable :sha-<commit> per build. A
+# :develop tag exists only when someone dispatches that workflow from `develop`,
+# so :latest is the only moving tag guaranteed to resolve. Override for a
+# release, which pins the exact base digest rather than a tag:
+#   --build-arg QUASAR_BASE_IMAGE=ghcr.io/accreleus/quasar-base@sha256:<hex>
+#
+# ══ GLOBAL PINS ═══════════════════════════════════════════════════════════════
+# Every third-party pin is declared exactly ONCE, here, BEFORE the first FROM.
+#
+# An ARG declared before the first FROM is at GLOBAL scope: a stage that wants to
+# read it re-declares it BARE (`ARG GST_VERSION`, no `=value`) and inherits this
+# default. That is what lets the runtime stage interpolate a pin into a
+# provenance LABEL without repeating the value. Before 2026-08-20 each of these
+# was declared twice — build stage and runtime stage — and kept in step by a
+# Python guard in build-images.sh; DOCKER_VERSION and CUDA_PKG_VERSION were
+# duplicated with NO guard. Duplicate defaults are now a build failure, not a
+# thing a guard patches over.
+#
+# THE VALUES BELOW MUST AGREE WITH deploy/pins.env, which is the source of truth
+# outside this file (CI and deploy/toolchain-hash.sh read it without parsing
+# Docker syntax). build-images.sh asserts the agreement on every build and
+# refuses to build on a mismatch, so edit pins.env and mirror it here.
+ARG QUASAR_BASE_IMAGE=ghcr.io/accreleus/quasar-base:latest
+ARG GST_VERSION=1.28.4
+ARG GST_PLUGINS_RS_REF=cee45224cb2d10e1523af4f256d0dd64c8b29491
+ARG GST_INTERPIPE_REF=0c454917
+ARG GST_WAYLAND_DISPLAY_REPO=https://github.com/salty2011/gst-wayland-display.git
+ARG GST_WAYLAND_DISPLAY_REF=310c03eca4b90b653885def4e3348034067c8c72
+ARG RUST_VERSION=1.94.0
+ARG CARGO_C_VERSION=0.10.23
+ARG RUSTUP_VERSION=1.29.0
+ARG RUSTUP_INIT_SHA256_X86_64=4acc9acc76d5079515b46346a485974457b5a79893cfb01112423c89aeb5aa10
+ARG RUSTUP_INIT_SHA256_AARCH64=9732d6c5e2a098d3521fca8145d826ae0aaa067ef2385ead08e6feac88fa5792
+ARG CUDA_PKG_VERSION=13-2
+ARG CUDA_ENABLE=1
+ARG DOCKER_VERSION=27.5.1
+ARG DOCKER_CLI_SHA256_X86_64=4f798b3ee1e0140eab5bf30b0edc4e84f4cdb53255a429dc3bbae9524845d640
+ARG DOCKER_CLI_SHA256_AARCH64=e6b53725a73763ab3f988c73f8772eaed429754c1a579db5ff11f21990fd1817
+ARG GST_TESTS=disabled
+ARG SAMPLY_VERSION=0.13.1
+
+# ══ TOOLCHAIN SELECTION ═══════════════════════════════════════════════════════
+# `toolchain` (below) compiles patched GStreamer + gst-interpipe + gst-plugins-rs
+# + gst-wayland-display into /opt/gst. That is ~40 minutes, and it changes only
+# when one of the pins above (or a patch, or the toolchain stage text) changes —
+# a few times a month. Node-agent code changes daily and does not touch it.
+#
+# So the toolchain is a PUBLISHABLE ARTEFACT, not a stage everyone recompiles:
+#
+#   TOOLCHAIN_IMAGE=toolchain                       (default) build it locally
+#   TOOLCHAIN_IMAGE=ghcr.io/…/quasar-gst-toolchain:<h>            pull the artefact
+#
+# `FROM ${TOOLCHAIN_IMAGE} AS build` resolves the ARG against this file's stage
+# names FIRST, so the default names the local stage; anything else is a registry
+# reference. BuildKit only builds the stages a target actually needs, so when
+# this points at the registry the local `toolchain` stage is never instantiated
+# and nothing is compiled. That is the whole mechanism — there is no second
+# Dockerfile and no generated file.
+#
+# <h> is deploy/toolchain-hash.sh: a content hash over the toolchain pins, every
+# file in deploy/patches/, and the toolchain stage text. deploy/build-images.sh
+# --toolchain registry resolves and passes it; CI skips the toolchain job
+# entirely when `docker manifest inspect` finds the tag already published.
+#
+# ONE build for every agent target. quasar-node-agent (runtime), quasar-agent-dev and
+# quasar-profiling all consume the SAME toolchain image. Before this split the two shipped
+# lineages were separate CI jobs in separate GHA cache scopes, each recompiling the
+# identical `build` stage — 33 + 35 minutes in parallel, measured on run 31245708171, for
+# one set of bytes. (#545 then removed the second shipped lineage outright.)
+ARG TOOLCHAIN_IMAGE=toolchain
+
+# ══ Toolchain stage (target: toolchain → quasar-gst-toolchain:<pins-hash>) ════════
+# Everything that is expensive and pin-keyed. Produces /opt/gst plus the Rust and
+# CUDA toolchains. Carries NO node-agent source and NO node-agent binary — that
+# is what makes it reusable across every agent-image build until a pin moves.
+FROM ${QUASAR_BASE_IMAGE} AS toolchain
+
+# quasar-base's tini + PUID-switching entrypoint is for application images; this
+# stage (and the `dev` image built FROM it) runs toolchains and the compose agent
+# as root with the repo mounted — neutralize it so `docker run ... cargo build`
+# behaves exactly as before.
+ENTRYPOINT []
+
+# Build toolchain + the -devel headers our widened GStreamer enable-set needs. `builddep` pulls in
+# everything the Fedora gstreamer1* packages themselves need to build, which covers most transitive
+# deps for free; the explicit list below is what's left for our OWN additions (webrtc/va/nvcodec/
+# openh264/vulkan/libnice/audio/input).
+RUN dnf install -y dnf-plugins-core 'dnf-command(builddep)' \
+    && dnf builddep -y gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free \
+    && dnf install -y --setopt=install_weak_deps=False \
+        git ca-certificates curl \
+        gcc gcc-c++ make cmake pkgconf-pkg-config ninja-build nasm flex bison meson \
+        glib2-devel libdrm-devel mesa-libgbm-devel systemd-devel \
+        wayland-devel wayland-protocols-devel libxkbcommon-devel libX11-devel \
+        libinput-devel openssl-devel \
+        clang clang-devel llvm-devel libffi-devel expat-devel \
+        vulkan-headers vulkan-loader-devel \
+        alsa-lib-devel opus-devel pulseaudio-libs-devel libseat-devel \
+        libsrtp-devel libva-devel \
+        mesa-libEGL-devel mesa-libGLES-devel mesa-libGL-devel \
+    && dnf clean all
+# NOTE: libnice-devel is deliberately NOT installed — `-Dlibnice=enabled` below builds libnice as
+# a monorepo subproject INTO /opt/gst (including its gst `nice` plugin). A system libnice-devel
+# would satisfy meson's dependency probe and skip the subproject, leaving nicesrc/nicesink out of
+# /opt/gst's plugin dir (Fedora's own libnice-gstreamer1 targets the distro gst, not ours).
+
+# openh264 (patent-encumbered — Cisco's binary-only redistribution repo). Conditional: if the repo
+# isn't reachable/available at build time, skip rather than fail the whole build — openh264enc is
+# our software-encode fallback, not the Vulkan path this image exists to add.
+RUN dnf config-manager setopt fedora-cisco-openh264.enabled=1 \
+    && dnf install -y --setopt=install_weak_deps=False openh264-devel \
+    || echo "WARN: fedora-cisco-openh264 unavailable at build time — openh264enc dev headers skipped, software-encode fallback will be absent from this image" >&2
+
+# Fail-fast: vulkanh264enc needs a Vulkan video-encode-capable headers version. A silently-old
+# vulkan-headers produces a GStreamer that builds clean but simply never registers vulkanh264enc —
+# discovered only at runtime, far from this line. Check now, loudly.
+RUN set -eu; \
+    v="$(rpm -q --qf '%{VERSION}' vulkan-headers)"; \
+    major="$(echo "$v" | cut -d. -f1)"; minor="$(echo "$v" | cut -d. -f2)"; patch="$(echo "$v" | cut -d. -f3)"; \
+    need_major=1; need_minor=4; need_patch=317; \
+    ok=0; \
+    if [ "$major" -gt "$need_major" ]; then ok=1; \
+    elif [ "$major" -eq "$need_major" ] && [ "$minor" -gt "$need_minor" ]; then ok=1; \
+    elif [ "$major" -eq "$need_major" ] && [ "$minor" -eq "$need_minor" ] && [ "$patch" -ge "$need_patch" ]; then ok=1; \
+    fi; \
+    if [ "$ok" -ne 1 ]; then \
+        echo "FATAL: vulkan-headers $v < 1.4.317 — vulkanh264enc would be silently absent from the GStreamer build. Bump the base image or pin a newer vulkan-headers." >&2; \
+        exit 1; \
+    fi; \
+    echo "vulkan-headers $v OK (>= 1.4.317)"
+
+# No from-source Wayland build here (unlike Dockerfile.dev/.nv): Fedora 43 ships libwayland
+# >= 1.23, which is all gst-wayland-display needs.
+
+# ── CUDA toolkit (nv128 target only — CUDA_ENABLE=1) ──────────────────────────
+# #367 image consolidation: the NVENC/CUDA image (was Dockerfile.nv, Ubuntu 1.24) is folded onto
+# this gst-1.28 lineage as the `nv` target, built with `--build-arg CUDA_ENABLE=1`. When set, the
+# NVIDIA Fedora dnf repo (CUDA 13.2 for F43 — cuda-nvcc/cuda-nvrtc-devel/cuda-cudart-devel/
+# libnpp-devel confirmed present) is installed BEFORE the shared GStreamer meson RUN below, so the
+# already-`-Dnvcodec=enabled` build picks up `cudaconvert`/`cudascale` (they exist only when the
+# toolkit + NPP are discoverable at compile time — this is the SOLE difference from the vulkan/dev
+# build; the meson enable-set itself is unchanged). Same ARG later gates gst-wayland-display's
+# `--features cuda`. CUDA_ENABLE=0 (the default, used by quasar-vulkan + quasar-dev128) is a no-op:
+# the layer text is identical to today's image, cudaconvert simply isn't produced.
+#
+# DEFAULT IS 1 (changed 2026-07-26). The shipped lineage is ALWAYS CUDA-built, so ONE
+# /opt/gst and ONE agent binary serve both vendors and the `nv` image can be a thin
+# runtime-library delta on top of `runtime` instead of a parallel hand-maintained stage.
+# Verified safe on non-NVIDIA hosts: without libcuda.so.1 the nvcodec plugin loads,
+# warns once, and registers ZERO features; the `--features cuda` agent binary carries no
+# libcuda/libgstcuda DT_NEEDED (they are dlopened) and starts clean on a driver-less host.
+# Setting this to 0 is a diagnostic-only escape hatch — it produces an image that cannot
+# serve an NVIDIA host, and deploy/validate-image.sh rejects such an image for the
+# runtime/nv roles (no libgstnvcodec.so ⇒ contract violation).
+ARG CUDA_ENABLE
+ARG CUDA_PKG_VERSION
+RUN if [ "$CUDA_ENABLE" = "1" ]; then set -eu; \
+      dnf config-manager addrepo --from-repofile="https://developer.download.nvidia.com/compute/cuda/repos/fedora43/x86_64/cuda-fedora43.repo" \
+      && dnf install -y --setopt=install_weak_deps=False \
+           cuda-nvcc-${CUDA_PKG_VERSION} \
+           cuda-nvrtc-${CUDA_PKG_VERSION} \
+           cuda-nvrtc-devel-${CUDA_PKG_VERSION} \
+           cuda-cudart-${CUDA_PKG_VERSION} \
+           cuda-cudart-devel-${CUDA_PKG_VERSION} \
+           libnpp-${CUDA_PKG_VERSION} \
+           libnpp-devel-${CUDA_PKG_VERSION} \
+      && dnf clean all; \
+    else echo "CUDA_ENABLE=0 — skipping CUDA toolkit (vulkan/dev build)"; fi
+# Harmless when CUDA absent: the dirs simply don't exist. Placed so both the meson probe (nvcc on
+# PATH → cudaconvert) and gst-wayland-display's --features cuda (libcudart/nvrtc via pkg-config) see it.
+ENV CUDA_PATH=/usr/local/cuda
+ENV PATH=/usr/local/cuda/bin:$PATH
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64
+ENV PKG_CONFIG_PATH_CUDA=/usr/local/cuda/lib64/pkgconfig
+
+# NOTE ON PATCH COPY PLACEMENT (2026-08-26, layer-key audit).
+# The two patch COPYs used to sit HERE, above the Rust toolchain. That made every
+# file under deploy/patches/ a cache key for the Rust install, cargo-c, the whole
+# patched-GStreamer build, gst-interpipe, gst-plugins-rs and gst-wayland-display —
+# the entire ~40 minute toolchain. Measured on devbox: appending one line to
+# deploy/patches/vulkan/gst-wayland-display-vulkan-pts.patch (a file this build has
+# not applied since 2026-07-26 — the gwd delta lives in the fork's `develop`, these
+# copies are the authored record) invalidated toolchain steps 8/16 through 16/16,
+# i.e. rustup + cargo-c + everything downstream.
+#
+# Each COPY now sits immediately above the ONLY step that reads it, and the
+# record-only gwd patches are copied at the END of the stage where nothing depends
+# on them. /tmp ends up with exactly the same 24 files as before; only the layer
+# they arrive in changed.
+#
+# If you add a patch, put it in the COPY whose consumer applies it. A patch copied
+# too early is not a style problem — it is a 40-minute rebuild for a comment.
+
+# Rust toolchain OUTSIDE /opt/gst so the runtime COPY of /opt/gst stays clean of the toolchain.
+ARG RUST_VERSION
+ENV RUSTUP_HOME=/opt/rustup
+ENV CARGO_HOME=/opt/cargo
+ENV PATH=/opt/cargo/bin:$PATH
+# NOT `curl https://sh.rustup.rs | sh`: that URL serves an unversioned script, so there is
+# nothing to pin and whatever the origin returns is piped straight into a shell. The archive's
+# rustup-init is immutable per version and is checked before it is executed.
+ARG RUSTUP_VERSION
+ARG RUSTUP_INIT_SHA256_X86_64
+ARG RUSTUP_INIT_SHA256_AARCH64
+RUN set -eux; \
+    case "$(uname -m)" in \
+      x86_64)  rarch=x86_64-unknown-linux-gnu;  want="${RUSTUP_INIT_SHA256_X86_64}" ;; \
+      aarch64) rarch=aarch64-unknown-linux-gnu; want="${RUSTUP_INIT_SHA256_AARCH64}" ;; \
+      *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    curl --proto '=https' --tlsv1.2 -fsSL \
+      "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${rarch}/rustup-init" \
+      -o /tmp/rustup-init; \
+    echo "${want}  /tmp/rustup-init" | sha256sum -c -; \
+    chmod 0755 /tmp/rustup-init; \
+    /tmp/rustup-init -y --no-modify-path --default-toolchain "${RUST_VERSION}" --profile minimal; \
+    rm -f /tmp/rustup-init
+# cargo-c: PINNED for reproducibility (VULKAN-WORKLOG 2026-07-05 regression triage). The old
+# Dockerfile.agent.prod pin (0.10.20+cargo-0.94.0) predates Rust 1.94; cargo-c's MSRV tracks cargo
+# closely, so we pin the version validated against RUST_VERSION above rather than take a moving
+# "latest". 0.10.23 is the version baked into the known-good quasar-vulkan image (verified in the
+# hermes build logs — see docs/third-party-pins.md). `--locked` uses cargo-c's committed Cargo.lock
+# so a transitive-dep bump on crates.io can't drift the build either.
+ARG CARGO_C_VERSION
+RUN cargo install cargo-c --version "${CARGO_C_VERSION}" --locked
+
+# Patched GStreamer 1.28.4 -> /opt/gst. Ten vendored patches, applied in the order below; the
+# order is load-bearing (each was diffed against the tree with its predecessors applied) and is
+# documented per patch in deploy/patches/vulkan/README.md. The fifth is a diagnostic A/B arm for
+# Tower Xid 32: it serializes every GstVulkanQueue wrapper through one process-wide submit domain.
+# The tenth (issue #507) recycles the per-frame Vulkan bitstream buffer and must apply LAST,
+# because it was diffed against gstvkencoder-private.c with all nine predecessors applied.
+# All ten must land after the clone and before Meson config/build.
+ARG GST_VERSION
+
+# The gst-chain patches, copied HERE — directly above their only consumer — so a
+# re-diff of one of them costs the GStreamer build and nothing above it. The three
+# globs together name every patch in deploy/patches/vulkan/ that is NOT a
+# `gst-wayland-display-*` record file: vk*, vulkan*, gstreamer-*.
+COPY deploy/patches/vulkan/vk*.patch \
+     deploy/patches/vulkan/vulkan*.patch \
+     deploy/patches/vulkan/gstreamer-*.patch \
+     /tmp/
+
+RUN git clone --depth 1 --branch "${GST_VERSION}" \
+        https://gitlab.freedesktop.org/gstreamer/gstreamer.git /opt/gstreamer-src \
+    && cd /opt/gstreamer-src \
+    && git apply /tmp/vkh264enc-dpb-pool-in-new-sequence.patch \
+    && git apply /tmp/vulkanh265enc.patch \
+    && git apply /tmp/vkh264enc-rc-fix.patch \
+    && git apply /tmp/vkh264enc-num-slices.patch \
+    && git apply /tmp/gstreamer-vulkan-global-submit-lock.patch \
+    && git apply /tmp/vkh264enc-intra-refresh.patch \
+    && git apply /tmp/gstreamer-vulkan-rc-retarget-no-reset.patch \
+    && git apply /tmp/vulkanav1enc.patch \
+    && git apply /tmp/vulkan-enc-output-state-on-resize.patch \
+    && git apply /tmp/vkenc-bitstream-buffer-pool.patch
+
+# Upstream's docs/meson.build subdir_done() workaround (carried verbatim from
+# games-on-whales/gst-wayland-display's build recipe at the same pin) — with -Ddoc=disabled,
+# some subproject docs/meson.build files still probe for doc tooling before honoring the option;
+# this prepends an early bail so `-Ddoc=disabled` is honored everywhere before any of that runs.
+RUN cd /opt/gstreamer-src && \
+    for d in subprojects/*/docs/meson.build docs/meson.build; do \
+      [ -f "$d" ] || continue; \
+      { printf "if not get_option('doc').allowed()\n  subdir_done()\nendif\n"; cat "$d"; } > "$d.tmp"; \
+      mv "$d.tmp" "$d"; \
+    done
+
+# Meson enable-set: upstream's PR #37 vulkan-image set, PLUS Quasar's widening for the transport +
+# existing encoder paths (webrtc/va/nvcodec/openh264) and the specific base/good sub-plugins the
+# node-agent pipeline calls ElementFactory::make/find on. Comment maps each addition to its
+# node-agent call site so a future pipeline change can tell what to also enable here:
+#
+#   gst-plugins-base:app          -> appsink                         (source_branch.rs / pipeline.rs)
+#   gst-plugins-base:typefind     -> (core decodebin-adjacent, upstream default-on)
+#   gst-plugins-base:videotestsrc -> videotestsrc                    (pipeline.rs test/fallback source)
+#   gst-plugins-base:audiotestsrc -> audiotestsrc                    (audio_branch.rs silent Pulse fallback)
+#   gst-plugins-base:alsa         -> alsasink                        (console local-audio output)
+#   gst-plugins-base:videoconvertscale -> videoconvert, videoscale   (pipeline.rs, source_branch.rs)
+#   gst-plugins-base:playback     -> upstream default (decodebin family; kept for parity)
+#   gst-plugins-base:drm          -> DRM buffer/caps negotiation (va/vulkan dmabuf paths)
+#   gst-plugins-base:audioconvert -> audioconvert                    (audio_branch.rs)
+#   gst-plugins-base:audioresample -> audioresample                  (audio_branch.rs)
+#   gst-plugins-base:audiorate    -> upstream default (audio_branch.rs safety net)
+#   gst-plugins-base:videorate    -> videorate (scale_stage.rs, the SPT-08 fps rung). MANDATORY,
+#                                     not optional: the fps lever is a framerate write on the tail
+#                                     capsfilter, and WITHOUT videorate in the graph that write is a
+#                                     hard `not-negotiated` error that kills the stream (measured —
+#                                     docs/design/research/2026-08-16-fps-rung-spike.md, variant
+#                                     `nvenc-novr`). Built with drop-only=true and max-rate left
+#                                     UNSET for the life of the session.
+#   gst-plugins-base:opus         -> opusenc                         (audio_branch.rs)
+#   gst-plugins-base:volume       -> upstream default (audio path headroom)
+#   gst-plugins-good:pulse        -> pulsesrc                        (source.rs / audio_branch.rs)
+#   gst-plugins-bad:vulkan        -> vulkanh264enc (+ vulkanh265enc from the vendored patch)
+#   gst-plugins-bad:vulkan-video  -> the Vulkan video-encode/decode extension vulkanh264enc needs
+#   gst-plugins-bad:videoparsers  -> h264parse                       (pipeline.rs / encoders.rs)
+#   gst-plugins-bad:wayland       -> upstream default (Wayland sink/buffer-pool support)
+#   gst-plugins-bad:kms           -> kmssink (AMD direct-KMS console backend)
+#   libnice (monorepo subproject) -> nicesrc/nicesink (webrtcbin's ICE backend)
+#   libnice:gstreamer             -> the gst plugin INSIDE the libnice subproject; the global
+#                                     -Dauto_features=disabled propagates into subprojects and
+#                                     silently skips it otherwise (bit us: build #2, nicesrc absent)
+#   gst-plugins-bad:webrtc        -> webrtcbin                       (pipeline/webrtc.rs)
+#   gst-plugins-bad:dtls          -> webrtcbin's DTLS-SRTP handshake
+#   gst-plugins-bad:srtp          -> webrtcbin's SRTP media encryption
+#   gst-plugins-bad:sctp          -> webrtcbin's DataChannel transport (protocol/input.md)
+#   gst-plugins-bad:va            -> vah264enc / vapostproc           (encoders.rs, source_branch.rs,
+#                                     caps.rs — the existing AMD VA path, kept alongside vulkanh264enc)
+#   gst-plugins-bad:nvcodec       -> nvh264enc                        (encoders.rs make_nvenc_encoder;
+#                                     gst >= 1.26 renamed nvcudah264enc -> nvh264enc — node-agent's
+#                                     factory-name list must be updated for this image, see report)
+#   gst-plugins-bad:openh264      -> openh264enc                      (encoders.rs make_openh264_encoder)
+#   gst-plugins-good:rtpmanager   -> rtprtxsend/rtpulpfecenc/rtpredenc (managed internally by
+#                                     webrtcbin's transceivers, pipeline/webrtc.rs FEC/RTX)
+#   gst-plugins-good:rtp          -> rtph264pay / rtpopuspay          (pipeline.rs / audio_branch.rs)
+#   gst-plugins-good:udp          -> upstream default (rtpbin/webrtcbin transport plumbing)
+#
+# `queue`/`capsfilter`/`identity`/`interpipe*` are core/always-built or a separate from-source
+# build (gst-interpipe, below) and need no meson enable here.
+# GST_TESTS: `disabled` (default, every shipped image) or `enabled`.
+#
+# `enabled` builds GStreamer's check suite AND retains /opt/gstreamer-src, so the
+# upstream Vulkan video conformance tests can be run against this exact build --
+# in particular tests/check/libs/vkvideoencodeav1.c, the AV1 hardware-encode test
+# that already ships in 1.28.4 and is the M0 gate for the vulkanav1enc work
+# (docs/design/plans/2026-07-26-vulkanav1enc-feasibility-and-implementation-spec.md).
+#
+# It exists as an ARG rather than a hand-hacked Dockerfile copy because the probe
+# is worth repeating: on every gst re-pin, and against every driver update, the
+# question "does this driver still do AV1/H.265 encode, and with which caps?" is
+# answered by running these tests. Never ship an image built with `enabled` -- it
+# carries the source tree and the test binaries (multi-GB).
+#
+#   docker build -f deploy/Dockerfile.vulkan --target build \
+#     --build-arg GST_TESTS=enabled --build-arg CUDA_ENABLE=1 -t quasar-gsttest:latest .
+#   docker run --rm --gpus all -e NVIDIA_DRIVER_CAPABILITIES=all quasar-gsttest:latest \
+#     sh -c 'cd /opt/gstreamer-src && meson test -C build --suite gst-plugins-bad vkvideoencodeav1'
+# NOTE: `-Dgstreamer:check` tracks the same switch. The check suite links libgstcheck
+# (gstreamer-check-1.0), which `-Dauto_features=disabled` switches off, so `-Dtests=enabled`
+# alone dies at gst-plugins-base/meson.build:390 "Dependency 'gstreamer-check-1.0' is
+# required but not found". At the default (disabled) this matches what auto_features already
+# gave us, so shipped images are byte-identical.
+ARG GST_TESTS
+
+RUN cd /opt/gstreamer-src && meson setup build --prefix=/opt/gst --libdir=lib64 \
+    -Dauto_features=disabled \
+    -Dbase=enabled \
+    -Dbad=enabled \
+    -Dgood=enabled \
+    -Dtools=enabled \
+    -Dugly=disabled \
+    -Dlibav=disabled \
+    -Dges=disabled \
+    -Drtsp_server=disabled \
+    -Ddevtools=disabled \
+    -Dpython=disabled \
+    -Dsharp=disabled \
+    -Dgst-plugins-base:app=enabled \
+    -Dgst-plugins-base:typefind=enabled \
+    -Dgst-plugins-base:videotestsrc=enabled \
+    -Dgst-plugins-base:audiotestsrc=enabled \
+    -Dgst-plugins-base:alsa=enabled \
+    -Dgst-plugins-base:videoconvertscale=enabled \
+    -Dgst-plugins-base:playback=enabled \
+    -Dgst-plugins-base:drm=enabled \
+    -Dgst-plugins-base:audioconvert=enabled \
+    -Dgst-plugins-base:audioresample=enabled \
+    -Dgst-plugins-base:audiorate=enabled \
+    -Dgst-plugins-base:videorate=enabled \
+    -Dgst-plugins-base:opus=enabled \
+    -Dgst-plugins-base:volume=enabled \
+    -Dgst-plugins-good:pulse=enabled \
+    -Dgst-plugins-bad:vulkan=enabled \
+    -Dgst-plugins-bad:vulkan-video=enabled \
+    -Dgst-plugins-bad:videoparsers=enabled \
+    -Dgst-plugins-bad:wayland=enabled \
+    -Dgst-plugins-bad:kms=enabled \
+    -Dorc=disabled \
+    -Ddoc=disabled \
+    -Dgtk_doc=disabled \
+    -Dintrospection=disabled \
+    -Dexamples=disabled \
+    -Dtests="$GST_TESTS" \
+    -Dgstreamer:check="$GST_TESTS" \
+    -Dnls=disabled \
+    -Dgst-examples=disabled \
+    -Drs=disabled \
+    -Dlibnice=enabled \
+    -Dlibnice:gstreamer=enabled \
+    -Dgst-plugins-bad:webrtc=enabled \
+    -Dgst-plugins-bad:dtls=enabled \
+    -Dgst-plugins-bad:srtp=enabled \
+    -Dgst-plugins-bad:sctp=enabled \
+    -Dgst-plugins-bad:va=enabled \
+    -Dgst-plugins-bad:nvcodec=enabled \
+    -Dgst-plugins-bad:openh264=enabled \
+    -Dgst-plugins-good:rtpmanager=enabled \
+    -Dgst-plugins-good:rtp=enabled \
+    -Dgst-plugins-good:udp=enabled \
+    && ninja -C build install \
+    && if [ "$GST_TESTS" = "enabled" ]; then \
+         echo "GST_TESTS=enabled -- retaining /opt/gstreamer-src for conformance runs"; \
+       else rm -rf /opt/gstreamer-src; fi
+
+ENV PKG_CONFIG_PATH=/opt/gst/lib64/pkgconfig
+ENV LD_LIBRARY_PATH=/opt/gst/lib64
+ENV GST_PLUGIN_PATH=/opt/gst/lib64/gstreamer-1.0
+ENV PATH=/opt/gst/bin:/opt/cargo/bin:$PATH
+# clang-sys (bindgen, used transitively by cargo-c / gst-wayland-display's Rust build) needs to
+# find libclang; Fedora installs it under /usr/lib64, not the Debian-style /usr/lib/llvm-*/lib.
+ENV LIBCLANG_PATH=/usr/lib64
+
+# gst-interpipe (gow fork — P2-07 swap boundary). Pin, not upstream HEAD — same convention as
+# Dockerfile.agent.prod/.nv (checkout an explicit ref, not a --depth=1 clone of a moving branch).
+ARG GST_INTERPIPE_REF
+
+# Vendored gst-interpipe patch (Quasar-authored, issue #418: one GstCaps leaked per session on
+# the add_listener "sink has not negotiated yet" shortcut). Copied here, immediately above its
+# only consumer, so the interpipe pin and its patches move independently of the GStreamer build
+# above — see deploy/patches/interpipe/.
+COPY deploy/patches/interpipe/*.patch /tmp/interpipe-patches/
+
+RUN git clone https://github.com/games-on-whales/gst-interpipe.git /opt/gst-interpipe \
+    && git -C /opt/gst-interpipe checkout ${GST_INTERPIPE_REF} \
+    && cd /opt/gst-interpipe \
+    && for p in /tmp/interpipe-patches/*.patch; do git apply -v "$p"; done \
+    && meson setup build --prefix=/opt/gst --libdir=lib64 -Denable-gtk-doc=false \
+    && ninja -C build install \
+    && rm -rf /opt/gst-interpipe
+
+# gst-plugins-rs `rtp` plugin (rtpgccbwe — AS-03 ABR bandwidth estimation). 0.15 pairs with
+# GStreamer 1.28; 0.14 pairs with 1.26 and 0.13 (used by Dockerfile.agent.prod/.nv) pairs with
+# 1.24 — do NOT mix a 0.13/0.14 checkout against this image's 1.28 headers, it will not build.
+#
+# PINNED to an exact commit (VULKAN-WORKLOG 2026-07-05 reproducibility fix), not a bare
+# `--branch 0.15` clone: `0.15` is a MOVING branch, so a `--depth=1` clone bakes whatever HEAD is at
+# build time — an un-pinned input that makes the image non-reproducible. Clone the branch then
+# `checkout` the ref, exactly like GST_WAYLAND_DISPLAY_REF / GST_INTERPIPE_REF below.
+# GST_PLUGINS_RS_REF is the SHA baked into the known-good image (0.15.3-cee4522, 2026-07-03; verified
+# via `gst-inspect-1.0 rtpgccbwe` on the good image + the hermes build logs — see
+# docs/third-party-pins.md). cargo uses the repo's committed Cargo.lock at this checkout by default,
+# so the transitive-dep set is also frozen with the SHA (no extra flag needed — the good build used
+# the same bare invocation, only the ref was unpinned).
+ARG GST_PLUGINS_RS_REF
+RUN git clone --branch 0.15 \
+        https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git /opt/gst-plugins-rs \
+    && git -C /opt/gst-plugins-rs checkout ${GST_PLUGINS_RS_REF} \
+    && cd /opt/gst-plugins-rs/net/rtp \
+    && cargo cinstall --release --prefix=/opt/gst --libdir=/opt/gst/lib64 \
+    && rm -rf /opt/gst-plugins-rs
+
+# gst-wayland-display (compositor element), pinned to the exact commit the vendored patches were
+# taken from — building the compositor at a different ref than the patches risks drift between
+# what the patches assume and what actually gets compiled.
+#
+# gst-wayland-display-vulkan-pts.patch: fixes the vulkan=true output path stamping recycled
+# ring-slot buffers with STALE PTS (~4 recurring, non-monotonic values → libwebrtc PacketBuffer
+# can't assemble → ~60% frame drop at decode). Root cause + validation: VULKAN-WORKLOG 2026-07-06;
+# see deploy/patches/vulkan/README.md. Applied AFTER checkout, BEFORE cargo cinstall.
+# gst-wayland-display-app-cadence.patch exports a read-only mapped-top-level
+# buffer-commit counter used for Wave 4 source-vs-compositor cadence attribution.
+# gst-wayland-display-gles-vulkan-sync.patch completes the GLES render fence before the
+# Vulkan converter imports and samples the shared RGBA dmabuf.
+# gst-wayland-display-initial-pointer-focus.patch refreshes Window::bbox() (on_commit) at
+# initial toplevel map so Space::element_under() can resolve the surface and wl_pointer
+# focus is assigned — without it a client that never re-commits its root (Steam Big
+# Picture launcher, idle wev) never receives ANY pointer events (2026-07-19 Steam input).
+# gst-wayland-display-fail-closed-renderer.patch (#378 W1): demotes the misleading EGL
+# bind-failure log (dead-code EGLBufferReader, never a loss of hw-accel), unbinds the
+# wl_display explicitly at compositor teardown (kills the back-to-back AlreadyBound race),
+# and bridges GPU client-buffer import failures to a `quasar-renderer-degraded` gst bus
+# WARNING the node-agent fails-closed on.
+# gst-wayland-display-linear-encsrc-fallback.patch implements the tiled fallback that
+# WOLF_VULKAN_LINEAR_ENCSRC's own comment promises: a failed LINEAR encode-src alloc (NVIDIA
+# Vulkan-Video rejects LINEAR encode-src images — verified live on the RTX 5090, 2026-07-24)
+# retries with OPTIMAL + a warning instead of hard-failing the session's Vulkan output.
+# gst-wayland-display-per-element-vulkan-device.patch (8th gwd patch) moves the owned
+# GstVulkanInstance+GstVulkanDevice out of vulkan_share.rs's two process-global OnceLock slots
+# and onto per-waylanddisplaysrc-element storage (threaded to the compositor thread like the
+# app_surface_commits/renderer_degraded Arcs), so N concurrent Vulkan-encode sessions in one
+# process each own an ISOLATED VkDevice (per-session failure domain; no device leak per session).
+# Storage-location change only — device creation is byte-identical, no vendor branch, RADV
+# unchanged. Applied LAST of all: it touches vulkan_share.rs, which nvidia-sync AND
+# linear-encsrc-fallback also touch, so it must land after the full stack (spec 2a,
+# docs/design/plans/2026-07-25-vulkan-multisession-spec.md).
+# gst-wayland-display-vulkan-parent-buffer-gate.patch (9th gwd patch, applied last) is the G1
+# buffer-reuse gate (spec 2c): VulkanNv12::to_gst_buffer hands the encode path a CHILD header
+# carrying GstParentBufferMeta over the cached encode-src slot (not a bare clone the encoder's
+# BaseSrc COW can silently free), and convert() drops-and-re-emits rather than reuse a slot the
+# encoder still references — making the auto-pinned ring depth (WOLF_VULKAN_RING=2,
+# double-buffered — RING=1's single slot starves under this same gate) safe and closing a
+# candidate green-bars artifact. Touches only vulkan_nv12.rs; applies on top of the pts patch
+# (which touches the same to_gst_buffer). RADV path unchanged (encode_src-only).
+# gst-wayland-display-cuda-pool-config-leak.patch (10th gwd patch, applied last) fixes TWO
+# refcount errors in the CUDA decide_allocation path, which must land together: (1)
+# CUDABufferPool::get_updated_size() never freed the (transfer full) GstStructure from
+# gst_buffer_pool_get_config(); that copy re-refs the config's `cuda-stream` field, and a
+# GstCudaStream holds gst_object_ref() on its GstCudaContext — so one context ref leaked per
+# session, pinning the app-injected CUDA context forever (~500 MiB VRAM + a cuda-EvtHandlr thread
+# per session; invisible to leaks(filters=GstObject), since a GstStructure is not refcounted and
+# GstCudaStream is a GstMiniObject). (2) The query's BORROWED caps was adopted with
+# Caps::from_glib_full, leaving it one ref short — harmless only while (1) held a compensating
+# ref, so fixing (1) alone retains every session's pipelines. Applies last: imp.rs is also
+# touched by app-cadence / initial-pointer-focus / per-element-vulkan-device. CUDA-only (both
+# sites are behind --features cuda ⇒ the nv target): VA/Vulkan/RADV byte-identical.
+
+# --features cuda is gated on CUDA_ENABLE (#367): the nv128 target adds the `cuda` feature
+# (waylanddisplaysrc emits memory:CUDAMemory, FFI-links libgstcuda) exactly as the retired
+# Dockerfile.nv did; vulkan/dev builds omit it (the Vulkan/VA path uses dmabuf, not CUDAMemory).
+# BUILD SOURCE: the Quasar fork's `develop` branch, NOT upstream + a patch stack.
+# `develop` on github.com/salty2011/gst-wayland-display is upstream `43d4c25`
+# (games-on-whales PR #37 `feat/vulkan-encode`) plus the ten Quasar commits that used to be
+# applied here as loose patch files, one commit per former patch, each carrying its
+# provenance in the commit message. The branch tip was verified byte-identical to the old
+# clone-then-apply-ten-patches result at the flip (2026-07-26), so this changed nothing about
+# what gets compiled -- it only moves the delta into reviewable git history.
+#
+# deploy/patches/vulkan/*.patch are RETAINED as the authored record + upstream submission
+# source, and README.md there still documents what each does and why. They are no longer
+# applied at build time.
+#
+# BRANCHING (mirrors the quasar repo's policy, operator directive 2026-07-26): the fork's
+# `develop` is the persistent integration branch and the ONLY thing this image builds from.
+# Compositor work branches off `develop`, merges back into `develop` (no PR needed), and the
+# build moves only when GST_WAYLAND_DISPLAY_REF is bumped here to a new `develop` SHA -- that
+# ARG bump is the deliberate gate, which is why this pins a full SHA and never a branch name.
+# Also re-diff the affected file in deploy/patches/vulkan/ so the authored record stays in step
+# (docs/third-party-pins.md has the procedure).
+#
+# Rebasing onto a newer upstream: `git rebase --onto <new-upstream> 43d4c25 develop`, fix
+# conflicts as real commits, push, then bump the ARG. That replaces the old "re-diff ten patch
+# files by hand" ritual.
+#
+# The fork's `stable` tracks upstream and additionally carries an HDR commit (`7d736ce`) that is
+# deliberately NOT in `develop` -- it has never been part of what this image builds. Do not merge
+# `stable` into `develop` expecting a no-op.
+ARG GST_WAYLAND_DISPLAY_REPO
+# `develop` @ the #432 merge (507887d = f2fa30f + cc07f1b). The newest commit is the
+# edge-triggered wl_pointer refocus (quasar issue #432): smithay emits enter only on a
+# focus TRANSITION and broadcasts it to the wl_pointer resources existing at that
+# instant, so a client that calls wl_seat.get_pointer after the map-time synthetic
+# motion never receives an enter and ignores all pointer input forever (rootful
+# Xwayland deterministically; gamescope intermittently, self-healing on re-map). The
+# map handler arms a flag AFTER its synthetic motion; the next real motion -- guarded
+# on surface-present / not-grabbed / no-active-constraint -- forces smithay's focus to
+# None so the following motion re-emits a genuine enter (serial newer than the forced
+# leave's). Human-validated on Tower 2026-08-05 (XFCE + Steam). Authored record:
+# deploy/patches/vulkan/gst-wayland-display-pointer-enter-refocus.patch.
+ARG GST_WAYLAND_DISPLAY_REF
+RUN git clone ${GST_WAYLAND_DISPLAY_REPO} /opt/gst-wayland-display \
+    && git -C /opt/gst-wayland-display checkout ${GST_WAYLAND_DISPLAY_REF} \
+    && cd /opt/gst-wayland-display \
+    && cargo cinstall --release \
+        $( [ "$CUDA_ENABLE" = "1" ] && echo --features cuda ) \
+        --prefix=/opt/gst \
+        --libdir=/opt/gst/lib64/gstreamer-1.0 \
+        --pkgconfigdir=/opt/gst/lib64/pkgconfig \
+    && rm -rf /opt/gst-wayland-display
+
+# Drop the STATIC archives cargo-c installs alongside every cdylib. 190 MB,
+# measured in quasar-nv:latest on 2026-08-19 — libgstrsrtp.a 78.6 MB,
+# libgstwaylanddisplaysrc.a 60.2 MB, liblibgstwaylanddisplay.a 59.4 MB, i.e. 62%
+# of the whole 308 MB /opt/gst tree. `cargo cinstall` emits both a .so and a .a
+# by design (it targets C consumers that may want to link statically); GStreamer
+# loads plugins by dlopen and never reads a .a, and nothing in this repo links
+# one. They were shipping in every agent image simply because nobody looked.
+#
+# Deleted HERE, in the toolchain stage, so the runtime `COPY --from=build
+# /opt/gst` never sees them — a delete in the runtime stage would be a later
+# layer over the same bytes and would reclaim nothing.
+#
+# The .pc files and headers stay: the `dev` image is a build environment and
+# cargo/meson do read those.
+RUN find /opt/gst -name '*.a' -delete \
+    && ! find /opt/gst -name '*.a' | grep -q . \
+    && echo "static archives stripped from /opt/gst: $(du -sh /opt/gst | cut -f1) remaining"
+
+# The gst-wayland-display patch set, carried as the AUTHORED RECORD and the upstream
+# submission source. Nothing in this build applies them — since 2026-07-26 the gwd delta
+# is the fork's `develop` branch (GST_WAYLAND_DISPLAY_REF above), one commit per former
+# patch file. They are copied in for provenance, exactly as before.
+#
+# LAST IN THE STAGE, DELIBERATELY. Re-diffing one of these is a documented step of the
+# GST_WAYLAND_DISPLAY_REF bump procedure (docs/third-party-pins.md), so it happens often;
+# and because they are a record rather than an input, invalidating anything for them is
+# pure waste. Copied here, they invalidate this COPY and the LABEL below and nothing else.
+COPY deploy/patches/vulkan/gst-wayland-display-*.patch /tmp/
+
+# Provenance for the PUBLISHED artefact. A quasar-toolchain image pulled from
+# GHCR months later has no build log and no local .build-report.json; without
+# these labels the only way to know what is inside it is to trust its tag. The
+# tag IS a content hash (deploy/toolchain-hash.sh), so these labels are what let
+# you verify that claim rather than take it.
+ARG QUASAR_BASE_IMAGE
+ARG SOURCE_COMMIT=unknown
+ARG BUILT_AT=unknown
+LABEL org.quasar.image.role="toolchain" \
+      org.quasar.pins.gwd="${GST_WAYLAND_DISPLAY_REF}" \
+      org.quasar.pins.gst="${GST_VERSION}" \
+      org.quasar.pins.plugins-rs="${GST_PLUGINS_RS_REF}" \
+      org.quasar.pins.interpipe="${GST_INTERPIPE_REF}" \
+      org.quasar.pins.rust="${RUST_VERSION}" \
+      org.quasar.pins.cuda="${CUDA_PKG_VERSION}" \
+      org.quasar.pins.base="${QUASAR_BASE_IMAGE}" \
+      org.quasar.source.commit="${SOURCE_COMMIT}" \
+      org.quasar.built.at="${BUILT_AT}"
+
+# ══ Build stage (node-agent compile ONLY) ═════════════════════════════════════
+# Everything above this line is the pin-keyed toolchain and is reused, not
+# rebuilt, whenever TOOLCHAIN_IMAGE names a published artefact. Everything below
+# is keyed on node-agent SOURCE and is ~5 minutes.
+#
+# Do NOT move toolchain work down here or agent work up there: the split IS the
+# cost model. If a step belongs to neither (it depends on node-agent sources AND
+# is expensive), that is a design problem to solve, not a reason to blur the line.
+FROM ${TOOLCHAIN_IMAGE} AS build
+
+# node-agent release binary, built against /opt/gst.
+#
+# Built WITH `--features cuda` whenever the toolkit is present (the default). Before
+# 2026-07-26 this line omitted the feature unconditionally, so the binary baked into the
+# `nv` image could not take the ZC-02 zero-copy CUDA path — which forced the Tower
+# deployment to compile the agent INSIDE the container from a bind-mounted workspace,
+# which in turn is why 6.15 GB of Rust + C toolchain was baked into a production image.
+# Fixing this one flag is what lets the runtime images drop the toolchain entirely and
+# lets compose exec the baked binary instead of a build artifact that is not part of the
+# image identity.
+#
+# The feature is safe in the vendor-neutral image: the CUDA symbols are dlopened, not
+# linked (`readelf -d` shows no libcuda/libgstcuda DT_NEEDED), so the same binary starts
+# and runs on an AMD/Intel host.
+COPY node-agent /src/node-agent
+RUN cd /src/node-agent && cargo build --release \
+        $( [ "$CUDA_ENABLE" = "1" ] && echo --features cuda ) \
+    && install -Dm0755 target/release/quasar-node-agent /opt/agent/quasar-node-agent
+
+# ══ Runtime stage (target: runtime → quasar-node-agent:latest) ════════════════════
+# The VA/Vulkan node-agent image, unchanged from the VK-01 image. NOT the default build result:
+# the #367 dev/nv targets live below this stage, and Docker builds the LAST stage (`nv`) when no
+# --target is given — building this image requires an explicit `--target runtime`.
+FROM ${QUASAR_BASE_IMAGE} AS runtime
+
+# Runtime-only libraries: no compilers, no -devel headers, no Rust/meson/ninja toolchain.
+#
+# ONE LAYER, DELIBERATELY (2026-08-20). This used to be four RUNs: base packages,
+# then openh264, then RPM Fusion freeworld with `--allowerasing`, then avahi. The
+# freeworld install ERASES the stock mesa-vulkan-drivers — but it did so in the
+# THIRD layer, and an overlay layer is additive: deleting a file in a later layer
+# hides it, it does not reclaim the bytes. So ~153 MB of stock Mesa Vulkan driver
+# shipped in every agent image, invisible in the final filesystem and impossible
+# to find by looking at the running container. Installing and erasing inside ONE
+# RUN means the erased package never lands in a layer at all.
+#
+# The same reasoning is why `dnf clean all` and the locale/doc prune below happen
+# in this RUN and not a tidier one of their own.
+#
+# The openh264 and freeworld groups keep their tolerant `|| echo WARN` posture:
+# those repos are third-party and their absence degrades a fallback rather than
+# breaking the image. `set -e` is NOT used here for exactly that reason — each
+# group's own `&&` chain carries its failure semantics.
+RUN dnf install -y --setopt=install_weak_deps=False \
+    ca-certificates curl openssl-libs \
+    glib2 libdrm mesa-libgbm \
+    libwayland-server libwayland-client libxkbcommon libseat libinput \
+    systemd-libs libX11 \
+    vulkan-loader vulkan-tools \
+    mesa-va-drivers libva \
+    libglvnd libglvnd-egl mesa-libEGL mesa-libGLES mesa-libGL mesa-dri-drivers \
+    # The unified image also serves as the per-session PulseAudio sidecar.
+    # pulseaudio-utils provides pactl/pacat but not the daemon executable;
+    # install the daemon explicitly (weak deps remain disabled above).
+    alsa-lib pulseaudio-libs pulseaudio \
+    pciutils-libs libsrtp \
+    # #527: the #483 media-reachability readiness check (node-agent/src/readiness.rs
+    # detect_firewall_posture) needs a firewall client tool inside the container to read the
+    # HOST's firewall posture (network_mode: host + CAP_NET_ADMIN already grant the netlink
+    # access; nothing baked into this image ever gave it the CLIENT). `nftables` provides
+    # `nft`, which alone covers a modern firewalld-on-nftables host (Fedora's default backend
+    # since F32) as well as a raw nftables setup -- `nft list ruleset` reads the same kernel
+    # tables firewalld itself programs. iptables/iptables-nft is deliberately NOT added: it is
+    # a legacy-backend fallback the readiness code also tries, but every host this image
+    # targets (Fedora/RHEL family) is nftables-backed, and adding both client stacks for one
+    # probe is not worth the bytes. Without this package the check can only report
+    # FirewallPosture::Unknown (readiness.rs combine_firewall_signals falls through when
+    # firewall-cmd is unreachable AND nft is absent) and the #483 WARN never fires even on a
+    # filtering host.
+    nftables \
+    # Console local-output runtime: weston drives atomic KMS and seatd provides
+    # VT-unbound device access inside the agent container.
+    weston seatd ddcutil pulseaudio-utils procps-ng iproute \
+    # host-observability: hwdata ships /usr/share/hwdata/pci.ids, the vendor/device
+    # id -> model-name database the node-agent's GPU model detection falls back to
+    # (pciutils-libs above is the lspci shared libs — no ids database on Fedora).
+    hwdata \
+    # mDNS resolution for Chrome's .local ICE candidates. Chrome hides local IPs behind
+    # random <uuid>.local hostnames; libnice resolves them via getaddrinfo inside THIS
+    # container — network_mode:host shares the network namespace but NOT the resolver
+    # stack (nsswitch + NSS modules are container-local), so a host-side avahi install
+    # never reaches the agent. avahi (D-Bus off, publishing off — pure resolver, so it
+    # cannot name-conflict with a host avahi) + nss-mdns in nsswitch make .local resolve
+    # with zero host-side setup; the entrypoint below starts the daemon. Without this,
+    # ICE stalls at "checking" whenever the browser peer offers only mDNS candidates.
+    avahi nss-mdns \
+ ; \
+    # openh264 runtime lib (patent-encumbered Cisco repo): absence degrades to "no
+    # software-encode fallback", not a hard fail — hence the tolerant `||`.
+    { dnf config-manager setopt fedora-cisco-openh264.enabled=1 \
+      && dnf install -y --setopt=install_weak_deps=False openh264 ; } \
+    || echo "WARN: fedora-cisco-openh264 unavailable — openh264enc runtime lib skipped, software-encode fallback disabled in this image" >&2 ; \
+    # RPM Fusion freeworld: BOTH the Vulkan and VA hardware-encode driver stacks. Stock
+    # Fedora Mesa strips the patent-encumbered encode entrypoints; freeworld restores them
+    # for both APIs (Quasar's existing vah264enc path AND the vulkanh264enc path).
+    #
+    # `.x86_64` pin + `--allowerasing` are mandatory, not stylistic: without them dnf can
+    # silently resolve only the i686 (32-bit) variant on a multilib-capable Fedora, leaving
+    # the 64-bit RADV/VA driver with NO encode queue at all — a failure that only shows up
+    # at runtime as "no encoder found", nowhere near this line.
+    #
+    # `--allowerasing` REMOVES stock mesa-vulkan-drivers. That is why this is in the same
+    # RUN as the install above: erased in a later layer, its ~153 MB would still ship.
+    dnf install -y "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm" \
+      && dnf install -y --allowerasing --skip-unavailable \
+          mesa-vulkan-drivers-freeworld.x86_64 \
+          mesa-va-drivers-freeworld.x86_64 ; \
+    dnf clean all && rm -rf /var/cache/dnf ; \
+    sed -i 's/^hosts:.*/hosts:      files myhostname mdns4_minimal [NOTFOUND=return] resolve [!UNAVAIL=return] dns/' /etc/nsswitch.conf ; \
+    sed -i -e 's/^#*enable-dbus=.*/enable-dbus=no/' \
+           -e 's/^#*disable-publishing=.*/disable-publishing=yes/' /etc/avahi/avahi-daemon.conf ; \
+    # Fail LOUDLY if the single-layer restructure lost anything the contract requires.
+    # These four are the packages whose absence has actually caused an outage or a
+    # "no encoder found" report, so they are checked here, at the point of install,
+    # in addition to deploy/image-contract.json checking the finished image.
+    rpm -q pulseaudio mesa-vulkan-drivers-freeworld mesa-va-drivers-freeworld avahi || exit 1 ; \
+    # -- Runtime image trim (2026-08-20): ~250 MB, IN THIS LAYER --------------------
+    # Three groups of packages that are pulled in as transitive dependencies, are
+    # never used by any Quasar code path, and together weigh ~210 MB. Each is removed
+    # with `rpm -e --nodeps` because the thing that requires them (weston-libs,
+    # pulseaudio) IS wanted — only its optional backend is not. The removals and the
+    # proof that the survivors still link are in the SAME layer as the install, so a
+    # broken removal fails the build here rather than shipping.
+    #
+    # SAME RUN AS THE INSTALL, not a tidier one of its own. The first version of this
+    # was a separate RUN and `docker history` showed exactly what that costs: the dnf
+    # layer stayed 873 MB and the trim layer added 16 MB of whiteouts on top. An
+    # overlay delete hides bytes; it never reclaims them. Same lesson as the
+    # `--allowerasing` merge above, learned twice in one file.
+    #
+    # GROUP 1 — weston's VNC and RDP backends (~120 MB measured: libicu 38.2,
+    # flite 22.5, samba-client-libs 20.6, lpcnetfreedv 15.5, libavcodec-free 10.3,
+    # libavfilter-free 4.2, freerdp-libs 3.9, libavformat-free 2.7, codec2 1.4,
+    # libwinpr 1.3, neatvnc 0.16). Console local-output mode drives atomic KMS
+    # through drm-backend.so only (CM-08). Weston's backends are dlopen'd plugins, so
+    # the vnc/rdp .so files are deleted alongside their libraries — leaving the
+    # plugins in place with their deps gone would turn a config typo into a confusing
+    # dlopen error instead of a clean "no such backend".
+    #
+    # GROUP 2 — Fedora's OWN GStreamer 1.26 and the python3 it drags in (~81 MB:
+    # python3-libs 45.5, iso-codes 22.5, gstreamer1-plugins-base 7.7, gstreamer1 5.6).
+    # Required by `pulseaudio` (for its RTP modules, which Quasar does not load) and
+    # by `weston-libs` (for remoting-plugin, removed in group 1). This is also a
+    # CORRECTNESS fix, not only a size one: 36 distro plugins for a DIFFERENT
+    # GStreamer major-minor were sitting in /usr/lib64/gstreamer-1.0 next to the
+    # vendored 1.28 tree, one GST_PLUGIN_PATH mistake away from being loaded.
+    # Pulse's own gst-linked modules go with them for the same reason as group 1.
+    #
+    # GROUP 3 — locales, but only the ones THIS layer installed. glibc-langpack-en
+    # from quasar-base provides en_US.UTF-8, which is what LANG/LC_ALL are set to;
+    # every other language's catalogues are dead weight on a headless streaming host.
+    #
+    # SIZED HONESTLY: /usr/share/locale is 53 MB in the finished image, but ~all of
+    # that arrives in quasar-base's upstream Fedora KIWI layer, which no child layer
+    # can reclaim -- pruning it there was tried, measured, and reverted (see the
+    # comment in quasar-images images/quasar-base/Dockerfile). What this prune does
+    # reclaim is the catalogues weston, mesa, pulseaudio and friends add in the RUN
+    # above, which is worth single-digit MB, not 53. It stays because it is free and
+    # in the right layer; do not quote 53 MB for it. \
+    # Weston's VNC and RDP backends, and the two plugins that pull the distro
+    # GStreamer in. Named explicitly because which backend console mode uses is a
+    # DESIGN decision (drm-backend, CM-08), not something to infer from linkage.
+    rm -f /usr/lib64/libweston-*/vnc-backend.so \
+          /usr/lib64/libweston-*/rdp-backend.so \
+          /usr/lib64/libweston-*/remoting-plugin.so \
+          /usr/lib64/libweston-*/pipewire-plugin.so ; \
+    # Every dlopen-able pulse plugin that reaches the distro GStreamer, found by
+    # asking the linker rather than by listing names -- a hand-written list is only
+    # as good as whoever last read the package contents, and the build gate below
+    # caught two successive versions of that mistake.
+    #
+    # SWEPT TO A FIXED POINT, not once. `ldd` reports the TRANSITIVE closure, so
+    # pulseaudio's `librtp.so` (gst-linked) and the `module-rtp-*.so` that load it
+    # both match on the first pass -- but glob order deletes librtp.so first, after
+    # which its dependents no longer mention libgst at all: they report
+    # `librtp.so => not found`. So the match is "links libgst OR has an unresolved
+    # soname": within this set the only thing that can have become unresolvable is
+    # something an earlier iteration deleted. Repeating until a pass removes
+    # nothing handles a dependency chain of any depth.
+    #
+    # Nothing Quasar runs is lost. The per-session pulse sidecar loads null-sink,
+    # remap-source and native-protocol-unix; the RTP modules are for streaming
+    # audio over the network, which is what WebRTC does here instead.
+    #
+    # Runs BEFORE the rpm -e below, while ldd can still resolve.
+    while : ; do \
+      removed=0 ; \
+      for f in /usr/lib64/pulseaudio/modules/*.so /usr/lib64/pulse-*/modules/*.so ; do \
+        [ -e "$f" ] || continue ; \
+        if ldd "$f" 2>/dev/null | grep -qE 'libgst|not found' ; then \
+          echo "removing gst-linked pulse module: $f" ; rm -f "$f" ; removed=1 ; \
+        fi ; \
+      done ; \
+      [ "$removed" = 0 ] && break ; \
+    done ; \
+    rpm -e --nodeps \
+        neatvnc freerdp-libs libwinpr samba-client-libs libicu \
+        libavfilter-free libavformat-free libavcodec-free codec2 lpcnetfreedv flite \
+        gstreamer1-plugins-base gstreamer1 iso-codes python3 python3-libs \
+      2>/dev/null || true ; \
+    find /usr/share/locale -mindepth 1 -maxdepth 1 -type d ! -name 'en*' -exec rm -rf {} + ; \
+    ldconfig ; \
+    # PROOF, in the same layer as the removal: every survivor that matters still
+    # resolves every soname it needs. `weston --version` and `pulseaudio --version`
+    # both exec the real binary, so a missing library is an immediate non-zero exit
+    # rather than a surprise at first console session or first audio capture.
+    missing=$(for f in /usr/bin/weston /usr/bin/pulseaudio /usr/bin/pactl /usr/bin/seatd \
+                       /usr/lib64/libweston-*/drm-backend.so \
+                       /usr/lib64/libweston-*/gl-renderer.so \
+                       /usr/lib64/libweston-*/headless-backend.so \
+                       /usr/lib64/pulseaudio/modules/*.so /usr/lib64/pulse-*/modules/*.so ; do \
+                { [ -e "$f" ] && ldd "$f" 2>/dev/null | grep 'not found' ; } || true ; \
+              done) ; \
+    if [ -n "$missing" ]; then echo "TRIM BROKE A SURVIVOR:"; echo "$missing"; exit 1; fi ; \
+    weston --version && pulseaudio --version && echo "runtime trim OK: $(du -sh /usr/share/locale | cut -f1) locale, no distro GStreamer" ; \
+    ! test -e /usr/lib64/gstreamer-1.0/libgstapp.so
+
+# ── Agent-INDEPENDENT half of this stage ──────────────────────────────────────
+# Everything from here down to the agent-binary COPY is keyed on the toolchain and
+# on DOCKER_VERSION only. It is above the binary on purpose (2026-08-26 layer-key
+# audit): with the binary copied first, a one-character node-agent change re-ran the
+# gst-inspect sweep, the registry drop, the entrypoint write AND a fresh network
+# download of the static Docker CLI, every time. Keep agent-keyed steps below this
+# line and pin-keyed steps above it.
+#
+# `COPY --from=build /opt/gst` stays cached across agent changes on its own merits:
+# BuildKit keys a COPY on the CONTENT of what is copied, and `build` adds nothing to
+# /opt/gst. Measured: runtime step 3/9 CACHED with a changed agent binary.
+COPY --from=build /opt/gst /opt/gst
+RUN echo /opt/gst/lib64 > /etc/ld.so.conf.d/gst-vulkan.conf && ldconfig
+
+ENV GST_PLUGIN_PATH=/opt/gst/lib64/gstreamer-1.0
+ENV PATH=/opt/gst/bin:$PATH
+# lavapipe (Mesa's software Vulkan ICD) registers alongside the hardware ICD and collides with the
+# GLES/libLLVM the compositor also loads ("option registered more than once" abort on init) — and
+# it cannot encode video anyway, so there is never a reason to let it load in this image. Runtime
+# override allowed (unset this if a future debug need actually wants lavapipe present).
+ENV VK_LOADER_DRIVERS_DISABLE="*lvp_icd*"
+ENV QUASAR_HEALTH_ADDR=127.0.0.1:9091
+
+# Docker CLI — the agent launches sibling app containers via the mounted socket
+# (same static-binary install as Dockerfile.agent.prod).
+#
+# ABOVE the agent binary since 2026-08-26: this is a network download keyed on
+# DOCKER_VERSION alone, and it used to sit below the binary COPY, so every
+# node-agent edit re-fetched it. Nothing about it depends on the agent.
+ARG DOCKER_VERSION
+ARG DOCKER_CLI_SHA256_X86_64
+ARG DOCKER_CLI_SHA256_AARCH64
+# Checked before the tarball is unpacked: this binary drives the mounted host docker
+# socket, so a substituted payload is host-level code execution.
+RUN set -eux; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64) darch=x86_64;  want="${DOCKER_CLI_SHA256_X86_64}" ;; \
+      aarch64) darch=aarch64; want="${DOCKER_CLI_SHA256_AARCH64}" ;; \
+      *) echo "unsupported arch $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://download.docker.com/linux/static/stable/${darch}/docker-${DOCKER_VERSION}.tgz" \
+      -o /tmp/docker.tgz; \
+    echo "${want}  /tmp/docker.tgz" | sha256sum -c -; \
+    tar -xzf /tmp/docker.tgz -C /tmp; \
+    install -m0755 /tmp/docker/docker /usr/local/bin/docker; \
+    rm -rf /tmp/docker /tmp/docker.tgz
+
+# Entrypoint wrapper — copied VERBATIM from Dockerfile.agent.prod (learned live during the
+# 2026-07-04 soak): compose deployments pass Mesa knobs as EMPTY-BUT-SET vars on the GPU path, and
+# an empty-but-set MESA_LOADER_DRIVER_OVERRIDE makes Mesa load a driver literally named "" — the
+# compositor's eglInitialize then fails with "DRI2: failed to load driver" (issue #71). The dev
+# compose file works around it with a bash -c command wrapper, but an ENTRYPOINT'd image swallows
+# compose `command` as argv — so the guard must live IN the image. The wrapper also creates
+# XDG_RUNTIME_DIR when missing.
+#
+# `exec "$@"` when args are present (2026-07-25): the original wrapper hard-exec'd the BAKED
+# binary and silently DISCARDED compose `command` — so a compose file exec'ing the bind-mounted
+# /workspace/node-agent/target/release binary (dev/nv stacks, `qstack agent` fast-deploy) never
+# actually ran it; the container always ran the binary baked at image build. Standard
+# ENTRYPOINT+command semantics restored: args given -> exec them (env guards above still apply);
+# no args -> the baked binary. Compose `command` wrappers that also start avahi are safe — they
+# check `avahi-daemon --check` first, so the entrypoint's own start is not duplicated.
+#
+# The script text is a constant, so this layer is keyed on nothing that moves. It sits
+# above the agent binary for that reason; the ENTRYPOINT instruction that names it is
+# image config and stays at the bottom of the stage with the rest of the config.
+RUN printf '%s\n' \
+    '#!/bin/bash' \
+    'set -e' \
+    '[ -n "$XDG_RUNTIME_DIR" ] && { mkdir -p "$XDG_RUNTIME_DIR"; chmod 0700 "$XDG_RUNTIME_DIR"; }' \
+    '[ -z "$MESA_LOADER_DRIVER_OVERRIDE" ] && unset MESA_LOADER_DRIVER_OVERRIDE' \
+    '[ -z "$LIBGL_ALWAYS_SOFTWARE" ] && unset LIBGL_ALWAYS_SOFTWARE' \
+    'if command -v avahi-daemon >/dev/null 2>&1 && ! avahi-daemon --check 2>/dev/null; then' \
+    '  avahi-daemon --daemonize --no-chroot || echo "WARN: avahi-daemon failed to start; Chrome .local mDNS ICE candidates will not resolve" >&2' \
+    'fi' \
+    '# Compose deployments that set a `command` expect it to RUN (the dev stack execs the' \
+    '# workspace target/release build). Swallowing argv here made agent code changes' \
+    '# silently not deploy (2026-07-25 leak-fix session). Args win; baked binary is the default.' \
+    'if [ "$#" -gt 0 ]; then exec "$@"; fi' \
+    'exec /usr/local/bin/quasar-node-agent' \
+    > /usr/local/bin/quasar-node-agent-entrypoint \
+    && chmod 0755 /usr/local/bin/quasar-node-agent-entrypoint
+
+# ── Agent-KEYED half of this stage ────────────────────────────────────────────
+# From here down, every step re-runs when the node-agent binary changes. Keep the
+# list short and cheap: a COPY, a gst-inspect sweep, an rm. Anything expensive that
+# does not read the binary belongs above the line.
+COPY --from=build /opt/agent/quasar-node-agent /usr/local/bin/quasar-node-agent
+
+# Build-time verification: device-FREE elements only. vulkanh264enc and vah264enc are registered
+# per-GPU at plugin-scan time (the "stale-registry trap", CLAUDE.md GStreamer gotchas) — this build
+# has no GPU attached, so neither can be checked here; they are validated at first runtime launch
+# against real hardware instead. Everything checked below has no such dependency.
+RUN gst-inspect-1.0 waylanddisplaysrc \
+    && gst-inspect-1.0 kmssink \
+    && gst-inspect-1.0 interpipesrc \
+    && gst-inspect-1.0 rtpgccbwe \
+    && gst-inspect-1.0 webrtcbin \
+    && gst-inspect-1.0 openh264enc \
+    && gst-inspect-1.0 rtpulpfecenc \
+    && gst-inspect-1.0 rtprtxsend \
+    && gst-inspect-1.0 nicesrc \
+    && gst-inspect-1.0 dtlssrtpenc \
+    && gst-inspect-1.0 sctpenc \
+    && gst-inspect-1.0 rtpbin \
+    && gst-inspect-1.0 h264parse \
+    && gst-inspect-1.0 opusenc \
+    && gst-inspect-1.0 pulsesrc \
+    && gst-inspect-1.0 audiotestsrc \
+    && gst-inspect-1.0 alsasink \
+    && command -v pulseaudio \
+    && pulseaudio --version \
+    && command -v weston \
+    && command -v seatd \
+    && ldd /usr/local/bin/quasar-node-agent | (! grep "not found")
+
+# The registry above was scanned with NO GPU present — drop it so the first runtime invocation
+# re-scans with the passed-in GPU and registers vulkanh264enc/vah264enc/nvh264enc as applicable
+# (the stale-registry trap, see CLAUDE.md GStreamer gotchas).
+# NB both paths: quasar-base sets HOME=/home/quasar, so root-run build steps
+# bake the registry there, not /root (missing it re-arms the stale-registry trap).
+RUN rm -rf /root/.cache/gstreamer-1.0 /home/quasar/.cache/gstreamer-1.0
+
+# ── Image config: LAST in the stage, deliberately ─────────────────────────────
+# Provenance (image-lineage spec §4). Baked so ANY image self-describes its pins and
+# source commit — a GHCR-pulled image or one built on another box has no local
+# .build-report.json, and that opacity is how two hosts drifted under one tag.
+# deploy/image-contract.json asserts these, so they cannot silently go missing.
+#
+# An ARG's scope ends at the next FROM, so every pin a LABEL below interpolates
+# must be re-declared in THIS stage. Each re-declare is BARE (`ARG NAME`, no
+# `=value`) and inherits the file's GLOBAL default — the block before the first
+# FROM. That is safe precisely BECAUSE the ARG is declared globally: a bare
+# re-declare of an ARG that has NO global declaration interpolates to an empty
+# string and would silently ship a real label key with an empty value.
+#
+# Until 2026-08-20 these repeated the build stage's defaults by hand instead, kept
+# in step by a Python guard in build-images.sh; DOCKER_VERSION and
+# CUDA_PKG_VERSION were repeated with no guard at all. Do not reintroduce a
+# `=value` here — build-images.sh now REFUSES to build when a pin has more than
+# one default in this file.
+#
+# WHY IT IS AT THE BOTTOM (2026-08-26 layer-key audit). BUILT_AT is a wall-clock
+# stamp: build-images.sh recomputes it on every invocation, so this LABEL misses the
+# cache every single build, by construction. It used to sit in the MIDDLE of the
+# stage, and a LABEL creates a new build state, so everything below it inherited the
+# miss. Measured on devbox with an otherwise fully-cached tree: changing only
+# BUILT_AT re-ran runtime steps 6/9 through 9/9 — the gst-inspect sweep, the registry
+# drop, the Docker CLI download and the entrypoint write. Nothing that costs anything
+# may sit below this block.
+ARG GST_WAYLAND_DISPLAY_REF
+ARG GST_VERSION
+ARG GST_PLUGINS_RS_REF
+ARG GST_INTERPIPE_REF
+ARG QUASAR_BASE_IMAGE
+ARG SOURCE_COMMIT=unknown
+ARG BUILT_AT=unknown
+LABEL org.quasar.image.role="runtime" \
+      org.quasar.pins.gwd="${GST_WAYLAND_DISPLAY_REF}" \
+      org.quasar.pins.gst="${GST_VERSION}" \
+      org.quasar.pins.plugins-rs="${GST_PLUGINS_RS_REF}" \
+      org.quasar.pins.interpipe="${GST_INTERPIPE_REF}" \
+      org.quasar.pins.base="${QUASAR_BASE_IMAGE}" \
+      org.quasar.source.commit="${SOURCE_COMMIT}" \
+      org.quasar.built.at="${BUILT_AT}"
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:9091/health || exit 1
+
+ENTRYPOINT ["/usr/local/bin/quasar-node-agent-entrypoint"]
+
+# ══ DEV stage (target: dev → quasar-dev128:latest) ════════════════════════════
+# #367: replaces the Ubuntu/gst-1.24 quasar-agent-dev:latest with the gst-1.28 lineage. This ONE image
+# fills all three roles the old quasar-agent-dev did (CLAUDE.md build/test conventions):
+#   1. Container build/test env — `docker run -v repo:/workspace -w /workspace/node-agent
+#      quasar-dev128 cargo build` (scripts/dev/dev.sh, qtest). FROM `toolchain` so the full toolchain +
+#      gst 1.28 -devel headers + /opt/gst are already present; the repo is MOUNTED, not baked.
+#   2. Session app-container image — bench apps' runtime_spec image is quasar-agent-dev: needs weston +
+#      weston-terminal demo clients, gst-launch tools (-Dtools=enabled, already in /opt/gst),
+#      videotestsrc/waylandsink (in /opt/gst), wayland + pulse client libs.
+#   3. Base-compose agent-service image — runs the repo-built target/release binary with the repo
+#      mounted; needs the GPU runtime driver stacks + /dev/dri (freeworld VA/Vulkan, same as the
+#      runtime target) and the docker CLI to launch sibling app containers.
+# Built with the same CUDA_ENABLE as every other stage — 1 by default since 2026-07-26 — so its
+# /opt/gst is identical to quasar-node-agent's, CUDA plugins included. (This line used to claim
+# CUDA_ENABLE=0; that was already false when it was written, and believing it is what made the
+# quasar-nv retirement look harder than it was — see #545.)
+#
+# FROM `toolchain`, NOT FROM `build` (2026-08-26, docs/design/2026-08-26-dev-stage-cache-memo.md
+# option A). `build` is `COPY node-agent` + `cargo build --release`, so while `dev` was its child
+# EVERY one-character edit under node-agent/ invalidated the COPY, which invalidated the cargo
+# build, which invalidated every layer below — the rustup components, three dnf transactions
+# (RPM Fusion freeworld drivers, weston/seatd/ddcutil/vulkan-tools, avahi), and the docker CLI
+# download. Not one of those reads node-agent source; the dependency was stage ordering, not
+# content. `runtime` never had the defect because it is FROM the base and pulls the binary in with
+# a single trailing `COPY --from=build`. This stage now has that same shape: the environment is
+# built on the pin-keyed toolchain, and the one source-keyed thing it carries — the release binary
+# — arrives in a cheap COPY at the very end.
+#
+# Consequences, both licensed by the memo: the layer digests change, and the `/src/node-agent`
+# source tree plus its warm `target/` (529 MB, measured in quasar-agent-dev:latest on devbox) are no
+# longer inherited. Nothing uses them — every consumer of this image bind-mounts the repo at
+# /workspace (scripts/dev/dev.sh, the compose agent service, docs/profiling-tokio-console.md's
+# `-v <scratch>:/src`), and deploy/image-contract.json's `dev` role asserts nothing about either
+# path. `profiling` DID compile from /src/node-agent, so it now copies that tree in itself.
+FROM ${TOOLCHAIN_IMAGE} AS dev
+
+# The toolchain stage installs Rust with --profile minimal (no rustfmt/clippy) to keep the runtime
+# image lean; the dev image is the build/test env, and CLAUDE.md's DONE gate requires
+# `cargo fmt` + `cargo clippy -- -D warnings` clean, so add those components here.
+RUN rustup component add rustfmt clippy
+
+# RPM Fusion freeworld VA + Vulkan driver stacks (same rationale as the runtime target: stock
+# Fedora Mesa strips the patent-encumbered encode entrypoints). Needed so a weston app-container
+# and the compose agent can drive the GPU. The `.x86_64` pin + --allowerasing are mandatory (see
+# the runtime stage's note) to avoid dnf silently resolving only the 32-bit driver.
+RUN dnf install -y "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm" \
+    && dnf install -y --allowerasing --skip-unavailable \
+        mesa-vulkan-drivers-freeworld.x86_64 \
+        mesa-va-drivers-freeworld.x86_64 \
+    && dnf clean all
+
+# Weston + a visibly-rendering demo client (weston-terminal; the SHM flower/smoke clients render
+# near-black on the black compositor bg — CLAUDE.md gst-interpipe note), plus the Wayland/pulse
+# client libs + diagnostics an app container or interactive debugging wants. The build stage
+# already carries wayland-devel/pulseaudio-libs-devel/vulkan-tools etc.; these are the extras.
+RUN dnf install -y --setopt=install_weak_deps=False \
+        weston \
+        seatd \
+        ddcutil \
+        pulseaudio-utils \
+        mesa-va-drivers libva-utils \
+        vulkan-tools \
+        procps-ng iproute less vim-minimal \
+        # host-observability: pci.ids database (see the `runtime` stage's note).
+        hwdata \
+    && dnf clean all
+
+# mDNS resolution for Chrome's .local ICE candidates (see the `runtime` stage's note:
+# the resolver stack is container-local even under network_mode:host). This stage runs
+# the agent via the compose `command:` bash wrapper, which starts the daemon.
+RUN dnf install -y --setopt=install_weak_deps=False avahi nss-mdns \
+    && dnf clean all \
+    && sed -i 's/^hosts:.*/hosts:      files myhostname mdns4_minimal [NOTFOUND=return] resolve [!UNAVAIL=return] dns/' /etc/nsswitch.conf \
+    && sed -i -e 's/^#*enable-dbus=.*/enable-dbus=no/' \
+              -e 's/^#*disable-publishing=.*/disable-publishing=yes/' /etc/avahi/avahi-daemon.conf
+
+# Docker CLI — the agent launches sibling app containers via the mounted socket (same static-binary
+# install as the runtime stage / the retired Dockerfile.dev).
+ARG DOCKER_VERSION
+ARG DOCKER_CLI_SHA256_X86_64
+ARG DOCKER_CLI_SHA256_AARCH64
+# Checked before the tarball is unpacked: this binary drives the mounted host docker
+# socket, so a substituted payload is host-level code execution.
+RUN set -eux; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64) darch=x86_64;  want="${DOCKER_CLI_SHA256_X86_64}" ;; \
+      aarch64) darch=aarch64; want="${DOCKER_CLI_SHA256_AARCH64}" ;; \
+      *) echo "unsupported arch $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://download.docker.com/linux/static/stable/${darch}/docker-${DOCKER_VERSION}.tgz" \
+      -o /tmp/docker.tgz; \
+    echo "${want}  /tmp/docker.tgz" | sha256sum -c -; \
+    tar -xzf /tmp/docker.tgz -C /tmp; \
+    install -m0755 /tmp/docker/docker /usr/local/bin/docker; \
+    rm -rf /tmp/docker /tmp/docker.tgz
+
+# Same lavapipe suppression as the runtime target (a software Vulkan ICD collides on init).
+ENV VK_LOADER_DRIVERS_DISABLE="*lvp_icd*"
+
+# Build-time verification: the dev image exposes the same device-free elements the runtime target
+# checks, PLUS the weston demo client and the toolchain (this image doubles as the cargo build env).
+RUN gst-inspect-1.0 waylanddisplaysrc \
+    && gst-inspect-1.0 kmssink \
+    && gst-inspect-1.0 interpipesrc \
+    && gst-inspect-1.0 rtpgccbwe \
+    && gst-inspect-1.0 webrtcbin \
+    && gst-inspect-1.0 videotestsrc \
+    && gst-inspect-1.0 waylandsink \
+    && command -v weston-terminal \
+    && command -v gst-launch-1.0 \
+    && rustc --version && cargo --version
+
+# The registry was baked with NO GPU present — by the build stage AND re-baked by the
+# gst-inspect verification RUN just above. Drop it as the LAST gst-touching step (mirroring
+# the nv stage) so the first GPU-attached invocation rescans and registers vah264enc /
+# vulkanh264enc / nvcodec's cudaconvert. This drop used to sit BEFORE the verification RUN,
+# which re-baked a registry with `nvcodec: 0 features` into the image — the stale-registry
+# trap re-armed by ordering (found 2026-08-25: cuda_element_churn_is_critical_free
+# self-skipped forever because cudaconvert "didn't exist" in quasar-agent-dev).
+# NB both paths: quasar-base sets HOME=/home/quasar, so root-run build steps
+# bake the registry there, not /root (missing it re-arms the stale-registry trap).
+RUN rm -rf /root/.cache/gstreamer-1.0 /home/quasar/.cache/gstreamer-1.0
+
+# The ONLY node-agent-source-keyed layer in this stage, and it is deliberately LAST: everything
+# above is pin-keyed and stays cached across agent edits. Same path the stage used to inherit from
+# `build`, so `profiling`'s release-binary assertion (`! readelf -S /opt/agent/quasar-node-agent
+# | grep -q .debug_line`) is unaffected.
+COPY --from=build /opt/agent/quasar-node-agent /opt/agent/quasar-node-agent
+
+WORKDIR /workspace
+CMD ["bash"]
+
+# ══ PROFILING stage (target: profiling → quasar-profiling, NEVER promoted) ════
+# PROF-02 (#389). The Rust half of the profiling campaign captures against THIS image.
+#
+# WHY IT EXISTS. `[profile.release]` sets no `debug` key, so the shipped agent carries no
+# DWARF. Symbols survive, so perf/samply resolve function NAMES off the release binary
+# already — but there are no line numbers, and inlined frames are attributed to whatever
+# they were inlined INTO. With `codegen-units = 1` plus thin LTO the inlining is
+# aggressive, so a flamegraph off the shipped binary is confidently wrong about where
+# time goes. That is the defect this stage exists to remove.
+#
+# WHY IT IS A SEPARATE IMAGE AND NOT A CHANGE TO `[profile.release]`. Line tables inflate
+# the binary and therefore the image, and deploy/image-contract.json asserts image
+# properties. CLAUDE.md: the contract is never relaxed to make a build green. So the
+# shipped lineage is untouched and this variant sits outside the contract entirely —
+# build-images.sh skips validation for this role and refuses to promote :latest or push
+# it. That is not the contract being weakened; it is this image never claiming to be a
+# shipped artifact.
+#
+# FROM `dev`, so it inherits the toolchain, both freeworld driver stacks, weston, the
+# docker CLI and mDNS — everything needed to run a real session and profile it.
+#
+# Build:  deploy/build-images.sh profiling
+# Use:    docs/profiling-rust.md  (needs perf_event_paranoid <= 1 on the host,
+#         CAP_PERFMON, and seccomp=unconfined — Docker's default seccomp profile
+#         blocks perf_event_open outright)
+FROM dev AS profiling
+
+LABEL org.quasar.image.role="profiling"
+
+# Sampling profiler. Firefox Profiler UI, same perf_event_open backend as perf, and it
+# reads the DWARF this stage's binary carries. `perf` itself comes along for
+# cargo-flamegraph fallback captures and for diagnosing perf_event permissions in situ.
+ARG SAMPLY_VERSION
+RUN cargo install samply --locked --version "${SAMPLY_VERSION}"
+RUN dnf install -y --setopt=install_weak_deps=False perf && dnf clean all
+
+# The agent, rebuilt under [profile.profiling]: identical opt-level/LTO/codegen-units to
+# release (so the measured shape is the shipped shape) plus line tables.
+#
+# force-frame-pointers is the one deliberate codegen deviation, and it is the smaller
+# evil: without it, unwinding through the GStreamer C frames that dominate this call
+# graph depends on CFI that is not always present, and a truncated stack is a silently
+# wrong flamegraph rather than a missing one.
+#
+# --features cuda mirrors the `build` stage: a profiling image that cannot take the
+# ZC-02 CUDA path would profile a different program than Tower runs.
+ARG CUDA_ENABLE
+# `dev` stopped being FROM `build` on 2026-08-26 (see its header), so this stage no longer
+# inherits the source tree it compiles from — it copies it in explicitly. Copied FROM `build`
+# rather than from the context so the tree is byte-identical to what produced the release binary
+# asserted below, warm `target/` included, exactly as when it was inherited.
+COPY --from=build /src/node-agent /src/node-agent
+RUN cd /src/node-agent \
+    && RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling \
+        $( [ "$CUDA_ENABLE" = "1" ] && echo --features cuda ) \
+    && install -Dm0755 target/profiling/quasar-node-agent /usr/local/bin/quasar-node-agent \
+    && install -Dm0755 target/profiling/quasar-node-agent /opt/agent/quasar-node-agent-profiling \
+    && rm -rf target/profiling
+
+# Build-time proof that this image is worth having: the profiling binary carries line
+# tables and the RELEASE binary inherited from `build` does not. If these ever agree,
+# either the profile stopped applying or [profile.release] grew a `debug` key — both are
+# things that must fail the build rather than produce a flamegraph nobody can trust.
+RUN readelf -S /usr/local/bin/quasar-node-agent | grep -q '\.debug_line' \
+    && ! readelf -S /opt/agent/quasar-node-agent | grep -q '\.debug_line' \
+    && command -v samply \
+    && command -v perf \
+    && echo "profiling image: line tables present, release binary still stripped of DWARF"
+
+# Same entrypoint as the `runtime` stage, and for the same reasons — this image has to be
+# a DROP-IN for the agent service or it cannot profile a live session, which is the only
+# thing it exists for. `dev` is FROM `toolchain`, not FROM `runtime`, so it inherits none of
+# this. In particular avahi must start: without it Chrome's `.local` mDNS ICE candidates
+# do not resolve inside the container (CLAUDE.md webrtc-testing rule), and a profiling
+# run that cannot establish a session profiles nothing.
+#
+# Args win over the baked binary, exactly as in `runtime` — that is what lets a capture
+# wrap the agent (`samply record -- quasar-node-agent`) instead of attaching to it.
+RUN printf '%s\n' \
+    '#!/bin/bash' \
+    'set -e' \
+    '[ -n "$XDG_RUNTIME_DIR" ] && { mkdir -p "$XDG_RUNTIME_DIR"; chmod 0700 "$XDG_RUNTIME_DIR"; }' \
+    '[ -z "$MESA_LOADER_DRIVER_OVERRIDE" ] && unset MESA_LOADER_DRIVER_OVERRIDE' \
+    '[ -z "$LIBGL_ALWAYS_SOFTWARE" ] && unset LIBGL_ALWAYS_SOFTWARE' \
+    'if command -v avahi-daemon >/dev/null 2>&1 && ! avahi-daemon --check 2>/dev/null; then' \
+    '  avahi-daemon --daemonize --no-chroot || echo "WARN: avahi-daemon failed to start; Chrome .local mDNS ICE candidates will not resolve" >&2' \
+    'fi' \
+    'if [ "$#" -gt 0 ]; then exec "$@"; fi' \
+    'exec /usr/local/bin/quasar-node-agent' \
+    > /usr/local/bin/quasar-node-agent-entrypoint \
+    && chmod 0755 /usr/local/bin/quasar-node-agent-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/quasar-node-agent-entrypoint"]
+CMD []
+
+# ══ (retired) NV stage ═══════════════════════════════════════════════════════
+# There was a fourth agent target here — `nv` → quasar-nv:latest — from 2026-07-26 until
+# #545 retired it on 2026-08-26. It was `FROM runtime` plus two CUDA runtime packages, and
+# by the end its only load-bearing content was ONE library: libnvrtc, ~115 MB, which gates
+# cudaconvert/cudaconvertscale/cudascale/cudacompositor and therefore the per-session NVENC
+# fallback. (libcudart went with it — measured dead weight: no string, no DT_NEEDED, no API
+# symbol anywhere in /opt/gst or the agent binary references it.)
+#
+# The agent now fetches that library from NVIDIA at run time into the driver volume
+# (node-agent/src/cuda_runtime.rs, pinned version + published sha256), the same way it
+# already fetches the graphics driver userspace. So `runtime` is the universal agent image
+# and the NVIDIA delta is a compose overlay, not a lineage.
+#
+# Two things from that stage moved rather than vanished, and both are worth finding again if
+# something regresses:
+#   * The UNVERSIONED `libnvrtc.so` symlink. gstcuda dlopens the unversioned name; NVIDIA
+#     ships only .so.<ver>, and `ldconfig -n` will never create it (it links SONAMEs). This
+#     stage made that link with a shell loop; `cuda_runtime::link_unversioned` makes it now,
+#     with the same comment attached to it. It is the #384 trap.
+#   * The registry drop (`rm -rf ~/.cache/gstreamer-1.0`), so the first runtime invocation
+#     re-scans with the GPU attached. `runtime` already does this for itself.
+#
+# Do not re-add a CUDA stage to make an NVIDIA host work. If cuda* elements are missing on
+# one, read the agent log for `token="cudart-provision-failed"` or
+# `token="cudart-ld-library-path-missing"` — the answer is in one of those.

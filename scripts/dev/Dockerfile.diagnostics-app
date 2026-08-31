@@ -1,0 +1,30 @@
+# quasar-diagnostics-app — the seeded stream-diagnostics catalog app.
+#
+# Builds on quasar-images' quasar-diagnostics (Chromium on the quasar-app
+# graphics stack: Mesa/GLVND/Vulkan/NVIDIA-init, fonts, portals), adding only
+# the baked diagnostics page and Quasar's kiosk entrypoint (GPU/ANGLE selection,
+# logging, keepalive knobs).
+# NOTE: ghcr.io/accreleus/quasar-diagnostics publishes :latest from its main
+# branch; until quasar-images has a main branch, override with
+#   --build-arg BASE_IMAGE=ghcr.io/accreleus/quasar-diagnostics:latest
+ARG BASE_IMAGE=ghcr.io/accreleus/quasar-diagnostics:latest
+FROM ${BASE_IMAGE}
+
+ENV QUASAR_DIAGNOSTICS_URL=file:///opt/quasar/diagnostics/quasar-stream-diagnostics.html
+
+# dbus-run-session for the entrypoint's session wrapper (the base ships
+# dbus-libs only; the entrypoint degrades gracefully without it, but portals
+# behave better with a session bus).
+RUN dnf -y --setopt=install_weak_deps=False install dbus-daemon \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+COPY scripts/dev/assets/quasar-stream-diagnostics.html /opt/quasar/diagnostics/quasar-stream-diagnostics.html
+COPY scripts/dev/diagnostics-app-entrypoint.sh /usr/local/bin/quasar-diagnostics-app
+
+RUN chmod 0755 /usr/local/bin/quasar-diagnostics-app
+
+# Keep the inherited quasar-base entrypoint (tini + PUID/init contract — this IS
+# an application image; the node-agent forwards PUID/PGID expecting it) and run
+# the kiosk script as the CMD it execs.
+CMD ["/usr/local/bin/quasar-diagnostics-app"]

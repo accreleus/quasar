@@ -1,0 +1,733 @@
+---
+/**
+ * The quick start wizard.
+ *
+ * Five steps, one output. The client script imports the same generator the
+ * Install page uses, so there is one Compose template rather than two, and Vite
+ * bundles it into the page.
+ *
+ * Everything happens in the browser. No fetch, no analytics, no secret: the
+ * generated script calls `openssl rand` on the target machine, so nothing
+ * sensitive exists here to leak.
+ *
+ * Design: existing --q-* tokens from styles/theme.css only. No new colours.
+ */
+---
+
+<div class="qs" data-quickstart>
+	<ol class="qs-progress" aria-label="Progress">
+		<li data-dot="1" class="on">Host</li>
+		<li data-dot="2">GPU</li>
+		<li data-dot="3">Storage</li>
+		<li data-dot="4">Owner</li>
+		<li data-dot="5">Access</li>
+		<li data-dot="6">Result</li>
+	</ol>
+
+	<!-- 1. Platform -->
+	<section data-step="1" class="qs-step on">
+		<h2>Where are you deploying Quasar?</h2>
+		<p class="qs-hint">
+			This sets sensible defaults later, and it changes how the script makes
+			things survive a reboot.
+		</p>
+		<div class="qs-choices">
+			<label><input type="radio" name="platform" value="fedora" checked /><span><strong>Fedora</strong><em>What the install is verified on</em></span></label>
+			<label><input type="radio" name="platform" value="debian" /><span><strong>Debian or Ubuntu</strong></span></label>
+			<label><input type="radio" name="platform" value="arch" /><span><strong>Arch</strong></span></label>
+			<label><input type="radio" name="platform" value="unraid" /><span><strong>Unraid</strong><em>Different paths, different persistence</em></span></label>
+			<label><input type="radio" name="platform" value="other" /><span><strong>Another systemd Linux</strong></span></label>
+		</div>
+		<p class="qs-note" data-platform-note></p>
+	</section>
+
+	<!-- 2. GPU -->
+	<section data-step="2" class="qs-step">
+		<h2>What GPU does this machine have?</h2>
+		<p class="qs-hint">This picks the encoder and the agent image.</p>
+		<div class="qs-choices">
+			<label><input type="radio" name="gpu" value="amd-intel" checked /><span><strong>AMD or Intel</strong><em>Vulkan Video</em></span></label>
+			<label><input type="radio" name="gpu" value="nvidia" /><span><strong>NVIDIA</strong><em>Vulkan Video</em></span></label>
+		</div>
+		<p class="qs-note" data-when-gpu="amd-intel">
+			AMD is verified. Intel takes the same Vulkan path but nobody has run it
+			yet, so you would be first. If it gives you trouble, VA-API is a one-line
+			change on that host afterwards.
+		</p>
+		<p class="qs-note" data-when-gpu="nvidia">
+			You need the NVIDIA driver and <code>nvidia-container-toolkit</code>
+			installed first. The generated script runs <code>nvidia-ctk runtime
+			configure</code> and asks before restarting Docker.
+		</p>
+	</section>
+
+	<!-- 3. Storage -->
+	<section data-step="3" class="qs-step">
+		<h2>Where should Quasar keep things?</h2>
+		<p class="qs-hint">
+			Two directories. A small one for the certificate and the artwork cache,
+			and one that holds a home directory per user. Everything a game writes
+			goes in the second one: saves, settings, and whatever a launcher
+			downloads into its library.
+		</p>
+		<label class="qs-field">
+			<span>Base path</span>
+			<input type="text" name="basePath" value="/var/lib/quasar" spellcheck="false" />
+		</label>
+		<label class="qs-check">
+			<input type="checkbox" name="separateSaves" />
+			<span>Keep user homes on a different disk</span>
+		</label>
+		<label class="qs-field" data-when-saves>
+			<span>Path for user homes</span>
+			<input type="text" name="savesPath" placeholder="/mnt/tank/quasar" spellcheck="false" />
+		</label>
+
+		<figure class="qs-tree">
+			<figcaption>What you end up with</figcaption>
+			<pre data-tree></pre>
+		</figure>
+	</section>
+
+	<!-- 4. Owner -->
+	<section data-step="4" class="qs-step">
+		<h2>Who should own your save data?</h2>
+		<p class="qs-hint">
+			Game containers drop to this user, so it decides who can read the saves
+			from outside Quasar. It does not change what the node agent runs as: that
+			is root, because it needs the Docker socket and the input devices.
+		</p>
+		<div class="qs-choices">
+			<label><input type="radio" name="owner" value="dedicated" checked /><span><strong>The default for this host</strong><em data-owner-default>uid 1000</em></span></label>
+			<label><input type="radio" name="owner" value="custom" /><span><strong>A specific uid and gid</strong><em>If your files need to belong to an existing account</em></span></label>
+		</div>
+		<div class="qs-row" data-when-owner="custom">
+			<label class="qs-field"><span>uid</span><input type="number" name="uid" value="1000" min="0" /></label>
+			<label class="qs-field"><span>gid</span><input type="number" name="gid" value="1000" min="0" /></label>
+		</div>
+	</section>
+
+	<!-- 5. Access -->
+	<section data-step="5" class="qs-step">
+		<h2>How will you reach Quasar?</h2>
+		<p class="qs-hint">
+			Quasar needs HTTPS. Gamepads, Escape capture and the microphone all need
+			a secure context.
+		</p>
+		<div class="qs-choices">
+			<label><input type="radio" name="access" value="self-signed" checked /><span><strong>Let Quasar make a certificate</strong><em>The default. Right for a LAN</em></span></label>
+			<label><input type="radio" name="access" value="proxy" /><span><strong>I already have a reverse proxy</strong><em>Caddy, Traefik, nginx already running</em></span></label>
+			<label><input type="radio" name="access" value="own-cert" /><span><strong>I have my own certificate</strong><em>From an internal or public CA</em></span></label>
+		</div>
+
+		<div data-when-access="self-signed">
+			<label class="qs-field qs-required">
+				<span>What addresses will you type into the browser?</span>
+				<input type="text" name="tlsHosts" placeholder="192.168.1.50,quasar.lan" spellcheck="false" />
+			</label>
+			<p class="qs-note">
+				Every IP and hostname, comma separated. The certificate is generated
+				once on first boot and names exactly these. Leave one out and that
+				address gives you <code>ERR_CERT_COMMON_NAME_INVALID</code>, which
+				cannot be clicked through, because the certificate does not claim that
+				address at all.
+			</p>
+		</div>
+
+		<div data-when-access="proxy">
+			<label class="qs-field qs-required">
+				<span>Public URL your proxy serves</span>
+				<input type="text" name="publicUrl" placeholder="https://quasar.example.com" spellcheck="false" />
+			</label>
+			<label class="qs-field">
+				<span>Addresses for direct LAN access, if you still want it</span>
+				<input type="text" name="tlsHostsProxy" placeholder="192.168.1.50" spellcheck="false" />
+			</label>
+			<p class="qs-note qs-warn">
+				Your proxy carries login and signaling. It does not carry the stream.
+				Video is WebRTC straight from the GPU host to the browser, so the two
+				still need a direct route: a LAN or a VPN. Publishing the login page
+				does not publish the stream.
+			</p>
+			<label class="qs-field">
+				<span>Which proxy?</span>
+				<select name="proxy">
+					<option value="caddy">Caddy</option>
+					<option value="traefik">Traefik</option>
+					<option value="nginx">nginx</option>
+					<option value="npm">NGINX Proxy Manager</option>
+				</select>
+			</label>
+		</div>
+
+		<div data-when-access="own-cert">
+			<label class="qs-field qs-required">
+				<span>Certificate file on this host</span>
+				<input type="text" name="certPath" placeholder="/etc/ssl/quasar/fullchain.pem" spellcheck="false" />
+			</label>
+			<label class="qs-field qs-required">
+				<span>Private key file</span>
+				<input type="text" name="keyPath" placeholder="/etc/ssl/quasar/privkey.pem" spellcheck="false" />
+			</label>
+			<label class="qs-field">
+				<span>Addresses for direct access</span>
+				<input type="text" name="tlsHostsCert" placeholder="192.168.1.50,quasar.lan" spellcheck="false" />
+			</label>
+			<p class="qs-note">
+				The certificate needs every browser-facing name as a subject
+				alternative name, with IP addresses as IP SANs. Browsers ignore the
+				common name. Include the full chain leaf first, and use an unencrypted
+				key: there is nowhere to type a passphrase at boot.
+			</p>
+		</div>
+	</section>
+
+	<!-- 6. Result -->
+	<section data-step="6" class="qs-step">
+		<h2>Your install</h2>
+		<dl class="qs-summary">
+			<div class="qs-sum-row"><dt>Host</dt><dd data-sum="platform"></dd></div>
+			<div class="qs-sum-row"><dt>GPU</dt><dd data-sum="gpu"></dd></div>
+			<div class="qs-sum-row"><dt>Base path</dt><dd data-sum="base"></dd></div>
+			<div class="qs-sum-row"><dt>User homes</dt><dd data-sum="homes"></dd></div>
+			<div class="qs-sum-row"><dt>Owned by</dt><dd data-sum="owner"></dd></div>
+			<div class="qs-sum-row"><dt>Access</dt><dd data-sum="access"></dd></div>
+			<div class="qs-sum-row" data-sum-row="tls"><dt>Certificate names</dt><dd data-sum="tls"></dd></div>
+			<div class="qs-sum-row" data-sum-row="public"><dt>Public URL</dt><dd data-sum="public"></dd></div>
+			<div class="qs-sum-row" data-sum-row="proxy"><dt>Proxy</dt><dd data-sum="proxy"></dd></div>
+		</dl>
+
+		<details class="qs-adv">
+			<summary>Change the ports</summary>
+			<div class="qs-row">
+				<label class="qs-field"><span>HTTP</span><input type="number" name="controlPort" value="8080" min="1" max="65535" /></label>
+				<label class="qs-field"><span>HTTPS</span><input type="number" name="tlsPort" value="8443" min="1" max="65535" /></label>
+			</div>
+		</details>
+
+		<div class="qs-out">
+			<div class="qs-out-head">
+				<h3>Run this on the host</h3>
+				<button type="button" data-copy="script">Copy</button>
+			</div>
+			<p class="qs-hint">
+				Read it before you run it. It writes two files, sets one sysctl, loads
+				the uinput module and starts the stack. The three secrets are generated
+				on that machine by the script, so nothing sensitive came from this page.
+			</p>
+			<pre><code data-out="script"></code></pre>
+		</div>
+
+		<div class="qs-out" data-out-block="proxy" hidden>
+			<div class="qs-out-head">
+				<h3>Add to your <span data-out="proxyName"></span> config</h3>
+				<button type="button" data-copy="proxy">Copy</button>
+			</div>
+			<p class="qs-hint">
+				Goes in <code data-out="proxyFile"></code>. This adds Quasar to a proxy
+				you already run; it does not stand one up.
+			</p>
+			<pre><code data-out="proxy"></code></pre>
+		</div>
+
+		<details class="qs-adv">
+			<summary>The individual files, if you would rather write them yourself</summary>
+			<div class="qs-out-head"><h4>deploy/docker-compose.yml</h4><button type="button" data-copy="compose">Copy</button></div>
+			<pre><code data-out="compose"></code></pre>
+			<div data-out-block="nvidia" hidden>
+				<div class="qs-out-head"><h4>deploy/docker-compose.nvidia.yml</h4><button type="button" data-copy="nvidia">Copy</button></div>
+				<pre><code data-out="nvidia"></code></pre>
+			</div>
+			<div class="qs-out-head"><h4>deploy/.env</h4><button type="button" data-copy="env">Copy</button></div>
+			<pre><code data-out="env"></code></pre>
+		</details>
+
+		<p class="qs-hint">
+			Then open Quasar and continue with
+			<a href="/quasar/install/first-run/">first-run setup</a>. Prefer to read
+			the whole thing instead? <a href="/quasar/install/install/">Install
+			Quasar</a> covers the same ground as prose.
+		</p>
+	</section>
+
+	<nav class="qs-nav">
+		<button type="button" data-back disabled>Back</button>
+		<span class="qs-count"><span data-current>1</span> of 6</span>
+		<button type="button" data-next>Next</button>
+	</nav>
+</div>
+
+<script>
+	import { DEFAULTS, generate, homePath, statePath } from '../data/stack-template.js';
+	import { platform } from '../data/platforms.js';
+
+	for (const root of document.querySelectorAll('[data-quickstart]')) {
+		const PROXY_NAMES = { caddy: 'Caddy', traefik: 'Traefik', nginx: 'nginx', npm: 'NGINX Proxy Manager' };
+		const answers = { ...DEFAULTS };
+		let step = 1;
+		const LAST = 6;
+		// Only overwrite a path or uid the reader has not typed into themselves.
+		const touched = new Set();
+
+		const $ = (sel) => root.querySelector(sel);
+		const $$ = (sel) => Array.from(root.querySelectorAll(sel));
+		const field = (name) => root.querySelector(`[name="${name}"]`);
+
+		/** Read every control into the answers object. */
+		function collect() {
+			const val = (n) => field(n)?.value?.trim() ?? '';
+			answers.platform = root.querySelector('[name="platform"]:checked')?.value ?? 'fedora';
+			answers.gpu = root.querySelector('[name="gpu"]:checked')?.value ?? 'amd-intel';
+			answers.owner = root.querySelector('[name="owner"]:checked')?.value ?? 'dedicated';
+			answers.access = root.querySelector('[name="access"]:checked')?.value ?? 'self-signed';
+			answers.basePath = val('basePath') || platform(answers.platform).defaultBasePath;
+			answers.separateSaves = field('separateSaves')?.checked ?? false;
+			answers.savesPath = val('savesPath');
+			answers.uid = Number(val('uid') || platform(answers.platform).defaultUid);
+			answers.gid = Number(val('gid') || platform(answers.platform).defaultGid);
+			answers.proxy = val('proxy') || 'caddy';
+			answers.publicUrl = val('publicUrl');
+			answers.certPath = val('certPath');
+			answers.keyPath = val('keyPath');
+			answers.controlPort = Number(val('controlPort') || 8080);
+			answers.tlsPort = Number(val('tlsPort') || 8443);
+			// One answer, three inputs: whichever branch is showing owns it.
+			answers.tlsHosts =
+				answers.access === 'proxy'
+					? val('tlsHostsProxy')
+					: answers.access === 'own-cert'
+						? val('tlsHostsCert')
+						: val('tlsHosts');
+		}
+
+		/**
+		 * Move the defaults to match the platform, unless the reader has typed
+		 * their own value into that field. Unraid wants /mnt/user/appdata and
+		 * uid 99, and guessing wrong there is worse than not guessing at all.
+		 */
+		function applyPlatformDefaults() {
+			const p = platform(answers.platform);
+			if (!touched.has('basePath')) field('basePath').value = p.defaultBasePath;
+			if (!touched.has('uid')) field('uid').value = String(p.defaultUid);
+			if (!touched.has('gid')) field('gid').value = String(p.defaultGid);
+			const note = $('[data-platform-note]');
+			note.textContent = p.note;
+			note.hidden = !p.note;
+			$('[data-owner-default]').textContent = p.ownerLabel;
+		}
+
+		/**
+		 * A picture of the directories, because "base path" and "save data path"
+		 * mean nothing until you see what lands in each.
+		 */
+		function tree() {
+			const state = statePath(answers);
+			const homes = homePath(answers);
+			// Pad to one column so the comments line up whatever the nesting depth.
+			const row = (path, comment) => (comment ? `${path.padEnd(26)}${comment}` : path);
+			const lines = answers.separateSaves && answers.savesPath.trim()
+				? [
+						`${state}/`,
+						row('  tls/', 'the certificate, made on first boot'),
+						row('  artwork/', 'cover art cache'),
+						'',
+						`${homes}/`,
+						row('  alice/', 'one directory per user'),
+						row('    steam-a1b2c3d4/', 'her Steam library, saves, settings'),
+						row('  bob/', ''),
+						row('    kde-desktop-9f8e/', "his desktop session's home"),
+					]
+				: [
+						`${answers.basePath.replace(/\/+$/, '')}/`,
+						row('  control/', 'the certificate and artwork cache'),
+						row('  homes/', 'one directory per user'),
+						row('    alice/', ''),
+						row('      steam-a1b2c3d4/', 'her Steam library, saves, settings'),
+						row('    bob/', ''),
+						row('      kde-desktop-9f8e/', "his desktop session's home"),
+					];
+			$('[data-tree]').textContent = lines.join('\n');
+		}
+
+		/** Show and hide the conditional blocks. */
+		function reveal() {
+			$$('[data-when-gpu]').forEach((el) => {
+				el.hidden = el.dataset.whenGpu !== answers.gpu;
+			});
+			$$('[data-when-owner]').forEach((el) => {
+				el.hidden = el.dataset.whenOwner !== answers.owner;
+			});
+			$$('[data-when-access]').forEach((el) => {
+				el.hidden = el.dataset.whenAccess !== answers.access;
+			});
+			const saves = $('[data-when-saves]');
+			if (saves) saves.hidden = !answers.separateSaves;
+		}
+
+		/**
+		 * The required field on the access step is the whole reason this wizard
+		 * exists, so Next stays disabled until it has a value. Nothing else blocks.
+		 */
+		const ACCESS_STEP = 5;
+		function stepComplete(n) {
+			if (n !== ACCESS_STEP) return true;
+			if (answers.access === 'self-signed') return answers.tlsHosts.length > 0;
+			if (answers.access === 'proxy') return answers.publicUrl.length > 0;
+			return answers.certPath.length > 0 && answers.keyPath.length > 0;
+		}
+
+		function summary() {
+			const p = platform(answers.platform);
+			const gpuName = { 'amd-intel': 'AMD or Intel', nvidia: 'NVIDIA' }[answers.gpu];
+			const accessName = {
+				'self-signed': 'Certificate generated by Quasar',
+				proxy: 'Behind your own reverse proxy',
+				'own-cert': 'Your own certificate',
+			}[answers.access];
+
+			const set = (k, v) => ($(`[data-sum="${k}"]`).textContent = v);
+			set('platform', p.label);
+			set('gpu', gpuName);
+			set('base', answers.basePath);
+			set('homes', homePath(answers));
+			set('owner', `uid ${answers.uid}, gid ${answers.gid}`);
+			set('access', accessName);
+			set('tls', answers.tlsHosts);
+			set('public', answers.publicUrl);
+			set('proxy', PROXY_NAMES[answers.proxy] ?? '');
+
+			$('[data-sum-row="tls"]').hidden = !answers.tlsHosts;
+			$('[data-sum-row="public"]').hidden = answers.access !== 'proxy' || !answers.publicUrl;
+			$('[data-sum-row="proxy"]').hidden = answers.access !== 'proxy';
+		}
+
+		function render() {
+			collect();
+			applyPlatformDefaults();
+			collect();
+			reveal();
+			tree();
+			const out = generate(answers);
+
+			$('[data-out="script"]').textContent = out.script;
+			$('[data-out="compose"]').textContent = out.compose;
+			$('[data-out="env"]').textContent = out.env;
+
+			const nvBlock = $('[data-out-block="nvidia"]');
+			nvBlock.hidden = !out.nvidia;
+			if (out.nvidia) $('[data-out="nvidia"]').textContent = out.nvidia;
+
+			const pxBlock = $('[data-out-block="proxy"]');
+			pxBlock.hidden = !out.proxyConfig;
+			if (out.proxyConfig) {
+				$('[data-out="proxy"]').textContent = out.proxyConfig.body;
+				$('[data-out="proxyName"]').textContent = out.proxyConfig.name;
+				$('[data-out="proxyFile"]').textContent = out.proxyConfig.filename;
+			}
+
+			summary();
+			$('[data-next]').disabled = step === LAST || !stepComplete(step);
+			$('[data-back]').disabled = step === 1;
+			$('[data-current]').textContent = String(step);
+		}
+
+		function show(n) {
+			step = Math.min(LAST, Math.max(1, n));
+			$$('[data-step]').forEach((el) => el.classList.toggle('on', Number(el.dataset.step) === step));
+			$$('[data-dot]').forEach((el) => el.classList.toggle('on', Number(el.dataset.dot) <= step));
+			render();
+			root.scrollIntoView({ behavior: 'smooth', block: 'start' });
+		}
+
+		root.addEventListener('input', (e) => {
+			if (e.target?.name) touched.add(e.target.name);
+			render();
+		});
+		root.addEventListener('change', render);
+		$('[data-next]').addEventListener('click', () => show(step + 1));
+		$('[data-back]').addEventListener('click', () => show(step - 1));
+
+		$$('[data-copy]').forEach((btn) => {
+			btn.addEventListener('click', async () => {
+				const text = $(`[data-out="${btn.dataset.copy}"]`).textContent;
+				try {
+					await navigator.clipboard.writeText(text);
+					const was = btn.textContent;
+					btn.textContent = 'Copied';
+					setTimeout(() => (btn.textContent = was), 1600);
+				} catch {
+					btn.textContent = 'Select it and copy';
+				}
+			});
+		});
+
+		show(1);
+	}
+</script>
+
+<style>
+	.qs {
+		border: 1px solid var(--q-line-2, rgba(255, 255, 255, 0.12));
+		border-radius: var(--q-r-lg, 12px);
+		background: var(--q-ink-2, oklch(0.163 0.018 268));
+		padding: 1.5rem;
+		margin: 1.75rem 0;
+	}
+
+	.qs-progress {
+		display: flex;
+		gap: 0.5rem;
+		list-style: none;
+		margin: 0 0 1.75rem;
+		padding: 0;
+		font-family: var(--q-font-mono, ui-monospace, monospace);
+		font-size: 0.6875rem;
+		letter-spacing: 0.12em;
+		text-transform: uppercase;
+	}
+	/* Starlight puts 0.25rem between list items inside markdown content, which
+	   pushed every step but the first down by 4px and left the first bar
+	   floating above the row. */
+	.qs-progress li + li {
+		margin-top: 0;
+	}
+	.qs-progress li {
+		flex: 1;
+		padding-top: 0.5rem;
+		border-top: 2px solid var(--q-line-2, rgba(255, 255, 255, 0.12));
+		color: var(--q-text-4, oklch(0.56 0.024 259));
+	}
+	.qs-progress li.on {
+		border-top-color: var(--sl-color-accent, oklch(0.5998 0.2179 273.21));
+		color: var(--q-text-2, oklch(0.76 0.022 258));
+	}
+
+	.qs-step {
+		display: none;
+	}
+	.qs-step.on {
+		display: block;
+	}
+	.qs-step h2 {
+		margin: 0 0 0.35rem;
+		font-size: 1.25rem;
+	}
+
+	.qs-hint {
+		color: var(--q-text-3, oklch(0.6605 0.0265 259.81));
+		font-size: 0.875rem;
+		margin: 0 0 1rem;
+	}
+
+	.qs-choices {
+		display: grid;
+		gap: 0.5rem;
+		margin-bottom: 1rem;
+	}
+	.qs-choices label {
+		display: flex;
+		gap: 0.75rem;
+		align-items: baseline;
+		padding: 0.75rem 0.9rem;
+		border: 1px solid var(--q-line-2, rgba(255, 255, 255, 0.12));
+		border-radius: var(--q-r-md, 10px);
+		cursor: pointer;
+	}
+	.qs-choices label:has(input:checked) {
+		border-color: var(--sl-color-accent, oklch(0.5998 0.2179 273.21));
+		background: color-mix(in srgb, var(--sl-color-accent, oklch(0.5998 0.2179 273.21)) 8%, transparent);
+	}
+	.qs-choices span {
+		display: flex;
+		flex-direction: column;
+		gap: 0.15rem;
+	}
+	.qs-choices em {
+		font-style: normal;
+		font-size: 0.8125rem;
+		color: var(--q-text-3, oklch(0.6605 0.0265 259.81));
+	}
+
+	.qs-field {
+		display: block;
+		margin-bottom: 0.9rem;
+	}
+	.qs-field > span {
+		display: block;
+		font-size: 0.875rem;
+		margin-bottom: 0.35rem;
+	}
+	.qs-field input,
+	.qs-field select {
+		width: 100%;
+		padding: 0.55rem 0.7rem;
+		border-radius: var(--q-r-md, 10px);
+		border: 1px solid var(--q-line-2, rgba(255, 255, 255, 0.12));
+		background: var(--q-ink-3, oklch(0.208 0.02 268));
+		color: inherit;
+		font-family: var(--q-font-mono, ui-monospace, monospace);
+		font-size: 0.875rem;
+	}
+	.qs-required > span::after {
+		content: ' *';
+		color: var(--sl-color-accent, oklch(0.5998 0.2179 273.21));
+	}
+
+	.qs-check {
+		display: flex;
+		gap: 0.5rem;
+		align-items: center;
+		font-size: 0.875rem;
+		margin-bottom: 0.9rem;
+	}
+	.qs-row {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 0.75rem;
+		align-items: start;
+	}
+	.qs-row .qs-field {
+		margin-bottom: 0;
+	}
+	.qs-adv .qs-row {
+		margin-top: 0.75rem;
+	}
+
+	.qs-note {
+		font-size: 0.8125rem;
+		color: var(--q-text-3, oklch(0.6605 0.0265 259.81));
+		border-left: 2px solid var(--q-line-2, rgba(255, 255, 255, 0.12));
+		padding-left: 0.75rem;
+		margin: 0.75rem 0;
+	}
+	.qs-warn {
+		border-left-color: var(--sl-color-orange, #f5a623);
+	}
+
+	.qs-summary {
+		margin-bottom: 1.5rem;
+		border: 1px solid var(--q-line-2, rgba(255, 255, 255, 0.12));
+		border-radius: var(--q-r-md, 10px);
+		overflow: hidden;
+	}
+	.qs-sum-row {
+		display: grid;
+		grid-template-columns: 11rem 1fr;
+		gap: 1rem;
+		align-items: baseline;
+		padding: 0.5rem 0.9rem;
+		font-size: 0.875rem;
+	}
+	.qs-sum-row + .qs-sum-row {
+		border-top: 1px solid var(--q-line-2, rgba(255, 255, 255, 0.12));
+	}
+	.qs-summary dt {
+		color: var(--q-text-3, oklch(0.6605 0.0265 259.81));
+		margin: 0;
+	}
+	.qs-summary dd {
+		margin: 0;
+		font-family: var(--q-font-mono, ui-monospace, monospace);
+		word-break: break-all;
+	}
+	.qs-sum-row[hidden] {
+		display: none;
+	}
+
+	.qs-tree {
+		margin: 1.25rem 0 0;
+	}
+	.qs-tree figcaption {
+		font-family: var(--q-font-mono, ui-monospace, monospace);
+		font-size: 0.6875rem;
+		letter-spacing: 0.12em;
+		text-transform: uppercase;
+		color: var(--q-text-3, oklch(0.6605 0.0265 259.81));
+		margin-bottom: 0.4rem;
+	}
+	.qs-tree pre {
+		margin: 0;
+		max-height: none;
+		color: var(--q-text-2, oklch(0.76 0.022 258));
+	}
+
+	.qs-out {
+		margin: 1.25rem 0;
+	}
+	.qs-out-head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 1rem;
+		margin-bottom: 0.35rem;
+	}
+	.qs-out-head h3,
+	.qs-out-head h4 {
+		margin: 0;
+		font-size: 1rem;
+	}
+	.qs pre {
+		max-height: 26rem;
+		overflow: auto;
+		background: var(--q-ink-3, oklch(0.208 0.02 268));
+		border: 1px solid var(--q-line-2, rgba(255, 255, 255, 0.12));
+		border-radius: var(--q-r-md, 10px);
+		padding: 0.9rem;
+		font-size: 0.8125rem;
+		line-height: 1.5;
+	}
+
+	.qs-adv {
+		margin: 1rem 0;
+		font-size: 0.9375rem;
+	}
+	.qs-adv summary {
+		cursor: pointer;
+		color: var(--q-text-2, oklch(0.76 0.022 258));
+	}
+
+	.qs-nav {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 1rem;
+		margin-top: 1.75rem;
+		padding-top: 1.25rem;
+		border-top: 1px solid var(--q-line-2, rgba(255, 255, 255, 0.12));
+	}
+	.qs-count {
+		font-family: var(--q-font-mono, ui-monospace, monospace);
+		font-size: 0.75rem;
+		color: var(--q-text-3, oklch(0.6605 0.0265 259.81));
+	}
+	.qs button {
+		padding: 0.5rem 1.1rem;
+		border-radius: var(--q-r-md, 10px);
+		border: 1px solid var(--q-line-2, rgba(255, 255, 255, 0.12));
+		background: var(--q-ink-3, oklch(0.208 0.02 268));
+		color: inherit;
+		font: inherit;
+		font-size: 0.875rem;
+		cursor: pointer;
+	}
+	.qs [data-next] {
+		background: var(--sl-color-accent, oklch(0.5998 0.2179 273.21));
+		border-color: transparent;
+		color: #fff;
+	}
+	.qs button:disabled {
+		opacity: 0.4;
+		cursor: not-allowed;
+	}
+
+	@media (max-width: 45rem) {
+		.qs-progress li {
+			font-size: 0;
+			padding-top: 0.4rem;
+		}
+		.qs-summary div,
+		.qs-row {
+			grid-template-columns: 1fr;
+		}
+	}
+</style>

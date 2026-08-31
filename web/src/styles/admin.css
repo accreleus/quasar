@@ -1,0 +1,754 @@
+/* ============================================================
+   admin.css — styles for the /admin/* operator area (UI-10+)
+   Other admin tickets (UI-11..14) can append to this file.
+   Uses only CSS custom properties from tokens.css.
+   ============================================================ */
+
+/* ── Overview (v3, mock §A.1) ───────────────────────────────
+   The KPI card, the table cells and the bars are primitives; what the
+   Overview adds is the two composite rows the mock builds inline — the
+   alert row and the activity row — plus the gap between its three bands.
+   ------------------------------------------------------------------ */
+.overview-page {
+  --stack-gap: var(--s5);
+}
+
+/* Needs attention: icon, title + mono detail, age + CTA. */
+.alert-row {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 13px var(--card-pad);
+  border-bottom: 1px solid var(--line);
+}
+
+.alert-ico {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  flex: none;
+  display: grid;
+  place-content: center;
+  margin-top: 1px;
+}
+
+.alert-ico svg {
+  width: 14px;
+  height: 14px;
+}
+
+.alert-ico.danger {
+  background: var(--danger-bg);
+  color: var(--danger-text);
+}
+
+.alert-ico.warning {
+  background: var(--warning-bg);
+  color: var(--warning-text);
+}
+
+.alert-body {
+  min-width: 0;
+  flex: 1;
+}
+
+.alert-title {
+  font-size: var(--t-sm);
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* One line, ellipsised: the full text lives on the page the CTA opens. */
+.alert-detail {
+  font-size: var(--t-xs);
+  font-family: var(--font-mono);
+  color: var(--text-3);
+  margin-top: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.alert-act {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+}
+
+.alert-age {
+  font-size: var(--t-xs);
+  font-family: var(--font-mono);
+  color: var(--text-4);
+}
+
+/* Pinned to the bottom of the card so the two cards in the row end level. */
+.alert-foot {
+  padding: 11px var(--card-pad);
+  margin-top: auto;
+}
+
+/* Recent activity: time, actor, action, target on one baseline. */
+.act-list {
+  padding: 6px 0;
+}
+
+.act-row {
+  display: flex;
+  gap: 11px;
+  align-items: baseline;
+  padding: 9px var(--card-pad);
+  font-size: var(--t-sm);
+}
+
+.act-time {
+  font-size: var(--t-xs);
+  color: var(--text-4);
+  flex: none;
+}
+
+
+
+.act-actor {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.act-body .mono {
+  font-size: var(--t-xs);
+}
+
+/* One line: a long target id truncates rather than wrapping the row. */
+.act-body {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.act-target {
+  color: var(--text-3);
+}
+
+/* Two stacked bars per host; the width keeps them off the Sessions column. */
+.ov-cap-cell {
+  width: 190px;
+}
+
+.ov-cap-cell .bar-row + .bar-row {
+  margin-top: 5px;
+}
+
+.ov-trend-cell {
+  width: 84px;
+}
+
+/* === UI-13 Admin Apps === */
+
+/* 2-col field row */
+.apps-frow {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--s3);
+}
+
+/* 3-col field row */
+.apps-frow-3 {
+  grid-template-columns: 1fr 1fr 1fr;
+}
+
+/* Error highlight on inputs */
+.input-error {
+  border-color: var(--danger-line) !important;
+}
+
+@media (max-width: 540px) {
+  .apps-frow,
+  .apps-frow-3 {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* === end UI-11b === */
+
+/* === UI-12 Admin Sessions === */
+
+/* ── Sessions table stack cell (user/app with sub-label) ─── */
+.qtable-stack {
+  display: flex;
+  flex-direction: column;
+}
+.qtable-stack .primary {
+  font-family: var(--font-mono);
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+.qtable-stack .sub {
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  color: var(--text-3);
+  margin-top: 1px;
+}
+
+/* ── Session detail: latest snapshot grid ───────────────────── */
+.sd-latest-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--s5);
+  margin-bottom: var(--s6);
+}
+
+@media (max-width: 700px) {
+  .sd-latest-grid { grid-template-columns: 1fr; }
+}
+
+.sd-latest {
+  padding: var(--card-pad);
+}
+
+.sd-latest-head {
+  font-size: var(--t-xs);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  font-weight: 700;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.sd-latest-rows {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: var(--line);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  overflow: hidden;
+}
+
+.sd-lr {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 11px 14px;
+  background: var(--ink-2);
+}
+
+.sd-lr .l {
+  color: var(--text-3);
+  font-size: var(--t-sm);
+}
+
+.sd-lr .v {
+  font-family: var(--font-mono);
+  font-size: var(--t-base);
+  color: var(--text);
+}
+
+.sd-lr .v.good { color: var(--success-text); }
+.sd-lr .v.warn { color: var(--warning-text); }
+.sd-lr .v.info { color: var(--info-text); }
+
+/* ── Session detail: chart grid ─────────────────────────────── */
+/* auto-fit with minmax(240px,1fr): packs 4 cols on wide viewports,
+   flows to 2 on medium, 1 on narrow — no hard breakpoints needed,
+   and minmax(0,1fr) via the card min-width:0 guard prevents blowout. */
+.sd-charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--s4);
+  margin-bottom: var(--s6);
+}
+
+/* min-width:0 lets grid tracks shrink below the SVG's intrinsic size;
+   ResizeObserver in LineChart2 redraws to the shrunken wrapper width. */
+.sd-chart-card {
+  min-width: 0;
+  padding: 16px;
+}
+
+.sd-chart-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  gap: 8px;
+}
+
+.sd-chart-title {
+  font-size: var(--t-sm);
+  font-weight: 600;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+.sd-chart-val {
+  font-family: var(--font-mono);
+  font-size: var(--t-sm);
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.sd-chart-val.good { color: var(--success-text); }
+
+.sd-chart-area {
+  height: 96px;
+  min-width: 0; /* allow ResizeObserver wrapper to shrink in constrained grid tracks */
+}
+
+/* Failure card app-log tail styling is now shared — see
+ * .failure-log-tail-pre in components.css
+ * (components/SessionFailureDetail.tsx's CollapsibleLogTail). */
+
+/* ── Session detail: chart legend ───────────────────────────── */
+.sd-legend {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: var(--s4);
+  font-size: var(--t-xs);
+  color: var(--text-3);
+}
+
+/* ── Session detail: the Diagnostics disclosure ─────────────── */
+.sd-diagnostics > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  cursor: pointer;
+  list-style: none;
+}
+
+/* display:flex already drops the marker in Chrome; this covers Safari. */
+.sd-diagnostics > summary::-webkit-details-marker {
+  display: none;
+}
+
+.sd-diag-caret {
+  width: 16px;
+  height: 16px;
+  color: var(--text-3);
+  transition: transform .16s ease;
+}
+
+.sd-diagnostics[open] > summary .sd-diag-caret {
+  transform: rotate(90deg);
+  color: var(--accent-text);
+}
+
+/* === UI-14 Admin Users === */
+
+.u-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: var(--r-sm);
+  display: grid;
+  place-content: center;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 0.9rem;
+  color: #fff;
+  flex: none;
+  user-select: none;
+}
+
+.u-avatar-lg {
+  width: 44px;
+  height: 44px;
+  font-size: 1.1rem;
+  border-radius: var(--r-sm);
+}
+
+.u-name {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.u-email {
+  font-size: var(--t-xs);
+  color: var(--text-3);
+  font-family: var(--font-mono);
+}
+
+/* Inline action buttons in table cells — moved to styles/primitives.css
+   (#386): AccountSessions (pages/app/account) and the styleguide depend on it
+   overriding the narrower components.css rule. */
+
+/* User history drawer — user identity header block */
+.drawer-user-head {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  margin-bottom: var(--s5);
+}
+
+/* Fact rows in user drawer */
+.ufact-list {
+  border-top: 1px solid var(--line);
+}
+
+.ufact {
+  display: flex;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: var(--t-sm);
+}
+
+.ufact .l {
+  color: var(--text-3);
+}
+
+.ufact .v {
+  color: var(--text-2);
+}
+
+/* Session history items in drawer */
+.hist-item {
+  display: flex;
+  gap: 13px;
+  padding: 13px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.hist-item:last-child {
+  border-bottom: 0;
+}
+
+.hist-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  margin-top: 5px;
+  flex: none;
+}
+
+.hist-item .hi-app {
+  font-weight: 600;
+  font-size: var(--t-sm);
+}
+
+.hist-item .hi-meta {
+  font-size: var(--t-xs);
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  margin-top: 3px;
+}
+
+@media (max-width: 760px) {
+  .admin-users-page .page-head {
+    align-items: stretch;
+  }
+
+  .admin-users-page .toolbar,
+  .admin-users-page .search {
+    width: 100%;
+  }
+
+  .admin-users-page .table-wrap {
+    border: 0;
+    background: transparent;
+    overflow: visible;
+  }
+
+  .admin-users-page .qtable,
+  .admin-users-page .qtable tbody,
+  .admin-users-page .qtable tr,
+  .admin-users-page .qtable td {
+    display: block;
+    width: 100%;
+  }
+
+  .admin-users-page .qtable thead {
+    display: none;
+  }
+
+  .admin-users-page .qtable tbody {
+    display: grid;
+    gap: var(--s3);
+  }
+
+  .admin-users-page .qtable tbody tr {
+    border: 1px solid var(--line);
+    border-radius: var(--r-md);
+    background: var(--ink-2);
+    overflow: hidden;
+  }
+
+  .admin-users-page .qtable tbody td {
+    min-height: 0;
+    height: auto;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .admin-users-page .qtable tbody td:last-child {
+    border-bottom: 0;
+  }
+
+  .admin-users-page .qtable tbody td::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 6px;
+    color: var(--text-3);
+    font-size: var(--t-xs);
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .admin-users-page .qtable tbody td[data-label=""]::before {
+    display: none;
+  }
+
+  .admin-users-page .qtable tbody td:first-child {
+    padding-bottom: 0;
+    border-bottom: 0;
+  }
+
+  .admin-users-page .cell-actions {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+}
+
+/* ── Session detail: trace viewer (ST-07) ───────────────────── */
+
+.trace-viewer {
+  margin-top: var(--s6);
+  position: relative;
+}
+
+.trace-clock-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  margin-bottom: var(--s4);
+}
+
+.trace-clock-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px;
+  border-radius: var(--r-sm);
+  font-size: var(--t-xs);
+  font-family: var(--font-mono);
+  background: var(--ink-3);
+  color: var(--text-2);
+  border: 1px solid var(--line);
+}
+
+.trace-clock-unmeasured {
+  color: var(--warning-text);
+  border-color: var(--warning-text);
+}
+
+/* Verdict panel */
+.trace-verdict {
+  border-radius: var(--r-md);
+  border: 1px solid var(--line);
+  padding: 10px 14px;
+  margin-bottom: var(--s4);
+  font-size: var(--t-sm);
+}
+
+.trace-verdict-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s3);
+}
+
+.trace-verdict-label {
+  font-weight: 600;
+}
+
+.trace-verdict-toggle {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: var(--t-xs);
+  color: var(--text-3);
+  padding: 0;
+  text-decoration: underline;
+}
+
+.trace-verdict-toggle:hover {
+  color: var(--text);
+}
+
+.trace-verdict-evidence {
+  margin: 8px 0 0 0;
+  padding: 0 0 0 16px;
+  font-size: var(--t-xs);
+  color: var(--text-3);
+  line-height: 1.6;
+}
+
+.trace-verdict-encoder { border-color: rgba(240,160,48,0.4); background: rgba(240,160,48,0.06); }
+.trace-verdict-network  { border-color: rgba(88,166,255,0.4); background: rgba(88,166,255,0.06); }
+.trace-verdict-client   { border-color: rgba(163,113,247,0.4); background: rgba(163,113,247,0.06); }
+.trace-verdict-unknown  { border-color: var(--line); background: var(--ink-2); }
+/* ST-07 (#324): the old overloaded "unknown" split into a green healthy verdict and a
+   grey indeterminate-because-hidden verdict, distinct from the amber likely_* problem
+   verdicts and the plain genuine-unknown chip. */
+.trace-verdict-nominal       { border-color: var(--success-line, rgba(63,185,80,0.4)); background: rgba(63,185,80,0.06); }
+.trace-verdict-indeterminate { border-color: var(--line); background: var(--ink-3); }
+
+.trace-verdict-encoder .trace-verdict-label { color: #f0a030; }
+.trace-verdict-network .trace-verdict-label  { color: #58a6ff; }
+.trace-verdict-client .trace-verdict-label   { color: #a371f7; }
+.trace-verdict-nominal .trace-verdict-label       { color: var(--success-text, #3fb950); }
+.trace-verdict-indeterminate .trace-verdict-label { color: var(--text-3); }
+
+/* Live auto-update indicator (#324) */
+.trace-live-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--t-xs);
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.trace-live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--success, #3fb950);
+  box-shadow: 0 0 0 3px rgba(63,185,80,0.18);
+}
+
+/* Stacked lanes */
+.trace-lanes {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.trace-lane {
+  display: flex;
+  align-items: stretch;
+}
+
+.trace-lane-label {
+  width: 80px;
+  flex: none;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-weight: 700;
+  color: var(--text-4);
+  display: flex;
+  align-items: center;
+  padding-right: 8px;
+  justify-content: flex-end;
+}
+
+.trace-lane-svg {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Legend */
+.trace-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s3) var(--s5);
+  margin-top: var(--s3);
+  font-size: var(--t-xs);
+  color: var(--text-3);
+}
+
+.trace-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+/* Tooltip */
+.trace-tooltip {
+  position: fixed;
+  z-index: 200;
+  background: var(--ink-4, var(--ink-3));
+  border: 1px solid var(--line-2, var(--line));
+  border-radius: var(--r-md);
+  padding: 8px 12px;
+  font-size: var(--t-xs);
+  pointer-events: none;
+  max-width: 240px;
+  box-shadow: var(--shadow-md);
+}
+
+.trace-tooltip-lane {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-4);
+  margin-bottom: 4px;
+  font-weight: 700;
+}
+
+.trace-tooltip-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding: 1px 0;
+}
+
+.trace-tooltip-val {
+  font-family: var(--font-mono);
+  color: var(--text);
+}
+
+/* The estimator + window, from the metric manifest. Dim because it qualifies
+   the label rather than competing with it — but present, because this chart
+   puts a rolling multi-minute median on the same axis as a ~5 s mean. */
+.trace-tooltip-qual {
+  color: var(--text-4);
+  font-style: italic;
+}
+
+.trace-tooltip-event {
+  margin-top: 4px;
+  font-size: 9px;
+  font-style: italic;
+}
+
+/* ---------- NOTE ----------
+   Moved to styles/primitives.css (#386): `.note` is used by SecretField,
+   ProfilePicker, AppHome, DiagPanel and the styleguide, so it must stay in the
+   base bundle now that admin.css loads only with the admin chunk. */
+
+/* ---------- CODEC PAIR (server-resolved vs browser-negotiated) ----------
+   Two values that should agree. When they do not, that is a real defect
+   signal (silent fallback / mis-negotiated m-line), so disagreement is
+   surfaced rather than resolved by picking one. */
+.cpair {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.cpair .arrow {
+  width: 13px;
+  height: 13px;
+  color: var(--text-4);
+  flex: none;
+}
+.cpair.disagree .chip {
+  color: var(--warning-text);
+  background: var(--warning-bg);
+  border-color: var(--warning-line);
+}
+
+/* The launch profiles a stream profile is used by, as a chip row. */
+.used-by {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}

@@ -1,0 +1,105 @@
+---
+title: Upgrading
+description: Upgrade between tagged releases without running an older control plane against a newer database.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+## The hard rule
+
+**Do not run a control-plane image older than the database's applied migration
+version.** The control plane migrates Postgres at startup. A binary that does not
+contain a migration the database has already applied refuses to start.
+
+Restoring the old image alone is therefore not a rollback. A rollback requires
+both the older image and the database backup taken before the upgrade.
+
+## Upgrade a release install
+
+<Steps>
+
+1. **Read the new release notes and changelog.** Note any release-specific
+   migration or configuration instructions.
+
+2. **Back up Postgres, managed homes, and `deploy/.env`.** Follow
+   [Backup and restore](/quasar/operations/backup/) before changing image pins.
+
+3. **Fetch the tagged deployment files.** Keep the existing `deploy/.env` and
+   compare it with the new tag's `.env.example` for added settings.
+
+   ```bash
+   git fetch origin --tags
+   git checkout vX.Y.Z
+   ```
+
+4. **Point the two image variables** in `deploy/.env` at the new build. On
+   `:latest` there is nothing to change. If you pin digests, take the new ones
+   from the release body:
+
+   ```bash
+   QUASAR_CONTROL_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@sha256:<new-digest>
+   QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<new-digest>
+   ```
+
+   One agent image covers every host. NVIDIA driver userspace is provisioned at
+   run time into a volume, so there is no separate NVIDIA image to choose.
+
+5. **Pull and recreate**, using the same `-f` list you installed with.
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml pull
+   docker compose -f deploy/docker-compose.yml up -d
+   ```
+
+   On NVIDIA:
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml \
+                  -f deploy/docker-compose.nvidia.yml pull
+   docker compose -f deploy/docker-compose.yml \
+                  -f deploy/docker-compose.nvidia.yml up -d
+   ```
+
+6. **Verify the result.**
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml ps
+   curl http://localhost:8080/health
+   ```
+
+   Confirm the node agent re-registered under Admin, Fleet, Hosts, then launch a real
+   session. Container health does not prove video, audio, or input.
+
+</Steps>
+
+On `:latest` the pull is the upgrade. If you pinned digests, nothing moves until
+you change them, which is the point of pinning.
+
+## If the control plane crash-loops after a rollback
+
+Redeploy the newer control-plane image containing the migration already present
+in the database. If you genuinely need to return to the older release, restore
+the pre-upgrade database backup as well. Do not hand-edit migration bookkeeping
+or run down migrations against production state.
+
+Check the current migration version with:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec quasar-postgres \
+  psql -U quasar -d quasar -c 'SELECT version, dirty FROM schema_migrations;'
+```
+
+`dirty=true` means a migration failed partway and needs investigation before
+another upgrade attempt.
+
+## Source-built development hosts
+
+Contributors who intentionally deploy a branch use the canonical Makefile and
+explicit refs. See [GPU and remote workflows](/quasar/developer/gpu-workflows/).
+Do not turn the release instructions into an implicit branch deployment.
+
+<Aside type="caution" title="Multiple hosts must stay version-aligned">
+Upgrade the control plane and every agent host as one planned operation. Brief
+skew while containers restart may work, but a permanently mixed fleet is not a
+supported target.
+</Aside>

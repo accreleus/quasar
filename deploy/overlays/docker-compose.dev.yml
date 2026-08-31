@@ -1,0 +1,50 @@
+# Build-from-source overlay — the development shape of the stack.
+#
+#   docker compose -f deploy/docker-compose.yml \
+#                  -f deploy/overlays/docker-compose.dev.yml up -d
+#
+# deploy/redeploy.sh adds this automatically on every source deploy, so a
+# contributor never types it. Apply it by hand only for a manual compose
+# invocation against a source checkout.
+#
+# The base file is the PRODUCTION deployment: published images, no build, no
+# source mounts. Everything that makes the stack buildable from a working tree
+# lives here, which is the split that lets docker-compose.release.yml go away —
+# the base needed no rewriting to become a release, so a release needed no
+# overlay to rewrite it.
+#
+# Three deltas, all on the control plane:
+#
+#  1. `build:` — compose builds deploy/Dockerfile.control (a golang:1.24-alpine
+#     compile plus a debian-slim runtime, reading nothing from
+#     Dockerfile.vulkan, which is what makes `redeploy.sh <env> <ref> control`
+#     a ~1-minute deploy). The image name comes from the base file, so the
+#     build lands on the same tag the base would otherwise pull.
+#
+#  2. The web/dist bind mount. Dockerfile.control does NOT bake the SPA — only
+#     Dockerfile.control.prod does — so on the source path the control plane
+#     serves the dist the host built (redeploy.sh step 4/7 builds it in a
+#     node:22 container). Recreating the container is what re-picks-up the
+#     bind-mount inode after a rebuild (#131); `compose restart` silently
+#     serves the stale dist.
+#
+#  3. The wget healthcheck. Dockerfile.control's debian-slim runtime ships wget
+#     and no curl; the production image is the other way round, which is why
+#     the base file uses curl. A healthcheck calling a binary the image lacks
+#     does not fail loudly — the container stays `unhealthy` forever and the
+#     node agent, gated on `condition: service_healthy`, never starts.
+#
+# The volume list here APPENDS to the base file's (Compose merges volume
+# sequences), so quasar-control-tls survives. Never turn this into a
+# `volumes: !override` — dropping that mount makes the control plane exit at
+# boot with `tls: create TLS dir ... permission denied`.
+services:
+  quasar-control-plane:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.control
+    volumes:
+      # Pre-build with: cd web && npm install && npm run build
+      - ../web/dist:/app/web:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO /dev/null http://localhost:8080/health || exit 1"]

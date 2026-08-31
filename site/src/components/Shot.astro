@@ -1,0 +1,58 @@
+---
+/**
+ * A framed screenshot slot for use inside docs pages.
+ *
+ * Today it renders <Placeholder>. When the real screenshot lands, drop the
+ * image into src/assets/shots/ and pass `src`. The frame does not change, so
+ * nothing reflows.
+ *
+ * Every <Shot> in the docs must have a matching row in site/SCREENSHOTS.md
+ * describing exactly what to capture.
+ */
+import { Image } from 'astro:assets';
+import Placeholder from './Placeholder.astro';
+
+interface Props {
+	/** Short uppercase label naming the surface, e.g. "ADMIN HOSTS". */
+	label: string;
+	/** One plain sentence of context. Shown under the placeholder label, or as the caption once a real image exists. */
+	sublabel?: string;
+	/** Imported image. When present, the real screenshot renders instead of the placeholder. */
+	src?: ImageMetadata;
+	/** Alt text. Required when `src` is set. */
+	alt?: string;
+}
+
+const { label, sublabel, src, alt } = Astro.props;
+---
+
+<figure class="q-shot">
+	{
+		src ? (
+			<Image src={src} alt={alt ?? label} class="q-shot-img" />
+		) : (
+			<Placeholder label={label} sublabel={sublabel} />
+		)
+	}
+	{src && sublabel && <figcaption>{sublabel}</figcaption>}
+</figure>
+
+<style>
+	.q-shot {
+		margin: 1.75rem 0;
+	}
+
+	.q-shot-img {
+		width: 100%;
+		height: auto;
+		border-radius: var(--q-r-lg, 12px);
+		border: 1px solid var(--q-line-2, rgba(255, 255, 255, 0.12));
+		box-shadow: var(--q-shadow-md, 0 6px 20px -6px rgba(0, 0, 0, 0.55));
+	}
+
+	figcaption {
+		margin-top: 0.6rem;
+		font-size: 0.8125rem;
+		color: var(--q-text-3, oklch(0.6605 0.0265 259.81));
+	}
+</style>

@@ -1,0 +1,1270 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#08080c">
+  <title>Quasar | Stream Diagnostics</title>
+  <style>
+    @import url("https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;600&display=swap");
+
+    :root {
+      color-scheme: dark;
+      --ink-0: #08080c;
+      --ink-1: #0c0c12;
+      --ink-2: #11111a;
+      --ink-3: #16161f;
+      --ink-4: #1d1d29;
+      --ink-5: #262635;
+      --text: #f5f5fa;
+      --text-2: #b7b7c6;
+      --text-3: #828292;
+      --text-4: #5d5d6d;
+      --line: rgb(255 255 255 / 7%);
+      --line-2: rgb(255 255 255 / 12%);
+      --violet: #6a45f5;
+      --purple: #8a5cf7;
+      --lavender: #b084ff;
+      --event: #5b6bff;
+      --blue: #2e8bff;
+      --cyan: #00c0ff;
+      --success: #2bd487;
+      --warning: #ffc24b;
+      --danger: #ff5470;
+      --brand-grad: linear-gradient(135deg, var(--violet), var(--event) 52%, var(--cyan));
+      --font-display: "Space Grotesk", sans-serif;
+      --font-ui: "Hanken Grotesk", sans-serif;
+      --font-mono: "JetBrains Mono", monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: var(--ink-0);
+    }
+
+    body {
+      color: var(--text);
+      font-family: var(--font-ui);
+      user-select: none;
+    }
+
+    button {
+      color: inherit;
+      font: inherit;
+    }
+
+    canvas {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+
+    .grain {
+      position: fixed;
+      z-index: 2;
+      inset: 0;
+      pointer-events: none;
+      opacity: .14;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.22'/%3E%3C/svg%3E");
+      mix-blend-mode: soft-light;
+    }
+
+    .flash {
+      position: fixed;
+      z-index: 3;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0;
+      background: rgb(0 192 255 / 18%);
+      box-shadow: inset 0 0 90px rgb(0 192 255 / 35%);
+    }
+
+    .flash.on {
+      animation: input-flash 150ms steps(2) both;
+    }
+
+    .ui {
+      position: fixed;
+      z-index: 4;
+      inset: 0;
+      pointer-events: none;
+    }
+
+    .brand {
+      position: absolute;
+      top: clamp(16px, 3vw, 34px);
+      left: clamp(16px, 3vw, 38px);
+      display: flex;
+      align-items: center;
+      gap: 11px;
+    }
+
+    .brand svg {
+      width: 34px;
+      height: 34px;
+      filter: drop-shadow(0 0 12px rgb(91 107 255 / 30%));
+    }
+
+    .brand-name {
+      font-family: var(--font-display);
+      font-size: 15px;
+      font-weight: 600;
+    }
+
+    .brand-mode {
+      color: var(--text-4);
+      font-family: var(--font-mono);
+      font-size: 8px;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+    }
+
+    .top-stats {
+      position: absolute;
+      top: clamp(16px, 3vw, 34px);
+      right: clamp(16px, 3vw, 38px);
+      display: flex;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: rgb(12 12 18 / 72%);
+      box-shadow: 0 16px 35px rgb(0 0 0 / 22%), inset 0 1px rgb(255 255 255 / 4%);
+      backdrop-filter: blur(14px);
+    }
+
+    .readout {
+      min-width: 82px;
+      padding: 9px 12px;
+      border-right: 1px solid var(--line);
+    }
+
+    .readout:last-child {
+      border-right: 0;
+    }
+
+    .readout strong {
+      display: block;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+
+    .readout span {
+      display: block;
+      margin-top: 2px;
+      color: var(--text-4);
+      font-size: 8px;
+      font-weight: 700;
+      letter-spacing: .09em;
+      text-transform: uppercase;
+    }
+
+    .readout.fps strong {
+      color: #8bf0bd;
+    }
+
+    .test-label {
+      position: absolute;
+      top: 50%;
+      left: clamp(16px, 3vw, 38px);
+      transform: translateY(-50%);
+    }
+
+    .eyebrow {
+      margin-bottom: 7px;
+      color: #79d9ff;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      max-width: 440px;
+      margin: 0;
+      font-family: var(--font-display);
+      font-size: clamp(29px, 4vw, 60px);
+      font-weight: 600;
+      letter-spacing: -.04em;
+      line-height: .98;
+    }
+
+    h1 span {
+      color: var(--lavender);
+    }
+
+    .test-copy {
+      max-width: 360px;
+      margin: 12px 0 0;
+      color: var(--text-3);
+      font-size: clamp(11px, 1.1vw, 14px);
+      line-height: 1.5;
+    }
+
+    .motion-key {
+      display: flex;
+      gap: 15px;
+      margin-top: 17px;
+      color: var(--text-4);
+      font-family: var(--font-mono);
+      font-size: 8px;
+      letter-spacing: .05em;
+      text-transform: uppercase;
+    }
+
+    .motion-key span {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .motion-key i {
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: var(--cyan);
+      box-shadow: 0 0 6px var(--cyan);
+    }
+
+    .motion-key span:nth-child(2) i {
+      background: var(--violet);
+      box-shadow: 0 0 6px var(--violet);
+    }
+
+    .input-panel {
+      position: absolute;
+      right: clamp(16px, 3vw, 38px);
+      bottom: clamp(16px, 3vw, 32px);
+      display: grid;
+      width: min(440px, 46vw);
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background:
+        linear-gradient(180deg, rgb(255 255 255 / 3%), transparent 1px),
+        rgb(17 17 26 / 76%);
+      box-shadow: 0 20px 50px rgb(0 0 0 / 30%), inset 0 1px rgb(255 255 255 / 4%);
+      backdrop-filter: blur(16px);
+      pointer-events: auto;
+      grid-template-columns: 1.35fr .65fr;
+      gap: 14px;
+    }
+
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      grid-column: 1 / -1;
+    }
+
+    .panel-title {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+    }
+
+    .device-state {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--text-3);
+      font-family: var(--font-mono);
+      font-size: 8px;
+    }
+
+    .device-state i {
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: var(--text-4);
+    }
+
+    .device-state.connected {
+      color: #8bf0bd;
+    }
+
+    .device-state.connected i {
+      background: var(--success);
+      box-shadow: 0 0 7px rgb(43 212 135 / 60%);
+    }
+
+    .controller {
+      width: 100%;
+      min-height: 150px;
+      overflow: visible;
+      filter: drop-shadow(0 13px 18px rgb(0 0 0 / 32%));
+    }
+
+    .controller .shell {
+      fill: url("#shellFill");
+      stroke: url("#shellEdge");
+      stroke-width: 1.6;
+    }
+
+    .controller .shell-highlight {
+      fill: none;
+      stroke: rgb(255 255 255 / 9%);
+      stroke-width: 1;
+    }
+
+    .controller .grip {
+      fill: url("#gripFill");
+      stroke: rgb(255 255 255 / 6%);
+      stroke-width: 1;
+    }
+
+    .controller .center-panel {
+      fill: rgb(22 22 31 / 88%);
+      stroke: rgb(255 255 255 / 7%);
+      stroke-width: 1;
+    }
+
+    .controller .well {
+      fill: rgb(5 5 9 / 58%);
+      stroke: rgb(255 255 255 / 7%);
+      stroke-width: 1;
+    }
+
+    .controller .detail-line {
+      fill: none;
+      stroke: rgb(0 192 255 / 17%);
+      stroke-width: 1;
+    }
+
+    .controller .control {
+      fill: url("#controlFill");
+      stroke: rgb(255 255 255 / 20%);
+      stroke-width: 1.1;
+      transition: fill 60ms linear, filter 60ms linear, stroke 60ms linear;
+    }
+
+    .controller .control.active {
+      fill: var(--cyan);
+      stroke: #fff;
+      filter: drop-shadow(0 0 7px var(--cyan));
+    }
+
+    .controller .trigger {
+      fill: rgb(29 29 41 / 92%);
+      stroke: rgb(255 255 255 / 15%);
+      stroke-width: 1.2;
+    }
+
+    .controller .trigger.active {
+      fill: var(--cyan);
+      stroke: #fff;
+      filter: drop-shadow(0 0 7px var(--cyan));
+    }
+
+    .controller .face-a.active { fill: var(--success); }
+    .controller .face-b.active { fill: var(--danger); }
+    .controller .face-x.active { fill: var(--blue); }
+    .controller .face-y.active { fill: var(--warning); }
+
+    .controller text {
+      fill: var(--text-2);
+      font-family: var(--font-mono);
+      font-size: 7px;
+      font-weight: 500;
+      text-anchor: middle;
+      dominant-baseline: middle;
+      pointer-events: none;
+    }
+
+    .stick-dot {
+      fill: url("#stickFill");
+      stroke: rgb(255 255 255 / 22%);
+      stroke-width: 1;
+      transition: transform 30ms linear;
+    }
+
+    .stick-ring {
+      fill: none;
+      stroke: rgb(255 255 255 / 13%);
+      stroke-width: 1;
+      stroke-dasharray: 2 3;
+    }
+
+    .controller .logo-core {
+      fill: url("#logoFill");
+      filter: drop-shadow(0 0 5px rgb(91 107 255 / 35%));
+    }
+
+    .controller .logo-orbit {
+      fill: none;
+      stroke: url("#shellEdge");
+      stroke-width: 1;
+      opacity: .72;
+    }
+
+    .keyboard {
+      display: grid;
+      align-content: center;
+      justify-content: center;
+      grid-template-columns: repeat(3, 37px);
+      grid-template-rows: repeat(3, 37px);
+      gap: 5px;
+    }
+
+    .key {
+      display: grid;
+      border: 1px solid var(--line-2);
+      border-radius: 8px;
+      place-items: center;
+      color: var(--text-3);
+      background: var(--ink-3);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      box-shadow: inset 0 -2px rgb(0 0 0 / 32%);
+      transition: color 50ms linear, border-color 50ms linear, background 50ms linear, transform 50ms linear;
+    }
+
+    .key.active {
+      border-color: #9ce8ff;
+      color: #fff;
+      background: var(--blue);
+      box-shadow: 0 0 12px rgb(0 192 255 / 40%);
+      transform: translateY(2px);
+    }
+
+    .key-up { grid-column: 2; grid-row: 1; }
+    .key-left { grid-column: 1; grid-row: 2; }
+    .key-down { grid-column: 2; grid-row: 2; }
+    .key-right { grid-column: 3; grid-row: 2; }
+    .key-space {
+      grid-column: 1 / 4;
+      grid-row: 3;
+      font-size: 8px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    .event-strip {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 28px;
+      padding-top: 12px;
+      border-top: 1px solid var(--line);
+      grid-column: 1 / -1;
+    }
+
+    .event-name {
+      color: var(--text-2);
+      font-family: var(--font-mono);
+      font-size: 9px;
+      text-transform: uppercase;
+    }
+
+    .event-meta {
+      color: var(--text-4);
+      font-family: var(--font-mono);
+      font-size: 8px;
+    }
+
+    .controls {
+      position: absolute;
+      bottom: clamp(16px, 3vw, 32px);
+      left: clamp(16px, 3vw, 38px);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      pointer-events: auto;
+    }
+
+    .btn {
+      padding: 8px 11px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      color: var(--text-3);
+      background: rgb(17 17 26 / 72%);
+      cursor: pointer;
+      font-size: 10px;
+      font-weight: 600;
+      backdrop-filter: blur(12px);
+      transition: color .2s ease, border-color .2s ease, background .2s ease;
+    }
+
+    .btn:hover,
+    .btn:focus-visible {
+      border-color: rgb(0 192 255 / 45%);
+      color: var(--text);
+      background: var(--ink-3);
+      outline: none;
+    }
+
+    .btn[aria-pressed="true"] {
+      border-color: rgb(0 192 255 / 32%);
+      color: #8bdfff;
+      background: rgb(0 192 255 / 8%);
+    }
+
+    .latency-pip {
+      position: fixed;
+      z-index: 5;
+      top: 50%;
+      right: 0;
+      width: 8px;
+      height: 80px;
+      border-radius: 5px 0 0 5px;
+      transform: translateY(-50%);
+      background: #fff;
+      box-shadow: 0 0 18px #fff, 0 0 35px var(--cyan);
+      animation: pip-scan 1s linear infinite alternate;
+    }
+
+    @keyframes input-flash {
+      0% { opacity: 1; }
+      50% { opacity: .22; }
+      100% { opacity: 0; }
+    }
+
+    @keyframes pip-scan {
+      from { transform: translateY(-340%); }
+      to { transform: translateY(240%); }
+    }
+
+    @media (max-width: 820px) {
+      .test-label {
+        top: 23%;
+        right: 18px;
+        left: 18px;
+        text-align: center;
+      }
+
+      h1 {
+        max-width: none;
+        font-size: clamp(28px, 8vw, 46px);
+      }
+
+      .test-copy {
+        display: none;
+      }
+
+      .motion-key {
+        justify-content: center;
+      }
+
+      .input-panel {
+        right: 14px;
+        bottom: 66px;
+        left: 14px;
+        width: auto;
+        padding: 12px;
+      }
+
+      .controls {
+        right: 14px;
+        bottom: 14px;
+        left: 14px;
+        justify-content: center;
+      }
+
+      .top-stats {
+        top: 64px;
+        right: 14px;
+        left: 14px;
+      }
+
+      .readout {
+        min-width: 0;
+        flex: 1;
+        padding: 7px 8px;
+      }
+
+      .readout strong {
+        font-size: 9px;
+      }
+
+      .brand {
+        top: 14px;
+        left: 16px;
+      }
+    }
+
+    @media (max-height: 670px) {
+      .test-label {
+        top: 42%;
+      }
+
+      .input-panel {
+        width: min(390px, 47vw);
+        padding: 10px;
+      }
+
+      .controller {
+        min-height: 115px;
+      }
+
+      .event-strip {
+        padding-top: 7px;
+      }
+    }
+
+    @media (max-width: 520px) {
+      .brand-mode,
+      .readout:nth-child(3) {
+        display: none;
+      }
+
+      .input-panel {
+        grid-template-columns: 1fr 116px;
+      }
+
+      .controller {
+        min-height: 120px;
+      }
+
+      .keyboard {
+        transform: scale(.86);
+      }
+
+      .panel-title {
+        font-size: 9px;
+      }
+
+      .motion-key {
+        display: none;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .latency-pip {
+        animation: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <canvas id="stressCanvas" aria-hidden="true"></canvas>
+  <div class="grain" aria-hidden="true"></div>
+  <div class="flash" aria-hidden="true"></div>
+  <div class="latency-pip" aria-hidden="true"></div>
+
+  <main class="ui">
+    <header class="brand">
+      <svg viewBox="0 0 32 32" fill="none" aria-hidden="true">
+        <defs>
+          <linearGradient id="qg" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#6A45F5"/>
+            <stop offset=".5" stop-color="#5B6BFF"/>
+            <stop offset="1" stop-color="#00C0FF"/>
+          </linearGradient>
+        </defs>
+        <ellipse cx="16" cy="16" rx="14.2" ry="5.4" transform="rotate(-30 16 16)" stroke="url(#qg)" stroke-width="1.6" opacity=".75"/>
+        <circle cx="16" cy="16" r="6.2" fill="url(#qg)"/>
+        <circle cx="16" cy="16" r="2.1" fill="#fff"/>
+      </svg>
+      <div>
+        <div class="brand-name">Quasar</div>
+        <div class="brand-mode">Stream diagnostics</div>
+      </div>
+    </header>
+
+    <section class="top-stats" aria-label="Local test metrics">
+      <div class="readout fps"><strong id="fps">--.-</strong><span>Render FPS</span></div>
+      <div class="readout"><strong id="frameTime">--.- ms</strong><span>Frame time</span></div>
+      <div class="readout"><strong id="resolution">-- × --</strong><span>Viewport</span></div>
+      <div class="readout"><strong id="clock">00:00.000</strong><span>Test clock</span></div>
+    </section>
+
+    <section class="test-label">
+      <div class="eyebrow">Motion and input test</div>
+      <h1>Signal under <span>pressure.</span></h1>
+      <p class="test-copy">Fast edges, particles, gradients and fine detail expose dropped frames, compression artifacts, scaling softness and color banding.</p>
+      <div class="motion-key">
+        <span><i></i>60 px/s reference</span>
+        <span><i></i>High-frequency detail</span>
+      </div>
+    </section>
+
+    <section class="input-panel" aria-label="Input latency visualizer">
+      <div class="panel-head">
+        <div class="panel-title">Input response</div>
+        <div class="device-state" id="deviceState"><i></i><span>Awaiting gamepad</span></div>
+      </div>
+
+      <svg class="controller" viewBox="0 0 320 190" role="img" aria-label="Game controller input display">
+        <defs>
+          <linearGradient id="shellFill" x1="42" y1="30" x2="275" y2="170">
+            <stop offset="0" stop-color="#222232"/>
+            <stop offset=".45" stop-color="#11111a"/>
+            <stop offset="1" stop-color="#09090e"/>
+          </linearGradient>
+          <linearGradient id="shellEdge" x1="40" y1="30" x2="280" y2="165">
+            <stop offset="0" stop-color="#6A45F5"/>
+            <stop offset=".5" stop-color="#5B6BFF"/>
+            <stop offset="1" stop-color="#00C0FF"/>
+          </linearGradient>
+          <linearGradient id="gripFill" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stop-color="#171722"/>
+            <stop offset="1" stop-color="#09090e"/>
+          </linearGradient>
+          <linearGradient id="controlFill" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stop-color="#2b2b3b"/>
+            <stop offset="1" stop-color="#171720"/>
+          </linearGradient>
+          <radialGradient id="stickFill">
+            <stop offset="0" stop-color="#3a3a4d"/>
+            <stop offset=".65" stop-color="#252534"/>
+            <stop offset="1" stop-color="#111118"/>
+          </radialGradient>
+          <linearGradient id="logoFill" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#6A45F5"/>
+            <stop offset="1" stop-color="#00C0FF"/>
+          </linearGradient>
+        </defs>
+
+        <path class="shell" d="M80 35c20-9 44-5 62 5h36c18-10 42-14 62-5 28 13 43 44 51 77 8 34 2 59-15 64-19 6-34-29-53-50-12 8-31 13-63 13s-51-5-63-13c-19 21-34 56-53 50-17-5-23-30-15-64 8-33 23-64 51-77Z"/>
+        <path class="shell-highlight" d="M81 40c20-8 42-3 59 7h40c17-10 39-15 59-7 24 10 39 39 47 72"/>
+        <path class="grip" d="M39 105c10 9 31 17 58 21-18 20-34 54-52 48-16-6-21-31-6-69Z"/>
+        <path class="grip" d="M281 105c-10 9-31 17-58 21 18 20 34 54 52 48 16-6 21-31 6-69Z"/>
+        <path class="center-panel" d="M126 43h68l15 76c-12 12-31 18-49 18s-37-6-49-18Z"/>
+        <path class="detail-line" d="M109 123c14 10 31 15 51 15s37-5 51-15"/>
+
+        <path class="trigger" data-pad="6" d="M70 29h63l8 12H80c-9 0-14-5-10-12Z"/>
+        <path class="trigger" data-pad="7" d="M250 29h-63l-8 12h61c9 0 14-5 10-12Z"/>
+        <text x="104" y="36">LT</text>
+        <text x="216" y="36">RT</text>
+        <path class="control" data-pad="4" d="M79 43h61l-8 10H87c-7 0-11-4-8-10Z"/>
+        <path class="control" data-pad="5" d="M241 43h-61l8 10h45c7 0 11-4 8-10Z"/>
+        <text x="108" y="48">LB</text>
+        <text x="212" y="48">RB</text>
+
+        <circle class="well" cx="91" cy="84" r="29"/>
+        <circle class="stick-ring" cx="91" cy="84" r="21"/>
+        <circle class="control" data-pad="10" cx="91" cy="84" r="17"/>
+        <circle class="stick-dot" id="leftStick" cx="91" cy="84" r="10"/>
+
+        <circle class="well" cx="184" cy="116" r="27"/>
+        <circle class="stick-ring" cx="184" cy="116" r="20"/>
+        <circle class="control" data-pad="11" cx="184" cy="116" r="16"/>
+        <circle class="stick-dot" id="rightStick" cx="184" cy="116" r="9"/>
+
+        <circle class="well" cx="81" cy="128" r="25"/>
+        <path class="control" data-pad="12" d="M75 106h12l4 5-10 13-10-13Z"/>
+        <path class="control" data-pad="13" d="M75 150h12l4-5-10-13-10 13Z"/>
+        <path class="control" data-pad="14" d="M59 122v12l5 4 13-10-13-10Z"/>
+        <path class="control" data-pad="15" d="M103 122v12l-5 4-13-10 13-10Z"/>
+        <circle cx="81" cy="128" r="5" fill="#111118"/>
+
+        <circle class="well" cx="239" cy="84" r="35"/>
+        <circle class="control face-y" data-pad="3" cx="239" cy="60" r="10"/>
+        <circle class="control face-b" data-pad="1" cx="263" cy="84" r="10"/>
+        <circle class="control face-a" data-pad="0" cx="239" cy="108" r="10"/>
+        <circle class="control face-x" data-pad="2" cx="215" cy="84" r="10"/>
+        <text x="239" y="60">Y</text>
+        <text x="263" y="84">B</text>
+        <text x="239" y="108">A</text>
+        <text x="215" y="84">X</text>
+
+        <rect class="control" data-pad="8" x="133" y="70" width="15" height="10" rx="5"/>
+        <rect class="control" data-pad="9" x="172" y="70" width="15" height="10" rx="5"/>
+        <text x="140.5" y="75">−</text>
+        <text x="179.5" y="75">+</text>
+
+        <ellipse class="logo-orbit" cx="160" cy="96" rx="15" ry="5" transform="rotate(-28 160 96)"/>
+        <circle class="logo-core control" data-pad="16" cx="160" cy="96" r="8"/>
+        <circle cx="160" cy="96" r="2.4" fill="#fff"/>
+      </svg>
+
+      <div class="keyboard" aria-label="Keyboard input display">
+        <div class="key key-up" data-key="ArrowUp">↑</div>
+        <div class="key key-left" data-key="ArrowLeft">←</div>
+        <div class="key key-down" data-key="ArrowDown">↓</div>
+        <div class="key key-right" data-key="ArrowRight">→</div>
+        <div class="key key-space" data-key="Space">Space / action</div>
+      </div>
+
+      <div class="event-strip" aria-live="polite">
+        <span class="event-name" id="eventName">No input detected</span>
+        <span class="event-meta"><span id="eventCount">0000</span> events · <span id="eventTime">--:--.---</span></span>
+      </div>
+    </section>
+
+    <div class="controls">
+      <button class="btn" id="motionToggle" type="button" aria-pressed="true">Pause motion</button>
+      <button class="btn" id="flashToggle" type="button" aria-pressed="true">Input flash on</button>
+      <button class="btn" id="toneToggle" type="button" aria-pressed="true">Tone on</button>
+      <button class="btn" id="fullscreen" type="button">Fullscreen</button>
+    </div>
+  </main>
+
+  <script>
+    const canvas = document.querySelector("#stressCanvas");
+    const ctx = canvas.getContext("2d", { alpha: false });
+    const fpsEl = document.querySelector("#fps");
+    const frameTimeEl = document.querySelector("#frameTime");
+    const resolutionEl = document.querySelector("#resolution");
+    const clockEl = document.querySelector("#clock");
+    const eventNameEl = document.querySelector("#eventName");
+    const eventCountEl = document.querySelector("#eventCount");
+    const eventTimeEl = document.querySelector("#eventTime");
+    const deviceState = document.querySelector("#deviceState");
+    const flash = document.querySelector(".flash");
+    const motionToggle = document.querySelector("#motionToggle");
+    const flashToggle = document.querySelector("#flashToggle");
+    const toneToggle = document.querySelector("#toneToggle");
+    const fullscreenButton = document.querySelector("#fullscreen");
+    const leftStick = document.querySelector("#leftStick");
+    const rightStick = document.querySelector("#rightStick");
+
+    const startTime = performance.now();
+    const particles = [];
+    const heldKeys = new Set();
+    const previousButtons = new Map();
+    let width = 0;
+    let height = 0;
+    let dpr = 1;
+    let running = true;
+    let frozenTime = 0;
+    let flashEnabled = true;
+    let eventCount = 0;
+    let lastFrame = performance.now();
+    let fpsSamples = [];
+    let lastStatsUpdate = 0;
+    let audioContext = null;
+    let toneGain = null;
+    let toneTimer = null;
+    let toneEnabled = true;
+
+    const keyAliases = {
+      KeyW: "ArrowUp",
+      KeyA: "ArrowLeft",
+      KeyS: "ArrowDown",
+      KeyD: "ArrowRight"
+    };
+
+    const padNames = [
+      "A", "B", "X", "Y", "LB", "RB", "LT", "RT",
+      "View", "Menu", "Left stick", "Right stick",
+      "D-pad up", "D-pad down", "D-pad left", "D-pad right", "Home"
+    ];
+
+    function resize() {
+      width = window.innerWidth;
+      height = window.innerHeight;
+      dpr = Math.min(window.devicePixelRatio || 1, 2);
+      canvas.width = Math.round(width * dpr);
+      canvas.height = Math.round(height * dpr);
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      resolutionEl.textContent = `${width} × ${height}`;
+      seedParticles();
+    }
+
+    function seedParticles() {
+      particles.length = 0;
+      const count = Math.min(260, Math.max(90, Math.round(width * height / 7000)));
+      for (let i = 0; i < count; i++) {
+        particles.push({
+          x: Math.random() * width,
+          y: Math.random() * height,
+          size: Math.random() * 1.8 + .4,
+          speed: Math.random() * 95 + 35,
+          phase: Math.random() * Math.PI * 2
+        });
+      }
+    }
+
+    function roundedRect(x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.roundRect(x, y, w, h, r);
+    }
+
+    function drawBackground(t) {
+      const bg = ctx.createLinearGradient(0, 0, width, height);
+      bg.addColorStop(0, "#08080c");
+      bg.addColorStop(.55, "#0c0c16");
+      bg.addColorStop(1, "#090d18");
+      ctx.fillStyle = bg;
+      ctx.fillRect(0, 0, width, height);
+
+      const glow = ctx.createRadialGradient(width * .62, height * .46, 0, width * .62, height * .46, Math.max(width, height) * .48);
+      glow.addColorStop(0, "rgba(91,107,255,.19)");
+      glow.addColorStop(.38, "rgba(106,69,245,.07)");
+      glow.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = glow;
+      ctx.fillRect(0, 0, width, height);
+
+      ctx.save();
+      ctx.globalAlpha = .1;
+      ctx.strokeStyle = "#6974a4";
+      ctx.lineWidth = 1;
+      const grid = Math.max(32, Math.min(64, width / 24));
+      const shift = (t * .018) % grid;
+      for (let x = -grid + shift; x < width + grid; x += grid) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, height);
+        ctx.stroke();
+      }
+      for (let y = -grid + shift; y < height + grid; y += grid) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(width, y);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    function drawParticles(t, dt) {
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      for (const p of particles) {
+        if (running) p.x += p.speed * dt;
+        if (p.x > width + 20) p.x = -20;
+        const y = p.y + Math.sin(t * .0015 + p.phase) * 9;
+        ctx.fillStyle = p.size > 1.4 ? "rgba(0,192,255,.65)" : "rgba(176,132,255,.5)";
+        ctx.fillRect(p.x, y, p.size * 3.2, p.size);
+      }
+      ctx.restore();
+    }
+
+    function drawQuasar(t) {
+      const cx = width * .64;
+      const cy = height * .43;
+      const base = Math.min(width, height);
+      const pulse = 1 + Math.sin(t * .003) * .04;
+      const rotation = t * .00032;
+
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(-.24);
+      ctx.scale(pulse, pulse);
+
+      for (let i = 4; i >= 0; i--) {
+        ctx.beginPath();
+        ctx.ellipse(0, 0, base * (.16 + i * .035), base * (.045 + i * .008), rotation + i * .16, 0, Math.PI * 2);
+        ctx.strokeStyle = i % 2 ? `rgba(0,192,255,${.14 - i * .018})` : `rgba(106,69,245,${.18 - i * .022})`;
+        ctx.lineWidth = Math.max(1, 2.2 - i * .25);
+        ctx.stroke();
+      }
+
+      const disc = ctx.createRadialGradient(0, 0, 0, 0, 0, base * .17);
+      disc.addColorStop(0, "#ffffff");
+      disc.addColorStop(.04, "#00c0ff");
+      disc.addColorStop(.17, "rgba(91,107,255,.95)");
+      disc.addColorStop(.48, "rgba(106,69,245,.45)");
+      disc.addColorStop(1, "rgba(106,69,245,0)");
+      ctx.scale(1, .28);
+      ctx.fillStyle = disc;
+      ctx.beginPath();
+      ctx.arc(0, 0, base * .2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      const jet = ctx.createLinearGradient(cx - base * .42, cy, cx + base * .42, cy);
+      jet.addColorStop(0, "rgba(91,107,255,0)");
+      jet.addColorStop(.43, "rgba(0,192,255,.4)");
+      jet.addColorStop(.5, "#fff");
+      jet.addColorStop(.57, "rgba(0,192,255,.4)");
+      jet.addColorStop(1, "rgba(91,107,255,0)");
+      ctx.translate(cx, cy);
+      ctx.rotate(-.24);
+      ctx.fillStyle = jet;
+      ctx.fillRect(-base * .43, -1.2, base * .86, 2.4);
+      ctx.restore();
+    }
+
+    function drawReferenceBars(t) {
+      const w = Math.min(width * .28, 390);
+      const h = Math.max(42, height * .065);
+      const x = width * .5 - w * .5;
+      const y = height * .72;
+      const colors = ["#ffffff", "#b084ff", "#6a45f5", "#5b6bff", "#2e8bff", "#00c0ff", "#08080c"];
+      const offset = running ? (t * .11) % (w / colors.length) : 0;
+
+      ctx.save();
+      roundedRect(x, y, w, h, 8);
+      ctx.clip();
+      const segment = w / colors.length;
+      for (let i = -1; i < colors.length + 1; i++) {
+        ctx.fillStyle = colors[(i + colors.length) % colors.length];
+        ctx.fillRect(x + i * segment + offset, y, segment + 1, h);
+      }
+      ctx.restore();
+
+      ctx.strokeStyle = "rgba(255,255,255,.2)";
+      ctx.lineWidth = 1;
+      roundedRect(x, y, w, h, 8);
+      ctx.stroke();
+    }
+
+    function drawSharpnessTarget(t) {
+      const size = Math.min(width, height) * .17;
+      const x = width * .63;
+      const y = height * .72;
+      const cell = Math.max(3, size / 22);
+      const shift = running ? Math.floor(t / 180) % 2 : 0;
+
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(t * .00022);
+      for (let row = -11; row < 11; row++) {
+        for (let col = -11; col < 11; col++) {
+          ctx.fillStyle = (row + col + shift) % 2 ? "rgba(245,245,250,.82)" : "rgba(8,8,12,.88)";
+          ctx.fillRect(col * cell, row * cell, cell + .2, cell + .2);
+        }
+      }
+      ctx.strokeStyle = "rgba(0,192,255,.6)";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(-11 * cell, -11 * cell, 22 * cell, 22 * cell);
+      ctx.restore();
+    }
+
+    function drawSweep(t) {
+      const x = running ? (t * .22) % (width + 180) - 90 : width * .5;
+      const gradient = ctx.createLinearGradient(x - 60, 0, x + 60, 0);
+      gradient.addColorStop(0, "rgba(0,192,255,0)");
+      gradient.addColorStop(.5, "rgba(255,255,255,.42)");
+      gradient.addColorStop(1, "rgba(0,192,255,0)");
+      ctx.fillStyle = gradient;
+      ctx.fillRect(x - 60, 0, 120, height);
+
+      ctx.strokeStyle = "#fff";
+      ctx.globalAlpha = .8;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, height);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    function formatClock(ms) {
+      const mins = Math.floor(ms / 60000);
+      const secs = Math.floor(ms / 1000) % 60;
+      const millis = Math.floor(ms % 1000);
+      return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}.${String(millis).padStart(3, "0")}`;
+    }
+
+    function ensureAudio() {
+      if (audioContext) return audioContext;
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) return null;
+      audioContext = new AudioContextClass();
+      toneGain = audioContext.createGain();
+      toneGain.gain.value = 0.055;
+      toneGain.connect(audioContext.destination);
+      return audioContext;
+    }
+
+    function playTonePulse() {
+      const context = ensureAudio();
+      if (!context || !toneEnabled || context.state !== "running") return;
+
+      const now = context.currentTime;
+      const filter = context.createBiquadFilter();
+      filter.type = "lowpass";
+      filter.frequency.setValueAtTime(4200, now);
+      filter.frequency.exponentialRampToValueAtTime(1400, now + 0.42);
+      filter.Q.value = 7;
+      filter.connect(toneGain);
+
+      function pingVoice(start, level, high, low) {
+        const oscillator = context.createOscillator();
+        const envelope = context.createGain();
+        oscillator.type = "sine";
+        oscillator.frequency.setValueAtTime(high, start);
+        oscillator.frequency.exponentialRampToValueAtTime(low, start + 0.34);
+        envelope.gain.setValueAtTime(0.0001, start);
+        envelope.gain.exponentialRampToValueAtTime(level, start + 0.012);
+        envelope.gain.exponentialRampToValueAtTime(0.0001, start + 0.48);
+        oscillator.connect(envelope);
+        envelope.connect(filter);
+        oscillator.start(start);
+        oscillator.stop(start + 0.52);
+      }
+
+      pingVoice(now, 1, 1560, 720);
+      pingVoice(now + 0.18, 0.22, 1180, 620);
+    }
+
+    async function startTone() {
+      const context = ensureAudio();
+      if (!context) {
+        toneEnabled = false;
+        toneToggle.textContent = "No audio";
+        toneToggle.setAttribute("aria-pressed", "false");
+        return;
+      }
+
+      try {
+        await context.resume();
+      } catch {
+        return;
+      }
+
+      if (!toneTimer) {
+        playTonePulse();
+        toneTimer = window.setInterval(playTonePulse, 1800);
+      }
+    }
+
+    function setToneEnabled(enabled) {
+      toneEnabled = enabled;
+      toneToggle.setAttribute("aria-pressed", String(toneEnabled));
+      toneToggle.textContent = toneEnabled ? "Tone on" : "Tone off";
+      if (toneEnabled) {
+        startTone();
+      }
+    }
+
+    function render(now) {
+      const rawDt = now - lastFrame;
+      const dt = Math.min(rawDt, 50) / 1000;
+      lastFrame = now;
+      const t = running ? now : frozenTime;
+
+      drawBackground(t);
+      drawParticles(t, dt);
+      drawQuasar(t);
+      drawReferenceBars(t);
+      drawSharpnessTarget(t);
+      drawSweep(t);
+
+      fpsSamples.push(rawDt);
+      if (fpsSamples.length > 90) fpsSamples.shift();
+      if (now - lastStatsUpdate > 180) {
+        const avg = fpsSamples.reduce((sum, value) => sum + value, 0) / Math.max(1, fpsSamples.length);
+        fpsEl.textContent = (1000 / avg).toFixed(1);
+        frameTimeEl.textContent = `${avg.toFixed(1)} ms`;
+        clockEl.textContent = formatClock(now - startTime);
+        lastStatsUpdate = now;
+      }
+
+      pollGamepads();
+      requestAnimationFrame(render);
+    }
+
+    function triggerInput(name) {
+      eventCount++;
+      eventNameEl.textContent = name;
+      eventCountEl.textContent = String(eventCount).padStart(4, "0");
+      eventTimeEl.textContent = formatClock(performance.now() - startTime);
+      if (flashEnabled) {
+        flash.classList.remove("on");
+        void flash.offsetWidth;
+        flash.classList.add("on");
+      }
+    }
+
+    function setKey(code, active) {
+      const normalized = keyAliases[code] || code;
+      const key = document.querySelector(`[data-key="${normalized}"]`);
+      if (key) key.classList.toggle("active", active);
+    }
+
+    function pollGamepads() {
+      const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+      const pad = Array.from(pads).find(Boolean);
+      if (!pad) {
+        deviceState.classList.remove("connected");
+        deviceState.querySelector("span").textContent = "Awaiting gamepad";
+        document.querySelectorAll("[data-pad]").forEach((node) => node.classList.remove("active"));
+        return;
+      }
+
+      deviceState.classList.add("connected");
+      deviceState.querySelector("span").textContent = pad.id.length > 26 ? `${pad.id.slice(0, 24)}…` : pad.id;
+
+      pad.buttons.forEach((button, index) => {
+        const pressed = button.pressed || button.value > .5;
+        const node = document.querySelector(`[data-pad="${index}"]`);
+        if (node) node.classList.toggle("active", pressed);
+        if (pressed && !previousButtons.get(index)) triggerInput(`Gamepad ${padNames[index] || `button ${index}`}`);
+        previousButtons.set(index, pressed);
+      });
+
+      const lx = pad.axes[0] || 0;
+      const ly = pad.axes[1] || 0;
+      const rx = pad.axes[2] || 0;
+      const ry = pad.axes[3] || 0;
+      leftStick.style.transform = `translate(${lx * 10}px, ${ly * 10}px)`;
+      rightStick.style.transform = `translate(${rx * 10}px, ${ry * 10}px)`;
+    }
+
+    window.addEventListener("keydown", (event) => {
+      const normalized = keyAliases[event.code] || event.code;
+      if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space"].includes(normalized)) {
+        event.preventDefault();
+        setKey(event.code, true);
+        if (!heldKeys.has(event.code)) triggerInput(`Keyboard ${normalized.replace("Arrow", "")}`);
+        heldKeys.add(event.code);
+      }
+    });
+
+    window.addEventListener("keyup", (event) => {
+      setKey(event.code, false);
+      heldKeys.delete(event.code);
+    });
+
+    window.addEventListener("blur", () => {
+      heldKeys.forEach((code) => setKey(code, false));
+      heldKeys.clear();
+    });
+
+    window.addEventListener("gamepadconnected", () => {
+      deviceState.classList.add("connected");
+    });
+
+    window.addEventListener("gamepaddisconnected", () => {
+      previousButtons.clear();
+    });
+
+    motionToggle.addEventListener("click", () => {
+      running = !running;
+      if (!running) frozenTime = performance.now();
+      motionToggle.setAttribute("aria-pressed", String(running));
+      motionToggle.textContent = running ? "Pause motion" : "Resume motion";
+    });
+
+    flashToggle.addEventListener("click", () => {
+      flashEnabled = !flashEnabled;
+      flashToggle.setAttribute("aria-pressed", String(flashEnabled));
+      flashToggle.textContent = flashEnabled ? "Input flash on" : "Input flash off";
+    });
+
+    toneToggle.addEventListener("click", () => {
+      setToneEnabled(!toneEnabled);
+    });
+
+    fullscreenButton.addEventListener("click", async () => {
+      if (!document.fullscreenElement) {
+        await document.documentElement.requestFullscreen();
+      } else {
+        await document.exitFullscreen();
+      }
+    });
+
+    document.querySelectorAll(".btn").forEach((button) => {
+      button.addEventListener("click", () => button.blur());
+    });
+
+    window.addEventListener("resize", resize);
+    window.addEventListener("pointerdown", () => {
+      if (toneEnabled) startTone();
+    }, { once: true });
+    window.addEventListener("keydown", () => {
+      if (toneEnabled) startTone();
+    }, { once: true });
+    resize();
+    startTone();
+    requestAnimationFrame(render);
+  </script>
+</body>
+</html>

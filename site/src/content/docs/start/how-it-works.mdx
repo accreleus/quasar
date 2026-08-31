@@ -1,0 +1,94 @@
+---
+title: How it works
+description: The two services Quasar runs, what happens when you press play, and the handful of terms you will meet in the admin area.
+---
+
+import ArchDiagram from '../../../components/ArchDiagram.astro';
+
+You do not need to know any of this to play a game. You do need it to run the
+thing, because every term here shows up in the admin area.
+
+## Two services
+
+Quasar is two programs, deliberately kept apart.
+
+**The control plane** is a Go service backed by Postgres. It owns accounts,
+authentication, the API, WebRTC signaling, the scheduler, and it serves the web
+app. It holds no GPU state of its own. It decides which host runs a session and
+then tells that host to do it.
+
+**The node agent** is a Rust program that runs on every GPU machine. It owns
+that machine's GPUs, reports capacity, launches game containers, and runs the
+compositor, the encoder and the WebRTC connection for each session.
+
+The split is the reason multi-host works. A second GPU machine is a second node
+agent pointed at the same control plane. Nothing about the deployment changes
+shape.
+
+The web app only ever talks to the control plane. It never contacts a node agent
+directly, even though the video comes from one.
+
+## What happens when you press play
+
+1. The browser asks the control plane for a session.
+2. The control plane picks a host with a free encode slot and enough GPU memory,
+   and resolves the quality tier down to one concrete codec, resolution, frame
+   rate and bitrate.
+3. That host's node agent starts the game container, brings up a Wayland
+   compositor for it, and builds a GStreamer pipeline: compositor to encoder to
+   WebRTC.
+4. The browser and the node agent negotiate through the control plane, then
+   connect to each other directly.
+5. Video, audio and your keyboard, mouse and gamepad input travel directly
+   between the browser and the GPU host over WebRTC. The control plane is out of
+   the media path.
+
+Step 5 is why remote access is more restricted than you might expect. See
+[Reaching Quasar remotely](/quasar/network/remote-access/).
+
+## The terms you will meet
+
+**Host.** A machine running the node agent. It has one or more GPUs and runs
+sessions. Managed under Admin, Fleet, Hosts.
+
+**Session.** One user, one app, one host, one connection. It moves through
+assigned, starting, running, and then stopped or failed.
+
+**App.** A catalog entry a user can launch. An app is content plus a container
+image plus a launch command, not a single monolithic image. Apps are classified
+as a game, a desktop, or a launcher.
+
+**Runtime preset.** A reusable container spec (image, environment, GPU flag,
+mounts) that several apps can share instead of each carrying its own copy.
+
+**Stream profile.** One concrete encode rung: one codec, one resolution, one
+frame rate, one bitrate, plus the eligibility thresholds that decide whether a
+given client can use it. Users never see these.
+
+**Launch profile.** An ordered list of stream profiles, best first. This is what
+a user actually picks, and it is what "1080p60" or "4K120" means in the UI. At
+launch the server walks the list and takes the first rung the host can encode
+and the client can decode. Every launch profile must contain at least one H.264
+rung, which is the guaranteed floor.
+
+**Entitlement.** The grant that decides whether an app appears in a given user's
+library. Can be granted to everyone or to named users.
+
+**Device.** A browser Quasar has seen you log in from. Quasar measures what it
+can decode and stores that, which is how it knows not to send you a codec your
+machine cannot play. You can rename, trust or revoke devices from your account.
+
+<ArchDiagram caption="The control plane places the session and then steps out of the media path. Video, audio and input travel directly between the browser and the host." />
+
+## What the pieces are built from
+
+The compositor is `gst-wayland-display` and the virtual input is `inputtino`,
+both from the [Wolf](https://github.com/games-on-whales/wolf) project. Encoding
+and transport are GStreamer. The encoder is selected per host. Auto-detection
+defaults AMD and NVIDIA to Vulkan Video and Intel to VA-API, with vendor encoder
+paths available as fallbacks or explicit overrides.
+
+The transport is deliberately a replaceable slot in the pipeline. WebRTC to the
+browser is the first implementation. A native client with its own UDP transport
+is the intended second, which is why the compositor and encoder do not know
+anything about WebRTC.

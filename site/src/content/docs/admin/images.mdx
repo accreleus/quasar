@@ -1,0 +1,121 @@
+---
+title: Images
+description: How container images get onto your GPU hosts, digest pinning, update policy, and why images are managed rather than typed in by hand.
+---
+
+import Shot from '../../../components/Shot.astro';
+import admin_images from '../../../assets/shots/admin-images.png';
+import { Aside } from '@astrojs/starlight/components';
+
+Every app runs in a container image. Admin, Library, Images is where those
+images are installed onto your hosts and kept up to date.
+
+<Shot
+	label="Admin images"
+	sublabel="The image catalog, with installed versions and their rollout state across the fleet."
+	src={admin_images}
+	alt="The admin images page"
+/>
+
+## Why this exists
+
+Before it did, images were pulled by hand and referenced by tag. That had two
+problems worth knowing about, because they explain the design.
+
+A tag is a moving target. Pulling `:latest` on host A on Tuesday and host B on
+Friday can give you two different images, and the resulting difference in
+behaviour is genuinely painful to track down.
+
+Worse, a routine `docker image prune` deleted hand-managed app images
+permanently, because there was no record of what they were or where they came
+from.
+
+So images are now a managed catalog. Quasar knows what should be installed, on
+which hosts, and at which exact version.
+
+## Where images come from
+
+Quasar reads a catalog manifest published by the `quasar-images` project. That
+manifest lists the available images, what they are for, and the runtime settings
+each one needs.
+
+Entries are one of two kinds.
+
+**Prebuilt** images are published to a container registry. Quasar resolves the
+tag to a content digest at sync time and then only ever dispatches the digest.
+Every host gets byte-identical bits, and a tag moving underneath you cannot
+change what is running.
+
+**Template** images are a Dockerfile plus build arguments. The node agent
+downloads the build context pinned to an exact commit and builds the image
+locally on the host. This is behind an explicit action, not something that
+happens on its own.
+
+## Installing an image
+
+Install from the list. The control plane records the intent, and the node agents
+do the work: each host pulls or builds independently and reports back. Progress
+shows per host.
+
+Installing an image also creates or updates a **runtime preset** from the
+manifest, which is the container specification (image, environment, GPU access,
+mounts) that apps can then reference. That is why you install an image before
+creating an app against it.
+
+## Where images get placed
+
+By default every host gets every installed image, so a session can be placed
+anywhere without waiting for a pull.
+
+Individual apps can opt into lazy placement instead, where the image is only
+fetched on the first launch attempt on that host. Worth it for large images you
+rarely use, at the cost of a slow first launch.
+
+## Updates
+
+Instance-wide policy under Admin, Settings:
+
+| Policy | Behaviour |
+| --- | --- |
+| `notify` | Default. Tells you an update exists and waits. |
+| `manual` | You update when you update. |
+| `auto` | Updates are applied as they appear. |
+
+Any individual image can be **pinned**, which holds it at its current version
+regardless of the policy.
+
+Updates never disturb a running session. A new version takes effect at the next
+launch.
+
+<Aside type="caution" title="There is no rollback">
+Quasar does not keep the previous version. Going back means re-pulling or
+rebuilding an older catalog version. If a specific version works for you, pin it.
+</Aside>
+
+## Registry allowlist
+
+`QUASAR_IMAGE_REGISTRY_HOSTS` limits which registries Quasar will resolve
+digests or fetch artwork from. It defaults to `ghcr.io`. This is a containment
+measure: it means a manifest cannot point your hosts at an arbitrary address.
+Widen it only if you are publishing your own images elsewhere.
+
+## If an install stalls
+
+Open Admin, Fleet, Jobs and inspect the image job and its most recent run. The
+published Steam package is public; an unresolved digest now points to registry
+reachability, the registry allowlist, credentials for a different registry, or a
+malformed image reference rather than a private upstream package.
+
+## Using your own image
+
+The image family is layered: a Fedora base, then a graphics layer carrying
+Vulkan, EGL, Wayland, audio and the NVIDIA runtime pieces, then app layers on
+top.
+
+**Every image in the app catalog must derive from the graphics layer.** That is
+what supplies GPU access and the Wayland plumbing the compositor expects. An
+arbitrary image from Docker Hub will not work.
+
+Images also carry contract labels that are validated when they enter Quasar. If
+you develop Quasar's image family itself, use the canonical image build and QA
+workflow described in [GPU and remote workflows](/quasar/developer/gpu-workflows/).

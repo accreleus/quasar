@@ -1,0 +1,97 @@
+---
+title: The admin area
+description: What lives where in /admin, and the one thing to understand about how admin access is enforced.
+---
+
+import Shot from '../../../components/Shot.astro';
+import admin_overview from '../../../assets/shots/admin-overview.png';
+import { Aside } from '@astrojs/starlight/components';
+
+The admin area is at `/admin`, in the same web app as everything else. You reach
+it if your account has the admin role.
+
+<Shot
+	label="Admin overview"
+	sublabel="The admin overview: live sessions, what needs attention, fleet capacity and recent activity."
+	src={admin_overview}
+	alt="The Quasar admin overview page"
+/>
+
+## How admin access is enforced
+
+Admin is a role on your user account, checked by the server on every admin API
+call. The `/admin` routes in the browser are hidden from non-admins purely so
+they do not see a menu full of things they cannot use. That hiding is not the
+security boundary. Typing the URL gets you a page that cannot load any data,
+because the server refuses every request behind it.
+
+This matters if you are evaluating Quasar: there is no client-side admin flag to
+flip.
+
+The first admin is provisioned by whoever runs the host, either through the
+first-run wizard's token or through `BOOTSTRAP_ADMIN_*` environment variables.
+Registration only ever creates ordinary users, so nobody can promote themselves
+by signing up first.
+
+## The map
+
+The admin navigation is grouped as follows.
+
+**Overview** is the landing page: a readiness checklist for a new instance, GPU
+capacity across the fleet, and recent failures.
+
+**Settings** holds instance-wide configuration: registration, library discovery,
+allowed browser origins, artwork credentials, microphone permission, and other
+access settings. Per-host storage roots live under Fleet, Hosts.
+
+**Sessions** is live and historical sessions, with per-session drill-down into
+metrics, traces and diagnostic bundles.
+
+**Audit log** is a record of admin actions.
+
+The remaining four entries are sections. Each opens on a page of tabs.
+
+### Fleet
+
+- **Hosts**, your GPU machines, their GPUs, capacity, per-host settings and a
+  console.
+- **Storage**, the managed home directories.
+- **Jobs**, background work, schedules, run history, and run-now controls.
+
+### Library
+
+- **Apps**, the catalog of things users can launch.
+- **Runtime presets**, reusable container specifications shared between apps.
+- **Images**, the container images installed across your hosts.
+- **Sources**, where catalog content and cover art come from: the Steam library
+  provider, manually defined apps, and the artwork provider.
+
+### Streaming
+
+- **Launch profiles**, the quality tiers users pick from.
+- **Stream profiles**, the individual encode rungs those tiers are built out of.
+
+### People
+
+- **Users**, accounts, roles and session limits.
+- **Invites**, the registration mode and invite codes.
+
+## A sensible order for a new instance
+
+1. Confirm hosts and GPUs are healthy under **Fleet, Hosts**.
+2. Install the images you need under **Library, Images**.
+3. Create apps against those images under **Library, Apps**.
+4. Check the default quality tiers under **Streaming, Launch profiles**, and
+   adjust if your hardware is unusual.
+5. Set the registration mode and invite people under **People, Invites**.
+6. Play something, then look at it under **Sessions** to confirm the numbers are
+   what you expect.
+
+## What the admin area does not do
+
+It does not install games. Quasar launches container images, and getting content
+into those images is a separate job. The Steam library provider is the closest
+thing to an automatic path.
+
+It does not manage the host operating system. Drivers, kernel modules and the
+socket buffer sysctl are yours.

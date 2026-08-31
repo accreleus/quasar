@@ -1,0 +1,114 @@
+---
+title: Check your install
+description: Prove the stack is healthy, the agent registered, the GPU was found, and a session actually streams.
+---
+
+import { Steps, Aside } from '@astrojs/starlight/components';
+
+Work down this list. Each step assumes the ones above it passed.
+
+## 1. The control plane answers
+
+```bash
+curl http://localhost:8080/health
+```
+
+Expected:
+
+```json
+{"status":"ok","db":"ok"}
+```
+
+This endpoint is deliberately left on plain HTTP and excluded from the HTTPS
+redirect, so it works before certificates are sorted out. `"db":"ok"` means
+Postgres is reachable and migrations applied.
+
+## 2. The containers are up
+
+```bash
+docker compose -f deploy/docker-compose.yml ps
+```
+
+You want three: `quasar-postgres`, `quasar-control-plane` and
+`quasar-node-agent`. All three should report healthy. The node agent runs with
+host networking, and its image healthcheck reads the local agent health endpoint.
+
+## 3. The node agent registered
+
+Look at Admin, Fleet, Hosts in the web app. Your machine should be listed with a
+recent heartbeat.
+
+From the shell, the agent's own health listener answers on the host:
+
+```bash
+curl http://127.0.0.1:9091/health
+```
+
+```json
+{"status":"ok","sessions":0,"connected":true}
+```
+
+`connected: true` is the important field. It means the agent's WebSocket to the
+control plane is up. If it is false, the agent is running but cannot reach the
+control plane, so check `CONTROL_PLANE_URL` and `ENROLLMENT_TOKEN`.
+
+## 4. The GPU was found, and an encoder with it
+
+Open the host in Admin, Fleet, Hosts. You want to see the GPU listed with a
+render node path, and an encoder reported against it.
+
+A GPU that appears with no encoder is the common failure and it is not the same
+as no GPU. See
+[Install and startup problems](/quasar/troubleshooting/install/).
+
+```bash
+ls -l /dev/dri
+```
+
+If there is no `renderD128` there is no GPU available to containers at all.
+
+## 5. Virtual input works
+
+```bash
+ls -l /dev/uinput
+```
+
+The file must exist and the agent must be able to open it for **writing**. A
+read-only open succeeds even on a broken setup, which is why this catches people
+out. The agent's own readiness check tests for write access, and reports the
+result on the host detail page.
+
+## 6. A session actually streams
+
+This is the only check that proves the whole path. Launch something from the
+library in Chrome and confirm you see moving video and hear audio.
+
+<Aside type="caution" title="A session in the `running` state is not proof">
+The server can report a session as running while the browser is failing to
+decode a single frame. Look at the picture, not the state.
+</Aside>
+
+In the session, open the drawer with **Ctrl+Alt+Shift+Q** and turn on
+performance stats. You want a non-zero frame rate that is close to the tier you
+launched.
+
+## 7. Certificates cover the address you use
+
+If you reach Quasar at `https://192.168.1.50:8443` then the certificate needs to
+name `192.168.1.50`. That comes from `QUASAR_TLS_HOSTS` in `deploy/.env`, set
+before the first boot. If you missed it, or added an address later, see
+[HTTPS and certificates](/quasar/network/https/).
+
+A quick check of what is actually being served:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec quasar-control-plane \
+  sh -c 'openssl x509 -in /var/lib/quasar-control/tls/cert.pem -noout -text' \
+  | grep -A1 'Subject Alternative Name'
+```
+
+## If something failed
+
+Start at [Install and startup problems](/quasar/troubleshooting/install/), then
+[Health and logs](/quasar/operations/health/) for how to read what the
+containers are saying.

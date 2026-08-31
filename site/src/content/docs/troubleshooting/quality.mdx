@@ -1,0 +1,127 @@
+---
+title: Stream quality
+description: Deciding whether stutter is the network, the encoder or the client, and what to do about each.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Diagnose before you tune
+
+Stutter has three possible causes and they need opposite fixes. Guessing wastes
+an evening.
+
+Take a diagnostic bundle from Admin, Sessions while the problem is happening. It
+correlates encoder, network and client signals over the same window and gives you
+a verdict. See [Diagnostics](/quasar/operations/diagnostics/).
+
+<Aside type="caution" title="Reproduce it with the browser tab visible">
+A backgrounded or occluded tab throttles frame presentation, which inflates every
+client-side smoothness figure. The classifier refuses to give a verdict in that
+case rather than guessing, and reports `indeterminate_client_hidden`.
+</Aside>
+
+## Reading the verdict
+
+### `likely_network_congestion`
+
+Loss and round trip time rose together with a bitrate downshift.
+
+- Get both ends onto wired ethernet. This is the single biggest improvement
+  available to most people.
+- Apply the socket buffer sysctl if you skipped it at install. Without it,
+  keyframe bursts overflow the send buffer and the drops look like congestion.
+  See [Requirements](/quasar/start/requirements/).
+- Drop to a lower quality tier.
+- Confirm adaptive bitrate is on and in `smooth` mode.
+- Look for other traffic on the same link.
+
+### `likely_encoder_saturation`
+
+Encode time was at or above 16 ms per frame while the frame rate was steady. The
+GPU cannot compress fast enough for the tier you asked for.
+
+- Drop the tier. A steady 1080p60 beats an unsteady 1440p120.
+- Check the right encoder is selected. Software encoding will always look like
+  this. See [Encoders](/quasar/tuning/encoders/).
+- Check the right GPU is selected on a multi-GPU host. `QUASAR_RENDER_NODE`.
+- Check whether something else is using the GPU.
+- Try the Vulkan encoder, which is the fastest measured path, if your host
+  supports it.
+
+### `likely_client_presentation_limit`
+
+Encode and network looked clean, and the client still presented frames unevenly.
+
+- Close other tabs and applications.
+- Check the client can hardware-decode the codec it received. AV1 without
+  hardware decode costs a few extra milliseconds per frame, which is usually fine
+  but is not free on a weak client.
+- Check display refresh rate. A 60 fps stream on a 75 Hz display produces a beat
+  pattern that reads as judder.
+- On a Mac on WiFi, check whether the AWDL interface is up. AirDrop and Handoff
+  bring it up and its channel hopping produces periodic latency spikes. This has
+  accounted for a drop from 68 ms to 4 ms at the 95th percentile.
+
+  ```bash
+  ifconfig awdl0
+  ```
+
+### `nominal`
+
+Nothing measurable was wrong. If it still feels bad, the likely candidates are
+input latency rather than video, or the game's own frame pacing.
+
+## Reading the numbers yourself
+
+| Signal | Where | Threshold |
+| --- | --- | --- |
+| Encode time, 95th percentile | Session detail | 16 ms and above is saturation |
+| Presentation interval variation | Session detail, in-session overlay | 18 ms and above is visible stutter |
+| Round trip time, 95th percentile | Session detail | above 50 ms contributes to congestion |
+| Packet loss rise | Session detail | above 5 packets in a window contributes |
+| Host frame rate, 10th percentile | Session detail | below 50 means the host is not keeping up |
+
+<Aside type="note" title="Two numbers, two questions">
+Host-side frame rate and encode time describe what was produced. Client-side
+presentation interval variation describes what the user saw. Confusing the two
+wastes a lot of time.
+</Aside>
+
+## Smoothness beats the average
+
+A stream at 45 ms that arrives evenly feels better than one at 38 ms that
+arrives unevenly. Optimise for consistency.
+
+This is why adaptive bitrate defaults to `smooth`, which caps how sharply it
+reduces bitrate and waits between steps. Under induced congestion that took
+presentation interval variation at the 95th percentile from about 69 ms to about
+19 ms.
+
+## Bitrate keeps sawtoothing
+
+Look at the ABR setpoint against the congestion controller's estimate in the
+session detail, and look at loss and round trip time in the same window.
+
+A controller reacting to real congestion is doing its job. A controller
+oscillating on a clean link is worth investigating, and the socket buffer sysctl
+is the first thing to check because its absence produces exactly that.
+
+On NVENC, note that the encoder can overshoot its target on high-entropy content.
+Persistently sitting above the setpoint on busy scenes is known behaviour rather
+than a fault.
+
+## Everything is bad and nothing is obviously wrong
+
+Check you are not on software encoding. Admin, Fleet, Hosts shows the encoder
+each GPU actually reported, as opposed to what was configured. A host configured
+for VA that reports no encoder has fallen back to software, and software
+encoding looks poor at every tier and makes adaptive bitrate ineffective because
+it cannot saturate the link enough for the controller to see anything.
+
+## Comparing before and after
+
+Change exactly one thing. Keep the app, tier, client, network and content the
+same. Take a bundle for each run.
+
+The differences most tuning produces are smaller than the variation you get from
+an uncontrolled test.

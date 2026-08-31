@@ -1,0 +1,26 @@
+{
+  "events": [
+    {
+      "ts_unix_ms": 1786845972000,
+      "type": "abr.ladder.step",
+      "payload": {
+        "rung": "resolution",
+        "from": 0,
+        "to": 1,
+        "reason": "engage",
+        "setpoint_kbps": 4200
+      }
+    },
+    {
+      "ts_unix_ms": 1786846062000,
+      "type": "abr.ladder.step",
+      "payload": {
+        "rung": "resolution",
+        "from": 1,
+        "to": 0,
+        "reason": "recover",
+        "setpoint_kbps": 9000
+      }
+    }
+  ]
+}

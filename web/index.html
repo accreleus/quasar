@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <title>Quasar</title>
+
+    <!-- Installable web app (#435). MANIFEST ONLY — there is deliberately no
+         service worker, and adding one is a regression, not an upgrade:
+         httpx/spa.go serves index.html no-cache, assets immutable, and a real
+         404 on an asset miss, which is what closed the #131 blank-page class.
+         A SW would put a cache layer back in front of that, on a stack that
+         redeploys constantly. iOS gives standalone display from the manifest
+         alone; a SW only buys Chrome's install *prompt*.
+
+         Colours are --surf-canvas (oklch(0.115 0.012 267), "app background") from
+         styles/tokens.css, as its sRGB equivalent #040509 — a webmanifest and a
+         theme-color meta cannot carry oklch portably.
+         Status-bar style is `black`, not `black-translucent`: translucent puts
+         page content under the iOS status bar, which needs viewport-fit=cover
+         and safe-area insets the layout does not currently use. -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#040509" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <meta name="apple-mobile-web-app-title" content="Quasar" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon-180.png" />
+    <!-- Anti-FOUC (theme only): <html> always exists in <head> -->
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem('quasar-theme');
+          if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+        } catch (_) {}
+      })();
+    </script>
+  </head>
+  <body data-density="comfortable">
+    <!-- Anti-FOUC (density): <body> exists here, setAttribute is safe -->
+    <script>
+      (function () {
+        try {
+          var d = localStorage.getItem('quasar-density');
+          if (d === 'dense' || d === 'comfortable') document.body.setAttribute('data-density', d);
+        } catch (_) {}
+      })();
+    </script>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,66 @@
+name: quasar-devtools
+
+services:
+  devtools:
+    build:
+      context: ../..
+      dockerfile: scripts/verify/Dockerfile.devtools
+      args:
+        DEVTOOLS_BUILD_DATE: ${DEVTOOLS_BUILD_DATE:-unknown}
+    image: quasar-devtools:local
+    working_dir: /workspace
+    environment:
+      HOME: /tmp/quasar-home
+      TEST_DATABASE_URL: postgres://quasar_test:quasar_test@postgres:5432/quasar_test?sslmode=disable
+    volumes:
+      - ../..:/workspace
+      - quasar-go-build-cache:/cache/go-build
+      - quasar-go-mod-cache:/cache/go-mod
+      - quasar-cargo-registry:/cache/cargo/registry
+      - quasar-cargo-git:/cache/cargo/git
+      - quasar-cargo-target:/cache/cargo-target
+      - quasar-npm-cache:/cache/npm
+      - quasar-web-node-modules:/workspace/web/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
+    networks:
+      - default
+      - test
+
+  postgres:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_USER: quasar_test
+      POSTGRES_PASSWORD: quasar_test
+      POSTGRES_DB: quasar_test
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quasar_test -d quasar_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      - /var/lib/postgresql/data
+    networks:
+      - test
+
+networks:
+  test:
+    internal: true
+
+volumes:
+  quasar-go-build-cache:
+    name: quasar-go-build-cache
+  quasar-go-mod-cache:
+    name: quasar-go-mod-cache
+  quasar-cargo-registry:
+    name: quasar-cargo-registry
+  quasar-cargo-git:
+    name: quasar-cargo-git
+  quasar-cargo-target:
+    name: quasar-cargo-target
+  quasar-npm-cache:
+    name: quasar-npm-cache
+  quasar-web-node-modules:
+    name: quasar-web-node-modules

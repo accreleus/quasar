@@ -1,0 +1,101 @@
+/* In-session chrome that is not the HUD.
+ *
+ * The HUD itself — pill, shelf, panes, toasts, banner and the mic pill — lives
+ * in hud.css. What is left here is the surfaces that surround it: the
+ * connecting hint, the touch summon button, and the quick-switch transition
+ * screen.
+ *
+ * Every value below is an existing token.
+ */
+
+/* Connecting/disconnected hint, shown while the input DataChannel isn't open
+ * yet. A flow child of `.session-bottom-stack` (styles.css), not a second
+ * bottom-anchored fixed element: two of those overlapped exactly. */
+.session-hint {
+  font-size: var(--t-sm);
+  color: var(--text-3);
+  pointer-events: none;
+  text-align: center;
+  max-width: 100%;
+}
+
+/* Touch bootstrap for the HUD — hidden by default (the coarse-pointer block
+ * below is the only thing that shows it). Declared before that media query:
+ * both rules have the same specificity, so source order decides. */
+.session-summon {
+  display: none;
+  position: fixed;
+  right: 12px;
+  /* Above the HUD's own bottom row, whichever end it is docked to. */
+  bottom: calc(76px + env(safe-area-inset-bottom, 0px));
+  z-index: 22;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  padding: 0;
+  border: 1px solid var(--line-2);
+  border-radius: 50%;
+  background: oklch(0.13 0.012 267 / 0.72);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+  backdrop-filter: blur(20px) saturate(150%);
+  box-shadow: var(--shadow-lg);
+  color: var(--text-2);
+  cursor: pointer;
+}
+/* Capture engaged on a browser with no Pointer Lock: this button is the only
+   guaranteed way back to the menu (nothing is locked, so a tap reaches it), and
+   whether it is on screen must not depend on a pointer media query guessing
+   right about the device. Force-shown for exactly that state. */
+.session-summon.always { display: grid; }
+.session-summon svg { width: 22px; height: 22px; }
+.session-summon:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.session-summon:active { background: var(--ink-3); }
+
+@media (hover: none) and (pointer: coarse) {
+  /* Display-gated rather than React-gated so it is `display: none` — and
+     therefore absent from the tab order and the accessibility tree — on every
+     pointer-fine device. */
+  .session-summon { display: grid; }
+
+  /* "Menu Ctrl Alt ⇧ Q" cannot be followed without a keyboard, so showing it
+     is a lie rather than a preference honoured. The stored preference is
+     untouched; only this device's rendering of it is. */
+  .hud .summon { display: none !important; }
+}
+
+@media (max-width: 640px) {
+  .session-hint { font-size: var(--t-xs); }
+}
+
+/* Quick-switch transition screen (SessionSwapTransition).
+ *
+ * z-index 60 — above the HUD (20): the transition covers the whole session,
+ * and SessionPage collapses the shelf the instant a swap starts.
+ */
+.switcher {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: var(--core);
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 18px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .35s ease;
+}
+.switcher.show { opacity: 1; pointer-events: auto; }
+.switcher svg { width: 72px; height: 72px; animation: switcher-pulse-mark 1.4s ease-in-out infinite; }
+@keyframes switcher-pulse-mark {
+  0%, 100% { transform: scale(1); opacity: .85; }
+  50% { transform: scale(1.08); opacity: 1; }
+}
+.switcher .sw-nm { font-family: var(--font-display); font-weight: 600; font-size: var(--t-h3); color: var(--text); }
+.switcher .sw-sub { font-size: var(--t-sm); color: var(--text-3); }
+.switcher .sw-err { font-size: var(--t-sm); color: var(--danger-text); max-width: 420px; text-align: center; line-height: 1.5; }
+
+@media (prefers-reduced-motion: reduce) {
+  .switcher { transition: none; }
+  .switcher svg { animation: none; }
+}

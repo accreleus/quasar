@@ -1,0 +1,158 @@
+{
+  "kind": "quasar-qa-report",
+  "schema_version": 1,
+  "image": {
+    "tag": "quasar-steam:dev",
+    "digest": "sha256:4b1c9f2e",
+    "base": { "tag": "quasar-steam-runtime:dev", "digest": "sha256:77aa10c3" }
+  },
+  "replaced_pin": {
+    "image_ref": "ghcr.io/accretion-io/quasar-steam@sha256:009ad46",
+    "restored": true
+  },
+  "host": "devbox",
+  "stack_api": "https://gpu-test.example.internal:9443",
+  "profile": "steam-bpm",
+  "runs": 3,
+  "commit": "1ba86aa9",
+  "generated_at": "2026-08-13T12:41:07Z",
+  "duration_ms": 862000,
+  "summary": { "pass": 6, "fail": 0, "skipped": 1, "evidence": 1, "overall": "PASS" },
+  "gates": [
+    {
+      "id": "preflight",
+      "n": "0",
+      "title": "preflight",
+      "proves": "Stack can host the test at all",
+      "threshold": "health 200, image tag present, dev-agent auth on",
+      "measured": "ok / ok / ok",
+      "verdict": "PASS",
+      "detail": "GET /health -> 200\ndocker image inspect quasar-steam:dev -> present\nQUASAR_DEV_AGENT_AUTH=1, dev key reachable"
+    },
+    {
+      "id": "repoint",
+      "n": "1",
+      "title": "repoint",
+      "proves": "Sessions actually launch the candidate, not the pinned digest",
+      "threshold": "pin == quasar-steam:dev",
+      "measured": "applied, 3/3 runs resolved to it",
+      "verdict": "PASS",
+      "detail": "previous image_ref recorded: ghcr.io/accretion-io/quasar-steam@sha256:009ad46\npin -> quasar-steam:dev (confirmed via re-read)"
+    },
+    {
+      "id": "launch",
+      "n": "2",
+      "title": "launch & decode",
+      "proves": "Each run: launch via control-plane, headless peer on hermes attaches, decode confirmed, steady-state luma sampled after the content-settle gate.",
+      "threshold": "fps>=55 · luma>=25 · first content 30-55s",
+      "measured": "3/3 · 60-61 · 36.2/37.1/37.9 · 33.7/37.9/36.3s",
+      "verdict": "PASS",
+      "detail": "run  session_id                            state    fps   luma   first_content_s  codec\n1    9d2c1f0a-3e77-4b21-9a55-1c0b8e44f210  running  61    36.2   33.7             h264\n2    3f81b6d4-77aa-4c19-88de-45b3c0119ee2  running  60    37.1   37.9             h264\n3    c4a70b19-2d55-4f0e-b6a1-90cc2a771b83  running  61    37.9   36.3             h264\nbudget: fps>=55  luma>=25  first_content 30-55s (steam cold-home baseline)",
+      "metrics": { "fps": [61, 60, 61], "luma": [36.2, 37.1, 37.9], "first_content_s": [33.7, 37.9, 36.3] },
+      "screenshots": [
+        { "label": "run 1 · steady state", "png_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" },
+        { "label": "run 2 · steady state", "png_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" },
+        { "label": "run 3 · steady state", "png_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" }
+      ]
+    },
+    {
+      "id": "oracle",
+      "n": "3",
+      "title": "screen oracle: BPM sign-in",
+      "proves": "No pixel matcher is declared for oracle: bpm-signin, so this gate captures evidence and does not assert.",
+      "threshold": "operator eyeball (no matcher declared)",
+      "measured": "3 screenshots below",
+      "verdict": "EVIDENCE",
+      "detail": "Expected on screen: account + password fields, QR sign-in panel, live clock, Xbox glyph footer.\nFailure mode being ruled out: a \"Waiting for network\" stall from the moved system-bus/NetworkManager hook.",
+      "screenshots": [
+        { "label": "bpm sign-in run 1 · t=45s", "png_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" },
+        { "label": "bpm sign-in run 2 · t=45s", "png_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" },
+        { "label": "bpm sign-in run 3 · t=45s", "png_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" }
+      ]
+    },
+    {
+      "id": "input-mouse",
+      "n": "4a",
+      "title": "input · mouse",
+      "proves": "Injects {t:ma} absolute position then {t:mm} motion on the agent-offered input DataChannel. Baseline is taken only after the content-settle gate.",
+      "threshold": "focus-region delta >= 4%",
+      "measured": "11.8% (cursor drawn, field active)",
+      "verdict": "PASS",
+      "detail": "stimuli : ma(960,540) x1 ; mm(dx=12,dy=7) x10\nsettle  : reached at t=41.2s (3 stable frames)\ndelta   : 11.8% of focus region (threshold 4%)",
+      "screenshots": [
+        { "label": "before", "png_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" },
+        { "label": "after · Δ 11.8%", "png_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" }
+      ]
+    },
+    {
+      "id": "input-gamepad",
+      "n": "4b",
+      "title": "input · gamepad",
+      "proves": "Injects {t:gp} with W3C button indices 13 / 15 (D-pad down / up). Profile-declared stimuli.",
+      "threshold": "focus-region delta >= 4%, reproduced on 2 sessions",
+      "measured": "9.4% / 9.1% (Cancel -> \"Remember me\")",
+      "verdict": "PASS",
+      "detail": "stimuli : gp button 13 x1 ; gp button 15 x1\nfocus   : \"Cancel\" -> \"Remember me\" -> \"Cancel\"\ndelta   : 9.4% (run 1) / 9.1% (run 2)   threshold 4%\nfooter  : \"A SELECT / B BACK\" present -> virtual pad bound",
+      "screenshots": [
+        { "label": "before · focus = Cancel", "png_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" },
+        { "label": "after dpad-up · Δ 9.4%", "png_b64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" }
+      ]
+    },
+    {
+      "id": "input-keyboard",
+      "n": "4c",
+      "title": "input · keyboard",
+      "proves": "Not run. Operator passed SKIP_INPUT=keyboard. This gate is neither pass nor fail — the keyboard path is unproven for this image.",
+      "threshold": "focus-region delta >= 4%",
+      "measured": "not run — SKIP_INPUT=keyboard",
+      "verdict": "SKIPPED",
+      "detail": "Partial signal seen while the gate was still enabled: the cursor hid on key injection (a normal Steam reaction) but the focus ring did not move on arrow keys. Inconclusive; the deciding stimulus is click-field-then-type."
+    },
+    {
+      "id": "shutdown",
+      "n": "5",
+      "title": "clean shutdown",
+      "proves": "Times docker stop on the live session container and asserts the launcher relayed SIGTERM instead of hitting the SIGKILL backstop.",
+      "threshold": "stop <= 8.0s · exit == 143 · required log lines present",
+      "measured": "2.33s / 2.57s · 143 / 143 · 3/3 lines",
+      "verdict": "PASS",
+      "detail": "run 1: stop_seconds=2.33  exit_code=143\nrun 2: stop_seconds=2.57  exit_code=143\nbudget: <=8.0s, exit 143 (SIGTERM), never 137 (SIGKILL)\n\nrequired log lines (3/3 matched):\n  quasar-steam: shutdown requested; relaying to launched processes\n  quasar-steam: sending SIGTERM to steam (pid 1468, budget 8s)\n  quasar-steam: terminating gamescope (pid 147)\nforbidden log lines (0 matched):\n  SIGKILL backstop",
+      "warnings": [
+        "Steam was at the sign-in screen, not signed in — Steam never printed its own Shutdown line. Evidence is the launcher relay plus exit 143. Signed-in shutdown is not covered by this harness (no credentials)."
+      ]
+    },
+    {
+      "id": "teardown",
+      "n": "6",
+      "title": "teardown",
+      "proves": "No state pollution, environment restored",
+      "threshold": "sessions deleted via API · pin restored · 0 stray containers",
+      "measured": "3 deleted · restored · 0",
+      "verdict": "PASS",
+      "detail": "sessions deleted via DELETE /v1/sessions/{id}: 3/3\npin restored: ghcr.io/accretion-io/quasar-steam@sha256:009ad46\nstray session containers: 0"
+    }
+  ],
+  "notes": [
+    {
+      "title": "Keyboard is unproven, not broken",
+      "body": "Only open item. Re-run without SKIP_INPUT to close it."
+    },
+    {
+      "title": "Signed-in shutdown untested",
+      "body": "Gate 5's evidence comes from a signed-out Steam; the harness cannot sign in."
+    },
+    {
+      "title": "Peer-side reading, not an encode defect",
+      "body": "Run 2's overlay showed \"device can't keep up, present p95 69.9 ms\". That is the headless peer's presentation side (hermes), not the encoder. Not counted against any gate."
+    },
+    {
+      "title": "Teardown used the control-plane delete API",
+      "body": "So no sessions were left in failed state. Tearing down with a bare docker stop pollutes the DB — the harness never does that outside gate 5, which stops the container deliberately and then deletes the session properly."
+    }
+  ],
+  "environment_restored": {
+    "pin": true,
+    "stray_containers": 0,
+    "sessions_deleted": 3
+  }
+}

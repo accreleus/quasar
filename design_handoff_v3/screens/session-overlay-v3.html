@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html lang="en" data-density="comfortable" data-theme-lock="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Quasar — In-session (morphing HUD)</title>
+<link rel="stylesheet" href="assets/console-v3.css">
+<style>
+  html,body{height:100%;overflow:hidden;background:#000;}
+  .stage{position:fixed;inset:0;background:radial-gradient(120% 120% at 50% 40%,#0a0a12,#000);overflow:hidden;transition:filter .3s;}
+  .ball{position:absolute;width:46px;height:46px;border-radius:50%;background:radial-gradient(circle at 35% 30%,#fff,#dfe4ff 60%,#b9c0ff);box-shadow:0 10px 40px rgba(120,140,255,.25);animation:bounce 2.6s ease-in-out infinite alternate,drift 7s linear infinite alternate;top:20%;left:20%;}
+  @keyframes bounce{from{top:16%;}to{top:64%;}}
+  @keyframes drift{from{left:14%;}to{left:76%;}}
+  .stage[data-game="purple"]{background:radial-gradient(120% 120% at 50% 40%,#2a1650,#0d0620);}
+  .stage[data-game="blue"]{background:radial-gradient(120% 120% at 50% 40%,#0d2a50,#040f22);}
+  .stage[data-game="snow"]{background:radial-gradient(120% 120% at 50% 40%,#10121e,#000);}
+  body.hud-open .stage{filter:brightness(.62);}
+
+  /* MOCK-ONLY dev panel — not part of the design. */
+  .dev{position:fixed;top:14px;left:14px;z-index:31;background:rgba(12,12,18,.9);backdrop-filter:blur(18px);
+    border:1px dashed var(--line-3);border-radius:var(--r-md);padding:10px 12px;font-size:var(--t-xs);
+    color:var(--text-3);display:flex;flex-direction:column;gap:8px;max-width:250px;
+    transition:opacity .2s;}
+  /* Mock chrome must never sit on top of the thing being evaluated. */
+  body.hud-open .dev{opacity:.1;pointer-events:none;}
+  /* the left dock lands where the mock panel lives — move the panel, not the HUD */
+  body[data-pos="left"] .dev{left:auto;right:14px;top:78px;}
+  .dev .dev-t{font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:var(--text-4);}
+  .dev .row{display:flex;gap:6px;flex-wrap:wrap;align-items:center;}
+  .dev button{font-family:var(--font-ui);font-size:var(--t-xs);padding:4px 8px;border-radius:var(--r-xs);
+    border:1px solid var(--line-2);background:var(--ink-3);color:var(--text-2);cursor:pointer;}
+  .dev button:hover{background:var(--ink-4);color:var(--text);}
+  .dev button[aria-selected="true"]{background:var(--accent);border-color:var(--accent);color:#fff;}
+  .dev .dev-note{color:var(--text-4);line-height:1.45;}
+
+  /* ============================================================
+     THE HUD — one object, dockable to any edge. At rest it is a
+     floating pill inset from its edge; on summon it slides flush
+     to that edge, squares the corners that meet it, and grows a
+     shelf on its inner face. Top/bottom lay out horizontally,
+     left/right vertically — same parts, re-oriented.
+     ============================================================ */
+  .hud{position:fixed;z-index:20;
+    background:rgba(12,12,18,.74);backdrop-filter:blur(22px) saturate(150%);
+    border:1px solid var(--line-2);border-radius:var(--r-pill);box-shadow:var(--shadow-lg);
+    display:flex;overflow:hidden;
+    transition:width .36s cubic-bezier(.2,.85,.25,1),height .36s cubic-bezier(.2,.85,.25,1),
+      top .3s cubic-bezier(.2,.85,.25,1),bottom .3s cubic-bezier(.2,.85,.25,1),
+      left .3s cubic-bezier(.2,.85,.25,1),right .3s cubic-bezier(.2,.85,.25,1),
+      border-radius .28s ease,opacity .25s,transform .25s,background .3s;}
+  body.hud-open .hud{background:rgba(12,12,18,.86);}
+
+  /* Expanded, the HUD spans its whole edge — full width when docked top or
+     bottom, full height when docked left or right. The shelf depth is then the
+     only thing that changes between sections, so switching tabs never resizes
+     the bar. Meeting every edge means no corner radius at all. */
+  body[data-axis="h"] .hud{left:50%;transform:translateX(-50%);flex-direction:column;width:var(--hud-w,auto);height:auto;}
+  body[data-axis="h"].hud-open .hud{width:100vw;}
+  /* Docked at every size: flush against its edge, round only on the inward
+     corners — at the same radius as the icon buttons inside it, so the shell
+     and its contents share one corner language. */
+  body[data-pos="bottom"] .hud{bottom:0;border-radius:var(--r-feature) var(--r-feature) 0 0;}
+  body[data-pos="bottom"].hud-open .hud{border-radius:0;}
+  body[data-pos="top"] .hud{top:0;border-radius:0 0 var(--r-feature) var(--r-feature);}
+  body[data-pos="top"].hud-open .hud{border-radius:0;}
+  body[data-pos="top"].banner-on .hud{top:74px;}
+
+  /* vertical docks — the shelf opens on the inner face, so the bar keeps the edge */
+  body[data-axis="v"] .hud{top:50%;transform:translateY(-50%);height:var(--hud-h,auto);width:auto;}
+  body[data-axis="v"].hud-open .hud{height:100vh;}
+  body[data-pos="left"] .hud{left:0;flex-direction:row;border-radius:0 var(--r-feature) var(--r-feature) 0;}
+  body[data-pos="left"].hud-open .hud{border-radius:0;}
+  body[data-pos="right"] .hud{right:0;flex-direction:row-reverse;border-radius:var(--r-feature) 0 0 var(--r-feature);}
+  body[data-pos="right"].hud-open .hud{border-radius:0;}
+
+  .hud.hidden{opacity:0;pointer-events:none;}
+  body[data-pos="bottom"] .hud.hidden{transform:translateX(-50%) translateY(14px);}
+  body[data-pos="top"] .hud.hidden{transform:translateX(-50%) translateY(-14px);}
+  body[data-pos="left"] .hud.hidden{transform:translateY(-50%) translateX(-14px);}
+  body[data-pos="right"] .hud.hidden{transform:translateY(-50%) translateX(14px);}
+
+  /* --- the bar (rest state: signal, frame rate, the controls you reach for) --- */
+  .hud-bar{display:flex;align-items:center;gap:12px;height:36px;padding:0 14px;flex:none;min-width:0;position:relative;}
+  .hud-bar .sep{width:1px;height:16px;background:var(--line-2);flex:none;}
+  .hud-bar>.signal{flex:none;}
+  /* Detail that only earns its place once the shelf is open. Declared with
+     !important because the .m / .ib display rules come later. */
+  .open-only{display:none!important;}
+  body.hud-open .m.open-only{display:flex!important;}
+  body.hud-open .ib.open-only{display:grid!important;}
+  body.hud-open .div.open-only{display:block!important;}
+  .title{font-size:var(--t-sm);font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:210px;flex:0 1 auto;}
+  /* Once the bar spans the whole edge, the title centres on the screen rather
+     than trailing the metrics — and its separator has nothing left to divide. */
+  body[data-axis="h"].hud-open .title{position:absolute;left:50%;transform:translateX(-50%);max-width:32vw;}
+  body[data-axis="h"].hud-open .hud-bar .sep{display:none;}
+  .ident{display:none;}
+  .metrics{display:flex;align-items:center;gap:14px;flex:0 1 auto;min-width:0;overflow:hidden;}
+  .m{display:flex;align-items:baseline;line-height:1;font-variant-numeric:tabular-nums;}
+  .m b{font-family:var(--font-mono);font-size:var(--t-sm);font-weight:600;color:var(--text);}
+  .m b u{text-decoration:none;font-size:9px;color:var(--text-4);margin-left:2px;}
+  .m b.good{color:var(--success-text);} .m b.info{color:var(--info-text);}
+  .codec-chip{font-family:var(--font-mono);font-size:var(--t-xs);color:var(--text-2);background:var(--ink-4);
+    border:1px solid var(--line);border-radius:var(--r-xs);padding:2px 7px;white-space:nowrap;}
+  .summon{font-size:var(--t-xs);color:var(--text-4);white-space:nowrap;}
+  .summon kbd{font-family:var(--font-mono);background:var(--ink-4);border:1px solid var(--line-2);border-radius:4px;padding:1px 5px;color:var(--text-3);}
+
+  /* --- right cluster: tabs + direct actions --- */
+  .hud-ctl{margin-left:auto;display:flex;align-items:center;gap:5px;flex:none;}
+  .hud-ctl .div{width:1px;height:18px;background:var(--line-2);margin:0 2px;flex:none;}
+  /* Icon buttons follow the console's .icon-btn: pill, no chrome until hover,
+     glass on hover. Exit keeps its danger colours from .btn-danger. */
+  .ib{width:28px;height:28px;display:grid;place-content:center;border-radius:var(--r-pill);
+    border:1px solid transparent;background:none;color:var(--text-3);cursor:pointer;
+    transition:background .14s,color .14s,border-color .14s;flex:none;}
+  .ib svg{width:16px;height:16px;stroke-width:1.5;}
+  .ib:hover{background:color-mix(in srgb,var(--ink-4) 62%,transparent);backdrop-filter:blur(16px) saturate(170%);color:var(--text);}
+  .ib[aria-selected="true"]{background:var(--accent-soft-2);border-color:var(--accent-soft-2);color:var(--accent-text);}
+  .ib.on{color:var(--accent-text);background:var(--accent-soft);border-color:var(--accent-soft-2);}
+  /* Exit is the last thing in the cluster and wears its danger colours at rest:
+     a control that stops something should not need a hover to say so. */
+  .ib.danger{background:color-mix(in srgb,var(--danger-bg) 70%,transparent);border-color:var(--danger-line);color:var(--danger-text);}
+  body[data-axis="h"] .ib.danger{margin-left:12px;}
+  body[data-axis="v"] .ib.danger{margin-top:12px;}
+  .ib.danger:hover{background:var(--danger-bg);border-color:var(--danger-line);color:var(--danger-text);}
+  .ib.chev svg{transition:transform .3s cubic-bezier(.2,.85,.25,1);}
+  body.hud-open .ib.chev svg{transform:rotate(180deg);}
+
+  /* --- the shelf --- */
+  .shelf{overflow:hidden;transition:height .36s cubic-bezier(.2,.85,.25,1),width .36s cubic-bezier(.2,.85,.25,1);}
+  body[data-axis="h"] .shelf{height:0;}
+  body[data-axis="h"].hud-open .shelf{height:var(--shelf-h,186px);}
+  body[data-axis="h"] .shelf-in{border-top:1px solid var(--line);height:var(--shelf-h,186px);}
+  body[data-axis="v"] .shelf{width:0;}
+  body[data-axis="v"].hud-open .shelf{width:var(--shelf-w,236px);}
+  body[data-axis="v"] .shelf-in{border-left:1px solid var(--line);width:var(--shelf-w,236px);height:100%;}
+  body[data-pos="right"] .shelf-in{border-left:0;border-right:1px solid var(--line);}
+  .shelf-in{display:flex;flex-direction:column;}
+  .pane{display:none;flex:1;min-height:0;flex-direction:column;}
+  .pane.active{display:flex;animation:pin .26s ease both;}
+  @keyframes pin{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:none;}}
+  .pane-head{display:flex;align-items:baseline;gap:12px;padding:11px 18px 0;flex:none;}
+  .pane-head h3{margin:0;font-family:var(--font-ui);font-size:var(--t-sm);font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-4);}
+  .pane-head p{margin:0;font-size:var(--t-xs);color:var(--text-4);line-height:1.45;}
+
+  /* pane: games */
+  .qs-rail{display:flex;gap:12px;overflow-x:auto;padding:8px 18px 14px;scrollbar-width:thin;}
+  .qs{flex:0 0 172px;display:flex;flex-direction:column;border-radius:var(--r-md);overflow:hidden;border:1px solid var(--line);
+    background:var(--ink-3);cursor:pointer;padding:0;text-align:left;font-family:var(--font-ui);transition:.15s;position:relative;}
+  .qs,.qs:hover{text-decoration:none;}
+  .qs:hover{border-color:var(--line-3);transform:translateY(-2px);}
+  .qs .cv{height:96px;width:100%;display:grid;place-content:center;position:relative;}
+  .qs .cv .glyph{font-family:var(--font-display);font-weight:700;font-size:1.4rem;color:rgba(255,255,255,.9);mix-blend-mode:overlay;}
+  .qs .cv::after{content:"";position:absolute;inset:0;background:radial-gradient(120% 90% at 50% -10%,transparent 45%,rgba(8,8,12,.45));}
+  .qs .nm{display:block;padding:7px 10px 8px;font-size:var(--t-xs);font-weight:600;color:var(--text-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .qs.current{border-color:rgba(106,69,245,.5);box-shadow:0 0 0 1px rgba(106,69,245,.35);}
+  .qs.current::after{content:"PLAYING";position:absolute;top:7px;left:7px;font-size:8px;font-weight:800;letter-spacing:.1em;color:#fff;
+    background:var(--accent);border-radius:4px;padding:2px 5px;}
+  .cv-violet{background:linear-gradient(150deg,#6A45F5,#3a1f9e);}
+  .cv-cyan{background:linear-gradient(150deg,#00C0FF,#0b5a8f);}
+  .cv-horizon{background:linear-gradient(150deg,#5B6BFF,#2a2f8c);}
+  .cv-nebula{background:linear-gradient(150deg,#8A5CF7,#b084ff);}
+  .cv-plasma{background:linear-gradient(150deg,#2E8BFF,#123a7a);}
+
+  /* pane: controller & input */
+  .cols{display:grid;grid-template-columns:1.15fr 1fr 1fr;gap:26px;padding:8px 18px 14px;align-items:start;}
+  .capture-cta{display:flex;align-items:center;gap:11px;width:100%;padding:12px 14px;border-radius:var(--r-md);
+    border:1px solid rgba(106,69,245,.35);background:var(--accent-soft);color:var(--text);font-family:var(--font-ui);
+    font-size:var(--t-base);font-weight:600;cursor:pointer;transition:.14s;}
+  .capture-cta:hover{background:var(--accent-soft-2);}
+  .capture-cta svg{width:20px;height:20px;color:var(--accent-text);flex:none;}
+  .ov-kv{display:flex;flex-direction:row;align-items:center;justify-content:space-between;gap:12px;padding:6px 0;font-size:var(--t-sm);color:var(--text-3);}
+  .ov-kv b{font-weight:600;color:var(--text-2);}
+  .ov-kv .mono{font-family:var(--font-mono);color:var(--text-2);}
+  .combo{display:inline-flex;gap:3px;}
+  .combo kbd{font-family:var(--font-mono);font-size:var(--t-xs);background:var(--ink-4);border:1px solid var(--line-2);border-radius:4px;padding:2px 6px;color:var(--text-2);}
+  .col-note{font-size:var(--t-xs);color:var(--text-4);line-height:1.5;margin-top:4px;}
+  .col-lb{font-size:var(--t-xs);letter-spacing:.1em;text-transform:uppercase;color:var(--text-4);font-weight:700;padding-bottom:4px;}
+  .ctl-row{display:flex;align-items:center;gap:12px;padding:6px 0;font-size:var(--t-sm);color:var(--text-2);}
+  .ctl-row .segmented{margin-left:auto;}
+  .ctl-row .segmented button{padding:5px 10px;font-size:var(--t-xs);}
+
+  /* pane: performance stats — a simple view of the four numbers anyone acts on,
+     with the full table one press away for support and debugging. */
+  .pane-head .segmented{margin-left:auto;}
+  .pane-head .segmented button{padding:4px 10px;font-size:var(--t-xs);}
+  .stat-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;padding:8px 18px 14px;}
+  body[data-stats="detail"] .stat-cards{display:none;}
+  body:not([data-stats="detail"]) .diag-grid{display:none;}
+  .card{background:var(--ink-3);border:1px solid var(--line);border-radius:var(--r-md);padding:9px 12px 6px;
+    display:flex;flex-direction:column;gap:3px;--c:var(--text-2);}
+  .card .lb{font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-4);font-weight:700;}
+  .card .vv{font-family:var(--font-mono);font-size:1.3rem;font-weight:600;color:var(--c);line-height:1.15;font-variant-numeric:tabular-nums;}
+  .card .vv u{text-decoration:none;font-size:var(--t-xs);color:var(--text-4);margin-left:3px;}
+  .card svg{width:100%;flex:1;min-height:38px;display:block;margin-top:2px;}
+  .card .spark{fill:none;stroke:var(--c);stroke-width:1.5;vector-effect:non-scaling-stroke;stroke-linejoin:round;}
+  .card .area{fill:var(--c);stroke:none;opacity:.13;}
+  .card[data-k="fps"]{--c:var(--success-text);}
+  .card[data-k="lat"]{--c:var(--info-text);}
+  .card[data-k="jit"]{--c:var(--warning-text);}
+  .diag-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:0 26px;padding:8px 18px 14px;overflow-y:auto;}
+  .diag-grid table{width:100%;border-collapse:collapse;font-family:var(--font-mono);font-size:var(--t-xs);}
+  .diag-grid td{padding:3px 0;color:var(--text-2);}
+  .diag-grid td:first-child{color:var(--text-4);}
+  .diag-grid td:last-child{text-align:right;font-variant-numeric:tabular-nums;}
+  .hz-flag{display:none;align-items:center;gap:5px;font-size:var(--t-xs);color:var(--warning-text);
+    background:var(--warning-bg);border:1px solid var(--warning-line);border-radius:var(--r-pill);padding:2px 9px;font-weight:600;}
+  .hz-flag svg{width:11px;height:11px;flex:none;}
+  body.hz-mismatch .hz-flag{display:inline-flex;}
+
+  /* swap-in-progress: replaces the bar content, no fade to black */
+  .swapping{display:none;align-items:center;gap:9px;font-size:var(--t-sm);color:var(--text-2);}
+  .swapping .spin{width:13px;height:13px;border-radius:50%;border:2px solid var(--line-3);border-top-color:var(--accent-text);animation:sp .7s linear infinite;}
+  @keyframes sp{to{transform:rotate(360deg);}}
+  body.swapping .hud-bar>*:not(.swapping){display:none;}
+  body.swapping .swapping{display:flex;}
+
+  body[data-off~="signal"] .v-signal,
+  body[data-off~="metrics"] .v-metrics{display:none;}
+
+  /* mic "hot" dot — outside the HUD on purpose: a live mic must never hide */
+  .mic-hot{position:fixed;top:18px;right:18px;z-index:35;display:none;align-items:center;gap:7px;
+    background:rgba(12,12,18,.7);backdrop-filter:blur(14px);border:1px solid var(--danger-line);
+    border-radius:var(--r-pill);padding:5px 11px 5px 9px;font-size:var(--t-xs);color:var(--danger-text);font-weight:600;}
+  body.mic-on .mic-hot{display:flex;}
+  .mic-hot .dot{width:7px;height:7px;border-radius:50%;background:var(--danger);animation:lp2 2.2s infinite;}
+  @keyframes lp2{0%,100%{opacity:1;}50%{opacity:.35;}}
+
+  .ev-toast{position:fixed;top:18px;right:18px;z-index:30;display:flex;align-items:center;gap:11px;
+    background:rgba(12,12,18,.8);backdrop-filter:blur(18px);border:1px solid var(--line-2);border-radius:var(--r-md);
+    padding:11px 16px 11px 13px;box-shadow:var(--shadow-lg);font-size:var(--t-sm);color:var(--text-2);max-width:340px;
+    transform:translateY(-12px);opacity:0;pointer-events:none;transition:.3s ease;}
+  body.mic-on .ev-toast{top:56px;}
+  .ev-toast.show{transform:none;opacity:1;}
+  .ev-toast svg{width:18px;height:18px;color:var(--warning-text);flex:none;}
+  .ev-toast b{color:var(--text);font-weight:600;}
+
+  .banner{position:fixed;top:0;left:0;right:0;z-index:32;display:none;align-items:center;gap:16px;
+    padding:13px 20px;background:rgba(12,12,18,.9);backdrop-filter:blur(20px);border-bottom:1px solid var(--danger-line);box-shadow:var(--shadow-md);}
+  .banner.on{display:flex;}
+  .banner .bt{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px;}
+  .banner .bt strong{font-size:var(--t-base);color:var(--danger-text);}
+  .banner .bt span{font-size:var(--t-sm);color:var(--text-3);}
+  .banner .ba{display:flex;gap:8px;flex:none;}
+
+  a{color:var(--accent-text);}a:hover{color:var(--text);}
+
+  /* Shrink order is a priority list, not a squeeze: the icon cluster is the only
+     pointer route into the shelf, so it never yields — the open-state detail
+     drops out ahead of it. */
+  @media (max-width:900px){.m.open-only:last-child{display:none!important;}}
+  @media (max-width:780px){body.hud-open .m.open-only{display:none!important;}}
+  @media (max-width:620px){.title,.hud-bar .sep{display:none;}}
+  @media (max-width:900px){.stat-cards{grid-template-columns:repeat(2,1fr);}.card svg{min-height:26px;}}
+
+  /* ============================================================
+     VERTICAL DOCKS — the same parts, re-oriented. The bar becomes
+     a column, its separators become rules, the chevron points at
+     the shelf, and every pane collapses to a single column.
+     ============================================================ */
+  body[data-axis="v"] .hud-bar{flex-direction:column;height:auto;width:39px;padding:14px 0;gap:11px;}
+  body[data-axis="v"] .hud-bar .sep{width:16px;height:1px;}
+  body[data-axis="v"] .title{display:none;}
+  body[data-axis="v"] .metrics{flex-direction:column;gap:10px;overflow:visible;}
+  body[data-axis="v"] .m b{display:flex;flex-direction:column;align-items:center;line-height:1.05;}
+  body[data-axis="v"] .m b u{margin-left:0;}
+  body[data-axis="v"] .hud-ctl{margin-left:0;margin-top:auto;flex-direction:column;align-items:center;gap:5px;}
+  body[data-axis="v"] .hud-ctl .div{width:16px;height:1px;margin:2px 0;}
+  body[data-pos="left"] .ib.chev svg{transform:rotate(90deg);}
+  body[data-pos="left"].hud-open .ib.chev svg{transform:rotate(270deg);}
+  body[data-pos="right"] .ib.chev svg{transform:rotate(-90deg);}
+  body[data-pos="right"].hud-open .ib.chev svg{transform:rotate(90deg);}
+  body[data-axis="v"] .pane-head{flex-direction:column;align-items:flex-start;gap:7px;padding:12px 14px 0;}
+  body[data-axis="v"] .pane-head .segmented{margin-left:0;}
+  body[data-axis="v"] .qs-rail{display:grid;grid-template-columns:1fr;grid-auto-rows:max-content;align-content:start;gap:10px;overflow-x:hidden;overflow-y:auto;padding:9px 14px 14px;}
+  body[data-axis="v"] .qs{flex:0 0 auto;}
+  body[data-axis="v"] .qs .cv{height:110px;flex:none;}
+  body[data-axis="v"] .qs .cv .glyph{font-size:1.3rem;}
+  body[data-axis="v"] .cols{grid-template-columns:1fr;gap:14px;padding:9px 14px 14px;overflow-y:auto;}
+  body[data-axis="v"] .stat-cards{grid-template-columns:1fr;gap:10px;padding:9px 14px 14px;overflow-y:auto;}
+  body[data-axis="v"] .card svg{min-height:30px;}
+  body[data-axis="v"] .diag-grid{grid-template-columns:1fr;gap:0;padding:9px 14px 14px;}
+</style>
+</head>
+<body data-shelf="games">
+<div class="stage" data-game="ball" id="stage"><div class="ball"></div></div>
+
+<!-- ============ MOCK-ONLY dev panel ============ -->
+<div class="dev">
+  <span class="dev-t">Mock controls</span>
+  <span class="dev-t" style="margin-top:2px">Bar prefs (user profile)</span>
+  <div class="row">Show:
+    <button data-item="signal" aria-selected="true">Signal</button>
+    <button data-item="metrics" aria-selected="true">Frame rate</button>
+  </div>
+  <div class="row">Dock:
+    <button data-pos="bottom" aria-selected="true">Bottom</button>
+    <button data-pos="top">Top</button>
+    <button data-pos="left">Left</button>
+    <button data-pos="right">Right</button>
+  </div>
+  <div class="row">Auto-hide:
+    <button data-hide="capture" aria-selected="true">On capture</button>
+    <button data-hide="never">Always on</button>
+    <button data-hide="always">Never show</button>
+  </div>
+  <span class="dev-t" style="margin-top:2px">States</span>
+  <div class="row">
+    <button onclick="openShelf('games')">Open shelf</button>
+    <button onclick="setCapture(!captured)">Toggle capture</button>
+    <button onclick="fireToast()">Toast</button>
+  </div>
+  <div class="row">
+    <button onclick="toggleBanner()">Banner</button>
+    <button onclick="toggleMic()">Mic</button>
+    <button onclick="document.body.classList.toggle('hz-mismatch')">50 Hz</button>
+  </div>
+  <span class="dev-note">At rest the bar carries only signal, frame rate, the title and the controls you reach for. Section tabs appear as it expands, and the expanded HUD docks flush to its edge.</span>
+</div>
+
+<!-- ============ THE HUD ============ -->
+<div class="hud" id="hud">
+  <div class="hud-bar">
+    <span class="signal v-signal" data-q="excellent" title="Connection quality: Excellent"><i></i><i></i><i></i><i></i></span>
+
+    <div class="metrics v-metrics">
+      <div class="m"><b class="good" id="mFps">60<u>fps</u></b></div>
+      <div class="m open-only"><b class="info" id="mLat">18<u>ms</u></b></div>
+      <div class="m open-only"><b id="mBr">8.4<u>mb</u></b></div>
+    </div>
+
+    <span class="sep"></span>
+    <span class="title" id="barTitle" title="Now playing">Quasar Bench: Ball</span>
+
+    <div class="swapping"><span class="spin"></span><span>Switching to <b id="swTo">Purple App</b>…</span></div>
+
+    <div class="hud-ctl">
+      <!-- Tabs surface only while the shelf is open: at rest they would be three
+           more things to read, and the chevron already gets you in. -->
+      <button class="ib open-only" data-tab="games" onclick="openShelf('games')" title="Switch game" aria-label="Switch game">
+        <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.6" y="4.4" width="14.8" height="9.2" rx="3.4"/><path d="M5.4 7.6v2.8M4 9h2.8" stroke-linecap="round"/><circle cx="12" cy="8.2" r=".85" fill="currentColor"/><circle cx="13.4" cy="10.2" r=".85" fill="currentColor"/></svg>
+      </button>
+      <button class="ib open-only" data-tab="input" onclick="openShelf('input')" title="Controller &amp; input" aria-label="Controller and input">
+        <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2.4" y="6" width="13.2" height="8.4" rx="1.6"/><path d="M5.6 3.4h6.8"/><path d="M6.2 9.2v2.2M5.1 10.3h2.2"/><circle cx="11.8" cy="10.3" r=".8" fill="currentColor"/></svg>
+      </button>
+      <button class="ib open-only" data-tab="stats" onclick="openShelf('stats')" title="Performance stats (⇧S)" aria-label="Performance stats">
+        <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2.8 15V9.6M9 15V4M15.2 15V7.2"/></svg>
+      </button>
+      <span class="div open-only"></span>
+      <!-- direct actions: one state each, nothing to explain -->
+      <button class="ib" id="capBtn" onclick="setCapture(!captured)" title="Capture input" aria-label="Capture input" aria-pressed="false">
+        <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="9" cy="9" r="5.4"/><path d="M9 1.6v2.4M9 14v2.4M1.6 9h2.4M14 9h2.4"/><circle cx="9" cy="9" r="1.5" fill="currentColor" stroke="none"/></svg>
+      </button>
+      <button class="ib" id="micBtn" onclick="toggleMic()" title="Microphone" aria-label="Microphone">
+        <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="6.6" y="1.9" width="4.8" height="8.6" rx="2.4"/><path d="M4 8.4v.6a5 5 0 0 0 10 0v-.6"/><path d="M9 14v2.1"/><path d="M2.6 2.6l12.8 12.8" id="micSlash"/></svg>
+      </button>
+      <button class="ib" onclick="toggleFs()" title="Fullscreen" aria-label="Fullscreen">
+        <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6.5V3.5h3M15 6.5V3.5h-3M3 11.5v3h3M15 11.5v3h-3"/></svg>
+      </button>
+      <span class="div"></span>
+      <button class="ib chev" onclick="toggleShelf()" title="Menu" aria-label="Open menu" aria-expanded="false">
+        <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 11 9 6.5l4.5 4.5"/></svg>
+      </button>
+      <button class="ib danger" onclick="fireToast('<b>Exit session</b> would return you to the library.')" title="Exit session" aria-label="Exit session">
+        <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3H4v12h3M11 5.5 14.5 9 11 12.5M14.5 9H7.5"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- ============ the shelf — one section at a time ============ -->
+  <div class="shelf">
+    <div class="shelf-in">
+      <!-- games: the default section, so summoning never lands on a menu -->
+      <div class="pane active" data-pane="games">
+        <div class="pane-head"><h3>Switch game</h3><p>Switching keeps this session and its stream alive — no reconnect, and the resolution stays as launched.</p></div>
+        <div class="qs-rail">
+          <a class="qs current" role="button" tabindex="0" data-game="ball" data-name="Quasar Bench: Ball"><span class="cv cv-cyan"><span class="glyph">Ball</span></span><span class="nm">Bench: Ball</span></a>
+          <a class="qs" role="button" tabindex="0" data-game="snow" data-name="Quasar Bench: Snow" onclick="switchGame(this)"><span class="cv cv-violet"><span class="glyph">Snow</span></span><span class="nm">Bench: Snow</span></a>
+          <a class="qs" role="button" tabindex="0" data-game="purple" data-name="Purple App" onclick="switchGame(this)"><span class="cv cv-nebula"><span class="glyph">P</span></span><span class="nm">Purple App</span></a>
+          <a class="qs" role="button" tabindex="0" data-game="blue" data-name="Blue App" onclick="switchGame(this)"><span class="cv cv-plasma"><span class="glyph">B</span></span><span class="nm">Blue App</span></a>
+          <a class="qs" role="button" tabindex="0" data-game="snow" data-name="Quasar Bench: Static" onclick="switchGame(this)"><span class="cv cv-horizon"><span class="glyph">St</span></span><span class="nm">Bench: Static</span></a>
+        </div>
+      </div>
+
+      <!-- controller & input -->
+      <div class="pane" data-pane="input">
+        <div class="pane-head"><h3>Controller &amp; input</h3><p>Controllers are forwarded while input is captured. Press a button on an idle pad to wake it.</p></div>
+        <div class="cols">
+          <div>
+            <button class="capture-cta" id="captureCta" onclick="setCapture(!captured)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M7 8h10a4.5 4.5 0 0 1 4.4 5.5l-.7 3a2 2 0 0 1-3.6.6L15.5 15h-7l-1.6 2.1a2 2 0 0 1-3.6-.6l-.7-3A4.5 4.5 0 0 1 7 8Z"/><line x1="7" y1="11" x2="7" y2="13"/><line x1="6" y1="12" x2="8" y2="12"/><circle cx="16" cy="11.4" r=".55" fill="currentColor"/><circle cx="17.6" cy="13" r=".55" fill="currentColor"/></svg>
+              <span id="captureLabel">Capture input</span>
+            </button>
+            <div class="ov-kv"><span>Release capture</span><span class="combo"><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>⇧</kbd><kbd>Z</kbd></span></div>
+          </div>
+          <div>
+            <div class="col-lb">Keys</div>
+            <div class="ov-kv" id="escRow"><span>Esc key</span><b>Sent to the app</b></div>
+            <div class="col-note">Fullscreen + a secure origin lets Quasar forward <b>Esc</b> to the game. Over plain HTTP, or outside fullscreen, the browser keeps it and capture releases instead.</div>
+          </div>
+          <div>
+            <div class="col-lb">Connected</div>
+            <div class="ov-kv"><span>Gamepads</span><b class="mono">1</b></div>
+            <div class="ov-kv"><span>Slot 1</span><b>Xbox Wireless</b></div>
+            <div class="ctl-row">Scaling
+              <div class="segmented" role="tablist">
+                <button role="tab" aria-selected="true">Fit</button>
+                <button role="tab" aria-selected="false">Fill</button>
+                <button role="tab" aria-selected="false">1:1</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- performance stats -->
+      <div class="pane" data-pane="stats">
+        <div class="pane-head"><h3>Performance stats</h3>
+          <span class="hz-flag" title="This display runs at 50 Hz, below the stream's 60 fps — some frames can't be presented. The stream itself is healthy.">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M8 2.8 14.2 13H1.8z" stroke-linejoin="round"/><path d="M8 6.6v3.1" stroke-linecap="round"/><circle cx="8" cy="11.3" r=".7" fill="currentColor" stroke="none"/></svg>
+            50 Hz display · frames dropped
+          </span>
+          <div class="segmented" role="tablist">
+            <button role="tab" aria-selected="true" onclick="setStats('simple',this)">Simple</button>
+            <button role="tab" aria-selected="false" onclick="setStats('detail',this)">Detailed</button>
+          </div>
+        </div>
+        <div class="stat-cards">
+          <div class="card" data-k="fps"><span class="lb">Frame rate</span><span class="vv"><span data-v="fps">60</span><u>fps</u></span>
+            <svg viewBox="0 0 100 30" preserveAspectRatio="none"><path class="area" data-a="fps"></path><path class="spark" data-s="fps"></path></svg></div>
+          <div class="card" data-k="lat"><span class="lb">Latency</span><span class="vv"><span data-v="lat">18</span><u>ms</u></span>
+            <svg viewBox="0 0 100 30" preserveAspectRatio="none"><path class="area" data-a="lat"></path><path class="spark" data-s="lat"></path></svg></div>
+          <div class="card" data-k="br"><span class="lb">Bitrate</span><span class="vv"><span data-v="br">8.4</span><u>Mb/s</u></span>
+            <svg viewBox="0 0 100 30" preserveAspectRatio="none"><path class="area" data-a="br"></path><path class="spark" data-s="br"></path></svg></div>
+          <div class="card" data-k="jit"><span class="lb">Jitter buffer</span><span class="vv"><span data-v="jit">11.4</span><u>ms</u></span>
+            <svg viewBox="0 0 100 30" preserveAspectRatio="none"><path class="area" data-a="jit"></path><path class="spark" data-s="jit"></path></svg></div>
+        </div>
+        <div class="diag-grid">
+          <table><tbody>
+            <tr><td>tier</td><td>1920×1080@60</td></tr>
+            <tr><td>codec (server)</td><td>H.264</td></tr>
+            <tr><td>codec (browser)</td><td>H.264</td></tr>
+            <tr><td>display Hz</td><td>50</td></tr>
+            <tr><td>fps (recv)</td><td id="dFps">60</td></tr>
+            <tr><td>fps (shown)</td><td>50</td></tr>
+          </tbody></table>
+          <table><tbody>
+            <tr><td>present σ</td><td>4.2ms</td></tr>
+            <tr><td>playout buf</td><td>30.0ms</td></tr>
+            <tr><td>rtt</td><td id="dRtt">18.0ms</td></tr>
+            <tr><td>jitter-buf</td><td id="dJit">11.4ms</td></tr>
+            <tr><td>decode</td><td>2.6ms</td></tr>
+            <tr><td>pkt lost</td><td>0</td></tr>
+          </tbody></table>
+          <table><tbody>
+            <tr><td>drops / freezes</td><td>3 / 0</td></tr>
+            <tr><td>capture→display</td><td>46.1ms</td></tr>
+            <tr><td>p95</td><td>58.3ms</td></tr>
+            <tr><td>network+pacing</td><td>21.7ms</td></tr>
+            <tr><td>decode+display</td><td>24.4ms</td></tr>
+            <tr><td>backpressure</td><td>no</td></tr>
+          </tbody></table>
+          <table><tbody>
+            <tr><td>input locked</td><td id="lockCell">yes</td></tr>
+            <tr><td>msg/s</td><td>124</td></tr>
+            <tr><td>mm/s</td><td>96</td></tr>
+            <tr><td>coalesced/s</td><td>212</td></tr>
+            <tr><td>gp send/s</td><td>60</td></tr>
+            <tr><td>ch buffered</td><td>0.4 KiB</td></tr>
+          </tbody></table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="mic-hot" role="status" aria-label="Microphone is on"><span class="dot"></span>MIC</div>
+
+<div class="ev-toast" id="evToast" role="status">
+  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 6.5a8.5 8.5 0 0 1 12 0M4.3 9a5.2 5.2 0 0 1 7.4 0M6.6 11.4a2 2 0 0 1 2.8 0" stroke-linecap="round"/><circle cx="8" cy="13.4" r=".9" fill="currentColor" stroke="none"/></svg>
+  <span><b>Connection is unstable.</b> Bitrate reduced to keep latency low.</span>
+</div>
+
+<div class="banner" id="banner" role="alert">
+  <div class="bt">
+    <strong>This stream isn’t supported on your device</strong>
+    <span>Your browser received video data but couldn’t decode it — the negotiated codec or profile isn’t supported here. Stop and try a different stream quality.</span>
+  </div>
+  <div class="ba">
+    <button class="btn btn-ghost" onclick="toggleBanner()">Dismiss</button>
+    <button class="btn btn-primary" onclick="toggleBanner()">Stop</button>
+  </div>
+</div>
+
+<script>
+let captured=false,hideTimer=null,micOn=false,tab='games';
+const hud=document.getElementById('hud');
+
+/* ── user profile preferences (bar content, position, auto-hide) ── */
+const prefs={off:new Set(),position:'bottom',autoHide:'capture'};
+
+/* The collapsed pill has no fixed size — it is as big as its content, and the
+   content changes with state, prefs and orientation. Measure the bar alone (the
+   shelf must not contribute its much larger intrinsic size), cache it, and the
+   morph becomes a plain width/height transition along the docked axis. */
+function measure(){
+  const open=document.body.classList.contains('hud-open');
+  const bar=hud.querySelector('.hud-bar'),shelf=hud.querySelector('.shelf');
+  const vert=document.body.dataset.axis==='v';
+  document.body.classList.remove('hud-open');
+  hud.style.transition='none';
+  hud.style.setProperty('--hud-w','auto');hud.style.setProperty('--hud-h','auto');
+  shelf.style.display='none';
+  if(!vert)bar.style.width='max-content';
+  const r=bar.getBoundingClientRect();
+  bar.style.width='';shelf.style.display='';
+  const w=Math.ceil(r.width)+2,h=Math.ceil(r.height)+2;
+  /* Both sizes are clamped against the same intrinsic measurement: the pill
+     never exceeds the viewport, and the open state is never SMALLER than the
+     bar needs — otherwise the morph would read as a shrink. */
+  hud.style.setProperty('--hud-w','min('+w+'px, calc(100vw - 48px))');
+  hud.style.setProperty('--hud-h','min('+h+'px, calc(100vh - 48px))');
+  if(open)document.body.classList.add('hud-open');
+  void hud.offsetWidth;hud.style.transition='';
+}
+addEventListener('resize',measure);
+if(document.fonts&&document.fonts.ready)document.fonts.ready.then(measure);
+
+function applyPrefs(){
+  document.body.dataset.off=[...prefs.off].join(' ');
+  document.body.dataset.pos=prefs.position;
+  document.body.dataset.axis=(prefs.position==='left'||prefs.position==='right')?'v':'h';
+  document.querySelectorAll('.dev [data-item]').forEach(b=>b.setAttribute('aria-selected',String(!prefs.off.has(b.dataset.item))));
+  document.querySelectorAll('.dev [data-pos]').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.pos===prefs.position)));
+  document.querySelectorAll('.dev [data-hide]').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.hide===prefs.autoHide)));
+  measure();evaluateHud();
+}
+document.querySelectorAll('.dev [data-item]').forEach(b=>b.addEventListener('click',()=>{
+  const k=b.dataset.item;prefs.off.has(k)?prefs.off.delete(k):prefs.off.add(k);applyPrefs();}));
+document.querySelectorAll('.dev [data-pos]').forEach(b=>b.addEventListener('click',()=>{prefs.position=b.dataset.pos;applyPrefs();}));
+document.querySelectorAll('.dev [data-hide]').forEach(b=>b.addEventListener('click',()=>{prefs.autoHide=b.dataset.hide;applyPrefs();}));
+
+/* ── the morph ──────────────────────────────────────────────────────────────
+   One entry point. openShelf(name) opens on a section, or — if that section is
+   already showing — collapses back to the pill, so an icon press is always
+   reversible by pressing it again. */
+function openShelf(name){
+  const open=document.body.classList.contains('hud-open');
+  if(open&&tab===name){closeShelf();return;}
+  tab=name;document.body.dataset.shelf=name;
+  document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('active',p.dataset.pane===name));
+  document.querySelectorAll('.ib[data-tab]').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.tab===name)));
+  document.body.classList.add('hud-open');
+  document.querySelector('.ib.chev').setAttribute('aria-expanded','true');
+  evaluateHud();
+}
+function closeShelf(){
+  document.body.classList.remove('hud-open');
+  document.querySelectorAll('.ib[data-tab]').forEach(b=>b.setAttribute('aria-selected','false'));
+  document.querySelector('.ib.chev').setAttribute('aria-expanded','false');
+  evaluateHud();
+}
+function toggleShelf(){document.body.classList.contains('hud-open')?closeShelf():openShelf(tab);}
+
+/* Auto-hide honours the preference. An open shelf always pins the HUD. */
+function evaluateHud(){
+  clearTimeout(hideTimer);
+  const b=document.body;
+  if(prefs.autoHide==='always'&&!b.classList.contains('hud-open')){hud.classList.add('hidden');return;}
+  const pinned=b.classList.contains('hud-open')||b.classList.contains('swapping');
+  hud.classList.remove('hidden');
+  if(prefs.autoHide==='never'||pinned||!captured)return;
+  hideTimer=setTimeout(()=>hud.classList.add('hidden'),4000);
+}
+function setCapture(on){
+  captured=on;
+  document.getElementById('captureLabel').textContent=on?'Release input':'Capture input';
+  const cb=document.getElementById('capBtn');
+  cb.setAttribute('aria-pressed',String(on));cb.classList.toggle('on',on);
+  cb.title=on?'Release input (Ctrl Alt ⇧ Z)':'Capture input';
+  document.getElementById('escRow').querySelector('b').textContent=on?'Sent to the app':'Releases capture';
+  document.getElementById('lockCell').textContent=on?'yes':'no';
+  if(on)closeShelf();
+  evaluateHud();
+}
+function toggleFs(){if(document.fullscreenElement)document.exitFullscreen();else document.documentElement.requestFullscreen();}
+function toggleMic(){
+  micOn=!micOn;
+  document.body.classList.toggle('mic-on',micOn);
+  document.getElementById('micBtn').classList.toggle('on',micOn);
+  document.getElementById('micSlash').style.display=micOn?'none':'';
+  fireToast(micOn?'<b>Microphone on.</b> Your voice is being sent to the session.':'<b>Microphone muted.</b>');
+}
+
+/* Clicking the stage while input is NOT captured summons the shelf — the only
+   pointer route in for a user who does not know the combo. Never while
+   captured: those clicks belong to the game. */
+document.getElementById('stage').addEventListener('click',()=>{if(!captured)openShelf(tab);});
+
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'&&document.body.classList.contains('hud-open')){closeShelf();return;}
+  if(e.ctrlKey&&e.altKey&&e.shiftKey&&(e.key==='Q'||e.key==='q')){
+    e.preventDefault();if(captured)setCapture(false);openShelf(tab);
+  }
+  if(e.ctrlKey&&e.altKey&&e.shiftKey&&(e.key==='Z'||e.key==='z')){e.preventDefault();setCapture(false);}
+  if(e.shiftKey&&(e.key==='S'||e.key==='s')&&!e.ctrlKey&&!e.altKey&&!e.metaKey)openShelf('stats');
+  /* Tab-cycling with the shelf open: sections are peers, so ←/→ walk them. */
+  if(document.body.classList.contains('hud-open')&&(e.key==='ArrowLeft'||e.key==='ArrowRight')){
+    const names=['games','input','stats'],i=names.indexOf(tab);
+    openShelf(names[(i+(e.key==='ArrowRight'?1:names.length-1))%names.length]);
+  }
+});
+
+let toastTimer=null;
+function fireToast(html){
+  const t=document.getElementById('evToast');
+  if(html)t.querySelector('span').innerHTML=html;
+  t.classList.add('show');clearTimeout(toastTimer);
+  toastTimer=setTimeout(()=>t.classList.remove('show'),4200);
+}
+function toggleBanner(){
+  const on=document.getElementById('banner').classList.toggle('on');
+  document.body.classList.toggle('banner-on',on);
+}
+
+/* quick switch — the stream stays alive, so the transition is an in-place bar
+   state, never a fade to black. The shelf collapses first so the morph and the
+   swap don't animate over each other. */
+function switchGame(btn){
+  const name=btn.dataset.name,game=btn.dataset.game;
+  closeShelf();
+  document.getElementById('swTo').textContent=name;
+  setTimeout(()=>{
+    document.body.classList.add('swapping');measure();evaluateHud();
+    setTimeout(()=>{
+      document.getElementById('stage').dataset.game=game;
+      document.querySelectorAll('.qs').forEach(q=>{q.classList.remove('current');if(!q.onclick)q.setAttribute('onclick','switchGame(this)');});
+      btn.classList.add('current');btn.removeAttribute('onclick');
+      document.getElementById('barTitle').textContent=name;
+      document.body.classList.remove('swapping');
+      measure();fireToast('<b>Now playing '+name+'.</b> Stream quality unchanged.');evaluateHud();
+    },1800);
+  },260);
+}
+
+/* ── telemetry ───────────────────────────────────────────────────────────────
+   One rolling series per metric feeds the bar, the simple cards and the full
+   table, so the three can never disagree. Random-walk stand-in for WebRTC
+   getStats() in the real client. */
+const SPEC={fps:{v:60,lo:52,hi:61,dp:0},lat:{v:18,lo:13,hi:29,dp:0},br:{v:8.4,lo:6.4,hi:9.6,dp:1},jit:{v:11.4,lo:8,hi:16,dp:1}};
+const series={};
+for(const k in SPEC)series[k]=Array.from({length:44},()=>SPEC[k].v);
+
+function spark(k){
+  const a=series[k],lo=Math.min(...a),hi=Math.max(...a),r=(hi-lo)||1;
+  return a.map((v,i)=>(i?'L':'M')+(i/(a.length-1)*100).toFixed(2)+' '+(27-((v-lo)/r)*24).toFixed(2)).join(' ');
+}
+function tickStats(){
+  for(const k in SPEC){
+    const s=SPEC[k],a=series[k],step=(s.hi-s.lo)*0.13;
+    let v=a[a.length-1]+(Math.random()-0.5)*2*step+(s.v-a[a.length-1])*0.18;
+    v=Math.max(s.lo,Math.min(s.hi,v));
+    a.push(v);a.shift();
+    document.querySelectorAll('[data-v="'+k+'"]').forEach(e=>e.textContent=v.toFixed(s.dp));
+    const d=spark(k),sp=document.querySelector('[data-s="'+k+'"]'),ar=document.querySelector('[data-a="'+k+'"]');
+    if(sp)sp.setAttribute('d',d);
+    if(ar)ar.setAttribute('d',d+' L100 30 L0 30 Z');
+  }
+  const last=k=>series[k][series[k].length-1];
+  const f=last('fps').toFixed(0),l=last('lat').toFixed(0),b=last('br').toFixed(1),j=last('jit').toFixed(1);
+  document.getElementById('mFps').innerHTML=f+'<u>fps</u>';
+  document.getElementById('mLat').innerHTML=l+'<u>ms</u>';
+  document.getElementById('mBr').innerHTML=b+'<u>mb</u>';
+  document.getElementById('dFps').textContent=f;
+  document.getElementById('dRtt').textContent=l+'.0ms';
+  document.getElementById('dJit').textContent=j+'ms';
+}
+function setStats(mode,btn){
+  document.body.dataset.stats=mode;
+  btn.parentElement.querySelectorAll('button').forEach(b=>b.setAttribute('aria-selected',String(b===btn)));
+}
+tickStats();setInterval(tickStats,1000);
+
+applyPrefs();
+requestAnimationFrame(measure);
+</script>
+</body>
+</html>

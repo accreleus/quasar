@@ -1,0 +1,73 @@
+---
+title: Architecture and contracts
+description: The component boundaries and frozen interfaces a Quasar contributor must preserve.
+---
+
+Quasar is split across three implementation components and one contract
+repository.
+
+## Control plane
+
+The Go control plane owns accounts, authentication, the HTTP API, WebRTC
+signaling, scheduling, administrative state, and Postgres migrations. It decides
+where a session should run but does not own a GPU or media pipeline.
+
+## Node agent
+
+The Rust node agent owns one GPU host. It reports capacity, launches app
+containers, creates virtual input devices, builds the compositor and encoder
+pipeline, and maintains the direct WebRTC connection to the client.
+
+## Web client
+
+The React client serves both `/app` and `/admin`. It talks only to the control
+plane for API and signaling. Session media travels directly between the client
+and the selected node agent.
+
+## Protocol submodule
+
+`protocol/` is a frozen interface shared across components and repositories.
+Changing it is not a routine refactor: it requires explicit human sign-off and
+the review level specified in `CLAUDE.md`. Generated client schemas must continue
+to match `protocol/openapi.yaml`.
+
+## Control-plane API reference
+
+Every `/v1` endpoint is browsable under
+[Control-plane API](/quasar/developer/api/), with parameters, request and
+response schemas, status codes, and a request example in curl, fetch, or
+reqwest.
+
+Those pages are generated from `protocol/openapi.yaml` at build time rather than
+written by hand, so they cannot drift from the contract. The contract in turn
+cannot drift from the server: a route-coverage test in the control plane fails
+when a registered route is missing from the schema, or the schema describes a
+route that is not registered.
+
+Three things the reference will not tell you on its own:
+
+- **Which endpoints are admin-only.** Most of them are. The schema marks each
+  with `x-required-role: admin`, which the page renderer does not display.
+  The gate is server-enforced middleware, never a client-side check, and the
+  authoritative list is `protocol/control-api.md` under Authorization.
+- **That two tags are not for you.** `agent` is the node agent talking to the
+  control plane, and `dev` is registered only when `QUASAR_DEV_AGENT_AUTH=1`,
+  which production refuses to boot with. Neither is part of the operator-facing
+  API.
+- **A 403 does not imply admin.** A number of non-admin endpoints return 403
+  too, for ownership rather than role.
+
+## Load-bearing boundaries
+
+- The control plane schedules; the node agent realises sessions.
+- App containers are untrusted tenant workloads and do not become part of the
+  control plane.
+- WebRTC is one transport behind the media-pipeline seam, not an assumption that
+  should leak into the compositor or encoder.
+- Host identities, ports, container names, and storage roots are configuration,
+  not constants to copy into code.
+- Database migrations move forward. An older binary is not a supported rollback
+  mechanism after a newer migration has run.
+
+For the rationale and current phase context, read `CLAUDE.md` and
+`docs/architecture-and-plan.md` in the checkout.

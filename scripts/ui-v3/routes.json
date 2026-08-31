@@ -1,0 +1,138 @@
+{
+  "$comment": "Route table for scripts/ui-v3/capture.sh (UI v3 visual pass, plan task 32). `app` routes are captured against a running SPA; `mock` routes render design_handoff_v3/screens over file://. Placeholders {hostId} {appId} {sessionId} are resolved at runtime from the control-plane API; a route whose placeholder cannot be resolved is skipped and listed in the manifest. Actions run after load: {click|clickText|waitFor|wait|eval}. `storage` seeds localStorage before the navigation (theme/density/rail live there). The `loader-*` / `hud-*` mock routes pin the loading and session-overlay mocks into one deterministic state each (they animate on a timer), for comparison against the `--mode session` captures.",
+  "app": [
+    { "id": "login", "path": "/login", "auth": false },
+    { "id": "register", "path": "/register", "auth": false },
+    { "id": "styleguide", "path": "/styleguide", "auth": false },
+
+    { "id": "app-home", "path": "/app" },
+    { "id": "app-home-detail", "path": "/app", "actions": [{ "click": ".home-feat-surface, .lib-tile-surface" }, { "waitFor": ".d-inner" }, { "wait": 700 }] },
+    { "id": "app-home-launch-options", "path": "/app", "actions": [{ "click": ".home-feat-surface, .lib-tile-surface" }, { "waitFor": ".d-inner" }, { "wait": 500 }, { "clickText": "Adjust" }, { "wait": 800 }] },
+    { "id": "app-library", "path": "/app/library" },
+    { "id": "app-library-detail", "path": "/app/library", "actions": [{ "click": ".lib-tile-surface" }, { "waitFor": ".d-inner" }, { "wait": 700 }] },
+
+    { "id": "account-profile", "path": "/app/account/profile" },
+    { "id": "account-devices", "path": "/app/account/devices" },
+    { "id": "account-overlay", "path": "/app/account/overlay" },
+    { "id": "account-streaming", "path": "/app/account/streaming" },
+    { "id": "account-storage", "path": "/app/account/storage" },
+    { "id": "account-sessions", "path": "/app/account/sessions" },
+
+    { "id": "admin-overview", "path": "/admin" },
+    { "id": "admin-overview-light", "path": "/admin", "storage": { "quasar-theme": "light" } },
+    { "id": "admin-overview-dense", "path": "/admin", "storage": { "quasar-density": "dense" } },
+    { "id": "admin-overview-rail-collapsed", "path": "/admin", "storage": { "quasar-rail": "collapsed" } },
+    { "id": "admin-palette", "path": "/admin", "actions": [{ "wait": 400 }, { "clickText": "Search hosts" }, { "wait": 600 }] },
+
+    { "id": "admin-sessions", "path": "/admin/sessions" },
+    { "id": "admin-session-detail", "path": "/admin/sessions/{sessionId}", "wait": 1500 },
+
+    { "id": "admin-fleet-hosts", "path": "/admin/fleet/hosts" },
+    { "id": "admin-fleet-host-detail", "path": "/admin/fleet/hosts/{hostId}" },
+    { "id": "admin-fleet-host-console", "path": "/admin/fleet/hosts/{hostId}/console", "wait": 1500 },
+    { "id": "admin-fleet-host-settings", "path": "/admin/fleet/hosts/{hostId}/settings", "wait": 1500 },
+    { "id": "admin-fleet-storage", "path": "/admin/fleet/storage" },
+    { "id": "admin-fleet-jobs", "path": "/admin/fleet/jobs" },
+    { "id": "admin-fleet-jobs-expanded", "path": "/admin/fleet/jobs", "actions": [{ "wait": 600 }, { "click": ".jobs-page .exp-btn[aria-label^=\"Show per-host breakdown\"]" }, { "wait": 600 }] },
+    { "id": "admin-fleet-jobs-history", "path": "/admin/fleet/jobs", "actions": [{ "wait": 600 }, { "click": ".jobs-page .row-menu-btn[aria-label=\"Actions for Auth token janitor\"]" }, { "wait": 300 }, { "clickText": "View history" }, { "waitFor": ".drawer.open" }, { "wait": 900 }] },
+    { "id": "admin-fleet-jobs-schedule", "path": "/admin/fleet/jobs", "actions": [{ "wait": 600 }, { "click": ".jobs-page .row-menu-btn[aria-label=\"Actions for Artwork grabber\"]" }, { "wait": 300 }, { "clickText": "Edit schedule" }, { "waitFor": ".modal" }, { "wait": 600 }] },
+    { "id": "admin-fleet-jobs-failing", "path": "/admin/fleet/jobs", "actions": [{ "wait": 600 }, { "clickText": "Failing" }, { "wait": 500 }] },
+    { "id": "admin-fleet-jobs-disabled", "path": "/admin/fleet/jobs", "note": "captured with one job disabled through the API, then re-enabled" },
+
+    { "id": "admin-library-apps", "path": "/admin/library/apps" },
+    { "id": "admin-library-presets", "path": "/admin/library/presets" },
+    { "id": "admin-library-images", "path": "/admin/library/images" },
+    { "id": "admin-library-image-detail", "path": "/admin/library/images/{imageId}" },
+    { "id": "admin-library-sources", "path": "/admin/library/sources" },
+
+    { "id": "admin-app-editor-identity", "path": "/admin/library/apps/{appId}" },
+    { "id": "admin-app-editor-artwork", "path": "/admin/library/apps/{appId}/artwork" },
+    { "id": "admin-app-editor-access", "path": "/admin/library/apps/{appId}/access" },
+    { "id": "admin-app-editor-quality", "path": "/admin/library/apps/{appId}/quality" },
+    { "id": "admin-app-editor-runtime", "path": "/admin/library/apps/{appId}/runtime" },
+    { "id": "admin-app-editor-library", "path": "/admin/library/apps/{appId}/library" },
+
+    { "id": "admin-streaming-launch", "path": "/admin/streaming/launch" },
+    { "id": "admin-streaming-profiles", "path": "/admin/streaming/profiles" },
+
+    { "id": "admin-people-users", "path": "/admin/people/users" },
+    { "id": "admin-people-invites", "path": "/admin/people/invites" },
+
+    { "id": "admin-audit", "path": "/admin/audit" },
+    { "id": "admin-audit-expanded", "path": "/admin/audit", "actions": [{ "wait": 600 }, { "clickText": "Expand all" }, { "wait": 600 }] },
+
+    { "id": "admin-settings", "path": "/admin/settings" },
+
+    { "id": "notfound", "path": "/no-such-route" }
+  ],
+  "mock": [
+    { "id": "login", "file": "login-v3.html" },
+    { "id": "app-home", "file": "home.html" },
+    { "id": "app-home-detail", "file": "home.html", "actions": [{ "eval": "openDetail('injustice2',true)" }, { "wait": 1200 }] },
+    { "id": "app-home-launch-options", "file": "home.html", "actions": [{ "eval": "openDetail('injustice2',true)" }, { "wait": 700 }, { "clickText": "Adjust" }, { "wait": 900 }] },
+    { "id": "app-library", "file": "home.html", "actions": [{ "clickText": "Library" }, { "wait": 900 }] },
+
+    { "id": "admin-overview", "file": "admin-console-v3.html", "hash": "#/overview" },
+    { "id": "admin-overview-light", "file": "admin-console-v3.html", "hash": "#/overview", "eval": "setTheme('light')" },
+    { "id": "admin-overview-dense", "file": "admin-console-v3.html", "hash": "#/overview", "eval": "setDensity('dense')" },
+    { "id": "admin-overview-rail-collapsed", "file": "admin-console-v3.html", "hash": "#/overview", "eval": "toggleRail()" },
+    { "id": "admin-palette", "file": "admin-console-v3.html", "hash": "#/overview", "eval": "openPalette()" },
+
+    { "id": "admin-sessions", "file": "admin-console-v3.html", "hash": "#/sessions" },
+    { "id": "admin-session-detail", "file": "admin-console-v3.html", "hash": "#/sessions/s-1c48f60b" },
+
+    { "id": "admin-fleet-hosts", "file": "admin-console-v3.html", "hash": "#/fleet/hosts" },
+    { "id": "admin-fleet-host-detail", "file": "admin-console-v3.html", "hash": "#/fleet/hosts/c2059601" },
+    { "id": "admin-fleet-host-console", "file": "admin-console-v3.html", "hash": "#/fleet/hosts/c2059601/console" },
+    { "id": "admin-fleet-host-settings", "file": "admin-console-v3.html", "hash": "#/fleet/hosts/c2059601/settings" },
+    { "id": "admin-fleet-storage", "file": "admin-console-v3.html", "hash": "#/fleet/storage" },
+
+    { "id": "admin-library-apps", "file": "admin-console-v3.html", "hash": "#/library/apps" },
+    { "id": "admin-library-presets", "file": "admin-console-v3.html", "hash": "#/library/presets" },
+    { "id": "admin-library-images", "file": "admin-console-v3.html", "hash": "#/library/images" },
+    { "id": "admin-library-image-detail", "file": "admin-console-v3.html", "hash": "#/library/images/steam" },
+    { "id": "admin-library-sources", "file": "admin-console-v3.html", "hash": "#/library/sources" },
+
+    { "id": "admin-app-editor-identity", "file": "admin-console-v3.html", "hash": "#/library/apps/app-cp2077" },
+    { "id": "admin-app-editor-artwork", "file": "admin-console-v3.html", "hash": "#/library/apps/app-cp2077/artwork" },
+    { "id": "admin-app-editor-access", "file": "admin-console-v3.html", "hash": "#/library/apps/app-cp2077/access" },
+    { "id": "admin-app-editor-quality", "file": "admin-console-v3.html", "hash": "#/library/apps/app-cp2077/quality" },
+    { "id": "admin-app-editor-runtime", "file": "admin-console-v3.html", "hash": "#/library/apps/app-cp2077/runtime" },
+    { "id": "admin-app-editor-library", "file": "admin-console-v3.html", "hash": "#/library/apps/app-steam/library" },
+
+    { "id": "admin-streaming-launch", "file": "admin-console-v3.html", "hash": "#/streaming/launch" },
+    { "id": "admin-streaming-profiles", "file": "admin-console-v3.html", "hash": "#/streaming/profiles" },
+
+    { "id": "admin-people-users", "file": "admin-console-v3.html", "hash": "#/people/users" },
+    { "id": "admin-people-invites", "file": "admin-console-v3.html", "hash": "#/people/invites" },
+
+    { "id": "admin-audit", "file": "admin-console-v3.html", "hash": "#/audit" },
+    { "id": "admin-audit-expanded", "file": "admin-console-v3.html", "hash": "#/audit", "actions": [{ "clickText": "Expand all" }, { "wait": 700 }] },
+    { "id": "admin-settings", "file": "admin-console-v3.html", "hash": "#/settings" },
+
+    { "id": "account-profile", "file": "admin-console-v3.html", "hash": "#/account/profile" },
+    { "id": "account-devices", "file": "admin-console-v3.html", "hash": "#/account/devices" },
+    { "id": "account-overlay", "file": "admin-console-v3.html", "hash": "#/account/overlay" },
+    { "id": "account-streaming", "file": "admin-console-v3.html", "hash": "#/account/streaming" },
+    { "id": "account-storage", "file": "admin-console-v3.html", "hash": "#/account/storage" },
+    { "id": "account-sessions", "file": "admin-console-v3.html", "hash": "#/account/sessions" },
+
+    {"id": "loader-1-connection", "file": "loading-v3.html", "actions": [{"wait": 400}, {"eval": "(() => { for (let i = 1; i < 5000; i++) { clearInterval(i); clearTimeout(i); } stageIndex = 0; stage.textContent = stages[0]; stage.classList.remove('changing'); paintSteps(); })()"}, {"wait": 400}]},
+    {"id": "loader-2-secure-path", "file": "loading-v3.html", "actions": [{"wait": 400}, {"eval": "(() => { for (let i = 1; i < 5000; i++) { clearInterval(i); clearTimeout(i); } stageIndex = 1; stage.textContent = stages[1]; stage.classList.remove('changing'); paintSteps(); })()"}, {"wait": 400}]},
+    {"id": "loader-3-video-channel", "file": "loading-v3.html", "actions": [{"wait": 400}, {"eval": "(() => { for (let i = 1; i < 5000; i++) { clearInterval(i); clearTimeout(i); } stageIndex = 2; stage.textContent = stages[2]; stage.classList.remove('changing'); paintSteps(); })()"}, {"wait": 400}]},
+    {"id": "loader-4-locking-aperture", "file": "loading-to-stream-v3.html", "actions": [{"wait": 400}, {"eval": "(() => { for (let i = 1; i < 5000; i++) { clearInterval(i); clearTimeout(i); } completeConnection(); })()"}, {"wait": 500}, {"eval": "(() => { for (let i = 1; i < 5000; i++) clearTimeout(i); })()"}, {"wait": 200}]},
+    {"id": "loader-5-after-handoff", "file": "loading-to-stream-v3.html", "actions": [{"wait": 400}, {"eval": "completeConnection()"}, {"wait": 1800}]},
+    {"id": "hud-rest", "file": "session-overlay-v3.html", "actions": [{"wait": 700}]},
+    {"id": "hud-pane-games", "file": "session-overlay-v3.html", "actions": [{"wait": 600}, {"eval": "(() => { openShelf('games'); })()"}, {"wait": 700}]},
+    {"id": "hud-pane-input", "file": "session-overlay-v3.html", "actions": [{"wait": 600}, {"eval": "(() => { openShelf('input'); })()"}, {"wait": 700}]},
+    {"id": "hud-pane-stats", "file": "session-overlay-v3.html", "actions": [{"wait": 600}, {"eval": "(() => { openShelf('stats'); })()"}, {"wait": 700}]},
+    {"id": "hud-pane-stats-detailed", "file": "session-overlay-v3.html", "actions": [{"wait": 600}, {"eval": "(() => { openShelf('stats'); })()"}, {"wait": 500}, {"clickText": "Detailed"}, {"wait": 700}]},
+    {"id": "hud-dock-top-rest", "file": "session-overlay-v3.html", "actions": [{"wait": 600}, {"eval": "(() => { prefs.position = 'top'; applyPrefs(); })()"}, {"wait": 700}]},
+    {"id": "hud-dock-top-open", "file": "session-overlay-v3.html", "actions": [{"wait": 600}, {"eval": "(() => { prefs.position = 'top'; applyPrefs(); openShelf('stats'); })()"}, {"wait": 800}]},
+    {"id": "hud-dock-left-rest", "file": "session-overlay-v3.html", "actions": [{"wait": 600}, {"eval": "(() => { prefs.position = 'left'; applyPrefs(); })()"}, {"wait": 700}]},
+    {"id": "hud-dock-left-open", "file": "session-overlay-v3.html", "actions": [{"wait": 600}, {"eval": "(() => { prefs.position = 'left'; applyPrefs(); openShelf('stats'); })()"}, {"wait": 800}]},
+    {"id": "hud-dock-right-rest", "file": "session-overlay-v3.html", "actions": [{"wait": 600}, {"eval": "(() => { prefs.position = 'right'; applyPrefs(); })()"}, {"wait": 700}]},
+    {"id": "hud-dock-right-open", "file": "session-overlay-v3.html", "actions": [{"wait": 600}, {"eval": "(() => { prefs.position = 'right'; applyPrefs(); openShelf('stats'); })()"}, {"wait": 800}]},
+    {"id": "hud-hidden", "file": "session-overlay-v3.html", "actions": [{"wait": 600}, {"eval": "(() => { prefs.autoHide = 'always'; applyPrefs(); })()"}, {"wait": 800}]}
+  ]
+}

@@ -1,0 +1,32 @@
+{
+  "app_id": "99999999-8888-7777-6666-555555555555",
+  "bitrate_kbps": 11500,
+  "codec": "h264",
+  "duration_s": 240.0,
+  "external_resize_supported": true,
+  "fps": 120,
+  "host_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  "id": "11111111-2222-3333-4444-555555555555",
+  "kind": "session",
+  "launch": [
+    1920,
+    1080
+  ],
+  "profile": "observe",
+  "rungs": [
+    [
+      1920,
+      1080
+    ],
+    [
+      1600,
+      900
+    ],
+    [
+      1280,
+      720
+    ]
+  ],
+  "started_at_ms": 1786940000000,
+  "state": "running"
+}

@@ -1,0 +1,83 @@
+---
+title: Your library
+description: Finding things to play, favourites, and choosing a quality tier before you launch.
+---
+
+import Shot from '../../../components/Shot.astro';
+import library from '../../../assets/shots/library.png';
+import { Aside } from '@astrojs/starlight/components';
+
+Your library lives at `/app`. It shows the apps you have been granted, and
+nothing else. If someone else on the instance has access to something you do
+not, you will not see it at all.
+
+<Shot
+	label="Library"
+	sublabel="The library, grouped by source, with a cover tile for every app you have been granted."
+	src={library}
+	alt="The Quasar library page"
+/>
+
+## What is in here
+
+Apps come in three kinds and you can filter by them:
+
+- **Games**, launched directly.
+- **Desktops**, a full desktop session rather than a single title.
+- **Launchers**, which open a storefront client such as Steam and let you pick
+  from there.
+
+Artwork comes from SteamGridDB if your administrator has configured a key. If
+not, tiles render as gradient panels. It is cosmetic either way.
+
+## Favourites
+
+The heart on a tile pins it. Favourites surface first, which is worth doing if
+your catalog is large.
+
+## Choosing quality
+
+Before you launch you can pick a quality tier: a resolution and frame rate pair
+such as 1080p60 or 1440p120. Twelve tiers ship by default, from 720p60 up to
+4K120, and 1080p60 is the recommended starting point.
+
+What you pick is a **preference**, not a command. Each tier is an ordered list
+of encoder settings, and the server takes the first one that works for your
+particular situation:
+
+1. Your GPU host has to be able to encode it.
+2. Your browser has to be able to decode it. Quasar measures this when you log
+   in, so it already knows.
+3. If a codec has failed for you before, it gets skipped.
+
+Every tier ends in an H.264 rung, which every browser can decode. That is the
+guaranteed floor, so a launch never fails purely because nothing was playable.
+
+The practical consequence is that asking for 4K120 on a machine that cannot
+manage it gets you the best rung it can manage, not an error.
+
+<Aside type="note" title="Set it once">
+Account, Stream quality lets you set a default tier so you are not choosing
+every time. Your administrator may have set an instance default, and may have
+locked it.
+</Aside>
+
+## Why something might not launch
+
+| What you see | What it means |
+| --- | --- |
+| No host available | Nothing in the fleet is online. This is for your administrator. |
+| Capacity exhausted | Hosts are up but full. Wait for someone to finish and try again. |
+| Session limit reached | You already have as many sessions running as your account allows. |
+| Already running | You have a live session of this same app. Only one at a time, because your save files cannot have two writers. |
+| Not entitled | You do not have access to this app. Ask your administrator. |
+
+## Steam
+
+If your administrator has enabled the Steam library, games already installed in
+the Steam container appear as their own launchable tiles rather than making you
+go through the Steam client every time.
+
+This is filesystem discovery of what is installed, not a sync of everything you
+own. A game you own but have not installed will not appear. Install it once
+through the Steam launcher app and it shows up on the next scan.

@@ -1,0 +1,61 @@
+{
+  "name": "steam-bpm",
+  "description": "Steam Big Picture image (quasar-steam family): cold home, sign-in screen, gamepad-first UI.",
+  "app": "Steam",
+  "session_profile_id": "1080p60",
+  "runs": 3,
+  "session_container_match": "steam",
+  "gates": {
+    "launch": {
+      "min_fps": 55,
+      "min_luma": 25,
+      "first_content_s": [30, 55]
+    },
+    "oracle": {
+      "label": "bpm-signin",
+      "expect": "account + password fields, QR sign-in panel, live clock, Xbox glyph footer",
+      "rules_out": "a \"Waiting for network\" stall from the system-bus / NetworkManager init hook",
+      "matcher": null
+    },
+    "input": {
+      "settle": { "frames": 3, "tolerance_pct": 1.0, "timeout_s": 90 },
+      "delta_threshold_pct": 4.0,
+      "region": [0.0, 0.5, 1.0, 0.5],
+      "devices": {
+        "mouse": {
+          "stimuli": [
+            { "t": "ma", "x": 0.5, "y": 0.62 },
+            { "t": "mm", "dx": 12, "dy": 7, "repeat": 10 }
+          ]
+        },
+        "gamepad": {
+          "stimuli": [
+            { "t": "gp", "button": 12 },
+            { "t": "gp", "button": 13 }
+          ],
+          "settle_ms": 800
+        },
+        "keyboard": {
+          "stimuli": [
+            { "t": "k", "code": 103 },
+            { "t": "k", "code": 108 }
+          ],
+          "settle_ms": 800
+        }
+      }
+    },
+    "shutdown": {
+      "budget_s": 8.0,
+      "expect_exit": 143,
+      "require_logs": [
+        "shutdown requested; relaying to launched processes",
+        "sending SIGTERM to",
+        "terminating gamescope"
+      ],
+      "forbid_logs": ["SIGKILL backstop"]
+    }
+  },
+  "notes": [
+    "Steam is signed out under QA (the harness holds no credentials), so Steam never prints its own \"Shutdown\" line — gate 5's evidence is the launcher's SIGTERM relay plus exit 143. Signed-in shutdown is out of scope."
+  ]
+}

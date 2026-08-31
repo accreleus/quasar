@@ -1,0 +1,791 @@
+/* ============================================================
+   QUASAR — THE SHELL (v3)
+
+   Everything that frames a page and nothing that is in one: the
+   `.app` grid, the two topbars, the rail, the page column, the
+   command-palette trigger, the user button and its popover, and the
+   small-screen tab bar. Components live in primitives.css.
+
+   ONE OWNER PER CLASS. `.cmdk`, `.user-btn`, `.u-*`, `.user-pop`,
+   `.up-*` and `.mk` moved here from primitives.css when the v3 shell
+   landed — they are chrome, not primitives. `.icon-btn`, `.menu`,
+   `.pal*`, `.scrim*` and `.search` stay there: pages use them too.
+
+   Geometry from design_handoff_v3/screens/assets/console-v3.css (the
+   console) and assets/quasar.css + home-v3.css (the home topbar); see
+   docs/superpowers/specs/2026-08-28-ui-v3/handoff-v3-spec.md §A.0/§B/§F.
+
+   EVERY `backdrop-filter` IS WRITTEN TWICE — see the canonical note in
+   components.css: `web/` ships no autoprefixer, and an unpaired blur is
+   silently dropped on the iPad class of device Quasar targets.
+   ============================================================ */
+
+/* ---------- THE GRID ---------- */
+
+/* Console: rail | page under a full-width topbar. The column track is a
+   token, so collapsing the rail is a variable change, not a re-layout. */
+.app {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: var(--rail-w) 1fr;
+  grid-template-rows: var(--topbar-h) 1fr;
+  height: 100vh;
+  transition: grid-template-columns 0.16s ease;
+}
+
+/* Home: one column, page-scrolled, sticky topbar (the console scrolls
+   `.main` instead, so its topbar never moves). */
+.app-home {
+  display: flex;
+  flex-direction: column;
+  height: auto;
+  min-height: 100vh;
+}
+
+/* ---------- TOPBAR ---------- */
+.topbar {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: var(--rail-w) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--s4);
+  padding: 0 var(--s5);
+  background: color-mix(in oklch, var(--surf-chrome) 88%, transparent);
+  backdrop-filter: blur(26px) saturate(112%);
+  -webkit-backdrop-filter: blur(26px) saturate(112%);
+  border-bottom: 1px solid var(--glass-border);
+  box-shadow: 0 1px 0 oklch(0.02 0.01 267/.55);
+  position: relative;
+  z-index: 40;
+}
+
+/* The user-area variant: 64px, flex, sticky, with a pill row and a
+   centred search field instead of the palette trigger. */
+.topbar.home {
+  position: sticky;
+  top: 0;
+  display: flex;
+  gap: var(--s6);
+  height: 64px;
+  padding: 0 var(--page-pad);
+}
+
+.tb-left {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  min-width: 0;
+}
+
+.tb-right {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  justify-self: end;
+}
+
+.topbar .spacer {
+  flex: 1 1 auto;
+}
+
+/* Brand: 24px mark + Michroma wordmark. The wordmark is the only place
+   --font-brand is used. */
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.brand:hover {
+  text-decoration: none;
+  color: var(--text);
+}
+
+.brand .mark {
+  width: 24px;
+  height: 24px;
+  flex: none;
+}
+
+.wordmark {
+  font-family: var(--font-brand);
+  font-weight: 400;
+  font-size: 0.72rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+/* A collapsed rail leaves no room for the word — the mark stays. */
+[data-rail="collapsed"] .wordmark {
+  display: none;
+}
+
+/* Rail toggle. Only exists below the drawer breakpoint. */
+.rail-btn {
+  display: none;
+  flex: none;
+}
+
+/* ---------- COMMAND-PALETTE TRIGGER ----------
+   Moved from primitives.css: only the console topbar renders it. */
+.cmdk {
+  width: min(440px, 100%);
+  justify-self: center;
+  height: var(--control-h);
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 14px;
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-control);
+  background: color-mix(in oklch, var(--surf-inset) 76%, transparent);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  color: var(--text-3);
+  font-size: var(--t-sm);
+  cursor: pointer;
+  transition: border-color 0.16s ease, color 0.16s ease;
+}
+
+.cmdk:hover {
+  border-color: var(--text-2);
+  color: var(--text-2);
+}
+
+.cmdk svg {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+
+.cmdk kbd {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-control);
+  padding: 1px 5px;
+  color: var(--text-3);
+}
+
+/* ---------- USER BUTTON + POPOVER ----------
+   Moved from primitives.css with the same values. */
+.usermenu {
+  position: relative;
+  display: inline-block;
+}
+
+.user-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: var(--control-h);
+  padding: 0 8px 0 6px;
+  border: 1px solid transparent;
+  background: none;
+  border-radius: var(--r-control);
+  cursor: pointer;
+  font-family: var(--font-ui);
+  font-size: var(--t-sm);
+  font-weight: 500;
+  color: var(--text);
+}
+
+.user-btn:hover,
+.user-btn[aria-expanded="true"] {
+  background: var(--glass-control);
+}
+
+.u-ava {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--action);
+  color: oklch(1 0 0);
+  display: grid;
+  place-content: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
+  flex: none;
+}
+
+.u-nm {
+  font-weight: 600;
+  font-size: var(--t-sm);
+  color: var(--text);
+}
+
+.u-chev {
+  width: 13px;
+  height: 13px;
+  color: var(--text-3);
+  transition: transform 0.18s ease;
+}
+
+.user-btn[aria-expanded="true"] .u-chev {
+  transform: rotate(180deg);
+}
+
+/* The open/closed switch is load-bearing, not decoration.
+   `visibility: hidden` (not just opacity + pointer-events) is what takes
+   every .up-item — Sign out included — out of the Tab order while the menu
+   is closed; UserMenu.tsx keeps the open state as a class for exactly this
+   rule, and shell.test.ts + UserMenu.test.tsx pin it. The visibility
+   transition is delayed to the end of the fade out and to 0s on the way in,
+   so the menu is focusable the instant it opens and unfocusable only once
+   it has gone. */
+.user-pop {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 80;
+  width: 248px;
+  padding: 6px;
+  background: color-mix(in oklch, var(--surf-raised) 90%, transparent);
+  backdrop-filter: blur(28px);
+  -webkit-backdrop-filter: blur(28px);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-panel);
+  box-shadow: inset 0 1px 0 var(--glass-highlight), 0 1.5rem 3.5rem oklch(0.05 0.01 267/.72);
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-4px);
+  pointer-events: none;
+  transition: opacity 0.16s ease, transform 0.16s ease, visibility 0s 0.16s;
+}
+
+.user-pop.open {
+  opacity: 1;
+  visibility: visible;
+  transform: none;
+  pointer-events: auto;
+  transition-delay: 0s;
+}
+
+.up-head {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 10px 10px 12px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 6px;
+}
+
+.up-head .u-ava {
+  width: 38px;
+  height: 38px;
+  font-size: 1rem;
+}
+
+.up-name {
+  font-weight: 600;
+  font-size: var(--t-sm);
+  color: var(--text);
+}
+
+.up-mail {
+  font-size: var(--t-xs);
+  color: var(--text-3);
+  margin-top: 1px;
+}
+
+.up-item {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: var(--r-control);
+  background: none;
+  text-align: left;
+  cursor: pointer;
+  font-family: var(--font-ui);
+  font-size: var(--t-sm);
+  font-weight: 500;
+  color: var(--text-2);
+  white-space: nowrap;
+  text-decoration: none;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.up-item:hover {
+  background: var(--glass-control);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.up-item svg {
+  width: 16px;
+  height: 16px;
+  color: var(--text-3);
+  flex: none;
+}
+
+.up-item:hover svg {
+  color: var(--text-2);
+}
+
+.up-item.danger {
+  color: var(--danger-text);
+}
+
+.up-item.danger:hover {
+  background: var(--danger-bg);
+  color: var(--danger-text);
+}
+
+.up-item.danger:hover svg {
+  color: var(--danger-text);
+}
+
+.up-div {
+  height: 1px;
+  background: var(--line);
+  margin: 6px 4px;
+}
+
+.up-val {
+  margin-left: auto;
+  font-size: var(--t-xs);
+  color: var(--text-3);
+  font-weight: 600;
+}
+
+/* The Admin chip rides in the .up-val slot; it is a chip, not a value. */
+.up-item .chip.up-val {
+  height: 18px;
+  color: var(--accent-text);
+}
+
+/* ---------- RAIL ---------- */
+.rail {
+  border-right: 1px solid var(--line);
+  background: color-mix(in oklch, var(--surf-chrome) 84%, transparent);
+  /* The inner light edge that separates the rail's glass from the page's
+     without a second hairline — the same trick the topbar's bottom uses. */
+  box-shadow: inset -1px 0 0 oklch(0.9618 0.0086 247.91/.07);
+  backdrop-filter: blur(26px) saturate(112%);
+  -webkit-backdrop-filter: blur(26px) saturate(112%);
+  display: flex;
+  flex-direction: column;
+  padding: var(--s3) 10px;
+  gap: 2px;
+  overflow: hidden auto;
+}
+
+.rail-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  height: 36px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--r-control);
+  background: none;
+  color: var(--text-2);
+  font-family: var(--font-ui);
+  font-size: var(--t-sm);
+  font-weight: 500;
+  text-align: left;
+  text-decoration: none;
+  white-space: nowrap;
+  width: 100%;
+  cursor: pointer;
+  flex: none;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.rail-item svg {
+  width: 17px;
+  height: 17px;
+  flex: none;
+  opacity: 0.85;
+}
+
+.rail-item:hover {
+  background: var(--glass-control);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.rail-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.rail-item.active {
+  background: var(--accent-soft);
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* The accent edge bar, hung in the rail's own 10px gutter. 2px is the
+   mock's FINAL cascade — console-v3.css's first pass says 3px and the
+   palette pass later narrows it; the shipped bar is the narrow one. */
+.rail-item.active::before {
+  content: "";
+  position: absolute;
+  left: -10px;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  border-radius: 0 2px 2px 0;
+  background: var(--accent);
+}
+
+.rail-item .lbl {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Rail marker — a live count or a fault count beside a nav label.
+   Moved from primitives.css; the rail is its only consumer. */
+.mk {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 1px 6px;
+  border-radius: var(--r-pill);
+  flex: none;
+}
+
+.mk-live { background: var(--success-bg); color: var(--success-text); }
+.mk-fault { background: var(--danger-bg); color: var(--danger-text); }
+
+/* Section heading. The admin rail is flat and emits none; the account
+   rail groups six rows across three subjects and needs all three. */
+.rail-sec {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-4);
+  font-weight: 700;
+  padding: var(--s4) 10px var(--s2);
+}
+
+.rail-foot {
+  margin-top: auto;
+  padding-top: var(--s3);
+  border-top: 1px solid var(--line);
+}
+
+/* ---------- COLLAPSED RAIL ---------- */
+[data-rail="collapsed"] .rail-item .lbl,
+[data-rail="collapsed"] .rail-item .mk,
+[data-rail="collapsed"] .rail-sec {
+  display: none;
+}
+
+[data-rail="collapsed"] .rail-item {
+  justify-content: center;
+  padding: 0;
+}
+
+[data-rail="collapsed"] .rail-collapse svg {
+  transform: rotate(180deg);
+}
+
+/* ---------- PAGE ---------- */
+.main {
+  overflow: auto;
+  padding: var(--s6) var(--page-pad) var(--s10);
+  min-width: 0;
+}
+
+/* The home shell scrolls the document, not the main box, and its surfaces
+   own their own gutters (hero, rails, grid). */
+.main-home {
+  overflow: visible;
+  padding: 0;
+}
+
+/* ---------- HOME PILL NAV ---------- */
+.nav {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+
+.nav a {
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+  color: var(--text-3);
+  font-size: var(--t-sm);
+  font-weight: 600;
+  padding: 8px 13px;
+  border-radius: var(--r-control);
+  text-decoration: none;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.nav a:hover {
+  color: var(--text);
+  background: oklch(0.9618 0.0086 247.91/.05);
+  text-decoration: none;
+}
+
+.nav a.active {
+  color: var(--text);
+  background: color-mix(in oklch, var(--surf-control) 66%, transparent);
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
+}
+
+/* ---------- HOME SEARCH ----------
+   Absolutely centred on the bar, so the field sits on the page's centre
+   line whatever the brand or username width. 280px, 340px on focus. */
+.topbar.home .search {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 280px;
+  min-width: 0;
+  transition: width 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.topbar.home .search:focus-within {
+  width: 340px;
+}
+
+/* ---------- SMALL-SCREEN TAB BAR ----------
+   The user area's narrow-viewport primary nav (Home / Library / Account).
+   Everything except `display: none` lives inside the media query, so the
+   desktop is byte-identical. */
+.tabbar {
+  display: none;
+}
+
+/* ---------- RESPONSIVE ---------- */
+
+/* The rail becomes a slide-over, reusing the drawer motion the system
+   already has rather than adding a second responsive pattern. Collapse is
+   meaningless at this width, so the foot goes. */
+@media (max-width: 820px) {
+  .app {
+    grid-template-columns: 1fr;
+  }
+
+  .topbar {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: var(--s3);
+    padding-inline: var(--s4);
+  }
+
+  .rail-btn {
+    display: inline-flex;
+  }
+
+  .rail {
+    position: fixed;
+    top: 0;
+    left: 0;
+    height: 100vh;
+    width: 264px;
+    z-index: 56;
+    transform: translateX(-100%);
+    transition: transform 0.24s ease;
+    border-right: 1px solid var(--line-2);
+    box-shadow: var(--shadow-lg);
+    padding-top: var(--s4);
+  }
+
+  .app-rail-open .rail {
+    transform: none;
+  }
+
+  .rail-foot {
+    display: none;
+  }
+
+  .rail-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 55;
+    background: oklch(0.02 0.01 267/.55);
+    backdrop-filter: blur(3px);
+    -webkit-backdrop-filter: blur(3px);
+  }
+
+  /* The pill row is the wide expression of this nav; the tab bar is the
+     narrow one. Exactly one is ever rendered. */
+  .topbar.home .nav {
+    display: none;
+  }
+
+  .tabbar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    /* Above page content and the topbar (40), below the rail drawer and
+       its scrim (55/56) — an open rail must cover the bar, not fight it. */
+    z-index: 45;
+    display: flex;
+    align-items: stretch;
+    background: color-mix(in oklch, var(--surf-chrome) 88%, transparent);
+    backdrop-filter: blur(26px) saturate(112%);
+    -webkit-backdrop-filter: blur(26px) saturate(112%);
+    border-top: 1px solid var(--glass-border);
+    /* iOS home-indicator gutter: extends the glass, not the touch target. */
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  .tabbar a {
+    flex: 1 1 0;
+    min-width: 0;
+    height: var(--tabbar-h);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    position: relative;
+    color: var(--text-3);
+    font-size: var(--t-xs);
+    font-weight: 600;
+    text-decoration: none;
+    transition: color 0.15s ease, background-color 0.15s ease;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .tabbar a .tb-ic {
+    width: 20px;
+    height: 20px;
+    display: block;
+  }
+
+  .tabbar a .tb-ic svg {
+    width: 20px;
+    height: 20px;
+  }
+
+  .tabbar a:hover {
+    color: var(--text-2);
+    text-decoration: none;
+  }
+
+  .tabbar a.active {
+    color: var(--accent-text);
+  }
+
+  /* The lit tab carries a 2px cap, the same edge language the rail uses. */
+  .tabbar a.active::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 22%;
+    right: 22%;
+    height: 2px;
+    border-radius: 0 0 2px 2px;
+    background: var(--accent);
+  }
+
+  /* The bar floats over the page; give the scrolled box room under it. */
+  .main {
+    padding-bottom: calc(var(--tabbar-h) + var(--s6));
+  }
+}
+
+/* The topbar has no room for a pill row, a search field and a username. */
+@media (max-width: 760px) {
+  .topbar.home {
+    gap: var(--s3);
+    padding-inline: var(--s4);
+  }
+
+  .topbar.home .search {
+    position: static;
+    transform: none;
+    width: auto;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .topbar.home .search:focus-within {
+    width: auto;
+  }
+
+  .user-btn {
+    gap: 7px;
+    padding-inline: 6px;
+  }
+
+  .user-btn .u-nm {
+    display: none;
+  }
+
+  .wordmark {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app,
+  .rail,
+  .rail-item,
+  .user-pop,
+  .topbar.home .search {
+    transition: none;
+  }
+}
+
+/* ---------- LIGHT APPEARANCE ----------
+   The dark-tuned glass fills read as smoke on white; these are the same
+   overrides primitives.css carries for the classes it kept. */
+[data-theme="light"] .user-btn:hover,
+[data-theme="light"] .user-btn[aria-expanded="true"] {
+  background: oklch(0.24 0.022 268/.06);
+  color: var(--text);
+}
+
+[data-theme="light"] .cmdk {
+  background-color: oklch(1 0 0/.86);
+  border-color: var(--line-2);
+}
+
+[data-theme="light"] .user-pop {
+  background: oklch(0.998 0.002 268/.92);
+  box-shadow: var(--shadow-lg);
+}
+
+[data-theme="light"] .up-item:hover {
+  background: oklch(0.24 0.022 268/.05);
+}
+
+[data-theme="light"] .u-ava {
+  text-shadow: none;
+}
+
+[data-theme="light"] .rail-item:hover {
+  background: oklch(0.24 0.022 268/.05);
+}
+
+[data-theme="light"] .nav a.active {
+  background: oklch(1 0 0);
+  border: 1px solid var(--line-2);
+  box-shadow: var(--shadow-sm);
+}
+
+[data-theme="light"] .topbar,
+[data-theme="light"] .tabbar {
+  box-shadow: 0 1px 0 oklch(1 0 0/.6);
+}
+
+[data-theme="light"] .rail-scrim {
+  background: oklch(0.24 0.022 268/.28);
+}

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="1024" height="1024">
+<defs>
+<linearGradient id="h1" gradientUnits="userSpaceOnUse" x1="59" y1="280" x2="453" y2="280"><stop offset="0" stop-color="#2E8BFF"></stop><stop offset="1" stop-color="#5B6BFF"></stop></linearGradient>
+<linearGradient id="h2" gradientUnits="userSpaceOnUse" x1="105" y1="280" x2="407" y2="280"><stop offset="0" stop-color="#6A45F5"></stop><stop offset="1" stop-color="#B85CDB"></stop></linearGradient>
+<linearGradient id="h3" gradientUnits="userSpaceOnUse" x1="141" y1="280" x2="371" y2="280"><stop offset="0" stop-color="#E0559E"></stop><stop offset="1" stop-color="#FF5470"></stop></linearGradient>
+<linearGradient id="h4" gradientUnits="userSpaceOnUse" x1="172" y1="280" x2="340" y2="280"><stop offset="0" stop-color="#FFC24B"></stop><stop offset="1" stop-color="#FFD37C"></stop></linearGradient>
+<linearGradient id="hrim" gradientUnits="userSpaceOnUse" x1="210" y1="234" x2="302" y2="326"><stop offset="0" stop-color="#FFF6E0"></stop><stop offset=".55" stop-color="#FFE9B8"></stop><stop offset="1" stop-color="#FF8DA1"></stop></linearGradient>
+<linearGradient id="hjet" gradientUnits="userSpaceOnUse" x1="256" y1="76" x2="256" y2="300"><stop offset="0" stop-color="#5BD6FF" stop-opacity=".15"></stop><stop offset=".28" stop-color="#5BD6FF"></stop><stop offset=".62" stop-color="#FF8DA1"></stop><stop offset="1" stop-color="#FFF6E0"></stop></linearGradient>
+<linearGradient id="hjetglow" gradientUnits="userSpaceOnUse" x1="256" y1="100" x2="256" y2="300"><stop offset="0" stop-color="#FF8DA1" stop-opacity="0"></stop><stop offset="1" stop-color="#FFC24B" stop-opacity=".45"></stop></linearGradient>
+<clipPath id="lowhalf"><rect x="0" y="280" width="512" height="232"></rect></clipPath>
+<path id="c1" fill-rule="evenodd" fill="url(#h1)" d="M54 280a202 84 0 1 0 404 0a202 84 0 1 0 -404 0ZM80 280a176 74 0 1 0 352 0a176 74 0 1 0 -352 0Z"></path>
+<path id="c2" fill-rule="evenodd" fill="url(#h2)" d="M90 280a166 68 0 1 0 332 0a166 68 0 1 0 -332 0ZM118 280a138 58 0 1 0 276 0a138 58 0 1 0 -276 0Z"></path>
+<path id="c3" fill-rule="evenodd" fill="url(#h3)" d="M128 280a128 52 0 1 0 256 0a128 52 0 1 0 -256 0ZM162 280a94 40 0 1 0 188 0a94 40 0 1 0 -188 0Z"></path>
+<path id="c4" fill-rule="evenodd" fill="url(#h4)" d="M172 280a84 34 0 1 0 168 0a84 34 0 1 0 -168 0ZM192 280a64 18 0 1 0 128 0a64 18 0 1 0 -128 0Z"></path>
+</defs>
+<g transform="translate(0,-12)">
+<use href="#c1"></use><use href="#c2"></use><use href="#c3"></use><use href="#c4"></use>
+<path d="M230 296 L248 104 h16 L282 296 z" fill="url(#hjetglow)"></path>
+<path d="M240 300 L252 76 h8 L272 300 z" fill="url(#hjet)"></path>
+<circle cx="256" cy="280" r="44" fill="#000"></circle>
+<circle cx="256" cy="280" r="51" fill="none" stroke="url(#hrim)" stroke-width="16"></circle>
+<g clip-path="url(#lowhalf)"><use href="#c1"></use><use href="#c2"></use><use href="#c3"></use><use href="#c4"></use></g>
+</g>
+</svg>

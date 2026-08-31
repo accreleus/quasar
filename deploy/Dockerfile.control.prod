@@ -1,0 +1,93 @@
+# Dockerfile.control.prod — production control-plane image (self-contained).
+#
+# Differences from Dockerfile.control (the dev/compose image, which stays as-is):
+#   - the web SPA is BUILT AND EMBEDDED (no web/dist bind mount needed; the image
+#     is a single portable artifact — the #131 stale-bind-mount footgun is gone)
+#   - runs as a non-root user
+#   - has an image-level HEALTHCHECK (works outside compose, e.g. Kubernetes)
+#
+# Build from the repo root:
+#   docker build -f deploy/Dockerfile.control.prod -t quasar-control-plane:prod .
+#
+# The control-plane self-migrates on startup (embedded golang-migrate FS).
+#
+# NOTE web build toolchain: node:22 + npm is the known-good combo (pnpm >= 11
+# silently skips esbuild's postinstall and vite 6 needs Node >= 22 — see
+# CLAUDE.md "Web deploys" gotchas). Do not "upgrade" this stage to pnpm.
+
+# Runtime base (ARG must precede the first FROM to be usable in any FROM).
+#
+# THIS VALUE MUST AGREE WITH deploy/pins.env, which is the source of truth for it
+# (Dockerfile.vulkan carries the same assertion for all nine pins; this file
+# declares only this one). build-images.sh checks the agreement on every `control`
+# build and refuses to build on a mismatch — edit pins.env and mirror it here.
+# quasar-images publishes :latest from its `stable` branch (its default branch —
+# there is no `main`). Override for a release, which pins an exact base digest:
+#   --build-arg QUASAR_BASE_IMAGE=ghcr.io/accreleus/quasar-base@sha256:<hex>
+ARG QUASAR_BASE_IMAGE=ghcr.io/accreleus/quasar-base:latest
+
+# ── Web build stage ───────────────────────────────────────────────────────────
+FROM node@sha256:a25c9934ff6382cd4f08b6bc26c82bf4ea69b1e6f8dabfb2ead457374127c365 AS web-builder
+
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ .
+RUN npm run build
+
+# ── Go build stage ────────────────────────────────────────────────────────────
+FROM golang@sha256:8bee1901f1e530bfb4a7850aa7a479d17ae3a18beb6e09064ed54cfd245b7191 AS builder
+
+WORKDIR /src
+COPY control-plane/go.mod control-plane/go.sum ./
+RUN go mod download
+COPY control-plane/ .
+# CGO_ENABLED=0 → fully static binary (no libc deps in the runtime image).
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath -ldflags="-s -w" \
+    -o /quasar-control ./cmd/quasar-control
+
+# ── Runtime stage ─────────────────────────────────────────────────────────────
+# All shipped Quasar images build on the shared quasar-base (Fedora 43) from
+# quasar-images, which owns the Fedora pin and provides ca-certificates, curl,
+# and the unprivileged `quasar` user. Node and Go remain build-only stages and
+# never ship in this artifact.
+ARG QUASAR_BASE_IMAGE
+FROM ${QUASAR_BASE_IMAGE}
+
+COPY --from=builder /quasar-control /usr/local/bin/quasar-control
+COPY --from=web-builder /web/dist /app/web
+
+ENV QUASAR_WEB_ROOT=/app/web
+
+# /run/quasar must exist and be writable by the runtime user BEFORE the USER
+# directive: /run itself is root-owned 0755, so a non-root process cannot create
+# a subdirectory there. The dev-agent-auth key file (#399,
+# /run/quasar/dev-agent-key, mode 0600) is written here when
+# QUASAR_DEV_AGENT_AUTH=1, and `make agent-creds` reads it via docker exec.
+# Nothing else uses the directory, and a failure to write is non-fatal (the key
+# is also logged) — but the documented fetch recipe only works if this exists.
+# NOTE: a runtime that mounts a fresh tmpfs over /run (podman does; docker does
+# not, and no compose file in deploy/ mounts one over /run) would mask this, and
+# the control plane would fall back to the log-only key.
+RUN mkdir -p /run/quasar && chown quasar:quasar /run/quasar && chmod 0700 /run/quasar
+
+# /var/lib/quasar-control is the TLS-pair + artwork-cache mount point, and it
+# needs the same treatment for the same reason. Docker creates a fresh named
+# volume root:root 0755 and copies the image's ownership of the mount point onto
+# it, so declaring the directory here is what makes the volume land owned by
+# `quasar`. Without it the non-root process cannot mkdir the `tls` subdirectory
+# and the control plane exits at boot — which only ever bites the published-image
+# path, because compose's build target (Dockerfile.control) runs as root.
+RUN mkdir -p /var/lib/quasar-control && chown quasar:quasar /var/lib/quasar-control
+
+USER quasar
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -fsS -o /dev/null http://localhost:8080/health || exit 1
+
+# Static Go binary handles its own signals — bypass quasar-base's tini +
+# PUID-switching entrypoint (that contract is for application images).
+ENTRYPOINT ["/usr/local/bin/quasar-control"]

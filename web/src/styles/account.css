@@ -1,0 +1,179 @@
+/* /app/account/* — the surfaces the console primitives do not already cover.
+   Ported from design_handoff_v3/screens/assets/console-v3.css (.dev*, .ae-fact*,
+   the 64px avatar) plus the few layout helpers these six pages need. */
+
+/* The account page column is narrower than the console's: every page here is a
+   form or a short table, and full width would strand the labels. */
+.page.ac-page {
+  max-width: 1000px;
+}
+
+/* ---- profile ---- */
+/* Avatar sits with the name, not centred against the whole text block. */
+.ac-id {
+  align-items: flex-start;
+}
+
+.ac-ava {
+  width: 64px;
+  height: 64px;
+  border-radius: var(--r-panel);
+  font-size: 1.6rem;
+}
+
+.ac-name {
+  font-family: var(--font-display);
+  font-size: var(--t-h2);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.ac-facts {
+  max-width: 420px;
+}
+
+.ac-pw {
+  max-width: 560px;
+}
+
+.ac-narrow {
+  max-width: 560px;
+}
+
+/* ---- devices ---- */
+.dev {
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-panel);
+  padding: var(--s4);
+  background: color-mix(in oklch, var(--surf-raised) 60%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+}
+
+/* Wraps because a named current device that is also streaming carries three
+   things on this row and the card is only 288px. */
+.dev-head {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.dev-head > .grow {
+  min-width: 0;
+}
+
+.dev-key {
+  margin-top: 2px;
+}
+
+.dev-ico {
+  width: 32px;
+  height: 32px;
+  flex: none;
+  display: grid;
+  place-content: center;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-control);
+  color: var(--text-3);
+}
+
+.dev-ico svg {
+  width: 17px;
+  height: 17px;
+}
+
+.dev-name {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--t-base);
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+  border-bottom: 1px dashed var(--line-3);
+}
+
+.dev-name:hover {
+  color: var(--accent-text);
+  border-bottom-color: var(--accent);
+}
+
+.dev-live {
+  flex: none;
+  align-items: center;
+  margin-left: auto;
+}
+
+/* The label reads first and the control sits at the far edge; Switch renders
+   control-then-label, so the row reverses it rather than splitting the label
+   off into a second element the switch would not be named by. */
+.dev-trust {
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.dev-trust .switch-row {
+  flex-direction: row-reverse;
+  justify-content: space-between;
+  width: 100%;
+}
+
+.dev-foot {
+  align-items: center;
+  gap: var(--s3);
+}
+
+.dev-foot .ml-auto {
+  margin-left: auto;
+}
+
+/* ---- overlay preferences ---- */
+.ac-fieldset {
+  border: none;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+
+/* The segmented control is as wide as its options, not as wide as the card. */
+.ac-fieldset .field > .segmented {
+  align-self: flex-start;
+}
+
+.ac-group {
+  margin-bottom: 6px;
+}
+
+.ac-sw {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.ac-sw .switch-row {
+  flex-direction: row-reverse;
+  justify-content: space-between;
+  width: 100%;
+}
+
+/* ---- storage ---- */
+.ac-stat {
+  font-size: var(--t-lg);
+  color: var(--text);
+  margin-top: 5px;
+}
+
+.ac-size {
+  color: var(--text-2);
+}
+
+/* ---- sessions ---- */
+.ac-dur {
+  display: block;
+  text-align: right;
+}

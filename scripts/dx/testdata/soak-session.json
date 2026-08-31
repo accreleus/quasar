@@ -1,0 +1,32 @@
+{
+  "kind": "session",
+  "id": "defecc13-a690-4687-95dd-3c7ddc0b1d69",
+  "state": "running",
+  "app_name": "KDE Desktop",
+  "host_name": "devbox",
+  "launch": [
+    1920,
+    1080
+  ],
+  "fps": 60,
+  "bitrate_kbps": 15000,
+  "codec": "h264",
+  "external_resize_supported": true,
+  "rungs": [
+    [
+      1920,
+      1080
+    ],
+    [
+      1600,
+      900
+    ],
+    [
+      1280,
+      720
+    ]
+  ],
+  "profile": "ladder",
+  "duration_s": 180.0,
+  "started_at_ms": 1786845900000
+}

@@ -1,0 +1,129 @@
+---
+title: Uninstalling
+description: Stopping cleanly, what a volume wipe destroys, and what it leaves behind.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+There is no uninstall script. Removal is a Compose command plus some manual
+cleanup.
+
+## Stop, keeping everything
+
+```bash
+docker compose -f deploy/docker-compose.yml down
+```
+
+Containers stop, volumes are untouched. Bring it back with the same deploy
+command and everything is as you left it.
+
+This is what you want for maintenance.
+
+## Stop and destroy the state
+
+```bash
+docker compose -f deploy/docker-compose.yml down -v
+```
+
+<Aside type="danger" title="No confirmation, no undo">
+There is no prompt. This is a plain Docker volume removal.
+</Aside>
+
+Destroyed:
+
+- **The database.** Every user, app, host, session and entitlement. Gone.
+- **The agent's enrollment secret.** The agent will re-enroll using the token.
+- **The TLS certificate.** A new one is generated on next boot, with a new
+  fingerprint, so every client re-trusts.
+- **The artwork cache.** Re-fetched.
+
+Not destroyed:
+
+- **User home directories**, if you configured a host path. They are a bind
+  mount, not a Compose volume, so `down -v` never touches them. This is
+  deliberate, and it is the reason a host path is the better storage choice.
+- **Container images.**
+- **`deploy/.env`**, secrets and all.
+
+## Full removal
+
+<Steps>
+
+1. **Drain and stop additional agents** using the agent-only packaging you
+   installed on those machines. The shipped base Compose file is a complete
+   stack, not a safe generic command for a second host.
+
+2. **Take a final backup** if there is any chance you want the data. See
+   [Backup and restore](/quasar/operations/backup/).
+
+3. **Bring the stack down with volumes.**
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml down -v
+   ```
+
+4. **Remove the home directories.** Resolve the effective root for every host
+   under Admin, Fleet, Hosts and verify each exact path before removal. These are
+   everyone's save games; there is no universal path once per-host roots are in
+   use.
+
+   ```bash
+   sudo rm -rf -- <verified-managed-home-root>
+   ```
+
+5. **Remove the images.**
+
+   ```bash
+   docker image ls --filter reference='ghcr.io/accreleus/quasar/*'
+   docker image rm <verified-image-id-or-digest>
+   ```
+
+   App images pulled or built by Quasar are also on the host. List them before
+   removing, and be careful with a blanket prune if you have other things on this
+   machine.
+
+6. **Remove the environment file.**
+
+   ```bash
+   shred -u deploy/.env
+   ```
+
+7. **Remove the checkout.** First leave it, print its absolute path, and verify
+   that no backups or unrelated files were placed inside it. Delete that exact
+   directory using your normal file-management tool.
+
+</Steps>
+
+## Host changes to undo
+
+Quasar asks you to make three changes outside Docker. None are removed by any of
+the above.
+
+The socket buffer sysctl:
+
+```bash
+sudo rm /etc/sysctl.d/99-quasar.conf
+```
+
+The uinput module load, if you added it and nothing else needs it:
+
+```bash
+sudo rm /etc/modules-load.d/uinput.conf
+```
+
+Any TLS certificate you added to your machines' trust stores.
+
+## Removing one host from a fleet
+
+Do not tear down the whole deployment for this.
+
+<Steps>
+
+1. Drain the host in Admin, Fleet, Hosts so it stops taking new sessions.
+2. Wait for its sessions to finish.
+3. Stop the agent on that machine.
+4. Forget the host in Admin, Fleet, Hosts.
+
+</Steps>
+
+Its home directories stay where they are. Move or delete them deliberately.

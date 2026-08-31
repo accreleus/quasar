@@ -1,0 +1,364 @@
+/* ============================================================
+   Legacy app-level sheet: the rules with no home in the v3 layer yet — the
+   global focus ring, the centered login/404 screen, the live session view,
+   the diagnostics value language the HUD's stats pane reads, and the route
+   skeleton/error states.
+
+   Imported after styles/tokens.css and styles/base.css in main.tsx, so its
+   rules shadow theirs where the two overlap. Pending retirement: put new
+   rules in the v3 sheets, not here.
+   ============================================================ */
+
+/* ---------- BASE ---------- */
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+/* ---------- A11Y: GLOBAL FOCUS RING ----------
+   A single visible focus-visible ring on every interactive element,
+   keyed off a token outline. Component-level rings (.btn, .input, …)
+   still apply their own richer treatment; this is the floor so that
+   links, nav pills, cards-as-buttons, table rows and bare controls
+   never focus invisibly. Mouse focus stays clean (:focus-visible). */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible,
+[role="button"]:focus-visible,
+.qtable tbody tr:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--r-xs);
+}
+
+/* ---------- LAYOUT: full-screen centered (login, 404, loading) ---------- */
+.centered-screen {
+  min-height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--s6);
+}
+
+/* ---------- GENERIC PAGE ---------- */
+.page h2 {
+  margin-top: 0;
+}
+
+/* ---------- SESSION (fullscreen, dark-locked) ---------- */
+.session-root {
+  position: fixed;
+  inset: 0;
+  background: #000;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Stable video wrapper — flex:1 + min-height:0 so it fills the session-root
+   column. The <video> lives inside it, so its DOM node survives
+   isDeep/loaderDone state changes; a remount loses srcObject and gaps RVFC. */
+.session-video-wrap {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+/* flex:1 + min-height:0 — do NOT add height:100% (CLAUDE.md gotcha). */
+/* AS10-14: data-scaling-mode drives CSS-only presentation — never triggers
+   WebRTC renegotiation. Default (contain) is letterbox; cover crops to fill;
+   stretch fills with distortion; integer uses pixelated rendering. */
+/* Touch: the picture is a game surface, not a document.
+   `touch-action: none` is load-bearing for the gesture layer in
+   input/capture.ts — without it iOS starts interpreting a drag as a pan and
+   fires pointercancel partway through, so a look-drag would stall a few frames
+   in. The callout/selection suppressions kill the iOS press-and-hold menu
+   ("Save Video…"), which would otherwise cover the screen at exactly the
+   moment a long-press becomes a right click.
+   Deliberately scoped to `.session-video`: pinch-zoom and scrolling elsewhere
+   in the app, and on every non-session page, are untouched. */
+.session-video {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  object-fit: contain;
+  background: #000;
+  display: block;
+  touch-action: none;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.session-video[data-scaling-mode="cover"] {
+  object-fit: cover;
+}
+.session-video[data-scaling-mode="stretch"] {
+  object-fit: fill;
+}
+.session-video[data-scaling-mode="integer"] {
+  object-fit: contain;
+  image-rendering: pixelated;
+}
+
+/* AS10-14: scaling mode select (standalone control, dark session chrome). */
+.session-scaling-select {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--r-xs);
+  color: var(--text);
+  font-size: var(--t-sm);
+  padding: var(--s1) var(--s2);
+  cursor: pointer;
+  min-height: 36px;
+}
+/* `:not(:disabled)` is load-bearing, not decoration: without it a select
+   locked mid-request still lit up under the pointer, which read as "clickable,
+   just ignoring you". */
+.session-scaling-select:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+/* Matches the global disabled control treatment (`.btn:disabled`,
+   components.css) rather than inventing a second opacity for the session
+   chrome. `progress`, not `not-allowed`: on these selects disabled ONLY ever
+   means "a display PATCH is in flight" — a transient wait, not a refusal. */
+.session-scaling-select:disabled {
+  opacity: 0.42;
+  cursor: progress;
+}
+
+
+/* Host-lost overlay — shown when the host went offline mid-session. */
+.session-lost {
+  justify-content: center;
+  align-items: center;
+}
+
+.session-lost-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: var(--s8) var(--s9);
+  max-width: 480px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s4);
+}
+
+.session-lost-card h2 {
+  margin: 0;
+  font-size: var(--t-h3);
+}
+
+.session-lost-card p {
+  margin: 0;
+  line-height: 1.6;
+}
+
+/* The diagnostics value language, now read by the HUD's stats pane. The
+   panel shell it came from retired with DiagPanel. */
+/* A codec disagreement between server and browser is a real defect signal. */
+.diag-warn {
+  color: var(--warning-text);
+}
+.diag-table td.diag-note {
+  text-align: left;
+  white-space: normal;
+  font-family: var(--font-ui);
+  font-size: var(--t-xs);
+  padding-top: 0;
+}
+
+.diag-table {
+  border-collapse: collapse;
+  width: 100%;
+  padding: var(--s2) 0;
+}
+.diag-table td {
+  padding: 3px var(--s4);
+  white-space: nowrap;
+  color: var(--text-3);
+}
+.diag-table td:last-child {
+  text-align: right;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.diag-dim {
+  color: var(--text-4);
+}
+
+/* AS10-06 — stream-health banner (overlays above the bottom status bar). */
+/* Floats over the live stream like the other HUD surfaces, so it gets the same
+   glass treatment they do (it previously had a flat --surface-2 fill, no
+   shadow, and state carried only by a 1px border — which read as decoration
+   rather than an alert). State is carried the way .toast carries it: a
+   left-edge accent plus the matching -bg/-line tint from the token set. */
+/* Bottom-anchored stack for the connection hint + every health banner. Each of
+   those used to carry its own `position: absolute; bottom: …`, so two visible at
+   once occupied the same box — a recovery banner over an unsustainable banner
+   overlapped exactly. They are flow children of this column now, which makes
+   overlap structurally impossible rather than a matter of tuned offsets.
+
+   `bottom: 78px` clears the status strip's own box (22px offset + 44px tall);
+   the strip is a fixed sibling, so nothing here can reflow it. */
+.session-bottom-stack {
+  position: absolute;
+  left: 50%;
+  bottom: 78px;
+  transform: translateX(-50%);
+  z-index: 21;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s3);
+  width: calc(100% - 32px);
+  max-width: 640px;
+  /* Click-through when empty (and between items); each child opts back in. */
+  pointer-events: none;
+}
+.session-bottom-stack > * {
+  pointer-events: auto;
+}
+
+@media (max-width: 640px) {
+  .session-bottom-stack {
+    bottom: calc(78px + env(safe-area-inset-bottom, 0px));
+    width: calc(100% - 16px);
+  }
+  .session-lost-card {
+    padding: var(--s6) var(--s4);
+    margin: 0 var(--s3);
+  }
+}
+
+/* perf: while streaming (data-streaming on <html>, set by useDarkLock), lighten
+   the blur on every glass surface drawn over the video. Still glassy; half the
+   radius, saving roughly half the per-frame compositing cost. */
+[data-streaming] .hud,
+[data-streaming] .banner,
+[data-streaming] .ev-toast,
+[data-streaming] .mic-hot {
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
+}
+
+/* Route-level loading and error states (components/RouteBoundary.tsx). Stable
+   geometry so a lazy chunk swapping in does not shift the page. */
+.route-skeleton {
+  min-height: 22rem;
+  padding: var(--s7);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+  animation: route-pulse 1.4s ease-in-out infinite;
+}
+
+.route-skeleton span,
+.route-skeleton__cards span {
+  display: block;
+  border-radius: var(--r-control);
+  background: color-mix(in srgb, var(--text-4) 14%, transparent);
+}
+
+.route-skeleton__title { width: min(20rem, 55%); height: 2rem; }
+.route-skeleton__line { width: min(34rem, 85%); height: .85rem; }
+.route-skeleton__line--short { width: min(24rem, 60%); }
+
+.route-skeleton__cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--s4);
+  margin-top: var(--s5);
+}
+
+.route-skeleton__cards span { height: 9rem; }
+
+.route-error {
+  max-width: 44rem;
+  margin: 10vh auto;
+  padding: var(--s7);
+  border: 1px solid var(--border);
+  border-radius: var(--r-panel);
+  background: var(--surf-panel);
+  box-shadow: var(--shadow-lg);
+}
+
+.route-error h1 { margin-top: var(--s2); }
+.route-error details { margin: var(--s5) 0; }
+
+.route-error code {
+  display: block;
+  padding: var(--s3);
+  overflow-wrap: anywhere;
+  background: var(--surf-inset);
+  border-radius: var(--r-control);
+}
+
+.route-error__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s3);
+}
+
+@keyframes route-pulse {
+  50% { opacity: .58; }
+}
+
+@media (max-width: 640px) {
+  .route-skeleton { padding: var(--s4); }
+  .route-skeleton__cards { grid-template-columns: 1fr; }
+  .route-error { margin: var(--s4); padding: var(--s5); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .route-skeleton { animation: none; }
+}
+
+/* Post-session summary on the home page (app/home/panels.tsx). */
+.session-summary {
+  display: grid;
+  grid-template-columns: minmax(12rem, 1fr) minmax(20rem, 2fr) auto;
+  align-items: center;
+  gap: var(--s5);
+  margin-bottom: var(--s6);
+  padding: var(--s5);
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border));
+  border-radius: var(--r-panel);
+  background: linear-gradient(120deg, color-mix(in srgb, var(--accent) 12%, var(--surf-panel)), var(--surf-panel));
+}
+
+.session-summary h2,
+.session-summary p { margin: 0; }
+
+.session-summary dl {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--s4);
+  margin: 0;
+}
+
+.session-summary dt { font-size: .75rem; color: var(--text-3); }
+
+.session-summary dd {
+  margin: .25rem 0 0;
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+
+@media (max-width: 800px) {
+  .session-summary { grid-template-columns: 1fr; }
+  .session-summary dl { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+

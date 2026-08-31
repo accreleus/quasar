@@ -1,0 +1,30 @@
+{
+  "manifest_version": 1,
+  "generated_note": "Quasar app-image catalog. Consumed by the Quasar control plane (GET /v1/admin/images + sync). This file is a contract surface: Quasar refuses a manifest_version it does not understand. See MANIFEST.md.",
+  "images": [
+    {
+      "id": "steam",
+      "display_name": "Steam",
+      "description": "Steam in a game-console experience through nested Gamescope (legacy Big Picture, the games-on-whales-validated game-foreground path). Needs a host --shm-size bump, 32-bit graphics libraries, and PUID/PGID matching the managed home.",
+      "kind": "prebuilt",
+      "version": "sha-4afbf76",
+      "registry_ref": "ghcr.io/accreleus/quasar-steam:sha-4afbf76",
+      "library_provider": "steam",
+      "artwork": {
+        "tile": "images/quasar-steam/artwork/tile.png"
+      },
+      "runtime": {
+        "preset_name": "Steam",
+        "gpu": true,
+        "no_new_privileges": false,
+        "managed_home": true,
+        "home_container_path": "/home/quasar",
+        "args": [],
+        "env": {},
+        "mounts": []
+      },
+      "min_quasar_version": "0.1.0",
+      "notes": "no_new_privileges MUST be false: Steam's startup re-escalates via sudo inside the container, which the default --security-opt no-new-privileges blocks (black bare compositor otherwise). This knob rides apps.runtime_spec, not the runtime_presets columns — see MANIFEST.md 'runtime mapping'."
+    }
+  ]
+}

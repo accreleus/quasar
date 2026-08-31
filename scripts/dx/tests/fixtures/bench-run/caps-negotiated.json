@@ -1,0 +1,9 @@
+{
+  "window": {"from_ms": 1786940000000, "to_ms": 1786940300000},
+  "events": [
+    {"ts_unix_ms": 1786940002000, "type": "caps.negotiated", "source": "agent",
+     "payload": {"trigger": "launch", "encoder_factory": "vulkanh264enc",
+                 "codec": "h264", "profile": "main", "level": "4.1",
+                 "size": {"w": 1920, "h": 1080, "fps": 120}}}
+  ]
+}

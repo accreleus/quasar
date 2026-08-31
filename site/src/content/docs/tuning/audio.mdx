@@ -1,0 +1,114 @@
+---
+title: Audio and microphone
+description: How audio reaches you, how to enable microphone capture, and the settings that stop a silent session going unnoticed.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## Game audio
+
+Audio is captured from the session's PulseAudio sidecar, encoded as Opus, and
+sent to your browser on its own peer connection, separate from video.
+
+The separation is deliberate. Audio and video get their own clock, jitter buffer
+and congestion state, so a video stream in trouble does not drag audio down with
+it.
+
+There is nothing to configure for normal use.
+
+## Failing loudly instead of silently
+
+By default, if the audio sidecar is unavailable, the session continues without
+sound. That is usually the right choice for a home setup, since silent play beats
+no play.
+
+It also means a misconfiguration can mute every session on a host for days with
+nothing but a warning in a log to show for it. That has happened.
+
+If you would rather know:
+
+```bash
+QUASAR_AUDIO_REQUIRED=1
+```
+
+The session then fails instead of degrading. Worth setting on anything you care
+about.
+
+Check the current state per session in Admin, Sessions. The detail carries
+whether audio degraded and why.
+
+<Aside type="caution" title="The sidecar image must match the agent image lineage">
+The PulseAudio sidecar has to come from the same image family as the agent. A
+mismatched image can lack the PulseAudio binary entirely, and the session then
+runs silently with only a warning logged.
+</Aside>
+
+## Microphone capture
+
+Microphone works, and it needs three separate things to be true.
+
+### 1. The administrator enables it
+
+Under Admin, Settings. It is off by default and it is enforced on the server. A
+launch that asks for a microphone while the instance setting is off succeeds
+without one rather than failing, on the grounds that a policy decision should not
+cost you your session.
+
+### 2. The user turns it on
+
+In the session drawer. Off at the start of every session, always. There is no
+setting that makes a microphone hot on connect.
+
+### 3. The browser grants permission
+
+The standard browser prompt. This requires a secure context, so plain HTTP
+deployments cannot use the microphone at all.
+
+## The indicator
+
+A live microphone shows a persistent indicator that cannot be dismissed or
+hidden. If the microphone is on, the user can see that it is on.
+
+## How it works, briefly
+
+The microphone is a second receive-only audio track on the existing audio
+connection, negotiated once when the session starts. Muting and unmuting toggles
+the track rather than renegotiating, so there is no session-level churn when you
+mute.
+
+Inside the container, a null sink and a remapped source present the microphone as
+a first-class capture device. This matters because Steam and many games hide
+monitor-class sources and would otherwise not offer it at all.
+
+## The host kill switch
+
+```bash
+QUASAR_MIC_DISABLED=1
+```
+
+Disables microphone capture at the agent, overriding everything above. For when
+you want a host that cannot capture audio regardless of what the instance
+settings say.
+
+## Chrome and the audio format
+
+Chrome requires the microphone track to be advertised as stereo Opus at 48 kHz.
+A mono declaration is rejected outright, and because the negotiation happens once
+at session start, there is no recovery within that session.
+
+Quasar gets this right. It is documented here because it explains why the
+microphone format is not configurable.
+
+## Troubleshooting
+
+**No sound at all.** Check the session detail for degraded audio. Then check the
+sidecar image matches the agent image lineage. Then set `QUASAR_AUDIO_REQUIRED=1`
+so the next occurrence fails visibly.
+
+**Microphone toggle missing.** The instance setting is off.
+
+**Microphone toggle present but does nothing.** Browser permission was denied, or
+the page is not on HTTPS.
+
+**Sound in some apps and not others.** The application is choosing a different
+output device. That is inside the container and is the app's own configuration.

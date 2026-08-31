@@ -1,0 +1,85 @@
+---
+title: Reaching Quasar remotely
+description: Use a VPN. Quasar is not built to be exposed directly to the internet.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="danger" title="Do not expose Quasar directly to the internet">
+Quasar is designed for a network you control. It has not been security reviewed,
+hardened, or tested against hostile traffic, and the maintainer actively
+discourages putting it on a public address. If you do it anyway, that is your
+call and your risk, and no support or responsibility is offered for what
+follows.
+
+Use a VPN. It is the answer this page recommends and the only remote setup that
+gets tested.
+</Aside>
+
+## Why a proxy is not enough
+
+Quasar has two network paths and they behave differently.
+
+**Control and signaling** go to the control plane over HTTPS and a WebSocket.
+That proxies fine. Put it behind a reverse proxy and you can log in and browse
+your library from anywhere.
+
+**Media** is WebRTC, straight between your browser and the GPU host: video,
+audio and input. It never touches the HTTP proxy. WebRTC uses host candidates,
+so the two ends have to reach each other directly by IP.
+
+So publishing the login page gets you a login page. The stream still needs a
+route to the GPU host, and if there is not one, ICE finds no working candidate
+pair and the session never starts even though you signed in perfectly well.
+
+## Use a VPN
+
+WireGuard or Tailscale put your client on the same routable network as the GPU
+host. Quasar then behaves exactly as it does on a LAN, because as far as it is
+concerned that is what it is on.
+
+Two things to get right.
+
+**The certificate has to name the address you use over the VPN.** If you reach
+Quasar at `10.8.0.5`, that address belongs in `QUASAR_TLS_HOSTS`. See
+[HTTPS and certificates](/quasar/network/https/).
+
+**The VPN has to carry UDP well.** Media is UDP and latency sensitive. A VPN
+that adds 60 ms and reorders packets makes the stream feel bad no matter how
+much bandwidth you have. Tailscale suits this because its connections are
+usually genuinely peer to peer. When it falls back to a relay for a particular
+pair of machines, you get that relay's latency and there is nothing Quasar can
+do about it.
+
+## On a LAN
+
+Nothing to configure beyond the certificate names. This is the design point.
+
+## Signaling through a proxy
+
+If you are proxying the control plane so that login works from elsewhere, two
+settings need attention. Both are covered in
+[Behind a reverse proxy](/quasar/network/reverse-proxy/).
+
+`PUBLIC_BASE_URL` matters when the proxy rewrites `Host`, so that invite links
+and the signaling address handed to the client do not point at a private
+listener. A proxy that forwards the public host can derive it from the request.
+
+The allowed-origins setting decides whether the signaling WebSocket accepts the
+browser's origin. Manage it under Admin, Settings, or override it with
+`QUASAR_ALLOWED_ORIGINS`.
+
+## When login works but sessions do not
+
+That combination almost always means the network path, not Quasar.
+
+1. Check the session under Admin, Sessions. If it sits at starting, or reaches
+   running with nothing on screen, the pipeline is fine and the connection is
+   not.
+2. Check the browser console for ICE state. Stuck at `checking` means no
+   candidate pair worked.
+3. Look at the selected candidate pair in the browser's WebRTC diagnostics and
+   confirm the client can route to the GPU host directly.
+
+A working login proves the control plane is reachable. It proves nothing about
+the media path.

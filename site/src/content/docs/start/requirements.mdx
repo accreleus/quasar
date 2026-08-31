@@ -1,0 +1,111 @@
+---
+title: Requirements
+description: What the host machine needs before you install Quasar, and what your client device needs to play.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+## The host machine
+
+**Linux only.** The node agent runs with `network_mode: host`, because WebRTC
+has to send UDP from the host's own network namespace. Docker Desktop on macOS
+and Windows cannot do that, so media will not work there at all. Any systemd
+distribution with Docker should be fine. Fedora 44 is what the install is
+verified on.
+
+**Docker Engine with Compose v2.20 or newer.**
+
+**About 20 GB of disk** for the images, plus room for game containers and save
+data.
+
+<Aside type="caution" title="Fedora's default root volume is too small">
+A stock Fedora install gives the root logical volume 15 GB. Grow it first with
+`lvextend` and `xfs_growfs`.
+</Aside>
+
+**CPU and RAM** matter less than you would think, because the GPU does the
+encoding. 8 vCPU and 32 GB is what the install is measured on. Less works.
+
+### GPU
+
+| Vendor | Encoder | Status |
+| --- | --- | --- |
+| AMD | Vulkan Video | Verified. |
+| NVIDIA | Vulkan Video | Verified. |
+| Intel | Vulkan Video or VA-API | Untested. Both paths exist and should work; nobody has run it. |
+| None | openh264, in software | Proves the install. Too slow and too ugly to play on. |
+
+NVIDIA hosts need the driver plus `nvidia-container-toolkit`, registered with
+Docker once:
+
+```bash
+sudo nvidia-ctk runtime configure
+sudo systemctl restart docker
+```
+
+<Aside type="caution" title="A CUDA-only NVIDIA install is not enough">
+The CUDA packages alone leave you without EGL and without 32-bit GL. The
+compositor needs EGL, and native 32-bit game binaries need the 32-bit libraries.
+Quasar can work around this by provisioning a driver volume, but installing the
+full driver stack is better. See
+[Install and startup problems](/quasar/troubleshooting/install/).
+</Aside>
+
+### Kernel
+
+`/dev/uinput` has to exist and be writable. That is how Quasar creates the
+virtual keyboard, mouse and gamepads.
+
+```bash
+sudo modprobe uinput
+echo uinput | sudo tee /etc/modules-load.d/uinput.conf
+```
+
+The compose file declares the device and the input cgroup rule, so loading the
+module is all you do.
+
+### One sysctl
+
+Raise the default UDP send buffer on every machine that streams:
+
+```bash
+echo 'net.core.wmem_default=2097152' | sudo tee /etc/sysctl.d/99-quasar.conf
+sudo sysctl --system
+```
+
+This one is not optional and nothing applies it for you. The media path sends
+through libnice, which never calls `setsockopt(SO_SNDBUF)`, so its UDP sockets
+inherit the kernel default of 208 KB. A keyframe burst at 8 Mbps overflows that,
+the kernel drops the overflow silently, and the bitrate estimator reads the loss
+as network congestion and throttles the stream. The symptom looks exactly like a
+bad network.
+
+### Firewall
+
+The control plane's ports are published through Docker, which routes them past
+the host firewall, so they need no rule. The node agent is different: it uses
+the host network directly, and a default-deny firewall will drop its WebRTC UDP.
+See [Ports and endpoints](/quasar/reference/ports/#firewall).
+
+SELinux can stay enforcing. That is verified, with no denials.
+
+## The client device
+
+Anything running a recent Chrome or Chromium browser that can reach the GPU host
+over the network.
+
+Chrome is what Quasar is validated against. Keyboard Lock, which is what lets
+Escape reach the game instead of leaving fullscreen, is Chromium-only. Firefox
+and Safari are untested. See [Browser support](/quasar/playing/browsers/).
+
+The page has to be served over HTTPS. Gamepads, Keyboard Lock and microphone
+capture all need a secure context, so a plain HTTP deployment loses all three.
+Quasar generates its own certificate on first boot, so this is handled for you.
+See [HTTPS and certificates](/quasar/network/https/).
+
+## Network
+
+Your client needs to reach the GPU host directly, on the same LAN or over a VPN.
+Media is WebRTC between the browser and the host, and it does not travel through
+a reverse proxy. Putting the login page on the internet does not put the stream
+there. See [Reaching Quasar remotely](/quasar/network/remote-access/).

@@ -1,0 +1,92 @@
+---
+title: What Quasar is
+description: Quasar runs games on GPU servers you own and streams them to a browser. Here is what it does, what it does not do, and who it suits.
+---
+
+Quasar is a self-hostable cloud gaming platform. Games run in containers on GPU
+machines you own, and you play them in a browser tab on whatever device is in
+front of you. The reference point most people find useful is GeForce Now, except
+the servers are yours and so is the library.
+
+A session looks like this. You log in, pick something from your library, and
+press play. Quasar finds a GPU host with capacity, starts the game in a
+container, captures its output through a Wayland compositor, encodes it on the
+GPU, and sends video, audio and input straight to your browser over WebRTC. When
+you close the tab, the session ends and the container stops.
+
+## What you get
+
+**Multiple GPU hosts, one library.** Quasar was built around a control plane
+that owns accounts and scheduling, and node agents that own GPUs. Add a second
+GPU box and it joins the pool. Sessions get placed on whichever host has room.
+
+**Multiple users.** Every user gets their own persistent home directory, their
+own save games, and their own entitlements to apps. Registration can be closed,
+invite-only, or open.
+
+**Hardware encoding on AMD, Intel and NVIDIA.** Auto-detection defaults AMD and
+NVIDIA to Vulkan Video and Intel to VA-API. Vendor encoders remain available as
+explicit choices and per-codec fallbacks. Frames can stay in GPU memory through
+the encode path.
+
+**Adaptive bitrate.** The stream measures the network continuously and adjusts.
+This is on by default and tuned for smoothness rather than for chasing the
+highest possible bitrate.
+
+**A browser client, with nothing to install.** Chrome and Chromium-based
+browsers on desktop. Gamepads work through the Gamepad API. Keyboard, mouse and
+touch work. There is no launcher and no client binary.
+
+**An admin area.** Apps, images, stream profiles, hosts, GPUs, sessions and
+users are all managed from `/admin` in the same web app.
+
+## What Quasar is not
+
+**It does not speak Moonlight or GameStream.** This is a deliberate and
+permanent decision, not a gap waiting to be filled. NVIDIA discontinued
+GameStream, and building on a dead protocol to reach existing clients was not
+worth the architecture it forces. Moonlight clients cannot connect to Quasar and
+never will.
+
+**It is not a game store.** Quasar launches container images. Getting games into
+those containers is your problem, the same way it is on any self-hosted setup.
+Steam is supported as a library provider, so a Steam container can surface your
+owned titles as launchable tiles.
+
+**It is not built to face the internet.** Play happens over a LAN or a VPN.
+Quasar has not been security reviewed or tested against hostile traffic, and
+exposing it on a public address is discouraged. See
+[Reaching Quasar remotely](/quasar/network/remote-access/).
+
+**It has no native client yet.** The browser is the only client. A native client
+is planned and some of the groundwork exists, but nothing is shippable.
+
+## Who this suits
+
+Quasar suits you if you already run a homelab, own a machine with a decent GPU
+that sits idle most of the day, and want to play the games on it from a laptop,
+a tablet, or a TV without moving hardware around. It suits households where one
+GPU is shared. It suits anyone who wants their save games on storage they
+control.
+
+It suits you less if you want to play over the public internet from anywhere
+with no VPN, if you want a one-click appliance, or if you are not comfortable
+with Docker and a Linux host.
+
+## Where Quasar came from
+
+Quasar reuses two components from the [Wolf](https://github.com/games-on-whales/wolf)
+project (MIT): the `gst-wayland-display` Wayland compositor and `inputtino`
+virtual input. Both are excellent and there was no reason to rewrite them.
+
+Quasar goes a different direction from Wolf rather than replacing it. Wolf grew
+from a single-host, single-user core and speaks Moonlight. Quasar starts from
+multi-host and multi-user, and streams to browsers. If Moonlight compatibility
+is what you want, Wolf is the better answer and you should use it.
+
+## Next
+
+- [How it works](/quasar/start/how-it-works/) explains the moving parts you will
+  meet in the admin area.
+- [Requirements](/quasar/start/requirements/) tells you whether your hardware
+  qualifies before you spend 25 minutes on a build.

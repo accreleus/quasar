@@ -1,0 +1,21 @@
+# Build contexts for deploy/Dockerfile.{dev,nv}. Without this, host-side build
+# artifacts ride into the image's `COPY . /workspace` layer — measured 6.2 GB of
+# a 16.6 GB quasar-agent-dev (node-agent/target 4.6 GB + spike/host/target 1 GB).
+**/target
+web/node_modules
+web/dist
+deploy/results
+.git
+*.log
+
+# Local env / secrets — never bake into a layer
+deploy/.env
+**/.env
+**/*.pem
+
+# Agent/editor state and heavy non-build assets
+.claude
+.omc
+.playwright-mcp
+ui-evidence
+design_handoff_v3

@@ -1,0 +1,54 @@
+---
+title: GPU and remote workflows
+description: How contributors validate changes on a fleet host without bypassing Quasar's deployment and diagnostic tooling.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+GPU and streaming work must be validated on a Linux GPU host. Address a host by
+its configured role or hostname and pass it explicitly:
+
+```bash
+make status HOST=<role-or-host>
+make session-list HOST=<role-or-host>
+```
+
+The host map used by repository tooling lives at
+`.claude/skills/_shared/hosts.json`. Keep real hostnames out of prose and scripts;
+roles let the same workflow run in different environments.
+
+## Deploy the component that changed
+
+| Changed | Command | Expected cost |
+| --- | --- | --- |
+| Go control plane only | `make redeploy-cp HOST=<role-or-host>` | About one minute |
+| Rust, GStreamer, or agent image | `make rebuild HOST=<role-or-host>` | 40 minutes or more |
+
+Both commands accept `REF=<branch-or-sha>` and otherwise preserve the branch the
+host is already testing. Do not call `deploy/redeploy.sh` remotely with an
+implicit ref: its own default can move the host back to `origin/main` while a
+test is in progress.
+
+Images are built only through `deploy/build-images.sh` and the Makefile wrappers.
+Do not substitute a hand-written `docker build` or weaken
+`deploy/image-contract.json` to make a candidate pass.
+
+<Aside type="danger" title="Remote mutation is explicit">
+Starting, stopping, rebuilding, or redeploying a remote stack requires an
+explicit `HOST=`. Destructive fleet, database, volume, or image operations still
+require operator authorisation.
+</Aside>
+
+## Inspect a live session
+
+```bash
+make session-verdict SID=latest HOST=<role-or-host>
+make session-diagnose SID=latest HOST=<role-or-host>
+make session-metrics SID=latest HOST=<role-or-host> SINCE=5m
+make session-trace SID=latest HOST=<role-or-host>
+make session-logs SID=latest HOST=<role-or-host> SINCE=10m
+```
+
+Use these bounded commands before reaching for raw SQL or unbounded log streams.
+For multi-run comparisons, impairment experiments, and soak reports, follow the
+current workflow documented in `AGENTS.md` and `docs/developer-tooling.md`.

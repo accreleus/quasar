@@ -1,0 +1,168 @@
+---
+title: HTTPS and certificates
+description: Quasar generates its own certificate on first boot. How to trust it properly, and how to supply your own instead.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+HTTPS is not optional here. Gamepads, Keyboard Lock and microphone capture all
+need a secure context, so an HTTP-only deployment quietly loses three features.
+
+You do not have to obtain a certificate. Quasar generates one on first boot and
+keeps it.
+
+## The default: Quasar's own certificate
+
+On first boot the control plane writes a self-signed certificate into its state
+directory and reuses it from then on. Nothing to configure, and no re-prompting
+after a restart.
+
+The one thing you must get right is which names it claims. Set them before you
+start the stack:
+
+```bash
+QUASAR_TLS_HOSTS=192.168.1.50,quasar.lan
+```
+
+List every address anyone will type into a browser. LAN IP, hostname, VPN
+address, all of them.
+
+<Aside type="caution" title="Without this you get a name error, not a trust prompt">
+Left unset, the certificate names `localhost`, the loopback addresses, and
+whatever the control plane can see on its own interfaces. That last set is the
+trap: it runs in a container, so it sees a Docker bridge address like
+`172.18.0.3` and never the host's real LAN address.
+
+Visit `https://192.168.1.50:8443` and you get `ERR_CERT_COMMON_NAME_INVALID`.
+Clicking through does not help, because the certificate does not claim that
+address at all. There is nothing to trust.
+</Aside>
+
+## Trusting it on your devices
+
+Accepting the browser warning works, but you redo it per browser and per device,
+and it leaves the padlock struck through. Installing the certificate in your
+operating system's trust store fixes it once per machine.
+
+Download it straight from the server:
+
+```bash
+curl -k https://<host-ip>:8443/v1/tls/certificate.pem -o quasar.pem
+```
+
+That endpoint needs no login, which is deliberate and safe. A server
+certificate is public by definition: every TLS handshake hands the same bytes to
+every client that connects, before any authentication happens. Anyone who can
+reach port 8443 can already read it with `openssl s_client`. The route serves the
+leaf only, re-encoded from the parsed certificate rather than read off disk, so
+there is no file path that could point at a key. The private key is never
+returned by any route.
+
+Add `quasar.pem` to your platform's trust store. On macOS that is Keychain
+Access, set to Always Trust. On Windows it is the Trusted Root Certification
+Authorities store. On Linux it varies by distribution, usually
+`/usr/local/share/ca-certificates` followed by `update-ca-certificates`.
+
+Trusting it only helps if it names the address you actually use, so fix
+`QUASAR_TLS_HOSTS` first.
+
+### Check the fingerprint first
+
+On a LAN you control, clicking through is reasonable. On a network you do not
+control it is not, and first contact is exactly when it matters, because that is
+when the founding admin account gets claimed.
+
+The control plane logs the fingerprint at startup. Compare it against what your
+browser shows:
+
+```bash
+docker compose -f deploy/docker-compose.yml logs quasar-control-plane | grep fingerprint
+```
+
+## Adding a name later
+
+The certificate is generated once and kept for ten years, so adding a name to
+`QUASAR_TLS_HOSTS` afterwards does nothing by itself. Delete the certificate and
+let it regenerate.
+
+<Steps>
+
+1. Add the name to `QUASAR_TLS_HOSTS` in `deploy/.env`.
+
+2. Delete the existing pair.
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml exec quasar-control-plane \
+     rm -f /var/lib/quasar-control/tls/cert.pem /var/lib/quasar-control/tls/key.pem
+   ```
+
+3. Recreate the container.
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml up -d --force-recreate quasar-control-plane
+   ```
+
+</Steps>
+
+The new certificate has a new fingerprint, so every browser that accepted the
+old one warns again, and every machine you added it to needs the new one.
+
+## Supplying your own certificate
+
+If you have a certificate already, from an internal certificate authority or a
+public one for a name you own, Quasar will serve it instead. Mount both PEM
+files into the container and point at them:
+
+```bash
+QUASAR_TLS_CERT=/etc/quasar/tls/cert.pem
+QUASAR_TLS_KEY=/etc/quasar/tls/key.pem
+```
+
+Set both or neither. One alone is a configuration error and the control plane
+refuses to start.
+
+What the certificate needs:
+
+- **Every browser-facing name as a subject alternative name.** LAN IP, hostname,
+  VPN address, public name if you have one. Modern browsers ignore the common
+  name entirely and read only the SAN list. IP addresses go in as IP SANs, not
+  DNS SANs.
+- **The full chain in the certificate file**, leaf first, then intermediates. A
+  leaf on its own validates in `curl` on your machine and fails in a browser
+  somewhere else.
+- **An unencrypted private key.** There is nowhere to type a passphrase at boot.
+- **Extended key usage including server authentication**, which is the default
+  for anything issued as a server certificate.
+
+The node agent and `/health` talk to the control plane over plain HTTP on 8080
+and are exempt from the HTTPS redirect, so your certificate only ever has to
+satisfy browsers.
+
+## Behind a reverse proxy
+
+If your own proxy terminates TLS and forwards to Quasar, its certificate is the
+one browsers see and Quasar's own is irrelevant. Check the allowed origins under
+Admin, Settings: a proxy that preserves the public host may work with the
+same-origin default, while a host-rewriting proxy or several public names needs
+an explicit list. See [Behind a reverse proxy](/quasar/network/reverse-proxy/).
+
+## Turning TLS off
+
+```bash
+QUASAR_TLS=off
+```
+
+HTTP only, and you lose gamepads, Escape capture and microphone with it. Only do
+this when something in front of Quasar is providing HTTPS.
+
+## Settings
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `QUASAR_TLS` | `auto` | `auto` generates and keeps a self-signed pair. `off` disables the listener. |
+| `QUASAR_TLS_HOSTS` | unset | Names and IPs the generated certificate claims. |
+| `QUASAR_TLS_CERT` / `QUASAR_TLS_KEY` | unset | Your own PEM files. Set both. |
+| `QUASAR_TLS_ADDR` | `:8443` | The HTTPS listener. |
+| `LISTEN_ADDR` | `:8080` | The HTTP listener. |
+| `QUASAR_HTTP_REDIRECT` | `auto` | Redirects browser routes from HTTP to HTTPS. |
+| `QUASAR_TLS_REDIRECT_PORT` | the TLS port | The external port to redirect to, when it differs. |

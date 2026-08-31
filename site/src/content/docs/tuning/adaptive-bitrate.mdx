@@ -1,0 +1,130 @@
+---
+title: Adaptive bitrate
+description: What ABR does, the two modes, when to change mode, and how to turn it off.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Adaptive bitrate measures the connection continuously and moves the encoder's
+target bitrate to match. It is on by default in `smooth` mode, and for most
+deployments that is the end of the story.
+
+## Why it exists
+
+A fixed bitrate is wrong almost all the time. Set it high and any congestion
+turns into dropped packets and visible corruption. Set it low and you waste a
+good connection.
+
+ABR watches round trip time, packet loss and the congestion controller's
+bandwidth estimate, and moves the target as conditions change.
+
+## The two modes
+
+Set with `QUASAR_ABR_MODE`, globally in `deploy/.env` or per host under Admin,
+Hosts, Settings.
+
+### `smooth`, the default
+
+Tuned for how a stream feels rather than for maximising bitrate.
+
+The key behaviour is on the way down. When the encoder is already saturated, a
+non-emergency reduction is capped at 12.5 percent per step with a seven second
+wait between steps, and the congestion controller alone cannot force a large
+cliff. The theory is that a large sudden drop is more visible than a slightly
+too-high bitrate held for a few more seconds.
+
+The emergency path is preserved. A confirmed network congestion window still
+triggers a fast single-step descent.
+
+Measured against `protective` under induced congestion: presentation interval
+variation at the 95th percentile fell from about 69 ms to about 19 ms, and
+freezes fell from 14 to 2. On a clean path the two modes are indistinguishable.
+
+### `protective`
+
+The older governor. One step down when it sees trouble, gradual ramp back up.
+More willing to drop hard and fast.
+
+Worth trying if `smooth` behaves oddly on your hardware, particularly if the
+encoder speed ladder causes problems.
+
+### `off`
+
+Fixed bitrate at whatever the tier specifies. The congestion controller stays
+attached for telemetry but never moves the encoder.
+
+Reasonable on a dedicated wired LAN where the bandwidth genuinely is not going to
+change. Not reasonable over WiFi.
+
+## Turning it off
+
+```bash
+QUASAR_ABR_MODE=off
+```
+
+Or the older aliases, which still work:
+
+```bash
+QUASAR_ABR=0
+```
+
+## The floor
+
+ABR will not reduce below a floor, so a bad moment cannot leave you at an
+unwatchable bitrate.
+
+By default the floor is 30 percent of the tier's bitrate, clamped to at least
+500 kbps. Set it explicitly with `QUASAR_ABR_FLOOR_KBPS`, or change the ratio
+with `QUASAR_ABR_FLOOR_RATIO`.
+
+## The encoder speed ladder
+
+In `smooth` mode, sustained encoder saturation escalates the encoder's speed
+setting rather than only cutting bitrate. Trading some compression efficiency for
+encode time is often the better deal when the GPU is the bottleneck rather than
+the network. It unwinds after four healthy windows.
+
+Disable it with `QUASAR_ABR_LADDER=0`.
+
+<Aside type="note" title="Resolution and frame-rate rungs are opt-in">
+`QUASAR_ABR_LADDER_RESOLUTION` and `QUASAR_ABR_LADDER_FPS` are implemented but
+default off. Both require `smooth` mode and apply to the next session. The FPS
+rung halves 120 fps to 60 and restores it; a 60 fps launch has no lower FPS rung.
+The resolution rung moves through the session's supported external-size ladder.
+Support depends on the active codec and image; Vulkan HEVC cannot resize live.
+</Aside>
+
+## Hardware only, really
+
+ABR is validated on hardware encoders. On software encoding it barely functions,
+because openh264 cannot saturate a 1080p stream at 8 Mbps, so the congestion
+controller never observes congestion to react to.
+
+If you are on software encoding, ABR is not the reason your stream is poor.
+
+<Aside type="caution" title="NVENC can overshoot">
+On high-entropy content NVENC sometimes produces more bits than the target ABR
+set. The controller compensates, but a stream that persistently sits above its
+setpoint on busy scenes is a known behaviour rather than a misconfiguration.
+</Aside>
+
+## Watching it work
+
+Admin, Sessions, session detail plots the ABR setpoint against the congestion
+controller's estimate. The gap between the two is the smoothing that `smooth`
+mode is adding.
+
+A setpoint sawtoothing rapidly means the controller is fighting something. Look
+at loss and round trip time in the same window before assuming it is the
+controller's fault.
+
+## Fine tuning
+
+There are roughly fifteen further settings covering the governor's hysteresis:
+smoothing factor, deadband, maximum step sizes, dwell times, cliff guard
+fractions. Every default matches the value that used to be hardcoded, so leaving
+them alone reproduces the tested behaviour exactly.
+
+Do not touch them without a measurement to compare against. See
+[Diagnostics](/quasar/operations/diagnostics/) for how to take one. The full list
+is in [Environment variables](/quasar/reference/environment/).

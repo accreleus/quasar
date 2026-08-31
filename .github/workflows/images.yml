@@ -1,0 +1,858 @@
+name: Images
+
+# Builds and publishes the production container images. Publishing to GHCR is
+# MANUAL ONLY (workflow_dispatch → Actions tab → "Images" → Run workflow) —
+# during rapid development images are built locally on the deploy hosts
+# (deploy/redeploy.sh); nothing is pushed automatically on merge.
+#
+# ── BUILD IS SPLIT FROM PROMOTION (2026-08-31) ────────────────────────────────
+#
+# Before this split, one job did `docker/build-push-action` with `push: true` and
+# the repo's own gates — deploy/build-images.sh, deploy/validate-image.sh,
+# deploy/image-contract.json, scripts/release/ — appeared here only inside
+# comments. A dispatch could therefore publish `:latest` for an image the
+# canonical local builder would have refused, and the toolchain lane re-tagged one
+# GHCR package into another with no check at all.
+#
+# The lane is now four phases, and the ONLY thing that ever moves a tag a consumer
+# follows is the last one:
+#
+#   inputs      resolve the quasar-base digest once, so every artifact in a run is
+#               built FROM the same bytes (a moving `:latest` base could otherwise
+#               give the two lanes different foundations in the same publish).
+#   build-*     push the artifact BY DIGEST (`push-by-digest=true`, no `tags:`).
+#               The manifest lands in GHCR as an untagged version. Nothing —
+#               `:latest`, `:X.Y.Z`, `sha-*`, a branch name — points at it yet, so
+#               a build that turns out to be broken is invisible to every puller.
+#   validate-*  pull that exact digest and run deploy/validate-image.sh against
+#               deploy/image-contract.json. Token is `packages: read`: the job that
+#               judges an artifact cannot publish one.
+#   preflight   scripts/release/release-preflight.sh over the whole candidate
+#               (pin drift, patches, compose inputs, submodule identity, and — on a
+#               release-tag dispatch — that every artifact and the base are exact
+#               digest references). Token is `contents: read` only.
+#   promote     `docker buildx imagetools create` the real tag set ONTO the
+#               validated digest. Registry-side, no rebuild, no re-resolution.
+#
+# WHY THE DIGEST CANNOT BE SWAPPED. `build-*` emits `steps.build.outputs.digest`;
+# every later job consumes `needs.build-*.outputs.digest` and composes the
+# reference itself. At no point between the build and the promotion does anything
+# resolve a tag — there is no tag to resolve. A registry cannot serve different
+# bytes for one digest, so "the thing validated" and "the thing promoted" are the
+# same object by construction, not by timing.
+#
+# FAILURE LEAVES CONSUMERS WHERE THEY WERE. Both images promote or neither does
+# (`promote` needs every validate job). Inside `promote`, the pre-promotion
+# `:latest` digest of each package is recorded first and restored by an
+# `if: failure()` step, so a partial run cannot strand half a publish.
+#
+# RUNNER DISK. No job uses `load: true`. Exporting a multi-GB image into the
+# runner's docker daemon on top of the build cache is what makes these lanes run
+# out of space; pushing by digest and pulling only in the (separate, cheap)
+# validate job keeps each job's footprint to one copy of one image. The node-agent
+# build still frees the preinstalled toolchains up front — its `build` stage
+# (patched GStreamer + CUDA toolkit + Rust) needs the headroom even with the
+# toolchain image doing the heavy lifting.
+#
+# UNTAGGED VERSIONS ARE NOT CLEANED UP. A failed candidate stays in GHCR as an
+# untagged package version. GITHUB_TOKEN cannot be granted `delete:packages`
+# through the `permissions:` key, so pruning them is a manual step in the GHCR UI
+# (Package → Versions → untagged). They cost storage, not correctness.
+#
+# NOTE for future image additions: ghcr.io/games-on-whales/gst-wayland-display
+# images are NOT usable as a base for a node-agent image — they are built with
+# `-Dauto_features=disabled` (no webrtcbin, no rtpgccbwe). The node-agent image
+# must build gst-wayland-display / gst-interpipe / gst-plugins-rs from source at
+# the pinned refs (docs/third-party-pins.md).
+#
+# Consumption story (issue #449 — self-hosters previously had to compile
+# GStreamer + the Rust agent from source, ~25 min / ~25 GB per install):
+# this workflow is the ONLY thing that publishes the two runtime images a
+# self-hoster (or a deploy host) actually pulls:
+#   ghcr.io/accreleus/quasar/quasar-control-plane (control plane, prod target)
+#   ghcr.io/accreleus/quasar/quasar-node-agent    (the universal node agent —
+#                                                     AMD/Intel VA, Vulkan AND NVIDIA)
+# There were three until #545 retired the separate NVIDIA image (quasar-nv). An NVIDIA
+# host pulls quasar-node-agent like everyone else and the agent fetches the CUDA
+# userspace it needs at run time; the difference is the compose overlay, not the image.
+# `deploy/` compose consumes these via QUASAR_NODE_IMAGE (the base/nvidia
+# overlays already parameterize the agent image tag) and, on the release
+# overlay, via QUASAR_CONTROL_IMAGE / QUASAR_AGENT_IMAGE digest pins — so a
+# self-hoster on that overlay never runs a from-source build.
+
+# Versioned release tags — the design, so nobody has to infer it from the tag
+# blocks below (issue #510):
+#
+#   The version comes from the REF THE WORKFLOW IS DISPATCHED ON, not from a
+#   free-text input. Dispatch this workflow with the Actions tab's ref selector
+#   set to the release tag (`v0.1.0`), and each published image additionally
+#   gets a `:X.Y.Z` tag — `docker/metadata-action`'s `type=semver` rule reads
+#   `refs/tags/vX.Y.Z` and strips the `v`.
+#
+#   Tag-detect was chosen over an optional `version:` dispatch input on purpose.
+#   An input can be typed while the ref selector still points at `develop`,
+#   which would publish `:0.1.0` built from a tree that is not the tagged one —
+#   a provenance hole with no way to notice it after the fact. With tag-detect
+#   the image contents and the version tag cannot disagree by construction,
+#   which is the same rule deploy/image-contract.json applies to everything else.
+#
+#   `latest` behaviour is stated explicitly rather than inherited: `flavor:
+#   latest=auto` is metadata-action's default, and it moves `:latest` onto a
+#   non-prerelease semver tag. Combined with the `type=raw,value=latest,
+#   enable={{is_default_branch}}` rule, that means `:latest` tracks whichever of
+#   `main` or the newest release tag was published most recently — which is what
+#   deploy/README.md promises ("`:latest` is the only moving tag guaranteed to
+#   resolve"). A dispatch on any other branch publishes only `sha-<sha>` and the
+#   branch name; it can never move `:latest` or mint a version tag.
+#
+#   The metadata is computed in the PROMOTE job, not the build jobs. Tag naming
+#   is a promotion decision; a build job that knew the final tags would be one
+#   `push: true` away from applying them.
+#
+# TRANSITION ALIASES (role rename, 2026-08-26). Platform images are now named for
+# the role they play, not the technology inside them:
+#
+#   quasar-vulkan    -> quasar-node-agent
+#   quasar-control   -> quasar-control-plane
+#   quasar-toolchain -> quasar-gst-toolchain
+#   quasar-dev       -> quasar-agent-dev      (not published here)
+#
+# The promote job lists BOTH names under `images:`. metadata-action expands its
+# whole tag set across every listed image, so one `imagetools create` publishes an
+# identical tag set to the new package (primary) and to the old package
+# (DEPRECATED alias), pointing at the same digest — a puller pinned to the old
+# name keeps getting the same bytes for one transition window.
+#
+# REMOVAL CONDITION for every alias in this file: drop the old name after the
+# FIRST RELEASE THAT SHIPS THE NEW NAMES, PLUS ONE MORE release. That is the same
+# window build-images.sh applies to its local alias tags (role_legacy_image) —
+# move both together or neither. GHCR package descriptions cannot be set from
+# this workflow; marking the old packages "deprecated, see <new name>" in the
+# GHCR UI is a manual operator step.
+#
+#   The toolchain image below is deliberately NOT version-tagged: its tag is a
+#   content hash over deploy/pins.env + deploy/patches + the toolchain stage
+#   (deploy/toolchain-hash.sh). It is keyed by what it contains, not by which
+#   release shipped it, and a release tag must not fork that identity. It is a
+#   build INPUT, never deployed, and deploy/image-contract.json declares no role
+#   for it — so it is not contract-validated. What it does get is a verified
+#   re-tag: see the toolchain job.
+#
+# MANUAL ONLY (operator directive 2026-07-06): the quasar-node-agent lane builds
+# patched GStreamer from source (~85 min cold) and automatic per-push/PR
+# triggers exhausted the account's Actions minutes. Run from the Actions tab.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only floor. `packages: write` is granted PER JOB, and now only to the three
+# that put bytes or tags in the registry — the jobs that JUDGE an artifact
+# (validate-*, preflight) run without it, so a gate cannot publish what it just
+# approved. Every third-party action below is pinned to a full commit sha (the
+# trailing comment is the version that sha was) — a tag is mutable, and these run
+# alongside that token.
+permissions:
+  contents: read
+
+env:
+  REGISTRY_NS: ghcr.io/${{ github.repository }}
+
+jobs:
+  # ── Shared build inputs, resolved exactly once ─────────────────────────────
+  #
+  # QUASAR_BASE_IMAGE (deploy/pins.env) is a MOVING tag. Resolving it here and
+  # handing the digest to every build makes a run self-consistent: the control
+  # plane and the node agent are built FROM the same base bytes, and the toolchain
+  # content hash reflects them. Without it a base rebuild mid-run silently splits
+  # the publish, and toolchain-hash.sh reuses a toolchain built on a base that is
+  # no longer what the agent image sits on.
+  inputs:
+    name: resolve shared build inputs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      base_ref: ${{ steps.resolve.outputs.base_ref }}
+      base_pinned: ${{ steps.resolve.outputs.base_pinned }}
+      built_at: ${{ steps.resolve.outputs.built_at }}
+      release_candidate: ${{ steps.resolve.outputs.release_candidate }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve the base image to a digest
+        id: resolve
+        env:
+          # Through the environment, never interpolated into the script body: a ref
+          # name is attacker-influenceable input in the general case, and `${{ }}`
+          # inside `run:` is textual substitution.
+          GIT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          base="$(grep -E '^QUASAR_BASE_IMAGE=' deploy/pins.env | head -1 | cut -d= -f2-)"
+          [ -n "$base" ] || { echo "deploy/pins.env declares no QUASAR_BASE_IMAGE" >&2; exit 1; }
+          digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$base" 2>/dev/null || true)"
+
+          # A release candidate must be reproducible from its recorded inputs, and
+          # scripts/release/release-preflight.sh --require-artifact-images refuses a
+          # base that is not an exact digest reference. Failing here costs seconds;
+          # failing in preflight costs the whole ~45 minute agent build.
+          release_candidate=false
+          case "$GIT_REF" in refs/tags/v*) release_candidate=true ;; esac
+
+          if [ -n "$digest" ]; then
+            # Drop the tag component, keeping any registry port: `:[^:/]*$` only
+            # matches a colon with no slash after it, i.e. a trailing tag.
+            base_ref="$(printf '%s' "$base" | sed 's/:[^:/]*$//')@${digest}"
+            echo "base_pinned=true" >> "$GITHUB_OUTPUT"
+          elif [ "$release_candidate" = true ]; then
+            echo "::error::could not resolve $base to a digest, and a release-tag dispatch requires a digest-pinned base."
+            exit 1
+          else
+            base_ref="$base"
+            echo "::warning::could not resolve $base to a digest; building against the moving tag."
+            echo "base_pinned=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo "base_ref=$base_ref"
+            echo "release_candidate=$release_candidate"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Shared build inputs"
+            echo ""
+            echo "| input | value |"
+            echo "| --- | --- |"
+            echo "| base (pins.env) | \`$base\` |"
+            echo "| base resolved | \`$base_ref\` |"
+            echo "| release candidate | \`$release_candidate\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── The patched GStreamer toolchain, built once per pin bump ───────────────
+  #
+  # A build INPUT, not a shipped artifact: it is never deployed and
+  # deploy/image-contract.json declares no role for it, so there is nothing to
+  # contract-validate. Its identity guarantee is the content hash over
+  # deploy/pins.env, deploy/patches/ and the toolchain stage text
+  # (deploy/toolchain-hash.sh) — plus the base digest resolved above, which is why
+  # a rebuilt base produces a new toolchain tag instead of silently reusing a
+  # toolchain built on a base that no longer exists.
+  #
+  # Cache is `type=registry`, not `type=gha`: GHA cache evicts after 7 days idle
+  # and is capped at 10 GB per repo, which is why the existing scopes are empty.
+  # A registry cache does not expire and is shared with the dev boxes.
+  toolchain:
+    name: quasar-gst-toolchain (patched GStreamer, pin-keyed)
+    needs: inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      # `ref` is the DIGEST form and is what the agent build and the preflight both
+      # consume. `image` (the content-hash tag) stays an output because it is the
+      # human-readable identity in logs and in the GHCR UI.
+      ref: ${{ steps.digest.outputs.ref }}
+      image: ${{ steps.resolve.outputs.image }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      built: ${{ steps.resolve.outputs.built }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve the toolchain tag, and build it only if it is missing
+        id: resolve
+        env:
+          BASE_REF: ${{ needs.inputs.outputs.base_ref }}
+        run: |
+          set -euo pipefail
+          # toolchain-hash.sh mixes QUASAR_BASE_DIGEST into the hash when it is set.
+          QUASAR_BASE_DIGEST="${BASE_REF##*@}"
+          case "$QUASAR_BASE_DIGEST" in sha256:*) ;; *) QUASAR_BASE_DIGEST="" ;; esac
+          export QUASAR_BASE_DIGEST
+          echo "base image: $BASE_REF"
+
+          tag="$(bash deploy/toolchain-hash.sh)"
+          image="$REGISTRY_NS/quasar-gst-toolchain:${tag}"
+          # DEPRECATED alias package, pre-2026-08-26 rename. See the transition-alias
+          # note in the header for the removal condition.
+          legacy="$REGISTRY_NS/quasar-toolchain:${tag}"
+          echo "tag=$tag"     >> "$GITHUB_OUTPUT"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          bash deploy/toolchain-hash.sh --explain
+
+          if docker manifest inspect "$image" >/dev/null 2>&1; then
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            echo "REUSING $image -- pins, patches, the toolchain stage and the base are unchanged."
+            echo "Skipping a ~40 minute GStreamer build."
+            exit 0
+          fi
+
+          # The rename must not cost a 40-minute rebuild of bytes that already exist.
+          # toolchain-hash.sh hashes pins/patches/stage text ONLY -- never the image
+          # name -- so the artefact published under the old package name for this hash
+          # IS this artefact. Re-point the new name at it instead of rebuilding.
+          #
+          # This adoption used to be an unchecked `imagetools create`: whatever sat at
+          # the legacy tag became the toolchain the agent image was compiled against.
+          # It now has to prove two things first.
+          if docker manifest inspect "$legacy" >/dev/null 2>&1; then
+            # 1. It really is a toolchain image. The role label is baked by
+            #    deploy/Dockerfile.vulkan's toolchain stage, and the contract's
+            #    provenance requirement (image-contract.json labels.required) exists
+            #    precisely so an image can say what it is.
+            #
+            #    An UNREADABLE label is not the same as a WRONG one: `--format
+            #    .Image.…` reads the config, which is a per-platform map on a
+            #    multi-platform index. Unreadable falls through to a rebuild (correct,
+            #    just slow); a label that reads and says something else means the
+            #    legacy tag is not what this hash claims, and is refused.
+            #    `.Image` is the image config for a single-platform manifest and a
+            #    map keyed by platform for an index (which is what an attested build
+            #    produces), so read it as JSON and accept either shape.
+            role="$(docker buildx imagetools inspect --format '{{json .Image}}' "$legacy" 2>/dev/null \
+              | jq -r 'if (type=="object" and has("config")) then . else (to_entries|map(.value)|first // {}) end
+                       | (.config.Labels["org.quasar.image.role"] // empty)' 2>/dev/null || true)"
+            if [ -n "$role" ] && [ "$role" != "toolchain" ]; then
+              echo "::error::refusing to adopt $legacy: org.quasar.image.role is '$role', expected 'toolchain'."
+              exit 1
+            fi
+            if [ -z "$role" ]; then
+              echo "::warning::could not read org.quasar.image.role from $legacy; rebuilding rather than adopting an unidentified image."
+            else
+              src_digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$legacy")"
+              echo "ADOPTING $legacy@$src_digest -> $image (same content hash, no rebuild)."
+              docker buildx imagetools create --tag "$image" "${legacy%:*}@${src_digest}"
+              # 2. The new name resolves to the digest we meant. This is the check the
+              #    old unconditional `imagetools create` did not have: without it,
+              #    "the re-tag succeeded" was an assumption, not an observation.
+              new_digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$image")"
+              if [ "$new_digest" != "$src_digest" ]; then
+                echo "::error::re-tag verification failed: $image is $new_digest, expected $src_digest."
+                exit 1
+              fi
+              echo "built=false" >> "$GITHUB_OUTPUT"
+              echo "verified $image == $legacy == $src_digest"
+              exit 0
+            fi
+          fi
+
+          echo "built=true" >> "$GITHUB_OUTPUT"
+          echo "BUILDING $image -- a pin, a patch, the toolchain stage or the base changed."
+      - name: Build and publish the toolchain
+        if: steps.resolve.outputs.built == 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: deploy/Dockerfile.vulkan
+          target: toolchain
+          push: true
+          # Both names, one push. The second is the DEPRECATED pre-rename package.
+          tags: |
+            ${{ steps.resolve.outputs.image }}
+            ${{ env.REGISTRY_NS }}/quasar-toolchain:${{ steps.resolve.outputs.tag }}
+          # Plain manifests, no attestations — same reasoning as the artifact lanes,
+          # and it also keeps the label read above on its single-platform path.
+          provenance: false
+          sbom: false
+          build-args: |
+            QUASAR_BASE_IMAGE=${{ needs.inputs.outputs.base_ref }}
+            SOURCE_COMMIT=${{ github.sha }}
+            BUILT_AT=${{ needs.inputs.outputs.built_at }}
+          # Two cache sources: the new scope, plus the pre-rename scope so the warm
+          # cache built before the rename is not thrown away. Only the new one is
+          # written; the old scope goes cold on its own and is dropped with the alias.
+          cache-from: |
+            type=registry,ref=${{ env.REGISTRY_NS }}/quasar-gst-toolchain:buildcache
+            type=registry,ref=${{ env.REGISTRY_NS }}/quasar-toolchain:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-gst-toolchain:buildcache,mode=max
+
+      # Whether it was reused, adopted or freshly built, the toolchain leaves this
+      # job as a DIGEST. The agent build then compiles against an immutable input
+      # rather than against whatever the content-hash tag happens to point at when
+      # the next job starts — the same reason the artifacts themselves are carried
+      # by digest — and release preflight can see the whole input set pinned.
+      - name: Resolve the toolchain to a digest
+        id: digest
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
+        run: |
+          set -euo pipefail
+          d="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$IMAGE")"
+          case "$d" in sha256:*) ;; *) echo "::error::unexpected digest for $IMAGE: $d"; exit 1 ;; esac
+          echo "ref=${IMAGE%:*}@${d}" >> "$GITHUB_OUTPUT"
+          echo "toolchain: ${IMAGE%:*}@${d}"
+
+  # ── Phase 1: build to a digest. No tag a consumer follows is created here. ──
+  build-control-plane:
+    name: build quasar-control-plane (digest only)
+    needs: inputs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: deploy/Dockerfile.control.prod
+          # `push-by-digest=true` with no `tags:`. The manifest is uploaded and
+          # addressable, and nothing names it. That is the whole point of the split:
+          # an artifact that fails the contract below was never reachable.
+          outputs: type=image,name=${{ env.REGISTRY_NS }}/quasar-control-plane,push-by-digest=true,name-canonical=true,push=true
+          # provenance/sbom off DELIBERATELY. With attestations on, buildx pushes an
+          # index whose digest addresses image + attestation manifests; every consumer
+          # downstream (docker pull, validate-image.sh's docker inspect, imagetools
+          # create) then has to agree on how that index resolves. Nothing in this repo
+          # reads a SLSA attestation, and the provenance that IS load-bearing here is
+          # the org.quasar.* labels the contract asserts plus the preflight evidence.
+          # Keeping the digest a plain image manifest makes "the thing validated is the
+          # thing promoted" checkable by eye.
+          provenance: false
+          sbom: false
+          build-args: |
+            QUASAR_BASE_IMAGE=${{ needs.inputs.outputs.base_ref }}
+          cache-from: |
+            type=registry,ref=${{ env.REGISTRY_NS }}/quasar-control-plane:buildcache
+            type=registry,ref=${{ env.REGISTRY_NS }}/quasar-control:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-control-plane:buildcache,mode=max
+
+  build-node-agent:
+    name: build quasar-node-agent (digest only)
+    needs: [inputs, toolchain]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Free runner disk space
+        # ubuntu-latest ships with ~25-30 GB free after the OS/tooling preinstalls, and
+        # this lane's `build` stage (CUDA toolkit + Rust, on top of the toolchain image)
+        # plus the `runtime` image exceeds that headroom. Preinstalled bloat this
+        # workflow never uses (dotnet, Android SDK, GHC, CodeQL, boost) is removed up
+        # front rather than via a third-party disk-cleanup action, to avoid pulling in an
+        # extra unpinned supply-chain dependency for something `rm -rf` does directly.
+        run: |
+          echo "Disk space before cleanup:"
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          echo "Disk space after cleanup:"
+          df -h /
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: deploy/Dockerfile.vulkan
+          # Dockerfile.vulkan is multi-target and BuildKit's no-target default is "last
+          # stage wins", which historically built the ~10.7 GB CUDA image and tagged it
+          # quasar-node-agent. Always pass an explicit target, whatever is last today.
+          # (deploy/build-images.sh enforces the same rule on the local path.)
+          target: runtime
+          outputs: type=image,name=${{ env.REGISTRY_NS }}/quasar-node-agent,push-by-digest=true,name-canonical=true,push=true
+          # See the control-plane lane for why attestations are off here.
+          provenance: false
+          sbom: false
+          # SOURCE_COMMIT / BUILT_AT are not cosmetic: deploy/image-contract.json's
+          # runtime role REQUIRES org.quasar.source.commit and org.quasar.built.at, and
+          # Dockerfile.vulkan defaults both to "unknown". A GHA-built image that omitted
+          # them would carry provenance labels asserting nothing.
+          # The ~40 min GStreamer tree comes from the toolchain job's artefact, so
+          # this build compiles the node-agent and nothing else.
+          build-args: |
+            TOOLCHAIN_IMAGE=${{ needs.toolchain.outputs.ref }}
+            QUASAR_BASE_IMAGE=${{ needs.inputs.outputs.base_ref }}
+            SOURCE_COMMIT=${{ github.sha }}
+            BUILT_AT=${{ needs.inputs.outputs.built_at }}
+          # Explicit scope, one per published image. When two agent jobs shared this
+          # Dockerfile's `build` stage, an unscoped cache had them write the SAME key and
+          # evict each other on alternating runs; the scoping outlived the second job
+          # (#545) because it is the correct shape either way.
+          # Registry cache, not type=gha: the gha backend evicts after 7 days idle
+          # and is capped at 10 GB per repo, which is why the two scopes this
+          # replaces hold 0 caches today. A registry cache does not expire and is
+          # shared with the dev boxes.
+          cache-from: |
+            type=registry,ref=${{ env.REGISTRY_NS }}/quasar-node-agent:buildcache
+            type=registry,ref=${{ env.REGISTRY_NS }}/quasar-vulkan:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-node-agent:buildcache,mode=max
+
+  # ── Phase 2: the repo's own contract, run against the exact pushed digest ──
+  #
+  # deploy/validate-image.sh + deploy/image-contract.json are the SINGLE
+  # implementation of what a shippable Quasar image is; nothing about the contract
+  # is re-expressed in YAML here. The only thing this workflow needed the script to
+  # learn was how to address a registry artifact, which is `--pull` +
+  # `--require-digest-ref` (deploy/test-validate-image-refs.sh covers both).
+  #
+  # `packages: read`, not write. This job decides whether an image may ship; it
+  # must not be able to ship one.
+  validate-control-plane:
+    name: contract - quasar-control-plane
+    needs: build-control-plane
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Validate against deploy/image-contract.json
+        env:
+          REF: ${{ env.REGISTRY_NS }}/quasar-control-plane@${{ needs.build-control-plane.outputs.digest }}
+        run: |
+          set -euo pipefail
+          echo "validating $REF"
+          bash deploy/validate-image.sh \
+            --image "$REF" --role control \
+            --pull --require-digest-ref --no-gpu \
+            --json "$RUNNER_TEMP/contract-control.json"
+      - name: Record the verdict on the run
+        if: always()
+        run: |
+          set -uo pipefail
+          f="$RUNNER_TEMP/contract-control.json"
+          [ -f "$f" ] || { echo "no contract report produced" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          {
+            echo "### Contract: quasar-control-plane"
+            echo ""
+            echo '```json'
+            cat "$f"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  validate-node-agent:
+    name: contract - quasar-node-agent
+    needs: build-node-agent
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # NOTE ON COVERAGE, so nobody reads a green run as more than it is: a GHA
+      # runner has no GPU, so the contract's `required_with_gpu` elements
+      # (vulkanh264enc, vulkanscale) are SKIPPED, not passed — validate-image.sh
+      # reports them as skipped by design. Everything device-free is asserted,
+      # including the `forbidden_without_gpu` degradation property that only a
+      # driver-less host CAN assert. GPU-gated coverage stays where it has always
+      # been: `deploy/build-images.sh --gpu` on the gpu-test host.
+      - name: Validate against deploy/image-contract.json
+        env:
+          REF: ${{ env.REGISTRY_NS }}/quasar-node-agent@${{ needs.build-node-agent.outputs.digest }}
+        run: |
+          set -euo pipefail
+          echo "validating $REF"
+          bash deploy/validate-image.sh \
+            --image "$REF" --role runtime \
+            --pull --require-digest-ref --no-gpu \
+            --json "$RUNNER_TEMP/contract-runtime.json"
+      - name: Record the verdict on the run
+        if: always()
+        run: |
+          set -uo pipefail
+          f="$RUNNER_TEMP/contract-runtime.json"
+          [ -f "$f" ] || { echo "no contract report produced" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          {
+            echo "### Contract: quasar-node-agent"
+            echo ""
+            echo '```json'
+            cat "$f"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Phase 3: the candidate as a whole ──────────────────────────────────────
+  #
+  # validate-* judge each image in isolation. This judges the RELEASE INPUTS:
+  # release-manifest.json still agrees with deploy/pins.env, every vendored patch
+  # is present, the compose inputs exist, the protocol submodule matches its
+  # superproject pin. On a release-tag dispatch it additionally runs strict
+  # (`--require-artifact-images`), which refuses anything but exact
+  # name@sha256 references for both artifacts and the base — the digests it is
+  # handed are the same job outputs the promote job will tag.
+  #
+  # `contents: read` only. No registry credential reaches this job at all.
+  preflight:
+    name: release preflight (candidate inputs)
+    needs: [inputs, toolchain, build-control-plane, build-node-agent]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Strict preflight asserts the protocol submodule is initialized and at
+          # the superproject's recorded revision; without this it reports an
+          # uninitialized submodule and refuses every release candidate.
+          submodules: true
+      - name: Run scripts/release/release-preflight.sh
+        env:
+          # These are read by release-preflight.sh's Dockerfile FROM-line resolution
+          # (environment wins over the ARG default, mirroring `docker build
+          # --build-arg`), so the pin_status it reports is the pin_status the builds
+          # actually used — not the committed :latest dev convenience.
+          QUASAR_BASE_IMAGE: ${{ needs.inputs.outputs.base_ref }}
+          TOOLCHAIN_IMAGE: ${{ needs.toolchain.outputs.ref }}
+          QUASAR_CONTROL_IMAGE: ${{ env.REGISTRY_NS }}/quasar-control-plane@${{ needs.build-control-plane.outputs.digest }}
+          QUASAR_AGENT_IMAGE: ${{ env.REGISTRY_NS }}/quasar-node-agent@${{ needs.build-node-agent.outputs.digest }}
+          RELEASE_CANDIDATE: ${{ needs.inputs.outputs.release_candidate }}
+        run: |
+          set -euo pipefail
+          strict=()
+          if [ "$RELEASE_CANDIDATE" = true ]; then strict=(--require-artifact-images); fi
+          # Output outside the repository: strict preflight refuses to write exact
+          # release identity to an unignored repo file.
+          bash scripts/release/release-preflight.sh \
+            --output "$RUNNER_TEMP/preflight.json" "${strict[@]+"${strict[@]}"}"
+      - name: Record the evidence on the run
+        if: always()
+        run: |
+          set -uo pipefail
+          f="$RUNNER_TEMP/preflight.json"
+          [ -f "$f" ] || exit 0
+          {
+            echo "### Release preflight"
+            echo ""
+            echo '```json'
+            jq '{result, errors, source, release_artifact_images, release_base_image, unavailable_release_gates}' "$f"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Phase 4: promotion. The only job that moves a tag anyone follows. ──────
+  promote:
+    name: promote validated digests
+    needs:
+      - inputs
+      - build-control-plane
+      - build-node-agent
+      - validate-control-plane
+      - validate-node-agent
+      - preflight
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata (control plane)
+        id: meta_control
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          # Second entry is the DEPRECATED pre-rename package: metadata-action
+          # expands the tag set below across BOTH, so one promotion publishes an
+          # identical tag set to each. Header note carries the removal condition.
+          images: |
+            ${{ env.REGISTRY_NS }}/quasar-control-plane
+            ${{ env.REGISTRY_NS }}/quasar-control
+          # `type=semver` is the release lever: dispatching on the `vX.Y.Z` tag
+          # adds `:X.Y.Z` here (see the versioned-release-tags note in the header).
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+          # Stated, not inherited: `auto` is metadata-action's default and moves
+          # `:latest` onto a non-prerelease semver tag. Header note explains why.
+          flavor: |
+            latest=auto
+
+      - name: Image metadata (node agent)
+        id: meta_agent
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: |
+            ${{ env.REGISTRY_NS }}/quasar-node-agent
+            ${{ env.REGISTRY_NS }}/quasar-vulkan
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+          flavor: |
+            latest=auto
+
+      # Recorded BEFORE anything moves. `:latest` is the only tag deploy/README.md
+      # promises will resolve, so it is the one a half-landed promotion must be able
+      # to put back. A package with no `:latest` yet records an empty string and is
+      # skipped on rollback rather than being tagged with something invented.
+      - name: Record the current :latest digests (rollback point)
+        id: rollback
+        run: |
+          set -euo pipefail
+          out=""
+          for repo in quasar-control-plane quasar-control quasar-node-agent quasar-vulkan; do
+            ref="$REGISTRY_NS/$repo"
+            d="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref:latest" 2>/dev/null || true)"
+            echo "  $ref:latest = ${d:-<none>}"
+            out="${out}${ref} ${d}"$'\n'
+          done
+          {
+            echo 'previous<<QUASAR_EOF'
+            printf '%s' "$out"
+            echo 'QUASAR_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Promote the validated digests
+        id: apply
+        env:
+          CONTROL_SRC: ${{ env.REGISTRY_NS }}/quasar-control-plane@${{ needs.build-control-plane.outputs.digest }}
+          AGENT_SRC: ${{ env.REGISTRY_NS }}/quasar-node-agent@${{ needs.build-node-agent.outputs.digest }}
+          CONTROL_TAGS: ${{ steps.meta_control.outputs.tags }}
+          AGENT_TAGS: ${{ steps.meta_agent.outputs.tags }}
+        run: |
+          set -euo pipefail
+
+          # Tag sets arrive through the environment, never interpolated into this
+          # script body: GitHub expression substitution inside a run block is
+          # TEXTUAL, and a ref name is attacker-influenceable input in the general
+          # case. Reading them as "$CONTROL_TAGS" / "$AGENT_TAGS" keeps them data.
+          promote() { # promote <source-digest-ref> <newline-separated tags>
+            local src="$1" tags="$2" want t
+            want="${src##*@}"
+            local args=()
+            while IFS= read -r t; do
+              [ -n "$t" ] || continue
+              args+=(--tag "$t")
+            done <<< "$tags"
+            [ "${#args[@]}" -gt 0 ] || { echo "::error::no tags computed for $src"; return 1; }
+
+            echo "promoting $src"
+            docker buildx imagetools create "${args[@]}" "$src"
+
+            # Verify, do not assume. Every tag just written must resolve to the
+            # digest that was validated — this is the assertion the old in-registry
+            # re-tag did not have.
+            local i
+            for (( i=1; i<${#args[@]}; i+=2 )); do
+              local got
+              got="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "${args[$i]}")"
+              if [ "$got" != "$want" ]; then
+                echo "::error::${args[$i]} resolves to $got, expected the validated digest $want"
+                return 1
+              fi
+              echo "  verified ${args[$i]} == $want"
+            done
+          }
+
+          promote "$CONTROL_SRC" "$CONTROL_TAGS"
+          promote "$AGENT_SRC"   "$AGENT_TAGS"
+
+          {
+            echo "### Promoted"
+            echo ""
+            echo "| image | digest |"
+            echo "| --- | --- |"
+            echo "| quasar-control-plane | \`${CONTROL_SRC##*@}\` |"
+            echo "| quasar-node-agent | \`${AGENT_SRC##*@}\` |"
+            echo ""
+            echo '```'
+            printf '%s\n%s\n' "$CONTROL_TAGS" "$AGENT_TAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # A promotion is several registry writes and cannot be atomic. If one of them
+      # fails, consumers must end where they started rather than on a half-moved
+      # `:latest` — so put EVERY `:latest` back to the digest recorded above,
+      # including one whose own promotion succeeded. Both images ship together or
+      # neither does; a control plane on the new digest and an agent on the old one
+      # is a worse state than a clean no-op.
+      #
+      # SCOPE, stated so nobody reads more into a green rollback than is there: only
+      # `:latest` is restored. `sha-<sha>` and the branch tag are new names nothing
+      # followed before this run, so leaving them pointing at an unpromoted digest
+      # harms no consumer. The one case needing a human is a RE-dispatch on an
+      # already-published `vX.Y.Z`: `:X.Y.Z` may have moved and is not restored here.
+      # Re-dispatch the workflow on that tag once the cause is fixed.
+      - name: Roll :latest back if the promotion did not complete
+        if: failure() && steps.rollback.outcome == 'success'
+        env:
+          PREVIOUS: ${{ steps.rollback.outputs.previous }}
+        run: |
+          # No `-e`: every restore is attempted even if an earlier one fails.
+          set -uo pipefail
+          rc=0
+          while read -r ref digest; do
+            [ -n "${ref:-}" ] || continue
+            if [ -z "${digest:-}" ]; then
+              echo "  $ref:latest had no previous digest — leaving it alone"
+              continue
+            fi
+            echo "  restoring $ref:latest -> $digest"
+            docker buildx imagetools create --tag "$ref:latest" "$ref@$digest" || rc=1
+          done <<< "$PREVIOUS"
+          {
+            echo "### Promotion failed — :latest rolled back"
+            echo ""
+            echo "Restored to (blank = the package had no \`:latest\` and was left alone):"
+            echo ""
+            echo '```'
+            printf '%s\n' "$PREVIOUS"
+            echo '```'
+            echo ""
+            echo "Not restored: \`sha-*\` and branch tags (nothing followed them), and"
+            echo "\`:X.Y.Z\` on a re-dispatched release tag — re-dispatch to fix that one."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"

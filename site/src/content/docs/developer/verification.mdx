@@ -1,0 +1,47 @@
+---
+title: Testing and verification
+description: The required checks for Go, Rust, web, database, streaming, and deployment changes.
+---
+
+The root Makefile is the supported test interface. Run this for every change:
+
+```bash
+make verify
+```
+
+It formats, lints, and builds all components, checks shell scripts, and runs the
+developer-experience self-tests.
+
+## Checks by change type
+
+| Change | Additional verification |
+| --- | --- |
+| Go | `make test-go` |
+| Go touching the database | `make test-db` as well as `make test-go` |
+| Rust | `make test-rust` |
+| Web | `make test-web` |
+| Before merging to `develop` | `make preflight` |
+| Pipeline, encoder, or streaming | Real-session validation on a GPU host |
+| Images or deployment | Image contract validation through the canonical build scripts |
+| Candidate application image | `make qa IMAGE=<tag> PROFILE=<name> HOST=<role-or-host>` |
+
+`make test-go` can pass while database-backed tests were skipped, so it is not a
+substitute for `make test-db` after a migration or store/query change.
+
+## Useful diagnostics
+
+```bash
+make diagnose
+make diagnose-bundle
+```
+
+The bundle is sanitised, stored under the gitignored `.diagnostics/` directory,
+and includes a manifest of included and excluded material. Review it before
+sharing it.
+
+## Git and generated files
+
+Branches are based on `develop` and merge back to `develop`; promotion from
+`develop` to `main` is sign-off gated. Do not patch vendored generated clients or
+generated API types by hand. Regenerate them from their declared source and keep
+the source revision recorded where the repository requires it.

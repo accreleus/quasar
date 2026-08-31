@@ -1,0 +1,46 @@
+/* ============================================================
+   Layout — the pre-auth login screen.
+   ============================================================ */
+
+/* `.shell-main` and its narrow-viewport gutters went to styles/shell.css's
+   `.main` when the v3 shell replaced AppShell, and the last `.page-container`
+   holdouts moved to `.page` (primitives.css) when they lost the styling that
+   made them differ from it. What is left here is the pre-auth login layout. */
+
+/* ============================================================
+   Pre-auth leftovers (the wizard's steps)
+
+   The pre-auth SURFACE is now styles/login.css (`.auth-scene`, built to
+   design_handoff_v3 §C). What survives here are the two class names the
+   /setup steps still render: `.login-card`, which is the only thing in this
+   file (or `.card` in components.css) that gives a card padding — `.card`
+   alone is deliberately bare — and `.login-error`, the boxed message the
+   steps and library/ImagesTab use. Inside `.auth-scene` the card padding is
+   flattened again: there the step IS the content of the auth card, not a
+   second surface. If a new wizard step is added, give its outer element BOTH
+   `card` and `login-card` (#461: three steps had only `card` and rendered
+   with headings flush against the corner).
+   ============================================================ */
+
+.login-card {
+  width: 100%;
+  max-width: 400px;
+  padding: var(--s8) var(--s7);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s5);
+}
+
+.login-error {
+  font-size: var(--t-sm);
+  color: var(--danger-text);
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-line);
+  border-radius: var(--r-sm);
+  padding: 10px 14px;
+}
+
+/* The wizard's submit reads a step larger than an app-wide `.btn` (t-sm). */
+.login-card .btn-primary {
+  font-size: var(--t-base);
+}

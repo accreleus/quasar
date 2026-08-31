@@ -1,0 +1,111 @@
+/* Quasar V2 design system applied to the user-area home page.
+ * Loaded AFTER assets/quasar.css: same class names, same layout — only the
+ * tokens, type, radii, glass and topbar treatment change, so the page keeps
+ * its shape while matching Admin Console v3. Scoped to this page by being
+ * linked only from home.html. */
+@import url('https://fonts.googleapis.com/css2?family=Michroma&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+:root{
+--surf-canvas:oklch(0.115 0.012 267);
+--surf-chrome:oklch(0.163 0.018 268);
+--surf-panel:oklch(0.208 0.020 268);
+--surf-raised:oklch(0.252 0.022 267);
+--surf-control:oklch(0.292 0.022 265);
+--surf-inset:oklch(0.088 0.012 267);
+--ink-0:var(--surf-inset);--ink-1:var(--surf-canvas);--ink-2:var(--surf-chrome);--ink-3:var(--surf-panel);--ink-4:var(--surf-raised);--ink-5:var(--surf-control);
+--line:oklch(0.9618 0.0086 247.91/.09);--line-2:oklch(0.9618 0.0086 247.91/.12);--line-3:oklch(0.6605 0.0265 259.81/.46);
+--glass-border:oklch(0.9618 0.0086 247.91/.12);--glass-highlight:oklch(0.9618 0.0086 247.91/.14);
+--text:oklch(0.9618 0.0086 247.91);--text-2:oklch(0.76 0.022 258);--text-3:oklch(0.6605 0.0265 259.81);--text-4:oklch(0.56 0.024 259);
+--accent:oklch(0.5998 0.2179 273.21);--action:oklch(0.5 0.19 273.21);--accent-hover:oklch(0.54 0.19 273.21);--accent-press:oklch(0.46 0.19 273.21);--accent-text:oklch(0.78 0.13 273.21);
+--accent-soft:oklch(0.5998 0.2179 273.21/.16);--accent-soft-2:oklch(0.5998 0.2179 273.21/.26);
+--violet:var(--accent);--nebula:oklch(0.66 0.19 280);--lavender:oklch(0.74 0.14 285);--horizon:oklch(0.62 0.17 268);--plasma:oklch(0.66 0.16 262);--cyan:oklch(0.78 0.11 196);
+--teal:oklch(0.78 0.11 196);
+--brand-grad:linear-gradient(118deg,oklch(0.5998 0.2179 273.21),oklch(0.5 0.19 273.21));
+--brand-grad-soft:linear-gradient(118deg,oklch(0.5998 0.2179 273.21/.16),oklch(0.5 0.19 273.21/.1));
+--success:oklch(0.76 0.15 164);--success-text:oklch(0.82 0.13 164);--success-bg:oklch(0.76 0.15 164/.12);--success-line:oklch(0.76 0.15 164/.34);
+--warning:oklch(0.82 0.14 85);--warning-text:oklch(0.87 0.12 85);--warning-bg:oklch(0.82 0.14 85/.12);--warning-line:oklch(0.82 0.14 85/.34);
+--danger:oklch(0.69 0.19 27);--danger-text:oklch(0.82 0.12 27);--danger-bg:oklch(0.69 0.19 27/.13);--danger-line:oklch(0.69 0.19 27/.4);
+--info:var(--teal);--info-text:oklch(0.84 0.09 196);--info-bg:oklch(0.78 0.11 196/.16);--info-line:oklch(0.78 0.11 196/.32);
+--font-brand:'Michroma','Eurostile Extended',Microgramma,ui-sans-serif,sans-serif;
+--font-display:'IBM Plex Sans',Inter,ui-sans-serif,system-ui,sans-serif;
+--font-ui:'IBM Plex Sans',Inter,ui-sans-serif,system-ui,sans-serif;
+--font-mono:'IBM Plex Mono','SFMono-Regular',Consolas,monospace;
+--r-xs:4px;--r-sm:4px;--r-md:8px;--r-lg:8px;--r-xl:12px;
+--shadow-sm:0 1px 2px oklch(0.05 0.01 267/.38);
+--shadow-md:inset 0 1px 0 var(--glass-highlight),0 14px 36px -28px oklch(0.02 0.01 267/.8);
+--shadow-lg:inset 0 1px 0 var(--glass-highlight),0 22px 58px -30px oklch(0.02 0.01 267/.85);
+--inset-top:inset 0 1px 0 var(--glass-highlight);--pop-bg:var(--surf-raised)}
+html body{background-color:var(--surf-canvas);background-image:radial-gradient(1400px 800px at 74% -20%,oklch(0.5998 0.2179 273.21/.12),transparent 62%),radial-gradient(1000px 600px at -8% 26%,oklch(0.5 0.19 273.21/.07),transparent 58%);font-family:var(--font-ui)}
+h1,h2,h3,h4{letter-spacing:-.02em}
+:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+::selection{background:var(--accent-soft);color:var(--text)}
+/* ---- topbar: same treatment as Admin Console v3 ---- */
+.topbar{background:color-mix(in oklch,var(--surf-chrome) 88%,transparent);backdrop-filter:blur(26px) saturate(112%);-webkit-backdrop-filter:blur(26px) saturate(112%);border-bottom:1px solid var(--glass-border);box-shadow:0 1px 0 oklch(0.02 0.01 267/.55)}
+.brand{font-family:var(--font-brand);font-weight:400;font-size:.72rem;letter-spacing:.2em;text-transform:uppercase;color:var(--text)}
+.brand .wordmark{background:none;-webkit-background-clip:border-box;background-clip:border-box;color:var(--text)}
+.brand .mark{width:24px;height:24px}
+.nav a{font-size:var(--t-sm);font-weight:600;color:var(--text-3);border-radius:var(--r-sm);padding:8px 13px}
+.nav a:hover{background:oklch(0.9618 0.0086 247.91/.05);color:var(--text)}
+.nav a.active{background:color-mix(in oklch,var(--surf-control) 66%,transparent);color:var(--text);box-shadow:inset 0 1px 0 var(--glass-highlight)}
+.search input{border-radius:var(--r-sm);background:color-mix(in oklch,var(--surf-inset) 76%,transparent);border-color:var(--line-3);font-family:var(--font-ui);font-size:var(--t-sm);backdrop-filter:blur(14px)}
+.search input::placeholder{color:var(--text-3)}
+.search input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.icon-btn{border-radius:var(--r-sm);background:color-mix(in oklch,var(--surf-control) 60%,transparent);border-color:var(--line-3);color:var(--text-2)}
+.icon-btn:hover{background:color-mix(in oklch,var(--surf-control) 88%,transparent);border-color:var(--text-2);color:var(--text)}
+.icon-btn.ghost{background:transparent;border-color:transparent}
+.icon-btn.ghost:hover{background:oklch(0.9618 0.0086 247.91/.06)}
+.user-btn{border-radius:var(--r-sm);font-family:var(--font-ui)}
+.user-btn:hover,.user-btn[aria-expanded="true"]{background:color-mix(in oklch,var(--surf-control) 70%,transparent);border-color:var(--glass-border)}
+.u-ava{background:var(--action);font-family:var(--font-mono);font-weight:600;box-shadow:inset 0 1px 0 var(--glass-highlight)}
+.user-pop{background:color-mix(in oklch,var(--surf-raised) 90%,transparent);backdrop-filter:blur(28px);-webkit-backdrop-filter:blur(28px);border-radius:var(--r-md);border-color:var(--glass-border);box-shadow:inset 0 1px 0 var(--glass-highlight),0 1.5rem 3.5rem oklch(0.02 0.01 267/.72)}
+.up-item{border-radius:var(--r-sm)}
+.up-item:hover{background:color-mix(in oklch,var(--surf-control) 70%,transparent);color:var(--text)}
+/* ---- surfaces below the topbar keep their layout, take the new material ---- */
+.card,.game,.panel{border-radius:var(--r-md);border-color:var(--glass-border)}
+.card,.panel{background:color-mix(in oklch,var(--surf-panel) 88%,transparent);box-shadow:var(--shadow-md)}
+.btn{border-radius:var(--r-sm);font-weight:600}
+.btn-primary{background:var(--action);border-color:oklch(0.72 0.15 273.21/.68);color:#fff;box-shadow:inset 0 1px 0 oklch(0.9618 0.0086 247.91/.2),0 10px 24px -14px oklch(0.46 0.19 273.21/.8)}
+.btn-primary:hover{background:var(--accent-hover)}
+.chip,.tier{font-family:var(--font-mono);letter-spacing:.05em}
+.mono,.num{font-family:var(--font-mono)}
+/* ---- light appearance ----
+ * Mirrors console-v3's light ramp. Scoped with html[data-theme="light"] so it
+ * outranks BOTH this file's :root dark ramp and quasar.css's own light block
+ * (which is only [data-theme="light"], one specificity step lower). */
+html[data-theme="light"]{color-scheme:light;
+--surf-canvas:oklch(0.958 0.006 268);
+--surf-chrome:oklch(0.928 0.011 268);
+--surf-panel:oklch(0.998 0.002 268);
+--surf-raised:oklch(0.972 0.006 268);
+--surf-control:oklch(0.988 0.004 268);
+--surf-inset:oklch(0.935 0.007 268);
+--ink-0:oklch(0.90 0.008 268);--ink-1:var(--surf-canvas);--ink-2:var(--surf-chrome);--ink-3:var(--surf-panel);--ink-4:var(--surf-raised);--ink-5:var(--surf-control);
+--line:oklch(0.24 0.022 268/.09);--line-2:oklch(0.24 0.022 268/.14);--line-3:oklch(0.24 0.022 268/.24);
+--glass-border:oklch(0.24 0.022 268/.12);--glass-highlight:oklch(1 0 0/.7);
+--text:oklch(0.24 0.022 268);--text-2:oklch(0.42 0.018 268);--text-3:oklch(0.53 0.016 268);--text-4:oklch(0.64 0.014 268);
+--accent-text:oklch(0.5 0.19 273.21);--accent-soft:oklch(0.5998 0.2179 273.21/.12);--accent-soft-2:oklch(0.5998 0.2179 273.21/.2);
+--success-text:oklch(0.5 0.13 164);--success-bg:oklch(0.76 0.15 164/.15);--success-line:oklch(0.6 0.14 164/.34);
+--warning-text:oklch(0.52 0.12 78);--warning-bg:oklch(0.82 0.14 85/.2);--warning-line:oklch(0.68 0.13 82/.36);
+--danger-text:oklch(0.52 0.2 27);--danger-bg:oklch(0.69 0.19 27/.14);--danger-line:oklch(0.6 0.19 27/.34);
+--teal:oklch(0.62 0.11 196);--info:oklch(0.62 0.11 196);--info-text:oklch(0.48 0.1 210);--info-bg:oklch(0.62 0.11 196/.16);--info-line:oklch(0.62 0.11 196/.32);
+--shadow-sm:0 1px 2px oklch(0.24 0.022 268/.1);
+--shadow-md:0 1px 2px oklch(0.24 0.022 268/.06),0 14px 34px -26px oklch(0.24 0.022 268/.3);
+--shadow-lg:0 22px 58px -30px oklch(0.24 0.022 268/.34);
+--inset-top:inset 0 1px 0 oklch(1 0 0/.75);--pop-bg:oklch(0.998 0.002 268)}
+html[data-theme="light"] body{background-color:var(--surf-canvas);background-image:radial-gradient(1400px 800px at 74% -20%,oklch(0.5998 0.2179 273.21/.1),transparent 62%),radial-gradient(1000px 600px at -8% 26%,oklch(0.5 0.19 273.21/.06),transparent 58%)}
+html[data-theme="light"] .topbar{background:color-mix(in oklch,var(--surf-chrome) 88%,transparent);border-bottom:1px solid var(--glass-border);box-shadow:0 1px 0 oklch(1 0 0/.6)}
+html[data-theme="light"] .nav a:hover{background:oklch(0.24 0.022 268/.05)}
+html[data-theme="light"] .nav a.active{background:oklch(1 0 0);border:1px solid var(--line-2);box-shadow:0 1px 2px oklch(0.24 0.022 268/.12);color:var(--text)}
+html[data-theme="light"] .search input,html[data-theme="light"] .input,html[data-theme="light"] .select,html[data-theme="light"] .textarea{background:oklch(1 0 0/.9);border-color:var(--line-2)}
+html[data-theme="light"] .icon-btn{background:oklch(1 0 0/.9);border-color:var(--line-2);color:var(--text-2)}
+html[data-theme="light"] .icon-btn:hover{background:oklch(1 0 0);border-color:var(--line-3);color:var(--text)}
+html[data-theme="light"] .icon-btn.ghost{background:transparent;border-color:transparent}
+html[data-theme="light"] .icon-btn.ghost:hover{background:oklch(0.24 0.022 268/.05)}
+html[data-theme="light"] .user-btn:hover,html[data-theme="light"] .user-btn[aria-expanded="true"]{background:oklch(0.24 0.022 268/.05);border-color:var(--line-2)}
+html[data-theme="light"] .user-pop{background:oklch(0.998 0.002 268/.94);box-shadow:var(--shadow-lg)}
+html[data-theme="light"] .up-item:hover{background:oklch(0.24 0.022 268/.05)}
+html[data-theme="light"] .card,html[data-theme="light"] .panel,html[data-theme="light"] .game{background:color-mix(in oklch,var(--surf-panel) 92%,transparent);border-color:var(--glass-border)}
+html[data-theme="light"] .btn{background:oklch(1 0 0/.9);border-color:var(--line-2);color:var(--text)}
+html[data-theme="light"] .btn:hover{background:oklch(1 0 0);border-color:var(--line-3)}
+html[data-theme="light"] .btn-primary{background:var(--action);border-color:oklch(0.42 0.19 273.21);color:#fff}
+html[data-theme="light"] .btn-primary:hover{background:var(--accent-press);color:#fff}
+html[data-theme="light"] .u-ava{color:#fff}

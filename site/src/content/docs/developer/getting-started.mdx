@@ -1,0 +1,88 @@
+---
+title: Set up a checkout
+description: Initialise a Quasar development checkout and run the local UI and API loop.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+The local development stack contains Postgres, the control plane, and the web
+app. It intentionally has no node agent: the agent needs a Linux GPU host, so a
+local checkout is for UI and API work unless your workstation is also configured
+as a fleet host.
+
+<Steps>
+
+1. Clone the repository and its submodules.
+
+   ```bash
+   git clone --recurse-submodules https://github.com/accreleus/quasar.git
+   cd quasar
+   ```
+
+2. Read the project contracts.
+
+   ```bash
+   less CLAUDE.md
+   less AGENTS.md
+   make help
+   ```
+
+3. Initialise the checkout.
+
+   ```bash
+   make init
+   ```
+
+   This is idempotent. It initialises the protocol submodule, builds the
+   containerised development toolchain, and checks the environment. It never
+   overwrites an existing `.env`.
+
+4. Check the environment and configuration.
+
+   ```bash
+   make doctor
+   make config-check
+   ```
+
+5. Start the local agentless stack.
+
+   ```bash
+   make up
+   make status
+   ```
+
+</Steps>
+
+Use `make dev-web` for the Vite development loop and `make dev-cp` to run the Go
+control plane against an ephemeral Postgres database. Stop the local stack with
+`make down`; its volumes are preserved.
+
+## Worktrees and parallel checkouts
+
+Each worktree gets a derived `QUASAR_INSTANCE`, its own Compose project, a
+dedicated ten-port block, and an ephemeral test database. Do not hardcode ports,
+container names, or Compose project names in new tooling. Use the helpers under
+`scripts/dx/` and expose routine workflows through the root Makefile.
+
+<Aside type="note" title="A remote warning from doctor is advisory">
+An unreachable GPU host can make `make doctor` report degraded when you are off
+that network. It does not mean the local toolchain is unusable.
+</Aside>
+
+## Working on this site
+
+```bash
+cd site
+npm ci
+npm run dev
+```
+
+Build the production site with `npm run build`. Keep user and operator material
+outside this developer section; implementation and contribution material belongs
+here or in the repository's canonical `docs/` tree.
+
+The build reads `protocol/openapi.yaml` to generate the
+[Control-plane API](/quasar/developer/api/) reference, so it needs the protocol
+submodule present. `make init` handles that; in a checkout cloned without
+`--recurse-submodules`, run `git submodule update --init protocol` first. The
+build says so if it is missing.

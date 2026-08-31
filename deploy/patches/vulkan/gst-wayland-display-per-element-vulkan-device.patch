@@ -1,0 +1,571 @@
+diff --git a/gst-plugin-wayland-display/src/waylandsrc/imp.rs b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+index 2472251..01b6c98 100644
+--- a/gst-plugin-wayland-display/src/waylandsrc/imp.rs
++++ b/gst-plugin-wayland-display/src/waylandsrc/imp.rs
+@@ -52,6 +52,15 @@ pub struct WaylandDisplaySrc {
+     /// `quasar-renderer-degraded` bus WARNING (tracing does not reach the gst bus, so this
+     /// delta-sample is the bridge to the node-agent's fail-closed hook). Default 0 (#378).
+     renderer_degraded_seen: AtomicU64,
++    /// This element's OWN Vulkan-encode device share (8th gwd patch — per-element device
++    /// ownership). Replaces the old process-global `vulkan_share` `OnceLock` slots so N
++    /// concurrent Vulkan sessions in one process each mint/own/destroy their own `VkDevice`
++    /// (an isolated failure domain). Lives for the element's whole lifetime (created in
++    /// `Default`) so `set_context` / the context query / `set_caps` can reach it regardless of
++    /// start/stop ordering; a clone is handed to this element's compositor thread in `start()`
++    /// (`WaylandDisplay::new_with_channel`), and `stop()` calls `clear()` to destroy the device
++    /// per session so N sessions don't leak N devices.
++    vulkan_share: Arc<waylanddisplaycore::utils::vulkan_share::VulkanShare>,
+ }
+ 
+ impl Default for WaylandDisplaySrc {
+@@ -65,6 +74,7 @@ impl Default for WaylandDisplaySrc {
+             hdr_active: AtomicBool::new(false),
+             hdr_meta: Mutex::new((None, None)),
+             renderer_degraded_seen: AtomicU64::new(0),
++            vulkan_share: waylanddisplaycore::utils::vulkan_share::VulkanShare::new(),
+         }
+     }
+ }
+@@ -592,7 +602,7 @@ impl ElementImpl for WaylandDisplaySrc {
+     fn set_context(&self, context: &Context) {
+         // Absorb a downstream encoder's shared GstVulkanDevice so the Vulkan-encode path can
+         // mint encode-src images on the same device (best-effort; no-op for other contexts).
+-        if waylanddisplaycore::utils::vulkan_share::handle_set_context(context) {
++        if self.vulkan_share.handle_set_context(context) {
+             tracing::info!("waylandsrc: absorbed shared GstVulkanDevice for Vulkan encode path");
+         }
+ 
+@@ -728,7 +738,7 @@ impl WaylandDisplaySrc {
+         }
+         let node = render_node.unwrap_or_else(|| "/dev/dri/renderD128".into());
+         let minor = waylanddisplaycore::utils::vulkan_nv12::render_node_minor(&node);
+-        waylanddisplaycore::utils::vulkan_share::provide_context(
++        self.vulkan_share.provide_context(
+             self.obj().upcast_ref::<gst::Element>(),
+             query,
+             minor,
+@@ -1190,7 +1200,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
+                 .clone()
+                 .unwrap_or_else(|| "/dev/dri/renderD128".into());
+             let minor = waylanddisplaycore::utils::vulkan_nv12::render_node_minor(&node);
+-            waylanddisplaycore::utils::vulkan_share::ensure_owned_device(minor);
++            self.vulkan_share.ensure_owned_device(minor);
+             let base_video_info =
+                 gst_video::VideoInfo::from_caps(caps).expect("failed to get vulkan video info");
+             // P010 ⇒ the Vulkan HEVC encoder (vulkanh265enc) Main-10; NV12 ⇒ vulkanh264enc.
+@@ -1293,6 +1303,10 @@ impl BaseSrcImpl for WaylandDisplaySrc {
+                 render_node.clone(),
+                 self.command_tx.clone(),
+                 command_rx.deref_mut().take().unwrap(),
++                // Hand this element's compositor thread a clone of OUR per-element Vulkan share
++                // (8th gwd patch), so producer + compositor + encoder resolve THIS element's
++                // device — not a process-global singleton.
++                Arc::clone(&self.vulkan_share),
+             )
+         }) else {
+             return Err(gst::error_msg!(
+@@ -1374,6 +1388,11 @@ impl BaseSrcImpl for WaylandDisplaySrc {
+             let subscriber = Registry::default().with(GstLayer);
+             tracing::subscriber::with_default(subscriber, || drop(state.display));
+         }
++        // Destroy this session's owned Vulkan device+instance alongside the compositor teardown
++        // (8th gwd patch). The old process-global slots leaked by design; per-element ownership
++        // means a retired session must take its VkDevice with it so N sessions don't leak N
++        // devices. Safe to call unconditionally (no-op when the Vulkan path was never used).
++        self.vulkan_share.clear();
+         Ok(())
+     }
+ 
+diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
+index 00b3eb4..f0e08f4 100644
+--- a/wayland-display-core/src/comp/mod.rs
++++ b/wayland-display-core/src/comp/mod.rs
+@@ -85,6 +85,7 @@ pub use self::input::*;
+ pub use self::rendering::*;
+ #[cfg(feature = "cuda")]
+ use crate::utils::allocator::GsCUDABuf;
++use crate::utils::vulkan_share::VulkanShare;
+ use crate::utils::allocator::{
+     GsBuffer, GsBufferType, GsDmaBuf, GsGlesbuffer, GsNv12Buf, GsVulkanBuf, VideoInfoTypes,
+     gst_video_format_to_drm_fourcc, gst_video_format_to_drm_modifier, new_gbm_device,
+@@ -199,6 +200,12 @@ pub struct State {
+     /// Shared lifetime counter exported by waylanddisplaysrc. Only mapped
+     /// top-level application buffer commits increment it.
+     pub(crate) app_surface_commits: Arc<AtomicU64>,
++    /// This element's Vulkan-encode device share (8th gwd patch). A clone of the gst element's
++    /// own `Arc<VulkanShare>`, so the compositor thread reads the SAME per-element device the
++    /// element mints — not a process-global singleton. Read in `apply_video_info` when building
++    /// the `memory:VulkanImage` output ring. Replaced by the real share in [`init`]; the
++    /// `State::new` default is an empty placeholder.
++    pub(crate) vulkan_share: Arc<VulkanShare>,
+     /// When the current candidate HDR<->SDR flip was first observed; the flip is only
+     /// committed (TV switched) once it has held for [`HDR_DEBOUNCE`]. `None` = no pending
+     /// flip. See [`State::update_hdr_state`].
+@@ -505,6 +512,7 @@ impl State {
+             hdr_state_tx: None,
+             last_hdr_state: false,
+             app_surface_commits: Arc::new(AtomicU64::new(0)),
++            vulkan_share: VulkanShare::new(),
+             hdr_candidate_since: None,
+         }
+     }
+@@ -781,7 +789,11 @@ pub(crate) fn apply_video_info(
+                     // of panicking when it merely hasn't been shared yet. If it never comes,
+                     // leave output_buffer unset -- the render loop turns that into a clean
+                     // FlowError rather than aborting the process.
+-                    if crate::utils::vulkan_share::wait_for_shared_device(Duration::from_secs(5))
++                    // Per-element share (8th gwd patch): clone the Arc so we can pass it to
++                    // GsVulkanBuf::new while `state.renderer` is borrowed mutably below.
++                    let vulkan_share = Arc::clone(&state.vulkan_share);
++                    if vulkan_share
++                        .wait_for_shared_device(Duration::from_secs(5))
+                         .is_some()
+                     {
+                         match GsVulkanBuf::new(
+@@ -789,6 +801,7 @@ pub(crate) fn apply_video_info(
+                             node,
+                             params.video_info,
+                             params.profile,
++                            &vulkan_share,
+                         ) {
+                             Some(allocator) => {
+                                 state.output_buffer = Some(GsBufferType::VULKAN(allocator))
+@@ -873,6 +886,7 @@ pub(crate) fn init(
+     hdr_state_tx: Sender<Command>,
+     app_surface_commits: Arc<AtomicU64>,
+     renderer_degraded: Arc<AtomicU64>,
++    vulkan_share: Arc<VulkanShare>,
+ ) {
+     let render_target = render.into();
+     let _ = devices_tx.send(render_target.clone().as_devices());
+@@ -891,6 +905,7 @@ pub(crate) fn init(
+     let mut state = State::new(&render_target, &dh, &input_context, event_loop.handle());
+     state.app_surface_commits = app_surface_commits;
+     state.renderer_degraded = renderer_degraded;
++    state.vulkan_share = vulkan_share;
+ 
+     // Wire the compositor -> element HDR-state reverse channel only under WOLF_HDR_CM;
+     // unset leaves `hdr_state_tx` as `None`, making the per-frame HDR check a no-op.
+diff --git a/wayland-display-core/src/lib.rs b/wayland-display-core/src/lib.rs
+index e49239b..033d9b3 100644
+--- a/wayland-display-core/src/lib.rs
++++ b/wayland-display-core/src/lib.rs
+@@ -5,6 +5,7 @@ pub use smithay::reexports::calloop::channel::{Channel, Sender, channel};
+ #[cfg(feature = "cuda")]
+ use crate::utils::allocator::cuda::CUDABufferPool;
+ use crate::utils::device::gpu::GPUDevice;
++use crate::utils::vulkan_share::VulkanShare;
+ pub use smithay::backend::allocator::{
+     Format as DrmFormat, Fourcc, Modifier as DrmModifier, Vendor as DrmVendor, format::FormatSet,
+ };
+@@ -150,6 +151,12 @@ impl WaylandDisplay {
+         let compositor_commits = Arc::clone(&app_surface_commits);
+         let renderer_degraded = Arc::new(AtomicU64::new(0));
+         let compositor_degraded = Arc::clone(&renderer_degraded);
++        // Per-element Vulkan share (8th gwd patch). This constructor has no gst element to
++        // answer context queries, so nothing outside the compositor thread mints on it — but
++        // comp::init still needs one, and making it per-instance keeps the process-global
++        // singleton gone on this path too.
++        let vulkan_share = VulkanShare::new();
++        let compositor_vulkan_share = Arc::clone(&vulkan_share);
+         let render_target = RenderTarget::from_str(
+             &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
+         )?;
+@@ -167,6 +174,7 @@ impl WaylandDisplay {
+                     hdr_state_tx,
+                     compositor_commits,
+                     compositor_degraded,
++                    compositor_vulkan_share,
+                 );
+             }) {
+                 tracing::error!(?err, "Compositor thread panic'ed!");
+@@ -190,6 +198,7 @@ impl WaylandDisplay {
+         render_node: Option<String>,
+         command_tx: Sender<Command>,
+         commands_rx: Channel<Command>,
++        vulkan_share: Arc<VulkanShare>,
+     ) -> Result<WaylandDisplay, CreateDrmNodeError> {
+         let (devices_tx, devices_rx) = std::sync::mpsc::channel();
+         let (envs_tx, envs_rx) = std::sync::mpsc::channel();
+@@ -199,6 +208,11 @@ impl WaylandDisplay {
+         let compositor_commits = Arc::clone(&app_surface_commits);
+         let renderer_degraded = Arc::new(AtomicU64::new(0));
+         let compositor_degraded = Arc::clone(&renderer_degraded);
++        // Per-element Vulkan share (8th gwd patch): the gst element owns it (for its
++        // set_context / context-query / teardown calls) and hands the compositor thread a
++        // clone, so producer + encoder + compositor all see THIS element's device — mirrors
++        // the app_surface_commits / renderer_degraded Arcs threaded just above.
++        let compositor_vulkan_share = Arc::clone(&vulkan_share);
+         let render_target = RenderTarget::from_str(
+             &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
+         )?;
+@@ -212,6 +226,7 @@ impl WaylandDisplay {
+                 hdr_state_tx,
+                 compositor_commits,
+                 compositor_degraded,
++                compositor_vulkan_share,
+             );
+         });
+ 
+diff --git a/wayland-display-core/src/utils/allocator/mod.rs b/wayland-display-core/src/utils/allocator/mod.rs
+index aa1f130..5418f5a 100644
+--- a/wayland-display-core/src/utils/allocator/mod.rs
++++ b/wayland-display-core/src/utils/allocator/mod.rs
+@@ -285,6 +285,7 @@ impl GsVulkanBuf {
+         render_node: DrmNode,
+         video_info: VideoInfo,
+         profile: String,
++        vulkan_share: &crate::utils::vulkan_share::VulkanShare,
+     ) -> Option<Self> {
+         let (w, h) = (video_info.width(), video_info.height());
+ 
+@@ -318,8 +319,9 @@ impl GsVulkanBuf {
+             rgba.format().modifier
+         );
+ 
+-        // The shared device must already have been absorbed from a GstContext.
+-        let dev = crate::utils::vulkan_share::shared_device()?;
++        // This element's shared device must already have been absorbed from a GstContext
++        // (8th gwd patch: read THIS element's per-element share, not a process-global slot).
++        let dev = vulkan_share.shared_device()?;
+         let raw = crate::utils::vulkan_share::raw_handles(&dev)?;
+         // NV12 (8-bit, vulkanh264enc) or P010 (10-bit, vulkanh265enc Main-10) per the
+         // negotiated memory:VulkanImage format.
+diff --git a/wayland-display-core/src/utils/vulkan_share.rs b/wayland-display-core/src/utils/vulkan_share.rs
+index 4aaaf31..ffdbd6d 100644
+--- a/wayland-display-core/src/utils/vulkan_share.rs
++++ b/wayland-display-core/src/utils/vulkan_share.rs
+@@ -28,7 +28,7 @@ use gst::prelude::*;
+ use gstreamer_vulkan::prelude::*;
+ use gstreamer_vulkan::{VulkanDevice, VulkanInstance, VulkanPhysicalDevice, VulkanQueue};
+ use gstreamer_vulkan_sys as gstvk;
+-use std::sync::{Mutex, OnceLock};
++use std::sync::{Arc, Mutex};
+ 
+ // VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR / VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR via raw
+ // values (stable, and avoids depending on the named ash constants existing).
+@@ -57,39 +57,68 @@ pub struct RawVk {
+     pub gfx_queue: VulkanQueue,
+ }
+ 
+-/// Process-wide slot for the shared device, filled from `set_context` and read by the
+-/// converter when it builds its output ring (mirrors `va_share`'s display slot).
+-fn device_slot() -> &'static Mutex<Option<VulkanDevice>> {
+-    static SLOT: OnceLock<Mutex<Option<VulkanDevice>>> = OnceLock::new();
+-    SLOT.get_or_init(|| Mutex::new(None))
++/// Per-`waylanddisplaysrc`-element owner of the Vulkan objects the encode path shares.
++///
++/// **8th gst-wayland-display patch — per-element Vulkan device ownership.** Historically the
++/// owned `GstVulkanInstance` + `GstVulkanDevice` lived in *process-global* `OnceLock` slots,
++/// so every session in one process reused the first session's `VkDevice` (a single failure
++/// domain — one session's `DEVICE_LOST` corrupts all N; session 2..N's `target_minor`
++/// ignored; a deliberate per-process device leak). One `VulkanShare` is now created per
++/// element and cloned **once** into that element's compositor thread (mirroring the existing
++/// `app_surface_commits` / `renderer_degraded` `Arc`s threaded through
++/// `WaylandDisplay::new_with_channel` -> `comp::init`), so each `waylanddisplaysrc` mints,
++/// answers `gst.vulkan.{instance,device}` context queries with, and (on teardown, via
++/// [`clear`](VulkanShare::clear)) destroys its **own** device. N concurrent Vulkan-encode
++/// sessions on one host therefore get N isolated devices — a `DEVICE_LOST` on one retires
++/// only that element's device, leaving the other N-1 untouched.
++///
++/// This is a **storage-location** change only: device creation
++/// ([`ensure_owned_device`](VulkanShare::ensure_owned_device)) is byte-identical to the
++/// previous global path, with no vendor branch, so the RADV path sees no behavioral change.
++/// The `repr(C)` overlays (module header) and the `wayland_display_vk_*` C bridge are
++/// untouched.
++pub struct VulkanShare {
++    /// The `GstVulkanInstance` we own (keeps it alive + lets us answer `gst.vulkan.instance`
++    /// context queries). Replaces the process-global `instance_slot()`.
++    instance: Mutex<Option<VulkanInstance>>,
++    /// The shared device, filled from `set_context`
++    /// ([`handle_set_context`](VulkanShare::handle_set_context)) or minted by
++    /// [`ensure_owned_device`](VulkanShare::ensure_owned_device), and read by the converter
++    /// when it builds its output ring. Replaces the process-global `device_slot()`.
++    device: Mutex<Option<VulkanDevice>>,
+ }
+ 
+-/// Pull the shared `GstVulkanDevice` out of a received `GstContext` and stash it. Call from
+-/// `ElementImpl::set_context` for the `gst.vulkan.device` context type. Returns true if a
+-/// device is now shared.
+-pub fn handle_set_context(context: &gst::Context) -> bool {
+-    let ctx_ptr = context.to_glib_none().0;
+-    let mut dev_ptr: *mut gstvk::GstVulkanDevice = std::ptr::null_mut();
+-    let got = unsafe { gstvk::gst_context_get_vulkan_device(ctx_ptr, &mut dev_ptr) };
+-    if got == gst::glib::ffi::GFALSE || dev_ptr.is_null() {
+-        return false;
++impl VulkanShare {
++    /// A fresh, empty per-element share. Cheap; holds no Vulkan objects until first use. Kept
++    /// behind an `Arc` so one clone can be handed to the compositor thread while the element
++    /// keeps the other (exactly like `app_surface_commits` / `renderer_degraded`).
++    pub fn new() -> Arc<VulkanShare> {
++        Arc::new(VulkanShare {
++            instance: Mutex::new(None),
++            device: Mutex::new(None),
++        })
+     }
+-    let device: VulkanDevice = unsafe { from_glib_full(dev_ptr) };
+-    tracing::debug!("vulkan_share: absorbed shared GstVulkanDevice {dev_ptr:?}");
+-    *device_slot().lock().unwrap() = Some(device);
+-    true
+-}
+ 
+-/// The shared device, if one has been created (or absorbed).
+-pub fn shared_device() -> Option<VulkanDevice> {
+-    device_slot().lock().unwrap().clone()
+-}
++    /// Pull the shared `GstVulkanDevice` out of a received `GstContext` and stash it in **this
++    /// element's** slot. Call from `ElementImpl::set_context` for the `gst.vulkan.device`
++    /// context type. Returns true if a device is now shared.
++    pub fn handle_set_context(&self, context: &gst::Context) -> bool {
++        let ctx_ptr = context.to_glib_none().0;
++        let mut dev_ptr: *mut gstvk::GstVulkanDevice = std::ptr::null_mut();
++        let got = unsafe { gstvk::gst_context_get_vulkan_device(ctx_ptr, &mut dev_ptr) };
++        if got == gst::glib::ffi::GFALSE || dev_ptr.is_null() {
++            return false;
++        }
++        let device: VulkanDevice = unsafe { from_glib_full(dev_ptr) };
++        tracing::debug!("vulkan_share: absorbed shared GstVulkanDevice {dev_ptr:?}");
++        *self.device.lock().unwrap() = Some(device);
++        true
++    }
+ 
+-/// Process-wide slot for the `GstVulkanInstance` we own (keeps it alive + lets us answer
+-/// `gst.vulkan.instance` context queries).
+-fn instance_slot() -> &'static Mutex<Option<VulkanInstance>> {
+-    static SLOT: OnceLock<Mutex<Option<VulkanInstance>>> = OnceLock::new();
+-    SLOT.get_or_init(|| Mutex::new(None))
++    /// This element's shared device, if one has been created (or absorbed).
++    pub fn shared_device(&self) -> Option<VulkanDevice> {
++        self.device.lock().unwrap().clone()
++    }
+ }
+ 
+ // VK_QUEUE_VIDEO_ENCODE_BIT_KHR — the encoder (gst_vulkan_encoder_create_from_queue) requires a
+@@ -169,95 +198,114 @@ unsafe fn physical_index_for_minor(
+     Some(0)
+ }
+ 
+-/// Create (once) the `GstVulkanInstance` + `GstVulkanDevice` that *we* own, on the GPU
+-/// backing `target_minor`, with the external-memory extensions the RGBA-dmabuf import needs
+-/// (`VK_KHR_external_memory_fd` etc.) enabled — which gst-vulkan's own device does not. This
+-/// is the device we hand the encoder (see [`provide_context`]) so producer and encoder share
+-/// one device with no zero-copy gap *and* no gstreamer fork. Idempotent.
+-pub fn ensure_owned_device(target_minor: Option<u32>) -> Option<VulkanDevice> {
+-    let mut slot = device_slot().lock().unwrap();
+-    if let Some(d) = slot.clone() {
+-        return Some(d);
+-    }
+-    let instance = VulkanInstance::new();
+-    if let Err(e) = instance.open() {
+-        tracing::error!("vulkan_share: GstVulkanInstance open failed: {e}");
+-        return None;
+-    }
+-    let vk_instance = unsafe { wayland_display_vk_instance_handle(instance.as_ptr()) };
+-    let index = unsafe {
+-        let entry = match ash::Entry::load() {
+-            Ok(e) => e,
+-            Err(e) => {
+-                tracing::error!("vulkan_share: ash entry load failed: {e}");
+-                return None;
+-            }
++impl VulkanShare {
++    /// Create (once, on **this element**) the `GstVulkanInstance` + `GstVulkanDevice` that *we*
++    /// own, on the GPU backing `target_minor`, with the external-memory extensions the
++    /// RGBA-dmabuf import needs (`VK_KHR_external_memory_fd` etc.) enabled — which gst-vulkan's
++    /// own device does not. This is the device we hand the encoder (see
++    /// [`provide_context`](VulkanShare::provide_context)) so producer and encoder share one
++    /// device with no zero-copy gap *and* no gstreamer fork. Idempotent **per element** (not
++    /// per process): the first call on *this* share mints on *this* element's `target_minor`.
++    ///
++    /// Device creation below is unchanged from the pre-patch process-global path — no vendor
++    /// branch — so RADV behaves byte-identically; only where the result is stored moved from a
++    /// `static` slot to `self`.
++    pub fn ensure_owned_device(&self, target_minor: Option<u32>) -> Option<VulkanDevice> {
++        let mut slot = self.device.lock().unwrap();
++        if let Some(d) = slot.clone() {
++            return Some(d);
++        }
++        let instance = VulkanInstance::new();
++        if let Err(e) = instance.open() {
++            tracing::error!("vulkan_share: GstVulkanInstance open failed: {e}");
++            return None;
++        }
++        let vk_instance = unsafe { wayland_display_vk_instance_handle(instance.as_ptr()) };
++        let index = unsafe {
++            let entry = match ash::Entry::load() {
++                Ok(e) => e,
++                Err(e) => {
++                    tracing::error!("vulkan_share: ash entry load failed: {e}");
++                    return None;
++                }
++            };
++            let ash_inst = ash::Instance::load(entry.static_fn(), vk_instance);
++            physical_index_for_minor(&ash_inst, target_minor)?
+         };
+-        let ash_inst = ash::Instance::load(entry.static_fn(), vk_instance);
+-        physical_index_for_minor(&ash_inst, target_minor)?
+-    };
+-    let physical = VulkanPhysicalDevice::new(&instance, index);
+-    let device = VulkanDevice::new(&physical);
+-    for ext in [
+-        "VK_KHR_external_memory_fd",
+-        "VK_EXT_external_memory_dma_buf",
+-        "VK_EXT_image_drm_format_modifier",
+-        "VK_KHR_external_semaphore_fd",
+-    ] {
+-        device.enable_extension(ext);
+-    }
+-    if let Err(e) = device.open() {
+-        tracing::error!("vulkan_share: GstVulkanDevice open failed: {e}");
+-        return None;
++        let physical = VulkanPhysicalDevice::new(&instance, index);
++        let device = VulkanDevice::new(&physical);
++        for ext in [
++            "VK_KHR_external_memory_fd",
++            "VK_EXT_external_memory_dma_buf",
++            "VK_EXT_image_drm_format_modifier",
++            "VK_KHR_external_semaphore_fd",
++        ] {
++            device.enable_extension(ext);
++        }
++        if let Err(e) = device.open() {
++            tracing::error!("vulkan_share: GstVulkanDevice open failed: {e}");
++            return None;
++        }
++        *self.instance.lock().unwrap() = Some(instance);
++        *slot = Some(device.clone());
++        tracing::info!(
++            "vulkan_share: created per-element shared GstVulkanDevice (phys idx {index}) with external-memory extensions"
++        );
++        Some(device)
+     }
+-    *instance_slot().lock().unwrap() = Some(instance);
+-    *slot = Some(device.clone());
+-    tracing::info!(
+-        "vulkan_share: created shared GstVulkanDevice (phys idx {index}) with external-memory extensions"
+-    );
+-    Some(device)
+-}
+ 
+-/// Answer a `gst.vulkan.{instance,device}` context query on `element` with the device we own,
+-/// creating it on `target_minor`'s GPU on first ask. The downstream encoder's
+-/// `gst_vulkan_ensure_element_data` then adopts *our* device instead of minting its own.
+-pub fn provide_context(
+-    element: &gst::Element,
+-    query: &mut gst::QueryRef,
+-    target_minor: Option<u32>,
+-) -> bool {
+-    if ensure_owned_device(target_minor).is_none() {
+-        return false;
+-    }
+-    let inst = instance_slot().lock().unwrap().clone();
+-    let dev = device_slot().lock().unwrap().clone();
+-    unsafe {
+-        gstvk::gst_vulkan_handle_context_query(
+-            element.as_ptr() as *mut _,
+-            query.as_mut_ptr() as *mut _,
+-            std::ptr::null_mut(),
+-            inst.as_ref().map_or(std::ptr::null_mut(), |i| i.as_ptr()) as *mut _,
+-            dev.as_ref().map_or(std::ptr::null_mut(), |d| d.as_ptr()) as *mut _,
+-        ) != gst::glib::ffi::GFALSE
++    /// Answer a `gst.vulkan.{instance,device}` context query on `element` with the device we
++    /// own, creating it on `target_minor`'s GPU on first ask. The downstream encoder's
++    /// `gst_vulkan_ensure_element_data` then adopts *our* device instead of minting its own.
++    pub fn provide_context(
++        &self,
++        element: &gst::Element,
++        query: &mut gst::QueryRef,
++        target_minor: Option<u32>,
++    ) -> bool {
++        if self.ensure_owned_device(target_minor).is_none() {
++            return false;
++        }
++        let inst = self.instance.lock().unwrap().clone();
++        let dev = self.device.lock().unwrap().clone();
++        unsafe {
++            gstvk::gst_vulkan_handle_context_query(
++                element.as_ptr() as *mut _,
++                query.as_mut_ptr() as *mut _,
++                std::ptr::null_mut(),
++                inst.as_ref().map_or(std::ptr::null_mut(), |i| i.as_ptr()) as *mut _,
++                dev.as_ref().map_or(std::ptr::null_mut(), |d| d.as_ptr()) as *mut _,
++            ) != gst::glib::ffi::GFALSE
++        }
+     }
+-}
+ 
+-/// Wait up to `timeout` for our shared `GstVulkanDevice` to be available.
+-///
+-/// The encoder shares its device via a `GstContext` delivered to `set_context` on the
+-/// streaming thread, which races the compositor thread that allocates our Vulkan output
+-/// buffer. Polling here lets the allocation wait for the device to arrive instead of
+-/// failing when it merely hasn't been shared *yet*. Returns `None` if it never arrives.
+-pub fn wait_for_shared_device(timeout: std::time::Duration) -> Option<VulkanDevice> {
+-    let start = std::time::Instant::now();
+-    loop {
+-        if let Some(dev) = shared_device() {
+-            return Some(dev);
+-        }
+-        if start.elapsed() >= timeout {
+-            return None;
++    /// Wait up to `timeout` for **this element's** shared `GstVulkanDevice` to be available.
++    ///
++    /// The encoder shares its device via a `GstContext` delivered to `set_context` on the
++    /// streaming thread, which races the compositor thread that allocates this element's Vulkan
++    /// output buffer. Polling here lets the allocation wait for the device to arrive instead of
++    /// failing when it merely hasn't been shared *yet*. The race is **per element**, so the
++    /// poll is retained, scoped to this share. Returns `None` if it never arrives.
++    pub fn wait_for_shared_device(&self, timeout: std::time::Duration) -> Option<VulkanDevice> {
++        let start = std::time::Instant::now();
++        loop {
++            if let Some(dev) = self.shared_device() {
++                return Some(dev);
++            }
++            if start.elapsed() >= timeout {
++                return None;
++            }
++            std::thread::sleep(std::time::Duration::from_millis(10));
+         }
+-        std::thread::sleep(std::time::Duration::from_millis(10));
++    }
++
++    /// Destroy this element's owned instance + device (session teardown). Called from the
++    /// element's `stop()` alongside `drop(state.display)`, so a retired session takes its
++    /// `VkDevice` with it — the gwd half of the per-session failure domain, and what keeps N
++    /// sessions from leaking N devices (the old process-global slot leaked by design).
++    pub fn clear(&self) {
++        *self.device.lock().unwrap() = None;
++        *self.instance.lock().unwrap() = None;
+     }
+ }
+ 
+@@ -539,3 +587,29 @@ pub fn recover_vk_image(buffer: &gst::Buffer) -> Option<vk::Image> {
+         (image != vk::Image::null()).then_some(image)
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Per-element ownership, GPU-free half of spec §4 rung 1: two `VulkanShare`s are
++    /// independent objects (distinct backing storage), each starts with no device, and
++    /// clearing / mutating one never touches the other. The full "two elements mint **distinct**
++    /// `GstVulkanDevice` pointers" assertion needs a real GPU and belongs to the Tower soak
++    /// (§4 rung 1 / §7 cross-session distinctness log) — it cannot run in a headless unit test
++    /// because `ensure_owned_device` opens a real `VkDevice`.
++    #[test]
++    fn shares_are_independent_per_element() {
++        let a = VulkanShare::new();
++        let b = VulkanShare::new();
++        // Distinct allocations — not the old process-global singleton.
++        assert!(!Arc::ptr_eq(&a, &b));
++        // Fresh shares own no device until first use.
++        assert!(a.shared_device().is_none());
++        assert!(b.shared_device().is_none());
++        // Clearing one is a no-op on the other (both remain empty; no shared slot).
++        a.clear();
++        assert!(a.shared_device().is_none());
++        assert!(b.shared_device().is_none());
++    }
++}

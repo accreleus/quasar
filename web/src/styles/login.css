@@ -1,0 +1,343 @@
+/* ============================================================
+   QUASAR — Pre-auth surface (v3)
+   Source of truth: design_handoff_v3/screens/login-v3.html, described in
+   docs/superpowers/specs/2026-08-28-ui-v3/handoff-v3-spec.md §C.
+
+   Every rule is scoped under `.auth-scene` (the mock's `.scene` root),
+   because the class names it uses — .card, .field, .input, .check, .row —
+   are all names the app already owns in primitives.css. The scope is what
+   keeps a login rule out of the console, and it is also what makes these
+   rules win: one extra class beats the unscoped primitive regardless of
+   which sheet the bundler happens to emit first.
+
+   Imported LAST in main.tsx for the same reason: where a selector ties on
+   specificity with a legacy sheet, source order decides, and the pre-auth
+   card is the later artefact.
+
+   Dark-locked: the pages render inside useDarkLock(), so no light-theme
+   block is needed here. The mock's two optional backdrops (.globe, #runner)
+   are deliberately not implemented — see §C "What is cut".
+   ============================================================ */
+
+.auth-scene {
+  /* The login/loading alias the mock uses for its brightest ink; the app's
+     scale tops out at --text. Local to this surface by design. */
+  --fg-strong: oklch(0.985 0.004 247);
+
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-height: 100svh;
+  padding: clamp(1.5rem, 5vw, 3rem);
+  overflow: clip;
+  isolation: isolate;
+  background:
+    radial-gradient(circle at 50% 34%, var(--accent-soft), transparent 34%),
+    radial-gradient(circle at 84% 8%, oklch(0.5998 0.2179 273.21/.07), transparent 32%),
+    linear-gradient(150deg, var(--bg), oklch(0.13 0.012 267) 58%, var(--core));
+}
+
+.auth-scene .stack {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  justify-items: center;
+  width: min(24.5rem, 100%);
+  /* `.stack` is also a primitives name (a 1px-gap flex column at line-height
+     1.25). Inside the card that leading applied to every line of copy. */
+  gap: 0;
+  line-height: 1.55;
+}
+
+/* Thinner glass than the app default: the blur does the legibility work,
+   not opacity. */
+.auth-scene .card {
+  width: 100%;
+  padding: clamp(1.4rem, 3vw, 1.85rem);
+  border: 1px solid oklch(0.9618 0.0086 247.91/.16);
+  border-radius: var(--r-feature);
+  background: oklch(0.224 0.018 263/.34);
+  box-shadow: var(--shadow-lg);
+  backdrop-filter: blur(14px) saturate(130%);
+  -webkit-backdrop-filter: blur(14px) saturate(130%);
+}
+
+/* The setup wizard's steps are themselves `.card login-card` forms (that is
+   how they got their padding pre-v3). Inside the auth card they are the
+   content, not a second surface, so they flatten. */
+.auth-scene .card > .card {
+  /* `.login-card` caps itself at 400px and the steps set their own inline
+     max-width; neither should sit off-centre in the wider card. */
+  max-width: none;
+  margin-inline: auto;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* ---------- LOCKUP (the heading) ----------
+   A wordmark plus a greeting gave the card two titles competing for the
+   same job, so the lockup IS the heading. */
+.auth-scene .lockup {
+  display: grid;
+  justify-items: center;
+  gap: .85rem;
+  margin-bottom: 1.6rem;
+}
+
+.auth-scene .lockup .mark {
+  width: 3.25rem;
+  height: 3.25rem;
+}
+
+.auth-scene .wordmark {
+  /* shell.css hides `.wordmark` below 760px and under [data-rail="collapsed"]
+     — that is the topbar's word next to a 24px mark, not this card's heading.
+     Without this the card lost its only <h1> on a phone. */
+  display: block;
+  margin: 0;
+  font-family: var(--font-brand);
+  font-size: .9rem;
+  font-weight: 400;
+  letter-spacing: .2em;
+  line-height: 1.4;
+  text-transform: uppercase;
+  color: var(--fg-strong);
+}
+
+/* ---------- FORM ---------- */
+.auth-scene form {
+  display: grid;
+  gap: 1.05rem;
+}
+
+.auth-scene .field {
+  display: grid;
+  gap: .45rem;
+}
+
+.auth-scene .field label,
+.auth-scene .field .label {
+  color: var(--text-2);
+  font-size: .75rem;
+  font-weight: 500;
+}
+
+.auth-scene .input {
+  width: 100%;
+  height: auto;
+  min-height: 2.75rem;
+  padding: 0 .8rem;
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-control);
+  background: oklch(0.105 0.01 267/.56);
+  color: var(--text);
+  font-size: var(--t-base);
+  outline: none;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  transition: border-color 150ms ease, box-shadow 150ms ease;
+}
+
+.auth-scene .input::placeholder {
+  color: oklch(0.6605 0.0265 259.81/.7);
+}
+
+.auth-scene .input:hover {
+  border-color: var(--text-2);
+}
+
+.auth-scene .input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.auth-scene .input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+/* ---------- PASSWORD REVEAL ---------- */
+.auth-scene .pw {
+  position: relative;
+}
+
+.auth-scene .pw .input {
+  padding-right: 4.1rem;
+}
+
+.auth-scene .reveal {
+  position: absolute;
+  top: 50%;
+  right: .35rem;
+  transform: translateY(-50%);
+  padding: .3rem .5rem;
+  border: 0;
+  border-radius: var(--r-control);
+  background: none;
+  color: var(--text-3);
+  cursor: pointer;
+  font-size: .72rem;
+  font-weight: 600;
+  transition: color 150ms ease, background 150ms ease;
+}
+
+.auth-scene .reveal:hover {
+  color: var(--text);
+  background: var(--glass-control);
+}
+
+/* ---------- MESSAGES ----------
+   `:empty` takes the error out of the layout AND out of the accessibility
+   tree until it says something, so the message is effectively inserted at
+   error time — which browsers announce for a role="alert" all the same. */
+.auth-scene .error {
+  min-height: 0;
+  color: oklch(0.82 0.12 27);
+  font-size: .7rem;
+}
+
+.auth-scene .error:empty {
+  display: none;
+}
+
+/* The form-level alert is a <p>: drop the UA margin so the grid gap is the
+   only spacing. */
+.auth-scene p.error {
+  margin: 0;
+}
+
+.auth-scene .auth-note {
+  margin: 0;
+  padding: .5rem .7rem;
+  border: 1px solid var(--success-line);
+  border-radius: var(--r-control);
+  background: var(--success-bg);
+  color: var(--success-text);
+  font-size: .72rem;
+}
+
+/* ---------- REMEMBER ----------
+   1.15rem box on a 2.75rem row: the row, not the box, is the hit target. */
+.auth-scene .check {
+  display: flex;
+  min-height: 2.75rem;
+  align-items: center;
+  gap: .75rem;
+  color: var(--text-2);
+  cursor: pointer;
+  font-size: .8rem;
+}
+
+.auth-scene .check input {
+  appearance: none;
+  display: grid;
+  width: 1.15rem;
+  height: 1.15rem;
+  flex: none;
+  place-content: center;
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-control);
+  background: var(--glass-control);
+  cursor: pointer;
+}
+
+.auth-scene .check input::after,
+.auth-scene .check input:checked::after {
+  content: "";
+  position: static;
+  left: auto;
+  top: auto;
+  width: .55rem;
+  height: .55rem;
+  border: 0;
+  border-right: 2px solid var(--text);
+  border-bottom: 2px solid var(--text);
+  translate: 0 -.08rem;
+  transition: transform 140ms ease;
+}
+
+.auth-scene .check input::after {
+  transform: rotate(45deg) scale(0);
+}
+
+.auth-scene .check input:checked {
+  border-color: var(--accent);
+  background: var(--action);
+}
+
+.auth-scene .check input:checked::after {
+  transform: rotate(45deg) scale(1);
+}
+
+/* ---------- SUBMIT ----------
+   Colour, hover lift and press come from `.btn.btn-primary` (primitives);
+   only the pre-auth card's taller box and its submitting state live here. */
+.auth-scene .btn.btn-block {
+  height: auto;
+  min-height: 2.75rem;
+  font-size: .88rem;
+}
+
+/* Only the button whose own request is in flight reads as progress: a
+   wizard button disabled while its step loads is not this state. */
+.auth-scene .btn.is-submitting:disabled {
+  opacity: .62;
+  cursor: progress;
+  transform: none;
+}
+
+.auth-scene .spin {
+  width: .95rem;
+  height: .95rem;
+  flex: none;
+  border: 2px solid oklch(1 0 0/.35);
+  border-top-color: oklch(1 0 0);
+  border-radius: 50%;
+  animation: auth-spin 700ms linear infinite;
+}
+
+@keyframes auth-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---------- QUIET LINKS ---------- */
+.auth-scene .link-line {
+  margin: 0;
+  color: var(--text-4);
+  font-size: .72rem;
+  text-align: center;
+}
+
+/* The link has to out-contrast the sentence around it and look clickable —
+   quiet is not the same as hidden. */
+.auth-scene .link-quiet {
+  color: var(--text-2);
+  font-size: .72rem;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.auth-scene .link-quiet:hover {
+  color: var(--fg-strong);
+}
+
+/* The wizard's pre-step status line ("Checking instance status..."). */
+.auth-scene .auth-status {
+  margin: 0;
+  color: var(--text-3);
+  font-size: var(--t-sm);
+  text-align: center;
+}
+
+/* ---------- WIZARD ----------
+   The step indicator and step bodies sit in the same card; give the
+   indicator room without touching the steps themselves. */
+.auth-scene .step-indicator {
+  margin-bottom: 1.3rem;
+}

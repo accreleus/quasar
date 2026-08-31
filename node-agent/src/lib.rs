@@ -1,0 +1,30 @@
+//! Library surface for the Quasar node-agent. The binary entry point lives in
+//! `main.rs` and consumes this crate; exposing the modules here also lets the
+//! Criterion benches (`benches/`) and any integration tests exercise internal
+//! APIs such as `session::metrics::SessionMetrics`.
+
+pub mod agent;
+/// Shared download/lock/backoff machinery for the artifact provisioners
+/// (`nvidia_volume`, `cuda_runtime`).
+pub mod artifact;
+pub mod capacity;
+pub mod config;
+/// Runtime-provisioned CUDA userspace (NVRTC) — what registers the `cuda*`
+/// GStreamer elements on an NVIDIA host (#545).
+pub mod cuda_runtime;
+pub mod ddc;
+/// `host.xid` / `host.gpu_fault`: the kernel's own GPU fault records, off `/dev/kmsg`.
+pub mod gpu_kmsg;
+/// GPU-vendor detection backing the `QUASAR_ENCODER` auto-default.
+pub mod gpu_vendor;
+pub mod health;
+pub mod images;
+pub mod jobs;
+/// Log spans + the WARN/ERROR `token=` convention (`.claude/rules/agent-logging.md`).
+pub mod logging;
+pub mod memstat;
+pub mod messages;
+pub mod nvidia_volume;
+pub mod readiness;
+pub mod session;
+pub mod vram;

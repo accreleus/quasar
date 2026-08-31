@@ -1,0 +1,38 @@
+"AppState"
+{
+	"appid"		"1628350"
+	"Universe"		"1"
+	"name"		"Steam Linux Runtime 3.0 (sniper)"
+	"StateFlags"		"4"
+	"installdir"		"SteamLinuxRuntime_sniper"
+	"LastUpdated"		"1784943013"
+	"LastPlayed"		"0"
+	"SizeOnDisk"		"802852005"
+	"StagingSize"		"0"
+	"buildid"		"23629198"
+	"LastOwner"		"76561190000000000"
+	"DownloadType"		"1"
+	"UpdateResult"		"0"
+	"BytesToDownload"		"227183072"
+	"BytesDownloaded"		"227183072"
+	"BytesToStage"		"802852005"
+	"BytesStaged"		"802852005"
+	"TargetBuildID"		"23629198"
+	"AutoUpdateBehavior"		"0"
+	"AllowOtherDownloadsWhileRunning"		"0"
+	"ScheduledAutoUpdate"		"0"
+	"InstalledDepots"
+	{
+		"1628351"
+		{
+			"manifest"		"6709564751129534468"
+			"size"		"802852005"
+		}
+	}
+	"UserConfig"
+	{
+	}
+	"MountedConfig"
+	{
+	}
+}

@@ -1,0 +1,35 @@
+-- First-run wizard v2, wave W-A (docs/design/plans/2026-08-09-first-run-wizard-v2-spec.md
+-- §S6e).
+--
+-- NOTE: this migration originally also created instance_tls_certificate for the
+-- §S6d certificate-upload endpoint. That endpoint was split onto
+-- feat/tls-certificate-upload before either shipped, so the table went with it —
+-- there is no deployed database that has ever had it, and nothing to clean up.
+--
+-- S6e — the signaling allow-list becomes admin-editable.
+--
+-- QUASAR_ALLOWED_ORIGINS was env-only, gated exactly /v1/signal, and its 403 is
+-- structurally invisible to browser JS. The case it exists for — a reverse proxy
+-- that rewrites Host, so the same-origin exemption in signal.originAllowed
+-- misses — is therefore an outage an operator cannot diagnose from the client.
+-- Moving it to a column makes it settable from the admin UI and reportable by
+-- GET /v1/admin/access-check.
+--
+-- THE ENV VAR REMAINS AN OVERRIDE, NOT A DEFAULT. When QUASAR_ALLOWED_ORIGINS is
+-- SET (even to an empty string, which is a deliberate "explicitly nothing"), it
+-- wins outright and this column is not consulted. That is what makes the upgrade
+-- a no-op for every existing deployment: nothing about their behaviour changes
+-- until they unset the variable. GET /v1/admin/access-check reports which source
+-- won so a UI can grey out a control the environment has pinned — the same
+-- precedent library_discovery_interval_minutes set.
+--
+-- Empty array (the default) means "no configured allow-list", which is NOT
+-- "deny all": signal.originAllowed still exempts a same-origin request and a
+-- request with no Origin header at all. A fresh instance therefore keeps
+-- working with nothing configured, exactly as it does today.
+--
+-- text[] rather than a comma-joined text column: the values are a set, and a
+-- comma-joined string would invite a UI to split on a character that a
+-- (rejected, but still submittable) entry could contain.
+ALTER TABLE instance_settings
+    ADD COLUMN IF NOT EXISTS allowed_origins TEXT[] NOT NULL DEFAULT '{}';

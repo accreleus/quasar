@@ -1,0 +1,1011 @@
+/* ============================================================
+   THE SESSION HUD — one object, dockable to any edge.
+   Ported from design_handoff_v3/screens/session-overlay-v3.html
+   (the page-local <style> block), with three translations:
+
+   1. The mock drives everything from <body> classes and data
+      attributes. A React SPA must not mutate <body> from a
+      component — the account page renders the same HUD as a
+      preview, and a global class would leak into it — so every
+      `body[data-pos]` / `body.hud-open` selector becomes
+      `.hud-root[data-pos]` / `.hud-root[data-open="true"]` on
+      the HUD's own wrapper.
+   2. State the mock toggles with a class (`body.swapping`,
+      `body.hz-mismatch`, `body[data-off~=...]`, `body[data-stats]`)
+      is conditional RENDERING here, so those rules are absent
+      rather than ported: an element that isn't shown isn't in
+      the DOM, and the accessibility tree stays honest.
+   3. The mock's `.card` inside the stats pane is `.stat-card` —
+      `.card` is already the console's panel primitive.
+
+   The `.dev` mock-control panel is deliberately NOT ported: the
+   handoff marks it mock-only.
+   ============================================================ */
+
+:root {
+  /* The mock's rgba(12,12,18,.74) / .86, in the token colour space. */
+  --hud-glass: oklch(0.13 0.012 267 / 0.74);
+  --hud-glass-open: oklch(0.13 0.012 267 / 0.86);
+  --hud-morph: 0.36s cubic-bezier(0.2, 0.85, 0.25, 1);
+  /* Shelf depth: the only thing that changes between sections, which is what
+     keeps the bar the same size across a tab switch. */
+  --shelf-h: 186px;
+  --shelf-w: 236px;
+}
+
+/* The wrapper carries the dock state for the cascade and nothing else — it
+   must not become a layout box between the fixed HUD and its container. */
+.hud-root {
+  display: contents;
+}
+
+.hud {
+  position: fixed;
+  z-index: 20;
+  display: flex;
+  overflow: hidden;
+  background: var(--hud-glass);
+  -webkit-backdrop-filter: blur(22px) saturate(150%);
+  backdrop-filter: blur(22px) saturate(150%);
+  border: 1px solid var(--line-2);
+  box-shadow: var(--shadow-lg);
+  transition:
+    width var(--hud-morph),
+    height var(--hud-morph),
+    top 0.3s cubic-bezier(0.2, 0.85, 0.25, 1),
+    bottom 0.3s cubic-bezier(0.2, 0.85, 0.25, 1),
+    left 0.3s cubic-bezier(0.2, 0.85, 0.25, 1),
+    right 0.3s cubic-bezier(0.2, 0.85, 0.25, 1),
+    border-radius 0.28s ease,
+    opacity 0.25s,
+    transform 0.25s,
+    background 0.3s;
+}
+.hud-root[data-open="true"] .hud {
+  background: var(--hud-glass-open);
+}
+
+/* Docked at every size: flush against its edge. Width/height/radius/direction
+   come from `dockLayout` as inline styles — this is only the anchoring. */
+.hud-root[data-axis="h"] .hud {
+  left: 50%;
+  transform: translateX(-50%);
+}
+.hud-root[data-pos="bottom"] .hud { bottom: 0; }
+.hud-root[data-pos="top"] .hud { top: 0; }
+
+.hud-root[data-axis="v"] .hud {
+  top: 50%;
+  transform: translateY(-50%);
+}
+.hud-root[data-pos="left"] .hud { left: 0; }
+.hud-root[data-pos="right"] .hud { right: 0; }
+
+/* The error banner pushes a top-docked HUD down (SessionPage puts `banner-on`
+   on the shared `.session-root` ancestor — the one place that knows both). */
+.session-root.banner-on .hud-root[data-pos="top"] .hud { top: 74px; }
+
+.hud.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+.hud-root[data-pos="bottom"] .hud.hidden { transform: translateX(-50%) translateY(14px); }
+.hud-root[data-pos="top"] .hud.hidden { transform: translateX(-50%) translateY(-14px); }
+.hud-root[data-pos="left"] .hud.hidden { transform: translateY(-50%) translateX(-14px); }
+.hud-root[data-pos="right"] .hud.hidden { transform: translateY(-50%) translateX(14px); }
+
+/* ---- the bar: the rest state ------------------------------------------- */
+.hud-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 36px;
+  padding: 0 14px;
+  flex: none;
+  min-width: 0;
+  position: relative;
+}
+/* Passive readouts share the bar's rhythm; they are wrapped only so the live
+   region can exclude the buttons. */
+.hud-read {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.hud-bar .sep {
+  width: 1px;
+  height: 16px;
+  background: var(--line-2);
+  flex: none;
+}
+.hud-bar .signal { flex: none; }
+
+/* Detail that only earns its place once the shelf is open. `!important`
+   because the .m / .ib display rules below are more specific. */
+.open-only { display: none !important; }
+.hud-root[data-open="true"] .m.open-only { display: flex !important; }
+.hud-root[data-open="true"] .ib.open-only { display: grid !important; }
+.hud-root[data-open="true"] .div.open-only { display: block !important; }
+/* Horizontal docks only: a 39px column has no room for either, and the
+   vertical rules below cannot outrank an `!important`. */
+.hud-root[data-axis="h"][data-open="true"] .codec-chip.open-only,
+.hud-root[data-axis="h"][data-open="true"] .summon.open-only { display: inline-block !important; }
+
+.hud .title {
+  font-size: var(--t-sm);
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 210px;
+  flex: 0 1 auto;
+}
+/* Once the bar spans the whole edge the title centres on the screen rather
+   than trailing the metrics — and its separator has nothing left to divide. */
+.hud-root[data-axis="h"][data-open="true"] .title {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 32vw;
+}
+.hud-root[data-axis="h"][data-open="true"] .hud-bar .sep { display: none; }
+
+.hud .metrics {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.hud .m {
+  display: flex;
+  align-items: baseline;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.hud .m b {
+  font-family: var(--font-mono);
+  font-size: var(--t-sm);
+  font-weight: 600;
+  color: var(--text);
+}
+.hud .m b u {
+  text-decoration: none;
+  font-size: 9px;
+  color: var(--text-4);
+  margin-left: 2px;
+}
+.hud .m b.good { color: var(--success-text); }
+.hud .m b.info { color: var(--info-text); }
+
+.hud .codec-chip {
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  color: var(--text-2);
+  background: var(--ink-4);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xs);
+  padding: 2px 7px;
+  white-space: nowrap;
+}
+.hud .codec-chip.warn {
+  color: var(--warning-text);
+  border-color: var(--warning-line);
+  background: var(--warning-bg);
+}
+.hud .codec-chip.extres { animation: hud-extres-in 150ms ease-out; }
+.hud .codec-chip.adapting { color: var(--text-3); }
+@keyframes hud-extres-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.hud .summon {
+  font-size: var(--t-xs);
+  color: var(--text-4);
+  white-space: nowrap;
+}
+.hud .summon kbd {
+  font-family: var(--font-mono);
+  background: var(--ink-4);
+  border: 1px solid var(--line-2);
+  border-radius: 4px;
+  padding: 1px 5px;
+  color: var(--text-3);
+  margin-left: 2px;
+}
+
+/* ---- right cluster: tabs + direct actions ------------------------------ */
+.hud-ctl {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+}
+/* Semantics-only wrapper for the tab buttons; matches the cluster's own gap so
+   it changes nothing visually. */
+.hud-tabs {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.hud-root[data-axis="v"] .hud-tabs {
+  flex-direction: column;
+}
+.hud-ctl .div {
+  width: 1px;
+  height: 18px;
+  background: var(--line-2);
+  margin: 0 2px;
+  flex: none;
+}
+
+/* Icon buttons follow the console's `.icon-btn`: pill, no chrome until hover,
+   glass on hover. 28px boxes inside a 36px pill, so the 44px-class target is
+   a padded hit area (handoff §G "Hit targets"). */
+.ib {
+  position: relative;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-content: center;
+  border-radius: var(--r-pill);
+  border: 1px solid transparent;
+  background: none;
+  color: var(--text-3);
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.14s, color 0.14s, border-color 0.14s;
+  flex: none;
+}
+.ib::before {
+  content: "";
+  position: absolute;
+  inset: -8px;
+}
+.ib svg {
+  width: 16px;
+  height: 16px;
+  stroke-width: 1.5;
+}
+.ib:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--ink-4) 62%, transparent);
+  -webkit-backdrop-filter: blur(16px) saturate(170%);
+  backdrop-filter: blur(16px) saturate(170%);
+  color: var(--text);
+}
+.ib:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.ib:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.ib[aria-selected="true"] {
+  background: var(--accent-soft-2);
+  border-color: var(--accent-soft-2);
+  color: var(--accent-text);
+}
+.ib.on {
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  border-color: var(--accent-soft-2);
+}
+/* Exit is the last thing in the cluster and wears its danger colours at rest:
+   a control that stops something should not need a hover to say so. */
+.ib.danger {
+  background: color-mix(in srgb, var(--danger-bg) 70%, transparent);
+  border-color: var(--danger-line);
+  color: var(--danger-text);
+}
+.hud-root[data-axis="h"] .ib.danger { margin-left: 12px; }
+.hud-root[data-axis="v"] .ib.danger { margin-top: 12px; }
+.ib.danger:hover:not(:disabled) {
+  background: var(--danger-bg);
+  border-color: var(--danger-line);
+  color: var(--danger-text);
+}
+.ib.chev svg {
+  transform: rotate(var(--chev-rot, 0deg));
+  transition: transform 0.3s cubic-bezier(0.2, 0.85, 0.25, 1);
+}
+
+/* ---- swap in progress: replaces the bar content, no fade to black ------- */
+.hud .swapping {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+.hud .swapping .spin {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 2px solid var(--line-3);
+  border-top-color: var(--accent-text);
+  animation: hud-spin 0.7s linear infinite;
+}
+@keyframes hud-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ---- the shelf --------------------------------------------------------- */
+.shelf {
+  overflow: hidden;
+  transition: height var(--hud-morph), width var(--hud-morph);
+}
+.hud-root[data-axis="h"] .shelf { height: 0; }
+.hud-root[data-axis="h"][data-open="true"] .shelf { height: var(--shelf-h, 186px); }
+.hud-root[data-axis="h"] .shelf-in {
+  border-top: 1px solid var(--line);
+  height: var(--shelf-h, 186px);
+}
+.hud-root[data-axis="v"] .shelf { width: 0; }
+.hud-root[data-axis="v"][data-open="true"] .shelf { width: var(--shelf-w, 236px); }
+.hud-root[data-axis="v"] .shelf-in {
+  border-left: 1px solid var(--line);
+  width: var(--shelf-w, 236px);
+  height: 100%;
+}
+.hud-root[data-pos="right"] .shelf-in {
+  border-left: 0;
+  border-right: 1px solid var(--line);
+}
+.shelf-in {
+  display: flex;
+  flex-direction: column;
+}
+.pane {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  animation: hud-pin 0.26s ease both;
+}
+@keyframes hud-pin {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+.pane-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 11px 18px 0;
+  flex: none;
+}
+.pane-head h3 {
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: var(--t-sm);
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-4);
+}
+.pane-head p {
+  margin: 0;
+  font-size: var(--t-xs);
+  color: var(--text-4);
+  line-height: 1.45;
+}
+.pane-head .segmented { margin-left: auto; }
+.pane-head .segmented button {
+  padding: 4px 10px;
+  font-size: var(--t-xs);
+}
+
+/* ---- pane: games ------------------------------------------------------- */
+.qs-rail {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  padding: 8px 18px 14px;
+  scrollbar-width: thin;
+  align-items: flex-start;
+}
+.qs {
+  flex: 0 0 172px;
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--r-md);
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: var(--ink-3);
+  cursor: pointer;
+  padding: 0;
+  text-align: left;
+  font-family: var(--font-ui);
+  transition: 0.15s;
+  position: relative;
+}
+.qs:hover:not(:disabled) {
+  border-color: var(--line-3);
+  transform: translateY(-2px);
+}
+.qs:disabled { cursor: default; }
+.qs:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.qs .cv {
+  height: 96px;
+  width: 100%;
+  display: grid;
+  place-content: center;
+  position: relative;
+  overflow: hidden;
+}
+.qs .cv .glyph {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 1.4rem;
+  color: oklch(1 0 0 / 0.9);
+  mix-blend-mode: overlay;
+}
+.qs .cv::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  background: radial-gradient(120% 90% at 50% -10%, transparent 45%, oklch(0.09 0.01 267 / 0.45));
+}
+.qs .nm {
+  display: block;
+  padding: 7px 10px 8px;
+  font-size: var(--t-xs);
+  font-weight: 600;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.qs.current {
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+/* A real element, not the mock's `::after` content: a pseudo-element is
+   invisible to the accessibility tree and to a test. */
+.qs-badge {
+  position: absolute;
+  top: 7px;
+  left: 7px;
+  z-index: 3;
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  color: var(--text);
+  background: var(--accent);
+  border-radius: 4px;
+  padding: 2px 5px;
+}
+
+/* ---- pane: controller & input, display --------------------------------- */
+.cols {
+  display: grid;
+  grid-template-columns: 1.15fr 1fr 1fr;
+  gap: 26px;
+  padding: 8px 18px 14px;
+  align-items: start;
+  overflow-y: auto;
+}
+.capture-cta {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: var(--r-md);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  background: var(--accent-soft);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--t-base);
+  font-weight: 600;
+  cursor: pointer;
+  transition: 0.14s;
+}
+.capture-cta:hover:not(:disabled) { background: var(--accent-soft-2); }
+.capture-cta:disabled {
+  cursor: default;
+  color: var(--text-4);
+}
+.capture-cta svg {
+  width: 20px;
+  height: 20px;
+  color: var(--accent-text);
+  flex: none;
+}
+.capture-cta:disabled svg { color: var(--text-4); }
+.ov-kv {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+  font-size: var(--t-sm);
+  color: var(--text-3);
+}
+.ov-kv b {
+  font-weight: 600;
+  color: var(--text-2);
+}
+.ov-kv .mono {
+  font-family: var(--font-mono);
+  color: var(--text-2);
+}
+.combo {
+  display: inline-flex;
+  gap: 3px;
+}
+.combo kbd {
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  background: var(--ink-4);
+  border: 1px solid var(--line-2);
+  border-radius: 4px;
+  padding: 2px 6px;
+  color: var(--text-2);
+}
+.col-note {
+  font-size: var(--t-xs);
+  color: var(--text-4);
+  line-height: 1.5;
+  margin-top: 4px;
+}
+.col-lb {
+  font-size: var(--t-xs);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-4);
+  font-weight: 700;
+  padding-bottom: 4px;
+}
+.ctl-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 0;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+.ctl-row .segmented { margin-left: auto; }
+.ctl-row .segmented button {
+  padding: 5px 10px;
+  font-size: var(--t-xs);
+}
+.ctl-row select { margin-left: auto; }
+
+/* ---- pane: performance stats ------------------------------------------- */
+.stat-card {
+  background: var(--ink-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 9px 12px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  --c: var(--text-2);
+}
+.stat-card .lb {
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-4);
+  font-weight: 700;
+}
+.stat-card .vv {
+  font-family: var(--font-mono);
+  font-size: 1.3rem;
+  font-weight: 600;
+  color: var(--c);
+  line-height: 1.15;
+  font-variant-numeric: tabular-nums;
+}
+.stat-card .vv u {
+  text-decoration: none;
+  font-size: var(--t-xs);
+  color: var(--text-4);
+  margin-left: 3px;
+}
+/* `height: 0` is load-bearing: an <svg width:100%> with a viewBox and no height
+   takes its INTRINSIC aspect ratio (100:30), so a quarter-viewport card grew a
+   95px sparkline and the four cards overflowed the 186px shelf. The path is
+   drawn with preserveAspectRatio="none", so the flex basis is the real height. */
+.stat-card svg {
+  width: 100%;
+  flex: 1 1 0;
+  height: 0;
+  min-height: 38px;
+  display: block;
+  margin-top: 2px;
+}
+/* Nothing in a pane may overflow the shelf: its depth is fixed. */
+.pane .stat-cards { overflow-y: auto; }
+.stat-card .spark {
+  fill: none;
+  stroke: var(--c);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+  stroke-linejoin: round;
+}
+.stat-card .area {
+  fill: var(--c);
+  stroke: none;
+  opacity: 0.13;
+}
+.stat-card[data-k="fps"] { --c: var(--success-text); }
+.stat-card[data-k="lat"] { --c: var(--info-text); }
+.stat-card[data-k="jit"] { --c: var(--warning-text); }
+
+/* The shelf depth is fixed, so the detailed read scrolls as one region rather
+   than four independently-clipped tables. */
+.diag-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.diag-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0 26px;
+  padding: 8px 18px 14px;
+}
+.diag-grid table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+}
+.diag-grid td {
+  padding: 3px 0;
+  color: var(--text-2);
+}
+.diag-grid td:first-child { color: var(--text-4); }
+.diag-grid td:last-child {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The verdict block and the Advanced disclosure sit below the four tables:
+   they are the support read, not the glanceable one. */
+.diag-extra {
+  padding: 0 18px 14px;
+  flex: none;
+}
+.diag-extra .diag-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+}
+.diag-extra .diag-table td {
+  padding: 3px 0;
+  color: var(--text-2);
+  vertical-align: top;
+}
+.diag-extra .diag-table td:first-child { color: var(--text-4); }
+.diag-extra .diag-table td:last-child {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.diag-extra .diag-table td[colspan="2"] { text-align: left; }
+
+/* The Advanced disclosure inside the stats pane: input-pipeline and cadence
+   instrumentation that "mostly don't provide value" to a player reading it
+   live (operator request 2026-08-05). Rows enter the DOM only when open. */
+.diag-advanced {
+  flex: none;
+  border-top: 1px solid var(--line);
+  margin-top: var(--s2);
+  padding-top: var(--s1);
+}
+.diag-advanced-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  margin: 0;
+  padding: var(--s2) 0;
+  background: none;
+  border: none;
+  color: var(--text-3);
+  font-family: var(--font-ui);
+  font-size: var(--t-xs);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  text-align: left;
+  cursor: pointer;
+}
+.diag-advanced-toggle:hover { color: var(--text); }
+.diag-advanced-caret {
+  font-size: 9px;
+  color: var(--text-4);
+}
+
+.hz-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--t-xs);
+  color: var(--warning-text);
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-line);
+  border-radius: var(--r-pill);
+  padding: 2px 9px;
+  font-weight: 600;
+}
+.hz-flag svg {
+  width: 11px;
+  height: 11px;
+  flex: none;
+}
+
+/* ---- shrink order ------------------------------------------------------
+   A priority list, not a squeeze: the icon cluster is the only pointer route
+   into the shelf, so it never yields — the open-state detail drops out ahead
+   of it. */
+@media (max-width: 900px) {
+  .hud .m.open-only:last-child { display: none !important; }
+}
+@media (max-width: 780px) {
+  .hud-root[data-open="true"] .m.open-only { display: none !important; }
+}
+@media (max-width: 620px) {
+  .hud .title,
+  .hud-bar .sep { display: none; }
+}
+@media (max-width: 900px) {
+  .stat-card svg { min-height: 26px; }
+  .cols { grid-template-columns: 1fr 1fr; }
+}
+
+/* ============================================================
+   VERTICAL DOCKS — the same parts, re-oriented. The bar becomes
+   a column, its separators become rules, the chevron points at
+   the shelf, and every pane collapses to a single column.
+   ============================================================ */
+.hud-root[data-axis="v"] .hud-bar {
+  flex-direction: column;
+  height: auto;
+  width: 39px;
+  padding: 14px 0;
+  gap: 11px;
+}
+.hud-root[data-axis="v"] .hud-read {
+  flex-direction: column;
+  gap: 11px;
+}
+.hud-root[data-axis="v"] .hud-bar .sep {
+  width: 16px;
+  height: 1px;
+}
+.hud-root[data-axis="v"] .title,
+.hud-root[data-axis="v"] .summon,
+.hud-root[data-axis="v"] .codec-chip { display: none; }
+.hud-root[data-axis="v"] .metrics {
+  flex-direction: column;
+  gap: 10px;
+  overflow: visible;
+}
+.hud-root[data-axis="v"] .m b {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  line-height: 1.05;
+}
+.hud-root[data-axis="v"] .m b u { margin-left: 0; }
+.hud-root[data-axis="v"] .hud-ctl {
+  margin-left: 0;
+  margin-top: auto;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+}
+.hud-root[data-axis="v"] .hud-ctl .div {
+  width: 16px;
+  height: 1px;
+  margin: 2px 0;
+}
+.hud-root[data-axis="v"] .swapping {
+  flex-direction: column;
+  text-align: center;
+  font-size: var(--t-xs);
+}
+.hud-root[data-axis="v"] .pane-head {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 12px 14px 0;
+}
+.hud-root[data-axis="v"] .pane-head .segmented { margin-left: 0; }
+.hud-root[data-axis="v"] .qs-rail {
+  display: grid;
+  grid-template-columns: 1fr;
+  grid-auto-rows: max-content;
+  align-content: start;
+  gap: 10px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 9px 14px 14px;
+}
+.hud-root[data-axis="v"] .qs { flex: 0 0 auto; }
+.hud-root[data-axis="v"] .qs .cv {
+  height: 110px;
+  flex: none;
+}
+.hud-root[data-axis="v"] .qs .cv .glyph { font-size: 1.3rem; }
+.hud-root[data-axis="v"] .cols {
+  grid-template-columns: 1fr;
+  gap: 14px;
+  padding: 9px 14px 14px;
+}
+.hud-root[data-axis="v"] .stat-card svg { min-height: 30px; }
+.hud-root[data-axis="v"] .diag-grid {
+  grid-template-columns: 1fr;
+  gap: 0;
+  padding: 9px 14px 14px;
+}
+.hud-root[data-axis="v"] .diag-extra { padding: 0 14px 14px; }
+
+/* ============================================================
+   OVERLAY CHROME OUTSIDE THE HUD
+   ============================================================ */
+
+/* A live microphone must never be able to become invisible — including under
+   the "never show" preference — so this sits outside the HUD entirely. */
+.mic-hot {
+  position: fixed;
+  top: 18px;
+  right: 18px;
+  z-index: 35;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  background: var(--hud-glass);
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+  border: 1px solid var(--danger-line);
+  border-radius: var(--r-pill);
+  padding: 5px 11px 5px 9px;
+  font-size: var(--t-xs);
+  color: var(--danger-text);
+  font-weight: 600;
+  /* Purely an indicator: it must never take a click meant for the game. */
+  pointer-events: none;
+}
+.mic-hot .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--danger);
+  animation: mic-hot-pulse 2.2s infinite;
+}
+@keyframes mic-hot-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+/* Self-dismissing informational notice (4.2 s). Slides down from the top
+   right; drops clear of the mic pill when one is showing. */
+.ev-toast {
+  position: fixed;
+  top: 18px;
+  right: 18px;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  background: oklch(0.13 0.012 267 / 0.8);
+  -webkit-backdrop-filter: blur(18px);
+  backdrop-filter: blur(18px);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-md);
+  padding: 11px 16px 11px 13px;
+  box-shadow: var(--shadow-lg);
+  font-size: var(--t-sm);
+  color: var(--text-2);
+  max-width: 340px;
+  animation: ev-toast-in 0.3s ease;
+}
+@keyframes ev-toast-in {
+  from { transform: translateY(-12px); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+.ev-toast svg {
+  width: 18px;
+  height: 18px;
+  color: var(--warning-text);
+  flex: none;
+}
+.ev-toast b {
+  color: var(--text);
+  font-weight: 600;
+}
+.session-root.mic-on .ev-toast { top: 56px; }
+
+/* An actionable notice never times out: full-width, top, with its buttons. */
+.banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 32;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 13px 20px;
+  background: oklch(0.13 0.012 267 / 0.9);
+  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px);
+  border-bottom: 1px solid var(--danger-line);
+  box-shadow: var(--shadow-md);
+}
+.banner.warning { border-bottom-color: var(--warning-line); }
+.banner .bt {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.banner .bt strong {
+  font-size: var(--t-base);
+  color: var(--danger-text);
+}
+.banner.warning .bt strong { color: var(--warning-text); }
+.banner .bt span {
+  font-size: var(--t-sm);
+  color: var(--text-3);
+}
+.banner .ba {
+  display: flex;
+  gap: 8px;
+  flex: none;
+}
+
+/* Two banners can be live at once (a recovery notice over a decode failure);
+   they stack rather than overlap. */
+.session-banners {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 32;
+  display: flex;
+  flex-direction: column;
+}
+.session-banners .banner { position: static; }
+
+@media (max-width: 640px) {
+  .banner {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .banner .ba { justify-content: flex-end; }
+  .cols { grid-template-columns: 1fr; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hud,
+  .shelf,
+  .ib.chev svg {
+    transition: none;
+  }
+  .pane,
+  .ev-toast,
+  .hud .codec-chip.extres {
+    animation: none;
+  }
+  .hud .swapping .spin,
+  .mic-hot .dot {
+    animation: none;
+  }
+}

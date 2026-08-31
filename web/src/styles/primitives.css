@@ -1,0 +1,2769 @@
+/* ============================================================
+   QUASAR — Shared primitives (v3)
+
+   Source of truth: design_handoff_v3/screens/assets/console-v3.css,
+   read as the browser computes it — the later "depth pass", "palette
+   pass" and v3-override blocks win over the earlier ones, so what is
+   ported here is the RESULT, not the first declaration.
+
+   Every rule is keyed on a class the React tree already emits (see
+   web/src/components/*.tsx), so a page restyles without being edited.
+   Where the mock and the components disagree on a name the sheet
+   styles both — `.btn-ico`/`.btn-icon`, `.bar > i`/`.bar > span`,
+   `.bar-row .v`/`.bar-row .val`, `.spec-pill span`/`.spec-pill .sp`,
+   `[aria-checked]` switches and `input`-backed ones.
+
+   Rules of the house:
+   - Exactly one owner per class. If a selector is here, it is not in
+     components.css / styles.css / admin.css.
+   - oklch only. No hex, ever (primitives.test.ts enforces it).
+   - Primitives only. Page-specific composition belongs to the page.
+   ============================================================ */
+
+/* ------------------------------------------------------------------
+   PAGE FRAME
+   .page centres the content column; .page-head is the title block the
+   PageHeader component emits; .crumbs is the drill-down trail.
+   ------------------------------------------------------------------ */
+.page {
+  max-width: 1360px;
+  margin: 0 auto;
+  padding-bottom: var(--s10);
+  /* Vertical rhythm between stacked surfaces. One number, adjusted here. */
+  --stack-gap: var(--s4);
+}
+
+/* Stacked surfaces (cards, split rows, notes, grids) space themselves from
+   the surface before them, in any container that is not itself a grid or a
+   row (those own their gap). Surfaces never carry a margin of their own, so
+   a page reads the same whether it stacks two cards or ten. */
+:not(.split, .grid, .row, .rowflex, .toolbar, .kv, .readiness-grid) > :is(.card, .split, .note, .grid) + :is(.card, .split, .note, .grid) {
+  margin-top: var(--stack-gap, var(--s4));
+}
+
+.page-head {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--s5);
+  margin-bottom: var(--s5);
+  flex-wrap: wrap;
+}
+
+.page-head h1 {
+  font-size: var(--t-h1);
+}
+
+/* PageHeader renders the subtitle as a <p>; the mock's is a <div>. Without
+   the shorthand the UA's bottom margin pushes the whole page body 13px down
+   (D-02). */
+.page-head .sub {
+  color: var(--text-3);
+  font-size: var(--t-sm);
+  margin: 5px 0 0;
+  max-width: 70ch;
+  text-wrap: pretty;
+}
+
+/* PageHeader renders its actions in a .toolbar; the mock calls the same
+   slot .acts. Both push right and sit on the baseline. */
+.page-head .acts,
+.page-head > .toolbar,
+.panel-head .acts {
+  margin-left: auto;
+  display: flex;
+  gap: var(--s2);
+  align-items: center;
+  margin-bottom: 0;
+}
+
+.crumbs {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: var(--t-sm);
+  color: var(--text-3);
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+
+.crumbs svg {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  stroke-width: 1.6;
+  color: var(--text-4);
+}
+
+.crumbs a {
+  color: var(--text-3);
+  cursor: pointer;
+}
+
+.crumbs a:hover {
+  color: var(--text);
+}
+
+.crumbs .cur {
+  color: var(--text-2);
+  font-weight: 500;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  margin-bottom: var(--s4);
+  flex-wrap: wrap;
+}
+
+.toolbar .right {
+  margin-left: auto;
+  display: flex;
+  gap: var(--s2);
+  align-items: center;
+}
+
+.toolbar .right .label {
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------
+   LAYOUT HELPERS
+   The mock's grid vocabulary. .split is the 1.35fr/1fr two-pane;
+   .editor is the main+rail pane; .six is the fact strip.
+   ------------------------------------------------------------------ */
+.grid {
+  display: grid;
+  gap: var(--s4);
+}
+
+.grid > * {
+  min-width: 0;
+}
+
+.g2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.g3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.g4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+.split {
+  display: grid;
+  gap: var(--s4);
+  grid-template-columns: 1.35fr 1fr;
+  align-items: start;
+}
+
+.split.even {
+  align-items: stretch;
+}
+
+.split.even > .card {
+  display: flex;
+  flex-direction: column;
+}
+
+.split.even > .card > .table-wrap {
+  flex: 1;
+}
+
+.editor {
+  display: grid;
+  gap: var(--s4);
+  grid-template-columns: minmax(0, 1fr) 320px;
+  align-items: start;
+}
+
+/* .editor's right rail (app editor, image detail): stacked cards, sticky. */
+.ae-rail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+  position: sticky;
+  top: var(--s5);
+}
+
+.ae-rail a {
+  color: var(--accent-text);
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.ae-rail a:hover {
+  text-decoration: underline;
+}
+
+/* A fact strip: label/value rows, hairline between, no border on the first. */
+.ae-facts {
+  display: flex;
+  flex-direction: column;
+}
+
+.ae-fact {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s4);
+  padding: 7px 0;
+  border-top: 1px solid var(--line);
+  font-size: var(--t-sm);
+}
+
+.ae-fact:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.ae-fact > span:first-child {
+  color: var(--text-3);
+}
+
+.six {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: var(--s5);
+}
+
+/* The HUD's Simple stats pane (session-overlay-v3.html). Four across, two on a
+   narrow viewport, one when the HUD is docked to a side rail — `data-axis="v"`
+   is the dock axis the HUD sets on its own wrapper (`.hud-root`), not on
+   <body>: the same HUD renders as a preview inside the account page. */
+.stat-cards {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  padding: 8px 18px 14px;
+}
+
+@media (max-width: 900px) {
+  .stat-cards { grid-template-columns: repeat(2, 1fr); }
+}
+
+[data-axis="v"] .stat-cards {
+  grid-template-columns: 1fr;
+  gap: 10px;
+  padding: 9px 14px 14px;
+  overflow-y: auto;
+}
+
+@media (max-width: 1240px) {
+  .split { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 1100px) {
+  .g4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .g3,
+  .g2 { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 1000px) {
+  .editor { grid-template-columns: 1fr; }
+  .six { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+/* ------------------------------------------------------------------
+   TABS
+   .tabs is the section switcher under a page head (Fleet, Library,
+   Streaming, People, the app editor). 36px, 2px accent underline.
+   ------------------------------------------------------------------ */
+.tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--line-2);
+  margin-bottom: var(--s5);
+  overflow-x: auto;
+}
+
+.tab {
+  /* Tabs are Links, not buttons: blockified anchors need explicit centring. */
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+  height: 36px;
+  padding: 0 14px;
+  border: 0;
+  background: none;
+  color: var(--text-3);
+  font-size: var(--t-sm);
+  font-weight: 500;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  border-radius: var(--r-control) var(--r-control) 0 0;
+}
+
+.tab:hover {
+  color: var(--text);
+  background: transparent;
+}
+
+.tab.active,
+.tab[aria-selected="true"] {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.tab .cnt {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-4);
+  margin-left: 6px;
+}
+
+/* ------------------------------------------------------------------
+   SMALL TYPE
+   .eyebrow labels a group; .hint / .field-hint explain a control;
+   .empty is the no-rows state.
+   ------------------------------------------------------------------ */
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  font-weight: 500;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+.hint,
+.field-hint {
+  font-size: var(--t-xs);
+  color: var(--text-3);
+}
+
+.empty {
+  text-align: center;
+  padding: var(--s9) var(--s6);
+  color: var(--text-3);
+}
+
+.empty h3 {
+  font-size: var(--t-h3);
+  color: var(--text);
+  margin-bottom: 6px;
+}
+
+.empty p {
+  font-size: var(--t-sm);
+  max-width: 380px;
+  margin: 0 auto var(--s5);
+}
+
+/* ------------------------------------------------------------------
+   BUTTONS
+   34px (30px dense) glass control on --surf-control, 4px radius — the
+   v3 override re-radiuses every control away from the pill. Lift 1px
+   on hover, press 1px with an inset shadow.
+   ------------------------------------------------------------------ */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  height: var(--control-h);
+  padding: 0 13px;
+  border-radius: var(--r-control);
+  border: 1px solid var(--line-3);
+  background: color-mix(in oklch, var(--surf-control) 70%, transparent);
+  backdrop-filter: blur(14px) saturate(115%);
+  -webkit-backdrop-filter: blur(14px) saturate(115%);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--t-sm);
+  font-weight: 600;
+  letter-spacing: .02em;
+  cursor: pointer;
+  white-space: nowrap;
+  box-shadow:
+    inset 0 1px 0 oklch(0.9618 0.0086 247.91/.12),
+    0 1px 2px oklch(0.05 0.01 267/.38),
+    0 6px 14px -10px oklch(0.05 0.01 267/.8);
+  transition: background .16s ease, border-color .16s ease, transform .16s ease, box-shadow .16s ease;
+}
+
+.btn svg,
+.btn .ic {
+  width: 15px;
+  height: 15px;
+  stroke-width: 1.6;
+  flex: none;
+}
+
+.btn:hover:not(:disabled):not([aria-disabled="true"]) {
+  background: color-mix(in oklch, var(--surf-control) 88%, transparent);
+  border-color: var(--text-2);
+  transform: translateY(-1px);
+}
+
+.btn:active:not(:disabled) {
+  box-shadow: inset 0 2px 4px oklch(0.05 0.01 267/.55);
+  transform: translateY(1px);
+}
+
+.btn:disabled,
+.btn[aria-disabled="true"] {
+  opacity: .42;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.btn-primary {
+  background: var(--action);
+  border-color: oklch(0.72 0.15 273.21/.68);
+  color: oklch(1 0 0);
+  text-shadow: 0 1px 1px oklch(0.05 0.01 267/.5);
+  box-shadow:
+    inset 0 1px 0 oklch(0.9618 0.0086 247.91/.2),
+    inset 0 -1px 0 oklch(0.22 0.1 273.21/.72),
+    0 2px 4px oklch(0.05 0.01 267/.45),
+    0 10px 24px -12px oklch(0.46 0.19 273.21/.8);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: oklch(0.78 0.13 273.21/.76);
+  color: oklch(1 0 0);
+}
+
+.btn-primary:active:not(:disabled) {
+  background: var(--accent-press);
+}
+
+/* Ghost keeps `.btn`'s glass and drops only the border and the shadow: the
+   mock's palette pass re-declares `.btn { background }` AFTER `.btn-ghost`,
+   so the transparent background in console-v3.css:96/359 never reaches the
+   screen. Re-introducing it here renders ghosts as bare text (D-01). */
+.btn-ghost {
+  border-color: transparent;
+  box-shadow: none;
+  color: var(--text-2);
+}
+
+/* Matches `.btn:hover`'s specificity so the glass border survives it. */
+.btn-ghost:hover:not(:disabled):not([aria-disabled="true"]) {
+  border-color: var(--glass-border);
+  color: var(--text);
+}
+
+.btn-danger {
+  background: transparent;
+  border-color: oklch(0.69 0.19 27/.55);
+  color: var(--danger-text);
+  box-shadow: none;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: var(--danger-bg);
+  border-color: var(--danger);
+  color: var(--text);
+}
+
+.btn-sm {
+  height: 28px;
+  padding: 0 12px;
+  font-size: var(--t-xs);
+  letter-spacing: .01em;
+}
+
+.btn-sm svg,
+.btn-sm .ic {
+  width: 14px;
+  height: 14px;
+}
+
+/* .btn-lg survives from the login/setup card, which needs a 46px CTA. */
+.btn-lg {
+  height: 46px;
+  padding: 0 24px;
+  font-size: var(--t-base);
+}
+
+.btn-block {
+  width: 100%;
+}
+
+/* Icon-only. `.btn-ico` is the mock's name, `.btn-icon` the component's.
+   As a modifier they change shape only; standalone (Modal/Drawer close
+   render `btn-icon btn-ghost` with no `.btn`) it supplies its own box. */
+.btn-ico,
+.btn.btn-icon {
+  width: 28px;
+  padding: 0;
+  justify-content: center;
+  flex: none;
+}
+
+.btn-ico svg,
+.btn.btn-icon svg {
+  width: 14px;
+  height: 14px;
+}
+
+.btn-icon:not(.btn) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-h);
+  height: var(--control-h);
+  padding: 0;
+  flex: none;
+  border: 1px solid transparent;
+  border-radius: var(--r-control);
+  background: transparent;
+  color: var(--text-3);
+  cursor: pointer;
+  transition: background .14s ease, color .14s ease;
+}
+
+.btn-icon:not(.btn) svg {
+  width: 16px;
+  height: 16px;
+}
+
+.btn-icon:not(.btn):hover {
+  background: var(--glass-control);
+  color: var(--text);
+}
+
+/* Chrome icon button: transparent until hover, then a glass square. */
+.icon-btn {
+  height: var(--control-h);
+  width: var(--control-h);
+  display: grid;
+  place-content: center;
+  border: 1px solid transparent;
+  background: none;
+  border-radius: var(--r-control);
+  color: var(--text-3);
+  cursor: pointer;
+  transition: background .14s ease, color .14s ease;
+}
+
+.icon-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.icon-btn:hover {
+  background: var(--glass-control);
+  color: var(--text);
+}
+
+.icon-btn.ghost {
+  background: transparent;
+  border-color: transparent;
+}
+
+/* Grouped 26px glyph buttons — the images table's per-row action bar. */
+.gbar {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  justify-content: flex-end;
+}
+
+.gbtn {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-content: center;
+  border: 0;
+  background: none;
+  border-radius: var(--r-control);
+  color: var(--text-4);
+  cursor: pointer;
+  transition: background .14s ease, color .14s ease;
+}
+
+.gbtn svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 1.5;
+}
+
+.gbtn:hover {
+  background: var(--surf-raised);
+  color: var(--text);
+}
+
+.gbtn.todo {
+  color: var(--accent-text);
+  background: var(--accent-soft);
+}
+
+.gbtn.todo:hover {
+  background: var(--accent-soft-2);
+  color: var(--accent-text);
+}
+
+.gbtn.on {
+  color: var(--text-2);
+}
+
+.gbtn.dim {
+  opacity: .3;
+  cursor: default;
+}
+
+.gbtn.dim:hover {
+  background: none;
+  color: var(--text-4);
+}
+
+.gbtn.rm:hover {
+  color: var(--danger-text);
+  background: var(--danger-bg);
+}
+
+/* A button in a head or toolbar never stretches to the row height. */
+.page-head .acts .btn,
+.panel-head .acts .btn,
+.toolbar .btn {
+  flex: none;
+}
+
+/* ------------------------------------------------------------------
+   CARDS AND PANELS
+   .card is panel glass with the depth-pass cast shadow — the one thing
+   that gives a table an edge against the canvas. --shadow-md stays the
+   lighter global value for everything else.
+   ------------------------------------------------------------------ */
+.card {
+  background: color-mix(in oklch, var(--surf-panel) 90%, transparent);
+  border: 1px solid oklch(0.9618 0.0086 247.91/.13);
+  border-radius: var(--r-panel);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    0 2px 4px oklch(0.02 0.01 267/.45),
+    0 18px 44px -28px oklch(0.02 0.01 267/.85);
+}
+
+.card-pad {
+  padding: var(--card-pad);
+}
+
+/* .panel is the flat, un-elevated sibling (rail cards, inline sections). */
+.panel {
+  background: color-mix(in oklch, var(--surf-panel) 72%, transparent);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-panel);
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: var(--s4) var(--card-pad);
+  border-bottom: 1px solid var(--glass-border);
+}
+
+.panel-title {
+  font-family: var(--font-display);
+  font-size: var(--t-h3);
+  font-weight: 600;
+  letter-spacing: -.01em;
+}
+
+/* Account/settings section card — head, description, right-aligned acts. */
+.sec-card {
+  padding: var(--card-pad);
+}
+
+.sec-head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s4);
+  margin-bottom: var(--s5);
+}
+
+.sec-head h3 {
+  font-family: var(--font-display);
+  font-size: var(--t-h3);
+}
+
+.sec-head .desc {
+  color: var(--text-3);
+  font-size: var(--t-sm);
+  margin-top: 5px;
+  max-width: 68ch;
+}
+
+.sec-head .acts {
+  margin-left: auto;
+  display: flex;
+  gap: var(--s2);
+}
+
+/* ------------------------------------------------------------------
+   CHIPS, DOTS AND MARKERS
+   21px mono uppercase pill. The status vocabulary is the caller's; the
+   chip only owns tone.
+   ------------------------------------------------------------------ */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 21px;
+  padding: 0 8px;
+  border-radius: var(--r-pill);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  background: var(--glass-strong);
+  color: var(--text-2);
+  border: 1px solid var(--line-3);
+  white-space: nowrap;
+}
+
+.chip .dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+
+.chip-success { background: var(--success-bg); color: var(--success-text); border-color: var(--success-line); }
+.chip-warning { background: var(--warning-bg); color: var(--warning-text); border-color: var(--warning-line); }
+.chip-danger  { background: var(--danger-bg);  color: var(--danger-text);  border-color: var(--danger-line); }
+.chip-info    { background: var(--info-bg);    color: var(--info-text);    border-color: var(--info-line); }
+.chip-accent  { background: var(--accent-soft); color: var(--accent-text); border-color: var(--accent-soft-2); }
+.chip-neutral { background: var(--glass-strong); color: var(--text-2);     border-color: var(--line-3); }
+
+/* Denser variant used inside table rows and readiness lists. */
+.chip-sm {
+  height: 18px;
+  padding: 0 6px;
+  font-size: 9px;
+}
+
+/* Status dot: 8px disc with a 3px halo of its own colour. */
+.sdot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  display: inline-block;
+  background: currentColor;
+  box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 20%, transparent);
+}
+
+.sdot.ok   { color: var(--success-text); }
+.sdot.warn { color: var(--warning-text); }
+.sdot.bad  { color: var(--danger-text); }
+.sdot.info { color: var(--info-text); }
+.sdot.off  { color: var(--text-4); }
+
+.shdr-title {
+  gap: 11px;
+}
+
+.shdr-title .sdot {
+  width: 10px;
+  height: 10px;
+  box-shadow: 0 0 0 4px color-mix(in srgb, currentColor 16%, transparent);
+}
+
+/* `.mk` (the rail's live/fault marker) moved to shell.css — it is chrome. */
+
+/* Stream-tier badge (TierBadge). Not in the mock; retoken only — the
+   swatch reads accent, never the retired violet-to-cyan ramp. */
+.tier {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 26px;
+  padding: 0 11px;
+  border-radius: var(--r-control);
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: var(--t-sm);
+  border: 1px solid var(--line-2);
+  background: var(--surf-raised);
+  color: var(--text);
+}
+
+.tier::before {
+  content: "";
+  width: 14px;
+  height: 11px;
+  border-radius: 2px;
+  background: var(--brand-grad);
+  flex: none;
+}
+
+.tier-hi {
+  border-color: var(--accent-soft-2);
+  background: var(--accent-soft);
+}
+
+.tier-low { color: var(--text-2); }
+.tier-low::before { background: var(--surf-control); }
+
+/* Monogram tile — app art fallback and user avatar (Avatar.tsx). */
+.mono-tile {
+  display: grid;
+  place-content: center;
+  border-radius: var(--r-control);
+  font-family: var(--font-display);
+  font-weight: 600;
+  color: oklch(1 0 0/.85);
+  background: var(--brand-grad);
+  border: 1px solid var(--line-2);
+  overflow: hidden;
+  position: relative;
+  flex: none;
+}
+
+.mono-tile.grad { background: var(--brand-grad); }
+
+/* Capability pills on a device card. */
+.caps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.cap {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: .04em;
+  padding: 3px 7px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-control);
+  color: var(--text-3);
+}
+
+.cap.hl {
+  color: var(--teal);
+  border-color: color-mix(in oklch, var(--teal) 40%, transparent);
+}
+
+.dev-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(288px, 1fr));
+  gap: var(--s4);
+}
+
+/* ------------------------------------------------------------------
+   FORM CONTROLS
+   Inputs recess into --surf-inset; every control is 4px, --control-h
+   tall, and focuses with the accent border plus a 3px soft ring.
+   ------------------------------------------------------------------ */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.label {
+  font-size: var(--t-sm);
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.form-error {
+  font-size: var(--t-sm);
+  color: var(--danger-text);
+  line-height: 1.4;
+}
+
+.input,
+.textarea,
+.select {
+  height: var(--control-h);
+  padding: 0 13px;
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-control);
+  background-color: color-mix(in oklch, var(--surf-inset) 76%, transparent);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--t-sm);
+  width: 100%;
+}
+
+.input::placeholder,
+.textarea::placeholder {
+  color: var(--text-4);
+}
+
+.input:hover,
+.textarea:hover,
+.select:hover {
+  border-color: var(--text-2);
+}
+
+.input:focus,
+.textarea:focus,
+.select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--glow-accent);
+}
+
+.input:disabled,
+.textarea:disabled,
+.select:disabled {
+  opacity: .55;
+  cursor: not-allowed;
+}
+
+.input.mono,
+.textarea {
+  font-family: var(--font-mono);
+}
+
+/* TextareaField reuses `.input`, so the multi-line box is opted into by
+   element rather than by class. */
+.textarea,
+textarea.input {
+  height: auto;
+  min-height: 84px;
+  padding: 9px 13px;
+  line-height: 1.6;
+  resize: vertical;
+}
+
+/* Second declaration, deliberate: the shared box (height, border, inset
+   background, focus) is declared with .input/.textarea above; only what is
+   specific to a <select> lives here. Do not merge the two — the group rule is
+   what keeps the three controls identical.
+
+   The chevron reproduces the mock's stroked `M4 6l4 4 4-4` at stroke-width
+   1.5 as two diagonal strokes rather than an SVG data URI: a data URI has to
+   bake a literal colour into the URL (the mock hard-codes a grey there), while a
+   gradient stroke tracks --text-3. It is drawn on the background rather than
+   an ::after because Chrome does not paint pseudo-elements on a bare
+   <select>, and SelectField renders exactly that. */
+.select {
+  padding-right: 32px;
+  appearance: none;
+  cursor: pointer;
+  background-image:
+    linear-gradient(to bottom left, transparent 40%, var(--text-3) 40% 60%, transparent 60%),
+    linear-gradient(to bottom right, transparent 40%, var(--text-3) 40% 60%, transparent 60%);
+  background-position: right 15px center, right 11px center;
+  background-size: 4px 4px, 4px 4px;
+  background-repeat: no-repeat;
+}
+
+/* .select is width:100% as a form control; in a toolbar it is one inline
+   filter beside the segment and the search box (mock §A.2), and the full
+   width would win the flex-shrink fight against the search box and push
+   whatever follows onto a second line. */
+.toolbar .select {
+  width: auto;
+  flex: none;
+}
+
+.search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: var(--control-h);
+  padding: 0 14px;
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-control);
+  background-color: color-mix(in oklch, var(--surf-inset) 76%, transparent);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  color: var(--text-3);
+  min-width: 220px;
+}
+
+.search:hover {
+  border-color: var(--text-2);
+}
+
+.search:focus-within {
+  border-color: var(--accent);
+  box-shadow: var(--glow-accent);
+}
+
+.search svg,
+.search .ic {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+
+.search input {
+  border: 0;
+  background: none;
+  outline: none;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--t-sm);
+  width: 100%;
+  height: 100%;
+  padding: 0;
+}
+
+/* `.cmdk` (the topbar palette trigger) moved to shell.css — it is chrome.
+   `.icon-btn`, `.menu`, `.pal*` and `.scrim*` stay: pages use them too. */
+
+/* Switch: 34x19 with a 13px knob travelling 2px -> 17px. Two markups are
+   in play — a <label> wrapping a checkbox (TextField.tsx) and a button
+   carrying aria-checked (the admin knob rows) — so both are styled. */
+.switch {
+  position: relative;
+  display: inline-block;
+  box-sizing: border-box;
+  width: 34px;
+  height: 19px;
+  flex: none;
+  padding: 0;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-pill);
+  background: var(--glass-control);
+  box-shadow: inset 0 1px 2px oklch(0.05 0.01 267/.45), 0 1px 0 var(--glass-highlight);
+  cursor: pointer;
+  transition: background .16s ease, border-color .16s ease;
+}
+
+.switch input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.switch .track {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: transparent;
+  transition: background .16s ease, box-shadow .16s ease;
+}
+
+.switch .thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--text-3);
+  transition: left .16s ease, background .16s ease;
+}
+
+.switch input:checked ~ .track {
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.switch input:checked ~ .thumb {
+  left: 17px;
+  background: var(--text);
+}
+
+.switch::after {
+  content: none;
+}
+
+.switch[aria-checked]::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--text-3);
+  transition: left .16s ease, background .16s ease;
+}
+
+.switch[aria-checked="true"] {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.switch[aria-checked="true"]::after {
+  left: 17px;
+  background: var(--text);
+}
+
+.switch:disabled {
+  cursor: not-allowed;
+  opacity: .5;
+}
+
+.switch-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+}
+
+/* Checkbox: a 15px accent square, drawn on the native control. */
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+  min-height: 2.75rem;
+}
+
+.check input {
+  appearance: none;
+  width: 15px;
+  height: 15px;
+  flex: none;
+  border: 1px solid var(--line-3);
+  border-radius: var(--r-control);
+  background: color-mix(in oklch, var(--surf-inset) 76%, transparent);
+  cursor: inherit;
+  position: relative;
+  transition: background .14s ease, border-color .14s ease;
+}
+
+.check input:checked {
+  background: var(--accent);
+  border-color: transparent;
+}
+
+.check input:checked::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 8px;
+  border: solid oklch(1 0 0);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+.check input:disabled {
+  cursor: default;
+  opacity: .6;
+}
+
+/* Segmented control: an 8px inset trough holding 4px segments. */
+.segmented {
+  display: inline-flex;
+  padding: 3px;
+  gap: 2px;
+  background: color-mix(in oklch, var(--surf-inset) 72%, transparent);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-panel);
+}
+
+.segmented button {
+  height: calc(var(--control-h) - 10px);
+  padding: 0 12px;
+  border: 1px solid transparent;
+  background: none;
+  border-radius: var(--r-control);
+  color: var(--text-2);
+  font-size: var(--t-xs);
+  font-weight: 600;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  white-space: nowrap;
+  transition: background .16s ease, color .16s ease;
+}
+
+.segmented button svg {
+  width: 14px;
+  height: 14px;
+  stroke-width: 1.5;
+}
+
+.segmented button:hover:not(:disabled) {
+  color: var(--text);
+}
+
+.segmented button[aria-selected="true"] {
+  background: var(--glass-control);
+  color: var(--text);
+  border-color: var(--glass-border);
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
+}
+
+.segmented button:disabled {
+  opacity: .5;
+  cursor: not-allowed;
+}
+
+/* Repeatable key/value rows (env vars, mounts, launch args). */
+.kv {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.kv-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  width: 100%;
+}
+
+.kv-del {
+  width: 30px;
+  height: var(--control-h);
+  flex: none;
+  border: 1px solid var(--line-3);
+  background: var(--surf-panel);
+  border-radius: var(--r-control);
+  color: var(--text-3);
+  cursor: pointer;
+  display: grid;
+  place-content: center;
+}
+
+.kv-del:hover {
+  background: var(--danger-bg);
+  color: var(--danger-text);
+  border-color: var(--danger-line);
+}
+
+/* ------------------------------------------------------------------
+   TABLE
+   Sticky 34px mono head on --surf-raised, --row-h body rows, hairline
+   rules. The wrapper owns the radius so the head clips to the card.
+   ------------------------------------------------------------------ */
+.table-wrap {
+  overflow: auto;
+  border-radius: var(--r-panel);
+}
+
+table.qtable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--t-sm);
+}
+
+.qtable thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: color-mix(in oklch, var(--surf-raised) 94%, transparent);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--text-2);
+  padding: 0 14px;
+  height: 34px;
+  border-bottom: 1px solid oklch(0.9618 0.0086 247.91/.13);
+  white-space: nowrap;
+}
+
+.qtable tbody td {
+  padding: 10px 14px;
+  line-height: 1.4;
+  height: var(--row-h);
+  border-bottom: 1px solid oklch(0.9618 0.0086 247.91/.07);
+  vertical-align: middle;
+  white-space: nowrap;
+  color: var(--text-2);
+}
+
+[data-density="dense"] .qtable tbody td {
+  padding: 5px 14px;
+}
+
+.qtable tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.qtable tbody tr.clickable {
+  cursor: pointer;
+}
+
+/* Only a row that goes somewhere takes the depth-pass tint; a plain row keeps
+   the flat raised-surface hover the base sheet gives it. */
+.qtable tbody tr:hover {
+  background: var(--ink-4);
+}
+
+.qtable tbody tr.clickable:hover {
+  background: oklch(0.9618 0.0086 247.91/.045);
+}
+
+.qtable .primary {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.qtable .sub {
+  color: var(--text-3);
+  font-size: var(--t-xs);
+}
+
+.qtable td.right,
+.qtable th.right {
+  text-align: right;
+}
+
+/* The in-cell wrapper: a `<div>` inside the `<td>`. */
+.cell-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  justify-content: flex-end;
+  flex-wrap: nowrap;
+}
+
+/* Some rows put the class on the `<td>` itself. `display: flex` there takes
+   the cell out of the table box model, so the row's border-bottom and hover
+   land on a box of content height and a seam runs down the column. Restore the
+   cell and lay its contents out inline; `.row-menu` keeps its own
+   `position: relative` for the popover. */
+td.cell-actions {
+  display: table-cell;
+  text-align: right;
+  white-space: nowrap;
+}
+
+td.cell-actions > * {
+  vertical-align: middle;
+}
+
+td.cell-actions > * + * {
+  margin-left: var(--s2);
+}
+
+.cell-id {
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  color: var(--text-3);
+  background: var(--surf-control);
+  padding: 2px 6px;
+  border-radius: var(--r-control);
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  line-height: 1.25;
+}
+
+.rowflex {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+/* Sortable column header (Table.tsx). */
+.th-sort-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 0;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  cursor: pointer;
+}
+
+.th-sort-btn:hover {
+  color: var(--text);
+}
+
+.th-sort-ind {
+  font-size: 0.65em;
+  color: var(--accent-text);
+  width: 0.8em;
+  display: inline-block;
+}
+
+/* Expandable rows (Table.tsx + the mock's `.exp-*`). */
+.qtable-expand-th,
+.qtable-expand-cell {
+  width: 34px;
+  padding-right: 0;
+}
+
+.exp-btn,
+.qtable-expand-btn {
+  width: 22px;
+  height: 22px;
+  border: 0;
+  background: none;
+  color: var(--text-4);
+  cursor: pointer;
+  display: grid;
+  place-content: center;
+  border-radius: var(--r-control);
+}
+
+.exp-btn svg,
+.qtable-expand-btn svg,
+.qtable-expand-chevron {
+  width: 12px;
+  height: 12px;
+  transition: transform .15s ease;
+}
+
+.exp-btn:hover,
+.qtable-expand-btn:hover {
+  background: var(--surf-raised);
+  color: var(--text);
+}
+
+.exp-btn[aria-expanded="true"],
+.qtable-expand-btn[aria-expanded="true"] {
+  color: var(--text-2);
+}
+
+.exp-btn[aria-expanded="true"] svg,
+.qtable-expand-btn[aria-expanded="true"] svg,
+.qtable-expand-chevron.open {
+  transform: rotate(90deg);
+}
+
+.qtable tr.exp-row > td,
+.qtable tr.qtable-expand-row > td {
+  padding: 0;
+  height: auto;
+  background: color-mix(in oklch, var(--surf-inset) 82%, transparent);
+  box-shadow: inset 0 1px 0 oklch(0.02 0.01 267/.5);
+}
+
+.qtable tr.exp-row:hover > td,
+.qtable tr.qtable-expand-row:hover > td {
+  background: color-mix(in oklch, var(--surf-inset) 82%, transparent);
+}
+
+.exp-in {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s5) var(--s6);
+  padding: var(--s5) var(--s5) var(--s5) 44px;
+  border-top: 0;
+}
+
+.exp-in > div {
+  flex: 1 1 200px;
+  min-width: 186px;
+}
+
+.exp-in p,
+.exp-in .sub,
+.exp-fact > span {
+  white-space: normal;
+}
+
+.exp-in .eyebrow {
+  margin-bottom: 7px;
+}
+
+.exp-fact {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 1px var(--s3);
+  font-size: var(--t-sm);
+  padding: 5px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.exp-fact > span:first-child {
+  color: var(--text-3);
+}
+
+.exp-fact > span:last-child {
+  text-align: right;
+  min-width: 0;
+}
+
+.exp-in a {
+  color: var(--accent-text);
+  cursor: pointer;
+  font-size: var(--t-sm);
+}
+
+.exp-in a:hover {
+  text-decoration: underline;
+}
+
+
+/* ------------------------------------------------------------------
+   CAPACITY ENCODINGS
+   Violet is reserved for action and selection: a bar or a gauge rebinds
+   --accent to teal locally so every fill that reads "how full" is teal.
+   ------------------------------------------------------------------ */
+/* The track is the mock's --surface-active, an alias the v3 token sheet
+   dropped; --surf-raised is the surviving step at that lightness. */
+.bar {
+  --accent: var(--teal);
+  display: block;
+  position: relative;
+  height: 5px;
+  border-radius: var(--r-pill);
+  background: var(--surf-raised);
+  overflow: hidden;
+  flex: 1;
+  min-width: 40px;
+}
+
+/* `> i` is the mock's fill element, `> span` the Bar component's. */
+.bar > i,
+.bar > span {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+  transition: width .2s ease;
+}
+
+.bar.success > i, .bar.success > span { background: var(--success); }
+.bar.warning > i, .bar.warning > span { background: var(--warning); }
+.bar.danger  > i, .bar.danger  > span { background: var(--danger); }
+.bar.info    > i, .bar.info    > span { background: var(--info); }
+.bar.grad    > i, .bar.grad    > span { background: var(--brand-grad); }
+
+/* No-data state (issue 383): no fill at all, never a 0%-filled bar. */
+.bar-row.unknown { opacity: .62; cursor: help; }
+.bar-row.unknown .val,
+.bar-row.unknown .v { color: var(--text-4); }
+
+.bar-row {
+  display: grid;
+  grid-template-columns: 62px 1fr auto;
+  gap: 10px;
+  align-items: center;
+  font-size: var(--t-xs);
+  color: var(--text-3);
+}
+
+.bar-row .lbl {
+  color: var(--text-3);
+}
+
+.bar-row .v,
+.bar-row .val {
+  font-family: var(--font-mono);
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.gauge {
+  --accent: var(--teal);
+  --p: 0;
+  --gc: var(--accent);
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  background: conic-gradient(var(--gc) calc(var(--p) * 1%), var(--surf-control) 0);
+  display: grid;
+  place-content: center;
+  position: relative;
+  flex: none;
+}
+
+.gauge::before {
+  content: "";
+  position: absolute;
+  inset: 5px;
+  border-radius: 50%;
+  background: var(--surf-panel);
+}
+
+/* The mock centres a bare <span>; the Gauge component nests b + span. */
+.gauge > span,
+.gauge .g-val {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  line-height: 1.05;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.gauge .g-val span {
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--text-4);
+}
+
+.spark {
+  display: block;
+  width: 74px;
+  height: 20px;
+  overflow: visible;
+}
+
+.live-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 0 0 var(--success-line);
+  animation: qs-pulse 2s infinite;
+  flex: none;
+}
+
+@keyframes qs-pulse {
+  70%  { box-shadow: 0 0 0 6px oklch(0.76 0.15 164/0); }
+  100% { box-shadow: 0 0 0 0 oklch(0.76 0.15 164/0); }
+}
+
+/* Connection-quality glyph: four rising bars, coloured by data-q. */
+.signal {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2.5px;
+  height: 16px;
+}
+
+.signal i {
+  width: 3.5px;
+  border-radius: 1px;
+  background: var(--text-4);
+  display: block;
+}
+
+.signal i:nth-child(1) { height: 30%; }
+.signal i:nth-child(2) { height: 55%; }
+.signal i:nth-child(3) { height: 78%; }
+.signal i:nth-child(4) { height: 100%; }
+
+.signal[data-q="excellent"] i { background: var(--success); }
+.signal[data-q="good"] i:nth-child(-n+3) { background: var(--info); }
+.signal[data-q="fair"] i:nth-child(-n+2) { background: var(--warning); }
+.signal[data-q="poor"] i:nth-child(1) { background: var(--danger); }
+
+/* 2x2 utilisation block inside a host row. */
+.u2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 5px 12px;
+}
+
+.u2 .bar-row { gap: 5px; }
+.u2 .bar { min-width: 20px; }
+.u2 .bar-row > span:first-child { font-size: 9px; }
+
+/* ------------------------------------------------------------------
+   NOTE
+   The one place the UI explains a rule it cannot show by shape. Inset
+   well, 2px accent left rule; .warn swaps the rule to the warning hue.
+   ------------------------------------------------------------------ */
+.note {
+  background: color-mix(in oklch, var(--surf-inset) 70%, transparent);
+  border: 1px solid var(--glass-border);
+  border-left: 2px solid var(--accent);
+  border-radius: var(--r-control);
+  padding: 11px 13px;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+  line-height: 1.45;
+}
+
+.note.warn {
+  border-left-color: var(--warning);
+}
+
+.note b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.note svg {
+  width: 16px;
+  height: 16px;
+  color: var(--accent-text);
+  flex: none;
+  vertical-align: -3px;
+  margin-right: 7px;
+}
+
+.note.warn svg {
+  color: var(--warning-text);
+}
+
+/* ------------------------------------------------------------------
+   MENUS AND POPOVERS
+   Raised glass, 8px radius, 4px items. `.menu` is the mock's name and
+   `.row-menu-pop` the ActionsMenu component's; both get the same box.
+   ------------------------------------------------------------------ */
+.menu-wrap,
+.row-menu {
+  position: relative;
+  display: inline-block;
+}
+
+.menu,
+.row-menu-pop {
+  background: color-mix(in oklch, var(--surf-raised) 90%, transparent);
+  backdrop-filter: blur(28px);
+  -webkit-backdrop-filter: blur(28px);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-panel);
+  box-shadow: inset 0 1px 0 var(--glass-highlight), 0 1.5rem 3.5rem oklch(0.05 0.01 267/.72);
+  min-width: 186px;
+  padding: 5px;
+}
+
+.menu {
+  position: fixed;
+  z-index: 120;
+  display: none;
+}
+
+.menu.open {
+  display: block;
+}
+
+.row-menu-pop {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 120;
+}
+
+.menu button,
+.row-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  border: 0;
+  background: none;
+  text-align: left;
+  padding: 7px 10px;
+  border-radius: var(--r-control);
+  cursor: pointer;
+  font-family: var(--font-ui);
+  font-size: var(--t-sm);
+  color: var(--text-2);
+  white-space: nowrap;
+  transition: background .12s ease, color .12s ease;
+}
+
+.menu button:hover,
+.row-menu-item:hover:not(:disabled) {
+  background: var(--glass-control);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.menu button svg,
+.row-menu-item svg {
+  width: 16px;
+  height: 16px;
+  color: var(--text-3);
+  flex: none;
+}
+
+.row-menu-item:disabled {
+  color: var(--text-4);
+  cursor: default;
+}
+
+.menu button.danger,
+.row-menu-item.danger {
+  color: var(--danger-text);
+}
+
+.menu button.danger:hover,
+.row-menu-item.danger:hover:not(:disabled) {
+  background: var(--danger-bg);
+  color: var(--danger-text);
+}
+
+.menu hr,
+.row-menu-pop hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 5px 0;
+}
+
+/* ActionsMenu's separator entry (ActionsMenu.tsx's ActionsMenuSeparator) —
+   same hairline treatment as .menu hr, at the row-menu's own hairline tone. */
+.row-menu-pop hr {
+  border: 0;
+  border-top: 1px solid var(--line-2);
+  margin: 4px 0;
+}
+
+/* Kebab trigger on a table row. */
+.row-menu-btn {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-content: center;
+  border: 1px solid transparent;
+  background: none;
+  border-radius: var(--r-control);
+  color: var(--text-3);
+  cursor: pointer;
+  transition: background .14s ease, color .14s ease;
+}
+
+.row-menu-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+.row-menu-btn:hover,
+.row-menu-btn[aria-expanded="true"] {
+  background: var(--glass-control);
+  color: var(--text);
+}
+
+/* The topbar user button and its 248px popover (`.user-btn`, `.u-*`,
+   `.user-pop`, `.up-*`) moved to shell.css — chrome, not a primitive. */
+
+/* ------------------------------------------------------------------
+   OVERLAYS
+   Scrim + modal, drawer, command palette, toasts, bulk bar.
+
+   Z-ORDER: the mock puts .scrim at 80 because its only stack is the
+   console's. Ours also carries the Modal, which must sit above the Drawer
+   (7000/7001) and below the toasts (9000) — so the scrim keeps 8000 and the
+   bulk bar 8500. Menus stay at 120, under everything modal.
+   ------------------------------------------------------------------ */
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 8000;
+  background: oklch(0.05 0.01 267/.6);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: qs-fade-in .18s ease;
+}
+
+@keyframes qs-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* The command palette docks near the top of the viewport rather than centring,
+   so its list can grow downward without the box drifting. */
+.scrim-top {
+  display: grid;
+  place-items: start center;
+  padding-top: 12vh;
+}
+
+.modal {
+  background: color-mix(in oklch, var(--surf-panel) 94%, transparent);
+  backdrop-filter: blur(28px);
+  -webkit-backdrop-filter: blur(28px);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-feature);
+  box-shadow: inset 0 1px 0 var(--glass-highlight), 0 2rem 6rem oklch(0.05 0.01 267/.76);
+  width: 100%;
+  max-width: 460px;
+  animation: qs-rise-in .22s cubic-bezier(.22, 1, .36, 1);
+}
+
+@keyframes qs-rise-in {
+  from { opacity: 0; transform: scale(.96) translateY(8px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.modal-head,
+.drawer-head,
+.dw-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s4);
+  padding: var(--s5) var(--s6);
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+.modal-head h3,
+.drawer-head h3,
+.dw-head h2,
+.dw-head h3 {
+  font-family: var(--font-display);
+  font-size: var(--t-h3);
+  font-weight: 600;
+  color: var(--text);
+  margin: 0;
+}
+
+.modal-body,
+.drawer-body,
+.dw-body {
+  padding: var(--s6);
+}
+
+.drawer-body,
+.dw-body {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.modal-foot,
+.drawer-foot,
+.dw-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--s3);
+  padding: var(--s4) var(--s6);
+  border-top: 1px solid var(--line);
+}
+
+/* `.dscrim` / `.dw-*` are the mock's names for the same parts, so drawer
+   markup pasted from admin-console-v3.html renders without translation. */
+.drawer-scrim,
+.dscrim {
+  position: fixed;
+  inset: 0;
+  z-index: 7000;
+  background: oklch(0.05 0.01 267/.52);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  animation: qs-fade-in .2s ease;
+}
+
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 7001;
+  width: min(760px, 94vw);
+  background: color-mix(in oklch, var(--surf-panel) 94%, transparent);
+  backdrop-filter: blur(28px);
+  -webkit-backdrop-filter: blur(28px);
+  border-left: 1px solid var(--glass-border);
+  box-shadow: inset 0 1px 0 var(--glass-highlight), 0 2rem 6rem oklch(0.05 0.01 267/.76);
+  display: flex;
+  flex-direction: column;
+  animation: qs-slide-in .25s cubic-bezier(.22, 1, .36, 1);
+}
+
+@keyframes qs-slide-in {
+  from { transform: translateX(100%); }
+  to   { transform: translateX(0); }
+}
+
+.drawer-foot,
+.dw-foot {
+  background: color-mix(in oklch, var(--surf-chrome) 88%, transparent);
+}
+
+/* Command palette. */
+.pal {
+  width: min(620px, 92vw);
+  background: color-mix(in oklch, var(--surf-raised) 90%, transparent);
+  backdrop-filter: blur(28px);
+  -webkit-backdrop-filter: blur(28px);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-panel);
+  box-shadow: inset 0 1px 0 var(--glass-highlight), 0 1.5rem 3.5rem oklch(0.05 0.01 267/.72);
+  overflow: hidden;
+}
+
+.pal-in {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 16px;
+  height: 52px;
+  border-bottom: 1px solid var(--line);
+}
+
+.pal-in svg {
+  width: 16px;
+  height: 16px;
+  color: var(--text-3);
+  flex: none;
+}
+
+.pal-in input {
+  flex: 1;
+  border: 0;
+  background: none;
+  outline: none;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--t-lg);
+}
+
+/* The global `input:focus-visible` floor (styles.css) draws a rounded ring
+   around the bare field, which reads as a box inside a box against the
+   palette's own 52px header. The indicator MOVES rather than disappearing:
+   the header row takes the accent underline + soft ring, so focus is still
+   announced visually — at the scale the palette actually uses. */
+.pal-in input:focus-visible {
+  outline: none;
+}
+
+.pal-in:focus-within {
+  border-bottom-color: var(--accent);
+  box-shadow: inset 0 -1px 0 var(--accent), var(--glow-accent);
+}
+
+.pal-list {
+  max-height: min(420px, 56vh);
+  overflow: auto;
+  padding: 6px;
+}
+
+.pal-sec {
+  font-family: var(--font-ui);
+  font-size: 10px;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--text-4);
+  font-weight: 700;
+  padding: 10px 12px 5px;
+}
+
+.pal-item {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  width: 100%;
+  border: 0;
+  background: none;
+  text-align: left;
+  padding: 8px 12px;
+  border-radius: var(--r-control);
+  cursor: pointer;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+
+.pal-item .k {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.pal-item .m {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  color: var(--text-4);
+}
+
+.pal-item svg {
+  width: 15px;
+  height: 15px;
+  stroke-width: 1.5;
+  color: var(--text-3);
+  flex: none;
+}
+
+.pal-item.sel,
+.pal-item:hover {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.pal-foot {
+  border-top: 1px solid var(--line);
+  padding: 9px 16px;
+  font-size: var(--t-xs);
+  color: var(--text-4);
+  display: flex;
+  gap: 16px;
+}
+
+/* Toasts. */
+.toast-host {
+  position: fixed;
+  bottom: var(--s6);
+  right: var(--s6);
+  z-index: 9000;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+  pointer-events: none;
+}
+
+.toast {
+  display: flex;
+  gap: var(--s3);
+  align-items: flex-start;
+  padding: var(--s4);
+  border-radius: var(--r-panel);
+  background: color-mix(in oklch, var(--surf-raised) 92%, transparent);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid var(--glass-border);
+  border-left: 2px solid var(--accent);
+  box-shadow: inset 0 1px 0 var(--glass-highlight), 0 1.5rem 3.5rem oklch(0.05 0.01 267/.72);
+  min-width: 280px;
+  max-width: 360px;
+  pointer-events: all;
+  animation: qs-toast-in .22s cubic-bezier(.22, 1, .36, 1);
+}
+
+@keyframes qs-toast-in {
+  from { opacity: 0; transform: translateY(12px) scale(.97); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.toast.exiting {
+  animation: qs-toast-out .18s ease-in forwards;
+}
+
+@keyframes qs-toast-out {
+  from { opacity: 1; transform: translateY(0); }
+  to   { opacity: 0; transform: translateY(8px); }
+}
+
+.toast.success { border-left-color: var(--success); }
+.toast.warning { border-left-color: var(--warning); }
+.toast.danger  { border-left-color: var(--danger); }
+
+.toast .ic {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.toast .t-title {
+  font-weight: 600;
+  font-size: var(--t-sm);
+  color: var(--text);
+}
+
+.toast .t-body {
+  font-size: var(--t-sm);
+  color: var(--text-3);
+  margin-top: 2px;
+}
+
+.toast .toast-action {
+  margin-top: var(--s2);
+  border: 0;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-size: var(--t-sm);
+  font-weight: 600;
+  color: var(--accent-text);
+  cursor: pointer;
+}
+
+.toast .toast-action:hover {
+  color: var(--text);
+}
+
+/* Bulk-selection bar. */
+.bulk-bar {
+  position: fixed;
+  bottom: var(--s6);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 8500;
+  display: flex;
+  align-items: center;
+  gap: var(--s4);
+  padding: var(--s3) var(--s5);
+  background: color-mix(in oklch, var(--surf-raised) 92%, transparent);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--r-panel);
+  box-shadow: inset 0 1px 0 var(--glass-highlight), 0 1.5rem 3.5rem oklch(0.05 0.01 267/.72);
+  animation: qs-toast-in .22s cubic-bezier(.22, 1, .36, 1);
+  white-space: nowrap;
+}
+
+.bulk-bar .bulk-count {
+  font-size: var(--t-sm);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.bulk-bar .bulk-count span {
+  font-family: var(--font-mono);
+  color: var(--accent-text);
+}
+
+/* `.tabbar` (components.css) is fixed to the bottom below 820px in the user
+   area, so both bottom-anchored overlays have to clear it. Not scoped to the
+   shell: neither host renders inside the shell subtree. */
+@media (max-width: 820px) {
+  .toast-host,
+  .bulk-bar {
+    bottom: calc(var(--s6) + var(--tabbar-h) + env(safe-area-inset-bottom, 0px));
+  }
+}
+
+/* ------------------------------------------------------------------
+   COMPOSITES
+   Larger shapes the v3 pages compose from: the KPI card, the settings
+   row, the drawer field section, the rung editor, the spec pill.
+   ------------------------------------------------------------------ */
+
+/* KPI: a whole .card.card-pad that is also a button. */
+/* A .card.card-pad that is also a button: .card-pad supplies the padding. */
+.kpi {
+  display: block;
+  position: relative;
+  overflow: hidden;
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  transition: border-color .16s ease, transform .16s ease;
+}
+
+.kpi:hover {
+  border-color: var(--line-3);
+  transform: translateY(-1px);
+}
+
+.kpi-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  margin-top: 9px;
+}
+
+.kpi-val {
+  font-family: var(--font-display);
+  font-size: 2rem;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--text);
+}
+
+.kpi-unit {
+  font-size: .95rem;
+  color: var(--text-2);
+  font-weight: 500;
+  margin-left: 4px;
+}
+
+.kpi-trend {
+  margin-left: auto;
+  margin-bottom: 3px;
+}
+
+.kpi-meta {
+  font-size: var(--t-sm);
+  color: var(--text-3);
+  margin-top: 7px;
+}
+
+/* Stat tile (Stat/StatGrid) — the non-clickable sibling of .kpi. */
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.stat .k {
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  font-weight: 500;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+.stat .v {
+  font-family: var(--font-display);
+  font-size: 1.6rem;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--text);
+}
+
+.stat .v small {
+  font-size: .95rem;
+  color: var(--text-2);
+  font-weight: 500;
+  margin-left: 4px;
+}
+
+.stat .meta {
+  font-size: var(--t-sm);
+  color: var(--text-3);
+}
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: var(--s4);
+}
+
+/* Settings row: copy on the left, one control on the right. */
+.cset {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 260px;
+  gap: var(--s6);
+  align-items: center;
+  padding: var(--s4) var(--card-pad);
+  border-top: 1px solid var(--line);
+}
+
+.cset h3 {
+  font-size: var(--t-base);
+  font-weight: 600;
+}
+
+.cset p {
+  margin: 4px 0 0;
+  max-width: 62ch;
+}
+
+.cset > div:last-child {
+  justify-self: end;
+}
+
+@media (max-width: 1200px) {
+  .cset {
+    grid-template-columns: 1fr;
+    gap: var(--s3);
+  }
+  .cset > div:last-child {
+    justify-self: start;
+  }
+}
+
+/* Drawer field section: a 210px label column beside the fields. */
+.fsec {
+  display: grid;
+  grid-template-columns: 210px minmax(0, 1fr);
+  gap: var(--s6);
+  padding: var(--s6) 0;
+  border-top: 1px solid var(--line);
+}
+
+.fsec:first-of-type {
+  border-top: 0;
+  padding-top: var(--s3);
+}
+
+.fsec h4 {
+  font-family: var(--font-display);
+  font-size: var(--t-h3);
+  font-weight: 600;
+  margin: 0;
+}
+
+.fsec .fs-label p {
+  margin: 6px 0 0;
+  font-size: var(--t-sm);
+  color: var(--text-3);
+  line-height: 1.45;
+}
+
+.fsec .fs-fields {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s4);
+}
+
+@media (max-width: 900px) {
+  .fsec { grid-template-columns: 1fr; gap: var(--s3); }
+}
+
+/* Rung editor row: rank, name, bitrate, then the reorder/remove cluster. */
+.rung {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.rung .rank {
+  width: 18px;
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  color: var(--text-4);
+}
+
+.rung .nm {
+  font-size: var(--t-sm);
+  color: var(--text);
+  font-weight: 500;
+}
+
+.rung .br {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+  color: var(--text-3);
+}
+
+.rung .ctl {
+  display: flex;
+  gap: 2px;
+  opacity: .55;
+  transition: opacity .12s ease;
+}
+
+.rung:hover .ctl {
+  opacity: 1;
+}
+
+.rung .ctl button {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-content: center;
+  border: 0;
+  background: none;
+  border-radius: var(--r-control);
+  color: var(--text-3);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.rung .ctl button:hover:not(:disabled) {
+  background: var(--surf-raised);
+  color: var(--text);
+}
+
+.rung .ctl button:disabled {
+  opacity: .35;
+  cursor: default;
+}
+
+.rung .ctl button.rm:hover:not(:disabled) {
+  background: var(--danger-bg);
+  color: var(--danger-text);
+}
+
+/* The last rung must be H.264, so its remove control is not offered. */
+.rung.locked .ctl button.rm {
+  visibility: hidden;
+}
+
+/* The move/remove icons carry no intrinsic size (stroke-only inline SVGs) —
+   without this they lay out at 0x0 and the control renders as an empty hit
+   target. */
+.rung .ctl button svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* Spec pill: mono segments divided by hairlines, first one accent-tinted.
+   `span` is the mock's segment, `.sp` the component's. */
+.spec-pill {
+  display: inline-flex;
+  align-self: flex-start;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-pill);
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+}
+
+.spec-pill > span,
+.spec-pill .sp {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 11px;
+  border-left: 1px solid var(--line-2);
+  color: var(--text-2);
+}
+
+.spec-pill > span:first-child,
+.spec-pill .sp:first-child {
+  border-left: 0;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.spec-pill .sp svg {
+  width: 13px;
+  height: 13px;
+  color: var(--text-3);
+}
+
+/* ------------------------------------------------------------------
+   LIGHT APPEARANCE
+   The ramp itself re-points in tokens.css; these are the component
+   rules whose treatment (not just colour) differs on light.
+   ------------------------------------------------------------------ */
+[data-theme="light"] .btn {
+  background: oklch(1 0 0/.9);
+  border-color: var(--line-2);
+  color: var(--text);
+  box-shadow: var(--inset-top), 0 1px 2px oklch(0.24 0.022 268/.1);
+}
+
+[data-theme="light"] .btn:hover:not(:disabled) {
+  background: oklch(1 0 0);
+  border-color: var(--line-3);
+}
+
+[data-theme="light"] .btn:active:not(:disabled) {
+  box-shadow: inset 0 2px 4px oklch(0.24 0.022 268/.14);
+}
+
+[data-theme="light"] .btn-primary {
+  background: var(--action);
+  border-color: oklch(0.42 0.19 273.21);
+  color: oklch(1 0 0);
+  text-shadow: none;
+  box-shadow:
+    inset 0 1px 0 oklch(1 0 0/.24),
+    0 2px 4px oklch(0.24 0.022 268/.18),
+    0 10px 22px -14px oklch(0.5 0.19 273.21/.7);
+}
+
+[data-theme="light"] .btn-primary:hover:not(:disabled) {
+  background: var(--accent-press);
+  border-color: oklch(0.38 0.19 273.21);
+}
+
+[data-theme="light"] .btn-ghost {
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-2);
+}
+
+[data-theme="light"] .btn-ghost:hover:not(:disabled) {
+  background: oklch(0.24 0.022 268/.05);
+  border-color: transparent;
+  color: var(--text);
+}
+
+[data-theme="light"] .btn-danger {
+  background: transparent;
+  border-color: var(--danger-line);
+  color: var(--danger-text);
+  box-shadow: none;
+}
+
+[data-theme="light"] .btn-danger:hover:not(:disabled) {
+  background: var(--danger-bg);
+  color: var(--danger-text);
+}
+
+[data-theme="light"] .icon-btn:hover,
+[data-theme="light"] .gbtn:hover,
+[data-theme="light"] .btn-icon:not(.btn):hover {
+  background: oklch(0.24 0.022 268/.06);
+  color: var(--text);
+}
+
+[data-theme="light"] .card {
+  background: color-mix(in oklch, var(--surf-panel) 88%, transparent);
+  border-color: var(--glass-border);
+  box-shadow: var(--inset-top), var(--shadow-md);
+}
+
+[data-theme="light"] .qtable thead th {
+  background: color-mix(in oklch, var(--surf-raised) 94%, transparent);
+  border-bottom: 1px solid var(--glass-border);
+  color: var(--text-3);
+}
+
+[data-theme="light"] .qtable tbody td {
+  border-bottom: 1px solid var(--line);
+}
+
+[data-theme="light"] .qtable tbody tr.clickable:hover {
+  background: oklch(0.24 0.022 268/.035);
+}
+
+[data-theme="light"] .qtable tr.exp-row > td,
+[data-theme="light"] .qtable tr.qtable-expand-row > td {
+  background: color-mix(in oklch, var(--surf-inset) 74%, transparent);
+  box-shadow: inset 0 1px 0 oklch(0.24 0.022 268/.07);
+}
+
+[data-theme="light"] .note {
+  background: color-mix(in oklch, var(--surf-inset) 62%, transparent);
+  border-color: var(--line);
+  border-left-color: var(--accent);
+}
+
+[data-theme="light"] .note.warn {
+  border-left-color: var(--warning);
+}
+
+[data-theme="light"] .input,
+[data-theme="light"] .textarea,
+[data-theme="light"] .select,
+[data-theme="light"] .search {
+  background-color: oklch(1 0 0/.86);
+  border-color: var(--line-2);
+}
+
+[data-theme="light"] .segmented {
+  background: color-mix(in oklch, var(--surf-inset) 70%, transparent);
+  border-color: var(--line-2);
+}
+
+[data-theme="light"] .segmented button[aria-selected="true"] {
+  background: oklch(1 0 0);
+  color: var(--text);
+  border-color: var(--line-2);
+  box-shadow: 0 1px 2px oklch(0.24 0.022 268/.12);
+}
+
+[data-theme="light"] .switch {
+  background: oklch(0.24 0.022 268/.12);
+  border-color: var(--line-2);
+  box-shadow: inset 0 1px 2px oklch(0.24 0.022 268/.12);
+}
+
+[data-theme="light"] .switch .thumb,
+[data-theme="light"] .switch[aria-checked]::after {
+  background: oklch(1 0 0);
+  box-shadow: 0 1px 2px oklch(0.24 0.022 268/.3);
+}
+
+[data-theme="light"] .switch input:checked ~ .track {
+  background: var(--action);
+  box-shadow: none;
+}
+
+[data-theme="light"] .switch[aria-checked="true"] {
+  background: var(--action);
+  border-color: transparent;
+}
+
+[data-theme="light"] .menu,
+[data-theme="light"] .row-menu-pop,
+[data-theme="light"] .pal,
+[data-theme="light"] .toast,
+[data-theme="light"] .bulk-bar {
+  background: oklch(0.998 0.002 268/.92);
+  box-shadow: var(--shadow-lg);
+}
+
+[data-theme="light"] .modal,
+[data-theme="light"] .drawer {
+  background: oklch(0.998 0.002 268/.95);
+  box-shadow: var(--shadow-lg);
+}
+
+[data-theme="light"] .scrim,
+[data-theme="light"] .drawer-scrim,
+[data-theme="light"] .dscrim {
+  background: oklch(0.24 0.022 268/.28);
+}
+
+[data-theme="light"] .chip {
+  background: oklch(1 0 0/.8);
+  border-color: var(--line-2);
+  color: var(--text-2);
+}
+
+[data-theme="light"] .bar {
+  background: oklch(0.24 0.022 268/.1);
+}
+
+[data-theme="light"] .sdot {
+  box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 14%, transparent);
+}
+
+/* ------------------------------------------------------------------
+   COVER ART
+   The 2:3 artwork frame shared by the library grid and rail
+   (pages/app/home/*), the session quick-switch rail and the admin
+   artwork panel. `.cv-*` is the gradient a title falls back to when
+   it has no artwork, cycled per app by libraryGrid.coverClassAt.
+
+   PORTRAIT, 2:3 (issue 385 item 1): the artwork provider's most common —
+   and only exactly-2:3 — grid dimension is 600x900 box art, far more
+   recognisable per pixel than a landscape crop of the same width.
+
+   `object-fit: cover` is what lets ONE frame hold BOTH crops: the
+   portrait grid fills a 2:3 tile, the far wider hero fills the hero
+   panel (which overrides `aspect-ratio`), and neither is distorted.
+   It is also the safety net behind pickBest's aspect PREFERENCE
+   (control-plane/internal/artwork/steamgriddb.go) — a landscape grid
+   is trimmed, never stretched.
+   ------------------------------------------------------------------ */
+.cover {
+  position: relative;
+  aspect-ratio: 2 / 3;
+  display: grid;
+  place-content: center;
+  overflow: hidden;
+}
+
+.cover .glyph {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 2.6rem;
+  color: oklch(1 0 0 / 0.92);
+  letter-spacing: -0.03em;
+  mix-blend-mode: overlay;
+}
+
+/* Above the gradient, and above the glyph it stands in for. */
+.cover-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  z-index: 1;
+}
+
+/* home.html's own palette, converted to oklch. */
+.cv-violet { background: linear-gradient(150deg, oklch(0.5443 0.2453 284.39), oklch(0.3727 0.1878 282.05)); }
+.cv-cyan { background: linear-gradient(150deg, oklch(0.7577 0.1529 231.09), oklch(0.4526 0.1106 245.69)); }
+.cv-horizon { background: linear-gradient(150deg, oklch(0.5998 0.2179 273.21), oklch(0.3657 0.1512 273.75)); }
+.cv-nebula { background: linear-gradient(150deg, oklch(0.6054 0.2201 292.20), oklch(0.7079 0.1770 298.27)); }
+.cv-plasma { background: linear-gradient(150deg, oklch(0.6443 0.1926 256.34), oklch(0.3612 0.1181 259.70)); }
+.cv-rose { background: linear-gradient(150deg, oklch(0.6861 0.2061 14.99), oklch(0.4033 0.1197 4.83)); }
+
+/* ------------------------------------------------------------------
+   REDUCED MOTION
+   base.css zeroes transitions and animation durations globally; the
+   entry animations still need their keyframes suppressed, and the
+   live-dot pulse must not sit frozen mid-halo.
+   ------------------------------------------------------------------ */
+@media (prefers-reduced-motion: reduce) {
+  .toast,
+  .toast.exiting,
+  .scrim,
+  .modal,
+  .drawer,
+  .drawer-scrim,
+  .bulk-bar,
+  .live-dot {
+    animation: none;
+  }
+
+  .btn:hover,
+  .btn:active,
+  .kpi:hover {
+    transform: none;
+  }
+
+  .bar > i,
+  .bar > span {
+    transition: none;
+  }
+}

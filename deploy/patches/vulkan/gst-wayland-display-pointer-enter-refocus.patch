@@ -1,0 +1,233 @@
+From cc07f1b9f65a083879941aec79626b29650aad55 Mon Sep 17 00:00:00 2001
+From: salty2011 <salty2011@proton.me>
+Date: Wed, 5 Aug 2026 00:19:36 +1000
+Subject: [PATCH] fix(compositor): re-emit wl_pointer.enter for clients that
+ lose the map race
+
+smithay emits wl_pointer.enter only on a focus TRANSITION. Its enter()
+broadcasts to the wl_pointer resources that exist at that instant, but
+records the new focus unconditionally. This compositor resolves pointer
+focus exactly once, via the synthetic zero-delta pointer_motion() in the
+toplevel map handler.
+
+A client that calls wl_seat.get_pointer AFTER that instant therefore
+loses: the enter reached zero resources, smithay's focus is already
+Some(surface), and every subsequent motion takes smithay's same-target
+arm, which sends wl_pointer.motion only. The client never learns it has
+pointer focus and ignores all pointer input, permanently. Rootful
+Xwayland (which maps exactly once) fails deterministically; gamescope
+fails intermittently and self-heals only on a re-map.
+
+Fix: an edge trigger. The map handler sets pending_pointer_refocus AFTER
+its synthetic motion -- the order is load-bearing, since that motion is
+itself a pointer_motion() call and would otherwise consume the flag
+inside the very race window this escapes. The next real motion forces
+smithay's focus to None, so the motion that follows takes the
+(focus, None) => enter arm and re-emits the enter.
+
+Guards on consumption:
+- no surface under the pointer: flag RETAINED, so a later motion still
+  delivers the enter once something is there.
+- pointer grabbed: flag RETAINED. smithay's default click grab is live
+  while a button is held, and a forced leave would break a click-drag.
+- active pointer constraint on the surface: flag CLEARED without the
+  forced leave. A constraint can only activate on an entered surface, so
+  the client demonstrably already has its enter and the refocus is
+  unnecessary rather than deferred.
+
+Refs: quasar issue #432
+---
+ wayland-display-core/src/comp/input.rs        | 58 ++++++++++++++++++-
+ wayland-display-core/src/comp/mod.rs          |  5 ++
+ .../src/tests/test_pointer.rs                 | 57 ++++++++++++++++++
+ .../src/wayland/handlers/compositor.rs        | 12 ++++
+ 4 files changed, 130 insertions(+), 2 deletions(-)
+
+diff --git a/wayland-display-core/src/comp/input.rs b/wayland-display-core/src/comp/input.rs
+index 06e0360..18f046d 100644
+--- a/wayland-display-core/src/comp/input.rs
++++ b/wayland-display-core/src/comp/input.rs
+@@ -199,13 +199,67 @@ impl State {
+         delta_unaccelerated: Point<f64, Logical>,
+     ) {
+         self.last_pointer_movement = Instant::now();
+-        let serial = SERIAL_COUNTER.next_serial();
+         let pointer = self.seat.get_pointer().unwrap();
+-        let under = self
++        let under: Option<(FocusTarget, Point<f64, Logical>)> = self
+             .space
+             .element_under(self.pointer_location)
+             .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
+ 
++        // Edge-triggered pointer refocus (quasar issue #432).
++        //
++        // smithay only emits wl_pointer.enter on a focus TRANSITION, and broadcasts it to
++        // the wl_pointer resources that exist at that instant while recording the new focus
++        // unconditionally. This compositor resolves pointer focus once, via a synthetic
++        // zero-delta motion in the toplevel map handler. A client that calls
++        // wl_seat.get_pointer AFTER that instant loses the race: the enter reached zero
++        // resources, smithay's focus is already Some(surface), and every later motion takes
++        // smithay's same-target arm (wl_pointer.motion only) -- so the client never learns
++        // it has pointer focus and ignores all pointer input, forever. Rootful Xwayland
++        // (maps exactly once) fails deterministically; gamescope fails intermittently.
++        //
++        // Fix: on the first real motion after a map, force smithay's focus to None so the
++        // motion below takes the (focus, None) => enter arm and re-emits the enter.
++        //
++        // The flag is RETAINED (not consumed) when there is no surface under the pointer --
++        // there is nothing to refocus onto yet -- and while the pointer is grabbed, since
++        // smithay's default click grab is active for as long as a button is held and a
++        // forced leave mid-click-drag would break the drag.
++        let refocus_target = under
++            .as_ref()
++            .filter(|_| self.pending_pointer_refocus && !pointer.is_grabbed());
++        if let Some((target, _)) = refocus_target {
++            // An active pointer constraint proves the client already received its enter
++            // (constraints only activate on an entered surface), so the refocus is
++            // unnecessary rather than deferred -- clear the flag, don't retry.
++            let constrained = target
++                .wl_surface()
++                .map(|surface| {
++                    with_pointer_constraint(
++                        &surface,
++                        &pointer,
++                        |constraint| matches!(constraint, Some(c) if c.is_active()),
++                    )
++                })
++                .unwrap_or(false);
++
++            self.pending_pointer_refocus = false;
++            if !constrained {
++                pointer.motion(
++                    self,
++                    None,
++                    &MotionEvent {
++                        location: self.pointer_location,
++                        serial: SERIAL_COUNTER.next_serial(),
++                        time: event_time_msec,
++                    },
++                );
++            }
++        }
++
++        // Allocated AFTER the refocus block: the re-emitted wl_pointer.enter below must carry
++        // a serial NEWER than the forced leave's, since clients echo enter serials back.
++        let serial = SERIAL_COUNTER.next_serial();
++
+         let possible_pos = self.clamp_coords(self.pointer_location + delta);
+ 
+         // Pointer should only move if it's not locked or confined (and going out of bounds)
+diff --git a/wayland-display-core/src/comp/mod.rs b/wayland-display-core/src/comp/mod.rs
+index 731ec71..c958a3a 100644
+--- a/wayland-display-core/src/comp/mod.rs
++++ b/wayland-display-core/src/comp/mod.rs
+@@ -163,6 +163,10 @@ pub struct State {
+     pub(crate) pointer_location: Point<f64, Logical>,
+     pub(crate) pointer_absolute_location: Point<f64, Logical>,
+     last_pointer_movement: Instant,
++    /// Edge trigger for a forced wl_pointer refocus (quasar issue #432). Set at initial
++    /// toplevel map, consumed by the next `pointer_motion()` that has a surface under the
++    /// pointer; see `comp::input::pointer_motion`.
++    pub(crate) pending_pointer_refocus: bool,
+     cursor_element: MemoryRenderBuffer,
+     pub cursor_state: CursorImageStatus,
+     surpressed_keys: HashSet<u32>,
+@@ -489,6 +493,7 @@ impl State {
+             pointer_location: (0., 0.).into(),
+             pointer_absolute_location: (0., 0.).into(),
+             last_pointer_movement: Instant::now(),
++            pending_pointer_refocus: false,
+             cursor_element,
+             cursor_state: CursorImageStatus::default_named(),
+             cursor_event_count: 0,
+diff --git a/wayland-display-core/src/tests/test_pointer.rs b/wayland-display-core/src/tests/test_pointer.rs
+index 55b7686..464ac7d 100644
+--- a/wayland-display-core/src/tests/test_pointer.rs
++++ b/wayland-display-core/src/tests/test_pointer.rs
+@@ -289,3 +289,60 @@ fn confine_mouse_absolute_movement() {
+         }
+     }
+ }
++
++/// quasar issue #432: a client whose wl_pointer did not exist when pointer focus was first
++/// resolved must still receive a wl_pointer.enter. The armed `pending_pointer_refocus` flag
++/// forces the next motion to cycle smithay's focus (leave -> enter) instead of taking its
++/// same-target motion-only arm.
++#[test]
++fn pending_refocus_re_emits_enter() {
++    let mut f = Fixture::new();
++    f.round_trip();
++    f.create_window(320, 240);
++
++    // Establish focus the normal way, then drop the events it produced.
++    f.server
++        .pointer_motion_absolute(0, Point::from((10.0, 10.0)));
++    f.round_trip();
++    clean_events(f.client.get_client_events());
++
++    // Without the flag, a second motion is motion-only (see `move_mouse`). With it armed,
++    // the client must see a fresh Enter.
++    f.server.pending_pointer_refocus = true;
++    let delta = Point::from((5.0, 5.0));
++    f.server.pointer_motion(0, 0, delta, delta);
++    f.round_trip();
++
++    assert!(
++        !f.server.pending_pointer_refocus,
++        "flag must be consumed when a surface is under the pointer"
++    );
++
++    let client_events = f.client.get_client_events();
++    assert!(
++        client_events
++            .iter()
++            .any(|e| matches!(e, MouseEvents::Pointer(wl_pointer::Event::Enter { .. }))),
++        "expected a re-emitted wl_pointer.enter, got: {:?}",
++        client_events
++    );
++}
++
++/// The flag is RETAINED when nothing is under the pointer, so a later motion can still
++/// deliver the enter once a surface is mappable there.
++#[test]
++fn pending_refocus_retained_without_surface() {
++    let mut f = Fixture::new();
++    f.round_trip();
++    // No window created: `Space::element_under` resolves to None.
++
++    f.server.pending_pointer_refocus = true;
++    let delta = Point::from((5.0, 5.0));
++    f.server.pointer_motion(0, 0, delta, delta);
++    f.round_trip();
++
++    assert!(
++        f.server.pending_pointer_refocus,
++        "flag must survive a motion with no surface under the pointer"
++    );
++}
+diff --git a/wayland-display-core/src/wayland/handlers/compositor.rs b/wayland-display-core/src/wayland/handlers/compositor.rs
+index ec706f9..facf10c 100644
+--- a/wayland-display-core/src/wayland/handlers/compositor.rs
++++ b/wayland-display-core/src/wayland/handlers/compositor.rs
+@@ -324,6 +324,18 @@ impl CompositorHandler for State {
+                     (0., 0.).into(),
+                     (0., 0.).into(),
+                 );
++                // Arm the edge-triggered pointer refocus for the NEXT motion (quasar
++                // issue #432): the enter emitted by the synthetic motion above reaches
++                // only the wl_pointer resources that exist at this instant, and a client
++                // that calls wl_seat.get_pointer afterwards (rootful Xwayland always;
++                // gamescope intermittently) would never see one, because smithay records
++                // focus regardless and every later motion then takes its same-target arm.
++                //
++                // ORDER IS LOAD-BEARING: this must be set AFTER the synthetic motion.
++                // That motion is itself a pointer_motion() call, so arming the flag first
++                // would let it consume itself inside the exact race window this fix
++                // exists to escape.
++                self.pending_pointer_refocus = true;
+             }
+ 
+             return;
+-- 
+2.50.1 (Apple Git-155)
+

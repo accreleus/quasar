@@ -1,0 +1,140 @@
+---
+/**
+ * The architecture diagram for start/how-it-works.
+ *
+ * An enlarged version of the inline diagram on the landing page
+ * (Landing.astro), drawn against the same product tokens rather than exported
+ * as an image, so it stays crisp at any size and follows the theme toggle.
+ *
+ * Kept in step with Landing.astro by hand. If the shapes there change, change
+ * them here too.
+ */
+interface Props {
+	/** Caption below the frame. */
+	caption?: string;
+}
+
+const { caption } = Astro.props;
+---
+
+<figure class="q-arch">
+	<div class="q-arch-frame">
+		<svg
+			class="q-arch-svg"
+			viewBox="0 0 880 400"
+			role="img"
+			aria-label="The browser talks to the control plane over HTTPS, and the control plane directs a node agent over a WebSocket. The node agent starts a game container on a GPU and then sends media and input directly to the browser over WebRTC, with the control plane out of the path."
+		>
+			<defs>
+				<!-- v3 reserves violet for action and retired the violet-to-cyan
+				     spectrum, so this is the accent to its pressed shade. -->
+				<linearGradient id="arch-media" x1="0" y1="0" x2="1" y2="0">
+					<stop offset="0" stop-color="oklch(0.5998 0.2179 273.21)"></stop>
+					<stop offset="1" stop-color="oklch(0.5 0.19 273.21)"></stop>
+				</linearGradient>
+			</defs>
+
+			<!-- Your device -->
+			<rect x="24" y="40" width="216" height="96" rx="16" class="q-anode"></rect>
+			<text x="132" y="82" class="q-alabel">Browser</text>
+			<text x="132" y="108" class="q-asub">YOUR DEVICE</text>
+
+			<!-- Control plane -->
+			<rect x="332" y="40" width="216" height="96" rx="16" class="q-anode"></rect>
+			<text x="440" y="82" class="q-alabel">Control plane</text>
+			<text x="440" y="108" class="q-asub">GO · POSTGRES</text>
+
+			<!-- Node agent -->
+			<rect x="640" y="40" width="216" height="96" rx="16" class="q-anode"></rect>
+			<text x="748" y="82" class="q-alabel">Node agent</text>
+			<text x="748" y="108" class="q-asub">RUST · ONE PER HOST</text>
+
+			<!-- Game container -->
+			<rect x="640" y="216" width="216" height="88" rx="16" class="q-anode"></rect>
+			<text x="748" y="254" class="q-alabel">Game container</text>
+			<text x="748" y="280" class="q-asub">COMPOSITOR · GPU ENCODE</text>
+
+			<!-- Control edges -->
+			<line x1="240" y1="88" x2="332" y2="88" class="q-aedge"></line>
+			<line x1="548" y1="88" x2="640" y2="88" class="q-aedge"></line>
+			<line x1="748" y1="136" x2="748" y2="216" class="q-aedge"></line>
+
+			<text x="286" y="74" class="q-aelabel">HTTPS API</text>
+			<text x="594" y="74" class="q-aelabel">WEBSOCKET</text>
+			<text x="748" y="182" class="q-aelabel">STARTS</text>
+
+			<!-- The media path, which does not go through the control plane -->
+			<path d="M 712 304 L 712 356 L 132 356 L 132 136" class="q-amedia"></path>
+			<text x="422" y="344" class="q-amlabel">WEBRTC · VIDEO, AUDIO AND INPUT</text>
+		</svg>
+	</div>
+	{caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<style>
+	.q-arch {
+		margin: 1.75rem 0;
+	}
+
+	.q-arch-frame {
+		border-radius: var(--q-r-lg, 12px);
+		border: 1px solid var(--q-line-2, rgba(255, 255, 255, 0.12));
+		background: var(--q-ink-2, oklch(0.163 0.018 268));
+		box-shadow: var(--q-shadow-md, 0 6px 20px -6px rgba(0, 0, 0, 0.55));
+		padding: 1.5rem 1.25rem;
+	}
+
+	.q-arch-svg {
+		width: 100%;
+		height: auto;
+		display: block;
+	}
+
+	.q-anode {
+		fill: var(--q-ink-3, oklch(0.208 0.02 268));
+		stroke: var(--q-line-2, rgba(255, 255, 255, 0.12));
+		stroke-width: 1;
+	}
+
+	.q-alabel {
+		fill: var(--q-text, oklch(0.9618 0.0086 247.91));
+		font-family: var(--q-font-ui, sans-serif);
+		font-weight: 600;
+		font-size: 19px;
+		text-anchor: middle;
+	}
+
+	.q-asub {
+		fill: var(--q-text-3, oklch(0.6605 0.0265 259.81));
+		font-family: var(--q-font-mono, ui-monospace, monospace);
+		font-size: 11px;
+		letter-spacing: 0.14em;
+		text-anchor: middle;
+	}
+
+	.q-aedge {
+		stroke: var(--q-text-4, oklch(0.56 0.024 259));
+		stroke-width: 1.25;
+	}
+
+	.q-aelabel,
+	.q-amlabel {
+		fill: var(--q-text-3, oklch(0.6605 0.0265 259.81));
+		font-family: var(--q-font-mono, ui-monospace, monospace);
+		font-size: 11px;
+		letter-spacing: 0.14em;
+		text-anchor: middle;
+	}
+
+	.q-amedia {
+		fill: none;
+		stroke: url(#arch-media);
+		stroke-width: 2;
+	}
+
+	figcaption {
+		margin-top: 0.6rem;
+		font-size: 0.8125rem;
+		color: var(--q-text-3, oklch(0.6605 0.0265 259.81));
+	}
+</style>
