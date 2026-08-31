@@ -120,8 +120,9 @@ name: Images
 #   (deploy/toolchain-hash.sh). It is keyed by what it contains, not by which
 #   release shipped it, and a release tag must not fork that identity. It is a
 #   build INPUT, never deployed, and deploy/image-contract.json declares no role
-#   for it — so it is not contract-validated. What it does get is a verified
-#   re-tag: see the toolchain job.
+#   for it — so it is not contract-validated. Nor is it re-tagged from anywhere:
+#   the toolchain job either reuses the hash under this repo's own package name or
+#   builds it. Adopting the old package name is not a fallback, it is unreadable.
 #
 # MANUAL ONLY (operator directive 2026-07-06): the quasar-node-agent lane builds
 # patched GStreamer from source (~85 min cold) and automatic per-push/PR
@@ -291,55 +292,12 @@ jobs:
             exit 0
           fi
 
-          # The rename must not cost a 40-minute rebuild of bytes that already exist.
-          # toolchain-hash.sh hashes pins/patches/stage text ONLY -- never the image
-          # name -- so the artefact published under the old package name for this hash
-          # IS this artefact. Re-point the new name at it instead of rebuilding.
-          #
-          # This adoption used to be an unchecked `imagetools create`: whatever sat at
-          # the legacy tag became the toolchain the agent image was compiled against.
-          # It now has to prove two things first.
-          if docker manifest inspect "$legacy" >/dev/null 2>&1; then
-            # 1. It really is a toolchain image. The role label is baked by
-            #    deploy/Dockerfile.vulkan's toolchain stage, and the contract's
-            #    provenance requirement (image-contract.json labels.required) exists
-            #    precisely so an image can say what it is.
-            #
-            #    An UNREADABLE label is not the same as a WRONG one: `--format
-            #    .Image.…` reads the config, which is a per-platform map on a
-            #    multi-platform index. Unreadable falls through to a rebuild (correct,
-            #    just slow); a label that reads and says something else means the
-            #    legacy tag is not what this hash claims, and is refused.
-            #    `.Image` is the image config for a single-platform manifest and a
-            #    map keyed by platform for an index (which is what an attested build
-            #    produces), so read it as JSON and accept either shape.
-            role="$(docker buildx imagetools inspect --format '{{json .Image}}' "$legacy" 2>/dev/null \
-              | jq -r 'if (type=="object" and has("config")) then . else (to_entries|map(.value)|first // {}) end
-                       | (.config.Labels["org.quasar.image.role"] // empty)' 2>/dev/null || true)"
-            if [ -n "$role" ] && [ "$role" != "toolchain" ]; then
-              echo "::error::refusing to adopt $legacy: org.quasar.image.role is '$role', expected 'toolchain'."
-              exit 1
-            fi
-            if [ -z "$role" ]; then
-              echo "::warning::could not read org.quasar.image.role from $legacy; rebuilding rather than adopting an unidentified image."
-            else
-              src_digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$legacy")"
-              echo "ADOPTING $legacy@$src_digest -> $image (same content hash, no rebuild)."
-              docker buildx imagetools create --tag "$image" "${legacy%:*}@${src_digest}"
-              # 2. The new name resolves to the digest we meant. This is the check the
-              #    old unconditional `imagetools create` did not have: without it,
-              #    "the re-tag succeeded" was an assumption, not an observation.
-              new_digest="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$image")"
-              if [ "$new_digest" != "$src_digest" ]; then
-                echo "::error::re-tag verification failed: $image is $new_digest, expected $src_digest."
-                exit 1
-              fi
-              echo "built=false" >> "$GITHUB_OUTPUT"
-              echo "verified $image == $legacy == $src_digest"
-              exit 0
-            fi
-          fi
-
+          # A miss here always means a build. There is deliberately no adoption of a
+          # pre-rename `quasar-toolchain:<hash>` artefact: that package is owned by the
+          # private quasar-internal repo, so this repository's GITHUB_TOKEN cannot even
+          # read it (`denied: permission_denied: read_package`) -- see NO TRANSITION
+          # ALIASES in the header. Content hashes published under the new name are the
+          # only reuse source, and the branch above is the one that serves them.
           echo "built=true" >> "$GITHUB_OUTPUT"
           echo "BUILDING $image -- a pin, a patch, the toolchain stage or the base changed."
       - name: Build and publish the toolchain
