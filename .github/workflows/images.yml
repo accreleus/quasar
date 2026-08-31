@@ -109,27 +109,12 @@ name: Images
 #   is a promotion decision; a build job that knew the final tags would be one
 #   `push: true` away from applying them.
 #
-# TRANSITION ALIASES (role rename, 2026-08-26). Platform images are now named for
-# the role they play, not the technology inside them:
-#
-#   quasar-vulkan    -> quasar-node-agent
-#   quasar-control   -> quasar-control-plane
-#   quasar-toolchain -> quasar-gst-toolchain
-#   quasar-dev       -> quasar-agent-dev      (not published here)
-#
-# The promote job lists BOTH names under `images:`. metadata-action expands its
-# whole tag set across every listed image, so one `imagetools create` publishes an
-# identical tag set to the new package (primary) and to the old package
-# (DEPRECATED alias), pointing at the same digest — a puller pinned to the old
-# name keeps getting the same bytes for one transition window.
-#
-# REMOVAL CONDITION for every alias in this file: drop the old name after the
-# FIRST RELEASE THAT SHIPS THE NEW NAMES, PLUS ONE MORE release. That is the same
-# window build-images.sh applies to its local alias tags (role_legacy_image) —
-# move both together or neither. GHCR package descriptions cannot be set from
-# this workflow; marking the old packages "deprecated, see <new name>" in the
-# GHCR UI is a manual operator step.
-#
+# NO TRANSITION ALIASES. The pre-2026-08-26 package names (quasar-control,
+# quasar-vulkan, quasar-toolchain) are owned by the PRIVATE quasar-internal repo
+# and this repository's GITHUB_TOKEN cannot write to them: a push is refused with
+# `denied: permission_denied: read_package`, which is what killed the first run
+# from the public repo. Nothing ever pulled the old names from here, so there is
+# no transition window to serve. Do not re-add them.
 #   The toolchain image below is deliberately NOT version-tagged: its tag is a
 #   content hash over deploy/pins.env + deploy/patches + the toolchain stage
 #   (deploy/toolchain-hash.sh). It is keyed by what it contains, not by which
@@ -295,9 +280,6 @@ jobs:
 
           tag="$(bash deploy/toolchain-hash.sh)"
           image="$REGISTRY_NS/quasar-gst-toolchain:${tag}"
-          # DEPRECATED alias package, pre-2026-08-26 rename. See the transition-alias
-          # note in the header for the removal condition.
-          legacy="$REGISTRY_NS/quasar-toolchain:${tag}"
           echo "tag=$tag"     >> "$GITHUB_OUTPUT"
           echo "image=$image" >> "$GITHUB_OUTPUT"
           bash deploy/toolchain-hash.sh --explain
@@ -368,10 +350,7 @@ jobs:
           file: deploy/Dockerfile.vulkan
           target: toolchain
           push: true
-          # Both names, one push. The second is the DEPRECATED pre-rename package.
-          tags: |
-            ${{ steps.resolve.outputs.image }}
-            ${{ env.REGISTRY_NS }}/quasar-toolchain:${{ steps.resolve.outputs.tag }}
+          tags: ${{ steps.resolve.outputs.image }}
           # Plain manifests, no attestations — same reasoning as the artifact lanes,
           # and it also keeps the label read above on its single-platform path.
           provenance: false
@@ -380,12 +359,7 @@ jobs:
             QUASAR_BASE_IMAGE=${{ needs.inputs.outputs.base_ref }}
             SOURCE_COMMIT=${{ github.sha }}
             BUILT_AT=${{ needs.inputs.outputs.built_at }}
-          # Two cache sources: the new scope, plus the pre-rename scope so the warm
-          # cache built before the rename is not thrown away. Only the new one is
-          # written; the old scope goes cold on its own and is dropped with the alias.
-          cache-from: |
-            type=registry,ref=${{ env.REGISTRY_NS }}/quasar-gst-toolchain:buildcache
-            type=registry,ref=${{ env.REGISTRY_NS }}/quasar-toolchain:buildcache
+          cache-from: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-gst-toolchain:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-gst-toolchain:buildcache,mode=max
 
       # Whether it was reused, adopted or freshly built, the toolchain leaves this
@@ -445,9 +419,7 @@ jobs:
           sbom: false
           build-args: |
             QUASAR_BASE_IMAGE=${{ needs.inputs.outputs.base_ref }}
-          cache-from: |
-            type=registry,ref=${{ env.REGISTRY_NS }}/quasar-control-plane:buildcache
-            type=registry,ref=${{ env.REGISTRY_NS }}/quasar-control:buildcache
+          cache-from: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-control-plane:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-control-plane:buildcache,mode=max
 
   build-node-agent:
@@ -517,9 +489,7 @@ jobs:
           # and is capped at 10 GB per repo, which is why the two scopes this
           # replaces hold 0 caches today. A registry cache does not expire and is
           # shared with the dev boxes.
-          cache-from: |
-            type=registry,ref=${{ env.REGISTRY_NS }}/quasar-node-agent:buildcache
-            type=registry,ref=${{ env.REGISTRY_NS }}/quasar-vulkan:buildcache
+          cache-from: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-node-agent:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-node-agent:buildcache,mode=max
 
   # ── Phase 2: the repo's own contract, run against the exact pushed digest ──
@@ -701,12 +671,7 @@ jobs:
         id: meta_control
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
-          # Second entry is the DEPRECATED pre-rename package: metadata-action
-          # expands the tag set below across BOTH, so one promotion publishes an
-          # identical tag set to each. Header note carries the removal condition.
-          images: |
-            ${{ env.REGISTRY_NS }}/quasar-control-plane
-            ${{ env.REGISTRY_NS }}/quasar-control
+          images: ${{ env.REGISTRY_NS }}/quasar-control-plane
           # `type=semver` is the release lever: dispatching on the `vX.Y.Z` tag
           # adds `:X.Y.Z` here (see the versioned-release-tags note in the header).
           tags: |
@@ -723,9 +688,7 @@ jobs:
         id: meta_agent
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
-          images: |
-            ${{ env.REGISTRY_NS }}/quasar-node-agent
-            ${{ env.REGISTRY_NS }}/quasar-vulkan
+          images: ${{ env.REGISTRY_NS }}/quasar-node-agent
           tags: |
             type=sha,prefix=sha-
             type=ref,event=branch
@@ -743,7 +706,7 @@ jobs:
         run: |
           set -euo pipefail
           out=""
-          for repo in quasar-control-plane quasar-control quasar-node-agent quasar-vulkan; do
+          for repo in quasar-control-plane quasar-node-agent; do
             ref="$REGISTRY_NS/$repo"
             d="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref:latest" 2>/dev/null || true)"
             echo "  $ref:latest = ${d:-<none>}"
