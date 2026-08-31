@@ -1,10 +1,16 @@
 name: CI
 
-# MANUAL ONLY (operator directive 2026-07-06): automatic pull_request/push
-# triggers exhausted the account's Actions minutes. Run from the Actions tab
-# (or `gh workflow run ci.yml --ref <branch>`) before merges. Local gates
-# (qtest check/test node-agent, go-test-db, web-check) remain the primary CI.
+# Runs on every pull request. The 2026-07-06 manual-only directive was a COST
+# decision: automatic triggers exhausted a private account's Actions minutes.
+# Public repositories get them free, and the tradeoff inverted on 2026-08-31 —
+# an open repo where nobody can tell whether an incoming change compiles is the
+# worse failure. These three jobs are the required checks for a merge to main.
+#
+# Not on push: develop takes direct merges by design, and the local gates
+# (make test-db, make test-web, the devtools container) stay the primary signal
+# for work in progress. A dispatch still works for checking a branch by hand.
 on:
+  pull_request:
   workflow_dispatch:
 
 concurrency:

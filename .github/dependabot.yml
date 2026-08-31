@@ -1,0 +1,33 @@
+version: 2
+updates:
+  # Actions are pinned to full commit SHAs for supply-chain reasons; Dependabot
+  # is what keeps those pins current without anyone tracking advisories by hand.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+    commit-message: { prefix: "ci" }
+
+  - package-ecosystem: gomod
+    directory: /control-plane
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+    commit-message: { prefix: "chore" }
+
+  - package-ecosystem: cargo
+    directory: /node-agent
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+    commit-message: { prefix: "chore" }
+
+  - package-ecosystem: npm
+    directory: /web
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+    commit-message: { prefix: "chore" }
+
+  - package-ecosystem: npm
+    directory: /site
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 3
+    commit-message: { prefix: "docs" }
