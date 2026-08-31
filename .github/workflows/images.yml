@@ -728,40 +728,107 @@ jobs:
         run: |
           set -euo pipefail
 
+          # WHAT A TAG MUST BE PROVEN TO BE, and why it is not raw digest equality.
+          #
+          # `docker buildx imagetools create --tag X src` does not point X at `src`.
+          # It WRAPS src in a freshly written OCI index (application/vnd.oci.image.
+          # index.v1+json) and points X at that index. An index is a different
+          # object with different bytes, so it necessarily has a different digest
+          # from the manifest inside it. The builds here push a PLAIN image manifest
+          # (push-by-digest, provenance/sbom off), so every promotion goes
+          # manifest -> index and `X`'s own digest can never equal the validated
+          # digest. The old check compared exactly those two and so failed 100% of
+          # runs, including clean ones (run 33404727019: :develop resolved to the
+          # index sha256:6c319257…, wrapping the validated sha256:f0fe018d…).
+          #
+          # The guarantee that has to survive is unchanged: the bytes a puller ends
+          # up with must be the bytes that were validated. That is not the tag's own
+          # digest — it is the SET OF PLATFORM MANIFESTS the reference resolves to,
+          # which is what a pull selects from and what a registry cannot vary for a
+          # given index. So the assertion becomes set equality between the tag and
+          # the validated source, computed the same way on both sides. A tag over
+          # the wrong image, over extra images, or over nothing still fails, and the
+          # rollback below still runs.
+          target_digests() { # target_digests <ref> -> sorted, comma-joined leaf digests
+            local ref="$1" raw out
+            raw="$(docker buildx imagetools inspect --raw "$ref")"
+            # Attestation manifests are not platform content and are filtered out;
+            # this lane builds with provenance/sbom off, but the filter keeps the
+            # invariant correct if that ever changes.
+            out="$(printf '%s' "$raw" | jq -r '
+              if has("manifests") then
+                [ .manifests[]
+                  | select((.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest")
+                  | .digest ] | sort | join(",")
+              else "" end')"
+            if [ -n "$out" ]; then printf '%s' "$out"; return 0; fi
+            if printf '%s' "$raw" | jq -e 'has("manifests")' >/dev/null; then
+              echo "::error::$ref is an index with no platform manifest" >&2
+              return 1
+            fi
+            # Not an index: the reference is itself the single manifest.
+            docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref"
+          }
+
           # Tag sets arrive through the environment, never interpolated into this
           # script body: GitHub expression substitution inside a run block is
           # TEXTUAL, and a ref name is attacker-influenceable input in the general
           # case. Reading them as "$CONTROL_TAGS" / "$AGENT_TAGS" keeps them data.
-          promote() { # promote <source-digest-ref> <newline-separated tags>
-            local src="$1" tags="$2" want t
-            want="${src##*@}"
-            local args=()
+          tag_args() { # tag_args <newline-separated tags> -> prints one --tag/<tag> per line
+            local t
             while IFS= read -r t; do
               [ -n "$t" ] || continue
-              args+=(--tag "$t")
-            done <<< "$tags"
-            [ "${#args[@]}" -gt 0 ] || { echo "::error::no tags computed for $src"; return 1; }
+              printf -- '--tag\n%s\n' "$t"
+            done <<< "$1"
+          }
 
+          write_tags() { # write_tags <source-digest-ref> <newline-separated tags>
+            local src="$1" args=()
+            mapfile -t args < <(tag_args "$2")
+            [ "${#args[@]}" -gt 0 ] || { echo "::error::no tags computed for $src"; return 1; }
             echo "promoting $src"
             docker buildx imagetools create "${args[@]}" "$src"
+          }
 
-            # Verify, do not assume. Every tag just written must resolve to the
-            # digest that was validated — this is the assertion the old in-registry
-            # re-tag did not have.
-            local i
+          verify_tags() { # verify_tags <source-digest-ref> <newline-separated tags>
+            local src="$1" want args=() i got
+            want="$(target_digests "$src")"
+            mapfile -t args < <(tag_args "$2")
+            echo "verifying $src (validated content: $want)"
             for (( i=1; i<${#args[@]}; i+=2 )); do
-              local got
-              got="$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "${args[$i]}")"
+              got="$(target_digests "${args[$i]}")"
               if [ "$got" != "$want" ]; then
-                echo "::error::${args[$i]} resolves to $got, expected the validated digest $want"
+                echo "::error::${args[$i]} resolves to [$got], expected the validated content [$want]"
                 return 1
               fi
-              echo "  verified ${args[$i]} == $want"
+              echo "  verified ${args[$i]} -> $want"
             done
           }
 
-          promote "$CONTROL_SRC" "$CONTROL_TAGS"
-          promote "$AGENT_SRC"   "$AGENT_TAGS"
+          # WRITE BOTH, THEN VERIFY BOTH — deliberately two passes, not
+          # write-and-verify per package.
+          #
+          # The header promises "both images promote or neither does". A single
+          # interleaved pass could not deliver that: with `set -e`, a failed
+          # verification on the control plane aborted the step before the node agent
+          # was tagged at all, so the run that motivated this fix left
+          # quasar-control-plane carrying sha-*/develop and quasar-node-agent
+          # carrying no real tag whatsoever — precisely the half-publish the design
+          # says is worse than a clean no-op. Verification is the failure mode this
+          # gate exists to produce, so it must not be the thing that splits them.
+          #
+          # Registries have no cross-repository transaction, so this is as atomic as
+          # the medium allows, and the honest residual is stated rather than hidden:
+          # if a `create` call itself fails against the registry, the packages can
+          # still end up unevenly tagged. In that case, as in every other, the
+          # rollback step below puts every `:latest` back — `:latest` is the only tag
+          # deploy/README.md promises will resolve, and `sha-*`/branch tags are names
+          # nothing followed before this run.
+          write_tags "$CONTROL_SRC" "$CONTROL_TAGS"
+          write_tags "$AGENT_SRC"   "$AGENT_TAGS"
+
+          verify_tags "$CONTROL_SRC" "$CONTROL_TAGS"
+          verify_tags "$AGENT_SRC"   "$AGENT_TAGS"
 
           {
             echo "### Promoted"
@@ -796,6 +863,28 @@ jobs:
         run: |
           # No `-e`: every restore is attempted even if an earlier one fails.
           set -uo pipefail
+
+          # Same content identity the promotion asserts, for the same reason:
+          # `imagetools create` rewrites the index, so the restored `:latest` will
+          # not carry the recorded index digest even on a perfect restore. What must
+          # match is the set of platform manifests the tag resolves to. (Recording
+          # and restoring by the index digest is content-correct — re-wrapping that
+          # index yields the same children — but it was never checked, so a failed
+          # restore could pass silently. See the promotion step for the full note.)
+          target_digests() { # target_digests <ref> -> sorted, comma-joined leaf digests
+            local ref="$1" raw out
+            raw="$(docker buildx imagetools inspect --raw "$ref")" || return 1
+            out="$(printf '%s' "$raw" | jq -r '
+              if has("manifests") then
+                [ .manifests[]
+                  | select((.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest")
+                  | .digest ] | sort | join(",")
+              else "" end')"
+            if [ -n "$out" ]; then printf '%s' "$out"; return 0; fi
+            printf '%s' "$raw" | jq -e 'has("manifests")' >/dev/null && return 1
+            docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref"
+          }
+
           rc=0
           while read -r ref digest; do
             [ -n "${ref:-}" ] || continue
@@ -804,7 +893,19 @@ jobs:
               continue
             fi
             echo "  restoring $ref:latest -> $digest"
-            docker buildx imagetools create --tag "$ref:latest" "$ref@$digest" || rc=1
+            if ! docker buildx imagetools create --tag "$ref:latest" "$ref@$digest"; then
+              echo "::error::failed to restore $ref:latest to $digest"
+              rc=1
+              continue
+            fi
+            want="$(target_digests "$ref@$digest")"
+            got="$(target_digests "$ref:latest")"
+            if [ -z "$want" ] || [ "$got" != "$want" ]; then
+              echo "::error::$ref:latest restored to [$got], expected the recorded content [$want]"
+              rc=1
+            else
+              echo "  verified $ref:latest -> $want"
+            fi
           done <<< "$PREVIOUS"
           {
             echo "### Promotion failed — :latest rolled back"
