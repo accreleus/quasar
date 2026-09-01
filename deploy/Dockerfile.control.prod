@@ -36,7 +36,10 @@ COPY web/ .
 RUN npm run build
 
 # ── Go build stage ────────────────────────────────────────────────────────────
-FROM golang@sha256:8bee1901f1e530bfb4a7850aa7a479d17ae3a18beb6e09064ed54cfd245b7191 AS builder
+# golang:1.25.14-alpine. Must stay >= control-plane/go.mod's `go` directive
+# (currently 1.25.0) — the official golang images set GOTOOLCHAIN=local, so a
+# lower pin fails the build instead of auto-downloading the newer toolchain.
+FROM golang@sha256:1ae0735f00daffa3aaf1363a5184c0d2dc55c78e3db4ec70241cdac97bf84b59 AS builder
 
 WORKDIR /src
 COPY control-plane/go.mod control-plane/go.sum ./

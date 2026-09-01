@@ -34,7 +34,7 @@
 #                                       whatever deploy/pins.env sets (currently the
 #                                       :latest channel quasar-images publishes from
 #                                       `stable`). Edit pins.env, never a copy of it.
-#   GO_IMAGE=golang:1.24                image for Go (control-plane); the host
+#   GO_IMAGE=golang:1.25                image for Go (control-plane); the host
 #                                       and quasar-agent-dev have no Go toolchain
 #   NET=host                            add --network host (needed for the
 #                                       browser WebRTC path on Linux)
@@ -45,7 +45,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 IMAGE="${IMAGE:-quasar-agent-dev:latest}"
-GO_IMAGE="${GO_IMAGE:-golang:1.24}"
+GO_IMAGE="${GO_IMAGE:-golang:1.25}"
 
 # Postgres for control-plane DB integration tests (go-test-db). Defaults match
 # the long-running test container documented in CLAUDE.md; override either to
