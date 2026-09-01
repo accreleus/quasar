@@ -12,14 +12,16 @@ given session ends up using is a separate question, covered in
 
 ## What you get by default
 
-Vulkan Video, on both AMD and NVIDIA. It is the validated path on each and there
-is no reason to pick anything else unless something specific pushes you off it.
+Leave `QUASAR_ENCODER` unset and the agent detects the GPU vendor at startup and
+picks for you: Vulkan Video on AMD and NVIDIA, VA-API on Intel, openh264 on a
+machine with no GPU. It logs the choice as `encoder resolved`.
 
-On NVIDIA it also avoids an NVENC teardown fault that no driver version escapes.
-Vulkan is immune to it, which is why NVENC is no longer the default there.
+Vulkan is the validated path on AMD and NVIDIA, and there is no reason to pick
+anything else unless something specific pushes you off it. On NVIDIA it also
+avoids an NVENC teardown fault that no driver version escapes. Vulkan is immune
+to it, which is why NVENC is no longer the default there.
 
-`QUASAR_ENCODER` is read from the environment; nothing is auto-detected at
-runtime. Change it in your `.env`:
+An explicit value always wins over detection. Set one in your `.env`:
 
 ```bash
 QUASAR_ENCODER=vulkan
@@ -54,7 +56,7 @@ HEVC pins the compositor ring to two slots automatically, which works around a
 tiling defect on affected NVIDIA hardware. AV1 needs no such override.
 
 <Aside type="caution" title="Vulkan does not work on a driver-volume NVIDIA host">
-If your NVIDIA host uses automatic driver-volume provisioning rather than a full
+If your NVIDIA host uses automatic driver-volume provisioning instead of a full
 driver install, some driver versions cannot supply a Vulkan ICD the compositor
 can use. Set `QUASAR_ENCODER=nvenc` there. Admin, Fleet, Hosts reports the gap
 rather than claiming Vulkan works.
@@ -86,7 +88,7 @@ anything to react to.
 Compositor output stays on the GPU all the way to the encoder. Vulkan keeps it
 as Vulkan images, VA uses DMABuf, NVENC uses CUDA memory with a shared context.
 
-This is how the pipeline is built rather than something you enable. It is worth
+This is how the pipeline is built, not something you enable. It is worth
 knowing because it explains why CPU usage stays low during a session, and why
 the encoder is so sensitive to being pointed at the right GPU.
 
@@ -98,7 +100,7 @@ the encoder is so sensitive to being pointed at the right GPU.
 ls -l /dev/dri/by-path/
 ```
 
-Use a `/dev/dri/by-path/` path rather than `/dev/dri/renderD128`. The numbered
+Use a `/dev/dri/by-path/` path instead of `/dev/dri/renderD128`. The numbered
 names are assigned in probe order and can move between reboots. By-path names
 follow the PCI address and do not.
 
@@ -116,7 +118,7 @@ You should rarely need these. The defaults come from measurement.
 | `QUASAR_TARGET_USAGE` | 6 | VA speed against quality, 1 slowest and best, 7 fastest. Adaptive bitrate moves this under load. |
 | `QUASAR_QUEUE_BUFFERS` | 3 | Encode queue depth. More absorbs jitter and adds latency. |
 
-## Checking what you actually got
+## Checking what you got
 
 Admin, Fleet, Hosts shows the encoder each GPU reported, which is what the agent
 found rather than what you configured. A host set to `va` that reports no

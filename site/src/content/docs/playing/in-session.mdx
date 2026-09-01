@@ -50,7 +50,7 @@ almost always the reason.
 Controllers work through the browser's Gamepad API, and the input travels over
 the same data channel as everything else.
 
-Browsers only reveal a gamepad after it has sent an input, so press a button
+Browsers do not reveal a gamepad until it has sent input, so press a button
 after connecting one. The drawer lists what it currently sees.
 
 ## Microphone
@@ -94,9 +94,9 @@ Two of them are worth understanding.
 the bottleneck is the host, not your network.
 
 **Presentation interval variation** is how consistent the gaps between displayed
-frames are. This is the number that matches what stutter actually feels like. A
-high frame rate with high variation looks worse than a slightly lower frame rate
-with low variation.
+frames are. This is the number that matches what stutter feels like. A high
+frame rate with high variation looks worse than a slightly lower frame rate with
+low variation.
 
 See [Stream quality problems](/quasar/troubleshooting/quality/) for reading
 these properly.

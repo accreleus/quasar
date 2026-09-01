@@ -21,13 +21,13 @@ what a user picks, and it is what "1080p60" means in the interface.
 At launch, the server walks the chosen launch profile's rungs in order and takes
 the first one that survives four checks:
 
-1. **The host can encode it.** The placed GPU has to have that codec.
-2. **The client can decode it.** Measured when the user logged in. HEVC and AV1
-   are hard-gated on a positive result, because sending an undecodable codec is
-   a black screen, not a quality drop.
-3. **It has not failed for this client before.** A codec that failed gets
-   skipped on later launches.
+1. **The host can encode it.**
+2. **The client can decode it**, as measured when the user logged in.
+3. **It has not failed for this client before.**
 4. **Hardware encode is available**, if the rung requires it.
+
+[Codecs](/quasar/tuning/codecs/#how-the-server-picks) covers what each check
+tests and why HEVC and AV1 are gated harder than H.264.
 
 Every launch profile must contain at least one H.264 rung. The server rejects a
 profile that does not. H.264 decodes everywhere, so there is always a rung that
@@ -45,8 +45,8 @@ works and a launch never fails because nothing was playable.
 Twelve launch profiles, covering 720p, 1080p, 1440p and 4K at 60, 90 and 120
 frames per second. **1080p60 is the recommended default.**
 
-Within each tier the rungs are ordered AV1 first, then HEVC, then H.264. That
-order is deliberate:
+Within each tier the rungs are ordered AV1 first, then HEVC, then H.264. Why
+that order:
 
 - **AV1** saves roughly 40 to 50 percent of the bitrate of H.264 at equivalent
   quality, and Chrome can decode it everywhere thanks to its software fallback.

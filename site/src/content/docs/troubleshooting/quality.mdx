@@ -15,9 +15,9 @@ correlates encoder, network and client signals over the same window and gives yo
 a verdict. See [Diagnostics](/quasar/operations/diagnostics/).
 
 <Aside type="caution" title="Reproduce it with the browser tab visible">
-A backgrounded or occluded tab throttles frame presentation, which inflates every
-client-side smoothness figure. The classifier refuses to give a verdict in that
-case rather than guessing, and reports `indeterminate_client_hidden`.
+A backgrounded or occluded browser tab throttles presentation, which inflates
+every client-side smoothness number. The classifier refuses to give a verdict in
+that case instead of guessing, and reports `indeterminate_client_hidden`.
 </Aside>
 
 ## Reading the verdict
@@ -89,13 +89,12 @@ wastes a lot of time.
 
 ## Smoothness beats the average
 
-A stream at 45 ms that arrives evenly feels better than one at 38 ms that
-arrives unevenly. Optimise for consistency.
+Consistency matters more than the average. That is why adaptive bitrate defaults
+to `smooth`, which caps how sharply it reduces bitrate and waits between steps.
+Under induced congestion that took presentation interval variation at the 95th
+percentile from about 69 ms to about 19 ms.
 
-This is why adaptive bitrate defaults to `smooth`, which caps how sharply it
-reduces bitrate and waits between steps. Under induced congestion that took
-presentation interval variation at the 95th percentile from about 69 ms to about
-19 ms.
+[Latency and smoothness](/quasar/tuning/latency/) explains why consistency wins.
 
 ## Bitrate keeps sawtoothing
 
@@ -104,7 +103,7 @@ session detail, and look at loss and round trip time in the same window.
 
 A controller reacting to real congestion is doing its job. A controller
 oscillating on a clean link is worth investigating, and the socket buffer sysctl
-is the first thing to check because its absence produces exactly that.
+is the first thing to check, because its absence produces that oscillation.
 
 On NVENC, note that the encoder can overshoot its target on high-entropy content.
 Persistently sitting above the setpoint on busy scenes is known behaviour rather

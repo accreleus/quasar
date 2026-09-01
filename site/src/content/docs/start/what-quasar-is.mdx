@@ -30,8 +30,8 @@ explicit choices and per-codec fallbacks. Frames can stay in GPU memory through
 the encode path.
 
 **Adaptive bitrate.** The stream measures the network continuously and adjusts.
-This is on by default and tuned for smoothness rather than for chasing the
-highest possible bitrate.
+This is on by default and tuned for smoothness, not for chasing the highest
+possible bitrate.
 
 **A browser client, with nothing to install.** Chrome and Chromium-based
 browsers on desktop. Gamepads work through the Gamepad API. Keyboard, mouse and
@@ -42,10 +42,10 @@ users are all managed from `/admin` in the same web app.
 
 ## What Quasar is not
 
-**It does not speak Moonlight or GameStream.** This is a deliberate and
-permanent decision, not a gap waiting to be filled. NVIDIA discontinued
-GameStream, and building on a dead protocol to reach existing clients was not
-worth the architecture it forces. Moonlight clients cannot connect to Quasar and
+**It does not speak Moonlight or GameStream.** This is a permanent decision, not
+a gap waiting to be filled. NVIDIA discontinued GameStream, and building on a
+dead protocol to reach existing clients was not worth the architecture it
+forces. Moonlight clients cannot connect to Quasar and
 never will.
 
 **It is not a game store.** Quasar launches container images. Getting games into
@@ -65,9 +65,8 @@ is planned and some of the groundwork exists, but nothing is shippable.
 
 Quasar suits you if you already run a homelab, own a machine with a decent GPU
 that sits idle most of the day, and want to play the games on it from a laptop,
-a tablet, or a TV without moving hardware around. It suits households where one
-GPU is shared. It suits anyone who wants their save games on storage they
-control.
+a tablet, or a TV without moving hardware around. Households sharing one GPU
+fit too, as does anyone who wants their save games on storage they control.
 
 It suits you less if you want to play over the public internet from anywhere
 with no VPN, if you want a one-click appliance, or if you are not comfortable

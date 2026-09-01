@@ -24,7 +24,7 @@ problems worth knowing about, because they explain the design.
 
 A tag is a moving target. Pulling `:latest` on host A on Tuesday and host B on
 Friday can give you two different images, and the resulting difference in
-behaviour is genuinely painful to track down.
+behaviour is painful to track down.
 
 Worse, a routine `docker image prune` deleted hand-managed app images
 permanently, because there was no record of what they were or where they came

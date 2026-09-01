@@ -19,7 +19,7 @@ There is nothing to configure for normal use.
 ## Failing loudly instead of silently
 
 By default, if the audio sidecar is unavailable, the session continues without
-sound. That is usually the right choice for a home setup, since silent play beats
+sound. That is the right choice for most home setups, since silent play beats
 no play.
 
 It also means a misconfiguration can mute every session on a host for days with
@@ -51,7 +51,7 @@ Microphone works, and it needs three separate things to be true.
 
 Under Admin, Settings. It is off by default and it is enforced on the server. A
 launch that asks for a microphone while the instance setting is off succeeds
-without one rather than failing, on the grounds that a policy decision should not
+without one instead of failing, on the grounds that a policy decision should not
 cost you your session.
 
 ### 2. The user turns it on
@@ -96,8 +96,8 @@ Chrome requires the microphone track to be advertised as stereo Opus at 48 kHz.
 A mono declaration is rejected outright, and because the negotiation happens once
 at session start, there is no recovery within that session.
 
-Quasar gets this right. It is documented here because it explains why the
-microphone format is not configurable.
+This is documented here because it explains why the microphone format is not
+configurable.
 
 ## Troubleshooting
 
