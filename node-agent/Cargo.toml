@@ -41,7 +41,7 @@ drm = "0.15"
 # pass runs on a spawned blocking thread (like the startup orphan sweep), so a
 # blocking client is the natural fit and avoids pulling a full async HTTP stack.
 # Image-management P4 also reuses it to download the template build-context tarball.
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3.4", features = ["json"] }
 
 # Image-management P4 (template builds): extract the GitHub codeload `.tar.gz`
 # build-context tarball. Small, pure-Rust crates; the extraction runs on the

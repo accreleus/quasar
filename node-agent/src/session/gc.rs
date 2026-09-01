@@ -264,14 +264,17 @@ impl GcClient {
     // ── HTTP ────────────────────────────────────────────────────────────────
 
     fn fetch_pending(&self) -> Result<Vec<PendingHome>, String> {
-        let resp = ureq::get(&self.pending_url())
-            .timeout(HTTP_TIMEOUT)
-            .set("Authorization", &format!("Bearer {}", self.node_secret))
-            .set("X-Quasar-Node", &self.node_name)
+        let mut resp = ureq::get(&self.pending_url())
+            .config()
+            .timeout_global(Some(HTTP_TIMEOUT))
+            .build()
+            .header("Authorization", &format!("Bearer {}", self.node_secret))
+            .header("X-Quasar-Node", &self.node_name)
             .call()
             .map_err(|e| format!("GET gc-pending: {e}"))?;
         let parsed: PendingResp = resp
-            .into_json()
+            .body_mut()
+            .read_json()
             .map_err(|e| format!("decode gc-pending: {e}"))?;
         Ok(parsed
             .homes
@@ -282,10 +285,12 @@ impl GcClient {
 
     fn confirm(&self, ids: &[String]) -> Result<i64, String> {
         let body = serde_json::json!({ "home_ids": ids });
-        let resp = ureq::post(&self.confirm_url())
-            .timeout(HTTP_TIMEOUT)
-            .set("Authorization", &format!("Bearer {}", self.node_secret))
-            .set("X-Quasar-Node", &self.node_name)
+        let mut resp = ureq::post(&self.confirm_url())
+            .config()
+            .timeout_global(Some(HTTP_TIMEOUT))
+            .build()
+            .header("Authorization", &format!("Bearer {}", self.node_secret))
+            .header("X-Quasar-Node", &self.node_name)
             .send_json(body)
             .map_err(|e| format!("POST gc-confirm: {e}"))?;
         #[derive(Deserialize)]
@@ -293,7 +298,8 @@ impl GcClient {
             deleted: i64,
         }
         let parsed: ConfirmResp = resp
-            .into_json()
+            .body_mut()
+            .read_json()
             .map_err(|e| format!("decode gc-confirm: {e}"))?;
         Ok(parsed.deleted)
     }
