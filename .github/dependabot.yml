@@ -29,6 +29,15 @@ updates:
     open-pull-requests-limit: 5
     commit-message: { prefix: "chore" }
     target-branch: develop
+    # The gstreamer-rs crates version together against one GStreamer release;
+    # bumping one alone resolves a SECOND parallel gst stack into the lockfile
+    # (seen on the gstreamer-webrtc 0.25 solo bump — two gstreamer-sys
+    # generations in one binary). Group them so the family moves as one PR.
+    groups:
+      gstreamer:
+        patterns:
+          - "gstreamer*"
+          - "gst-*"
 
   - package-ecosystem: npm
     directory: /web
@@ -36,6 +45,24 @@ updates:
     open-pull-requests-limit: 5
     commit-message: { prefix: "chore" }
     target-branch: develop
+    # react and react-dom (and their @types) must bump together — a solo
+    # react bump leaves @types/react-dom pinned to the old major and the
+    # install fails on peer resolution (seen on the react 19 solo bump).
+    # The vite ecosystem likewise: @vitejs/plugin-react majors track vite
+    # majors.
+    groups:
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
+      vite:
+        patterns:
+          - "vite"
+          - "@vitejs/*"
+          - "vitest"
+          - "@vitest/*"
 
   - package-ecosystem: npm
     directory: /site
