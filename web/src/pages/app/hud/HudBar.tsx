@@ -4,7 +4,7 @@
 // the fan-out itself (#139), so a 1 Hz snapshot re-renders three numbers.
 
 import { memo, useEffect, useState } from "react";
-import type { Ref } from "react";
+import type { JSX, Ref } from "react";
 import { Signal } from "../../../components/Signal";
 import { codecDisplayName, compareCodecs } from "../../../lib/codecDisplay";
 import { signalQuality, qualityLabelFor } from "../streamHealth";

@@ -41,7 +41,7 @@ export interface DetailBandProps {
   profiles: ProfilesResponse | string | null;
   /** The overlay's open state — the page's one Escape handler owns it. */
   optionsOpen: boolean;
-  optionsToggleRef: RefObject<HTMLButtonElement>;
+  optionsToggleRef: RefObject<HTMLButtonElement | null>;
   onToggleOptions: () => void;
   /** Closes the overlay and returns focus to Adjust. Cancel, the overlay's ✕
    *  and Escape all route through this one path. */
@@ -99,12 +99,10 @@ export const DetailBand = forwardRef<HTMLDivElement, DetailBandProps>(function D
 
   // The overlay covers the band, so focus has to enter it; `.d-inner` goes
   // inert behind it so Tab cannot walk back out into the covered controls.
-  // @types/react 18 has no `inert`; the empty string is its true value.
   const closeRef = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     if (optionsOpen) closeRef.current?.focus();
   }, [optionsOpen]);
-  const inertProps: Record<string, unknown> = optionsOpen ? { inert: "" } : {};
 
   /** Commits `next` (defaulting to the committed selection) and launches it. */
   const play = useCallback(
@@ -178,7 +176,7 @@ export const DetailBand = forwardRef<HTMLDivElement, DetailBandProps>(function D
         <IconClose />
       </button>
 
-      <div className="d-inner" {...inertProps}>
+      <div className="d-inner" inert={optionsOpen}>
         <div className="d-kind">{KIND_LABEL[app.kind] ?? "Game"}</div>
         <h2>{app.name}</h2>
         {app.description && <p className="d-desc">{app.description}</p>}

@@ -6,7 +6,7 @@
 // renders in the same slot for every app in a row.
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AppHomeNext } from "../AppHomeNext";
 import { AuthContext, type AuthContextValue } from "../../../auth/context";
@@ -112,6 +112,10 @@ async function openBand(name: string, tiles: number) {
   await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(tiles));
   fireEvent.click(screen.getByRole("button", { name }));
   await waitFor(() => expect(document.querySelector(".d-specs")).toBeTruthy());
+  // `.d-specs` renders on the profiles response, but the selection is seeded by
+  // an effect one flush later — under React 19 that lands after `waitFor`
+  // returns, so the band would still be showing the app's defaults here.
+  await act(async () => {});
 }
 
 async function openOptions() {
