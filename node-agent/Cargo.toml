@@ -18,7 +18,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # WebRTC negotiation / SDP marshalling. Versions match the proven spike/host
 # (GStreamer 1.24, as the gst-wayland-display compositor targets).
 gstreamer = "0.23"
-gstreamer-webrtc = "0.23"
+gstreamer-webrtc = "0.25"
 gstreamer-sdp = "0.23"
 # g2g: RTPBuffer writable access for the abs-capture-time one-byte-header extension.
 gstreamer-rtp = { version = "0.23", features = ["v1_20"] }
