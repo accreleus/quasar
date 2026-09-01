@@ -59,7 +59,7 @@ base64 = "0.23"
 # First-run S1 (NVIDIA driver-volume provisioning): the `.run` installer has no
 # signature to verify, so the sha256 of exactly what was fetched is recorded in
 # the volume's manifest. Pure Rust, no C toolchain.
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Console-mode local audio: enable the `IEC958 Playback Switch` ALSA mixer
 # control before starting the local-audio pipeline. HDA codec state (incl.
