@@ -17,14 +17,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # P1-5: graduated session pipeline (compositor -> encode -> webrtcbin) +
 # WebRTC negotiation / SDP marshalling. Versions match the proven spike/host
 # (GStreamer 1.24, as the gst-wayland-display compositor targets).
-gstreamer = "0.23"
-gstreamer-webrtc = "0.23"
-gstreamer-sdp = "0.23"
+gstreamer = "0.25"
+gstreamer-webrtc = "0.25"
+gstreamer-sdp = "0.25"
 # g2g: RTPBuffer writable access for the abs-capture-time one-byte-header extension.
-gstreamer-rtp = { version = "0.23", features = ["v1_20"] }
+gstreamer-rtp = { version = "0.25", features = ["v1_20"] }
 # Adaptive external resolution: the typed upstream force-key-unit event used to make
 # the encoder emit an IDR (with headers) right after a live resolution change.
-gstreamer-video = "0.23"
+gstreamer-video = "0.25"
 glib = "0.20"
 
 # P1-5 (container launch): virtual evdev input devices (uinput) so a
