@@ -83,7 +83,7 @@ pkg-config = "0.3"
 
 [dev-dependencies]
 # SO-03: micro-benchmark the per-frame encode-metrics hot path (record_encode_in/out).
-criterion = "0.5"
+criterion = "0.8"
 # P5-03: temporary directories for home module unit tests.
 tempfile = "3"
 # #530: `#[tokio::test(start_paused = true)]` needs the `test-util` feature (not
