@@ -145,8 +145,12 @@ describe("SessionSwapController — click through to the DOM", () => {
     await waitFor(() => expect(screen.getByText("Redout: Enhanced Edition")).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: /Redout: Enhanced Edition/ }));
 
-    await waitFor(() => expect(onCommitted).toHaveBeenCalledWith("a2", "Redout: Enhanced Edition"));
-    await waitFor(() => expect(document.querySelector(".switcher.show")).toBeNull());
+    // The confirming poll tick fires at SWAP_POLL_MS (1s) — the same instant
+    // waitFor's default 1s deadline expires, so slow runners lose the race.
+    await waitFor(() => expect(onCommitted).toHaveBeenCalledWith("a2", "Redout: Enhanced Edition"), {
+      timeout: 5000,
+    });
+    await waitFor(() => expect(document.querySelector(".switcher.show")).toBeNull(), { timeout: 5000 });
   });
 
   it("never shows the overlay and never renders a rail when there is no current app id yet", () => {
@@ -195,8 +199,12 @@ describe("SessionSwapController — two swaps in one session", () => {
     // ── Swap A: Snow -> Redout ──────────────────────────────────────────
     fireEvent.click(screen.getByRole("button", { name: "Redout: Enhanced Edition" }));
     await vi.advanceTimersByTimeAsync(1_000);
-    await waitFor(() => expect(onCommitted).toHaveBeenCalledWith("a2", "Redout: Enhanced Edition"));
-    await waitFor(() => expect(document.querySelector(".switcher.show")).toBeNull());
+    // The confirming poll tick fires at SWAP_POLL_MS (1s) — the same instant
+    // waitFor's default 1s deadline expires, so slow runners lose the race.
+    await waitFor(() => expect(onCommitted).toHaveBeenCalledWith("a2", "Redout: Enhanced Edition"), {
+      timeout: 5000,
+    });
+    await waitFor(() => expect(document.querySelector(".switcher.show")).toBeNull(), { timeout: 5000 });
 
     expect(screen.getByTestId("strip-identity").textContent).toBe("Redout: Enhanced Edition");
     expect(screen.getByText("PLAYING").closest("button")?.getAttribute("aria-label")).toBe(
@@ -230,8 +238,8 @@ describe("SessionSwapController — two swaps in one session", () => {
     // The real progress resolves the swap.
     await vi.advanceTimersByTimeAsync(1_000); // "swapping" observed, armed
     await vi.advanceTimersByTimeAsync(1_000); // "swap complete" -> a3
-    await waitFor(() => expect(onCommitted).toHaveBeenCalledWith("a3", "Ball"));
-    await waitFor(() => expect(document.querySelector(".switcher.show")).toBeNull());
+    await waitFor(() => expect(onCommitted).toHaveBeenCalledWith("a3", "Ball"), { timeout: 5000 });
+    await waitFor(() => expect(document.querySelector(".switcher.show")).toBeNull(), { timeout: 5000 });
 
     // Strip and rail agree on the new identity — no divergence.
     expect(screen.getByTestId("strip-identity").textContent).toBe("Ball");
