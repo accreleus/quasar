@@ -123,13 +123,14 @@ pub fn download_context(url: &str, dest: &Path, deadline: Instant) -> Result<(),
     if now >= deadline {
         return Err("build context download timed out".to_string());
     }
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(CONNECT_TIMEOUT)
-        .timeout_read(READ_TIMEOUT)
-        .timeout(deadline - now)
-        .redirects(0)
-        .build();
-    let resp = agent
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_recv_body(Some(READ_TIMEOUT))
+        .timeout_global(Some(deadline - now))
+        .max_redirects(0)
+        .build()
+        .into();
+    let mut resp = agent
         .get(url)
         .call()
         .map_err(|e| format!("build context download failed: {}", download_err(&e)))?;
@@ -140,7 +141,7 @@ pub fn download_context(url: &str, dest: &Path, deadline: Instant) -> Result<(),
             resp.status()
         ));
     }
-    let mut reader = resp.into_reader().take(MAX_CONTEXT_BYTES + 1);
+    let mut reader = resp.body_mut().as_reader().take(MAX_CONTEXT_BYTES + 1);
     let mut file = std::fs::File::create(dest)
         .map_err(|e| format!("could not create build context file: {e}"))?;
     // Manual loop, not io::copy: the deadline and the size cap must both be enforced
@@ -173,8 +174,8 @@ pub fn download_context(url: &str, dest: &Path, deadline: Instant) -> Result<(),
 /// Short classification; never the URL or body.
 fn download_err(e: &ureq::Error) -> String {
     match e {
-        ureq::Error::Status(code, _) => format!("HTTP {code}"),
-        ureq::Error::Transport(_) => "transport error".to_string(),
+        ureq::Error::StatusCode(code) => format!("HTTP {code}"),
+        _ => "transport error".to_string(),
     }
 }
 
