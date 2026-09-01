@@ -30,7 +30,7 @@ else
 fi
 
 # ── go ───────────────────────────────────────────────────────────────────────
-# Control-plane go.mod targets 1.24; a newer toolchain is fine.
+# Control-plane go.mod targets 1.25; a newer toolchain is fine.
 if ! dx_have go; then
   dx_warn go "not on PATH — control-plane builds fall back to the container path"
 else
@@ -38,10 +38,10 @@ else
   go_major="${go_ver%%.*}"
   go_rest="${go_ver#*.}"
   go_minor="${go_rest%%.*}"
-  if [ "${go_major:-0}" -gt 1 ] || { [ "${go_major:-0}" -eq 1 ] && [ "${go_minor:-0}" -ge 24 ]; }; then
-    dx_pass go "$go_ver (>= 1.24)"
+  if [ "${go_major:-0}" -gt 1 ] || { [ "${go_major:-0}" -eq 1 ] && [ "${go_minor:-0}" -ge 25 ]; }; then
+    dx_pass go "$go_ver (>= 1.25)"
   else
-    dx_warn go "$go_ver is below the 1.24 the control-plane targets"
+    dx_warn go "$go_ver is below the 1.25 the control-plane targets"
   fi
 fi
 

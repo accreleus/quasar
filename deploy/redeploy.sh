@@ -727,7 +727,7 @@ step "[$ENV] 6/7 recreate control-plane${SCOPE:+ (scope=$SCOPE)}"
 # re-mount the freshly-built dist by recreating the container (bind-mount inode
 # swap, #131). scope=control is the opposite case: the build IS the deploy.
 #
-# This build reads deploy/Dockerfile.control (a golang:1.24-alpine compile plus a
+# This build reads deploy/Dockerfile.control (a golang:1.25-alpine compile plus a
 # debian-slim runtime) and nothing from Dockerfile.vulkan — which is what makes
 # scope=control cheap. Do not "optimise" it by folding the control-plane into the
 # vulkan image lineage.
