@@ -43,7 +43,7 @@ export interface FeaturedRailProps {
   cards: readonly RailCard[];
   /** The scroll container, owned by the page: the roving-focus model spans the
    *  rail and the grid, so it has to be able to scroll this one itself. */
-  trackRef: RefObject<HTMLDivElement>;
+  trackRef: RefObject<HTMLDivElement | null>;
   appById: ReadonlyMap<string, App>;
   coverClassById: ReadonlyMap<string, string>;
   busy: boolean;

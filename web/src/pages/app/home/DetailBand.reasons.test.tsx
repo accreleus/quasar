@@ -12,7 +12,7 @@
 // both; the resume test file covers the classic render path.
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AppHomeNext } from "../AppHomeNext";
 import { AuthContext, type AuthContextValue } from "../../../auth/context";
@@ -127,6 +127,10 @@ async function openBand() {
   await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(1));
   fireEvent.click(screen.getByRole("button", { name: "Portal 2" }));
   await waitFor(() => expect(document.querySelector(".d-specs")).toBeTruthy());
+  // `.d-specs` renders on the profiles response, but the selection is seeded by
+  // an effect one flush later — under React 19 that lands after `waitFor`
+  // returns, so the band would still be showing the app's defaults here.
+  await act(async () => {});
 }
 
 const bandText = () => document.querySelector(".detail")?.textContent ?? "";

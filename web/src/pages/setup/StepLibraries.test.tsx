@@ -16,7 +16,7 @@
 
 import { StrictMode } from "react";
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { StepLibraries } from "./StepLibraries";
 import { AuthContext, type AuthContextValue } from "../../auth/context";
 import { ApiError } from "../../api/client";
@@ -124,7 +124,15 @@ describe("StepLibraries", () => {
 
   it("virgin instance (empty + never synced): auto-syncs, then lists the providers the sync found", async () => {
     vi.mocked(adminApi.listImages).mockResolvedValue(virginCatalog());
-    vi.mocked(adminApi.syncImages).mockResolvedValue(syncedCatalog([steamImage()]));
+    // Held open, so the in-flight state is a state the DOM actually passes
+    // through: with an already-resolved sync, React batches the start and the
+    // finish into one commit and the message never renders.
+    let finishSync: (v: unknown) => void = () => {};
+    vi.mocked(adminApi.syncImages).mockReturnValue(
+      new Promise((res) => {
+        finishSync = res;
+      }) as never,
+    );
     renderStep();
 
     // The catalog-fetch state, in the step's own idiom.
@@ -132,6 +140,9 @@ describe("StepLibraries", () => {
       expect(screen.getByText(/fetching the image catalog/i)).toBeInTheDocument();
     });
 
+    await act(async () => {
+      finishSync(syncedCatalog([steamImage()]));
+    });
     await waitFor(() => {
       expect(screen.getByText("Steam")).toBeInTheDocument();
     });

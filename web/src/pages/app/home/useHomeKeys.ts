@@ -17,8 +17,8 @@ export interface UseHomeKeysOptions {
   apps: readonly App[];
   featured: readonly RailCard[];
   blockedIds: ReadonlySet<string>;
-  railTrackRef: RefObject<HTMLElement>;
-  gridsRef: RefObject<HTMLElement>;
+  railTrackRef: RefObject<HTMLElement | null>;
+  gridsRef: RefObject<HTMLElement | null>;
   /** Whether the band's launch-options panel is open (Escape's first target). */
   optionsOpen: boolean;
   /** Whether a detail band is open at all (Escape's second target). */

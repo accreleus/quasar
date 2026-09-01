@@ -29,7 +29,7 @@ export interface LaunchOptionsProps {
   onPlay: () => void;
   /** Focused when the panel opens, so keyboard focus enters the overlay rather
    *  than staying on the covered band. */
-  closeRef?: RefObject<HTMLButtonElement>;
+  closeRef?: RefObject<HTMLButtonElement | null>;
 }
 
 export function LaunchOptions({

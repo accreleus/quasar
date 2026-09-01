@@ -11,7 +11,7 @@ import { DEFAULT_HERO_PALETTE, samplePalette, type HeroPalette } from "../../../
 export interface HeroArt {
   /** The hero image URL, or null when the app has none and the glyph shows. */
   art: ReturnType<typeof artFor>;
-  imgRef: RefObject<HTMLImageElement>;
+  imgRef: RefObject<HTMLImageElement | null>;
   onLoad: () => void;
   /** The band's scrim and accent. The interior ink stays pinned light in both
    *  themes (home.css); only these two follow the art. */
