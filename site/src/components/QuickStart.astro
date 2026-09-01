@@ -51,8 +51,10 @@
 		</div>
 		<p class="qs-note" data-when-gpu="amd-intel">
 			AMD is verified. Intel takes the same Vulkan path but nobody has run it
-			yet, so you would be first. If it gives you trouble, VA-API is a one-line
-			change on that host afterwards.
+			yet, so you would be first. Note that the script pins
+			<code>QUASAR_ENCODER=vulkan</code>, which on Intel overrides the VA-API
+			the agent would otherwise detect for itself. If Vulkan gives you trouble,
+			changing that one line to <code>va</code> puts you back on the default.
 		</p>
 		<p class="qs-note" data-when-gpu="nvidia">
 			You need the NVIDIA driver and <code>nvidia-container-toolkit</code>

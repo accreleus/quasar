@@ -5,8 +5,9 @@ description: How contributors validate changes on a fleet host without bypassing
 
 import { Aside } from '@astrojs/starlight/components';
 
-GPU and streaming work must be validated on a Linux GPU host. Address a host by
-its configured role or hostname and pass it explicitly:
+GPU and streaming work must be validated on a Linux GPU host, because a pipeline
+that compiles is not a pipeline that works. Address a host by its configured
+role or hostname, and pass it explicitly:
 
 ```bash
 make status HOST=<role-or-host>
@@ -14,8 +15,9 @@ make session-list HOST=<role-or-host>
 ```
 
 The host map used by repository tooling lives at
-`.claude/skills/_shared/hosts.json`. Keep real hostnames out of prose and scripts;
-roles let the same workflow run in different environments.
+`.claude/skills/_shared/hosts.json`, which is operator-local and not committed.
+Keep real hostnames out of prose and scripts. Roles let the same workflow run
+against a different fleet.
 
 ## Deploy the component that changed
 
@@ -24,14 +26,22 @@ roles let the same workflow run in different environments.
 | Go control plane only | `make redeploy-cp HOST=<role-or-host>` | About one minute |
 | Rust, GStreamer, or agent image | `make rebuild HOST=<role-or-host>` | 40 minutes or more |
 
+Match the verb to what changed. `redeploy-cp` recreates one service and leaves
+the node agent alone, so sessions in flight survive; `rebuild` on a Go-only
+change spends forty minutes recompiling Rust and GStreamer that did not.
+
 Both commands accept `REF=<branch-or-sha>` and otherwise preserve the branch the
 host is already testing. Do not call `deploy/redeploy.sh` remotely with an
-implicit ref: its own default can move the host back to `origin/main` while a
-test is in progress.
+implicit ref. It checks out its ref on the host and defaults to `origin/main`,
+so a bare call moves the host off the branch under test mid-run.
 
-Images are built only through `deploy/build-images.sh` and the Makefile wrappers.
-Do not substitute a hand-written `docker build` or weaken
-`deploy/image-contract.json` to make a candidate pass.
+Images are built only through `deploy/build-images.sh` and the Makefile
+wrappers. Do not substitute a hand-written `docker build` or weaken
+`deploy/image-contract.json` to make a candidate pass. The wrapper forces an
+explicit `--target`, because a bare build takes the last stage in the file
+regardless of what you tagged it, and it validates every artifact against the
+contract before promoting `:latest`. That contract is the durable form of every
+image defect that reached production.
 
 <Aside type="danger" title="Remote mutation is explicit">
 Starting, stopping, rebuilding, or redeploying a remote stack requires an
@@ -50,5 +60,7 @@ make session-logs SID=latest HOST=<role-or-host> SINCE=10m
 ```
 
 Use these bounded commands before reaching for raw SQL or unbounded log streams.
+Each is finite and exits 1 on a degraded verdict.
+
 For multi-run comparisons, impairment experiments, and soak reports, follow the
 current workflow documented in `AGENTS.md` and `docs/developer-tooling.md`.

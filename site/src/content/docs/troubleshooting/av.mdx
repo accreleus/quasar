@@ -45,7 +45,7 @@ silently with only a warning logged. This has muted a whole host for days.
 QUASAR_AUDIO_REQUIRED=1
 ```
 
-The session then fails rather than degrading to silence.
+The session then fails instead of degrading to silence.
 
 **Sound in some apps and not others** is the application picking a different
 output device. That is inside the container and is the app's own configuration.
@@ -88,9 +88,14 @@ above.
 
 ## Controllers not detected
 
-Press a button first. Browsers do not reveal a gamepad until it sends input.
+Browsers do not reveal a gamepad until it has sent input, so press a button.
 
-Then HTTPS, then `/dev/uinput`.
+Then confirm the page is on HTTPS, since the Gamepad API needs a secure context.
+
+Then check `/dev/uinput` on the host is present and writable by the agent. A
+read-only open succeeds even on a broken setup, which is what makes this easy to
+misdiagnose. The agent's readiness check tests for write access and reports the
+result on the host detail page.
 
 ## Touch input on a tablet
 
@@ -101,8 +106,7 @@ Whether a given game is playable by touch is a separate question and usually the
 answer is no without a controller.
 
 <Aside type="note" title="Frame drop counters in a hidden tab are meaningless">
-A backgrounded or occluded browser tab throttles presentation and inflates
-dropped-frame counts that have nothing to do with the stream. Judge picture
-problems from a visible tab, and judge delivery from the host-side numbers in the
-session detail.
+A backgrounded or occluded browser tab throttles presentation, which inflates
+every client-side smoothness number. Judge picture problems from a visible tab,
+and judge delivery from the host-side numbers in the session detail.
 </Aside>

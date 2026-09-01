@@ -35,12 +35,12 @@ docker compose -f deploy/docker-compose.yml exec quasar-control-plane \
 Paste that into the wizard along with the email, username and password you want
 for the admin account.
 
-The trust model here is simple: to claim the instance you must be able to run a
-command on the host. If you can do that, you already own the machine.
+To claim the instance you must be able to run a command on the host. If you can
+do that, you already own the machine.
 
 <Aside type="note" title="Restarting rotates the token">
 The token lives in memory-backed storage and is regenerated if the control plane
-restarts before you claim. Read it again rather than reusing an old one.
+restarts before you claim. Read it again; do not reuse an old one.
 </Aside>
 
 ### Or skip the wizard entirely
@@ -81,8 +81,8 @@ A check of what each node agent has actually reported, as opposed to what the
 configuration claims, plus the managed-home root each host will use.
 
 It tells you whether the agent registered at all, whether GPUs were found, and
-whether an encoder was genuinely detected on each one. Known misconfigurations
-are named directly: no encoder registered, driver components missing, `/dev/uinput`
+whether an encoder was detected on each one. Known misconfigurations are named
+directly: no encoder registered, driver components missing, `/dev/uinput`
 not writable, input device rules absent.
 
 Nothing here blocks you. A failing check warns and links you to Admin, Fleet,
@@ -131,7 +131,7 @@ you can run it later from the administration area.
 
 You land in the admin area. The sensible order from here:
 
-1. [Check your install](/quasar/install/verify/) actually works end to end.
+1. [Check your install](/quasar/install/verify/) works end to end.
 2. [Add apps](/quasar/admin/apps/) beyond whatever library discovery gave you.
 3. [Invite people](/quasar/admin/users/), if it is not just you.
 

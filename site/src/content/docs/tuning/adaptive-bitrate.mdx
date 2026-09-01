@@ -53,7 +53,7 @@ encoder speed ladder causes problems.
 Fixed bitrate at whatever the tier specifies. The congestion controller stays
 attached for telemetry but never moves the encoder.
 
-Reasonable on a dedicated wired LAN where the bandwidth genuinely is not going to
+Reasonable on a dedicated wired LAN where the bandwidth is not going to
 change. Not reasonable over WiFi.
 
 ## Turning it off
@@ -80,7 +80,7 @@ with `QUASAR_ABR_FLOOR_RATIO`.
 ## The encoder speed ladder
 
 In `smooth` mode, sustained encoder saturation escalates the encoder's speed
-setting rather than only cutting bitrate. Trading some compression efficiency for
+setting instead of only cutting bitrate. Trading some compression efficiency for
 encode time is often the better deal when the GPU is the bottleneck rather than
 the network. It unwinds after four healthy windows.
 
@@ -94,7 +94,7 @@ The resolution rung moves through the session's supported external-size ladder.
 Support depends on the active codec and image; Vulkan HEVC cannot resize live.
 </Aside>
 
-## Hardware only, really
+## Hardware encoders only
 
 ABR is validated on hardware encoders. On software encoding it barely functions,
 because openh264 cannot saturate a 1080p stream at 8 Mbps, so the congestion

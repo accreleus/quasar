@@ -39,7 +39,7 @@ changes, playout buffer changes.
 
 **Clock alignment** between the host and the browser, so browser-clock and
 host-clock series can be compared honestly. If the clocks were never
-synchronised, this says so rather than assuming a zero offset. An unmeasured
+synchronised, this says so instead of assuming a zero offset. An unmeasured
 clock means any end-to-end latency figure in the bundle is not trustworthy.
 
 **Derived windows**, where the analysis found hitches, bitrate downshifts,
@@ -64,7 +64,7 @@ percentile.
 
 <Aside type="note" title="`indeterminate_client_hidden` is not a failure to diagnose">
 A backgrounded or occluded browser tab throttles presentation, which inflates
-every client-side smoothness number. Rather than guess, the classifier refuses.
+every client-side smoothness number. The classifier refuses to guess.
 Reproduce the problem with the tab visible and take another bundle.
 </Aside>
 

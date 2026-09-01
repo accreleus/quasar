@@ -87,7 +87,7 @@ private-address range. Empty is safe: forwarded addresses are ignored and the
 direct peer is used for rate limiting and logs.
 
 <Aside type="caution" title="Keep your LAN origins in the list">
-Adding a public name and replacing the list rather than extending it breaks
+Adding a public name and overwriting the list instead of extending it breaks
 direct access at `https://<lan-ip>:8443`. List every origin people actually use.
 </Aside>
 
@@ -108,10 +108,10 @@ HTTPS.
 ## What not to proxy
 
 Node agents connect to the control plane over `/agent/ws` on plain HTTP, and
-`/health` is deliberately exempt from the HTTPS redirect so healthchecks work.
+`/health` is exempt from the HTTPS redirect so healthchecks work.
 
 If the agents are on the same machine or the same trusted network, point them at
-the control plane's direct address rather than through the proxy. Fewer moving
+the control plane's direct address instead of through the proxy. Fewer moving
 parts in the path that keeps your fleet registered is a good thing.
 
 ## Checking it worked

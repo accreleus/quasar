@@ -32,7 +32,7 @@ encoding. 8 vCPU and 32 GB is what the install is measured on. Less works.
 | --- | --- | --- |
 | AMD | Vulkan Video | Verified. |
 | NVIDIA | Vulkan Video | Verified. |
-| Intel | Vulkan Video or VA-API | Untested. Both paths exist and should work; nobody has run it. |
+| Intel | VA-API by default | Untested. VA-API is what detection picks; the Vulkan path exists too. Nobody has run either. |
 | None | openh264, in software | Proves the install. Too slow and too ugly to play on. |
 
 NVIDIA hosts need the driver plus `nvidia-container-toolkit`, registered with

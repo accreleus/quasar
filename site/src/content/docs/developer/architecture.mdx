@@ -3,33 +3,47 @@ title: Architecture and contracts
 description: The component boundaries and frozen interfaces a Quasar contributor must preserve.
 ---
 
-Quasar is split across three implementation components and one contract
-repository.
+Three implementation components and one contract repository. Most of the rules
+below are a consequence of that split.
 
 ## Control plane
 
 The Go control plane owns accounts, authentication, the HTTP API, WebRTC
 signaling, scheduling, administrative state, and Postgres migrations. It decides
-where a session should run but does not own a GPU or media pipeline.
+where a session should run. It does not own a GPU, a media pipeline, or any
+per-host GPU state. That last part is what lets multi-host and Kubernetes fall
+out of the design instead of being retrofitted later. Do not collapse the split
+back into one process.
 
 ## Node agent
 
 The Rust node agent owns one GPU host. It reports capacity, launches app
 containers, creates virtual input devices, builds the compositor and encoder
-pipeline, and maintains the direct WebRTC connection to the client.
+pipeline, and holds the WebRTC connection to the client. Media never routes
+through the control plane.
 
 ## Web client
 
-The React client serves both `/app` and `/admin`. It talks only to the control
-plane for API and signaling. Session media travels directly between the client
-and the selected node agent.
+The React client serves both `/app` and `/admin` from one codebase, and talks
+only to the control plane for API and signaling. Session media travels directly
+between the client and the selected node agent.
+
+The `/admin` route gating in the client is presentation. Admin access is
+enforced by middleware on each admin endpoint, which rejects a non-admin bearer
+token whatever the client believes. A client-side role flag must never become
+the enforcement mechanism.
 
 ## Protocol submodule
 
-`protocol/` is a frozen interface shared across components and repositories.
-Changing it is not a routine refactor: it requires explicit human sign-off and
-the review level specified in `CLAUDE.md`. Generated client schemas must continue
-to match `protocol/openapi.yaml`.
+`protocol/` is a frozen interface, shared between the components here and with
+photon, the native client, which submodules the same repository. Changing it is
+not a routine refactor: it requires explicit human sign-off and the review level
+specified in `CLAUDE.md`. Generated client schemas must continue to match
+`protocol/openapi.yaml`.
+
+Push a `protocol/` commit to its own remote before you push anything that pins
+it. A pushed `develop` pinning an unpushed protocol commit has broken fresh
+clones once already.
 
 ## Control-plane API reference
 
@@ -66,8 +80,11 @@ Three things the reference will not tell you on its own:
   should leak into the compositor or encoder.
 - Host identities, ports, container names, and storage roots are configuration,
   not constants to copy into code.
-- Database migrations move forward. An older binary is not a supported rollback
-  mechanism after a newer migration has run.
+- Database migrations move forward. An older binary is not a rollback mechanism
+  after a newer migration has run. The control plane runs its embedded
+  migrations up at boot, so a binary that stops short of the applied version
+  crash-loops instead of degrading. Recovery is redeploying the commit that
+  embeds the migration. This has taken out two fleet stacks.
 
 For the rationale and current phase context, read `CLAUDE.md` and
 `docs/architecture-and-plan.md` in the checkout.

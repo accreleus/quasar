@@ -55,7 +55,7 @@ runtime preset for that app.
 the project's graphics base layer, which is what provides GPU access and the
 Wayland and audio plumbing. An arbitrary public image will not work.
 
-**The app genuinely crashed.** Its own logs.
+**The app crashed on its own.** Its own logs.
 
 ## The session stays running but shows a frozen frame
 
@@ -63,7 +63,8 @@ This used to happen when a container exited without the agent noticing. Liveness
 monitoring now catches it and fails the session.
 
 If you are seeing it, check the app's exit policy. `keep` deliberately holds the
-session open when the app exits. `fail` is the default and usually what you want.
+session open when the app exits. `fail` is the default and the right choice for
+most setups.
 
 ## Steam will not start
 
@@ -107,13 +108,10 @@ Then check the app exists in Admin, Library, Apps at all.
 
 ## Controllers are not detected
 
-Press a button. Browsers do not reveal a gamepad until it has sent input.
+Browsers do not reveal a gamepad until it has sent input, so press a button.
 
-Then confirm the page is on HTTPS, since the Gamepad API needs a secure context.
-
-Then check `/dev/uinput` on the host is present and writable by the agent. A
-read-only open succeeds even when it is broken, which makes this easy to
-misdiagnose. The host readiness check tests writing.
+If that is not it, the rest of the checklist is under
+[Picture, sound and input](/quasar/troubleshooting/av/#controllers-not-detected).
 
 <Aside type="note" title="Big Picture mode and the first controller event">
 Steam's Big Picture interface can start without keyboard or controller focus. The

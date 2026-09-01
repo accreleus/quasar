@@ -60,7 +60,7 @@ curl http://127.0.0.1:9091/health
 - Is `CONTROL_PLANE_URL` right, and reachable from that machine?
 - Does `ENROLLMENT_TOKEN` match the control plane's?
 - Is the control plane's HTTP port reachable? Enrollment uses plain HTTP on 8080
-  and is exempt from the HTTPS redirect for exactly this reason.
+  and is exempt from the HTTPS redirect for that reason.
 
 If the agent previously enrolled and now cannot, its stored node secret may be
 gone. Enrollment then needs the token again, and the token has to still be valid.
@@ -97,7 +97,7 @@ blunt fix.
 
 Or software rendering is being forced by an environment variable that should not
 be set. `MESA_LOADER_DRIVER_OVERRIDE` and `LIBGL_ALWAYS_SOFTWARE` must be
-genuinely **unset**, not set to an empty string. The `.env.example` file contains
+**unset**, not set to an empty string. The `.env.example` file contains
 a software-only configuration block and a hardware block, and copying both is an
 easy mistake.
 
@@ -139,9 +139,9 @@ echo uinput | sudo tee /etc/modules-load.d/uinput.conf
 ```
 
 Present but the agent cannot use it: the agent needs to open it for **writing**.
-A read-only open succeeds even on a broken setup, which is why this is easy to
-misdiagnose. The agent's readiness check tests writing, and reports on the host
-detail page.
+A read-only open succeeds even on a broken setup, which is what makes this easy
+to misdiagnose. The agent's readiness check tests for write access and reports
+the result on the host detail page.
 
 ## A GPU-less host will not start
 

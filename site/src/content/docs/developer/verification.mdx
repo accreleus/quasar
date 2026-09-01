@@ -3,7 +3,7 @@ title: Testing and verification
 description: The required checks for Go, Rust, web, database, streaming, and deployment changes.
 ---
 
-The root Makefile is the supported test interface. Run this for every change:
+The root Makefile is the test interface. Run this for every change:
 
 ```bash
 make verify
@@ -25,8 +25,13 @@ developer-experience self-tests.
 | Images or deployment | Image contract validation through the canonical build scripts |
 | Candidate application image | `make qa IMAGE=<tag> PROFILE=<name> HOST=<role-or-host>` |
 
-`make test-go` can pass while database-backed tests were skipped, so it is not a
-substitute for `make test-db` after a migration or store/query change.
+A green `make test-go` does not mean the database tests passed. They skip
+themselves when no test database is configured. `make test-db` provisions a
+fresh throwaway Postgres and runs them for real, and it is not optional after a
+migration or a store or query change.
+
+`make test-web` is the typecheck gate for the same reason. Hand-typed `tsc`
+invocations have been seen passing here while checking nothing.
 
 ## Useful diagnostics
 
@@ -42,6 +47,12 @@ sharing it.
 ## Git and generated files
 
 Branches are based on `develop` and merge back to `develop`; promotion from
-`develop` to `main` is sign-off gated. Do not patch vendored generated clients or
-generated API types by hand. Regenerate them from their declared source and keep
-the source revision recorded where the repository requires it.
+`develop` to `main` is sign-off gated, because `main` is production. Push the
+branch to origin as you work, and pull `develop` before starting a migration.
+Two branches both numbering a migration 0070 give you a control plane that
+crash-loops on boot.
+
+Do not patch vendored generated clients or generated API types by hand.
+Regenerate them from their declared source and keep the source revision recorded
+where the repository requires it. A hand edit trips the schema drift check and
+gets dropped by the next regeneration anyway.

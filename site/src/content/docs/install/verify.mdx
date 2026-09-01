@@ -1,6 +1,6 @@
 ---
 title: Check your install
-description: Prove the stack is healthy, the agent registered, the GPU was found, and a session actually streams.
+description: Prove the stack is healthy, the agent registered, the GPU was found, and a session streams.
 ---
 
 import { Steps, Aside } from '@astrojs/starlight/components';
@@ -74,8 +74,8 @@ ls -l /dev/uinput
 ```
 
 The file must exist and the agent must be able to open it for **writing**. A
-read-only open succeeds even on a broken setup, which is why this catches people
-out. The agent's own readiness check tests for write access, and reports the
+read-only open succeeds even on a broken setup, which is what makes this easy to
+misdiagnose. The agent's readiness check tests for write access and reports the
 result on the host detail page.
 
 ## 6. A session actually streams
@@ -99,7 +99,7 @@ name `192.168.1.50`. That comes from `QUASAR_TLS_HOSTS` in `deploy/.env`, set
 before the first boot. If you missed it, or added an address later, see
 [HTTPS and certificates](/quasar/network/https/).
 
-A quick check of what is actually being served:
+A quick check of what is being served:
 
 ```bash
 docker compose -f deploy/docker-compose.yml exec quasar-control-plane \
