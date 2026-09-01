@@ -2,32 +2,71 @@ version: 2
 updates:
   # Actions are pinned to full commit SHAs for supply-chain reasons; Dependabot
   # is what keeps those pins current without anyone tracking advisories by hand.
+  #
+  # target-branch: develop on every entry — main is the sign-off-gated
+  # production branch and day-to-day work (dependency bumps included) lands on
+  # develop first. Without this Dependabot targets the default branch and every
+  # bump PR queues against main, where nothing but an operator-approved
+  # promotion may merge. NOTE: Dependabot reads this file from the DEFAULT
+  # branch, so a change here takes effect only once it reaches main.
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly }
     open-pull-requests-limit: 5
     commit-message: { prefix: "ci" }
+    target-branch: develop
 
   - package-ecosystem: gomod
     directory: /control-plane
     schedule: { interval: weekly }
     open-pull-requests-limit: 5
     commit-message: { prefix: "chore" }
+    target-branch: develop
 
   - package-ecosystem: cargo
     directory: /node-agent
     schedule: { interval: weekly }
     open-pull-requests-limit: 5
     commit-message: { prefix: "chore" }
+    target-branch: develop
+    # The gstreamer-rs crates version together against one GStreamer release;
+    # bumping one alone resolves a SECOND parallel gst stack into the lockfile
+    # (seen on the gstreamer-webrtc 0.25 solo bump — two gstreamer-sys
+    # generations in one binary). Group them so the family moves as one PR.
+    groups:
+      gstreamer:
+        patterns:
+          - "gstreamer*"
+          - "gst-*"
 
   - package-ecosystem: npm
     directory: /web
     schedule: { interval: weekly }
     open-pull-requests-limit: 5
     commit-message: { prefix: "chore" }
+    target-branch: develop
+    # react and react-dom (and their @types) must bump together — a solo
+    # react bump leaves @types/react-dom pinned to the old major and the
+    # install fails on peer resolution (seen on the react 19 solo bump).
+    # The vite ecosystem likewise: @vitejs/plugin-react majors track vite
+    # majors.
+    groups:
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
+      vite:
+        patterns:
+          - "vite"
+          - "@vitejs/*"
+          - "vitest"
+          - "@vitest/*"
 
   - package-ecosystem: npm
     directory: /site
     schedule: { interval: weekly }
     open-pull-requests-limit: 3
     commit-message: { prefix: "docs" }
+    target-branch: develop
