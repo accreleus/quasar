@@ -225,6 +225,11 @@ function renderPage() {
 }
 
 beforeEach(() => {
+  // `restoreAllMocks` (afterEach) only restores `vi.spyOn` spies since vitest 3;
+  // the module doubles above are plain `vi.fn()`s, so their call history now
+  // survives into the next test unless it is cleared here. The PATCH-count
+  // assertions below are per-test counts and read as cumulative without this.
+  vi.clearAllMocks();
   lastOnChannel = null;
   lastDrawerProps = null;
   lastStripProps = null;
