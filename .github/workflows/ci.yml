@@ -50,13 +50,15 @@ jobs:
         # which is a submodule. Without this they fail on a missing file, not on drift.
         with:
           submodules: true
-      # go-version (not go-version-file): setup-go reads go.mod's `go 1.23.0`
-      # directive and ignores the `toolchain go1.24.x` line — and gofmt 1.23
-      # formats differently from the 1.24 the project builds with (dev.sh uses
-      # golang:1.24), producing false gofmt-drift failures.
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      # go-version (not go-version-file): pin the same Go the project builds
+      # with, explicitly — a mismatched gofmt formats differently and produces
+      # false gofmt-drift failures. Must stay >= go.mod's `go` directive
+      # (currently 1.25.0): setup-go v7 runs with GOTOOLCHAIN=local, so an
+      # older pin no longer silently auto-downloads the newer toolchain — it
+      # fails the build outright.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.24.x'
+          go-version: '1.25.x'
           cache-dependency-path: control-plane/go.sum
       - name: gofmt
         run: |
