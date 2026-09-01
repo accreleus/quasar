@@ -63,6 +63,9 @@ const settle = () => new Promise<void>((r) => setTimeout(r, 0));
 afterEach(() => {
   removeWakeLock();
   Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+  // `restoreAllMocks` only restores `vi.spyOn` spies since vitest 3; clear call
+  // history too, or a plain `vi.fn()`'s counters survive into the next test.
+  vi.clearAllMocks();
   vi.restoreAllMocks();
 });
 

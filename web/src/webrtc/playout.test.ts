@@ -60,6 +60,9 @@ describe("PlayoutController — IL-1 verdict-aware fast descent", () => {
   });
   afterEach(() => {
     vi.useRealTimers();
+    // `restoreAllMocks` only restores `vi.spyOn` spies since vitest 3; clear call
+    // history too, or a plain `vi.fn()`'s counters survive into the next test.
+    vi.clearAllMocks();
     vi.restoreAllMocks();
   });
 
