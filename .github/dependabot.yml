@@ -2,32 +2,44 @@ version: 2
 updates:
   # Actions are pinned to full commit SHAs for supply-chain reasons; Dependabot
   # is what keeps those pins current without anyone tracking advisories by hand.
+  #
+  # target-branch: develop on every entry — main is the sign-off-gated
+  # production branch and day-to-day work (dependency bumps included) lands on
+  # develop first. Without this Dependabot targets the default branch and every
+  # bump PR queues against main, where nothing but an operator-approved
+  # promotion may merge. NOTE: Dependabot reads this file from the DEFAULT
+  # branch, so a change here takes effect only once it reaches main.
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly }
     open-pull-requests-limit: 5
     commit-message: { prefix: "ci" }
+    target-branch: develop
 
   - package-ecosystem: gomod
     directory: /control-plane
     schedule: { interval: weekly }
     open-pull-requests-limit: 5
     commit-message: { prefix: "chore" }
+    target-branch: develop
 
   - package-ecosystem: cargo
     directory: /node-agent
     schedule: { interval: weekly }
     open-pull-requests-limit: 5
     commit-message: { prefix: "chore" }
+    target-branch: develop
 
   - package-ecosystem: npm
     directory: /web
     schedule: { interval: weekly }
     open-pull-requests-limit: 5
     commit-message: { prefix: "chore" }
+    target-branch: develop
 
   - package-ecosystem: npm
     directory: /site
     schedule: { interval: weekly }
     open-pull-requests-limit: 3
     commit-message: { prefix: "docs" }
+    target-branch: develop
