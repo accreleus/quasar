@@ -14,6 +14,9 @@ import { EMPTY_SNAPSHOT, SessionTelemetry, type TelemetrySnapshot } from "../web
 import type { CaptureMetrics } from "./capture";
 
 afterEach(() => {
+  // `restoreAllMocks` only restores `vi.spyOn` spies since vitest 3; clear call
+  // history too, or a plain `vi.fn()`'s counters survive into the next test.
+  vi.clearAllMocks();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   vi.useRealTimers();
