@@ -45,7 +45,7 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         # TestOpenAPIDrift and TestMetricsManifestDrift read protocol/openapi.yaml,
         # which is a submodule. Without this they fail on a missing file, not on drift.
         with:
@@ -83,7 +83,7 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
@@ -107,7 +107,7 @@ jobs:
       run:
         working-directory: node-agent
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # gstreamer-rs 0.23 sys crates need the GStreamer 1.24 dev headers;
       # ubuntu-24.04 (ubuntu-latest) ships gst 1.24. webrtc/sdp live in -bad.
       - name: Install GStreamer dev packages
