@@ -632,7 +632,7 @@ jobs:
 
       - name: Image metadata (control plane)
         id: meta_control
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY_NS }}/quasar-control-plane
           # `type=semver` is the release lever: dispatching on the `vX.Y.Z` tag
@@ -649,7 +649,7 @@ jobs:
 
       - name: Image metadata (node agent)
         id: meta_agent
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY_NS }}/quasar-node-agent
           tags: |
