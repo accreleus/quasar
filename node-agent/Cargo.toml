@@ -54,7 +54,7 @@ flate2 = "1"
 # reliable trace lane. `flate2` above is reused; base64 is already in the lock as a
 # transitive dep, so this makes an existing crate a direct one rather than adding a
 # new build input.
-base64 = "0.22"
+base64 = "0.23"
 
 # First-run S1 (NVIDIA driver-volume provisioning): the `.run` installer has no
 # signature to verify, so the sha256 of exactly what was fetched is recorded in
