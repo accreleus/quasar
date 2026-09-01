@@ -125,7 +125,7 @@ pub fn download_context(url: &str, dest: &Path, deadline: Instant) -> Result<(),
     }
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(CONNECT_TIMEOUT))
-        .timeout_read(Some(READ_TIMEOUT))
+        .timeout_recv_body(Some(READ_TIMEOUT))
         .timeout_global(Some(deadline - now))
         .max_redirects(0)
         .build()

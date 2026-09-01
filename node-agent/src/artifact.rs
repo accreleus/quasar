@@ -135,7 +135,6 @@ pub fn fetch(d: &Download<'_>) -> Result<String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .max_redirects(0)
         .timeout_connect(Some(Duration::from_secs(20)))
-        .timeout_read(Some(READ_TIMEOUT))
         .build()
         .into();
 
@@ -144,7 +143,13 @@ pub fn fetch(d: &Download<'_>) -> Result<String> {
     for hop in 0..=MAX_REDIRECTS {
         validate_url(&current, d.host)?;
         tracing::info!(target: T, artifact = %what, url = %current, hop, "downloading {}", d.what);
-        match agent.get(&current).call() {
+        match agent
+            .get(&current)
+            .config()
+            .timeout_recv_body(Some(d.timeout))
+            .build()
+            .call()
+        {
             // A 3xx arrives in the Ok arm, never Err(StatusCode) (#478): ureq converts to
             // `Error::StatusCode` only at >= 400. Handling it on the Err arm is dead code, and
             // the empty 3xx body then lands on disk under a misleading error.
