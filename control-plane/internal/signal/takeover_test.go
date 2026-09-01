@@ -24,7 +24,7 @@ import (
 // the rest of this package (TEST_DATABASE_URL); `make test-db` runs it.
 func TestDisplacedBrowserGetsTakeoverCloseCode(t *testing.T) {
 	pool := testDB(t)
-	srv := newTestServer(t, pool)
+	srv, relay, _ := newTestServerWithRelay(t, pool)
 	store := session.NewStore(pool)
 
 	sess, firstToken := seedAssignedSession(t, pool)
@@ -35,6 +35,23 @@ func TestDisplacedBrowserGetsTakeoverCloseCode(t *testing.T) {
 		t.Fatalf("dial first: %v", err)
 	}
 	defer first.Close()
+
+	// Dial returning only means the upgrade finished — the handler still has
+	// the token consume (DB roundtrips) ahead of it before it reaches
+	// relay.Register. If tab 2 dials now, a loaded runner can register tab 2
+	// FIRST, so tab 1 displaces tab 2 and then waits out its read deadline for
+	// a close that never comes (the 5.07s i/o-timeout flake, issue #36).
+	// "Last attach wins" is defined by Register order, not dial order, so the
+	// test must observe tab 1's registration before creating tab 2: a frame
+	// delivered on the agent leg reaches the browser socket only after
+	// Register (buffered frames flush immediately after it), so reading it
+	// back is proof of registration.
+	if err := relay.Deliver(sess.ID, []byte(`{"type":"ice","pc":"video","candidate":"registration probe"}`)); err != nil {
+		t.Fatalf("deliver registration probe: %v", err)
+	}
+	if frame := readBrowserFrame(t, first); frame == "" {
+		t.Fatalf("empty registration probe frame")
+	}
 
 	// Tab 2 mints its own (independently single-use) token and attaches. This is
 	// exactly the #524 resume path: the mint succeeds, so the second attach is
