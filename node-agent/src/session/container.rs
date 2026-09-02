@@ -21,6 +21,8 @@
 //!     the image entrypoint is root-init-then-`setpriv`.
 //!   - `--security-opt seccomp=unconfined` (`QUASAR_APP_SECCOMP`): Docker's default
 //!     profile denies the userns creation Steam's pressure-vessel (bwrap) requires.
+//!   - `--security-opt apparmor=unconfined`, on AppArmor hosts only: `docker-default`
+//!     denies mount inside that userns, which is the other half of the same gate.
 //!   - `--security-opt no-new-privileges` + `--pids-limit` (`QUASAR_APP_PIDS_LIMIT`,
 //!     default 8192, a fork-bomb backstop that still fits Steam + a game).
 //!   - `--shm-size` (`QUASAR_APP_SHM_SIZE`, default 1g): Chromium-embedding apps fail
@@ -719,6 +721,22 @@ impl ContainerRuntime {
                 args.push("seccomp=unconfined".into());
             }
         }
+
+        // seccomp is not the only gate on the user namespaces the images need: Ubuntu's
+        // `docker-default` AppArmor profile denies mount inside one, so Steam's bootstrap
+        // fails ("Steam now requires user namespaces to be enabled") while `unshare -U`
+        // alone succeeds and `unshare -Urm` dies with "cannot change root filesystem
+        // propagation: Permission denied". Only on AppArmor hosts — an SELinux host
+        // (Fedora, `spc_t`) must get a byte-identical argv. Pairs with a HOST setting on
+        // Ubuntu 24.04+: `kernel.apparmor_restrict_unprivileged_userns=0`.
+        let apparmor = apparmor_unconfined_args(host_uses_apparmor());
+        if !apparmor.is_empty() {
+            tracing::info!(
+                token = "app-apparmor-unconfined",
+                "host uses AppArmor: app container runs unconfined so its user namespaces can mount"
+            );
+        }
+        args.extend(apparmor);
 
         // Per-app opt-in (`"systempaths_unconfined": true`): unmask /proc and /sys.
         // Docker's default `systempaths=masked` blocks Flatpak's sandbox helper
@@ -1430,6 +1448,28 @@ fn host_has_fuse_node() -> bool {
     Path::new("/dev/fuse").exists()
 }
 
+/// Does the HOST enforce AppArmor?
+///
+/// `/sys/module` is the host's module tree even inside a container (sysfs is not
+/// namespaced), so this reads the host's answer with no `/host` mount. The securityfs
+/// directory is the other host-wide signal but is NOT mounted in the agent container, so
+/// it can only add a yes, never a no.
+fn host_uses_apparmor() -> bool {
+    if let Ok(enabled) = std::fs::read_to_string("/sys/module/apparmor/parameters/enabled") {
+        return enabled.trim().eq_ignore_ascii_case("y");
+    }
+    Path::new("/sys/kernel/security/apparmor").is_dir()
+}
+
+/// `--security-opt apparmor=unconfined` args, gated on the host enforcing AppArmor. Split
+/// out so the decision is testable without touching the live host filesystem.
+fn apparmor_unconfined_args(host_enforces_apparmor: bool) -> Vec<String> {
+    if !host_enforces_apparmor {
+        return Vec::new();
+    }
+    vec!["--security-opt".into(), "apparmor=unconfined".into()]
+}
+
 /// The DRM node directory, in the agent and in every GPU app container alike: `--device`
 /// reproduces each node with the HOST's mode and gid, so what the agent stats here is
 /// what the app container gets.
@@ -1753,6 +1793,17 @@ mod tests {
             mode,
             gid,
         }
+    }
+
+    /// Ubuntu's `docker-default` denies mount inside a user namespace, which Steam's
+    /// bootstrap needs; an SELinux host must see a byte-identical argv.
+    #[test]
+    fn apparmor_is_unconfined_only_on_an_apparmor_host() {
+        assert_eq!(
+            apparmor_unconfined_args(true),
+            vec!["--security-opt", "apparmor=unconfined"]
+        );
+        assert!(apparmor_unconfined_args(false).is_empty());
     }
 
     /// The AMD/Intel launch defect: 0660 root:render nodes with no group-add make RADV
