@@ -1,0 +1,647 @@
+#!/usr/bin/env bash
+# validate — quasar-diagnose self-test.
+#
+# Checks:
+#   1. config.json parses and has required keys
+#   2. Every script is executable + bash/python syntax-clean
+#   3. Every assets/*.tmpl placeholder is emitted by some script (no orphan/missing)
+#   4. validators.py imports without error (smoke-test the shared lib)
+#   5. (--live [--host ROLE|NAME]) live smoke: run qdiag latest, assert bundle-shape PASS
+#
+# Usage:
+#   validate                    # offline checks only
+#   validate --live             # offline + live qdiag against the gpu-test host
+#   validate --live --host aux-infra
+#
+# Exit: 0 = all checks PASS.  Non-zero = failure(s) with a clear message.
+set -euo pipefail
+
+SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+LIVE=0
+LIVE_HOST="${QUASAR_DEFAULT_ROLE:-gpu-test}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --live)   LIVE=1; shift ;;
+    --host)   LIVE_HOST="$2"; shift 2 ;;
+    *)        echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+PASS=0
+FAIL=0
+
+check_pass() { echo "  PASS  $*"; PASS=$((PASS+1)); }
+check_fail() { echo "  FAIL  $*" >&2; FAIL=$((FAIL+1)); }
+
+echo "quasar-diagnose self-test"
+echo "skill dir: $SKILL_DIR"
+echo "══════════════════════════════════════════════════════════════"
+
+# ── 1. config.json parses ────────────────────────────────────────────────────
+echo ""
+echo "[1] config.json"
+
+if python3 - "$SKILL_DIR/config.json" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+required = ["bench_app","endpoints","classifier",
+            "netem_shapes","abr_modes","sampling","runs_dir","bundle_shape"]
+missing = [k for k in required if k not in cfg]
+if missing:
+    print(f"  missing keys: {missing}"); sys.exit(1)
+
+# The verdict vocabulary is the CONTROL PLANE's. This file must NOT carry a copy:
+# a stale four-string enum here failed a healthy `nominal` session on 2026-08-22.
+if "verdicts" in cfg["classifier"]:
+    print("  classifier.verdicts is back — the verdict vocabulary belongs to "
+          "control-plane/internal/session/classifier.go, not this file"); sys.exit(1)
+
+# Host addressing lives ONLY in _shared/hosts.json.
+for gone in ("hosts", "creds_source", "creds_keys"):
+    if gone in cfg:
+        print(f"  '{gone}' is back in config.json — host addressing and credentials "
+              f"belong to _shared/hosts.json and scripts/dx/admin_token.sh"); sys.exit(1)
+
+# Check abr_modes. `smooth` is the SHIPPED DEFAULT (SPT-10 #346, 2026-06-27) —
+# this file used to claim it was NOT IMPLEMENTED, and the check enforced the lie.
+for mode in ["on","off","smooth","protective"]:
+    if mode not in cfg["abr_modes"]:
+        print(f"  abr_modes missing '{mode}'"); sys.exit(1)
+if "NOT IMPLEMENTED" in str(cfg["abr_modes"]["smooth"]):
+    print("  smooth abr_mode is still marked NOT IMPLEMENTED — it has been the "
+          "default since SPT-10 (#346)"); sys.exit(1)
+
+print("  ok: all required keys present")
+PY
+then
+  check_pass "config.json parses and all required keys present"
+else
+  check_fail "config.json check failed"
+fi
+
+# ── 2. Scripts executable + syntax clean ────────────────────────────────────
+echo ""
+echo "[2] Script executability + syntax"
+
+SCRIPTS=(
+  "$SKILL_DIR/scripts/qdiag"
+  "$SKILL_DIR/scripts/qdiag-sample"
+  "$SKILL_DIR/scripts/qdiag-compare"
+  "$SKILL_DIR/scripts/qdiag-experiment"
+  "$SKILL_DIR/scripts/qdiag-ir-experiment"
+  "$SKILL_DIR/scripts/qdiag-report"
+  "$SKILL_DIR/scripts/validate"
+)
+# The analysis package moved into the DX layer (scripts/dx/session_diagnose/);
+# the skill is a wrapper over `make session-*` and owns no Python of its own.
+PKG="$(cd "$SKILL_DIR/../../.." && pwd)/scripts/dx/session_diagnose"
+PY_SCRIPTS=(
+  "$PKG/validators.py"
+  "$PKG/runner.py"
+  "$PKG/sample_runner.py"
+  "$PKG/ir_env.py"
+  "$PKG/ir_experiment_runner.py"
+  "$PKG/report_gen.py"
+)
+
+for s in "${SCRIPTS[@]}"; do
+  name="$(basename "$s")"
+  if [ ! -f "$s" ]; then
+    check_fail "$name — not found"
+    continue
+  fi
+  if [ ! -x "$s" ]; then
+    check_fail "$name — not executable (chmod +x missing)"
+    continue
+  fi
+  if bash -n "$s" 2>/dev/null; then
+    check_pass "$name — executable + bash syntax clean"
+  else
+    check_fail "$name — bash syntax error"
+  fi
+done
+
+for s in "${PY_SCRIPTS[@]}"; do
+  name="$(basename "$s")"
+  if [ ! -f "$s" ]; then
+    check_fail "$name — not found"
+    continue
+  fi
+  if python3 -c "import ast, sys; ast.parse(open(sys.argv[1]).read()); print('  ok')" "$s" >/dev/null 2>&1; then
+    check_pass "$name — python syntax clean"
+  else
+    check_fail "$name — python syntax error"
+  fi
+done
+
+# ── 3. Template placeholder coverage ────────────────────────────────────────
+echo ""
+echo "[3] Template placeholder coverage"
+
+python3 - "$SKILL_DIR" <<'PY'
+import re, sys, json
+from pathlib import Path
+
+skill_dir = Path(sys.argv[1])
+assets_dir = skill_dir / "assets"
+scripts_dir = skill_dir / "scripts"
+
+# Collect all placeholders across templates.
+templates = list(assets_dir.glob("*.tmpl"))
+all_placeholders = {}  # {placeholder: [tmpl_file, ...]}
+for tmpl in templates:
+    text = tmpl.read_text()
+    for ph in re.findall(r"\{\{(\w+)\}\}", text):
+        all_placeholders.setdefault(ph, []).append(tmpl.name)
+
+# Collect all substitution targets in scripts (look for .replace("{{ph}}") or print of {{ph}}).
+# The wrappers live here; the code that FILLS the templates lives in the DX
+# package (scripts/dx/session_diagnose/). Scan both, or every placeholder reads
+# as unemitted the moment the analysis code moves out of the skill.
+pkg_dir = skill_dir.parents[2] / "scripts" / "dx" / "session_diagnose"
+script_texts = {}
+for d in (scripts_dir, pkg_dir):
+    if not d.is_dir():
+        continue
+    for f in d.iterdir():
+        if f.is_file() and not f.name.startswith("."):
+            script_texts[f.name] = f.read_text()
+
+all_script_text = "\n".join(script_texts.values())
+
+missing = []
+for ph, tmpls in all_placeholders.items():
+    pattern = "{{" + ph + "}}"
+    if pattern not in all_script_text:
+        missing.append(f"  {{{{ {ph} }}}} (in {tmpls}) not emitted by any script")
+
+orphan_warnings = []  # scripts referencing placeholders not in any template
+template_phs = set(all_placeholders.keys())
+for name, text in script_texts.items():
+    for ph in re.findall(r"\{\{(\w+)\}\}", text):
+        if ph not in template_phs:
+            orphan_warnings.append(f"  {{{{ {ph} }}}} used in {name} but not in any template")
+
+if missing:
+    print("MISSING placeholder emissions:")
+    for m in missing: print(m)
+    sys.exit(1)
+else:
+    print(f"  ok: all {len(all_placeholders)} template placeholders are emitted by scripts")
+    print(f"  templates: {[t.name for t in templates]}")
+    print(f"  placeholders: {sorted(all_placeholders.keys())}")
+if orphan_warnings:
+    print("WARN (non-fatal) orphan script placeholders:")
+    for w in orphan_warnings: print(w)
+PY
+
+if [ $? -eq 0 ]; then
+  check_pass "Template placeholder coverage — all placeholders emitted"
+else
+  check_fail "Template placeholder check failed"
+fi
+
+# ── 4. session_diagnose.validators imports cleanly ──────────────────────────
+echo ""
+echo "[4] session_diagnose/validators.py import smoke"
+
+if python3 - "$PKG/validators.py" <<'PYX'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("validators", sys.argv[1])
+mod  = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+cfg = mod.load_config()
+assert "classifier" in cfg and "bundle_shape" in cfg, "config missing keys"
+assert not hasattr(mod, "validate_creds"), "validate_creds is back — credentials belong to admin_token.sh"
+assert not hasattr(mod, "validate_host"), "validate_host is back — hosts belong to _shared/hosts.json"
+
+# A verdict this code has never seen is DATA, not a validation failure.
+bundle = {"trace": {}, "window": {}, "clock": None, "series": {}, "events": [],
+          "derived_windows": {k: [] for k in cfg["bundle_shape"]["derived_windows_keys"]},
+          "classifier": {"verdict": "a_verdict_from_the_future", "evidence": []}}
+assert mod.validate_bundle_shape(bundle, cfg) == [], "an unknown verdict must not warn or raise"
+print("  ok: load_config works; an unknown verdict passes through")
+PYX
+then
+  check_pass "validators.py imports and smoke-tests pass"
+else
+  check_fail "validators.py import/smoke failed"
+fi
+
+# ── 6. IR-period experiment: T1 config schema ───────────────────────────────
+echo ""
+echo "[6] T1 — config.json ir_experiment schema"
+
+if python3 - "$PKG" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import validators as V
+
+cfg = V.load_config()
+warnings = V.validate_ir_experiment_config(cfg)
+ir = cfg["ir_experiment"]
+assert ir["rows"], "rows must be non-empty"
+assert ir["cols"], "cols must be non-empty"
+for row_id, row in ir["rows"].items():
+    for k in row["env"]:
+        assert k in ir["env_keys_whitelist"], f"{row_id} env key {k} not whitelisted"
+for col_id, col in ir["cols"].items():
+    assert col["netem_args"] is None or isinstance(col["netem_args"], str)
+print(f"  ok: rows={list(ir['rows'].keys())} cols={list(ir['cols'].keys())}")
+print(f"  env_keys_whitelist: {ir['env_keys_whitelist']}")
+if warnings:
+    print(f"  warnings: {warnings}")
+
+# Negative check: an unwhitelisted env key must be rejected.
+import copy
+bad_cfg = copy.deepcopy(cfg)
+bad_cfg["ir_experiment"]["rows"]["ir-off"]["env"]["QUASAR_NOT_WHITELISTED"] = "1"
+try:
+    V.validate_ir_experiment_config(bad_cfg)
+    raise AssertionError("should have raised for an unwhitelisted env key")
+except ValueError as e:
+    assert "not in env_keys_whitelist" in str(e)
+print("  ok: unwhitelisted env key correctly rejected")
+PY
+then
+  check_pass "T1: ir_experiment config schema valid + negative check"
+else
+  check_fail "T1: ir_experiment config schema check failed"
+fi
+
+# ── 7. IR-period experiment: T2 --help / --dry-run golden snippet ───────────
+echo ""
+echo "[7] T2 — qdiag-ir-experiment --help / --dry-run"
+
+if "$SKILL_DIR/scripts/qdiag-ir-experiment" --help > /tmp/qdiag-ir-help.txt 2>&1 \
+   && grep -q "orchestrate the IR-period experiment matrix" /tmp/qdiag-ir-help.txt \
+   && grep -q -- "--dry-run" /tmp/qdiag-ir-help.txt
+then
+  check_pass "T2: qdiag-ir-experiment --help prints usage"
+else
+  check_fail "T2: qdiag-ir-experiment --help failed"
+fi
+
+if "$SKILL_DIR/scripts/qdiag-ir-experiment" --rows ir-cont --cols clean --dry-run \
+     > /tmp/qdiag-ir-dryrun.txt 2>&1
+then
+  GOLDEN_OK=1
+  grep -q "CELL ir-cont x clean" /tmp/qdiag-ir-dryrun.txt || GOLDEN_OK=0
+  grep -q -- "\[env\]" /tmp/qdiag-ir-dryrun.txt || GOLDEN_OK=0
+  grep -q "QUASAR_INTRA_REFRESH=1 QUASAR_INTRA_REFRESH_PERIOD=0" /tmp/qdiag-ir-dryrun.txt || GOLDEN_OK=0
+  grep -q "docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.nvidia.yml up -d quasar-node-agent" /tmp/qdiag-ir-dryrun.txt || GOLDEN_OK=0
+  # --secs = netem_apply_delay_s(15) + duration(120) + margin(30) = 165 (CRITICAL-1 fix:
+  # the drive is launched via Popen and kept running for the whole cell, not just login).
+  grep -q "qses run --stack=gpu-test --profile 1080p60 --keep --secs 165" /tmp/qdiag-ir-dryrun.txt || GOLDEN_OK=0
+  grep -q "clean column" /tmp/qdiag-ir-dryrun.txt || GOLDEN_OK=0
+  grep -q "qdiag-sample --host gpu-test --session <SID>" /tmp/qdiag-ir-dryrun.txt || GOLDEN_OK=0
+  grep -q -- "\[stop\]" /tmp/qdiag-ir-dryrun.txt || GOLDEN_OK=0
+  # MINOR-6: gate-a-log must be ordered BEFORE netem apply in the plan.
+  GATE_A_LOG_LINE=$(grep -n -- "\[gate-a-log\]" /tmp/qdiag-ir-dryrun.txt | head -1 | cut -d: -f1)
+  NETEM_LINE=$(grep -n -- "\[netem\]" /tmp/qdiag-ir-dryrun.txt | head -1 | cut -d: -f1)
+  if [ -z "$GATE_A_LOG_LINE" ] || [ -z "$NETEM_LINE" ] || [ "$GATE_A_LOG_LINE" -ge "$NETEM_LINE" ]; then
+    echo "  gate-a-log must precede netem apply (MINOR-6)" >&2
+    GOLDEN_OK=0
+  fi
+  if "$SKILL_DIR/scripts/qdiag-ir-experiment" --rows ir-cont --cols loss1 --dry-run \
+       > /tmp/qdiag-ir-dryrun-loss1.txt 2>&1
+  then
+    # MAJOR-3: default netem verb is sender-side egress shaping, not aux ingress.
+    grep -q "qnetem sender 'delay 20ms 2ms loss 1%'" /tmp/qdiag-ir-dryrun-loss1.txt || GOLDEN_OK=0
+    grep -q "qnetem sender-clear" /tmp/qdiag-ir-dryrun-loss1.txt || GOLDEN_OK=0
+  else
+    echo "  qdiag-ir-experiment --cols loss1 --dry-run failed to run" >&2
+    GOLDEN_OK=0
+  fi
+  if [ "$GOLDEN_OK" = "1" ]; then
+    check_pass "T2: --dry-run command plan matches the golden snippet (incl. gate-a-log-before-netem ordering and sender netem verb), nothing executed"
+  else
+    echo "  dry-run output (for diagnosis):" >&2
+    cat /tmp/qdiag-ir-dryrun.txt >&2
+    check_fail "T2: --dry-run output did not match the golden snippet"
+  fi
+else
+  check_fail "T2: qdiag-ir-experiment --dry-run failed to run"
+fi
+
+# ── 7b. FEC auto-arm experiment: config schema + --dry-run (fec block) ──────
+echo ""
+echo "[7b] FEC — config.json fec_experiment schema + --experiment fec --dry-run"
+
+if python3 - "$PKG" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import validators as V
+
+cfg = V.load_config()
+warnings = V.validate_fec_experiment_config(cfg)
+fx = cfg["fec_experiment"]
+assert {"fec-off", "fec-20-fixed", "fec-auto"} <= set(fx["rows"].keys()), fx["rows"].keys()
+assert set(fx["cols"].keys()) == {"clean", "loss1", "burst"}, fx["cols"].keys()
+assert set(fx["env_keys_whitelist"]) == {"QUASAR_FEC_MODE", "QUASAR_FEC_PERCENTAGE"}
+# The new production baseline is the fixed env for every cell.
+for k, v in {"QUASAR_INTRA_REFRESH": "1", "QUASAR_INTRA_REFRESH_PERIOD": "60",
+             "QUASAR_SLICES": "4"}.items():
+    assert fx["fixed_env"].get(k) == v, f"fixed_env {k} != {v}"
+assert fx["control_row"] == "fec-off"
+for row_id, row in fx["rows"].items():
+    for k in row["env"]:
+        assert k in fx["env_keys_whitelist"], f"{row_id} env key {k} not whitelisted"
+print(f"  ok: rows={list(fx['rows'].keys())} cols={list(fx['cols'].keys())}")
+if warnings:
+    print(f"  warnings: {warnings}")
+
+# Negative check: an unwhitelisted env key must be rejected.
+import copy
+bad = copy.deepcopy(cfg)
+bad["fec_experiment"]["rows"]["fec-off"]["env"]["QUASAR_NOT_WHITELISTED"] = "1"
+try:
+    V.validate_fec_experiment_config(bad)
+    raise AssertionError("should have raised for an unwhitelisted env key")
+except ValueError as e:
+    assert "not in env_keys_whitelist" in str(e)
+print("  ok: unwhitelisted env key correctly rejected")
+PY
+then
+  check_pass "FEC: fec_experiment config schema valid + negative check"
+else
+  check_fail "FEC: fec_experiment config schema check failed"
+fi
+
+if "$SKILL_DIR/scripts/qdiag-ir-experiment" --experiment fec --rows fec-auto --cols burst --dry-run \
+     > /tmp/qdiag-fec-dryrun.txt 2>&1
+then
+  FEC_OK=1
+  grep -q "CELL fec-auto x burst" /tmp/qdiag-fec-dryrun.txt || FEC_OK=0
+  grep -q "QUASAR_FEC_MODE=auto QUASAR_FEC_PERCENTAGE=20" /tmp/qdiag-fec-dryrun.txt || FEC_OK=0
+  # Fixed env carries the new production IR baseline into every FEC cell.
+  grep -q "QUASAR_INTRA_REFRESH=1 QUASAR_INTRA_REFRESH_PERIOD=60 QUASAR_SLICES=4" /tmp/qdiag-fec-dryrun.txt || FEC_OK=0
+  grep -q "qses run --stack=gpu-test --profile 1080p60 --keep --secs 165" /tmp/qdiag-fec-dryrun.txt || FEC_OK=0
+  # per_row_expect gate-A: the auto row asserts its controller-armed log line.
+  grep -q "auto FEC controller armed" /tmp/qdiag-fec-dryrun.txt || FEC_OK=0
+  grep -q "qnetem sender 'delay 20ms 2ms loss 3% 25%'" /tmp/qdiag-fec-dryrun.txt || FEC_OK=0
+  # gate-a-log before netem apply (same ordering guarantee as IR).
+  GAL=$(grep -n -- "\[gate-a-log\]" /tmp/qdiag-fec-dryrun.txt | head -1 | cut -d: -f1)
+  NL=$(grep -n -- "\[netem\]" /tmp/qdiag-fec-dryrun.txt | head -1 | cut -d: -f1)
+  if [ -z "$GAL" ] || [ -z "$NL" ] || [ "$GAL" -ge "$NL" ]; then FEC_OK=0; fi
+  # The off/control row has no FEC log to assert — its gate-A log is a no-op echo.
+  if "$SKILL_DIR/scripts/qdiag-ir-experiment" --experiment fec --rows fec-off --cols clean --dry-run \
+       > /tmp/qdiag-fec-off-dryrun.txt 2>&1
+  then
+    grep -q "no gate-A log assertion for this row" /tmp/qdiag-fec-off-dryrun.txt || FEC_OK=0
+  else
+    FEC_OK=0
+  fi
+  if [ "$FEC_OK" = "1" ]; then
+    check_pass "FEC: --experiment fec --dry-run plan valid (env baseline, per-row gate-A, sender-side burst netem)"
+  else
+    echo "  fec dry-run output (for diagnosis):" >&2
+    cat /tmp/qdiag-fec-dryrun.txt >&2
+    check_fail "FEC: --experiment fec --dry-run output did not match expectations"
+  fi
+else
+  check_fail "FEC: qdiag-ir-experiment --experiment fec --dry-run failed to run"
+fi
+
+# ── 8. IR-period experiment: T3 report + T4 .env mutation ───────────────────
+echo ""
+echo "[8] T3 — qdiag-report over the fixture set"
+
+FIXTURES_DIR="$SKILL_DIR/assets/fixtures/ir"
+REPORT_OUT="/tmp/qdiag-ir-report-validate.html"
+if "$SKILL_DIR/scripts/qdiag-report" "$FIXTURES_DIR"/*.json --out "$REPORT_OUT" \
+     > /tmp/qdiag-report-stdout.txt 2>&1
+then
+  T3_OK=1
+  for anchor in summary verdict-table graphs configuration-appendix limitations; do
+    grep -q "id=\"$anchor\"" "$REPORT_OUT" || { echo "  missing anchor: $anchor" >&2; T3_OK=0; }
+  done
+  # Zero external http(s):// references, excluding the standard SVG/XML namespace URIs
+  # (namespace declarations are not network fetches — a real external reference would
+  # be a CDN <script src=...>, <link href=...>, or an http(s) image/font URL).
+  EXTERNAL_REFS=$(grep -oE 'https?://[^"'"'"' <>]+' "$REPORT_OUT" \
+    | grep -v -E '^https?://www\.w3\.org/(2000/svg|1999/xhtml)$' || true)
+  if [ -n "$EXTERNAL_REFS" ]; then
+    echo "  external references found:" >&2
+    echo "$EXTERNAL_REFS" >&2
+    T3_OK=0
+  fi
+  grep -q "FAILED" "$REPORT_OUT" || { echo "  failed cell not marked" >&2; T3_OK=0; }
+  grep -q "ir-ir-60-loss1" "$REPORT_OUT" || { echo "  failed cell metadata not present (not dropped)" >&2; T3_OK=0; }
+  if [ "$T3_OK" = "1" ]; then
+    check_pass "T3: qdiag-report renders all sections, no external refs, marks the failed cell"
+  else
+    check_fail "T3: qdiag-report output failed one or more checks (see above)"
+  fi
+else
+  cat /tmp/qdiag-report-stdout.txt >&2
+  check_fail "T3: qdiag-report failed to run over the fixture set"
+fi
+
+echo ""
+echo "[8b] T4 — ir_env.py .env mutation is pure + idempotent + preserves + restores"
+
+if python3 - "$PKG" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import ir_env as E
+
+FIXTURE = """# Quasar deploy env fixture — do not commit real secrets
+COMPOSE_PROJECT_NAME=quasar
+BOOTSTRAP_ADMIN_EMAIL=admin@example.com
+
+# intra-refresh knobs (#227)
+QUASAR_INTRA_REFRESH=0
+QUASAR_INTRA_REFRESH_PERIOD=0
+QUASAR_SLICES=4
+"""
+
+updates = {"QUASAR_INTRA_REFRESH": "1", "QUASAR_INTRA_REFRESH_PERIOD": "60"}
+once = E.apply_env(FIXTURE, updates)
+twice = E.apply_env(once, updates)
+assert once == twice, "apply_env must be idempotent"
+
+vals = E.read_env(once, ["QUASAR_INTRA_REFRESH", "QUASAR_INTRA_REFRESH_PERIOD"])
+assert vals["QUASAR_INTRA_REFRESH"] == "1"
+assert vals["QUASAR_INTRA_REFRESH_PERIOD"] == "60"
+
+# Unrelated lines/comments preserved verbatim.
+assert "# Quasar deploy env fixture — do not commit real secrets" in once
+assert "COMPOSE_PROJECT_NAME=quasar" in once
+assert "BOOTSTRAP_ADMIN_EMAIL=admin@example.com" in once
+assert "# intra-refresh knobs (#227)" in once
+assert "QUASAR_SLICES=4" in once
+
+# A key not present in the fixture is appended, not duplicated.
+added = E.apply_env(FIXTURE, {"QUASAR_FEC_PERCENTAGE": "0"})
+assert added.count("QUASAR_FEC_PERCENTAGE=0") == 1
+
+# Restore: writing the captured original text back is byte-identical.
+restored = added  # start from a mutated state
+restored_back = FIXTURE  # what restore_env conceptually writes back
+assert restored_back == FIXTURE, "restore must reproduce the original byte-for-byte"
+
+print("  ok: idempotent, preserves unrelated lines, appends new keys once, restore is byte-identical")
+PY
+then
+  check_pass "T4: ir_env.py apply_env is pure/idempotent and preserves + restores .env content"
+else
+  check_fail "T4: ir_env.py mutation test failed"
+fi
+
+echo ""
+echo "[8c] CRITICAL-2 — ir_experiment_runner.py restore_env() is injection-safe"
+
+# restore_env() base64-encodes the captured .env content locally and pipes it
+# through `base64 -d` remotely, specifically so a live .env containing
+# `$`-bearing secrets or backticks can never be expanded by the LOCAL shell
+# before ssh sees it (the bug: embedding raw file content in an f-string
+# shell command run under shell=True). Reproduce the exact local-shell
+# round-trip restore_env() performs (swap ssh for a plain shell here — the
+# vulnerability is 100% in the LOCAL quoting, not the remote side) and prove
+# dangerous content survives byte-for-byte, unexpanded and unexecuted.
+if python3 - <<'PY'
+import base64, subprocess
+
+DANGEROUS = "BOOTSTRAP_ADMIN_PASSWORD=$(rm -rf /tmp/should-not-run)\nOTHER=`echo pwned`\nPLAIN=ok\n"
+b64 = base64.b64encode(DANGEROUS.encode()).decode()
+# Exactly restore_env()'s local command shape, minus the ssh hop.
+cmd = f"printf '%s' '{b64}' | base64 -d"
+r = subprocess.run(cmd, shell=True, text=True, capture_output=True)
+assert r.returncode == 0, f"round-trip command failed: {r.stderr}"
+assert r.stdout == DANGEROUS, (
+    f"restore must reproduce dangerous $ / backtick content byte-for-byte unexpanded:\n"
+    f"  got:      {r.stdout!r}\n  expected: {DANGEROUS!r}"
+)
+print("  ok: $()/backtick-bearing .env content survives the b64 round-trip unexpanded and unexecuted")
+PY
+then
+  check_pass "CRITICAL-2: restore_env() b64 round-trip is injection-safe for \$/backtick .env content"
+else
+  check_fail "CRITICAL-2: restore_env() injection-safety check failed"
+fi
+
+# ── 9. Live smoke (optional) ─────────────────────────────────────────────────
+if [ "$LIVE" = "1" ]; then
+  echo ""
+  echo "[9] Live smoke: qdiag latest --host $LIVE_HOST"
+  echo "(This runs against the live Quasar stack — requires the session to be running)"
+
+  if "$SKILL_DIR/scripts/qdiag" latest --host "$LIVE_HOST" --json > /tmp/qdiag-validate-live.json 2>&1; then
+    # Validate the bundle shape from the JSON output.
+    python3 - /tmp/qdiag-validate-live.json "$SKILL_DIR/config.json" <<'PY'
+import json, sys
+out_path, cfg_path = sys.argv[1], sys.argv[2]
+try:
+    out = json.load(open(out_path))
+except Exception as e:
+    print(f"  FATAL: could not parse qdiag --json output: {e}"); sys.exit(1)
+
+cfg = json.load(open(cfg_path))
+
+# The --json output is the analysis, not the raw bundle.
+# Validate key sections are present.
+required = ["session", "classifier", "series", "derived_windows", "events"]
+for k in required:
+    if k not in out:
+        print(f"  FAIL: analysis output missing '{k}'"); sys.exit(1)
+
+verdict = out["classifier"].get("verdict","")
+valid_verdicts = cfg["classifier"]["verdicts"]
+if verdict not in valid_verdicts:
+    print(f"  FAIL: verdict '{verdict}' not in {valid_verdicts}"); sys.exit(1)
+
+warnings = out.get("warnings", [])
+if warnings:
+    print(f"  WARN: {len(warnings)} bundle warning(s):")
+    for w in warnings: print(f"    - {w}")
+
+print(f"  session: {out['session']}")
+print(f"  verdict: {verdict}")
+print(f"  evidence: {out['classifier'].get('evidence', [])}")
+print(f"  series_count: {len(out['series'])}")
+print(f"  event_types: {list(out['events'].keys())}")
+print(f"  derived_windows: {out['derived_windows']}")
+print("  bundle-shape: PASS")
+PY
+    if [ $? -eq 0 ]; then
+      check_pass "Live qdiag latest --host $LIVE_HOST — bundle-shape PASS"
+    else
+      check_fail "Live qdiag output failed bundle-shape validation"
+    fi
+  else
+    echo ""
+    echo "  qdiag output (for diagnosis):"
+    cat /tmp/qdiag-validate-live.json 2>/dev/null | head -30 || true
+    check_fail "Live qdiag latest --host $LIVE_HOST failed (session running? stack up?)"
+  fi
+else
+  echo ""
+  echo "[9] Live smoke: SKIPPED (pass --live [--host ROLE|NAME] to run)"
+fi
+
+# ── deploy-only contract ─────────────────────────────────────────────────────
+# hosts.example.json promises a deploy-only host takes read-only verbs only.
+# qdiag-experiment mutates that host's deploy/.env and force-recreates the
+# node-agent once per cell, so it must refuse outright — an experiment verb has
+# no confirmation flag. Asserted against the shared synthetic fleet; the guard
+# fires before any ssh, so nothing is contacted.
+echo ""
+echo "[10] deploy-only guard"
+# An `ssh` stub that always fails: the allowed-host cases below deliberately get
+# past the guard, and this self-test must never dial a real network (the fixture
+# addresses are RFC 5737, so a real attempt is just a 15s timeout).
+_STUB_BIN="$(mktemp -d)"
+printf '#!/usr/bin/env bash\nexit 255\n' > "$_STUB_BIN/ssh"
+chmod +x "$_STUB_BIN/ssh"
+trap 'rm -rf "$_STUB_BIN"' EXIT
+PATH="$_STUB_BIN:$PATH"
+_deploy_only_msg="$(QUASAR_HOSTS_JSON="$SKILL_DIR/../_shared/fixtures/hosts.three-role.json" \
+  bash "$SKILL_DIR/scripts/qdiag-experiment" --host deploy-only --shapes clean --abr on 2>&1 || true)"
+case "$_deploy_only_msg" in
+  *"no destructive operations"*)
+    check_pass "qdiag-experiment refused on a deploy-only host" ;;
+  *)
+    check_fail "qdiag-experiment not refused on a deploy-only host: $_deploy_only_msg" ;;
+esac
+
+# The same fleet must still allow it on the role it is meant for — a guard that
+# refuses everything is not a guard, it is an outage.
+_gpu_msg="$(QUASAR_HOSTS_JSON="$SKILL_DIR/../_shared/fixtures/hosts.three-role.json" \
+  bash "$SKILL_DIR/scripts/qdiag-experiment" --host gpu-test --shapes clean --abr on 2>&1 || true)"
+case "$_gpu_msg" in
+  *"deploy-only role"*)
+    check_fail "qdiag-experiment wrongly refused on the gpu-test host: $_gpu_msg" ;;
+  *)
+    check_pass "qdiag-experiment still allowed on a non-deploy-only host" ;;
+esac
+
+# --abr smooth is the SHIPPED DEFAULT (SPT-10 #346) and used to be filtered out
+# of the matrix as "NOT IMPLEMENTED". It must reach the run plan; an unknown
+# mode must still be refused.
+_smooth="$(QUASAR_HOSTS_JSON="$SKILL_DIR/../_shared/fixtures/hosts.three-role.json" \
+  bash "$SKILL_DIR/scripts/qdiag-experiment" --host gpu-test --shapes clean --abr smooth 2>&1 || true)"
+case "$_smooth" in
+  *"NOT IMPLEMENTED"*|*"unknown --abr mode"*)
+    check_fail "--abr smooth was rejected: $_smooth" ;;
+  *"abr=smooth"*)
+    check_pass "--abr smooth reaches the run plan" ;;
+  *)
+    check_fail "--abr smooth did not reach the run plan: $_smooth" ;;
+esac
+_bogus="$(QUASAR_HOSTS_JSON="$SKILL_DIR/../_shared/fixtures/hosts.three-role.json" \
+  bash "$SKILL_DIR/scripts/qdiag-experiment" --host gpu-test --abr not-a-mode 2>&1 || true)"
+case "$_bogus" in
+  *"unknown --abr mode"*) check_pass "an unknown --abr mode is refused up front" ;;
+  *) check_fail "an unknown --abr mode was accepted: $_bogus" ;;
+esac
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo ""
+echo "══════════════════════════════════════════════════════════════"
+echo "RESULT: $PASS PASSED  /  $FAIL FAILED"
+if [ "$FAIL" -gt 0 ]; then
+  exit 1
+fi

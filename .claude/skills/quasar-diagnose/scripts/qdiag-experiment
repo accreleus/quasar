@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+# qdiag-experiment — run the ABR experiment matrix: (abr_mode × netem_shape) × host.
+#
+# For each cell: optionally deploy the ABR env override, run scripts/harness/run-st-trace.sh
+# (the ST-08 acceptance harness) with the chosen shape, capture the run, then call
+# qdiag-compare across cells to produce the experiment-matrix report.
+#
+# Usage:
+#   qdiag-experiment [--host ROLE|NAME]
+#                    [--shapes clean,mild,moderate,severe]
+#                    [--abr on,off,smooth,protective]
+#
+#   qdiag-experiment                               # all shapes, abr on|off, gpu-test host
+#   qdiag-experiment --shapes mild,severe          # subset of shapes
+#   qdiag-experiment --abr on --shapes clean,mild  # abr=on only, 2 shapes
+#   qdiag-experiment --abr smooth,protective       # the shipped default vs the revert
+#   qdiag-experiment --host aux-infra --shapes mild  # single cell on another host
+#
+# abr modes come from config.json's abr_modes block: on | off | smooth | protective.
+# ("smooth" used to be filtered out here as "NOT IMPLEMENTED" — long after it
+# became the shipped default, SPT-10 #346 — so the matrix silently dropped the
+# one arm most worth measuring. config.json has carried its env block all along.)
+# Cells run sequentially (each launches a headless session + netem).
+# Prerequisites: same as run-st-trace.sh (stack up, Colour Ripple app seeded,
+#                Chrome-for-Testing at /tmp/cft/, playwright at /tmp/t8-driver/).
+set -euo pipefail
+
+SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+source "$(dirname "$0")/../../_shared/lib.sh"
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+HOST="$QUASAR_DEFAULT_ROLE"
+SHAPES="clean,mild,moderate,severe"
+ABR_MODES="on,off"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --host)   HOST="$2"; shift 2 ;;
+    --shapes) SHAPES="$2"; shift 2 ;;
+    --abr)    ABR_MODES="$2"; shift 2 ;;
+    *)        echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+# No mode is filtered out. Instead every requested mode must EXIST in
+# config.json — a typo is refused up front rather than run as a whole matrix of
+# cells carrying an empty env block and a label nobody chose.
+python3 -c 'import json,sys
+modes=json.load(open(sys.argv[1])).get("abr_modes",{})
+bad=[m for m in sys.argv[2].split(",") if m and m not in modes]
+if bad:
+    sys.exit("unknown --abr mode(s) %s (config.json has: %s)"%(", ".join(bad), ", ".join(sorted(modes))))' \
+  "$SKILL_DIR/config.json" "$ABR_MODES"
+
+# ── Host resolution ───────────────────────────────────────────────────────────
+# --host takes a ROLE (gpu-test, aux-infra, ...) or a literal host name.
+HOST="$(q_resolve "$HOST")" || {
+  echo "Unknown host or role '$HOST' (hosts: $(q_hosts | tr '\n' ' ')| roles: $(q_roles | tr '\n' ' '))" >&2
+  exit 1
+}
+
+# This verb mutates the host's ABR environment and force-recreates the node-agent
+# once per cell — an experiment verb by any reading, and hosts.example.json says a
+# deploy-only host refuses those. No flag confirms it.
+q_guard_mutating qdiag "$HOST" 0 experiment destructive
+
+# The host's checkout path comes from hosts.json like every other host fact;
+# `cd ~/code/quasar` was the one place this script assumed the operator's layout.
+DIR="$(q_host_cfg "$HOST" dir)"
+[ -n "$DIR" ] || { echo "hosts.json has no dir for host '$HOST'" >&2; exit 1; }
+
+ssh_run() { q_ssh "$HOST" "$@"; }
+
+# ── Run matrix ────────────────────────────────────────────────────────────────
+RUNS_DIR="$SKILL_DIR/qdiag-runs"
+mkdir -p "$RUNS_DIR"
+TS=$(date -u '+%Y%m%dT%H%M%SZ')
+EXPERIMENT_DIR="$RUNS_DIR/experiment-${TS}-${HOST}"
+mkdir -p "$EXPERIMENT_DIR"
+
+CELL_FILES=()
+CELL_LABELS=()
+
+IFS=',' read -ra SHAPE_LIST <<< "$SHAPES"
+IFS=',' read -ra ABR_LIST   <<< "$ABR_MODES"
+
+echo "qdiag-experiment: host=$HOST  shapes=${SHAPES}  abr=${ABR_MODES}"
+echo "  cells: $((${#SHAPE_LIST[@]} * ${#ABR_LIST[@]}))"
+echo "  results: $EXPERIMENT_DIR"
+echo ""
+
+for abr_mode in "${ABR_LIST[@]}"; do
+  for shape in "${SHAPE_LIST[@]}"; do
+    CELL_LABEL="${abr_mode}-${shape}"
+    CELL_FILE="$EXPERIMENT_DIR/${CELL_LABEL}.json"
+    echo "── CELL: abr=$abr_mode  shape=$shape ──────────────────────────"
+
+    # Read ABR env from config.
+    ABR_ENV_JSON=$(python3 - "$SKILL_DIR/config.json" "$abr_mode" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+mode = sys.argv[2]
+env_block = cfg["abr_modes"].get(mode, {}).get("env") or {}
+# Output as VAR=VAL lines for shell eval
+for k, v in env_block.items():
+    print(f"export {k}={v}")
+PY
+)
+
+    # Run st-trace on the host (the harness lives in deploy/).
+    ssh_run "bash -c '
+      ${ABR_ENV_JSON}
+      cd '$DIR'
+      bash scripts/harness/run-st-trace.sh --shape ${shape} 2>&1
+    '" | tee /dev/stderr > "$CELL_FILE.raw" || {
+      echo "WARN: cell $CELL_LABEL run-st-trace.sh failed — skipping" >&2
+      continue
+    }
+
+    # Extract the last JSON bundle from the run output (run-st-trace writes JSON to
+    # deploy/results/ on the host; capture it here).
+    REMOTE_RESULT=$(ssh_run "ls -t '$DIR'/deploy/results/st-trace-${shape}-*.json 2>/dev/null | head -1" || true)
+    if [ -z "$REMOTE_RESULT" ]; then
+      echo "WARN: no result file found for cell $CELL_LABEL" >&2
+      continue
+    fi
+
+    # Wrap the bundle in a run-file envelope so qdiag-compare can read it.
+    ssh_run "python3 - '$REMOTE_RESULT' '$abr_mode' '$shape' '$HOST'" <<'PYEOF' > "$CELL_FILE"
+import json, sys, time
+result_path, abr_mode, shape, host = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+with open(result_path) as f:
+    raw = json.load(f)
+# run-st-trace.sh writes the diagnostic bundle directly; wrap it.
+bundle = raw.get("bundle") or raw
+run = {
+    "meta": {
+        "host": host,
+        "app": bundle.get("trace", {}).get("app") or "Quasar Bench: Colour Ripple",
+        "profile": bundle.get("trace", {}).get("profile_id", "?"),
+        "session": bundle.get("trace", {}).get("session_id", "?"),
+        "started": time.time(),
+        "duration_s": 45,
+        "n_samples": 1,
+        "interval_s": 0,
+        "abr_mode": abr_mode,
+        "netem_shape": shape,
+    },
+    "samples": [{"ts_unix_s": time.time(), "bundle": bundle}],
+    "final_bundle": bundle,
+}
+print(json.dumps(run, default=str))
+PYEOF
+
+    CELL_FILES+=("$CELL_FILE")
+    CELL_LABELS+=("$CELL_LABEL")
+    echo "  cell saved: $CELL_FILE"
+    echo ""
+  done
+done
+
+if [ "${#CELL_FILES[@]}" -lt 1 ]; then
+  echo "ERROR: no cells completed successfully." >&2
+  exit 1
+fi
+
+echo "══ EXPERIMENT COMPLETE — comparing ${#CELL_FILES[@]} cells ══"
+"$SKILL_DIR/scripts/qdiag-compare" --allow-cross "${CELL_FILES[@]}"
+
+# Fill experiment-matrix template.
+python3 - "$SKILL_DIR/assets/experiment-matrix.md.tmpl" "${CELL_FILES[@]}" <<'PY'
+import json, math, sys
+from pathlib import Path
+from collections import Counter
+
+tmpl_path  = sys.argv[1]
+cell_paths = sys.argv[2:]
+
+def pctile(vals, p):
+    if not vals: return math.nan
+    s = sorted(vals)
+    rank = (p/100)*(len(s)-1)
+    lo = int(rank); hi = min(lo+1, len(s)-1)
+    return s[lo] + (rank-lo)*(s[hi]-s[lo])
+
+def fmt(v, unit=""):
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "—"
+    return f"{v}{unit}"
+
+cells = []
+for p in cell_paths:
+    with open(p) as f:
+        run = json.load(f)
+    meta = run.get("meta", {})
+    bundles = [s.get("bundle", {}) for s in run.get("samples", []) if s.get("bundle")]
+    if run.get("final_bundle"):
+        bundles.append(run["final_bundle"])
+
+    def agg(name, stat):
+        pts = []
+        for b in bundles:
+            ps = (b.get("series") or {}).get(name, [])
+            pts.extend(p[1] if isinstance(p, list) else p.get("v", p.get("V", 0)) for p in ps)
+        if not pts: return None
+        return round(pctile(pts, 50 if stat=="p50" else 95), 1)
+
+    downshifts = sum(
+        len((b.get("derived_windows") or {}).get("abr_downshifts", []))
+        for b in bundles
+    )
+    verdicts = [(b.get("classifier") or {}).get("verdict", "unknown") for b in bundles]
+    cells.append({
+        "label":     Path(p).stem,
+        "abr_mode":  meta.get("abr_mode", "?"),
+        "shape":     meta.get("netem_shape", "?"),
+        "host":      meta.get("host", "?"),
+        "encode_p50": agg("encoder.encode_ms","p50"),
+        "encode_p95": agg("encoder.encode_ms","p95"),
+        "fps_p50":    agg("encoder.fps","p50"),
+        "sd_p95":     agg("client.present_interval_sd_ms","p95"),
+        "downshifts": downshifts,
+        "verdict":    Counter(verdicts).most_common(1)[0][0] if verdicts else "?",
+    })
+
+tmpl = Path(tmpl_path).read_text()
+matrix_rows = ""
+for c in cells:
+    matrix_rows += (
+        f"| {c['abr_mode']} | {c['shape']} | {c['host']} |"
+        f" {fmt(c['encode_p50'],'ms')} / {fmt(c['encode_p95'],'ms')} |"
+        f" {fmt(c['fps_p50'],'fps')} |"
+        f" {fmt(c['sd_p95'],'ms')} |"
+        f" {c['downshifts']} |"
+        f" {c['verdict']} |\n"
+    )
+
+filled = (tmpl
+    .replace("{{experiment_rows}}", matrix_rows)
+    .replace("{{n_cells}}", str(len(cells)))
+    .replace("{{host}}", cells[0]["host"] if cells else "?")
+)
+print(filled)
+PY
+
+echo ""
+echo "Experiment matrix results saved to: $EXPERIMENT_DIR"

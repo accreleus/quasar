@@ -1,0 +1,23 @@
+{
+  "_comment": "quasar-image — single source of truth. Scripts and SKILL.md read from here; no role, tag, host fact or deploy command is duplicated elsewhere.",
+  "roles": {
+    "runtime": { "tag": "quasar-node-agent", "deployable": true,
+                 "_role": "Vendor-neutral node-agent (AMD/Intel VA + Vulkan)" },
+    "nv":      { "tag": "quasar-nv",     "deployable": true,
+                 "_role": "runtime + NVIDIA CUDA runtime libs" },
+    "dev":     { "tag": "quasar-agent-dev",    "deployable": false,
+                 "_role": "Build/test env. NEVER deployed as an agent." },
+    "control": { "tag": "quasar-control-plane","deployable": false,
+                 "_role": "Control-plane production image" }
+  },
+  "deploy": {
+    "_comment": "Literal command run on the host by `qimg deploy`, keyed by host NAME as configured in _shared/hosts.json. A host with no entry makes deploy refuse rather than guess.",
+    "_empty_on_purpose": "SHIPPED EMPTY. Add an entry only for a host YOU named in _shared/hosts.json. This map used to arrive pre-filled with the original operator's own host names, so anyone whose host happened to be called the same thing inherited a force-recreate they never wrote. Example entries, for reference only: 'deploy/build-images.sh runtime --deploy' or 'docker compose -f deploy/docker-compose.yml up -d --force-recreate --wait quasar-node-agent'."
+  },
+  "report": {
+    "default_dir": "deploy/results",
+    "filename": "qimg-report-{ts}.html",
+    "_comment": "deploy/results/ is gitignored."
+  },
+  "agent_container_filter": "quasar-node-agent"
+}

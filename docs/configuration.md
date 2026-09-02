@@ -872,6 +872,10 @@ compose). See `CLAUDE.md` for the full rationale.
 | `GST_PLUGIN_PATH` | `/usr/local/lib/.../gstreamer-1.0` | Lists the from-source plugins (nvcodec/waylanddisplaysrc/interpipe) first so they shadow the apt builds. |
 
 Host kernel/network tuning (UDP `wmem_default`, etc.) lives in `deploy/host-tuning.md`.
+The node agent's device and capability grants (`/dev/dri`, `/dev/uinput`, `/dev/kmsg`
+read-only, `NET_ADMIN` + `SYSLOG`) are compose-level, not environment variables — they
+are listed in `deploy/README.md` §"Prerequisites in detail", and each one is what makes
+a specific readiness check answerable rather than `skip`.
 
 ---
 

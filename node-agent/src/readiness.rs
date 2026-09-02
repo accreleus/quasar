@@ -327,11 +327,14 @@ fn check_xid_visibility(env: &ProbeEnv) -> ReadinessCheck {
                 crate::gpu_kmsg::KMSG_PATH
             ),
             remediation: format!(
-                "Optional. To turn it on, give the node-agent service read access to the \
-                 kernel ring buffer in deploy/docker-compose.yml: add `{}:{}:ro` under \
-                 `devices:` and `SYS_ADMIN`-free `cap_add: [SYSLOG]`. Then restart the \
-                 agent. Nothing else changes — the tailer is read-only, off the media \
-                 path, and reports only NVRM Xid and amdgpu fault lines.",
+                "The shipped deploy/docker-compose.yml grants this, so a stack that cannot \
+                 read it predates that or has the entry removed. Under the node-agent \
+                 service add `{}:{}:r` to `devices:` — `:r` is the device-cgroup permission \
+                 set, a bind mount's `:ro` is rejected there — and `SYSLOG` to `cap_add:`, \
+                 which the device alone does not cover while kernel.dmesg_restrict=1 (the \
+                 distro default). Then recreate the agent container. Optional, and nothing \
+                 else changes — the tailer is read-only, off the media path, and reports \
+                 only NVRM Xid and amdgpu fault lines.",
                 crate::gpu_kmsg::KMSG_PATH,
                 crate::gpu_kmsg::KMSG_PATH
             ),
@@ -2851,6 +2854,32 @@ mod tests {
             log_report(&checks),
             0,
             "a WARN-only host must not be reported as having FAILED checks: {checks:?}"
+        );
+    }
+
+    /// The remediation has to name the entry the shipped compose actually uses. `devices:`
+    /// takes a device-cgroup permission set (`r`/`w`/`m`), not a bind mount's `:ro` — Compose
+    /// rejects `:ro` there outright, so the old text sent operators to an error (#83). And
+    /// `dmesg_restrict=1` is the distro default, so the device without the capability is EPERM.
+    #[test]
+    fn xid_visibility_remediation_matches_the_shipped_compose_entry() {
+        let root = FakeRoot::new("xid-remediation");
+        let c = check_xid_visibility(&root.env(true, ""));
+        assert_eq!(
+            c.status, SKIP,
+            "no dev/kmsg fixture, so this is the skip arm"
+        );
+        assert!(
+            c.remediation.contains("/dev/kmsg:/dev/kmsg:r"),
+            "remediation must name the device entry verbatim: {c:?}"
+        );
+        assert!(
+            !c.remediation.contains("/dev/kmsg:/dev/kmsg:ro"),
+            "must never hand out the `:ro` form — Compose rejects it under `devices:`: {c:?}"
+        );
+        assert!(
+            c.remediation.contains("SYSLOG"),
+            "the device alone is EPERM under dmesg_restrict=1: {c:?}"
         );
     }
 

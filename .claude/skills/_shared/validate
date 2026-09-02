@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# validate — self-test for the shared quasar-skills library.
+#
+#   validate                   # offline checks
+#   validate --live ROLE|HOST  # additionally prove q_ssh reaches that host
+#
+# Exit: 0 all pass, non-zero on first failure.
+set -euo pipefail
+
+SHARED_DIR="$(cd "$(dirname "$0")" && pwd)"
+LIVE_TARGET=""
+[ "${1:-}" = "--live" ] && LIVE_TARGET="${2:?--live needs a role or host name}"
+
+fail() { printf 'FAIL  %s\n' "$*" >&2; exit 1; }
+pass() { printf 'PASS  %s\n' "$*"; }
+
+# shellcheck source=/dev/null
+source "$SHARED_DIR/lib.sh"
+
+# 1. hosts.json is schema v2: normalized hosts + a roles map, no legacy top-level hosts
+python3 -c "
+import json,sys
+c=json.load(open('$SHARED_DIR/hosts.json'))
+assert c.get('_schema','').startswith('quasar-skills/hosts@2'), 'missing/old _schema marker'
+assert 'hosts' in c and c['hosts'], 'no hosts section'
+assert 'roles' in c and c['roles'], 'no roles section'
+for name, h in c['hosts'].items():
+    assert 'dir' in h, name + ' has no dir'
+    assert ('ssh_alias' in h) or ('ssh_host' in h), name + ' has no usable ssh form'
+    assert h.get('gpu') in ('nvidia','amd','intel','none'), name + ' has a bad gpu value'
+    assert isinstance(h.get('notes', []), list), name + ' notes must be a list'
+for role, host in c['roles'].items():
+    if role.startswith('_'): continue
+    assert host in c['hosts'], 'role %s -> unknown host %s' % (role, host)
+legacy = [k for k,v in c.items()
+          if isinstance(v, dict) and k not in ('hosts','roles','harness','netem')
+          and ({'ssh','ssh_host','ssh_alias','dir'} & set(v))]
+assert not legacy, 'legacy top-level host blocks still present: %s' % legacy
+" || fail "hosts.json schema invalid"
+pass "hosts.json schema v2 (roles + normalized hosts, no legacy blocks)"
+
+# 2. hosts.example.json parses and documents the same schema
+python3 -c "
+import json
+c=json.load(open('$SHARED_DIR/hosts.example.json'))
+assert c.get('_schema','').startswith('quasar-skills/hosts@2')
+assert c['roles'] and c['hosts'] and '_field_reference' in c and '_roles_vocabulary' in c
+for role, host in c['roles'].items():
+    if not role.startswith('_'):
+        assert host in c['hosts'], 'example role %s -> unknown host' % role
+" || fail "hosts.example.json invalid"
+pass "hosts.example.json documents the schema"
+
+# 3. role-derived exports exist
+[ -n "${QUASAR_GPU_HOST:-}" ] || fail "QUASAR_GPU_HOST export missing (is the gpu-test role bound?)"
+[ -n "${QUASAR_GPU_DIR:-}" ]  || fail "QUASAR_GPU_DIR export missing"
+[ -n "${QUASAR_GPU_SSH:-}" ]  || fail "QUASAR_GPU_SSH export missing"
+pass "role-derived env exports"
+
+# 4. q_hosts / q_roles list everything configured
+listed="$(q_hosts | sort | tr '\n' ' ')"
+expected="$(python3 -c "
+import json
+print(' '.join(sorted(json.load(open('$SHARED_DIR/hosts.json'))['hosts'])) + ' ')
+")"
+[ "$listed" = "$expected" ] || fail "q_hosts returned '$listed', expected '$expected'"
+[ -n "$(q_roles)" ] || fail "q_roles returned nothing"
+pass "q_hosts / q_roles"
+
+# 5. every configured role resolves to a host, and the default role resolves
+for r in $(q_roles); do
+  [ -n "$(q_resolve "$r")" ] || fail "role '$r' does not resolve"
+done
+[ -n "$(q_default_host)" ] || fail "default role '$QUASAR_DEFAULT_ROLE' does not resolve"
+pass "role resolution (default role: $QUASAR_DEFAULT_ROLE -> $(q_default_host))"
+
+# 6. q_host_cfg reads a field, expands ~, and accepts a role name
+for h in $(q_hosts); do
+  [ -n "$(q_host_cfg "$h" dir)" ] || fail "q_host_cfg $h dir is empty"
+  key="$(q_host_cfg "$h" ssh_key)"
+  case "$key" in "~"*) fail "q_host_cfg did not expand ~ for $h" ;; esac
+done
+[ "$(q_host_cfg "$QUASAR_DEFAULT_ROLE" dir)" = "$(q_host_cfg "$(q_default_host)" dir)" ] \
+  || fail "q_host_cfg by role != by host name"
+pass "q_host_cfg (fields, ~ expansion, role names)"
+
+# 7. absent key is empty, not an error
+[ -z "$(q_host_cfg "$(q_hosts | head -1)" definitely_not_a_key)" ] \
+  || fail "q_host_cfg should return empty for an absent key"
+pass "q_host_cfg absent key"
+
+# 8. non-host sections still readable (harness creds removed for #399 — qses
+# now mints per-run creds via `make agent-creds` instead of a shared account)
+[ -n "$(q_cfg netem mild)" ]     || fail "q_cfg netem mild empty"
+pass "q_cfg sections (netem)"
+
+# 9. unknown host fails loudly rather than silently
+if q_ssh __no_such_host__ true 2>/dev/null; then
+  fail "q_ssh accepted an unknown host"
+fi
+if q_resolve __no_such_host__ >/dev/null 2>&1; then
+  fail "q_resolve accepted an unknown host"
+fi
+pass "unknown host/role rejected"
+
+# 10. ssh prefixes are non-empty and headless (an agent prompt can never block a run)
+for h in $(q_hosts); do
+  p="$(q_ssh_prefix "$h")"
+  [ -n "$p" ] || fail "q_ssh_prefix $h empty"
+  case "$p" in
+    *" -i "*) case "$p" in *IdentityAgent=none*) ;; *) fail "$h uses a key without IdentityAgent=none" ;; esac ;;
+  esac
+done
+pass "q_ssh_prefix"
+
+# The deploy-only guard, unit-tested where it lives. Every skill calls this one
+# implementation; each skill's own validate then proves it is WIRED to that
+# skill's write verbs. Run against the synthetic fleet, not the operator's.
+(
+  export QUASAR_HOSTS_JSON="$SHARED_DIR/fixtures/hosts.three-role.json"
+
+  q_has_role deploy-only deploy-only  || fail "q_has_role: deploy-only role not recognised"
+  q_has_role fixture-prod deploy-only || fail "q_has_role: host name not accepted for a role"
+  ! q_has_role gpu-test deploy-only   || fail "q_has_role: gpu-test wrongly reported deploy-only"
+
+  # destructive: refused even when the caller named the host (explicit=1).
+  out="$( (q_guard_mutating tool deploy-only 1 wipe destructive) 2>&1 || true)"
+  case "$out" in *"no destructive operations"*) ;;
+    *) fail "q_guard_mutating: destructive verb not refused: $out" ;; esac
+
+  # mutating: refused when the host was NOT named, allowed when it was.
+  out="$( (q_guard_mutating tool deploy-only 0 poke) 2>&1 || true)"
+  case "$out" in *"pass --host"*) ;;
+    *) fail "q_guard_mutating: implicit mutating verb not gated: $out" ;; esac
+  out="$( (q_guard_mutating tool deploy-only 1 poke) 2>&1 || true)"
+  [ -z "$out" ] || fail "q_guard_mutating: explicit mutating verb was refused: $out"
+
+  # and it says nothing at all about a host that holds no deploy-only role.
+  out="$( (q_guard_mutating tool gpu-test 0 wipe destructive) 2>&1 || true)"
+  [ -z "$out" ] || fail "q_guard_mutating: fired on a non-deploy-only host: $out"
+
+  # exit status is 2 — the usage-error convention every skill script uses.
+  rc=0; (q_guard_mutating tool deploy-only 1 wipe destructive) >/dev/null 2>&1 || rc=$?
+  [ "$rc" = 2 ] || fail "q_guard_mutating: refusal exited $rc, expected 2"
+) || exit 1
+pass "q_has_role / q_guard_mutating (deploy-only contract)"
+
+if [ -n "$LIVE_TARGET" ]; then
+  out="$(q_ssh "$LIVE_TARGET" 'echo reachable')" || fail "q_ssh $LIVE_TARGET failed"
+  [ "$out" = "reachable" ] || fail "q_ssh $LIVE_TARGET returned '$out'"
+  pass "q_ssh --live $LIVE_TARGET"
+fi
+
+printf '\nshared lib: all checks passed\n'

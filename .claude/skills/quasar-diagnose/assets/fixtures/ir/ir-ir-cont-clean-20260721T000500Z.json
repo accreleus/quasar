@@ -1,0 +1,1197 @@
+{
+  "meta": {
+    "host": "tower",
+    "app": "NV Bench Ball",
+    "profile": "1080p60",
+    "session": "sess-ir-cont-clean",
+    "started": 1753000300,
+    "duration_s": 60,
+    "n_samples": 12,
+    "interval_s": 5
+  },
+  "samples": [
+    {
+      "ts_unix_s": 1753000300,
+      "bundle": {
+        "trace": {
+          "app": "NV Bench Ball",
+          "profile_id": "1080p60",
+          "session_id": "sess-ir-cont-clean"
+        },
+        "window": {
+          "from_ms": 1753000000000,
+          "to_ms": 1753000006000
+        },
+        "clock": {
+          "unmeasured": true
+        },
+        "series": {
+          "client.present_interval_sd_ms": [
+            [
+              1753000000000,
+              4.08
+            ]
+          ],
+          "encoder.encode_ms": [
+            [
+              1753000000000,
+              2.18
+            ]
+          ],
+          "encoder.fps": [
+            [
+              1753000000000,
+              58.37
+            ]
+          ],
+          "network.rtt_ms": [
+            [
+              1753000000000,
+              19.76
+            ]
+          ],
+          "abr.setpoint_kbps": [
+            [
+              1753000000000,
+              8287.71
+            ]
+          ]
+        },
+        "events": {},
+        "derived_windows": {
+          "hitches": [],
+          "abr_downshifts": [],
+          "encoder_saturation": [],
+          "likely_network_congestion": []
+        },
+        "classifier": {
+          "verdict": "unknown",
+          "evidence": [
+            "synthetic fixture evidence for unknown"
+          ]
+        }
+      }
+    },
+    {
+      "ts_unix_s": 1753000305,
+      "bundle": {
+        "trace": {
+          "app": "NV Bench Ball",
+          "profile_id": "1080p60",
+          "session_id": "sess-ir-cont-clean"
+        },
+        "window": {
+          "from_ms": 1753000005000,
+          "to_ms": 1753000011000
+        },
+        "clock": {
+          "unmeasured": true
+        },
+        "series": {
+          "client.present_interval_sd_ms": [
+            [
+              1753000005000,
+              4.08
+            ]
+          ],
+          "encoder.encode_ms": [
+            [
+              1753000005000,
+              1.93
+            ]
+          ],
+          "encoder.fps": [
+            [
+              1753000005000,
+              61.01
+            ]
+          ],
+          "network.rtt_ms": [
+            [
+              1753000005000,
+              15.06
+            ]
+          ],
+          "abr.setpoint_kbps": [
+            [
+              1753000005000,
+              7705.85
+            ]
+          ]
+        },
+        "events": {},
+        "derived_windows": {
+          "hitches": [],
+          "abr_downshifts": [],
+          "encoder_saturation": [],
+          "likely_network_congestion": []
+        },
+        "classifier": {
+          "verdict": "unknown",
+          "evidence": [
+            "synthetic fixture evidence for unknown"
+          ]
+        }
+      }
+    },
+    {
+      "ts_unix_s": 1753000310,
+      "bundle": {
+        "trace": {
+          "app": "NV Bench Ball",
+          "profile_id": "1080p60",
+          "session_id": "sess-ir-cont-clean"
+        },
+        "window": {
+          "from_ms": 1753000010000,
+          "to_ms": 1753000016000
+        },
+        "clock": {
+          "unmeasured": true
+        },
+        "series": {
+          "client.present_interval_sd_ms": [
+            [
+              1753000010000,
+              6.94
+            ]
+          ],
+          "encoder.encode_ms": [
+            [
+              1753000010000,
+              2.14
+            ]
+          ],
+          "encoder.fps": [
+            [
+              1753000010000,
+              59.84
+            ]
+          ],
+          "network.rtt_ms": [
+            [
+              1753000010000,
+              18.94
+            ]
+          ],
+          "abr.setpoint_kbps": [
+            [
+              1753000010000,
+              8246.0
+            ]
+          ]
+        },
+        "events": {},
+        "derived_windows": {
+          "hitches": [],
+          "abr_downshifts": [],
+          "encoder_saturation": [],
+          "likely_network_congestion": []
+        },
+        "classifier": {
+          "verdict": "unknown",
+          "evidence": [
+            "synthetic fixture evidence for unknown"
+          ]
+        }
+      }
+    },
+    {
+      "ts_unix_s": 1753000315,
+      "bundle": {
+        "trace": {
+          "app": "NV Bench Ball",
+          "profile_id": "1080p60",
+          "session_id": "sess-ir-cont-clean"
+        },
+        "window": {
+          "from_ms": 1753000015000,
+          "to_ms": 1753000021000
+        },
+        "clock": {
+          "unmeasured": true
+        },
+        "series": {
+          "client.present_interval_sd_ms": [
+            [
+              1753000015000,
+              4.48
+            ]
+          ],
+          "encoder.encode_ms": [
+            [
+              1753000015000,
+              1.85
+            ]
+          ],
+          "encoder.fps": [
+            [
+              1753000015000,
+              59.59
+            ]
+          ],
+          "network.rtt_ms": [
+            [
+              1753000015000,
+              16.48
+            ]
+          ],
+          "abr.setpoint_kbps": [
+            [
+              1753000015000,
+              7973.62
+            ]
+          ]
+        },
+        "events": {},
+        "derived_windows": {
+          "hitches": [],
+          "abr_downshifts": [],
+          "encoder_saturation": [],
+          "likely_network_congestion": []
+        },
+        "classifier": {
+          "verdict": "unknown",
+          "evidence": [
+            "synthetic fixture evidence for unknown"
+          ]
+        }
+      }
+    },
+    {
+      "ts_unix_s": 1753000320,
+      "bundle": {
+        "trace": {
+          "app": "NV Bench Ball",
+          "profile_id": "1080p60",
+          "session_id": "sess-ir-cont-clean"
+        },
+        "window": {
+          "from_ms": 1753000020000,
+          "to_ms": 1753000026000
+        },
+        "clock": {
+          "unmeasured": true
+        },
+        "series": {
+          "client.present_interval_sd_ms": [
+            [
+              1753000020000,
+              6.26
+            ]
+          ],
+          "encoder.encode_ms": [
+            [
+              1753000020000,
+              2.21
+            ]
+          ],
+          "encoder.fps": [
+            [
+              1753000020000,
+              62.9
+            ]
+          ],
+          "network.rtt_ms": [
+            [
+              1753000020000,
+              14.27
+            ]
+          ],
+          "abr.setpoint_kbps": [
+            [
+              1753000020000,
+              7922.1
+            ]
+          ]
+        },
+        "events": {},
+        "derived_windows": {
+          "hitches": [],
+          "abr_downshifts": [],
+          "encoder_saturation": [],
+          "likely_network_congestion": []
+        },
+        "classifier": {
+          "verdict": "unknown",
+          "evidence": [
+            "synthetic fixture evidence for unknown"
+          ]
+        }
+      }
+    },
+    {
+      "ts_unix_s": 1753000325,
+      "bundle": {
+        "trace": {
+          "app": "NV Bench Ball",
+          "profile_id": "1080p60",
+          "session_id": "sess-ir-cont-clean"
+        },
+        "window": {
+          "from_ms": 1753000025000,
+          "to_ms": 1753000031000
+        },
+        "clock": {
+          "unmeasured": true
+        },
+        "series": {
+          "client.present_interval_sd_ms": [
+            [
+              1753000025000,
+              4.97
+            ]
+          ],
+          "encoder.encode_ms": [
+            [
+              1753000025000,
+              2.33
+            ]
+          ],
+          "encoder.fps": [
+            [
+              1753000025000,
+              58.49
+            ]
+          ],
+          "network.rtt_ms": [
+            [
+              1753000025000,
+              14.89
+            ]
+          ],
+          "abr.setpoint_kbps": [
+            [
+              1753000025000,
+              7958.89
+            ]
+          ]
+        },
+        "events": {},
+        "derived_windows": {
+          "hitches": [],
+          "abr_downshifts": [],
+          "encoder_saturation": [],
+          "likely_network_congestion": []
+        },
+        "classifier": {
+          "verdict": "unknown",
+          "evidence": [
+            "synthetic fixture evidence for unknown"
+          ]
+        }
+      }
+    },
+    {
+      "ts_unix_s": 1753000330,
+      "bundle": {
+        "trace": {
+          "app": "NV Bench Ball",
+          "profile_id": "1080p60",
+          "session_id": "sess-ir-cont-clean"
+        },
+        "window": {
+          "from_ms": 1753000030000,
+          "to_ms": 1753000036000
+        },
+        "clock": {
+          "unmeasured": true
+        },
+        "series": {
+          "client.present_interval_sd_ms": [
+            [
+              1753000030000,
+              5.24
+            ]
+          ],
+          "encoder.encode_ms": [
+            [
+              1753000030000,
+              1.96
+            ]
+          ],
+          "encoder.fps": [
+            [
+              1753000030000,
+              58.5
+            ]
+          ],
+          "network.rtt_ms": [
+            [
+              1753000030000,
+              19.88
+            ]
+          ],
+          "abr.setpoint_kbps": [
+            [
+              1753000030000,
+              7954.5
+            ]
+          ]
+        },
+        "events": {},
+        "derived_windows": {
+          "hitches": [],
+          "abr_downshifts": [],
+          "encoder_saturation": [],
+          "likely_network_congestion": []
+        },
+        "classifier": {
+          "verdict": "unknown",
+          "evidence": [
+            "synthetic fixture evidence for unknown"
+          ]
+        }
+      }
+    },
+    {
+      "ts_unix_s": 1753000335,
+      "bundle": {
+        "trace": {
+          "app": "NV Bench Ball",
+          "profile_id": "1080p60",
+          "session_id": "sess-ir-cont-clean"
+        },
+        "window": {
+          "from_ms": 1753000035000,
+          "to_ms": 1753000041000
+        },
+        "clock": {
+          "unmeasured": true
+        },
+        "series": {
+          "client.present_interval_sd_ms": [
+            [
+              1753000035000,
+              6.69
+            ]
+          ],
+          "encoder.encode_ms": [
+            [
+              1753000035000,
+              2.13
+            ]
+          ],
+          "encoder.fps": [
+            [
+              1753000035000,
+              57.3
+            ]
+          ],
+          "network.rtt_ms": [
+            [
+              1753000035000,
+              20.4
+            ]
+          ],
+          "abr.setpoint_kbps": [
+            [
+              1753000035000,
+              8268.82
+            ]
+          ]
+        },
+        "events": {},
+        "derived_windows": {
+          "hitches": [],
+          "abr_downshifts": [],
+          "encoder_saturation": [],
+          "likely_network_congestion": []
+        },
+        "classifier": {
+          "verdict": "unknown",
+          "evidence": [
+            "synthetic fixture evidence for unknown"
+          ]
+        }
+      }
+    },
+    {
+      "ts_unix_s": 1753000340,
+      "bundle": {
+        "trace": {
+          "app": "NV Bench Ball",
+          "profile_id": "1080p60",
+          "session_id": "sess-ir-cont-clean"
+        },
+        "window": {
+          "from_ms": 1753000040000,
+          "to_ms": 1753000046000
+        },
+        "clock": {
+          "unmeasured": true
+        },
+        "series": {
+          "client.present_interval_sd_ms": [
+            [
+              1753000040000,
+              7.05
+            ]
+          ],
+          "encoder.encode_ms": [
+            [
+              1753000040000,
+              2.37
+            ]
+          ],
+          "encoder.fps": [
+            [
+              1753000040000,
+              62.09
+            ]
+          ],
+          "network.rtt_ms": [
+            [
+              1753000040000,
+              14.73
+            ]
+          ],
+          "abr.setpoint_kbps": [
+            [
+              1753000040000,
+              7988.51
+            ]
+          ]
+        },
+        "events": {},
+        "derived_windows": {
+          "hitches": [],
+          "abr_downshifts": [],
+          "encoder_saturation": [],
+          "likely_network_congestion": []
+        },
+        "classifier": {
+          "verdict": "unknown",
+          "evidence": [
+            "synthetic fixture evidence for unknown"
+          ]
+        }
+      }
+    },
+    {
+      "ts_unix_s": 1753000345,
+      "bundle": {
+        "trace": {
+          "app": "NV Bench Ball",
+          "profile_id": "1080p60",
+          "session_id": "sess-ir-cont-clean"
+        },
+        "window": {
+          "from_ms": 1753000045000,
+          "to_ms": 1753000051000
+        },
+        "clock": {
+          "unmeasured": true
+        },
+        "series": {
+          "client.present_interval_sd_ms": [
+            [
+              1753000045000,
+              4.56
+            ]
+          ],
+          "encoder.encode_ms": [
+            [
+              1753000045000,
+              2.04
+            ]
+          ],
+          "encoder.fps": [
+            [
+              1753000045000,
+              57.35
+            ]
+          ],
+          "network.rtt_ms": [
+            [
+              1753000045000,
+              16.18
+            ]
+          ],
+          "abr.setpoint_kbps": [
+            [
+              1753000045000,
+              8388.25
+            ]
+          ]
+        },
+        "events": {},
+        "derived_windows": {
+          "hitches": [],
+          "abr_downshifts": [],
+          "encoder_saturation": [],
+          "likely_network_congestion": []
+        },
+        "classifier": {
+          "verdict": "unknown",
+          "evidence": [
+            "synthetic fixture evidence for unknown"
+          ]
+        }
+      }
+    },
+    {
+      "ts_unix_s": 1753000350,
+      "bundle": {
+        "trace": {
+          "app": "NV Bench Ball",
+          "profile_id": "1080p60",
+          "session_id": "sess-ir-cont-clean"
+        },
+        "window": {
+          "from_ms": 1753000050000,
+          "to_ms": 1753000056000
+        },
+        "clock": {
+          "unmeasured": true
+        },
+        "series": {
+          "client.present_interval_sd_ms": [
+            [
+              1753000050000,
+              4.73
+            ]
+          ],
+          "encoder.encode_ms": [
+            [
+              1753000050000,
+              2.28
+            ]
+          ],
+          "encoder.fps": [
+            [
+              1753000050000,
+              59.73
+            ]
+          ],
+          "network.rtt_ms": [
+            [
+              1753000050000,
+              16.48
+            ]
+          ],
+          "abr.setpoint_kbps": [
+            [
+              1753000050000,
+              8365.85
+            ]
+          ]
+        },
+        "events": {},
+        "derived_windows": {
+          "hitches": [],
+          "abr_downshifts": [],
+          "encoder_saturation": [],
+          "likely_network_congestion": []
+        },
+        "classifier": {
+          "verdict": "unknown",
+          "evidence": [
+            "synthetic fixture evidence for unknown"
+          ]
+        }
+      }
+    },
+    {
+      "ts_unix_s": 1753000355,
+      "bundle": {
+        "trace": {
+          "app": "NV Bench Ball",
+          "profile_id": "1080p60",
+          "session_id": "sess-ir-cont-clean"
+        },
+        "window": {
+          "from_ms": 1753000055000,
+          "to_ms": 1753000061000
+        },
+        "clock": {
+          "unmeasured": true
+        },
+        "series": {
+          "client.present_interval_sd_ms": [
+            [
+              1753000055000,
+              7.13
+            ]
+          ],
+          "encoder.encode_ms": [
+            [
+              1753000055000,
+              2.14
+            ]
+          ],
+          "encoder.fps": [
+            [
+              1753000055000,
+              61.31
+            ]
+          ],
+          "network.rtt_ms": [
+            [
+              1753000055000,
+              14.65
+            ]
+          ],
+          "abr.setpoint_kbps": [
+            [
+              1753000055000,
+              7837.37
+            ]
+          ]
+        },
+        "events": {},
+        "derived_windows": {
+          "hitches": [],
+          "abr_downshifts": [],
+          "encoder_saturation": [],
+          "likely_network_congestion": []
+        },
+        "classifier": {
+          "verdict": "unknown",
+          "evidence": [
+            "synthetic fixture evidence for unknown"
+          ]
+        }
+      }
+    }
+  ],
+  "final_bundle": {
+    "trace": {
+      "app": "NV Bench Ball",
+      "profile_id": "1080p60",
+      "session_id": "sess-ir-cont-clean"
+    },
+    "window": {
+      "from_ms": 1753000000000,
+      "to_ms": 1753000120000
+    },
+    "clock": {
+      "unmeasured": true
+    },
+    "series": {
+      "client.present_interval_sd_ms": [
+        [
+          1753000000000,
+          7.05
+        ],
+        [
+          1753000006000,
+          5.76
+        ],
+        [
+          1753000012000,
+          5.64
+        ],
+        [
+          1753000018000,
+          6.32
+        ],
+        [
+          1753000024000,
+          4.04
+        ],
+        [
+          1753000030000,
+          5.78
+        ],
+        [
+          1753000036000,
+          5.51
+        ],
+        [
+          1753000042000,
+          6.66
+        ],
+        [
+          1753000048000,
+          4.37
+        ],
+        [
+          1753000054000,
+          7.02
+        ],
+        [
+          1753000060000,
+          4.11
+        ],
+        [
+          1753000066000,
+          4.46
+        ],
+        [
+          1753000072000,
+          5.81
+        ],
+        [
+          1753000078000,
+          6.08
+        ],
+        [
+          1753000084000,
+          4.63
+        ],
+        [
+          1753000090000,
+          4.25
+        ],
+        [
+          1753000096000,
+          6.79
+        ],
+        [
+          1753000102000,
+          4.66
+        ],
+        [
+          1753000108000,
+          5.81
+        ],
+        [
+          1753000114000,
+          5.89
+        ]
+      ],
+      "encoder.encode_ms": [
+        [
+          1753000000000,
+          2.05
+        ],
+        [
+          1753000006000,
+          2.15
+        ],
+        [
+          1753000012000,
+          2.11
+        ],
+        [
+          1753000018000,
+          2.37
+        ],
+        [
+          1753000024000,
+          1.91
+        ],
+        [
+          1753000030000,
+          2.24
+        ],
+        [
+          1753000036000,
+          1.94
+        ],
+        [
+          1753000042000,
+          2.03
+        ],
+        [
+          1753000048000,
+          2.21
+        ],
+        [
+          1753000054000,
+          1.97
+        ],
+        [
+          1753000060000,
+          1.98
+        ],
+        [
+          1753000066000,
+          2.26
+        ],
+        [
+          1753000072000,
+          1.83
+        ],
+        [
+          1753000078000,
+          2.07
+        ],
+        [
+          1753000084000,
+          2.41
+        ],
+        [
+          1753000090000,
+          2.41
+        ],
+        [
+          1753000096000,
+          1.83
+        ],
+        [
+          1753000102000,
+          1.92
+        ],
+        [
+          1753000108000,
+          1.95
+        ],
+        [
+          1753000114000,
+          2.37
+        ]
+      ],
+      "encoder.fps": [
+        [
+          1753000000000,
+          62.29
+        ],
+        [
+          1753000006000,
+          62.28
+        ],
+        [
+          1753000012000,
+          59.22
+        ],
+        [
+          1753000018000,
+          57.95
+        ],
+        [
+          1753000024000,
+          62.0
+        ],
+        [
+          1753000030000,
+          61.22
+        ],
+        [
+          1753000036000,
+          60.67
+        ],
+        [
+          1753000042000,
+          62.92
+        ],
+        [
+          1753000048000,
+          60.92
+        ],
+        [
+          1753000054000,
+          57.05
+        ],
+        [
+          1753000060000,
+          61.9
+        ],
+        [
+          1753000066000,
+          58.8
+        ],
+        [
+          1753000072000,
+          60.98
+        ],
+        [
+          1753000078000,
+          62.63
+        ],
+        [
+          1753000084000,
+          57.81
+        ],
+        [
+          1753000090000,
+          57.69
+        ],
+        [
+          1753000096000,
+          57.64
+        ],
+        [
+          1753000102000,
+          60.32
+        ],
+        [
+          1753000108000,
+          58.63
+        ],
+        [
+          1753000114000,
+          60.63
+        ]
+      ],
+      "network.rtt_ms": [
+        [
+          1753000000000,
+          18.48
+        ],
+        [
+          1753000006000,
+          14.98
+        ],
+        [
+          1753000012000,
+          17.91
+        ],
+        [
+          1753000018000,
+          15.4
+        ],
+        [
+          1753000024000,
+          16.92
+        ],
+        [
+          1753000030000,
+          19.76
+        ],
+        [
+          1753000036000,
+          19.35
+        ],
+        [
+          1753000042000,
+          14.23
+        ],
+        [
+          1753000048000,
+          16.48
+        ],
+        [
+          1753000054000,
+          15.48
+        ],
+        [
+          1753000060000,
+          13.62
+        ],
+        [
+          1753000066000,
+          18.84
+        ],
+        [
+          1753000072000,
+          17.93
+        ],
+        [
+          1753000078000,
+          15.38
+        ],
+        [
+          1753000084000,
+          18.64
+        ],
+        [
+          1753000090000,
+          17.35
+        ],
+        [
+          1753000096000,
+          16.51
+        ],
+        [
+          1753000102000,
+          13.67
+        ],
+        [
+          1753000108000,
+          14.11
+        ],
+        [
+          1753000114000,
+          19.61
+        ]
+      ],
+      "abr.setpoint_kbps": [
+        [
+          1753000000000,
+          8323.14
+        ],
+        [
+          1753000006000,
+          8036.47
+        ],
+        [
+          1753000012000,
+          8267.68
+        ],
+        [
+          1753000018000,
+          8066.01
+        ],
+        [
+          1753000024000,
+          7718.48
+        ],
+        [
+          1753000030000,
+          7701.96
+        ],
+        [
+          1753000036000,
+          7846.61
+        ],
+        [
+          1753000042000,
+          8319.19
+        ],
+        [
+          1753000048000,
+          8236.9
+        ],
+        [
+          1753000054000,
+          8288.56
+        ],
+        [
+          1753000060000,
+          8319.14
+        ],
+        [
+          1753000066000,
+          7768.06
+        ],
+        [
+          1753000072000,
+          7799.62
+        ],
+        [
+          1753000078000,
+          7682.23
+        ],
+        [
+          1753000084000,
+          8224.09
+        ],
+        [
+          1753000090000,
+          8307.31
+        ],
+        [
+          1753000096000,
+          7925.1
+        ],
+        [
+          1753000102000,
+          8096.53
+        ],
+        [
+          1753000108000,
+          7723.64
+        ],
+        [
+          1753000114000,
+          8343.9
+        ]
+      ]
+    },
+    "events": {},
+    "derived_windows": {
+      "hitches": [],
+      "abr_downshifts": [],
+      "encoder_saturation": [],
+      "likely_network_congestion": []
+    },
+    "classifier": {
+      "verdict": "unknown",
+      "evidence": [
+        "synthetic fixture evidence for unknown"
+      ]
+    }
+  }
+}

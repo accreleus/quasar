@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# qdiag-sample — soak a Quasar session by polling the diagnostic bundle at regular
+#                intervals and writing a single run file for qdiag-compare.
+#
+# Usage:
+#   qdiag-sample [--host ROLE|NAME] [--session latest|<UUID>]
+#                [--interval N] [--duration M] [--out <dir>]
+#
+#   qdiag-sample                                   # 120s soak on the gpu-test host
+#   qdiag-sample --host aux-infra --duration 60    # shorter soak elsewhere
+#   qdiag-sample --interval 10 --out my-runs/      # custom cadence + output dir
+#
+# Output: <out>/<ISO-ts>-<host>-<session-prefix>.json
+#         Also prints run-completeness validation at the end.
+#
+# The run file format:
+#   {
+#     "meta":  {host, app, profile, session, started, duration, n_samples, interval},
+#     "samples": [{ts_unix_s, bundle}, ...],
+#     "final_bundle": <last bundle>
+#   }
+set -euo pipefail
+
+SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+source "$(dirname "$0")/../../_shared/lib.sh"
+
+# ── Defaults from config ──────────────────────────────────────────────────────
+_cfg_val() {
+  python3 - "$SKILL_DIR/config.json" "$1" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))
+# path like "sampling.interval_s"
+keys = sys.argv[2].split(".")
+v = c
+for k in keys:
+    v = v[k]
+print(v)
+PY
+}
+
+DEFAULT_INTERVAL="$(_cfg_val sampling.interval_s)"
+DEFAULT_DURATION="$(_cfg_val sampling.duration_s)"
+DEFAULT_RUNS_DIR="$SKILL_DIR/$(_cfg_val runs_dir)"
+
+# ── Args ──────────────────────────────────────────────────────────────────────
+HOST="$QUASAR_DEFAULT_ROLE"
+SESSION_TARGET="latest"
+INTERVAL="$DEFAULT_INTERVAL"
+DURATION="$DEFAULT_DURATION"
+OUT_DIR="$DEFAULT_RUNS_DIR"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --host)     HOST="$2"; shift 2 ;;
+    --session)  SESSION_TARGET="$2"; shift 2 ;;
+    --interval) INTERVAL="$2"; shift 2 ;;
+    --duration) DURATION="$2"; shift 2 ;;
+    --out)      OUT_DIR="$2"; shift 2 ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+mkdir -p "$OUT_DIR"
+
+# ── Host resolution ──────────────────────────────────────────────────────────
+# --host takes a ROLE (gpu-test, aux-infra, ...) or a literal host name.
+HOST="$(q_resolve "$HOST")" || {
+  echo "Unknown host or role '$HOST' (hosts: $(q_hosts | tr '\n' ' ')| roles: $(q_roles | tr '\n' ' '))" >&2
+  exit 1
+}
+# The stack's own local URL comes from _shared/hosts.json — the single host
+# registry. config.json carries ANALYSIS facts only; it no longer duplicates
+# host addressing (that copy went stale and left devbox unusable).
+API="$(q_host_cfg "$HOST" api)"
+[ -n "$API" ] || { echo "hosts.json has no api for host '$HOST'" >&2; exit 1; }
+
+# THE admin-bearer ladder. Nothing in this skill mints credentials.
+REPO_ROOT="$(cd "$SKILL_DIR/../../.." && pwd)"
+TOKEN="$(DX_HOSTS_JSON="$QUASAR_HOSTS_JSON" bash "$REPO_ROOT/scripts/dx/admin_token.sh" --host "$HOST" --quiet)" || TOKEN=""
+[ -n "$TOKEN" ] || {
+  echo "qdiag-sample: no admin bearer for $HOST. Next: scripts/dx/admin_token.sh --host $HOST --fresh" >&2
+  exit 2; }
+
+ssh_run() { q_ssh "$HOST" "$@"; }
+
+# ── Run the soak over SSH ────────────────────────────────────────────────────
+TS=$(date -u '+%Y%m%dT%H%M%SZ')
+OUTFILE="$OUT_DIR/${TS}-${HOST}-${SESSION_TARGET:0:8}.json"
+
+echo "qdiag-sample: host=$HOST session=$SESSION_TARGET interval=${INTERVAL}s duration=${DURATION}s"
+echo "  output: $OUTFILE"
+echo ""
+
+# The bearer goes over STDIN, ahead of the runner it belongs to.
+#
+# The previous comment here claimed it was "exported inside the remote shell,
+# not spliced into argv" — it was doing exactly the opposite. `ssh_run "QDIAG_
+# TOKEN='$TOKEN' ..."` makes the whole assignment the remote command STRING,
+# which is the sshd child's command line: `ps` on that host printed the admin
+# bearer for the length of a soak (up to several minutes).
+#
+# So: stdin carries one line (the token) followed by the runner's source. The
+# remote shell reads the first line into the environment — bash reads a pipe a
+# byte at a time precisely so a script can hand the rest of stdin to a child —
+# and python3 then reads the remainder as its program. Nothing secret is ever
+# an argument.
+{ printf '%s\n' "$TOKEN"; cat "$REPO_ROOT/scripts/dx/session_diagnose/sample_runner.py"; } \
+  | ssh_run "IFS= read -r QDIAG_TOKEN; export QDIAG_TOKEN; exec python3 /dev/stdin $SESSION_TARGET $HOST '$API' $INTERVAL $DURATION" \
+  > "$OUTFILE"
+
+# ── Validate completeness on the Mac side ────────────────────────────────────
+python3 - "$OUTFILE" "$SKILL_DIR/config.json" <<'PY'
+import json, math, sys
+run_path, cfg_path = sys.argv[1], sys.argv[2]
+run = json.load(open(run_path))
+cfg = json.load(open(cfg_path))
+
+meta    = run.get("meta", {})
+samples = run.get("samples", [])
+n       = len(samples)
+min_s   = cfg["sampling"]["min_samples"]
+req_dur = meta.get("duration_s", cfg["sampling"]["duration_s"])
+app     = meta.get("app", "?")
+profile = meta.get("profile", "?")
+
+print(f"Run file: {run_path}")
+print(f"  session: {meta.get('session', '?')}")
+print(f"  app:     {app}  profile: {profile}")
+print(f"  samples: {n}  (min required: {min_s})")
+
+ok = True
+if n < min_s:
+    print(f"  FAIL: only {n} sample(s) — run is degenerate (need {min_s})", file=sys.stderr)
+    ok = False
+
+if n >= 2:
+    span = samples[-1].get("ts_unix_s", 0) - samples[0].get("ts_unix_s", 0)
+    req_span = req_dur * 0.8
+    print(f"  span:    {span:.0f}s  (need {req_span:.0f}s = 80% of {req_dur}s)")
+    if span < req_span:
+        print(f"  WARN: span {span:.0f}s < {req_span:.0f}s required — results may be incomplete")
+
+if ok:
+    print("  completeness: PASS")
+    sys.exit(0)
+else:
+    sys.exit(1)
+PY
+
+echo ""
+echo "qdiag-sample done: $OUTFILE"

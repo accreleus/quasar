@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# validate — quasar-netem self-test.
+#
+#   validate     # offline checks only; no host is contacted, no qdisc is touched
+#
+# There was no self-test here until the deploy-only guard was added, which is
+# part of why the guard was missing: nothing asserted the contract for this
+# skill. Everything below runs against _shared/fixtures/hosts.three-role.json (a
+# synthetic fleet on RFC 5737 addresses) with `ssh` stubbed out, so it is safe on
+# any workstation.
+set -euo pipefail
+
+SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+QNETEM="$SKILL_DIR/scripts/qnetem"
+FIXTURE="$SKILL_DIR/../_shared/fixtures/hosts.three-role.json"
+
+PASSN=0; FAILN=0
+pass() { echo "  PASS  $*"; PASSN=$((PASSN+1)); }
+fail() { echo "  FAIL  $*" >&2; FAILN=$((FAILN+1)); }
+
+echo "quasar-netem self-test"
+
+# 1. syntax + executability
+[ -x "$QNETEM" ] && pass "qnetem is executable" || fail "qnetem is not executable"
+bash -n "$QNETEM" && pass "qnetem is bash-syntax clean" || fail "qnetem has syntax errors"
+bash -n "$0"      && pass "validate is bash-syntax clean" || fail "validate has syntax errors"
+
+# Nothing below may reach a network. An `ssh` that always fails also proves the
+# guard fires BEFORE the remote hop: a refusal message can only come from the
+# guard, never from a host.
+STUB_BIN="$(mktemp -d)"
+printf '#!/usr/bin/env bash\nexit 255\n' > "$STUB_BIN/ssh"
+chmod +x "$STUB_BIN/ssh"
+trap 'rm -rf "$STUB_BIN"' EXIT
+export PATH="$STUB_BIN:$PATH"
+export QUASAR_HOSTS_JSON="$FIXTURE"
+
+# 2. deploy-only contract: every shaping verb is refused, with no way to confirm.
+# `clear` is the sharpest case — it deletes the ingress qdisc on EVERY interface
+# and the root qdisc on the sender NIC, and it does not put back what was there.
+for v in bootstrap apply ingress sender sender-clear clear; do
+  case "$v" in
+    ingress) args=(198.51.100.99 mild) ;;
+    apply|sender) args=(mild) ;;
+    *) args=("") ;;   # bash 3.2: an empty array under `set -u` is unbound
+  esac
+  # Point BOTH roles at the deploy-only host: apply/ingress shape the impairment
+  # host, sender/sender-clear the sender host, and clear touches both.
+  out="$(QNETEM_IMPAIR_ROLE=deploy-only QNETEM_SENDER_ROLE=deploy-only \
+         "$QNETEM" "$v" "${args[@]}" 2>&1 || true)"
+  case "$out" in
+    *"no destructive operations"*) pass "'$v' refused on a deploy-only host" ;;
+    *) fail "'$v' not refused on a deploy-only host: $out" ;;
+  esac
+done
+
+# 3. the guard is targeted, not a blanket refusal: the roles this skill exists
+# for still get through it (and then die on the stubbed ssh, not on the guard).
+out="$("$QNETEM" apply mild 2>&1 || true)"
+case "$out" in
+  *"deploy-only role"*) fail "shaping wrongly refused on the aux-infra host: $out" ;;
+  *) pass "shaping still allowed on the aux-infra host" ;;
+esac
+
+# 4. read-only verbs are never gated.
+out="$(QNETEM_IMPAIR_ROLE=deploy-only QNETEM_SENDER_ROLE=deploy-only \
+       "$QNETEM" status 2>&1 || true)"
+case "$out" in
+  *"deploy-only role"*) fail "'status' (read-only) was refused on a deploy-only host" ;;
+  *) pass "read-only 'status' allowed on a deploy-only host" ;;
+esac
+
+# 5. named levels come from hosts.json, not from the script.
+grep -q 'q_cfg netem' "$QNETEM" \
+  && pass "netem levels read from hosts.json" \
+  || fail "netem levels are not host-config driven"
+
+echo ""
+echo "quasar-netem: $PASSN passed, $FAILN failed"
+[ "$FAILN" -eq 0 ]

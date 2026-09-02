@@ -26,8 +26,16 @@ The readiness checks are the useful part, because they report what the agent
 and still have no working encoder.
 
 Checks cover the render node, `/dev/uinput` write access, the managed home root,
-media reachability through the host firewall, and on NVIDIA the presence of the
-EGL and 32-bit GL components that a CUDA-only driver install leaves out.
+media reachability through the host firewall, whether GPU faults are visible, and
+on NVIDIA the presence of the EGL and 32-bit GL components that a CUDA-only driver
+install leaves out.
+
+`xid_visibility` is the odd one out: it reports whether the agent can read
+`/dev/kmsg`, which is where the kernel logs an NVIDIA Xid or an amdgpu fault. The
+generated compose passes that device read-only and grants `SYSLOG`, so the check
+passes on a stock install and a GPU fault turns up in the session trace. Where it
+is skipped, faults are still happening or not happening exactly as before — you
+just have to go and read the host's `dmesg` yourself to find one.
 
 A `media_reachability` warning names the scoped firewall rule the host is
 missing. See [Ports and endpoints](/quasar/reference/ports/#firewall).

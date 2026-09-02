@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# qdiag-report — generate the IR-period experiment HTML report from a set of
+#                run files + their sidecar cell-metadata files.
+#
+# Usage:
+#   qdiag-report <run1.json> [<run2.json> ...] --out <report.html> [--summary <file.md>]
+#
+#   qdiag-report qdiag-runs/ir-*.json --out reports/ir-period-2026-07-21.html \
+#                --summary my-summary.md
+#
+# Self-contained single HTML file (inline CSS/JS/SVG, no CDN, no external
+# assets — renders from a file:// open). The plain-language summary section is
+# INPUT (--summary), not generated — author it per run, then pass it here.
+# All logic lives in scripts/dx/session_diagnose/report_gen.py; this is a thin wrapper.
+set -euo pipefail
+
+SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+exec python3 "$(cd "$SKILL_DIR/../../.." && pwd)/scripts/dx/session_diagnose/report_gen.py" "$@"

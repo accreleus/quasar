@@ -159,7 +159,7 @@ ${certMount}    depends_on:
     image: \${QUASAR_AGENT_IMAGE:-${agentImage(a.gpu)}}
     entrypoint: ["/usr/local/bin/quasar-node-agent-entrypoint"]
     network_mode: host
-    cap_add: [NET_ADMIN]
+    cap_add: [NET_ADMIN, SYSLOG]
     init: true
     environment:
       CONTROL_PLANE_URL: ws://localhost:\${CONTROL_PORT:-8080}
@@ -184,6 +184,10 @@ ${certMount}    depends_on:
     devices:
       - /dev/dri
       - /dev/uinput
+      # Kernel ring buffer, read-only: GPU faults (NVIDIA Xid, amdgpu) reach the
+      # session trace. Needs CAP_SYSLOG above. Drop both lines on a kernel with
+      # no /dev/kmsg; the agent then reports xid_visibility: skip.
+      - /dev/kmsg:/dev/kmsg:r
     device_cgroup_rules:
       - 'c 13:* rmw'
     depends_on:

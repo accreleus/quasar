@@ -1,0 +1,261 @@
+{
+  "_comment": "quasar-diagnose — this skill's ANALYSIS facts and nothing else. Host addressing (ssh, dir, api, api_external, roles) lives ONLY in _shared/hosts.json; the per-host block that used to be duplicated here went stale (devbox was never added) and is gone. The classifier's verdict vocabulary is the CONTROL PLANE's — this file records the thresholds only, never a copy of the verdict enum to validate against.",
+  "bench_app": "Quasar Bench: Colour Ripple",
+  "endpoints": {
+    "login": "/v1/auth/login",
+    "sessions": "/v1/admin/sessions",
+    "bundle": "/v1/admin/sessions/{id}/diagnostic-bundle"
+  },
+  "classifier": {
+    "thresholds": {
+      "encode_budget_ms_60fps": 16.7,
+      "encoder_ceiling_ms": 16.0,
+      "hitch_sigma_ms": 18.0,
+      "congestion_rtt_p95_ms": 50.0,
+      "congestion_loss_delta": 5.0,
+      "host_fps_steady_p10": 50.0
+    },
+    "_source": "control-plane/internal/session/classifier.go constants: encoderCeilingMs=16.0, hitchSdThresholdMs=18.0, congestionRttP95Ms=50.0, congestionLossDelta=5.0, classifierMinHostFps=50.0"
+  },
+  "netem_shapes": [
+    {
+      "name": "clean",
+      "args": null,
+      "description": "No shaping — baseline ABR/playout events may not fire"
+    },
+    {
+      "name": "mild",
+      "args": "delay 20ms 2ms loss 0.5% rate 5000kbit",
+      "description": "20ms delay ±2ms, 0.5% loss, 5Mbps — recommended for ABR trigger"
+    },
+    {
+      "name": "moderate",
+      "args": "delay 40ms 10ms loss 1% rate 3500kbit",
+      "description": "40ms delay ±10ms, 1% loss, 3.5Mbps"
+    },
+    {
+      "name": "severe",
+      "args": "delay 60ms 15ms loss 2% rate 2400kbit",
+      "description": "60ms delay ±15ms, 2% loss, 2.4Mbps"
+    }
+  ],
+  "abr_modes": {
+    "on": {
+      "description": "ABR default-on (QUASAR_ABR unset / QUASAR_ABR=1)",
+      "env": {}
+    },
+    "off": {
+      "description": "ABR disabled",
+      "env": {
+        "QUASAR_ABR": "0",
+        "QUASAR_ABR_DISABLED": "1"
+      }
+    },
+    "smooth": {
+      "description": "encoder-aware, smoothness-biased ABR — the SHIPPED DEFAULT since SPT-10 (#346, 2026-06-27)",
+      "env": {
+        "QUASAR_ABR_MODE": "smooth"
+      }
+    },
+    "protective": {
+      "description": "the pre-SPT-10 one-step-down / EWMA-gated-up governor; the per-host revert",
+      "env": {
+        "QUASAR_ABR_MODE": "protective"
+      }
+    }
+  },
+  "sampling": {
+    "interval_s": 5,
+    "duration_s": 120,
+    "min_samples": 10
+  },
+  "runs_dir": "qdiag-runs",
+  "bundle_shape": {
+    "required_keys": [
+      "trace",
+      "window",
+      "clock",
+      "series",
+      "events",
+      "derived_windows",
+      "classifier"
+    ],
+    "classifier_required_keys": [
+      "verdict",
+      "evidence"
+    ],
+    "derived_windows_keys": [
+      "hitches",
+      "abr_downshifts",
+      "encoder_saturation",
+      "likely_network_congestion"
+    ],
+    "_source": "control-plane/internal/session/diagnostic_handler.go diagnosticBundleResp + classifier.go derivedWindows"
+  },
+  "ir_experiment": {
+    "_source": "docs/design/plans/2026-07-21-ir-period-experiment.md §2-4",
+    "_comment": "Rolling intra-refresh overhead vs recovery (Experiment 1). Fixed env applies to every cell; row env overrides QUASAR_INTRA_REFRESH{,_PERIOD} on top of it.",
+    "host": "gpu-test",
+    "app": "NV Bench Ball",
+    "profile": "1080p60",
+    "env_path": "deploy/.env",
+    "compose_files": [
+      "deploy/docker-compose.yml",
+      "deploy/docker-compose.nvidia.yml"
+    ],
+    "recreate_service": "quasar-node-agent",
+    "agent_container": "deploy-quasar-node-agent-1",
+    "env_keys_whitelist": [
+      "QUASAR_INTRA_REFRESH",
+      "QUASAR_INTRA_REFRESH_PERIOD"
+    ],
+    "fixed_env": {
+      "QUASAR_ENCODER": "vulkan",
+      "QUASAR_SLICES": "4",
+      "QUASAR_FEC_PERCENTAGE": "0"
+    },
+    "rows": {
+      "ir-off": {
+        "env": {
+          "QUASAR_INTRA_REFRESH": "0",
+          "QUASAR_INTRA_REFRESH_PERIOD": "0"
+        },
+        "description": "control — recovery = PLI→IDR only"
+      },
+      "ir-cont": {
+        "env": {
+          "QUASAR_INTRA_REFRESH": "1",
+          "QUASAR_INTRA_REFRESH_PERIOD": "0"
+        },
+        "description": "the previously-deployed config, continuous wave"
+      },
+      "ir-60": {
+        "env": {
+          "QUASAR_INTRA_REFRESH": "1",
+          "QUASAR_INTRA_REFRESH_PERIOD": "60"
+        },
+        "description": "wave every 1s @60fps"
+      },
+      "ir-120": {
+        "env": {
+          "QUASAR_INTRA_REFRESH": "1",
+          "QUASAR_INTRA_REFRESH_PERIOD": "120"
+        },
+        "description": "wave every 2s"
+      }
+    },
+    "cols": {
+      "clean": {
+        "netem_args": null,
+        "description": "no shaping"
+      },
+      "loss1": {
+        "netem_args": "delay 20ms 2ms loss 1%",
+        "description": "steady random loss, no rate cap"
+      },
+      "burst": {
+        "netem_args": "delay 20ms 2ms loss 3% 25%",
+        "description": "correlated/bursty loss"
+      }
+    },
+    "control_row": "ir-off",
+    "netem_apply_cmd": "sender",
+    "_netem_apply_cmd_comment": "'sender' = qnetem sender/sender-clear (sender-side egress shaping on the gpu-test host); 'aux-ingress' = the cross-host path, qnetem ingress <gpu-test-ip>/clear on the aux-infra host. Both selectable.",
+    "netem_apply_delay_s": 15,
+    "cell_duration_s": 120,
+    "sample_interval_s": 5,
+    "noise_band_pct": 0.1,
+    "noise_band_abs_ms": 1.0,
+    "gate_a_env_grep": "INTRA",
+    "gate_a_log_pattern": "intra-refresh="
+  },
+  "fec_experiment": {
+    "_source": "docs/design/plans/2026-07-22-fec-auto-arm.md §7 L1-L3",
+    "_comment": "FEC auto-arm (Experiment 2): off vs fixed-20 vs auto, on the gpu-test host (vulkan) with the production IR baseline (period=60, slices=4). fixed_env applies to every cell; row env overrides QUASAR_FEC_MODE/QUASAR_FEC_PERCENTAGE on top of it. Run via qdiag-ir-experiment --experiment fec.",
+    "host": "gpu-test",
+    "app": "NV Bench Ball",
+    "profile": "1080p60",
+    "env_path": "deploy/.env",
+    "compose_files": [
+      "deploy/docker-compose.yml",
+      "deploy/docker-compose.nvidia.yml"
+    ],
+    "recreate_service": "quasar-node-agent",
+    "agent_container": "deploy-quasar-node-agent-1",
+    "run_prefix": "fec",
+    "env_keys_whitelist": [
+      "QUASAR_FEC_MODE",
+      "QUASAR_FEC_PERCENTAGE"
+    ],
+    "fixed_env": {
+      "QUASAR_ENCODER": "vulkan",
+      "QUASAR_INTRA_REFRESH": "1",
+      "QUASAR_INTRA_REFRESH_PERIOD": "60",
+      "QUASAR_SLICES": "4"
+    },
+    "rows": {
+      "fec-off": {
+        "env": {
+          "QUASAR_FEC_MODE": "off",
+          "QUASAR_FEC_PERCENTAGE": "0"
+        },
+        "description": "control — no FEC (transceiver untouched, no red/ulpfec lines)"
+      },
+      "fec-20-fixed": {
+        "env": {
+          "QUASAR_FEC_MODE": "fixed",
+          "QUASAR_FEC_PERCENTAGE": "20"
+        },
+        "gate_a_log_expect": "fec-percentage=20",
+        "description": "static ulp-red at 20% for the whole session (Sunshine-style always-on)"
+      },
+      "fec-auto": {
+        "env": {
+          "QUASAR_FEC_MODE": "auto",
+          "QUASAR_FEC_PERCENTAGE": "20"
+        },
+        "gate_a_log_expect": "auto FEC controller armed",
+        "description": "negotiate ulp-red at 0%, ramp 0→20→0 on the agent-local loss signal"
+      },
+      "fec-5-fixed": {
+        "env": {
+          "QUASAR_FEC_MODE": "fixed",
+          "QUASAR_FEC_PERCENTAGE": "5"
+        },
+        "gate_a_log_expect": "fec-percentage=5",
+        "description": "static ulp-red at 5% — does a small repair fraction avoid the Chrome ULPFEC hitching seen at 20%?"
+      },
+      "fec-5-auto": {
+        "env": {
+          "QUASAR_FEC_MODE": "auto",
+          "QUASAR_FEC_PERCENTAGE": "5"
+        },
+        "gate_a_log_expect": "auto FEC controller armed",
+        "description": "auto-arm with armed level 5% instead of 20%"
+      }
+    },
+    "cols": {
+      "clean": {
+        "netem_args": null,
+        "description": "no shaping"
+      },
+      "loss1": {
+        "netem_args": "delay 20ms 2ms loss 1%",
+        "description": "steady random loss, no rate cap"
+      },
+      "burst": {
+        "netem_args": "delay 20ms 2ms loss 3% 25%",
+        "description": "correlated/bursty loss — the WiFi-burst case FEC exists for"
+      }
+    },
+    "control_row": "fec-off",
+    "netem_apply_cmd": "sender",
+    "netem_apply_delay_s": 15,
+    "cell_duration_s": 120,
+    "sample_interval_s": 5,
+    "noise_band_pct": 0.1,
+    "noise_band_abs_ms": 1.0,
+    "gate_a_mode": "per_row_expect",
+    "gate_a_env_grep": "FEC"
+  }
+}

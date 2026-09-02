@@ -1,0 +1,1198 @@
+#!/usr/bin/env bash
+# qses — Quasar live-session lifecycle one-liners: launch a session, drive the
+# headless Chrome-for-Testing peer, pull the metrics series, read filtered agent
+# logs, clean up. Replaces the ~30-line inline bash blob this previously took.
+#
+# The headless browser peer runs on the `aux-infra` host (this workstation has no
+# toolchain; running the peer there is sanctioned infrastructure use). The target
+# stack is selectable by ROLE or host name — hosts come from _shared/hosts.json:
+#   --stack=gpu-test (default)  the streaming host under test
+#   --stack=aux-infra           the aux host's own stack, when it runs one
+# When the stack host IS the peer host the runner uses that host's local API URL;
+# otherwise it uses its api_external. Roles: QSES_PEER_ROLE, QSES_STACK_ROLE.
+#
+# Verbs:
+#   qses run [--app 'Name'] [--profile ID] [--secs N] [--warmup N] [--keep] [--no-browser]
+#            [--evidence-dir PATH] [--min-luma N] [--playout MS] [--peer-unlock-fps]
+#            --peer-unlock-fps (or env QSES_PEER_UNLOCK_FPS=1): adds
+#            --disable-frame-rate-limit --disable-gpu-vsync to the CFT Chrome
+#            launch. Headless Chrome's RVFC present loop is capped at 60fps
+#            regardless of decoded content rate (docs/reports/2026-08-19-overnight-2/
+#            README.md §C) — this lifts that cap for a >60fps profile. Default off;
+#            bench_run.sh auto-arms it from the requested profile's fps.
+#            --playout MS: pin the receiver playout target via ?playout=<MS>.
+#            This is the AS-04/T8 instrument and it also switches OFF the AS-05
+#            adaptive controller, so a sweep arm measures one fixed buffer.
+#            full cycle: login → launch → wait running → browser → series → delete
+#            --profile launches by AS10-01 profile id (e.g. 1080p60); the resolved
+#            profile_id + h264 + WxH@fps are printed; an ineligible/unknown profile
+#            prints "launch failed: HTTP 409/400 …" instead of a traceback.
+#            --keep: don't delete (prints SID for follow-ups); --no-browser: skip peer
+#            --evidence-dir: retain browser output + run metadata on the peer host
+#            T0 (#378): the browser samples the decoded <video>'s luma every
+#            500ms across warmup+measurement and prints the STEADY-STATE verdict
+#            "LUMA mean=<m> sd=<sd> (steady state; first content <t>s)" — the
+#            last 10 samples, not the first 5s (a cold app is legitimately black
+#            for tens of seconds after decode; sampling the head of the run
+#            measures app startup, not stream liveness). "LUMA unavailable
+#            <reason>" never fails the run on its own.
+#            --min-luma N: content-live gate — exit nonzero with "LUMA FAIL" if
+#            the steady-state mean < N. Omitted (default): report-only.
+#   qses series <SID>        setpoint/fps/encode_ms series (runs on the stack's host)
+#   qses logs [abr|ice|all]  filtered agent logs (runs on the stack's host)
+#   qses ls                  sessions visible to a freshly-minted per-run user
+#
+# Auth (#399): qses no longer registers/logs in as a shared, git-committed
+# harness account. Every `run`/`ls` mints a throwaway identity via the DX verb
+# `make agent-creds` (scripts/dx/agentcreds.sh -> POST /v1/dev/agent-session),
+# run on the peer host against the target stack's API. That endpoint requires
+# QUASAR_DEV_AGENT_AUTH=1 on the STACK host and its per-boot dev key:
+#   QSES_DEV_KEY / QUASAR_DEV_AGENT_KEY   the stack host's per-boot dev-agent
+#            key. Required whenever the peer host cannot reach the stack
+#            host's own docker daemon (i.e. any real --stack=gpu-test/aux-infra
+#            run against Tower/hermes) — agentcreds.sh's local docker-exec
+#            fallback only ever applies to a dev workstation's own agentless
+#            stack. Fetch the key from the STACK host:
+#              ssh <stack-host> "cd <stack-dir> && docker compose exec -T \
+#                quasar-control-plane cat /run/quasar/dev-agent-key"
+#            (fleet stacks compose service name is quasar-control-plane, see
+#            _shared/hosts.json compose_files — not the DX-local "control-plane").
+#   qses stop <SID>          DELETE /v1/sessions/{id} with the stack's admin bearer
+#                            (202=stopped, 404=already gone exit 0). 404 is judged on
+#                            the SELECTED stack — a SID from another stack 404s here
+#                            while that session lives on (the 2026-07-25 "DELETE race"
+#                            that wasn't). Hence the stack name in every outcome line.
+#   qses provision           (re)install CFT + playwright on the peer host (survives /tmp wipes)
+#   qses display <SID> [--stream WxH] [--render WxH] [--ui-scale S]
+#                            PATCH /v1/sessions/{id}/display (adaptive external
+#                            resolution) with the stack's admin bearer — thin
+#                            wrapper over `scripts/dx/session_display.sh`
+#                            (DX-layer-first: this verb has no logic of its
+#                            own, it just sets HOST=<--stack> for that script,
+#                            which reads the SAME _shared/hosts.json roles).
+#                            Prints "HTTP <code> ..." then the resulting
+#                            stream.external_*/render_*/rungs/ui_scale.
+#   qses soak [<SID>|--latest] [--duration 180] [--profile ladder|sawtooth|floor]
+#                            on-demand "bad connection" soak: walks the EXTERNAL
+#                            (stream) resolution DOWN the rung ladder and back
+#                            UP over --duration, sampling agent + browser
+#                            telemetry, and writes REPORT.md (step table,
+#                            boundary analysis, ASCII timeline, optimisation
+#                            candidates) under .diagnostics/soak/. Thin wrapper
+#                            over `scripts/dx/session_soak.sh` — no logic here.
+#                            Point it at a session Michael is ALREADY playing;
+#                            it never launches or stops one, and it restores the
+#                            launch size on exit (including Ctrl-C). Nothing is
+#                            wired into ABR — this is manual only.
+#   qses matrix <SID> [--rungs WxH,WxH,...]
+#   qses matrix --app 'Name' [--rungs WxH,WxH,...]
+#                            steps external-resolution rungs (default
+#                            1280x720,1920x1080,1600x900) against a RUNNING
+#                            session and asserts the resize actually took:
+#                            browser videoWidth matches the rung within 3s,
+#                            totalVideoFrames advances >=30 across the step,
+#                            no decode failure, and exactly one
+#                            `offer created` for the whole run (no
+#                            renegotiation storm from resizing). Requires the
+#                            SID to be reconnectable by the acting admin
+#                            identity (POST /v1/sessions/{id}/signaling-token
+#                            is owner-gated — see protocol/control-api.md); a
+#                            SID from a throwaway per-run user (the `run`
+#                            default, #399) 404s unless QSES_ADMIN_TOKEN/--app
+#                            is used (below). `--app 'Name'` self-launches
+#                            instead of taking a SID, guaranteeing ownership.
+#   QSES_ADMIN_TOKEN          a pre-minted admin bearer (exported from this
+#                            workstation). It is the FIRST credential every
+#                            admin-credentialed verb tries (series/stop/matrix
+#                            via admin_auth_snippet(), and
+#                            scripts/dx/session_display.sh for display/matrix's
+#                            per-rung PATCH). Needed when the SID must be OWNED
+#                            by the identity that minted the token — mint one
+#                            long-TTL (make agent-creds ARGS='--role admin
+#                            --ttl 2h'), launch the session with it via POST
+#                            /v1/sessions, then export it before `qses matrix
+#                            <that SID>`. `qses matrix --app` does this whole
+#                            dance for you.
+#
+#                            The ladder itself lives in ONE place for the whole
+#                            repo: scripts/dx/admin_token.sh (QUASAR_ADMIN_TOKEN
+#                            -> cached token -> mint on the host via the per-boot
+#                            dev key or BOOTSTRAP_ADMIN_*). qses feeds
+#                            QSES_ADMIN_TOKEN into its tier 1 and carries no
+#                            ladder of its own. Nothing resolving is FATAL — a
+#                            verb never proceeds with an empty bearer and never
+#                            reports a success it has not read back from the API.
+set -euo pipefail
+
+source "$(dirname "$0")/../../_shared/lib.sh"
+
+# Repo root, for invoking scripts/dx/*.sh (four levels up from this script:
+# .claude/skills/quasar-session/scripts/qses).
+QSES_ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"
+
+# The browser peer host (sanctioned infrastructure use of the aux host) and the
+# stack under test. Both are roles; either may be given as a literal host name.
+PEER_ROLE="${QSES_PEER_ROLE:-aux-infra}"
+PEER_HOST="$(q_resolve "$PEER_ROLE")" || { echo "qses: no host bound to role '$PEER_ROLE'" >&2; exit 2; }
+PEER_DIR="$(q_host_cfg "$PEER_HOST" dir)"
+peer_ssh() { q_ssh "$PEER_HOST" "$@"; }
+
+# ── Credential-safe remote execution ─────────────────────────────────────────
+# A remote script that carries a bearer, a dev key or a signaling token must
+# reach the host on STDIN, never as an ssh command argument: an argument becomes
+# the sshd child's command line, which every user on that host can read out of
+# `ps` for as long as the call runs. (`qhost registered` set the pattern with a
+# 0600 header file; this is the same rule for a whole script.)
+#
+# The runner reads the ENTIRE script first and only then evaluates it, with its
+# own stdin repointed at /dev/null — so a child inside the script (the browser
+# driver, agentcreds.sh) cannot eat the tail of the script it is part of.
+_QSES_STDIN_RUNNER='S=$(cat); exec 0</dev/null; eval "$S"'
+ssh_script()  { q_ssh "$1" "$_QSES_STDIN_RUNNER"; }   # script arrives on stdin
+peer_script() { ssh_script "$PEER_HOST"; }
+
+# STACK_EXPLICIT records whether the caller NAMED the stack (--stack=, or
+# QSES_STACK_ROLE in the environment) rather than falling into the gpu-test
+# default. The deploy-only guard below turns on exactly that distinction.
+STACK="${QSES_STACK_ROLE:-gpu-test}"; ARGS=()
+STACK_EXPLICIT=0
+[ -n "${QSES_STACK_ROLE:-}" ] && STACK_EXPLICIT=1
+for a in "$@"; do case "$a" in --stack=*) STACK="${a#*=}"; STACK_EXPLICIT=1;; *) ARGS+=("$a");; esac; done
+set -- "${ARGS[@]:-}"
+
+STACK_HOST="$(q_resolve "$STACK")" || {
+  echo "unknown --stack=$STACK (hosts: $(q_hosts | tr '\n' ' ')| roles: $(q_roles | tr '\n' ' '))" >&2; exit 2; }
+STACK_DIR="$(q_host_cfg "$STACK_HOST" dir)"
+
+# guard_stack <verb> [mutating|destructive] — hosts.example.json's deploy-only
+# contract, enforced through the one shared implementation in _shared/lib.sh.
+guard_stack() { q_guard_mutating qses "$STACK_HOST" "$STACK_EXPLICIT" "$1" "${2:-mutating}"; }
+# Local URL when the peer runs ON the stack host, external URL when it reaches
+# across the network.
+if [ "$STACK_HOST" = "$PEER_HOST" ]; then API="$(q_host_cfg "$STACK_HOST" api)"
+else API="$(q_host_cfg "$STACK_HOST" api_external)"; fi
+[ -n "$API" ] || { echo "qses: host '$STACK_HOST' has no api/api_external in hosts.json" >&2; exit 2; }
+
+# Per-run identity (#399): DEV_KEY authenticates the mint call on the STACK
+# host, never a shared registered account. Never echoed.
+DEV_KEY="${QSES_DEV_KEY:-${QUASAR_DEV_AGENT_KEY:-}}"
+CFT=/tmp/cft/chrome-linux64/chrome
+PWD_DIR=/tmp/t8-driver
+
+# Scratch directory for the peer's browser, on the PEER host. Playwright puts
+# each Chrome's user-data-dir under $TMPDIR, so a full /tmp does not surface as
+# "no space left" — it surfaces as `page.evaluate: Target crashed`, i.e. exactly
+# the shape of a decode/ICE failure. That mis-read cost a capstone run: devbox's
+# /tmp is a 16G tmpfs and several stale git worktrees had filled it to 100%
+# (62 MB free), so every peer attach died mid-probe and read as a broken stream.
+# Default is unchanged (/tmp); set QSES_PEER_TMPDIR to point the browser's
+# scratch at a filesystem with room when /tmp is squeezed.
+#
+# POINT IT AT ANOTHER tmpfs, NOT AT DISK. /tmp is RAM-backed, and moving the
+# peer's scratch onto the root filesystem changes what the run measures: the
+# capstone's first re-run did exactly that and came back
+# `likely_client_presentation_limit` (19 hitches, present-interval sd 232 ms)
+# with the host encoder steady and no congestion window — client-side judder
+# manufactured by the harness, not by Quasar. /dev/shm is the right escape
+# hatch (same class of filesystem, usually empty):
+#   QSES_PEER_TMPDIR=/dev/shm/qses-tmp
+PEER_TMPDIR="${QSES_PEER_TMPDIR:-/tmp}"
+
+# Admin bearer: qses no longer carries a ladder of its own. scripts/dx/admin_token.sh
+# is THE ladder for the whole DX layer ($QUASAR_ADMIN_TOKEN -> cache -> mint on the
+# host via the per-boot dev key or BOOTSTRAP_ADMIN_*). QSES_ADMIN_TOKEN stays as the
+# historical override name and is simply fed into tier 1.
+#
+# An unresolvable admin identity is FATAL, never "carry on and see": a request with
+# `Authorization: Bearer ` is a 401, and a verb that then reports success has told
+# you the opposite of the truth.
+QSES_ADMIN_BEARER=""
+resolve_admin_token() {
+  [ -n "$QSES_ADMIN_BEARER" ] && return 0
+  local tok
+  if ! tok="$(QUASAR_ADMIN_TOKEN="${QUASAR_ADMIN_TOKEN:-${QSES_ADMIN_TOKEN:-}}" \
+        DX_HOSTS_JSON="$QUASAR_HOSTS_JSON" \
+        bash "$QSES_ROOT/scripts/dx/admin_token.sh" --host "$STACK_HOST" --quiet)"; then
+    tok=""
+  fi
+  if [ -z "$tok" ]; then
+    echo "qses: no admin bearer could be obtained for stack '$STACK_HOST' — see the admin-token lines above, or run: scripts/dx/admin_token.sh --host $STACK_HOST --fresh" >&2
+    echo "qses: pick ONE — export QSES_ADMIN_TOKEN=<bearer>; or set BOOTSTRAP_ADMIN_EMAIL/BOOTSTRAP_ADMIN_PASSWORD in $STACK_HOST's deploy/.env; or arm the per-boot dev-agent key there (QUASAR_DEV_AGENT_AUTH=1) and export QSES_DEV_KEY/QUASAR_DEV_AGENT_KEY." >&2
+    exit 1
+  fi
+  QSES_ADMIN_BEARER="$tok"
+}
+
+# Prints a bash snippet that leaves the resolved admin bearer in $ADMIN on the
+# remote shell. The token is resolved HERE, on the workstation, and the snippet
+# it produces is a SECRET: every caller must deliver it to the remote shell on
+# STDIN (`q_ssh "$HOST" bash -s <<<"$script"`), never as an ssh command
+# argument. An argument becomes the remote sshd child's command line, which any
+# user on that host can read out of `ps` for the life of the call — which is
+# exactly what this function used to do.
+admin_auth_snippet() {
+  resolve_admin_token
+  cat <<EOS
+ADMIN='$QSES_ADMIN_BEARER'
+if [ -z "\$ADMIN" ]; then
+  echo 'qses: no admin bearer could be obtained (scripts/dx/admin_token.sh returned nothing).' >&2
+  exit 1
+fi
+EOS
+}
+
+# Run an admin-credentialed snippet on the stack's OWNING host (creds live in ITS
+# deploy/.env, which no other host can read). $1 = bash snippet; has $API and
+# $ADMIN (token) in scope. The API is the stack host's own local URL here.
+admin_exec() {
+  local snip="$1" local_api auth
+  local_api="$(q_host_cfg "$STACK_HOST" api)"
+  [ -n "$local_api" ] || local_api="$API"
+  auth="$(admin_auth_snippet)"
+  # `bash -s` + stdin, not an ssh argument: the bearer travels down the ssh
+  # channel into the remote shell's input, so it never appears in any process's
+  # command line on this workstation or on the stack host.
+  ssh_script "$STACK_HOST" <<EOS
+cd '$STACK_DIR' && set -a; . deploy/.env 2>/dev/null; set +a
+API=$local_api
+$auth
+$snip
+EOS
+}
+
+# Agent-log read on the stack's owning host (container name is the same everywhere).
+agent_logs() { # $1 = --since value, $2 = grep -E pattern
+  local since="$1" pat="$2"
+  q_ssh "$STACK_HOST" "docker logs --since $since ${QSES_AGENT_CONTAINER:-deploy-quasar-node-agent-1} 2>&1 \
+    | grep -avE 'EGL|GL_|smithay|egl_context|renderer_gles|pci.ids|Supported' \
+    | grep -aE '$pat'" || true
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+
+provision)
+  peer_ssh 'set -e
+if [ ! -x /tmp/cft/chrome-linux64/chrome ]; then
+  mkdir -p /tmp/cft && cd /tmp/cft
+  URL=$(curl -k -s https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json \
+    | python3 -c "import sys,json;d=json.load(sys.stdin);print([x[\"url\"] for x in d[\"channels\"][\"Stable\"][\"downloads\"][\"chrome\"] if x[\"platform\"]==\"linux64\"][0])")
+  curl -k -sL "$URL" -o chrome.zip && python3 -c "import zipfile;zipfile.ZipFile(\"chrome.zip\").extractall(\".\")" && rm chrome.zip
+  # zipfile drops exec bits — the crashpad handler missing +x kills the browser with
+  # "Permission denied (13)" and Playwright reports "browser has been closed".
+  chmod +x /tmp/cft/chrome-linux64/chrome /tmp/cft/chrome-linux64/chrome_crashpad_handler /tmp/cft/chrome-linux64/chrome_sandbox 2>/dev/null || true
+fi
+/tmp/cft/chrome-linux64/chrome --version
+if [ ! -d /tmp/t8-driver/node_modules/playwright-core ]; then
+  mkdir -p /tmp/t8-driver && cd /tmp/t8-driver && npm init -y >/dev/null 2>&1 && npm install playwright-core@1.60.0 >/dev/null 2>&1
+fi
+echo "playwright-core OK"'
+  ;;
+
+browser-self-test)
+  # No Quasar session: prove success/failure evidence survives in a path with
+  # spaces and browser exit codes do not disappear through a shell pipe.
+  COMPOSED=$(QSES_RUN_COMPOSE_ONLY=1 "$0" run --app "self-test ' app" --profile "profile ' value" \
+    --secs 7 --warmup 2 --evidence-dir '/tmp/qses evidence composed')
+  bash -n <<<"$COMPOSED"
+  grep -Fq 'encoding="utf-8"' <<<"$COMPOSED"
+  grep -Fq 'DECODE OK fps=' <<<"$COMPOSED"
+  peer_ssh "set -e
+ROOT=\$(mktemp -d '/tmp/qses evidence selftest.XXXXXXXX')
+trap 'rm -rf -- \"\$ROOT\"' EXIT
+capture_case() {
+  NAME=\$1; EXPECTED_RC=\$2
+  CASE_DIR=\$ROOT/\$NAME' case'
+  mkdir -p -- \"\$CASE_DIR\"
+  OUT=\$CASE_DIR/.browser.stdout.tmp
+  ERR=\$CASE_DIR/.browser.stderr.tmp
+  set +e
+  if [ \"\$NAME\" = success ]; then
+    node -e 'console.log(JSON.stringify({ok:true})); console.error(\"success stderr\")' >\"\$OUT\" 2>\"\$ERR\"
+  else
+    node -e 'console.error(\"failure stderr\"); process.exit(42)' >\"\$OUT\" 2>\"\$ERR\"
+  fi
+  RC=\$?
+  set -e
+  mv -- \"\$OUT\" \"\$CASE_DIR/browser.stdout\"
+  mv -- \"\$ERR\" \"\$CASE_DIR/browser.stderr\"
+  printf 'browser_rc=%s\\noverall_rc=%s\\n' \"\$RC\" \"\$RC\" >\"\$CASE_DIR/.metadata.tmp\"
+  mv -- \"\$CASE_DIR/.metadata.tmp\" \"\$CASE_DIR/metadata.txt\"
+  [ \"\$RC\" -eq \"\$EXPECTED_RC\" ]
+  [ -f \"\$CASE_DIR/browser.stdout\" ] && [ -f \"\$CASE_DIR/browser.stderr\" ] && [ -f \"\$CASE_DIR/metadata.txt\" ]
+  grep -qx \"browser_rc=\$EXPECTED_RC\" \"\$CASE_DIR/metadata.txt\"
+}
+capture_case success 0
+grep -qx '{\"ok\":true}' \"\$ROOT/success case/browser.stdout\"
+grep -qx 'success stderr' \"\$ROOT/success case/browser.stderr\"
+capture_case failure 42
+[ ! -s \"\$ROOT/failure case/browser.stdout\" ]
+grep -qx 'failure stderr' \"\$ROOT/failure case/browser.stderr\"
+echo 'browser evidence self-test OK: composition=OK success=0 failure=42 quoted_path=OK'"
+  ;;
+
+run)
+  # Mutating against a deploy-only host: a run launches a real session and takes
+  # an encode slot on that stack. Allowed only if the caller named the stack.
+  guard_stack run
+  APP="$(q_host_cfg "$STACK_HOST" bench_app)"; SECS=40; WARMUP=4; KEEP=0; BROWSER=1; PROFILE=""; EVIDENCE_DIR=""; MIN_LUMA=""; PLAYOUT=""
+  # PEER_UNLOCK_FPS: honour QSES_PEER_UNLOCK_FPS=1 as a default (direct qses
+  # callers), overridable by the explicit --peer-unlock-fps flag below.
+  PEER_UNLOCK_FPS="${QSES_PEER_UNLOCK_FPS:-0}"
+  while [ $# -gt 0 ]; do case "$1" in
+    --app) [ $# -ge 2 ] || { echo "--app requires a value" >&2; exit 2; }; APP="$2"; shift 2;;
+    --secs) [ $# -ge 2 ] || { echo "--secs requires a value" >&2; exit 2; }; SECS="$2"; shift 2;;
+    --warmup) [ $# -ge 2 ] || { echo "--warmup requires a value" >&2; exit 2; }; WARMUP="$2"; shift 2;;
+    --profile) [ $# -ge 2 ] || { echo "--profile requires a value" >&2; exit 2; }; PROFILE="$2"; shift 2;;
+    --evidence-dir)
+      [ $# -ge 2 ] && [ -n "$2" ] || { echo "--evidence-dir requires a path" >&2; exit 2; }
+      EVIDENCE_DIR="$2"; shift 2;;
+    --min-luma) [ $# -ge 2 ] || { echo "--min-luma requires a value" >&2; exit 2; }; MIN_LUMA="$2"; shift 2;;
+    --codec)
+      [ $# -ge 2 ] || { echo "--codec requires a value" >&2; exit 2; }
+      case "$2" in h264|h265|av1|auto) CODEC="$2";; *) echo "--codec must be h264|h265|av1|auto" >&2; exit 2;; esac
+      shift 2;;
+    --playout)
+      # AS-04/T8 measurement instrument: pins the receiver playout target by
+      # appending ?playout=<N> to the session URL, which ALSO disables the
+      # AS-05 adaptive controller (web/src/webrtc/playout.ts playoutOverride).
+      [ $# -ge 2 ] || { echo "--playout requires a value (ms)" >&2; exit 2; }
+      case "$2" in ''|*[!0-9]*) echo "--playout must be a non-negative integer (ms)" >&2; exit 2;; esac
+      PLAYOUT="$2"; shift 2;;
+    --bench-mode) BENCH_MODE=1; shift;;
+    --peer-unlock-fps) PEER_UNLOCK_FPS=1; shift;;
+    --input-pulse-every)
+      [ $# -ge 2 ] || { echo "--input-pulse-every requires a value" >&2; exit 2; }
+      case "$2" in ''|*[!0-9]*) echo "--input-pulse-every must be an integer (seconds)" >&2; exit 2;; esac
+      # 0 would pass the --bench-mode guard below and then silently disable the
+      # pulse, i.e. produce a run with an empty i2p column and no complaint.
+      [ "$2" -ge 1 ] || { echo "--input-pulse-every must be at least 1 second" >&2; exit 2; }
+      BENCH_PULSE_EVERY="$2"; shift 2;;
+    --keep) KEEP=1; shift;; --no-browser) BROWSER=0; shift;;
+    *) echo "unknown arg $1" >&2; exit 2;;
+  esac; done
+  # --input-pulse-every is meaningless without the in-page instrument that
+  # answers it; say so rather than running a pulse nothing measures.
+  if [ -n "${BENCH_PULSE_EVERY:-}" ] && [ "${BENCH_MODE:-0}" != 1 ]; then
+    echo "--input-pulse-every requires --bench-mode" >&2; exit 2
+  fi
+  case "$SECS" in ''|*[!0-9]*) echo "--secs must be an integer from 1 to 3600" >&2; exit 2;; esac
+  case "$WARMUP" in ''|*[!0-9]*) echo "--warmup must be an integer from 0 to 600" >&2; exit 2;; esac
+  [ "${#SECS}" -le 4 ] && SECS=$((10#$SECS)) && [ "$SECS" -ge 1 ] && [ "$SECS" -le 3600 ] || {
+    echo "--secs must be an integer from 1 to 3600" >&2; exit 2;
+  }
+  [ "${#WARMUP}" -le 3 ] && WARMUP=$((10#$WARMUP)) && [ "$WARMUP" -ge 0 ] && [ "$WARMUP" -le 600 ] || {
+    echo "--warmup must be an integer from 0 to 600" >&2; exit 2;
+  }
+  if [ -n "$MIN_LUMA" ]; then
+    case "$MIN_LUMA" in
+      ''|*[!0-9.]*|*.*.*) echo "--min-luma must be a non-negative number" >&2; exit 2;;
+    esac
+  fi
+  # AS10-03: launch by profile_id. The minted per-run user is NON-admin (#399),
+  # so the launch goes through the real eligibility gate (a probeless fresh
+  # user is never hard-ineligible → user-facing profiles launch; an
+  # ineligible/unknown profile surfaces as the launch HTTP code below, not a
+  # python traceback).
+  RUN_DEV_KEY="$DEV_KEY"
+  if [ "${QSES_RUN_COMPOSE_ONLY:-0}" = 1 ]; then
+    # Composition tests must never print a configured dev key.
+    RUN_DEV_KEY="self-test ' key"
+  fi
+  printf -v API_Q '%q' "$API"
+  printf -v EVIDENCE_DIR_Q '%q' "$EVIDENCE_DIR"
+  printf -v RUN_APP_Q '%q' "$APP"
+  printf -v RUN_PROFILE_Q '%q' "$PROFILE"
+  printf -v RUN_MIN_LUMA_Q '%q' "$MIN_LUMA"
+  printf -v RUN_CODEC_Q '%q' "${CODEC:-}"
+  printf -v RUN_DEV_KEY_Q '%q' "$RUN_DEV_KEY"
+  case "${QSES_PRESERVE_ON_FAILURE:-0}" in 0|1) ;;
+    *) echo "QSES_PRESERVE_ON_FAILURE must be 0 or 1" >&2; exit 2;;
+  esac
+  printf -v PRESERVE_ON_FAILURE_Q '%q' "${QSES_PRESERVE_ON_FAILURE:-0}"
+  REMOTE_RUN="set -e; cd '$PEER_DIR'
+API=$API_Q
+EVIDENCE_ARG=$EVIDENCE_DIR_Q
+RUN_APP=$RUN_APP_Q
+RUN_PROFILE=$RUN_PROFILE_Q
+RUN_MIN_LUMA=$RUN_MIN_LUMA_Q
+RUN_CODEC=$RUN_CODEC_Q
+RUN_BENCH_MODE=${BENCH_MODE:-0}; RUN_BENCH_PULSE=${BENCH_PULSE_EVERY:-0}
+RUN_PLAYOUT=${PLAYOUT:-}
+RUN_PEER_UNLOCK_FPS=${PEER_UNLOCK_FPS:-0}
+RUN_SECS=$SECS; RUN_WARMUP=$WARMUP; RUN_KEEP=$KEEP; RUN_BROWSER=$BROWSER
+QSES_PRESERVE_ON_FAILURE=$PRESERVE_ON_FAILURE_Q
+DEV_KEY=$RUN_DEV_KEY_Q
+EVIDENCE_RUN_DIR=; BROWSER_OUT=; BROWSER_ERR=; BROWSER_RC=not_run
+SID=; APP_ID=; CODE=not_sent; ST=not_started
+STARTED_AT=\$(date -u +%Y-%m-%dT%H:%M:%SZ)
+if [ -n \"\$EVIDENCE_ARG\" ]; then
+  umask 077
+  case \"\$EVIDENCE_ARG\" in
+    /*) EVIDENCE_ROOT=\$EVIDENCE_ARG ;;
+    *) EVIDENCE_ROOT=\$PWD/\$EVIDENCE_ARG ;;
+  esac
+  mkdir -p -- \"\$EVIDENCE_ROOT\"
+  EVIDENCE_RUN_DIR=\$(mktemp -d \"\$EVIDENCE_ROOT/qses-run.XXXXXXXX\")
+  BROWSER_OUT=\$EVIDENCE_RUN_DIR/.browser.stdout.tmp
+  BROWSER_ERR=\$EVIDENCE_RUN_DIR/.browser.stderr.tmp
+  : >\"\$BROWSER_OUT\"; : >\"\$BROWSER_ERR\"
+fi
+qses_redact() {
+  QSES_AUTH=\${TOK:-} QSES_SIGNAL=\${SIG_TOKEN:-} QSES_DEVKEY=\${DEV_KEY:-} python3 -c 'import os,sys
+p=sys.argv[1]
+d=open(p,encoding=\"utf-8\",errors=\"replace\").read()
+for key in (\"QSES_AUTH\",\"QSES_SIGNAL\",\"QSES_DEVKEY\"):
+    value=os.environ.get(key,\"\")
+    if value: d=d.replace(value,\"[REDACTED]\")
+open(p,\"w\",encoding=\"utf-8\").write(d)' \"\$1\"
+}
+qses_delete_session() {
+  DELETE_CODE=\$(curl -k -sS -o /dev/null -w '%{http_code}' -X DELETE \"\$API/v1/sessions/\$SID\" -H \"Authorization: Bearer \$TOK\") || return 1
+  case \"\$DELETE_CODE\" in 200|202) return 0;; *) return 1;; esac
+}
+CLEANUP_RESULT=not_needed
+qses_finish() {
+  RUN_RC=\$1
+  trap - EXIT
+  set +e
+  if [ \"\$RUN_RC\" -ne 0 ] && [ -n \"\$SID\" ] && [ -n \"\${TOK:-}\" ] && [ \"\${QSES_PRESERVE_ON_FAILURE:-0}\" != 1 ]; then
+    if qses_delete_session; then
+      CLEANUP_RESULT=deleted_after_failure
+    else
+      CLEANUP_RESULT=delete_failed
+    fi
+  fi
+  if [ -n \"\$EVIDENCE_RUN_DIR\" ]; then
+    EVIDENCE_FINALIZE_RC=0
+    if ! qses_redact \"\$BROWSER_OUT\"; then
+      rm -f -- \"\$BROWSER_OUT\"
+      printf '%s\\n' 'evidence redaction failed; browser output withheld' >\"\$BROWSER_OUT\"
+      EVIDENCE_FINALIZE_RC=1
+    fi
+    if ! qses_redact \"\$BROWSER_ERR\"; then
+      rm -f -- \"\$BROWSER_ERR\"
+      printf '%s\\n' 'evidence redaction failed; browser stderr withheld' >\"\$BROWSER_ERR\"
+      EVIDENCE_FINALIZE_RC=1
+    fi
+    mv -- \"\$BROWSER_OUT\" \"\$EVIDENCE_RUN_DIR/browser.stdout\" || EVIDENCE_FINALIZE_RC=1
+    mv -- \"\$BROWSER_ERR\" \"\$EVIDENCE_RUN_DIR/browser.stderr\" || EVIDENCE_FINALIZE_RC=1
+    if [ \"\$EVIDENCE_FINALIZE_RC\" -ne 0 ] && [ \"\$RUN_RC\" -eq 0 ]; then
+      RUN_RC=1
+    fi
+    if ! {
+      printf 'started_at=%s\\n' \"\$STARTED_AT\"
+      printf 'finished_at=%s\\n' \"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+      printf 'stack=%s\\napp=%s\\nprofile=%s\\n' '$STACK' \"\$RUN_APP\" \"\$RUN_PROFILE\"
+      printf 'requested_secs=%s\\nwarmup_secs=%s\\nbrowser_requested=%s\\n' \"\$RUN_SECS\" \"\$RUN_WARMUP\" \"\$RUN_BROWSER\"
+      printf 'app_id=%s\\nsession_id=%s\\nlaunch_http_code=%s\\nsession_state=%s\\n' \"\$APP_ID\" \"\$SID\" \"\$CODE\" \"\$ST\"
+      printf 'browser_rc=%s\\noverall_rc=%s\\ncleanup=%s\\n' \"\$BROWSER_RC\" \"\$RUN_RC\" \"\$CLEANUP_RESULT\"
+      printf 'preserve_on_failure=%s\\n' \"\${QSES_PRESERVE_ON_FAILURE:-0}\"
+    } >\"\$EVIDENCE_RUN_DIR/.metadata.tmp\"; then
+      EVIDENCE_FINALIZE_RC=1
+    fi
+    mv -- \"\$EVIDENCE_RUN_DIR/.metadata.tmp\" \"\$EVIDENCE_RUN_DIR/metadata.txt\" || EVIDENCE_FINALIZE_RC=1
+    if [ \"\$EVIDENCE_FINALIZE_RC\" -eq 0 ] && ! (cd \"\$EVIDENCE_RUN_DIR\" && sha256sum browser.stdout browser.stderr metadata.txt > SHA256SUMS); then
+      EVIDENCE_FINALIZE_RC=1
+    fi
+    if [ \"\$EVIDENCE_FINALIZE_RC\" -eq 0 ]; then
+      echo \"evidence_dir=\$EVIDENCE_RUN_DIR\"
+    else
+      echo \"qses: evidence finalization failed in \$EVIDENCE_RUN_DIR\" >&2
+      [ \"\$RUN_RC\" -ne 0 ] || RUN_RC=1
+    fi
+  else
+    rm -f -- \"\${BROWSER_OUT:-}\" \"\${BROWSER_ERR:-}\"
+  fi
+  exit \"\$RUN_RC\"
+}
+trap 'qses_finish \$?' EXIT
+# #399: mint a throwaway per-run identity via the DX verb instead of
+# registering/logging in as a shared harness account. agentcreds.sh reads
+# QUASAR_DEV_AGENT_KEY from its own environment (set below) rather than a
+# --key flag, AND writes the dev-key header to a 0600 temp file for curl
+# instead of putting it in curl argv.
+#
+# That covered agentcreds.sh's own curl, and nothing else: these lines are a
+# REMOTE SCRIPT, and until it started travelling on stdin the whole thing —
+# the DEV_KEY assignment below included — was the ssh command argument, i.e.
+# the peer host's sshd child command line, readable via ps by anyone on that
+# host. The claim that the key was 'never visible via ps' was therefore false
+# for the whole time it was written down. The delivery, not the header file, is
+# what makes it true: see peer_script / _QSES_STDIN_RUNNER at the top of the
+# outer script.
+#
+# (No backticks in this comment: it lives INSIDE a double-quoted shell string,
+# where a backtick is command substitution, not punctuation.)
+AGENTCREDS_JSON=\$(QUASAR_DEV_AGENT_KEY=\$DEV_KEY bash scripts/dx/agentcreds.sh --role user --ttl 30m --url \"\$API\") || {
+  echo 'agent-creds mint failed — set QSES_DEV_KEY/QUASAR_DEV_AGENT_KEY for this stack (needs QUASAR_DEV_AGENT_AUTH=1 there); see: qses (no args) for the fetch recipe' >&2
+  exit 1
+}
+TOK=\$(printf '%s' \"\$AGENTCREDS_JSON\" | python3 -c 'import sys,json;print(json.load(sys.stdin)[\"quasar.auth.token\"])')
+APP_ID=\$(curl -k -fs \$API/v1/apps -H \"Authorization: Bearer \$TOK\" | QSES_APP=\$RUN_APP python3 -c '
+import os,sys,json
+name=os.environ[\"QSES_APP\"].lower()
+for a in json.load(sys.stdin).get(\"items\",[]):
+    if name in a[\"name\"].lower(): print(a[\"id\"]); break')
+[ -n \"\$APP_ID\" ] || { echo \"app not found: \$RUN_APP\" >&2; exit 1; }
+# --codec: make codec resolution DETERMINISTIC instead of \"whatever the profile
+# lists first\". Codec is resolved server-side as
+#   profile codec list  n  host encoder set  n  client decode probe  n  failure history,
+# and the minted per-run user (#399) is PROBELESS -- so a codec-ladder profile such
+# as 1080p60 (av1 -> hevc -> h264) silently resolves to its FIRST rung and the bench
+# cell is labelled with a codec nobody chose (2026-08-18 benchapp bring-up §6.3: two
+# runs landed on AV1 when the task assumed H.264).
+#
+# The pin is NOT a launch-body field -- there is no codec knob on POST /v1/sessions
+# for a non-admin user. It is a device capability record, posted exactly the way the
+# SPA posts it at login (control-api.md, POST /v1/me/devices). Declaring only the
+# codecs we want gates every other one OUT of the intersection.
+if [ -n \"\$RUN_CODEC\" ] && [ \"\$RUN_CODEC\" != auto ]; then
+  PROBE_JSON=\$(QSES_CODEC=\$RUN_CODEC QSES_DEV_SEED=\$\$ python3 -c 'import json,os
+c=os.environ[\"QSES_CODEC\"]
+print(json.dumps({\"device_key\":\"qses-bench-\"+os.environ[\"QSES_DEV_SEED\"],
+ \"capabilities\":{\"client_type\":\"web\",\"max_decode_height\":2160,
+  \"codecs\":{\"h264\":c==\"h264\",\"vp9\":False,\"hevc\":c==\"h265\",\"av1\":c==\"av1\"}}}))')
+  PCODE=\$(curl -k -s -o /dev/null -w '%{http_code}' -X POST \$API/v1/me/devices -H \"Authorization: Bearer \$TOK\" -H 'Content-Type: application/json' -d \"\$PROBE_JSON\")
+  case \"\$PCODE\" in
+    2*) echo \"codec probe posted: \$RUN_CODEC\" ;;
+    *) echo \"codec probe FAILED (HTTP \$PCODE) -- refusing to run a cell whose codec is unpinned\" >&2; exit 1 ;;
+  esac
+fi
+LAUNCH_JSON=\$(QSES_APP_ID=\$APP_ID QSES_PROFILE=\$RUN_PROFILE python3 -c 'import json,os
+d={\"app_id\":os.environ[\"QSES_APP_ID\"]}
+if os.environ[\"QSES_PROFILE\"]: d[\"profile_id\"]=os.environ[\"QSES_PROFILE\"]
+print(json.dumps(d))')
+RESP=\$(curl -k -s -w '\n%{http_code}' -X POST \$API/v1/sessions -H \"Authorization: Bearer \$TOK\" -H 'Content-Type: application/json' -d \"\$LAUNCH_JSON\")
+CODE=\$(echo \"\$RESP\" | tail -1); LA=\$(echo \"\$RESP\" | sed '\$d')
+[ \"\$CODE\" = 201 ] || { echo \"launch failed: HTTP \$CODE — \$LA\" >&2; exit 1; }
+SID=\$(echo \"\$LA\" | python3 -c 'import sys,json;print(json.load(sys.stdin)[\"session\"][\"id\"])')
+SIG_URL=\$(echo \"\$LA\" | python3 -c 'import sys,json;print(json.load(sys.stdin)[\"signaling\"][\"url\"])')
+SIG_TOKEN=\$(echo \"\$LA\" | python3 -c 'import sys,json;print(json.load(sys.stdin)[\"signaling\"][\"token\"])')
+# #509: the deployment's STUN/TURN list travels on SignalingCoords alongside the
+# url/token. The SPA reads it from React Router location.state, which the driver
+# synthesises -- so without carrying it here every harness run silently builds an
+# RTCPeerConnection with NO ice servers, and a TURN deployment measures as if it
+# had none. Base64 so the JSON's quotes survive the nested SSH quoting.
+ICE_SERVERS_B64=\$(echo \"\$LA\" | python3 -c 'import sys,json,base64;print(base64.b64encode(json.dumps(json.load(sys.stdin)[\"signaling\"].get(\"ice_servers\") or []).encode()).decode())')
+echo \"SID=\$SID\"
+# REDACTED on the way out. A turn:/turns: entry carries an operator-configured,
+# long-lived \"credential\" (control-plane/internal/ice/ice.go), and this line is
+# NOT covered by qses_redact -- that only strips TOK/SIG_TOKEN/DEV_KEY. Printing
+# the list verbatim would put a standing TURN password in every run log and in
+# every retained evidence bundle. Mirror ice.Redact: urls and username survive,
+# the credential is reported only as present/absent.
+echo \$ICE_SERVERS_B64 | base64 -d | python3 -c 'import sys,json
+try: srv=json.load(sys.stdin) or []
+except Exception: srv=[]
+print(\"ICE_SERVERS n=%d\"%len(srv))
+for s in srv:
+    print(\"  urls=%s username=%s credential=%s\"%(\",\".join(s.get(\"urls\") or []),s.get(\"username\") or \"-\",\"present\" if s.get(\"credential\") else \"absent\"))'
+echo \"\$LA\" | python3 -c 'import sys,json;s=json.load(sys.stdin)[\"session\"];print(\"launched: profile_id=%s h264=%s %dx%d@%d/%dkbps\"%(s.get(\"profile_id\"),s[\"stream\"][\"h264_profile\"],s[\"stream\"][\"width\"],s[\"stream\"][\"height\"],s[\"stream\"][\"fps\"],s[\"stream\"][\"bitrate_kbps\"]))'
+# PROVE the pin, do not assume it. The predecessor commit 76f69d86 set this
+# standard for the abr=off arm: an arm that only *intends* a setting produces a
+# mislabelled cell, which is worse than no cell. Wire vocab is h264|h265|av1;
+# the session reports the resolved codec, so compare and refuse on mismatch.
+if [ -n \"\$RUN_CODEC\" ] && [ \"\$RUN_CODEC\" != auto ]; then
+  RESOLVED=\$(echo \"\$LA\" | python3 -c 'import sys,json
+s=json.load(sys.stdin)[\"session\"]
+st=s.get(\"stream\") or {}
+print(st.get(\"codec\") or s.get(\"codec\") or \"\")')
+  if [ -z \"\$RESOLVED\" ]; then
+    echo \"codec pin UNVERIFIABLE: the launch response carried no resolved codec\" >&2; exit 1
+  elif [ \"\$RESOLVED\" != \"\$RUN_CODEC\" ]; then
+    echo \"codec pin MISMATCH: asked \$RUN_CODEC, session resolved \$RESOLVED -- refusing to run a mislabelled cell\" >&2; exit 1
+  fi
+  echo \"codec pin verified: \$RESOLVED\"
+fi
+for _ in \$(seq 1 30); do sleep 2
+  ST=\$(curl -k -fs \$API/v1/sessions/\$SID -H \"Authorization: Bearer \$TOK\" | python3 -c 'import sys,json;print(json.load(sys.stdin)[\"session\"][\"state\"])')
+  [ \"\$ST\" = running ] && break; [ \"\$ST\" = failed ] && { echo 'session FAILED' >&2; exit 1; }
+done
+echo \"state=\$ST\"
+if [ \$RUN_BROWSER = 1 ]; then
+  # Provenance line (2026-08-11). The browser driver runs from the PEER HOST's repo
+  # checkout, never from the workstation that invoked qses -- so a harness fix that
+  # exists only on a local branch silently does not apply, and the run is measured by
+  # whatever the peer happens to have. That is exactly how a healthy devbox stack was
+  # mis-diagnosed as a bistable \"black stream\" for two sessions: peers on develop
+  # carried the pre-10d17bb0 luma probe, which samples ~5 s starting the instant decode
+  # is confirmed -- i.e. during Steam's ~35-55 s cold start, long before first paint --
+  # and reported mean=0.0 on sessions that were streaming perfectly. Runs peered on a
+  # host with the fix read mean~36 on the same stack, which looked like per-session
+  # bistability. Print what is actually about to run so the two can never be confused.
+  echo \"HARNESS peer=$PEER_HOST dir=$PEER_DIR head=\$(git rev-parse --short HEAD 2>/dev/null || echo unknown) driver=\$(sha256sum scripts/harness/peer-driver.mjs 2>/dev/null | cut -c1-12 || echo unknown)\"
+  # All browser diagnostics use stderr/stdout files on the peer host. Escape inner
+  # double quotes because this block is embedded in outer SSH double quotes.
+  if [ -z \"\$EVIDENCE_RUN_DIR\" ]; then
+    BROWSER_OUT=\$(mktemp /tmp/qses-browser-out.XXXXXX)
+    BROWSER_ERR=\$(mktemp /tmp/qses-browser-err.XXXXXX)
+  fi
+  set +e
+  SPA_URL=\$API SID=\$SID SIG_URL=\$SIG_URL SIG_TOKEN=\$SIG_TOKEN AUTH_TOKEN=\$TOK \
+    TMPDIR=$PEER_TMPDIR \
+    APP_NAME=\$RUN_APP CHROME=$CFT PW_DIR=$PWD_DIR WARMUP=\$RUN_WARMUP SECS=\$RUN_SECS CONNECT_TIMEOUT_MS=45000 INPUT_PROBE=${INPUT_PROBE:-0} \
+    BENCH_MODE=\$RUN_BENCH_MODE BENCH_PULSE_EVERY=\$RUN_BENCH_PULSE PLAYOUT_MS=\$RUN_PLAYOUT \
+    PEER_UNLOCK_FPS=\$RUN_PEER_UNLOCK_FPS ICE_SERVERS_B64=\$ICE_SERVERS_B64 \
+    node scripts/harness/peer-driver.mjs >\"\$BROWSER_OUT\" 2>\"\$BROWSER_ERR\"
+  BROWSER_RC=\$?
+  set -e
+  BROWSER_SANITIZE_FAILED=0
+  qses_redact \"\$BROWSER_OUT\" || { rm -f -- \"\$BROWSER_OUT\"; printf '%s\\n' 'browser output redaction failed; output withheld' >\"\$BROWSER_OUT\"; BROWSER_SANITIZE_FAILED=1; }
+  qses_redact \"\$BROWSER_ERR\" || { rm -f -- \"\$BROWSER_ERR\"; printf '%s\\n' 'browser stderr redaction failed; stderr withheld' >\"\$BROWSER_ERR\"; BROWSER_SANITIZE_FAILED=1; }
+  if [ \"\$BROWSER_SANITIZE_FAILED\" -ne 0 ]; then
+    echo BROWSER_HARNESS_FAILED:evidence_redaction >&2
+    [ \"\$BROWSER_RC\" -ne 0 ] && exit \"\$BROWSER_RC\"
+    exit 1
+  fi
+  RES=\$(tail -n 1 \"\$BROWSER_OUT\")
+  if [ \$BROWSER_RC -ne 0 ]; then
+    echo BROWSER_HARNESS_FAILED:exit=\$BROWSER_RC >&2
+    if [ -n \"\$EVIDENCE_RUN_DIR\" ]; then
+      echo 'sanitized browser output retained in requested evidence directory' >&2
+    else
+      echo browser_stderr >&2; sed -n '1,160p' \"\$BROWSER_ERR\" >&2
+      echo browser_stdout >&2; sed -n '1,80p' \"\$BROWSER_OUT\" >&2
+    fi
+    exit \$BROWSER_RC
+  fi
+  if ! printf '%s' \"\$RES\" | python3 -c 'import json,sys; json.load(sys.stdin)' >/dev/null 2>&1; then
+    echo BROWSER_HARNESS_FAILED:missing_valid_JSON >&2
+    if [ -n \"\$EVIDENCE_RUN_DIR\" ]; then
+      echo 'sanitized browser output retained in requested evidence directory' >&2
+    else
+      echo browser_stderr >&2; sed -n '1,160p' \"\$BROWSER_ERR\" >&2
+      echo browser_stdout >&2; sed -n '1,80p' \"\$BROWSER_OUT\" >&2
+    fi
+    exit 1
+  fi
+  # T0 (#378): after DECODE OK, print the luma content-liveness line the browser
+  # driver (scripts/harness/peer-driver.mjs) attached at result.luma. Unavailable luma
+  # is report-only (never fails the run); --min-luma is the only failure trigger.
+  echo \"\$RES\" | QSES_MIN_LUMA=\$RUN_MIN_LUMA python3 -c 'import sys,json,os
+d=json.load(sys.stdin); lw=d.get(\"lightweight\") or {}
+if \"error\" in d:
+    print(\"DECODE FAIL:\",d.get(\"error\"))
+else:
+    print(\"DECODE OK fps=%s res=%s rtt=%sms jb=%sms\"%(lw.get(\"fps\"),lw.get(\"resolution\"),lw.get(\"rtt_ms\"),lw.get(\"jitter_buffer_ms\")))
+    luma=d.get(\"luma\") or {}
+    if \"mean\" in luma and \"sd\" in luma:
+        fc=luma.get(\"first_content_s\")
+        print(\"LUMA mean=%.1f sd=%.2f (steady state; first content %s)\"%(luma[\"mean\"],luma[\"sd\"],(\"%.1fs\"%fc) if fc is not None else \"never\"))
+        min_luma=os.environ.get(\"QSES_MIN_LUMA\",\"\")
+        if min_luma and luma[\"mean\"] < float(min_luma):
+            print(\"LUMA FAIL: mean %.1f < min-luma %s\"%(luma[\"mean\"],min_luma))
+            sys.exit(1)
+    else:
+        print(\"LUMA unavailable %s\"%luma.get(\"error\",\"no_data\"))
+    ip=d.get(\"input_probe\")
+    if ip:
+        if ip.get(\"error\"): print(\"INPUT_PROBE error=%s\"%ip[\"error\"])
+        else:
+            print(\"INPUT_PROBE idle_delta=%s click_delta=%s\"%(ip.get(\"idle\"),ip.get(\"reaction\")))
+            if ip.get(\"keyReaction\") is not None:
+                print(\"INPUT_PROBE stage2 window_open_delta=%s click_after_map_delta=%s\"%(ip.get(\"keyReaction\"),ip.get(\"reactionAfterMap\")))
+    # #509: WHICH PATH THE MEDIA ACTUALLY TOOK. The driver attaches result.ice.
+    # Surfacing it here is the whole point of the fix: the first TURN-configured
+    # run passed the 'no regression' gate while relaying nothing, and nothing in
+    # the RESULT lines would have shown that. A run that cannot say host vs relay
+    # has not measured the thing the gate claims to measure.
+    ice=d.get(\"ice\")
+    peers=ice if isinstance(ice,list) else []
+    if isinstance(ice,dict) and ice.get(\"error\"):
+        print(\"ICE unavailable %s\"%ice[\"error\"])
+    elif not peers:
+        print(\"ICE unavailable no_peer\")
+    else:
+        # The media peer is the one with an inbound video track; fall back to the
+        # first peer so a pre-decode failure still reports its candidate state.
+        p=next((x for x in peers if (x.get(\"inbound_video\") or {}).get(\"framesDecoded\")),peers[0])
+        sp=p.get(\"selected_pair\") or {}
+        lc=sp.get(\"local\") or {}; rc=sp.get(\"remote\") or {}
+        nsrv=len(p.get(\"configured_ice_servers\") or [])
+        print(\"ICE selected=%s/%s relay_protocol=%s servers=%d local_types=%s remote_types=%s state=%s\"%(
+            lc.get(\"type\") or \"none\", rc.get(\"type\") or \"none\",
+            lc.get(\"relayProtocol\") or \"none\", nsrv,
+            \",\".join(sorted(t for t in (p.get(\"local_candidate_types\") or []) if t)) or \"none\",
+            \",\".join(sorted(t for t in (p.get(\"remote_candidate_types\") or []) if t)) or \"none\",
+            p.get(\"ice_connection_state\")))
+        iv=p.get(\"inbound_video\") or {}
+        print(\"ICE_RTP mime=%s decoded=%s lost=%s freezes=%s bytes=%s\"%(
+            iv.get(\"mimeType\"),iv.get(\"framesDecoded\"),iv.get(\"packetsLost\"),
+            iv.get(\"freezeCount\"),iv.get(\"bytesReceived\")))
+        # One machine-readable line for bench_run.sh, in the same shape as
+        # BENCH_JSON below. Deliberately a LOW-CARDINALITY SUMMARY, not the raw
+        # block: the raw block carries candidate IP addresses and TURN server
+        # URLs, and this line is destined for an external bench store.
+        print(\"ICE_JSON \"+json.dumps({
+            \"local\":lc.get(\"type\") or \"none\",\"remote\":rc.get(\"type\") or \"none\",
+            \"relay_protocol\":lc.get(\"relayProtocol\") or \"none\",
+            \"servers\":nsrv,\"ice_connection_state\":p.get(\"ice_connection_state\"),
+            \"freezes\":iv.get(\"freezeCount\"),\"packets_lost\":iv.get(\"packetsLost\"),
+        },separators=(\",\",\":\")))
+    b=d.get(\"bench\")
+    if b:
+        st=b.get(\"stats\") or {}
+        ws=b.get(\"windows\") or []
+        print(\"BENCH windows=%d frames=%s decoded=%s located=%s\"%(len(ws),st.get(\"frames\"),st.get(\"decoded\"),st.get(\"located\")))
+        # One machine-readable line so bench_run.sh can lift the windows without
+        # re-parsing the whole (redacted, multi-line) browser output.
+        print(\"BENCH_JSON \"+json.dumps(b,separators=(\",\",\":\")))'
+fi
+if [ \$RUN_KEEP = 0 ]; then
+  qses_delete_session
+  CLEANUP_RESULT=deleted_on_success
+  echo 'session deleted'
+else
+  echo \"kept: qses stop \$SID --stack=$STACK  (and qses series \$SID)\"
+fi"
+  if [ "${QSES_RUN_COMPOSE_ONLY:-0}" = 1 ]; then
+    printf '%s\n' "$REMOTE_RUN"
+  else
+    # PIPED, not passed as an ssh argument: $REMOTE_RUN carries the stack's
+    # dev-agent key in a `DEV_KEY=...` assignment, and an ssh argument becomes
+    # the peer host's sshd child command line — readable by every user there for
+    # the length of the run.
+    printf '%s' "$REMOTE_RUN" | peer_script
+  fi
+  ;;
+
+display)
+  SID="${1:?usage: qses display <SID> [--stream WxH] [--render WxH] [--ui-scale S]}"
+  shift
+  # DX-layer-first: qses does no work of its own here, it just maps the
+  # --stack role/host onto HOST= for scripts/dx/session_display.sh, which
+  # reads the SAME .claude/skills/_shared/hosts.json registry qses does.
+  guard_stack display
+  HOST="$STACK" bash "$QSES_ROOT/scripts/dx/session_display.sh" "$SID" "$@"
+  ;;
+
+soak)
+  # Same DX-layer-first shape as `display`: no logic here, just HOST=<--stack>
+  # for scripts/dx/session_soak.sh. <SID> is positional; `--latest` (or no SID)
+  # picks the newest running session on that stack.
+  guard_stack soak
+  SOAK_ARGS=()
+  case "${1:-}" in --*|"") SOAK_ARGS=(--latest) ;; *) SOAK_ARGS=("$1"); shift ;; esac
+  HOST="$STACK" bash "$QSES_ROOT/scripts/dx/session_soak.sh" "${SOAK_ARGS[@]}" "$@"
+  ;;
+
+matrix)
+  # Destructive against a deploy-only host: matrix self-launches a session,
+  # walks a live one through resolution rungs, and stops what it started.
+  guard_stack matrix destructive
+  # SID is positional UNLESS --app is given (self-launch mode: matrix mints
+  # its own session so ownership of the signaling-token reconnect below is
+  # guaranteed, instead of requiring a pre-existing SID owned by the right
+  # identity).
+  SID=""
+  case "${1:-}" in --*|"") ;; *) SID="$1"; shift ;; esac
+  RUNGS="1280x720,1920x1080,1600x900"
+  APP=""
+  KEEP=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --rungs) [ $# -ge 2 ] || { echo "--rungs requires a value" >&2; exit 2; }; RUNGS="$2"; shift 2;;
+    --app) [ $# -ge 2 ] || { echo "--app requires a value" >&2; exit 2; }; APP="$2"; shift 2;;
+    --keep) KEEP=1; shift;;
+    *) echo "unknown arg $1" >&2; exit 2;;
+  esac; done
+  if [ -z "$SID" ] && [ -z "$APP" ]; then
+    echo "usage: qses matrix <SID> [--rungs W1xH1,...]  OR  qses matrix --app 'Name' [--rungs ...] [--keep]" >&2
+    exit 2
+  fi
+  if [ -n "$SID" ] && [ -n "$APP" ]; then
+    echo "matrix: pass either an existing <SID> OR --app 'Name' to self-launch one, not both" >&2
+    exit 2
+  fi
+
+  # A --app self-launched session is matrix's own responsibility to clean up —
+  # on BOTH the pass and fail path (a leaked session holds an encode slot
+  # exactly like a leaked `qses run --keep` one does). SELF_LAUNCHED flips to 1
+  # only once the launch actually produces a SID (below); an EXISTING <SID>
+  # passed by the caller is NEVER touched by this trap. --keep opts out.
+  SELF_LAUNCHED=0
+  matrix_cleanup() {
+    local rc=$?
+    if [ "${SELF_LAUNCHED:-0}" = 1 ] && [ "${KEEP:-0}" != 1 ] && [ -n "${SID:-}" ] && [ -n "${QSES_ADMIN_TOKEN:-}" ]; then
+      printf '%s' "curl -k -s -o /dev/null -X DELETE '$API/v1/sessions/$SID' -H \"Authorization: Bearer $QSES_ADMIN_TOKEN\"" \
+        | peer_script >/dev/null 2>&1 || true
+      echo "matrix: stopped session $SID"
+    fi
+    exit "$rc"
+  }
+
+  IFS=',' read -r -a RUNG_ARR <<< "$RUNGS"
+  N_RUNGS=${#RUNG_ARR[@]}
+  [ "$N_RUNGS" -ge 1 ] || { echo "matrix: --rungs produced no rungs" >&2; exit 2; }
+
+  # ── Resolve the admin identity that will own the session + issue the
+  # per-rung PATCHes. QSES_ADMIN_TOKEN (this workstation's env) always wins
+  # if the caller already set it (same override admin_exec()/session_display.sh
+  # honor — see the qses header). Otherwise, in --app self-launch mode, mint a
+  # fresh long-TTL admin dev-agent identity: ownership of the
+  # signaling-token reconnect is then guaranteed, since THIS identity is the
+  # one that launches the session below. In existing-SID mode with no preset
+  # token, defer to admin_exec's own BOOTSTRAP_ADMIN login (unchanged).
+  if [ -z "${QSES_ADMIN_TOKEN:-}" ] && [ -n "$APP" ]; then
+    echo "matrix: minting a long-TTL admin identity to self-launch '$APP' (guarantees signaling-token ownership)"
+    printf -v DEV_KEY_Q '%q' "$DEV_KEY"
+    printf -v API_MINT_Q '%q' "$API"
+    AGENTCREDS_JSON="$(printf '%s' "cd '$PEER_DIR' && QUASAR_DEV_AGENT_KEY=$DEV_KEY_Q bash scripts/dx/agentcreds.sh --role admin --ttl 2h --url $API_MINT_Q" | peer_script)" || {
+      echo "matrix FAILED: could not mint an admin identity for self-launch — set QSES_DEV_KEY/QUASAR_DEV_AGENT_KEY for this stack, or pass QSES_ADMIN_TOKEN directly to skip minting" >&2
+      exit 1
+    }
+    MINTED_TOKEN="$(echo "$AGENTCREDS_JSON" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("quasar.auth.token",""))' 2>/dev/null || true)"
+    [ -n "$MINTED_TOKEN" ] || { echo "matrix FAILED: could not parse the minted admin token" >&2; echo "$AGENTCREDS_JSON" >&2; exit 1; }
+    export QSES_ADMIN_TOKEN="$MINTED_TOKEN"
+  fi
+
+  if [ -n "$APP" ]; then
+    echo "matrix: launching '$APP' as the (self-minted or preset) admin identity"
+    printf -v APP_Q '%q' "$APP"
+    printf -v AUTH_TOKEN_LAUNCH_Q '%q' "$QSES_ADMIN_TOKEN"
+    printf -v API_LAUNCH_Q '%q' "$API"
+    LAUNCH_OUT="$(printf '%s' "cd '$PEER_DIR'
+API=$API_LAUNCH_Q
+AUTH_TOKEN=$AUTH_TOKEN_LAUNCH_Q
+APP_ID=\$(curl -k -fs \"\$API/v1/apps\" -H \"Authorization: Bearer \$AUTH_TOKEN\" | QSES_APP=$APP_Q python3 -c '
+import os,sys,json
+name=os.environ[\"QSES_APP\"].lower()
+for a in json.load(sys.stdin).get(\"items\",[]):
+    if name in a[\"name\"].lower(): print(a[\"id\"]); break')
+[ -n \"\$APP_ID\" ] || { echo \"app not found: $APP\" >&2; exit 1; }
+RESP=\$(curl -k -s -w '\n%{http_code}' -X POST \"\$API/v1/sessions\" -H \"Authorization: Bearer \$AUTH_TOKEN\" -H 'Content-Type: application/json' -d \"{\\\"app_id\\\":\\\"\$APP_ID\\\"}\")
+CODE=\$(echo \"\$RESP\" | tail -1); LA=\$(echo \"\$RESP\" | sed '\$d')
+[ \"\$CODE\" = 201 ] || { echo \"launch failed: HTTP \$CODE — \$LA\" >&2; exit 1; }
+echo \"\$LA\" | python3 -c 'import sys,json;print(json.load(sys.stdin)[\"session\"][\"id\"])'" | peer_script)" || {
+      echo "matrix FAILED: could not launch '$APP' — see stderr above" >&2; exit 1; }
+    SID="$LAUNCH_OUT"
+    [ -n "$SID" ] || { echo "matrix FAILED: launch produced no session id" >&2; exit 1; }
+    # From here on this SID is matrix's own — arm the cleanup trap so it gets
+    # stopped on ANY exit (including every early `exit 1` below), not just a
+    # clean finish.
+    SELF_LAUNCHED=1
+    trap matrix_cleanup EXIT
+    echo "matrix: launched SID=$SID, waiting for state=running"
+    RUNNING=0
+    for _ in $(seq 1 30); do
+      sleep 2
+      ST="$(printf '%s' "curl -k -fs '$API/v1/sessions/$SID' -H \"Authorization: Bearer $QSES_ADMIN_TOKEN\" | python3 -c 'import sys,json;print(json.load(sys.stdin)[\"session\"][\"state\"])'" | peer_script 2>/dev/null)" || ST=""
+      [ "$ST" = running ] && { RUNNING=1; break; }
+      [ "$ST" = failed ] && { echo "matrix FAILED: self-launched session $SID failed" >&2; exit 1; }
+    done
+    [ "$RUNNING" = 1 ] || { echo "matrix FAILED: self-launched session $SID never reached running" >&2; exit 1; }
+  fi
+
+  echo "MATRIX sid=$SID stack=$STACK rungs=$RUNGS"
+
+  # ── Reconnect signaling once, on the resolved admin identity (QSES_ADMIN_TOKEN
+  # if set/minted above, else admin_exec()'s own BOOTSTRAP_ADMIN login — it
+  # honors the same override internally). This is the ONE AND ONLY browser
+  # attach for the entire matrix run: reconnecting per rung would each mint a
+  # fresh offer and blow the "offer created count == 1" invariant asserted
+  # below. POST /v1/sessions/{id}/signaling-token requires the caller to OWN
+  # the session (protocol/control-api.md) — self-launch mode guarantees that;
+  # an existing SID from a throwaway per-run user (qses run's default, #399)
+  # still 404s here unless QSES_ADMIN_TOKEN/--app is used.
+  RECONNECT="$(admin_exec "RESP=\$(curl -k -s -w '\n%{http_code}' -X POST \"\$API/v1/sessions/$SID/signaling-token\" -H \"Authorization: Bearer \$ADMIN\")
+CODE=\$(echo \"\$RESP\" | tail -1); BODY=\$(echo \"\$RESP\" | sed '\$d')
+if [ \"\$CODE\" != 201 ]; then echo \"RECONNECT_FAILED http=\$CODE body=\$BODY\"; exit 0; fi
+echo \"\$BODY\" | python3 -c 'import sys,json
+d=json.load(sys.stdin)[\"signaling\"]
+print(\"SIG_URL=\"+d[\"url\"])
+print(\"SIG_TOKEN=\"+d[\"token\"])'")" || true
+  if echo "$RECONNECT" | grep -q '^RECONNECT_FAILED'; then
+    echo "matrix FAILED: could not reconnect signaling for $SID on stack=$STACK" >&2
+    echo "$RECONNECT" >&2
+    echo "hint: /v1/sessions/{id}/signaling-token requires the ADMIN identity to OWN the session — use --app to self-launch, or pass QSES_ADMIN_TOKEN=<token that launched $SID>" >&2
+    exit 1
+  fi
+  SIG_URL="$(echo "$RECONNECT" | sed -n 's/^SIG_URL=//p')"
+  SIG_TOKEN="$(echo "$RECONNECT" | sed -n 's/^SIG_TOKEN=//p')"
+  # The admin bearer is ALREADY resolved on this workstation — the admin_exec
+  # call above went through resolve_admin_token to build it. It used to be
+  # echoed back by the remote snippet, which put it inside $RECONNECT — and
+  # $RECONNECT is printed verbatim to stderr on both failure paths below. Read
+  # it locally instead, so no diagnostic can ever carry the token.
+  resolve_admin_token
+  AUTH_TOKEN="$QSES_ADMIN_BEARER"
+  [ -n "$SIG_URL" ] && [ -n "$SIG_TOKEN" ] && [ -n "$AUTH_TOKEN" ] || {
+    echo "matrix FAILED: incomplete signaling-token response for $SID" >&2; echo "$RECONNECT" >&2; exit 1; }
+
+  # Root-caused live on the devbox (2026-08-16): the per-rung PATCH used to
+  # call scripts/dx/session_display.sh with NO token, so it did its OWN
+  # separate BOOTSTRAP_ADMIN login on the target host — on a stack with no
+  # (or stale) BOOTSTRAP_ADMIN creds in deploy/.env that login silently
+  # failed, session_display.sh never printed an "HTTP <code>" line, and the
+  # matrix table read "HTTP ?" for every rung with no PATCH ever reaching the
+  # control plane. Exporting the admin token we JUST verified works (via the
+  # reconnect call above) makes every downstream call — including
+  # session_display.sh's own QSES_ADMIN_TOKEN override — reuse it instead of
+  # re-authenticating.
+  export QSES_ADMIN_TOKEN="$AUTH_TOKEN"
+
+  # HOLD_SECS: the .mjs process's internal clock starts at PROCESS LAUNCH, not
+  # at decode-confirmed — connecting + waiting for decode (up to
+  # CONNECT_TIMEOUT_MS=45s, plus ~2s page nav) already consumes part of the
+  # budget before this loop issues a single PATCH, and each rung's own
+  # patch+settle+probe-read cycle adds more on top. Root-caused live
+  # (devbox): an earlier, too-tight budget let HOLD expire mid-loop, closing
+  # the browser — every remaining rung then read back `decodeFailed:true
+  # videoWidth:0` because the page was already gone, not because the resize
+  # failed. Budget generously so the explicit `pkill` after the loop is what
+  # actually ends the probe, never the hold's own timeout.
+  CONNECT_BUDGET_SECS=60
+  HOLD_SECS=$(( CONNECT_BUDGET_SECS + N_RUNGS * 25 + 60 ))
+  PROBE_FILE="/tmp/qses-matrix-${SID}.jsonl"
+  printf -v SIG_URL_Q '%q' "$SIG_URL"
+  printf -v SIG_TOKEN_Q '%q' "$SIG_TOKEN"
+  printf -v AUTH_TOKEN_Q '%q' "$AUTH_TOKEN"
+  printf -v SID_Q '%q' "$SID"
+  printf -v API_Q '%q' "$API"
+
+  echo "matrix: starting the HOLD-mode browser probe on $PEER_HOST (single connection for the whole run)"
+  # `env VAR=...` puts every assignment into env's OWN argv, so this backgrounded
+  # probe used to advertise SIG_TOKEN and AUTH_TOKEN in `ps` for the entire
+  # matrix run — the longest-lived credential exposure in this script. The two
+  # secrets are now shell PREFIX assignments (environment, never argv); the
+  # non-secret ones stay under `env` because the SID-scoped `pkill -f` below
+  # matches "SID=<id>" in the command line and needs it to still be there.
+  # The script itself travels on stdin.
+  printf '%s' "cd '$PEER_DIR' && rm -f '$PROBE_FILE' '$PROBE_FILE.err'
+SIG_TOKEN=$SIG_TOKEN_Q AUTH_TOKEN=$AUTH_TOKEN_Q \
+nohup env SPA_URL=$API_Q SID=$SID_Q SIG_URL=$SIG_URL_Q \
+  TMPDIR=$PEER_TMPDIR \
+  APP_NAME=matrix-probe CHROME=$CFT PW_DIR=$PWD_DIR CONNECT_TIMEOUT_MS=45000 \
+  node scripts/harness/peer-driver.mjs --hold $HOLD_SECS --probe-every 1000 \
+  >'$PROBE_FILE' 2>'$PROBE_FILE.err' </dev/null &
+disown
+true" | peer_script
+
+  DECODE_OK=0
+  for _ in $(seq 1 30); do
+    sleep 2
+    if peer_ssh "[ -s '$PROBE_FILE' ] && head -n1 '$PROBE_FILE' | grep -q videoWidth" 2>/dev/null; then
+      DECODE_OK=1; break
+    fi
+  done
+  if [ "$DECODE_OK" != 1 ]; then
+    echo "matrix FAILED: probe never produced a decode sample — see $PROBE_FILE / $PROBE_FILE.err on $PEER_HOST" >&2
+    peer_ssh "tail -n 60 '$PROBE_FILE.err' 2>/dev/null" >&2 || true
+    exit 1
+  fi
+  echo "matrix: decode confirmed, stepping $N_RUNGS rung(s)"
+
+  printf '%-12s %-6s %-10s %-9s %-10s %-6s\n' RUNG HTTP VW_MATCH FRAMES DECODE_OK RESULT
+  FAIL_N=0
+  for r in "${RUNG_ARR[@]}"; do
+    W="${r%%x*}"; H="${r#*x}"
+    case "$W$H" in ''|*[!0-9]*)
+      printf '%-12s %-6s %-10s %-9s %-10s %-6s\n' "$r" - - - - "FAIL(bad rung)"
+      FAIL_N=$((FAIL_N+1)); continue ;;
+    esac
+
+    SERIES_BEFORE="$("$0" series "$SID" --stack="$STACK" 2>/dev/null | tr '\n' ' ' || true)"
+    FRAMES_BEFORE="$(peer_ssh "tail -n1 '$PROBE_FILE' 2>/dev/null" 2>/dev/null \
+      | python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get("totalVideoFrames",0))
+except Exception: print(0)' 2>/dev/null || echo 0)"
+
+    # QSES_ADMIN_TOKEN is exported above (the reconnect's verified-working
+    # admin bearer) — passing it explicitly here (on top of the export)
+    # guarantees session_display.sh skips its own BOOTSTRAP_ADMIN login and
+    # reuses this token, which is the actual fix for the "HTTP ?" / PATCH
+    # never reaching the control plane failure mode.
+    PATCH_OUT="$(HOST="$STACK" QSES_ADMIN_TOKEN="$AUTH_TOKEN" bash "$QSES_ROOT/scripts/dx/session_display.sh" "$SID" --stream "${W}x${H}" 2>&1)" || true
+    HTTP="$(echo "$PATCH_OUT" | sed -n 's/^HTTP \([0-9]*\).*/\1/p' | head -n1)"
+    if [ -z "$HTTP" ]; then
+      echo "  PATCH did not return an HTTP line — raw output:" >&2
+      echo "$PATCH_OUT" | sed 's/^/    /' >&2
+    fi
+
+    sleep 3
+    SERIES_AFTER="$("$0" series "$SID" --stack="$STACK" 2>/dev/null | tr '\n' ' ' || true)"
+
+    CHECK="$(peer_ssh "tail -n 8 '$PROBE_FILE' 2>/dev/null" 2>/dev/null | python3 -c "
+import sys, json
+w = $W
+lines = []
+for l in sys.stdin:
+    l = l.strip()
+    if not l: continue
+    try: lines.append(json.loads(l))
+    except Exception: pass
+matched = any(x.get('videoWidth') == w for x in lines)
+failed = any(x.get('decodeFailed') for x in lines)
+frames = lines[-1].get('totalVideoFrames', 0) if lines else 0
+print('MATCH=%d DECODE_FAILED=%d FRAMES_AFTER=%d' % (int(matched), int(failed), frames))
+" 2>/dev/null)" || CHECK=""
+    [ -n "$CHECK" ] || CHECK="MATCH=0 DECODE_FAILED=1 FRAMES_AFTER=0"
+    MATCH="$(echo "$CHECK" | sed -n 's/.*MATCH=\([01]\).*/\1/p')"
+    DFAIL="$(echo "$CHECK" | sed -n 's/.*DECODE_FAILED=\([01]\).*/\1/p')"
+    FRAMES_AFTER="$(echo "$CHECK" | sed -n 's/.*FRAMES_AFTER=\([0-9]*\).*/\1/p')"
+    FRAMES_AFTER="${FRAMES_AFTER:-0}"; FRAMES_BEFORE="${FRAMES_BEFORE:-0}"
+    FRAMES_DELTA=$(( FRAMES_AFTER - FRAMES_BEFORE ))
+
+    RESULT=PASS
+    [ "$HTTP" = "202" ] || RESULT=FAIL
+    [ "${MATCH:-0}" = "1" ] || RESULT=FAIL
+    [ "${DFAIL:-1}" = "0" ] || RESULT=FAIL
+    [ "$FRAMES_DELTA" -ge 30 ] 2>/dev/null || RESULT=FAIL
+    [ "$RESULT" = FAIL ] && FAIL_N=$((FAIL_N+1))
+
+    printf '%-12s %-6s %-10s %-9s %-10s %-6s\n' "${W}x${H}" "${HTTP:-?}" "match=${MATCH:-0}" "d=$FRAMES_DELTA" "fail=${DFAIL:-1}" "$RESULT"
+    echo "  series(before): ${SERIES_BEFORE:-n/a}"
+    echo "  series(after) : ${SERIES_AFTER:-n/a}"
+  done
+
+  # Explicit stop — SID-scoped so a concurrent matrix run's probe on the same
+  # peer host is never collaterally killed (pkill -f matches the full
+  # command line, which includes the "SID=<...>" env assignment the launch
+  # command below sets).
+  echo "matrix: stopping the held probe"
+  peer_ssh "pkill -f \"SID=$SID .*peer-driver.mjs --hold\" 2>/dev/null; true" || true
+
+  # One-offer assertion — counts the VIDEO PC's "offer created" line only.
+  # There is ALSO one for the audio PC (a separate PeerConnection, separate
+  # offer) when the session streams audio, so grepping "offer created"
+  # unscoped over-counts by design, not by bug — this counts pc=video.
+  #
+  # The line is now tagged `session=<id>` by the agent (node-agent/src/
+  # session/pipeline/webrtc.rs, fixed alongside this harness change) — until
+  # that build is the one actually deployed, an OLDER agent emits the same
+  # line with NO session tag, which used to make this assertion count 0 and
+  # FAIL on every single run regardless of what actually happened (the
+  # original bug this fix replaces). So: 0 tagged + >=1 untagged in the
+  # window is treated as "old agent, can't judge" — WARN, not FAIL. Any other
+  # count off of exactly 1 tagged is a real renegotiation-storm FAIL.
+  SINCE="${QSES_MATRIX_SINCE:-15m}"
+  TAGGED_VIDEO_OFFERS="$(agent_logs "$SINCE" 'offer created \(video PC' | grep -c "session=$SID\b" || true)"
+  ANY_VIDEO_OFFERS="$(agent_logs "$SINCE" 'offer created \(video PC' | wc -l | tr -d ' ')"
+  echo "offer created (video PC) for $SID (since $SINCE): tagged=$TAGGED_VIDEO_OFFERS of $ANY_VIDEO_OFFERS total in window"
+  if [ "$TAGGED_VIDEO_OFFERS" = 1 ]; then
+    : # exactly one tagged video offer — the invariant holds
+  elif [ "$TAGGED_VIDEO_OFFERS" = 0 ] && [ "$ANY_VIDEO_OFFERS" -ge 1 ] 2>/dev/null; then
+    echo "matrix WARNING: 0 offers tagged session=$SID but $ANY_VIDEO_OFFERS untagged 'offer created (video PC' line(s) in the window — looks like an OLDER agent build (pre session-tagging fix), not a renegotiation storm. Not counted as a failure; re-run once the current agent build is deployed to judge this for real." >&2
+  else
+    echo "matrix WARNING: expected exactly 1 tagged video offer for $SID, saw $TAGGED_VIDEO_OFFERS (of $ANY_VIDEO_OFFERS total in window) — renegotiation storm? verify manually with: qses logs abr --stack=$STACK" >&2
+    FAIL_N=$((FAIL_N+1))
+  fi
+
+  if [ "$FAIL_N" -eq 0 ]; then
+    echo "MATRIX OVERALL: PASS ($N_RUNGS rung(s), 1 offer)"
+  else
+    echo "MATRIX OVERALL: FAIL ($FAIL_N issue(s) — see table/warnings above)" >&2
+    exit 1
+  fi
+  ;;
+
+series)
+  SID="${1:?usage: qses series <SID>}"
+  admin_exec "curl -k -s \"\$API/v1/admin/sessions/$SID/metrics?source=agent&limit=40\" -H \"Authorization: Bearer \$ADMIN\" | python3 -c '
+import sys,json
+items=list(reversed(json.load(sys.stdin).get(\"items\",[])))
+print(\"setpoint:\", [i[\"metrics\"].get(\"abr_setpoint_kbps\") for i in items])
+print(\"fps     :\", [round(i[\"metrics\"].get(\"fps\",0)) for i in items])
+print(\"enc_ms  :\", [round(i[\"metrics\"][\"encode_ms\"],1) if i[\"metrics\"].get(\"encode_ms\") else None for i in items])'"
+  ;;
+
+logs)
+  GROUP="${1:-abr}"
+  case "$GROUP" in
+    abr) PAT='AS-03 ABR|offer created|rtpgccbwe' ;;
+    ice) PAT='ICE|candidate|CONNECTED|connection state' ;;
+    all) PAT='.' ;;
+    *)   PAT="$GROUP" ;;  # any custom grep -E pattern
+  esac
+  agent_logs "${QSES_SINCE:-5m}" "$PAT" | tail -n "${QSES_LINES:-25}"
+  ;;
+
+ls)
+  # #399: mint a throwaway per-run identity instead of logging in as a shared
+  # harness account (same DEV_KEY resolution as `run`).
+  printf -v LS_DEV_KEY_Q '%q' "$DEV_KEY"
+  # The dev key travels on stdin, not in the ssh command argument.
+  printf '%s' "cd '$PEER_DIR'
+API=$API
+DEV_KEY=$LS_DEV_KEY_Q
+AGENTCREDS_JSON=\$(QUASAR_DEV_AGENT_KEY=\$DEV_KEY bash scripts/dx/agentcreds.sh --role user --ttl 10m --url \"\$API\") || {
+  echo 'agent-creds mint failed — set QSES_DEV_KEY/QUASAR_DEV_AGENT_KEY for this stack (needs QUASAR_DEV_AGENT_AUTH=1 there)' >&2
+  exit 1
+}
+TOK=\$(printf '%s' \"\$AGENTCREDS_JSON\" | python3 -c 'import sys,json;print(json.load(sys.stdin)[\"quasar.auth.token\"])')
+curl -k -fs \$API/v1/sessions -H \"Authorization: Bearer \$TOK\" | python3 -c '
+import sys,json
+for s in json.load(sys.stdin).get(\"items\",[]): print(s[\"id\"], s[\"state\"], s.get(\"app_id\",\"\")[:8])'" | peer_script
+  ;;
+
+stop)
+  # W3 (#378): the only real stop route is DELETE /v1/sessions/{id} — there has
+  # never been an admin-namespaced session-delete route (the SPA 404 fallback
+  # made a prior admin-path attempt look like it "worked"). canAccess already
+  # admits an admin bearer for any owner's session, so this runs on the stack's
+  # own host with the shared credential resolver above — which means it honours
+  # QSES_ADMIN_TOKEN and can mint from the per-boot dev key. It used to do its
+  # OWN BOOTSTRAP_ADMIN login and nothing else, so on a stack whose bootstrap
+  # password had been rotated (devbox) it authenticated with an EMPTY bearer.
+  #
+  # CROSS-STACK 404 TRAP (triaged 2026-07-25): `qses stop <SID>` against the WRONG
+  # --stack deletes on a stack whose DB has no such row → a genuine 404 that reads
+  # as "already gone" while the real session is still running. This masqueraded as
+  # a control-plane DELETE race 3x; the server path is deterministic (DB-first
+  # lookup, verified 202 at +2s after running). A 404 is therefore a FAILURE here,
+  # not a success: a session that really was stopped keeps its row and answers 200
+  # with state=stopped. Hence the stack name in every outcome line below.
+  #
+  # And 202 means ACCEPTED, not stopped. The only honest report comes from reading
+  # the session back until it reaches a terminal state.
+  SID="${1:?usage: qses stop <SID>}"
+  # Destructive against a deploy-only host: this kills a live session there, and
+  # nothing gives it back. No flag confirms it.
+  guard_stack stop destructive
+  STOP_API="$(q_host_cfg "$STACK_HOST" api)"; [ -n "$STOP_API" ] || STOP_API="$API"
+  STOP_AUTH="$(admin_auth_snippet)"
+  # stdin, not argv — the bearer must not reach the host's process list. The
+  # script is built as a double-quoted string (its \" / \$ escapes are written
+  # for that context) and PIPED, rather than moved into a here-doc where those
+  # escapes would mean something different.
+  STOP_SCRIPT="cd '$STACK_DIR' && set -a; . deploy/.env 2>/dev/null; set +a
+API=$STOP_API
+$STOP_AUTH
+RESP=\$(curl -k -s -w '\n%{http_code}' -X DELETE \"\$API/v1/sessions/$SID\" -H \"Authorization: Bearer \$ADMIN\")
+CODE=\$(echo \"\$RESP\" | tail -1); BODY=\$(echo \"\$RESP\" | sed '\$d')
+case \"\$CODE\" in
+  2*|404) ;;
+  *) echo \"qses stop FAILED (stack=$STACK): DELETE /v1/sessions/$SID -> HTTP \$CODE — \$BODY\" >&2; exit 1 ;;
+esac
+STATE=''
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  GET=\$(curl -k -s -w '\n%{http_code}' \"\$API/v1/sessions/$SID\" -H \"Authorization: Bearer \$ADMIN\")
+  GCODE=\$(echo \"\$GET\" | tail -1)
+  if [ \"\$GCODE\" = 404 ]; then STATE=absent; break; fi
+  if [ \"\$GCODE\" = 200 ]; then
+    STATE=\$(echo \"\$GET\" | sed '\$d' | python3 -c 'import sys,json
+d = json.load(sys.stdin)
+s = d.get(\"session\") if isinstance(d.get(\"session\"), dict) else d
+print((s or {}).get(\"state\") or \"\")' 2>/dev/null || echo '')
+    case \"\$STATE\" in stopped|failed) break ;; esac
+  fi
+  sleep 3
+done
+case \"\$STATE\" in
+  stopped|failed)
+    echo \"stopped $SID (state=\$STATE, stack=$STACK)\" ;;
+  absent)
+    echo 'qses stop FAILED (stack=$STACK): there is NO session $SID on this stack (404 on the follow-up GET).' >&2
+    echo 'A 404 is NOT proof it is gone — a stopped session keeps its row. If this session was launched on a DIFFERENT stack it is still running there: rerun with the matching --stack= flag.' >&2
+    exit 1 ;;
+  *)
+    echo \"qses stop FAILED (stack=$STACK): session $SID is still '\$STATE' ~30s after DELETE returned \$CODE — it is holding an encode slot, stop it before launching anything else\" >&2
+    exit 1 ;;
+esac"
+  printf '%s' "$STOP_SCRIPT" | ssh_script "$STACK_HOST"
+  ;;
+
+*)
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  ;;
+esac

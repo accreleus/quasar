@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# qdiag-ir-experiment — orchestrate the IR-period experiment matrix (rows × cols)
+#                        per docs/design/plans/2026-07-21-ir-period-experiment.md §4/§6a.
+#
+# Usage:
+#   qdiag-ir-experiment [--rows ir-off,ir-cont,ir-60,ir-120] [--cols clean,loss1,burst]
+#                       [--duration 120] [--out qdiag-runs/]
+#                       [--dry-run] [--resume] [--fail-fast]
+#   qdiag-ir-experiment --help
+#
+#   qdiag-ir-experiment --rows ir-cont --cols clean --dry-run   # print the plan, no execution
+#   qdiag-ir-experiment                                         # full 12-cell matrix on the gpu-test host
+#
+# All matrix values (row env settings, col netem args) come from config.json's
+# ir_experiment block — no literals here. Real logic lives in
+# scripts/dx/session_diagnose/ir_experiment_runner.py; this wrapper only sources _shared/lib.sh so
+# the role-derived QUASAR_GPU_* env is set, then delegates.
+set -euo pipefail
+
+SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(cd "$SKILL_DIR/../../.." && pwd)"
+source "$(dirname "$0")/../../_shared/lib.sh"
+
+# Same contract as qdiag-experiment: the runner sets IR env on the host and
+# recreates the node-agent per cell, so a deploy-only host refuses it outright.
+# The matrix always targets the gpu-test role (that is where QUASAR_GPU_* points).
+q_guard_mutating qdiag gpu-test 0 ir-experiment destructive
+
+cd "$REPO_ROOT"
+exec python3 "$(cd "$SKILL_DIR/../../.." && pwd)/scripts/dx/session_diagnose/ir_experiment_runner.py" "$@"
