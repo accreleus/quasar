@@ -19,8 +19,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use quasar_node_agent::session::metrics::SessionMetrics;
+// criterion 0.8 deprecated its own `black_box` re-export in favour of std's.
+use std::hint::black_box;
 
 const PENDING_CAP: usize = 64;
 
