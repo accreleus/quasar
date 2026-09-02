@@ -15,17 +15,38 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # P1-5: graduated session pipeline (compositor -> encode -> webrtcbin) +
-# WebRTC negotiation / SDP marshalling. Versions match the proven spike/host
-# (GStreamer 1.24, as the gst-wayland-display compositor targets).
-gstreamer = "0.23"
-gstreamer-webrtc = "0.23"
-gstreamer-sdp = "0.23"
+# WebRTC negotiation / SDP marshalling.
+#
+# The gstreamer-rs family — every `gstreamer*` crate PLUS `glib` and the `-sys`
+# crates they pull — moves as ONE generation. Two glib generations linked into one
+# binary is never acceptable: the subclass traits (`ObjectSubclass`, `ElementImpl`,
+# `RTPHeaderExtensionImpl`) are per-crate-version, so a `glib 0.20` subclass impl
+# does not satisfy a `gstreamer-rtp 0.25` bound and the build fails with an E0277
+# cascade that reads like a macro change. `.github/dependabot.yml` groups them for
+# the same reason; if a bump ever splits them, bump the stragglers by hand.
+# gstreamer-rs 0.25 <-> glib 0.22, MSRV 1.92.
+#
+# GStreamer floor: gstreamer-sys 0.25 requires gstreamer-1.0 >= 1.14 by default and
+# >= 1.20 with the `v1_20` feature enabled below. The vendored runtime is pinned at
+# 1.28.4 (docs/third-party-pins.md) and CI runs against 1.24, so do NOT enable a
+# `v1_26`/`v1_28`/`v1_30` feature here — it would raise the floor above CI's gst.
+#
+# Cargo.lock PIN: `kstring` is held at 2.0.2. gstreamer 0.25 depends on it (^2.0) and
+# kstring 2.0.3+ raises its MSRV to rustc 1.96, above the toolchain the image lineage
+# pins (deploy/Dockerfile.vulkan `ARG RUST_VERSION=1.94.0`), so an unpinned resolve
+# builds fine on CI's `stable` and then fails the agent image build with
+# "rustc 1.94.0 is not supported by the following package: kstring@2.0.4".
+# Re-pin with `cargo update -p kstring --precise 2.0.2` after any lockfile churn,
+# or lift the pin once RUST_VERSION reaches 1.96.
+gstreamer = "0.25"
+gstreamer-webrtc = "0.25"
+gstreamer-sdp = "0.25"
 # g2g: RTPBuffer writable access for the abs-capture-time one-byte-header extension.
-gstreamer-rtp = { version = "0.23", features = ["v1_20"] }
+gstreamer-rtp = { version = "0.25", features = ["v1_20"] }
 # Adaptive external resolution: the typed upstream force-key-unit event used to make
 # the encoder emit an IDR (with headers) right after a live resolution change.
-gstreamer-video = "0.23"
-glib = "0.20"
+gstreamer-video = "0.25"
+glib = "0.22"
 
 # P1-5 (container launch): virtual evdev input devices (uinput) so a
 # containerized game — and the gamepad, which Wayland has no protocol for — sees
