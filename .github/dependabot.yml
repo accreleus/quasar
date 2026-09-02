@@ -63,6 +63,14 @@ updates:
           - "@vitejs/*"
           - "vitest"
           - "@vitest/*"
+    # openapi-typescript (the gen:api generator whose output is a checked-in
+    # contract artifact) peers on typescript ^5.x with no release accepting a
+    # newer major. Until its peer range moves, a typescript major bump can only
+    # install with --legacy-peer-deps, which we will not do (#72, and the
+    # earlier typescript 7 PR, both closed for this reason).
+    ignore:
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: npm
     directory: /site
