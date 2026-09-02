@@ -115,3 +115,35 @@ describe("v3 primitives", () => {
     expect(css).not.toMatch(/#[0-9a-f]{3,8}\b/i);
   });
 });
+
+/**
+ * The global a11y focus floor in styles.css lists a bare `input:focus-visible`
+ * and gives it a 2px accent outline. That is right for a lone control and wrong
+ * for a composite field: `.search` and `.pal-in` wrap an icon plus a bare
+ * <input> and take the focus treatment on the WRAPPER, so the floor draws a
+ * second, smaller ring around the input alone — a box inside a box, inset from
+ * the field by the padding, the icon and the gap (#87: a 288px ring in a 340px
+ * search field).
+ *
+ * Each wrapper opts its own input out, with a selector that out-specifies the
+ * floor (0,2,1 against 0,1,1) so the outcome does not depend on the sheet order
+ * in main.tsx.
+ */
+const globalCss = readFileSync(resolve(__dirname, "../styles.css"), "utf8");
+
+describe("composite fields keep the focus ring on the wrapper", () => {
+  // The tripwire. If the floor is ever scoped so it stops matching a bare
+  // input, these opt-outs are dead weight and should be removed with it.
+  it("styles.css still rings every bare input", () => {
+    expect(globalCss).toMatch(/^input:focus-visible,$/m);
+  });
+
+  it.each([".search", ".pal-in"])("%s opts its input out of the floor", (wrap) => {
+    expect(rule(`${wrap} input:focus-visible`)).toMatch(/outline:\s*none/);
+    // The opt-out only removes a duplicate: the wrapper must still announce
+    // focus, or suppressing the ring would leave the field with no indicator.
+    expect(css, `${wrap} must still show focus`).toMatch(
+      new RegExp(`^\\${wrap}:focus-within\\s*\\{`, "m"),
+    );
+  });
+});
