@@ -356,6 +356,19 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
 
   function set(next: Partial<SessionRuntimeSnapshot>): void {
     if (destroyed) return; // L5
+    // A no-op write must not notify: the telemetry sink re-reports
+    // displayRefreshHz every snapshot (~1 Hz), and an unconditional notify
+    // re-rendered SessionPage each tick — which replayed the HUD shelf's
+    // entry animation through Hud's per-render measure() (#78).
+    let changed = false;
+    for (const k in next) {
+      const key = k as keyof SessionRuntimeSnapshot;
+      if (!Object.is(snapshot[key], next[key])) {
+        changed = true;
+        break;
+      }
+    }
+    if (!changed) return;
     snapshot = { ...snapshot, ...next };
     for (const listener of [...listeners]) listener();
   }

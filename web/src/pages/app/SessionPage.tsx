@@ -11,7 +11,7 @@
 // snapshot, so the video/input subtree re-renders only on status/channelOpen/
 // pointerLocked/stopping/hostLost/health, never per telemetry tick.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import "../../styles/session.css";
 import "../../styles/hud.css";
@@ -727,6 +727,17 @@ export function SessionPage() {
   // AS10-14: parse fps from tier string e.g. "1920×1080@60" → 60.
   const tierFps = state?.tier ? parseInt(state.tier.split("@")[1] ?? "", 10) || null : null;
 
+  // Memoized: an inline object literal here churned the HUD's prop identity on
+  // every render, and Hud's per-render measure() turned that into a visible
+  // shelf-pane flash each telemetry tick (#78).
+  const displayHzWarning = useMemo(
+    () =>
+      tierFps != null && displayRefreshHz != null && tierFps > displayRefreshHz
+        ? { displayHz: displayRefreshHz, streamFps: tierFps }
+        : null,
+    [tierFps, displayRefreshHz],
+  );
+
   // Poll is authoritative; the tier string is only the pre-first-poll seed.
   const streamSize = polledStreamSize ?? parseTierSize(state?.tier);
 
@@ -935,11 +946,7 @@ export function SessionPage() {
             scalingMode={scalingMode}
             onScalingChange={handleScalingChange}
             startedAt={startedAt}
-            displayHzWarning={
-              tierFps != null && displayRefreshHz != null && tierFps > displayRefreshHz
-                ? { displayHz: displayRefreshHz, streamFps: tierFps }
-                : null
-            }
+            displayHzWarning={displayHzWarning}
             streamSize={streamSize}
             // Null = "match the stream" / still at launch size — the pane
             // resolves it against `streamSize`, so this page never duplicates
