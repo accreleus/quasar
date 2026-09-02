@@ -76,7 +76,6 @@ export interface HudProps {
 
   scalingMode: ScalingMode;
   onScalingChange: (m: ScalingMode) => void;
-  displayHzWarning: { displayHz: number; streamFps: number } | null;
   /** `session.started_at`, for the stats pane's elapsed row. */
   startedAt?: string | null;
 
@@ -383,7 +382,6 @@ export const Hud = forwardRef<HudHandle, HudProps>(function Hud(props, ref) {
             tier={props.tier}
             resolvedCodec={props.resolvedCodec}
             sessionId={props.sessionId}
-            displayHzWarning={props.displayHzWarning}
             startedAt={props.startedAt}
           />
         );
