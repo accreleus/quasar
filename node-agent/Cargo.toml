@@ -67,7 +67,7 @@ sha2 = "0.11"
 # alsactl-restore, so the agent must flip it on itself every session start
 # (see `session::audio::enable_iec958_playback_switches`). Uses alsa-lib,
 # already a runtime dependency of `alsasink`/`pulsesrc`.
-alsa = "0.9"
+alsa = "0.12"
 
 [features]
 # ZC-02 N-A (full zero-copy NVENC): FFI-links libgstcuda-1.0 to create one GstCudaContext
