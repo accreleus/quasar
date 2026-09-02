@@ -1433,7 +1433,11 @@ pub fn run_blocking(
     // Every swap's source gets the same clock+base so PTS stay continuous.
     // See `.claude/rules/gstreamer-gotchas.md`.
     let shared_clock: gst::Clock = gst::SystemClock::obtain();
-    let shared_base = shared_clock.time().unwrap_or(gst::ClockTime::ZERO);
+    // gstreamer-rs 0.25 made `ClockExt::time()` infallible (it returned
+    // `Option<ClockTime>` through 0.23, hence the old `.unwrap_or(ZERO)`). The system
+    // clock's `gst_clock_get_time` never yields GST_CLOCK_TIME_NONE, so the fallback
+    // was unreachable and the base time is unchanged.
+    let shared_base = shared_clock.time();
 
     // The process-global application-owned GstCudaContext, injected into every pipeline
     // before start so the compositor adopts ours and its memory:CUDAMemory surfaces are
