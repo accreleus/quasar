@@ -1003,6 +1003,18 @@ textarea.input {
   padding: 0;
 }
 
+/* `outline: none` above is not enough on its own: the global a11y focus floor
+   in styles.css lists a bare `input:focus-visible` at the same specificity
+   (0,1,1) and is imported later (main.tsx), so it won the cascade and ringed
+   the bare input. That ring sits 37px inside the field (padding + icon + gap)
+   and 15px short of its right edge, which reads as a box inside a box (#87).
+   The wrapper already announces focus via `.search:focus-within` above, so the
+   indicator moves rather than disappearing — the same treatment `.pal-in` gets
+   below. Kept at 0,2,1 so it beats the floor whatever the sheet order. */
+.search input:focus-visible {
+  outline: none;
+}
+
 /* `.cmdk` (the topbar palette trigger) moved to shell.css — it is chrome.
    `.icon-btn`, `.menu`, `.pal*` and `.scrim*` stay: pages use them too. */
 
