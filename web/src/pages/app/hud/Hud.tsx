@@ -247,7 +247,12 @@ export const Hud = forwardRef<HudHandle, HudProps>(function Hud(props, ref) {
   // dependency array: a swap replaces the bar's children. A measurement is
   // layout, not telemetry — nothing here reaches React state (#139).
   useLayoutEffect(() => {
-    measure();
+    // Same rule as the observer callback below: open, the pill size is unused
+    // — and measure() toggles the shelf's display, which REPLAYS the pane's
+    // entry animation, so a per-render measure while open blanked the open
+    // pane on every parent re-render (#78). Closing re-renders, which re-runs
+    // this effect with open=false and measures then.
+    if (!open) measure();
     if (typeof ResizeObserver === "undefined") return;
     let frame = 0;
     const ro = new ResizeObserver(() => {
