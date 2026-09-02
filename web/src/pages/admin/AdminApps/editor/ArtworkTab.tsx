@@ -275,8 +275,10 @@ export function ArtworkTab({ appId, appName, token, kind }: ArtworkTabProps) {
                         )
                       }
                     >
-                      {/* The one place a remote URL loads directly: admin picker
-                          only, never stored, never shown to users. */}
+                      {/* A data: URI, inlined by the control plane (#80): the
+                          CSP never allowed a remote image, and the hotlinking
+                          rule means it never will. Never stored, never shown
+                          to users. */}
                       <i>
                         {c.thumb_url ? (
                           <img src={c.thumb_url} alt="" loading="lazy" />
