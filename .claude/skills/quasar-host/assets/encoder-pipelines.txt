@@ -1,0 +1,32 @@
+# Canonical low-latency zero-copy encode chains, per GPU vendor.
+# Run a stage of one standalone with:  qhost gst '<pipeline>'   (the host's
+# `gpu` field in _shared/hosts.json selects the vendor-appropriate container flags).
+#
+# Substitute <N>=device id, <fps>, <kbps>.
+
+# ── NVIDIA / NVENC (CUDAMemory zero-copy) ────────────────────────────────────
+# nvh264enc ingests BGRA CUDA memory DIRECTLY — no cudaconvert (~3x faster than
+# cudaconvert ! nvcudah264enc). Multi-GPU pinning is via cuda-device-id on the
+# source; the CUDA context propagates downstream.
+waylanddisplaysrc cuda-device-id=<N>
+  ! 'video/x-raw(memory:CUDAMemory),format=BGRA'
+  ! nvh264enc rc-mode=cbr zerolatency=true preset=p4 tune=ultra-low-latency \
+              bframes=0 gop-size=<fps> aud=false bitrate=<kbps>
+  ! h264parse ! rtph264pay ! webrtcbin
+
+# ── AMD / Intel VA (DMABuf zero-copy) ────────────────────────────────────────
+# The zero-copy path is DMABuf modifier negotiation, NOT VAMemory. A shared
+# GstVaDisplay must be injected AT VA-element creation — before any device-path
+# read or a NULL->READY transition, or the encoder binds its own display.
+# Co-locate vapostproc in the encode pipeline (a split costs ~40% CPU).
+waylanddisplaysrc
+  ! 'video/x-raw(memory:DMABuf)'
+  ! vapostproc ! va<vendor>h264enc rate-control=cbr bitrate=<kbps> key-int-max=<fps>
+  ! h264parse ! rtph264pay ! webrtcbin
+
+# ── Reference numbers ────────────────────────────────────────────────────────
+# Healthy 1080p60 on a current discrete NVIDIA card (deep trace):
+#   agent fps 60.0 flat, encode_ms p50 ~2.0, browser present_interval_sd_ms ~0.3-0.4.
+# A mid-range integrated VA part is far slower (encode p50 ~19 ms => ~45 fps
+# ceiling) — do not read its numbers as a regression on the discrete path.
+# Per-host hardware facts live in _shared/hosts.json `notes`, not here.

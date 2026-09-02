@@ -279,7 +279,14 @@ services:
     # reach: the container already sees the host's real netfilter state
     # because of `network_mode: host` above (shared network namespace), this
     # capability only lets it ask for it.
-    cap_add: [NET_ADMIN]
+    # SYSLOG: read `/dev/kmsg` (the device below). `kernel.dmesg_restrict=1` is the
+    # default on Fedora and Ubuntu, and the container's root user does not carry
+    # CAP_SYSLOG by default, so without this the open fails EPERM and the agent
+    # reports `xid_visibility: skip` — an NVIDIA Xid or amdgpu fault then never
+    # reaches a session trace and its absence is indistinguishable from "no fault
+    # occurred" (#83). Read-only, off the media path: the tailer reports NVRM Xid
+    # and amdgpu fault lines and nothing else.
+    cap_add: [NET_ADMIN, SYSLOG]
     # tini as pid 1: weston's orphaned helper processes (reparented when a
     # console session's process group is SIGKILL'd, see session/console.rs) are
     # reaped instead of accumulating as zombies under the node-agent.
@@ -572,6 +579,13 @@ services:
       # uinput: virtual keyboard/mouse/gamepad for Wayland input injection.
       # Comment out if uinput is unavailable; virtual input self-test will fail.
       - /dev/uinput
+      # Kernel ring buffer, READ ONLY (`:r` is the device cgroup permission set —
+      # `:ro` is bind-mount syntax and Compose rejects it here). This is what makes
+      # `host.xid` / `host.gpu_fault` trace events possible; it needs the SYSLOG
+      # capability above. Comment BOTH out on a kernel without /dev/kmsg — Docker
+      # refuses to start a container whose device is absent — and the agent simply
+      # reports `xid_visibility: skip`, which fails nothing.
+      - /dev/kmsg:/dev/kmsg:r
     device_cgroup_rules:
       # Allow r/w/mknod for Linux input event devices (char major 13).
       # uinput creates /dev/input/eventN nodes on the host at session start;

@@ -1,0 +1,25 @@
+{
+  "row": "ir-off",
+  "col": "clean",
+  "cell_id": "ir-ir-off-clean",
+  "status": "ok",
+  "env": {
+    "QUASAR_INTRA_REFRESH": "0",
+    "QUASAR_INTRA_REFRESH_PERIOD": "0",
+    "QUASAR_ENCODER": "vulkan",
+    "QUASAR_SLICES": "4",
+    "QUASAR_FEC_PERCENTAGE": "0"
+  },
+  "netem_args": null,
+  "agent_git_sha": "fe11b7d1234567890abcdef1234567890abcdef",
+  "image_tag": "quasar-nv:latest",
+  "start_unix_ms": 1753000000000,
+  "end_unix_ms": 1753000135000,
+  "gate_a": {
+    "env_evidence": "QUASAR_INTRA_REFRESH=0\nQUASAR_INTRA_REFRESH_PERIOD=0",
+    "log_evidence": "intra-refresh=false(not requested)",
+    "passed": true
+  },
+  "run_file": "ir-ir-off-clean-20260721T000000Z.json",
+  "failure_reason": null
+}

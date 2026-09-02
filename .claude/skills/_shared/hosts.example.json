@@ -5,7 +5,7 @@
   "_roles_vocabulary": {
     "gpu-test": "Primary GPU / streaming test host. DEFAULT target of every host-taking verb. Judge stream quality here.",
     "aux-infra": "Sanctioned infrastructure host: network-impairment shaping (netem/IFB) and the headless browser peer. May also host the container build/test runner. Never the box you judge Quasar's own quality on unless it is also gpu-test.",
-    "deploy-only": "Production/staging deployment target. Read-only verbs only — skills refuse destructive or experiment verbs against it.",
+    "deploy-only": "Production/staging deployment target. Read-only verbs only — skills refuse destructive or experiment verbs against it, and gate merely-mutating ones behind an explicitly named host. Enforced by q_guard_mutating in _shared/lib.sh, which every skill script calls; each skill's scripts/validate asserts it against _shared/fixtures/hosts.three-role.json. A new write verb that skips the guard is the bug this sentence used to describe.",
     "_note": "A role maps to exactly one host name. A host may hold several roles. Roles a deployment does not have are simply absent; skills that need a missing role say so instead of guessing. A single-box install can point every role at the same host."
   },
 

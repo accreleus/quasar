@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# ms-status — print a one-row-per-issue status table for a GitHub milestone.
+# Usage: ms-status "<milestone title>"
+# Requires: gh (authenticated), python3
+# Read-only; no side effects.
+set -euo pipefail
+
+MILESTONE="${1:?Usage: ms-status \"<milestone title>\"}"
+REPO="accreleus/quasar"
+
+# ── Fetch all issues (open + closed) for the milestone ──────────────────────
+ISSUES_JSON=$(gh issue list \
+  --repo "$REPO" \
+  --milestone "$MILESTONE" \
+  --state all \
+  --limit 200 \
+  --json number,title,body,labels,state)
+
+if [[ "$ISSUES_JSON" == "[]" ]]; then
+  echo "No issues found for milestone: $MILESTONE" >&2
+  exit 1
+fi
+
+# ── Fetch PR list once (open+closed, milestone filter not available for PRs) ─
+PRS_JSON=$(gh pr list \
+  --repo "$REPO" \
+  --state all \
+  --limit 200 \
+  --json number,title,headRefName,state,labels)
+
+# ── Python: parse + render table ────────────────────────────────────────────
+python3 - "$MILESTONE" "$ISSUES_JSON" "$PRS_JSON" <<'PYEOF'
+import sys, json, re
+
+milestone = sys.argv[1]
+issues    = json.loads(sys.argv[2])
+prs       = json.loads(sys.argv[3])
+
+# Index PRs by branch name (ship/<KEY> or issue-<NNN>)
+pr_by_branch = {}
+for p in prs:
+    pr_by_branch[p["headRefName"]] = p
+
+def extract_header(body, key):
+    """Best-effort: find 'Key: value' in first ~40 lines of issue body."""
+    if not body:
+        return ""
+    for line in body.splitlines()[:40]:
+        m = re.match(rf"^\*{{0,2}}{re.escape(key)}\*{{0,2}}:\s*(.+)", line, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+def label_names(labels):
+    return [l["name"] for l in labels]
+
+rows = []
+for iss in issues:
+    num   = iss["number"]
+    title = iss["title"]
+    body  = iss.get("body") or ""
+    state = iss["state"]          # OPEN / CLOSED
+    lbls  = label_names(iss.get("labels", []))
+
+    # Parse Tier: and Depends on: from body (best-effort)
+    tier    = extract_header(body, "Tier")    or "?"
+    deps    = extract_header(body, "Depends on") or "—"
+
+    # Derive KEY: prefer explicit label, else issue-NNN
+    key_match = re.search(r'\b([A-Z]+-\d+)\b', title)
+    key = key_match.group(1) if key_match else f"#{num}"
+
+    # Find associated PR (branch ship/<KEY> or issue-<NNN>)
+    branch_candidates = [
+        f"ship/{key}",
+        f"ship/issue-{num}",
+        f"issue-{num}",
+    ]
+    pr = None
+    for bc in branch_candidates:
+        if bc in pr_by_branch:
+            pr = pr_by_branch[bc]
+            break
+
+    pr_num   = f"#{pr['number']}" if pr else "—"
+    pr_state = pr["state"].lower() if pr else "—"
+    pr_lbls  = label_names(pr.get("labels", [])) if pr else []
+
+    # Derive display state
+    if state == "CLOSED":
+        disp_state = "MERGED"
+    elif "needs-operator" in lbls or "needs-operator" in pr_lbls:
+        disp_state = "NEEDS-OPERATOR"
+    elif "ready-to-merge" in lbls or "ready-to-merge" in pr_lbls:
+        disp_state = "READY-TO-MERGE"
+    elif "ready-for-review" in lbls or "ready-for-review" in pr_lbls:
+        disp_state = "REVIEW-REQUESTED"
+    elif pr and pr_state == "open":
+        disp_state = "IN-PROGRESS"
+    elif pr and pr_state in ("closed", "merged"):
+        disp_state = "MERGED"
+    else:
+        disp_state = "PENDING"
+
+    rows.append((key, tier, disp_state, pr_num, pr_state, deps, ",".join(lbls) or "—"))
+
+# ── Render ──────────────────────────────────────────────────────────────────
+COL = "{:<12} {:<12} {:<20} {:<8} {:<10} {:<20} {}"
+header = COL.format("KEY", "TIER", "STATE", "PR", "PR-STATE", "DEPS", "LABELS")
+sep    = "-" * len(header)
+print(sep)
+print(f"Milestone: {milestone}")
+print(sep)
+print(header)
+print(sep)
+for r in rows:
+    print(COL.format(*r))
+print(sep)
+print(f"Total: {len(rows)} issues")
+PYEOF

@@ -198,6 +198,17 @@ test('every proxy config meets the documented requirements', () => {
   }
 });
 
+// The generated compose is the operator's copy of deploy/docker-compose.yml.
+// Anything the shipped file passes to the agent has to be here too, or the site
+// hands out a stack that quietly lacks it (#83).
+test('the agent can read the kernel ring buffer for GPU faults', () => {
+  for (const gpu of GPUS) {
+    const { compose } = generate(full({ gpu }));
+    assert.match(compose, /- \/dev\/kmsg:\/dev\/kmsg:r\b/, `${gpu}: /dev/kmsg must be passed read-only`);
+    assert.match(compose, /cap_add: \[NET_ADMIN, SYSLOG\]/, `${gpu}: reading kmsg needs CAP_SYSLOG under dmesg_restrict=1`);
+  }
+});
+
 test('the path-based proxies name both websocket routes', () => {
   for (const id of ['nginx', 'npm']) {
     const { body } = proxyConfig(id, {

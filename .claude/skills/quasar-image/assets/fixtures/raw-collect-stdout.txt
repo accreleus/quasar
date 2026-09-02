@@ -1,0 +1,17 @@
+@@QIMG9f3d1c:BASE@@
+{"disk":{"Type":"Images","TotalCount":"6","Active":"2","Size":"12.34GB","Reclaimable":"3.21GB (26%)"},"disk_free_kb":1173554588,"images":[{"tag":"[quasar-node-agent:latest]","id":"sha256:aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111","size":1857231872,"created":"2026-07-20T10:00:00Z","labels":{"org.quasar.pins.gwd":"43d4c25","org.quasar.pins.gst":"1.28.4","org.quasar.source.commit":"abc1234"}}
+,{"tag":"[quasar-nv:latest]","id":"sha256:bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222","size":2306867200,"created":"2026-07-21T11:00:00Z","labels":{"org.quasar.pins.gwd":"43d4c25","org.quasar.pins.gst":"1.28.4","org.quasar.source.commit":"def5678"}}
+]}
+@@QIMG9f3d1c:BUILDREPORT@@
+null
+@@QIMG9f3d1c:RUNNING@@
+null
+@@QIMG9f3d1c:ROLE:runtime@@
+
+@@QIMG9f3d1c:ROLE:nv@@
+
+@@QIMG9f3d1c:ROLE:dev@@
+
+@@QIMG9f3d1c:ROLE:control@@
+
+@@QIMG9f3d1c:END@@

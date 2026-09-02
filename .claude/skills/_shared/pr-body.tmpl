@@ -1,0 +1,22 @@
+{{!--
+  Shared PR-body template for Quasar skills (quasar-ticket §6, ship-milestone Phase 2.5).
+  Fill the {{placeholders}}; drop any section that doesn't apply. Keep it terse —
+  reviewers want what changed + how it was verified, not prose.
+--}}
+{{closes}}                      {{!-- e.g. "Closes #158" — omit if no issue --}}
+
+## What changed
+{{summary}}                     {{!-- 1–3 bullets: the deliverables --}}
+
+## How it was verified
+{{evidence}}                    {{!-- exact commands + their results, e.g.
+                                     `qhost test go-test-db` → all suites green;
+                                     `qhost test web-check` → typecheck+build+N tests --}}
+
+## Decisions / escalations
+{{notes}}                       {{!-- frozen-interface touches, sign-off needs,
+                                     anything the reviewer must weigh; "none" if n/a --}}
+
+{{stacked_on}}                  {{!-- "Stacked on: <base-branch>" for stacked PRs; omit otherwise --}}
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)

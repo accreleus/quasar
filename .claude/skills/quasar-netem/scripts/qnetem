@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# qnetem — network impairment for Quasar streaming tests.
+#
+# Two shaping points, both host-agnostic (hosts come from _shared/hosts.json):
+#   * the IMPAIRMENT host — the `aux-infra` role. Shapes its own loopback, or its
+#     ingress from a named source. Runs inside a NET_ADMIN helper container, so no
+#     sudo is needed. This is a sanctioned use of the aux host.
+#   * the SENDER host — the `gpu-test` role. Shapes that host's egress directly, so
+#     the impairment applies to ANY client, not just the headless browser peer.
+#     Needs sch_netem/sch_prio/cls_u32 on that host (some appliance kernels omit
+#     them — see `qhost notes` for that host).
+#
+# Shapes ONLY UDP (the WebRTC media). A flat `netem rate` on an interface starves
+# the stack's own TCP — control-plane API/WS, Postgres, SSH — and launches begin
+# failing for non-network reasons (measured).
+#
+#   qnetem apply <level|'args'>          shape the impairment host's lo (host-local tests)
+#   qnetem ingress <src-ip> <level|args> shape the impairment host's INGRESS UDP from
+#                                        <src-ip> via an IFB redirect (cross-host path)
+#   qnetem sender <level|'args'>         shape the sender host's EGRESS UDP
+#   qnetem sender-clear                  remove sender-side shaping only
+#   qnetem clear                         remove all shaping on both hosts
+#   qnetem status                        active qdiscs/filters on both hosts
+#   qnetem bootstrap                     build the helper image (alpine+iproute2)
+#
+# Levels are named in _shared/hosts.json under `netem` (mild|moderate|severe by
+# default); any literal '<netem args>' string is passed through unchanged.
+# Apply MID-SESSION (a hard cap before connect floods the cold-start keyframe → no decode).
+#
+# Roles: QNETEM_IMPAIR_ROLE (default aux-infra) · QNETEM_SENDER_ROLE (default gpu-test).
+#
+# SAFETY: a host holding the `deploy-only` role refuses every shaping verb here
+# (bootstrap/apply/ingress/sender/sender-clear/clear). See guard_shaping below.
+set -euo pipefail
+
+source "$(dirname "$0")/../../_shared/lib.sh"
+
+IMPAIR_ROLE="${QNETEM_IMPAIR_ROLE:-aux-infra}"
+SENDER_ROLE="${QNETEM_SENDER_ROLE:-gpu-test}"
+IMG=quasar-netem
+
+impair_host() { q_resolve "$IMPAIR_ROLE"; }
+sender_host() { q_resolve "$SENDER_ROLE"; }
+
+# Every shaping verb is DESTRUCTIVE against a deploy-only host, with no
+# confirmation flag to buy past it. Two reasons, and either alone is enough:
+# impairing a production host degrades its real users' traffic, not a test's;
+# and `clear`/`sender-clear` delete the ingress qdisc on every interface and the
+# root qdisc on the sender NIC — they remove, they do not restore, so whatever
+# that host's own networking had configured is simply gone. Shaping is the
+# textbook "experiment verb" hosts.example.json says this role refuses.
+guard_shaping() {  # guard_shaping <verb> <role...>
+  local verb="$1"; shift
+  local r
+  for r in "$@"; do q_guard_mutating qnetem "$r" 0 "$verb" destructive; done
+}
+
+# Run a shaping command on the impairment host inside the NET_ADMIN helper container.
+helper() { q_ssh "$IMPAIR_ROLE" "docker run --rm --network host --cap-add NET_ADMIN $IMG sh -c '$1'"; }
+
+# Run a shaping command on the SENDER host. Native `tc` when the host has it;
+# otherwise the same NET_ADMIN helper container used on the impairment host.
+# (The devbox VM ships no iproute2-tc. We do not install packages into the test
+# host's own filesystem just to run a test — the helper container is equivalent
+# and self-contained: --network host puts it in the host's netns, so tc sees the
+# real NIC. Note the container image is still BUILT on that host, so this is not
+# a "we touch nothing" claim — it is "we leave no packages behind on the host".)
+_QNETEM_SENDER_MODE=""
+sender_exec() {
+  local script="$1"
+  if [ -z "$_QNETEM_SENDER_MODE" ]; then
+    if q_ssh "$SENDER_ROLE" "command -v tc >/dev/null 2>&1"; then
+      _QNETEM_SENDER_MODE=native
+    else
+      _QNETEM_SENDER_MODE=container
+      q_ssh "$SENDER_ROLE" \
+        "docker image inspect $IMG >/dev/null 2>&1 || printf 'FROM alpine\nRUN apk add --no-cache iproute2\n' | docker build -q -t $IMG -" >/dev/null
+    fi
+  fi
+  if [ "$_QNETEM_SENDER_MODE" = native ]; then
+    q_ssh "$SENDER_ROLE" "$script"
+  else
+    q_ssh "$SENDER_ROLE" "docker run --rm --network host --cap-add NET_ADMIN $IMG sh -c '$script'"
+  fi
+}
+
+# The sender's NIC facing the impairment host.
+sender_nic() {
+  local peer; peer="$(q_host_cfg "$IMPAIR_ROLE" ip)"
+  [ -n "$peer" ] || { echo "qnetem: role '$IMPAIR_ROLE' has no ip in hosts.json" >&2; return 2; }
+  q_ssh "$SENDER_ROLE" "ip route get $peer | grep -oP 'dev \K\S+'"
+}
+
+# Resolve a named level to its netem args, or pass a literal args string through.
+level() {
+  local v; v="$(q_cfg netem "$1" 2>/dev/null || true)"
+  case "$v" in ""|"{}") printf '%s' "$1" ;; *) printf '%s' "$v" ;; esac
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+
+bootstrap)
+  guard_shaping bootstrap "$IMPAIR_ROLE"
+  q_ssh "$IMPAIR_ROLE" "printf 'FROM alpine\nRUN apk add --no-cache iproute2\n' | docker build -q -t $IMG -" \
+    && echo "helper image $IMG ready on $(impair_host)"
+  ;;
+
+apply)
+  guard_shaping apply "$IMPAIR_ROLE"
+  ARGS="$(level "${1:?usage: qnetem apply '<netem args>'|<level>}")"
+  helper "tc qdisc del dev lo root 2>/dev/null;
+    tc qdisc add dev lo root handle 1: prio &&
+    tc qdisc add dev lo parent 1:3 handle 30: netem $ARGS &&
+    tc filter add dev lo parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff flowid 1:3 &&
+    echo \"UDP-only netem on lo: $ARGS\""
+  ;;
+
+ingress)
+  guard_shaping ingress "$IMPAIR_ROLE"
+  SRC="${1:?usage: qnetem ingress <src-ip> '<netem args>'|<level>}"; ARGS="$(level "${2:?missing netem args}")"
+  NIC=$(q_ssh "$IMPAIR_ROLE" "ip route get $SRC | grep -oP 'dev \K\S+'")
+  helper "ip link add ifb0 type ifb 2>/dev/null; ip link set ifb0 up &&
+    tc qdisc del dev $NIC ingress 2>/dev/null;
+    tc qdisc add dev $NIC handle ffff: ingress &&
+    tc filter add dev $NIC parent ffff: protocol ip u32 match ip protocol 17 0xff match ip src $SRC/32 action mirred egress redirect dev ifb0 &&
+    tc qdisc del dev ifb0 root 2>/dev/null;
+    tc qdisc add dev ifb0 root netem $ARGS &&
+    echo \"ingress UDP from $SRC via $NIC → ifb0 netem: $ARGS\""
+  ;;
+
+sender)
+  guard_shaping sender "$SENDER_ROLE"
+  ARGS="$(level "${1:?usage: qnetem sender '<netem args>'|<level>}")"
+  NIC="$(sender_nic)"
+  sender_exec "tc qdisc del dev $NIC root 2>/dev/null;
+    tc qdisc add dev $NIC root handle 1: prio &&
+    tc qdisc add dev $NIC parent 1:3 handle 30: netem $ARGS &&
+    tc filter add dev $NIC parent 1: protocol ip prio 1 u32 match ip protocol 17 0xff flowid 1:3 &&
+    echo \"sender egress UDP-only netem on $NIC: $ARGS\""
+  ;;
+
+sender-clear)
+  guard_shaping sender-clear "$SENDER_ROLE"
+  NIC="$(sender_nic)"
+  sender_exec "tc qdisc del dev $NIC root 2>/dev/null; echo sender-cleared" || true
+  ;;
+
+clear)
+  guard_shaping clear "$IMPAIR_ROLE" "$SENDER_ROLE"
+  helper "tc qdisc del dev lo root 2>/dev/null;
+    for d in \$(ls /sys/class/net); do tc qdisc del dev \$d ingress 2>/dev/null; done;
+    tc qdisc del dev ifb0 root 2>/dev/null; ip link del ifb0 2>/dev/null; echo cleared" || true
+  NIC="$(sender_nic 2>/dev/null)" && [ -n "$NIC" ] && \
+    sender_exec "tc qdisc del dev $NIC root 2>/dev/null; echo sender-cleared" || true
+  ;;
+
+status)
+  helper "echo ==lo==; tc -s qdisc show dev lo | head -6;
+    echo ==ifb0==; tc -s qdisc show dev ifb0 2>/dev/null | head -4 || echo none"
+  NIC="$(sender_nic 2>/dev/null)" && [ -n "$NIC" ] && \
+    sender_exec "echo ==sender:$NIC==; tc -s qdisc show dev $NIC | head -6" || true
+  ;;
+
+*)
+  sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+  ;;
+esac

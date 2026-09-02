@@ -1,0 +1,754 @@
+{
+  "built_at": "2026-07-26T13:10:07Z",
+  "build_host": "fixture-host",
+  "source_commit": "1e92ea20e6d36b42b8f7d16b27d19db8556d2ba4",
+  "source_dirty": true,
+  "git_ref": null,
+  "generation": "20260726-1307",
+  "validated": true,
+  "roles": [
+    {
+      "role": "nv",
+      "image": "quasar-nv",
+      "tag": "20260726-1307",
+      "image_id": "sha256:47d971decfe9562c468525e13b826f07aeaff6bd0305bc4e37991b4b562f60b1",
+      "size_mb": 1786,
+      "dockerfile": "deploy/Dockerfile.vulkan",
+      "target": "nv",
+      "build_args": [
+        "QUASAR_BASE_IMAGE=ghcr.io/example/quasar-base:develop"
+      ],
+      "build_seconds": 134,
+      "verdict": "pass",
+      "validation": {
+        "image": "quasar-nv:20260726-1307",
+        "image_id": "sha256:47d971decfe9562c468525e13b826f07aeaff6bd0305bc4e37991b4b562f60b1",
+        "role": "nv",
+        "chain": [
+          "runtime",
+          "nv"
+        ],
+        "size_mb": 1786,
+        "gpu_attached": false,
+        "gpu_skipped_elements": [
+          "cudaconvert",
+          "cudascale",
+          "nvautogpuh264enc",
+          "nvav1enc",
+          "vulkanh264enc",
+          "vulkanh265enc"
+        ],
+        "passed": 141,
+        "failed": 0,
+        "verdict": "PASS",
+        "assertions": [
+          {
+            "status": "PASS",
+            "id": "package.alsa-lib",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.avahi",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.ca-certificates",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.cuda-cudart-13-2",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.cuda-nvrtc-13-2",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.curl",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.ddcutil",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.glib2",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.hwdata",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.iproute",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.libX11",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.libdrm",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.libglvnd",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.libinput",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.libnpp-13-2",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.libseat",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.libsrtp",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.libva",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.libwayland-client",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.libwayland-server",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.libxkbcommon",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.mesa-dri-drivers",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.mesa-libEGL",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.mesa-libGL",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.mesa-libGLES",
+            "detail": "provided by libglvnd-gles-1.7.0-8.fc43.x86_64"
+          },
+          {
+            "status": "PASS",
+            "id": "package.mesa-libgbm",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.mesa-va-drivers",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.mesa-va-drivers-freeworld",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.mesa-vulkan-drivers-freeworld",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.nss-mdns",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.openh264",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.openssl-libs",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.pciutils-libs",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.procps-ng",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.pulseaudio",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.pulseaudio-libs",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.pulseaudio-utils",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.seatd",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.systemd-libs",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.vulkan-loader",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.vulkan-tools",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package.weston",
+            "detail": "installed"
+          },
+          {
+            "status": "PASS",
+            "id": "package-absent.clang",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "package-absent.clang-devel",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "package-absent.cmake",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "package-absent.cuda-cudart-devel",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "package-absent.cuda-nvcc",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "package-absent.cuda-nvrtc-devel",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "package-absent.dnf-plugins-core",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "package-absent.gcc",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "package-absent.gcc-c++",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "package-absent.glib2-devel",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "package-absent.libdrm-devel",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "package-absent.libnpp-devel",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "package-absent.libva-devel",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "package-absent.llvm-devel",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "package-absent.meson",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "package-absent.ninja-build",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "package-absent.vulkan-headers",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "package-absent.vulkan-loader-devel",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "package-absent.wayland-devel",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "binary.avahi-daemon",
+            "detail": "/usr/bin/avahi-daemon"
+          },
+          {
+            "status": "PASS",
+            "id": "binary.curl",
+            "detail": "/usr/bin/curl"
+          },
+          {
+            "status": "PASS",
+            "id": "binary.docker",
+            "detail": "/usr/local/bin/docker"
+          },
+          {
+            "status": "PASS",
+            "id": "binary.gst-inspect-1.0",
+            "detail": "/opt/gst/bin/gst-inspect-1.0"
+          },
+          {
+            "status": "PASS",
+            "id": "binary.gst-launch-1.0",
+            "detail": "/opt/gst/bin/gst-launch-1.0"
+          },
+          {
+            "status": "PASS",
+            "id": "binary.pactl",
+            "detail": "/usr/bin/pactl"
+          },
+          {
+            "status": "PASS",
+            "id": "binary.pulseaudio",
+            "detail": "/usr/bin/pulseaudio"
+          },
+          {
+            "status": "PASS",
+            "id": "binary.quasar-node-agent",
+            "detail": "/usr/local/bin/quasar-node-agent"
+          },
+          {
+            "status": "PASS",
+            "id": "binary.quasar-node-agent-entrypoint",
+            "detail": "/usr/local/bin/quasar-node-agent-entrypoint"
+          },
+          {
+            "status": "PASS",
+            "id": "binary.seatd",
+            "detail": "/usr/bin/seatd"
+          },
+          {
+            "status": "PASS",
+            "id": "binary.weston",
+            "detail": "/usr/bin/weston"
+          },
+          {
+            "status": "PASS",
+            "id": "binary-absent.cargo",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "binary-absent.cc",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "binary-absent.gcc",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "binary-absent.meson",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "binary-absent.ninja",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "binary-absent.rustc",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "binary-absent.rustup",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "path./etc/ld.so.conf.d/cuda.conf",
+            "detail": "present"
+          },
+          {
+            "status": "PASS",
+            "id": "path./etc/ld.so.conf.d/gst-vulkan.conf",
+            "detail": "present"
+          },
+          {
+            "status": "PASS",
+            "id": "path./opt/gst/lib64/gstreamer-1.0",
+            "detail": "present"
+          },
+          {
+            "status": "PASS",
+            "id": "path./opt/gst/lib64/gstreamer-1.0/libgstnvcodec.so",
+            "detail": "present"
+          },
+          {
+            "status": "PASS",
+            "id": "path./usr/local/bin/quasar-node-agent",
+            "detail": "present"
+          },
+          {
+            "status": "PASS",
+            "id": "path./usr/local/bin/quasar-node-agent-entrypoint",
+            "detail": "present"
+          },
+          {
+            "status": "PASS",
+            "id": "path./usr/local/cuda/lib64/libnppc.so",
+            "detail": "present"
+          },
+          {
+            "status": "PASS",
+            "id": "path./usr/local/cuda/lib64/libnppicc.so",
+            "detail": "present"
+          },
+          {
+            "status": "PASS",
+            "id": "path./usr/local/cuda/lib64/libnppig.so",
+            "detail": "present"
+          },
+          {
+            "status": "PASS",
+            "id": "path./usr/local/cuda/lib64/libnvrtc.so",
+            "detail": "present"
+          },
+          {
+            "status": "PASS",
+            "id": "path-absent./home/quasar/.cache/gstreamer-1.0",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "path-absent./opt/cargo",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "path-absent./opt/gstreamer-src",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "path-absent./opt/rustup",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "path-absent./root/.cache/gstreamer-1.0",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "path-absent./src/node-agent",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "path-absent./usr/local/cuda/bin/nvcc",
+            "detail": "absent"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.alsasink",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.audioconvert",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.audioresample",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.audiotestsrc",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.dtlssrtpenc",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.h264parse",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.h265parse",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.interpipesink",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.interpipesrc",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.kmssink",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.nicesrc",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.openh264enc",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.opusenc",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.pulsesink",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.pulsesrc",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.rtpbin",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.rtpgccbwe",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.rtph264pay",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.rtpopuspay",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.rtprtxsend",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.rtpulpfecenc",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.sctpenc",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.videotestsrc",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.waylanddisplaysrc",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "gst.webrtcbin",
+            "detail": "registered"
+          },
+          {
+            "status": "PASS",
+            "id": "driver-not-baked.libcuda.so.1",
+            "detail": "not baked (injected at run time)"
+          },
+          {
+            "status": "PASS",
+            "id": "gst-absent-nogpu.cudaconvert",
+            "detail": "not registered (expected)"
+          },
+          {
+            "status": "PASS",
+            "id": "gst-absent-nogpu.cudascale",
+            "detail": "not registered (expected)"
+          },
+          {
+            "status": "PASS",
+            "id": "gst-absent-nogpu.nvautogpuh264enc",
+            "detail": "not registered (expected)"
+          },
+          {
+            "status": "PASS",
+            "id": "gst-absent-nogpu.nvav1enc",
+            "detail": "not registered (expected)"
+          },
+          {
+            "status": "PASS",
+            "id": "gst-absent-nogpu.nvh264enc",
+            "detail": "not registered (expected)"
+          },
+          {
+            "status": "PASS",
+            "id": "agent.no-dt-needed.libcuda",
+            "detail": "no libcuda DT_NEEDED"
+          },
+          {
+            "status": "PASS",
+            "id": "agent.no-dt-needed.libgstcuda",
+            "detail": "no libgstcuda DT_NEEDED"
+          },
+          {
+            "status": "PASS",
+            "id": "agent.no-dt-needed.libnvidia",
+            "detail": "no libnvidia DT_NEEDED"
+          },
+          {
+            "status": "PASS",
+            "id": "agent.no-unresolved-libs",
+            "detail": "all libraries resolve"
+          },
+          {
+            "status": "PASS",
+            "id": "agent.starts",
+            "detail": "starts (reached argument/config handling)"
+          },
+          {
+            "status": "PASS",
+            "id": "env.CUDA_PATH",
+            "detail": "/usr/local/cuda"
+          },
+          {
+            "status": "PASS",
+            "id": "env.GST_PLUGIN_PATH",
+            "detail": "/opt/gst/lib64/gstreamer-1.0"
+          },
+          {
+            "status": "PASS",
+            "id": "env.NVIDIA_DRIVER_CAPABILITIES",
+            "detail": "compute,utility,video,graphics,display"
+          },
+          {
+            "status": "PASS",
+            "id": "env.NVIDIA_VISIBLE_DEVICES",
+            "detail": "all"
+          },
+          {
+            "status": "PASS",
+            "id": "env.QUASAR_HEALTH_ADDR",
+            "detail": "127.0.0.1:9091"
+          },
+          {
+            "status": "PASS",
+            "id": "env.VK_LOADER_DRIVERS_DISABLE",
+            "detail": "*lvp_icd*"
+          },
+          {
+            "status": "PASS",
+            "id": "size",
+            "detail": "1786MB <= 2300MB"
+          },
+          {
+            "status": "PASS",
+            "id": "image.entrypoint",
+            "detail": "[\"/usr/local/bin/quasar-node-agent-entrypoint\"] null"
+          },
+          {
+            "status": "PASS",
+            "id": "image.healthcheck",
+            "detail": "declared"
+          }
+        ]
+      }
+    }
+  ]
+}

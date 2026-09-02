@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# qdiag-compare — compare two or more qdiag-sample run files side-by-side.
+#
+# Usage:
+#   qdiag-compare <runA.json> <runB.json> [runC.json ...]
+#   qdiag-compare --latest N           # compare N most recent runs from runs_dir
+#   qdiag-compare --latest 2 --allow-cross   # cross-host/app comparison
+#
+# Output: a side-by-side table of the perf-tuning metrics; fills assets/comparison.md.tmpl.
+set -euo pipefail
+
+SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+source "$(dirname "$0")/../../_shared/lib.sh"
+
+# ── Args ──────────────────────────────────────────────────────────────────────
+RUNS=()
+LATEST_N=0
+ALLOW_CROSS=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --latest)     LATEST_N="$2"; shift 2 ;;
+    --allow-cross) ALLOW_CROSS=1; shift ;;
+    *.json)       RUNS+=("$1"); shift ;;
+    *)            echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+# Resolve --latest N from runs_dir.
+if [ "$LATEST_N" -gt 0 ]; then
+  RUNS_DIR="$SKILL_DIR/$( python3 - "$SKILL_DIR/config.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))["runs_dir"])
+PY
+)"
+  if [ ! -d "$RUNS_DIR" ]; then
+    echo "No runs directory found at $RUNS_DIR" >&2
+    echo "Run qdiag-sample first to collect runs." >&2
+    exit 1
+  fi
+  # shellcheck disable=SC2207
+  LATEST_FILES=($(ls -t "$RUNS_DIR"/*.json 2>/dev/null | head -"$LATEST_N"))
+  if [ "${#LATEST_FILES[@]}" -lt 2 ]; then
+    echo "Need at least 2 run files in $RUNS_DIR (found ${#LATEST_FILES[@]})" >&2
+    exit 1
+  fi
+  RUNS=("${LATEST_FILES[@]}")
+fi
+
+if [ "${#RUNS[@]}" -lt 2 ]; then
+  echo "Usage: qdiag-compare <runA.json> <runB.json> [...]" >&2
+  echo "       qdiag-compare --latest N" >&2
+  exit 1
+fi
+
+for f in "${RUNS[@]}"; do
+  if [ ! -f "$f" ]; then
+    echo "Run file not found: $f" >&2
+    exit 1
+  fi
+done
+
+# ── Python analysis ───────────────────────────────────────────────────────────
+python3 - "$ALLOW_CROSS" "$SKILL_DIR/assets/comparison.md.tmpl" "${RUNS[@]}" <<'PY'
+import json, math, sys
+from pathlib import Path
+from collections import Counter
+
+allow_cross = sys.argv[1] == "1"
+tmpl_path   = sys.argv[2]
+run_paths   = sys.argv[3:]
+
+
+def pctile(values, p):
+    if not values:
+        return math.nan
+    s = sorted(values)
+    rank = (p / 100) * (len(s) - 1)
+    lo = int(rank)
+    hi = min(lo + 1, len(s) - 1)
+    return s[lo] + (rank - lo) * (s[hi] - s[lo])
+
+
+def series_stat(bundle, series_name, stat="p50"):
+    pts = (bundle.get("series") or {}).get(series_name, [])
+    vals = [p[1] if isinstance(p, list) else p.get("v", p.get("V", 0)) for p in pts]
+    if not vals:
+        return None
+    if stat == "p50":
+        return round(pctile(vals, 50), 1)
+    if stat == "p95":
+        return round(pctile(vals, 95), 1)
+    if stat == "mean":
+        return round(sum(vals) / len(vals), 1)
+    return None
+
+
+def fmt(v, unit=""):
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "—"
+    return f"{v}{unit}"
+
+
+runs = []
+for p in run_paths:
+    with open(p) as f:
+        runs.append(json.load(f))
+
+# Validate comparability.
+ref_meta = runs[0].get("meta", {})
+mismatches = []
+for i, run in enumerate(runs[1:], start=1):
+    m = run.get("meta", {})
+    for key in ("app", "profile", "host"):
+        if m.get(key) != ref_meta.get(key):
+            mismatches.append(f"run[{i}] {key}='{m.get(key)}' != '{ref_meta.get(key)}'")
+if mismatches and not allow_cross:
+    print("ERROR: runs are not directly comparable:", file=sys.stderr)
+    for mm in mismatches:
+        print(f"  {mm}", file=sys.stderr)
+    print("Pass --allow-cross to compare anyway.", file=sys.stderr)
+    sys.exit(1)
+elif mismatches:
+    print("WARN: cross-run comparison (--allow-cross):")
+    for mm in mismatches:
+        print(f"  {mm}")
+
+# Build per-run metrics.
+rows = []
+for i, run in enumerate(runs):
+    meta    = run.get("meta", {})
+    fb      = run.get("final_bundle") or {}
+    samples = run.get("samples", [])
+    bundles = [s.get("bundle", {}) for s in samples if s.get("bundle")]
+    if fb:
+        bundles.append(fb)
+
+    # Aggregate over all snapshots for stable stats.
+    def agg_series(name, stat):
+        all_pts = []
+        for b in bundles:
+            pts = (b.get("series") or {}).get(name, [])
+            all_pts.extend(p[1] if isinstance(p, list) else p.get("v", p.get("V", 0)) for p in pts)
+        if not all_pts:
+            return None
+        if stat == "p50": return round(pctile(all_pts, 50), 1)
+        if stat == "p95": return round(pctile(all_pts, 95), 1)
+
+    # ABR setpoint sawtooth amplitude (max-min over all snapshots).
+    all_setpoints = []
+    for b in bundles:
+        pts = (b.get("series") or {}).get("abr.setpoint_kbps", [])
+        all_setpoints.extend(p[1] if isinstance(p, list) else p.get("v", p.get("V", 0)) for p in pts)
+    abr_amplitude = round(max(all_setpoints) - min(all_setpoints), 0) if len(all_setpoints) > 1 else None
+
+    # ABR downshifts (count across all samples).
+    total_downshifts = sum(
+        len((b.get("derived_windows") or {}).get("abr_downshifts", []))
+        for b in bundles
+    )
+
+    # Classifier verdict distribution.
+    verdicts = [
+        (b.get("classifier") or {}).get("verdict", "unknown")
+        for b in bundles
+    ]
+    verdict_dist = dict(Counter(verdicts).most_common())
+
+    rows.append({
+        "label":    f"run[{i}] {Path(run_paths[i]).stem}",
+        "host":     meta.get("host", "?"),
+        "app":      meta.get("app", "?"),
+        "profile":  meta.get("profile", "?"),
+        "n_samples": meta.get("n_samples", len(samples)),
+        "duration_s": meta.get("duration_s", "?"),
+        "abr_amplitude_kbps":  abr_amplitude,
+        "abr_downshifts":      total_downshifts,
+        "encode_ms_p50":       agg_series("encoder.encode_ms", "p50"),
+        "encode_ms_p95":       agg_series("encoder.encode_ms", "p95"),
+        "fps_p50":             agg_series("encoder.fps", "p50"),
+        "present_sd_p95":      agg_series("client.present_interval_sd_ms", "p95"),
+        "verdict_distribution": verdict_dist,
+    })
+
+# Print table.
+print("\n" + "=" * 72)
+print("QUASAR DIAGNOSE — RUN COMPARISON")
+print("=" * 72)
+print(f"{'Metric':<38}", end="")
+for r in rows:
+    print(f"  {r['label'][:22]:<22}", end="")
+print()
+print("-" * 72)
+
+def row(label, *vals):
+    print(f"  {label:<36}", end="")
+    for v in vals:
+        print(f"  {str(v):<22}", end="")
+    print()
+
+for key, label, unit in [
+    ("host",                "Host",                  ""),
+    ("app",                 "App",                   ""),
+    ("profile",             "Profile",               ""),
+    ("n_samples",           "Samples",               ""),
+    ("duration_s",          "Duration",              "s"),
+    ("abr_amplitude_kbps",  "ABR sawtooth ampl.",    "kbps"),
+    ("abr_downshifts",      "ABR downshifts",        ""),
+    ("encode_ms_p50",       "encode_ms p50",         "ms"),
+    ("encode_ms_p95",       "encode_ms p95",         "ms"),
+    ("fps_p50",             "encoder fps p50",       "fps"),
+    ("present_sd_p95",      "present_interval_sd p95","ms"),
+]:
+    vals = []
+    for r in rows:
+        v = r.get(key)
+        if v is None:
+            vals.append("—")
+        elif unit:
+            vals.append(f"{v} {unit}")
+        else:
+            vals.append(str(v))
+    row(label, *vals)
+
+print("-" * 72)
+print("Classifier verdict distribution:")
+for r in rows:
+    print(f"  {r['label']}: {r['verdict_distribution']}")
+
+# Fill template.
+tmpl = Path(tmpl_path).read_text()
+rows_md = ""
+for r in rows:
+    rows_md += f"| {r['label']} | {r['host']} | {r['app']} | {r['profile']} |"
+    rows_md += f" {fmt(r['abr_amplitude_kbps'], 'kbps')} / {r['abr_downshifts']} |"
+    rows_md += f" {fmt(r['encode_ms_p50'], 'ms')} / {fmt(r['encode_ms_p95'], 'ms')} |"
+    rows_md += f" {fmt(r['fps_p50'], 'fps')} |"
+    rows_md += f" {fmt(r['present_sd_p95'], 'ms')} |"
+    rows_md += f" {json.dumps(r['verdict_distribution'])} |\n"
+
+filled = (tmpl
+    .replace("{{comparison_rows}}", rows_md)
+    .replace("{{n_runs}}", str(len(rows)))
+    .replace("{{run_labels}}", ", ".join(r["label"] for r in rows))
+)
+
+print("\n--- FILLED TEMPLATE ---")
+print(filled)
+PY
