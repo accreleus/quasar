@@ -58,9 +58,16 @@ filtered like any other host traffic, and a default-deny firewall blocks it out
 of the box.
 
 Check **Admin, Fleet, Hosts** for a `media_reachability` warning on that host.
-The agent probes the firewall at startup and on reconnect, and when it finds a
-filtering posture the warning names the exact scoped rule for the tool it
-detected.
+The agent probes the firewall at startup and on reconnect, reads the accept
+rules in front of the input chain, and warns only when the media path really is
+closed — naming the exact scoped rule for the tool it detected, or the half of
+the path that is missing. A host whose rules already cover the ephemeral UDP
+range and UDP/5353 passes instead, quoting the rules it matched.
+
+One thing it cannot see is whether those rules' **source scope** reaches the
+client you are testing from. A rule scoped to a subnet your client is not on
+reads as covered and still drops the media, so check the scope before ruling the
+firewall out on a green check.
 
 <Aside type="caution" title="No warning is not an all-clear">
 The probe reports no finding when it cannot reach a firewall client tool from
