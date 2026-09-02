@@ -15,7 +15,7 @@
 #
 # Three deltas, all on the control plane:
 #
-#  1. `build:` — compose builds deploy/Dockerfile.control (a golang:1.24-alpine
+#  1. `build:` — compose builds deploy/Dockerfile.control (a golang:1.25-alpine
 #     compile plus a debian-slim runtime, reading nothing from
 #     Dockerfile.vulkan, which is what makes `redeploy.sh <env> <ref> control`
 #     a ~1-minute deploy). The image name comes from the base file, so the

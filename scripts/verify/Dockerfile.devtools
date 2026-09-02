@@ -1,4 +1,4 @@
-ARG GO_IMAGE=golang:1.24.13-bookworm
+ARG GO_IMAGE=golang:1.25.14-bookworm
 ARG NODE_IMAGE=node:22.22.0-bookworm
 ARG RUST_IMAGE=rust:1.88.0-bookworm
 ARG POSTGRES_IMAGE=postgres:16.4-bookworm

@@ -63,7 +63,7 @@ case "${1:-}" in
   *) exit 0 ;;
 esac'
 make_stub ssh 'exit 255'          # every remote probe fails: unreachable
-make_stub go   'echo "go version go1.24.0 stub/stub"'
+make_stub go   'echo "go version go1.25.0 stub/stub"'
 make_stub node 'echo "v22.0.0"'
 # In-memory crontab, state file overridable per test via $CRONTAB_STATE — real
 # crontab must never be touched by this suite.

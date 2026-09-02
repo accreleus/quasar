@@ -14,6 +14,9 @@ import {
 } from "./capability";
 
 afterEach(() => {
+  // `restoreAllMocks` only restores `vi.spyOn` spies since vitest 3; clear call
+  // history too, or a plain `vi.fn()`'s counters survive into the next test.
+  vi.clearAllMocks();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   // Remove any navigator props defined per-test (jsdom lacks getGamepads).

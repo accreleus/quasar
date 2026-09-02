@@ -363,6 +363,7 @@ distribution with Docker should behave the same.
 | RAM / CPU | Installing a release is download-bound. Building from source was measured on 8 vCPU / 32 GB; less works, it just takes longer |
 | GPU: AMD/Intel (VA-API) or NVIDIA | Optional in principle (`QUASAR_ENCODER=openh264` encodes in software at reduced quality and throughput), expected in practice. NVIDIA hosts also need the driver plus `nvidia-container-toolkit` with CDI configured (`nvidia-ctk runtime configure`) |
 | `/dev/uinput` | Virtual input devices (keyboard, mouse, gamepad injection) |
+| `/dev/kmsg` | Kernel ring buffer, passed read-only with `CAP_SYSLOG`, so an NVIDIA Xid or amdgpu fault reaches the session trace instead of only the host's `dmesg`. Optional: on a kernel without it, drop the device and the capability from the node-agent service and the `xid_visibility` readiness check reports `skip`, which fails nothing |
 | Node.js | **Not** required on the host — the web app builds inside a `node:22` container |
 | SELinux | Enforcing is fine; zero denials observed on Fedora 44 |
 | Network path between player and host | Same LAN segment, or a VPN that joins them. Media is peer-to-peer between browser and GPU host, so the control plane being reachable is not enough. See [Media reachability](#media-reachability-lan-or-vpn) |

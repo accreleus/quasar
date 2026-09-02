@@ -1,6 +1,6 @@
 ---
 title: Backup and restore
-description: What holds state, how to back it up, and how to prove the backup actually restores.
+description: What holds state, how to back it up, and how to prove the backup restores.
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components';
@@ -129,6 +129,6 @@ the developer verification workflow.
 
 There is no published matrix of which control plane versions work with which
 database states. Combined with the one-way migration rule, the practical policy
-is: back up before every upgrade, and restore rather than rolling back.
+is: back up before every upgrade, and restore forward; do not roll back.
 
 See [Upgrading](/quasar/operations/upgrading/).

@@ -14,7 +14,7 @@
 //      forced app — stays live.
 
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AppHomeNext } from "../AppHomeNext";
 import { AuthContext, type AuthContextValue } from "../../../auth/context";
@@ -125,6 +125,10 @@ async function openBand(over: Partial<AuthContextValue> = {}) {
   await waitFor(() => expect(document.querySelectorAll(".lib-tile").length).toBe(1), { timeout: 8000 });
   fireEvent.click(screen.getByRole("button", { name: "Benchapp" }));
   await waitFor(() => expect(document.querySelector(".d-specs")).toBeTruthy(), { timeout: 8000 });
+  // `.d-specs` renders on the profiles response, but the selection is seeded by
+  // an effect one flush later — under React 19 that lands after `waitFor`
+  // returns, so the band would still be showing the app's defaults here.
+  await act(async () => {});
 }
 
 async function openOptions() {

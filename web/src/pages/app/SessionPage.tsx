@@ -323,7 +323,6 @@ export function SessionPage() {
     inputCaptured,
     recovery,
     clientUnsupported,
-    displayRefreshHz,
     iceState,
     wsOpen,
     pcConnected,
@@ -724,8 +723,10 @@ export function SessionPage() {
     );
   }
 
-  // AS10-14: parse fps from tier string e.g. "1920×1080@60" → 60.
-  const tierFps = state?.tier ? parseInt(state.tier.split("@")[1] ?? "", 10) || null : null;
+  // #85: the display-cadence warning used to be computed here from the tier
+  // and `displayRefreshHz` alone. It now lives in StatsPane, which already
+  // subscribes to the telemetry it needs to check whether frames are in fact
+  // being dropped — the check the old predicate never made.
 
   // Poll is authoritative; the tier string is only the pre-first-poll seed.
   const streamSize = polledStreamSize ?? parseTierSize(state?.tier);
@@ -935,11 +936,6 @@ export function SessionPage() {
             scalingMode={scalingMode}
             onScalingChange={handleScalingChange}
             startedAt={startedAt}
-            displayHzWarning={
-              tierFps != null && displayRefreshHz != null && tierFps > displayRefreshHz
-                ? { displayHz: displayRefreshHz, streamFps: tierFps }
-                : null
-            }
             streamSize={streamSize}
             // Null = "match the stream" / still at launch size — the pane
             // resolves it against `streamSize`, so this page never duplicates

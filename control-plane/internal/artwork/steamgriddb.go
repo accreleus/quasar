@@ -107,7 +107,66 @@ func (c *SteamGridDBClient) Search(ctx context.Context, query string) ([]Candida
 			Attribution: sgdbAttribution,
 		})
 	}
+	c.fillSearchThumbs(ctx, out)
 	return out, nil
+}
+
+// searchThumbLimit caps how many search candidates get a preview looked up.
+// Autocomplete tops out around this size anyway, and the picker shows them all.
+const searchThumbLimit = 15
+
+// fillSearchThumbs resolves a preview thumb for each candidate in ONE extra
+// request: autocomplete carries no images at all (#80 — the picker rendered
+// its glyph fallback for every result), and the per-call throttle makes
+// per-candidate lookups cost seconds while an admin is watching. The multi-id
+// grids endpoint answers for all of them at once; SteamGridDB returns per-game
+// results in request order, with an empty entry for a game with no grids.
+//
+// Previews are best-effort by contract (the UI's glyph fallback is the
+// degraded path), so every failure here — transport, decode, a shorter reply
+// than asked — leaves candidates unfilled rather than failing the search.
+func (c *SteamGridDBClient) fillSearchThumbs(ctx context.Context, cands []Candidate) {
+	n := min(len(cands), searchThumbLimit)
+	if n == 0 {
+		return
+	}
+	ids := make([]string, n)
+	for i := range n {
+		ids[i] = cands[i].Ref
+	}
+
+	if n == 1 {
+		// One id gets the flat single-game shape, same as crops().
+		var grids sgdbEnvelope[[]sgdbImage]
+		if err := c.do(ctx, "/grids/game/"+url.PathEscape(ids[0])+"?"+sgdbGridFilter, &grids); err != nil {
+			return
+		}
+		if best, ok := pickBest(grids.Data, TileAspect); ok {
+			cands[0].ThumbURL = best.Thumb
+		}
+		return
+	}
+
+	// Multiple ids nest each game's grids under its own success envelope.
+	var multi sgdbEnvelope[[]sgdbGameImages]
+	path := "/grids/game/" + strings.Join(ids, ",") + "?" + sgdbGridFilter
+	if err := c.do(ctx, path, &multi); err != nil {
+		return
+	}
+	for i, game := range multi.Data {
+		if i >= n || !game.Success {
+			continue
+		}
+		if best, ok := pickBest(game.Data, TileAspect); ok {
+			cands[i].ThumbURL = best.Thumb
+		}
+	}
+}
+
+// sgdbGameImages is one game's slot in a multi-id grids response.
+type sgdbGameImages struct {
+	Success bool        `json:"success"`
+	Data    []sgdbImage `json:"data"`
 }
 
 // Art resolves the two crops for a SteamGridDB game id (a ref from Search).
@@ -149,6 +208,11 @@ func (c *SteamGridDBClient) ArtByExternalRef(ctx context.Context, source, id str
 // apps_external_id_ck and crud's write gate: a bare positive integer.
 var steamAppIDPattern = regexp.MustCompile(`^[1-9][0-9]{0,9}$`)
 
+// sgdbGridFilter is the portrait-grid query shared by crops() and
+// fillSearchThumbs, so the picker's previews and the resolved tile can never
+// select from different pools.
+const sgdbGridFilter = "dimensions=600x900,660x930,342x482&types=static&mimes=image/png,image/jpeg,image/webp&nsfw=false&humor=false"
+
 // crops resolves the tile and hero assets for one selector ("game/<sgdb id>"
 // or "steam/<appid>") — the shared body of Art and ArtByExternalRef. A missing
 // crop is left empty rather than failing the resolution (half the art beats
@@ -158,8 +222,7 @@ func (c *SteamGridDBClient) crops(ctx context.Context, ref, selector string) (Ca
 
 	// Portrait grid for the 2:3 tile, most-common dimension first.
 	var grids sgdbEnvelope[[]sgdbImage]
-	gridPath := "/grids/" + selector +
-		"?dimensions=600x900,660x930,342x482&types=static&mimes=image/png,image/jpeg,image/webp&nsfw=false&humor=false"
+	gridPath := "/grids/" + selector + "?" + sgdbGridFilter
 	gridErr := c.do(ctx, gridPath, &grids)
 	if gridErr != nil && !errors.Is(gridErr, ErrArtNotFound) {
 		return Candidate{}, gridErr

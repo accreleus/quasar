@@ -22,12 +22,20 @@ Each host shows its status, when it last sent a heartbeat, its CPU, its storage,
 and a set of readiness checks.
 
 The readiness checks are the useful part, because they report what the agent
-**found**, not what the configuration claims. The distinction matters. A host can
-be configured for NVENC and still have no working encoder.
+**found**, not what the configuration claims. A host can be configured for NVENC
+and still have no working encoder.
 
 Checks cover the render node, `/dev/uinput` write access, the managed home root,
-media reachability through the host firewall, and on NVIDIA the presence of the
-EGL and 32-bit GL components that a CUDA-only driver install leaves out.
+media reachability through the host firewall, whether GPU faults are visible, and
+on NVIDIA the presence of the EGL and 32-bit GL components that a CUDA-only driver
+install leaves out.
+
+`xid_visibility` is the odd one out: it reports whether the agent can read
+`/dev/kmsg`, which is where the kernel logs an NVIDIA Xid or an amdgpu fault. The
+generated compose passes that device read-only and grants `SYSLOG`, so the check
+passes on a stock install and a GPU fault turns up in the session trace. Where it
+is skipped, faults are still happening or not happening exactly as before — you
+just have to go and read the host's `dmesg` yourself to find one.
 
 A `media_reachability` warning names the scoped firewall rule the host is
 missing. See [Ports and endpoints](/quasar/reference/ports/#firewall).
@@ -93,9 +101,9 @@ Quasar tells you before it does it.
 On a machine with more than one GPU, `QUASAR_RENDER_NODE` picks which one the
 compositor and encoder use.
 
-Prefer a `/dev/dri/by-path/` path over `/dev/dri/renderD128`. The numbered names
-are assigned in probe order and can move between reboots. The by-path names are
-tied to the PCI address and do not.
+Prefer a `/dev/dri/by-path/` path over `/dev/dri/renderD128`, because the
+numbered names can move between reboots. See
+[Encoders](/quasar/tuning/encoders/#picking-a-gpu-on-a-multi-gpu-host).
 
 For NVENC on a multi-GPU box, `QUASAR_CUDA_DEVICE` selects the CUDA device index
 as well.
@@ -115,7 +123,7 @@ currently route a specific session to a specific GPU on a multi-GPU host.
 | `least-loaded` | Prefers the host with the most free capacity. |
 | `locality` | Prefers the host that already holds the user's home directory. |
 
-Use `locality` if home directories are host-local rather than on shared storage.
+Use `locality` if home directories are host-local instead of on shared storage.
 Otherwise a user's saves are on whichever host happened to run the session.
 
 ## Draining and removing
@@ -128,7 +136,7 @@ Once it is empty, stop the agent on that machine and forget the host here.
 ## The console
 
 Each host has a console page for local-display mode, where the host renders to a
-physically attached screen rather than to a browser. It needs additional
+physically attached screen, not to a browser. It needs additional
 privileges and a separate compose overlay, and it is not part of the default
 deployment.
 
@@ -136,13 +144,14 @@ deployment.
 
 Admin, Fleet, Storage shows the managed home directories across your fleet.
 
-Each host can have its own managed-home root. It must be genuinely shared storage
-if you want saves to follow users between machines; otherwise use locality
-placement to keep a user near the host holding their files. The readiness check
-reports whether the root is visible and writable from the agent's namespace.
+Each host can have its own managed-home root. If you want saves to follow users
+between machines it must be real shared storage, not merely the same path on
+each host; otherwise use locality placement to keep a user near the host holding
+their files. The readiness check reports whether the root is visible and
+writable from the agent's namespace.
 
 <Aside type="danger" title="Changing a storage root does not migrate data">
 Pointing a host at a different directory makes new launches use that directory.
-Existing homes remain at the old path until you move them deliberately. To a
-user, changing the root without migrating data looks like their saves vanished.
+Existing homes remain at the old path until you move them. To a user, changing
+the root without migrating data looks like their saves vanished.
 </Aside>

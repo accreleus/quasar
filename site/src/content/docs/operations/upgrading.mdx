@@ -78,7 +78,7 @@ you change them, which is the point of pinning.
 ## If the control plane crash-loops after a rollback
 
 Redeploy the newer control-plane image containing the migration already present
-in the database. If you genuinely need to return to the older release, restore
+in the database. If you must return to the older release, restore
 the pre-upgrade database backup as well. Do not hand-edit migration bookkeeping
 or run down migrations against production state.
 

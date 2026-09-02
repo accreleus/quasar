@@ -56,8 +56,8 @@ decodes it with operating system hardware support, so effectively macOS and
 Windows only. The catalog calls it `hevc` and the wire calls it `h265`.
 
 **Home root.** The directory on a host where managed home directories live. Must
-be the same path on every host, and genuinely shared storage if saves are to
-follow users between machines.
+be the same path on every host. For saves to follow users between machines it
+must also be real shared storage, not merely that same path on each one.
 
 **Host.** A machine running the node agent. Owns GPUs and runs sessions.
 

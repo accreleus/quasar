@@ -11,7 +11,7 @@
  * after the `iconAttrs(props)` spread; callers can still override further
  * via their own props since `iconAttrs` folds `...rest` in last.
  */
-import type { SVGProps } from "react";
+import type { JSX, SVGProps } from "react";
 
 /** Every icon: 16×16 viewBox, stroke=currentColor, strokeWidth 1.5,
  *  className "ic" by default, aria-hidden unless a label is given. */

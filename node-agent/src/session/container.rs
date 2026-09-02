@@ -21,6 +21,8 @@
 //!     the image entrypoint is root-init-then-`setpriv`.
 //!   - `--security-opt seccomp=unconfined` (`QUASAR_APP_SECCOMP`): Docker's default
 //!     profile denies the userns creation Steam's pressure-vessel (bwrap) requires.
+//!   - `--security-opt apparmor=unconfined`, on AppArmor hosts only: `docker-default`
+//!     denies mount inside that userns, which is the other half of the same gate.
 //!   - `--security-opt no-new-privileges` + `--pids-limit` (`QUASAR_APP_PIDS_LIMIT`,
 //!     default 8192, a fork-bomb backstop that still fits Steam + a game).
 //!   - `--shm-size` (`QUASAR_APP_SHM_SIZE`, default 1g): Chromium-embedding apps fail
@@ -38,8 +40,9 @@
 //!     remapped mic (`quasar_mic_src`), and catalog env wins for the device names. The
 //!     sidecar socket grants anonymous auth, so no cookie is shared
 //!     (`audio::pulse_run_args`).
-//!   - GPU: `--gpus all` (NVIDIA) or `--device /dev/dri` (VA/DRI). The image registers
-//!     the runtime-injected driver itself, never baked.
+//!   - GPU: `--gpus all` (NVIDIA) or `--device /dev/dri` (VA/DRI), plus one numeric
+//!     `--group-add` per group owning a passed DRM node. The image registers the
+//!     runtime-injected driver itself, never baked.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -719,6 +722,22 @@ impl ContainerRuntime {
             }
         }
 
+        // seccomp is not the only gate on the user namespaces the images need: Ubuntu's
+        // `docker-default` AppArmor profile denies mount inside one, so Steam's bootstrap
+        // fails ("Steam now requires user namespaces to be enabled") while `unshare -U`
+        // alone succeeds and `unshare -Urm` dies with "cannot change root filesystem
+        // propagation: Permission denied". Only on AppArmor hosts — an SELinux host
+        // (Fedora, `spc_t`) must get a byte-identical argv. Pairs with a HOST setting on
+        // Ubuntu 24.04+: `kernel.apparmor_restrict_unprivileged_userns=0`.
+        let apparmor = apparmor_unconfined_args(host_uses_apparmor());
+        if !apparmor.is_empty() {
+            tracing::info!(
+                token = "app-apparmor-unconfined",
+                "host uses AppArmor: app container runs unconfined so its user namespaces can mount"
+            );
+        }
+        args.extend(apparmor);
+
         // Per-app opt-in (`"systempaths_unconfined": true`): unmask /proc and /sys.
         // Docker's default `systempaths=masked` blocks Flatpak's sandbox helper
         // (`bwrap`) from mounting a fresh /proc inside the app's mount namespace, so
@@ -790,7 +809,30 @@ impl ContainerRuntime {
             }
             // AMD/Intel (and NVIDIA's render node for Vulkan/EGL) want the DRI nodes.
             args.push("--device".into());
-            args.push("/dev/dri".into());
+            args.push(DRI_DIR.into());
+
+            // The nodes arrive 0660 root:render, and the app user (PUID, no supplementary
+            // groups) is neither — so RADV fails `Could not open device
+            // /dev/dri/renderD128: Permission denied`, Vulkan enumerates llvmpipe only,
+            // and gamescope aborts with "physical device doesn't support
+            // VK_EXT_physical_device_drm" (desktop images degrade silently to software
+            // rendering instead). NVIDIA never hit it: its ICD opens the 0666
+            // /dev/nvidia* nodes. Grants nothing the passed device did not already imply.
+            let dri_nodes = dri_node_owners(Path::new(DRI_DIR));
+            let group_add = dri_group_add_args(&dri_nodes);
+            if !group_add.is_empty() {
+                tracing::info!(
+                    token = "app-dri-group-add",
+                    nodes = %dri_nodes
+                        .iter()
+                        .map(|n| format!("{}:{:o}:{}", n.name, n.mode & 0o777, n.gid))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    "app container joins DRM node groups: {}",
+                    group_add.join(" ")
+                );
+            }
+            args.extend(group_add);
         }
 
         // ── Virtual input device nodes (mouse/keyboard for evdev-native apps,
@@ -1406,6 +1448,98 @@ fn host_has_fuse_node() -> bool {
     Path::new("/dev/fuse").exists()
 }
 
+/// Does the HOST enforce AppArmor?
+///
+/// `/sys/module` is the host's module tree even inside a container (sysfs is not
+/// namespaced), so this reads the host's answer with no `/host` mount. The securityfs
+/// directory is the other host-wide signal but is NOT mounted in the agent container, so
+/// it can only add a yes, never a no.
+fn host_uses_apparmor() -> bool {
+    if let Ok(enabled) = std::fs::read_to_string("/sys/module/apparmor/parameters/enabled") {
+        return enabled.trim().eq_ignore_ascii_case("y");
+    }
+    Path::new("/sys/kernel/security/apparmor").is_dir()
+}
+
+/// `--security-opt apparmor=unconfined` args, gated on the host enforcing AppArmor. Split
+/// out so the decision is testable without touching the live host filesystem.
+fn apparmor_unconfined_args(host_enforces_apparmor: bool) -> Vec<String> {
+    if !host_enforces_apparmor {
+        return Vec::new();
+    }
+    vec!["--security-opt".into(), "apparmor=unconfined".into()]
+}
+
+/// The DRM node directory, in the agent and in every GPU app container alike: `--device`
+/// reproduces each node with the HOST's mode and gid, so what the agent stats here is
+/// what the app container gets.
+const DRI_DIR: &str = "/dev/dri";
+
+/// Ownership of one DRM node, as the `--group-add` decision needs it.
+struct DrmNodeOwner {
+    name: String,
+    mode: u32,
+    gid: u32,
+}
+
+/// Stat every DRM node in `dir`. A node whose metadata will not read is dropped with a
+/// WARN and simply contributes no group: a launch must never fail on a stat.
+fn dri_node_owners(dir: &Path) -> Vec<DrmNodeOwner> {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut owners = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("renderD") || name.starts_with("card")) {
+            continue;
+        }
+        match std::fs::metadata(entry.path()) {
+            Ok(md) => owners.push(DrmNodeOwner {
+                name,
+                mode: md.mode(),
+                gid: md.gid(),
+            }),
+            Err(e) => tracing::warn!(
+                token = "dri-node-stat-failed",
+                node = %entry.path().display(),
+                error = %e,
+                "cannot read DRM node ownership; the app container gets no group for it"
+            ),
+        }
+    }
+    owners
+}
+
+/// One `--group-add <gid>` per distinct group owning a DRM node the app cannot already
+/// open through the node's `other` bits. Sorted and deduped so the argv is stable.
+///
+/// Numeric only: `render`/`video` do not exist in the app images, and a name that does
+/// not resolve fails the whole `docker run`.
+fn dri_group_add_args(nodes: &[DrmNodeOwner]) -> Vec<String> {
+    let mut gids: Vec<u32> = nodes
+        .iter()
+        .filter(|n| dri_group_granted(n.mode, n.gid))
+        .map(|n| n.gid)
+        .collect();
+    gids.sort_unstable();
+    gids.dedup();
+    gids.iter()
+        .flat_map(|gid| ["--group-add".to_string(), gid.to_string()])
+        .collect()
+}
+
+/// Does the launcher hand the app container this node's owning group? Readiness
+/// (`dri_node_app_access`) predicts app access with the same rule, so the check and the
+/// launch cannot drift apart.
+///
+/// A world-rw node needs no group. gid 0 is never granted: root-group membership widens
+/// far past the DRM node, so a 0660 root:root node stays unopenable and readiness says so.
+pub(crate) fn dri_group_granted(mode: u32, gid: u32) -> bool {
+    mode & 0o006 != 0o006 && mode & 0o060 != 0 && gid != 0
+}
+
 /// `--device /dev/fuse` args, gated on host fuse-node presence. Split out so the
 /// decision is testable without touching the live host filesystem.
 fn fuse_device_args(host_has_fuse: bool) -> Vec<String> {
@@ -1652,6 +1786,69 @@ impl Drop for RunningContainer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn node(name: &str, mode: u32, gid: u32) -> DrmNodeOwner {
+        DrmNodeOwner {
+            name: name.to_string(),
+            mode,
+            gid,
+        }
+    }
+
+    /// Ubuntu's `docker-default` denies mount inside a user namespace, which Steam's
+    /// bootstrap needs; an SELinux host must see a byte-identical argv.
+    #[test]
+    fn apparmor_is_unconfined_only_on_an_apparmor_host() {
+        assert_eq!(
+            apparmor_unconfined_args(true),
+            vec!["--security-opt", "apparmor=unconfined"]
+        );
+        assert!(apparmor_unconfined_args(false).is_empty());
+    }
+
+    /// The AMD/Intel launch defect: 0660 root:render nodes with no group-add make RADV
+    /// fail to open renderD128, so Vulkan enumerates llvmpipe and gamescope exits 1.
+    #[test]
+    fn dri_group_add_covers_every_node_the_app_cannot_open_otherwise() {
+        // hermes: renderD128 root:render(991), card0 root:video(44).
+        assert_eq!(
+            dri_group_add_args(&[node("renderD128", 0o660, 991), node("card0", 0o660, 44)]),
+            vec!["--group-add", "44", "--group-add", "991"],
+            "both owning gids, ascending"
+        );
+
+        // Deduped across nodes sharing a group, and ordered independently of readdir.
+        assert_eq!(
+            dri_group_add_args(&[
+                node("renderD129", 0o660, 991),
+                node("renderD128", 0o660, 991),
+                node("card1", 0o660, 44),
+            ]),
+            vec!["--group-add", "44", "--group-add", "991"]
+        );
+
+        // Nothing to grant: world-rw needs no group, a groupless mode has none to give,
+        // and gid 0 is never handed out.
+        assert!(dri_group_add_args(&[
+            node("renderD128", 0o666, 991),
+            node("card0", 0o600, 44),
+            node("renderD129", 0o660, 0),
+        ])
+        .is_empty());
+
+        assert!(dri_group_add_args(&[]).is_empty());
+    }
+
+    /// Readiness predicts app access with this same predicate; a divergence is how the
+    /// check false-passes a host whose sessions cannot start.
+    #[test]
+    fn a_granted_group_is_exactly_what_the_args_contain() {
+        for (mode, gid) in [(0o660, 991), (0o666, 991), (0o600, 44), (0o660, 0)] {
+            let granted = dri_group_granted(mode, gid);
+            let args = dri_group_add_args(&[node("renderD128", mode, gid)]);
+            assert_eq!(granted, !args.is_empty(), "mode {mode:o} gid {gid}");
+        }
+    }
 
     // `deny` is the only value that hardens; everything else, including a typo, keeps
     // the shipped catalog launching.

@@ -44,6 +44,9 @@ function securityError(): Error {
 afterEach(() => {
   resetCertTrustForTests();
   vi.unstubAllGlobals();
+  // `restoreAllMocks` only restores `vi.spyOn` spies since vitest 3; clear call
+  // history too, or a plain `vi.fn()`'s counters survive into the next test.
+  vi.clearAllMocks();
   vi.restoreAllMocks();
   delete (navigator as unknown as { serviceWorker?: unknown }).serviceWorker;
 });

@@ -35,7 +35,7 @@ pair and the session never starts even though you signed in perfectly well.
 ## Use a VPN
 
 WireGuard or Tailscale put your client on the same routable network as the GPU
-host. Quasar then behaves exactly as it does on a LAN, because as far as it is
+host. Quasar then behaves as it does on a LAN, because as far as it is
 concerned that is what it is on.
 
 Two things to get right.
@@ -47,7 +47,7 @@ Quasar at `10.8.0.5`, that address belongs in `QUASAR_TLS_HOSTS`. See
 **The VPN has to carry UDP well.** Media is UDP and latency sensitive. A VPN
 that adds 60 ms and reorders packets makes the stream feel bad no matter how
 much bandwidth you have. Tailscale suits this because its connections are
-usually genuinely peer to peer. When it falls back to a relay for a particular
+usually peer to peer. When it falls back to a relay for a particular
 pair of machines, you get that relay's latency and there is nothing Quasar can
 do about it.
 

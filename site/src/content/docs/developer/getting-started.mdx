@@ -5,10 +5,10 @@ description: Initialise a Quasar development checkout and run the local UI and A
 
 import { Aside, Steps } from '@astrojs/starlight/components';
 
-The local development stack contains Postgres, the control plane, and the web
-app. It intentionally has no node agent: the agent needs a Linux GPU host, so a
-local checkout is for UI and API work unless your workstation is also configured
-as a fleet host.
+The local development stack is Postgres, the control plane, and the web app.
+There is no node agent, because the agent needs a Linux GPU host. A local
+checkout covers UI and API work; streaming work happens on a fleet host, unless
+your workstation is also configured as one.
 
 <Steps>
 
@@ -60,9 +60,13 @@ control plane against an ephemeral Postgres database. Stop the local stack with
 ## Worktrees and parallel checkouts
 
 Each worktree gets a derived `QUASAR_INSTANCE`, its own Compose project, a
-dedicated ten-port block, and an ephemeral test database. Do not hardcode ports,
-container names, or Compose project names in new tooling. Use the helpers under
-`scripts/dx/` and expose routine workflows through the root Makefile.
+dedicated ten-port block, and an ephemeral test database, so two checkouts
+cannot collide on containers, volumes, ports, or Postgres.
+
+That holds only while everything goes through the derivation. Do not hardcode
+ports, container names, or Compose project names in new tooling. Use
+the helpers under `scripts/dx/` and expose routine workflows through the root
+Makefile.
 
 <Aside type="note" title="A remote warning from doctor is advisory">
 An unreachable GPU host can make `make doctor` report degraded when you are off
@@ -85,4 +89,5 @@ The build reads `protocol/openapi.yaml` to generate the
 [Control-plane API](/quasar/developer/api/) reference, so it needs the protocol
 submodule present. `make init` handles that; in a checkout cloned without
 `--recurse-submodules`, run `git submodule update --init protocol` first. The
-build says so if it is missing.
+build says so if it is missing. `go test ./...` reads the same file and fails
+with only a missing-file error.

@@ -132,25 +132,33 @@ pub struct Download<'a> {
 /// followed manually and re-validated on every hop.
 pub fn fetch(d: &Download<'_>) -> Result<String> {
     let what = d.what;
-    let agent = ureq::AgentBuilder::new()
-        .redirects(0)
-        .timeout_connect(Duration::from_secs(20))
-        .timeout_read(READ_TIMEOUT)
-        .build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .max_redirects(0)
+        .timeout_connect(Some(Duration::from_secs(20)))
+        .build()
+        .into();
 
     let mut current = d.url.to_string();
     let mut resp = None;
     for hop in 0..=MAX_REDIRECTS {
         validate_url(&current, d.host)?;
         tracing::info!(target: T, artifact = %what, url = %current, hop, "downloading {}", d.what);
-        match agent.get(&current).call() {
-            // A 3xx arrives in the Ok arm, never Err(Status) (#478): ureq 2.x converts to
-            // `Error::Status` only at >= 400. Handling it on the Err arm is dead code, and
+        match agent
+            .get(&current)
+            .config()
+            .timeout_recv_body(Some(d.timeout))
+            .build()
+            .call()
+        {
+            // A 3xx arrives in the Ok arm, never Err(StatusCode) (#478): ureq converts to
+            // `Error::StatusCode` only at >= 400. Handling it on the Err arm is dead code, and
             // the empty 3xx body then lands on disk under a misleading error.
-            Ok(r) if (300..400).contains(&r.status()) => {
-                let code = r.status();
+            Ok(r) if (300..400).contains(&r.status().as_u16()) => {
+                let code = r.status().as_u16();
                 let loc = r
-                    .header("Location")
+                    .headers()
+                    .get("Location")
+                    .and_then(|v| v.to_str().ok())
                     .ok_or_else(|| anyhow!("HTTP {code} redirect with no Location header"))?
                     .to_string();
                 let next = join_redirect(&current, &loc)?;
@@ -162,16 +170,18 @@ pub fn fetch(d: &Download<'_>) -> Result<String> {
                 resp = Some(r);
                 break;
             }
-            Err(ureq::Error::Status(404, _)) => bail!("{} (HTTP 404)", d.not_found),
-            Err(ureq::Error::Status(code, _)) => bail!("HTTP {code} fetching {current}"),
+            Err(ureq::Error::StatusCode(404)) => bail!("{} (HTTP 404)", d.not_found),
+            Err(ureq::Error::StatusCode(code)) => bail!("HTTP {code} fetching {current}"),
             Err(e) => bail!("network error fetching {current}: {e}"),
         }
     }
-    let resp =
+    let mut resp =
         resp.ok_or_else(|| anyhow!("too many redirects (>{MAX_REDIRECTS}) fetching {}", d.url))?;
 
     let total: Option<u64> = resp
-        .header("Content-Length")
+        .headers()
+        .get("Content-Length")
+        .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     tracing::info!(
         target: T, artifact = %what,
@@ -180,7 +190,7 @@ pub fn fetch(d: &Download<'_>) -> Result<String> {
         total.map(|t| t / (1024 * 1024)).unwrap_or(0)
     );
 
-    let mut reader = resp.into_reader();
+    let mut reader = resp.body_mut().as_reader();
     let mut file =
         std::fs::File::create(d.dest).with_context(|| format!("create {}", d.dest.display()))?;
     let mut hasher = Sha256::new();

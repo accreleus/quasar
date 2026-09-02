@@ -438,3 +438,73 @@ func mustQuery(t *testing.T, requestURI string) url.Values {
 	}
 	return u.Query()
 }
+
+// #80: autocomplete carries no images, so Search must resolve previews itself
+// — in ONE extra request (the throttle makes per-candidate lookups cost
+// seconds while an admin watches the picker).
+func TestSearchFillsThumbsInOneRequest(t *testing.T) {
+	c, stub := newStubProvider(t, map[string]stubResponse{
+		"/search/autocomplete/": {http.StatusOK, `{"success":true,"data":[
+			{"id":1234,"name":"Portal 2"},
+			{"id":5678,"name":"Portal 2: Community Update"}
+		]}`},
+		"/grids/game/": {http.StatusOK, `{"success":true,"data":[
+			{"success":true,"data":[{"id":1,"width":600,"height":900,"score":5,"url":"https://cdn/full-a.png","thumb":"https://cdn/thumb-a.png"}]},
+			{"success":true,"data":[{"id":2,"width":600,"height":900,"score":5,"url":"https://cdn/full-b.png","thumb":"https://cdn/thumb-b.png"}]}
+		]}`},
+	})
+	got, err := c.Search(context.Background(), "Portal 2")
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(got) != 2 || got[0].ThumbURL != "https://cdn/thumb-a.png" || got[1].ThumbURL != "https://cdn/thumb-b.png" {
+		t.Fatalf("thumbs not filled from the multi-id grids response: %+v", got)
+	}
+	if len(stub.requests) != 2 {
+		t.Fatalf("want exactly 2 requests (autocomplete + one grids), got %v", stub.requests)
+	}
+	if !strings.Contains(stub.requests[1], "/grids/game/1234,5678?") {
+		t.Fatalf("grids request must carry every candidate id: %q", stub.requests[1])
+	}
+	if !strings.Contains(stub.requests[1], "dimensions=600x900") {
+		t.Fatalf("grids request must reuse the portrait-tile filter: %q", stub.requests[1])
+	}
+}
+
+// A single candidate gets SteamGridDB's FLAT single-game response shape, not
+// the nested multi-id one.
+func TestSearchSingleCandidateUsesFlatShape(t *testing.T) {
+	c, _ := newStubProvider(t, map[string]stubResponse{
+		"/search/autocomplete/": {http.StatusOK, `{"success":true,"data":[{"id":42,"name":"Blender"}]}`},
+		"/grids/game/": {http.StatusOK, `{"success":true,"data":[
+			{"id":1,"width":600,"height":900,"score":5,"url":"https://cdn/full.png","thumb":"https://cdn/thumb.png"}
+		]}`},
+	})
+	got, err := c.Search(context.Background(), "Blender")
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(got) != 1 || got[0].ThumbURL != "https://cdn/thumb.png" {
+		t.Fatalf("single-candidate thumb not filled: %+v", got)
+	}
+}
+
+// Previews are best-effort: a failing grids lookup must leave the search
+// result intact (the picker's glyph fallback is the degraded path), never
+// fail it.
+func TestSearchSurvivesThumbLookupFailure(t *testing.T) {
+	c, _ := newStubProvider(t, map[string]stubResponse{
+		"/search/autocomplete/": {http.StatusOK, `{"success":true,"data":[
+			{"id":1234,"name":"Portal 2"},
+			{"id":5678,"name":"Portal 2: Community Update"}
+		]}`},
+		"/grids/game/": {http.StatusInternalServerError, `{"success":false,"errors":["boom"]}`},
+	})
+	got, err := c.Search(context.Background(), "Portal 2")
+	if err != nil {
+		t.Fatalf("a thumb failure must not fail the search: %v", err)
+	}
+	if len(got) != 2 || got[0].ThumbURL != "" || got[1].ThumbURL != "" {
+		t.Fatalf("candidates must survive unfilled: %+v", got)
+	}
+}

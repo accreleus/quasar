@@ -184,23 +184,28 @@ impl LibraryScanClient {
     }
 
     fn fetch_pending(&self) -> Result<Vec<ScanTask>, String> {
-        let resp = ureq::get(&self.pending_url())
-            .timeout(HTTP_TIMEOUT)
-            .set("Authorization", &format!("Bearer {}", self.node_secret))
-            .set("X-Quasar-Node", &self.node_name)
+        let mut resp = ureq::get(&self.pending_url())
+            .config()
+            .timeout_global(Some(HTTP_TIMEOUT))
+            .build()
+            .header("Authorization", &format!("Bearer {}", self.node_secret))
+            .header("X-Quasar-Node", &self.node_name)
             .call()
             .map_err(|e| format!("GET scan-pending: {e}"))?;
         let parsed: ScanPendingResp = resp
-            .into_json()
+            .body_mut()
+            .read_json()
             .map_err(|e| format!("decode scan-pending: {e}"))?;
         Ok(parsed.scans)
     }
 
     fn post_report(&self, report: &ScanReport) -> Result<(), String> {
         ureq::post(&self.report_url())
-            .timeout(HTTP_TIMEOUT)
-            .set("Authorization", &format!("Bearer {}", self.node_secret))
-            .set("X-Quasar-Node", &self.node_name)
+            .config()
+            .timeout_global(Some(HTTP_TIMEOUT))
+            .build()
+            .header("Authorization", &format!("Bearer {}", self.node_secret))
+            .header("X-Quasar-Node", &self.node_name)
             .send_json(report)
             .map_err(|e| format!("POST scan-report: {e}"))?;
         Ok(())

@@ -1749,7 +1749,7 @@
         "ts_unix_ms"
       ],
       "clock": "host_wall",
-      "why": "An NVIDIA Xid the kernel recorded, tailed off /dev/kmsg. Emitted to EVERY running session because the kernel does not know whose work faulted \u2014 two sessions reporting the same Xid are one fault seen twice. Corroborates vulkan_fault's failure-string inference; it does not replace it. Absent on a host where /dev/kmsg is unreadable (see the xid_visibility readiness check), which is NOT evidence that no fault occurred."
+      "why": "An NVIDIA Xid the kernel recorded, tailed off /dev/kmsg. Emitted to EVERY running session because the kernel does not know whose work faulted \u2014 two sessions reporting the same Xid are one fault seen twice. Corroborates vulkan_fault's failure-string inference; it does not replace it. Present by default: the shipped compose passes /dev/kmsg read-only and grants CAP_SYSLOG. Absent on a host whose compose predates that, dropped the entry, or runs a kernel without /dev/kmsg (see the xid_visibility readiness check), which is NOT evidence that no fault occurred."
     },
     {
       "type": "host.gpu_fault",

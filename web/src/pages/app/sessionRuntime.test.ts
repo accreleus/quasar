@@ -664,3 +664,30 @@ describe("launch signals", () => {
     expect(cancelVideoFrameCallback).toHaveBeenCalledWith(77);
   });
 });
+
+describe("snapshot notification dedupe (#78)", () => {
+  // The telemetry sink re-reports displayRefreshHz on every ~1 Hz snapshot.
+  // Before the dedupe, each report notified subscribers even when nothing
+  // changed — SessionPage re-rendered every tick, and the HUD's per-render
+  // measure() replayed the open shelf pane's entry animation as a visible
+  // flash. A no-op write must not notify.
+  it("does not notify subscribers when a telemetry tick changes nothing", () => {
+    const h = harness();
+    h.runtime.start();
+    h.transport.fireChannel(new FakeChannel());
+    const notify = vi.fn();
+    h.runtime.subscribe(notify);
+
+    h.emit(snap({ displayRefreshHz: 60 }));
+    const afterFirst = notify.mock.calls.length;
+    expect(h.runtime.getSnapshot().displayRefreshHz).toBe(60);
+
+    h.emit(snap({ displayRefreshHz: 60 }));
+    h.emit(snap({ displayRefreshHz: 60 }));
+    expect(notify.mock.calls.length).toBe(afterFirst);
+
+    h.emit(snap({ displayRefreshHz: 59 }));
+    expect(notify.mock.calls.length).toBe(afterFirst + 1);
+    expect(h.runtime.getSnapshot().displayRefreshHz).toBe(59);
+  });
+});

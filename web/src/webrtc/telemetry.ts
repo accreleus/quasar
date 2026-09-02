@@ -70,6 +70,11 @@ const RVFC_CAPTURE_TIME_GRACE_FRAMES = 3;
 // stall, detachment). Do not persist old timing.
 const RVFC_CAPTURE_TIME_STALE_MS = 5_000;
 
+/** Settle time before a resize/fullscreen change triggers a refresh
+ *  re-measurement. Long enough that dragging a window across a monitor edge
+ *  measures once, at the destination, rather than continuously en route. */
+const DISPLAY_REMEASURE_DEBOUNCE_MS = 400;
+
 export interface TelemetrySnapshot {
   fps: number;
   /** Delta of inbound-rtp bytesReceived over the poll window; null until 2nd poll. */
@@ -187,13 +192,22 @@ export class SessionTelemetry {
   private presentSdMs: number | null = null;
   private presentP95Ms: number | null = null;
   private presentCadence: PresentCadence = EMPTY_CADENCE;
-  /** rAF/vsync-measured; re-measured on visibilitychange (tab may have moved display). */
+  /** rAF/vsync-measured. Re-measured on every event that can change which
+   * display (or which compositing rate) the tab is presenting at: tab
+   * visibility, fullscreen entry/exit, and window resize — the last two stand
+   * in for "moved to another monitor", which the platform does not report.
+   * The first measurement is taken during start(), the busiest moment on the
+   * main thread, so treating it as permanent is exactly the #85 defect. */
   private displayRefreshHz: number | null = null;
-  /** In-flight rAF measurement handle: lets stop() cancel it and visibilitychange
-   * coalesce concurrent re-measurements to one at a time. */
+  /** In-flight rAF measurement handle: lets stop() cancel it and the re-measure
+   * triggers coalesce concurrent re-measurements to one at a time. */
   private refreshMeasurement: MeasurementHandle | null = null;
   private stopped = false; // guards against late .result resolves writing back
   private readonly onVisibilityChange: () => void;
+  private readonly onDisplayChange: () => void;
+  /** Debounces the resize trigger: a drag across a monitor edge fires resize
+   * continuously, and each measurement runs an rAF loop for up to 2 s. */
+  private resizeDebounce: ReturnType<typeof setTimeout> | null = null;
 
   // getStats() delta tracking (cumulative counters -> per-interval rates)
   private prevJbDelay = 0;
@@ -296,17 +310,35 @@ export class SessionTelemetry {
       this.handleChannelMessage(e.data as string);
     };
 
-    // Coalesces to one measurement at a time: skip if one is already in flight.
     this.onVisibilityChange = () => {
-      if (document.visibilityState === "visible" && this.refreshMeasurement === null) {
-        const handle = measureDisplayRefreshHz();
-        this.refreshMeasurement = handle;
-        handle.result.then((hz) => {
-          this.refreshMeasurement = null;
-          if (!this.stopped && hz !== null) this.displayRefreshHz = hz;
-        });
-      }
+      if (document.visibilityState === "visible") this.remeasureDisplayRefresh();
     };
+    // Fullscreen and resize share one debounced handler: entering fullscreen
+    // fires BOTH events, and a window dragged across a monitor edge fires
+    // resize continuously. Debouncing means one measurement, taken once the
+    // new geometry has settled — which is the only geometry worth measuring.
+    this.onDisplayChange = () => {
+      if (this.resizeDebounce !== null) clearTimeout(this.resizeDebounce);
+      this.resizeDebounce = setTimeout(() => {
+        this.resizeDebounce = null;
+        this.remeasureDisplayRefresh();
+      }, DISPLAY_REMEASURE_DEBOUNCE_MS);
+    };
+  }
+
+  /** Start an rAF refresh measurement unless one is already running. Coalescing
+   *  on `refreshMeasurement` is what makes it safe to call from three listeners
+   *  that can all fire for a single user action (fullscreen fires resize too).
+   *  A null result (throttled tab, cancelled) leaves the previous estimate in
+   *  place rather than blanking a number the UI is reading. */
+  private remeasureDisplayRefresh(): void {
+    if (this.stopped || this.refreshMeasurement !== null) return;
+    const handle = measureDisplayRefreshHz();
+    this.refreshMeasurement = handle;
+    handle.result.then((hz) => {
+      this.refreshMeasurement = null;
+      if (!this.stopped && hz !== null) this.displayRefreshHz = hz;
+    });
   }
 
   /** Register a callback invoked after each getStats() poll (approximately 1 Hz). */
@@ -325,13 +357,10 @@ export class SessionTelemetry {
     this.startClockSync();
     this.startOverlayLoop();
     this.startPosting();
-    const handle = measureDisplayRefreshHz(); // true monitor refresh from rAF vsync, not RVFC
-    this.refreshMeasurement = handle;
-    handle.result.then((hz) => {
-      this.refreshMeasurement = null;
-      if (!this.stopped && hz !== null) this.displayRefreshHz = hz;
-    });
+    this.remeasureDisplayRefresh(); // true monitor refresh from rAF vsync, not RVFC
     document.addEventListener("visibilitychange", this.onVisibilityChange);
+    document.addEventListener("fullscreenchange", this.onDisplayChange);
+    window.addEventListener("resize", this.onDisplayChange);
   }
 
   /** Stop all loops and disconnect. Safe to call multiple times. */
@@ -349,7 +378,13 @@ export class SessionTelemetry {
       this.refreshMeasurement.cancel();
       this.refreshMeasurement = null;
     }
+    if (this.resizeDebounce !== null) {
+      clearTimeout(this.resizeDebounce);
+      this.resizeDebounce = null;
+    }
     document.removeEventListener("visibilitychange", this.onVisibilityChange);
+    document.removeEventListener("fullscreenchange", this.onDisplayChange);
+    window.removeEventListener("resize", this.onDisplayChange);
   }
 
   /**

@@ -313,7 +313,8 @@ fn check_xid_visibility(env: &ProbeEnv) -> ReadinessCheck {
         Ok(_) => pass(
             ID,
             format!(
-                "{} is readable — GPU Xid / amdgpu fault records are reported as                  `host.xid` / `host.gpu_fault` trace events",
+                "{} is readable — GPU Xid / amdgpu fault records are reported as \
+                 `host.xid` / `host.gpu_fault` trace events",
                 crate::gpu_kmsg::KMSG_PATH
             ),
         ),
@@ -321,11 +322,19 @@ fn check_xid_visibility(env: &ProbeEnv) -> ReadinessCheck {
             id: ID.to_string(),
             status: SKIP.to_string(),
             summary: format!(
-                "{} is not readable ({e}) — GPU faults will not appear in a session trace;                  an Xid can only be found by hand in the host's dmesg",
+                "{} is not readable ({e}) — GPU faults will not appear in a session trace; \
+                 an Xid can only be found by hand in the host's dmesg",
                 crate::gpu_kmsg::KMSG_PATH
             ),
             remediation: format!(
-                "Optional. To turn it on, give the node-agent service read access to the                  kernel ring buffer in deploy/docker-compose.yml: add `{}:{}:ro` under                  `devices:` and `SYS_ADMIN`-free `cap_add: [SYSLOG]`. Then restart the                  agent. Nothing else changes — the tailer is read-only, off the media                  path, and reports only NVRM Xid and amdgpu fault lines.",
+                "The shipped deploy/docker-compose.yml grants this, so a stack that cannot \
+                 read it predates that or has the entry removed. Under the node-agent \
+                 service add `{}:{}:r` to `devices:` — `:r` is the device-cgroup permission \
+                 set, a bind mount's `:ro` is rejected there — and `SYSLOG` to `cap_add:`, \
+                 which the device alone does not cover while kernel.dmesg_restrict=1 (the \
+                 distro default). Then recreate the agent container. Optional, and nothing \
+                 else changes — the tailer is read-only, off the media path, and reports \
+                 only NVRM Xid and amdgpu fault lines.",
                 crate::gpu_kmsg::KMSG_PATH,
                 crate::gpu_kmsg::KMSG_PATH
             ),
@@ -914,8 +923,10 @@ fn check_host_render_node(env: &ProbeEnv, distro: Distro) -> ReadinessCheck {
 /// in every GPU container indefinitely, with the HOST nodes still correct. The agent is root so
 /// it never notices; the app drops to `QUASAR_APP_PUID` and gamescope dies ~30s in.
 ///
-/// Narrow on purpose: only a node with no group AND no other access is called broken. The
-/// app's supplementary groups are unknowable here, so `0660` is never failed on suspicion.
+/// The app's supplementary groups are not a guess: the launcher hands it one `--group-add`
+/// per DRM-node group ([`crate::session::container::dri_group_granted`]), so this asks the
+/// question the app will actually face. Probing as root instead false-passed hermes, whose
+/// 0660 root:render node left RADV with permission denied and gamescope dead.
 fn check_dri_node_app_access(env: &ProbeEnv, _distro: Distro) -> ReadinessCheck {
     const ID: &str = "dri_node_app_access";
     if !env.gpu_present {
@@ -939,7 +950,7 @@ fn check_dri_node_app_access(env: &ProbeEnv, _distro: Distro) -> ReadinessCheck 
     let unusable: Vec<String> = nodes
         .iter()
         .filter(|p| !openable_by_app(Path::new(p), env))
-        .cloned()
+        .map(|p| describe_node(Path::new(p)))
         .collect();
     if unusable.is_empty() {
         return pass(
@@ -954,13 +965,25 @@ fn check_dri_node_app_access(env: &ProbeEnv, _distro: Distro) -> ReadinessCheck 
             ),
         );
     }
+    let remediation = if env.nvidia {
+        "The boot-time CDI spec baked the wrong device modes (nvidia-cdi-refresh.service ran \
+         before udev applied group ownership). Regenerate it on the HOST and recreate the \
+         containers: `sudo nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml && \
+         docker compose up -d --force-recreate`. A correct spec carries `fileMode: 438` (0666) \
+         and a gid for each /dev/dri entry."
+    } else {
+        "Give the node a non-root owning group with group rw (the distro default is \
+         `0660 root:render` for renderD* and `0660 root:video` for card*, both of which the \
+         launcher grants numerically), or make it world-rw. Check the HOST with \
+         `ls -l /dev/dri` and the udev rules that set it."
+    };
     fail(
         ID,
         format!(
-            "{} /dev/dri node(s) in this container are root-only (mode 0600, no group or other \
-             access) and cannot be opened by the unprivileged app user{}: {} — gamescope will \
-             fail with `vulkan: physical device has no primary node` and the app container will \
-             exit 1 about 30s after launch, while the HOST's own nodes look correct",
+            "{} /dev/dri node(s) in this container cannot be opened by the unprivileged app \
+             user{}, even with the DRM groups the launcher grants: {} — gamescope will fail with \
+             `vulkan: physical device has no primary node` and the app container will exit 1 \
+             about 30s after launch, while the HOST's own nodes look correct",
             unusable.len(),
             match env.app_uid {
                 Some(u) => format!(" (QUASAR_APP_PUID={u})"),
@@ -968,17 +991,31 @@ fn check_dri_node_app_access(env: &ProbeEnv, _distro: Distro) -> ReadinessCheck 
             },
             unusable.join(", ")
         ),
-        "The boot-time CDI spec baked the wrong device modes (nvidia-cdi-refresh.service ran \
-         before udev applied group ownership). Regenerate it on the HOST and recreate the \
-         containers: `sudo nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml && \
-         docker compose up -d --force-recreate`. A correct spec carries `fileMode: 438` (0666) \
-         and a gid for each /dev/dri entry."
-            .to_string(),
+        remediation.to_string(),
     )
 }
 
+/// `renderD128 (mode 0660 uid 0 gid 991)` — enough to see which bit is missing without a
+/// second trip to the host.
+fn describe_node(path: &Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    match std::fs::metadata(path) {
+        Ok(md) => format!(
+            "{name} (mode {:04o} uid {} gid {})",
+            md.mode() & 0o7777,
+            md.uid(),
+            md.gid()
+        ),
+        Err(_) => name,
+    }
+}
+
 /// Could a process running as the app user open `path` read-write? Fails open by construction:
-/// only a node with no group access, no other access, and an owner the app is not says no.
+/// only a node whose owner, group and other bits all exclude the app says no.
 fn openable_by_app(path: &Path, env: &ProbeEnv) -> bool {
     use std::os::unix::fs::MetadataExt;
     let Ok(md) = std::fs::metadata(path) else {
@@ -989,8 +1026,11 @@ fn openable_by_app(path: &Path, env: &ProbeEnv) -> bool {
     let group_rw = mode & 0o060 == 0o060;
     let other_rw = mode & 0o006 == 0o006;
     let owner_rw = mode & 0o600 == 0o600;
-    // Group access counts as usable: the app's supplementary groups are unknowable here.
-    other_rw || group_rw || (owner_rw && env.app_uid == Some(md.uid()))
+    // Group access counts only when the app is IN that group: either PGID, or a gid the
+    // launcher passes as `--group-add`.
+    let group_reachable = env.app_gid == Some(md.gid())
+        || crate::session::container::dri_group_granted(mode, md.gid());
+    other_rw || (group_rw && group_reachable) || (owner_rw && env.app_uid == Some(md.uid()))
 }
 
 /// (c) Does the Quasar NVIDIA driver volume match the RUNNING kernel driver?
@@ -1552,6 +1592,13 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// Fixtures are owned by whoever runs the tests, so a group-ownership case has to ask
+    /// rather than assume a gid.
+    fn fixture_gid(path: &Path) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).unwrap().gid()
     }
 
     fn get<'a>(checks: &'a [ReadinessCheck], id: &str) -> &'a ReadinessCheck {
@@ -2295,16 +2342,32 @@ mod tests {
         let c = get(&probe(&bad.env(true, "")), "dri_node_app_access").clone();
         assert_eq!(c.status, FAIL, "{c:?}");
         assert!(c.remediation.contains("nvidia-ctk cdi generate"), "{c:?}");
-        assert!(c.summary.contains("renderD128"), "{c:?}");
+        // The node and its mode/owner, so the operator need not go stat it again.
+        assert!(c.summary.contains("renderD128 (mode 0600 uid"), "{c:?}");
 
-        // Healthy: root:video 0660 card, root:render 0666 render node. Group access counts.
+        // Healthy: a world-rw render node, plus a 0660 card whose group the app is in.
         let good = FakeRoot::new("cdi-ok");
         good.file_mode("dev/dri/renderD128", "", 0o666)
             .file_mode("dev/dri/card1", "", 0o660);
-        assert_eq!(
-            get(&probe(&good.env(true, "")), "dri_node_app_access").status,
-            PASS
-        );
+        let mut env = good.env(true, "");
+        env.app_gid = Some(fixture_gid(&good.dir.join("dev/dri/card1")));
+        assert_eq!(get(&probe(&env), "dri_node_app_access").status, PASS);
+    }
+
+    /// A group with no WRITE bit is a group the launcher cannot make usable, and on an
+    /// AMD host the CDI story is the wrong remediation to print.
+    #[test]
+    fn an_ungrantable_dri_node_fails_with_a_vendor_neutral_remediation() {
+        let root = FakeRoot::new("dri-group-ro");
+        root.file_mode("dev/dri/renderD128", "", 0o640);
+        let mut env = root.env(false, "");
+        env.gpu_present = true;
+        env.app_gid = Some(fixture_gid(&root.dir.join("dev/dri/renderD128")));
+        let c = get(&probe(&env), "dri_node_app_access").clone();
+        assert_eq!(c.status, FAIL, "{c:?}");
+        assert!(c.summary.contains("renderD128 (mode 0640 uid"), "{c:?}");
+        assert!(c.remediation.contains("udev"), "{c:?}");
+        assert!(!c.remediation.contains("nvidia-ctk"), "{c:?}");
     }
 
     /// A driver DOWNGRADE leaves the volume on the old version; provisioning is
@@ -2792,5 +2855,76 @@ mod tests {
             0,
             "a WARN-only host must not be reported as having FAILED checks: {checks:?}"
         );
+    }
+
+    /// The remediation has to name the entry the shipped compose actually uses. `devices:`
+    /// takes a device-cgroup permission set (`r`/`w`/`m`), not a bind mount's `:ro` — Compose
+    /// rejects `:ro` there outright, so the old text sent operators to an error (#83). And
+    /// `dmesg_restrict=1` is the distro default, so the device without the capability is EPERM.
+    #[test]
+    fn xid_visibility_remediation_matches_the_shipped_compose_entry() {
+        let root = FakeRoot::new("xid-remediation");
+        let c = check_xid_visibility(&root.env(true, ""));
+        assert_eq!(
+            c.status, SKIP,
+            "no dev/kmsg fixture, so this is the skip arm"
+        );
+        assert!(
+            c.remediation.contains("/dev/kmsg:/dev/kmsg:r"),
+            "remediation must name the device entry verbatim: {c:?}"
+        );
+        assert!(
+            !c.remediation.contains("/dev/kmsg:/dev/kmsg:ro"),
+            "must never hand out the `:ro` form — Compose rejects it under `devices:`: {c:?}"
+        );
+        assert!(
+            c.remediation.contains("SYSLOG"),
+            "the device alone is EPERM under dmesg_restrict=1: {c:?}"
+        );
+    }
+
+    /// Every operator-facing string is one normalised paragraph. A `format!` literal that lost
+    /// its `\` line continuations carries the source's own indentation into the summary the
+    /// agent reports (#82) — HTML collapses the run so the admin UI looks fine, while the JSON,
+    /// the log line and the copy-to-clipboard text all keep the gap.
+    #[test]
+    fn no_check_text_carries_a_run_of_spaces() {
+        let visible = FakeRoot::new("text-visible");
+        visible
+            .file("usr/share/glvnd/egl_vendor.d/10_nvidia.json", "{}")
+            .file("usr/lib64/libnvidia-eglcore.so.570.86", "")
+            .file("dev/dri/renderD128", "")
+            .file("dev/uinput", "")
+            // Present: the `pass` arm of xid_visibility.
+            .file("dev/kmsg", "")
+            .file("proc/sys/user/max_user_namespaces", "15000\n")
+            .file("sys/class/drm/renderD128", "")
+            .file("etc/os-release", "ID=fedora\n");
+        // Absent `dev/kmsg`: the `skip` arm, which is the one that carries a remediation.
+        let hidden = FakeRoot::new("text-hidden");
+        hidden
+            .file("dev/dri/renderD128", "")
+            .file("dev/uinput", "")
+            .file("proc/sys/user/max_user_namespaces", "15000\n")
+            .file("etc/os-release", "ID=fedora\n");
+
+        let mut checks = probe(&visible.env(true, "/usr/lib"));
+        checks.extend(probe(&ProbeEnv {
+            firewall: FirewallPosture::Filtering {
+                tool: FirewallTool::Nftables,
+                detail: "nftables input policy=drop".to_string(),
+            },
+            ..hidden.env(true, "")
+        }));
+
+        for c in &checks {
+            for (field, text) in [("summary", &c.summary), ("remediation", &c.remediation)] {
+                assert!(
+                    !text.contains("  "),
+                    "{} {field} carries a run of spaces (a missing `\\` line continuation): {text:?}",
+                    c.id
+                );
+            }
+        }
     }
 }

@@ -33,11 +33,18 @@ updates:
     # bumping one alone resolves a SECOND parallel gst stack into the lockfile
     # (seen on the gstreamer-webrtc 0.25 solo bump — two gstreamer-sys
     # generations in one binary). Group them so the family moves as one PR.
+    # glib/gio/gobject are the same family: gstreamer-rs 0.25 requires glib
+    # 0.22, and a gstreamer-only bump left glib 0.20 behind, resolving TWO
+    # glib generations into the lockfile (#69 — every glib subclass in the
+    # tree failed to compile against the other generation's traits).
     groups:
       gstreamer:
         patterns:
           - "gstreamer*"
           - "gst-*"
+          - "glib*"
+          - "gio*"
+          - "gobject*"
 
   - package-ecosystem: npm
     directory: /web
@@ -63,6 +70,14 @@ updates:
           - "@vitejs/*"
           - "vitest"
           - "@vitest/*"
+    # openapi-typescript (the gen:api generator whose output is a checked-in
+    # contract artifact) peers on typescript ^5.x with no release accepting a
+    # newer major. Until its peer range moves, a typescript major bump can only
+    # install with --legacy-peer-deps, which we will not do (#72, and the
+    # earlier typescript 7 PR, both closed for this reason).
+    ignore:
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: npm
     directory: /site

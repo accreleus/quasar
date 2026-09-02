@@ -1,6 +1,6 @@
 ---
 title: Latency and smoothness
-description: Where the milliseconds go, why smoothness matters more than the average, and the small number of things that genuinely help.
+description: Where the milliseconds go, why smoothness matters more than the average, and the small number of things that help.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -25,9 +25,9 @@ performance overlay and in the admin session detail.
 
 <Aside type="caution" title="Frame drop counters from the browser are unreliable">
 A backgrounded or occluded browser tab throttles presentation, which inflates
-dropped-frame counts that have nothing to do with your network or your encoder.
-Judge delivery from the host-side frame rate and encode time. Judge smoothness
-from presentation interval variation, in a tab that is actually visible.
+every client-side smoothness number. Judge delivery from the host-side frame
+rate and encode time. Judge smoothness from presentation interval variation, in
+a visible tab.
 </Aside>
 
 ## Where the time goes
@@ -56,7 +56,7 @@ consistent.
 
 This is client-side and automatic. There is no server setting for it.
 
-## Things that actually help
+## Things that help
 
 **Wired, on both ends.** The single biggest improvement available to most
 people. WiFi jitter is the most common cause of a stream that feels bad on a
@@ -66,7 +66,7 @@ connection that measures fine.
 [Requirements](/quasar/start/requirements/). Without it, keyframe bursts overflow
 the send buffer and the drops get misread as congestion.
 
-**A frame rate your GPU can genuinely hold.** A steady 60 beats an unsteady 90.
+**A frame rate your GPU can hold.** A steady 60 beats an unsteady 90.
 Encode time rises with resolution and frame rate, and past the point where the
 encoder cannot keep up, everything gets worse at once.
 
@@ -81,7 +81,7 @@ is fine but not free.
 periodic spikes that hurt smoothness. The default of 60 is reasonable.
 
 **Reducing the encode queue depth.** `QUASAR_QUEUE_BUFFERS` below 3 trades jitter
-absorption for a couple of milliseconds. Usually a bad trade.
+absorption for a couple of milliseconds. A bad trade.
 
 **Forward error correction.** Do not enable it for browser clients. See
 [Experimental options](/quasar/tuning/experimental/).
@@ -90,7 +90,7 @@ absorption for a couple of milliseconds. Usually a bad trade.
 
 If a Mac on WiFi shows periodic sawtooth latency spikes, check whether the AWDL
 interface is up. It is used by AirDrop and Handoff, and its channel hopping
-produces exactly that pattern.
+produces that pattern.
 
 ```bash
 ifconfig awdl0

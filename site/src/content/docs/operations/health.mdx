@@ -29,8 +29,7 @@ curl http://localhost:8080/health
 {"status":"ok","db":"ok"}
 ```
 
-Deliberately excluded from the HTTPS redirect so it works before certificates are
-sorted.
+Excluded from the HTTPS redirect so it works before certificates are sorted.
 
 Node agent, on the host it runs on:
 
@@ -81,9 +80,9 @@ got an unexpected codec.
 
 ### Bad
 
-`no VA H264 encoder found` means the VA encoder did not register. Usually a stale
-GStreamer registry, or software Mesa being forced by an environment variable that
-should not be set.
+`no VA H264 encoder found` means the VA encoder did not register. Usually a
+stale GStreamer registry, or software Mesa being forced by an environment
+variable that should not be set.
 
 `quasar-renderer-degraded` means a hardware frame import fell back to software
 rendering. Two of these within 30 seconds fails the session, unless

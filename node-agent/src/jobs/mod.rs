@@ -268,23 +268,28 @@ impl HttpTransport {
 
 impl JobTransport for HttpTransport {
     fn fetch_pending(&self) -> Result<Vec<PendingRun>, String> {
-        let resp = ureq::get(&format!("{}/v1/agent/jobs/pending", self.http_base))
-            .timeout(HTTP_TIMEOUT)
-            .set("Authorization", &format!("Bearer {}", self.node_secret))
-            .set("X-Quasar-Node", &self.node_name)
+        let mut resp = ureq::get(&format!("{}/v1/agent/jobs/pending", self.http_base))
+            .config()
+            .timeout_global(Some(HTTP_TIMEOUT))
+            .build()
+            .header("Authorization", &format!("Bearer {}", self.node_secret))
+            .header("X-Quasar-Node", &self.node_name)
             .call()
             .map_err(|e| format!("GET jobs/pending: {e}"))?;
         let parsed: PendingResponse = resp
-            .into_json()
+            .body_mut()
+            .read_json()
             .map_err(|e| format!("decode jobs/pending: {e}"))?;
         Ok(parsed.runs)
     }
 
     fn post_report(&self, report: &JobReport) -> Result<(), String> {
         ureq::post(&format!("{}/v1/agent/jobs/report", self.http_base))
-            .timeout(HTTP_TIMEOUT)
-            .set("Authorization", &format!("Bearer {}", self.node_secret))
-            .set("X-Quasar-Node", &self.node_name)
+            .config()
+            .timeout_global(Some(HTTP_TIMEOUT))
+            .build()
+            .header("Authorization", &format!("Bearer {}", self.node_secret))
+            .header("X-Quasar-Node", &self.node_name)
             .send_json(report)
             .map_err(|e| format!("POST jobs/report: {e}"))?;
         Ok(())

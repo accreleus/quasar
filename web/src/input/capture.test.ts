@@ -101,6 +101,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // `restoreAllMocks` only restores `vi.spyOn` spies since vitest 3; clear call
+  // history too, or a plain `vi.fn()`'s counters survive into the next test.
+  vi.clearAllMocks();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   vi.useRealTimers();
@@ -1169,20 +1172,12 @@ describe("engage() without Pointer Lock — the send gate opens anyway", () => {
     // A tap: pointerdown(pointerType:"touch") then a synthesized mousedown. This
     // is also what a tap on the session-menu button produces, so forwarding it
     // would fire a shot into the game every time the user reached for the menu.
-    document.dispatchEvent(
-      Object.assign(new PointerEvent("pointerdown", { bubbles: true }), {
-        pointerType: "touch",
-      }),
-    );
+    document.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerType: "touch" }));
     video.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
     expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ t: "mb" }));
 
     // A trackpad/mouse click on the picture: forwarded.
-    document.dispatchEvent(
-      Object.assign(new PointerEvent("pointerdown", { bubbles: true }), {
-        pointerType: "mouse",
-      }),
-    );
+    document.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, pointerType: "mouse" }));
     video.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
     expect(send).toHaveBeenCalledWith({ t: "mb", button: MB_MAP[0], pressed: true });
 
