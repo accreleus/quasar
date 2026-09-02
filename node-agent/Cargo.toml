@@ -30,6 +30,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # >= 1.20 with the `v1_20` feature enabled below. The vendored runtime is pinned at
 # 1.28.4 (docs/third-party-pins.md) and CI runs against 1.24, so do NOT enable a
 # `v1_26`/`v1_28`/`v1_30` feature here — it would raise the floor above CI's gst.
+#
+# Cargo.lock PIN: `kstring` is held at 2.0.2. gstreamer 0.25 depends on it (^2.0) and
+# kstring 2.0.3+ raises its MSRV to rustc 1.96, above the toolchain the image lineage
+# pins (deploy/Dockerfile.vulkan `ARG RUST_VERSION=1.94.0`), so an unpinned resolve
+# builds fine on CI's `stable` and then fails the agent image build with
+# "rustc 1.94.0 is not supported by the following package: kstring@2.0.4".
+# Re-pin with `cargo update -p kstring --precise 2.0.2` after any lockfile churn,
+# or lift the pin once RUST_VERSION reaches 1.96.
 gstreamer = "0.25"
 gstreamer-webrtc = "0.25"
 gstreamer-sdp = "0.25"
