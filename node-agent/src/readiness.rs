@@ -313,7 +313,8 @@ fn check_xid_visibility(env: &ProbeEnv) -> ReadinessCheck {
         Ok(_) => pass(
             ID,
             format!(
-                "{} is readable — GPU Xid / amdgpu fault records are reported as                  `host.xid` / `host.gpu_fault` trace events",
+                "{} is readable — GPU Xid / amdgpu fault records are reported as \
+                 `host.xid` / `host.gpu_fault` trace events",
                 crate::gpu_kmsg::KMSG_PATH
             ),
         ),
@@ -321,11 +322,16 @@ fn check_xid_visibility(env: &ProbeEnv) -> ReadinessCheck {
             id: ID.to_string(),
             status: SKIP.to_string(),
             summary: format!(
-                "{} is not readable ({e}) — GPU faults will not appear in a session trace;                  an Xid can only be found by hand in the host's dmesg",
+                "{} is not readable ({e}) — GPU faults will not appear in a session trace; \
+                 an Xid can only be found by hand in the host's dmesg",
                 crate::gpu_kmsg::KMSG_PATH
             ),
             remediation: format!(
-                "Optional. To turn it on, give the node-agent service read access to the                  kernel ring buffer in deploy/docker-compose.yml: add `{}:{}:ro` under                  `devices:` and `SYS_ADMIN`-free `cap_add: [SYSLOG]`. Then restart the                  agent. Nothing else changes — the tailer is read-only, off the media                  path, and reports only NVRM Xid and amdgpu fault lines.",
+                "Optional. To turn it on, give the node-agent service read access to the \
+                 kernel ring buffer in deploy/docker-compose.yml: add `{}:{}:ro` under \
+                 `devices:` and `SYS_ADMIN`-free `cap_add: [SYSLOG]`. Then restart the \
+                 agent. Nothing else changes — the tailer is read-only, off the media \
+                 path, and reports only NVRM Xid and amdgpu fault lines.",
                 crate::gpu_kmsg::KMSG_PATH,
                 crate::gpu_kmsg::KMSG_PATH
             ),

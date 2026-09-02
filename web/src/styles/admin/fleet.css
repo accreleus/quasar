@@ -53,8 +53,21 @@
   margin-top: 2px;
 }
 
+/* `.qtable tbody td` is nowrap so a collapsed row stays on one line, and
+   primitives lifts that only for `.exp-in` content — but the readiness card is
+   a sibling of `.exp-in`, so every check summary inherited nowrap and ran off
+   the card's right edge (#82). `white-space` inherits, so the reset belongs on
+   the container: one declaration covers the card, and a descendant that wants
+   nowrap back still says so itself. */
 .hosts-page .exp-readiness {
   padding: 0 var(--s5) var(--s5) 44px;
+  white-space: normal;
+}
+
+/* A remediation command is one long token run (an nft rule, a firewall-cmd
+   rich rule) with no space to break at — wrapping alone would still overflow. */
+.hosts-page .exp-readiness code {
+  overflow-wrap: anywhere;
 }
 
 /* `.exp-in a` (primitives) colours drawer links accent — the three ghost
