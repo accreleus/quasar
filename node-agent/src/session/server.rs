@@ -416,7 +416,7 @@ where
                 match outbound {
                     Some(msg) => {
                         let json = msg.to_json().context("failed to serialize signaling message")?;
-                        ws_sink.send(Message::Text(json)).await
+                        ws_sink.send(Message::Text(json.into())).await
                             .map_err(|e| anyhow!("websocket send failed: {e}"))?;
                     }
                     None => break, // all senders dropped (pipeline torn down)

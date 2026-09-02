@@ -2617,7 +2617,7 @@ where
     S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
     let json = serde_json::to_string(msg)?;
-    sink.send(Message::Text(json)).await?;
+    sink.send(Message::Text(json.into())).await?;
     Ok(())
 }
 
@@ -2629,7 +2629,7 @@ where
         match stream.next().await {
             None => anyhow::bail!("WebSocket closed by server"),
             Some(Err(e)) => return Err(e.into()),
-            Some(Ok(Message::Text(t))) => return Ok(t),
+            Some(Ok(Message::Text(t))) => return Ok(t.to_string()),
             Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue, // handled by tungstenite
             Some(Ok(Message::Close(_))) => anyhow::bail!("WebSocket closed by server"),
             Some(Ok(other)) => {
