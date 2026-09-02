@@ -45,7 +45,7 @@ function renderPane(props: Partial<ComponentProps<typeof StatsPane>> = {}) {
   const { register, push } = makeRegister();
   const view = render(
     <AuthContext.Provider value={authValue}>
-      <StatsPane register={register} displayHzWarning={null} {...props} />
+      <StatsPane register={register} {...props} />
     </AuthContext.Provider>,
   );
   return { ...view, push };
@@ -153,14 +153,57 @@ describe("StatsPane simple view", () => {
     expect(screen.queryByText("msg/s")).toBeNull();
   });
 
+  // #85 — the pill needs BOTH a real refresh gap and frames actually dropping.
+  /** Push `n` windows, each reporting `dropped` frames, at a fixed display Hz. */
+  const pushWindows = (
+    push: (s: TelemetrySnapshot) => void,
+    n: number,
+    dropped: number,
+    displayRefreshHz: number,
+  ) => {
+    for (let i = 0; i < n; i++) {
+      act(() => push({ ...EMPTY_SNAPSHOT, displayRefreshHz, framesDropped: dropped }));
+    }
+  };
+
   it("flags a display that cannot present every streamed frame", () => {
-    renderPane({ displayHzWarning: { displayHz: 50, streamFps: 60 } });
-    expect(screen.getByText(/50 Hz display · frames dropped/)).toBeTruthy();
+    const { push } = renderPane({ tier: "1920×1080@60" });
+    pushWindows(push, 3, 4, 50);
+    expect(screen.getByText(/50 Hz display · can't show 60 fps/)).toBeTruthy();
   });
 
   it("shows no Hz flag when the display keeps up", () => {
-    renderPane();
-    expect(screen.queryByText(/frames dropped/)).toBeNull();
+    const { push } = renderPane({ tier: "1920×1080@60" });
+    pushWindows(push, 3, 4, 60);
+    expect(screen.queryByText(/Hz display/)).toBeNull();
+  });
+
+  // The operator's report: 2560×1440@120 on a fast display, 119 fps received,
+  // drops/freezes 0/0 — and a pill insisting frames were being dropped.
+  it("#85: does not flag a 120 fps stream while zero frames are dropping", () => {
+    const { push } = renderPane({ tier: "2560×1440@120" });
+    pushWindows(push, 5, 0, 61);
+    expect(screen.queryByText(/Hz display/)).toBeNull();
+  });
+
+  it("#85: does not flag on a single dropped window", () => {
+    const { push } = renderPane({ tier: "1920×1080@60" });
+    pushWindows(push, 1, 4, 50);
+    expect(screen.queryByText(/Hz display/)).toBeNull();
+  });
+
+  it("#85: a clean window resets the streak, so the flag clears", () => {
+    const { push } = renderPane({ tier: "1920×1080@60" });
+    pushWindows(push, 3, 4, 50);
+    expect(screen.getByText(/Hz display/)).toBeTruthy();
+    pushWindows(push, 1, 0, 50);
+    expect(screen.queryByText(/Hz display/)).toBeNull();
+  });
+
+  it("#85: tolerates the estimator's own rounding (119 measured on a 120 tier)", () => {
+    const { push } = renderPane({ tier: "2560×1440@120" });
+    pushWindows(push, 5, 4, 119);
+    expect(screen.queryByText(/Hz display/)).toBeNull();
   });
 });
 

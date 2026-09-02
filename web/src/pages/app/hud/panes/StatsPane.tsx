@@ -29,6 +29,7 @@ import {
   seriesInfo,
 } from "../../../../lib/metricsManifest";
 import { IconHzWarn } from "../icons";
+import { displayHzWarning, parseTierFps } from "../displayHzWarning";
 import type { TelemetryRegistrar } from "../HudBar";
 
 export interface StatsPaneProps {
@@ -39,8 +40,6 @@ export interface StatsPaneProps {
   resolvedCodec?: string;
   /** Without it the pane shows only client-side numbers (no server verdict). */
   sessionId?: string;
-  /** Set when the local display cannot present every streamed frame. */
-  displayHzWarning: { displayHz: number; streamFps: number } | null;
   /** ISO `session.started_at`. The v1 drawer header carried this timer and the
    *  v3 mock has no home for it, so it lands with the other session facts. */
   startedAt?: string | null;
@@ -198,6 +197,13 @@ export function StatsPane(props: StatsPaneProps) {
   // written in the same tick as the snapshot, so a card and its sparkline can
   // never disagree, and render never reads a mutable value.
   const buffer = useRef<Record<SeriesKey, number[]>>({ fps: [], lat: [], br: [], jit: [] });
+  // #85: consecutive telemetry windows reporting dropped frames. The ref
+  // accumulates and the state is what render reads — the same split `buffer` /
+  // `series` uses above, and for the same reason: both are written in the tick
+  // that delivers the snapshot, so the pill and the `drops / freezes` row it
+  // sits above can never describe different windows.
+  const droppedRun = useRef(0);
+  const [droppedWindows, setDroppedWindows] = useState(0);
   const [series, setSeries] = useState<Record<SeriesKey, readonly number[]>>(() => ({
     fps: [],
     lat: [],
@@ -224,6 +230,10 @@ export function StatsPane(props: StatsPaneProps) {
           br: [...buffer.current.br],
           jit: [...buffer.current.jit],
         });
+        // Reset on any clean window: the pill claims a standing display limit,
+        // and a limit that stops costing frames has stopped being one.
+        droppedRun.current = snap.framesDropped > 0 ? droppedRun.current + 1 : 0;
+        setDroppedWindows(droppedRun.current);
         setTelemetry(snap);
       }),
     [props.register],
@@ -274,6 +284,15 @@ export function StatsPane(props: StatsPaneProps) {
       ? "–"
       : `${(cadence.doubledFraction * 100).toFixed(0)}% doubled${cadence.inherentBeat ? " · inherent" : ""}`;
 
+  // Derived here rather than passed in: every input is telemetry this pane
+  // already subscribes to, and routing it through the page would put a 1 Hz
+  // value back on the parent's render path (#139/#78).
+  const hzWarning = displayHzWarning({
+    streamFps: parseTierFps(props.tier),
+    displayHz: telemetry.displayRefreshHz,
+    droppedWindows,
+  });
+
   const value = (k: SeriesKey): number | null => {
     const a = series[k];
     return a.length ? a[a.length - 1] : null;
@@ -284,13 +303,13 @@ export function StatsPane(props: StatsPaneProps) {
     <>
       <div className="pane-head">
         <h3>Performance stats</h3>
-        {props.displayHzWarning && (
+        {hzWarning && (
           <span
             className="hz-flag"
-            title={`This display runs at ${props.displayHzWarning.displayHz} Hz, below the stream's ${props.displayHzWarning.streamFps} fps. Some frames can't be presented. The stream itself is healthy.`}
+            title={`This display runs at ${hzWarning.displayHz} Hz, below the stream's ${hzWarning.streamFps} fps, and frames are being dropped at present time. The stream itself is healthy — see drops / freezes below.`}
           >
             <IconHzWarn />
-            {props.displayHzWarning.displayHz} Hz display · frames dropped
+            {hzWarning.displayHz} Hz display · can't show {hzWarning.streamFps} fps
           </span>
         )}
         <div className="segmented" role="tablist" aria-label="Detail level">
