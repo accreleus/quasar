@@ -11,7 +11,7 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 
 import { UserMenu, type UserMenuMode } from "./UserMenu";
@@ -164,7 +164,14 @@ describe("UserMenu items", () => {
     fireEvent.click(trigger());
     fireEvent.click(screen.getByRole("menuitem", { name: "Sign out" }));
     expect(logout).toHaveBeenCalledTimes(1);
-    expect(await screen.findByTestId("where")).toHaveTextContent("/login");
+    // Sign out navigates from a microtask — `Promise.resolve(logout()).finally(
+    // () => navigate("/login"))` — so the route element already exists, still
+    // reading "/app", the instant the click handler returns. `findByTestId`
+    // resolves on the element EXISTING, not on its content, so it hands back
+    // the pre-navigation span and the assertion races React's flush: it wins
+    // on an idle machine and loses under suite load. waitFor retries the
+    // assertion instead of the lookup, which is what this test actually means.
+    await waitFor(() => expect(screen.getByTestId("where")).toHaveTextContent("/login"));
   });
 });
 
