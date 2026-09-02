@@ -178,7 +178,15 @@ func (s *Service) Search(ctx context.Context, appID, query string) ([]Candidate,
 	if strings.TrimSpace(query) == "" {
 		query = app.Name
 	}
-	return provider.Search(ctx, query)
+	cands, err := provider.Search(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	// The picker renders these; the CSP (img-src 'self' data:) will never let
+	// a browser hotlink the provider's CDN, so the previews ship inlined
+	// (thumbs.go). Best-effort: a failed inline is a glyph, not an error.
+	inlineSearchThumbs(ctx, s.fetcher, cands)
+	return cands, nil
 }
 
 // Resolve is the automatic path: identify an app's art and cache the result.
