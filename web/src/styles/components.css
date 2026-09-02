@@ -87,7 +87,10 @@
   min-width: 0;
 }
 
-.readiness-check .host-setting-copy {
+/* Both layouts put this block in a grid item, whose default `min-width: auto`
+   floors the track at the content's min-content width — one unbreakable token
+   in a remediation then widens the track past the card and spills (#82). */
+.host-setting-copy {
   min-width: 0;
 }
 
@@ -100,6 +103,7 @@
   margin: var(--s2) 0;
   color: var(--text-2);
   font-size: var(--t-sm);
+  overflow-wrap: anywhere;
 }
 
 .host-setting-copy code {

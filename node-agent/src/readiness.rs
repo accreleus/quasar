@@ -313,7 +313,8 @@ fn check_xid_visibility(env: &ProbeEnv) -> ReadinessCheck {
         Ok(_) => pass(
             ID,
             format!(
-                "{} is readable — GPU Xid / amdgpu fault records are reported as                  `host.xid` / `host.gpu_fault` trace events",
+                "{} is readable — GPU Xid / amdgpu fault records are reported as \
+                 `host.xid` / `host.gpu_fault` trace events",
                 crate::gpu_kmsg::KMSG_PATH
             ),
         ),
@@ -321,11 +322,16 @@ fn check_xid_visibility(env: &ProbeEnv) -> ReadinessCheck {
             id: ID.to_string(),
             status: SKIP.to_string(),
             summary: format!(
-                "{} is not readable ({e}) — GPU faults will not appear in a session trace;                  an Xid can only be found by hand in the host's dmesg",
+                "{} is not readable ({e}) — GPU faults will not appear in a session trace; \
+                 an Xid can only be found by hand in the host's dmesg",
                 crate::gpu_kmsg::KMSG_PATH
             ),
             remediation: format!(
-                "Optional. To turn it on, give the node-agent service read access to the                  kernel ring buffer in deploy/docker-compose.yml: add `{}:{}:ro` under                  `devices:` and `SYS_ADMIN`-free `cap_add: [SYSLOG]`. Then restart the                  agent. Nothing else changes — the tailer is read-only, off the media                  path, and reports only NVRM Xid and amdgpu fault lines.",
+                "Optional. To turn it on, give the node-agent service read access to the \
+                 kernel ring buffer in deploy/docker-compose.yml: add `{}:{}:ro` under \
+                 `devices:` and `SYS_ADMIN`-free `cap_add: [SYSLOG]`. Then restart the \
+                 agent. Nothing else changes — the tailer is read-only, off the media \
+                 path, and reports only NVRM Xid and amdgpu fault lines.",
                 crate::gpu_kmsg::KMSG_PATH,
                 crate::gpu_kmsg::KMSG_PATH
             ),
@@ -2846,5 +2852,50 @@ mod tests {
             0,
             "a WARN-only host must not be reported as having FAILED checks: {checks:?}"
         );
+    }
+
+    /// Every operator-facing string is one normalised paragraph. A `format!` literal that lost
+    /// its `\` line continuations carries the source's own indentation into the summary the
+    /// agent reports (#82) — HTML collapses the run so the admin UI looks fine, while the JSON,
+    /// the log line and the copy-to-clipboard text all keep the gap.
+    #[test]
+    fn no_check_text_carries_a_run_of_spaces() {
+        let visible = FakeRoot::new("text-visible");
+        visible
+            .file("usr/share/glvnd/egl_vendor.d/10_nvidia.json", "{}")
+            .file("usr/lib64/libnvidia-eglcore.so.570.86", "")
+            .file("dev/dri/renderD128", "")
+            .file("dev/uinput", "")
+            // Present: the `pass` arm of xid_visibility.
+            .file("dev/kmsg", "")
+            .file("proc/sys/user/max_user_namespaces", "15000\n")
+            .file("sys/class/drm/renderD128", "")
+            .file("etc/os-release", "ID=fedora\n");
+        // Absent `dev/kmsg`: the `skip` arm, which is the one that carries a remediation.
+        let hidden = FakeRoot::new("text-hidden");
+        hidden
+            .file("dev/dri/renderD128", "")
+            .file("dev/uinput", "")
+            .file("proc/sys/user/max_user_namespaces", "15000\n")
+            .file("etc/os-release", "ID=fedora\n");
+
+        let mut checks = probe(&visible.env(true, "/usr/lib"));
+        checks.extend(probe(&ProbeEnv {
+            firewall: FirewallPosture::Filtering {
+                tool: FirewallTool::Nftables,
+                detail: "nftables input policy=drop".to_string(),
+            },
+            ..hidden.env(true, "")
+        }));
+
+        for c in &checks {
+            for (field, text) in [("summary", &c.summary), ("remediation", &c.remediation)] {
+                assert!(
+                    !text.contains("  "),
+                    "{} {field} carries a run of spaces (a missing `\\` line continuation): {text:?}",
+                    c.id
+                );
+            }
+        }
     }
 }
