@@ -628,7 +628,8 @@ mod tests {
     fn a_held_lock_is_counted_in_flight_and_blocks_a_restart_barrier() {
         // #66: the restart path must see the driver-volume provision that the cudart
         // thread's `exit(0)` would otherwise kill mid-extraction.
-        let dir = std::env::temp_dir().join(format!("quasar-artifact-barrier-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("quasar-artifact-barrier-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join(".provision.lock");
         let _ = std::fs::remove_file(&p);
@@ -652,14 +653,22 @@ mod tests {
     #[test]
     fn a_heartbeating_lock_is_reclaimed_far_sooner_than_a_legacy_one() {
         // A holder that advertises a heartbeat is reclaimed at five missed beats...
-        let heartbeat = format!("pid=7 agent=0.1.0 heartbeat={}\n", HEARTBEAT_INTERVAL.as_secs());
+        let heartbeat = format!(
+            "pid=7 agent=0.1.0 heartbeat={}\n",
+            HEARTBEAT_INTERVAL.as_secs()
+        );
         assert_eq!(stale_after_for(&heartbeat), MIN_HEARTBEAT_STALE);
         let slow = "pid=7 agent=0.1.0 heartbeat=120\n";
         assert_eq!(stale_after_for(slow), Duration::from_secs(600));
 
         // ...while a lockfile written by an agent predating #66 keeps the long window, so
         // a rolling upgrade cannot evict an old agent that is merely slow.
-        for legacy in ["pid=7 agent=0.1.0\n", "", "pid=7 heartbeat=notanumber\n", "heartbeat=0\n"] {
+        for legacy in [
+            "pid=7 agent=0.1.0\n",
+            "",
+            "pid=7 heartbeat=notanumber\n",
+            "heartbeat=0\n",
+        ] {
             assert_eq!(
                 stale_after_for(legacy),
                 LOCK_STALE_AFTER,
@@ -677,8 +686,14 @@ mod tests {
 
         let l = Lock::acquire(&p, "test").unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
-        assert!(body.contains(&format!("heartbeat={}", HEARTBEAT_INTERVAL.as_secs())), "body was {body:?}");
-        assert!(body.contains("pid="), "the operator-facing pid must survive: {body:?}");
+        assert!(
+            body.contains(&format!("heartbeat={}", HEARTBEAT_INTERVAL.as_secs())),
+            "body was {body:?}"
+        );
+        assert!(
+            body.contains("pid="),
+            "the operator-facing pid must survive: {body:?}"
+        );
         assert_eq!(stale_after_for(&body), MIN_HEARTBEAT_STALE);
         drop(l);
         let _ = std::fs::remove_dir_all(&dir);
