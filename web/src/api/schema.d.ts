@@ -4183,6 +4183,7 @@ export interface paths {
                         };
                     };
                 };
+                400: components["responses"]["ValidationFailed"];
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
             };
@@ -4199,13 +4200,13 @@ export interface paths {
             requestBody?: {
                 content: {
                     "application/json": {
-                        /** @description Bind the token to exactly this node_name. Absent = any node_name. */
+                        /** @description Bind the token to exactly this node_name. Absent = any node_name; empty string is 400 (it would silently mint an any-node token). */
                         node_name?: string;
                         /** @default 1 */
                         max_uses?: number;
                         /**
                          * Format: date-time
-                         * @description Absent = one hour from mint.
+                         * @description Absent = one hour from mint. Must be in the future and at most 30 days out.
                          */
                         expires_at?: string;
                         note?: string;
@@ -4224,6 +4225,7 @@ export interface paths {
                         };
                     };
                 };
+                400: components["responses"]["ValidationFailed"];
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
             };
@@ -4265,6 +4267,7 @@ export interface paths {
                     };
                     content?: never;
                 };
+                400: components["responses"]["ValidationFailed"];
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
             };
@@ -7338,10 +7341,15 @@ export interface components {
             revoked_at: string | null;
             /** Format: date-time */
             last_used_at: string | null;
+            /** @description node_name presented at the most recent redemption; null until first redeemed. */
+            used_by_node_name: string | null;
             note: string | null;
             /** Format: date-time */
             created_at: string;
-            /** Format: uuid */
+            /**
+             * Format: uuid
+             * @description Null once the minting admin has been deleted — the token outlives its minter.
+             */
             created_by_user_id: string | null;
             created_by_username: string | null;
         };
