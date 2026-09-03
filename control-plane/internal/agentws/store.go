@@ -13,16 +13,30 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/accreleus/quasar/control-plane/internal/hostenroll"
 )
 
 var (
 	ErrInvalidEnrollmentToken = errors.New("invalid enrollment token")
+	// ErrHostAgentConnected refuses re-enrollment onto a host whose agent is live (#96).
+	// Enrollment rotates node_secret, so allowing it against a connected host is identity
+	// takeover: the incumbent's next reconnect fails and the scheduler keeps placing work
+	// on the row the caller now authenticates as. A genuinely dead host is unaffected.
+	ErrHostAgentConnected = errors.New("a live agent is already registered under this node name")
 	ErrHostNotFound           = errors.New("host not found")
 	ErrInvalidNodeSecret      = errors.New("invalid node secret")
 )
 
 type agentStore struct {
 	pool *pgxpool.Pool
+	// isAgentConnected reports whether a host id currently holds a live agent websocket.
+	// A func rather than the Registry itself: the store must stay testable without one,
+	// and the authoritative answer is in-memory, not in the database.
+	isAgentConnected func(hostID string) bool
+	// redeemEnrollment consumes a minted token inside the caller's transaction. Injected
+	// so agentws does not import hostenroll (and so tests can supply a stub).
+	redeemEnrollment func(ctx context.Context, db hostenroll.DBTX, plaintext, nodeName string) error
 }
 
 // Takes a host's GPU inventory out of scheduling before a capacity report
@@ -73,11 +87,19 @@ var agentRestartMinGap = 15 * time.Second
 // enrollHost creates or re-enrolls a host using the enrollment token.
 // If the host row already exists, the node_secret is rotated (idempotent re-enrollment).
 func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, token, configToken string) (registerResult, error) {
-	// Constant-time: the enrollment token gates rogue-node enrollment, and
-	// /agent/ws is reachable pre-auth — don't leak a byte-by-byte timing oracle.
-	if subtle.ConstantTimeCompare([]byte(token), []byte(configToken)) != 1 {
-		return registerResult{}, ErrInvalidEnrollmentToken
-	}
+	// Two credentials are accepted, minted first (#12/#96).
+	//
+	// A minted token is per-host, hashed, single-use and expiring; the static configToken
+	// is the fleet-wide value every deployment has today and must keep working across the
+	// upgrade. Redemption is deferred into the transaction below so that consuming a
+	// single-use token is atomic with the host row it creates: if the upsert fails, the
+	// use is given back with the rollback.
+	//
+	// Constant-time on the static compare: the enrollment token gates rogue-node
+	// enrollment, and /agent/ws is reachable pre-auth — don't leak a byte-by-byte timing
+	// oracle. A minted token needs no such care: it is looked up by hash, not compared.
+	staticOK := configToken != "" &&
+		subtle.ConstantTimeCompare([]byte(token), []byte(configToken)) == 1
 
 	secret := make([]byte, 32)
 	if _, err := rand.Read(secret); err != nil {
@@ -92,6 +114,32 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 		return registerResult{}, fmt.Errorf("begin enrollment: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// #96: enrollment onto an EXISTING node_name replaces its node_secret. That is correct
+	// for re-enrolling a host you own and it is identity takeover for one you do not, so
+	// refuse it while that host's agent is connected. Row-locked, so the check cannot race
+	// a concurrent enrollment of the same name.
+	var existingID string
+	err = tx.QueryRow(ctx, `SELECT id::text FROM hosts WHERE node_name = $1 FOR UPDATE`, nodeName).
+		Scan(&existingID)
+	switch {
+	case err == nil:
+		if s.isAgentConnected != nil && s.isAgentConnected(existingID) {
+			return registerResult{}, ErrHostAgentConnected
+		}
+	case errors.Is(err, pgx.ErrNoRows):
+		// New host; nothing to take over.
+	default:
+		return registerResult{}, fmt.Errorf("look up host for enrollment: %w", err)
+	}
+
+	// Consume the credential inside the transaction (see the note in the caller above).
+	if !staticOK {
+		if err := s.redeemEnrollment(ctx, tx, token, nodeName); err != nil {
+			return registerResult{}, ErrInvalidEnrollmentToken
+		}
+	}
+
 	// Enrollment is an identity event: the restart tally resets, and
 	// agent_disconnected_at is cleared so a re-enrolling node never carries a
 	// stale pending disconnect into its first reconnect.
