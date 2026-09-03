@@ -4,6 +4,24 @@ Issues and specs for this repo live as GitHub issues on **`accreleus/quasar`**. 
 
 Referenced from `CLAUDE.md` → "Agent skills". This file is the durable answer to "where do issues live and how do I touch them", so a session never has to infer it from `gh label list`.
 
+## `accreleus/quasar` is public — never name a real host
+
+This repo is public. `CLAUDE.md`'s "Dev environments — addressed by ROLE, never by
+hostname" rule applies to issue bodies and comments exactly as it applies to skill
+prose: an issue must speak in the role vocabulary (`gpu-test` / `aux-infra` /
+`deploy-only`, `_shared/hosts.example.json`), never a real ssh alias, IP, hostname,
+or host filesystem path (including a reporter's own `$HOME`). This is not
+hypothetical — issues #66, #67, #76, #78, #80, #83, #87, #92 and #93 all leaked one
+or more of a real hostname, a real LAN IP, or an absolute path containing the
+operator's username before being redacted (2026-09-03); #92/#93 came from the
+photon-side triage agent, which had no equivalent guard. Before filing or
+commenting, re-read anything pulled from local logs, `hosts.json`-adjacent tooling
+output, or another (even private) repo's issue for exactly this pattern, and
+substitute the role name or a placeholder (`/path/to/quasar`, a documentation-range
+IP like `192.0.2.5`) before it goes out. This applies whether the issue is filed by
+an agent working in this repo or by an agent in another repo (e.g. photon) that
+happens to write to this tracker.
+
 ## Conventions
 
 - **Create an issue**: `gh issue create --title "..." --body-file <file>`. Prefer `--body-file` with a heredoc over `--body` for anything multi-line — the bodies here carry fenced code, tables and backticks, and shell quoting mangles them.
