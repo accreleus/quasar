@@ -42,9 +42,13 @@ impl Fingerprint {
             .unwrap_or(s);
         let hex: String = s.chars().filter(|c| *c != ':').collect();
         if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            // Never the whole input: operators paste a full enrollment string into
+            // CONTROL_PLANE_FINGERPRINT often enough that echoing it would put the
+            // token on stderr and from there into the container log.
             return Err(format!(
                 "fingerprint must be a SHA-256 as 32 colon-separated hex pairs (as the control \
-                 plane logs it), got {raw:?}"
+                 plane logs it), got {}",
+                elide(raw)
             ));
         }
         let mut out = [0u8; 32];
@@ -83,8 +87,16 @@ impl fmt::Debug for Fingerprint {
     }
 }
 
+/// The leading few characters of an operator-supplied value, quoted. Any error that wants
+/// to say "you pasted the wrong thing here" uses this: the wrong thing is frequently a
+/// credential.
+fn elide(raw: &str) -> String {
+    let head: String = raw.trim().chars().take(8).collect();
+    format!("{head:?}…")
+}
+
 /// The decoded blob.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Blob {
     pub url: String,
     /// `None` = the fingerprint segment was empty: the control plane serves a certificate
@@ -95,6 +107,28 @@ pub struct Blob {
     pub token: String,
 }
 
+/// Hand-written so no `{:?}` anywhere — a panic message, a `dbg!`, a future log line —
+/// can print the enrollment token.
+impl fmt::Debug for Blob {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Blob")
+            .field("url", &self.url)
+            .field("fingerprint", &self.fingerprint)
+            .field("token", &Redacted(&self.token))
+            .finish()
+    }
+}
+
+/// Prints `<redacted, N chars>`: the length is diagnostic (a truncated paste), the value
+/// is not printable.
+struct Redacted<'a>(&'a str);
+
+impl fmt::Debug for Redacted<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<redacted, {} chars>", self.0.chars().count())
+    }
+}
+
 /// Strict: unknown version, a non-`wss://` URL, a malformed fingerprint or an empty token
 /// are each a distinct error. A token containing `.` survives (max-3 split).
 pub fn parse_blob(raw: &str) -> Result<Blob, String> {
@@ -103,9 +137,9 @@ pub fn parse_blob(raw: &str) -> Result<Blob, String> {
     let prefix = parts.next().unwrap_or("");
     if prefix != BLOB_PREFIX {
         return Err(format!(
-            "enrollment string must start with `{BLOB_PREFIX}.` (got {:?}); if the control \
+            "enrollment string must start with `{BLOB_PREFIX}.` (got {}); if the control \
              plane is newer than this agent, update the agent",
-            prefix.chars().take(16).collect::<String>()
+            elide(prefix)
         ));
     }
     let fp = parts
@@ -185,13 +219,46 @@ pub struct Inputs<'a> {
     pub allow_plaintext: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+/// Which input named the pin in force. `agent.rs` refreshes the persisted pin file only
+/// for [`PinSource::Env`] — the operator-driven rotation — and never for the others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinSource {
+    /// `CONTROL_PLANE_FINGERPRINT`.
+    Env,
+    /// The fingerprint segment of `QUASAR_ENROLLMENT`.
+    Blob,
+    /// `<NODE_SECRET_PATH>.tls`, written at a previous verified connect.
+    Persisted,
+}
+
+#[derive(PartialEq, Eq)]
 pub struct Resolved {
     pub url: String,
     pub token: Option<String>,
     pub policy: TransportPolicy,
+    /// `None` when the policy carries no pin.
+    pub pin_source: Option<PinSource>,
+    /// The blob's fingerprint segment was empty, so this host verifies against the
+    /// WebPKI roots rather than a pin. Worth an INFO at connect: `qenr1..` (a mispasted
+    /// `qenr1.AB:…`) and a genuine CA deployment are indistinguishable from the policy
+    /// alone.
+    pub webpki_from_blob: bool,
     /// Precedence decisions worth a WARN line — logged by the caller once tracing is up.
     pub warnings: Vec<String>,
+}
+
+/// Hand-written for the same reason as [`Blob`]'s: the token must not reach a log.
+impl fmt::Debug for Resolved {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Resolved")
+            .field("url", &self.url)
+            .field("token", &self.token.as_deref().map(Redacted))
+            .field("policy", &self.policy)
+            .field("pin_source", &self.pin_source)
+            .field("webpki_from_blob", &self.webpki_from_blob)
+            .field("warnings", &self.warnings)
+            .finish()
+    }
 }
 
 /// Precedence, stated once:
@@ -203,6 +270,8 @@ pub struct Resolved {
 ///   is never resolved silently.
 /// - A persisted pin is used when nothing in the environment names one.
 /// - `ws://` to a non-loopback host is fatal without `QUASAR_ALLOW_PLAINTEXT_AGENT=1`.
+/// - Downgrading a blob to `ws://` is fatal, opt-in or not: the blob's own token would be
+///   the first thing to cross that link.
 pub fn resolve(inputs: Inputs<'_>) -> Result<Resolved, String> {
     let mut warnings = Vec::new();
     let blob = match inputs.blob.map(str::trim).filter(|s| !s.is_empty()) {
@@ -248,6 +317,20 @@ pub fn resolve(inputs: Inputs<'_>) -> Result<Resolved, String> {
         (None, None) => None,
     };
 
+    // A blob is only ever minted over https and always carries a wss:// URL (parse_blob
+    // enforces it), so any cleartext resolution here is a downgrade — and the token above
+    // is exactly what would cross it. QUASAR_ALLOW_PLAINTEXT_AGENT does NOT cover this:
+    // the opt-in says "I accept cleartext", not "discard the credential protection I just
+    // configured". Fatal before the policy is even computed.
+    if blob.is_some() && !url.starts_with("wss://") {
+        return Err(format!(
+            "CONTROL_PLANE_URL ({url}) is cleartext but QUASAR_ENROLLMENT carries a wss:// \
+             control plane: the enrollment token would cross the network as plain JSON. \
+             QUASAR_ALLOW_PLAINTEXT_AGENT does not apply here — unset QUASAR_ENROLLMENT if \
+             cleartext is really what you want, and set ENROLLMENT_TOKEN separately"
+        ));
+    }
+
     let env_pin = match inputs.fingerprint.map(str::trim).filter(|s| !s.is_empty()) {
         Some(raw) => Some(Fingerprint::parse(raw)?),
         None => None,
@@ -260,24 +343,19 @@ pub fn resolve(inputs: Inputs<'_>) -> Result<Resolved, String> {
         Some(raw) => Some(Fingerprint::parse(raw).map_err(|e| format!("persisted pin file: {e}"))?),
         None => None,
     };
-    let pin = match (
-        env_pin,
-        blob.as_ref().and_then(|b| b.fingerprint),
-        persisted_pin,
-    ) {
-        (Some(env), Some(inner), _) => {
+    let (pin, pin_source) = match (env_pin, blob.as_ref().and_then(|b| b.fingerprint)) {
+        (Some(env), Some(inner)) => {
             if env != inner {
                 warnings.push(format!(
                     "CONTROL_PLANE_FINGERPRINT ({env}) overrides the fingerprint inside \
                      QUASAR_ENROLLMENT ({inner}) — expected only during a certificate rotation"
                 ));
             }
-            Some(env)
+            (Some(env), Some(PinSource::Env))
         }
-        (Some(env), None, _) => Some(env),
-        (None, Some(inner), _) => Some(inner),
-        (None, None, Some(persisted)) => Some(persisted),
-        (None, None, None) => None,
+        (Some(env), None) => (Some(env), Some(PinSource::Env)),
+        (None, Some(inner)) => (Some(inner), Some(PinSource::Blob)),
+        (None, None) => (persisted_pin, persisted_pin.map(|_| PinSource::Persisted)),
     };
 
     let policy = if url.starts_with("wss://") {
@@ -308,10 +386,29 @@ pub fn resolve(inputs: Inputs<'_>) -> Result<Resolved, String> {
         ));
     };
 
+    let webpki_from_blob =
+        policy == TransportPolicy::WebPki && blob.as_ref().is_some_and(|b| b.fingerprint.is_none());
+    // A pin on a cleartext link was warned about above and does not reach the policy, so
+    // it has no source either — nothing downstream may act on it.
+    let pin_source = pin_source.filter(|_| matches!(policy, TransportPolicy::Pinned(_)));
+    // The saved pin is the one that verified the last connection, so a pin configured
+    // elsewhere that disagrees is either a rotation in progress or the wrong host's blob.
+    // Say which one wins; `agent.rs` decides whether the file is then refreshed.
+    if let (TransportPolicy::Pinned(configured), Some(saved)) = (&policy, persisted_pin) {
+        if pin_source != Some(PinSource::Persisted) && *configured != saved {
+            warnings.push(format!(
+                "the pin saved at <NODE_SECRET_PATH>.tls ({saved}) differs from the configured \
+                 one ({configured}) and will be superseded"
+            ));
+        }
+    }
+
     Ok(Resolved {
         url,
         token,
         policy,
+        pin_source,
+        webpki_from_blob,
         warnings,
     })
 }
@@ -405,6 +502,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(r.policy, TransportPolicy::WebPki);
+        assert!(r.webpki_from_blob, "a mispasted `qenr1..` must be visible");
+        assert_eq!(r.pin_source, None);
         // A pin from anywhere else still wins over the blob's "none".
         let r = resolve(Inputs {
             blob: Some(&s),
@@ -413,6 +512,19 @@ mod tests {
         })
         .unwrap();
         assert_eq!(r.policy, TransportPolicy::Pinned(fp()));
+        assert!(!r.webpki_from_blob);
+    }
+
+    /// The flag is about the blob's empty segment specifically, not about WebPKI.
+    #[test]
+    fn webpki_without_a_blob_is_not_flagged_as_an_empty_blob_segment() {
+        let r = resolve(Inputs {
+            url: Some("wss://play.example.com"),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(r.policy, TransportPolicy::WebPki);
+        assert!(!r.webpki_from_blob);
     }
 
     #[test]
@@ -445,7 +557,118 @@ mod tests {
         assert_eq!(r.url, "wss://cp.example:8443");
         assert_eq!(r.token.as_deref(), Some("tok"));
         assert_eq!(r.policy, TransportPolicy::Pinned(fp()));
+        assert_eq!(r.pin_source, Some(PinSource::Blob));
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    /// The blob's token is the first thing a downgraded link would carry, so the
+    /// cleartext opt-in must not reach this combination.
+    #[test]
+    fn a_blob_can_never_be_downgraded_to_cleartext_even_with_the_opt_in() {
+        let s = compose_blob("wss://cp.example:8443", Some(&fp()), "tok");
+        for allow_plaintext in [false, true] {
+            let err = resolve(Inputs {
+                blob: Some(&s),
+                url: Some("ws://cp.lan:8080"),
+                allow_plaintext,
+                ..Default::default()
+            })
+            .unwrap_err();
+            assert!(err.contains("QUASAR_ENROLLMENT"), "{err}");
+            assert!(err.contains("QUASAR_ALLOW_PLAINTEXT_AGENT"), "{err}");
+            // Loopback is no exception: the operator still configured a pinned peer.
+            assert!(resolve(Inputs {
+                blob: Some(&s),
+                url: Some("ws://localhost:8080"),
+                allow_plaintext,
+                ..Default::default()
+            })
+            .is_err());
+        }
+        // Without a blob the opt-in still works — this closes one combination, not the
+        // cleartext path.
+        assert!(resolve(Inputs {
+            url: Some("ws://cp.lan:8080"),
+            allow_plaintext: true,
+            ..Default::default()
+        })
+        .is_ok());
+    }
+
+    /// A saved pin that disagrees with the configured one is either a rotation or the
+    /// wrong host's blob; either way the operator gets told which one won.
+    #[test]
+    fn a_persisted_pin_that_differs_from_the_configured_one_warns() {
+        let other = "11:".repeat(31) + "11";
+        let r = resolve(Inputs {
+            url: Some("wss://cp.lan:8443"),
+            fingerprint: Some(FP),
+            persisted_pin: Some(&other),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(r.policy, TransportPolicy::Pinned(fp()));
+        assert_eq!(r.pin_source, Some(PinSource::Env));
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("<NODE_SECRET_PATH>.tls") && w.contains("superseded")),
+            "{:?}",
+            r.warnings
+        );
+        // Agreeing is the normal reconnect and says nothing.
+        let r = resolve(Inputs {
+            url: Some("wss://cp.lan:8443"),
+            fingerprint: Some(FP),
+            persisted_pin: Some(FP),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        // And a persisted pin used on its own is not "superseded" by itself.
+        let r = resolve(Inputs {
+            url: Some("wss://cp.lan:8443"),
+            persisted_pin: Some(&other),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(r.pin_source, Some(PinSource::Persisted));
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    /// `{:?}` on either carrier must be safe to hand to `tracing`.
+    #[test]
+    fn debug_output_never_carries_the_token() {
+        let secret = "tok-ThisIsTheSecretCredential";
+        let s = compose_blob("wss://cp.example:8443", Some(&fp()), secret);
+        let b = parse_blob(&s).unwrap();
+        let dbg = format!("{b:?}");
+        assert!(!dbg.contains(secret), "{dbg}");
+        assert!(dbg.contains("<redacted, 29 chars>"), "{dbg}");
+
+        let r = resolve(Inputs {
+            blob: Some(&s),
+            ..Default::default()
+        })
+        .unwrap();
+        let dbg = format!("{r:?}");
+        assert!(!dbg.contains(secret), "{dbg}");
+        assert!(dbg.contains("<redacted"), "{dbg}");
+    }
+
+    /// A pasted enrollment string in `CONTROL_PLANE_FINGERPRINT` is the realistic
+    /// mistake, and the error goes to stderr → docker logs.
+    #[test]
+    fn a_parse_error_does_not_echo_the_whole_input() {
+        let secret = "tok-ThisIsTheSecretCredential";
+        let pasted = compose_blob("wss://cp.example:8443", Some(&fp()), secret);
+        let err = Fingerprint::parse(&pasted).unwrap_err();
+        assert!(!err.contains(secret), "{err}");
+        assert!(!err.contains(&pasted), "{err}");
+        assert!(err.contains("qenr1.0A"), "{err}");
+
+        let err = parse_blob(&pasted.replacen("qenr1", "qenr9", 1)).unwrap_err();
+        assert!(!err.contains(secret), "{err}");
     }
 
     #[test]

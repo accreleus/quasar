@@ -20,6 +20,14 @@ pub struct Config {
     /// `QUASAR_ENROLLMENT` / `CONTROL_PLANE_FINGERPRINT` / the persisted pin / the URL scheme.
     pub transport: TransportPolicy,
 
+    /// Which input named the pin in `transport` (#12). Only `PinSource::Env` may refresh
+    /// the persisted pin file — see `agent::persist_pin_if_new`.
+    pub pin_source: Option<enrollment::PinSource>,
+
+    /// The enrollment string's fingerprint segment was empty, so this host verifies
+    /// against the WebPKI roots. Logged at connect so a mispasted `qenr1..` is visible.
+    pub webpki_from_blob: bool,
+
     /// Precedence decisions made while resolving the transport, to be logged at WARN once
     /// tracing is up (config is read before the subscriber exists).
     pub startup_warnings: Vec<String>,
@@ -57,6 +65,8 @@ impl Config {
             enrollment_token: resolved.token,
             node_secret_path,
             transport: resolved.policy,
+            pin_source: resolved.pin_source,
+            webpki_from_blob: resolved.webpki_from_blob,
             startup_warnings: resolved.warnings,
         })
     }

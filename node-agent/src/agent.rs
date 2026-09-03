@@ -627,6 +627,15 @@ async fn connect_and_run(
 ) -> anyhow::Result<()> {
     let url = cfg.ws_url();
     info!(policy = ?cfg.transport, "connecting to {url}");
+    if cfg.webpki_from_blob {
+        // `qenr1..` (a mispaste that dropped the fingerprint) and a real CA deployment
+        // produce the same policy; only this line tells them apart in a log.
+        info!(
+            token = "cp-tls-webpki-from-blob",
+            "the enrollment string carried an empty fingerprint segment: verifying the control \
+             plane against the WebPKI roots, not a pin"
+        );
+    }
 
     // #12: the connector is chosen by policy, never by tokio-tungstenite's default — a
     // wss:// URL must not silently validate against the OS/bundled roots when a pin was
@@ -880,8 +889,15 @@ async fn connect_and_run(
     // (aborted by `_library_scan_guard`'s Drop), node_secret auth, never fatal to the
     // agent. The agent never learns a user — it walks a path the control plane gives
     // it and reports the manifests it finds.
-    let _library_scan_guard = match current_node_secret(cfg) {
-        Some(secret) => Some(spawn_library_scanner(cp_client(cfg, secret))),
+    let _library_scan_guard = match current_node_secret(cfg).map(|s| cp_client(cfg, s)) {
+        Some(Ok(cp)) => Some(spawn_library_scanner(cp)),
+        Some(Err(e)) => {
+            warn!(
+                token = "library-scan-client-unavailable",
+                "library-scan: {e} — skipping library scanner this connection"
+            );
+            None
+        }
         None => {
             warn!(
                 token = "library-scan-no-secret",
@@ -897,9 +913,15 @@ async fn connect_and_run(
     // their schedules in the control plane's `jobs` table; adding a third is a
     // `register` here plus a `Definition` there. Runners are built before the poller
     // because an empty registry spawns no task at all.
-    let _job_poller_guard = match current_node_secret(cfg) {
-        Some(secret) => {
-            let cp = cp_client(cfg, secret);
+    let _job_poller_guard = match current_node_secret(cfg).map(|s| cp_client(cfg, s)) {
+        Some(Err(e)) => {
+            warn!(
+                token = "job-poller-client-unavailable",
+                "job: {e} — skipping the job poller this connection"
+            );
+            None
+        }
+        Some(Ok(cp)) => {
             let mut registry = crate::jobs::JobRegistry::new();
             registry.register(warmup_runner);
             registry.register(std::sync::Arc::new(
@@ -2516,7 +2538,7 @@ impl Drop for LibraryScanGuard {
 /// The node-secret HTTP client for this connection's pull channels: same transport policy
 /// as the websocket (#12), so a pinned host never has one client accept the control plane
 /// while the other refuses it.
-fn cp_client(cfg: &Config, node_secret: String) -> crate::cp_http::CpClient {
+fn cp_client(cfg: &Config, node_secret: String) -> Result<crate::cp_http::CpClient, String> {
     crate::cp_http::CpClient::new(
         &cfg.transport,
         cfg.http_base_url(),
@@ -2598,22 +2620,81 @@ fn choose_auth(cfg: &Config) -> anyhow::Result<Auth> {
 }
 
 /// Write the verified pin beside the node secret the first time a pinned connection
-/// registers. Never overwrites: a changed pin is a rotation the operator performs
-/// explicitly through CONTROL_PLANE_FINGERPRINT, not something a reconnect learns.
+/// registers. Never overwrites what a reconnect merely re-learned — the single exception
+/// is a rotation the operator drove through CONTROL_PLANE_FINGERPRINT, which is the one
+/// pin that both differs from the file and has just verified a real handshake.
 fn persist_pin_if_new(cfg: &Config) {
     let crate::enrollment::TransportPolicy::Pinned(fp) = &cfg.transport else {
         return;
     };
     let path = cfg.pin_path();
-    if std::path::Path::new(&path).exists() {
+    // Compared as fingerprints, not as bytes: the file may have been hand-written
+    // lowercase or with a `sha256:` prefix.
+    let saved = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| crate::enrollment::Fingerprint::parse(&s).ok());
+    if saved.as_ref() == Some(fp) {
         return;
     }
-    match std::fs::write(&path, format!("{fp}\n")) {
-        Ok(()) => {
-            info!(token = "cp-tls-pin-persisted", path = %path, "control-plane certificate pin saved")
+    let occupied = std::fs::symlink_metadata(&path).is_ok();
+    let rotating = occupied && cfg.pin_source == Some(crate::enrollment::PinSource::Env);
+    if occupied && !rotating {
+        return;
+    }
+    let written = if rotating {
+        replace_pin_file(&path, fp)
+    } else {
+        create_pin_file(&path, fp)
+    };
+    match written {
+        // `Ok(false)` = the path was taken between the check and the create. Another
+        // agent (or an attacker's symlink) owns it; leaving it alone is the safe answer.
+        Ok(false) => {}
+        Ok(true) => {
+            info!(token = "cp-tls-pin-persisted", path = %path, rotated = rotating, "control-plane certificate pin saved")
         }
         Err(e) => {
             warn!(token = "cp-tls-pin-persist-failed", path = %path, "could not save the certificate pin: {e}")
+        }
+    }
+}
+
+/// `O_CREAT|O_EXCL` at 0600: no symlink is followed (EEXIST even for a dangling one), no
+/// TOCTOU window behind the occupancy check above, and no umask widening. `Ok(false)`
+/// means the path was already taken.
+fn create_pin_file(path: &str, fp: &crate::enrollment::Fingerprint) -> std::io::Result<bool> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    f.write_all(format!("{fp}\n").as_bytes())?;
+    Ok(true)
+}
+
+/// The rotation path, the only one allowed to overwrite. Writes a pid-scoped temp with the
+/// same `create_new` + 0600 rules and renames over the target: `rename(2)` replaces the
+/// symlink itself rather than writing through it, and a reader never sees a half-file.
+fn replace_pin_file(path: &str, fp: &crate::enrollment::Fingerprint) -> std::io::Result<bool> {
+    let tmp = format!("{path}.{}.tmp", std::process::id());
+    if !create_pin_file(&tmp, fp)? {
+        return Ok(false);
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(true),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
         }
     }
 }
@@ -2711,7 +2792,139 @@ mod tests {
             enrollment_token: enrollment_token.map(str::to_string),
             node_secret_path: node_secret_path.to_string(),
             transport: crate::enrollment::TransportPolicy::Plaintext,
+            pin_source: None,
+            webpki_from_blob: false,
             startup_warnings: Vec::new(),
+        }
+    }
+
+    /// A pinned `Config` for the pin-file tests.
+    fn pinned_cfg(
+        node_secret_path: &str,
+        fp: crate::enrollment::Fingerprint,
+        pin_source: crate::enrollment::PinSource,
+    ) -> Config {
+        Config {
+            transport: crate::enrollment::TransportPolicy::Pinned(fp),
+            pin_source: Some(pin_source),
+            ..test_cfg(node_secret_path, None)
+        }
+    }
+
+    fn pin_fixture(byte: u8) -> crate::enrollment::Fingerprint {
+        crate::enrollment::Fingerprint([byte; 32])
+    }
+
+    #[test]
+    fn a_fresh_pin_lands_at_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        let cfg = pinned_cfg(
+            secret_path.to_str().unwrap(),
+            pin_fixture(0xAB),
+            crate::enrollment::PinSource::Blob,
+        );
+        persist_pin_if_new(&cfg);
+
+        let written = std::fs::read_to_string(cfg.pin_path()).unwrap();
+        assert_eq!(written.trim(), pin_fixture(0xAB).to_colon_hex());
+        let mode = std::fs::metadata(cfg.pin_path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
+    }
+
+    /// A reconnect must never re-learn a pin: a file already there is the operator's.
+    #[test]
+    fn an_existing_pin_file_is_not_overwritten_by_a_blob_or_persisted_pin() {
+        for source in [
+            crate::enrollment::PinSource::Blob,
+            crate::enrollment::PinSource::Persisted,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let secret_path = dir.path().join("node-secret");
+            let cfg = pinned_cfg(secret_path.to_str().unwrap(), pin_fixture(0xAB), source);
+            std::fs::write(cfg.pin_path(), "not-a-fingerprint\n").unwrap();
+
+            persist_pin_if_new(&cfg);
+            assert_eq!(
+                std::fs::read_to_string(cfg.pin_path()).unwrap(),
+                "not-a-fingerprint\n",
+                "{source:?}"
+            );
+        }
+    }
+
+    /// CONTROL_PLANE_FINGERPRINT is the rotation vehicle, and the new pin has just
+    /// verified a real handshake — the one case overwriting is right.
+    #[test]
+    fn an_operator_driven_rotation_refreshes_the_pin_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        let cfg = pinned_cfg(
+            secret_path.to_str().unwrap(),
+            pin_fixture(0xCD),
+            crate::enrollment::PinSource::Env,
+        );
+        std::fs::write(cfg.pin_path(), format!("{}\n", pin_fixture(0xAB))).unwrap();
+
+        persist_pin_if_new(&cfg);
+        assert_eq!(
+            std::fs::read_to_string(cfg.pin_path()).unwrap().trim(),
+            pin_fixture(0xCD).to_colon_hex()
+        );
+        // No temp file survives the rename.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// A file whose content only differs in case/prefix is the same pin — an equality
+    /// check on bytes would rewrite it on every connect.
+    #[test]
+    fn a_pin_file_in_another_spelling_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        let cfg = pinned_cfg(
+            secret_path.to_str().unwrap(),
+            pin_fixture(0xAB),
+            crate::enrollment::PinSource::Env,
+        );
+        let lowercase = format!(
+            "sha256:{}\n",
+            pin_fixture(0xAB).to_colon_hex().to_lowercase()
+        );
+        std::fs::write(cfg.pin_path(), &lowercase).unwrap();
+
+        persist_pin_if_new(&cfg);
+        assert_eq!(std::fs::read_to_string(cfg.pin_path()).unwrap(), lowercase);
+    }
+
+    /// A symlink planted at the pin path must not become a write primitive: neither the
+    /// create nor the rotation path may create the symlink's target.
+    #[test]
+    fn a_dangling_symlink_at_the_pin_path_is_never_followed() {
+        for source in [
+            crate::enrollment::PinSource::Blob,
+            crate::enrollment::PinSource::Env,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let secret_path = dir.path().join("node-secret");
+            let cfg = pinned_cfg(secret_path.to_str().unwrap(), pin_fixture(0xAB), source);
+            let target = dir.path().join("victim");
+            std::os::unix::fs::symlink(&target, cfg.pin_path()).unwrap();
+
+            persist_pin_if_new(&cfg);
+            assert!(
+                !target.exists(),
+                "{source:?} wrote through the symlink to {target:?}"
+            );
         }
     }
 

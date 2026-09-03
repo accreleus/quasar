@@ -26,8 +26,8 @@ use ureq::unversioned::transport::{
 
 use crate::enrollment::TransportPolicy;
 
-/// Per-request budget shared by every pull channel (they each had their own copy of the
-/// same 20 s; one definition now).
+/// Per-request budget shared by every pull channel. Consolidates the three separate 15 s
+/// constants that GC, jobs and library-scan each carried, raised to 20 s.
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A TLS connector that uses OUR `rustls::ClientConfig` — pinned or WebPKI — instead of
@@ -49,7 +49,16 @@ impl<In: Transport> Connector<In> for PolicyTlsConnector {
                 "policy TLS connector needs a chained TCP transport",
             ));
         };
-        if !details.needs_tls() || transport.is_tls() {
+        // Fail closed. This connector is only installed under a TLS policy, so a plain
+        // request reaching it means the base URL and the policy disagree and the node
+        // secret is one `Ok` away from crossing the wire in cleartext. `CpClient::new`
+        // rejects that mismatch at construction; this is the second gate, not the only one.
+        if !details.needs_tls() {
+            return Err(ureq::Error::Tls(
+                "control-plane URL is not https:// but the transport policy requires TLS",
+            ));
+        }
+        if transport.is_tls() {
             return Ok(Some(Either::A(transport)));
         }
         // `ServerName` from the bare host: a DNS name OR an IP literal (rustls-pki-types 1.x
@@ -140,17 +149,41 @@ pub struct CpClient {
 }
 
 impl CpClient {
+    /// Errors when the base URL's scheme contradicts the policy. The two are derived from
+    /// the same resolved `CONTROL_PLANE_URL`, so a disagreement is a bug — but a silent
+    /// one would either send the node secret in cleartext or skip the pin, so it is
+    /// refused rather than repaired.
     pub fn new(
         policy: &TransportPolicy,
         http_base: String,
         node_name: String,
         node_secret: String,
-    ) -> Self {
+    ) -> Result<Self, String> {
+        let https = http_base.starts_with("https://");
+        match (policy, https) {
+            (TransportPolicy::Pinned(_) | TransportPolicy::WebPki, false) => {
+                return Err(format!(
+                    "transport policy {policy:?} requires https:// but the control-plane HTTP \
+                     base is {http_base:?}"
+                ))
+            }
+            (TransportPolicy::Plaintext, true) => {
+                return Err(format!(
+                    "control-plane HTTP base {http_base:?} is https:// but the transport policy \
+                     is Plaintext; no certificate would be verified"
+                ))
+            }
+            _ => {}
+        }
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(HTTP_TIMEOUT))
             .build();
         let agent = match crate::cp_tls::client_config(policy) {
             // Our verifier for both pinned and WebPKI: one code path, one answer.
+            // This chain REPLACES ureq's default connector stack, which means its SOCKS
+            // and HTTP-CONNECT proxy connectors are gone: the agent's control-plane link
+            // ignores `*_proxy` by construction. Restoring proxy support means chaining
+            // them back in ahead of this one, not swapping the TLS layer out.
             Some(tls) => ureq::Agent::with_parts(
                 config,
                 TcpConnector::default().chain(PolicyTlsConnector { config: tls }),
@@ -159,12 +192,12 @@ impl CpClient {
             // Plaintext: the URL is http://, so TLS never enters the picture.
             None => ureq::Agent::new_with_config(config),
         };
-        Self {
+        Ok(Self {
             agent,
             http_base: http_base.trim_end_matches('/').to_string(),
             node_name,
             node_secret,
-        }
+        })
     }
 
     pub fn http_base(&self) -> &str {
@@ -242,22 +275,39 @@ mod tests {
     use super::*;
     use crate::enrollment::Fingerprint;
 
+    fn client(policy: &TransportPolicy, base: &str) -> Result<CpClient, String> {
+        CpClient::new(policy, base.into(), "n".into(), "s3cret".into())
+    }
+
     #[test]
     fn a_client_builds_for_every_policy_and_never_prints_its_secret() {
-        for policy in [
-            TransportPolicy::Plaintext,
-            TransportPolicy::WebPki,
-            TransportPolicy::Pinned(Fingerprint([3; 32])),
+        for (policy, base) in [
+            (TransportPolicy::Plaintext, "http://127.0.0.1:8080/"),
+            (TransportPolicy::WebPki, "https://cp.example:8443/"),
+            (
+                TransportPolicy::Pinned(Fingerprint([3; 32])),
+                "https://cp.example:8443/",
+            ),
         ] {
-            let c = CpClient::new(
-                &policy,
-                "https://cp.example:8443/".into(),
-                "n".into(),
-                "s3cret".into(),
-            );
-            assert_eq!(c.http_base(), "https://cp.example:8443");
+            let c = client(&policy, base).expect("matching scheme and policy");
+            assert_eq!(c.http_base(), base.trim_end_matches('/'));
             let dbg = format!("{c:?}");
             assert!(!dbg.contains("s3cret"), "{dbg}");
         }
+    }
+
+    /// A policy/scheme mismatch would either leak the node secret or skip the pin, so it
+    /// is refused at construction rather than at the first request.
+    #[test]
+    fn a_policy_that_contradicts_the_base_url_scheme_is_refused() {
+        for policy in [
+            TransportPolicy::WebPki,
+            TransportPolicy::Pinned(Fingerprint([3; 32])),
+        ] {
+            let err = client(&policy, "http://cp.example:8080").unwrap_err();
+            assert!(err.contains("https://"), "{err}");
+        }
+        let err = client(&TransportPolicy::Plaintext, "https://cp.example:8443").unwrap_err();
+        assert!(err.contains("Plaintext"), "{err}");
     }
 }

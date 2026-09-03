@@ -910,7 +910,8 @@ mod tests {
                     "http://127.0.0.1:1".into(),
                     "tower".into(),
                     "secret".into(),
-                ),
+                )
+                .unwrap(),
                 Arc::new(JobRegistry::new()),
             )
         });
