@@ -45,7 +45,9 @@ impl<In: Transport> Connector<In> for PolicyTlsConnector {
         chained: Option<In>,
     ) -> Result<Option<Self::Out>, ureq::Error> {
         let Some(transport) = chained else {
-            return Err(ureq::Error::Tls("policy TLS connector needs a chained TCP transport"));
+            return Err(ureq::Error::Tls(
+                "policy TLS connector needs a chained TCP transport",
+            ));
         };
         if !details.needs_tls() || transport.is_tls() {
             return Ok(Some(Either::A(transport)));
@@ -131,7 +133,12 @@ pub struct CpClient {
 }
 
 impl CpClient {
-    pub fn new(policy: &TransportPolicy, http_base: String, node_name: String, node_secret: String) -> Self {
+    pub fn new(
+        policy: &TransportPolicy,
+        http_base: String,
+        node_name: String,
+        node_secret: String,
+    ) -> Self {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(HTTP_TIMEOUT))
             .build();
@@ -198,7 +205,11 @@ impl CpClient {
     }
 
     /// `POST` whose response body is not needed.
-    pub fn post_json_no_body<B: serde::Serialize>(&self, path: &str, body: &B) -> Result<(), String> {
+    pub fn post_json_no_body<B: serde::Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<(), String> {
         self.agent
             .post(&self.url(path))
             .header("Authorization", &format!("Bearer {}", self.node_secret))
@@ -231,7 +242,12 @@ mod tests {
             TransportPolicy::WebPki,
             TransportPolicy::Pinned(Fingerprint([3; 32])),
         ] {
-            let c = CpClient::new(&policy, "https://cp.example:8443/".into(), "n".into(), "s3cret".into());
+            let c = CpClient::new(
+                &policy,
+                "https://cp.example:8443/".into(),
+                "n".into(),
+                "s3cret".into(),
+            );
             assert_eq!(c.http_base(), "https://cp.example:8443");
             let dbg = format!("{c:?}");
             assert!(!dbg.contains("s3cret"), "{dbg}");

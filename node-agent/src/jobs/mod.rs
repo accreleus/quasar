@@ -908,7 +908,12 @@ mod tests {
             .unwrap();
         let guard = rt.block_on(async {
             spawn_job_poller(
-                CpClient::new(&crate::enrollment::TransportPolicy::Plaintext, "http://127.0.0.1:1".into(), "tower".into(), "secret".into()),
+                CpClient::new(
+                    &crate::enrollment::TransportPolicy::Plaintext,
+                    "http://127.0.0.1:1".into(),
+                    "tower".into(),
+                    "secret".into(),
+                ),
                 Arc::new(JobRegistry::new()),
             )
         });

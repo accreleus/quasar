@@ -118,9 +118,7 @@ pub fn client_config(policy: &TransportPolicy) -> Option<Arc<rustls::ClientConfi
             let mut roots = rustls::RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             Some(Arc::new(
-                builder
-                    .with_root_certificates(roots)
-                    .with_no_client_auth(),
+                builder.with_root_certificates(roots).with_no_client_auth(),
             ))
         }
         TransportPolicy::Plaintext => None,

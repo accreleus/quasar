@@ -2609,8 +2609,12 @@ fn persist_pin_if_new(cfg: &Config) {
         return;
     }
     match std::fs::write(&path, format!("{fp}\n")) {
-        Ok(()) => info!(token = "cp-tls-pin-persisted", path = %path, "control-plane certificate pin saved"),
-        Err(e) => warn!(token = "cp-tls-pin-persist-failed", path = %path, "could not save the certificate pin: {e}"),
+        Ok(()) => {
+            info!(token = "cp-tls-pin-persisted", path = %path, "control-plane certificate pin saved")
+        }
+        Err(e) => {
+            warn!(token = "cp-tls-pin-persist-failed", path = %path, "could not save the certificate pin: {e}")
+        }
     }
 }
 

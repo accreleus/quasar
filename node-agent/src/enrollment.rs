@@ -36,7 +36,10 @@ impl Fingerprint {
     /// and an optional `sha256:` prefix. Anything else is an error naming the expected shape.
     pub fn parse(raw: &str) -> Result<Self, String> {
         let s = raw.trim();
-        let s = s.strip_prefix("sha256:").or_else(|| s.strip_prefix("SHA256:")).unwrap_or(s);
+        let s = s
+            .strip_prefix("sha256:")
+            .or_else(|| s.strip_prefix("SHA256:"))
+            .unwrap_or(s);
         let hex: String = s.chars().filter(|c| *c != ':').collect();
         if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
             return Err(format!(
@@ -239,7 +242,11 @@ pub fn resolve(inputs: Inputs<'_>) -> Result<Resolved, String> {
         Some(raw) => Some(Fingerprint::parse(raw)?),
         None => None,
     };
-    let persisted_pin = match inputs.persisted_pin.map(str::trim).filter(|s| !s.is_empty()) {
+    let persisted_pin = match inputs
+        .persisted_pin
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(raw) => Some(Fingerprint::parse(raw).map_err(|e| format!("persisted pin file: {e}"))?),
         None => None,
     };
@@ -307,7 +314,10 @@ pub fn is_loopback_ws_url(url: &str) -> bool {
     let host = if let Some(v6) = authority.strip_prefix('[') {
         v6.split(']').next().unwrap_or("")
     } else {
-        authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority)
+        authority
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(authority)
     };
     let host = host.to_ascii_lowercase();
     host == "localhost"
@@ -372,20 +382,30 @@ mod tests {
     #[test]
     fn blob_decoder_is_strict() {
         let good = compose_blob("wss://cp.example", &fp(), "tok");
-        assert!(parse_blob(&good.replacen("qenr1", "qenr2", 1)).unwrap_err().contains("qenr1"));
+        assert!(parse_blob(&good.replacen("qenr1", "qenr2", 1))
+            .unwrap_err()
+            .contains("qenr1"));
         // A cleartext URL inside a blob is exactly the exposure the blob exists to close.
         let ws = compose_blob("ws://cp.example", &fp(), "tok");
         assert!(parse_blob(&ws).unwrap_err().contains("wss://"));
         assert!(parse_blob("qenr1.notafingerprint.d3NzOi8vY3A.tok").is_err());
         assert!(parse_blob("qenr1").unwrap_err().contains("fingerprint"));
-        assert!(parse_blob(&format!("qenr1.{FP}.!!!.tok")).unwrap_err().contains("base64url"));
-        assert!(parse_blob(&format!("qenr1.{FP}.d3NzOi8vY3A.")).unwrap_err().contains("empty token"));
+        assert!(parse_blob(&format!("qenr1.{FP}.!!!.tok"))
+            .unwrap_err()
+            .contains("base64url"));
+        assert!(parse_blob(&format!("qenr1.{FP}.d3NzOi8vY3A."))
+            .unwrap_err()
+            .contains("empty token"));
     }
 
     #[test]
     fn blob_alone_yields_a_pinned_wss_policy() {
         let s = compose_blob("wss://cp.example:8443", &fp(), "tok");
-        let r = resolve(Inputs { blob: Some(&s), ..Default::default() }).unwrap();
+        let r = resolve(Inputs {
+            blob: Some(&s),
+            ..Default::default()
+        })
+        .unwrap();
         assert_eq!(r.url, "wss://cp.example:8443");
         assert_eq!(r.token.as_deref(), Some("tok"));
         assert_eq!(r.policy, TransportPolicy::Pinned(fp()));
@@ -404,7 +424,10 @@ mod tests {
         })
         .unwrap();
         assert_eq!(r.url, "wss://cp.lan:8443");
-        assert_eq!(r.policy, TransportPolicy::Pinned(Fingerprint::parse(&other).unwrap()));
+        assert_eq!(
+            r.policy,
+            TransportPolicy::Pinned(Fingerprint::parse(&other).unwrap())
+        );
         assert_eq!(r.warnings.len(), 2, "{:?}", r.warnings);
         assert!(r.warnings[0].contains("CONTROL_PLANE_URL"));
         assert!(r.warnings[1].contains("CONTROL_PLANE_FINGERPRINT"));
@@ -413,16 +436,29 @@ mod tests {
     #[test]
     fn a_differing_explicit_token_is_fatal_not_silently_resolved() {
         let s = compose_blob("wss://cp.example", &fp(), "tok-a");
-        let err = resolve(Inputs { blob: Some(&s), token: Some("tok-b"), ..Default::default() })
-            .unwrap_err();
+        let err = resolve(Inputs {
+            blob: Some(&s),
+            token: Some("tok-b"),
+            ..Default::default()
+        })
+        .unwrap_err();
         assert!(err.contains("differ"), "{err}");
         // Identical is fine — the operator pasted both.
-        assert!(resolve(Inputs { blob: Some(&s), token: Some("tok-a"), ..Default::default() }).is_ok());
+        assert!(resolve(Inputs {
+            blob: Some(&s),
+            token: Some("tok-a"),
+            ..Default::default()
+        })
+        .is_ok());
     }
 
     #[test]
     fn wss_without_any_pin_is_webpki_and_a_persisted_pin_is_used_when_nothing_else_names_one() {
-        let r = resolve(Inputs { url: Some("wss://play.example.com"), ..Default::default() }).unwrap();
+        let r = resolve(Inputs {
+            url: Some("wss://play.example.com"),
+            ..Default::default()
+        })
+        .unwrap();
         assert_eq!(r.policy, TransportPolicy::WebPki);
 
         let r = resolve(Inputs {
@@ -436,11 +472,24 @@ mod tests {
 
     #[test]
     fn cleartext_is_free_to_loopback_and_gated_everywhere_else() {
-        for url in ["ws://localhost:8080", "ws://127.0.0.1:8080", "ws://[::1]:8080", "ws://127.9.9.9"] {
-            let r = resolve(Inputs { url: Some(url), ..Default::default() }).unwrap();
+        for url in [
+            "ws://localhost:8080",
+            "ws://127.0.0.1:8080",
+            "ws://[::1]:8080",
+            "ws://127.9.9.9",
+        ] {
+            let r = resolve(Inputs {
+                url: Some(url),
+                ..Default::default()
+            })
+            .unwrap();
             assert_eq!(r.policy, TransportPolicy::Plaintext, "{url}");
         }
-        let err = resolve(Inputs { url: Some("ws://cp.lan:8080"), ..Default::default() }).unwrap_err();
+        let err = resolve(Inputs {
+            url: Some("ws://cp.lan:8080"),
+            ..Default::default()
+        })
+        .unwrap_err();
         assert!(err.contains("QUASAR_ALLOW_PLAINTEXT_AGENT"), "{err}");
         let r = resolve(Inputs {
             url: Some("ws://cp.lan:8080"),
@@ -456,7 +505,11 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert!(r.warnings.iter().any(|w| w.contains("ws://")), "{:?}", r.warnings);
+        assert!(
+            r.warnings.iter().any(|w| w.contains("ws://")),
+            "{:?}",
+            r.warnings
+        );
     }
 
     #[test]
