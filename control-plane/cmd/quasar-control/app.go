@@ -22,6 +22,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/devices"
 	"github.com/accreleus/quasar/control-plane/internal/health"
 	"github.com/accreleus/quasar/control-plane/internal/hostcfg"
+	"github.com/accreleus/quasar/control-plane/internal/hostenroll"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
 	"github.com/accreleus/quasar/control-plane/internal/ice"
 	"github.com/accreleus/quasar/control-plane/internal/images"
@@ -76,6 +77,7 @@ type Services struct {
 	cfgHandler      *hostcfg.Handler
 	settingsHandler *settings.Handler
 	invitesHandler  *invites.Handler
+	enrollHandler   *hostenroll.Handler
 	consoleHandler  *console.Handler
 	auditHandler    *audit.Handler
 	artworkHandler  *artwork.Handler
@@ -379,6 +381,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	cfgHandler := hostcfg.NewHandler(cfgStore, agentRegistry, sessionStore, auditStore)
 	settingsHandler := settings.NewHandler(settingsStore, auditStore)
 	invitesHandler := invites.NewHandler(invites.NewStore(pool), cfg.PublicBaseURL, auditStore)
+	enrollHandler := hostenroll.NewHandler(hostenroll.NewStore(pool), auditStore)
 	consoleHandler := console.NewHandler(consoleStore, agentRegistry, auditStore)
 	auditHandler := audit.NewHandler(auditStore)
 
@@ -776,6 +779,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		cfgHandler:       cfgHandler,
 		settingsHandler:  settingsHandler,
 		invitesHandler:   invitesHandler,
+		enrollHandler:    enrollHandler,
 		consoleHandler:   consoleHandler,
 		auditHandler:     auditHandler,
 		artworkHandler:   artworkHandler,
@@ -815,6 +819,7 @@ func (s *Services) RegisterRoutes(mux httpx.Router) {
 	}
 	s.settingsHandler.Register(mux, admin)
 	s.invitesHandler.Register(mux, admin)
+	s.enrollHandler.Register(mux, admin)
 	s.consoleHandler.Register(mux, admin)
 	s.auditHandler.Register(mux, admin)
 	s.secretsHandler.Register(mux, admin)
