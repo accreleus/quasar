@@ -584,6 +584,17 @@ pub fn free_space_verdict(free: u64, required: u64, what: &str, consequence: &st
 mod tests {
     use super::*;
 
+    /// `PROVISIONS_IN_FLIGHT` is process-global, so the tests that assert on it must not
+    /// run beside each other — cargo runs tests on parallel threads and a neighbour holding
+    /// its own lock makes the count read one too high.
+    static LOCK_TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial_lock_test() -> std::sync::MutexGuard<'static, ()> {
+        LOCK_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn only_the_pinned_https_host_is_accepted() {
         assert!(validate_url("https://example.com/a", "example.com").is_ok());
@@ -606,6 +617,7 @@ mod tests {
 
     #[test]
     fn lock_is_exclusive_and_released_on_drop() {
+        let _serial = serial_lock_test();
         let dir = std::env::temp_dir().join(format!("quasar-artifact-lock-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join(".provision.lock");
@@ -626,6 +638,7 @@ mod tests {
 
     #[test]
     fn a_held_lock_is_counted_in_flight_and_blocks_a_restart_barrier() {
+        let _serial = serial_lock_test();
         // #66: the restart path must see the driver-volume provision that the cudart
         // thread's `exit(0)` would otherwise kill mid-extraction.
         let dir =
@@ -644,7 +657,7 @@ mod tests {
         drop(l);
         assert_eq!(provisioning_in_flight(), before);
         assert!(
-            wait_for_quiescence(Duration::from_millis(300)),
+            wait_for_quiescence(Duration::from_secs(5)),
             "the barrier must clear once the provision releases its lock"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -679,6 +692,7 @@ mod tests {
 
     #[test]
     fn acquire_advertises_the_heartbeat_in_the_lockfile() {
+        let _serial = serial_lock_test();
         let dir = std::env::temp_dir().join(format!("quasar-artifact-hb-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join(".provision.lock");
