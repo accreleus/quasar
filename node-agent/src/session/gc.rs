@@ -24,7 +24,6 @@ use tracing::{debug, info, warn};
 
 use crate::session::home;
 
-/// HTTP request timeout for the GC endpoints (small JSON payloads).
 
 /// One reapable home as returned by GET /v1/agent/storage/gc-pending. Built from
 /// the wire shape via [`PendingHome::from_wire`] (the wire field `ref` is a Rust

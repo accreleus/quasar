@@ -43,7 +43,6 @@ use tracing::debug;
 
 use crate::session::home;
 
-/// HTTP request timeout for the two library-scan endpoints (small JSON
 
 /// Wall-clock budget for one scan's filesystem walk. Smaller than
 /// `session::home::DU_TIMEOUT` (10s) because this glob is shallow — a handful

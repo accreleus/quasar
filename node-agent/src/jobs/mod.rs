@@ -38,8 +38,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
-/// HTTP request timeout for the two job endpoints (small JSON payloads),
-/// matching `session::gc` and `session::library_scan`.
 
 /// Initial delay before the first poll: must not contend with the
 /// session-handling burst that follows a (re)connect.
