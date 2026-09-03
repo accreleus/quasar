@@ -2263,7 +2263,8 @@ mod tests {
                 "proc/sys/kernel/apparmor_restrict_unprivileged_userns",
                 "1\n",
             );
-        let c = get(&probe(&ubuntu.env(false, "")), "user_namespaces");
+        let checks = probe(&ubuntu.env(false, ""));
+        let c = get(&checks, "user_namespaces");
         assert_eq!(c.status, FAIL, "{c:?}");
         assert!(
             c.remediation
