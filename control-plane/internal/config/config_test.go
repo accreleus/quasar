@@ -910,3 +910,22 @@ func TestLoadICEServers(t *testing.T) {
 		})
 	}
 }
+
+// --- enrollment token (#12) --------------------------------------------------
+
+// A deployment can enroll entirely with admin-minted per-host tokens, so the
+// fleet-wide static one is optional. Empty must load, and must stay empty:
+// agentws only compares a non-empty configured token, so "" is "the static path
+// is off", never a wildcard that matches whatever an agent presents.
+func TestLoadEnrollmentTokenIsOptional(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://test")
+	t.Setenv("ENROLLMENT_TOKEN", "")
+
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load without ENROLLMENT_TOKEN: %v", err)
+	}
+	if c.EnrollmentToken != "" {
+		t.Fatalf("EnrollmentToken = %q, want empty", c.EnrollmentToken)
+	}
+}

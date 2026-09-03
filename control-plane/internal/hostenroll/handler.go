@@ -48,6 +48,15 @@ type mintResp struct {
 	CreatedAt time.Time  `json:"created_at"`
 }
 
+// Bounds on a fleet-join credential. The two ways to make one dangerous are "usable
+// by many machines" and "usable for a long time", and neither has an operator use that
+// needs more than this — a fleet build-out mints per host. Contract: control-api.md
+// §Host enrollment tokens.
+const (
+	maxMintUses = 100
+	maxMintTTL  = 30 * 24 * time.Hour
+)
+
 func (h *Handler) handleMint(w http.ResponseWriter, r *http.Request) {
 	user, ok := auth.UserFromContext(r.Context())
 	if !ok {
@@ -72,6 +81,12 @@ func (h *Handler) handleMint(w http.ResponseWriter, r *http.Request) {
 
 	p := MintParams{CreatedBy: user.ID, ExpiresAt: req.ExpiresAt}
 	if req.NodeName != nil {
+		// "" would mint an ANY-node token (MintParams reads empty as unbound) — the
+		// opposite of what a caller that sent the field asked for. Refuse, don't guess.
+		if *req.NodeName == "" {
+			httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "node_name must be non-empty or omitted")
+			return
+		}
 		if len(*req.NodeName) > 253 {
 			httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "node_name too long")
 			return
@@ -83,11 +98,21 @@ func (h *Handler) handleMint(w http.ResponseWriter, r *http.Request) {
 			httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "max_uses must be >= 1")
 			return
 		}
+		if *req.MaxUses > maxMintUses {
+			httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "max_uses must be <= 100")
+			return
+		}
 		p.MaxUses = *req.MaxUses
 	}
-	if req.ExpiresAt != nil && !req.ExpiresAt.After(time.Now()) {
-		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "expires_at must be in the future")
-		return
+	if req.ExpiresAt != nil {
+		if !req.ExpiresAt.After(time.Now()) {
+			httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "expires_at must be in the future")
+			return
+		}
+		if req.ExpiresAt.After(time.Now().Add(maxMintTTL)) {
+			httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "expires_at must be within 30 days")
+			return
+		}
 	}
 	if req.Note != nil {
 		p.Note = *req.Note

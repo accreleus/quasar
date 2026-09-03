@@ -213,7 +213,7 @@ func NewHandler(pool *pgxpool.Pool, enrollmentToken string, log *slog.Logger, re
 	h := &Handler{
 		store: &agentStore{
 			pool: pool,
-			// The registry is the authoritative "is that agent live" answer (#96).
+			// The local half of the #96 liveness answer; the DB half is in enrollHost.
 			isAgentConnected: registry.IsConnected,
 			redeemEnrollment: hostenroll.Redeem,
 		},

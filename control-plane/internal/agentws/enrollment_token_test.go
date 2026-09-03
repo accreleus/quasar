@@ -11,7 +11,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/hostenroll"
 )
 
-// seedAdmin returns a user id to own minted tokens (created_by is NOT NULL).
+// seedAdmin returns a user id to own minted tokens.
 func seedAdmin(t *testing.T, pool *pgxpool.Pool) string {
 	t.Helper()
 	var id string
@@ -155,9 +155,147 @@ func TestEnrollmentCannotTakeOverAConnectedHost(t *testing.T) {
 	}
 
 	// A host whose agent is gone still re-enrolls: that is the legitimate case this
-	// guard must not break.
+	// guard must not break. markOffline is what really runs on every path that ends
+	// the read loop, and the guard's DB half now requires it.
 	connected = false
+	if err := st.markOffline(ctx, first.HostID); err != nil {
+		t.Fatalf("mark offline: %v", err)
+	}
 	if _, err := st.enrollHost(ctx, "contested", "0.1.0", "static-token", "static-token"); err != nil {
 		t.Fatalf("re-enrolling a disconnected host: %v", err)
+	}
+}
+
+// usedCount reads a minted token's consume tally straight from the row.
+func usedCount(t *testing.T, pool *pgxpool.Pool, id string) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT used_count FROM host_enrollments WHERE id::text = $1`, id).Scan(&n); err != nil {
+		t.Fatalf("read used_count: %v", err)
+	}
+	return n
+}
+
+// /agent/ws is reachable pre-auth, so the takeover guard must never answer before the
+// credential does: a bad token gets the same plain refusal whether the node_name is live,
+// dead, or unknown. Otherwise the distinct ErrHostAgentConnected is an existence oracle.
+func TestBadCredentialNeverRevealsALiveHost(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	connected := false
+	st := storeWithMintedTokens(pool, func(string) bool { return connected })
+
+	if _, err := st.enrollHost(ctx, "oracle-host", "0.1.0", "static-token", "static-token"); err != nil {
+		t.Fatalf("initial enrollment: %v", err)
+	}
+	connected = true
+
+	if _, err := st.enrollHost(ctx, "oracle-host", "0.1.0", "wrong", "static-token"); !errors.Is(err, ErrInvalidEnrollmentToken) {
+		t.Fatalf("bad credential on a live node_name: got %v, want ErrInvalidEnrollmentToken", err)
+	}
+	if _, err := st.enrollHost(ctx, "no-such-host", "0.1.0", "wrong", "static-token"); !errors.Is(err, ErrInvalidEnrollmentToken) {
+		t.Fatalf("bad credential on an unknown node_name: got %v, want ErrInvalidEnrollmentToken", err)
+	}
+}
+
+// Validating the credential before the takeover guard means a minted token is consumed
+// first — so the refusal has to give the use back, or an operator's single-use token is
+// destroyed by an attempt that was refused for a reason they can fix.
+func TestRefusedTakeoverDoesNotBurnAMintedToken(t *testing.T) {
+	pool := testPool(t)
+	admin := seedAdmin(t, pool)
+	ctx := context.Background()
+	connected := false
+	st := storeWithMintedTokens(pool, func(string) bool { return connected })
+	mint := hostenroll.NewStore(pool)
+
+	first, err := st.enrollHost(ctx, "burned", "0.1.0", "static-token", "static-token")
+	if err != nil {
+		t.Fatalf("initial enrollment: %v", err)
+	}
+	row, plaintext, err := mint.Mint(ctx, hostenroll.MintParams{CreatedBy: admin, NodeName: "burned"})
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+
+	connected = true
+	if _, err := st.enrollHost(ctx, "burned", "0.1.0", plaintext, ""); !errors.Is(err, ErrHostAgentConnected) {
+		t.Fatalf("takeover while connected: got %v, want ErrHostAgentConnected", err)
+	}
+	if n := usedCount(t, pool, row.ID); n != 0 {
+		t.Fatalf("a refused takeover burned the token: used_count = %d, want 0", n)
+	}
+
+	connected = false
+	if err := st.markOffline(ctx, first.HostID); err != nil {
+		t.Fatalf("mark offline: %v", err)
+	}
+	if _, err := st.enrollHost(ctx, "burned", "0.1.0", plaintext, ""); err != nil {
+		t.Fatalf("the same token once the host is gone: %v", err)
+	}
+	if n := usedCount(t, pool, row.ID); n != 1 {
+		t.Fatalf("used_count after the successful enrollment = %d, want 1", n)
+	}
+}
+
+// The registry only sees connections on THIS process, so a host connected to a sibling
+// replica is live in the database and invisible in memory. It must still refuse a takeover.
+func TestEnrollmentRefusesAHostOnlyTheDatabaseCallsLive(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	st := storeWithMintedTokens(pool, func(string) bool { return false }) // nothing local
+
+	res, err := st.enrollHost(ctx, "other-replica", "0.1.0", "static-token", "static-token")
+	if err != nil {
+		t.Fatalf("initial enrollment: %v", err)
+	}
+	if _, err := st.enrollHost(ctx, "other-replica", "0.1.0", "static-token", "static-token"); !errors.Is(err, ErrHostAgentConnected) {
+		t.Fatalf("takeover of an online row: got %v, want ErrHostAgentConnected", err)
+	}
+
+	// Offline is the whole condition: the row must be re-enrollable once its agent is
+	// recorded as gone, or a host that lost its node_secret could never come back.
+	if err := st.markOffline(ctx, res.HostID); err != nil {
+		t.Fatalf("mark offline: %v", err)
+	}
+	if _, err := st.enrollHost(ctx, "other-replica", "0.1.0", "static-token", "static-token"); err != nil {
+		t.Fatalf("re-enrolling an offline row: %v", err)
+	}
+}
+
+// A database outage during redemption is not "your token is bad". Reporting it as
+// auth_failed sends the operator to rotate a credential that was fine.
+func TestRedemptionOutageIsNotAnAuthFailure(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	outage := errors.New("server closed the connection unexpectedly")
+	st := &agentStore{
+		pool:             pool,
+		isAgentConnected: func(string) bool { return false },
+		redeemEnrollment: func(context.Context, hostenroll.DBTX, string, string) error { return outage },
+	}
+
+	_, err := st.enrollHost(ctx, "outage-host", "0.1.0", "some-token", "static-token")
+	if errors.Is(err, ErrInvalidEnrollmentToken) {
+		t.Fatalf("a redemption outage was reported as an auth failure: %v", err)
+	}
+	if !errors.Is(err, outage) {
+		t.Fatalf("got %v, want an error wrapping %v", err, outage)
+	}
+}
+
+// A store built without a redeemer (older wiring, or a test fixture) must refuse the
+// unknown token rather than panic on the pre-auth path; the static token still enrolls.
+func TestEnrollmentWithoutMintedTokenSupport(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	st := &agentStore{pool: pool}
+
+	if _, err := st.enrollHost(ctx, "no-minting", "0.1.0", "whatever", "static-token"); !errors.Is(err, ErrInvalidEnrollmentToken) {
+		t.Fatalf("minted token with no redeemer wired: got %v, want ErrInvalidEnrollmentToken", err)
+	}
+	if _, err := st.enrollHost(ctx, "no-minting", "0.1.0", "static-token", "static-token"); err != nil {
+		t.Fatalf("static token with no redeemer wired: %v", err)
 	}
 }

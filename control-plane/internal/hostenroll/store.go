@@ -58,8 +58,12 @@ type Enrollment struct {
 	ExpiresAt   *time.Time `json:"expires_at"`
 	RevokedAt   *time.Time `json:"revoked_at"`
 	LastUsedAt  *time.Time `json:"last_used_at"`
-	Note        *string    `json:"note"`
-	CreatedAt   time.Time  `json:"created_at"`
+	// Which node actually redeemed it, most recent wins (migration 0073). NULL until
+	// first redemption: last_used_at alone says a redemption happened without saying
+	// by whom, which is what an operator needs when a token was used unexpectedly.
+	UsedByNodeName *string   `json:"used_by_node_name"`
+	Note           *string   `json:"note"`
+	CreatedAt      time.Time `json:"created_at"`
 	// Provenance, resolved at read time; nullable on the wire for the same reason
 	// Invite.created_by_username is.
 	CreatedByUserID   *string `json:"created_by_user_id"`
@@ -148,12 +152,14 @@ func (s *Store) Mint(ctx context.Context, p MintParams) (Enrollment, string, err
 // narrows to tokens that would still redeem.
 func (s *Store) List(ctx context.Context, pendingOnly bool) ([]Enrollment, error) {
 	q := `SELECT e.id::text, left(e.token_hash, 8), e.node_name, e.max_uses, e.used_count,
-	             e.expires_at, e.revoked_at, e.last_used_at, e.note, e.created_at,
-	             e.created_by::text, u.username
+	             e.expires_at, e.revoked_at, e.last_used_at, e.used_by_node_name, e.note,
+	             e.created_at, e.created_by::text, u.username
 	      FROM host_enrollments e
 	      LEFT JOIN users u ON u.id = e.created_by`
 	if pendingOnly {
-		q += ` WHERE ` + pendingSQLQualified
+		// pendingSQL unqualified, not a hand-written alias copy: `users` shares none of
+		// its columns, so the join leaves it unambiguous (mirrors invites.List).
+		q += ` WHERE ` + pendingSQL
 	}
 	q += ` ORDER BY e.created_at DESC`
 
@@ -167,18 +173,14 @@ func (s *Store) List(ctx context.Context, pendingOnly bool) ([]Enrollment, error
 	for rows.Next() {
 		var e Enrollment
 		if err := rows.Scan(&e.ID, &e.TokenPrefix, &e.NodeName, &e.MaxUses, &e.UsedCount,
-			&e.ExpiresAt, &e.RevokedAt, &e.LastUsedAt, &e.Note, &e.CreatedAt,
-			&e.CreatedByUserID, &e.CreatedByUsername); err != nil {
+			&e.ExpiresAt, &e.RevokedAt, &e.LastUsedAt, &e.UsedByNodeName, &e.Note,
+			&e.CreatedAt, &e.CreatedByUserID, &e.CreatedByUsername); err != nil {
 			return nil, fmt.Errorf("scan host enrollment: %w", err)
 		}
 		out = append(out, e)
 	}
 	return out, rows.Err()
 }
-
-// pendingSQLQualified is pendingSQL with the alias the List join needs.
-const pendingSQLQualified = `e.revoked_at IS NULL AND e.used_count < e.max_uses
-	AND (e.expires_at IS NULL OR e.expires_at > now())`
 
 // Revoke makes a token unusable. Idempotent: revoking twice keeps the first timestamp.
 func (s *Store) Revoke(ctx context.Context, id string) error {
@@ -209,7 +211,7 @@ func Redeem(ctx context.Context, db DBTX, plaintext, nodeName string) error {
 	var id string
 	err := db.QueryRow(ctx, `
 		UPDATE host_enrollments
-		SET used_count = used_count + 1, last_used_at = now()
+		SET used_count = used_count + 1, last_used_at = now(), used_by_node_name = $2
 		WHERE token_hash = $1
 		  AND (node_name IS NULL OR node_name = $2)
 		  AND `+pendingSQL+`

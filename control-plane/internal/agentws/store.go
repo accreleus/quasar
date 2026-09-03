@@ -24,18 +24,21 @@ var (
 	// takeover: the incumbent's next reconnect fails and the scheduler keeps placing work
 	// on the row the caller now authenticates as. A genuinely dead host is unaffected.
 	ErrHostAgentConnected = errors.New("a live agent is already registered under this node name")
-	ErrHostNotFound           = errors.New("host not found")
-	ErrInvalidNodeSecret      = errors.New("invalid node secret")
+	ErrHostNotFound       = errors.New("host not found")
+	ErrInvalidNodeSecret  = errors.New("invalid node secret")
 )
 
 type agentStore struct {
 	pool *pgxpool.Pool
-	// isAgentConnected reports whether a host id currently holds a live agent websocket.
-	// A func rather than the Registry itself: the store must stay testable without one,
-	// and the authoritative answer is in-memory, not in the database.
+	// isAgentConnected reports whether a host id holds a live agent websocket ON THIS
+	// PROCESS. A func rather than the Registry itself, so the store stays testable
+	// without one. It is only half the liveness answer: another replica's connection is
+	// invisible here, which is why enrollHost also reads the host row's own status (see
+	// hostIsLiveSQL). Nil is treated as "no local connections".
 	isAgentConnected func(hostID string) bool
 	// redeemEnrollment consumes a minted token inside the caller's transaction. Injected
-	// so agentws does not import hostenroll (and so tests can supply a stub).
+	// so agentws does not import hostenroll (and so tests can supply a stub). Nil means
+	// minted tokens are unavailable: only the static token can enroll.
 	redeemEnrollment func(ctx context.Context, db hostenroll.DBTX, plaintext, nodeName string) error
 }
 
@@ -115,29 +118,43 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	// Consume the credential inside the transaction (see the note above), and BEFORE the
+	// takeover guard below: /agent/ws is reachable pre-auth, and running the guard first
+	// told an unauthenticated caller whether a node_name exists with a live agent.
+	if !staticOK {
+		if s.redeemEnrollment == nil {
+			return registerResult{}, ErrInvalidEnrollmentToken // minted tokens unavailable
+		}
+		if err := s.redeemEnrollment(ctx, tx, token, nodeName); err != nil {
+			// Only a genuinely unusable token is an auth failure. A DB outage reported as
+			// "authentication failed" sends the operator to rotate a token that was fine.
+			if errors.Is(err, hostenroll.ErrInvalidToken) {
+				return registerResult{}, ErrInvalidEnrollmentToken
+			}
+			return registerResult{}, fmt.Errorf("redeem enrollment token: %w", err)
+		}
+	}
+
 	// #96: enrollment onto an EXISTING node_name replaces its node_secret. That is correct
 	// for re-enrolling a host you own and it is identity takeover for one you do not, so
-	// refuse it while that host's agent is connected. Row-locked, so the check cannot race
-	// a concurrent enrollment of the same name.
+	// refuse it while that host's agent is live. The refusal happens after the redeem, and
+	// the deferred rollback gives the use back — a refused takeover never burns a token.
 	var existingID string
-	err = tx.QueryRow(ctx, `SELECT id::text FROM hosts WHERE node_name = $1 FOR UPDATE`, nodeName).
-		Scan(&existingID)
+	var dbLive bool
+	err = tx.QueryRow(ctx,
+		`SELECT id::text, `+hostIsLiveSQL+` FROM hosts WHERE node_name = $1 FOR UPDATE`,
+		nodeName).Scan(&existingID, &dbLive)
 	switch {
 	case err == nil:
-		if s.isAgentConnected != nil && s.isAgentConnected(existingID) {
+		if dbLive || (s.isAgentConnected != nil && s.isAgentConnected(existingID)) {
 			return registerResult{}, ErrHostAgentConnected
 		}
 	case errors.Is(err, pgx.ErrNoRows):
-		// New host; nothing to take over.
+		// A new node_name: nothing to take over, and nothing locked either — zero rows
+		// lock nothing. Concurrent first-enrollments of the same name serialize on the
+		// ON CONFLICT (node_name) below instead, which is the same outcome.
 	default:
 		return registerResult{}, fmt.Errorf("look up host for enrollment: %w", err)
-	}
-
-	// Consume the credential inside the transaction (see the note in the caller above).
-	if !staticOK {
-		if err := s.redeemEnrollment(ctx, tx, token, nodeName); err != nil {
-			return registerResult{}, ErrInvalidEnrollmentToken
-		}
 	}
 
 	// Enrollment is an identity event: the restart tally resets, and
@@ -172,6 +189,18 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 	}
 	return registerResult{HostID: hostID, NodeSecret: secretHex}, nil
 }
+
+// hostIsLiveSQL is the DB half of the #96 takeover guard: the registry only sees
+// connections on THIS process, so a multi-replica control plane would let a
+// takeover through against a host connected to a sibling replica. markOffline
+// stamps agent_disconnected_at on every path that ends the read loop, so a row
+// that is online with none is one somebody believes they are still serving.
+//
+// Tradeoff: after a control-plane crash the deferred markOffline never runs, so a
+// dead host reads as live until its agent connects and drops again — nothing
+// sweeps stale rows. A genuine re-enrollment in that window uses a new node_name,
+// or the admin deletes the host row first.
+const hostIsLiveSQL = `(status = 'online' AND agent_disconnected_at IS NULL)`
 
 // reconnectHost verifies the node_secret and marks the host online.
 func (s *agentStore) reconnectHost(ctx context.Context, nodeName, agentVersion, nodeSecret string) (registerResult, error) {

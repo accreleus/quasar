@@ -28,5 +28,6 @@ CREATE TABLE host_enrollments (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Admin list view is scoped to the minter, as with invites.
+-- Provenance lookups by minter (who did this admin mint tokens for). The admin
+-- list itself is instance-wide, newest first, exactly as with invites.
 CREATE INDEX host_enrollments_created_by_idx ON host_enrollments (created_by);
