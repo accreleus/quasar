@@ -846,6 +846,33 @@ fn check_user_namespaces(env: &ProbeEnv, distro: Distro) -> ReadinessCheck {
         }
     }
 
+    // Ubuntu 24.04+ replaced the Debian clone knob with an AppArmor-backed one, and it is
+    // the gate that actually decides whether Steam's bwrap/pressure-vessel bootstrap can
+    // start (#76). It is a HOST kernel setting: the app container's own distro is
+    // irrelevant, because a container shares the host's kernel and its LSM. Reading only
+    // the two knobs above calls an Ubuntu host ready while every Steam-class app dies with
+    // "Steam now requires user namespaces to be enabled".
+    let apparmor_knob = env
+        .root
+        .join("proc/sys/kernel/apparmor_restrict_unprivileged_userns");
+    if let Ok(body) = std::fs::read_to_string(&apparmor_knob) {
+        if body.trim() == "1" {
+            return fail(
+                ID,
+                "the host restricts unprivileged user namespaces through AppArmor \
+                 (kernel.apparmor_restrict_unprivileged_userns=1, the Ubuntu 24.04+ default) — \
+                 sandboxed app launchers (bwrap, Steam's container runtime) cannot create the \
+                 namespace they need and the app exits before producing video, however much \
+                 user.max_user_namespaces allows"
+                    .to_string(),
+                "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 && \
+                 echo kernel.apparmor_restrict_unprivileged_userns=0 | sudo tee \
+                 /etc/sysctl.d/99-quasar-userns.conf"
+                    .to_string(),
+            );
+        }
+    }
+
     let path = env.root.join("proc/sys/user/max_user_namespaces");
     let Ok(body) = std::fs::read_to_string(&path) else {
         // Not every kernel exposes the knob; absence must never read as a failure. A present,
@@ -2218,6 +2245,57 @@ mod tests {
         assert_eq!(
             get(&probe(&absent.env(false, "")), "user_namespaces").status,
             SKIP
+        );
+    }
+
+    /// #76: an Ubuntu 24.04+ host advertises a healthy `max_user_namespaces` and has no
+    /// Debian clone knob at all, while AppArmor refuses every unprivileged `CLONE_NEWUSER`.
+    /// That combination used to read as `pass` — on precisely the hosts where Steam-class
+    /// apps cannot start.
+    #[test]
+    fn user_namespace_check_fails_when_apparmor_restricts_unprivileged_userns() {
+        let ubuntu = FakeRoot::new("userns-apparmor");
+        ubuntu
+            .file("dev/dri/renderD128", "")
+            .file("dev/uinput", "")
+            .file("proc/sys/user/max_user_namespaces", "15000\n")
+            .file(
+                "proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+                "1\n",
+            );
+        let checks = probe(&ubuntu.env(false, ""));
+        let c = get(&checks, "user_namespaces");
+        assert_eq!(c.status, FAIL, "{c:?}");
+        assert!(
+            c.remediation
+                .contains("kernel.apparmor_restrict_unprivileged_userns=0"),
+            "the operator must be told the sysctl that fixes it: {c:?}"
+        );
+
+        // The same host with the restriction lifted is ready again.
+        let lifted = FakeRoot::new("userns-apparmor-off");
+        lifted
+            .file("dev/dri/renderD128", "")
+            .file("dev/uinput", "")
+            .file("proc/sys/user/max_user_namespaces", "15000\n")
+            .file(
+                "proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+                "0\n",
+            );
+        assert_eq!(
+            get(&probe(&lifted.env(false, "")), "user_namespaces").status,
+            PASS
+        );
+
+        // A host that does not carry the knob at all (Fedora/SELinux) is unaffected.
+        let fedora = FakeRoot::new("userns-no-apparmor-knob");
+        fedora
+            .file("dev/dri/renderD128", "")
+            .file("dev/uinput", "")
+            .file("proc/sys/user/max_user_namespaces", "15000\n");
+        assert_eq!(
+            get(&probe(&fedora.env(false, "")), "user_namespaces").status,
+            PASS
         );
     }
 
