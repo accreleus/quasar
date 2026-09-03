@@ -77,4 +77,21 @@ describe("EnrollHostModal", () => {
     await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
     expect(screen.queryByTestId("enroll-string")).toBeNull();
   });
+
+  it("forgets the previous host's token on close and re-checks access on reopen", async () => {
+    const { rerender } = render(
+      <EnrollHostModal open onClose={() => {}} origin="https://cp.example:8443" />,
+    );
+    await waitFor(() => expect(screen.getByTestId("enroll-fingerprint").textContent).toBe(FP));
+    fireEvent.click(screen.getByText("Mint enrollment string"));
+    await waitFor(() => expect(screen.getByTestId("enroll-string")).toBeTruthy());
+    expect(mocked.accessCheck).toHaveBeenCalledTimes(1);
+
+    rerender(<EnrollHostModal open={false} onClose={() => {}} origin="https://cp.example:8443" />);
+    rerender(<EnrollHostModal open onClose={() => {}} origin="https://cp.example:8443" />);
+
+    expect(screen.queryByTestId("enroll-string")).toBeNull();
+    await waitFor(() => expect(screen.getByText("Mint enrollment string")).toBeTruthy());
+    await waitFor(() => expect(mocked.accessCheck).toHaveBeenCalledTimes(2));
+  });
 });

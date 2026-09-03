@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   agentWssUrl,
   base64UrlNoPad,
+  canMintFrom,
   composeEnrollmentString,
   normalizeFingerprint,
 } from "./enrollmentString";
@@ -53,5 +54,10 @@ describe("enrollment string", () => {
       expect(parts.slice(0, 3)).toEqual(["qenr1", FP, base64UrlNoPad("wss://cp.lan:8443")]);
       expect(parts.slice(3).join(".")).toBe("a.b.c");
     }
+  });
+
+  it("gates mint()'s pre-flight guard on the same http-origin check", () => {
+    expect(canMintFrom("http://cp.example:8080")).toBe(false);
+    expect(canMintFrom("https://cp.example:8443")).toBe(true);
   });
 });

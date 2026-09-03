@@ -20,20 +20,15 @@ import { Modal } from "../../../components/Modal";
 import * as adminApi from "../../../api/admin";
 import { ApiError } from "../../../api/client";
 import type { AccessCheck } from "../../../api/types";
-import { composeEnrollmentString, agentWssUrl } from "../../../lib/enrollmentString";
+import {
+  composeEnrollmentString,
+  agentWssUrl,
+  canMintFrom,
+  HTTP_ORIGIN_REFUSAL,
+} from "../../../lib/enrollmentString";
 
 /** Where the release's own instructions for this live. */
 const SECOND_HOST_DOCS = "https://accreleus.github.io/quasar/install/second-host/";
-
-/**
- * Kept for callers that only need the address: the scheme swap of the page's
- * origin. Prefer `lib/enrollmentString` for anything that composes the string.
- */
-export function agentControlPlaneUrl(origin: string): string {
-  if (origin.startsWith("https://")) return `wss://${origin.slice("https://".length)}`;
-  if (origin.startsWith("http://")) return `ws://${origin.slice("http://".length)}`;
-  return origin;
-}
 
 type CertState =
   | { kind: "loading" }
@@ -49,7 +44,10 @@ function certStateOf(check: AccessCheck): CertState {
       kind: "proxied",
       reason:
         cert.not_in_use_reason ??
-        "A proxy in front of this control plane terminates TLS; the agent will verify the proxy's certificate normally.",
+        "A proxy in front of this control plane terminates TLS. The enrollment string carries no " +
+          "pin for it: the agent verifies the proxy's certificate against public CAs. A proxy " +
+          "presenting a self-signed certificate is not supported by this flow — use the manual " +
+          "CONTROL_PLANE_FINGERPRINT path on that agent instead.",
     };
   }
   if (cert.info?.self_signed) return { kind: "self_signed", fingerprint: cert.info.fingerprint_sha256 };
@@ -72,6 +70,16 @@ export function EnrollHostModal({
   const [minting, setMinting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<{ value: string; fingerprint: string | null; expiresAt: string | null } | null>(null);
+
+  // HostsTab mounts this modal once and toggles `open`, so state from a
+  // previous host (the plaintext token, an error, a stuck `minting` flag)
+  // would otherwise survive a close/reopen — reset it on every open.
+  useEffect(() => {
+    if (!open) return;
+    setResult(null);
+    setError(null);
+    setMinting(false);
+  }, [open]);
 
   useEffect(() => {
     if (!open || !token || !wssUrl) return;
@@ -98,6 +106,12 @@ export function EnrollHostModal({
 
   async function mint() {
     if (!token) return;
+    // Re-checked here, not just relied on via `canMint`: never spend the
+    // single-use token when the string cannot be composed.
+    if (!canMintFrom(origin)) {
+      setError(HTTP_ORIGIN_REFUSAL);
+      return;
+    }
     setMinting(true);
     setError(null);
     try {

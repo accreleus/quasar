@@ -33,6 +33,20 @@ export function agentWssUrl(origin: string): string | null {
   return null;
 }
 
+/** Refusal reason shared by the composer and by `mint()`'s pre-flight guard
+ *  (EnrollHostModal) for a plain-http origin. */
+export const HTTP_ORIGIN_REFUSAL =
+  "Open this page over HTTPS to enroll a remote host. From an http:// page the " +
+  "string would tell the agent to dial ws://, which carries the enrollment token " +
+  "and node secret in cleartext.";
+
+/** `mint()`'s defense-in-depth check: re-run right before a single-use token
+ *  is spent, so the origin is confirmed to compose a wss:// URL independent
+ *  of whatever gates the mint button in the UI. */
+export function canMintFrom(origin: string): boolean {
+  return agentWssUrl(origin) !== null;
+}
+
 /** RFC 4648 §5, no padding — the alphabet has no `.`, which is the separator. */
 export function base64UrlNoPad(s: string): string {
   const bytes = new TextEncoder().encode(s);
@@ -53,13 +67,7 @@ export function composeEnrollmentString(opts: {
 }): EnrollmentStringResult {
   const url = agentWssUrl(opts.origin);
   if (!url) {
-    return {
-      ok: false,
-      reason:
-        "Open this page over HTTPS to enroll a remote host. From an http:// page the " +
-        "string would tell the agent to dial ws://, which carries the enrollment token " +
-        "and node secret in cleartext.",
-    };
+    return { ok: false, reason: HTTP_ORIGIN_REFUSAL };
   }
   let fingerprint: string | null = null;
   if (opts.fingerprint !== null) {

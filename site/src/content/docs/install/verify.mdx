@@ -50,7 +50,9 @@ curl http://127.0.0.1:9091/health
 
 `connected: true` is the important field. It means the agent's WebSocket to the
 control plane is up. If it is false, the agent is running but cannot reach the
-control plane, so check `CONTROL_PLANE_URL` and `ENROLLMENT_TOKEN`.
+control plane, so check `CONTROL_PLANE_URL` and `ENROLLMENT_TOKEN` — or the
+single `QUASAR_ENROLLMENT` string that supplies both, minted from Admin,
+Fleet, Enroll host.
 
 ## 4. The GPU was found, and an encoder with it
 
