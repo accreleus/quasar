@@ -3338,7 +3338,7 @@ mod tests {
         "\t\ttcp dport 9090 accept\n",
         "\t\tip daddr 224.0.0.251 udp dport 5353 accept\n",
         "\t\tip6 daddr ff02::fb udp dport 5353 accept\n",
-        "\t\tip saddr 10.1.1.0/24 udp dport 32768-60999 accept\n",
+        "\t\tip saddr 192.0.2.0/24 udp dport 32768-60999 accept\n",
         "\t}\n",
         "}\n",
     );
@@ -3371,11 +3371,12 @@ mod tests {
         "  ports:\n",
         "  protocols:\n",
         "  rich rules:\n",
-        "\trule family=\"ipv4\" source address=\"10.1.1.0/24\" port port=\"32768-60999\" \
+        "\trule family=\"ipv4\" source address=\"192.0.2.0/24\" port port=\"32768-60999\" \
          protocol=\"udp\" accept\n",
     );
 
-    /// #67: the exact devbox configuration — filtering posture, documented rules present —
+    /// #67: the exact gpu-test host configuration — filtering posture, documented rules
+    /// present —
     /// must read as covered, not as a finding.
     #[test]
     fn nft_media_allow_sees_the_documented_scoped_accepts() {
@@ -3384,7 +3385,7 @@ mod tests {
                 assert!(evidence.contains("32768-60999"), "{evidence}");
                 assert!(evidence.contains("5353"), "{evidence}");
                 assert!(
-                    evidence.contains("10.1.1.0/24"),
+                    evidence.contains("192.0.2.0/24"),
                     "the rule's source scope must survive into the evidence — a rule scoped to \
                      the wrong subnet is the one thing this cannot judge, so the operator has \
                      to be able to read it: {evidence}"
@@ -3585,7 +3586,7 @@ mod tests {
         let out = concat!(
             "-P INPUT DROP\n",
             "-A INPUT -i lo -j ACCEPT\n",
-            "-A INPUT -s 10.1.1.0/24 -p udp -m udp --dport 32768:60999 -j ACCEPT\n",
+            "-A INPUT -s 192.0.2.0/24 -p udp -m udp --dport 32768:60999 -j ACCEPT\n",
             "-A INPUT -p udp -m udp --dport 5353 -j ACCEPT\n",
         );
         match iptables_media_allow(out, MEDIA) {
@@ -3606,7 +3607,7 @@ mod tests {
             tool: FirewallTool::Nftables,
             detail: "nftables input policy=reject".to_string(),
             media_allow: MediaAllow::Covered {
-                evidence: "ip saddr 10.1.1.0/24 udp dport 32768-60999 accept".to_string(),
+                evidence: "ip saddr 192.0.2.0/24 udp dport 32768-60999 accept".to_string(),
             },
         });
         let c = check_media_reachability(&env, Distro::Fedora);
