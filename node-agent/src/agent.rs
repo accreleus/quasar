@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
 use crate::capacity;
@@ -120,6 +120,10 @@ const ENROLLMENT_UNCONFIGURED_EXIT_DELAY: Duration = Duration::from_secs(5);
 
 /// Run the agent forever, reconnecting with exponential backoff on failure.
 pub async fn run(cfg: Config) {
+    // #12: precedence decisions the transport resolver made before tracing existed.
+    for w in &cfg.startup_warnings {
+        warn!(token = "cp-transport-precedence", "{w}");
+    }
     // #519: no persisted node_secret and no ENROLLMENT_TOKEN can never succeed, so
     // exit rather than retry forever. Checked before any other startup work.
     if let Err(msg) = enrollment_reachable(&cfg) {
@@ -622,9 +626,18 @@ async fn connect_and_run(
     image_mgr: &Arc<ImageManager>,
 ) -> anyhow::Result<()> {
     let url = cfg.ws_url();
-    info!("connecting to {url}");
+    info!(policy = ?cfg.transport, "connecting to {url}");
 
-    let (ws_stream, _) = connect_async(&url).await?;
+    // #12: the connector is chosen by policy, never by tokio-tungstenite's default — a
+    // wss:// URL must not silently validate against the OS/bundled roots when a pin was
+    // configured, and a ws:// URL is explicitly Plain.
+    let (ws_stream, _) = connect_async_tls_with_config(
+        &url,
+        None,
+        false,
+        Some(crate::cp_tls::ws_connector(&cfg.transport)),
+    )
+    .await?;
     let (mut tx, mut rx) = ws_stream.split();
 
     // agent-api.md: recorded images are verified against the docker daemon on startup
@@ -675,6 +688,9 @@ async fn connect_and_run(
             } else {
                 info!("reconnected as host {host_id}");
             }
+            // #12: the pin that just verified this connection outlives the enrollment
+            // string, so the operator can delete QUASAR_ENROLLMENT from the environment.
+            persist_pin_if_new(cfg);
             (host_id, heartbeat_interval_ms)
         }
         ControlMsg::Error { code, message } => {
@@ -2587,6 +2603,23 @@ fn choose_auth(cfg: &Config) -> anyhow::Result<Auth> {
     }
 }
 
+/// Write the verified pin beside the node secret the first time a pinned connection
+/// registers. Never overwrites: a changed pin is a rotation the operator performs
+/// explicitly through CONTROL_PLANE_FINGERPRINT, not something a reconnect learns.
+fn persist_pin_if_new(cfg: &Config) {
+    let crate::enrollment::TransportPolicy::Pinned(fp) = &cfg.transport else {
+        return;
+    };
+    let path = cfg.pin_path();
+    if std::path::Path::new(&path).exists() {
+        return;
+    }
+    match std::fs::write(&path, format!("{fp}\n")) {
+        Ok(()) => info!(token = "cp-tls-pin-persisted", path = %path, "control-plane certificate pin saved"),
+        Err(e) => warn!(token = "cp-tls-pin-persist-failed", path = %path, "could not save the certificate pin: {e}"),
+    }
+}
+
 fn persist_node_secret(path: &str, secret: &str) -> anyhow::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -2679,6 +2712,8 @@ mod tests {
             node_name: "test-node".to_string(),
             enrollment_token: enrollment_token.map(str::to_string),
             node_secret_path: node_secret_path.to_string(),
+            transport: crate::enrollment::TransportPolicy::Plaintext,
+            startup_warnings: Vec::new(),
         }
     }
 
