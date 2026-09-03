@@ -80,6 +80,25 @@ export interface MintInviteResponse {
   invite: Schemas["InviteMinted"];
 }
 
+// ── Host enrollment tokens (#12/#96) ─────────────────────────────────────────
+
+/** List shape — never carries the plaintext token. */
+export type HostEnrollment = Schemas["HostEnrollment"];
+
+export interface HostEnrollmentsResponse {
+  enrollments: HostEnrollment[];
+}
+
+/** The plaintext token, ONCE. The one-paste enrollment string is composed
+ *  client-side from it (`lib/enrollmentString`), never by the server. */
+export interface MintHostEnrollmentResponse {
+  enrollment: Schemas["HostEnrollmentMinted"];
+}
+
+/** GET /v1/admin/access-check — THIS request's reachability: the certificate in
+ *  use (with its fingerprint), origin, secure context. */
+export type AccessCheck = Schemas["AccessCheck"];
+
 // ── Encrypted secrets ─────────────────────────────────────────────────────────
 // Write-only on the wire: no type here can hold a secret value, and there is
 // deliberately no reveal endpoint.

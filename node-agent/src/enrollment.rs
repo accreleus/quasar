@@ -87,7 +87,11 @@ impl fmt::Debug for Fingerprint {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Blob {
     pub url: String,
-    pub fingerprint: Fingerprint,
+    /// `None` = the fingerprint segment was empty: the control plane serves a certificate
+    /// that chains to a real CA, so the agent verifies it through WebPKI instead of a pin.
+    /// The admin UI emits that form when the certificate is not self-signed — pinning a
+    /// Let's Encrypt leaf would break on every renewal.
+    pub fingerprint: Option<Fingerprint>,
     pub token: String,
 }
 
@@ -114,7 +118,11 @@ pub fn parse_blob(raw: &str) -> Result<Blob, String> {
         .next()
         .ok_or("enrollment string is missing its token segment")?;
 
-    let fingerprint = Fingerprint::parse(fp)?;
+    let fingerprint = if fp.is_empty() {
+        None
+    } else {
+        Some(Fingerprint::parse(fp)?)
+    };
     let url_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(url_b64)
         .map_err(|e| format!("enrollment string URL segment is not base64url: {e}"))?;
@@ -139,10 +147,10 @@ pub fn parse_blob(raw: &str) -> Result<Blob, String> {
 
 /// Compose a blob — the agent never does this in production (the admin UI does), but the
 /// round-trip is what the tests pin, and a harness minting its own is welcome to use it.
-pub fn compose_blob(url: &str, fingerprint: &Fingerprint, token: &str) -> String {
+pub fn compose_blob(url: &str, fingerprint: Option<&Fingerprint>, token: &str) -> String {
     format!(
         "{BLOB_PREFIX}.{}.{}.{token}",
-        fingerprint.to_colon_hex(),
+        fingerprint.map(Fingerprint::to_colon_hex).unwrap_or_default(),
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(url.as_bytes())
     )
 }
@@ -250,7 +258,7 @@ pub fn resolve(inputs: Inputs<'_>) -> Result<Resolved, String> {
         Some(raw) => Some(Fingerprint::parse(raw).map_err(|e| format!("persisted pin file: {e}"))?),
         None => None,
     };
-    let pin = match (env_pin, blob.as_ref().map(|b| b.fingerprint), persisted_pin) {
+    let pin = match (env_pin, blob.as_ref().and_then(|b| b.fingerprint), persisted_pin) {
         (Some(env), Some(inner), _) => {
             if env != inner {
                 warnings.push(format!(
@@ -371,22 +379,44 @@ mod tests {
     #[test]
     fn blob_round_trips_and_a_token_with_dots_survives() {
         let token = "abc.def.ghi";
-        let s = compose_blob("wss://cp.example:8443", &fp(), token);
+        let s = compose_blob("wss://cp.example:8443", Some(&fp()), token);
         assert!(s.starts_with(&format!("qenr1.{FP}.")), "{s}");
         let b = parse_blob(&s).unwrap();
         assert_eq!(b.url, "wss://cp.example:8443");
-        assert_eq!(b.fingerprint, fp());
+        assert_eq!(b.fingerprint, Some(fp()));
         assert_eq!(b.token, token);
     }
 
     #[test]
+    fn an_empty_fingerprint_segment_means_webpki_not_a_pin() {
+        let s = compose_blob("wss://play.example.com", None, "tok");
+        assert!(s.starts_with("qenr1..") , "{s}");
+        let b = parse_blob(&s).unwrap();
+        assert_eq!(b.fingerprint, None);
+        let r = resolve(Inputs {
+            blob: Some(&s),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(r.policy, TransportPolicy::WebPki);
+        // A pin from anywhere else still wins over the blob's "none".
+        let r = resolve(Inputs {
+            blob: Some(&s),
+            fingerprint: Some(FP),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(r.policy, TransportPolicy::Pinned(fp()));
+    }
+
+    #[test]
     fn blob_decoder_is_strict() {
-        let good = compose_blob("wss://cp.example", &fp(), "tok");
+        let good = compose_blob("wss://cp.example", Some(&fp()), "tok");
         assert!(parse_blob(&good.replacen("qenr1", "qenr2", 1))
             .unwrap_err()
             .contains("qenr1"));
         // A cleartext URL inside a blob is exactly the exposure the blob exists to close.
-        let ws = compose_blob("ws://cp.example", &fp(), "tok");
+        let ws = compose_blob("ws://cp.example", Some(&fp()), "tok");
         assert!(parse_blob(&ws).unwrap_err().contains("wss://"));
         assert!(parse_blob("qenr1.notafingerprint.d3NzOi8vY3A.tok").is_err());
         assert!(parse_blob("qenr1").unwrap_err().contains("fingerprint"));
@@ -400,7 +430,7 @@ mod tests {
 
     #[test]
     fn blob_alone_yields_a_pinned_wss_policy() {
-        let s = compose_blob("wss://cp.example:8443", &fp(), "tok");
+        let s = compose_blob("wss://cp.example:8443", Some(&fp()), "tok");
         let r = resolve(Inputs {
             blob: Some(&s),
             ..Default::default()
@@ -414,7 +444,7 @@ mod tests {
 
     #[test]
     fn explicit_url_and_fingerprint_override_the_blob_with_a_warning() {
-        let s = compose_blob("wss://cp.example:8443", &fp(), "tok");
+        let s = compose_blob("wss://cp.example:8443", Some(&fp()), "tok");
         let other = "11:".repeat(31) + "11";
         let r = resolve(Inputs {
             blob: Some(&s),
@@ -435,7 +465,7 @@ mod tests {
 
     #[test]
     fn a_differing_explicit_token_is_fatal_not_silently_resolved() {
-        let s = compose_blob("wss://cp.example", &fp(), "tok-a");
+        let s = compose_blob("wss://cp.example", Some(&fp()), "tok-a");
         let err = resolve(Inputs {
             blob: Some(&s),
             token: Some("tok-b"),
