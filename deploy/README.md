@@ -596,27 +596,18 @@ shared network needs.
 
 ### Multi-host: the client may have no route to the host that won
 
-**Before the second host: the agent link is plaintext only.** A node agent
-reaches the control plane over `CONTROL_PLANE_URL`, and the agent's WebSocket
-client is built without TLS — a `wss://` value fails to connect. On a single
-host that costs nothing, because the agent shares the host's network namespace
-and dials `ws://localhost`. A second host puts that link on the wire, carrying
-the enrollment token and then the per-node secret in cleartext; whoever reads
-them can register a host of their own and be handed sessions. Run the
-agent↔control-plane link over a private path you operate — a VPN, Tailscale, or
-a dedicated link — and never over a shared network. This is a current
-limitation, not a choice you configure.
-
-Several GPU hosts can register to one control plane, and the scheduler places
-each session on whichever host has capacity. That opens a case a single host
-never has: the client reaches the control plane, browses the library and
-launches fine, and then has no route to the machine that got the session,
-because that is a different machine on a different network. Nothing about this
-is exotic. It is what a two-host deployment looks like the first time the second
-host wins a placement.
-
-A relay is the standard answer to that case, and it is on the roadmap alongside
-multi-host setup. Until it lands, join both ends to one private network.
+**The agent link is TLS, pinned, and one paste (#12).** A second host joins with the
+enrollment string from Admin → Fleet → Enroll host, set as `QUASAR_ENROLLMENT` in that
+host's `deploy/.env`. It carries the control plane's `wss://` URL, the SHA-256 fingerprint
+of its certificate — first and verbatim, so you can compare it against the control plane's
+startup log before you paste — and a per-host enrollment token that is single-use and
+expires in an hour. Both agent clients (the websocket and the node-secret HTTP polls) pin
+that certificate; nothing about the self-signed default needs to change, and no name or IP
+needs adding to it for the agent's sake. After the first connection the pin is saved
+beside the node secret and the string can be removed. A `ws://` URL to another machine is
+refused — the enrollment token and node secret would cross the wire in cleartext — unless
+`QUASAR_ALLOW_PLAINTEXT_AGENT=1` says you own that network end to end. See
+`docs/configuration.md` for the precedence rules and the certificate-rotation path.
 
 ### Checking which path a session actually took
 

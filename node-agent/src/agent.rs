@@ -2568,10 +2568,10 @@ fn enrollment_reachable(cfg: &Config) -> Result<(), String> {
     match &cfg.enrollment_token {
         Some(t) if !t.trim().is_empty() => Ok(()),
         _ => Err(format!(
-            "no persisted node_secret at {} and ENROLLMENT_TOKEN is not set: this agent can \
-             never register as-is. Set ENROLLMENT_TOKEN to a token minted on the control \
-             plane's admin Hosts page (see docs/configuration.md#enrollment_token), then \
-             restart the container.",
+            "no persisted node_secret at {} and neither QUASAR_ENROLLMENT nor ENROLLMENT_TOKEN \
+             is set: this agent can never register as-is. Paste the enrollment string from \
+             Admin -> Fleet -> Enroll host into QUASAR_ENROLLMENT (or set ENROLLMENT_TOKEN; see \
+             docs/configuration.md#enrollment_token), then restart the container.",
             cfg.node_secret_path
         )),
     }

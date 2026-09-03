@@ -55,11 +55,18 @@ impl<In: Transport> Connector<In> for PolicyTlsConnector {
         // `ServerName` from the bare host: a DNS name OR an IP literal (rustls-pki-types 1.x
         // parses both). Under a pin the name is not verified against the certificate at all;
         // it only selects SNI, which rustls omits for IP literals.
-        let name: ServerName<'_> = details
+        let host = details
             .uri
             .authority()
             .ok_or(ureq::Error::Tls("control-plane URL has no authority"))?
-            .host_bare()
+            .host();
+        // `http`'s `Authority::host()` keeps the brackets on an IPv6 literal; `ServerName`
+        // wants them off.
+        let host = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        let name: ServerName<'_> = host
             .try_into()
             .map_err(|_| ureq::Error::Tls("control-plane host is not a valid server name"))?;
         let conn = ClientConnection::new(self.config.clone(), name.to_owned())?;
