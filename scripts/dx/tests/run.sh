@@ -741,6 +741,42 @@ else
   pass "inject:no-payload-executed" "no injected payload ran"
 fi
 
+printf '\n== leak-scan (issue tracker) ==\n'
+
+# The tree modes cannot see the OTHER public surface. These run the real script
+# against fixture payloads, because a live tracker that was just scrubbed proves
+# nothing about detection.
+LS="$(cd "$TESTS_DIR/../../dev" && pwd)/leak-scan.sh"
+
+ls_dirty="$(LEAK_SCAN_ISSUES_JSON="$FIXTURES/leak-issues-dirty.json" bash "$LS" --issues 2>&1)"
+ls_dirty_rc=$?
+if [ "$ls_dirty_rc" -eq 1 ] &&
+  printf '%s' "$ls_dirty" | grep -q 'issue#101 title' &&
+  printf '%s' "$ls_dirty" | grep -q 'issue#102 body' &&
+  printf '%s' "$ls_dirty" | grep -q 'issue#102 comment\[1\]' &&
+  ! printf '%s' "$ls_dirty" | grep -q 'issue#103'; then
+  pass "leakscan:issues-detects" "LAN IP in a title, domain in a body, home path + key name in a comment; the clean issue is not flagged"
+else
+  fail "leakscan:issues-detects" "rc=$ls_dirty_rc, output: $(printf '%s' "$ls_dirty" | head -n 6)"
+fi
+
+ls_clean="$(LEAK_SCAN_ISSUES_JSON="$FIXTURES/leak-issues-clean.json" bash "$LS" --issues 2>&1)"
+ls_clean_rc=$?
+if [ "$ls_clean_rc" -eq 0 ]; then
+  pass "leakscan:issues-clean" "role names and RFC 5737 stand-ins do not trip the guard"
+else
+  fail "leakscan:issues-clean" "rc=$ls_clean_rc, output: $(printf '%s' "$ls_clean" | head -n 6)"
+fi
+
+# A guard that reads 'clean' when it could not look is worse than no guard.
+LEAK_SCAN_ISSUES_JSON="$WORK/definitely-absent.json" bash "$LS" --issues >/dev/null 2>&1
+ls_missing_rc=$?
+if [ "$ls_missing_rc" -eq 2 ]; then
+  pass "leakscan:issues-fetch-failure-is-not-clean" "an unreadable payload exits 2, not 0"
+else
+  fail "leakscan:issues-fetch-failure-is-not-clean" "expected rc=2, got rc=$ls_missing_rc"
+fi
+
 printf '\n== redaction ==\n'
 
 # ── golden test ──────────────────────────────────────────────────────────────

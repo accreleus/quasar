@@ -14,6 +14,15 @@
 #
 #   scripts/dev/leak-scan.sh            # the tracked tree at HEAD's index
 #   scripts/dev/leak-scan.sh --staged   # staged content only (pre-push/pre-commit)
+#   scripts/dev/leak-scan.sh --issues   # GitHub issue titles/bodies/comments
+#
+# THE TRACKER IS THE OTHER PUBLIC SURFACE. The repo is not the only thing that
+# gets published: an issue body is just as public and just as permanently
+# archived, and on 2026-09-03 nine issues were found carrying real hostnames, a
+# LAN IP, an absolute /home/<user>/ path and the operator's dev domain — several
+# filed by an agent working in a DIFFERENT repo that had no such guard. The tree
+# modes cannot see any of that, so `--issues` runs the SAME patterns over the
+# tracker. It needs `gh` authenticated; it reads, never writes.
 #
 # Exit: 0 clean, 1 fingerprints found (each printed as path:line:match), 2 usage.
 #
@@ -30,12 +39,13 @@ MODE="tree"
 case "${1:-}" in
   "") ;;
   --staged) MODE="staged" ;;
+  --issues) MODE="issues" ;;
   -h | --help)
-    sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
   *)
-    echo "usage: $0 [--staged]" >&2
+    echo "usage: $0 [--staged|--issues]" >&2
     exit 2
     ;;
 esac
@@ -83,6 +93,13 @@ INTERNAL_BOUND=(
 # This script names every pattern it hunts for, so it always matches itself.
 SELF=':(exclude)scripts/dev/leak-scan.sh'
 
+# Same reason, one level out: the negative-test corpus for --issues has to CONTAIN
+# fingerprints or it proves nothing. Named as one exact file, never a directory —
+# a wildcard here would silently amnesty every future fixture. Its contents are
+# invented (someone/192.0.2-style stand-ins are useless for a detection test); it
+# describes no real host.
+ISSUES_TEST_CORPUS=':(exclude)scripts/dx/tests/fixtures/leak-issues-dirty.json'
+
 # The schema template's placeholders are RFC 5737 addresses, but keep it named
 # so a future placeholder choice cannot trip the guard.
 ALLOWLIST=(
@@ -94,11 +111,102 @@ ALTERNATION="$(
   echo "${PATTERNS[*]}"
 )"
 
+# --- issue-tracker mode -------------------------------------------------------
+#
+# Same patterns, other public surface. Hostnames alone are deliberately NOT
+# patterns here either (see the note above the list): what leaks is an address,
+# a key name, a home path or the personal domain.
+if [ "$MODE" = issues ]; then
+  if [ -z "${LEAK_SCAN_ISSUES_JSON:-}" ]; then
+    command -v gh >/dev/null 2>&1 || {
+      echo "leak-scan: --issues needs the gh CLI on PATH." >&2
+      exit 2
+    }
+    gh auth status >/dev/null 2>&1 || {
+      echo "leak-scan: --issues needs gh authenticated (gh auth login)." >&2
+      exit 2
+    }
+  fi
+
+  # One API call. Every issue, open and closed, with its comments. A failure to
+  # fetch must never read as 'clean' — that is the whole point of the guard.
+  #
+  # LEAK_SCAN_ISSUES_JSON is the TEST SEAM: a file holding the same payload shape,
+  # so the detection itself is verifiable offline instead of only against whatever
+  # the live tracker happens to contain today (which, right after a scrub, is
+  # exactly the payload that proves nothing).
+  if [ -n "${LEAK_SCAN_ISSUES_JSON:-}" ]; then
+    ISSUES_JSON="$(cat "$LEAK_SCAN_ISSUES_JSON")" || {
+      echo "leak-scan: --issues could not read $LEAK_SCAN_ISSUES_JSON" >&2
+      exit 2
+    }
+  else
+    ISSUES_JSON="$(gh issue list --state all --limit "${LEAK_SCAN_ISSUE_LIMIT:-500}" \
+      --json number,title,body,comments 2>/dev/null)" || {
+      echo "leak-scan: --issues could not read the tracker (gh issue list failed)." >&2
+      exit 2
+    }
+  fi
+
+  # Flatten to one grep-able line per source line, labelled the way the tree
+  # modes label a file: <location>:<line>:<text>.
+  FLAT="$(printf '%s' "$ISSUES_JSON" | jq -r '
+    .[] as $i
+    | ( [ {f: "title", t: ($i.title // "")}, {f: "body", t: ($i.body // "")} ]
+        + ( ($i.comments // [])
+            | to_entries
+            | map({f: "comment[\(.key + 1)]", t: (.value.body // "")}) ) )[]
+    | . as $part
+    | ($part.t | split("\n") | to_entries[])
+    | "issue#\($i.number) \($part.f):\(.key + 1):\(.value)"
+  ')" || {
+    echo "leak-scan: --issues could not parse the tracker payload (is jq installed?)." >&2
+    exit 2
+  }
+
+  set +e
+  HITS="$(printf '%s' "$FLAT" | grep --extended-regexp --color=never -e "$ALTERNATION")"
+  rc=$?
+  set -e
+  [ "$rc" -gt 1 ] && {
+    echo "leak-scan: grep failed (rc=$rc) while scanning issues" >&2
+    exit 2
+  }
+
+  if [ -z "$HITS" ]; then
+    echo "leak-scan: clean (issues) — no operator fingerprints in the tracker."
+    exit 0
+  fi
+
+  echo "leak-scan: FINGERPRINTS FOUND in the issue tracker." >&2
+  echo >&2
+  echo "$HITS" >&2
+  echo >&2
+  cat >&2 <<'EOF'
+An issue body is as public and as permanently archived as a commit. Edit the
+issue or comment; the same stand-ins apply as for the tree:
+
+  LAN address     -> a role name (gpu-test / aux-infra / deploy-only), or an
+                     RFC 5737 documentation address (192.0.2.x)
+  absolute path   -> a repo-relative path, or /path/to/quasar
+  personal domain -> a description ("the reporter's dev origin")
+
+NOTE: GitHub keeps an edit history, so editing reduces but does not erase the
+disclosure. Deleting the comment is the only full removal.
+
+Beware `gh api -f body=@file`: -f writes the LITERAL string "@file" and silently
+blanks the issue. Use `jq -Rs '{body: .}' < file | gh api <path> -X PATCH --input -`
+and read one object back afterwards.
+EOF
+  exit 1
+fi
+
 grep_args=(--line-number --extended-regexp --no-color -I -e "$ALTERNATION")
 [ "$MODE" = "staged" ] && grep_args=(--cached "${grep_args[@]}")
 
 set +e
-HITS="$(git grep "${grep_args[@]}" -- . "${INTERNAL_BOUND[@]}" "${ALLOWLIST[@]}" "$SELF" 2>/dev/null)"
+HITS="$(git grep "${grep_args[@]}" -- . "${INTERNAL_BOUND[@]}" "${ALLOWLIST[@]}" "$SELF" \
+  "$ISSUES_TEST_CORPUS" 2>/dev/null)"
 rc=$?
 set -e
 
