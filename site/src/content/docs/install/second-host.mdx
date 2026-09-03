@@ -1,6 +1,6 @@
 ---
 title: Add a second GPU host
-description: Multi-host is built into the control plane, but there is no supported way to install a second host yet.
+description: Enrolling a second host is one paste over TLS; the agent-only install package is what does not exist yet.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
@@ -21,7 +21,25 @@ recipe published today would be guesswork.
 
 Each host runs one node agent. It reports its GPUs, capacity and readiness to
 the control plane, and receives sessions from it. The pieces are in place; the
-packaging and the testing are not.
+packaging is not.
+
+**Enrolling a second host is one paste, over TLS.** In the admin console, open
+Fleet → Enroll host over `https://` and mint an enrollment string. It carries the
+control plane's `wss://` address, the fingerprint of its certificate — shown first
+and verbatim so you can compare it against the `fingerprint=` line in the control
+plane's startup log before you paste — and a per-host token that is single-use and
+expires in an hour. Set it as `QUASAR_ENROLLMENT` in the new host's `deploy/.env`.
+The agent pins that certificate for both its websocket and its HTTP polls, so
+nothing about the default self-signed certificate needs to change for the agent's
+sake. A `ws://` address to another machine is refused unless you explicitly opt in
+(`QUASAR_ALLOW_PLAINTEXT_AGENT=1`) — the enrollment token and node secret would
+otherwise cross the wire in cleartext. Details and the rotation path are in
+`docs/configuration.md` under `QUASAR_ENROLLMENT`.
+
+This was verified end to end on 2026-09-03: a second agent enrolled over `wss://`
+against a pinned self-signed certificate, a replayed string was refused, a wrong
+fingerprint was refused before any credential left the machine, and re-enrolling a
+name whose agent was still connected was refused.
 
 Hosts can use different local storage roots. If you want saves to follow a user
 between machines, back those roots with shared storage. Otherwise set the
