@@ -14,18 +14,15 @@
 //! pass continues; an id is confirmed only once its store is gone or provably
 //! absent (idempotent). A live mount is skipped and retried next pass.
 
+use crate::cp_http::CpClient;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::session::home;
-
-/// HTTP request timeout for the GC endpoints (small JSON payloads).
-const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One reapable home as returned by GET /v1/agent/storage/gc-pending. Built from
 /// the wire shape via [`PendingHome::from_wire`] (the wire field `ref` is a Rust
@@ -102,28 +99,16 @@ pub struct GcPass {
 /// `ContainerRuntime` — the docker-volume driver is hard-removed (#473); the
 /// local-driver reap path is plain `std::fs::remove_dir_all`.
 pub struct GcClient {
-    http_base: String,
-    node_name: String,
-    node_secret: String,
+    cp: CpClient,
     live: LiveRefs,
 }
 
+const GC_PENDING_PATH: &str = "/v1/agent/storage/gc-pending";
+const GC_CONFIRM_PATH: &str = "/v1/agent/storage/gc-confirm";
+
 impl GcClient {
-    pub fn new(http_base: String, node_name: String, node_secret: String, live: LiveRefs) -> Self {
-        GcClient {
-            http_base,
-            node_name,
-            node_secret,
-            live,
-        }
-    }
-
-    fn pending_url(&self) -> String {
-        format!("{}/v1/agent/storage/gc-pending", self.http_base)
-    }
-
-    fn confirm_url(&self) -> String {
-        format!("{}/v1/agent/storage/gc-confirm", self.http_base)
+    pub fn new(cp: CpClient, live: LiveRefs) -> Self {
+        GcClient { cp, live }
     }
 
     /// Run one full reap pass: pull → reap each → confirm reaped ids. Blocking;
@@ -264,18 +249,7 @@ impl GcClient {
     // ── HTTP ────────────────────────────────────────────────────────────────
 
     fn fetch_pending(&self) -> Result<Vec<PendingHome>, String> {
-        let mut resp = ureq::get(&self.pending_url())
-            .config()
-            .timeout_global(Some(HTTP_TIMEOUT))
-            .build()
-            .header("Authorization", &format!("Bearer {}", self.node_secret))
-            .header("X-Quasar-Node", &self.node_name)
-            .call()
-            .map_err(|e| format!("GET gc-pending: {e}"))?;
-        let parsed: PendingResp = resp
-            .body_mut()
-            .read_json()
-            .map_err(|e| format!("decode gc-pending: {e}"))?;
+        let parsed: PendingResp = self.cp.get_json(GC_PENDING_PATH)?;
         Ok(parsed
             .homes
             .into_iter()
@@ -285,22 +259,11 @@ impl GcClient {
 
     fn confirm(&self, ids: &[String]) -> Result<i64, String> {
         let body = serde_json::json!({ "home_ids": ids });
-        let mut resp = ureq::post(&self.confirm_url())
-            .config()
-            .timeout_global(Some(HTTP_TIMEOUT))
-            .build()
-            .header("Authorization", &format!("Bearer {}", self.node_secret))
-            .header("X-Quasar-Node", &self.node_name)
-            .send_json(body)
-            .map_err(|e| format!("POST gc-confirm: {e}"))?;
         #[derive(Deserialize)]
         struct ConfirmResp {
             deleted: i64,
         }
-        let parsed: ConfirmResp = resp
-            .body_mut()
-            .read_json()
-            .map_err(|e| format!("decode gc-confirm: {e}"))?;
+        let parsed: ConfirmResp = self.cp.post_json(GC_CONFIRM_PATH, &body)?;
         Ok(parsed.deleted)
     }
 }
@@ -317,20 +280,13 @@ pub const JOB_ID: &str = "home.gc";
 /// live-ref skip rule and the `QUASAR_HOME_ROOT` path-traversal refusal are
 /// unchanged; the pass still cannot fail the agent.
 pub struct HomeGcJobRunner {
-    http_base: String,
-    node_name: String,
-    node_secret: String,
+    cp: CpClient,
     live: LiveRefs,
 }
 
 impl HomeGcJobRunner {
-    pub fn new(http_base: String, node_name: String, node_secret: String, live: LiveRefs) -> Self {
-        HomeGcJobRunner {
-            http_base,
-            node_name,
-            node_secret,
-            live,
-        }
+    pub fn new(cp: CpClient, live: LiveRefs) -> Self {
+        HomeGcJobRunner { cp, live }
     }
 }
 
@@ -344,12 +300,7 @@ impl crate::jobs::JobRunner for HomeGcJobRunner {
         _params: &serde_json::Value,
         _abort: &crate::jobs::AbortFlag,
     ) -> crate::jobs::JobOutcome {
-        let client = GcClient::new(
-            self.http_base.clone(),
-            self.node_name.clone(),
-            self.node_secret.clone(),
-            self.live.clone(),
-        );
+        let client = GcClient::new(self.cp.clone(), self.live.clone());
         summarize(client.run_pass())
     }
 }

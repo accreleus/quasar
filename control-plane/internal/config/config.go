@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
@@ -32,7 +33,9 @@ type Config struct {
 
 	AuthTokenTTL time.Duration // bearer-token lifetime (AUTH_TOKEN_TTL, e.g. "24h")
 
-	EnrollmentToken string // pre-shared token for node-agent first enrollment (ENROLLMENT_TOKEN)
+	// Fleet-wide fallback for node-agent enrollment (ENROLLMENT_TOKEN). Optional:
+	// empty means only admin-minted per-host tokens enroll (#12).
+	EnrollmentToken string
 
 	// All three together provision the first admin at boot if none exists
 	// (control-api.md §Authorization). Never "first to register wins".
@@ -258,9 +261,14 @@ func Load() (*Config, error) {
 		c.DBLockTimeout = d
 	}
 
+	// Optional since #12: a deployment can enroll entirely with admin-minted per-host
+	// tokens, and requiring the fleet-wide static one would force every operator to keep
+	// the credential the minted tokens exist to replace. Empty never matches any presented
+	// token (agentws only compares when it is non-empty), so this disables the static path
+	// rather than opening it. Contract: control-api.md §Host enrollment tokens.
 	c.EnrollmentToken = os.Getenv("ENROLLMENT_TOKEN")
 	if c.EnrollmentToken == "" {
-		return nil, fmt.Errorf("ENROLLMENT_TOKEN is required")
+		slog.Warn("no static ENROLLMENT_TOKEN: only minted per-host tokens can enroll")
 	}
 
 	c.BootstrapAdminEmail = os.Getenv("BOOTSTRAP_ADMIN_EMAIL")

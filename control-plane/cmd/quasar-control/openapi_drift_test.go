@@ -20,6 +20,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/crud"
 	"github.com/accreleus/quasar/control-plane/internal/devices"
 	"github.com/accreleus/quasar/control-plane/internal/hostcfg"
+	"github.com/accreleus/quasar/control-plane/internal/hostenroll"
 	"github.com/accreleus/quasar/control-plane/internal/images"
 	"github.com/accreleus/quasar/control-plane/internal/invites"
 	"github.com/accreleus/quasar/control-plane/internal/jobs"
@@ -84,6 +85,9 @@ func nilDepServices(t *testing.T) *Services {
 		// jobs.Handler.Register only takes method values; nil store/registry/
 		// dispatcher/auditor are never dereferenced at registration.
 		jobsHandler: jobs.NewHandler(nil, nil, nil, log, nil),
+		// nil store: hostenroll.Handler.Register only takes method values, so the
+		// admin host-enrollment routes record with no database behind them.
+		enrollHandler: hostenroll.NewHandler(nil),
 	}
 }
 

@@ -33,6 +33,10 @@ The release install has you generate these values before first boot. The
 source-build `redeploy.sh` path generates missing secrets and never overwrites
 existing ones.
 
+`CONTROL_PLANE_URL` and `ENROLLMENT_TOKEN` can also be supplied together as
+one paste: mint `QUASAR_ENROLLMENT` from Admin, Fleet, Enroll host on an
+existing host and set only that on the new one. See below.
+
 ## Setup and identity
 
 | Variable | Default | Purpose |
@@ -43,6 +47,7 @@ existing ones.
 | `REGISTRATION_MODE` | `closed` | Seeds the registration mode on first boot of a fresh database only. The admin UI is authoritative afterwards. |
 | `PUBLIC_BASE_URL` | unset | Canonical public URL for invite links and proxied signaling. Set it when a proxy rewrites `Host`; otherwise the public host can be derived from forwarded or request headers. |
 | `NODE_NAME` | hostname | Agent side. A stable identity for this host. |
+| `QUASAR_ENROLLMENT` | unset | Agent side. The one-paste second-host string from Admin, Fleet, Enroll host: a `wss://` control-plane address, the certificate fingerprint the agent pins, and a single-use hour-long token, together. `CONTROL_PLANE_URL` / `ENROLLMENT_TOKEN`, if also set, override the values inside it. |
 
 ## Secrets
 
@@ -66,6 +71,8 @@ existing ones.
 | `LISTEN_ADDR` | `:8080` | HTTP listener. |
 | `CONTROL_PORT` | `8080` | Compose. Host port for HTTP. |
 | `QUASAR_TLS_PORT` | `8443` | Compose. Host port for HTTPS. |
+| `CONTROL_PLANE_FINGERPRINT` | unset | Agent side. Manual pin of the control plane's certificate (the SHA-256 it logs at startup), for rotating without re-enrolling. Overrides the fingerprint carried in `QUASAR_ENROLLMENT`. |
+| `QUASAR_ALLOW_PLAINTEXT_AGENT` | unset (off) | Agent side. A `wss://` `CONTROL_PLANE_URL` is pinned to that fingerprint and just works; a `ws://` URL to anything but localhost is refused unless this is `1`, since the enrollment token and node secret would cross it in cleartext. |
 
 ## Storage
 

@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/accreleus/quasar/control-plane/internal/console"
+	"github.com/accreleus/quasar/control-plane/internal/hostenroll"
 	"github.com/accreleus/quasar/control-plane/internal/hostcfg"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
 	"github.com/accreleus/quasar/control-plane/internal/ratelimit"
@@ -210,7 +211,12 @@ func NewHandler(pool *pgxpool.Pool, enrollmentToken string, log *slog.Logger, re
 		relay = NewRelayBus(log)
 	}
 	h := &Handler{
-		store:           &agentStore{pool: pool},
+		store: &agentStore{
+			pool: pool,
+			// The local half of the #96 liveness answer; the DB half is in enrollHost.
+			isAgentConnected: registry.IsConnected,
+			redeemEnrollment: hostenroll.Redeem,
+		},
 		log:             log,
 		enrollmentToken: enrollmentToken,
 		registry:        registry,
@@ -558,6 +564,15 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		switch {
 		case errors.Is(err, ErrInvalidEnrollmentToken), errors.Is(err, ErrInvalidNodeSecret):
 			h.writeError(conn, "auth_failed", "authentication failed")
+		case errors.Is(err, ErrHostAgentConnected):
+			// Deliberately distinct from auth_failed: the credential was fine, the
+			// REQUEST was refused. An operator re-enrolling a machine that is quietly
+			// already running needs to be told that, not sent to check their token (#96).
+			// The existing `auth_failed` code stays exactly as it was for bad credentials,
+			// so this adds a case rather than changing one.
+			h.writeError(conn, "auth_failed",
+				"a live agent is already registered under this node name; stop it before re-enrolling, "+
+					"or enroll under a different node_name")
 		case errors.Is(err, ErrHostNotFound):
 			h.writeError(conn, "host_not_found", "node not enrolled; use enrollment_token to enroll first")
 		default:

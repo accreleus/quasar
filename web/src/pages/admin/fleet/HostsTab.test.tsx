@@ -401,12 +401,18 @@ describe("HostsTab — enroll", () => {
     fireEvent.click(screen.getByRole("button", { name: "Enroll host" }));
   };
 
-  it("shows the agent's control plane URL, derived from this origin", async () => {
+  // #12: the modal composes a wss:// enrollment string from the page origin. jsdom's
+  // origin is plain http, and from there the string would carry ws:// — the cleartext
+  // link the enrollment string exists to close — so the modal refuses rather than
+  // derive a ws:// address, and never mints.
+  it("refuses to compose an enrollment string from a plain-http origin", async () => {
     await openEnroll();
 
     expect(screen.getByRole("dialog")).toBeTruthy();
-    expect(screen.getByText("Control plane URL")).toBeTruthy();
-    expect(screen.getByText("ws://localhost:3000")).toBeTruthy();
+    expect(screen.getByTestId("enroll-needs-https")).toBeTruthy();
+    expect(screen.queryByText(/ws:\/\/localhost/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Mint enrollment string" })).toBeNull();
+    expect(mocked.mintHostEnrollment).not.toHaveBeenCalled();
     expect(screen.getAllByText(/deploy\/\.env/, { selector: ".mono" }).length).toBeGreaterThan(0);
   });
 

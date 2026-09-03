@@ -4152,6 +4152,131 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/admin/hosts/enrollments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List minted host-enrollment tokens (never the plaintext token). */
+        get: {
+            parameters: {
+                query?: {
+                    /** @description `pending` returns only tokens that would still redeem right now: not revoked, not expired, and `used_count < max_uses`. An unrecognized value is `400 validation_failed` with code `invalid_state`. */
+                    state?: "all" | "pending";
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            enrollments?: components["schemas"]["HostEnrollment"][];
+                        };
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
+        put?: never;
+        /** Mint a host-enrollment token (plaintext returned once). */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        /** @description Bind the token to exactly this node_name. Absent = any node_name; empty string is 400 (it would silently mint an any-node token). */
+                        node_name?: string;
+                        /** @default 1 */
+                        max_uses?: number;
+                        /**
+                         * Format: date-time
+                         * @description Absent = one hour from mint. Must be in the future and at most 30 days out.
+                         */
+                        expires_at?: string;
+                        note?: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description Token minted. */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            enrollment?: components["schemas"]["HostEnrollmentMinted"];
+                        };
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/hosts/enrollments/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Revoke a host-enrollment token (idempotent). */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Revoked. */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/admin/storage/homes": {
         parameters: {
             query?: never;
@@ -7193,6 +7318,48 @@ export interface components {
             /** @description Present only when the server has a configured public base URL. */
             invite_url?: string;
             role: components["schemas"]["Role"];
+            max_uses: number;
+            used_count: number;
+            /** Format: date-time */
+            expires_at: string | null;
+            /** Format: date-time */
+            created_at: string;
+        };
+        /** @description List shape for a per-host enrollment token (#12/#96) — never carries the plaintext token. */
+        HostEnrollment: {
+            /** Format: uuid */
+            id: string;
+            /** @description First 8 hex of token_hash — a stable non-secret handle. */
+            token_prefix: string;
+            /** @description Bound node_name, or null for any. */
+            node_name: string | null;
+            max_uses: number;
+            used_count: number;
+            /** Format: date-time */
+            expires_at: string | null;
+            /** Format: date-time */
+            revoked_at: string | null;
+            /** Format: date-time */
+            last_used_at: string | null;
+            /** @description node_name presented at the most recent redemption; null until first redeemed. */
+            used_by_node_name: string | null;
+            note: string | null;
+            /** Format: date-time */
+            created_at: string;
+            /**
+             * Format: uuid
+             * @description Null once the minting admin has been deleted — the token outlives its minter.
+             */
+            created_by_user_id: string | null;
+            created_by_username: string | null;
+        };
+        /** @description POST /v1/admin/hosts/enrollments 201 body's `enrollment` — the plaintext token, ONCE. The admin UI composes the one-paste enrollment string (`qenr1.<FINGERPRINT>.<base64url(wss-url)>.<token>`) from this plus the page origin and the certificate fingerprint from /v1/admin/access-check; the server never composes it, because it does not know its own reachable address. */
+        HostEnrollmentMinted: {
+            /** Format: uuid */
+            id: string;
+            /** @description Plaintext, returned once, never retrievable again. */
+            token: string;
+            node_name: string | null;
             max_uses: number;
             used_count: number;
             /** Format: date-time */

@@ -36,6 +36,9 @@ import type {
   StorageProvider,
   InvitesResponse,
   MintInviteResponse,
+  HostEnrollmentsResponse,
+  MintHostEnrollmentResponse,
+  AccessCheck,
   RuntimePresetEnvelope,
   RuntimePresetsResponse,
   RuntimePresetWrite,
@@ -208,6 +211,45 @@ export function mintInvite(
 
 export function revokeInvite(token: string, id: string): Promise<void> {
   return apiFetch<void>(`/admin/invites/${id}`, { method: "DELETE", token });
+}
+
+// ── Host enrollment tokens (#12/#96) ─────────────────────────────────────────
+// Per-host, hashed, single-use by default, one-hour expiry. Same custody model
+// as invites: the plaintext is returned exactly once by mint and never again.
+
+/** Never returns the plaintext token. */
+export function listHostEnrollments(
+  token: string,
+  opts: { state?: InviteState } = {},
+): Promise<HostEnrollmentsResponse> {
+  return apiFetch<HostEnrollmentsResponse>(
+    `/admin/hosts/enrollments${queryString({ state: opts.state })}`,
+    { token },
+  );
+}
+
+/** `{}` mints a single-use, one-hour, any-node token. `node_name` binds it to
+ *  exactly one host. */
+export function mintHostEnrollment(
+  token: string,
+  req: { node_name?: string; max_uses?: number; expires_at?: string | null; note?: string } = {},
+): Promise<MintHostEnrollmentResponse> {
+  return apiFetch<MintHostEnrollmentResponse>("/admin/hosts/enrollments", {
+    method: "POST",
+    body: req,
+    token,
+  });
+}
+
+export function revokeHostEnrollment(token: string, id: string): Promise<void> {
+  return apiFetch<void>(`/admin/hosts/enrollments/${id}`, { method: "DELETE", token });
+}
+
+/** This request's reachability. The enroll-host flow reads the certificate
+ *  fingerprint from here, so the value it pins is the one THIS browser session
+ *  was served — and tells the operator to compare it against the startup log. */
+export function accessCheck(token: string): Promise<AccessCheck> {
+  return apiFetch<AccessCheck>("/admin/access-check", { token });
 }
 
 // ── App catalog (P2-08) ───────────────────────────────────────────────────────
