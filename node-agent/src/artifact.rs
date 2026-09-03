@@ -9,6 +9,8 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -32,7 +34,17 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// An older lockfile is taken over as belonging to an agent killed mid-provision. Long
 /// enough that it can never race a live download that is merely slow.
+///
+/// Only for a lockfile with no `heartbeat=` marker — one written by an agent predating
+/// #66. A heartbeating holder is reclaimed on [`stale_after_for`]'s much shorter window.
 pub const LOCK_STALE_AFTER: Duration = Duration::from_secs(90 * 60);
+
+/// How often a lock holder rewrites its lockfile to say it is still working.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Floor on the heartbeat takeover window, so a short interval cannot make takeover
+/// trigger-happy against a holder whose beat is merely delayed by a loaded box.
+pub const MIN_HEARTBEAT_STALE: Duration = Duration::from_secs(5 * 60);
 
 // ── url policy ───────────────────────────────────────────────────────────────
 
@@ -277,13 +289,62 @@ pub fn fetch(d: &Download<'_>) -> Result<String> {
     Ok(sha256)
 }
 
+// ── restart barrier (#66) ────────────────────────────────────────────────────
+
+/// Provisioning locks this process holds right now.
+///
+/// The two provisioners ([`crate::nvidia_volume`], [`crate::cuda_runtime`]) run on
+/// independent threads and each schedules a self-restart when it finishes. `exit(0)` from
+/// one kills the other mid-write: on a virgin host the small NVRTC fetch routinely wins
+/// that race and tore down a 441 MB driver extraction, stranding the lockfile behind it
+/// and leaving the host without Vulkan encode for the whole stale window (#66). A restart
+/// path must therefore wait for quiescence instead of exiting on its own schedule.
+static PROVISIONS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Poll cadence for [`wait_for_quiescence`].
+const QUIESCENCE_POLL: Duration = Duration::from_millis(200);
+
+/// How many provisions this process is running right now.
+pub fn provisioning_in_flight() -> usize {
+    PROVISIONS_IN_FLIGHT.load(Ordering::SeqCst)
+}
+
+/// Block until this process holds no provisioning lock, or `timeout` elapses; `true` if it
+/// went quiescent. Deliberately a poll rather than a condvar: the only caller is a restart
+/// thread about to end the process, where a missed notify would hang the restart forever
+/// and the extra precision buys nothing.
+pub fn wait_for_quiescence(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if provisioning_in_flight() == 0 {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(QUIESCENCE_POLL);
+    }
+}
+
 // ── lock ─────────────────────────────────────────────────────────────────────
 
 /// Cross-process guard: two agents sharing a volume must never both write it. `O_EXCL`
-/// create; a lockfile older than [`LOCK_STALE_AFTER`] is taken over.
+/// create; a lockfile whose holder has stopped touching it is taken over.
+///
+/// The holder rewrites its lockfile every [`HEARTBEAT_INTERVAL`] while it works, so a lock
+/// abandoned by a killed agent is reclaimed in minutes rather than [`LOCK_STALE_AFTER`].
+/// The heartbeat is advertised IN the lockfile (`heartbeat=<secs>`) and takeover only uses
+/// the short window when it sees that marker — a lock written by an agent too old to
+/// heartbeat keeps the long, conservative window, so a rolling upgrade can never let a new
+/// agent evict an old one that is merely slow.
+///
+/// PID liveness is deliberately NOT the signal: the agent runs in a container under
+/// `init: true`, so a restarted agent gets the same low PID its dead predecessor recorded
+/// and `/proc/<pid>` would report the corpse as alive.
 pub struct Lock {
     path: PathBuf,
     what: String,
+    stop: Arc<AtomicBool>,
 }
 
 impl Lock {
@@ -298,16 +359,15 @@ impl Lock {
                 .open(path)
             {
                 Ok(mut f) => {
-                    let _ = writeln!(
-                        f,
-                        "pid={} agent={}",
-                        std::process::id(),
-                        env!("CARGO_PKG_VERSION")
-                    );
+                    let _ = f.write_all(lock_body().as_bytes());
                     tracing::debug!(target: T, artifact = %what, path = %path.display(), "provisioning lock acquired");
+                    PROVISIONS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+                    let stop = Arc::new(AtomicBool::new(false));
+                    spawn_heartbeat(path.to_path_buf(), what.to_string(), Arc::clone(&stop));
                     return Ok(Lock {
                         path: path.to_path_buf(),
                         what: what.to_string(),
+                        stop,
                     });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
@@ -316,18 +376,23 @@ impl Lock {
                         .ok()
                         .and_then(|t| SystemTime::now().duration_since(t).ok())
                         .unwrap_or(Duration::ZERO);
-                    if age > LOCK_STALE_AFTER {
+                    let body = std::fs::read_to_string(path).unwrap_or_default();
+                    let window = stale_after_for(&body);
+                    if age > window {
                         tracing::warn!(
                             target: T, token = "artifact-stale-lock-taken",
-                            artifact = %what, age_s = age.as_secs(), path = %path.display(),
+                            artifact = %what, age_s = age.as_secs(),
+                            window_s = window.as_secs(), path = %path.display(),
                             "taking over a stale provisioning lock (a previous agent died mid-provision)"
                         );
                         let _ = std::fs::remove_file(path);
                         continue;
                     }
                     bail!(
-                        "another agent is already provisioning this artifact (lock held for {}s)",
-                        age.as_secs()
+                        "another agent is already provisioning this artifact (lock held for {}s, \
+                         taken over after {}s untouched)",
+                        age.as_secs(),
+                        window.as_secs()
                     );
                 }
                 Err(e) => return Err(anyhow!("acquire provisioning lock: {e}")),
@@ -337,9 +402,61 @@ impl Lock {
     }
 }
 
+/// The lockfile's contents. `pid`/`agent` are for the operator reading it; `heartbeat` is
+/// the load-bearing field — see [`stale_after_for`].
+fn lock_body() -> String {
+    format!(
+        "pid={} agent={} heartbeat={}\n",
+        std::process::id(),
+        env!("CARGO_PKG_VERSION"),
+        HEARTBEAT_INTERVAL.as_secs()
+    )
+}
+
+/// Rewrite the lockfile on a cadence so its mtime keeps saying "still working". Rewriting
+/// the body (rather than a `utimensat`) keeps this dependency-free and self-describing.
+fn spawn_heartbeat(path: PathBuf, what: String, stop: Arc<AtomicBool>) {
+    let _ = std::thread::Builder::new()
+        .name("quasar-provision-hb".into())
+        .spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(HEARTBEAT_INTERVAL);
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                if std::fs::write(&path, lock_body()).is_err() {
+                    tracing::debug!(target: T, artifact = %what, "provisioning lock heartbeat could not write");
+                    return;
+                }
+            }
+        });
+}
+
+/// How long a lockfile may go untouched before another agent may take it over.
+///
+/// A holder that advertises a heartbeat is reclaimed at five missed beats (floored at
+/// [`MIN_HEARTBEAT_STALE`] so a tiny interval cannot make takeover trigger-happy). A
+/// lockfile with no marker predates the heartbeat and keeps [`LOCK_STALE_AFTER`].
+pub fn stale_after_for(body: &str) -> Duration {
+    match heartbeat_interval(body) {
+        Some(interval) => (interval * 5).max(MIN_HEARTBEAT_STALE),
+        None => LOCK_STALE_AFTER,
+    }
+}
+
+fn heartbeat_interval(body: &str) -> Option<Duration> {
+    body.split_whitespace()
+        .find_map(|field| field.strip_prefix("heartbeat="))
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+}
+
 impl Drop for Lock {
     fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
         let _ = std::fs::remove_file(&self.path);
+        PROVISIONS_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
         tracing::debug!(target: T, artifact = %self.what, "provisioning lock released");
     }
 }
@@ -504,6 +621,66 @@ mod tests {
         assert!(!p.exists());
         let l2 = Lock::acquire(&p, "test").unwrap();
         drop(l2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_held_lock_is_counted_in_flight_and_blocks_a_restart_barrier() {
+        // #66: the restart path must see the driver-volume provision that the cudart
+        // thread's `exit(0)` would otherwise kill mid-extraction.
+        let dir = std::env::temp_dir().join(format!("quasar-artifact-barrier-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(".provision.lock");
+        let _ = std::fs::remove_file(&p);
+
+        let before = provisioning_in_flight();
+        let l = Lock::acquire(&p, "test").unwrap();
+        assert_eq!(provisioning_in_flight(), before + 1);
+        assert!(
+            !wait_for_quiescence(Duration::from_millis(300)),
+            "a restart must not be cleared to exit while a provision holds the lock"
+        );
+        drop(l);
+        assert_eq!(provisioning_in_flight(), before);
+        assert!(
+            wait_for_quiescence(Duration::from_millis(300)),
+            "the barrier must clear once the provision releases its lock"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_heartbeating_lock_is_reclaimed_far_sooner_than_a_legacy_one() {
+        // A holder that advertises a heartbeat is reclaimed at five missed beats...
+        let heartbeat = format!("pid=7 agent=0.1.0 heartbeat={}\n", HEARTBEAT_INTERVAL.as_secs());
+        assert_eq!(stale_after_for(&heartbeat), MIN_HEARTBEAT_STALE);
+        let slow = "pid=7 agent=0.1.0 heartbeat=120\n";
+        assert_eq!(stale_after_for(slow), Duration::from_secs(600));
+
+        // ...while a lockfile written by an agent predating #66 keeps the long window, so
+        // a rolling upgrade cannot evict an old agent that is merely slow.
+        for legacy in ["pid=7 agent=0.1.0\n", "", "pid=7 heartbeat=notanumber\n", "heartbeat=0\n"] {
+            assert_eq!(
+                stale_after_for(legacy),
+                LOCK_STALE_AFTER,
+                "a lockfile with no usable heartbeat marker must keep the conservative window: {legacy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn acquire_advertises_the_heartbeat_in_the_lockfile() {
+        let dir = std::env::temp_dir().join(format!("quasar-artifact-hb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(".provision.lock");
+        let _ = std::fs::remove_file(&p);
+
+        let l = Lock::acquire(&p, "test").unwrap();
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.contains(&format!("heartbeat={}", HEARTBEAT_INTERVAL.as_secs())), "body was {body:?}");
+        assert!(body.contains("pid="), "the operator-facing pid must survive: {body:?}");
+        assert_eq!(stale_after_for(&body), MIN_HEARTBEAT_STALE);
+        drop(l);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

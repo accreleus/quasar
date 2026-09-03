@@ -254,6 +254,15 @@ pub async fn run(cfg: Config) {
 /// one more capacity report reach the control plane before the process goes.
 const NVIDIA_VOLUME_RESTART_GRACE: Duration = Duration::from_secs(10);
 
+/// How long a self-restart waits for OTHER provisions to finish before giving up and
+/// leaving the restart to the next agent start (#66).
+///
+/// Sized for the slow case this exists to protect: a 441 MB driver installer downloading
+/// and extracting on a domestic link. Overshooting costs only a delayed restart of an
+/// agent that is already serving; undershooting kills a live provision, which is the
+/// defect itself.
+pub const PROVISION_QUIESCENCE_WAIT: Duration = Duration::from_secs(30 * 60);
+
 /// Kick off driver-volume auto-provisioning only when the readiness probe reports a
 /// real NVIDIA graphics gap.
 ///
@@ -342,6 +351,21 @@ fn spawn_cuda_runtime_provisioner(runtime: &ContainerRuntime) {
                  in place. The container restart policy brings the agent straight back."
             );
             std::thread::sleep(NVIDIA_VOLUME_RESTART_GRACE);
+            // #66: the driver-volume provisioner runs on its own thread and may still be
+            // extracting a 441 MB installer. NVRTC is the smaller fetch and routinely wins
+            // that race, so exiting on this thread's own schedule killed the extraction
+            // mid-write and stranded its lockfile. Wait for the volume to go quiescent.
+            if !crate::artifact::wait_for_quiescence(PROVISION_QUIESCENCE_WAIT) {
+                warn!(
+                    token = "cudart-agent-restart-deferred",
+                    waited_s = PROVISION_QUIESCENCE_WAIT.as_secs(),
+                    in_flight = crate::artifact::provisioning_in_flight(),
+                    "another provision is still in flight — NOT restarting; cudaconvert & co \
+                     will register on the next agent start instead. Killing a live provision \
+                     is worse than deferring the elements."
+                );
+                return;
+            }
             warn!(
                 token = "cudart-agent-restart-now",
                 "restarting node agent now"

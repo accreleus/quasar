@@ -2016,6 +2016,17 @@ pub fn restart_for_egl(grace: Duration) {
     }
     std::thread::spawn(move || {
         std::thread::sleep(grace);
+        // #66: symmetric with the cudart path — never exit while any provision is still
+        // writing into a shared volume, including the CUDA userspace fetch.
+        if !crate::artifact::wait_for_quiescence(crate::agent::PROVISION_QUIESCENCE_WAIT) {
+            tracing::warn!(
+                target: T, token = "drvvol-agent-restart-deferred",
+                in_flight = crate::artifact::provisioning_in_flight(),
+                "another provision is still in flight — NOT restarting; the EGL stack will \
+                 re-initialise on the next agent start instead"
+            );
+            return;
+        }
         tracing::warn!(target: T, token = "drvvol-agent-restart-now", "restarting node agent now");
         std::process::exit(0);
     });

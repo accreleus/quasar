@@ -55,7 +55,14 @@
 # Exit status is 0 only if every post-deploy verification passes. The final
 # line is a machine-readable summary the drift-check (qstack sync) parses:
 #   REDEPLOY env=<> scope=<> ref=<> sha=<short> bundle=<index-hash.js> \
-#            health=<ok|FAIL> catalog=<code> agent=<registered|MISSING> result=<OK|FAIL>
+#            health=<ok|FAIL> catalog=<code> agent=<registered|MISSING> \
+#            readiness=<ok|FAILED|unknown> codecs=<ok|degraded|pending|unknown> \
+#            result=<OK|WARN|FAIL>
+#
+# result=WARN means the deploy mechanically succeeded but the host is degraded
+# (failing readiness checks, a degraded codec plan, or a refused provisioning lock).
+# The exit status stays 0 there — the redeploy did what it was asked — so automation
+# that gates on the exit code is unchanged, while anything reading result= sees it.
 set -euo pipefail
 
 ENV="${1:-}"
@@ -903,7 +910,53 @@ else
   fail=1
 fi
 
-result=OK; [ "$fail" -eq 0 ] || result=FAIL
+# The agent can be running, registered and healthy while the HOST is unusable for
+# streaming: a provision that died mid-flight leaves no Vulkan encode and failing
+# readiness checks behind it, and #66 was diagnosed on a deploy where this script
+# printed a confident result=OK through exactly that for 90 minutes. Read the agent's
+# own verdict rather than inferring one from liveness.
+readiness=unknown
+codecs=unknown
+agent_log="$($DC logs --tail 400 quasar-node-agent 2>/dev/null || true)"
+if [ -n "$agent_log" ]; then
+  readiness=ok
+  codecs=ok
+  if printf '%s' "$agent_log" | grep -q 'readiness-checks-failed'; then
+    readiness=FAILED
+    echo "  WARN: the node-agent reports FAILING host readiness checks:"
+    printf '%s' "$agent_log" | grep 'readiness-checks-failed' | tail -1 | sed 's/^/        /'
+    echo "        Admin -> Hosts -> this host lists them with remediation."
+    degraded=1
+  fi
+  # A codec plan that is merely waiting on the driver volume is the expected first-boot
+  # state and self-clears on the agent's restart; only a genuinely degraded plan counts.
+  if printf '%s' "$agent_log" | grep -q 'vulkan-codec-plan-degraded'; then
+    codecs=degraded
+    echo "  WARN: the vulkan codec plan is DEGRADED — at least one enabled codec is not"
+    echo "        on the Vulkan encoder. Sessions still run (per-codec vendor fallback),"
+    echo "        but this host is not serving what it advertises."
+    degraded=1
+  elif printf '%s' "$agent_log" | grep -q 'vulkan-codec-plan-pending-driver-volume'; then
+    codecs=pending
+    echo "  note: codec plan pending the NVIDIA driver volume (expected on a first boot);"
+    echo "        the agent re-probes after it self-restarts."
+  fi
+  # A provision that was killed mid-write strands its lockfile, and every later attempt
+  # refuses until the takeover window passes. That is the #66 failure in one line.
+  if printf '%s' "$agent_log" | grep -q 'already provisioning this artifact'; then
+    echo "  WARN: a provisioning lock is being refused — a previous agent may have died"
+    echo "        mid-provision. The holder is taken over once its lockfile goes untouched;"
+    echo "        if nothing is actually downloading, remove the stale .provision.lock in"
+    echo "        the driver volume to reclaim it now."
+    degraded=1
+  fi
+else
+  echo "  note: could not read node-agent logs; readiness and codec plan not verified"
+fi
+
+result=OK
+[ "${degraded:-0}" -eq 0 ] || result=WARN
+[ "$fail" -eq 0 ] || result=FAIL
 echo
-echo "REDEPLOY env=$ENV scope=$SCOPE ref=$REF sha=$SHA bundle=$BUNDLE health=$health catalog=$catalog agent=$agent result=$result"
+echo "REDEPLOY env=$ENV scope=$SCOPE ref=$REF sha=$SHA bundle=$BUNDLE health=$health catalog=$catalog agent=$agent readiness=$readiness codecs=$codecs result=$result"
 exit "$fail"
