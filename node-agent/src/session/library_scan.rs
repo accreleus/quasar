@@ -33,6 +33,7 @@
 //! value — validation point 1 of 4 (the other three: control-plane ingest, a
 //! database CHECK, and the launch-time render).
 
+use crate::cp_http::CpClient;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -43,8 +44,6 @@ use tracing::debug;
 use crate::session::home;
 
 /// HTTP request timeout for the two library-scan endpoints (small JSON
-/// payloads), matching the GC reaper's `HTTP_TIMEOUT`.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Wall-clock budget for one scan's filesystem walk. Smaller than
 /// `session::home::DU_TIMEOUT` (10s) because this glob is shallow — a handful
@@ -129,26 +128,15 @@ impl ScanReport {
 /// it needs no `ContainerRuntime` or `LiveRefs` — a filesystem walk has no
 /// container or live-session interaction.
 pub struct LibraryScanClient {
-    http_base: String,
-    node_name: String,
-    node_secret: String,
+    cp: CpClient,
 }
 
+const SCAN_PENDING_PATH: &str = "/v1/agent/library/scan-pending";
+const SCAN_REPORT_PATH: &str = "/v1/agent/library/scan-report";
+
 impl LibraryScanClient {
-    pub fn new(http_base: String, node_name: String, node_secret: String) -> Self {
-        LibraryScanClient {
-            http_base,
-            node_name,
-            node_secret,
-        }
-    }
-
-    fn pending_url(&self) -> String {
-        format!("{}/v1/agent/library/scan-pending", self.http_base)
-    }
-
-    fn report_url(&self) -> String {
-        format!("{}/v1/agent/library/scan-report", self.http_base)
+    pub fn new(cp: CpClient) -> Self {
+        LibraryScanClient { cp }
     }
 
     /// Run one full pass: pull pending scans, run each, report the result.
@@ -184,31 +172,12 @@ impl LibraryScanClient {
     }
 
     fn fetch_pending(&self) -> Result<Vec<ScanTask>, String> {
-        let mut resp = ureq::get(&self.pending_url())
-            .config()
-            .timeout_global(Some(HTTP_TIMEOUT))
-            .build()
-            .header("Authorization", &format!("Bearer {}", self.node_secret))
-            .header("X-Quasar-Node", &self.node_name)
-            .call()
-            .map_err(|e| format!("GET scan-pending: {e}"))?;
-        let parsed: ScanPendingResp = resp
-            .body_mut()
-            .read_json()
-            .map_err(|e| format!("decode scan-pending: {e}"))?;
+        let parsed: ScanPendingResp = self.cp.get_json(SCAN_PENDING_PATH)?;
         Ok(parsed.scans)
     }
 
     fn post_report(&self, report: &ScanReport) -> Result<(), String> {
-        ureq::post(&self.report_url())
-            .config()
-            .timeout_global(Some(HTTP_TIMEOUT))
-            .build()
-            .header("Authorization", &format!("Bearer {}", self.node_secret))
-            .header("X-Quasar-Node", &self.node_name)
-            .send_json(report)
-            .map_err(|e| format!("POST scan-report: {e}"))?;
-        Ok(())
+        self.cp.post_json_no_body(SCAN_REPORT_PATH, report)
     }
 }
 

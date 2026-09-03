@@ -27,6 +27,7 @@
 //! [`JobPoller::run_pass`] enforces the same rule for anyone constructing a
 //! poller directly.
 
+use crate::cp_http::CpClient;
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,7 +40,6 @@ use tracing::{debug, info, warn};
 
 /// HTTP request timeout for the two job endpoints (small JSON payloads),
 /// matching `session::gc` and `session::library_scan`.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Initial delay before the first poll: must not contend with the
 /// session-handling burst that follows a (re)connect.
@@ -251,48 +251,23 @@ pub trait JobTransport: Send + Sync {
 /// The real transport: node-secret auth, identical in shape to
 /// `session::gc::GcClient` and `session::library_scan::LibraryScanClient`.
 pub struct HttpTransport {
-    http_base: String,
-    node_name: String,
-    node_secret: String,
+    cp: CpClient,
 }
 
 impl HttpTransport {
-    pub fn new(http_base: String, node_name: String, node_secret: String) -> Self {
-        HttpTransport {
-            http_base,
-            node_name,
-            node_secret,
-        }
+    pub fn new(cp: CpClient) -> Self {
+        HttpTransport { cp }
     }
 }
 
 impl JobTransport for HttpTransport {
     fn fetch_pending(&self) -> Result<Vec<PendingRun>, String> {
-        let mut resp = ureq::get(&format!("{}/v1/agent/jobs/pending", self.http_base))
-            .config()
-            .timeout_global(Some(HTTP_TIMEOUT))
-            .build()
-            .header("Authorization", &format!("Bearer {}", self.node_secret))
-            .header("X-Quasar-Node", &self.node_name)
-            .call()
-            .map_err(|e| format!("GET jobs/pending: {e}"))?;
-        let parsed: PendingResponse = resp
-            .body_mut()
-            .read_json()
-            .map_err(|e| format!("decode jobs/pending: {e}"))?;
+        let parsed: PendingResponse = self.cp.get_json("/v1/agent/jobs/pending")?;
         Ok(parsed.runs)
     }
 
     fn post_report(&self, report: &JobReport) -> Result<(), String> {
-        ureq::post(&format!("{}/v1/agent/jobs/report", self.http_base))
-            .config()
-            .timeout_global(Some(HTTP_TIMEOUT))
-            .build()
-            .header("Authorization", &format!("Bearer {}", self.node_secret))
-            .header("X-Quasar-Node", &self.node_name)
-            .send_json(report)
-            .map_err(|e| format!("POST jobs/report: {e}"))?;
-        Ok(())
+        self.cp.post_json_no_body("/v1/agent/jobs/report", report)
     }
 }
 
@@ -593,12 +568,7 @@ impl Drop for JobPollerGuard {
 /// poll for: an empty registry (host with no node_secret), or
 /// `QUASAR_JOB_POLL_SECS=0`. Polling anyway with an empty registry would put a
 /// request per host per minute on the control plane for nothing.
-pub fn spawn_job_poller(
-    http_base: String,
-    node_name: String,
-    node_secret: String,
-    registry: Arc<JobRegistry>,
-) -> Option<JobPollerGuard> {
+pub fn spawn_job_poller(cp: CpClient, registry: Arc<JobRegistry>) -> Option<JobPollerGuard> {
     if registry.is_empty() {
         debug!("job: no agent-side job runners registered — job poller not started");
         return None;
@@ -612,8 +582,7 @@ pub fn spawn_job_poller(
         interval.as_secs(),
         registry.job_ids().join(", ")
     );
-    let transport: Arc<dyn JobTransport> =
-        Arc::new(HttpTransport::new(http_base, node_name, node_secret));
+    let transport: Arc<dyn JobTransport> = Arc::new(HttpTransport::new(cp));
     let poller = JobPoller::new(transport, registry);
     // Taken BEFORE the poller moves into the task: the guard must reach the
     // flag of the poller that is actually running (#492).
@@ -939,9 +908,7 @@ mod tests {
             .unwrap();
         let guard = rt.block_on(async {
             spawn_job_poller(
-                "http://127.0.0.1:1".into(),
-                "tower".into(),
-                "secret".into(),
+                CpClient::new(&crate::enrollment::TransportPolicy::Plaintext, "http://127.0.0.1:1".into(), "tower".into(), "secret".into()),
                 Arc::new(JobRegistry::new()),
             )
         });

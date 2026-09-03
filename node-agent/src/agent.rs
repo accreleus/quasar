@@ -881,11 +881,7 @@ async fn connect_and_run(
     // agent. The agent never learns a user — it walks a path the control plane gives
     // it and reports the manifests it finds.
     let _library_scan_guard = match current_node_secret(cfg) {
-        Some(secret) => Some(spawn_library_scanner(
-            cfg.http_base_url(),
-            cfg.node_name.clone(),
-            secret,
-        )),
+        Some(secret) => Some(spawn_library_scanner(cp_client(cfg, secret))),
         None => {
             warn!(
                 token = "library-scan-no-secret",
@@ -903,22 +899,13 @@ async fn connect_and_run(
     // because an empty registry spawns no task at all.
     let _job_poller_guard = match current_node_secret(cfg) {
         Some(secret) => {
+            let cp = cp_client(cfg, secret);
             let mut registry = crate::jobs::JobRegistry::new();
             registry.register(warmup_runner);
             registry.register(std::sync::Arc::new(
-                crate::session::gc::HomeGcJobRunner::new(
-                    cfg.http_base_url(),
-                    cfg.node_name.clone(),
-                    secret.clone(),
-                    live_refs.clone(),
-                ),
+                crate::session::gc::HomeGcJobRunner::new(cp.clone(), live_refs.clone()),
             ));
-            crate::jobs::spawn_job_poller(
-                cfg.http_base_url(),
-                cfg.node_name.clone(),
-                secret,
-                std::sync::Arc::new(registry),
-            )
+            crate::jobs::spawn_job_poller(cp, std::sync::Arc::new(registry))
         }
         None => {
             warn!(
@@ -2526,11 +2513,19 @@ impl Drop for LibraryScanGuard {
 /// Spawn the Steam library discovery scanner: one pass 30 s after registration (so it
 /// does not contend with the post-reconnect burst), then every 60 s. Each pass runs on
 /// a blocking thread and swallows its own errors — a scan failure must never be fatal.
-fn spawn_library_scanner(
-    http_base: String,
-    node_name: String,
-    node_secret: String,
-) -> LibraryScanGuard {
+/// The node-secret HTTP client for this connection's pull channels: same transport policy
+/// as the websocket (#12), so a pinned host never has one client accept the control plane
+/// while the other refuses it.
+fn cp_client(cfg: &Config, node_secret: String) -> crate::cp_http::CpClient {
+    crate::cp_http::CpClient::new(
+        &cfg.transport,
+        cfg.http_base_url(),
+        cfg.node_name.clone(),
+        node_secret,
+    )
+}
+
+fn spawn_library_scanner(cp: crate::cp_http::CpClient) -> LibraryScanGuard {
     let handle = tokio::spawn(async move {
         sleep(Duration::from_secs(30)).await;
         // Poll cadence is NOT scan cadence. This ticker only asks whether a scan is
@@ -2541,8 +2536,7 @@ fn spawn_library_scanner(
         let mut ticker = tokio::time::interval(Duration::from_secs(60));
         ticker.tick().await; // discard the immediate first tick
         loop {
-            let client =
-                LibraryScanClient::new(http_base.clone(), node_name.clone(), node_secret.clone());
+            let client = LibraryScanClient::new(cp.clone());
             if let Err(e) = tokio::task::spawn_blocking(move || client.run_pass()).await {
                 warn!(
                     token = "library-scan-join-error",

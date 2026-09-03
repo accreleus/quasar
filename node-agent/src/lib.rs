@@ -9,6 +9,7 @@ pub mod agent;
 pub mod artifact;
 pub mod capacity;
 pub mod config;
+pub mod cp_http;
 pub mod cp_tls;
 /// Runtime-provisioned CUDA userspace (NVRTC) — what registers the `cuda*`
 /// GStreamer elements on an NVIDIA host (#545).
