@@ -150,7 +150,9 @@ pub fn parse_blob(raw: &str) -> Result<Blob, String> {
 pub fn compose_blob(url: &str, fingerprint: Option<&Fingerprint>, token: &str) -> String {
     format!(
         "{BLOB_PREFIX}.{}.{}.{token}",
-        fingerprint.map(Fingerprint::to_colon_hex).unwrap_or_default(),
+        fingerprint
+            .map(Fingerprint::to_colon_hex)
+            .unwrap_or_default(),
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(url.as_bytes())
     )
 }
@@ -258,7 +260,11 @@ pub fn resolve(inputs: Inputs<'_>) -> Result<Resolved, String> {
         Some(raw) => Some(Fingerprint::parse(raw).map_err(|e| format!("persisted pin file: {e}"))?),
         None => None,
     };
-    let pin = match (env_pin, blob.as_ref().and_then(|b| b.fingerprint), persisted_pin) {
+    let pin = match (
+        env_pin,
+        blob.as_ref().and_then(|b| b.fingerprint),
+        persisted_pin,
+    ) {
         (Some(env), Some(inner), _) => {
             if env != inner {
                 warnings.push(format!(
@@ -390,7 +396,7 @@ mod tests {
     #[test]
     fn an_empty_fingerprint_segment_means_webpki_not_a_pin() {
         let s = compose_blob("wss://play.example.com", None, "tok");
-        assert!(s.starts_with("qenr1..") , "{s}");
+        assert!(s.starts_with("qenr1.."), "{s}");
         let b = parse_blob(&s).unwrap();
         assert_eq!(b.fingerprint, None);
         let r = resolve(Inputs {
