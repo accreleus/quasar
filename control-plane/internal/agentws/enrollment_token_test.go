@@ -18,7 +18,7 @@ func seedAdmin(t *testing.T, pool *pgxpool.Pool) string {
 	err := pool.QueryRow(context.Background(), `
 		INSERT INTO users (email, username, password_hash, role)
 		VALUES ('enroll-admin@test', 'enroll-admin', 'x', 'admin')
-		ON CONFLICT (email) DO UPDATE SET username = EXCLUDED.username
+		ON CONFLICT (username) DO UPDATE SET role = EXCLUDED.role
 		RETURNING id::text`).Scan(&id)
 	if err != nil {
 		t.Fatalf("seed admin: %v", err)
