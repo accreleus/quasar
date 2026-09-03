@@ -1,0 +1,22 @@
+[
+  {
+    "number": 101,
+    "title": "stream fails on 10.1.1.7 after a restart",
+    "body": "Reproduced on the gpu-test host.\n\nNothing sensitive on this line.\n",
+    "comments": []
+  },
+  {
+    "number": 102,
+    "title": "a clean title",
+    "body": "Fetched the bundle from https://qdev.techanvil.net/assets/index.js and diffed it.\n",
+    "comments": [
+      { "body": "Harness lives at /home/someone/code/quasar/scripts and uses ~/.ssh/id_ed25519_loopback.\n" }
+    ]
+  },
+  {
+    "number": 103,
+    "title": "entirely clean issue",
+    "body": "Uses 192.0.2.5 and /path/to/quasar, which are the sanctioned stand-ins.\n",
+    "comments": [ { "body": "Role names only: gpu-test, aux-infra.\n" } ]
+  }
+]

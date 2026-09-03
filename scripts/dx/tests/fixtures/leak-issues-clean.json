@@ -1,0 +1,8 @@
+[
+  {
+    "number": 201,
+    "title": "readiness warns on firewalld hosts",
+    "body": "On the gpu-test host, the rule accepting UDP from 192.0.2.0/24 is present.\nSee /path/to/quasar/deploy/README.md.\n",
+    "comments": [ { "body": "Validated on the aux-infra host; origin is the reporter's dev origin.\n" } ]
+  }
+]

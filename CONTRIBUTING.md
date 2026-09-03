@@ -48,6 +48,12 @@ hosts by ROLE (`gpu-test`, `aux-infra`, `deploy-only`) rather than by name. In
 prose and examples use a role name, an RFC 5737 documentation address
 (`192.0.2.x`, `198.51.100.x`, `203.0.113.x`), or a `<placeholder>`.
 
+`scripts/dev/leak-scan.sh --issues` applies the same patterns to the GitHub
+issue tracker — titles, bodies and comments — because an issue is as public and
+as permanently archived as a commit, and issues arrive from agents working in
+other repos that have no such guard. It runs daily in CI; run it by hand after
+filing anything built from real host output.
+
 `scripts/dev/leak-scan.sh` enforces this over git-tracked content. **The
 authority is `.github/workflows/leak-scan.yml`**, which runs it on every push and
 pull request and is the one gate a contributor branch cannot rewrite. Everything

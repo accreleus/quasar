@@ -22,6 +22,12 @@ IP like `192.0.2.5`) before it goes out. This applies whether the issue is filed
 an agent working in this repo or by an agent in another repo (e.g. photon) that
 happens to write to this tracker.
 
+**This is enforced, not just documented:** `scripts/dev/leak-scan.sh --issues`
+runs the repo's fingerprint patterns over every issue title, body and comment,
+and runs daily in CI (`.github/workflows/leak-scan.yml`). Run it after filing
+anything transcribed from real host output — that transcription is how both the
+2026-09-03 tracker leak and the operator-subnet test-fixture leak happened.
+
 ## Conventions
 
 - **Create an issue**: `gh issue create --title "..." --body-file <file>`. Prefer `--body-file` with a heredoc over `--body` for anything multi-line — the bodies here carry fenced code, tables and backticks, and shell quoting mangles them.
