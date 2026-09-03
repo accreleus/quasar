@@ -24,7 +24,6 @@ use tracing::{debug, info, warn};
 
 use crate::session::home;
 
-
 /// One reapable home as returned by GET /v1/agent/storage/gc-pending. Built from
 /// the wire shape via [`PendingHome::from_wire`] (the wire field `ref` is a Rust
 /// keyword), so this struct itself carries no derive.

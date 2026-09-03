@@ -43,7 +43,6 @@ use tracing::debug;
 
 use crate::session::home;
 
-
 /// Wall-clock budget for one scan's filesystem walk. Smaller than
 /// `session::home::DU_TIMEOUT` (10s) because this glob is shallow — a handful
 /// of `steamapps` directories and a direct listing of `appmanifest_*.acf`

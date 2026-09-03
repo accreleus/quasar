@@ -38,7 +38,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
-
 /// Initial delay before the first poll: must not contend with the
 /// session-handling burst that follows a (re)connect.
 const INITIAL_DELAY: Duration = Duration::from_secs(30);
