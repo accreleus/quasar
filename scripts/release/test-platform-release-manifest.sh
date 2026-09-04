@@ -109,13 +109,10 @@ gen "$work/pre.json" 0.2.0-rc.1 >/dev/null || fail "generator failed on a prerel
   --expect-control-digest "$control_digest" --expect-agent-digest "$agent_digest" >/dev/null \
   || fail "generated prerelease manifest failed validation"
 
-# Byte-for-byte the fixture: key order, 2-space indent and trailing newline are
-# part of the format, and the fixture is what the schema doc shows.
-diff -u "$fixtures/valid.json" "$work/pre.json" >/dev/null 2>&1 && shape_ok=1 || shape_ok=0
-if [[ "$shape_ok" != 1 ]]; then
-  # schema_version differs by fixture design (74 in the doc, 12 in the fixture
-  # migrations dir); compare everything else.
-  python3 - "$fixtures/valid.json" "$work/pre.json" <<'PY'
+# The documented shape, field for field and in key order: the fixture is what
+# the schema doc shows. schema_version is compared separately because the fixture
+# migrations dir tops out at 0012 while the doc's example says 74.
+python3 - "$fixtures/valid.json" "$work/pre.json" <<'PY'
 import json
 import sys
 
@@ -125,7 +122,6 @@ assert got.pop("schema_version") == 12, "schema_version must be max NNNN over th
 assert list(want) == list(got), f"key order drifted: {list(got)}"
 assert want == got, f"generated manifest differs from the documented shape: {got}"
 PY
-fi
 grep -q '^  "format_version": 1,$' "$work/pre.json" || fail "generated manifest is not 2-space indented"
 [[ "$(tail -c 1 "$work/pre.json" | xxd -p)" == "0a" ]] || fail "generated manifest has no trailing newline"
 
