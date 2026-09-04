@@ -3,6 +3,10 @@ package auth
 // #92: deleting a user tombstones its homes AND nudges every host that held one,
 // so the backing store goes on the next agent poll instead of aging out of a
 // grace window nobody is waiting on. TEST_DATABASE_URL-gated (see setup_test.go).
+//
+// That the nudge leaves a run the agent can claim NOW is asserted in
+// cmd/quasar-control (TestReapNudgeLeavesAClaimableHomeGCRun): internal/jobs
+// imports this package, so a test here cannot drive the real dispatcher.
 
 import (
 	"context"
