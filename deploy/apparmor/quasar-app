@@ -1,0 +1,113 @@
+# quasar-app — AppArmor profile for Quasar APP containers (#76).
+#
+# Load it on the host, as root:
+#     sudo apparmor_parser -r -W deploy/apparmor/quasar-app
+# The node agent then picks it up by itself. It never loads this: loading policy
+# needs root ON THE HOST, and the agent has neither that nor any business with it.
+# deploy/enroll-host.sh writes and loads this file on an AppArmor host.
+#
+# WHY THIS FILE EXISTS
+# Docker confines every container with `docker-default`, which contains `deny mount,`.
+# Steam's pressure-vessel and Flatpak's bwrap set up their sandbox by creating a user
+# namespace and mounting inside it, so under docker-default `unshare -U true` succeeds
+# while `unshare -Urm true` dies with "cannot change root filesystem propagation:
+# Permission denied", and Steam reports "Steam now requires user namespaces to be
+# enabled". The agent's first answer was `--security-opt apparmor=unconfined`, which
+# drops EVERY protection docker-default carries, not just the mount deny. This profile
+# is docker-default with the mount family allowed and the escape routes that opens
+# closed again.
+#
+# DELTA FROM docker-default (everything else below is docker-default verbatim):
+#   + mount, umount, pivot_root, userns   the sandbox bootstrap
+#   + deny mount on the kernel-control filesystems
+#   + deny on the escape files BY BASENAME, so a fresh mount cannot launder them
+#
+# KNOWN LIMIT: a process may still mount a fresh proc or sysfs somewhere and reach
+# writable knobs under it that the path-based denies only cover at their usual paths.
+# The named escape files are covered at any path (`/**/…`); the rest of /proc/sys and
+# /sys is not. Closing that needs mount-point-scoped rules that bwrap's flag
+# combinations do not survive — see the mount block.
+#
+# The host sysctl prereq is unchanged and still required:
+# `kernel.apparmor_restrict_unprivileged_userns=0` (deploy/README.md). The `userns`
+# rule below is what a host would need to keep that restriction ON instead; that
+# combination is not validated, so do not rely on it.
+
+#include <tunables/global>
+
+profile quasar-app flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  network,
+  # docker-default is equally blanket here, and an AppArmor capability rule takes no
+  # target, so there is no narrower form to write: `capability sys_admin` is either on
+  # or off, and bwrap needs it inside its user namespace. The real bound is the
+  # kernel's — the agent launches app containers with `--cap-drop ALL` plus a named
+  # user-switch subset (node-agent/src/session/container.rs), and the capabilities
+  # bwrap holds inside its own user namespace carry no authority over the host.
+  capability,
+  file,
+  umount,
+
+  # Host (privileged) processes may send signals to container processes.
+  signal (receive) peer=unconfined,
+  # Container processes may send signals amongst themselves.
+  signal (send,receive) peer=quasar-app,
+
+  deny @{PROC}/* w,   # deny write for all files directly in /proc (not in a subdir)
+  # deny write to files not in /proc/<number>/** or /proc/sys/**
+  deny @{PROC}/{[^1-9],[^1-9][^1-9],[^1-9s][^1-9y][^1-9s],[^1-9][^1-9][^1-9][^1-9]*}/** w,
+  deny @{PROC}/sys/[^k]** w,  # deny /proc/sys except /proc/sys/k* (effectively /proc/sys/kernel)
+  deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,  # deny everything except shm* in /proc/sys/kernel/
+  deny @{PROC}/sysrq-trigger rwklx,
+  deny @{PROC}/kcore rwklx,
+
+  # ── delta: the sandbox bootstrap ───────────────────────────────────────────
+  # Allowed as verbs rather than enumerated by flags. `mount options=(…)` matches the
+  # flag set EXACTLY, and bwrap/pressure-vessel derive each remount's flags from the
+  # source mount, so any enumeration passes on one host filesystem and denies on the
+  # next. Ubuntu ships the same judgement: its own /etc/apparmor.d/bwrap-userns-restrict
+  # grants bare `mount, umount, pivot_root, userns` to /usr/bin/bwrap. What that opens
+  # is closed below instead.
+  mount,
+  pivot_root,
+  # AppArmor 4 (Ubuntu 24.04+) only; older parsers reject the rule and the loader in
+  # deploy/enroll-host.sh retries without this one line. Keep it alone on its line.
+  userns,
+
+  # Mounting any of these is a container escape, and no app-image sandbox mounts one:
+  # pressure-vessel and bwrap bind /sys read-only, they never mount it fresh. proc and
+  # sysfs are deliberately NOT here — Flatpak's bwrap mounts a fresh /proc, which is
+  # what the per-app `systempaths_unconfined` knob exists for.
+  deny mount fstype=securityfs,
+  deny mount fstype=debugfs,
+  deny mount fstype=tracefs,
+  deny mount fstype=cgroup,
+  deny mount fstype=cgroup2,
+  deny mount fstype=bpf,
+  deny mount fstype=configfs,
+  deny mount fstype=pstore,
+  deny mount fstype=efivarfs,
+
+  # By basename, at any path: with `mount,` allowed, the @{PROC} and /sys denies can be
+  # sidestepped by mounting proc or sysfs elsewhere and using the new path. These are
+  # the escape files that matters for, and no app image ships a file so named.
+  deny /**/sysrq-trigger rwklx,
+  deny /**/kcore rwklx,
+  deny /**/uevent_helper rwklx,
+  deny /**/core_pattern rwklx,
+  deny /**/release_agent rwklx,
+  # ── end of the delta ───────────────────────────────────────────────────────
+
+  deny /sys/[^f]*/** wklx,
+  deny /sys/f[^s]*/** wklx,
+  deny /sys/fs/[^c]*/** wklx,
+  deny /sys/fs/c[^g]*/** wklx,
+  deny /sys/fs/cg[^r]*/** wklx,
+  deny /sys/firmware/** rwklx,
+  deny /sys/devices/virtual/powercap/** rwklx,
+  deny /sys/kernel/security/** rwklx,
+
+  # suppress ptrace denials when using 'docker ps' or using 'ps' inside a container
+  ptrace (trace,read,tracedby,readby) peer=quasar-app,
+}

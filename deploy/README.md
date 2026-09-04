@@ -369,7 +369,7 @@ distribution with Docker should behave the same.
 | `/dev/kmsg` | Kernel ring buffer, passed read-only with `CAP_SYSLOG`, so an NVIDIA Xid or amdgpu fault reaches the session trace instead of only the host's `dmesg`. Optional: on a kernel without it, drop the device and the capability from the node-agent service and the `xid_visibility` readiness check reports `skip`, which fails nothing |
 | Node.js | **Not** required on the host — the web app builds inside a `node:22` container |
 | SELinux | Enforcing is fine; zero denials observed on Fedora 44 |
-| AppArmor (Ubuntu/Debian hosts) | **Ubuntu 24.04+ needs one sysctl.** Its default `kernel.apparmor_restrict_unprivileged_userns=1` blocks the unprivileged user namespace that Steam's container runtime (bwrap / pressure-vessel) creates, and the app exits with "Steam now requires user namespaces to be enabled" before producing video. This is a **host kernel** setting — a container shares the host's kernel and its LSM, so the app image's own distribution does not change it. Set `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` and persist it in `/etc/sysctl.d/99-quasar-userns.conf`; the `user_namespaces` readiness check reports this by name. The node agent additionally launches app containers with `--security-opt apparmor=unconfined` on AppArmor hosts, because the `docker-default` profile denies the mounts those sandboxes perform inside the namespace. SELinux hosts are unaffected |
+| AppArmor (Ubuntu/Debian hosts) | **Ubuntu 24.04+ needs one sysctl.** Its default `kernel.apparmor_restrict_unprivileged_userns=1` blocks the unprivileged user namespace that Steam's container runtime (bwrap / pressure-vessel) creates, and the app exits with "Steam now requires user namespaces to be enabled" before producing video. This is a **host kernel** setting — a container shares the host's kernel and its LSM, so the app image's own distribution does not change it. Set `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` and persist it in `/etc/sysctl.d/99-quasar-userns.conf`; the `user_namespaces` readiness check reports this by name. The `docker-default` profile also denies the mounts those sandboxes perform inside the namespace, so app containers need a profile that allows them: load the scoped `quasar-app` profile shipped in this directory (`sudo apparmor_parser -r -W deploy/apparmor/quasar-app` — see [App-container AppArmor profile](#app-container-apparmor-profile)). Without it the agent falls back to `--security-opt apparmor=unconfined` and says so on the readiness card. SELinux hosts are unaffected |
 | Network path between player and host | Same LAN segment, or a VPN that joins them. Media is peer-to-peer between browser and GPU host, so the control plane being reachable is not enough. See [Media reachability](#media-reachability-lan-or-vpn) |
 | Host firewall | The control plane's published ports go through Docker's DNAT and bypass the host firewall. The node agent uses host networking, so its WebRTC UDP **is** subject to it, and a default-deny firewall silently drops the video. See [Host firewall blocking WebRTC media](#host-firewall-blocking-webrtc-media) |
 
@@ -378,6 +378,52 @@ node-agent image resolves these itself (it ships avahi + nss-mdns and starts a
 resolver-only avahi-daemon at container start), so nothing is needed on the
 host. If ICE ever stalls at "checking", confirm the resolver is up:
 `docker exec <node-agent container> avahi-daemon --check`.
+
+### App-container AppArmor profile
+
+*AppArmor hosts only (Ubuntu, Debian, openSUSE). SELinux hosts skip this entirely.*
+
+Docker confines every container with its `docker-default` AppArmor profile, which
+contains `deny mount,`. Steam's pressure-vessel and Flatpak's `bwrap` build their sandbox
+by creating a user namespace and mounting inside it, so under `docker-default` the app
+dies at "Steam now requires user namespaces to be enabled" — `unshare -U true` succeeds
+while `unshare -Urm true` reports "cannot change root filesystem propagation: Permission
+denied".
+
+This directory ships `deploy/apparmor/quasar-app`: `docker-default` with that one family
+of operations allowed (`mount`, `umount`, `pivot_root`, `userns`) and the escape routes
+that opens closed again. Load it as root on the GPU host:
+
+```bash
+sudo apparmor_parser -r -W deploy/apparmor/quasar-app
+```
+
+`deploy/enroll-host.sh` does this for you on a host it enrolls, from
+`/opt/quasar-agent/apparmor/quasar-app`. Loading kernel policy needs root on the host, so
+the node agent never does it itself; it only reads which profiles are loaded and picks
+accordingly. Confirm with `sudo aa-status | grep quasar-app` — the profile should be
+listed in enforce mode — and the host's readiness card in Admin → Fleet shows
+`app_apparmor_profile`.
+
+The profile is loaded into the running kernel and is **gone after a reboot** unless it
+also lives in `/etc/apparmor.d`. Persist it with either
+`QUASAR_ENROLL_APPARMOR_PERSIST=1` on the enrollment command, or by hand:
+
+```bash
+sudo install -m 0644 deploy/apparmor/quasar-app /etc/apparmor.d/quasar-app
+sudo apparmor_parser -r -W /etc/apparmor.d/quasar-app
+```
+
+**Without the profile nothing breaks.** The agent falls back to
+`--security-opt apparmor=unconfined`, exactly as before this profile existed: sessions
+run, but app containers keep none of `docker-default`'s protections. That fallback is a
+`warn` on the readiness card, never a failure. `QUASAR_APP_APPARMOR_PROFILE=unconfined`
+in the agent's environment forces it back deliberately, for a title the profile breaks.
+
+Two things must both be true, and they are independent: this profile (app containers may
+mount inside their namespace) and the `kernel.apparmor_restrict_unprivileged_userns=0`
+sysctl from the prerequisites table (the host kernel lets them create the namespace at
+all).
 
 ### NVIDIA: order the CDI refresh after udev
 
@@ -681,7 +727,9 @@ The script prints each step. It checks the host the way the agent's readiness do
 including the Ubuntu 24.04+ AppArmor knob from #76, the NVIDIA Container Toolkit on an
 NVIDIA host), then writes `/opt/quasar-agent/docker-compose.yml` (the node-agent service
 alone, plus the NVIDIA overlay when needed) and a 0600 `/opt/quasar-agent/.env` — the
-only place the string lands — starts the one agent service and waits until it logs
+only place the string lands. On an AppArmor host it also writes
+`/opt/quasar-agent/apparmor/quasar-app` and loads it with `apparmor_parser` (`QUASAR_ENROLL_APPARMOR_PERSIST=1` additionally installs it in `/etc/apparmor.d` so it
+survives a reboot). Then it starts the one agent service and waits until it logs
 `enrolled as host`, or names the failure (an expired or used token, a certificate that
 does not match the pin, a container that exited). Re-running it updates that agent in
 place; it never adds a second one. It never edits the firewall: media reachability is
@@ -690,12 +738,13 @@ reported by the host's readiness in Admin → Fleet, with the exact rule.
 Inputs it reads: `QUASAR_ENROLLMENT` (required), `QUASAR_REF`, `QUASAR_AGENT_IMAGE`
 (an explicit digest reference, overriding the ref-derived tag), `QUASAR_DIR`
 (default `/opt/quasar-agent`), `NODE_NAME` (default: the hostname), `QUASAR_HOME_ROOT`
-(default `/var/lib/quasar/homes`), `QUASAR_RENDER_NODE`; `QUASAR_ENROLL_DRY_RUN=1`
-prints the plan and touches nothing. Read it first if you like: the same `curl` piped
+(default `/var/lib/quasar/homes`), `QUASAR_RENDER_NODE`; `QUASAR_ENROLL_APPARMOR_PERSIST=1`;
+`QUASAR_ENROLL_DRY_RUN=1` prints the plan and touches nothing. Read it first if you like: the same `curl` piped
 into `less` instead of `sh`, or `deploy/enroll-host.sh` in this tree.
 
 **Manual / air-gapped path.** `sh deploy/enroll-host.sh --print-compose` prints the
-agent-only Compose file and `--print-nvidia-overlay` the NVIDIA overlay; put them in a
+agent-only Compose file, `--print-nvidia-overlay` the NVIDIA overlay and
+`--print-apparmor-profile` the app-container AppArmor profile; put them in a
 directory with a `.env` that sets `QUASAR_ENROLLMENT` (and `NODE_NAME`,
 `QUASAR_HOME_ROOT`, `QUASAR_AGENT_IMAGE`) and `docker compose up -d`. The base
 `deploy/docker-compose.yml` is not a second-host install: its agent depends on the

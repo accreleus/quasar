@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::messages::ReadinessCheck;
+use crate::session::container;
 
 /// Check statuses. `&'static str`, not an enum: they cross the wire and the control plane
 /// stores them opaquely, so a new status must be additive on both sides. Open enum per
@@ -315,6 +316,7 @@ pub fn probe(env: &ProbeEnv) -> Vec<ReadinessCheck> {
         check_render_node(env, distro),
         check_uinput(env, distro),
         check_user_namespaces(env, distro),
+        check_app_apparmor_profile(env),
         // ── GPU host post-boot sanity (#493) ─────────────────────────────────
         check_host_render_node(env, distro),
         check_dri_node_app_access(env, distro),
@@ -998,6 +1000,14 @@ fn check_uinput(env: &ProbeEnv, _distro: Distro) -> ReadinessCheck {
 
 /// Unprivileged user namespaces, which `bwrap` and app-image sandboxes need to create. A
 /// kernel with these disabled fails app startup with an error that never reaches the operator.
+///
+/// This reads the AGENT's context, not an app container's, and that is the honest limit of
+/// what it can do (#76): every knob it reads is a HOST KERNEL setting, shared by both — a
+/// container has no private copy of `kernel.apparmor_restrict_unprivileged_userns` — so for
+/// these three the agent's answer IS the app's. The one thing that does diverge is the LSM
+/// profile applied per container at `docker run`, and probing that from here would mean
+/// launching a throwaway container on every capacity report. [`check_app_apparmor_profile`]
+/// reports that half directly instead.
 fn check_user_namespaces(env: &ProbeEnv, distro: Distro) -> ReadinessCheck {
     const ID: &str = "user_namespaces";
 
@@ -1075,6 +1085,106 @@ fn check_user_namespaces(env: &ProbeEnv, distro: Distro) -> ReadinessCheck {
             .to_string(),
         hint,
     )
+}
+
+/// Is the scoped `quasar-app` AppArmor profile loaded, so app containers can be confined by
+/// it instead of running `apparmor=unconfined` (#76)?
+///
+/// Never a `fail`: without the profile the agent falls back to unconfined and sessions run
+/// exactly as they did before, so this is a security posture the operator should see, not a
+/// broken host. `skip` on a non-AppArmor host — an SELinux box gets no `apparmor=` flag at
+/// all and nothing to load.
+fn check_app_apparmor_profile(env: &ProbeEnv) -> ReadinessCheck {
+    let over = container::app_apparmor_override();
+    let wanted = match over.as_deref() {
+        Some("unconfined") => None,
+        Some(name) => Some(name),
+        None => Some(container::APP_APPARMOR_PROFILE),
+    };
+    let state = wanted.map(|name| container::apparmor_profile_state(&env.root, name));
+    app_apparmor_check(
+        container::host_uses_apparmor_in(&env.root),
+        state,
+        over.as_deref(),
+    )
+}
+
+/// The verdict, as a pure function of the three inputs — the same three
+/// [`container::app_apparmor_choice`] decides the launch flag from, so the card and the
+/// launch cannot disagree. `state` is `None` when nothing is to be looked for (forced
+/// unconfined).
+fn app_apparmor_check(
+    host_uses_apparmor: bool,
+    state: Option<container::AppArmorProfileState>,
+    override_name: Option<&str>,
+) -> ReadinessCheck {
+    use container::AppArmorProfileState as S;
+    const ID: &str = "app_apparmor_profile";
+    let profile = container::APP_APPARMOR_PROFILE;
+    let load = container::APP_APPARMOR_LOAD_CMD;
+
+    if !host_uses_apparmor {
+        return skip(
+            ID,
+            "this host does not enforce AppArmor — app containers carry no AppArmor profile \
+             and there is nothing to load",
+        );
+    }
+    if override_name == Some("unconfined") {
+        return warn_check(
+            ID,
+            "app containers run APPARMOR-UNCONFINED because QUASAR_APP_APPARMOR_PROFILE is \
+             set to `unconfined`: they keep none of docker-default's protections"
+                .to_string(),
+            format!(
+                "Deliberate, and the escape hatch for a title the profile breaks. To go back \
+                 to the scoped profile, unset QUASAR_APP_APPARMOR_PROFILE in the agent's \
+                 environment and make sure {profile} is loaded: {load}"
+            ),
+        );
+    }
+    let named = override_name.unwrap_or(profile);
+    match state {
+        Some(S::Loaded) => pass(
+            ID,
+            format!("app containers are confined by the {named} AppArmor profile"),
+        ),
+        Some(S::NotLoaded) if override_name.is_some() => warn_check(
+            ID,
+            format!(
+                "QUASAR_APP_APPARMOR_PROFILE names the {named} AppArmor profile, which is not \
+                 loaded on this host — the container runtime refuses a launch against a \
+                 profile it cannot find, so every session here will fail to start"
+            ),
+            format!("Load {named} on the host, or unset the variable to fall back to {profile}/unconfined: {load}"),
+        ),
+        Some(S::NotLoaded) => warn_check(
+            ID,
+            format!(
+                "the {profile} AppArmor profile is not loaded, so app containers run \
+                 APPARMOR-UNCONFINED: sessions work, but they keep none of docker-default's \
+                 protections (no /proc or /sys write denies, no capability or ptrace \
+                 mediation)"
+            ),
+            format!("Load it on the HOST — the agent must not load kernel policy itself: {load}"),
+        ),
+        // Not "no profile": the agent cannot see the list at all, so it keeps the safe
+        // fallback and says which mount is missing rather than guessing.
+        Some(S::Unknown) | None => warn_check(
+            ID,
+            format!(
+                "cannot tell whether the {profile} AppArmor profile is loaded — the kernel's \
+                 profile list does not read from in here, so app containers take the safe \
+                 fallback and run APPARMOR-UNCONFINED"
+            ),
+            format!(
+                "The agent container needs the host's securityfs to answer this: \
+                 `/sys/kernel/security:/host/sys/kernel/security:ro` under the node-agent \
+                 service's `volumes:` (the shipped deploy/docker-compose.yml has it — a stack \
+                 that predates it needs the agent recreated). Then load the profile: {load}"
+            ),
+        ),
+    }
 }
 
 // ── GPU host post-boot sanity (#493) ─────────────────────────────────────────
@@ -2522,6 +2632,87 @@ mod tests {
         assert_eq!(
             get(&probe(&fedora.env(false, "")), "user_namespaces").status,
             PASS
+        );
+    }
+
+    /// #76's second half: the scoped `quasar-app` profile is the difference between an
+    /// AppArmor host confining app containers and running them with nothing at all, and only
+    /// a human with root on the host can load it — so the card has to say which it is.
+    #[test]
+    fn app_apparmor_profile_check_reports_the_confinement_app_containers_will_get() {
+        use container::AppArmorProfileState::*;
+
+        // Not an AppArmor host: nothing to load, and no `apparmor=` flag is passed at all.
+        assert_eq!(app_apparmor_check(false, Some(NotLoaded), None).status, SKIP);
+
+        let loaded = app_apparmor_check(true, Some(Loaded), None);
+        assert_eq!(loaded.status, PASS);
+        assert!(loaded.summary.contains("quasar-app"), "{loaded:?}");
+
+        // Never a failure: without the profile the agent falls back to unconfined and
+        // sessions run exactly as they did before #76.
+        for state in [NotLoaded, Unknown] {
+            let c = app_apparmor_check(true, Some(state), None);
+            assert_eq!(c.status, WARN, "{c:?}");
+            assert!(
+                c.remediation.contains("apparmor_parser -r -W"),
+                "the load command is the whole point of the row: {c:?}"
+            );
+        }
+        // "cannot read the list" must name the missing mount, not send the operator to
+        // re-load a profile that may already be there.
+        assert!(
+            app_apparmor_check(true, Some(Unknown), None)
+                .remediation
+                .contains("/host/sys/kernel/security"),
+        );
+
+        // Forced unconfined is a posture, not a fault — but it must not read as green.
+        let forced = app_apparmor_check(true, None, Some("unconfined"));
+        assert_eq!(forced.status, WARN);
+        assert!(forced.summary.contains("QUASAR_APP_APPARMOR_PROFILE"));
+
+        // An override naming a profile the host does not have breaks every launch.
+        let missing = app_apparmor_check(true, Some(NotLoaded), Some("site-profile"));
+        assert_eq!(missing.status, WARN);
+        assert!(missing.summary.contains("site-profile"), "{missing:?}");
+    }
+
+    /// The wiring, end to end on a fake root: AppArmor detection and the profile list are
+    /// read from the same tree the rest of the probe reads.
+    #[test]
+    fn app_apparmor_profile_check_reads_the_hosts_loaded_profile_list() {
+        let selinux = FakeRoot::new("apparmor-selinux");
+        selinux.file("dev/uinput", "");
+        assert_eq!(
+            get(&probe(&selinux.env(false, "")), "app_apparmor_profile").status,
+            SKIP,
+            "a Fedora/SELinux host has no AppArmor profile to load"
+        );
+
+        let ubuntu = FakeRoot::new("apparmor-loaded");
+        ubuntu
+            .file("dev/uinput", "")
+            .file("sys/module/apparmor/parameters/enabled", "Y\n")
+            .file(
+                "host/sys/kernel/security/apparmor/profiles",
+                "docker-default (enforce)\nquasar-app (enforce)\n",
+            );
+        assert_eq!(
+            get(&probe(&ubuntu.env(false, "")), "app_apparmor_profile").status,
+            PASS
+        );
+
+        let bare = FakeRoot::new("apparmor-not-loaded");
+        bare.file("dev/uinput", "")
+            .file("sys/module/apparmor/parameters/enabled", "Y\n")
+            .file(
+                "host/sys/kernel/security/apparmor/profiles",
+                "docker-default (enforce)\n",
+            );
+        assert_eq!(
+            get(&probe(&bare.env(false, "")), "app_apparmor_profile").status,
+            WARN
         );
     }
 

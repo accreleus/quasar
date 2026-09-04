@@ -11,7 +11,9 @@
 #   3. the host preflights that mirror node-agent/src/readiness.rs refuse BEFORE
 #      anything is written or started, naming the fix (#76's AppArmor sysctl);
 #   4. re-running updates the one installed agent instead of adding a second;
-#   5. the image is pinned from the ref the script was fetched at.
+#   5. the image is pinned from the ref the script was fetched at;
+#   6. the quasar-app AppArmor profile is written and loaded on an AppArmor host,
+#      and on no other (#76).
 #
 # Run: bash deploy/test-enroll-host.sh
 set -euo pipefail
@@ -89,21 +91,32 @@ shift
 exec "$@"
 MOCK
 chmod +x "$tmp/bin/sudo"
+# apparmor_parser stub: records argv so the load call can be asserted without
+# touching the workstation's kernel policy. MOCK_AA_MISSING=1 removes it from PATH.
+cat >"$tmp/bin/apparmor_parser" <<'MOCK'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${MOCK_AA_LOG:-/dev/null}"
+exit 0
+MOCK
+chmod +x "$tmp/bin/apparmor_parser"
 
 # run_installer <label> [ENV=val ...] — runs the script piped through sh the way
 # the one-liner does (stdin is the script), captures stdout+stderr and rc.
 run_installer() {
   local label="$1"; shift
   local log="$tmp/$label.docker.log"
-  : > "$log"
+  local aalog="$tmp/$label.aa.log"
+  : > "$log"; : > "$aalog"
   set +e
-  env PATH="$tmp/bin:$PATH" MOCK_DOCKER_LOG="$log" QUASAR_ENROLL_ROOT="${ROOT_DIR:-$tmp/root}" \
+  env PATH="$tmp/bin:$PATH" MOCK_DOCKER_LOG="$log" MOCK_AA_LOG="$aalog" \
+      QUASAR_ENROLL_ROOT="${ROOT_DIR:-$tmp/root}" \
       QUASAR_DIR="${INSTALL_DIR:-$tmp/install}" QUASAR_ENROLL_TAIL_SECS=1 \
       "$@" sh < "$script" > "$tmp/$label.out" 2>&1
   RC=$?
   set -e
   OUT="$(cat "$tmp/$label.out")"
   DOCKER_LOG="$(cat "$log")"
+  AA_LOG="$(cat "$aalog")"
 }
 
 # ── 1. the string is required and never cleartext ────────────────────────────
@@ -361,6 +374,44 @@ if [ "$RC" -eq 1 ] && grep -q "${esc}\[31m✘ enroll-host: the host restricts" <
   pass "tty: a failed preflight is a red cross with the remediation"
 else
   fail "tty failure" "rc=$RC $(tail -3 <<<"$OUT" | cat -v)"
+fi
+
+# ── 9. the app-container AppArmor profile (#76) ──────────────────────────────
+# The workstation's real apparmor_parser is shadowed by the stub in $tmp/bin for
+# every run here — nothing below can load policy on this machine.
+if diff -q <(sh "$script" --print-apparmor-profile) "$root/deploy/apparmor/quasar-app" >/dev/null; then
+  pass "--print-apparmor-profile is byte-identical to deploy/apparmor/quasar-app"
+else
+  fail "apparmor profile drift" "$(diff <(sh "$script" --print-apparmor-profile) "$root/deploy/apparmor/quasar-app" | head -8)"
+fi
+
+rm -rf "$tmp/install"; mk_root "$tmp/root"
+run_installer aa-absent QUASAR_ENROLLMENT="$WSS_BLOB" QUASAR_REF=v1.2.3 NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes" MOCK_AGENT_LOG="$ENROLLED_LOG"
+if [ "$RC" -eq 0 ] && [ ! -e "$tmp/install/apparmor" ] && [ -z "$AA_LOG" ] && ! grep -qi 'apparmor' <<<"$OUT"; then
+  pass "host without AppArmor: no profile written, apparmor_parser never called"
+else
+  fail "apparmor on a non-apparmor host" "aa=[$AA_LOG] $(grep -i apparmor <<<"$OUT" | head -3)"
+fi
+
+rm -rf "$tmp/install"; mk_root "$tmp/root"
+mkdir -p "$tmp/root/sys/module/apparmor/parameters"; printf 'Y\n' > "$tmp/root/sys/module/apparmor/parameters/enabled"
+run_installer aa-load QUASAR_ENROLLMENT="$WSS_BLOB" QUASAR_REF=v1.2.3 NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes" MOCK_AGENT_LOG="$ENROLLED_LOG"
+prof="$tmp/install/apparmor/quasar-app"
+if [ "$RC" -eq 0 ] && [ -f "$prof" ] && diff -q "$prof" "$root/deploy/apparmor/quasar-app" >/dev/null \
+   && grep -qxF -- "-r -W $prof" <<<"$AA_LOG" && grep -q 'loaded the quasar-app AppArmor profile' <<<"$OUT" \
+   && [ ! -e "$tmp/root/etc/apparmor.d/quasar-app" ]; then
+  pass "AppArmor host: profile written beside the compose, loaded with apparmor_parser -r -W, not persisted by default"
+else
+  fail "apparmor profile install" "rc=$RC aa=[$AA_LOG] prof=$( [ -f "$prof" ] && echo present || echo MISSING) out=$(grep -i apparmor <<<"$OUT" | head -3)"
+fi
+
+rm -rf "$tmp/install"
+run_installer aa-persist QUASAR_ENROLLMENT="$WSS_BLOB" QUASAR_REF=v1.2.3 NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes" MOCK_AGENT_LOG="$ENROLLED_LOG" QUASAR_ENROLL_APPARMOR_PERSIST=1
+if [ "$RC" -eq 0 ] && diff -q "$tmp/root/etc/apparmor.d/quasar-app" "$root/deploy/apparmor/quasar-app" >/dev/null \
+   && [ "$(stat -c %a "$tmp/root/etc/apparmor.d/quasar-app")" = 644 ] && grep -q 'persisted /etc/apparmor.d/quasar-app' <<<"$OUT"; then
+  pass "QUASAR_ENROLL_APPARMOR_PERSIST=1: the profile is also installed 0644 in /etc/apparmor.d"
+else
+  fail "apparmor persist" "rc=$RC $(grep -i apparmor <<<"$OUT" | head -3)"
 fi
 
 # Every run above must have kept the token off stdout/stderr.

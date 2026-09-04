@@ -28,7 +28,7 @@ export const READINESS_GROUPS: readonly ReadinessGroupDef[] = [
     label: "NVIDIA driver",
     ids: ["nvidia_egl_vendor_json", "nvidia_eglcore_library", "nvidia_lib32_gl", "driver_volume_version"],
   },
-  { key: "input", label: "Input & sandbox", ids: ["uinput", "user_namespaces"] },
+  { key: "input", label: "Input & sandbox", ids: ["uinput", "user_namespaces", "app_apparmor_profile"] },
   { key: "network", label: "Network", ids: ["media_reachability"] },
 ];
 
