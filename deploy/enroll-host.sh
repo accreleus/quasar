@@ -444,6 +444,9 @@ while :; do
     verdict=pin_mismatch; break
   elif printf '%s' "$logs" | grep -q 'boot-enrollment-unconfigured'; then
     verdict=unconfigured; break
+  elif printf '%s' "$logs" | grep -q 'CONTROL_PLANE_URL is required'; then
+    # An agent that never learned QUASAR_ENROLLMENT: the local image predates #12.
+    verdict=stale_image; break
   fi
   state="$(compose ps --format '{{.State}}' quasar-node-agent 2>/dev/null || true)"
   case "$state" in exited*|dead*) verdict=exited; break ;; esac
@@ -467,6 +470,8 @@ case "$verdict" in
     host_error "the certificate the control plane presented does not match the pin in the enrollment string (cp-tls-pin-mismatch). Mint a fresh string from the control plane's own page, or set CONTROL_PLANE_FINGERPRINT in $DIR/.env to the fingerprint= line from its startup log." ;;
   unconfigured)
     host_error "the agent started without an enrollment (boot-enrollment-unconfigured) — $DIR/.env did not reach it. Check 'docker compose --project-directory $DIR config'." ;;
+  stale_image)
+    host_error "the agent image on this host ($image) predates the enrollment string: it asks for CONTROL_PLANE_URL instead of reading QUASAR_ENROLLMENT. Give it a current image — QUASAR_AGENT_IMAGE=<published reference>, or build/copy quasar-node-agent:latest from the control plane's tree — then re-run this command." ;;
   exited)
     host_error "the agent container exited. Its log: docker compose --project-directory $DIR logs quasar-node-agent" ;;
   *)
