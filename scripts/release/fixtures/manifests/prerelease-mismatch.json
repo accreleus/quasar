@@ -1,0 +1,20 @@
+{
+  "format_version": 1,
+  "version": "0.2.0-rc.1",
+  "prerelease": false,
+  "source_commit": "cccccccccccccccccccccccccccccccccccccccc",
+  "built_at": "2026-09-04T12:00:00Z",
+  "schema_version": 74,
+  "components": [
+    {
+      "name": "control-plane",
+      "image": "ghcr.io/accreleus/quasar/quasar-control-plane",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "node-agent",
+      "image": "ghcr.io/accreleus/quasar/quasar-node-agent",
+      "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ]
+}
