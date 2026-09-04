@@ -1080,7 +1080,10 @@ fn check_host_render_node(env: &ProbeEnv, distro: Distro) -> ReadinessCheck {
     }
     let count = host_render_node_count(env);
     if count > 0 {
-        return pass(ID, format!("host kernel created {count} DRM render node(s)"));
+        return pass(
+            ID,
+            format!("host kernel created {count} DRM render node(s)"),
+        );
     }
     let initramfs = match distro {
         Distro::Debian => "sudo update-initramfs -u -k all",
