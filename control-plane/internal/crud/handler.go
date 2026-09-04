@@ -345,7 +345,7 @@ func (h *Handler) handleListApps(w http.ResponseWriter, r *http.Request) {
 
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"items":       items,
-		"next_cursor": nextCursor,
+		"next_cursor": nullableCursor(nextCursor),
 	})
 }
 
@@ -1030,6 +1030,15 @@ func optionalUUIDArg(id *string, present bool) **string {
 	return &id
 }
 
+// nullableCursor maps the store's "" (no further page) to JSON null, per
+// control-api.md / openapi.yaml `next_cursor: <opaque>|null` — never "".
+func nullableCursor(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
 func (h *Handler) handleListHosts(w http.ResponseWriter, r *http.Request) {
 	cursor := r.URL.Query().Get("cursor")
 	limit := int32(50)
@@ -1050,7 +1059,7 @@ func (h *Handler) handleListHosts(w http.ResponseWriter, r *http.Request) {
 
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"items":       items,
-		"next_cursor": nextCursor,
+		"next_cursor": nullableCursor(nextCursor),
 	})
 }
 
@@ -1089,7 +1098,7 @@ func (h *Handler) handleAdminListApps(w http.ResponseWriter, r *http.Request) {
 	for _, a := range apps {
 		items = append(items, appToAdminResp(a))
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": nextCursor})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": nullableCursor(nextCursor)})
 }
 
 func (h *Handler) handleDeleteApp(w http.ResponseWriter, r *http.Request) {
