@@ -737,14 +737,16 @@ accept rules, not just the input chain's posture: a default-deny host whose
 rules already cover the ephemeral UDP range *and* UDP/5353 passes, quoting the
 rules it matched; a host covering only one of the two warns and names the
 missing half; a host with no media rule at all gets a `WARN` naming the exact
-rule to add for the firewall tool it detected. All of it surfaces in
-Admin → Hosts.
+rule to add for the firewall tool it detected. A host with no inbound filtering
+at all — no input chain in the ruleset, which is what a machine with no firewall
+configured looks like — passes as well. All of it surfaces in Admin → Hosts.
 
 Two limits are worth knowing. It cannot tell whether a rule's **source scope**
 actually reaches your clients — a rule scoped to the wrong subnet still reads as
 covered, so if video never arrives with a green check, look at the scope first.
 And detection degrades to "no finding" (not a failure) when no firewall client
-tool is reachable from inside the container, which is the common case — so the
+tool answers at all: `nft` ships in the agent image and the compose file grants
+it `CAP_NET_ADMIN`, so that now means the probe itself could not run, and the
 absence of a warning is not proof the host is open.
 
 **What needs to be reachable.** Two things, both inbound to the GPU host from
