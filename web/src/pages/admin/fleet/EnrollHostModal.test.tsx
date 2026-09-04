@@ -65,7 +65,7 @@ describe("EnrollHostModal", () => {
     expect(cmd.startsWith(`curl -fsSL -k --pinnedpubkey 'sha256//${PIN}' ${SCRIPT} | QUASAR_ENROLLMENT='qenr1.${FP}.`)).toBe(true);
     expect(cmd.endsWith(`.tok.with.dots' QUASAR_REF=${REF} sh`)).toBe(true);
     expect(cmd).not.toMatch(/githubusercontent/);
-    expect(screen.getByText(/--pinnedpubkey/)).toBeTruthy();
+    expect(screen.getByText(/makes curl trust only the key above/)).toBeTruthy();
     expect(mocked.mintHostEnrollment).toHaveBeenCalledWith("tok", {});
     // The fingerprint stays on screen next to the command for the eye check.
     expect(screen.getByTestId("enroll-fingerprint").textContent).toBe(FP);

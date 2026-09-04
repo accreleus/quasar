@@ -39,18 +39,18 @@ const (
 // Info is everything public about the certificate in force — all of it already
 // disclosed by any TLS handshake. No field can hold key material.
 type Info struct {
-	Source            string    `json:"source"`
-	FingerprintSHA256 string    `json:"fingerprint_sha256"`
+	Source            string `json:"source"`
+	FingerprintSHA256 string `json:"fingerprint_sha256"`
 	// SPKISHA256 is curl's --pinnedpubkey form (sha256//<this>), so the enroll-host
 	// one-liner can pin the key instead of trusting a CA. Contract: control-api.md.
-	SPKISHA256 string    `json:"spki_sha256"`
-	Subject    string    `json:"subject"`
-	Issuer            string    `json:"issuer"`
-	NotBefore         time.Time `json:"not_before"`
-	NotAfter          time.Time `json:"not_after"`
-	DaysUntilExpiry   int       `json:"days_until_expiry"`
-	DNSNames          []string  `json:"dns_names"`
-	IPAddresses       []string  `json:"ip_addresses"`
+	SPKISHA256      string    `json:"spki_sha256"`
+	Subject         string    `json:"subject"`
+	Issuer          string    `json:"issuer"`
+	NotBefore       time.Time `json:"not_before"`
+	NotAfter        time.Time `json:"not_after"`
+	DaysUntilExpiry int       `json:"days_until_expiry"`
+	DNSNames        []string  `json:"dns_names"`
+	IPAddresses     []string  `json:"ip_addresses"`
 	// ChainLength counts the leaf plus any intermediates supplied with it.
 	ChainLength int `json:"chain_length"`
 	// SelfSigned reports whether the leaf issued itself — the reason a browser warns.
