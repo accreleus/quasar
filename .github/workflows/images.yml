@@ -1120,10 +1120,11 @@ jobs:
             --registry-ns "$REGISTRY_NS" \
             --output "$manifest"
 
-          # The generator already validated its own output. Validating again with
-          # the --expect-* flags is a different assertion: it ties the file to
-          # THIS run's tag and THIS run's build digests, so a stale or hand-edited
-          # manifest cannot be uploaded.
+          # The generator already ran this exact validation on its own output.
+          # Running it again here, from the job rather than from inside the
+          # generator, is deliberate belt-and-braces: the upload step below never
+          # depends on the generator's internals to have tied the file to THIS
+          # run's tag and build digests.
           bash scripts/release/validate-platform-release-manifest.sh "$manifest" \
             --expect-version "$VERSION" \
             --expect-control-digest "$CONTROL_DIGEST" \

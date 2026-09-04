@@ -2,7 +2,8 @@
 
 ## This is early, dev-mode software
 
-Quasar has no tagged releases and is under active development. Interfaces move,
+Quasar is under active development; tagged releases exist (see `CHANGELOG.md`, and
+`deploy/README.md` "Publishing a platform release" for how one is cut), but interfaces move,
 migrations are one-way (see `CLAUDE.md`), and some documented invariants exist
 specifically because a workaround caused real pain earlier. Read `CLAUDE.md` and
 `AGENTS.md` before making non-trivial changes; they cover the architecture

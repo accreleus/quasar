@@ -54,10 +54,10 @@ type Config struct {
 	// reachable by accident in production. Build it with ParseHostList.
 	AllowHosts map[string]struct{}
 
-	// Timeout bounds one whole request; zero means DefaultTimeout.
+	// Timeout bounds one whole request; zero or negative means DefaultTimeout.
 	Timeout time.Duration
 
-	// MaxBodyBytes bounds every response body; zero means DefaultMaxBodyBytes.
+	// MaxBodyBytes bounds every response body; zero or negative means DefaultMaxBodyBytes.
 	MaxBodyBytes int64
 
 	// LookupIP resolves a host for the DNS-rebind guard. Test seam: nil uses the
@@ -102,19 +102,6 @@ func New(cfg Config) (*Client, error) {
 		hc.Transport = cfg.transport
 	}
 	return &Client{http: hc, allowHosts: allow, maxBody: maxBody}, nil
-}
-
-// NewGuardedHTTPClient returns the raw hardened *http.Client — transport-level
-// protections only (timeout, no redirects, DNS-rebind dial guard), with no host
-// allowlist and no body bound.
-//
-// It exists for callers that still need a plain *http.Client and enforce the
-// remaining rules themselves. New callers should use New and Client.Do instead.
-func NewGuardedHTTPClient(timeout time.Duration, lookup IPLookup) *http.Client {
-	if timeout <= 0 {
-		timeout = DefaultTimeout
-	}
-	return newGuardedHTTPClient(timeout, lookup, nil)
 }
 
 // HostAllowed reports whether this client may contact host (case-insensitive).

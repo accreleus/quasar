@@ -993,7 +993,7 @@ attaches `platform-release-manifest.json` — the machine-readable list of the t
 component images by digest ([schema](../scripts/release/platform-release-manifest.md)).
 
 A **prerelease** tag (`v0.2.0-rc.1`) publishes a GitHub *prerelease*, which the
-`stable` update channel ignores. It needs its own changelog section, under its
+`stable` channel ignores. It needs its own changelog section, under its
 full version.
 
 Before anything builds, a gate refuses a tag that cannot be released, so a

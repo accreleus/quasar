@@ -58,22 +58,33 @@ const githubAPIHost = "api.github.com"
 // currently names (GET /repos/{owner}/{repo}/commits/{ref}, Accept:
 // application/vnd.github.sha — a raw sha response, no JSON).
 //
-// HTTPS-only, repo/ref interpolated only into the path, and reuses the shared
-// guarded transport (internal/outbound: no redirects, DNS-rebind-safe) even
-// with a fixed host — same SSRF discipline as the digest resolver.
+// HTTPS-only, repo/ref interpolated only into the path, and an
+// internal/outbound client of its own (allowlist = githubAPIHost, no redirects,
+// DNS-rebind-safe, bounded body) even with a fixed host — same SSRF discipline
+// as the digest resolver, and the second caller the shared client exists for.
 type GitHubContextResolver struct {
-	client *http.Client
+	client doer
 	// baseURL, when non-empty, replaces https://api.github.com — test seam only.
 	baseURL string
 }
 
 // NewGitHubContextResolver builds the production resolver. A nil client gets
-// the shared guarded transport (internal/outbound).
+// the shared hardened outbound client (internal/outbound) allowlisted to
+// githubAPIHost alone; callers supplying their own transport take
+// responsibility for those protections.
 func NewGitHubContextResolver(client *http.Client) *GitHubContextResolver {
-	if client == nil {
-		client = outbound.NewGuardedHTTPClient(digestResolveTimeout, nil)
+	if client != nil {
+		return &GitHubContextResolver{client: client}
 	}
-	return &GitHubContextResolver{client: client}
+	c, err := outbound.New(outbound.Config{
+		AllowHosts: outbound.ParseHostList("", githubAPIHost),
+		Timeout:    digestResolveTimeout,
+	})
+	if err != nil {
+		// A compiled-in one-host allowlist cannot be empty: programming error.
+		panic(fmt.Sprintf("images: build GitHub outbound client: %v", err))
+	}
+	return &GitHubContextResolver{client: c}
 }
 
 // newTestContextResolver builds a resolver whose HTTP calls all go to baseURL.
