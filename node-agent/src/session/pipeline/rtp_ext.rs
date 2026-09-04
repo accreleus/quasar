@@ -418,7 +418,11 @@ mod tests {
                 .unwrap_or_else(|_| {
                     panic!("{factory_name}'s registered extension is not an RTPHeaderExtension")
                 });
-            assert_eq!(ext.id(), ABS_CAPTURE_TIME_EXT_ID, "{factory_name} extmap id");
+            assert_eq!(
+                ext.id(),
+                ABS_CAPTURE_TIME_EXT_ID,
+                "{factory_name} extmap id"
+            );
             assert_eq!(
                 ext.uri().as_deref(),
                 Some(super::super::ABS_CAPTURE_TIME_URI),
