@@ -68,16 +68,26 @@ func (m *Manager) AuthAgentHost(ctx context.Context, nodeName, nodeSecret string
 	return hostID, nil
 }
 
-// GCPending returns up to gcPendingLimit homes pinned to hostID that are past
-// the 24h GC grace period and so are ready for backing-store reaping. NULL-host
-// rows are never returned here (no agent owns them — the janitor row-reaps them).
+// gcReapable is the predicate for "this tombstone may be reaped now", shared by
+// GCPending and GCConfirm so a row can never be offered and then refused.
+//
+// The 24h grace exists so a launch can revive a tombstoned home (EnsureHome
+// clears gc_after). An ORPHANED home — user_id NULL, i.e. the owning users row
+// is gone (ON DELETE SET NULL, migration 0009) — can never be revived, so the
+// grace protects nothing and only costs disk: a harness minting an identity per
+// login filled a host to 100% inside it (#92). Orphans are reapable at once.
+const gcReapable = `gc_after IS NOT NULL
+	  AND (user_id IS NULL OR gc_after + interval '24 hours' < now())`
+
+// GCPending returns up to gcPendingLimit homes pinned to hostID that are ready
+// for backing-store reaping. NULL-host rows are never returned here (no agent
+// owns them — the janitor row-reaps them).
 func (m *Manager) GCPending(ctx context.Context, hostID string) ([]PendingHome, error) {
 	rows, err := m.pool.Query(ctx, `
 		SELECT id::text, provider, ref
 		FROM user_homes
 		WHERE host_id = $1::uuid
-		  AND gc_after IS NOT NULL
-		  AND gc_after + interval '24 hours' < now()
+		  AND `+gcReapable+`
 		ORDER BY gc_after
 		LIMIT $2
 	`, hostID, gcPendingLimit)
@@ -101,7 +111,8 @@ func (m *Manager) GCPending(ctx context.Context, hostID string) ([]PendingHome, 
 }
 
 // GCConfirm hard-deletes the homes whose ids the agent reaped on hostID. The
-// per-row guard (still tombstoned AND past grace AND on this host) makes a
+// per-row guard (still reapable by the same gcReapable predicate GCPending
+// offered, AND on this host) makes a
 // confirm a no-op for any home that was revived (gc_after cleared by a launch)
 // or relocated to another host between the pull and the confirm — the agent's
 // reap of a now-stale backing store is harmless (idempotent at the agent), and
@@ -116,8 +127,7 @@ func (m *Manager) GCConfirm(ctx context.Context, hostID string, homeIDs []string
 			DELETE FROM user_homes
 			WHERE id::text = $1
 			  AND host_id = $2::uuid
-			  AND gc_after IS NOT NULL
-			  AND gc_after + interval '24 hours' < now()
+			  AND `+gcReapable+`
 		`, id, hostID)
 		if err != nil {
 			return deleted, fmt.Errorf("gc confirm %s: %w", id, err)

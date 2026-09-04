@@ -628,17 +628,19 @@ func (m *Manager) ListUserStorage(ctx context.Context, userID string) ([]MyStora
 }
 
 // SweepHomes hard-deletes only the tombstoned rows the agent-pull reaper
-// (#175) can never claim: past the 24h grace with host_id IS NULL (no
-// node-agent owns the backing store, so a row-only delete is all there is).
+// (#175) can never claim: reapable ones with host_id IS NULL (no node-agent
+// owns the backing store, so a row-only delete is all there is).
 // Host-pinned tombstoned rows are left for the agent to pull, reap host-side,
 // and confirm — the confirm hard-deletes the row after the directory is
 // actually gone. The control plane has no host-FS access (invariant #1), so it
 // must not row-delete a pinned home out from under its backing store.
+// Reapability is storage.gcReapable, the same predicate the agent pull uses:
+// an orphan (user_id NULL) skips the grace, because nothing can revive it.
 // Triggered by the storage.home_janitor job (internal/jobs); the count is the
 // run summary.
 func (m *Manager) SweepHomes(ctx context.Context, log *slog.Logger) (int64, error) {
 	const sweep = `DELETE FROM user_homes
-		WHERE gc_after IS NOT NULL AND gc_after + interval '24 hours' < now()
+		WHERE ` + gcReapable + `
 		  AND host_id IS NULL`
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()

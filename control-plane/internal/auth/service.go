@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -64,6 +65,17 @@ type ErrValidation struct{ Msg string }
 
 func (e ErrValidation) Error() string { return e.Msg }
 
+// HomeReaper is nudged with the hosts holding a just-deleted user's homes, so
+// each reaps the backing store now rather than at its next scheduled sweep
+// (#92). Implemented in the main package over the jobs dispatcher; nil means no
+// nudge, which costs latency only — the homes are tombstoned and orphaned
+// either way, and the host's own home.gc interval still collects them.
+type HomeReaper interface {
+	// ReapHomesOn asks each host to run its home-GC pass soon. Best-effort:
+	// implementations log and swallow their own failures.
+	ReapHomesOn(ctx context.Context, hostIDs []string)
+}
+
 // Service holds the auth business logic. Construct with NewService.
 type Service struct {
 	store        *store
@@ -71,6 +83,31 @@ type Service struct {
 	tokenTTL     time.Duration
 	dummyHash    string       // a real argon2id hash, verified against on unknown users to equalize timing
 	registration Registration // injected registration gate (LP-SEC-01); nil ⇒ legacy 'open'
+
+	// Guards homeReaper alone: SetHomeReaper runs during wiring, DeleteUser /
+	// ReapEphemeral read it from request and job goroutines.
+	reaperMu   sync.RWMutex
+	homeReaper HomeReaper
+}
+
+// SetHomeReaper wires the post-delete home reap nudge. A setter, not an Option,
+// only because the jobs dispatcher is built after this Service in app.go.
+func (s *Service) SetHomeReaper(r HomeReaper) {
+	s.reaperMu.Lock()
+	s.homeReaper = r
+	s.reaperMu.Unlock()
+}
+
+func (s *Service) reapHomesOn(ctx context.Context, hostIDs []string) {
+	if len(hostIDs) == 0 {
+		return
+	}
+	s.reaperMu.RLock()
+	r := s.homeReaper
+	s.reaperMu.RUnlock()
+	if r != nil {
+		r.ReapHomesOn(ctx, hostIDs)
+	}
 }
 
 // NewService wires the auth service to the pool. tokenTTL is how long an issued
@@ -356,9 +393,16 @@ func (s *Service) UpdateUser(ctx context.Context, id string, role *string, disab
 }
 
 // DeleteUser hard-deletes an account (admin only). Terminal session history
-// cascades; see store.deleteUser for the guard set.
+// cascades; see store.deleteUser for the guard set. The user's homes are
+// tombstoned and orphaned by that call; the nudge here only shortens how long
+// the bytes survive their owner (#92).
 func (s *Service) DeleteUser(ctx context.Context, id string) error {
-	return s.store.deleteUser(ctx, id)
+	hosts, err := s.store.deleteUser(ctx, id)
+	if err != nil {
+		return err
+	}
+	s.reapHomesOn(ctx, hosts)
+	return nil
 }
 
 // --- validation --------------------------------------------------------------
