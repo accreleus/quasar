@@ -92,9 +92,16 @@ RUN ?= latest
 NAME ?=
 export URL ROUTES KEY BEFORE AFTER OUT RUN NAME
 
+# release-cut passthrough: make release VERSION=x.y.z [DRY_RUN=1] — the script
+# validates VERSION itself (strict semver); nothing here is interpolated into
+# a recipe line (#550).
+VERSION ?=
+DRY_RUN ?= 0
+export VERSION DRY_RUN
+
 .PHONY: help init doctor config-check verify docs-metrics-sync docs-trace \
 	test test-go test-rust test-web \
-        test-db preflight up down restart rebuild redeploy-cp status health logs logs-follow \
+        test-db preflight release up down restart rebuild redeploy-cp status health logs logs-follow \
         dev-web dev-cp diagnose diagnose-bundle clean reset agent-creds validate \
         ui-audit ui-audit-routes ui-audit-ab session-display session-soak abr-ladder \
         bench-submit bench-retro bench-run bench-suite bench-budget bench-baseline \
@@ -159,6 +166,11 @@ docs-trace: docs-metrics-sync ## Regenerate the trace-format.md metric table fro
 
 preflight: doctor config-check verify ## Pre-push gate: doctor + config-check + verify
 	@printf 'preflight complete — see the RESULT lines above\n'
+
+## ── Release ──────────────────────────────────────────────────────────────────
+
+release: ## Cut a release in one command — VERSION=x.y.z [DRY_RUN=1] — main only, see docs/upgrading.md
+	@bash scripts/release/release-cut.sh
 
 ## ── Stack ───────────────────────────────────────────────────────────────────
 
