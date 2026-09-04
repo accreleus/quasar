@@ -1480,7 +1480,7 @@ pub(crate) const APP_APPARMOR_PROFILE: &str = "quasar-app";
 
 /// The one command that makes [`APP_APPARMOR_PROFILE`] available. Every message about the
 /// profile being absent carries it, because the profile is useless until someone with root
-/// ON THE HOST runs this — the agent must never load policy itself.
+/// on the host runs this — the agent must never load policy itself.
 pub(crate) const APP_APPARMOR_LOAD_CMD: &str =
     "sudo apparmor_parser -r -W <compose dir>/apparmor/quasar-app \
      (deploy/apparmor/quasar-app in the repo; enrolled hosts have it next to their \
@@ -1504,7 +1504,12 @@ const APPARMOR_PROFILES_RELS: [&str; 2] = [
 /// Is [`APP_APPARMOR_PROFILE`] loaded, as far as the agent can tell?
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AppArmorProfileState {
+    /// Loaded and enforcing (`enforce` or the stricter `kill`).
     Loaded,
+    /// Loaded, but in a mode that only logs what it would have denied. Confining with it
+    /// is harmless and still the right flag, but nothing is actually being enforced, so it
+    /// must not read as "confined" anywhere an operator looks.
+    Complain,
     NotLoaded,
     /// The profile list does not read from in here. Distinct from `NotLoaded` on purpose:
     /// "we cannot see" must keep today's behaviour, never confine with a profile whose
@@ -1550,8 +1555,11 @@ pub(crate) fn app_apparmor_choice(
     match override_name {
         Some("unconfined") => AppArmorChoice::Unconfined,
         Some(name) => AppArmorChoice::Profile(name.to_string()),
+        // Complain picks the profile too: it is the flag the operator asked for, and a
+        // profile that logs instead of denying can only be an improvement over no profile
+        // at all. Readiness is where the mode is called out.
         None => match state {
-            AppArmorProfileState::Loaded => {
+            AppArmorProfileState::Loaded | AppArmorProfileState::Complain => {
                 AppArmorChoice::Profile(APP_APPARMOR_PROFILE.to_string())
             }
             AppArmorProfileState::NotLoaded | AppArmorProfileState::Unknown => {
@@ -1566,20 +1574,34 @@ pub(crate) fn apparmor_profile_state(root: &Path, name: &str) -> AppArmorProfile
         let Ok(body) = std::fs::read_to_string(root.join(rel)) else {
             continue;
         };
-        return if profile_list_contains(&body, name) {
-            AppArmorProfileState::Loaded
-        } else {
-            AppArmorProfileState::NotLoaded
-        };
+        return profile_list_state(&body, name);
     }
     AppArmorProfileState::Unknown
 }
 
 /// One profile per line as `name (mode)`; a child profile is `parent//child (mode)`, which
 /// must not answer for its parent.
-fn profile_list_contains(body: &str, name: &str) -> bool {
-    body.lines()
-        .any(|line| line.split(" (").next().map(str::trim) == Some(name))
+///
+/// The mode is not decoration: a profile loaded in `complain` matches by name while
+/// enforcing nothing, so matching on the name alone would report a confinement that does
+/// not exist. `enforce` and the stricter `kill` are the enforcing modes; every other mode
+/// AppArmor can report (`complain`, `prompt`, `unconfined`) only logs.
+fn profile_list_state(body: &str, name: &str) -> AppArmorProfileState {
+    for line in body.lines() {
+        let (found, rest) = match line.split_once(" (") {
+            Some((n, rest)) => (n.trim(), rest),
+            None => continue,
+        };
+        if found != name {
+            continue;
+        }
+        let mode = rest.trim_end().trim_end_matches(')');
+        return match mode {
+            "enforce" | "kill" => AppArmorProfileState::Loaded,
+            _ => AppArmorProfileState::Complain,
+        };
+    }
+    AppArmorProfileState::NotLoaded
 }
 
 /// `QUASAR_APP_APPARMOR_PROFILE`, empty or whitespace treated as unset.
@@ -1615,7 +1637,7 @@ fn app_apparmor_selection() -> AppArmorChoice {
             };
             tracing::warn!(
                 token = "app-apparmor-profile-missing",
-                "app containers run APPARMOR-UNCONFINED on this AppArmor host: {reason}. \
+                "app containers run apparmor-unconfined on this AppArmor host: {reason}. \
                  Load it: {APP_APPARMOR_LOAD_CMD}"
             );
         });
@@ -1972,7 +1994,14 @@ mod tests {
             vec!["--security-opt", "apparmor=unconfined"]
         );
 
-        for state in [Loaded, NotLoaded, Unknown] {
+        // Complain enforces nothing, but the flag is still the one to pass: readiness is
+        // what tells the operator the mode.
+        assert_eq!(
+            choose(true, Complain),
+            AppArmorChoice::Profile("quasar-app".into())
+        );
+
+        for state in [Loaded, Complain, NotLoaded, Unknown] {
             assert_eq!(choose(false, state), AppArmorChoice::NoFlag);
             assert!(choose(false, state).args().is_empty());
         }
@@ -2026,6 +2055,19 @@ mod tests {
             "docker-default (enforce)\nquasar-app (enforce)\nquasar-app//bwrap (enforce)\n",
         )
         .unwrap();
+        assert_eq!(
+            apparmor_profile_state(root, "quasar-app"),
+            AppArmorProfileState::Loaded
+        );
+
+        // A complain-mode profile matches by name while enforcing nothing.
+        std::fs::write(rel.join("profiles"), "quasar-app (complain)\n").unwrap();
+        assert_eq!(
+            apparmor_profile_state(root, "quasar-app"),
+            AppArmorProfileState::Complain
+        );
+        // kill is stricter than enforce, not weaker.
+        std::fs::write(rel.join("profiles"), "quasar-app (kill)\n").unwrap();
         assert_eq!(
             apparmor_profile_state(root, "quasar-app"),
             AppArmorProfileState::Loaded

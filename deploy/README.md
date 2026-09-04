@@ -402,8 +402,15 @@ sudo apparmor_parser -r -W deploy/apparmor/quasar-app
 `/opt/quasar-agent/apparmor/quasar-app`. Loading kernel policy needs root on the host, so
 the node agent never does it itself; it only reads which profiles are loaded and picks
 accordingly. Confirm with `sudo aa-status | grep quasar-app` — the profile should be
-listed in enforce mode — and the host's readiness card in Admin → Fleet shows
-`app_apparmor_profile`.
+listed in enforce mode, and a profile in *complain* mode enforces nothing — and the host's
+readiness card in Admin → Fleet shows `app_apparmor_profile`.
+
+The agent reads that list through the node-agent service's
+`/sys/kernel/security:/host/sys/kernel/security:ro` volume, which assumes securityfs
+exists on the host. Every AppArmor host has it, and so does every distro kernel with
+`CONFIG_SECURITYFS` (systemd mounts it at boot). On a kernel built without it the path is
+absent and the container would fail to start — drop that volume line, and the agent
+reports that it cannot tell and stays unconfined.
 
 The profile is loaded into the running kernel and is **gone after a reboot** unless it
 also lives in `/etc/apparmor.d`. Persist it with either

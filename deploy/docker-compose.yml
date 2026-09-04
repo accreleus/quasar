@@ -571,8 +571,10 @@ services:
       # `quasar-app` AppArmor profile loaded (#76)? Without an answer the agent keeps
       # launching app containers `apparmor=unconfined`. securityfs is not mounted inside a
       # container, so the agent's own /sys/kernel/security is an empty directory — same
-      # /host convention as /dev above. The list of loaded profile NAMES is all this is
+      # /host convention as /dev above. The list of loaded profile names is all this is
       # read for; changing policy needs CAP_MAC_ADMIN, which this container does not have.
+      # Assumes securityfs exists (it does on every AppArmor host, and on any kernel with
+      # CONFIG_SECURITYFS); on a kernel without it, drop this line.
       - /sys/kernel/security:/host/sys/kernel/security:ro
       # Persistent agent state: the per-node secret issued at enrollment.
       - quasar-agent-data:/var/lib/quasar-agent

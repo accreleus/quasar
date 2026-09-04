@@ -1130,7 +1130,7 @@ fn app_apparmor_check(
     if override_name == Some("unconfined") {
         return warn_check(
             ID,
-            "app containers run APPARMOR-UNCONFINED because QUASAR_APP_APPARMOR_PROFILE is \
+            "app containers run apparmor-unconfined because QUASAR_APP_APPARMOR_PROFILE is \
              set to `unconfined`: they keep none of docker-default's protections"
                 .to_string(),
             format!(
@@ -1146,6 +1146,22 @@ fn app_apparmor_check(
             ID,
             format!("app containers are confined by the {named} AppArmor profile"),
         ),
+        // Loaded but only logging. The launch still passes the profile, so nothing is worse
+        // off than unconfined — but "confined" would be a false pass, which is the exact
+        // class of bug #76 was filed for.
+        S::Complain => warn_check(
+            ID,
+            format!(
+                "the {named} AppArmor profile is loaded but not in enforce mode (complain): \
+                 app containers launch with it, so every rule it would have applied is only \
+                 logged to the kernel audit and nothing is denied"
+            ),
+            format!(
+                "Reload it in enforce mode — `apparmor_parser -r` sets enforce unless the \
+                 profile was put in complain by `aa-complain` or a symlink in \
+                 /etc/apparmor.d/force-complain: {load}"
+            ),
+        ),
         S::NotLoaded if override_name.is_some() => warn_check(
             ID,
             format!(
@@ -1159,11 +1175,11 @@ fn app_apparmor_check(
             ID,
             format!(
                 "the {profile} AppArmor profile is not loaded, so app containers run \
-                 APPARMOR-UNCONFINED: sessions work, but they keep none of docker-default's \
+                 apparmor-unconfined: sessions work, but they keep none of docker-default's \
                  protections (no /proc or /sys write denies, no capability or ptrace \
                  mediation)"
             ),
-            format!("Load it on the HOST — the agent must not load kernel policy itself: {load}"),
+            format!("Load it on the host — the agent must not load kernel policy itself: {load}"),
         ),
         // Not "no profile": the agent cannot see the list at all, so it keeps the safe
         // fallback and says which mount is missing rather than guessing.
@@ -1172,7 +1188,7 @@ fn app_apparmor_check(
             format!(
                 "cannot tell whether the {profile} AppArmor profile is loaded — the kernel's \
                  profile list does not read from in here, so app containers take the safe \
-                 fallback and run APPARMOR-UNCONFINED"
+                 fallback and run apparmor-unconfined"
             ),
             format!(
                 "The agent container needs the host's securityfs to answer this: \
@@ -2654,15 +2670,21 @@ mod tests {
         assert!(loaded.summary.contains("quasar-app"), "{loaded:?}");
 
         // Never a failure: without the profile the agent falls back to unconfined and
-        // sessions run exactly as they did before #76.
-        for state in [NotLoaded, Unknown] {
+        // sessions run exactly as they did before #76. Complain is loaded-but-enforcing-
+        // nothing, which must not read as "confined".
+        for state in [NotLoaded, Unknown, Complain] {
             let c = app_apparmor_check(true, state, None);
             assert_eq!(c.status, WARN, "{c:?}");
             assert!(
-                c.remediation.contains("apparmor_parser -r -W"),
+                c.remediation.contains("apparmor_parser -r"),
                 "the load command is the whole point of the row: {c:?}"
             );
         }
+        let complain = app_apparmor_check(true, Complain, None);
+        assert!(
+            complain.summary.contains("complain"),
+            "the mode has to be named, not just 'not confined': {complain:?}"
+        );
         // "cannot read the list" must name the missing mount, not send the operator to
         // re-load a profile that may already be there.
         assert!(app_apparmor_check(true, Unknown, None)
@@ -2716,6 +2738,18 @@ mod tests {
             get(&probe(&bare.env(false, "")), "app_apparmor_profile").status,
             WARN
         );
+
+        // Loaded in complain mode: enforcing nothing, so not a pass.
+        let complain = FakeRoot::new("apparmor-complain");
+        complain
+            .file("dev/uinput", "")
+            .file("sys/module/apparmor/parameters/enabled", "Y\n")
+            .file(
+                "host/sys/kernel/security/apparmor/profiles",
+                "docker-default (enforce)\nquasar-app (complain)\n",
+            );
+        let c = get(&probe(&complain.env(false, "")), "app_apparmor_profile");
+        assert_eq!(c.status, WARN, "{c:?}");
     }
 
     /// `max_user_namespaces` wide open while `kernel.unprivileged_userns_clone=0` refuses every
