@@ -427,6 +427,29 @@ while IFS= read -r spec; do
   fi
 done < <(collect '.env.required')
 
+# Entrypoint env guards (#94): unlike the checks above, this measures RUNTIME behavior of
+# the real ENTRYPOINT, not baked image config — so it gets its own `docker run`s (with
+# `env` as the command) instead of joining the bypassed --entrypoint /bin/sh assertion
+# program. Empty-but-set must come out unset (the entrypoint's own `[ -z ] && unset`
+# guard); a real value must survive, so a deliberate bounded trace path still works.
+while IFS= read -r name; do
+  [ -n "$name" ] || continue
+  empty_out="$(docker run --rm --network none -e "${name}=" "$IMAGE" env 2>&1)" || true
+  if printf '%s\n' "$empty_out" | grep -q "^${name}="; then
+    hemit FAIL "entrypoint-guard.$name.empty" "still present when set empty: $(printf '%s\n' "$empty_out" | grep "^${name}=")"
+  else
+    hemit PASS "entrypoint-guard.$name.empty" "absent from \`env\` (guard fired)"
+  fi
+
+  want="/tmp/qv-guard-$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+  set_out="$(docker run --rm --network none -e "${name}=${want}" "$IMAGE" env 2>&1)" || true
+  if printf '%s\n' "$set_out" | grep -qF "${name}=${want}"; then
+    hemit PASS "entrypoint-guard.$name.set" "survives: ${want}"
+  else
+    hemit FAIL "entrypoint-guard.$name.set" "expected ${name}=${want}, got: $(printf '%s\n' "$set_out" | grep "^${name}=" || echo '<absent>')"
+  fi
+done < <(collect '.entrypoint_env_guards.unset_when_empty')
+
 # Image-declared provenance labels (§4 of the image-lineage spec). Host-side, like
 # env: these are image config, not container state.
 IMAGE_LABELS="$(docker image inspect --format '{{range $k, $v := .Config.Labels}}{{$k}}={{$v}}{{"\n"}}{{end}}' "$IMAGE")"
