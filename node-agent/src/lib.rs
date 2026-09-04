@@ -7,6 +7,8 @@ pub mod agent;
 /// Shared download/lock/backoff machinery for the artifact provisioners
 /// (`nvidia_volume`, `cuda_runtime`).
 pub mod artifact;
+/// Build stamps + install-mode discovery: what this agent is and how it got here.
+pub mod buildinfo;
 pub mod capacity;
 pub mod config;
 pub mod cp_http;

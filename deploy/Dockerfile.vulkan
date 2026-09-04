@@ -719,7 +719,21 @@ FROM ${TOOLCHAIN_IMAGE} AS build
 # linked (`readelf -d` shows no libcuda/libgstcuda DT_NEEDED), so the same binary starts
 # and runs on an AMD/Intel host.
 COPY node-agent /src/node-agent
-RUN cd /src/node-agent && cargo build --release \
+
+# Build identity (#107): node-agent/build.rs bakes these into the binary, which
+# reports them on `register` (agent-api.md) and logs them at startup. The build
+# context carries no .git, so its `git rev-parse` fallback cannot fire here —
+# these args are the only source.
+#
+# They sit HERE, not at the bottom like the runtime stage's label ARGs, because
+# a stamp has to be in the binary. BUILT_AT is wall-clock, so a rebuild of an
+# unchanged tree now recompiles the agent (~5 min) instead of hitting cache; a
+# rebuild of a NEW commit changes the source anyway and recompiled regardless.
+ARG SOURCE_COMMIT=unknown
+ARG BUILT_AT=unknown
+RUN cd /src/node-agent \
+    && QUASAR_SOURCE_COMMIT="${SOURCE_COMMIT}" QUASAR_BUILT_AT="${BUILT_AT}" \
+       cargo build --release \
         $( [ "$CUDA_ENABLE" = "1" ] && echo --features cuda ) \
     && install -Dm0755 target/release/quasar-node-agent /opt/agent/quasar-node-agent
 

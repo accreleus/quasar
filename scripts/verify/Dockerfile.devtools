@@ -1,6 +1,10 @@
 ARG GO_IMAGE=golang:1.25.14-bookworm
 ARG NODE_IMAGE=node:22.22.0-bookworm
-ARG RUST_IMAGE=rust:1.88.0-bookworm
+# Must stay >= deploy/pins.env RUST_VERSION: the node-agent's locked deps
+# (gstreamer-rs 0.25 / glib 0.22) carry an MSRV, and a lower pin fails
+# `cargo clippy` at RESOLUTION with "rustc X is not supported", before it
+# compiles anything.
+ARG RUST_IMAGE=rust:1.94.0-bookworm
 ARG POSTGRES_IMAGE=postgres:16.4-bookworm
 
 FROM ${GO_IMAGE} AS go

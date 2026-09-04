@@ -538,8 +538,19 @@ jobs:
           # thing promoted" checkable by eye.
           provenance: false
           sbom: false
+          # SOURCE_COMMIT / BUILT_AT do double duty here (#107): the provenance
+          # labels deploy/image-contract.json's control role requires, AND the
+          # -ldflags stamps the binary serves from GET /v1/admin/platform/identity.
+          # QUASAR_VERSION is the release tag verbatim (`v0.2.0`) and empty on every
+          # other ref — a branch build has no version and reports "dev". The leading
+          # `v` is stripped server-side by internal/buildinfo, not here: GitHub
+          # expressions have no substring, and the contract serves it without one.
           build-args: |
             QUASAR_BASE_IMAGE=${{ needs.inputs.outputs.base_ref }}
+            SOURCE_COMMIT=${{ github.sha }}
+            BUILT_AT=${{ needs.inputs.outputs.built_at }}
+            QUASAR_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+            QUASAR_SOURCE_REF=${{ github.ref_name }}
           cache-from: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-control-plane-cache:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY_NS }}/quasar-control-plane-cache:buildcache,mode=max
 

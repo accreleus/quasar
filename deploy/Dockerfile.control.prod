@@ -51,9 +51,22 @@ WORKDIR /src
 COPY control-plane/go.mod control-plane/go.sum ./
 RUN go mod download
 COPY control-plane/ .
+
+# Build identity (#107), served by GET /v1/admin/platform/identity and logged at
+# startup. Unset stamps read as "dev" + null, never a stale package version. The
+# build context carries no .git, so these must be passed in — build-images.sh and
+# the images workflow both do.
+ARG QUASAR_VERSION=
+ARG SOURCE_COMMIT=unknown
+ARG BUILT_AT=unknown
+
 # CGO_ENABLED=0 → fully static binary (no libc deps in the runtime image).
+# -s -w stay: -X writes string data, which stripping symbols does not touch.
 RUN CGO_ENABLED=0 GOOS=linux go build \
-    -trimpath -ldflags="-s -w" \
+    -trimpath -ldflags="-s -w \
+      -X github.com/accreleus/quasar/control-plane/internal/buildinfo.version=${QUASAR_VERSION} \
+      -X github.com/accreleus/quasar/control-plane/internal/buildinfo.sourceCommit=${SOURCE_COMMIT} \
+      -X github.com/accreleus/quasar/control-plane/internal/buildinfo.builtAt=${BUILT_AT}" \
     -o /quasar-control ./cmd/quasar-control
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
@@ -63,6 +76,16 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # never ship in this artifact.
 ARG QUASAR_BASE_IMAGE
 FROM ${QUASAR_BASE_IMAGE}
+
+# Provenance, mirroring the agent image's labels and asserted by
+# deploy/image-contract.json. Re-declared: an ARG does not cross a FROM.
+ARG QUASAR_BASE_IMAGE
+ARG SOURCE_COMMIT=unknown
+ARG BUILT_AT=unknown
+LABEL org.quasar.image.role="control" \
+      org.quasar.pins.base="${QUASAR_BASE_IMAGE}" \
+      org.quasar.source.commit="${SOURCE_COMMIT}" \
+      org.quasar.built.at="${BUILT_AT}"
 
 COPY --from=builder /quasar-control /usr/local/bin/quasar-control
 COPY --from=web-builder /web/dist /app/web

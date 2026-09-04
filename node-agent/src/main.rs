@@ -290,9 +290,11 @@ async fn run_agent() {
     };
 
     tracing::info!(
-        "quasar node-agent {} starting (node_name={})",
-        env!("CARGO_PKG_VERSION"),
-        cfg.node_name
+        "quasar node-agent {} starting (node_name={}, source_commit={}, built_at={})",
+        quasar_node_agent::buildinfo::AGENT_VERSION,
+        cfg.node_name,
+        quasar_node_agent::buildinfo::source_commit().unwrap_or("unknown"),
+        quasar_node_agent::buildinfo::built_at().unwrap_or("unknown"),
     );
     // #419: records the allocator A/B arm plus baseline RSS, so a soak artifact is
     // self-describing.
