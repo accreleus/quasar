@@ -117,13 +117,10 @@ func NewRegistryResolver(client *http.Client) *RegistryResolver {
 		MaxBodyBytes: registryMaxBodyBytes,
 	})
 	if err != nil {
-		// Unreachable: allowedHostsFromEnv is never empty. Fall back to the raw
-		// guarded transport rather than to no resolver at all — Resolve and
-		// fetchToken still refuse an off-allowlist registry host or token realm.
-		return &RegistryResolver{
-			client:     outbound.NewGuardedHTTPClient(digestResolveTimeout, nil),
-			allowHosts: hosts,
-		}
+		// outbound.New fails only on an empty allowlist, and allowedHostsFromEnv
+		// always falls back to defaultRegistryHost — so this is a programming
+		// error at boot, not a runtime condition to degrade around.
+		panic(fmt.Sprintf("images: build registry outbound client: %v", err))
 	}
 	return &RegistryResolver{client: c, allowHosts: hosts}
 }
@@ -205,6 +202,13 @@ func parseRef(ref string) (parsedRef, error) {
 }
 
 // apiHost handles docker.io's split between ref name and API endpoint.
+//
+// The allowlist is checked against BOTH: Resolve checks the ref's registry
+// (docker.io) before building a request, and the outbound client checks the
+// host actually dialled (registry-1.docker.io, then the auth.docker.io realm).
+// So a Docker Hub ref resolves only when QUASAR_IMAGE_REGISTRY_HOSTS lists
+// docker.io, registry-1.docker.io and auth.docker.io — deliberately: the
+// allowlist names hosts the control plane may contact, not aliases of them.
 func (p parsedRef) apiHost() string {
 	if p.Registry == "docker.io" {
 		return "registry-1.docker.io"
