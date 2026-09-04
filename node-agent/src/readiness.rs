@@ -1227,8 +1227,8 @@ fn check_media_reachability(env: &ProbeEnv, distro: Distro) -> ReadinessCheck {
         FirewallPosture::Unknown => skip(
             ID,
             "could not determine whether a host firewall would block WebRTC media — no \
-             firewalld/nft/iptables client tool answered from inside the agent container (nft \
-             is in the image and needs CAP_NET_ADMIN, which the compose file grants)",
+             firewalld or nft client tool answered from inside the agent container (nft is in \
+             the image and needs CAP_NET_ADMIN, which the compose file grants)",
         ),
         FirewallPosture::Unfiltered { detail, .. } => pass(
             ID,
@@ -1520,7 +1520,7 @@ fn parse_nft_input_policy(ruleset: &str) -> Option<String> {
 
 /// Does the ruleset declare ANY base chain on the input hook? A ruleset without one filters no
 /// inbound traffic at all — the common shape on a host where only Docker programs netfilter
-/// (nat/forward/raw tables, no input hook) — which is a finding, not a missing signal (#103).
+/// (nat/forward/raw tables, no input hook) — which is a finding, not a missing signal.
 fn nft_has_input_base_chain(ruleset: &str) -> bool {
     nft_base_chain_body(ruleset, "hook input").is_some()
 }
@@ -1881,7 +1881,7 @@ fn iptables_udp_accepts(output: &str) -> Vec<UdpAccept> {
 }
 
 /// What `nft list ruleset` said. A ruleset with no input hook chain is NOT the same answer as
-/// nft never running: both once collapsed to `None` and rendered as `Unknown` (#103).
+/// nft never running: both once collapsed to `None` and rendered as `Unknown`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NftSignal {
     Policy {
@@ -1895,7 +1895,9 @@ enum NftSignal {
 const NFT_NO_INPUT_CHAIN_DETAIL: &str = "nft answered: no input hook chain in the ruleset";
 
 /// The pure decision. Trust order: firewalld's zone target, then nft, then iptables INPUT
-/// policy. Takes already-parsed signals so it needs no exec and no filesystem to test.
+/// policy — except that nft reporting no input chain yields to an iptables reading that IS
+/// filtering (both front-ends program the same netfilter). Takes already-parsed signals so
+/// it needs no exec and no filesystem to test.
 fn combine_firewall_signals(
     firewalld: Option<(&str, MediaAllow)>,
     nft: Option<NftSignal>,
@@ -3181,9 +3183,11 @@ table ip raw {
 "#;
 
     /// A ruleset that answered and filters nothing inbound is a positive finding, not the
-    /// `None` of a tool that never ran (#103).
+    /// `None` of a tool that never ran.
     #[test]
     fn parse_nft_input_policy_docker_only_ruleset_has_no_input_chain() {
+        // An empty answer is the same finding: nothing hooks input.
+        assert!(!nft_has_input_base_chain(""));
         assert!(
             !nft_has_input_base_chain(DOCKER_ONLY_RULESET),
             "Docker programs nat/filter/raw with no input hook — nothing filters inbound"
@@ -3376,14 +3380,14 @@ table ip raw {
         assert_eq!(
             c.summary,
             "could not determine whether a host firewall would block WebRTC media — no \
-             firewalld/nft/iptables client tool answered from inside the agent container (nft \
-             is in the image and needs CAP_NET_ADMIN, which the compose file grants)"
+             firewalld or nft client tool answered from inside the agent container (nft is in \
+             the image and needs CAP_NET_ADMIN, which the compose file grants)"
         );
         assert!(c.remediation.is_empty());
     }
 
     /// A host whose ruleset filters nothing inbound is the best possible answer for the media
-    /// path — a pass, never the "not applicable" bucket a `skip` lands in (#103).
+    /// path — a pass, never the "not applicable" bucket a `skip` lands in.
     #[test]
     fn check_media_reachability_unfiltered_is_pass_with_the_positive_summary() {
         let root = FakeRoot::new("firewall-unfiltered");
