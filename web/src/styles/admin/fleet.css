@@ -246,3 +246,23 @@
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* The bare enrollment string is one click away, not the headline (#100). */
+.enroll-more > summary {
+  cursor: pointer;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+  list-style: none;
+}
+.enroll-more > summary::-webkit-details-marker {
+  display: none;
+}
+.enroll-more > summary::before {
+  content: "▸ ";
+}
+.enroll-more[open] > summary::before {
+  content: "▾ ";
+}
+.enroll-more > .enroll-fact {
+  margin-top: var(--s2);
+}

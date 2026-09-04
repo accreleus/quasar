@@ -413,17 +413,15 @@ describe("HostsTab — enroll", () => {
     expect(screen.queryByText(/ws:\/\/localhost/)).toBeNull();
     expect(screen.queryByRole("button", { name: "Mint enrollment string" })).toBeNull();
     expect(mocked.mintHostEnrollment).not.toHaveBeenCalled();
-    expect(screen.getAllByText(/deploy\/\.env/, { selector: ".mono" }).length).toBeGreaterThan(0);
   });
 
-  it("prints no command, and says agent-only packaging is operator work", async () => {
+  // #100: from a refused origin there is no command either — the one-liner is
+  // composed only from a minted string, and nothing is minted here.
+  it("prints no install command from a refused origin", async () => {
     await openEnroll();
 
     const dialog = screen.getByRole("dialog");
-    expect(dialog.textContent).not.toMatch(/docker compose/);
-    expect(screen.getByText(/There is no supported agent-only package yet/)).toBeTruthy();
-    expect(screen.getByRole("link", { name: "Add a second GPU host" }).getAttribute("href")).toBe(
-      "https://accreleus.github.io/quasar/install/second-host/",
-    );
+    expect(dialog.textContent).not.toMatch(/curl |docker compose/);
+    expect(screen.queryByTestId("enroll-command")).toBeNull();
   });
 });

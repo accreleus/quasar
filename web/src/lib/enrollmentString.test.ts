@@ -4,6 +4,8 @@ import {
   base64UrlNoPad,
   canMintFrom,
   composeEnrollmentString,
+  composeInstallCommand,
+  installerScriptUrl,
   normalizeFingerprint,
 } from "./enrollmentString";
 
@@ -59,5 +61,36 @@ describe("enrollment string", () => {
   it("gates mint()'s pre-flight guard on the same http-origin check", () => {
     expect(canMintFrom("http://cp.example:8080")).toBe(false);
     expect(canMintFrom("https://cp.example:8443")).toBe(true);
+  });
+});
+
+describe("one-line installer (#100)", () => {
+  const FULL = `qenr1.${FP}.d3NzOi8vY3A.tok`;
+
+  it("fetches the script from the GitHub tree at the running build's ref, over a real-CA origin", () => {
+    expect(installerScriptUrl("v1.2.3")).toBe(
+      "https://raw.githubusercontent.com/accreleus/quasar/v1.2.3/deploy/enroll-host.sh",
+    );
+    expect(installerScriptUrl("e89c36f0e89c36f0e89c36f0e89c36f0e89c36f0")).toBe(
+      "https://raw.githubusercontent.com/accreleus/quasar/e89c36f0e89c36f0e89c36f0e89c36f0e89c36f0/deploy/enroll-host.sh",
+    );
+  });
+
+  it("passes the string and the ref as environment, never in the URL, and single-quotes the string", () => {
+    expect(composeInstallCommand({ enrollment: FULL, ref: "v1.2.3" })).toBe(
+      `curl -fsSL https://raw.githubusercontent.com/accreleus/quasar/v1.2.3/deploy/enroll-host.sh | QUASAR_ENROLLMENT='${FULL}' QUASAR_REF=v1.2.3 sh`,
+    );
+  });
+
+  it("never emits curl -k, and never a command without a ref to pin the script to", () => {
+    expect(composeInstallCommand({ enrollment: FULL, ref: "" })).toBeNull();
+    expect(installerScriptUrl("")).toBeNull();
+    expect(composeInstallCommand({ enrollment: FULL, ref: "v1.2.3" })).not.toMatch(/ -k| --insecure/);
+  });
+
+  it("refuses a ref or string that would break out of the shell quoting", () => {
+    expect(composeInstallCommand({ enrollment: FULL, ref: "v1; rm -rf /" })).toBeNull();
+    expect(composeInstallCommand({ enrollment: "qenr1..abc.tok'; id #", ref: "v1.2.3" })).toBeNull();
+    expect(composeInstallCommand({ enrollment: "", ref: "v1.2.3" })).toBeNull();
   });
 });

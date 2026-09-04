@@ -1,60 +1,112 @@
 ---
 title: Add a second GPU host
-description: Enrolling a second host is one paste over TLS; the agent-only install package is what does not exist yet.
+description: One command on the new machine, minted from the admin console. What it checks, what it writes, and what to do when it says no.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-Coming soon.
+Each host runs one node agent. It reports its GPUs, capacity and readiness to the
+control plane and receives sessions from it. The control plane holds no GPU state, so
+adding a host is enrolling one more agent.
 
-<Aside type="caution" title="Not tested, not supported yet">
-Multi-host is in the architecture from the beginning. The control plane holds no
-GPU state, the scheduler places sessions across hosts, and the admin UI is built
-around a fleet rather than one machine. None of that is speculative.
+## Before you start
 
-What does not exist yet is a tested way to install the second machine. There is
-no agent-only Compose file, no installer, and no verification run behind it. Any
-recipe published today would be guesswork.
+On the new machine you need:
+
+- Linux with a GPU whose kernel driver is loaded (`ls /dev/dri` shows a `renderD*` node).
+- Docker Engine and the Compose v2 plugin. The installer does not install Docker.
+- On an NVIDIA host, the NVIDIA Container Toolkit.
+- Root, or a user who can `sudo`.
+- A route to the control plane's `https://` address. Nothing else needs to be open
+  towards the control plane; players reach the host directly for media, which the
+  host's readiness check reports on afterwards.
+
+## 1. Mint the command
+
+Open the admin console **over `https://`**, go to **Fleet → Enroll host**, and press
+**Mint enrollment string**. The dialog shows a command of this shape:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/accreleus/quasar/<ref>/deploy/enroll-host.sh \
+  | QUASAR_ENROLLMENT='qenr1.…' QUASAR_REF=<ref> sh
+```
+
+`<ref>` is the tag or commit your control plane was built from. The script and the
+agent image it pins come from that same tree, so a host you add tomorrow runs what the
+control plane runs today.
+
+If the control plane serves its own self-signed certificate, the dialog also shows that
+certificate's fingerprint. It is the same value the control plane printed as
+`fingerprint=` when it started; if the two differ, stop — something between your
+browser and the control plane is presenting another certificate. With a real-CA
+certificate there is nothing to compare and nothing is pinned.
+
+The string inside the command is single use and expires in an hour. Copy the command
+whole; it is meant to be pasted, not typed.
+
+<Aside type="tip" title="Why the string is in an environment variable, not the URL">
+The script is fetched from GitHub over a real-CA certificate, so `curl` verifies it
+normally and `-k` never appears. The control plane's identity is the fingerprint inside
+the string, which the agent pins. A token in a URL would land in proxy logs and browser
+history; in an environment variable, on a disposable credential, the only trace is your
+shell history, and the token is dead within the hour anyway.
 </Aside>
 
-## What already works
+## 2. Run it on the new machine
 
-Each host runs one node agent. It reports its GPUs, capacity and readiness to
-the control plane, and receives sessions from it. The pieces are in place; the
-packaging is not.
+Paste the command as root, or as a user who can `sudo`. The script prints every step and
+stops at the first thing it cannot fix itself.
 
-**Enrolling a second host is one paste, over TLS.** In the admin console, open
-Fleet → Enroll host over `https://` and mint an enrollment string. It carries the
-control plane's `wss://` address, the fingerprint of its certificate — shown first
-and verbatim so you can compare it against the `fingerprint=` line in the control
-plane's startup log before you paste — and a per-host token that is single-use and
-expires in an hour. Set it as `QUASAR_ENROLLMENT` in the new host's `deploy/.env`.
-The agent pins that certificate for both its websocket and its HTTP polls, so
-nothing about the default self-signed certificate needs to change for the agent's
-sake. A `ws://` address to another machine is refused unless you explicitly opt in
-(`QUASAR_ALLOW_PLAINTEXT_AGENT=1`) — the enrollment token and node secret would
-otherwise cross the wire in cleartext. Details and the rotation path are in
-`docs/configuration.md` under `QUASAR_ENROLLMENT`.
+It checks the host the way the agent's own readiness check will: Docker and Compose,
+a render node, `/dev/uinput`, unprivileged user namespaces (on Ubuntu 24.04 and later
+that means `kernel.apparmor_restrict_unprivileged_userns`, which the script names with
+the exact `sysctl` line), and the NVIDIA Container Toolkit on an NVIDIA host.
 
-This was verified end to end on 2026-09-03: a second agent enrolled over `wss://`
-against a pinned self-signed certificate, a replayed string was refused, a wrong
-fingerprint was refused before any credential left the machine, and re-enrolling a
-name whose agent was still connected was refused.
+It then pins the agent image (`ghcr.io/accreleus/quasar/quasar-node-agent` at the
+release, or the local `quasar-node-agent:latest` for a source build), writes
+`/opt/quasar-agent/docker-compose.yml` with the node-agent service alone — plus the
+NVIDIA overlay when needed — and `/opt/quasar-agent/.env`, mode 0600, which is the only
+place the enrollment string lands. It starts the agent with `restart: unless-stopped`
+and waits until the agent logs that it is enrolled.
 
-Hosts can use different local storage roots. If you want saves to follow a user
-between machines, back those roots with shared storage. Otherwise set the
-`locality` placement policy so Quasar prefers the host that already holds that
-user's home directory.
+> You should see `enrolled: this host is now '<name>' in Admin → Fleet.` The host
+> appears in the Fleet table within a few seconds, online.
 
-## If you want to help
+Re-running the command on the same machine updates that one agent. It never starts a
+second one.
 
-The repository has a multi-agent Compose overlay used for scheduler testing. It
-runs several agents on one machine and is not a second-host installer.
+## When it says no
 
-If you want to work on real agent-only packaging, start with
-[GPU and remote workflows](/quasar/developer/gpu-workflows/). The thing to get
-right is the runtime contract the base node-agent service carries: host
-networking, GPU and `/dev/uinput` access, the PulseAudio sidecar, the managed-home
-root mounted at the same path inside and outside the container, and the enrollment
-flow that issues a per-node secret on first contact. Copying five environment
-variables across is not enough, which is most of why this is not shipped.
+The last line names the reason.
+
+- **`auth_failed`** — the token was expired, already used, minted for another node
+  name, or a host with this name already has a live agent (a name cannot be taken over
+  while its agent is connected). Mint a fresh string.
+- **`cp-tls-pin-mismatch`** — the certificate the control plane presented is not the one
+  the string pins. Mint a fresh string from the control plane's own page, or, after a
+  certificate rotation, set `CONTROL_PLANE_FINGERPRINT` in `/opt/quasar-agent/.env`.
+- **A preflight** — the fix is printed with it. Apply it and re-run the same command; the
+  string is still unused.
+- **`still connecting`** — the agent has not reached the control plane yet. Follow its
+  log with `docker compose --project-directory /opt/quasar-agent logs -f quasar-node-agent`;
+  the usual cause is that the control plane's address in the string is not reachable from
+  this machine.
+
+## Manual and air-gapped installs
+
+The dialog keeps the bare enrollment string behind **Show the enrollment string**.
+`sh deploy/enroll-host.sh --print-compose` (from any checkout) prints the agent-only
+Compose file and `--print-nvidia-overlay` the NVIDIA overlay. Put them in a directory
+with a `.env` that sets `QUASAR_ENROLLMENT`, `NODE_NAME`, `QUASAR_HOME_ROOT` and
+`QUASAR_AGENT_IMAGE`, and `docker compose up -d`. Every knob the agent reads is in the
+[environment reference](/quasar/reference/environment/).
+
+The base `deploy/docker-compose.yml` is not a second-host install: its agent depends on
+the local stack. The service the installer prints and the base file's node-agent service
+are held identical by a test, so a device or mount added to one reaches the other.
+
+## Storage across hosts
+
+Hosts can use different local storage roots. If you want saves to follow a user between
+machines, back those roots with shared storage. Otherwise set the `locality` placement
+policy so Quasar prefers the host that already holds that user's home directory.
