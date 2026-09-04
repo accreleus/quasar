@@ -66,31 +66,42 @@ describe("enrollment string", () => {
 
 describe("one-line installer (#100)", () => {
   const FULL = `qenr1.${FP}.d3NzOi8vY3A.tok`;
+  const PIN = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE=";
 
-  it("fetches the script from the GitHub tree at the running build's ref, over a real-CA origin", () => {
-    expect(installerScriptUrl("v1.2.3")).toBe(
-      "https://raw.githubusercontent.com/accreleus/quasar/v1.2.3/deploy/enroll-host.sh",
-    );
-    expect(installerScriptUrl("e89c36f0e89c36f0e89c36f0e89c36f0e89c36f0")).toBe(
-      "https://raw.githubusercontent.com/accreleus/quasar/e89c36f0e89c36f0e89c36f0e89c36f0e89c36f0/deploy/enroll-host.sh",
+  it("fetches the script from the control plane itself, at the origin this page was opened at", () => {
+    expect(installerScriptUrl("https://cp.example:8443")).toBe("https://cp.example:8443/enroll-host.sh");
+    expect(installerScriptUrl("https://cp.example:8443/")).toBe("https://cp.example:8443/enroll-host.sh");
+    expect(installerScriptUrl("http://cp.example:8080")).toBeNull();
+  });
+
+  it("pins the self-signed control plane's key: -k is only ever paired with --pinnedpubkey", () => {
+    const cmd = composeInstallCommand({ origin: "https://cp.example:8443", enrollment: FULL, ref: "v1.2.3", spkiPin: PIN });
+    expect(cmd).toBe(
+      `curl -fsSL -k --pinnedpubkey 'sha256//${PIN}' https://cp.example:8443/enroll-host.sh | QUASAR_ENROLLMENT='${FULL}' QUASAR_REF=v1.2.3 sh`,
     );
   });
 
-  it("passes the string and the ref as environment, never in the URL, and single-quotes the string", () => {
-    expect(composeInstallCommand({ enrollment: FULL, ref: "v1.2.3" })).toBe(
-      `curl -fsSL https://raw.githubusercontent.com/accreleus/quasar/v1.2.3/deploy/enroll-host.sh | QUASAR_ENROLLMENT='${FULL}' QUASAR_REF=v1.2.3 sh`,
+  it("uses plain CA verification for a real certificate: no -k, no pin", () => {
+    const cmd = composeInstallCommand({ origin: "https://play.example.com", enrollment: FULL, ref: "v1.2.3", spkiPin: null });
+    expect(cmd).toBe(
+      `curl -fsSL https://play.example.com/enroll-host.sh | QUASAR_ENROLLMENT='${FULL}' QUASAR_REF=v1.2.3 sh`,
     );
+    expect(cmd).not.toMatch(/ -k| --insecure|pinnedpubkey/);
   });
 
-  it("never emits curl -k, and never a command without a ref to pin the script to", () => {
-    expect(composeInstallCommand({ enrollment: FULL, ref: "" })).toBeNull();
-    expect(installerScriptUrl("")).toBeNull();
-    expect(composeInstallCommand({ enrollment: FULL, ref: "v1.2.3" })).not.toMatch(/ -k| --insecure/);
+  it("passes the string and the ref as environment, never in the URL; drops the ref when the build has none", () => {
+    const cmd = composeInstallCommand({ origin: "https://cp.example:8443", enrollment: FULL, ref: "", spkiPin: PIN }) ?? "";
+    expect(cmd.endsWith(`| QUASAR_ENROLLMENT='${FULL}' sh`)).toBe(true);
+    expect(cmd).not.toContain("QUASAR_REF");
+    expect(cmd.indexOf(FULL)).toBeGreaterThan(cmd.indexOf("|"));
   });
 
-  it("refuses a ref or string that would break out of the shell quoting", () => {
-    expect(composeInstallCommand({ enrollment: FULL, ref: "v1; rm -rf /" })).toBeNull();
-    expect(composeInstallCommand({ enrollment: "qenr1..abc.tok'; id #", ref: "v1.2.3" })).toBeNull();
-    expect(composeInstallCommand({ enrollment: "", ref: "v1.2.3" })).toBeNull();
+  it("refuses anything that would break out of the shell quoting or is not a real pin", () => {
+    const base = { origin: "https://cp.example:8443", enrollment: FULL, ref: "v1.2.3", spkiPin: PIN };
+    expect(composeInstallCommand({ ...base, ref: "v1; rm -rf /" })).toBeNull();
+    expect(composeInstallCommand({ ...base, enrollment: "qenr1..abc.tok'; id #" })).toBeNull();
+    expect(composeInstallCommand({ ...base, enrollment: "" })).toBeNull();
+    expect(composeInstallCommand({ ...base, spkiPin: "not-a-pin'" })).toBeNull();
+    expect(composeInstallCommand({ ...base, origin: "http://cp.example:8080" })).toBeNull();
   });
 });

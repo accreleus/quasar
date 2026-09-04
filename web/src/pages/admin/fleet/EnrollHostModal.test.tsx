@@ -10,13 +10,18 @@ import { EnrollHostModal } from "./EnrollHostModal";
 const mocked = vi.mocked(adminApi);
 const FP =
   "0A:1B:2C:3D:4E:5F:60:71:82:93:A4:B5:C6:D7:E8:F9:0A:1B:2C:3D:4E:5F:60:71:82:93:A4:B5:C6:D7:E8:F9";
+const PIN = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE=";
 
 function accessCheck(over: { self_signed?: boolean; in_use?: boolean } = {}) {
   const in_use = over.in_use ?? true;
   return {
     request: { host: "cp.example:8443", origin: "https://cp.example:8443", secure_context: true },
     certificate: in_use
-      ? { in_use: true, host_covered: true, info: { self_signed: over.self_signed ?? true, fingerprint_sha256: FP, source: "self_signed" } }
+      ? {
+          in_use: true,
+          host_covered: true,
+          info: { self_signed: over.self_signed ?? true, fingerprint_sha256: FP, spki_sha256: PIN, source: "self_signed" },
+        }
       : { in_use: false, not_in_use_reason: "a proxy terminates TLS" },
     origins: { source: "database" },
   } as never;
@@ -39,7 +44,7 @@ beforeEach(() => {
 });
 
 const REF = "v1.2.3";
-const SCRIPT = "https://raw.githubusercontent.com/accreleus/quasar/v1.2.3/deploy/enroll-host.sh";
+const SCRIPT = "https://cp.example:8443/enroll-host.sh";
 
 describe("EnrollHostModal", () => {
   it("refuses to compose from a plain-http page and never mints", () => {
@@ -50,16 +55,17 @@ describe("EnrollHostModal", () => {
     expect(mocked.mintHostEnrollment).not.toHaveBeenCalled();
   });
 
-  it("shows the self-signed fingerprint, then mints and hands over the one-liner for this build's ref", async () => {
+  it("shows the self-signed fingerprint, then mints and hands over a key-pinned one-liner served by this control plane", async () => {
     render(<EnrollHostModal open onClose={() => {}} origin="https://cp.example:8443" sourceRef={REF} />);
     await waitFor(() => expect(screen.getByTestId("enroll-fingerprint").textContent).toBe(FP));
 
     fireEvent.click(screen.getByText("Mint enrollment string"));
     await waitFor(() => expect(screen.getByTestId("enroll-command")).toBeTruthy());
     const cmd = screen.getByTestId("enroll-command").textContent ?? "";
-    expect(cmd.startsWith(`curl -fsSL ${SCRIPT} | QUASAR_ENROLLMENT='qenr1.${FP}.`)).toBe(true);
+    expect(cmd.startsWith(`curl -fsSL -k --pinnedpubkey 'sha256//${PIN}' ${SCRIPT} | QUASAR_ENROLLMENT='qenr1.${FP}.`)).toBe(true);
     expect(cmd.endsWith(`.tok.with.dots' QUASAR_REF=${REF} sh`)).toBe(true);
-    expect(cmd).not.toMatch(/ -k| --insecure/);
+    expect(cmd).not.toMatch(/githubusercontent/);
+    expect(screen.getByText(/makes curl trust only the key above/)).toBeTruthy();
     expect(mocked.mintHostEnrollment).toHaveBeenCalledWith("tok", {});
     // The fingerprint stays on screen next to the command for the eye check.
     expect(screen.getByTestId("enroll-fingerprint").textContent).toBe(FP);
@@ -87,16 +93,21 @@ describe("EnrollHostModal", () => {
     fireEvent.click(screen.getByText("Mint enrollment string"));
     await waitFor(() => expect(screen.getByTestId("enroll-command")).toBeTruthy());
     expect(screen.queryByTestId("enroll-fingerprint")).toBeNull();
-    expect(screen.getByTestId("enroll-command").textContent).toContain("QUASAR_ENROLLMENT='qenr1..");
+    const cmd = screen.getByTestId("enroll-command").textContent ?? "";
+    expect(cmd).toContain("QUASAR_ENROLLMENT='qenr1..");
+    expect(cmd.startsWith("curl -fsSL https://play.example.com/enroll-host.sh |")).toBe(true);
+    expect(cmd).not.toMatch(/ -k|pinnedpubkey/);
   });
 
-  it("falls back to the bare string when the build carries no source ref", async () => {
+  it("still composes the command when the build carries no source ref, just without QUASAR_REF", async () => {
     render(<EnrollHostModal open onClose={() => {}} origin="https://cp.example:8443" sourceRef="" />);
     await waitFor(() => expect(screen.getByText("Mint enrollment string")).toBeTruthy());
     fireEvent.click(screen.getByText("Mint enrollment string"));
-    await waitFor(() => expect(screen.getByTestId("enroll-string")).toBeTruthy());
-    expect(screen.queryByTestId("enroll-command")).toBeNull();
-    expect(screen.getByTestId("enroll-no-installer")).toBeTruthy();
+    await waitFor(() => expect(screen.getByTestId("enroll-command")).toBeTruthy());
+    const cmd = screen.getByTestId("enroll-command").textContent ?? "";
+    expect(cmd).not.toContain("QUASAR_REF");
+    expect(cmd.endsWith("' sh")).toBe(true);
+    expect(screen.queryByTestId("enroll-no-installer")).toBeNull();
   });
 
   it("no longer carries the runtime-contract prose the installer replaced", async () => {

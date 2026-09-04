@@ -601,17 +601,24 @@ In Admin → Fleet → Enroll host (open the console over `https://`), mint an e
 string. The dialog prints a command of the form
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/accreleus/quasar/<ref>/deploy/enroll-host.sh \
+curl -fsSL -k --pinnedpubkey 'sha256//<key hash>' https://<control-plane>/enroll-host.sh \
   | QUASAR_ENROLLMENT='qenr1.…' QUASAR_REF=<ref> sh
 ```
 
-Run it on the new machine as root (or a sudo user) with Docker installed. `<ref>` is the
-tag or commit this control plane was built from, so the script and the agent image it
-pins come from the same tree. The script is fetched from GitHub over a real-CA
-certificate — never `curl -k` — while the control plane's own identity comes from the
-fingerprint inside the string, which the agent pins. The string travels as an
-environment variable, not in a URL: it is single-use and expires in an hour, which is
-what makes a shell-history exposure bounded.
+Run it on the new machine as root, or as a user with **passwordless** sudo (the script
+never prompts; with a password-asking sudo it stops and says so — open a root shell with
+`sudo -i` and paste the command there). Docker must already be installed.
+
+The control plane serves the script itself (`/enroll-host.sh`, copied into the SPA at
+build time from `deploy/enroll-host.sh`), so it is the script from the tree the control
+plane runs. With the default self-signed certificate the command carries
+`-k --pinnedpubkey 'sha256//…'`: curl then trusts nothing but that public key, whose hash
+the dialog read from the same certificate it shows the fingerprint of — `-k` on its own
+would let anyone on the path feed the new host a root shell. With a real-CA certificate
+neither flag appears. `<ref>` is the tag or commit the control plane was built from and
+selects the matching agent image tag. The enrollment string travels as an environment
+variable, not in a URL: it is single-use and expires in an hour, which is what makes a
+shell-history exposure bounded.
 
 The script prints each step. It checks the host the way the agent's readiness does
 (Docker + Compose v2, a DRM render node, `/dev/uinput`, unprivileged user namespaces
@@ -628,8 +635,8 @@ Inputs it reads: `QUASAR_ENROLLMENT` (required), `QUASAR_REF`, `QUASAR_AGENT_IMA
 (an explicit digest reference, overriding the ref-derived tag), `QUASAR_DIR`
 (default `/opt/quasar-agent`), `NODE_NAME` (default: the hostname), `QUASAR_HOME_ROOT`
 (default `/var/lib/quasar/homes`), `QUASAR_RENDER_NODE`; `QUASAR_ENROLL_DRY_RUN=1`
-prints the plan and touches nothing. Read it first if you like:
-`curl -fsSL <that URL> | less`.
+prints the plan and touches nothing. Read it first if you like: the same `curl` piped
+into `less` instead of `sh`, or `deploy/enroll-host.sh` in this tree.
 
 **Manual / air-gapped path.** `sh deploy/enroll-host.sh --print-compose` prints the
 agent-only Compose file and `--print-nvidia-overlay` the NVIDIA overlay; put them in a

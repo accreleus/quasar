@@ -16,7 +16,9 @@ On the new machine you need:
 - Linux with a GPU whose kernel driver is loaded (`ls /dev/dri` shows a `renderD*` node).
 - Docker Engine and the Compose v2 plugin. The installer does not install Docker.
 - On an NVIDIA host, the NVIDIA Container Toolkit.
-- Root, or a user who can `sudo`.
+- Root, or a user with passwordless `sudo`. The script never prompts for a password; if
+  your `sudo` asks for one, open a root shell first (`sudo -i`) and paste the command
+  there.
 - A route to the control plane's `https://` address. Nothing else needs to be open
   towards the control plane; players reach the host directly for media, which the
   host's readiness check reports on afterwards.
@@ -27,13 +29,13 @@ Open the admin console **over `https://`**, go to **Fleet → Enroll host**, and
 **Mint enrollment string**. The dialog shows a command of this shape:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/accreleus/quasar/<ref>/deploy/enroll-host.sh \
+curl -fsSL -k --pinnedpubkey 'sha256//<key hash>' https://<control-plane>/enroll-host.sh \
   | QUASAR_ENROLLMENT='qenr1.…' QUASAR_REF=<ref> sh
 ```
 
-`<ref>` is the tag or commit your control plane was built from. The script and the
-agent image it pins come from that same tree, so a host you add tomorrow runs what the
-control plane runs today.
+The control plane serves the script itself, so it is the script from the tree the
+control plane runs, and `<ref>` — the tag or commit it was built from — selects the
+matching agent image. A host you add tomorrow runs what the control plane runs today.
 
 If the control plane serves its own self-signed certificate, the dialog also shows that
 certificate's fingerprint. It is the same value the control plane printed as
@@ -44,10 +46,13 @@ certificate there is nothing to compare and nothing is pinned.
 The string inside the command is single use and expires in an hour. Copy the command
 whole; it is meant to be pasted, not typed.
 
-<Aside type="tip" title="Why the string is in an environment variable, not the URL">
-The script is fetched from GitHub over a real-CA certificate, so `curl` verifies it
-normally and `-k` never appears. The control plane's identity is the fingerprint inside
-the string, which the agent pins. A token in a URL would land in proxy logs and browser
+<Aside type="tip" title="About -k, and why the string is an environment variable">
+`-k` never appears alone. With the default self-signed certificate the command pairs it
+with `--pinnedpubkey`, so `curl` trusts nothing except the control plane's own public
+key, whose hash the dialog read from the same certificate it shows the fingerprint of.
+Anyone on the path presenting another certificate is refused. With a real-CA
+certificate neither flag appears and `curl` verifies normally. The agent then pins the
+fingerprint inside the string. A token in a URL would land in proxy logs and browser
 history; in an environment variable, on a disposable credential, the only trace is your
 shell history, and the token is dead within the hour anyway.
 </Aside>

@@ -7222,6 +7222,8 @@ export interface components {
             source: "self_signed" | "provided";
             /** @description SHA-256 over the DER, uppercase colon-separated hex. The value to compare OUT OF BAND against the control-plane startup log before trusting a self-signed certificate. */
             fingerprint_sha256: string;
+            /** @description SHA-256 over the DER SubjectPublicKeyInfo, standard base64 — the value after `sha256//` in curl's `--pinnedpubkey`. The same key fingerprint_sha256 identifies, in the form key-pinning tools consume; the enroll-host one-liner (#100) uses it to fetch the installer from a self-signed control plane without trusting any CA. */
+            spki_sha256: string;
             subject?: string;
             issuer?: string;
             /** Format: date-time */

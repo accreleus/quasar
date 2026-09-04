@@ -78,7 +78,17 @@ MOCK
 chmod +x "$tmp/bin/docker"
 # sudo shim: the tests never run as root; the installer prefixes privileged
 # commands with sudo, which here just runs them.
-printf '#!/usr/bin/env bash\nexec "$@"\n' > "$tmp/bin/sudo"; chmod +x "$tmp/bin/sudo"
+# It refuses to run without -n (the installer must never let sudo prompt from
+# inside a pipe), and MOCK_SUDO_PASSWORD=1 makes it behave like a host whose
+# sudo wants a password.
+cat >"$tmp/bin/sudo" <<'MOCK'
+#!/usr/bin/env bash
+[ "${1:-}" = "-n" ] || { echo "mock sudo: invoked without -n (would prompt)" >&2; exit 97; }
+shift
+[ "${MOCK_SUDO_PASSWORD:-0}" = 1 ] && { echo "sudo: a password is required" >&2; exit 1; }
+exec "$@"
+MOCK
+chmod +x "$tmp/bin/sudo"
 
 # run_installer <label> [ENV=val ...] — runs the script piped through sh the way
 # the one-liner does (stdin is the script), captures stdout+stderr and rc.
@@ -129,6 +139,14 @@ fi
 
 
 # ── 2. preflights refuse before anything is written ──────────────────────────
+mk_root "$tmp/root"
+run_installer sudo-pw QUASAR_ENROLLMENT="$WSS_BLOB" NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes" MOCK_SUDO_PASSWORD=1
+if [ "$RC" -eq 1 ] && grep -q 'password' <<<"$OUT" && grep -q 'sudo -i' <<<"$OUT" && [ -z "$DOCKER_LOG" ] && [ ! -e "$tmp/install" ]; then
+  pass "sudo wants a password: refused up front with the root-shell way out; never prompts, touches nothing"
+else
+  fail "sudo password" "rc=$RC docker=[$DOCKER_LOG] out=$(head -4 <<<"$OUT")"
+fi
+
 mk_root "$tmp/root"
 printf '1\n' > "$tmp/root/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
 run_installer apparmor QUASAR_ENROLLMENT="$WSS_BLOB" NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes"
