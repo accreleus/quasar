@@ -10,13 +10,29 @@
     "title": "a clean title",
     "body": "Fetched the bundle from https://qdev.techanvil.net/assets/index.js and diffed it.\n",
     "comments": [
-      { "body": "Harness lives at /home/someone/code/quasar/scripts and uses ~/.ssh/id_ed25519_loopback.\n" }
+      {
+        "body": "Harness lives at /home/someone/code/quasar/scripts and uses ~/.ssh/id_ed25519_loopback.\n"
+      }
     ]
   },
   {
     "number": 103,
     "title": "entirely clean issue",
     "body": "Uses 192.0.2.5 and /path/to/quasar, which are the sanctioned stand-ins.\n",
-    "comments": [ { "body": "Role names only: gpu-test, aux-infra.\n" } ]
+    "comments": [
+      {
+        "body": "Role names only: gpu-test, aux-infra.\n"
+      }
+    ]
+  },
+  {
+    "number": 104,
+    "title": "encode stalls after resume",
+    "body": "Reproduced on Tower with the stack under /mnt/user/appdata/quasar.\n",
+    "comments": [
+      {
+        "body": "Same on devbox; hermes and qdev unaffected.\n"
+      }
+    ]
   }
 ]
