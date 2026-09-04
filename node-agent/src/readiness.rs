@@ -1096,26 +1096,23 @@ fn check_user_namespaces(env: &ProbeEnv, distro: Distro) -> ReadinessCheck {
 /// all and nothing to load.
 fn check_app_apparmor_profile(env: &ProbeEnv) -> ReadinessCheck {
     let over = container::app_apparmor_override();
-    let wanted = match over.as_deref() {
-        Some("unconfined") => None,
-        Some(name) => Some(name),
-        None => Some(container::APP_APPARMOR_PROFILE),
+    let name = match over.as_deref() {
+        Some("unconfined") | None => container::APP_APPARMOR_PROFILE,
+        Some(n) => n,
     };
-    let state = wanted.map(|name| container::apparmor_profile_state(&env.root, name));
     app_apparmor_check(
         container::host_uses_apparmor_in(&env.root),
-        state,
+        container::apparmor_profile_state(&env.root, name),
         over.as_deref(),
     )
 }
 
-/// The verdict, as a pure function of the three inputs — the same three
+/// The verdict, as a pure function of the same three inputs
 /// [`container::app_apparmor_choice`] decides the launch flag from, so the card and the
-/// launch cannot disagree. `state` is `None` when nothing is to be looked for (forced
-/// unconfined).
+/// launch cannot disagree.
 fn app_apparmor_check(
     host_uses_apparmor: bool,
-    state: Option<container::AppArmorProfileState>,
+    state: container::AppArmorProfileState,
     override_name: Option<&str>,
 ) -> ReadinessCheck {
     use container::AppArmorProfileState as S;
@@ -1145,11 +1142,11 @@ fn app_apparmor_check(
     }
     let named = override_name.unwrap_or(profile);
     match state {
-        Some(S::Loaded) => pass(
+        S::Loaded => pass(
             ID,
             format!("app containers are confined by the {named} AppArmor profile"),
         ),
-        Some(S::NotLoaded) if override_name.is_some() => warn_check(
+        S::NotLoaded if override_name.is_some() => warn_check(
             ID,
             format!(
                 "QUASAR_APP_APPARMOR_PROFILE names the {named} AppArmor profile, which is not \
@@ -1158,7 +1155,7 @@ fn app_apparmor_check(
             ),
             format!("Load {named} on the host, or unset the variable to fall back to {profile}/unconfined: {load}"),
         ),
-        Some(S::NotLoaded) => warn_check(
+        S::NotLoaded => warn_check(
             ID,
             format!(
                 "the {profile} AppArmor profile is not loaded, so app containers run \
@@ -1170,7 +1167,7 @@ fn app_apparmor_check(
         ),
         // Not "no profile": the agent cannot see the list at all, so it keeps the safe
         // fallback and says which mount is missing rather than guessing.
-        Some(S::Unknown) | None => warn_check(
+        S::Unknown => warn_check(
             ID,
             format!(
                 "cannot tell whether the {profile} AppArmor profile is loaded — the kernel's \
@@ -2651,18 +2648,18 @@ mod tests {
 
         // Not an AppArmor host: nothing to load, and no `apparmor=` flag is passed at all.
         assert_eq!(
-            app_apparmor_check(false, Some(NotLoaded), None).status,
+            app_apparmor_check(false, NotLoaded, None).status,
             SKIP
         );
 
-        let loaded = app_apparmor_check(true, Some(Loaded), None);
+        let loaded = app_apparmor_check(true, Loaded, None);
         assert_eq!(loaded.status, PASS);
         assert!(loaded.summary.contains("quasar-app"), "{loaded:?}");
 
         // Never a failure: without the profile the agent falls back to unconfined and
         // sessions run exactly as they did before #76.
         for state in [NotLoaded, Unknown] {
-            let c = app_apparmor_check(true, Some(state), None);
+            let c = app_apparmor_check(true, state, None);
             assert_eq!(c.status, WARN, "{c:?}");
             assert!(
                 c.remediation.contains("apparmor_parser -r -W"),
@@ -2671,17 +2668,17 @@ mod tests {
         }
         // "cannot read the list" must name the missing mount, not send the operator to
         // re-load a profile that may already be there.
-        assert!(app_apparmor_check(true, Some(Unknown), None)
+        assert!(app_apparmor_check(true, Unknown, None)
             .remediation
             .contains("/host/sys/kernel/security"));
 
         // Forced unconfined is a posture, not a fault — but it must not read as green.
-        let forced = app_apparmor_check(true, None, Some("unconfined"));
+        let forced = app_apparmor_check(true, Unknown, Some("unconfined"));
         assert_eq!(forced.status, WARN);
         assert!(forced.summary.contains("QUASAR_APP_APPARMOR_PROFILE"));
 
         // An override naming a profile the host does not have breaks every launch.
-        let missing = app_apparmor_check(true, Some(NotLoaded), Some("site-profile"));
+        let missing = app_apparmor_check(true, NotLoaded, Some("site-profile"));
         assert_eq!(missing.status, WARN);
         assert!(missing.summary.contains("site-profile"), "{missing:?}");
     }

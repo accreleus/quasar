@@ -1492,6 +1492,10 @@ pub(crate) const APP_APPARMOR_LOAD_CMD: &str =
 /// host's read-only at `/host/sys/kernel/security` (the `/host/dev` convention). The bare
 /// path is the bare-metal agent's own. An agent whose compose predates that mount reads
 /// neither and gets [`AppArmorProfileState::Unknown`].
+///
+/// The `/host` prefix is also what makes the read succeed at all in a container: the agent
+/// itself runs under `docker-default`, whose `deny /sys/kernel/security/** rwklx` covers the
+/// bare path but not the bind's. Do not "simplify" this to the direct path.
 const APPARMOR_PROFILES_RELS: [&str; 2] = [
     "host/sys/kernel/security/apparmor/profiles",
     "sys/kernel/security/apparmor/profiles",
