@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the version numbers are [semantic](https://semver.org/). `Unreleased` tracks
 `develop`; each released version gets a dated section below it.
 
+**Each released version needs a `## X.Y.Z — YYYY-MM-DD` section with a non-empty
+body, and it must exist on `main` before the tag is pushed.** The Images workflow
+publishes that section verbatim as the GitHub Release notes and **refuses a tag
+whose section is missing or empty** — before any image is built, so the fix is to
+add the section and re-tag, not to wait out an 85-minute build. A prerelease tag
+needs its own section under its full version (`## 0.2.0-rc.1 — 2026-09-04`): a
+`## 0.2.0` heading does not satisfy `v0.2.0-rc.1`. `scripts/release/changelog-section.sh <version>`
+prints exactly what the release will carry.
+
 The published runtime images (`quasar-control-plane` and `quasar-node-agent` —
 named `quasar-control` and `quasar-vulkan` through 0.1.0, alongside a third,
 `quasar-nv`, retired after it) carry the release version as an immutable

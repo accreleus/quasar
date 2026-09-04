@@ -80,6 +80,8 @@ ephemeral test database) so parallel checkouts and agents never collide.
 | `deploy/seed-tls-hosts.sh` | Idempotent TLS-host seed (operator path; run automatically by `redeploy.sh`) |
 | `scripts/dev/seed-*.sh` | Idempotent catalog seeds for development (benchmark apps, diagnostics app) |
 | `scripts/release/release-preflight.sh` · `generate-release-sbom.sh` · `scan-release-image.sh` | Release-evidence gates — deliberately separate artifacts, shared `release-supply-chain-lib.sh` |
+| `scripts/release/changelog-section.sh` | Prints one version's `CHANGELOG.md` section — the release notes. The tag-push workflow refuses a tag whose section is missing or empty, before any build |
+| `scripts/release/generate-platform-release-manifest.sh` · `validate-platform-release-manifest.sh` | Write and check `platform-release-manifest.json`, the GitHub Release asset naming each component image by digest ([schema](../scripts/release/platform-release-manifest.md)). Not `scripts/release/release-manifest.json`, which is the preflight's committed INPUTS file |
 | `scripts/harness/lib/harness.sh` (+ `harness-selftest.sh`) | PASS/FAIL/SKIP/report core every `run-*.sh` harness builds on |
 
 ### Where things live
@@ -94,7 +96,7 @@ else moved out on 2026-08-27:
 | `scripts/dev/` | `dev.sh`, the compose-overlay test, the volume migrator, the local-audio validator, the dev seeders and the diagnostics-app image |
 | `scripts/verify/` | The verify stage scripts plus the devtools image they run on |
 | `scripts/harness/` | Acceptance harnesses (`run-*.sh`), `lib/`, `checks/`, `fixtures/`, the `apitest` Go module, and `peer-driver.mjs` (the headless WebRTC peer driver, formerly `p4-troubleshoot.mjs`) |
-| `scripts/release/` | Release preflight, supply-chain lib + manifest, SBOM, image scan, the Vulkan encoder runtime probe, and their offline contract tests |
+| `scripts/release/` | Release preflight, supply-chain lib + manifest, SBOM, image scan, the Vulkan encoder runtime probe, the tag-push release lane's changelog/manifest scripts, and their offline contract tests |
 
 ### Deploying and proving the agent on a host
 
@@ -158,7 +160,7 @@ issue closes (precedent: 2026-07-17; recover any from git history). Current set:
 | `scripts/harness/peer-driver.mjs` | The headless WebRTC peer the shell harnesses drive |
 | `scripts/dev/validate-local-audio.sh` | Console-mode Pulse sidecar audio |
 | `scripts/release/probe-vulkan-encoder-runtime.sh` | Vulkan encoder actually registered on this GPU |
-| `scripts/release/test-*.sh` | Offline contract tests for the release scripts (mock docker) |
+| `scripts/release/test-*.sh` | Offline contract tests for the release scripts (mock docker, fixtures). `test-release-preflight.sh`, `test-release-supply-chain.sh`, `test-probe-vulkan-encoder-runtime.sh`, `test-changelog-section.sh`, `test-platform-release-manifest.sh`. Run them by hand — no verify stage does |
 | `deploy/db-backup-restore-drill.sh` | Postgres backup/restore drill (disposable containers) |
 
 The phase-era harnesses (`run-p1-10-demo`, `run-p3-multihost`, `run-p5-home`,
