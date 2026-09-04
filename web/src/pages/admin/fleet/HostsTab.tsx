@@ -303,8 +303,11 @@ export function HostsTab() {
           // active sessions, checked live rather than off `status` — so an
           // offline row still gets the real confirm, everything else gets
           // the explanation + a way to get there (#101).
-          const removable = forgetTarget.status === "offline";
-          const draining = forgetTarget.status === "draining" || actionPendingId === forgetTarget.id;
+          // Read the LIVE row, not the snapshot taken when the dialog opened:
+          // Drain from inside the dialog changes the status it is explaining.
+          const live = hosts.find((h) => h.id === forgetTarget.id) ?? forgetTarget;
+          const removable = live.status === "offline";
+          const draining = live.status === "draining" || actionPendingId === live.id;
           return (
             <Modal
               open
@@ -329,7 +332,7 @@ export function HostsTab() {
                     <Button variant="ghost" onClick={() => setForgetTarget(null)}>
                       Close
                     </Button>
-                    <Button variant="primary" disabled={draining} onClick={() => drainRow(forgetTarget)}>
+                    <Button variant="primary" disabled={draining} onClick={() => drainRow(live)}>
                       {draining ? "Draining…" : "Drain"}
                     </Button>
                   </>
