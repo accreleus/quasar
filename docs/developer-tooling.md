@@ -82,6 +82,7 @@ ephemeral test database) so parallel checkouts and agents never collide.
 | `scripts/release/release-preflight.sh` · `generate-release-sbom.sh` · `scan-release-image.sh` | Release-evidence gates — deliberately separate artifacts, shared `release-supply-chain-lib.sh` |
 | `scripts/release/changelog-section.sh` | Prints one version's `CHANGELOG.md` section — the release notes. The tag-push workflow refuses a tag whose section is missing or empty, before any build |
 | `scripts/release/generate-platform-release-manifest.sh` · `validate-platform-release-manifest.sh` | Write and check `platform-release-manifest.json`, the GitHub Release asset naming each component image by digest ([schema](../scripts/release/platform-release-manifest.md)). Not `scripts/release/release-manifest.json`, which is the preflight's committed INPUTS file |
+| `scripts/release/release-cut.sh` (`make release VERSION=x.y.z`) | Cuts a release in one command (#109): moves `## Unreleased` into a dated section, commits + tags `vX.Y.Z` on `main`, pushes both — the push is what fires the tag-push lane above. `--dry-run` previews; `--transform` is the pure changelog rewrite (fixture-testable, no git) |
 | `scripts/harness/lib/harness.sh` (+ `harness-selftest.sh`) | PASS/FAIL/SKIP/report core every `run-*.sh` harness builds on |
 
 ### Where things live
@@ -160,7 +161,7 @@ issue closes (precedent: 2026-07-17; recover any from git history). Current set:
 | `scripts/harness/peer-driver.mjs` | The headless WebRTC peer the shell harnesses drive |
 | `scripts/dev/validate-local-audio.sh` | Console-mode Pulse sidecar audio |
 | `scripts/release/probe-vulkan-encoder-runtime.sh` | Vulkan encoder actually registered on this GPU |
-| `scripts/release/test-*.sh` | Offline contract tests for the release scripts (mock docker, fixtures). `test-release-preflight.sh`, `test-release-supply-chain.sh`, `test-probe-vulkan-encoder-runtime.sh`, `test-changelog-section.sh`, `test-platform-release-manifest.sh`. Run them by hand — no verify stage does |
+| `scripts/release/test-*.sh` | Offline contract tests for the release scripts (mock docker, fixtures). `test-release-preflight.sh`, `test-release-supply-chain.sh`, `test-probe-vulkan-encoder-runtime.sh`, `test-changelog-section.sh`, `test-platform-release-manifest.sh`, `test-release-cut.sh` (git-dependent cases run against a throwaway repo + bare "origin" under `mktemp`, never the real remote). Run them by hand — no verify stage does |
 | `deploy/db-backup-restore-drill.sh` | Postgres backup/restore drill (disposable containers) |
 
 The phase-era harnesses (`run-p1-10-demo`, `run-p3-multihost`, `run-p5-home`,

@@ -248,6 +248,43 @@ the older version.
 
 ---
 
+## Cutting a release
+
+This is for a maintainer publishing a new Quasar version, not for a
+self-hoster upgrading one — see "Which version to move to" above for that.
+
+`make release VERSION=x.y.z` (`scripts/release/release-cut.sh`) is the one
+command: on a clean `main` that matches `origin/main`, it moves
+`CHANGELOG.md`'s `## Unreleased` section into a dated `## X.Y.Z — YYYY-MM-DD`
+section directly above the old one, leaving a fresh empty `## Unreleased` in
+its place, commits that (`chore(release): x.y.z`), tags the commit `vX.Y.Z`
+(annotated), and pushes both. Pushing the tag is what triggers the tag-push
+release lane (`.github/workflows/images.yml`, #108): it builds and validates
+the images, then publishes them, a GitHub Release whose body is that
+version's changelog section, and a `platform-release-manifest.json` asset.
+
+It refuses — with a one-line reason, before touching anything — unless:
+
+- the repo is on `main`, with a clean working tree that matches `origin/main`
+- `VERSION` is strict semver (`X.Y.Z`, an optional `-prerelease` part is
+  allowed for a release candidate; no leading `v`, no build metadata) and
+  strictly newer than the newest existing `v*` tag
+- the `## Unreleased` section is non-empty
+
+It never merges `develop` into `main` for you — that merge, and the operator
+sign-off it requires (`CLAUDE.md`, "Git branching & environments"), happens
+first, by hand. Add `DRY_RUN=1` to see the changelog diff and the exact git
+commands it would run without executing any of them:
+
+```bash
+make release VERSION=0.2.0 DRY_RUN=1   # preview
+make release VERSION=0.2.0             # cut, commit, tag and push v0.2.0
+```
+
+A prerelease tag (`v0.2.0-rc.1`) runs the same workflow and publishes a GitHub
+prerelease instead of a stable release — useful for exercising the publish
+lane before cutting the real version.
+
 ## See also
 
 - [`../CHANGELOG.md`](../CHANGELOG.md): what changed in each released version
