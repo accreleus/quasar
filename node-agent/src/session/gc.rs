@@ -16,7 +16,7 @@
 
 use crate::cp_http::CpClient;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
@@ -227,7 +227,7 @@ impl GcClient {
             );
             return false;
         }
-        match std::fs::remove_dir_all(&path) {
+        let removed = match std::fs::remove_dir_all(&path) {
             Ok(()) => {
                 info!("gc: removed local home dir {dir}");
                 true
@@ -243,7 +243,11 @@ impl GcClient {
                 );
                 false
             }
+        };
+        if removed {
+            prune_empty_throwaway_parent(&root, &path);
         }
+        removed
     }
 
     // ── HTTP ────────────────────────────────────────────────────────────────
@@ -265,6 +269,41 @@ impl GcClient {
         }
         let parsed: ConfirmResp = self.cp.post_json(GC_CONFIRM_PATH, &body)?;
         Ok(parsed.deleted)
+    }
+}
+
+/// Remove the throwaway-identity home directory a reap has just emptied.
+///
+/// The local driver lays a home out as `<root>/<user-slug>/<app-slug>`, so
+/// reaping one app leaves `<root>/<user-slug>/` behind. That is not merely
+/// untidy: removing the child bumps the parent's mtime, which restarts
+/// `homes_gc`'s idle clock, so an emptied ephemeral home looks freshly used for
+/// another full retention window (#92).
+///
+/// Confined three ways: the parent must be a DIRECT child of `root`, its name
+/// must be an exact ephemeral username (`homes_gc::is_throwaway_name` — a real
+/// account's home never matches), and removal is `remove_dir`, which the kernel
+/// refuses on a non-empty directory. A second app's home under the same user
+/// therefore survives, and that refusal is silent because it is the normal case.
+fn prune_empty_throwaway_parent(root: &Path, home_dir: &Path) -> bool {
+    let Some(parent) = home_dir.parent() else {
+        return false;
+    };
+    if parent.parent() != Some(root) {
+        return false;
+    }
+    let Some(name) = parent.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if !crate::session::homes_gc::is_throwaway_name(name) {
+        return false;
+    }
+    match std::fs::remove_dir(parent) {
+        Ok(()) => {
+            info!("gc: removed emptied throwaway home {}", parent.display());
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -335,6 +374,58 @@ fn summarize(pass: GcPass) -> crate::jobs::JobOutcome {
 mod tests {
     use super::*;
     use crate::jobs::JobOutcome;
+
+    /// #92: reaping `<root>/<user>/<app>` must take the emptied ephemeral parent
+    /// with it, or `homes_gc`'s idle clock restarts on the removal.
+    #[test]
+    fn an_emptied_throwaway_parent_goes_with_the_last_app_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("homes");
+        let user = root.join("agent-0bdc5920-fc5182ea");
+        let app = user.join("kde-desktop");
+        std::fs::create_dir_all(&app).unwrap();
+
+        std::fs::remove_dir_all(&app).unwrap();
+        assert!(prune_empty_throwaway_parent(&root, &app));
+        assert!(!user.exists(), "the emptied throwaway home must go too");
+    }
+
+    #[test]
+    fn a_parent_still_holding_another_app_home_survives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("homes");
+        let user = root.join("agent-0bdc5920-fc5182ea");
+        let reaped = user.join("kde-desktop");
+        std::fs::create_dir_all(&reaped).unwrap();
+        std::fs::create_dir_all(user.join("steam")).unwrap();
+
+        std::fs::remove_dir_all(&reaped).unwrap();
+        assert!(!prune_empty_throwaway_parent(&root, &reaped));
+        assert!(user.exists(), "a home with another app must survive");
+    }
+
+    /// A real account's home is never removed, and neither is anything that is
+    /// not a direct child of the root.
+    #[test]
+    fn only_a_direct_child_of_root_with_a_throwaway_name_is_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("homes");
+
+        let real = root.join("salty2011");
+        std::fs::create_dir_all(&real).unwrap();
+        assert!(!prune_empty_throwaway_parent(&root, &real.join("app")));
+        assert!(real.exists(), "a real account's home is never a candidate");
+
+        // Two levels down: the parent is not a direct child of the root.
+        let nested = root.join("agent-13d96fa5-8dff9894/sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(!prune_empty_throwaway_parent(&root, &nested.join("app")));
+        assert!(nested.exists());
+
+        // The root itself must never be removed, however empty.
+        assert!(!prune_empty_throwaway_parent(&root, &root.join("anything")));
+        assert!(root.exists());
+    }
 
     #[test]
     fn a_pass_with_nothing_pending_is_skipped_with_a_reason() {
