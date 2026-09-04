@@ -54,10 +54,86 @@ TAIL_SECS="${QUASAR_ENROLL_TAIL_SECS:-90}"
 DRY="${QUASAR_ENROLL_DRY_RUN:-0}"
 PROJECT="quasar-agent"
 
-say() { printf '%s\n' "$*"; }
-step() { printf '\n==> %s\n' "$*"; }
-usage_error() { printf 'enroll-host: %s\n' "$*" >&2; exit 2; }
-host_error() { printf 'enroll-host: %s\n' "$*" >&2; exit 1; }
+# ── rendering ────────────────────────────────────────────────────────────────
+# Two styles. `plain` is the log form: what goes into bug reports, CI output and
+# `| tee`; `tty` adds colour, ticks and lines that rewrite themselves while a
+# step runs. Picked from the terminal unless QUASAR_ENROLL_STYLE says otherwise;
+# NO_COLOR and TERM=dumb force plain. Every line of information is printed in
+# both — tty only changes how, never what.
+STYLE="${QUASAR_ENROLL_STYLE:-}"
+if [ -z "$STYLE" ]; then
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then STYLE=tty; else STYLE=plain; fi
+fi
+case "$STYLE" in tty|plain) ;; *) STYLE=plain ;; esac
+UNICODE=0
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) UNICODE=1 ;; esac
+if [ "$STYLE" = tty ]; then
+  C_OK="$(printf '\033[32m')"; C_WARN="$(printf '\033[33m')"; C_ERR="$(printf '\033[31m')"
+  C_DIM="$(printf '\033[2m')"; C_BOLD="$(printf '\033[1m')"; C_OFF="$(printf '\033[0m')"
+  CLR="$(printf '\r\033[K')"
+else
+  C_OK=""; C_WARN=""; C_ERR=""; C_DIM=""; C_BOLD=""; C_OFF=""; CLR=""
+fi
+if [ "$UNICODE" = 1 ]; then
+  G_OK="✔"; G_FAIL="✘"; G_WARN="!"; SPIN_FRAMES="⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏"
+else
+  G_OK="[ok]"; G_FAIL="[!!]"; G_WARN="[!]"; SPIN_FRAMES="- \\ | /"
+fi
+
+# A spinner is a background loop rewriting one line; it MUST be stopped before
+# anything else prints, so every printer below calls spin_stop first.
+SPIN_PID=""
+spin_start() { # spin_start <label>
+  [ "$STYLE" = tty ] || return 0
+  spin_stop
+  (
+    set +e
+    # shellcheck disable=SC2086
+    set -- $SPIN_FRAMES
+    while :; do
+      printf '%s  %s %s' "$CLR" "$1" "$SPIN_LABEL"
+      f="$1"; shift; set -- "$@" "$f"
+      sleep 0.1
+    done
+  ) &
+  SPIN_PID=$!
+}
+spin_stop() {
+  [ -n "$SPIN_PID" ] || return 0
+  { kill "$SPIN_PID" && wait "$SPIN_PID"; } 2>/dev/null || true
+  SPIN_PID=""
+  printf '%s' "$CLR"
+}
+spin() { SPIN_LABEL="$1"; spin_start; }
+
+say() { spin_stop; printf '%s\n' "$*"; }
+step() {
+  spin_stop
+  if [ "$STYLE" = tty ]; then printf '\n%s==> %s%s\n' "$C_BOLD" "$*" "$C_OFF"; else printf '\n==> %s\n' "$*"; fi
+}
+# ok/warn: one fact that went well / one that needs a look. Plain prints the
+# bare text; tty prefixes a coloured glyph.
+ok() {
+  spin_stop
+  if [ "$STYLE" = tty ]; then printf '  %s%s%s %s\n' "$C_OK" "$G_OK" "$C_OFF" "$*"; else printf '  %s\n' "$*"; fi
+}
+warn() {
+  spin_stop
+  if [ "$STYLE" = tty ]; then printf '  %s%s%s %s\n' "$C_WARN" "$G_WARN" "$C_OFF" "$*"; else printf '  WARN: %s\n' "$*"; fi
+}
+dim() { spin_stop; if [ "$STYLE" = tty ]; then printf '  %s%s%s\n' "$C_DIM" "$*" "$C_OFF"; else printf '  %s\n' "$*"; fi; }
+usage_error() { spin_stop; printf '%senroll-host: %s%s\n' "$C_ERR" "$*" "$C_OFF" >&2; exit 2; }
+host_error() {
+  spin_stop
+  if [ "$STYLE" = tty ]; then printf '  %s%s enroll-host: %s%s\n' "$C_ERR" "$G_FAIL" "$*" "$C_OFF" >&2; else printf 'enroll-host: %s\n' "$*" >&2; fi
+  exit 1
+}
+ENV_TMP=""
+# Always exits 0: under dash a failing last command in an EXIT trap replaces
+# the script's own exit status.
+cleanup() { spin_stop; if [ -n "$ENV_TMP" ]; then rm -f "$ENV_TMP"; fi; return 0; }
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
 
 # ── the compose text (kept in lockstep with deploy/docker-compose.yml) ───────
 compose_yaml() {
@@ -263,12 +339,13 @@ fi
 # ── 2. host preflights (the readiness checks, before anything is written) ────
 step "Host preflights"
 
+spin "checking docker"
 command -v docker >/dev/null 2>&1 || host_error "docker is not installed. Install Docker Engine first (https://docs.docker.com/engine/install/) — this script does not install it."
 if [ "$DRY" != 1 ]; then
   $SUDO docker info >/dev/null 2>&1 || host_error "the Docker daemon is not reachable (is it running, and can $(id -un) use it?)"
 fi
 docker compose version >/dev/null 2>&1 || host_error "the Docker Compose v2 plugin is missing ('docker compose version' fails). Install docker-compose-plugin."
-say "  docker + compose: ok"
+ok "docker + compose: ok"
 
 distro=""
 if [ -r "$ROOT/etc/os-release" ]; then
@@ -289,22 +366,22 @@ for vendor_file in "$ROOT"/sys/class/drm/renderD*/device/vendor; do
   esac
 done
 [ -n "$gpu" ] || host_error "no DRM render node with a known GPU vendor under /sys/class/drm (renderD*). The agent needs a GPU with a loaded kernel driver; check 'ls /dev/dri' and the driver install."
-say "  gpu: $gpu ($render_node)"
+ok "gpu: $gpu ($render_node)"
 
 if [ "$gpu" = nvidia ]; then
   if ! command -v nvidia-ctk >/dev/null 2>&1 && ! command -v nvidia-container-cli >/dev/null 2>&1; then
     host_error "NVIDIA GPU, but the NVIDIA Container Toolkit is not installed (no nvidia-ctk / nvidia-container-cli). The agent's compose uses 'gpus: all'. Install it: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html"
   fi
   if [ ! -e "$ROOT/etc/cdi/nvidia.yaml" ] && [ ! -e "$ROOT/var/run/cdi/nvidia.yaml" ]; then
-    say "  WARN: no CDI spec at /etc/cdi/nvidia.yaml — if the agent's readiness reports a CDI problem, generate one:"
+    warn "no CDI spec at /etc/cdi/nvidia.yaml — if the agent's readiness reports a CDI problem, generate one:"
     say "        sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml"
   fi
-  say "  nvidia container toolkit: ok"
+  ok "nvidia container toolkit: ok"
 fi
 
 [ -e "$ROOT/dev/uinput" ] || host_error "/dev/uinput is missing — virtual keyboard, mouse and gamepad injection cannot work. Load the module:
   sudo modprobe uinput && echo uinput | sudo tee /etc/modules-load.d/uinput.conf"
-say "  /dev/uinput: ok"
+ok "/dev/uinput: ok"
 
 # Unprivileged user namespaces, in the order readiness.rs decides them.
 knob="$ROOT/proc/sys/kernel/unprivileged_userns_clone"
@@ -326,7 +403,7 @@ if [ -r "$knob" ] && [ "$(tr -d '[:space:]' < "$knob")" = 0 ]; then
   host_error "unprivileged user namespaces are disabled (user.max_user_namespaces=0) — sandboxed app launchers cannot start. Fix, then re-run:
   $hint"
 fi
-say "  user namespaces: ok"
+ok "user namespaces: ok"
 
 # ── 3. the agent image, pinned to the ref this script came from ──────────────
 step "Agent image"
@@ -350,11 +427,15 @@ fi
 if [ "$DRY" = 1 ]; then
   say "  would use: ${image:-$LOCAL_IMAGE (local build, if present)} ($image_from)"
 else
+  [ -n "$image" ] && spin "pulling $image"
   if [ -n "$image" ] && $SUDO docker pull "$image" >/dev/null 2>&1; then
-    say "  pulled $image (from $image_from)"
+    ok "pulled $image (from $image_from)"
   elif $SUDO docker image inspect "$LOCAL_IMAGE" >/dev/null 2>&1; then
-    [ -n "$image" ] && say "  WARN: could not pull $image (from $image_from)"
-    say "  using the local build $LOCAL_IMAGE already on this host"
+    if [ -n "$image" ]; then
+      ok "image: $LOCAL_IMAGE (local build; $image is not published)"
+    else
+      ok "image: $LOCAL_IMAGE (local build)"
+    fi
     image="$LOCAL_IMAGE"
   else
     host_error "no agent image: ${image:+could not pull $image (from $image_from), and }$LOCAL_IMAGE is not on this host. For a release, re-run with QUASAR_REF=<the release tag> or QUASAR_AGENT_IMAGE=<digest reference from the release body>; for a source build, build $LOCAL_IMAGE here with deploy/build-images.sh first."
@@ -396,10 +477,10 @@ fi
 managed='^(QUASAR_ENROLLMENT|NODE_NAME|QUASAR_AGENT_IMAGE|QUASAR_HOME_ROOT|QUASAR_RENDER_NODE|COMPOSE_FILE|COMPOSE_PROJECT_NAME)='
 umask 077
 env_tmp="$(mktemp)"
-trap 'rm -f "$env_tmp"' EXIT
+ENV_TMP="$env_tmp"
 if $SUDO test -f "$DIR/.env"; then
   $SUDO cat "$DIR/.env" | grep -Ev "$managed" > "$env_tmp" || true
-  say "  updating existing $DIR/.env (operator lines kept)"
+  dim "updating existing $DIR/.env (operator lines kept)"
 else
   printf '# Written by deploy/enroll-host.sh. Add agent knobs (docs/configuration.md) below.\n' > "$env_tmp"
 fi
@@ -413,8 +494,12 @@ fi
   printf 'QUASAR_ENROLLMENT=%s\n' "$blob"
 } >> "$env_tmp"
 $SUDO install -m 0600 "$env_tmp" "$DIR/.env"
-rm -f "$env_tmp"
-say "  wrote $DIR/docker-compose.yml${gpu:+ }$( [ "$gpu" = nvidia ] && printf '+ docker-compose.nvidia.yml ')and .env (0600)"
+rm -f "$env_tmp"; ENV_TMP=""
+if [ "$gpu" = nvidia ]; then
+  ok "wrote $DIR/docker-compose.yml + docker-compose.nvidia.yml and .env (0600)"
+else
+  ok "wrote $DIR/docker-compose.yml and .env (0600)"
+fi
 
 # ── 5. start (or update) the one agent ───────────────────────────────────────
 step "Starting the node agent"
@@ -426,13 +511,55 @@ compose() {
   $SUDO docker compose --project-directory "$DIR" --project-name "$PROJECT" \
     $(printf '%s' "$compose_files" | tr ':' '\n' | sed "s#^#-f $DIR/#" | tr '\n' ' ') "$@"
 }
-compose up -d quasar-node-agent
-say "  started (compose project '$PROJECT'; re-running this script updates it in place)"
+# tty: Compose's own progress block is noise when it works and evidence when
+# it does not — captured, shown only on failure. plain: passed through as-is.
+if [ "$STYLE" = tty ]; then
+  spin "starting the node agent"
+  if ! up_out="$(compose up -d quasar-node-agent 2>&1)"; then
+    spin_stop
+    printf '%s\n' "$up_out" >&2
+    host_error "docker compose up failed (output above)"
+  fi
+else
+  compose up -d quasar-node-agent
+fi
+ok "started (compose project '$PROJECT'; re-running this script updates it in place)"
+
+summary_paths() {
+  [ "$STYLE" = tty ] || return 0
+  dim "files:  $DIR/docker-compose.yml, $DIR/.env"
+  dim "logs:   docker compose --project-directory $DIR logs -f quasar-node-agent"
+  dim "update: re-run this command; it never adds a second agent"
+}
+summary() {
+  summary_paths
+  say ""
+  say "Firewall was not touched. If sessions launch but video never arrives, the"
+  say "host's readiness in Admin → Fleet names the UDP range and the exact rule."
+}
 
 # ── 6. wait for enrollment ───────────────────────────────────────────────────
 step "Waiting for enrollment (up to ${TAIL_SECS}s)"
 elapsed=0
 verdict=""
+tick=0
+# tty: the wait is one line that keeps moving — a frame every half second, the
+# log read every two. plain: the log read every two seconds, nothing printed.
+wait_beat() {
+  if [ "$STYLE" = tty ]; then
+    for _ in 1 2 3 4; do
+      # shellcheck disable=SC2086
+      set -- $SPIN_FRAMES
+      eval "frame=\${$((tick % 10 + 1))}"
+      printf '%s  %s waiting for the agent to enroll… %ss' "$CLR" "$frame" "$elapsed"
+      tick=$((tick + 1))
+      sleep 0.5
+    done
+  else
+    sleep 2
+  fi
+  elapsed=$((elapsed + 2))
+}
 while :; do
   logs="$(compose logs --no-log-prefix --since "$started_at" quasar-node-agent 2>/dev/null || true)"
   if printf '%s' "$logs" | grep -q 'enrolled as host'; then
@@ -452,18 +579,18 @@ while :; do
   state="$(compose ps --format '{{.State}}' quasar-node-agent 2>/dev/null || true)"
   case "$state" in exited*|dead*) verdict=exited; break ;; esac
   [ "$elapsed" -lt "$TAIL_SECS" ] || { verdict=timeout; break; }
-  sleep 2; elapsed=$((elapsed + 2))
+  wait_beat
 done
+[ "$STYLE" = tty ] && printf '%s' "$CLR"
 
 case "$verdict" in
   enrolled)
-    say "  enrolled: this host is now '$node_name' in Admin → Fleet."
-    say ""
-    say "Firewall was not touched. If sessions launch but video never arrives, the"
-    say "host's readiness in Admin → Fleet names the UDP range and the exact rule."
+    ok "enrolled: this host is now '$node_name' in Admin → Fleet."
+    summary
     exit 0 ;;
   reconnected)
-    say "  already enrolled: the agent reconnected as '$node_name' with its saved node secret."
+    ok "already enrolled: the agent reconnected as '$node_name' with its saved node secret."
+    summary_paths
     exit 0 ;;
   auth_failed)
     host_error "the control plane refused the credential (auth_failed). The token was expired, already used, minted for a different node name, or '$node_name' already has a live agent. Mint a fresh string in Admin → Fleet → Enroll host and re-run." ;;
