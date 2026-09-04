@@ -199,6 +199,15 @@
       "paths": {
         "forbidden": ["/root/.npm", "/go", "/usr/local/go"]
       },
+      "labels": {
+        "required": [
+          "org.quasar.image.role",
+          "org.quasar.pins.base",
+          "org.quasar.source.commit",
+          "org.quasar.built.at"
+        ],
+        "_notes": "Provenance, the same assertion the runtime role carries. The control plane also SERVES its identity (GET /v1/admin/platform/identity) from linker stamps passed by the same build args, so a missing label here means the served identity is unstamped too."
+      },
       "image_config": {
         "healthcheck_required": true,
         "must_not_run_as_root": true

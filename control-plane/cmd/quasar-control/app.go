@@ -30,6 +30,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/jobs"
 	"github.com/accreleus/quasar/control-plane/internal/library"
 	"github.com/accreleus/quasar/control-plane/internal/origins"
+	"github.com/accreleus/quasar/control-plane/internal/platform"
 	"github.com/accreleus/quasar/control-plane/internal/secrets"
 	"github.com/accreleus/quasar/control-plane/internal/session"
 	"github.com/accreleus/quasar/control-plane/internal/settings"
@@ -79,6 +80,7 @@ type Services struct {
 	invitesHandler  *invites.Handler
 	enrollHandler   *hostenroll.Handler
 	consoleHandler  *console.Handler
+	platformHandler *platform.Handler
 	auditHandler    *audit.Handler
 	artworkHandler  *artwork.Handler
 	secretsHandler  *secrets.Handler
@@ -817,6 +819,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		invitesHandler:   invitesHandler,
 		enrollHandler:    enrollHandler,
 		consoleHandler:   consoleHandler,
+		platformHandler:  platform.NewHandler(),
 		auditHandler:     auditHandler,
 		artworkHandler:   artworkHandler,
 		secretsHandler:   secretsHandler,
@@ -857,6 +860,7 @@ func (s *Services) RegisterRoutes(mux httpx.Router) {
 	s.invitesHandler.Register(mux, admin)
 	s.enrollHandler.Register(mux, admin)
 	s.consoleHandler.Register(mux, admin)
+	s.platformHandler.Register(mux, admin)
 	s.auditHandler.Register(mux, admin)
 	s.secretsHandler.Register(mux, admin)
 	s.artworkHandler.Register(mux, s.authHandler.RequireAuth, s.authHandler.RequireAdmin)

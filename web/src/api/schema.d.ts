@@ -3759,6 +3759,13 @@ export interface paths {
                         image_update_policy?: "manual" | "notify" | "auto";
                         /** @description First-run wizard v2 §S6e (migration 0064). The signaling origin allow-list. ABSENT = UNCHANGED; an explicitly-sent [] CLEARS the list. Those are different requests and the server distinguishes them (pointer decode), so a PATCH that only changes the registration mode can never wipe the allow-list. Each entry must be scheme + host only (http/https, no path, query, credentials or trailing slash); the server stores the NORMALIZED form, so what is saved is exactly what /v1/signal compares against. "*" IS REJECTED OUTRIGHT with 400 validation_failed - a wildcard would discard the layer entirely. A bad entry is 400 naming its position, and nothing is written. Setting this does NOT lift an environment override: when QUASAR_ALLOWED_ORIGINS is SET it wins, and GET /v1/admin/access-check reports which source is in force. */
                         allowed_origins?: string[];
+                        /**
+                         * @description Platform-release amendment 1 (#104/#106, migration 0074). Which platform releases the admin console is shown. Absent = unchanged (pointer decode, the same rule every field on this body follows - a plain decode would read "" and silently reset the channel whenever an admin changed the registration mode). Any value outside the enum is 400 validation_failed. Takes effect immediately: the next GET /v1/admin/platform/releases reads the other channel's rows. IT DOES NOT TRIGGER DETECTION - that is a jobs-framework job, and "check now" is POST /v1/admin/jobs/{job_id}/run.
+                         * @enum {string}
+                         */
+                        release_channel?: "stable" | "edge";
+                        /** @description Platform-release amendment 1 (#104/#106, migration 0074). The branch the EDGE channel follows; default develop. Absent = unchanged. Validated as a git ref name component - non-empty, at most 255 characters, no whitespace, no "..", no leading "-", no control characters - 400 validation_failed otherwise. Validated and stored whatever the channel is, and NEVER CLEARED BY A CHANNEL SWITCH, so an operator who visits stable and comes back keeps their branch. */
+                        release_edge_branch?: string;
                     };
                 };
             };
@@ -3777,6 +3784,90 @@ export interface paths {
                 403: components["responses"]["Forbidden"];
             };
         };
+        trace?: never;
+    };
+    "/v1/admin/platform/identity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * This control plane's own build identity (admin).
+         * @description What THIS control plane is: the stamped semver, the source commit and build time it was built from, and schema_version, the highest migration version its binary embeds. schema_version is the ORDERING KEY for the whole release surface because it is the only one with a consequence: boot runs migrations forward and crash-loops against a database ahead of the binary (ADR 0002). A read of the running binary - it touches no row and does not vary with the channel.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            identity: components["schemas"]["PlatformIdentity"];
+                        };
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/platform/releases": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The platform-release view — installed, available, eligibility, faults (admin). NOT CURRENTLY SERVED — see x-unimplemented.
+         * @description NOT IMPLEMENTED AS OF 2026-09-04 — registered by #107/#110, which removes this marker. One read that answers the whole admin Releases page: the installed identities (this control plane plus every host), the releases available on the configured channel newest first with their notes, the per-target eligibility FOR THE NEWEST LISTED RELEASE with a stable reason identifier, and the faults. READ-ONLY AND NEVER A TRIGGER: it applies nothing, writes nothing, and does not run detection - detection is a jobs-framework job and "Check now" is POST /v1/admin/jobs/{job_id}/run. A release below the installed control plane's schema_version is never listed on either channel (ADR 0002), and a stable release whose manifest is missing or invalid is not listed either (ADR 0001 - there is nothing to pin it by); the latter surfaces as a manifest_invalid fault.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["PlatformReleaseView"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/v1/admin/secrets": {
@@ -7114,6 +7205,20 @@ export interface components {
              * @description When the stored readiness value last changed; null until reported.
              */
             readiness_reported_at: string | null;
+            /** @description The git commit the running agent binary was built from: 7-40 lowercase hex, stored exactly as sent. */
+            source_commit: string | null;
+            /**
+             * Format: date-time
+             * @description When that agent binary was built.
+             */
+            built_at: string | null;
+            /**
+             * @description How this host got its platform images (CONTEXT.md "Install mode"): registry = pulled published images, source = built on the host. A source host can be TOLD about a platform release but never given one.
+             * @enum {string|null}
+             */
+            install_mode: "registry" | "source" | null;
+            /** @description Whether an updater sits on this host's stack. NULL IS NOT false: null = no amendment-aware agent has registered, false = an agent looked and found none. */
+            updater_present: boolean | null;
             /** @description Summed over this host's REPORTED GPUs. Null - not a zeroed object - when the host has no schedulable GPUs to sum: none reported yet, or `capacity_detection` is not `ok`, which is the same condition under which `GET /v1/hosts/{id}/gpus` returns an empty list. "Nothing to say" and "zero capacity" are different facts and a fleet gauge must not draw the first as the second. */
             capacity: components["schemas"]["HostCapacity"];
         };
@@ -7207,11 +7312,173 @@ export interface components {
                 library_discovery_enabled: boolean;
                 /** @description First-run wizard v2 §S6e (migration 0064). The admin-editable signaling origin allow-list, normalized (scheme + lowercased host). THIS IS THE DATABASE COLUMN, NOT NECESSARILY WHAT /v1/signal ENFORCES: QUASAR_ALLOWED_ORIGINS, when SET, overrides it outright - including when set to the empty string, which is how a hardened deployment pins the list off. That override rule is what makes the migration a behavioural no-op on upgrade for every existing deployment. GET /v1/admin/access-check reports the RESOLVED list plus which source won, so a UI can grey out a control the environment has pinned - the same shape library_discovery_interval_minutes uses. AN EMPTY LIST IS NOT "DENY ALL": /v1/signal still admits a same-origin request and a request with no Origin header at all, so a fresh instance with nothing configured works. Optional in the envelope so pre-amendment servers stay conformant. */
                 allowed_origins?: string[];
+                /**
+                 * @description Platform-release amendment 1 (#104/#106, migration 0074). The instance's platform- release channel: stable = tagged, noted releases; edge = whatever was last published from release_edge_branch, with no notes. DEFAULT stable - an instance that has never been configured is not shown branch builds. Read per request rather than at boot, so a switch needs no restart. Optional in the envelope so pre-amendment servers stay conformant.
+                 * @enum {string}
+                 */
+                release_channel?: "stable" | "edge";
+                /** @description Platform-release amendment 1 (#104/#106, migration 0074). The branch the edge channel follows; default develop. Reported whatever the channel is (it selects nothing while the channel is stable) so a UI can render the control without a second read. Optional in the envelope so pre-amendment servers stay conformant. */
+                release_edge_branch?: string;
                 /** Format: uuid */
                 updated_by: string | null;
                 /** Format: date-time */
                 updated_at: string;
             };
+        };
+        /** @description What one component IS. Served for the control plane by GET /v1/admin/platform/identity and carried inside the release view. */
+        PlatformIdentity: {
+            /** @description Stamped semver without a leading "v". "dev" when the binary was built unstamped (a developer build, or a source deploy that skipped the linker flags). NEVER NULL - a build always has some answer, and "dev" is the honest one. */
+            version: string;
+            /** @description Full 40-character lowercase hex; null on an unstamped build. */
+            source_commit: string | null;
+            /**
+             * Format: date-time
+             * @description RFC3339 UTC; null on an unstamped build.
+             */
+            built_at: string | null;
+            /** @description The highest migration version the binary embeds (the 0NNN file number as an integer). ALWAYS KNOWN, because it is derived from the embedded migration set rather than a build flag - which is why it, and not semver or built_at, is the ordering key everywhere in this surface (ADR 0002). */
+            schema_version: number;
+        };
+        /** @description One host's installed identity, as last reported on the agent `register` message. */
+        PlatformHostIdentity: {
+            /** Format: uuid */
+            host_id: string;
+            node_name: string;
+            /** @enum {string} */
+            status: "online" | "offline" | "draining";
+            agent_version: string | null;
+            /** @description 7-40 lowercase hex, stored exactly as the agent sent it; null until reported. */
+            source_commit: string | null;
+            /** Format: date-time */
+            built_at: string | null;
+            /** @enum {string|null} */
+            install_mode: "registry" | "source" | null;
+            /** @description Whether an updater sits on this host's stack. NULL IS NOT false: null = no amendment-aware agent has registered, false = an agent looked and found none. The first is an old agent, the second a real gap an operator must close. */
+            updater_present: boolean | null;
+            /** @description True only when all four of source_commit, built_at, install_mode and updater_present are non-null. A CLIENT MUST READ THIS RATHER THAN RE-DERIVING IT, so "what counts as known" cannot disagree between server and client. A host with identity_known false is never eligible for an apply. */
+            identity_known: boolean;
+        };
+        /** @description One detected platform release (schema.md `platform_releases`). Ordering wherever a list of these appears is schema_version DESC, then built_at DESC. */
+        PlatformRelease: {
+            /**
+             * Format: uuid
+             * @description Stable across detections; the handle amendment 2's apply will name.
+             */
+            id: string;
+            /** @enum {string} */
+            channel: "stable" | "edge";
+            /** @description Stable semver without a leading "v" ("0.2.0", "0.2.0-rc.1"). NULL ON EDGE - an edge build is a commit, not a version, and a synthesized one would be rendered to an operator as if it were real. */
+            version: string | null;
+            /** @description Full 40-character lowercase hex. The identity on both channels. */
+            source_commit: string;
+            /**
+             * Format: date-time
+             * @description The second ordering key.
+             */
+            built_at: string;
+            /** @description The highest migration the release's control-plane image embeds. The first ordering key and the ADR 0002 gate. */
+            schema_version: number;
+            /** @description True for a prerelease tag. A stable-channel read never lists one; on edge it is reported as found. */
+            prerelease: boolean;
+            /** @description Release notes, MARKDOWN, verbatim from the GitHub Release's `body` field (which the publish workflow takes from the changelog section). "" ON EDGE - no notes exist and compare_url stands in for them. Never null, so a client renders one type. UNTRUSTED UPSTREAM TEXT: sanitize at render. */
+            notes: string;
+            /** @description On edge, the GitHub compare link from the installed control plane's source_commit to this release's. Null on stable (the notes are that), and null on edge when the installed commit is unknown - there is nothing to compare from. */
+            compare_url: string | null;
+            /** @description The release manifest asset verbatim. NULL ON EDGE, which publishes no asset. */
+            manifest: components["schemas"]["ReleaseManifest"] | null;
+            /**
+             * Format: date-time
+             * @description When THIS instance first saw the release. Provenance, not ordering - two instances can legitimately disagree.
+             */
+            discovered_at: string;
+        };
+        /**
+         * @description Why a target is not eligible for the newest listed release. A CLOSED vocabulary of STABLE IDENTIFIERS the UI maps to text - the server never sends the sentence, so wording can improve in the client with no contract change. Precedence is fixed and is the order listed here, so two implementations cannot disagree about which of several true reasons is reported. A client meeting an unrecognized value renders it verbatim rather than dropping the row. Full per-value semantics: control-api.md §"Platform releases".
+         * @enum {string}
+         */
+        EligibilityReason: "no_release" | "identity_unknown" | "up_to_date" | "install_mode_source" | "updater_absent" | "host_offline" | "release_above_control_plane" | "control_plane_not_first";
+        /** @description One target's eligibility, EVALUATED AGAINST available[0] - the newest listed release - and against nothing else. This surface carries no per-release eligibility matrix and a client must not present one. */
+        PlatformReleaseTarget: {
+            /** @enum {string} */
+            kind: "control_plane" | "host";
+            /**
+             * Format: uuid
+             * @description Null for the control-plane target.
+             */
+            host_id: string | null;
+            /** @description Null for the control-plane target. */
+            node_name: string | null;
+            eligible: boolean;
+            /** @description Null exactly when eligible is true; exactly one non-null reason when it is false. */
+            reason: components["schemas"]["EligibilityReason"] | null;
+        };
+        /**
+         * @description Everything wrong that is not an ineligibility. A CLOSED vocabulary. A fault gates nothing anywhere - it is reported so a wrong state is visible instead of silent. Prefixed (rather than a bare FaultKind) because "fault" already names an unrelated thing in this system - an NVIDIA Xid is a GPU fault. Full semantics: control-api.md §"Platform releases".
+         * @enum {string}
+         */
+        PlatformReleaseFaultKind: "agent_ahead_of_control_plane" | "identity_unknown" | "manifest_invalid";
+        PlatformReleaseFault: {
+            kind: components["schemas"]["PlatformReleaseFaultKind"];
+            /**
+             * Format: uuid
+             * @description Null on an instance-scoped fault (manifest_invalid).
+             */
+            host_id: string | null;
+            /** @description Null on an instance-scoped fault. */
+            node_name: string | null;
+            /** @description Operator prose. NEVER PARSED and never branched on - the kind is what a client keys off. */
+            detail: string;
+        };
+        /** @description The whole admin Releases page in one read (GET /v1/admin/platform/releases). */
+        PlatformReleaseView: {
+            /**
+             * @description The instance's channel. Everything in `available` is on it; the other channel's releases are never mixed in.
+             * @enum {string}
+             */
+            channel: "stable" | "edge";
+            /** @description The branch the edge channel follows. Reported on BOTH channels so a UI can render the control without a second read; it selects nothing while channel is stable. */
+            edge_branch: string;
+            /**
+             * Format: date-time
+             * @description When detection LAST SUCCEEDED; null before the first success. It is NOT when this response was computed - a view served from a week-old list must say so.
+             */
+            checked_at: string | null;
+            /** @description The last detection failure as operator prose, cleared on the next success. Prose, never parsed - the machine-readable record is the job's run history. A stale checked_at WITH a non-null last_error is the normal shape of "failing since then". */
+            last_error: string | null;
+            installed: {
+                control_plane: components["schemas"]["PlatformIdentity"];
+                hosts: components["schemas"]["PlatformHostIdentity"][];
+            };
+            /** @description Releases on the configured channel that are still offerable, NEWEST FIRST (schema_version DESC, then built_at DESC - the tiebreak matters because an edge channel produces many builds at one schema_version). A release below the installed control plane's schema_version is NEVER here (ADR 0002); a prerelease is never here on stable; a stable release with a missing or invalid manifest is never here either (it is a manifest_invalid fault instead). */
+            available: components["schemas"]["PlatformRelease"][];
+            /** @description One entry per target - the control plane, then every registered host - each evaluated against available[0]. When available is empty every target is eligible:false with reason "no_release". */
+            targets: components["schemas"]["PlatformReleaseTarget"][];
+            faults: components["schemas"]["PlatformReleaseFault"][];
+        };
+        /** @description The platform-release-manifest.json asset attached to a stable GitHub Release, produced by the publish workflow from the same tag as the notes so digests and prose cannot disagree. Served back VERBATIM as PlatformRelease.manifest. NOTE THE TWO VERSION FIELDS ARE DIFFERENT THINGS: format_version versions THIS DOCUMENT'S FORMAT, schema_version is the DATABASE MIGRATION VERSION the release's control-plane image embeds (ADR 0002's ordering key). Not to be confused with scripts/release/release-manifest.json in the quasar superproject, which is the release-preflight input set and a different file - the asset is named platform-release-manifest.json precisely so the two never collide. */
+        ReleaseManifest: {
+            /** @description The manifest format's own version; 1 today. A consumer that meets a format_version it does not know treats the manifest as INVALID (a manifest_invalid fault, and the release is not listed) rather than guessing. */
+            format_version: number;
+            /** @description Semver without a leading "v". */
+            version: string;
+            /** @description Mirrors the tag's prerelease status - what keeps a release candidate off the stable channel. */
+            prerelease: boolean;
+            /** @description 40 lowercase hex. */
+            source_commit: string;
+            /** Format: date-time */
+            built_at: string;
+            /** @description The highest migration the release's control-plane image embeds. */
+            schema_version: number;
+            /** @description EXACTLY TWO ENTRIES, IN THIS ORDER: control-plane, then node-agent. THE ORDER IS NORMATIVE, NOT PRESENTATIONAL - #108's producer validator emits and checks exactly this sequence, so a consumer validates positionally rather than searching by name and a reordered manifest is invalid rather than quietly accepted. The platform release is the control plane (which carries the web client) and the node agent; app catalog images have their own version and push machinery and never appear here. */
+            components: components["schemas"]["ReleaseManifestComponent"][];
+        };
+        ReleaseManifestComponent: {
+            /** @enum {string} */
+            name: "control-plane" | "node-agent";
+            /** @description A registry reference with NO TAG AND NO DIGEST - the repository name alone (e.g. ghcr.io/accreleus/quasar/quasar-control-plane). Consumers compose image@digest with the digest field beside it. A TAG IS NEVER AN IDENTITY (ADR 0001), and the digest is named in exactly one place, so an image that already carried a tag or a digest could only disagree with the field that is authoritative. */
+            image: string;
+            /** @description sha256:<64 lowercase hex>. The only form that cannot be moved under a running fleet. */
+            digest: string;
         };
         /** @description The PUBLIC metadata of a certificate. Every field here is already disclosed by any TLS handshake with this listener. THERE IS DELIBERATELY NO FIELD THAT COULD HOLD KEY MATERIAL, and adding one would be the bug this shape exists to prevent. */
         TLSCertificateInfo: {

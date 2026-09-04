@@ -30,6 +30,22 @@ type RegisterMsg struct {
 	// images. Keep-if-absent: nil ⇒ key absent, stored host_images rows untouched;
 	// an explicit [] is a real "I have none" and flips ready rows to absent.
 	Images []RegisterImage `json:"images"`
+
+	// Platform-release identity (amendment 1, agent-api.md §register): four
+	// OPTIONAL flat fields describing the build the agent IS. Pointers, so
+	// absent is distinguishable from a zero value — `updater_present: false`
+	// ("I looked, there is none") is a real answer and not the same fact as the
+	// key being missing ("nobody has said").
+	//
+	// Unlike Images, these are replaced WHOLESALE on every register (absent =>
+	// NULL): they describe the binary connected right now, so a downgrade to a
+	// pre-amendment agent must read as identity-unknown rather than keep a
+	// commit nothing is running. Validated by identityFromRegister; a malformed
+	// value is dropped, never a registration failure.
+	SourceCommit   *string `json:"source_commit"`
+	BuiltAt        *string `json:"built_at"`
+	InstallMode    *string `json:"install_mode"`
+	UpdaterPresent *bool   `json:"updater_present"`
 }
 
 // AuthEnrollment is the auth field on first contact.

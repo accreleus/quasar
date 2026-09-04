@@ -743,7 +743,14 @@ step "[$ENV] 6/7 recreate control-plane${SCOPE:+ (scope=$SCOPE)}"
 # scope=control cheap. Do not "optimise" it by folding the control-plane into the
 # vulkan image lineage.
 if [ "$SCOPE" != web ]; then
-  $DC build quasar-control-plane
+  # Build identity (#107): the compose dev overlay forwards these as build args,
+  # so the control plane this deploy produces knows which commit it is and says
+  # so on GET /v1/admin/platform/identity. A source deploy has no version tag
+  # unless HEAD sits on one, and reports "dev" when it does not.
+  SOURCE_COMMIT="$(git rev-parse HEAD)" \
+  BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  QUASAR_VERSION="$(git describe --tags --exact-match 2>/dev/null || true)" \
+    $DC build quasar-control-plane
 fi
 # Three separate ups, each force-recreate confined to its named service with
 # --no-deps (#453): on Compose v5, `up --force-recreate <svc>` recreates the

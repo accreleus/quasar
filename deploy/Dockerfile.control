@@ -23,9 +23,21 @@ COPY control-plane/go.mod control-plane/go.sum ./
 RUN go mod download
 
 COPY control-plane/ .
+
+# Build identity (#107), served by GET /v1/admin/platform/identity and logged at
+# startup. Unset stamps read as "dev" + null, never a stale package version. The
+# build context carries no .git, so these must be passed in.
+ARG QUASAR_VERSION=
+ARG SOURCE_COMMIT=unknown
+ARG BUILT_AT=unknown
+
 # CGO_ENABLED=0 → fully static binary (no libc deps in the runtime image).
+# -s -w stay: -X writes string data, which stripping symbols does not touch.
 RUN CGO_ENABLED=0 GOOS=linux go build \
-    -trimpath -ldflags="-s -w" \
+    -trimpath -ldflags="-s -w \
+      -X github.com/accreleus/quasar/control-plane/internal/buildinfo.version=${QUASAR_VERSION} \
+      -X github.com/accreleus/quasar/control-plane/internal/buildinfo.sourceCommit=${SOURCE_COMMIT} \
+      -X github.com/accreleus/quasar/control-plane/internal/buildinfo.builtAt=${BUILT_AT}" \
     -o /quasar-control ./cmd/quasar-control
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────

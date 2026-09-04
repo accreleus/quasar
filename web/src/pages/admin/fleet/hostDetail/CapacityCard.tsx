@@ -20,6 +20,13 @@ import {
   toneColor,
   uptimeSince,
 } from "../hostDerived";
+import {
+  installModeHint,
+  installModeLabel,
+  shortCommit,
+  updaterHint,
+  updaterLabel,
+} from "../hostIdentity";
 
 /** A gauge with no reading: the track, and the word for it. Never a 0 % arc,
  *  which would read as a confirmed zero. */
@@ -147,6 +154,47 @@ export function CapacityCard({ host, gpus, now }: CapacityCardProps) {
             />
             <Fact label="CPU" value={cpuLabel(host)} />
             <Fact label="Agent" value={host.agent_version ?? "n/a"} />
+            {/* The agent build's identity. Every row reads "Unknown" until an
+                amendment-aware agent has registered; for the updater that is a
+                different fact from "None" (openapi.yaml Host.updater_present). */}
+            <Fact
+              label="Commit"
+              value={
+                host.source_commit ? (
+                  <span className="mono" data-testid="fact-source-commit" title={host.source_commit}>
+                    {shortCommit(host.source_commit)}
+                  </span>
+                ) : (
+                  "Unknown"
+                )
+              }
+            />
+            <Fact
+              label="Built"
+              value={
+                host.built_at ? (
+                  <span title={host.built_at}>{relativeTime(host.built_at, now)}</span>
+                ) : (
+                  "Unknown"
+                )
+              }
+            />
+            <Fact
+              label="Install"
+              value={
+                <span title={installModeHint(host.install_mode)}>
+                  {installModeLabel(host.install_mode)}
+                </span>
+              }
+            />
+            <Fact
+              label="Updater"
+              value={
+                <span title={updaterHint(host.updater_present)}>
+                  {updaterLabel(host.updater_present)}
+                </span>
+              }
+            />
             <Fact label="Agent uptime" value={uptimeSince(host.agent_connected_since, now)} />
             <Fact
               label="Heartbeat"

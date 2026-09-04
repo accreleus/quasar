@@ -533,13 +533,11 @@ fi
 # with --git-ref that is the worktree's commit, not the caller's HEAD.
 #
 # Deliberately NOT folded into the shared EXTRA_ARGS list: EXTRA_ARGS is passed to
-# EVERY role's docker build (that's how a single --base-image override reaches both
-# Dockerfile.vulkan and Dockerfile.control.prod, since both declare ARG
-# QUASAR_BASE_IMAGE). SOURCE_COMMIT/BUILT_AT are declared only in
-# Dockerfile.vulkan's `runtime` stage — Dockerfile.control.prod has no such ARG — so
-# adding them here would make the default no-args invocation (runtime+nv+control)
-# die at the undeclared-ARG guard below the moment the `control` role's turn comes
-# up. Attached per-role instead, only when that role's Dockerfile declares them.
+# EVERY role's docker build, including the toolchain, which declares neither and
+# would die at the undeclared-ARG guard below. Attached per-role instead, only to
+# the Dockerfiles that declare them (Dockerfile.vulkan's runtime stage, and
+# Dockerfile.control.prod since #107, which needs the same values BOTH as image
+# labels and as the -ldflags identity stamps the binary serves).
 PROVENANCE_ARGS=("SOURCE_COMMIT=$SRC_SHA" "BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)")
 # The SPA bakes in the ref it was built from (web/vite.config.ts) for the
 # enroll-host one-liner (#100): the exact tag when the tree sits on one, else the
@@ -780,7 +778,15 @@ for role in "${ROLES[@]}"; do
 
   ROLE_ARGS=("${EXTRA_ARGS[@]:-}")
   [ "$DF_REL" = "deploy/Dockerfile.vulkan" ] && ROLE_ARGS+=("${PROVENANCE_ARGS[@]}")
-  [ "$DF_REL" = "deploy/Dockerfile.control.prod" ] && [ "$SRC_REF" != unknown ] && ROLE_ARGS+=("QUASAR_SOURCE_REF=$SRC_REF")
+  if [ "$DF_REL" = "deploy/Dockerfile.control.prod" ]; then
+    ROLE_ARGS+=("${PROVENANCE_ARGS[@]}")
+    [ "$SRC_REF" != unknown ] && ROLE_ARGS+=("QUASAR_SOURCE_REF=$SRC_REF")
+    # The served semver, and only from a real `vX.Y.Z` tag. A branch build has no
+    # version and must say so ("dev") rather than borrow the last tag's number.
+    case "$SRC_REF" in
+      v[0-9]*) ROLE_ARGS+=("QUASAR_VERSION=${SRC_REF#v}") ;;
+    esac
+  fi
 
   [ "$DF_REL" = "deploy/Dockerfile.vulkan" ] && { check_pins_agree "$DF_ABS" "$PINS_FILE" || exit 2; }
   [ "$DF_REL" = "deploy/Dockerfile.control.prod" ] && { check_base_arg_agrees "$DF_ABS" || exit 2; }

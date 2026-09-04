@@ -25,6 +25,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/invites"
 	"github.com/accreleus/quasar/control-plane/internal/jobs"
 	"github.com/accreleus/quasar/control-plane/internal/origins"
+	"github.com/accreleus/quasar/control-plane/internal/platform"
 	"github.com/accreleus/quasar/control-plane/internal/secrets"
 	"github.com/accreleus/quasar/control-plane/internal/session"
 	"github.com/accreleus/quasar/control-plane/internal/settings"
@@ -68,6 +69,8 @@ func nilDepServices(t *testing.T) *Services {
 		settingsHandler: settings.NewHandler(nil),
 		invitesHandler:  invites.NewHandler(nil, ""),
 		consoleHandler:  console.NewHandler(nil, nil),
+		// Stateless: the identity it serves is linker-injected, not a dep.
+		platformHandler: platform.NewHandler(),
 		// nil service/store: Register only needs the handler to exist. Every
 		// request path checks for it and answers 503, so no route can 500 here.
 		artworkHandler: artwork.NewHandler(nil, log),
@@ -236,10 +239,9 @@ func devOnlyOperation(t *testing.T, op yaml.Node) bool {
 var allowedUnimplemented = map[string]struct{}{
 	"GET /v1/sessions/{}/events": {}, // parked session-events SSE amendment
 	// Platform-release amendment 1 (#104/#106): the contract was authored ahead
-	// of the server so detection is not gated on the updater. #107/#110 register
-	// these routes and MUST delete both the marker in protocol/openapi.yaml and
-	// the entry here in the same change.
-	"GET /v1/admin/platform/identity": {},
+	// of the server so detection is not gated on the updater. #107 registered
+	// /identity and deleted both its marker in protocol/openapi.yaml and its
+	// entry here; #110 owns the release view and does the same for it.
 	"GET /v1/admin/platform/releases": {},
 }
 

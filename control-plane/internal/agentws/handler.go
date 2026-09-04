@@ -580,6 +580,21 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		}
 		return fail(err)
 	}
+	// Platform-release identity (amendment 1): written AFTER auth succeeded, so
+	// a failed registration never touches a host row, and wholesale — absent
+	// fields become NULL (agent-api.md §register). A write failure is logged
+	// and swallowed: the control plane never refuses a registration over these
+	// fields, and a host that streams is worth more than a known build stamp.
+	identity, droppedIdentity := identityFromRegister(reg)
+	if len(droppedIdentity) > 0 {
+		h.log.Warn("register: ignoring malformed identity fields",
+			"host_id", result.HostID, "node_name", reg.NodeName, "fields", droppedIdentity)
+	}
+	if err := h.store.replaceHostIdentity(ctx, result.HostID, identity); err != nil {
+		h.log.Warn("register: could not store host identity",
+			"host_id", result.HostID, "node_name", reg.NodeName, "err", err)
+	}
+
 	if result.AgentRestarted {
 		// #429: logged so an operator tailing logs sees it in real time, not
 		// only on the next admin-panel poll.

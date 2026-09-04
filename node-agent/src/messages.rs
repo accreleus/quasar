@@ -72,6 +72,19 @@ pub enum AgentMsg {
         /// the state file must still report `[]`, or the host reads falsely
         /// `ready` forever (agent-api.md `register`).
         images: Vec<RegisterImageEntry>,
+        /// Platform-release identity (amendment 1, agent-api.md `register`):
+        /// four OPTIONAL flat fields. Omitted when unknown — the control plane
+        /// stores absent as NULL, and a wrong stamp is worse than none, since
+        /// it would be offered platform releases against a build that is not
+        /// running. `updater_present: false` is a real answer and IS sent.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_commit: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        built_at: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        install_mode: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        updater_present: Option<bool>,
     },
     Capacity {
         host: HostCapacity,
@@ -1565,9 +1578,66 @@ mod tests {
                 enrollment_token: "tok".to_string(),
             },
             images: Vec::new(),
+            source_commit: None,
+            built_at: None,
+            install_mode: None,
+            updater_present: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["images"], serde_json::json!([]));
+    }
+
+    // Unknown identity is OMITTED, not sent as null or as the word "unknown":
+    // an older agent registers byte-identically, and that is the shape this
+    // agent must produce when it cannot stamp itself.
+    #[test]
+    fn register_omits_every_unknown_identity_field() {
+        let msg = AgentMsg::Register {
+            node_name: "gpu-host-01".to_string(),
+            agent_version: "0.1.0".to_string(),
+            auth: Auth::Reconnect {
+                node_secret: "secret".to_string(),
+            },
+            images: Vec::new(),
+            source_commit: None,
+            built_at: None,
+            install_mode: None,
+            updater_present: None,
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        for key in [
+            "source_commit",
+            "built_at",
+            "install_mode",
+            "updater_present",
+        ] {
+            assert!(json.get(key).is_none(), "{key} must be absent, got {json}");
+        }
+    }
+
+    #[test]
+    fn register_sends_identity_flat_beside_agent_version() {
+        let msg = AgentMsg::Register {
+            node_name: "gpu-host-01".to_string(),
+            agent_version: "0.1.0".to_string(),
+            auth: Auth::Reconnect {
+                node_secret: "secret".to_string(),
+            },
+            images: Vec::new(),
+            source_commit: Some("1f0c1e0e0c5a9d1b7a2f3e4d5c6b7a8901234567".to_string()),
+            built_at: Some("2026-09-04T12:00:00Z".to_string()),
+            install_mode: Some("registry".to_string()),
+            // `false` is a real answer and must reach the wire.
+            updater_present: Some(false),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            json["source_commit"],
+            "1f0c1e0e0c5a9d1b7a2f3e4d5c6b7a8901234567"
+        );
+        assert_eq!(json["built_at"], "2026-09-04T12:00:00Z");
+        assert_eq!(json["install_mode"], "registry");
+        assert_eq!(json["updater_present"], false);
     }
 
     #[test]
@@ -1583,6 +1653,10 @@ mod tests {
                 version: "2026.08.07".to_string(),
                 state: "ready".to_string(),
             }],
+            source_commit: None,
+            built_at: None,
+            install_mode: None,
+            updater_present: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["images"][0]["image_id"], "steam");

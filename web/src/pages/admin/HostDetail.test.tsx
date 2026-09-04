@@ -173,6 +173,72 @@ describe("HostDetail — head and facts", () => {
   });
 });
 
+describe("HostDetail — the agent build", () => {
+  const identified = {
+    source_commit: "1f0c1e0e0c5a9d1b7a2f3e4d5c6b7a8901234567",
+    built_at: new Date(NOW - 3 * 24 * 60 * 60 * 1000).toISOString(),
+    install_mode: "registry" as const,
+    updater_present: true,
+  };
+
+  it("shows the commit short and in full, the build age, install mode and updater", async () => {
+    mocked.getHost.mockResolvedValue({ host: host(identified) } as never);
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByTestId("fact-source-commit")).toBeTruthy());
+    const commit = screen.getByTestId("fact-source-commit");
+    expect(commit.textContent).toBe("1f0c1e0e0c5a");
+    expect(commit.getAttribute("title")).toBe(identified.source_commit);
+
+    const built = screen.getByText("Built").closest("tr") as HTMLElement;
+    expect(within(built).getByTitle(identified.built_at).textContent).toBe("3 days ago");
+
+    expect(within(screen.getByText("Install").closest("tr") as HTMLElement).getByText("Registry")).toBeTruthy();
+    expect(within(screen.getByText("Updater").closest("tr") as HTMLElement).getByText("Present")).toBeTruthy();
+  });
+
+  it("reads a source-built host as such", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...identified, install_mode: "source" }),
+    } as never);
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByText("Built from source")).toBeTruthy());
+  });
+
+  // NULL is "no amendment-aware agent has registered"; false is "an agent
+  // looked and found none". Rendering both as the same word would lose the
+  // distinction the release surface is built on.
+  it("distinguishes an unreported updater from one an agent looked for and did not find", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...identified, updater_present: false }),
+    } as never);
+    const { unmount } = renderDetail();
+    await waitFor(() =>
+      expect(within(screen.getByText("Updater").closest("tr") as HTMLElement).getByText("None")).toBeTruthy(),
+    );
+    unmount();
+
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...identified, updater_present: null }),
+    } as never);
+    renderDetail();
+    await waitFor(() =>
+      expect(within(screen.getByText("Updater").closest("tr") as HTMLElement).getByText("Unknown")).toBeTruthy(),
+    );
+  });
+
+  it("says Unknown for a host whose agent predates the identity fields", async () => {
+    renderDetail(); // the base fixture reports none of the four
+
+    await waitFor(() => expect(screen.getByText("Commit")).toBeTruthy());
+    for (const label of ["Commit", "Built", "Install", "Updater"]) {
+      const row = screen.getByText(label).closest("tr") as HTMLElement;
+      expect(within(row).getByText("Unknown")).toBeTruthy();
+    }
+  });
+});
+
 describe("HostDetail — notes", () => {
   it("explains an offline host and that scheduling is paused", async () => {
     mocked.getHost.mockResolvedValue({

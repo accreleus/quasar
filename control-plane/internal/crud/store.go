@@ -133,6 +133,16 @@ type Host struct {
 	AgentConnectedSince *time.Time `json:"agent_connected_since"`
 	AgentRestartCount   int32      `json:"agent_restart_count"`
 	AgentLastRestartAt  *time.Time `json:"agent_last_restart_at"`
+	// The agent build's identity (platform-release amendment 1, migration
+	// 0074), as last reported on `register`. All four null until an
+	// amendment-aware agent registers, and replaced WHOLESALE on every register
+	// — unlike Storage/Readiness beside them, which are keep-if-absent.
+	// UpdaterPresent is a *bool for the reason schema.md states: NULL ("nobody
+	// has said") is not false ("an agent looked and found none").
+	SourceCommit   *string    `json:"source_commit"`
+	BuiltAt        *time.Time `json:"built_at"`
+	InstallMode    *string    `json:"install_mode"`
+	UpdaterPresent *bool      `json:"updater_present"`
 	// Capacity: the GPU roll-up, filled by hostCapacities after the row read.
 	// Nil = nothing to sum (no reported GPUs), which is not the same fact as zero.
 	Capacity *HostCapacity `json:"capacity"`
@@ -1074,7 +1084,8 @@ func (s *store) listHosts(ctx context.Context, cursor string, limit int32) ([]Ho
 		       last_registered_at, last_heartbeat_at, storage, cpu_model,
 		       readiness, readiness_reported_at,
 		       capacity_detection, capacity_reason, created_at,
-		       agent_process_started_at, agent_restart_count, agent_last_restart_at
+		       agent_process_started_at, agent_restart_count, agent_last_restart_at,
+		       source_commit, built_at, install_mode, updater_present
 		FROM hosts
 		ORDER BY created_at DESC
 		LIMIT $1 OFFSET $2
@@ -1092,7 +1103,8 @@ func (s *store) listHosts(ctx context.Context, cursor string, limit int32) ([]Ho
 			&h.CPUCores, &h.MemMB, &h.LastRegistered, &h.LastHeartbeat, &rawStorage, &h.CPUModel,
 			&rawReadiness, &h.ReadinessReportedAt,
 			&h.CapacityDetection, &h.CapacityReason, &h.CreatedAt,
-			&h.AgentConnectedSince, &h.AgentRestartCount, &h.AgentLastRestartAt); err != nil {
+			&h.AgentConnectedSince, &h.AgentRestartCount, &h.AgentLastRestartAt,
+			&h.SourceCommit, &h.BuiltAt, &h.InstallMode, &h.UpdaterPresent); err != nil {
 			return nil, "", fmt.Errorf("scan host: %w", err)
 		}
 		h.Storage = json.RawMessage(rawStorage) // nil scans to a JSON "null" (json.RawMessage.MarshalJSON)
@@ -1124,13 +1136,15 @@ func (s *store) getHost(ctx context.Context, id string) (Host, error) {
 		       last_registered_at, last_heartbeat_at, storage, cpu_model,
 		       readiness, readiness_reported_at,
 		       capacity_detection, capacity_reason, created_at,
-		       agent_process_started_at, agent_restart_count, agent_last_restart_at
+		       agent_process_started_at, agent_restart_count, agent_last_restart_at,
+		       source_commit, built_at, install_mode, updater_present
 		FROM hosts WHERE id::text = $1
 	`, id).Scan(&h.ID, &h.NodeName, &h.Status, &h.AgentVersion,
 		&h.CPUCores, &h.MemMB, &h.LastRegistered, &h.LastHeartbeat, &rawStorage, &h.CPUModel,
 		&rawReadiness, &h.ReadinessReportedAt,
 		&h.CapacityDetection, &h.CapacityReason, &h.CreatedAt,
-		&h.AgentConnectedSince, &h.AgentRestartCount, &h.AgentLastRestartAt)
+		&h.AgentConnectedSince, &h.AgentRestartCount, &h.AgentLastRestartAt,
+		&h.SourceCommit, &h.BuiltAt, &h.InstallMode, &h.UpdaterPresent)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Host{}, ErrNotFound
 	}

@@ -2000,6 +2000,10 @@ mod tests {
                 enrollment_token: "tok".to_string(),
             },
             images: m.register_images(),
+            source_commit: None,
+            built_at: None,
+            install_mode: None,
+            updater_present: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["images"], serde_json::json!([]));

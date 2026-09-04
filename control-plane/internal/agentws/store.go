@@ -403,6 +403,33 @@ func (s *agentStore) upsertCapacityWithDetection(ctx context.Context, hostID str
 	return tx.Commit(ctx)
 }
 
+// replaceHostIdentity writes the four platform-release identity columns
+// (schema.md `hosts`, migration 0074) from one `register` message.
+//
+// WHOLESALE REPLACE, not keep-if-absent, and that is the point: every column is
+// written from this message and an absent field becomes NULL. The columns
+// beside it (storage, codecs, readiness) are keep-if-absent because they
+// describe hardware an older agent merely fails to re-report; these describe
+// the binary connected right now, so an agent downgraded to a pre-amendment
+// build must read as identity-unknown rather than carry a commit that
+// describes nothing running.
+//
+// One statement, no branching on which fields are present — a partial UPDATE
+// would be exactly the keep-if-absent behaviour the contract forbids.
+func (s *agentStore) replaceHostIdentity(ctx context.Context, hostID string, id HostIdentity) error {
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE hosts SET
+			source_commit   = $2,
+			built_at        = $3,
+			install_mode    = $4,
+			updater_present = $5
+		WHERE id = $1
+	`, hostID, id.SourceCommit, id.BuiltAt, id.InstallMode, id.UpdaterPresent); err != nil {
+		return fmt.Errorf("update host identity: %w", err)
+	}
+	return nil
+}
+
 // upsertHostReadiness writes hosts.readiness. Keep-if-absent (nil leaves value
 // and timestamp untouched; explicit [] is a real report and overwrites). The
 // agent's raw bytes are stored verbatim, never re-encoded — re-encoding would
