@@ -377,7 +377,7 @@ RUN cd /opt/gstreamer-src && \
 #   gst-plugins-base:opus         -> opusenc                         (audio_branch.rs)
 #   gst-plugins-base:volume       -> upstream default (audio path headroom)
 #   gst-plugins-good:pulse        -> pulsesrc                        (source.rs / audio_branch.rs)
-#   gst-plugins-good:coloreffects -> coloreffects (issue #97: the "Colour Ripple" bench app's
+#   gst-plugins-bad:coloreffects  -> coloreffects (issue #97: the "Colour Ripple" bench app's
 #                                     gst-launch pipeline; not called from node-agent Rust)
 #   gst-plugins-bad:vulkan        -> vulkanh264enc (+ vulkanh265enc from the vendored patch)
 #   gst-plugins-bad:vulkan-video  -> the Vulkan video-encode/decode extension vulkanh264enc needs
@@ -458,7 +458,7 @@ RUN cd /opt/gstreamer-src && meson setup build --prefix=/opt/gst --libdir=lib64 
     -Dgst-plugins-base:opus=enabled \
     -Dgst-plugins-base:volume=enabled \
     -Dgst-plugins-good:pulse=enabled \
-    -Dgst-plugins-good:coloreffects=enabled \
+    -Dgst-plugins-bad:coloreffects=enabled \
     -Dgst-plugins-bad:vulkan=enabled \
     -Dgst-plugins-bad:vulkan-video=enabled \
     -Dgst-plugins-bad:videoparsers=enabled \
