@@ -279,6 +279,12 @@ if [ "$RC" -eq 1 ] && grep -q 'CONTROL_PLANE_FINGERPRINT' <<<"$OUT"; then
 else
   fail "pin mismatch verdict" "rc=$RC out=$(tail -3 <<<"$OUT")"
 fi
+run_installer stale QUASAR_ENROLLMENT="$WSS_BLOB" QUASAR_REF=v1.2.3 NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes" MOCK_AGENT_LOG='config error: CONTROL_PLANE_URL is required (e.g. ws://localhost:8080)'
+if [ "$RC" -eq 1 ] && grep -q 'predates the enrollment string' <<<"$OUT" && grep -q 'QUASAR_AGENT_IMAGE' <<<"$OUT"; then
+  pass "an agent image older than the enrollment string: named as stale, with the way to a current one"
+else
+  fail "stale image verdict" "rc=$RC out=$(tail -3 <<<"$OUT")"
+fi
 run_installer timeout QUASAR_ENROLLMENT="$WSS_BLOB" QUASAR_REF=v1.2.3 NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes" MOCK_AGENT_LOG=''
 if [ "$RC" -eq 3 ] && grep -q 'still connecting' <<<"$OUT" && grep -q 'logs -f quasar-node-agent' <<<"$OUT"; then
   pass "no verdict within the window: rc=3 with the follow command"
