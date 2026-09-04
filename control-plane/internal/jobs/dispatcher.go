@@ -300,7 +300,7 @@ func (d *Dispatcher) materializeTarget(ctx context.Context, j Job, hostID string
 		d.log.Warn("job: unsatisfiable run window, skipping", "job_id", j.ID, "err", err)
 		return
 	}
-	run, created, err := d.store.Materialize(ctx, MaterializeParams{
+	run, m, err := d.store.Materialize(ctx, MaterializeParams{
 		JobID:        j.ID,
 		HostID:       hostID,
 		Trigger:      TriggerSchedule,
@@ -316,7 +316,7 @@ func (d *Dispatcher) materializeTarget(ctx context.Context, j Job, hostID string
 	}
 	// Say out loud when a window pushed a run out — the operator wondering why
 	// nothing happened at 14:00 should find the answer in the log.
-	if created && j.Schedule.HasWindow() && when.After(now.Add(time.Second)) {
+	if m == RunCreated && j.Schedule.HasWindow() && when.After(now.Add(time.Second)) {
 		d.log.Info("job: window closed", "job_id", j.ID, "host_id", hostField(hostID),
 			"next_run_at", when.In(loc).Format(time.RFC3339), "run_id", run.ID)
 	}
@@ -517,7 +517,9 @@ func (d *Dispatcher) prune(ctx context.Context) {
 // Enqueue is the event trigger: a pending run for a KindEvent job. params is
 // the event's opaque blob, handed to the runner verbatim. An already-open run
 // is returned, not duplicated — a burst of events collapses into one run, the
-// cap-1-channel coalescing the hand-rolled workers had.
+// cap-1-channel coalescing the hand-rolled workers had. If that run is a
+// future-dated pending one it is pulled forward to now, so an event never
+// waits out the interval of the schedule it coalesced onto (#92).
 func (d *Dispatcher) Enqueue(ctx context.Context, jobID, hostID string, params any) (Run, error) {
 	job, err := d.store.Get(ctx, jobID)
 	if err != nil {
@@ -533,14 +535,24 @@ func (d *Dispatcher) Enqueue(ctx context.Context, jobID, hostID string, params a
 			return Run{}, err
 		}
 	}
-	run, _, err := d.store.Materialize(ctx, MaterializeParams{
+	run, m, err := d.store.Materialize(ctx, MaterializeParams{
 		JobID:        jobID,
 		HostID:       hostID,
 		Trigger:      TriggerEvent,
 		ScheduledFor: when,
 		Params:       params,
 	})
-	return run, err
+	if err != nil {
+		return Run{}, err
+	}
+	if m == RunPulledForward {
+		d.log.Info("job: pending run pulled forward by an event trigger",
+			"token", "job-run-pulled-forward",
+			"job_id", jobID, "run_id", run.ID, "host_id", hostField(hostID),
+			"trigger", string(run.Trigger),
+			"scheduled_for", run.ScheduledFor.UTC().Format(time.RFC3339))
+	}
+	return run, nil
 }
 
 // RunNow is the admin trigger. It ignores the window and never ignores the

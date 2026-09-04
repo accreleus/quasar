@@ -337,65 +337,81 @@ type MaterializeParams struct {
 	Params       any
 }
 
+// Materialization is which of the three things Materialize did with the
+// (job, target) single-flight slot. Callers log on it; nothing branches on it
+// for correctness.
+type Materialization string
+
+const (
+	RunCreated Materialization = "created"
+	// An open pending run's scheduled_for moved earlier.
+	RunPulledForward Materialization = "pulled_forward"
+	// An open run was already due, or already running.
+	RunCoalesced Materialization = "coalesced"
+)
+
 // Materialize creates the next pending run for (job, target), or returns the
-// run already open (created=false; check its State to tell queued from
-// in-progress).
+// run already open (check its State to tell queued from in-progress).
 //
 // Single-flight is a storage invariant: the partial unique index
 // job_runs_open_per_target makes a second open run impossible, and the
 // advisory lock makes the ordinary read-then-insert avoid the violation rather
-// than recover from it — either alone is insufficient. A manual trigger pulls
-// an existing pending row forward ("Run now" means now, not twice); a schedule
-// or event trigger leaves it untouched.
-func (s *Store) Materialize(ctx context.Context, p MaterializeParams) (Run, bool, error) {
+// than recover from it — either alone is insufficient. A manual OR an event
+// trigger pulls an open pending row forward (both mean "now", not "twice"); a
+// schedule trigger never moves a row it just found.
+func (s *Store) Materialize(ctx context.Context, p MaterializeParams) (Run, Materialization, error) {
 	if p.Attempt < 1 {
 		p.Attempt = 1
 	}
 	params, err := marshalBounded(p.Params, "params")
 	if err != nil {
-		return Run{}, false, err
+		return Run{}, "", err
 	}
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return Run{}, false, fmt.Errorf("materialize: begin: %w", err)
+		return Run{}, "", fmt.Errorf("materialize: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, hashtext($2))`,
 		lockNamespaceJob, p.JobID); err != nil {
-		return Run{}, false, fmt.Errorf("materialize: lock %s: %w", p.JobID, err)
+		return Run{}, "", fmt.Errorf("materialize: lock %s: %w", p.JobID, err)
 	}
 
 	job, err := scanJob(tx.QueryRow(ctx, `SELECT`+jobColumns+` FROM jobs WHERE id = $1`, p.JobID))
 	if errors.Is(err, pgx.ErrNoRows) {
-		return Run{}, false, ErrNotFound
+		return Run{}, "", ErrNotFound
 	}
 	if err != nil {
-		return Run{}, false, fmt.Errorf("materialize: read job %s: %w", p.JobID, err)
+		return Run{}, "", fmt.Errorf("materialize: read job %s: %w", p.JobID, err)
 	}
 	// The jobs.scope <-> job_runs.host_id agreement. No row-level CHECK can span
 	// two tables, so it is enforced here, on the one path every insert takes.
 	if job.Scope == ScopeHost && p.HostID == "" {
-		return Run{}, false, ErrHostRequired
+		return Run{}, "", ErrHostRequired
 	}
 	if job.Scope == ScopeInstance && p.HostID != "" {
-		return Run{}, false, ErrHostNotAllowed
+		return Run{}, "", ErrHostNotAllowed
 	}
 	if !job.Managed {
-		return Run{}, false, ErrUnmanaged
+		return Run{}, "", ErrUnmanaged
 	}
 	if !job.Enabled {
 		// A disabled job never runs, not even manually. Disabling is the operator's
 		// kill switch and it has to mean it.
-		return Run{}, false, ErrDisabled
+		return Run{}, "", ErrDisabled
 	}
 
 	existing, found, err := openRunTx(ctx, tx, p.JobID, p.HostID)
 	if err != nil {
-		return Run{}, false, err
+		return Run{}, "", err
 	}
 	if found {
+		// attempt and params are never rewritten here. Keeping attempt is what
+		// stops a trigger that pulls a deferral retry forward from also resetting
+		// the backoff ladder: it skips one wait, it does not start over.
+		earlier := existing.ScheduledFor.After(p.ScheduledFor)
 		if existing.State == StatePending && p.Trigger == TriggerManual {
 			pulled, err := scanRun(tx.QueryRow(ctx, `
 				UPDATE job_runs
@@ -405,17 +421,40 @@ func (s *Store) Materialize(ctx context.Context, p MaterializeParams) (Run, bool
 				WHERE id = $1::uuid
 				RETURNING`+runColumns, existing.ID, p.ScheduledFor, p.ActorUserID))
 			if err != nil {
-				return Run{}, false, fmt.Errorf("materialize: pull forward: %w", err)
+				return Run{}, "", fmt.Errorf("materialize: pull forward: %w", err)
 			}
 			if err := tx.Commit(ctx); err != nil {
-				return Run{}, false, fmt.Errorf("materialize: commit: %w", err)
+				return Run{}, "", fmt.Errorf("materialize: commit: %w", err)
 			}
-			return pulled, false, nil
+			m := RunCoalesced
+			if earlier {
+				m = RunPulledForward
+			}
+			return pulled, m, nil
+		}
+		// The event trigger's half (#92): coalescing an event onto a run the
+		// schedule dated hours out made the trigger a no-op — the reap waited for
+		// the interval it was meant to skip. A pending manual run keeps its
+		// trigger and actor: the event moved the clock, not the reason.
+		if existing.State == StatePending && p.Trigger == TriggerEvent && earlier {
+			pulled, err := scanRun(tx.QueryRow(ctx, `
+				UPDATE job_runs
+				SET scheduled_for = $2,
+				    trigger = CASE WHEN trigger = 'manual' THEN trigger ELSE 'event' END
+				WHERE id = $1::uuid
+				RETURNING`+runColumns, existing.ID, p.ScheduledFor))
+			if err != nil {
+				return Run{}, "", fmt.Errorf("materialize: pull forward: %w", err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return Run{}, "", fmt.Errorf("materialize: commit: %w", err)
+			}
+			return pulled, RunPulledForward, nil
 		}
 		if err := tx.Commit(ctx); err != nil {
-			return Run{}, false, fmt.Errorf("materialize: commit: %w", err)
+			return Run{}, "", fmt.Errorf("materialize: commit: %w", err)
 		}
-		return existing, false, nil
+		return existing, RunCoalesced, nil
 	}
 
 	run, err := scanRun(tx.QueryRow(ctx, `
@@ -432,18 +471,18 @@ func (s *Store) Materialize(ctx context.Context, p MaterializeParams) (Run, bool
 			_ = tx.Rollback(ctx)
 			cur, found, rerr := s.OpenRun(ctx, p.JobID, p.HostID)
 			if rerr != nil {
-				return Run{}, false, rerr
+				return Run{}, "", rerr
 			}
 			if found {
-				return cur, false, nil
+				return cur, RunCoalesced, nil
 			}
 		}
-		return Run{}, false, fmt.Errorf("materialize: insert: %w", err)
+		return Run{}, "", fmt.Errorf("materialize: insert: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return Run{}, false, fmt.Errorf("materialize: commit: %w", err)
+		return Run{}, "", fmt.Errorf("materialize: commit: %w", err)
 	}
-	return run, true, nil
+	return run, RunCreated, nil
 }
 
 func openRunTx(ctx context.Context, tx pgx.Tx, jobID, hostID string) (Run, bool, error) {

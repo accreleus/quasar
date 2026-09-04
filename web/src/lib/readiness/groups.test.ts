@@ -16,6 +16,7 @@ const AGENT_CHECK_IDS = [
   "render_node",
   "uinput",
   "user_namespaces",
+  "app_apparmor_profile",
   "host_render_node",
   "dri_node_app_access",
   "driver_volume_version",
