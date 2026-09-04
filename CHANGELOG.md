@@ -126,7 +126,49 @@ own; the two do not move together, and that is deliberate.
   air-gapped host. A host whose NVIDIA driver is older than r580 skips the fetch
   and says so. See [`docs/configuration.md`](docs/configuration.md).
 
+### Added
+
+- **Pushing a `vX.Y.Z` tag on `main` publishes a platform release (#104, #108).** The
+  Images workflow gains a `v*` tag-push trigger beside manual dispatch. A `release-gate`
+  job runs first and every build needs it: the tag must be strict semver, its commit must
+  be reachable from `main`, and `CHANGELOG.md` must carry a non-empty section for that
+  version — each refusal fails in seconds, before the ~85-minute node-agent build. After
+  the existing build/validate/preflight/promote lane, a `release` job creates the GitHub
+  Release with that section as its body (a prerelease tag makes a GitHub prerelease) and
+  attaches `platform-release-manifest.json`: format version, release version, source
+  commit, build time, the highest embedded control-plane migration, and the two component
+  images by tag-free reference and sha256 digest. The workflow asserts the promoted
+  `:X.Y.Z` tags resolve to exactly those digests before it publishes. Generator,
+  validator, changelog extractor and their fixture tests live in `scripts/release/`
+  (schema: `scripts/release/platform-release-manifest.md`). Branch pushes still build
+  nothing and `develop` publishing stays manual. The first live tag-push run is still
+  outstanding: it needs the workflow on `main`, then a prerelease tag.
+
+- **Protocol amendment 1 for platform releases — identity and the release read surface
+  (#104, #106).** `protocol/` is pinned to the `amend/platform-release-identity` branch of
+  `quasar-protocol` (merge to its `main` is the operator's sign-off): `register` gains four
+  optional identity fields (`source_commit`, `built_at`, `install_mode`, `updater_present`;
+  replaced wholesale on every register, absent ⇒ unknown), the host body carries them, and
+  two admin reads are specified — `GET /v1/admin/platform/identity` and
+  `GET /v1/admin/platform/releases` (installed identities, available releases newest first
+  by schema version, per-target eligibility with a closed reason vocabulary, faults). The
+  channel and edge branch ride `/v1/admin/settings` as `release_channel` /
+  `release_edge_branch`. `schema.md` documents the `hosts` identity columns, the
+  `platform_releases` table and the two settings columns as provisional migration 0074.
+  Both routes carry `x-unimplemented` in `openapi.yaml` and sit in the drift test's
+  reviewed allowlist until #107/#110 register them.
+
 ### Changed
+
+- **One hardened outbound HTTP client for the control plane (#105).** The SSRF
+  containment that lived inside the registry digest resolver — HTTPS only, per-caller
+  host allowlist, no redirects, DNS-rebind dial guard, bounded bodies, short timeouts —
+  is now `internal/outbound`, constructed per caller with its own allowlist and timeout
+  so the coming GitHub Releases client (#110) gets it by construction. The registry
+  resolver and the template-context resolver use it; `QUASAR_IMAGE_REGISTRY_HOSTS`
+  stays the registry's own knob. One visible delta: a registry token body over 1 MiB
+  now fails with a named "body too large" error instead of being silently truncated
+  into a JSON parse failure.
 
 - **The platform container images are named for their role, not their
   implementation.** `quasar-control` → `quasar-control-plane`, `quasar-vulkan` →
