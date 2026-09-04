@@ -5,9 +5,19 @@
  * actions menu (admin-hosts.html uses full-width inline buttons on cards);
  * built from styleguide tokens/components as an extrapolation for the
  * table-with-expandable-rows redesign (host-observability round 2).
+ *
+ * The popover is `position: fixed`, anchored from the trigger button's
+ * `getBoundingClientRect()` rather than `.row-menu`'s own box (like `.menu`,
+ * primitives.css) — it renders inside `.table-wrap { overflow: auto }`
+ * (HostsTab/StorageTab), which clips anything `absolute` past the table's
+ * edge (#101). It defaults below the button and flips above when a
+ * post-mount measurement of its own height would overflow the viewport, and
+ * closes on any ancestor scroll (capture phase, since scroll doesn't bubble)
+ * or a window resize, since a stale fixed position no longer points at the
+ * button.
  */
-import { useEffect, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import type { CSSProperties, ReactNode } from "react";
 
 import { IconMore } from "./icons";
 
@@ -39,9 +49,17 @@ interface ActionsMenuProps {
   label?: string;
 }
 
+/** Gap between the button and the popover, in either direction. */
+const GAP = 6;
+
 export function ActionsMenu({ items, label = "Actions" }: ActionsMenuProps) {
   const [open, setOpen] = useState(false);
+  const [placement, setPlacement] = useState<"below" | "above">("below");
+  const [right, setRight] = useState(0);
+  const [offset, setOffset] = useState(0);
   const ref = useRef<HTMLDivElement>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const popRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -59,10 +77,51 @@ export function ActionsMenu({ items, label = "Actions" }: ActionsMenuProps) {
     };
   }, [open]);
 
+  // A fixed-position popover stops tracking the button the moment its
+  // scroll container moves, so any scroll (capture: scroll doesn't bubble)
+  // or resize closes it rather than leaving it floating over the wrong row.
+  useEffect(() => {
+    if (!open) return;
+    function close() {
+      setOpen(false);
+    }
+    document.addEventListener("scroll", close, true);
+    window.addEventListener("resize", close);
+    return () => {
+      document.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
+    };
+  }, [open]);
+
+  // Anchor from the button's own rect, not `.row-menu`'s, so the popover
+  // reads correctly regardless of what clips its offset parent. Runs before
+  // paint so the flip (measured against the popover's real height) never
+  // flashes at the wrong spot.
+  useLayoutEffect(() => {
+    if (!open) return;
+    const btn = btnRef.current;
+    if (!btn) return;
+    const rect = btn.getBoundingClientRect();
+    const popHeight = popRef.current?.getBoundingClientRect().height ?? 0;
+    const fitsBelow = rect.bottom + GAP + popHeight <= window.innerHeight;
+    setRight(window.innerWidth - rect.right);
+    if (fitsBelow) {
+      setPlacement("below");
+      setOffset(rect.bottom + GAP);
+    } else {
+      setPlacement("above");
+      setOffset(window.innerHeight - rect.top + GAP);
+    }
+  }, [open]);
+
+  const popStyle: CSSProperties =
+    placement === "below" ? { top: offset, right } : { bottom: offset, right };
+
   return (
     <div className="row-menu" ref={ref}>
       <button
         type="button"
+        ref={btnRef}
         className="row-menu-btn"
         aria-haspopup="true"
         aria-expanded={open}
@@ -75,7 +134,7 @@ export function ActionsMenu({ items, label = "Actions" }: ActionsMenuProps) {
         <IconMore className="" />
       </button>
       {open && (
-        <div className="row-menu-pop" role="menu" aria-label={label}>
+        <div className="row-menu-pop" role="menu" aria-label={label} ref={popRef} style={popStyle}>
           {items.map((item) =>
             isSeparator(item) ? (
               <hr key={item.key} />
