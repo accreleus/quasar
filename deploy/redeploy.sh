@@ -925,13 +925,47 @@ agent_log="$($DC logs --tail 400 quasar-node-agent 2>/dev/null || true)"
 if [ -n "$agent_log" ]; then
   readiness=ok
   codecs=ok
-  if printf '%s' "$agent_log" | grep -q 'readiness-checks-failed'; then
+  # Classify the LAST readiness verdict in the log, never the first. The #98 boot race
+  # exits on purpose and heals on the retry, and a restart-policy restart keeps the same
+  # container's log, so a healed host still carries the failing line from the boot before.
+  # Token contract: node-agent/src/{readiness,agent}.rs.
+  readiness_line="$(printf '%s' "$agent_log" |
+    grep -E 'boot-render-node-missing|boot-render-node-retry-deferred|boot-dri-modes-stale-cdi|boot-host-render-node-missing|readiness-checks-failed|host readiness: all checks passed or skipped' |
+    tail -1 || true)"
+  case "$readiness_line" in
+  *boot-render-node-missing*)
+    readiness=RETRYING
+    echo "  FAIL: the node-agent is exiting on purpose because it cannot see a /dev/dri render"
+    echo "        node the host kernel HAS (#98). A device list is fixed at container creation,"
+    echo "        so the restart policy re-creating it is the fix, and it normally settles on"
+    echo "        the next boot. If it does not, /dev/dri is not reaching the agent at all:"
+    echo "        check the node-agent service's devices:/gpus: entry, then recreate."
+    fail=1
+    ;;
+  *boot-dri-modes-stale-cdi*)
+    readiness=FAILED
+    echo "  FAIL: the /dev/dri nodes inside the agent container cannot be opened by the app"
+    echo "        user — the boot-time CDI spec baked the wrong modes, and no restart can fix"
+    echo "        it (CDI edits are applied when a container is created). On the HOST:"
+    echo "          sudo nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml"
+    echo "          $DC up -d --force-recreate"
+    fail=1
+    ;;
+  *boot-host-render-node-missing* | *boot-render-node-retry-deferred*)
+    readiness=FAILED
+    echo "  FAIL: the node-agent reports a boot sanity failure that no restart can fix:"
+    printf '%s' "$readiness_line" | sed 's/^/        /'
+    echo "        $DC logs quasar-node-agent | grep gpu-host-sanity"
+    fail=1
+    ;;
+  *readiness-checks-failed*)
     readiness=FAILED
     echo "  WARN: the node-agent reports FAILING host readiness checks:"
-    printf '%s' "$agent_log" | grep 'readiness-checks-failed' | tail -1 | sed 's/^/        /'
+    printf '%s' "$readiness_line" | sed 's/^/        /'
     echo "        Admin -> Hosts -> this host lists them with remediation."
     degraded=1
-  fi
+    ;;
+  esac
   # A codec plan that is merely waiting on the driver volume is the expected first-boot
   # state and self-clears on the agent's restart; only a genuinely degraded plan counts.
   if printf '%s' "$agent_log" | grep -q 'vulkan-codec-plan-degraded'; then
