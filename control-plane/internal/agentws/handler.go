@@ -21,8 +21,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/accreleus/quasar/control-plane/internal/console"
-	"github.com/accreleus/quasar/control-plane/internal/hostenroll"
 	"github.com/accreleus/quasar/control-plane/internal/hostcfg"
+	"github.com/accreleus/quasar/control-plane/internal/hostenroll"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
 	"github.com/accreleus/quasar/control-plane/internal/ratelimit"
 )
