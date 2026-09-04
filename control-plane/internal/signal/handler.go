@@ -68,6 +68,15 @@ const (
 	signalValidationTimeout = 15 * time.Second
 )
 
+// The frame-validation rejections, as sentinels: logSafeErr renders the text of
+// an error only when this package authored it (see safeErrTexts).
+var (
+	errNonTextFrame  = errors.New("non-text WebSocket message rejected")
+	errFrameTooLarge = errors.New("WebSocket message exceeds browser read limit")
+	errFrameNotUTF8  = errors.New("invalid UTF-8 WebSocket text rejected")
+	errFrameNotJSON  = errors.New("invalid JSON WebSocket message rejected")
+)
+
 // validateBrowserFrame is deliberately small and side-effect free: it is used
 // by the socket reader before any relay work and is also the boundary exercised
 // by the deterministic fuzz regression. Gorilla enforces browserReadLimit while
@@ -75,16 +84,16 @@ const (
 // accidentally bypass the cap later.
 func validateBrowserFrame(messageType int, frame []byte) (int, string, error) {
 	if messageType != websocket.TextMessage {
-		return websocket.CloseUnsupportedData, "text JSON messages required", errors.New("non-text WebSocket message rejected")
+		return websocket.CloseUnsupportedData, "text JSON messages required", errNonTextFrame
 	}
 	if len(frame) > browserReadLimit {
-		return websocket.CloseMessageTooBig, "message too large", errors.New("WebSocket message exceeds browser read limit")
+		return websocket.CloseMessageTooBig, "message too large", errFrameTooLarge
 	}
 	if !utf8.Valid(frame) {
-		return websocket.CloseUnsupportedData, "UTF-8 text required", errors.New("invalid UTF-8 WebSocket text rejected")
+		return websocket.CloseUnsupportedData, "UTF-8 text required", errFrameNotUTF8
 	}
 	if !json.Valid(frame) {
-		return websocket.CloseUnsupportedData, "valid JSON required", errors.New("invalid JSON WebSocket message rejected")
+		return websocket.CloseUnsupportedData, "valid JSON required", errFrameNotJSON
 	}
 	return 0, "", nil
 }
@@ -224,9 +233,14 @@ func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clien
 	}
 	// The other kind of exit: the transport already failed, so no close frame can
 	// reach the client. Same level as wsClose — telling the two apart from the
-	// host side is the point.
+	// host side is the point. `err` is rendered through logSafeErr because a raw
+	// net.OpError string carries the client's address and this line is visible at
+	// the default LOG_LEVEL; the raw error stays at Debug.
 	closedNoFrame := func(reason string, err error) {
 		h.log.Info("signaling WS dropped without a close frame",
+			"token", "signal-ws-dropped", "reason", reason,
+			"session_id", sessionID, "err", logSafeErr(err))
+		h.log.Debug("signaling WS drop detail",
 			"token", "signal-ws-dropped", "reason", reason,
 			"session_id", sessionID, "err", err)
 	}
@@ -398,7 +412,8 @@ func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clien
 				// here without one gave the client a bare transport close one
 				// frame after its own write, indistinguishable from a reset.
 				h.log.Warn("relay to agent failed",
-					"token", "signal-relay-send-failed", "session_id", sess.ID, "err", err)
+					"token", "signal-relay-send-failed", "session_id", sess.ID,
+					"err", logSafeErr(err))
 				wsClose(wsCloseRelayUnavail, "relay to agent failed", "relay-send-failed")
 				return
 			}
