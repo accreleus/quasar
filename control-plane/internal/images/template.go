@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/accreleus/quasar/control-plane/internal/outbound"
 )
 
 // Template context sha resolution (protocol/schema.md's P4 amendment). A
@@ -56,9 +58,9 @@ const githubAPIHost = "api.github.com"
 // currently names (GET /repos/{owner}/{repo}/commits/{ref}, Accept:
 // application/vnd.github.sha — a raw sha response, no JSON).
 //
-// HTTPS-only, repo/ref interpolated only into the path, and reuses digest.go's
-// guarded client (no redirects, DNS-rebind-safe) even with a fixed host —
-// same SSRF discipline as the digest resolver.
+// HTTPS-only, repo/ref interpolated only into the path, and reuses the shared
+// guarded transport (internal/outbound: no redirects, DNS-rebind-safe) even
+// with a fixed host — same SSRF discipline as the digest resolver.
 type GitHubContextResolver struct {
 	client *http.Client
 	// baseURL, when non-empty, replaces https://api.github.com — test seam only.
@@ -66,10 +68,10 @@ type GitHubContextResolver struct {
 }
 
 // NewGitHubContextResolver builds the production resolver. A nil client gets
-// the guarded client (shared with the digest resolver).
+// the shared guarded transport (internal/outbound).
 func NewGitHubContextResolver(client *http.Client) *GitHubContextResolver {
 	if client == nil {
-		client = newGuardedClient(defaultLookupIP)
+		client = outbound.NewGuardedHTTPClient(digestResolveTimeout, nil)
 	}
 	return &GitHubContextResolver{client: client}
 }
@@ -77,7 +79,7 @@ func NewGitHubContextResolver(client *http.Client) *GitHubContextResolver {
 // newTestContextResolver builds a resolver whose HTTP calls all go to baseURL.
 func newTestContextResolver(client *http.Client, baseURL string) *GitHubContextResolver {
 	if client != nil && client.CheckRedirect == nil {
-		client.CheckRedirect = noRedirect
+		client.CheckRedirect = outbound.NoRedirect
 	}
 	return &GitHubContextResolver{client: client, baseURL: strings.TrimSuffix(baseURL, "/")}
 }
