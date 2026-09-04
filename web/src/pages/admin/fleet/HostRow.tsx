@@ -224,13 +224,12 @@ function menuItems(props: HostRowProps): ActionsMenuEntry[] {
     });
   }
 
-  // Forgetting a host that is still talking would have it re-enroll seconds
-  // later, so the action exists only once it has gone quiet.
+  // Always enabled: the offline precondition (server 409s otherwise) is
+  // explained and actioned in the confirm modal, not gated here (#101).
   items.push({
     key: "forget",
     label: "Remove host",
     variant: "danger",
-    disabled: host.status !== "offline",
     onClick: props.onForget,
   });
 

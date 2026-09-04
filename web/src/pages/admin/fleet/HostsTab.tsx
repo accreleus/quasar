@@ -47,6 +47,7 @@ export function HostsTab() {
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const [enrollOpen, setEnrollOpen] = useState(false);
   const [forgetTarget, setForgetTarget] = useState<Host | null>(null);
+  const [forgetError, setForgetError] = useState<string | null>(null);
   const [actionPendingId, setActionPendingId] = useState<string | null>(null);
   const [actionErrors, setActionErrors] = useState<Record<string, string>>({});
 
@@ -128,6 +129,11 @@ export function HostsTab() {
     }
   };
 
+  /** Shared with the row's own Drain menu item — the confirm modal offers the
+   *  same action for a connected host rather than a second code path. */
+  const drainRow = (host: Host) =>
+    void runRowAction(host, (t) => adminApi.drainHost(t, host.id), "drain failed");
+
   const forget = useAdminAction<[Host], void>(
     async (host) => {
       if (!token) return;
@@ -138,7 +144,10 @@ export function HostsTab() {
       success: (_result, host) => `Host "${host.node_name}" forgotten`,
       failure: "could not forget host",
       onSuccess: () => setForgetTarget(null),
-      onFailure: () => setForgetTarget(null),
+      // Keep the modal open on failure (e.g. 409: sessions still active, or
+      // the host reconnected) and show the server's message inline (#101).
+      onFailure: (error) =>
+        setForgetError(error instanceof ApiError ? error.message : "could not remove host"),
     },
   );
 
@@ -262,13 +271,7 @@ export function HostsTab() {
                       onOpen={() => navigate(`/admin/fleet/hosts/${host.id}`)}
                       onConsole={() => navigate(`/admin/fleet/hosts/${host.id}/console`)}
                       onSettings={() => navigate(`/admin/fleet/hosts/${host.id}/settings`)}
-                      onDrain={() =>
-                        void runRowAction(
-                          host,
-                          (t) => adminApi.drainHost(t, host.id),
-                          "drain failed",
-                        )
-                      }
+                      onDrain={() => drainRow(host)}
                       onResume={() =>
                         void runRowAction(
                           host,
@@ -276,7 +279,10 @@ export function HostsTab() {
                           "uncordon failed",
                         )
                       }
-                      onForget={() => setForgetTarget(host)}
+                      onForget={() => {
+                        setForgetError(null);
+                        setForgetTarget(host);
+                      }}
                       actionPending={actionPendingId === host.id}
                       actionError={actionErrors[host.id]}
                       now={now}
@@ -291,33 +297,78 @@ export function HostsTab() {
 
       <EnrollHostModal open={enrollOpen} onClose={() => setEnrollOpen(false)} />
 
-      {forgetTarget && (
-        <Modal
-          open
-          onClose={() => setForgetTarget(null)}
-          title="Remove host"
-          footer={
-            <>
-              <Button variant="ghost" onClick={() => setForgetTarget(null)}>
-                Cancel
-              </Button>
-              <Button
-                variant="danger"
-                disabled={forget.pending != null}
-                onClick={() => void forget.run(forgetTarget)}
-              >
-                {forget.pending ? "Removing…" : "Remove host"}
-              </Button>
-            </>
-          }
-        >
-          <p className="sec">
-            This permanently removes <strong>{forgetTarget.node_name}</strong> from the host
-            registry. Its GPU records and session history are deleted. If the host comes back
-            online it re-enrolls automatically. This cannot be undone.
-          </p>
-        </Modal>
-      )}
+      {forgetTarget &&
+        (() => {
+          // The server refuses (409) while the agent is reachable or has
+          // active sessions, checked live rather than off `status` — so an
+          // offline row still gets the real confirm, everything else gets
+          // the explanation + a way to get there (#101).
+          // Read the LIVE row, not the snapshot taken when the dialog opened:
+          // Drain from inside the dialog changes the status it is explaining.
+          const live = hosts.find((h) => h.id === forgetTarget.id) ?? forgetTarget;
+          const removable = live.status === "offline";
+          const draining = live.status === "draining" || actionPendingId === live.id;
+          return (
+            <Modal
+              open
+              onClose={() => setForgetTarget(null)}
+              title="Remove host"
+              footer={
+                removable ? (
+                  <>
+                    <Button variant="ghost" onClick={() => setForgetTarget(null)}>
+                      Cancel
+                    </Button>
+                    <Button
+                      variant="danger"
+                      disabled={forget.pending != null}
+                      onClick={() => void forget.run(forgetTarget)}
+                    >
+                      {forget.pending ? "Removing…" : "Remove host"}
+                    </Button>
+                  </>
+                ) : (
+                  <>
+                    <Button variant="ghost" onClick={() => setForgetTarget(null)}>
+                      Close
+                    </Button>
+                    <Button variant="primary" disabled={draining} onClick={() => drainRow(live)}>
+                      {draining ? "Draining…" : "Drain"}
+                    </Button>
+                  </>
+                )
+              }
+            >
+              {removable ? (
+                <>
+                  <p className="sec">
+                    This permanently removes <strong>{forgetTarget.node_name}</strong> from the
+                    host registry. Its GPU records and session history are deleted. If the host
+                    comes back online it re-enrolls automatically. This cannot be undone.
+                  </p>
+                  {forgetError && (
+                    <p className="note warn" role="alert">
+                      {forgetError}
+                    </p>
+                  )}
+                </>
+              ) : (
+                <>
+                  <p className="sec">
+                    <strong>{forgetTarget.node_name}</strong> is still connected, so it can't be
+                    removed yet.
+                  </p>
+                  <p className="note">
+                    Drain it, then stop the agent on that machine — for a host enrolled with the
+                    installer, <span className="mono">docker compose --project-directory
+                    /opt/quasar-agent down</span>. The row turns offline within a heartbeat
+                    window; remove it from here once it does.
+                  </p>
+                </>
+              )}
+            </Modal>
+          );
+        })()}
     </section>
   );
 }
