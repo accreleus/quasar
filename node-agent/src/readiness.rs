@@ -2748,7 +2748,8 @@ mod tests {
                 "host/sys/kernel/security/apparmor/profiles",
                 "docker-default (enforce)\nquasar-app (complain)\n",
             );
-        let c = get(&probe(&complain.env(false, "")), "app_apparmor_profile");
+        let checks = probe(&complain.env(false, ""));
+        let c = get(&checks, "app_apparmor_profile");
         assert_eq!(c.status, WARN, "{c:?}");
     }
 
