@@ -111,8 +111,8 @@ func (m *Manager) GCPending(ctx context.Context, hostID string) ([]PendingHome, 
 }
 
 // GCConfirm hard-deletes the homes whose ids the agent reaped on hostID. The
-// per-row guard (still reapable AND on this host — the same gcReapable
-// predicate GCPending offered) makes a
+// per-row guard (still reapable by the same gcReapable predicate GCPending
+// offered, AND on this host) makes a
 // confirm a no-op for any home that was revived (gc_after cleared by a launch)
 // or relocated to another host between the pull and the confirm — the agent's
 // reap of a now-stale backing store is harmless (idempotent at the agent), and
