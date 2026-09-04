@@ -761,7 +761,11 @@ mod tests {
     fn an_empty_home_is_collectable_before_the_retention_window() {
         let retention = Duration::from_secs(72 * 3600);
         // Not empty: only retention lets it go.
-        assert!(!reclaimable(Duration::from_secs(2 * 3600), retention, false));
+        assert!(!reclaimable(
+            Duration::from_secs(2 * 3600),
+            retention,
+            false
+        ));
         assert!(reclaimable(retention, retention, false));
         // Empty: past the floor is enough, below it is not.
         assert!(reclaimable(EMPTY_HOME_MIN_AGE, retention, true));
@@ -808,7 +812,9 @@ mod tests {
         fs::write(populated.join("kde-desktop/state"), b"payload").unwrap();
 
         let old = SystemTime::now() - Duration::from_secs(4 * 3600);
-        let times = std::fs::FileTimes::new().set_accessed(old).set_modified(old);
+        let times = std::fs::FileTimes::new()
+            .set_accessed(old)
+            .set_modified(old);
         for p in [&emptied, &populated, &populated.join("kde-desktop")] {
             std::fs::File::open(p).unwrap().set_times(times).unwrap();
         }
@@ -820,7 +826,10 @@ mod tests {
         };
         let rep = sweep(&cfg, &ContainerRuntime::from_env());
         assert!(!emptied.exists(), "an aged empty home must be collected");
-        assert!(populated.exists(), "a home holding data must wait out retention");
+        assert!(
+            populated.exists(),
+            "a home holding data must wait out retention"
+        );
         assert_eq!(rep.deleted, 1);
         assert_eq!(rep.deleted_empty, 1);
         assert_eq!(rep.skipped_young, 1);
