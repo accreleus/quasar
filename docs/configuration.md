@@ -871,6 +871,7 @@ compose). See `CLAUDE.md` for the full rationale.
 | `XDG_RUNTIME_DIR` | `/tmp/runtime-quasar` (agent default) / `/run/quasar-agent` (compose) | Wayland + PulseAudio sockets. Must be a host bind-mount in compose so DooD sibling mounts resolve. |
 | `MESA_LOADER_DRIVER_OVERRIDE` | unset for HW | `softpipe` forces software Mesa — **must stay unset** for VA/NVENC and a real render node, or the VA encoder disappears. |
 | `LIBGL_ALWAYS_SOFTWARE` | unset for HW | Same: forces software GL; unset on any hardware-encode run. |
+| `LIBVA_TRACE` | unset | Diagnostic only. libva treats mere PRESENCE as "tracing on" — an empty value is NOT "off" to libva itself (#94: a present-but-empty value from an unset operator var wrote 66GB of `.<pid>.thd-*` files, one per encode thread per session, into the container's writable layer and filled the disk). The entrypoint (`deploy/Dockerfile.vulkan`) and the agent binary both unset it when it arrives empty, mirroring `MESA_LOADER_DRIVER_OVERRIDE`/`LIBGL_ALWAYS_SOFTWARE` above. If you deliberately set it, point it at a bounded, volume-backed path — never a bare prefix in the container's own filesystem. |
 | `GST_REGISTRY` | per-process (VA/NVENC) | Pointed at a fresh path so GStreamer rescans and registers the HW encoder for the GPU present at runtime. |
 | `GST_PLUGIN_PATH` | `/usr/local/lib/.../gstreamer-1.0` | Lists the from-source plugins (nvcodec/waylanddisplaysrc/interpipe) first so they shadow the apt builds. |
 

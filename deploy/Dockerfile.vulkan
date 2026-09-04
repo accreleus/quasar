@@ -991,6 +991,7 @@ RUN printf '%s\n' \
     '[ -n "$XDG_RUNTIME_DIR" ] && { mkdir -p "$XDG_RUNTIME_DIR"; chmod 0700 "$XDG_RUNTIME_DIR"; }' \
     '[ -z "$MESA_LOADER_DRIVER_OVERRIDE" ] && unset MESA_LOADER_DRIVER_OVERRIDE' \
     '[ -z "$LIBGL_ALWAYS_SOFTWARE" ] && unset LIBGL_ALWAYS_SOFTWARE' \
+    '[ -z "$LIBVA_TRACE" ] && unset LIBVA_TRACE' \
     'if command -v avahi-daemon >/dev/null 2>&1 && ! avahi-daemon --check 2>/dev/null; then' \
     '  avahi-daemon --daemonize --no-chroot || echo "WARN: avahi-daemon failed to start; Chrome .local mDNS ICE candidates will not resolve" >&2' \
     'fi' \
@@ -1307,6 +1308,7 @@ RUN printf '%s\n' \
     '[ -n "$XDG_RUNTIME_DIR" ] && { mkdir -p "$XDG_RUNTIME_DIR"; chmod 0700 "$XDG_RUNTIME_DIR"; }' \
     '[ -z "$MESA_LOADER_DRIVER_OVERRIDE" ] && unset MESA_LOADER_DRIVER_OVERRIDE' \
     '[ -z "$LIBGL_ALWAYS_SOFTWARE" ] && unset LIBGL_ALWAYS_SOFTWARE' \
+    '[ -z "$LIBVA_TRACE" ] && unset LIBVA_TRACE' \
     'if command -v avahi-daemon >/dev/null 2>&1 && ! avahi-daemon --check 2>/dev/null; then' \
     '  avahi-daemon --daemonize --no-chroot || echo "WARN: avahi-daemon failed to start; Chrome .local mDNS ICE candidates will not resolve" >&2' \
     'fi' \

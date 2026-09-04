@@ -103,6 +103,11 @@
         }
       },
 
+      "entrypoint_env_guards": {
+        "unset_when_empty": ["LIBVA_TRACE"],
+        "_why": "#94: compose always passes LIBVA_TRACE through (`${LIBVA_TRACE:-}`), so an operator who never set it gets a present-but-empty value. libva treats mere PRESENCE as tracing-on and uses the (empty) value as a file prefix -- one file per encode thread per session, 66GB/1589 files on one deploy that filled the disk and crashed Postgres. Run with the REAL entrypoint (unlike the assertion-program checks above, which bypass it with --entrypoint /bin/sh) and `env` as the command: with the var set empty it must be absent from the output (the entrypoint's `[ -z ] && unset` guard fired); with a non-empty value it must survive unchanged, so a deliberate bounded trace path still works."
+      },
+
       "gst_elements": {
         "required": [
           "waylanddisplaysrc", "kmssink",
