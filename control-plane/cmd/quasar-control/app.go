@@ -115,6 +115,10 @@ func (q jobEnqueuer) EnqueueJob(ctx context.Context, jobID, hostID string, param
 	return err
 }
 
+// homeGCJobID is the registered id AND the id the nudge enqueues; the two must
+// stay one name. Agent-side twin: node-agent `session::gc::JOB_ID`.
+const homeGCJobID = "home.gc"
+
 // homeReaper implements auth.HomeReaper by enqueuing a `home.gc` run on each
 // host that held a deleted user's homes (#92). Best-effort by contract: the
 // homes are already orphaned tombstones, so a failure here only means they wait
@@ -126,12 +130,17 @@ type homeReaper struct {
 
 func (h homeReaper) ReapHomesOn(ctx context.Context, hostIDs []string) {
 	for _, hostID := range hostIDs {
-		if _, err := h.d.Enqueue(ctx, "home.gc", hostID, nil); err != nil {
+		switch _, err := h.d.Enqueue(ctx, homeGCJobID, hostID, nil); {
+		case err == nil:
+			h.log.Info("nudged home GC after a user delete", "host_id", hostID)
+		case errors.Is(err, jobs.ErrDisabled):
+			// An operator turned the job off; not something to warn about every
+			// reaper sweep.
+			h.log.Debug("home GC is disabled — not nudging", "host_id", hostID)
+		default:
 			h.log.Warn("could not nudge home GC after a user delete",
 				"host_id", hostID, "err", err)
-			continue
 		}
-		h.log.Info("nudged home GC after a user delete", "host_id", hostID)
 	}
 }
 
@@ -724,7 +733,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		ResolveParams: imagesEnsurer.WarmupParamsForHost,
 	})
 	jobRegistry.MustRegister(jobs.Definition{
-		ID:          "home.gc",
+		ID:          homeGCJobID,
 		Name:        "Home backing-store GC",
 		Description: "Reaps the docker volume or directory behind each user home the control plane has tombstoned past its 24 h grace period (#175).",
 		Plane:       jobs.PlaneAgent,
