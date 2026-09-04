@@ -109,14 +109,21 @@ glib::wrapper! {
         @extends gstreamer_rtp::RTPHeaderExtension, gst::Element, gst::Object;
 }
 
-/// Register abs-capture-time with the payloader so downstream RTP helpers know the URI/id
-/// association and preserve it through RTX/FEC/WebRTC transport.
+/// Register abs-capture-time with `pay` — whichever video payloader the session's codec
+/// resolved to (`rtph264pay`/`rtph265pay`/`rtpav1pay`, see `Codec::rtp_payloader`) — so
+/// downstream RTP helpers know the URI/id association and preserve it through
+/// RTX/FEC/WebRTC transport. Codec-agnostic by construction: the caller always passes the
+/// one payloader the session actually built, never a hardcoded element.
 pub(super) fn attach_abs_capture_time_probe(pay: &gst::Element) -> AbsCaptureTimeExtension {
     let extension: AbsCaptureTimeExtension = glib::Object::builder().build();
     extension.set_id(ABS_CAPTURE_TIME_EXT_ID);
     pay.emit_by_name::<()>("add-extension", &[&extension]);
+    let pay_name = pay
+        .factory()
+        .map(|f| f.name().to_string())
+        .unwrap_or_else(|| pay.name().to_string());
     tracing::info!(
-        "g2g abs-capture-time RTPHeaderExtension installed on rtph264pay (extmap-{ABS_CAPTURE_TIME_EXT_ID}, always-on)"
+        "g2g abs-capture-time RTPHeaderExtension installed on {pay_name} (extmap-{ABS_CAPTURE_TIME_EXT_ID}, always-on)"
     );
     extension
 }
@@ -199,8 +206,8 @@ pub(super) fn attach_abs_capture_time_egress_probe(
                 }
             }
 
-            // Only the H.264 video stream owns extmap-6; audio shares the bundled DTLS
-            // transport on a different RTP session/payload type.
+            // Only the video stream owns extmap-6, any codec (pt=96 always, `codec_chain.rs`);
+            // audio shares the bundled DTLS transport on a different RTP session/payload type.
             if rtp.payload_type() != 96 {
                 return gst::PadProbeReturn::Ok;
             }
@@ -371,4 +378,52 @@ fn ntp64_now() -> u64 {
     // nanos < 1_000_000_000, so `nanos << 32` fits in u64.
     let frac = ((unix.subsec_nanos() as u64) << 32) / 1_000_000_000;
     (ntp_secs << 32) | frac
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::Codec;
+
+    fn init() {
+        gst::init().unwrap();
+    }
+
+    /// Regression for #95: abs-capture-time was only ever exercised against
+    /// `rtph264pay`, so h265/av1 sessions silently carried no capture timestamps.
+    /// `attach_abs_capture_time_probe` takes whatever payloader the codec resolved
+    /// to — this locks that dispatch in for all three.
+    #[test]
+    fn attaches_to_every_codecs_payloader() {
+        init();
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+            let factory_name = codec.rtp_payloader();
+            let Ok(pay) = gst::ElementFactory::make(factory_name).build() else {
+                // rtpav1pay ships in gst-plugins-rs (`rsrtp`); skip rather than fail if
+                // this GStreamer install doesn't have it registered.
+                eprintln!("skipping {factory_name}: not available in this GStreamer install");
+                continue;
+            };
+            attach_abs_capture_time_probe(&pay);
+
+            let extensions = pay.property::<gst::Array>("extensions");
+            let attached = extensions.as_slice();
+            assert_eq!(
+                attached.len(),
+                1,
+                "{factory_name} should carry exactly one registered extension"
+            );
+            let ext = attached[0]
+                .get::<gstreamer_rtp::RTPHeaderExtension>()
+                .unwrap_or_else(|_| {
+                    panic!("{factory_name}'s registered extension is not an RTPHeaderExtension")
+                });
+            assert_eq!(ext.id(), ABS_CAPTURE_TIME_EXT_ID, "{factory_name} extmap id");
+            assert_eq!(
+                ext.uri().as_deref(),
+                Some(super::super::ABS_CAPTURE_TIME_URI),
+                "{factory_name} extension URI"
+            );
+        }
+    }
 }
