@@ -23,7 +23,8 @@ an agent working in this repo or by an agent in another repo (e.g. photon) that
 happens to write to this tracker.
 
 **This is enforced, not just documented:** `scripts/dev/leak-scan.sh --issues`
-runs the repo's fingerprint patterns over every issue title, body and comment,
+runs the repo's fingerprint patterns — plus the bare hostnames of the operator
+machines, which only the tracker mode checks — over every issue title, body and comment,
 and runs daily in CI (`.github/workflows/leak-scan.yml`). Run it after filing
 anything transcribed from real host output — that transcription is how both the
 2026-09-03 tracker leak and the operator-subnet test-fixture leak happened.

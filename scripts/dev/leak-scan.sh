@@ -71,6 +71,22 @@ PATTERNS=(
   '[~]/\.ssh/[A-Za-z0-9._-]*(unraid|tower|hermes|devbox)'
 )
 
+# Bare hostnames of the operator machines. ISSUE-TRACKER MODE ONLY, and a
+# deliberate exception to the note above: tracked source still carries these in
+# code comments and Makefile help text (a separate cleanup), but the tracker is
+# where NEW prose lands, and on 2026-09-04 four freshly filed issues named a
+# machine by its hostname while every address-shaped pattern stayed quiet.
+# `qdev` is the gpu-test host's local alias; the appdata path is the unraid
+# stack directory. `Tower` is also an English word: a false positive costs a
+# glance, a false negative is permanent.
+ISSUE_PATTERNS=(
+  '\b[Tt]ower\b'
+  '\bdevbox\b'
+  '\b[Hh]ermes\b'
+  '\bqdev\b'
+  '/mnt/user/appdata'
+)
+
 # --- exclusions --------------------------------------------------------------
 #
 # PHASE 1 ONLY. These directories are bound for the PRIVATE internal repo and
@@ -110,12 +126,15 @@ ALTERNATION="$(
   IFS='|'
   echo "${PATTERNS[*]}"
 )"
+ISSUE_ALTERNATION="$(
+  IFS='|'
+  echo "${PATTERNS[*]}|${ISSUE_PATTERNS[*]}"
+)"
 
 # --- issue-tracker mode -------------------------------------------------------
 #
-# Same patterns, other public surface. Hostnames alone are deliberately NOT
-# patterns here either (see the note above the list): what leaks is an address,
-# a key name, a home path or the personal domain.
+# Same patterns, other public surface — PLUS the bare hostnames in
+# ISSUE_PATTERNS, because an issue body has no code-comment excuse for one.
 if [ "$MODE" = issues ]; then
   if [ -z "${LEAK_SCAN_ISSUES_JSON:-}" ]; then
     command -v gh >/dev/null 2>&1 || {
@@ -165,7 +184,7 @@ if [ "$MODE" = issues ]; then
   }
 
   set +e
-  HITS="$(printf '%s' "$FLAT" | grep --extended-regexp --color=never -e "$ALTERNATION")"
+  HITS="$(printf '%s' "$FLAT" | grep --extended-regexp --color=never -e "$ISSUE_ALTERNATION")"
   rc=$?
   set -e
   [ "$rc" -gt 1 ] && {

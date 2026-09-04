@@ -754,8 +754,10 @@ if [ "$ls_dirty_rc" -eq 1 ] &&
   printf '%s' "$ls_dirty" | grep -q 'issue#101 title' &&
   printf '%s' "$ls_dirty" | grep -q 'issue#102 body' &&
   printf '%s' "$ls_dirty" | grep -q 'issue#102 comment\[1\]' &&
+  printf '%s' "$ls_dirty" | grep -q 'issue#104 body' &&
+  printf '%s' "$ls_dirty" | grep -q 'issue#104 comment\[1\]' &&
   ! printf '%s' "$ls_dirty" | grep -q 'issue#103'; then
-  pass "leakscan:issues-detects" "LAN IP in a title, domain in a body, home path + key name in a comment; the clean issue is not flagged"
+  pass "leakscan:issues-detects" "LAN IP in a title, domain in a body, home path + key name in a comment, bare hostnames + the appliance path in a fourth; the clean issue is not flagged"
 else
   fail "leakscan:issues-detects" "rc=$ls_dirty_rc, output: $(printf '%s' "$ls_dirty" | head -n 6)"
 fi
