@@ -409,7 +409,9 @@ say "  wrote $DIR/docker-compose.yml${gpu:+ }$( [ "$gpu" = nvidia ] && printf '+
 
 # ── 5. start (or update) the one agent ───────────────────────────────────────
 step "Starting the node agent"
-started_at="$(date -u '+%Y-%m-%dT%H:%M:%S')"
+# RFC 3339 with the Z: without it docker parses the stamp in the daemon's local
+# zone and `logs --since` reaches back into a previous run's lines.
+started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 compose() {
   # shellcheck disable=SC2086
   $SUDO docker compose --project-directory "$DIR" --project-name "$PROJECT" \
