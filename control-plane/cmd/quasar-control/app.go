@@ -735,7 +735,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	jobRegistry.MustRegister(jobs.Definition{
 		ID:          homeGCJobID,
 		Name:        "Home backing-store GC",
-		Description: "Reaps the docker volume or directory behind each user home the control plane has tombstoned past its 24 h grace period (#175).",
+		Description: "Reaps the docker volume or directory behind each user home the control plane has tombstoned: past its 24 h grace period, or at once when the owning user is gone (#175, #92).",
 		Plane:       jobs.PlaneAgent,
 		Scope:       jobs.ScopeHost,
 		Managed:     true,

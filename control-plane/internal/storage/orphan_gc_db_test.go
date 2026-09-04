@@ -32,6 +32,12 @@ func TestGCPending_OrphanSkipsTheGracePeriod(t *testing.T) {
 	setGCAfter(t, pool, orphan, "interval '1 minute'")
 	_, err := pool.Exec(ctx, `UPDATE user_homes SET user_id = NULL WHERE id::text = $1`, orphan)
 	must(t, err)
+	// Owner gone but never tombstoned (gc_after NULL): the orphan carve-out is
+	// scoped to tombstones, so this one is untouched.
+	app3 := seedApp(t, pool, "o3")
+	untombstoned := insertHome(t, pool, u, app3, hostA)
+	_, err = pool.Exec(ctx, `UPDATE user_homes SET user_id = NULL WHERE id::text = $1`, untombstoned)
+	must(t, err)
 
 	pending, err := mgr.GCPending(ctx, hostA)
 	must(t, err)
@@ -41,7 +47,7 @@ func TestGCPending_OrphanSkipsTheGracePeriod(t *testing.T) {
 
 	// The confirm must honour the same predicate, or the agent reaps a store
 	// whose row it can never delete.
-	deleted, err := mgr.GCConfirm(ctx, hostA, []string{orphan, owned})
+	deleted, err := mgr.GCConfirm(ctx, hostA, []string{orphan, owned, untombstoned})
 	must(t, err)
 	if deleted != 1 {
 		t.Fatalf("GCConfirm deleted = %d, want 1 (the orphan only)", deleted)
@@ -50,6 +56,10 @@ func TestGCPending_OrphanSkipsTheGracePeriod(t *testing.T) {
 	must(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM user_homes WHERE id::text = $1`, owned).Scan(&n))
 	if n != 1 {
 		t.Errorf("owned in-grace home was wrongly deleted")
+	}
+	must(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM user_homes WHERE id::text = $1`, untombstoned).Scan(&n))
+	if n != 1 {
+		t.Errorf("never-tombstoned orphan was wrongly deleted")
 	}
 }
 
