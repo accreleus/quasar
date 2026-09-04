@@ -21,8 +21,10 @@
 //!     the image entrypoint is root-init-then-`setpriv`.
 //!   - `--security-opt seccomp=unconfined` (`QUASAR_APP_SECCOMP`): Docker's default
 //!     profile denies the userns creation Steam's pressure-vessel (bwrap) requires.
-//!   - `--security-opt apparmor=unconfined`, on AppArmor hosts only: `docker-default`
-//!     denies mount inside that userns, which is the other half of the same gate.
+//!   - `--security-opt apparmor=…`, on AppArmor hosts only: `docker-default` denies mount
+//!     inside that userns, which is the other half of the same gate. The scoped
+//!     `quasar-app` profile (`deploy/apparmor/quasar-app`) is used when the host has it
+//!     loaded, `unconfined` when it does not.
 //!   - `--security-opt no-new-privileges` + `--pids-limit` (`QUASAR_APP_PIDS_LIMIT`,
 //!     default 8192, a fork-bomb backstop that still fits Steam + a game).
 //!   - `--shm-size` (`QUASAR_APP_SHM_SIZE`, default 1g): Chromium-embedding apps fail
@@ -726,17 +728,25 @@ impl ContainerRuntime {
         // `docker-default` AppArmor profile denies mount inside one, so Steam's bootstrap
         // fails ("Steam now requires user namespaces to be enabled") while `unshare -U`
         // alone succeeds and `unshare -Urm` dies with "cannot change root filesystem
-        // propagation: Permission denied". Only on AppArmor hosts — an SELinux host
-        // (Fedora, `spc_t`) must get a byte-identical argv. Pairs with a HOST setting on
-        // Ubuntu 24.04+: `kernel.apparmor_restrict_unprivileged_userns=0`.
-        let apparmor = apparmor_unconfined_args(host_uses_apparmor());
-        if !apparmor.is_empty() {
-            tracing::info!(
+        // propagation: Permission denied". The scoped `quasar-app` profile
+        // (deploy/apparmor/quasar-app) is docker-default with that one family allowed;
+        // without it loaded the fallback is still unconfined. Only on AppArmor hosts — an
+        // SELinux host (Fedora, `spc_t`) must get a byte-identical argv. Pairs with a HOST
+        // setting on Ubuntu 24.04+: `kernel.apparmor_restrict_unprivileged_userns=0`.
+        let apparmor = app_apparmor_selection();
+        match &apparmor {
+            AppArmorChoice::NoFlag => {}
+            AppArmorChoice::Profile(p) => tracing::info!(
+                token = "app-apparmor-profile",
+                profile = %p,
+                "host uses AppArmor: app container is confined by the {p} profile"
+            ),
+            AppArmorChoice::Unconfined => tracing::info!(
                 token = "app-apparmor-unconfined",
                 "host uses AppArmor: app container runs unconfined so its user namespaces can mount"
-            );
+            ),
         }
-        args.extend(apparmor);
+        args.extend(apparmor.args());
 
         // Per-app opt-in (`"systempaths_unconfined": true`): unmask /proc and /sys.
         // Docker's default `systempaths=masked` blocks Flatpak's sandbox helper
@@ -1454,20 +1464,185 @@ fn host_has_fuse_node() -> bool {
 /// namespaced), so this reads the host's answer with no `/host` mount. The securityfs
 /// directory is the other host-wide signal but is NOT mounted in the agent container, so
 /// it can only add a yes, never a no.
-fn host_uses_apparmor() -> bool {
-    if let Ok(enabled) = std::fs::read_to_string("/sys/module/apparmor/parameters/enabled") {
+pub(crate) fn host_uses_apparmor_in(root: &Path) -> bool {
+    if let Ok(enabled) =
+        std::fs::read_to_string(root.join("sys/module/apparmor/parameters/enabled"))
+    {
         return enabled.trim().eq_ignore_ascii_case("y");
     }
-    Path::new("/sys/kernel/security/apparmor").is_dir()
+    root.join("sys/kernel/security/apparmor").is_dir()
 }
 
-/// `--security-opt apparmor=unconfined` args, gated on the host enforcing AppArmor. Split
-/// out so the decision is testable without touching the live host filesystem.
-fn apparmor_unconfined_args(host_enforces_apparmor: bool) -> Vec<String> {
-    if !host_enforces_apparmor {
-        return Vec::new();
+/// The scoped app-container profile, shipped as `deploy/apparmor/quasar-app` and loaded on
+/// the host by `deploy/enroll-host.sh` (or by hand). Its whole reason to exist is to
+/// replace `apparmor=unconfined` here.
+pub(crate) const APP_APPARMOR_PROFILE: &str = "quasar-app";
+
+/// The one command that makes [`APP_APPARMOR_PROFILE`] available. Every message about the
+/// profile being absent carries it, because the profile is useless until someone with root
+/// on the host runs this — the agent must never load policy itself.
+pub(crate) const APP_APPARMOR_LOAD_CMD: &str =
+    "sudo apparmor_parser -r -W <compose dir>/apparmor/quasar-app \
+     (deploy/apparmor/quasar-app in the repo; enrolled hosts have it next to their \
+     docker-compose.yml), then relaunch the session";
+
+/// Where the kernel lists loaded AppArmor profiles, most specific first.
+///
+/// securityfs is not mounted inside a container, so `deploy/docker-compose.yml` binds the
+/// host's read-only at `/host/sys/kernel/security` (the `/host/dev` convention). The bare
+/// path is the bare-metal agent's own. An agent whose compose predates that mount reads
+/// neither and gets [`AppArmorProfileState::Unknown`].
+///
+/// The `/host` prefix is also what makes the read succeed at all in a container: the agent
+/// itself runs under `docker-default`, whose `deny /sys/kernel/security/** rwklx` covers the
+/// bare path but not the bind's. Do not "simplify" this to the direct path.
+const APPARMOR_PROFILES_RELS: [&str; 2] = [
+    "host/sys/kernel/security/apparmor/profiles",
+    "sys/kernel/security/apparmor/profiles",
+];
+
+/// Is [`APP_APPARMOR_PROFILE`] loaded, as far as the agent can tell?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AppArmorProfileState {
+    /// Loaded and enforcing (`enforce` or the stricter `kill`).
+    Loaded,
+    /// Loaded, but in a mode that only logs what it would have denied. Confining with it
+    /// is harmless and still the right flag, but nothing is actually being enforced, so it
+    /// must not read as "confined" anywhere an operator looks.
+    Complain,
+    NotLoaded,
+    /// The profile list does not read from in here. Distinct from `NotLoaded` on purpose:
+    /// "we cannot see" must keep today's behaviour, never confine with a profile whose
+    /// presence was never established.
+    Unknown,
+}
+
+/// What confinement an app container launches under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AppArmorChoice {
+    /// Not an AppArmor host: no `--security-opt apparmor=` at all. An SELinux host
+    /// (Fedora, `spc_t`) must get a byte-identical argv.
+    NoFlag,
+    Profile(String),
+    Unconfined,
+}
+
+impl AppArmorChoice {
+    fn args(&self) -> Vec<String> {
+        match self {
+            AppArmorChoice::NoFlag => Vec::new(),
+            AppArmorChoice::Profile(p) => vec!["--security-opt".into(), format!("apparmor={p}")],
+            AppArmorChoice::Unconfined => {
+                vec!["--security-opt".into(), "apparmor=unconfined".into()]
+            }
+        }
     }
-    vec!["--security-opt".into(), "apparmor=unconfined".into()]
+}
+
+/// The confinement decision, as a pure function of the three inputs that drive it.
+///
+/// `override_name` is `QUASAR_APP_APPARMOR_PROFILE`: a profile name, or `unconfined` to
+/// force the pre-#76 behaviour when the profile turns out to break a title. It is ignored
+/// on a non-AppArmor host — the flag must not appear there whatever it is set to.
+pub(crate) fn app_apparmor_choice(
+    host_enforces_apparmor: bool,
+    state: AppArmorProfileState,
+    override_name: Option<&str>,
+) -> AppArmorChoice {
+    if !host_enforces_apparmor {
+        return AppArmorChoice::NoFlag;
+    }
+    match override_name {
+        Some("unconfined") => AppArmorChoice::Unconfined,
+        Some(name) => AppArmorChoice::Profile(name.to_string()),
+        // Complain picks the profile too: it is the flag the operator asked for, and a
+        // profile that logs instead of denying can only be an improvement over no profile
+        // at all. Readiness is where the mode is called out.
+        None => match state {
+            AppArmorProfileState::Loaded | AppArmorProfileState::Complain => {
+                AppArmorChoice::Profile(APP_APPARMOR_PROFILE.to_string())
+            }
+            AppArmorProfileState::NotLoaded | AppArmorProfileState::Unknown => {
+                AppArmorChoice::Unconfined
+            }
+        },
+    }
+}
+
+pub(crate) fn apparmor_profile_state(root: &Path, name: &str) -> AppArmorProfileState {
+    for rel in APPARMOR_PROFILES_RELS {
+        let Ok(body) = std::fs::read_to_string(root.join(rel)) else {
+            continue;
+        };
+        return profile_list_state(&body, name);
+    }
+    AppArmorProfileState::Unknown
+}
+
+/// One profile per line as `name (mode)`; a child profile is `parent//child (mode)`, which
+/// must not answer for its parent.
+///
+/// The mode is not decoration: a profile loaded in `complain` matches by name while
+/// enforcing nothing, so matching on the name alone would report a confinement that does
+/// not exist. `enforce` and the stricter `kill` are the enforcing modes; every other mode
+/// AppArmor can report (`complain`, `prompt`, `unconfined`) only logs.
+fn profile_list_state(body: &str, name: &str) -> AppArmorProfileState {
+    for line in body.lines() {
+        let (found, rest) = match line.split_once(" (") {
+            Some((n, rest)) => (n.trim(), rest),
+            None => continue,
+        };
+        if found != name {
+            continue;
+        }
+        let mode = rest.trim_end().trim_end_matches(')');
+        return match mode {
+            "enforce" | "kill" => AppArmorProfileState::Loaded,
+            _ => AppArmorProfileState::Complain,
+        };
+    }
+    AppArmorProfileState::NotLoaded
+}
+
+/// `QUASAR_APP_APPARMOR_PROFILE`, empty or whitespace treated as unset.
+pub(crate) fn app_apparmor_override() -> Option<String> {
+    let v = std::env::var("QUASAR_APP_APPARMOR_PROFILE").ok()?;
+    let v = v.trim();
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+/// Read the live host and decide. Warns ONCE per process when an AppArmor host ends up
+/// unconfined for want of the profile: it is a standing security posture, not a per-launch
+/// event, and a line per session would train the operator to scroll past it.
+fn app_apparmor_selection() -> AppArmorChoice {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let host = host_uses_apparmor_in(Path::new("/"));
+    let over = app_apparmor_override();
+    let state = if host && over.is_none() {
+        apparmor_profile_state(Path::new("/"), APP_APPARMOR_PROFILE)
+    } else {
+        AppArmorProfileState::Unknown
+    };
+    let choice = app_apparmor_choice(host, state, over.as_deref());
+    if choice == AppArmorChoice::Unconfined && over.is_none() {
+        WARNED.call_once(|| {
+            let reason = match state {
+                AppArmorProfileState::NotLoaded => {
+                    format!("the {APP_APPARMOR_PROFILE} profile is not loaded on this host")
+                }
+                _ => "the agent cannot read the host's loaded-profile list \
+                      (/sys/kernel/security is not mounted into this container — recreate \
+                      it from a current deploy/docker-compose.yml)"
+                    .to_string(),
+            };
+            tracing::warn!(
+                token = "app-apparmor-profile-missing",
+                "app containers run apparmor-unconfined on this AppArmor host: {reason}. \
+                 Load it: {APP_APPARMOR_LOAD_CMD}"
+            );
+        });
+    }
+    choice
 }
 
 /// The DRM node directory, in the agent and in every GPU app container alike: `--device`
@@ -1798,12 +1973,114 @@ mod tests {
     /// Ubuntu's `docker-default` denies mount inside a user namespace, which Steam's
     /// bootstrap needs; an SELinux host must see a byte-identical argv.
     #[test]
-    fn apparmor_is_unconfined_only_on_an_apparmor_host() {
+    fn apparmor_confines_with_the_profile_when_it_is_loaded_and_never_on_a_non_apparmor_host() {
+        use AppArmorProfileState::*;
+        let choose = |host, state| app_apparmor_choice(host, state, None);
+
         assert_eq!(
-            apparmor_unconfined_args(true),
+            choose(true, Loaded),
+            AppArmorChoice::Profile("quasar-app".into())
+        );
+        assert_eq!(
+            choose(true, Loaded).args(),
+            vec!["--security-opt", "apparmor=quasar-app"]
+        );
+
+        // Absent, and "cannot tell", both keep the pre-#76 behaviour.
+        assert_eq!(choose(true, NotLoaded), AppArmorChoice::Unconfined);
+        assert_eq!(choose(true, Unknown), AppArmorChoice::Unconfined);
+        assert_eq!(
+            choose(true, NotLoaded).args(),
             vec!["--security-opt", "apparmor=unconfined"]
         );
-        assert!(apparmor_unconfined_args(false).is_empty());
+
+        // Complain enforces nothing, but the flag is still the one to pass: readiness is
+        // what tells the operator the mode.
+        assert_eq!(
+            choose(true, Complain),
+            AppArmorChoice::Profile("quasar-app".into())
+        );
+
+        for state in [Loaded, Complain, NotLoaded, Unknown] {
+            assert_eq!(choose(false, state), AppArmorChoice::NoFlag);
+            assert!(choose(false, state).args().is_empty());
+        }
+    }
+
+    /// The escape hatch, for a host where the profile turns out to break a title.
+    #[test]
+    fn the_apparmor_override_wins_over_detection_but_not_over_a_non_apparmor_host() {
+        use AppArmorProfileState::*;
+        assert_eq!(
+            app_apparmor_choice(true, Loaded, Some("unconfined")),
+            AppArmorChoice::Unconfined
+        );
+        assert_eq!(
+            app_apparmor_choice(true, NotLoaded, Some("my-profile")),
+            AppArmorChoice::Profile("my-profile".into())
+        );
+        assert_eq!(
+            app_apparmor_choice(false, Loaded, Some("my-profile")),
+            AppArmorChoice::NoFlag,
+            "an SELinux host gets no apparmor flag whatever the override says"
+        );
+    }
+
+    /// `Unknown` (unreadable list) must never collapse into `NotLoaded`: an agent that
+    /// cannot see securityfs would otherwise report a confinement it never established.
+    #[test]
+    fn the_loaded_profile_list_is_parsed_by_name_and_absent_means_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            apparmor_profile_state(root, "quasar-app"),
+            AppArmorProfileState::Unknown
+        );
+
+        let rel = root.join("sys/kernel/security/apparmor");
+        std::fs::create_dir_all(&rel).unwrap();
+        // A child profile of another parent must not answer for `quasar-app`.
+        std::fs::write(
+            rel.join("profiles"),
+            "docker-default (enforce)\nsomething//quasar-app (enforce)\n",
+        )
+        .unwrap();
+        assert_eq!(
+            apparmor_profile_state(root, "quasar-app"),
+            AppArmorProfileState::NotLoaded
+        );
+
+        std::fs::write(
+            rel.join("profiles"),
+            "docker-default (enforce)\nquasar-app (enforce)\nquasar-app//bwrap (enforce)\n",
+        )
+        .unwrap();
+        assert_eq!(
+            apparmor_profile_state(root, "quasar-app"),
+            AppArmorProfileState::Loaded
+        );
+
+        // A complain-mode profile matches by name while enforcing nothing.
+        std::fs::write(rel.join("profiles"), "quasar-app (complain)\n").unwrap();
+        assert_eq!(
+            apparmor_profile_state(root, "quasar-app"),
+            AppArmorProfileState::Complain
+        );
+        // kill is stricter than enforce, not weaker.
+        std::fs::write(rel.join("profiles"), "quasar-app (kill)\n").unwrap();
+        assert_eq!(
+            apparmor_profile_state(root, "quasar-app"),
+            AppArmorProfileState::Loaded
+        );
+
+        // The compose bind wins over the agent's own (empty) securityfs.
+        let host = root.join("host/sys/kernel/security/apparmor");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("profiles"), "docker-default (enforce)\n").unwrap();
+        assert_eq!(
+            apparmor_profile_state(root, "quasar-app"),
+            AppArmorProfileState::NotLoaded
+        );
     }
 
     /// The AMD/Intel launch defect: 0660 root:render nodes with no group-add make RADV
