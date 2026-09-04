@@ -58,8 +58,11 @@ skipped(){ printf "${col_yellow}  EXISTS ${col_reset} %s (id=%s) — skipped\n" 
 die()    { echo "FATAL: $*" >&2; exit 1; }
 
 # ── Login ──────────────────────────────────────────────────────────────────────
+# QUASAR_ADMIN_TOKEN (a bearer from scripts/dx/admin_token.sh) skips the
+# BOOTSTRAP_ADMIN login — stacks running dev-agent auth carry no such creds.
 say "login as admin"
-ADMIN_TOK=$(curl -fsk -X POST "$API/v1/auth/login" \
+ADMIN_TOK="${QUASAR_ADMIN_TOKEN:-}"
+[ -n "$ADMIN_TOK" ] || ADMIN_TOK=$(curl -fsk -X POST "$API/v1/auth/login" \
   -H 'Content-Type: application/json' \
   -d "{\"email\":\"${BOOTSTRAP_ADMIN_EMAIL:?}\",\"password\":\"${BOOTSTRAP_ADMIN_PASSWORD:?}\"}" \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])") \

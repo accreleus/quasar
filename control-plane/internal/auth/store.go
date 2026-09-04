@@ -633,32 +633,32 @@ func (s *store) updateUser(ctx context.Context, id string, role *string, disable
 //   - no non-terminal sessions may remain        → ErrUserHasActiveSessions
 //
 // Self-deletion is refused at the handler (it knows the caller identity).
-func (s *store) deleteUser(ctx context.Context, id string) error {
+func (s *store) deleteUser(ctx context.Context, id string) ([]string, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("begin delete tx: %w", err)
+		return nil, fmt.Errorf("begin delete tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck — no-op after commit
 
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, adminDemoteAdvisoryLock); err != nil {
-		return fmt.Errorf("delete advisory lock: %w", err)
+		return nil, fmt.Errorf("delete advisory lock: %w", err)
 	}
 
 	var role string
 	err = tx.QueryRow(ctx, `SELECT role FROM users WHERE id::text = $1`, id).Scan(&role)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrUserNotFound
+		return nil, ErrUserNotFound
 	}
 	if err != nil {
-		return fmt.Errorf("check user: %w", err)
+		return nil, fmt.Errorf("check user: %w", err)
 	}
 	if role == RoleAdmin {
 		var admins int
 		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE role = 'admin'`).Scan(&admins); err != nil {
-			return fmt.Errorf("count admins: %w", err)
+			return nil, fmt.Errorf("count admins: %w", err)
 		}
 		if admins <= 1 {
-			return ErrLastAdmin
+			return nil, ErrLastAdmin
 		}
 	}
 
@@ -667,22 +667,37 @@ func (s *store) deleteUser(ctx context.Context, id string) error {
 		SELECT COUNT(*) FROM sessions
 		WHERE user_id::text = $1 AND state NOT IN ('stopped','failed')
 	`, id).Scan(&active); err != nil {
-		return fmt.Errorf("count active sessions: %w", err)
+		return nil, fmt.Errorf("count active sessions: %w", err)
 	}
 	if active > 0 {
-		return ErrUserHasActiveSessions
+		return nil, ErrUserHasActiveSessions
 	}
 
 	// Tombstone all of the user's homes before deleting the user row (P5-05).
-	// The FK ON DELETE SET NULL then orphans those rows (user_id → NULL) so the
-	// GC janitor can reap the backing stores after the 24h grace period.
-	if _, err := tx.Exec(ctx,
-		`UPDATE user_homes SET gc_after = now() WHERE user_id = $1::uuid AND gc_after IS NULL`, id); err != nil {
-		return fmt.Errorf("tombstone user homes: %w", err)
+	// The FK ON DELETE SET NULL then orphans those rows (user_id → NULL), which
+	// makes them reapable at once — storage.gcReapable skips the 24h grace for
+	// an orphan. RETURNING carries the hosts back so the caller can nudge each
+	// one's home.gc job instead of waiting for its 6h tick (#92).
+	var hostIDs []string
+	if err := tx.QueryRow(ctx, `
+		WITH tombstoned AS (
+			UPDATE user_homes SET gc_after = now()
+			WHERE user_id = $1::uuid AND gc_after IS NULL
+			RETURNING host_id
+		)
+		SELECT COALESCE(
+			array_agg(DISTINCT host_id::text) FILTER (WHERE host_id IS NOT NULL),
+			ARRAY[]::text[])
+		FROM tombstoned
+	`, id).Scan(&hostIDs); err != nil {
+		return nil, fmt.Errorf("tombstone user homes: %w", err)
 	}
 
 	if _, err := tx.Exec(ctx, `DELETE FROM users WHERE id::text = $1`, id); err != nil {
-		return fmt.Errorf("delete user: %w", err)
+		return nil, fmt.Errorf("delete user: %w", err)
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return hostIDs, nil
 }

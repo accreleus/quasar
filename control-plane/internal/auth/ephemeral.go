@@ -76,6 +76,9 @@ type ReapReport struct {
 	InSession int
 	// Failed is how many hit some other error. The sweep continues past each one.
 	Failed int
+	// HostsNudged is how many distinct hosts were asked to reap the homes those
+	// identities left behind (#92).
+	HostsNudged int
 }
 
 // ReapEphemeral deletes expired throwaway identities one row at a time through
@@ -85,6 +88,10 @@ type ReapReport struct {
 // orphan a running session and its GPU reservation), user_homes are tombstoned
 // so the janitor reclaims the store (bulk DELETE leaks the volume forever),
 // and the last admin is refused. One row's failure never aborts the sweep.
+//
+// Each host that held one of those homes is then nudged to run its home-GC pass
+// (#92): the home is orphaned the moment its owner's row goes, so waiting out a
+// grace window or a 6h tick only keeps multi-GB payloads on disk.
 func (s *Service) ReapEphemeral(ctx context.Context) (ReapReport, error) {
 	ids, err := s.store.expiredEphemeralUserIDs(ctx)
 	if err != nil {
@@ -93,10 +100,18 @@ func (s *Service) ReapEphemeral(ctx context.Context) (ReapReport, error) {
 
 	var rep ReapReport
 	var errs []error
+	seen := map[string]bool{}
+	var hosts []string
 	for _, id := range ids {
-		switch err := s.store.deleteUser(ctx, id); {
+		switch hostIDs, err := s.store.deleteUser(ctx, id); {
 		case err == nil:
 			rep.Deleted++
+			for _, h := range hostIDs {
+				if !seen[h] {
+					seen[h] = true
+					hosts = append(hosts, h)
+				}
+			}
 		case errors.Is(err, ErrUserHasActiveSessions):
 			// Expected and correct: try again next sweep.
 			rep.InSession++
@@ -107,6 +122,11 @@ func (s *Service) ReapEphemeral(ctx context.Context) (ReapReport, error) {
 			errs = append(errs, fmt.Errorf("reap ephemeral user %s: %w", id, err))
 		}
 	}
+	// One nudge per host for the whole batch, not per identity: a harness that
+	// mints an identity per login expires them in clumps, and Enqueue coalesces
+	// onto the one open run anyway.
+	rep.HostsNudged = len(hosts)
+	s.reapHomesOn(ctx, hosts)
 	return rep, errors.Join(errs...)
 }
 

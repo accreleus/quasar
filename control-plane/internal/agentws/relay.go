@@ -21,11 +21,25 @@ const relayDeliveryTimeout = time.Second
 // offer is ready as soon as the pipeline is live — often before the browser WS
 // is established). Thread-safe; shared between the agent WS handler (writes) and
 // the browser signal handler (reads/registers).
-// browserReg is one registered browser channel, plus the signal RelayBus
-// closes when a LATER Register call for the same session displaces it (#415).
+// browserReg is one registered browser channel plus the two signals the bus
+// raises against it. At most one is ever closed per registration: displacement
+// hands off the old reg, Forget deletes the entry.
 type browserReg struct {
 	ch        chan<- []byte
 	displaced chan struct{}
+	terminal  chan struct{}
+}
+
+// BrowserSignals is why a registered signaling socket must tear itself down.
+// The socket selects on both channels; each is closed at most once.
+type BrowserSignals struct {
+	// Displaced closes when a LATER Register call for the same session
+	// supersedes this one (#415).
+	Displaced <-chan struct{}
+	// Terminal closes when Forget evicts this registration because the session
+	// ended (#93). Without it the socket was silently deleted and left deaf, so
+	// the client learned of the teardown only when its own transport died.
+	Terminal <-chan struct{}
 }
 
 type RelayBus struct {
@@ -60,10 +74,10 @@ func NewRelayBus(log *slog.Logger) *RelayBus {
 // displacement for agent connections: the caller (signal/handler.go) selects
 // on the returned channel and tears its own connection down immediately on
 // displacement, instead of waiting out a read deadline while deaf.
-func (b *RelayBus) Register(sessionID string, ch chan<- []byte) <-chan struct{} {
+func (b *RelayBus) Register(sessionID string, ch chan<- []byte) BrowserSignals {
 	b.mu.Lock()
 	old, hadOld := b.browsers[sessionID]
-	reg := browserReg{ch: ch, displaced: make(chan struct{})}
+	reg := browserReg{ch: ch, displaced: make(chan struct{}), terminal: make(chan struct{})}
 	b.browsers[sessionID] = reg
 	for _, frame := range b.pending[sessionID] {
 		select {
@@ -76,7 +90,7 @@ func (b *RelayBus) Register(sessionID string, ch chan<- []byte) <-chan struct{} 
 	if hadOld {
 		close(old.displaced)
 	}
-	return reg.displaced
+	return BrowserSignals{Displaced: reg.displaced, Terminal: reg.terminal}
 }
 
 // Unregister drops ch's registration for sessionID iff it is still the
@@ -102,15 +116,25 @@ func (b *RelayBus) Unregister(sessionID string, ch chan<- []byte) {
 // buffered frames (up to relayBufMax each) are retained for the life of the
 // process, one entry per session ever launched.
 //
+// It also closes the attached browser's BrowserSignals.Terminal, which is what
+// turns a session ending into a WS close frame (4404) instead of a bare
+// transport close (#93).
+//
 // Idempotent and safe to call for a session that never relayed anything, which
 // is the common case: the coordinator fires it on every terminal transition.
 // Takes only b.mu — callers must not hold another lock that could be taken
-// under it (nothing here calls out).
+// under it (the channel close is outside it).
 func (b *RelayBus) Forget(sessionID string) {
 	b.mu.Lock()
 	delete(b.pending, sessionID)
+	reg, hadBrowser := b.browsers[sessionID]
 	delete(b.browsers, sessionID)
 	b.mu.Unlock()
+	if hadBrowser {
+		// #93: tell the still-attached socket, outside the lock. Deleting its
+		// registration silently left it deaf until its own transport failed.
+		close(reg.terminal)
+	}
 }
 
 // Deliver routes a raw inner-message frame (the Phase 0 signaling JSON) to the

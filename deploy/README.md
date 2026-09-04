@@ -642,6 +642,22 @@ QUASAR_ENV=production                     # optional, see below
 - `QUASAR_ENV=production` is optional and cheap: it turns the dev-only
   agent-auth flag into a boot refusal rather than something to remember not to
   set.
+- **Keep the proxy's idle-connection timeout below 60 seconds.** The control
+  plane closes idle upstream connections at 60s (`http.Server` `IdleTimeout`).
+  A proxy that pools them for longer — Caddy's default is 2 minutes, nginx's
+  `keepalive_timeout` for upstreams is 60s, Traefik's is 90s — will eventually
+  send a request on a connection the control plane has already closed. Ordinary
+  proxied requests are not retryable (they carry a body the proxy cannot rewind),
+  so the reuse surfaces to the user as a **502**, classically on the first
+  `/v1/signal` WebSocket upgrade after the client has been idle. In Caddy:
+  `transport http { keepalive 30s }` — `Caddyfile.hardened` already sets it. In
+  nginx: `keepalive_timeout 30s` in the upstream block.
+
+Session teardown, for reference: when a session ends the control plane closes
+the client's signaling socket with close code `4404` and code `4500` when it
+cannot reach the node agent (`protocol/signaling.md`). A client that reports a
+close with *no* code — "reset without closing handshake" — was cut off by
+something between it and the control plane, not by the control plane.
 
 The control plane keeps serving its self-signed certificate to the proxy, which
 is fine on a link you control; set `QUASAR_TLS=off` if you would rather it talk
