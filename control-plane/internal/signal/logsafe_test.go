@@ -45,8 +45,13 @@ func TestLogSafeErrOmitsPeerAddress(t *testing.T) {
 			t.Fatalf("logSafeErr(%v) rendered nothing; the line must still say something", err)
 		}
 	}
-	if got := logSafeErr(opErr); got != "net read: deadline exceeded" {
-		t.Fatalf("logSafeErr(opErr) = %q, want the Op plus the unwrapped cause", got)
+	// The Op must survive: net.OpError unwraps to its cause, so a category check
+	// ordered ahead of the OpError branch would render "deadline exceeded" and
+	// lose which operation timed out.
+	for _, err := range []error{opErr, fmt.Errorf("read from socket: %w", opErr)} {
+		if got := logSafeErr(err); got != "net read: deadline exceeded" {
+			t.Fatalf("logSafeErr(%v) = %q, want the Op plus the unwrapped cause", err, got)
+		}
 	}
 }
 

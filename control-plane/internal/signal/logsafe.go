@@ -37,6 +37,28 @@ func logSafeErr(err error) string {
 			return safe.Error()
 		}
 	}
+	// The structural cases come FIRST: net.OpError unwraps to its cause, so a
+	// category check ahead of it would swallow the Op ("deadline exceeded"
+	// instead of "net read: deadline exceeded").
+	//
+	// CloseError.Text is peer-supplied; only the code is ours to log.
+	var ce *websocket.CloseError
+	if errors.As(err, &ce) {
+		return fmt.Sprintf("websocket close %d", ce.Code)
+	}
+	// Name is the looked-up host, Server the resolver.
+	var de *net.DNSError
+	if errors.As(err, &de) {
+		return "dns error"
+	}
+	// Addr/Source hold the peer address; Op and the unwrapped cause do not.
+	var oe *net.OpError
+	if errors.As(err, &oe) {
+		if oe.Err != nil {
+			return "net " + oe.Op + ": " + logSafeErr(oe.Err)
+		}
+		return "net " + oe.Op
+	}
 	switch {
 	case errors.Is(err, os.ErrDeadlineExceeded):
 		return "deadline exceeded"
@@ -54,23 +76,6 @@ func logSafeErr(err error) string {
 		return "context canceled"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "context deadline exceeded"
-	}
-	// CloseError.Text is peer-supplied; only the code is ours to log.
-	var ce *websocket.CloseError
-	if errors.As(err, &ce) {
-		return fmt.Sprintf("websocket close %d", ce.Code)
-	}
-	var de *net.DNSError
-	if errors.As(err, &de) {
-		return "dns error"
-	}
-	// Addr/Source hold the peer address; Op and the unwrapped cause do not.
-	var oe *net.OpError
-	if errors.As(err, &oe) {
-		if oe.Err != nil {
-			return "net " + oe.Op + ": " + logSafeErr(oe.Err)
-		}
-		return "net " + oe.Op
 	}
 	return fmt.Sprintf("%T", err)
 }
