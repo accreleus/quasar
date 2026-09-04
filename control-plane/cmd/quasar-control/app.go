@@ -326,6 +326,9 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		session.WithAuditor(auditStore),
 		// Mic capture (spec §3.5): the launcher reads mic_capture_enabled per launch.
 		session.WithMicSettings(settingsStore),
+		// #11: uncordon must check the live connection, not just hosts.status — a
+		// control-plane restart leaves a draining row whose agent has not reconnected.
+		session.WithAgentConnectivity(agentRegistry),
 		// #402: the relay buffers agent signaling frames per session while no browser
 		// is attached. Register/Unregister are browser-driven, so a headless session
 		// would leak its buffer; the coordinator evicts at every terminal transition.
