@@ -377,6 +377,8 @@ RUN cd /opt/gstreamer-src && \
 #   gst-plugins-base:opus         -> opusenc                         (audio_branch.rs)
 #   gst-plugins-base:volume       -> upstream default (audio path headroom)
 #   gst-plugins-good:pulse        -> pulsesrc                        (source.rs / audio_branch.rs)
+#   gst-plugins-good:coloreffects -> coloreffects (issue #97: the "Colour Ripple" bench app's
+#                                     gst-launch pipeline; not called from node-agent Rust)
 #   gst-plugins-bad:vulkan        -> vulkanh264enc (+ vulkanh265enc from the vendored patch)
 #   gst-plugins-bad:vulkan-video  -> the Vulkan video-encode/decode extension vulkanh264enc needs
 #   gst-plugins-bad:videoparsers  -> h264parse                       (pipeline.rs / encoders.rs)
@@ -456,6 +458,7 @@ RUN cd /opt/gstreamer-src && meson setup build --prefix=/opt/gst --libdir=lib64 
     -Dgst-plugins-base:opus=enabled \
     -Dgst-plugins-base:volume=enabled \
     -Dgst-plugins-good:pulse=enabled \
+    -Dgst-plugins-good:coloreffects=enabled \
     -Dgst-plugins-bad:vulkan=enabled \
     -Dgst-plugins-bad:vulkan-video=enabled \
     -Dgst-plugins-bad:videoparsers=enabled \
@@ -1030,6 +1033,7 @@ RUN gst-inspect-1.0 waylanddisplaysrc \
     && gst-inspect-1.0 pulsesrc \
     && gst-inspect-1.0 audiotestsrc \
     && gst-inspect-1.0 alsasink \
+    && gst-inspect-1.0 coloreffects \
     && command -v pulseaudio \
     && pulseaudio --version \
     && command -v weston \
