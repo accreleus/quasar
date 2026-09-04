@@ -331,8 +331,9 @@ say "  user namespaces: ok"
 # ── 3. the agent image, pinned to the ref this script came from ──────────────
 step "Agent image"
 image="${QUASAR_AGENT_IMAGE:-}"
-image_from="QUASAR_AGENT_IMAGE"
+image_from="${image:+QUASAR_AGENT_IMAGE}"
 if [ -z "$image" ]; then
+  image_from="no QUASAR_REF or QUASAR_AGENT_IMAGE given"
   ref="${QUASAR_REF:-}"
   case "$ref" in
     "") ;;
@@ -347,7 +348,7 @@ if [ -z "$image" ]; then
 fi
 
 if [ "$DRY" = 1 ]; then
-  say "  would use: ${image:-$LOCAL_IMAGE (local build)} (from $image_from)"
+  say "  would use: ${image:-$LOCAL_IMAGE (local build, if present)} ($image_from)"
 else
   if [ -n "$image" ] && $SUDO docker pull "$image" >/dev/null 2>&1; then
     say "  pulled $image (from $image_from)"
