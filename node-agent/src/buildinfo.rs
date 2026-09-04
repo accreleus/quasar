@@ -81,8 +81,7 @@ const UPDATER_SERVICE: &str = "quasar-updater";
 /// `ContainerRuntime` the agent already wraps: no second docker dependency
 /// (the rule in `images/mod.rs`).
 pub trait ContainerFacts {
-    /// This container's own id or name, as docker would accept it. `$HOSTNAME`
-    /// inside a container is its short id unless the operator set one.
+    /// This container's own id, as docker would accept it.
     fn self_reference(&self) -> Option<String>;
     /// `docker inspect --format '{{.Config.Image}}'` for one container.
     fn image_reference(&self, container: &str) -> Option<String>;
@@ -104,8 +103,13 @@ impl<'a> DockerFacts<'a> {
 }
 
 impl ContainerFacts for DockerFacts<'_> {
+    /// `/proc/self/mountinfo` first, `$HOSTNAME` only when it LOOKS like a
+    /// container id. A compose stack that sets `hostname:` makes `$HOSTNAME` a
+    /// DNS name (`quasar-dev.local`), and `docker inspect -- quasar-dev.local`
+    /// answers "No such object" — which is how install_mode and
+    /// updater_present came back unknown on a source-built host.
     fn self_reference(&self) -> Option<String> {
-        std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty())
+        crate::nvidia_volume::self_container_id()
     }
 
     fn image_reference(&self, container: &str) -> Option<String> {
@@ -196,9 +200,13 @@ pub fn classify_image_reference(reference: &str) -> Option<InstallMode> {
 pub fn discover_install(facts: &dyn ContainerFacts) -> InstallFacts {
     let mut out = InstallFacts::default();
 
+    // Every failure below is INFO, not debug: identity-unknown is a state a host
+    // operator has to be able to explain, and the reason is only ever visible here.
     let Some(me) = facts.self_reference() else {
-        debug!(
-            "install discovery: no container reference for this process; identity stays unknown"
+        info!(
+            "install discovery: could not determine this process's own container id \
+             (/proc/self/mountinfo carries none and $HOSTNAME is not a container id); \
+             install mode and updater presence stay unknown"
         );
         return out;
     };
@@ -211,7 +219,10 @@ pub fn discover_install(facts: &dyn ContainerFacts) -> InstallFacts {
                 out.install_mode
             );
         }
-        None => debug!("install discovery: could not read this container's image reference"),
+        None => info!(
+            "install discovery: could not read container {me}'s image reference; \
+             install mode stays unknown"
+        ),
     }
 
     match facts
@@ -222,9 +233,15 @@ pub fn discover_install(facts: &dyn ContainerFacts) -> InstallFacts {
             Some(services) => {
                 out.updater_present = Some(services.iter().any(|s| s == UPDATER_SERVICE));
             }
-            None => debug!("install discovery: could not list compose project {project}"),
+            None => info!(
+                "install discovery: could not list compose project {project}; \
+                 updater presence stays unknown"
+            ),
         },
-        _ => debug!("install discovery: this container carries no compose project label"),
+        _ => info!(
+            "install discovery: container {me} carries no {LABEL_PROJECT} label, \
+             so it is not part of a compose stack; updater presence stays unknown"
+        ),
     }
 
     out
@@ -391,6 +408,39 @@ mod tests {
                 install_mode: Some(InstallMode::Source),
                 updater_present: None,
             }
+        );
+    }
+
+    /// A compose stack that sets `hostname:` gives the agent container a DNS
+    /// name, not its id — `docker inspect -- quasar-dev.local` then answers "No
+    /// such object" and identity comes back unknown on a perfectly healthy
+    /// host. `self_container_id` reads /proc/self/mountinfo first and accepts
+    /// `$HOSTNAME` only when it looks like an id.
+    #[test]
+    fn a_hostname_that_is_not_a_container_id_is_never_used_as_one() {
+        // The live case: compose sets `hostname:` on this stack, so $HOSTNAME is
+        // a DNS name and `docker inspect -- quasar-dev.local` answers "No such
+        // object" — which is exactly how install_mode and updater_present came
+        // back unknown on a healthy source-built host.
+        for hostname in ["quasar-dev.local", "gpu-host-01", "abc123", ""] {
+            assert!(
+                !crate::nvidia_volume::hostname_is_container_id(hostname),
+                "{hostname} would have been handed to `docker inspect` as an id"
+            );
+        }
+        for hostname in ["0123456789ab", "0123456789abcdef0123456789abcdef01234567"] {
+            assert!(crate::nvidia_volume::hostname_is_container_id(hostname));
+        }
+    }
+
+    #[test]
+    fn the_container_id_comes_from_mountinfo_before_any_hostname() {
+        let id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let body =
+            format!("2079 1856 0:132 /var/lib/docker/containers/{id}/hostname /etc/hostname rw\n");
+        assert_eq!(
+            crate::nvidia_volume::parse_container_id_from_mountinfo(&body).as_deref(),
+            Some(id)
         );
     }
 
