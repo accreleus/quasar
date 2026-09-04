@@ -96,7 +96,7 @@ else moved out on 2026-08-27:
 | `scripts/dev/` | `dev.sh`, the compose-overlay test, the volume migrator, the local-audio validator, the dev seeders and the diagnostics-app image |
 | `scripts/verify/` | The verify stage scripts plus the devtools image they run on |
 | `scripts/harness/` | Acceptance harnesses (`run-*.sh`), `lib/`, `checks/`, `fixtures/`, the `apitest` Go module, and `peer-driver.mjs` (the headless WebRTC peer driver, formerly `p4-troubleshoot.mjs`) |
-| `scripts/release/` | Release preflight, supply-chain lib + manifest, SBOM, image scan, the Vulkan encoder runtime probe, and their offline contract tests |
+| `scripts/release/` | Release preflight, supply-chain lib + manifest, SBOM, image scan, the Vulkan encoder runtime probe, the tag-push release lane's changelog/manifest scripts, and their offline contract tests |
 
 ### Deploying and proving the agent on a host
 
