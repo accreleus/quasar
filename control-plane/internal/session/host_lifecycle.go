@@ -92,10 +92,27 @@ func (c *Coordinator) DrainHost(ctx context.Context, hostID string, force bool) 
 	return h, nil
 }
 
-// UncordonHost returns a draining host to service. A `draining` host always has
-// a connected agent (a disconnect flips it offline), so draining IS the
-// agent-connected precondition. Idempotent. Returns ErrNotFound or
-// ErrHostNotResumable (offline; it returns online on its agent's reconnect).
+// AgentConnectivity reports whether a host's agent websocket is connected on
+// this process right now. The concrete type is *agentws.Registry, injected via
+// WithAgentConnectivity; an interface here because agentws imports session.
+type AgentConnectivity interface {
+	IsConnected(hostID string) bool
+}
+
+// WithAgentConnectivity wires the live-connection check UncordonHost needs.
+// Unwired (nil) trusts the status column instead.
+func WithAgentConnectivity(a AgentConnectivity) CoordinatorOption {
+	return func(c *Coordinator) { c.agents = a }
+}
+
+// UncordonHost lifts an admin cordon so the scheduler may place on the host
+// again. Idempotent. Returns ErrNotFound or ErrHostNotResumable (offline; it
+// returns online on its agent's reconnect).
+//
+// `draining` is not proof the agent is connected: a control-plane restart drops
+// every connection while the column keeps its value. With no live connection the
+// cordon lifts to `offline`, not `online` (#11) — admin intent is honoured
+// without handing the scheduler a host that cannot take an assign.
 func (c *Coordinator) UncordonHost(ctx context.Context, hostID string) (Host, error) {
 	h, err := c.store.GetHost(ctx, hostID)
 	if err != nil {
@@ -106,11 +123,23 @@ func (c *Coordinator) UncordonHost(ctx context.Context, hostID string) (Host, er
 		return Host{}, ErrHostNotResumable
 	case "online":
 	case "draining":
-		if err := c.store.SetHostStatus(ctx, hostID, "online"); err != nil {
+		// A nil seam means unwired, not disconnected: reading it as disconnected
+		// would strand a host whose agent is connected and so never reconnects to
+		// flip the row back.
+		next := "online"
+		if c.agents != nil && !c.agents.IsConnected(hostID) {
+			next = "offline"
+		}
+		if err := c.store.SetHostStatus(ctx, hostID, next); err != nil {
 			return Host{}, err
 		}
-		h.Status = "online"
-		c.log.Info("uncordoned host", "host_id", hostID)
+		h.Status = next
+		if next == "online" {
+			c.log.Info("uncordoned host", "host_id", hostID)
+		} else {
+			c.log.Warn("uncordoned host with no connected agent; offline until it reconnects",
+				"host_id", hostID)
+		}
 	}
 	return h, nil
 }

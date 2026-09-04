@@ -342,6 +342,11 @@ services:
       # Instrumentation passthroughs (empty = off). VULKAN_GST_DEBUG is the retired
       # name of GST_DEBUG from the old per-image overlays; still honoured.
       QUASAR_CAPTURE_H264: ${QUASAR_CAPTURE_H264:-}
+      # Unlike the other passthroughs above, libva treats mere PRESENCE as "tracing on" —
+      # an empty value is not "off" to libva itself (#94: 66 GB of .<pid>.thd-* files from
+      # one unset operator var). The entrypoint (deploy/Dockerfile.vulkan) unsets this var
+      # when it arrives empty, so leaving it unset here is safe. If you DO set it, point it
+      # at a bounded, volume-backed path: libva writes one file per encode thread per session.
       LIBVA_TRACE: ${LIBVA_TRACE:-}
       GST_DEBUG: ${GST_DEBUG:-${VULKAN_GST_DEBUG:-}}
       # SO-02 encoder tuning knobs (VA path). Defaults match the node-agent code
