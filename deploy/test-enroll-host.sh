@@ -247,8 +247,9 @@ rm -rf "$tmp/install"; mk_root "$tmp/root"
 SHA=0123456789abcdef0123456789abcdef01234567
 run_installer sha-fallback QUASAR_ENROLLMENT="$WSS_BLOB" QUASAR_REF=$SHA NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes" MOCK_AGENT_LOG="$ENROLLED_LOG" MOCK_PULL_OK=0 MOCK_LOCAL_IMAGE=1
 if [ "$RC" -eq 0 ] && grep -q '^pull ghcr.io/accreleus/quasar/quasar-node-agent:sha-0123456$' <<<"$DOCKER_LOG" \
-   && grep -q 'WARN: could not pull' <<<"$OUT" && grep -qxF 'QUASAR_AGENT_IMAGE=quasar-node-agent:latest' "$envf"; then
-  pass "commit ref: tries :sha-<7>, falls back to the local build with a WARN"
+   && grep -q 'image: quasar-node-agent:latest (local build; ghcr.io/accreleus/quasar/quasar-node-agent:sha-0123456 is not published)' <<<"$OUT" \
+   && grep -qxF 'QUASAR_AGENT_IMAGE=quasar-node-agent:latest' "$envf"; then
+  pass "commit ref: tries :sha-<7>, falls back to the local build and says which tag is unpublished"
 else
   fail "sha fallback" "rc=$RC docker=[$DOCKER_LOG] out=$(tail -4 <<<"$OUT")"
 fi
@@ -305,6 +306,61 @@ if grep -q '^  quasar-node-agent:$' <<<"$printed" && grep -q 'QUASAR_ENROLLMENT'
   pass "--print-compose / --print-nvidia-overlay: the manual path needs no enrollment string"
 else
   fail "print sub-commands"
+fi
+
+# ── 8. tty rendering: same facts, live lines; plain stays the log form ───────
+rm -rf "$tmp/install"; mk_root "$tmp/root"
+run_installer tty-ok QUASAR_ENROLLMENT="$WSS_BLOB" QUASAR_REF=v1.2.3 NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes" MOCK_AGENT_LOG="$ENROLLED_LOG" QUASAR_ENROLL_STYLE=tty LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+esc="$(printf '\033')"
+if [ "$RC" -eq 0 ] && grep -q "${esc}\[32m✔${esc}\[0m docker + compose: ok" <<<"$OUT" \
+   && grep -q "✔${esc}\[0m enrolled: this host is now 'gpu-b'" <<<"$OUT" \
+   && grep -q "${esc}\[1m==> Host preflights" <<<"$OUT" \
+   && grep -q 'logs:   docker compose --project-directory' <<<"$OUT"; then
+  pass "tty: bold steps, green ticks, a live wait line, and the where-things-are summary"
+else
+  fail "tty rendering" "rc=$RC out=$(cat -v <<<"$OUT")"
+fi
+# A rewritten line must leave nothing behind: after the last carriage return on
+# every line, no spinner frame may remain.
+if ! sed 's/.*\r//' <<<"$OUT" | grep -q '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]'; then
+  pass "tty: no spinner frame survives on any line"
+else
+  fail "tty: stray spinner" "$(sed 's/.*\r//' <<<"$OUT" | grep '[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]' | head -3 | cat -v)"
+fi
+# Same facts in both styles: strip the tty decoration and compare to plain.
+rm -rf "$tmp/install"; mk_root "$tmp/root"
+run_installer plain-ok QUASAR_ENROLLMENT="$WSS_BLOB" QUASAR_REF=v1.2.3 NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes" MOCK_AGENT_LOG="$ENROLLED_LOG" QUASAR_ENROLL_STYLE=plain
+PLAIN="$OUT"
+stripped="$(sed 's/.*\r//' "$tmp/tty-ok.out" | sed -E "s/${esc}\[[0-9;]*[mK]//g; s/^  ✔ /  /; s/^  (files|logs|update):.*$//" | grep -v '^$')"
+if diff <(grep -v '^$' <<<"$PLAIN") <(printf '%s\n' "$stripped") >/dev/null; then
+  pass "tty carries exactly the plain facts, decorated"
+else
+  fail "tty/plain facts differ" "$(diff <(grep -v '^$' <<<"$PLAIN") <(printf '%s\n' "$stripped") | head -12 | cat -v)"
+fi
+
+rm -rf "$tmp/install"; mk_root "$tmp/root"
+run_installer tty-wait QUASAR_ENROLLMENT="$WSS_BLOB" QUASAR_REF=v1.2.3 NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes" MOCK_AGENT_LOG='' QUASAR_ENROLL_STYLE=tty LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+if [ "$RC" -eq 3 ] && grep -q 'waiting for the agent to enroll… 0s' <<<"$OUT" && grep -q 'still connecting' <<<"$OUT" \
+   && ! sed 's/.*\r//' <<<"$OUT" | grep -q 'waiting for the agent'; then
+  pass "tty: the wait is a live line that is cleared before the verdict"
+else
+  fail "tty wait line" "rc=$RC $(tail -3 <<<"$OUT" | cat -v)"
+fi
+
+rm -rf "$tmp/install"; mk_root "$tmp/root"
+run_installer tty-ascii QUASAR_ENROLLMENT="$WSS_BLOB" QUASAR_REF=v1.2.3 NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes" MOCK_AGENT_LOG="$ENROLLED_LOG" QUASAR_ENROLL_STYLE=tty LANG=C LC_ALL=C
+if [ "$RC" -eq 0 ] && grep -q '\[ok\]' <<<"$OUT" && ! grep -q '✔' <<<"$OUT"; then
+  pass "tty without a UTF-8 locale: ASCII glyphs"
+else
+  fail "tty ascii" "$(tail -3 <<<"$OUT" | cat -v)"
+fi
+
+mk_root "$tmp/root"; printf '1\n' > "$tmp/root/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
+run_installer tty-fail QUASAR_ENROLLMENT="$WSS_BLOB" NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes" QUASAR_ENROLL_STYLE=tty LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+if [ "$RC" -eq 1 ] && grep -q "${esc}\[31m✘ enroll-host: the host restricts" <<<"$OUT" && grep -q 'apparmor_restrict_unprivileged_userns=0' <<<"$OUT"; then
+  pass "tty: a failed preflight is a red cross with the remediation"
+else
+  fail "tty failure" "rc=$RC $(tail -3 <<<"$OUT" | cat -v)"
 fi
 
 # Every run above must have kept the token off stdout/stderr.
