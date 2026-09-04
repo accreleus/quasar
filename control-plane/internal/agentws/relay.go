@@ -22,9 +22,8 @@ const relayDeliveryTimeout = time.Second
 // is established). Thread-safe; shared between the agent WS handler (writes) and
 // the browser signal handler (reads/registers).
 // browserReg is one registered browser channel plus the two signals the bus
-// raises against it. At most one of them is ever closed for a given
-// registration: displacement deletes nothing, and Forget deletes the entry, so
-// neither signal can fire twice or both fire for the same reg.
+// raises against it. At most one is ever closed per registration: displacement
+// hands off the old reg, Forget deletes the entry.
 type browserReg struct {
 	ch        chan<- []byte
 	displaced chan struct{}
@@ -38,11 +37,8 @@ type BrowserSignals struct {
 	// supersedes this one (#415).
 	Displaced <-chan struct{}
 	// Terminal closes when Forget evicts this registration because the session
-	// reached a terminal state (#93). Without it the socket stayed
-	// registered-then-silently-deleted: the bus would never deliver another
-	// agent frame, and the client learned of the teardown only when its own
-	// transport died — a close with no closing handshake, indistinguishable
-	// from a network reset.
+	// ended (#93). Without it the socket was silently deleted and left deaf, so
+	// the client learned of the teardown only when its own transport died.
 	Terminal <-chan struct{}
 }
 

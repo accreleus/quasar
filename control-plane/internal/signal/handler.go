@@ -209,14 +209,12 @@ func (h *Handler) originAllowed(r *http.Request) bool {
 }
 
 func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clientIP string) {
-	// Empty until the token resolves; wsClose closes over it so every close
-	// line names its session (#93 — a close log with no session id cannot be
-	// correlated with a client's report).
+	// Closed over by both close paths, so a close line always names its session.
+	// Empty until the token resolves.
 	var sessionID string
-	// Every socket teardown logs at Info with a `reason` naming WHO closed and
-	// WHY. #93 was undiagnosable because the relay's failure exits logged at
-	// Debug (invisible under the default LOG_LEVEL=info) and sent no close
-	// frame, so the client saw only a transport close with no closing handshake.
+	// #93: every teardown logs at Info with a `reason` naming who closed and why.
+	// The failure exits used to log at Debug — invisible under the default
+	// LOG_LEVEL=info, which is why the issue had no host-side evidence.
 	wsClose := func(code int, msg, reason string) {
 		_ = conn.SetWriteDeadline(time.Now().Add(browserWriteTimeout))
 		_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(code, msg))
@@ -224,9 +222,9 @@ func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clien
 			"token", "signal-ws-closed", "reason", reason,
 			"session_id", sessionID, "code", code, "detail", msg)
 	}
-	// closedNoFrame is the other kind of exit: the transport already failed, so
-	// no close frame can reach the client. Logged at the same level, because
-	// telling these two apart from the host side is the whole point.
+	// The other kind of exit: the transport already failed, so no close frame can
+	// reach the client. Same level as wsClose — telling the two apart from the
+	// host side is the point.
 	closedNoFrame := func(reason string, err error) {
 		h.log.Info("signaling WS dropped without a close frame",
 			"token", "signal-ws-dropped", "reason", reason,
@@ -395,12 +393,10 @@ func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clien
 					wsClose(wsCloseRelayUnavail, "agent unavailable", "agent-not-connected")
 					return
 				}
-				// #93: this exit used to return with no close frame, one frame
-				// after the client's own write — which the client reports as
-				// "connection reset without closing handshake right after the
-				// answer", with that answer silently never reaching the agent.
-				// A saturated agent queue IS signaling.md's 4500 "relay to node
-				// agent unavailable": no new code, no shape change.
+				// A saturated agent queue is signaling.md's 4500 "relay to node
+				// agent unavailable" — no new code, no shape change. Returning
+				// here without one gave the client a bare transport close one
+				// frame after its own write, indistinguishable from a reset.
 				h.log.Warn("relay to agent failed",
 					"token", "signal-relay-send-failed", "session_id", sess.ID, "err", err)
 				wsClose(wsCloseRelayUnavail, "relay to agent failed", "relay-send-failed")
@@ -413,13 +409,10 @@ func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clien
 				return
 			}
 		case <-signals.Terminal:
-			// #93: the session went terminal, so the bus dropped this
-			// registration and will never deliver another agent frame. Hand
-			// over whatever it already queued — the agent's `bye` is typically
-			// the last frame in flight — then close with the code signaling.md
-			// already defines for a terminal session. Before this the socket
-			// stayed open and deaf, and the client learned of the teardown only
-			// when its own transport died, with no closing handshake.
+			// The session is terminal: the bus dropped this registration and
+			// will never deliver another agent frame, so a socket that stayed
+			// open would be deaf until its own transport died. Drain first —
+			// the agent's `bye` is typically the last frame in flight.
 			if err := drainAgentFrames(); err != nil {
 				closedNoFrame("browser-write-failed", err)
 				return
