@@ -125,11 +125,28 @@ rm -f "$gitwork/untracked.txt"
 # Bad semver.
 reject_cut "not strict semver" --version v0.2.0 --dry-run
 
-# Not strictly newer than the newest existing tag (equal to it).
-reject_cut "is not strictly newer than the newest existing tag v0.1.0" --version 0.1.0 --dry-run
+# Equal to the newest existing tag: caught by the explicit exists-check, with
+# its own clearer reason, before the precedence check even runs.
+reject_cut "v0.1.0 already exists (local or remote tag)" --version 0.1.0 --dry-run
 
 # A prerelease of an ALREADY-RELEASED version is not newer either.
 reject_cut "is not strictly newer than the newest existing tag v0.1.0" --version 0.1.0-rc.1 --dry-run
+
+# A tag that exists ONLY on origin (this clone never fetched it locally) must
+# still be seen: `git tag -l` alone would report no tags at all here, which is
+# exactly the defect this guards against — a clone with an empty local tag
+# list must not treat that as "no releases yet".
+git -C "$gitwork" tag -d v0.1.0 >/dev/null
+[[ -z "$(git -C "$gitwork" tag -l v0.1.0)" ]] || fail "setup: local tag delete did not take"
+
+# (a) remote-only tag, VERSION not newer than it -> refused.
+reject_cut "is not strictly newer than the newest existing tag v0.1.0" --version 0.1.0-beta --dry-run
+
+# (b) VERSION equals a tag that exists only on origin -> refused.
+reject_cut "v0.1.0 already exists (local or remote tag)" --version 0.1.0 --dry-run
+
+# Restore the local tag for the rest of this test's flow.
+git -C "$gitwork" fetch --quiet origin 'refs/tags/v0.1.0:refs/tags/v0.1.0'
 
 # HEAD behind/ahead of origin/main (an unpushed local commit).
 echo "local only" > "$gitwork/local.txt"
@@ -137,6 +154,14 @@ git -C "$gitwork" add local.txt
 git -C "$gitwork" commit --quiet -m "unpushed"
 reject_cut "does not match origin/main" --version 0.2.0 --dry-run
 git -C "$gitwork" reset --hard --quiet HEAD~1
+
+# An unreachable origin must refuse with a one-line reason, not a raw git
+# fatal-error dump — this is what "refuse with a one-line reason if ls-remote
+# fails" also depends on: the fetch that runs first has the same discipline.
+git -C "$gitwork" remote set-url origin "$gitremote-does-not-exist"
+reject_cut "could not fetch origin/main" --version 0.2.0 --dry-run
+git -C "$gitwork" remote set-url origin "$gitremote"
+
 
 # --dry-run performs every check but mutates nothing: still clean, no new tag.
 dry_out="$(run --version 0.2.0 --dry-run)"

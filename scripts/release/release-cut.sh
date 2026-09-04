@@ -30,8 +30,11 @@
 #     platform-release-manifest validator use)
 #   - HEAD is not exactly `origin/main` (fetched fresh — refuses both "behind"
 #     and "ahead of unpushed" mismatches)
-#   - VERSION is not strictly newer than the newest existing `v*` tag (semver
-#     precedence, prereleases sort below their release)
+#   - the tag `vVERSION` already exists, locally OR on origin (`git ls-remote`
+#     — a clone with no tags fetched must not see an empty tag list and let a
+#     stale VERSION through)
+#   - VERSION is not strictly newer than the newest of the union of local and
+#     remote `v*` tags (semver precedence, prereleases sort below their release)
 #   - the `## Unreleased` section is missing or empty
 #
 # `--dry-run` runs every refusal check (including the fetch — the diff it
@@ -206,15 +209,42 @@ fi
 # is not guaranteed to already carry an origin/main remote-tracking ref, and
 # comparing against one that does not exist would fail for the wrong reason —
 # same discipline as the release-gate job in .github/workflows/images.yml.
-git -C "$root" fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+if ! fetch_out="$(git -C "$root" fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main' 2>&1)"; then
+  fail "could not fetch origin/main (git fetch failed): $fetch_out"
+fi
 local_head="$(git -C "$root" rev-parse HEAD)"
 origin_head="$(git -C "$root" rev-parse refs/remotes/origin/main)"
 [[ "$local_head" == "$origin_head" ]] || fail "HEAD ($local_head) does not match origin/main ($origin_head); pull or push first"
 
+# The tag list must include the REMOTE's tags, not just local ones: a clone
+# with no tags fetched (`git tag` empty) would otherwise see no existing
+# releases at all and let a stale or already-published VERSION through, only
+# to have `git push` reject the tag after the commit was already pushed to
+# main — a half-cut release. `ls-remote` failing (no connectivity, no such
+# remote) is refused outright rather than silently treated as "no tags".
+mapfile -t local_tags < <(git -C "$root" tag -l 'v*' | sed 's/^v//')
+if ! remote_tags_raw="$(git -C "$root" ls-remote --tags --refs origin 'refs/tags/v*' 2>&1)"; then
+  fail "could not list tags on origin (git ls-remote failed): $remote_tags_raw"
+fi
+mapfile -t remote_tags < <(printf '%s\n' "$remote_tags_raw" | sed -n 's#.*refs/tags/v##p')
+
+mapfile -t existing_tags < <(
+  {
+    printf '%s\n' "${local_tags[@]+"${local_tags[@]}"}"
+    printf '%s\n' "${remote_tags[@]+"${remote_tags[@]}"}"
+  } | sed '/^$/d' | sort -u
+)
+
+# Exact match beats the precedence check below with a clearer reason: a
+# version can equal an existing tag without being "the newest" (e.g. a
+# same-core prerelease chain), and the message should say so plainly.
+for existing in "${existing_tags[@]+"${existing_tags[@]}"}"; do
+  [[ "$existing" != "$version" ]] || fail "v$version already exists (local or remote tag)"
+done
+
 # Strictly newer than the newest existing v* tag, by semver precedence (a
 # prerelease sorts below its own release, per semver.org). No existing tag at
 # all trivially passes.
-mapfile -t existing_tags < <(git -C "$root" tag -l 'v*' | sed 's/^v//')
 newest_offender=""
 if ! newest_offender="$(python3 - "$version" "${existing_tags[@]+"${existing_tags[@]}"}" <<'PY'
 import re
