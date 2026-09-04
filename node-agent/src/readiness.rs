@@ -2366,6 +2366,13 @@ mod tests {
                 &format!("{NVIDIA_VOLUME_REL}/manifest.json"),
                 r#"{"driver_version":"610.57.04"}"#,
             )
+            // A fully set-up host now includes the app-container AppArmor profile; without
+            // these two the check correctly reports `skip` and this loop rejects it.
+            .file("sys/module/apparmor/parameters/enabled", "Y\n")
+            .file(
+                "host/sys/kernel/security/apparmor/profiles",
+                "docker-default (enforce)\nquasar-app (enforce)\n",
+            )
             .file("etc/os-release", "ID=fedora\nVERSION_ID=42\n");
         // Explicit: the default `Unknown` would `skip`, not `pass`.
         let checks = probe(&ProbeEnv {
@@ -2661,11 +2668,9 @@ mod tests {
         }
         // "cannot read the list" must name the missing mount, not send the operator to
         // re-load a profile that may already be there.
-        assert!(
-            app_apparmor_check(true, Some(Unknown), None)
-                .remediation
-                .contains("/host/sys/kernel/security"),
-        );
+        assert!(app_apparmor_check(true, Some(Unknown), None)
+            .remediation
+            .contains("/host/sys/kernel/security"));
 
         // Forced unconfined is a posture, not a fault — but it must not read as green.
         let forced = app_apparmor_check(true, None, Some("unconfined"));

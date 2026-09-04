@@ -1465,7 +1465,8 @@ fn host_has_fuse_node() -> bool {
 /// directory is the other host-wide signal but is NOT mounted in the agent container, so
 /// it can only add a yes, never a no.
 pub(crate) fn host_uses_apparmor_in(root: &Path) -> bool {
-    if let Ok(enabled) = std::fs::read_to_string(root.join("sys/module/apparmor/parameters/enabled"))
+    if let Ok(enabled) =
+        std::fs::read_to_string(root.join("sys/module/apparmor/parameters/enabled"))
     {
         return enabled.trim().eq_ignore_ascii_case("y");
     }
