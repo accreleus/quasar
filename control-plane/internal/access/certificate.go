@@ -9,6 +9,7 @@
 package access
 
 import (
+	"encoding/base64"
 	"bytes"
 	"crypto/sha256"
 	"crypto/tls"
@@ -40,7 +41,10 @@ const (
 type Info struct {
 	Source            string    `json:"source"`
 	FingerprintSHA256 string    `json:"fingerprint_sha256"`
-	Subject           string    `json:"subject"`
+	// SPKISHA256 is curl's --pinnedpubkey form (sha256//<this>), so the enroll-host
+	// one-liner can pin the key instead of trusting a CA. Contract: control-api.md.
+	SPKISHA256 string    `json:"spki_sha256"`
+	Subject    string    `json:"subject"`
 	Issuer            string    `json:"issuer"`
 	NotBefore         time.Time `json:"not_before"`
 	NotAfter          time.Time `json:"not_after"`
@@ -99,6 +103,13 @@ func hostOnly(host string) string {
 // Fingerprint renders SHA-256 over the DER as uppercase colon-separated hex —
 // the same form tlsx.Fingerprint logs at startup and a browser's certificate
 // viewer shows, so an operator can compare literally (§S6a).
+// SPKIPin is base64(SHA-256(DER SubjectPublicKeyInfo)) — the value after
+// `sha256//` in curl's --pinnedpubkey.
+func SPKIPin(spkiDER []byte) string {
+	sum := sha256.Sum256(spkiDER)
+	return base64.StdEncoding.EncodeToString(sum[:])
+}
+
 func Fingerprint(der []byte) string {
 	sum := sha256.Sum256(der)
 	parts := make([]string, len(sum))
@@ -136,6 +147,7 @@ func describe(source string, chain []*x509.Certificate) Info {
 	return Info{
 		Source:            source,
 		FingerprintSHA256: Fingerprint(leaf.Raw),
+		SPKISHA256:        SPKIPin(leaf.RawSubjectPublicKeyInfo),
 		Subject:           leaf.Subject.String(),
 		Issuer:            leaf.Issuer.String(),
 		NotBefore:         leaf.NotBefore.UTC(),

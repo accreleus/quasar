@@ -100,6 +100,9 @@ func TestNewManagerAcceptsAnExistingLooseOnDiskPair(t *testing.T) {
 		t.Fatalf("GetCertificate: %v", err)
 	}
 	info := mgr.Current()
+	if want := SPKIPin(leaf.cert.RawSubjectPublicKeyInfo); info.SPKISHA256 != want {
+		t.Errorf("spki_sha256 = %q, want the leaf's %q", info.SPKISHA256, want)
+	}
 	if info.FingerprintSHA256 != Fingerprint(leaf.cert.Raw) {
 		t.Errorf("fingerprint = %q, want the on-disk leaf's %q", info.FingerprintSHA256, Fingerprint(leaf.cert.Raw))
 	}

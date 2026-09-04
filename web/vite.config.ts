@@ -1,4 +1,6 @@
 import { execSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 
@@ -92,8 +94,28 @@ function preloadFonts(): Plugin {
 // localhost:8080.
 const controlOrigin = process.env.QUASAR_CONTROL_ORIGIN ?? "http://localhost:8080";
 
+// The control plane serves deploy/enroll-host.sh from the SPA root as
+// /enroll-host.sh (#100), so the installer a second host fetches is the one from
+// the tree the control plane was built from. Copied at build time, never
+// duplicated in web/: deploy/ stays the single home of operator scripts.
+// Missing must fail the build — the SPA handler would otherwise answer the URL
+// with index.html and `sh` would choke on HTML.
+function enrollHostScript(): Plugin {
+  const src = path.resolve(__dirname, "..", "deploy", "enroll-host.sh");
+  return {
+    name: "quasar-enroll-host-script",
+    apply: "build",
+    generateBundle() {
+      if (!fs.existsSync(src)) {
+        throw new Error(`quasar-enroll-host-script: ${src} not found — the build context must include deploy/enroll-host.sh`);
+      }
+      this.emitFile({ type: "asset", fileName: "enroll-host.sh", source: fs.readFileSync(src) });
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [react(), preloadFonts()],
+  plugins: [react(), preloadFonts(), enrollHostScript()],
   define: { __QUASAR_SOURCE_REF__: JSON.stringify(sourceRef()) },
   server: {
     proxy: {

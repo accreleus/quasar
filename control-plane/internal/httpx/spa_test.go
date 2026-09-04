@@ -27,7 +27,25 @@ func buildWebRoot(t *testing.T) string {
 	must(t, os.WriteFile(filepath.Join(root, "manifest.webmanifest"), []byte(`{"name":"Quasar"}`), 0o644))
 	must(t, os.MkdirAll(filepath.Join(root, "icons"), 0o755))
 	must(t, os.WriteFile(filepath.Join(root, "icons", "icon-192.png"), []byte("\x89PNG"), 0o644))
+	// #100: the second-host installer, copied to the web root by the SPA build.
+	must(t, os.WriteFile(filepath.Join(root, "enroll-host.sh"), []byte("#!/bin/sh\necho enroll\n"), 0o644))
 	return root
+}
+
+// The installer must come back as itself: index.html here would be piped into
+// `sh` on the new host.
+func TestSPAHandler_EnrollHostScriptServedVerbatim(t *testing.T) {
+	h := httpx.SPAHandler(buildWebRoot(t))
+	rr := do(t, h, "/enroll-host.sh")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rr.Code)
+	}
+	if got := rr.Body.String(); got != "#!/bin/sh\necho enroll\n" {
+		t.Fatalf("body = %q, want the script itself", got)
+	}
+	if cc := rr.Header().Get("Cache-Control"); cc == "public, max-age=31536000, immutable" {
+		t.Fatalf("a root file is not content-addressed; must not be immutable")
+	}
 }
 
 func must(t *testing.T, err error) {

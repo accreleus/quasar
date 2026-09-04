@@ -1,13 +1,16 @@
 #!/bin/sh
 # deploy/enroll-host.sh — join a machine to a Quasar control plane as a GPU host (#100).
 #
-#   curl -fsSL https://raw.githubusercontent.com/accreleus/quasar/<ref>/deploy/enroll-host.sh \
+#   curl -fsSL [-k --pinnedpubkey 'sha256//…'] https://<control-plane>/enroll-host.sh \
 #     | QUASAR_ENROLLMENT='qenr1.…' QUASAR_REF=<ref> sh
 #
-# Admin → Fleet → Enroll host prints that line with the string and ref filled in.
-# The script is fetched from GitHub over a real-CA certificate — never with
-# verification off — and the control plane's identity comes from the fingerprint
-# INSIDE the enrollment string, which the agent pins (#12). The token travels in
+# Admin → Fleet → Enroll host prints that line filled in. The control plane serves
+# this file itself (the SPA build copies it into web/dist), so the script is by
+# construction the one that matches the running deployment. With a self-signed
+# control plane, curl trusts nothing but the pinned public key (`-k` alone would
+# hand anyone on the path a root shell; `--pinnedpubkey` is what makes `-k`
+# safe); with a real-CA certificate neither flag appears. The agent then pins the
+# certificate fingerprint INSIDE the enrollment string (#12). The token travels in
 # an environment variable, never a URL: it is single-use and expires in an hour,
 # which is what makes a shell-history exposure bounded.
 #
@@ -26,8 +29,8 @@
 #
 # Inputs (environment):
 #   QUASAR_ENROLLMENT   required — the string from Admin → Fleet → Enroll host
-#   QUASAR_REF          the git ref this script was fetched at (vX.Y.Z tag, or a
-#                       commit); it selects the matching agent image tag
+#   QUASAR_REF          the git ref the control plane was built from (vX.Y.Z tag,
+#                       or a commit); it selects the matching agent image tag
 #   QUASAR_AGENT_IMAGE  explicit image reference (a digest pin) — overrides QUASAR_REF
 #   QUASAR_DIR          install directory, default /opt/quasar-agent
 #   NODE_NAME           this host's stable fleet name, default: its hostname
@@ -205,8 +208,8 @@ esac
 
 # ── 1. the enrollment string ─────────────────────────────────────────────────
 blob="${QUASAR_ENROLLMENT:-}"
-[ -n "$blob" ] || usage_error "QUASAR_ENROLLMENT is not set. Mint one in Admin → Fleet → Enroll host and run:
-  curl -fsSL <that page's script URL> | QUASAR_ENROLLMENT='qenr1.…' sh"
+[ -n "$blob" ] || usage_error "QUASAR_ENROLLMENT is not set. Mint one in Admin → Fleet → Enroll host and run the command it prints:
+  curl -fsSL … https://<control-plane>/enroll-host.sh | QUASAR_ENROLLMENT='qenr1.…' sh"
 
 case "$blob" in
   qenr1.*) ;;
@@ -246,10 +249,15 @@ fi
 say "  token:       single-use, read from QUASAR_ENROLLMENT (not shown)"
 
 # ── privileges ───────────────────────────────────────────────────────────────
+# Never prompt from inside a pipe: every privileged command runs `sudo -n`, and a
+# host whose sudo wants a password is refused up front with the way out.
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
-  command -v sudo >/dev/null 2>&1 || host_error "run as root, or install sudo: this writes $DIR and talks to the Docker daemon"
-  SUDO="sudo"
+  command -v sudo >/dev/null 2>&1 || host_error "not root and no sudo: this writes $DIR and talks to the Docker daemon. Run it from a root shell (su -, then paste the command)."
+  if ! sudo -n true 2>/dev/null; then
+    host_error "sudo asks $(id -un) for a password on this host, and this script never prompts. Either allow passwordless sudo for this user (NOPASSWD in sudoers), or open a root shell first (sudo -i) and paste the command there."
+  fi
+  SUDO="sudo -n"
 fi
 
 # ── 2. host preflights (the readiness checks, before anything is written) ────

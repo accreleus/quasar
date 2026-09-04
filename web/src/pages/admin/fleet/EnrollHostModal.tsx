@@ -31,7 +31,7 @@ const SECOND_HOST_DOCS = "https://accreleus.github.io/quasar/install/second-host
 
 type CertState =
   | { kind: "loading" }
-  | { kind: "self_signed"; fingerprint: string }
+  | { kind: "self_signed"; fingerprint: string; spkiPin: string }
   | { kind: "public_ca" }
   | { kind: "proxied"; reason: string }
   | { kind: "error"; message: string };
@@ -48,7 +48,8 @@ function certStateOf(check: AccessCheck): CertState {
           "needs the manual CONTROL_PLANE_FINGERPRINT path on the agent instead.",
     };
   }
-  if (cert.info?.self_signed) return { kind: "self_signed", fingerprint: cert.info.fingerprint_sha256 };
+  if (cert.info?.self_signed)
+    return { kind: "self_signed", fingerprint: cert.info.fingerprint_sha256, spkiPin: cert.info.spki_sha256 };
   return { kind: "public_ca" };
 }
 
@@ -104,6 +105,7 @@ export function EnrollHostModal({
   if (!open) return null;
 
   const fingerprint = cert.kind === "self_signed" ? cert.fingerprint : null;
+  const spkiPin = cert.kind === "self_signed" ? cert.spkiPin : null;
   const canMint =
     !!token && !!wssUrl && (cert.kind === "self_signed" || cert.kind === "public_ca" || cert.kind === "proxied") && !minting;
 
@@ -126,7 +128,7 @@ export function EnrollHostModal({
       }
       setResult({
         value: composed.value,
-        command: composeInstallCommand({ enrollment: composed.value, ref: sourceRef }),
+        command: composeInstallCommand({ origin, enrollment: composed.value, ref: sourceRef, spkiPin }),
         expiresAt: enrollment.expires_at ?? null,
       });
     } catch (e) {
@@ -213,8 +215,16 @@ export function EnrollHostModal({
                 caption={`Run on the new host as root — single use, ${expiry}`}
               />
               <p className="hint" style={{ margin: 0 }}>
-                The script checks the host, pins the agent image to this release, starts the agent and
-                reports when it is enrolled. It never edits the firewall.{" "}
+                This control plane serves the script. The script checks the host, pins the agent image
+                to this release, starts the agent and reports when it is enrolled; it never edits the
+                firewall.
+                {cert.kind === "self_signed" && (
+                  <>
+                    {" "}
+                    <span className="mono">--pinnedpubkey</span> makes curl trust only the key above, so{" "}
+                    <span className="mono">-k</span> here is not &quot;trust anything&quot;.
+                  </>
+                )}{" "}
                 <a href={SECOND_HOST_DOCS} target="_blank" rel="noreferrer">
                   Add a second GPU host
                 </a>
@@ -228,8 +238,8 @@ export function EnrollHostModal({
           {result && !result.command && (
             <>
               <p className="note warn" style={{ margin: 0 }} data-testid="enroll-no-installer">
-                This build carries no source ref, so no installer command can be pinned to it. Use the
-                enrollment string with the agent&apos;s own Compose file — see{" "}
+                The install command could not be composed for this certificate. Use the enrollment
+                string with the agent&apos;s own Compose file — see{" "}
                 <a href={SECOND_HOST_DOCS} target="_blank" rel="noreferrer">
                   Add a second GPU host
                 </a>
