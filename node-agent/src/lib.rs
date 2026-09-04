@@ -31,5 +31,6 @@ pub mod memstat;
 pub mod messages;
 pub mod nvidia_volume;
 pub mod readiness;
+pub mod release;
 pub mod session;
 pub mod vram;
