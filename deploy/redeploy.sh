@@ -930,7 +930,7 @@ if [ -n "$agent_log" ]; then
   # container's log, so a healed host still carries the failing line from the boot before.
   # Token contract: node-agent/src/{readiness,agent}.rs.
   readiness_line="$(printf '%s' "$agent_log" |
-    grep -E 'boot-render-node-missing|boot-render-node-retry-deferred|boot-dri-modes-stale-cdi|boot-host-render-node-missing|readiness-checks-failed|host readiness: all checks passed or skipped' |
+    grep -E 'boot-render-node-missing|boot-render-node-retry-deferred|boot-render-node-retries-spent|boot-render-node-unopenable|boot-dri-modes-stale-cdi|boot-host-render-node-missing|readiness-checks-failed|host readiness: all checks passed or skipped' |
     tail -1 || true)"
   case "$readiness_line" in
   *boot-render-node-missing*)
@@ -942,6 +942,16 @@ if [ -n "$agent_log" ]; then
     echo "        check the node-agent service's devices:/gpus: entry, then recreate."
     fail=1
     ;;
+  *boot-render-node-retry-deferred*)
+    # Transient by construction: the agent held the retry back only because a provision was
+    # writing a shared volume, and it takes it on the next boot.
+    readiness=RETRYING
+    echo "  WARN: the node-agent cannot see a /dev/dri render node yet and is holding its"
+    echo "        restart back until a driver/CUDA provision finishes (#66/#98). It retries on"
+    echo "        the next agent start; re-check once the provision completes:"
+    echo "          $DC logs quasar-node-agent | grep gpu-host-sanity"
+    degraded=1
+    ;;
   *boot-dri-modes-stale-cdi*)
     readiness=FAILED
     echo "  FAIL: the /dev/dri nodes inside the agent container cannot be opened by the app"
@@ -951,7 +961,15 @@ if [ -n "$agent_log" ]; then
     echo "          $DC up -d --force-recreate"
     fail=1
     ;;
-  *boot-host-render-node-missing* | *boot-render-node-retry-deferred*)
+  *boot-render-node-unopenable*)
+    readiness=FAILED
+    echo "  FAIL: a /dev/dri render node IS in the agent container but cannot be opened —"
+    echo "        a mode/group/device-cgroup fault, which a restart reproduces exactly."
+    echo "        Check the nodes on the HOST ('ls -l /dev/dri') and the node-agent service's"
+    echo "        devices:/device_cgroup_rules: entries, then recreate the containers."
+    fail=1
+    ;;
+  *boot-render-node-retries-spent* | *boot-host-render-node-missing*)
     readiness=FAILED
     echo "  FAIL: the node-agent reports a boot sanity failure that no restart can fix:"
     printf '%s' "$readiness_line" | sed 's/^/        /'

@@ -503,9 +503,22 @@ pub enum BootAction {
     Stay(BootFault),
 }
 
+/// One token per condition; `redeploy.sh` classifies deploys by them and the log sites in
+/// `agent.rs` repeat them as literals (the log-convention test wants a literal first field).
 pub const BOOT_RENDER_NODE_TOKEN: &str = "boot-render-node-missing";
+pub const BOOT_RENDER_NODE_DEFERRED_TOKEN: &str = "boot-render-node-retry-deferred";
+pub const BOOT_RENDER_NODE_SPENT_TOKEN: &str = "boot-render-node-retries-spent";
+pub const BOOT_RENDER_NODE_UNOPENABLE_TOKEN: &str = "boot-render-node-unopenable";
 pub const BOOT_DRI_MODES_TOKEN: &str = "boot-dri-modes-stale-cdi";
 pub const BOOT_HOST_RENDER_NODE_TOKEN: &str = "boot-host-render-node-missing";
+
+/// Does this container have a `/dev/dri/renderD*` node at all? The gate's own read: the
+/// `render_node` check FAILs both for "no node here" and "node here but not openable", and
+/// only the first is fixed by a fresh container start. Kept out of `ReadinessCheck` — that
+/// shape is the agent-api contract.
+pub fn container_has_render_node(root: &Path) -> bool {
+    !dir_entries_matching(&root.join("dev/dri"), |n| n.starts_with("renderD")).is_empty()
+}
 
 /// Inputs to [`boot_action`]. All of them, so the decision stays pure and testable with no
 /// devices: the caller reads the world once and this function only decides.
@@ -514,6 +527,9 @@ pub struct BootInputs<'a> {
     /// Capacity's vendor-neutral answer (`/sys/class/drm` card* with a known vendor id and
     /// readable VRAM). False ⇒ never exit: a GPU-less host is not broken, it is small.
     pub gpu_present: bool,
+    /// [`container_has_render_node`]'s answer. True with `render_node` FAIL means the node is
+    /// here and unopenable (mode, group, device cgroup), which a restart reproduces exactly.
+    pub container_has_render_node: bool,
     /// A driver-volume / CUDA-runtime provision is materialising right now. Exiting would
     /// kill a hundreds-of-MB download mid-flight, so it defers the retry to the next boot.
     pub provision_in_flight: bool,
@@ -530,11 +546,11 @@ pub const BOOT_EXIT_MAX_ATTEMPTS: u32 = 5;
 
 /// The boot decision, pure over an already-taken readiness report.
 ///
-/// Exit is reserved for the one fault a fresh container start actually fixes: `host_render_node`
-/// PASS (the kernel made a node) with `render_node` FAIL (this container has none). Keying on
-/// that pair rather than on `render_node` alone is what keeps a synthetic-capacity dev host and
-/// the GSP-firmware case (`host_render_node` FAIL — only a host reboot fixes it) out of a
-/// crash loop.
+/// Exit is reserved for the one fault a fresh container start actually fixes: the host kernel
+/// made a render node (`host_render_node` PASS) and this container has NONE
+/// (`container_has_render_node` false). The other readings of a `render_node` FAIL each get a
+/// `Stay`: a synthetic-capacity dev host, the GSP-firmware case (only a host reboot fixes it),
+/// and a node that is present but unopenable (mode/group/cgroup — a restart reproduces it).
 pub fn boot_action(input: BootInputs<'_>) -> BootAction {
     fn find<'a>(checks: &'a [ReadinessCheck], id: &str) -> Option<&'a ReadinessCheck> {
         checks.iter().find(|c| c.id == id)
@@ -571,11 +587,27 @@ pub fn boot_action(input: BootInputs<'_>) -> BootAction {
                 .map(BootAction::Stay)
                 .unwrap_or(BootAction::Continue);
         }
+        if input.container_has_render_node {
+            // Present but not openable: the device list is fine, the permissions are not, and
+            // a fresh container reproduces both. Its remediation names the mode/cgroup fix.
+            return fault(checks, "render_node", BOOT_RENDER_NODE_UNOPENABLE_TOKEN)
+                .map(BootAction::Stay)
+                .unwrap_or(BootAction::Continue);
+        }
         let Some(f) = fault(checks, "render_node", BOOT_RENDER_NODE_TOKEN) else {
             return BootAction::Continue;
         };
-        if input.provision_in_flight || input.prior_exits >= BOOT_EXIT_MAX_ATTEMPTS {
-            return BootAction::Stay(f);
+        if input.provision_in_flight {
+            return BootAction::Stay(BootFault {
+                token: BOOT_RENDER_NODE_DEFERRED_TOKEN,
+                ..f
+            });
+        }
+        if input.prior_exits >= BOOT_EXIT_MAX_ATTEMPTS {
+            return BootAction::Stay(BootFault {
+                token: BOOT_RENDER_NODE_SPENT_TOKEN,
+                ..f
+            });
         }
         return BootAction::ExitForRetry(f);
     }
@@ -3131,10 +3163,22 @@ mod tests {
         env
     }
 
-    fn gate(checks: &[ReadinessCheck], gpu_present: bool) -> BootAction {
+    /// A hand-built report, for the branches whose real-world trigger (a node the process
+    /// cannot open) cannot be staged in a fixture the test user owns.
+    fn boot_check(id: &str, status: &str) -> ReadinessCheck {
+        ReadinessCheck {
+            id: id.to_string(),
+            status: status.to_string(),
+            summary: format!("{id} is {status}"),
+            remediation: format!("fix {id}"),
+        }
+    }
+
+    fn gate_at(root: &FakeRoot, checks: &[ReadinessCheck], gpu_present: bool) -> BootAction {
         boot_action(BootInputs {
             checks,
             gpu_present,
+            container_has_render_node: container_has_render_node(&root.dir),
             provision_in_flight: false,
             prior_exits: 0,
         })
@@ -3146,7 +3190,8 @@ mod tests {
         let checks = probe(&boot_env(&root));
         assert_eq!(get(&checks, "host_render_node").status, PASS);
         assert_eq!(get(&checks, "render_node").status, FAIL);
-        match gate(&checks, true) {
+        assert!(!container_has_render_node(&root.dir));
+        match gate_at(&root, &checks, true) {
             BootAction::ExitForRetry(f) => {
                 assert_eq!(f.token, BOOT_RENDER_NODE_TOKEN);
                 assert_eq!(f.check, "render_node");
@@ -3158,6 +3203,50 @@ mod tests {
             }
             other => panic!("expected ExitForRetry, got {other:?}"),
         }
+    }
+
+    /// The permission fault: the node IS in the container, the agent cannot open it. A restart
+    /// re-creates the same node with the same mode, so exiting would burn every retry on a
+    /// message about a device list that is not the problem.
+    #[test]
+    fn boot_gate_stays_when_the_render_node_is_present_but_unopenable() {
+        let checks = [
+            boot_check("render_node", FAIL),
+            boot_check("host_render_node", PASS),
+            boot_check("dri_node_app_access", PASS),
+        ];
+        let action = boot_action(BootInputs {
+            checks: &checks,
+            gpu_present: true,
+            container_has_render_node: true,
+            provision_in_flight: false,
+            prior_exits: 0,
+        });
+        match action {
+            BootAction::Stay(f) => {
+                assert_eq!(f.token, BOOT_RENDER_NODE_UNOPENABLE_TOKEN);
+                assert_eq!(f.check, "render_node");
+                assert_eq!(f.remediation, "fix render_node");
+            }
+            other => panic!("a mode/cgroup fault must never exit, got {other:?}"),
+        }
+    }
+
+    /// Same report, node genuinely absent: the one case a fresh container start fixes.
+    #[test]
+    fn boot_gate_exit_hinges_on_the_container_having_no_node() {
+        let checks = [
+            boot_check("render_node", FAIL),
+            boot_check("host_render_node", PASS),
+        ];
+        let action = boot_action(BootInputs {
+            checks: &checks,
+            gpu_present: true,
+            container_has_render_node: false,
+            provision_in_flight: false,
+            prior_exits: 0,
+        });
+        assert!(matches!(action, BootAction::ExitForRetry(_)), "{action:?}");
     }
 
     #[test]
@@ -3177,7 +3266,7 @@ mod tests {
             "the node's owner can open 0600"
         );
         assert_eq!(get(&checks, "dri_node_app_access").status, FAIL);
-        match gate(&checks, true) {
+        match gate_at(&root, &checks, true) {
             BootAction::Stay(f) => {
                 assert_eq!(f.token, BOOT_DRI_MODES_TOKEN);
                 assert!(
@@ -3199,7 +3288,7 @@ mod tests {
             .file("dev/uinput", "")
             .file("proc/sys/user/max_user_namespaces", "15000\n");
         let checks = probe(&boot_env(&root));
-        match gate(&checks, true) {
+        match gate_at(&root, &checks, true) {
             BootAction::Stay(f) => assert_eq!(f.token, BOOT_HOST_RENDER_NODE_TOKEN),
             other => panic!("expected Stay, got {other:?}"),
         }
@@ -3212,7 +3301,7 @@ mod tests {
             .file("proc/sys/user/max_user_namespaces", "15000\n");
         let checks = probe(&root.env(false, ""));
         assert_eq!(get(&checks, "render_node").status, FAIL);
-        assert_eq!(gate(&checks, false), BootAction::Continue);
+        assert_eq!(gate_at(&root, &checks, false), BootAction::Continue);
     }
 
     #[test]
@@ -3223,7 +3312,7 @@ mod tests {
             .file("dev/uinput", "")
             .file("proc/sys/user/max_user_namespaces", "15000\n");
         let checks = probe(&boot_env(&root));
-        assert_eq!(gate(&checks, true), BootAction::Continue);
+        assert_eq!(gate_at(&root, &checks, true), BootAction::Continue);
     }
 
     #[test]
@@ -3233,11 +3322,14 @@ mod tests {
         let action = boot_action(BootInputs {
             checks: &checks,
             gpu_present: true,
+            container_has_render_node: false,
             provision_in_flight: true,
             prior_exits: 0,
         });
         match action {
-            BootAction::Stay(f) => assert_eq!(f.token, BOOT_RENDER_NODE_TOKEN),
+            // Its own token: a provision is transient and clears on the next boot, unlike a
+            // spent retry budget.
+            BootAction::Stay(f) => assert_eq!(f.token, BOOT_RENDER_NODE_DEFERRED_TOKEN),
             other => panic!("a provision in flight must never exit, got {other:?}"),
         }
     }
@@ -3250,6 +3342,7 @@ mod tests {
             boot_action(BootInputs {
                 checks: &checks,
                 gpu_present: true,
+                container_has_render_node: false,
                 provision_in_flight: false,
                 prior_exits,
             })
@@ -3258,7 +3351,10 @@ mod tests {
             at(BOOT_EXIT_MAX_ATTEMPTS - 1),
             BootAction::ExitForRetry(_)
         ));
-        assert!(matches!(at(BOOT_EXIT_MAX_ATTEMPTS), BootAction::Stay(_)));
+        match at(BOOT_EXIT_MAX_ATTEMPTS) {
+            BootAction::Stay(f) => assert_eq!(f.token, BOOT_RENDER_NODE_SPENT_TOKEN),
+            other => panic!("expected Stay, got {other:?}"),
+        }
     }
 
     // ── (#483) media reachability / firewall detection ──────────────────────
