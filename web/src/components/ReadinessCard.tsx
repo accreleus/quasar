@@ -5,6 +5,7 @@
 
 import { useState } from "react";
 import type { ReadinessCheck } from "../api/types";
+import { groupChecks } from "../lib/readiness/groups";
 import { Button } from "./Button";
 import { Chip } from "./Chip";
 import { IconCheck, IconClose, IconWarning } from "./icons";
@@ -20,6 +21,7 @@ const GLYPH: Record<string, { label: string; className: string; icon: React.Reac
   fail: { label: "Fail", className: "rdy-glyph rdy-bad", icon: <IconClose /> },
   warn: { label: "Warning", className: "rdy-glyph rdy-warn", icon: <IconWarning /> },
   skip: { label: "Skipped", className: "rdy-glyph rdy-off", icon: DASH },
+  provisioning: { label: "Provisioning", className: "rdy-glyph rdy-off", icon: DASH },
 };
 
 function ReadinessGlyph({ status }: { status: string }) {
@@ -95,6 +97,30 @@ export function ReadinessCard({
   // same thing here — nothing to render yet.
   const hasChecks = checks != null && checks.length > 0;
   const anyFail = hasChecks && checks.some((c) => c.status === "fail");
+  // #102: grouped by the area an operator would fix; `skip` (not applicable
+  // to this host, per the contract) leaves the first screen for a disclosure.
+  const { groups, notApplicable } = groupChecks(checks ?? []);
+  const rowClass = layout === "grid" ? "readiness-check" : "host-setting-row";
+  const listClass = layout === "grid" ? "readiness-grid" : "col gap3";
+
+  const renderCheck = (c: ReadinessCheck) => (
+    <div key={c.id} className={rowClass} data-testid={`readiness-check-${c.id}`}>
+      <div className="host-setting-copy">
+        <div className="row gap2" style={{ alignItems: "center" }}>
+          <ReadinessGlyph status={c.status} />
+          <h3 style={{ fontSize: "var(--t-sm)" }}>{c.id.replaceAll("_", " ")}</h3>
+        </div>
+        <p>{c.summary}</p>
+        {/* #483: `warn` is advisory-but-actionable (e.g. media_reachability) —
+            it carries a real remediation command same as `fail`, just never
+            blocks anything. Show it here too, or the whole point of a WARN
+            check (here's exactly what to run) is invisible. */}
+        {(c.status === "fail" || c.status === "warn") && c.remediation && (
+          <CopyableRemediation text={c.remediation} />
+        )}
+      </div>
+    </div>
+  );
 
   return (
     <div className="card sec-card" data-testid="readiness-card">
@@ -123,33 +149,30 @@ export function ReadinessCard({
       )}
 
       {hasChecks && (
-        <div
-          className={layout === "grid" ? "readiness-grid" : "col gap3"}
-          data-testid="readiness-checks"
-        >
-          {checks.map((c) => (
-            <div
-              key={c.id}
-              className={layout === "grid" ? "readiness-check" : "host-setting-row"}
-              data-testid={`readiness-check-${c.id}`}
-            >
-              <div className="host-setting-copy">
-                <div className="row gap2" style={{ alignItems: "center" }}>
-                  <ReadinessGlyph status={c.status} />
-                  <h3 style={{ fontSize: "var(--t-sm)" }}>{c.id.replaceAll("_", " ")}</h3>
-                </div>
-                <p>{c.summary}</p>
-                {/* #483: `warn` is advisory-but-actionable (e.g. media_reachability) —
-                    it carries a real remediation command same as `fail`, just never
-                    blocks anything. Show it here too, or the whole point of a WARN
-                    check (here's exactly what to run) is invisible. */}
-                {(c.status === "fail" || c.status === "warn") && c.remediation && (
-                  <CopyableRemediation text={c.remediation} />
-                )}
-              </div>
+        <div className="col gap4" data-testid="readiness-checks">
+          {groups.map((g) => (
+            <div key={g.key} className="readiness-group" data-testid="readiness-group" data-group={g.key}>
+              <div className="eyebrow">{g.label}</div>
+              <div className={listClass}>{g.checks.map(renderCheck)}</div>
             </div>
           ))}
+          {groups.length === 0 && (
+            <p className="muted" style={{ marginBottom: 0 }}>
+              Nothing to check on this host beyond what is listed below.
+            </p>
+          )}
         </div>
+      )}
+
+      {notApplicable.length > 0 && (
+        <details className="readiness-more" data-testid="readiness-not-applicable">
+          <summary>
+            {notApplicable.length} {notApplicable.length === 1 ? "check" : "checks"} not applicable to this host
+          </summary>
+          <div className={listClass} style={{ marginTop: "var(--s3)" }}>
+            {notApplicable.map(renderCheck)}
+          </div>
+        </details>
       )}
 
       {footnote && (

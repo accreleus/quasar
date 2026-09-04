@@ -112,7 +112,7 @@ describe("ReadinessCard", () => {
         checks={[
           check({
             id: "future_check",
-            status: "provisioning" as ReadinessCheck["status"],
+            status: "recalibrating" as ReadinessCheck["status"],
             summary: "New check from a newer agent.",
           }),
         ]}
@@ -120,7 +120,7 @@ describe("ReadinessCard", () => {
     );
     const row = screen.getByTestId("readiness-check-future_check");
     // Unknown status renders as its own raw value, neutrally.
-    expect(within(row).getByRole("img", { name: "provisioning" })).toBeInTheDocument();
+    expect(within(row).getByRole("img", { name: "recalibrating" })).toBeInTheDocument();
     expect(screen.queryByText("Needs attention")).not.toBeInTheDocument();
   });
 
