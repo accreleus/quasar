@@ -385,6 +385,198 @@ fn spawn_cuda_runtime_provisioner(runtime: &ContainerRuntime) {
         });
 }
 
+// ── boot-time sanity gate (#98) ──────────────────────────────────────────────
+
+/// Delay before a boot-fault exit. Short: the restart policy's own backoff is what paces the
+/// retries, this only buys the log lines a moment to be shipped.
+const BOOT_SANITY_EXIT_DELAY: Duration = Duration::from_secs(5);
+
+/// Consecutive boot exits, in the CONTAINER's filesystem. A restart-policy restart reuses the
+/// container, so the count survives exactly the retries it counts and resets on the recreate
+/// that the other race needs anyway.
+fn boot_exit_counter_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("quasar-boot-sanity-exits")
+}
+
+fn read_boot_exits(path: &std::path::Path) -> u32 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Returns the new count. A write failure costs only the escalation, never the retry.
+fn record_boot_exit(path: &std::path::Path) -> u32 {
+    let next = read_boot_exits(path).saturating_add(1);
+    let _ = std::fs::write(path, next.to_string());
+    next
+}
+
+/// The gate's effects, injected so the decide→sleep→recheck→exit sequence is testable with no
+/// device, no real sleep and no exit.
+struct BootGateEffects<'a> {
+    /// #66 barrier: provisions this process holds. Sampled before deciding AND after the
+    /// delay — a provision that starts inside the delay must still cancel the exit.
+    in_flight: &'a dyn Fn() -> usize,
+    record_exit: &'a dyn Fn() -> u32,
+    clear_exits: &'a dyn Fn(),
+    sleep: &'a dyn Fn(Duration),
+    exit: &'a dyn Fn(i32),
+}
+
+/// Act on the boot-time readiness verdict: exit for the fault a fresh container start fixes,
+/// stay and name the fix for one it does not. The decision is
+/// [`crate::readiness::boot_action`]; this is only its effects. Returns whether the exit
+/// effect fired.
+fn run_boot_gate(
+    checks: &[crate::messages::ReadinessCheck],
+    gpu_present: bool,
+    container_has_render_node: bool,
+    prior_exits: u32,
+    fx: &BootGateEffects<'_>,
+) -> bool {
+    use crate::readiness::{BootAction, BootInputs, BOOT_EXIT_MAX_ATTEMPTS, SANITY_LOG_TOKEN};
+    let in_flight = (fx.in_flight)();
+    let action = crate::readiness::boot_action(BootInputs {
+        checks,
+        gpu_present,
+        container_has_render_node,
+        provision_in_flight: in_flight > 0,
+        prior_exits,
+    });
+    let fault = match action {
+        BootAction::Continue => {
+            // Streak over: a later fault gets a full retry budget.
+            (fx.clear_exits)();
+            return false;
+        }
+        BootAction::Stay(f) => {
+            log_boot_stay(&f, prior_exits, in_flight);
+            return false;
+        }
+        BootAction::ExitForRetry(f) => f,
+    };
+    let attempt = (fx.record_exit)();
+    error!(
+        token = "boot-render-node-missing",
+        check = %fault.check,
+        attempt,
+        max_attempts = BOOT_EXIT_MAX_ATTEMPTS,
+        exit_in_s = BOOT_SANITY_EXIT_DELAY.as_secs(),
+        "{SANITY_LOG_TOKEN} boot: {} — waiting for a /dev/dri/renderD* node to be visible \
+         INSIDE this container. A device list is fixed at container creation, so exiting in \
+         {}s and letting the restart policy start a fresh container is what picks the node up. \
+         Attempt {attempt} of {}. RUN (only if this repeats): {}",
+        fault.summary,
+        BOOT_SANITY_EXIT_DELAY.as_secs(),
+        BOOT_EXIT_MAX_ATTEMPTS,
+        fault.remediation
+    );
+    (fx.sleep)(BOOT_SANITY_EXIT_DELAY);
+    let in_flight = (fx.in_flight)();
+    if in_flight > 0 {
+        warn!(
+            token = "boot-render-node-exit-deferred",
+            in_flight,
+            "a provision started while the boot exit was pending — staying up; the retry \
+             happens on the next agent start"
+        );
+        return false;
+    }
+    (fx.exit)(1);
+    true
+}
+
+/// One line per Stay, keyed on the fault's token. The tokens are repeated as literals because
+/// the log-convention test requires a literal first field.
+fn log_boot_stay(f: &crate::readiness::BootFault, prior_exits: u32, in_flight: usize) {
+    use crate::readiness::{
+        BOOT_DRI_MODES_TOKEN, BOOT_EXIT_MAX_ATTEMPTS, BOOT_HOST_RENDER_NODE_TOKEN,
+        BOOT_RENDER_NODE_DEFERRED_TOKEN, BOOT_RENDER_NODE_UNOPENABLE_TOKEN, SANITY_LOG_TOKEN,
+    };
+    match f.token {
+        BOOT_DRI_MODES_TOKEN => error!(
+            token = "boot-dri-modes-stale-cdi",
+            check = %f.check,
+            "{SANITY_LOG_TOKEN} boot: {} — NOT restarting for this: CDI device edits are \
+             applied when a container is CREATED, so every restart reproduces the same modes \
+             from the same stale spec and nothing inside this container can re-read them. \
+             Regenerate the spec on the HOST, then recreate the containers. RUN: {}",
+            f.summary,
+            f.remediation
+        ),
+        BOOT_HOST_RENDER_NODE_TOKEN => error!(
+            token = "boot-host-render-node-missing",
+            check = %f.check,
+            "{SANITY_LOG_TOKEN} boot: {} — NOT restarting for this: the node has to be created \
+             by the HOST kernel first, which no container restart can do. RUN: {}",
+            f.summary,
+            f.remediation
+        ),
+        BOOT_RENDER_NODE_UNOPENABLE_TOKEN => error!(
+            token = "boot-render-node-unopenable",
+            check = %f.check,
+            "{SANITY_LOG_TOKEN} boot: {} — the node IS in this container and the agent cannot \
+             open it, so this is a mode/group/device-cgroup fault rather than the boot race, \
+             and a fresh container re-creates the same node with the same permissions. NOT \
+             restarting. RUN: {}",
+            f.summary,
+            f.remediation
+        ),
+        BOOT_RENDER_NODE_DEFERRED_TOKEN => warn!(
+            token = "boot-render-node-retry-deferred",
+            check = %f.check,
+            in_flight,
+            "{SANITY_LOG_TOKEN} boot: {} — a restart would fix it, but {in_flight} provision(s) \
+             are still writing a shared volume and killing one mid-write is worse than waiting: \
+             the retry happens on the next agent start instead",
+            f.summary
+        ),
+        // The only remaining Stay token: the retry budget is spent.
+        _ => error!(
+            token = "boot-render-node-retries-spent",
+            check = %f.check,
+            prior_exits,
+            "{SANITY_LOG_TOKEN} boot: {} — {prior_exits} restarts have already failed to bring \
+             the device in, so the pass-through is missing rather than late (budget: {}). NOT \
+             exiting again; staying up so the readiness card shows this. RUN: {}",
+            f.summary,
+            BOOT_EXIT_MAX_ATTEMPTS,
+            f.remediation
+        ),
+    }
+}
+
+/// Wire the gate to the real world. First connection of the process only: a later reconnect is
+/// not a boot, and by then live sessions exist that an exit would kill.
+async fn boot_sanity_gate(readiness: &[crate::messages::ReadinessCheck], gpu_present: bool) {
+    static EVALUATED: AtomicBool = AtomicBool::new(false);
+    if EVALUATED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let checks = readiness.to_vec();
+    let prior_exits = read_boot_exits(&boot_exit_counter_path());
+    // Blocking pool: the exit path sleeps, and parking a runtime worker for that would stall
+    // the heartbeat of a process that may yet be told to stay.
+    offload_probe(move || {
+        let counter = boot_exit_counter_path();
+        let has_node = crate::readiness::container_has_render_node(std::path::Path::new("/"));
+        let fx = BootGateEffects {
+            in_flight: &crate::artifact::provisioning_in_flight,
+            record_exit: &|| record_boot_exit(&counter),
+            clear_exits: &|| {
+                let _ = std::fs::remove_file(&counter);
+            },
+            sleep: &std::thread::sleep,
+            exit: &|code: i32| {
+                std::process::exit(code);
+            },
+        };
+        run_boot_gate(&checks, gpu_present, has_node, prior_exits, &fx);
+    })
+    .await;
+}
+
 /// #375: resolve the 32-bit NVIDIA driver-lib directory to inject into NVIDIA app
 /// containers. Returns the PROBED value only — empty when nothing was found or when
 /// `QUASAR_NV_LIB32_PATH` is set, since the override already rides the
@@ -758,9 +950,9 @@ async fn connect_and_run(
     // Every input is already paid for (the vendor read, the #375 lib32 probe, the
     // codec probe above), so nothing here re-probes or launches a container.
     let nvidia_host = cap.gpus.iter().any(|g| g.vendor == "nvidia");
+    let gpu_present = !cap.gpus.is_empty();
     let readiness = {
         let lib32 = first_settings.nvidia_lib32_path.clone();
-        let gpu_present = !cap.gpus.is_empty();
         let probed_codecs = host_codec_report.as_ref().map(|r| r.codecs.clone());
         offload_probe(move || {
             crate::readiness::probe(
@@ -785,6 +977,10 @@ async fn connect_and_run(
     };
     send(&mut tx, &capacity_msg).await?;
     info!("capacity report sent");
+
+    // Sent first on purpose: the card carries the remediation, and the gate below may end
+    // the process a few seconds later.
+    boot_sanity_gate(&readiness, gpu_present).await;
 
     // CM-06/07: re-send capacity on a debounced console hotplug so the control plane's
     // connector-diff auto-start/stop sees it promptly. Spawned after `registered`; the
@@ -2813,6 +3009,169 @@ mod tests {
 
     fn pin_fixture(byte: u8) -> crate::enrollment::Fingerprint {
         crate::enrollment::Fingerprint([byte; 32])
+    }
+
+    /// A readiness check by hand: `run_boot_gate` only reads id + status + wording, and a
+    /// real probe would need devices these tests must not touch.
+    fn gate_check(id: &str, status: &str) -> crate::messages::ReadinessCheck {
+        crate::messages::ReadinessCheck {
+            id: id.to_string(),
+            status: status.to_string(),
+            summary: format!("{id} is {status}"),
+            remediation: format!("fix {id}"),
+        }
+    }
+
+    /// The #98 boot race as the gate sees it: host kernel has a node, this container has none.
+    fn race_1_checks() -> Vec<crate::messages::ReadinessCheck> {
+        vec![
+            gate_check("render_node", crate::readiness::FAIL),
+            gate_check("host_render_node", crate::readiness::PASS),
+            gate_check("dri_node_app_access", crate::readiness::PASS),
+        ]
+    }
+
+    /// Recorded effects, so a test asserts on what the gate DID rather than on log text.
+    #[derive(Default)]
+    struct GateSpy {
+        in_flight_calls: AtomicU64,
+        sleeps: AtomicU64,
+        exits: AtomicU64,
+        recorded: AtomicU64,
+        cleared: AtomicU64,
+    }
+
+    #[test]
+    fn a_provision_that_starts_during_the_delay_cancels_the_boot_exit() {
+        let spy = GateSpy::default();
+        // Quiescent when the decision is taken, busy by the time the delay ends: the exact
+        // #66 race the post-sleep re-check exists for.
+        let in_flight = || -> usize {
+            if spy.in_flight_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                0
+            } else {
+                1
+            }
+        };
+        let fx = BootGateEffects {
+            in_flight: &in_flight,
+            record_exit: &|| spy.recorded.fetch_add(1, Ordering::SeqCst) as u32 + 1,
+            clear_exits: &|| {
+                spy.cleared.fetch_add(1, Ordering::SeqCst);
+            },
+            sleep: &|_| {
+                spy.sleeps.fetch_add(1, Ordering::SeqCst);
+            },
+            exit: &|_| {
+                spy.exits.fetch_add(1, Ordering::SeqCst);
+            },
+        };
+        let exited = run_boot_gate(&race_1_checks(), true, false, 0, &fx);
+        assert!(
+            !exited,
+            "a provision in flight must never be killed by the exit"
+        );
+        assert_eq!(spy.exits.load(Ordering::SeqCst), 0);
+        assert_eq!(spy.sleeps.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_quiescent_boot_race_exits_once_and_records_the_attempt() {
+        let spy = GateSpy::default();
+        let fx = BootGateEffects {
+            in_flight: &|| 0usize,
+            record_exit: &|| spy.recorded.fetch_add(1, Ordering::SeqCst) as u32 + 1,
+            clear_exits: &|| {
+                spy.cleared.fetch_add(1, Ordering::SeqCst);
+            },
+            sleep: &|_| {
+                spy.sleeps.fetch_add(1, Ordering::SeqCst);
+            },
+            exit: &|code| {
+                assert_eq!(code, 1, "the restart policy keys on a non-zero exit");
+                spy.exits.fetch_add(1, Ordering::SeqCst);
+            },
+        };
+        assert!(run_boot_gate(&race_1_checks(), true, false, 0, &fx));
+        assert_eq!(spy.exits.load(Ordering::SeqCst), 1);
+        assert_eq!(spy.recorded.load(Ordering::SeqCst), 1);
+        assert_eq!(spy.sleeps.load(Ordering::SeqCst), 1);
+        assert_eq!(spy.cleared.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_stay_verdict_neither_sleeps_nor_exits() {
+        let spy = GateSpy::default();
+        let fx = BootGateEffects {
+            in_flight: &|| 0usize,
+            record_exit: &|| spy.recorded.fetch_add(1, Ordering::SeqCst) as u32 + 1,
+            clear_exits: &|| {
+                spy.cleared.fetch_add(1, Ordering::SeqCst);
+            },
+            sleep: &|_| {
+                spy.sleeps.fetch_add(1, Ordering::SeqCst);
+            },
+            exit: &|_| {
+                spy.exits.fetch_add(1, Ordering::SeqCst);
+            },
+        };
+        // Stale CDI modes: a restart reproduces them, so the gate must not spend a boot on it.
+        let checks = vec![
+            gate_check("render_node", crate::readiness::PASS),
+            gate_check("host_render_node", crate::readiness::PASS),
+            gate_check("dri_node_app_access", crate::readiness::FAIL),
+        ];
+        assert!(!run_boot_gate(&checks, true, true, 0, &fx));
+        assert_eq!(spy.sleeps.load(Ordering::SeqCst), 0);
+        assert_eq!(spy.exits.load(Ordering::SeqCst), 0);
+        assert_eq!(spy.recorded.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            spy.cleared.load(Ordering::SeqCst),
+            0,
+            "a fault is not a clean boot"
+        );
+    }
+
+    #[test]
+    fn a_clean_boot_clears_the_retry_streak() {
+        let spy = GateSpy::default();
+        let fx = BootGateEffects {
+            in_flight: &|| 0usize,
+            record_exit: &|| spy.recorded.fetch_add(1, Ordering::SeqCst) as u32 + 1,
+            clear_exits: &|| {
+                spy.cleared.fetch_add(1, Ordering::SeqCst);
+            },
+            sleep: &|_| {
+                spy.sleeps.fetch_add(1, Ordering::SeqCst);
+            },
+            exit: &|_| {
+                spy.exits.fetch_add(1, Ordering::SeqCst);
+            },
+        };
+        let checks = vec![
+            gate_check("render_node", crate::readiness::PASS),
+            gate_check("host_render_node", crate::readiness::PASS),
+        ];
+        assert!(!run_boot_gate(&checks, true, true, 3, &fx));
+        assert_eq!(spy.cleared.load(Ordering::SeqCst), 1);
+        assert_eq!(spy.exits.load(Ordering::SeqCst), 0);
+    }
+
+    /// The boot-exit streak has to survive a restart-policy restart (same container, same
+    /// /tmp) and be clearable, or the retry bound is not a bound.
+    #[test]
+    fn boot_exits_count_up_and_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("boot-exits");
+        assert_eq!(read_boot_exits(&counter), 0, "no file is a fresh streak");
+        assert_eq!(record_boot_exit(&counter), 1);
+        assert_eq!(record_boot_exit(&counter), 2);
+        assert_eq!(read_boot_exits(&counter), 2);
+        std::fs::remove_file(&counter).unwrap();
+        assert_eq!(read_boot_exits(&counter), 0);
+        // A truncated or hand-edited file must read as a fresh streak, never panic.
+        std::fs::write(&counter, "not-a-number").unwrap();
+        assert_eq!(read_boot_exits(&counter), 0);
     }
 
     #[test]

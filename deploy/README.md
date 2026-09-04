@@ -23,7 +23,10 @@ Contributor tooling (the dev container, the harnesses, image builds) is not here
 - **Docker Engine + Compose v2.20 or newer** (`docker compose version`).
 - **Disk for Docker**: ~20 GB to install a release, 40 GB+ to build from source.
 - **A GPU**: AMD/Intel (VA-API) works as-is. NVIDIA also needs the driver plus
-  `nvidia-container-toolkit` with CDI configured (`sudo nvidia-ctk runtime configure`).
+  `nvidia-container-toolkit` with CDI configured (`sudo nvidia-ctk runtime configure`),
+  plus the CDI refresh ordering in
+  [NVIDIA: order the CDI refresh after udev](#nvidia-order-the-cdi-refresh-after-udev)
+  if the host reboots.
 - **The browser and the GPU host on the same LAN**, or on a VPN that joins them.
   The video does not travel through the control plane — see
   [Media reachability](#media-reachability-lan-or-vpn).
@@ -361,7 +364,7 @@ distribution with Docker should behave the same.
 | Docker Engine + Compose v2.20+ | Verified against Compose v5.4.0 |
 | Disk free for Docker | ~20 GB to install a release, 40 GB+ to build from source (~25 GB of images and build cache, plus headroom). Fedora's installer default 15 GB root LV is not enough for either — growing it (`lvextend` + `xfs_growfs`) was required on the test box. App images are extra: the KDE desktop image alone is ~1.2 GB compressed |
 | RAM / CPU | Installing a release is download-bound. Building from source was measured on 8 vCPU / 32 GB; less works, it just takes longer |
-| GPU: AMD/Intel (VA-API) or NVIDIA | Optional in principle (`QUASAR_ENCODER=openh264` encodes in software at reduced quality and throughput), expected in practice. NVIDIA hosts also need the driver plus `nvidia-container-toolkit` with CDI configured (`nvidia-ctk runtime configure`) |
+| GPU: AMD/Intel (VA-API) or NVIDIA | Optional in principle (`QUASAR_ENCODER=openh264` encodes in software at reduced quality and throughput), expected in practice. NVIDIA hosts also need the driver plus `nvidia-container-toolkit` with CDI configured (`nvidia-ctk runtime configure`), and on a host that reboots the ordering fix in [NVIDIA: order the CDI refresh after udev](#nvidia-order-the-cdi-refresh-after-udev) |
 | `/dev/uinput` | Virtual input devices (keyboard, mouse, gamepad injection) |
 | `/dev/kmsg` | Kernel ring buffer, passed read-only with `CAP_SYSLOG`, so an NVIDIA Xid or amdgpu fault reaches the session trace instead of only the host's `dmesg`. Optional: on a kernel without it, drop the device and the capability from the node-agent service and the `xid_visibility` readiness check reports `skip`, which fails nothing |
 | Node.js | **Not** required on the host — the web app builds inside a `node:22` container |
@@ -375,6 +378,59 @@ node-agent image resolves these itself (it ships avahi + nss-mdns and starts a
 resolver-only avahi-daemon at container start), so nothing is needed on the
 host. If ICE ever stalls at "checking", confirm the resolver is up:
 `docker exec <node-agent container> avahi-daemon --check`.
+
+### NVIDIA: order the CDI refresh after udev
+
+On a host that reboots, `nvidia-ctk runtime configure` is not the whole story.
+The CDI spec (`/var/run/cdi/nvidia.yaml`) is regenerated at boot by
+`nvidia-cdi-refresh.service`, and when that runs in the same second the DRM
+nodes appear — before udev has applied their group ownership — it bakes
+`fileMode: 384` (0600) with no gid for `/dev/dri`. Docker then reproduces
+root-only nodes in **every** GPU container: the unprivileged app user cannot
+open them, gamescope fails with `vulkan: physical device has no primary node`
+and the app container exits about 30 s into every session, while the host's own
+`ls -l /dev/dri` still looks correct. Restarting the container does not clear it
+— CDI edits are applied when a container is *created*, so the stale spec is
+reused until it is regenerated (issue #98).
+
+Order the refresh after udev has settled:
+
+```bash
+sudo mkdir -p /etc/systemd/system/nvidia-cdi-refresh.service.d
+sudo tee /etc/systemd/system/nvidia-cdi-refresh.service.d/10-after-udev.conf >/dev/null <<'EOF'
+[Unit]
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+EOF
+sudo systemctl daemon-reload
+```
+
+(On a host without `systemd-udev-settle.service`, a `.path` unit keyed on
+`/dev/dri/renderD128` that starts `nvidia-cdi-refresh.service` does the same
+job.)
+
+A correct spec carries `fileMode: 438` (0666) and a gid for each `/dev/dri`
+entry:
+
+```bash
+grep -B2 -A4 renderD /var/run/cdi/nvidia.yaml
+```
+
+If it baked 384, regenerate it and recreate the containers — a restart is not
+enough:
+
+```bash
+sudo nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml
+docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.nvidia.yml up -d --force-recreate
+```
+
+The node agent detects this state at boot: the `dri_node_app_access` readiness
+check goes red with the same remediation, and the log carries one
+`boot-dri-modes-stale-cdi` line per boot. It deliberately does **not** restart
+itself for it, because a restart cannot fix it. (The neighbouring race — the
+agent starting in the second before `/dev/dri/renderD128` exists — it does fix
+itself: it exits, and the restart policy starts a container that re-enumerates
+the devices, logging `boot-render-node-missing` while it waits.)
 
 ## How TLS works by default
 

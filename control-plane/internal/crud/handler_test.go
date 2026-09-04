@@ -140,6 +140,23 @@ func getReq(t *testing.T, url, bearer string) (*http.Response, map[string]any) {
 	return resp, parsed
 }
 
+// getRawReq is getReq without the map[string]any decode, for tests that must
+// see the literal JSON (e.g. `"next_cursor":null` vs an omitted/empty key).
+func getRawReq(t *testing.T, url, bearer string) (*http.Response, []byte) {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	return resp, raw
+}
+
 func TestAppsCRUD(t *testing.T) {
 	pool := testDB(t)
 	srv, authSvc := newTestServer(t, pool)
@@ -681,4 +698,70 @@ func TestPublicAppReadOmitsResourceDefaults(t *testing.T) {
 	if adminListedApp["default_encode_slots"] != float64(2) {
 		t.Fatalf("admin list apps: default_encode_slots missing/wrong: %v", adminListedApp)
 	}
+}
+
+// TestNextCursorIsNullOnLastPage guards #99: control-api.md / openapi.yaml
+// require next_cursor to be JSON null (never "") once there is no further
+// page — a strict client that treats "" as "keep paging" re-requests the
+// same page forever.
+func TestNextCursorIsNullOnLastPage(t *testing.T) {
+	pool := testDB(t)
+	srv, authSvc := newTestServer(t, pool)
+	ctx := context.Background()
+
+	user, err := authSvc.Register(ctx, "admin@test.local", "admin", "quasar-fixture-pw-99")
+	if err != nil {
+		t.Fatalf("register admin: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE users SET role = 'admin' WHERE id::text = $1`, user.ID); err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+	tok, err := authSvc.Login(ctx, "admin@test.local", "quasar-fixture-pw-99", "")
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+
+	// Two apps and two hosts, so a limit=1 page has a real next page before
+	// the final (cursor-exhausted) one.
+	for _, name := range []string{"cursor-app-1", "cursor-app-2"} {
+		resp, body := post(t, srv.URL+"/v1/apps", map[string]any{
+			"name": name, "description": "d",
+			"default_width": 1280, "default_height": 720, "default_fps": 30,
+			"default_bitrate_kbps": 5000, "default_vram_mb": 2048, "default_encode_slots": 1,
+		}, tok.Plaintext)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("create app %s: want 201, got %d (%v)", name, resp.StatusCode, body)
+		}
+	}
+	for _, name := range []string{"cursor-host-1", "cursor-host-2"} {
+		if _, err := pool.Exec(ctx, `INSERT INTO hosts (node_name, status) VALUES ($1, $2)`, name, "online"); err != nil {
+			t.Fatalf("insert host %s: %v", name, err)
+		}
+	}
+
+	check := func(path string) {
+		t.Helper()
+		// Page 1 (limit=1): a second page exists, so next_cursor is a real
+		// opaque string, not null and not "".
+		_, raw := getRawReq(t, srv.URL+path+"?limit=1", tok.Plaintext)
+		var page1 struct {
+			NextCursor *string `json:"next_cursor"`
+		}
+		if err := json.Unmarshal(raw, &page1); err != nil {
+			t.Fatalf("%s page1 decode: %v (%s)", path, err, raw)
+		}
+		if page1.NextCursor == nil || *page1.NextCursor == "" {
+			t.Fatalf("%s page1: want non-empty next_cursor, got %v (body %s)", path, page1.NextCursor, raw)
+		}
+
+		// Final page: next_cursor must be the JSON literal null, never "".
+		_, raw = getRawReq(t, srv.URL+path+"?limit=1&cursor="+*page1.NextCursor, tok.Plaintext)
+		if !bytes.Contains(raw, []byte(`"next_cursor":null`)) {
+			t.Fatalf("%s last page: want literal next_cursor:null, got %s", path, raw)
+		}
+	}
+
+	check("/v1/apps")
+	check("/v1/admin/apps")
+	check("/v1/hosts")
 }

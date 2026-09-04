@@ -476,6 +476,144 @@ pub fn log_report(checks: &[ReadinessCheck]) -> usize {
     failed
 }
 
+// ── boot-time gate (#98) ─────────────────────────────────────────────────────
+
+/// A boot-time sanity fault, already resolved into a log token and the check's own wording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootFault {
+    /// Grep token for the log line. Distinct per race, so an operator (and `redeploy.sh`)
+    /// can tell "wait for a restart" from "regenerate the CDI spec" without reading prose.
+    pub token: &'static str,
+    pub check: String,
+    pub summary: String,
+    pub remediation: String,
+}
+
+/// What a boot-time readiness report means for the process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootAction {
+    /// No boot fault this process can act on. Includes every GPU-less host.
+    Continue,
+    /// The host has a render node this container cannot see. A device list is fixed at
+    /// container CREATE, so only a fresh start picks it up: exit non-zero and let the
+    /// restart policy do it.
+    ExitForRetry(BootFault),
+    /// A sanity fault no restart can fix. Stay up so the readiness card carries the
+    /// remediation, and name the fix once in the log.
+    Stay(BootFault),
+}
+
+/// One token per condition; `redeploy.sh` classifies deploys by them and the log sites in
+/// `agent.rs` repeat them as literals (the log-convention test wants a literal first field).
+pub const BOOT_RENDER_NODE_TOKEN: &str = "boot-render-node-missing";
+pub const BOOT_RENDER_NODE_DEFERRED_TOKEN: &str = "boot-render-node-retry-deferred";
+pub const BOOT_RENDER_NODE_SPENT_TOKEN: &str = "boot-render-node-retries-spent";
+pub const BOOT_RENDER_NODE_UNOPENABLE_TOKEN: &str = "boot-render-node-unopenable";
+pub const BOOT_DRI_MODES_TOKEN: &str = "boot-dri-modes-stale-cdi";
+pub const BOOT_HOST_RENDER_NODE_TOKEN: &str = "boot-host-render-node-missing";
+
+/// Does this container have a `/dev/dri/renderD*` node at all? The gate's own read: the
+/// `render_node` check FAILs both for "no node here" and "node here but not openable", and
+/// only the first is fixed by a fresh container start. Kept out of `ReadinessCheck` — that
+/// shape is the agent-api contract.
+pub fn container_has_render_node(root: &Path) -> bool {
+    !dir_entries_matching(&root.join("dev/dri"), |n| n.starts_with("renderD")).is_empty()
+}
+
+/// Inputs to [`boot_action`]. All of them, so the decision stays pure and testable with no
+/// devices: the caller reads the world once and this function only decides.
+pub struct BootInputs<'a> {
+    pub checks: &'a [ReadinessCheck],
+    /// Capacity's vendor-neutral answer (`/sys/class/drm` card* with a known vendor id and
+    /// readable VRAM). False ⇒ never exit: a GPU-less host is not broken, it is small.
+    pub gpu_present: bool,
+    /// [`container_has_render_node`]'s answer. True with `render_node` FAIL means the node is
+    /// here and unopenable (mode, group, device cgroup), which a restart reproduces exactly.
+    pub container_has_render_node: bool,
+    /// A driver-volume / CUDA-runtime provision is materialising right now. Exiting would
+    /// kill a hundreds-of-MB download mid-flight, so it defers the retry to the next boot.
+    pub provision_in_flight: bool,
+    /// Consecutive boots that have already exited for this fault. Past
+    /// [`BOOT_EXIT_MAX_ATTEMPTS`] the retry has proven useless, so stop looping and stay
+    /// visible instead.
+    pub prior_exits: u32,
+}
+
+/// Retries before the loop is declared useless. Docker's restart policy backs off on its own;
+/// this bound is what stops a permanently-unfixable fault from hiding the readiness card
+/// behind a container that never stays up.
+pub const BOOT_EXIT_MAX_ATTEMPTS: u32 = 5;
+
+/// The boot decision, pure over an already-taken readiness report.
+///
+/// Exit is reserved for the one fault a fresh container start actually fixes: the host kernel
+/// made a render node (`host_render_node` PASS) and this container has NONE
+/// (`container_has_render_node` false). The other readings of a `render_node` FAIL each get a
+/// `Stay`: a synthetic-capacity dev host, the GSP-firmware case (only a host reboot fixes it),
+/// and a node that is present but unopenable (mode/group/cgroup — a restart reproduces it).
+pub fn boot_action(input: BootInputs<'_>) -> BootAction {
+    fn find<'a>(checks: &'a [ReadinessCheck], id: &str) -> Option<&'a ReadinessCheck> {
+        checks.iter().find(|c| c.id == id)
+    }
+    fn has_status(checks: &[ReadinessCheck], id: &str, status: &str) -> bool {
+        find(checks, id).is_some_and(|c| c.status == status)
+    }
+    fn fault(checks: &[ReadinessCheck], id: &str, token: &'static str) -> Option<BootFault> {
+        find(checks, id).map(|c| BootFault {
+            token,
+            check: c.id.clone(),
+            summary: c.summary.clone(),
+            remediation: c.remediation.clone(),
+        })
+    }
+    let checks = input.checks;
+    if !input.gpu_present {
+        return BootAction::Continue;
+    }
+    // Ordered before the render-node arm: a stale CDI spec reproduces root-only nodes at every
+    // container create, so restarting for it loops forever on the same spec. A delayed re-probe
+    // is no better — the runtime creates these nodes from the spec at container create and no
+    // udev runs in here, so their modes cannot change under a live process.
+    if has_status(checks, "dri_node_app_access", FAIL) {
+        if let Some(f) = fault(checks, "dri_node_app_access", BOOT_DRI_MODES_TOKEN) {
+            return BootAction::Stay(f);
+        }
+    }
+    if has_status(checks, "render_node", FAIL) {
+        if !has_status(checks, "host_render_node", PASS) {
+            // The kernel never made a node. A restart cannot conjure one; the check's own
+            // initramfs/GSP remediation is the fix, and it needs the card to stay up.
+            return fault(checks, "host_render_node", BOOT_HOST_RENDER_NODE_TOKEN)
+                .map(BootAction::Stay)
+                .unwrap_or(BootAction::Continue);
+        }
+        if input.container_has_render_node {
+            // Present but not openable: the device list is fine, the permissions are not, and
+            // a fresh container reproduces both. Its remediation names the mode/cgroup fix.
+            return fault(checks, "render_node", BOOT_RENDER_NODE_UNOPENABLE_TOKEN)
+                .map(BootAction::Stay)
+                .unwrap_or(BootAction::Continue);
+        }
+        let Some(f) = fault(checks, "render_node", BOOT_RENDER_NODE_TOKEN) else {
+            return BootAction::Continue;
+        };
+        if input.provision_in_flight {
+            return BootAction::Stay(BootFault {
+                token: BOOT_RENDER_NODE_DEFERRED_TOKEN,
+                ..f
+            });
+        }
+        if input.prior_exits >= BOOT_EXIT_MAX_ATTEMPTS {
+            return BootAction::Stay(BootFault {
+                token: BOOT_RENDER_NODE_SPENT_TOKEN,
+                ..f
+            });
+        }
+        return BootAction::ExitForRetry(f);
+    }
+    BootAction::Continue
+}
+
 // ── individual checks ────────────────────────────────────────────────────────
 
 fn pass(id: &str, summary: String) -> ReadinessCheck {
@@ -752,6 +890,16 @@ fn check_nvidia_lib32(env: &ProbeEnv, distro: Distro) -> ReadinessCheck {
     )
 }
 
+/// How many DRM render nodes the HOST kernel created. `/sys/class/drm` is the kernel's own
+/// view and needs no extra mount, so it answers independently of what the container runtime
+/// injected into `/dev/dri`.
+fn host_render_node_count(env: &ProbeEnv) -> usize {
+    dir_entries_matching(&env.root.join("sys/class/drm"), |n| {
+        n.starts_with("renderD")
+    })
+    .len()
+}
+
 /// A DRM render node the agent can actually OPEN. Existence is not enough: a passed-through
 /// node whose cgroup or mode denies the open reads identically to "no GPU" inside GStreamer.
 fn check_render_node(env: &ProbeEnv, _distro: Distro) -> ReadinessCheck {
@@ -759,6 +907,24 @@ fn check_render_node(env: &ProbeEnv, _distro: Distro) -> ReadinessCheck {
     let dri = env.root.join("dev/dri");
     let nodes = dir_entries_matching(&dri, |n| n.starts_with("renderD"));
     if nodes.is_empty() {
+        // The host's own view separates "this box has no GPU node" from the #98 boot race
+        // (container created in the second before nvidia_drm made the node). Only the second
+        // one is fixed by a fresh container start, and [`boot_action`] keys on this wording's
+        // check pair, not on the prose.
+        if host_render_node_count(env) > 0 {
+            return fail(
+                ID,
+                "the host kernel HAS a DRM render node but none is visible to the agent — the \
+                 container was created before the device existed, and a device list is fixed \
+                 at container creation, so this process can never pick it up"
+                    .to_string(),
+                "Nothing to do by hand: the agent exits so the container restart policy starts \
+                 a fresh container that re-enumerates /dev/dri. If it repeats every boot, the \
+                 pass-through itself is missing — confirm `devices: [/dev/dri]` (or `gpus: all`) \
+                 on the node-agent service in deploy/docker-compose.yml."
+                    .to_string(),
+            );
+        }
         return fail(
             ID,
             "no DRM render node (/dev/dri/renderD*) is visible to the agent — hardware \
@@ -944,11 +1110,11 @@ fn check_host_render_node(env: &ProbeEnv, distro: Distro) -> ReadinessCheck {
              host kernel created a render node",
         );
     }
-    let nodes = dir_entries_matching(&drm, |n| n.starts_with("renderD"));
-    if !nodes.is_empty() {
+    let count = host_render_node_count(env);
+    if count > 0 {
         return pass(
             ID,
-            format!("host kernel created {} DRM render node(s)", nodes.len()),
+            format!("host kernel created {count} DRM render node(s)"),
         );
     }
     let initramfs = match distro {
@@ -2976,6 +3142,219 @@ mod tests {
             );
         }
         assert_eq!(log_report(&checks), 0);
+    }
+
+    // ── (#98) boot-time gate ────────────────────────────────────────────────
+
+    /// The container was created in the second before `nvidia_drm` made the node: the host
+    /// kernel has one, `/dev/dri` in here does not.
+    fn boot_race_1_root() -> FakeRoot {
+        let root = FakeRoot::new("boot-race-1");
+        root.file("sys/class/drm/renderD128", "")
+            .file("sys/class/drm/card0", "")
+            .file("dev/uinput", "")
+            .file("proc/sys/user/max_user_namespaces", "15000\n");
+        root
+    }
+
+    fn boot_env(root: &FakeRoot) -> ProbeEnv {
+        let mut env = root.env(false, "");
+        env.gpu_present = true;
+        env
+    }
+
+    /// A hand-built report, for the branches whose real-world trigger (a node the process
+    /// cannot open) cannot be staged in a fixture the test user owns.
+    fn boot_check(id: &str, status: &str) -> ReadinessCheck {
+        ReadinessCheck {
+            id: id.to_string(),
+            status: status.to_string(),
+            summary: format!("{id} is {status}"),
+            remediation: format!("fix {id}"),
+        }
+    }
+
+    fn gate_at(root: &FakeRoot, checks: &[ReadinessCheck], gpu_present: bool) -> BootAction {
+        boot_action(BootInputs {
+            checks,
+            gpu_present,
+            container_has_render_node: container_has_render_node(&root.dir),
+            provision_in_flight: false,
+            prior_exits: 0,
+        })
+    }
+
+    #[test]
+    fn boot_gate_exits_for_retry_when_the_host_has_a_render_node_this_container_lacks() {
+        let root = boot_race_1_root();
+        let checks = probe(&boot_env(&root));
+        assert_eq!(get(&checks, "host_render_node").status, PASS);
+        assert_eq!(get(&checks, "render_node").status, FAIL);
+        assert!(!container_has_render_node(&root.dir));
+        match gate_at(&root, &checks, true) {
+            BootAction::ExitForRetry(f) => {
+                assert_eq!(f.token, BOOT_RENDER_NODE_TOKEN);
+                assert_eq!(f.check, "render_node");
+                assert!(
+                    f.summary.contains("fixed at container creation"),
+                    "the card must name the create-time device list: {}",
+                    f.summary
+                );
+            }
+            other => panic!("expected ExitForRetry, got {other:?}"),
+        }
+    }
+
+    /// The permission fault: the node IS in the container, the agent cannot open it. A restart
+    /// re-creates the same node with the same mode, so exiting would burn every retry on a
+    /// message about a device list that is not the problem.
+    #[test]
+    fn boot_gate_stays_when_the_render_node_is_present_but_unopenable() {
+        let checks = [
+            boot_check("render_node", FAIL),
+            boot_check("host_render_node", PASS),
+            boot_check("dri_node_app_access", PASS),
+        ];
+        let action = boot_action(BootInputs {
+            checks: &checks,
+            gpu_present: true,
+            container_has_render_node: true,
+            provision_in_flight: false,
+            prior_exits: 0,
+        });
+        match action {
+            BootAction::Stay(f) => {
+                assert_eq!(f.token, BOOT_RENDER_NODE_UNOPENABLE_TOKEN);
+                assert_eq!(f.check, "render_node");
+                assert_eq!(f.remediation, "fix render_node");
+            }
+            other => panic!("a mode/cgroup fault must never exit, got {other:?}"),
+        }
+    }
+
+    /// Same report, node genuinely absent: the one case a fresh container start fixes.
+    #[test]
+    fn boot_gate_exit_hinges_on_the_container_having_no_node() {
+        let checks = [
+            boot_check("render_node", FAIL),
+            boot_check("host_render_node", PASS),
+        ];
+        let action = boot_action(BootInputs {
+            checks: &checks,
+            gpu_present: true,
+            container_has_render_node: false,
+            provision_in_flight: false,
+            prior_exits: 0,
+        });
+        assert!(matches!(action, BootAction::ExitForRetry(_)), "{action:?}");
+    }
+
+    #[test]
+    fn boot_gate_never_exits_for_stale_cdi_modes_and_names_regeneration() {
+        let root = FakeRoot::new("boot-race-2");
+        // 0600 root-only nodes: what a CDI spec baked before udev applied group ownership
+        // reproduces at every container create.
+        root.file_mode("dev/dri/renderD128", "", 0o600)
+            .file_mode("dev/dri/card0", "", 0o600)
+            .file("sys/class/drm/renderD128", "")
+            .file("dev/uinput", "")
+            .file("proc/sys/user/max_user_namespaces", "15000\n");
+        let checks = probe(&root.env(true, ""));
+        assert_eq!(
+            get(&checks, "render_node").status,
+            PASS,
+            "the node's owner can open 0600"
+        );
+        assert_eq!(get(&checks, "dri_node_app_access").status, FAIL);
+        match gate_at(&root, &checks, true) {
+            BootAction::Stay(f) => {
+                assert_eq!(f.token, BOOT_DRI_MODES_TOKEN);
+                assert!(
+                    f.remediation.contains("nvidia-ctk cdi generate"),
+                    "the CDI fix must be in the remediation: {}",
+                    f.remediation
+                );
+            }
+            other => panic!("expected Stay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn boot_gate_stays_when_the_host_kernel_itself_has_no_render_node() {
+        // GSP-firmware race: a GPU card exists, no render node anywhere. Restarting the
+        // container cannot make one, so it must not loop.
+        let root = FakeRoot::new("boot-no-host-node");
+        root.file("sys/class/drm/card0", "")
+            .file("dev/uinput", "")
+            .file("proc/sys/user/max_user_namespaces", "15000\n");
+        let checks = probe(&boot_env(&root));
+        match gate_at(&root, &checks, true) {
+            BootAction::Stay(f) => assert_eq!(f.token, BOOT_HOST_RENDER_NODE_TOKEN),
+            other => panic!("expected Stay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn boot_gate_continues_on_a_host_with_no_gpu() {
+        let root = FakeRoot::new("boot-nogpu");
+        root.file("dev/uinput", "")
+            .file("proc/sys/user/max_user_namespaces", "15000\n");
+        let checks = probe(&root.env(false, ""));
+        assert_eq!(get(&checks, "render_node").status, FAIL);
+        assert_eq!(gate_at(&root, &checks, false), BootAction::Continue);
+    }
+
+    #[test]
+    fn boot_gate_continues_on_a_healthy_host() {
+        let root = FakeRoot::new("boot-healthy");
+        root.file("dev/dri/renderD128", "")
+            .file("sys/class/drm/renderD128", "")
+            .file("dev/uinput", "")
+            .file("proc/sys/user/max_user_namespaces", "15000\n");
+        let checks = probe(&boot_env(&root));
+        assert_eq!(gate_at(&root, &checks, true), BootAction::Continue);
+    }
+
+    #[test]
+    fn boot_gate_never_exits_while_a_provision_is_in_flight() {
+        let root = boot_race_1_root();
+        let checks = probe(&boot_env(&root));
+        let action = boot_action(BootInputs {
+            checks: &checks,
+            gpu_present: true,
+            container_has_render_node: false,
+            provision_in_flight: true,
+            prior_exits: 0,
+        });
+        match action {
+            // Its own token: a provision is transient and clears on the next boot, unlike a
+            // spent retry budget.
+            BootAction::Stay(f) => assert_eq!(f.token, BOOT_RENDER_NODE_DEFERRED_TOKEN),
+            other => panic!("a provision in flight must never exit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn boot_gate_stops_exiting_once_the_retries_are_spent() {
+        let root = boot_race_1_root();
+        let checks = probe(&boot_env(&root));
+        let at = |prior_exits| {
+            boot_action(BootInputs {
+                checks: &checks,
+                gpu_present: true,
+                container_has_render_node: false,
+                provision_in_flight: false,
+                prior_exits,
+            })
+        };
+        assert!(matches!(
+            at(BOOT_EXIT_MAX_ATTEMPTS - 1),
+            BootAction::ExitForRetry(_)
+        ));
+        match at(BOOT_EXIT_MAX_ATTEMPTS) {
+            BootAction::Stay(f) => assert_eq!(f.token, BOOT_RENDER_NODE_SPENT_TOKEN),
+            other => panic!("expected Stay, got {other:?}"),
+        }
     }
 
     // ── (#483) media reachability / firewall detection ──────────────────────
