@@ -166,9 +166,12 @@ own; the two do not move together, and that is deliberate.
   is now `internal/outbound`, constructed per caller with its own allowlist and timeout
   so the coming GitHub Releases client (#110) gets it by construction. The registry
   resolver and the template-context resolver use it; `QUASAR_IMAGE_REGISTRY_HOSTS`
-  stays the registry's own knob. One visible delta: a registry token body over 1 MiB
+  stays the registry's own knob. Two visible deltas. A registry token body over 1 MiB
   now fails with a named "body too large" error instead of being silently truncated
-  into a JSON parse failure.
+  into a JSON parse failure. And the allowlist is now enforced on every host actually
+  contacted, so a Docker Hub ref needs `docker.io,registry-1.docker.io,auth.docker.io`
+  in `QUASAR_IMAGE_REGISTRY_HOSTS` — an allowlist of `docker.io` alone used to let the
+  manifest request through unchecked and now refuses it (`docs/configuration.md`).
 
 - **The platform container images are named for their role, not their
   implementation.** `quasar-control` → `quasar-control-plane`, `quasar-vulkan` →
