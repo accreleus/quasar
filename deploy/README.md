@@ -66,7 +66,8 @@ Compose refuses to start without them. `QUASAR_SECRET_KEY` is optional but set
 it now: without it, credentials saved through the admin UI cannot be stored.
 
 The two image lines pin the stack to the release. Take the digests from the
-release body.
+release body, or from the release's `platform-release-manifest.json` asset, which
+carries the same two digests in machine-readable form.
 
 ```bash
 umask 077
@@ -956,6 +957,46 @@ bash deploy/redeploy.sh nvidia my-branch control
 
 Neither narrow scope touches the node-agent image or container, so running
 sessions survive.
+
+## Publishing a platform release (maintainers)
+
+Pushing a `vX.Y.Z` tag on `main` publishes the release. There is nothing else to
+do:
+
+```bash
+git checkout main && git pull
+git tag v0.2.0            # the version must already have a CHANGELOG section
+git push origin v0.2.0
+```
+
+That tag push runs `.github/workflows/images.yml`, which builds both images,
+validates them against `deploy/image-contract.json`, runs the release preflight,
+promotes the tag set (`:0.2.0`, and `:latest` for a stable version), then creates
+the GitHub Release with that version's `CHANGELOG.md` section as the body and
+attaches `platform-release-manifest.json` — the machine-readable list of the two
+component images by digest ([schema](../scripts/release/platform-release-manifest.md)).
+
+A **prerelease** tag (`v0.2.0-rc.1`) publishes a GitHub *prerelease*, which the
+`stable` update channel ignores. It needs its own changelog section, under its
+full version.
+
+Before anything builds, a gate refuses a tag that cannot be released, so a
+mistake costs seconds rather than the ~85-minute node-agent build:
+
+| refused | fix |
+|---|---|
+| the tag is not strict semver `vX.Y.Z[-pre]` | re-tag |
+| the tag's commit is not reachable from `main` | merge to `main` (operator sign-off), then tag the merge commit |
+| `CHANGELOG.md` has no section for that version, or it is empty | add `## X.Y.Z — YYYY-MM-DD` with a body on `main`, then re-tag |
+
+Everything else stays manual: a merge to `develop` or `main` publishes nothing.
+To publish from a branch, dispatch the workflow from the Actions tab with the ref
+selector on that branch — it produces `sha-<sha>` and branch tags, never a
+version tag and never a Release.
+
+If a run fails *after* the promote job, the images are published but the Release
+is not. Re-run the failed job (Actions → the run → "Re-run failed jobs"); the
+release job is idempotent.
 
 ## Stopping and cleanup
 

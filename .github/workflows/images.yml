@@ -1,9 +1,16 @@
 name: Images
 
-# Builds and publishes the production container images. Publishing to GHCR is
-# MANUAL ONLY (workflow_dispatch → Actions tab → "Images" → Run workflow) —
-# during rapid development images are built locally on the deploy hosts
-# (deploy/redeploy.sh); nothing is pushed automatically on merge.
+# Builds and publishes the production container images. Two ways in, and only
+# two:
+#
+#   * MANUAL DISPATCH for a branch (workflow_dispatch → Actions tab → "Images" →
+#     Run workflow). Unchanged operator directive: during rapid development
+#     images are built locally on the deploy hosts (deploy/redeploy.sh), and
+#     nothing is pushed automatically on merge — a `develop` merge builds nothing.
+#   * AUTOMATIC on a `v*` TAG PUSH (#104/#108) — the release lever. See the
+#     trigger note above `on:` at the bottom of this header.
+#
+# A push to a BRANCH never triggers this workflow.
 #
 # ── BUILD IS SPLIT FROM PROMOTION (2026-08-31) ────────────────────────────────
 #
@@ -83,11 +90,17 @@ name: Images
 # Versioned release tags — the design, so nobody has to infer it from the tag
 # blocks below (issue #510):
 #
-#   The version comes from the REF THE WORKFLOW IS DISPATCHED ON, not from a
-#   free-text input. Dispatch this workflow with the Actions tab's ref selector
-#   set to the release tag (`v0.1.0`), and each published image additionally
+#   The version comes from THE REF THE WORKFLOW RUNS ON, not from a free-text
+#   input. Push the release tag (`git push origin v0.1.0`), or dispatch with the
+#   Actions tab's ref selector set to it, and each published image additionally
 #   gets a `:X.Y.Z` tag — `docker/metadata-action`'s `type=semver` rule reads
 #   `refs/tags/vX.Y.Z` and strips the `v`.
+#
+#   The tag-push trigger changed nothing here, deliberately: a tag push arrives
+#   as `github.ref = refs/tags/vX.Y.Z`, exactly what a dispatch on that tag
+#   produced, so `type=semver`, `latest=auto`, the `inputs` job's
+#   `release_candidate` detection and therefore strict preflight all engage on a
+#   tag push unchanged. The new `release` job below is additive.
 #
 #   Tag-detect was chosen over an optional `version:` dispatch input on purpose.
 #   An input can be typed while the ref selector still points at `develop`,
@@ -131,11 +144,29 @@ name: Images
 #   for it — so it is not contract-validated. What it does get is a verified
 #   re-tag: see the toolchain job.
 #
-# MANUAL ONLY (operator directive 2026-07-06): the quasar-node-agent lane builds
-# patched GStreamer from source (~85 min cold) and automatic per-push/PR
-# triggers exhausted the account's Actions minutes. Run from the Actions tab.
+# NO BRANCH PUSH TRIGGER (operator directive 2026-07-06): the quasar-node-agent
+# lane builds patched GStreamer from source (~85 min cold) and automatic per-push
+# /PR triggers exhausted the account's Actions minutes. A merge to `develop` or
+# `main` still builds NOTHING; publish from a branch by hand, from the Actions
+# tab. That directive stands.
+#
+# The one automatic trigger is a `v*` TAG PUSH (#104/#108), which is the release
+# lever: pushing `vX.Y.Z` on `main` publishes a stable platform release — images,
+# the version tag set, a GitHub Release whose body is that version's CHANGELOG
+# section, and the `platform-release-manifest.json` asset the control plane reads
+# (scripts/release/platform-release-manifest.md). A prerelease semver tag
+# (`v0.2.0-rc.1`) publishes a GitHub prerelease instead. Tags are pushed by hand,
+# a few times a release, so this costs no ambient Actions minutes.
+#
+# The `release-gate` job below runs FIRST and every other job needs it, so a tag
+# that cannot be published — not reachable from `main`, not strict semver, or
+# with no changelog section — fails in seconds rather than after the ~85 minute
+# agent build.
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
 
 concurrency:
   group: images-${{ github.ref }}
@@ -154,6 +185,129 @@ env:
   REGISTRY_NS: ghcr.io/${{ github.repository }}
 
 jobs:
+  # ── Phase 0: may this ref be released at all? ──────────────────────────────
+  #
+  # Runs on EVERY trigger and every other job needs it (transitively, through
+  # `inputs`), so it is the one place a release is refused. On a non-tag ref it
+  # is a no-op that passes; a manual branch dispatch is unaffected.
+  #
+  # On `refs/tags/v*` it asserts the three things that make a tag publishable,
+  # all of them cheap and all of them BEFORE any build:
+  #
+  #   1. the tag is strict semver (`vX.Y.Z`, optional `-prerelease`),
+  #   2. its commit is reachable from `main` — `main` is production and the only
+  #      branch a release may come from (CLAUDE.md's branching policy),
+  #   3. CHANGELOG.md has a non-empty section for that version, because that
+  #      section IS the release body.
+  #
+  # Failing here costs seconds. The same failure discovered in the `release` job
+  # would cost the ~85 minute node-agent build and would leave images promoted
+  # with no GitHub Release, which is the state this ordering exists to prevent.
+  #
+  # THIS APPLIES TO A MANUAL DISPATCH ON A TAG TOO, which is a deliberate change
+  # in behaviour: dispatching on `vX.Y.Z` used to build and mint `:X.Y.Z` with no
+  # questions asked. A version tag is a release either way — the same images, the
+  # same moving `:latest` — so it should meet the same conditions however the run
+  # started. The consequence a maintainer will notice: a tag on a branch can no
+  # longer be dispatched to publish a version tag. Dispatch on the BRANCH for
+  # that (it publishes `sha-*` and the branch name, never `:X.Y.Z`).
+  release-gate:
+    name: release gate (tags only; no-op on a branch)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      # 'true'/'false' strings — GitHub expressions have no booleans in outputs,
+      # so every consumer compares against the string form.
+      is_release: ${{ steps.gate.outputs.is_release }}
+      version: ${{ steps.gate.outputs.version }}
+      prerelease: ${{ steps.gate.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The gate needs history, not just the tagged tree: `merge-base
+          # --is-ancestor` against origin/main cannot be answered from a shallow
+          # checkout, and a wrong answer here would either refuse a good release
+          # or admit one built off a branch.
+          fetch-depth: 0
+      - name: Gate the ref
+        id: gate
+        env:
+          # Ref names reach the shell through the environment, never through
+          # `${{ }}` inside `run:` — expression substitution is TEXTUAL and a ref
+          # name is attacker-influenceable input in the general case. Same
+          # discipline as the `inputs` and `promote` jobs.
+          GIT_REF: ${{ github.ref }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          case "$GIT_REF" in
+            refs/tags/*) ;;
+            *)
+              echo "is_release=false" >> "$GITHUB_OUTPUT"
+              echo "$GIT_REF is not a release tag; gate is a no-op."
+              exit 0 ;;
+          esac
+
+          tag="${GIT_REF#refs/tags/}"
+          version="${tag#v}"
+          [ "$version" != "$tag" ] || {
+            echo "::error::tag $tag does not start with 'v'; a release tag is vX.Y.Z."
+            exit 1
+          }
+
+          # semver.org 2.0.0 core plus an optional prerelease part. Build
+          # metadata (`+`) is deliberately not accepted: it is not a legal
+          # character in a Docker tag, so `:X.Y.Z` could not carry it.
+          semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?$'
+          if ! printf '%s' "$version" | grep -Eq "$semver"; then
+            echo "::error::tag $tag is not a strict semver release tag. Expected vX.Y.Z with an optional -prerelease part (v0.2.0, v0.2.0-rc.1); build metadata (+) is not allowed."
+            exit 1
+          fi
+
+          prerelease=false
+          case "$version" in *-*) prerelease=true ;; esac
+
+          # `main` is production and the only branch a release may be cut from.
+          # A tag on a feature branch would publish images built from a tree no
+          # one signed off on, under a version that claims otherwise.
+          # Explicit refspec: a tag checkout does not necessarily leave an
+          # `origin/main` remote-tracking ref behind, and comparing against a ref
+          # that does not exist would fail for the wrong reason.
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          if ! git merge-base --is-ancestor "$COMMIT" refs/remotes/origin/main; then
+            echo "::error::the tag's commit $COMMIT is not reachable from main. A release tag must be on main — merge to main first (operator sign-off), then tag the merge commit and push the tag."
+            exit 1
+          fi
+
+          # The release body. Extracted here purely as a gate; the `release` job
+          # extracts it again from its own checkout to write the notes, so the
+          # notes always come from the tagged tree rather than from an artifact
+          # passed between jobs.
+          if ! bash scripts/release/changelog-section.sh "$version" >/dev/null; then
+            echo "::error::CHANGELOG.md has no usable section for $version. Add a '## $version — YYYY-MM-DD' section with a non-empty body on main, then re-tag: the section is published as the release notes. A prerelease tag needs its own section under its full version."
+            exit 1
+          fi
+
+          {
+            echo "is_release=true"
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Release gate"
+            echo ""
+            echo "| check | value |"
+            echo "| --- | --- |"
+            echo "| tag | \`$tag\` |"
+            echo "| version | \`$version\` |"
+            echo "| prerelease | \`$prerelease\` |"
+            echo "| commit on main | yes |"
+            echo "| changelog section | present |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ── Shared build inputs, resolved exactly once ─────────────────────────────
   #
   # QUASAR_BASE_IMAGE (deploy/pins.env) is a MOVING tag. Resolving it here and
@@ -164,6 +318,10 @@ jobs:
   # no longer what the agent image sits on.
   inputs:
     name: resolve shared build inputs
+    # Every other job needs `inputs` (directly or through the toolchain/build
+    # jobs), so making THIS one need `release-gate` is what puts the gate ahead
+    # of the whole graph: nothing builds for a tag that cannot be published.
+    needs: release-gate
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -883,3 +1041,224 @@ jobs:
             echo "\`:X.Y.Z\` on a re-dispatched release tag — re-dispatch to fix that one."
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
+
+  # ── Phase 5: publish the release itself (tag pushes only) ──────────────────
+  #
+  # Promotion put the bytes where a puller can reach them. This job is what makes
+  # the release EXIST for a human and for the control plane: a GitHub Release
+  # whose body is the tag's CHANGELOG section, carrying
+  # `platform-release-manifest.json` (scripts/release/platform-release-manifest.md)
+  # as its only asset. A prerelease semver tag publishes a GitHub prerelease, which
+  # the `stable` channel ignores.
+  #
+  # It runs LAST on purpose. The notes and the manifest are cheap; the images are
+  # not. Publishing a release that names digests which failed validation would be
+  # worse than publishing nothing, so nothing here runs until `promote` succeeded.
+  #
+  # The condition is the GATE's verdict, not "the event was a push", so a manual
+  # dispatch on the tag takes this path too — that is the documented recovery for
+  # a release whose run failed after promotion, and it works because every step
+  # below is idempotent.
+  #
+  # THE HONEST RESIDUAL: a failure in this job leaves the images promoted (`:latest`,
+  # `:X.Y.Z`, `sha-*` all moved) with no GitHub Release to describe them. There is no
+  # rollback for that and there should not be — un-promoting a validated release is
+  # not an improvement. The fix is to RE-RUN this job (Actions → the run → "Re-run
+  # failed jobs"): every step is idempotent by construction. The generator rewrites
+  # the manifest from the same inputs, the digest cross-check re-reads the registry,
+  # `gh release create` is skipped when the release already exists (the body is
+  # edited instead), and the asset upload is `--clobber`.
+  #
+  # `contents: write` is granted here and nowhere else in this workflow — creating a
+  # Release is the only thing in the lane that writes to the repository. `packages:
+  # read` is for the digest cross-check, which reads the registry and never writes
+  # to it: this job cannot move a tag.
+  release:
+    name: publish the GitHub Release
+    needs: [release-gate, inputs, build-control-plane, build-node-agent, promote]
+    if: needs.release-gate.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # No submodules: this job reads CHANGELOG.md, control-plane/migrations/
+        # and scripts/release/, none of which live in `protocol/`. (Strict
+        # preflight, which does need the submodule, already ran and passed.)
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate and validate the platform release manifest
+        id: manifest
+        env:
+          # Every value the manifest carries arrives here from the job that
+          # produced it — the version from the gate's parse of the tag, the
+          # digests from the build jobs, `built_at` from the shared `inputs` job
+          # so it matches the images' own org.quasar.built.at label. Nothing in
+          # the manifest is recomputed or re-resolved.
+          VERSION: ${{ needs.release-gate.outputs.version }}
+          COMMIT: ${{ github.sha }}
+          BUILT_AT: ${{ needs.inputs.outputs.built_at }}
+          CONTROL_DIGEST: ${{ needs.build-control-plane.outputs.digest }}
+          AGENT_DIGEST: ${{ needs.build-node-agent.outputs.digest }}
+        run: |
+          set -euo pipefail
+          manifest="$RUNNER_TEMP/platform-release-manifest.json"
+
+          bash scripts/release/generate-platform-release-manifest.sh \
+            --version "$VERSION" \
+            --source-commit "$COMMIT" \
+            --built-at "$BUILT_AT" \
+            --control-digest "$CONTROL_DIGEST" \
+            --agent-digest "$AGENT_DIGEST" \
+            --registry-ns "$REGISTRY_NS" \
+            --output "$manifest"
+
+          # The generator already validated its own output. Validating again with
+          # the --expect-* flags is a different assertion: it ties the file to
+          # THIS run's tag and THIS run's build digests, so a stale or hand-edited
+          # manifest cannot be uploaded.
+          bash scripts/release/validate-platform-release-manifest.sh "$manifest" \
+            --expect-version "$VERSION" \
+            --expect-control-digest "$CONTROL_DIGEST" \
+            --expect-agent-digest "$AGENT_DIGEST"
+
+          echo "path=$manifest" >> "$GITHUB_OUTPUT"
+          echo "schema_version=$(jq -r .schema_version "$manifest")" >> "$GITHUB_OUTPUT"
+          cat "$manifest"
+
+      - name: Assert the promoted :X.Y.Z tags carry the manifest's digests
+        env:
+          VERSION: ${{ needs.release-gate.outputs.version }}
+          MANIFEST: ${{ steps.manifest.outputs.path }}
+        run: |
+          set -euo pipefail
+
+          # Same content identity the promote job asserts, and set-based for the
+          # same reason: `docker buildx imagetools create --tag X src` WRAPS src in
+          # a freshly written OCI index, so `X`'s own digest can never equal the
+          # digest inside it. What must match is the SET OF PLATFORM MANIFESTS the
+          # reference resolves to, which is what a pull selects from. The full
+          # argument is in the promote job's "WHAT A TAG MUST BE PROVEN TO BE" note;
+          # this is a copy of the function, not a second rule.
+          target_digests() { # target_digests <ref> -> sorted, comma-joined leaf digests
+            local ref="$1" raw out
+            raw="$(docker buildx imagetools inspect --raw "$ref")"
+            out="$(printf '%s' "$raw" | jq -r '
+              if has("manifests") then
+                [ .manifests[]
+                  | select((.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest")
+                  | .digest ] | sort | join(",")
+              else "" end')"
+            if [ -n "$out" ]; then printf '%s' "$out"; return 0; fi
+            if printf '%s' "$raw" | jq -e 'has("manifests")' >/dev/null; then
+              echo "::error::$ref is an index with no platform manifest" >&2
+              return 1
+            fi
+            docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref"
+          }
+
+          # WHY THIS EXISTS. The manifest is the machine-readable claim "version
+          # X.Y.Z is these digests"; the `:X.Y.Z` tag is what a consumer following
+          # the version resolves. If those two ever disagreed, an updater pinning
+          # the manifest's digest and an operator pulling the tag would install
+          # different bytes under one version number. Both come from the same job
+          # outputs today, so this can only fail if something outside this run
+          # moved the tag — which is exactly the case worth refusing to publish.
+          count="$(jq '.components | length' "$MANIFEST")"
+          for i in $(seq 0 $((count - 1))); do
+            name="$(jq -r ".components[$i].name" "$MANIFEST")"
+            image="$(jq -r ".components[$i].image" "$MANIFEST")"
+            digest="$(jq -r ".components[$i].digest" "$MANIFEST")"
+            want="$(target_digests "$image@$digest")"
+            got="$(target_digests "$image:$VERSION")"
+            if [ "$got" != "$want" ]; then
+              echo "::error::$name: $image:$VERSION resolves to [$got], but the manifest names [$want]. The release manifest and the promoted version tag must describe the same bytes."
+              exit 1
+            fi
+            echo "  verified $name: $image:$VERSION == $digest"
+          done
+
+      - name: Extract the release notes from CHANGELOG.md
+        id: notes
+        env:
+          VERSION: ${{ needs.release-gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/release-notes.md"
+          # Re-extracted from this job's own checkout of the tagged tree rather
+          # than passed from the gate: the notes then provably come from the same
+          # commit as the images, which is the whole point of taking them from the
+          # changelog instead of a dispatch input. The gate already proved this
+          # succeeds, so a failure here is a real inconsistency, not a first look.
+          bash scripts/release/changelog-section.sh "$VERSION" > "$notes"
+          echo "path=$notes" >> "$GITHUB_OUTPUT"
+          wc -c < "$notes"
+
+      - name: Create or update the GitHub Release
+        id: publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # `github.ref_name` on a tag push is the tag itself. Through the
+          # environment, like every other ref in this file.
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.release-gate.outputs.prerelease }}
+          NOTES: ${{ steps.notes.outputs.path }}
+          MANIFEST: ${{ steps.manifest.outputs.path }}
+        run: |
+          set -euo pipefail
+
+          # Re-runnable. `gh release create` fails on an existing release, which
+          # would make a retry of a half-finished publish impossible; edit instead.
+          # The prerelease flag is set explicitly in BOTH paths so a re-run cannot
+          # leave a stale one behind.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists — updating its body and flags"
+            gh release edit "$TAG" \
+              --title "$TAG" \
+              --notes-file "$NOTES" \
+              --prerelease="$PRERELEASE"
+          else
+            create=(--verify-tag --title "$TAG" --notes-file "$NOTES")
+            # --verify-tag: refuse to invent a tag. The tag is what triggered this
+            # run; if it is not there, something is very wrong and a new one must
+            # not be created on our way past.
+            if [ "$PRERELEASE" = true ]; then create+=(--prerelease); fi
+            gh release create "$TAG" "${create[@]}"
+          fi
+
+          # --clobber so a re-run replaces the asset instead of failing on it.
+          gh release upload "$TAG" "$MANIFEST" --clobber
+
+          url="$(gh release view "$TAG" --json url --jq .url)"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Record the release on the run
+        if: always()
+        env:
+          VERSION: ${{ needs.release-gate.outputs.version }}
+          PRERELEASE: ${{ needs.release-gate.outputs.prerelease }}
+          CONTROL_DIGEST: ${{ needs.build-control-plane.outputs.digest }}
+          AGENT_DIGEST: ${{ needs.build-node-agent.outputs.digest }}
+          SCHEMA_VERSION: ${{ steps.manifest.outputs.schema_version }}
+          URL: ${{ steps.publish.outputs.url }}
+        run: |
+          set -uo pipefail
+          {
+            echo "### Platform release"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| version | \`$VERSION\` |"
+            echo "| prerelease | \`$PRERELEASE\` |"
+            echo "| schema_version | \`${SCHEMA_VERSION:-?}\` |"
+            echo "| quasar-control-plane | \`$CONTROL_DIGEST\` |"
+            echo "| quasar-node-agent | \`$AGENT_DIGEST\` |"
+            echo "| release | ${URL:-not published} |"
+          } >> "$GITHUB_STEP_SUMMARY"
