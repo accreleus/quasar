@@ -76,7 +76,7 @@ func TestRelayRegisterSignalsDisplacement(t *testing.T) {
 	chA := make(chan []byte, 1)
 	chB := make(chan []byte, 1)
 
-	displacedA := bus.Register("s1", chA)
+	displacedA := bus.Register("s1", chA).Displaced
 	select {
 	case <-displacedA:
 		t.Fatalf("displacedA closed before any reconnect")

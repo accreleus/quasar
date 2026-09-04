@@ -8,10 +8,12 @@
 // WS close codes (per signaling.md P1-D):
 //
 //	4401  token invalid / expired / already consumed
-//	4404  session not found or terminal
+//	4404  session not found or terminal — at attach, and (#93) mid-session the
+//	      moment the session reaches a terminal state
 //	4409  session not yet assigned to a host (retry shortly)
 //	4410  this attachment was taken over by a later attach (#526)
-//	4500  relay to agent unavailable (host offline)
+//	4500  relay to agent unavailable (host offline, or its inbound queue is
+//	      saturated — #93)
 //
 // 4410 is an additive application close code, not a row in signaling.md's
 // frozen table — no shape or meaning changes, and an unaware client lands in
@@ -207,10 +209,28 @@ func (h *Handler) originAllowed(r *http.Request) bool {
 }
 
 func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clientIP string) {
-	wsClose := func(code int, msg string) {
+	// Empty until the token resolves; wsClose closes over it so every close
+	// line names its session (#93 — a close log with no session id cannot be
+	// correlated with a client's report).
+	var sessionID string
+	// Every socket teardown logs at Info with a `reason` naming WHO closed and
+	// WHY. #93 was undiagnosable because the relay's failure exits logged at
+	// Debug (invisible under the default LOG_LEVEL=info) and sent no close
+	// frame, so the client saw only a transport close with no closing handshake.
+	wsClose := func(code int, msg, reason string) {
 		_ = conn.SetWriteDeadline(time.Now().Add(browserWriteTimeout))
 		_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(code, msg))
-		h.log.Info("signal WS closed", "code", code, "reason", msg)
+		h.log.Info("signaling WS closed by control plane",
+			"token", "signal-ws-closed", "reason", reason,
+			"session_id", sessionID, "code", code, "detail", msg)
+	}
+	// closedNoFrame is the other kind of exit: the transport already failed, so
+	// no close frame can reach the client. Logged at the same level, because
+	// telling these two apart from the host side is the whole point.
+	closedNoFrame := func(reason string, err error) {
+		h.log.Info("signaling WS dropped without a close frame",
+			"token", "signal-ws-dropped", "reason", reason,
+			"session_id", sessionID, "err", err)
 	}
 
 	// --- 1. Validate + atomically consume the token ---
@@ -223,7 +243,7 @@ func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clien
 		// credential — count it against the limiter.
 		h.failures.Failure(clientIP)
 		h.notifyAuthSettled(clientIP)
-		wsClose(wsCloseTokenInvalid, "token invalid, expired, or already used")
+		wsClose(wsCloseTokenInvalid, "token invalid, expired, or already used", "token-invalid")
 		return
 	}
 	// Every other outcome means the token was not proven invalid — not
@@ -234,22 +254,23 @@ func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clien
 	h.notifyAuthSettled(clientIP)
 	switch {
 	case errors.Is(err, session.ErrSessionTerminal):
-		wsClose(wsCloseNotFound, "session is terminal")
+		wsClose(wsCloseNotFound, "session is terminal", "terminal-at-attach")
 		return
 	case errors.Is(err, session.ErrSessionNotReady):
-		wsClose(wsCloseNotAssigned, "session not yet assigned to a host")
+		wsClose(wsCloseNotAssigned, "session not yet assigned to a host", "not-assigned")
 		return
 	case err != nil:
 		h.log.Error("consume signaling token", "err", err)
-		wsClose(wsCloseNotFound, "internal error")
+		wsClose(wsCloseNotFound, "internal error", "token-lookup-failed")
 		return
 	}
 
 	if sess.HostID == nil {
-		wsClose(wsCloseNotAssigned, "session has no host")
+		wsClose(wsCloseNotAssigned, "session has no host", "no-host")
 		return
 	}
 	hostID := *sess.HostID
+	sessionID = sess.ID
 	h.log.Info("signaling WS established", "session_id", sess.ID, "host_id", hostID)
 
 	// A healthy established session can be completely quiet on the signaling
@@ -266,7 +287,7 @@ func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clien
 	// --- 2. Register on relay bus; any buffered agent frames are drained on
 	//        register (the offer may already be waiting from pipeline start) ---
 	fromAgent := make(chan []byte, relayBufSize)
-	displaced := h.relay.Register(sess.ID, fromAgent)
+	signals := h.relay.Register(sess.ID, fromAgent)
 	defer h.relay.Unregister(sess.ID, fromAgent)
 
 	// #505: which PCs have an offer outstanding on THIS socket. See
@@ -278,22 +299,29 @@ func (h *Handler) handle(ctx context.Context, conn *websocket.Conn, token, clien
 		return conn.WriteMessage(websocket.TextMessage, frame)
 	}
 
+	// drainAgentFrames writes every frame the bus has already handed us and
+	// returns once the queue is momentarily empty.
+	drainAgentFrames := func() error {
+		for {
+			select {
+			case frame := <-fromAgent:
+				if err := writeToBrowser(frame); err != nil {
+					return err
+				}
+			default:
+				return nil
+			}
+		}
+	}
+
 	// --- 2a. Flush the frames Register just drained, before the browser
 	// reader exists (#505 ordering): this makes "was an offer outstanding when
 	// the browser's first frame arrived?" a fact rather than Go's uniform
 	// select choice between two ready cases — precisely the coin-flip #505 is
 	// about.
-flush:
-	for {
-		select {
-		case frame := <-fromAgent:
-			if err := writeToBrowser(frame); err != nil {
-				h.log.Debug("write buffered frame to browser failed", "session_id", sess.ID, "err", err)
-				return
-			}
-		default:
-			break flush
-		}
+	if err := drainAgentFrames(); err != nil {
+		closedNoFrame("buffered-write-failed", err)
+		return
 	}
 
 	// --- 3. Goroutine: read from browser, validate JSON, forward to agent ---
@@ -338,14 +366,16 @@ flush:
 		case frame := <-fromAgent:
 			// Agent → browser: raw inner Phase 0 JSON (offer/ice/…).
 			if err := writeToBrowser(frame); err != nil {
-				h.log.Debug("write to browser failed", "session_id", sess.ID, "err", err)
+				closedNoFrame("browser-write-failed", err)
 				return
 			}
 		case res := <-browserIn:
 			if res.err != nil {
+				reason := "client-hung-up"
 				if !websocket.IsCloseError(res.err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-					h.log.Debug("browser WS closed", "session_id", sess.ID, "err", res.err)
+					reason = "browser-read-failed"
 				}
+				closedNoFrame(reason, res.err)
 				return
 			}
 			// #505: an ICE restart for a PC whose offer is still outstanding is
@@ -362,19 +392,41 @@ flush:
 			// Browser → agent: wrap in signaling envelope and send.
 			if err := h.registry.SendSignaling(hostID, sess.ID, res.frame); err != nil {
 				if errors.Is(err, agentws.ErrAgentNotConnected) {
-					wsClose(wsCloseRelayUnavail, "agent unavailable")
-				} else {
-					h.log.Warn("relay to agent failed", "session_id", sess.ID, "err", err)
+					wsClose(wsCloseRelayUnavail, "agent unavailable", "agent-not-connected")
+					return
 				}
+				// #93: this exit used to return with no close frame, one frame
+				// after the client's own write — which the client reports as
+				// "connection reset without closing handshake right after the
+				// answer", with that answer silently never reaching the agent.
+				// A saturated agent queue IS signaling.md's 4500 "relay to node
+				// agent unavailable": no new code, no shape change.
+				h.log.Warn("relay to agent failed",
+					"token", "signal-relay-send-failed", "session_id", sess.ID, "err", err)
+				wsClose(wsCloseRelayUnavail, "relay to agent failed", "relay-send-failed")
 				return
 			}
 		case <-ping.C:
 			if err := conn.WriteControl(websocket.PingMessage, nil,
 				time.Now().Add(browserWriteTimeout)); err != nil {
-				h.log.Debug("signaling ping failed", "session_id", sess.ID, "err", err)
+				closedNoFrame("ping-failed", err)
 				return
 			}
-		case <-displaced:
+		case <-signals.Terminal:
+			// #93: the session went terminal, so the bus dropped this
+			// registration and will never deliver another agent frame. Hand
+			// over whatever it already queued — the agent's `bye` is typically
+			// the last frame in flight — then close with the code signaling.md
+			// already defines for a terminal session. Before this the socket
+			// stayed open and deaf, and the client learned of the teardown only
+			// when its own transport died, with no closing handshake.
+			if err := drainAgentFrames(); err != nil {
+				closedNoFrame("browser-write-failed", err)
+				return
+			}
+			wsClose(wsCloseNotFound, "session is terminal", "session-ended")
+			return
+		case <-signals.Displaced:
 			// #415: a later attach owns this session's signaling — this
 			// connection is deaf to agent frames and must tear down now.
 			// #526: close with a code the client can act on; 1000 looked like
@@ -385,9 +437,10 @@ flush:
 			// still-live socket — a different tab — observes this frame.
 			h.log.Info("signaling WS taken over by a later attach",
 				"token", "signal-taken-over", "session_id", sess.ID)
-			wsClose(wsCloseTakenOver, "session attached from another client")
+			wsClose(wsCloseTakenOver, "session attached from another client", "taken-over")
 			return
 		case <-ctx.Done():
+			closedNoFrame("context-cancelled", ctx.Err())
 			return
 		}
 	}
