@@ -3067,7 +3067,10 @@ mod tests {
             },
         };
         let exited = run_boot_gate(&race_1_checks(), true, false, 0, &fx);
-        assert!(!exited, "a provision in flight must never be killed by the exit");
+        assert!(
+            !exited,
+            "a provision in flight must never be killed by the exit"
+        );
         assert_eq!(spy.exits.load(Ordering::SeqCst), 0);
         assert_eq!(spy.sleeps.load(Ordering::SeqCst), 1);
     }
@@ -3122,7 +3125,11 @@ mod tests {
         assert_eq!(spy.sleeps.load(Ordering::SeqCst), 0);
         assert_eq!(spy.exits.load(Ordering::SeqCst), 0);
         assert_eq!(spy.recorded.load(Ordering::SeqCst), 0);
-        assert_eq!(spy.cleared.load(Ordering::SeqCst), 0, "a fault is not a clean boot");
+        assert_eq!(
+            spy.cleared.load(Ordering::SeqCst),
+            0,
+            "a fault is not a clean boot"
+        );
     }
 
     #[test]
