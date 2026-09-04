@@ -1747,7 +1747,7 @@ td.cell-actions > * + * {
 }
 
 /* Coordinates come from ActionsMenu's inline style (button getBoundingClientRect,
-   #101) — .table-wrap's overflow:auto clips an absolute popover past the row. */
+   issue 101) — .table-wrap's overflow:auto clips an absolute popover past the row. */
 .row-menu-pop {
   position: fixed;
   z-index: 120;
