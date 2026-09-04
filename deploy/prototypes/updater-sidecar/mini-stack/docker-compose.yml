@@ -1,0 +1,57 @@
+# PROTOTYPE (#113) — isolated stand-in stack for the updater exercises. Same service NAMES
+# as deploy/docker-compose.yml, no host ports, so it can run beside the real `deploy` project.
+# The control-plane / agent stand-ins are the real control-plane image (Fedora, has curl) with
+# a shell loop as entrypoint: on boot they print any updater results (question 2), then idle.
+services:
+  quasar-control-plane:
+    image: ${QUASAR_CONTROL_IMAGE:?}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "control-plane stand-in boot: image=$$QUASAR_PROTO_IMAGE_LABEL uid=$$(id -u)"
+        ls -la /run/quasar-updater /run/quasar-updater/results 2>&1
+        for f in /run/quasar-updater/results/*.json; do [ -f "$$f" ] && { echo "RESULT $$f:"; cat "$$f"; }; done
+        exec sleep infinity
+    environment:
+      QUASAR_PROTO_IMAGE_LABEL: ${QUASAR_CONTROL_IMAGE}
+    volumes:
+      - quasar-updater-run:/run/quasar-updater
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -S /run/quasar-updater/updater.sock"]
+      interval: 2s
+      timeout: 2s
+      retries: 3
+      start_period: 1s
+  quasar-node-agent:
+    image: ${QUASAR_AGENT_IMAGE:?}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "agent stand-in boot: image=$$QUASAR_PROTO_IMAGE_LABEL uid=$$(id -u)"
+        exec sleep infinity
+    user: "0:0"
+    environment:
+      QUASAR_PROTO_IMAGE_LABEL: ${QUASAR_AGENT_IMAGE}
+    volumes:
+      - quasar-updater-run:/run/quasar-updater
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 2s
+      timeout: 2s
+      retries: 1
+      start_period: 1s
+  quasar-updater:
+    # Finding (P1): under rootless podman on an SELinux-enforcing host the sidecar cannot open
+    # the mounted podman socket without this; docker is unaffected by it.
+    security_opt: ["label=disable"]
+    build: ..
+    image: quasar-updater-prototype:latest
+    environment:
+      UPDATER_ALLOW: ${QUASAR_UPDATER_ALLOW:-ghcr.io/accreleus/quasar/,docker.io/library/}
+      UPDATER_DOCKER_BIN: ${QUASAR_UPDATER_DOCKER_BIN:-docker}
+    volumes:
+      - ${QUASAR_CONTAINER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
+      - ${QUASAR_STACK_DIR:?absolute host path of this mini-stack dir}:${QUASAR_STACK_DIR}
+      - quasar-updater-run:/run/quasar-updater
+volumes:
+  quasar-updater-run:

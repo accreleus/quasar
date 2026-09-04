@@ -1,0 +1,27 @@
+# PROTOTYPE (#113) — overlay that adds the throwaway updater sidecar to the REAL stack.
+#   docker compose -f deploy/docker-compose.yml [-f deploy/docker-compose.nvidia.yml] \
+#     -f deploy/prototypes/updater-sidecar/docker-compose.updater-prototype.yml up -d quasar-updater
+# QUASAR_STACK_DIR must be the ABSOLUTE host path of the compose working dir (deploy/), mounted
+# at the same path so the config_files paths in our own compose labels resolve inside the sidecar.
+services:
+  quasar-updater:
+    # Finding (P1): under rootless podman on an SELinux-enforcing host the sidecar cannot open
+    # the mounted podman socket without this; docker is unaffected by it.
+    security_opt: ["label=disable"]
+    build: .
+    image: quasar-updater-prototype:latest
+    environment:
+      UPDATER_ALLOW: ${QUASAR_UPDATER_ALLOW:-ghcr.io/accreleus/quasar/}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${QUASAR_STACK_DIR:?set QUASAR_STACK_DIR to the absolute host path of deploy/}:${QUASAR_STACK_DIR}
+      - quasar-updater-run:/run/quasar-updater
+    restart: unless-stopped
+  quasar-control-plane:
+    volumes:
+      - quasar-updater-run:/run/quasar-updater
+  quasar-node-agent:
+    volumes:
+      - quasar-updater-run:/run/quasar-updater
+volumes:
+  quasar-updater-run:
