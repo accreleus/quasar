@@ -68,12 +68,17 @@ pub enum CodecProbe {
 /// full rich-rule parsing, neither of which is cheap or reliable.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum FirewallPosture {
-    /// No detection tool answered. The COMMON case on a stock image (none of
-    /// firewalld/nft/iptables is baked in), so "no signal" must never render as a warning.
+    /// No detection tool answered at all. `nft` IS in the image, so this means the probe could
+    /// not run it (missing CAP_NET_ADMIN, a non-container build); "no signal" must never render
+    /// as a warning.
     #[default]
     Unknown,
     /// A tool answered with a permissive (default-accept) posture.
     Open,
+    /// A tool answered and found NO inbound filtering at all — no input-filtering chain exists
+    /// on this host (#103). Distinct from `Open` (a chain exists, its policy is accept) and from
+    /// `Unknown` (nothing answered): it is a positive finding for the media path.
+    Unfiltered { tool: FirewallTool, detail: String },
     /// A tool answered with a default-deny/input-filtering posture. `tool` is which one
     /// answered; [`firewall_remediation`] keys its command block on it, never on distro.
     /// `media_allow` is that SAME tool's reading of its own accept rules — a default-deny
@@ -1194,10 +1199,10 @@ const ENCODER_CODECS_REMEDIATION: &str =
 // healthy while ICE UDP and mDNS (5353/udp, the fallback for Chrome's `.local` candidates) are
 // dropped; the only symptom is `WebRTC transport never established` ~2 min into a session.
 //
-// Detection is best-effort, not a reachability test: no firewalld/nft/iptables client is baked
-// into the stock image, so these degrade to `Unknown` (no finding, never a failure). A tool
-// that does run sees the HOST's real rules — netfilter state follows the network namespace, so
-// no bind mount is needed.
+// Detection is best-effort, not a reachability test: it degrades to `Unknown` (no finding,
+// never a failure) when no client tool answers. `nft` is baked into the image and sees the
+// HOST's real rules — netfilter state follows the network namespace, so no bind mount is
+// needed, only CAP_NET_ADMIN.
 //
 // Severity is `warn`, never `fail`: a filtering zone with a correct allow rule is fine and this
 // cannot cheaply tell the two apart.
@@ -1222,8 +1227,15 @@ fn check_media_reachability(env: &ProbeEnv, distro: Distro) -> ReadinessCheck {
         FirewallPosture::Unknown => skip(
             ID,
             "could not determine whether a host firewall would block WebRTC media — no \
-             firewalld/nft/iptables client tool answered from inside the agent container. This \
-             is the common case on a stock Quasar image and is not itself a finding",
+             firewalld/nft/iptables client tool answered from inside the agent container (nft \
+             is in the image and needs CAP_NET_ADMIN, which the compose file grants)",
+        ),
+        FirewallPosture::Unfiltered { detail, .. } => pass(
+            ID,
+            format!(
+                "no host firewall filters inbound traffic ({detail}) — nothing here would block \
+                 WebRTC media"
+            ),
         ),
         FirewallPosture::Open => pass(
             ID,
@@ -1384,14 +1396,24 @@ fn detect_firewall_posture() -> FirewallPosture {
             .map(|target| (target, firewalld_media_allow(&listing, media)))
     });
     let nft = run_with_timeout("nft", &["list", "ruleset"]).and_then(|ruleset| {
-        parse_nft_input_policy(&ruleset).map(|policy| (policy, nft_media_allow(&ruleset, media)))
+        if let Some(policy) = parse_nft_input_policy(&ruleset) {
+            Some(NftSignal::Policy {
+                policy,
+                media_allow: nft_media_allow(&ruleset, media),
+            })
+        } else if !nft_has_input_base_chain(&ruleset) {
+            Some(NftSignal::NoInputChain)
+        } else {
+            // A base chain whose policy word could not be read: no signal, not a finding.
+            None
+        }
     });
     let iptables = iptables_input_listing().and_then(|out| {
         parse_iptables_input_policy(&out).map(|policy| (policy, iptables_media_allow(&out, media)))
     });
     combine_firewall_signals(
         firewalld.as_ref().map(|(t, m)| (t.as_str(), m.clone())),
-        nft.as_ref().map(|(p, m)| (p.as_str(), m.clone())),
+        nft,
         iptables.as_ref().map(|(p, m)| (p.as_str(), m.clone())),
     )
 }
@@ -1494,6 +1516,13 @@ fn parse_nft_input_policy(ruleset: &str) -> Option<String> {
         return Some("reject".to_string());
     }
     declared
+}
+
+/// Does the ruleset declare ANY base chain on the input hook? A ruleset without one filters no
+/// inbound traffic at all — the common shape on a host where only Docker programs netfilter
+/// (nat/forward/raw tables, no input hook) — which is a finding, not a missing signal (#103).
+fn nft_has_input_base_chain(ruleset: &str) -> bool {
+    nft_base_chain_body(ruleset, "hook input").is_some()
 }
 
 /// The declared `policy` word from the chain's `hook input` header line, lowercased.
@@ -1851,11 +1880,25 @@ fn iptables_udp_accepts(output: &str) -> Vec<UdpAccept> {
     out
 }
 
+/// What `nft list ruleset` said. A ruleset with no input hook chain is NOT the same answer as
+/// nft never running: both once collapsed to `None` and rendered as `Unknown` (#103).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NftSignal {
+    Policy {
+        policy: String,
+        media_allow: MediaAllow,
+    },
+    NoInputChain,
+}
+
+/// Detail text for [`NftSignal::NoInputChain`]; reaches the operator inside the check summary.
+const NFT_NO_INPUT_CHAIN_DETAIL: &str = "nft answered: no input hook chain in the ruleset";
+
 /// The pure decision. Trust order: firewalld's zone target, then nft, then iptables INPUT
 /// policy. Takes already-parsed signals so it needs no exec and no filesystem to test.
 fn combine_firewall_signals(
     firewalld: Option<(&str, MediaAllow)>,
-    nft: Option<(&str, MediaAllow)>,
+    nft: Option<NftSignal>,
     iptables: Option<(&str, MediaAllow)>,
 ) -> FirewallPosture {
     if let Some((target, media_allow)) = firewalld {
@@ -1869,16 +1912,31 @@ fn combine_firewall_signals(
             FirewallPosture::Open
         };
     }
-    if let Some((policy, media_allow)) = nft {
-        return if policy_is_filtering(policy) {
-            FirewallPosture::Filtering {
+    let iptables_filtering = matches!(&iptables, Some((policy, _)) if policy_is_filtering(policy));
+    match nft {
+        Some(NftSignal::Policy {
+            policy,
+            media_allow,
+        }) => {
+            return if policy_is_filtering(&policy) {
+                FirewallPosture::Filtering {
+                    tool: FirewallTool::Nftables,
+                    detail: format!("nftables input policy={policy}"),
+                    media_allow,
+                }
+            } else {
+                FirewallPosture::Open
+            };
+        }
+        // Both front-ends program the same netfilter, so a filtering iptables INPUT policy is
+        // the more specific reading of the same host and keeps its usual turn below.
+        Some(NftSignal::NoInputChain) if !iptables_filtering => {
+            return FirewallPosture::Unfiltered {
                 tool: FirewallTool::Nftables,
-                detail: format!("nftables input policy={policy}"),
-                media_allow,
-            }
-        } else {
-            FirewallPosture::Open
-        };
+                detail: NFT_NO_INPUT_CHAIN_DETAIL.to_string(),
+            };
+        }
+        _ => {}
     }
     if let Some((policy, media_allow)) = iptables {
         return if policy_is_filtering(policy) {
@@ -3060,6 +3118,83 @@ mod tests {
         assert_eq!(parse_nft_input_policy(ruleset), Some("drop".to_string()));
     }
 
+    /// What `nft list ruleset` prints on a host with no host firewall of its own: only Docker's
+    /// iptables-nft tables, so a `hook forward` chain with `policy drop` and no input hook.
+    const DOCKER_ONLY_RULESET: &str = r#"# Warning: table ip nat is managed by iptables-nft, do not touch!
+table ip nat {
+	chain DOCKER {
+		iifname "docker0" counter packets 0 bytes 0 return
+	}
+
+	chain POSTROUTING {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname != "docker0" ip saddr 192.0.2.0/24 counter packets 0 bytes 0 masquerade
+	}
+
+	chain PREROUTING {
+		type nat hook prerouting priority dstnat; policy accept;
+		fib daddr type local counter packets 0 bytes 0 jump DOCKER
+	}
+}
+# Warning: table ip filter is managed by iptables-nft, do not touch!
+table ip filter {
+	chain DOCKER {
+	}
+
+	chain DOCKER-ISOLATION-STAGE-1 {
+		counter packets 0 bytes 0 jump DOCKER-ISOLATION-STAGE-2
+	}
+
+	chain DOCKER-ISOLATION-STAGE-2 {
+		counter packets 0 bytes 0 return
+	}
+
+	chain DOCKER-USER {
+	}
+
+	chain FORWARD {
+		type filter hook forward priority filter; policy drop;
+		counter packets 0 bytes 0 jump DOCKER-USER
+		counter packets 0 bytes 0 jump DOCKER-ISOLATION-STAGE-1
+		oifname "docker0" ct state related,established counter packets 0 bytes 0 accept
+		iifname "docker0" oifname != "docker0" counter packets 0 bytes 0 accept
+	}
+}
+# Warning: table ip6 nat is managed by iptables-nft, do not touch!
+table ip6 nat {
+	chain POSTROUTING {
+		type nat hook postrouting priority srcnat; policy accept;
+	}
+}
+# Warning: table ip6 filter is managed by iptables-nft, do not touch!
+table ip6 filter {
+	chain FORWARD {
+		type filter hook forward priority filter; policy drop;
+	}
+}
+# Warning: table ip raw is managed by iptables-nft, do not touch!
+table ip raw {
+	chain PREROUTING {
+		type filter hook prerouting priority raw; policy accept;
+	}
+}
+"#;
+
+    /// A ruleset that answered and filters nothing inbound is a positive finding, not the
+    /// `None` of a tool that never ran (#103).
+    #[test]
+    fn parse_nft_input_policy_docker_only_ruleset_has_no_input_chain() {
+        assert!(
+            !nft_has_input_base_chain(DOCKER_ONLY_RULESET),
+            "Docker programs nat/filter/raw with no input hook — nothing filters inbound"
+        );
+        assert_eq!(
+            parse_nft_input_policy(DOCKER_ONLY_RULESET),
+            None,
+            "a DROP forward policy must not be read as an input policy"
+        );
+    }
+
     #[test]
     fn parse_iptables_input_policy_reads_the_dash_p_line() {
         let out = "-P INPUT DROP\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-A INPUT -i lo -j ACCEPT\n";
@@ -3077,6 +3212,14 @@ mod tests {
         assert!(!policy_is_filtering("accept"));
         assert!(policy_is_filtering("drop"));
         assert!(policy_is_filtering("reject"));
+    }
+
+    /// An nft signal carrying a policy word, with no accept rules read.
+    fn nft_policy(policy: &str) -> NftSignal {
+        NftSignal::Policy {
+            policy: policy.to_string(),
+            media_allow: MediaAllow::Absent,
+        }
     }
 
     /// Trust order: firewalld beats nft beats iptables beats no signal.
@@ -3105,7 +3248,7 @@ mod tests {
 
         // nft fallback used only when firewalld has no answer.
         assert_eq!(
-            combine_firewall_signals(None, Some(("drop", MediaAllow::Absent)), None),
+            combine_firewall_signals(None, Some(nft_policy("drop")), None),
             FirewallPosture::Filtering {
                 tool: FirewallTool::Nftables,
                 detail: "nftables input policy=drop".to_string(),
@@ -3113,7 +3256,7 @@ mod tests {
             }
         );
         assert_eq!(
-            combine_firewall_signals(None, Some(("accept", MediaAllow::Absent)), None),
+            combine_firewall_signals(None, Some(nft_policy("accept")), None),
             FirewallPosture::Open
         );
 
@@ -3135,7 +3278,7 @@ mod tests {
         assert_eq!(
             combine_firewall_signals(
                 Some(("ACCEPT", MediaAllow::Absent)),
-                Some(("drop", MediaAllow::Absent)),
+                Some(nft_policy("drop")),
                 Some(("drop", MediaAllow::Absent)),
             ),
             FirewallPosture::Open
@@ -3144,10 +3287,62 @@ mod tests {
         assert_eq!(
             combine_firewall_signals(
                 None,
-                Some(("accept", MediaAllow::Absent)),
+                Some(nft_policy("accept")),
                 Some(("drop", MediaAllow::Absent)),
             ),
             FirewallPosture::Open
+        );
+    }
+
+    /// "nft answered, this host has no input-filtering chain" is a verdict of its own; only a
+    /// tool that answered with a FILTERING policy outranks it.
+    #[test]
+    fn combine_firewall_signals_nft_no_input_chain_is_unfiltered() {
+        let unfiltered = FirewallPosture::Unfiltered {
+            tool: FirewallTool::Nftables,
+            detail: NFT_NO_INPUT_CHAIN_DETAIL.to_string(),
+        };
+        assert_eq!(
+            combine_firewall_signals(None, Some(NftSignal::NoInputChain), None),
+            unfiltered
+        );
+
+        assert_eq!(
+            combine_firewall_signals(
+                Some(("default", MediaAllow::Absent)),
+                Some(NftSignal::NoInputChain),
+                None,
+            ),
+            FirewallPosture::Filtering {
+                tool: FirewallTool::Firewalld,
+                detail: "firewalld zone target=default".to_string(),
+                media_allow: MediaAllow::Absent,
+            },
+            "firewalld's zone target still wins the trust order"
+        );
+
+        assert_eq!(
+            combine_firewall_signals(
+                None,
+                Some(NftSignal::NoInputChain),
+                Some(("drop", MediaAllow::Absent)),
+            ),
+            FirewallPosture::Filtering {
+                tool: FirewallTool::Iptables,
+                detail: "iptables INPUT policy=drop".to_string(),
+                media_allow: MediaAllow::Absent,
+            },
+            "both front-ends program the same netfilter: a filtering INPUT policy is the more \
+             specific reading"
+        );
+
+        assert_eq!(
+            combine_firewall_signals(
+                None,
+                Some(NftSignal::NoInputChain),
+                Some(("accept", MediaAllow::Absent)),
+            ),
+            unfiltered
         );
     }
 
@@ -3178,6 +3373,31 @@ mod tests {
         let env = root.env_firewall(FirewallPosture::Unknown);
         let c = check_media_reachability(&env, Distro::Fedora);
         assert_eq!(c.status, SKIP);
+        assert_eq!(
+            c.summary,
+            "could not determine whether a host firewall would block WebRTC media — no \
+             firewalld/nft/iptables client tool answered from inside the agent container (nft \
+             is in the image and needs CAP_NET_ADMIN, which the compose file grants)"
+        );
+        assert!(c.remediation.is_empty());
+    }
+
+    /// A host whose ruleset filters nothing inbound is the best possible answer for the media
+    /// path — a pass, never the "not applicable" bucket a `skip` lands in (#103).
+    #[test]
+    fn check_media_reachability_unfiltered_is_pass_with_the_positive_summary() {
+        let root = FakeRoot::new("firewall-unfiltered");
+        let env = root.env_firewall(FirewallPosture::Unfiltered {
+            tool: FirewallTool::Nftables,
+            detail: NFT_NO_INPUT_CHAIN_DETAIL.to_string(),
+        });
+        let c = check_media_reachability(&env, Distro::Debian);
+        assert_eq!(c.status, PASS);
+        assert_eq!(
+            c.summary,
+            "no host firewall filters inbound traffic (nft answered: no input hook chain in the \
+             ruleset) — nothing here would block WebRTC media"
+        );
         assert!(c.remediation.is_empty());
     }
 
@@ -3654,7 +3874,7 @@ mod tests {
         assert_eq!(
             combine_firewall_signals(
                 Some(("default", covered.clone())),
-                Some(("reject", MediaAllow::Absent)),
+                Some(nft_policy("reject")),
                 None,
             ),
             FirewallPosture::Filtering {
