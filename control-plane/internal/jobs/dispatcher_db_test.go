@@ -788,3 +788,132 @@ func TestEnvKillSwitchSchedulesNothing(t *testing.T) {
 		t.Fatalf("the env kill switch still scheduled a run: found=%v err=%v", found, err)
 	}
 }
+
+// --- the event trigger's pull-forward (#92) --------------------------------
+//
+// The nudge from a user delete enqueued `home.gc`, coalesced onto the pending
+// row the 6h schedule had already dated two hours out, and then waited for it:
+// the identity was gone, its homes were tombstoned, and the reap the event
+// exists to bring forward did not happen. These three cover the whole rule —
+// pull a future run forward, leave a due one alone, never touch a running one.
+
+func runRowCount(t *testing.T, pool *pgxpool.Pool, jobID string) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM job_runs WHERE job_id = $1`, jobID).Scan(&n); err != nil {
+		t.Fatalf("count runs: %v", err)
+	}
+	return n
+}
+
+func TestEnqueuePullsAScheduledRunForwardToNow(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	hostID := newHost(t, pool, "host-a-nudge")
+	def := hostDef("home.gc")
+	d, store := newDispatcher(t, pool, NewRegistry(), def)
+
+	queued, m, err := store.Materialize(ctx, MaterializeParams{
+		JobID: "home.gc", HostID: hostID, Trigger: TriggerSchedule,
+		ScheduledFor: time.Now().Add(2 * time.Hour), Attempt: 3,
+	})
+	if err != nil || m != RunCreated {
+		t.Fatalf("seed the scheduled run: m=%v err=%v", m, err)
+	}
+
+	run, err := d.Enqueue(ctx, "home.gc", hostID, nil)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if run.ID != queued.ID {
+		t.Fatalf("the nudge created a second run: %s vs %s", run.ID, queued.ID)
+	}
+	if run.Trigger != TriggerEvent {
+		t.Errorf("trigger = %s, want event", run.Trigger)
+	}
+	if run.Attempt != queued.Attempt {
+		t.Errorf("attempt = %d, want the coalesced run's %d", run.Attempt, queued.Attempt)
+	}
+
+	// The claim GET /v1/agent/jobs/pending makes, on the agent's next poll.
+	claimed, err := store.ClaimDue(ctx, ClaimOptions{
+		Plane: PlaneAgent, HostID: hostID, Now: time.Now(), Limit: agentClaimLimit,
+	})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != queued.ID {
+		t.Fatalf("the nudged run is not claimable now: %+v", claimed)
+	}
+	if n := runRowCount(t, pool, "home.gc"); n != 1 {
+		t.Fatalf("run rows = %d, want 1", n)
+	}
+}
+
+func TestEnqueueLeavesAnAlreadyDueRunAlone(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	hostID := newHost(t, pool, "host-b-nudge")
+	def := hostDef("home.gc")
+	d, store := newDispatcher(t, pool, NewRegistry(), def)
+
+	queued, _, err := store.Materialize(ctx, MaterializeParams{
+		JobID: "home.gc", HostID: hostID, Trigger: TriggerSchedule,
+		ScheduledFor: time.Now().Add(-time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("seed the due run: %v", err)
+	}
+
+	run, err := d.Enqueue(ctx, "home.gc", hostID, nil)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if run.ID != queued.ID {
+		t.Fatalf("the nudge created a second run: %s vs %s", run.ID, queued.ID)
+	}
+	if run.Trigger != TriggerSchedule {
+		t.Errorf("trigger = %s, want the due run's schedule left as it was", run.Trigger)
+	}
+	if !run.ScheduledFor.Equal(queued.ScheduledFor) {
+		t.Errorf("scheduled_for = %s, want the due run's %s", run.ScheduledFor, queued.ScheduledFor)
+	}
+	if n := runRowCount(t, pool, "home.gc"); n != 1 {
+		t.Fatalf("run rows = %d, want 1", n)
+	}
+}
+
+func TestEnqueueDoesNotDisturbARunningRun(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	hostID := newHost(t, pool, "host-c-nudge")
+	def := hostDef("home.gc")
+	d, store := newDispatcher(t, pool, NewRegistry(), def)
+
+	if _, _, err := store.Materialize(ctx, MaterializeParams{
+		JobID: "home.gc", HostID: hostID, Trigger: TriggerSchedule, ScheduledFor: time.Now(),
+	}); err != nil {
+		t.Fatalf("seed the due run: %v", err)
+	}
+	claimed, err := store.ClaimDue(ctx, ClaimOptions{
+		Plane: PlaneAgent, HostID: hostID, Now: time.Now(), Limit: agentClaimLimit,
+	})
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim: %d runs, err=%v", len(claimed), err)
+	}
+
+	run, err := d.Enqueue(ctx, "home.gc", hostID, nil)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if run.ID != claimed[0].ID || run.State != StateRunning {
+		t.Fatalf("run = %s/%s, want the running run %s untouched", run.ID, run.State, claimed[0].ID)
+	}
+	if run.Trigger != TriggerSchedule || !run.ScheduledFor.Equal(claimed[0].ScheduledFor) {
+		t.Errorf("a running run was rewritten: trigger=%s scheduled_for=%s", run.Trigger, run.ScheduledFor)
+	}
+	if n := runRowCount(t, pool, "home.gc"); n != 1 {
+		t.Fatalf("run rows = %d, want 1", n)
+	}
+}

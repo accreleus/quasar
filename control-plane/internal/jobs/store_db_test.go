@@ -256,10 +256,10 @@ func TestPartialUniqueIndexIsPerTarget(t *testing.T) {
 	b := newHost(t, pool, "host-b")
 
 	for _, h := range []string{a, b} {
-		if _, created, err := s.Materialize(ctx, MaterializeParams{
+		if _, m, err := s.Materialize(ctx, MaterializeParams{
 			JobID: "home.gc", HostID: h, Trigger: TriggerSchedule, ScheduledFor: time.Now(),
-		}); err != nil || !created {
-			t.Fatalf("materialize for %s: created=%v err=%v", h, created, err)
+		}); err != nil || m != RunCreated {
+			t.Fatalf("materialize for %s: m=%v err=%v", h, m, err)
 		}
 	}
 }
@@ -269,20 +269,20 @@ func TestMaterializeReturnsTheOpenRunRatherThanDuplicating(t *testing.T) {
 	ctx := context.Background()
 	s := seed(t, pool, intervalDef("a.one"))
 
-	first, created, err := s.Materialize(ctx, MaterializeParams{
+	first, m, err := s.Materialize(ctx, MaterializeParams{
 		JobID: "a.one", Trigger: TriggerSchedule, ScheduledFor: time.Now(),
 	})
-	if err != nil || !created {
-		t.Fatalf("first: created=%v err=%v", created, err)
+	if err != nil || m != RunCreated {
+		t.Fatalf("first: m=%v err=%v", m, err)
 	}
-	second, created, err := s.Materialize(ctx, MaterializeParams{
+	second, m, err := s.Materialize(ctx, MaterializeParams{
 		JobID: "a.one", Trigger: TriggerSchedule, ScheduledFor: time.Now(),
 	})
 	if err != nil {
 		t.Fatalf("second: %v", err)
 	}
-	if created || second.ID != first.ID {
-		t.Fatalf("a second run row was created: %s vs %s (created=%v)", second.ID, first.ID, created)
+	if m != RunCoalesced || second.ID != first.ID {
+		t.Fatalf("a second run row was created: %s vs %s (m=%v)", second.ID, first.ID, m)
 	}
 }
 
@@ -301,14 +301,14 @@ func TestManualTriggerPullsAPendingRunForward(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	pulled, created, err := s.Materialize(ctx, MaterializeParams{
+	pulled, m, err := s.Materialize(ctx, MaterializeParams{
 		JobID: "a.one", Trigger: TriggerManual, ScheduledFor: now,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if created || pulled.ID != queued.ID {
-		t.Fatalf("manual trigger created a second row: %+v", pulled)
+	if m != RunPulledForward || pulled.ID != queued.ID {
+		t.Fatalf("manual trigger created a second row: m=%v %+v", m, pulled)
 	}
 	if pulled.Trigger != TriggerManual {
 		t.Fatalf("trigger not re-stamped: %s", pulled.Trigger)
