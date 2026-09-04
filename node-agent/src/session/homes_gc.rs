@@ -26,7 +26,8 @@
 //!   2. nothing under it is mounted by a live container (docker mount sources +
 //!      `/proc/mounts`), and
 //!   3. its last-use age (the newest mtime in the top two levels) exceeds the
-//!      retention window.
+//!      retention window — OR it is EMPTY and older than [`EMPTY_HOME_MIN_AGE`],
+//!      since retention protects data and an empty home has none (#92).
 //!
 //! Never: `templates`, a non-matching name, anything outside the root, or the
 //! root itself. A sweep must never fail the agent — every error is logged and
@@ -56,6 +57,13 @@ pub const DEFAULT_RETENTION_HOURS: u64 = 72;
 
 /// How often the background sweep runs after the startup pass.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// An EMPTY throwaway home is collectable this old whatever the retention window
+/// says: retention protects data, and there is none (#92). The floor covers the
+/// provisioner's gap between creating `<root>/<user>` and creating the app
+/// directory under it — a sweep landing in that gap must not delete a home a
+/// session is about to fill.
+pub const EMPTY_HOME_MIN_AGE: Duration = Duration::from_secs(3600);
 
 /// Directory names under the home root that must never be considered, whatever
 /// else is true (`is_throwaway_name` already rejects them; belt and braces).
@@ -151,6 +159,8 @@ pub struct SweepReport {
     pub skipped_live: usize,
     /// Candidates skipped because they are younger than the retention window.
     pub skipped_young: usize,
+    /// Of `deleted`, how many were collected early because they were empty.
+    pub deleted_empty: usize,
     /// Interrupted removals from a previous sweep that were purged.
     pub trash_purged: usize,
     /// Per-entry failures (each logged at warn).
@@ -237,9 +247,13 @@ pub fn sweep(cfg: &HomesGcSettings, runtime: &ContainerRuntime) -> SweepReport {
         }
 
         let age = last_use_age(&path, now);
-        if age < cfg.retention {
+        let empty = is_empty_dir(&path);
+        if !reclaimable(age, cfg.retention, empty) {
             rep.skipped_young += 1;
             continue;
+        }
+        if empty && age < cfg.retention {
+            rep.deleted_empty += 1;
         }
 
         let bytes = home::dir_bytes(&path);
@@ -278,14 +292,15 @@ pub fn sweep(cfg: &HomesGcSettings, runtime: &ContainerRuntime) -> SweepReport {
     }
 
     info!(
-        "homes-gc: sweep{} of {} — scanned {}, candidates {}, deleted {} ({:.1} MiB), \
-         live {}, too-young {}, purged {}, errors {}",
+        "homes-gc: sweep{} of {} — scanned {}, candidates {}, deleted {} ({:.1} MiB, \
+         {} empty), live {}, too-young {}, purged {}, errors {}",
         if cfg.dry_run { " (DRY RUN)" } else { "" },
         cfg.root.display(),
         rep.scanned,
         rep.candidates,
         rep.deleted,
         rep.bytes as f64 / (1024.0 * 1024.0),
+        rep.deleted_empty,
         rep.skipped_live,
         rep.skipped_young,
         rep.trash_purged,
@@ -355,6 +370,21 @@ pub fn is_throwaway_name(name: &str) -> bool {
         && b.len() == 8
         && a.bytes().all(|c| c.is_ascii_hexdigit())
         && b.bytes().all(|c| c.is_ascii_hexdigit())
+}
+
+/// May a candidate of this age be collected? Retention protects DATA; an empty
+/// home has none, so it waits out only [`EMPTY_HOME_MIN_AGE`] (#92). Pure, so
+/// the rule is testable without backdating a directory's mtime.
+pub fn reclaimable(age: Duration, retention: Duration, empty: bool) -> bool {
+    age >= retention || (empty && age >= EMPTY_HOME_MIN_AGE)
+}
+
+/// Has this home nothing left in it? An unreadable directory is NOT empty — the
+/// sweep must not delete what it cannot inspect.
+pub fn is_empty_dir(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|mut rd| rd.next().is_none())
+        .unwrap_or(false)
 }
 
 /// Is `dir` — or anything under it — one of the mount sources currently in use?
@@ -723,6 +753,78 @@ mod tests {
                 PathBuf::from("/run/quasar-agent"),
             ]
         );
+    }
+
+    /// #92: retention protects data. An empty throwaway home has none, so it
+    /// waits out only the anti-race floor.
+    #[test]
+    fn an_empty_home_is_collectable_before_the_retention_window() {
+        let retention = Duration::from_secs(72 * 3600);
+        // Not empty: only retention lets it go.
+        assert!(!reclaimable(Duration::from_secs(2 * 3600), retention, false));
+        assert!(reclaimable(retention, retention, false));
+        // Empty: past the floor is enough, below it is not.
+        assert!(reclaimable(EMPTY_HOME_MIN_AGE, retention, true));
+        assert!(reclaimable(
+            EMPTY_HOME_MIN_AGE + Duration::from_secs(1),
+            retention,
+            true
+        ));
+        assert!(
+            !reclaimable(EMPTY_HOME_MIN_AGE - Duration::from_secs(1), retention, true),
+            "a just-created home must survive the provisioner race"
+        );
+    }
+
+    #[test]
+    fn emptiness_is_read_from_the_directory_and_unreadable_is_not_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("agent-0bdc5920-fc5182ea");
+        fs::create_dir_all(&empty).unwrap();
+        assert!(is_empty_dir(&empty));
+
+        let full = tmp.path().join("agent-13d96fa5-8dff9894");
+        fs::create_dir_all(full.join("kde-desktop")).unwrap();
+        assert!(!is_empty_dir(&full));
+
+        // Absent (hence unreadable) is NOT empty: never delete what cannot be
+        // inspected.
+        assert!(!is_empty_dir(&tmp.path().join("agent-2b4851f0-1aea19c5")));
+    }
+
+    /// The whole rule through `sweep`: an emptied throwaway home backdated past
+    /// the floor goes even though retention is 72 h, while a populated one of
+    /// the same age stays.
+    #[test]
+    fn sweep_collects_an_aged_empty_home_inside_the_retention_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("var/lib/quasar/homes");
+        fs::create_dir_all(&root).unwrap();
+
+        let emptied = root.join("agent-0bdc5920-fc5182ea");
+        fs::create_dir_all(&emptied).unwrap();
+        let populated = root.join("agent-13d96fa5-8dff9894");
+        fs::create_dir_all(populated.join("kde-desktop")).unwrap();
+        fs::write(populated.join("kde-desktop/state"), b"payload").unwrap();
+
+        let old = SystemTime::now() - Duration::from_secs(4 * 3600);
+        let times = std::fs::FileTimes::new().set_accessed(old).set_modified(old);
+        for p in [&emptied, &populated, &populated.join("kde-desktop")] {
+            std::fs::File::open(p).unwrap().set_times(times).unwrap();
+        }
+
+        let cfg = HomesGcSettings {
+            root,
+            retention: Duration::from_secs(72 * 3600),
+            dry_run: false,
+        };
+        let rep = sweep(&cfg, &ContainerRuntime::from_env());
+        assert!(!emptied.exists(), "an aged empty home must be collected");
+        assert!(populated.exists(), "a home holding data must wait out retention");
+        assert_eq!(rep.deleted, 1);
+        assert_eq!(rep.deleted_empty, 1);
+        assert_eq!(rep.skipped_young, 1);
+        assert_eq!(rep.errors, 0);
     }
 
     #[test]
