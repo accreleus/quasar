@@ -325,7 +325,7 @@ pub fn locate_host_path(docker: &str) -> (Option<PathBuf>, Option<String>) {
 
 /// Our own container id, from `/proc/self/mountinfo` with `$HOSTNAME` as fallback. Both
 /// best-effort; a miss costs only app-container injection, never the agent's own use.
-fn self_container_id() -> Option<String> {
+pub fn self_container_id() -> Option<String> {
     if let Ok(body) = std::fs::read_to_string("/proc/self/mountinfo") {
         if let Some(id) = parse_container_id_from_mountinfo(&body) {
             return Some(id);
@@ -333,7 +333,14 @@ fn self_container_id() -> Option<String> {
     }
     std::env::var("HOSTNAME")
         .ok()
-        .filter(|h| h.len() >= 12 && h.chars().all(|c| c.is_ascii_hexdigit()))
+        .filter(|h| hostname_is_container_id(h))
+}
+
+/// Whether `$HOSTNAME` may stand in for the container id. A compose stack that
+/// sets `hostname:` makes it a DNS name (`quasar-dev.local`), which docker
+/// answers "No such object" for — so the shape is checked, never assumed.
+pub fn hostname_is_container_id(hostname: &str) -> bool {
+    hostname.len() >= 12 && hostname.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Pull the 64-hex container id out of a mountinfo body.

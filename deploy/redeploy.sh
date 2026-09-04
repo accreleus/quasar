@@ -724,9 +724,20 @@ if [ "$SCOPE" = all ]; then
   # at 1080p60, which is av1-first there). Both halves of that have since
   # changed: the CUDA plugins are in every image, and the one remaining
   # NVIDIA-only piece (libnvrtc) is fetched at run time.
+  # Build identity (#107). Both args do double duty: the org.quasar.source.commit
+  # / org.quasar.built.at labels deploy/image-contract.json asserts, AND the
+  # stamps node-agent/build.rs bakes into the binary and the agent reports on
+  # `register`. Omitting them is not cosmetic — the host then reads as
+  # identity-unknown in the admin console and is never eligible for a
+  # platform-release apply. The build context carries a .git, but the Docker
+  # build does not see it, so build.rs's `git rev-parse` fallback cannot fire
+  # here: these are the only source.
   # shellcheck disable=SC2086 # NA_BUILD_ARGS is a deliberate word-split arg list
   docker build -f deploy/Dockerfile.vulkan --target "$NA_TARGET" $NA_BUILD_ARGS \
-    --build-arg QUASAR_BASE_IMAGE="$BASE" -t "$NA_IMAGE" .
+    --build-arg QUASAR_BASE_IMAGE="$BASE" \
+    --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" \
+    --build-arg BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    -t "$NA_IMAGE" .
 else
   step "[$ENV] 5/7 skip node-agent build (scope=$SCOPE)"
 fi
