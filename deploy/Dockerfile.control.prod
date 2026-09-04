@@ -33,6 +33,10 @@ WORKDIR /web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
 COPY web/ .
+# The ref this tree is at, baked into the bundle for the enroll-host one-liner
+# (#100); build-images.sh passes it, since the build context carries no .git.
+ARG QUASAR_SOURCE_REF=
+ENV QUASAR_SOURCE_REF=$QUASAR_SOURCE_REF
 RUN npm run build
 
 # ── Go build stage ────────────────────────────────────────────────────────────

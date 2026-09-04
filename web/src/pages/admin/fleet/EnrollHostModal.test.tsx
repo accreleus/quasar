@@ -38,59 +38,102 @@ beforeEach(() => {
   } as never);
 });
 
+const REF = "v1.2.3";
+const SCRIPT = "https://raw.githubusercontent.com/accreleus/quasar/v1.2.3/deploy/enroll-host.sh";
+
 describe("EnrollHostModal", () => {
   it("refuses to compose from a plain-http page and never mints", () => {
-    render(<EnrollHostModal open onClose={() => {}} origin="http://cp.example:8080" />);
+    render(<EnrollHostModal open onClose={() => {}} origin="http://cp.example:8080" sourceRef={REF} />);
     expect(screen.getByTestId("enroll-needs-https")).toBeTruthy();
     expect(screen.queryByText("Mint enrollment string")).toBeNull();
     expect(mocked.accessCheck).not.toHaveBeenCalled();
     expect(mocked.mintHostEnrollment).not.toHaveBeenCalled();
   });
 
-  it("shows the served self-signed fingerprint, then mints and composes a pinned string", async () => {
-    render(<EnrollHostModal open onClose={() => {}} origin="https://cp.example:8443" />);
+  it("shows the self-signed fingerprint, then mints and hands over the one-liner for this build's ref", async () => {
+    render(<EnrollHostModal open onClose={() => {}} origin="https://cp.example:8443" sourceRef={REF} />);
     await waitFor(() => expect(screen.getByTestId("enroll-fingerprint").textContent).toBe(FP));
-    expect(screen.getByText("wss://cp.example:8443")).toBeTruthy();
 
     fireEvent.click(screen.getByText("Mint enrollment string"));
-    await waitFor(() => expect(screen.getByTestId("enroll-string")).toBeTruthy());
+    await waitFor(() => expect(screen.getByTestId("enroll-command")).toBeTruthy());
+    const cmd = screen.getByTestId("enroll-command").textContent ?? "";
+    expect(cmd.startsWith(`curl -fsSL ${SCRIPT} | QUASAR_ENROLLMENT='qenr1.${FP}.`)).toBe(true);
+    expect(cmd.endsWith(`.tok.with.dots' QUASAR_REF=${REF} sh`)).toBe(true);
+    expect(cmd).not.toMatch(/ -k| --insecure/);
+    expect(mocked.mintHostEnrollment).toHaveBeenCalledWith("tok", {});
+    // The fingerprint stays on screen next to the command for the eye check.
+    expect(screen.getByTestId("enroll-fingerprint").textContent).toBe(FP);
+  });
+
+  it("keeps the bare enrollment string one click away, behind the command", async () => {
+    render(<EnrollHostModal open onClose={() => {}} origin="https://cp.example:8443" sourceRef={REF} />);
+    await waitFor(() => expect(screen.getByText("Mint enrollment string")).toBeTruthy());
+    fireEvent.click(screen.getByText("Mint enrollment string"));
+    await waitFor(() => expect(screen.getByTestId("enroll-command")).toBeTruthy());
+
+    const summary = screen.getByText("Show the enrollment string");
+    expect(summary.closest("details")?.hasAttribute("open")).toBe(false);
+    fireEvent.click(summary);
     const value = screen.getByTestId("enroll-string").textContent ?? "";
     expect(value.startsWith(`qenr1.${FP}.`)).toBe(true);
     expect(value.endsWith(".tok.with.dots")).toBe(true);
-    expect(mocked.mintHostEnrollment).toHaveBeenCalledWith("tok", {});
   });
 
-  it("emits no pin for a real-CA certificate", async () => {
+  it("says nothing about a fingerprint for a real-CA certificate, and pins nothing in the string", async () => {
     mocked.accessCheck.mockResolvedValue(accessCheck({ self_signed: false }));
-    render(<EnrollHostModal open onClose={() => {}} origin="https://play.example.com" />);
-    await waitFor(() => expect(screen.getByText(/public CA/)).toBeTruthy());
+    render(<EnrollHostModal open onClose={() => {}} origin="https://play.example.com" sourceRef={REF} />);
+    await waitFor(() => expect(screen.getByText("Mint enrollment string")).toBeTruthy());
+    expect(screen.queryByTestId("enroll-fingerprint")).toBeNull();
+    fireEvent.click(screen.getByText("Mint enrollment string"));
+    await waitFor(() => expect(screen.getByTestId("enroll-command")).toBeTruthy());
+    expect(screen.queryByTestId("enroll-fingerprint")).toBeNull();
+    expect(screen.getByTestId("enroll-command").textContent).toContain("QUASAR_ENROLLMENT='qenr1..");
+  });
+
+  it("falls back to the bare string when the build carries no source ref", async () => {
+    render(<EnrollHostModal open onClose={() => {}} origin="https://cp.example:8443" sourceRef="" />);
+    await waitFor(() => expect(screen.getByText("Mint enrollment string")).toBeTruthy());
     fireEvent.click(screen.getByText("Mint enrollment string"));
     await waitFor(() => expect(screen.getByTestId("enroll-string")).toBeTruthy());
-    expect((screen.getByTestId("enroll-string").textContent ?? "").startsWith("qenr1..")).toBe(true);
+    expect(screen.queryByTestId("enroll-command")).toBeNull();
+    expect(screen.getByTestId("enroll-no-installer")).toBeTruthy();
+  });
+
+  it("no longer carries the runtime-contract prose the installer replaced", async () => {
+    render(<EnrollHostModal open onClose={() => {}} origin="https://cp.example:8443" sourceRef={REF} />);
+    await waitFor(() => expect(screen.getByText("Mint enrollment string")).toBeTruthy());
+    fireEvent.click(screen.getByText("Mint enrollment string"));
+    await waitFor(() => expect(screen.getByTestId("enroll-command")).toBeTruthy());
+    const text = screen.getByRole("dialog").textContent ?? "";
+    expect(text).not.toMatch(/operator work|host networking|no supported agent-only package/);
+    expect(screen.getByRole("link", { name: "Add a second GPU host" }).getAttribute("href")).toBe(
+      "https://accreleus.github.io/quasar/install/second-host/",
+    );
   });
 
   it("surfaces a mint failure instead of a half string", async () => {
     mocked.mintHostEnrollment.mockRejectedValue(new Error("boom"));
-    render(<EnrollHostModal open onClose={() => {}} origin="https://cp.example:8443" />);
+    render(<EnrollHostModal open onClose={() => {}} origin="https://cp.example:8443" sourceRef={REF} />);
     await waitFor(() => expect(screen.getByText("Mint enrollment string")).toBeTruthy());
     fireEvent.click(screen.getByText("Mint enrollment string"));
     await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+    expect(screen.queryByTestId("enroll-command")).toBeNull();
     expect(screen.queryByTestId("enroll-string")).toBeNull();
   });
 
   it("forgets the previous host's token on close and re-checks access on reopen", async () => {
     const { rerender } = render(
-      <EnrollHostModal open onClose={() => {}} origin="https://cp.example:8443" />,
+      <EnrollHostModal open onClose={() => {}} origin="https://cp.example:8443" sourceRef={REF} />,
     );
     await waitFor(() => expect(screen.getByTestId("enroll-fingerprint").textContent).toBe(FP));
     fireEvent.click(screen.getByText("Mint enrollment string"));
-    await waitFor(() => expect(screen.getByTestId("enroll-string")).toBeTruthy());
+    await waitFor(() => expect(screen.getByTestId("enroll-command")).toBeTruthy());
     expect(mocked.accessCheck).toHaveBeenCalledTimes(1);
 
-    rerender(<EnrollHostModal open={false} onClose={() => {}} origin="https://cp.example:8443" />);
-    rerender(<EnrollHostModal open onClose={() => {}} origin="https://cp.example:8443" />);
+    rerender(<EnrollHostModal open={false} onClose={() => {}} origin="https://cp.example:8443" sourceRef={REF} />);
+    rerender(<EnrollHostModal open onClose={() => {}} origin="https://cp.example:8443" sourceRef={REF} />);
 
-    expect(screen.queryByTestId("enroll-string")).toBeNull();
+    expect(screen.queryByTestId("enroll-command")).toBeNull();
     await waitFor(() => expect(screen.getByText("Mint enrollment string")).toBeTruthy());
     await waitFor(() => expect(mocked.accessCheck).toHaveBeenCalledTimes(2));
   });

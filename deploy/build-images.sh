@@ -541,6 +541,10 @@ fi
 # die at the undeclared-ARG guard below the moment the `control` role's turn comes
 # up. Attached per-role instead, only when that role's Dockerfile declares them.
 PROVENANCE_ARGS=("SOURCE_COMMIT=$SRC_SHA" "BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+# The SPA bakes in the ref it was built from (web/vite.config.ts) for the
+# enroll-host one-liner (#100): the exact tag when the tree sits on one, else the
+# commit. Declared only by Dockerfile.control.prod, so attached per role below.
+SRC_REF="$(git -C "$BUILD_CONTEXT" describe --tags --exact-match 2>/dev/null || echo "$SRC_SHA")"
 
 # ── Validate every override against the ARGs the Dockerfile actually declares ──
 # A --build-arg for an undeclared ARG is silently ignored by Docker. That is exactly
@@ -776,6 +780,7 @@ for role in "${ROLES[@]}"; do
 
   ROLE_ARGS=("${EXTRA_ARGS[@]:-}")
   [ "$DF_REL" = "deploy/Dockerfile.vulkan" ] && ROLE_ARGS+=("${PROVENANCE_ARGS[@]}")
+  [ "$DF_REL" = "deploy/Dockerfile.control.prod" ] && [ "$SRC_REF" != unknown ] && ROLE_ARGS+=("QUASAR_SOURCE_REF=$SRC_REF")
 
   [ "$DF_REL" = "deploy/Dockerfile.vulkan" ] && { check_pins_agree "$DF_ABS" "$PINS_FILE" || exit 2; }
   [ "$DF_REL" = "deploy/Dockerfile.control.prod" ] && { check_base_arg_agrees "$DF_ABS" || exit 2; }

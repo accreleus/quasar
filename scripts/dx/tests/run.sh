@@ -114,6 +114,29 @@ else
   warn shellcheck "not installed — SKIPPED (install: brew install shellcheck)"
 fi
 
+# The operator-facing installer is POSIX sh (it runs under whatever `sh` a
+# fresh host has), so it is checked as sh, separately from the bash DX layer.
+ENROLL="$ROOT/deploy/enroll-host.sh"
+if ! sh -n "$ENROLL" 2>/dev/null; then
+  fail "sh -n" "deploy/enroll-host.sh has a syntax error"
+elif command -v shellcheck >/dev/null 2>&1; then
+  sc_out="$(shellcheck -s sh -S warning "$ENROLL" 2>&1)"
+  if [ -z "$sc_out" ]; then
+    pass "shellcheck (enroll-host.sh, POSIX sh)" "clean at -S warning"
+  else
+    fail "shellcheck (enroll-host.sh, POSIX sh)" "$(printf '%s' "$sc_out" | head -n 20)"
+  fi
+fi
+
+printf '\n== enroll-host installer (#100) ==\n'
+# Offline contract tests: mock docker + a fake host root. deploy/test-enroll-host.sh
+# is the spec; this only records its verdict.
+if eh_out="$(bash "$ROOT/deploy/test-enroll-host.sh" 2>&1)"; then
+  pass "enroll-host:contract" "$(printf '%s' "$eh_out" | tail -n 1)"
+else
+  fail "enroll-host:contract" "$(printf '%s' "$eh_out" | grep '^FAIL' | head -n 5)"
+fi
+
 printf '\n== guards ==\n'
 
 # Guard tests point resolution at the fixture, never the real operator config

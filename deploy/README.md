@@ -594,20 +594,61 @@ recommended way to reach a Quasar host from outside the house. Quasar runs no
 relay of its own, so the browser offers host candidates only, which is all a
 shared network needs.
 
-### Multi-host: the client may have no route to the host that won
+### Multi-host: add a GPU host with one command
 
-**The agent link is TLS, pinned, and one paste (#12).** A second host joins with the
-enrollment string from Admin → Fleet → Enroll host, set as `QUASAR_ENROLLMENT` in that
-host's `deploy/.env`. It carries the control plane's `wss://` URL, the SHA-256 fingerprint
-of its certificate — first and verbatim, so you can compare it against the control plane's
+**The agent link is TLS, pinned, and one paste (#12); the install is one line (#100).**
+In Admin → Fleet → Enroll host (open the console over `https://`), mint an enrollment
+string. The dialog prints a command of the form
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/accreleus/quasar/<ref>/deploy/enroll-host.sh \
+  | QUASAR_ENROLLMENT='qenr1.…' QUASAR_REF=<ref> sh
+```
+
+Run it on the new machine as root (or a sudo user) with Docker installed. `<ref>` is the
+tag or commit this control plane was built from, so the script and the agent image it
+pins come from the same tree. The script is fetched from GitHub over a real-CA
+certificate — never `curl -k` — while the control plane's own identity comes from the
+fingerprint inside the string, which the agent pins. The string travels as an
+environment variable, not in a URL: it is single-use and expires in an hour, which is
+what makes a shell-history exposure bounded.
+
+The script prints each step. It checks the host the way the agent's readiness does
+(Docker + Compose v2, a DRM render node, `/dev/uinput`, unprivileged user namespaces
+including the Ubuntu 24.04+ AppArmor knob from #76, the NVIDIA Container Toolkit on an
+NVIDIA host), then writes `/opt/quasar-agent/docker-compose.yml` (the node-agent service
+alone, plus the NVIDIA overlay when needed) and a 0600 `/opt/quasar-agent/.env` — the
+only place the string lands — starts the one agent service and waits until it logs
+`enrolled as host`, or names the failure (an expired or used token, a certificate that
+does not match the pin, a container that exited). Re-running it updates that agent in
+place; it never adds a second one. It never edits the firewall: media reachability is
+reported by the host's readiness in Admin → Fleet, with the exact rule.
+
+Inputs it reads: `QUASAR_ENROLLMENT` (required), `QUASAR_REF`, `QUASAR_AGENT_IMAGE`
+(an explicit digest reference, overriding the ref-derived tag), `QUASAR_DIR`
+(default `/opt/quasar-agent`), `NODE_NAME` (default: the hostname), `QUASAR_HOME_ROOT`
+(default `/var/lib/quasar/homes`), `QUASAR_RENDER_NODE`; `QUASAR_ENROLL_DRY_RUN=1`
+prints the plan and touches nothing. Read it first if you like:
+`curl -fsSL <that URL> | less`.
+
+**Manual / air-gapped path.** `sh deploy/enroll-host.sh --print-compose` prints the
+agent-only Compose file and `--print-nvidia-overlay` the NVIDIA overlay; put them in a
+directory with a `.env` that sets `QUASAR_ENROLLMENT` (and `NODE_NAME`,
+`QUASAR_HOME_ROOT`, `QUASAR_AGENT_IMAGE`) and `docker compose up -d`. The base
+`deploy/docker-compose.yml` is not a second-host install: its agent depends on the
+local stack. That printed service and the base file's node-agent service are held
+identical by `TestEnrollHostComposeMatchesBase`.
+
+What the string carries: the control plane's `wss://` URL, the SHA-256 fingerprint of
+its certificate — first and verbatim, so you can compare it against the control plane's
 startup log before you paste — and a per-host enrollment token that is single-use and
-expires in an hour. Both agent clients (the websocket and the node-secret HTTP polls) pin
-that certificate; nothing about the self-signed default needs to change, and no name or IP
-needs adding to it for the agent's sake. After the first connection the pin is saved
-beside the node secret and the string can be removed. A `ws://` URL to another machine is
-refused — the enrollment token and node secret would cross the wire in cleartext — unless
-`QUASAR_ALLOW_PLAINTEXT_AGENT=1` says you own that network end to end. See
-`docs/configuration.md` for the precedence rules and the certificate-rotation path.
+expires in an hour. Both agent clients (the websocket and the node-secret HTTP polls)
+pin that certificate; nothing about the self-signed default needs to change. After the
+first connection the pin is saved beside the node secret and the string can be removed.
+A `ws://` URL to another machine is refused — the enrollment token and node secret
+would cross the wire in cleartext — unless `QUASAR_ALLOW_PLAINTEXT_AGENT=1` says you own
+that network end to end. See `docs/configuration.md` for the precedence rules and the
+certificate-rotation path.
 
 ### Checking which path a session actually took
 

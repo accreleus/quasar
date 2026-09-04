@@ -85,3 +85,35 @@ export function composeEnrollmentString(opts: {
     fingerprint,
   };
 }
+
+/**
+ * The one-line installer (#100). The script is fetched from the GitHub tree at
+ * the ref this build was made from — a real-CA origin, so `curl` verifies it
+ * normally and `-k` never appears — and the enrollment string travels as an
+ * environment variable on the `sh` side, never in the URL (a token in a GET
+ * lands in proxy logs and browser history). The control plane's own identity
+ * still comes from the fingerprint inside the string, which the agent pins.
+ *
+ * The ref is passed twice on purpose: once in the URL (which script) and once
+ * as QUASAR_REF (which agent image tag the script pins), because a script read
+ * from stdin cannot see the URL it came from.
+ */
+export const INSTALLER_RAW_BASE = "https://raw.githubusercontent.com/accreleus/quasar";
+
+/** A tag, branch or commit that is safe both in a URL path and unquoted in a shell word. */
+const SAFE_REF = /^[A-Za-z0-9][A-Za-z0-9._\/-]*$/;
+/** The string's own alphabet: prefix, hex+colons, base64url, and a token. */
+const SAFE_ENROLLMENT = /^qenr1\.[0-9A-F:]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9._~-]+$/;
+
+export function installerScriptUrl(ref: string): string | null {
+  const r = ref.trim();
+  if (!SAFE_REF.test(r)) return null;
+  return `${INSTALLER_RAW_BASE}/${r}/deploy/enroll-host.sh`;
+}
+
+export function composeInstallCommand(opts: { enrollment: string; ref: string }): string | null {
+  const url = installerScriptUrl(opts.ref);
+  if (!url) return null;
+  if (!SAFE_ENROLLMENT.test(opts.enrollment)) return null;
+  return `curl -fsSL ${url} | QUASAR_ENROLLMENT='${opts.enrollment}' QUASAR_REF=${opts.ref.trim()} sh`;
+}

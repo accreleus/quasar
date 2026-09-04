@@ -697,8 +697,12 @@ if [ "$SCOPE" = control ]; then
 else
   step "[$ENV] 4/7 build web SPA ($WEB_IMAGE)"
   # web/dist is a bind mount into the control-plane container (see CLAUDE.md #131).
-  docker run --rm -v "$PWD":/w -w /w/web "$WEB_IMAGE" \
-    sh -c "npm install --no-audit && npm run build"
+  # QUASAR_SOURCE_REF: the container cannot see .git (a worktree's .git is a
+  # file), so the ref the bundle bakes in for the enroll-host one-liner (#100)
+  # is resolved here: the exact tag when on one, else the commit.
+  docker run --rm -v "$PWD":/w -w /w/web \
+    -e QUASAR_SOURCE_REF="$(git describe --tags --exact-match 2>/dev/null || git rev-parse HEAD)" \
+    "$WEB_IMAGE" sh -c "npm install --no-audit && npm run build"
   BUNDLE="$(bundle_on_disk)"
   echo "built web bundle: $BUNDLE"
 fi
