@@ -2650,7 +2650,10 @@ mod tests {
         use container::AppArmorProfileState::*;
 
         // Not an AppArmor host: nothing to load, and no `apparmor=` flag is passed at all.
-        assert_eq!(app_apparmor_check(false, Some(NotLoaded), None).status, SKIP);
+        assert_eq!(
+            app_apparmor_check(false, Some(NotLoaded), None).status,
+            SKIP
+        );
 
         let loaded = app_apparmor_check(true, Some(Loaded), None);
         assert_eq!(loaded.status, PASS);
