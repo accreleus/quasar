@@ -831,15 +831,18 @@ $DC up -d --wait --wait-timeout 120 quasar-postgres
 # 300s: a virgin database runs the full migration chain on first boot.
 $DC up -d --force-recreate --no-deps --wait --wait-timeout 300 quasar-control-plane
 if [ "$SCOPE" = all ]; then
+  # THE UPDATER GOES UP BEFORE THE AGENT. The agent discovers updater presence
+  # once, at boot, by looking for the `quasar-updater` service in its own compose
+  # project (buildinfo.rs); started after it, the agent registers
+  # updater_present=false and stays that way until something recreates it. No
+  # --wait: the updater declares no healthcheck, so compose would only wait for
+  # `running`, which step 7/7's socket probe asserts far more usefully.
+  $DC up -d --force-recreate --no-deps quasar-updater
   # Recreate the node-agent from the freshly-built, self-contained Vulkan image.
   # `up -d` can return while a dependency-health wait has left the recreated
   # agent in Docker's Created state (observed repeatedly on Tower). `--wait`
   # makes the deployment contract require the new agent to be running/healthy.
   $DC up -d --force-recreate --no-deps --wait --wait-timeout 60 quasar-node-agent
-  # No --wait: the updater declares no healthcheck, and compose's --wait on a
-  # health-less service only waits for `running`, which the probe below asserts
-  # far more usefully.
-  $DC up -d --force-recreate --no-deps quasar-updater
 fi
 
 # ---------------------------------------------------------------------------
