@@ -531,7 +531,11 @@
 /* The badge rides the Chip primitive; this only makes the reading monospace,
    which is the house treatment for a metric. */
 .trace-clock-badge {
-  font-family: var(--font-mono);
+  /* .chip uppercases, which turns the unit into "±1.0MS". A reading is a
+     metric, not a label. */
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: var(--t-xs);
 }
 
 /* Also used inline in the verdict block, where "clock: unmeasured" is a caveat

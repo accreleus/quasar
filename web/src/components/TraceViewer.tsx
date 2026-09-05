@@ -40,8 +40,15 @@ function fmtSeconds(ms: number): string {
 
 // ── Event marker color by type ─────────────────────────────────────────────────
 
+// The loud events — the ones an operator is looking for when a session misbehaves.
+// Any other type still renders as a marker in OTHER_EVENT_COLOR and is accounted
+// for by a single "other event" legend entry, because the type vocabulary is
+// open-ended and a legend that silently omits half the markers on the chart is
+// worse than one that buckets them.
 const EVENT_COLORS: Record<string, string> = {
   "abr.retarget": "var(--warning)",
+  "encoder.stall": "var(--danger)",
+  "client.freeze_detected": "var(--danger-text)",
   // ABR resolution ladder (T6): distinct color so a rung step reads apart from
   // a plain bitrate retarget. No allow-list exists here — any event type not
   // in this map still renders as a marker (eventColor's fallback below), so
@@ -52,8 +59,10 @@ const EVENT_COLORS: Record<string, string> = {
   "webrtc.state_changed": "var(--text-3)",
 };
 
+const OTHER_EVENT_COLOR = "var(--text-4)";
+
 function eventColor(type: string): string {
-  return EVENT_COLORS[type] ?? "var(--text-4)";
+  return EVENT_COLORS[type] ?? OTHER_EVENT_COLOR;
 }
 
 // ── Lane definitions ───────────────────────────────────────────────────────────
@@ -78,8 +87,12 @@ const LANES: LaneDef[] = [
   {
     label: "Encoder",
     series: [
-      { key: "encoder.fps",       color: "var(--accent)",   label: "fps" },
-      { key: "encoder.encode_ms", color: "var(--lavender)", label: "encode ms" },
+      { key: "encoder.fps",       color: "var(--accent)",  label: "fps" },
+      // Amber, not the console's usual lavender for encode time: inside ONE lane
+      // the two series have to be told apart at a glance, and amber is also the
+      // hue of this lane's encoder-saturation band — which encode_ms is what
+      // detects.
+      { key: "encoder.encode_ms", color: "var(--warning)", label: "encode ms" },
     ],
     highlightKey: "encoder_saturation",
     highlightColor: "var(--warning-bg)",
@@ -202,17 +215,19 @@ const LaneSvg = memo(function LaneSvg({
 
       let d = "";
       if (s.area) {
-        // Count-like series (packets lost) draw as ticks from the baseline. A
-        // series that is flat at zero draws NOTHING — zero-height ticks used to
-        // render as a row of dots that read as a rendering artifact.
+        // Count-like series (packets lost) fill from the baseline. Drawing one
+        // isolated tick per sample — what this did before #124 — spaces them
+        // ~17px apart at any real width, so a low-but-nonzero count rendered as
+        // a row of dots that read as a rendering artifact rather than as data.
+        // A series flat at zero draws nothing at all.
+        const base = (LANE_PAD.top + innerH).toFixed(1);
         d =
           max > 0
-            ? pts
-                .map((p) => {
-                  const cx = toSvgX(p.ts_unix_ms).toFixed(1);
-                  return `M${cx},${(LANE_PAD.top + innerH).toFixed(1)} L${cx},${toY(p.v).toFixed(1)}`;
-                })
-                .join(" ")
+            ? `M${toSvgX(pts[0].ts_unix_ms).toFixed(1)},${base} ` +
+              pts
+                .map((p) => `L${toSvgX(p.ts_unix_ms).toFixed(1)},${toY(p.v).toFixed(1)}`)
+                .join(" ") +
+              ` L${toSvgX(pts[pts.length - 1].ts_unix_ms).toFixed(1)},${base} Z`
             : "";
       } else {
         d = pts
@@ -349,12 +364,12 @@ const LaneSvg = memo(function LaneSvg({
               key={r.key}
               data-series={r.key}
               d={r.d}
-              fill="none"
+              fill={r.isArea ? r.color : "none"}
+              fillOpacity={r.isArea ? 0.28 : undefined}
               stroke={r.color}
-              strokeWidth={r.isArea ? 2 : 1.5}
+              strokeWidth={r.isArea ? 1 : 1.5}
               strokeLinejoin="round"
               strokeLinecap="round"
-              opacity={r.isArea ? 0.75 : 1}
             />
           ) : null,
         )}
@@ -688,12 +703,15 @@ function VerdictPanel({ classifier }: { classifier: DiagnosticBundle["classifier
 // ── Legend ─────────────────────────────────────────────────────────────────────
 
 function TraceLegend({ events }: { events: TraceEvent[] }) {
-  const types = useMemo(
-    () => [...new Set(events.map((e) => e.type))].filter((t) => t in EVENT_COLORS),
-    [events],
-  );
+  const { types, hasOther } = useMemo(() => {
+    const present = [...new Set(events.map((e) => e.type))];
+    return {
+      types: present.filter((t) => t in EVENT_COLORS),
+      hasOther: present.some((t) => !(t in EVENT_COLORS)),
+    };
+  }, [events]);
 
-  if (types.length === 0) return null;
+  if (types.length === 0 && !hasOther) return null;
 
   return (
     <div className="trace-legend">
@@ -712,6 +730,19 @@ function TraceLegend({ events }: { events: TraceEvent[] }) {
           <span>{t}</span>
         </span>
       ))}
+      {hasOther && (
+        <span className="trace-legend-item" title="lifecycle and negotiation events — hover a lane to name the one under the cursor">
+          <svg width={16} height={10} aria-hidden="true">
+            <line
+              x1={0} y1={5} x2={16} y2={5}
+              stroke={OTHER_EVENT_COLOR}
+              strokeWidth={1.5}
+              strokeDasharray="3 3"
+            />
+          </svg>
+          <span>other event</span>
+        </span>
+      )}
     </div>
   );
 }
