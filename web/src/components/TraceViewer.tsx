@@ -203,10 +203,6 @@ const LaneSvg = memo(function LaneSvg({
   );
 
   const rendered = useMemo<SeriesRender[]>(() => {
-    // A series stops mattering as a line once it is this far short of the
-    // domain — below that it is just the sampling cadence, not a gap.
-    const endThreshold = xMax - xRange * 0.02;
-
     return laneDef.series.flatMap((s) => {
       const pts = [...(series[s.key] ?? [])].sort((a, b) => a.ts_unix_ms - b.ts_unix_ms);
       if (pts.length === 0) return [];
@@ -235,6 +231,14 @@ const LaneSvg = memo(function LaneSvg({
               pts[pts.length - 1].ts_unix_ms,
             ).toFixed(1)},${base} Z`
           : "";
+
+      // "This series stopped" has to be judged against the series' OWN cadence:
+      // a client sampling once a second is always ~1 s behind the domain end,
+      // and a flat 2%-of-range threshold would cap every live series on the
+      // chart. Three missed samples is a stop; one is the cadence.
+      const gaps = pts.slice(1).map((p, i) => p.ts_unix_ms - pts[i].ts_unix_ms).sort((a, b) => a - b);
+      const medianGap = gaps.length > 0 ? gaps[Math.floor(gaps.length / 2)] : 0;
+      const endThreshold = xMax - Math.max(xRange * 0.02, medianGap * 3);
 
       const last = pts[pts.length - 1];
       const end =
