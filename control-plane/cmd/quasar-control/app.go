@@ -834,7 +834,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		}
 		releaseDetector = platform.NewDetector(
 			platform.NewGitHubSource(releaseClient, platform.ConfiguredReleaseAPI(), releaseRepo,
-				os.Getenv("QUASAR_PLATFORM_RELEASE_TOKEN")),
+				os.Getenv("QUASAR_PLATFORM_RELEASE_TOKEN"), platform.ReleaseAssetHosts()),
 			platformStore, log)
 
 		// The edge channel reads the images themselves, so it needs the registry
