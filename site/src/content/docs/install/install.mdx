@@ -16,17 +16,16 @@ published images, which is about 20 GB.
 
 <Steps>
 
-1. **Make a directory and the two paths Quasar writes to.**
+1. **Make a stack directory and a home root.**
 
    ```bash
    mkdir -p quasar/deploy && cd quasar
    sudo install -d -m 0755 -o 1000 -g 1000 /var/lib/quasar/homes
-   sudo install -d -m 0755 -o 1000 -g 1000 /var/lib/quasar/control
    ```
 
-   Both paths are owned by uid 1000 because that is the user inside the
-   containers. The first holds save data, the second holds the certificate and
-   the artwork cache.
+   Choose the home owner for your host (Unraid commonly uses 99:100).
+   Control-plane certificates and artwork use a Docker-managed volume with
+   the image's ownership, so no control-state directory needs manual preparation.
 
    The `deploy/` subdirectory is not cosmetic. Every other page here writes
    `deploy/docker-compose.yml` and `deploy/.env`, so matching that layout keeps
@@ -49,7 +48,7 @@ published images, which is about 20 GB.
 
    # The two paths you created in step 1.
    QUASAR_HOME_ROOT=/var/lib/quasar/homes
-   QUASAR_STATE_DIR=/var/lib/quasar/control
+   QUASAR_TEMPLATE_ROOT=/var/lib/quasar/templates
 
    # This deploy/ directory, as an absolute path on this machine. Print it
    # with `cd deploy && pwd`. The updater service needs it.
@@ -60,25 +59,26 @@ published images, which is about 20 GB.
    QUASAR_TLS_HOSTS=192.168.1.50,quasar.lan
    ```
 
-4. **On NVIDIA only**, add this second file as `deploy/docker-compose.nvidia.yml`.
+4. **On NVIDIA, use this complete file instead of the file in step 2.**
 
-   <Code code={nvidiaFiles.nvidia} lang="yaml" />
+   <Code code={nvidiaFiles.compose} lang="yaml" />
 
-5. **Start it.**
+   GPU access and driver provisioning are already included. There is only one
+   Compose file to use for subsequent commands.
+
+5. **Select published images and start it.**
+
+   Set `QUASAR_CONTROL_IMAGE` and `QUASAR_AGENT_IMAGE` to the digest references
+   in your chosen GitHub release's `platform-release-manifest.json`. Set
+   `QUASAR_UPDATER_IMAGE` to the updater image published for that release.
+   Do not assume that a `latest` tag exists. These values are required before
+   Compose starts any service. A prerelease is for testing, not the default install.
 
    ```bash
+   docker compose -f deploy/docker-compose.yml config --quiet
+   docker compose -f deploy/docker-compose.yml pull
    docker compose -f deploy/docker-compose.yml up -d
    ```
-
-   On NVIDIA:
-
-   ```bash
-   docker compose -f deploy/docker-compose.yml \
-                  -f deploy/docker-compose.nvidia.yml up -d
-   ```
-
-   Keep using the same `-f` list for every later command. Compose merges only
-   the files you name.
 
 6. **Check it came up.**
 

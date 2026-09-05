@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { load } from 'js-yaml';
 
-import { DEFAULTS, generate, agentImage, encoder, homePath, statePath, appUser } from './stack-template.js';
+import { DEFAULTS, generate, homePath, statePath, appUser } from './stack-template.js';
 import { PROXIES, proxyConfig } from './proxy-configs.js';
 import { PLATFORMS } from './platforms.js';
 
@@ -25,50 +26,43 @@ const full = (over = {}) => ({
 test('compose keeps Compose interpolation literal', () => {
   const { compose } = generate(DEFAULTS);
   assert.ok(compose.includes('${POSTGRES_PASSWORD:?'), 'compose must keep ${POSTGRES_PASSWORD:?}');
-  assert.ok(compose.includes('${QUASAR_HOME_ROOT:?'), 'compose must keep ${QUASAR_HOME_ROOT:?}');
+  assert.ok(compose.includes('${QUASAR_HOME_ROOT:'), 'compose must keep the home-root override');
 });
 
-test('env carries openssl calls, not literal secrets', () => {
-  const { env } = generate(DEFAULTS);
-  assert.ok(env.includes('$(openssl rand -hex 24)'), 'POSTGRES_PASSWORD is generated on the host');
-  assert.ok(env.includes('$(openssl rand -hex 32)'), 'ENROLLMENT_TOKEN is generated on the host');
-  assert.ok(env.includes('$(openssl rand -base64 32)'), 'QUASAR_SECRET_KEY is generated on the host');
+test('copied env has blank credentials and instructions, never executable values', () => {
+  const { env, script } = generate(DEFAULTS);
+  for (const key of ['POSTGRES_PASSWORD', 'ENROLLMENT_TOKEN', 'QUASAR_SECRET_KEY']) {
+    assert.ok(env.split('\n').includes(`${key}=`));
+  }
+  assert.match(env, /paste each OUTPUT/);
+  assert.ok(!env.includes('$('));
+  assert.ok(script.includes("<<'ENV'"));
+  assert.ok(script.includes('if [ ! -e deploy/.env ]; then'));
+  assert.ok(script.includes('postgres=$(openssl rand -hex 24)'));
 });
 
-test('script quotes the compose heredoc and leaves the env heredoc unquoted', () => {
-  const { script } = generate(DEFAULTS);
-  assert.ok(script.includes("<<'COMPOSE'"), 'compose heredoc must be quoted so ${...} survives');
-  assert.ok(script.includes('<<ENV'), 'env heredoc must be unquoted so $(openssl ...) runs');
-  assert.ok(!script.includes("<<'ENV'"), 'a quoted env heredoc writes literal $(openssl ...) into .env');
-});
-
-// --- branch coverage ------------------------------------------------------
-
-test('nvidia is the only gpu that gets an overlay', () => {
+test('one complete compose includes NVIDIA wiring only when selected', () => {
   for (const gpu of GPUS) {
-    const { nvidia, script } = generate(full({ gpu }));
-    if (gpu === 'nvidia') {
-      assert.ok(nvidia?.includes('gpus: all'), 'nvidia needs the overlay');
-      assert.ok(script.includes('docker-compose.nvidia.yml'), 'nvidia must write and use the overlay');
-    } else {
-      assert.equal(nvidia, null, `${gpu} must not get an nvidia overlay`);
-      assert.ok(!script.includes('nvidia'), `${gpu} script must not mention nvidia`);
-    }
+    const result = generate(full({ gpu }));
+    const doc = load(result.compose);
+    assert.equal(result.nvidia, null);
+    assert.equal(doc.services['quasar-node-agent'].gpus, gpu === 'nvidia' ? 'all' : undefined);
+    assert.ok(!result.script.includes('docker-compose.nvidia.yml'));
+    assert.ok(doc.services['quasar-control-plane'].volumes.includes('quasar-updater-run:/run/quasar-updater'));
+    assert.ok(doc.services['quasar-control-plane'].volumes.includes('quasar-control-tls:/var/lib/quasar-control'));
+    assert.equal(doc.services['quasar-node-agent'].environment.QUASAR_APP_SHM_SIZE, '${QUASAR_APP_SHM_SIZE:-1g}');
   }
 });
 
-test('Vulkan is the encoder on every gpu the wizard offers', () => {
-  assert.equal(encoder(), 'vulkan');
-  for (const gpu of GPUS) {
-    assert.match(generate(full({ gpu })).env, /QUASAR_ENCODER=vulkan/, `${gpu} must use vulkan`);
+test('image choices are explicit and the GPU encoder is detected by the agent', () => {
+  const { compose, env } = generate(full());
+  assert.match(compose, /QUASAR_CONTROL_IMAGE:\?/);
+  assert.match(compose, /QUASAR_AGENT_IMAGE:\?/);
+  assert.match(env, /QUASAR_ENCODER=\n/);
+  const cp = load(compose).services['quasar-control-plane'].environment;
+  for (const key of ['QUASAR_PLATFORM_RELEASE_REPO', 'QUASAR_PLATFORM_RELEASE_API', 'QUASAR_PLATFORM_RELEASE_ASSET_HOSTS', 'QUASAR_PLATFORM_RELEASE_TOKEN', 'QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL', 'QUASAR_PLATFORM_REGISTRY', 'QUASAR_IMAGE_REGISTRY_HOSTS']) {
+    assert.equal(cp[key], '${' + key + ':-}', `${key} must retain its .env override`);
   }
-});
-
-// One universal agent image: the GPU answer selects the compose overlay, never
-// the image. A per-vendor lineage here would hand the user a 404.
-test('agent image is the same for every gpu', () => {
-  assert.match(agentImage('nvidia'), /quasar-node-agent:latest$/);
-  assert.equal(agentImage('nvidia'), agentImage('amd-intel'));
 });
 
 test('only the proxy branch emits a proxy config', () => {
@@ -90,12 +84,15 @@ test('the proxy branch sets the public URL and the origin allow-list', () => {
   assert.match(env, /QUASAR_ALLOWED_ORIGINS=https:\/\/quasar\.example\.com/);
 });
 
-test('the own-cert branch mounts the directory and names both files', () => {
-  const { env, compose } = generate(full({ access: 'own-cert' }));
-  assert.match(env, /QUASAR_TLS_CERT_DIR=\/etc\/ssl\/quasar/);
-  assert.match(env, /QUASAR_TLS_CERT=\/etc\/quasar\/tls\/cert\.pem/);
-  assert.match(env, /QUASAR_TLS_KEY=\/etc\/quasar\/tls\/key\.pem/);
-  assert.ok(compose.includes('/etc/quasar/tls:ro'), 'own-cert needs the read-only mount');
+test('own certificate and key can come from different directories', () => {
+  const { compose } = generate(full({ access: 'own-cert', keyPath: '/private/key.pem' }));
+  const cp = load(compose).services['quasar-control-plane'];
+  assert.equal(cp.environment.QUASAR_TLS_CERT, '/etc/quasar/tls/cert.pem');
+  assert.equal(cp.environment.QUASAR_TLS_KEY, '/etc/quasar/tls/key.pem');
+  assert.deepEqual(cp.volumes.filter(v => typeof v === 'object').map(v => [v.source, v.target, v.read_only, v.bind.create_host_path]), [
+    ['${QUASAR_TLS_CERT:?}', '/etc/quasar/tls/cert.pem', true, false],
+    ['${QUASAR_TLS_KEY:?}', '/etc/quasar/tls/key.pem', true, false],
+  ]);
 });
 
 // --- paths and ownership --------------------------------------------------
@@ -118,23 +115,18 @@ test('save ownership drives PUID/PGID and the chown, never the control plane', (
   assert.ok(script.includes('-o 4242 -g 4243'), 'the home root is chowned to the chosen owner');
   // The control plane image runs as 1000 and owns its files as 1000, so its
   // state directory is chowned to 1000 whatever the user picked for saves.
-  assert.ok(script.includes('-o 1000 -g 1000'), 'the state dir stays 1000');
+  assert.ok(!script.includes('-o 1000 -g 1000'), 'control state uses the image-owned named volume');
 });
 
 // --- the destructive step -------------------------------------------------
 
-test('the docker restart prompts before running', () => {
-  const { script } = generate(full({ gpu: 'nvidia' }));
-  const restart = script.indexOf('systemctl restart docker');
-  assert.ok(restart > -1, 'nvidia needs the restart');
-  assert.ok(script.slice(0, restart).includes('read -r'), 'the restart must sit behind a prompt');
-});
-
-test('a non-NVIDIA host never restarts docker', () => {
-  assert.ok(
-    !generate(full({ gpu: 'amd-intel' })).script.includes('restart docker'),
-    'only the NVIDIA branch touches the docker daemon'
-  );
+test('installer checks runtime but never restarts the shared Docker daemon', () => {
+  for (const gpu of GPUS) {
+    const { script } = generate(full({ gpu }));
+    assert.ok(!script.includes('restart docker'));
+    assert.ok(!script.includes('runtime configure'));
+    if (gpu === 'nvidia') assert.match(script, /NVIDIA Container Toolkit/);
+  }
 });
 
 // --- platform differences -------------------------------------------------
@@ -151,7 +143,7 @@ test('unraid persists through the boot script, not /etc', () => {
 
 test('unraid is not systemd and is already root', () => {
   const { script } = generate(full({ platform: 'unraid', gpu: 'nvidia' }));
-  assert.match(script, /\/etc\/rc\.d\/rc\.docker restart/, 'unraid restarts docker through rc.d');
+  assert.ok(!script.includes('rc.d/rc.docker restart'));
   assert.ok(!script.includes('systemctl'), 'systemctl does not exist on unraid');
   assert.ok(!script.includes('sudo '), 'the unraid shell is already root');
 });
@@ -160,7 +152,7 @@ test('systemd platforms use the drop-in and systemctl', () => {
   for (const id of ['fedora', 'debian', 'arch', 'other']) {
     const { script } = generate(full({ platform: id, gpu: 'nvidia' }));
     assert.match(script, /\/etc\/sysctl\.d\/99-quasar\.conf/, `${id}: sysctl drop-in`);
-    assert.match(script, /systemctl restart docker/, `${id}: systemctl restart`);
+    assert.ok(!script.includes('systemctl restart docker'));
     assert.ok(!script.includes('/boot/config/go'), `${id}: no unraid boot script`);
   }
 });
@@ -201,12 +193,18 @@ test('every proxy config meets the documented requirements', () => {
 // The generated compose is the operator's copy of deploy/docker-compose.yml.
 // Anything the shipped file passes to the agent has to be here too, or the site
 // hands out a stack that quietly lacks it (#83).
-test('the agent can read the kernel ring buffer for GPU faults', () => {
+test('optional kernel diagnostics include both device and capability', () => {
   for (const gpu of GPUS) {
-    const { compose } = generate(full({ gpu }));
+    const { compose } = generate(full({ gpu, kernelLogs: true }));
     assert.match(compose, /- \/dev\/kmsg:\/dev\/kmsg:r\b/, `${gpu}: /dev/kmsg must be passed read-only`);
-    assert.match(compose, /cap_add: \[NET_ADMIN, SYSLOG\]/, `${gpu}: reading kmsg needs CAP_SYSLOG under dmesg_restrict=1`);
+    assert.ok(load(compose).services['quasar-node-agent'].cap_add.includes('SYSLOG'));
   }
+});
+
+test('a clean install does not require optional kernel log devices', () => {
+  const doc = load(generate(full({ gpu: 'nvidia' })).compose);
+  assert.ok(!doc.services['quasar-node-agent'].devices.some(device => String(device).startsWith('/dev/kmsg')));
+  assert.ok(!doc.services['quasar-node-agent'].cap_add.includes('SYSLOG'));
 });
 
 test('the path-based proxies name both websocket routes', () => {
@@ -219,5 +217,109 @@ test('the path-based proxies name both websocket routes', () => {
     assert.match(body, /v1\/signal/, `${id}: must route /v1/signal`);
     assert.match(body, /agent\/ws/, `${id}: must route /agent/ws`);
     assert.match(body, /proxy_buffering off/, `${id}: must turn buffering off`);
+  }
+});
+
+test('generated install scripts parse for every platform and access mode', async () => {
+  const { spawnSync } = await import('node:child_process');
+  for (const platform of Object.keys(PLATFORMS)) {
+    for (const gpu of GPUS) {
+      for (const access of ACCESS) {
+        const script = generate(full({ platform, gpu, access })).script;
+        const result = spawnSync('bash', ['-n'], { input: script, encoding: 'utf8' });
+        assert.equal(result.status, 0, `${platform}/${gpu}/${access}: ${result.stderr}`);
+      }
+    }
+  }
+});
+
+test('Docker Compose parses all GPU/certificate combinations', async (t) => {
+  const { spawnSync } = await import('node:child_process');
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  if (spawnSync('docker', ['compose', 'version']).status !== 0) return t.skip('Docker Compose unavailable');
+  const dir = mkdtempSync(join(tmpdir(), 'quasar-compose-test-'));
+  try {
+    for (const gpu of GPUS) {
+      for (const access of ACCESS) {
+        const result = generate(full({ gpu, access }));
+        writeFileSync(join(dir, 'compose.yml'), result.compose);
+        writeFileSync(join(dir, '.env'), result.env + '\nQUASAR_STACK_DIR=/tmp/quasar-compose-fixture\nPOSTGRES_PASSWORD=test-only\nENROLLMENT_TOKEN=test-only\nQUASAR_SECRET_KEY=test-only\nQUASAR_CONTROL_IMAGE=example/control:test\nQUASAR_AGENT_IMAGE=example/agent:test\nQUASAR_UPDATER_IMAGE=example/updater:test\n');
+        const parsed = spawnSync('docker', ['compose', '-f', join(dir, 'compose.yml'), '--env-file', join(dir, '.env'), 'config', '--quiet'], { encoding: 'utf8' });
+        assert.equal(parsed.status, 0, `${gpu}/${access}: ${parsed.stderr}`);
+      }
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('omitted advanced knobs have service-specific override files', () => {
+  const doc = load(generate().compose);
+  assert.deepEqual(doc.services['quasar-node-agent'].env_file, [{ path: 'agent.env', required: false }]);
+  assert.deepEqual(doc.services['quasar-control-plane'].env_file, [{ path: 'control.env', required: false }]);
+  assert.ok(!('QUASAR_SECRET_KEY' in doc.services['quasar-node-agent'].environment));
+});
+
+test('installer creates private credentials once and preserves them on rerun', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const { mkdtempSync, mkdirSync, readFileSync, statSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'quasar-credentials-test-'));
+  try {
+    mkdirSync(join(dir, 'deploy'));
+    const { script } = generate(full());
+    const start = script.indexOf('echo "==> Environment file"');
+    const end = script.indexOf('\ndocker compose ', start);
+    const envStep = script.slice(start, end);
+    const run = () => spawnSync('bash', ['-eu', '-c', envStep], {
+      cwd: dir, encoding: 'utf8',
+      env: { ...process.env, control_image: 'control:test', agent_image: 'agent:test', updater_image: 'updater:test' },
+    });
+    assert.equal(run().status, 0);
+    const path = join(dir, 'deploy', '.env');
+    const original = readFileSync(path, 'utf8');
+    const keys = original.split('\n').filter(line => /^[A-Z_]+=/.test(line)).map(line => line.split('=')[0]);
+    assert.equal(new Set(keys).size, keys.length, 'image pins must be unique so self-update can replace them unambiguously');
+    assert.match(original, /^POSTGRES_PASSWORD=[a-f0-9]{48}$/m);
+    assert.match(original, /^ENROLLMENT_TOKEN=[a-f0-9]{64}$/m);
+    assert.match(original, /^QUASAR_SECRET_KEY=[a-zA-Z0-9+/]{43}=$/m);
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+    assert.equal(run().status, 0);
+    assert.equal(readFileSync(path, 'utf8'), original);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('release selection rejects prereleases and foreign component images', async (t) => {
+  const { spawnSync } = await import('node:child_process');
+  if (spawnSync('jq', ['--version']).status !== 0) return t.skip('jq unavailable');
+  const { script } = generate();
+  const start = script.indexOf("jq -e '\n") + 7;
+  const filter = script.slice(start, script.indexOf("' >/dev/null", start));
+  const manifest = {
+    format_version: 1, version: '1.2.3', prerelease: false,
+    components: ['control-plane', 'node-agent'].map(name => ({
+      name, image: 'ghcr.io/accreleus/quasar/quasar-' + name, digest: 'sha256:' + 'a'.repeat(64),
+    })),
+  };
+  const accepts = value => spawnSync('jq', ['-e', filter], { input: JSON.stringify(value) }).status === 0;
+  assert.ok(accepts(manifest));
+  assert.ok(!accepts({ ...manifest, prerelease: true }));
+  assert.ok(!accepts({ ...manifest, version: '1.2.3-rc.1' }));
+  manifest.components[0].image = 'example.invalid/foreign/control';
+  assert.ok(!accepts(manifest));
+});
+
+test('installer rejects missing and old Compose versions before host changes', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const { script } = generate();
+  const start = script.indexOf('  compose_version=');
+  const end = script.indexOf('\nfi\nif [ ! -d /dev/dri', start);
+  const check = script.slice(start, end);
+  for (const [version, accepted] of [['', false], ['garbage', false], ['1.29.2', false], ['2.23.3', false], ['2.29.9', false], ['v2.30.0', true], ['2.40.1', true], ['3.0.0', true]]) {
+    const result = spawnSync('bash', ['-eu', '-c', `docker() { echo "$TEST_VERSION"; }; preflight_failed=0; ${check}\nexit "$preflight_failed"`], {
+      encoding: 'utf8', env: { ...process.env, TEST_VERSION: version },
+    });
+    assert.equal(result.status, accepted ? 0 : 1, `${version}: ${result.stderr}`);
   }
 });

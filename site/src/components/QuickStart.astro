@@ -44,22 +44,19 @@
 	<!-- 2. GPU -->
 	<section data-step="2" class="qs-step">
 		<h2>What GPU does this machine have?</h2>
-		<p class="qs-hint">This picks the encoder and the agent image.</p>
+		<p class="qs-hint">This selects GPU access. The agent detects the encoder automatically.</p>
 		<div class="qs-choices">
-			<label><input type="radio" name="gpu" value="amd-intel" checked /><span><strong>AMD or Intel</strong><em>Vulkan Video</em></span></label>
+			<label><input type="radio" name="gpu" value="amd-intel" checked /><span><strong>AMD or Intel</strong><em>Automatic encoder</em></span></label>
 			<label><input type="radio" name="gpu" value="nvidia" /><span><strong>NVIDIA</strong><em>Vulkan Video</em></span></label>
 		</div>
 		<p class="qs-note" data-when-gpu="amd-intel">
-			AMD is verified. Intel takes the same Vulkan path but nobody has run it
-			yet, so you would be first. Note that the script pins
-			<code>QUASAR_ENCODER=vulkan</code>, which on Intel overrides the VA-API
-			the agent would otherwise detect for itself. If Vulkan gives you trouble,
-			changing that one line to <code>va</code> puts you back on the default.
+			The agent detects your GPU and selects its default encoder. Advanced
+			operators can override <code>QUASAR_ENCODER</code> in the environment file.
 		</p>
 		<p class="qs-note" data-when-gpu="nvidia">
 			You need the NVIDIA driver and <code>nvidia-container-toolkit</code>
-			installed first. The generated script runs <code>nvidia-ctk runtime
-			configure</code> and asks before restarting Docker.
+			installed and registered with Docker first. The generated script checks
+			that runtime without restarting your other containers.
 		</p>
 	</section>
 
@@ -67,10 +64,9 @@
 	<section data-step="3" class="qs-step">
 		<h2>Where should Quasar keep things?</h2>
 		<p class="qs-hint">
-			Two directories. A small one for the certificate and the artwork cache,
-			and one that holds a home directory per user. Everything a game writes
-			goes in the second one: saves, settings, and whatever a launcher
-			downloads into its library.
+			User homes hold game saves, settings and launcher downloads. Templates
+			live beside the homes. Certificates, artwork and the database use Docker-managed
+			volumes, so the installer does not need to change their host ownership.
 		</p>
 		<label class="qs-field">
 			<span>Base path</span>
@@ -240,6 +236,7 @@
 				<div class="qs-out-head"><h4>deploy/docker-compose.nvidia.yml</h4><button type="button" data-copy="nvidia">Copy</button></div>
 				<pre><code data-out="nvidia"></code></pre>
 			</div>
+			<p class="qs-hint">Replace the blank credentials with real values using the instructions in this file before starting. Paste command output, not shell commands.</p>
 			<div class="qs-out-head"><h4>deploy/.env</h4><button type="button" data-copy="env">Copy</button></div>
 			<pre><code data-out="env"></code></pre>
 		</details>
@@ -260,7 +257,7 @@
 </div>
 
 <script>
-	import { DEFAULTS, generate, homePath, statePath } from '../data/stack-template.js';
+	import { DEFAULTS, generate, homePath } from '../data/stack-template.js';
 	import { platform } from '../data/platforms.js';
 
 	for (const root of document.querySelectorAll('[data-quickstart]')) {
@@ -323,31 +320,22 @@
 		 * mean nothing until you see what lands in each.
 		 */
 		function tree() {
-			const state = statePath(answers);
 			const homes = homePath(answers);
 			// Pad to one column so the comments line up whatever the nesting depth.
 			const row = (path, comment) => (comment ? `${path.padEnd(26)}${comment}` : path);
-			const lines = answers.separateSaves && answers.savesPath.trim()
-				? [
-						`${state}/`,
-						row('  tls/', 'the certificate, made on first boot'),
-						row('  artwork/', 'cover art cache'),
-						'',
-						`${homes}/`,
-						row('  alice/', 'one directory per user'),
-						row('    steam-a1b2c3d4/', 'her Steam library, saves, settings'),
-						row('  bob/', ''),
-						row('    kde-desktop-9f8e/', "his desktop session's home"),
-					]
-				: [
-						`${answers.basePath.replace(/\/+$/, '')}/`,
-						row('  control/', 'the certificate and artwork cache'),
-						row('  homes/', 'one directory per user'),
-						row('    alice/', ''),
-						row('      steam-a1b2c3d4/', 'her Steam library, saves, settings'),
-						row('    bob/', ''),
-						row('      kde-desktop-9f8e/', "his desktop session's home"),
-					];
+			const lines = [
+				`${homes}/`,
+				row('  alice/', 'one directory per user'),
+				row('    steam/', 'library, saves and settings'),
+				row('  bob/', ''),
+				'',
+				`${homes.replace(/\/[^/]*$/, '/templates')}/`,
+				row('  …', 'prepared application homes'),
+				'',
+				'Docker-managed volumes:',
+				row('  quasar-control-tls', 'certificate and artwork cache'),
+				row('  quasar-postgres-data', 'accounts and configuration'),
+			];
 			$('[data-tree]').textContent = lines.join('\n');
 		}
 
