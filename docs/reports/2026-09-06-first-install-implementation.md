@@ -79,8 +79,11 @@ real GPU deployment or successful browser stream.
 
 - `make test-go` and `make test-db`: pass. The latter ran against this worktree's
   fresh isolated Postgres, including database integration tests.
-- `make test-rust`: pass; media/hardware-dependent acceptance remains unrun.
-- `make test-web`: pass, including type checking, API drift and production build.
+- `make test-rust`: pass (1,217 library tests, 6 binary tests and 3 integration tests);
+  media/hardware-dependent acceptance remains unrun.
+- `make test-web`: pass (2,906 tests), including type checking, API drift and production build.
+  One existing AppHomeNext test exceeded its 5-second timeout while image builds
+  ran concurrently; the full rerun after those builds passed with unchanged tests.
   The new checklist was visually inspected using a local mock setup page and the
   existing design tokens/components.
 - Site tests: 26 pass, including actual Docker Compose parsing for six GPU/access
@@ -98,7 +101,15 @@ real GPU deployment or successful browser stream.
   work's images during this local validation; existing builder defaults remain.
 - The entrypoint harness checks default non-root startup, 99:100 bind ownership,
   migration of old state and private token ownership, PID 1 behavior, and an
-  inaccessible-state rejection using disposable local containers.
+  inaccessible-state rejection using disposable local containers. Root aliases
+  (`0`, `00`, `000`) and malformed UIDs are rejected before privilege drop.
+
+Local image evidence: `quasar-control-plane:20260905-1645-first-install-131`
+(source `49804c43d45a`) passed 23/23, and
+`quasar-node-agent:20260905-1634-first-install-131` (source `2ced17e28d1f`)
+passed 139/139. Later commits after the agent build change installation prose
+and the control entrypoint only; the tested agent implementation is unchanged.
+These are local validation tags, not published installation recommendations.
 
 ## Publication and operator validation still required
 
