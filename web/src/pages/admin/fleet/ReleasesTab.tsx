@@ -15,6 +15,7 @@
 import { useState, type ReactNode } from "react";
 import * as adminApi from "../../../api/admin";
 import type {
+  PlatformHostIdentity,
   PlatformRelease,
   PlatformReleaseTarget,
   PlatformReleaseView,
@@ -24,6 +25,7 @@ import { useAuth } from "../../../auth/context";
 import { Button } from "../../../components/Button";
 import { Card } from "../../../components/Card";
 import { Chip } from "../../../components/Chip";
+import { CopyableCommand } from "../../../components/CopyableCommand";
 import { Markdown } from "../../../components/Markdown";
 import { ResourceStates } from "../../../components/ResourceStates";
 import { SegmentedControl } from "../../../components/SegmentedControl";
@@ -31,6 +33,7 @@ import { Table, type TableColumn } from "../../../components/Table";
 import { TextField } from "../../../components/TextField";
 import { useSectionHead } from "../../../components/shell/sectionHead";
 import { relativeTime } from "../../../lib/format/relativeTime";
+import { manualUpdatePath } from "../../../lib/platform/manualUpdate";
 import { useAdminAction } from "../../../lib/resource/action";
 import { useResource } from "../../../lib/resource/react";
 import { eligibilityText, faultText, hasUpdate, releaseLabel, shortCommit } from "./releasesCopy";
@@ -246,6 +249,54 @@ function ReleaseEntry({ release }: { release: PlatformRelease }) {
   );
 }
 
+/** The manual path for one ineligible target, under the targets table: what
+ *  this target is on, what it could be on, and the commands for ITS situation
+ *  (lib/platform/manualUpdate.ts, which is where the wording lives). */
+function ManualPath({
+  target,
+  identity,
+  release,
+}: {
+  target: PlatformReleaseTarget;
+  identity: PlatformHostIdentity | undefined;
+  release: PlatformRelease | undefined;
+}) {
+  const path = manualUpdatePath({
+    reason: target.reason ?? null,
+    kind: target.kind,
+    installMode: identity?.install_mode ?? null,
+    // The Releases view carries no GPU vendor, so the redeploy profile stays
+    // the doc's own placeholder rather than a guess.
+    release: release ?? null,
+  });
+  if (!path) return null;
+
+  const name = target.kind === "control_plane" ? "Control plane" : (target.node_name ?? "Host");
+  const installed = identity?.source_commit;
+
+  return (
+    <div className="note" data-testid={`manual-${target.host_id ?? "control-plane"}`}>
+      <div className="rowflex">
+        <b>{name}</b>
+        <span className="muted">
+          {installed ? (
+            <>
+              on <span className="mono">{shortCommit(installed)}</span>
+            </>
+          ) : (
+            "build unknown"
+          )}
+          {release && <> · release {releaseLabel(release)}</>}
+        </span>
+      </div>
+      <p className="hint">{path.summary}</p>
+      {path.commands.map((c) => (
+        <CopyableCommand key={c.label} label={c.label} text={c.command} />
+      ))}
+    </div>
+  );
+}
+
 function TargetsSection({ view }: { view: PlatformReleaseView }) {
   const columns: TableColumn<PlatformReleaseTarget>[] = [
     {
@@ -273,6 +324,14 @@ function TargetsSection({ view }: { view: PlatformReleaseView }) {
         rowKey={(t) => t.host_id ?? "control-plane"}
         empty="No targets."
       />
+      {view.targets.map((t) => (
+        <ManualPath
+          key={t.host_id ?? "control-plane"}
+          target={t}
+          identity={view.installed.hosts.find((h) => h.host_id === t.host_id)}
+          release={view.available[0]}
+        />
+      ))}
     </Section>
   );
 }

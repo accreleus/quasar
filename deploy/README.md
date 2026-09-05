@@ -1028,6 +1028,11 @@ Before pulling a new version onto a running stack, back up Postgres and read
 upgrade steps, and the fix for the crash loop you get if you roll a control-plane
 binary back *below* the database's applied migration version.
 
+Which recipe you use depends on how this host was installed. A registry install
+(path A) re-pins the two digest lines in `deploy/.env` and recreates those two
+services — [Upgrading a registry install](../docs/upgrading.md#upgrading-a-registry-install);
+a source install (path B) runs `deploy/redeploy.sh <va|nvidia> <ref>`.
+
 ### Narrow redeploys (source path)
 
 `deploy/redeploy.sh` takes a third argument that rebuilds one component instead

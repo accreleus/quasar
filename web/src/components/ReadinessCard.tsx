@@ -3,11 +3,10 @@
 // full by StepHosts, the Hosts tab's expanded row and the host detail page (as
 // a full-width grid). Host settings deliberately does not repeat it.
 
-import { useState } from "react";
 import type { ReadinessCheck } from "../api/types";
 import { groupChecks } from "../lib/readiness/groups";
-import { Button } from "./Button";
 import { Chip } from "./Chip";
+import { CopyableCommand } from "./CopyableCommand";
 import { IconCheck, IconClose, IconWarning } from "./icons";
 
 // One glyph per status, in a circle: a tick, a cross, an exclamation, a dash.
@@ -30,41 +29,6 @@ function ReadinessGlyph({ status }: { status: string }) {
     <span className={g.className} role="img" aria-label={g.label} title={g.label}>
       {g.icon}
     </span>
-  );
-}
-
-function CopyableRemediation({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false);
-
-  const copy = async () => {
-    // Guard availability explicitly rather than optional-chain into
-    // `writeText` — `clipboard?.writeText(...)` on an absent API awaits
-    // `undefined`, which resolves (not rejects), so the old code marked
-    // "Copied" even though nothing was written. Only a real, successful
-    // write may flip the button.
-    if (!navigator.clipboard) return;
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Best-effort — the text is still visible/selectable even if the
-      // write itself failed (e.g. a permission denial).
-    }
-  };
-
-  return (
-    <div className="row gap2" style={{ marginTop: 4, alignItems: "center" }}>
-      <code
-        className="mono"
-        style={{ flex: 1, overflowWrap: "anywhere", fontSize: "var(--t-xs)" }}
-      >
-        {text}
-      </code>
-      <Button type="button" variant="ghost" size="sm" onClick={() => void copy()}>
-        {copied ? "Copied" : "Copy"}
-      </Button>
-    </div>
   );
 }
 
@@ -116,7 +80,7 @@ export function ReadinessCard({
             blocks anything. Show it here too, or the whole point of a WARN
             check (here's exactly what to run) is invisible. */}
         {(c.status === "fail" || c.status === "warn") && c.remediation && (
-          <CopyableRemediation text={c.remediation} />
+          <CopyableCommand text={c.remediation} />
         )}
       </div>
     </div>

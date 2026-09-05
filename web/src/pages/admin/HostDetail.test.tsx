@@ -133,6 +133,7 @@ beforeEach(() => {
   setFleet();
   mocked.getHost.mockResolvedValue({ host: host() } as never);
   mocked.getHostGPUs.mockResolvedValue({ items: [gpu()] } as never);
+  mocked.getPlatformReleases.mockResolvedValue({ faults: [] } as never);
   mocked.drainHost.mockResolvedValue({} as never);
   mocked.uncordonHost.mockResolvedValue({} as never);
 });
@@ -414,5 +415,52 @@ describe("HostDetail — actions", () => {
 
     await waitFor(() => expect(screen.getByTestId("readiness-card")).toBeTruthy());
     expect(screen.getByTestId("readiness-check-nvidia_egl")).toBeTruthy();
+  });
+});
+
+describe("HostDetail — platform-release faults", () => {
+  const fault = (over: Record<string, unknown> = {}) => ({
+    kind: "agent_ahead_of_control_plane",
+    host_id: "c2059601",
+    node_name: "quasar-node-1",
+    detail: "the agent is on release 0.3.0 (schema 80), ahead of this control plane (schema 74)",
+    ...over,
+  });
+
+  it("warns that this host's agent is ahead of the control plane", async () => {
+    mocked.getPlatformReleases.mockResolvedValue({ faults: [fault()] } as never);
+    renderDetail();
+
+    await waitFor(() =>
+      expect(screen.getByText("Agent ahead of the control plane.")).toBeTruthy(),
+    );
+    expect(screen.getByText(/schema 80/)).toBeTruthy();
+  });
+
+  it("warns that this host has not reported a build identity", async () => {
+    mocked.getPlatformReleases.mockResolvedValue({
+      faults: [fault({ kind: "identity_unknown", detail: "the agent has not reported its build identity" })],
+    } as never);
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByText("Build identity unknown.")).toBeTruthy());
+  });
+
+  it("shows no fault note for another host's fault", async () => {
+    mocked.getPlatformReleases.mockResolvedValue({
+      faults: [fault({ host_id: "other-host" })],
+    } as never);
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByRole("heading", { name: "quasar-node-1" })).toBeTruthy());
+    expect(document.querySelector(".note.warn")).toBeNull();
+  });
+
+  it("renders the page normally when the release read fails — a fault gates nothing", async () => {
+    mocked.getPlatformReleases.mockRejectedValue(new Error("forbidden"));
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByRole("heading", { name: "quasar-node-1" })).toBeTruthy());
+    expect(document.querySelector(".note.warn")).toBeNull();
   });
 });

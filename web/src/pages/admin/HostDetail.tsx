@@ -7,7 +7,7 @@
 import { useMemo } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import * as adminApi from "../../api/admin";
-import type { GPUAvailability, Host } from "../../api/types";
+import type { GPUAvailability, Host, PlatformReleaseFault } from "../../api/types";
 import { useAuth } from "../../auth/context";
 import { Breadcrumbs } from "../../components/Breadcrumbs";
 import { shortId } from "../../lib/format/shortId";
@@ -24,6 +24,7 @@ import { useResource } from "../../lib/resource/react";
 import { CapacityCard } from "./fleet/hostDetail/CapacityCard";
 import { SessionsCard } from "./fleet/hostDetail/SessionsCard";
 import { hostStateChip, hostStateLabel } from "./fleet/hostDerived";
+import { faultText } from "./fleet/releasesCopy";
 import "../../styles/admin/fleet.css";
 
 const POLL_MS = 5000;
@@ -32,6 +33,9 @@ interface HostDetailData {
   host: Host;
   /** Null when the GPU read failed: the host is still worth rendering. */
   gpus: GPUAvailability[] | null;
+  /** This host's platform-release faults. Empty when the read failed: a fault
+   *  gates nothing, so its absence must never blank the page. */
+  faults: PlatformReleaseFault[];
 }
 
 export function HostDetail() {
@@ -47,14 +51,19 @@ export function HostDetail() {
       label: "host",
       pollMs: POLL_MS,
       fetch: async (ctx): Promise<HostDetailData> => {
-        const [{ host }, gpus] = await Promise.all([
+        const [{ host }, gpus, faults] = await Promise.all([
           adminApi.getHost(ctx.token, id),
           adminApi.getHostGPUs(ctx.token, id).then(
             (r) => r.items,
             () => null,
           ),
+          // Rides this page's one poll rather than earning a second timer.
+          adminApi.getPlatformReleases(ctx.token, ctx.signal).then(
+            (v) => v.faults.filter((f) => f.host_id === id),
+            () => [],
+          ),
         ]);
-        return { host, gpus };
+        return { host, gpus, faults };
       },
     },
     [id],
@@ -62,6 +71,7 @@ export function HostDetail() {
 
   const host = res.data?.host;
   const gpus = res.data?.gpus ?? null;
+  const faults = res.data?.faults ?? [];
   const now = res.updatedAt ?? Date.now();
 
   const sessions = useMemo(
@@ -156,6 +166,12 @@ export function HostDetail() {
             : " It has never sent one."}
         </p>
       )}
+
+      {faults.map((fault) => (
+        <p className="note warn host-note" key={fault.kind}>
+          <b>{faultText(fault.kind)}.</b> {fault.detail}
+        </p>
+      ))}
 
       {host.capacity_detection !== "ok" && (
         <p className="note warn host-note">
