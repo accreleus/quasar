@@ -1,6 +1,6 @@
 ---
 title: Upgrading
-description: Upgrade between tagged releases without running an older control plane against a newer database.
+description: Upgrade from the console or by hand, without running an older control plane against a newer database.
 ---
 
 import { Aside, Steps } from '@astrojs/starlight/components';
@@ -14,73 +14,197 @@ contain a migration the database has already applied refuses to start.
 Restoring the old image alone is therefore not a rollback. A rollback requires
 both the older image and the database backup taken before the upgrade.
 
-## Upgrade a release install
+The console enforces this for you: a release carrying a schema below the
+database's own is never listed or offered, and the control plane always moves
+before any agent.
+
+<Aside type="caution" title="A control-plane update ends every running session">
+Recreating the control plane drops every agent's connection to it, and an agent
+stops its sessions when that connection drops. This is a known limitation,
+tracked as [#128](https://github.com/accreleus/quasar/issues/128). A fleet update
+from the console therefore drains the whole instance and waits for it to be empty
+before the control-plane step, unless you tick the box that ends the sessions
+now.
+</Aside>
+
+## Upgrade from the console
+
+For an install running published images, this is the path. Admin, Fleet,
+Releases lists what is available, says which of your machines can take it, and
+applies it: the control plane first, then each eligible host in turn, each one
+cordoned and drained before its agent is recreated.
 
 <Steps>
 
-1. **Read the new release notes and changelog.** Note any release-specific
-   migration or configuration instructions.
+1. **Back up Postgres and `deploy/.env`.** Follow [Backup and
+   restore](/quasar/operations/backup/) first. An update runs migrations, and
+   migrations only go forward.
 
-2. **Back up Postgres, managed homes, and `deploy/.env`.** Follow
-   [Backup and restore](/quasar/operations/backup/) before changing image pins.
+2. **Open Admin, Fleet, Releases** and read the notes for the release you are
+   moving to.
 
-3. **Fetch the tagged deployment files.** Keep the existing `deploy/.env` and
-   compare it with the new tag's `.env.example` for added settings.
+3. **Press Update Quasar**, or Apply on a single host. The confirmation names how
+   many live sessions are involved.
+
+4. **Reload the console** when it offers to. The tab was loaded from the previous
+   build.
+
+5. **Verify.** Hosts back online under Admin, Fleet, Hosts, then a real session.
+   Container health does not prove video, audio, or input.
+
+</Steps>
+
+[Updating Quasar](/quasar/admin/releases/) covers channels, why a target might
+not be eligible, reverting a host, and what the history records.
+
+The console needs the `quasar-updater` service beside each stack, and it never
+offers an update to a control plane or host built from source. Both are covered
+below.
+
+## Upgrade by hand
+
+The commands the console runs, for a stack without an updater or an operator who
+would rather type them. Take the digests from the release's
+`platform-release-manifest.json` asset, which lists exactly two components,
+control plane then node agent; the release body carries the same pair. The
+Releases page shows these commands filled in for the release it is offering.
+
+<Steps>
+
+1. **Back up Postgres and `deploy/.env`.** As above.
+
+2. **Pin the two digests** in `deploy/.env`:
 
    ```bash
-   git fetch origin --tags
-   git checkout vX.Y.Z
-   ```
-
-4. **Point the two image variables** in `deploy/.env` at the new build. On
-   `:latest` there is nothing to change. If you pin digests, take the new ones
-   from the release body:
-
-   ```bash
-   QUASAR_CONTROL_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@sha256:<new-digest>
-   QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<new-digest>
+   QUASAR_CONTROL_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@sha256:<control-plane digest>
+   QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<node-agent digest>
    ```
 
    One agent image covers every host. NVIDIA driver userspace is provisioned at
    run time into a volume, so there is no separate NVIDIA image to choose.
 
-5. **Pull and recreate**, using the same `-f` list you installed with.
+3. **Pull and recreate those two services.**
 
    ```bash
-   docker compose -f deploy/docker-compose.yml pull
-   docker compose -f deploy/docker-compose.yml up -d
+   docker compose -f deploy/docker-compose.yml pull quasar-control-plane quasar-node-agent
+   docker compose -f deploy/docker-compose.yml up -d --force-recreate --no-deps \
+                  quasar-control-plane quasar-node-agent
    ```
 
-   On NVIDIA:
-
-   ```bash
-   docker compose -f deploy/docker-compose.yml \
-                  -f deploy/docker-compose.nvidia.yml pull
-   docker compose -f deploy/docker-compose.yml \
-                  -f deploy/docker-compose.nvidia.yml up -d
-   ```
-
-6. **Verify the result.**
+4. **Verify the result.**
 
    ```bash
    docker compose -f deploy/docker-compose.yml ps
    curl http://localhost:8080/health
    ```
 
-   Confirm the node agent re-registered under Admin, Fleet, Hosts, then launch a real
-   session. Container health does not prove video, audio, or input.
+   Confirm the node agent re-registered under Admin, Fleet, Hosts, then launch a
+   real session.
 
 </Steps>
 
-On `:latest` the pull is the upgrade. If you pinned digests, nothing moves until
-you change them, which is the point of pinning.
+Four things that matter here:
+
+- **Repeat every `-f` you deploy with.** An NVIDIA host that came up with
+  `-f deploy/docker-compose.yml -f deploy/docker-compose.nvidia.yml` must pass
+  both files to every command above. A compose invocation that drops an overlay
+  recreates the containers without it.
+- **Recreating the node agent ends every session on that host.** Drain it first
+  if that matters.
+- **Recreating the control plane runs migrations**, so the hard rule applies from
+  that moment: the digest you just replaced is no longer safe to pin back.
+- `--no-deps` leaves Postgres, the updater and the session containers alone.
+
+If you track `:latest` rather than pinning digests, the pull is the upgrade and
+step 2 has nothing to change. Pinning is what stops a tag moving underneath you.
+
+## Add the updater to an existing install
+
+`quasar-updater` is the per-host actor that applies a release: it pulls the
+pinned digests and recreates the containers they replace, because a container
+cannot recreate itself. An install from before this feature has no such service,
+and its hosts show *No updater is installed beside this host's stack* on the
+Releases tab.
+
+Once, on each host:
+
+<Steps>
+
+1. **Get the compose file that declares the service** — pull the checkout, or
+   re-download `deploy/docker-compose.yml` for a registry install.
+
+2. **Tell it where the stack lives**, in `deploy/.env`. This must be the stack
+   directory's absolute **host** path: the updater rebuilds its compose
+   invocation from its own container labels, and those record host paths.
+
+   ```bash
+   echo "QUASAR_STACK_DIR=$(cd deploy && pwd)" >> deploy/.env
+   echo "QUASAR_UPDATER_IMAGE=ghcr.io/accreleus/quasar/quasar-updater:latest" >> deploy/.env
+   ```
+
+3. **Bring it up**, touching nothing else.
+
+   ```bash
+   docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-updater
+   ```
+
+4. **Confirm the host sees it.** In Admin, Fleet, Hosts, the host drawer's
+   **Updater** row should read *Present*, and the host should stop reporting the
+   missing-updater reason on the Releases tab.
+
+</Steps>
+
+Left unset, `QUASAR_STACK_DIR` makes the updater refuse to serve and say so,
+rather than guess at a compose invocation and recreate the wrong project's
+containers.
+
+<Aside type="note" title="The updater updates itself by hand">
+It is what applies a release, so it is not one of the images a release moves and
+it is not in the release manifest. Its image is named by tag for that reason.
+Pull and recreate it whenever you like — it holds no state, and an apply already
+in flight finishes regardless.
+
+```bash
+docker compose -f deploy/docker-compose.yml pull quasar-updater
+docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-updater
+```
+</Aside>
+
+## If your install ever ran a source build
+
+**Only if your stack was built from source before this change, and only once.**
+
+Both control-plane images now run as uid 1000. The source-built image used to run
+as root, so on a stack that ever ran it the `quasar-control-tls` volume — which
+holds the TLS pair and the artwork cache — is owned by root. Applying a published
+release to such a stack starts a uid-1000 container that cannot write it, and the
+control plane crash-loops:
+
+```
+fatal: tls: write TLS key /var/lib/quasar-control/tls/key.pem: permission denied
+```
+
+Nothing is damaged and nothing is lost. Give the volume to uid 1000:
+
+```bash
+# The volume name is <compose project>_quasar-control-tls. The project is the
+# stack directory's name unless COMPOSE_PROJECT_NAME says otherwise, so this
+# lists the real one rather than assuming it:
+docker volume ls --format '{{.Name}}' | grep quasar-control-tls
+
+docker run --rm -v <that name>:/t alpine chown -R 1000:1000 /t
+docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-control-plane
+```
+
+A fresh install is unaffected, and an enrolled agent-only host has no
+control-plane volume at all.
 
 ## If the control plane crash-loops after a rollback
 
 Redeploy the newer control-plane image containing the migration already present
-in the database. If you must return to the older release, restore
-the pre-upgrade database backup as well. Do not hand-edit migration bookkeeping
-or run down migrations against production state.
+in the database. If you must return to the older release, restore the pre-upgrade
+database backup as well. Do not hand-edit migration bookkeeping or run down
+migrations against production state.
 
 Check the current migration version with:
 
@@ -98,8 +222,13 @@ Contributors who intentionally deploy a branch use the canonical Makefile and
 explicit refs. See [GPU and remote workflows](/quasar/developer/gpu-workflows/).
 Do not turn the release instructions into an implicit branch deployment.
 
+A source-built host is never offered a release from the console. It shows the
+`deploy/redeploy.sh <va|nvidia> <ref>` command for its own situation instead,
+which rebuilds and restarts it in place.
+
 <Aside type="caution" title="Multiple hosts must stay version-aligned">
 Upgrade the control plane and every agent host as one planned operation. Brief
 skew while containers restart may work, but a permanently mixed fleet is not a
-supported target.
+supported target. A fleet update from the console is exactly this operation, in
+the right order.
 </Aside>

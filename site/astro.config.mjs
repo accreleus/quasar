@@ -144,6 +144,7 @@ export default defineConfig({
 						{ label: 'Hosts and GPUs', slug: 'admin/hosts' },
 						{ label: 'Sessions and audit log', slug: 'admin/sessions' },
 						{ label: 'Jobs and schedules', slug: 'admin/jobs' },
+						{ label: 'Updating Quasar', slug: 'admin/releases' },
 					],
 				},
 				{

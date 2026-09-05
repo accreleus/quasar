@@ -181,6 +181,7 @@ ${certMount}    depends_on:
       - /etc/os-release:/host/etc/os-release:ro
       - \${QUASAR_HOME_ROOT}:\${QUASAR_HOME_ROOT}
       - quasar-agent-data:/var/lib/quasar-agent
+      - quasar-updater-run:/run/quasar-updater
     devices:
       - /dev/dri
       - /dev/uinput
@@ -195,9 +196,34 @@ ${certMount}    depends_on:
         condition: service_healthy
     restart: unless-stopped
 
+  # Applies a platform release to this stack: it pulls the pinned digests and
+  # recreates the containers they replace, because a container cannot recreate
+  # itself. It acts only when told to, over the socket in the shared volume
+  # above, and only on images inside the allow-listed namespace.
+  quasar-updater:
+    image: \${QUASAR_UPDATER_IMAGE:-${REGISTRY}/quasar-updater:latest}
+    environment:
+      QUASAR_UPDATER_ALLOWED_NAMESPACES: \${QUASAR_UPDATER_ALLOWED_NAMESPACES:-}
+      QUASAR_UPDATER_WAIT_TIMEOUT_S: \${QUASAR_UPDATER_WAIT_TIMEOUT_S:-}
+    volumes:
+      # Podman: point QUASAR_DOCKER_SOCKET at /run/user/<uid>/podman/podman.sock.
+      - \${QUASAR_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+      # This directory at its own host path. The updater rebuilds its compose
+      # invocation from its own container labels, which record host paths, so
+      # the same absolute path has to resolve inside the container. Left at the
+      # placeholder below, the updater refuses to serve and says so; nothing
+      # else in the stack is affected.
+      - \${QUASAR_STACK_DIR:-/var/lib/quasar/stack-dir-unset}:\${QUASAR_STACK_DIR:-/var/lib/quasar/stack-dir-unset}
+      - quasar-updater-run:/run/quasar-updater
+    # SELinux-enforcing hosts (Podman) refuse every call to the mounted socket
+    # without this. Docker is unaffected.
+    security_opt: ["label=disable"]
+    restart: unless-stopped
+
 volumes:
   quasar-postgres-data:
   quasar-agent-data:
+  quasar-updater-run:
 `;
 }
 
@@ -234,6 +260,10 @@ function envFile(a) {
     '# Where Quasar keeps things.',
     `QUASAR_HOME_ROOT=${homePath(a)}`,
     `QUASAR_STATE_DIR=${statePath(a)}`,
+    '',
+    '# This stack directory, at its absolute path on this host. The updater',
+    '# needs it to find the compose files it is asked to act on.',
+    'QUASAR_STACK_DIR=$(cd deploy && pwd)',
     '',
     '# Who owns save data. Game containers drop to this user.',
     `QUASAR_APP_PUID=${uid}`,

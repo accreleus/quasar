@@ -80,6 +80,22 @@ and waits until the agent logs that it is enrolled.
 Re-running the command on the same machine updates that one agent. It never starts a
 second one.
 
+## The updater comes with it
+
+The installer starts two containers, not one: the agent, and `quasar-updater`
+beside it. That second one is what lets this host be updated from the admin
+console later, because a container cannot recreate itself. It is started first
+and deliberately without `depends_on`, so a missing updater image never stops the
+agent — the host works, it just cannot be handed a release.
+
+If the host's drawer under Admin, Fleet, Hosts says its updater is **None**, the
+script said so at the time: either the image could not be pulled or the service
+did not start. Set `QUASAR_UPDATER_IMAGE` in the agent's `.env` and bring the
+service up, then restart the agent — it reads updater presence once, at boot. The
+[Releases tab](/quasar/admin/releases/) shows the exact commands for that host,
+and [Upgrading](/quasar/operations/upgrading/#add-the-updater-to-an-existing-install)
+has the longer version.
+
 ## When it says no
 
 The last line names the reason.

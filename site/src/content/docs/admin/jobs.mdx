@@ -33,6 +33,28 @@ the environment override and restart before expecting an admin change to win.
 
 Unmanaged jobs are listed for visibility but have no editable common schedule.
 
+## The release detection job
+
+`platform.release_detect` is the job that notices a new version of Quasar itself.
+It reads the release list of the project's own repository — the tagged releases
+and their manifests on the `stable` channel, or the branch build's image on
+`edge` — and records what it found. It never installs anything.
+
+It runs **weekly by default: Monday, in a one-hour window opening 02:00 UTC**,
+which is enough for something that ships at the pace of a release. If you would
+rather hear sooner, edit its interval here to daily like any other managed
+schedule.
+
+**Check now** on the Releases tab is this job's Run now. Both bypass the window.
+Detection finding nothing is the normal result on an instance that is current.
+
+The repository it reads, and the token it uses if you point it at a private fork,
+are environment settings — see [Updates and
+releases](/quasar/reference/environment/#updates-and-releases). Setting the
+repository to an empty string turns detection off: the job stays visible and
+every run is skipped. What it finds is shown on [Updating
+Quasar](/quasar/admin/releases/).
+
 ## Run history
 
 Open a job to see bounded, newest-first run history. The result distinguishes a
