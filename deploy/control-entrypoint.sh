@@ -18,8 +18,9 @@ if [ "$(id -u)" = 0 ]; then
     [ "$group" != 0 ] || group=1000
     uid=${QUASAR_CONTROL_UID:-$owner}
     gid=${QUASAR_CONTROL_GID:-$group}
-    case "$uid:$gid" in *[!0-9:]*|:*|*:) fail 'control UID/GID must be numeric' ;; esac
-    [ "$uid" != 0 ] || fail 'control plane must run as a non-root UID'
+    case "$uid" in ''|*[!0-9]*) fail 'control UID must be numeric' ;; esac
+    case "$gid" in ''|*[!0-9]*) fail 'control GID must be numeric' ;; esac
+    [ "$uid" -ne 0 ] || fail 'control plane must run as a non-root UID'
     # Migrate files owned by the image's previous identity, never arbitrary
     # host trees or symlink targets. Do not cross nested mounts.
     find "$state" "$runtime" -xdev -uid 1000 -exec chown -h "$uid:$gid" {} + || fail 'cannot prepare existing control-plane state'

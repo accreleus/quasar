@@ -27,4 +27,16 @@ if docker run "${common[@]}" --user 1000:1000 --tmpfs /var/lib/quasar-control:ui
   echo 'FAIL: mismatched non-root state ownership was silently accepted' >&2
   exit 1
 fi
+for invalid_uid in 0 00 000 99:100; do
+  if docker run "${common[@]}" --user 0:0 -e "QUASAR_CONTROL_UID=$invalid_uid" --tmpfs /var/lib/quasar-control --tmpfs /run/quasar --entrypoint /usr/bin/timeout "$image" 5s /entry.sh true; then
+    echo "FAIL: invalid control UID was accepted: $invalid_uid" >&2
+    exit 1
+  else
+    status=$?
+    if [ "$status" -ne 1 ]; then
+      echo "FAIL: invalid UID must be rejected immediately (exit=$status)" >&2
+      exit 1
+    fi
+  fi
+done
 echo 'PASS: control entrypoint prepares ownership, drops privileges, preserves PID 1 and rejects inaccessible state'
