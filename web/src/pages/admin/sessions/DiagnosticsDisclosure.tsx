@@ -751,17 +751,12 @@ export function DiagnosticsDisclosure({
             mount and then polls it for a live session, so a collapsed
             disclosure would keep the page's heaviest read running. */}
         {open && (
-          <div className="card card-pad">
-            <div className="sd-chart-title" style={{ marginBottom: 12 }}>
-              Trace
-              <span className="hint" style={{ marginLeft: 8, fontWeight: 400 }}>
-                stacked time-series + events
-              </span>
-            </div>
-            <Suspense fallback={<LoadingState>Loading trace…</LoadingState>}>
-              <TraceViewer sessionId={sessionId} token={token} sessionState={session?.state} />
-            </Suspense>
-          </div>
+          /* The Trace card renders its own panel-head (title, window selector,
+             clock, live chip, refresh) — see the reference mockup — so it is
+             mounted bare rather than inside another card. */
+          <Suspense fallback={<LoadingState>Loading trace…</LoadingState>}>
+            <TraceViewer sessionId={sessionId} token={token} sessionState={session?.state} />
+          </Suspense>
         )}
       </div>
     </details>

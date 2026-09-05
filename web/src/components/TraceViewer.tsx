@@ -1,23 +1,28 @@
 /**
- * TraceViewer — stacked time-series lane chart for the admin session-detail page.
+ * TraceViewer — the session-detail Trace card.
  *
- * Renders 4 stacked lanes (Encoder / Transport / Client / ABR) sharing a common
- * time axis, with event markers as vertical dashed lines and derived-window
- * highlight bands. Reads from GET /v1/admin/sessions/{id}/diagnostic-bundle.
+ * Structure and styling follow the operator's standalone reference mockup
+ * ("Quasar Session Trace", v3 tokens only): a `.card` with a `panel-head`, a
+ * one-line verdict strip over an expandable evidence panel, then a body of
+ * stacked lanes — a 96px eyebrow label beside a caption row and a 54px plot —
+ * with the event markers on their OWN track under the lanes, a relative time
+ * axis ending at "now", and an event legend.
  *
- * Design goal: "make a hitch obvious." No external chart deps — hand-rolled SVG
- * following the Charts.tsx / TelemetryChart.tsx patterns.
+ * Reads GET /v1/admin/sessions/{id}/diagnostic-bundle. No external chart deps —
+ * hand-rolled SVG, same as Charts.tsx / TelemetryChart.tsx.
  *
  * ST-07 — lazy-loaded into the session detail's Diagnostics disclosure.
  */
 
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { getDiagnosticBundle } from "../api/admin";
 import { ApiError } from "../api/client";
 import type { DiagnosticBundle, Falsifier, TraceSeriesPoint, TraceEvent } from "../api/types";
 import { estimatorLabel, metricTooltip, seriesInfo } from "../lib/metricsManifest";
 import { useContainerWidth } from "../lib/useContainerWidth";
-import { Chip, LiveDot } from "./Chip";
+import { Chip, type ChipVariant } from "./Chip";
+import { SegmentedControl } from "./SegmentedControl";
+import { IconRefresh } from "./icons";
 
 // ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -38,6 +43,16 @@ function fmtSeconds(ms: number): string {
   return `${Math.round(ms / 1000)} s`;
 }
 
+/** Axis labels: seconds under a minute, minutes above it. Exact, not rounded —
+ *  rounding to the nearest minute (the mockup's trFmt, which only ever sees a
+ *  step that divides the window evenly) labels a 30 s grid "-4m -4m -3m -3m". */
+function fmtAgo(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60);
+  return s === 0 ? `${m}m` : `${m}m${s}s`;
+}
+
 // ── Event marker color by type ─────────────────────────────────────────────────
 
 // The loud events — the ones an operator is looking for when a session misbehaves.
@@ -47,13 +62,11 @@ function fmtSeconds(ms: number): string {
 // worse than one that buckets them.
 const EVENT_COLORS: Record<string, string> = {
   "abr.retarget": "var(--warning)",
-  "encoder.stall": "var(--danger)",
-  "client.freeze_detected": "var(--danger-text)",
+  "encoder.stall": "var(--danger-text)",
+  "client.freeze_detected": "var(--danger)",
   // ABR resolution ladder (T6): distinct color so a rung step reads apart from
-  // a plain bitrate retarget. No allow-list exists here — any event type not
-  // in this map still renders as a marker (eventColor's fallback below), so
-  // "abr.ladder.step" was already reachable; this only gives it its own color.
-  "abr.ladder.step": "var(--danger-text)",
+  // a plain bitrate retarget.
+  "abr.ladder.step": "var(--warning-text)",
   "playout.changed": "var(--lavender)",
   "pipeline.source_swapped": "var(--info)",
   "webrtc.state_changed": "var(--text-3)",
@@ -71,57 +84,84 @@ interface LaneSeries {
   key: string;
   color: string;
   label: string;
-  /** True = render as area fill (bars approximation) instead of a line */
-  area?: boolean;
 }
 
 interface LaneDef {
+  id: string;
   label: string;
-  series: LaneSeries[];
-  /** Keys for derived_windows highlight bands: "hitches" / "encoder_saturation" */
+  /** Unit of the lane's PRIMARY series — the big current-value readout. */
+  unit: string;
+  /** [0] is the primary series: it carries the gradient area and the readout. */
+  series: [LaneSeries, ...LaneSeries[]];
+  /** Keys for derived_windows highlight bands. */
   highlightKey?: "hitches" | "encoder_saturation" | "likely_network_congestion";
   highlightColor?: string;
 }
 
 const LANES: LaneDef[] = [
   {
+    id: "enc",
     label: "Encoder",
+    unit: "fps",
     series: [
-      { key: "encoder.fps",       color: "var(--accent)",  label: "fps" },
+      { key: "encoder.fps", color: "var(--accent)", label: "fps" },
       // Amber, not the console's usual lavender for encode time: inside ONE lane
       // the two series have to be told apart at a glance, and amber is also the
       // hue of this lane's encoder-saturation band — which encode_ms is what
       // detects.
-      { key: "encoder.encode_ms", color: "var(--warning)", label: "encode ms" },
+      { key: "encoder.encode_ms", color: "var(--warning-text)", label: "encode ms" },
     ],
     highlightKey: "encoder_saturation",
     highlightColor: "var(--warning-bg)",
   },
   {
+    id: "net",
     label: "Transport",
+    unit: "ms",
     series: [
-      { key: "transport.rtt_ms",       color: "var(--info)",   label: "rtt ms" },
-      { key: "transport.packets_lost", color: "var(--danger)", label: "pkt lost", area: true },
+      { key: "transport.rtt_ms", color: "var(--info)", label: "rtt ms" },
+      { key: "transport.packets_lost", color: "var(--danger)", label: "pkt lost" },
     ],
     highlightKey: "likely_network_congestion",
     highlightColor: "var(--danger-bg)",
   },
   {
+    id: "cli",
     label: "Client",
+    unit: "ms",
     series: [
       { key: "client.present_interval_sd_ms", color: "var(--lavender)", label: "present σ ms" },
-      { key: "client.glass_to_glass_ms",      color: "var(--success)",  label: "qualified RVFC capture-to-display ms" },
+      {
+        key: "client.glass_to_glass_ms",
+        color: "var(--accent)",
+        label: "qualified RVFC capture-to-display ms",
+      },
     ],
     highlightKey: "hitches",
     highlightColor: "var(--danger-bg)",
   },
   {
+    id: "abr",
     label: "ABR",
-    series: [
-      { key: "abr.setpoint_kbps", color: "var(--accent)", label: "setpoint kbps" },
-    ],
+    unit: "kbps",
+    series: [{ key: "abr.setpoint_kbps", color: "var(--success)", label: "setpoint kbps" }],
   },
 ];
+
+// ── Lane geometry ──────────────────────────────────────────────────────────────
+//
+// One lane = a caption row above a 54px plot, per the reference mockup. The
+// caption is what makes the plot readable at all: series inside one lane are
+// scaled INDEPENDENTLY (#124 — fps ~60 and encode_ms ~20 on one shared scale
+// flattened encode_ms onto the baseline), so the only way to know what the top
+// of a curve is worth is to say so.
+
+const LANE_H = 54;
+/** Keeps a curve at its maximum off the lane's top rule. */
+const LANE_INSET = 3;
+/** Headroom over a series' own maximum, matching the mockup and the v3 mock's
+ *  own lineChart renderer. */
+const SCALE_HEADROOM = 1.15;
 
 // ── Tooltip state ──────────────────────────────────────────────────────────────
 
@@ -133,122 +173,113 @@ interface TooltipState {
   nearEvents: TraceEvent[];
 }
 
-// ── Lane geometry ──────────────────────────────────────────────────────────────
-//
-// A lane is a scale caption row above a plot box. The caption is what makes the
-// plot readable at all: series inside one lane are scaled INDEPENDENTLY (#124 —
-// fps ~60 and encode_ms ~20 on one shared scale flattened encode_ms onto the
-// baseline), so the only way to know what the top of a curve is worth is to say
-// so. Charts.tsx puts that in a y-axis gutter; a 4-lane stack has no room for
-// four gutters, and a gutter can only ever label one of the two series anyway.
-
-const LANE_PAD = { top: 5, right: 6, bottom: 5, left: 6 };
-const LANE_SCALE_H = 15;
-const LANE_PLOT_H = 62;
-const LANE_HEIGHT = LANE_SCALE_H + LANE_PLOT_H;
-
-/** Height of the whole lane stack — the event overlay is sized from it. */
-const LANE_STACK_H = LANES.length * LANE_HEIGHT;
-
 interface SeriesRender {
   key: string;
   color: string;
   label: string;
-  /** Highest sample in the window; the caption's "max". */
+  /** Highest sample in the visible window; the caption's "max". */
   max: number;
-  /** The stroked outline. Empty when the series is flat at zero. */
+  /** Latest sample in the visible window; the lane's readout for series[0]. */
+  last: number | null;
+  /** The stroked outline. Empty when the series has no samples in the window. */
   d: string;
-  /** Area fill under `d`, for count-like series only. Never stroked: stroking a
-   *  closed area paints its baseline edge too, which draws a hard rule across
-   *  the whole lane. */
+  /** Gradient area under the primary series. Never stroked: stroking a closed
+   *  area paints its baseline edge too, drawing a hard rule across the lane. */
   fillD: string;
-  isArea: boolean;
   /** Set when the series' last sample falls short of the shared x domain. */
   end: { x: number; y: number } | null;
 }
 
-interface LaneSvgProps {
+interface LaneChartProps {
   laneDef: LaneDef;
   series: Record<string, TraceSeriesPoint[] | undefined>;
-  /** Hover only — the markers themselves are drawn once by MarkerOverlay. */
+  /** Hover only — the markers themselves live on their own track. */
   events: TraceEvent[];
   xMin: number;
   xMax: number;
   width: number;
+  gradientId: string;
   derivedWindows: DiagnosticBundle["derived_windows"];
   windowFromMs: number;
   onHover: (tooltip: TooltipState | null) => void;
 }
 
-const LaneSvg = memo(function LaneSvg({
+const LaneChart = memo(function LaneChart({
   laneDef,
   series,
   events,
   xMin,
   xMax,
   width,
+  gradientId,
   derivedWindows,
   windowFromMs,
   onHover,
-}: LaneSvgProps) {
+}: LaneChartProps) {
   const svgRef = useRef<SVGSVGElement>(null);
 
   const xRange = xMax - xMin || 1;
-  const innerW = Math.max(width - LANE_PAD.left - LANE_PAD.right, 1);
-  const innerH = LANE_PLOT_H - LANE_PAD.top - LANE_PAD.bottom;
+  const plotH = LANE_H - LANE_INSET * 2;
 
-  const toSvgX = useCallback(
-    (ts: number) => LANE_PAD.left + ((ts - xMin) / xRange) * innerW,
-    [xMin, xRange, innerW],
-  );
+  const toSvgX = useCallback((ts: number) => ((ts - xMin) / xRange) * width, [xMin, xRange, width]);
 
   const rendered = useMemo<SeriesRender[]>(() => {
-    return laneDef.series.flatMap((s) => {
-      const pts = [...(series[s.key] ?? [])].sort((a, b) => a.ts_unix_ms - b.ts_unix_ms);
-      if (pts.length === 0) return [];
+    return laneDef.series.map((s, idx) => {
+      const pts = [...(series[s.key] ?? [])]
+        .filter((p) => p.ts_unix_ms >= xMin && p.ts_unix_ms <= xMax)
+        .sort((a, b) => a.ts_unix_ms - b.ts_unix_ms);
+
+      const empty: SeriesRender = {
+        key: s.key,
+        color: s.color,
+        label: s.label,
+        max: 0,
+        last: null,
+        d: "",
+        fillD: "",
+        end: null,
+      };
+      if (pts.length === 0) return empty;
 
       const max = arrMax(pts.map((p) => p.v));
-      // Own scale, always anchored at zero (the v3 mock's lineChart does the
-      // same) so a curve's height is proportional to its value.
-      const scaleMax = max > 0 ? max * 1.1 : 1;
-      const toY = (v: number) => LANE_PAD.top + innerH - (v / scaleMax) * innerH;
+      // Own scale, always anchored at zero, so a curve's height is proportional
+      // to its value.
+      const scaleMax = max > 0 ? max * SCALE_HEADROOM : 1;
+      const toY = (v: number) => LANE_H - (v / scaleMax) * plotH - LANE_INSET;
 
-      // Count-like series (packets lost) get an area fill under the same line.
-      // Drawing one isolated tick per sample — what this did before #124 —
-      // spaces them ~17px apart at any real width, so a low-but-nonzero count
-      // rendered as a row of dots that read as a rendering artifact.
-      const d =
-        s.area && max <= 0
-          ? "" // flat at zero: draw nothing rather than a hairline of dots
-          : pts
-              .map((p, i) => `${i === 0 ? "M" : "L"}${toSvgX(p.ts_unix_ms).toFixed(1)},${toY(p.v).toFixed(1)}`)
-              .join(" ");
+      const d = pts
+        .map(
+          (p, i) =>
+            `${i === 0 ? "M" : "L"}${toSvgX(p.ts_unix_ms).toFixed(1)},${toY(p.v).toFixed(1)}`,
+        )
+        .join(" ");
 
-      const base = (LANE_PAD.top + innerH).toFixed(1);
+      // Primary series only: two stacked gradients in one 54px lane is mud.
       const fillD =
-        s.area && d
-          ? `M${toSvgX(pts[0].ts_unix_ms).toFixed(1)},${base} ${d.slice(1)} L${toSvgX(
+        idx === 0
+          ? `M${toSvgX(pts[0].ts_unix_ms).toFixed(1)},${LANE_H} ${d.slice(1)} L${toSvgX(
               pts[pts.length - 1].ts_unix_ms,
-            ).toFixed(1)},${base} Z`
+            ).toFixed(1)},${LANE_H} Z`
           : "";
 
       // "This series stopped" has to be judged against the series' OWN cadence:
       // a client sampling once a second is always ~1 s behind the domain end,
       // and a flat 2%-of-range threshold would cap every live series on the
       // chart. Three missed samples is a stop; one is the cadence.
-      const gaps = pts.slice(1).map((p, i) => p.ts_unix_ms - pts[i].ts_unix_ms).sort((a, b) => a - b);
+      const gaps = pts
+        .slice(1)
+        .map((p, i) => p.ts_unix_ms - pts[i].ts_unix_ms)
+        .sort((a, b) => a - b);
       const medianGap = gaps.length > 0 ? gaps[Math.floor(gaps.length / 2)] : 0;
       const endThreshold = xMax - Math.max(xRange * 0.02, medianGap * 3);
 
       const last = pts[pts.length - 1];
       const end =
-        last.ts_unix_ms < endThreshold
-          ? { x: toSvgX(last.ts_unix_ms), y: toY(last.v) }
-          : null;
+        last.ts_unix_ms < endThreshold ? { x: toSvgX(last.ts_unix_ms), y: toY(last.v) } : null;
 
-      return [{ key: s.key, color: s.color, label: s.label, max, d, fillD, isArea: !!s.area, end }];
+      return { key: s.key, color: s.color, label: s.label, max, last: last.v, d, fillD, end };
     });
-  }, [laneDef.series, series, toSvgX, innerH, xMax, xRange]);
+  }, [laneDef.series, series, toSvgX, plotH, xMin, xMax, xRange]);
 
   // Highlight bands from derived_windows
   const bands = useMemo(() => {
@@ -262,30 +293,32 @@ const LaneSvg = memo(function LaneSvg({
         : key === "encoder_saturation"
           ? derivedWindows.encoder_saturation ?? []
           : derivedWindows.likely_network_congestion ?? [];
-    return windows.map((w) => ({
-      x1: toSvgX(windowFromMs + w.from_ms),
-      x2: toSvgX(windowFromMs + w.to_ms),
-    }));
-  }, [laneDef.highlightKey, derivedWindows, toSvgX, windowFromMs]);
+    return windows
+      .map((w) => ({
+        x1: Math.max(0, toSvgX(windowFromMs + w.from_ms)),
+        x2: Math.min(width, toSvgX(windowFromMs + w.to_ms)),
+      }))
+      .filter((b) => b.x2 > b.x1);
+  }, [laneDef.highlightKey, derivedWindows, toSvgX, windowFromMs, width]);
 
   const handleMouseMove = useCallback(
     (e: React.MouseEvent<SVGSVGElement>) => {
       const rect = svgRef.current?.getBoundingClientRect();
       if (!rect) return;
-      const svgX = e.clientX - rect.left;
-      const tsAtX = xMin + ((svgX - LANE_PAD.left) / innerW) * xRange;
+      const tsAtX = xMin + ((e.clientX - rect.left) / (rect.width || 1)) * xRange;
 
-      // Find nearest data values for each series
       const values: TooltipState["values"] = [];
       for (const s of laneDef.series) {
         const pts = series[s.key];
         if (!pts || pts.length === 0) continue;
-        // Find closest point by ts
         let closest = pts[0];
         let minDist = Math.abs(pts[0].ts_unix_ms - tsAtX);
         for (const p of pts) {
           const d = Math.abs(p.ts_unix_ms - tsAtX);
-          if (d < minDist) { minDist = d; closest = p; }
+          if (d < minDist) {
+            minDist = d;
+            closest = p;
+          }
         }
         // Manifest estimator/window/why ride the hover row: a lane label says
         // the unit only, and this chart puts a rolling multi-minute median on
@@ -306,68 +339,80 @@ const LaneSvg = memo(function LaneSvg({
 
       onHover({ x: e.clientX, y: e.clientY, laneLabel: laneDef.label, values, nearEvents });
     },
-    [xMin, xRange, innerW, laneDef, series, events, onHover],
+    [xMin, xRange, laneDef, series, events, onHover],
   );
 
   const handleMouseLeave = useCallback(() => onHover(null), [onHover]);
 
+  const primary = rendered[0];
+
   return (
     <>
-      <div className="trace-lane-scale" style={{ height: LANE_SCALE_H }}>
+      <div className="trace-lane-caption">
         {rendered.map((r) => (
           <span key={r.key} data-scale-for={r.key} className="trace-lane-scale-item">
-            <span className="trace-lane-swatch" style={{ background: r.color }} aria-hidden="true" />
-            {r.label} · max {fmtScale(r.max)}
+            <i className="trace-lane-swatch" style={{ background: r.color }} aria-hidden="true" />
+            <span className="num">
+              {r.label} · max {fmtScale(r.max)}
+            </span>
           </span>
         ))}
+        <span className="num trace-lane-value">
+          {primary.last == null ? "—" : fmtScale(primary.last)}
+          <span className="trace-lane-unit">{laneDef.unit}</span>
+        </span>
       </div>
+
       <svg
         ref={svgRef}
-        viewBox={`0 0 ${width} ${LANE_PLOT_H}`}
+        className="trace-lane-plot"
+        viewBox={`0 0 ${width} ${LANE_H}`}
         width={width}
-        height={LANE_PLOT_H}
-        style={{ display: "block", overflow: "visible" }}
+        height={LANE_H}
+        preserveAspectRatio="none"
         onMouseMove={handleMouseMove}
         onMouseLeave={handleMouseLeave}
         aria-hidden="true"
       >
-        {/* highlight bands */}
+        {/* derived-window bands sit under everything: context, not content */}
         {laneDef.highlightColor &&
           bands.map((b, i) => (
             <rect
               key={i}
-              x={Math.max(LANE_PAD.left, b.x1)}
-              y={LANE_PAD.top}
-              width={Math.max(0, Math.min(b.x2, width - LANE_PAD.right) - Math.max(LANE_PAD.left, b.x1))}
-              height={innerH}
+              x={b.x1}
+              y={0}
+              width={b.x2 - b.x1}
+              height={LANE_H}
               fill={laneDef.highlightColor}
             />
           ))}
 
-        {/* lane frame — the top rule is what stops two lanes reading as one */}
-        <line
-          x1={LANE_PAD.left}
-          y1={LANE_PAD.top}
-          x2={width - LANE_PAD.right}
-          y2={LANE_PAD.top}
-          stroke="var(--line)"
-          strokeWidth={0.5}
-        />
-        <line
-          x1={LANE_PAD.left}
-          y1={LANE_PAD.top + innerH}
-          x2={width - LANE_PAD.right}
-          y2={LANE_PAD.top + innerH}
-          stroke="var(--line-2)"
-          strokeWidth={0.5}
-        />
+        {/* baseline / midline / top rule */}
+        {[0, 0.5, 1].map((f) => (
+          <line
+            key={f}
+            x1={0}
+            y1={LANE_H * f}
+            x2={width}
+            y2={LANE_H * f}
+            stroke="var(--line)"
+            strokeWidth={1}
+            vectorEffect="non-scaling-stroke"
+          />
+        ))}
 
-        {/* series — fill first, then the line over it */}
-        {rendered.map((r) =>
-          r.fillD ? (
-            <path key={`${r.key}-fill`} d={r.fillD} fill={r.color} fillOpacity={0.26} stroke="none" />
-          ) : null,
+        {primary.fillD && (
+          <>
+            <defs>
+              <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stopColor={primary.color} stopOpacity={0.2} />
+                <stop offset="1" stopColor={primary.color} stopOpacity={0} />
+              </linearGradient>
+            </defs>
+            <path d={primary.fillD} fill={`url(#${gradientId})`} stroke="none" />
+          </>
         )}
+
         {rendered.map((r) =>
           r.d ? (
             <path
@@ -376,9 +421,10 @@ const LaneSvg = memo(function LaneSvg({
               d={r.d}
               fill="none"
               stroke={r.color}
-              strokeWidth={r.isArea ? 1.2 : 1.5}
+              strokeWidth={1.6}
               strokeLinejoin="round"
               strokeLinecap="round"
+              vectorEffect="non-scaling-stroke"
             />
           ) : null,
         )}
@@ -401,74 +447,75 @@ const LaneSvg = memo(function LaneSvg({
   );
 });
 
-// ── MarkerOverlay ──────────────────────────────────────────────────────────────
+// ── EventTrack ─────────────────────────────────────────────────────────────────
 //
-// Event markers are drawn ONCE across the whole lane stack rather than once per
-// lane: a per-lane marker is chopped into four segments by the lane boundaries,
-// and a dense burst of them turned the chart into a barcode (#124). Markers
-// closer together than MARKER_MIN_GAP_PX collapse into one, so a burst reads as
-// a single annotated moment.
+// Events get their OWN 16px track under the lane stack rather than a dashed line
+// drawn through every lane (#124: a dense burst turned the chart into a barcode
+// and the dashes cut through the lane captions). Markers closer together than
+// MARKER_MIN_GAP_PX collapse into one, so a burst reads as a single annotated
+// moment; the title says how many.
 
 const MARKER_MIN_GAP_PX = 3;
 
-interface MarkerOverlayProps {
+interface EventTrackProps {
   events: TraceEvent[];
   xMin: number;
   xMax: number;
   width: number;
+  trackRef: (el: HTMLElement | null) => void;
 }
 
-const MarkerOverlay = memo(function MarkerOverlay({ events, xMin, xMax, width }: MarkerOverlayProps) {
+const EventTrack = memo(function EventTrack({
+  events,
+  xMin,
+  xMax,
+  width,
+  trackRef,
+}: EventTrackProps) {
   const marks = useMemo(() => {
     const xRange = xMax - xMin || 1;
-    const innerW = Math.max(width - LANE_PAD.left - LANE_PAD.right, 1);
-    const out: Array<{ x: number; type: string; n: number }> = [];
+    const out: Array<{ pct: number; x: number; type: string; n: number; ts: number }> = [];
 
     for (const ev of [...events].sort((a, b) => a.ts_unix_ms - b.ts_unix_ms)) {
       if (ev.ts_unix_ms < xMin || ev.ts_unix_ms > xMax) continue;
-      const x = LANE_PAD.left + ((ev.ts_unix_ms - xMin) / xRange) * innerW;
+      const frac = (ev.ts_unix_ms - xMin) / xRange;
+      const x = frac * width;
       const prev = out[out.length - 1];
       if (prev && prev.type === ev.type && x - prev.x < MARKER_MIN_GAP_PX) {
         prev.n += 1;
         continue;
       }
-      out.push({ x, type: ev.type, n: 1 });
+      out.push({ pct: frac * 100, x, type: ev.type, n: 1, ts: ev.ts_unix_ms });
     }
     return out;
   }, [events, xMin, xMax, width]);
 
   return (
-    <div className="trace-markers" style={{ height: LANE_STACK_H }}>
-      <svg
-        viewBox={`0 0 ${width} ${LANE_STACK_H}`}
-        width={width}
-        height={LANE_STACK_H}
-        style={{ display: "block", overflow: "visible" }}
-        aria-hidden="true"
-      >
-        {marks.map((m, i) => (
-          <line
-            key={i}
-            x1={m.x}
-            y1={0}
-            x2={m.x}
-            y2={LANE_STACK_H}
-            stroke={eventColor(m.type)}
-            strokeWidth={1}
-            strokeDasharray="3 3"
-            opacity={0.55}
-          />
-        ))}
-      </svg>
+    // The measured element (#124): it is the lanes' own content column and it
+    // renders only once the bundle has loaded, which is exactly the case a
+    // mount-only effect could never observe.
+    <div className="trace-markers" ref={trackRef}>
+      {marks.map((m, i) => (
+        <i
+          key={i}
+          className="trace-mark"
+          data-event-type={m.type}
+          title={`${m.type}${m.n > 1 ? ` ×${m.n}` : ""} · ${Math.round(
+            (xMax - m.ts) / 1000,
+          )}s before the end of the window`}
+          style={{ left: `${m.pct.toFixed(2)}%`, background: eventColor(m.type) }}
+        />
+      ))}
     </div>
   );
 });
 
 // ── XAxis ──────────────────────────────────────────────────────────────────────
 //
-// Ticks land on a round number of seconds. Dividing the domain into
-// `floor(width / 80)` equal parts — what this did before #124 — produces labels
-// like +0/+6/+13/+19/+26s, which no operator can read a duration off.
+// Ticks land on a round number of seconds and are labelled as time BEFORE the
+// right edge, which is where "now" is on a live session. Dividing the domain
+// into `floor(width / 80)` equal parts — what this did before #124 — produces
+// labels like +0/+6/+13/+19/+26s, which no operator can read a duration off.
 
 const NICE_STEPS_S = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600];
 
@@ -486,39 +533,49 @@ interface XAxisProps {
   xMin: number;
   xMax: number;
   width: number;
+  /** The right edge is "now" only while the session is still producing samples. */
+  live: boolean;
 }
 
-const XAxis = memo(function XAxis({ xMin, xMax, width }: XAxisProps) {
+const XAxis = memo(function XAxis({ xMin, xMax, width, live }: XAxisProps) {
   const ticks = useMemo(() => {
     const rangeMs = xMax - xMin || 1;
-    const innerW = Math.max(width - LANE_PAD.left - LANE_PAD.right, 1);
-    const step = niceTickStepSeconds(rangeMs / 1000, innerW);
+    const rangeS = rangeMs / 1000;
+    const step = niceTickStepSeconds(rangeS, width);
 
-    const out: Array<{ x: number; label: string }> = [];
-    for (let t = 0; t * 1000 <= rangeMs + 1; t += step) {
+    const out: Array<{ pct: number; label: string; anchor: "start" | "mid" | "end" }> = [];
+    for (let ago = 0; ago <= rangeS + 0.001; ago += step) {
+      const pct = ((rangeS - ago) / rangeS) * 100;
       out.push({
-        x: LANE_PAD.left + ((t * 1000) / rangeMs) * innerW,
-        label: `+${t}s`,
+        pct,
+        label: ago === 0 ? (live ? "now" : "end") : `-${fmtAgo(ago)}`,
+        anchor: ago === 0 ? "end" : pct <= 0.01 ? "start" : "mid",
       });
     }
-    return out;
-  }, [xMin, xMax, width]);
+    return out.reverse();
+  }, [xMin, xMax, width, live]);
 
   return (
-    <svg
-      className="trace-axis"
-      viewBox={`0 0 ${width} 16`}
-      width={width}
-      height={16}
-      style={{ display: "block", overflow: "visible" }}
-      aria-hidden="true"
-    >
+    <div className="trace-axis">
       {ticks.map((t) => (
-        <text key={t.x} x={t.x} y={11} textAnchor="middle" fill="var(--text-4)" fontSize={9}>
+        <span
+          key={t.pct}
+          className="num trace-axis-tick"
+          data-anchor={t.anchor}
+          style={{
+            left: `${t.pct.toFixed(2)}%`,
+            transform:
+              t.anchor === "end"
+                ? "translateX(-100%)"
+                : t.anchor === "start"
+                  ? "none"
+                  : "translateX(-50%)",
+          }}
+        >
           {t.label}
-        </text>
+        </span>
       ))}
-    </svg>
+    </div>
   );
 });
 
@@ -526,10 +583,7 @@ const XAxis = memo(function XAxis({ xMin, xMax, width }: XAxisProps) {
 
 function Tooltip({ tooltip }: { tooltip: TooltipState }) {
   return (
-    <div
-      className="trace-tooltip"
-      style={{ left: tooltip.x + 12, top: tooltip.y - 8 }}
-    >
+    <div className="trace-tooltip" style={{ left: tooltip.x + 12, top: tooltip.y - 8 }}>
       <div className="trace-tooltip-lane">{tooltip.laneLabel}</div>
       {tooltip.values.map((v) => (
         <div key={v.label} className="trace-tooltip-row" title={v.title || undefined}>
@@ -566,41 +620,33 @@ function ClockBadge({ clock }: { clock: DiagnosticBundle["clock"] }) {
   );
 }
 
-// ── VerdictPanel ───────────────────────────────────────────────────────────────
+// ── Verdict ────────────────────────────────────────────────────────────────────
 
 // ST-07 (#324): the old classifier's overloaded "unknown" is split into "nominal"
-// (a healthy session — green) and "indeterminate_client_hidden" (grey — the classifier
-// can't assess presentation only because the tab was hidden/backgrounded). The three
-// likely_* verdicts stay amber/network/client-colored; genuine "unknown" stays plain.
+// (a healthy session) and "indeterminate_client_hidden" (the classifier can't
+// assess presentation only because the tab was hidden/backgrounded).
 const VERDICT_LABELS: Record<string, string> = {
-  likely_encoder_saturation:        "Likely: Encoder Saturation",
-  likely_network_congestion:        "Likely: Network Congestion",
+  likely_encoder_saturation: "Likely: Encoder Saturation",
+  likely_network_congestion: "Likely: Network Congestion",
   likely_client_presentation_limit: "Likely: Client Presentation Limit",
-  nominal:                          "Nominal",
-  indeterminate_client_hidden:      "Indeterminate (client hidden)",
-  unknown:                          "Verdict: Unknown",
+  nominal: "Nominal",
+  indeterminate_client_hidden: "Indeterminate (client hidden)",
+  unknown: "Verdict: Unknown",
 };
 
-const VERDICT_CLASSES: Record<string, string> = {
-  likely_encoder_saturation:        "trace-verdict-encoder",
-  likely_network_congestion:        "trace-verdict-network",
-  likely_client_presentation_limit: "trace-verdict-client",
-  nominal:                          "trace-verdict-nominal",
-  indeterminate_client_hidden:      "trace-verdict-indeterminate",
-  unknown:                          "trace-verdict-unknown",
+// Each verdict takes the state token that already means what the verdict means:
+// encoder saturation = warning, network congestion = info (the console's
+// transport hue), a client-side limit = accent (its client/browser hue),
+// nominal = success. #124: these were hardcoded GitHub-Primer hexes that did
+// not follow [data-theme="light"].
+const VERDICT_VARIANTS: Record<string, ChipVariant> = {
+  likely_encoder_saturation: "warning",
+  likely_network_congestion: "info",
+  likely_client_presentation_limit: "accent",
+  nominal: "success",
+  indeterminate_client_hidden: "neutral",
+  unknown: "neutral",
 };
-
-// ST-09: the verdict is now a VALUE, not a string plus prose. What it gained is
-// what an operator could not previously check — the window and the per-source
-// sample counts behind it, whether the two clocks can be aligned at all, and the
-// falsifiers: the specific numbers the verdict rests on, each with its estimator,
-// threshold and sample count, and whether it holds.
-//
-// Deliberately styled with the EXISTING verdict-block classes only. The design
-// handoff has no falsifier mockup (admin-session-detail.html predates it), so
-// this adds no new tokens, colours or rules — the falsifiers ride the same
-// `.trace-verdict-evidence` list the prose evidence uses, and the clock reuses
-// the `.trace-clock-unmeasured` chip already on this page.
 
 const TIER_LABELS: Record<string, string> = {
   full: "full (host + client, clocks aligned)",
@@ -638,10 +684,12 @@ function FalsifierRow({ f }: { f: Falsifier }) {
   );
 }
 
-function VerdictPanel({ classifier }: { classifier: DiagnosticBundle["classifier"] }) {
+// The strip is one row — chip, one-line reason, evidence toggle — over a panel
+// holding the prose evidence, the ST-09 falsifiers, and the tier/clock footnote.
+function VerdictStrip({ classifier }: { classifier: DiagnosticBundle["classifier"] }) {
   const [open, setOpen] = useState(false);
   const label = VERDICT_LABELS[classifier.verdict] ?? classifier.verdict;
-  const cls = VERDICT_CLASSES[classifier.verdict] ?? "trace-verdict-unknown";
+  const variant = VERDICT_VARIANTS[classifier.verdict] ?? "neutral";
   // Pre-ST-09 control planes return only verdict + evidence, and this admin page
   // is routinely pointed at a stack that has not been redeployed yet. Every new
   // field is therefore read defensively: an older bundle renders exactly as it
@@ -649,63 +697,66 @@ function VerdictPanel({ classifier }: { classifier: DiagnosticBundle["classifier
   const falsifiers = classifier.falsifiers ?? [];
   const clock = classifier.clock;
   const tier = classifier.evidence_tier;
-  const hasDetail = classifier.evidence.length > 0 || falsifiers.length > 0;
+  const hasDetail = classifier.evidence.length > 0 || falsifiers.length > 0 || !!tier || !!clock;
 
   return (
-    <div className={`trace-verdict ${cls}`}>
-      <div className="trace-verdict-head">
-        <span className="trace-verdict-label">{label}</span>
+    <>
+      <div className="trace-verdict-strip">
+        <Chip variant={variant}>{label}</Chip>
+        {classifier.reason && (
+          <span className="trace-verdict-line" title={classifier.reason}>
+            {classifier.reason}
+          </span>
+        )}
         {hasDetail && (
           <button
-            className="trace-verdict-toggle"
+            className="btn btn-sm btn-ghost trace-verdict-toggle"
             onClick={() => setOpen((o) => !o)}
             aria-expanded={open}
+            type="button"
           >
             {open ? "hide" : "evidence"}
           </button>
         )}
       </div>
 
-      {classifier.reason && <div className="trace-verdict-evidence">{classifier.reason}</div>}
-
-      {(tier || clock) && (
-        <div className="trace-verdict-evidence">
-          {tier && <>evidence: {TIER_LABELS[tier] ?? tier}</>}
-          {tier && clock && " · "}
-          {clock &&
-            (clock.quality === "measured" ? (
-              <>
-                clock: measured
-                {clock.offset_ms != null && ` (offset ${Math.round(clock.offset_ms * 10) / 10} ms`}
-                {clock.uncertainty_ms != null &&
-                  `, ±${Math.round(clock.uncertainty_ms * 10) / 10} ms`}
-                {clock.offset_ms != null && ")"}
-              </>
-            ) : (
-              <span className="trace-clock-unmeasured">clock: unmeasured</span>
-            ))}
-        </div>
-      )}
-
       {open && (
-        <>
+        <div className="trace-evidence">
           {classifier.evidence.length > 0 && (
-            <ul className="trace-verdict-evidence">
+            <ul className="trace-evidence-list">
               {classifier.evidence.map((e, i) => (
                 <li key={i}>{e}</li>
               ))}
             </ul>
           )}
           {falsifiers.length > 0 && (
-            <ul className="trace-verdict-evidence">
+            <ul className="trace-evidence-list">
               {falsifiers.map((f) => (
                 <FalsifierRow key={`${f.name}:${f.estimator}`} f={f} />
               ))}
             </ul>
           )}
-        </>
+          {(tier || clock) && (
+            <div className="num trace-evidence-meta">
+              {tier && <>evidence: {TIER_LABELS[tier] ?? tier}</>}
+              {tier && clock && " · "}
+              {clock &&
+                (clock.quality === "measured" ? (
+                  <>
+                    clock: measured
+                    {clock.offset_ms != null && ` (offset ${Math.round(clock.offset_ms * 10) / 10} ms`}
+                    {clock.uncertainty_ms != null &&
+                      `, ±${Math.round(clock.uncertainty_ms * 10) / 10} ms`}
+                    {clock.offset_ms != null && ")"}
+                  </>
+                ) : (
+                  <span className="trace-clock-unmeasured">clock: unmeasured</span>
+                ))}
+            </div>
+          )}
+        </div>
       )}
-    </div>
+    </>
   );
 }
 
@@ -726,35 +777,40 @@ function TraceLegend({ events }: { events: TraceEvent[] }) {
     <div className="trace-legend">
       {types.map((t) => (
         <span key={t} className="trace-legend-item">
-          {/* 16px to match the series legend in Charts.tsx — at 12px two event
-              colours a shade apart were indistinguishable. */}
-          <svg width={16} height={10} aria-hidden="true">
-            <line
-              x1={0} y1={5} x2={16} y2={5}
-              stroke={eventColor(t)}
-              strokeWidth={1.5}
-              strokeDasharray="3 3"
-            />
-          </svg>
-          <span>{t}</span>
+          <i className="trace-legend-swatch" style={{ background: eventColor(t) }} aria-hidden="true" />
+          <span className="num">{t}</span>
         </span>
       ))}
       {hasOther && (
-        <span className="trace-legend-item" title="lifecycle and negotiation events — hover a lane to name the one under the cursor">
-          <svg width={16} height={10} aria-hidden="true">
-            <line
-              x1={0} y1={5} x2={16} y2={5}
-              stroke={OTHER_EVENT_COLOR}
-              strokeWidth={1.5}
-              strokeDasharray="3 3"
-            />
-          </svg>
-          <span>other event</span>
+        <span
+          className="trace-legend-item"
+          title="lifecycle and negotiation events — hover a lane to name the one under the cursor"
+        >
+          <i
+            className="trace-legend-swatch"
+            style={{ background: OTHER_EVENT_COLOR }}
+            aria-hidden="true"
+          />
+          <span className="num">other event</span>
         </span>
       )}
     </div>
   );
 }
+
+// ── Window selector ────────────────────────────────────────────────────────────
+//
+// A view crop over the bundle already fetched, not a second request: the server
+// clamps the diagnostic-bundle window to [2, 10] minutes and defaults to 5, so a
+// wider position than 5m would silently show the same data under a longer label.
+// The reference mockup's third position (30m) is unimplementable against this
+// endpoint for that reason.
+const WINDOW_OPTIONS = [
+  { value: "60", label: "60s" },
+  { value: "300", label: "5m" },
+] as const;
+type WindowValue = (typeof WINDOW_OPTIONS)[number]["value"];
+const DEFAULT_WINDOW: WindowValue = "300";
 
 // Session states considered non-terminal for live polling purposes (schema.md /
 // api/types.ts SessionState). A session in any other state (stopped/failed, or the
@@ -781,8 +837,13 @@ export function TraceViewer({ sessionId, token, sessionState }: TraceViewerProps
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [tooltip, setTooltip] = useState<TooltipState | null>(null);
+  const [viewWindow, setViewWindow] = useState<WindowValue>(DEFAULT_WINDOW);
+  // Hovering the plot holds the chart still: a live poll that redraws under the
+  // cursor moves the sample the tooltip is describing.
+  const [hovering, setHovering] = useState(false);
 
-  const [plotRef, plotWidth] = useContainerWidth(600);
+  const [trackRef, plotWidth] = useContainerWidth(900);
+  const gradientBase = useId().replace(/:/g, "_");
 
   // Refetches without dropping into the full-page loading state — used by the poll
   // timer so a live-updating chart doesn't flash "Loading trace…" every tick (#139/#150
@@ -818,117 +879,150 @@ export function TraceViewer({ sessionId, token, sessionState }: TraceViewerProps
   // Stops automatically on a terminal state or unmount — no manual toggle needed to
   // avoid a leaked timer.
   const isLive = sessionState != null && NON_TERMINAL_STATES.has(sessionState);
+  const paused = isLive && hovering;
   useEffect(() => {
     if (!isLive) return;
     const id = window.setInterval(() => {
+      if (hovering) return;
       void refetch();
     }, POLL_INTERVAL_MS);
     return () => window.clearInterval(id);
-  }, [isLive, refetch]);
+  }, [isLive, hovering, refetch]);
 
-  // Compute shared x domain across all series
-  const { xMin, xMax } = useMemo(() => {
-    if (!bundle) return { xMin: 0, xMax: 1 };
+  // The sampled domain, before the view crop.
+  const { dataMin, dataMax } = useMemo(() => {
+    if (!bundle) return { dataMin: 0, dataMax: 1 };
     const allTs = Object.values(bundle.series)
       .flatMap((pts) => pts ?? [])
       .map((p) => p.ts_unix_ms);
     allTs.push(...bundle.events.map((e) => e.ts_unix_ms));
     if (allTs.length === 0) {
-      return { xMin: bundle.window.from_ms, xMax: bundle.window.to_ms };
+      return { dataMin: bundle.window.from_ms, dataMax: bundle.window.to_ms };
     }
-    return { xMin: arrMin(allTs), xMax: arrMax(allTs) };
+    return { dataMin: arrMin(allTs), dataMax: arrMax(allTs) };
   }, [bundle]);
 
-  // Stable series map
+  // The visible domain: the last N seconds of what was sampled, anchored on the
+  // newest sample rather than on wall-clock now, so a stopped session still
+  // fills its lanes.
+  const xMax = dataMax;
+  const xMin = Math.max(dataMin, dataMax - Number(viewWindow) * 1000);
+
   const seriesMap = useMemo(() => bundle?.series ?? {}, [bundle]);
 
-  // The lane label column; the plot itself takes the rest of the measured row.
-  const LABEL_W = 80;
-  const svgWidth = Math.max(plotWidth - LABEL_W, 100);
-
-  // The axis is drawn over the SAMPLED range, which can be much shorter than the
-  // window the verdict was computed over (a host that stopped reporting, a
-  // client that joined late). Saying so is the difference between "38 s of a
+  // The axis is drawn over the VISIBLE range, which can be much shorter than the
+  // window the verdict was computed over (a crop, a host that stopped reporting,
+  // a client that joined late). Saying so is the difference between "38 s of a
   // 300 s window" and a chart that looks truncated (#124).
   const axisNote = useMemo(() => {
     if (!bundle) return null;
-    const sampled = xMax - xMin;
+    const shown = xMax - xMin;
+    const sampled = dataMax - dataMin;
     const declared = bundle.window.to_ms - bundle.window.from_ms;
-    if (sampled <= 0 || declared <= 0 || sampled >= declared * 0.9) return null;
-    return `axis shows the sampled range — ${fmtSeconds(sampled)} of a ${fmtSeconds(declared)} window`;
-  }, [bundle, xMin, xMax]);
+    if (shown <= 0) return null;
+    if (sampled > 0 && shown < sampled * 0.99) {
+      return `showing the last ${fmtSeconds(shown)} of ${fmtSeconds(sampled)} sampled`;
+    }
+    if (declared <= 0 || shown >= declared * 0.9) return null;
+    return `axis shows the sampled range — ${fmtSeconds(shown)} of a ${fmtSeconds(declared)} window`;
+  }, [bundle, xMin, xMax, dataMin, dataMax]);
 
-  const hasData =
-    !!bundle && Object.values(bundle.series).some((pts) => (pts?.length ?? 0) > 0);
+  const hasData = !!bundle && Object.values(bundle.series).some((pts) => (pts?.length ?? 0) > 0);
   const isEmpty = !!bundle && !hasData && bundle.events.length === 0;
 
   return (
-    <div className="trace-viewer">
-      {/* Top row: clock badge + live indicator + refresh. Rendered in every
-          state so a failed load still offers a retry. */}
-      <div className="trace-clock-row">
-        {bundle && <ClockBadge clock={bundle.clock} />}
-        {isLive && (
-          <span title={`auto-updating every ${POLL_INTERVAL_MS / 1000}s`}>
-            <LiveDot label="live" />
-          </span>
-        )}
-        <button className="btn btn-sm" onClick={() => void load()}>
-          Refresh
-        </button>
+    <div className="card trace-card">
+      <div className="panel-head">
+        <span className="panel-title">Trace</span>
+        <span className="hint">stacked time-series + events</span>
+        <div className="acts">
+          <SegmentedControl
+            options={WINDOW_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
+            value={viewWindow}
+            onChange={(v) => setViewWindow(v as WindowValue)}
+            aria-label="Trace window"
+          />
+          {bundle && <ClockBadge clock={bundle.clock} />}
+          {isLive && (
+            <Chip
+              variant={paused ? "warning" : "success"}
+              dot
+              title={
+                paused
+                  ? "paused while the pointer is over the chart"
+                  : `auto-updating every ${POLL_INTERVAL_MS / 1000}s`
+              }
+            >
+              {paused ? "paused" : "live"}
+            </Chip>
+          )}
+          {/* Rendered in every state so a failed load still offers a retry. */}
+          <button className="btn btn-sm btn-ghost" onClick={() => void load()} type="button">
+            <IconRefresh />
+            Refresh
+          </button>
+        </div>
       </div>
 
       {loading ? (
-        <p className="muted">Loading trace…</p>
+        <p className="trace-state muted">Loading trace…</p>
       ) : loadError ? (
-        <p className="form-error">{loadError}</p>
+        <p className="trace-state form-error">{loadError}</p>
       ) : !bundle ? null : isEmpty ? (
-        <p className="muted">No trace data for this session yet.</p>
+        <p className="trace-state muted">No trace data for this session yet.</p>
       ) : (
         <>
-          <VerdictPanel classifier={bundle.classifier} />
+          <VerdictStrip classifier={bundle.classifier} />
 
-          {/* Stacked lanes. The measured element is this row — the observer is
-              attached by a callback ref, so it binds whenever the plot appears
-              rather than only on the component's first (loading) render. */}
-          <div className="trace-plot" ref={plotRef}>
-            <div className="trace-plot-labels" style={{ width: LABEL_W }}>
-              {LANES.map((lane) => (
-                <div key={lane.label} className="trace-lane-label" style={{ height: LANE_HEIGHT }}>
-                  {lane.label}
-                </div>
-              ))}
-            </div>
-
-            <div className="trace-plot-lanes">
-              <MarkerOverlay
-                events={bundle.events}
-                xMin={xMin}
-                xMax={xMax}
-                width={svgWidth}
-              />
-              {LANES.map((lane) => (
-                <div key={lane.label} className="trace-lane-svg" style={{ height: LANE_HEIGHT }}>
-                  <LaneSvg
+          <div
+            className="trace-body"
+            onMouseEnter={() => setHovering(true)}
+            onMouseLeave={() => setHovering(false)}
+          >
+            {LANES.map((lane) => (
+              <div key={lane.id} className="trace-lane-row">
+                <span className="eyebrow trace-lane-label">{lane.label}</span>
+                <div className="trace-lane-col">
+                  <LaneChart
                     laneDef={lane}
                     series={seriesMap}
                     events={bundle.events}
                     xMin={xMin}
                     xMax={xMax}
-                    width={svgWidth}
+                    width={plotWidth}
+                    gradientId={`${gradientBase}-${lane.id}`}
                     derivedWindows={bundle.derived_windows}
                     windowFromMs={bundle.window.from_ms}
                     onHover={setTooltip}
                   />
                 </div>
-              ))}
-              <XAxis xMin={xMin} xMax={xMax} width={svgWidth} />
+              </div>
+            ))}
+
+            <div className="trace-lane-row trace-event-row">
+              <span className="eyebrow trace-lane-label">Events</span>
+              <EventTrack
+                events={bundle.events}
+                xMin={xMin}
+                xMax={xMax}
+                width={plotWidth}
+                trackRef={trackRef}
+              />
+            </div>
+
+            <div className="trace-lane-row trace-axis-row">
+              <span />
+              <XAxis xMin={xMin} xMax={xMax} width={plotWidth} live={isLive} />
+            </div>
+
+            <div className="trace-lane-row trace-legend-row">
+              <span />
+              <div>
+                <TraceLegend events={bundle.events} />
+                {axisNote && <p className="trace-axis-note">{axisNote}</p>}
+              </div>
             </div>
           </div>
-
-          {axisNote && <p className="trace-axis-note">{axisNote}</p>}
-
-          <TraceLegend events={bundle.events} />
         </>
       )}
 

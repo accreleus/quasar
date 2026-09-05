@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { DiagnosticBundle } from "../api/types";
 
 // jsdom does not implement ResizeObserver — provide a stub that records what it
@@ -258,12 +258,18 @@ describe("TraceViewer", () => {
   // ST-09: the verdict block now carries the value's new fields. These are the
   // parts an operator uses to CHECK the verdict rather than take it on faith.
   describe("verdict value (ST-09)", () => {
-    it("shows the reason, the evidence tier and a measured clock without expanding", async () => {
+    it("shows the reason on the strip and the tier + clock behind `evidence`", async () => {
+      // The reference mockup's strip is one row — chip, one-line reason, the way
+      // in — so the ST-09 footnote moved into the disclosure. The clock is still
+      // unconditionally visible: it is a chip in the card head.
       mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
       render(<TraceViewer sessionId="sess-abc" token="tok" />);
       await waitFor(() =>
         expect(screen.getByText(/60 host, 58 client samples/)).toBeTruthy(),
       );
+      await act(async () => {
+        screen.getByText("evidence").click();
+      });
       expect(screen.getByText(/full \(host \+ client, clocks aligned\)/)).toBeTruthy();
       expect(screen.getByText(/clock: measured/)).toBeTruthy();
     });
@@ -279,7 +285,11 @@ describe("TraceViewer", () => {
       };
       mockGetDiagnosticBundle.mockResolvedValue(bundle);
       render(<TraceViewer sessionId="sess-abc" token="tok" />);
-      await waitFor(() => expect(screen.getByText("clock: unmeasured")).toBeTruthy());
+      await waitFor(() => expect(screen.getByText("evidence")).toBeTruthy());
+      await act(async () => {
+        screen.getByText("evidence").click();
+      });
+      expect(screen.getByText("clock: unmeasured")).toBeTruthy();
       expect(screen.getByText(/host only/)).toBeTruthy();
     });
 
@@ -386,19 +396,22 @@ describe("TraceViewer", () => {
     });
   });
 
-  // ── #124: the chart was stuck at its fallback width and off the token palette ──
+  // ── #124 / mockup conformance ───────────────────────────────────────────────
+  // The chart was stuck at its fallback width and off the token palette; the
+  // structure now follows the operator's standalone Session Trace reference.
   describe("layout and theming (#124)", () => {
     it("observes the real chart container once the bundle has loaded", async () => {
-      // The container carries the ref but sits behind the loading early-return,
-      // so an effect that only runs on mount attaches to nothing and the chart
-      // stays at its 600px fallback for the life of the component.
+      // The measured element is the lanes' content column, which sits behind the
+      // loading early-return: an effect that only runs on mount attaches to
+      // nothing and the chart stays at its fallback width for the life of the
+      // component.
       mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
       const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
-      await waitFor(() => expect(container.querySelector(".trace-viewer")).toBeTruthy());
+      await waitFor(() => expect(container.querySelector(".trace-body")).toBeTruthy());
 
-      const plot = container.querySelector(".trace-plot");
-      expect(plot).toBeTruthy();
-      await waitFor(() => expect(observedEls).toContain(plot));
+      const track = container.querySelector(".trace-markers");
+      expect(track).toBeTruthy();
+      await waitFor(() => expect(observedEls).toContain(track));
     });
 
     it("re-attaches the observer when the chart remounts after an error", async () => {
@@ -412,44 +425,70 @@ describe("TraceViewer", () => {
       await act(async () => {
         screen.getByText("Refresh").click();
       });
-      await waitFor(() => expect(container.querySelector(".trace-plot")).toBeTruthy());
-      expect(observedEls).toContain(container.querySelector(".trace-plot"));
+      await waitFor(() => expect(container.querySelector(".trace-markers")).toBeTruthy());
+      expect(observedEls).toContain(container.querySelector(".trace-markers"));
     });
 
-    it("labels the x axis on round second intervals", async () => {
+    it("labels the x axis on round intervals, back from the right edge", async () => {
       mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
       const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
       await waitFor(() => expect(container.querySelector(".trace-axis")).toBeTruthy());
 
-      const labels = [...container.querySelectorAll(".trace-axis text")].map(
+      const labels = [...container.querySelectorAll(".trace-axis-tick")].map(
         (t) => t.textContent ?? "",
       );
       expect(labels.length).toBeGreaterThan(1);
-      const secs = labels.map((l) => Number(/^\+(\d+)s$/.exec(l)?.[1]));
+      // No session state was passed, so the session is not live and the right
+      // edge is the end of the data rather than "now".
+      expect(labels[labels.length - 1]).toBe("end");
+
+      const secs = labels.slice(0, -1).map((l) => Number(/^-(\d+)s$/.exec(l)?.[1]));
       expect(secs.every((n) => Number.isFinite(n))).toBe(true);
       // Every gap is the same, and it is a round step an operator can read off.
-      const step = secs[1] - secs[0];
+      const step = secs[0] - secs[1];
       expect([1, 2, 5, 10, 15, 30, 60, 120, 300, 600]).toContain(step);
-      secs.forEach((n, i) => expect(n).toBe(secs[0] + step * i));
+      secs.forEach((n, i) => expect(n).toBe(secs[0] - step * i));
     });
 
-    it("draws every series and every event marker from a design token", async () => {
+    it('labels the right edge "now" while the session is live', async () => {
+      mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
+      const { container } = render(
+        <TraceViewer sessionId="sess-abc" token="tok" sessionState="running" />,
+      );
+      await waitFor(() => expect(container.querySelector(".trace-axis")).toBeTruthy());
+      const labels = [...container.querySelectorAll(".trace-axis-tick")].map(
+        (t) => t.textContent ?? "",
+      );
+      expect(labels[labels.length - 1]).toBe("now");
+    });
+
+    it("draws every series, band and marker from a design token", async () => {
       // No literal hex may survive: the hardcoded GitHub-Primer palette did not
       // follow [data-theme="light"] and matched nothing else in the console.
       mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
       const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
-      await waitFor(() => expect(container.querySelector(".trace-plot")).toBeTruthy());
+      await waitFor(() => expect(container.querySelector(".trace-body")).toBeTruthy());
 
-      const strokes = [...container.querySelectorAll("svg [stroke]")]
-        .map((el) => el.getAttribute("stroke") ?? "")
-        .filter((s) => s !== "none");
-      expect(strokes.length).toBeGreaterThan(0);
-      strokes.forEach((s) => expect(s).toMatch(/^var\(--/));
+      const paint = [
+        ...container.querySelectorAll("svg [stroke], svg [fill], svg [stop-color]"),
+      ].flatMap((el) =>
+        ["stroke", "fill", "stop-color"]
+          .map((a) => el.getAttribute(a) ?? "")
+          .filter((v) => v !== "" && v !== "none"),
+      );
+      expect(paint.length).toBeGreaterThan(0);
+      // A gradient area references its own <linearGradient>; everything else is
+      // a token directly.
+      paint.forEach((v) => expect(v).toMatch(/^(var\(--|url\(#)/));
 
-      const fills = [...container.querySelectorAll("svg [fill]")]
-        .map((el) => el.getAttribute("fill") ?? "")
-        .filter((s) => s !== "none");
-      fills.forEach((s) => expect(s).toMatch(/^var\(--/));
+      // Event marks and legend swatches are HTML, painted by inline background.
+      const swatches = [
+        ...container.querySelectorAll<HTMLElement>(
+          ".trace-mark, .trace-legend-swatch, .trace-lane-swatch",
+        ),
+      ].map((el) => el.style.background);
+      expect(swatches.length).toBeGreaterThan(0);
+      swatches.forEach((v) => expect(v).toMatch(/^var\(--/));
     });
 
     it("scales each series in a lane on its own range", async () => {
@@ -457,7 +496,7 @@ describe("TraceViewer", () => {
       // onto the baseline and made the lane look broken.
       mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
       const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
-      await waitFor(() => expect(container.querySelector(".trace-plot")).toBeTruthy());
+      await waitFor(() => expect(container.querySelector(".trace-body")).toBeTruthy());
 
       const encode = container.querySelector<SVGPathElement>(
         '[data-series="encoder.encode_ms"]',
@@ -474,7 +513,7 @@ describe("TraceViewer", () => {
     it("states each series' scale in the lane", async () => {
       mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
       const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
-      await waitFor(() => expect(container.querySelector(".trace-plot")).toBeTruthy());
+      await waitFor(() => expect(container.querySelector(".trace-body")).toBeTruthy());
       // The lane says what the top of each curve is worth; without it no value
       // on the chart can be read at all.
       expect(container.querySelector('[data-scale-for="encoder.fps"]')?.textContent).toMatch(
@@ -482,16 +521,38 @@ describe("TraceViewer", () => {
       );
     });
 
-    it("draws event markers once across the lane stack, not once per lane", async () => {
+    it("gives each lane a headline reading of its primary series", async () => {
+      mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
+      const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
+      await waitFor(() => expect(container.querySelector(".trace-lane-value")).toBeTruthy());
+      // Encoder is the first lane; its newest fps sample is 58.
+      const readout = container.querySelector(".trace-lane-value")!.textContent ?? "";
+      expect(readout).toMatch(/58/);
+      expect(readout).toMatch(/fps/);
+    });
+
+    it("fills the primary series with a gradient and leaves the rest as lines", async () => {
+      mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
+      const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
+      await waitFor(() => expect(container.querySelector(".trace-body")).toBeTruthy());
+
+      // One gradient per lane that has data — four here, never one per series:
+      // two stacked areas in a 54px lane is mud.
+      const gradients = container.querySelectorAll("linearGradient");
+      expect(gradients.length).toBe(4);
+      const filled = [...container.querySelectorAll("svg path[fill^='url(']")];
+      expect(filled.length).toBe(4);
+    });
+
+    it("draws event markers on their own track, not through the lanes", async () => {
       mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
       const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
       await waitFor(() => expect(container.querySelector(".trace-markers")).toBeTruthy());
 
-      // Two events in the fixture, one overlay, one line each.
-      const markers = container.querySelectorAll(".trace-markers line");
-      expect(markers.length).toBe(2);
+      // Two events in the fixture, one track, one mark each.
+      expect(container.querySelectorAll(".trace-markers .trace-mark").length).toBe(2);
       // …and no lane draws its own copy.
-      container.querySelectorAll(".trace-lane-svg").forEach((laneSvg) => {
+      container.querySelectorAll(".trace-lane-plot").forEach((laneSvg) => {
         expect(laneSvg.querySelectorAll("line[stroke-dasharray]").length).toBe(0);
       });
     });
@@ -501,23 +562,86 @@ describe("TraceViewer", () => {
       // early with nothing to say so — it read as a truncated chart.
       mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
       const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
-      await waitFor(() => expect(container.querySelector(".trace-plot")).toBeTruthy());
+      await waitFor(() => expect(container.querySelector(".trace-body")).toBeTruthy());
       // transport.rtt_ms has a single sample 30s before the last encoder sample.
-      expect(
-        container.querySelector('[data-series-end="transport.rtt_ms"]'),
-      ).toBeTruthy();
+      expect(container.querySelector('[data-series-end="transport.rtt_ms"]')).toBeTruthy();
       // encoder.encode_ms runs to the end of the domain, so it gets no end cap.
-      expect(
-        container.querySelector('[data-series-end="encoder.encode_ms"]'),
-      ).toBeNull();
+      expect(container.querySelector('[data-series-end="encoder.encode_ms"]')).toBeNull();
     });
 
     it("says so when the axis covers less than the classifier's window", async () => {
       mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
       render(<TraceViewer sessionId="sess-abc" token="tok" />);
-      // Fixture: samples span 30 s of a declared 60 s window.
+      // Fixture: samples span 20 s of a declared 60 s window.
       await waitFor(() =>
         expect(screen.getByText(/sampled range/i).textContent).toMatch(/60 s window/),
+      );
+    });
+
+    it("crops the view to the selected window and says it is cropped", async () => {
+      // The window control is a crop of the bundle already fetched: the server
+      // clamps the diagnostic-bundle window to [2, 10] minutes, so a second
+      // request would return the same samples under a different label.
+      const now = Date.now();
+      const long: DiagnosticBundle = {
+        ...BASE_BUNDLE,
+        window: { from_ms: now - 200_000, to_ms: now },
+        series: {
+          "encoder.fps": Array.from({ length: 21 }, (_, i) => ({
+            ts_unix_ms: now - 200_000 + i * 10_000,
+            v: 60,
+          })),
+        },
+        events: [],
+      };
+      mockGetDiagnosticBundle.mockResolvedValue(long);
+      const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
+      await waitFor(() => expect(container.querySelector(".trace-body")).toBeTruthy());
+
+      const commands = () =>
+        (container
+          .querySelector('[data-series="encoder.fps"]')!
+          .getAttribute("d")!
+          .match(/[ML]/g) ?? []).length;
+      // 5m (the default) holds all 21 samples.
+      expect(commands()).toBe(21);
+
+      await act(async () => {
+        screen.getByRole("tab", { name: "60s" }).click();
+      });
+      // 60s keeps only the last minute of them.
+      expect(commands()).toBe(7);
+      expect(screen.getByText(/showing the last 60 s of 200 s sampled/)).toBeTruthy();
+    });
+
+    it("holds the chart still while the pointer is over it", async () => {
+      // A live poll that redraws under the cursor moves the sample the tooltip
+      // is describing.
+      mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
+      const { container } = render(
+        <TraceViewer sessionId="sess-abc" token="tok" sessionState="running" />,
+      );
+      await waitFor(() => expect(screen.getByText("live")).toBeTruthy());
+
+      await act(async () => {
+        fireEvent.mouseEnter(container.querySelector(".trace-body")!);
+      });
+      expect(screen.getByText("paused")).toBeTruthy();
+
+      await act(async () => {
+        fireEvent.mouseLeave(container.querySelector(".trace-body")!);
+      });
+      expect(screen.getByText("live")).toBeTruthy();
+    });
+
+    it("renders the card head from the v3 panel primitives", async () => {
+      mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
+      const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
+      await waitFor(() => expect(container.querySelector(".trace-body")).toBeTruthy());
+      expect(container.querySelector(".card.trace-card > .panel-head")).toBeTruthy();
+      expect(container.querySelector(".panel-title")?.textContent).toBe("Trace");
+      expect(container.querySelector(".panel-head .hint")?.textContent).toBe(
+        "stacked time-series + events",
       );
     });
   });
