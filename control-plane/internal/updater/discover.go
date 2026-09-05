@@ -22,12 +22,10 @@ const (
 )
 
 // Discover reads this container's compose labels over the mounted socket.
-// `$HOSTNAME` is the container's short id unless the operator set one, which is
-// what `docker inspect` accepts.
 func Discover(ctx context.Context, d Docker) (project, workingDir string, configFiles []string, err error) {
-	self := os.Getenv("HOSTNAME")
+	self := SelfContainerID()
 	if self == "" {
-		return "", "", nil, fmt.Errorf("HOSTNAME is empty: the updater cannot identify its own container, so it cannot discover its compose project")
+		return "", "", nil, fmt.Errorf("cannot identify this container (no id in /proc/self/mountinfo and $HOSTNAME=%q is not a container id), so the compose project cannot be discovered", os.Getenv("HOSTNAME"))
 	}
 	// One inspect, three lines in a fixed order: no JSON parsing, and a missing
 	// label is an empty line rather than a template error.
@@ -73,4 +71,43 @@ func Discover(ctx context.Context, d Docker) (project, workingDir string, config
 		}
 	}
 	return project, workingDir, configFiles, nil
+}
+
+// SelfContainerID reads this container's own id from `/proc/self/mountinfo`,
+// falling back to `$HOSTNAME` only when it LOOKS like a container id. A compose
+// stack that sets `hostname:` makes `$HOSTNAME` a DNS name (`quasar-dev.local`)
+// and `docker inspect -- quasar-dev.local` answers "No such object" — the same
+// defect that made the agent's install discovery report unknown (#107). Its
+// Rust twin is `nvidia_volume::self_container_id`.
+func SelfContainerID() string {
+	if body, err := os.ReadFile("/proc/self/mountinfo"); err == nil {
+		if id := containerIDFromMountinfo(string(body)); id != "" {
+			return id
+		}
+	}
+	h := os.Getenv("HOSTNAME")
+	if len(h) >= 12 && isHex(h) {
+		return h
+	}
+	return ""
+}
+
+func containerIDFromMountinfo(body string) string {
+	for _, line := range strings.Split(body, "\n") {
+		for _, token := range strings.Split(line, "/") {
+			if len(token) == 64 && isHex(token) {
+				return token
+			}
+		}
+	}
+	return ""
+}
+
+func isHex(s string) bool {
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return s != ""
 }
