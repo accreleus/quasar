@@ -293,6 +293,22 @@ Read in `node-agent/src/config.rs`. `CONTROL_PLANE_URL` is **required**.
 
 ## Node agent — encoder & GPU
 
+Intel inventory does not require AMD's `mem_info_vram_total` attribute. The agent
+uses the DRM card's `lmem_total_bytes` when available, then sums exposed
+`device/tile*/physical_vram_size_bytes` values. Without a local-memory figure it
+reports **half of host `MemTotal` as an estimated shared-memory capacity**, logged
+as `token=intel-shared-memory-capacity`. This supports iGPUs without dedicated
+VRAM; it is neither reserved memory nor a measured free-VRAM value. Intel live
+used/free VRAM remains unknown. A driver that omits local-memory attributes on a
+discrete Intel GPU also takes this estimate; inspect that log when validating
+capacity on new hardware. Malformed local-memory data, incomplete tile readings,
+or an unavailable host-memory fallback keep detection fail-closed.
+
+Inventory success does not establish encoder support. Intel's default remains
+`va`, and explicit encoder settings still win. The runtime must provide a working
+Intel VA driver for that path; selecting Vulkan requires hardware/driver support
+for Vulkan Video encode. The Vulkan resolver has no automatic OpenH264 fallback.
+
 Read in `node-agent/src/session/mod.rs` (`SessionConfig::from_env`). Apply to every
 session the agent runs. Integer knobs use a parser that **ignores junk/≤0 and falls
 back to the default** (except `QUASAR_CUDA_DEVICE`, which allows `0`).
