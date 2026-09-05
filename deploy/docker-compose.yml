@@ -197,6 +197,24 @@ services:
       QUASAR_ARTWORK_DIR: ${QUASAR_ARTWORK_DIR:-/var/lib/quasar-control/artwork}
       QUASAR_ARTWORK_MAX_BYTES: ${QUASAR_ARTWORK_MAX_BYTES:-}
       QUASAR_ARTWORK_SWEEP_INTERVAL: ${QUASAR_ARTWORK_SWEEP_INTERVAL:-}
+      # --- Self-update / release detection (#104) -----------------------------
+      # Every one of these has a working built-in default, so an install that
+      # sets none of them is the normal case and an empty value here means
+      # "use the default". They are passed for the QUASAR_TRUSTED_PROXIES reason:
+      # an .env entry with no passthrough is silently inert, and these were —
+      # a registry install could not point detection at a fork, widen the asset
+      # allowlist after GitHub moved its CDN, or set a token, because none of
+      # them reached the process. Asserted by scripts/dev/test-compose-overlays.sh.
+      # Set QUASAR_PLATFORM_RELEASE_REPO=off to disable detection entirely.
+      QUASAR_PLATFORM_RELEASE_REPO: ${QUASAR_PLATFORM_RELEASE_REPO:-}
+      QUASAR_PLATFORM_RELEASE_API: ${QUASAR_PLATFORM_RELEASE_API:-}
+      QUASAR_PLATFORM_RELEASE_ASSET_HOSTS: ${QUASAR_PLATFORM_RELEASE_ASSET_HOSTS:-}
+      QUASAR_PLATFORM_RELEASE_TOKEN: ${QUASAR_PLATFORM_RELEASE_TOKEN:-}
+      QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL: ${QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL:-}
+      # The registry the edge channel resolves branch tags on, and the egress
+      # allowlist every registry read passes.
+      QUASAR_PLATFORM_REGISTRY: ${QUASAR_PLATFORM_REGISTRY:-}
+      QUASAR_IMAGE_REGISTRY_HOSTS: ${QUASAR_IMAGE_REGISTRY_HOSTS:-}
       # --- Debug / profiling listener (PROF-01, #388) -------------------------
       # SHIPS ENABLED, ON LOOPBACK. Diagnosing a box that has been up for three
       # weeks on somebody else's hardware is the whole point. 6060 is DELIBERATELY

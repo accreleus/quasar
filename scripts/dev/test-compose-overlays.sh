@@ -235,7 +235,11 @@ value=$(QUASAR_CONTROL_IMAGE=registry.example/cp@sha256:abc cp_field "svc['image
 # deploy/.env.example and must flow through the BASE chain.
 for var in QUASAR_TRUSTED_PROXIES QUASAR_PUBLIC_HOST QUASAR_ALLOWED_ORIGINS \
            QUASAR_ICE_SERVERS PUBLIC_BASE_URL QUASAR_TLS_HOSTS \
-           QUASAR_ARTWORK_MAX_BYTES QUASAR_ARTWORK_SWEEP_INTERVAL; do
+           QUASAR_ARTWORK_MAX_BYTES QUASAR_ARTWORK_SWEEP_INTERVAL \
+           QUASAR_PLATFORM_RELEASE_REPO QUASAR_PLATFORM_RELEASE_API \
+           QUASAR_PLATFORM_RELEASE_ASSET_HOSTS QUASAR_PLATFORM_RELEASE_TOKEN \
+           QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL QUASAR_PLATFORM_REGISTRY \
+           QUASAR_IMAGE_REGISTRY_HOSTS; do
   # Subshell + `export`: bash 3.2 cannot write `"$var"=value cmd`, and cp_field
   # is a function, so `env VAR=… cp_field` is not available either.
   actual=$(export "$var=sentinel-$var"; \
