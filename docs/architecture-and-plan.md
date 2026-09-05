@@ -166,6 +166,24 @@ split has existed since Phase 1 — it is packaging, not re-architecture, when r
 
 ---
 
+## Platform releases and self-update (2026-09-05)
+
+Quasar updates itself. A **platform release** is a matched control-plane + node-agent
+image set from one commit (`CONTEXT.md` "Platform releases"). The control plane detects
+releases (stable = GitHub Releases + a release manifest; edge = a branch tag's digest and
+the identity labels on the image), decides what is offered with a pure function ordered
+by **schema version** — the database migration the release embeds — and applies through
+a per-host **updater** sidecar that pulls pinned digests and recreates containers, since a
+container cannot recreate itself. The shape follows the invariants above: the control
+plane holds the decision and the state (`platform_releases`, apply runs and attempts in
+Postgres); the agent only relays a `release_apply` to its updater and reports
+`release_state`; the updater trusts nothing but an allowlisted registry namespace and a
+well-formed digest (ADR 0001). Order is fixed by ADR 0002: control plane first, hosts
+after, never below the database's applied migration, so the console can never offer a
+downgrade; revert exists only for agents. A source-built host is told about releases but
+never given one. The design record is #104 (spec), the ADRs, and
+`docs/reports/2026-09-05-self-update-live-gate/`.
+
 ## Open decisions to confirm
 
 - **Implementation language(s).** Leading recommendation: a polyglot split that mirrors the architectural split.
