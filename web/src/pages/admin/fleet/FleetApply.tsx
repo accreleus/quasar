@@ -31,6 +31,14 @@ function hostCount(n: number): string {
   return `${n} host${n === 1 ? "" : "s"}`;
 }
 
+/** The control plane's ineligibility reason, or null when a fleet run may
+ *  start. Server twin: apply_fleet_handler.go's refusal. */
+function controlPlaneBlocker(targets: PlatformReleaseTarget[]): string | null {
+  const cp = targets.find((t) => t.kind === "control_plane");
+  if (!cp || cp.eligible || !cp.reason || cp.reason === "up_to_date") return null;
+  return cp.reason;
+}
+
 /** "Update Quasar" — the whole instance, control plane first. Absent while a
  *  run is active: the run panel is then the only control. */
 export function FleetApplyButton({
@@ -45,9 +53,20 @@ export function FleetApplyButton({
 
   if (!newest || !hasUpdate(view) || view.active_apply?.run != null) return null;
 
+  // Nothing moves before the control plane, so a run it cannot take is refused
+  // outright (409 release_not_offered). `up_to_date` is the one reason that is
+  // not a refusal: the run then goes straight to the hosts.
+  const blocked = controlPlaneBlocker(view.targets);
+
   return (
     <>
-      <Button onClick={() => setConfirming(true)}>Update Quasar</Button>
+      <Button
+        onClick={() => setConfirming(true)}
+        disabled={blocked != null}
+        title={blocked ? eligibilityText(blocked) : undefined}
+      >
+        Update Quasar
+      </Button>
       {confirming && (
         <FleetApplyModal
           view={view}
