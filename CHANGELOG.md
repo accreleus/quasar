@@ -24,6 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+## 0.2.0 — 2026-09-05
+
 ### Security
 
 - **A copy-pasted `make` line could run a second command (#550).** The Makefile
