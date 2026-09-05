@@ -1,0 +1,55 @@
+[04:06:17] release=448c8994-b7cc-4743-8fed-b6f5c1fafea2
+  target None None True None
+  target None aux-infra False identity_unknown
+  target None quasar-node-1 False control_plane_not_first
+[04:06:17] starting a Steam session (gate, 420s)
+[04:06:57] POST fleet apply
+{"run":{"id":"14868e79-6a44-45fb-96cd-eeb44cd0d2bd","release_id":"448c8994-b7cc-4743-8fed-b6f5c1fafea2","state":"pending","force":false,"requested_by":"20007c82-69d5-4174-aa55-bb2b69e8dcb9","cancel_requested":false,"cancel_requested_at":null,"current_target":null,"current_host_id":null,"error":null,"skipped":[],"attempts":[],"created_at":"2026-09-05T04:06:57.347017Z","started_at":null,"finished_at
+[04:06:57] run=14868e79-6a44-45fb-96cd-eeb44cd0d2bd; second POST should be 409:
+409
+[04:07:01] control plane not answering (expected during its recreate)
+[04:21:27] identity now:
+
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import json,sys;d=json.load(sys.stdin);hs=d if isinstance(d,list) else d.get('hosts',d.get('items',[]));[print('  host',h['node_name'],h['status'],(h.get('source_commit') or '')[:8],h.get('install_mode'),h.get('updater_present')) for h in hs]
+                      ~~~~~~~~~^^^^^^^^^^^
+  File "/usr/lib/python3.14/json/__init__.py", line 298, in load
+    return loads(fp.read(),
+        cls=cls, object_hook=object_hook,
+        parse_float=parse_float, parse_int=parse_int,
+        parse_constant=parse_constant, object_pairs_hook=object_pairs_hook, **kw)
+  File "/usr/lib/python3.14/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.14/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+[04:21:27] gate tail:
+    at evaluate (file:///tmp/qgate/steam-gate.mjs:34:41)
+    at async file:///tmp/qgate/steam-gate.mjs:95:13
+
+Node.js v22.22.3
+[04:21:27] attempts:
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import json,sys;d=json.load(sys.stdin);[print('  ',a['kind'],a['target'],a['state'],a.get('reason'),a.get('run_id','')[:8]) for a in (d.get('attempts') or d)]
+                      ~~~~~~~~~^^^^^^^^^^^
+  File "/usr/lib/python3.14/json/__init__.py", line 298, in load
+    return loads(fp.read(),
+        cls=cls, object_hook=object_hook,
+        parse_float=parse_float, parse_int=parse_int,
+        parse_constant=parse_constant, object_pairs_hook=object_pairs_hook, **kw)
+  File "/usr/lib/python3.14/json/__init__.py", line 352, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.14/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+exit=1

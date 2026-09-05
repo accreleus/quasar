@@ -1,0 +1,20 @@
+[gate 04:31:45] injected 3 storage entries
+[gate 04:31:47] screenshot /tmp/qgate/gpu-test/survive2/library.png
+[gate 04:31:47] clicked Play Steam
+[gate 04:31:48] session 87a11c39-a35c-4afb-a480-d92bd4220e42
+[gate 04:31:48] screenshot /tmp/qgate/gpu-test/survive2/session-000s.png
+[gate 04:31:48] stats {"video":true,"w":0,"h":0,"t":0,"paused":true,"decoded":0,"dropped":0,"ready":0}
+[gate 04:32:18] screenshot /tmp/qgate/gpu-test/survive2/session-030s.png
+[gate 04:32:18] stats {"video":true,"w":2560,"h":1440,"t":29.1,"paused":false,"decoded":1758,"dropped":157,"ready":4}
+[gate 04:32:49] screenshot /tmp/qgate/gpu-test/survive2/session-060s.png
+[gate 04:32:49] stats {"video":false}
+[gate 04:33:19] screenshot /tmp/qgate/gpu-test/survive2/session-090s.png
+[gate 04:33:19] stats {"video":false}
+[gate 04:33:49] screenshot /tmp/qgate/gpu-test/survive2/session-120s.png
+[gate 04:33:49] stats {"video":false}
+[gate 04:34:19] screenshot /tmp/qgate/gpu-test/survive2/session-151s.png
+[gate 04:34:19] stats {"video":false}
+[gate 04:34:39] screenshot /tmp/qgate/gpu-test/survive2/session-final-170s.png
+[gate 04:34:39] final stats {"video":false}
+[gate 04:34:39] DELETE session -> 200
+GATE DECODED sid=87a11c39-a35c-4afb-a480-d92bd4220e42 frames=undefined size=undefinedxundefined
