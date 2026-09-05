@@ -206,8 +206,12 @@ if [ "$RC" -eq 0 ] && [ -f "$envf" ] && [ "$(stat -c %a "$envf")" = 600 ] \
    && grep -q "^pull ghcr.io/accreleus/quasar/quasar-updater:1.2.3$" <<<"$DOCKER_LOG" \
    && grep -q 'up -d quasar-node-agent' <<<"$DOCKER_LOG" \
    && grep -q 'up -d quasar-updater' <<<"$DOCKER_LOG" \
+   && [ "$(grep -n 'up -d quasar-updater' <<<"$DOCKER_LOG" | cut -d: -f1)" -lt \
+        "$(grep -n 'up -d quasar-node-agent' <<<"$DOCKER_LOG" | cut -d: -f1)" ] \
    && grep -q "enrolled: this host is now 'gpu-b'" <<<"$OUT"; then
-  pass "AMD host + release tag: 0600 env, both images pinned to :1.2.3, agent + updater started, enrolled"
+  # Ordering matters: the agent reads updater presence once at boot, so an agent
+  # started first registers updater_present=false and stays that way.
+  pass "AMD host + release tag: 0600 env, both images pinned to :1.2.3, updater started BEFORE the agent, enrolled"
 else
   fail "happy path" "rc=$RC docker=[$DOCKER_LOG] env=[$(cat "$envf" 2>/dev/null)] out=$(tail -5 <<<"$OUT")"
 fi

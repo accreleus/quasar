@@ -771,6 +771,21 @@ compose() {
   $SUDO docker compose --project-directory "$DIR" --project-name "$PROJECT" \
     $(printf '%s' "$compose_files" | tr ':' '\n' | sed "s#^#-f $DIR/#" | tr '\n' ' ') "$@"
 }
+# The updater first: the agent reads updater presence once at boot, so an agent
+# started ahead of it registers updater_present=false and stays that way. Never
+# fatal and never --wait (it declares no healthcheck) — a host with a live agent
+# and no updater is a working host that cannot be handed a release.
+#
+# Ordering, not `depends_on`: a stack whose updater image is missing would then
+# fail to start the AGENT too, which is far worse than reporting no updater.
+if [ -n "$updater_image" ]; then
+  if compose up -d quasar-updater >/dev/null 2>&1; then
+    ok "updater started ($updater_image)"
+  else
+    warn "the updater did not start; this host cannot be handed a platform release until it does. 'docker compose --project-directory $DIR logs quasar-updater' says why."
+  fi
+fi
+
 # tty: Compose's own progress block is noise when it works and evidence when
 # it does not — captured, shown only on failure. plain: passed through as-is.
 if [ "$STYLE" = tty ]; then
@@ -784,17 +799,6 @@ else
   compose up -d quasar-node-agent
 fi
 ok "started (compose project '$PROJECT'; re-running this script updates it in place)"
-
-# The updater, only when an image was obtained. Never fatal and never --wait: it
-# declares no healthcheck, and a host with a live agent and no updater is a
-# working host that cannot be handed a release.
-if [ -n "$updater_image" ]; then
-  if compose up -d quasar-updater >/dev/null 2>&1; then
-    ok "updater started ($updater_image)"
-  else
-    warn "the updater did not start; this host cannot be handed a platform release until it does. 'docker compose --project-directory $DIR logs quasar-updater' says why."
-  fi
-fi
 
 summary_paths() {
   [ "$STYLE" = tty ] || return 0
