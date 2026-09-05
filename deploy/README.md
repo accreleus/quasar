@@ -208,7 +208,7 @@ bash deploy/redeploy.sh va develop         # AMD / Intel host
 > the TLS host names. The last line is the verdict:
 >
 > ```
-> REDEPLOY env=nvidia scope=all ref=develop sha=<short> bundle=index-<hash>.js health=ok catalog=401 agent=registered result=OK
+> REDEPLOY env=nvidia scope=all ref=develop sha=<short> bundle=index-<hash>.js health=ok catalog=401 agent=registered updater=ok result=OK
 > ```
 >
 > `result=OK` means every post-deploy check passed. A non-zero exit or

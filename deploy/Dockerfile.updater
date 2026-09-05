@@ -44,6 +44,13 @@ LABEL org.quasar.image.role="updater" \
       org.quasar.source.commit="${SOURCE_COMMIT}" \
       org.quasar.built.at="${BUILT_AT}"
 
+# curl, for the `/v1/self` probe. It has to live HERE and not in the caller:
+# the control-plane image ships curl OR wget depending on which Dockerfile built
+# it (control.prod has curl and no wget, control has wget and no curl), busybox
+# wget cannot speak a unix socket at all, and the probe must work on both a
+# source-built and a registry host. deploy/image-contract.json asserts it.
+RUN apk add --no-cache curl
+
 COPY --from=builder /quasar-updater /usr/local/bin/quasar-updater
 
 ENTRYPOINT ["/usr/local/bin/quasar-updater"]

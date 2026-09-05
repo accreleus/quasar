@@ -131,10 +131,24 @@ func TestEnrollHostComposeMatchesBase(t *testing.T) {
 	diffMaps(t, agentService, want, got)
 
 	// Every named volume the service mounts must be declared in the printed file.
-	vols, _ := printedCompose(t, "--print-compose")["volumes"].(map[string]any)
-	if _, ok := vols["quasar-agent-data"]; !ok {
-		t.Errorf("--print-compose: named volume quasar-agent-data is mounted but not declared")
+	printed := printedCompose(t, "--print-compose")
+	vols, _ := printed["volumes"].(map[string]any)
+	for _, v := range []string{"quasar-agent-data", "quasar-updater-run"} {
+		if _, ok := vols[v]; !ok {
+			t.Errorf("--print-compose: named volume %s is mounted but not declared", v)
+		}
 	}
+
+	// An enrolled host with no updater has no actor for a platform-release apply
+	// and reports updater_present=false forever (#115), so the installer must
+	// write the service, not only the agent's mount of its volume.
+	svcs, _ := printed["services"].(map[string]any)
+	up, ok := svcs["quasar-updater"].(map[string]any)
+	if !ok {
+		t.Fatal("--print-compose: no services.quasar-updater")
+	}
+	baseUp, _ := loadComposeFile(t, "docker-compose.yml")["services"].(map[string]any)
+	diffMaps(t, "quasar-updater", baseUp["quasar-updater"].(map[string]any), up)
 }
 
 func TestEnrollHostNvidiaOverlayMatchesBase(t *testing.T) {

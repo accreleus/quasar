@@ -24,7 +24,8 @@
 #      only place the enrollment string lands;
 #   4b. on an AppArmor host, writes $QUASAR_DIR/apparmor/quasar-app and loads it
 #      with apparmor_parser (#76) — the agent cannot: policy needs host root;
-#   5. starts the one agent service (re-running updates it; never a second agent);
+#   5. starts the agent and the updater (re-running updates them in place;
+#      never a second agent);
 #   6. tails its log until it is enrolled, or names the failure.
 # It never edits the firewall: media reachability is reported by the agent's own
 # readiness check in Admin → Fleet, with the exact rule for this host.
@@ -34,6 +35,7 @@
 #   QUASAR_REF          the git ref the control plane was built from (vX.Y.Z tag,
 #                       or a commit); it selects the matching agent image tag
 #   QUASAR_AGENT_IMAGE  explicit image reference (a digest pin) — overrides QUASAR_REF
+#   QUASAR_UPDATER_IMAGE  same, for the updater; it follows QUASAR_REF otherwise
 #   QUASAR_DIR          install directory, default /opt/quasar-agent
 #   NODE_NAME           this host's stable fleet name, default: its hostname
 #   QUASAR_HOME_ROOT    managed-home root, default /var/lib/quasar/homes
@@ -48,12 +50,15 @@
 #
 # The compose text below is the node-agent service from deploy/docker-compose.yml
 # with the local-stack coupling removed (depends_on, CONTROL_PLANE_URL,
-# ENROLLMENT_TOKEN) and QUASAR_ENROLLMENT added. control-plane's
-# TestEnrollHostComposeMatchesBase fails the build if the two drift.
+# ENROLLMENT_TOKEN) and QUASAR_ENROLLMENT added, plus the quasar-updater service
+# verbatim. control-plane's TestEnrollHostComposeMatchesBase fails the build if
+# the agent service drifts.
 set -eu
 
 IMAGE_REPO="ghcr.io/accreleus/quasar/quasar-node-agent"
 LOCAL_IMAGE="quasar-node-agent:latest"
+UPDATER_REPO="ghcr.io/accreleus/quasar/quasar-updater"
+LOCAL_UPDATER_IMAGE="quasar-updater:latest"
 DIR="${QUASAR_DIR:-/opt/quasar-agent}"
 ROOT="${QUASAR_ENROLL_ROOT:-}"          # test seam: fake /proc,/sys,/dev,/etc root
 TAIL_SECS="${QUASAR_ENROLL_TAIL_SECS:-90}"
@@ -238,6 +243,7 @@ services:
       - /dev:/host/dev:ro
       - /sys/kernel/security:/host/sys/kernel/security:ro
       - quasar-agent-data:/var/lib/quasar-agent
+      - quasar-updater-run:/run/quasar-updater
     devices:
       - /dev/dri
       - /dev/uinput
@@ -245,8 +251,20 @@ services:
     device_cgroup_rules:
       - 'c 13:* rmw'
     restart: unless-stopped
+  quasar-updater:
+    image: ${QUASAR_UPDATER_IMAGE:-quasar-updater:latest}
+    environment:
+      QUASAR_UPDATER_ALLOWED_NAMESPACES: ${QUASAR_UPDATER_ALLOWED_NAMESPACES:-}
+      QUASAR_UPDATER_WAIT_TIMEOUT_S: ${QUASAR_UPDATER_WAIT_TIMEOUT_S:-}
+    volumes:
+      - ${QUASAR_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+      - ${QUASAR_STACK_DIR:-/var/lib/quasar/stack-dir-unset}:${QUASAR_STACK_DIR:-/var/lib/quasar/stack-dir-unset}
+      - quasar-updater-run:/run/quasar-updater
+    security_opt: ["label=disable"]
+    restart: unless-stopped
 volumes:
   quasar-agent-data:
+  quasar-updater-run:
 YAML
 }
 
@@ -568,21 +586,29 @@ ok "user namespaces: ok"
 
 # ── 3. the agent image, pinned to the ref this script came from ──────────────
 step "Agent image"
+# QUASAR_REF -> a published tag on one repo. Two artifacts follow the same rule,
+# so it is written once: a host whose agent came from a release tag and whose
+# updater came from somewhere else is a state nobody could explain.
+IMAGE_FROM=""
+ref_to_image() { # ref_to_image <repo> <ref> ; sets IMAGE_FROM
+  case "$2" in
+    "") IMAGE_FROM="no QUASAR_REF given"; printf '' ;;
+    v[0-9]*.[0-9]*.[0-9]*) IMAGE_FROM="release $2"; printf '%s:%s' "$1" "${2#v}" ;;
+    *)
+      if printf '%s' "$2" | grep -Eq '^[0-9a-f]{40}$'; then
+        IMAGE_FROM="commit $(printf '%.7s' "$2")"; printf '%s:sha-%.7s' "$1" "$2"
+      else
+        IMAGE_FROM="branch $2"; printf '%s:%s' "$1" "$(printf '%s' "$2" | tr '/' '-')"
+      fi ;;
+  esac
+}
+
 image="${QUASAR_AGENT_IMAGE:-}"
 image_from="${image:+QUASAR_AGENT_IMAGE}"
 if [ -z "$image" ]; then
-  image_from="no QUASAR_REF or QUASAR_AGENT_IMAGE given"
-  ref="${QUASAR_REF:-}"
-  case "$ref" in
-    "") ;;
-    v[0-9]*.[0-9]*.[0-9]*) image="$IMAGE_REPO:${ref#v}"; image_from="release $ref" ;;
-    *)
-      if printf '%s' "$ref" | grep -Eq '^[0-9a-f]{40}$'; then
-        image="$IMAGE_REPO:sha-$(printf '%.7s' "$ref")"; image_from="commit $(printf '%.7s' "$ref")"
-      else
-        image="$IMAGE_REPO:$(printf '%s' "$ref" | tr '/' '-')"; image_from="branch $ref"
-      fi ;;
-  esac
+  image="$(ref_to_image "$IMAGE_REPO" "${QUASAR_REF:-}")"
+  image_from="$IMAGE_FROM"
+  [ -n "$image" ] || image_from="no QUASAR_REF or QUASAR_AGENT_IMAGE given"
 fi
 
 if [ "$DRY" = 1 ]; then
@@ -603,6 +629,28 @@ else
   fi
 fi
 [ -n "$image" ] || image="$LOCAL_IMAGE"
+
+# The updater image. Same resolution as the agent, but a MISSING one is a warning
+# and not a refusal: the agent is what enrollment exists to deliver, and a host
+# without an updater simply reports updater_present=false and cannot be handed a
+# platform release. Refusing the whole enrollment over it would be worse.
+updater_image="${QUASAR_UPDATER_IMAGE:-}"
+updater_from="${updater_image:+QUASAR_UPDATER_IMAGE}"
+if [ -z "$updater_image" ]; then
+  updater_image="$(ref_to_image "$UPDATER_REPO" "${QUASAR_REF:-}")"
+  updater_from="$IMAGE_FROM"
+fi
+if [ "$DRY" = 1 ]; then
+  say "  would use: ${updater_image:-$LOCAL_UPDATER_IMAGE (local build, if present)} (updater)"
+elif [ -n "$updater_image" ] && $SUDO docker pull "$updater_image" >/dev/null 2>&1; then
+  ok "pulled $updater_image (updater, from $updater_from)"
+elif $SUDO docker image inspect "$LOCAL_UPDATER_IMAGE" >/dev/null 2>&1; then
+  updater_image="$LOCAL_UPDATER_IMAGE"
+  ok "updater image: $LOCAL_UPDATER_IMAGE (local build)"
+else
+  updater_image=""
+  warn "no updater image on this host, so this host cannot be handed a platform release from the console (its agent will report updater_present=false). Everything else works. To add it later: QUASAR_UPDATER_IMAGE=<reference> in $DIR/.env, then 'docker compose --project-directory $DIR up -d quasar-updater'."
+fi
 
 # ── 4. files ─────────────────────────────────────────────────────────────────
 node_name="${NODE_NAME:-$(hostname -s 2>/dev/null || hostname)}"
@@ -635,7 +683,7 @@ fi
 # The .env is the ONLY place the enrollment string lands, and it is written by
 # this shell (printf is a builtin: nothing below puts the token in an argv).
 # Re-runs keep every operator-added line and replace only the managed keys.
-managed='^(QUASAR_ENROLLMENT|NODE_NAME|QUASAR_AGENT_IMAGE|QUASAR_HOME_ROOT|QUASAR_RENDER_NODE|COMPOSE_FILE|COMPOSE_PROJECT_NAME)='
+managed='^(QUASAR_ENROLLMENT|NODE_NAME|QUASAR_AGENT_IMAGE|QUASAR_UPDATER_IMAGE|QUASAR_STACK_DIR|QUASAR_HOME_ROOT|QUASAR_RENDER_NODE|COMPOSE_FILE|COMPOSE_PROJECT_NAME)='
 umask 077
 env_tmp="$(mktemp)"
 ENV_TMP="$env_tmp"
@@ -650,6 +698,11 @@ fi
   printf 'COMPOSE_FILE=%s\n' "$compose_files"
   printf 'NODE_NAME=%s\n' "$node_name"
   printf 'QUASAR_AGENT_IMAGE=%s\n' "$image"
+  [ -n "$updater_image" ] && printf 'QUASAR_UPDATER_IMAGE=%s\n' "$updater_image"
+  # The stack directory at its HOST path: the updater rebuilds its compose
+  # invocation from its own container labels, which record host paths, and
+  # refuses to serve when the same absolute path is not visible inside it.
+  printf 'QUASAR_STACK_DIR=%s\n' "$DIR"
   printf 'QUASAR_HOME_ROOT=%s\n' "$home_root"
   printf 'QUASAR_RENDER_NODE=%s\n' "$render_node"
   printf 'QUASAR_ENROLLMENT=%s\n' "$blob"
@@ -708,7 +761,7 @@ if [ -r "$knob" ] && [ "$(tr -d '[:space:]' < "$knob")" = Y ]; then
   fi
 fi
 
-# ── 5. start (or update) the one agent ───────────────────────────────────────
+# ── 5. start (or update) the agent, and the updater beside it ────────────────
 step "Starting the node agent"
 # RFC 3339 with the Z: without it docker parses the stamp in the daemon's local
 # zone and `logs --since` reaches back into a previous run's lines.
@@ -731,6 +784,17 @@ else
   compose up -d quasar-node-agent
 fi
 ok "started (compose project '$PROJECT'; re-running this script updates it in place)"
+
+# The updater, only when an image was obtained. Never fatal and never --wait: it
+# declares no healthcheck, and a host with a live agent and no updater is a
+# working host that cannot be handed a release.
+if [ -n "$updater_image" ]; then
+  if compose up -d quasar-updater >/dev/null 2>&1; then
+    ok "updater started ($updater_image)"
+  else
+    warn "the updater did not start; this host cannot be handed a platform release until it does. 'docker compose --project-directory $DIR logs quasar-updater' says why."
+  fi
+fi
 
 summary_paths() {
   [ "$STYLE" = tty ] || return 0
