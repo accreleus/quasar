@@ -36,6 +36,9 @@ export interface ToastItem {
     label: string;
     onClick: () => void;
   };
+  /** Called when the reader closes the toast, not when it auto-dismisses or
+   *  its action is taken. A persistent toast always gets a close control. */
+  onDismiss?: () => void;
 }
 
 interface ToastContextValue {
@@ -104,6 +107,17 @@ function ToastItemComponent({ item, onRemove }: ToastItemProps) {
           </button>
         )}
       </div>
+      {item.duration === null && (
+        // A toast that never dismisses itself must be dismissible by hand.
+        <button
+          type="button"
+          className="toast-close"
+          aria-label="Dismiss"
+          onClick={() => { item.onDismiss?.(); onRemove(item.id); }}
+        >
+          ×
+        </button>
+      )}
     </div>
   );
 }

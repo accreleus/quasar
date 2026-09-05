@@ -2185,6 +2185,23 @@ td.cell-actions > * + * {
   color: var(--text);
 }
 
+.toast .toast-close {
+  margin-left: auto;
+  align-self: flex-start;
+  border: 0;
+  background: none;
+  padding: 0 var(--s1);
+  font: inherit;
+  font-size: var(--t-base);
+  line-height: 1;
+  color: var(--text-3);
+  cursor: pointer;
+}
+
+.toast .toast-close:hover {
+  color: var(--text);
+}
+
 /* Bulk-selection bar. */
 .bulk-bar {
   position: fixed;
