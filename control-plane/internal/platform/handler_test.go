@@ -11,7 +11,7 @@ import (
 
 func TestIdentityServesThePlatformIdentityEnvelope(t *testing.T) {
 	rec := httptest.NewRecorder()
-	NewHandler().handleIdentity(rec, httptest.NewRequest(http.MethodGet, "/v1/admin/platform/identity", nil))
+	NewHandler(nil, nil).handleIdentity(rec, httptest.NewRequest(http.MethodGet, "/v1/admin/platform/identity", nil))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -54,7 +54,7 @@ func TestRegisterWiresIdentityThroughTheAdminMiddleware(t *testing.T) {
 		return next
 	}
 	mux := http.NewServeMux()
-	NewHandler().Register(mux, admin)
+	NewHandler(nil, nil).Register(mux, admin)
 
 	if !wrapped {
 		t.Fatal("GET /v1/admin/platform/identity was registered without the admin middleware")

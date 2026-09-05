@@ -3837,8 +3837,8 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * The platform-release view — installed, available, eligibility, faults (admin). NOT CURRENTLY SERVED — see x-unimplemented.
-         * @description NOT IMPLEMENTED AS OF 2026-09-04 — registered by #107/#110, which removes this marker. One read that answers the whole admin Releases page: the installed identities (this control plane plus every host), the releases available on the configured channel newest first with their notes, the per-target eligibility FOR THE NEWEST LISTED RELEASE with a stable reason identifier, and the faults. READ-ONLY AND NEVER A TRIGGER: it applies nothing, writes nothing, and does not run detection - detection is a jobs-framework job and "Check now" is POST /v1/admin/jobs/{job_id}/run. A release below the installed control plane's schema_version is never listed on either channel (ADR 0002), and a stable release whose manifest is missing or invalid is not listed either (ADR 0001 - there is nothing to pin it by); the latter surfaces as a manifest_invalid fault.
+         * The platform-release view — installed, available, eligibility, faults (admin).
+         * @description One read that answers the whole admin Releases page: the installed identities (this control plane plus every host), the releases available on the configured channel newest first with their notes, the per-target eligibility FOR THE NEWEST LISTED RELEASE with a stable reason identifier, and the faults. READ-ONLY AND NEVER A TRIGGER: it applies nothing, writes nothing, and does not run detection - detection is a jobs-framework job and "Check now" is POST /v1/admin/jobs/{job_id}/run. A release below the installed control plane's schema_version is never listed on either channel (ADR 0002), and a stable release whose manifest is missing or invalid is not listed either (ADR 0001 - there is nothing to pin it by); the latter surfaces as a manifest_invalid fault.
          */
         get: {
             parameters: {
@@ -3858,6 +3858,403 @@ export interface paths {
                         "application/json": components["schemas"]["PlatformReleaseView"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/platform/apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Fleet apply of one platform release (admin). NOT CURRENTLY SERVED — see x-unimplemented.
+         * @description NOT IMPLEMENTED AS OF 2026-09-05 — registered by #117, which removes this marker. Applies one release across the instance: THE CONTROL PLANE FIRST, then every eligible host in sequence (ADR 0002). Returns immediately with the run; the work is asynchronous and is watched through the run endpoints or through active_apply on GET /v1/admin/platform/releases. At most one fleet run is active per instance, enforced by a partial unique index rather than by a code check. Which hosts are targets is decided WHEN EACH TARGET IS REACHED, by amendment 1's eligibility rule; a host ineligible at its turn is SKIPPED (reported in run.skipped) and produces no attempt. A run STOPS AT ITS FIRST FAILED TARGET - there is no partial state, and the per-target attempts are where a partial outcome is read.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["PlatformApplyRequest"];
+                };
+            };
+            responses: {
+                /** @description Accepted — the run was created. */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["PlatformApplyRunEnvelope"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description release_not_offered (the release is not in the current release view's available - other channel, prerelease on stable, or manifest missing/invalid, ADR 0001), run_active (a fleet run is already pending or running), or attempt_in_flight (a standalone attempt is open on some target). */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                /** @description release_below_schema_version - the release's schema_version is below the installed control plane's. UNPROCESSABLE rather than a conflict because it can never become true (ADR 0002). */
+                422: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/platform/apply/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Fleet apply runs, newest first (admin). NOT CURRENTLY SERVED — see x-unimplemented.
+         * @description NOT IMPLEMENTED AS OF 2026-09-05 — registered by #117, which removes this marker. Fleet runs newest first (created_at DESC, id DESC), each with its per-target attempts. An active run is first by construction and there is at most one.
+         */
+        get: {
+            parameters: {
+                query?: {
+                    /** @description 1-200, default 20. Out of range is 400 validation_failed. */
+                    limit?: number;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["PlatformApplyRunsResponse"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/platform/apply/runs/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One fleet apply run with its per-target attempts (admin). NOT CURRENTLY SERVED — see x-unimplemented.
+         * @description NOT IMPLEMENTED AS OF 2026-09-05 — registered by #117, which removes this marker. The run with its FULL per-target attempts, in the order the run reached them (control plane first).
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["PlatformApplyRunEnvelope"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/platform/apply/runs/{id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Stop a fleet run before its next target (admin). NOT CURRENTLY SERVED — see x-unimplemented.
+         * @description NOT IMPLEMENTED AS OF 2026-09-05 — registered by #117, which removes this marker. Sets the run's PERSISTED cancel flag. IT STOPS THE RUN BEFORE ITS NEXT TARGET AND NEVER INTERRUPTS AN IN-FLIGHT ATTEMPT - a pull or a recreate already running finishes, and the run goes cancelled when that attempt terminates. Interrupting a recreate is how a stack is left with no container at all, so this operation deliberately cannot do it. An attempt still queued or waiting_sessions becomes cancelled at once. Idempotent. The flag is persisted so a cancel issued while the run's control-plane target is restarting the control plane is honoured by the binary that boots.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description The run as it stands; state is still running if an attempt is in flight. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["PlatformApplyRunEnvelope"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description run_not_active - the run is already terminal and there is nothing to stop. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/platform/hosts/{id}/apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Apply one platform release to one host (admin). NOT CURRENTLY SERVED — see x-unimplemented.
+         * @description NOT IMPLEMENTED AS OF 2026-09-05 — registered by #116, which removes this marker. A STANDALONE attempt - no run, no fleet ordering - refused while a fleet run is active. ONLY THE NODE-AGENT IMAGE IS SENT; the control-plane component is never sent to a host. With force false the host is cordoned and the attempt sits in waiting_sessions until the non-terminal session count reaches zero; with force true the wait is skipped and the N sessions running are stopped, and a client MUST show N in the confirmation - force is the operator agreeing to end N live sessions. The host is uncordoned afterwards whatever the outcome, unless it was already cordoned when the apply started.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["PlatformHostApplyRequest"];
+                };
+            };
+            responses: {
+                /** @description Accepted — the attempt was created. */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["PlatformApplyAttemptEnvelope"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description release_not_offered; host_not_eligible (the body carries `reason`, one amendment-1 EligibilityReason, so the button's absence and this refusal are explained by the same string); attempt_in_flight (this host already has an open attempt - the database's partial unique index, not a code check); run_active. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                /** @description release_below_schema_version (ADR 0002). */
+                422: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                /** @description apply_unsupported - the agent never acked within the 10s ack timeout, so this agent build predates the amendment. The attempt is recorded failed with reason "unsupported" and is NOT retried until that host registers again; a register is the only evidence the build changed. */
+                501: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/platform/hosts/{id}/revert": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Put one host back on its previous digests (admin). NOT CURRENTLY SERVED — see x-unimplemented.
+         * @description NOT IMPLEMENTED AS OF 2026-09-05 — registered by #118, which removes this marker. A REVERT IS AN APPLY WITH AN OLDER DIGEST SET - the same agent-api.md release_apply message, the same states, the same reasons; only kind "revert" on the attempt distinguishes it, so history can say which button was pressed. THERE IS NO REVERT MESSAGE ON THE WIRE. The target digests are the previous_digests recorded on this host's last succeeded attempt and nothing else - a digest set observed running on THIS host, not a version an admin picks. Reverting the CONTROL PLANE is not offered at any depth: it carries migrations. Bounded by ADR 0002 all the same - a previous digest set ordering above the control plane's current release is refused with host_not_eligible / release_above_control_plane.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": components["schemas"]["PlatformHostRevertRequest"];
+                };
+            };
+            responses: {
+                /** @description Accepted — the revert attempt was created. */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["PlatformApplyAttemptEnvelope"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description nothing_to_revert (no succeeded attempt on this host, or its last succeeded attempt recorded no previous digests); host_not_eligible (with `reason`); attempt_in_flight; run_active. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                /** @description apply_unsupported - as for apply. */
+                501: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/platform/attempts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Platform-release apply history, newest first (admin). NOT CURRENTLY SERVED — see x-unimplemented.
+         * @description NOT IMPLEMENTED AS OF 2026-09-05 — registered by #116, which removes this marker. Every attempt this instance has made, newest first (created_at DESC, id DESC), INCLUDING CONTROL-PLANE ATTEMPTS AND REVERTS - the one place an operator reads "what has this instance done to itself". An unknown host_id yields an EMPTY LIST and not a 404: "this host has no history" and "this host is gone" are the same answer to the question being asked. There is deliberately no target= filter - host_id absent already means everything, and a second overlapping filter is how two clients come to disagree about what a list contains.
+         */
+        get: {
+            parameters: {
+                query?: {
+                    /** @description Narrow to one host. Omitted, the response spans the instance, control-plane attempts (host_id null) included. */
+                    host_id?: string;
+                    /** @description 1-200, default 50. */
+                    limit?: number;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["PlatformApplyAttemptsResponse"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
             };
@@ -7393,10 +7790,10 @@ export interface components {
             discovered_at: string;
         };
         /**
-         * @description Why a target is not eligible for the newest listed release. A CLOSED vocabulary of STABLE IDENTIFIERS the UI maps to text - the server never sends the sentence, so wording can improve in the client with no contract change. Precedence is fixed and is the order listed here, so two implementations cannot disagree about which of several true reasons is reported. A client meeting an unrecognized value renders it verbatim rather than dropping the row. Full per-value semantics: control-api.md §"Platform releases".
+         * @description Why a target is not eligible for the newest listed release. A CLOSED vocabulary of STABLE IDENTIFIERS the UI maps to text - the server never sends the sentence, so wording can improve in the client with no contract change. Precedence is fixed and is the order listed here, so two implementations cannot disagree about which of several true reasons is reported. A client meeting an unrecognized value renders it verbatim rather than dropping the row. Full per-value semantics: control-api.md §"Platform releases". AMENDMENT 2 (#104/#114) APPENDS attempt_in_flight and run_active AT THE END, so no existing evaluation changes: they are the most transient facts on the list, and amendment 1's rule that durable reasons outrank transient ones fixes their position. attempt_in_flight precedes run_active because it is about THIS target.
          * @enum {string}
          */
-        EligibilityReason: "no_release" | "identity_unknown" | "up_to_date" | "install_mode_source" | "updater_absent" | "host_offline" | "release_above_control_plane" | "control_plane_not_first";
+        EligibilityReason: "no_release" | "identity_unknown" | "up_to_date" | "install_mode_source" | "updater_absent" | "host_offline" | "release_above_control_plane" | "control_plane_not_first" | "attempt_in_flight" | "run_active";
         /** @description One target's eligibility, EVALUATED AGAINST available[0] - the newest listed release - and against nothing else. This surface carries no per-release eligibility matrix and a client must not present one. */
         PlatformReleaseTarget: {
             /** @enum {string} */
@@ -7454,6 +7851,178 @@ export interface components {
             /** @description One entry per target - the control plane, then every registered host - each evaluated against available[0]. When available is empty every target is eligible:false with reason "no_release". */
             targets: components["schemas"]["PlatformReleaseTarget"][];
             faults: components["schemas"]["PlatformReleaseFault"][];
+            /** @description Platform-release apply, AMENDMENT 2 (#104/#114), additive. What is in flight right now - the active fleet run, if any, plus EVERY open attempt including standalone per-host applies and reverts. null when nothing is in flight, and ALWAYS SERIALIZED by a server implementing amendment 2 (null is the answer, not the absence of one). Optional in the schema so a pre-amendment-2 server stays conformant. `targets` deliberately gains no field: the same attempt in two places in one response is a way for the two to disagree, and the join by host_id costs a client one line and cannot. */
+            active_apply?: components["schemas"]["ActiveApply"] | null;
+        };
+        /**
+         * @description A fleet run's state. A run succeeds only when EVERY target succeeded, and it STOPS AT ITS FIRST FAILED TARGET - past a failed control plane, continuing would move agents onto a release the control plane is not on (ADR 0002); past a failed host, it would march a known-bad digest set across the fleet. There is deliberately NO "partial": a failed run may have succeeded targets behind it, and the per-target attempts are where that is read.
+         * @enum {string}
+         */
+        ApplyRunState: "pending" | "running" | "succeeded" | "failed" | "cancelled";
+        /**
+         * @description One target's attempt state. The six middle values are EXACTLY agent-api.md release_state.state, relayed unchanged. queued and waiting_sessions are control-plane-only and precede the wire (the command has not been sent); cancelled applies ONLY to an attempt a cancel caught in one of those two states - CANCEL NEVER INTERRUPTS AN ATTEMPT THAT HAS BEEN SENT.
+         * @enum {string}
+         */
+        ApplyAttemptState: "queued" | "waiting_sessions" | "pending" | "pulling" | "recreating" | "verifying" | "succeeded" | "failed" | "cancelled";
+        /**
+         * @description Why an attempt failed. A CLOSED vocabulary of STABLE IDENTIFIERS the UI maps to text, shared verbatim with agent-api.md release_state.reason and with the release_apply ack's error, so ONE client-side mapping serves the wire, this API and the history. Non-null exactly when the state is failed. "unsupported" is written by the control plane and never sent on the wire: no ack arrived within the 10s ack timeout, so the agent build predates the amendment. A client meeting an unrecognized value renders it verbatim. Full per-value semantics: agent-api.md §release_state.
+         * @enum {string}
+         */
+        ApplyFailureReason: "updater_absent" | "busy" | "invalid" | "namespace_rejected" | "digest_malformed" | "pull_failed" | "recreate_failed" | "never_started" | "unhealthy" | "updater_unreachable" | "timeout" | "unsupported";
+        /** @description One component of a platform release, pinned. Same shape as ReleaseManifestComponent and as agent-api.md release_apply.components. */
+        ApplyComponentDigest: {
+            /** @description The component. Only "node-agent" is ever sent to a host; "control-plane" is applied by the updater beside the control plane and never over an agent connection. */
+            name: string;
+            /** @description Registry repository reference with NO TAG AND NO DIGEST. Consumers compose image@digest (ADR 0001). */
+            image: string;
+            /** @description sha256: followed by 64 lowercase hex. */
+            digest: string;
+        };
+        /** @description What a component was on BEFORE an attempt. Recorded from every release_state, in every state and not only failing ones, because the previous digests are what restores a half-failed stack and something has to have written them down before the restore is needed (#113 prototype finding 5). This is what a revert reads. */
+        ApplyPreviousDigest: {
+            name: string;
+            /** @description Null when the updater could not determine it. NEVER OMITTED - a client must be able to tell "nothing was there" from "nobody looked". */
+            digest: string | null;
+        };
+        /** @description A host a fleet run passed over. An ineligibility is NOT a failure - a run must not go failed because a host happened to be offline - so a skip produces no attempt row and is reported here instead, which is what answers "why did my host not move" from the run itself. */
+        PlatformApplySkip: {
+            /** Format: uuid */
+            host_id: string;
+            node_name: string;
+            reason: components["schemas"]["EligibilityReason"];
+        };
+        /** @description One attempt to move ONE target - the control plane, or one host - to one digest set (schema.md `platform_apply_attempts`). Every apply produces one: fleet or standalone, apply or revert, success or failure. */
+        PlatformApplyAttempt: {
+            /** Format: uuid */
+            id: string;
+            /**
+             * Format: uuid
+             * @description The fleet run this belongs to. NULL for a standalone per-host apply or revert - those are attempts with no run, because a run carries fleet ordering and a single-host action has none.
+             */
+            run_id: string | null;
+            /**
+             * @description A REVERT IS AN APPLY WITH AN OLDER DIGEST SET - same wire message, same states, same reasons. This field exists so history can say which button was pressed, and for nothing else.
+             * @enum {string}
+             */
+            kind: "apply" | "revert";
+            /** @enum {string} */
+            target: "control_plane" | "host";
+            /**
+             * Format: uuid
+             * @description Null exactly when target is control_plane.
+             */
+            host_id: string | null;
+            node_name: string | null;
+            /**
+             * Format: uuid
+             * @description The release the digests came from, when one is still known. NULL is legitimate on a revert, whose digest set may correspond to no release row this instance still has - requested_digests, not this field, is the authority for what an attempt did.
+             */
+            release_id: string | null;
+            /** @description What was asked for, in manifest order - the exact components array sent on agent-api.md release_apply. THE AUTHORITY for what this attempt did. */
+            requested_digests: components["schemas"]["ApplyComponentDigest"][];
+            /** @description What the target was on before. Empty until first reported. What a revert reads back, and what the manual restore recipe in a failure is copied from. */
+            previous_digests: components["schemas"]["ApplyPreviousDigest"][];
+            state: components["schemas"]["ApplyAttemptState"];
+            /** @description Non-null exactly when state is failed. */
+            reason: components["schemas"]["ApplyFailureReason"] | null;
+            /** @description The N in "waiting on N sessions": the last observed non-terminal session count on this host while state is waiting_sessions. A CLIENT MUST SHOW IT IN A FORCE CONFIRMATION - force is the operator agreeing to end N live sessions, and a confirmation that does not name N is not informed consent. Advisory and last-observed, never a gate. Null for the control-plane target and once the attempt has been sent. */
+            sessions_remaining: number | null;
+            /** @description Skip the zero-sessions wait and stop what is running. The agent does no session logic on it: it records which decision the control plane made. */
+            force: boolean;
+            /** @description The bounded tail (last 8192 bytes, truncated from the front at a line boundary) of the failing step's output. "" when there is nothing to report. NEVER a credential or an environment value. */
+            output: string;
+            /** Format: uuid */
+            requested_by: string | null;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            started_at: string | null;
+            /** Format: date-time */
+            finished_at: string | null;
+        };
+        /** @description One fleet apply (schema.md `platform_apply_runs`): one release applied across the instance, control plane first then eligible hosts in sequence (ADR 0002). AT MOST ONE IS ACTIVE PER INSTANCE, enforced by a partial unique index rather than by a code check, so two admins pressing Apply at once produce a unique violation and not two fleets moving. */
+        PlatformApplyRun: {
+            /** Format: uuid */
+            id: string;
+            /** Format: uuid */
+            release_id: string;
+            state: components["schemas"]["ApplyRunState"];
+            /** @description Applied to EVERY host target in this run. It exists on the fleet body, and not only on the per-host one, because a run whose every host target waits for a natural drain can otherwise stall indefinitely. */
+            force: boolean;
+            /** Format: uuid */
+            requested_by: string | null;
+            /** @description The cancel FLAG, not the cancel state. Read BETWEEN TARGETS and never mid-attempt. It is persisted rather than an in-memory signal so a cancel survives a control-plane restart - which matters here more than anywhere, because a fleet run's first target IS a control-plane restart. */
+            cancel_requested: boolean;
+            /** Format: date-time */
+            cancel_requested_at: string | null;
+            /**
+             * @description The target the run is on now; null when pending or terminal.
+             * @enum {string|null}
+             */
+            current_target: "control_plane" | "host" | null;
+            /** Format: uuid */
+            current_host_id: string | null;
+            /** @description Operator prose for a run-level failure belonging to no attempt. Never parsed. */
+            error: string | null;
+            /** @description Hosts the run passed over as ineligible at their turn. */
+            skipped: components["schemas"]["PlatformApplySkip"][];
+            /** @description The per-target attempts, in the order the run reached them (control plane first). */
+            attempts: components["schemas"]["PlatformApplyAttempt"][];
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            started_at: string | null;
+            /** Format: date-time */
+            finished_at: string | null;
+        };
+        PlatformApplyRequest: {
+            /**
+             * Format: uuid
+             * @description A platform_releases row id, as served in GET /v1/admin/platform/releases available[].id.
+             */
+            release_id: string;
+            /**
+             * @description Applies to every host target in this run. The control plane is never forced - it holds no sessions.
+             * @default false
+             */
+            force: boolean;
+        };
+        PlatformHostApplyRequest: {
+            /** Format: uuid */
+            release_id: string;
+            /**
+             * @description Skip the zero-sessions wait and STOP THE N SESSIONS RUNNING ON THIS HOST. The count is reported as sessions_remaining before the apply is sent.
+             * @default false
+             */
+            force: boolean;
+        };
+        /** @description A revert takes no target: the digests are the previous_digests recorded on this host's last succeeded attempt, and nothing else. THERE IS NO VERSION PICKER (ADR 0002). */
+        PlatformHostRevertRequest: {
+            /**
+             * @description As for apply.
+             * @default false
+             */
+            force: boolean;
+        };
+        PlatformApplyRunEnvelope: {
+            run: components["schemas"]["PlatformApplyRun"];
+        };
+        PlatformApplyRunsResponse: {
+            runs: components["schemas"]["PlatformApplyRun"][];
+        };
+        PlatformApplyAttemptEnvelope: {
+            attempt: components["schemas"]["PlatformApplyAttempt"];
+        };
+        PlatformApplyAttemptsResponse: {
+            /** @description Newest first (created_at DESC, id DESC), including control-plane attempts (host_id null) and reverts. */
+            attempts: components["schemas"]["PlatformApplyAttempt"][];
+        };
+        /** @description What is in flight right now, carried on the release view so the Releases page needs one read. ONE FIELD RATHER THAN A PER-TARGET ONE: a per-target "waiting on N sessions" field would cover only a fleet run and would put the same attempt in two places in one response, where the two can disagree. */
+        ActiveApply: {
+            /** @description The active fleet run, or null. There is at most one. */
+            run: components["schemas"]["PlatformApplyRun"] | null;
+            /** @description EVERY open attempt on the instance, whether it belongs to that run or is a standalone per-host apply or revert. A client renders a target's progress by finding the attempt whose host_id matches the targets entry (null = the control plane) and reading state and sessions_remaining. */
+            attempts: components["schemas"]["PlatformApplyAttempt"][];
         };
         /** @description The platform-release-manifest.json asset attached to a stable GitHub Release, produced by the publish workflow from the same tag as the notes so digests and prose cannot disagree. Served back VERBATIM as PlatformRelease.manifest. NOTE THE TWO VERSION FIELDS ARE DIFFERENT THINGS: format_version versions THIS DOCUMENT'S FORMAT, schema_version is the DATABASE MIGRATION VERSION the release's control-plane image embeds (ADR 0002's ordering key). Not to be confused with scripts/release/release-manifest.json in the quasar superproject, which is the release-preflight input set and a different file - the asset is named platform-release-manifest.json precisely so the two never collide. */
         ReleaseManifest: {
