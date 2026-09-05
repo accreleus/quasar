@@ -48,6 +48,30 @@ tells you why something will probably not work. The exception is a host with no
 usable encoder, which will fail sessions rather than pretend.
 </Aside>
 
+## Build identity in the host drawer
+
+Expanding a host row shows a **Build** block: what that agent actually is, as it
+reported itself.
+
+| Row | What it says |
+| --- | --- |
+| Commit | The commit the agent was built from. |
+| Built | When that build was made. |
+| Install | **Registry** (published images) or **Built from source** (images compiled on the machine). A source-built host can be told about a release but never given one. |
+| Updater | **Present** or **None**. Whether a `quasar-updater` service sits beside this host's stack, which is what can recreate its agent. |
+
+Any of these can read **Unknown**, and on an agent from before the self-update
+feature they all will: it has no way to say what it is running. Such a host keeps
+working exactly as before — it simply cannot be updated from the console until it
+is upgraded once by hand, after which it reports its identity like any other. The
+Releases tab shows the recipe for it.
+
+An agent **newer than the control plane** turns up as *Agent ahead of the control
+plane* under Needs attention. Nothing is broken, but it is the wrong way round —
+the control plane carries the migrations and always moves first. It is only
+reachable if something was rolled back by hand. See [Updating
+Quasar](/quasar/admin/releases/).
+
 ## GPU capacity and admission
 
 Each GPU shows its encode slots and its VRAM, used and free.

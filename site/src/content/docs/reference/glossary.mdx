@@ -14,9 +14,18 @@ a free encode slot and enough free GPU memory.
 **App.** A catalog entry a user can launch: content, a container specification and
 a launch command. Classified as a game, a desktop or a launcher.
 
+**Attempt.** One target's move to one set of images: the control plane, or one
+host. Every apply produces one, succeeded or failed, and it is the only durable
+record of what that target was running before.
+
 **AV1.** A modern video codec. Saves 40 to 50 percent of H.264's bitrate at
 equivalent quality, and Chrome can decode it everywhere thanks to a software
 fallback.
+
+**Channel.** Which platform releases an instance is shown. `stable` is a tagged
+release with notes; `edge` is whatever was last published from a branch, with
+none. An instance follows one at a time, and switching changes what is listed,
+never what is installed.
 
 **Constrained baseline.** The H.264 profile browser sessions are clamped to,
 because Chrome's WebRTC receiver cannot decode High profile from any encoder.
@@ -45,6 +54,11 @@ After a successful enrollment the agent uses its own stored node secret instead.
 **FEC.** Forward error correction. Adds redundancy so lost packets can be
 reconstructed. Off by default and not recommended for browser clients.
 
+**Fleet run.** One platform release applied across a whole instance: the control
+plane first, then every eligible host in sequence. A host that cannot take it is
+skipped, which is not a failure; a target that fails stops the run where it
+stands.
+
 **GOP.** Group of pictures. The interval between keyframes. Defaults to 60
 frames.
 
@@ -63,6 +77,10 @@ must also be real shared storage, not merely that same path on each one.
 
 **ICE.** The WebRTC mechanism for discovering a network path between two peers.
 A session stuck at "checking" means ICE found no working path.
+
+**Install mode.** How a host got its platform images: from the registry, or built
+from source on the machine. A source-built host can be told about a release but
+not given one.
 
 **Intra refresh.** Replacing periodic keyframes with a rolling wave of
 intra-coded blocks. Vulkan encoder only, and needs a patched image.
@@ -84,12 +102,21 @@ compositor and encoder, launches app containers.
 **Placement.** Choosing which host runs a session. Governed by
 `QUASAR_PLACEMENT_POLICY`.
 
+**Platform release.** A matched set of Quasar's own images — the control plane
+and the node agent — built from one commit and published together. This is Quasar
+updating Quasar; app catalog images have their own versions entirely.
+
 **Playout buffer.** The client-side jitter buffer. Adapts to how evenly frames
 arrive. Uneven arrival forces a bigger buffer, and the buffer is latency.
 
 **Presentation interval variation.** The standard deviation of the gap between
 displayed frames. The number that matches perceived stutter. Below 12 ms is
 healthy, above 18 ms is visible.
+
+**Release manifest.** The machine-readable description of one stable platform
+release: which component images it contains, by digest, and the commit they were
+built from. Published with the release, so the notes and the digests cannot
+disagree.
 
 **Render node.** The DRM device the compositor and encoder use, under `/dev/dri`.
 Prefer a `/dev/dri/by-path/` name, because the numbered names can move between
@@ -110,6 +137,10 @@ browser and the GPU host, which means a LAN or a VPN.
 
 **Stream profile.** One concrete encode rung: codec, resolution, frame rate,
 bitrate and eligibility thresholds. Users never see these.
+
+**Updater.** The per-host actor that pulls a platform release and recreates the
+containers it replaces, because a container cannot recreate itself. It acts only
+when told to, and only on the stack it sits beside.
 
 **VA-API.** The video acceleration interface used for AMD and Intel encoding.
 

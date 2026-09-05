@@ -1,0 +1,236 @@
+---
+title: Updating Quasar
+description: Platform releases in the console — channels, what each target can take, applying to one host or the whole fleet, and reverting an agent.
+---
+
+import Shot from '../../../components/Shot.astro';
+import admin_releases from '../../../assets/shots/admin-releases.png';
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+Quasar can update itself. A **platform release** is a matched set of Quasar's own
+images — the control plane, which carries the web app, and the node agent — built
+from one commit and published together. Admin, Fleet, Releases is where you see
+which one you are on, which ones exist, and which of your machines can take one.
+
+This is Quasar updating Quasar. It has nothing to do with the app catalog's
+images, which have their own versions and their own [rollout
+page](/quasar/admin/images/).
+
+<Shot
+	label="Admin releases"
+	sublabel="The Releases tab: installed identity, the channel controls, and an instance that is already current."
+	src={admin_releases}
+	alt="The admin Releases tab showing installed versions, channel selection and nothing available"
+/>
+
+When a newer release is listed, a banner appears across the admin area —
+*Quasar X.Y.Z is available* — with a link here. Dismissing it lasts for the
+browser session, not forever.
+
+## Installed
+
+The **Installed** section is what this instance is actually running, as reported
+by the components themselves rather than read from a configuration file.
+
+- **Control plane** — its version, its commit, the database schema version it is
+  on, and when it was built.
+- **Node agents** — how many hosts, and how many have not reported an identity.
+
+Per-host detail lives in the host drawer on the [Hosts
+tab](/quasar/admin/hosts/#build-identity-in-the-host-drawer).
+
+## Channels
+
+An instance follows one **channel** at a time.
+
+| Channel | What it lists |
+| --- | --- |
+| `stable` | Tagged releases, with notes and a published release manifest. The default. |
+| `edge` | Whatever was last published from a branch. No version and no notes. |
+
+`edge` follows one branch, named in the **Edge branch** field beside the
+selector. That field selects nothing while the channel is stable, and it survives
+a switch, so you can set it once.
+
+Switching the channel changes **what is listed, never what is installed**, and it
+does not start a check by itself.
+
+## Available, and the notes
+
+Each entry shows its name — the version on stable, a short commit on edge — when
+it was built, the commit, and the schema version it carries.
+
+A stable release renders the notes published with it. A release with no notes
+links to the changes instead. An edge build publishes no notes by design, so the
+entry offers a comparison against the installed build.
+
+Nothing below this control plane's own schema version is ever listed. That is the
+[one-way migration rule](/quasar/operations/upgrading/#the-hard-rule) enforced in
+the product: a release that would take the database backwards is not an option
+you can pick by mistake.
+
+## Check now
+
+Detection runs on a schedule as the `platform.release_detect` job — weekly by
+default. **Check now** runs that job immediately, which is the same thing as
+Run now on the [Jobs tab](/quasar/admin/jobs/#the-release-detection-job). It
+reads the release list, and never applies anything.
+
+The subtitle above the tabs says when the last check ran.
+
+## Targets
+
+The **Targets** table lists the control plane and every host, evaluated against
+the newest listed release. A target is **Ready** or **Not ready**, and a not-ready
+target says why.
+
+| Why it says | What it means |
+| --- | --- |
+| Already on the newest release. | Nothing to do. |
+| Nothing newer has been detected on this channel. | No release is on offer. |
+| This target has not reported what it is running. | An older agent, from before this feature. It cannot be updated from here until it is upgraded once by hand. |
+| Built from source on the host — update it with git, not from here. | A source install. The published image is a different build and cannot replace one built on the machine. |
+| No updater is installed beside this host's stack. | The host has no `quasar-updater` service, so nothing on it can recreate its own containers. |
+| The host's agent is not connected. | An offline host. It is skipped, not failed. |
+| Waiting on the control plane: this release carries a newer schema. | An agent is never moved past the control plane. |
+| Waiting on the control plane, which moves first. | The same ordering rule, during a fleet update. |
+| An update is already in flight on this target. | One at a time per target. |
+| A fleet update is already running. | Wait for it, or cancel it. |
+
+A host whose agent is **newer than the control plane** is not a target reason but
+a fault: it appears under **Needs attention** as *Agent ahead of the control
+plane*. That is only reachable if something was moved backwards by hand.
+
+### The manual recipe
+
+Under the table, each not-ready target gets its own block: what it is on, what it
+could be on, and the exact commands for *its* situation. A source install gets
+the redeploy command, a host with no updater gets the three lines that add one
+followed by the pin-and-recreate recipe, and an offline host gets no commands at
+all, because nothing is worth typing until it is back.
+
+Those commands are the same ones on the [Upgrading
+page](/quasar/operations/upgrading/), and they contain nothing about your
+environment: no addresses, no host names, no home directories. You copy them onto
+the machine you are already logged into.
+
+## Apply to one host
+
+A ready host offers **Apply**. What happens, in order:
+
+<Steps>
+
+1. **The host is cordoned.** It stops taking new sessions, exactly as
+   [draining](/quasar/admin/hosts/#draining-and-removing) does.
+
+2. **The attempt waits for that host's sessions to end**, showing how many are
+   left. The confirmation's checkbox — *Update now — ends N live sessions* —
+   skips the wait and names the count, because recreating the agent ends them
+   either way. Leave it off and nothing is lost.
+
+3. **The updater on that host pulls the release's digest and recreates the
+   agent.**
+
+4. **The new agent registers**, on the release's commit, which is what resolves
+   the attempt as succeeded. The old agent cannot report its own success; it is
+   the thing being replaced.
+
+5. **The cordon is restored to whatever it was before** — a host you had already
+   cordoned stays cordoned, one that was serving goes back to serving, whether
+   the apply worked or not.
+
+</Steps>
+
+A failed apply leaves the host on what it was running, records the digests it
+would have replaced, and shows the reason. There is no automatic rollback for a
+host, and the failure panel carries the commands to put it back by hand.
+
+## Update Quasar
+
+**Update Quasar** appears when a newer release is listed and nothing else is in
+flight. It moves the whole instance in one action, in an order that is not
+configurable: **the control plane first, then every eligible host, one at a
+time.** There is no hosts-only button, because an agent is never moved past the
+control plane.
+
+<Aside type="caution" title="A control-plane update ends every session">
+Recreating the control plane drops every agent's connection to it, and an agent
+stops its sessions the moment that connection drops. So a fleet update **drains
+the whole instance first** and waits for the session count to reach zero before
+the control-plane step. This is a known limitation, tracked as
+[#128](https://github.com/accreleus/quasar/issues/128); the drain is how the
+console keeps it from being a surprise.
+</Aside>
+
+After the drain, the control plane updates itself through the updater beside it,
+and the API and the console go away for roughly twenty seconds. The build that
+boots reads back the request written down before the restart and reports the
+outcome — the process carrying out its own update cannot survive to report
+success. Then each host follows in the fleet list's order, cordoned, drained,
+updated and uncordoned exactly as a single Apply is.
+
+The run **stops at the first target that fails** and says which. Targets behind
+it are already updated; targets ahead of it were never started.
+
+Hosts that cannot take the release are **skipped, not failed** — offline,
+source-built, or without an updater. They are listed with their reason and the
+run still finishes as succeeded. "Nothing was eligible" is a legitimate outcome.
+
+**Cancel** stops the run before its next target. It never interrupts one in
+flight: a pull or a recreate that has started finishes, because interrupting a
+recreate is how a stack ends up with no container at all. The flag is stored, so
+a cancel pressed while the control plane is restarting is still honoured.
+
+<Aside type="note" title="A source-built control plane is not offered an update">
+The published image is a different build from one compiled on the host, and
+swapping one for the other leaves a control plane that starts and cannot write
+its own state. The control plane learns its own install mode from the updater
+beside it, and refuses the run outright when it is source-built or unknown —
+nothing moves before the control plane.
+</Aside>
+
+### "Quasar was updated"
+
+An admin tab left open across the control-plane step keeps polling through the
+restart and says the control plane is restarting rather than showing an error.
+Once the served build differs from the one the page was loaded from, a toast
+appears: **Quasar was updated — This page is running the previous build**, with a
+Reload button. Take it; the tab is running old JavaScript against a new API.
+
+## Revert a host
+
+A host row offers **Revert** once it has one succeeded update behind it. A revert
+is an apply aimed backwards: same drain, same confirmation naming the live
+session count, same states, targeting the digests recorded as previous on that
+host's last succeeded update.
+
+It is not a version picker. The only thing on offer is the build that host was
+demonstrably running a moment ago, and the confirmation names that digest. A
+revert is itself recorded, so it can be reverted in turn.
+
+<Aside type="danger" title="The control plane is never revertible from here">
+The control plane carries database migrations, and rolling it below the schema
+version already applied is the crash loop described under [the hard
+rule](/quasar/operations/upgrading/#the-hard-rule). Agents carry no migrations,
+so they can move back — but never above the control plane's own release.
+</Aside>
+
+## History and the audit log
+
+**Apply history**, below the targets, is every update this instance has made to
+itself, newest first: the target, whether it was an apply or a revert, the
+outcome, and the digests it replaced. Those recorded digests are what makes
+Revert possible, so they are worth keeping — see [Backup and
+restore](/quasar/operations/backup/#the-apply-history-and-what-revert-depends-on).
+
+Every action is also written to the [audit log](/quasar/admin/sessions/), with
+the admin who started it: `platform.apply.host`, `platform.apply.run`,
+`platform.apply.cancel` and `platform.revert.host`.
+
+## See also
+
+- [Upgrading](/quasar/operations/upgrading/) — the manual recipes, adding the
+  updater to an existing install, and the migration rule.
+- [Jobs and schedules](/quasar/admin/jobs/) — the detection job's schedule.
+- [Environment variables](/quasar/reference/environment/#updates-and-releases) —
+  every knob behind this page.

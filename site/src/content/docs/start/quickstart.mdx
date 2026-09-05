@@ -12,4 +12,13 @@ Linux, Docker and about 20 GB of disk; the
 Everything here runs in your browser. The script makes its own secrets on the
 target machine, so nothing sensitive exists on this page to leak.
 
+The stack it writes has four services: Postgres, the control plane, the node
+agent, and `quasar-updater`, which is what lets Quasar update itself from the
+admin console later. The updater holds the Docker socket, so it is worth saying
+what it cannot do: it pulls only digests inside the allow-listed registry
+namespace and recreates only the two Quasar services in this stack. The script
+fills in `QUASAR_STACK_DIR` — this directory's absolute path on the machine —
+which the updater needs to find those compose files. On Podman, also set
+`QUASAR_DOCKER_SOCKET` to your own socket path.
+
 <QuickStart />

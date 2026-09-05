@@ -125,6 +125,19 @@ up and the data is there.
 See [Testing and verification](/quasar/developer/verification/) for the rest of
 the developer verification workflow.
 
+## The apply history, and what Revert depends on
+
+Every platform update this instance has made to itself is recorded in the
+database, including the image digests each target was running before it moved.
+That record is the only thing that makes [Revert](/quasar/admin/releases/#revert-a-host)
+possible, so restoring an older database loses it: the hosts keep running what
+they are running, but the console can no longer say what to put them back to.
+
+On each host, the updater also leaves `.env.prev` beside `deploy/.env` — the
+environment file exactly as it was before the last apply. It is one file, it is
+small, and it is the fastest way to see which digests were replaced on a machine
+whose history you no longer have.
+
 ## Version compatibility
 
 There is no published matrix of which control plane versions work with which

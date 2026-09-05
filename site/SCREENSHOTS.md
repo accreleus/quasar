@@ -20,6 +20,12 @@ they came from, how to retake them, and what is still worth adding.
 | `admin/steam.mdx` | `admin-sources.png` | The Steam source and the artwork provider. |
 | `admin/profiles.mdx` | `admin-profiles.png` | Launch profiles and their ordered rungs. |
 | `admin/users.mdx` | `admin-invites.png` | Registration mode and outstanding invites. |
+| `admin/releases.mdx` | `admin-releases.png` | The Releases tab: installed identity, the channel controls, and an instance with nothing available. |
+
+`admin-releases.png` should be retaken once a real published release with notes
+exists. The current shot is an instance that is already current, so the Available
+section reads as empty and neither the Targets table nor Apply history is in
+frame; the page is more useful when it has a release to show.
 
 `start/how-it-works.mdx` is not a screenshot. It renders
 `src/components/ArchDiagram.astro`, an enlarged version of the landing page's
