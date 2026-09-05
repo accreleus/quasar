@@ -24,6 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+## 0.2.1 — 2026-09-05
+
 ### Fixed
 
 - **A fleet update no longer fails on the first host right after the control plane
