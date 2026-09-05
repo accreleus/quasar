@@ -136,8 +136,12 @@ func newGitHubHarness(t *testing.T, assetHost, redirectTo string, allow ...strin
 		doer.rewriteTo[redirectTo] = cdn.URL
 	}
 
+	assetHosts := []string{assetHost}
+	if redirectTo != "" && doer.allow[redirectTo] {
+		assetHosts = append(assetHosts, redirectTo)
+	}
 	return harness{
-		src:  NewGitHubSource(doer, "https://api.example.test", "accreleus/quasar", "tok"),
+		src:  NewGitHubSource(doer, "https://api.example.test", "accreleus/quasar", "tok", assetHosts),
 		doer: doer,
 	}
 }
@@ -203,7 +207,7 @@ func TestGitHubSourceReportsANonOKStatus(t *testing.T) {
 		rewriteTo: map[string]string{"api.example.test": srv.URL},
 	}
 
-	src := NewGitHubSource(doer, "https://api.example.test", "accreleus/quasar", "")
+	src := NewGitHubSource(doer, "https://api.example.test", "accreleus/quasar", "", nil)
 	if _, err := src.List(context.Background()); err == nil ||
 		!strings.Contains(err.Error(), "503") {
 		t.Fatalf("err = %v, want the 503 reported", err)
@@ -220,7 +224,7 @@ func TestReleaseEgressHostsCoversTheAPIAndTheAssetHosts(t *testing.T) {
 }
 
 func TestCompareURLIsNilWithoutBothCommits(t *testing.T) {
-	src := NewGitHubSource(&fakeDoer{}, "", "accreleus/quasar", "")
+	src := NewGitHubSource(&fakeDoer{}, "", "accreleus/quasar", "", nil)
 	if got := src.CompareURL("", commitA); got != "" {
 		t.Errorf("CompareURL with no from-commit = %q, want empty", got)
 	}
@@ -290,9 +294,10 @@ func TestGitHubSourceFollowsOnlyOneHop(t *testing.T) {
 	t.Cleanup(loop.Close)
 	doer.rewriteTo["a.example.test"] = loop.URL
 
-	src := NewGitHubSource(doer, "https://api.example.test", "accreleus/quasar", "")
+	src := NewGitHubSource(doer, "https://api.example.test", "accreleus/quasar", "",
+		[]string{"a.example.test"})
 	_, err := src.FetchManifest(context.Background(), "https://a.example.test/manifest.json")
-	if err == nil || !strings.Contains(err.Error(), "one hop") {
+	if err == nil || !strings.Contains(err.Error(), "second redirect is not followed") {
 		t.Fatalf("err = %v, want the second redirect refused", err)
 	}
 }
