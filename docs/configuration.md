@@ -923,7 +923,7 @@ frozen: the updater's local socket").
 
 | Variable | Default | Notes |
 |---|---|---|
-| `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | Comma-separated registry namespaces this host will pull platform images from. Matched on `host/path/` segment boundaries, so `ghcr.io/accreleus/quasar` does not admit `ghcr.io/accreleus/quasar-evil/x`. Anything outside is refused `namespace_rejected` before a byte is pulled. Blank falls back to the default; to lock a host down, name a namespace nothing matches. |
+| `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | Comma-separated registry namespaces this host will pull platform images from. Matched on `host/path/` segment boundaries, so `ghcr.io/accreleus/quasar` does not admit `ghcr.io/accreleus/quasar-evil/x`. Anything outside is refused `namespace_rejected` before a byte is pulled. **Unset or blank is the org default, never "allow nothing" and never "allow everything"** — the compose default is `${QUASAR_UPDATER_ALLOWED_NAMESPACES:-}`, so the program is handed an empty string on every stack that does not set it (guarded by `TestUnsetNamespaceKnobIsTheOrgDefault`). To lock a host down, name a namespace nothing matches. |
 | `QUASAR_UPDATER_WAIT_TIMEOUT_S` | `300` | `docker compose up --wait --wait-timeout`. A request may name its own value. |
 | `QUASAR_UPDATER_PULL_TIMEOUT_S` | `3600` | Wall-clock bound on the `pull` step. |
 | `QUASAR_UPDATER_RECREATE_TIMEOUT_S` | `900` | Wall-clock bound on the `up` step, independent of compose's health wait. |

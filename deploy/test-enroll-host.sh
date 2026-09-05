@@ -200,10 +200,14 @@ if [ "$RC" -eq 0 ] && [ -f "$envf" ] && [ "$(stat -c %a "$envf")" = 600 ] \
    && grep -qxF "QUASAR_RENDER_NODE=/dev/dri/renderD128" "$envf" \
    && grep -qxF "COMPOSE_FILE=docker-compose.yml" "$envf" \
    && grep -qxF "QUASAR_HOME_ROOT=$tmp/homes" "$envf" && [ -d "$tmp/homes" ] \
+   && grep -qxF "QUASAR_STACK_DIR=$tmp/install" "$envf" \
+   && grep -qxF "QUASAR_UPDATER_IMAGE=ghcr.io/accreleus/quasar/quasar-updater:1.2.3" "$envf" \
    && grep -q "^pull ghcr.io/accreleus/quasar/quasar-node-agent:1.2.3$" <<<"$DOCKER_LOG" \
+   && grep -q "^pull ghcr.io/accreleus/quasar/quasar-updater:1.2.3$" <<<"$DOCKER_LOG" \
    && grep -q 'up -d quasar-node-agent' <<<"$DOCKER_LOG" \
+   && grep -q 'up -d quasar-updater' <<<"$DOCKER_LOG" \
    && grep -q "enrolled: this host is now 'gpu-b'" <<<"$OUT"; then
-  pass "AMD host + release tag: 0600 env, image pinned to :1.2.3, agent started, enrolled"
+  pass "AMD host + release tag: 0600 env, both images pinned to :1.2.3, agent + updater started, enrolled"
 else
   fail "happy path" "rc=$RC docker=[$DOCKER_LOG] env=[$(cat "$envf" 2>/dev/null)] out=$(tail -5 <<<"$OUT")"
 fi
@@ -274,8 +278,12 @@ else
   fail "no image" "rc=$RC docker=[$DOCKER_LOG] out=$(tail -3 <<<"$OUT")"
 fi
 run_installer explicit QUASAR_ENROLLMENT="$WSS_BLOB" QUASAR_AGENT_IMAGE=ghcr.io/x/y@sha256:abc QUASAR_REF=v9.9.9 NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes" MOCK_AGENT_LOG="$ENROLLED_LOG"
-if [ "$RC" -eq 0 ] && grep -q '^pull ghcr.io/x/y@sha256:abc$' <<<"$DOCKER_LOG" && ! grep -q '9.9.9' <<<"$DOCKER_LOG"; then
-  pass "QUASAR_AGENT_IMAGE overrides the ref-derived tag"
+# QUASAR_AGENT_IMAGE overrides the AGENT's ref-derived tag and nothing else: the
+# updater has its own override and still follows QUASAR_REF here.
+if [ "$RC" -eq 0 ] && grep -q '^pull ghcr.io/x/y@sha256:abc$' <<<"$DOCKER_LOG" \
+   && ! grep -q 'quasar-node-agent.*9\.9\.9' <<<"$DOCKER_LOG" \
+   && grep -q '^pull ghcr.io/accreleus/quasar/quasar-updater:9.9.9$' <<<"$DOCKER_LOG"; then
+  pass "QUASAR_AGENT_IMAGE overrides the ref-derived agent tag; the updater still follows the ref"
 else
   fail "explicit image" "docker=[$DOCKER_LOG]"
 fi
@@ -315,6 +323,7 @@ else
 fi
 printed="$(sh "$script" --print-compose)"
 if grep -q '^  quasar-node-agent:$' <<<"$printed" && grep -q 'QUASAR_ENROLLMENT' <<<"$printed" && ! grep -q 'depends_on' <<<"$printed" \
+   && grep -q '^  quasar-updater:$' <<<"$printed" && grep -q '^  quasar-updater-run:$' <<<"$printed" \
    && grep -q 'gpus: all' <<<"$(sh "$script" --print-nvidia-overlay)"; then
   pass "--print-compose / --print-nvidia-overlay: the manual path needs no enrollment string"
 else

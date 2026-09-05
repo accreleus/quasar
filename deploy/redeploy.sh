@@ -57,7 +57,7 @@
 #   REDEPLOY env=<> scope=<> ref=<> sha=<short> bundle=<index-hash.js> \
 #            health=<ok|FAIL> catalog=<code> agent=<registered|MISSING> \
 #            readiness=<ok|FAILED|unknown> codecs=<ok|degraded|pending|unknown> \
-#            result=<OK|WARN|FAIL>
+#            updater=<ok|FAIL|absent> result=<OK|WARN|FAIL>
 #
 # result=WARN means the deploy mechanically succeeded but the host is degraded
 # (failing readiness checks, a degraded codec plan, or a refused provisioning lock).
@@ -770,8 +770,17 @@ if [ "$SCOPE" = all ]; then
     --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" \
     --build-arg BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     -t "$NA_IMAGE" .
+  # The updater ships in the same source deploy, and a host without it has no
+  # actor for a platform-release apply at all (updater_present=false forever).
+  # Built here rather than through build-images.sh so one `docker build` failure
+  # cannot be mistaken for a contract failure; the image name and the two
+  # provenance args are the same either way.
+  docker build -f deploy/Dockerfile.updater --target runtime \
+    --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" \
+    --build-arg BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    -t quasar-updater:latest .
 else
-  step "[$ENV] 5/7 skip node-agent build (scope=$SCOPE)"
+  step "[$ENV] 5/7 skip node-agent + updater build (scope=$SCOPE)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -827,6 +836,10 @@ if [ "$SCOPE" = all ]; then
   # agent in Docker's Created state (observed repeatedly on Tower). `--wait`
   # makes the deployment contract require the new agent to be running/healthy.
   $DC up -d --force-recreate --no-deps --wait --wait-timeout 60 quasar-node-agent
+  # No --wait: the updater declares no healthcheck, and compose's --wait on a
+  # health-less service only waits for `running`, which the probe below asserts
+  # far more usefully.
+  $DC up -d --force-recreate --no-deps quasar-updater
 fi
 
 # ---------------------------------------------------------------------------
@@ -893,6 +906,46 @@ else
   else
     echo "  ok: control-plane container recreated by this run ($started_at)"
   fi
+fi
+
+# The updater must be able to see the stack it sits beside, or a platform-release
+# apply has an actor that will refuse every request. The probe runs INSIDE the
+# updater container: it is the only one guaranteed to have a client that speaks a
+# unix socket (the control-plane image ships curl or wget depending on which
+# Dockerfile built it, and busybox wget cannot do it at all).
+#
+# Discovery being right is the whole check. A `working_dir` that is not
+# QUASAR_STACK_DIR means the compose labels and the bind mount disagree, which is
+# exactly the state in which every apply fails with a file-not-found the operator
+# would have to read compose labels to explain.
+updater=absent
+if [ -n "$($DC ps -q quasar-updater 2>/dev/null || true)" ]; then
+  self_json="$($DC exec -T quasar-updater curl -sf --max-time 10 \
+      --unix-socket /run/quasar-updater/updater.sock http://u/v1/self 2>/dev/null || true)"
+  # No jq on every fleet host; the value is a JSON string with no escapes.
+  self_wd="$(printf '%s' "$self_json" | sed -n 's/.*"working_dir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  want_wd="$(cd deploy && pwd)"
+  if [ -z "$self_json" ]; then
+    echo "  FAIL: the updater is running but does not answer on its socket —"
+    echo "        check 'docker compose logs quasar-updater' (it fails closed when it"
+    echo "        cannot discover its own compose project)"
+    updater=FAIL
+    fail=1
+  elif [ "$self_wd" != "$want_wd" ]; then
+    echo "  FAIL: the updater discovered working_dir '$self_wd' but this stack is at"
+    echo "        '$want_wd' — set QUASAR_STACK_DIR=$want_wd in $ENV_FILE and redeploy"
+    updater=FAIL
+    fail=1
+  else
+    updater=ok
+    echo "  ok: updater reachable, stack dir $self_wd"
+  fi
+elif [ "$SCOPE" = all ]; then
+  echo "  FAIL: no quasar-updater container after a scope=all deploy"
+  updater=FAIL
+  fail=1
+else
+  echo "  note: no updater container (scope=$SCOPE does not create one) — probe skipped"
 fi
 
 # Catalog endpoint proves the control-plane binary is current: 401 = route
@@ -1064,5 +1117,5 @@ result=OK
 [ "${degraded:-0}" -eq 0 ] || result=WARN
 [ "$fail" -eq 0 ] || result=FAIL
 echo
-echo "REDEPLOY env=$ENV scope=$SCOPE ref=$REF sha=$SHA bundle=$BUNDLE health=$health catalog=$catalog agent=$agent readiness=$readiness codecs=$codecs result=$result"
+echo "REDEPLOY env=$ENV scope=$SCOPE ref=$REF sha=$SHA bundle=$BUNDLE health=$health catalog=$catalog agent=$agent readiness=$readiness codecs=$codecs updater=$updater result=$result"
 exit "$fail"

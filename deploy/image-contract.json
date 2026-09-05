@@ -190,9 +190,10 @@
       "_size_note": "docker:29-cli is ~120MB (alpine + docker CLI + buildx/compose plugins) and the updater binary is ~8MB. If this ceiling breaks, the base moved -- do not raise it to make a red build green.",
 
       "binaries": {
-        "required": ["docker", "quasar-updater"],
+        "required": ["docker", "quasar-updater", "curl"],
         "_required_notes": {
           "docker": "The CLI this program exists to drive. Its compose plugin is asserted separately below, because a docker CLI WITHOUT the compose plugin passes this line and can do nothing the updater needs.",
+          "curl": "The post-deploy `/v1/self` probe (deploy/redeploy.sh step 7/7) runs INSIDE this container, because it is the only one guaranteed to have a client that speaks a unix socket: the control-plane image ships curl or wget depending on which Dockerfile built it, and busybox wget cannot do it at all.",
           "quasar-updater": "The baked binary. Alpine base, so no rpm/package assertions apply to this role."
         },
         "forbidden": ["go", "gcc", "cargo"]

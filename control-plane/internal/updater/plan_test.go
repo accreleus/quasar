@@ -248,7 +248,27 @@ func TestParseNamespaces(t *testing.T) {
 	if got := ParseNamespaces(" ghcr.io/a/b/ , ghcr.io/c/d "); !reflect.DeepEqual(got, []string{"ghcr.io/a/b", "ghcr.io/c/d"}) {
 		t.Fatalf("got %v", got)
 	}
-	if got := ParseNamespaces("  "); !reflect.DeepEqual(got, DefaultAllowedNamespaces) {
-		t.Fatalf("blank must fall back to the default, got %v", got)
+}
+
+// The compose default is `${QUASAR_UPDATER_ALLOWED_NAMESPACES:-}`, so an unset
+// knob reaches the program as the empty string on every stack. That must be the
+// org default — not "allow nothing" (every apply dead) and not "allow
+// everything" (no allowlist at all).
+func TestUnsetNamespaceKnobIsTheOrgDefault(t *testing.T) {
+	for _, raw := range []string{"", "  ", ",", " , "} {
+		got := ParseNamespaces(raw)
+		if !reflect.DeepEqual(got, DefaultAllowedNamespaces) {
+			t.Fatalf("ParseNamespaces(%q) = %v, want %v", raw, got, DefaultAllowedNamespaces)
+		}
+		cfg := testCfg()
+		cfg.AllowedNamespaces = got
+		if _, rej := Plan(agentReq(), "", cfg); rej != nil {
+			t.Fatalf("ParseNamespaces(%q) refused an org image: %v", raw, rej)
+		}
+		foreign := agentReq()
+		foreign.Components[0].Image = "docker.io/library/busybox"
+		if _, rej := Plan(foreign, "", cfg); rej == nil || rej.Reason != ReasonNamespaceRejected {
+			t.Fatalf("ParseNamespaces(%q) admitted a foreign image", raw)
+		}
 	}
 }
