@@ -524,6 +524,14 @@
 .trace-card {
   margin-top: var(--s6);
   position: relative;
+  /* This card is a grid item on the session-detail page. Without it, the item's
+     automatic minimum size is its min-content width and the card escapes its
+     column — the lane SVG then measures WIDER, which is fed straight back into
+     the next render as the new viewBox width. min-width:0 breaks that loop at
+     the point where it starts. The SVGs carry no width/height attributes for
+     the same reason: they size from CSS and contribute no intrinsic width. */
+  min-width: 0;
+  max-width: 100%;
 }
 
 /* The badge rides the Chip primitive; this only makes the reading monospace,
@@ -665,6 +673,7 @@
 .trace-lane-plot {
   display: block;
   width: 100%;
+  min-width: 0;
   height: 54px;
   margin-top: 5px;
   overflow: visible;
