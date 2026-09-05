@@ -128,6 +128,37 @@ own; the two do not move together, and that is deliberate.
 
 ### Added
 
+- **Quasar updates itself from the admin console (#104; #105–#119).** A *platform
+  release* is a matched control-plane + node-agent image set from one commit. Every
+  component now stamps its build identity (semver, source commit, build time; the control
+  plane also its highest embedded migration) and the agent reports it on `register`
+  together with its install mode (registry or source) and whether an **updater** sits on
+  its stack (#107). The control plane detects releases on a weekly job (Monday 02:00 UTC,
+  editable, run-now) — the **stable** channel reads GitHub Releases and their
+  `platform-release-manifest.json`, the **edge** channel resolves the digest behind a
+  branch tag (default `develop`) and reads the build identity off the image labels (#110,
+  #111) — and the admin console gains a Fleet ▸ Releases tab plus a top banner: installed
+  vs available, cumulative sanitised release notes, channel + edge-branch settings, and a
+  per-host eligibility table whose ineligible rows carry the exact manual recipe (#112).
+  Applying is a per-host **updater** sidecar (`quasar-updater`, in every compose stack and
+  in `enroll-host.sh`'s generated stack) that only accepts digests under an allowlisted
+  registry namespace (`QUASAR_UPDATER_ALLOWED_NAMESPACES`, default the org's), rewrites
+  the two image lines in `.env` (keeping `.env.prev`), pulls, and recreates (#115). From
+  the console an admin applies to one host — the host is cordoned, the apply waits for
+  zero sessions (or `force` ends them), the new agent's `register` is the success
+  evidence — or presses **Update Quasar** to move the control plane first (it recreates
+  itself through its own updater and picks the run back up on boot) and then every
+  eligible host in sequence, stopping at the first failure; an open admin tab gets a
+  "Quasar was updated — reload" toast (#116, #117). A failed apply is left as it is with
+  the previous digests recorded, and an agent can be **reverted** to them from the console;
+  the control plane never is (ADR 0002: control plane first, never below the database's
+  migration) (#118). `make release VERSION=x.y.z` cuts a release from the changelog and
+  pushes the tag that publishes it (#109). Contract: quasar-protocol amendments 1 and 2
+  (register identity fields, `/v1/admin/platform/*`, `release_apply`/`release_state`,
+  migrations 0074 and 0075). **Existing installs must add the updater once** — see
+  `docs/upgrading.md` "The updater". Glossary: `CONTEXT.md` "Platform releases";
+  decisions: ADR 0001 (pinned-digest trust), ADR 0002.
+
 - **Pushing a `vX.Y.Z` tag on `main` publishes a platform release (#104, #108).** The
   Images workflow gains a `v*` tag-push trigger beside manual dispatch. A `release-gate`
   job runs first and every build needs it: the tag must be strict semver, its commit must
