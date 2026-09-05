@@ -242,9 +242,17 @@ const LaneChart = memo(function LaneChart({
       if (pts.length === 0) return empty;
 
       const max = arrMax(pts.map((p) => p.v));
+      const last = pts[pts.length - 1];
+
+      // A series that never left zero draws nothing. Its line would sit exactly
+      // on the lane's baseline rule, which reads as a coloured rule ruled across
+      // the whole lane rather than as data — "pkt lost · max 0" in the caption
+      // and an empty lane says the same thing without the false alarm.
+      if (max <= 0) return { ...empty, max, last: last.v };
+
       // Own scale, always anchored at zero, so a curve's height is proportional
       // to its value.
-      const scaleMax = max > 0 ? max * SCALE_HEADROOM : 1;
+      const scaleMax = max * SCALE_HEADROOM;
       const toY = (v: number) => LANE_H - (v / scaleMax) * plotH - LANE_INSET;
 
       const d = pts
@@ -273,7 +281,6 @@ const LaneChart = memo(function LaneChart({
       const medianGap = gaps.length > 0 ? gaps[Math.floor(gaps.length / 2)] : 0;
       const endThreshold = xMax - Math.max(xRange * 0.02, medianGap * 3);
 
-      const last = pts[pts.length - 1];
       const end =
         last.ts_unix_ms < endThreshold ? { x: toSvgX(last.ts_unix_ms), y: toY(last.v) } : null;
 

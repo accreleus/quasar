@@ -634,6 +634,32 @@ describe("TraceViewer", () => {
       expect(screen.getByText("live")).toBeTruthy();
     });
 
+    it("draws nothing for a series that never left zero", async () => {
+      // A flat-zero line sits exactly on the lane's baseline rule and reads as a
+      // coloured rule ruled across the lane. Live on gpu-test, "pkt lost" drew a
+      // solid red bar under a clean transport lane.
+      const now = Date.now();
+      const bundle: DiagnosticBundle = {
+        ...BASE_BUNDLE,
+        series: {
+          ...BASE_BUNDLE.series,
+          "transport.packets_lost": [
+            { ts_unix_ms: now - 30_000, v: 0 },
+            { ts_unix_ms: now - 10_000, v: 0 },
+          ],
+        },
+      };
+      mockGetDiagnosticBundle.mockResolvedValue(bundle);
+      const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
+      await waitFor(() => expect(container.querySelector(".trace-body")).toBeTruthy());
+
+      expect(container.querySelector('[data-series="transport.packets_lost"]')).toBeNull();
+      // …but the lane still accounts for it: the caption states the scale.
+      expect(
+        container.querySelector('[data-scale-for="transport.packets_lost"]')?.textContent,
+      ).toMatch(/max 0/);
+    });
+
     it("renders the card head from the v3 panel primitives", async () => {
       mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
       const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
