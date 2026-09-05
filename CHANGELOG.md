@@ -24,6 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+## 0.2.0-rc.2 — 2026-09-05
+
 ### Fixed
 
 - **Release detection follows the one redirect GitHub and GHCR answer with (#110, #111).**
