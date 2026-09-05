@@ -1,0 +1,13 @@
+[04:32:33] before recreate:
+[gate 04:32:18] stats {"video":true,"w":2560,"h":1440,"t":29.1,"paused":false,"decoded":1758,"dropped":157,"ready":4}
+[04:32:33] force-recreating the control plane
+ Container deploy-quasar-control-plane-1 Waiting 
+container deploy-quasar-control-plane-1 is unhealthy
+[04:33:42] recreated
+gate log tail:
+[gate 04:33:19] stats {"video":false}
+[gate 04:33:49] stats {"video":false}
+[gate 04:34:19] stats {"video":false}
+[gate 04:34:39] final stats {"video":false}
+[gate 04:34:39] DELETE session -> 200
+GATE DECODED sid=87a11c39-a35c-4afb-a480-d92bd4220e42 frames=undefined size=undefinedxundefined
