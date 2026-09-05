@@ -32,7 +32,7 @@ func TestSwitchBackToStableNeverOffersALowerSchema(t *testing.T) {
 	}
 
 	// The same rows on edge list the edge row and nothing from stable.
-	view = PlanRelease(PlanInputs{Channel: ChannelEdge, ControlPlane: installed, Releases: rows})
+	view = PlanRelease(PlanInputs{Channel: ChannelEdge, ControlPlane: installed, Releases: rows, UpdaterPresent: true})
 	if len(view.Available) != 1 || view.Available[0].ID != "edge-76" {
 		t.Fatalf("edge offered %v, want only edge-76", ids(view.Available))
 	}
@@ -46,7 +46,7 @@ func TestEdgeOrderingAndUpToDate(t *testing.T) {
 		edgeRel("newest", commitB, 76, at(3)),
 		edgeRel("below", commitA, 75, at(9)), // never listed, whatever its built_at
 	}
-	view := PlanRelease(PlanInputs{Channel: ChannelEdge, ControlPlane: installed, Releases: rows})
+	view := PlanRelease(PlanInputs{Channel: ChannelEdge, ControlPlane: installed, Releases: rows, UpdaterPresent: true})
 
 	want := []string{"newest", "installed", "older"}
 	if got := ids(view.Available); !equalStrings(got, want) {
@@ -70,7 +70,7 @@ func TestEdgeOrderingAndUpToDate(t *testing.T) {
 
 	// With the installed commit newest, the answer is up_to_date.
 	rows = rows[:2]
-	view = PlanRelease(PlanInputs{Channel: ChannelEdge, ControlPlane: installed, Releases: rows})
+	view = PlanRelease(PlanInputs{Channel: ChannelEdge, ControlPlane: installed, Releases: rows, UpdaterPresent: true})
 	if view.Available[0].ID != "installed" {
 		t.Fatalf("newest = %s, want installed", view.Available[0].ID)
 	}

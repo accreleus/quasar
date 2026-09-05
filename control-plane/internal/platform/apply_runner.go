@@ -261,6 +261,11 @@ func (r *Runner) prepareAndSend(ctx context.Context, a Attempt, hostID string) b
 				return r.deadlineOrCancel(ctx, a.ID)
 			case <-time.After(r.PollInterval):
 			}
+			// A cancel resolves an unsent attempt at once; without this the
+			// drain would keep waiting for sessions until the deadline.
+			if cur, err := r.store.Attempt(ctx, a.ID); err == nil && TerminalAttemptState(cur.State) {
+				return false
+			}
 			remaining, err = r.store.NonTerminalSessions(ctx, hostID)
 			if err != nil {
 				r.log.Warn("apply: session count failed while draining", "attempt_id", a.ID, "err", err)

@@ -51,6 +51,20 @@ export function attemptStateText(state: string): string {
   return ATTEMPT_STATE_TEXT[state] ?? state;
 }
 
+/** A fleet run's state. There is no `partial`: a failed run stops at its first
+ *  failed target and the per-target attempts carry the rest. */
+const RUN_STATE_TEXT: Record<string, string> = {
+  pending: "Queued.",
+  running: "Updating.",
+  succeeded: "Every target is on the new release.",
+  failed: "Stopped at the first target that failed.",
+  cancelled: "Cancelled; nothing further was started.",
+};
+
+export function runStateText(state: string): string {
+  return RUN_STATE_TEXT[state] ?? state;
+}
+
 /** The closed failure vocabulary, shared verbatim with the wire, so this one
  *  mapping serves progress, history and an ack rejection. An identifier this
  *  build does not know renders verbatim. */

@@ -242,15 +242,6 @@ func devOnlyOperation(t *testing.T, op yaml.Node) bool {
 // that registers the route.
 var allowedUnimplemented = map[string]struct{}{
 	"GET /v1/sessions/{}/events": {}, // parked session-events SSE amendment
-	// Platform-release apply, amendment 2 (#104/#114): the apply half of the
-	// contract, likewise authored ahead of the server so the wire and the schema
-	// are fixed before three tickets implement against them independently. Each
-	// ticket MUST delete both the marker in protocol/openapi.yaml and the entry
-	// here in the same change that registers its route.
-	"POST /v1/admin/platform/apply":                {}, // removed by #117
-	"GET /v1/admin/platform/apply/runs":            {}, // removed by #117
-	"GET /v1/admin/platform/apply/runs/{}":         {}, // removed by #117
-	"POST /v1/admin/platform/apply/runs/{}/cancel": {}, // removed by #117
 }
 
 // unimplementedOperation reports whether an OpenAPI operation carries

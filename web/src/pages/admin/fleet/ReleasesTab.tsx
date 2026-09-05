@@ -43,6 +43,7 @@ import {
   attemptForTarget,
   useHostSessionCounts,
 } from "./ApplyControls";
+import { ControlPlaneRestarting, FleetApplyButton, FleetRunPanel } from "./FleetApply";
 import {
   FailedAttemptPanel,
   RevertConfirmModal,
@@ -111,6 +112,7 @@ export function ReleasesTab() {
         <Button variant="ghost" onClick={() => void res.refresh()}>
           Refresh
         </Button>
+        {view && <FleetApplyButton view={view} onStarted={() => void res.refresh()} />}
         <Button onClick={() => void check.run()} disabled={check.pending != null}>
           Check now
         </Button>
@@ -118,14 +120,31 @@ export function ReleasesTab() {
     ),
   });
 
+  const run = view?.active_apply?.run ?? null;
+  const cpTarget = view?.targets.find((t) => t.kind === "control_plane");
+  const cpAttempt = cpTarget ? attemptForTarget(view?.active_apply?.attempts, cpTarget) : undefined;
+  // A run's first target restarts the process serving this page, so a load
+  // error while the run is active is the update working, not a fault to report.
+  const restarting =
+    run != null &&
+    (cpAttempt?.state === "recreating" ||
+      cpAttempt?.state === "pending" ||
+      res.errorMessage != null);
+
   return (
     <>
-      <ResourceStates loading={res.loading} error={res.errorMessage} />
+      <ResourceStates loading={res.loading} error={run ? null : res.errorMessage} />
+      {restarting && <ControlPlaneRestarting />}
       {view && (
         <>
           <InstalledSection view={view} />
           <ChannelSection view={view} onSaved={() => void res.refresh()} />
           <AvailableSection view={view} />
+          {run && (
+            <Section title="Fleet update">
+              <FleetRunPanel run={run} targets={view.targets} onChanged={() => void res.refresh()} />
+            </Section>
+          )}
           <TargetsSection
             view={view}
             refreshKey={applied}

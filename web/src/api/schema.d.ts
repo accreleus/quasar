@@ -3880,8 +3880,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Fleet apply of one platform release (admin). NOT CURRENTLY SERVED — see x-unimplemented.
-         * @description NOT IMPLEMENTED AS OF 2026-09-05 — registered by #117, which removes this marker. Applies one release across the instance: THE CONTROL PLANE FIRST, then every eligible host in sequence (ADR 0002). Returns immediately with the run; the work is asynchronous and is watched through the run endpoints or through active_apply on GET /v1/admin/platform/releases. At most one fleet run is active per instance, enforced by a partial unique index rather than by a code check. Which hosts are targets is decided WHEN EACH TARGET IS REACHED, by amendment 1's eligibility rule; a host ineligible at its turn is SKIPPED (reported in run.skipped) and produces no attempt. A run STOPS AT ITS FIRST FAILED TARGET - there is no partial state, and the per-target attempts are where a partial outcome is read.
+         * Fleet apply of one platform release (admin).
+         * @description Applies one release across the instance: THE CONTROL PLANE FIRST, then every eligible host in sequence (ADR 0002). Returns immediately with the run; the work is asynchronous and is watched through the run endpoints or through active_apply on GET /v1/admin/platform/releases. At most one fleet run is active per instance, enforced by a partial unique index rather than by a code check. Which hosts are targets is decided WHEN EACH TARGET IS REACHED, by amendment 1's eligibility rule; a host ineligible at its turn is SKIPPED (reported in run.skipped) and produces no attempt. A run STOPS AT ITS FIRST FAILED TARGET - there is no partial state, and the per-target attempts are where a partial outcome is read.
          */
         post: {
             parameters: {
@@ -3943,8 +3943,8 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Fleet apply runs, newest first (admin). NOT CURRENTLY SERVED — see x-unimplemented.
-         * @description NOT IMPLEMENTED AS OF 2026-09-05 — registered by #117, which removes this marker. Fleet runs newest first (created_at DESC, id DESC), each with its per-target attempts. An active run is first by construction and there is at most one.
+         * Fleet apply runs, newest first (admin).
+         * @description Fleet runs newest first (created_at DESC, id DESC), each with its per-target attempts. An active run is first by construction and there is at most one.
          */
         get: {
             parameters: {
@@ -3988,8 +3988,8 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * One fleet apply run with its per-target attempts (admin). NOT CURRENTLY SERVED — see x-unimplemented.
-         * @description NOT IMPLEMENTED AS OF 2026-09-05 — registered by #117, which removes this marker. The run with its FULL per-target attempts, in the order the run reached them (control plane first).
+         * One fleet apply run with its per-target attempts (admin).
+         * @description The run with its FULL per-target attempts, in the order the run reached them (control plane first).
          */
         get: {
             parameters: {
@@ -4034,8 +4034,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Stop a fleet run before its next target (admin). NOT CURRENTLY SERVED — see x-unimplemented.
-         * @description NOT IMPLEMENTED AS OF 2026-09-05 — registered by #117, which removes this marker. Sets the run's PERSISTED cancel flag. IT STOPS THE RUN BEFORE ITS NEXT TARGET AND NEVER INTERRUPTS AN IN-FLIGHT ATTEMPT - a pull or a recreate already running finishes, and the run goes cancelled when that attempt terminates. Interrupting a recreate is how a stack is left with no container at all, so this operation deliberately cannot do it. An attempt still queued or waiting_sessions becomes cancelled at once. Idempotent. The flag is persisted so a cancel issued while the run's control-plane target is restarting the control plane is honoured by the binary that boots.
+         * Stop a fleet run before its next target (admin).
+         * @description Sets the run's PERSISTED cancel flag. IT STOPS THE RUN BEFORE ITS NEXT TARGET AND NEVER INTERRUPTS AN IN-FLIGHT ATTEMPT - a pull or a recreate already running finishes, and the run goes cancelled when that attempt terminates. Interrupting a recreate is how a stack is left with no container at all, so this operation deliberately cannot do it. An attempt still queued or waiting_sessions becomes cancelled at once. Idempotent. The flag is persisted so a cancel issued while the run's control-plane target is restarting the control plane is honoured by the binary that boots.
          */
         post: {
             parameters: {

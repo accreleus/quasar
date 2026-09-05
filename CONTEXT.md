@@ -301,3 +301,15 @@ updater acts).
 built from source on the host. A source-built host can be told about a release
 but not given one. _Avoid_: "dev host" (a source-built host may be production),
 "pinned" (a registry install is always pinned; the word adds nothing).
+
+**Attempt** — one target's move to one digest set: the control plane, or one
+host. Every apply produces one, whether it succeeded or failed, and it is the
+only durable record of what that target was on before. _Avoid_: "job" (an
+attempt is operator-initiated and rides no schedule), "task".
+
+**Fleet run** — one release applied across the whole instance: the control plane
+first, then every eligible host in sequence. At most one is active. A host that
+cannot take the release at its turn is **skipped**, which is not a failure; a
+target that fails stops the run where it stands. _Avoid_: "rollout" (implies
+staging and percentages, of which there are none), "batch" (the run is strictly
+sequential), "deployment".

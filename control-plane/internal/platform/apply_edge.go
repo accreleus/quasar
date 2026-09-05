@@ -15,11 +15,12 @@ import (
 // branch tag. ADR 0001 still holds: what is sent is the resolved digest, and
 // the tag is only how it was found.
 
-// ApplyComponentResolver resolves a host's component when the release row has
+// ApplyComponentResolver resolves a target's component when the release row has
 // no manifest. Nil on a build with no registry egress: an edge apply is then
 // refused rather than guessed at.
 type ApplyComponentResolver interface {
 	NodeAgentComponent(ctx context.Context, release Release) (ComponentDigest, error)
+	ControlPlaneComponent(ctx context.Context, release Release) (ComponentDigest, error)
 }
 
 // EdgeApplyResolver reads the registry.
@@ -54,15 +55,26 @@ func CommitTag(commit string) string {
 	return "sha-" + commit[:7]
 }
 
-// NodeAgentComponent resolves the release's node-agent image to a digest, and
-// refuses unless the image's own commit label agrees with the release: a tag
-// that moved must not become an apply of something else (ADR 0001).
+// NodeAgentComponent resolves the release's node-agent image to a digest.
 func (r *EdgeApplyResolver) NodeAgentComponent(ctx context.Context, release Release) (ComponentDigest, error) {
+	return r.component(ctx, release, edgeComponents[1])
+}
+
+// ControlPlaneComponent resolves the release's control-plane image. Same rules;
+// it is never sent to a host, only to this host's own updater.
+func (r *EdgeApplyResolver) ControlPlaneComponent(ctx context.Context, release Release) (ComponentDigest, error) {
+	return r.component(ctx, release, edgeComponents[0])
+}
+
+// component refuses unless the image's own commit label agrees with the
+// release: a tag that moved must not become an apply of something else
+// (ADR 0001).
+func (r *EdgeApplyResolver) component(ctx context.Context, release Release, comp edgeComponent) (ComponentDigest, error) {
 	tag := CommitTag(release.SourceCommit)
 	if tag == "" {
 		return ComponentDigest{}, fmt.Errorf("release %s has no usable source commit", release.ID)
 	}
-	image := r.registry + "/" + r.repo + "/" + edgeComponents[1].Image
+	image := r.registry + "/" + r.repo + "/" + comp.Image
 	ref := image + ":" + tag
 
 	cfg, err := r.inspect.InspectConfig(ctx, ref)
@@ -77,5 +89,5 @@ func (r *EdgeApplyResolver) NodeAgentComponent(ctx context.Context, release Rele
 	if !digestRe.MatchString(cfg.ManifestDigest) {
 		return ComponentDigest{}, fmt.Errorf("%s resolved to %q, not a sha256 digest", ref, cfg.ManifestDigest)
 	}
-	return ComponentDigest{Name: ComponentNodeAgent, Image: image, Digest: cfg.ManifestDigest}, nil
+	return ComponentDigest{Name: comp.Name, Image: image, Digest: cfg.ManifestDigest}, nil
 }

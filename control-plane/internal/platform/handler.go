@@ -32,6 +32,13 @@ type Deps struct {
 	// Optional: a build with no apply store wired leaves it nil, and the view
 	// then reports nothing in flight rather than failing.
 	OpenAttempts func(ctx context.Context) ([]Attempt, error)
+	// ActiveRun is the fleet run that owns the fleet, or nil. Optional, as
+	// OpenAttempts is.
+	ActiveRun func(ctx context.Context) (*ApplyRun, error)
+	// UpdaterPresent reports whether an updater sits beside THIS control plane;
+	// false makes the control-plane target `updater_absent`. Nil reads as
+	// absent, which refuses rather than attempts.
+	UpdaterPresent func() bool
 }
 
 // errNoDeps is what a handler built with no dependencies answers with, rather
@@ -124,6 +131,13 @@ func (h *Handler) releaseView(ctx context.Context) (View, error) {
 			return View{}, err
 		}
 	}
+	var run *ApplyRun
+	if h.deps.ActiveRun != nil {
+		run, err = h.deps.ActiveRun(ctx)
+		if err != nil {
+			return View{}, err
+		}
+	}
 	return PlanRelease(PlanInputs{
 		Channel:      channel,
 		EdgeBranch:   edgeBranch,
@@ -133,5 +147,8 @@ func (h *Handler) releaseView(ctx context.Context) (View, error) {
 		CheckedAt:    status.CheckedAt,
 		LastError:    status.LastError,
 		OpenAttempts: open,
+		ActiveRun:    run,
+
+		UpdaterPresent: h.deps.UpdaterPresent != nil && h.deps.UpdaterPresent(),
 	}), nil
 }
