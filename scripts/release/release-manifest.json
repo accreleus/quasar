@@ -85,7 +85,8 @@
   },
   "legacy_non_release_dockerfiles_purpose": "Dockerfiles that exist in the tree but are deliberately NOT release inputs. release-preflight.sh stats every entry and FAILS on a missing one, so a file deleted from the tree must be removed from this list in the same commit -- the list cannot rot into naming phantoms again (Dockerfile.dev, Dockerfile.nv and Dockerfile.agent.prod were listed here long after deletion).",
   "legacy_non_release_dockerfiles": [
-    "deploy/Dockerfile.control"
+    "deploy/Dockerfile.control",
+    "deploy/Dockerfile.updater"
   ],
   "required_release_evidence": [
     "preflight JSON attached to the candidate",
