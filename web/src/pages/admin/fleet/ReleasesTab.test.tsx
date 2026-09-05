@@ -2,7 +2,7 @@
 // per-target eligibility text, notes sanitisation, the channel PATCH, and
 // "Check now" being the jobs run-now action rather than this page's read.
 
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as adminApi from "../../../api/admin";
@@ -196,5 +196,99 @@ describe("ReleasesTab", () => {
 
     expect(await screen.findByText("Agent ahead of the control plane")).toBeInTheDocument();
     expect(screen.getByText(/the agent is on release 0\.3\.0/)).toBeInTheDocument();
+  });
+});
+
+describe("ReleasesTab › manual update paths", () => {
+  const hostIdentity = (over: Record<string, unknown> = {}) => ({
+    host_id: "h1",
+    node_name: "gpu-host-01",
+    status: "online",
+    agent_version: "0.1.0",
+    source_commit: CP_COMMIT,
+    built_at: "2026-08-19T09:14:02Z",
+    install_mode: "registry",
+    updater_present: true,
+    identity_known: true,
+    ...over,
+  });
+
+  /** A view whose one host is ineligible for `reason`, with `identity` as the
+   *  facts the commands are keyed on. */
+  function ineligible(reason: string, identity: Record<string, unknown> = {}): PlatformReleaseView {
+    return view({
+      installed: {
+        control_plane: {
+          version: "0.1.0",
+          source_commit: NEW_COMMIT,
+          built_at: "2026-08-19T09:14:02Z",
+          schema_version: 75,
+        },
+        hosts: [hostIdentity(identity)],
+      },
+      targets: [
+        { kind: "control_plane", host_id: null, node_name: null, eligible: true, reason: null },
+        { kind: "host", host_id: "h1", node_name: "gpu-host-01", eligible: false, reason },
+      ],
+    } as Partial<PlatformReleaseView>);
+  }
+
+  it("a source-built host shows its commit, the release and the redeploy command, with no apply", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(
+      ineligible("install_mode_source", { install_mode: "source" }),
+    );
+    renderTab();
+
+    const block = await screen.findByTestId("manual-h1");
+    expect(block).toHaveTextContent(CP_COMMIT.slice(0, 12));
+    expect(block).toHaveTextContent("release 0.2.0");
+    expect(block).toHaveTextContent("deploy/redeploy.sh <va|nvidia> v0.2.0");
+    expect(screen.queryByRole("button", { name: /^apply/i })).not.toBeInTheDocument();
+  });
+
+  it("a host with no updater shows the one-time updater addition and the registry recipe", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(
+      ineligible("updater_absent", { updater_present: false }),
+    );
+    renderTab();
+
+    const block = await screen.findByTestId("manual-h1");
+    expect(block).toHaveTextContent("up -d --no-deps quasar-updater");
+    expect(block).toHaveTextContent("pull quasar-control-plane quasar-node-agent");
+    expect(block).toHaveTextContent("QUASAR_CONTROL_IMAGE=");
+  });
+
+  it("a host with no identity is told to upgrade the agent first", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(
+      ineligible("identity_unknown", {
+        source_commit: null,
+        install_mode: null,
+        updater_present: null,
+        identity_known: false,
+      }),
+    );
+    renderTab();
+
+    const block = await screen.findByTestId("manual-h1");
+    expect(block).toHaveTextContent(/predates identity reporting/i);
+    expect(block).toHaveTextContent("build unknown");
+  });
+
+  it("an offline host gets the state and no command to run at it", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(ineligible("host_offline", { status: "offline" }));
+    renderTab();
+
+    const block = await screen.findByTestId("manual-h1");
+    expect(block).toHaveTextContent(/online first/i);
+    expect(within(block).queryByRole("button", { name: /copy/i })).not.toBeInTheDocument();
+  });
+
+  it("an eligible target and a waiting one show no commands at all", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(view()); // host: release_above_control_plane
+    renderTab();
+
+    await screen.findByText("gpu-host-01");
+    expect(screen.queryByTestId("manual-h1")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("manual-control-plane")).not.toBeInTheDocument();
   });
 });

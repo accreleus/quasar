@@ -180,6 +180,48 @@ it is safe to run any time and leaves your real stack untouched.
 
 ---
 
+## Upgrading a registry install
+
+The section above rebuilds a host from source. A **registry install** — one
+running published images, pinned by digest in `deploy/.env` (`deploy/README.md`
+install path A) — upgrades by re-pinning those two digests and recreating the
+two containers they name. There is no build and no `git` step: the images
+already exist.
+
+Take the digests from the release's `platform-release-manifest.json` asset,
+which lists exactly two components, control-plane then node-agent. The admin
+Releases page shows the same commands filled in for the release it is offering.
+
+```bash
+# 1. Pin the release's digests — the two lines in deploy/.env.
+QUASAR_CONTROL_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@sha256:<control-plane digest>
+QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<node-agent digest>
+
+# 2. Pull the pinned images and recreate only those two services.
+docker compose -f deploy/docker-compose.yml pull quasar-control-plane quasar-node-agent
+docker compose -f deploy/docker-compose.yml up -d --force-recreate --no-deps quasar-control-plane quasar-node-agent
+```
+
+Notes that matter:
+
+- **Repeat every `-f` you deploy with.** An NVIDIA host that came up with
+  `-f deploy/docker-compose.yml -f deploy/docker-compose.nvidia.yml` must pass
+  both files here too; a compose invocation that drops an overlay recreates the
+  containers without it.
+- **Recreating the node agent kills every session on that host.** Drain it
+  first if that matters.
+- **Recreating the control plane runs migrations**, so the one-way rule below
+  applies from that moment: the digest you just replaced is no longer a safe
+  thing to pin back if the new one migrated the database.
+- Nothing else is touched: `--no-deps` leaves Postgres, the updater and the
+  session containers alone.
+
+An install with the updater beside it (see "The updater") does this for you
+from the admin UI once the apply half ships; the commands above are what it
+runs, and stay the manual path for a host without one.
+
+---
+
 ## The one-way migration rule
 
 Quasar's control-plane binary runs its database migrations automatically on

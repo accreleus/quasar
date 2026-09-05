@@ -180,6 +180,11 @@ func unknownIdentity(h *HostIdentity) {
 	h.SourceCommit, h.BuiltAt, h.InstallMode, h.UpdaterPresent = nil, nil, nil, nil
 }
 
+// NULL IS NOT false (openapi.yaml PlatformHostIdentity.updater_present): nobody
+// has said, which is an old agent, not a real gap.
+func updaterUnreported(h *HostIdentity) { h.UpdaterPresent = nil }
+func noInstallMode(h *HostIdentity)     { h.InstallMode = nil }
+
 func TestTargetEligibilityReasons(t *testing.T) {
 	newest := rel("newest", "0.3.0", commitC, 74, at(3))
 
@@ -246,6 +251,22 @@ func TestTargetEligibilityReasons(t *testing.T) {
 			host:       host("h1", "gpu-01", commitA, sourceInstall, offline),
 			wantCPRsn:  ReasonUpToDate,
 			wantHostRs: ReasonInstallModeSource,
+		},
+		{
+			name:       "updater_present NULL is nobody-has-said, not a gap: identity_unknown",
+			releases:   []Release{newest},
+			cp:         cp(commitC, 74),
+			host:       host("h1", "gpu-01", commitA, updaterUnreported),
+			wantCPRsn:  ReasonUpToDate,
+			wantHostRs: ReasonIdentityUnknown,
+		},
+		{
+			name:       "install_mode NULL with every other field reported is still identity_unknown",
+			releases:   []Release{newest},
+			cp:         cp(commitC, 74),
+			host:       host("h1", "gpu-01", commitA, noInstallMode),
+			wantCPRsn:  ReasonUpToDate,
+			wantHostRs: ReasonIdentityUnknown,
 		},
 		{
 			name:       "a registry host whose agent found no updater",
@@ -450,5 +471,136 @@ func TestCheckedAtNilBeforeTheFirstSuccess(t *testing.T) {
 	v := PlanRelease(PlanInputs{Channel: ChannelStable, ControlPlane: cp(commitA, 74)})
 	if v.CheckedAt != nil {
 		t.Fatalf("checked_at = %v, want nil before detection has ever succeeded", *v.CheckedAt)
+	}
+}
+
+// TestEveryContractIdentifierIsEvaluatedOrReserved walks the two CLOSED
+// vocabularies of control-api.md §"Platform releases" — EligibilityReason and
+// PlatformReleaseFaultKind — and asserts that this build either EVALUATES each
+// identifier (a scenario here produces it) or RESERVES it with the ticket that
+// will. A value the contract lists and this test does not name fails: silently
+// unimplemented is the one outcome a closed vocabulary must not allow.
+func TestEveryContractIdentifierIsEvaluatedOrReserved(t *testing.T) {
+	newest := rel("newest", "0.3.0", commitC, 74, at(3))
+	above := rel("above", "0.4.0", commitC, 80, at(4))
+
+	// Each evaluated reason with a plan that produces it, and the target it
+	// lands on: 0 = the control plane, 1 = the single host.
+	evaluated := []struct {
+		reason string
+		in     PlanInputs
+		target int
+	}{
+		{ReasonNoRelease, PlanInputs{Channel: ChannelStable, ControlPlane: cp(commitA, 74),
+			Hosts: []HostIdentity{host("h1", "gpu-01", commitA)}}, 0},
+		{ReasonIdentityUnknown, PlanInputs{Channel: ChannelStable, ControlPlane: cp("", 74),
+			Hosts: []HostIdentity{host("h1", "gpu-01", commitA, unknownIdentity)}, Releases: []Release{newest}}, 1},
+		{ReasonUpToDate, PlanInputs{Channel: ChannelStable, ControlPlane: cp(commitC, 74),
+			Hosts: []HostIdentity{host("h1", "gpu-01", commitC)}, Releases: []Release{newest}}, 1},
+		{ReasonInstallModeSource, PlanInputs{Channel: ChannelStable, ControlPlane: cp(commitC, 74),
+			Hosts: []HostIdentity{host("h1", "gpu-01", commitA, sourceInstall)}, Releases: []Release{newest}}, 1},
+		{ReasonUpdaterAbsent, PlanInputs{Channel: ChannelStable, ControlPlane: cp(commitC, 74),
+			Hosts: []HostIdentity{host("h1", "gpu-01", commitA, noUpdater)}, Releases: []Release{newest}}, 1},
+		{ReasonHostOffline, PlanInputs{Channel: ChannelStable, ControlPlane: cp(commitC, 74),
+			Hosts: []HostIdentity{host("h1", "gpu-01", commitA, offline)}, Releases: []Release{newest}}, 1},
+		{ReasonReleaseAboveControlPlane, PlanInputs{Channel: ChannelStable, ControlPlane: cp(commitA, 74),
+			Hosts: []HostIdentity{host("h1", "gpu-01", commitA)}, Releases: []Release{above}}, 1},
+		{ReasonControlPlaneNotFirst, PlanInputs{Channel: ChannelStable, ControlPlane: cp(commitA, 74),
+			Hosts: []HostIdentity{host("h1", "gpu-01", commitB)}, Releases: []Release{newest}}, 1},
+	}
+
+	// Amendment 2 appends these two at the END of the precedence. They need
+	// apply state this build has no table for; they must not appear until then.
+	reserved := map[string]string{
+		ReasonAttemptInFlight: "#116",
+		ReasonRunActive:       "#117",
+	}
+
+	seen := map[string]bool{}
+	for _, e := range evaluated {
+		t.Run(e.reason, func(t *testing.T) {
+			got := PlanRelease(e.in).Targets[e.target]
+			if got.Eligible || got.Reason == nil || *got.Reason != e.reason {
+				t.Fatalf("want reason %q on target %d, got eligible=%v reason=%v",
+					e.reason, e.target, got.Eligible, deref(got.Reason))
+			}
+		})
+		seen[e.reason] = true
+	}
+
+	// The contract's enumeration, verbatim and in its fixed precedence order.
+	for _, reason := range []string{
+		"no_release", "identity_unknown", "up_to_date", "install_mode_source",
+		"updater_absent", "host_offline", "release_above_control_plane",
+		"control_plane_not_first", "attempt_in_flight", "run_active",
+	} {
+		if seen[reason] {
+			continue
+		}
+		if _, ok := reserved[reason]; !ok {
+			t.Fatalf("EligibilityReason %q is neither evaluated nor reserved with a ticket", reason)
+		}
+	}
+
+	// A reserved reason must not leak out of any scenario above.
+	for _, e := range evaluated {
+		for _, target := range PlanRelease(e.in).Targets {
+			if target.Reason == nil {
+				continue
+			}
+			if ticket, isReserved := reserved[*target.Reason]; isReserved {
+				t.Fatalf("reason %q is reserved for %s but this build emitted it", *target.Reason, ticket)
+			}
+		}
+	}
+
+	t.Run("fault kinds", func(t *testing.T) {
+		// agent_ahead_of_control_plane and identity_unknown are raised here;
+		// manifest_invalid belongs to detection (detect.go), which is where a
+		// release with an unusable manifest is met — the plan never sees one,
+		// so it must never raise it either.
+		v := PlanRelease(PlanInputs{
+			Channel:      ChannelStable,
+			ControlPlane: cp(commitA, 74),
+			Hosts: []HostIdentity{
+				host("h1", "gpu-01", commitC),                  // ahead: on `above`
+				host("h2", "gpu-02", commitA, unknownIdentity), // identity unknown
+			},
+			Releases: []Release{rel("installed", "0.2.0", commitA, 74, at(1)), above},
+		})
+		kinds := map[string]bool{}
+		for _, f := range v.Faults {
+			kinds[f.Kind] = true
+		}
+		if !kinds[FaultAgentAhead] || !kinds[FaultIdentityUnknown] {
+			t.Fatalf("faults = %+v, want both agent_ahead_of_control_plane and identity_unknown", v.Faults)
+		}
+		if kinds[FaultManifestInvalid] {
+			t.Fatalf("manifest_invalid is detection's fault to raise, not the plan's: %+v", v.Faults)
+		}
+	})
+}
+
+// A host ahead of the control plane is a fault AND still a target row: the row
+// explains the absent button, the fault is what a "needs attention" count reads.
+func TestAgentAheadIsAFaultAndStillATargetRow(t *testing.T) {
+	above := rel("above", "0.4.0", commitC, 80, at(4))
+	v := PlanRelease(PlanInputs{
+		Channel:      ChannelStable,
+		ControlPlane: cp(commitA, 74),
+		Hosts:        []HostIdentity{host("h1", "gpu-01", commitC)},
+		Releases:     []Release{rel("installed", "0.2.0", commitA, 74, at(1)), above},
+	})
+	if len(v.Faults) != 1 || v.Faults[0].Kind != FaultAgentAhead {
+		t.Fatalf("faults = %+v, want one agent_ahead_of_control_plane", v.Faults)
+	}
+	if v.Faults[0].Detail == "" {
+		t.Fatal("a fault must carry operator prose")
+	}
+	// The host is ON the newest listed release, so its row reads up_to_date
+	// while the fault says it should never have got there: the two surfaces say
+	// different things about the same host on purpose — a fault gates nothing.
+	if v.Targets[1].Reason == nil || *v.Targets[1].Reason != ReasonUpToDate {
+		t.Fatalf("host target = %+v, want up_to_date", v.Targets[1])
 	}
 }
