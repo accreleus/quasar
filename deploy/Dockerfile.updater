@@ -1,0 +1,49 @@
+# Dockerfile.updater — the per-host updater (CONTEXT.md "Updater").
+#
+# Build from the repo root:
+#   bash deploy/build-images.sh updater
+#
+# NOT ON THE quasar-base FAMILY, and the one image in this repo that is not.
+# Its whole job is to run `docker compose`, so its base is the upstream docker
+# CLI image, which is where the CLI and the compose plugin come from — and
+# pinning compose in the IMAGE is what makes the invocation independent of
+# whatever compose version the host happens to have (prototype finding 4).
+#
+# IT RUNS AS ROOT, and cannot do otherwise. It talks to the mounted docker (or
+# podman) socket, whose ownership is the host's, and it writes the stack's
+# `.env` at the host path it is mounted at. A non-root uid would have to be
+# matched to both on every host, which is a configuration burden that buys
+# nothing: anything that can reach this container's socket can already reach the
+# daemon socket it proxies.
+
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /src
+COPY control-plane/go.mod control-plane/go.sum ./
+RUN go mod download
+COPY control-plane/ .
+
+ARG SOURCE_COMMIT=unknown
+ARG BUILT_AT=unknown
+
+# CGO_ENABLED=0 → a static binary, so the alpine runtime needs no libc match.
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath -ldflags="-s -w \
+      -X main.version=${SOURCE_COMMIT} \
+      -X main.sourceCommit=${SOURCE_COMMIT}" \
+    -o /quasar-updater ./cmd/quasar-updater
+
+# Pinned by tag rather than digest: this is the ONE image in the repo that is
+# not applied by digest, because the updater cannot update itself
+# (docs/upgrading.md).
+FROM docker:29-cli AS runtime
+
+ARG SOURCE_COMMIT=unknown
+ARG BUILT_AT=unknown
+LABEL org.quasar.image.role="updater" \
+      org.quasar.source.commit="${SOURCE_COMMIT}" \
+      org.quasar.built.at="${BUILT_AT}"
+
+COPY --from=builder /quasar-updater /usr/local/bin/quasar-updater
+
+ENTRYPOINT ["/usr/local/bin/quasar-updater"]

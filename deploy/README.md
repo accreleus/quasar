@@ -1003,6 +1003,24 @@ Runs the node-agent binary with all GStreamer plugins, using host networking
 over `localhost:8080`, and launches game containers and audio sidecars as
 sibling containers through the mounted Docker socket.
 
+### `quasar-updater`
+
+The per-host actor that applies a platform release: it pulls the pinned digests
+and recreates the containers they replace, because a container cannot recreate
+itself. It acts only when told to, over a unix socket in a volume shared with
+the other two services, and only on the stack it sits beside — it discovers that
+stack from its own compose labels, so it picks up whatever overlays you used
+without being told about them.
+
+Two things it will not do: apply an image from outside
+`QUASAR_UPDATER_ALLOWED_NAMESPACES`, and update itself. Its own image is named
+by tag rather than digest for that reason; see
+[`docs/upgrading.md`](../docs/upgrading.md) for the one-line update and for
+adding the service to an existing install.
+
+It needs `QUASAR_STACK_DIR` set to this directory's absolute host path.
+`deploy/redeploy.sh` seeds it.
+
 ## Upgrading, backups, and rollback
 
 Before pulling a new version onto a running stack, back up Postgres and read

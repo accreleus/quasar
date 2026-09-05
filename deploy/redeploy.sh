@@ -539,6 +539,38 @@ else
   echo "generated a new ENROLLMENT_TOKEN into $ENV_FILE (mode 600)"
 fi
 
+# --- QUASAR_STACK_DIR --------------------------------------------------------
+# The absolute HOST path of the stack directory, which the updater
+# (deploy/docker-compose.yml `quasar-updater`) mounts at that same path. It has
+# to be the host's path, not a container path: the updater rebuilds its compose
+# invocation from its own container's compose labels, and those record host
+# paths. With this unset the updater refuses to serve and logs why.
+#
+# Seeded whenever it is absent (not fresh-install-only): nothing is stored under
+# it, so writing it can strand nothing. An existing value is never overwritten,
+# only flagged when it no longer matches -- which is what a moved checkout looks
+# like.
+QUASAR_STACK_DIR_NOW="$(cd deploy && pwd)"
+if env_file_has_value QUASAR_STACK_DIR; then
+  _cur="$(grep -E '^QUASAR_STACK_DIR=' "$ENV_FILE" | tail -1 | cut -d= -f2-)"
+  if [ "$_cur" != "$QUASAR_STACK_DIR_NOW" ]; then
+    echo "  !! QUASAR_STACK_DIR in $ENV_FILE is $_cur but this deploy runs from"
+    echo "  !! $QUASAR_STACK_DIR_NOW. The updater will not find the compose files."
+    echo "  !! Update it, or remove the line and re-run to have it re-seeded."
+  fi
+else
+  umask 077
+  touch "$ENV_FILE"
+  {
+    echo ""
+    echo "# QUASAR_STACK_DIR -- this stack directory's absolute HOST path, mounted"
+    echo "# into the updater at the same path. Seeded by deploy/redeploy.sh."
+    echo "QUASAR_STACK_DIR=$QUASAR_STACK_DIR_NOW"
+  } >> "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  echo "seeded QUASAR_STACK_DIR=$QUASAR_STACK_DIR_NOW into $ENV_FILE"
+fi
+
 # --- QUASAR_HOME_ROOT (fresh installs only) ----------------------------------
 # NOT a `:?`-required var — compose runs fine without it. It is seeded because
 # its absence silently costs a feature: with no home root the storage provider

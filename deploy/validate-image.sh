@@ -244,6 +244,13 @@ while IFS= read -r p; do [ -n "$p" ] && emit path_forbidden "path-absent.$p"    
 # `void` after CDI injection, and any `-e` this script passes shadows the baked value. The
 # contract asserts what the IMAGE declares.
 while IFS= read -r e; do [ -n "$e" ] && emit gst_required   "gst.$e"            "$e"; done < <(collect '.gst_elements.required')
+# commands.must_succeed is an OBJECT (command -> why it is asserted), so it is
+# collected by key rather than through `collect`, which flattens arrays.
+while IFS= read -r c; do
+  [ -n "$c" ] && emit cmd_succeeds "command.$c" "$c"
+done < <(jq -r --argjson chain "$CHAIN_JSON" \
+    '[ .roles as $roles | $chain[] | $roles[.] | .commands.must_succeed // {} | keys[] ] | unique | .[]' \
+    "$CONTRACT")
 
 # libcuda.so.1 must NOT be in the image (it is injected at run time by the NVIDIA
 # container toolkit). Only meaningful with the driver detached.
@@ -350,6 +357,12 @@ while IFS="$(printf '\t')" read -r check id arg; do
         sz=$(du -sh "$arg" 2>/dev/null | cut -f1); [ -n "$sz" ] || sz="?"
         emit FAIL "$id" "present (${sz}) — build artifact in a shipped image"
       else emit PASS "$id" "absent"; fi ;;
+    cmd_succeeds)
+      # `sh -c` so an asserted command may be a multi-word invocation
+      # (`docker compose version`), which is the only way to check a CLI PLUGIN:
+      # the plugin binary is not on PATH and `command -v` cannot see it.
+      if out=$(sh -c "$arg" 2>&1); then emit PASS "$id" "$(printf '%s' "$out" | head -1)"
+      else emit FAIL "$id" "exited non-zero: $(printf '%s' "$out" | head -1)"; fi ;;
     gst_required)
       if has_elem "$arg"; then emit PASS "$id" "registered"
       else emit FAIL "$id" "element not registered"; fi ;;

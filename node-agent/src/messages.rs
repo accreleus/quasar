@@ -304,6 +304,24 @@ pub enum AgentMsg {
         /// cause, never a raw docker error blob (`images::errors`).
         error: String,
     },
+    /// Progress and outcome of one platform-release apply on this host
+    /// (agent-api.md `release_state`). Fire-and-forget like `image_state`.
+    ///
+    /// Every field is relayed from the updater's result file: the agent runs no
+    /// compose command, keeps no apply state of its own, and authors nothing
+    /// here but the framing. `reason` and `finished_at` are required-and-nullable
+    /// on the wire, so neither may be skipped when None.
+    ReleaseState {
+        request_id: String,
+        state: String,
+        reason: Option<String>,
+        components: Vec<ReleaseComponent>,
+        previous: Vec<ReleasePrevious>,
+        output: String,
+        started_at: String,
+        updated_at: String,
+        finished_at: Option<String>,
+    },
 }
 
 impl AgentMsg {
@@ -953,9 +971,50 @@ pub enum ControlMsg {
         local_tag: String,
         version: String,
     },
+    /// Move this host's agent image to a release's pinned digest
+    /// (agent-api.md `release_apply`). Acked on ACCEPTANCE, then handed to this
+    /// host's updater; progress arrives later as `release_state`.
+    ///
+    /// `request_id` is minted by the control plane, never by the agent: the
+    /// agent that receives this is normally destroyed by carrying it out, so an
+    /// id it invented would die with it.
+    ReleaseApply {
+        id: String,
+        request_id: String,
+        release: ReleaseInfo,
+        components: Vec<ReleaseComponent>,
+        #[serde(default)]
+        force: bool,
+    },
     /// Future additions land here until handled.
     #[serde(other)]
     Unknown,
+}
+
+/// Provenance only. ADR 0001: what is applied is the digest and only the
+/// digest, so nothing here is ever resolved into an image reference.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseInfo {
+    pub id: String,
+    pub version: Option<String>,
+    pub source_commit: String,
+}
+
+/// One component of a platform release. `image` is a repository reference with
+/// no tag and no digest; the pair composes as `image@digest`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseComponent {
+    pub name: String,
+    pub image: String,
+    pub digest: String,
+}
+
+/// The digest a component was on before an apply. `digest` is null — never
+/// omitted — when the updater could not determine it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ReleasePrevious {
+    pub name: String,
+    pub digest: Option<String>,
 }
 
 #[cfg(test)]

@@ -24,6 +24,7 @@ use crate::images::ImageManager;
 use crate::messages::{
     AgentMsg, AppSpec, Auth, CodecThroughput, ControlMsg, StreamSpec, VideoTopology,
 };
+use crate::release::ReleaseManager;
 use crate::session::capture::{self, CaptureRequest, CaptureSlot};
 use crate::session::console_hotplug::ConsoleHotplugWatcher;
 use crate::session::container::{ContainerRuntime, ContainerSpec};
@@ -225,6 +226,10 @@ pub async fn run(cfg: Config) {
         }
     };
 
+    // One ReleaseManager per process, for the same reason the ImageManager is:
+    // a poller outlives a disconnect, and normally outlives the process itself.
+    let release_mgr = ReleaseManager::from_env();
+
     // Materialise a missing NVIDIA graphics userspace into the driver volume. The
     // trigger is the readiness check set itself, so what provisions and what the
     // admin card shows can never disagree.
@@ -238,7 +243,15 @@ pub async fn run(cfg: Config) {
 
     let mut backoff = Duration::from_secs(1);
     loop {
-        match connect_and_run(&cfg, &health, &nvidia_lib32_probed, &image_mgr).await {
+        match connect_and_run(
+            &cfg,
+            &health,
+            &nvidia_lib32_probed,
+            &image_mgr,
+            &release_mgr,
+        )
+        .await
+        {
             Ok(()) => {
                 // clean shutdown (shouldn't happen in normal operation)
                 info!("agent exiting cleanly");
@@ -832,6 +845,7 @@ async fn connect_and_run(
     health: &Arc<HealthState>,
     nvidia_lib32_probed: &str,
     image_mgr: &Arc<ImageManager>,
+    release_mgr: &Arc<ReleaseManager>,
 ) -> anyhow::Result<()> {
     let url = cfg.ws_url();
     info!(policy = ?cfg.transport, "connecting to {url}");
@@ -875,6 +889,13 @@ async fn connect_and_run(
     // `Option`-wrapped for `recv_or_disabled`.
     let mut image_rx = Some(image_rx);
     let _image_upstream_guard = image_mgr.attach_upstream(image_tx);
+
+    // Same shape for `release_state`. Attaching re-emits the current state of every
+    // updater result file still present, which is how an apply that destroyed the
+    // previous agent still gets reported (agent-api.md `release_state`).
+    let (release_tx, release_rx) = mpsc::channel::<AgentMsg>(16);
+    let mut release_rx = Some(release_rx);
+    let _release_upstream_guard = release_mgr.attach_upstream(release_tx);
 
     // --- Step 1: send register ---
     let auth = choose_auth(cfg)?;
@@ -1027,6 +1048,7 @@ async fn connect_and_run(
         vram_targets,
         nvidia_lib32_probed.to_string(),
         image_mgr.clone(),
+        release_mgr.clone(),
     );
     // Cached with the encoder it was probed for, so capacity re-sends reuse it unless
     // a config_update flips the effective encoder and marks it stale.
@@ -1529,6 +1551,19 @@ async fn connect_and_run(
                 };
                 send(&mut tx, &msg).await?;
             }
+            // `release_state` emissions from the release poller thread.
+            rel = recv_or_disabled(&mut release_rx) => {
+                let Some(msg) = rel else {
+                    error!(
+                        token = "release-channel-closed",
+                        "release-state sender dropped unexpectedly; disabling release-state \
+                         forwarding for the rest of this connection"
+                    );
+                    release_rx = None;
+                    continue;
+                };
+                send(&mut tx, &msg).await?;
+            }
         }
     }
 }
@@ -1633,6 +1668,9 @@ struct SessionManager {
     /// `image_ensure`/`image_remove` dispatch target. Process-wide, so its
     /// docker-reconciled state and idempotency bookkeeping outlive sessions.
     image_mgr: Arc<ImageManager>,
+    /// `release_apply` dispatch target. Process-wide for the same reason as
+    /// `image_mgr`: its poller outlives this connection.
+    release_mgr: Arc<ReleaseManager>,
     /// The resolved golden-home template store, or `None` when
     /// `QUASAR_HOME_TEMPLATES` is off (the default) or the template root is
     /// misconfigured. Independent of the warm-up store — a host can seed from
@@ -1704,6 +1742,7 @@ impl SessionManager {
         vram_targets: Vec<VramTarget>,
         nvidia_lib32_probed: String,
         image_mgr: Arc<ImageManager>,
+        release_mgr: Arc<ReleaseManager>,
     ) -> Self {
         let mut runtime_settings = crate::session::settings::RuntimeSettings::baseline();
         seed_nvidia_lib32(&mut runtime_settings, &nvidia_lib32_probed);
@@ -1726,6 +1765,7 @@ impl SessionManager {
             warmup_activity: None,
             warmup_control: None,
             image_mgr,
+            release_mgr,
             template_store: None,
         }
     }
@@ -2504,6 +2544,18 @@ impl SessionManager {
                 local_tag,
                 version,
             )),
+            // The updater does the work; the agent validates, acks acceptance and
+            // relays. It never recreates itself and runs no compose command.
+            ControlMsg::ReleaseApply {
+                id,
+                request_id,
+                release,
+                components,
+                force,
+            } => Some(
+                self.release_mgr
+                    .handle_apply(id, request_id, release, components, force),
+            ),
             ControlMsg::Registered { .. } => {
                 warn!(
                     token = "duplicate-registered",
@@ -3525,6 +3577,7 @@ mod tests {
             Vec::new(),
             String::new(),
             test_image_mgr(),
+            test_release_mgr(),
         )
     }
 
@@ -3535,6 +3588,12 @@ mod tests {
 
     /// A throwaway `ImageManager`: an empty state_path means `ImageManager::new`
     /// touches neither disk nor a docker daemon.
+    /// A ReleaseManager pointed at paths that do not exist: `present()` is false,
+    /// so nothing in these tests can reach a socket.
+    fn test_release_mgr() -> Arc<ReleaseManager> {
+        ReleaseManager::new("/nonexistent/updater.sock", "/nonexistent/results")
+    }
+
     fn test_image_mgr() -> Arc<ImageManager> {
         ImageManager::new(ContainerRuntime::from_env(), String::new())
     }
@@ -3683,6 +3742,7 @@ mod tests {
             Vec::new(),
             String::new(),
             test_image_mgr(),
+            test_release_mgr(),
         );
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
         let msg = ControlMsg::ConfigUpdate {
@@ -3712,6 +3772,7 @@ mod tests {
             Vec::new(),
             String::new(),
             test_image_mgr(),
+            test_release_mgr(),
         );
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
         let env_encoder = crate::session::settings::RuntimeSettings::baseline().encoder;
@@ -3767,6 +3828,7 @@ mod tests {
             Vec::new(),
             String::new(),
             test_image_mgr(),
+            test_release_mgr(),
         );
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
         mgr.runtime_settings.encoder = EncoderChoice::Vulkan;
@@ -3842,6 +3904,7 @@ mod tests {
             Vec::new(),
             String::new(),
             test_image_mgr(),
+            test_release_mgr(),
         );
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
         let env_encoder = crate::session::settings::RuntimeSettings::baseline().encoder;
@@ -4306,6 +4369,7 @@ mod tests {
             Vec::new(),
             String::new(),
             test_image_mgr(),
+            test_release_mgr(),
         );
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
 
@@ -4354,6 +4418,7 @@ mod tests {
             Vec::new(),
             String::new(),
             test_image_mgr(),
+            test_release_mgr(),
         );
         mgr.runner = runner;
         (mgr, live_refs)

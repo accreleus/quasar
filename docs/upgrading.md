@@ -248,6 +248,87 @@ the older version.
 
 ---
 
+## The updater
+
+`quasar-updater` is the per-host actor that applies a platform release: it pulls
+the pinned digests and recreates the containers they replace, because a
+container cannot recreate itself. Nothing on this page requires it — a manual
+upgrade is still the two `.env` vars plus `docker compose up -d` — but the
+admin-facing "apply this release to this host" path goes through it.
+
+### Adding it to an existing install
+
+One time, on each host:
+
+```bash
+# 1. Get the compose file that declares the service.
+git -C /path/to/quasar pull            # source install
+#   ...or re-download deploy/docker-compose.yml for a registry install.
+
+# 2. Tell it where the stack lives. This must be the stack directory's
+#    absolute HOST path: the updater rebuilds its compose invocation from its
+#    own container labels, and those record host paths.
+echo "QUASAR_STACK_DIR=$(cd deploy && pwd)" >> deploy/.env
+#    A registry install also names the image (a tag, see below):
+echo "QUASAR_UPDATER_IMAGE=ghcr.io/accreleus/quasar/quasar-updater:latest" >> deploy/.env
+
+# 3. Bring it up. --no-deps so nothing else is touched.
+docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-updater
+
+# 4. Verify it discovered the stack it is sitting beside.
+docker compose -f deploy/docker-compose.yml exec quasar-node-agent \
+  curl -s --unix-socket /run/quasar-updater/updater.sock http://u/v1/self
+```
+
+That last command should print the compose project, the working directory, the
+`-f` files (**including every overlay you use**) and the namespace allowlist. If
+it instead reports that the stack directory is not visible in the container,
+`QUASAR_STACK_DIR` is wrong or unset — the updater fails closed rather than
+guessing at a compose invocation and recreating the wrong project's containers.
+
+`deploy/redeploy.sh` seeds `QUASAR_STACK_DIR` for you, so a source install that
+deploys through it only needs step 1 and step 3.
+
+### Updating the updater itself
+
+**The updater is not part of a platform release.** It is what applies one, so it
+is not one of the images an apply moves by digest, and it is not in the release
+manifest. Its image is therefore named by a tag, and it updates by hand:
+
+```bash
+docker compose -f deploy/docker-compose.yml pull quasar-updater
+docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-updater
+```
+
+Safe at any time: it holds no state beyond the result files in its volume, and
+an apply in flight is a detached `docker compose` invocation that finishes
+regardless.
+
+### What an apply does, and what it costs
+
+Recreating the **node agent kills every session on that host.** The
+`quasar-sess-*` / `quasar-pulse-*` sibling containers survive the recreate and
+are then swept by the new agent's startup orphan sweep, so nothing is orphaned
+and the apply is safe to retry — but the sessions are gone. Draining the host
+first is the control plane's job.
+
+Recreating the **control plane** runs the one-way migrations above. If the new
+container never starts, the updater restores `.env` from `.env.prev` and brings
+the previous digest back itself — never having started, it cannot have migrated
+anything. If it starts and then fails, the updater leaves it failed and records
+the previous digests in the result, because a started container may already have
+migrated and the rule at the top of this section then applies.
+
+Every result carries the previous digests, so the manual restore is copy-paste:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec quasar-node-agent \
+  curl -s --unix-socket /run/quasar-updater/updater.sock \
+  http://u/v1/results/<request-id>
+```
+
+---
+
 ## Cutting a release
 
 This is for a maintainer publishing a new Quasar version, not for a

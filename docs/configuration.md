@@ -902,7 +902,33 @@ code directly. Set in `deploy/.env`.
 | `QUASAR_CORE_DIR` | — (**required** by `docker-compose.cores.yml`) | Host directory for core dumps. Must be a real filesystem: **the kernel cannot write a core to FUSE**, and a share path silently produces zero cores. |
 | `QUASAR_CONTROL_IMAGE` / `QUASAR_AGENT_IMAGE` | the `:latest` local tags | Digest-pinned release artifacts. Setting both is what makes `deploy/docker-compose.yml` a pinned release install; unset, the stack runs the locally-built `:latest` images. `release-preflight.sh` rejects anything that is not `name@sha256:<64 hex>`. |
 | `QUASAR_POSTGRES_VOLUME` / `QUASAR_AGENT_VOLUME` / `QUASAR_CONTROL_VOLUME` | unset | **Upgrades only, AND only take effect with `-f deploy/overlays/docker-compose.adopt-volumes.yml` in the compose chain** (#448: Compose v5 rejects an empty `name:` default on the base file at `up`, so the override moved to this opt-in overlay). `deploy/redeploy.sh` adds the overlay automatically when all three are set (and refuses a partial set); manual compose invocations must pass it explicitly. Unset, or the overlay omitted = Compose's normal `<project>_<key>` naming. Set (with the overlay) to adopt volumes that already exist under other names, so a stack that used to run a forked compose file keeps its data instead of starting against an empty database. `scripts/dev/migrate-compose-volumes.sh` prints the exact values and the invocation. |
+| `QUASAR_UPDATER_IMAGE` | `quasar-updater:latest` | The updater's image. A **tag, not a digest**, on purpose: the updater is what applies a release, so it is not one of the images a release moves, and it is not in the release manifest. Registry installs set `ghcr.io/accreleus/quasar/quasar-updater:latest`; updating it is a separate manual step (`docs/upgrading.md`). |
+| `QUASAR_STACK_DIR` | `/var/lib/quasar/stack-dir-unset` (a sentinel) | The stack directory's absolute **host** path, bind-mounted into the updater at that same path. Required for the updater to function: it rebuilds its compose invocation from its own container's compose labels, which record host paths, so the same absolute path must resolve inside the container. `deploy/redeploy.sh` seeds it and warns when a moved checkout makes it stale. Left at the sentinel, the updater refuses to serve and logs which label it could not resolve. |
+| `QUASAR_DOCKER_SOCKET` | `/var/run/docker.sock` | Host path of the container-runtime socket mounted into the updater. Rootless Podman: `/run/user/<uid>/podman/podman.sock`. |
 | `QUASAR_APP_IMAGE` | `quasar-agent-dev:latest` | Override for `scripts/dev/seed-benchmark-apps.sh` so seeded apps use the host's runtime image. |
+
+---
+
+## Updater (`quasar-updater`)
+
+Read by the updater process only (`control-plane/cmd/quasar-updater`). Set in
+`deploy/.env`; the compose service passes them through. The socket path and the
+result-file layout are **not** a frozen interface (`protocol/schema.md` §"Not
+frozen: the updater's local socket").
+
+| Variable | Default | Notes |
+|---|---|---|
+| `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | Comma-separated registry namespaces this host will pull platform images from. Matched on `host/path/` segment boundaries, so `ghcr.io/accreleus/quasar` does not admit `ghcr.io/accreleus/quasar-evil/x`. Anything outside is refused `namespace_rejected` before a byte is pulled. Blank falls back to the default; to lock a host down, name a namespace nothing matches. |
+| `QUASAR_UPDATER_WAIT_TIMEOUT_S` | `300` | `docker compose up --wait --wait-timeout`. A request may name its own value. |
+| `QUASAR_UPDATER_PULL_TIMEOUT_S` | `3600` | Wall-clock bound on the `pull` step. |
+| `QUASAR_UPDATER_RECREATE_TIMEOUT_S` | `900` | Wall-clock bound on the `up` step, independent of compose's health wait. |
+| `QUASAR_UPDATER_SOCKET` | `/run/quasar-updater/updater.sock` | Where the socket is created, mode 0666, in the volume shared with the control plane and the agent. |
+| `QUASAR_UPDATER_RESULTS_DIR` | `/run/quasar-updater/results` | One result file per request id, written tmp+rename. Directory is root-owned 0755: the other containers read, only the updater writes. |
+| `QUASAR_UPDATER_DOCKER_BIN` | `docker` | The CLI the updater drives. |
+
+The node agent reads the first two of those paths too, under the same names, to
+find the socket it POSTs to and the result files it relays
+(`agent-api.md` `release_state`).
 
 ---
 
