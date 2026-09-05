@@ -25,6 +25,9 @@ type configRegistry struct {
 
 	requireToken bool
 	blobStatus   int
+	// blobRedirect, when set, answers the blob GET with a 307 to it — what
+	// GHCR does.
+	blobRedirect string
 	seen         []string
 }
 
@@ -69,6 +72,11 @@ func newConfigRegistry(t *testing.T, labels string) *configRegistry {
 			w.Header().Set(dockerContentDigest, digestOf(body))
 			fmt.Fprint(w, body)
 		case strings.Contains(r.URL.Path, "/blobs/"):
+			if f.blobRedirect != "" {
+				w.Header().Set("Location", f.blobRedirect)
+				w.WriteHeader(http.StatusTemporaryRedirect)
+				return
+			}
 			if f.blobStatus != 0 {
 				w.WriteHeader(f.blobStatus)
 				return

@@ -514,18 +514,24 @@
   }
 }
 
-/* ── Session detail: trace viewer (ST-07) ───────────────────── */
+/* ── Session detail: trace card (ST-07 / #124) ───────────────
+   Structure follows the operator's standalone Session Trace reference: a card
+   with a panel-head, a one-line verdict strip over an evidence disclosure, and
+   a body of `96px | 1fr` lane rows. Every value here is a v3 token — the chart
+   previously carried a hardcoded GitHub-Primer palette that matched nothing
+   else in the console and did not follow [data-theme="light"]. */
 
-.trace-viewer {
+.trace-card {
   margin-top: var(--s6);
   position: relative;
-}
-
-.trace-clock-row {
-  display: flex;
-  align-items: center;
-  gap: var(--s3);
-  margin-bottom: var(--s4);
+  /* This card is a grid item on the session-detail page. Without it, the item's
+     automatic minimum size is its min-content width and the card escapes its
+     column — the lane SVG then measures WIDER, which is fed straight back into
+     the next render as the new viewBox width. min-width:0 breaks that loop at
+     the point where it starts. The SVGs carry no width/height attributes for
+     the same reason: they size from CSS and contribute no intrinsic width. */
+  min-width: 0;
+  max-width: 100%;
 }
 
 /* The badge rides the Chip primitive; this only makes the reading monospace,
@@ -538,129 +544,98 @@
   font-size: var(--t-xs);
 }
 
-/* Also used inline in the verdict block, where "clock: unmeasured" is a caveat
-   on the verdict rather than a chip of its own. */
+/* Also used inline in the evidence footnote, where "clock: unmeasured" is a
+   caveat on the verdict rather than a chip of its own. */
 .trace-clock-unmeasured {
   color: var(--warning-text);
 }
 
-/* Verdict panel */
-.trace-verdict {
-  border-radius: var(--r-md);
-  border: 1px solid var(--line);
-  padding: 10px 14px;
-  margin-bottom: var(--s4);
+/* Loading / error / empty all sit in the card body, under the head. */
+.trace-state {
+  padding: var(--s4) var(--card-pad);
   font-size: var(--t-sm);
 }
 
-.trace-verdict-head {
+/* ── Verdict strip ──────────────────────────────────────────────────────────
+   One row: what the classifier concluded, why in one line, and the way in. The
+   line truncates rather than wrapping — the full text is in the disclosure and
+   on the element's title. */
+.trace-verdict-strip {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: var(--s3);
+  padding: 9px var(--card-pad);
+  border-bottom: 1px solid var(--line);
 }
 
-.trace-verdict-label {
-  font-weight: 600;
+.trace-verdict-line {
+  font-size: var(--t-sm);
+  color: var(--text-2);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .trace-verdict-toggle {
-  background: none;
-  border: none;
-  cursor: pointer;
-  font-size: var(--t-xs);
-  color: var(--text-3);
-  padding: 0;
-  text-decoration: underline;
-}
-
-.trace-verdict-toggle:hover {
-  color: var(--text);
-}
-
-.trace-verdict-evidence {
-  margin: 8px 0 0 0;
-  padding: 0 0 0 16px;
-  font-size: var(--t-xs);
-  color: var(--text-3);
-  line-height: 1.6;
-}
-
-/* #124: these carried the same hardcoded GitHub-Primer hexes as the chart and
-   did not follow [data-theme="light"]. Each verdict now takes the state token
-   that already means what the verdict means: encoder saturation = warning,
-   network congestion = info, a client-side limit = accent (the console's
-   client/browser hue), nominal = success. */
-.trace-verdict-encoder { border-color: var(--warning-line); background: var(--warning-bg); }
-.trace-verdict-network  { border-color: var(--info-line);   background: var(--info-bg); }
-.trace-verdict-client   { border-color: var(--accent-soft-2); background: var(--accent-soft); }
-.trace-verdict-unknown  { border-color: var(--line); background: var(--ink-2); }
-/* ST-07 (#324): the old overloaded "unknown" split into a green healthy verdict and a
-   grey indeterminate-because-hidden verdict, distinct from the amber likely_* problem
-   verdicts and the plain genuine-unknown chip. */
-.trace-verdict-nominal       { border-color: var(--success-line); background: var(--success-bg); }
-.trace-verdict-indeterminate { border-color: var(--line); background: var(--ink-3); }
-
-.trace-verdict-encoder .trace-verdict-label { color: var(--warning-text); }
-.trace-verdict-network .trace-verdict-label  { color: var(--info-text); }
-.trace-verdict-client .trace-verdict-label   { color: var(--accent-text); }
-.trace-verdict-nominal .trace-verdict-label       { color: var(--success-text); }
-.trace-verdict-indeterminate .trace-verdict-label { color: var(--text-3); }
-
-/* ── Stacked lanes ──────────────────────────────────────────────────────────
-   A label column beside a lane column. The lane column is the positioning
-   context for the event overlay, which spans the whole stack: a marker drawn
-   per lane is chopped into four segments by the lane boundaries. */
-.trace-plot {
-  display: flex;
-  align-items: flex-start;
-}
-
-.trace-plot-labels {
+  margin-left: auto;
   flex: none;
 }
 
-.trace-plot-lanes {
-  flex: 1;
-  min-width: 0;
-  position: relative;
+.trace-evidence {
+  padding: 12px var(--card-pad);
+  border-bottom: 1px solid var(--line);
+  font-size: var(--t-sm);
+  color: var(--text-2);
+  line-height: 1.55;
 }
 
-.trace-markers {
-  position: absolute;
-  top: 0;
-  left: 0;
-  pointer-events: none;
-  /* Under the curves and the scale captions: an event marker is context for
-     the data, never a thing that obscures it. */
-  z-index: 0;
+.trace-evidence-list {
+  margin: 0 0 6px;
+  padding-left: 16px;
 }
 
-.trace-lane-svg {
-  position: relative;
-  z-index: 1;
+.trace-evidence-meta {
+  margin-top: 6px;
+  font-size: var(--t-xs);
+  color: var(--text-3);
+}
+
+/* ── Lane stack ─────────────────────────────────────────────────────────────
+   Every row is the same two-column grid, so the lanes, the event track, the
+   axis and the legend all share one left edge and one width. */
+.trace-body {
+  padding: var(--s2) var(--card-pad) var(--card-pad);
+}
+
+.trace-lane-row {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: var(--s4);
+  border-bottom: 1px solid var(--line);
+  padding: 9px 0 7px;
 }
 
 .trace-lane-label {
-  font-size: 9px;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  font-weight: 700;
-  color: var(--text-4);
-  display: flex;
-  align-items: center;
-  padding-right: 8px;
-  justify-content: flex-end;
+  align-self: center;
+  text-align: right;
+  letter-spacing: 0.14em;
 }
 
-/* Per-series scale caption — see the LaneSvg comment in TraceViewer.tsx. */
-.trace-lane-scale {
+.trace-lane-col {
+  min-width: 0;
+}
+
+/* Per-series scale caption — see the LaneChart comment in TraceViewer.tsx.
+   Series in one lane are scaled independently, so the lane has to say what the
+   top of each curve is worth. */
+.trace-lane-caption {
   display: flex;
-  align-items: center;
+  align-items: baseline;
   gap: var(--s4);
-  font-size: 9px;
-  color: var(--text-4);
-  padding-left: 6px;
+  font-size: var(--t-xs);
+  color: var(--text-3);
+  min-width: 0;
   overflow: hidden;
   white-space: nowrap;
 }
@@ -668,54 +643,122 @@
 .trace-lane-scale-item {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 6px;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
-  /* The event overlay runs behind the captions, and a 3px-dashed line through
-     9px glyphs is unreadable. The card's own surface, so this reads as a gap in
-     the markers rather than as a chip. */
-  background: var(--surf-panel);
-  padding: 1px 4px;
-  border-radius: var(--r-xs);
 }
 
 .trace-lane-swatch {
-  width: 7px;
+  width: 10px;
   height: 2px;
   border-radius: 1px;
   flex: none;
 }
 
-.trace-axis-note {
-  margin: var(--s2) 0 0 88px;
-  font-size: var(--t-xs);
-  color: var(--text-4);
+/* The lane's headline reading: the newest sample of its primary series. */
+.trace-lane-value {
+  margin-left: auto;
+  flex: none;
+  font-size: var(--t-lg);
+  color: var(--text);
 }
 
-/* Legend */
+.trace-lane-unit {
+  font-size: var(--t-xs);
+  color: var(--text-3);
+  margin-left: 3px;
+}
+
+.trace-lane-plot {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  height: 54px;
+  margin-top: 5px;
+  overflow: visible;
+}
+
+/* ── Event track ────────────────────────────────────────────────────────────
+   Events get their own row rather than a dashed line through every lane: a
+   per-lane marker is chopped into segments by the lane boundaries, and a dense
+   burst of them turned the chart into a barcode (#124). */
+/* No rule under it: the lane borders separate LANES, and the event track is an
+   annotation of the stack above rather than another lane. */
+.trace-event-row {
+  align-items: center;
+  padding-top: 7px;
+  border-bottom: 0;
+}
+
+.trace-markers {
+  position: relative;
+  height: 16px;
+}
+
+.trace-mark {
+  position: absolute;
+  top: 2px;
+  width: 2px;
+  height: 12px;
+  border-radius: 1px;
+}
+
+/* ── Axis ───────────────────────────────────────────────────────────────────
+   Labelled as time before the right edge, on a round step (#124: dividing the
+   domain into floor(width/80) equal parts produced +0/+6/+13/+19/+26s). */
+.trace-axis-row,
+.trace-legend-row {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.trace-axis {
+  position: relative;
+  height: 20px;
+}
+
+.trace-axis-tick {
+  position: absolute;
+  top: 4px;
+  font-size: 10px;
+  color: var(--text-4);
+  white-space: nowrap;
+}
+
 .trace-legend {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--s3) var(--s5);
-  margin-top: var(--s3);
-  margin-left: 88px;
+  gap: 8px 22px;
   font-size: var(--t-xs);
   color: var(--text-3);
 }
 
 .trace-legend-item {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 7px;
 }
 
-/* Tooltip */
+.trace-legend-swatch {
+  width: 3px;
+  height: 10px;
+  border-radius: 1px;
+  flex: none;
+}
+
+.trace-axis-note {
+  margin: var(--s2) 0 0;
+  font-size: var(--t-xs);
+  color: var(--text-4);
+}
+
+/* ── Tooltip ────────────────────────────────────────────────────────────── */
 .trace-tooltip {
   position: fixed;
   z-index: 200;
-  background: var(--ink-4, var(--ink-3));
-  border: 1px solid var(--line-2, var(--line));
+  background: var(--pop-bg);
+  border: 1px solid var(--line-2);
   border-radius: var(--r-md);
   padding: 8px 12px;
   font-size: var(--t-xs);

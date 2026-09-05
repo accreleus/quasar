@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/accreleus/quasar/control-plane/internal/outbound"
 )
 
 // Reading an image's OCI config labels (#111), for the edge release channel:
@@ -178,7 +180,9 @@ func (r *RegistryResolver) getManifest(ctx context.Context, p parsedRef, referen
 	return body, "sha256:" + hex.EncodeToString(sum[:]), nil
 }
 
-// getBlob GETs a config blob by digest.
+// getBlob GETs a config blob by digest. This is the endpoint that REDIRECTS —
+// GHCR answers 307 to pkg-containers.githubusercontent.com — which tryGet
+// follows once through outbound.GetOneRedirect.
 func (r *RegistryResolver) getBlob(ctx context.Context, p parsedRef, digest string, token *string) ([]byte, error) {
 	url := fmt.Sprintf("%s/v2/%s/blobs/%s", r.base(p), p.Name, digest)
 	return r.registryGet(ctx, p, url, "application/octet-stream, application/json", token)
@@ -227,7 +231,9 @@ func (r *RegistryResolver) tryGet(ctx context.Context, url, accept, token string
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	resp, err := r.client.Do(req)
+	// One validated hop: the blob endpoint redirects to a presigned blob store,
+	// which the transport itself never follows.
+	resp, err := outbound.GetOneRedirect(r.client, req, r.allowHosts, nil)
 	if err != nil {
 		return nil, "", fmt.Errorf("get %s: %w", url, err)
 	}
