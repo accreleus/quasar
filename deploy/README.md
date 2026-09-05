@@ -23,7 +23,10 @@ Contributor tooling (the dev container, the harnesses, image builds) is not here
 - **Docker Engine + Compose v2.20 or newer** (`docker compose version`).
 - **Disk for Docker**: ~20 GB to install a release, 40 GB+ to build from source.
 - **A GPU**: AMD/Intel (VA-API) works as-is. NVIDIA also needs the driver plus
-  `nvidia-container-toolkit` with CDI configured (`sudo nvidia-ctk runtime configure`).
+  `nvidia-container-toolkit` with CDI configured (`sudo nvidia-ctk runtime configure`),
+  plus the CDI refresh ordering in
+  [NVIDIA: order the CDI refresh after udev](#nvidia-order-the-cdi-refresh-after-udev)
+  if the host reboots.
 - **The browser and the GPU host on the same LAN**, or on a VPN that joins them.
   The video does not travel through the control plane — see
   [Media reachability](#media-reachability-lan-or-vpn).
@@ -63,7 +66,8 @@ Compose refuses to start without them. `QUASAR_SECRET_KEY` is optional but set
 it now: without it, credentials saved through the admin UI cannot be stored.
 
 The two image lines pin the stack to the release. Take the digests from the
-release body.
+release body, or from the release's `platform-release-manifest.json` asset, which
+carries the same two digests in machine-readable form.
 
 ```bash
 umask 077
@@ -204,7 +208,7 @@ bash deploy/redeploy.sh va develop         # AMD / Intel host
 > the TLS host names. The last line is the verdict:
 >
 > ```
-> REDEPLOY env=nvidia scope=all ref=develop sha=<short> bundle=index-<hash>.js health=ok catalog=401 agent=registered result=OK
+> REDEPLOY env=nvidia scope=all ref=develop sha=<short> bundle=index-<hash>.js health=ok catalog=401 agent=registered updater=ok result=OK
 > ```
 >
 > `result=OK` means every post-deploy check passed. A non-zero exit or
@@ -361,11 +365,12 @@ distribution with Docker should behave the same.
 | Docker Engine + Compose v2.20+ | Verified against Compose v5.4.0 |
 | Disk free for Docker | ~20 GB to install a release, 40 GB+ to build from source (~25 GB of images and build cache, plus headroom). Fedora's installer default 15 GB root LV is not enough for either — growing it (`lvextend` + `xfs_growfs`) was required on the test box. App images are extra: the KDE desktop image alone is ~1.2 GB compressed |
 | RAM / CPU | Installing a release is download-bound. Building from source was measured on 8 vCPU / 32 GB; less works, it just takes longer |
-| GPU: AMD/Intel (VA-API) or NVIDIA | Optional in principle (`QUASAR_ENCODER=openh264` encodes in software at reduced quality and throughput), expected in practice. NVIDIA hosts also need the driver plus `nvidia-container-toolkit` with CDI configured (`nvidia-ctk runtime configure`) |
+| GPU: AMD/Intel (VA-API) or NVIDIA | Optional in principle (`QUASAR_ENCODER=openh264` encodes in software at reduced quality and throughput), expected in practice. NVIDIA hosts also need the driver plus `nvidia-container-toolkit` with CDI configured (`nvidia-ctk runtime configure`), and on a host that reboots the ordering fix in [NVIDIA: order the CDI refresh after udev](#nvidia-order-the-cdi-refresh-after-udev) |
 | `/dev/uinput` | Virtual input devices (keyboard, mouse, gamepad injection) |
 | `/dev/kmsg` | Kernel ring buffer, passed read-only with `CAP_SYSLOG`, so an NVIDIA Xid or amdgpu fault reaches the session trace instead of only the host's `dmesg`. Optional: on a kernel without it, drop the device and the capability from the node-agent service and the `xid_visibility` readiness check reports `skip`, which fails nothing |
 | Node.js | **Not** required on the host — the web app builds inside a `node:22` container |
 | SELinux | Enforcing is fine; zero denials observed on Fedora 44 |
+| AppArmor (Ubuntu/Debian hosts) | **Ubuntu 24.04+ needs one sysctl.** Its default `kernel.apparmor_restrict_unprivileged_userns=1` blocks the unprivileged user namespace that Steam's container runtime (bwrap / pressure-vessel) creates, and the app exits with "Steam now requires user namespaces to be enabled" before producing video. This is a **host kernel** setting — a container shares the host's kernel and its LSM, so the app image's own distribution does not change it. Set `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` and persist it in `/etc/sysctl.d/99-quasar-userns.conf`; the `user_namespaces` readiness check reports this by name. The `docker-default` profile also denies the mounts those sandboxes perform inside the namespace, so app containers need a profile that allows them: load the scoped `quasar-app` profile shipped in this directory (`sudo apparmor_parser -r -W deploy/apparmor/quasar-app` — see [App-container AppArmor profile](#app-container-apparmor-profile)). Without it the agent falls back to `--security-opt apparmor=unconfined` and says so on the readiness card. SELinux hosts are unaffected |
 | Network path between player and host | Same LAN segment, or a VPN that joins them. Media is peer-to-peer between browser and GPU host, so the control plane being reachable is not enough. See [Media reachability](#media-reachability-lan-or-vpn) |
 | Host firewall | The control plane's published ports go through Docker's DNAT and bypass the host firewall. The node agent uses host networking, so its WebRTC UDP **is** subject to it, and a default-deny firewall silently drops the video. See [Host firewall blocking WebRTC media](#host-firewall-blocking-webrtc-media) |
 
@@ -374,6 +379,112 @@ node-agent image resolves these itself (it ships avahi + nss-mdns and starts a
 resolver-only avahi-daemon at container start), so nothing is needed on the
 host. If ICE ever stalls at "checking", confirm the resolver is up:
 `docker exec <node-agent container> avahi-daemon --check`.
+
+### App-container AppArmor profile
+
+*AppArmor hosts only (Ubuntu, Debian, openSUSE). SELinux hosts skip this entirely.*
+
+Docker confines every container with its `docker-default` AppArmor profile, which
+contains `deny mount,`. Steam's pressure-vessel and Flatpak's `bwrap` build their sandbox
+by creating a user namespace and mounting inside it, so under `docker-default` the app
+dies at "Steam now requires user namespaces to be enabled" — `unshare -U true` succeeds
+while `unshare -Urm true` reports "cannot change root filesystem propagation: Permission
+denied".
+
+This directory ships `deploy/apparmor/quasar-app`: `docker-default` with that one family
+of operations allowed (`mount`, `umount`, `pivot_root`, `userns`) and the escape routes
+that opens closed again. Load it as root on the GPU host:
+
+```bash
+sudo apparmor_parser -r -W deploy/apparmor/quasar-app
+```
+
+`deploy/enroll-host.sh` does this for you on a host it enrolls, from
+`/opt/quasar-agent/apparmor/quasar-app`. Loading kernel policy needs root on the host, so
+the node agent never does it itself; it only reads which profiles are loaded and picks
+accordingly. Confirm with `sudo aa-status | grep quasar-app` — the profile should be
+listed in enforce mode, and a profile in *complain* mode enforces nothing — and the host's
+readiness card in Admin → Fleet shows `app_apparmor_profile`.
+
+The agent reads that list through the node-agent service's
+`/sys/kernel/security:/host/sys/kernel/security:ro` volume, which assumes securityfs
+exists on the host. Every AppArmor host has it, and so does every distro kernel with
+`CONFIG_SECURITYFS` (systemd mounts it at boot). On a kernel built without it the path is
+absent and the container would fail to start — drop that volume line, and the agent
+reports that it cannot tell and stays unconfined.
+
+The profile is loaded into the running kernel and is **gone after a reboot** unless it
+also lives in `/etc/apparmor.d`. Persist it with either
+`QUASAR_ENROLL_APPARMOR_PERSIST=1` on the enrollment command, or by hand:
+
+```bash
+sudo install -m 0644 deploy/apparmor/quasar-app /etc/apparmor.d/quasar-app
+sudo apparmor_parser -r -W /etc/apparmor.d/quasar-app
+```
+
+**Without the profile nothing breaks.** The agent falls back to
+`--security-opt apparmor=unconfined`, exactly as before this profile existed: sessions
+run, but app containers keep none of `docker-default`'s protections. That fallback is a
+`warn` on the readiness card, never a failure. `QUASAR_APP_APPARMOR_PROFILE=unconfined`
+in the agent's environment forces it back deliberately, for a title the profile breaks.
+
+Two things must both be true, and they are independent: this profile (app containers may
+mount inside their namespace) and the `kernel.apparmor_restrict_unprivileged_userns=0`
+sysctl from the prerequisites table (the host kernel lets them create the namespace at
+all).
+
+### NVIDIA: order the CDI refresh after udev
+
+On a host that reboots, `nvidia-ctk runtime configure` is not the whole story.
+The CDI spec (`/var/run/cdi/nvidia.yaml`) is regenerated at boot by
+`nvidia-cdi-refresh.service`, and when that runs in the same second the DRM
+nodes appear — before udev has applied their group ownership — it bakes
+`fileMode: 384` (0600) with no gid for `/dev/dri`. Docker then reproduces
+root-only nodes in **every** GPU container: the unprivileged app user cannot
+open them, gamescope fails with `vulkan: physical device has no primary node`
+and the app container exits about 30 s into every session, while the host's own
+`ls -l /dev/dri` still looks correct. Restarting the container does not clear it
+— CDI edits are applied when a container is *created*, so the stale spec is
+reused until it is regenerated (issue #98).
+
+Order the refresh after udev has settled:
+
+```bash
+sudo mkdir -p /etc/systemd/system/nvidia-cdi-refresh.service.d
+sudo tee /etc/systemd/system/nvidia-cdi-refresh.service.d/10-after-udev.conf >/dev/null <<'EOF'
+[Unit]
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+EOF
+sudo systemctl daemon-reload
+```
+
+(On a host without `systemd-udev-settle.service`, a `.path` unit keyed on
+`/dev/dri/renderD128` that starts `nvidia-cdi-refresh.service` does the same
+job.)
+
+A correct spec carries `fileMode: 438` (0666) and a gid for each `/dev/dri`
+entry:
+
+```bash
+grep -B2 -A4 renderD /var/run/cdi/nvidia.yaml
+```
+
+If it baked 384, regenerate it and recreate the containers — a restart is not
+enough:
+
+```bash
+sudo nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml
+docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.nvidia.yml up -d --force-recreate
+```
+
+The node agent detects this state at boot: the `dri_node_app_access` readiness
+check goes red with the same remediation, and the log carries one
+`boot-dri-modes-stale-cdi` line per boot. It deliberately does **not** restart
+itself for it, because a restart cannot fix it. (The neighbouring race — the
+agent starting in the second before `/dev/dri/renderD128` exists — it does fix
+itself: it exits, and the restart policy starts a container that re-enumerates
+the devices, logging `boot-render-node-missing` while it waits.)
 
 ## How TLS works by default
 
@@ -532,6 +643,22 @@ QUASAR_ENV=production                     # optional, see below
 - `QUASAR_ENV=production` is optional and cheap: it turns the dev-only
   agent-auth flag into a boot refusal rather than something to remember not to
   set.
+- **Keep the proxy's idle-connection timeout below 60 seconds.** The control
+  plane closes idle upstream connections at 60s (`http.Server` `IdleTimeout`).
+  A proxy that pools them for longer — Caddy's default is 2 minutes, nginx's
+  `keepalive_timeout` for upstreams is 60s, Traefik's is 90s — will eventually
+  send a request on a connection the control plane has already closed. Ordinary
+  proxied requests are not retryable (they carry a body the proxy cannot rewind),
+  so the reuse surfaces to the user as a **502**, classically on the first
+  `/v1/signal` WebSocket upgrade after the client has been idle. In Caddy:
+  `transport http { keepalive 30s }` — `Caddyfile.hardened` already sets it. In
+  nginx: `keepalive_timeout 30s` in the upstream block.
+
+Session teardown, for reference: when a session ends the control plane closes
+the client's signaling socket with close code `4404` and code `4500` when it
+cannot reach the node agent (`protocol/signaling.md`). A client that reports a
+close with *no* code — "reset without closing handshake" — was cut off by
+something between it and the control plane, not by the control plane.
 
 The control plane keeps serving its self-signed certificate to the proxy, which
 is fine on a link you control; set `QUASAR_TLS=off` if you would rather it talk
@@ -593,29 +720,71 @@ recommended way to reach a Quasar host from outside the house. Quasar runs no
 relay of its own, so the browser offers host candidates only, which is all a
 shared network needs.
 
-### Multi-host: the client may have no route to the host that won
+### Multi-host: add a GPU host with one command
 
-**Before the second host: the agent link is plaintext only.** A node agent
-reaches the control plane over `CONTROL_PLANE_URL`, and the agent's WebSocket
-client is built without TLS — a `wss://` value fails to connect. On a single
-host that costs nothing, because the agent shares the host's network namespace
-and dials `ws://localhost`. A second host puts that link on the wire, carrying
-the enrollment token and then the per-node secret in cleartext; whoever reads
-them can register a host of their own and be handed sessions. Run the
-agent↔control-plane link over a private path you operate — a VPN, Tailscale, or
-a dedicated link — and never over a shared network. This is a current
-limitation, not a choice you configure.
+**The agent link is TLS, pinned, and one paste (#12); the install is one line (#100).**
+In Admin → Fleet → Enroll host (open the console over `https://`), mint an enrollment
+string. The dialog prints a command of the form
 
-Several GPU hosts can register to one control plane, and the scheduler places
-each session on whichever host has capacity. That opens a case a single host
-never has: the client reaches the control plane, browses the library and
-launches fine, and then has no route to the machine that got the session,
-because that is a different machine on a different network. Nothing about this
-is exotic. It is what a two-host deployment looks like the first time the second
-host wins a placement.
+```bash
+curl -fsSL -k --pinnedpubkey 'sha256//<key hash>' https://<control-plane>/enroll-host.sh \
+  | QUASAR_ENROLLMENT='qenr1.…' QUASAR_REF=<ref> sh
+```
 
-A relay is the standard answer to that case, and it is on the roadmap alongside
-multi-host setup. Until it lands, join both ends to one private network.
+Run it on the new machine as root, or as a user with **passwordless** sudo (the script
+never prompts; with a password-asking sudo it stops and says so — open a root shell with
+`sudo -i` and paste the command there). Docker must already be installed.
+
+The control plane serves the script itself (`/enroll-host.sh`, copied into the SPA at
+build time from `deploy/enroll-host.sh`), so it is the script from the tree the control
+plane runs. With the default self-signed certificate the command carries
+`-k --pinnedpubkey 'sha256//…'`: curl then trusts nothing but that public key, whose hash
+the dialog read from the same certificate it shows the fingerprint of — `-k` on its own
+would let anyone on the path feed the new host a root shell. With a real-CA certificate
+neither flag appears. `<ref>` is the tag or commit the control plane was built from and
+selects the matching agent image tag. The enrollment string travels as an environment
+variable, not in a URL: it is single-use and expires in an hour, which is what makes a
+shell-history exposure bounded.
+
+The script prints each step. It checks the host the way the agent's readiness does
+(Docker + Compose v2, a DRM render node, `/dev/uinput`, unprivileged user namespaces
+including the Ubuntu 24.04+ AppArmor knob from #76, the NVIDIA Container Toolkit on an
+NVIDIA host), then writes `/opt/quasar-agent/docker-compose.yml` (the node-agent service
+alone, plus the NVIDIA overlay when needed) and a 0600 `/opt/quasar-agent/.env` — the
+only place the string lands. On an AppArmor host it also writes
+`/opt/quasar-agent/apparmor/quasar-app` and loads it with `apparmor_parser` (`QUASAR_ENROLL_APPARMOR_PERSIST=1` additionally installs it in `/etc/apparmor.d` so it
+survives a reboot). Then it starts the one agent service and waits until it logs
+`enrolled as host`, or names the failure (an expired or used token, a certificate that
+does not match the pin, a container that exited). Re-running it updates that agent in
+place; it never adds a second one. It never edits the firewall: media reachability is
+reported by the host's readiness in Admin → Fleet, with the exact rule.
+
+Inputs it reads: `QUASAR_ENROLLMENT` (required), `QUASAR_REF`, `QUASAR_AGENT_IMAGE`
+(an explicit digest reference, overriding the ref-derived tag), `QUASAR_DIR`
+(default `/opt/quasar-agent`), `NODE_NAME` (default: the hostname), `QUASAR_HOME_ROOT`
+(default `/var/lib/quasar/homes`), `QUASAR_RENDER_NODE`; `QUASAR_ENROLL_APPARMOR_PERSIST=1`;
+`QUASAR_ENROLL_DRY_RUN=1` prints the plan and touches nothing. Read it first if you like: the same `curl` piped
+into `less` instead of `sh`, or `deploy/enroll-host.sh` in this tree.
+
+**Manual / air-gapped path.** `sh deploy/enroll-host.sh --print-compose` prints the
+agent-only Compose file, `--print-nvidia-overlay` the NVIDIA overlay and
+`--print-apparmor-profile` the app-container AppArmor profile; put them in a
+directory with a `.env` that sets `QUASAR_ENROLLMENT` (and `NODE_NAME`,
+`QUASAR_HOME_ROOT`, `QUASAR_AGENT_IMAGE`) and `docker compose up -d`. The base
+`deploy/docker-compose.yml` is not a second-host install: its agent depends on the
+local stack. That printed service and the base file's node-agent service are held
+identical by `TestEnrollHostComposeMatchesBase`.
+
+What the string carries: the control plane's `wss://` URL, the SHA-256 fingerprint of
+its certificate — first and verbatim, so you can compare it against the control plane's
+startup log before you paste — and a per-host enrollment token that is single-use and
+expires in an hour. Both agent clients (the websocket and the node-secret HTTP polls)
+pin that certificate; nothing about the self-signed default needs to change. After the
+first connection the pin is saved beside the node secret and the string can be removed.
+A `ws://` URL to another machine is refused — the enrollment token and node secret
+would cross the wire in cleartext — unless `QUASAR_ALLOW_PLAINTEXT_AGENT=1` says you own
+that network end to end. See `docs/configuration.md` for the precedence rules and the
+certificate-rotation path.
 
 ### Checking which path a session actually took
 
@@ -692,12 +861,22 @@ session launch, even the session reaching `running` — keeps reporting fine,
 because none of them go through that path.
 
 **How Quasar tells you.** The node agent's `media_reachability` readiness check
-runs a best-effort firewall probe at startup and on reconnect, and when it finds
-a filtering posture it logs a `WARN` naming the exact rule to add for the
-firewall tool it detected, surfaced in Admin → Hosts. Detection degrades to "no
-finding" (not a failure) when no firewall client tool is reachable from inside
-the container, which is the common case — so the absence of that warning is not
-proof the host is open.
+runs a best-effort firewall probe at startup and on reconnect. It reads the
+accept rules, not just the input chain's posture: a default-deny host whose
+rules already cover the ephemeral UDP range *and* UDP/5353 passes, quoting the
+rules it matched; a host covering only one of the two warns and names the
+missing half; a host with no media rule at all gets a `WARN` naming the exact
+rule to add for the firewall tool it detected. A host with no inbound filtering
+at all — no input chain in the ruleset, which is what a machine with no firewall
+configured looks like — passes as well. All of it surfaces in Admin → Hosts.
+
+Two limits are worth knowing. It cannot tell whether a rule's **source scope**
+actually reaches your clients — a rule scoped to the wrong subnet still reads as
+covered, so if video never arrives with a green check, look at the scope first.
+And detection degrades to "no finding" (not a failure) when no firewall client
+tool answers at all: `nft` ships in the agent image and the compose file grants
+it `CAP_NET_ADMIN`, so that now means the probe itself could not run, and the
+absence of a warning is not proof the host is open.
 
 **What needs to be reachable.** Two things, both inbound to the GPU host from
 your client devices, scoped to your LAN or VPN subnet:
@@ -824,12 +1003,35 @@ Runs the node-agent binary with all GStreamer plugins, using host networking
 over `localhost:8080`, and launches game containers and audio sidecars as
 sibling containers through the mounted Docker socket.
 
+### `quasar-updater`
+
+The per-host actor that applies a platform release: it pulls the pinned digests
+and recreates the containers they replace, because a container cannot recreate
+itself. It acts only when told to, over a unix socket in a volume shared with
+the other two services, and only on the stack it sits beside — it discovers that
+stack from its own compose labels, so it picks up whatever overlays you used
+without being told about them.
+
+Two things it will not do: apply an image from outside
+`QUASAR_UPDATER_ALLOWED_NAMESPACES`, and update itself. Its own image is named
+by tag rather than digest for that reason; see
+[`docs/upgrading.md`](../docs/upgrading.md) for the one-line update and for
+adding the service to an existing install.
+
+It needs `QUASAR_STACK_DIR` set to this directory's absolute host path.
+`deploy/redeploy.sh` seeds it.
+
 ## Upgrading, backups, and rollback
 
 Before pulling a new version onto a running stack, back up Postgres and read
 [`docs/upgrading.md`](../docs/upgrading.md). It covers the backup command, the
 upgrade steps, and the fix for the crash loop you get if you roll a control-plane
 binary back *below* the database's applied migration version.
+
+Which recipe you use depends on how this host was installed. A registry install
+(path A) re-pins the two digest lines in `deploy/.env` and recreates those two
+services — [Upgrading a registry install](../docs/upgrading.md#upgrading-a-registry-install);
+a source install (path B) runs `deploy/redeploy.sh <va|nvidia> <ref>`.
 
 ### Narrow redeploys (source path)
 
@@ -850,6 +1052,46 @@ bash deploy/redeploy.sh nvidia my-branch control
 
 Neither narrow scope touches the node-agent image or container, so running
 sessions survive.
+
+## Publishing a platform release (maintainers)
+
+Pushing a `vX.Y.Z` tag on `main` publishes the release. There is nothing else to
+do:
+
+```bash
+git checkout main && git pull
+git tag v0.2.0            # the version must already have a CHANGELOG section
+git push origin v0.2.0
+```
+
+That tag push runs `.github/workflows/images.yml`, which builds both images,
+validates them against `deploy/image-contract.json`, runs the release preflight,
+promotes the tag set (`:0.2.0`, and `:latest` for a stable version), then creates
+the GitHub Release with that version's `CHANGELOG.md` section as the body and
+attaches `platform-release-manifest.json` — the machine-readable list of the two
+component images by digest ([schema](../scripts/release/platform-release-manifest.md)).
+
+A **prerelease** tag (`v0.2.0-rc.1`) publishes a GitHub *prerelease*, which the
+`stable` channel ignores. It needs its own changelog section, under its
+full version.
+
+Before anything builds, a gate refuses a tag that cannot be released, so a
+mistake costs seconds rather than the ~85-minute node-agent build:
+
+| refused | fix |
+|---|---|
+| the tag is not strict semver `vX.Y.Z[-pre]` | re-tag |
+| the tag's commit is not reachable from `main` | merge to `main` (operator sign-off), then tag the merge commit |
+| `CHANGELOG.md` has no section for that version, or it is empty | add `## X.Y.Z — YYYY-MM-DD` with a body on `main`, then re-tag |
+
+Everything else stays manual: a merge to `develop` or `main` publishes nothing.
+To publish from a branch, dispatch the workflow from the Actions tab with the ref
+selector on that branch — it produces `sha-<sha>` and branch tags, never a
+version tag and never a Release.
+
+If a run fails *after* the promote job, the images are published but the Release
+is not. Re-run the failed job (Actions → the run → "Re-run failed jobs"); the
+release job is idempotent.
 
 ## Stopping and cleanup
 

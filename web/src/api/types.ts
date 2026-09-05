@@ -69,6 +69,32 @@ export type InstanceSettings = NonNullable<Schemas["SettingsEnvelope"]["settings
 
 export type SettingsResponse = Schemas["SettingsEnvelope"];
 
+// ── Platform releases (#104/#110, control-api.md §Platform releases) ─────────
+
+export type ReleaseChannel = NonNullable<InstanceSettings["release_channel"]>;
+
+/** GET /v1/admin/platform/releases — the whole Releases page in one read. */
+export type PlatformReleaseView = Schemas["PlatformReleaseView"];
+export type PlatformRelease = Schemas["PlatformRelease"];
+export type PlatformReleaseTarget = Schemas["PlatformReleaseTarget"];
+export type PlatformReleaseFault = Schemas["PlatformReleaseFault"];
+export type PlatformHostIdentity = Schemas["PlatformHostIdentity"];
+export type PlatformIdentity = Schemas["PlatformIdentity"];
+/** Closed vocabulary the UI maps to text; an unrecognised value is rendered
+ *  verbatim rather than dropping the row (control-api.md). */
+export type EligibilityReason = Schemas["EligibilityReason"];
+
+export type PlatformApplyAttempt = Schemas["PlatformApplyAttempt"];
+export type PlatformApplyAttemptEnvelope = Schemas["PlatformApplyAttemptEnvelope"];
+export type PlatformApplyAttemptsResponse = Schemas["PlatformApplyAttemptsResponse"];
+export type PlatformApplyRun = Schemas["PlatformApplyRun"];
+export type PlatformApplySkip = Schemas["PlatformApplySkip"];
+export type PlatformApplyRequest = Schemas["PlatformApplyRequest"];
+export type PlatformApplyRunEnvelope = Schemas["PlatformApplyRunEnvelope"];
+export type PlatformApplyRunsResponse = Schemas["PlatformApplyRunsResponse"];
+export type ApplyAttemptState = Schemas["ApplyAttemptState"];
+export type ApplyFailureReason = Schemas["ApplyFailureReason"];
+
 /** Never carries the plaintext code. */
 export type Invite = Schemas["Invite"];
 
@@ -79,6 +105,25 @@ export interface InvitesResponse {
 export interface MintInviteResponse {
   invite: Schemas["InviteMinted"];
 }
+
+// ── Host enrollment tokens (#12/#96) ─────────────────────────────────────────
+
+/** List shape — never carries the plaintext token. */
+export type HostEnrollment = Schemas["HostEnrollment"];
+
+export interface HostEnrollmentsResponse {
+  enrollments: HostEnrollment[];
+}
+
+/** The plaintext token, ONCE. The one-paste enrollment string is composed
+ *  client-side from it (`lib/enrollmentString`), never by the server. */
+export interface MintHostEnrollmentResponse {
+  enrollment: Schemas["HostEnrollmentMinted"];
+}
+
+/** GET /v1/admin/access-check — THIS request's reachability: the certificate in
+ *  use (with its fingerprint), origin, secure context. */
+export type AccessCheck = Schemas["AccessCheck"];
 
 // ── Encrypted secrets ─────────────────────────────────────────────────────────
 // Write-only on the wire: no type here can hold a secret value, and there is

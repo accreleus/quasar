@@ -24,6 +24,18 @@
     # docs/configuration.md and docker-compose.hardened.yml.
     header_up X-Forwarded-For {remote_host}
     header_up -X-Real-IP
+
+    # Must stay BELOW the control plane's 60s http.Server IdleTimeout (#93).
+    # Caddy's default is 2 minutes, so for a full minute every pooled upstream
+    # connection is one the control plane has already closed. Go retries a
+    # replayable GET on a stale pooled connection, but a proxied request carries
+    # a non-nil Body with no GetBody, so it is not replayable and the reuse
+    # surfaces as 502 — first noticed on the first WebSocket upgrade after an
+    # idle period. Keeping OUR idle window shorter means Caddy retires the
+    # connection first and the race cannot happen.
+    transport http {
+      keepalive 30s
+    }
   }
   log {
     output stdout

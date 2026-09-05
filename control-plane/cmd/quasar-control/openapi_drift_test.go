@@ -20,10 +20,12 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/crud"
 	"github.com/accreleus/quasar/control-plane/internal/devices"
 	"github.com/accreleus/quasar/control-plane/internal/hostcfg"
+	"github.com/accreleus/quasar/control-plane/internal/hostenroll"
 	"github.com/accreleus/quasar/control-plane/internal/images"
 	"github.com/accreleus/quasar/control-plane/internal/invites"
 	"github.com/accreleus/quasar/control-plane/internal/jobs"
 	"github.com/accreleus/quasar/control-plane/internal/origins"
+	"github.com/accreleus/quasar/control-plane/internal/platform"
 	"github.com/accreleus/quasar/control-plane/internal/secrets"
 	"github.com/accreleus/quasar/control-plane/internal/session"
 	"github.com/accreleus/quasar/control-plane/internal/settings"
@@ -67,6 +69,12 @@ func nilDepServices(t *testing.T) *Services {
 		settingsHandler: settings.NewHandler(nil),
 		invitesHandler:  invites.NewHandler(nil, ""),
 		consoleHandler:  console.NewHandler(nil, nil),
+		// Stateless: the identity it serves is linker-injected, not a dep.
+		platformHandler: platform.NewHandler(&platform.Deps{}, nil),
+		// nil store/runner/view: ApplyHandler.Register only takes method
+		// values, and every request path checks ready() and answers 500, so no
+		// route can panic in the recorder.
+		platformApply: platform.NewApplyHandler(nil, nil, nil, nil, log),
 		// nil service/store: Register only needs the handler to exist. Every
 		// request path checks for it and answers 503, so no route can 500 here.
 		artworkHandler: artwork.NewHandler(nil, log),
@@ -84,6 +92,9 @@ func nilDepServices(t *testing.T) *Services {
 		// jobs.Handler.Register only takes method values; nil store/registry/
 		// dispatcher/auditor are never dereferenced at registration.
 		jobsHandler: jobs.NewHandler(nil, nil, nil, log, nil),
+		// nil store: hostenroll.Handler.Register only takes method values, so the
+		// admin host-enrollment routes record with no database behind them.
+		enrollHandler: hostenroll.NewHandler(nil),
 	}
 }
 

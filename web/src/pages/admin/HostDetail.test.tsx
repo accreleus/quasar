@@ -133,6 +133,7 @@ beforeEach(() => {
   setFleet();
   mocked.getHost.mockResolvedValue({ host: host() } as never);
   mocked.getHostGPUs.mockResolvedValue({ items: [gpu()] } as never);
+  mocked.getPlatformReleases.mockResolvedValue({ faults: [] } as never);
   mocked.drainHost.mockResolvedValue({} as never);
   mocked.uncordonHost.mockResolvedValue({} as never);
 });
@@ -170,6 +171,72 @@ describe("HostDetail — head and facts", () => {
     renderDetail();
 
     await waitFor(() => expect(screen.getByText("paused")).toBeTruthy());
+  });
+});
+
+describe("HostDetail — the agent build", () => {
+  const identified = {
+    source_commit: "1f0c1e0e0c5a9d1b7a2f3e4d5c6b7a8901234567",
+    built_at: new Date(NOW - 3 * 24 * 60 * 60 * 1000).toISOString(),
+    install_mode: "registry" as const,
+    updater_present: true,
+  };
+
+  it("shows the commit short and in full, the build age, install mode and updater", async () => {
+    mocked.getHost.mockResolvedValue({ host: host(identified) } as never);
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByTestId("fact-source-commit")).toBeTruthy());
+    const commit = screen.getByTestId("fact-source-commit");
+    expect(commit.textContent).toBe("1f0c1e0e0c5a");
+    expect(commit.getAttribute("title")).toBe(identified.source_commit);
+
+    const built = screen.getByText("Built").closest("tr") as HTMLElement;
+    expect(within(built).getByTitle(identified.built_at).textContent).toBe("3 days ago");
+
+    expect(within(screen.getByText("Install").closest("tr") as HTMLElement).getByText("Registry")).toBeTruthy();
+    expect(within(screen.getByText("Updater").closest("tr") as HTMLElement).getByText("Present")).toBeTruthy();
+  });
+
+  it("reads a source-built host as such", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...identified, install_mode: "source" }),
+    } as never);
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByText("Built from source")).toBeTruthy());
+  });
+
+  // NULL is "no amendment-aware agent has registered"; false is "an agent
+  // looked and found none". Rendering both as the same word would lose the
+  // distinction the release surface is built on.
+  it("distinguishes an unreported updater from one an agent looked for and did not find", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...identified, updater_present: false }),
+    } as never);
+    const { unmount } = renderDetail();
+    await waitFor(() =>
+      expect(within(screen.getByText("Updater").closest("tr") as HTMLElement).getByText("None")).toBeTruthy(),
+    );
+    unmount();
+
+    mocked.getHost.mockResolvedValue({
+      host: host({ ...identified, updater_present: null }),
+    } as never);
+    renderDetail();
+    await waitFor(() =>
+      expect(within(screen.getByText("Updater").closest("tr") as HTMLElement).getByText("Unknown")).toBeTruthy(),
+    );
+  });
+
+  it("says Unknown for a host whose agent predates the identity fields", async () => {
+    renderDetail(); // the base fixture reports none of the four
+
+    await waitFor(() => expect(screen.getByText("Commit")).toBeTruthy());
+    for (const label of ["Commit", "Built", "Install", "Updater"]) {
+      const row = screen.getByText(label).closest("tr") as HTMLElement;
+      expect(within(row).getByText("Unknown")).toBeTruthy();
+    }
   });
 });
 
@@ -348,5 +415,52 @@ describe("HostDetail — actions", () => {
 
     await waitFor(() => expect(screen.getByTestId("readiness-card")).toBeTruthy());
     expect(screen.getByTestId("readiness-check-nvidia_egl")).toBeTruthy();
+  });
+});
+
+describe("HostDetail — platform-release faults", () => {
+  const fault = (over: Record<string, unknown> = {}) => ({
+    kind: "agent_ahead_of_control_plane",
+    host_id: "c2059601",
+    node_name: "quasar-node-1",
+    detail: "the agent is on release 0.3.0 (schema 80), ahead of this control plane (schema 74)",
+    ...over,
+  });
+
+  it("warns that this host's agent is ahead of the control plane", async () => {
+    mocked.getPlatformReleases.mockResolvedValue({ faults: [fault()] } as never);
+    renderDetail();
+
+    await waitFor(() =>
+      expect(screen.getByText("Agent ahead of the control plane.")).toBeTruthy(),
+    );
+    expect(screen.getByText(/schema 80/)).toBeTruthy();
+  });
+
+  it("warns that this host has not reported a build identity", async () => {
+    mocked.getPlatformReleases.mockResolvedValue({
+      faults: [fault({ kind: "identity_unknown", detail: "the agent has not reported its build identity" })],
+    } as never);
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByText("Build identity unknown.")).toBeTruthy());
+  });
+
+  it("shows no fault note for another host's fault", async () => {
+    mocked.getPlatformReleases.mockResolvedValue({
+      faults: [fault({ host_id: "other-host" })],
+    } as never);
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByRole("heading", { name: "quasar-node-1" })).toBeTruthy());
+    expect(document.querySelector(".note.warn")).toBeNull();
+  });
+
+  it("renders the page normally when the release read fails — a fault gates nothing", async () => {
+    mocked.getPlatformReleases.mockRejectedValue(new Error("forbidden"));
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByRole("heading", { name: "quasar-node-1" })).toBeTruthy());
+    expect(document.querySelector(".note.warn")).toBeNull();
   });
 });

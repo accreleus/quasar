@@ -1,5 +1,27 @@
+import { execSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
+
+// The git ref this build is made from, baked in as __QUASAR_SOURCE_REF__ (see
+// src/lib/buildInfo.ts). QUASAR_SOURCE_REF wins when set — container builds
+// (deploy/redeploy.sh, Dockerfile.control.prod) pass it because they cannot see
+// .git — else the exact tag if the tree sits on one, else the commit. Empty,
+// not a guess, when neither is available: the enroll-host one-liner must never
+// point at a tree other than the one running.
+function sourceRef(): string {
+  const fromEnv = process.env.QUASAR_SOURCE_REF?.trim();
+  if (fromEnv) return fromEnv;
+  const git = (args: string): string => {
+    try {
+      return execSync(`git ${args}`, { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+    } catch {
+      return "";
+    }
+  };
+  return git("describe --tags --exact-match") || git("rev-parse HEAD");
+}
 
 // Fonts the UI needs on EVERY page, in every role. @fontsource ships them via
 // `@import` inside base.css, so the browser cannot discover them until the CSS
@@ -72,8 +94,29 @@ function preloadFonts(): Plugin {
 // localhost:8080.
 const controlOrigin = process.env.QUASAR_CONTROL_ORIGIN ?? "http://localhost:8080";
 
+// The control plane serves deploy/enroll-host.sh from the SPA root as
+// /enroll-host.sh (#100), so the installer a second host fetches is the one from
+// the tree the control plane was built from. Copied at build time, never
+// duplicated in web/: deploy/ stays the single home of operator scripts.
+// Missing must fail the build — the SPA handler would otherwise answer the URL
+// with index.html and `sh` would choke on HTML.
+function enrollHostScript(): Plugin {
+  const src = path.resolve(__dirname, "..", "deploy", "enroll-host.sh");
+  return {
+    name: "quasar-enroll-host-script",
+    apply: "build",
+    generateBundle() {
+      if (!fs.existsSync(src)) {
+        throw new Error(`quasar-enroll-host-script: ${src} not found — the build context must include deploy/enroll-host.sh`);
+      }
+      this.emitFile({ type: "asset", fileName: "enroll-host.sh", source: fs.readFileSync(src) });
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [react(), preloadFonts()],
+  plugins: [react(), preloadFonts(), enrollHostScript()],
+  define: { __QUASAR_SOURCE_REF__: JSON.stringify(sourceRef()) },
   server: {
     proxy: {
       "/v1": { target: controlOrigin, changeOrigin: true, ws: true },

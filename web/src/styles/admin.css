@@ -528,21 +528,20 @@
   margin-bottom: var(--s4);
 }
 
+/* The badge rides the Chip primitive; this only makes the reading monospace,
+   which is the house treatment for a metric. */
 .trace-clock-badge {
-  display: inline-flex;
-  align-items: center;
-  padding: 2px 10px;
-  border-radius: var(--r-sm);
+  /* .chip uppercases, which turns the unit into "±1.0MS". A reading is a
+     metric, not a label. */
+  text-transform: none;
+  letter-spacing: 0;
   font-size: var(--t-xs);
-  font-family: var(--font-mono);
-  background: var(--ink-3);
-  color: var(--text-2);
-  border: 1px solid var(--line);
 }
 
+/* Also used inline in the verdict block, where "clock: unmeasured" is a caveat
+   on the verdict rather than a chip of its own. */
 .trace-clock-unmeasured {
   color: var(--warning-text);
-  border-color: var(--warning-text);
 }
 
 /* Verdict panel */
@@ -587,56 +586,62 @@
   line-height: 1.6;
 }
 
-.trace-verdict-encoder { border-color: rgba(240,160,48,0.4); background: rgba(240,160,48,0.06); }
-.trace-verdict-network  { border-color: rgba(88,166,255,0.4); background: rgba(88,166,255,0.06); }
-.trace-verdict-client   { border-color: rgba(163,113,247,0.4); background: rgba(163,113,247,0.06); }
+/* #124: these carried the same hardcoded GitHub-Primer hexes as the chart and
+   did not follow [data-theme="light"]. Each verdict now takes the state token
+   that already means what the verdict means: encoder saturation = warning,
+   network congestion = info, a client-side limit = accent (the console's
+   client/browser hue), nominal = success. */
+.trace-verdict-encoder { border-color: var(--warning-line); background: var(--warning-bg); }
+.trace-verdict-network  { border-color: var(--info-line);   background: var(--info-bg); }
+.trace-verdict-client   { border-color: var(--accent-soft-2); background: var(--accent-soft); }
 .trace-verdict-unknown  { border-color: var(--line); background: var(--ink-2); }
 /* ST-07 (#324): the old overloaded "unknown" split into a green healthy verdict and a
    grey indeterminate-because-hidden verdict, distinct from the amber likely_* problem
    verdicts and the plain genuine-unknown chip. */
-.trace-verdict-nominal       { border-color: var(--success-line, rgba(63,185,80,0.4)); background: rgba(63,185,80,0.06); }
+.trace-verdict-nominal       { border-color: var(--success-line); background: var(--success-bg); }
 .trace-verdict-indeterminate { border-color: var(--line); background: var(--ink-3); }
 
-.trace-verdict-encoder .trace-verdict-label { color: #f0a030; }
-.trace-verdict-network .trace-verdict-label  { color: #58a6ff; }
-.trace-verdict-client .trace-verdict-label   { color: #a371f7; }
-.trace-verdict-nominal .trace-verdict-label       { color: var(--success-text, #3fb950); }
+.trace-verdict-encoder .trace-verdict-label { color: var(--warning-text); }
+.trace-verdict-network .trace-verdict-label  { color: var(--info-text); }
+.trace-verdict-client .trace-verdict-label   { color: var(--accent-text); }
+.trace-verdict-nominal .trace-verdict-label       { color: var(--success-text); }
 .trace-verdict-indeterminate .trace-verdict-label { color: var(--text-3); }
 
-/* Live auto-update indicator (#324) */
-.trace-live-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-size: var(--t-xs);
-  color: var(--text-3);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.trace-live-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--success, #3fb950);
-  box-shadow: 0 0 0 3px rgba(63,185,80,0.18);
-}
-
-/* Stacked lanes */
-.trace-lanes {
+/* ── Stacked lanes ──────────────────────────────────────────────────────────
+   A label column beside a lane column. The lane column is the positioning
+   context for the event overlay, which spans the whole stack: a marker drawn
+   per lane is chopped into four segments by the lane boundaries. */
+.trace-plot {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  align-items: flex-start;
 }
 
-.trace-lane {
-  display: flex;
-  align-items: stretch;
+.trace-plot-labels {
+  flex: none;
+}
+
+.trace-plot-lanes {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+}
+
+.trace-markers {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  /* Under the curves and the scale captions: an event marker is context for
+     the data, never a thing that obscures it. */
+  z-index: 0;
+}
+
+.trace-lane-svg {
+  position: relative;
+  z-index: 1;
 }
 
 .trace-lane-label {
-  width: 80px;
-  flex: none;
   font-size: 9px;
   text-transform: uppercase;
   letter-spacing: 0.1em;
@@ -648,9 +653,44 @@
   justify-content: flex-end;
 }
 
-.trace-lane-svg {
-  flex: 1;
+/* Per-series scale caption — see the LaneSvg comment in TraceViewer.tsx. */
+.trace-lane-scale {
+  display: flex;
+  align-items: center;
+  gap: var(--s4);
+  font-size: 9px;
+  color: var(--text-4);
+  padding-left: 6px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.trace-lane-scale-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* The event overlay runs behind the captions, and a 3px-dashed line through
+     9px glyphs is unreadable. The card's own surface, so this reads as a gap in
+     the markers rather than as a chip. */
+  background: var(--surf-panel);
+  padding: 1px 4px;
+  border-radius: var(--r-xs);
+}
+
+.trace-lane-swatch {
+  width: 7px;
+  height: 2px;
+  border-radius: 1px;
+  flex: none;
+}
+
+.trace-axis-note {
+  margin: var(--s2) 0 0 88px;
+  font-size: var(--t-xs);
+  color: var(--text-4);
 }
 
 /* Legend */
@@ -659,6 +699,7 @@
   flex-wrap: wrap;
   gap: var(--s3) var(--s5);
   margin-top: var(--s3);
+  margin-left: 88px;
   font-size: var(--t-xs);
   color: var(--text-3);
 }

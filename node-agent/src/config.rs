@@ -1,5 +1,7 @@
 use std::env;
 
+use crate::enrollment::{self, TransportPolicy};
+
 pub struct Config {
     /// WebSocket base URL of the control plane; `/agent/ws` is appended automatically.
     pub control_plane_url: String,
@@ -13,25 +15,66 @@ pub struct Config {
     /// Per-node secret persisted at first enrollment. Default path is scoped to
     /// NODE_NAME so two agents without an explicit NODE_SECRET_PATH never collide.
     pub node_secret_path: String,
+
+    /// How both control-plane clients verify the peer (#12). Derived once from
+    /// `QUASAR_ENROLLMENT` / `CONTROL_PLANE_FINGERPRINT` / the persisted pin / the URL scheme.
+    pub transport: TransportPolicy,
+
+    /// Which input named the pin in `transport` (#12). Only `PinSource::Env` may refresh
+    /// the persisted pin file — see `agent::persist_pin_if_new`.
+    pub pin_source: Option<enrollment::PinSource>,
+
+    /// The enrollment string's fingerprint segment was empty, so this host verifies
+    /// against the WebPKI roots. Logged at connect so a mispasted `qenr1..` is visible.
+    pub webpki_from_blob: bool,
+
+    /// Precedence decisions made while resolving the transport, to be logged at WARN once
+    /// tracing is up (config is read before the subscriber exists).
+    pub startup_warnings: Vec<String>,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self, String> {
-        let control_plane_url = env::var("CONTROL_PLANE_URL")
-            .map_err(|_| "CONTROL_PLANE_URL is required (e.g. ws://localhost:8080)")?;
         let node_name = env::var("NODE_NAME").unwrap_or_else(|_| detect_hostname());
-        // #519: an empty-but-set ENROLLMENT_TOKEN must fold to None like unset, so
-        // `choose_auth` never sends a blank token.
-        let enrollment_token = normalize_enrollment_token(env::var("ENROLLMENT_TOKEN").ok());
         let node_secret_path = env::var("NODE_SECRET_PATH")
             .unwrap_or_else(|_| format!("/tmp/quasar-{node_name}-secret"));
 
+        // #12: the one-paste enrollment string, the manual pin, the plaintext opt-in, and
+        // the pin persisted at first verified connect all feed one resolver. #519's rule
+        // that an empty-but-set ENROLLMENT_TOKEN folds to None is preserved by trimming.
+        let blob = env::var("QUASAR_ENROLLMENT").ok();
+        let url = env::var("CONTROL_PLANE_URL").ok();
+        let fingerprint = env::var("CONTROL_PLANE_FINGERPRINT").ok();
+        let token = normalize_enrollment_token(env::var("ENROLLMENT_TOKEN").ok());
+        let allow_plaintext =
+            enrollment::is_truthy(env::var("QUASAR_ALLOW_PLAINTEXT_AGENT").ok().as_deref());
+        let persisted_pin = std::fs::read_to_string(enrollment::pin_path(&node_secret_path)).ok();
+
+        let resolved = enrollment::resolve(enrollment::Inputs {
+            blob: blob.as_deref(),
+            url: url.as_deref(),
+            fingerprint: fingerprint.as_deref(),
+            token: token.as_deref(),
+            persisted_pin: persisted_pin.as_deref(),
+            allow_plaintext,
+        })?;
+
         Ok(Config {
-            control_plane_url,
+            control_plane_url: resolved.url,
             node_name,
-            enrollment_token,
+            enrollment_token: resolved.token,
             node_secret_path,
+            transport: resolved.policy,
+            pin_source: resolved.pin_source,
+            webpki_from_blob: resolved.webpki_from_blob,
+            startup_warnings: resolved.warnings,
         })
+    }
+
+    /// Where the pin learned at first verified connect is kept (`<NODE_SECRET_PATH>.tls`),
+    /// so the enrollment string can be removed from the environment afterwards.
+    pub fn pin_path(&self) -> String {
+        enrollment::pin_path(&self.node_secret_path)
     }
 
     pub fn ws_url(&self) -> String {

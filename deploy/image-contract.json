@@ -103,6 +103,11 @@
         }
       },
 
+      "entrypoint_env_guards": {
+        "unset_when_empty": ["LIBVA_TRACE"],
+        "_why": "#94: compose always passes LIBVA_TRACE through (`${LIBVA_TRACE:-}`), so an operator who never set it gets a present-but-empty value. libva treats mere PRESENCE as tracing-on and uses the (empty) value as a file prefix -- one file per encode thread per session, 66GB/1589 files on one deploy that filled the disk and crashed Postgres. Run with the REAL entrypoint (unlike the assertion-program checks above, which bypass it with --entrypoint /bin/sh) and `env` as the command: with the var set empty it must be absent from the output (the entrypoint's `[ -z ] && unset` guard fired); with a non-empty value it must survive unchanged, so a deliberate bounded trace path still works."
+      },
+
       "gst_elements": {
         "required": [
           "waylanddisplaysrc", "kmssink",
@@ -116,9 +121,10 @@
           "opusenc", "audioconvert", "audioresample",
           "pulsesrc", "pulsesink", "alsasink",
           "rtph264pay", "rtpopuspay",
-          "rtpopusdepay", "opusdec"
+          "rtpopusdepay", "opusdec",
+          "coloreffects"
         ],
-        "_required_notes": "Device-free elements only -- everything here must register with no GPU attached. rtpgccbwe comes from gst-plugins-rs and is the element most often lost to a wrong 0.13/0.14/0.15 pin. interpipesrc/sink come from the gow gst-interpipe fork. The webrtc transport chain (rtpbin/nicesrc/dtlssrtpenc/sctpenc/rtprtxsend/rtpulpfecenc) is asserted because the published games-on-whales gst-wayland-display images build with -Dauto_features=disabled and lack all of it -- that is why they cannot be used as a base here.",
+        "_required_notes": "Device-free elements only -- everything here must register with no GPU attached. rtpgccbwe comes from gst-plugins-rs and is the element most often lost to a wrong 0.13/0.14/0.15 pin. interpipesrc/sink come from the gow gst-interpipe fork. The webrtc transport chain (rtpbin/nicesrc/dtlssrtpenc/sctpenc/rtprtxsend/rtpulpfecenc) is asserted because the published games-on-whales gst-wayland-display images build with -Dauto_features=disabled and lack all of it -- that is why they cannot be used as a base here. coloreffects is gst-plugins-bad's, asserted for #97 (the 'Colour Ripple' bench app's gst-launch pipeline fails with 'no element \"coloreffects\"' otherwise) -- not used by node-agent Rust.",
         "_audio_note": "pulsesrc/audioconvert/audioresample/alsasink are the CONSOLE local-audio pipeline (node-agent/src/session/pipeline.rs build_local_audio_pipeline), and pulsesrc/opusenc feed the streamed audio PeerConnection. Note that console local audio reads from pulsesrc too -- so the PulseAudio sidecar daemon (the `pulseaudio` package above) is load-bearing for BOTH audio paths, not just streaming. When quasar-nv shipped without the daemon on 2026-07-26, both went silent. rtpopusdepay/opusdec are the microphone RECEIVE path (mic_branch.rs) -- client mic -> pulsesink device=quasar_mic in the sidecar.",
         "required_with_gpu": ["vulkanh264enc", "vulkanscale"],
         "_required_with_gpu_notes": "vah264enc/vah264lpenc are NOT asserted here: AMD VCN exposes the regular VAEntrypointEncSlice (vah264enc) while Intel exposes the low-power one (vah264lpenc), so the element name is host-dependent. Assert those per-host with --require-element instead. vulkanscale (added for #501) is the GPU scaler for memory:VulkanImage NV12/P010 frames, built in the Quasar gst-wayland-display fork alongside waylanddisplaysrc -- it is what gives a Vulkan host the external-resolution lever (ScaleStage::supported becomes true only when this factory registers). THIS ASSERTION WILL FAIL until GST_WAYLAND_DISPLAY_REF in deploy/pins.env is bumped to a fork commit that carries the element -- do not relax it to make a build green; bump the pin instead.",
@@ -178,6 +184,47 @@
       "_deployment_ban_note": "build-images.sh refuses to write the quasar-node-agent or quasar-nv tag from this role."
     },
 
+    "updater": {
+      "_role": "Per-host updater (Dockerfile.updater). Static Go binary on docker:29-cli. NOT part of a platform release -- it is what APPLIES one, so it cannot be one of the images an apply moves by digest (docs/upgrading.md).",
+      "size_max_mb": 200,
+      "_size_note": "docker:29-cli is ~120MB (alpine + docker CLI + buildx/compose plugins) and the updater binary is ~8MB. If this ceiling breaks, the base moved -- do not raise it to make a red build green.",
+
+      "binaries": {
+        "required": ["docker", "quasar-updater", "curl"],
+        "_required_notes": {
+          "docker": "The CLI this program exists to drive. Its compose plugin is asserted separately below, because a docker CLI WITHOUT the compose plugin passes this line and can do nothing the updater needs.",
+          "curl": "The post-deploy `/v1/self` probe (deploy/redeploy.sh step 7/7) runs INSIDE this container, because it is the only one guaranteed to have a client that speaks a unix socket: the control-plane image ships curl or wget depending on which Dockerfile built it, and busybox wget cannot do it at all.",
+          "quasar-updater": "The baked binary. Alpine base, so no rpm/package assertions apply to this role."
+        },
+        "forbidden": ["go", "gcc", "cargo"]
+      },
+
+      "commands": {
+        "must_succeed": {
+          "docker compose version": "The compose plugin, pinned IN THE IMAGE so the invocation is independent of the host's compose version (prototype finding 4). Its absence is invisible to a `docker` binary check and turns every apply into a `recreate_failed`."
+        }
+      },
+
+      "paths": {
+        "required": ["/usr/local/bin/quasar-updater"],
+        "forbidden": ["/go", "/usr/local/go", "/src"]
+      },
+
+      "labels": {
+        "required": [
+          "org.quasar.image.role",
+          "org.quasar.source.commit",
+          "org.quasar.built.at"
+        ],
+        "_notes": "No org.quasar.pins.base: this role is the one image not built on the quasar-base family, so there is no base pin to record."
+      },
+
+      "image_config": {
+        "healthcheck_required": false,
+        "must_not_run_as_root": false,
+        "_root_note": "Root is REQUIRED here: the updater talks to the mounted docker socket and writes the stack's .env at its host path. Documented in deploy/Dockerfile.updater."
+      }
+    },
     "control": {
       "_role": "Control-plane production image (Dockerfile.control.prod). Static Go binary + embedded web SPA on quasar-base.",
       "size_max_mb": 400,
@@ -192,6 +239,16 @@
       },
       "paths": {
         "forbidden": ["/root/.npm", "/go", "/usr/local/go"]
+      },
+      "labels": {
+        "required": [
+          "org.quasar.image.role",
+          "org.quasar.pins.base",
+          "org.quasar.source.commit",
+          "org.quasar.built.at",
+          "org.quasar.schema.version"
+        ],
+        "_notes": "Provenance, the same assertion the runtime role carries. org.quasar.schema.version is the control role's alone: the edge release channel reads the highest embedded migration off the published image, since a branch build ships no release manifest, and a control-plane image without it is unorderable and never offered as an update (#111). The control plane also SERVES its identity (GET /v1/admin/platform/identity) from linker stamps passed by the same build args, so a missing label here means the served identity is unstamped too."
       },
       "image_config": {
         "healthcheck_required": true,

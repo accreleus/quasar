@@ -5,13 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/accreleus/quasar/control-plane/internal/outbound"
 )
 
 // Digest resolution (#440, protocol/control-api.md §"Digest pinning"). A
@@ -30,6 +31,14 @@ const (
 	// supported; a hung sync is not.
 	digestResolveTimeout = 5 * time.Second
 	dockerContentDigest  = "Docker-Content-Digest"
+
+	// defaultRegistryHost is the allowlist QUASAR_IMAGE_REGISTRY_HOSTS falls back
+	// to when unset: the registry this project publishes to.
+	defaultRegistryHost = "ghcr.io"
+
+	// registryMaxBodyBytes bounds every registry response body (the token fetch
+	// is the only one read): a hostile registry must not stream us out of memory.
+	registryMaxBodyBytes int64 = 1 << 20
 )
 
 // manifestAccept: all four media types, since a multi-arch image answers with
@@ -67,16 +76,23 @@ func (noopResolver) Resolve(context.Context, string) (string, error) {
 // air-gapped deployments, to keep every digest empty.
 func NoopResolver() DigestResolver { return noopResolver{} }
 
+// doer is the outbound HTTP seam: *outbound.Client in production, a plain
+// *http.Client pointed at an httptest server in the resolver's own tests.
+type doer interface {
+	Do(*http.Request) (*http.Response, error)
+}
+
 // RegistryResolver is the production DigestResolver: an anonymous-pull registry
 // v2 client.
 //
 // SSRF containment (protocol/control-api.md §Digest pinning): the registry host
 // comes from remote catalog data and the token realm from the registry's own
-// response, so both are untrusted. HTTPS-only, both hosts checked against an
-// allowlist, no HTTP redirects followed, and the DialContext refuses any
-// non-public IP.
+// response, so both are untrusted. The transport hardening — HTTPS-only, no
+// redirects followed, non-public addresses refused at dial, bounded bodies —
+// is internal/outbound's; what stays here are the two host checks that must
+// happen on a ref/realm this resolver parses BEFORE it builds a request.
 type RegistryResolver struct {
-	client *http.Client
+	client doer
 	// Registry/realm hosts this resolver may contact (QUASAR_IMAGE_REGISTRY_HOSTS,
 	// default "ghcr.io"). nil only in tests — allows every host.
 	allowHosts map[string]struct{}
@@ -87,122 +103,70 @@ type RegistryResolver struct {
 }
 
 // NewRegistryResolver builds the production resolver. A nil client gets the
-// guarded client (timeout, no redirects, DNS-rebind dialer guard); callers
-// supplying their own transport take responsibility for those protections.
+// shared hardened outbound client (internal/outbound) with the registry
+// allowlist and the resolve timeout; callers supplying their own transport take
+// responsibility for those protections.
 func NewRegistryResolver(client *http.Client) *RegistryResolver {
-	if client == nil {
-		client = newGuardedClient(defaultLookupIP)
+	return NewRegistryResolverForHosts(client, allowedHostsFromEnv())
+}
+
+// RegistryEgressHosts is QUASAR_IMAGE_REGISTRY_HOSTS plus the extra hosts a
+// caller must be able to reach whatever that knob says — the platform registry
+// (QUASAR_PLATFORM_REGISTRY, #111) is one: an operator who repoints the
+// platform images at their own registry should not also have to remember to
+// add it to a second, differently-named list.
+func RegistryEgressHosts(extra ...string) map[string]struct{} {
+	hosts := allowedHostsFromEnv()
+	for _, h := range extra {
+		h = strings.ToLower(strings.TrimSpace(h))
+		if h != "" {
+			hosts[h] = struct{}{}
+		}
 	}
-	return &RegistryResolver{client: client, allowHosts: allowedHostsFromEnv()}
+	return hosts
+}
+
+// NewRegistryResolverForHosts is NewRegistryResolver over an explicit
+// allowlist. Same hardening; the caller decides the host set.
+func NewRegistryResolverForHosts(client *http.Client, hosts map[string]struct{}) *RegistryResolver {
+	if len(hosts) == 0 {
+		hosts = allowedHostsFromEnv()
+	}
+	if client != nil {
+		return &RegistryResolver{client: client, allowHosts: hosts}
+	}
+	c, err := outbound.New(outbound.Config{
+		AllowHosts:   hosts,
+		Timeout:      digestResolveTimeout,
+		MaxBodyBytes: registryMaxBodyBytes,
+	})
+	if err != nil {
+		// outbound.New fails only on an empty allowlist, and allowedHostsFromEnv
+		// always falls back to defaultRegistryHost — so this is a programming
+		// error at boot, not a runtime condition to degrade around.
+		panic(fmt.Sprintf("images: build registry outbound client: %v", err))
+	}
+	return &RegistryResolver{client: c, allowHosts: hosts}
 }
 
 // newTestResolver builds a resolver whose HTTP calls all go to baseURL, with a
 // nil allowlist since the httptest server stands in for any registry.
 func newTestResolver(client *http.Client, baseURL string) *RegistryResolver {
 	if client != nil && client.CheckRedirect == nil {
-		client.CheckRedirect = noRedirect
+		client.CheckRedirect = outbound.NoRedirect
 	}
 	return &RegistryResolver{client: client, baseURL: strings.TrimSuffix(baseURL, "/")}
 }
 
-// noRedirect: a registry response is untrusted, and a 3xx Location could point
-// the next request past the allowlist/dialer at an internal address.
-func noRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-
-// ipLookup resolves a host to its IPs. Injectable so the DNS-rebind guard can
-// be tested with a resolver returning a private address for an allowed host.
-type ipLookup func(ctx context.Context, host string) ([]net.IP, error)
-
-func defaultLookupIP(ctx context.Context, host string) ([]net.IP, error) {
-	return net.DefaultResolver.LookupIP(ctx, "ip", host)
-}
-
-// newGuardedClient: per-request timeout, no redirects, DialContext refuses any
-// non-public IP.
-func newGuardedClient(lookup ipLookup) *http.Client {
-	return &http.Client{
-		Timeout:       digestResolveTimeout,
-		CheckRedirect: noRedirect,
-		Transport: &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
-			DialContext:           guardedDialContext(lookup),
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          10,
-			IdleConnTimeout:       30 * time.Second,
-			TLSHandshakeTimeout:   5 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
-	}
-}
-
-// guardedDialContext refuses loopback/private/link-local/multicast/unspecified
-// addresses on every connection (DNS-rebind guard): resolves the host itself
-// and dials the resolved IP directly, so a name resolving public-then-private
-// across two lookups can't slip past. TLS ServerName still derives from the
-// request URL, unaffected.
-func guardedDialContext(lookup ipLookup) func(context.Context, string, string) (net.Conn, error) {
-	d := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		host, port, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, fmt.Errorf("split dial address %q: %w", addr, err)
-		}
-		ips, err := lookup(ctx, host)
-		if err != nil {
-			return nil, fmt.Errorf("resolve %q: %w", host, err)
-		}
-		for _, ip := range ips {
-			if disallowedIP(ip) {
-				return nil, fmt.Errorf("refusing connection to non-public address %s (host %q)", ip, host)
-			}
-		}
-		var lastErr error
-		for _, ip := range ips {
-			conn, err := d.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
-			if err == nil {
-				return conn, nil
-			}
-			lastErr = err
-		}
-		if lastErr == nil {
-			lastErr = fmt.Errorf("no addresses for %q", host)
-		}
-		return nil, lastErr
-	}
-}
-
-// disallowedIP reports whether ip is one the resolver must never connect to.
-func disallowedIP(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified()
+// hostAllowed: nil allowlist (test resolvers only) allows everything.
+func (r *RegistryResolver) hostAllowed(host string) bool {
+	return outbound.HostAllowed(r.allowHosts, host)
 }
 
 // allowedHostsFromEnv parses QUASAR_IMAGE_REGISTRY_HOSTS (comma-separated,
 // default "ghcr.io"); always non-nil so hostAllowed enforces it in production.
 func allowedHostsFromEnv() map[string]struct{} {
-	raw := os.Getenv("QUASAR_IMAGE_REGISTRY_HOSTS")
-	if strings.TrimSpace(raw) == "" {
-		raw = "ghcr.io"
-	}
-	out := make(map[string]struct{})
-	for _, h := range strings.Split(raw, ",") {
-		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
-			out[h] = struct{}{}
-		}
-	}
-	if len(out) == 0 {
-		out["ghcr.io"] = struct{}{}
-	}
-	return out
-}
-
-// hostAllowed: nil allowlist (test resolvers only) allows everything.
-func (r *RegistryResolver) hostAllowed(host string) bool {
-	if r.allowHosts == nil {
-		return true
-	}
-	_, ok := r.allowHosts[strings.ToLower(host)]
-	return ok
+	return outbound.ParseHostList(os.Getenv("QUASAR_IMAGE_REGISTRY_HOSTS"), defaultRegistryHost)
 }
 
 // parsedRef is a registry reference split into the pieces the v2 API needs.
@@ -262,6 +226,13 @@ func parseRef(ref string) (parsedRef, error) {
 }
 
 // apiHost handles docker.io's split between ref name and API endpoint.
+//
+// The allowlist is checked against BOTH: Resolve checks the ref's registry
+// (docker.io) before building a request, and the outbound client checks the
+// host actually dialled (registry-1.docker.io, then the auth.docker.io realm).
+// So a Docker Hub ref resolves only when QUASAR_IMAGE_REGISTRY_HOSTS lists
+// docker.io, registry-1.docker.io and auth.docker.io — deliberately: the
+// allowlist names hosts the control plane may contact, not aliases of them.
 func (p parsedRef) apiHost() string {
 	if p.Registry == "docker.io" {
 		return "registry-1.docker.io"
@@ -400,14 +371,8 @@ func (r *RegistryResolver) fetchToken(ctx context.Context, realm, service, scope
 	if err != nil {
 		return "", fmt.Errorf("parse token realm %q: %w", realm, err)
 	}
-	if u.Scheme != "https" {
-		return "", fmt.Errorf("token realm %q is not https", realm)
-	}
-	if u.User != nil {
-		return "", fmt.Errorf("token realm %q carries userinfo", realm)
-	}
-	if !r.hostAllowed(u.Hostname()) {
-		return "", fmt.Errorf("token realm host %q is not in the allowlist (QUASAR_IMAGE_REGISTRY_HOSTS)", u.Hostname())
+	if err := outbound.CheckURL(u, r.allowHosts); err != nil {
+		return "", fmt.Errorf("token realm %q refused (allowlist is QUASAR_IMAGE_REGISTRY_HOSTS): %w", realm, err)
 	}
 	if r.baseURL != "" && strings.HasPrefix(realm, "https://") {
 		// Test seam: redirect the constructed ghcr.io endpoint at the fake
@@ -437,7 +402,10 @@ func (r *RegistryResolver) fetchToken(ctx context.Context, realm, service, scope
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("fetch registry token: status %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // bounded: a hostile registry must not stream us out of memory
+	// Unbounded-looking on purpose: the outbound client caps the body at
+	// registryMaxBodyBytes and errors past it, so the bound is enforced in one
+	// place for every caller rather than re-derived at each read site.
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("read registry token: %w", err)
 	}

@@ -51,6 +51,10 @@ published images, which is about 20 GB.
    QUASAR_HOME_ROOT=/var/lib/quasar/homes
    QUASAR_STATE_DIR=/var/lib/quasar/control
 
+   # This deploy/ directory, as an absolute path on this machine. Print it
+   # with `cd deploy && pwd`. The updater service needs it.
+   QUASAR_STACK_DIR=/opt/quasar/deploy
+
    # Every IP and hostname anyone will type into a browser. The certificate
    # names these and it is generated once, on first boot.
    QUASAR_TLS_HOSTS=192.168.1.50,quasar.lan
@@ -96,6 +100,35 @@ be reconstructed. Lose it and every stored secret has to be entered again. Keep
 a copy off the host.
 </Aside>
 
+## The updater service
+
+The stack has four services, not three: `quasar-updater` sits beside the control
+plane and the agent so Quasar can update itself from the admin console. A
+container cannot recreate itself, which is why something else has to.
+
+It holds the Docker socket, so it is worth knowing what it will not do. It pulls
+only digests inside `QUASAR_UPDATER_ALLOWED_NAMESPACES` (the project's own
+registry namespace unless you narrow it), and it recreates only the two Quasar
+services in the stack it was started beside — which it discovers from its own
+compose labels. It builds nothing, runs no arbitrary command, and never touches
+Postgres, your game containers, or anything else on the machine.
+
+`QUASAR_STACK_DIR` above must be this directory's absolute host path. Left unset,
+the updater refuses to serve and says so, rather than guess at a compose
+invocation and recreate the wrong project's containers. Nothing else in the stack
+is affected.
+
+<Aside type="tip" title="Podman">
+Set `QUASAR_DOCKER_SOCKET=/run/user/<uid>/podman/podman.sock`. The service
+already ships `security_opt: ["label=disable"]`, without which an
+SELinux-enforcing host refuses every call to the mounted socket.
+</Aside>
+
+Deleting the service from the file is a supported choice: everything else works,
+the host simply reports that it has no updater and you upgrade it by hand. See
+[Upgrading](/quasar/operations/upgrading/) and [Updating
+Quasar](/quasar/admin/releases/).
+
 ## Updating
 
 ```bash
@@ -106,6 +139,10 @@ docker compose -f deploy/docker-compose.yml up -d
 `:latest` is what the image variables default to, so this is the whole upgrade.
 Read [Upgrading](/quasar/operations/upgrading/) before doing it on anything you
 care about, because database migrations only go forward.
+
+Once the stack is up, Admin, Fleet, Releases does the same thing with the
+sessions drained first and the whole fleet moved in order — see [Updating
+Quasar](/quasar/admin/releases/).
 
 ### Pinning a version instead
 
@@ -119,7 +156,18 @@ QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@sha256:...
 
 Read a digest with `docker buildx imagetools inspect <image>:latest`. A tag can
 move underneath you and a digest cannot. That is the whole trade. You stop
-getting surprises and you start doing upgrades by hand.
+getting surprises and you start deciding when to move — from the console, or by
+hand.
+
+`QUASAR_UPDATER_IMAGE` is set the same way, in the same file, but by tag:
+
+```bash
+QUASAR_UPDATER_IMAGE=ghcr.io/accreleus/quasar/quasar-updater:latest
+```
+
+The updater is what applies a release, so it is not one of the images a release
+moves and it is not pinned with them. It updates on its own schedule, which is
+whenever you pull it.
 
 ## Building from source
 

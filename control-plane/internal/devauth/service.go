@@ -80,7 +80,7 @@ func ReapOnce(ctx context.Context, minter Minter, log *slog.Logger) (auth.ReapRe
 			"failed", rep.Failed, "err", err)
 	}
 	if rep.Deleted > 0 {
-		log.Info("dev agent reaper", "deleted", rep.Deleted)
+		log.Info("dev agent reaper", "deleted", rep.Deleted, "hosts_nudged", rep.HostsNudged)
 	}
 	if rep.InSession > 0 {
 		// Not a problem: an expired identity still holding a live session is

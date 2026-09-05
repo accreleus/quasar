@@ -7,8 +7,9 @@
  * is the mock's order; `to` is the route the tab owns, and every route under
  * it lights the same tab.
  *
- * Jobs is a Fleet tab with no v3 mock: it is fleet operations, and it reuses
- * the Fleet head rather than earning a rail row of its own (spec §3.3).
+ * Jobs and Releases are Fleet tabs with no v3 mock: both are fleet operations,
+ * and they reuse the Fleet head rather than earning a rail row of their own
+ * (spec §3.3).
  */
 
 export interface SectionTab {
@@ -21,6 +22,7 @@ export const FLEET_TABS: SectionTab[] = [
   { id: "hosts", label: "Hosts", to: "/admin/fleet/hosts" },
   { id: "storage", label: "Storage", to: "/admin/fleet/storage" },
   { id: "jobs", label: "Jobs", to: "/admin/fleet/jobs" },
+  { id: "releases", label: "Releases", to: "/admin/fleet/releases" },
 ];
 
 export const LIBRARY_TABS: SectionTab[] = [

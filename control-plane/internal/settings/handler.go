@@ -86,6 +86,11 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		// Pointer to a slice: an explicit [] means "clear the list", which a
 		// plain []string could not tell apart from absence.
 		AllowedOrigins *[]string `json:"allowed_origins"`
+		// Platform-release channel + edge branch (control-api.md §Platform
+		// releases). Neither triggers detection: they change what the next
+		// read SELECTS, and "check now" stays the jobs run-now action.
+		ReleaseChannel    *string `json:"release_channel"`
+		ReleaseEdgeBranch *string `json:"release_edge_branch"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -118,6 +123,16 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 			"image_update_policy must be manual, notify, or auto")
 		return
 	}
+	if req.ReleaseChannel != nil && !ValidReleaseChannel(*req.ReleaseChannel) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,
+			"release_channel must be stable or edge")
+		return
+	}
+	if req.ReleaseEdgeBranch != nil && !ValidReleaseEdgeBranch(*req.ReleaseEdgeBranch) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,
+			"release_edge_branch must be a git ref name: 1-255 characters, no whitespace, no \"..\", no leading \"-\"")
+		return
+	}
 	// The allow-list stores the canonical form the socket later compares
 	// against, never the raw text — "what an admin saved" and "what /v1/signal
 	// enforces" cannot diverge. "*" and malformed entries are refused.
@@ -129,6 +144,8 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		LibraryDiscoveryAppDetailsEnabled: req.LibraryDiscoveryAppDetailsEnabled,
 		MicCaptureEnabled:                 req.MicCaptureEnabled,
 		ImageUpdatePolicy:                 req.ImageUpdatePolicy,
+		ReleaseChannel:                    req.ReleaseChannel,
+		ReleaseEdgeBranch:                 req.ReleaseEdgeBranch,
 	}
 	if req.AllowedOrigins != nil {
 		normalized, err := origins.ValidateList(*req.AllowedOrigins)

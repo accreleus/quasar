@@ -2,10 +2,16 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/accreleus/quasar/control-plane/internal/auth"
 )
 
 // nonexistentHostID is a well-formed UUID that no seeded host uses.
@@ -37,6 +43,19 @@ func newCoord(t *testing.T, pool *pgxpool.Pool) (*Store, *Coordinator, *fakeDisp
 	store := NewStore(pool)
 	disp := newFakeDispatcher(true)
 	return store, newTestCoordinator(t, store, disp, testLogger()), disp
+}
+
+// fakeAgents is the AgentConnectivity seam with a fixed answer.
+type fakeAgents bool
+
+func (f fakeAgents) IsConnected(string) bool { return bool(f) }
+
+func newCoordWithAgents(t *testing.T, pool *pgxpool.Pool, connected bool) (*Store, *Coordinator) {
+	t.Helper()
+	store := NewStore(pool)
+	coord := newTestCoordinator(t, store, newFakeDispatcher(true), testLogger(),
+		WithAgentConnectivity(fakeAgents(connected)))
+	return store, coord
 }
 
 // TestDrainOnlineHostGraceful: online → draining, sessions untouched (graceful).
@@ -194,7 +213,8 @@ func TestDrainNotFound(t *testing.T) {
 	}
 }
 
-// TestUncordonDrainingHost: draining → online.
+// TestUncordonDrainingHost: draining → online with no connectivity seam wired
+// (the seam is optional; unwired trusts the status column).
 func TestUncordonDrainingHost(t *testing.T) {
 	pool := testDB(t)
 	_, coord, _ := newCoord(t, pool)
@@ -240,5 +260,101 @@ func TestUncordonOfflineConflict(t *testing.T) {
 
 	if _, err := coord.UncordonHost(ctx, s.hostID); !errors.Is(err, ErrHostNotResumable) {
 		t.Fatalf("uncordon offline host: got %v want ErrHostNotResumable", err)
+	}
+	// The connectivity seam does not soften the offline conflict, even claiming
+	// the agent is connected.
+	_, wired := newCoordWithAgents(t, pool, true)
+	if _, err := wired.UncordonHost(ctx, s.hostID); !errors.Is(err, ErrHostNotResumable) {
+		t.Fatalf("uncordon offline host (agent connected): got %v want ErrHostNotResumable", err)
+	}
+	if st := hostStatus(t, pool, s.hostID); st != "offline" {
+		t.Fatalf("status after refused uncordon: got %q want offline", st)
+	}
+}
+
+// TestUncordonDrainingAgentConnected: the live check passes ⇒ draining → online.
+func TestUncordonDrainingAgentConnected(t *testing.T) {
+	pool := testDB(t)
+	_, coord := newCoordWithAgents(t, pool, true)
+	s := seed(t, pool, 4)
+	ctx := context.Background()
+
+	setHostStatusRaw(t, pool, s.hostID, "draining")
+	h, err := coord.UncordonHost(ctx, s.hostID)
+	if err != nil {
+		t.Fatalf("uncordon: %v", err)
+	}
+	if h.Status != "online" || hostStatus(t, pool, s.hostID) != "online" {
+		t.Fatalf("status: got %q/%q want online", h.Status, hostStatus(t, pool, s.hostID))
+	}
+}
+
+// TestUncordonDrainingAgentDisconnected (#11): the cordon lifts but the host is
+// not schedulable, so the row goes offline rather than online.
+func TestUncordonDrainingAgentDisconnected(t *testing.T) {
+	pool := testDB(t)
+	store, coord := newCoordWithAgents(t, pool, false)
+	s := seed(t, pool, 4)
+	ctx := context.Background()
+
+	setHostStatusRaw(t, pool, s.hostID, "draining")
+	h, err := coord.UncordonHost(ctx, s.hostID)
+	if err != nil {
+		t.Fatalf("uncordon: %v", err)
+	}
+	if h.Status != "offline" || hostStatus(t, pool, s.hostID) != "offline" {
+		t.Fatalf("status: got %q/%q want offline", h.Status, hostStatus(t, pool, s.hostID))
+	}
+	// The whole point: the scheduler must not pick it up.
+	if _, err := store.ScheduleAndCreate(ctx, launchParams(s)); !errors.Is(err, ErrNoHostAvailable) {
+		t.Fatalf("launch after uncordon with no agent: got %v want ErrNoHostAvailable", err)
+	}
+}
+
+// TestUncordonHTTPAgentDisconnected: the 200 body carries the offline status, so
+// an admin sees what the uncordon actually produced.
+func TestUncordonHTTPAgentDisconnected(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	authSvc, err := auth.NewService(pool, auth.DefaultParams(), time.Hour)
+	if err != nil {
+		t.Fatalf("auth service: %v", err)
+	}
+	store, coord := newCoordWithAgents(t, pool, false)
+
+	mux := http.NewServeMux()
+	authHandler := auth.NewHandler(authSvc)
+	authHandler.Register(mux)
+	NewHandler(coord, store).Register(mux, authHandler.RequireAuth, authHandler.RequireAdmin)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	if _, err := authSvc.Register(ctx, "drainadmin@test.local", "drainadmin", "unrelated-pw-16"); err != nil {
+		t.Fatalf("register admin: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE users SET role='admin' WHERE email='drainadmin@test.local'`); err != nil {
+		t.Fatalf("promote admin: %v", err)
+	}
+	tok := loginTok(t, authSvc, "drainadmin@test.local", "unrelated-pw-16")
+
+	s := seed(t, pool, 4)
+	setHostStatusRaw(t, pool, s.hostID, "draining")
+
+	resp := doJSON(t, http.MethodPost, srv.URL+"/v1/hosts/"+s.hostID+"/uncordon", tok, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST uncordon: got %d want 200 (code=%s)", resp.StatusCode, errCode(t, resp))
+	}
+	defer resp.Body.Close()
+	var body struct {
+		Host struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
+		} `json:"host"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode host body: %v", err)
+	}
+	if body.Host.ID != s.hostID || body.Host.Status != "offline" {
+		t.Fatalf("host body: got %+v want id=%s status=offline", body.Host, s.hostID)
 	}
 }

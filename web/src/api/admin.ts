@@ -32,10 +32,21 @@ import type {
   SecretResponse,
   SecretsResponse,
   SettingsResponse,
+  PlatformApplyAttemptEnvelope,
+  PlatformApplyAttemptsResponse,
+  PlatformApplyRequest,
+  PlatformApplyRunEnvelope,
+  PlatformApplyRunsResponse,
+  PlatformIdentity,
+  PlatformReleaseView,
+  ReleaseChannel,
   RegistrationMode,
   StorageProvider,
   InvitesResponse,
   MintInviteResponse,
+  HostEnrollmentsResponse,
+  MintHostEnrollmentResponse,
+  AccessCheck,
   RuntimePresetEnvelope,
   RuntimePresetsResponse,
   RuntimePresetWrite,
@@ -153,6 +164,10 @@ export function updateSettings(
     mic_capture_enabled?: boolean;
     /** `QUASAR_ALLOWED_ORIGINS` overrides this when set. */
     allowed_origins?: string[];
+    release_channel?: ReleaseChannel;
+    /** Rejected with 400 unless it is a git ref name: 1-255 characters, no
+     *  whitespace, no "..", no leading "-". */
+    release_edge_branch?: string;
   },
 ): Promise<SettingsResponse> {
   return apiFetch<SettingsResponse>("/admin/settings", {
@@ -208,6 +223,45 @@ export function mintInvite(
 
 export function revokeInvite(token: string, id: string): Promise<void> {
   return apiFetch<void>(`/admin/invites/${id}`, { method: "DELETE", token });
+}
+
+// ── Host enrollment tokens (#12/#96) ─────────────────────────────────────────
+// Per-host, hashed, single-use by default, one-hour expiry. Same custody model
+// as invites: the plaintext is returned exactly once by mint and never again.
+
+/** Never returns the plaintext token. */
+export function listHostEnrollments(
+  token: string,
+  opts: { state?: InviteState } = {},
+): Promise<HostEnrollmentsResponse> {
+  return apiFetch<HostEnrollmentsResponse>(
+    `/admin/hosts/enrollments${queryString({ state: opts.state })}`,
+    { token },
+  );
+}
+
+/** `{}` mints a single-use, one-hour, any-node token. `node_name` binds it to
+ *  exactly one host. */
+export function mintHostEnrollment(
+  token: string,
+  req: { node_name?: string; max_uses?: number; expires_at?: string | null; note?: string } = {},
+): Promise<MintHostEnrollmentResponse> {
+  return apiFetch<MintHostEnrollmentResponse>("/admin/hosts/enrollments", {
+    method: "POST",
+    body: req,
+    token,
+  });
+}
+
+export function revokeHostEnrollment(token: string, id: string): Promise<void> {
+  return apiFetch<void>(`/admin/hosts/enrollments/${id}`, { method: "DELETE", token });
+}
+
+/** This request's reachability. The enroll-host flow reads the certificate
+ *  fingerprint from here, so the value it pins is the one THIS browser session
+ *  was served — and tells the operator to compare it against the startup log. */
+export function accessCheck(token: string): Promise<AccessCheck> {
+  return apiFetch<AccessCheck>("/admin/access-check", { token });
 }
 
 // ── App catalog (P2-08) ───────────────────────────────────────────────────────
@@ -842,6 +896,115 @@ export function runJobNow(
   return apiFetch<JobRunNowAccepted>(`/admin/jobs/${jobId}/run`, {
     method: "POST",
     body: req,
+    token,
+  });
+}
+
+/** The whole admin Releases page in one read. READ ONLY — it never triggers
+ *  detection; "Check now" is runJobNow("platform.release_detect"). */
+export function getPlatformReleases(
+  token: string,
+  signal?: AbortSignal,
+): Promise<PlatformReleaseView> {
+  return apiFetch<PlatformReleaseView>("/admin/platform/releases", { token, signal });
+}
+
+/** Apply one release to one host. 202 with the attempt; the work is
+ *  asynchronous and watched through active_apply on the release view. */
+export function applyPlatformReleaseToHost(
+  token: string,
+  hostId: string,
+  req: { release_id: string; force?: boolean },
+): Promise<PlatformApplyAttemptEnvelope> {
+  return apiFetch<PlatformApplyAttemptEnvelope>(`/admin/platform/hosts/${hostId}/apply`, {
+    method: "POST",
+    body: req,
+    token,
+  });
+}
+
+/** Put one host back on the digests recorded as previous on its last succeeded
+ *  attempt. A revert is an apply with an older digest set; the control plane is
+ *  never revertible (ADR 0002). */
+export function revertPlatformHost(
+  token: string,
+  hostId: string,
+  req: { force?: boolean } = {},
+): Promise<PlatformApplyAttemptEnvelope> {
+  return apiFetch<PlatformApplyAttemptEnvelope>(`/admin/platform/hosts/${hostId}/revert`, {
+    method: "POST",
+    body: req,
+    token,
+  });
+}
+
+/** Apply history, newest first, control-plane attempts included. */
+export function listPlatformAttempts(
+  token: string,
+  opts: { hostId?: string; limit?: number } = {},
+  signal?: AbortSignal,
+): Promise<PlatformApplyAttemptsResponse> {
+  const query = queryString({ host_id: opts.hostId, limit: opts.limit });
+  return apiFetch<PlatformApplyAttemptsResponse>(`/admin/platform/attempts${query}`, {
+    token,
+    signal,
+  });
+}
+
+/** What the booted control-plane binary reports it is running. */
+export function getPlatformIdentity(
+  token: string,
+  signal?: AbortSignal,
+): Promise<{ identity: PlatformIdentity }> {
+  return apiFetch<{ identity: PlatformIdentity }>("/admin/platform/identity", { token, signal });
+}
+
+/** Fleet apply: the control plane first, then every eligible host, in sequence.
+ *  202 with the run; the work is asynchronous and watched through the run
+ *  endpoints or active_apply on the release view. */
+export function applyPlatformReleaseToFleet(
+  token: string,
+  req: PlatformApplyRequest,
+): Promise<PlatformApplyRunEnvelope> {
+  return apiFetch<PlatformApplyRunEnvelope>("/admin/platform/apply", {
+    method: "POST",
+    body: req,
+    token,
+  });
+}
+
+/** Fleet runs, newest first. At most one is active. */
+export function listPlatformApplyRuns(
+  token: string,
+  opts: { limit?: number } = {},
+  signal?: AbortSignal,
+): Promise<PlatformApplyRunsResponse> {
+  const query = queryString({ limit: opts.limit });
+  return apiFetch<PlatformApplyRunsResponse>(`/admin/platform/apply/runs${query}`, {
+    token,
+    signal,
+  });
+}
+
+export function getPlatformApplyRun(
+  token: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<PlatformApplyRunEnvelope> {
+  return apiFetch<PlatformApplyRunEnvelope>(`/admin/platform/apply/runs/${runId}`, {
+    token,
+    signal,
+  });
+}
+
+/** Sets the run's cancel flag: it stops before the next target and never
+ *  interrupts an in-flight attempt (control-api.md §"Platform-release apply"). */
+export function cancelPlatformApplyRun(
+  token: string,
+  runId: string,
+): Promise<PlatformApplyRunEnvelope> {
+  return apiFetch<PlatformApplyRunEnvelope>(`/admin/platform/apply/runs/${runId}/cancel`, {
+    method: "POST",
     token,
   });
 }

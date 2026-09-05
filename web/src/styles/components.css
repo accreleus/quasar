@@ -43,6 +43,30 @@
   background: var(--ink-3);
 }
 
+/* Readiness groups (#102): an eyebrow per area, and the not-applicable checks
+   behind a closed disclosure so they never crowd the first screen. */
+.readiness-group .eyebrow {
+  margin-bottom: var(--s2);
+}
+.readiness-more {
+  margin-top: var(--s4);
+}
+.readiness-more > summary {
+  cursor: pointer;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+  list-style: none;
+}
+.readiness-more > summary::-webkit-details-marker {
+  display: none;
+}
+.readiness-more > summary::before {
+  content: "▸ ";
+}
+.readiness-more[open] > summary::before {
+  content: "▾ ";
+}
+
 /* Readiness checks as tiles (ReadinessCard layout="grid"): auto-fill so the
    column count follows the viewport, never a fixed sidebar. */
 .readiness-grid {

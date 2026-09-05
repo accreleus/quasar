@@ -43,6 +43,13 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.control
+      args:
+        # Build identity (#107). deploy/redeploy.sh exports these from the ref it
+        # deployed; a bare `docker compose build` leaves them empty and the
+        # control plane honestly reports version "dev" with a null commit.
+        SOURCE_COMMIT: ${SOURCE_COMMIT:-unknown}
+        BUILT_AT: ${BUILT_AT:-unknown}
+        QUASAR_VERSION: ${QUASAR_VERSION:-}
     volumes:
       # Pre-build with: cd web && npm install && npm run build
       - ../web/dist:/app/web:ro

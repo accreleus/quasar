@@ -61,6 +61,11 @@ curl http://127.0.0.1:9091/health
 - Does `ENROLLMENT_TOKEN` match the control plane's?
 - Is the control plane's HTTP port reachable? Enrollment uses plain HTTP on 8080
   and is exempt from the HTTPS redirect for that reason.
+- Did you paste the one-value `QUASAR_ENROLLMENT` string from Admin, Fleet,
+  Enroll host instead of setting the two above by hand? It supplies a `wss://`
+  address that the agent pins to the certificate fingerprint inside it. A
+  `ws://` address to any host but localhost is refused unless
+  `QUASAR_ALLOW_PLAINTEXT_AGENT=1`.
 
 If the agent previously enrolled and now cannot, its stored node secret may be
 gone. Enrollment then needs the token again, and the token has to still be valid.
@@ -161,6 +166,77 @@ docker compose -f deploy/docker-compose.yml restart quasar-control-plane
 ```
 
 `redeploy.sh` checks for this and warns.
+
+## The Releases tab says a target cannot be updated from here
+
+Two causes account for nearly all of them, and the page prints the recipe for the
+one you have under the Targets table.
+
+**Built from source on the host.** The published image is a different build from
+one compiled on the machine, so it cannot replace it in place. Update it the way
+it was installed:
+
+```bash
+deploy/redeploy.sh <va|nvidia> <ref>
+```
+
+**No updater is installed beside this host's stack.** Nothing on the host can
+recreate its own containers. Add the service once, then update from the console
+or by hand:
+
+```bash
+echo "QUASAR_STACK_DIR=$(cd deploy && pwd)" >> deploy/.env
+echo "QUASAR_UPDATER_IMAGE=ghcr.io/accreleus/quasar/quasar-updater:latest" >> deploy/.env
+docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-updater
+```
+
+Restart the agent afterwards: it reads updater presence once, at boot.
+
+A third, on an older install: **this target has not reported what it is running.**
+That agent predates build identity. Upgrade it once by hand and it will report
+like any other. See [Updating Quasar](/quasar/admin/releases/#targets).
+
+## An apply failed with `namespace_rejected`
+
+The updater refused the image before pulling a byte of it, because it is outside
+the registry namespaces that host will accept. That allowlist is
+`QUASAR_UPDATER_ALLOWED_NAMESPACES` in the host's `deploy/.env`, and it defaults
+to the project's own namespace.
+
+You see this after repointing an instance at a fork's registry without widening
+the allowlist on each host, or after narrowing it deliberately. Set it to the
+namespace the release's images actually live in and recreate the updater. It is
+matched on path segment boundaries, so a namespace never admits a lookalike that
+merely starts with the same characters.
+
+## The control plane is unhealthy after an update
+
+Check its logs first. If it reports that it cannot write its TLS key —
+
+```
+fatal: tls: write TLS key /var/lib/quasar-control/tls/key.pem: permission denied
+```
+
+— this stack was built from source at some point, and its `quasar-control-tls`
+volume is owned by root while the published image runs as uid 1000. Nothing is
+damaged. [Upgrading](/quasar/operations/upgrading/#if-your-install-ever-ran-a-source-build)
+has the one-time fix.
+
+Avoid the mixed case entirely: use the console's update path on installs running
+published images, and `redeploy.sh` on installs built from source. The console
+will not offer an update to a source-built control plane for exactly this reason.
+
+If instead it reports a migration version it does not recognise, an older image
+is running against a newer database — see [the hard
+rule](/quasar/operations/upgrading/#the-hard-rule).
+
+## "Quasar was updated. This page is running the previous build"
+
+The control plane restarted under your open tab, which is now old JavaScript
+talking to a new API. Press Reload in the toast, or refresh. Nothing is wrong,
+and the update itself is unaffected. During the restart the page says the control
+plane is restarting rather than showing an error; that lasts about twenty
+seconds.
 
 ## Still stuck
 

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/access"
+	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
 	"github.com/accreleus/quasar/control-plane/internal/config"
 	"github.com/accreleus/quasar/control-plane/internal/db"
 	"github.com/accreleus/quasar/control-plane/internal/devauth"
@@ -37,7 +38,10 @@ func run() error {
 	}
 
 	log := newLogger(cfg.LogLevel)
-	log.Info("quasar control-plane starting")
+	// Build identity first, before anything can fail: when a boot goes wrong the
+	// first question is always which build is running, and an unstamped binary
+	// says "dev"/"unknown" rather than a version that describes nothing.
+	log.Info("quasar control-plane starting", buildinfo.LogAttrs()...)
 
 	// Configuration that parsed but is probably not what the operator meant.
 	// Emitted here because config.Load runs before a logger exists.

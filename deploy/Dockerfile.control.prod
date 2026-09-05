@@ -33,6 +33,12 @@ WORKDIR /web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
 COPY web/ .
+# vite copies ../deploy/enroll-host.sh into dist so the control plane serves it.
+COPY deploy/enroll-host.sh /deploy/enroll-host.sh
+# The ref this tree is at, baked into the bundle for the enroll-host one-liner
+# (#100); build-images.sh passes it, since the build context carries no .git.
+ARG QUASAR_SOURCE_REF=
+ENV QUASAR_SOURCE_REF=$QUASAR_SOURCE_REF
 RUN npm run build
 
 # ── Go build stage ────────────────────────────────────────────────────────────
@@ -45,9 +51,22 @@ WORKDIR /src
 COPY control-plane/go.mod control-plane/go.sum ./
 RUN go mod download
 COPY control-plane/ .
+
+# Build identity (#107), served by GET /v1/admin/platform/identity and logged at
+# startup. Unset stamps read as "dev" + null, never a stale package version. The
+# build context carries no .git, so these must be passed in — build-images.sh and
+# the images workflow both do.
+ARG QUASAR_VERSION=
+ARG SOURCE_COMMIT=unknown
+ARG BUILT_AT=unknown
+
 # CGO_ENABLED=0 → fully static binary (no libc deps in the runtime image).
+# -s -w stay: -X writes string data, which stripping symbols does not touch.
 RUN CGO_ENABLED=0 GOOS=linux go build \
-    -trimpath -ldflags="-s -w" \
+    -trimpath -ldflags="-s -w \
+      -X github.com/accreleus/quasar/control-plane/internal/buildinfo.version=${QUASAR_VERSION} \
+      -X github.com/accreleus/quasar/control-plane/internal/buildinfo.sourceCommit=${SOURCE_COMMIT} \
+      -X github.com/accreleus/quasar/control-plane/internal/buildinfo.builtAt=${BUILT_AT}" \
     -o /quasar-control ./cmd/quasar-control
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────
@@ -57,6 +76,23 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # never ship in this artifact.
 ARG QUASAR_BASE_IMAGE
 FROM ${QUASAR_BASE_IMAGE}
+
+# Provenance, mirroring the agent image's labels and asserted by
+# deploy/image-contract.json. Re-declared: an ARG does not cross a FROM.
+ARG QUASAR_BASE_IMAGE
+ARG SOURCE_COMMIT=unknown
+ARG BUILT_AT=unknown
+# The highest migration this image's binary embeds. The edge channel reads it off
+# the published image (#111) because a branch build ships no release manifest, and
+# schema_version is the ADR 0002 ordering key. "unknown" makes the build
+# unorderable and it is skipped, never guessed at. build-images.sh and the images
+# workflow both derive it from control-plane/migrations.
+ARG SCHEMA_VERSION=unknown
+LABEL org.quasar.image.role="control" \
+      org.quasar.pins.base="${QUASAR_BASE_IMAGE}" \
+      org.quasar.source.commit="${SOURCE_COMMIT}" \
+      org.quasar.built.at="${BUILT_AT}" \
+      org.quasar.schema.version="${SCHEMA_VERSION}"
 
 COPY --from=builder /quasar-control /usr/local/bin/quasar-control
 COPY --from=web-builder /web/dist /app/web
@@ -80,8 +116,10 @@ RUN mkdir -p /run/quasar && chown quasar:quasar /run/quasar && chmod 0700 /run/q
 # volume root:root 0755 and copies the image's ownership of the mount point onto
 # it, so declaring the directory here is what makes the volume land owned by
 # `quasar`. Without it the non-root process cannot mkdir the `tls` subdirectory
-# and the control plane exits at boot — which only ever bites the published-image
-# path, because compose's build target (Dockerfile.control) runs as root.
+# and the control plane exits at boot. Dockerfile.control declares the same
+# directory under the same uid for the same reason: a volume created by either
+# image has to be usable by the other, or applying a release to a source-built
+# stack crash-loops on it.
 RUN mkdir -p /var/lib/quasar-control && chown quasar:quasar /var/lib/quasar-control
 
 USER quasar

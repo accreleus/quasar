@@ -55,7 +55,14 @@
 # Exit status is 0 only if every post-deploy verification passes. The final
 # line is a machine-readable summary the drift-check (qstack sync) parses:
 #   REDEPLOY env=<> scope=<> ref=<> sha=<short> bundle=<index-hash.js> \
-#            health=<ok|FAIL> catalog=<code> agent=<registered|MISSING> result=<OK|FAIL>
+#            health=<ok|FAIL> catalog=<code> agent=<registered|MISSING> \
+#            readiness=<ok|FAILED|unknown> codecs=<ok|degraded|pending|unknown> \
+#            updater=<ok|FAIL|absent> result=<OK|WARN|FAIL>
+#
+# result=WARN means the deploy mechanically succeeded but the host is degraded
+# (failing readiness checks, a degraded codec plan, or a refused provisioning lock).
+# The exit status stays 0 there — the redeploy did what it was asked — so automation
+# that gates on the exit code is unchanged, while anything reading result= sees it.
 set -euo pipefail
 
 ENV="${1:-}"
@@ -532,6 +539,38 @@ else
   echo "generated a new ENROLLMENT_TOKEN into $ENV_FILE (mode 600)"
 fi
 
+# --- QUASAR_STACK_DIR --------------------------------------------------------
+# The absolute HOST path of the stack directory, which the updater
+# (deploy/docker-compose.yml `quasar-updater`) mounts at that same path. It has
+# to be the host's path, not a container path: the updater rebuilds its compose
+# invocation from its own container's compose labels, and those record host
+# paths. With this unset the updater refuses to serve and logs why.
+#
+# Seeded whenever it is absent (not fresh-install-only): nothing is stored under
+# it, so writing it can strand nothing. An existing value is never overwritten,
+# only flagged when it no longer matches -- which is what a moved checkout looks
+# like.
+QUASAR_STACK_DIR_NOW="$(cd deploy && pwd)"
+if env_file_has_value QUASAR_STACK_DIR; then
+  _cur="$(grep -E '^QUASAR_STACK_DIR=' "$ENV_FILE" | tail -1 | cut -d= -f2-)"
+  if [ "$_cur" != "$QUASAR_STACK_DIR_NOW" ]; then
+    echo "  !! QUASAR_STACK_DIR in $ENV_FILE is $_cur but this deploy runs from"
+    echo "  !! $QUASAR_STACK_DIR_NOW. The updater will not find the compose files."
+    echo "  !! Update it, or remove the line and re-run to have it re-seeded."
+  fi
+else
+  umask 077
+  touch "$ENV_FILE"
+  {
+    echo ""
+    echo "# QUASAR_STACK_DIR -- this stack directory's absolute HOST path, mounted"
+    echo "# into the updater at the same path. Seeded by deploy/redeploy.sh."
+    echo "QUASAR_STACK_DIR=$QUASAR_STACK_DIR_NOW"
+  } >> "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  echo "seeded QUASAR_STACK_DIR=$QUASAR_STACK_DIR_NOW into $ENV_FILE"
+fi
+
 # --- QUASAR_HOME_ROOT (fresh installs only) ----------------------------------
 # NOT a `:?`-required var — compose runs fine without it. It is seeded because
 # its absence silently costs a feature: with no home root the storage provider
@@ -690,8 +729,12 @@ if [ "$SCOPE" = control ]; then
 else
   step "[$ENV] 4/7 build web SPA ($WEB_IMAGE)"
   # web/dist is a bind mount into the control-plane container (see CLAUDE.md #131).
-  docker run --rm -v "$PWD":/w -w /w/web "$WEB_IMAGE" \
-    sh -c "npm install --no-audit && npm run build"
+  # QUASAR_SOURCE_REF: the container cannot see .git (a worktree's .git is a
+  # file), so the ref the bundle bakes in for the enroll-host one-liner (#100)
+  # is resolved here: the exact tag when on one, else the commit.
+  docker run --rm -v "$PWD":/w -w /w/web \
+    -e QUASAR_SOURCE_REF="$(git describe --tags --exact-match 2>/dev/null || git rev-parse HEAD)" \
+    "$WEB_IMAGE" sh -c "npm install --no-audit && npm run build"
   BUNDLE="$(bundle_on_disk)"
   echo "built web bundle: $BUNDLE"
 fi
@@ -713,11 +756,31 @@ if [ "$SCOPE" = all ]; then
   # at 1080p60, which is av1-first there). Both halves of that have since
   # changed: the CUDA plugins are in every image, and the one remaining
   # NVIDIA-only piece (libnvrtc) is fetched at run time.
+  # Build identity (#107). Both args do double duty: the org.quasar.source.commit
+  # / org.quasar.built.at labels deploy/image-contract.json asserts, AND the
+  # stamps node-agent/build.rs bakes into the binary and the agent reports on
+  # `register`. Omitting them is not cosmetic — the host then reads as
+  # identity-unknown in the admin console and is never eligible for a
+  # platform-release apply. The build context carries a .git, but the Docker
+  # build does not see it, so build.rs's `git rev-parse` fallback cannot fire
+  # here: these are the only source.
   # shellcheck disable=SC2086 # NA_BUILD_ARGS is a deliberate word-split arg list
   docker build -f deploy/Dockerfile.vulkan --target "$NA_TARGET" $NA_BUILD_ARGS \
-    --build-arg QUASAR_BASE_IMAGE="$BASE" -t "$NA_IMAGE" .
+    --build-arg QUASAR_BASE_IMAGE="$BASE" \
+    --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" \
+    --build-arg BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    -t "$NA_IMAGE" .
+  # The updater ships in the same source deploy, and a host without it has no
+  # actor for a platform-release apply at all (updater_present=false forever).
+  # Built here rather than through build-images.sh so one `docker build` failure
+  # cannot be mistaken for a contract failure; the image name and the two
+  # provenance args are the same either way.
+  docker build -f deploy/Dockerfile.updater --target runtime \
+    --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" \
+    --build-arg BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    -t quasar-updater:latest .
 else
-  step "[$ENV] 5/7 skip node-agent build (scope=$SCOPE)"
+  step "[$ENV] 5/7 skip node-agent + updater build (scope=$SCOPE)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -732,7 +795,14 @@ step "[$ENV] 6/7 recreate control-plane${SCOPE:+ (scope=$SCOPE)}"
 # scope=control cheap. Do not "optimise" it by folding the control-plane into the
 # vulkan image lineage.
 if [ "$SCOPE" != web ]; then
-  $DC build quasar-control-plane
+  # Build identity (#107): the compose dev overlay forwards these as build args,
+  # so the control plane this deploy produces knows which commit it is and says
+  # so on GET /v1/admin/platform/identity. A source deploy has no version tag
+  # unless HEAD sits on one, and reports "dev" when it does not.
+  SOURCE_COMMIT="$(git rev-parse HEAD)" \
+  BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  QUASAR_VERSION="$(git describe --tags --exact-match 2>/dev/null || true)" \
+    $DC build quasar-control-plane
 fi
 # Three separate ups, each force-recreate confined to its named service with
 # --no-deps (#453): on Compose v5, `up --force-recreate <svc>` recreates the
@@ -755,12 +825,47 @@ fi
 # seconds before it would have succeeded (#467, caught by the first-run
 # acceptance loop). An already-initialized postgres passes this in
 # milliseconds, which is why Tower/hermes never saw it.
+# One-time volume ownership repair, for stacks that predate the two control
+# images agreeing on a uid. A named volume takes its ownership from whichever
+# image created it: a stack built from source used to run as ROOT, so
+# quasar-control-tls is root-owned there, and the first apply of a published
+# release (uid 1000) crash-looped for 15 minutes on "write TLS key
+# /var/lib/quasar-control/tls/key.pem: permission denied" — a started-then-failed
+# container, so the updater correctly reported `unhealthy` and did NOT restore.
+#
+# Idempotent and cheap: a chown of an already-correct tree changes nothing, and
+# the volume holds a key pair and an artwork cache, never anything the numbers
+# have to be preserved for. Skipped when the volume does not exist yet, since
+# compose is about to create it from an image that already owns it correctly.
+# The name is derived from the compose project — never hardcoded `deploy_`,
+# which is only right when nothing set COMPOSE_PROJECT_NAME.
+if [ "$SCOPE" != web ]; then
+  CTRL_VOLUME_NAME="${ADOPT_CTRL_VOL:-${COMPOSE_PROJECT}_quasar-control-tls}"
+  if docker volume inspect "$CTRL_VOLUME_NAME" >/dev/null 2>&1; then
+    if docker run --rm -v "$CTRL_VOLUME_NAME":/t alpine \
+         chown -R 1000:1000 /t >/dev/null 2>&1; then
+      echo "control-plane TLS volume $CTRL_VOLUME_NAME owned by 1000:1000 (both control images run as uid 1000)"
+    else
+      echo "  WARN: could not chown $CTRL_VOLUME_NAME to 1000:1000. If the control plane"
+      echo "        fails to boot with 'create TLS dir ... permission denied', run:"
+      echo "        docker run --rm -v $CTRL_VOLUME_NAME:/t alpine chown -R 1000:1000 /t"
+    fi
+  fi
+fi
+
 $DC up -d --wait --wait-timeout 120 quasar-postgres
 # --wait on the control-plane: healthy means /health answers, which means the
 # migration run COMPLETED — nothing below may touch the stack before that.
 # 300s: a virgin database runs the full migration chain on first boot.
 $DC up -d --force-recreate --no-deps --wait --wait-timeout 300 quasar-control-plane
 if [ "$SCOPE" = all ]; then
+  # THE UPDATER GOES UP BEFORE THE AGENT. The agent discovers updater presence
+  # once, at boot, by looking for the `quasar-updater` service in its own compose
+  # project (buildinfo.rs); started after it, the agent registers
+  # updater_present=false and stays that way until something recreates it. No
+  # --wait: the updater declares no healthcheck, so compose would only wait for
+  # `running`, which step 7/7's socket probe asserts far more usefully.
+  $DC up -d --force-recreate --no-deps quasar-updater
   # Recreate the node-agent from the freshly-built, self-contained Vulkan image.
   # `up -d` can return while a dependency-health wait has left the recreated
   # agent in Docker's Created state (observed repeatedly on Tower). `--wait`
@@ -834,6 +939,46 @@ else
   fi
 fi
 
+# The updater must be able to see the stack it sits beside, or a platform-release
+# apply has an actor that will refuse every request. The probe runs INSIDE the
+# updater container: it is the only one guaranteed to have a client that speaks a
+# unix socket (the control-plane image ships curl or wget depending on which
+# Dockerfile built it, and busybox wget cannot do it at all).
+#
+# Discovery being right is the whole check. A `working_dir` that is not
+# QUASAR_STACK_DIR means the compose labels and the bind mount disagree, which is
+# exactly the state in which every apply fails with a file-not-found the operator
+# would have to read compose labels to explain.
+updater=absent
+if [ -n "$($DC ps -q quasar-updater 2>/dev/null || true)" ]; then
+  self_json="$($DC exec -T quasar-updater curl -sf --max-time 10 \
+      --unix-socket /run/quasar-updater/updater.sock http://u/v1/self 2>/dev/null || true)"
+  # No jq on every fleet host; the value is a JSON string with no escapes.
+  self_wd="$(printf '%s' "$self_json" | sed -n 's/.*"working_dir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  want_wd="$(cd deploy && pwd)"
+  if [ -z "$self_json" ]; then
+    echo "  FAIL: the updater is running but does not answer on its socket —"
+    echo "        check 'docker compose logs quasar-updater' (it fails closed when it"
+    echo "        cannot discover its own compose project)"
+    updater=FAIL
+    fail=1
+  elif [ "$self_wd" != "$want_wd" ]; then
+    echo "  FAIL: the updater discovered working_dir '$self_wd' but this stack is at"
+    echo "        '$want_wd' — set QUASAR_STACK_DIR=$want_wd in $ENV_FILE and redeploy"
+    updater=FAIL
+    fail=1
+  else
+    updater=ok
+    echo "  ok: updater reachable, stack dir $self_wd"
+  fi
+elif [ "$SCOPE" = all ]; then
+  echo "  FAIL: no quasar-updater container after a scope=all deploy"
+  updater=FAIL
+  fail=1
+else
+  echo "  note: no updater container (scope=$SCOPE does not create one) — probe skipped"
+fi
+
 # Catalog endpoint proves the control-plane binary is current: 401 = route
 # exists (auth required); 404/200-SPA-fallback = old binary without it.
 # NB: no -f here — we WANT the 401 status, and curl -f would exit non-zero on it.
@@ -903,7 +1048,105 @@ else
   fail=1
 fi
 
-result=OK; [ "$fail" -eq 0 ] || result=FAIL
+# The agent can be running, registered and healthy while the HOST is unusable for
+# streaming: a provision that died mid-flight leaves no Vulkan encode and failing
+# readiness checks behind it, and #66 was diagnosed on a deploy where this script
+# printed a confident result=OK through exactly that for 90 minutes. Read the agent's
+# own verdict rather than inferring one from liveness.
+readiness=unknown
+codecs=unknown
+agent_log="$($DC logs --tail 400 quasar-node-agent 2>/dev/null || true)"
+if [ -n "$agent_log" ]; then
+  readiness=ok
+  codecs=ok
+  # Classify the LAST readiness verdict in the log, never the first. The #98 boot race
+  # exits on purpose and heals on the retry, and a restart-policy restart keeps the same
+  # container's log, so a healed host still carries the failing line from the boot before.
+  # Token contract: node-agent/src/{readiness,agent}.rs.
+  readiness_line="$(printf '%s' "$agent_log" |
+    grep -E 'boot-render-node-missing|boot-render-node-retry-deferred|boot-render-node-retries-spent|boot-render-node-unopenable|boot-dri-modes-stale-cdi|boot-host-render-node-missing|readiness-checks-failed|host readiness: all checks passed or skipped' |
+    tail -1 || true)"
+  case "$readiness_line" in
+  *boot-render-node-missing*)
+    readiness=RETRYING
+    echo "  FAIL: the node-agent is exiting on purpose because it cannot see a /dev/dri render"
+    echo "        node the host kernel HAS (#98). A device list is fixed at container creation,"
+    echo "        so the restart policy re-creating it is the fix, and it normally settles on"
+    echo "        the next boot. If it does not, /dev/dri is not reaching the agent at all:"
+    echo "        check the node-agent service's devices:/gpus: entry, then recreate."
+    fail=1
+    ;;
+  *boot-render-node-retry-deferred*)
+    # Transient by construction: the agent held the retry back only because a provision was
+    # writing a shared volume, and it takes it on the next boot.
+    readiness=RETRYING
+    echo "  WARN: the node-agent cannot see a /dev/dri render node yet and is holding its"
+    echo "        restart back until a driver/CUDA provision finishes (#66/#98). It retries on"
+    echo "        the next agent start; re-check once the provision completes:"
+    echo "          $DC logs quasar-node-agent | grep gpu-host-sanity"
+    degraded=1
+    ;;
+  *boot-dri-modes-stale-cdi*)
+    readiness=FAILED
+    echo "  FAIL: the /dev/dri nodes inside the agent container cannot be opened by the app"
+    echo "        user — the boot-time CDI spec baked the wrong modes, and no restart can fix"
+    echo "        it (CDI edits are applied when a container is created). On the HOST:"
+    echo "          sudo nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml"
+    echo "          $DC up -d --force-recreate"
+    fail=1
+    ;;
+  *boot-render-node-unopenable*)
+    readiness=FAILED
+    echo "  FAIL: a /dev/dri render node IS in the agent container but cannot be opened —"
+    echo "        a mode/group/device-cgroup fault, which a restart reproduces exactly."
+    echo "        Check the nodes on the HOST ('ls -l /dev/dri') and the node-agent service's"
+    echo "        devices:/device_cgroup_rules: entries, then recreate the containers."
+    fail=1
+    ;;
+  *boot-render-node-retries-spent* | *boot-host-render-node-missing*)
+    readiness=FAILED
+    echo "  FAIL: the node-agent reports a boot sanity failure that no restart can fix:"
+    printf '%s' "$readiness_line" | sed 's/^/        /'
+    echo "        $DC logs quasar-node-agent | grep gpu-host-sanity"
+    fail=1
+    ;;
+  *readiness-checks-failed*)
+    readiness=FAILED
+    echo "  WARN: the node-agent reports FAILING host readiness checks:"
+    printf '%s' "$readiness_line" | sed 's/^/        /'
+    echo "        Admin -> Hosts -> this host lists them with remediation."
+    degraded=1
+    ;;
+  esac
+  # A codec plan that is merely waiting on the driver volume is the expected first-boot
+  # state and self-clears on the agent's restart; only a genuinely degraded plan counts.
+  if printf '%s' "$agent_log" | grep -q 'vulkan-codec-plan-degraded'; then
+    codecs=degraded
+    echo "  WARN: the vulkan codec plan is DEGRADED — at least one enabled codec is not"
+    echo "        on the Vulkan encoder. Sessions still run (per-codec vendor fallback),"
+    echo "        but this host is not serving what it advertises."
+    degraded=1
+  elif printf '%s' "$agent_log" | grep -q 'vulkan-codec-plan-pending-driver-volume'; then
+    codecs=pending
+    echo "  note: codec plan pending the NVIDIA driver volume (expected on a first boot);"
+    echo "        the agent re-probes after it self-restarts."
+  fi
+  # A provision that was killed mid-write strands its lockfile, and every later attempt
+  # refuses until the takeover window passes. That is the #66 failure in one line.
+  if printf '%s' "$agent_log" | grep -q 'already provisioning this artifact'; then
+    echo "  WARN: a provisioning lock is being refused — a previous agent may have died"
+    echo "        mid-provision. The holder is taken over once its lockfile goes untouched;"
+    echo "        if nothing is actually downloading, remove the stale .provision.lock in"
+    echo "        the driver volume to reclaim it now."
+    degraded=1
+  fi
+else
+  echo "  note: could not read node-agent logs; readiness and codec plan not verified"
+fi
+
+result=OK
+[ "${degraded:-0}" -eq 0 ] || result=WARN
+[ "$fail" -eq 0 ] || result=FAIL
 echo
-echo "REDEPLOY env=$ENV scope=$SCOPE ref=$REF sha=$SHA bundle=$BUNDLE health=$health catalog=$catalog agent=$agent result=$result"
+echo "REDEPLOY env=$ENV scope=$SCOPE ref=$REF sha=$SHA bundle=$BUNDLE health=$health catalog=$catalog agent=$agent readiness=$readiness codecs=$codecs updater=$updater result=$result"
 exit "$fail"

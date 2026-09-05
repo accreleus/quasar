@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
 use crate::capacity;
@@ -24,6 +24,7 @@ use crate::images::ImageManager;
 use crate::messages::{
     AgentMsg, AppSpec, Auth, CodecThroughput, ControlMsg, StreamSpec, VideoTopology,
 };
+use crate::release::ReleaseManager;
 use crate::session::capture::{self, CaptureRequest, CaptureSlot};
 use crate::session::console_hotplug::ConsoleHotplugWatcher;
 use crate::session::container::{ContainerRuntime, ContainerSpec};
@@ -120,6 +121,10 @@ const ENROLLMENT_UNCONFIGURED_EXIT_DELAY: Duration = Duration::from_secs(5);
 
 /// Run the agent forever, reconnecting with exponential backoff on failure.
 pub async fn run(cfg: Config) {
+    // #12: precedence decisions the transport resolver made before tracing existed.
+    for w in &cfg.startup_warnings {
+        warn!(token = "cp-transport-precedence", "{w}");
+    }
     // #519: no persisted node_secret and no ENROLLMENT_TOKEN can never succeed, so
     // exit rather than retry forever. Checked before any other startup work.
     if let Err(msg) = enrollment_reachable(&cfg) {
@@ -143,6 +148,22 @@ pub async fn run(cfg: Config) {
     if swept > 0 {
         info!("startup sweep removed {swept} orphaned container(s) from a prior run");
     }
+
+    // Install mode + updater presence, for the startup identity banner;
+    // `connect_and_run` re-discovers before every register. Failure is
+    // silent-by-design — the fields go absent and the host reads as
+    // identity-unknown (agent-api.md §register).
+    let runtime = {
+        let (runtime, facts) = offload_probe(move || {
+            let facts =
+                crate::buildinfo::discover_install(&crate::buildinfo::DockerFacts::new(&runtime));
+            (runtime, facts)
+        })
+        .await;
+        crate::buildinfo::set_install_facts(facts.clone());
+        crate::buildinfo::log_startup_identity(&facts);
+        runtime
+    };
 
     // #500 throwaway-home sweep. Only ever removes `agent-<8hex>-<8hex>` homes
     // (the ephemeral-username shape) that no live container mounts and that are
@@ -205,6 +226,10 @@ pub async fn run(cfg: Config) {
         }
     };
 
+    // One ReleaseManager per process, for the same reason the ImageManager is:
+    // a poller outlives a disconnect, and normally outlives the process itself.
+    let release_mgr = ReleaseManager::from_env();
+
     // Materialise a missing NVIDIA graphics userspace into the driver volume. The
     // trigger is the readiness check set itself, so what provisions and what the
     // admin card shows can never disagree.
@@ -218,7 +243,15 @@ pub async fn run(cfg: Config) {
 
     let mut backoff = Duration::from_secs(1);
     loop {
-        match connect_and_run(&cfg, &health, &nvidia_lib32_probed, &image_mgr).await {
+        match connect_and_run(
+            &cfg,
+            &health,
+            &nvidia_lib32_probed,
+            &image_mgr,
+            &release_mgr,
+        )
+        .await
+        {
             Ok(()) => {
                 // clean shutdown (shouldn't happen in normal operation)
                 info!("agent exiting cleanly");
@@ -253,6 +286,15 @@ pub async fn run(cfg: Config) {
 /// Grace between "provisioned" and the self-restart, so the final log lines and
 /// one more capacity report reach the control plane before the process goes.
 const NVIDIA_VOLUME_RESTART_GRACE: Duration = Duration::from_secs(10);
+
+/// How long a self-restart waits for OTHER provisions to finish before giving up and
+/// leaving the restart to the next agent start (#66).
+///
+/// Sized for the slow case this exists to protect: a 441 MB driver installer downloading
+/// and extracting on a domestic link. Overshooting costs only a delayed restart of an
+/// agent that is already serving; undershooting kills a live provision, which is the
+/// defect itself.
+pub const PROVISION_QUIESCENCE_WAIT: Duration = Duration::from_secs(30 * 60);
 
 /// Kick off driver-volume auto-provisioning only when the readiness probe reports a
 /// real NVIDIA graphics gap.
@@ -342,6 +384,21 @@ fn spawn_cuda_runtime_provisioner(runtime: &ContainerRuntime) {
                  in place. The container restart policy brings the agent straight back."
             );
             std::thread::sleep(NVIDIA_VOLUME_RESTART_GRACE);
+            // #66: the driver-volume provisioner runs on its own thread and may still be
+            // extracting a 441 MB installer. NVRTC is the smaller fetch and routinely wins
+            // that race, so exiting on this thread's own schedule killed the extraction
+            // mid-write and stranded its lockfile. Wait for the volume to go quiescent.
+            if !crate::artifact::wait_for_quiescence(PROVISION_QUIESCENCE_WAIT) {
+                warn!(
+                    token = "cudart-agent-restart-deferred",
+                    waited_s = PROVISION_QUIESCENCE_WAIT.as_secs(),
+                    in_flight = crate::artifact::provisioning_in_flight(),
+                    "another provision is still in flight — NOT restarting; cudaconvert & co \
+                     will register on the next agent start instead. Killing a live provision \
+                     is worse than deferring the elements."
+                );
+                return;
+            }
             warn!(
                 token = "cudart-agent-restart-now",
                 "restarting node agent now"
@@ -355,6 +412,198 @@ fn spawn_cuda_runtime_provisioner(runtime: &ContainerRuntime) {
                 "could not spawn the CUDA-userspace provisioner thread: {e}"
             )
         });
+}
+
+// ── boot-time sanity gate (#98) ──────────────────────────────────────────────
+
+/// Delay before a boot-fault exit. Short: the restart policy's own backoff is what paces the
+/// retries, this only buys the log lines a moment to be shipped.
+const BOOT_SANITY_EXIT_DELAY: Duration = Duration::from_secs(5);
+
+/// Consecutive boot exits, in the CONTAINER's filesystem. A restart-policy restart reuses the
+/// container, so the count survives exactly the retries it counts and resets on the recreate
+/// that the other race needs anyway.
+fn boot_exit_counter_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("quasar-boot-sanity-exits")
+}
+
+fn read_boot_exits(path: &std::path::Path) -> u32 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Returns the new count. A write failure costs only the escalation, never the retry.
+fn record_boot_exit(path: &std::path::Path) -> u32 {
+    let next = read_boot_exits(path).saturating_add(1);
+    let _ = std::fs::write(path, next.to_string());
+    next
+}
+
+/// The gate's effects, injected so the decide→sleep→recheck→exit sequence is testable with no
+/// device, no real sleep and no exit.
+struct BootGateEffects<'a> {
+    /// #66 barrier: provisions this process holds. Sampled before deciding AND after the
+    /// delay — a provision that starts inside the delay must still cancel the exit.
+    in_flight: &'a dyn Fn() -> usize,
+    record_exit: &'a dyn Fn() -> u32,
+    clear_exits: &'a dyn Fn(),
+    sleep: &'a dyn Fn(Duration),
+    exit: &'a dyn Fn(i32),
+}
+
+/// Act on the boot-time readiness verdict: exit for the fault a fresh container start fixes,
+/// stay and name the fix for one it does not. The decision is
+/// [`crate::readiness::boot_action`]; this is only its effects. Returns whether the exit
+/// effect fired.
+fn run_boot_gate(
+    checks: &[crate::messages::ReadinessCheck],
+    gpu_present: bool,
+    container_has_render_node: bool,
+    prior_exits: u32,
+    fx: &BootGateEffects<'_>,
+) -> bool {
+    use crate::readiness::{BootAction, BootInputs, BOOT_EXIT_MAX_ATTEMPTS, SANITY_LOG_TOKEN};
+    let in_flight = (fx.in_flight)();
+    let action = crate::readiness::boot_action(BootInputs {
+        checks,
+        gpu_present,
+        container_has_render_node,
+        provision_in_flight: in_flight > 0,
+        prior_exits,
+    });
+    let fault = match action {
+        BootAction::Continue => {
+            // Streak over: a later fault gets a full retry budget.
+            (fx.clear_exits)();
+            return false;
+        }
+        BootAction::Stay(f) => {
+            log_boot_stay(&f, prior_exits, in_flight);
+            return false;
+        }
+        BootAction::ExitForRetry(f) => f,
+    };
+    let attempt = (fx.record_exit)();
+    error!(
+        token = "boot-render-node-missing",
+        check = %fault.check,
+        attempt,
+        max_attempts = BOOT_EXIT_MAX_ATTEMPTS,
+        exit_in_s = BOOT_SANITY_EXIT_DELAY.as_secs(),
+        "{SANITY_LOG_TOKEN} boot: {} — waiting for a /dev/dri/renderD* node to be visible \
+         INSIDE this container. A device list is fixed at container creation, so exiting in \
+         {}s and letting the restart policy start a fresh container is what picks the node up. \
+         Attempt {attempt} of {}. RUN (only if this repeats): {}",
+        fault.summary,
+        BOOT_SANITY_EXIT_DELAY.as_secs(),
+        BOOT_EXIT_MAX_ATTEMPTS,
+        fault.remediation
+    );
+    (fx.sleep)(BOOT_SANITY_EXIT_DELAY);
+    let in_flight = (fx.in_flight)();
+    if in_flight > 0 {
+        warn!(
+            token = "boot-render-node-exit-deferred",
+            in_flight,
+            "a provision started while the boot exit was pending — staying up; the retry \
+             happens on the next agent start"
+        );
+        return false;
+    }
+    (fx.exit)(1);
+    true
+}
+
+/// One line per Stay, keyed on the fault's token. The tokens are repeated as literals because
+/// the log-convention test requires a literal first field.
+fn log_boot_stay(f: &crate::readiness::BootFault, prior_exits: u32, in_flight: usize) {
+    use crate::readiness::{
+        BOOT_DRI_MODES_TOKEN, BOOT_EXIT_MAX_ATTEMPTS, BOOT_HOST_RENDER_NODE_TOKEN,
+        BOOT_RENDER_NODE_DEFERRED_TOKEN, BOOT_RENDER_NODE_UNOPENABLE_TOKEN, SANITY_LOG_TOKEN,
+    };
+    match f.token {
+        BOOT_DRI_MODES_TOKEN => error!(
+            token = "boot-dri-modes-stale-cdi",
+            check = %f.check,
+            "{SANITY_LOG_TOKEN} boot: {} — NOT restarting for this: CDI device edits are \
+             applied when a container is CREATED, so every restart reproduces the same modes \
+             from the same stale spec and nothing inside this container can re-read them. \
+             Regenerate the spec on the HOST, then recreate the containers. RUN: {}",
+            f.summary,
+            f.remediation
+        ),
+        BOOT_HOST_RENDER_NODE_TOKEN => error!(
+            token = "boot-host-render-node-missing",
+            check = %f.check,
+            "{SANITY_LOG_TOKEN} boot: {} — NOT restarting for this: the node has to be created \
+             by the HOST kernel first, which no container restart can do. RUN: {}",
+            f.summary,
+            f.remediation
+        ),
+        BOOT_RENDER_NODE_UNOPENABLE_TOKEN => error!(
+            token = "boot-render-node-unopenable",
+            check = %f.check,
+            "{SANITY_LOG_TOKEN} boot: {} — the node IS in this container and the agent cannot \
+             open it, so this is a mode/group/device-cgroup fault rather than the boot race, \
+             and a fresh container re-creates the same node with the same permissions. NOT \
+             restarting. RUN: {}",
+            f.summary,
+            f.remediation
+        ),
+        BOOT_RENDER_NODE_DEFERRED_TOKEN => warn!(
+            token = "boot-render-node-retry-deferred",
+            check = %f.check,
+            in_flight,
+            "{SANITY_LOG_TOKEN} boot: {} — a restart would fix it, but {in_flight} provision(s) \
+             are still writing a shared volume and killing one mid-write is worse than waiting: \
+             the retry happens on the next agent start instead",
+            f.summary
+        ),
+        // The only remaining Stay token: the retry budget is spent.
+        _ => error!(
+            token = "boot-render-node-retries-spent",
+            check = %f.check,
+            prior_exits,
+            "{SANITY_LOG_TOKEN} boot: {} — {prior_exits} restarts have already failed to bring \
+             the device in, so the pass-through is missing rather than late (budget: {}). NOT \
+             exiting again; staying up so the readiness card shows this. RUN: {}",
+            f.summary,
+            BOOT_EXIT_MAX_ATTEMPTS,
+            f.remediation
+        ),
+    }
+}
+
+/// Wire the gate to the real world. First connection of the process only: a later reconnect is
+/// not a boot, and by then live sessions exist that an exit would kill.
+async fn boot_sanity_gate(readiness: &[crate::messages::ReadinessCheck], gpu_present: bool) {
+    static EVALUATED: AtomicBool = AtomicBool::new(false);
+    if EVALUATED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let checks = readiness.to_vec();
+    let prior_exits = read_boot_exits(&boot_exit_counter_path());
+    // Blocking pool: the exit path sleeps, and parking a runtime worker for that would stall
+    // the heartbeat of a process that may yet be told to stay.
+    offload_probe(move || {
+        let counter = boot_exit_counter_path();
+        let has_node = crate::readiness::container_has_render_node(std::path::Path::new("/"));
+        let fx = BootGateEffects {
+            in_flight: &crate::artifact::provisioning_in_flight,
+            record_exit: &|| record_boot_exit(&counter),
+            clear_exits: &|| {
+                let _ = std::fs::remove_file(&counter);
+            },
+            sleep: &std::thread::sleep,
+            exit: &|code: i32| {
+                std::process::exit(code);
+            },
+        };
+        run_boot_gate(&checks, gpu_present, has_node, prior_exits, &fx);
+    })
+    .await;
 }
 
 /// #375: resolve the 32-bit NVIDIA driver-lib directory to inject into NVIDIA app
@@ -596,11 +845,30 @@ async fn connect_and_run(
     health: &Arc<HealthState>,
     nvidia_lib32_probed: &str,
     image_mgr: &Arc<ImageManager>,
+    release_mgr: &Arc<ReleaseManager>,
 ) -> anyhow::Result<()> {
     let url = cfg.ws_url();
-    info!("connecting to {url}");
+    info!(policy = ?cfg.transport, "connecting to {url}");
+    if cfg.webpki_from_blob {
+        // `qenr1..` (a mispaste that dropped the fingerprint) and a real CA deployment
+        // produce the same policy; only this line tells them apart in a log.
+        info!(
+            token = "cp-tls-webpki-from-blob",
+            "the enrollment string carried an empty fingerprint segment: verifying the control \
+             plane against the WebPKI roots, not a pin"
+        );
+    }
 
-    let (ws_stream, _) = connect_async(&url).await?;
+    // #12: the connector is chosen by policy, never by tokio-tungstenite's default — a
+    // wss:// URL must not silently validate against the OS/bundled roots when a pin was
+    // configured, and a ws:// URL is explicitly Plain.
+    let (ws_stream, _) = connect_async_tls_with_config(
+        &url,
+        None,
+        false,
+        Some(crate::cp_tls::ws_connector(&cfg.transport)),
+    )
+    .await?;
     let (mut tx, mut rx) = ws_stream.split();
 
     // agent-api.md: recorded images are verified against the docker daemon on startup
@@ -622,13 +890,33 @@ async fn connect_and_run(
     let mut image_rx = Some(image_rx);
     let _image_upstream_guard = image_mgr.attach_upstream(image_tx);
 
+    // Same shape for `release_state`. Attaching re-emits the current state of every
+    // updater result file still present, which is how an apply that destroyed the
+    // previous agent still gets reported (agent-api.md `release_state`).
+    let (release_tx, release_rx) = mpsc::channel::<AgentMsg>(16);
+    let mut release_rx = Some(release_rx);
+    let _release_upstream_guard = release_mgr.attach_upstream(release_tx);
+
     // --- Step 1: send register ---
     let auth = choose_auth(cfg)?;
+    // Re-discovered per connection, not once at boot: an updater that starts
+    // after the agent must not leave the host reporting updater_present=false
+    // forever. Offloaded because it shells out to docker.
+    let install = offload_probe(|| {
+        let runtime = ContainerRuntime::from_env();
+        crate::buildinfo::discover_install(&crate::buildinfo::DockerFacts::new(&runtime))
+    })
+    .await;
+    crate::buildinfo::set_install_facts(install.clone());
     let register_msg = AgentMsg::Register {
         node_name: cfg.node_name.clone(),
         agent_version: AGENT_VERSION.to_string(),
         auth,
         images,
+        source_commit: crate::buildinfo::source_commit().map(str::to_string),
+        built_at: crate::buildinfo::built_at().map(str::to_string),
+        install_mode: install.install_mode.map(|m| m.as_str().to_string()),
+        updater_present: install.updater_present,
     };
     send(&mut tx, &register_msg).await?;
     info!("sent register (node_name={})", cfg.node_name);
@@ -651,6 +939,9 @@ async fn connect_and_run(
             } else {
                 info!("reconnected as host {host_id}");
             }
+            // #12: the pin that just verified this connection outlives the enrollment
+            // string, so the operator can delete QUASAR_ENROLLMENT from the environment.
+            persist_pin_if_new(cfg);
             (host_id, heartbeat_interval_ms)
         }
         ControlMsg::Error { code, message } => {
@@ -709,9 +1000,9 @@ async fn connect_and_run(
     // Every input is already paid for (the vendor read, the #375 lib32 probe, the
     // codec probe above), so nothing here re-probes or launches a container.
     let nvidia_host = cap.gpus.iter().any(|g| g.vendor == "nvidia");
+    let gpu_present = !cap.gpus.is_empty();
     let readiness = {
         let lib32 = first_settings.nvidia_lib32_path.clone();
-        let gpu_present = !cap.gpus.is_empty();
         let probed_codecs = host_codec_report.as_ref().map(|r| r.codecs.clone());
         offload_probe(move || {
             crate::readiness::probe(
@@ -737,6 +1028,10 @@ async fn connect_and_run(
     send(&mut tx, &capacity_msg).await?;
     info!("capacity report sent");
 
+    // Sent first on purpose: the card carries the remediation, and the gate below may end
+    // the process a few seconds later.
+    boot_sanity_gate(&readiness, gpu_present).await;
+
     // CM-06/07: re-send capacity on a debounced console hotplug so the control plane's
     // connector-diff auto-start/stop sees it promptly. Spawned after `registered`; the
     // guard's Drop stops the thread on every disconnect path, so it never survives
@@ -761,6 +1056,7 @@ async fn connect_and_run(
         vram_targets,
         nvidia_lib32_probed.to_string(),
         image_mgr.clone(),
+        release_mgr.clone(),
     );
     // Cached with the encoder it was probed for, so capacity re-sends reuse it unless
     // a config_update flips the effective encoder and marks it stale.
@@ -840,12 +1136,15 @@ async fn connect_and_run(
     // (aborted by `_library_scan_guard`'s Drop), node_secret auth, never fatal to the
     // agent. The agent never learns a user — it walks a path the control plane gives
     // it and reports the manifests it finds.
-    let _library_scan_guard = match current_node_secret(cfg) {
-        Some(secret) => Some(spawn_library_scanner(
-            cfg.http_base_url(),
-            cfg.node_name.clone(),
-            secret,
-        )),
+    let _library_scan_guard = match current_node_secret(cfg).map(|s| cp_client(cfg, s)) {
+        Some(Ok(cp)) => Some(spawn_library_scanner(cp)),
+        Some(Err(e)) => {
+            warn!(
+                token = "library-scan-client-unavailable",
+                "library-scan: {e} — skipping library scanner this connection"
+            );
+            None
+        }
         None => {
             warn!(
                 token = "library-scan-no-secret",
@@ -861,24 +1160,21 @@ async fn connect_and_run(
     // their schedules in the control plane's `jobs` table; adding a third is a
     // `register` here plus a `Definition` there. Runners are built before the poller
     // because an empty registry spawns no task at all.
-    let _job_poller_guard = match current_node_secret(cfg) {
-        Some(secret) => {
+    let _job_poller_guard = match current_node_secret(cfg).map(|s| cp_client(cfg, s)) {
+        Some(Err(e)) => {
+            warn!(
+                token = "job-poller-client-unavailable",
+                "job: {e} — skipping the job poller this connection"
+            );
+            None
+        }
+        Some(Ok(cp)) => {
             let mut registry = crate::jobs::JobRegistry::new();
             registry.register(warmup_runner);
             registry.register(std::sync::Arc::new(
-                crate::session::gc::HomeGcJobRunner::new(
-                    cfg.http_base_url(),
-                    cfg.node_name.clone(),
-                    secret.clone(),
-                    live_refs.clone(),
-                ),
+                crate::session::gc::HomeGcJobRunner::new(cp.clone(), live_refs.clone()),
             ));
-            crate::jobs::spawn_job_poller(
-                cfg.http_base_url(),
-                cfg.node_name.clone(),
-                secret,
-                std::sync::Arc::new(registry),
-            )
+            crate::jobs::spawn_job_poller(cp, std::sync::Arc::new(registry))
         }
         None => {
             warn!(
@@ -1263,6 +1559,19 @@ async fn connect_and_run(
                 };
                 send(&mut tx, &msg).await?;
             }
+            // `release_state` emissions from the release poller thread.
+            rel = recv_or_disabled(&mut release_rx) => {
+                let Some(msg) = rel else {
+                    error!(
+                        token = "release-channel-closed",
+                        "release-state sender dropped unexpectedly; disabling release-state \
+                         forwarding for the rest of this connection"
+                    );
+                    release_rx = None;
+                    continue;
+                };
+                send(&mut tx, &msg).await?;
+            }
         }
     }
 }
@@ -1367,6 +1676,9 @@ struct SessionManager {
     /// `image_ensure`/`image_remove` dispatch target. Process-wide, so its
     /// docker-reconciled state and idempotency bookkeeping outlive sessions.
     image_mgr: Arc<ImageManager>,
+    /// `release_apply` dispatch target. Process-wide for the same reason as
+    /// `image_mgr`: its poller outlives this connection.
+    release_mgr: Arc<ReleaseManager>,
     /// The resolved golden-home template store, or `None` when
     /// `QUASAR_HOME_TEMPLATES` is off (the default) or the template root is
     /// misconfigured. Independent of the warm-up store — a host can seed from
@@ -1438,6 +1750,7 @@ impl SessionManager {
         vram_targets: Vec<VramTarget>,
         nvidia_lib32_probed: String,
         image_mgr: Arc<ImageManager>,
+        release_mgr: Arc<ReleaseManager>,
     ) -> Self {
         let mut runtime_settings = crate::session::settings::RuntimeSettings::baseline();
         seed_nvidia_lib32(&mut runtime_settings, &nvidia_lib32_probed);
@@ -1460,6 +1773,7 @@ impl SessionManager {
             warmup_activity: None,
             warmup_control: None,
             image_mgr,
+            release_mgr,
             template_store: None,
         }
     }
@@ -2238,6 +2552,18 @@ impl SessionManager {
                 local_tag,
                 version,
             )),
+            // The updater does the work; the agent validates, acks acceptance and
+            // relays. It never recreates itself and runs no compose command.
+            ControlMsg::ReleaseApply {
+                id,
+                request_id,
+                release,
+                components,
+                force,
+            } => Some(
+                self.release_mgr
+                    .handle_apply(id, request_id, release, components, force),
+            ),
             ControlMsg::Registered { .. } => {
                 warn!(
                     token = "duplicate-registered",
@@ -2486,11 +2812,19 @@ impl Drop for LibraryScanGuard {
 /// Spawn the Steam library discovery scanner: one pass 30 s after registration (so it
 /// does not contend with the post-reconnect burst), then every 60 s. Each pass runs on
 /// a blocking thread and swallows its own errors — a scan failure must never be fatal.
-fn spawn_library_scanner(
-    http_base: String,
-    node_name: String,
-    node_secret: String,
-) -> LibraryScanGuard {
+/// The node-secret HTTP client for this connection's pull channels: same transport policy
+/// as the websocket (#12), so a pinned host never has one client accept the control plane
+/// while the other refuses it.
+fn cp_client(cfg: &Config, node_secret: String) -> Result<crate::cp_http::CpClient, String> {
+    crate::cp_http::CpClient::new(
+        &cfg.transport,
+        cfg.http_base_url(),
+        cfg.node_name.clone(),
+        node_secret,
+    )
+}
+
+fn spawn_library_scanner(cp: crate::cp_http::CpClient) -> LibraryScanGuard {
     let handle = tokio::spawn(async move {
         sleep(Duration::from_secs(30)).await;
         // Poll cadence is NOT scan cadence. This ticker only asks whether a scan is
@@ -2501,8 +2835,7 @@ fn spawn_library_scanner(
         let mut ticker = tokio::time::interval(Duration::from_secs(60));
         ticker.tick().await; // discard the immediate first tick
         loop {
-            let client =
-                LibraryScanClient::new(http_base.clone(), node_name.clone(), node_secret.clone());
+            let client = LibraryScanClient::new(cp.clone());
             if let Err(e) = tokio::task::spawn_blocking(move || client.run_pass()).await {
                 warn!(
                     token = "library-scan-join-error",
@@ -2534,10 +2867,10 @@ fn enrollment_reachable(cfg: &Config) -> Result<(), String> {
     match &cfg.enrollment_token {
         Some(t) if !t.trim().is_empty() => Ok(()),
         _ => Err(format!(
-            "no persisted node_secret at {} and ENROLLMENT_TOKEN is not set: this agent can \
-             never register as-is. Set ENROLLMENT_TOKEN to a token minted on the control \
-             plane's admin Hosts page (see docs/configuration.md#enrollment_token), then \
-             restart the container.",
+            "no persisted node_secret at {} and neither QUASAR_ENROLLMENT nor ENROLLMENT_TOKEN \
+             is set: this agent can never register as-is. Paste the enrollment string from \
+             Admin -> Fleet -> Enroll host into QUASAR_ENROLLMENT (or set ENROLLMENT_TOKEN; see \
+             docs/configuration.md#enrollment_token), then restart the container.",
             cfg.node_secret_path
         )),
     }
@@ -2560,6 +2893,86 @@ fn choose_auth(cfg: &Config) -> anyhow::Result<Auth> {
             "no node_secret at {} and ENROLLMENT_TOKEN not set; cannot register",
             cfg.node_secret_path
         ),
+    }
+}
+
+/// Write the verified pin beside the node secret the first time a pinned connection
+/// registers. Never overwrites what a reconnect merely re-learned — the single exception
+/// is a rotation the operator drove through CONTROL_PLANE_FINGERPRINT, which is the one
+/// pin that both differs from the file and has just verified a real handshake.
+fn persist_pin_if_new(cfg: &Config) {
+    let crate::enrollment::TransportPolicy::Pinned(fp) = &cfg.transport else {
+        return;
+    };
+    let path = cfg.pin_path();
+    // Compared as fingerprints, not as bytes: the file may have been hand-written
+    // lowercase or with a `sha256:` prefix.
+    let saved = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| crate::enrollment::Fingerprint::parse(&s).ok());
+    if saved.as_ref() == Some(fp) {
+        return;
+    }
+    let occupied = std::fs::symlink_metadata(&path).is_ok();
+    let rotating = occupied && cfg.pin_source == Some(crate::enrollment::PinSource::Env);
+    if occupied && !rotating {
+        return;
+    }
+    let written = if rotating {
+        replace_pin_file(&path, fp)
+    } else {
+        create_pin_file(&path, fp)
+    };
+    match written {
+        // `Ok(false)` = the path was taken between the check and the create. Another
+        // agent (or an attacker's symlink) owns it; leaving it alone is the safe answer.
+        Ok(false) => {}
+        Ok(true) => {
+            info!(token = "cp-tls-pin-persisted", path = %path, rotated = rotating, "control-plane certificate pin saved")
+        }
+        Err(e) => {
+            warn!(token = "cp-tls-pin-persist-failed", path = %path, "could not save the certificate pin: {e}")
+        }
+    }
+}
+
+/// `O_CREAT|O_EXCL` at 0600: no symlink is followed (EEXIST even for a dangling one), no
+/// TOCTOU window behind the occupancy check above, and no umask widening. `Ok(false)`
+/// means the path was already taken.
+fn create_pin_file(path: &str, fp: &crate::enrollment::Fingerprint) -> std::io::Result<bool> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    f.write_all(format!("{fp}\n").as_bytes())?;
+    Ok(true)
+}
+
+/// The rotation path, the only one allowed to overwrite. Writes a pid-scoped temp with the
+/// same `create_new` + 0600 rules and renames over the target: `rename(2)` replaces the
+/// symlink itself rather than writing through it, and a reader never sees a half-file.
+fn replace_pin_file(path: &str, fp: &crate::enrollment::Fingerprint) -> std::io::Result<bool> {
+    let tmp = format!("{path}.{}.tmp", std::process::id());
+    if !create_pin_file(&tmp, fp)? {
+        return Ok(false);
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(true),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
     }
 }
 
@@ -2617,7 +3030,7 @@ where
     S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
     let json = serde_json::to_string(msg)?;
-    sink.send(Message::Text(json)).await?;
+    sink.send(Message::Text(json.into())).await?;
     Ok(())
 }
 
@@ -2629,7 +3042,7 @@ where
         match stream.next().await {
             None => anyhow::bail!("WebSocket closed by server"),
             Some(Err(e)) => return Err(e.into()),
-            Some(Ok(Message::Text(t))) => return Ok(t),
+            Some(Ok(Message::Text(t))) => return Ok(t.to_string()),
             Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue, // handled by tungstenite
             Some(Ok(Message::Close(_))) => anyhow::bail!("WebSocket closed by server"),
             Some(Ok(other)) => {
@@ -2655,6 +3068,303 @@ mod tests {
             node_name: "test-node".to_string(),
             enrollment_token: enrollment_token.map(str::to_string),
             node_secret_path: node_secret_path.to_string(),
+            transport: crate::enrollment::TransportPolicy::Plaintext,
+            pin_source: None,
+            webpki_from_blob: false,
+            startup_warnings: Vec::new(),
+        }
+    }
+
+    /// A pinned `Config` for the pin-file tests.
+    fn pinned_cfg(
+        node_secret_path: &str,
+        fp: crate::enrollment::Fingerprint,
+        pin_source: crate::enrollment::PinSource,
+    ) -> Config {
+        Config {
+            transport: crate::enrollment::TransportPolicy::Pinned(fp),
+            pin_source: Some(pin_source),
+            ..test_cfg(node_secret_path, None)
+        }
+    }
+
+    fn pin_fixture(byte: u8) -> crate::enrollment::Fingerprint {
+        crate::enrollment::Fingerprint([byte; 32])
+    }
+
+    /// A readiness check by hand: `run_boot_gate` only reads id + status + wording, and a
+    /// real probe would need devices these tests must not touch.
+    fn gate_check(id: &str, status: &str) -> crate::messages::ReadinessCheck {
+        crate::messages::ReadinessCheck {
+            id: id.to_string(),
+            status: status.to_string(),
+            summary: format!("{id} is {status}"),
+            remediation: format!("fix {id}"),
+        }
+    }
+
+    /// The #98 boot race as the gate sees it: host kernel has a node, this container has none.
+    fn race_1_checks() -> Vec<crate::messages::ReadinessCheck> {
+        vec![
+            gate_check("render_node", crate::readiness::FAIL),
+            gate_check("host_render_node", crate::readiness::PASS),
+            gate_check("dri_node_app_access", crate::readiness::PASS),
+        ]
+    }
+
+    /// Recorded effects, so a test asserts on what the gate DID rather than on log text.
+    #[derive(Default)]
+    struct GateSpy {
+        in_flight_calls: AtomicU64,
+        sleeps: AtomicU64,
+        exits: AtomicU64,
+        recorded: AtomicU64,
+        cleared: AtomicU64,
+    }
+
+    #[test]
+    fn a_provision_that_starts_during_the_delay_cancels_the_boot_exit() {
+        let spy = GateSpy::default();
+        // Quiescent when the decision is taken, busy by the time the delay ends: the exact
+        // #66 race the post-sleep re-check exists for.
+        let in_flight = || -> usize {
+            if spy.in_flight_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                0
+            } else {
+                1
+            }
+        };
+        let fx = BootGateEffects {
+            in_flight: &in_flight,
+            record_exit: &|| spy.recorded.fetch_add(1, Ordering::SeqCst) as u32 + 1,
+            clear_exits: &|| {
+                spy.cleared.fetch_add(1, Ordering::SeqCst);
+            },
+            sleep: &|_| {
+                spy.sleeps.fetch_add(1, Ordering::SeqCst);
+            },
+            exit: &|_| {
+                spy.exits.fetch_add(1, Ordering::SeqCst);
+            },
+        };
+        let exited = run_boot_gate(&race_1_checks(), true, false, 0, &fx);
+        assert!(
+            !exited,
+            "a provision in flight must never be killed by the exit"
+        );
+        assert_eq!(spy.exits.load(Ordering::SeqCst), 0);
+        assert_eq!(spy.sleeps.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_quiescent_boot_race_exits_once_and_records_the_attempt() {
+        let spy = GateSpy::default();
+        let fx = BootGateEffects {
+            in_flight: &|| 0usize,
+            record_exit: &|| spy.recorded.fetch_add(1, Ordering::SeqCst) as u32 + 1,
+            clear_exits: &|| {
+                spy.cleared.fetch_add(1, Ordering::SeqCst);
+            },
+            sleep: &|_| {
+                spy.sleeps.fetch_add(1, Ordering::SeqCst);
+            },
+            exit: &|code| {
+                assert_eq!(code, 1, "the restart policy keys on a non-zero exit");
+                spy.exits.fetch_add(1, Ordering::SeqCst);
+            },
+        };
+        assert!(run_boot_gate(&race_1_checks(), true, false, 0, &fx));
+        assert_eq!(spy.exits.load(Ordering::SeqCst), 1);
+        assert_eq!(spy.recorded.load(Ordering::SeqCst), 1);
+        assert_eq!(spy.sleeps.load(Ordering::SeqCst), 1);
+        assert_eq!(spy.cleared.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_stay_verdict_neither_sleeps_nor_exits() {
+        let spy = GateSpy::default();
+        let fx = BootGateEffects {
+            in_flight: &|| 0usize,
+            record_exit: &|| spy.recorded.fetch_add(1, Ordering::SeqCst) as u32 + 1,
+            clear_exits: &|| {
+                spy.cleared.fetch_add(1, Ordering::SeqCst);
+            },
+            sleep: &|_| {
+                spy.sleeps.fetch_add(1, Ordering::SeqCst);
+            },
+            exit: &|_| {
+                spy.exits.fetch_add(1, Ordering::SeqCst);
+            },
+        };
+        // Stale CDI modes: a restart reproduces them, so the gate must not spend a boot on it.
+        let checks = vec![
+            gate_check("render_node", crate::readiness::PASS),
+            gate_check("host_render_node", crate::readiness::PASS),
+            gate_check("dri_node_app_access", crate::readiness::FAIL),
+        ];
+        assert!(!run_boot_gate(&checks, true, true, 0, &fx));
+        assert_eq!(spy.sleeps.load(Ordering::SeqCst), 0);
+        assert_eq!(spy.exits.load(Ordering::SeqCst), 0);
+        assert_eq!(spy.recorded.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            spy.cleared.load(Ordering::SeqCst),
+            0,
+            "a fault is not a clean boot"
+        );
+    }
+
+    #[test]
+    fn a_clean_boot_clears_the_retry_streak() {
+        let spy = GateSpy::default();
+        let fx = BootGateEffects {
+            in_flight: &|| 0usize,
+            record_exit: &|| spy.recorded.fetch_add(1, Ordering::SeqCst) as u32 + 1,
+            clear_exits: &|| {
+                spy.cleared.fetch_add(1, Ordering::SeqCst);
+            },
+            sleep: &|_| {
+                spy.sleeps.fetch_add(1, Ordering::SeqCst);
+            },
+            exit: &|_| {
+                spy.exits.fetch_add(1, Ordering::SeqCst);
+            },
+        };
+        let checks = vec![
+            gate_check("render_node", crate::readiness::PASS),
+            gate_check("host_render_node", crate::readiness::PASS),
+        ];
+        assert!(!run_boot_gate(&checks, true, true, 3, &fx));
+        assert_eq!(spy.cleared.load(Ordering::SeqCst), 1);
+        assert_eq!(spy.exits.load(Ordering::SeqCst), 0);
+    }
+
+    /// The boot-exit streak has to survive a restart-policy restart (same container, same
+    /// /tmp) and be clearable, or the retry bound is not a bound.
+    #[test]
+    fn boot_exits_count_up_and_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("boot-exits");
+        assert_eq!(read_boot_exits(&counter), 0, "no file is a fresh streak");
+        assert_eq!(record_boot_exit(&counter), 1);
+        assert_eq!(record_boot_exit(&counter), 2);
+        assert_eq!(read_boot_exits(&counter), 2);
+        std::fs::remove_file(&counter).unwrap();
+        assert_eq!(read_boot_exits(&counter), 0);
+        // A truncated or hand-edited file must read as a fresh streak, never panic.
+        std::fs::write(&counter, "not-a-number").unwrap();
+        assert_eq!(read_boot_exits(&counter), 0);
+    }
+
+    #[test]
+    fn a_fresh_pin_lands_at_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        let cfg = pinned_cfg(
+            secret_path.to_str().unwrap(),
+            pin_fixture(0xAB),
+            crate::enrollment::PinSource::Blob,
+        );
+        persist_pin_if_new(&cfg);
+
+        let written = std::fs::read_to_string(cfg.pin_path()).unwrap();
+        assert_eq!(written.trim(), pin_fixture(0xAB).to_colon_hex());
+        let mode = std::fs::metadata(cfg.pin_path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
+    }
+
+    /// A reconnect must never re-learn a pin: a file already there is the operator's.
+    #[test]
+    fn an_existing_pin_file_is_not_overwritten_by_a_blob_or_persisted_pin() {
+        for source in [
+            crate::enrollment::PinSource::Blob,
+            crate::enrollment::PinSource::Persisted,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let secret_path = dir.path().join("node-secret");
+            let cfg = pinned_cfg(secret_path.to_str().unwrap(), pin_fixture(0xAB), source);
+            std::fs::write(cfg.pin_path(), "not-a-fingerprint\n").unwrap();
+
+            persist_pin_if_new(&cfg);
+            assert_eq!(
+                std::fs::read_to_string(cfg.pin_path()).unwrap(),
+                "not-a-fingerprint\n",
+                "{source:?}"
+            );
+        }
+    }
+
+    /// CONTROL_PLANE_FINGERPRINT is the rotation vehicle, and the new pin has just
+    /// verified a real handshake — the one case overwriting is right.
+    #[test]
+    fn an_operator_driven_rotation_refreshes_the_pin_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        let cfg = pinned_cfg(
+            secret_path.to_str().unwrap(),
+            pin_fixture(0xCD),
+            crate::enrollment::PinSource::Env,
+        );
+        std::fs::write(cfg.pin_path(), format!("{}\n", pin_fixture(0xAB))).unwrap();
+
+        persist_pin_if_new(&cfg);
+        assert_eq!(
+            std::fs::read_to_string(cfg.pin_path()).unwrap().trim(),
+            pin_fixture(0xCD).to_colon_hex()
+        );
+        // No temp file survives the rename.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// A file whose content only differs in case/prefix is the same pin — an equality
+    /// check on bytes would rewrite it on every connect.
+    #[test]
+    fn a_pin_file_in_another_spelling_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        let cfg = pinned_cfg(
+            secret_path.to_str().unwrap(),
+            pin_fixture(0xAB),
+            crate::enrollment::PinSource::Env,
+        );
+        let lowercase = format!(
+            "sha256:{}\n",
+            pin_fixture(0xAB).to_colon_hex().to_lowercase()
+        );
+        std::fs::write(cfg.pin_path(), &lowercase).unwrap();
+
+        persist_pin_if_new(&cfg);
+        assert_eq!(std::fs::read_to_string(cfg.pin_path()).unwrap(), lowercase);
+    }
+
+    /// A symlink planted at the pin path must not become a write primitive: neither the
+    /// create nor the rotation path may create the symlink's target.
+    #[test]
+    fn a_dangling_symlink_at_the_pin_path_is_never_followed() {
+        for source in [
+            crate::enrollment::PinSource::Blob,
+            crate::enrollment::PinSource::Env,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let secret_path = dir.path().join("node-secret");
+            let cfg = pinned_cfg(secret_path.to_str().unwrap(), pin_fixture(0xAB), source);
+            let target = dir.path().join("victim");
+            std::os::unix::fs::symlink(&target, cfg.pin_path()).unwrap();
+
+            persist_pin_if_new(&cfg);
+            assert!(
+                !target.exists(),
+                "{source:?} wrote through the symlink to {target:?}"
+            );
         }
     }
 
@@ -2875,6 +3585,7 @@ mod tests {
             Vec::new(),
             String::new(),
             test_image_mgr(),
+            test_release_mgr(),
         )
     }
 
@@ -2885,6 +3596,12 @@ mod tests {
 
     /// A throwaway `ImageManager`: an empty state_path means `ImageManager::new`
     /// touches neither disk nor a docker daemon.
+    /// A ReleaseManager pointed at paths that do not exist: `present()` is false,
+    /// so nothing in these tests can reach a socket.
+    fn test_release_mgr() -> Arc<ReleaseManager> {
+        ReleaseManager::new("/nonexistent/updater.sock", "/nonexistent/results")
+    }
+
     fn test_image_mgr() -> Arc<ImageManager> {
         ImageManager::new(ContainerRuntime::from_env(), String::new())
     }
@@ -3033,6 +3750,7 @@ mod tests {
             Vec::new(),
             String::new(),
             test_image_mgr(),
+            test_release_mgr(),
         );
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
         let msg = ControlMsg::ConfigUpdate {
@@ -3062,6 +3780,7 @@ mod tests {
             Vec::new(),
             String::new(),
             test_image_mgr(),
+            test_release_mgr(),
         );
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
         let env_encoder = crate::session::settings::RuntimeSettings::baseline().encoder;
@@ -3117,6 +3836,7 @@ mod tests {
             Vec::new(),
             String::new(),
             test_image_mgr(),
+            test_release_mgr(),
         );
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
         mgr.runtime_settings.encoder = EncoderChoice::Vulkan;
@@ -3192,6 +3912,7 @@ mod tests {
             Vec::new(),
             String::new(),
             test_image_mgr(),
+            test_release_mgr(),
         );
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
         let env_encoder = crate::session::settings::RuntimeSettings::baseline().encoder;
@@ -3656,6 +4377,7 @@ mod tests {
             Vec::new(),
             String::new(),
             test_image_mgr(),
+            test_release_mgr(),
         );
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
 
@@ -3704,6 +4426,7 @@ mod tests {
             Vec::new(),
             String::new(),
             test_image_mgr(),
+            test_release_mgr(),
         );
         mgr.runner = runner;
         (mgr, live_refs)

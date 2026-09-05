@@ -49,13 +49,70 @@ describe("ReadinessCard", () => {
     expect(screen.queryByText("Needs attention")).not.toBeInTheDocument();
   });
 
+  // #102: skipped = not applicable to this host (contract), so those rows leave
+  // the first screen and sit behind one closed disclosure.
+  it("hides not-applicable checks behind a closed disclosure and groups the rest by area", () => {
+    render(
+      <ReadinessCard
+        checks={[
+          check({ id: "nvidia_egl_vendor_json", status: "skip", summary: "no NVIDIA GPU detected on this host" }),
+          check({ id: "nvidia_eglcore_library", status: "skip", summary: "no NVIDIA GPU detected on this host" }),
+          check({ id: "nvidia_lib32_gl", status: "skip", summary: "no NVIDIA GPU detected on this host" }),
+          check({ id: "render_node", status: "pass", summary: "render node present" }),
+          check({ id: "uinput", status: "pass", summary: "/dev/uinput present" }),
+          check({ id: "media_reachability", status: "warn", summary: "firewall filters UDP", remediation: "sudo ufw allow 40000:40100/udp" }),
+        ]}
+      />,
+    );
+    const main = screen.getByTestId("readiness-checks");
+    expect(within(main).queryByTestId("readiness-check-nvidia_egl_vendor_json")).not.toBeInTheDocument();
+    expect(within(main).getAllByTestId("readiness-group").map((g) => g.getAttribute("data-group"))).toEqual(["gpu", "input", "network"]);
+    expect(within(main).getByText("GPU & display")).toBeInTheDocument();
+    expect(within(main).getByText("Network")).toBeInTheDocument();
+    expect(within(main).queryByText("NVIDIA driver")).not.toBeInTheDocument();
+
+    const more = screen.getByTestId("readiness-not-applicable");
+    expect(more).not.toHaveAttribute("open");
+    expect(within(more).getByText("3 checks not applicable to this host")).toBeInTheDocument();
+    expect(within(more).getByTestId("readiness-check-nvidia_lib32_gl")).toBeInTheDocument();
+  });
+
+  it("shows the NVIDIA driver group with all four checks together on an NVIDIA host, and no disclosure", () => {
+    render(
+      <ReadinessCard
+        checks={[
+          check({ id: "render_node" }),
+          check({ id: "nvidia_egl_vendor_json" }),
+          check({ id: "driver_volume_version", status: "provisioning", summary: "provisioning the driver userspace" }),
+          check({ id: "nvidia_eglcore_library" }),
+          check({ id: "nvidia_lib32_gl" }),
+        ]}
+      />,
+    );
+    const nvidia = screen.getByTestId("readiness-checks").querySelector('[data-group="nvidia"]')!;
+    expect(within(nvidia as HTMLElement).getByText("NVIDIA driver")).toBeInTheDocument();
+    expect([...nvidia.querySelectorAll('[data-testid^="readiness-check-"]')].map((e) => e.getAttribute("data-testid"))).toEqual([
+      "readiness-check-driver_volume_version",
+      "readiness-check-nvidia_egl_vendor_json",
+      "readiness-check-nvidia_eglcore_library",
+      "readiness-check-nvidia_lib32_gl",
+    ]);
+    expect(screen.queryByTestId("readiness-not-applicable")).not.toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "Provisioning" })).toBeInTheDocument();
+  });
+
+  it("says 'check' in the singular when one is not applicable", () => {
+    render(<ReadinessCard checks={[check({ id: "render_node" }), check({ id: "nvidia_lib32_gl", status: "skip" })]} />);
+    expect(screen.getByText("1 check not applicable to this host")).toBeInTheDocument();
+  });
+
   it("passes an unrecognized status through instead of crashing", () => {
     render(
       <ReadinessCard
         checks={[
           check({
             id: "future_check",
-            status: "provisioning" as ReadinessCheck["status"],
+            status: "recalibrating" as ReadinessCheck["status"],
             summary: "New check from a newer agent.",
           }),
         ]}
@@ -63,7 +120,7 @@ describe("ReadinessCard", () => {
     );
     const row = screen.getByTestId("readiness-check-future_check");
     // Unknown status renders as its own raw value, neutrally.
-    expect(within(row).getByRole("img", { name: "provisioning" })).toBeInTheDocument();
+    expect(within(row).getByRole("img", { name: "recalibrating" })).toBeInTheDocument();
     expect(screen.queryByText("Needs attention")).not.toBeInTheDocument();
   });
 

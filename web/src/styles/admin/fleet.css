@@ -246,3 +246,71 @@
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* The bare enrollment string is one click away, not the headline (#100). */
+.enroll-more > summary {
+  cursor: pointer;
+  font-size: var(--t-sm);
+  color: var(--text-2);
+  list-style: none;
+}
+.enroll-more > summary::-webkit-details-marker {
+  display: none;
+}
+.enroll-more > summary::before {
+  content: "▸ ";
+}
+.enroll-more[open] > summary::before {
+  content: "▾ ";
+}
+.enroll-more > .enroll-fact {
+  margin-top: var(--s2);
+}
+
+/* Releases (Fleet › Releases). No v3 mock covers this page, so it composes the
+   primitives beside it and console-v3 tokens only. */
+.release-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s5);
+}
+.release-entry + .release-entry {
+  border-top: 1px solid var(--line);
+  padding-top: var(--s5);
+}
+.release-faults {
+  margin: 0;
+  padding-left: var(--s5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+}
+/* Release notes are upstream markdown: the heading rules exist so an h1 in a
+   release body cannot outrank the page's own head. */
+.release-notes {
+  font-size: var(--t-sm);
+  color: var(--text-2);
+}
+.release-notes h1,
+.release-notes h2,
+.release-notes h3,
+.release-notes h4 {
+  font-size: var(--t-sm);
+  font-weight: 600;
+  color: var(--text);
+  margin: var(--s4) 0 var(--s2);
+}
+.release-notes ul,
+.release-notes ol {
+  margin: 0;
+  padding-left: var(--s5);
+}
+.release-notes p {
+  margin: var(--s2) 0;
+}
+.release-notes code {
+  font-family: var(--font-mono);
+}

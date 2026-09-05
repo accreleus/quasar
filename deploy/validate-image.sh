@@ -244,6 +244,13 @@ while IFS= read -r p; do [ -n "$p" ] && emit path_forbidden "path-absent.$p"    
 # `void` after CDI injection, and any `-e` this script passes shadows the baked value. The
 # contract asserts what the IMAGE declares.
 while IFS= read -r e; do [ -n "$e" ] && emit gst_required   "gst.$e"            "$e"; done < <(collect '.gst_elements.required')
+# commands.must_succeed is an OBJECT (command -> why it is asserted), so it is
+# collected by key rather than through `collect`, which flattens arrays.
+while IFS= read -r c; do
+  [ -n "$c" ] && emit cmd_succeeds "command.$c" "$c"
+done < <(jq -r --argjson chain "$CHAIN_JSON" \
+    '[ .roles as $roles | $chain[] | $roles[.] | .commands.must_succeed // {} | keys[] ] | unique | .[]' \
+    "$CONTRACT")
 
 # libcuda.so.1 must NOT be in the image (it is injected at run time by the NVIDIA
 # container toolkit). Only meaningful with the driver detached.
@@ -350,6 +357,12 @@ while IFS="$(printf '\t')" read -r check id arg; do
         sz=$(du -sh "$arg" 2>/dev/null | cut -f1); [ -n "$sz" ] || sz="?"
         emit FAIL "$id" "present (${sz}) — build artifact in a shipped image"
       else emit PASS "$id" "absent"; fi ;;
+    cmd_succeeds)
+      # `sh -c` so an asserted command may be a multi-word invocation
+      # (`docker compose version`), which is the only way to check a CLI PLUGIN:
+      # the plugin binary is not on PATH and `command -v` cannot see it.
+      if out=$(sh -c "$arg" 2>&1); then emit PASS "$id" "$(printf '%s' "$out" | head -1)"
+      else emit FAIL "$id" "exited non-zero: $(printf '%s' "$out" | head -1)"; fi ;;
     gst_required)
       if has_elem "$arg"; then emit PASS "$id" "registered"
       else emit FAIL "$id" "element not registered"; fi ;;
@@ -426,6 +439,29 @@ while IFS= read -r spec; do
     else hemit FAIL "env.$name" "image declares '${actual:-<unset>}', contract wants '$want'"; fi
   fi
 done < <(collect '.env.required')
+
+# Entrypoint env guards (#94): unlike the checks above, this measures RUNTIME behavior of
+# the real ENTRYPOINT, not baked image config — so it gets its own `docker run`s (with
+# `env` as the command) instead of joining the bypassed --entrypoint /bin/sh assertion
+# program. Empty-but-set must come out unset (the entrypoint's own `[ -z ] && unset`
+# guard); a real value must survive, so a deliberate bounded trace path still works.
+while IFS= read -r name; do
+  [ -n "$name" ] || continue
+  empty_out="$(docker run --rm --network none -e "${name}=" "$IMAGE" env 2>&1)" || true
+  if printf '%s\n' "$empty_out" | grep -q "^${name}="; then
+    hemit FAIL "entrypoint-guard.$name.empty" "still present when set empty: $(printf '%s\n' "$empty_out" | grep "^${name}=")"
+  else
+    hemit PASS "entrypoint-guard.$name.empty" "absent from \`env\` (guard fired)"
+  fi
+
+  want="/tmp/qv-guard-$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+  set_out="$(docker run --rm --network none -e "${name}=${want}" "$IMAGE" env 2>&1)" || true
+  if printf '%s\n' "$set_out" | grep -qF "${name}=${want}"; then
+    hemit PASS "entrypoint-guard.$name.set" "survives: ${want}"
+  else
+    hemit FAIL "entrypoint-guard.$name.set" "expected ${name}=${want}, got: $(printf '%s\n' "$set_out" | grep "^${name}=" || echo '<absent>')"
+  fi
+done < <(collect '.entrypoint_env_guards.unset_when_empty')
 
 # Image-declared provenance labels (§4 of the image-lineage spec). Host-side, like
 # env: these are image config, not container state.

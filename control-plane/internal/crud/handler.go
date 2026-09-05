@@ -180,6 +180,16 @@ type hostResp struct {
 	AgentConnectedSince *string `json:"agent_connected_since"`
 	AgentRestartCount   int32   `json:"agent_restart_count"`
 	AgentLastRestartAt  *string `json:"agent_last_restart_at"`
+	// The agent build's identity (openapi.yaml Host.source_commit/built_at/
+	// install_mode/updater_present, all four required). ALWAYS SERIALIZED and
+	// null until an amendment-aware agent reports; a host with any of them null
+	// is identity-unknown. UpdaterPresent is a *bool deliberately: null ("nobody
+	// has said") and false ("an agent looked and found none") are different
+	// facts and the release surface reports them differently.
+	SourceCommit   *string `json:"source_commit"`
+	BuiltAt        *string `json:"built_at"`
+	InstallMode    *string `json:"install_mode"`
+	UpdaterPresent *bool   `json:"updater_present"`
 	// Capacity: always serialized, null when the host has no reported GPUs to sum.
 	Capacity *HostCapacity `json:"capacity"`
 }
@@ -295,6 +305,14 @@ func hostToResp(h Host) hostResp {
 		s := h.ReadinessReportedAt.Format("2006-01-02T15:04:05Z07:00")
 		readinessAt = &s
 	}
+	// Identity's built_at is served UTC: the agent sends RFC3339, the column is
+	// timestamptz, and a client rendering "built 3 days ago" should not have to
+	// reason about the control plane's local zone.
+	var builtAt *string
+	if h.BuiltAt != nil {
+		s := h.BuiltAt.UTC().Format("2006-01-02T15:04:05Z07:00")
+		builtAt = &s
+	}
 	return hostResp{
 		ID:                  h.ID,
 		NodeName:            h.NodeName,
@@ -314,6 +332,10 @@ func hostToResp(h Host) hostResp {
 		AgentConnectedSince: connectedSince,
 		AgentRestartCount:   h.AgentRestartCount,
 		AgentLastRestartAt:  lastRestart,
+		SourceCommit:        h.SourceCommit,
+		BuiltAt:             builtAt,
+		InstallMode:         h.InstallMode,
+		UpdaterPresent:      h.UpdaterPresent,
 	}
 }
 
@@ -345,7 +367,7 @@ func (h *Handler) handleListApps(w http.ResponseWriter, r *http.Request) {
 
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"items":       items,
-		"next_cursor": nextCursor,
+		"next_cursor": nullableCursor(nextCursor),
 	})
 }
 
@@ -1030,6 +1052,15 @@ func optionalUUIDArg(id *string, present bool) **string {
 	return &id
 }
 
+// nullableCursor maps the store's "" (no further page) to JSON null, per
+// control-api.md / openapi.yaml `next_cursor: <opaque>|null` — never "".
+func nullableCursor(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
 func (h *Handler) handleListHosts(w http.ResponseWriter, r *http.Request) {
 	cursor := r.URL.Query().Get("cursor")
 	limit := int32(50)
@@ -1050,7 +1081,7 @@ func (h *Handler) handleListHosts(w http.ResponseWriter, r *http.Request) {
 
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"items":       items,
-		"next_cursor": nextCursor,
+		"next_cursor": nullableCursor(nextCursor),
 	})
 }
 
@@ -1089,7 +1120,7 @@ func (h *Handler) handleAdminListApps(w http.ResponseWriter, r *http.Request) {
 	for _, a := range apps {
 		items = append(items, appToAdminResp(a))
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": nextCursor})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": nullableCursor(nextCursor)})
 }
 
 func (h *Handler) handleDeleteApp(w http.ResponseWriter, r *http.Request) {

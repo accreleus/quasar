@@ -9,7 +9,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -107,6 +109,14 @@ type Settings struct {
 	// working. `*` is refused by the PATCH handler.
 	AllowedOrigins []string `json:"allowed_origins"`
 
+	// Which platform releases the admin console is shown, and the branch the
+	// edge channel follows (migration 0074; control-api.md §Platform releases).
+	// Read per request, never cached at boot: a channel switch takes effect
+	// with no restart. The branch is validated by the PATCH handler — a CHECK
+	// cannot express a git ref name — and is never cleared by a channel switch.
+	ReleaseChannel    string `json:"release_channel"`
+	ReleaseEdgeBranch string `json:"release_edge_branch"`
+
 	UpdatedBy *string   `json:"updated_by"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -122,6 +132,43 @@ const (
 // ValidLibraryDiscoveryIntervalMinutes reports whether n is in PATCH bounds.
 func ValidLibraryDiscoveryIntervalMinutes(n int) bool {
 	return n >= MinLibraryDiscoveryIntervalMinutes && n <= MaxLibraryDiscoveryIntervalMinutes
+}
+
+// Platform-release channel + edge branch (schema.md instance_settings,
+// migration 0074; semantics: control-api.md §Platform releases).
+const (
+	ReleaseChannelStable = "stable"
+	ReleaseChannelEdge   = "edge"
+
+	DefaultReleaseEdgeBranch = "develop"
+
+	// The migration stores TEXT with no length CHECK; the contract's bound.
+	MaxReleaseEdgeBranchLen = 255
+)
+
+// ValidReleaseChannel mirrors the instance_settings CHECK so the PATCH handler
+// answers 400 validation_failed instead of a database error.
+func ValidReleaseChannel(c string) bool {
+	return c == ReleaseChannelStable || c == ReleaseChannelEdge
+}
+
+// ValidReleaseEdgeBranch enforces the contract's ref-name rule: non-empty, at
+// most 255 characters, and a valid git ref name component — no whitespace, no
+// "..", no leading "-", no control characters. It is validated whatever the
+// channel is, since the branch is stored on both and selects nothing on stable.
+func ValidReleaseEdgeBranch(b string) bool {
+	if b == "" || len(b) > MaxReleaseEdgeBranchLen {
+		return false
+	}
+	if strings.Contains(b, "..") || strings.HasPrefix(b, "-") {
+		return false
+	}
+	for _, r := range b {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // Store is the data-access layer for instance_settings over the pgx pool.
@@ -171,6 +218,8 @@ func (s *Store) Get(ctx context.Context) (Settings, error) {
 			// policy a seeded one would.
 			ImageUpdatePolicy: ImagePolicyNotify,
 			AllowedOrigins:    []string{},
+			ReleaseChannel:    ReleaseChannelStable,
+			ReleaseEdgeBranch: DefaultReleaseEdgeBranch,
 			UpdatedAt:         time.Now().UTC(),
 		}, nil
 	}
@@ -293,6 +342,16 @@ func (s *Store) AllowedOrigins(ctx context.Context) ([]string, error) {
 	return st.AllowedOrigins, nil
 }
 
+// ReleaseChannel is the release view's per-request read. A missing row reads
+// the column defaults, which is what a fresh instance follows.
+func (s *Store) ReleaseChannel(ctx context.Context) (channel, edgeBranch string, err error) {
+	st, err := s.Get(ctx)
+	if err != nil {
+		return ReleaseChannelStable, DefaultReleaseEdgeBranch, err
+	}
+	return st.ReleaseChannel, st.ReleaseEdgeBranch, nil
+}
+
 // --- the single write path ----------------------------------------------------
 
 // settingsColumns is the column list, written once. Adding a column is one
@@ -301,6 +360,7 @@ func (s *Store) AllowedOrigins(ctx context.Context) ([]string, error) {
 const settingsColumns = `registration_mode, storage_provider, library_discovery_enabled,
 	library_discovery_interval_minutes, library_discovery_appdetails_enabled,
 	mic_capture_enabled, image_update_policy, allowed_origins,
+	release_channel, release_edge_branch,
 	updated_by::text, updated_at`
 
 // scanner is the shared surface of pgx.Row and pgx.Rows.
@@ -311,6 +371,7 @@ func scanSettings(row scanner) (Settings, error) {
 	err := row.Scan(&st.RegistrationMode, &st.StorageProvider, &st.LibraryDiscoveryEnabled,
 		&st.LibraryDiscoveryIntervalMinutes, &st.LibraryDiscoveryAppDetailsEnabled,
 		&st.MicCaptureEnabled, &st.ImageUpdatePolicy, &st.AllowedOrigins,
+		&st.ReleaseChannel, &st.ReleaseEdgeBranch,
 		&st.UpdatedBy, &st.UpdatedAt)
 	if err != nil {
 		return Settings{}, err
@@ -334,6 +395,8 @@ type Patch struct {
 	MicCaptureEnabled                 *bool
 	ImageUpdatePolicy                 *string
 	AllowedOrigins                    *[]string
+	ReleaseChannel                    *string
+	ReleaseEdgeBranch                 *string
 }
 
 // ChangedKeys lists the fields this patch sets, for the audit row. Names only —
@@ -352,6 +415,8 @@ func (p Patch) ChangedKeys() []string {
 		{"mic_capture_enabled", p.MicCaptureEnabled != nil},
 		{"image_update_policy", p.ImageUpdatePolicy != nil},
 		{"allowed_origins", p.AllowedOrigins != nil},
+		{"release_channel", p.ReleaseChannel != nil},
+		{"release_edge_branch", p.ReleaseEdgeBranch != nil},
 	} {
 		if f.set {
 			keys = append(keys, f.name)
@@ -364,7 +429,8 @@ func (p Patch) ChangedKeys() []string {
 func (p Patch) Empty() bool {
 	return p.RegistrationMode == nil && p.StorageProvider == nil && p.LibraryDiscoveryEnabled == nil &&
 		p.LibraryDiscoveryIntervalMinutes == nil && p.LibraryDiscoveryAppDetailsEnabled == nil &&
-		p.MicCaptureEnabled == nil && p.ImageUpdatePolicy == nil && p.AllowedOrigins == nil
+		p.MicCaptureEnabled == nil && p.ImageUpdatePolicy == nil && p.AllowedOrigins == nil &&
+		p.ReleaseChannel == nil && p.ReleaseEdgeBranch == nil
 }
 
 // Apply writes every provided field in one statement inside one transaction —
@@ -419,12 +485,15 @@ func (s *Store) Apply(ctx context.Context, p Patch, updatedBy string) (st Settin
 		    mic_capture_enabled                  = COALESCE($6::boolean, s.mic_capture_enabled),
 		    image_update_policy                  = COALESCE($7::text,    s.image_update_policy),
 		    allowed_origins                      = COALESCE($8::text[],  s.allowed_origins),
-		    updated_by                           = $9::uuid
+		    release_channel                      = COALESCE($9::text,    s.release_channel),
+		    release_edge_branch                  = COALESCE($10::text,   s.release_edge_branch),
+		    updated_by                           = $11::uuid
 		WHERE id = true
 		RETURNING `+settingsColumns+`
 	`, p.RegistrationMode, p.StorageProvider, p.LibraryDiscoveryEnabled,
 		p.LibraryDiscoveryIntervalMinutes, p.LibraryDiscoveryAppDetailsEnabled,
-		p.MicCaptureEnabled, p.ImageUpdatePolicy, origins, updatedBy))
+		p.MicCaptureEnabled, p.ImageUpdatePolicy, origins,
+		p.ReleaseChannel, p.ReleaseEdgeBranch, updatedBy))
 	if err != nil {
 		return Settings{}, false, fmt.Errorf("update instance_settings: %w", err)
 	}

@@ -130,6 +130,16 @@ async fn main() {
     // (`probe-encoder --json`). Format knob: QUASAR_LOG_FORMAT.
     quasar_node_agent::logging::init_subscriber();
 
+    // Belt-and-braces for launches that bypass the Dockerfile.vulkan entrypoint (dev
+    // stacks, `scripts/dev/dev.sh run`, a bare `cargo run`): that entrypoint already
+    // unsets these before exec, for the same reason (#94 — libva treats a present-but-
+    // empty LIBVA_TRACE as tracing-on and writes a file per encode thread into cwd).
+    unset_empty_presence_vars(&[
+        "LIBVA_TRACE",
+        "MESA_LOADER_DRIVER_OVERRIDE",
+        "LIBGL_ALWAYS_SOFTWARE",
+    ]);
+
     install_sigusr1_fallback();
 
     match parse_args() {
@@ -154,6 +164,38 @@ async fn main() {
         Mode::VirtualInputSelfTest => run_vinput_selftest(),
         // Handled above, before the subscriber is installed.
         Mode::EglSelfTest { .. } => unreachable!(),
+    }
+}
+
+/// Some libraries treat a var's mere PRESENCE as "enabled", even empty (libva's
+/// `LIBVA_TRACE` — #94: compose always passes it through, so an operator who never set it
+/// gets a present-but-empty value, and libva starts tracing every VA thread to disk using
+/// it as a file prefix). Unset any of `vars` found set-but-empty; a var that is absent or
+/// non-empty is untouched.
+fn unset_empty_presence_vars(vars: &[&str]) {
+    unset_empty_presence_vars_with(
+        vars,
+        |name| std::env::var(name).ok(),
+        |name| std::env::remove_var(name),
+    );
+}
+
+/// Pure core of [`unset_empty_presence_vars`], parameterized on `get`/`unset` so it is
+/// testable without touching the real process environment.
+fn unset_empty_presence_vars_with(
+    vars: &[&str],
+    get: impl Fn(&str) -> Option<String>,
+    mut unset: impl FnMut(&str),
+) {
+    for &name in vars {
+        if get(name).is_some_and(|v| v.is_empty()) {
+            unset(name);
+            tracing::info!(
+                token = "env-empty-presence-var-unset",
+                "{name} was set but empty — unsetting (presence alone enables behavior in \
+                 the underlying library)"
+            );
+        }
     }
 }
 
@@ -248,9 +290,11 @@ async fn run_agent() {
     };
 
     tracing::info!(
-        "quasar node-agent {} starting (node_name={})",
-        env!("CARGO_PKG_VERSION"),
-        cfg.node_name
+        "quasar node-agent {} starting (node_name={}, source_commit={}, built_at={})",
+        quasar_node_agent::buildinfo::AGENT_VERSION,
+        cfg.node_name,
+        quasar_node_agent::buildinfo::source_commit().unwrap_or("unknown"),
+        quasar_node_agent::buildinfo::built_at().unwrap_or("unknown"),
     );
     // #419: records the allocator A/B arm plus baseline RSS, so a soak artifact is
     // self-describing.
@@ -448,8 +492,49 @@ fn run_vinput_selftest() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    /// #94 regression: a set-but-empty var is removed.
+    #[test]
+    fn unset_empty_presence_vars_removes_an_empty_var() {
+        let env: HashMap<&str, &str> = [("LIBVA_TRACE", "")].into_iter().collect();
+        let mut removed = Vec::new();
+        unset_empty_presence_vars_with(
+            &["LIBVA_TRACE"],
+            |name| env.get(name).map(|v| v.to_string()),
+            |name| removed.push(name.to_string()),
+        );
+        assert_eq!(removed, vec!["LIBVA_TRACE"]);
+    }
+
+    /// A non-empty value is a deliberate operator choice (e.g. a bounded trace path) —
+    /// must survive untouched.
+    #[test]
+    fn unset_empty_presence_vars_keeps_a_non_empty_var() {
+        let env: HashMap<&str, &str> = [("LIBVA_TRACE", "/tmp/trace/x")].into_iter().collect();
+        let mut removed = Vec::new();
+        unset_empty_presence_vars_with(
+            &["LIBVA_TRACE"],
+            |name| env.get(name).map(|v| v.to_string()),
+            |name| removed.push(name.to_string()),
+        );
+        assert!(removed.is_empty());
+    }
+
+    /// A var that was never set is left alone — no spurious "unset" call.
+    #[test]
+    fn unset_empty_presence_vars_ignores_an_absent_var() {
+        let env: HashMap<&str, &str> = HashMap::new();
+        let mut removed = Vec::new();
+        unset_empty_presence_vars_with(
+            &["LIBVA_TRACE"],
+            |name| env.get(name).map(|v| v.to_string()),
+            |name| removed.push(name.to_string()),
+        );
+        assert!(removed.is_empty());
+    }
 
     /// Fails to COMPILE the day `agent::run`'s future stops being `Send + 'static` — the
     /// day the spawn would silently have to be reverted. The future is never polled.

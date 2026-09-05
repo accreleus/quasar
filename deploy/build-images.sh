@@ -51,6 +51,7 @@
 #
 # ROLES
 #   runtime   quasar-node-agent    Dockerfile.vulkan --target runtime   AMD/Intel + Vulkan
+#   updater   quasar-updater       Dockerfile.updater --target runtime  per-host updater
 #   dev       quasar-agent-dev     Dockerfile.vulkan --target dev       build/test env only
 #   control   quasar-control-plane Dockerfile.control.prod              control plane
 #   profiling quasar-profiling     Dockerfile.vulkan --target profiling PROF-02 capture image
@@ -229,13 +230,13 @@ add_arg() { EXTRA_ARGS+=("$1"); }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    toolchain|runtime|dev|control|profiling) ROLES+=("$1"); shift ;;
+    toolchain|runtime|dev|control|profiling|updater) ROLES+=("$1"); shift ;;
     # `nv` was the NVIDIA lineage, retired by #545. Named explicitly so an old
     # command line or CI job fails with a sentence instead of "unknown argument".
     nv) die "the 'nv' role was retired by #545: quasar-node-agent (role 'runtime') is the universal agent image, and the CUDA userspace it needs is fetched at run time. Build 'runtime'." ;;
     # `profiling` is deliberately NOT in `all`: it is an on-demand diagnostic variant,
     # and a routine `all` build must not silently spend a full extra Rust compile on it.
-    all) ROLES+=(runtime dev control); shift ;;
+    all) ROLES+=(runtime dev control updater); shift ;;
 
     --base-image)       add_arg "QUASAR_BASE_IMAGE=${2:?}"; BASE_IMAGE_SET=1; shift 2 ;;
     --gst-version)      add_arg "GST_VERSION=${2:?}";              shift 2 ;;
@@ -306,7 +307,7 @@ done
 [ "$BASE_IMAGE_SET" = 1 ] || add_arg "QUASAR_BASE_IMAGE=$BASE_IMAGE_DEFAULT"
 
 # De-duplicate, then order so a base image is built before anything that layers on it.
-order_of() { case "$1" in toolchain) echo 0 ;; runtime) echo 1 ;; dev) echo 3 ;; profiling) echo 4 ;; control) echo 5 ;; esac; }
+order_of() { case "$1" in toolchain) echo 0 ;; runtime) echo 1 ;; dev) echo 3 ;; profiling) echo 4 ;; control) echo 5 ;; updater) echo 6 ;; esac; }
 # Plain while-read rather than `mapfile`: mapfile is bash 4+, and this script should
 # stay parseable/runnable on any bash the operator happens to have.
 _ordered=()
@@ -433,12 +434,14 @@ fi
 role_dockerfile() { case "$1" in
   toolchain|runtime|dev|profiling) echo "deploy/Dockerfile.vulkan" ;;
   control)                  echo "deploy/Dockerfile.control.prod" ;;
+  updater)                  echo "deploy/Dockerfile.updater" ;;
 esac; }
 role_target() { case "$1" in
   toolchain) echo toolchain ;;
   runtime) echo runtime ;; dev) echo dev ;; profiling) echo profiling ;;
   # Dockerfile.control.prod has a single unnamed final stage — no --target applies.
   control) echo "" ;;
+  updater) echo runtime ;;
 esac; }
 # Images are named for the ROLE they play, not for the technology that happens to
 # be inside them (2026-08-26 rename). The NVIDIA lineage that used to sit here was
@@ -448,6 +451,7 @@ role_image() { case "$1" in
   runtime) echo quasar-node-agent ;;
   dev) echo quasar-agent-dev ;; control) echo quasar-control-plane ;;
   profiling) echo quasar-profiling ;;
+  updater) echo quasar-updater ;;
 esac; }
 # The pre-rename name for a role, or nothing. Written as an extra LOCAL tag on the
 # same image id so an un-migrated deploy/.env, a hand-typed `docker run`, or a
@@ -533,14 +537,27 @@ fi
 # with --git-ref that is the worktree's commit, not the caller's HEAD.
 #
 # Deliberately NOT folded into the shared EXTRA_ARGS list: EXTRA_ARGS is passed to
-# EVERY role's docker build (that's how a single --base-image override reaches both
-# Dockerfile.vulkan and Dockerfile.control.prod, since both declare ARG
-# QUASAR_BASE_IMAGE). SOURCE_COMMIT/BUILT_AT are declared only in
-# Dockerfile.vulkan's `runtime` stage — Dockerfile.control.prod has no such ARG — so
-# adding them here would make the default no-args invocation (runtime+nv+control)
-# die at the undeclared-ARG guard below the moment the `control` role's turn comes
-# up. Attached per-role instead, only when that role's Dockerfile declares them.
+# EVERY role's docker build, including the toolchain, which declares neither and
+# would die at the undeclared-ARG guard below. Attached per-role instead, only to
+# the Dockerfiles that declare them (Dockerfile.vulkan's runtime stage, and
+# Dockerfile.control.prod since #107, which needs the same values BOTH as image
+# labels and as the -ldflags identity stamps the binary serves).
 PROVENANCE_ARGS=("SOURCE_COMMIT=$SRC_SHA" "BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+
+# The control image's org.quasar.schema.version: the highest NNNN_*.up.sql the
+# binary embeds. Twin of internal/buildinfo.HighestMigration — the label and the
+# served identity must be the same number. "unknown" when the directory cannot be
+# read; the edge channel then skips the build rather than guessing (#111).
+highest_migration() {
+  local dir="$BUILD_CONTEXT/control-plane/migrations" n
+  n="$(find "$dir" -maxdepth 1 -name '*.up.sql' -printf '%f\n' 2>/dev/null \
+        | sed -n 's/^0*\([0-9][0-9]*\)_.*\.up\.sql$/\1/p' | sort -n | tail -1)"
+  printf '%s' "${n:-unknown}"
+}
+# The SPA bakes in the ref it was built from (web/vite.config.ts) for the
+# enroll-host one-liner (#100): the exact tag when the tree sits on one, else the
+# commit. Declared only by Dockerfile.control.prod, so attached per role below.
+SRC_REF="$(git -C "$BUILD_CONTEXT" describe --tags --exact-match 2>/dev/null || echo "$SRC_SHA")"
 
 # ── Validate every override against the ARGs the Dockerfile actually declares ──
 # A --build-arg for an undeclared ARG is silently ignored by Docker. That is exactly
@@ -775,7 +792,30 @@ for role in "${ROLES[@]}"; do
   fi
 
   ROLE_ARGS=("${EXTRA_ARGS[@]:-}")
+  # The updater is the one role not built on the quasar-base family (its base is
+  # the upstream docker CLI image), so it declares no QUASAR_BASE_IMAGE ARG and
+  # the shared default must not be handed to it. An EXPLICIT --base-image is a
+  # misunderstanding worth saying out loud rather than dropping quietly.
+  if [ "$role" = updater ]; then
+    [ "$BASE_IMAGE_SET" = 1 ] && warn "role 'updater' is not built on quasar-base; --base-image does not apply to it and is ignored for this role."
+    _filtered=()
+    for kv in "${ROLE_ARGS[@]:-}"; do
+      case "$kv" in QUASAR_BASE_IMAGE=*) : ;; *) [ -n "$kv" ] && _filtered+=("$kv") ;; esac
+    done
+    ROLE_ARGS=("${_filtered[@]:-}")
+  fi
   [ "$DF_REL" = "deploy/Dockerfile.vulkan" ] && ROLE_ARGS+=("${PROVENANCE_ARGS[@]}")
+  [ "$DF_REL" = "deploy/Dockerfile.updater" ] && ROLE_ARGS+=("${PROVENANCE_ARGS[@]}")
+  if [ "$DF_REL" = "deploy/Dockerfile.control.prod" ]; then
+    ROLE_ARGS+=("${PROVENANCE_ARGS[@]}")
+    ROLE_ARGS+=("SCHEMA_VERSION=$(highest_migration)")
+    [ "$SRC_REF" != unknown ] && ROLE_ARGS+=("QUASAR_SOURCE_REF=$SRC_REF")
+    # The served semver, and only from a real `vX.Y.Z` tag. A branch build has no
+    # version and must say so ("dev") rather than borrow the last tag's number.
+    case "$SRC_REF" in
+      v[0-9]*) ROLE_ARGS+=("QUASAR_VERSION=${SRC_REF#v}") ;;
+    esac
+  fi
 
   [ "$DF_REL" = "deploy/Dockerfile.vulkan" ] && { check_pins_agree "$DF_ABS" "$PINS_FILE" || exit 2; }
   [ "$DF_REL" = "deploy/Dockerfile.control.prod" ] && { check_base_arg_agrees "$DF_ABS" || exit 2; }

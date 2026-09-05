@@ -14,18 +14,15 @@
 //! pass continues; an id is confirmed only once its store is gone or provably
 //! absent (idempotent). A live mount is skipped and retried next pass.
 
+use crate::cp_http::CpClient;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::session::home;
-
-/// HTTP request timeout for the GC endpoints (small JSON payloads).
-const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One reapable home as returned by GET /v1/agent/storage/gc-pending. Built from
 /// the wire shape via [`PendingHome::from_wire`] (the wire field `ref` is a Rust
@@ -102,28 +99,16 @@ pub struct GcPass {
 /// `ContainerRuntime` — the docker-volume driver is hard-removed (#473); the
 /// local-driver reap path is plain `std::fs::remove_dir_all`.
 pub struct GcClient {
-    http_base: String,
-    node_name: String,
-    node_secret: String,
+    cp: CpClient,
     live: LiveRefs,
 }
 
+const GC_PENDING_PATH: &str = "/v1/agent/storage/gc-pending";
+const GC_CONFIRM_PATH: &str = "/v1/agent/storage/gc-confirm";
+
 impl GcClient {
-    pub fn new(http_base: String, node_name: String, node_secret: String, live: LiveRefs) -> Self {
-        GcClient {
-            http_base,
-            node_name,
-            node_secret,
-            live,
-        }
-    }
-
-    fn pending_url(&self) -> String {
-        format!("{}/v1/agent/storage/gc-pending", self.http_base)
-    }
-
-    fn confirm_url(&self) -> String {
-        format!("{}/v1/agent/storage/gc-confirm", self.http_base)
+    pub fn new(cp: CpClient, live: LiveRefs) -> Self {
+        GcClient { cp, live }
     }
 
     /// Run one full reap pass: pull → reap each → confirm reaped ids. Blocking;
@@ -242,7 +227,7 @@ impl GcClient {
             );
             return false;
         }
-        match std::fs::remove_dir_all(&path) {
+        let removed = match std::fs::remove_dir_all(&path) {
             Ok(()) => {
                 info!("gc: removed local home dir {dir}");
                 true
@@ -258,24 +243,17 @@ impl GcClient {
                 );
                 false
             }
+        };
+        if removed {
+            prune_empty_throwaway_parent(&root, &path);
         }
+        removed
     }
 
     // ── HTTP ────────────────────────────────────────────────────────────────
 
     fn fetch_pending(&self) -> Result<Vec<PendingHome>, String> {
-        let mut resp = ureq::get(&self.pending_url())
-            .config()
-            .timeout_global(Some(HTTP_TIMEOUT))
-            .build()
-            .header("Authorization", &format!("Bearer {}", self.node_secret))
-            .header("X-Quasar-Node", &self.node_name)
-            .call()
-            .map_err(|e| format!("GET gc-pending: {e}"))?;
-        let parsed: PendingResp = resp
-            .body_mut()
-            .read_json()
-            .map_err(|e| format!("decode gc-pending: {e}"))?;
+        let parsed: PendingResp = self.cp.get_json(GC_PENDING_PATH)?;
         Ok(parsed
             .homes
             .into_iter()
@@ -285,23 +263,47 @@ impl GcClient {
 
     fn confirm(&self, ids: &[String]) -> Result<i64, String> {
         let body = serde_json::json!({ "home_ids": ids });
-        let mut resp = ureq::post(&self.confirm_url())
-            .config()
-            .timeout_global(Some(HTTP_TIMEOUT))
-            .build()
-            .header("Authorization", &format!("Bearer {}", self.node_secret))
-            .header("X-Quasar-Node", &self.node_name)
-            .send_json(body)
-            .map_err(|e| format!("POST gc-confirm: {e}"))?;
         #[derive(Deserialize)]
         struct ConfirmResp {
             deleted: i64,
         }
-        let parsed: ConfirmResp = resp
-            .body_mut()
-            .read_json()
-            .map_err(|e| format!("decode gc-confirm: {e}"))?;
+        let parsed: ConfirmResp = self.cp.post_json(GC_CONFIRM_PATH, &body)?;
         Ok(parsed.deleted)
+    }
+}
+
+/// Remove the throwaway-identity home directory a reap has just emptied.
+///
+/// The local driver lays a home out as `<root>/<user-slug>/<app-slug>`, so
+/// reaping one app leaves `<root>/<user-slug>/` behind. That is not merely
+/// untidy: removing the child bumps the parent's mtime, which restarts
+/// `homes_gc`'s idle clock, so an emptied ephemeral home looks freshly used for
+/// another full retention window (#92).
+///
+/// Confined three ways: the parent must be a DIRECT child of `root`, its name
+/// must be an exact ephemeral username (`homes_gc::is_throwaway_name` — a real
+/// account's home never matches), and removal is `remove_dir`, which the kernel
+/// refuses on a non-empty directory. A second app's home under the same user
+/// therefore survives, and that refusal is silent because it is the normal case.
+fn prune_empty_throwaway_parent(root: &Path, home_dir: &Path) -> bool {
+    let Some(parent) = home_dir.parent() else {
+        return false;
+    };
+    if parent.parent() != Some(root) {
+        return false;
+    }
+    let Some(name) = parent.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if !crate::session::homes_gc::is_throwaway_name(name) {
+        return false;
+    }
+    match std::fs::remove_dir(parent) {
+        Ok(()) => {
+            info!("gc: removed emptied throwaway home {}", parent.display());
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -317,20 +319,13 @@ pub const JOB_ID: &str = "home.gc";
 /// live-ref skip rule and the `QUASAR_HOME_ROOT` path-traversal refusal are
 /// unchanged; the pass still cannot fail the agent.
 pub struct HomeGcJobRunner {
-    http_base: String,
-    node_name: String,
-    node_secret: String,
+    cp: CpClient,
     live: LiveRefs,
 }
 
 impl HomeGcJobRunner {
-    pub fn new(http_base: String, node_name: String, node_secret: String, live: LiveRefs) -> Self {
-        HomeGcJobRunner {
-            http_base,
-            node_name,
-            node_secret,
-            live,
-        }
+    pub fn new(cp: CpClient, live: LiveRefs) -> Self {
+        HomeGcJobRunner { cp, live }
     }
 }
 
@@ -344,12 +339,7 @@ impl crate::jobs::JobRunner for HomeGcJobRunner {
         _params: &serde_json::Value,
         _abort: &crate::jobs::AbortFlag,
     ) -> crate::jobs::JobOutcome {
-        let client = GcClient::new(
-            self.http_base.clone(),
-            self.node_name.clone(),
-            self.node_secret.clone(),
-            self.live.clone(),
-        );
+        let client = GcClient::new(self.cp.clone(), self.live.clone());
         summarize(client.run_pass())
     }
 }
@@ -384,6 +374,58 @@ fn summarize(pass: GcPass) -> crate::jobs::JobOutcome {
 mod tests {
     use super::*;
     use crate::jobs::JobOutcome;
+
+    /// #92: reaping `<root>/<user>/<app>` must take the emptied ephemeral parent
+    /// with it, or `homes_gc`'s idle clock restarts on the removal.
+    #[test]
+    fn an_emptied_throwaway_parent_goes_with_the_last_app_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("homes");
+        let user = root.join("agent-0bdc5920-fc5182ea");
+        let app = user.join("kde-desktop");
+        std::fs::create_dir_all(&app).unwrap();
+
+        std::fs::remove_dir_all(&app).unwrap();
+        assert!(prune_empty_throwaway_parent(&root, &app));
+        assert!(!user.exists(), "the emptied throwaway home must go too");
+    }
+
+    #[test]
+    fn a_parent_still_holding_another_app_home_survives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("homes");
+        let user = root.join("agent-0bdc5920-fc5182ea");
+        let reaped = user.join("kde-desktop");
+        std::fs::create_dir_all(&reaped).unwrap();
+        std::fs::create_dir_all(user.join("steam")).unwrap();
+
+        std::fs::remove_dir_all(&reaped).unwrap();
+        assert!(!prune_empty_throwaway_parent(&root, &reaped));
+        assert!(user.exists(), "a home with another app must survive");
+    }
+
+    /// A real account's home is never removed, and neither is anything that is
+    /// not a direct child of the root.
+    #[test]
+    fn only_a_direct_child_of_root_with_a_throwaway_name_is_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("homes");
+
+        let real = root.join("salty2011");
+        std::fs::create_dir_all(&real).unwrap();
+        assert!(!prune_empty_throwaway_parent(&root, &real.join("app")));
+        assert!(real.exists(), "a real account's home is never a candidate");
+
+        // Two levels down: the parent is not a direct child of the root.
+        let nested = root.join("agent-13d96fa5-8dff9894/sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert!(!prune_empty_throwaway_parent(&root, &nested.join("app")));
+        assert!(nested.exists());
+
+        // The root itself must never be removed, however empty.
+        assert!(!prune_empty_throwaway_parent(&root, &root.join("anything")));
+        assert!(root.exists());
+    }
 
     #[test]
     fn a_pass_with_nothing_pending_is_skipped_with_a_reason() {

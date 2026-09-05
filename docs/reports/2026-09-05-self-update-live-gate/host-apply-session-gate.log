@@ -1,0 +1,18 @@
+[gate 02:48:12] injected 3 storage entries
+[gate 02:48:14] screenshot /tmp/qgate/gpu-test/apply/library.png
+[gate 02:48:14] clicked Play Steam
+[gate 02:48:15] session cd270588-9354-4047-8e6d-a6e326d81d16
+[gate 02:48:15] screenshot /tmp/qgate/gpu-test/apply/session-000s.png
+[gate 02:48:15] stats {"video":true,"w":0,"h":0,"t":0,"paused":true,"decoded":0,"dropped":0,"ready":0}
+[gate 02:48:45] screenshot /tmp/qgate/gpu-test/apply/session-030s.png
+[gate 02:48:45] stats {"video":true,"w":2560,"h":1440,"t":28,"paused":false,"decoded":1692,"dropped":43,"ready":4}
+[gate 02:49:15] screenshot /tmp/qgate/gpu-test/apply/session-060s.png
+[gate 02:49:15] stats {"video":true,"w":2560,"h":1440,"t":58.3,"paused":false,"decoded":3511,"dropped":70,"ready":4}
+[gate 02:49:46] screenshot /tmp/qgate/gpu-test/apply/session-090s.png
+[gate 02:49:46] stats {"video":true,"w":2560,"h":1440,"t":88.5,"paused":false,"decoded":5317,"dropped":107,"ready":4}
+[gate 02:50:16] screenshot /tmp/qgate/gpu-test/apply/session-120s.png
+[gate 02:50:16] stats {"video":true,"w":2560,"h":1440,"t":118.6,"paused":false,"decoded":7128,"dropped":151,"ready":4}
+[gate 02:50:46] screenshot /tmp/qgate/gpu-test/apply/session-final-150s.png
+[gate 02:50:46] final stats {"video":true,"w":2560,"h":1440,"t":146.8,"paused":false,"decoded":8776,"dropped":237,"ready":4}
+[gate 02:50:46] DELETE session -> 202
+GATE DECODED sid=cd270588-9354-4047-8e6d-a6e326d81d16 frames=8776 size=2560x1440

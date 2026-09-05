@@ -228,6 +228,10 @@ services:
       # (Dockerfile.control.prod). The dev overlay bind-mounts ../web/dist for the
       # source path, where Dockerfile.control does not bake it.
       - quasar-control-tls:/var/lib/quasar-control
+      # The updater's socket + result files. Read-write because connecting to a
+      # unix socket needs write permission on it; the results directory is
+      # root-owned 0755, so this uid (1000) can read a result and write nothing.
+      - quasar-updater-run:/run/quasar-updater
     depends_on:
       quasar-postgres:
         condition: service_healthy
@@ -342,6 +346,11 @@ services:
       # Instrumentation passthroughs (empty = off). VULKAN_GST_DEBUG is the retired
       # name of GST_DEBUG from the old per-image overlays; still honoured.
       QUASAR_CAPTURE_H264: ${QUASAR_CAPTURE_H264:-}
+      # Unlike the other passthroughs above, libva treats mere PRESENCE as "tracing on" —
+      # an empty value is not "off" to libva itself (#94: 66 GB of .<pid>.thd-* files from
+      # one unset operator var). The entrypoint (deploy/Dockerfile.vulkan) unsets this var
+      # when it arrives empty, so leaving it unset here is safe. If you DO set it, point it
+      # at a bounded, volume-backed path: libva writes one file per encode thread per session.
       LIBVA_TRACE: ${LIBVA_TRACE:-}
       GST_DEBUG: ${GST_DEBUG:-${VULKAN_GST_DEBUG:-}}
       # SO-02 encoder tuning knobs (VA path). Defaults match the node-agent code
@@ -562,8 +571,21 @@ services:
       # device cgroup still gates any actual access, so this grants nothing
       # beyond visibility (and the agent already holds the docker socket).
       - /dev:/host/dev:ro
+      # The HOST's securityfs, read-only, to answer one question: is the scoped
+      # `quasar-app` AppArmor profile loaded (#76)? Without an answer the agent keeps
+      # launching app containers `apparmor=unconfined`. securityfs is not mounted inside a
+      # container, so the agent's own /sys/kernel/security is an empty directory — same
+      # /host convention as /dev above. The list of loaded profile names is all this is
+      # read for; changing policy needs CAP_MAC_ADMIN, which this container does not have.
+      # Assumes securityfs exists (it does on every AppArmor host, and on any kernel with
+      # CONFIG_SECURITYFS); on a kernel without it, drop this line.
+      - /sys/kernel/security:/host/sys/kernel/security:ro
       # Persistent agent state: the per-node secret issued at enrollment.
       - quasar-agent-data:/var/lib/quasar-agent
+      # Same volume the updater and the control plane share: the agent POSTs
+      # `release_apply` here and reads the result file back (agent-api.md
+      # `release_state`).
+      - quasar-updater-run:/run/quasar-updater
     # Docker's default seccomp profile is intentional and deliberately NOT
     # overridden here: a disposable AMD VA driver initialization and a 720p60
     # vah264enc run both passed under it on 2026-07-13, superseding the historical
@@ -598,6 +620,40 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # ── Updater ───────────────────────────────────────────────────────────────────
+  # The per-host actor that pulls a platform release and recreates the containers
+  # it replaces, because a container cannot recreate itself (CONTEXT.md
+  # "Updater"). It acts only when told to, over the unix socket in
+  # quasar-updater-run, and only on the stack it sits beside.
+  #
+  # IT IS NOT PART OF A RELEASE, and its image is therefore a TAG, not a digest:
+  # it is what applies a release, so it cannot be one of the images an apply
+  # moves. Updating it is a separate, manual step (docs/upgrading.md).
+  quasar-updater:
+    image: ${QUASAR_UPDATER_IMAGE:-quasar-updater:latest}
+    environment:
+      # Registry namespaces this host will pull platform images from. Empty =
+      # the org's own. docs/configuration.md.
+      QUASAR_UPDATER_ALLOWED_NAMESPACES: ${QUASAR_UPDATER_ALLOWED_NAMESPACES:-}
+      QUASAR_UPDATER_WAIT_TIMEOUT_S: ${QUASAR_UPDATER_WAIT_TIMEOUT_S:-}
+    volumes:
+      # Podman: point QUASAR_DOCKER_SOCKET at /run/user/<uid>/podman/podman.sock.
+      - ${QUASAR_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+      # THE STACK DIRECTORY AT ITS OWN HOST PATH. The updater reconstructs its
+      # compose invocation from its own container labels
+      # (com.docker.compose.project.working_dir / .config_files), and those are
+      # HOST paths — so the same absolute path must resolve inside this
+      # container or every compose call reads a file that is not there. The
+      # updater refuses to serve and says so when it does not (fail closed).
+      # deploy/redeploy.sh seeds QUASAR_STACK_DIR; set it by hand for a compose
+      # invocation that does not go through redeploy.sh.
+      - ${QUASAR_STACK_DIR:-/var/lib/quasar/stack-dir-unset}:${QUASAR_STACK_DIR:-/var/lib/quasar/stack-dir-unset}
+      - quasar-updater-run:/run/quasar-updater
+    # SELinux-enforcing hosts refuse every call to the mounted socket without
+    # this (Podman; Docker was unaffected). Prototype finding 1.
+    security_opt: ["label=disable"]
+    restart: unless-stopped
+
 volumes:
   # No `name:` override here (#448). Compose v5 rejects an empty `name:` value
   # outright at `up` — "invalid volume name or ID: value is empty" — for EVERY
@@ -612,3 +668,4 @@ volumes:
   quasar-postgres-data:
   quasar-agent-data:
   quasar-control-tls: # #376 TLS pair + UI-P7 artwork cache (/var/lib/quasar-control)
+  quasar-updater-run: # the updater's socket (0666) + one result file per apply

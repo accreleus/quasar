@@ -22,6 +22,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/devices"
 	"github.com/accreleus/quasar/control-plane/internal/health"
 	"github.com/accreleus/quasar/control-plane/internal/hostcfg"
+	"github.com/accreleus/quasar/control-plane/internal/hostenroll"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
 	"github.com/accreleus/quasar/control-plane/internal/ice"
 	"github.com/accreleus/quasar/control-plane/internal/images"
@@ -29,6 +30,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/jobs"
 	"github.com/accreleus/quasar/control-plane/internal/library"
 	"github.com/accreleus/quasar/control-plane/internal/origins"
+	"github.com/accreleus/quasar/control-plane/internal/platform"
 	"github.com/accreleus/quasar/control-plane/internal/secrets"
 	"github.com/accreleus/quasar/control-plane/internal/session"
 	"github.com/accreleus/quasar/control-plane/internal/settings"
@@ -76,15 +78,22 @@ type Services struct {
 	cfgHandler      *hostcfg.Handler
 	settingsHandler *settings.Handler
 	invitesHandler  *invites.Handler
+	enrollHandler   *hostenroll.Handler
 	consoleHandler  *console.Handler
-	auditHandler    *audit.Handler
-	artworkHandler  *artwork.Handler
-	secretsHandler  *secrets.Handler
-	libraryHandler  *library.Handler
-	imagesHandler   *images.Handler
-	setupHandler    *setup.Service
-	accessHandler   *access.Service
-	jobsHandler     *jobs.Handler
+	platformHandler *platform.Handler
+	// The apply half (#116). Nil in a route-recorder build; Register only takes
+	// method values, so the drift test still sees the routes.
+	platformApply  *platform.ApplyHandler
+	applyRunner    *platform.Runner
+	fleetRunner    *platform.FleetRunner
+	auditHandler   *audit.Handler
+	artworkHandler *artwork.Handler
+	secretsHandler *secrets.Handler
+	libraryHandler *library.Handler
+	imagesHandler  *images.Handler
+	setupHandler   *setup.Service
+	accessHandler  *access.Service
+	jobsHandler    *jobs.Handler
 	// Registered unconditionally; with no agent-side runner it returns an empty
 	// claim list.
 	jobsAgentHandler *jobs.AgentHandler
@@ -113,6 +122,35 @@ func (q jobEnqueuer) EnqueueJob(ctx context.Context, jobID, hostID string, param
 	return err
 }
 
+// homeGCJobID is the registered id AND the id the nudge enqueues; the two must
+// stay one name. Agent-side twin: node-agent `session::gc::JOB_ID`.
+const homeGCJobID = "home.gc"
+
+// homeReaper implements auth.HomeReaper by enqueuing a `home.gc` run on each
+// host that held a deleted user's homes (#92). Best-effort by contract: the
+// homes are already orphaned tombstones, so a failure here only means they wait
+// for the job's own interval.
+type homeReaper struct {
+	d   *jobs.Dispatcher
+	log *slog.Logger
+}
+
+func (h homeReaper) ReapHomesOn(ctx context.Context, hostIDs []string) {
+	for _, hostID := range hostIDs {
+		switch _, err := h.d.Enqueue(ctx, homeGCJobID, hostID, nil); {
+		case err == nil:
+			h.log.Info("nudged home GC after a user delete", "host_id", hostID)
+		case errors.Is(err, jobs.ErrDisabled):
+			// An operator turned the job off; not something to warn about every
+			// reaper sweep.
+			h.log.Debug("home GC is disabled — not nudging", "host_id", hostID)
+		default:
+			h.log.Warn("could not nudge home GC after a user delete",
+				"host_id", hostID, "err", err)
+		}
+	}
+}
+
 // An unmanaged job's Description is also the API's unmanaged_note (openapi.yaml
 // Job). detail is the symbol inside file; empty when the file alone identifies it.
 func unmanagedDescription(desc, file, detail string) string {
@@ -120,6 +158,75 @@ func unmanagedDescription(desc, file, detail string) string {
 		return fmt.Sprintf("%s Hard-coded in %s.", desc, file)
 	}
 	return fmt.Sprintf("%s Hard-coded in %s (%s).", desc, file, detail)
+}
+
+func ptrTimeOfDay(t jobs.TimeOfDay) *jobs.TimeOfDay { return &t }
+
+// platformDeps adapts three stores onto the release view's reads. It lives in
+// main for the reason registrationGate does: internal/platform importing
+// settings and jobs (both of which sit above it) would be a cycle.
+//
+// checked_at is the last SUCCEEDED detection run and last_error the last FAILED
+// one, cleared once a later run succeeded — the two are read independently
+// because "failing since then" is a stale checked_at WITH an error, not one or
+// the other.
+func platformDeps(store *platform.Store, set *settings.Store, jobStore *jobs.Store) *platform.Deps {
+	return &platform.Deps{
+		Channel:  set.ReleaseChannel,
+		Hosts:    store.Hosts,
+		Releases: store.Releases,
+		// One read for the whole page: `active_apply` and the
+		// `attempt_in_flight` eligibility reason come from the same rows.
+		OpenAttempts: store.OpenAttempts,
+		Detection: func(ctx context.Context) (platform.DetectionStatus, error) {
+			var st platform.DetectionStatus
+			succeeded, hadSuccess, err := jobStore.LastRunInState(ctx, platform.DetectJobID, "", jobs.StateSucceeded)
+			if err != nil {
+				return st, err
+			}
+			if hadSuccess {
+				st.CheckedAt = succeeded.FinishedAt
+			}
+			failed, hadFailure, err := jobStore.LastRunInState(ctx, platform.DetectJobID, "", jobs.StateFailed)
+			if err != nil {
+				return st, err
+			}
+			if hadFailure && failed.Error != "" &&
+				(st.CheckedAt == nil || failed.FinishedAt == nil || failed.FinishedAt.After(*st.CheckedAt)) {
+				msg := failed.Error
+				st.LastError = &msg
+			}
+			return st, nil
+		},
+	}
+}
+
+// releaseEventsAdapter turns agentws' wire vocabulary into internal/platform's.
+// It lives in main for the same reason platformDeps does: neither package may
+// import the other, and the translation is the seam that keeps it that way.
+type releaseEventsAdapter struct{ runner *platform.Runner }
+
+func (a releaseEventsAdapter) AgentReleaseState(ctx context.Context, hostID string, m agentws.ReleaseStateMsg) {
+	previous := make([]platform.PreviousDigest, 0, len(m.Previous))
+	for _, p := range m.Previous {
+		previous = append(previous, platform.PreviousDigest{Name: p.Name, Digest: p.Digest})
+	}
+	components := make([]platform.ComponentDigest, 0, len(m.Components))
+	for _, c := range m.Components {
+		components = append(components, platform.ComponentDigest{Name: c.Name, Image: c.Image, Digest: c.Digest})
+	}
+	a.runner.HandleReleaseState(ctx, hostID, platform.ReleaseStateReport{
+		RequestID:  m.RequestID,
+		State:      m.State,
+		Reason:     m.Reason,
+		Components: components,
+		Previous:   previous,
+		Output:     m.Output,
+	})
+}
+
+func (a releaseEventsAdapter) AgentRegistered(ctx context.Context, hostID string, sourceCommit *string) {
+	a.runner.HandleRegister(ctx, hostID, sourceCommit)
 }
 
 // NewServices wires every subsystem; call Stop() for the goroutines it starts.
@@ -324,6 +431,9 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		session.WithAuditor(auditStore),
 		// Mic capture (spec §3.5): the launcher reads mic_capture_enabled per launch.
 		session.WithMicSettings(settingsStore),
+		// #11: uncordon must check the live connection, not just hosts.status — a
+		// control-plane restart leaves a draining row whose agent has not reconnected.
+		session.WithAgentConnectivity(agentRegistry),
 		// #402: the relay buffers agent signaling frames per session while no browser
 		// is attached. Register/Unregister are browser-driven, so a headless session
 		// would leak its buffer; the coordinator evicts at every terminal transition.
@@ -379,6 +489,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	cfgHandler := hostcfg.NewHandler(cfgStore, agentRegistry, sessionStore, auditStore)
 	settingsHandler := settings.NewHandler(settingsStore, auditStore)
 	invitesHandler := invites.NewHandler(invites.NewStore(pool), cfg.PublicBaseURL, auditStore)
+	enrollHandler := hostenroll.NewHandler(hostenroll.NewStore(pool), auditStore)
 	consoleHandler := console.NewHandler(consoleStore, agentRegistry, auditStore)
 	auditHandler := audit.NewHandler(auditStore)
 
@@ -666,9 +777,10 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 				return jobs.Outcome{}, err
 			}
 			return jobs.Succeeded(jobs.Summary{
-				"deleted":    rep.Deleted,
-				"in_session": rep.InSession,
-				"failed":     rep.Failed,
+				"deleted":      rep.Deleted,
+				"in_session":   rep.InSession,
+				"failed":       rep.Failed,
+				"hosts_nudged": rep.HostsNudged,
 			}), nil
 		},
 	})
@@ -697,14 +809,153 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		ResolveParams: imagesEnsurer.WarmupParamsForHost,
 	})
 	jobRegistry.MustRegister(jobs.Definition{
-		ID:          "home.gc",
+		ID:          homeGCJobID,
 		Name:        "Home backing-store GC",
-		Description: "Reaps the docker volume or directory behind each user home the control plane has tombstoned past its 24 h grace period (#175).",
+		Description: "Reaps the docker volume or directory behind each user home the control plane has tombstoned: past its 24 h grace period, or at once when the owning user is gone (#175, #92).",
 		Plane:       jobs.PlaneAgent,
 		Scope:       jobs.ScopeHost,
 		Managed:     true,
 		// Reproduces the agent ticker exactly: adoption must not change its timing.
 		Default: jobs.Schedule{Kind: jobs.KindInterval, IntervalSecs: 6 * 3600},
+	})
+
+	// Platform-release detection (#104/#110). Weekly, in a one-hour window that
+	// opens 02:00 Monday UTC: a self-hosted instance learns about a release on
+	// the operator's quiet hour, not on ours. "Check now" is this job's run-now
+	// action and bypasses the window, as it does for every job.
+	platformStore := platform.NewStore(pool)
+	releaseRepo := platform.ConfiguredReleaseRepo()
+	var releaseDetector *platform.Detector
+	if releaseRepo != "" {
+		releaseClient, err := platform.NewReleaseClient()
+		if err != nil {
+			janitorStop()
+			return nil, fmt.Errorf("platform release egress client: %w", err)
+		}
+		releaseDetector = platform.NewDetector(
+			platform.NewGitHubSource(releaseClient, platform.ConfiguredReleaseAPI(), releaseRepo,
+				os.Getenv("QUASAR_PLATFORM_RELEASE_TOKEN")),
+			platformStore, log)
+
+		// The edge channel reads the images themselves, so it needs the registry
+		// client rather than the GitHub one. The platform registry is added to
+		// the image allowlist here so repointing it takes one knob, not two.
+		platformRegistry := platform.ConfiguredPlatformRegistry()
+		releaseDetector = releaseDetector.WithEdge(
+			platform.NewRegistryEdgeSource(
+				images.NewRegistryResolverForHosts(nil, images.RegistryEgressHosts(platformRegistry)),
+				platformRegistry, releaseRepo),
+			settingsStore.ReleaseChannel)
+	}
+	// Platform-release APPLY (#116, amendment 2). The runner is the per-host
+	// state machine; its three effects are wired here because internal/platform
+	// must not import internal/session or internal/agentws (the one-way
+	// dependency the control-plane/agent split rests on).
+	//
+	// Cordon is the EXISTING drain with force=false: this path never stops a
+	// session, because the recreate does that and doing it twice can only fail
+	// halfway. Uncordon's ErrHostNotResumable on an offline host is expected —
+	// a host mid-recreate has no agent, and its register brings it back online.
+	applyRunner := platform.NewRunner(platformStore, platform.ApplyDeps{
+		Cordon: func(ctx context.Context, hostID string) error {
+			_, err := coordinator.DrainHost(ctx, hostID, false)
+			return err
+		},
+		Uncordon: func(ctx context.Context, hostID string) error {
+			_, err := coordinator.UncordonHost(ctx, hostID)
+			return err
+		},
+		Send: func(ctx context.Context, hostID string, cmd platform.ApplyCommand) (platform.Ack, error) {
+			components := make([]agentws.ReleaseComponent, 0, len(cmd.Components))
+			for _, c := range cmd.Components {
+				components = append(components, agentws.ReleaseComponent{
+					Name: c.Name, Image: c.Image, Digest: c.Digest,
+				})
+			}
+			ack, err := agentRegistry.SendReleaseApply(ctx, hostID, cmd.RequestID, agentws.ReleaseApplyCmd{
+				// The command id is the request id: one apply, one identity,
+				// and an ack that names the thing it accepted.
+				RequestID: cmd.RequestID,
+				Release: agentws.ReleaseApplyRef{
+					ID: cmd.Release.ID, Version: cmd.Release.Version,
+					SourceCommit: cmd.Release.SourceCommit,
+				},
+				Components: components,
+				Force:      cmd.Force,
+			})
+			return platform.Ack{OK: ack.OK, Error: ack.Error}, err
+		},
+	}, log)
+	agentHandler.SetReleaseEvents(releaseEventsAdapter{runner: applyRunner})
+	// An edge release stores no manifest, so its digest is resolved from the
+	// commit's image tag at apply time, off the same allowlisted registry the
+	// edge detector reads.
+	edgeApply := platform.NewEdgeApplyResolver(
+		images.NewRegistryResolverForHosts(nil, images.RegistryEgressHosts(platform.ConfiguredPlatformRegistry())),
+		platform.ConfiguredPlatformRegistry(), platform.ConfiguredReleaseRepo())
+	// The control plane applies ITSELF over the updater socket beside it, never
+	// over an agent connection (agent-api.md §release_apply).
+	updaterClient := platform.NewUpdaterClient(platform.ConfiguredUpdaterSocket())
+	selfApplier := platform.NewSelfApplier(platformStore, updaterClient, log)
+
+	pDeps := platformDeps(platformStore, settingsStore, jobStore)
+	pDeps.UpdaterPresent = selfApplier.UpdaterPresent
+	pDeps.ControlPlaneInstallMode = selfApplier.InstallMode
+	platformHandler := platform.NewHandler(pDeps, log)
+	// The fleet run cordons the WHOLE instance for its control-plane step:
+	// recreating the control plane drops every agent connection, and an agent
+	// stops its sessions when that drops.
+	fleetCordons := platform.FleetCordons{
+		Cordon: func(ctx context.Context, hostID string) error {
+			_, err := coordinator.DrainHost(ctx, hostID, false)
+			return err
+		},
+		Uncordon: func(ctx context.Context, hostID string) error {
+			_, err := coordinator.UncordonHost(ctx, hostID)
+			return err
+		},
+	}
+	fleetRunner := platform.NewFleetRunner(platformStore, applyRunner, selfApplier,
+		platform.ManifestOrEdge{Edge: edgeApply}, fleetCordons, platformHandler.ReleaseView, log)
+	platformApply := platform.NewApplyHandler(platformStore, applyRunner, platformHandler.ReleaseView, auditStore, log).
+		WithEdgeResolver(edgeApply).
+		WithFleet(fleetRunner)
+	// Closed after construction: the view reports the active run, and the run's
+	// skips live on the sequencer the apply handler owns.
+	pDeps.ActiveRun = platformApply.ActiveRun
+	// An apply the previous process was driving is re-adopted, not orphaned: its
+	// deadline is re-armed from started_at, and the row's persisted request id is
+	// what still correlates the agent's release_state. A fleet run is re-adopted
+	// the same way — including after the restart its own first target caused.
+	applyRunner.Adopt(context.Background())
+	fleetRunner.Adopt(context.Background())
+
+	jobRegistry.MustRegister(jobs.Definition{
+		ID:          platform.DetectJobID,
+		Name:        "Platform release detection",
+		Description: "Reads the configured repository's releases and records new platform releases and their manifests.",
+		Plane:       jobs.PlaneControl,
+		Scope:       jobs.ScopeInstance,
+		Managed:     true,
+		Default: jobs.Schedule{
+			Kind:         jobs.KindInterval,
+			IntervalSecs: 7 * 24 * 3600,
+			WindowStart:  ptrTimeOfDay(jobs.MustTimeOfDay("02:00")),
+			WindowEnd:    ptrTimeOfDay(jobs.MustTimeOfDay("03:00")),
+			WindowDays:   []int{int(time.Monday)},
+			Timezone:     "UTC",
+		},
+		EnvOverride: "QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL",
+		Run: func(ctx context.Context, rc jobs.RunContext) (jobs.Outcome, error) {
+			if releaseDetector == nil {
+				return jobs.Skipped("no platform release repository configured (QUASAR_PLATFORM_RELEASE_REPO)"), nil
+			}
+			rep, err := releaseDetector.Detect(ctx)
+			if err != nil {
+				return jobs.Outcome{}, err
+			}
+			return jobs.Succeeded(rep.Summary()), nil
+		},
 	})
 
 	// Unmanaged legacy jobs (§8.6). Never claimed, never scheduled, "run now"
@@ -757,6 +1008,9 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// image reached `ready`. Wired after the dispatcher exists; until then, and when
 	// QUASAR_JOBS leaves it inert, an image_state is ingested as before.
 	imagesEnsurer.SetJobEnqueuer(jobEnqueuer{jobsDispatcher})
+	// Deleting a user orphans its homes; this turns the next reap from "within
+	// the 6h home.gc interval" into "on the next agent poll" (#92).
+	authSvc.SetHomeReaper(homeReaper{jobsDispatcher, log})
 	jobsHandler := jobs.NewHandler(jobStore, jobRegistry, jobsDispatcher, log, auditStore)
 
 	// Agent auth is homeProvider, the same storage.Manager passed to the storage and
@@ -776,7 +1030,12 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		cfgHandler:       cfgHandler,
 		settingsHandler:  settingsHandler,
 		invitesHandler:   invitesHandler,
+		enrollHandler:    enrollHandler,
 		consoleHandler:   consoleHandler,
+		platformHandler:  platformHandler,
+		platformApply:    platformApply,
+		applyRunner:      applyRunner,
+		fleetRunner:      fleetRunner,
 		auditHandler:     auditHandler,
 		artworkHandler:   artworkHandler,
 		secretsHandler:   secretsHandler,
@@ -815,7 +1074,10 @@ func (s *Services) RegisterRoutes(mux httpx.Router) {
 	}
 	s.settingsHandler.Register(mux, admin)
 	s.invitesHandler.Register(mux, admin)
+	s.enrollHandler.Register(mux, admin)
 	s.consoleHandler.Register(mux, admin)
+	s.platformHandler.Register(mux, admin)
+	s.platformApply.Register(mux, admin)
 	s.auditHandler.Register(mux, admin)
 	s.secretsHandler.Register(mux, admin)
 	s.artworkHandler.Register(mux, s.authHandler.RequireAuth, s.authHandler.RequireAdmin)
@@ -854,6 +1116,14 @@ func (s *Services) Stop() {
 	// `running` row the claim reaper only aborts an hour later.
 	if s.jobsDispatcher != nil {
 		s.jobsDispatcher.Wait()
+	}
+	// In-flight applies are cancelled, not failed: their rows stay open and the
+	// next boot's Adopt resumes them.
+	if s.fleetRunner != nil {
+		s.fleetRunner.Close()
+	}
+	if s.applyRunner != nil {
+		s.applyRunner.Close()
 	}
 	s.coordinator.Close()
 }

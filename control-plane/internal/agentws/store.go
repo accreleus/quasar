@@ -13,16 +13,33 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/accreleus/quasar/control-plane/internal/hostenroll"
 )
 
 var (
 	ErrInvalidEnrollmentToken = errors.New("invalid enrollment token")
-	ErrHostNotFound           = errors.New("host not found")
-	ErrInvalidNodeSecret      = errors.New("invalid node secret")
+	// ErrHostAgentConnected refuses re-enrollment onto a host whose agent is live (#96).
+	// Enrollment rotates node_secret, so allowing it against a connected host is identity
+	// takeover: the incumbent's next reconnect fails and the scheduler keeps placing work
+	// on the row the caller now authenticates as. A genuinely dead host is unaffected.
+	ErrHostAgentConnected = errors.New("a live agent is already registered under this node name")
+	ErrHostNotFound       = errors.New("host not found")
+	ErrInvalidNodeSecret  = errors.New("invalid node secret")
 )
 
 type agentStore struct {
 	pool *pgxpool.Pool
+	// isAgentConnected reports whether a host id holds a live agent websocket ON THIS
+	// PROCESS. A func rather than the Registry itself, so the store stays testable
+	// without one. It is only half the liveness answer: another replica's connection is
+	// invisible here, which is why enrollHost also reads the host row's own status (see
+	// hostIsLiveSQL). Nil is treated as "no local connections".
+	isAgentConnected func(hostID string) bool
+	// redeemEnrollment consumes a minted token inside the caller's transaction. Injected
+	// so agentws does not import hostenroll (and so tests can supply a stub). Nil means
+	// minted tokens are unavailable: only the static token can enroll.
+	redeemEnrollment func(ctx context.Context, db hostenroll.DBTX, plaintext, nodeName string) error
 }
 
 // Takes a host's GPU inventory out of scheduling before a capacity report
@@ -73,11 +90,19 @@ var agentRestartMinGap = 15 * time.Second
 // enrollHost creates or re-enrolls a host using the enrollment token.
 // If the host row already exists, the node_secret is rotated (idempotent re-enrollment).
 func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, token, configToken string) (registerResult, error) {
-	// Constant-time: the enrollment token gates rogue-node enrollment, and
-	// /agent/ws is reachable pre-auth — don't leak a byte-by-byte timing oracle.
-	if subtle.ConstantTimeCompare([]byte(token), []byte(configToken)) != 1 {
-		return registerResult{}, ErrInvalidEnrollmentToken
-	}
+	// Two credentials are accepted, minted first (#12/#96).
+	//
+	// A minted token is per-host, hashed, single-use and expiring; the static configToken
+	// is the fleet-wide value every deployment has today and must keep working across the
+	// upgrade. Redemption is deferred into the transaction below so that consuming a
+	// single-use token is atomic with the host row it creates: if the upsert fails, the
+	// use is given back with the rollback.
+	//
+	// Constant-time on the static compare: the enrollment token gates rogue-node
+	// enrollment, and /agent/ws is reachable pre-auth — don't leak a byte-by-byte timing
+	// oracle. A minted token needs no such care: it is looked up by hash, not compared.
+	staticOK := configToken != "" &&
+		subtle.ConstantTimeCompare([]byte(token), []byte(configToken)) == 1
 
 	secret := make([]byte, 32)
 	if _, err := rand.Read(secret); err != nil {
@@ -92,6 +117,46 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 		return registerResult{}, fmt.Errorf("begin enrollment: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// Consume the credential inside the transaction (see the note above), and BEFORE the
+	// takeover guard below: /agent/ws is reachable pre-auth, and running the guard first
+	// told an unauthenticated caller whether a node_name exists with a live agent.
+	if !staticOK {
+		if s.redeemEnrollment == nil {
+			return registerResult{}, ErrInvalidEnrollmentToken // minted tokens unavailable
+		}
+		if err := s.redeemEnrollment(ctx, tx, token, nodeName); err != nil {
+			// Only a genuinely unusable token is an auth failure. A DB outage reported as
+			// "authentication failed" sends the operator to rotate a token that was fine.
+			if errors.Is(err, hostenroll.ErrInvalidToken) {
+				return registerResult{}, ErrInvalidEnrollmentToken
+			}
+			return registerResult{}, fmt.Errorf("redeem enrollment token: %w", err)
+		}
+	}
+
+	// #96: enrollment onto an EXISTING node_name replaces its node_secret. That is correct
+	// for re-enrolling a host you own and it is identity takeover for one you do not, so
+	// refuse it while that host's agent is live. The refusal happens after the redeem, and
+	// the deferred rollback gives the use back — a refused takeover never burns a token.
+	var existingID string
+	var dbLive bool
+	err = tx.QueryRow(ctx,
+		`SELECT id::text, `+hostIsLiveSQL+` FROM hosts WHERE node_name = $1 FOR UPDATE`,
+		nodeName).Scan(&existingID, &dbLive)
+	switch {
+	case err == nil:
+		if dbLive || (s.isAgentConnected != nil && s.isAgentConnected(existingID)) {
+			return registerResult{}, ErrHostAgentConnected
+		}
+	case errors.Is(err, pgx.ErrNoRows):
+		// A new node_name: nothing to take over, and nothing locked either — zero rows
+		// lock nothing. Concurrent first-enrollments of the same name serialize on the
+		// ON CONFLICT (node_name) below instead, which is the same outcome.
+	default:
+		return registerResult{}, fmt.Errorf("look up host for enrollment: %w", err)
+	}
+
 	// Enrollment is an identity event: the restart tally resets, and
 	// agent_disconnected_at is cleared so a re-enrolling node never carries a
 	// stale pending disconnect into its first reconnect.
@@ -124,6 +189,18 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 	}
 	return registerResult{HostID: hostID, NodeSecret: secretHex}, nil
 }
+
+// hostIsLiveSQL is the DB half of the #96 takeover guard: the registry only sees
+// connections on THIS process, so a multi-replica control plane would let a
+// takeover through against a host connected to a sibling replica. markOffline
+// stamps agent_disconnected_at on every path that ends the read loop, so a row
+// that is online with none is one somebody believes they are still serving.
+//
+// Tradeoff: after a control-plane crash the deferred markOffline never runs, so a
+// dead host reads as live until its agent connects and drops again — nothing
+// sweeps stale rows. A genuine re-enrollment in that window uses a new node_name,
+// or the admin deletes the host row first.
+const hostIsLiveSQL = `(status = 'online' AND agent_disconnected_at IS NULL)`
 
 // reconnectHost verifies the node_secret and marks the host online.
 func (s *agentStore) reconnectHost(ctx context.Context, nodeName, agentVersion, nodeSecret string) (registerResult, error) {
@@ -324,6 +401,33 @@ func (s *agentStore) upsertCapacityWithDetection(ctx context.Context, hostID str
 	}
 
 	return tx.Commit(ctx)
+}
+
+// replaceHostIdentity writes the four platform-release identity columns
+// (schema.md `hosts`, migration 0074) from one `register` message.
+//
+// WHOLESALE REPLACE, not keep-if-absent, and that is the point: every column is
+// written from this message and an absent field becomes NULL. The columns
+// beside it (storage, codecs, readiness) are keep-if-absent because they
+// describe hardware an older agent merely fails to re-report; these describe
+// the binary connected right now, so an agent downgraded to a pre-amendment
+// build must read as identity-unknown rather than carry a commit that
+// describes nothing running.
+//
+// One statement, no branching on which fields are present — a partial UPDATE
+// would be exactly the keep-if-absent behaviour the contract forbids.
+func (s *agentStore) replaceHostIdentity(ctx context.Context, hostID string, id HostIdentity) error {
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE hosts SET
+			source_commit   = $2,
+			built_at        = $3,
+			install_mode    = $4,
+			updater_present = $5
+		WHERE id = $1
+	`, hostID, id.SourceCommit, id.BuiltAt, id.InstallMode, id.UpdaterPresent); err != nil {
+		return fmt.Errorf("update host identity: %w", err)
+	}
+	return nil
 }
 
 // upsertHostReadiness writes hosts.readiness. Keep-if-absent (nil leaves value

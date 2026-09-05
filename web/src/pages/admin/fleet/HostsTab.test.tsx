@@ -22,6 +22,7 @@ vi.mock("../../../lib/fleet/FleetContext", () => ({
 }));
 
 import * as adminApi from "../../../api/admin";
+import { ApiError } from "../../../api/client";
 import type { AdminSession, GPUAvailability, Host } from "../../../api/types";
 import type { FleetContextValue } from "../../../lib/fleet/FleetContext";
 import { SectionHeadProvider } from "../../../components/shell/sectionHead";
@@ -374,10 +375,23 @@ describe("HostsTab — the row menu", () => {
     await waitFor(() => expect(screen.getByText("drain failed")).toBeTruthy());
   });
 
-  it("only offers to remove a host that has gone offline", async () => {
+  it("offers to remove a host regardless of status — the precondition lives in the dialog", async () => {
     renderTab();
     await openMenu();
-    expect(screen.getByRole("menuitem", { name: "Remove host" }).hasAttribute("disabled")).toBe(true);
+    expect(screen.getByRole("menuitem", { name: "Remove host" }).hasAttribute("disabled")).toBe(false);
+  });
+
+  it("explains a connected host in the remove dialog and offers Drain instead of a confirm", async () => {
+    renderTab();
+    await openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove host" }));
+
+    expect(screen.getByText(/is still connected/)).toBeTruthy();
+    expect(screen.getByText(/docker compose --project-directory \/opt\/quasar-agent down/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Remove host" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Drain" }));
+    await waitFor(() => expect(mocked.drainHost).toHaveBeenCalledWith("tok", "c2059601"));
   });
 
   it("removes an offline host through a confirmation", async () => {
@@ -392,6 +406,24 @@ describe("HostsTab — the row menu", () => {
     fireEvent.click(screen.getByRole("button", { name: "Remove host" }));
     await waitFor(() => expect(mocked.deleteHost).toHaveBeenCalledWith("tok", "c2059601"));
   });
+
+  it("keeps the remove dialog open and shows the server's message on a 409", async () => {
+    setFleet([host({ status: "offline" })]);
+    mocked.deleteHost.mockRejectedValue(
+      new ApiError(409, "conflict", "host is online — drain and wait for it to disconnect first"),
+    );
+    renderTab();
+    await openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove host" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove host" }));
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("host is online — drain and wait for it to disconnect first"),
+      ).toBeTruthy(),
+    );
+    expect(screen.getByText(/permanently removes/)).toBeTruthy();
+  });
 });
 
 describe("HostsTab — enroll", () => {
@@ -401,23 +433,27 @@ describe("HostsTab — enroll", () => {
     fireEvent.click(screen.getByRole("button", { name: "Enroll host" }));
   };
 
-  it("shows the agent's control plane URL, derived from this origin", async () => {
+  // #12: the modal composes a wss:// enrollment string from the page origin. jsdom's
+  // origin is plain http, and from there the string would carry ws:// — the cleartext
+  // link the enrollment string exists to close — so the modal refuses rather than
+  // derive a ws:// address, and never mints.
+  it("refuses to compose an enrollment string from a plain-http origin", async () => {
     await openEnroll();
 
     expect(screen.getByRole("dialog")).toBeTruthy();
-    expect(screen.getByText("Control plane URL")).toBeTruthy();
-    expect(screen.getByText("ws://localhost:3000")).toBeTruthy();
-    expect(screen.getAllByText(/deploy\/\.env/, { selector: ".mono" }).length).toBeGreaterThan(0);
+    expect(screen.getByTestId("enroll-needs-https")).toBeTruthy();
+    expect(screen.queryByText(/ws:\/\/localhost/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Mint enrollment string" })).toBeNull();
+    expect(mocked.mintHostEnrollment).not.toHaveBeenCalled();
   });
 
-  it("prints no command, and says agent-only packaging is operator work", async () => {
+  // #100: from a refused origin there is no command either — the one-liner is
+  // composed only from a minted string, and nothing is minted here.
+  it("prints no install command from a refused origin", async () => {
     await openEnroll();
 
     const dialog = screen.getByRole("dialog");
-    expect(dialog.textContent).not.toMatch(/docker compose/);
-    expect(screen.getByText(/There is no supported agent-only package yet/)).toBeTruthy();
-    expect(screen.getByRole("link", { name: "Add a second GPU host" }).getAttribute("href")).toBe(
-      "https://accreleus.github.io/quasar/install/second-host/",
-    );
+    expect(dialog.textContent).not.toMatch(/curl |docker compose/);
+    expect(screen.queryByTestId("enroll-command")).toBeNull();
   });
 });

@@ -23,6 +23,12 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  # The tracker is the other public surface, and it changes without a push — an
+  # issue filed from another repo's agent never touches this one. So the issue
+  # scan runs on a schedule instead. Same justification as the push trigger
+  # above: one API call and a grep, against a disclosure that is irreversible.
+  schedule:
+    - cron: '17 6 * * *'
 
 concurrency:
   group: leak-scan-${{ github.ref }}
@@ -30,6 +36,7 @@ concurrency:
 
 permissions:
   contents: read
+  issues: read
 
 jobs:
   scan:
@@ -43,3 +50,11 @@ jobs:
           fetch-depth: 0
       - name: Scan tracked content
         run: bash scripts/dev/leak-scan.sh
+
+      # Never on a pull_request: a fork PR's token cannot read issues, and a
+      # scheduled/push run on the repo itself already covers the tracker.
+      - name: Scan the issue tracker
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/dev/leak-scan.sh --issues

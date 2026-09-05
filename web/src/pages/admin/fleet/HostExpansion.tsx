@@ -1,5 +1,5 @@
 /**
- * The four-column drawer under a host row (mock §A.4): hardware, GPUs and
+ * The drawer under a host row (mock §A.4): hardware, the agent build, GPUs and
  * slots, storage, and the three places to go next. Host memory use, CPU load
  * and host uptime are not on the agent report, so they are absent, not guessed.
  */
@@ -14,6 +14,13 @@ import { bytesFromMb } from "../../../lib/format/bytes";
 import { relativeTime } from "../../../lib/format/relativeTime";
 import { primaryGpuLabel } from "../../../lib/gpu";
 import { percentOf, storageTotals, tone, uptimeSince, utilisation } from "./hostDerived";
+import {
+  installModeHint,
+  installModeLabel,
+  shortCommit,
+  updaterHint,
+  updaterLabel,
+} from "./hostIdentity";
 
 export interface HostExpansionProps {
   host: Host;
@@ -79,6 +86,48 @@ export function HostExpansion({ host, gpus, gpuError, actionError, now }: HostEx
               }
             />
           )}
+        </div>
+
+        <div>
+          <div className="eyebrow">Build</div>
+          <Fact
+            label="Commit"
+            value={
+              host.source_commit ? (
+                <span className="mono" title={host.source_commit}>
+                  {shortCommit(host.source_commit)}
+                </span>
+              ) : (
+                "Unknown"
+              )
+            }
+          />
+          <Fact
+            label="Built"
+            value={
+              host.built_at ? (
+                <span title={host.built_at}>{relativeTime(host.built_at, now)}</span>
+              ) : (
+                "Unknown"
+              )
+            }
+          />
+          <Fact
+            label="Install"
+            value={
+              <span title={installModeHint(host.install_mode)}>
+                {installModeLabel(host.install_mode)}
+              </span>
+            }
+          />
+          <Fact
+            label="Updater"
+            value={
+              <span title={updaterHint(host.updater_present)}>
+                {updaterLabel(host.updater_present)}
+              </span>
+            }
+          />
         </div>
 
         <div>

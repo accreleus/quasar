@@ -180,6 +180,48 @@ it is safe to run any time and leaves your real stack untouched.
 
 ---
 
+## Upgrading a registry install
+
+The section above rebuilds a host from source. A **registry install** — one
+running published images, pinned by digest in `deploy/.env` (`deploy/README.md`
+install path A) — upgrades by re-pinning those two digests and recreating the
+two containers they name. There is no build and no `git` step: the images
+already exist.
+
+Take the digests from the release's `platform-release-manifest.json` asset,
+which lists exactly two components, control-plane then node-agent. The admin
+Releases page shows the same commands filled in for the release it is offering.
+
+```bash
+# 1. Pin the release's digests — the two lines in deploy/.env.
+QUASAR_CONTROL_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@sha256:<control-plane digest>
+QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@sha256:<node-agent digest>
+
+# 2. Pull the pinned images and recreate only those two services.
+docker compose -f deploy/docker-compose.yml pull quasar-control-plane quasar-node-agent
+docker compose -f deploy/docker-compose.yml up -d --force-recreate --no-deps quasar-control-plane quasar-node-agent
+```
+
+Notes that matter:
+
+- **Repeat every `-f` you deploy with.** An NVIDIA host that came up with
+  `-f deploy/docker-compose.yml -f deploy/docker-compose.nvidia.yml` must pass
+  both files here too; a compose invocation that drops an overlay recreates the
+  containers without it.
+- **Recreating the node agent kills every session on that host.** Drain it
+  first if that matters.
+- **Recreating the control plane runs migrations**, so the one-way rule below
+  applies from that moment: the digest you just replaced is no longer a safe
+  thing to pin back if the new one migrated the database.
+- Nothing else is touched: `--no-deps` leaves Postgres, the updater and the
+  session containers alone.
+
+An install with the updater beside it (see "The updater") does this for you
+from the admin UI once the apply half ships; the commands above are what it
+runs, and stay the manual path for a host without one.
+
+---
+
 ## The one-way migration rule
 
 Quasar's control-plane binary runs its database migrations automatically on
@@ -247,6 +289,269 @@ pre-upgrade backup is the way to get a clean, working database again on
 the older version.
 
 ---
+
+## One-time: the control-plane TLS volume's ownership
+
+**Only if your stack was built from source before this change, and only once.**
+
+Both control-plane images now run as uid 1000. The source-built image used to run
+as root, so on a stack that ever ran it the `quasar-control-tls` volume — which
+holds the TLS pair and the artwork cache — is owned by root. Applying a published
+release to such a stack starts a uid-1000 container that cannot write it, and the
+control plane crash-loops:
+
+```
+fatal: tls: write TLS key /var/lib/quasar-control/tls/key.pem: permission denied
+```
+
+Nothing is damaged and nothing is lost. Give the volume to uid 1000:
+
+```bash
+# The volume name is <compose project>_quasar-control-tls. The project is the
+# stack directory's name unless COMPOSE_PROJECT_NAME says otherwise, so this
+# lists the real one rather than assuming it:
+docker volume ls --format '{{.Name}}' | grep quasar-control-tls
+
+docker run --rm -v <that name>:/t alpine chown -R 1000:1000 /t
+docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-control-plane
+```
+
+`deploy/redeploy.sh` does this for you on every deploy that touches the control
+plane, so a source install that deploys through it needs nothing here. The
+enrolled-host stack (`deploy/enroll-host.sh`) has no control-plane volume at all
+— it runs only the agent and the updater — so nothing there needs it either.
+
+---
+
+## The updater
+
+`quasar-updater` is the per-host actor that applies a platform release: it pulls
+the pinned digests and recreates the containers they replace, because a
+container cannot recreate itself. Nothing on this page requires it — a manual
+upgrade is still the two `.env` vars plus `docker compose up -d` — but the
+admin-facing "apply this release to this host" path goes through it.
+
+### Adding it to an existing install
+
+One time, on each host:
+
+```bash
+# 1. Get the compose file that declares the service.
+git -C /path/to/quasar pull            # source install
+#   ...or re-download deploy/docker-compose.yml for a registry install.
+
+# 2. Tell it where the stack lives. This must be the stack directory's
+#    absolute HOST path: the updater rebuilds its compose invocation from its
+#    own container labels, and those record host paths.
+echo "QUASAR_STACK_DIR=$(cd deploy && pwd)" >> deploy/.env
+#    A registry install also names the image (a tag, see below):
+echo "QUASAR_UPDATER_IMAGE=ghcr.io/accreleus/quasar/quasar-updater:latest" >> deploy/.env
+
+# 3. Bring it up. --no-deps so nothing else is touched.
+docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-updater
+
+# 4. Verify it discovered the stack it is sitting beside.
+docker compose -f deploy/docker-compose.yml exec quasar-node-agent \
+  curl -s --unix-socket /run/quasar-updater/updater.sock http://u/v1/self
+```
+
+That last command should print the compose project, the working directory, the
+`-f` files (**including every overlay you use**) and the namespace allowlist. If
+it instead reports that the stack directory is not visible in the container,
+`QUASAR_STACK_DIR` is wrong or unset — the updater fails closed rather than
+guessing at a compose invocation and recreating the wrong project's containers.
+
+`deploy/redeploy.sh` seeds `QUASAR_STACK_DIR` for you, so a source install that
+deploys through it only needs step 1 and step 3.
+
+### Updating the updater itself
+
+**The updater is not part of a platform release.** It is what applies one, so it
+is not one of the images an apply moves by digest, and it is not in the release
+manifest. Its image is therefore named by a tag, and it updates by hand:
+
+```bash
+docker compose -f deploy/docker-compose.yml pull quasar-updater
+docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-updater
+```
+
+Safe at any time: it holds no state beyond the result files in its volume, and
+an apply in flight is a detached `docker compose` invocation that finishes
+regardless.
+
+### What an apply does, and what it costs
+
+Recreating the **node agent kills every session on that host.** The
+`quasar-sess-*` / `quasar-pulse-*` sibling containers survive the recreate and
+are then swept by the new agent's startup orphan sweep, so nothing is orphaned
+and the apply is safe to retry — but the sessions are gone. Draining the host
+first is the control plane's job.
+
+Recreating the **control plane** runs the one-way migrations above. If the new
+container never starts, the updater restores `.env` from `.env.prev` and brings
+the previous digest back itself — never having started, it cannot have migrated
+anything. If it starts and then fails, the updater leaves it failed and records
+the previous digests in the result, because a started container may already have
+migrated and the rule at the top of this section then applies.
+
+### Applying from the console
+
+Admin › Fleet › Releases lists every target and, for an eligible host, offers
+**Apply**. What that does, in order: the host is cordoned through the same drain
+as `POST /v1/hosts/{id}/drain`, the attempt sits in **waiting_sessions** showing
+how many sessions are still running, and only when the count reaches zero is the
+apply handed to that host's updater. The cordon is then restored to whatever it
+was before — a host an admin had already cordoned stays cordoned, and one that
+was serving goes back to serving, whether the apply succeeded or failed.
+
+The confirmation's **force** checkbox skips the wait and names the number of
+live sessions it ends, because recreating the agent kills them all either way
+(above); with force off, nothing is lost. Force never stops sessions itself —
+the recreate does.
+
+Success is the host registering again on the release's commit, which is why a
+successful apply is reported by the *new* agent and not by the one that carried
+it out. A failed apply leaves the host on whatever it is running, records the
+previous digests, and shows the reason; there is no automatic rollback for a
+host. The Apply history section below the targets is the durable record, and
+`GET /v1/admin/platform/attempts` is the same data.
+
+Every result carries the previous digests, so the manual restore is copy-paste:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec quasar-node-agent \
+  curl -s --unix-socket /run/quasar-updater/updater.sock \
+  http://u/v1/results/<request-id>
+```
+
+### Update Quasar from the console
+
+Admin › Fleet › Releases offers **Update Quasar** when a newer release is
+listed and nothing else is in flight. It moves the whole instance in one
+action, in one order that is not configurable: **the control plane first, then
+every eligible host, one at a time.** An agent is never moved past the control
+plane (ADR 0002), which is why the order exists and why there is no "hosts
+only" button.
+
+What happens, step by step:
+
+1. **The whole fleet drains first.** Recreating the control plane drops every
+   agent's connection to it, and an agent stops its sessions the moment that
+   connection drops — so a control-plane update ends **every session on the
+   instance**, not none. The run cordons every host and sits in
+   **waiting_sessions**, showing the instance-wide count, until it reaches
+   zero. Force skips the wait and ends them. The cordons are released when the
+   run finishes, and a host an admin had already cordoned stays cordoned.
+2. **The control plane updates itself** through the updater sitting beside it,
+   over that host's local socket — never through a node agent. It pulls, then
+   recreates its own container, so **the API and the console go away for
+   roughly twenty seconds.**
+3. **The new build reports the outcome.** The control plane cannot report its
+   own success — carrying the update out kills the process holding the request
+   — so the request id is written down before the socket call and the binary
+   that boots reads it back. Its own liveness on the release's commit is the
+   evidence; the run and its cancel flag are in Postgres, so the run resumes
+   on the new build.
+4. **Each host follows, in the fleet list's order.** Each is cordoned, drained,
+   updated and uncordoned exactly as a per-host Apply is (above).
+5. **The run stops at the first target that fails**, and says which. Targets
+   behind it are already updated; targets ahead of it were never started. There
+   is no partial state to interpret: the per-target list is the outcome.
+
+**Force** applies to every target in the run, the control plane included, and
+the confirmation names how many hosts it will take sessions from. Without it
+the run waits for the instance to empty before the control-plane step, and then
+for each host's own sessions in turn, which means a run can sit for as long as
+someone is playing.
+
+**A source-built control plane is not offered an update from here.** The
+registry image is a different build with a different uid, and swapping one for
+the other leaves a control plane that starts and then cannot write its own
+state — a crash-loop with no console left to fix it from. The control plane
+learns its own install mode from the updater beside it; a source install, or
+one it cannot determine, makes the target ineligible and refuses the run
+outright, since nothing moves before the control plane.
+
+**Hosts that cannot take the release are skipped, not failed** — an offline
+host, a source-built host, one with no updater. The run lists them under "Not
+updated" with the reason, and still finishes `succeeded`. "Nothing was
+eligible" is a legitimate outcome, not an error.
+
+**Cancel stops the run before its next target and never interrupts one in
+flight.** A pull or a recreate that has already started finishes; interrupting
+a recreate is how a stack is left with no container at all. The flag is
+persisted, so a cancel pressed while the control plane is restarting is
+honoured by the build that boots.
+
+**An admin tab left open across the control-plane step** shows "Quasar was
+updated" with a Reload button once the served build differs from the one the
+page was loaded from. The page keeps polling through the restart and says the
+control plane is restarting rather than showing an error.
+
+### Reverting an agent
+
+A host row also offers **Revert** once that host has one succeeded update behind
+it. A revert is an apply with an older digest set. Same drain, same message,
+same states, aimed at the digests recorded as `previous_digests` on that host's
+last succeeded attempt. It is not a version picker. The only thing on offer is
+the build the host was demonstrably running a moment ago, and the confirmation
+names that digest.
+
+**The control plane is never revertible from the console, at any depth.** It
+carries migrations, and rolling it below the database's applied version is the
+crash-loop described under the one-way migration rule above. Agents carry no
+migrations, so they can move back, but never above the control plane's own
+release: a revert whose target orders above it is refused with
+`host_not_eligible` / `release_above_control_plane`. That is only reachable if
+the control plane was moved backwards by hand.
+
+If this instance can no longer name the build being restored, because the digest
+predates its release records, the revert still runs. That digest ran on this
+host under this control plane or an older one, so it cannot be above it. What
+changes is the evidence. With a known release, the revert succeeds when the host
+registers on that release's commit. Without one, the updater's own `succeeded`
+result resolves it, as does a register reporting any commit other than the one
+it was reverted from. A revert is itself recorded as an attempt
+(`kind: revert`), so it can be reverted in turn.
+
+---
+
+## Cutting a release
+
+This is for a maintainer publishing a new Quasar version, not for a
+self-hoster upgrading one — see "Which version to move to" above for that.
+
+`make release VERSION=x.y.z` (`scripts/release/release-cut.sh`) is the one
+command: on a clean `main` that matches `origin/main`, it moves
+`CHANGELOG.md`'s `## Unreleased` section into a dated `## X.Y.Z — YYYY-MM-DD`
+section directly above the old one, leaving a fresh empty `## Unreleased` in
+its place, commits that (`chore(release): x.y.z`), tags the commit `vX.Y.Z`
+(annotated), and pushes both. Pushing the tag is what triggers the tag-push
+release lane (`.github/workflows/images.yml`, #108): it builds and validates
+the images, then publishes them, a GitHub Release whose body is that
+version's changelog section, and a `platform-release-manifest.json` asset.
+
+It refuses — with a one-line reason, before touching anything — unless:
+
+- the repo is on `main`, with a clean working tree that matches `origin/main`
+- `VERSION` is strict semver (`X.Y.Z`, an optional `-prerelease` part is
+  allowed for a release candidate; no leading `v`, no build metadata) and
+  strictly newer than the newest existing `v*` tag
+- the `## Unreleased` section is non-empty
+
+It never merges `develop` into `main` for you — that merge, and the operator
+sign-off it requires (`CLAUDE.md`, "Git branching & environments"), happens
+first, by hand. Add `DRY_RUN=1` to see the changelog diff and the exact git
+commands it would run without executing any of them:
+
+```bash
+make release VERSION=0.2.0 DRY_RUN=1   # preview
+make release VERSION=0.2.0             # cut, commit, tag and push v0.2.0
+```
+
+A prerelease tag (`v0.2.0-rc.1`) runs the same workflow and publishes a GitHub
+prerelease instead of a stable release — useful for exercising the publish
+lane before cutting the real version.
 
 ## See also
 

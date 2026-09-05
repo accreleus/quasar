@@ -98,6 +98,10 @@ type Coordinator struct {
 	// on re-register (#492). nil is a quiet no-op.
 	jobs JobReclaimer
 
+	// agents answers "is this host's agent connected right now"; see
+	// AgentConnectivity. nil keeps UncordonHost on the status column alone.
+	agents AgentConnectivity
+
 	// certRuns tracks in-flight certification runs; one per host at a time.
 	certRuns *certRunManager
 

@@ -3,7 +3,7 @@ import { FLEET_TABS, LIBRARY_TABS, STREAMING_TABS, PEOPLE_TABS, activeTab } from
 
 describe("section tabs", () => {
   it("fleet has hosts, storage, jobs", () => {
-    expect(FLEET_TABS.map((t) => t.id)).toEqual(["hosts", "storage", "jobs"]);
+    expect(FLEET_TABS.map((t) => t.id)).toEqual(["hosts", "storage", "jobs", "releases"]);
   });
 
   it("library has apps, presets, images, sources", () => {

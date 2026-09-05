@@ -325,7 +325,7 @@ pub fn locate_host_path(docker: &str) -> (Option<PathBuf>, Option<String>) {
 
 /// Our own container id, from `/proc/self/mountinfo` with `$HOSTNAME` as fallback. Both
 /// best-effort; a miss costs only app-container injection, never the agent's own use.
-fn self_container_id() -> Option<String> {
+pub fn self_container_id() -> Option<String> {
     if let Ok(body) = std::fs::read_to_string("/proc/self/mountinfo") {
         if let Some(id) = parse_container_id_from_mountinfo(&body) {
             return Some(id);
@@ -333,7 +333,14 @@ fn self_container_id() -> Option<String> {
     }
     std::env::var("HOSTNAME")
         .ok()
-        .filter(|h| h.len() >= 12 && h.chars().all(|c| c.is_ascii_hexdigit()))
+        .filter(|h| hostname_is_container_id(h))
+}
+
+/// Whether `$HOSTNAME` may stand in for the container id. A compose stack that
+/// sets `hostname:` makes it a DNS name (`quasar-dev.local`), which docker
+/// answers "No such object" for — so the shape is checked, never assumed.
+pub fn hostname_is_container_id(hostname: &str) -> bool {
+    hostname.len() >= 12 && hostname.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Pull the 64-hex container id out of a mountinfo body.
@@ -2016,6 +2023,17 @@ pub fn restart_for_egl(grace: Duration) {
     }
     std::thread::spawn(move || {
         std::thread::sleep(grace);
+        // #66: symmetric with the cudart path — never exit while any provision is still
+        // writing into a shared volume, including the CUDA userspace fetch.
+        if !crate::artifact::wait_for_quiescence(crate::agent::PROVISION_QUIESCENCE_WAIT) {
+            tracing::warn!(
+                target: T, token = "drvvol-agent-restart-deferred",
+                in_flight = crate::artifact::provisioning_in_flight(),
+                "another provision is still in flight — NOT restarting; the EGL stack will \
+                 re-initialise on the next agent start instead"
+            );
+            return;
+        }
         tracing::warn!(target: T, token = "drvvol-agent-restart-now", "restarting node agent now");
         std::process::exit(0);
     });

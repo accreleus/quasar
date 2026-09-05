@@ -267,3 +267,51 @@ page and logged (`token=catalog-manifest-changed`). _Avoid_: "manifest
 signature" and "manifest verification" (nothing is verified), "manifest digest"
 on its own when the ref/commit/URL are also meant (the digest is one field of
 the record).
+
+## Platform releases
+
+**Platform release** — a matched set of Quasar's own images (control plane, which
+carries the web client, and node agent) built from one commit and published
+together. It is Quasar updating Quasar, and it never reaches the app catalog:
+catalog images have their own version and push machinery. _Avoid_: "update"
+(overloaded — catalog images are also "updated", and `redeploy.sh` "updates" a
+source checkout), "image version" (that is the catalog term), "build" (a build
+may never be published).
+
+**Channel** — which platform releases an admin is shown. `stable` is a tagged,
+noted release; `edge` is whatever was last published from a branch, with no
+notes. An instance follows one channel at a time. _Avoid_: "track", "branch"
+(edge follows a branch, but a channel is the admin-facing choice, not the git
+object).
+
+**Release manifest** — the machine-readable description of one stable platform
+release: which component images it contains, by digest, and the commit they were
+built from. Published with the release, from the same tag, so the human-readable
+notes and the digests cannot disagree. _Avoid_: "release body" (the notes are
+for people; the manifest is what the control plane reads), "catalog manifest"
+(that is the app catalog's file).
+
+**Updater** — the per-host actor that pulls a platform release and recreates the
+containers it replaces, because a container cannot recreate itself. It acts only
+when told to, and only on the stack it sits beside. _Avoid_: "sidecar" in
+prose (that is how it is deployed, not what it is), "agent" (the agent asks; the
+updater acts).
+
+**Install mode** — how a host got its platform images: from the registry, or
+built from source on the host. A source-built host can be told about a release
+but not given one. _Avoid_: "dev host" (a source-built host may be production),
+"pinned" (a registry install is always pinned; the word adds nothing).
+
+**Attempt** — one target's move to one digest set: the control plane, or one
+host. Every apply produces one, whether it succeeded or failed, and it is the
+only durable record of what that target was on before. _Avoid_: "job" (an
+attempt is operator-initiated and rides no schedule), "task".
+
+**Fleet run** — one release applied across the whole instance: the control plane
+first, then every eligible host in sequence. At most one is active. A host that
+cannot take the release at its turn is **skipped**, which is not a failure; a
+target that fails stops the run where it stands. _Avoid_: "rollout" (implies
+staging and percentages, of which there are none), "batch" (the run is strictly
+sequential), "deployment". Its control-plane step drains the WHOLE instance
+first: recreating the control plane drops every agent's connection, and an agent
+stops its sessions when that connection drops.

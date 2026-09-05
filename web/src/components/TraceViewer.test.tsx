@@ -10,9 +10,16 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import type { DiagnosticBundle } from "../api/types";
 
-// jsdom does not implement ResizeObserver — provide a stub
+// jsdom does not implement ResizeObserver — provide a stub that records what it
+// was pointed at. #124: the chart was pinned to its fallback width forever
+// because the observer was never attached to the real container, so "did anything
+// get observed at all" is the assertion that catches the regression.
+const observedEls: Element[] = [];
 class MockResizeObserver {
-  observe() {}
+  observe(el: Element) {
+    observedEls.push(el);
+  }
+  unobserve() {}
   disconnect() {}
 }
 globalThis.ResizeObserver = MockResizeObserver as unknown as typeof ResizeObserver;
@@ -126,6 +133,7 @@ const BASE_BUNDLE: DiagnosticBundle = {
 describe("TraceViewer", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    observedEls.length = 0;
   });
 
   it("renders loading state initially", () => {
@@ -375,6 +383,142 @@ describe("TraceViewer", () => {
 
       rerender(<TraceViewer sessionId="sess-abc" token="tok" sessionState="stopped" />);
       await waitFor(() => expect(screen.queryByText("live")).toBeNull());
+    });
+  });
+
+  // ── #124: the chart was stuck at its fallback width and off the token palette ──
+  describe("layout and theming (#124)", () => {
+    it("observes the real chart container once the bundle has loaded", async () => {
+      // The container carries the ref but sits behind the loading early-return,
+      // so an effect that only runs on mount attaches to nothing and the chart
+      // stays at its 600px fallback for the life of the component.
+      mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
+      const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
+      await waitFor(() => expect(container.querySelector(".trace-viewer")).toBeTruthy());
+
+      const plot = container.querySelector(".trace-plot");
+      expect(plot).toBeTruthy();
+      await waitFor(() => expect(observedEls).toContain(plot));
+    });
+
+    it("re-attaches the observer when the chart remounts after an error", async () => {
+      // Same defect, second shape: an error render followed by a successful
+      // Refresh must not leave the observer pointing at a detached node.
+      mockGetDiagnosticBundle.mockRejectedValueOnce(new Error("boom"));
+      const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
+      await waitFor(() => expect(screen.getByText("could not load trace bundle")).toBeTruthy());
+
+      mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
+      await act(async () => {
+        screen.getByText("Refresh").click();
+      });
+      await waitFor(() => expect(container.querySelector(".trace-plot")).toBeTruthy());
+      expect(observedEls).toContain(container.querySelector(".trace-plot"));
+    });
+
+    it("labels the x axis on round second intervals", async () => {
+      mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
+      const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
+      await waitFor(() => expect(container.querySelector(".trace-axis")).toBeTruthy());
+
+      const labels = [...container.querySelectorAll(".trace-axis text")].map(
+        (t) => t.textContent ?? "",
+      );
+      expect(labels.length).toBeGreaterThan(1);
+      const secs = labels.map((l) => Number(/^\+(\d+)s$/.exec(l)?.[1]));
+      expect(secs.every((n) => Number.isFinite(n))).toBe(true);
+      // Every gap is the same, and it is a round step an operator can read off.
+      const step = secs[1] - secs[0];
+      expect([1, 2, 5, 10, 15, 30, 60, 120, 300, 600]).toContain(step);
+      secs.forEach((n, i) => expect(n).toBe(secs[0] + step * i));
+    });
+
+    it("draws every series and every event marker from a design token", async () => {
+      // No literal hex may survive: the hardcoded GitHub-Primer palette did not
+      // follow [data-theme="light"] and matched nothing else in the console.
+      mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
+      const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
+      await waitFor(() => expect(container.querySelector(".trace-plot")).toBeTruthy());
+
+      const strokes = [...container.querySelectorAll("svg [stroke]")]
+        .map((el) => el.getAttribute("stroke") ?? "")
+        .filter((s) => s !== "none");
+      expect(strokes.length).toBeGreaterThan(0);
+      strokes.forEach((s) => expect(s).toMatch(/^var\(--/));
+
+      const fills = [...container.querySelectorAll("svg [fill]")]
+        .map((el) => el.getAttribute("fill") ?? "")
+        .filter((s) => s !== "none");
+      fills.forEach((s) => expect(s).toMatch(/^var\(--/));
+    });
+
+    it("scales each series in a lane on its own range", async () => {
+      // fps ~60 and encode_ms ~20 shared one y-scale, which flattened encode_ms
+      // onto the baseline and made the lane look broken.
+      mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
+      const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
+      await waitFor(() => expect(container.querySelector(".trace-plot")).toBeTruthy());
+
+      const encode = container.querySelector<SVGPathElement>(
+        '[data-series="encoder.encode_ms"]',
+      );
+      expect(encode).toBeTruthy();
+      const ys = [...(encode!.getAttribute("d") ?? "").matchAll(/[ML][\d.]+,([\d.]+)/g)].map(
+        (m) => Number(m[1]),
+      );
+      expect(ys.length).toBeGreaterThan(1);
+      // 16 -> 22 must be a visible climb, not a flat line pinned to the floor.
+      expect(Math.max(...ys) - Math.min(...ys)).toBeGreaterThan(8);
+    });
+
+    it("states each series' scale in the lane", async () => {
+      mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
+      const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
+      await waitFor(() => expect(container.querySelector(".trace-plot")).toBeTruthy());
+      // The lane says what the top of each curve is worth; without it no value
+      // on the chart can be read at all.
+      expect(container.querySelector('[data-scale-for="encoder.fps"]')?.textContent).toMatch(
+        /60/,
+      );
+    });
+
+    it("draws event markers once across the lane stack, not once per lane", async () => {
+      mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
+      const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
+      await waitFor(() => expect(container.querySelector(".trace-markers")).toBeTruthy());
+
+      // Two events in the fixture, one overlay, one line each.
+      const markers = container.querySelectorAll(".trace-markers line");
+      expect(markers.length).toBe(2);
+      // …and no lane draws its own copy.
+      container.querySelectorAll(".trace-lane-svg").forEach((laneSvg) => {
+        expect(laneSvg.querySelectorAll("line[stroke-dasharray]").length).toBe(0);
+      });
+    });
+
+    it("marks where a series' samples stop short of the axis", async () => {
+      // Host lanes ran to the right edge while the browser-sourced lanes stopped
+      // early with nothing to say so — it read as a truncated chart.
+      mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
+      const { container } = render(<TraceViewer sessionId="sess-abc" token="tok" />);
+      await waitFor(() => expect(container.querySelector(".trace-plot")).toBeTruthy());
+      // transport.rtt_ms has a single sample 30s before the last encoder sample.
+      expect(
+        container.querySelector('[data-series-end="transport.rtt_ms"]'),
+      ).toBeTruthy();
+      // encoder.encode_ms runs to the end of the domain, so it gets no end cap.
+      expect(
+        container.querySelector('[data-series-end="encoder.encode_ms"]'),
+      ).toBeNull();
+    });
+
+    it("says so when the axis covers less than the classifier's window", async () => {
+      mockGetDiagnosticBundle.mockResolvedValue(BASE_BUNDLE);
+      render(<TraceViewer sessionId="sess-abc" token="tok" />);
+      // Fixture: samples span 30 s of a declared 60 s window.
+      await waitFor(() =>
+        expect(screen.getByText(/sampled range/i).textContent).toMatch(/60 s window/),
+      );
     });
   });
 });

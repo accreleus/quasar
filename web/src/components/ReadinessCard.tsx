@@ -3,10 +3,10 @@
 // full by StepHosts, the Hosts tab's expanded row and the host detail page (as
 // a full-width grid). Host settings deliberately does not repeat it.
 
-import { useState } from "react";
 import type { ReadinessCheck } from "../api/types";
-import { Button } from "./Button";
+import { groupChecks } from "../lib/readiness/groups";
 import { Chip } from "./Chip";
+import { CopyableCommand } from "./CopyableCommand";
 import { IconCheck, IconClose, IconWarning } from "./icons";
 
 // One glyph per status, in a circle: a tick, a cross, an exclamation, a dash.
@@ -20,6 +20,7 @@ const GLYPH: Record<string, { label: string; className: string; icon: React.Reac
   fail: { label: "Fail", className: "rdy-glyph rdy-bad", icon: <IconClose /> },
   warn: { label: "Warning", className: "rdy-glyph rdy-warn", icon: <IconWarning /> },
   skip: { label: "Skipped", className: "rdy-glyph rdy-off", icon: DASH },
+  provisioning: { label: "Provisioning", className: "rdy-glyph rdy-off", icon: DASH },
 };
 
 function ReadinessGlyph({ status }: { status: string }) {
@@ -28,41 +29,6 @@ function ReadinessGlyph({ status }: { status: string }) {
     <span className={g.className} role="img" aria-label={g.label} title={g.label}>
       {g.icon}
     </span>
-  );
-}
-
-function CopyableRemediation({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false);
-
-  const copy = async () => {
-    // Guard availability explicitly rather than optional-chain into
-    // `writeText` — `clipboard?.writeText(...)` on an absent API awaits
-    // `undefined`, which resolves (not rejects), so the old code marked
-    // "Copied" even though nothing was written. Only a real, successful
-    // write may flip the button.
-    if (!navigator.clipboard) return;
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Best-effort — the text is still visible/selectable even if the
-      // write itself failed (e.g. a permission denial).
-    }
-  };
-
-  return (
-    <div className="row gap2" style={{ marginTop: 4, alignItems: "center" }}>
-      <code
-        className="mono"
-        style={{ flex: 1, overflowWrap: "anywhere", fontSize: "var(--t-xs)" }}
-      >
-        {text}
-      </code>
-      <Button type="button" variant="ghost" size="sm" onClick={() => void copy()}>
-        {copied ? "Copied" : "Copy"}
-      </Button>
-    </div>
   );
 }
 
@@ -95,6 +61,30 @@ export function ReadinessCard({
   // same thing here — nothing to render yet.
   const hasChecks = checks != null && checks.length > 0;
   const anyFail = hasChecks && checks.some((c) => c.status === "fail");
+  // #102: grouped by the area an operator would fix; `skip` (not applicable
+  // to this host, per the contract) leaves the first screen for a disclosure.
+  const { groups, notApplicable } = groupChecks(checks ?? []);
+  const rowClass = layout === "grid" ? "readiness-check" : "host-setting-row";
+  const listClass = layout === "grid" ? "readiness-grid" : "col gap3";
+
+  const renderCheck = (c: ReadinessCheck) => (
+    <div key={c.id} className={rowClass} data-testid={`readiness-check-${c.id}`}>
+      <div className="host-setting-copy">
+        <div className="row gap2" style={{ alignItems: "center" }}>
+          <ReadinessGlyph status={c.status} />
+          <h3 style={{ fontSize: "var(--t-sm)" }}>{c.id.replaceAll("_", " ")}</h3>
+        </div>
+        <p>{c.summary}</p>
+        {/* #483: `warn` is advisory-but-actionable (e.g. media_reachability) —
+            it carries a real remediation command same as `fail`, just never
+            blocks anything. Show it here too, or the whole point of a WARN
+            check (here's exactly what to run) is invisible. */}
+        {(c.status === "fail" || c.status === "warn") && c.remediation && (
+          <CopyableCommand text={c.remediation} />
+        )}
+      </div>
+    </div>
+  );
 
   return (
     <div className="card sec-card" data-testid="readiness-card">
@@ -123,33 +113,30 @@ export function ReadinessCard({
       )}
 
       {hasChecks && (
-        <div
-          className={layout === "grid" ? "readiness-grid" : "col gap3"}
-          data-testid="readiness-checks"
-        >
-          {checks.map((c) => (
-            <div
-              key={c.id}
-              className={layout === "grid" ? "readiness-check" : "host-setting-row"}
-              data-testid={`readiness-check-${c.id}`}
-            >
-              <div className="host-setting-copy">
-                <div className="row gap2" style={{ alignItems: "center" }}>
-                  <ReadinessGlyph status={c.status} />
-                  <h3 style={{ fontSize: "var(--t-sm)" }}>{c.id.replaceAll("_", " ")}</h3>
-                </div>
-                <p>{c.summary}</p>
-                {/* #483: `warn` is advisory-but-actionable (e.g. media_reachability) —
-                    it carries a real remediation command same as `fail`, just never
-                    blocks anything. Show it here too, or the whole point of a WARN
-                    check (here's exactly what to run) is invisible. */}
-                {(c.status === "fail" || c.status === "warn") && c.remediation && (
-                  <CopyableRemediation text={c.remediation} />
-                )}
-              </div>
+        <div className="col gap4" data-testid="readiness-checks">
+          {groups.map((g) => (
+            <div key={g.key} className="readiness-group" data-testid="readiness-group" data-group={g.key}>
+              <div className="eyebrow">{g.label}</div>
+              <div className={listClass}>{g.checks.map(renderCheck)}</div>
             </div>
           ))}
+          {groups.length === 0 && (
+            <p className="muted" style={{ marginBottom: 0 }}>
+              Nothing to check on this host beyond what is listed below.
+            </p>
+          )}
         </div>
+      )}
+
+      {notApplicable.length > 0 && (
+        <details className="readiness-more" data-testid="readiness-not-applicable">
+          <summary>
+            {notApplicable.length} {notApplicable.length === 1 ? "check" : "checks"} not applicable to this host
+          </summary>
+          <div className={listClass} style={{ marginTop: "var(--s3)" }}>
+            {notApplicable.map(renderCheck)}
+          </div>
+        </details>
       )}
 
       {footnote && (

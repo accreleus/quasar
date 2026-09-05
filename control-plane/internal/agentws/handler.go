@@ -22,6 +22,7 @@ import (
 
 	"github.com/accreleus/quasar/control-plane/internal/console"
 	"github.com/accreleus/quasar/control-plane/internal/hostcfg"
+	"github.com/accreleus/quasar/control-plane/internal/hostenroll"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
 	"github.com/accreleus/quasar/control-plane/internal/ratelimit"
 )
@@ -67,6 +68,9 @@ type Handler struct {
 	// Image-management P2 callback surface (images.go). Never nil — NewHandler
 	// installs a no-op — so dispatch needs no guard.
 	imageEvents ImageEvents
+	// Platform-release apply callback surface (release.go, amendment 2). Never
+	// nil — NewHandler installs a no-op — so dispatch needs no guard.
+	releaseEvents ReleaseEvents
 	// Per-host image_state token bucket; bounded by the live connection set
 	// (see imageStateLimiter).
 	imageLimiter *imageStateLimiter
@@ -210,7 +214,12 @@ func NewHandler(pool *pgxpool.Pool, enrollmentToken string, log *slog.Logger, re
 		relay = NewRelayBus(log)
 	}
 	h := &Handler{
-		store:           &agentStore{pool: pool},
+		store: &agentStore{
+			pool: pool,
+			// The local half of the #96 liveness answer; the DB half is in enrollHost.
+			isAgentConnected: registry.IsConnected,
+			redeemEnrollment: hostenroll.Redeem,
+		},
 		log:             log,
 		enrollmentToken: enrollmentToken,
 		registry:        registry,
@@ -221,6 +230,7 @@ func NewHandler(pool *pgxpool.Pool, enrollmentToken string, log *slog.Logger, re
 		consoleAuto:     newConsoleAutoState(),
 		failures:        ratelimit.NewFailureLimiter(enrollmentFailureLimit, enrollmentFailureTTL, enrollmentFailureMaxIPs),
 		imageEvents:     noopImageEvents{},
+		releaseEvents:   noopReleaseEvents{},
 		imageLimiter:    newImageStateLimiter(),
 	}
 	h.diagnostics = newDiagnosticQueue(events, log)
@@ -238,6 +248,17 @@ func (h *Handler) SetImageEvents(ev ImageEvents) {
 		ev = noopImageEvents{}
 	}
 	h.imageEvents = ev
+}
+
+// SetReleaseEvents wires the platform-apply callback surface (release_state
+// relay + the register success-evidence hook, #116). A setter for the same
+// reason SetImageEvents is one: the apply runner is constructed after this
+// handler. A nil argument restores the no-op.
+func (h *Handler) SetReleaseEvents(ev ReleaseEvents) {
+	if ev == nil {
+		ev = noopReleaseEvents{}
+	}
+	h.releaseEvents = ev
 }
 
 // Close stops the handler's background queues. Optional for the production
@@ -297,7 +318,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 
 	// Step 1 — register
 	registerCtx, cancelRegister := context.WithTimeout(bg, handshakeTimeout)
-	hostID, regImages, err := h.handleRegister(registerCtx, conn, clientIP)
+	hostID, regImages, regCommit, err := h.handleRegister(registerCtx, conn, clientIP)
 	cancelRegister()
 	h.failures.Release(clientIP)
 	if err != nil {
@@ -311,6 +332,13 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	}()
 
 	h.log.Info("agent registered", "host_id", hostID)
+
+	// Platform-apply success evidence: a register resolves an in-flight apply,
+	// because the recreate killed the agent that would have reported it.
+	// Bounded and swallowed — a registration is never refused over an apply.
+	regEvCtx, regEvCancel := context.WithTimeout(bg, agentDBCallTimeout)
+	h.releaseEvents.AgentRegistered(regEvCtx, hostID, regCommit)
+	regEvCancel()
 
 	// Step 2 — register the connection + start the sole writer goroutine
 	// (gorilla allows one concurrent writer) BEFORE the capacity handshake.
@@ -509,6 +537,23 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			imgCtx, imgCancel := context.WithTimeout(bg, agentDBCallTimeout)
 			h.imageEvents.AgentImageState(imgCtx, hostID, m)
 			imgCancel()
+		case "release_state":
+			// Fire-and-forget apply progress. No token bucket: the contract
+			// throttles it to one message per 2 s and the database allows at
+			// most one open apply per host. A malformed message drops the
+			// message, never the connection.
+			var rm ReleaseStateMsg
+			if err := json.Unmarshal(raw, &rm); err != nil {
+				logReleaseDrop(h.log, hostID, "could not be decoded")
+				continue
+			}
+			if !validateReleaseState(&rm) {
+				logReleaseDrop(h.log, hostID, "is missing a request id or a state")
+				continue
+			}
+			relCtx, relCancel := context.WithTimeout(bg, agentDBCallTimeout)
+			h.releaseEvents.AgentReleaseState(relCtx, hostID, rm)
+			relCancel()
 		case "signaling":
 			// Relay agent→browser: deliver only the verbatim inner msg.
 			var env SignalingEnvelope
@@ -529,10 +574,13 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 // handleRegister performs the register handshake and returns the resolved host
 // id plus the agent's optional image-management P2 `images` snapshot (nil when
 // the agent sent no such field — see RegisterMsg.Images).
-func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clientIP string) (string, []RegisterImage, error) {
-	fail := func(err error) (string, []RegisterImage, error) {
+// The third return value is the identity commit the agent reported (nil when it
+// reported none or one this build refused), which the caller hands to the
+// platform-apply success-evidence hook.
+func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clientIP string) (string, []RegisterImage, *string, error) {
+	fail := func(err error) (string, []RegisterImage, *string, error) {
 		h.failures.Failure(clientIP)
-		return "", nil, err
+		return "", nil, nil, err
 	}
 	conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	raw, err := readTextMessage(conn)
@@ -558,6 +606,15 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		switch {
 		case errors.Is(err, ErrInvalidEnrollmentToken), errors.Is(err, ErrInvalidNodeSecret):
 			h.writeError(conn, "auth_failed", "authentication failed")
+		case errors.Is(err, ErrHostAgentConnected):
+			// Deliberately distinct from auth_failed: the credential was fine, the
+			// REQUEST was refused. An operator re-enrolling a machine that is quietly
+			// already running needs to be told that, not sent to check their token (#96).
+			// The existing `auth_failed` code stays exactly as it was for bad credentials,
+			// so this adds a case rather than changing one.
+			h.writeError(conn, "auth_failed",
+				"a live agent is already registered under this node name; stop it before re-enrolling, "+
+					"or enroll under a different node_name")
 		case errors.Is(err, ErrHostNotFound):
 			h.writeError(conn, "host_not_found", "node not enrolled; use enrollment_token to enroll first")
 		default:
@@ -565,6 +622,21 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		}
 		return fail(err)
 	}
+	// Platform-release identity (amendment 1): written AFTER auth succeeded, so
+	// a failed registration never touches a host row, and wholesale — absent
+	// fields become NULL (agent-api.md §register). A write failure is logged
+	// and swallowed: the control plane never refuses a registration over these
+	// fields, and a host that streams is worth more than a known build stamp.
+	identity, droppedIdentity := identityFromRegister(reg)
+	if len(droppedIdentity) > 0 {
+		h.log.Warn("register: ignoring malformed identity fields",
+			"host_id", result.HostID, "node_name", reg.NodeName, "fields", droppedIdentity)
+	}
+	if err := h.store.replaceHostIdentity(ctx, result.HostID, identity); err != nil {
+		h.log.Warn("register: could not store host identity",
+			"host_id", result.HostID, "node_name", reg.NodeName, "err", err)
+	}
+
 	if result.AgentRestarted {
 		// #429: logged so an operator tailing logs sees it in real time, not
 		// only on the next admin-panel poll.
@@ -577,9 +649,9 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		HeartbeatIntervalMs: heartbeatIntervalMs,
 	}
 	if err := conn.WriteJSON(resp); err != nil {
-		return "", nil, fmt.Errorf("write registered: %w", err)
+		return "", nil, nil, fmt.Errorf("write registered: %w", err)
 	}
-	return result.HostID, reg.Images, nil
+	return result.HostID, reg.Images, identity.SourceCommit, nil
 }
 
 func (h *Handler) handleCapacity(ctx context.Context, conn *websocket.Conn, hostID string) error {
