@@ -123,6 +123,19 @@ func RegistryEgressHosts(extra ...string) map[string]struct{} {
 			hosts[h] = struct{}{}
 		}
 	}
+	return withImpliedHosts(hosts)
+}
+
+// ghcrBlobHost is where ghcr.io 307s a blob GET. Implied by ghcr.io rather than
+// listed: an operator configuring a registry should not have to know its blob
+// store's name. Another registry that redirects needs its blob host added to
+// QUASAR_IMAGE_REGISTRY_HOSTS by hand (docs/configuration.md).
+const ghcrBlobHost = "pkg-containers.githubusercontent.com"
+
+func withImpliedHosts(hosts map[string]struct{}) map[string]struct{} {
+	if _, ok := hosts["ghcr.io"]; ok {
+		hosts[ghcrBlobHost] = struct{}{}
+	}
 	return hosts
 }
 
@@ -166,7 +179,7 @@ func (r *RegistryResolver) hostAllowed(host string) bool {
 // allowedHostsFromEnv parses QUASAR_IMAGE_REGISTRY_HOSTS (comma-separated,
 // default "ghcr.io"); always non-nil so hostAllowed enforces it in production.
 func allowedHostsFromEnv() map[string]struct{} {
-	return outbound.ParseHostList(os.Getenv("QUASAR_IMAGE_REGISTRY_HOSTS"), defaultRegistryHost)
+	return withImpliedHosts(outbound.ParseHostList(os.Getenv("QUASAR_IMAGE_REGISTRY_HOSTS"), defaultRegistryHost))
 }
 
 // parsedRef is a registry reference split into the pieces the v2 API needs.

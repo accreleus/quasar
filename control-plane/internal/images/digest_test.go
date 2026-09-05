@@ -338,8 +338,9 @@ func TestResolveDoesNotFollowRedirects(t *testing.T) {
 // lowercase.
 func TestAllowedHostsFromEnv(t *testing.T) {
 	t.Setenv("QUASAR_IMAGE_REGISTRY_HOSTS", "")
-	if h := allowedHostsFromEnv(); len(h) != 1 || func() bool { _, ok := h["ghcr.io"]; return !ok }() {
-		t.Fatalf("default: got %v want {ghcr.io}", h)
+	// ghcr.io plus the blob host it redirects to (TestGHCRImpliesItsBlobHost).
+	if h := allowedHostsFromEnv(); len(h) != 2 || func() bool { _, ok := h["ghcr.io"]; return !ok }() {
+		t.Fatalf("default: got %v want {ghcr.io, %s}", h, ghcrBlobHost)
 	}
 	t.Setenv("QUASAR_IMAGE_REGISTRY_HOSTS", " ghcr.io , Registry.Example.COM ,, ")
 	h := allowedHostsFromEnv()
@@ -349,7 +350,7 @@ func TestAllowedHostsFromEnv(t *testing.T) {
 	if _, ok := h["registry.example.com"]; !ok {
 		t.Fatalf("missing lowercased registry.example.com: %v", h)
 	}
-	if len(h) != 2 {
+	if len(h) != 3 { // the two entries plus GHCR's implied blob host
 		t.Fatalf("empty entries must be dropped: %v", h)
 	}
 }
