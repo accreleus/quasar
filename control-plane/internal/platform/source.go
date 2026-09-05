@@ -18,7 +18,8 @@ type ReleaseSource interface {
 	FetchManifest(ctx context.Context, url string) ([]byte, error)
 
 	// CompareURL is the human-readable diff between two commits, "" when the
-	// source has no such concept.
+	// source has no such concept. Unused on stable, where the notes ARE the
+	// diff and compare_url is null (control-api.md); #111 calls it for edge.
 	CompareURL(fromCommit, toCommit string) string
 }
 

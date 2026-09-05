@@ -133,13 +133,12 @@ func TestDetectRecordsNewReleasesAndIsIdempotent(t *testing.T) {
 	if err := json.Unmarshal(got.Manifest, &manifest); err != nil {
 		t.Errorf("stored manifest is not the asset: %v", err)
 	}
-	// compare_url links a release to the one below it in the ordering; the
-	// oldest release has nothing to compare from.
-	if got.CompareURL == nil || *got.CompareURL != src.CompareURL(commitA, commitB) {
-		t.Errorf("compare_url = %v, want the diff from 0.2.0", got.CompareURL)
-	}
-	if byVersion["0.2.0"].CompareURL != nil {
-		t.Errorf("the oldest release has nothing to compare from, got %v", *byVersion["0.2.0"].CompareURL)
+	// compare_url is NULL on stable: the notes are the diff (control-api.md).
+	// It is the edge channel's field, and #111 is what fills it.
+	for _, r := range rows {
+		if r.CompareURL != nil {
+			t.Errorf("release %v: compare_url = %q, want null on stable", r.Version, *r.CompareURL)
+		}
 	}
 
 	// A second pass re-observes the same commits and must not accumulate

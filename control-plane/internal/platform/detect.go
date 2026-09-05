@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -92,10 +91,6 @@ func (d *Detector) Detect(ctx context.Context) (Report, error) {
 		fresh = append(fresh, rel)
 	}
 
-	// The release below a new one may be another new one, so the links are
-	// computed over the merged list before anything is written.
-	d.linkCompareURLs(append(append([]Release{}, existing...), fresh...), fresh)
-
 	for _, rel := range fresh {
 		inserted, err := d.store.UpsertRelease(ctx, rel)
 		if err != nil {
@@ -140,31 +135,10 @@ func (d *Detector) resolve(ctx context.Context, l Listing) (Release, error) {
 		Prerelease:    m.Prerelease,
 		Notes:         boundNotes(l.Body),
 		Manifest:      raw,
+		// compare_url stays NULL on stable: the notes ARE the diff
+		// (control-api.md §Platform releases). It is the edge channel's field,
+		// and #111 is what fills it.
 	}, nil
-}
-
-// linkCompareURLs fills compare_url with the diff from the release below each
-// fresh one. The oldest has nothing to compare from and keeps a null.
-func (d *Detector) linkCompareURLs(all []Release, fresh []Release) {
-	sort.SliceStable(all, func(i, j int) bool {
-		if all[i].SchemaVersion != all[j].SchemaVersion {
-			return all[i].SchemaVersion < all[j].SchemaVersion
-		}
-		return all[i].BuiltAt.Before(all[j].BuiltAt)
-	})
-	prev := make(map[string]string, len(all))
-	for i := 1; i < len(all); i++ {
-		prev[all[i].SourceCommit] = all[i-1].SourceCommit
-	}
-	for i := range fresh {
-		from, ok := prev[fresh[i].SourceCommit]
-		if !ok {
-			continue
-		}
-		if u := d.source.CompareURL(from, fresh[i].SourceCommit); u != "" {
-			fresh[i].CompareURL = &u
-		}
-	}
 }
 
 // Truncates on a rune boundary: a cut mid-rune is not valid UTF-8 and will not
