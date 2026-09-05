@@ -1,13 +1,19 @@
 // Fleet › Releases. Covers the three page states through <ResourceStates>, the
-// per-target eligibility text, notes sanitisation, the channel PATCH, and
-// "Check now" being the jobs run-now action rather than this page's read.
+// per-target eligibility text, notes sanitisation, the channel PATCH, "Check
+// now" being the jobs run-now action rather than this page's read, and the
+// per-host apply: the button's gating, the force confirmation naming N, live
+// attempt state, a refused apply, and the history.
 
 import { render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as adminApi from "../../../api/admin";
 import { ApiError } from "../../../api/client";
-import type { PlatformRelease, PlatformReleaseView } from "../../../api/types";
+import type {
+  PlatformApplyAttempt,
+  PlatformRelease,
+  PlatformReleaseView,
+} from "../../../api/types";
 import { SectionHeadProvider } from "../../../components/shell/sectionHead";
 import { FLEET_TABS } from "../../../components/shell/sectionTabs";
 import { ToastProvider } from "../../../components/Toast";
@@ -93,7 +99,57 @@ function renderTab() {
   );
 }
 
-beforeEach(() => vi.resetAllMocks());
+function attempt(over: Partial<PlatformApplyAttempt> = {}): PlatformApplyAttempt {
+  return {
+    id: "a1",
+    run_id: null,
+    kind: "apply",
+    target: "host",
+    host_id: "h1",
+    node_name: "gpu-host-01",
+    release_id: "r1",
+    requested_digests: [{ name: "node-agent", image: "img", digest: "sha256:" + "9".repeat(64) }],
+    previous_digests: [{ name: "node-agent", digest: "sha256:" + "1".repeat(64) }],
+    state: "waiting_sessions",
+    reason: null,
+    sessions_remaining: 2,
+    force: false,
+    output: "",
+    requested_by: "u1",
+    created_at: "2026-09-05T11:00:00Z",
+    started_at: null,
+    finished_at: null,
+    ...over,
+  } as PlatformApplyAttempt;
+}
+
+/** An eligible host target is what the Apply button is gated on. */
+function eligibleHostView(over: Partial<PlatformReleaseView> = {}): PlatformReleaseView {
+  return view({
+    targets: [
+      { kind: "control_plane", host_id: null, node_name: null, eligible: true, reason: null },
+      { kind: "host", host_id: "h1", node_name: "gpu-host-01", eligible: true, reason: null },
+    ],
+    ...over,
+  });
+}
+
+function sessionsOnH1(n: number) {
+  return {
+    items: Array.from({ length: n }, (_, i) => ({
+      id: "s" + i,
+      host_id: "h1",
+      state: "running",
+    })),
+    next_cursor: null,
+  } as never;
+}
+
+beforeEach(() => {
+  vi.resetAllMocks();
+  mocked.listAllSessions.mockResolvedValue(sessionsOnH1(0));
+  mocked.listPlatformAttempts.mockResolvedValue({ attempts: [] });
+});
 
 describe("ReleasesTab", () => {
   it("lists an available release with its version, date, commit and rendered notes", async () => {
@@ -118,15 +174,15 @@ describe("ReleasesTab", () => {
     expect((window as unknown as { __pwned?: boolean }).__pwned).toBeUndefined();
   });
 
-  it("maps each eligibility reason to text and offers no apply control", async () => {
+  it("maps each eligibility reason to text and offers no apply control for an ineligible host", async () => {
     mocked.getPlatformReleases.mockResolvedValue(view());
     renderTab();
 
     await screen.findByText("gpu-host-01");
     expect(screen.getByText(/Waiting on the control plane: this release carries a newer schema/))
       .toBeInTheDocument();
-    // Apply is amendment 2 (#116); nothing on this page must offer it yet.
-    expect(screen.queryByRole("button", { name: /^apply/i })).not.toBeInTheDocument();
+    // An ineligible target never gets the button; the gate is the server's too.
+    expect(screen.queryByRole("button", { name: /^apply$/i })).not.toBeInTheDocument();
   });
 
   it("says so when nothing is available, and does not claim an update", async () => {
@@ -177,6 +233,121 @@ describe("ReleasesTab", () => {
     await waitFor(() =>
       expect(mocked.runJobNow).toHaveBeenCalledWith("tok", "platform.release_detect"),
     );
+  });
+
+  it("offers Apply on an eligible host, and its confirmation names the live sessions force ends", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(eligibleHostView());
+    mocked.listAllSessions.mockResolvedValue(sessionsOnH1(2));
+    mocked.applyPlatformReleaseToHost.mockResolvedValue({ attempt: attempt() } as never);
+    renderTab();
+
+    (await screen.findByRole("button", { name: /^Apply$/ })).click();
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText(/ends 2 live sessions/)).toBeInTheDocument();
+
+    within(dialog).getByRole("checkbox").click();
+    within(dialog).getByRole("button", { name: "Update" }).click();
+
+    await waitFor(() =>
+      expect(mocked.applyPlatformReleaseToHost).toHaveBeenCalledWith("tok", "h1", {
+        release_id: "r1",
+        force: true,
+      }),
+    );
+  });
+
+  it("sends force false by default", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(eligibleHostView());
+    mocked.applyPlatformReleaseToHost.mockResolvedValue({ attempt: attempt() } as never);
+    renderTab();
+
+    (await screen.findByRole("button", { name: /^Apply$/ })).click();
+    (await screen.findByRole("button", { name: "Update" })).click();
+
+    await waitFor(() =>
+      expect(mocked.applyPlatformReleaseToHost).toHaveBeenCalledWith("tok", "h1", {
+        release_id: "r1",
+        force: false,
+      }),
+    );
+  });
+
+  it("says the count is unknown rather than inventing one", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(eligibleHostView());
+    mocked.listAllSessions.mockRejectedValue(new ApiError(503, "internal", "no"));
+    renderTab();
+
+    (await screen.findByRole("button", { name: /^Apply$/ })).click();
+    expect(
+      within(await screen.findByRole("dialog")).getByText(/ends every live session on this host/),
+    ).toBeInTheDocument();
+  });
+
+  it("renders each attempt state on the target row, and no Apply while one is open", async () => {
+    for (const [state, text] of [
+      ["waiting_sessions", "Waiting for sessions to end"],
+      ["pulling", "Pulling the image"],
+      ["recreating", "Recreating the agent"],
+      ["verifying", "Verifying"],
+    ] as const) {
+      mocked.getPlatformReleases.mockResolvedValue(
+        eligibleHostView({ active_apply: { run: null, attempts: [attempt({ state })] } }),
+      );
+      const { unmount } = renderTab();
+      expect(await screen.findByText(text)).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /^Apply$/ })).not.toBeInTheDocument();
+      unmount();
+    }
+  });
+
+  it("shows how many sessions an open attempt is waiting on", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(
+      eligibleHostView({ active_apply: { run: null, attempts: [attempt()] } }),
+    );
+    renderTab();
+
+    expect(await screen.findByText(/waiting on 2 sessions/)).toBeInTheDocument();
+  });
+
+  it("renders a failed attempt's reason as text", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(
+      eligibleHostView({
+        active_apply: {
+          run: null,
+          attempts: [attempt({ state: "failed", reason: "recreate_failed" })],
+        },
+      }),
+    );
+    renderTab();
+
+    expect(await screen.findByText(/this host's agent is stopped/)).toBeInTheDocument();
+  });
+
+  it("surfaces a refused apply through the action hook's toast", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(eligibleHostView());
+    mocked.applyPlatformReleaseToHost.mockRejectedValue(
+      new ApiError(409, "attempt_in_flight", "an update is already in flight on this host"),
+    );
+    renderTab();
+
+    (await screen.findByRole("button", { name: /^Apply$/ })).click();
+    (await screen.findByRole("button", { name: "Update" })).click();
+
+    expect(
+      await screen.findByText(/an update is already in flight on this host/),
+    ).toBeInTheDocument();
+  });
+
+  it("lists the apply history with its digests", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(eligibleHostView());
+    mocked.listPlatformAttempts.mockResolvedValue({
+      attempts: [attempt({ state: "succeeded", sessions_remaining: null })],
+    });
+    renderTab();
+
+    expect(await screen.findByText("Updated")).toBeInTheDocument();
+    expect(screen.getByText(/111111111111/)).toBeInTheDocument();
   });
 
   it("lists a fault so a wrong state is visible", async () => {

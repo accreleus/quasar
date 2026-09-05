@@ -69,7 +69,12 @@ function renderTab() {
   );
 }
 
-beforeEach(() => vi.resetAllMocks());
+beforeEach(() => {
+  vi.resetAllMocks();
+  // The page also reads sessions (for the force count) and the apply history.
+  mocked.listAllSessions.mockResolvedValue({ items: [], next_cursor: null } as never);
+  mocked.listPlatformAttempts.mockResolvedValue({ attempts: [] });
+});
 
 describe("ReleasesTab on edge", () => {
   it("shows the commit and the compare link in place of a version and notes", async () => {

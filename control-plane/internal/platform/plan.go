@@ -29,6 +29,11 @@ type PlanInputs struct {
 	// rather than in SQL, beside the rule that orders them.
 	Releases []Release
 
+	// OpenAttempts is every non-terminal platform_apply_attempts row on the
+	// instance (amendment 2). It feeds both `active_apply` and the
+	// `attempt_in_flight` eligibility reason, from one read.
+	OpenAttempts []Attempt
+
 	// CheckedAt is when detection last SUCCEEDED. Orthogonal to LastError: a
 	// stale CheckedAt with an error is the normal "failing since then".
 	CheckedAt *time.Time
@@ -44,6 +49,7 @@ func PlanRelease(in PlanInputs) View {
 
 	available := offerable(in.Releases, channel, in.ControlPlane)
 	hosts := withDerivedIdentity(in.Hosts)
+	open := openTargets(in.OpenAttempts)
 
 	v := View{
 		Channel:    channel,
@@ -55,10 +61,37 @@ func PlanRelease(in PlanInputs) View {
 			Hosts:        hosts,
 		},
 		Available: available,
-		Targets:   targets(available, in.ControlPlane, hosts),
+		Targets:   targets(available, in.ControlPlane, hosts, open),
 		Faults:    faults(in.Releases, channel, in.ControlPlane, hosts),
+		// Always serialized, `null` when nothing is in flight: null is the
+		// answer, not the absence of one.
+		ActiveApply: activeApply(in.OpenAttempts),
 	}
 	return v
+}
+
+// openTargets keys the open attempts the way `targets` reads them: by host id,
+// with "" standing for the control-plane target — the same collapse the
+// database's partial unique index makes with the zero uuid.
+func openTargets(attempts []Attempt) map[string]bool {
+	out := make(map[string]bool, len(attempts))
+	for _, a := range attempts {
+		if a.HostID == nil {
+			out[""] = true
+			continue
+		}
+		out[*a.HostID] = true
+	}
+	return out
+}
+
+// activeApply is the view's `active_apply`. `run` stays nil here: no fleet run
+// can exist until #117 creates one, and this build creates none.
+func activeApply(attempts []Attempt) *ActiveApply {
+	if len(attempts) == 0 {
+		return nil
+	}
+	return &ActiveApply{Attempts: attempts}
 }
 
 // offerable applies the three listing rules and the ordering: schema_version
@@ -112,18 +145,18 @@ func withDerivedIdentity(hosts []HostIdentity) []HostIdentity {
 
 // targets evaluates every target against available[0] and nothing else: this
 // surface carries no per-release eligibility matrix.
-func targets(available []Release, cp buildinfo.Identity, hosts []HostIdentity) []Target {
+func targets(available []Release, cp buildinfo.Identity, hosts []HostIdentity, open map[string]bool) []Target {
 	var newest *Release
 	if len(available) > 0 {
 		newest = &available[0]
 	}
 
 	out := make([]Target, 0, len(hosts)+1)
-	out = append(out, target(TargetControlPlane, nil, nil, controlPlaneReason(newest, cp)))
+	out = append(out, target(TargetControlPlane, nil, nil, controlPlaneReason(newest, cp, open[""])))
 	for i := range hosts {
 		h := hosts[i]
 		hostID, nodeName := h.HostID, h.NodeName
-		out = append(out, target(TargetHost, &hostID, &nodeName, hostReason(newest, cp, h)))
+		out = append(out, target(TargetHost, &hostID, &nodeName, hostReason(newest, cp, h, open[hostID])))
 	}
 	return out
 }
@@ -142,7 +175,7 @@ func target(kind string, hostID, nodeName *string, reason string) Target {
 // controlPlaneReason: "" means eligible. Only the reasons that apply to every
 // target kind can appear here; the four host-only ones describe an install this
 // process does not have.
-func controlPlaneReason(newest *Release, cp buildinfo.Identity) string {
+func controlPlaneReason(newest *Release, cp buildinfo.Identity, attemptOpen bool) string {
 	if newest == nil {
 		return ReasonNoRelease
 	}
@@ -153,14 +186,17 @@ func controlPlaneReason(newest *Release, cp buildinfo.Identity) string {
 	if commitsMatch(*cp.SourceCommit, newest.SourceCommit) {
 		return ReasonUpToDate
 	}
-	// attempt_in_flight (9) belongs here — amendment 2, #116.
+	// The most transient fact on the list, so it comes last (amendment 2).
+	if attemptOpen {
+		return ReasonAttemptInFlight
+	}
 	return ""
 }
 
 // hostReason: "" means eligible. The contract fixes the precedence as the order
 // below, durable facts outranking transient ones: an offline source-built host
 // reports install_mode_source, because reconnecting would not change it.
-func hostReason(newest *Release, cp buildinfo.Identity, h HostIdentity) string {
+func hostReason(newest *Release, cp buildinfo.Identity, h HostIdentity, attemptOpen bool) string {
 	if newest == nil {
 		return ReasonNoRelease
 	}
@@ -192,7 +228,11 @@ func hostReason(newest *Release, cp buildinfo.Identity, h HostIdentity) string {
 	if cp.SourceCommit == nil || !commitsMatch(*cp.SourceCommit, newest.SourceCommit) {
 		return ReasonControlPlaneNotFirst
 	}
-	// attempt_in_flight (9) and run_active (10) belong here — #116/#117.
+	// attempt_in_flight (9) — amendment 2. run_active (10) belongs after it,
+	// and is #117's: no fleet run can exist until it creates one.
+	if attemptOpen {
+		return ReasonAttemptInFlight
+	}
 	return ""
 }
 

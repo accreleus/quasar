@@ -247,23 +247,28 @@ pub fn discover_install(facts: &dyn ContainerFacts) -> InstallFacts {
     out
 }
 
-/// Discovery runs ONCE per process (it shells out to docker) while `register`
-/// is sent on every reconnect, so the answer is cached here rather than
-/// re-derived per connection. Unset reads as "nothing discovered", which is the
-/// correct answer for the standalone session subcommands that never register.
-static INSTALL_FACTS: std::sync::OnceLock<InstallFacts> = std::sync::OnceLock::new();
+/// Re-discovered before every `register`, not once at boot: a boot-time
+/// snapshot pinned `updater_present=false` on a host whose updater started
+/// after the agent, and the host then read as ineligible forever. Unset reads
+/// as "nothing discovered", the correct answer for the standalone session
+/// subcommands that never register.
+static INSTALL_FACTS: std::sync::RwLock<Option<InstallFacts>> = std::sync::RwLock::new(None);
 
-/// Record this process's discovered install facts. Later calls are ignored:
-/// the facts describe the container, which does not change under a running
-/// process.
+/// Record this process's discovered install facts, replacing any earlier answer.
 pub fn set_install_facts(facts: InstallFacts) {
-    let _ = INSTALL_FACTS.set(facts);
+    if let Ok(mut slot) = INSTALL_FACTS.write() {
+        *slot = Some(facts);
+    }
 }
 
-/// The install facts discovered at startup, or all-unknown when discovery never
-/// ran or found nothing.
+/// The last discovered install facts, or all-unknown when discovery never ran
+/// or found nothing.
 pub fn install_facts() -> InstallFacts {
-    INSTALL_FACTS.get().cloned().unwrap_or_default()
+    INSTALL_FACTS
+        .read()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .unwrap_or_default()
 }
 
 /// Log what this binary is, and warn once when it does not know — an

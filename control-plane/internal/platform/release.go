@@ -126,8 +126,8 @@ type Installed struct {
 }
 
 // View is the whole `GET /v1/admin/platform/releases` body. `active_apply` is
-// absent rather than null: the contract keeps it optional so a server without
-// the apply half (#116/#117/#118) stays conformant.
+// ALWAYS serialized now that the apply half is served (#116): `null` is the
+// answer, not the absence of one.
 type View struct {
 	Channel    string    `json:"channel"`
 	EdgeBranch string    `json:"edge_branch"`
@@ -137,6 +137,9 @@ type View struct {
 	Available  []Release `json:"available"`
 	Targets    []Target  `json:"targets"`
 	Faults     []Fault   `json:"faults"`
+	// Every open attempt on the instance, plus the active fleet run (#117).
+	// A client joins an attempt to a target by host_id.
+	ActiveApply *ActiveApply `json:"active_apply"`
 }
 
 // An agent reports 7-40 hex (agent-api.md) while a manifest carries the full

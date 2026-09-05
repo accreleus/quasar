@@ -84,6 +84,12 @@ export type PlatformIdentity = Schemas["PlatformIdentity"];
  *  verbatim rather than dropping the row (control-api.md). */
 export type EligibilityReason = Schemas["EligibilityReason"];
 
+export type PlatformApplyAttempt = Schemas["PlatformApplyAttempt"];
+export type PlatformApplyAttemptEnvelope = Schemas["PlatformApplyAttemptEnvelope"];
+export type PlatformApplyAttemptsResponse = Schemas["PlatformApplyAttemptsResponse"];
+export type ApplyAttemptState = Schemas["ApplyAttemptState"];
+export type ApplyFailureReason = Schemas["ApplyFailureReason"];
+
 /** Never carries the plaintext code. */
 export type Invite = Schemas["Invite"];
 

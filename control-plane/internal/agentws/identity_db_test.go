@@ -186,6 +186,12 @@ func TestMigration0074DownDropsEverythingItAdded(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 
+	// 0075's tables reference platform_releases, so its down runs first — the
+	// order golang-migrate itself uses.
+	down0075, err := migrations.FS.ReadFile("0075_platform_apply.down.sql")
+	if err != nil {
+		t.Fatalf("read down migration: %v", err)
+	}
 	down, err := migrations.FS.ReadFile("0074_platform_release_identity.down.sql")
 	if err != nil {
 		t.Fatalf("read down migration: %v", err)
@@ -197,6 +203,9 @@ func TestMigration0074DownDropsEverythingItAdded(t *testing.T) {
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	if _, err := tx.Exec(ctx, string(down0075)); err != nil {
+		t.Fatalf("down migration 0075: %v", err)
+	}
 	if _, err := tx.Exec(ctx, string(down)); err != nil {
 		t.Fatalf("down migration: %v", err)
 	}

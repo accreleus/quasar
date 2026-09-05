@@ -3,11 +3,13 @@
 // is, what has been published, and what each target could be moved to.
 //
 // Every decision is PlanRelease (plan.go), which is pure; this file gathers the
-// reads. The apply half is amendment 2, #116/#117/#118.
+// reads. The apply half's endpoints are apply_handler.go (#116); its reads join
+// this one through Deps.OpenAttempts, so the page needs a single fetch.
 package platform
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 
@@ -26,7 +28,15 @@ type Deps struct {
 	Releases func(ctx context.Context, channel string) ([]Release, error)
 	// Detection reports when detection last SUCCEEDED and the last failure.
 	Detection func(ctx context.Context) (DetectionStatus, error)
+	// OpenAttempts is every non-terminal apply on the instance (amendment 2).
+	// Optional: a build with no apply store wired leaves it nil, and the view
+	// then reports nothing in flight rather than failing.
+	OpenAttempts func(ctx context.Context) ([]Attempt, error)
 }
+
+// errNoDeps is what a handler built with no dependencies answers with, rather
+// than dereferencing nil.
+var errNoDeps = errors.New("platform release view has no dependencies wired")
 
 // Handler serves the platform-release read surface.
 type Handler struct {
@@ -78,6 +88,15 @@ func (h *Handler) handleReleases(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, view)
 }
 
+// ReleaseView is the view the page reads, exposed so the apply endpoints
+// evaluate eligibility against exactly it — one evaluation, one vocabulary.
+func (h *Handler) ReleaseView(ctx context.Context) (View, error) {
+	if h.deps == nil {
+		return View{}, errNoDeps
+	}
+	return h.releaseView(ctx)
+}
+
 func (h *Handler) releaseView(ctx context.Context) (View, error) {
 	channel, edgeBranch, err := h.deps.Channel(ctx)
 	if err != nil {
@@ -98,6 +117,13 @@ func (h *Handler) releaseView(ctx context.Context) (View, error) {
 	if err != nil {
 		return View{}, err
 	}
+	var open []Attempt
+	if h.deps.OpenAttempts != nil {
+		open, err = h.deps.OpenAttempts(ctx)
+		if err != nil {
+			return View{}, err
+		}
+	}
 	return PlanRelease(PlanInputs{
 		Channel:      channel,
 		EdgeBranch:   edgeBranch,
@@ -106,5 +132,6 @@ func (h *Handler) releaseView(ctx context.Context) (View, error) {
 		Releases:     releases,
 		CheckedAt:    status.CheckedAt,
 		LastError:    status.LastError,
+		OpenAttempts: open,
 	}), nil
 }

@@ -361,6 +361,28 @@ anything. If it starts and then fails, the updater leaves it failed and records
 the previous digests in the result, because a started container may already have
 migrated and the rule at the top of this section then applies.
 
+### Applying from the console
+
+Admin › Fleet › Releases lists every target and, for an eligible host, offers
+**Apply**. What that does, in order: the host is cordoned through the same drain
+as `POST /v1/hosts/{id}/drain`, the attempt sits in **waiting_sessions** showing
+how many sessions are still running, and only when the count reaches zero is the
+apply handed to that host's updater. The cordon is then restored to whatever it
+was before — a host an admin had already cordoned stays cordoned, and one that
+was serving goes back to serving, whether the apply succeeded or failed.
+
+The confirmation's **force** checkbox skips the wait and names the number of
+live sessions it ends, because recreating the agent kills them all either way
+(above); with force off, nothing is lost. Force never stops sessions itself —
+the recreate does.
+
+Success is the host registering again on the release's commit, which is why a
+successful apply is reported by the *new* agent and not by the one that carried
+it out. A failed apply leaves the host on whatever it is running, records the
+previous digests, and shows the reason; there is no automatic rollback for a
+host. The Apply history section below the targets is the durable record, and
+`GET /v1/admin/platform/attempts` is the same data.
+
 Every result carries the previous digests, so the manual restore is copy-paste:
 
 ```bash

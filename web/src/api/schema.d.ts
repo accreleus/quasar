@@ -4087,8 +4087,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Apply one platform release to one host (admin). NOT CURRENTLY SERVED — see x-unimplemented.
-         * @description NOT IMPLEMENTED AS OF 2026-09-05 — registered by #116, which removes this marker. A STANDALONE attempt - no run, no fleet ordering - refused while a fleet run is active. ONLY THE NODE-AGENT IMAGE IS SENT; the control-plane component is never sent to a host. With force false the host is cordoned and the attempt sits in waiting_sessions until the non-terminal session count reaches zero; with force true the wait is skipped and the N sessions running are stopped, and a client MUST show N in the confirmation - force is the operator agreeing to end N live sessions. The host is uncordoned afterwards whatever the outcome, unless it was already cordoned when the apply started.
+         * Apply one platform release to one host (admin).
+         * @description A STANDALONE attempt - no run, no fleet ordering - refused while a fleet run is active. ONLY THE NODE-AGENT IMAGE IS SENT; the control-plane component is never sent to a host. With force false the host is cordoned and the attempt sits in waiting_sessions until the non-terminal session count reaches zero; with force true the wait is skipped and the N sessions running are stopped, and a client MUST show N in the confirmation - force is the operator agreeing to end N live sessions. The host is uncordoned afterwards whatever the outcome, unless it was already cordoned when the apply started.
          */
         post: {
             parameters: {
@@ -4228,8 +4228,8 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * Platform-release apply history, newest first (admin). NOT CURRENTLY SERVED — see x-unimplemented.
-         * @description NOT IMPLEMENTED AS OF 2026-09-05 — registered by #116, which removes this marker. Every attempt this instance has made, newest first (created_at DESC, id DESC), INCLUDING CONTROL-PLANE ATTEMPTS AND REVERTS - the one place an operator reads "what has this instance done to itself". An unknown host_id yields an EMPTY LIST and not a 404: "this host has no history" and "this host is gone" are the same answer to the question being asked. There is deliberately no target= filter - host_id absent already means everything, and a second overlapping filter is how two clients come to disagree about what a list contains.
+         * Platform-release apply history, newest first (admin).
+         * @description Every attempt this instance has made, newest first (created_at DESC, id DESC), INCLUDING CONTROL-PLANE ATTEMPTS AND REVERTS - the one place an operator reads "what has this instance done to itself". An unknown host_id yields an EMPTY LIST and not a 404: "this host has no history" and "this host is gone" are the same answer to the question being asked. There is deliberately no target= filter - host_id absent already means everything, and a second overlapping filter is how two clients come to disagree about what a list contains.
          */
         get: {
             parameters: {
