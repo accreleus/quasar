@@ -161,6 +161,7 @@ func TestServerBusyRefusesNeverQueues(t *testing.T) {
 
 func TestServerSelfAndHealthz(t *testing.T) {
 	f := newFakeEnv(t, "")
+	f.canned("config.out", `{"services":{"quasar-control-plane":{"image":"quasar-control-plane:latest"}}}`)
 	c := serveOnSocket(t, f)
 	if code, _ := get(t, c, "/v1/healthz"); code != http.StatusOK {
 		t.Fatalf("healthz status = %d", code)
@@ -174,6 +175,20 @@ func TestServerSelfAndHealthz(t *testing.T) {
 	}
 	if len(body["allowed_namespaces"].([]any)) != 1 {
 		t.Fatalf("self must report the allowlist: %v", body)
+	}
+	// Exact key names: the control plane reads them to classify its own install
+	// mode (#117).
+	images, ok := body["images"].(map[string]any)
+	if !ok {
+		t.Fatalf("self must report images: %v", body)
+	}
+	for _, k := range []string{"control-plane", "node-agent"} {
+		if _, present := images[k]; !present {
+			t.Fatalf("images is missing the key %q: %v", k, images)
+		}
+	}
+	if images["control-plane"] != "quasar-control-plane:latest" {
+		t.Fatalf("images = %v", images)
 	}
 }
 

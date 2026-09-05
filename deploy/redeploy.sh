@@ -825,6 +825,34 @@ fi
 # seconds before it would have succeeded (#467, caught by the first-run
 # acceptance loop). An already-initialized postgres passes this in
 # milliseconds, which is why Tower/hermes never saw it.
+# One-time volume ownership repair, for stacks that predate the two control
+# images agreeing on a uid. A named volume takes its ownership from whichever
+# image created it: a stack built from source used to run as ROOT, so
+# quasar-control-tls is root-owned there, and the first apply of a published
+# release (uid 1000) crash-looped for 15 minutes on "write TLS key
+# /var/lib/quasar-control/tls/key.pem: permission denied" — a started-then-failed
+# container, so the updater correctly reported `unhealthy` and did NOT restore.
+#
+# Idempotent and cheap: a chown of an already-correct tree changes nothing, and
+# the volume holds a key pair and an artwork cache, never anything the numbers
+# have to be preserved for. Skipped when the volume does not exist yet, since
+# compose is about to create it from an image that already owns it correctly.
+# The name is derived from the compose project — never hardcoded `deploy_`,
+# which is only right when nothing set COMPOSE_PROJECT_NAME.
+if [ "$SCOPE" != web ]; then
+  CTRL_VOLUME_NAME="${ADOPT_CTRL_VOL:-${COMPOSE_PROJECT}_quasar-control-tls}"
+  if docker volume inspect "$CTRL_VOLUME_NAME" >/dev/null 2>&1; then
+    if docker run --rm -v "$CTRL_VOLUME_NAME":/t alpine \
+         chown -R 1000:1000 /t >/dev/null 2>&1; then
+      echo "control-plane TLS volume $CTRL_VOLUME_NAME owned by 1000:1000 (both control images run as uid 1000)"
+    else
+      echo "  WARN: could not chown $CTRL_VOLUME_NAME to 1000:1000. If the control plane"
+      echo "        fails to boot with 'create TLS dir ... permission denied', run:"
+      echo "        docker run --rm -v $CTRL_VOLUME_NAME:/t alpine chown -R 1000:1000 /t"
+    fi
+  fi
+fi
+
 $DC up -d --wait --wait-timeout 120 quasar-postgres
 # --wait on the control-plane: healthy means /health answers, which means the
 # migration run COMPLETED — nothing below may touch the stack before that.

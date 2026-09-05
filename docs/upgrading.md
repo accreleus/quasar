@@ -290,6 +290,39 @@ the older version.
 
 ---
 
+## One-time: the control-plane TLS volume's ownership
+
+**Only if your stack was built from source before this change, and only once.**
+
+Both control-plane images now run as uid 1000. The source-built image used to run
+as root, so on a stack that ever ran it the `quasar-control-tls` volume — which
+holds the TLS pair and the artwork cache — is owned by root. Applying a published
+release to such a stack starts a uid-1000 container that cannot write it, and the
+control plane crash-loops:
+
+```
+fatal: tls: write TLS key /var/lib/quasar-control/tls/key.pem: permission denied
+```
+
+Nothing is damaged and nothing is lost. Give the volume to uid 1000:
+
+```bash
+# The volume name is <compose project>_quasar-control-tls. The project is the
+# stack directory's name unless COMPOSE_PROJECT_NAME says otherwise, so this
+# lists the real one rather than assuming it:
+docker volume ls --format '{{.Name}}' | grep quasar-control-tls
+
+docker run --rm -v <that name>:/t alpine chown -R 1000:1000 /t
+docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-control-plane
+```
+
+`deploy/redeploy.sh` does this for you on every deploy that touches the control
+plane, so a source install that deploys through it needs nothing here. The
+enrolled-host stack (`deploy/enroll-host.sh`) has no control-plane volume at all
+— it runs only the agent and the updater — so nothing there needs it either.
+
+---
+
 ## The updater
 
 `quasar-updater` is the per-host actor that applies a platform release: it pulls
