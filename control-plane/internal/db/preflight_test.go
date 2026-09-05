@@ -27,9 +27,12 @@ func testConnCfg(t *testing.T) *pgx.ConnConfig {
 func TestPreflight_ParseFailure(t *testing.T) {
 	// A URL whose port is not numeric fails pgx's own parse step before any
 	// dial is attempted.
-	err := Preflight(context.Background(), "postgres://user:pass@host:not-a-port/db")
+	err := Preflight(context.Background(), "postgres://user:must-not-leak@host:not-a-port/db")
 	if err == nil {
 		t.Fatal("expected a parse error, got nil")
+	}
+	if strings.Contains(err.Error(), "must-not-leak") {
+		t.Fatal("parse error leaked database credentials")
 	}
 	var pfErr *PreflightError
 	if !errors.As(err, &pfErr) {

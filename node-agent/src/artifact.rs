@@ -7,7 +7,8 @@
 //! provisioner ([`crate::nvidia_volume`], [`crate::cuda_runtime`]). `nvidia_volume` keeps
 //! thin wrappers at the old names so its tests still assert the same surface.
 
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -328,20 +329,18 @@ pub fn wait_for_quiescence(timeout: Duration) -> bool {
 
 // ── lock ─────────────────────────────────────────────────────────────────────
 
-/// Cross-process guard: two agents sharing a volume must never both write it. `O_EXCL`
-/// create; a lockfile whose holder has stopped touching it is taken over.
-///
-/// The holder rewrites its lockfile every [`HEARTBEAT_INTERVAL`] while it works, so a lock
-/// abandoned by a killed agent is reclaimed in minutes rather than [`LOCK_STALE_AFTER`].
-/// The heartbeat is advertised IN the lockfile (`heartbeat=<secs>`) and takeover only uses
-/// the short window when it sees that marker — a lock written by an agent too old to
-/// heartbeat keeps the long, conservative window, so a rolling upgrade can never let a new
-/// agent evict an old one that is merely slow.
+/// Cross-process guard using a persistent flock inode plus a compatibility marker.
+/// A killed modern writer releases the kernel lock immediately. Its marker can
+/// then be replaced without waiting for age. Legacy writers do not acquire flock,
+/// so their markers keep the conservative heartbeat/age rule during upgrades.
+/// The heartbeat writes its original descriptor, never a replacement owner's file.
 ///
 /// PID liveness is deliberately NOT the signal: the agent runs in a container under
 /// `init: true`, so a restarted agent gets the same low PID its dead predecessor recorded
 /// and `/proc/<pid>` would report the corpse as alive.
 pub struct Lock {
+    // Persistent inode: never unlink a flock file while another process may hold it.
+    _guard: std::fs::File,
     path: PathBuf,
     what: String,
     stop: Arc<AtomicBool>,
@@ -352,6 +351,21 @@ impl Lock {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
+        let guard_path = path.with_extension("guard");
+        let guard = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&guard_path)
+            .context("open provisioning kernel lock")?;
+        // SAFETY: the descriptor belongs to `guard`, retained for the entire Lock lifetime.
+        if unsafe { libc::flock(guard.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            bail!(
+                "provisioning is active in another agent; waiting for its kernel lock: {}",
+                std::io::Error::last_os_error()
+            );
+        }
         for attempt in 0..2 {
             match std::fs::OpenOptions::new()
                 .write(true)
@@ -359,12 +373,17 @@ impl Lock {
                 .open(path)
             {
                 Ok(mut f) => {
-                    let _ = f.write_all(lock_body().as_bytes());
+                    if let Err(error) = f.write_all(lock_body().as_bytes()) {
+                        let _ = std::fs::remove_file(path);
+                        return Err(anyhow!("write provisioning lock metadata: {error}"));
+                    }
                     tracing::debug!(target: T, artifact = %what, path = %path.display(), "provisioning lock acquired");
+                    let heartbeat = f.try_clone().context("clone provisioning heartbeat file")?;
                     PROVISIONS_IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
                     let stop = Arc::new(AtomicBool::new(false));
-                    spawn_heartbeat(path.to_path_buf(), what.to_string(), Arc::clone(&stop));
+                    spawn_heartbeat(heartbeat, what.to_string(), Arc::clone(&stop));
                     return Ok(Lock {
+                        _guard: guard,
                         path: path.to_path_buf(),
                         what: what.to_string(),
                         stop,
@@ -378,7 +397,11 @@ impl Lock {
                         .unwrap_or(Duration::ZERO);
                     let body = std::fs::read_to_string(path).unwrap_or_default();
                     let window = stale_after_for(&body);
-                    if age > window {
+                    if body
+                        .split_whitespace()
+                        .any(|field| field == "kernel_lock=1")
+                        || age > window
+                    {
                         tracing::warn!(
                             target: T, token = "artifact-stale-lock-taken",
                             artifact = %what, age_s = age.as_secs(),
@@ -406,7 +429,7 @@ impl Lock {
 /// the load-bearing field — see [`stale_after_for`].
 fn lock_body() -> String {
     format!(
-        "pid={} agent={} heartbeat={}\n",
+        "pid={} agent={} heartbeat={} kernel_lock=1\n",
         std::process::id(),
         env!("CARGO_PKG_VERSION"),
         HEARTBEAT_INTERVAL.as_secs()
@@ -415,7 +438,7 @@ fn lock_body() -> String {
 
 /// Rewrite the lockfile on a cadence so its mtime keeps saying "still working". Rewriting
 /// the body (rather than a `utimensat`) keeps this dependency-free and self-describing.
-fn spawn_heartbeat(path: PathBuf, what: String, stop: Arc<AtomicBool>) {
+fn spawn_heartbeat(mut file: std::fs::File, what: String, stop: Arc<AtomicBool>) {
     let _ = std::thread::Builder::new()
         .name("quasar-provision-hb".into())
         .spawn(move || {
@@ -424,7 +447,7 @@ fn spawn_heartbeat(path: PathBuf, what: String, stop: Arc<AtomicBool>) {
                 if stop.load(Ordering::SeqCst) {
                     return;
                 }
-                if std::fs::write(&path, lock_body()).is_err() {
+                if file.seek(SeekFrom::Start(0)).and_then(|_| file.write_all(lock_body().as_bytes())).is_err() {
                     tracing::debug!(target: T, artifact = %what, "provisioning lock heartbeat could not write");
                     return;
                 }
@@ -688,6 +711,19 @@ mod tests {
                 "a lockfile with no usable heartbeat marker must keep the conservative window: {legacy:?}"
             );
         }
+    }
+
+    #[test]
+    fn abandoned_kernel_lock_is_recovered_without_waiting_for_age() {
+        let _serial = serial_lock_test();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".provision.lock");
+        // Simulate a killed writer: metadata survives but no process holds the guard.
+        std::fs::write(&path, lock_body()).unwrap();
+        let held = Lock::acquire(&path, "recovery").unwrap();
+        assert!(Lock::acquire(&path, "competitor").is_err());
+        drop(held);
+        assert!(Lock::acquire(&path, "next").is_ok());
     }
 
     #[test]

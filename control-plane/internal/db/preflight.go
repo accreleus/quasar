@@ -46,6 +46,11 @@ type PreflightError struct {
 }
 
 func (e *PreflightError) Error() string {
+	// Parse errors can contain the entire credential-bearing DSN. Keep the
+	// cause for errors.As/Unwrap, but never format it into startup logs.
+	if e.Kind == PreflightParseFailure {
+		return e.Message
+	}
 	return fmt.Sprintf("%s\n  driver error: %v", e.Message, e.Cause)
 }
 
