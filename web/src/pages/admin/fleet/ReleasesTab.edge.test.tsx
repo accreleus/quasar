@@ -37,6 +37,7 @@ function edgeView(over: Partial<PlatformRelease> = {}): PlatformReleaseView {
   } as PlatformRelease;
   return {
     channel: "edge",
+    source_repo: "accreleus/quasar",
     edge_branch: "develop",
     checked_at: "2026-09-04T12:05:00Z",
     last_error: null,
@@ -74,6 +75,8 @@ beforeEach(() => {
   // The page also reads sessions (for the force count) and the apply history.
   mocked.listAllSessions.mockResolvedValue({ items: [], next_cursor: null } as never);
   mocked.listPlatformAttempts.mockResolvedValue({ attempts: [] });
+  // The head's "next check" fragment reads the detection job's schedule.
+  mocked.listJobs.mockResolvedValue({ items: [], next_cursor: null } as never);
 });
 
 describe("ReleasesTab on edge", () => {
@@ -81,14 +84,16 @@ describe("ReleasesTab on edge", () => {
     mocked.getPlatformReleases.mockResolvedValue(edgeView());
     const { container } = renderTab();
 
-    expect(await screen.findByText(EDGE_COMMIT.slice(0, 12))).toBeInTheDocument();
+    // The card's title IS the commit, and so is the commit line beside it.
+    expect((await screen.findAllByText(EDGE_COMMIT.slice(0, 12))).length).toBeGreaterThan(0);
     const link = screen.getByRole("link", { name: /compare with the installed build/i });
     expect(link).toHaveAttribute("href", COMPARE);
-    // No notes exist on a branch build, so nothing renders a markdown body.
-    expect(container.querySelector(".release-entry h1, .release-entry h2, .release-entry h3"))
-      .toBeNull();
-    // The branch is readable beside the channel control.
-    expect(screen.getByText("develop", { selector: ".mono" })).toBeInTheDocument();
+    // A branch build publishes no notes, so the card has no changelog rows and
+    // offers no release page to view.
+    expect(container.querySelector(".rel-e")).toBeNull();
+    expect(screen.queryByRole("link", { name: /view on github/i })).not.toBeInTheDocument();
+    // The branch is editable beside the channel control.
+    expect(screen.getByLabelText(/edge branch/i)).toHaveValue("develop");
   });
 
   it("says a branch build has no notes when there is nothing to compare from", async () => {

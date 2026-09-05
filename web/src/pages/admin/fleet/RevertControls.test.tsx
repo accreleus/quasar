@@ -128,6 +128,8 @@ beforeEach(() => {
   vi.resetAllMocks();
   mocked.listAllSessions.mockResolvedValue({ items: [], next_cursor: null } as never);
   mocked.listPlatformAttempts.mockResolvedValue({ attempts: [] });
+  // The head's "next check" fragment reads the detection job's schedule.
+  mocked.listJobs.mockResolvedValue({ items: [], next_cursor: null } as never);
   mocked.getPlatformReleases.mockResolvedValue(view());
 });
 
@@ -173,7 +175,8 @@ describe("revertStates", () => {
 describe("Revert on the Releases page", () => {
   it("offers no Revert when the host has nothing to go back to", async () => {
     renderTab();
-    await screen.findByText("gpu-host-01");
+    // The host is named by the targets rollup and by the table behind it.
+    expect((await screen.findAllByText("gpu-host-01")).length).toBeGreaterThan(0);
     expect(screen.queryByRole("button", { name: /^Revert$/ })).not.toBeInTheDocument();
   });
 

@@ -7,7 +7,7 @@
  * same card/table/chip primitives the rest of the page uses.
  */
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import * as adminApi from "../../../api/admin";
 import type {
   PlatformApplyRun,
@@ -44,9 +44,12 @@ function controlPlaneBlocker(targets: PlatformReleaseTarget[]): string | null {
 export function FleetApplyButton({
   view,
   onStarted,
+  children,
 }: {
   view: PlatformReleaseView;
   onStarted: () => void;
+  /** The label, so the head can put its icon in front of it. */
+  children?: ReactNode;
 }) {
   const [confirming, setConfirming] = useState(false);
   const newest = view.available[0];
@@ -65,7 +68,7 @@ export function FleetApplyButton({
         disabled={blocked != null}
         title={blocked ? eligibilityText(blocked) : undefined}
       >
-        Update Quasar
+        {children ?? "Update Quasar"}
       </Button>
       {confirming && (
         <FleetApplyModal
