@@ -141,6 +141,17 @@ function composeYaml(a) {
       PUBLIC_BASE_URL: \${PUBLIC_BASE_URL:-}
       QUASAR_ALLOWED_ORIGINS: \${QUASAR_ALLOWED_ORIGINS:-}
       QUASAR_TRUSTED_PROXIES: \${QUASAR_TRUSTED_PROXIES:-}
+      # Self-update. Every one has a working default, so leaving them empty is
+      # the normal case; they are passed because an .env entry with no
+      # passthrough is silently inert. QUASAR_PLATFORM_RELEASE_REPO=off disables
+      # release detection entirely.
+      QUASAR_PLATFORM_RELEASE_REPO: \${QUASAR_PLATFORM_RELEASE_REPO:-}
+      QUASAR_PLATFORM_RELEASE_API: \${QUASAR_PLATFORM_RELEASE_API:-}
+      QUASAR_PLATFORM_RELEASE_ASSET_HOSTS: \${QUASAR_PLATFORM_RELEASE_ASSET_HOSTS:-}
+      QUASAR_PLATFORM_RELEASE_TOKEN: \${QUASAR_PLATFORM_RELEASE_TOKEN:-}
+      QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL: \${QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL:-}
+      QUASAR_PLATFORM_REGISTRY: \${QUASAR_PLATFORM_REGISTRY:-}
+      QUASAR_IMAGE_REGISTRY_HOSTS: \${QUASAR_IMAGE_REGISTRY_HOSTS:-}
 ${ownCert}      QUASAR_WEB_ROOT: /app/web
     volumes:
       - \${QUASAR_STATE_DIR:?set it in .env}:/var/lib/quasar-control

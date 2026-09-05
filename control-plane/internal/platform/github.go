@@ -82,14 +82,23 @@ func NewGitHubSource(client Doer, apiBase, repo, token string, assetHosts []stri
 	}
 }
 
-// ConfiguredReleaseRepo reads QUASAR_PLATFORM_RELEASE_REPO. An explicitly empty
-// value disables detection rather than falling back to the default: an operator
-// who blanks it is turning the feature off.
+// ConfiguredReleaseRepo reads QUASAR_PLATFORM_RELEASE_REPO. Returns "" when
+// detection is switched off.
+//
+// EMPTY MEANS THE DEFAULT, NOT OFF. Every compose layer forwards a knob as
+// `${VAR:-}`, so a stock install with nothing in deploy/.env hands this process
+// an empty string — and reading that as "off" would silently disable
+// self-update on every one of them. `off` is the off switch, and it is the only
+// one; the same reading applies to every other knob in this package.
 func ConfiguredReleaseRepo() string {
-	if v, ok := os.LookupEnv("QUASAR_PLATFORM_RELEASE_REPO"); ok {
-		return strings.TrimSpace(v)
+	v := strings.TrimSpace(os.Getenv("QUASAR_PLATFORM_RELEASE_REPO"))
+	switch strings.ToLower(v) {
+	case "":
+		return DefaultReleaseRepo
+	case "off", "none", "disabled":
+		return ""
 	}
-	return DefaultReleaseRepo
+	return v
 }
 
 // ConfiguredReleaseAPI reads QUASAR_PLATFORM_RELEASE_API.

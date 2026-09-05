@@ -338,3 +338,41 @@ func TestGitHubSourceFollowsOnlyOneHop(t *testing.T) {
 		t.Fatalf("err = %v, want the second redirect refused", err)
 	}
 }
+
+// Every knob below is forwarded by compose as `${VAR:-}`, so an install that
+// sets none of them hands this process an EMPTY STRING for each. Reading any of
+// them as anything but "the built-in default" silently changes behaviour on a
+// stock install — which is exactly how a curated compose passthrough breaks a
+// feature nobody touched.
+func TestAnEmptyKnobMeansTheBuiltInDefault(t *testing.T) {
+	for _, v := range []string{
+		"QUASAR_PLATFORM_RELEASE_REPO",
+		"QUASAR_PLATFORM_RELEASE_API",
+		"QUASAR_PLATFORM_RELEASE_ASSET_HOSTS",
+		"QUASAR_PLATFORM_RELEASE_TOKEN",
+	} {
+		t.Setenv(v, "")
+	}
+	if got := ConfiguredReleaseRepo(); got != DefaultReleaseRepo {
+		t.Errorf("repo = %q, want %q — an empty knob must not read as off", got, DefaultReleaseRepo)
+	}
+	if got := ConfiguredReleaseAPI(); got != DefaultReleaseAPI {
+		t.Errorf("api = %q, want %q", got, DefaultReleaseAPI)
+	}
+	if got := ReleaseAssetHosts(); len(got) != len(defaultAssetHosts) {
+		t.Errorf("asset hosts = %v, want the default list", got)
+	}
+}
+
+func TestTheReleaseRepoOffSwitch(t *testing.T) {
+	for _, off := range []string{"off", "OFF", "none", "disabled", " off "} {
+		t.Setenv("QUASAR_PLATFORM_RELEASE_REPO", off)
+		if got := ConfiguredReleaseRepo(); got != "" {
+			t.Errorf("repo with %q = %q, want the off switch to hold", off, got)
+		}
+	}
+	t.Setenv("QUASAR_PLATFORM_RELEASE_REPO", "someone/fork")
+	if got := ConfiguredReleaseRepo(); got != "someone/fork" {
+		t.Errorf("repo = %q, want the configured fork", got)
+	}
+}
