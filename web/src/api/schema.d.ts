@@ -7833,6 +7833,8 @@ export interface components {
              * @enum {string}
              */
             channel: "stable" | "edge";
+            /** @description ADDITIVE (#104). The configured release repository as `owner/name` (QUASAR_PLATFORM_RELEASE_REPO, default `accreleus/quasar`), so a client can compose the GitHub links a release view needs - the release page, the commit, and the issues the notes reference - instead of hard-coding a repository the operator may have re-pointed. "" when detection is switched off, which a client reads as "render no links", never as the default. Optional in the schema so a pre-#104 server stays conformant; a client must read absent as "". */
+            source_repo?: string;
             /** @description The branch the edge channel follows. Reported on BOTH channels so a UI can render the control without a second read; it selects nothing while channel is stable. */
             edge_branch: string;
             /**

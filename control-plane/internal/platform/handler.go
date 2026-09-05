@@ -147,6 +147,7 @@ func (h *Handler) releaseView(ctx context.Context) (View, error) {
 	}
 	return PlanRelease(PlanInputs{
 		Channel:      channel,
+		SourceRepo:   ConfiguredReleaseRepo(),
 		EdgeBranch:   edgeBranch,
 		ControlPlane: buildinfo.Get(),
 		Hosts:        hosts,

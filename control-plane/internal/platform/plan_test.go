@@ -439,6 +439,7 @@ func TestViewSerializesEveryRequiredKeyIncludingActiveApply(t *testing.T) {
 	checked := at(4)
 	v := PlanRelease(PlanInputs{
 		Channel:      ChannelStable,
+		SourceRepo:   "accreleus/quasar",
 		EdgeBranch:   "develop",
 		ControlPlane: cp(commitA, 74),
 		CheckedAt:    &checked,
@@ -452,7 +453,7 @@ func TestViewSerializesEveryRequiredKeyIncludingActiveApply(t *testing.T) {
 	if err := json.Unmarshal(raw, &body); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	for _, key := range []string{"channel", "edge_branch", "checked_at", "last_error",
+	for _, key := range []string{"channel", "source_repo", "edge_branch", "checked_at", "last_error",
 		"installed", "available", "targets", "faults", "active_apply"} {
 		if _, ok := body[key]; !ok {
 			t.Errorf("view is missing required key %q: %s", key, raw)
@@ -465,6 +466,11 @@ func TestViewSerializesEveryRequiredKeyIncludingActiveApply(t *testing.T) {
 	}
 	if string(body["available"]) != "[]" || string(body["targets"]) == "null" || string(body["faults"]) != "[]" {
 		t.Errorf("empty lists must serialize as [], never null: %s", raw)
+	}
+	// The console composes every GitHub link from this, so it must survive the
+	// round trip rather than being a repo the client hard-codes (#104).
+	if string(body["source_repo"]) != `"accreleus/quasar"` {
+		t.Errorf("source_repo = %s, want the configured release repo", body["source_repo"])
 	}
 	if string(body["checked_at"]) != `"2026-09-04T12:00:00Z"` {
 		t.Errorf("checked_at = %s, want RFC3339 UTC", body["checked_at"])

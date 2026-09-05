@@ -115,6 +115,7 @@ func TestReleaseViewIsAdminOnlyAndServesThePlan(t *testing.T) {
 	}
 	var view struct {
 		Channel    string `json:"channel"`
+		SourceRepo string `json:"source_repo"`
 		EdgeBranch string `json:"edge_branch"`
 		CheckedAt  string `json:"checked_at"`
 		Installed  struct {
@@ -138,6 +139,10 @@ func TestReleaseViewIsAdminOnlyAndServesThePlan(t *testing.T) {
 	}
 	if view.Channel != ChannelStable || view.EdgeBranch != "develop" {
 		t.Errorf("channel/edge_branch = %q/%q", view.Channel, view.EdgeBranch)
+	}
+	// Served from the detection config, not hard-coded by the client (#104).
+	if view.SourceRepo != DefaultReleaseRepo {
+		t.Errorf("source_repo = %q, want %q", view.SourceRepo, DefaultReleaseRepo)
 	}
 	if view.CheckedAt != "2026-09-04T02:07:11Z" {
 		t.Errorf("checked_at = %q, want the last successful detection", view.CheckedAt)
