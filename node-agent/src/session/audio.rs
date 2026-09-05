@@ -102,8 +102,13 @@ impl PulseSidecar {
         let socket_dir = pulse_socket_dir(runtime_dir, session_id);
         let socket_path = socket_dir.join("native");
         let container_name = pulse_container_name(session_id);
-        let image = std::env::var("QUASAR_PULSE_IMAGE")
-            .unwrap_or_else(|_| "quasar-agent-dev:latest".to_string());
+        let image = match std::env::var("QUASAR_PULSE_IMAGE")
+            .ok()
+            .filter(|v| !v.is_empty())
+        {
+            Some(image) => image,
+            None => runtime.own_image().context("cannot select audio sidecar image; set QUASAR_PULSE_IMAGE when running outside a container")?,
+        };
 
         // Idempotent clean of any stale container from a prior crashed run.
         runtime.force_remove(&container_name);

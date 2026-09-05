@@ -154,8 +154,12 @@ pub struct ProbeEnv {
     /// result rather than re-running it — it costs a throwaway container per run.
     pub nvidia_lib32_path: String,
     /// Driver-volume provisioner state. Provisioned turns the three NVIDIA checks green;
-    /// in-flight reports [`PROVISIONING`]; failed keeps the manual remediation plus the error.
+    /// in-flight reports [`PROVISIONING`]; failed reports the specific error and retry policy.
     pub nvidia_volume: VolumeView,
+    /// Can the runtime pass the provisioned driver into sibling app containers?
+    pub driver_mount_error: Option<String>,
+    pub container_mount_error: Option<String>,
+    pub sibling_egl: crate::nvidia_volume::EglRuntime,
     /// Does the EGL stack this container loads actually WORK, as opposed to being present on
     /// disk? A file-presence pass that is green while the compositor cannot init EGL sends the
     /// operator elsewhere, so this runtime verdict VETOES it (loop-3 guard).
@@ -208,11 +212,17 @@ impl ProbeEnv {
     /// Production environment: probe the agent's own filesystem, read
     /// `/host/etc/os-release` when the compose mount is present.
     pub fn live(nvidia: bool, nvidia_lib32_path: &str) -> Self {
-        let host_root = if Path::new(HOST_ROOT).join("etc/os-release").exists() {
-            PathBuf::from(HOST_ROOT)
-        } else {
-            PathBuf::from("/")
-        };
+        if nvidia {
+            let docker =
+                std::env::var("QUASAR_CONTAINER_RUNTIME").unwrap_or_else(|_| "docker".into());
+            crate::nvidia_volume::retry_mount_resolution(&docker);
+        }
+        let host_root =
+            if is_containerized() || Path::new(HOST_ROOT).join("etc/os-release").exists() {
+                PathBuf::from(HOST_ROOT)
+            } else {
+                PathBuf::from("/")
+            };
         ProbeEnv {
             root: PathBuf::from("/"),
             host_root,
@@ -227,6 +237,13 @@ impl ProbeEnv {
             host_codecs: CodecProbe::NotProbed,
             nvidia_lib32_path: nvidia_lib32_path.to_string(),
             nvidia_volume: VolumeView::live(),
+            container_mount_error: sibling_mount_error(),
+            sibling_egl: if nvidia { crate::nvidia_volume::probe_sibling_egl() } else { crate::nvidia_volume::EglRuntime::Unknown },
+            driver_mount_error: crate::nvidia_volume::current().and_then(|info| {
+                if info.host.is_none() && info.name.is_none() {
+                    Some("The agent can read its NVIDIA driver volume but cannot resolve its Docker mount. App launches are blocked; check the Docker socket and container identity inspection.".to_string())
+                } else { None }
+            }),
             // NVIDIA only: on AMD/Intel the EGL stack is Mesa's and none of this module's
             // remediation applies, so the subprocess (and a confusing red row) buys nothing.
             egl_runtime: if nvidia {
@@ -304,6 +321,68 @@ fn detect_distro(env: &ProbeEnv) -> Distro {
     }
 }
 
+fn is_containerized() -> bool {
+    Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists()
+}
+
+/// Docker resolves app bind sources in the host namespace, not the agent's.
+/// Validate that the directories the agent writes are the directories apps mount.
+pub(crate) fn sibling_mount_error() -> Option<String> {
+    if !is_containerized() {
+        return None;
+    }
+    let Some(id) = crate::nvidia_volume::self_container_id() else {
+        return Some("Cannot identify the agent container to validate app mounts".into());
+    };
+    let docker = std::env::var("QUASAR_CONTAINER_RUNTIME").unwrap_or_else(|_| "docker".into());
+    let Some(body) = run_with_timeout(&docker, &["inspect", "--format", "{{json .Mounts}}", &id])
+    else {
+        return Some("Docker could not inspect the agent's mounts; check socket access".into());
+    };
+    let Ok(mounts) = serde_json::from_str::<Vec<serde_json::Value>>(&body) else {
+        return Some("Docker returned invalid agent mount data".into());
+    };
+    let mut paths =
+        vec![std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/quasar-agent".into())];
+    let home = std::env::var("QUASAR_HOME_ROOT").unwrap_or_default();
+    if !home.is_empty() {
+        paths.push(home.clone());
+        let template = std::env::var("QUASAR_TEMPLATE_ROOT")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| {
+                Path::new(&home)
+                    .parent()
+                    .unwrap_or(Path::new("/var/lib/quasar"))
+                    .join("templates")
+                    .to_string_lossy()
+                    .into_owned()
+            });
+        paths.push(template);
+    }
+    validate_sibling_mounts(&mounts, &paths)
+}
+
+fn validate_sibling_mounts(mounts: &[serde_json::Value], paths: &[String]) -> Option<String> {
+    let broken: Vec<_> = paths
+        .iter()
+        .filter(|path| {
+            !mounts.iter().any(|mount| {
+                mount["Type"].as_str() == Some("bind")
+                    && mount["Source"].as_str() == Some(path.as_str())
+                    && mount["Destination"].as_str() == Some(path.as_str())
+                    && mount["RW"].as_bool() == Some(true)
+            })
+        })
+        .cloned()
+        .collect();
+    if broken.is_empty() {
+        None
+    } else {
+        Some(format!("Agent directories do not have matching writable host bind mounts: {}. Apps would receive different or inaccessible files.", broken.join(", ")))
+    }
+}
+
 /// Run the full check set. Pure w.r.t. `env` (no global state, network, or container launches)
 /// so it is cheap to re-run on every capacity report.
 pub fn probe(env: &ProbeEnv) -> Vec<ReadinessCheck> {
@@ -321,10 +400,24 @@ pub fn probe(env: &ProbeEnv) -> Vec<ReadinessCheck> {
         check_host_render_node(env, distro),
         check_dri_node_app_access(env, distro),
         check_driver_volume_version(env, distro),
+        match &env.sibling_egl {
+            crate::nvidia_volume::EglRuntime::Ok { .. } => pass("nvidia_sibling_egl", "Provisioned NVIDIA driver loads in a sibling container".into()),
+            crate::nvidia_volume::EglRuntime::Broken { detail, .. } => fail("nvidia_sibling_egl", detail.clone(), "The agent's driver works locally but failed the sibling-container EGL test. Check the driver mount and libraries; the test retries automatically.".into()),
+            crate::nvidia_volume::EglRuntime::Indeterminate { detail } => warn_check("nvidia_sibling_egl", detail.clone(), "Driver loading in a sibling container is not confirmed. Check Docker runtime access; the test retries automatically.".into()),
+            crate::nvidia_volume::EglRuntime::Unknown => skip("nvidia_sibling_egl", "No provisioned driver requires a sibling-container test"),
+        },
+        match &env.driver_mount_error {
+            Some(error) => fail("nvidia_driver_mount", error.clone(), "Check Docker socket access and recreate the agent with the generated Compose file. The driver is already present; reinstalling it will not fix mount resolution.".to_string()),
+            None => skip("nvidia_driver_mount", "No unresolved NVIDIA app driver mount"),
+        },
         check_encoder_codecs(env, distro),
         check_xid_visibility(env),
         // Applies to every host, GPU or not — not part of the sanity family.
         check_media_reachability(env, distro),
+        match &env.container_mount_error {
+            Some(error) => fail("host_container_mounts", error.clone(), "Use the generated bind mounts at identical host/container paths. Fix the Docker socket or mount configuration, then recreate the agent; checks refresh automatically.".to_string()),
+            None => pass("host_container_mounts", "Required sibling-container paths agree with their host bind mounts".to_string()),
+        },
     ]
 }
 
@@ -763,8 +856,8 @@ fn nvidia_gap_outcome(
         ),
         VolumeView::Failed(err) => fail(
             id,
-            format!("{fail_summary} — automatic driver-volume provisioning failed: {err}"),
-            manual(extra_remediation),
+            format!("Automatic NVIDIA driver-volume provisioning is waiting to retry: {err}"),
+            "Resolve the specific error above. Quasar retries automatically; do not replace the host driver merely because provisioning failed.".to_string(),
         ),
         VolumeView::None => fail(id, fail_summary.to_string(), manual(extra_remediation)),
     }
@@ -1675,6 +1768,20 @@ fn media_port_range(root: &Path) -> Option<(u32, u32)> {
 /// policy. Every step degrades to "no signal", never an error — a missing binary is the
 /// expected case on the stock image, and these probes must never hard-fail.
 fn detect_firewall_posture() -> FirewallPosture {
+    // A bridged container can have an empty local ruleset while the host filters
+    // every packet. Only host-networked agents may report this as host evidence.
+    if is_containerized() {
+        let docker = std::env::var("QUASAR_CONTAINER_RUNTIME").unwrap_or_else(|_| "docker".into());
+        let network = crate::nvidia_volume::self_container_id().and_then(|id| {
+            run_with_timeout(
+                &docker,
+                &["inspect", "--format", "{{.HostConfig.NetworkMode}}", &id],
+            )
+        });
+        if network.as_deref().map(str::trim) != Some("host") {
+            return FirewallPosture::Unknown;
+        }
+    }
     // Live probe, so the real root: a fake one is only ever passed in tests, which drive the
     // pure parsers directly.
     let media = media_port_range(Path::new("/")).unwrap_or(DEFAULT_MEDIA_PORTS);
@@ -1735,7 +1842,7 @@ fn firewalld_zone_listing() -> Option<String> {
 /// stdout as UTF-8 iff the command spawns, exits within [`FIREWALL_PROBE_TIMEOUT`], and
 /// succeeds. Every other outcome is `None`. A `None` is a fact about the probe, never about the
 /// host, so callers must not distinguish "absent" from "errored".
-fn run_with_timeout(cmd: &str, args: &[&str]) -> Option<String> {
+pub(crate) fn run_with_timeout(cmd: &str, args: &[&str]) -> Option<String> {
     use std::process::{Command, Stdio};
     let mut child = Command::new(cmd)
         .args(args)
@@ -2323,6 +2430,9 @@ mod tests {
                 host_codecs: CodecProbe::Probed(vec!["h264".to_string()]),
                 nvidia_lib32_path: lib32.to_string(),
                 nvidia_volume: VolumeView::None,
+                driver_mount_error: None,
+                container_mount_error: None,
+                sibling_egl: crate::nvidia_volume::EglRuntime::Unknown,
                 // `Unknown` means "not probed" and must never influence a verdict on its own.
                 egl_runtime: crate::nvidia_volume::EglRuntime::Unknown,
                 firewall: FirewallPosture::Unknown,
@@ -2364,7 +2474,21 @@ mod tests {
             .unwrap_or_else(|| panic!("no check {id} in {checks:?}"))
     }
 
-    /// A healthy NVIDIA host: every check passes, nothing reads as a failure.
+    #[test]
+    fn wrong_mount_source_is_not_treated_as_a_valid_app_path() {
+        let paths = vec!["/run/quasar-agent".to_string()];
+        let good = serde_json::json!({"Type":"bind", "Source":"/run/quasar-agent", "Destination":"/run/quasar-agent", "RW":true});
+        assert!(validate_sibling_mounts(std::slice::from_ref(&good), &paths).is_none());
+        let mut wrong = good.clone();
+        wrong["Source"] = serde_json::json!("/some/other/directory");
+        assert!(validate_sibling_mounts(&[wrong], &paths).is_some());
+        let mut readonly = good;
+        readonly["RW"] = serde_json::json!(false);
+        assert!(validate_sibling_mounts(&[readonly], &paths).is_some());
+        assert!(validate_sibling_mounts(&[], &paths).is_some());
+    }
+
+    /// A healthy NVIDIA host: every applicable check passes.
     #[test]
     fn healthy_nvidia_host_passes_every_check() {
         let root = FakeRoot::new("healthy");
@@ -2393,6 +2517,13 @@ mod tests {
             ..root.env(true, "/usr/lib")
         });
         for c in &checks {
+            if matches!(c.id.as_str(), "nvidia_driver_mount" | "nvidia_sibling_egl") {
+                assert_eq!(
+                    c.status, SKIP,
+                    "native host needs no provisioned driver mount"
+                );
+                continue;
+            }
             assert_eq!(c.status, PASS, "check {} should pass: {:?}", c.id, c);
             assert!(
                 c.remediation.is_empty(),
@@ -2919,8 +3050,8 @@ mod tests {
             assert_eq!(c.status, FAIL, "{id}: {c:?}");
             assert!(c.summary.contains("HTTP 404"), "{id}: {c:?}");
             assert!(
-                c.remediation.contains("dnf install"),
-                "{id} must still carry the manual fallback: {c:?}"
+                c.remediation.contains("retries automatically"),
+                "{id} must explain recovery without blaming the host driver: {c:?}"
             );
         }
     }

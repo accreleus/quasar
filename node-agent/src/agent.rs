@@ -311,7 +311,7 @@ fn spawn_nvidia_volume_provisioner(runtime: &ContainerRuntime, nvidia_lib32_prob
     let nvidia_lib32_probed = nvidia_lib32_probed.to_string();
     std::thread::Builder::new()
         .name("quasar-nvvol".into())
-        .spawn(move || {
+        .spawn(move || loop {
             // ONE `ProbeEnv::live`: building it forks the EGL self-test, and the gap
             // and the card must answer about the same instant.
             let env = crate::readiness::ProbeEnv::live(true, &nvidia_lib32_probed);
@@ -335,8 +335,15 @@ fn spawn_nvidia_volume_provisioner(runtime: &ContainerRuntime, nvidia_lib32_prob
                          the next session launch; no agent restart needed"
                     );
                 }
+                crate::nvidia_volume::Outcome::Failed(_) => {
+                    // The artifact layer owns download backoff and integrity refusal.
+                    // Rechecking also recovers from another provisioner's stale lock.
+                    std::thread::sleep(Duration::from_secs(60));
+                    continue;
+                }
                 _ => {}
             }
+            return;
         })
         .map(|_| ())
         .unwrap_or_else(|e| {
@@ -1186,8 +1193,45 @@ async fn connect_and_run(
         }
     };
 
+    // Readiness observes filesystem and provisioning state, which can change while
+    // connected. Keep probes off the WebSocket loop and allow only one in flight.
+    let mut readiness_timer = tokio::time::interval(Duration::from_secs(15));
+    readiness_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let (readiness_tx, mut readiness_rx) = tokio::sync::mpsc::channel(1);
+    let mut readiness_busy = false;
+
     loop {
         tokio::select! {
+            _ = readiness_timer.tick(), if !readiness_busy => {
+                readiness_busy = true;
+                let sender = readiness_tx.clone();
+                let lib32 = mgr.runtime_settings.nvidia_lib32_path.clone();
+                let codecs = mgr.host_codec_report.as_ref().map(|r| r.codecs.clone());
+                tokio::spawn(async move {
+                    let checks = tokio::task::spawn_blocking(move || crate::readiness::probe(
+                        &crate::readiness::ProbeEnv::live(nvidia_host, &lib32)
+                            .with_gpu_present(gpu_present)
+                            .with_codec_probe(codecs.as_deref()),
+                    )).await;
+                    let _ = sender.send(checks).await;
+                });
+            }
+            Some(checks) = readiness_rx.recv() => {
+                readiness_busy = false;
+                match checks {
+                    Ok(checks) => mgr.readiness = checks,
+                    Err(error) => {
+                        warn!(token = "readiness-refresh-failed", "host readiness refresh failed: {error}");
+                        mgr.readiness = vec![crate::messages::ReadinessCheck {
+                            id: "readiness_probe".into(), status: "warn".into(),
+                            summary: "Host readiness could not be refreshed; previous results are no longer current".into(),
+                            remediation: "The agent will retry automatically. Check its logs if this persists.".into(),
+                        }];
+                    }
+                }
+                send_fresh_capacity(&mut tx, &mut mgr).await?;
+            }
+
             _ = hb_timer.tick() => {
                 let ts_unix_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)

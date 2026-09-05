@@ -273,6 +273,28 @@ fn set_current(info: Option<VolumeInfo>) {
     }
 }
 
+/// Retry a transient Docker inspection failure without restarting or re-downloading.
+pub fn retry_mount_resolution(docker: &str) {
+    let Some(info) = current() else {
+        return;
+    };
+    if info.host.is_some() || info.name.is_some() {
+        return;
+    }
+    let (host, name) = locate_host_path(docker);
+    if host.is_none() && name.is_none() {
+        return;
+    }
+    if let Ok(mut state) = CURRENT.write() {
+        if let Some(current) = state.as_mut() {
+            if current.manifest.driver_version == info.manifest.driver_version {
+                current.host = host;
+                current.name = name;
+            }
+        }
+    }
+}
+
 // ── opt-out ──────────────────────────────────────────────────────────────────
 
 /// `QUASAR_NVIDIA_DRIVER_VOLUME`. Defaults on; `0` is the opt-out for a host that must
@@ -293,32 +315,35 @@ pub fn enabled() -> bool {
 /// also the exact signal that the compose overlay was never applied.
 pub fn locate_host_path(docker: &str) -> (Option<PathBuf>, Option<String>) {
     let Some(id) = self_container_id() else {
-        tracing::debug!(target: T, "could not determine own container id; app-container driver injection will be skipped");
+        tracing::debug!(target: T, "could not determine own container id; driver mount resolution is unavailable");
         return (None, None);
     };
-    let out = std::process::Command::new(docker)
-        .args([
-            "inspect",
-            "--format",
-            "{{range .Mounts}}{{.Destination}}\t{{.Source}}\t{{.Name}}\n{{end}}",
-            &id,
-        ])
-        .output();
-    let Ok(out) = out else {
+    let Some(out) = crate::readiness::run_with_timeout(
+        docker,
+        &["inspect", "--format", "{{json .Mounts}}", &id],
+    ) else {
         return (None, None);
     };
-    if !out.status.success() {
+    let Ok(mounts) = serde_json::from_str::<Vec<serde_json::Value>>(&out) else {
         return (None, None);
-    }
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let mut it = line.split('\t');
-        let (Some(dst), Some(src)) = (it.next(), it.next()) else {
+    };
+    for mount in mounts {
+        if mount["Destination"].as_str() != Some(VOLUME_MOUNT) {
             continue;
-        };
-        if dst == VOLUME_MOUNT {
-            let name = it.next().filter(|n| !n.is_empty()).map(str::to_string);
-            return (Some(PathBuf::from(src)), name);
         }
+        let host = mount["Source"]
+            .as_str()
+            .filter(|src| src.starts_with('/'))
+            .map(PathBuf::from);
+        let name = if mount["Type"].as_str() == Some("volume") {
+            mount["Name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+        } else {
+            None
+        };
+        return (host, name);
     }
     (None, None)
 }
@@ -345,10 +370,25 @@ pub fn hostname_is_container_id(hostname: &str) -> bool {
 
 /// Pull the 64-hex container id out of a mountinfo body.
 pub fn parse_container_id_from_mountinfo(body: &str) -> Option<String> {
+    // Overlay lowerdir digests are also 64 hex characters. Only Docker's
+    // per-container identity-file mounts identify THIS container.
     for line in body.lines() {
-        for token in line.split('/') {
-            if token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Some(token.to_string());
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 6
+            || !matches!(
+                fields[4],
+                "/etc/hosts" | "/etc/hostname" | "/etc/resolv.conf"
+            )
+        {
+            continue;
+        }
+        let parts: Vec<_> = fields[3].split('/').collect();
+        for pair in parts.windows(2) {
+            if pair[0] == "containers"
+                && pair[1].len() == 64
+                && pair[1].chars().all(|c| c.is_ascii_hexdigit())
+            {
+                return Some(pair[1].to_owned());
             }
         }
     }
@@ -474,6 +514,14 @@ pub fn adopt_current(docker: &str) -> Option<Manifest> {
 pub fn provision_blocking(nvidia_present: bool, gap: Gap, docker: &str) -> Outcome {
     let volume = PathBuf::from(VOLUME_MOUNT);
     let volume_mounted = volume.is_dir();
+    if nvidia_present && gap.any() && enabled() {
+        let (host, name) = locate_host_path(docker);
+        if host.is_none() && name.is_none() {
+            let error = "Cannot verify a persistent NVIDIA driver mount through Docker. Check the agent's Docker socket, container identity and /opt/quasar/nvidia-driver mount; provisioning will retry automatically.".to_string();
+            set_status(Status::Failed(error.clone()));
+            return Outcome::Failed(error);
+        }
+    }
     let kernel_version = match kernel_driver_version(Path::new("/")) {
         Some(v) => v,
         None => {
@@ -587,8 +635,8 @@ fn publish(volume: &Path, manifest: Manifest, docker: &str) {
             target: T, token = "drvvol-host-path-unresolved",
             "the driver volume's HOST path could not be resolved from this container's mounts — \
              the agent will still use the volume, but app containers will NOT receive the driver \
-             libraries (32-bit Steam will stay broken). This usually means the agent container was \
-             started without deploy/docker-compose.nvidia.yml."
+             libraries. Check Docker socket access and the agent's container identity/mount inspection; \
+             app launches are blocked until the driver mount can be resolved."
         ),
     }
     set_current(Some(VolumeInfo {
@@ -656,7 +704,8 @@ pub fn read_digest_pins(volume: &Path) -> Result<DigestPins> {
     let body = match std::fs::read_to_string(&path) {
         Ok(b) => b,
         // Absent is the honest "nothing pinned here yet", unlike unparseable.
-        Err(_) => return Ok(DigestPins::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(DigestPins::new()),
+        Err(e) => return Err(anyhow!("cannot read driver digest pins {}: {e}; refusing to provision without the existing trust record", path.display())),
     };
     serde_json::from_str(&body).map_err(|e| {
         anyhow!(
@@ -1741,6 +1790,88 @@ pub fn parse_egl_selftest(stdout: &str) -> EglRuntime {
     }
 }
 
+static SIBLING_EGL: Mutex<Option<(String, Instant, EglRuntime)>> = Mutex::new(None);
+
+/// Validate the driver through Docker's sibling-container namespace using the
+/// same mount/environment arguments as an app. Cached for one minute per image
+/// and driver digest; failures are retried without re-downloading the driver.
+pub fn probe_sibling_egl() -> EglRuntime {
+    let Some(info) = current() else {
+        return EglRuntime::Unknown;
+    };
+    if info.host.is_none() && info.name.is_none() {
+        return EglRuntime::Unknown;
+    }
+    let runtime = crate::session::container::ContainerRuntime::from_env();
+    let image = match runtime.own_image() {
+        Ok(image) => image,
+        Err(error) => {
+            return EglRuntime::Indeterminate {
+                detail: format!("cannot identify the sibling probe image: {error}"),
+            }
+        }
+    };
+    let key = format!(
+        "{image}:{}:{:?}:{:?}",
+        info.manifest.sha256, info.name, info.host
+    );
+    let Ok(mut cached) = SIBLING_EGL.lock() else {
+        return EglRuntime::Indeterminate {
+            detail: "sibling EGL probe cache is unavailable".into(),
+        };
+    };
+    if let Some((old, at, result)) = &*cached {
+        if old == &key && at.elapsed() < Duration::from_secs(60) {
+            return result.clone();
+        }
+    }
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let name = format!("quasar-driver-probe-{}-{nonce}", std::process::id());
+    let mut args: Vec<String> = [
+        "run",
+        "--rm",
+        "--name",
+        &name,
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--gpus",
+        "all",
+        "--entrypoint",
+        "/usr/bin/timeout",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    args.extend(app_container_args(Some(&info), VOLUME_MOUNT, ""));
+    args.extend([
+        image,
+        "20s".into(),
+        "/usr/local/bin/quasar-node-agent".into(),
+        EGL_SELFTEST_ARG.into(),
+        format!("{VOLUME_MOUNT}/lib64/libEGL_nvidia.so.0"),
+    ]);
+    let output = runtime.run_raw(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    // Also clean up after a daemon/client timeout. The in-container timeout
+    // bounds the probe even if the agent itself is killed during this call.
+    runtime.force_remove(&name);
+    let result = match output {
+        Ok(body) => parse_egl_selftest(&body),
+        Err(error) => EglRuntime::Indeterminate {
+            detail: format!("sibling EGL test could not complete: {error}"),
+        },
+    };
+    *cached = Some((key, Instant::now(), result.clone()));
+    result
+}
+
 /// Run the self-test as a CHILD of this binary (`/proc/self/exe egl-selftest`).
 ///
 /// Out-of-process: it dlopens a driver stack already suspected of being broken, and a
@@ -1936,7 +2067,11 @@ pub fn app_container_args(
     let Some(info) = info else {
         return Vec::new();
     };
-    let Some(host) = &info.host else {
+    let source = if let Some(name) = &info.name {
+        format!("type=volume,src={name},dst={mount_dst},readonly")
+    } else if let Some(host) = &info.host {
+        format!("type=bind,src={},dst={mount_dst},readonly", host.display())
+    } else {
         return Vec::new();
     };
     let dst = Path::new(mount_dst);
@@ -1945,8 +2080,8 @@ pub fn app_container_args(
         ld.push(p.to_string());
     }
     let mut args = vec![
-        "-v".into(),
-        format!("{}:{mount_dst}:ro", host.display()),
+        "--mount".into(),
+        source,
         "-e".into(),
         format!("LD_LIBRARY_PATH={}", ld.join(":")),
         "-e".into(),
@@ -3039,7 +3174,7 @@ mod tests {
         let args = app_container_args(Some(&i), "/opt/quasar/nvidia-driver", "");
         let joined = args.join(" ");
         assert!(joined.contains(
-            "-v /var/lib/docker/volumes/deploy_quasar-nvidia-driver/_data:/opt/quasar/nvidia-driver:ro"
+            "--mount type=volume,src=deploy_quasar-nvidia-driver,dst=/opt/quasar/nvidia-driver,readonly"
         ), "{joined}");
         assert!(
             joined.contains("LD_LIBRARY_PATH=/opt/quasar/nvidia-driver/lib64"),
@@ -3117,11 +3252,11 @@ mod tests {
         );
     }
 
-    /// Host path unresolved ⇒ no injection at all, rather than a broken mount.
+    /// Docker can attach a named volume even when its host storage path is unavailable.
     #[test]
-    fn unresolved_host_path_skips_app_container_injection() {
+    fn named_volume_does_not_require_a_host_storage_path() {
         let i = info(None, 12);
-        assert!(app_container_args(Some(&i), "/opt/quasar/nvidia-driver", "").is_empty());
+        assert!(!app_container_args(Some(&i), "/opt/quasar/nvidia-driver", "").is_empty());
         assert!(lib32_host_path(Some(&i)).is_none());
     }
 
@@ -3157,6 +3292,27 @@ mod tests {
     }
 
     // ── misc ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn overlay_digests_are_not_container_ids() {
+        let layer = "b".repeat(64);
+        let id = "a".repeat(64);
+        let body = format!("1 0 0:1 / / rw - overlay overlay rw,lowerdir=/layers/{layer}/diff\n2 1 8:1 /var/lib/docker/containers/{id}/hosts /etc/hosts rw - ext4 /dev/sda rw\n");
+        assert_eq!(parse_container_id_from_mountinfo(&body), Some(id));
+        assert_eq!(
+            parse_container_id_from_mountinfo(&format!(
+                "1 0 0:1 /layers/{layer}/diff /opt/data rw - ext4 /dev/sda rw"
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn unreadable_pin_store_does_not_reset_trust() {
+        let dir = Tmp::new("pins-is-directory");
+        std::fs::create_dir_all(dir.0.join(layout::DIGESTS)).unwrap();
+        assert!(read_digest_pins(&dir.0).is_err());
+    }
 
     #[test]
     fn container_id_is_recovered_from_mountinfo() {
