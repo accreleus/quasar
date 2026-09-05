@@ -18,6 +18,10 @@ type PlanInputs struct {
 	// EdgeBranch is reported on both channels so a UI needs no second read.
 	Channel    string
 	EdgeBranch string
+	// SourceRepo is the configured release repository ("owner/name"), passed
+	// through to the view so a client composes GitHub links from the repo
+	// detection reads. "" means detection is off.
+	SourceRepo string
 
 	ControlPlane buildinfo.Identity
 
@@ -70,6 +74,7 @@ func PlanRelease(in PlanInputs) View {
 
 	v := View{
 		Channel:    channel,
+		SourceRepo: in.SourceRepo,
 		EdgeBranch: in.EdgeBranch,
 		CheckedAt:  rfc3339OrNil(in.CheckedAt),
 		LastError:  in.LastError,

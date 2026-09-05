@@ -31,6 +31,7 @@ design_handoff_v3/
     ├── session-overlay-v3.html  ← uses assets/console-v3.css
     ├── home.html                ← uses assets/quasar.css + home-v3.css + quasar.js
     ├── admin-console-v3.html    ← uses assets/console-v3.css + data.js + ui.js + pages-*.js
+    ├── releases-v3.html         ← self-contained: Fleet ▸ Releases, the platform updater tab (installed vs available, per-release changelog rows, targets rollup, channel, apply history); releases-v3.png is its render
     └── assets/
         ├── console-v3.css       ← v3 token contract + console/HUD component styles (source of truth)
         ├── home-v3.css          ← v3 reskin layered over quasar.css for the home page

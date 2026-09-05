@@ -24,42 +24,6 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
-## 0.2.0-rc.2 — 2026-09-05
-
-### Fixed
-
-- **Release detection follows the one redirect GitHub and GHCR answer with (#110, #111).**
-  The stable channel downloaded `platform-release-manifest.json` from the GitHub Release
-  and got a `302` to `release-assets.githubusercontent.com`; the edge channel read an
-  image config from GHCR and got a `307` to `pkg-containers.githubusercontent.com`. The
-  hardened outbound client refuses redirects, so stable stored nothing and edge failed.
-  Both now take exactly one validated hop through a shared helper (https only, redirect
-  host allowlisted, no `Authorization` on the hop); `release-assets.githubusercontent.com`
-  joins the default `QUASAR_PLATFORM_RELEASE_ASSET_HOSTS`, and `ghcr.io` implies its blob
-  host. Found live against the first published prerelease.
-- **The compose file forwards the release-detection knobs to the control plane (#110).**
-  `QUASAR_PLATFORM_RELEASE_REPO/_API/_ASSET_HOSTS/_TOKEN/_DETECT_INTERVAL`,
-  `QUASAR_PLATFORM_REGISTRY` and `QUASAR_IMAGE_REGISTRY_HOSTS` set in `deploy/.env` now
-  reach the process on a registry install; the public site's stack template matches. An
-  empty `QUASAR_PLATFORM_RELEASE_REPO` means the default; `off`/`none`/`disabled` turns
-  detection off.
-- **The "Quasar was updated" toast is dismissible and only appears when a reload would
-  fetch a different bundle (#117).** It compared the bundle's baked commit with the
-  control plane's, which differ on any source-built stack whose web bundle and control
-  plane were built separately, so it never went away. It now compares the served
-  `index.html`'s bundle hash with the loaded one, has a close control, and remembers a
-  dismissal per bundle.
-- **Update Quasar is disabled when the control plane is not eligible (#117)**, with the
-  reason in its tooltip, instead of answering a `409` after the click.
-- **A source-built control plane is never offered a registry image (#117)**, and both
-  control-plane images run as uid 1000 so a volume created by either is usable by the
-  other; `redeploy.sh` fixes the TLS volume's ownership once (#115).
-- **The leak scan no longer treats Unraid's generic appdata path as an operator
-  fingerprint**; every push had been red on the tracker scan since an install-help
-  comment used it.
-
-## 0.2.0-rc.1 — 2026-09-05
-
 ### Security
 
 - **A copy-pasted `make` line could run a second command (#550).** The Makefile
@@ -107,6 +71,122 @@ own; the two do not move together, and that is deliberate.
   `no_new_privileges: false` and `systempaths_unconfined: true`. It defaults to `allow`
   because the shipped Steam and KDE images need both; set it when running a catalog you do
   not author.
+
+### Added
+
+- **Quasar updates itself from the admin console (#104; #105–#119).** A *platform
+  release* is a matched control-plane + node-agent image set from one commit. Every
+  component now stamps its build identity (semver, source commit, build time; the control
+  plane also its highest embedded migration) and the agent reports it on `register`
+  together with its install mode (registry or source) and whether an **updater** sits on
+  its stack (#107). The control plane detects releases on a weekly job (Monday 02:00 UTC,
+  editable, run-now) — the **stable** channel reads GitHub Releases and their
+  `platform-release-manifest.json`, the **edge** channel resolves the digest behind a
+  branch tag (default `develop`) and reads the build identity off the image labels, each
+  following exactly one validated redirect through the shared outbound client
+  (`release-assets.githubusercontent.com` for a GitHub Release asset, GHCR's blob host
+  for an edge image config) (#110, #111) — and the admin console gains a Fleet ▸ Releases
+  tab plus a top banner: installed vs available, cumulative sanitised release notes,
+  channel + edge-branch settings, and a per-host eligibility table whose ineligible rows
+  carry the exact manual recipe (#112). The release-detection knobs
+  (`QUASAR_PLATFORM_RELEASE_REPO/_API/_ASSET_HOSTS/_TOKEN/_DETECT_INTERVAL`,
+  `QUASAR_PLATFORM_REGISTRY`, `QUASAR_IMAGE_REGISTRY_HOSTS`) travel from `deploy/.env`
+  to the control plane on a registry install, and the public site's stack template
+  matches (#110). Applying is a per-host **updater** sidecar (`quasar-updater`, in every
+  compose stack and in `enroll-host.sh`'s generated stack) that only accepts digests
+  under an allowlisted registry namespace (`QUASAR_UPDATER_ALLOWED_NAMESPACES`, default
+  the org's), rewrites the two image lines in `.env` (keeping `.env.prev`), pulls, and
+  recreates (#115). From the console an admin applies to one host — the host is
+  cordoned, the apply waits for zero sessions (or `force` ends them), the new agent's
+  `register` is the success evidence — or presses **Update Quasar** to move the control
+  plane first (it recreates itself through its own updater and picks the run back up on
+  boot) and then every eligible host in sequence, stopping at the first failure.
+  **Update Quasar** is disabled, with the reason in its tooltip, when the control plane
+  is not eligible, instead of answering a `409` after the click; a source-built control
+  plane is never offered a registry image, and both control-plane images run as uid 1000
+  so a volume created by either is usable by the other (`redeploy.sh` fixes the TLS
+  volume's ownership once) (#117, #115). An open admin tab gets a dismissible "Quasar was
+  updated — reload" toast that appears only when the served bundle actually differs from
+  the loaded one (#116, #117). A failed apply is left as it is with the previous digests
+  recorded, and an agent can be **reverted** to them from the console; the control plane
+  never is (ADR 0002: control plane first, never below the database's migration) (#118).
+  `make release VERSION=x.y.z` cuts a release from the changelog and pushes the tag that
+  publishes it (#109). Contract: quasar-protocol amendments 1 and 2 (register identity
+  fields, `/v1/admin/platform/*`, `release_apply`/`release_state`, migrations 0074 and
+  0075). **Existing installs must add the updater once** — see `docs/upgrading.md` "The
+  updater". Glossary: `CONTEXT.md` "Platform releases"; decisions: ADR 0001 (pinned-digest
+  trust), ADR 0002.
+
+- **Pushing a `vX.Y.Z` tag on `main` publishes a platform release (#104, #108).** The
+  Images workflow gains a `v*` tag-push trigger beside manual dispatch. A `release-gate`
+  job runs first and every build needs it: the tag must be strict semver, its commit must
+  be reachable from `main`, and `CHANGELOG.md` must carry a non-empty section for that
+  version — each refusal fails in seconds, before the ~85-minute node-agent build. After
+  the existing build/validate/preflight/promote lane, a `release` job creates the GitHub
+  Release with that section as its body (a prerelease tag makes a GitHub prerelease) and
+  attaches `platform-release-manifest.json`: format version, release version, source
+  commit, build time, the highest embedded control-plane migration, and the two component
+  images by tag-free reference and sha256 digest. The workflow asserts the promoted
+  `:X.Y.Z` tags resolve to exactly those digests before it publishes. Generator,
+  validator, changelog extractor and their fixture tests live in `scripts/release/`
+  (schema: `scripts/release/platform-release-manifest.md`). Branch pushes still build
+  nothing and `develop` publishing stays manual.
+
+- **Protocol amendment 1 for platform releases — identity and the release read surface
+  (#104, #106).** `protocol/` is pinned to the `amend/platform-release-identity` branch of
+  `quasar-protocol` (merge to its `main` is the operator's sign-off): `register` gains four
+  optional identity fields (`source_commit`, `built_at`, `install_mode`, `updater_present`;
+  replaced wholesale on every register, absent ⇒ unknown), the host body carries them, and
+  two admin reads are specified — `GET /v1/admin/platform/identity` and
+  `GET /v1/admin/platform/releases` (installed identities, available releases newest first
+  by schema version, per-target eligibility with a closed reason vocabulary, faults). The
+  channel and edge branch ride `/v1/admin/settings` as `release_channel` /
+  `release_edge_branch`. `schema.md` documents the `hosts` identity columns, the
+  `platform_releases` table and the two settings columns as provisional migration 0074.
+
+### Changed
+
+- **One hardened outbound HTTP client for the control plane (#105).** The SSRF
+  containment that lived inside the registry digest resolver — HTTPS only, per-caller
+  host allowlist, no redirects, DNS-rebind dial guard, bounded bodies, short timeouts —
+  is now `internal/outbound`, constructed per caller with its own allowlist and timeout
+  so the GitHub Releases client and the edge-channel image-config reader (#110) get it by
+  construction, each following exactly one validated redirect (https only, redirect host
+  allowlisted, no `Authorization` on the hop) to cover the redirects GitHub and GHCR
+  actually answer with — `release-assets.githubusercontent.com` and GHCR's blob host join
+  the default allowlist (#111). The registry resolver and the template-context resolver
+  use it; `QUASAR_IMAGE_REGISTRY_HOSTS` stays the registry's own knob. Two visible
+  deltas. A registry token body over 1 MiB now fails with a named "body too large" error
+  instead of being silently truncated into a JSON parse failure. And the allowlist is now
+  enforced on every host actually contacted, so a Docker Hub ref needs
+  `docker.io,registry-1.docker.io,auth.docker.io` in `QUASAR_IMAGE_REGISTRY_HOSTS` — an
+  allowlist of `docker.io` alone used to let the manifest request through unchecked and
+  now refuses it (`docs/configuration.md`).
+
+- **The platform container images are named for their role, not their
+  implementation.** `quasar-control` → `quasar-control-plane`, `quasar-vulkan` →
+  `quasar-node-agent`, and the build-time-only images `quasar-toolchain` →
+  `quasar-gst-toolchain`, `quasar-dev` → `quasar-agent-dev`. `quasar-nv` was
+  left out of the rename because that lineage was being retired rather than
+  renamed — see Removed below. App and session images are unaffected.
+
+  **Upgrading requires no action.** Both names are published for one transition
+  window and resolve to the same digests, and a local `deploy/build-images.sh`
+  writes the old name as an alias tag on the same image id
+  (`--no-legacy-alias` opts out). Pin the new names when you next edit
+  `deploy/.env`; the old names are dropped one release after the release that
+  introduces the new ones. See [`docs/upgrading.md`](docs/upgrading.md).
+
+- **The published GitHub Release body ends with an install/upgrade footer carrying the
+  digests (#104).** Generated from the same validated manifest as the machine-readable
+  asset, it gives an operator the per-component digests, the updater's image tag,
+  `QUASAR_STACK_DIR`, the pull/recreate command, and links to the docs — the
+  human-readable form of the facts the manifest already carries for machines.
+
+- **The admin Fleet ▸ Releases tab was rebuilt to the v3 design (#104).** A
+  changelog-aware notes renderer replaces the raw markdown dump: category tags,
+  bold-title entries, issue-reference chips, and a "View on GitHub" link per release.
+  The release view also gains an additive `source_repo` field.
 
 ### Fixed
 
@@ -161,98 +241,6 @@ own; the two do not move together, and that is deliberate.
   or `QUASAR_CUDA_RUNTIME_DIR=<dir>` to stage the libraries from local disk on an
   air-gapped host. A host whose NVIDIA driver is older than r580 skips the fetch
   and says so. See [`docs/configuration.md`](docs/configuration.md).
-
-### Added
-
-- **Quasar updates itself from the admin console (#104; #105–#119).** A *platform
-  release* is a matched control-plane + node-agent image set from one commit. Every
-  component now stamps its build identity (semver, source commit, build time; the control
-  plane also its highest embedded migration) and the agent reports it on `register`
-  together with its install mode (registry or source) and whether an **updater** sits on
-  its stack (#107). The control plane detects releases on a weekly job (Monday 02:00 UTC,
-  editable, run-now) — the **stable** channel reads GitHub Releases and their
-  `platform-release-manifest.json`, the **edge** channel resolves the digest behind a
-  branch tag (default `develop`) and reads the build identity off the image labels (#110,
-  #111) — and the admin console gains a Fleet ▸ Releases tab plus a top banner: installed
-  vs available, cumulative sanitised release notes, channel + edge-branch settings, and a
-  per-host eligibility table whose ineligible rows carry the exact manual recipe (#112).
-  Applying is a per-host **updater** sidecar (`quasar-updater`, in every compose stack and
-  in `enroll-host.sh`'s generated stack) that only accepts digests under an allowlisted
-  registry namespace (`QUASAR_UPDATER_ALLOWED_NAMESPACES`, default the org's), rewrites
-  the two image lines in `.env` (keeping `.env.prev`), pulls, and recreates (#115). From
-  the console an admin applies to one host — the host is cordoned, the apply waits for
-  zero sessions (or `force` ends them), the new agent's `register` is the success
-  evidence — or presses **Update Quasar** to move the control plane first (it recreates
-  itself through its own updater and picks the run back up on boot) and then every
-  eligible host in sequence, stopping at the first failure; an open admin tab gets a
-  "Quasar was updated — reload" toast (#116, #117). A failed apply is left as it is with
-  the previous digests recorded, and an agent can be **reverted** to them from the console;
-  the control plane never is (ADR 0002: control plane first, never below the database's
-  migration) (#118). `make release VERSION=x.y.z` cuts a release from the changelog and
-  pushes the tag that publishes it (#109). Contract: quasar-protocol amendments 1 and 2
-  (register identity fields, `/v1/admin/platform/*`, `release_apply`/`release_state`,
-  migrations 0074 and 0075). **Existing installs must add the updater once** — see
-  `docs/upgrading.md` "The updater". Glossary: `CONTEXT.md` "Platform releases";
-  decisions: ADR 0001 (pinned-digest trust), ADR 0002.
-
-- **Pushing a `vX.Y.Z` tag on `main` publishes a platform release (#104, #108).** The
-  Images workflow gains a `v*` tag-push trigger beside manual dispatch. A `release-gate`
-  job runs first and every build needs it: the tag must be strict semver, its commit must
-  be reachable from `main`, and `CHANGELOG.md` must carry a non-empty section for that
-  version — each refusal fails in seconds, before the ~85-minute node-agent build. After
-  the existing build/validate/preflight/promote lane, a `release` job creates the GitHub
-  Release with that section as its body (a prerelease tag makes a GitHub prerelease) and
-  attaches `platform-release-manifest.json`: format version, release version, source
-  commit, build time, the highest embedded control-plane migration, and the two component
-  images by tag-free reference and sha256 digest. The workflow asserts the promoted
-  `:X.Y.Z` tags resolve to exactly those digests before it publishes. Generator,
-  validator, changelog extractor and their fixture tests live in `scripts/release/`
-  (schema: `scripts/release/platform-release-manifest.md`). Branch pushes still build
-  nothing and `develop` publishing stays manual. The first live tag-push run is still
-  outstanding: it needs the workflow on `main`, then a prerelease tag.
-
-- **Protocol amendment 1 for platform releases — identity and the release read surface
-  (#104, #106).** `protocol/` is pinned to the `amend/platform-release-identity` branch of
-  `quasar-protocol` (merge to its `main` is the operator's sign-off): `register` gains four
-  optional identity fields (`source_commit`, `built_at`, `install_mode`, `updater_present`;
-  replaced wholesale on every register, absent ⇒ unknown), the host body carries them, and
-  two admin reads are specified — `GET /v1/admin/platform/identity` and
-  `GET /v1/admin/platform/releases` (installed identities, available releases newest first
-  by schema version, per-target eligibility with a closed reason vocabulary, faults). The
-  channel and edge branch ride `/v1/admin/settings` as `release_channel` /
-  `release_edge_branch`. `schema.md` documents the `hosts` identity columns, the
-  `platform_releases` table and the two settings columns as provisional migration 0074.
-  Both routes carry `x-unimplemented` in `openapi.yaml` and sit in the drift test's
-  reviewed allowlist until #107/#110 register them.
-
-### Changed
-
-- **One hardened outbound HTTP client for the control plane (#105).** The SSRF
-  containment that lived inside the registry digest resolver — HTTPS only, per-caller
-  host allowlist, no redirects, DNS-rebind dial guard, bounded bodies, short timeouts —
-  is now `internal/outbound`, constructed per caller with its own allowlist and timeout
-  so the coming GitHub Releases client (#110) gets it by construction. The registry
-  resolver and the template-context resolver use it; `QUASAR_IMAGE_REGISTRY_HOSTS`
-  stays the registry's own knob. Two visible deltas. A registry token body over 1 MiB
-  now fails with a named "body too large" error instead of being silently truncated
-  into a JSON parse failure. And the allowlist is now enforced on every host actually
-  contacted, so a Docker Hub ref needs `docker.io,registry-1.docker.io,auth.docker.io`
-  in `QUASAR_IMAGE_REGISTRY_HOSTS` — an allowlist of `docker.io` alone used to let the
-  manifest request through unchecked and now refuses it (`docs/configuration.md`).
-
-- **The platform container images are named for their role, not their
-  implementation.** `quasar-control` → `quasar-control-plane`, `quasar-vulkan` →
-  `quasar-node-agent`, and the build-time-only images `quasar-toolchain` →
-  `quasar-gst-toolchain`, `quasar-dev` → `quasar-agent-dev`. `quasar-nv` was
-  left out of the rename because that lineage was being retired rather than
-  renamed — see Removed above. App and session images are unaffected.
-
-  **Upgrading requires no action.** Both names are published for one transition
-  window and resolve to the same digests, and a local `deploy/build-images.sh`
-  writes the old name as an alias tag on the same image id
-  (`--no-legacy-alias` opts out). Pin the new names when you next edit
-  `deploy/.env`; the old names are dropped one release after the release that
-  introduces the new ones. See [`docs/upgrading.md`](docs/upgrading.md).
 
 ## 0.1.0 — 2026-08-26
 

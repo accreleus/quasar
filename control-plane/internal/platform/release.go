@@ -129,7 +129,12 @@ type Installed struct {
 // ALWAYS serialized now that the apply half is served (#116): `null` is the
 // answer, not the absence of one.
 type View struct {
-	Channel    string    `json:"channel"`
+	Channel string `json:"channel"`
+	// SourceRepo is the configured release repository as "owner/name", so the
+	// console composes the release / commit / issue links from the repository
+	// detection actually reads instead of hard-coding one. "" when detection is
+	// switched off — the client renders no links rather than the default.
+	SourceRepo string    `json:"source_repo"`
 	EdgeBranch string    `json:"edge_branch"`
 	CheckedAt  *string   `json:"checked_at"`
 	LastError  *string   `json:"last_error"`
