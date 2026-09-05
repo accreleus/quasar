@@ -216,10 +216,47 @@ func TestGitHubSourceReportsANonOKStatus(t *testing.T) {
 
 func TestReleaseEgressHostsCoversTheAPIAndTheAssetHosts(t *testing.T) {
 	hosts := ReleaseEgressHosts()
-	for _, want := range []string{defaultAPIHost, "github.com", "objects.githubusercontent.com"} {
+	for _, want := range append([]string{defaultAPIHost}, defaultAssetHosts...) {
 		if _, ok := hosts[want]; !ok {
 			t.Errorf("the default release allowlist is missing %q", want)
 		}
+	}
+}
+
+// defaultAssetHosts is the list a stock instance must reach without an operator
+// touching a knob. release-assets.githubusercontent.com is on it because GitHub
+// moved its asset CDN there mid-flight and the omission stopped detection dead
+// on a live instance running v0.2.0-rc.1; objects. stays because an unused
+// entry costs nothing and a missing one costs a release.
+var defaultAssetHosts = []string{
+	"github.com",
+	"objects.githubusercontent.com",
+	"release-assets.githubusercontent.com",
+}
+
+func TestReleaseAssetHostsDefault(t *testing.T) {
+	t.Setenv("QUASAR_PLATFORM_RELEASE_ASSET_HOSTS", "")
+	got := ReleaseAssetHosts()
+
+	have := make(map[string]bool, len(got))
+	for _, h := range got {
+		have[h] = true
+	}
+	for _, want := range defaultAssetHosts {
+		if !have[want] {
+			t.Errorf("the default asset-host list is missing %q (got %v)", want, got)
+		}
+	}
+	if len(got) != len(defaultAssetHosts) {
+		t.Errorf("default asset hosts = %v, want exactly %v", got, defaultAssetHosts)
+	}
+}
+
+func TestReleaseAssetHostsHonoursTheKnob(t *testing.T) {
+	t.Setenv("QUASAR_PLATFORM_RELEASE_ASSET_HOSTS", " cdn.example.test , github.com ")
+	got := ReleaseAssetHosts()
+	if len(got) != 2 || got[0] != "cdn.example.test" || got[1] != "github.com" {
+		t.Fatalf("asset hosts = %v, want the knob's two entries trimmed and sorted", got)
 	}
 }
 

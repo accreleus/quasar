@@ -20,10 +20,15 @@ import (
 // (QUASAR_PLATFORM_RELEASE_REPO / _API / _TOKEN / _ASSET_HOSTS).
 
 const (
-	DefaultReleaseRepo   = "accreleus/quasar"
-	DefaultReleaseAPI    = "https://api.github.com"
-	defaultAPIHost       = "api.github.com"
-	defaultAssetHostList = "github.com,objects.githubusercontent.com"
+	DefaultReleaseRepo = "accreleus/quasar"
+	DefaultReleaseAPI  = "https://api.github.com"
+	defaultAPIHost     = "api.github.com"
+	// GitHub serves release assets from a CDN it moves without notice: the
+	// 302 target was objects.githubusercontent.com and is now
+	// release-assets.githubusercontent.com, which cost a live detection run.
+	// All three stay listed — an old target that stops being used costs
+	// nothing, and a hop this list does not cover is a dead detector.
+	defaultAssetHostList = "github.com,objects.githubusercontent.com,release-assets.githubusercontent.com"
 
 	// One page is more history than an instance needs; walking them all is an
 	// unbounded egress loop.
