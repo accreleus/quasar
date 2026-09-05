@@ -1395,6 +1395,8 @@ jobs:
         id: notes
         env:
           VERSION: ${{ needs.release-gate.outputs.version }}
+          TAG: ${{ github.ref_name }}
+          MANIFEST: ${{ steps.manifest.outputs.path }}
         run: |
           set -euo pipefail
           notes="$RUNNER_TEMP/release-notes.md"
@@ -1404,6 +1406,27 @@ jobs:
           # changelog instead of a dispatch input. The gate already proved this
           # succeeds, so a failure here is a real inconsistency, not a first look.
           bash scripts/release/changelog-section.sh "$VERSION" > "$notes"
+          # Install / upgrade footer (#104): the body is what an operator reads, and
+          # the docs tell them to take the digests "from the release"; the manifest
+          # asset carries them for machines, this footer carries the same values for
+          # people. Generated from the validated manifest, never typed.
+          cp_digest="$(jq -r '.components[] | select(.name=="control-plane") | .digest' "$MANIFEST")"
+          agent_digest="$(jq -r '.components[] | select(.name=="node-agent") | .digest' "$MANIFEST")"
+          {
+            echo
+            echo "## Install or upgrade"
+            echo
+            echo "Pins for \`deploy/.env\` (the two digests are the ones \`platform-release-manifest.json\` names; the updater follows the version tag):"
+            echo
+            echo '```'
+            echo "QUASAR_CONTROL_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@${cp_digest}"
+            echo "QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@${agent_digest}"
+            echo "QUASAR_UPDATER_IMAGE=ghcr.io/accreleus/quasar/quasar-updater:${VERSION}"
+            echo "QUASAR_STACK_DIR=<absolute host path of your deploy directory>"
+            echo '```'
+            echo
+            echo "Then, with the same \`-f\` list you installed with: \`docker compose -f deploy/docker-compose.yml pull && docker compose -f deploy/docker-compose.yml up -d --force-recreate --no-deps quasar-control-plane quasar-updater quasar-node-agent\` — or, on an instance that already runs the updater, apply it from Admin ▸ Fleet ▸ Releases. New install: https://accreleus.github.io/quasar/install/install/ · Upgrading: https://accreleus.github.io/quasar/operations/upgrading/"
+          } >> "$notes"
           echo "path=$notes" >> "$GITHUB_OUTPUT"
           wc -c < "$notes"
 
