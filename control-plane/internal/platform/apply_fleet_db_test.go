@@ -110,11 +110,20 @@ func newFleetHarness(t *testing.T, cpCommit string, drivers interface {
 		}), nil
 	}
 
-	noCordons := FleetCordons{
-		Cordon:   func(context.Context, string) error { return nil },
-		Uncordon: func(context.Context, string) error { return nil },
+	// Real cordons: they move hosts.status, which is what the restore is read
+	// back from.
+	cordons := FleetCordons{
+		Cordon: func(ctx context.Context, hostID string) error {
+			_, err := pool.Exec(ctx, `UPDATE hosts SET status='draining' WHERE id = $1::uuid`, hostID)
+			return err
+		},
+		Uncordon: func(ctx context.Context, hostID string) error {
+			_, err := pool.Exec(ctx, `UPDATE hosts SET status='online' WHERE id = $1::uuid`, hostID)
+			return err
+		},
 	}
-	h.fleet = NewFleetRunner(store, drivers, drivers, ManifestOrEdge{}, noCordons, view, testLogger())
+	h.fleet = NewFleetRunner(store, drivers, drivers, ManifestOrEdge{}, cordons, view, testLogger())
+	h.fleet.AdoptSettle = time.Millisecond
 	h.fleet.PollWait = 5 * time.Millisecond
 	t.Cleanup(h.fleet.Close)
 
@@ -373,5 +382,63 @@ func TestFleetRunIsAdoptedAfterARestart(t *testing.T) {
 	}
 	if attempts[1].RunID == nil || *attempts[1].RunID != run.ID {
 		t.Fatal("the host attempt does not name its run")
+	}
+}
+
+// The live #117 failure: a run's control-plane step restarts this process, so
+// the pre-run scheduling state cannot live in its memory. A failed run left
+// both hosts `draining` with nothing left that knew to lift it.
+func TestFleetRestoresTheCordonAcrossARestart(t *testing.T) {
+	drivers := &succeedingDrivers{}
+	h := newFleetHarness(t, commitB, drivers)
+	drivers.store = h.store
+	ctx := context.Background()
+
+	// A second host, so the record has both shapes in it.
+	other := seedHost(t, h.pool, "gpu-fleet-02", commitA, "online")
+
+	run, err := h.store.CreateRun(ctx, h.release.ID, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What the previous process wrote before it cordoned and replaced itself.
+	if err := h.store.SetCordonedHosts(ctx, run.ID, []HostCordon{
+		{HostID: h.hostID, WasCordoned: false},
+		{HostID: other, WasCordoned: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, h.pool, `UPDATE hosts SET status='draining'`)
+	if err := h.store.SetRunTarget(ctx, run.ID, TargetControlPlane, nil); err != nil {
+		t.Fatal(err)
+	}
+	a, err := h.store.CreateControlPlaneAttempt(ctx, NewControlPlaneAttempt{
+		RunID: &run.ID, ReleaseID: &h.release.ID,
+		Requested: []ComponentDigest{{Name: ComponentControlPlane, Image: "x", Digest: "sha256:" + hex64}},
+		Previous:  []PreviousDigest{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.SucceedAttempt(ctx, a.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// A NEW sequencer over the same database, as the next boot builds.
+	h.fleet.Adopt(ctx)
+	waitFor(t, "the adopted run to finish", func() bool {
+		r, err := h.store.Run(ctx, run.ID)
+		return err == nil && TerminalRunState(r.State)
+	})
+
+	// The run's own cordon is lifted whatever the outcome; the operator's stays.
+	// The restore runs after the terminal write, so it is waited for rather than
+	// read straight after.
+	waitFor(t, "the run's cordon to be lifted", func() bool {
+		status, err := h.store.HostStatus(ctx, h.hostID)
+		return err == nil && status == "online"
+	})
+	if status, err := h.store.HostStatus(ctx, other); err != nil || status != "draining" {
+		t.Fatalf("the operator's cordon = %q (%v), want it left in place", status, err)
 	}
 }

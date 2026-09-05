@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -553,9 +554,10 @@ func TestUnknownAckReasonIsStoredVerbatim(t *testing.T) {
 	}
 }
 
-// A delivery failure is not silence: the agent could not be reached, which is
-// updater_unreachable, and it must NOT mark the host as predating the amendment.
-func TestDeliveryFailureIsUpdaterUnreachable(t *testing.T) {
+// A delivery failure is not silence: the control plane could not reach the
+// agent. NOT updater_unreachable, which is the agent's word for its own socket,
+// and it must NOT mark the host as predating the amendment.
+func TestDeliveryFailureIsATimeout(t *testing.T) {
 	a := queuedAttempt(true)
 	store := newFakeStore(a)
 	agent := &fakeAgent{err: errors.New("agent not connected")}
@@ -564,11 +566,55 @@ func TestDeliveryFailureIsUpdaterUnreachable(t *testing.T) {
 
 	r.Start(a)
 	waitFor(t, "the attempt to fail", func() bool { return store.snapshot(a.ID).State == AttemptFailed })
-	if got := *store.snapshot(a.ID).Reason; got != ReasonUpdaterUnreachable {
-		t.Errorf("reason = %q, want updater_unreachable", got)
+	if got := *store.snapshot(a.ID).Reason; got != ReasonTimeout {
+		t.Errorf("reason = %q, want timeout", got)
 	}
 	if !r.Supported(testHostID) {
 		t.Error("a delivery failure must not read as an old agent")
+	}
+}
+
+// The live #117 failure: a fleet run re-adopted after the control plane
+// recreated itself reached its first host while every agent was still
+// reconnecting, and the send failed instantly.
+func TestApplyWaitsForTheAgentToReconnect(t *testing.T) {
+	a := queuedAttempt(true)
+	store := newFakeStore(a)
+	agent := &fakeAgent{ack: Ack{OK: true}}
+	deps := agent.deps()
+	var connected atomic.Bool
+	deps.Connected = func(string) bool { return connected.Load() }
+	r := testRunner(store, deps)
+	r.ConnectWait = 3 * time.Second
+	defer r.Close()
+
+	r.Start(a)
+	// Nothing goes out while the agent is off the wire.
+	time.Sleep(20 * time.Millisecond)
+	if agent.sentCount() != 0 {
+		t.Fatal("release_apply was sent to a host with no agent connected")
+	}
+	connected.Store(true)
+	waitFor(t, "the apply to be sent once the agent is back", func() bool { return agent.sentCount() == 1 })
+}
+
+func TestApplyTimesOutWhenTheAgentNeverReconnects(t *testing.T) {
+	a := queuedAttempt(true)
+	store := newFakeStore(a)
+	agent := &fakeAgent{ack: Ack{OK: true}}
+	deps := agent.deps()
+	deps.Connected = func(string) bool { return false }
+	r := testRunner(store, deps)
+	r.ConnectWait = 20 * time.Millisecond
+	defer r.Close()
+
+	r.Start(a)
+	waitFor(t, "the attempt to fail", func() bool { return store.snapshot(a.ID).State == AttemptFailed })
+	if got := *store.snapshot(a.ID).Reason; got != ReasonTimeout {
+		t.Errorf("reason = %q, want timeout", got)
+	}
+	if agent.sentCount() != 0 {
+		t.Error("release_apply was sent to a host that never reconnected")
 	}
 }
 
