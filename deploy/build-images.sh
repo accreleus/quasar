@@ -543,6 +543,17 @@ fi
 # Dockerfile.control.prod since #107, which needs the same values BOTH as image
 # labels and as the -ldflags identity stamps the binary serves).
 PROVENANCE_ARGS=("SOURCE_COMMIT=$SRC_SHA" "BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+
+# The control image's org.quasar.schema.version: the highest NNNN_*.up.sql the
+# binary embeds. Twin of internal/buildinfo.HighestMigration — the label and the
+# served identity must be the same number. "unknown" when the directory cannot be
+# read; the edge channel then skips the build rather than guessing (#111).
+highest_migration() {
+  local dir="$BUILD_CONTEXT/control-plane/migrations" n
+  n="$(find "$dir" -maxdepth 1 -name '*.up.sql' -printf '%f\n' 2>/dev/null \
+        | sed -n 's/^0*\([0-9][0-9]*\)_.*\.up\.sql$/\1/p' | sort -n | tail -1)"
+  printf '%s' "${n:-unknown}"
+}
 # The SPA bakes in the ref it was built from (web/vite.config.ts) for the
 # enroll-host one-liner (#100): the exact tag when the tree sits on one, else the
 # commit. Declared only by Dockerfile.control.prod, so attached per role below.
@@ -797,6 +808,7 @@ for role in "${ROLES[@]}"; do
   [ "$DF_REL" = "deploy/Dockerfile.updater" ] && ROLE_ARGS+=("${PROVENANCE_ARGS[@]}")
   if [ "$DF_REL" = "deploy/Dockerfile.control.prod" ]; then
     ROLE_ARGS+=("${PROVENANCE_ARGS[@]}")
+    ROLE_ARGS+=("SCHEMA_VERSION=$(highest_migration)")
     [ "$SRC_REF" != unknown ] && ROLE_ARGS+=("QUASAR_SOURCE_REF=$SRC_REF")
     # The served semver, and only from a real `vX.Y.Z` tag. A branch build has no
     # version and must say so ("dev") rather than borrow the last tag's number.

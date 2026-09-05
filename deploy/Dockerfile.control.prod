@@ -82,10 +82,17 @@ FROM ${QUASAR_BASE_IMAGE}
 ARG QUASAR_BASE_IMAGE
 ARG SOURCE_COMMIT=unknown
 ARG BUILT_AT=unknown
+# The highest migration this image's binary embeds. The edge channel reads it off
+# the published image (#111) because a branch build ships no release manifest, and
+# schema_version is the ADR 0002 ordering key. "unknown" makes the build
+# unorderable and it is skipped, never guessed at. build-images.sh and the images
+# workflow both derive it from control-plane/migrations.
+ARG SCHEMA_VERSION=unknown
 LABEL org.quasar.image.role="control" \
       org.quasar.pins.base="${QUASAR_BASE_IMAGE}" \
       org.quasar.source.commit="${SOURCE_COMMIT}" \
-      org.quasar.built.at="${BUILT_AT}"
+      org.quasar.built.at="${BUILT_AT}" \
+      org.quasar.schema.version="${SCHEMA_VERSION}"
 
 COPY --from=builder /quasar-control /usr/local/bin/quasar-control
 COPY --from=web-builder /web/dist /app/web

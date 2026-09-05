@@ -800,6 +800,16 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 			platform.NewGitHubSource(releaseClient, platform.ConfiguredReleaseAPI(), releaseRepo,
 				os.Getenv("QUASAR_PLATFORM_RELEASE_TOKEN")),
 			platformStore, log)
+
+		// The edge channel reads the images themselves, so it needs the registry
+		// client rather than the GitHub one. The platform registry is added to
+		// the image allowlist here so repointing it takes one knob, not two.
+		platformRegistry := platform.ConfiguredPlatformRegistry()
+		releaseDetector = releaseDetector.WithEdge(
+			platform.NewRegistryEdgeSource(
+				images.NewRegistryResolverForHosts(nil, images.RegistryEgressHosts(platformRegistry)),
+				platformRegistry, releaseRepo),
+			settingsStore.ReleaseChannel)
 	}
 	jobRegistry.MustRegister(jobs.Definition{
 		ID:          platform.DetectJobID,

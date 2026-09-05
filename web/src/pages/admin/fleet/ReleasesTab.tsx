@@ -169,14 +169,21 @@ function ChannelSection({ view, onSaved }: { view: PlatformReleaseView; onSaved:
       title="Channel"
       hint="Stable follows tagged releases with notes; edge follows a branch. Switching changes what is listed, never what is installed, and never starts a check."
     >
-      <SegmentedControl<ReleaseChannel>
-        options={CHANNEL_OPTIONS}
-        value={view.channel}
-        activation="manual"
-        aria-label="Release channel"
-        disabled={save.pending != null}
-        onChange={(value) => void save.run({ release_channel: value })}
-      />
+      <div className="rowflex" style={{ alignItems: "center" }}>
+        <SegmentedControl<ReleaseChannel>
+          options={CHANNEL_OPTIONS}
+          value={view.channel}
+          activation="manual"
+          aria-label="Release channel"
+          disabled={save.pending != null}
+          onChange={(value) => void save.run({ release_channel: value })}
+        />
+        {view.channel === "edge" && (
+          <span className="muted">
+            following <span className="mono">{view.edge_branch}</span>
+          </span>
+        )}
+      </div>
       <div className="rowflex mt4" style={{ alignItems: "flex-end" }}>
         <TextField
           label="Edge branch"
@@ -218,18 +225,36 @@ function AvailableSection({ view }: { view: PlatformReleaseView }) {
 }
 
 function ReleaseEntry({ release }: { release: PlatformRelease }) {
+  // An edge build has no version and no notes: the title IS the commit, and the
+  // compare link stands in for the notes (control-api.md §Platform releases).
+  const edge = release.channel === "edge";
   return (
     <li className="release-entry">
       <div className="rowflex">
         <b>{releaseLabel(release)}</b>
         {release.prerelease && <Chip variant="warning">Prerelease</Chip>}
         <span className="muted">
-          {when(release.built_at)} ·{" "}
-          <span className="mono">{shortCommit(release.source_commit)}</span> · schema{" "}
-          {release.schema_version}
+          {when(release.built_at)}
+          {!edge && (
+            <>
+              {" · "}
+              <span className="mono">{shortCommit(release.source_commit)}</span>
+            </>
+          )}{" "}
+          · schema {release.schema_version}
         </span>
       </div>
-      {release.notes ? (
+      {edge ? (
+        <p className="muted">
+          {release.compare_url ? (
+            <a href={release.compare_url} target="_blank" rel="noreferrer noopener">
+              Compare with the installed build
+            </a>
+          ) : (
+            "A branch build publishes no notes."
+          )}
+        </p>
+      ) : release.notes ? (
         <Markdown>{release.notes}</Markdown>
       ) : (
         <p className="muted">
