@@ -87,6 +87,11 @@ export type EligibilityReason = Schemas["EligibilityReason"];
 export type PlatformApplyAttempt = Schemas["PlatformApplyAttempt"];
 export type PlatformApplyAttemptEnvelope = Schemas["PlatformApplyAttemptEnvelope"];
 export type PlatformApplyAttemptsResponse = Schemas["PlatformApplyAttemptsResponse"];
+export type PlatformApplyRun = Schemas["PlatformApplyRun"];
+export type PlatformApplySkip = Schemas["PlatformApplySkip"];
+export type PlatformApplyRequest = Schemas["PlatformApplyRequest"];
+export type PlatformApplyRunEnvelope = Schemas["PlatformApplyRunEnvelope"];
+export type PlatformApplyRunsResponse = Schemas["PlatformApplyRunsResponse"];
 export type ApplyAttemptState = Schemas["ApplyAttemptState"];
 export type ApplyFailureReason = Schemas["ApplyFailureReason"];
 

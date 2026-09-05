@@ -86,7 +86,9 @@ func (s *Store) queryAttempts(ctx context.Context, sql string, args ...any) ([]A
 // resolved by the caller (from the manifest, or from an earlier attempt for a
 // revert) because they, not the release row, are the authority.
 type NewHostAttempt struct {
-	Kind      string
+	Kind string
+	// The fleet run this attempt belongs to; nil for a standalone apply.
+	RunID     *string
 	HostID    string
 	ReleaseID *string
 	Requested []ComponentDigest
@@ -110,11 +112,11 @@ func (s *Store) CreateHostAttempt(ctx context.Context, in NewHostAttempt) (Attem
 	var id string
 	err = s.pool.QueryRow(ctx, `
 		INSERT INTO platform_apply_attempts
-		    (kind, target, host_id, release_id, requested_digests, previous_digests,
+		    (run_id, kind, target, host_id, release_id, requested_digests, previous_digests,
 		     state, force, requested_by)
-		VALUES ($1, 'host', $2::uuid, $3::uuid, $4::jsonb, $5::jsonb, 'queued', $6, $7::uuid)
+		VALUES ($1::uuid, $2, 'host', $3::uuid, $4::uuid, $5::jsonb, $6::jsonb, 'queued', $7, $8::uuid)
 		RETURNING id::text
-	`, in.Kind, in.HostID, in.ReleaseID, requested, previous, in.Force, in.Actor).Scan(&id)
+	`, in.RunID, in.Kind, in.HostID, in.ReleaseID, requested, previous, in.Force, in.Actor).Scan(&id)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {

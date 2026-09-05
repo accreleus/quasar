@@ -34,6 +34,10 @@ import type {
   SettingsResponse,
   PlatformApplyAttemptEnvelope,
   PlatformApplyAttemptsResponse,
+  PlatformApplyRequest,
+  PlatformApplyRunEnvelope,
+  PlatformApplyRunsResponse,
+  PlatformIdentity,
   PlatformReleaseView,
   ReleaseChannel,
   RegistrationMode,
@@ -944,6 +948,64 @@ export function listPlatformAttempts(
   return apiFetch<PlatformApplyAttemptsResponse>(`/admin/platform/attempts${query}`, {
     token,
     signal,
+  });
+}
+
+/** What the booted control-plane binary reports it is running. */
+export function getPlatformIdentity(
+  token: string,
+  signal?: AbortSignal,
+): Promise<{ identity: PlatformIdentity }> {
+  return apiFetch<{ identity: PlatformIdentity }>("/admin/platform/identity", { token, signal });
+}
+
+/** Fleet apply: the control plane first, then every eligible host, in sequence.
+ *  202 with the run; the work is asynchronous and watched through the run
+ *  endpoints or active_apply on the release view. */
+export function applyPlatformReleaseToFleet(
+  token: string,
+  req: PlatformApplyRequest,
+): Promise<PlatformApplyRunEnvelope> {
+  return apiFetch<PlatformApplyRunEnvelope>("/admin/platform/apply", {
+    method: "POST",
+    body: req,
+    token,
+  });
+}
+
+/** Fleet runs, newest first. At most one is active. */
+export function listPlatformApplyRuns(
+  token: string,
+  opts: { limit?: number } = {},
+  signal?: AbortSignal,
+): Promise<PlatformApplyRunsResponse> {
+  const query = queryString({ limit: opts.limit });
+  return apiFetch<PlatformApplyRunsResponse>(`/admin/platform/apply/runs${query}`, {
+    token,
+    signal,
+  });
+}
+
+export function getPlatformApplyRun(
+  token: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<PlatformApplyRunEnvelope> {
+  return apiFetch<PlatformApplyRunEnvelope>(`/admin/platform/apply/runs/${runId}`, {
+    token,
+    signal,
+  });
+}
+
+/** Sets the run's cancel flag: it stops before the next target and never
+ *  interrupts an in-flight attempt (control-api.md §"Platform-release apply"). */
+export function cancelPlatformApplyRun(
+  token: string,
+  runId: string,
+): Promise<PlatformApplyRunEnvelope> {
+  return apiFetch<PlatformApplyRunEnvelope>(`/admin/platform/apply/runs/${runId}/cancel`, {
+    method: "POST",
+    token,
   });
 }
 

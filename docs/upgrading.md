@@ -391,6 +391,55 @@ docker compose -f deploy/docker-compose.yml exec quasar-node-agent \
   http://u/v1/results/<request-id>
 ```
 
+### Update Quasar from the console
+
+Admin › Fleet › Releases offers **Update Quasar** when a newer release is
+listed and nothing else is in flight. It moves the whole instance in one
+action, in one order that is not configurable: **the control plane first, then
+every eligible host, one at a time.** An agent is never moved past the control
+plane (ADR 0002), which is why the order exists and why there is no "hosts
+only" button.
+
+What happens, step by step:
+
+1. **The control plane updates itself** through the updater sitting beside it,
+   over that host's local socket — never through a node agent. It pulls, then
+   recreates its own container, so **the API and the console go away for
+   roughly twenty seconds.** Running sessions are untouched: the media path is
+   agent-to-browser and does not pass through the control plane.
+2. **The new build reports the outcome.** The control plane cannot report its
+   own success — carrying the update out kills the process holding the request
+   — so the request id is written down before the socket call and the binary
+   that boots reads it back. Its own liveness on the release's commit is the
+   evidence; the run and its cancel flag are in Postgres, so the run resumes
+   on the new build.
+3. **Each host follows, in the fleet list's order.** Each is cordoned, drained,
+   updated and uncordoned exactly as a per-host Apply is (above).
+4. **The run stops at the first target that fails**, and says which. Targets
+   behind it are already updated; targets ahead of it were never started. There
+   is no partial state to interpret: the per-target list is the outcome.
+
+**Force** applies to every host in the run, and the confirmation names how many
+hosts it will take sessions from. Without it each host waits for its own
+sessions to end, which means a run can sit on a busy host for as long as
+someone is playing.
+
+**Hosts that cannot take the release are skipped, not failed** — an offline
+host, a source-built host, one with no updater. The run lists them under "Not
+updated" with the reason, and still finishes `succeeded`. "Nothing was
+eligible" is a legitimate outcome, not an error.
+
+**Cancel stops the run before its next target and never interrupts one in
+flight.** A pull or a recreate that has already started finishes; interrupting
+a recreate is how a stack is left with no container at all. The flag is
+persisted, so a cancel pressed while the control plane is restarting is
+honoured by the build that boots.
+
+**An admin tab left open across the control-plane step** shows "Quasar was
+updated" with a Reload button once the served build differs from the one the
+page was loaded from. The page keeps polling through the restart and says the
+control plane is restarting rather than showing an error.
+
 ### Reverting an agent
 
 A host row also offers **Revert** once that host has one succeeded update behind

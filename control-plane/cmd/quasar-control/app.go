@@ -85,6 +85,7 @@ type Services struct {
 	// method values, so the drift test still sees the routes.
 	platformApply  *platform.ApplyHandler
 	applyRunner    *platform.Runner
+	fleetRunner    *platform.FleetRunner
 	auditHandler   *audit.Handler
 	artworkHandler *artwork.Handler
 	secretsHandler *secrets.Handler
@@ -886,18 +887,34 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		},
 	}, log)
 	agentHandler.SetReleaseEvents(releaseEventsAdapter{runner: applyRunner})
-	platformHandler := platform.NewHandler(platformDeps(platformStore, settingsStore, jobStore), log)
+	// An edge release stores no manifest, so its digest is resolved from the
+	// commit's image tag at apply time, off the same allowlisted registry the
+	// edge detector reads.
+	edgeApply := platform.NewEdgeApplyResolver(
+		images.NewRegistryResolverForHosts(nil, images.RegistryEgressHosts(platform.ConfiguredPlatformRegistry())),
+		platform.ConfiguredPlatformRegistry(), platform.ConfiguredReleaseRepo())
+	// The control plane applies ITSELF over the updater socket beside it, never
+	// over an agent connection (agent-api.md §release_apply).
+	updaterClient := platform.NewUpdaterClient(platform.ConfiguredUpdaterSocket())
+	selfApplier := platform.NewSelfApplier(platformStore, updaterClient, log)
+
+	pDeps := platformDeps(platformStore, settingsStore, jobStore)
+	pDeps.UpdaterPresent = selfApplier.UpdaterPresent
+	platformHandler := platform.NewHandler(pDeps, log)
+	fleetRunner := platform.NewFleetRunner(platformStore, applyRunner, selfApplier,
+		platform.ManifestOrEdge{Edge: edgeApply}, platformHandler.ReleaseView, log)
 	platformApply := platform.NewApplyHandler(platformStore, applyRunner, platformHandler.ReleaseView, auditStore, log).
-		// An edge release stores no manifest, so its digest is resolved from the
-		// commit's image tag at apply time, off the same allowlisted registry the
-		// edge detector reads.
-		WithEdgeResolver(platform.NewEdgeApplyResolver(
-			images.NewRegistryResolverForHosts(nil, images.RegistryEgressHosts(platform.ConfiguredPlatformRegistry())),
-			platform.ConfiguredPlatformRegistry(), platform.ConfiguredReleaseRepo()))
+		WithEdgeResolver(edgeApply).
+		WithFleet(fleetRunner)
+	// Closed after construction: the view reports the active run, and the run's
+	// skips live on the sequencer the apply handler owns.
+	pDeps.ActiveRun = platformApply.ActiveRun
 	// An apply the previous process was driving is re-adopted, not orphaned: its
 	// deadline is re-armed from started_at, and the row's persisted request id is
-	// what still correlates the agent's release_state.
+	// what still correlates the agent's release_state. A fleet run is re-adopted
+	// the same way — including after the restart its own first target caused.
 	applyRunner.Adopt(context.Background())
+	fleetRunner.Adopt(context.Background())
 
 	jobRegistry.MustRegister(jobs.Definition{
 		ID:          platform.DetectJobID,
@@ -1004,6 +1021,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		platformHandler:  platformHandler,
 		platformApply:    platformApply,
 		applyRunner:      applyRunner,
+		fleetRunner:      fleetRunner,
 		auditHandler:     auditHandler,
 		artworkHandler:   artworkHandler,
 		secretsHandler:   secretsHandler,
@@ -1087,6 +1105,9 @@ func (s *Services) Stop() {
 	}
 	// In-flight applies are cancelled, not failed: their rows stay open and the
 	// next boot's Adopt resumes them.
+	if s.fleetRunner != nil {
+		s.fleetRunner.Close()
+	}
 	if s.applyRunner != nil {
 		s.applyRunner.Close()
 	}

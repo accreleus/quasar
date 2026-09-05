@@ -917,7 +917,9 @@ code directly. Set in `deploy/.env`.
 
 ## Updater (`quasar-updater`)
 
-Read by the updater process only (`control-plane/cmd/quasar-updater`). Set in
+Read by the updater process (`control-plane/cmd/quasar-updater`); the control
+plane also reads `QUASAR_UPDATER_SOCKET`, because it applies **itself** over
+that socket rather than through any agent. Set in
 `deploy/.env`; the compose service passes them through. The socket path and the
 result-file layout are **not** a frozen interface (`protocol/schema.md` §"Not
 frozen: the updater's local socket").
@@ -928,7 +930,7 @@ frozen: the updater's local socket").
 | `QUASAR_UPDATER_WAIT_TIMEOUT_S` | `300` | `docker compose up --wait --wait-timeout`. A request may name its own value. |
 | `QUASAR_UPDATER_PULL_TIMEOUT_S` | `3600` | Wall-clock bound on the `pull` step. |
 | `QUASAR_UPDATER_RECREATE_TIMEOUT_S` | `900` | Wall-clock bound on the `up` step, independent of compose's health wait. |
-| `QUASAR_UPDATER_SOCKET` | `/run/quasar-updater/updater.sock` | Where the socket is created, mode 0666, in the volume shared with the control plane and the agent. |
+| `QUASAR_UPDATER_SOCKET` | `/run/quasar-updater/updater.sock` | Where the socket is created, mode 0666, in the volume shared with the control plane and the agent. Read by all three: an absent socket makes the control-plane target of an update `updater_absent` rather than an apply that fails halfway. |
 | `QUASAR_UPDATER_RESULTS_DIR` | `/run/quasar-updater/results` | One result file per request id, written tmp+rename. Directory is root-owned 0755: the other containers read, only the updater writes. |
 | `QUASAR_UPDATER_DOCKER_BIN` | `docker` | The CLI the updater drives. |
 

@@ -321,10 +321,11 @@ func TestTargetEligibilityReasons(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			v := PlanRelease(PlanInputs{
-				Channel:      ChannelStable,
-				ControlPlane: tc.cp,
-				Hosts:        []HostIdentity{tc.host},
-				Releases:     tc.releases,
+				Channel:        ChannelStable,
+				ControlPlane:   tc.cp,
+				Hosts:          []HostIdentity{tc.host},
+				Releases:       tc.releases,
+				UpdaterPresent: true,
 			})
 			if len(v.Targets) != 2 {
 				t.Fatalf("targets = %d, want the control plane then one host", len(v.Targets))

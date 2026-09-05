@@ -107,6 +107,10 @@ type PreviousDigest struct {
 // rather than trusted to be absent.
 const ComponentNodeAgent = "node-agent"
 
+// The component the control plane applies to ITSELF, over its own host's
+// updater socket. Never sent to a host.
+const ComponentControlPlane = "control-plane"
+
 // Attempt is one `platform_apply_attempts` row and the `PlatformApplyAttempt`
 // wire shape.
 type Attempt struct {
@@ -134,28 +138,80 @@ type Attempt struct {
 // field rather than a per-target one, so the same attempt is never in two
 // places in one response where the two could disagree.
 type ActiveApply struct {
-	// The active fleet run, or null. Always null until #117 serves runs — this
-	// build creates no run row, and a run is the only thing that could fill it.
+	// The active fleet run, or null. There is at most one
+	// (platform_apply_runs_active_uk).
 	Run *ApplyRun `json:"run"`
 	// EVERY open attempt on the instance, joined to `targets` by host_id.
 	Attempts []Attempt `json:"attempts"`
 }
 
-// ApplyRun is the `PlatformApplyRun` shape. Declared so `active_apply.run` has
-// a type and #117 has one place to fill; this build never constructs one.
+// `ApplyRunState`. A run `succeeded` only when every target succeeded, and
+// stops at its first failed target: there is no `partial`.
+const (
+	RunPending   = "pending"
+	RunRunning   = "running"
+	RunSucceeded = "succeeded"
+	RunFailed    = "failed"
+	RunCancelled = "cancelled"
+)
+
+// TerminalRunState reports whether a run in this state is resolved. SQL twin:
+// terminalRunStatesSQL.
+func TerminalRunState(state string) bool {
+	switch state {
+	case RunSucceeded, RunFailed, RunCancelled:
+		return true
+	}
+	return false
+}
+
+// RunSkip is one `PlatformApplySkip`: a host the run passed over as ineligible
+// at its turn. An ineligibility is not a failure, so it produces no attempt row
+// and is reported here instead.
+type RunSkip struct {
+	HostID   string `json:"host_id"`
+	NodeName string `json:"node_name"`
+	Reason   string `json:"reason"`
+}
+
+// ApplyRun is the `PlatformApplyRun` shape.
+//
+// `skipped` has no column in migration 0075: it is held by the sequencer for
+// the life of the process. A run's skips are all computed AFTER its
+// control-plane target, so the restart a fleet run causes cannot lose them;
+// only a crash mid-fleet can, and then the list is empty rather than wrong.
 type ApplyRun struct {
-	ID              string     `json:"id"`
-	ReleaseID       string     `json:"release_id"`
-	State           string     `json:"state"`
-	Force           bool       `json:"force"`
-	RequestedBy     *string    `json:"requested_by"`
-	CancelRequested bool       `json:"cancel_requested"`
-	CurrentTarget   *string    `json:"current_target"`
-	CurrentHostID   *string    `json:"current_host_id"`
-	Error           *string    `json:"error"`
-	CreatedAt       time.Time  `json:"created_at"`
-	StartedAt       *time.Time `json:"started_at"`
-	FinishedAt      *time.Time `json:"finished_at"`
+	ID                string     `json:"id"`
+	ReleaseID         string     `json:"release_id"`
+	State             string     `json:"state"`
+	Force             bool       `json:"force"`
+	RequestedBy       *string    `json:"requested_by"`
+	CancelRequested   bool       `json:"cancel_requested"`
+	CancelRequestedAt *time.Time `json:"cancel_requested_at"`
+	CurrentTarget     *string    `json:"current_target"`
+	CurrentHostID     *string    `json:"current_host_id"`
+	Error             *string    `json:"error"`
+	Skipped           []RunSkip  `json:"skipped"`
+	Attempts          []Attempt  `json:"attempts"`
+	CreatedAt         time.Time  `json:"created_at"`
+	StartedAt         *time.Time `json:"started_at"`
+	FinishedAt        *time.Time `json:"finished_at"`
+}
+
+// FleetApplyRequest is `PlatformApplyRequest`.
+type FleetApplyRequest struct {
+	ReleaseID string `json:"release_id"`
+	Force     bool   `json:"force"`
+}
+
+// RunEnvelope is the body of every run response.
+type RunEnvelope struct {
+	Run ApplyRun `json:"run"`
+}
+
+// RunsResponse is the `GET /v1/admin/platform/apply/runs` body.
+type RunsResponse struct {
+	Runs []ApplyRun `json:"runs"`
 }
 
 // AttemptsResponse is the `GET /v1/admin/platform/attempts` body.
@@ -203,6 +259,20 @@ func NodeAgentComponents(m Manifest) []ComponentDigest {
 	out := make([]ComponentDigest, 0, 1)
 	for _, c := range m.Components {
 		if c.Name != ComponentNodeAgent {
+			continue
+		}
+		out = append(out, ComponentDigest{Name: c.Name, Image: c.Image, Digest: c.Digest})
+	}
+	return out
+}
+
+// ControlPlaneComponents extracts the components the control plane may apply to
+// itself: today exactly the `control-plane` entry. Empty means the release
+// cannot move this control plane, which is a refusal and never an empty apply.
+func ControlPlaneComponents(m Manifest) []ComponentDigest {
+	out := make([]ComponentDigest, 0, 1)
+	for _, c := range m.Components {
+		if c.Name != ComponentControlPlane {
 			continue
 		}
 		out = append(out, ComponentDigest{Name: c.Name, Image: c.Image, Digest: c.Digest})

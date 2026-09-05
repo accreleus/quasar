@@ -22,8 +22,9 @@ export interface ToastItem {
   variant: ToastVariant;
   title: string;
   body?: string;
-  /** Auto-dismiss after ms (default 4000) */
-  duration?: number;
+  /** Auto-dismiss after ms (default 4000). `null` never dismisses — a huge
+   *  number cannot stand in for it: setTimeout above 2^31-1 ms fires at once. */
+  duration?: number | null;
   /**
    * One optional call-to-action button (e.g. "Go to session" — steam-library-
    * discovery spec §2.2's `home_in_use` copy needs a real link, not just a
@@ -75,6 +76,7 @@ function ToastItemComponent({ item, onRemove }: ToastItemProps) {
 
   // Start auto-dismiss on mount
   const startTimer = useCallback(() => {
+    if (item.duration === null) return;
     const ms = item.duration ?? 4000;
     timerRef.current = setTimeout(() => onRemove(item.id), ms);
   }, [item, onRemove]);

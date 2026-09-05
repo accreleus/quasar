@@ -34,6 +34,7 @@ import * as adminApi from "../../api/admin";
 import * as setupApi from "../../api/setup";
 import { AuthContext, type AuthContextValue } from "../../auth/context";
 import { SetupStatusProvider } from "../../setup/useSetupStatus";
+import { ToastProvider } from "../../components/Toast";
 import { ThemeProvider } from "../../settings/ThemeContext";
 import { AdminLayout } from "./AdminLayout";
 
@@ -67,6 +68,7 @@ beforeEach(() => {
   // The layout's two advisory banners each own a read; an automocked one
   // resolves to undefined and takes the whole shell down.
   mocked.getPlatformReleases.mockResolvedValue({ available: [] } as never);
+  mocked.getPlatformIdentity.mockResolvedValue({ identity: { source_commit: null } } as never);
 });
 
 function renderAdmin() {
@@ -75,7 +77,9 @@ function renderAdmin() {
       <ThemeProvider>
         <AuthContext.Provider value={auth}>
           <SetupStatusProvider>
-            <AdminLayout />
+            <ToastProvider>
+              <AdminLayout />
+            </ToastProvider>
           </SetupStatusProvider>
         </AuthContext.Provider>
       </ThemeProvider>

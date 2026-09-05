@@ -42,9 +42,11 @@ type ApplyHandler struct {
 	view    func(ctx context.Context) (View, error)
 	auditor audit.Recorder
 	log     logger
-	// Resolves the node-agent digest for a release with no manifest (edge).
-	// Nil refuses those applies rather than guessing.
+	// Resolves a target's digest for a release with no manifest (edge). Nil
+	// refuses those applies rather than guessing.
 	edge ApplyComponentResolver
+	// The fleet sequencer (apply_fleet.go); nil on a build with no fleet half.
+	fleet *FleetRunner
 }
 
 // logger is the sliver of *slog.Logger this file uses.
@@ -73,6 +75,10 @@ func (h *ApplyHandler) Register(mux httpx.Router, admin func(http.Handler) http.
 	mux.Handle("POST /v1/admin/platform/hosts/{id}/apply", admin(http.HandlerFunc(h.handleHostApply)))
 	mux.Handle("POST /v1/admin/platform/hosts/{id}/revert", admin(http.HandlerFunc(h.handleHostRevert)))
 	mux.Handle("GET /v1/admin/platform/attempts", admin(http.HandlerFunc(h.handleAttempts)))
+	mux.Handle("POST /v1/admin/platform/apply", admin(http.HandlerFunc(h.handleFleetApply)))
+	mux.Handle("GET /v1/admin/platform/apply/runs", admin(http.HandlerFunc(h.handleRuns)))
+	mux.Handle("GET /v1/admin/platform/apply/runs/{id}", admin(http.HandlerFunc(h.handleRun)))
+	mux.Handle("POST /v1/admin/platform/apply/runs/{id}/cancel", admin(http.HandlerFunc(h.handleRunCancel)))
 }
 
 // notEligible is the `409 host_not_eligible` body: the envelope plus `reason`
@@ -293,15 +299,7 @@ func (h *ApplyHandler) previousDigests(ctx context.Context, hostID string, reque
 	if err != nil {
 		return nil, err
 	}
-	if len(last) == 0 {
-		return unknownPrevious(requested), nil
-	}
-	out := make([]PreviousDigest, 0, len(last))
-	for _, c := range last {
-		digest := c.Digest
-		out = append(out, PreviousDigest{Name: c.Name, Digest: &digest})
-	}
-	return out, nil
+	return previousOrUnknown(last, requested), nil
 }
 
 func (h *ApplyHandler) internal(w http.ResponseWriter, what string, err error) {
