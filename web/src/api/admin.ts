@@ -32,6 +32,8 @@ import type {
   SecretResponse,
   SecretsResponse,
   SettingsResponse,
+  PlatformApplyAttemptEnvelope,
+  PlatformApplyAttemptsResponse,
   PlatformReleaseView,
   ReleaseChannel,
   RegistrationMode,
@@ -901,6 +903,33 @@ export function getPlatformReleases(
   signal?: AbortSignal,
 ): Promise<PlatformReleaseView> {
   return apiFetch<PlatformReleaseView>("/admin/platform/releases", { token, signal });
+}
+
+/** Apply one release to one host. 202 with the attempt; the work is
+ *  asynchronous and watched through active_apply on the release view. */
+export function applyPlatformReleaseToHost(
+  token: string,
+  hostId: string,
+  req: { release_id: string; force?: boolean },
+): Promise<PlatformApplyAttemptEnvelope> {
+  return apiFetch<PlatformApplyAttemptEnvelope>(`/admin/platform/hosts/${hostId}/apply`, {
+    method: "POST",
+    body: req,
+    token,
+  });
+}
+
+/** Apply history, newest first, control-plane attempts included. */
+export function listPlatformAttempts(
+  token: string,
+  opts: { hostId?: string; limit?: number } = {},
+  signal?: AbortSignal,
+): Promise<PlatformApplyAttemptsResponse> {
+  const query = queryString({ host_id: opts.hostId, limit: opts.limit });
+  return apiFetch<PlatformApplyAttemptsResponse>(`/admin/platform/attempts${query}`, {
+    token,
+    signal,
+  });
 }
 
 /** Bounded, newest first. */

@@ -431,7 +431,7 @@ func TestFaults(t *testing.T) {
 	})
 }
 
-func TestViewSerializesEveryRequiredKeyAndNoActiveApply(t *testing.T) {
+func TestViewSerializesEveryRequiredKeyIncludingActiveApply(t *testing.T) {
 	checked := at(4)
 	v := PlanRelease(PlanInputs{
 		Channel:      ChannelStable,
@@ -449,15 +449,15 @@ func TestViewSerializesEveryRequiredKeyAndNoActiveApply(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	for _, key := range []string{"channel", "edge_branch", "checked_at", "last_error",
-		"installed", "available", "targets", "faults"} {
+		"installed", "available", "targets", "faults", "active_apply"} {
 		if _, ok := body[key]; !ok {
 			t.Errorf("view is missing required key %q: %s", key, raw)
 		}
 	}
-	// active_apply is amendment 2's; a pre-amendment-2 server stays conformant
-	// by omitting it, and #116 is what starts serializing it.
-	if _, ok := body["active_apply"]; ok {
-		t.Error("active_apply must not be serialized before the apply half exists")
+	// #116 serves the apply half, so active_apply is ALWAYS serialized: null is
+	// the answer, not the absence of one.
+	if got := string(body["active_apply"]); got != "null" {
+		t.Errorf("active_apply = %s, want null when nothing is in flight", got)
 	}
 	if string(body["available"]) != "[]" || string(body["targets"]) == "null" || string(body["faults"]) != "[]" {
 		t.Errorf("empty lists must serialize as [], never null: %s", raw)

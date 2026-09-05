@@ -149,8 +149,8 @@ pub async fn run(cfg: Config) {
         info!("startup sweep removed {swept} orphaned container(s) from a prior run");
     }
 
-    // Install mode + updater presence, discovered once per process: it shells
-    // out to docker, while `register` is re-sent on every reconnect. Failure is
+    // Install mode + updater presence, for the startup identity banner;
+    // `connect_and_run` re-discovers before every register. Failure is
     // silent-by-design — the fields go absent and the host reads as
     // identity-unknown (agent-api.md §register).
     let runtime = {
@@ -899,7 +899,15 @@ async fn connect_and_run(
 
     // --- Step 1: send register ---
     let auth = choose_auth(cfg)?;
-    let install = crate::buildinfo::install_facts();
+    // Re-discovered per connection, not once at boot: an updater that starts
+    // after the agent must not leave the host reporting updater_present=false
+    // forever. Offloaded because it shells out to docker.
+    let install = offload_probe(|| {
+        let runtime = ContainerRuntime::from_env();
+        crate::buildinfo::discover_install(&crate::buildinfo::DockerFacts::new(&runtime))
+    })
+    .await;
+    crate::buildinfo::set_install_facts(install.clone());
     let register_msg = AgentMsg::Register {
         node_name: cfg.node_name.clone(),
         agent_version: AGENT_VERSION.to_string(),

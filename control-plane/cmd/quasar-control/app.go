@@ -81,6 +81,10 @@ type Services struct {
 	enrollHandler   *hostenroll.Handler
 	consoleHandler  *console.Handler
 	platformHandler *platform.Handler
+	// The apply half (#116). Nil in a route-recorder build; Register only takes
+	// method values, so the drift test still sees the routes.
+	platformApply *platform.ApplyHandler
+	applyRunner   *platform.Runner
 	auditHandler    *audit.Handler
 	artworkHandler  *artwork.Handler
 	secretsHandler  *secrets.Handler
@@ -170,6 +174,9 @@ func platformDeps(store *platform.Store, set *settings.Store, jobStore *jobs.Sto
 		Channel:  set.ReleaseChannel,
 		Hosts:    store.Hosts,
 		Releases: store.Releases,
+		// One read for the whole page: `active_apply` and the
+		// `attempt_in_flight` eligibility reason come from the same rows.
+		OpenAttempts: store.OpenAttempts,
 		Detection: func(ctx context.Context) (platform.DetectionStatus, error) {
 			var st platform.DetectionStatus
 			succeeded, hadSuccess, err := jobStore.LastRunInState(ctx, platform.DetectJobID, "", jobs.StateSucceeded)
@@ -191,6 +198,34 @@ func platformDeps(store *platform.Store, set *settings.Store, jobStore *jobs.Sto
 			return st, nil
 		},
 	}
+}
+
+// releaseEventsAdapter turns agentws' wire vocabulary into internal/platform's.
+// It lives in main for the same reason platformDeps does: neither package may
+// import the other, and the translation is the seam that keeps it that way.
+type releaseEventsAdapter struct{ runner *platform.Runner }
+
+func (a releaseEventsAdapter) AgentReleaseState(ctx context.Context, hostID string, m agentws.ReleaseStateMsg) {
+	previous := make([]platform.PreviousDigest, 0, len(m.Previous))
+	for _, p := range m.Previous {
+		previous = append(previous, platform.PreviousDigest{Name: p.Name, Digest: p.Digest})
+	}
+	components := make([]platform.ComponentDigest, 0, len(m.Components))
+	for _, c := range m.Components {
+		components = append(components, platform.ComponentDigest{Name: c.Name, Image: c.Image, Digest: c.Digest})
+	}
+	a.runner.HandleReleaseState(ctx, hostID, platform.ReleaseStateReport{
+		RequestID:  m.RequestID,
+		State:      m.State,
+		Reason:     m.Reason,
+		Components: components,
+		Previous:   previous,
+		Output:     m.Output,
+	})
+}
+
+func (a releaseEventsAdapter) AgentRegistered(ctx context.Context, hostID string, sourceCommit *string) {
+	a.runner.HandleRegister(ctx, hostID, sourceCommit)
 }
 
 // NewServices wires every subsystem; call Stop() for the goroutines it starts.
@@ -811,6 +846,59 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 				platformRegistry, releaseRepo),
 			settingsStore.ReleaseChannel)
 	}
+	// Platform-release APPLY (#116, amendment 2). The runner is the per-host
+	// state machine; its three effects are wired here because internal/platform
+	// must not import internal/session or internal/agentws (the one-way
+	// dependency the control-plane/agent split rests on).
+	//
+	// Cordon is the EXISTING drain with force=false: this path never stops a
+	// session, because the recreate does that and doing it twice can only fail
+	// halfway. Uncordon's ErrHostNotResumable on an offline host is expected —
+	// a host mid-recreate has no agent, and its register brings it back online.
+	applyRunner := platform.NewRunner(platformStore, platform.ApplyDeps{
+		Cordon: func(ctx context.Context, hostID string) error {
+			_, err := coordinator.DrainHost(ctx, hostID, false)
+			return err
+		},
+		Uncordon: func(ctx context.Context, hostID string) error {
+			_, err := coordinator.UncordonHost(ctx, hostID)
+			return err
+		},
+		Send: func(ctx context.Context, hostID string, cmd platform.ApplyCommand) (platform.Ack, error) {
+			components := make([]agentws.ReleaseComponent, 0, len(cmd.Components))
+			for _, c := range cmd.Components {
+				components = append(components, agentws.ReleaseComponent{
+					Name: c.Name, Image: c.Image, Digest: c.Digest,
+				})
+			}
+			ack, err := agentRegistry.SendReleaseApply(ctx, hostID, cmd.RequestID, agentws.ReleaseApplyCmd{
+				// The command id is the request id: one apply, one identity,
+				// and an ack that names the thing it accepted.
+				RequestID: cmd.RequestID,
+				Release: agentws.ReleaseApplyRef{
+					ID: cmd.Release.ID, Version: cmd.Release.Version,
+					SourceCommit: cmd.Release.SourceCommit,
+				},
+				Components: components,
+				Force:      cmd.Force,
+			})
+			return platform.Ack{OK: ack.OK, Error: ack.Error}, err
+		},
+	}, log)
+	agentHandler.SetReleaseEvents(releaseEventsAdapter{runner: applyRunner})
+	platformHandler := platform.NewHandler(platformDeps(platformStore, settingsStore, jobStore), log)
+	platformApply := platform.NewApplyHandler(platformStore, applyRunner, platformHandler.ReleaseView, auditStore, log).
+		// An edge release stores no manifest, so its digest is resolved from the
+		// commit's image tag at apply time, off the same allowlisted registry the
+		// edge detector reads.
+		WithEdgeResolver(platform.NewEdgeApplyResolver(
+			images.NewRegistryResolverForHosts(nil, images.RegistryEgressHosts(platform.ConfiguredPlatformRegistry())),
+			platform.ConfiguredPlatformRegistry(), platform.ConfiguredReleaseRepo()))
+	// An apply the previous process was driving is re-adopted, not orphaned: its
+	// deadline is re-armed from started_at, and the row's persisted request id is
+	// what still correlates the agent's release_state.
+	applyRunner.Adopt(context.Background())
+
 	jobRegistry.MustRegister(jobs.Definition{
 		ID:          platform.DetectJobID,
 		Name:        "Platform release detection",
@@ -913,7 +1001,9 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		invitesHandler:   invitesHandler,
 		enrollHandler:    enrollHandler,
 		consoleHandler:   consoleHandler,
-		platformHandler:  platform.NewHandler(platformDeps(platformStore, settingsStore, jobStore), log),
+		platformHandler:  platformHandler,
+		platformApply:    platformApply,
+		applyRunner:      applyRunner,
 		auditHandler:     auditHandler,
 		artworkHandler:   artworkHandler,
 		secretsHandler:   secretsHandler,
@@ -955,6 +1045,7 @@ func (s *Services) RegisterRoutes(mux httpx.Router) {
 	s.enrollHandler.Register(mux, admin)
 	s.consoleHandler.Register(mux, admin)
 	s.platformHandler.Register(mux, admin)
+	s.platformApply.Register(mux, admin)
 	s.auditHandler.Register(mux, admin)
 	s.secretsHandler.Register(mux, admin)
 	s.artworkHandler.Register(mux, s.authHandler.RequireAuth, s.authHandler.RequireAdmin)
@@ -993,6 +1084,11 @@ func (s *Services) Stop() {
 	// `running` row the claim reaper only aborts an hour later.
 	if s.jobsDispatcher != nil {
 		s.jobsDispatcher.Wait()
+	}
+	// In-flight applies are cancelled, not failed: their rows stay open and the
+	// next boot's Adopt resumes them.
+	if s.applyRunner != nil {
+		s.applyRunner.Close()
 	}
 	s.coordinator.Close()
 }

@@ -8,8 +8,8 @@
  * (sectionTabs.ts). Everything composes existing card/table/chip primitives;
  * the only new rule is `.release-*` in styles/admin/fleet.css.
  *
- * There are no Apply buttons: the apply half is amendment 2 (#116/#117/#118).
- * This page reads, and says what could move.
+ * The per-host apply half is #116 (ApplyControls.tsx); fleet apply and revert
+ * are #117/#118.
  */
 
 import { useState, type ReactNode } from "react";
@@ -36,6 +36,13 @@ import { relativeTime } from "../../../lib/format/relativeTime";
 import { manualUpdatePath } from "../../../lib/platform/manualUpdate";
 import { useAdminAction } from "../../../lib/resource/action";
 import { useResource } from "../../../lib/resource/react";
+import {
+  ApplyConfirmModal,
+  ApplyHistory,
+  AttemptProgress,
+  attemptForTarget,
+  useHostSessionCounts,
+} from "./ApplyControls";
 import { eligibilityText, faultText, hasUpdate, releaseLabel, shortCommit } from "./releasesCopy";
 import "../../../styles/admin/fleet.css";
 
@@ -75,8 +82,13 @@ export function ReleasesTab() {
   const res = useResource<PlatformReleaseView>({
     label: "platform releases",
     fetch: ({ token: t, signal }) => adminApi.getPlatformReleases(t, signal),
+    // Only while something is in flight: an idle Releases page has nothing to
+    // animate, and the read is not free.
+    pollMs: (view) => (view.active_apply ? 3000 : undefined),
   });
   const view = res.data;
+  // Bumped on every apply, so the history reloads without polling it too.
+  const [applied, setApplied] = useState(0);
 
   // "Check now" is the jobs run-now action: this page's read never triggers
   // detection (control-api.md).
@@ -108,7 +120,19 @@ export function ReleasesTab() {
           <InstalledSection view={view} />
           <ChannelSection view={view} onSaved={() => void res.refresh()} />
           <AvailableSection view={view} />
-          <TargetsSection view={view} />
+          <TargetsSection
+            view={view}
+            onApplied={() => {
+              setApplied((n) => n + 1);
+              void res.refresh();
+            }}
+          />
+          <Section
+            title="Apply history"
+            hint="Every update this instance has made to itself, newest first."
+          >
+            <ApplyHistory refreshKey={applied} />
+          </Section>
           <FaultsSection view={view} />
         </>
       )}
@@ -322,7 +346,13 @@ function ManualPath({
   );
 }
 
-function TargetsSection({ view }: { view: PlatformReleaseView }) {
+function TargetsSection({ view, onApplied }: { view: PlatformReleaseView; onApplied: () => void }) {
+  const [confirming, setConfirming] = useState<PlatformReleaseTarget | null>(null);
+  const counts = useHostSessionCounts();
+  // Targets are evaluated against the newest listed release and nothing else.
+  const newest = view.available[0];
+  const attempts = view.active_apply?.attempts;
+
   const columns: TableColumn<PlatformReleaseTarget>[] = [
     {
       key: "target",
@@ -332,16 +362,44 @@ function TargetsSection({ view }: { view: PlatformReleaseView }) {
     {
       key: "state",
       header: "State",
-      width: "120px",
-      render: (t) =>
-        t.eligible ? <Chip variant="success">Ready</Chip> : <Chip variant="neutral">Not ready</Chip>,
+      width: "220px",
+      render: (t) => {
+        const open = attemptForTarget(attempts, t);
+        if (open) return <AttemptProgress attempt={open} />;
+        return t.eligible ? (
+          <Chip variant="success">Ready</Chip>
+        ) : (
+          <Chip variant="neutral">Not ready</Chip>
+        );
+      },
     },
-    { key: "why", header: "Why", render: (t) => eligibilityText(t.reason ?? null) },
+    {
+      key: "why",
+      header: "Why",
+      render: (t) => (attemptForTarget(attempts, t) ? "" : eligibilityText(t.reason ?? null)),
+    },
+    {
+      key: "action",
+      header: "",
+      width: "110px",
+      render: (t) => {
+        // The control plane is #117's. An apply that has been sent cannot be
+        // forced or cancelled, so an open attempt offers no second action.
+        if (t.kind !== "host" || !t.eligible || !newest || attemptForTarget(attempts, t)) {
+          return null;
+        }
+        return (
+          <Button variant="ghost" onClick={() => setConfirming(t)}>
+            Apply
+          </Button>
+        );
+      },
+    },
   ];
   return (
     <Section
       title="Targets"
-      hint="Evaluated against the newest listed release. Applying an update from here arrives with the apply half; this reports what could move."
+      hint="Evaluated against the newest listed release. A host is cordoned while it updates and returns to service afterwards."
     >
       <Table
         columns={columns}
@@ -357,6 +415,15 @@ function TargetsSection({ view }: { view: PlatformReleaseView }) {
           release={view.available[0]}
         />
       ))}
+      {confirming && newest && (
+        <ApplyConfirmModal
+          release={newest}
+          target={confirming}
+          liveSessions={counts ? (counts.get(confirming.host_id ?? "") ?? 0) : null}
+          onClose={() => setConfirming(null)}
+          onApplied={onApplied}
+        />
+      )}
     </Section>
   );
 }

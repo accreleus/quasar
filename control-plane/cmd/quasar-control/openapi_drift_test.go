@@ -71,6 +71,10 @@ func nilDepServices(t *testing.T) *Services {
 		consoleHandler:  console.NewHandler(nil, nil),
 		// Stateless: the identity it serves is linker-injected, not a dep.
 		platformHandler: platform.NewHandler(&platform.Deps{}, nil),
+		// nil store/runner/view: ApplyHandler.Register only takes method
+		// values, and every request path checks ready() and answers 500, so no
+		// route can panic in the recorder.
+		platformApply: platform.NewApplyHandler(nil, nil, nil, nil, log),
 		// nil service/store: Register only needs the handler to exist. Every
 		// request path checks for it and answers 503, so no route can 500 here.
 		artworkHandler: artwork.NewHandler(nil, log),
@@ -243,8 +247,6 @@ var allowedUnimplemented = map[string]struct{}{
 	// are fixed before three tickets implement against them independently. Each
 	// ticket MUST delete both the marker in protocol/openapi.yaml and the entry
 	// here in the same change that registers its route.
-	"POST /v1/admin/platform/hosts/{}/apply":       {}, // removed by #116
-	"GET /v1/admin/platform/attempts":              {}, // removed by #116
 	"POST /v1/admin/platform/apply":                {}, // removed by #117
 	"GET /v1/admin/platform/apply/runs":            {}, // removed by #117
 	"GET /v1/admin/platform/apply/runs/{}":         {}, // removed by #117

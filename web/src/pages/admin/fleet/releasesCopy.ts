@@ -34,6 +34,53 @@ const FAULT_TEXT: Record<string, string> = {
   manifest_invalid: "Release manifest invalid",
 };
 
+/** Apply progress, as a phrase the row reads as its state. */
+const ATTEMPT_STATE_TEXT: Record<string, string> = {
+  queued: "Queued",
+  waiting_sessions: "Waiting for sessions to end",
+  pending: "Handed to the updater",
+  pulling: "Pulling the image",
+  recreating: "Recreating the agent",
+  verifying: "Verifying",
+  succeeded: "Updated",
+  failed: "Update failed",
+  cancelled: "Cancelled",
+};
+
+export function attemptStateText(state: string): string {
+  return ATTEMPT_STATE_TEXT[state] ?? state;
+}
+
+/** The closed failure vocabulary, shared verbatim with the wire, so this one
+ *  mapping serves progress, history and an ack rejection. An identifier this
+ *  build does not know renders verbatim. */
+const FAILURE_TEXT: Record<string, string> = {
+  updater_absent: "No updater is installed beside this host's stack.",
+  busy: "An update was already in flight on this host.",
+  invalid: "The update request was rejected as un-actionable.",
+  namespace_rejected: "The image is outside this host's platform-image namespace.",
+  digest_malformed: "The image digest was malformed.",
+  pull_failed: "The image could not be pulled.",
+  recreate_failed: "The container could not be recreated — this host's agent is stopped.",
+  never_started: "The new container never started.",
+  unhealthy: "The new container started but never became healthy.",
+  updater_unreachable: "The updater could not be reached.",
+  timeout: "The update did not finish in time.",
+  unsupported: "This host's agent predates the update feature; update it another way.",
+};
+
+export function failureText(reason: string | null | undefined): string {
+  if (!reason) return "";
+  return FAILURE_TEXT[reason] ?? reason;
+}
+
+/** A digest, short enough to read and long enough to identify. */
+export function shortDigest(digest: string | null | undefined): string {
+  if (!digest) return "unknown";
+  const hex = digest.startsWith("sha256:") ? digest.slice(7) : digest;
+  return hex.slice(0, 12);
+}
+
 export function faultText(kind: string): string {
   return FAULT_TEXT[kind] ?? kind;
 }
