@@ -107,7 +107,31 @@ type RegistryResolver struct {
 // allowlist and the resolve timeout; callers supplying their own transport take
 // responsibility for those protections.
 func NewRegistryResolver(client *http.Client) *RegistryResolver {
+	return NewRegistryResolverForHosts(client, allowedHostsFromEnv())
+}
+
+// RegistryEgressHosts is QUASAR_IMAGE_REGISTRY_HOSTS plus the extra hosts a
+// caller must be able to reach whatever that knob says — the platform registry
+// (QUASAR_PLATFORM_REGISTRY, #111) is one: an operator who repoints the
+// platform images at their own registry should not also have to remember to
+// add it to a second, differently-named list.
+func RegistryEgressHosts(extra ...string) map[string]struct{} {
 	hosts := allowedHostsFromEnv()
+	for _, h := range extra {
+		h = strings.ToLower(strings.TrimSpace(h))
+		if h != "" {
+			hosts[h] = struct{}{}
+		}
+	}
+	return hosts
+}
+
+// NewRegistryResolverForHosts is NewRegistryResolver over an explicit
+// allowlist. Same hardening; the caller decides the host set.
+func NewRegistryResolverForHosts(client *http.Client, hosts map[string]struct{}) *RegistryResolver {
+	if len(hosts) == 0 {
+		hosts = allowedHostsFromEnv()
+	}
 	if client != nil {
 		return &RegistryResolver{client: client, allowHosts: hosts}
 	}

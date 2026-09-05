@@ -245,9 +245,10 @@
           "org.quasar.image.role",
           "org.quasar.pins.base",
           "org.quasar.source.commit",
-          "org.quasar.built.at"
+          "org.quasar.built.at",
+          "org.quasar.schema.version"
         ],
-        "_notes": "Provenance, the same assertion the runtime role carries. The control plane also SERVES its identity (GET /v1/admin/platform/identity) from linker stamps passed by the same build args, so a missing label here means the served identity is unstamped too."
+        "_notes": "Provenance, the same assertion the runtime role carries. org.quasar.schema.version is the control role's alone: the edge release channel reads the highest embedded migration off the published image, since a branch build ships no release manifest, and a control-plane image without it is unorderable and never offered as an update (#111). The control plane also SERVES its identity (GET /v1/admin/platform/identity) from linker stamps passed by the same build args, so a missing label here means the served identity is unstamped too."
       },
       "image_config": {
         "healthcheck_required": true,
