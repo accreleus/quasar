@@ -195,7 +195,74 @@ func (g *GitHubSource) FetchManifest(ctx context.Context, rawURL string) ([]byte
 	}
 	req.Header.Set("Accept", "application/octet-stream")
 	g.authorize(req)
-	return g.read(req)
+	return g.readAsset(ctx, req)
+}
+
+// readAsset is the ONE place in this package that follows a redirect, and it
+// follows exactly one.
+//
+// GitHub answers an asset download with a 302 to a presigned URL on
+// objects.githubusercontent.com, so the flat no-redirect rule the outbound
+// client enforces (a Location can point past the allowlist at an internal
+// address) reads that 302 as the answer and every real release records
+// `manifest_invalid` — found live against v0.2.0-rc.1. The hop is therefore
+// taken here, under the same rules the first request passed: https only, the
+// target host on the release allowlist, one hop and no more, and NO
+// Authorization header on the second request — the URL is already presigned,
+// and forwarding a token to a CDN leaks it.
+func (g *GitHubSource) readAsset(ctx context.Context, req *http.Request) ([]byte, error) {
+	body, loc, err := g.readAllowingRedirect(req)
+	if err != nil || loc == "" {
+		return body, err
+	}
+	next, err := url.Parse(loc)
+	if err != nil {
+		return nil, fmt.Errorf("asset redirect target %q is unparseable: %w", loc, err)
+	}
+	next = req.URL.ResolveReference(next)
+	if !g.client.HostAllowed(next.Hostname()) {
+		return nil, fmt.Errorf("asset redirected to host %q, which is not on the release egress "+
+			"allowlist (QUASAR_PLATFORM_RELEASE_ASSET_HOSTS)", next.Hostname())
+	}
+	hop, err := http.NewRequestWithContext(ctx, http.MethodGet, next.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("build asset redirect request: %w", err)
+	}
+	hop.Header.Set("Accept", "application/octet-stream")
+	body, loc, err = g.readAllowingRedirect(hop)
+	if err != nil {
+		return nil, err
+	}
+	if loc != "" {
+		return nil, fmt.Errorf("%s redirected again; the release path follows one hop", next.Redacted())
+	}
+	return body, nil
+}
+
+// readAllowingRedirect returns the body on a 200 and the Location on a 3xx that
+// carries one; a 3xx with no Location is an ordinary failure.
+func (g *GitHubSource) readAllowingRedirect(req *http.Request) ([]byte, string, error) {
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode >= 300 && resp.StatusCode <= 399 {
+		if loc := resp.Header.Get("Location"); loc != "" {
+			return nil, loc, nil
+		}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("%s answered %s", req.URL.Redacted(), resp.Status)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("read %s: %w", req.URL.Redacted(), err)
+	}
+	return body, "", nil
 }
 
 func (g *GitHubSource) CompareURL(fromCommit, toCommit string) string {
@@ -222,7 +289,8 @@ func (g *GitHubSource) read(req *http.Request) ([]byte, error) {
 		_ = resp.Body.Close()
 	}()
 	// The outbound client follows no redirect (a Location could point past the
-	// allowlist), so a 3xx arrives here as an ordinary status.
+	// allowlist), so a 3xx arrives here as an ordinary status. Only the asset
+	// download takes a hop, and it does it in readAsset.
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("%s answered %s", req.URL.Redacted(), resp.Status)
 	}
