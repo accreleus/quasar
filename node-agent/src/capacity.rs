@@ -34,12 +34,16 @@ const AGENT_DATA_ROOT: &str = "/var/lib/quasar-agent";
 pub fn detect() -> SystemCapacity {
     let allow_synthetic = std::env::var("QUASAR_SYNTHETIC_GPU_CAPACITY")
         .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
-    let (gpus, vram_targets, gpu_detection, gpu_detection_reason) =
-        detect_gpus_at(std::path::Path::new("/sys/class/drm"), allow_synthetic);
+    let mem_mb = detect_mem_mb();
+    let (gpus, vram_targets, gpu_detection, gpu_detection_reason) = detect_gpus_at(
+        std::path::Path::new("/sys/class/drm"),
+        allow_synthetic,
+        mem_mb,
+    );
     SystemCapacity {
         host: HostCapacity {
             cpu_cores: detect_cpu_cores(),
-            mem_mb: detect_mem_mb(),
+            mem_mb,
             storage: Some(detect_storage()),
             cpu_model: detect_cpu_model(),
         },
@@ -471,6 +475,7 @@ fn detect_mem_mb() -> i32 {
 fn detect_gpus_at(
     root: &std::path::Path,
     allow_synthetic: bool,
+    mem_mb: i32,
 ) -> (Vec<GpuCapacity>, Vec<VramTarget>, String, Option<String>) {
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
@@ -522,7 +527,12 @@ fn detect_gpus_at(
         };
 
         let model = read_model(&device_path, vendor);
-        let Some(vram_mb_total) = read_vram_mb(&device_path, vendor) else {
+        let vram_mb_total = if vendor == "intel" {
+            read_intel_memory_mb(card_path, mem_mb)
+        } else {
+            read_vram_mb(&device_path, vendor)
+        };
+        let Some(vram_mb_total) = vram_mb_total else {
             tracing::warn!(
                 token = "gpu-omitted-no-vram",vendor, path = %device_path.display(), "GPU omitted: VRAM capacity unavailable");
             continue;
@@ -912,6 +922,70 @@ fn parse_pci_ids(db: &str, vendor_id: &str, device_id: &str) -> Option<String> {
     None
 }
 
+/// Intel local-memory sysfs is optional (and driver-dependent). An iGPU has no
+/// dedicated VRAM: budget half of host RAM for admission, as an estimate, never a
+/// free-memory reading. Keep the remaining half for the OS and session processes.
+/// This does not prove encoder support; readiness still owns that decision.
+fn read_intel_memory_mb(card_path: &std::path::Path, mem_mb: i32) -> Option<i32> {
+    // i915 exposes this on the DRM card, NOT on its PCI `device` directory.
+    let local = read_optional_memory_bytes(&card_path.join("lmem_total_bytes"))?;
+    if local > 0 {
+        return positive_memory_mb(local);
+    }
+
+    // Where xe exposes per-tile VRAM, count every tile, not just tile0. Missing
+    // files mean this ABI is unavailable; malformed/unreadable data fails closed.
+    let mut local = 0_u64;
+    let mut missing = false;
+    for entry in std::fs::read_dir(card_path.join("device")).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name
+            .strip_prefix("tile")
+            .is_some_and(|n| !n.is_empty() && n.parse::<u32>().is_ok())
+        {
+            let bytes = read_optional_memory_bytes(&entry.path().join("physical_vram_size_bytes"))?;
+            missing |= bytes == 0;
+            local = local.checked_add(bytes)?;
+        }
+    }
+    if local > 0 {
+        return if missing {
+            None
+        } else {
+            positive_memory_mb(local)
+        };
+    }
+
+    let budget = mem_mb / 2;
+    if budget <= 0 {
+        return None;
+    }
+    tracing::info!(
+        token = "intel-shared-memory-capacity",
+        path = %card_path.display(),
+        host_mem_mb = mem_mb,
+        budget_mb = budget,
+        "Intel local-memory capacity unavailable; using estimated shared-memory budget"
+    );
+    Some(budget)
+}
+
+/// Absent sysfs attributes are optional; corrupt or unreadable ones are not a
+/// reason to advertise a potentially larger shared-memory estimate.
+fn read_optional_memory_bytes(path: &std::path::Path) -> Option<u64> {
+    match std::fs::read_to_string(path) {
+        Ok(value) => value.trim().parse().ok(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(0),
+        Err(_) => None,
+    }
+}
+
+fn positive_memory_mb(bytes: u64) -> Option<i32> {
+    i32::try_from(bytes / 1024 / 1024).ok().filter(|mb| *mb > 0)
+}
+
 fn read_vram_mb(device_path: &std::path::Path, vendor: &str) -> Option<i32> {
     if vendor == "amd" {
         let bytes: u64 = std::fs::read_to_string(device_path.join("mem_info_vram_total"))
@@ -1101,6 +1175,7 @@ mod tests {
         let (gpus, vram_targets, status, reason) = detect_gpus_at(
             std::path::Path::new("/definitely/not/a/drm/inventory"),
             false,
+            16384,
         );
         assert!(gpus.is_empty());
         assert!(vram_targets.is_empty());
@@ -1111,7 +1186,7 @@ mod tests {
     #[test]
     fn empty_drm_inventory_is_unavailable() {
         let dir = tempfile::tempdir().unwrap();
-        let (gpus, vram_targets, status, _) = detect_gpus_at(dir.path(), false);
+        let (gpus, vram_targets, status, _) = detect_gpus_at(dir.path(), false, 16384);
         assert!(gpus.is_empty());
         assert!(vram_targets.is_empty());
         assert_eq!(status, "unavailable");
@@ -1120,7 +1195,7 @@ mod tests {
     #[test]
     fn synthetic_capacity_requires_explicit_opt_in() {
         let dir = tempfile::tempdir().unwrap();
-        let (gpus, vram_targets, status, reason) = detect_gpus_at(dir.path(), true);
+        let (gpus, vram_targets, status, reason) = detect_gpus_at(dir.path(), true, 16384);
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].vendor, "unknown");
         assert_eq!(vram_targets.len(), 1);
@@ -1458,6 +1533,148 @@ stepping\t: 2
         std::fs::write(device_dir.join("mem_info_vram_total"), "8589934592\n").unwrap();
     }
 
+    #[test]
+    fn intel_igpu_without_dedicated_vram_remains_in_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("card0/device");
+        std::fs::create_dir_all(&device).unwrap();
+        std::fs::write(device.join("vendor"), "0x8086\n").unwrap();
+        std::fs::write(device.join("device"), "0x4692\n").unwrap();
+
+        let (gpus, targets, status, reason) = detect_gpus_at(dir.path(), false, 16384);
+        assert_eq!(status, "ok", "Intel iGPU discarded: {reason:?}");
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].vendor, "intel");
+        assert_eq!(gpus[0].vram_mb_total, 8192);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].total_mb, gpus[0].vram_mb_total);
+    }
+
+    #[test]
+    fn intel_memory_sources_and_invalid_capacity() {
+        type MemoryCase = (
+            &'static str,
+            &'static [(&'static str, &'static str)],
+            i32,
+            Option<i32>,
+        );
+        let cases: &[MemoryCase] = &[
+            ("shared", &[], 16384, Some(8192)),
+            ("no host memory", &[], 0, None),
+            ("invalid host memory", &[], -4096, None),
+            (
+                "i915 local",
+                &[("lmem_total_bytes", "4294967296\n")],
+                16384,
+                Some(4096),
+            ),
+            (
+                "i915 zero means shared",
+                &[("lmem_total_bytes", "0")],
+                16384,
+                Some(8192),
+            ),
+            (
+                "xe local",
+                &[("device/tile0/physical_vram_size_bytes", "6442450944")],
+                16384,
+                Some(6144),
+            ),
+            (
+                "xe multiple tiles",
+                &[
+                    ("device/tile0/physical_vram_size_bytes", "4294967296"),
+                    ("device/tile1/physical_vram_size_bytes", "4294967296"),
+                ],
+                16384,
+                Some(8192),
+            ),
+            (
+                "local needs no host memory",
+                &[("lmem_total_bytes", "4294967296")],
+                0,
+                Some(4096),
+            ),
+            ("corrupt local", &[("lmem_total_bytes", "bad")], 16384, None),
+            ("negative local", &[("lmem_total_bytes", "-1")], 16384, None),
+            ("sub MiB local", &[("lmem_total_bytes", "1")], 16384, None),
+            (
+                "overflow local",
+                &[("lmem_total_bytes", "18446744073709551615")],
+                16384,
+                None,
+            ),
+            (
+                "corrupt xe",
+                &[("device/tile0/physical_vram_size_bytes", "bad")],
+                16384,
+                None,
+            ),
+            (
+                "incomplete xe",
+                &[
+                    ("device/tile0/physical_vram_size_bytes", "4294967296"),
+                    ("device/tile1/other", "0"),
+                ],
+                16384,
+                None,
+            ),
+        ];
+        for (name, files, mem_mb, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let card = dir.path().join("card0");
+            std::fs::create_dir_all(card.join("device")).unwrap();
+            std::fs::write(card.join("device/vendor"), "0x8086").unwrap();
+            for (path, value) in *files {
+                let path = card.join(path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, value).unwrap();
+            }
+            let (gpus, targets, status, _) = detect_gpus_at(dir.path(), false, *mem_mb);
+            assert_eq!(gpus.first().map(|g| g.vram_mb_total), *expected, "{name}");
+            assert_eq!(
+                status,
+                if expected.is_some() {
+                    "ok"
+                } else {
+                    "unavailable"
+                },
+                "{name}"
+            );
+            assert_eq!(targets.len(), gpus.len(), "{name}");
+        }
+    }
+
+    #[test]
+    fn intel_detection_preserves_render_node_and_other_vendors() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_amd_card_with_render_node(dir.path(), "card0", "renderD128", "0000:00:02.0");
+        let device = dir.path().join("card0/device");
+        std::fs::write(device.join("vendor"), "0x8086").unwrap();
+        std::fs::remove_file(device.join("mem_info_vram_total")).unwrap();
+        fake_amd_card(dir.path(), "card1");
+        let (gpus, targets, status, _) = detect_gpus_at(dir.path(), false, 8192);
+        assert_eq!(status, "ok");
+        assert_eq!(gpus.len(), 2);
+        assert_eq!(gpus[0].vendor, "intel");
+        assert_eq!(gpus[0].vram_mb_total, 4096);
+        assert_eq!(
+            gpus[0].render_node.as_deref(),
+            Some("/dev/dri/by-path/pci-0000:00:02.0-render")
+        );
+        assert_eq!(gpus[0].device_path.as_deref(), Some("/dev/dri/renderD128"));
+        assert_eq!(gpus[1].vendor, "amd");
+        assert_eq!(gpus[1].vram_mb_total, 8192);
+        for (gpu, target) in gpus.iter().zip(&targets) {
+            assert_eq!(gpu.index, target.index);
+            assert_eq!(gpu.vram_mb_total, target.total_mb);
+        }
+        // An estimate must not masquerade as measured live free VRAM.
+        let samples = crate::vram::sample(&targets[..1]);
+        assert_eq!(samples[0].free_mb, None);
+        assert_eq!(samples[0].used_mb, None);
+    }
+
     /// A `VramTarget` per detected GPU, same index and order as `gpus`, without changing
     /// `GpuCapacity`'s wire shape.
     #[test]
@@ -1467,7 +1684,7 @@ stepping\t: 2
         std::fs::create_dir_all(&drm_root).unwrap();
         fake_amd_card(&drm_root, "card0");
 
-        let (gpus, vram_targets, status, _) = detect_gpus_at(&drm_root, false);
+        let (gpus, vram_targets, status, _) = detect_gpus_at(&drm_root, false, 16384);
         assert_eq!(status, "ok");
         assert_eq!(gpus.len(), 1);
         assert_eq!(vram_targets.len(), 1);
@@ -1509,7 +1726,7 @@ stepping\t: 2
 
         // Non-vulkan host: the knob is inert off the vulkan path.
         std::env::set_var("QUASAR_VULKAN_MAX_SESSIONS", "5");
-        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false);
+        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384);
         assert_eq!(gpus.len(), 1);
         assert_eq!(
             gpus[0].encode_slots_total, 2,
@@ -1519,14 +1736,14 @@ stepping\t: 2
         // Vulkan host honors the knob.
         std::env::set_var("QUASAR_ENCODER", "vulkan");
         std::env::set_var("QUASAR_VULKAN_MAX_SESSIONS", "5");
-        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false);
+        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384);
         assert_eq!(
             gpus[0].encode_slots_total, 5,
             "vulkan host honors QUASAR_VULKAN_MAX_SESSIONS"
         );
 
         std::env::remove_var("QUASAR_VULKAN_MAX_SESSIONS");
-        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false);
+        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384);
         assert_eq!(
             gpus[0].encode_slots_total, 2,
             "vulkan host with the knob unset defaults to 2"
@@ -1535,7 +1752,7 @@ stepping\t: 2
         // Malformed or non-positive values must never advertise a zero or negative capacity.
         for bad in ["0", "-1", "not-a-number", ""] {
             std::env::set_var("QUASAR_VULKAN_MAX_SESSIONS", bad);
-            let (gpus, _, _, _) = detect_gpus_at(&drm_root, false);
+            let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384);
             assert_eq!(
                 gpus[0].encode_slots_total, 2,
                 "invalid QUASAR_VULKAN_MAX_SESSIONS={bad:?} falls back to default 2"
