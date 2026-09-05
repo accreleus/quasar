@@ -60,6 +60,9 @@ type fleetHarness struct {
 	// What this control plane reports it is on: commitA is "behind the
 	// release", commitB is "already booted on it".
 	cpCommit string
+	// How this control plane got its own image; a source-built one is never
+	// offered a registry image.
+	cpInstallMode string
 }
 
 // newFleetHarness wires the four fleet endpoints behind the real admin chain.
@@ -74,7 +77,7 @@ func newFleetHarness(t *testing.T, cpCommit string, drivers interface {
 	ctx := context.Background()
 	store := NewStore(pool)
 
-	h := &fleetHarness{pool: pool, store: store, cpCommit: cpCommit}
+	h := &fleetHarness{pool: pool, store: store, cpCommit: cpCommit, cpInstallMode: InstallRegistry}
 	h.release = seedRelease(t, store, commitB, buildinfo.Get().SchemaVersion)
 	h.hostID = seedHost(t, pool, "gpu-fleet-01", commitA, "online")
 
@@ -96,17 +99,22 @@ func newFleetHarness(t *testing.T, cpCommit string, drivers interface {
 			return View{}, err
 		}
 		return PlanRelease(PlanInputs{
-			Channel:        ChannelStable,
-			ControlPlane:   cp(h.cpCommit, buildinfo.Get().SchemaVersion),
-			Hosts:          hosts,
-			Releases:       releases,
-			OpenAttempts:   open,
-			ActiveRun:      run,
-			UpdaterPresent: true,
+			Channel:                 ChannelStable,
+			ControlPlane:            cp(h.cpCommit, buildinfo.Get().SchemaVersion),
+			Hosts:                   hosts,
+			Releases:                releases,
+			OpenAttempts:            open,
+			ActiveRun:               run,
+			UpdaterPresent:          true,
+			ControlPlaneInstallMode: nilIfEmpty(h.cpInstallMode),
 		}), nil
 	}
 
-	h.fleet = NewFleetRunner(store, drivers, drivers, ManifestOrEdge{}, view, testLogger())
+	noCordons := FleetCordons{
+		Cordon:   func(context.Context, string) error { return nil },
+		Uncordon: func(context.Context, string) error { return nil },
+	}
+	h.fleet = NewFleetRunner(store, drivers, drivers, ManifestOrEdge{}, noCordons, view, testLogger())
 	h.fleet.PollWait = 5 * time.Millisecond
 	t.Cleanup(h.fleet.Close)
 
@@ -215,6 +223,34 @@ func TestFleetApplyIsAdminOnlyAndRefusesASecondRun(t *testing.T) {
 	}
 }
 
+// The live #117 failure: a source-built control plane was offered the registry
+// image, which starts as a different uid and cannot write its own state. Nothing
+// moves before the control plane, so the run must not start at all.
+func TestFleetApplyRefusesASourceBuiltControlPlane(t *testing.T) {
+	for _, tc := range []struct{ name, mode string }{
+		{"source-built", InstallSource},
+		{"install mode unknown", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newFleetHarness(t, commitA, parkedDrivers{})
+			h.cpInstallMode = tc.mode
+
+			code, raw := h.do(t, http.MethodPost, "/v1/admin/platform/apply", h.admin,
+				FleetApplyRequest{ReleaseID: h.release.ID})
+			if code != http.StatusConflict || errCode(t, raw) != CodeReleaseNotOffered {
+				t.Fatalf("POST apply = %d %s, want 409 release_not_offered", code, raw)
+			}
+			runs, err := h.store.ListRuns(context.Background(), 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(runs) != 0 {
+				t.Fatalf("runs = %+v, want none created", runs)
+			}
+		})
+	}
+}
+
 func TestFleetRunsHistoryAndCancel(t *testing.T) {
 	h := newFleetHarness(t, commitA, parkedDrivers{})
 	code, raw := h.do(t, http.MethodPost, "/v1/admin/platform/apply", h.admin,
@@ -264,8 +300,18 @@ func TestFleetRunsHistoryAndCancel(t *testing.T) {
 	if len(cancelled.Attempts) != 1 || cancelled.Attempts[0].State != AttemptCancelled {
 		t.Fatalf("attempts = %+v, want the unsent one cancelled", cancelled.Attempts)
 	}
-	// Idempotent while the run is still active.
-	if code, raw := h.do(t, http.MethodPost, "/v1/admin/platform/apply/runs/"+run.ID+"/cancel", h.admin, nil); code != http.StatusOK {
+	// Idempotent while the run is still active; once the run has stopped there
+	// is nothing left to stop, which is its own refusal.
+	current, err := h.store.Run(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, raw = h.do(t, http.MethodPost, "/v1/admin/platform/apply/runs/"+run.ID+"/cancel", h.admin, nil)
+	if TerminalRunState(current.State) {
+		if code != http.StatusConflict || errCode(t, raw) != CodeRunNotActive {
+			t.Fatalf("cancel of a finished run = %d %s, want 409 run_not_active", code, raw)
+		}
+	} else if code != http.StatusOK {
 		t.Fatalf("second cancel = %d %s, want a 200 no-op", code, raw)
 	}
 

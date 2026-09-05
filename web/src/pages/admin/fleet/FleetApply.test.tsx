@@ -249,6 +249,29 @@ describe("FleetRunPanel", () => {
     expect(screen.getByText("Pulling the image")).toBeInTheDocument();
   });
 
+  // A control-plane recreate ends every session on the instance, so its wait is
+  // fleet-wide and the panel must say so.
+  it("says the control-plane step is waiting on the whole fleet", () => {
+    renderPanel(
+      run({
+        current_target: "control_plane",
+        current_host_id: null,
+        attempts: [
+          attempt({
+            id: "cp",
+            target: "control_plane",
+            host_id: null,
+            node_name: null,
+            state: "waiting_sessions",
+            sessions_remaining: 3,
+          }),
+        ],
+      }),
+    );
+
+    expect(screen.getByText(/waiting on 3 sessions across the fleet/)).toBeInTheDocument();
+  });
+
   it("lists what it passed over, with the reason as a sentence", () => {
     renderPanel(
       run({ skipped: [{ host_id: "h4", node_name: "gpu-host-04", reason: "host_offline" }] }),

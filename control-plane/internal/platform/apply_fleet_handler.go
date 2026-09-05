@@ -114,6 +114,18 @@ func (h *ApplyHandler) handleFleetApply(w http.ResponseWriter, r *http.Request) 
 			"this release is not offered on this instance's channel")
 		return
 	}
+	// A run that cannot move the control plane must not start: ADR 0002 puts it
+	// first, so with it ineligible every host reads control_plane_not_first and
+	// the run would do nothing but fail. `up_to_date` is the one reason that is
+	// not a refusal — the run then goes straight to the hosts.
+	// Only the durable reasons refuse here: the two transient ones have their
+	// own, more specific codes below.
+	if reason := fleetTargetReason(view, nil); reason != "" &&
+		reason != ReasonUpToDate && reason != ReasonAttemptInFlight {
+		httpx.WriteError(w, http.StatusConflict, CodeReleaseNotOffered,
+			"this release cannot be applied to the control plane ("+reason+"), and nothing moves before it")
+		return
+	}
 	open, err := h.store.OpenAttempts(ctx)
 	if err != nil {
 		h.internal(w, "read open attempts", err)

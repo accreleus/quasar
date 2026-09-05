@@ -7925,7 +7925,7 @@ export interface components {
             state: components["schemas"]["ApplyAttemptState"];
             /** @description Non-null exactly when state is failed. */
             reason: components["schemas"]["ApplyFailureReason"] | null;
-            /** @description The N in "waiting on N sessions": the last observed non-terminal session count on this host while state is waiting_sessions. A CLIENT MUST SHOW IT IN A FORCE CONFIRMATION - force is the operator agreeing to end N live sessions, and a confirmation that does not name N is not informed consent. Advisory and last-observed, never a gate. Null for the control-plane target and once the attempt has been sent. */
+            /** @description The N in "waiting on N sessions": the last observed non-terminal session count while state is waiting_sessions - ON THIS HOST for a host target, and FLEET-WIDE for the control-plane target, because recreating the control plane drops every agent's connection and an agent stops its sessions when that connection drops. A CLIENT MUST SHOW IT IN A FORCE CONFIRMATION - force is the operator agreeing to end N live sessions, and a confirmation that does not name N is not informed consent. Advisory and last-observed, never a gate. Null once the attempt has been sent. */
             sessions_remaining: number | null;
             /** @description Skip the zero-sessions wait and stop what is running. The agent does no session logic on it: it records which decision the control plane made. */
             force: boolean;
@@ -7982,7 +7982,7 @@ export interface components {
              */
             release_id: string;
             /**
-             * @description Applies to every host target in this run. The control plane is never forced - it holds no sessions.
+             * @description Applies to EVERY target in this run, the control plane included: its recreate ends every session on the instance, so without force the control-plane step waits for the whole fleet to drain.
              * @default false
              */
             force: boolean;

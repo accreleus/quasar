@@ -113,13 +113,17 @@ function FleetApplyModal({
       </p>
       <p>
         The control plane updates first and restarts; this page will lose contact for about 20
-        seconds.
+        seconds. That restart ends every session on the instance, so the update waits for the
+        whole fleet to be empty before it starts.
       </p>
       <label className="rowflex">
         <input type="checkbox" checked={force} onChange={(e) => setForce(e.target.checked)} />
         <span>Update now — ends every live session on {hostCount(hosts)}</span>
       </label>
-      <p className="hint">Without this, each host waits for its sessions to end on their own.</p>
+      <p className="hint">
+        Without this, the update waits for every session on the instance to end on its own, and
+        then for each host's own sessions in turn.
+      </p>
     </Modal>
   );
 }
@@ -189,7 +193,26 @@ export function FleetRunPanel({
       header: "Target",
       render: (a) => (a.target === "control_plane" ? "Control plane" : (a.node_name ?? "gone")),
     },
-    { key: "state", header: "State", render: (a) => <AttemptProgress attempt={a} /> },
+    {
+      key: "state",
+      header: "State",
+      // The control-plane step waits for the WHOLE fleet: its recreate drops
+      // every agent connection, and an agent stops its sessions when that drops.
+      render: (a) =>
+        a.target === "control_plane" && a.state === "waiting_sessions" ? (
+          <span>
+            <Chip variant="info">Waiting for sessions to end</Chip>{" "}
+            {a.sessions_remaining != null && (
+              <span className="muted">
+                waiting on {a.sessions_remaining} session
+                {a.sessions_remaining === 1 ? "" : "s"} across the fleet
+              </span>
+            )}
+          </span>
+        ) : (
+          <AttemptProgress attempt={a} />
+        ),
+    },
   ];
 
   return (

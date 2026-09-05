@@ -31,10 +31,12 @@ func (f *fakeStore) AttemptRequestID(_ context.Context, attemptID string) (strin
 
 // fakeUpdater is the socket's four routes, minus everything an apply does.
 type fakeUpdater struct {
-	mu       sync.Mutex
-	accepted []updater.ApplyRequest
-	result   *updater.Result
-	reject   *updaterError
+	mu        sync.Mutex
+	accepted  []updater.ApplyRequest
+	result    *updater.Result
+	reject    *updaterError
+	self      *UpdaterSelf
+	selfReads int
 }
 
 func (u *fakeUpdater) handler() http.Handler {
@@ -60,6 +62,15 @@ func (u *fakeUpdater) handler() http.Handler {
 			RequestID: req.RequestID,
 			Previous:  []updater.PreviousComponent{{Name: ComponentControlPlane, Digest: strPtr("sha256:old")}},
 		})
+	})
+	mux.HandleFunc("GET /v1/self", func(w http.ResponseWriter, _ *http.Request) {
+		u.mu.Lock()
+		self := u.self
+		u.mu.Unlock()
+		if self == nil {
+			self = &UpdaterSelf{}
+		}
+		_ = json.NewEncoder(w).Encode(self)
 	})
 	mux.HandleFunc("GET /v1/results/{request_id}", func(w http.ResponseWriter, _ *http.Request) {
 		u.mu.Lock()
@@ -242,8 +253,79 @@ func TestAdoptLeavesAnUnsentAttemptToTheRun(t *testing.T) {
 	}
 }
 
+// A source-built control plane must never be offered the registry image: the
+// two are different builds with different uids, and the swap leaves a container
+// that starts and then cannot write its own TLS volume.
+func TestClassifyImageRefMatchesTheAgentsRule(t *testing.T) {
+	cases := []struct{ ref, want string }{
+		{"ghcr.io/accreleus/quasar/quasar-control-plane:v0.9.0", InstallRegistry},
+		{"ghcr.io/accreleus/quasar/quasar-control-plane@sha256:" + hex64, InstallRegistry},
+		{"localhost:5000/quasar-control-plane:latest", InstallRegistry},
+		{"registry.example.com/quasar/quasar-control-plane:latest", InstallRegistry},
+		{"myorg/quasar-control-plane:latest", InstallSource},
+		{"quasar-control-plane:latest", InstallSource},
+		{"quasar-control-plane", InstallSource},
+		{"", ""},
+		{"   ", ""},
+	}
+	for _, c := range cases {
+		if got := ClassifyImageRef(c.ref); got != c.want {
+			t.Errorf("ClassifyImageRef(%q) = %q, want %q", c.ref, got, c.want)
+		}
+	}
+}
+
+func TestInstallModeComesFromTheUpdater(t *testing.T) {
+	tests := []struct {
+		name  string
+		self  *UpdaterSelf
+		want  string
+		known bool
+	}{
+		{"registry", &UpdaterSelf{Images: map[string]string{
+			ComponentControlPlane: "ghcr.io/accreleus/quasar/quasar-control-plane:v1"}}, InstallRegistry, true},
+		{"source", &UpdaterSelf{Images: map[string]string{
+			ComponentControlPlane: "quasar-control-plane:latest"}}, InstallSource, true},
+		// An updater that predates the `images` object says nothing, and
+		// nothing is never read as registry.
+		{"older updater", &UpdaterSelf{}, "", false},
+		{"unreachable", nil, "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			up := &fakeUpdater{self: tc.self}
+			self := testSelfApplier(t, newFakeStore(controlPlaneAttempt(AttemptQueued)), up)
+			got := self.InstallMode()
+			if !tc.known {
+				if got != nil {
+					t.Fatalf("install mode = %q, want unknown", *got)
+				}
+				return
+			}
+			if got == nil || *got != tc.want {
+				t.Fatalf("install mode = %v, want %q", got, tc.want)
+			}
+			// Read once and reused: the answer is cached for its TTL.
+			_ = self.InstallMode()
+			if up.selfReads != 1 {
+				t.Fatalf("the updater was read %d times, want the answer cached", up.selfReads)
+			}
+		})
+	}
+}
+
 // fakeUpdater doubles as an UpdaterAPI for the cases that need no socket.
 func (u *fakeUpdater) Present() bool { return true }
+
+func (u *fakeUpdater) Self(context.Context) (UpdaterSelf, error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.selfReads++
+	if u.self == nil {
+		return UpdaterSelf{}, ErrNoResult
+	}
+	return *u.self, nil
+}
 
 func (u *fakeUpdater) Apply(context.Context, updater.ApplyRequest) (updater.Accepted, error) {
 	return updater.Accepted{}, nil

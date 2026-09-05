@@ -170,6 +170,28 @@ describe("manualUpdatePath", () => {
     expect(source?.commands.map((c) => c.command)).toEqual(["deploy/redeploy.sh va v0.3.0"]);
   });
 
+  // A source-built control plane is refused an update from the console, so the
+  // row must show the recipe that does work.
+  it("the control-plane row gets the redeploy recipe when it is source-built or unknown", () => {
+    const source = manualUpdatePath({
+      reason: "install_mode_source",
+      kind: "control_plane",
+      gpuVendor: "AMD",
+      release: release(),
+    });
+    expect(source?.summary).toMatch(/control plane runs an image it built itself/i);
+    expect(source?.commands.map((c) => c.command)).toEqual(["deploy/redeploy.sh va v0.3.0"]);
+
+    const unknown = manualUpdatePath({
+      reason: "identity_unknown",
+      kind: "control_plane",
+      gpuVendor: "AMD",
+      release: release(),
+    });
+    expect(unknown?.summary).toMatch(/how this control plane was installed/i);
+    expect(unknown?.commands.map((c) => c.command)).toEqual(["deploy/redeploy.sh va v0.3.0"]);
+  });
+
   it("never interpolates anything from the environment: every path is deploy/-relative", () => {
     for (const reason of ["install_mode_source", "updater_absent", "identity_unknown"]) {
       const commands = commandsOf(reason) ?? "";

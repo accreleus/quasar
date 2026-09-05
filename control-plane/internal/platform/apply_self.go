@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
@@ -30,6 +32,10 @@ import (
 // Twin of the agent's release::DEFAULT_SOCKET and of the compose mount.
 const UpdaterSocketPath = "/run/quasar-updater/updater.sock"
 
+// DefaultInstallModeTTL bounds how stale this control plane's own install mode
+// may be. Seconds, not a boot-time read: the stack can be re-composed under it.
+const DefaultInstallModeTTL = 30 * time.Second
+
 // ConfiguredUpdaterSocket resolves the socket path; docs/configuration.md.
 func ConfiguredUpdaterSocket() string {
 	if v := os.Getenv("QUASAR_UPDATER_SOCKET"); v != "" {
@@ -45,8 +51,42 @@ type UpdaterAPI interface {
 	// plane. False makes the control-plane target ineligible (`updater_absent`)
 	// rather than an apply that fails halfway.
 	Present() bool
+	// Self is what the updater discovered about the stack it sits beside.
+	Self(ctx context.Context) (UpdaterSelf, error)
 	Apply(ctx context.Context, req updater.ApplyRequest) (updater.Accepted, error)
 	Result(ctx context.Context, requestID string) (updater.Result, error)
+}
+
+// UpdaterSelf is the sliver of `GET /v1/self` this package reads. Declared here
+// rather than imported so an older updater, whose answer carries no `images`,
+// decodes to "unknown" instead of failing.
+type UpdaterSelf struct {
+	// Component name → the effective image reference compose would use for its
+	// service, defaults included.
+	Images map[string]string `json:"images"`
+}
+
+// ClassifyImageRef is the Go twin of node-agent buildinfo::classify_image_ref:
+// registry when the reference names a registry host or pins a digest, source
+// when it is a bare local tag like `quasar-control-plane:latest`. "" when
+// nothing can be said.
+//
+// The host test is docker's own: the first path segment is a registry only if
+// it contains a `.` or a `:`, or is exactly `localhost`.
+func ClassifyImageRef(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return ""
+	}
+	// A digest pin can only have come from a registry (ADR 0001).
+	if strings.Contains(ref, "@sha256:") {
+		return InstallRegistry
+	}
+	first, _, hasSlash := strings.Cut(ref, "/")
+	if hasSlash && (first == "localhost" || strings.ContainsAny(first, ".:")) {
+		return InstallRegistry
+	}
+	return InstallSource
 }
 
 // UpdaterClient speaks the local socket. Its request body and result file are
@@ -127,6 +167,27 @@ func (c *UpdaterClient) Apply(ctx context.Context, req updater.ApplyRequest) (up
 	return out, nil
 }
 
+func (c *UpdaterClient) Self(ctx context.Context) (UpdaterSelf, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://updater/v1/self", nil)
+	if err != nil {
+		return UpdaterSelf{}, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return UpdaterSelf{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return UpdaterSelf{}, fmt.Errorf("updater answered %d: %s", resp.StatusCode, string(raw))
+	}
+	var out UpdaterSelf
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return UpdaterSelf{}, fmt.Errorf("decode updater self: %w", err)
+	}
+	return out, nil
+}
+
 // ErrNoResult is a request id the updater has written no result file for yet —
 // normal for the first seconds of an apply, and on boot before the executor
 // has re-stamped it.
@@ -179,23 +240,75 @@ type SelfApplier struct {
 	Identity     func() buildinfo.Identity
 	Deadline     time.Duration
 	PollInterval time.Duration
+	// How long a read install mode is reused. Short rather than cached at boot:
+	// the stack can be re-composed under a running control plane, and an
+	// install mode read once at start would then be a lie for its whole life.
+	InstallModeTTL time.Duration
+
+	mu             sync.Mutex
+	installMode    string
+	installModeAt  time.Time
+	installModeSet bool
 }
 
 // NewSelfApplier builds the control-plane applier with the contract's timings.
 func NewSelfApplier(store selfStore, up UpdaterAPI, log logger) *SelfApplier {
 	return &SelfApplier{
-		store:        store,
-		updater:      up,
-		log:          log,
-		Identity:     buildinfo.Get,
-		Deadline:     DefaultApplyDeadline,
-		PollInterval: DefaultApplyPoll,
+		store:          store,
+		updater:        up,
+		log:            log,
+		Identity:       buildinfo.Get,
+		Deadline:       DefaultApplyDeadline,
+		PollInterval:   DefaultApplyPoll,
+		InstallModeTTL: DefaultInstallModeTTL,
 	}
 }
 
 // UpdaterPresent reports whether this control plane could apply itself at all.
 func (s *SelfApplier) UpdaterPresent() bool {
 	return s.updater != nil && s.updater.Present()
+}
+
+// InstallMode is how THIS control plane got its image, learned from the updater
+// beside it: it reads the compose config, so a default like
+// `quasar-control-plane:latest` is seen as the source install it is. nil is
+// "nobody could say", which is never treated as registry.
+//
+// A source-built control plane must never be offered a registry image: the two
+// images are different builds with different uids, and replacing one with the
+// other leaves a container that starts and then cannot write its own TLS volume
+// — a crash-loop with no console left to fix it from.
+func (s *SelfApplier) InstallMode() *string {
+	s.mu.Lock()
+	if s.installModeSet && time.Since(s.installModeAt) < s.InstallModeTTL {
+		mode := s.installMode
+		s.mu.Unlock()
+		if mode == "" {
+			return nil
+		}
+		return &mode
+	}
+	s.mu.Unlock()
+
+	mode := ""
+	if s.updater != nil && s.updater.Present() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		self, err := s.updater.Self(ctx)
+		cancel()
+		if err != nil {
+			s.log.Warn("could not read this control plane's install mode from the updater", "err", err)
+		} else {
+			mode = ClassifyImageRef(self.Images[ComponentControlPlane])
+		}
+	}
+
+	s.mu.Lock()
+	s.installMode, s.installModeAt, s.installModeSet = mode, time.Now(), true
+	s.mu.Unlock()
+	if mode == "" {
+		return nil
+	}
+	return &mode
 }
 
 // Apply drives one control-plane attempt to terminal — or, in the normal case,

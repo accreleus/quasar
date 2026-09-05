@@ -435,27 +435,42 @@ only" button.
 
 What happens, step by step:
 
-1. **The control plane updates itself** through the updater sitting beside it,
+1. **The whole fleet drains first.** Recreating the control plane drops every
+   agent's connection to it, and an agent stops its sessions the moment that
+   connection drops — so a control-plane update ends **every session on the
+   instance**, not none. The run cordons every host and sits in
+   **waiting_sessions**, showing the instance-wide count, until it reaches
+   zero. Force skips the wait and ends them. The cordons are released when the
+   run finishes, and a host an admin had already cordoned stays cordoned.
+2. **The control plane updates itself** through the updater sitting beside it,
    over that host's local socket — never through a node agent. It pulls, then
    recreates its own container, so **the API and the console go away for
-   roughly twenty seconds.** Running sessions are untouched: the media path is
-   agent-to-browser and does not pass through the control plane.
-2. **The new build reports the outcome.** The control plane cannot report its
+   roughly twenty seconds.**
+3. **The new build reports the outcome.** The control plane cannot report its
    own success — carrying the update out kills the process holding the request
    — so the request id is written down before the socket call and the binary
    that boots reads it back. Its own liveness on the release's commit is the
    evidence; the run and its cancel flag are in Postgres, so the run resumes
    on the new build.
-3. **Each host follows, in the fleet list's order.** Each is cordoned, drained,
+4. **Each host follows, in the fleet list's order.** Each is cordoned, drained,
    updated and uncordoned exactly as a per-host Apply is (above).
-4. **The run stops at the first target that fails**, and says which. Targets
+5. **The run stops at the first target that fails**, and says which. Targets
    behind it are already updated; targets ahead of it were never started. There
    is no partial state to interpret: the per-target list is the outcome.
 
-**Force** applies to every host in the run, and the confirmation names how many
-hosts it will take sessions from. Without it each host waits for its own
-sessions to end, which means a run can sit on a busy host for as long as
+**Force** applies to every target in the run, the control plane included, and
+the confirmation names how many hosts it will take sessions from. Without it
+the run waits for the instance to empty before the control-plane step, and then
+for each host's own sessions in turn, which means a run can sit for as long as
 someone is playing.
+
+**A source-built control plane is not offered an update from here.** The
+registry image is a different build with a different uid, and swapping one for
+the other leaves a control plane that starts and then cannot write its own
+state — a crash-loop with no console left to fix it from. The control plane
+learns its own install mode from the updater beside it; a source install, or
+one it cannot determine, makes the target ineligible and refuses the run
+outright, since nothing moves before the control plane.
 
 **Hosts that cannot take the release are skipped, not failed** — an offline
 host, a source-built host, one with no updater. The run lists them under "Not

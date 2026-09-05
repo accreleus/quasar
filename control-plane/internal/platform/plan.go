@@ -40,6 +40,11 @@ type PlanInputs struct {
 	// host's is reported by its agent; this one is a local fact, so the caller
 	// reads it and hands it in.
 	UpdaterPresent bool
+	// ControlPlaneInstallMode is how THIS control plane got its image, read
+	// from its own updater. nil is "nobody could say" and is never treated as
+	// registry: a source-built control plane offered a registry image is a
+	// crash-loop with no console left to fix it from.
+	ControlPlaneInstallMode *string
 
 	// CheckedAt is when detection last SUCCEEDED. Orthogonal to LastError: a
 	// stale CheckedAt with an error is the normal "failing since then".
@@ -57,7 +62,11 @@ func PlanRelease(in PlanInputs) View {
 	available := offerable(in.Releases, channel, in.ControlPlane)
 	hosts := withDerivedIdentity(in.Hosts)
 	open := openTargets(in.OpenAttempts)
-	fleet := fleetState{runActive: in.ActiveRun != nil, updaterPresent: in.UpdaterPresent}
+	fleet := fleetState{
+		runActive:      in.ActiveRun != nil,
+		updaterPresent: in.UpdaterPresent,
+		installMode:    in.ControlPlaneInstallMode,
+	}
 
 	v := View{
 		Channel:    channel,
@@ -98,6 +107,8 @@ func openTargets(attempts []Attempt) map[string]bool {
 type fleetState struct {
 	runActive      bool
 	updaterPresent bool
+	// This control plane's own install mode; nil is unknown.
+	installMode *string
 }
 
 // activeApply is the view's `active_apply`: null when nothing is in flight.
@@ -203,9 +214,21 @@ func controlPlaneReason(newest *Release, cp buildinfo.Identity, attemptOpen bool
 	if commitsMatch(*cp.SourceCommit, newest.SourceCommit) {
 		return ReasonUpToDate
 	}
-	// Nothing beside this control plane could carry an apply out.
+	// Nothing beside this control plane could carry an apply out — and with no
+	// updater there is nothing to learn the install mode from either, so this
+	// answer comes first even though the contract's order lists it later.
 	if !fleet.updaterPresent {
 		return ReasonUpdaterAbsent
+	}
+	// Its image was never pulled, so there is nothing to re-pin, and the
+	// registry image is a DIFFERENT build: replacing a source-built control
+	// plane with it leaves a container that starts and then cannot write its
+	// own state.
+	if fleet.installMode == nil {
+		return ReasonIdentityUnknown
+	}
+	if *fleet.installMode == InstallSource {
+		return ReasonInstallModeSource
 	}
 	// The two most transient facts on the list, so they come last (amendment 2).
 	if attemptOpen {
