@@ -581,6 +581,27 @@ func (s *Store) LastTerminalRun(ctx context.Context, jobID, hostID string) (Run,
 	return r, true, nil
 }
 
+// LastRunInState returns the most recently FINISHED run for (job, target) that
+// ended in state. The release view reads it twice — the last SUCCEEDED run is
+// checked_at, the last FAILED one is last_error — which "the last run" alone
+// cannot answer, the two being independent facts.
+func (s *Store) LastRunInState(ctx context.Context, jobID, hostID string, state State) (Run, bool, error) {
+	r, err := scanRun(s.pool.QueryRow(ctx, `
+		SELECT`+runColumns+` FROM job_runs
+		WHERE job_id = $1
+		  AND COALESCE(host_id, '`+zeroUUID+`'::uuid) = COALESCE(NULLIF($2, '')::uuid, '`+zeroUUID+`'::uuid)
+		  AND state = $3
+		ORDER BY finished_at DESC NULLS LAST, created_at DESC
+		LIMIT 1`, jobID, hostID, string(state)))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Run{}, false, nil
+	}
+	if err != nil {
+		return Run{}, false, fmt.Errorf("last %s run %s: %w", state, jobID, err)
+	}
+	return r, true, nil
+}
+
 // ListRuns returns a job's run history, newest first.
 func (s *Store) ListRuns(ctx context.Context, jobID, hostID string, limit int) ([]Run, error) {
 	if limit < 1 || limit > 500 {

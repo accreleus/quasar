@@ -64,6 +64,9 @@ beforeEach(() => {
     next_cursor: null,
   } as never);
   mocked.listSecrets.mockResolvedValue({ items: [] } as never);
+  // The layout's two advisory banners each own a read; an automocked one
+  // resolves to undefined and takes the whole shell down.
+  mocked.getPlatformReleases.mockResolvedValue({ available: [] } as never);
 });
 
 function renderAdmin() {

@@ -10,6 +10,7 @@ import { ADMIN_NAV } from "./adminNav";
 import { FleetProvider, useFleetBadges, useFleetContext } from "../../lib/fleet/FleetContext";
 import { SetupResumeBanner } from "../setup/SetupResumeBanner";
 import { SecretStoreBanner } from "./SecretStoreBanner";
+import { ReleaseBanner } from "./ReleaseBanner";
 
 // #386: admin.css imports here, not main.tsx, so it ships only in this lazy
 // chunk — non-admin users never download it.
@@ -52,6 +53,7 @@ function AdminConsoleShell() {
     >
       <SetupResumeBanner />
       <SecretStoreBanner />
+      <ReleaseBanner />
       <Outlet />
     </ConsoleShell>
   );

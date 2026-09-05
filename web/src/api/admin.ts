@@ -32,6 +32,8 @@ import type {
   SecretResponse,
   SecretsResponse,
   SettingsResponse,
+  PlatformReleaseView,
+  ReleaseChannel,
   RegistrationMode,
   StorageProvider,
   InvitesResponse,
@@ -156,6 +158,10 @@ export function updateSettings(
     mic_capture_enabled?: boolean;
     /** `QUASAR_ALLOWED_ORIGINS` overrides this when set. */
     allowed_origins?: string[];
+    release_channel?: ReleaseChannel;
+    /** Rejected with 400 unless it is a git ref name: 1-255 characters, no
+     *  whitespace, no "..", no leading "-". */
+    release_edge_branch?: string;
   },
 ): Promise<SettingsResponse> {
   return apiFetch<SettingsResponse>("/admin/settings", {
@@ -886,6 +892,15 @@ export function runJobNow(
     body: req,
     token,
   });
+}
+
+/** The whole admin Releases page in one read. READ ONLY — it never triggers
+ *  detection; "Check now" is runJobNow("platform.release_detect"). */
+export function getPlatformReleases(
+  token: string,
+  signal?: AbortSignal,
+): Promise<PlatformReleaseView> {
+  return apiFetch<PlatformReleaseView>("/admin/platform/releases", { token, signal });
 }
 
 /** Bounded, newest first. */

@@ -97,6 +97,9 @@ const adminPages = {
   Jobs: lazyPage(() =>
     import("./pages/admin/fleet/JobsTab").then((m) => ({ default: m.JobsTab }))
   ),
+  Releases: lazyPage(() =>
+    import("./pages/admin/fleet/ReleasesTab").then((m) => ({ default: m.ReleasesTab }))
+  ),
   AppEditor: lazyPage(() =>
     import("./pages/admin/AdminApps/AppEditorPage").then((m) => ({
       default: m.AppEditorPage,
@@ -322,6 +325,14 @@ export function App() {
                 element={
                   <Suspended>
                     <adminPages.Jobs />
+                  </Suspended>
+                }
+              />
+              <Route
+                path="releases"
+                element={
+                  <Suspended>
+                    <adminPages.Releases />
                   </Suspended>
                 }
               />

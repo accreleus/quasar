@@ -163,7 +163,7 @@ describe("section containers", () => {
   it("renders the section tabs on a tab route", async () => {
     renderAt("/admin/fleet/storage");
     const tabs = await screen.findAllByRole("tab");
-    expect(tabs.map((t) => t.textContent)).toEqual(["Hosts", "Storage", "Jobs"]);
+    expect(tabs.map((t) => t.textContent)).toEqual(["Hosts", "Storage", "Jobs", "Releases"]);
     expect(screen.getByRole("tab", { name: "Storage" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByRole("tab", { name: "Hosts" })).toHaveAttribute("aria-selected", "false");
     expect(screen.getAllByRole("heading", { name: "Fleet", level: 1 })).toHaveLength(1);

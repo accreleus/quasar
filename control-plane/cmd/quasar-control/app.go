@@ -155,6 +155,44 @@ func unmanagedDescription(desc, file, detail string) string {
 	return fmt.Sprintf("%s Hard-coded in %s (%s).", desc, file, detail)
 }
 
+func ptrTimeOfDay(t jobs.TimeOfDay) *jobs.TimeOfDay { return &t }
+
+// platformDeps adapts three stores onto the release view's reads. It lives in
+// main for the reason registrationGate does: internal/platform importing
+// settings and jobs (both of which sit above it) would be a cycle.
+//
+// checked_at is the last SUCCEEDED detection run and last_error the last FAILED
+// one, cleared once a later run succeeded — the two are read independently
+// because "failing since then" is a stale checked_at WITH an error, not one or
+// the other.
+func platformDeps(store *platform.Store, set *settings.Store, jobStore *jobs.Store) *platform.Deps {
+	return &platform.Deps{
+		Channel:  set.ReleaseChannel,
+		Hosts:    store.Hosts,
+		Releases: store.Releases,
+		Detection: func(ctx context.Context) (platform.DetectionStatus, error) {
+			var st platform.DetectionStatus
+			succeeded, hadSuccess, err := jobStore.LastRunInState(ctx, platform.DetectJobID, "", jobs.StateSucceeded)
+			if err != nil {
+				return st, err
+			}
+			if hadSuccess {
+				st.CheckedAt = succeeded.FinishedAt
+			}
+			failed, hadFailure, err := jobStore.LastRunInState(ctx, platform.DetectJobID, "", jobs.StateFailed)
+			if err != nil {
+				return st, err
+			}
+			if hadFailure && failed.Error != "" &&
+				(st.CheckedAt == nil || failed.FinishedAt == nil || failed.FinishedAt.After(*st.CheckedAt)) {
+				msg := failed.Error
+				st.LastError = &msg
+			}
+			return st, nil
+		},
+	}
+}
+
 // NewServices wires every subsystem; call Stop() for the goroutines it starts.
 // certManager (internal/access) must be built by main.go before this call: a bad
 // cert/key on disk must be fatal before any listener or goroutine exists. Nil when
@@ -745,6 +783,52 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		Default: jobs.Schedule{Kind: jobs.KindInterval, IntervalSecs: 6 * 3600},
 	})
 
+	// Platform-release detection (#104/#110). Weekly, in a one-hour window that
+	// opens 02:00 Monday UTC: a self-hosted instance learns about a release on
+	// the operator's quiet hour, not on ours. "Check now" is this job's run-now
+	// action and bypasses the window, as it does for every job.
+	platformStore := platform.NewStore(pool)
+	releaseRepo := platform.ConfiguredReleaseRepo()
+	var releaseDetector *platform.Detector
+	if releaseRepo != "" {
+		releaseClient, err := platform.NewReleaseClient()
+		if err != nil {
+			janitorStop()
+			return nil, fmt.Errorf("platform release egress client: %w", err)
+		}
+		releaseDetector = platform.NewDetector(
+			platform.NewGitHubSource(releaseClient, platform.ConfiguredReleaseAPI(), releaseRepo,
+				os.Getenv("QUASAR_PLATFORM_RELEASE_TOKEN")),
+			platformStore, log)
+	}
+	jobRegistry.MustRegister(jobs.Definition{
+		ID:          platform.DetectJobID,
+		Name:        "Platform release detection",
+		Description: "Reads the configured repository's releases and records new platform releases and their manifests.",
+		Plane:       jobs.PlaneControl,
+		Scope:       jobs.ScopeInstance,
+		Managed:     true,
+		Default: jobs.Schedule{
+			Kind:         jobs.KindInterval,
+			IntervalSecs: 7 * 24 * 3600,
+			WindowStart:  ptrTimeOfDay(jobs.MustTimeOfDay("02:00")),
+			WindowEnd:    ptrTimeOfDay(jobs.MustTimeOfDay("03:00")),
+			WindowDays:   []int{int(time.Monday)},
+			Timezone:     "UTC",
+		},
+		EnvOverride: "QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL",
+		Run: func(ctx context.Context, rc jobs.RunContext) (jobs.Outcome, error) {
+			if releaseDetector == nil {
+				return jobs.Skipped("no platform release repository configured (QUASAR_PLATFORM_RELEASE_REPO)"), nil
+			}
+			rep, err := releaseDetector.Detect(ctx)
+			if err != nil {
+				return jobs.Outcome{}, err
+			}
+			return jobs.Succeeded(rep.Summary()), nil
+		},
+	})
+
 	// Unmanaged legacy jobs (§8.6). Never claimed, never scheduled, "run now"
 	// refuses with job_unmanaged (protocol/openapi.yaml unmanaged_note,
 	// control-api.md "Unmanaged jobs are listed on purpose").
@@ -819,7 +903,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		invitesHandler:   invitesHandler,
 		enrollHandler:    enrollHandler,
 		consoleHandler:   consoleHandler,
-		platformHandler:  platform.NewHandler(),
+		platformHandler:  platform.NewHandler(platformDeps(platformStore, settingsStore, jobStore), log),
 		auditHandler:     auditHandler,
 		artworkHandler:   artworkHandler,
 		secretsHandler:   secretsHandler,
