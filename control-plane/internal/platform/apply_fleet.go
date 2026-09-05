@@ -39,6 +39,9 @@ type fleetStore interface {
 	Attempt(ctx context.Context, attemptID string) (Attempt, error)
 	FailAttempt(ctx context.Context, attemptID, reason, output string) error
 	Hosts(ctx context.Context) ([]HostIdentity, error)
+	HostStatus(ctx context.Context, hostID string) (string, error)
+	SetCordonedHosts(ctx context.Context, runID string, states []HostCordon) error
+	CordonedHosts(ctx context.Context, runID string) ([]HostCordon, error)
 	FleetNonTerminalSessions(ctx context.Context) (int, error)
 	CreateHostAttempt(ctx context.Context, in NewHostAttempt) (Attempt, error)
 	CreateControlPlaneAttempt(ctx context.Context, in NewControlPlaneAttempt) (Attempt, error)
@@ -55,6 +58,20 @@ type FleetCordons struct {
 	Cordon   func(ctx context.Context, hostID string) error
 	Uncordon func(ctx context.Context, hostID string) error
 }
+
+// HostCordon is what the run found for one host before it cordoned, persisted
+// on the run row (migration 0076).
+type HostCordon struct {
+	HostID string `json:"host_id"`
+	// The host was ALREADY out of scheduling, so the run must leave it that way.
+	WasCordoned bool `json:"was_cordoned"`
+}
+
+// DefaultAdoptSettle is how long a re-adopted run waits before its first host.
+// Agents re-register within a couple of seconds of the new control plane
+// listening, and a run that moves first sees a fleet that is briefly all
+// disconnected.
+const DefaultAdoptSettle = 10 * time.Second
 
 // hostDriver is the per-host attempt machine (apply_runner.go).
 type hostDriver interface {
@@ -128,18 +145,17 @@ type FleetRunner struct {
 	PollWait time.Duration
 	// The control-plane drain's ceiling, from the attempt's created_at.
 	Deadline time.Duration
+	// How long a re-adopted run waits for its agents to come back.
+	AdoptSettle time.Duration
 
 	mu sync.Mutex
 	// run id → cancel, bounded at one by the active-run index.
 	running map[string]context.CancelFunc
+	// run ids this process re-adopted rather than started, which is what the
+	// settle window keys on.
+	adopted map[string]bool
 	// run id → hosts passed over. No column holds these (apply.go says why).
 	skips map[string][]RunSkip
-	// run id → host id → the host was ALREADY cordoned when the run found it,
-	// so the run must leave it that way. In memory, like the per-host machine's
-	// equivalent: after the restart the control-plane step causes, the run
-	// re-reads what it finds, and agents have re-registered themselves online by
-	// then, so what it re-reads is very nearly the truth.
-	cordoned map[string]map[string]bool
 
 	baseCtx context.Context
 	stop    context.CancelFunc
@@ -153,13 +169,14 @@ func NewFleetRunner(store fleetStore, hosts hostDriver, self selfDriver, resolve
 	return &FleetRunner{
 		store: store, hosts: hosts, self: self, resolve: resolve, cordons: cordons,
 		view: view, log: log,
-		PollWait: DefaultApplyPoll,
-		Deadline: DefaultApplyDeadline,
-		running:  make(map[string]context.CancelFunc),
-		skips:    make(map[string][]RunSkip),
-		cordoned: make(map[string]map[string]bool),
-		baseCtx:  ctx,
-		stop:     cancel,
+		PollWait:    DefaultApplyPoll,
+		Deadline:    DefaultApplyDeadline,
+		AdoptSettle: DefaultAdoptSettle,
+		running:     make(map[string]context.CancelFunc),
+		adopted:     make(map[string]bool),
+		skips:       make(map[string][]RunSkip),
+		baseCtx:     ctx,
+		stop:        cancel,
 	}
 }
 
@@ -201,7 +218,10 @@ func (f *FleetRunner) Adopt(ctx context.Context) {
 		return
 	}
 	f.log.Warn("re-adopting a fleet apply left in flight by a restart",
-		"run_id", run.ID, "state", run.State, "current_target", run.CurrentTarget)
+		"run_id", run.ID, "state", run.State, "current_target", orEmpty(run.CurrentTarget))
+	f.mu.Lock()
+	f.adopted[run.ID] = true
+	f.mu.Unlock()
 	f.Start(*run)
 }
 
@@ -391,53 +411,73 @@ func (f *FleetRunner) prepareFleet(ctx context.Context, run ApplyRun, a Attempt)
 // remembering the ones it found already cordoned. Nothing must land on a host
 // that is about to lose its agent.
 func (f *FleetRunner) cordonFleet(ctx context.Context, runID string) {
+	// Written BEFORE the first cordon and never overwritten: the run's own
+	// control-plane step restarts this process, and a re-read afterwards would
+	// record the run's own cordons as the operator's.
+	if existing, err := f.store.CordonedHosts(ctx, runID); err == nil && len(existing) > 0 {
+		return
+	}
 	hosts, err := f.store.Hosts(ctx)
 	if err != nil {
 		f.log.Error("fleet apply: could not read the host list to cordon it", "run_id", runID, "err", err)
 		return
 	}
-	states := make(map[string]bool, len(hosts))
+	states := make([]HostCordon, 0, len(hosts))
 	for _, h := range hosts {
-		if h.Status != "online" {
-			states[h.HostID] = true // an admin's cordon, restored rather than lifted
-			continue
-		}
-		if err := f.cordons.Cordon(ctx, h.HostID); err != nil {
-			f.log.Warn("fleet apply: could not cordon a host", "run_id", runID, "host_id", h.HostID, "err", err)
-			continue
-		}
-		states[h.HostID] = false
+		states = append(states, HostCordon{HostID: h.HostID, WasCordoned: h.Status != "online"})
 	}
-	f.mu.Lock()
-	f.cordoned[runID] = states
-	f.mu.Unlock()
+	if err := f.store.SetCordonedHosts(ctx, runID, states); err != nil {
+		// Cordoning without a record of what to undo is how a fleet is left out
+		// of scheduling with nothing left that knows to lift it.
+		f.log.Error("fleet apply: could not record the fleet's scheduling state; not cordoning",
+			"run_id", runID, "err", err)
+		return
+	}
+	for _, st := range states {
+		if st.WasCordoned {
+			continue // an admin's cordon, restored rather than lifted
+		}
+		if err := f.cordons.Cordon(ctx, st.HostID); err != nil {
+			f.log.Warn("fleet apply: could not cordon a host", "run_id", runID, "host_id", st.HostID, "err", err)
+		}
+	}
 }
 
 // restoreCordons puts every host back to the scheduling state the run found.
 // Runs on every terminal path, including a failed one: a fleet left draining by
 // a failed run would silently drop out of scheduling entirely.
 func (f *FleetRunner) restoreCordons(runID string) {
-	f.mu.Lock()
-	states := f.cordoned[runID]
-	delete(f.cordoned, runID)
-	f.mu.Unlock()
-	if len(states) == 0 {
-		return
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	for hostID, wasCordoned := range states {
-		if wasCordoned {
-			if err := f.cordons.Cordon(ctx, hostID); err != nil {
-				f.log.Warn("fleet apply: could not restore an admin cordon", "host_id", hostID, "err", err)
+	states, err := f.store.CordonedHosts(ctx, runID)
+	if err != nil {
+		f.log.Error("fleet apply: could not read what to restore; hosts may be left out of scheduling",
+			"run_id", runID, "err", err)
+		return
+	}
+	for _, st := range states {
+		if st.WasCordoned {
+			if err := f.cordons.Cordon(ctx, st.HostID); err != nil {
+				f.log.Warn("fleet apply: could not restore an admin cordon", "host_id", st.HostID, "err", err)
 			}
 			continue
 		}
-		if err := f.cordons.Uncordon(ctx, hostID); err != nil {
+		if err := f.cordons.Uncordon(ctx, st.HostID); err != nil {
 			// An offline host cannot be uncordoned; it returns online on its
 			// agent's reconnect.
 			f.log.Info("fleet apply: host not uncordoned (it will return online on its agent's reconnect)",
-				"host_id", hostID, "err", err)
+				"host_id", st.HostID, "err", err)
+		}
+	}
+	// Loud, because a fleet silently out of scheduling is the failure mode this
+	// whole path exists to avoid.
+	for _, st := range states {
+		if st.WasCordoned {
+			continue
+		}
+		if status, err := f.store.HostStatus(ctx, st.HostID); err == nil && status != "online" {
+			f.log.Error("fleet apply: a host this run cordoned is still out of scheduling; uncordon it by hand",
+				"run_id", runID, "host_id", st.HostID, "status", status)
 		}
 	}
 }
@@ -461,6 +501,23 @@ func (f *FleetRunner) hostPhase(ctx context.Context, run ApplyRun) bool {
 	for _, t := range view.Targets {
 		if t.Kind == TargetHost && t.HostID != nil {
 			order = append(order, t)
+		}
+	}
+
+	// A re-adopted run boots seconds after the control plane started listening,
+	// and its agents reconnect a beat later. Moving straight to the first host
+	// sends into a registry that is still empty.
+	f.mu.Lock()
+	adopted := f.adopted[run.ID]
+	delete(f.adopted, run.ID)
+	f.mu.Unlock()
+	if adopted && len(order) > 0 {
+		f.log.Info("fleet apply: letting the fleet reconnect before the first host",
+			"run_id", run.ID, "settle", f.AdoptSettle)
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(f.AdoptSettle):
 		}
 	}
 
@@ -533,7 +590,7 @@ func (f *FleetRunner) resumeHost(ctx context.Context, run ApplyRun, a Attempt) b
 		return false
 	default:
 		f.log.Warn("fleet apply stopped at a failed target",
-			"run_id", run.ID, "host_id", a.HostID, "reason", final.Reason)
+			"run_id", run.ID, "host_id", orEmpty(a.HostID), "reason", orEmpty(final.Reason))
 		f.finish(run.ID, RunFailed, "")
 		return false
 	}
@@ -667,6 +724,14 @@ func attemptForHost(attempts []Attempt, hostID string) *Attempt {
 		}
 	}
 	return nil
+}
+
+// orEmpty renders a nullable log field as its value, not its address.
+func orEmpty(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
 }
 
 func nodeName(t Target) string {

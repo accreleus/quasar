@@ -77,6 +77,8 @@ type fakeFleetStore struct {
 	hosts    []HostIdentity
 	cordon   []string
 	uncordon []string
+	// The run's persisted record of what it found (migration 0076).
+	cordons_ []HostCordon
 }
 
 func newFakeFleetStore(force bool) *fakeFleetStore {
@@ -97,6 +99,30 @@ func (f *fakeFleetStore) Hosts(context.Context) ([]HostIdentity, error) {
 	out := make([]HostIdentity, len(f.hosts))
 	copy(out, f.hosts)
 	return out, nil
+}
+
+func (f *fakeFleetStore) HostStatus(_ context.Context, hostID string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, h := range f.hosts {
+		if h.HostID == hostID {
+			return h.Status, nil
+		}
+	}
+	return "", ErrHostNotFound
+}
+
+func (f *fakeFleetStore) SetCordonedHosts(_ context.Context, _ string, states []HostCordon) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cordons_ = append([]HostCordon(nil), states...)
+	return nil
+}
+
+func (f *fakeFleetStore) CordonedHosts(context.Context, string) ([]HostCordon, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]HostCordon(nil), f.cordons_...), nil
 }
 
 func (f *fakeFleetStore) FleetNonTerminalSessions(context.Context) (int, error) {
@@ -130,16 +156,26 @@ func (f *fakeFleetStore) cordons() FleetCordons {
 	return FleetCordons{
 		Cordon: func(_ context.Context, hostID string) error {
 			f.mu.Lock()
+			defer f.mu.Unlock()
 			f.cordon = append(f.cordon, hostID)
-			f.mu.Unlock()
+			f.setStatusLocked(hostID, "draining")
 			return nil
 		},
 		Uncordon: func(_ context.Context, hostID string) error {
 			f.mu.Lock()
+			defer f.mu.Unlock()
 			f.uncordon = append(f.uncordon, hostID)
-			f.mu.Unlock()
+			f.setStatusLocked(hostID, "online")
 			return nil
 		},
+	}
+}
+
+func (f *fakeFleetStore) setStatusLocked(hostID, status string) {
+	for i := range f.hosts {
+		if f.hosts[i].HostID == hostID {
+			f.hosts[i].Status = status
+		}
 	}
 }
 
@@ -377,6 +413,7 @@ func testFleet(t *testing.T, store *fakeFleetStore, d *fakeDrivers, view func(co
 	f := NewFleetRunner(store, d, d, ManifestOrEdge{}, store.cordons(), view, testLogger())
 	f.PollWait = time.Millisecond
 	f.Deadline = 2 * time.Second
+	f.AdoptSettle = time.Millisecond
 	t.Cleanup(f.Close)
 	return f
 }
@@ -614,10 +651,10 @@ func TestFleetDrainsEverySessionBeforeTheControlPlaneStep(t *testing.T) {
 		t.Fatalf("run state = %q, want succeeded", run.State)
 	}
 	// And back into service when the run is done.
-	_, uncordoned := store.scheduling()
-	if len(uncordoned) != 2 {
-		t.Fatalf("uncordoned = %v, want both hosts restored", uncordoned)
-	}
+	waitFor(t, "both hosts to be restored", func() bool {
+		_, uncordoned := store.scheduling()
+		return len(uncordoned) == 2
+	})
 }
 
 func TestFleetForceSkipsTheDrain(t *testing.T) {
@@ -652,10 +689,11 @@ func TestFleetRestoresTheCordonItFoundOnFailure(t *testing.T) {
 	if run.State != RunFailed {
 		t.Fatalf("run state = %q, want failed", run.State)
 	}
-	cordoned, uncordoned := store.scheduling()
-	if len(uncordoned) != 1 || uncordoned[0] != "h1" {
-		t.Fatalf("uncordoned = %v, want only the host the run cordoned", uncordoned)
-	}
+	waitFor(t, "the run's cordon to be lifted", func() bool {
+		_, uncordoned := store.scheduling()
+		return len(uncordoned) == 1 && uncordoned[0] == "h1"
+	})
+	cordoned, _ := store.scheduling()
 	// h2 is cordoned once at the start (it was found draining, so untouched)
 	// and re-asserted at the end.
 	found := 0
@@ -708,11 +746,84 @@ func TestFleetReCordonsOnAdoption(t *testing.T) {
 		return TerminalRunState(r.State)
 	})
 
-	cordoned, uncordoned := store.scheduling()
-	if len(cordoned) != 2 {
+	waitFor(t, "both hosts to be restored when the adopted run finished", func() bool {
+		_, uncordoned := store.scheduling()
+		return len(uncordoned) == 2
+	})
+	if cordoned, _ := store.scheduling(); len(cordoned) != 2 {
 		t.Fatalf("cordoned = %v, want both hosts re-cordoned on adoption", cordoned)
 	}
-	if len(uncordoned) != 2 {
-		t.Fatalf("uncordoned = %v, want both restored when the adopted run finished", uncordoned)
+}
+
+// The live #117 failure: the run was re-adopted, resolved its control-plane
+// attempt and reached the first host while every agent was still reconnecting.
+func TestFleetSettlesBeforeTheFirstHostOnAdoption(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.run.State = RunRunning
+	if _, err := store.CreateControlPlaneAttempt(context.Background(), NewControlPlaneAttempt{
+		RunID: &store.run.ID, ReleaseID: &store.release.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store.attempts[0].State = AttemptSucceeded
+
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+	f.AdoptSettle = 60 * time.Millisecond
+
+	start := time.Now()
+	f.Adopt(context.Background())
+	waitFor(t, "the adopted run to finish", func() bool {
+		r, _ := store.Run(context.Background(), testRunID)
+		return TerminalRunState(r.State)
+	})
+	if elapsed := time.Since(start); elapsed < 60*time.Millisecond {
+		t.Fatalf("reached the first host after %s, want the settle window observed", elapsed)
+	}
+}
+
+// The cordon record is persisted, so the restart the run causes cannot lose it.
+func TestFleetRestoresCordonsRecordedBeforeTheRestart(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.run.State = RunRunning
+	// What the previous process wrote before it cordoned and replaced itself.
+	if err := store.SetCordonedHosts(context.Background(), testRunID, []HostCordon{
+		{HostID: "h1", WasCordoned: false},
+		{HostID: "h2", WasCordoned: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store.hosts[0].Status = "draining"
+	store.hosts[1].Status = "draining"
+	if _, err := store.CreateControlPlaneAttempt(context.Background(), NewControlPlaneAttempt{
+		RunID: &store.run.ID, ReleaseID: &store.release.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store.attempts[0].State = AttemptSucceeded
+
+	d := &fakeDrivers{store: store, outcome: map[string]string{"h1": AttemptFailed}}
+	f := testFleet(t, store, d, fleetView("",
+		hostTarget("h1", "gpu-01", ""), hostTarget("h2", "gpu-02", "")))
+
+	f.Adopt(context.Background())
+	waitFor(t, "the adopted run to finish", func() bool {
+		r, _ := store.Run(context.Background(), testRunID)
+		return TerminalRunState(r.State)
+	})
+
+	run, _ := store.Run(context.Background(), testRunID)
+	if run.State != RunFailed {
+		t.Fatalf("run state = %q, want failed", run.State)
+	}
+	// A failed run must still put the fleet back: h1 was the run's cordon, h2
+	// was the operator's. The restore runs after the terminal write.
+	waitFor(t, "the run's cordon to be lifted", func() bool {
+		_, uncordoned := store.scheduling()
+		return len(uncordoned) == 1 && uncordoned[0] == "h1"
+	})
+	status, _ := store.HostStatus(context.Background(), "h2")
+	if status != "draining" {
+		t.Fatalf("the operator's cordon = %q, want it left in place", status)
 	}
 }
