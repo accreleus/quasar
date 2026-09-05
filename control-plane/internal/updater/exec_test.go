@@ -24,7 +24,7 @@ printf '%s\n' "$*" >> "$d/argv.log"
 verb=""
 for a in "$@"; do
   case "$a" in
-    pull|up|ps|inspect) verb="$a"; break ;;
+    pull|up|ps|inspect|config) verb="$a"; break ;;
   esac
 done
 [ -n "$verb" ] || { echo "fake docker: no verb in: $*" >&2; exit 99; }
@@ -248,6 +248,60 @@ func TestExecutorHealthlessRunningServiceSucceeds(t *testing.T) {
 	f.canned("ps.out", psJSON("quasar-node-agent", "na1", "running", ""))
 	if res := f.apply(agentReq()); res.State != StateSucceeded {
 		t.Fatalf("state=%s reason=%v output=%s", res.State, res.Reason, res.Output)
+	}
+}
+
+// `compose config`, not the compose file: an unset ${QUASAR_CONTROL_IMAGE} must
+// come back as the default tag and an .env pin as a digest reference, which is
+// what makes the answer usable for classifying install mode.
+func TestEffectiveImagesReportsWhatComposeResolves(t *testing.T) {
+	f := newFakeEnv(t, "")
+	f.canned("config.out", `{"services":{
+	  "quasar-control-plane":{"image":"quasar-control-plane:latest"},
+	  "quasar-node-agent":{"image":"ghcr.io/accreleus/quasar/quasar-node-agent@`+prevDigest+`"},
+	  "quasar-postgres":{"image":"postgres:16-alpine"}}}`)
+	e := &Executor{Store: f.store, Docker: f.docker, Cfg: f.cfg(), EnvPath: f.envPath}
+
+	got := e.EffectiveImages(context.Background())
+	if got["control-plane"] == nil || *got["control-plane"] != "quasar-control-plane:latest" {
+		t.Fatalf("control-plane = %v", got["control-plane"])
+	}
+	if got["node-agent"] == nil || *got["node-agent"] != "ghcr.io/accreleus/quasar/quasar-node-agent@"+prevDigest {
+		t.Fatalf("node-agent = %v", got["node-agent"])
+	}
+	if _, ok := got["postgres"]; ok {
+		t.Fatal("only the two components this updater can move belong in images")
+	}
+	if !strings.Contains(f.argv(), "config --format json") {
+		t.Fatalf("argv log:\n%s", f.argv())
+	}
+}
+
+// An agentless stack (deploy/overlays/docker-compose.local.yml) has no
+// node-agent service: null, which is not the same as an empty string.
+func TestEffectiveImagesReportsNullForAnAbsentService(t *testing.T) {
+	f := newFakeEnv(t, "")
+	f.canned("config.out", `{"services":{"quasar-control-plane":{"image":"cp:latest"}}}`)
+	e := &Executor{Store: f.store, Docker: f.docker, Cfg: f.cfg(), EnvPath: f.envPath}
+
+	got := e.EffectiveImages(context.Background())
+	v, present := got["node-agent"]
+	if !present || v != nil {
+		t.Fatalf("node-agent = %v (present=%v), want a present null", v, present)
+	}
+}
+
+// A compose that cannot be read is null for BOTH, never a guess.
+func TestEffectiveImagesIsNullWhenComposeFails(t *testing.T) {
+	f := newFakeEnv(t, "")
+	f.canned("config.code", "1")
+	f.canned("config.out", "no such file\n")
+	e := &Executor{Store: f.store, Docker: f.docker, Cfg: f.cfg(), EnvPath: f.envPath}
+
+	for name, ref := range e.EffectiveImages(context.Background()) {
+		if ref != nil {
+			t.Fatalf("%s = %q, want null", name, *ref)
+		}
 	}
 }
 

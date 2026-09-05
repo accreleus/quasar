@@ -68,9 +68,14 @@ type SelfResponse struct {
 	Components        []string `json:"components"`
 	WaitTimeoutS      int      `json:"wait_timeout_s"`
 	InFlight          *string  `json:"in_flight"`
+	// The image reference compose resolves for each component right now, or
+	// null when that component's service is not in this stack. Read by the
+	// control plane to classify its own install mode: a bare local tag is a
+	// source build, a `repo@sha256:…` is a registry install.
+	Images map[string]*string `json:"images"`
 }
 
-func (s *Server) handleSelf(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleSelf(w http.ResponseWriter, r *http.Request) {
 	resp := SelfResponse{
 		Version:           s.Version,
 		Project:           s.Cfg.Project,
@@ -80,6 +85,7 @@ func (s *Server) handleSelf(w http.ResponseWriter, _ *http.Request) {
 		AllowedNamespaces: s.Cfg.AllowedNamespaces,
 		Components:        []string{"control-plane", "node-agent"},
 		WaitTimeoutS:      s.Cfg.WaitTimeoutS,
+		Images:            s.executor().EffectiveImages(r.Context()),
 	}
 	if id := s.Store.InFlight(); id != "" {
 		resp.InFlight = &id
@@ -165,11 +171,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 
 	// 202 now, execute detached: the requester is normally destroyed by the
 	// work it asked for, so the context is the process's, never the request's.
-	exec := &Executor{
-		Store: s.Store, Docker: s.Docker, Cfg: s.Cfg, EnvPath: s.EnvPath,
-		PullTimeout: s.PullTimeout, RecreateTimeout: s.RecreateTimeout,
-	}
-	go exec.Apply(context.Background(), req, plan, priorEnv)
+	go s.executor().Apply(context.Background(), req, plan, priorEnv)
 
 	log.Printf("apply %s ACCEPTED: services=%v", req.RequestID, plan.Services)
 	writeJSON(w, http.StatusAccepted, accepted)
@@ -187,6 +189,16 @@ func (s *Server) handleResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+// executor is built per use rather than held: it carries no state of its own
+// (the latch and the results live in the Store), so one construction site is
+// simpler than one lifetime.
+func (s *Server) executor() *Executor {
+	return &Executor{
+		Store: s.Store, Docker: s.Docker, Cfg: s.Cfg, EnvPath: s.EnvPath,
+		PullTimeout: s.PullTimeout, RecreateTimeout: s.RecreateTimeout,
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

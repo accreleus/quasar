@@ -171,6 +171,45 @@ func (e *Executor) restore(ctx context.Context, plan *ApplyPlan) bool {
 	return true
 }
 
+// EffectiveImages is the image reference compose would actually use for each
+// component, keyed by COMPONENT name (`control-plane`, `node-agent`), not by
+// service name — the caller thinks in components. A component whose service is
+// absent from this stack maps to nil, which is different from an empty string.
+//
+// It comes from `compose config`, not from the compose file, so every layer of
+// resolution is already applied: an unset `${QUASAR_CONTROL_IMAGE}` shows as the
+// default `quasar-control-plane:latest`, an `.env` pin shows as
+// `repo@sha256:…`, and an overlay that replaces the image shows the override.
+// That is what makes the answer usable for classifying install mode.
+func (e *Executor) EffectiveImages(ctx context.Context) map[string]*string {
+	out := map[string]*string{}
+	for name := range componentTargets {
+		out[name] = nil
+	}
+	args := append(ComposeArgs(e.Cfg), "config", "--format", "json")
+	body, code, err := e.run(ctx, args, 60*time.Second)
+	if err != nil || code != 0 {
+		log.Printf("compose config: exit %d: %s", code, TailOutput(body, 512))
+		return out
+	}
+	var doc struct {
+		Services map[string]struct {
+			Image string `json:"image"`
+		} `json:"services"`
+	}
+	if err := json.Unmarshal([]byte(body), &doc); err != nil {
+		log.Printf("compose config: unparsable output: %v", err)
+		return out
+	}
+	for name, t := range componentTargets {
+		if svc, ok := doc.Services[t.service]; ok && svc.Image != "" {
+			img := svc.Image
+			out[name] = &img
+		}
+	}
+	return out
+}
+
 // composePS is one service's post-state as `docker compose ps --format json`
 // reports it. Only the fields that decide the verdict are named.
 type composePS struct {

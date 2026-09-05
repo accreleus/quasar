@@ -50,15 +50,31 @@ RUN apt-get update && \
 
 COPY --from=builder /quasar-control /usr/local/bin/quasar-control
 
-# Parity with Dockerfile.control.prod: the dev-agent-auth key file (#399) lives
-# at /run/quasar/dev-agent-key. This image runs as ROOT, so the control plane
-# could create the directory itself at boot — the explicit mkdir just keeps the
-# two images' filesystem contract identical, which is what `make agent-creds`
-# and the docs describe.
-RUN mkdir -p /run/quasar && chmod 0700 /run/quasar
+# THE SAME uid:gid AS Dockerfile.control.prod (`quasar`, 1000:1000, which the
+# quasar-base family defines). Not cosmetic: a named volume takes its ownership
+# from the mount point of whichever image created it, so a stack that ran the
+# source image as root left quasar-control-tls root-owned, and a later apply to
+# the published image crash-looped on "write TLS key
+# /var/lib/quasar-control/tls/key.pem: permission denied". Either image must be
+# able to use a volume the other created, and running both as 1000 is what makes
+# that true. deploy/redeploy.sh chowns the volume once for stacks that predate
+# this. Changing the uid here without changing it there re-opens the same hole.
+RUN groupadd -g 1000 quasar && useradd -u 1000 -g 1000 -m -s /bin/bash quasar
+
+# Both directories must exist and be owned before USER: /run and /var/lib are
+# root-owned 0755, so a non-root process cannot create a subdirectory in either.
+# /run/quasar holds the dev-agent-auth key (#399, mode 0600);
+# /var/lib/quasar-control is the TLS-pair + artwork-cache mount point, and
+# declaring it here is what makes a fresh named volume land owned by `quasar`.
+RUN mkdir -p /run/quasar && chown quasar:quasar /run/quasar && chmod 0700 /run/quasar
+RUN mkdir -p /var/lib/quasar-control && chown quasar:quasar /var/lib/quasar-control
 
 # The SPA is mounted at runtime via QUASAR_WEB_ROOT (see docker-compose.yml).
-# Nothing to COPY here — the SPA is built separately with `pnpm build`.
+# Nothing to COPY here — the SPA is built separately with `pnpm build`. The dev
+# overlay bind-mounts ../web/dist read-only; the web build writes it 0755/0644,
+# so uid 1000 reads it.
+
+USER quasar
 
 EXPOSE 8080
 

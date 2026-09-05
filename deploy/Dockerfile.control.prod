@@ -116,8 +116,10 @@ RUN mkdir -p /run/quasar && chown quasar:quasar /run/quasar && chmod 0700 /run/q
 # volume root:root 0755 and copies the image's ownership of the mount point onto
 # it, so declaring the directory here is what makes the volume land owned by
 # `quasar`. Without it the non-root process cannot mkdir the `tls` subdirectory
-# and the control plane exits at boot — which only ever bites the published-image
-# path, because compose's build target (Dockerfile.control) runs as root.
+# and the control plane exits at boot. Dockerfile.control declares the same
+# directory under the same uid for the same reason: a volume created by either
+# image has to be usable by the other, or applying a release to a source-built
+# stack crash-loops on it.
 RUN mkdir -p /var/lib/quasar-control && chown quasar:quasar /var/lib/quasar-control
 
 USER quasar
