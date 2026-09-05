@@ -271,6 +271,37 @@ describe("ReleasesTab", () => {
     expect(screen.queryByRole("button", { name: /^apply$/i })).not.toBeInTheDocument();
   });
 
+  it("calls a current control plane up to date, not not-ready", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(
+      view({
+        available: [release({ source_commit: CP_COMMIT })],
+        targets: [
+          {
+            kind: "control_plane",
+            host_id: null,
+            node_name: null,
+            eligible: false,
+            reason: "up_to_date",
+          },
+          { kind: "host", host_id: "h1", node_name: "gpu-host-01", eligible: true, reason: null },
+        ],
+      }),
+    );
+    renderTab();
+
+    // Once in the rollup, once on the row behind the per-host disclosure.
+    expect((await screen.findAllByText("Up to date")).length).toBe(2);
+    expect(screen.queryByText("Not ready")).not.toBeInTheDocument();
+  });
+
+  it("keeps Not ready for every other ineligibility", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(view()); // host: release_above_control_plane
+    renderTab();
+
+    expect(await screen.findByText("Not ready")).toBeInTheDocument();
+    expect(screen.queryByText("Up to date")).not.toBeInTheDocument();
+  });
+
   it("says so when nothing is available, and does not claim an update", async () => {
     mocked.getPlatformReleases.mockResolvedValue(view({ available: [], targets: [] }));
     renderTab();
