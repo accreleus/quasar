@@ -10,31 +10,14 @@
  *
  * Both Sparkline and LineChart2 are resize-debounced via ResizeObserver.
  */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo } from "react";
 import type { ReactElement } from "react";
+import { useContainerWidth } from "../lib/useContainerWidth";
 
 // ── helpers ────────────────────────────────────────────────
 
 const arrMin = (a: number[]) => a.reduce((m, v) => (v < m ? v : m), Infinity);
 const arrMax = (a: number[]) => a.reduce((m, v) => (v > m ? v : m), -Infinity);
-
-function useContainerWidth(fallback = 300): [React.RefObject<HTMLDivElement>, number] {
-  const ref = useRef<HTMLDivElement>(null!) as React.RefObject<HTMLDivElement>;
-  const [width, setWidth] = useState(fallback);
-
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    const ro = new ResizeObserver((entries) => {
-      const w = entries[0]?.contentRect.width;
-      if (w && w > 0) setWidth(w);
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
-
-  return [ref, width];
-}
 
 // ── Sparkline ──────────────────────────────────────────────
 
