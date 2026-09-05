@@ -43,6 +43,12 @@ import {
   attemptForTarget,
   useHostSessionCounts,
 } from "./ApplyControls";
+import {
+  FailedAttemptPanel,
+  RevertConfirmModal,
+  releaseForDigest,
+  useRevertStates,
+} from "./RevertControls";
 import { eligibilityText, faultText, hasUpdate, releaseLabel, shortCommit } from "./releasesCopy";
 import "../../../styles/admin/fleet.css";
 
@@ -122,6 +128,7 @@ export function ReleasesTab() {
           <AvailableSection view={view} />
           <TargetsSection
             view={view}
+            refreshKey={applied}
             onApplied={() => {
               setApplied((n) => n + 1);
               void res.refresh();
@@ -346,9 +353,21 @@ function ManualPath({
   );
 }
 
-function TargetsSection({ view, onApplied }: { view: PlatformReleaseView; onApplied: () => void }) {
+function TargetsSection({
+  view,
+  refreshKey,
+  onApplied,
+}: {
+  view: PlatformReleaseView;
+  refreshKey: number;
+  onApplied: () => void;
+}) {
   const [confirming, setConfirming] = useState<PlatformReleaseTarget | null>(null);
+  const [reverting, setReverting] = useState<PlatformReleaseTarget | null>(null);
   const counts = useHostSessionCounts();
+  // Derived from the history: a revert restores the digests of the host's last
+  // succeeded attempt, and `targets` carries no signal for that.
+  const reverts = useRevertStates(refreshKey);
   // Targets are evaluated against the newest listed release and nothing else.
   const newest = view.available[0];
   const attempts = view.active_apply?.attempts;
@@ -381,17 +400,26 @@ function TargetsSection({ view, onApplied }: { view: PlatformReleaseView; onAppl
     {
       key: "action",
       header: "",
-      width: "110px",
+      width: "170px",
       render: (t) => {
-        // The control plane is #117's. An apply that has been sent cannot be
-        // forced or cancelled, so an open attempt offers no second action.
-        if (t.kind !== "host" || !t.eligible || !newest || attemptForTarget(attempts, t)) {
-          return null;
-        }
+        // The control plane is #117's, and it is never revertible (ADR 0002).
+        // An apply that has been sent cannot be forced or cancelled, so an open
+        // attempt offers no second action.
+        if (t.kind !== "host" || !t.host_id || attemptForTarget(attempts, t)) return null;
+        const back = reverts.get(t.host_id);
         return (
-          <Button variant="ghost" onClick={() => setConfirming(t)}>
-            Apply
-          </Button>
+          <>
+            {t.eligible && newest && (
+              <Button variant="ghost" onClick={() => setConfirming(t)}>
+                Apply
+              </Button>
+            )}
+            {back?.digest && (
+              <Button variant="ghost" onClick={() => setReverting(t)}>
+                Revert
+              </Button>
+            )}
+          </>
         );
       },
     },
@@ -415,6 +443,29 @@ function TargetsSection({ view, onApplied }: { view: PlatformReleaseView; onAppl
           release={view.available[0]}
         />
       ))}
+      {view.targets.map((t) => {
+        const back = t.host_id ? reverts.get(t.host_id) : undefined;
+        if (!back?.failed) return null;
+        return (
+          <FailedAttemptPanel
+            key={`failed-${t.host_id}`}
+            attempt={back.failed}
+            state={back}
+            onRevert={back.digest ? () => setReverting(t) : undefined}
+          />
+        );
+      })}
+      {reverting?.host_id && reverts.get(reverting.host_id) && (
+        <RevertConfirmModal
+          hostId={reverting.host_id}
+          nodeName={reverting.node_name ?? "this host"}
+          state={reverts.get(reverting.host_id)!}
+          release={releaseForDigest(view.available, reverts.get(reverting.host_id)?.digest ?? "")}
+          liveSessions={counts ? (counts.get(reverting.host_id) ?? 0) : null}
+          onClose={() => setReverting(null)}
+          onReverted={onApplied}
+        />
+      )}
       {confirming && newest && (
         <ApplyConfirmModal
           release={newest}

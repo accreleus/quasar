@@ -172,7 +172,16 @@ export function ApplyHistory({ refreshKey }: { refreshKey: number }) {
       header: "Target",
       render: (a) => (a.target === "control_plane" ? "Control plane" : (a.node_name ?? "gone")),
     },
-    { key: "kind", header: "Action", width: "90px", render: (a) => a.kind },
+    {
+      key: "kind",
+      header: "Action",
+      width: "90px",
+      render: (a) => (
+        <Chip variant={a.kind === "revert" ? "warning" : "neutral"}>
+          {a.kind === "revert" ? "Revert" : "Apply"}
+        </Chip>
+      ),
+    },
     {
       key: "state",
       header: "Outcome",

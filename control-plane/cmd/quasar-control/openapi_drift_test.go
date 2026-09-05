@@ -251,7 +251,6 @@ var allowedUnimplemented = map[string]struct{}{
 	"GET /v1/admin/platform/apply/runs":            {}, // removed by #117
 	"GET /v1/admin/platform/apply/runs/{}":         {}, // removed by #117
 	"POST /v1/admin/platform/apply/runs/{}/cancel": {}, // removed by #117
-	"POST /v1/admin/platform/hosts/{}/revert":      {}, // removed by #118
 }
 
 // unimplementedOperation reports whether an OpenAPI operation carries

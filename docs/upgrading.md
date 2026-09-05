@@ -391,6 +391,32 @@ docker compose -f deploy/docker-compose.yml exec quasar-node-agent \
   http://u/v1/results/<request-id>
 ```
 
+### Reverting an agent
+
+A host row also offers **Revert** once that host has one succeeded update behind
+it. A revert is an apply with an older digest set. Same drain, same message,
+same states, aimed at the digests recorded as `previous_digests` on that host's
+last succeeded attempt. It is not a version picker. The only thing on offer is
+the build the host was demonstrably running a moment ago, and the confirmation
+names that digest.
+
+**The control plane is never revertible from the console, at any depth.** It
+carries migrations, and rolling it below the database's applied version is the
+crash-loop described under the one-way migration rule above. Agents carry no
+migrations, so they can move back, but never above the control plane's own
+release: a revert whose target orders above it is refused with
+`host_not_eligible` / `release_above_control_plane`. That is only reachable if
+the control plane was moved backwards by hand.
+
+If this instance can no longer name the build being restored, because the digest
+predates its release records, the revert still runs. That digest ran on this
+host under this control plane or an older one, so it cannot be above it. What
+changes is the evidence. With a known release, the revert succeeds when the host
+registers on that release's commit. Without one, the updater's own `succeeded`
+result resolves it, as does a register reporting any commit other than the one
+it was reverted from. A revert is itself recorded as an attempt
+(`kind: revert`), so it can be reverted in turn.
+
 ---
 
 ## Cutting a release

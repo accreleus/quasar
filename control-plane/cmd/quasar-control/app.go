@@ -83,16 +83,16 @@ type Services struct {
 	platformHandler *platform.Handler
 	// The apply half (#116). Nil in a route-recorder build; Register only takes
 	// method values, so the drift test still sees the routes.
-	platformApply *platform.ApplyHandler
-	applyRunner   *platform.Runner
-	auditHandler    *audit.Handler
-	artworkHandler  *artwork.Handler
-	secretsHandler  *secrets.Handler
-	libraryHandler  *library.Handler
-	imagesHandler   *images.Handler
-	setupHandler    *setup.Service
-	accessHandler   *access.Service
-	jobsHandler     *jobs.Handler
+	platformApply  *platform.ApplyHandler
+	applyRunner    *platform.Runner
+	auditHandler   *audit.Handler
+	artworkHandler *artwork.Handler
+	secretsHandler *secrets.Handler
+	libraryHandler *library.Handler
+	imagesHandler  *images.Handler
+	setupHandler   *setup.Service
+	accessHandler  *access.Service
+	jobsHandler    *jobs.Handler
 	// Registered unconditionally; with no agent-side runner it returns an empty
 	// claim list.
 	jobsAgentHandler *jobs.AgentHandler
