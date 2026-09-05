@@ -32,6 +32,30 @@ the GitHub Releases the detector will read once real releases exist.
 
 The tag-push publish lane (#108) and cutting a real prerelease with `make release` (#109), and with them the stable channel's first real detection from a GitHub Release. A source-built control plane can no longer be moved by the console (by design after this gate); the fleet path was proven on registry-installed components.
 
+## Addendum — real published artifacts (2026-09-06)
+
+After the operator promoted `develop` to `main`, `make release VERSION=0.2.0-rc.1` cut the
+first prerelease through the tag-push lane (release gate → build → validate → promote →
+GitHub prerelease + `platform-release-manifest.json`, all green); a develop dispatch published
+the edge build. The `gpu-test` host was then converted to a **registry install** of the
+published images (base compose, no dev overlay) and the whole chain re-run against GitHub and
+GHCR for real:
+
+| step | result |
+|---|---|
+| manifest | validates; its digests are the linux/amd64 platform manifests inside the promoted tags' indexes and pull by digest |
+| stable detection | **failed at first**: the asset download got GitHub's `302` (to `release-assets.githubusercontent.com`) and the client refuses redirects → fixed (#110): one validated hop, default asset-host allowlist widened |
+| edge detection | **failed at first**: GHCR's config blob answers `307` (to `pkg-containers.githubusercontent.com`) → fixed (#111) with the same shared helper |
+| compose knobs | the release-detection knobs were not forwarded to the control-plane container → fixed (#110) |
+| console apply from GHCR | agent moved `v0.2.0-rc.1` → develop build in 30 s (`pulling → recreating → succeeded`) |
+| Steam gate on the published agent image | 8908 frames, 60 fps, clean teardown |
+| `v0.2.0-rc.2` | cut from the second promotion with the fixes; on the rc.2 control plane, stable detection with **default** settings stored the release (`manifest_invalid: 0`) and hides it as a prerelease, as designed |
+| hermes (aux-infra) | own stack converted to a rc.2 registry install; its agent-only stack re-enrolled through the installer at `QUASAR_REF=v0.2.0-rc.2`, now reporting identity, `install_mode=registry`, `updater_present=true` |
+
+Filed from this pass: agent `agent_version` stays at the Cargo package version on tagged
+builds; the edge channel can offer a develop build older than an installed tagged release at
+the same schema version.
+
 ## Files
 - `redeploy-summaries.txt` — every REDEPLOY summary line of the day
 - `regression-gate-after-107.log`, `steam-regression-after-107.png`
