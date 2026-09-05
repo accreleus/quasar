@@ -260,6 +260,22 @@ func (s *Store) OpenControlPlaneAttempt(ctx context.Context) (Attempt, string, e
 	return a, *commit, nil
 }
 
+// FleetNonTerminalSessions counts what a CONTROL-PLANE apply would end: every
+// session on the instance, not one host's. Recreating the control plane drops
+// every agent's connection, and an agent stops its sessions when that
+// connection drops. Same state predicate as NonTerminalSessions, without the
+// host filter.
+func (s *Store) FleetNonTerminalSessions(ctx context.Context) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `
+		SELECT count(*) FROM sessions WHERE state NOT IN ('stopped','failed')
+	`).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count fleet sessions: %w", err)
+	}
+	return n, nil
+}
+
 // AttemptRequestID is the id the control plane minted before calling the
 // updater. "" while the attempt is queued; it is what a boot polls the result
 // file on.

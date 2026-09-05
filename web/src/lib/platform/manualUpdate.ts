@@ -185,10 +185,12 @@ export function manualUpdatePath(inputs: ManualUpdateInputs): ManualUpdatePath |
     case "install_mode_source":
       return {
         summary:
-          "This host builds its own images, so it updates with the redeploy script rather than by pinning digests.",
+          inputs.kind === "control_plane"
+            ? "This control plane runs an image it built itself. The published one is a different build and cannot replace it in place, so it updates with the redeploy script."
+            : "This host builds its own images, so it updates with the redeploy script rather than by pinning digests.",
         commands: [
           {
-            label: `Rebuild and restart this host at ${redeployRef(release)}`,
+            label: `Rebuild and restart this ${inputs.kind === "control_plane" ? "stack" : "host"} at ${redeployRef(release)}`,
             command: redeployCommand(inputs),
           },
         ],
@@ -212,10 +214,12 @@ export function manualUpdatePath(inputs: ManualUpdateInputs): ManualUpdatePath |
       // is running; upgrading it is what makes every other answer meaningful.
       return {
         summary:
-          "This agent predates identity reporting and has not said what it is running — redeploy or upgrade the agent first, then this page can tell you the rest.",
+          inputs.kind === "control_plane"
+            ? "Nothing could say how this control plane was installed, and it is never updated on a guess: the published image is a different build from a source one. Update it by hand."
+            : "This agent predates identity reporting and has not said what it is running — redeploy or upgrade the agent first, then this page can tell you the rest.",
         commands:
-          inputs.installMode === "source"
-            ? [{ label: "Rebuild and restart this host", command: redeployCommand(inputs) }]
+          inputs.installMode === "source" || inputs.kind === "control_plane"
+            ? [{ label: "Rebuild and restart this stack", command: redeployCommand(inputs) }]
             : registryCommands(release),
       };
 

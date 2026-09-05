@@ -326,6 +326,9 @@ func TestTargetEligibilityReasons(t *testing.T) {
 				Hosts:          []HostIdentity{tc.host},
 				Releases:       tc.releases,
 				UpdaterPresent: true,
+				// The control plane's own install mode; the axis under test is
+				// elsewhere in every case here.
+				ControlPlaneInstallMode: str(InstallRegistry),
 			})
 			if len(v.Targets) != 2 {
 				t.Fatalf("targets = %d, want the control plane then one host", len(v.Targets))

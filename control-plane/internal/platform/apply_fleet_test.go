@@ -18,11 +18,12 @@ func TestPlanReportsRunActiveAndTheControlPlanesOwnUpdater(t *testing.T) {
 	newest := Release{ID: "r1", Channel: ChannelStable, SourceCommit: commitC,
 		BuiltAt: at(3), SchemaVersion: 74, Manifest: []byte(`{}`)}
 	in := PlanInputs{
-		Channel:        ChannelStable,
-		ControlPlane:   cp(commitA, 74),
-		Hosts:          []HostIdentity{host("h1", "gpu-01", commitB)},
-		Releases:       []Release{newest},
-		UpdaterPresent: true,
+		Channel:                 ChannelStable,
+		ControlPlane:            cp(commitA, 74),
+		Hosts:                   []HostIdentity{host("h1", "gpu-01", commitB)},
+		Releases:                []Release{newest},
+		UpdaterPresent:          true,
+		ControlPlaneInstallMode: str(InstallRegistry),
 	}
 
 	// With no updater beside it, this control plane cannot be moved at all.
@@ -30,6 +31,19 @@ func TestPlanReportsRunActiveAndTheControlPlanesOwnUpdater(t *testing.T) {
 	noUpdater.UpdaterPresent = false
 	if got := targetReason(PlanRelease(noUpdater), TargetControlPlane); got != ReasonUpdaterAbsent {
 		t.Fatalf("control plane reason = %q, want updater_absent", got)
+	}
+
+	// A source-built control plane is never offered a registry image, and an
+	// install mode nobody could read is never assumed to be one.
+	sourceBuilt := in
+	sourceBuilt.ControlPlaneInstallMode = str(InstallSource)
+	if got := targetReason(PlanRelease(sourceBuilt), TargetControlPlane); got != ReasonInstallModeSource {
+		t.Fatalf("control plane reason = %q, want install_mode_source", got)
+	}
+	unknownMode := in
+	unknownMode.ControlPlaneInstallMode = nil
+	if got := targetReason(PlanRelease(unknownMode), TargetControlPlane); got != ReasonIdentityUnknown {
+		t.Fatalf("control plane reason = %q, want identity_unknown", got)
 	}
 
 	// An active run owns the fleet, so no standalone apply may start on any
@@ -58,6 +72,11 @@ type fakeFleetStore struct {
 	release  Release
 	next     int
 	inFlight map[string]bool
+	// Fleet-wide non-terminal sessions, and the cordon calls the run made.
+	sessions int
+	hosts    []HostIdentity
+	cordon   []string
+	uncordon []string
 }
 
 func newFakeFleetStore(force bool) *fakeFleetStore {
@@ -65,7 +84,69 @@ func newFakeFleetStore(force bool) *fakeFleetStore {
 		run:      ApplyRun{ID: testRunID, ReleaseID: testReleaseID, State: RunPending, Force: force},
 		release:  Release{ID: testReleaseID, SourceCommit: testCommit, SchemaVersion: 75, Manifest: applyManifest(testCommit, 75)},
 		inFlight: map[string]bool{},
+		hosts: []HostIdentity{
+			{HostID: "h1", NodeName: "gpu-01", Status: "online"},
+			{HostID: "h2", NodeName: "gpu-02", Status: "online"},
+		},
 	}
+}
+
+func (f *fakeFleetStore) Hosts(context.Context) ([]HostIdentity, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]HostIdentity, len(f.hosts))
+	copy(out, f.hosts)
+	return out, nil
+}
+
+func (f *fakeFleetStore) FleetNonTerminalSessions(context.Context) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sessions, nil
+}
+
+func (f *fakeFleetStore) setSessions(n int) {
+	f.mu.Lock()
+	f.sessions = n
+	f.mu.Unlock()
+}
+
+func (f *fakeFleetStore) FailAttempt(_ context.Context, id, reason, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, a := range f.attempts {
+		if a.ID != id || TerminalAttemptState(a.State) {
+			continue
+		}
+		a.State = AttemptFailed
+		r := reason
+		a.Reason = &r
+	}
+	return nil
+}
+
+// cordons records what the run did to scheduling.
+func (f *fakeFleetStore) cordons() FleetCordons {
+	return FleetCordons{
+		Cordon: func(_ context.Context, hostID string) error {
+			f.mu.Lock()
+			f.cordon = append(f.cordon, hostID)
+			f.mu.Unlock()
+			return nil
+		},
+		Uncordon: func(_ context.Context, hostID string) error {
+			f.mu.Lock()
+			f.uncordon = append(f.uncordon, hostID)
+			f.mu.Unlock()
+			return nil
+		},
+	}
+}
+
+func (f *fakeFleetStore) scheduling() (cordoned, uncordoned []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.cordon...), append([]string(nil), f.uncordon...)
 }
 
 func (f *fakeFleetStore) Run(context.Context, string) (ApplyRun, error) {
@@ -183,7 +264,19 @@ func (f *fakeFleetStore) Release(context.Context, string) (Release, error) {
 
 func (f *fakeFleetStore) NonTerminalSessions(context.Context, string) (int, error) { return 0, nil }
 
-func (f *fakeFleetStore) SetWaitingSessions(context.Context, string, int) error { return nil }
+func (f *fakeFleetStore) SetWaitingSessions(_ context.Context, id string, n int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, a := range f.attempts {
+		if a.ID != id || TerminalAttemptState(a.State) {
+			continue
+		}
+		a.State = AttemptWaitingSessions
+		remaining := n
+		a.SessionsRemaining = &remaining
+	}
+	return nil
+}
 
 // resolve settles one attempt, as the per-target machine would.
 func (f *fakeFleetStore) resolve(id, state string) {
@@ -281,8 +374,9 @@ func hostTarget(id, name, reason string) Target {
 
 func testFleet(t *testing.T, store *fakeFleetStore, d *fakeDrivers, view func(context.Context) (View, error)) *FleetRunner {
 	t.Helper()
-	f := NewFleetRunner(store, d, d, ManifestOrEdge{}, view, testLogger())
+	f := NewFleetRunner(store, d, d, ManifestOrEdge{}, store.cordons(), view, testLogger())
 	f.PollWait = time.Millisecond
+	f.Deadline = 2 * time.Second
 	t.Cleanup(f.Close)
 	return f
 }
@@ -481,5 +575,144 @@ func TestFleetResumesAnOpenControlPlaneAttempt(t *testing.T) {
 	}
 	if got := d.steps(); len(got) != 2 || got[1] != "h1" {
 		t.Fatalf("targets reached = %v, want the control plane then the host", got)
+	}
+}
+
+// The live #117 finding: recreating the control plane ends every session on the
+// instance, so the control-plane target drains the WHOLE fleet first.
+func TestFleetDrainsEverySessionBeforeTheControlPlaneStep(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.setSessions(2)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+
+	f.Start(store.run)
+	// The count is reported on the CONTROL-PLANE attempt, and nothing is sent
+	// while it is above zero.
+	waitFor(t, "the fleet-wide session count on the control-plane attempt", func() bool {
+		as, _ := store.RunAttempts(context.Background(), testRunID)
+		return len(as) == 1 && as[0].Target == TargetControlPlane &&
+			as[0].State == AttemptWaitingSessions && as[0].SessionsRemaining != nil &&
+			*as[0].SessionsRemaining == 2
+	})
+	if steps := d.steps(); len(steps) != 0 {
+		t.Fatalf("targets reached = %v, want nothing sent while the fleet is busy", steps)
+	}
+	// Every online host is out of scheduling for the duration.
+	cordoned, _ := store.scheduling()
+	if len(cordoned) != 2 {
+		t.Fatalf("cordoned = %v, want both hosts", cordoned)
+	}
+
+	store.setSessions(0)
+	waitFor(t, "the run to finish", func() bool {
+		r, _ := store.Run(context.Background(), testRunID)
+		return TerminalRunState(r.State)
+	})
+	run, _ := store.Run(context.Background(), testRunID)
+	if run.State != RunSucceeded {
+		t.Fatalf("run state = %q, want succeeded", run.State)
+	}
+	// And back into service when the run is done.
+	_, uncordoned := store.scheduling()
+	if len(uncordoned) != 2 {
+		t.Fatalf("uncordoned = %v, want both hosts restored", uncordoned)
+	}
+}
+
+func TestFleetForceSkipsTheDrain(t *testing.T) {
+	store := newFakeFleetStore(true)
+	store.setSessions(3)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+
+	run := runToEnd(t, f, store)
+
+	if run.State != RunSucceeded {
+		t.Fatalf("run state = %q, want succeeded with force", run.State)
+	}
+	// force is the operator agreeing to lose them, and the N is still recorded.
+	as, _ := store.RunAttempts(context.Background(), testRunID)
+	if as[0].SessionsRemaining == nil || *as[0].SessionsRemaining != 3 {
+		t.Fatalf("sessions_remaining = %v, want the 3 the operator agreed to lose", as[0].SessionsRemaining)
+	}
+}
+
+// A host an admin had already cordoned stays cordoned; the run restores what it
+// found, on every terminal path including a failed one.
+func TestFleetRestoresTheCordonItFoundOnFailure(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.hosts[1].Status = "draining"
+	d := &fakeDrivers{store: store, outcome: map[string]string{"h1": AttemptFailed}}
+	f := testFleet(t, store, d, fleetView("",
+		hostTarget("h1", "gpu-01", ""), hostTarget("h2", "gpu-02", "")))
+
+	run := runToEnd(t, f, store)
+
+	if run.State != RunFailed {
+		t.Fatalf("run state = %q, want failed", run.State)
+	}
+	cordoned, uncordoned := store.scheduling()
+	if len(uncordoned) != 1 || uncordoned[0] != "h1" {
+		t.Fatalf("uncordoned = %v, want only the host the run cordoned", uncordoned)
+	}
+	// h2 is cordoned once at the start (it was found draining, so untouched)
+	// and re-asserted at the end.
+	found := 0
+	for _, id := range cordoned {
+		if id == "h2" {
+			found++
+		}
+	}
+	if found != 1 {
+		t.Fatalf("cordon calls for the admin-cordoned host = %d, want the one restore", found)
+	}
+}
+
+// The control-plane step is skipped when it is already on the release, and so
+// is the fleet drain: nothing is about to be recreated.
+func TestFleetDoesNotDrainWhenTheControlPlaneIsUpToDate(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.setSessions(5)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView(ReasonUpToDate, hostTarget("h1", "gpu-01", "")))
+
+	run := runToEnd(t, f, store)
+
+	if run.State != RunSucceeded {
+		t.Fatalf("run state = %q, want succeeded", run.State)
+	}
+	if cordoned, _ := store.scheduling(); len(cordoned) != 0 {
+		t.Fatalf("cordoned = %v, want none: the per-host machine cordons its own", cordoned)
+	}
+}
+
+// The run restarts mid-flight, so the fleet cordon is re-established from what
+// the new process finds, and released when the adopted run finishes.
+func TestFleetReCordonsOnAdoption(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.run.State = RunRunning
+	if _, err := store.CreateControlPlaneAttempt(context.Background(), NewControlPlaneAttempt{
+		RunID: &store.run.ID, ReleaseID: &store.release.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store.attempts[0].State = AttemptRecreating
+
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+
+	f.Adopt(context.Background())
+	waitFor(t, "the adopted run to finish", func() bool {
+		r, _ := store.Run(context.Background(), testRunID)
+		return TerminalRunState(r.State)
+	})
+
+	cordoned, uncordoned := store.scheduling()
+	if len(cordoned) != 2 {
+		t.Fatalf("cordoned = %v, want both hosts re-cordoned on adoption", cordoned)
+	}
+	if len(uncordoned) != 2 {
+		t.Fatalf("uncordoned = %v, want both restored when the adopted run finished", uncordoned)
 	}
 }

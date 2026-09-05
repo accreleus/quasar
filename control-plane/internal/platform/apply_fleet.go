@@ -19,6 +19,10 @@ import (
 //   - An ineligible host is SKIPPED, not failed: a run must not go `failed`
 //     because a host happened to be offline.
 //   - The cancel flag is read BETWEEN targets and never mid-attempt.
+//   - Recreating the CONTROL PLANE ends every session on the instance: an agent
+//     stops its sessions the moment its control-plane connection drops. So the
+//     control-plane target drains the whole fleet first, and the fleet stays
+//     cordoned until the run is terminal.
 //
 // A fleet run survives the restart it causes: everything durable is in
 // Postgres, so the control plane that boots on the new image re-adopts the run
@@ -33,6 +37,9 @@ type fleetStore interface {
 	SetRunTarget(ctx context.Context, runID, target string, hostID *string) error
 	FinishRun(ctx context.Context, runID, state, errText string) error
 	Attempt(ctx context.Context, attemptID string) (Attempt, error)
+	FailAttempt(ctx context.Context, attemptID, reason, output string) error
+	Hosts(ctx context.Context) ([]HostIdentity, error)
+	FleetNonTerminalSessions(ctx context.Context) (int, error)
 	CreateHostAttempt(ctx context.Context, in NewHostAttempt) (Attempt, error)
 	CreateControlPlaneAttempt(ctx context.Context, in NewControlPlaneAttempt) (Attempt, error)
 	LastSucceededDigests(ctx context.Context, hostID string) ([]ComponentDigest, error)
@@ -40,6 +47,13 @@ type fleetStore interface {
 	Release(ctx context.Context, id string) (Release, error)
 	NonTerminalSessions(ctx context.Context, hostID string) (int, error)
 	SetWaitingSessions(ctx context.Context, attemptID string, remaining int) error
+}
+
+// FleetCordons are the scheduling effects the run needs. Function fields as in
+// ApplyDeps: internal/session sits above this package.
+type FleetCordons struct {
+	Cordon   func(ctx context.Context, hostID string) error
+	Uncordon func(ctx context.Context, hostID string) error
 }
 
 // hostDriver is the per-host attempt machine (apply_runner.go).
@@ -108,15 +122,24 @@ type FleetRunner struct {
 	hosts    hostDriver
 	self     selfDriver
 	resolve  componentResolver
+	cordons  FleetCordons
 	view     func(ctx context.Context) (View, error)
 	log      logger
 	PollWait time.Duration
+	// The control-plane drain's ceiling, from the attempt's created_at.
+	Deadline time.Duration
 
 	mu sync.Mutex
 	// run id → cancel, bounded at one by the active-run index.
 	running map[string]context.CancelFunc
 	// run id → hosts passed over. No column holds these (apply.go says why).
 	skips map[string][]RunSkip
+	// run id → host id → the host was ALREADY cordoned when the run found it,
+	// so the run must leave it that way. In memory, like the per-host machine's
+	// equivalent: after the restart the control-plane step causes, the run
+	// re-reads what it finds, and agents have re-registered themselves online by
+	// then, so what it re-reads is very nearly the truth.
+	cordoned map[string]map[string]bool
 
 	baseCtx context.Context
 	stop    context.CancelFunc
@@ -125,13 +148,16 @@ type FleetRunner struct {
 
 // NewFleetRunner builds the sequencer.
 func NewFleetRunner(store fleetStore, hosts hostDriver, self selfDriver, resolve componentResolver,
-	view func(ctx context.Context) (View, error), log logger) *FleetRunner {
+	cordons FleetCordons, view func(ctx context.Context) (View, error), log logger) *FleetRunner {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &FleetRunner{
-		store: store, hosts: hosts, self: self, resolve: resolve, view: view, log: log,
+		store: store, hosts: hosts, self: self, resolve: resolve, cordons: cordons,
+		view: view, log: log,
 		PollWait: DefaultApplyPoll,
+		Deadline: DefaultApplyDeadline,
 		running:  make(map[string]context.CancelFunc),
 		skips:    make(map[string][]RunSkip),
+		cordoned: make(map[string]map[string]bool),
 		baseCtx:  ctx,
 		stop:     cancel,
 	}
@@ -268,15 +294,22 @@ func (f *FleetRunner) controlPlanePhase(ctx context.Context, run ApplyRun) bool 
 			f.log.Warn("fleet apply: could not record the current target", "run_id", run.ID, "err", err)
 		}
 		cp = &a
-		// Normally never returns: the updater recreates this container partway
-		// through, and the next boot's Adopt resolves the row.
-		f.self.Apply(ctx, a)
+		if f.prepareFleet(ctx, run, a) {
+			// Normally never returns: the updater recreates this container
+			// partway through, and the next boot's Adopt resolves the row.
+			f.self.Apply(ctx, a)
+		}
 	} else if !TerminalAttemptState(cp.State) {
 		if err := f.store.SetRunTarget(ctx, run.ID, TargetControlPlane, nil); err != nil {
 			f.log.Warn("fleet apply: could not record the current target", "run_id", run.ID, "err", err)
 		}
+		// The fleet is re-cordoned on adoption: the run holds it for the rest of
+		// its life, and the restart wiped the in-memory record of it.
+		f.cordonFleet(ctx, run.ID)
 		if !f.self.Adopt(ctx, *cp, f.releaseCommit(ctx, run.ReleaseID)) {
-			f.self.Apply(ctx, *cp) // never sent; re-drive it
+			if f.prepareFleet(ctx, run, *cp) {
+				f.self.Apply(ctx, *cp) // never sent; re-drive it
+			}
 		}
 	}
 
@@ -297,6 +330,123 @@ func (f *FleetRunner) controlPlanePhase(ctx context.Context, run ApplyRun) bool 
 	default:
 		// Still open with the process alive: shutting down. Adopt resumes.
 		return false
+	}
+}
+
+// prepareFleet cordons the whole instance and waits for it to be empty, because
+// recreating the control plane ends every session on it. False means the attempt
+// resolved underneath (a cancel, a timeout) or the process is shutting down, and
+// there is nothing to send.
+func (f *FleetRunner) prepareFleet(ctx context.Context, run ApplyRun, a Attempt) bool {
+	f.cordonFleet(ctx, run.ID)
+
+	remaining, err := f.store.FleetNonTerminalSessions(ctx)
+	if err != nil {
+		f.log.Error("fleet apply: could not count sessions", "run_id", run.ID, "err", err)
+		return true // the count is advisory; refusing to update over it would be worse
+	}
+	// The N the operator agreed to lose is recorded before the apply is sent,
+	// forced or not.
+	if err := f.store.SetWaitingSessions(ctx, a.ID, remaining); err != nil {
+		f.log.Warn("fleet apply: could not record sessions_remaining", "attempt_id", a.ID, "err", err)
+	}
+	if run.Force {
+		return true
+	}
+
+	started := a.CreatedAt
+	if a.StartedAt != nil {
+		started = *a.StartedAt
+	}
+	deadline := started.Add(f.Deadline)
+	for remaining > 0 {
+		if time.Now().After(deadline) {
+			f.log.Warn("fleet apply: the fleet did not drain before the deadline", "run_id", run.ID)
+			f.failAttempt(a.ID, ReasonTimeout)
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(f.PollWait):
+		}
+		// A cancel caught the attempt before it was sent, so it is already
+		// resolved and the caller finishes the run.
+		if cur, err := f.store.Attempt(ctx, a.ID); err == nil && TerminalAttemptState(cur.State) {
+			return false
+		}
+		remaining, err = f.store.FleetNonTerminalSessions(ctx)
+		if err != nil {
+			f.log.Warn("fleet apply: session count failed while draining", "run_id", run.ID, "err", err)
+			continue
+		}
+		if err := f.store.SetWaitingSessions(ctx, a.ID, remaining); err != nil {
+			f.log.Warn("fleet apply: could not record sessions_remaining", "attempt_id", a.ID, "err", err)
+		}
+	}
+	return true
+}
+
+// cordonFleet takes every online host out of scheduling for the rest of the run,
+// remembering the ones it found already cordoned. Nothing must land on a host
+// that is about to lose its agent.
+func (f *FleetRunner) cordonFleet(ctx context.Context, runID string) {
+	hosts, err := f.store.Hosts(ctx)
+	if err != nil {
+		f.log.Error("fleet apply: could not read the host list to cordon it", "run_id", runID, "err", err)
+		return
+	}
+	states := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		if h.Status != "online" {
+			states[h.HostID] = true // an admin's cordon, restored rather than lifted
+			continue
+		}
+		if err := f.cordons.Cordon(ctx, h.HostID); err != nil {
+			f.log.Warn("fleet apply: could not cordon a host", "run_id", runID, "host_id", h.HostID, "err", err)
+			continue
+		}
+		states[h.HostID] = false
+	}
+	f.mu.Lock()
+	f.cordoned[runID] = states
+	f.mu.Unlock()
+}
+
+// restoreCordons puts every host back to the scheduling state the run found.
+// Runs on every terminal path, including a failed one: a fleet left draining by
+// a failed run would silently drop out of scheduling entirely.
+func (f *FleetRunner) restoreCordons(runID string) {
+	f.mu.Lock()
+	states := f.cordoned[runID]
+	delete(f.cordoned, runID)
+	f.mu.Unlock()
+	if len(states) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for hostID, wasCordoned := range states {
+		if wasCordoned {
+			if err := f.cordons.Cordon(ctx, hostID); err != nil {
+				f.log.Warn("fleet apply: could not restore an admin cordon", "host_id", hostID, "err", err)
+			}
+			continue
+		}
+		if err := f.cordons.Uncordon(ctx, hostID); err != nil {
+			// An offline host cannot be uncordoned; it returns online on its
+			// agent's reconnect.
+			f.log.Info("fleet apply: host not uncordoned (it will return online on its agent's reconnect)",
+				"host_id", hostID, "err", err)
+		}
+	}
+}
+
+func (f *FleetRunner) failAttempt(attemptID, reason string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := f.store.FailAttempt(ctx, attemptID, reason, ""); err != nil {
+		f.log.Error("fleet apply: could not record the failure", "attempt_id", attemptID, "err", err)
 	}
 }
 
@@ -473,6 +623,9 @@ func (f *FleetRunner) cancelRequested(ctx context.Context, runID string) bool {
 }
 
 func (f *FleetRunner) finish(runID, state, errText string) {
+	// Every terminal transition comes through here, which is what makes the
+	// fleet cordon impossible to leak.
+	defer f.restoreCordons(runID)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := f.store.FinishRun(ctx, runID, state, errText); err != nil {

@@ -900,9 +900,23 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 
 	pDeps := platformDeps(platformStore, settingsStore, jobStore)
 	pDeps.UpdaterPresent = selfApplier.UpdaterPresent
+	pDeps.ControlPlaneInstallMode = selfApplier.InstallMode
 	platformHandler := platform.NewHandler(pDeps, log)
+	// The fleet run cordons the WHOLE instance for its control-plane step:
+	// recreating the control plane drops every agent connection, and an agent
+	// stops its sessions when that drops.
+	fleetCordons := platform.FleetCordons{
+		Cordon: func(ctx context.Context, hostID string) error {
+			_, err := coordinator.DrainHost(ctx, hostID, false)
+			return err
+		},
+		Uncordon: func(ctx context.Context, hostID string) error {
+			_, err := coordinator.UncordonHost(ctx, hostID)
+			return err
+		},
+	}
 	fleetRunner := platform.NewFleetRunner(platformStore, applyRunner, selfApplier,
-		platform.ManifestOrEdge{Edge: edgeApply}, platformHandler.ReleaseView, log)
+		platform.ManifestOrEdge{Edge: edgeApply}, fleetCordons, platformHandler.ReleaseView, log)
 	platformApply := platform.NewApplyHandler(platformStore, applyRunner, platformHandler.ReleaseView, auditStore, log).
 		WithEdgeResolver(edgeApply).
 		WithFleet(fleetRunner)

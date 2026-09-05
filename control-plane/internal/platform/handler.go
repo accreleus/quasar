@@ -39,6 +39,9 @@ type Deps struct {
 	// false makes the control-plane target `updater_absent`. Nil reads as
 	// absent, which refuses rather than attempts.
 	UpdaterPresent func() bool
+	// ControlPlaneInstallMode is this control plane's own install mode, read
+	// from its updater. Nil, or a nil answer, is unknown.
+	ControlPlaneInstallMode func() *string
 }
 
 // errNoDeps is what a handler built with no dependencies answers with, rather
@@ -138,6 +141,10 @@ func (h *Handler) releaseView(ctx context.Context) (View, error) {
 			return View{}, err
 		}
 	}
+	var installMode *string
+	if h.deps.ControlPlaneInstallMode != nil {
+		installMode = h.deps.ControlPlaneInstallMode()
+	}
 	return PlanRelease(PlanInputs{
 		Channel:      channel,
 		EdgeBranch:   edgeBranch,
@@ -149,6 +156,7 @@ func (h *Handler) releaseView(ctx context.Context) (View, error) {
 		OpenAttempts: open,
 		ActiveRun:    run,
 
-		UpdaterPresent: h.deps.UpdaterPresent != nil && h.deps.UpdaterPresent(),
+		UpdaterPresent:          h.deps.UpdaterPresent != nil && h.deps.UpdaterPresent(),
+		ControlPlaneInstallMode: installMode,
 	}), nil
 }
