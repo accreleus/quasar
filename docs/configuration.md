@@ -1371,3 +1371,77 @@ without `vulkanscale` in its image, #501) is refused with exit 3 and the
 
 See `protocol/agent-api.md` §session_display_update and
 `protocol/control-api.md` §PATCH /v1/sessions/{id}/display.
+
+### First-install generated configuration
+
+The public installer derives its service definitions from `deploy/docker-compose.yml`
+and its NVIDIA overlay. NVIDIA installations receive one complete Compose file.
+The site build/test gate checks the generated snapshot against both source files.
+After changing either source, run `cd site && npm run compose:sync` and commit the
+snapshot. Installation-specific transformations are in `site/src/data/stack-template.js`.
+
+Copied `.env` files deliberately have **blank credentials**. Run each documented
+OpenSSL command in a terminal and paste its output after the matching `=`; `.env`
+does not execute shell commands. The installer script generates credentials on the
+host only when creating a new `.env`, and preserves an existing file on reruns.
+It resolves stable release manifests and pulls all images before starting services.
+
+Generated files retain process and application defaults, including 1 GiB of app
+shared memory (`QUASAR_APP_SHM_SIZE`, a Docker launch setting). Shared memory is a
+per-container tmpfs used by Chromium/Steam; it is not a general filesystem cache.
+The agent entrypoint establishes NVIDIA loader paths before exec; these cannot
+be set effectively after the dynamic loader has initialized.
+
+For settings omitted from the compact generated Compose, place agent variables
+in `deploy/agent.env` and control-plane variables in `deploy/control.env`. These
+files are optional. Variables explicitly present under a service's `environment`
+retain Compose precedence and use `deploy/.env` where shown. Do not put database
+credentials in `agent.env`. The repository Compose continues to support its full
+set of `.env` passthroughs.
+
+The control plane also accepts separate database fields when `DATABASE_URL` is
+unset: `QUASAR_DATABASE_HOST` and `QUASAR_DATABASE_PASSWORD` are required;
+`QUASAR_DATABASE_USER` and `QUASAR_DATABASE_NAME` default to `quasar`,
+`QUASAR_DATABASE_PORT` to `5432`, and `QUASAR_DATABASE_SSLMODE` to `disable`.
+It constructs the connection URL with proper credential escaping. An explicit
+`DATABASE_URL` remains authoritative. Password-bearing parser errors are withheld
+from startup error strings.
+
+Control-plane state defaults to a Docker-managed volume. For an operator-supplied
+bind mount, the control entrypoint can prepare ownership when the service starts
+with `user: "0:0"`; it then drops privileges and execs Go as PID 1. It adopts the
+state directory's non-root owner, or uses 1000:1000 for a new root-owned directory.
+`QUASAR_CONTROL_UID` and `QUASAR_CONTROL_GID` override that choice. Only the state
+and private runtime directories are prepared; symlink roots are refused and
+ownership traversal does not cross filesystem boundaries. The image itself still
+defaults to its non-root user. A non-root start with inaccessible storage fails
+immediately with an ownership error.
+
+The generated installer requires Docker Compose 2.30 or newer: its NVIDIA file
+uses [`gpus`](https://docs.docker.com/reference/compose-file/services/#gpus), and
+its optional service environment files use
+[`required: false`](https://docs.docker.com/compose/how-tos/environment-variables/set-environment-variables/).
+Preflight reports missing tools, Docker access, graphics devices, and NVIDIA
+runtime registration together before changing host settings. It does not restart
+Docker or reconfigure the host's NVIDIA runtime.
+
+The basic generated file omits optional kernel-log access. To opt into NVIDIA
+Xid diagnostics, add `/dev/kmsg:/dev/kmsg:r` to the agent's `devices` and `SYSLOG`
+to `cap_add`, after checking that the host exposes `/dev/kmsg`. The generator's
+`kernelLogs` option emits both. Missing kernel-log visibility is reported by the
+existing readiness check; it is not a prerequisite for streaming.
+
+Connected agents refresh readiness every 15 seconds with one background probe
+at a time; the setup page polls every five seconds. Failed NVIDIA provisioning
+is reconsidered every minute, subject to the artifact downloader's persisted
+backoff and integrity rules. New provisioning locks use kernel-held locks, so a
+killed writer releases ownership immediately. Legacy lock markers retain their
+conservative heartbeat/age timeout during upgrades.
+
+A provisioned NVIDIA driver is also tested in a temporary sibling container using
+the running agent's local image and the app's driver-mount arguments. Results are
+cached for 60 seconds per image/driver/mount combination, with a 20-second
+in-container timeout. A confirmed EGL failure blocks launch; an inconclusive
+probe appears as a warning. This checks driver loading, not a custom app's full
+renderer or the browser's video, audio and input path. The final setup step offers
+a manual streaming checklist; those confirmations are not a stored certification.
