@@ -7,18 +7,13 @@ import (
 	"strings"
 )
 
-// SELF-DISCOVERY (prototype finding 4). The compose invocation that survives
-// every overlay — base, nvidia, console, dev, hardened, multiagent — is the one
-// nobody configures: the updater reads its OWN container's compose labels and
-// reconstructs `docker compose -p <project> --project-directory <dir> -f <f>...`
-// from them. Whatever overlays the operator used are in those labels already,
-// so there is no list to keep in step and nothing to get wrong on a host with
-// an unusual stack.
+// The compose invocation that survives every overlay is the one nobody
+// configures: read this container's own compose labels and rebuild
+// `docker compose -p <project> --project-directory <dir> -f <f>...` from them,
+// so the operator's overlays are already in it.
 //
-// It FAILS CLOSED. Without the labels there is no correct compose invocation to
-// guess at, and guessing would mean acting on the wrong project — so the
-// program refuses to serve rather than serving something that might recreate
-// somebody else's containers.
+// Fails closed. Without the labels there is no correct invocation to guess at,
+// and a guess would recreate some other project's containers.
 
 const (
 	labelProject     = "com.docker.compose.project"
@@ -26,16 +21,16 @@ const (
 	labelConfigFiles = "com.docker.compose.project.config_files"
 )
 
-// Discover reads this container's compose labels through the mounted socket.
-// `$HOSTNAME` inside a container is its short id unless the operator set one,
-// which is exactly what `docker inspect` accepts.
+// Discover reads this container's compose labels over the mounted socket.
+// `$HOSTNAME` is the container's short id unless the operator set one, which is
+// what `docker inspect` accepts.
 func Discover(ctx context.Context, d Docker) (project, workingDir string, configFiles []string, err error) {
 	self := os.Getenv("HOSTNAME")
 	if self == "" {
 		return "", "", nil, fmt.Errorf("HOSTNAME is empty: the updater cannot identify its own container, so it cannot discover its compose project")
 	}
-	// One inspect, three lines, in a fixed order — no JSON parsing, and a
-	// missing label comes back as an empty line rather than a template error.
+	// One inspect, three lines in a fixed order: no JSON parsing, and a missing
+	// label is an empty line rather than a template error.
 	format := fmt.Sprintf(`{{index .Config.Labels "%s"}}
 {{index .Config.Labels "%s"}}
 {{index .Config.Labels "%s"}}`, labelProject, labelWorkingDir, labelConfigFiles)
@@ -62,9 +57,9 @@ func Discover(ctx context.Context, d Docker) (project, workingDir string, config
 			"container %s carries no compose labels (%s / %s / %s). The updater must run as a compose service in the stack it updates; a bare `docker run` cannot be discovered",
 			self, labelProject, labelWorkingDir, labelConfigFiles)
 	}
-	// The label paths are HOST paths. If the stack directory is not mounted at
-	// that same absolute path, every compose call would read a file that is not
-	// there — so say it now, with the fix, rather than at the first apply.
+	// The label paths are HOST paths: unmounted at the same absolute path,
+	// every compose call reads a file that is not there. Say so now, with the
+	// fix, rather than at the first apply.
 	if _, statErr := os.Stat(workingDir); statErr != nil {
 		return "", "", nil, fmt.Errorf(
 			"the stack directory %s (from label %s) is not visible in this container: %v. Mount it at its HOST path — set QUASAR_STACK_DIR in deploy/.env",

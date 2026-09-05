@@ -1,20 +1,18 @@
-//! Minimal HTTP/1.0 over a unix socket.
+//! Minimal HTTP/1.0 over a unix socket. Hand-rolled rather than a new
+//! dependency: `ureq` has no unix-socket transport and the surface here is two
+//! verbs against a local socket with no TLS, redirects or auth.
 //!
-//! Hand-rolled rather than a new dependency: `ureq` (the agent's only HTTP
-//! client) has no unix-socket transport, and the whole surface used here is two
-//! verbs against a local socket with no TLS, no redirects and no auth.
-//!
-//! The request line says HTTP/1.0 on purpose: Go's server then answers without
-//! chunked transfer-encoding and closes the connection, so the body is
-//! everything up to EOF and there is no de-chunker to get wrong.
+//! HTTP/1.0 in the request line, not 1.1: Go's server then answers without
+//! chunked transfer-encoding and closes, so the body is everything up to EOF
+//! and there is no de-chunker to get wrong.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
-/// Response bodies are bounded: a result file carries at most an 8 KiB output
-/// tail, so anything past this is not one.
+/// A result file carries at most an 8 KiB output tail, so anything past this
+/// is not one.
 const MAX_BODY: usize = 256 * 1024;
 
 pub struct Response {

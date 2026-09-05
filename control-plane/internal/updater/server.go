@@ -15,19 +15,16 @@ import (
 	"time"
 )
 
-// The local HTTP surface. Four routes, over a unix socket in a named volume
-// shared by exactly one host's containers; nothing outside the host can reach
-// it and nothing outside the host is allowed to know its shape
-// (protocol/schema.md §"Not frozen: the updater's local socket").
+// The local HTTP surface: four routes over a unix socket in a volume shared by
+// one host's containers (protocol/schema.md §"Not frozen: the updater's local
+// socket").
 //
-// AUTHORISATION IS THE REQUEST, NOT THE CALLER. SO_PEERCRED yields the caller's
-// uid but pid 0 — the caller is in another pid namespace — so it is a coarse
-// sanity check and never authentication (prototype finding 1). What actually
-// constrains this program is the namespace allowlist and the digest rules in
-// plan.go, which hold no matter who connects.
+// Authorisation is the REQUEST, never the caller. SO_PEERCRED yields the
+// caller's uid but pid 0 (another pid namespace), so it is a sanity check and
+// not authentication; what constrains this program is the namespace allowlist
+// and the digest rules in plan.go, which hold whoever connects.
 
-// MaxRequestBytes bounds the body. Generous against any real request; a body
-// larger than this is not one.
+// MaxRequestBytes bounds the body; a larger one is not a real request.
 const MaxRequestBytes = 64 * 1024
 
 // Server holds everything a request needs.
@@ -42,13 +39,12 @@ type Server struct {
 	PullTimeout     time.Duration
 	RecreateTimeout time.Duration
 
-	// Version identifies this build in `/v1/self`, for the same reason every
-	// other component reports one.
+	// Reported by `/v1/self`.
 	Version string
 }
 
-// Handler wires the routes. Separate from Listen so tests can serve it over a
-// temp socket without a process.
+// Handler wires the routes, separate from Listen so a test can serve it over a
+// temp socket.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -60,9 +56,8 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// SelfResponse is what the updater discovered about itself, which is the first
-// thing to check on a host where an apply did not behave (and the acceptance
-// check for this ticket).
+// SelfResponse is what the updater discovered about itself — the first thing to
+// check on a host where an apply did not behave.
 type SelfResponse struct {
 	Version           string   `json:"version"`
 	Project           string   `json:"project"`
@@ -92,18 +87,17 @@ func (s *Server) handleSelf(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// errorBody is every rejection's shape: one closed-vocabulary identifier plus a
-// message for a human. The identifier is what a caller keys on.
+// Every rejection: one closed-vocabulary identifier (what a caller keys on)
+// plus a message for a human.
 type errorBody struct {
 	RequestID string `json:"request_id,omitempty"`
 	Reason    string `json:"reason"`
 	Message   string `json:"message"`
 }
 
-// statusFor maps a reason to its HTTP status. `busy` is 409 (a state, will
-// change), the request-shape rejections are 400, and the two rejections an
-// operator fixes by CONFIGURATION rather than by editing the request are 422 —
-// the request is well-formed and this host still will not do it.
+// `busy` is 409 (a state that will change); request-shape rejections are 400;
+// the two an operator fixes by CONFIGURATION rather than by editing the request
+// are 422 — well-formed, and this host still will not do it.
 func statusFor(reason string) int {
 	switch reason {
 	case ReasonBusy:
@@ -133,8 +127,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A re-post of an id already accepted is idempotent: the same 202, no
-	// second apply. Same rule as an `image_ensure` for an image already ready.
+	// A re-post of an accepted id is idempotent: same 202, no second apply.
 	if a, ok := s.Store.AcceptedFor(req.RequestID); ok {
 		writeJSON(w, http.StatusAccepted, a)
 		return
@@ -158,9 +151,8 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 	}
 
 	accepted := &Accepted{RequestID: req.RequestID, Previous: plan.Previous, Commands: plan.Commands}
-	// Claim is the authoritative latch; Plan's `busy` above is only the early,
-	// friendly answer. Two simultaneous posts of different ids both pass Plan
-	// and exactly one passes here.
+	// Two simultaneous posts of different ids both pass Plan; exactly one
+	// passes here.
 	if err := s.Store.Claim(req.RequestID, accepted); err != nil {
 		var rj *Rejection
 		if errors.As(err, &rj) {
@@ -171,9 +163,8 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 202 NOW, execute DETACHED. The requester is normally destroyed by the
-	// work it asked for (prototype finding 2), so the job must not be tied to
-	// the connection — the context is the process's, never the request's.
+	// 202 now, execute detached: the requester is normally destroyed by the
+	// work it asked for, so the context is the process's, never the request's.
 	exec := &Executor{
 		Store: s.Store, Docker: s.Docker, Cfg: s.Cfg, EnvPath: s.EnvPath,
 		PullTimeout: s.PullTimeout, RecreateTimeout: s.RecreateTimeout,
@@ -204,20 +195,16 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// Listen creates the unix socket at path with mode 0666 in its (named-volume)
-// directory.
-//
-// 0666 AND NO GROUP MAPPING is the decision from prototype finding 1: the
-// control plane runs as uid 1000 and the agent as root, in containers that
-// share no user namespace mapping worth relying on, and the socket is inside a
-// volume only this host's stack can mount. Tightening the mode here would buy
-// nothing and lock out the control plane.
+// Listen creates the unix socket at mode 0666, with no group mapping: the
+// control plane runs as uid 1000 and the agent as root, sharing no user-
+// namespace mapping worth relying on, and the volume is mountable only by this
+// host's stack. Tightening it locks out the control plane and buys nothing.
 func Listen(path string) (net.Listener, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	// A socket left behind by a killed predecessor is not a running server;
-	// bind would fail with "address already in use" forever.
+	// A socket left by a killed predecessor is not a server, and bind would
+	// fail "address already in use" forever.
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}

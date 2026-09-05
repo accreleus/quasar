@@ -1,23 +1,15 @@
 // Package updater is the per-host actor that pulls a platform release and
-// recreates the containers it replaces, because a container cannot recreate
-// itself (CONTEXT.md "Updater"). It ships as its own image
-// (deploy/Dockerfile.updater), runs beside the stack as compose service
-// `quasar-updater`, and is reached only over a unix socket in a named volume
-// shared by that one host's containers.
+// recreates the containers it replaces (CONTEXT.md "Updater"). It ships as its
+// own image, runs beside the stack as compose service `quasar-updater`, and is
+// reached only over a unix socket in a volume shared by one host's containers.
 //
-// NOTHING OUTSIDE A HOST SPEAKS THIS. The socket, the request body and the
-// result file are explicitly NOT a frozen interface (protocol/schema.md §"Not
-// frozen: the updater's local socket"). Both ends ship in the same platform
-// release. The frozen surface is agent-api.md's `release_apply` /
-// `release_state`, which the agent relays from the result file — which is why
-// the result file's field spellings mirror `release_state`: a relay that has to
-// translate is a relay that can lie.
+// Its socket, request body and result file are NOT a frozen interface
+// (protocol/schema.md §"Not frozen: the updater's local socket"); the frozen
+// surface is agent-api.md `release_apply` / `release_state`, which the agent
+// relays from the result file.
 //
-// This file is the DECISION, and it is a pure function. Given a request, the
-// current `.env` bytes and the host's discovered configuration it produces
-// either a plan (the exact env rewrite, the previous digests, the ordered
-// commands) or a rejection carrying one identifier from the closed `reason`
-// vocabulary. No I/O, no clock, no docker: exec.go runs what this decides.
+// This file is the decision and it is pure: request + current `.env` + host
+// config in, plan or rejection out. No I/O, no clock, no docker.
 package updater
 
 import (
@@ -54,17 +46,14 @@ const (
 // Terminal reports whether a state is one an apply can no longer leave.
 func Terminal(state string) bool { return state == StateSucceeded || state == StateFailed }
 
-// componentTarget maps a component name to the two things this program can
-// touch for it. The table is closed on purpose: a component this build does not
-// know is `invalid`, and — prototype finding 2 — the updater NEVER accepts a
-// request naming itself, which falls out of `quasar-updater` simply not being
-// in the table.
+// componentTarget maps a component name to the two things this program may
+// touch. The table is closed: an unknown name is `invalid`, and the updater
+// never accepts a request naming ITSELF because `quasar-updater` is not in it.
 type componentTarget struct {
 	service string // compose service name
 	envVar  string // the .env variable carrying its image reference
-	// aliasVar is an older spelling still honoured for READING the previous
-	// value. It is never written: compose precedence makes envVar win, and
-	// rewriting both would be two sources of truth.
+	// An older spelling, read for the previous value and never written:
+	// compose precedence makes envVar win, so writing both is two truths.
 	aliasVar string
 }
 
@@ -73,8 +62,7 @@ var componentTargets = map[string]componentTarget{
 	"node-agent":    {service: "quasar-node-agent", envVar: "QUASAR_AGENT_IMAGE", aliasVar: "QUASAR_NODE_IMAGE"},
 }
 
-// ComponentControlPlane is the one component whose never-started failure is
-// auto-restored (exec.go); named rather than spelled twice.
+// The one component whose never-started failure is auto-restored (exec.go).
 const ComponentControlPlane = "control-plane"
 
 // Component is one image to move, as the request names it.
@@ -100,11 +88,9 @@ type ApplyRequest struct {
 	WaitTimeoutS int         `json:"wait_timeout_s,omitempty"`
 }
 
-// PreviousComponent is the digest a component was on BEFORE this apply.
-// Digest is nil — never omitted — when the previous value was a local tag or
-// there was no previous value at all, which is exactly what an install-mode
-// `source` host looks like. It is what makes the manual restore recipe
-// copy-paste from any observation.
+// PreviousComponent is the digest a component was on before this apply. Digest
+// is nil, never omitted, when the previous value was a local tag or absent (an
+// install-mode `source` host). It is what makes the manual restore copy-paste.
 type PreviousComponent struct {
 	Name   string  `json:"name"`
 	Digest *string `json:"digest"`
@@ -125,16 +111,14 @@ type Config struct {
 	// WaitTimeoutS is the default `--wait-timeout` when the request names none.
 	WaitTimeoutS int
 
-	// InFlightRequestID is the single-flight latch: the id of the request that
-	// has not reached a terminal state, or "". Single-flight per host: refuse,
-	// never queue (agent-api.md `busy`). It lives here rather than in a mutex
-	// the decision reaches for so that "is this busy?" stays testable as a
-	// table row.
+	// The id of the non-terminal request, or "". Single-flight per host:
+	// refuse, never queue (agent-api.md `busy`). An input rather than a mutex
+	// the decision reaches for, so "is this busy?" stays a table row.
 	InFlightRequestID string
 }
 
-// Rejection is a refusal on the request's face, carrying one closed-vocabulary
-// identifier plus an operator-readable message.
+// Rejection carries one identifier from the closed `reason` vocabulary plus an
+// operator-readable message.
 type Rejection struct {
 	Reason  string
 	Message string
@@ -148,9 +132,8 @@ func reject(reason, format string, a ...any) *Rejection {
 
 // ApplyPlan is everything the executor needs and nothing it has to decide.
 type ApplyPlan struct {
-	// EnvRewrite is the COMPLETE new content of the stack's `.env`. Only the
-	// mapped variables' lines differ from the input; every other byte,
-	// including comments, blank lines and ordering, is preserved.
+	// The complete new content of the stack's `.env`: only the mapped
+	// variables' lines differ, every other byte is preserved.
 	EnvRewrite string
 	Previous   []PreviousComponent
 	Services   []string
@@ -171,11 +154,9 @@ var (
 var DefaultAllowedNamespaces = []string{"ghcr.io/accreleus/quasar"}
 
 // ParseNamespaces splits the comma-separated knob, trimming spaces and any
-// trailing slash so `a/b` and `a/b/` are one entry. An empty/blank value yields
-// the default rather than an empty allowlist — an empty allowlist would reject
-// everything, which reads as "the updater is broken" rather than "the operator
-// meant to lock it down", and locking it down is spelled by naming a namespace
-// nothing matches.
+// trailing slash. Blank yields the default, never an empty allowlist: an
+// allowlist that rejects everything reads as a broken updater. Lock a host down
+// by naming a namespace nothing matches.
 func ParseNamespaces(raw string) []string {
 	out := make([]string, 0, 4)
 	for _, part := range strings.Split(raw, ",") {
@@ -236,8 +217,8 @@ func Plan(req ApplyRequest, env string, cfg Config) (*ApplyPlan, *Rejection) {
 	for _, c := range req.Components {
 		t, known := componentTargets[c.Name]
 		if !known {
-			// `updater` / `quasar-updater` lands here, which is the whole of
-			// "the updater never accepts a request naming itself".
+			// `updater` / `quasar-updater` lands here: the updater never
+			// accepts a request naming itself.
 			return nil, reject(ReasonInvalid, "unknown component %q", c.Name)
 		}
 		if seen[c.Name] {
@@ -270,8 +251,7 @@ func Plan(req ApplyRequest, env string, cfg Config) (*ApplyPlan, *Rejection) {
 		t := targets[i]
 		prevVal, found := envLookup(newEnv, t.envVar)
 		if !found && t.aliasVar != "" {
-			// The alias is what compose would have resolved, so it is the
-			// honest "previous" even though it is never rewritten.
+			// What compose would have resolved, so the honest previous value.
 			prevVal, _ = envLookup(newEnv, t.aliasVar)
 		}
 		previous = append(previous, PreviousComponent{Name: c.Name, Digest: digestOf(prevVal)})
@@ -307,10 +287,9 @@ func Plan(req ApplyRequest, env string, cfg Config) (*ApplyPlan, *Rejection) {
 // by then, but a control plane runs migrations before it is healthy.
 const DefaultWaitTimeoutS = 300
 
-// ComposeArgs is the invocation that survives every overlay, because it is the
-// one nobody configures (prototype finding 4): project, working directory and
-// the ordered `-f` list all come from the updater's OWN compose labels, so
-// whatever overlays the operator used are already in it.
+// ComposeArgs is the invocation that survives every overlay because nobody
+// configures it: project, working dir and the `-f` list come from the updater's
+// own compose labels, so the operator's overlays are already in them.
 func ComposeArgs(cfg Config) []string {
 	args := []string{"compose", "-p", cfg.Project, "--project-directory", cfg.WorkingDir}
 	for _, f := range cfg.ConfigFiles {
@@ -319,9 +298,8 @@ func ComposeArgs(cfg Config) []string {
 	return args
 }
 
-// digestOf extracts the `sha256:...` half of `repo@sha256:...`. A local tag
-// (`quasar-node-agent:latest`), an empty value or anything unparsable yields
-// nil: "we could not determine it", never a guess.
+// digestOf extracts the `sha256:...` half of `repo@sha256:...`. A local tag or
+// anything unparsable yields nil — "could not determine", never a guess.
 func digestOf(value string) *string {
 	i := strings.Index(value, "@")
 	if i < 0 {

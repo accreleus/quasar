@@ -13,24 +13,22 @@ import (
 	"time"
 )
 
-// The executor runs what plan.go decided, and judges the outcome by LOOKING AT
-// THE STACK rather than by trusting an exit code (prototype finding 5):
-// `up -d` without `--wait` returns 0 for a container that starts and then dies,
-// and the one distinction that matters for safety — never-started versus
-// started-then-failed — is not in an exit code at all. It is
+// The executor runs what plan.go decided and judges the outcome from the
+// stack's post-state, not from an exit code: `up -d` without `--wait` returns 0
+// for a container that starts and then dies, and the distinction that decides
+// whether a restore is safe — never-started vs started-then-failed — is
 // `State.StartedAt` being zero, which is what proves no migration can have run.
 
-// Docker is every docker invocation this program makes, behind one seam so the
-// tests drive a fake `docker` and the production path is a plain exec.
+// Docker is every docker invocation this program makes, behind one seam so
+// tests can drive a fake `docker`.
 type Docker interface {
-	// Run executes `docker <args...>` and returns the COMBINED output. A
-	// non-zero exit is not an error: it is an exit code, returned as one.
-	// err is reserved for "the command could not be run at all".
+	// Run executes `docker <args...>` and returns the combined output. A
+	// non-zero exit is an exit code, not an error; err means the command could
+	// not be run at all.
 	Run(ctx context.Context, args []string) (output string, exitCode int, err error)
 }
 
-// CLI is the production Docker: the docker binary the image ships, talking to
-// the mounted socket.
+// CLI drives the docker binary the image ships, over the mounted socket.
 type CLI struct {
 	Bin string // "docker" unless a test or an operator says otherwise
 }
@@ -57,23 +55,20 @@ type Executor struct {
 	Store  *Store
 	Docker Docker
 	Cfg    Config
-	// EnvPath is the stack's `.env`, at the HOST path — the stack directory is
-	// mounted into this container at its host path precisely so the compose
-	// labels' paths resolve here (prototype finding 4).
+	// The stack's `.env`, at its HOST path: the stack directory is mounted into
+	// this container at that path so the compose labels resolve here.
 	EnvPath string
-	// PullTimeout / RecreateTimeout bound each step's wall clock independently
-	// of compose's own `--wait-timeout`, which only covers health.
+	// Wall-clock bounds per step, independent of compose's `--wait-timeout`,
+	// which only covers health.
 	PullTimeout     time.Duration
 	RecreateTimeout time.Duration
 }
 
-// prevPath is `.env.prev`: the previous file kept verbatim beside the new one,
-// which is what makes the restore a copy rather than a reconstruction.
+// `.env.prev`: the previous file kept verbatim, so a restore is a copy.
 func (e *Executor) prevPath() string { return e.EnvPath + ".prev" }
 
-// Apply is the whole detached job. It never returns an error to a caller —
-// there is no caller left by design — so every outcome is written to the result
-// file, which is the only thing anyone reads.
+// Apply is the whole detached job. There is no caller left to return an error
+// to, so every outcome goes to the result file, which is all anyone reads.
 func (e *Executor) Apply(ctx context.Context, req ApplyRequest, plan *ApplyPlan, priorEnv string) {
 	defer e.Store.Release(req.RequestID)
 
@@ -88,9 +83,8 @@ func (e *Executor) Apply(ctx context.Context, req ApplyRequest, plan *ApplyPlan,
 	}
 	e.save(res)
 
-	// `.env.prev` FIRST, then `.env`. In the other order a crash between the
-	// two writes leaves the new digest installed with no record of the old one,
-	// which is exactly the state prototype finding 5 says must never exist.
+	// `.env.prev` FIRST. The other order leaves a crash between the two writes
+	// with the new digest installed and no record of the old one.
 	if err := os.WriteFile(e.prevPath(), []byte(priorEnv), 0o600); err != nil {
 		e.fail(res, ReasonRecreateFailed, fmt.Sprintf("could not write %s: %v", e.prevPath(), err))
 		return
@@ -123,20 +117,17 @@ func (e *Executor) Apply(ctx context.Context, req ApplyRequest, plan *ApplyPlan,
 		return
 	}
 
-	// A verification failure reports the RECREATE's output, not the
-	// verification's: the operator needs what compose said, and the post-state
-	// probe adds one line of context rather than replacing it.
+	// Report the recreate's output, not the probe's: the operator needs what
+	// compose said, with the post-state as one added line.
 	body := outputOrErr(upOut, upErr)
 	if detail != "" {
 		body = strings.TrimRight(body, "\n") + "\n" + detail + "\n"
 	}
 
-	// AUTO-RESTORE, and only here. The target is the control plane and the new
-	// container never started, so ADR 0002 holds — no migration can have run —
-	// and there is no console left to click "Revert" with. A node-agent apply is
-	// NEVER auto-restored: the agent carries no migrations, so nothing about it
-	// is unsafe to leave failed, and a host that silently reverts its own agent
-	// hides the failure from the fleet view that exists to show it.
+	// The only automatic restore: control-plane target, never started, so no
+	// migration can have run (ADR 0002) and no console is left to click
+	// "Revert". A node-agent apply is NEVER auto-restored — it carries no
+	// migrations, and a host that silently reverts hides the failure.
 	if reason == ReasonNeverStarted && targetsControlPlane(req.Components) {
 		res.Restored = e.restore(ctx, plan)
 		if res.Restored {
@@ -190,16 +181,14 @@ type composePS struct {
 	Health  string `json:"Health"`
 }
 
-// verify judges the stack's ACTUAL post-state. It returns "" when everything
-// asked for is running and healthy-or-health-less, else a reason plus one line
-// of detail.
+// verify returns "" when every named service is running and healthy-or-
+// health-less, else a reason plus one line of detail.
 func (e *Executor) verify(ctx context.Context, services []string, upFailed bool) (string, string) {
 	args := append(ComposeArgs(e.Cfg), "ps", "-a", "--format", "json")
 	args = append(args, services...)
 	out, code, err := e.run(ctx, args, 60*time.Second)
 	if err != nil || code != 0 {
-		// Cannot see the stack. That is not evidence of success, and the
-		// recreate's own verdict is the best information available.
+		// Cannot see the stack, which is not evidence of success.
 		if upFailed {
 			return ReasonRecreateFailed, "post-state could not be read: " + strings.TrimSpace(out)
 		}
@@ -213,8 +202,7 @@ func (e *Executor) verify(ctx context.Context, services []string, upFailed bool)
 	for _, svc := range services {
 		p, found := byService[svc]
 		if !found || p.ID == "" {
-			// No container at all: the recreate did not get far enough to make
-			// one, so there is nothing to have started or not started.
+			// No container at all, so there is nothing to have started.
 			return ReasonRecreateFailed, fmt.Sprintf("service %s has no container after the recreate", svc)
 		}
 		running := strings.EqualFold(p.State, "running")
@@ -222,9 +210,8 @@ func (e *Executor) verify(ctx context.Context, services []string, upFailed bool)
 		if running && healthy {
 			continue
 		}
-		// NEVER-STARTED is checked before anything else, because it is the one
-		// failure in which nothing the new image would have done can have
-		// happened — the whole basis of the control-plane auto-restore.
+		// Checked first: it is the one failure in which nothing the new image
+		// would have done can have happened, which is what makes a restore safe.
 		if e.neverStarted(ctx, p.ID) {
 			return ReasonNeverStarted, fmt.Sprintf("service %s: container %s never started (State.StartedAt is zero)", svc, p.Name)
 		}
@@ -248,18 +235,15 @@ const zeroStartedAt = "0001-01-01T00:00:00Z"
 func (e *Executor) neverStarted(ctx context.Context, containerID string) bool {
 	out, code, err := e.run(ctx, []string{"inspect", "--format", "{{.State.StartedAt}}", "--", containerID}, 30*time.Second)
 	if err != nil || code != 0 {
-		// Unknown is not "never started": the safe reading is the one that does
-		// NOT trigger an automatic restore.
+		// Unknown is not "never started": never trigger a restore on a guess.
 		return false
 	}
 	s := strings.TrimSpace(out)
 	return s == "" || strings.HasPrefix(s, "0001-01-01")
 }
 
-// parseComposePS accepts both shapes compose has emitted for `--format json`:
-// a JSON array, and one object per line (NDJSON). Which one you get depends on
-// the compose version, and the updater image pins its own compose independently
-// of the host's — so it must not depend on either.
+// Both shapes compose emits for `--format json`: a JSON array and NDJSON. Which
+// one depends on the compose version, and this image pins its own.
 func parseComposePS(out string) []composePS {
 	trimmed := strings.TrimSpace(out)
 	if strings.HasPrefix(trimmed, "[") {
@@ -313,6 +297,6 @@ func (e *Executor) fail(r *Result, reason, output string) {
 	log.Printf("apply %s FAILED: %s", r.RequestID, reason)
 }
 
-// EnvPathFor is where a discovered project keeps its env file. Named rather
-// than spelled inline so the server and the executor cannot disagree.
+// Where a discovered project keeps its env file; named so the server and the
+// executor cannot disagree.
 func EnvPathFor(cfg Config) string { return filepath.Join(cfg.WorkingDir, ".env") }

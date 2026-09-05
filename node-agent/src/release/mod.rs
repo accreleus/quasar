@@ -1,14 +1,13 @@
-//! Agent-side client for this host's **updater** (`CONTEXT.md`).
+//! Agent-side client for this host's updater (`CONTEXT.md`).
 //!
-//! The agent relays; it does not author. `release_apply` is validated, acked on
-//! acceptance, POSTed to the updater's local socket, and from then on every
-//! `release_state` is a re-frame of the updater's result file for that request
-//! id. This module runs no compose command, keeps no apply state of its own,
-//! and performs no session logic at any point (agent-api.md `release_state`).
+//! The agent relays and does not author: `release_apply` is validated, acked on
+//! acceptance, POSTed to the local socket, and every `release_state` after that
+//! is a re-frame of the updater's result file. This module runs no compose
+//! command, keeps no apply state, and performs no session logic at any point
+//! (agent-api.md `release_state`).
 //!
 //! The socket and the result file are NOT a frozen interface
-//! (protocol/schema.md §"Not frozen: the updater's local socket"); the wire
-//! shapes this module emits are.
+//! (protocol/schema.md §"Not frozen: the updater's local socket").
 
 mod unix_http;
 
@@ -32,19 +31,17 @@ pub const DEFAULT_RESULTS_DIR: &str = "/run/quasar-updater/results";
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How long the result may stop advancing before the apply is called
-/// `updater_unreachable`. The window has to survive the agent's own recreate
-/// (2 s in the prototype) plus a control-plane apply's health wait, so it is
-/// generous: a wrong `updater_unreachable` is a false alarm about a working
-/// apply, which is worse than a late one.
+/// `updater_unreachable`. Generous: it must survive the agent's own recreate
+/// plus a health wait, and a false alarm about a working apply is worse than a
+/// late one.
 const UNREACHABLE_AFTER: Duration = Duration::from_secs(180);
 
 /// Hard bound on one apply's observation, past which nothing more will be
 /// learned by looking.
 const POLL_DEADLINE: Duration = Duration::from_secs(2 * 3600);
 
-/// The component names this agent build is allowed to apply. `control-plane` is
-/// absent on purpose: a control plane asking an agent to replace the control
-/// plane is the shape of a confused-deputy bug, and this makes it
+/// What this build may apply. `control-plane` is absent: a control plane asking
+/// an agent to replace the control plane is a confused deputy, and this makes it
 /// unrepresentable (agent-api.md `release_apply`).
 const APPLIABLE_COMPONENTS: &[&str] = &["node-agent"];
 
@@ -140,10 +137,9 @@ impl ReleaseManager {
     }
 
     /// Attach this connection's channel and re-emit the current state of every
-    /// result file still present — the reconciliation posture `register`'s
-    /// `images` snapshot has. A control plane that missed frames catches up
-    /// without asking, and an agent replaced mid-apply reports what happened to
-    /// the apply that replaced it.
+    /// result file still present, so a control plane that missed frames catches
+    /// up without asking and an agent replaced mid-apply still reports the
+    /// apply that replaced it.
     pub fn attach_upstream(self: &Arc<Self>, tx: mpsc::Sender<AgentMsg>) -> UpstreamGuard {
         *self.upstream.write().unwrap() = Some(tx);
         for res in self.read_all_results() {
@@ -232,9 +228,9 @@ impl ReleaseManager {
             Duration::from_secs(30),
         );
         match reply {
-            // A socket file with nobody listening is "there is no actor", which
-            // is `updater_absent` — `updater_unreachable` is reserved for losing
-            // sight of an apply that was already accepted.
+            // A socket with nobody listening is "there is no actor" =
+            // `updater_absent`; `updater_unreachable` is for losing sight of an
+            // apply already accepted.
             Err(e) => {
                 self.clear_inflight(&request_id);
                 warn!(
@@ -271,10 +267,9 @@ impl ReleaseManager {
         }
     }
 
-    /// Relay every state change until the apply is terminal.
-    ///
-    /// A std thread, not a task: this normally outlives the connection AND the
-    /// process, since recreating the agent is what the apply does.
+    /// Relay every state change until the apply is terminal. A std thread, not
+    /// a task: it normally outlives the connection and the process, since
+    /// recreating the agent is what the apply does.
     fn spawn_poller(self: &Arc<Self>, request_id: String) {
         let mgr = self.clone();
         std::thread::spawn(move || {
@@ -322,10 +317,9 @@ impl ReleaseManager {
         });
     }
 
-    /// The result file, read over the socket, or straight off the shared volume
-    /// when the socket is unavailable. Either source is the same file; the
-    /// direct read is what keeps an apply observable while the updater itself
-    /// is restarting.
+    /// The result file over the socket, or straight off the shared volume when
+    /// the socket is unavailable — the same file either way, and the direct read
+    /// keeps an apply observable while the updater itself restarts.
     fn read_result(&self, request_id: &str) -> Option<UpdaterResult> {
         let over_socket = unix_http::request(
             &self.socket,
@@ -360,8 +354,8 @@ impl ReleaseManager {
         }
     }
 
-    /// Every result file present, newest state per request id, ordered so the
-    /// re-emit is deterministic.
+    /// Every result file present, one per request id, ordered so the re-emit is
+    /// deterministic.
     fn read_all_results(&self) -> Vec<UpdaterResult> {
         let Ok(entries) = std::fs::read_dir(&self.results_dir) else {
             return Vec::new();
@@ -429,8 +423,8 @@ fn ack(id: String) -> AgentMsg {
     }
 }
 
-/// A rejected apply carries one identifier from the `release_state` `reason`
-/// vocabulary, never a sentence: the admin UI maps identifiers to text.
+/// One identifier from the `release_state` `reason` vocabulary, never a
+/// sentence: the admin UI maps identifiers to text.
 fn nack(id: String, reason: &str) -> AgentMsg {
     AgentMsg::Ack {
         id,
@@ -439,10 +433,9 @@ fn nack(id: String, reason: &str) -> AgentMsg {
     }
 }
 
-/// Ack-time validation. Returns the rejection reason, or None to proceed.
-/// The namespace allowlist is the updater's to enforce — it is host
-/// configuration the agent does not hold — so `namespace_rejected` reaches the
-/// ack by relay, not from here.
+/// Ack-time validation; the rejection reason, or None to proceed. The namespace
+/// allowlist is host configuration the agent does not hold, so
+/// `namespace_rejected` reaches the ack by relay rather than from here.
 fn validate(request_id: &str, components: &[ReleaseComponent]) -> Option<&'static str> {
     if !is_uuid(request_id) {
         return Some("invalid");

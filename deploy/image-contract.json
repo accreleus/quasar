@@ -184,6 +184,46 @@
       "_deployment_ban_note": "build-images.sh refuses to write the quasar-node-agent or quasar-nv tag from this role."
     },
 
+    "updater": {
+      "_role": "Per-host updater (Dockerfile.updater). Static Go binary on docker:29-cli. NOT part of a platform release -- it is what APPLIES one, so it cannot be one of the images an apply moves by digest (docs/upgrading.md).",
+      "size_max_mb": 200,
+      "_size_note": "docker:29-cli is ~120MB (alpine + docker CLI + buildx/compose plugins) and the updater binary is ~8MB. If this ceiling breaks, the base moved -- do not raise it to make a red build green.",
+
+      "binaries": {
+        "required": ["docker", "quasar-updater"],
+        "_required_notes": {
+          "docker": "The CLI this program exists to drive. Its compose plugin is asserted separately below, because a docker CLI WITHOUT the compose plugin passes this line and can do nothing the updater needs.",
+          "quasar-updater": "The baked binary. Alpine base, so no rpm/package assertions apply to this role."
+        },
+        "forbidden": ["go", "gcc", "cargo"]
+      },
+
+      "commands": {
+        "must_succeed": {
+          "docker compose version": "The compose plugin, pinned IN THE IMAGE so the invocation is independent of the host's compose version (prototype finding 4). Its absence is invisible to a `docker` binary check and turns every apply into a `recreate_failed`."
+        }
+      },
+
+      "paths": {
+        "required": ["/usr/local/bin/quasar-updater"],
+        "forbidden": ["/go", "/usr/local/go", "/src"]
+      },
+
+      "labels": {
+        "required": [
+          "org.quasar.image.role",
+          "org.quasar.source.commit",
+          "org.quasar.built.at"
+        ],
+        "_notes": "No org.quasar.pins.base: this role is the one image not built on the quasar-base family, so there is no base pin to record."
+      },
+
+      "image_config": {
+        "healthcheck_required": false,
+        "must_not_run_as_root": false,
+        "_root_note": "Root is REQUIRED here: the updater talks to the mounted docker socket and writes the stack's .env at its host path. Documented in deploy/Dockerfile.updater."
+      }
+    },
     "control": {
       "_role": "Control-plane production image (Dockerfile.control.prod). Static Go binary + embedded web SPA on quasar-base.",
       "size_max_mb": 400,

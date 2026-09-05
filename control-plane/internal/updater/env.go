@@ -2,17 +2,14 @@ package updater
 
 import "strings"
 
-// The stack's `.env` is an OPERATOR-OWNED file. It carries the database
-// password, the enrollment token, every tuning knob and the operator's own
-// comments, and the updater rewrites exactly two of its lines. So the rule here
-// is byte preservation, not round-tripping: nothing is parsed into a map and
-// re-serialised. Lines are found, the matched one is replaced in place, and
-// every other byte — comments, blank lines, ordering, CRLF, a missing trailing
-// newline — comes out unchanged.
+// The stack's `.env` is operator-owned: it holds the database password, the
+// enrollment token and the operator's comments, and the updater rewrites two of
+// its lines. The rule is byte preservation, never round-tripping — nothing is
+// parsed into a map and re-serialised, so comments, ordering, CRLF and a
+// missing trailing newline all survive.
 //
-// The dialect matched is compose's own, which is deliberately narrow:
-// `NAME=value`, optional leading whitespace, no `export`, value to end of line.
-// Anything else is not a definition of NAME and is left alone.
+// The dialect matched is compose's own and no wider: `NAME=value`, optional
+// leading whitespace, no `export`. Anything else is not a definition of NAME.
 
 // envSplitLines splits content into lines while remembering their terminators,
 // so joining them back is byte-identical to the input.
@@ -72,17 +69,10 @@ func envLookup(content, name string) (string, bool) {
 	return value, found
 }
 
-// envSet replaces every definition of name with `name=value`, or appends one
-// when there is none.
-//
-// EVERY definition, not just the last: a duplicate is already pathological, and
-// leaving a stale one behind would make the file disagree with itself about
-// which digest is installed — the exact confusion `.env.prev` exists to avoid.
-// Replacement is in place, so a duplicate's position is preserved too.
-//
-// Appending adds a newline first when the file does not end with one, so a
-// `.env` whose last line has no terminator does not silently absorb the new
-// variable into it.
+// envSet replaces EVERY definition of name with `name=value`, or appends one.
+// Every, not just the last: a stale duplicate would make the file disagree with
+// itself about which digest is installed. Appending adds a newline first when
+// the file lacks one, so an unterminated last line cannot absorb the new var.
 func envSet(content, name, value string) string {
 	lines, terms := envSplitLines(content)
 	replaced := false

@@ -11,20 +11,17 @@ import (
 	"time"
 )
 
-// One result file per request id, in the shared volume, written atomically
-// (tmp + rename) — prototype finding 2. The reader is a DIFFERENT container
-// than the writer and is normally being replaced while the write happens, so a
+// One result file per request id, written tmp+rename. The reader is a different
+// container from the writer and is normally being replaced mid-write, so a
 // half-written file must be unrepresentable: rename is atomic within a
-// filesystem, so a reader sees either the previous complete result or the next
-// one, never a prefix.
+// filesystem, so a reader sees one complete result or the previous one.
 //
-// The field spellings are agent-api.md `release_state`'s, so the agent's relay
-// is a re-frame and not a translation. That is a convenience, NOT a contract:
-// schema.md declares this file explicitly un-frozen.
+// Field spellings match agent-api.md `release_state` so the agent's relay is a
+// re-frame, not a translation. A convenience, not a contract: schema.md
+// declares this file un-frozen.
 
-// OutputTailBytes bounds the failing step's captured output in a result. The
-// wire caps `output` at 8192 bytes and truncates from the FRONT at a line
-// boundary — the error is at the end — so the file carries what the wire can.
+// The wire caps `output` at 8192 bytes, truncated from the front at a line
+// boundary (the error is at the end), so the file carries what the wire can.
 const OutputTailBytes = 8192
 
 // Result is one apply's whole observable state.
@@ -39,22 +36,18 @@ type Result struct {
 	UpdatedAt  string              `json:"updated_at"`
 	FinishedAt *string             `json:"finished_at"`
 
-	// Beyond the wire's fields, and local by definition:
-	// Restored is true when a never-started control-plane apply was rolled back
-	// to `.env.prev` by the updater itself (exec.go).
+	// Local-only, beyond the wire's fields.
+	// True when a never-started control-plane apply was rolled back (exec.go).
 	Restored bool `json:"restored"`
-	// Release is the provenance the request carried, so a human reading this
-	// file knows what was being installed.
+	// The provenance the request carried, so a human reading this file knows
+	// what was being installed.
 	Release Release `json:"release"`
-	// Commands is exactly what was (or will be) run, so the manual recipe in a
-	// failure is copy-paste rather than reconstructed.
+	// Exactly what was run, so a failure's manual recipe is copy-paste.
 	Commands [][]string `json:"commands"`
 }
 
-// resultIDRe guards the path built from a request id. The id is a uuid by the
-// time it reaches here, but this is the one place a request field becomes a
-// FILESYSTEM PATH, so it is re-checked rather than assumed: `../../etc/x` must
-// never be openable through this door.
+// The one place a request field becomes a filesystem path, so the uuid shape is
+// re-checked rather than assumed: `../../etc/x` must never open through here.
 var resultIDRe = regexp.MustCompile(`^[0-9a-fA-F-]{36}$`)
 
 // Store owns the results directory and the single-flight latch.
@@ -68,9 +61,8 @@ type Store struct {
 	accepted map[string]*Accepted
 }
 
-// Accepted is the 202 body: what the updater will do, answered at once so the
-// requester can persist it and stop caring whether it survives (prototype
-// finding 2 — the requester is often destroyed by the work).
+// Accepted is the 202 body: what the updater will do, answered at once because
+// the requester is normally destroyed by the work it asked for.
 type Accepted struct {
 	RequestID string              `json:"request_id"`
 	Previous  []PreviousComponent `json:"previous"`
@@ -112,9 +104,8 @@ func (s *Store) AcceptedFor(requestID string) (*Accepted, bool) {
 	return a, ok
 }
 
-// Claim latches the single-flight slot for requestID. It fails when another id
-// holds it, so the latch and the check cannot race apart — Plan's `busy` is the
-// friendly answer, this is the one that is actually authoritative.
+// Claim latches the single-flight slot. Authoritative: Plan's `busy` is the
+// early answer, but only this can decide between two simultaneous posts.
 func (s *Store) Claim(requestID string, a *Accepted) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -136,7 +127,7 @@ func (s *Store) Release(requestID string) {
 }
 
 // Write persists a result atomically. `updated_at` is stamped here so no caller
-// can forget it, and `finished_at` is filled exactly when the state is terminal.
+// can forget it; `finished_at` is set exactly when the state is terminal.
 func (s *Store) Write(r *Result) error {
 	p, err := s.path(r.RequestID)
 	if err != nil {
@@ -154,8 +145,8 @@ func (s *Store) Write(r *Result) error {
 	} else {
 		r.FinishedAt = nil
 	}
-	// Never a nil slice on the wire: `components` and `previous` are required
-	// arrays, and `null` is not an empty array.
+	// `components` and `previous` are required arrays on the wire, and `null`
+	// is not an empty array.
 	if r.Components == nil {
 		r.Components = []Component{}
 	}
@@ -168,7 +159,7 @@ func (s *Store) Write(r *Result) error {
 	}
 	body = append(body, '\n')
 
-	// tmp in the SAME directory: rename is only atomic within a filesystem.
+	// Same directory: rename is only atomic within a filesystem.
 	tmp, err := os.CreateTemp(s.dir, ".tmp-"+r.RequestID+"-*")
 	if err != nil {
 		return err
@@ -179,8 +170,8 @@ func (s *Store) Write(r *Result) error {
 		tmp.Close()
 		return err
 	}
-	// fsync before rename: a rename that lands before the data does would leave
-	// a valid name over an empty file after a host crash.
+	// fsync before rename, or a host crash can leave a valid name over an
+	// empty file.
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		return err
@@ -211,9 +202,8 @@ func (s *Store) Read(requestID string) (*Result, error) {
 	return &r, nil
 }
 
-// TailOutput keeps the LAST cap bytes, cut forward to a line boundary. The
-// failing step's error is at the end of its output; a prefix would reliably
-// capture the banner and drop the cause.
+// TailOutput keeps the last cap bytes, cut forward to a line boundary. The
+// error is at the END of a failing step's output; a prefix keeps the banner.
 func TailOutput(s string, cap int) string {
 	if len(s) <= cap {
 		return s
