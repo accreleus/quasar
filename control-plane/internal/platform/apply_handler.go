@@ -71,6 +71,7 @@ func (h *ApplyHandler) WithEdgeResolver(r ApplyComponentResolver) *ApplyHandler 
 // control.
 func (h *ApplyHandler) Register(mux httpx.Router, admin func(http.Handler) http.Handler) {
 	mux.Handle("POST /v1/admin/platform/hosts/{id}/apply", admin(http.HandlerFunc(h.handleHostApply)))
+	mux.Handle("POST /v1/admin/platform/hosts/{id}/revert", admin(http.HandlerFunc(h.handleHostRevert)))
 	mux.Handle("GET /v1/admin/platform/attempts", admin(http.HandlerFunc(h.handleAttempts)))
 }
 

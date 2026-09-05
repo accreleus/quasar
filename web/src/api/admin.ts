@@ -919,6 +919,21 @@ export function applyPlatformReleaseToHost(
   });
 }
 
+/** Put one host back on the digests recorded as previous on its last succeeded
+ *  attempt. A revert is an apply with an older digest set; the control plane is
+ *  never revertible (ADR 0002). */
+export function revertPlatformHost(
+  token: string,
+  hostId: string,
+  req: { force?: boolean } = {},
+): Promise<PlatformApplyAttemptEnvelope> {
+  return apiFetch<PlatformApplyAttemptEnvelope>(`/admin/platform/hosts/${hostId}/revert`, {
+    method: "POST",
+    body: req,
+    token,
+  });
+}
+
 /** Apply history, newest first, control-plane attempts included. */
 export function listPlatformAttempts(
   token: string,

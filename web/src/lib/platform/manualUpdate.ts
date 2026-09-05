@@ -112,11 +112,36 @@ function pinnedImages(release?: PlatformRelease | null): [string, string] | null
   return [pins[0], pins[1]];
 }
 
-/** The registry-install recipe: re-pin the two digests, pull, recreate. */
-export function registryCommands(release?: PlatformRelease | null): ManualCommand[] {
+/** A digest to go BACK to, and the repository it belongs to: what an attempt
+ *  recorded as previous. */
+export interface PreviousAgentImage {
+  image?: string | null;
+  digest: string;
+}
+
+/** The registry-install recipe: re-pin the digests, pull, recreate.
+ *  With `previous`, only the node agent moves — a revert never touches the
+ *  control plane's pin (ADR 0002). */
+export function registryCommands(
+  release?: PlatformRelease | null,
+  previous?: PreviousAgentImage | null,
+): ManualCommand[] {
   const pins = pinnedImages(release);
   const control = pins ? pins[0] : CONTROL_IMAGE_PLACEHOLDER;
   const agent = pins ? pins[1] : AGENT_IMAGE_PLACEHOLDER;
+  if (previous) {
+    const repo = previous.image?.trim() || "ghcr.io/accreleus/quasar/quasar-node-agent";
+    return [
+      {
+        label: "1. Pin the previous node-agent digest in deploy/.env",
+        command: `${AGENT_IMAGE_VAR}=${repo}@${previous.digest}`,
+      },
+      {
+        label: "2. Pull the pinned image and recreate the agent",
+        command: `${REGISTRY_PULL_COMMAND}\n${REGISTRY_RECREATE_COMMAND}`,
+      },
+    ];
+  }
   return [
     {
       label: "1. Pin the release's digests in deploy/.env",

@@ -487,7 +487,13 @@ func (r *Runner) HandleRegister(ctx context.Context, hostID string, sourceCommit
 		r.log.Warn("register: could not check for an in-flight apply", "host_id", hostID, "err", err)
 		return
 	}
-	if wantCommit == "" || sourceCommit == nil || *sourceCommit == "" {
+	if sourceCommit == nil || *sourceCommit == "" {
+		return
+	}
+	if wantCommit == "" {
+		// A revert to a build this instance can no longer name has no commit
+		// to match; its evidence rule is in apply_revert.go.
+		r.revertRegisterEvidence(ctx, a, *sourceCommit)
 		return
 	}
 	if !commitsMatch(wantCommit, *sourceCommit) {

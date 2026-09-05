@@ -4163,8 +4163,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Put one host back on its previous digests (admin). NOT CURRENTLY SERVED — see x-unimplemented.
-         * @description NOT IMPLEMENTED AS OF 2026-09-05 — registered by #118, which removes this marker. A REVERT IS AN APPLY WITH AN OLDER DIGEST SET - the same agent-api.md release_apply message, the same states, the same reasons; only kind "revert" on the attempt distinguishes it, so history can say which button was pressed. THERE IS NO REVERT MESSAGE ON THE WIRE. The target digests are the previous_digests recorded on this host's last succeeded attempt and nothing else - a digest set observed running on THIS host, not a version an admin picks. Reverting the CONTROL PLANE is not offered at any depth: it carries migrations. Bounded by ADR 0002 all the same - a previous digest set ordering above the control plane's current release is refused with host_not_eligible / release_above_control_plane.
+         * Put one host back on its previous digests (admin).
+         * @description A REVERT IS AN APPLY WITH AN OLDER DIGEST SET - the same agent-api.md release_apply message, the same states, the same reasons; only kind "revert" on the attempt distinguishes it, so history can say which button was pressed. THERE IS NO REVERT MESSAGE ON THE WIRE. The target digests are the previous_digests recorded on this host's last succeeded attempt and nothing else - a digest set observed running on THIS host, not a version an admin picks. Reverting the CONTROL PLANE is not offered at any depth: it carries migrations. Bounded by ADR 0002 all the same - a previous digest set ordering above the control plane's current release is refused with host_not_eligible / release_above_control_plane.
          */
         post: {
             parameters: {
