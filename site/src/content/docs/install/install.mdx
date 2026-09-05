@@ -37,27 +37,12 @@ published images, which is about 20 GB.
 
 3. **Save this as `deploy/.env`**, beside it, with your own secrets.
 
-   ```bash
-   # Generate each of these. Do not reuse anything from a guide.
-   #   openssl rand -hex 24     -> POSTGRES_PASSWORD
-   #   openssl rand -hex 32     -> ENROLLMENT_TOKEN
-   #   openssl rand -base64 32  -> QUASAR_SECRET_KEY
-   POSTGRES_PASSWORD=
-   ENROLLMENT_TOKEN=
-   QUASAR_SECRET_KEY=
+   <Code code={files.env} lang="bash" />
 
-   # The two paths you created in step 1.
-   QUASAR_HOME_ROOT=/var/lib/quasar/homes
-   QUASAR_TEMPLATE_ROOT=/var/lib/quasar/templates
-
-   # This deploy/ directory, as an absolute path on this machine. Print it
-   # with `cd deploy && pwd`. The updater service needs it.
-   QUASAR_STACK_DIR=/opt/quasar/deploy
-
-   # Every IP and hostname anyone will type into a browser. The certificate
-   # names these and it is generated once, on first boot.
-   QUASAR_TLS_HOSTS=192.168.1.50,quasar.lan
-   ```
+   Run the three OpenSSL commands in a terminal and paste their outputs into the
+   blank credential values. Set the actual stack-directory path and published
+   image references as instructed. Keep `deploy/.env` private (`chmod 600 deploy/.env`).
+   For Unraid-owned application data, set `QUASAR_APP_PUID=99` and `QUASAR_APP_PGID=100`.
 
 4. **On NVIDIA, use this complete file instead of the file in step 2.**
 
@@ -69,7 +54,8 @@ published images, which is about 20 GB.
 5. **Select published images and start it.**
 
    Set `QUASAR_CONTROL_IMAGE` and `QUASAR_AGENT_IMAGE` to the digest references
-   in your chosen GitHub release's `platform-release-manifest.json`. Set
+   in your chosen [GitHub release](https://github.com/accreleus/quasar/releases)'s
+   `platform-release-manifest.json`. Set
    `QUASAR_UPDATER_IMAGE` to the updater image published for that release.
    Do not assume that a `latest` tag exists. These values are required before
    Compose starts any service. A prerelease is for testing, not the default install.
@@ -114,9 +100,8 @@ compose labels. It builds nothing, runs no arbitrary command, and never touches
 Postgres, your game containers, or anything else on the machine.
 
 `QUASAR_STACK_DIR` above must be this directory's absolute host path. Left unset,
-the updater refuses to serve and says so, rather than guess at a compose
-invocation and recreate the wrong project's containers. Nothing else in the stack
-is affected.
+Compose refuses to start this generated stack and asks you to set the path.
+It must point to your existing deployment files, not an empty directory.
 
 <Aside type="tip" title="Podman">
 Set `QUASAR_DOCKER_SOCKET=/run/user/<uid>/podman/podman.sock`. The service
@@ -131,43 +116,24 @@ Quasar](/quasar/admin/releases/).
 
 ## Updating
 
+Images in this installation are explicitly pinned. Pulling the same digest does
+not select a new release. Use **Admin → Fleet → Releases** to review and apply
+available updates with sessions drained first; see [Updating
+Quasar](/quasar/admin/releases/).
+
+For a manual update, read [Upgrading](/quasar/operations/upgrading/), then replace
+the control-plane and agent pins in `deploy/.env` with the new release's digest
+references. Use that release's published updater version where required. Do not
+use an invented tag or assume `latest` exists.
+
 ```bash
+docker compose -f deploy/docker-compose.yml config --quiet
 docker compose -f deploy/docker-compose.yml pull
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
-`:latest` is what the image variables default to, so this is the whole upgrade.
-Read [Upgrading](/quasar/operations/upgrading/) before doing it on anything you
-care about, because database migrations only go forward.
-
-Once the stack is up, Admin, Fleet, Releases does the same thing with the
-sessions drained first and the whole fleet moved in order — see [Updating
-Quasar](/quasar/admin/releases/).
-
-### Pinning a version instead
-
-If you would rather decide when to move, set both image variables to digests in
-`deploy/.env`:
-
-```bash
-QUASAR_CONTROL_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@sha256:...
-QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@sha256:...
-```
-
-Read a digest with `docker buildx imagetools inspect <image>:latest`. A tag can
-move underneath you and a digest cannot. That is the whole trade. You stop
-getting surprises and you start deciding when to move — from the console, or by
-hand.
-
-`QUASAR_UPDATER_IMAGE` is set the same way, in the same file, but by tag:
-
-```bash
-QUASAR_UPDATER_IMAGE=ghcr.io/accreleus/quasar/quasar-updater:latest
-```
-
-The updater is what applies a release, so it is not one of the images a release
-moves and it is not pinned with them. It updates on its own schedule, which is
-whenever you pull it.
+Keep a backup of the existing pins and follow the documented database migration
+limits when considering a rollback.
 
 ## Building from source
 
@@ -193,4 +159,5 @@ docker compose -f deploy/docker-compose.yml down
 ```
 
 Leave `-v` off unless you mean to delete the database and the agent state. Save
-data and the certificate are on host paths and Compose never touches them.
+data stays on its host path. Certificates and artwork are in the control-plane
+named volume, which `down` preserves unless you also request volume removal.
