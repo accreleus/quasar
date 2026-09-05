@@ -84,7 +84,10 @@ ISSUE_PATTERNS=(
   '\bdevbox\b'
   '\b[Hh]ermes\b'
   '\bqdev\b'
-  '/mnt/user/appdata'
+  # An Unraid appdata path is only a fingerprint when it names one of the operator's
+  # machines or users; `/mnt/user/appdata/<app>` alone is every Unraid user's path
+  # and appears legitimately in install-help comments (#126, 2026-09-06).
+  '/mnt/user/appdata/[A-Za-z0-9._/-]*(qdev|devbox|[Hh]ermes|[Tt]ower)'
 )
 
 # --- exclusions --------------------------------------------------------------
