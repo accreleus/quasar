@@ -24,6 +24,23 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+
+- **A fleet update no longer fails on the first host right after the control plane
+  updates itself (#117).** When the new control plane came back and picked the run up,
+  it moved to the first host before the agents had reconnected, recorded the miss as
+  `updater_unreachable` and failed the run. An apply now waits for the host's agent to
+  be connected (up to 60 s) before sending, a re-adopted run pauses briefly before its
+  first host, and an unreachable agent is reported as `timeout`. Found on the first real
+  fleet update, `v0.2.0-rc.2` → `v0.2.0`.
+- **A failed fleet run no longer leaves hosts cordoned (#117).** The hosts' pre-run
+  cordon state was held in memory and lost across the control plane's own restart. It is
+  now recorded on the run (migration 0076, `platform_apply_runs.cordoned_hosts`) and
+  restored on every terminal path; a host still draining afterwards is logged as an
+  error.
+- **The Releases tab's Targets rail says "Up to date" for a current control plane (#104)**
+  instead of "Not ready".
+
 ## 0.2.0 — 2026-09-05
 
 ### Security
