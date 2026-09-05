@@ -16,6 +16,7 @@ import { SectionHeadProvider } from "../../../components/shell/sectionHead";
 import { FLEET_TABS } from "../../../components/shell/sectionTabs";
 import { ToastProvider } from "../../../components/Toast";
 import { FleetApplyButton, FleetRunPanel } from "./FleetApply";
+import { eligibilityText } from "./releasesCopy";
 import { ReleasesTab } from "./ReleasesTab";
 
 vi.mock("../../../auth/context", () => ({ useAuth: () => ({ token: "tok" }) }));
@@ -182,6 +183,46 @@ describe("FleetApplyButton", () => {
     expect(within(dialog).getByText("0.3.0")).toBeInTheDocument();
     expect(within(dialog).getByText(/ends every live session on 3 hosts/)).toBeInTheDocument();
     expect(within(dialog).getByText(/lose contact for about 20 seconds/)).toBeInTheDocument();
+  });
+
+  // Nothing moves before the control plane, so a run it cannot take is refused
+  // by the server; the button must not offer it.
+  it("is disabled, with the control plane's own reason, when the control plane cannot take it", () => {
+    const v = view({
+      targets: [
+        {
+          kind: "control_plane",
+          host_id: null,
+          node_name: null,
+          eligible: false,
+          reason: "install_mode_source",
+        },
+        { kind: "host", host_id: "h1", node_name: "gpu-host-01", eligible: true, reason: null },
+      ],
+    } as Partial<PlatformReleaseView>);
+    renderButton(v);
+
+    const button = screen.getByRole("button", { name: "Update Quasar" });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("title", eligibilityText("install_mode_source"));
+  });
+
+  it("stays enabled when the control plane is only already on the release", () => {
+    const v = view({
+      targets: [
+        {
+          kind: "control_plane",
+          host_id: null,
+          node_name: null,
+          eligible: false,
+          reason: "up_to_date",
+        },
+        { kind: "host", host_id: "h1", node_name: "gpu-host-01", eligible: true, reason: null },
+      ],
+    } as Partial<PlatformReleaseView>);
+    renderButton(v);
+
+    expect(screen.getByRole("button", { name: "Update Quasar" })).toBeEnabled();
   });
 
   it("says one eligible host in the singular", async () => {
