@@ -21,7 +21,6 @@ import { Button } from "../../../components/Button";
 import { Chip } from "../../../components/Chip";
 import { Modal } from "../../../components/Modal";
 import { ResourceStates } from "../../../components/ResourceStates";
-import { Table, type TableColumn } from "../../../components/Table";
 import { relativeTime } from "../../../lib/format/relativeTime";
 import { useAdminAction } from "../../../lib/resource/action";
 import { useResource } from "../../../lib/resource/react";
@@ -156,7 +155,9 @@ function when(iso: string | null | undefined): string {
   return iso ? relativeTime(iso) : "—";
 }
 
-/** Apply history: what this instance has done to itself, newest first. */
+/** Apply history: what this instance has done to itself, newest first. Drawn as
+ *  the rail's compact list (design_handoff_v3/screens/releases-v3.html), not a
+ *  table: it sits in a 300px column. */
 export function ApplyHistory({ refreshKey }: { refreshKey: number }) {
   const res = useResource<PlatformApplyAttemptsResponse>(
     {
@@ -166,57 +167,35 @@ export function ApplyHistory({ refreshKey }: { refreshKey: number }) {
     [refreshKey],
   );
 
-  const columns: TableColumn<PlatformApplyAttempt>[] = [
-    {
-      key: "target",
-      header: "Target",
-      render: (a) => (a.target === "control_plane" ? "Control plane" : (a.node_name ?? "gone")),
-    },
-    {
-      key: "kind",
-      header: "Action",
-      width: "90px",
-      render: (a) => (
-        <Chip variant={a.kind === "revert" ? "warning" : "neutral"}>
-          {a.kind === "revert" ? "Revert" : "Apply"}
-        </Chip>
-      ),
-    },
-    {
-      key: "state",
-      header: "Outcome",
-      render: (a) => (
-        <>
-          {attemptStateText(a.state)}
-          {a.reason && <span className="muted"> — {failureText(a.reason)}</span>}
-        </>
-      ),
-    },
-    {
-      key: "digests",
-      header: "Digest",
-      render: (a) => (
-        <span className="mono">
-          {a.previous_digests.map((p) => shortDigest(p.digest)).join(", ") || "unknown"}
-          {" → "}
-          {a.requested_digests.map((c) => shortDigest(c.digest)).join(", ")}
-        </span>
-      ),
-    },
-    { key: "when", header: "When", width: "140px", render: (a) => when(a.created_at) },
-  ];
-
   return (
     <>
       <ResourceStates loading={res.loading} error={res.errorMessage} />
-      {res.data && (
-        <Table
-          columns={columns}
-          rows={res.data.attempts}
-          rowKey={(a) => a.id}
-          empty="Nothing has been applied on this instance yet."
-        />
-      )}
+      {res.data &&
+        (res.data.attempts.length === 0 ? (
+          <p className="muted">Nothing has been applied on this instance yet.</p>
+        ) : (
+          res.data.attempts.map((a) => <ApplyHistoryRow key={a.id} attempt={a} />)
+        ))}
     </>
+  );
+}
+
+function ApplyHistoryRow({ attempt: a }: { attempt: PlatformApplyAttempt }) {
+  const from = a.previous_digests.map((p) => shortDigest(p.digest)).join(", ") || "unknown";
+  const to = a.requested_digests.map((c) => shortDigest(c.digest)).join(", ");
+  return (
+    <div className="rel-fact stack">
+      <div className="rowflex" style={{ justifyContent: "space-between", width: "100%" }}>
+        <span>{a.target === "control_plane" ? "Control plane" : (a.node_name ?? "gone")}</span>
+        <span className="hint">{when(a.created_at)}</span>
+      </div>
+      <span className="mono hint">
+        {from} → {to}
+      </span>
+      <span className="hint">
+        <span>{a.kind === "revert" ? "Revert" : "Apply"}</span> · {attemptStateText(a.state)}
+        {a.reason && ` · ${failureText(a.reason)}`}
+      </span>
+    </div>
   );
 }

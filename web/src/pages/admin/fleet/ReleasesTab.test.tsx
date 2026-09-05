@@ -1,8 +1,10 @@
-// Fleet › Releases. Covers the three page states through <ResourceStates>, the
-// per-target eligibility text, notes sanitisation, the channel PATCH, "Check
-// now" being the jobs run-now action rather than this page's read, and the
-// per-host apply: the button's gating, the force confirmation naming N, live
-// attempt state, a refused apply, and the history.
+// Fleet › Releases, laid out to design_handoff_v3/screens/releases-v3.html.
+// Covers the three page states through <ResourceStates>, the update banner, the
+// release cards and their changelog rows, the targets rollup and the per-host
+// detail behind it, the eligibility text, notes sanitisation, the channel
+// PATCH, "Check now" being the jobs run-now action rather than this page's
+// read, and the per-host apply: the button's gating, the force confirmation
+// naming N, live attempt state, a refused apply, and the history.
 
 import { render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -47,6 +49,7 @@ function release(over: Partial<PlatformRelease> = {}): PlatformRelease {
 function view(over: Partial<PlatformReleaseView> = {}): PlatformReleaseView {
   return {
     channel: "stable",
+    source_repo: "accreleus/quasar",
     edge_branch: "develop",
     checked_at: "2026-09-04T02:07:11Z",
     last_error: null,
@@ -85,6 +88,13 @@ function view(over: Partial<PlatformReleaseView> = {}): PlatformReleaseView {
     faults: [],
     ...over,
   } as PlatformReleaseView;
+}
+
+/** The targets card folds the per-host table away; a test that reaches for a
+ *  row's control opens it the way an operator would. */
+function openPerHostDetail() {
+  const detail = document.querySelector("details.rel-detail");
+  if (detail) (detail as HTMLDetailsElement).open = true;
 }
 
 function renderTab() {
@@ -149,18 +159,89 @@ beforeEach(() => {
   vi.resetAllMocks();
   mocked.listAllSessions.mockResolvedValue(sessionsOnH1(0));
   mocked.listPlatformAttempts.mockResolvedValue({ attempts: [] });
+  // The head's "next check" fragment reads the detection job's schedule.
+  mocked.listJobs.mockResolvedValue({ items: [], next_cursor: null } as never);
 });
 
 describe("ReleasesTab", () => {
-  it("lists an available release with its version, date, commit and rendered notes", async () => {
+  it("lists an available release with its version, date, commit and note rows", async () => {
     mocked.getPlatformReleases.mockResolvedValue(view());
     renderTab();
 
-    expect(await screen.findByText("0.2.0")).toBeInTheDocument();
+    expect(await screen.findByText("v0.2.0")).toBeInTheDocument();
     expect(screen.getByText(NEW_COMMIT.slice(0, 12))).toBeInTheDocument();
-    // The markdown body renders as markup, not as a wall of text.
-    expect(screen.getByRole("heading", { name: "Fixed" })).toBeInTheDocument();
+    // The body is parsed into rows: a category tag and a title, not markdown.
+    expect(screen.getByText("FIX")).toBeInTheDocument();
     expect(screen.getByText("Boot race in the node agent")).toBeInTheDocument();
+    // Once on the update banner, once on the release card.
+    expect(screen.getAllByText(/1 fixed/).length).toBe(2);
+  });
+
+  it("chips the newest release as latest and the installed one as installed", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(
+      view({ available: [release(), release({ id: "r0", version: "0.1.0", source_commit: CP_COMMIT })] }),
+    );
+    renderTab();
+
+    await screen.findByText("v0.2.0");
+    expect(screen.getByText("Latest", { selector: ".chip" })).toBeInTheDocument();
+    expect(screen.getByText("Installed", { selector: ".chip" })).toBeInTheDocument();
+  });
+
+  it("links each release card at its GitHub release page, composed from source_repo", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(view());
+    renderTab();
+
+    expect(await screen.findByRole("link", { name: "View on GitHub" })).toHaveAttribute(
+      "href",
+      "https://github.com/accreleus/quasar/releases/tag/v0.2.0",
+    );
+  });
+
+  it("links a note row's issues at that repo, and expanding shows the detail", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(
+      view({
+        available: [
+          release({ notes: "### Fixed\n- **Boot race in the node agent (#98).** It raced.\n" }),
+        ],
+      }),
+    );
+    const { container } = renderTab();
+
+    await screen.findByText("Boot race in the node agent");
+    expect(screen.getByRole("link", { name: "#98" })).toHaveAttribute(
+      "href",
+      "https://github.com/accreleus/quasar/issues/98",
+    );
+    // The detail is in the row's disclosure, not in the summary line.
+    expect(container.querySelector(".rel-b")).toHaveTextContent("It raced.");
+  });
+
+  it("offers the update as a version step, and does not when there is none", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(view());
+    const { container, unmount } = renderTab();
+    expect(await screen.findByText(/Update available/i)).toBeInTheDocument();
+    // The step reads "v<installed> → v<available>" in one line.
+    expect(container.querySelector(".rel-version")).toHaveTextContent("v0.1.0 → v0.2.0");
+    unmount();
+
+    mocked.getPlatformReleases.mockResolvedValue(
+      view({ available: [release({ source_commit: CP_COMMIT })] }),
+    );
+    renderTab();
+    expect(await screen.findByText(/Up to date/)).toBeInTheDocument();
+    expect(screen.queryByText(/Update available/i)).not.toBeInTheDocument();
+  });
+
+  it("rolls the targets up, and the per-host detail still carries the table", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(eligibleHostView());
+    renderTab();
+
+    // The rollup: the control plane's chip and k/N for the agents.
+    expect(await screen.findByText("1/1")).toBeInTheDocument();
+    expect(screen.getByText("Per-host detail")).toBeInTheDocument();
+    openPerHostDetail();
+    expect(screen.getByRole("columnheader", { name: "Target" })).toBeInTheDocument();
   });
 
   it("renders release notes sanitised", async () => {
@@ -169,7 +250,7 @@ describe("ReleasesTab", () => {
     );
     const { container } = renderTab();
 
-    await screen.findByText("0.2.0");
+    await screen.findByText("v0.2.0");
     expect(container.querySelector("script")).toBeNull();
     expect((window as unknown as { __pwned?: boolean }).__pwned).toBeUndefined();
   });
@@ -178,10 +259,15 @@ describe("ReleasesTab", () => {
     mocked.getPlatformReleases.mockResolvedValue(view());
     renderTab();
 
-    await screen.findByText("gpu-host-01");
-    expect(screen.getByText(/Waiting on the control plane: this release carries a newer schema/))
-      .toBeInTheDocument();
+    // The rollup names the not-ready host, and the table behind it repeats the
+    // reason on its own row.
+    expect((await screen.findAllByText("gpu-host-01")).length).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText(/Waiting on the control plane: this release carries a newer schema/)
+        .length,
+    ).toBeGreaterThan(0);
     // An ineligible target never gets the button; the gate is the server's too.
+    openPerHostDetail();
     expect(screen.queryByRole("button", { name: /^apply$/i })).not.toBeInTheDocument();
   });
 
@@ -235,13 +321,41 @@ describe("ReleasesTab", () => {
     );
   });
 
+  it("puts the channel, the last check and the job's next run in the head", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(view());
+    mocked.listJobs.mockResolvedValue({
+      items: [
+        {
+          id: "platform.release_detect",
+          enabled: true,
+          next_run_at: "2026-09-07T02:00:00Z",
+        },
+      ],
+      next_cursor: null,
+    } as never);
+    renderTab();
+
+    expect(await screen.findByText(/stable channel/)).toHaveTextContent(
+      /next check Mon 02:00 UTC/,
+    );
+  });
+
+  it("omits the next check rather than inventing one when the job says nothing", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(view());
+    renderTab();
+
+    expect(await screen.findByText(/stable channel/)).not.toHaveTextContent(/next check/);
+  });
+
   it("offers Apply on an eligible host, and its confirmation names the live sessions force ends", async () => {
     mocked.getPlatformReleases.mockResolvedValue(eligibleHostView());
     mocked.listAllSessions.mockResolvedValue(sessionsOnH1(2));
     mocked.applyPlatformReleaseToHost.mockResolvedValue({ attempt: attempt() } as never);
     renderTab();
 
-    (await screen.findByRole("button", { name: /^Apply$/ })).click();
+    await screen.findByText("Per-host detail");
+    openPerHostDetail();
+    screen.getByRole("button", { name: /^Apply$/ }).click();
 
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText(/ends 2 live sessions/)).toBeInTheDocument();
@@ -262,7 +376,9 @@ describe("ReleasesTab", () => {
     mocked.applyPlatformReleaseToHost.mockResolvedValue({ attempt: attempt() } as never);
     renderTab();
 
-    (await screen.findByRole("button", { name: /^Apply$/ })).click();
+    await screen.findByText("Per-host detail");
+    openPerHostDetail();
+    screen.getByRole("button", { name: /^Apply$/ }).click();
     (await screen.findByRole("button", { name: "Update" })).click();
 
     await waitFor(() =>
@@ -278,7 +394,9 @@ describe("ReleasesTab", () => {
     mocked.listAllSessions.mockRejectedValue(new ApiError(503, "internal", "no"));
     renderTab();
 
-    (await screen.findByRole("button", { name: /^Apply$/ })).click();
+    await screen.findByText("Per-host detail");
+    openPerHostDetail();
+    screen.getByRole("button", { name: /^Apply$/ }).click();
     expect(
       within(await screen.findByRole("dialog")).getByText(/ends every live session on this host/),
     ).toBeInTheDocument();
@@ -296,6 +414,7 @@ describe("ReleasesTab", () => {
       );
       const { unmount } = renderTab();
       expect(await screen.findByText(text)).toBeInTheDocument();
+      openPerHostDetail();
       expect(screen.queryByRole("button", { name: /^Apply$/ })).not.toBeInTheDocument();
       unmount();
     }
@@ -331,7 +450,9 @@ describe("ReleasesTab", () => {
     );
     renderTab();
 
-    (await screen.findByRole("button", { name: /^Apply$/ })).click();
+    await screen.findByText("Per-host detail");
+    openPerHostDetail();
+    screen.getByRole("button", { name: /^Apply$/ }).click();
     (await screen.findByRole("button", { name: "Update" })).click();
 
     expect(
@@ -346,7 +467,9 @@ describe("ReleasesTab", () => {
     });
     renderTab();
 
-    expect(await screen.findByText("Updated")).toBeInTheDocument();
+    // "Apply · Updated", the row's own state line, over its digest step.
+    expect(await screen.findByText("Apply")).toBeInTheDocument();
+    expect(screen.getByText(/Updated/)).toBeInTheDocument();
     expect(screen.getByText(/111111111111/)).toBeInTheDocument();
   });
 
@@ -458,7 +581,7 @@ describe("ReleasesTab › manual update paths", () => {
     mocked.getPlatformReleases.mockResolvedValue(view()); // host: release_above_control_plane
     renderTab();
 
-    await screen.findByText("gpu-host-01");
+    expect((await screen.findAllByText("gpu-host-01")).length).toBeGreaterThan(0);
     expect(screen.queryByTestId("manual-h1")).not.toBeInTheDocument();
     expect(screen.queryByTestId("manual-control-plane")).not.toBeInTheDocument();
   });

@@ -156,6 +156,8 @@ beforeEach(() => {
   vi.resetAllMocks();
   mocked.listAllSessions.mockResolvedValue({ items: [], next_cursor: null } as never);
   mocked.listPlatformAttempts.mockResolvedValue({ attempts: [] });
+  // The head's "next check" fragment reads the detection job's schedule.
+  mocked.listJobs.mockResolvedValue({ items: [], next_cursor: null } as never);
 });
 
 describe("FleetApplyButton", () => {

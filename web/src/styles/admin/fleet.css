@@ -267,20 +267,7 @@
   margin-top: var(--s2);
 }
 
-/* Releases (Fleet › Releases). No v3 mock covers this page, so it composes the
-   primitives beside it and console-v3 tokens only. */
-.release-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: var(--s5);
-}
-.release-entry + .release-entry {
-  border-top: 1px solid var(--line);
-  padding-top: var(--s5);
-}
+/* Releases (Fleet › Releases). */
 .release-faults {
   margin: 0;
   padding-left: var(--s5);
@@ -313,4 +300,168 @@
 }
 .release-notes code {
   font-family: var(--font-mono);
+}
+
+/* ------------------------------------------------------------------
+   Fleet › Releases, v3 (design_handoff_v3/screens/releases-v3.html).
+   Two columns: the release feed, and a rail of small fact cards.
+   ------------------------------------------------------------------ */
+.rel-split {
+  grid-template-columns: minmax(0, 1fr) 300px;
+}
+.rel-rail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s4);
+}
+
+.rel-update {
+  display: flex;
+  gap: var(--s6);
+  align-items: center;
+  flex-wrap: wrap;
+}
+.rel-update-main {
+  flex: 1;
+  min-width: 260px;
+}
+.rel-version {
+  font-family: var(--font-display);
+  font-size: 1.45rem;
+  font-weight: 600;
+  color: var(--text);
+}
+.rel-arrow {
+  color: var(--text-4);
+  font-weight: 400;
+}
+.rel-update-why {
+  max-width: 340px;
+  line-height: 1.55;
+}
+
+.rel-card-title {
+  font-family: var(--font-display);
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* One changelog bullet: a tag gutter, a one-line title, its issue chips, and
+   the detail behind a disclosure. */
+.rel-e {
+  border-top: 1px solid var(--line);
+}
+.rel-e > summary {
+  display: flex;
+  gap: 11px;
+  align-items: baseline;
+  padding: 9px var(--card-pad);
+  cursor: pointer;
+  list-style: none;
+}
+.rel-e > summary::-webkit-details-marker {
+  display: none;
+}
+.rel-e > summary:hover {
+  background: var(--ink-4);
+}
+.rel-c {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  min-width: 36px;
+  font-family: var(--font-mono);
+  color: var(--text-3);
+}
+.rel-c.danger { color: var(--danger-text); }
+.rel-c.success { color: var(--success-text); }
+.rel-c.info { color: var(--info-text); }
+.rel-c.warning { color: var(--warning-text); }
+.rel-t {
+  font-size: var(--t-sm);
+  color: var(--text);
+  flex: 1;
+  min-width: 0;
+}
+.rel-ref {
+  font-family: var(--font-mono);
+  font-size: var(--t-xs);
+}
+.rel-x {
+  display: inline-flex;
+  color: var(--text-4);
+}
+.rel-x svg {
+  transition: transform 0.15s;
+}
+.rel-e[open] .rel-x svg {
+  transform: rotate(180deg);
+}
+.rel-b {
+  padding: 2px var(--card-pad) 13px calc(var(--card-pad) + 47px);
+  font-size: var(--t-sm);
+  color: var(--text-3);
+  line-height: 1.6;
+  max-width: 78ch;
+}
+.rel-b p {
+  margin: 0 0 var(--s2);
+}
+.rel-b p:last-child {
+  margin-bottom: 0;
+}
+.rel-b ul,
+.rel-b ol {
+  margin: 0 0 var(--s2);
+  padding-left: var(--s5);
+}
+.rel-b code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  color: var(--text-2);
+  background: var(--ink-5);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+
+/* A label/value line in a rail card. */
+.rel-fact {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--s3);
+  padding: 7px 0;
+  border-top: 1px solid var(--line);
+  font-size: var(--t-sm);
+}
+.rel-fact:first-of-type {
+  border-top: 0;
+}
+.rel-fact > span:first-child {
+  color: var(--text-3);
+}
+.rel-fact.stack {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 3px;
+}
+.rel-holdout {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--s2);
+  padding: 4px 0;
+  font-size: var(--t-xs);
+}
+/* The per-host detail: today's targets table, its manual recipes and its
+   revert controls, folded away rather than dropped. */
+.rel-detail > summary {
+  cursor: pointer;
+  list-style: none;
+  font-size: var(--t-sm);
+  color: var(--accent-text);
+  padding: var(--s2) 0;
+}
+.rel-detail > summary::-webkit-details-marker {
+  display: none;
 }
