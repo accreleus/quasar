@@ -672,6 +672,12 @@
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+  /* The event overlay runs behind the captions, and a 3px-dashed line through
+     9px glyphs is unreadable. The card's own surface, so this reads as a gap in
+     the markers rather than as a chip. */
+  background: var(--surf-panel);
+  padding: 1px 4px;
+  border-radius: var(--r-xs);
 }
 
 .trace-lane-swatch {

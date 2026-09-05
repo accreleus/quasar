@@ -156,8 +156,12 @@ interface SeriesRender {
   label: string;
   /** Highest sample in the window; the caption's "max". */
   max: number;
-  /** Path data. Empty when the series is flat at zero and has nothing to draw. */
+  /** The stroked outline. Empty when the series is flat at zero. */
   d: string;
+  /** Area fill under `d`, for count-like series only. Never stroked: stroking a
+   *  closed area paints its baseline edge too, which draws a hard rule across
+   *  the whole lane. */
+  fillD: string;
   isArea: boolean;
   /** Set when the series' last sample falls short of the shared x domain. */
   end: { x: number; y: number } | null;
@@ -213,27 +217,24 @@ const LaneSvg = memo(function LaneSvg({
       const scaleMax = max > 0 ? max * 1.1 : 1;
       const toY = (v: number) => LANE_PAD.top + innerH - (v / scaleMax) * innerH;
 
-      let d = "";
-      if (s.area) {
-        // Count-like series (packets lost) fill from the baseline. Drawing one
-        // isolated tick per sample — what this did before #124 — spaces them
-        // ~17px apart at any real width, so a low-but-nonzero count rendered as
-        // a row of dots that read as a rendering artifact rather than as data.
-        // A series flat at zero draws nothing at all.
-        const base = (LANE_PAD.top + innerH).toFixed(1);
-        d =
-          max > 0
-            ? `M${toSvgX(pts[0].ts_unix_ms).toFixed(1)},${base} ` +
-              pts
-                .map((p) => `L${toSvgX(p.ts_unix_ms).toFixed(1)},${toY(p.v).toFixed(1)}`)
-                .join(" ") +
-              ` L${toSvgX(pts[pts.length - 1].ts_unix_ms).toFixed(1)},${base} Z`
-            : "";
-      } else {
-        d = pts
-          .map((p, i) => `${i === 0 ? "M" : "L"}${toSvgX(p.ts_unix_ms).toFixed(1)},${toY(p.v).toFixed(1)}`)
-          .join(" ");
-      }
+      // Count-like series (packets lost) get an area fill under the same line.
+      // Drawing one isolated tick per sample — what this did before #124 —
+      // spaces them ~17px apart at any real width, so a low-but-nonzero count
+      // rendered as a row of dots that read as a rendering artifact.
+      const d =
+        s.area && max <= 0
+          ? "" // flat at zero: draw nothing rather than a hairline of dots
+          : pts
+              .map((p, i) => `${i === 0 ? "M" : "L"}${toSvgX(p.ts_unix_ms).toFixed(1)},${toY(p.v).toFixed(1)}`)
+              .join(" ");
+
+      const base = (LANE_PAD.top + innerH).toFixed(1);
+      const fillD =
+        s.area && d
+          ? `M${toSvgX(pts[0].ts_unix_ms).toFixed(1)},${base} ${d.slice(1)} L${toSvgX(
+              pts[pts.length - 1].ts_unix_ms,
+            ).toFixed(1)},${base} Z`
+          : "";
 
       const last = pts[pts.length - 1];
       const end =
@@ -241,7 +242,7 @@ const LaneSvg = memo(function LaneSvg({
           ? { x: toSvgX(last.ts_unix_ms), y: toY(last.v) }
           : null;
 
-      return [{ key: s.key, color: s.color, label: s.label, max, d, isArea: !!s.area, end }];
+      return [{ key: s.key, color: s.color, label: s.label, max, d, fillD, isArea: !!s.area, end }];
     });
   }, [laneDef.series, series, toSvgX, innerH, xMax, xRange]);
 
@@ -357,17 +358,21 @@ const LaneSvg = memo(function LaneSvg({
           strokeWidth={0.5}
         />
 
-        {/* series */}
+        {/* series — fill first, then the line over it */}
+        {rendered.map((r) =>
+          r.fillD ? (
+            <path key={`${r.key}-fill`} d={r.fillD} fill={r.color} fillOpacity={0.26} stroke="none" />
+          ) : null,
+        )}
         {rendered.map((r) =>
           r.d ? (
             <path
               key={r.key}
               data-series={r.key}
               d={r.d}
-              fill={r.isArea ? r.color : "none"}
-              fillOpacity={r.isArea ? 0.28 : undefined}
+              fill="none"
               stroke={r.color}
-              strokeWidth={r.isArea ? 1 : 1.5}
+              strokeWidth={r.isArea ? 1.2 : 1.5}
               strokeLinejoin="round"
               strokeLinecap="round"
             />
