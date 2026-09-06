@@ -1,8 +1,8 @@
 # Release completion validation — 2026-09-06
 
-Status: in progress; no release is claimed. Scope is #129, #130, #131, #135,
-#136, #145 and #146. Keep those issues open until the containing release is
-published and its acceptance verified. The operator approved the #145 contract
+Status: v0.2.4 published and published-image acceptance passed.
+Scope is #129, #130, #131, #135, #136, #145 and #146; the evidence below
+supports closing them against this release. The operator approved the #145 contract
 proposal and expressly waived the separate Opus review prerequisite.
 
 ## Provisioning acceptance (#129)
@@ -198,7 +198,7 @@ prepared template, not proof about arbitrary future Steam data formats.
 independent markers, and a controlled change to one home's Steam script that
 changed neither the template nor the other home. The changed file was restored.
 
-The existing-home policy smoke at 14:39:50 UTC also passed: disabling reached
+The existing-home policy smoke at 14:39:50 UTC passed: disabling reached
 acknowledged revision 15, re-enabling reached revision 16, template identity
 remained unchanged, and decoded frames advanced from 855 to 1,900 to 2,957.
 The same app process stayed alive, the current session did not seed the existing
@@ -227,18 +227,95 @@ of the startup logs and exact container states. This proves real session
 container survival, while the separate browser measurements establish media
 continued; it is not a frame-by-frame no-jitter guarantee.
 
-## Remaining release acceptance
+## Release publication
 
-- Review the final release diff and required gates after any further changes.
-- Promote to main, publish v0.2.4 and
-  verify the published manifest, all three image tags and tagged agent identity.
-- Validate deployment/update using those published artifacts and publish the
-  matching public site. The operator explicitly authorized autonomous promotion
-  and publication after validation.
-- Close #129, #130, #131, #135, #136, #145 and #146 only after the containing
-  release is published and accepted. Candidate checks do not prove future
-  published-image provenance; earlier provisioning campaign scope remains as
-  stated above.
+[Version v0.2.4](https://github.com/accreleus/quasar/releases/tag/v0.2.4)
+was published at 14:52:37 UTC from
+`5e488b686ee9b66066899ba8e6b892ba1914b9b5`. Protocol PR #18 and parent
+PR #147 were merged first; the validated parent tree was promoted through
+develop to main under explicit operator authorization. The release changelog
+was then cut with the canonical `make release` command and synchronized back
+to develop.
+
+The [image workflow](https://github.com/accreleus/quasar/actions/runs/34040019335)
+passed every build, image contract, candidate preflight, promotion and publication
+job. The updater promotion completed before publication. The released platform
+manifest describes control plane and agent; updater is independently published
+as `0.2.4`. GPU hardware validation remains a separate live gate.
+
+A stricter final existing-home smoke at 14:41:27 UTC additionally waited for the
+Quasar startup overlay to disappear before changing policy. Revisions 17 and 18
+were acknowledged; decoded frames advanced 998 → 2,045 → 3,090. The same app
+process and template survived, the current session did not reseed its home, and
+cleanup had no failures. The off/on screenshots show readable Steam sign-in.
+
+## Published artifact and upgrade acceptance
+
+The canonical manifest validator passed for version `0.2.4`, schema `77` and
+source `5e488b686ee9b66066899ba8e6b892ba1914b9b5`. Independent registry reads
+confirmed the version tags resolve to the same platform leaf manifests as the
+published pins:
+
+| Image | Platform digest |
+| --- | --- |
+| Control plane | `sha256:4adfc4bd6b77d8779ffdc61d2a53831bafc7aba8026754b7c8edea93759e2eac` |
+| Node agent | `sha256:020808456401f041c018d7431cff876f9a4aaac1ce8124dd3f910af0c1d3d882` |
+| Updater | `sha256:41f25f559f5a374f072eda48470b857f046f2acf66513d089cc81aae1b822162` |
+
+The updater is outside the two-component platform manifest. The control-plane
+and agent images inherit a generic OCI version label of `43` from Fedora; that
+label is not Quasar release evidence. Quasar-specific source/build labels match
+the release, and the control-plane schema label is `77`. Actual running
+control-plane and agent identities both report `0.2.4` and the correct release source commit.
+
+The isolated stack was upgraded manually with the published digest pins while
+both host preparation controls were explicitly false. After recreation, the
+same host and source revision 18 remained acknowledged, both effective controls
+remained false, and the template metadata hash was unchanged. This verifies
+operator opt-outs across a manual published-image upgrade; it is not a test of
+the self-updater apply path.
+
+Removing those explicit host overrides returned both effective controls to true
+and preparation to ready, with the same host/revision and unchanged template
+metadata. No readiness failure or warning remained. The published runtime passed
+139/139 GPU contracts and the control-plane image passed 23/23 contracts.
+
+Public-site deployment initially refused the release tag under the existing
+Pages environment branch policy. A second dispatch from main, still exactly the
+same release source commit, passed without changing the protection rules:
+[Pages deployment](https://github.com/accreleus/quasar/actions/runs/34040645044).
+
+The published runtime then passed two existing-home policy-toggle streams at
+1920×1080, 60 fps: H.264 ended at 3,136 decoded frames and AV1 at 3,004, both
+with zero recorded browser errors, no reseeding, unchanged app process/template
+and successful cleanup. Screenshots show readable Steam sign-in text and QR
+codes. Exact-session encoder logs identify `vulkanav1enc` for the AV1 run on
+NVIDIA 610.57.04. This is a bounded functional check of the original Vulkan AV1
+path, not a long-duration quality or latency benchmark.
+
+The live [public documentation](https://accreleus.github.io/quasar/) passed
+fresh-browser acceptance at 14:58:13 UTC: six relevant documentation URLs
+returned rendered pages, and desktop/mobile Unraid + NVIDIA wizard runs produced
+one complete GPU-wired Compose file. All three component references were
+present; copied database/admin credentials were blank with instructions and no
+executable dotenv substitutions. Installer release/manifest selection and exact
+clipboard copying were verified. The generated installer was inspected, not
+executed as another live installation. No browser errors were recorded.
+
+## Completion and boundaries
+
+- Candidate and published-image gates passed at the scope recorded above.
+- Main/develop contain the implementation; v0.2.4 and its matching public site
+  are published. Selected issue closure is supported by this evidence.
+- The published isolated stack remains healthy with default preparation enabled.
+  All owned streaming sessions stopped and source policy was restored. Four
+  obsolete provisioning helper containers were stopped; their volumes remain,
+  including the driver volume used by the current validation agent.
+- The production stack was not redeployed during this release-completion phase.
+- The upgrade exercise used manual Compose recreation with published digest
+  pins. It does not claim a self-updater apply test, a broad hardware certification
+  or a long-duration streaming benchmark. Earlier provisioning campaign and
+  transient/harness limitations are retained above rather than erased.
 
 Raw captures remain in the worktree's ignored
 `.diagnostics/release-completion/` directory. Credential files in that directory
