@@ -95,6 +95,7 @@ LABEL org.quasar.image.role="control" \
       org.quasar.schema.version="${SCHEMA_VERSION}"
 
 COPY --from=builder /quasar-control /usr/local/bin/quasar-control
+COPY --chmod=0755 deploy/control-entrypoint.sh /usr/local/bin/quasar-control-entrypoint
 COPY --from=web-builder /web/dist /app/web
 
 ENV QUASAR_WEB_ROOT=/app/web
@@ -129,6 +130,7 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD curl -fsS -o /dev/null http://localhost:8080/health || exit 1
 
-# Static Go binary handles its own signals — bypass quasar-base's tini +
-# PUID-switching entrypoint (that contract is for application images).
-ENTRYPOINT ["/usr/local/bin/quasar-control"]
+# Preparation execs Go directly, preserving its PID 1 signal handling. The
+# default remains non-root; generated host-bind installs can prepare as root
+# and drop to the bind's owner before Go starts.
+ENTRYPOINT ["/usr/local/bin/quasar-control-entrypoint"]

@@ -24,6 +24,22 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+
+- RTX 5090 hosts running NVIDIA 595.99.02 exclude the known-corrupt Vulkan AV1
+  path and its unsafe NVENC AV1 fallback. Host readiness and setup explain the
+  restriction; the profile picker reflects reported host codecs and automatic
+  negotiation can select eligible HEVC/H.264 instead.
+- First-install Compose now includes the selected GPU wiring from repository
+  definitions, preserves generated credentials on reruns, and uses verified
+  image pins. Copied environment files carry blank credentials and instructions.
+- Control-plane state ownership preparation, NVIDIA provisioning recovery,
+  refreshed readiness and validated sibling mounts reduce delayed app-launch
+  failures. App shared memory remains 1 GiB by default.
+- Unraid deployments tolerate absent securityfs, including additional-host
+  enrollment, and the updater no longer mistakes Btrfs subvolume IDs for Docker
+  container IDs.
+
 ## 0.2.3 — 2026-09-06
 
 ### Fixed

@@ -179,7 +179,17 @@ pub fn sweep(cfg: &HomesGcSettings, runtime: &ContainerRuntime) -> SweepReport {
         );
         return rep;
     }
-    let live = live_mount_sources(runtime);
+    let live = match live_mount_sources(runtime) {
+        Ok(live) => live,
+        Err(e) => {
+            warn!(
+                token = "homes-gc-liveness-unavailable",
+                "homes-gc: skipping sweep because live mounts cannot be established: {e}"
+            );
+            rep.errors += 1;
+            return rep;
+        }
+    };
     let now = SystemTime::now();
 
     let entries = match std::fs::read_dir(&cfg.root) {
@@ -486,44 +496,26 @@ fn delete_home(root: &Path, path: &Path) -> std::io::Result<()> {
 
 // ── liveness ────────────────────────────────────────────────────────────────
 
-/// Every host path currently mounted into a running container, plus this
-/// process's `/proc/mounts`. Best-effort: a failure yields an EMPTY set only
-/// for that source; the age gate still protects a home in use.
-fn live_mount_sources(runtime: &ContainerRuntime) -> HashSet<PathBuf> {
+/// Liveness is mandatory: an old home may still be mounted by a running app.
+fn live_mount_sources(runtime: &ContainerRuntime) -> anyhow::Result<HashSet<PathBuf>> {
     let mut set = HashSet::new();
-    match runtime.run_raw(&["ps", "-q"]) {
-        Ok(ids) => {
-            let ids: Vec<String> = ids
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(String::from)
-                .collect();
-            if !ids.is_empty() {
-                let mut args: Vec<&str> = vec![
-                    "inspect",
-                    "--format",
-                    "{{range .Mounts}}{{println .Source}}{{end}}",
-                ];
-                args.extend(ids.iter().map(String::as_str));
-                match runtime.run_raw(&args) {
-                    Ok(out) => set.extend(parse_paths(&out)),
-                    Err(e) => warn!(
-                        token = "homes-gc-inspect-failed",
-                        "homes-gc: docker inspect for live mounts failed: {e}"
-                    ),
-                }
-            }
-        }
-        Err(e) => warn!(
-            token = "homes-gc-ps-failed",
-            "homes-gc: docker ps for live mounts failed: {e}"
-        ),
+    let output = runtime.run_raw(&["ps", "-q"])?;
+    let ids: Vec<_> = output
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !ids.is_empty() {
+        let mut args = vec![
+            "inspect",
+            "--format",
+            "{{range .Mounts}}{{println .Source}}{{end}}",
+        ];
+        args.extend(ids);
+        set.extend(parse_paths(&runtime.run_raw(&args)?));
     }
-    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
-        set.extend(parse_proc_mounts(&mounts));
-    }
-    set
+    set.extend(parse_proc_mounts(&std::fs::read_to_string("/proc/mounts")?));
+    Ok(set)
 }
 
 /// Absolute paths, one per line, ignoring blanks.
@@ -624,6 +616,23 @@ mod tests {
         assert!(check_root(&f).is_err());
     }
 
+    #[test]
+    fn failed_docker_liveness_preserves_aged_homes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("var/lib/quasar/homes");
+        let home = root.join("agent-0bdc5920-fc5182ea");
+        fs::create_dir_all(&home).unwrap();
+        let cfg = HomesGcSettings {
+            root,
+            retention: Duration::ZERO,
+            dry_run: false,
+        };
+        let report = sweep(&cfg, &ContainerRuntime::test_runtime("/bin/false"));
+        assert!(home.exists());
+        assert_eq!(report.deleted, 0);
+        assert_eq!(report.errors, 1);
+    }
+
     /// The whole selection rule end to end: only aged throwaway homes go.
     #[test]
     fn sweep_deletes_only_aged_unmounted_throwaways() {
@@ -652,7 +661,7 @@ mod tests {
             retention: Duration::ZERO,
             dry_run: false,
         };
-        let rep = sweep(&cfg, &ContainerRuntime::from_env());
+        let rep = sweep(&cfg, &ContainerRuntime::test_runtime("/bin/true"));
 
         assert!(!old_a.exists(), "an aged throwaway home must be deleted");
         assert!(!old_b.exists());
@@ -680,7 +689,7 @@ mod tests {
             retention: Duration::from_secs(72 * 3600),
             dry_run: false,
         };
-        let rep = sweep(&cfg, &ContainerRuntime::from_env());
+        let rep = sweep(&cfg, &ContainerRuntime::test_runtime("/bin/true"));
         assert!(home.exists());
         assert_eq!(rep.skipped_young, 1);
         assert_eq!(rep.deleted, 0);
@@ -691,7 +700,7 @@ mod tests {
             dry_run: true,
             ..cfg
         };
-        let rep = sweep(&cfg, &ContainerRuntime::from_env());
+        let rep = sweep(&cfg, &ContainerRuntime::test_runtime("/bin/true"));
         assert!(home.exists(), "a dry run must never delete");
         assert_eq!(rep.deleted, 1);
     }
@@ -714,7 +723,10 @@ mod tests {
             retention: Duration::ZERO,
             dry_run: true,
         };
-        assert_eq!(sweep(&cfg, &ContainerRuntime::from_env()).deleted, 1);
+        assert_eq!(
+            sweep(&cfg, &ContainerRuntime::test_runtime("/bin/true")).deleted,
+            1
+        );
     }
 
     #[test]
@@ -725,7 +737,7 @@ mod tests {
             dry_run: false,
         };
         assert_eq!(
-            sweep(&cfg, &ContainerRuntime::from_env()),
+            sweep(&cfg, &ContainerRuntime::test_runtime("/bin/true")),
             SweepReport::default()
         );
     }
@@ -824,7 +836,7 @@ mod tests {
             retention: Duration::from_secs(72 * 3600),
             dry_run: false,
         };
-        let rep = sweep(&cfg, &ContainerRuntime::from_env());
+        let rep = sweep(&cfg, &ContainerRuntime::test_runtime("/bin/true"));
         assert!(!emptied.exists(), "an aged empty home must be collected");
         assert!(
             populated.exists(),

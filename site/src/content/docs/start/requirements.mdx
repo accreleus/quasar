@@ -13,7 +13,8 @@ and Windows cannot do that, so media will not work there at all. Any systemd
 distribution with Docker should be fine. Fedora 44 is what the install is
 verified on.
 
-**Docker Engine with Compose v2.20 or newer.**
+**Docker Engine with Compose v2.30 or newer.** The generated stack uses optional
+environment files, which require this version.
 
 **About 20 GB of disk** for the images, plus room for game containers and save
 data.
@@ -51,6 +52,22 @@ full driver stack is better. See
 [Install and startup problems](/quasar/troubleshooting/install/).
 </Aside>
 
+### NVIDIA on Unraid
+
+Install the NVIDIA driver plugin and confirm `nvidia-smi` lists the GPU on the
+host before starting Quasar. RTX 50-series GPUs require NVIDIA’s **open kernel
+modules**. A driver version shown as installed is not enough if the GPU is absent.
+
+Available open-module packages depend on your Unraid kernel and plugin package
+feed. Selecting a newer proprietary package does not meet the open-module
+requirement. Quasar cannot install or replace this host kernel driver.
+
+RTX 5090 with driver 595.99.02 has a confirmed Vulkan AV1 corruption issue;
+610.57.04 produced clean output, including an operator-built open-module install
+on Unraid. This is a tested combination, not a universal minimum for all GPUs.
+Use HEVC or H.264 if a compatible open-module update is unavailable. See
+[AV1 driver compatibility](/quasar/tuning/encoders/#av1-driver-compatibility).
+
 ### Kernel
 
 `/dev/uinput` has to exist and be writable. That is how Quasar creates the
@@ -73,7 +90,10 @@ echo 'net.core.wmem_default=2097152' | sudo tee /etc/sysctl.d/99-quasar.conf
 sudo sysctl --system
 ```
 
-This one is not optional and nothing applies it for you. The media path sends
+The quick-start script applies and persists this setting for your selected
+platform; a manual Compose install must configure it on the host. On Unraid, use
+the generated Unraid script, which persists the setting in `/boot/config/go`
+because `/etc` is recreated at boot. The media path sends
 through libnice, which never calls `setsockopt(SO_SNDBUF)`, so its UDP sockets
 inherit the kernel default of 208 KB. A keyframe burst at 8 Mbps overflows that,
 the kernel drops the overflow silently, and the bitrate estimator reads the loss

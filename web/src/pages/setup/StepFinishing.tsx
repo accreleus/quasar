@@ -62,6 +62,7 @@ export function StepFinishing({ onFinish }: StepFinishingProps) {
   const [micError, setMicError] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>("form");
   const [scanMessage, setScanMessage] = useState<string | null>(null);
+  const [streamChecks, setStreamChecks] = useState({ video: false, audio: false, input: false });
 
   // In-flight scan controller, aborted on unmount.
   const scanControllerRef = useRef<AbortController | null>(null);
@@ -170,8 +171,8 @@ export function StepFinishing({ onFinish }: StepFinishingProps) {
       <div>
         <h2 style={{ margin: 0 }}>Finishing touches</h2>
         <p className="sub" style={{ marginTop: 6 }}>
-          Last step. Everything below is optional and can be changed later from{" "}
-          <strong>Admin → Settings</strong>.
+          Last step. Settings below are optional and can be changed later from{" "}
+          <strong>Admin → Settings</strong>. You can also check your first stream before finishing.
         </p>
       </div>
 
@@ -232,6 +233,27 @@ export function StepFinishing({ onFinish }: StepFinishingProps) {
           label={settings?.mic_capture_enabled ? "Enabled" : "Enable microphone capture"}
           disabled={micBusy || !settings}
         />
+      </div>
+
+      <div>
+        <h3 style={{ margin: "0 0 6px" }}>Try your first stream</h3>
+        <p className="field-hint">
+          A ready host still needs a browser streaming check. Open your library in a new tab,
+          launch an installed app with the H.264 720p60 profile if available, then return here.
+          If your library is empty, finish setup and install an app from Admin → Library first.
+        </p>
+        <p><a href="/app" target="_blank" rel="noopener noreferrer">Open library for a test stream</a></p>
+        <Switch id="setup-test-video" label="I can see the app and its picture updates"
+          checked={streamChecks.video} onChange={video => setStreamChecks(prev => ({ ...prev, video }))} />
+        <Switch id="setup-test-audio" label="I can hear sound from the app"
+          checked={streamChecks.audio} onChange={audio => setStreamChecks(prev => ({ ...prev, audio }))} />
+        <Switch id="setup-test-input" label="Keyboard, mouse or controller input reaches the app"
+          checked={streamChecks.input} onChange={input => setStreamChecks(prev => ({ ...prev, input }))} />
+        <p className="field-hint" role="status">
+          {Object.values(streamChecks).every(Boolean)
+            ? "You have confirmed video, audio and input. Stop the test session when finished."
+            : "Streaming is not yet confirmed. If a check fails, keep the session ID and inspect its error in Admin → Sessions. You can finish setup and return to testing later."}
+        </p>
       </div>
 
       {phase === "done" && scanMessage && (

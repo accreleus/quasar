@@ -96,6 +96,7 @@
 #   --push                  push AFTER a passing validation, never before
 #   --no-latest             skip the :latest promotion
 #   --keep N                dated generations to retain per image (default 2)
+#   --no-prune              preserve all existing images (shared-host validation)
 #   --no-legacy-alias       do NOT write the pre-rename local alias tags
 #                           (quasar-vulkan / quasar-control / quasar-toolchain /
 #                           quasar-dev). They are written by default so an
@@ -190,7 +191,7 @@ ROLES=()
 declare -a EXTRA_ARGS=()          # KEY=VALUE build args
 declare -a REQUIRE_ELEMENTS=()
 GIT_REF=""; WORKTREE_DIR=""
-TAG_SUFFIX=""; REGISTRY=""; DO_PUSH=0; NO_LATEST=0; KEEP=2; LEGACY_ALIAS=1
+TAG_SUFFIX=""; REGISTRY=""; DO_PUSH=0; NO_LATEST=0; NO_PRUNE=0; KEEP=2; LEGACY_ALIAS=1
 DO_VALIDATE=1; GPU_FLAG=""; CONTRACT="$SCRIPT_DIR/image-contract.json"
 REPORT="$SCRIPT_DIR/.build-report.json"
 MIN_FREE_GB=20; PRUNE_CACHE=0; DRY_RUN=0; NO_CACHE=0
@@ -274,6 +275,7 @@ while [ $# -gt 0 ]; do
     --registry)         REGISTRY="${2:?}";      shift 2 ;;
     --push)             DO_PUSH=1;              shift ;;
     --no-latest)        NO_LATEST=1;            shift ;;
+    --no-prune)         NO_PRUNE=1;             shift ;;
     --keep)             KEEP="${2:?}";          shift 2 ;;
     # Retired with the NVIDIA lineage it aliased (#545). Accepted-and-ignored
     # rather than rejected: it may still be in a host's shell history or a cron
@@ -957,9 +959,11 @@ for role in "${ROLES[@]}"; do
   fi
 
   # ── Retention ───────────────────────────────────────────────────────────────
-  docker images "$IMG" --format '{{.Tag}}' \
-    | grep -E '^[0-9]{8}-[0-9]{4}(-.*)?$' | sort -r | tail -n "+$((KEEP + 1))" \
-    | xargs -r -I{} docker rmi "$IMG:{}" >/dev/null 2>&1 || true
+  if [ "$NO_PRUNE" = 0 ]; then
+    docker images "$IMG" --format '{{.Tag}}' \
+      | grep -E '^[0-9]{8}-[0-9]{4}(-.*)?$' | sort -r | tail -n "+$((KEEP + 1))" \
+      | xargs -r -I{} docker rmi "$IMG:{}" >/dev/null 2>&1 || true
+  fi
 done
 
 if [ "$DRY_RUN" = 1 ]; then
@@ -967,7 +971,9 @@ if [ "$DRY_RUN" = 1 ]; then
   exit 0
 fi
 
-docker image prune -f >/dev/null 2>&1 || true
+if [ "$NO_PRUNE" = 0 ]; then
+  docker image prune -f >/dev/null 2>&1 || true
+fi
 
 # ── Report ────────────────────────────────────────────────────────────────────
 jq -n \

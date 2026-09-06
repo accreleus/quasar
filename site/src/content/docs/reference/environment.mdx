@@ -98,7 +98,7 @@ existing host and set only that on the new one. See below.
 | `QUASAR_QUEUE_BUFFERS` | `3` | Encode queue depth. |
 | `QUASAR_VULKAN_H264` | on | Set `0` to move H.264 off Vulkan when a vendor fallback exists. |
 | `QUASAR_VULKAN_HEVC` | on | Set `0` to move HEVC off Vulkan when a vendor fallback exists. |
-| `QUASAR_VULKAN_AV1` | on | Set `0` to move AV1 off Vulkan when a vendor fallback exists. |
+| `QUASAR_VULKAN_AV1` | on | Set `0` to move AV1 off Vulkan when a vendor fallback exists. This does not bypass a known GPU/driver AV1 restriction; see [compatibility](/quasar/tuning/encoders/#av1-driver-compatibility). |
 | `QUASAR_VULKAN_MAX_SESSIONS` | `2` | Concurrent Vulkan encode sessions per GPU. |
 | `QUASAR_REQUIRE_HW_RENDER` | `1` | Fail a session that falls back to software rendering. |
 
@@ -161,7 +161,7 @@ The updater service, on every host that has one:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `QUASAR_UPDATER_IMAGE` | `quasar-updater:latest` | The updater's image. A tag, not a digest, on purpose: the updater applies a release, so it is not one of the images a release moves. Registry installs set `ghcr.io/accreleus/quasar/quasar-updater:latest`. |
+| `QUASAR_UPDATER_IMAGE` | required in the generated stack | Select the updater image published for your chosen release. The updater is not one of the two components changed by a platform update. Do not assume a `latest` tag exists. |
 | `QUASAR_STACK_DIR` | a sentinel that refuses to work | The stack directory's absolute **host** path, mounted into the updater at that same path. Required. The updater rebuilds its compose invocation from its own container labels, which record host paths. Left unset it refuses to serve and says which label it could not resolve. |
 | `QUASAR_DOCKER_SOCKET` | `/var/run/docker.sock` | Host path of the container-runtime socket mounted into the updater. Rootless Podman: `/run/user/<uid>/podman/podman.sock`. |
 | `QUASAR_UPDATER_ALLOWED_NAMESPACES` | `ghcr.io/accreleus/quasar` | Comma-separated registry namespaces this host will pull platform images from, matched on path segment boundaries. Anything outside is refused before a byte is pulled. Unset or blank means the project's own namespace, never "allow nothing" and never "allow everything"; to lock a host down, name a namespace nothing matches. |

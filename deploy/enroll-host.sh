@@ -241,7 +241,7 @@ services:
       - ${QUASAR_TEMPLATE_ROOT:-/var/lib/quasar/templates}:${QUASAR_TEMPLATE_ROOT:-/var/lib/quasar/templates}
       - /etc/os-release:/host/etc/os-release:ro
       - /dev:/host/dev:ro
-      - /sys/kernel/security:/host/sys/kernel/security:ro
+      - /sys/kernel:/host/sys/kernel:ro
       - quasar-agent-data:/var/lib/quasar-agent
       - quasar-updater-run:/run/quasar-updater
     devices:

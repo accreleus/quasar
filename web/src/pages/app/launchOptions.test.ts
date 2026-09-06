@@ -105,6 +105,20 @@ const ALL_CODECS: CodecCapabilities = { h264: true, hevc: true, av1: true, vp9: 
 const H264_ONLY: CodecCapabilities = { h264: true, hevc: false, av1: false, vp9: false };
 
 describe("buildOptionSpace", () => {
+  it("previews HEVC for Auto when the host rejects AV1, while preserving an explicit AV1 rejection", () => {
+    const blocked = rung("av1", "av1", 2560, 1440, 120, 1, 12000, "ineligible", [
+      { code: "host_encoder_not_supported", message: "Host does not support AV1" },
+    ]);
+    const fallback = rung("hevc", "hevc", 2560, 1440, 120, 2, 12000);
+    const space = buildOptionSpace([profile("p", [blocked, fallback])], ALL_CODECS, "p");
+    const auto = resolveSelection(space, defaultDraft(space, "p"));
+    expect(auto?.entryCodec).toBe("hevc");
+    expect(auto?.codec).toBeNull(); // Auto must let the server negotiate.
+    const explicit = resolveSelection(space, { codec: "av1", fps: 120, height: 1440 });
+    expect(explicit?.eligibility).toBe("ineligible");
+    expect(explicit?.reasons[0].code).toBe("host_encoder_not_supported");
+  });
+
   it("offers auto + every catalog codec the client can decode", () => {
     const space = buildOptionSpace(catalog120(), ALL_CODECS, "1080p120");
     expect(space.codecs).toEqual(["auto", "h264", "hevc", "av1"]);

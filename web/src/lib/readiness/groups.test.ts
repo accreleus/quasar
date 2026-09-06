@@ -22,6 +22,7 @@ const AGENT_CHECK_IDS = [
   "driver_volume_version",
   "encoder_codecs",
   "media_reachability",
+  "nvidia_vulkan_av1_compatibility",
 ];
 
 describe("readiness groups (#102)", () => {
@@ -32,9 +33,9 @@ describe("readiness groups (#102)", () => {
     expect([...seen.values()].every((n) => n === 1)).toBe(true);
   });
 
-  it("keeps the four NVIDIA-related checks together, driver_volume_version included", () => {
+  it("keeps NVIDIA-related checks together, driver_volume_version included", () => {
     const nvidia = READINESS_GROUPS.find((g) => g.key === "nvidia");
-    expect(nvidia?.ids).toEqual(["nvidia_egl_vendor_json", "nvidia_eglcore_library", "nvidia_lib32_gl", "driver_volume_version"]);
+    expect(nvidia?.ids).toEqual(["nvidia_egl_vendor_json", "nvidia_eglcore_library", "nvidia_lib32_gl", "driver_volume_version", "nvidia_vulkan_av1_compatibility"]);
   });
 
   it("demotes skipped checks to not-applicable and omits a group with nothing left to show", () => {

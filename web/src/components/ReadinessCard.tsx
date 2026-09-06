@@ -72,7 +72,7 @@ export function ReadinessCard({
       <div className="host-setting-copy">
         <div className="row gap2" style={{ alignItems: "center" }}>
           <ReadinessGlyph status={c.status} />
-          <h3 style={{ fontSize: "var(--t-sm)" }}>{c.id.replaceAll("_", " ")}</h3>
+          <h3 style={{ fontSize: "var(--t-sm)" }}>{c.id === "nvidia_vulkan_av1_compatibility" ? "Vulkan AV1 compatibility" : c.id.replaceAll("_", " ")}</h3>
         </div>
         <p>{c.summary}</p>
         {/* #483: `warn` is advisory-but-actionable (e.g. media_reachability) —

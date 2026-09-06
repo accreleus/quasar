@@ -45,10 +45,11 @@ FROM debian:bookworm-slim
 
 # ca-certificates: needed for TLS outbound (DB connections, future HTTPS).
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates wget && \
+    apt-get install -y --no-install-recommends ca-certificates wget util-linux && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /quasar-control /usr/local/bin/quasar-control
+COPY --chmod=0755 deploy/control-entrypoint.sh /usr/local/bin/quasar-control-entrypoint
 
 # THE SAME uid:gid AS Dockerfile.control.prod (`quasar`, 1000:1000, which the
 # quasar-base family defines). Not cosmetic: a named volume takes its ownership
@@ -78,4 +79,4 @@ USER quasar
 
 EXPOSE 8080
 
-ENTRYPOINT ["/usr/local/bin/quasar-control"]
+ENTRYPOINT ["/usr/local/bin/quasar-control-entrypoint"]

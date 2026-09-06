@@ -21,4 +21,11 @@ fills in `QUASAR_STACK_DIR` — this directory's absolute path on the machine �
 which the updater needs to find those compose files. On Podman, also set
 `QUASAR_DOCKER_SOCKET` to your own socket path.
 
+The installer selects a stable release, pins its control-plane and agent image
+digests, and checks the matching updater image before starting anything. If the
+stable release predates this installer configuration, it stops with instructions
+to use that release’s installation guide or wait for a compatible release.
+Development changes described here are not available merely because they have
+merged into `develop`.
+
 <QuickStart />

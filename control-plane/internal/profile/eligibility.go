@@ -76,12 +76,16 @@ type Probe struct {
 	Codecs map[Codec]bool
 }
 
-// HostCaps carries optional host-side capability. When Known is false the host
-// is not considered (unknown → allow), so eligibility never hard-fails purely
-// because host info was unavailable.
+// HostCaps carries optional host-side capability. Known covers hardware-encoder
+// telemetry; Codecs independently distinguishes an unreported set from a measured
+// exclusion. Missing information never hard-fails eligibility.
 type HostCaps struct {
 	Known           bool // whether host capability info is available at all
 	HardwareEncoder bool // host has a hardware video encoder
+	// Codecs is independent of Known: nil means unreported, while a non-nil
+	// map is the union advertised by candidate hosts. Missing codecs then fail
+	// eligibility even when hardware-encoder telemetry itself is unknown.
+	Codecs map[Codec]bool
 }
 
 // EvalInput bundles every input to Evaluate.
@@ -159,6 +163,9 @@ func evaluateProfile(p Profile, in EvalInput) ProfileEval {
 	}
 	if in.HostCaps.Known && p.HardwareEncoderRequired && !in.HostCaps.HardwareEncoder {
 		hard(ReasonHostEncoderNotSupported, "no host with a hardware encoder is available for this profile")
+	}
+	if in.HostCaps.Codecs != nil && p.Codec != "" && !in.HostCaps.Codecs[p.Codec] {
+		hard(ReasonHostEncoderNotSupported, "no available host advertises this rung's codec")
 	}
 	if in.HistoricalFailures[p.ID] {
 		hard(ReasonHistoricalClientPerfFailed, "this client previously failed performance certification at this profile")

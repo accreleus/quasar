@@ -1,32 +1,12 @@
-/**
- * The single source of truth for the Quasar install artifacts.
- *
- * `generate(answers)` turns the quick start wizard's answers into the Compose
- * file, the NVIDIA overlay, the .env file, the one-paste shell script, and a
- * reverse proxy config. It is pure: no DOM, no I/O, no imports beyond the proxy
- * builders, so it runs in the browser (bundled into the wizard), at build time
- * (rendering the Install page) and under `node --test`.
- *
- * THE ONE RULE: the two heredocs in the generated script are quoted
- * differently, on purpose.
- *
- *   COMPOSE is quoted   (<<'COMPOSE')  so ${POSTGRES_PASSWORD:?} reaches the
- *                                      file for Compose to expand at up time.
- *   ENV is NOT quoted   (<<ENV)        so $(openssl rand ...) runs on the
- *                                      target machine and writes a real secret.
- *
- * Swap them and you get a Compose file full of empty interpolations and a .env
- * full of literal `$(openssl ...)` strings. `stack-template.test.js` asserts
- * both directions.
- */
-
+/** Install artifacts derived from the repository Compose files. */
+import { dump } from 'js-yaml';
+import templates from './compose-template.generated.js';
 import { proxyConfig } from './proxy-configs.js';
 import { platform } from './platforms.js';
 
-const REGISTRY = 'ghcr.io/accreleus/quasar';
-
 export const DEFAULTS = {
   platform: 'fedora', // see platforms.js
+  kernelLogs: false, // Optional host /dev/kmsg diagnostics.
   gpu: 'amd-intel', // 'nvidia' | 'amd-intel'
   basePath: '/var/lib/quasar',
   separateSaves: false,
@@ -43,23 +23,6 @@ export const DEFAULTS = {
   controlPort: 8080,
   tlsPort: 8443,
 };
-
-/** One agent image covers every host: NVIDIA driver userspace and the CUDA
- *  runtime are provisioned into a volume at run time, so there is no per-vendor
- *  lineage to choose. The GPU answer still selects the compose overlay. */
-export function agentImage() {
-  return `${REGISTRY}/quasar-node-agent:latest`;
-}
-
-/**
- * Vulkan Video everywhere. It is the validated path on AMD and NVIDIA, and on
- * NVIDIA it sidesteps an NVENC teardown fault no driver version escapes. Intel
- * is untested but takes the same path; VA-API is there as a fallback if it
- * turns out not to work, which is a per-host setting rather than a fork here.
- */
-export function encoder() {
-  return 'vulkan';
-}
 
 /** Certificate, artwork cache and other control-plane state. */
 export function statePath(a) {
@@ -78,7 +41,7 @@ export function homePath(a) {
  * This drives QUASAR_APP_PUID/PGID (the game container drops to it) and the
  * ownership of the created directories. It deliberately does NOT change the
  * control plane's own user: that image runs as uid 1000 and owns its files as
- * 1000, so the state directory is always chowned to 1000 regardless.
+ * 1000 on its named volume; bind-storage overrides are a separate choice.
  */
 export function appUser(a) {
   const p = platform(a.platform);
@@ -89,199 +52,109 @@ export function appUser(a) {
 }
 
 /** The -f list every generated docker compose command carries. */
-export function composeFiles(a) {
-  const files = ['deploy/docker-compose.yml'];
-  if (a.gpu === 'nvidia') files.push('deploy/docker-compose.nvidia.yml');
-  return files;
+export function composeFiles() {
+  return ['deploy/docker-compose.yml'];
 }
 
 function composeYaml(a) {
-  const ownCert =
-    a.access === 'own-cert'
-      ? `        QUASAR_TLS_CERT: \${QUASAR_TLS_CERT:?set it in .env}
-        QUASAR_TLS_KEY: \${QUASAR_TLS_KEY:?set it in .env}
-`
-      : '';
-  const certMount =
-    a.access === 'own-cert'
-      ? `        - \${QUASAR_TLS_CERT_DIR:?set it in .env}:/etc/quasar/tls:ro
-`
-      : '';
-
-  return `services:
-  quasar-postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: quasar
-      POSTGRES_USER: quasar
-      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD:?set it in .env}
-    volumes:
-      - quasar-postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U quasar -d quasar"]
-      interval: 5s
-      timeout: 3s
-      retries: 12
-    restart: unless-stopped
-
-  quasar-control-plane:
-    image: \${QUASAR_CONTROL_IMAGE:-${REGISTRY}/quasar-control-plane:latest}
-    ports:
-      - "\${CONTROL_PORT:-8080}:8080"
-      - "\${QUASAR_TLS_PORT:-8443}:8443"
-    environment:
-      DATABASE_URL: postgres://quasar:\${POSTGRES_PASSWORD:?}@quasar-postgres:5432/quasar?sslmode=disable
-      LISTEN_ADDR: ":8080"
-      QUASAR_TLS_ADDR: ":8443"
-      QUASAR_TLS_HOSTS: \${QUASAR_TLS_HOSTS:-}
-      QUASAR_TLS_REDIRECT_PORT: \${QUASAR_TLS_PORT:-8443}
-      ENROLLMENT_TOKEN: \${ENROLLMENT_TOKEN:?set it in .env}
-      QUASAR_SECRET_KEY: \${QUASAR_SECRET_KEY:-}
-      QUASAR_HOME_ROOT: \${QUASAR_HOME_ROOT:?set it in .env}
-      PUBLIC_BASE_URL: \${PUBLIC_BASE_URL:-}
-      QUASAR_ALLOWED_ORIGINS: \${QUASAR_ALLOWED_ORIGINS:-}
-      QUASAR_TRUSTED_PROXIES: \${QUASAR_TRUSTED_PROXIES:-}
-      # Self-update. Every one has a working default, so leaving them empty is
-      # the normal case; they are passed because an .env entry with no
-      # passthrough is silently inert. QUASAR_PLATFORM_RELEASE_REPO=off disables
-      # release detection entirely.
-      QUASAR_PLATFORM_RELEASE_REPO: \${QUASAR_PLATFORM_RELEASE_REPO:-}
-      QUASAR_PLATFORM_RELEASE_API: \${QUASAR_PLATFORM_RELEASE_API:-}
-      QUASAR_PLATFORM_RELEASE_ASSET_HOSTS: \${QUASAR_PLATFORM_RELEASE_ASSET_HOSTS:-}
-      QUASAR_PLATFORM_RELEASE_TOKEN: \${QUASAR_PLATFORM_RELEASE_TOKEN:-}
-      QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL: \${QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL:-}
-      QUASAR_PLATFORM_REGISTRY: \${QUASAR_PLATFORM_REGISTRY:-}
-      QUASAR_IMAGE_REGISTRY_HOSTS: \${QUASAR_IMAGE_REGISTRY_HOSTS:-}
-${ownCert}      QUASAR_WEB_ROOT: /app/web
-    volumes:
-      - \${QUASAR_STATE_DIR:?set it in .env}:/var/lib/quasar-control
-${certMount}    depends_on:
-      quasar-postgres:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 6
-      start_period: 15s
-    restart: unless-stopped
-
-  quasar-node-agent:
-    image: \${QUASAR_AGENT_IMAGE:-${agentImage(a.gpu)}}
-    entrypoint: ["/usr/local/bin/quasar-node-agent-entrypoint"]
-    network_mode: host
-    cap_add: [NET_ADMIN, SYSLOG]
-    init: true
-    environment:
-      CONTROL_PLANE_URL: ws://localhost:\${CONTROL_PORT:-8080}
-      ENROLLMENT_TOKEN: \${ENROLLMENT_TOKEN:?}
-      NODE_NAME: \${NODE_NAME:-quasar-node-1}
-      NODE_SECRET_PATH: /var/lib/quasar-agent/node-secret
-      XDG_RUNTIME_DIR: /run/quasar-agent
-      QUASAR_ENCODER: \${QUASAR_ENCODER:-${encoder()}}
-      QUASAR_HOME_ROOT: \${QUASAR_HOME_ROOT:?}
-      QUASAR_APP_PUID: \${QUASAR_APP_PUID:-}
-      QUASAR_APP_PGID: \${QUASAR_APP_PGID:-}
-      QUASAR_APP_SHM_SIZE: 1g
-      QUASAR_PULSE_IMAGE: \${QUASAR_AGENT_IMAGE:-${agentImage(a.gpu)}}
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /run/quasar-agent:/run/quasar-agent
-      - /dev/input:/dev/input
-      - /dev:/host/dev:ro
-      - /etc/os-release:/host/etc/os-release:ro
-      - \${QUASAR_HOME_ROOT}:\${QUASAR_HOME_ROOT}
-      - quasar-agent-data:/var/lib/quasar-agent
-      - quasar-updater-run:/run/quasar-updater
-    devices:
-      - /dev/dri
-      - /dev/uinput
-      # Kernel ring buffer, read-only: GPU faults (NVIDIA Xid, amdgpu) reach the
-      # session trace. Needs CAP_SYSLOG above. Drop both lines on a kernel with
-      # no /dev/kmsg; the agent then reports xid_visibility: skip.
-      - /dev/kmsg:/dev/kmsg:r
-    device_cgroup_rules:
-      - 'c 13:* rmw'
-    depends_on:
-      quasar-control-plane:
-        condition: service_healthy
-    restart: unless-stopped
-
-  # Applies a platform release to this stack: it pulls the pinned digests and
-  # recreates the containers they replace, because a container cannot recreate
-  # itself. It acts only when told to, over the socket in the shared volume
-  # above, and only on images inside the allow-listed namespace.
-  quasar-updater:
-    image: \${QUASAR_UPDATER_IMAGE:-${REGISTRY}/quasar-updater:latest}
-    environment:
-      QUASAR_UPDATER_ALLOWED_NAMESPACES: \${QUASAR_UPDATER_ALLOWED_NAMESPACES:-}
-      QUASAR_UPDATER_WAIT_TIMEOUT_S: \${QUASAR_UPDATER_WAIT_TIMEOUT_S:-}
-    volumes:
-      # Podman: point QUASAR_DOCKER_SOCKET at /run/user/<uid>/podman/podman.sock.
-      - \${QUASAR_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
-      # This directory at its own host path. The updater rebuilds its compose
-      # invocation from its own container labels, which record host paths, so
-      # the same absolute path has to resolve inside the container. Left at the
-      # placeholder below, the updater refuses to serve and says so; nothing
-      # else in the stack is affected.
-      - \${QUASAR_STACK_DIR:-/var/lib/quasar/stack-dir-unset}:\${QUASAR_STACK_DIR:-/var/lib/quasar/stack-dir-unset}
-      - quasar-updater-run:/run/quasar-updater
-    # SELinux-enforcing hosts (Podman) refuse every call to the mounted socket
-    # without this. Docker is unaffected.
-    security_opt: ["label=disable"]
-    restart: unless-stopped
-
-volumes:
-  quasar-postgres-data:
-  quasar-agent-data:
-  quasar-updater-run:
-`;
+  const doc = structuredClone(templates['deploy/docker-compose.yml']);
+  const cp = doc.services['quasar-control-plane'];
+  const agent = doc.services['quasar-node-agent'];
+  if (a.gpu === 'nvidia') {
+    const overlay = templates['deploy/docker-compose.nvidia.yml'];
+    const nv = overlay.services['quasar-node-agent'];
+    Object.assign(agent, nv, {
+      environment: { ...agent.environment, ...nv.environment },
+      volumes: [...agent.volumes, ...nv.volumes],
+    });
+    Object.assign(doc.volumes, overlay.volumes);
+  }
+  if (!a.kernelLogs) {
+    agent.devices = agent.devices.filter(device => !String(device).startsWith('/dev/kmsg'));
+    agent.cap_add = agent.cap_add.filter(capability => capability !== 'SYSLOG');
+  }
+  // Installation policy is explicit; service wiring comes from the repo.
+  cp.image = '${QUASAR_CONTROL_IMAGE:?Select a published control-plane image}';
+  agent.image = '${QUASAR_AGENT_IMAGE:?Select a published node-agent image}';
+  doc.services['quasar-updater'].image = '${QUASAR_UPDATER_IMAGE:?Select a published updater image}';
+  doc.services['quasar-updater'].volumes = doc.services['quasar-updater'].volumes.map(mount =>
+    typeof mount === 'string' ? mount.replaceAll('${QUASAR_STACK_DIR:-/var/lib/quasar/stack-dir-unset}', '${QUASAR_STACK_DIR:?Set the absolute deploy directory in .env}') : mount);
+  delete cp.environment.DATABASE_URL;
+  Object.assign(cp.environment, {
+    QUASAR_DATABASE_HOST: 'quasar-postgres',
+    QUASAR_DATABASE_USER: '${POSTGRES_USER:-quasar}',
+    QUASAR_DATABASE_PASSWORD: '${POSTGRES_PASSWORD:?Run openssl rand -hex 24 and paste its output into POSTGRES_PASSWORD in .env}',
+    QUASAR_SECRET_KEY: '${QUASAR_SECRET_KEY:?Run openssl rand -base64 32 and paste its output into QUASAR_SECRET_KEY in .env}',
+  });
+  agent.environment.QUASAR_PULSE_IMAGE = '${QUASAR_PULSE_IMAGE:-${QUASAR_AGENT_IMAGE:?}}';
+  // These are established before exec by the image entrypoint.
+  for (const key of ['NODE_SECRET_PATH', 'XDG_RUNTIME_DIR', 'LD_LIBRARY_PATH', 'NVIDIA_DRIVER_CAPABILITIES']) {
+    delete agent.environment[key];
+  }
+  // Optional settings belong in a service-specific override file. Keeping them
+  // separate avoids exposing database credentials to the Docker-privileged agent.
+  // Empty passthroughs have no deployment meaning; preserve all nonempty defaults.
+  const choices = new Set([
+    'QUASAR_HOME_ROOT', 'QUASAR_TEMPLATE_ROOT', 'QUASAR_APP_PUID', 'QUASAR_APP_PGID',
+    'QUASAR_ENCODER', 'QUASAR_TLS_HOSTS', 'QUASAR_SECRET_KEY', 'PUBLIC_BASE_URL',
+    'QUASAR_ALLOWED_ORIGINS', 'QUASAR_TRUSTED_PROXIES',
+    // Release detection knobs retain the upstream install's .env interface.
+    'QUASAR_PLATFORM_RELEASE_REPO', 'QUASAR_PLATFORM_RELEASE_API',
+    'QUASAR_PLATFORM_RELEASE_ASSET_HOSTS', 'QUASAR_PLATFORM_RELEASE_TOKEN',
+    'QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL', 'QUASAR_PLATFORM_REGISTRY',
+    'QUASAR_IMAGE_REGISTRY_HOSTS',
+  ]);
+  for (const [service, file] of [[cp, 'control.env'], [agent, 'agent.env']]) {
+    for (const [key, value] of Object.entries(service.environment)) {
+      if (value === '${' + key + ':-}' && !choices.has(key)) delete service.environment[key];
+    }
+    service.env_file = [{ path: file, required: false }];
+  }
+  if (a.access === 'own-cert') {
+    Object.assign(cp.environment, {
+      QUASAR_TLS_CERT: '/etc/quasar/tls/cert.pem',
+      QUASAR_TLS_KEY: '/etc/quasar/tls/key.pem',
+    });
+    cp.volumes.push(
+      { type: 'bind', source: '${QUASAR_TLS_CERT:?}', target: '/etc/quasar/tls/cert.pem', read_only: true, bind: { create_host_path: false } },
+      { type: 'bind', source: '${QUASAR_TLS_KEY:?}', target: '/etc/quasar/tls/key.pem', read_only: true, bind: { create_host_path: false } },
+    );
+  }
+  return '# Quasar generated install v2\n' + dump(doc, { lineWidth: -1, noRefs: true });
 }
 
-function nvidiaYaml() {
-  return `services:
-  quasar-node-agent:
-    image: \${QUASAR_AGENT_IMAGE:-${REGISTRY}/quasar-node-agent:latest}
-    gpus: all
-    environment:
-      NVIDIA_DRIVER_CAPABILITIES: all
-      QUASAR_GPU_NVIDIA: "1"
-      QUASAR_CUDA_DEVICE: \${QUASAR_CUDA_DEVICE:-0}
-      QUASAR_RENDER_NODE: \${QUASAR_RENDER_NODE:-/dev/dri/renderD128}
-      QUASAR_NVIDIA_DRIVER_VOLUME: \${QUASAR_NVIDIA_DRIVER_VOLUME:-1}
-      LD_LIBRARY_PATH: /opt/quasar/nvidia-driver/lib64
-      QUASAR_PULSE_IMAGE: \${QUASAR_AGENT_IMAGE:-${REGISTRY}/quasar-node-agent:latest}
-    volumes:
-      - quasar-nvidia-driver:/opt/quasar/nvidia-driver
-
-volumes:
-  quasar-nvidia-driver:
-`;
-}
-
-function envFile(a) {
+function envFile(a, installer = false) {
   const { uid, gid } = appUser(a);
   const lines = [
-    '# Generated by the Quasar quick start. The three secrets below are created',
-    '# on this machine when the script runs; they were never in your browser.',
-    'POSTGRES_PASSWORD=$(openssl rand -hex 24)',
-    'ENROLLMENT_TOKEN=$(openssl rand -hex 32)',
-    'QUASAR_SECRET_KEY=$(openssl rand -base64 32)',
+    '# Replace ALL three blank values below before starting. Keep this file private.',
+    '# Run these commands in a terminal, then paste each OUTPUT after the matching =.',
+    '# Do not paste the command itself into a value; .env does not run shell commands.',
+    '# POSTGRES_PASSWORD: openssl rand -hex 24',
+    '# ENROLLMENT_TOKEN: openssl rand -hex 32',
+    '# QUASAR_SECRET_KEY: openssl rand -base64 32',
+    'POSTGRES_PASSWORD=',
+    'ENROLLMENT_TOKEN=',
+    'QUASAR_SECRET_KEY=',
     '',
     '# Where Quasar keeps things.',
     `QUASAR_HOME_ROOT=${homePath(a)}`,
-    `QUASAR_STATE_DIR=${statePath(a)}`,
+    `QUASAR_TEMPLATE_ROOT=${homePath(a).replace(/\/[^/]*$/, '/templates')}`,
     '',
     '# This stack directory, at its absolute path on this host. The updater',
     '# needs it to find the compose files it is asked to act on.',
-    'QUASAR_STACK_DIR=$(cd deploy && pwd)',
+    '# Set this to the absolute directory where you save docker-compose.yml and .env.',
+    'QUASAR_STACK_DIR=',
     '',
     '# Who owns save data. Game containers drop to this user.',
     `QUASAR_APP_PUID=${uid}`,
     `QUASAR_APP_PGID=${gid}`,
     '',
-    '# Encoder for this host.',
-    `QUASAR_ENCODER=${encoder()}`,
+    '# Optional encoder override; the agent detects the GPU when empty.',
+    'QUASAR_ENCODER=',
+    '# Pin all images to a published release before starting.',
+    `QUASAR_CONTROL_IMAGE=${a.controlImage || ''}`,
+    `QUASAR_AGENT_IMAGE=${a.agentImage || ''}`,
+    `QUASAR_UPDATER_IMAGE=${a.updaterImage || ''}`,
     '',
     '# Ports on the host.',
     `CONTROL_PORT=${a.controlPort}`,
@@ -313,17 +186,64 @@ function envFile(a) {
   }
 
   if (a.access === 'own-cert') {
-    const dir = (a.certPath || '').trim().replace(/\/[^/]*$/, '') || '/etc/quasar/tls';
-    lines.push(
-      '',
-      '# Your own certificate, mounted read-only into the container.',
-      `QUASAR_TLS_CERT_DIR=${dir}`,
-      `QUASAR_TLS_CERT=/etc/quasar/tls/${(a.certPath || 'cert.pem').split('/').pop()}`,
-      `QUASAR_TLS_KEY=/etc/quasar/tls/${(a.keyPath || 'key.pem').split('/').pop()}`
-    );
+    lines.push('', '# Host paths; each file is mounted independently, read-only.',
+      `QUASAR_TLS_CERT=${a.certPath.trim()}`,
+      `QUASAR_TLS_KEY=${a.keyPath.trim()}`);
   }
 
-  return lines.join('\n') + '\n';
+  const resolvedByInstaller = new Set(['QUASAR_STACK_DIR', 'QUASAR_CONTROL_IMAGE', 'QUASAR_AGENT_IMAGE', 'QUASAR_UPDATER_IMAGE']);
+  return lines.filter(line => !installer || !resolvedByInstaller.has(line.split('=')[0])).map(line => {
+    if (line.startsWith('#') || !line.includes('=')) return line;
+    const index = line.indexOf('=');
+    const value = line.slice(index + 1);
+    if (/^[a-zA-Z0-9_./,:@%+-]*$/.test(value)) return line;
+    return line.slice(0, index + 1) + "'" + value.replaceAll("\\", "\\\\").replaceAll("'", "\\'") + "'";
+  }).join('\n') + '\n';
+}
+
+// The release manifest's two-component contract is shared with self-update.
+// The independently published updater is checked by pulling its matching version.
+function releaseSelection() {
+  return `
+# Fresh installations select the latest stable GitHub release, never a guessed
+# image tag or a prerelease. Existing .env files keep their image pins.
+echo "==> Published release"
+release=$(curl --fail --silent --show-error --connect-timeout 10 --max-time 60 https://api.github.com/repos/accreleus/quasar/releases/latest) || {
+  echo "No stable release could be retrieved. Select a published release explicitly before installing." >&2
+  exit 1
+}
+manifest_url=$(printf '%s' "$release" | jq -er '.assets[] | select(.name == "platform-release-manifest.json") | .browser_download_url')
+case "$manifest_url" in
+  https://github.com/accreleus/quasar/releases/download/*/platform-release-manifest.json) ;;
+  *) echo "Release has no recognized platform manifest asset" >&2; exit 1 ;;
+esac
+manifest=$(curl --fail --silent --show-error --location --connect-timeout 10 --max-time 60 "$manifest_url")
+printf '%s' "$manifest" | jq -e '
+  .format_version == 1 and .prerelease == false and
+  (.version | test("^[0-9]+[.][0-9]+[.][0-9]+$")) and
+  (.components | length == 2) and
+  ([.components[].name] | sort == ["control-plane", "node-agent"]) and
+  all(.components[]; .image == ("ghcr.io/accreleus/quasar/quasar-" + .name) and
+    (.digest | test("^sha256:[a-f0-9]{64}$")))
+' >/dev/null || { echo "Invalid stable platform release manifest" >&2; exit 1; }
+control_image=$(printf '%s' "$manifest" | jq -r '.components[] | select(.name == "control-plane") | .image + "@" + .digest')
+agent_image=$(printf '%s' "$manifest" | jq -r '.components[] | select(.name == "node-agent") | .image + "@" + .digest')
+version=$(printf '%s' "$manifest" | jq -r '.version')
+updater_image="ghcr.io/accreleus/quasar/quasar-updater:$version"
+# Verify availability before writing credentials or creating stack services.
+docker pull "$control_image"
+docker pull "$agent_image"
+docker pull "$updater_image"
+entrypoint=$(docker image inspect --format '{{json .Config.Entrypoint}}' "$control_image")
+printf '%s' "$entrypoint" | jq -e '.[0] == "/usr/local/bin/quasar-control-entrypoint"' >/dev/null || {
+  echo "The latest stable release predates this installer configuration. Use the installation instructions shipped with that release, or wait for a compatible release." >&2
+  exit 1
+}
+`;
+}
+
+function shellQuote(value) {
+  return "'" + value.replaceAll("'", "'\"'\"'") + "'";
 }
 
 function scriptText(a) {
@@ -333,37 +253,63 @@ function scriptText(a) {
     .map((f) => `-f ${f}`)
     .join(' ');
 
-  const nvidiaBlock =
-    a.gpu === 'nvidia'
-      ? `
-echo "==> NVIDIA container toolkit"
-${p.sudo}nvidia-ctk runtime configure
+  const nvidiaBlock = a.gpu === 'nvidia' ? `
+if command -v docker >/dev/null && command -v jq >/dev/null; then
+  if ! docker info --format '{{json .Runtimes}}' | jq -e 'has("nvidia")' >/dev/null; then
+    echo "NVIDIA Container Toolkit is not registered with Docker. Configure it on this host, then rerun this installer." >&2
+    preflight_failed=1
+  fi
+fi
+if [ ! -r /sys/module/nvidia/version ]; then
+  echo "The NVIDIA kernel driver is not loaded. Install/enable the host graphics driver first." >&2
+  preflight_failed=1
+fi
+` : '';
 
-# The one destructive step in this script: restarting Docker stops every other
-# container on this machine. Nothing else here touches anything you already run.
-echo
-echo "Docker has to restart for the NVIDIA runtime to register."
-echo "This stops every container currently running on this host."
-printf 'Restart Docker now? [y/N] '
-read -r reply
-case "$reply" in
-  [yY]*) ${p.dockerRestart} ;;
-  *) echo "Skipped. Run '${p.dockerRestart}' before starting Quasar." ;;
-esac
-
-cat > deploy/docker-compose.nvidia.yml <<'NVIDIA'
-${nvidiaYaml()}NVIDIA
-`
-      : '';
 
   return `#!/usr/bin/env bash
 # Quasar quick start for ${p.label}. Generated in your browser; nothing was sent
 # anywhere. Read it before you run it.
 set -euo pipefail
 
+echo "==> Host preflight"
+preflight_failed=0
+for tool in docker openssl curl jq; do
+  if ! command -v "$tool" >/dev/null; then
+    echo "Install required tool: $tool" >&2
+    preflight_failed=1
+  fi
+done
+if command -v docker >/dev/null; then
+  if ! docker info >/dev/null; then
+    echo "Docker is unavailable or this user cannot access its socket." >&2
+    preflight_failed=1
+  fi
+  compose_version=$(docker compose version --short 2>/dev/null || true)
+  if [[ ! "$compose_version" =~ ^v?([0-9]+)[.]([0-9]+) ]] ||
+     (( BASH_REMATCH[1] < 2 || (BASH_REMATCH[1] == 2 && BASH_REMATCH[2] < 30) )); then
+    echo "Install Docker Compose v2.30 or newer (found: $compose_version)." >&2
+    preflight_failed=1
+  fi
+fi
+if [ ! -d /dev/dri ]; then
+  echo "GPU devices are unavailable under /dev/dri. Check the host graphics driver." >&2
+  preflight_failed=1
+fi
+${nvidiaBlock}
+if [ "$preflight_failed" != 0 ]; then
+  echo "Correct the preflight problems above before starting Quasar." >&2
+  exit 1
+fi
+if [ -e deploy/docker-compose.yml ] && ! grep -q '^# Quasar generated install v2$' deploy/docker-compose.yml; then
+  echo "This directory contains an existing stack. Keep its deployment commands; this first-install script will not rewrite it." >&2
+  exit 1
+fi
+if [ ! -e deploy/.env ]; then
+${releaseSelection()}fi
+
 echo "==> Directories"
-${p.sudo}install -d -m 0755 -o ${uid} -g ${gid} "${homePath(a)}"
-${p.sudo}install -d -m 0755 -o 1000 -g 1000 "${statePath(a)}"
+${p.sudo}install -d -m 0755 -o ${uid} -g ${gid} ${shellQuote(homePath(a))}
 mkdir -p deploy
 
 echo "==> UDP send buffer"
@@ -374,16 +320,36 @@ ${p.sysctl()}
 
 echo "==> Virtual input"
 ${p.module()}
-${nvidiaBlock}
+[ -c /dev/uinput ] || { echo "Virtual input device /dev/uinput is unavailable after loading uinput" >&2; exit 1; }
+[ -d /dev/dri ] || { echo "GPU device directory /dev/dri is unavailable; check the host graphics driver" >&2; exit 1; }
+
 echo "==> Compose file"
-cat > deploy/docker-compose.yml <<'COMPOSE'
+if [ ! -e deploy/docker-compose.yml ]; then
+  cat > deploy/docker-compose.yml <<'COMPOSE'
 ${composeYaml(a)}COMPOSE
+fi
 
 echo "==> Environment file"
 umask 077
-cat > deploy/.env <<ENV
-${envFile(a)}ENV
+if [ ! -e deploy/.env ]; then
+  postgres=$(openssl rand -hex 24)
+  enrollment=$(openssl rand -hex 32)
+  secret=$(openssl rand -base64 32)
+  env_tmp=$(mktemp deploy/.env.XXXXXX)
+  trap 'rm -f "$env_tmp"' EXIT
+  cat > "$env_tmp" <<'ENV'
+${envFile(a, true)}ENV
+  sed -i "s|^POSTGRES_PASSWORD=$|POSTGRES_PASSWORD=$postgres|; s|^ENROLLMENT_TOKEN=$|ENROLLMENT_TOKEN=$enrollment|; s|^QUASAR_SECRET_KEY=$|QUASAR_SECRET_KEY=$secret|" "$env_tmp"
+  printf '\nQUASAR_STACK_DIR=%s\nQUASAR_CONTROL_IMAGE=%s\nQUASAR_AGENT_IMAGE=%s\nQUASAR_UPDATER_IMAGE=%s\n' "$(cd deploy && pwd)" "$control_image" "$agent_image" "$updater_image" >> "$env_tmp"
+  # noclobber refuses a concurrent installer instead of replacing its credentials.
+  (set -o noclobber; cat "$env_tmp" > deploy/.env)
+  rm -f "$env_tmp"
+  trap - EXIT
+fi
 umask 022
+
+docker compose ${files} config --quiet
+docker compose ${files} pull
 
 echo "==> Starting Quasar"
 docker compose ${files} up -d
@@ -404,9 +370,12 @@ echo "Then open https://<this-host>:${a.tlsPort} and accept the certificate once
  */
 export function generate(input = {}) {
   const a = { ...DEFAULTS, ...input };
+  for (const key of ['basePath', 'savesPath', 'certPath', 'keyPath', 'tlsHosts', 'publicUrl']) {
+    if (/[\r\n\0]/.test(a[key])) throw new Error(`${key} must be a single line`);
+  }
   return {
     compose: composeYaml(a),
-    nvidia: a.gpu === 'nvidia' ? nvidiaYaml() : null,
+    nvidia: null,
     env: envFile(a),
     script: scriptText(a),
     proxyConfig:

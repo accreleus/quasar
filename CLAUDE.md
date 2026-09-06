@@ -201,8 +201,8 @@ session memory `current-focus.md`, not this file.**
   which also produced the #370 re-characterisation; no further operator soak is
   outstanding.
 - **Encoders:** AMD/Intel = VA (ZC-03 DMABuf zero-copy). **NVIDIA = Vulkan by
-  default** (2026-08-12): `docker-compose.nvidia.yml` sets
-  `QUASAR_ENCODER=${QUASAR_ENCODER:-vulkan}`, so H.264 and HEVC encode with
+  default** (2026-08-12): the agent detects NVIDIA when `QUASAR_ENCODER` is
+  unset or empty (Compose passes an operator override through), so H.264 and HEVC encode with
   `vulkanh264enc`/`vulkanh265enc`. Rationale:
   #489 is an NVIDIA-driver NVENC teardown UAF spanning the 595 **and** 610
   branches — no driver pin escapes it — and Vulkan is immune, so the default path
@@ -219,7 +219,12 @@ session memory `current-focus.md`, not this file.**
   with no vendor element the codec drops off the host — except h264, which is the
   floor and stays on `vulkanh264enc` with an error logged.
   `QUASAR_ENCODER=nvenc` in `deploy/.env` (or an admin host override) restores
-  the whole NVENC path.
+  the whole NVENC path, subject to compatibility exclusions.
+  **Driver compatibility precedes these knobs:** `encoder_compatibility.rs`
+  excludes AV1 for the measured RTX 5090 / 595.99.02 combination, including
+  NVENC fallback. Existing host/profile/client negotiation chooses eligible
+  HEVC/H.264; an explicitly forced unavailable codec fails. Readiness explains
+  the exclusion. See `docs/configuration.md` before changing that policy.
   **That NVENC fallback needs `libnvrtc`, which the agent now fetches at RUN TIME
   (#545, 2026-08-26) — there is no NVIDIA image any more.** `quasar-node-agent` is
   the universal agent image (CUDA-built like every lineage; `quasar-nv` is retired,

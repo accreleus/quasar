@@ -393,7 +393,14 @@ pub(crate) fn effective_encoder(
     knobs: EncoderKnobs,
     render_node: &str,
 ) -> Option<ResolvedEncoder> {
-    effective_encoder_with(choice, codec, knobs, render_node, any_registered)
+    effective_encoder_compatible_with(
+        choice,
+        codec,
+        knobs,
+        render_node,
+        crate::encoder_compatibility::av1_blocked(),
+        any_registered,
+    )
 }
 
 /// The registry-independent core of [`effective_encoder`], parameterized on the
@@ -406,6 +413,25 @@ pub(crate) fn effective_encoder_with(
     render_node: &str,
     registered: impl Fn(&[String]) -> bool,
 ) -> Option<ResolvedEncoder> {
+    effective_encoder_compatible_with(choice, codec, knobs, render_node, false, registered)
+}
+
+/// Compatibility exclusions precede registry/knob resolution, so disabling Vulkan
+/// AV1 cannot accidentally turn a corruption protection into NVENC AV1 fallback.
+fn effective_encoder_compatible_with(
+    choice: EncoderChoice,
+    codec: Codec,
+    knobs: EncoderKnobs,
+    render_node: &str,
+    av1_blocked: bool,
+    registered: impl Fn(&[String]) -> bool,
+) -> Option<ResolvedEncoder> {
+    if av1_blocked
+        && codec == Codec::Av1
+        && matches!(choice, EncoderChoice::Vulkan | EncoderChoice::Nvenc)
+    {
+        return None;
+    }
     if choice == EncoderChoice::Vulkan {
         // 1. The Vulkan element itself: knob allows it and it is registered.
         if let Some(factory) = first_registered(
@@ -514,6 +540,8 @@ pub fn probe_codec_support(choice: EncoderChoice, knobs: EncoderKnobs) -> CodecS
 pub(crate) enum CodecPlan {
     /// Produced by the Vulkan encoder element.
     Vulkan,
+    /// Evidence-based driver exclusion, independent of operator knobs or factories.
+    CompatibilityBlocked,
     /// The Vulkan element is unavailable (knob disabled, or element absent), so
     /// sessions borrow this vendor HW element instead. The codec stays advertised.
     Fallback(String),
@@ -529,6 +557,7 @@ impl std::fmt::Display for CodecPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CodecPlan::Vulkan => f.write_str("vulkan"),
+            CodecPlan::CompatibilityBlocked => f.write_str("disabled:driver-compatibility"),
             CodecPlan::Fallback(el) => write!(f, "fallback:{el}"),
             CodecPlan::Disabled => f.write_str("disabled"),
             CodecPlan::Unavailable => f.write_str("unavailable"),
@@ -583,7 +612,14 @@ pub struct CodecPlanReport {
 /// What each codec resolves to on this Vulkan-encoder host and where its knob value
 /// came from. Requires `gst::init` (it consults the registry).
 pub fn describe_codec_plan(knobs: EncoderKnobs) -> CodecPlanReport {
-    let plan = codec_plan_with(knobs, "software", any_registered);
+    let mut plan = codec_plan_with(knobs, "software", any_registered);
+    if crate::encoder_compatibility::av1_blocked() {
+        for (codec, state) in &mut plan {
+            if *codec == Codec::Av1 {
+                *state = CodecPlan::CompatibilityBlocked;
+            }
+        }
+    }
     let degraded = plan_is_degraded(knobs, &plan);
     let line = plan
         .into_iter()
@@ -1874,5 +1910,74 @@ mod pixel_rate_tests {
         let s = support(&[(Codec::H264, "vah264lpenc"), (Codec::H265, "vah265lpenc")]);
         assert!(s.pixel_rates_mpix_s().is_empty());
         assert_eq!(s.codec_strings(), vec!["h264", "h265"]);
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn known_corruption_prevents_av1_advertising_and_nvenc_fallback() {
+        for choice in [EncoderChoice::Vulkan, EncoderChoice::Nvenc] {
+            for enabled in [true, false] {
+                let mut knobs = EncoderKnobs::default();
+                knobs.av1.enabled = enabled;
+                // Even with every Vulkan/NVENC factory present, the exclusion wins.
+                assert!(effective_encoder_compatible_with(
+                    choice,
+                    Codec::Av1,
+                    knobs,
+                    "software",
+                    true,
+                    |_| true,
+                )
+                .is_none());
+                for codec in [Codec::H264, Codec::H265] {
+                    assert!(effective_encoder_compatible_with(
+                        choice,
+                        codec,
+                        knobs,
+                        "software",
+                        true,
+                        |_| true,
+                    )
+                    .is_some());
+                }
+                assert!(effective_encoder_compatible_with(
+                    choice,
+                    Codec::Av1,
+                    knobs,
+                    "software",
+                    false,
+                    |_| true,
+                )
+                .is_some());
+            }
+        }
+        assert!(
+            effective_encoder_compatible_with(
+                EncoderChoice::Va,
+                Codec::Av1,
+                EncoderKnobs::default(),
+                "software",
+                true,
+                |_| true,
+            )
+            .is_some(),
+            "a different vendor's encoder is not affected"
+        );
+    }
+
+    #[test]
+    fn compatibility_exclusion_is_not_a_broken_image_diagnosis() {
+        assert!(!plan_is_degraded(
+            EncoderKnobs::default(),
+            &[
+                (Codec::H264, CodecPlan::Vulkan),
+                (Codec::H265, CodecPlan::Vulkan),
+                (Codec::Av1, CodecPlan::CompatibilityBlocked),
+            ]
+        ));
     }
 }
