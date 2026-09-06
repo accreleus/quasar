@@ -411,6 +411,7 @@ pub fn probe(env: &ProbeEnv) -> Vec<ReadinessCheck> {
             None => skip("nvidia_driver_mount", "No unresolved NVIDIA app driver mount"),
         },
         check_encoder_codecs(env, distro),
+        check_vulkan_av1_compatibility(env),
         check_xid_visibility(env),
         // Applies to every host, GPU or not — not part of the sanity family.
         check_media_reachability(env, distro),
@@ -419,6 +420,19 @@ pub fn probe(env: &ProbeEnv) -> Vec<ReadinessCheck> {
             None => pass("host_container_mounts", "Required sibling-container paths agree with their host bind mounts".to_string()),
         },
     ]
+}
+
+fn check_vulkan_av1_compatibility(env: &ProbeEnv) -> ReadinessCheck {
+    use crate::encoder_compatibility::{self as compatibility, Av1Compatibility};
+    match compatibility::inspect(&env.root) {
+        Av1Compatibility::KnownCorrupt => warn_check(
+            compatibility::CHECK_ID, compatibility::SUMMARY.into(), compatibility::REMEDIATION.into(),
+        ),
+        Av1Compatibility::Validated => pass(compatibility::CHECK_ID,
+            "RTX 5090 with NVIDIA 610.57.04: Vulkan AV1 was validated on this GPU/driver combination. Codec availability still depends on the configured encoder and installed elements.".into()),
+        Av1Compatibility::Unknown => skip(compatibility::CHECK_ID,
+            "No recorded Vulkan AV1 compatibility result for this GPU/driver combination; this is not a visual-quality certification"),
+    }
 }
 
 /// Can this agent see the kernel's GPU fault records? Usually `skip` and never `fail`:
@@ -2493,12 +2507,14 @@ mod tests {
     fn healthy_nvidia_host_passes_every_check() {
         let root = FakeRoot::new("healthy");
         root.file("usr/share/glvnd/egl_vendor.d/10_nvidia.json", "{}")
-            .file("usr/lib64/libnvidia-eglcore.so.570.86", "")
+            .file("usr/lib64/libnvidia-eglcore.so.610.57.04", "")
             .file("dev/dri/renderD128", "")
             .file("dev/uinput", "")
             .file("dev/kmsg", "")
             .file("proc/sys/user/max_user_namespaces", "15000\n")
-            .file("sys/class/drm/renderD128", "")
+            .file("sys/class/drm/renderD128/device/vendor", "0x10de\n")
+            .file("sys/class/drm/renderD128/device/device", "0x2b85\n")
+            .file("sys/module/nvidia/version", "610.57.04\n")
             .file(
                 &format!("{NVIDIA_VOLUME_REL}/manifest.json"),
                 r#"{"driver_version":"610.57.04"}"#,
@@ -3337,6 +3353,28 @@ mod tests {
     }
 
     // ── GPU host post-boot sanity (#493) ─────────────────────────────────────
+
+    #[test]
+    fn av1_compatibility_refreshes_after_driver_change_without_blocking_readiness() {
+        let root = FakeRoot::new("av1-driver-compatibility");
+        root.file("sys/module/nvidia/version", "595.99.02\n")
+            .file("sys/class/drm/renderD128/device/vendor", "0x10de\n")
+            .file("sys/class/drm/renderD128/device/device", "0x2b85\n")
+            .file("dev/dri/renderD128", "");
+        let env = root.env(true, "");
+        let checks = probe(&env);
+        let check = get(&checks, crate::encoder_compatibility::CHECK_ID);
+        assert_eq!(check.status, WARN);
+        assert!(check.summary.contains("HEVC or H.264"));
+        assert!(check.remediation.contains("does not substitute NVENC AV1"));
+        root.file("sys/module/nvidia/version", "610.57.04\n");
+        assert_eq!(check_vulkan_av1_compatibility(&env).status, PASS);
+        root.file("sys/module/nvidia/version", "610.57.05\n");
+        assert_eq!(check_vulkan_av1_compatibility(&env).status, SKIP);
+        root.file("sys/module/nvidia/version", "595.99.02\n");
+        std::fs::remove_file(root.dir.join("dev/dri/renderD128")).unwrap();
+        assert_eq!(check_vulkan_av1_compatibility(&env).status, SKIP);
+    }
 
     /// The probe-root-relative volume path must stay in lockstep with the provisioner's
     /// absolute mount, or the version check reads an empty directory and skips forever.

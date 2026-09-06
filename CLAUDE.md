@@ -219,7 +219,12 @@ session memory `current-focus.md`, not this file.**
   with no vendor element the codec drops off the host — except h264, which is the
   floor and stays on `vulkanh264enc` with an error logged.
   `QUASAR_ENCODER=nvenc` in `deploy/.env` (or an admin host override) restores
-  the whole NVENC path.
+  the whole NVENC path, subject to compatibility exclusions.
+  **Driver compatibility precedes these knobs:** `encoder_compatibility.rs`
+  excludes AV1 for the measured RTX 5090 / 595.99.02 combination, including
+  NVENC fallback. Existing host/profile/client negotiation chooses eligible
+  HEVC/H.264; an explicitly forced unavailable codec fails. Readiness explains
+  the exclusion. See `docs/configuration.md` before changing that policy.
   **That NVENC fallback needs `libnvrtc`, which the agent now fetches at RUN TIME
   (#545, 2026-08-26) — there is no NVIDIA image any more.** `quasar-node-agent` is
   the universal agent image (CUDA-built like every lineage; `quasar-nv` is retired,

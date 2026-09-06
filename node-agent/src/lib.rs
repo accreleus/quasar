@@ -17,6 +17,7 @@ pub mod cp_tls;
 /// GStreamer elements on an NVIDIA host (#545).
 pub mod cuda_runtime;
 pub mod ddc;
+mod encoder_compatibility;
 pub mod enrollment;
 /// `host.xid` / `host.gpu_fault`: the kernel's own GPU fault records, off `/dev/kmsg`.
 pub mod gpu_kmsg;

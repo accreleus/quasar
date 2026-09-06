@@ -165,6 +165,16 @@ pub(crate) fn mic_disabled() -> bool {
 pub(crate) fn resolve_effective_encoder(cfg: &mut SessionConfig) -> Result<ResolvedEncoder> {
     let configured = cfg.encoder;
     let codec = cfg.stream.codec;
+    if codec == Codec::Av1
+        && matches!(configured, EncoderChoice::Vulkan | EncoderChoice::Nvenc)
+        && crate::encoder_compatibility::av1_blocked()
+    {
+        anyhow::bail!(
+            "{} {}",
+            crate::encoder_compatibility::SUMMARY,
+            crate::encoder_compatibility::REMEDIATION
+        );
+    }
     let knobs = EncoderKnobs::from_env();
     match effective_encoder(configured, codec, knobs, cfg.render_node.as_str()) {
         Some(resolved) => {

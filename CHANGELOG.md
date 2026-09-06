@@ -26,6 +26,9 @@ own; the two do not move together, and that is deliberate.
 
 ### Fixed
 
+- RTX 5090 hosts running NVIDIA 595.99.02 exclude the known-corrupt Vulkan AV1
+  path and its unsafe NVENC AV1 fallback. Host readiness and setup explain the
+  restriction; automatic negotiation can select eligible HEVC/H.264 instead.
 - First-install Compose now includes the selected GPU wiring from repository
   definitions, preserves generated credentials on reruns, and uses verified
   image pins. Copied environment files carry blank credentials and instructions.
