@@ -11,8 +11,8 @@
 //!   runs only with `--extract-only`.
 //! - Never a precedence override: a host whose graphics driver is CDI-injected has no
 //!   gap, so the module no-ops.
-//! - Never a gate: every failure degrades to the readiness card's manual remediation;
-//!   nothing blocks registration or a session launch.
+//! - Registration remains available for diagnosis. Readiness explains failures;
+//!   apps that require an unresolved or invalid driver mount are refused.
 //!
 //! The extract runs as a CHILD PROCESS of the agent, not a helper container: the agent
 //! image already ships [`REQUIRED_TOOLS`] and already mounts the volume, so this needs
@@ -31,6 +31,9 @@ use crate::artifact;
 
 /// Tracing target for every line this module emits.
 const T: &str = "quasar.nvidia_volume";
+
+mod host_path;
+pub use host_path::ENV as HOST_PATH_ENV;
 
 /// This provisioner's name in the shared [`artifact`] machinery: its download, lock and
 /// preflight lines land on `quasar.artifact` carrying `artifact="nvidia-driver"`.
@@ -218,8 +221,8 @@ pub fn run_url(version: &str) -> String {
 pub struct VolumeInfo {
     /// Path inside the AGENT container.
     pub local: PathBuf,
-    /// The volume's HOST path, from the agent's own mounts. `None` ⇒ app-container
-    /// injection is skipped; the agent still uses the volume itself.
+    /// The volume's HOST path, from a validated explicit override or Docker mounts.
+    /// Without either a host path or volume name, dependent app launches are blocked.
     pub host: Option<PathBuf>,
     /// Docker volume name, for logging.
     pub name: Option<String>,
@@ -244,6 +247,32 @@ pub enum Status {
 
 static STATUS: RwLock<Option<Status>> = RwLock::new(None);
 static CURRENT: RwLock<Option<VolumeInfo>> = RwLock::new(None);
+static MOUNT_ERROR: RwLock<Option<String>> = RwLock::new(None);
+
+fn set_mount_error(error: Option<String>) {
+    if let Ok(mut current) = MOUNT_ERROR.write() {
+        *current = error;
+    }
+}
+
+pub fn mount_resolution_error() -> Option<String> {
+    MOUNT_ERROR.read().ok().and_then(|error| error.clone())
+}
+
+/// Recheck an explicit bind immediately before launching an app: a host directory
+/// replaced after startup must not silently become a different driver volume.
+pub fn validate_host_path_for_launch(docker: &str) -> Result<(), String> {
+    if let Some(result) = host_path::resolve(docker, true) {
+        match result {
+            Ok(_) => set_mount_error(None),
+            Err(error) => {
+                set_mount_error(Some(error.clone()));
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}
 
 pub fn status() -> Status {
     STATUS
@@ -275,16 +304,19 @@ fn set_current(info: Option<VolumeInfo>) {
 
 /// Retry a transient Docker inspection failure without restarting or re-downloading.
 pub fn retry_mount_resolution(docker: &str) {
-    let Some(info) = current() else {
-        return;
-    };
-    if info.host.is_some() || info.name.is_some() {
+    let explicit = host_path::configured();
+    let info = current();
+    if !explicit
+        && info
+            .as_ref()
+            .is_none_or(|info| info.host.is_some() || info.name.is_some())
+    {
         return;
     }
     let (host, name) = locate_host_path(docker);
-    if host.is_none() && name.is_none() {
+    let Some(info) = info else {
         return;
-    }
+    };
     if let Ok(mut state) = CURRENT.write() {
         if let Some(current) = state.as_mut() {
             if current.manifest.driver_version == info.manifest.driver_version {
@@ -308,24 +340,36 @@ pub fn enabled() -> bool {
 
 // ── locating the volume ──────────────────────────────────────────────────────
 
-/// Resolve the volume's HOST path and name from the agent's OWN container mounts.
-///
-/// Not `docker volume inspect <name>`: compose names volumes `<project>_<key>` and the
-/// project name varies per worktree, so the agent cannot know it a priori. A miss is
-/// also the exact signal that the compose overlay was never applied.
+/// Prefer a validated explicit host bind when supplied. Otherwise discover the
+/// agent's structured Docker mount, preserving named-volume injection by default.
 pub fn locate_host_path(docker: &str) -> (Option<PathBuf>, Option<String>) {
+    if let Some(result) = host_path::resolve(docker, false) {
+        return match result {
+            Ok(host) => {
+                set_mount_error(None);
+                (Some(host), None)
+            }
+            Err(error) => {
+                set_mount_error(Some(error));
+                (None, None)
+            }
+        };
+    }
+    let unresolved = |detail: &str| {
+        set_mount_error(Some(format!("NVIDIA driver mount introspection failed: {detail}. Check Docker socket access and container identity/mount inspection, or set {HOST_PATH_ENV} to the host directory already mounted at {VOLUME_MOUNT}. App launches requiring this driver are blocked.")));
+        (None, None)
+    };
     let Some(id) = self_container_id() else {
-        tracing::debug!(target: T, "could not determine own container id; driver mount resolution is unavailable");
-        return (None, None);
+        return unresolved("could not identify the agent container");
     };
     let Some(out) = crate::readiness::run_with_timeout(
         docker,
         &["inspect", "--format", "{{json .Mounts}}", &id],
     ) else {
-        return (None, None);
+        return unresolved("Docker could not inspect the agent's mounts");
     };
     let Ok(mounts) = serde_json::from_str::<Vec<serde_json::Value>>(&out) else {
-        return (None, None);
+        return unresolved("Docker returned invalid mount data");
     };
     for mount in mounts {
         if mount["Destination"].as_str() != Some(VOLUME_MOUNT) {
@@ -343,13 +387,18 @@ pub fn locate_host_path(docker: &str) -> (Option<PathBuf>, Option<String>) {
         } else {
             None
         };
+        if host.is_none() && name.is_none() {
+            return unresolved("the driver mount has no usable source or volume name");
+        }
+        set_mount_error(None);
         return (host, name);
     }
-    (None, None)
+    unresolved("the agent mount list has no NVIDIA driver destination")
 }
 
 /// Our own container id, from `/proc/self/mountinfo` with `$HOSTNAME` as fallback. Both
-/// best-effort; a miss costs only app-container injection, never the agent's own use.
+/// best-effort; a miss blocks dependent app launches unless an explicit host path
+/// is validated. The agent remains available to explain the failed inspection.
 pub fn self_container_id() -> Option<String> {
     if let Ok(body) = std::fs::read_to_string("/proc/self/mountinfo") {
         if let Some(id) = parse_container_id_from_mountinfo(&body) {
@@ -447,7 +496,7 @@ pub fn decide(
     }
     if !volume_mounted {
         return Err(
-            "driver volume is not mounted into the agent (apply deploy/docker-compose.nvidia.yml)",
+            "mount persistent driver storage at /opt/quasar/nvidia-driver in the node agent; the host-path override does not create this mount",
         );
     }
     // A host with a working graphics driver never provisions, even with an empty
@@ -517,7 +566,7 @@ pub fn provision_blocking(nvidia_present: bool, gap: Gap, docker: &str) -> Outco
     if nvidia_present && gap.any() && enabled() {
         let (host, name) = locate_host_path(docker);
         if host.is_none() && name.is_none() {
-            let error = "Cannot verify a persistent NVIDIA driver mount through Docker. Check the agent's Docker socket, container identity and /opt/quasar/nvidia-driver mount; provisioning will retry automatically.".to_string();
+            let error = mount_resolution_error().unwrap_or_else(|| format!("Cannot verify a persistent NVIDIA driver mount. Check Docker socket and mount inspection, or set {HOST_PATH_ENV} to the host directory mounted at {VOLUME_MOUNT}; provisioning retries automatically."));
             set_status(Status::Failed(error.clone()));
             return Outcome::Failed(error);
         }
@@ -602,12 +651,12 @@ pub fn provision_blocking(nvidia_present: bool, gap: Gap, docker: &str) -> Outco
         }
         Err(e) => {
             let msg = format!("{e:#}");
-            note_failure(&volume, &msg);
+            record_provision_failure(&volume, &e);
             tracing::error!(
                 target: T, token = "drvvol-provision-failed",
                 error = %msg,
-                "driver-volume provisioning FAILED — falling back to the manual remediation shown \
-                 on the host readiness card"
+                "driver-volume provisioning could not complete — readiness describes the cause; \
+                 the agent will retry automatically"
             );
             set_status(Status::Failed(msg.clone()));
             Outcome::Failed(msg)
@@ -636,7 +685,8 @@ fn publish(volume: &Path, manifest: Manifest, docker: &str) {
             "the driver volume's HOST path could not be resolved from this container's mounts — \
              the agent will still use the volume, but app containers will NOT receive the driver \
              libraries. Check Docker socket access and the agent's container identity/mount inspection; \
-             app launches are blocked until the driver mount can be resolved."
+             app launches are blocked until the driver mount can be resolved. Set \
+             QUASAR_NVIDIA_DRIVER_HOST_PATH to the existing host directory as an explicit alternative."
         ),
     }
     set_current(Some(VolumeInfo {
@@ -921,6 +971,25 @@ fn note_failure(volume: &Path, error: &str) {
     artifact::note_failure(&attempts_path(volume), error)
 }
 
+// Waiting is not a new failure. Persisting this message on each retry nests the
+// previous backoff inside itself and eventually hides the original diagnosis.
+#[derive(Debug)]
+struct BackoffPending(String);
+
+impl std::fmt::Display for BackoffPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BackoffPending {}
+
+fn record_provision_failure(volume: &Path, error: &anyhow::Error) {
+    if !error.is::<BackoffPending>() {
+        note_failure(volume, &format!("{error:#}"));
+    }
+}
+
 fn clear_attempts(volume: &Path) {
     artifact::clear_attempts(&attempts_path(volume))
 }
@@ -981,7 +1050,7 @@ fn run_provision(volume: &Path, version: &str, _gap: Gap) -> Result<Manifest> {
     // Rate-limit repeated failures before spending anything.
     let attempts = read_attempts(volume);
     if let Some(wait) = backoff_remaining(&attempts, version, now_unix()) {
-        bail!(
+        return Err(BackoffPending(format!(
             "driver-volume provisioning has failed {} time(s) for driver {version} and is backing \
              off — not re-attempting for another {} min. Last error: {}. (Clearing the backoff is \
              deliberate: delete {} inside the driver volume.)",
@@ -993,7 +1062,8 @@ fn run_provision(volume: &Path, version: &str, _gap: Gap) -> Result<Manifest> {
                 attempts.last_error.as_str()
             },
             layout::ATTEMPTS
-        );
+        ))
+        .into());
     }
     check_free_space(volume)?;
     note_attempt(volume, version);
@@ -1057,7 +1127,7 @@ fn run_provision(volume: &Path, version: &str, _gap: Gap) -> Result<Manifest> {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
-        agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        agent_version: crate::buildinfo::version().to_string(),
         lib64_count: counts.0,
         lib32_count: counts.1,
         layout_version: CURRENT_LAYOUT_VERSION,
@@ -2907,6 +2977,25 @@ mod tests {
     }
 
     #[test]
+    fn retry_wait_does_not_replace_the_original_failure() {
+        let t = Tmp::new("backoff-diagnosis");
+        note_attempt(&t.0, "610.57.04");
+        record_provision_failure(&t.0, &anyhow::anyhow!("network unavailable"));
+        let before = read_attempts(&t.0);
+        for _ in 0..3 {
+            let waiting = anyhow::Error::new(BackoffPending(
+                "waiting to retry; last error: network unavailable".into(),
+            ))
+            .context("provisioning");
+            record_provision_failure(&t.0, &waiting);
+        }
+        let after = read_attempts(&t.0);
+        assert_eq!(after.last_error, "network unavailable");
+        assert_eq!(after.attempts, before.attempts);
+        assert_eq!(after.last_attempt_unix, before.last_attempt_unix);
+    }
+
+    #[test]
     fn attempts_are_counted_before_the_download_and_cleared_on_success() {
         let t = Tmp::new("attempts");
         assert_eq!(read_attempts(&t.0).attempts, 0);
@@ -3258,6 +3347,21 @@ mod tests {
         let i = info(None, 12);
         assert!(!app_container_args(Some(&i), "/opt/quasar/nvidia-driver", "").is_empty());
         assert!(lib32_host_path(Some(&i)).is_none());
+    }
+
+    #[test]
+    fn explicit_bind_source_delivers_driver_and_lib32_to_app() {
+        let mut i = info(Some("/mnt/user/appdata/driver files"), 12);
+        i.name = None; // A validated override intentionally takes precedence over discovery.
+        let args = app_container_args(Some(&i), VOLUME_MOUNT, "/image/lib");
+        assert!(args.iter().any(|arg| arg == "type=bind,src=/mnt/user/appdata/driver files,dst=/opt/quasar/nvidia-driver,readonly"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "LD_LIBRARY_PATH=/opt/quasar/nvidia-driver/lib64:/image/lib"));
+        assert_eq!(
+            lib32_host_path(Some(&i)).as_deref(),
+            Some("/mnt/user/appdata/driver files/lib32")
+        );
     }
 
     #[test]

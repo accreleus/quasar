@@ -465,3 +465,9 @@
 .rel-detail > summary::-webkit-details-marker {
   display: none;
 }
+
+/* Keep the scoped Releases rail from overriding the shared split breakpoint. */
+.rel-split > * { min-width: 0; }
+@media (max-width: 1240px) {
+  .rel-split { grid-template-columns: minmax(0, 1fr); }
+}

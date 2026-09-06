@@ -812,8 +812,11 @@ for role in "${ROLES[@]}"; do
     ROLE_ARGS+=("${PROVENANCE_ARGS[@]}")
     ROLE_ARGS+=("SCHEMA_VERSION=$(highest_migration)")
     [ "$SRC_REF" != unknown ] && ROLE_ARGS+=("QUASAR_SOURCE_REF=$SRC_REF")
-    # The served semver, and only from a real `vX.Y.Z` tag. A branch build has no
-    # version and must say so ("dev") rather than borrow the last tag's number.
+  fi
+  # Both platform components use the same exact tag. Never stamp the shared
+  # toolchain: its content and tag are independent of platform release versions.
+  if [ "$DF_REL" = "deploy/Dockerfile.control.prod" ] ||
+     { [ "$DF_REL" = "deploy/Dockerfile.vulkan" ] && [ "$role" != toolchain ]; }; then
     case "$SRC_REF" in
       v[0-9]*) ROLE_ARGS+=("QUASAR_VERSION=${SRC_REF#v}") ;;
     esac

@@ -6,4 +6,12 @@ The tag-push release lane (`.github/workflows/images.yml`) also lives here: `cha
 
 `release-cut.sh` (`make release VERSION=x.y.z`, #109) is what pushes the tag that triggers that lane: it moves `CHANGELOG.md`'s `## Unreleased` section into a dated section, commits and tags on `main`, and pushes both, refusing on a dirty/behind tree, a non-semver or not-strictly-newer version, or an empty `## Unreleased`. Its changelog rewrite is exposed as a pure `--transform` mode (stdin in, stdout out, no git) for fixture testing, and doc: `docs/upgrading.md` "Cutting a release".
 
-Run the contract tests by hand (no verify stage runs them): `bash scripts/release/test-*.sh`.
+Run the contract tests by hand (no verify stage runs them):
+
+```bash
+for test in scripts/release/test-*.sh; do bash "$test"; done
+```
+
+`test-release-publication-gate.sh` (also run by `make verify` and the image workflow release gate) verifies that GitHub Release publication waits
+for the control-plane, node-agent and separately promoted updater. The release
+manifest still contains only the first two; the release notes advertise all three.

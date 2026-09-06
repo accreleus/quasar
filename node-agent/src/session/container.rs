@@ -80,7 +80,11 @@ fn output_with_timeout(cmd: &mut Command, what: &str) -> Result<Output> {
     output_with_deadline(cmd, what, RUNTIME_CMD_TIMEOUT)
 }
 
-fn output_with_deadline(cmd: &mut Command, what: &str, timeout: Duration) -> Result<Output> {
+pub(crate) fn output_with_deadline(
+    cmd: &mut Command,
+    what: &str,
+    timeout: Duration,
+) -> Result<Output> {
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -623,50 +627,76 @@ impl ContainerRuntime {
         format!("{SESSION_NAME_PREFIX}{session_id}")
     }
 
-    /// Force-remove every container whose name contains any of `prefixes`. Called at
-    /// agent startup to reap session/sidecar containers orphaned by a previous agent
-    /// that died without a clean unwind: `docker run --rm` siblings survive a SIGKILL of
-    /// the agent (P2-05). Fails open — logged, never fatal, since a clean boot must not
-    /// hinge on the sweep. Returns the number removed.
+    /// Reap only this persistent agent's labelled session/audio siblings. Legacy
+    /// unlabelled containers remain untouched for operator review.
     pub fn sweep_orphans(&self, prefixes: &[&str]) -> usize {
+        match crate::container_ownership::token() {
+            Ok(owner) => self.sweep_orphans_for(&owner, prefixes),
+            Err(error) => {
+                tracing::warn!(token = "orphan-sweep-owner-unavailable", "{error}");
+                0
+            }
+        }
+    }
+
+    fn sweep_orphans_for(&self, owner: &str, prefixes: &[&str]) -> usize {
+        let filter = format!("label={}={owner}", crate::container_ownership::LABEL);
+        let output = match self.run_raw(&["ps", "-aq", "--no-trunc", "--filter", &filter]) {
+            Ok(output) => output,
+            Err(error) => {
+                tracing::warn!(token = "orphan-sweep-ps-failed", "{error}");
+                return 0;
+            }
+        };
         let mut removed = 0;
-        for prefix in prefixes {
-            // `--filter name=` matches as a substring; our names all start with the
-            // prefix and no other container carries it, so this selects exactly the
-            // orphans.
-            let out = output_with_timeout(
-                Command::new(&self.bin).args(["ps", "-aq", "--filter", &format!("name={prefix}")]),
-                "container ps",
-            );
-            let ids = match out {
-                Ok(o) if o.status.success() => {
-                    String::from_utf8_lossy(&o.stdout).trim().to_string()
-                }
-                Ok(o) => {
-                    tracing::warn!(
-                        token = "orphan-sweep-ps-failed",
-                        "orphan sweep: `{} ps` for {prefix} failed: {}",
-                        self.bin,
-                        String::from_utf8_lossy(&o.stderr).trim()
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        token = "orphan-sweep-ps-exec-failed",
-                        "orphan sweep: failed to exec `{} ps` for {prefix}: {e}",
-                        self.bin
-                    );
-                    continue;
-                }
-            };
-            for id in ids.lines().filter(|l| !l.is_empty()) {
-                tracing::info!("orphan sweep: removing stale container {id} (prefix {prefix})");
-                self.force_remove(id);
-                removed += 1;
+        for target in output.lines().filter(|id| !id.is_empty()) {
+            match self.owned_container_id(target, owner, prefixes) {
+                Ok(Some(id)) => match self.run_raw(&["rm", "-f", &id]) {
+                    Ok(_) => removed += 1,
+                    Err(error) => tracing::warn!(token = "orphan-sweep-rm-failed", "{error}"),
+                },
+                Ok(None) => {}
+                Err(error) => tracing::warn!(token = "orphan-sweep-preserved", "{error}"),
             }
         }
         removed
+    }
+
+    fn owned_container_id(
+        &self,
+        target: &str,
+        owner: &str,
+        prefixes: &[&str],
+    ) -> Result<Option<String>> {
+        // Inspect only ownership fields, never container environment credentials.
+        let template =
+            r#"{"Id":{{json .Id}},"Name":{{json .Name}},"Labels":{{json .Config.Labels}}}"#;
+        let output = match self.run_raw(&["inspect", "--format", template, "--", target]) {
+            Ok(output) => output,
+            Err(error) if error.to_string().contains("No such") => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let value: serde_json::Value = serde_json::from_str(&output)?;
+        crate::container_ownership::owned_id(&value, owner, prefixes)
+            .map(Some)
+            .ok_or_else(|| anyhow!("Preserving container {target}: it is unowned, belongs to another agent, or has an unrelated name. Review legacy containers manually; this agent cannot remove them."))
+    }
+
+    fn managed_container_id(&self, target: &str) -> Result<Option<String>> {
+        let owner = crate::container_ownership::token().map_err(anyhow::Error::msg)?;
+        self.owned_container_id(
+            target,
+            &owner,
+            &[SESSION_NAME_PREFIX, super::audio::PULSE_NAME_PREFIX],
+        )
+    }
+
+    /// Prepare a managed name without ever deleting another agent's collision.
+    pub(crate) fn remove_owned_container(&self, name: &str) -> Result<()> {
+        if let Some(id) = self.managed_container_id(name)? {
+            self.run_raw(&["rm", "-f", &id])?;
+        }
+        Ok(())
     }
 
     /// Launch the app container as a detached Wayland client of the session
@@ -687,8 +717,12 @@ impl ContainerRuntime {
         // fail the launch, never reach `docker run`.
         let network = resolve_network(spec.network.as_deref())?;
 
-        // Clear any stale same-named container first (idempotent prepare).
-        self.force_remove(&name);
+        anyhow::ensure!(
+            name.starts_with(SESSION_NAME_PREFIX),
+            "app container name must start with {SESSION_NAME_PREFIX}"
+        );
+        let owner = crate::container_ownership::token().map_err(anyhow::Error::msg)?;
+        self.remove_owned_container(&name)?;
 
         let mut args: Vec<String> = vec![
             "run".into(),
@@ -696,6 +730,8 @@ impl ContainerRuntime {
             "--rm".into(), // self-clean if it exits on its own (no orphan)
             "--name".into(),
             name.clone(),
+            "--label".into(),
+            format!("{}={owner}", crate::container_ownership::LABEL),
             // Isolated by default: `none` unless the app declares a requirement
             // (§S2: Steam's first boot must download steamui.so) or the operator sets
             // a host-wide default.
@@ -1144,6 +1180,15 @@ impl ContainerRuntime {
     /// auto-removes and `force_remove` is the idempotent backstop. Knob:
     /// `QUASAR_APP_STOP_TIMEOUT_SECS`.
     pub fn graceful_remove(&self, name: &str) {
+        let id = match self.managed_container_id(name) {
+            Ok(Some(id)) => id,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(token = "container-graceful-cleanup-preserved", "{error}");
+                return;
+            }
+        };
+        let name = id.as_str();
         let secs: u64 = std::env::var("QUASAR_APP_STOP_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1182,6 +1227,22 @@ impl ContainerRuntime {
     /// `rm -f` a container by name. Idempotent and best-effort: a missing
     /// container is success (the orphan-free postcondition holds either way).
     pub fn force_remove(&self, name: &str) {
+        let owned_id;
+        let name = if crate::container_ownership::managed_name(name) {
+            match self.managed_container_id(name) {
+                Ok(Some(id)) => {
+                    owned_id = id;
+                    owned_id.as_str()
+                }
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::warn!(token = "container-force-cleanup-preserved", "{error}");
+                    return;
+                }
+            }
+        } else {
+            name
+        };
         let res = output_with_timeout(
             Command::new(&self.bin).args(["rm", "-f", name]),
             "container rm",
@@ -1482,11 +1543,14 @@ const NVIDIA_DRIVER_VOLUME_DST: &str = "/opt/quasar/nvidia-driver";
 /// provisioned. Reads the image's own `LD_LIBRARY_PATH` because `-e` REPLACES it, and
 /// overwriting an app image's loader path trades one breakage for another.
 fn nvidia_driver_volume_args(runtime: &ContainerRuntime, image: &str) -> Result<Vec<String>> {
+    crate::nvidia_volume::validate_host_path_for_launch(runtime.bin())
+        .map_err(anyhow::Error::msg)?;
+    crate::nvidia_volume::retry_mount_resolution(runtime.bin());
     let Some(info) = crate::nvidia_volume::current() else {
         return Ok(Vec::new());
     };
     anyhow::ensure!(info.host.is_some() || info.name.is_some(),
-        "NVIDIA driver is provisioned but its app-container mount is unresolved; check Docker socket access and agent container identity");
+        "NVIDIA driver is provisioned but its app-container mount is unresolved; check Docker socket and identity inspection or set QUASAR_NVIDIA_DRIVER_HOST_PATH to the existing host directory");
     if let crate::nvidia_volume::EglRuntime::Broken { detail, .. } =
         crate::nvidia_volume::probe_sibling_egl()
     {
@@ -2002,7 +2066,7 @@ impl RunningContainer {
     pub fn stop(&mut self) {
         // `swap`, not load+store: the idempotency check is itself the one-shot gate.
         if !self.removed.swap(true, Ordering::SeqCst) {
-            self.runtime.graceful_remove(&self.name);
+            self.runtime.graceful_remove(&self.container_id);
         }
     }
 
@@ -2772,5 +2836,59 @@ mod tests {
             vec!["--device".to_string(), "/dev/fuse".to_string()]
         );
         assert!(fuse_device_args(false).is_empty());
+    }
+    #[test]
+    fn orphan_sweep_independently_checks_owner_and_prefix_before_removing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("docker");
+        let removed = dir.path().join("removed");
+        let one = "a".repeat(64);
+        let two = "b".repeat(64);
+        let legacy = "c".repeat(64);
+        let unrelated = "d".repeat(64);
+        let pulse = "e".repeat(64);
+        // Deliberately ignore Docker's filter: the independent inspect check must
+        // preserve foreign, unlabelled and substring-only names even then.
+        let body = format!(
+            r#"#!/bin/sh
+case "$1" in
+ps) printf '%s\n' '{one}' '{two}' '{legacy}' '{unrelated}' '{pulse}' ;;
+inspect)
+ for target do :; done
+ case "$target" in
+ {one}) name=quasar-sess-one; owner=one ;;
+ {two}) name=quasar-sess-two; owner=two ;;
+ {legacy}) name=quasar-sess-legacy; owner= ;;
+ {unrelated}) name=other-quasar-sess-one; owner=one ;;
+ {pulse}) name=quasar-pulse-one; owner=one ;;
+ *) echo 'No such container' >&2; exit 1 ;;
+ esac
+ printf '{{"Id":"%s","Name":"/%s","Labels":{{"io.quasar.agent-owner":"%s"}}}}\n' "$target" "$name" "$owner" ;;
+rm) printf '%s\n' "$3" >> '{}' ;;
+esac
+"#,
+            removed.display()
+        );
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = ContainerRuntime::test_runtime(script.to_str().unwrap());
+        let prefixes = [SESSION_NAME_PREFIX, super::super::audio::PULSE_NAME_PREFIX];
+        assert_eq!(runtime.sweep_orphans_for("one", &prefixes), 2);
+        assert_eq!(
+            std::fs::read_to_string(&removed).unwrap(),
+            format!("{one}\n{pulse}\n")
+        );
+        std::fs::write(&removed, "").unwrap();
+        assert_eq!(runtime.sweep_orphans_for("two", &prefixes), 1);
+        assert_eq!(
+            std::fs::read_to_string(&removed).unwrap(),
+            format!("{two}\n")
+        );
+        assert!(runtime.owned_container_id(&two, "one", &prefixes).is_err());
+        assert!(runtime
+            .owned_container_id("missing", "one", &prefixes)
+            .unwrap()
+            .is_none());
     }
 }

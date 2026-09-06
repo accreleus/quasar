@@ -14,6 +14,15 @@ describe("SessionLoader — transport vs scheduling (#482)", () => {
 
   const advance = (ms: number) => act(() => void vi.advanceTimersByTime(ms));
 
+  it("identifies an unopened signaling socket before blaming media networking", () => {
+    render(<SessionLoader statusMsg="connecting" streaming={false} onExit={vi.fn()}
+      hostAssigned sessionRunning wsOpen={false} />);
+    advance(TRANSPORT_STALL_MS + 1_000);
+    expect(screen.getByText("The signaling connection could not open")).toBeInTheDocument();
+    expect(screen.getByText(/allowed browser origins/)).toBeInTheDocument();
+    expect(screen.queryByText(/could not establish a media connection/)).not.toBeInTheDocument();
+  });
+
   // The live report: session running, host_id set, pipeline live and offering,
   // and the status string is one the stage table does not recognise.
   it("never claims no host picked up a session the host is running", () => {

@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	"github.com/accreleus/quasar/control-plane/internal/console"
+	"github.com/accreleus/quasar/control-plane/internal/preparation"
 )
 
 // envelope is used to peek at the type field before full decode.
@@ -22,10 +23,11 @@ func peekType(raw []byte) (string, error) {
 
 // RegisterMsg is the first message the agent sends after every connect.
 type RegisterMsg struct {
-	Type         string          `json:"type"`
-	NodeName     string          `json:"node_name"`
-	AgentVersion string          `json:"agent_version"`
-	Auth         json.RawMessage `json:"auth"`
+	SourcePolicyVersions map[string]int  `json:"source_policy_versions,omitempty"`
+	Type                 string          `json:"type"`
+	NodeName             string          `json:"node_name"`
+	AgentVersion         string          `json:"agent_version"`
+	Auth                 json.RawMessage `json:"auth"`
 	// Images (image-management P2) is a wholesale snapshot of the agent's managed
 	// images. Keep-if-absent: nil ⇒ key absent, stored host_images rows untouched;
 	// an explicit [] is a real "I have none" and flips ready rows to absent.
@@ -68,9 +70,10 @@ type RegisteredMsg struct {
 
 // CapacityMsg is a full capacity report from the agent.
 type CapacityMsg struct {
-	Type string        `json:"type"`
-	Host HostCapacity  `json:"host"`
-	GPUs []GPUCapacity `json:"gpus"`
+	SourcePreparation *preparation.Reports `json:"source_preparation,omitempty"`
+	Type              string               `json:"type"`
+	Host              HostCapacity         `json:"host"`
+	GPUs              []GPUCapacity        `json:"gpus"`
 	// GPUDetection is additive and fail-closed. Older agents omit it; a non-empty
 	// GPU list is then treated as ok, while an empty list is unavailable.
 	GPUDetection string `json:"gpu_detection,omitempty"`

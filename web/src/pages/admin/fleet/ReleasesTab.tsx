@@ -65,6 +65,7 @@ import {
   eligibilityText,
   faultText,
   hasUpdate,
+  olderEdgeCandidate,
   releaseLabel,
   shortCommit,
 } from "./releasesCopy";
@@ -262,6 +263,9 @@ function UpdateBanner({ view }: { view: PlatformReleaseView }) {
   // empty card is the whole answer.
   if (!newest) return null;
   if (!hasUpdate(view)) {
+    if (olderEdgeCandidate(view, newest)) {
+      return <p className="note mb4"><strong>Older than installed.</strong> The detected edge build predates this control plane. No control-plane update is available.</p>;
+    }
     return (
       <p className="note mb4">
         <strong>Up to date.</strong> {prefixed(releaseLabel(newest))} is the newest release on the{" "}
@@ -325,6 +329,7 @@ function ReleaseFeed({ view }: { view: PlatformReleaseView }) {
             release={release}
             repo={repo}
             latest={i === 0}
+            older={olderEdgeCandidate(view, release)}
             installed={commitsMatch(installedCommit, release.source_commit)}
           />
         ))
@@ -348,11 +353,13 @@ function ReleaseCard({
   release,
   repo,
   latest,
+  older,
   installed,
 }: {
   release: PlatformRelease;
   repo: string;
   latest: boolean;
+  older: boolean;
   installed: boolean;
 }) {
   // An edge build has no version and no notes: the title IS the commit, and the
@@ -369,7 +376,7 @@ function ReleaseCard({
         <div>
           <div className="rowflex" style={{ alignItems: "center" }}>
             <span className="rel-card-title">{prefixed(releaseLabel(release))}</span>
-            {latest && <Chip variant="accent">Latest</Chip>}
+            {older ? <Chip variant="neutral">Older than installed</Chip> : latest && <Chip variant="accent">Latest</Chip>}
             {installed && (
               <Chip variant="success" dot>
                 Installed
@@ -621,7 +628,7 @@ function ManualPath({
 /** A target's readiness for the newest listed release. `up_to_date` is not a
  *  fault: a current instance is ineligible for the release it is already on,
  *  and "not ready" reads as a fault on a healthy fleet. */
-function TargetChip({ target }: { target: PlatformReleaseTarget }) {
+function TargetChip({ target, older = false }: { target: PlatformReleaseTarget; older?: boolean }) {
   if (target.eligible) {
     return (
       <Chip variant="success" dot>
@@ -629,7 +636,7 @@ function TargetChip({ target }: { target: PlatformReleaseTarget }) {
       </Chip>
     );
   }
-  if (target.reason === "up_to_date") return <Chip variant="neutral">Up to date</Chip>;
+  if (target.reason === "up_to_date") return <Chip variant="neutral">{older ? "Older than installed" : "Up to date"}</Chip>;
   return <Chip variant="neutral">Not ready</Chip>;
 }
 
@@ -671,7 +678,7 @@ function TargetsCard({
       render: (t) => {
         const open = attemptForTarget(attempts, t);
         if (open) return <AttemptProgress attempt={open} />;
-        return <TargetChip target={t} />;
+        return <TargetChip target={t} older={t.kind === "control_plane" && olderEdgeCandidate(view, newest)} />;
       },
     },
     {
@@ -717,7 +724,7 @@ function TargetsCard({
       </p>
       <div className="mt3">
         <Fact label="Control plane">
-          {cp ? <TargetChip target={cp} /> : <span className="muted">—</span>}
+          {cp ? <TargetChip target={cp} older={olderEdgeCandidate(view, newest)} /> : <span className="muted">—</span>}
         </Fact>
         <Fact label="Node agents">
           <span className="rowflex" style={{ alignItems: "center" }}>

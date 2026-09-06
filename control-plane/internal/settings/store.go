@@ -75,8 +75,10 @@ func ValidImageUpdatePolicy(p string) bool {
 
 // Settings is the instance_settings singleton row.
 type Settings struct {
-	RegistrationMode string `json:"registration_mode"`
-	StorageProvider  string `json:"storage_provider"`
+	SteamPreparationEnabled  bool   `json:"steam_preparation_enabled"`
+	SteamPreparationRevision string `json:"steam_preparation_revision"`
+	RegistrationMode         string `json:"registration_mode"`
+	StorageProvider          string `json:"storage_provider"`
 	// The Phase 4 discovery master switch, and the only switch (migration
 	// 0045): auto-publish is the behaviour, so there is no separate publish
 	// toggle. Default false — ship-dark.
@@ -211,6 +213,7 @@ func (s *Store) Get(ctx context.Context) (Settings, error) {
 		// The secure default for every field — a missing seed can never be read
 		// as "open", nor as "walk everybody's home directory".
 		return Settings{
+			SteamPreparationRevision:        "1",
 			RegistrationMode:                RegistrationClosed,
 			StorageProvider:                 StorageAuto,
 			LibraryDiscoveryIntervalMinutes: 360,
@@ -361,7 +364,7 @@ const settingsColumns = `registration_mode, storage_provider, library_discovery_
 	library_discovery_interval_minutes, library_discovery_appdetails_enabled,
 	mic_capture_enabled, image_update_policy, allowed_origins,
 	release_channel, release_edge_branch,
-	updated_by::text, updated_at`
+	steam_preparation_enabled, steam_preparation_revision::text, updated_by::text, updated_at`
 
 // scanner is the shared surface of pgx.Row and pgx.Rows.
 type scanner interface{ Scan(dest ...any) error }
@@ -372,7 +375,7 @@ func scanSettings(row scanner) (Settings, error) {
 		&st.LibraryDiscoveryIntervalMinutes, &st.LibraryDiscoveryAppDetailsEnabled,
 		&st.MicCaptureEnabled, &st.ImageUpdatePolicy, &st.AllowedOrigins,
 		&st.ReleaseChannel, &st.ReleaseEdgeBranch,
-		&st.UpdatedBy, &st.UpdatedAt)
+		&st.SteamPreparationEnabled, &st.SteamPreparationRevision, &st.UpdatedBy, &st.UpdatedAt)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -387,6 +390,7 @@ func scanSettings(row scanner) (Settings, error) {
 // default". AllowedOrigins is a pointer to a slice so that an explicit empty
 // list ("clear it") stays distinguishable from absence.
 type Patch struct {
+	SteamPreparationEnabled           *bool
 	RegistrationMode                  *string
 	StorageProvider                   *string
 	LibraryDiscoveryEnabled           *bool
@@ -407,6 +411,7 @@ func (p Patch) ChangedKeys() []string {
 		name string
 		set  bool
 	}{
+		{"steam_preparation_enabled", p.SteamPreparationEnabled != nil},
 		{"registration_mode", p.RegistrationMode != nil},
 		{"storage_provider", p.StorageProvider != nil},
 		{"library_discovery_enabled", p.LibraryDiscoveryEnabled != nil},
@@ -427,7 +432,7 @@ func (p Patch) ChangedKeys() []string {
 
 // Empty reports whether the patch names no known field.
 func (p Patch) Empty() bool {
-	return p.RegistrationMode == nil && p.StorageProvider == nil && p.LibraryDiscoveryEnabled == nil &&
+	return p.SteamPreparationEnabled == nil && p.RegistrationMode == nil && p.StorageProvider == nil && p.LibraryDiscoveryEnabled == nil &&
 		p.LibraryDiscoveryIntervalMinutes == nil && p.LibraryDiscoveryAppDetailsEnabled == nil &&
 		p.MicCaptureEnabled == nil && p.ImageUpdatePolicy == nil && p.AllowedOrigins == nil &&
 		p.ReleaseChannel == nil && p.ReleaseEdgeBranch == nil
@@ -487,13 +492,15 @@ func (s *Store) Apply(ctx context.Context, p Patch, updatedBy string) (st Settin
 		    allowed_origins                      = COALESCE($8::text[],  s.allowed_origins),
 		    release_channel                      = COALESCE($9::text,    s.release_channel),
 		    release_edge_branch                  = COALESCE($10::text,   s.release_edge_branch),
-		    updated_by                           = $11::uuid
+		    steam_preparation_enabled = COALESCE($12::boolean, s.steam_preparation_enabled),
+ steam_preparation_revision = s.steam_preparation_revision + CASE WHEN $12::boolean IS NOT NULL AND $12::boolean IS DISTINCT FROM s.steam_preparation_enabled THEN 1 ELSE 0 END,
+ updated_by                           = $11::uuid
 		WHERE id = true
 		RETURNING `+settingsColumns+`
 	`, p.RegistrationMode, p.StorageProvider, p.LibraryDiscoveryEnabled,
 		p.LibraryDiscoveryIntervalMinutes, p.LibraryDiscoveryAppDetailsEnabled,
 		p.MicCaptureEnabled, p.ImageUpdatePolicy, origins,
-		p.ReleaseChannel, p.ReleaseEdgeBranch, updatedBy))
+		p.ReleaseChannel, p.ReleaseEdgeBranch, updatedBy, p.SteamPreparationEnabled))
 	if err != nil {
 		return Settings{}, false, fmt.Errorf("update instance_settings: %w", err)
 	}

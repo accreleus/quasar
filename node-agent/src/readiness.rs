@@ -239,11 +239,11 @@ impl ProbeEnv {
             nvidia_volume: VolumeView::live(),
             container_mount_error: sibling_mount_error(),
             sibling_egl: if nvidia { crate::nvidia_volume::probe_sibling_egl() } else { crate::nvidia_volume::EglRuntime::Unknown },
-            driver_mount_error: crate::nvidia_volume::current().and_then(|info| {
+            driver_mount_error: crate::nvidia_volume::mount_resolution_error().or_else(|| crate::nvidia_volume::current().and_then(|info| {
                 if info.host.is_none() && info.name.is_none() {
-                    Some("The agent can read its NVIDIA driver volume but cannot resolve its Docker mount. App launches are blocked; check the Docker socket and container identity inspection.".to_string())
+                    Some(format!("The agent can read its NVIDIA driver volume but cannot resolve its Docker mount. App launches are blocked; check Docker socket and identity inspection, or set {} to the host directory already mounted at /opt/quasar/nvidia-driver.", crate::nvidia_volume::HOST_PATH_ENV))
                 } else { None }
-            }),
+            })),
             // NVIDIA only: on AMD/Intel the EGL stack is Mesa's and none of this module's
             // remediation applies, so the subprocess (and a confusing red row) buys nothing.
             egl_runtime: if nvidia {
@@ -407,7 +407,7 @@ pub fn probe(env: &ProbeEnv) -> Vec<ReadinessCheck> {
             crate::nvidia_volume::EglRuntime::Unknown => skip("nvidia_sibling_egl", "No provisioned driver requires a sibling-container test"),
         },
         match &env.driver_mount_error {
-            Some(error) => fail("nvidia_driver_mount", error.clone(), "Check Docker socket access and recreate the agent with the generated Compose file. The driver is already present; reinstalling it will not fix mount resolution.".to_string()),
+            Some(error) => fail("nvidia_driver_mount", error.clone(), "Check Docker socket and container mount inspection, or set QUASAR_NVIDIA_DRIVER_HOST_PATH to the host directory already mounted at /opt/quasar/nvidia-driver. Explicit paths must pass the same-directory sibling check. Recreate the agent after changing environment settings; reinstalling drivers will not fix mount resolution.".to_string()),
             None => skip("nvidia_driver_mount", "No unresolved NVIDIA app driver mount"),
         },
         check_encoder_codecs(env, distro),
@@ -3353,6 +3353,23 @@ mod tests {
     }
 
     // ── GPU host post-boot sanity (#493) ─────────────────────────────────────
+
+    #[test]
+    fn invalid_explicit_driver_mount_is_a_visible_failure_with_override_remediation() {
+        let root = FakeRoot::new("driver-host-override");
+        let mut env = root.env(true, "");
+        env.driver_mount_error = Some(
+            "QUASAR_NVIDIA_DRIVER_HOST_PATH does not point to the same mounted directory".into(),
+        );
+        let checks = probe(&env);
+        let check = get(&checks, "nvidia_driver_mount");
+        assert_eq!(check.status, FAIL);
+        assert!(check.summary.contains("same mounted directory"));
+        assert!(check
+            .remediation
+            .contains(crate::nvidia_volume::HOST_PATH_ENV));
+        assert!(!check.remediation.contains("overlay"));
+    }
 
     #[test]
     fn av1_compatibility_refreshes_after_driver_change_without_blocking_readiness() {

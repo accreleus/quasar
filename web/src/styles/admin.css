@@ -836,3 +836,38 @@
   gap: 4px;
   flex-wrap: wrap;
 }
+
+/* Image details share the existing responsive row-card table pattern with Users.
+   Long preparation diagnostics must not force the editor pane beyond its track. */
+.image-detail-page .ae-fact > span:last-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+.image-detail-page .qtable {
+  table-layout: fixed;
+}
+.image-detail-page .qtable td {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.image-detail-page .qtable th:nth-child(4) { width: 40%; }
+@media (max-width: 760px) {
+  .image-detail-page .table-wrap { overflow: visible; }
+  .image-detail-page .qtable,
+  .image-detail-page .qtable tbody,
+  .image-detail-page .qtable tr,
+  .image-detail-page .qtable td { display: block; width: 100%; }
+  .image-detail-page .qtable thead { display: none; }
+  .image-detail-page .qtable td { height: auto; text-align: left; }
+  .image-detail-page .qtable td::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 6px;
+    color: var(--text-3);
+    font-size: var(--t-xs);
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+}

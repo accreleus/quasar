@@ -5,6 +5,7 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
+tempfile = "3"
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 # #12: TLS on the control-plane link. `rustls-tls-webpki-roots` — never native roots: the
@@ -112,7 +113,6 @@ pkg-config = "0.3"
 # SO-03: micro-benchmark the per-frame encode-metrics hot path (record_encode_in/out).
 criterion = "0.8"
 # P5-03: temporary directories for home module unit tests.
-tempfile = "3"
 # #530: `#[tokio::test(start_paused = true)]` needs the `test-util` feature (not
 # part of `full`) — used by the select!-arm-disable regression tests in agent.rs.
 tokio = { version = "1", features = ["test-util"] }

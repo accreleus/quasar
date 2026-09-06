@@ -19,6 +19,7 @@ import { ApiError } from "../../api/client";
 
 vi.mock("../../api/admin", () => ({
   getSettings: vi.fn(),
+  accessCheck: vi.fn(),
   updateSettings: vi.fn(),
 }));
 
@@ -48,7 +49,78 @@ function renderStep(onNext = vi.fn()) {
 describe("StepBasics", () => {
   beforeEach(() => {
     vi.mocked(adminApi.getSettings).mockReset();
+    vi.mocked(adminApi.accessCheck).mockResolvedValue({
+      request: { host: new URL(window.location.origin).host },
+      origins: { source: "database", allowed: [window.location.origin] },
+    } as never);
     vi.mocked(adminApi.updateSettings).mockReset();
+  });
+
+  it("adds the detected browser origin while preserving existing origins on Continue", async () => {
+    vi.mocked(adminApi.getSettings).mockResolvedValue(settingsResponse("closed"));
+    vi.mocked(adminApi.accessCheck).mockResolvedValueOnce({
+      origins: { source: "database", allowed: ["https://existing.example"] },
+    } as never);
+    vi.mocked(adminApi.updateSettings).mockResolvedValue({} as never);
+    const next = renderStep();
+    await waitFor(() => expect(screen.getByRole("button", { name: /continue/i })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: /continue/i }));
+    await waitFor(() => expect(next).toHaveBeenCalled());
+    expect(adminApi.updateSettings).toHaveBeenCalledWith("tok", {
+      registration_mode: "closed", allowed_origins: ["https://existing.example", window.location.origin],
+    });
+  });
+
+  it("does not overwrite a rejecting environment pin or advance", async () => {
+    vi.mocked(adminApi.getSettings).mockResolvedValue(settingsResponse("closed"));
+    vi.mocked(adminApi.accessCheck).mockResolvedValue({
+      request: { host: "internal.example:8443" },
+      origins: { source: "environment", allowed: [] },
+    } as never);
+    const next = renderStep();
+    await waitFor(() => expect(screen.getByRole("button", { name: /continue/i })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: /continue/i }));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("QUASAR_ALLOWED_ORIGINS"));
+    expect(adminApi.updateSettings).not.toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it("keeps a matching explicit environment policy unchanged", async () => {
+    vi.mocked(adminApi.getSettings).mockResolvedValue(settingsResponse("closed"));
+    vi.mocked(adminApi.accessCheck).mockResolvedValue({
+      request: { host: "internal.example:8443" },
+      origins: { source: "environment", allowed: [window.location.origin] },
+    } as never);
+    vi.mocked(adminApi.updateSettings).mockResolvedValue({} as never);
+    const next = renderStep();
+    await waitFor(() => expect(screen.getByRole("button", { name: /continue/i })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: /continue/i }));
+    await waitFor(() => expect(next).toHaveBeenCalled());
+    expect(adminApi.updateSettings).toHaveBeenCalledWith("tok", { registration_mode: "closed" });
+  });
+
+  it("does not save settings or advance when the access policy cannot be read", async () => {
+    vi.mocked(adminApi.getSettings).mockResolvedValue(settingsResponse("closed"));
+    vi.mocked(adminApi.accessCheck).mockRejectedValue(new Error("Access check unavailable"));
+    const next = renderStep();
+    await waitFor(() => expect(screen.getByRole("button", { name: /continue/i })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: /continue/i }));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("Access check unavailable"));
+    expect(adminApi.updateSettings).not.toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it("verifies the saved browser address is active before advancing", async () => {
+    vi.mocked(adminApi.getSettings).mockResolvedValue(settingsResponse("closed"));
+    vi.mocked(adminApi.accessCheck).mockResolvedValue({
+      origins: { source: "database", allowed: [] },
+    } as never);
+    vi.mocked(adminApi.updateSettings).mockResolvedValue({} as never);
+    const next = renderStep();
+    await waitFor(() => expect(screen.getByRole("button", { name: /continue/i })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: /continue/i }));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("not active for streaming"));
+    expect(next).not.toHaveBeenCalled();
   });
 
   it("shows a loading state (and a disabled Continue) while settings are in flight", () => {
@@ -140,7 +212,7 @@ describe("StepBasics", () => {
     fireEvent.click(cont);
 
     await waitFor(() => expect(onNext).toHaveBeenCalled());
-    expect(adminApi.updateSettings).toHaveBeenCalledWith("tok", { registration_mode: "open" });
+    expect(adminApi.updateSettings).toHaveBeenCalledWith("tok", { registration_mode: "open", allowed_origins: [window.location.origin] });
   });
 
   it("disables Continue while the save is in flight", async () => {

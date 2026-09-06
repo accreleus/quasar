@@ -31,6 +31,7 @@ const DU_DEPTH_CAP: u32 = 32;
 pub struct TemplateSeeder<'a> {
     pub store: &'a TemplateStore,
     pub seed: &'a TemplateSeed,
+    pub authorization: Option<&'a crate::source_policy::PolicyLease>,
 }
 
 /// Resolve an effective home-root string to a validated absolute path. `None`
@@ -175,6 +176,24 @@ pub fn provision_home_dirs(
 /// empty directory — the same state a template-less provision leaves it in.
 fn seed_home(seeder: &TemplateSeeder<'_>, dest: &Path) {
     let started = Instant::now();
+    // Clone outside the destination, then atomically install only while the
+    // current policy lease is held. A live disable leaves a cold empty home.
+    let staging = if seeder.authorization.is_some() {
+        match tempfile::Builder::new()
+            .prefix(".quasar-seed-")
+            .tempdir_in(dest.parent().unwrap_or(dest))
+        {
+            Ok(dir) => Some(dir),
+            Err(error) => {
+                tracing::warn!(token = "template-seed-staging-failed", "{error}");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let original_dest = dest;
+    let dest = staging.as_ref().map_or(dest, |dir| dir.path());
     if let Err(e) = seeder.store.clone_home_into(&seeder.seed.home_path, dest) {
         tracing::warn!(
             token = "template-seed-failed",
@@ -193,6 +212,20 @@ fn seed_home(seeder: &TemplateSeeder<'_>, dest: &Path) {
                 dest.display()
             );
             reset_to_empty_dir(dest);
+            return;
+        }
+    }
+    if let Some(authorization) = seeder.authorization {
+        if let Err(error) = authorization.commit(|| {
+            if original_dest.read_dir()?.next().is_some() {
+                return Err(std::io::Error::other("home is no longer empty"));
+            }
+            std::fs::rename(dest, original_dest)
+        }) {
+            tracing::warn!(
+                token = "template-seed-policy-changed",
+                "{error}; leaving home unseeded"
+            );
             return;
         }
     }
@@ -487,6 +520,7 @@ mod tests {
         let seeder = TemplateSeeder {
             store: &store,
             seed: &seed,
+            authorization: None,
         };
         provision_home_dirs(&mounts, home_root.to_str().unwrap(), Some(seeder));
 
@@ -508,6 +542,7 @@ mod tests {
         let seeder = TemplateSeeder {
             store: &store,
             seed: &seed,
+            authorization: None,
         };
         provision_home_dirs(&mounts, home_root.to_str().unwrap(), Some(seeder));
 
@@ -535,6 +570,7 @@ mod tests {
         let seeder = TemplateSeeder {
             store: &store,
             seed: &seed,
+            authorization: None,
         };
         provision_home_dirs(&mounts, home_root.to_str().unwrap(), Some(seeder));
 
@@ -569,6 +605,7 @@ mod tests {
         let seeder = TemplateSeeder {
             store: &store,
             seed: &seed,
+            authorization: None,
         };
         provision_home_dirs(&mounts, home_root.to_str().unwrap(), Some(seeder));
 
@@ -596,6 +633,7 @@ mod tests {
         let seeder = TemplateSeeder {
             store: &store,
             seed: &seed,
+            authorization: None,
         };
         provision_home_dirs(&mounts, home_root.to_str().unwrap(), Some(seeder));
 

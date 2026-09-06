@@ -85,6 +85,8 @@ pub enum AgentMsg {
         install_mode: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         updater_present: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_policy_versions: Option<serde_json::Value>,
     },
     Capacity {
         host: HostCapacity,
@@ -120,6 +122,8 @@ pub enum AgentMsg {
         /// registration, scheduling or a session (agent-api.md `capacity`).
         #[serde(skip_serializing_if = "Option::is_none")]
         readiness: Option<Vec<ReadinessCheck>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_preparation: Option<serde_json::Value>,
     },
     Heartbeat {
         running_sessions: Vec<String>,
@@ -931,6 +935,8 @@ pub enum ControlMsg {
         /// (falls back to `QUASAR_LOCAL_DISPLAY` for dev).
         #[serde(default)]
         console_config: Option<ConsoleConfig>,
+        #[serde(default)]
+        source_policies: Option<serde_json::Value>,
     },
     /// Restart request: ack, then exit so the container restart policy
     /// restarts us with fresh config.
@@ -1273,6 +1279,7 @@ mod tests {
     #[test]
     fn capacity_json_omits_absent_additive_fields() {
         let msg = AgentMsg::Capacity {
+            source_preparation: None,
             host: HostCapacity {
                 cpu_cores: 16,
                 mem_mb: 64000,
@@ -1316,6 +1323,7 @@ mod tests {
     #[test]
     fn capacity_json_includes_present_additive_fields() {
         let msg = AgentMsg::Capacity {
+            source_preparation: None,
             host: HostCapacity {
                 cpu_cores: 16,
                 mem_mb: 64000,
@@ -1631,6 +1639,7 @@ mod tests {
         // With nothing recorded, must send `[]`, not omit — omission means
         // pre-amendment agent, so the control plane never demotes stale rows.
         let msg = AgentMsg::Register {
+            source_policy_versions: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Enrollment {
@@ -1652,6 +1661,7 @@ mod tests {
     #[test]
     fn register_omits_every_unknown_identity_field() {
         let msg = AgentMsg::Register {
+            source_policy_versions: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {
@@ -1677,6 +1687,7 @@ mod tests {
     #[test]
     fn register_sends_identity_flat_beside_agent_version() {
         let msg = AgentMsg::Register {
+            source_policy_versions: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {
@@ -1702,6 +1713,7 @@ mod tests {
     #[test]
     fn register_includes_images_when_present() {
         let msg = AgentMsg::Register {
+            source_policy_versions: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {

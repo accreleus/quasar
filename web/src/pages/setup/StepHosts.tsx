@@ -113,9 +113,9 @@ export function StepHosts({ onNext }: StepHostsProps) {
       </div>
 
       <p className="login-error" role="note" style={{ color: "var(--info-text)", background: "var(--info-bg)", borderColor: "var(--info-line)" }}>
-        Media (WebRTC) is LAN/VPN-only in this release — there is no STUN/TURN
-        yet. A player connecting from outside your network needs a VPN into
-        it; this is a deliberate v1 posture, not a bug.
+        Media (WebRTC) needs a reachable host. For remote players, configure
+        STUN/TURN or use a shared VPN. A reverse proxy carries signaling but
+        does not relay video.
       </p>
 
       {loadError && (

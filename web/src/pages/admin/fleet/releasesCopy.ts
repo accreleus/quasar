@@ -110,17 +110,29 @@ export function shortCommit(commit: string | null | undefined): string {
   return commit.slice(0, 12);
 }
 
-/** True when the newest listed release is not what the control plane is on —
- *  which is what "there is an update" means. `available` alone is not: a
+/** Display counterpart of the server's same-schema edge ordering. Unknown
+ * build metadata never proves that the candidate is older. */
+export function olderEdgeCandidate(
+  view: { installed: { control_plane: { schema_version?: number; built_at?: string | null } } },
+  release: PlatformRelease | undefined,
+): boolean {
+  const installed = view.installed.control_plane;
+  return installed.built_at != null && installed.schema_version !== undefined &&
+    release?.channel === "edge" && release.schema_version === installed.schema_version &&
+    Date.parse(release.built_at) < Date.parse(installed.built_at);
+}
+
+/** A different release is an update candidate unless its same-schema edge
+ *  build predates the installed one. `available` alone is not: a
  *  current instance still lists the release it is already running, so that the
  *  contract's `up_to_date` and `control_plane_not_first` reasons can be
  *  evaluated against it. */
 export function hasUpdate(view: {
   available: PlatformRelease[];
-  installed: { control_plane: { source_commit?: string | null } };
+  installed: { control_plane: { source_commit?: string | null; schema_version?: number; built_at?: string | null } };
 }): boolean {
   const newest = view.available[0];
-  if (!newest) return false;
+  if (!newest || olderEdgeCandidate(view, newest)) return false;
   const installed = view.installed.control_plane.source_commit;
   if (!installed) return true;
   return !commitsMatch(installed, newest.source_commit);

@@ -106,7 +106,7 @@ function composeYaml(a) {
   ]);
   for (const [service, file] of [[cp, 'control.env'], [agent, 'agent.env']]) {
     for (const [key, value] of Object.entries(service.environment)) {
-      if (value === '${' + key + ':-}' && !choices.has(key)) delete service.environment[key];
+      if ((value === null || value === '${' + key + ':-}') && !choices.has(key)) delete service.environment[key];
     }
     service.env_file = [{ path: file, required: false }];
   }

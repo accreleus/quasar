@@ -291,7 +291,7 @@ async fn run_agent() {
 
     tracing::info!(
         "quasar node-agent {} starting (node_name={}, source_commit={}, built_at={})",
-        quasar_node_agent::buildinfo::AGENT_VERSION,
+        quasar_node_agent::buildinfo::version(),
         cfg.node_name,
         quasar_node_agent::buildinfo::source_commit().unwrap_or("unknown"),
         quasar_node_agent::buildinfo::built_at().unwrap_or("unknown"),
@@ -321,7 +321,7 @@ async fn run_session(
     }
     tracing::info!(
         "quasar node-agent {} — P1-5 session (direct signaling)",
-        env!("CARGO_PKG_VERSION")
+        quasar_node_agent::buildinfo::version()
     );
     if let Err(e) = session::server::serve_direct(&addr, cfg).await {
         tracing::error!(

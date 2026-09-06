@@ -36,6 +36,11 @@ by the components themselves rather than read from a configuration file.
   on, and when it was built.
 - **Node agents** — how many hosts, and how many have not reported an identity.
 
+Tagged builds containing the release-version fix report the same release version
+for the control plane and agent. Branch/source builds report `dev`; the agent’s
+Cargo package version is not the Quasar release version. Older agents may still
+show `0.1.0`, so use their commit and build time when identifying those installs.
+
 Per-host detail lives in the host drawer on the [Hosts
 tab](/quasar/admin/hosts/#build-identity-in-the-host-drawer).
 
@@ -54,6 +59,12 @@ a switch, so you can set it once.
 
 Switching the channel changes **what is listed, never what is installed**, and it
 does not start a check by itself.
+
+An edge build can lag behind a tagged release already installed. When its schema
+version is the same but its build time is older, it remains listed as **Older
+than installed** and cannot be applied. A higher schema version still takes
+precedence. If the installed build has no usable timestamp, Quasar cannot make
+that age comparison; the existing schema and identity checks still apply.
 
 ## Available, and the notes
 

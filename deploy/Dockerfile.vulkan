@@ -731,9 +731,10 @@ COPY node-agent /src/node-agent
 # rebuild of a NEW commit changes the source anyway and recompiled regardless.
 ARG SOURCE_COMMIT=unknown
 ARG BUILT_AT=unknown
+ARG QUASAR_VERSION=
 RUN cd /src/node-agent \
     && QUASAR_SOURCE_COMMIT="${SOURCE_COMMIT}" QUASAR_BUILT_AT="${BUILT_AT}" \
-       cargo build --release \
+       QUASAR_VERSION="${QUASAR_VERSION}" cargo build --release \
         $( [ "$CUDA_ENABLE" = "1" ] && echo --features cuda ) \
     && install -Dm0755 target/release/quasar-node-agent /opt/agent/quasar-node-agent
 

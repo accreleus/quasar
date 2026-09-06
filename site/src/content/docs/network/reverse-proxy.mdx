@@ -57,7 +57,10 @@ points at a listener the browser cannot reach.
 QUASAR_ALLOWED_ORIGINS=https://quasar.example.com
 ```
 
-This gates the signaling WebSocket. Manage the list under Admin, Settings and
+This gates the signaling WebSocket. From Quasar 0.2.4, opening first-run
+setup through the public address and pressing Continue on Basics saves that
+exact browser origin automatically, preserving existing entries. Manage additional
+addresses under Admin, Settings and
 leave `QUASAR_ALLOWED_ORIGINS` unset, or set the environment variable as an
 authoritative override. Unset with no saved list means same-origin only, which
 is correct for a direct deployment and for a proxy that preserves the public
@@ -72,12 +75,15 @@ proxy, check the actual Compose environment as well as `deploy/.env`. An explici
 empty `QUASAR_ALLOWED_ORIGINS` still pins the environment policy and overrides a
 list saved in Admin. Remove that environment entry from the service to use the
 Admin setting, or set the exact public origin explicitly and recreate the control
-plane. The first-run wizard currently displays the browser URL without saving it.
+plane. The Compose template shipped with Quasar 0.2.4 preserves an unset override; explicitly
+empty values still pin policy. Earlier releases only display the browser URL in
+setup, so configure the origin manually on those releases.
 Use Admin’s access check from the same browser address before launching a stream.
 
-The failure mode is unhelpful: the browser cannot tell the difference between
-this and any other connection failure, so you get a session that never starts and
-no clear reason.
+The launch screen in Quasar 0.2.4 distinguishes an unopened signaling connection from
+a failed media connection. Its signaling advice points to the public address,
+WebSocket proxying and allowed origins. It cannot determine the precise HTTP
+rejection reason from a browser WebSocket failure alone.
 
 Rules for the value:
 

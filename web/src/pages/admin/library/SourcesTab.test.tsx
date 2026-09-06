@@ -35,6 +35,8 @@ function settingsResponse(over: Partial<SettingsResponse["settings"]> = {}): Set
       storage_provider: "local",
       mic_capture_enabled: false,
       library_discovery_enabled: true,
+      steam_preparation_enabled: true,
+      steam_preparation_revision: "1",
       library_discovery_interval_minutes: 360,
       library_discovery_appdetails_enabled: false,
       updated_by: null,
@@ -166,11 +168,31 @@ function renderPage() {
 
 beforeEach(() => {
   vi.resetAllMocks();
+  mocked.listImages.mockResolvedValue({ images: [] } as never);
   mocked.getSettings.mockResolvedValue(settingsResponse());
   mocked.getLibraryStatus.mockResolvedValue(libraryStatus());
   mocked.listAdminApps.mockResolvedValue({ items: [], next_cursor: null });
   mocked.listUnpublishedLibraryItems.mockResolvedValue({ items: [] });
   mocked.listSecrets.mockResolvedValue(secretsResponse([artworkSecret()]));
+});
+
+describe("Steam preparation policy", () => {
+  it("defaults to the saved enabled policy and changes only preparation", async () => {
+    mocked.updateSettings.mockResolvedValue(settingsResponse({ steam_preparation_enabled: false }));
+    renderPage();
+    const toggle = await screen.findByRole("checkbox", { name: "Prepare Steam for faster first launch" });
+    expect(toggle).toBeChecked();
+    fireEvent.click(toggle);
+    await waitFor(() => expect(mocked.updateSettings).toHaveBeenCalledWith("tok", { steam_preparation_enabled: false }));
+    await waitFor(() => expect(toggle).not.toBeChecked());
+    expect(screen.getByRole("checkbox", { name: "Steam discovery" })).toBeChecked();
+  });
+  it("shows a preparation status load error instead of assuming hosts are enabled", async () => {
+    mocked.listImages.mockRejectedValue(new ApiError(500, "internal", "Preparation status unavailable"));
+    renderPage();
+    expect(await screen.findByText("Preparation status unavailable")).toBeInTheDocument();
+    expect(screen.queryByText(/status appears after/)).not.toBeInTheDocument();
+  });
 });
 
 describe("SourcesTab — head", () => {

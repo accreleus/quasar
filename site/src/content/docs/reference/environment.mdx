@@ -66,7 +66,7 @@ existing host and set only that on the new one. See below.
 | `QUASAR_TLS_KEY` | unset | Your own key. |
 | `QUASAR_TLS_DIR` | `/var/lib/quasar-control/tls` | Where the generated certificate is kept. |
 | `QUASAR_HTTP_REDIRECT` | `auto` | HTTP to HTTPS redirect for browser routes. |
-| `QUASAR_ALLOWED_ORIGINS` | unset | Authoritative override for signaling WebSocket origins. Leave unset to manage them in Admin, Settings; with neither source set, same-origin is allowed. `*` is rejected. |
+| `QUASAR_ALLOWED_ORIGINS` | unset | Authoritative override for signaling WebSocket origins. Leave unset for Admin, Settings and first-run setup (Quasar 0.2.4+) to manage the saved list. Explicitly empty still overrides that list. With neither source set, same-origin is allowed. `*` is rejected. |
 | `QUASAR_TRUSTED_PROXIES` | unset | Proxy IPs or CIDRs whose forwarded client-address headers are trusted. Empty ignores forwarded addresses. |
 | `LISTEN_ADDR` | `:8080` | HTTP listener. |
 | `CONTROL_PORT` | `8080` | Compose. Host port for HTTP. |
@@ -90,6 +90,7 @@ existing host and set only that on the new one. See below.
 | --- | --- | --- |
 | `QUASAR_ENCODER` | unset, auto-detect | AMD and NVIDIA default to `vulkan`, Intel to `va`, and no GPU to `openh264`. Explicit `va`, `nvenc`, `vulkan`, or `openh264` wins. |
 | `QUASAR_RENDER_NODE` | unset | Optional DRM render-node pin. Prefer a `/dev/dri/by-path/` path when pinning a multi-GPU host. |
+| `QUASAR_NVIDIA_DRIVER_HOST_PATH` | unset, automatic discovery | Advanced recovery override: the absolute **host** directory already mounted at `/opt/quasar/nvidia-driver` in the agent. Quasar verifies that Docker sees the same directory before provisioning and app launch; wrong or unverifiable paths produce a readiness error. It does not create the mount. Leave unset for normal named-volume discovery. A custom stack without discoverable container identity must also set `QUASAR_PULSE_IMAGE` to its locally installed agent image; the generated Compose already does this. Recreate the agent after changing the value. |
 | `QUASAR_CUDA_DEVICE` | `0` | NVENC device index on a multi-GPU host. |
 | `QUASAR_ZEROCOPY` | off | Full zero-copy on the VA path. |
 | `QUASAR_GOP` | `60` | Frames between keyframes. |

@@ -18,6 +18,7 @@ import { SecretField } from "../../../components/SecretField";
 import { useToast } from "../../../components/Toast";
 import { useSectionHead } from "../../../components/shell/sectionHead";
 import { ScanHealth } from "./ScanHealth";
+import { SteamPreparation } from "./SteamPreparation";
 import { SourceRow } from "./SourceRow";
 import { inertReasonCopy, lastScanText, scanResultToast } from "./sourcesDerived";
 import { STEAM_PROVIDER_LABEL, useSourcesData } from "./useSourcesData";
@@ -119,6 +120,7 @@ export function SourcesTab() {
               switchDisabled={data.settings.pending === "library_discovery_enabled"}
               switchLabel="Steam discovery"
             >
+              <SteamPreparation settings={data.settings} />
               {ls.inert_reason && (
                 <div className="note warn" style={{ marginTop: "var(--s3)" }}>
                   <div>{inertReasonCopy(ls.inert_reason)}</div>

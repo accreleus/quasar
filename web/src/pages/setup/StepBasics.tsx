@@ -1,6 +1,5 @@
-// Wizard step 2 — instance basics. Writes only registration_mode (PATCH
-// /v1/admin/settings, LP-SEC-01); "Public URL" is a live display of
-// window.location.origin and the TLS note is static copy — neither is stored.
+// Wizard step 2 — authenticated admin confirmation saves instance basics
+// and this browser origin through the existing settings API.
 
 import { useEffect, useState, type FormEvent } from "react";
 import * as adminApi from "../../api/admin";
@@ -57,10 +56,29 @@ export function StepBasics({ onNext }: StepBasicsProps) {
     setSaveError(null);
     setSaving(true);
     try {
-      await adminApi.updateSettings(token, { registration_mode: mode });
+      // Read policy at confirmation time; never mutate policy from an
+      // unauthenticated request header or overwrite an environment pin.
+      const access = await adminApi.accessCheck(token);
+      if (access.origins.source === "environment") {
+        const listed = access.origins.allowed.some((origin) => new URL(origin).origin === publicUrl);
+        const sameHost = new URL(publicUrl).host === new URL(`${new URL(publicUrl).protocol}//${access.request.host}`).host;
+        if (!listed && !sameHost) {
+          throw new Error(`Streaming from ${publicUrl} is blocked by QUASAR_ALLOWED_ORIGINS. Add this exact address to that environment setting and recreate the control plane, or remove the override to configure access in setup.`);
+        }
+        await adminApi.updateSettings(token, { registration_mode: mode });
+      } else if (access.origins.source === "database") {
+        const allowedOrigins = [...new Set([...access.origins.allowed, publicUrl])];
+        await adminApi.updateSettings(token, { registration_mode: mode, allowed_origins: allowedOrigins });
+        const verified = await adminApi.accessCheck(token);
+        if (!verified.origins.allowed.some((origin) => new URL(origin).origin === publicUrl)) {
+          throw new Error("The browser address was saved but is not active for streaming. Check the allowed-origin environment override and try again.");
+        }
+      } else {
+        throw new Error("Could not determine the active browser-origin policy. Retry before continuing.");
+      }
       onNext();
     } catch (err) {
-      setSaveError(err instanceof ApiError ? err.message : "Could not save settings.");
+      setSaveError(err instanceof Error ? err.message : "Could not save settings.");
       setSaving(false);
     }
   }
@@ -82,7 +100,7 @@ export function StepBasics({ onNext }: StepBasicsProps) {
         </p>
       </div>
 
-      <Field label="Public URL" hint="Where users and hosts reach this control plane. Read-only here — set it at the reverse proxy / DNS layer.">
+      <Field label="Public URL" hint="Continue permits streaming from this exact browser address and preserves existing allowed addresses. An environment-pinned policy is checked and left unchanged.">
         <input className="input mono" value={publicUrl} readOnly disabled />
       </Field>
 
@@ -90,8 +108,8 @@ export function StepBasics({ onNext }: StepBasicsProps) {
         <span className="label">TLS / network posture</span>
         <p className="field-hint" style={{ margin: 0 }}>
           {isHttps
-            ? "Served over HTTPS. Media (WebRTC) is still LAN/VPN-only in this release — there is no STUN/TURN yet, so a session only connects when the client can reach a host directly."
-            : "Served over plain HTTP. Media (WebRTC) is LAN/VPN-only in this release regardless — there is no STUN/TURN yet, so remote access needs a VPN either way."}
+            ? "Served over HTTPS. Remote media needs a reachable host or configured STUN/TURN; a reverse proxy alone does not relay video."
+            : "Served over plain HTTP. Use HTTPS for browser streaming features. Remote media needs a reachable host or configured STUN/TURN."}
         </p>
       </div>
 

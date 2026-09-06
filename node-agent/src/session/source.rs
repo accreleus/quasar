@@ -164,19 +164,22 @@ impl SessionResources {
         // create them root:root 755. No-op when unset or no mount matches; never fails
         // the session.
         //
-        // #488: resolve a golden-home seed when the feature is on
-        // (`cfg.template_store`) and the launch image is one the agent has
-        // `image_ensure`'d (`cfg.image_id`). Either absent ⇒ `None`, and
-        // `provision_home_dirs` runs as it did before the feature existed.
+        // An authoritative source policy and matching adopted template are both
+        // required. Unknown/custom images and disconnected sessions launch cold.
         if let Some(c) = cfg.container.as_ref() {
             let seed = cfg
-                .template_store
+                .source_policy
                 .as_ref()
                 .zip(cfg.image_id.as_deref())
-                .and_then(|(store, image_id)| store.seed(image_id).map(|seed| (store, seed)));
-            let template = seed
-                .as_ref()
-                .map(|(store, seed)| super::home::TemplateSeeder { store, seed });
+                .and_then(|(policy, image_id)| policy.seed(image_id, &c.image))
+                .filter(|(store, _, _)| store.home_root() == std::path::Path::new(&cfg.home_root));
+            let template =
+                seed.as_ref()
+                    .map(|(store, seed, authorization)| super::home::TemplateSeeder {
+                        store,
+                        seed,
+                        authorization: Some(authorization),
+                    });
             super::home::provision_home_dirs(&c.mounts, &cfg.home_root, template);
         }
         Ok((
