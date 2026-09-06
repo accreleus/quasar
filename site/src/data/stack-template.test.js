@@ -323,3 +323,10 @@ test('installer rejects missing and old Compose versions before host changes', a
     assert.equal(result.status, accepted ? 0 : 1, `${version}: ${result.stderr}`);
   }
 });
+
+
+test('optional securityfs does not become a required Docker bind source', () => {
+  const agent = load(generate(full({ platform: 'unraid', gpu: 'nvidia' })).compose).services['quasar-node-agent'];
+  assert.ok(agent.volumes.includes('/sys/kernel:/host/sys/kernel:ro'));
+  assert.ok(!agent.volumes.some(mount => typeof mount === 'string' && mount.startsWith('/sys/kernel/security:')));
+});

@@ -13,12 +13,14 @@ func TestSelfContainerIDRejectsAHostnameThatIsNotAContainerID(t *testing.T) {
 }
 
 func TestContainerIDFromMountinfo(t *testing.T) {
+	layer := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	id := "b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff0011"
-	body := "1234 1000 0:59 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/" + id + "/diff\n"
-	if got := containerIDFromMountinfo(body); got != id {
-		t.Fatalf("got %q, want %q", got, id)
+	root := "4592 4484 0:81 /btrfs/subvolumes/" + layer + " / rw - btrfs /dev/loop2 rw,subvol=/btrfs/subvolumes/" + layer + "\n"
+	identity := "4600 4592 0:81 /var/lib/docker/containers/" + id + "/hosts /etc/hosts rw - btrfs /dev/loop2 rw\n"
+	if got := containerIDFromMountinfo(root + identity); got != id {
+		t.Fatalf("got %q, want container %q (not Btrfs filesystem id)", got, id)
 	}
-	if got := containerIDFromMountinfo("nothing here\n"); got != "" {
-		t.Fatalf("got %q, want empty", got)
+	if got := containerIDFromMountinfo(root); got != "" {
+		t.Fatalf("a filesystem id is not a container id: %q", got)
 	}
 }
