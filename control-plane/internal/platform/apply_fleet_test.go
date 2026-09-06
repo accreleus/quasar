@@ -827,3 +827,93 @@ func TestFleetRestoresCordonsRecordedBeforeTheRestart(t *testing.T) {
 		t.Fatalf("the operator's cordon = %q, want it left in place", status)
 	}
 }
+
+// Adoption with a record re-cordons: between the two processes something (an
+// agent re-register, an admin) may have lifted the cordon on a host the run
+// itself cordoned. The host the record calls the operator's is not touched.
+func TestFleetReCordonsRecordedHostsOnAdoption(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.run.State = RunRunning
+	if err := store.SetCordonedHosts(context.Background(), testRunID, []HostCordon{
+		{HostID: "h1", WasCordoned: false},
+		{HostID: "h2", WasCordoned: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// h1's cordon was lifted underneath the run; h2 is the operator's.
+	store.hosts[0].Status = "online"
+	store.hosts[1].Status = "draining"
+	if _, err := store.CreateControlPlaneAttempt(context.Background(), NewControlPlaneAttempt{
+		RunID: &store.run.ID, ReleaseID: &store.release.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store.attempts[0].State = AttemptRecreating
+
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("",
+		hostTarget("h1", "gpu-01", ""), hostTarget("h2", "gpu-02", "")))
+
+	f.Adopt(context.Background())
+	waitFor(t, "the adopted run to finish", func() bool {
+		r, _ := store.Run(context.Background(), testRunID)
+		return TerminalRunState(r.State)
+	})
+	waitFor(t, "the run's cordon to be lifted", func() bool {
+		_, uncordoned := store.scheduling()
+		return len(uncordoned) == 1 && uncordoned[0] == "h1"
+	})
+
+	// h1 cordoned on adoption; h2 only ever cordoned by the restore at the end.
+	cordoned, _ := store.scheduling()
+	if len(cordoned) != 2 || cordoned[0] != "h1" || cordoned[1] != "h2" {
+		t.Fatalf("cordon calls = %v, want h1 re-cordoned on adoption then h2 restored", cordoned)
+	}
+	if status, _ := store.HostStatus(context.Background(), "h2"); status != "draining" {
+		t.Fatalf("the operator's cordon = %q, want it left in place", status)
+	}
+}
+
+// #140: a run started by a control plane older than migration 0076 has no
+// record, and every host is draining because THAT process cordoned them.
+// Reading those live statuses as the operator's intent re-cordons the whole
+// fleet at finish with nothing left to lift it.
+func TestFleetAdoptedWithNoRecordTreatsEveryCordonAsItsOwn(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.run.State = RunRunning
+	store.hosts[0].Status = "draining"
+	store.hosts[1].Status = "draining"
+	if _, err := store.CreateControlPlaneAttempt(context.Background(), NewControlPlaneAttempt{
+		RunID: &store.run.ID, ReleaseID: &store.release.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store.attempts[0].State = AttemptRecreating
+
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("",
+		hostTarget("h1", "gpu-01", ""), hostTarget("h2", "gpu-02", "")))
+
+	f.Adopt(context.Background())
+	waitFor(t, "the adopted run to finish", func() bool {
+		r, _ := store.Run(context.Background(), testRunID)
+		return TerminalRunState(r.State)
+	})
+	waitFor(t, "both hosts to be back in scheduling", func() bool {
+		one, _ := store.HostStatus(context.Background(), "h1")
+		two, _ := store.HostStatus(context.Background(), "h2")
+		return one == "online" && two == "online"
+	})
+	record, err := store.CordonedHosts(context.Background(), testRunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(record) != 2 {
+		t.Fatalf("cordon record = %v, want one entry per host", record)
+	}
+	for _, st := range record {
+		if st.WasCordoned {
+			t.Fatalf("recorded %s as the operator's cordon, want every cordon read as the run's own", st.HostID)
+		}
+	}
+}

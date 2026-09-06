@@ -24,6 +24,19 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+
+- **A fleet update from v0.2.0 no longer leaves every host `draining` when it
+  finishes (#140).** The v0.2.0 control plane cordoned the fleet with nothing to record
+  it in; when the new control plane picked the run up it found every host draining, took
+  that for the operator's intent, and "restored" the cordons at the end — the run said
+  `succeeded` with zero hosts in scheduling. A run adopted with no cordon record now
+  treats every cordon as its own and lifts them all; a run adopted with a record
+  re-cordons the hosts it owns (the old code only claimed to). An agent's re-register
+  also no longer lifts a cordon: `draining` stays `draining` until an admin or the run
+  uncordons it, so a cordon survives the control plane's own restart. Found on the
+  first real `v0.2.0` → `v0.2.1` update.
+
 ## 0.2.1 — 2026-09-05
 
 ### Fixed
