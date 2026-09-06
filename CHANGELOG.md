@@ -24,6 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+## 0.2.2 — 2026-09-06
+
 ### Fixed
 
 - **A fleet update from v0.2.0 no longer leaves every host `draining` when it
