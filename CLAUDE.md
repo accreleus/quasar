@@ -181,8 +181,16 @@ session memory `current-focus.md`, not this file.**
   whole fleet before the control-plane step because a control-plane restart ends every session
   today (#128). A **source-built host or control plane is never offered a release** — it shows
   the manual `redeploy.sh` recipe instead. Existing installs add the updater once
-  (`docs/upgrading.md` "The updater"). Publishing is a `vX.Y.Z` tag push on `main`
-  (`make release VERSION=`), still to be exercised live after the first main promotion.
+  (`docs/upgrading.md` "The updater"). **Publishing a release** (exercised live: 0.2.0 → 0.2.3, 2026-09-05/06) is
+  `make release VERSION=x.y.z` on a clean `main` — recipe and refusals in `docs/upgrading.md`
+  "Cutting a release". Two disciplines make it work: (1) **every change that lands on `develop`
+  adds its line to `CHANGELOG.md` `## Unreleased` in the same landing** — the cut refuses an
+  empty section and the section becomes the GitHub Release notes verbatim (Keep-a-Changelog
+  headings; the Releases tab parses them); (2) the develop→main promotion is a PR merged only
+  with the operator's sign-off, and only THEN is the cut run. After the tag push, watch the
+  Images run to success, verify `gh release view vX.Y.Z` (manifest asset, not prerelease), merge
+  `main` back into `develop` (the changelog cut), then run the live update on gpu-test from
+  Fleet ▸ Releases ("Check now" → apply) before calling the release done.
 - **ABR is ON by default, mode `smooth`** (SPT-10 #346, 2026-06-27). `smooth` is
   encoder-aware + smoothness-biased (under congestion: present σ p95 ~69→19 ms,
   freezes 14→2 vs `protective`; identical on a clean path; preserves the #68 emergency
