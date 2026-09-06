@@ -3,8 +3,8 @@
 // each an ordered chain of rungs; no invented CAPS matrix, a walk over real chains.
 //
 // "auto" codec segment: one row per profile, keyed by the profile's own nominal
-// and profile-level eligibility (codec is whatever the top rung is; the server
-// picks at launch). An explicit codec: one row per profile's FIRST rung matching
+// and profile-level eligibility (codec previews the first permitted, decodable
+// rung; the server picks at launch). An explicit codec: one row per profile's FIRST rung matching
 // that codec (mirrors the launch resolver's clamp-0 rule, control-plane rung.go),
 // deduped by (width,height,fps); eligibility is rung-level here.
 //
@@ -35,7 +35,7 @@ export interface LaunchDraft {
 /** One real (codec, height, fps) combo the catalog actually offers. */
 interface OptionEntry {
   /** The rung's actual codec — equal to the segment codec for an explicit
-   * segment, and the profile's top-rung codec for "auto" rows. */
+   * segment, and the profile's preview codec for "auto" rows. */
   codec: CatalogCodec;
   width: number;
   height: number;

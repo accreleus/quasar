@@ -201,8 +201,8 @@ session memory `current-focus.md`, not this file.**
   which also produced the #370 re-characterisation; no further operator soak is
   outstanding.
 - **Encoders:** AMD/Intel = VA (ZC-03 DMABuf zero-copy). **NVIDIA = Vulkan by
-  default** (2026-08-12): `docker-compose.nvidia.yml` sets
-  `QUASAR_ENCODER=${QUASAR_ENCODER:-vulkan}`, so H.264 and HEVC encode with
+  default** (2026-08-12): the agent detects NVIDIA when `QUASAR_ENCODER` is
+  unset or empty (Compose passes an operator override through), so H.264 and HEVC encode with
   `vulkanh264enc`/`vulkanh265enc`. Rationale:
   #489 is an NVIDIA-driver NVENC teardown UAF spanning the 595 **and** 610
   branches — no driver pin escapes it — and Vulkan is immune, so the default path

@@ -1,0 +1,63 @@
+case=actual610-av1 actual_driver=610.57.04 identity=actual610 encoder=vulkan codec=av1 exit=0 expected=0
+{
+  "codec": "av1",
+  "encoder_factory": "vulkanav1enc",
+  "configured_encoder": "vulkan",
+  "effective_encoder": "vulkan",
+  "negotiated_sink_caps": "video/x-raw(memory:VulkanImage), format=(string)NV12, width=(int)1280, height=(int)720, framerate=(fraction)30/1, multiview-mode=(string)mono, pixel-aspect-ratio=(fraction)1/1, interlace-mode=(string)progressive",
+  "negotiated_src_caps": "video/x-av1, profile=(string)main, width=(int)1280, height=(int)720, alignment=(string)tu, stream-format=(string)obu-stream, colorimetry=(string)bt709, chroma-site=(string)mpeg2, pixel-aspect-ratio=(fraction)1/1, framerate=(fraction)30/1, interlace-mode=(string)progressive, multiview-mode=(string)mono, multiview-flags=(GstVideoMultiviewFlagsSet)0:ffffffff:/right-view-first/left-flipped/left-flopped/right-flipped/right-flopped/half-aspect/mixed-mono",
+  "profile": "main",
+  "level": null,
+  "ok": true
+}
+case=blocked595-vulkan-av1 actual_driver=610.57.04 identity=simulated595 encoder=vulkan codec=av1 exit=1 expected=1
+{
+  "codec": "av1",
+  "encoder_factory": null,
+  "configured_encoder": "vulkan",
+  "effective_encoder": "",
+  "negotiated_sink_caps": null,
+  "negotiated_src_caps": null,
+  "profile": null,
+  "level": null,
+  "ok": false,
+  "error": "AV1 is disabled on RTX 5090 with NVIDIA 595.99.02 because Vulkan AV1 produces corrupted video. Quasar negotiates HEVC or H.264 when the profile and client support them. NVIDIA 610.57.04 has been validated for Vulkan AV1 on RTX 5090; this is not a universal minimum version. Install a compatible driver with the open kernel module required by Blackwell, then recreate the agent to refresh driver libraries and codec discovery. Quasar does not substitute NVENC AV1 because that path has a separate teardown fault."
+}
+case=blocked595-nvenc-av1 actual_driver=610.57.04 identity=simulated595 encoder=nvenc codec=av1 exit=1 expected=1
+{
+  "codec": "av1",
+  "encoder_factory": null,
+  "configured_encoder": "nvenc",
+  "effective_encoder": "",
+  "negotiated_sink_caps": null,
+  "negotiated_src_caps": null,
+  "profile": null,
+  "level": null,
+  "ok": false,
+  "error": "AV1 is disabled on RTX 5090 with NVIDIA 595.99.02 because Vulkan AV1 produces corrupted video. Quasar negotiates HEVC or H.264 when the profile and client support them. NVIDIA 610.57.04 has been validated for Vulkan AV1 on RTX 5090; this is not a universal minimum version. Install a compatible driver with the open kernel module required by Blackwell, then recreate the agent to refresh driver libraries and codec discovery. Quasar does not substitute NVENC AV1 because that path has a separate teardown fault."
+}
+case=eligible595-h264 actual_driver=610.57.04 identity=simulated595 encoder=vulkan codec=h264 exit=0 expected=0
+{
+  "codec": "h264",
+  "encoder_factory": "vulkanh264enc",
+  "configured_encoder": "vulkan",
+  "effective_encoder": "vulkan",
+  "negotiated_sink_caps": "video/x-raw(memory:VulkanImage), format=(string)NV12, width=(int)1280, height=(int)720, framerate=(fraction)30/1, multiview-mode=(string)mono, pixel-aspect-ratio=(fraction)1/1, interlace-mode=(string)progressive",
+  "negotiated_src_caps": "video/x-h264, profile=(string)constrained-baseline, level=(string)3.1, width=(int)1280, height=(int)720, alignment=(string)au, stream-format=(string)byte-stream, pixel-aspect-ratio=(fraction)1/1, framerate=(fraction)30/1, interlace-mode=(string)progressive, colorimetry=(string)bt709, chroma-site=(string)mpeg2, multiview-mode=(string)mono, multiview-flags=(GstVideoMultiviewFlagsSet)0:ffffffff:/right-view-first/left-flipped/left-flopped/right-flipped/right-flopped/half-aspect/mixed-mono",
+  "profile": "constrained-baseline",
+  "level": "3.1",
+  "ok": true
+}
+case=eligible595-hevc actual_driver=610.57.04 identity=simulated595 encoder=vulkan codec=h265 exit=0 expected=0
+{
+  "codec": "h265",
+  "encoder_factory": "vulkanh265enc",
+  "configured_encoder": "vulkan",
+  "effective_encoder": "vulkan",
+  "negotiated_sink_caps": "video/x-raw(memory:VulkanImage), format=(string)NV12, width=(int)1280, height=(int)720, framerate=(fraction)30/1, multiview-mode=(string)mono, pixel-aspect-ratio=(fraction)1/1, interlace-mode=(string)progressive",
+  "negotiated_src_caps": "video/x-h265, profile=(string)main, level=(string)3.1, width=(int)1280, height=(int)720, alignment=(string)au, stream-format=(string)byte-stream, colorimetry=(string)bt709, chroma-site=(string)mpeg2, pixel-aspect-ratio=(fraction)1/1, framerate=(fraction)30/1, interlace-mode=(string)progressive, multiview-mode=(string)mono, multiview-flags=(GstVideoMultiviewFlagsSet)0:ffffffff:/right-view-first/left-flipped/left-flopped/right-flipped/right-flopped/half-aspect/mixed-mono",
+  "profile": "main",
+  "level": "3.1",
+  "ok": true
+}
+All isolated candidate probes completed; host driver unchanged.

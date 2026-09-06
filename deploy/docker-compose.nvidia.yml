@@ -39,6 +39,9 @@
 # deployment streams h264 regardless.
 #
 # NVENC is NOT gone — it is the per-session fallback and the explicit opt-out:
+# Known driver compatibility exclusions apply before either path. RTX 5090 on
+# 595.99.02 excludes AV1, including NVENC AV1; eligible HEVC/H.264 remain available.
+# See docs/configuration.md for the measured scope and validated driver guidance.
 #   * Any codec whose Vulkan knob is disabled, or whose Vulkan element is absent
 #     from the image (e.g. vulkanav1enc needs the vendored patch), falls back per
 #     session to nvcuda<codec>enc. That fallback is resolved in

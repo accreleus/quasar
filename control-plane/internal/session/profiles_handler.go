@@ -126,7 +126,8 @@ func (h *Handler) handleListProfiles(w http.ResponseWriter, r *http.Request) {
 
 	// ?app_id narrows the catalogue for the launch menu; convenience only — POST
 	// /v1/sessions enforces the same allow-list independently in launcher.go.
-	if appID := strings.TrimSpace(r.URL.Query().Get("app_id")); appID != "" {
+	appID := strings.TrimSpace(r.URL.Query().Get("app_id"))
+	if appID != "" {
 		restriction, err := h.store.AppProfileRestrictionByID(r.Context(), user.ID, appID)
 		switch {
 		case errors.Is(err, ErrNotFound):
@@ -142,7 +143,11 @@ func (h *Handler) handleListProfiles(w http.ResponseWriter, r *http.Request) {
 		catalog = restriction.Filter(catalog)
 	}
 
-	ev := profile.EvaluateLaunchProfiles(catalog, profile.EvalInput{Probe: pr, HistoricalFailures: historical})
+	hostCaps, err := h.store.profileHostCaps(r.Context(), user.ID, appID)
+	if err != nil {
+		slog.Warn("profile host codecs load failed, evaluating without host capabilities", "err", err)
+	}
+	ev := profile.EvaluateLaunchProfiles(catalog, profile.EvalInput{Probe: pr, HostCaps: hostCaps, HistoricalFailures: historical})
 	httpx.WriteJSON(w, http.StatusOK, toProfilesResponse(ev))
 }
 

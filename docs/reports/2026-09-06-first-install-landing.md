@@ -58,3 +58,44 @@ states that `develop` changes require a compatible published release before an
 existing installation receives them. The AV1 exclusion is host-wide for Vulkan
 and NVENC because the current codec advertisement is host-wide; mixed-GPU hosts
 are treated conservatively. Unknown versions are not claimed validated.
+
+## AV1 compatibility candidate validation
+
+The agent image `quasar-node-agent:20260906-1053-av1-compat-143`, built through
+`deploy/build-images.sh` from `c20193d67fae`, passed its runtime contract:
+**139 passed, zero failed**. Later changes to agent source add tests only.
+
+Isolated `probe-encoder` containers exercised the shared production resolver,
+encoder builder and bitstream chain at 1280×720, 30 fps, for two seconds:
+
+| Host kernel driver | Identity visible to probe | Requested path | Result |
+|---|---|---|---|
+| 610.57.04 | Actual RTX 5090 / 610.57.04 | Vulkan AV1 | Passed with `vulkanav1enc`, VulkanImage input and AV1 output |
+| 610.57.04 | Simulated 595.99.02 version file | Vulkan AV1 | Rejected before encoder construction, with compatibility guidance |
+| 610.57.04 | Simulated 595.99.02 version file | NVENC AV1 | Rejected before encoder construction, with the same guidance |
+| 610.57.04 | Simulated 595.99.02 version file | Vulkan H.264 | Passed with `vulkanh264enc` |
+| 610.57.04 | Simulated 595.99.02 version file | Vulkan HEVC | Passed with `vulkanh265enc`, profile `main` |
+
+[Raw probe reports](2026-09-06-av1-evidence/compatibility-probes.txt) include the
+requested and effective encoders. The simulated cases bind a version-file fixture
+only into temporary probe containers; the host driver remained 610.57.04.
+These validate exclusion behavior, not output on an actual 595 kernel. Actual
+595 corruption and operator-confirmed clean 610 streaming are documented in the
+separate comparison report. The production stack and its running session were
+left in place.
+
+The first isolated probe omitted the normal agent's driver-volume activation
+environment and resolved AV1 to NVENC. That result was discarded as Vulkan
+validation. Candidate and working Vulkan plugin checksums were identical. The
+corrected probes reproduced `nvidia_volume::process_env()` (EGL vendor/platform
+paths, GBM backend and additive Vulkan ICD discovery) with a fresh GStreamer
+registry, and explicitly checked the effective encoder. No toolchain defect was
+established.
+
+The control-plane profile endpoint now considers reported codecs from candidate
+hosts, using existing app-image, GPU-binding and derived-home gates. Its existing
+`host_encoder_not_supported` reason makes an unavailable AV1 rung ineligible;
+the Auto preview selects a permitted, decodable rung. A fresh database-backed
+HTTP test covers AV1 exclusion, HEVC eligibility, restoration after a host
+re-report, and legacy unreported capabilities. The menu is advisory across a
+mixed-capability fleet; the placed host's launch checks remain authoritative.
