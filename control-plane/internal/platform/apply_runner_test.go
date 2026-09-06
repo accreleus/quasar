@@ -619,3 +619,58 @@ func TestApplyTimesOutWhenTheAgentNeverReconnects(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// #140: an attempt that belongs to a fleet run leaves the cordon to the run.
+// The run cordoned this host before its control-plane step, so the attempt
+// finds it draining; restoring "the admin's cordon" here re-cordoned the host
+// right after the run's own restore had lifted it.
+func TestARunOwnedAttemptLeavesTheCordonToTheRun(t *testing.T) {
+	a := queuedAttempt(true)
+	run := "44444444-4444-4444-8444-444444444444"
+	a.RunID = &run
+	store := newFakeStore(a)
+	store.status = "draining"
+	agent := &fakeAgent{ack: Ack{OK: true}}
+	r := testRunner(store, agent.deps())
+	defer r.Close()
+
+	r.Start(a)
+	waitFor(t, "release_apply to be sent", func() bool { return agent.sentCount() == 1 })
+	commit := testCommit
+	r.HandleRegister(context.Background(), testHostID, &commit)
+	waitFor(t, "the attempt to succeed", func() bool { return store.snapshot(a.ID).State == AttemptSucceeded })
+
+	// Long enough for a deferred restore to have run, had there been one.
+	time.Sleep(20 * time.Millisecond)
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	if agent.cordons != 0 || agent.uncordon != 0 {
+		t.Fatalf("cordon calls = %d cordon / %d uncordon, want none: the run restores its own cordons", agent.cordons, agent.uncordon)
+	}
+}
+
+// The same attempt on a host the run's cordon no longer covers (a disconnect
+// then a register flipped it offline → online) still drains it before the
+// apply — and still leaves the restore to the run.
+func TestARunOwnedAttemptStillCordonsAServingHost(t *testing.T) {
+	a := queuedAttempt(true)
+	run := "44444444-4444-4444-8444-444444444444"
+	a.RunID = &run
+	store := newFakeStore(a)
+	agent := &fakeAgent{ack: Ack{OK: true}}
+	r := testRunner(store, agent.deps())
+	defer r.Close()
+
+	r.Start(a)
+	waitFor(t, "release_apply to be sent", func() bool { return agent.sentCount() == 1 })
+	commit := testCommit
+	r.HandleRegister(context.Background(), testHostID, &commit)
+	waitFor(t, "the attempt to succeed", func() bool { return store.snapshot(a.ID).State == AttemptSucceeded })
+
+	time.Sleep(20 * time.Millisecond)
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	if agent.cordons != 1 || agent.uncordon != 0 {
+		t.Fatalf("cordon calls = %d cordon / %d uncordon, want 1 / 0", agent.cordons, agent.uncordon)
+	}
+}

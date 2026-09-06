@@ -310,18 +310,14 @@ func TestFleetRunsHistoryAndCancel(t *testing.T) {
 		t.Fatalf("attempts = %+v, want the unsent one cancelled", cancelled.Attempts)
 	}
 	// Idempotent while the run is still active; once the run has stopped there
-	// is nothing left to stop, which is its own refusal.
-	current, err := h.store.Run(context.Background(), run.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// is nothing left to stop, which is its own refusal. The run is winding down
+	// concurrently, so either answer is right — what is wrong is anything else.
 	code, raw = h.do(t, http.MethodPost, "/v1/admin/platform/apply/runs/"+run.ID+"/cancel", h.admin, nil)
-	if TerminalRunState(current.State) {
-		if code != http.StatusConflict || errCode(t, raw) != CodeRunNotActive {
-			t.Fatalf("cancel of a finished run = %d %s, want 409 run_not_active", code, raw)
-		}
-	} else if code != http.StatusOK {
-		t.Fatalf("second cancel = %d %s, want a 200 no-op", code, raw)
+	switch {
+	case code == http.StatusOK:
+	case code == http.StatusConflict && errCode(t, raw) == CodeRunNotActive:
+	default:
+		t.Fatalf("second cancel = %d %s, want a 200 no-op or 409 run_not_active", code, raw)
 	}
 
 	if code, _ := h.do(t, http.MethodGet, "/v1/admin/platform/apply/runs/"+testRunID, h.admin, nil); code != http.StatusNotFound {
