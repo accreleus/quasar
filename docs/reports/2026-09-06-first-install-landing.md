@@ -28,6 +28,7 @@ No new frozen-contract changes were authored.
 | #129 | Kernel provisioning lock with abandoned-marker recovery test; provisioning retry; background readiness refresh; shared setup/admin readiness rendering; documented provisioning | Keep open for a controlled live interrupted graphics download, progress visible in both UIs, and network/digest/disk failure remediation checks. Tower's successful NVRTC installation is not that test. |
 | #130 | Structured Docker identity-file discovery, rejection of filesystem IDs, named-volume injection, retry and readiness/launch refusal for unresolved required mounts; regression tests | Keep open: the originally requested explicit host-path override and its override-specific remediation are not implemented. Do not describe that acceptance criterion as satisfied. |
 | #131 | Repository-derived Compose, credential handling, image/runtime defaults, ownership preparation, recovery/readiness protections; two live Unraid deployment blockers fixed | Keep open for first-time setup to persist the administrator's detected browser origin, omission of an unset origin override from generated environment, accurate signaling errors, and diagnostic evidence sufficiency. |
+| #143 | Evidence-scoped AV1 exclusion before codec advertising and Vulkan/NVENC resolution; shared readiness/setup explanation; eligible HEVC/H.264 negotiation; public documentation | Included in this delivery at the operator's request. Final GPU/image validation and merge evidence are attached to the PR before closeout. |
 
 The operator explicitly agreed that setup should use the detected browser URL to
 configure access. Implement that through the authenticated administrator's setup
@@ -47,3 +48,13 @@ or publish a stable release.
 The original implementation report is historical: its missing-harness verify
 failure was subsequently resolved. The landing check results are recorded in the
 PR and issue updates rather than treating that old report as current gate status.
+
+The public-site audit updates installation, prerequisites, first-run setup,
+reverse-proxy access, host readiness, encoder tuning, troubleshooting, upgrades
+and environment references. It removes the disproven blanket driver-volume
+Vulkan restriction and unsafe NVENC recommendation, distinguishes host kernel
+drivers from provisioned userspace, retains the manual origin workaround, and
+states that `develop` changes require a compatible published release before an
+existing installation receives them. The AV1 exclusion is host-wide for Vulkan
+and NVENC because the current codec advertisement is host-wide; mixed-GPU hosts
+are treated conservatively. Unknown versions are not claimed validated.

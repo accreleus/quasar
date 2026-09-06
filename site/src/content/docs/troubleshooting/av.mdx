@@ -27,6 +27,14 @@ produced and the problem is host-side, not client-side.
 **Packet loss.** Look at the loss series in the session detail. If it is rising,
 the network is the problem, not the encoder.
 
+**RTX 5090, Vulkan AV1 and driver 595.99.02.** Repeatedly corrupted text or
+blocky pixels can occur even with no packet loss. Driver 610.57.04 produced clean
+output in comparison tests. Releases containing the compatibility protection
+exclude AV1 on the affected GPU/driver combination and use another eligible
+codec. On older releases, select HEVC or H.264 explicitly. Do not use NVENC AV1
+as the workaround; see [the compatibility
+policy](/quasar/tuning/encoders/#av1-driver-compatibility).
+
 **A Vulkan host with HEVC armed.** If one frame in four is black or torn, the
 compositor's encode ring depth is wrong. Arming `QUASAR_VULKAN_HEVC=1` pins it
 correctly. If you overrode the ring depth by hand, undo that.

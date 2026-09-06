@@ -14,6 +14,14 @@ Read [Requirements](/quasar/start/requirements/) first, particularly the sysctl
 and, on NVIDIA, the container toolkit. Nothing here compiles Quasar. It pulls
 published images, which is about 20 GB.
 
+<Aside type="note" title="Use matching release images and instructions">
+This configuration includes the first-install recovery changes. The quick-start
+installer checks that the selected stable images support it and stops if they
+do not. When copying these files manually, use a release containing those
+changes, or use the instructions shipped with your chosen release. A merge into
+`develop` does not publish compatible stable images.
+</Aside>
+
 <Steps>
 
 1. **Make a stack directory and a home root.**
@@ -85,6 +93,17 @@ published images, which is about 20 GB.
 be reconstructed. Lose it and every stored secret has to be entered again. Keep
 a copy off the host.
 </Aside>
+
+## Application memory and ownership
+
+Application containers retain **1 GiB of shared memory** by default through
+`QUASAR_APP_SHM_SIZE=1g`. This supports applications such as Steam; it is a Docker
+container setting, not a value baked into an image or a general filesystem cache.
+Set the override only when an application needs a different allocation.
+
+`QUASAR_APP_PUID` and `QUASAR_APP_PGID` control game and save-data ownership. They
+do not change the control-plane user. The default control-plane named volume
+already has the ownership its image needs.
 
 ## The updater service
 

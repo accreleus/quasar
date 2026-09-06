@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import type { ReadinessCheck } from "../api/types";
 import { explainCodecGap } from "./hostCodecs";
 
 describe("explainCodecGap", () => {
@@ -13,6 +14,21 @@ describe("explainCodecGap", () => {
     expect(explainCodecGap(["h264", "h265", "av1"], "va")).toBeNull();
   });
 
+  it("uses the agent's compatibility reason without inventing a fallback selection", () => {
+    const readiness: ReadinessCheck[] = [{
+      id: "nvidia_vulkan_av1_compatibility",
+      status: "warn",
+      summary: "NVIDIA 595.99.02 on RTX 5090 produces corrupted Vulkan AV1 video. AV1 is disabled.",
+      remediation: "610.57.04 is validated on this GPU.",
+    }];
+    const gap = explainCodecGap(["h264", "h265"], "vulkan", readiness);
+    expect(gap?.reason).toContain(readiness[0].summary);
+    expect(gap?.reason).not.toMatch(/not registered|NVENC|selected/i);
+    expect(explainCodecGap(["h264", "h265", "av1"], "vulkan", readiness)).toBeNull();
+    expect(explainCodecGap(["h264", "h265"], "vulkan", [{ ...readiness[0], status: "pass" }])?.reason)
+      .not.toContain("595.99.02");
+  });
+
   it("names the QUASAR_VULKAN_HEVC knob for an h264-only Vulkan host", () => {
     const gap = explainCodecGap(["h264"], "vulkan");
     expect(gap).not.toBeNull();
@@ -22,7 +38,7 @@ describe("explainCodecGap", () => {
     expect(gap!.reason).toContain("by default");
     expect(gap!.reason).toContain("vulkanh265enc");
     // AV1 has no one-line fix on Vulkan — must say so, not imply misconfiguration.
-    expect(gap!.reason).toContain("vendor AV1 encoder");
+    expect(gap!.reason).toContain("driver compatibility");
   });
 
   it("does NOT claim the Vulkan gate for a non-Vulkan encoder", () => {
@@ -43,6 +59,6 @@ describe("explainCodecGap", () => {
     const gap = explainCodecGap(["h264"], "nvenc");
     expect(gap).not.toBeNull();
     expect(gap!.reason).not.toMatch(/misconfigur/i);
-    expect(gap!.reason).toMatch(/not registered/i);
+    expect(gap!.reason).toMatch(/unavailable/i);
   });
 });

@@ -198,7 +198,7 @@ export function StepHosts({ onNext }: StepHostsProps) {
                 }
               />
 
-              <CodecSection settings={settings} />
+              <CodecSection settings={settings} readiness={host.readiness} />
 
               {/* §S4b/§S4c — a rootless host is misconfigured, not blocking. */}
               {token && (
@@ -249,7 +249,7 @@ const dangerBoxStyle = {
  *  `codecs` null (pre-multi-codec agent — the API deliberately does not
  *  normalise to ["h264"]) → "not reported" plus the consequence, never an
  *  assertion; present → list them and explain any gap (explainCodecGap). */
-function CodecSection({ settings }: { settings: HostSettingsResponse | null }) {
+function CodecSection({ settings, readiness }: { settings: HostSettingsResponse | null; readiness: Host["readiness"] }) {
   if (!settings) {
     return (
       <p className="field-hint" style={{ margin: 0 }}>
@@ -274,7 +274,7 @@ function CodecSection({ settings }: { settings: HostSettingsResponse | null }) {
   // agent env and reads "openh264" on an un-overridden Vulkan host, which
   // would suppress the one gap with a real fix.
   const encoder = settings.effective?.["encoder"] ?? null;
-  const gap = explainCodecGap(codecs, encoder);
+  const gap = explainCodecGap(codecs, encoder, readiness);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "var(--s2)" }}>

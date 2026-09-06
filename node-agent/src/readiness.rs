@@ -3376,6 +3376,51 @@ mod tests {
         assert_eq!(check_vulkan_av1_compatibility(&env).status, SKIP);
     }
 
+    /// Codec advertisements are host-wide: an unknown GPU cannot hide an
+    /// exposed affected GPU, regardless of render-node numbering. All NVIDIA
+    /// GPUs share the loaded kernel driver version, so a known-bad 595 GPU and
+    /// a validated 610 GPU cannot coexist in one real inspector snapshot.
+    #[test]
+    fn av1_compatibility_is_conservative_across_exposed_gpus() {
+        use crate::encoder_compatibility::{inspect, Av1Compatibility};
+        for affected_node in ["renderD128", "renderD130"] {
+            let root = FakeRoot::new("av1-mixed-gpu");
+            root.file("sys/module/nvidia/version", "595.99.02\n");
+            for node in ["renderD128", "renderD129", "renderD130"] {
+                root.file(&format!("dev/dri/{node}"), "")
+                    .file(&format!("sys/class/drm/{node}/device/vendor"), "0x10de\n")
+                    .file(
+                        &format!("sys/class/drm/{node}/device/device"),
+                        if node == affected_node {
+                            "0x2b85\n"
+                        } else {
+                            "0x2684\n"
+                        },
+                    );
+            }
+            assert_eq!(
+                inspect(&root.dir),
+                Av1Compatibility::KnownCorrupt,
+                "the unknown GPUs must not mask the affected {affected_node}"
+            );
+            assert_eq!(
+                check_vulkan_av1_compatibility(&root.env(true, "")).status,
+                WARN
+            );
+
+            // The same 5090 becomes validated after the driver changes; unknown
+            // neighbouring devices must not erase that GPU-specific evidence.
+            root.file("sys/module/nvidia/version", "610.57.04\n");
+            assert_eq!(inspect(&root.dir), Av1Compatibility::Validated);
+            root.file("sys/module/nvidia/version", "595.99.02\n");
+
+            // sysfs lists host devices even when the container cannot use them.
+            // A hidden affected GPU does not restrict this agent's codec set.
+            std::fs::remove_file(root.dir.join(format!("dev/dri/{affected_node}"))).unwrap();
+            assert_eq!(inspect(&root.dir), Av1Compatibility::Unknown);
+        }
+    }
+
     /// The probe-root-relative volume path must stay in lockstep with the provisioner's
     /// absolute mount, or the version check reads an empty directory and skips forever.
     #[test]

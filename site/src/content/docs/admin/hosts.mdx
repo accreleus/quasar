@@ -32,20 +32,25 @@ install leaves out.
 
 `xid_visibility` is the odd one out: it reports whether the agent can read
 `/dev/kmsg`, which is where the kernel logs an NVIDIA Xid or an amdgpu fault. The
-generated compose passes that device read-only and grants `SYSLOG`, so the check
-passes on a stock install and a GPU fault turns up in the session trace. Where it
-is skipped, faults are still happening or not happening exactly as before — you
-just have to go and read the host's `dmesg` yourself to find one.
+generator makes this an optional diagnostics choice because some hosts do not
+provide that device. When enabled, it passes the device read-only and grants
+`SYSLOG`, allowing GPU faults to appear in the session trace. Otherwise, read the
+host’s `dmesg` when investigating a GPU fault.
 
 A `media_reachability` warning names the scoped firewall rule the host is
 missing, or the half of the media path an existing rule leaves closed. A
 default-deny host whose rules already cover the range passes, quoting them. See
 [Ports and endpoints](/quasar/reference/ports/#firewall).
 
-<Aside type="note" title="Readiness checks warn, they do not block">
-A failing check does not stop the host registering or accepting sessions. It
-tells you why something will probably not work. The exception is a host with no
-usable encoder, which will fail sessions rather than pretend.
+Driver provisioning is reported as work in progress, and readiness refreshes
+while the agent remains connected. A known AV1 driver restriction leaves the host
+usable with its other eligible codecs; see
+[AV1 driver compatibility](/quasar/tuning/encoders/#av1-driver-compatibility).
+
+<Aside type="note" title="Readiness and launch checks">
+The agent remains available for administration when a readiness check fails.
+Required driver, home, template or runtime mounts that cannot be resolved prevent
+an affected app launch. Warnings about optional diagnostics do not block it.
 </Aside>
 
 ## Build identity in the host drawer

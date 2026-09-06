@@ -51,8 +51,11 @@ these in `deploy/.env` before the first boot:
 ```bash
 BOOTSTRAP_ADMIN_EMAIL=you@example.com
 BOOTSTRAP_ADMIN_USERNAME=you
-BOOTSTRAP_ADMIN_PASSWORD=a-real-password
+BOOTSTRAP_ADMIN_PASSWORD=
 ```
+
+Replace the blank password with a strong password you choose before starting.
+The example deliberately contains no usable password.
 
 The control plane creates that account at startup. It is idempotent and does
 nothing once an admin exists. The Claim step is then skipped.
@@ -73,7 +76,10 @@ Set the instance name and choose how new accounts are created:
 You can change this later under Admin, People, Invites.
 
 The public URL and TLS notes on this step are informational. They describe what
-the browser is currently seeing, they do not configure anything.
+the browser is currently seeing, they do not configure anything. If you are
+using an existing reverse proxy, configure its public URL and allowed origin
+[before testing a stream](/quasar/network/reverse-proxy/#your-own-proxy). A
+successful login does not establish that signaling accepts that address.
 
 ## Step 3: Hosts
 

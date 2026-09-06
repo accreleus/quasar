@@ -14,6 +14,22 @@ function check(overrides: Partial<ReadinessCheck> = {}): ReadinessCheck {
 }
 
 describe("ReadinessCard", () => {
+  it("shows AV1 compatibility as an NVIDIA warning, with the installed driver and guidance", () => {
+    render(<ReadinessCard checks={[check({
+      id: "nvidia_vulkan_av1_compatibility",
+      status: "warn",
+      summary: "NVIDIA 595.99.02 on RTX 5090 produces corrupted Vulkan AV1 video. AV1 is disabled.",
+      remediation: "610.57.04 is validated on this GPU. Restart the agent after upgrading.",
+    })]} />);
+    const group = screen.getByTestId("readiness-group");
+    expect(group).toHaveAttribute("data-group", "nvidia");
+    expect(within(group).getByRole("heading", { name: "Vulkan AV1 compatibility" })).toBeInTheDocument();
+    expect(within(group).getByRole("img", { name: "Warning" })).toBeInTheDocument();
+    expect(within(group).getByText(/NVIDIA 595.99.02/)).toBeInTheDocument();
+    expect(within(group).getByText(/610.57.04 is validated/)).toBeInTheDocument();
+    expect(screen.queryByText("Needs attention")).not.toBeInTheDocument();
+  });
+
   it("renders a pass check with no remediation line", () => {
     render(<ReadinessCard checks={[check()]} />);
     const row = screen.getByTestId("readiness-check-nvidia_egl_vendor_json");

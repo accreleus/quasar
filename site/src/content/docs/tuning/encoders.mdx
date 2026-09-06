@@ -21,7 +21,8 @@ anything else unless something specific pushes you off it. On NVIDIA it also
 avoids an NVENC teardown fault that no driver version escapes. Vulkan is immune
 to it, which is why NVENC is no longer the default there.
 
-An explicit value always wins over detection. Set one in your `.env`:
+An explicit value overrides vendor detection, but does not bypass a known codec
+compatibility restriction. Set one in your `.env`:
 
 ```bash
 QUASAR_ENCODER=vulkan
@@ -55,12 +56,43 @@ floor and stays on Vulkan regardless, with an error in the log.
 HEVC pins the compositor ring to two slots automatically, which works around a
 tiling defect on affected NVIDIA hardware. AV1 needs no such override.
 
-<Aside type="caution" title="Vulkan does not work on a driver-volume NVIDIA host">
-If your NVIDIA host uses automatic driver-volume provisioning instead of a full
-driver install, some driver versions cannot supply a Vulkan ICD the compositor
-can use. Set `QUASAR_ENCODER=nvenc` there. Admin, Fleet, Hosts reports the gap
-rather than claiming Vulkan works.
+### AV1 driver compatibility
+
+RTX 5090 (PCI ID `10de:2b85`) with NVIDIA **595.99.02** produced corrupted Vulkan
+AV1 video in both a standalone encoder test and a browser stream. The same GPU
+and encoder plugin produced clean output with **610.57.04**, including on Unraid
+with manually installed open kernel modules. This concerns host **encoding**, not
+browser AV1 decoding. 610.57.04 is a validated working version; these tests do not
+establish a universal minimum driver version for every GPU.
+
+Codec advertisements are currently host-wide. With the Vulkan or NVENC encoder,
+the protection removes AV1 from the host’s offered codecs when any visible
+render device matches the affected combination, including on a mixed-GPU host.
+It explains the restriction in host readiness. Session selection can then use
+HEVC or H.264 where the profile and client support them. An AV1-only configuration
+has no eligible codec; it must allow another codec or use a compatible host.
+
+Quasar does **not** route this restriction through NVENC AV1. That path has a
+separate teardown fault. Selecting `nvenc` or disabling `QUASAR_VULKAN_AV1` does
+not bypass the restriction. Unlisted GPU/driver combinations remain eligible;
+that is not a claim that each has been visually validated.
+
+After installing a host driver update, recreate the agent container and check its
+reported driver and codecs. Quasar reassesses compatibility at startup. On Unraid,
+confirm that the package supplies the open kernel modules required by the GPU;
+package availability depends on the Unraid kernel version.
+
+<Aside type="note" title="Release availability">
+This automatic restriction is part of the first-install recovery delivery.
+Check your release notes for the AV1 compatibility change: landing the source on
+`develop` does not update an existing installation. On an older release, select
+HEVC or H.264 explicitly before launching on the affected driver.
 </Aside>
+
+Automatic driver-volume provisioning can supply missing container libraries,
+including the Vulkan ICD; it does not replace the host kernel driver. A provisioned
+volume alone is not a reason to switch to NVENC. Check the host’s readiness
+findings if the Vulkan loader cannot initialize.
 
 ## VA-API
 
@@ -73,7 +105,8 @@ variant that exists only here.
 
 NVIDIA's own encoder. Faster to reach for historically, but the driver fault
 above is why it is no longer the default. Set `QUASAR_ENCODER=nvenc` if you want
-it, or if you are on a driver-volume host where Vulkan cannot work.
+it for a specific validated use case. It is not the automatic fallback for the
+AV1 driver restriction above.
 
 ## openh264
 

@@ -68,8 +68,11 @@ Encode and network looked clean, and the client still presented frames unevenly.
 
 ### `nominal`
 
-Nothing measurable was wrong. If it still feels bad, the likely candidates are
-input latency rather than video, or the game's own frame pacing.
+The available timing and transport measurements did not identify a fault. This
+is not a visual-quality certificate: decoded frames and high FPS can coexist with
+corrupted pixels, and missing browser evidence limits the result. If the picture
+is damaged, compare codecs and check
+[driver compatibility](/quasar/tuning/encoders/#av1-driver-compatibility).
 
 ## Reading the numbers yourself
 

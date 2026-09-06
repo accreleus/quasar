@@ -118,7 +118,10 @@ export function buildOptionSpace(
   recommendedId: string,
 ): OptionSpace {
   const autoEntries: OptionEntry[] = profiles.map((p) => {
-    const topRung = orderedRungs(p)[0];
+    const rungs = orderedRungs(p);
+    // Preview only a codec the current evaluation permits. Placement still
+    // owns the final choice; Auto never sends an explicit codec override.
+    const topRung = rungs.find((r) => r.eligibility !== "ineligible" && decodable(r.codec, codecCaps)) ?? rungs[0];
     return {
       codec: topRung?.codec ?? "h264",
       width: p.nominal.width,
