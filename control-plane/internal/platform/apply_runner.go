@@ -33,6 +33,10 @@ const (
 	// How often the drain is re-counted, and how often a sent attempt is
 	// re-read for a terminal state written by the relay.
 	DefaultApplyPoll = 2 * time.Second
+	// How long an apply waits for its host's agent to be connected before it
+	// gives up. A fleet run adopted after the control plane recreated itself
+	// reaches its first host while every agent is still reconnecting.
+	DefaultConnectWait = 60 * time.Second
 )
 
 // applyStore is the persistence the machine needs, as an interface so it is
@@ -79,6 +83,9 @@ type ApplyDeps struct {
 	// Send dispatches release_apply and waits for the ack. ctx carries the ack
 	// timeout, so a context.DeadlineExceeded IS the "old agent" signal.
 	Send func(ctx context.Context, hostID string, cmd ApplyCommand) (Ack, error)
+	// Connected reports whether this host's agent is on the wire right now.
+	// Nil reads as connected, which sends and lets the send's own error decide.
+	Connected func(hostID string) bool
 }
 
 // Runner drives every in-flight attempt. Its state is the goroutine set and the
@@ -92,6 +99,7 @@ type Runner struct {
 	AckTimeout   time.Duration
 	Deadline     time.Duration
 	PollInterval time.Duration
+	ConnectWait  time.Duration
 
 	mu sync.Mutex
 	// attempt id → cancel. Bounded by the open attempts, which the database
@@ -120,6 +128,7 @@ func NewRunner(store applyStore, deps ApplyDeps, log *slog.Logger) *Runner {
 		AckTimeout:   DefaultAckTimeout,
 		Deadline:     DefaultApplyDeadline,
 		PollInterval: DefaultApplyPoll,
+		ConnectWait:  DefaultConnectWait,
 		running:      make(map[string]context.CancelFunc),
 		unsupported:  make(map[string]bool),
 		baseCtx:      ctx,
@@ -228,7 +237,16 @@ func (r *Runner) drive(ctx context.Context, a Attempt) {
 			return
 		}
 	}
-	defer r.restoreCordon(hostID, wasCordoned)
+	// A fleet run owns the scheduling state of every host it touches: it
+	// cordoned the fleet before its control-plane step and restores every
+	// cordon from its own record when it finishes. This attempt still cordons
+	// a host that is serving (a disconnect/register cycle can have lifted the
+	// run's cordon), but the restore is the run's: done here too, it read the
+	// run's cordon as an admin's and re-applied it milliseconds after the run
+	// had lifted it (#140).
+	if a.RunID == nil {
+		defer r.restoreCordon(hostID, wasCordoned)
+	}
 
 	// A re-adopted attempt that was already sent skips straight to watching:
 	// its request id is persisted, so the relay can still resolve it.
@@ -300,6 +318,15 @@ func (r *Runner) prepareAndSend(ctx context.Context, a Attempt, hostID string) b
 		release = ReleaseRef{ID: rel.ID, Version: rel.Version, SourceCommit: rel.SourceCommit}
 	}
 
+	// An agent that is not on the wire yet is not an agent that failed: after a
+	// control-plane recreate every agent reconnects a beat later, and sending
+	// into that gap is what made a whole fleet run fail on its first host.
+	if !r.waitConnected(ctx, hostID) {
+		r.log.Warn("apply: the host's agent did not reconnect in time", "attempt_id", a.ID, "host_id", hostID)
+		r.fail(a.ID, ReasonTimeout, "")
+		return false
+	}
+
 	ackCtx, cancel := context.WithTimeout(ctx, r.AckTimeout)
 	ack, err := r.deps.Send(ackCtx, hostID, ApplyCommand{
 		RequestID:  requestID,
@@ -318,8 +345,10 @@ func (r *Runner) prepareAndSend(ctx context.Context, a Attempt, hostID string) b
 		r.fail(a.ID, ReasonUnsupported, "")
 		return false
 	case err != nil:
+		// Never updater_unreachable: that is the AGENT's word for its own
+		// socket, and this is the control plane failing to reach the agent.
 		r.log.Error("apply: could not deliver release_apply", "attempt_id", a.ID, "host_id", hostID, "err", err)
-		r.fail(a.ID, ReasonUpdaterUnreachable, "")
+		r.fail(a.ID, ReasonTimeout, err.Error())
 		return false
 	case !ack.OK:
 		reason := ack.Error
@@ -338,6 +367,30 @@ func (r *Runner) prepareAndSend(ctx context.Context, a Attempt, hostID string) b
 	r.log.Info("apply: accepted by the agent", "attempt_id", a.ID, "host_id", hostID,
 		"request_id", requestID, "force", a.Force)
 	return true
+}
+
+// waitConnected blocks until the host's agent is on the wire, the deadline
+// passes, or the process shuts down. False means the attempt should be failed.
+func (r *Runner) waitConnected(ctx context.Context, hostID string) bool {
+	if r.deps.Connected == nil {
+		return true
+	}
+	deadline := time.Now().Add(r.ConnectWait)
+	for {
+		if r.deps.Connected(hostID) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			// A shutdown or the apply deadline; the caller's own handling is
+			// what decides, so this is not a connection failure.
+			return false
+		case <-time.After(r.PollInterval):
+		}
+	}
 }
 
 // watch waits for the relay or the register hook to resolve the attempt, and
@@ -392,9 +445,10 @@ func (r *Runner) restoreCordon(hostID string, wasCordoned bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if wasCordoned {
-		// An admin's cordon is restored, not lifted — and the new agent's
-		// register flips the row back to online, so this is a real re-cordon
-		// rather than a no-op.
+		// An admin's cordon is restored, not lifted. The new agent's register
+		// keeps a draining row draining (#140), so this is usually a no-op —
+		// it is real when the agent's disconnect was observed and flipped the
+		// row offline before it came back online.
 		if err := r.deps.Cordon(ctx, hostID); err != nil {
 			r.log.Warn("apply: could not restore the admin cordon", "host_id", hostID, "err", err)
 		}

@@ -618,6 +618,21 @@ function ManualPath({
   );
 }
 
+/** A target's readiness for the newest listed release. `up_to_date` is not a
+ *  fault: a current instance is ineligible for the release it is already on,
+ *  and "not ready" reads as a fault on a healthy fleet. */
+function TargetChip({ target }: { target: PlatformReleaseTarget }) {
+  if (target.eligible) {
+    return (
+      <Chip variant="success" dot>
+        Ready
+      </Chip>
+    );
+  }
+  if (target.reason === "up_to_date") return <Chip variant="neutral">Up to date</Chip>;
+  return <Chip variant="neutral">Not ready</Chip>;
+}
+
 function TargetsCard({
   view,
   refreshKey,
@@ -656,11 +671,7 @@ function TargetsCard({
       render: (t) => {
         const open = attemptForTarget(attempts, t);
         if (open) return <AttemptProgress attempt={open} />;
-        return t.eligible ? (
-          <Chip variant="success">Ready</Chip>
-        ) : (
-          <Chip variant="neutral">Not ready</Chip>
-        );
+        return <TargetChip target={t} />;
       },
     },
     {
@@ -706,17 +717,7 @@ function TargetsCard({
       </p>
       <div className="mt3">
         <Fact label="Control plane">
-          {cp ? (
-            cp.eligible ? (
-              <Chip variant="success" dot>
-                Ready
-              </Chip>
-            ) : (
-              <Chip variant="neutral">Not ready</Chip>
-            )
-          ) : (
-            <span className="muted">—</span>
-          )}
+          {cp ? <TargetChip target={cp} /> : <span className="muted">—</span>}
         </Fact>
         <Fact label="Node agents">
           <span className="rowflex" style={{ alignItems: "center" }}>

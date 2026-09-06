@@ -260,6 +260,42 @@ func (s *Store) OpenControlPlaneAttempt(ctx context.Context) (Attempt, string, e
 	return a, *commit, nil
 }
 
+// SetCordonedHosts records what the run found before it cordoned. Persisted,
+// not held in memory: the run's first target restarts this process (migration
+// 0076).
+func (s *Store) SetCordonedHosts(ctx context.Context, runID string, states []HostCordon) error {
+	raw, err := json.Marshal(states)
+	if err != nil {
+		return fmt.Errorf("encode cordoned_hosts: %w", err)
+	}
+	_, err = s.pool.Exec(ctx,
+		`UPDATE platform_apply_runs SET cordoned_hosts = $2::jsonb WHERE id = $1::uuid`, runID, raw)
+	if err != nil {
+		return fmt.Errorf("set cordoned_hosts: %w", err)
+	}
+	return nil
+}
+
+// CordonedHosts reads that record back.
+func (s *Store) CordonedHosts(ctx context.Context, runID string) ([]HostCordon, error) {
+	var raw []byte
+	err := s.pool.QueryRow(ctx,
+		`SELECT cordoned_hosts FROM platform_apply_runs WHERE id = $1::uuid`, runID).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrRunNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read cordoned_hosts: %w", err)
+	}
+	out := make([]HostCordon, 0)
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return nil, fmt.Errorf("decode cordoned_hosts: %w", err)
+		}
+	}
+	return out, nil
+}
+
 // FleetNonTerminalSessions counts what a CONTROL-PLANE apply would end: every
 // session on the instance, not one host's. Recreating the control plane drops
 // every agent's connection, and an agent stops its sessions when that

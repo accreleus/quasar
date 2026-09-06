@@ -24,6 +24,50 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+## 0.2.3 — 2026-09-06
+
+### Fixed
+
+- **A fleet update no longer re-cordons each host moments after it finishes (#140,
+  second half).** The per-host apply inside a fleet run found the host already draining
+  — the run's own cordon — took it for an admin's, and restored it a few milliseconds
+  after the run had lifted it, so 0.2.2 still ended with the host `draining`. An apply
+  that belongs to a fleet run now leaves the restore to the run. Found on the 0.2.2 gate.
+
+## 0.2.2 — 2026-09-06
+
+### Fixed
+
+- **A fleet update from v0.2.0 no longer leaves every host `draining` when it
+  finishes (#140).** The v0.2.0 control plane cordoned the fleet with nothing to record
+  it in; when the new control plane picked the run up it found every host draining, took
+  that for the operator's intent, and "restored" the cordons at the end — the run said
+  `succeeded` with zero hosts in scheduling. A run adopted with no cordon record now
+  treats every cordon as its own and lifts them all; a run adopted with a record
+  re-cordons the hosts it owns (the old code only claimed to). An agent's re-register
+  also no longer lifts a cordon: `draining` stays `draining` until an admin or the run
+  uncordons it, so a cordon survives the control plane's own restart. Found on the
+  first real `v0.2.0` → `v0.2.1` update.
+
+## 0.2.1 — 2026-09-05
+
+### Fixed
+
+- **A fleet update no longer fails on the first host right after the control plane
+  updates itself (#117).** When the new control plane came back and picked the run up,
+  it moved to the first host before the agents had reconnected, recorded the miss as
+  `updater_unreachable` and failed the run. An apply now waits for the host's agent to
+  be connected (up to 60 s) before sending, a re-adopted run pauses briefly before its
+  first host, and an unreachable agent is reported as `timeout`. Found on the first real
+  fleet update, `v0.2.0-rc.2` → `v0.2.0`.
+- **A failed fleet run no longer leaves hosts cordoned (#117).** The hosts' pre-run
+  cordon state was held in memory and lost across the control plane's own restart. It is
+  now recorded on the run (migration 0076, `platform_apply_runs.cordoned_hosts`) and
+  restored on every terminal path; a host still draining afterwards is logged as an
+  error.
+- **The Releases tab's Targets rail says "Up to date" for a current control plane (#104)**
+  instead of "Not ready".
+
 ## 0.2.0 — 2026-09-05
 
 ### Security

@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -553,9 +554,10 @@ func TestUnknownAckReasonIsStoredVerbatim(t *testing.T) {
 	}
 }
 
-// A delivery failure is not silence: the agent could not be reached, which is
-// updater_unreachable, and it must NOT mark the host as predating the amendment.
-func TestDeliveryFailureIsUpdaterUnreachable(t *testing.T) {
+// A delivery failure is not silence: the control plane could not reach the
+// agent. NOT updater_unreachable, which is the agent's word for its own socket,
+// and it must NOT mark the host as predating the amendment.
+func TestDeliveryFailureIsATimeout(t *testing.T) {
 	a := queuedAttempt(true)
 	store := newFakeStore(a)
 	agent := &fakeAgent{err: errors.New("agent not connected")}
@@ -564,12 +566,111 @@ func TestDeliveryFailureIsUpdaterUnreachable(t *testing.T) {
 
 	r.Start(a)
 	waitFor(t, "the attempt to fail", func() bool { return store.snapshot(a.ID).State == AttemptFailed })
-	if got := *store.snapshot(a.ID).Reason; got != ReasonUpdaterUnreachable {
-		t.Errorf("reason = %q, want updater_unreachable", got)
+	if got := *store.snapshot(a.ID).Reason; got != ReasonTimeout {
+		t.Errorf("reason = %q, want timeout", got)
 	}
 	if !r.Supported(testHostID) {
 		t.Error("a delivery failure must not read as an old agent")
 	}
 }
 
+// The live #117 failure: a fleet run re-adopted after the control plane
+// recreated itself reached its first host while every agent was still
+// reconnecting, and the send failed instantly.
+func TestApplyWaitsForTheAgentToReconnect(t *testing.T) {
+	a := queuedAttempt(true)
+	store := newFakeStore(a)
+	agent := &fakeAgent{ack: Ack{OK: true}}
+	deps := agent.deps()
+	var connected atomic.Bool
+	deps.Connected = func(string) bool { return connected.Load() }
+	r := testRunner(store, deps)
+	r.ConnectWait = 3 * time.Second
+	defer r.Close()
+
+	r.Start(a)
+	// Nothing goes out while the agent is off the wire.
+	time.Sleep(20 * time.Millisecond)
+	if agent.sentCount() != 0 {
+		t.Fatal("release_apply was sent to a host with no agent connected")
+	}
+	connected.Store(true)
+	waitFor(t, "the apply to be sent once the agent is back", func() bool { return agent.sentCount() == 1 })
+}
+
+func TestApplyTimesOutWhenTheAgentNeverReconnects(t *testing.T) {
+	a := queuedAttempt(true)
+	store := newFakeStore(a)
+	agent := &fakeAgent{ack: Ack{OK: true}}
+	deps := agent.deps()
+	deps.Connected = func(string) bool { return false }
+	r := testRunner(store, deps)
+	r.ConnectWait = 20 * time.Millisecond
+	defer r.Close()
+
+	r.Start(a)
+	waitFor(t, "the attempt to fail", func() bool { return store.snapshot(a.ID).State == AttemptFailed })
+	if got := *store.snapshot(a.ID).Reason; got != ReasonTimeout {
+		t.Errorf("reason = %q, want timeout", got)
+	}
+	if agent.sentCount() != 0 {
+		t.Error("release_apply was sent to a host that never reconnected")
+	}
+}
+
 func strPtr(s string) *string { return &s }
+
+// #140: an attempt that belongs to a fleet run leaves the cordon to the run.
+// The run cordoned this host before its control-plane step, so the attempt
+// finds it draining; restoring "the admin's cordon" here re-cordoned the host
+// right after the run's own restore had lifted it.
+func TestARunOwnedAttemptLeavesTheCordonToTheRun(t *testing.T) {
+	a := queuedAttempt(true)
+	run := "44444444-4444-4444-8444-444444444444"
+	a.RunID = &run
+	store := newFakeStore(a)
+	store.status = "draining"
+	agent := &fakeAgent{ack: Ack{OK: true}}
+	r := testRunner(store, agent.deps())
+	defer r.Close()
+
+	r.Start(a)
+	waitFor(t, "release_apply to be sent", func() bool { return agent.sentCount() == 1 })
+	commit := testCommit
+	r.HandleRegister(context.Background(), testHostID, &commit)
+	waitFor(t, "the attempt to succeed", func() bool { return store.snapshot(a.ID).State == AttemptSucceeded })
+
+	// Long enough for a deferred restore to have run, had there been one.
+	time.Sleep(20 * time.Millisecond)
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	if agent.cordons != 0 || agent.uncordon != 0 {
+		t.Fatalf("cordon calls = %d cordon / %d uncordon, want none: the run restores its own cordons", agent.cordons, agent.uncordon)
+	}
+}
+
+// The same attempt on a host the run's cordon no longer covers (a disconnect
+// then a register flipped it offline → online) still drains it before the
+// apply — and still leaves the restore to the run.
+func TestARunOwnedAttemptStillCordonsAServingHost(t *testing.T) {
+	a := queuedAttempt(true)
+	run := "44444444-4444-4444-8444-444444444444"
+	a.RunID = &run
+	store := newFakeStore(a)
+	agent := &fakeAgent{ack: Ack{OK: true}}
+	r := testRunner(store, agent.deps())
+	defer r.Close()
+
+	r.Start(a)
+	waitFor(t, "release_apply to be sent", func() bool { return agent.sentCount() == 1 })
+	commit := testCommit
+	r.HandleRegister(context.Background(), testHostID, &commit)
+	waitFor(t, "the attempt to succeed", func() bool { return store.snapshot(a.ID).State == AttemptSucceeded })
+
+	time.Sleep(20 * time.Millisecond)
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	if agent.cordons != 1 || agent.uncordon != 0 {
+		t.Fatalf("cordon calls = %d cordon / %d uncordon, want 1 / 0", agent.cordons, agent.uncordon)
+	}
+}

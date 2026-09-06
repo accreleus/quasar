@@ -885,6 +885,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 			})
 			return platform.Ack{OK: ack.OK, Error: ack.Error}, err
 		},
+		Connected: agentRegistry.IsConnected,
 	}, log)
 	agentHandler.SetReleaseEvents(releaseEventsAdapter{runner: applyRunner})
 	// An edge release stores no manifest, so its digest is resolved from the

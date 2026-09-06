@@ -38,7 +38,8 @@ const (
 
 // DrainHost cordons a host: online → draining, so the scheduler (which places
 // only on `online`) stops putting sessions on it. A stable administrative state —
-// an admin uncordons it, or an agent disconnect flips it offline. Race-safe by
+// an admin uncordons it, or an agent disconnect flips it offline; the agent's own
+// re-register does not lift it (#140). Race-safe by
 // construction: a launch that already read status='online' may complete, but any
 // pick after the status commits excludes the host.
 //

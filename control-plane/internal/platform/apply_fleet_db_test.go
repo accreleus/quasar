@@ -110,11 +110,20 @@ func newFleetHarness(t *testing.T, cpCommit string, drivers interface {
 		}), nil
 	}
 
-	noCordons := FleetCordons{
-		Cordon:   func(context.Context, string) error { return nil },
-		Uncordon: func(context.Context, string) error { return nil },
+	// Real cordons: they move hosts.status, which is what the restore is read
+	// back from.
+	cordons := FleetCordons{
+		Cordon: func(ctx context.Context, hostID string) error {
+			_, err := pool.Exec(ctx, `UPDATE hosts SET status='draining' WHERE id = $1::uuid`, hostID)
+			return err
+		},
+		Uncordon: func(ctx context.Context, hostID string) error {
+			_, err := pool.Exec(ctx, `UPDATE hosts SET status='online' WHERE id = $1::uuid`, hostID)
+			return err
+		},
 	}
-	h.fleet = NewFleetRunner(store, drivers, drivers, ManifestOrEdge{}, noCordons, view, testLogger())
+	h.fleet = NewFleetRunner(store, drivers, drivers, ManifestOrEdge{}, cordons, view, testLogger())
+	h.fleet.AdoptSettle = time.Millisecond
 	h.fleet.PollWait = 5 * time.Millisecond
 	t.Cleanup(h.fleet.Close)
 
@@ -301,18 +310,14 @@ func TestFleetRunsHistoryAndCancel(t *testing.T) {
 		t.Fatalf("attempts = %+v, want the unsent one cancelled", cancelled.Attempts)
 	}
 	// Idempotent while the run is still active; once the run has stopped there
-	// is nothing left to stop, which is its own refusal.
-	current, err := h.store.Run(context.Background(), run.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// is nothing left to stop, which is its own refusal. The run is winding down
+	// concurrently, so either answer is right — what is wrong is anything else.
 	code, raw = h.do(t, http.MethodPost, "/v1/admin/platform/apply/runs/"+run.ID+"/cancel", h.admin, nil)
-	if TerminalRunState(current.State) {
-		if code != http.StatusConflict || errCode(t, raw) != CodeRunNotActive {
-			t.Fatalf("cancel of a finished run = %d %s, want 409 run_not_active", code, raw)
-		}
-	} else if code != http.StatusOK {
-		t.Fatalf("second cancel = %d %s, want a 200 no-op", code, raw)
+	switch {
+	case code == http.StatusOK:
+	case code == http.StatusConflict && errCode(t, raw) == CodeRunNotActive:
+	default:
+		t.Fatalf("second cancel = %d %s, want a 200 no-op or 409 run_not_active", code, raw)
 	}
 
 	if code, _ := h.do(t, http.MethodGet, "/v1/admin/platform/apply/runs/"+testRunID, h.admin, nil); code != http.StatusNotFound {
@@ -374,4 +379,105 @@ func TestFleetRunIsAdoptedAfterARestart(t *testing.T) {
 	if attempts[1].RunID == nil || *attempts[1].RunID != run.ID {
 		t.Fatal("the host attempt does not name its run")
 	}
+}
+
+// The live #117 failure: a run's control-plane step restarts this process, so
+// the pre-run scheduling state cannot live in its memory. A failed run left
+// both hosts `draining` with nothing left that knew to lift it.
+func TestFleetRestoresTheCordonAcrossARestart(t *testing.T) {
+	drivers := &succeedingDrivers{}
+	h := newFleetHarness(t, commitB, drivers)
+	drivers.store = h.store
+	ctx := context.Background()
+
+	// A second host, so the record has both shapes in it.
+	other := seedHost(t, h.pool, "gpu-fleet-02", commitA, "online")
+
+	run, err := h.store.CreateRun(ctx, h.release.ID, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What the previous process wrote before it cordoned and replaced itself.
+	if err := h.store.SetCordonedHosts(ctx, run.ID, []HostCordon{
+		{HostID: h.hostID, WasCordoned: false},
+		{HostID: other, WasCordoned: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, h.pool, `UPDATE hosts SET status='draining'`)
+	if err := h.store.SetRunTarget(ctx, run.ID, TargetControlPlane, nil); err != nil {
+		t.Fatal(err)
+	}
+	a, err := h.store.CreateControlPlaneAttempt(ctx, NewControlPlaneAttempt{
+		RunID: &run.ID, ReleaseID: &h.release.ID,
+		Requested: []ComponentDigest{{Name: ComponentControlPlane, Image: "x", Digest: "sha256:" + hex64}},
+		Previous:  []PreviousDigest{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.SucceedAttempt(ctx, a.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// A NEW sequencer over the same database, as the next boot builds.
+	h.fleet.Adopt(ctx)
+	waitFor(t, "the adopted run to finish", func() bool {
+		r, err := h.store.Run(ctx, run.ID)
+		return err == nil && TerminalRunState(r.State)
+	})
+
+	// The run's own cordon is lifted whatever the outcome; the operator's stays.
+	// The restore runs after the terminal write, so it is waited for rather than
+	// read straight after.
+	waitFor(t, "the run's cordon to be lifted", func() bool {
+		status, err := h.store.HostStatus(ctx, h.hostID)
+		return err == nil && status == "online"
+	})
+	if status, err := h.store.HostStatus(ctx, other); err != nil || status != "draining" {
+		t.Fatalf("the operator's cordon = %q (%v), want it left in place", status, err)
+	}
+}
+
+// The #140 incident: a v0.2.0 control plane started the run, cordoned the fleet
+// and recreated itself before migration 0076 existed, so the adopting process
+// finds every host draining and NO record. Inferring the operator's intent from
+// those statuses left the whole fleet out of scheduling at finish.
+func TestFleetAdoptedWithNoCordonRecordLeavesTheFleetOnline(t *testing.T) {
+	drivers := &succeedingDrivers{}
+	h := newFleetHarness(t, commitB, drivers)
+	drivers.store = h.store
+	ctx := context.Background()
+
+	other := seedHost(t, h.pool, "gpu-fleet-02", commitA, "online")
+
+	run, err := h.store.CreateRun(ctx, h.release.ID, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The old process cordoned the fleet and had no column to record it in.
+	mustExec(t, h.pool, `UPDATE hosts SET status='draining'`)
+	mustExec(t, h.pool, `UPDATE platform_apply_runs SET cordoned_hosts = '[]'::jsonb`)
+	if err := h.store.SetRunTarget(ctx, run.ID, TargetControlPlane, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Left open: the recreate is what ended that process.
+	if _, err := h.store.CreateControlPlaneAttempt(ctx, NewControlPlaneAttempt{
+		RunID: &run.ID, ReleaseID: &h.release.ID,
+		Requested: []ComponentDigest{{Name: ComponentControlPlane, Image: "x", Digest: "sha256:" + hex64}},
+		Previous:  []PreviousDigest{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	h.fleet.Adopt(ctx)
+	waitFor(t, "the adopted run to finish", func() bool {
+		r, err := h.store.Run(ctx, run.ID)
+		return err == nil && TerminalRunState(r.State)
+	})
+	waitFor(t, "the fleet to be back in scheduling", func() bool {
+		one, err1 := h.store.HostStatus(ctx, h.hostID)
+		two, err2 := h.store.HostStatus(ctx, other)
+		return err1 == nil && err2 == nil && one == "online" && two == "online"
+	})
 }

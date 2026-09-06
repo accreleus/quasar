@@ -22,7 +22,7 @@ they came from, how to retake them, and what is still worth adding.
 | `admin/users.mdx` | `admin-invites.png` | Registration mode and outstanding invites. |
 | `admin/releases.mdx` | `admin-releases.png` | The Releases tab: installed identity, the channel controls, and an instance with nothing available. |
 
-`admin-releases.png` should be retaken once a real published release with notes
+`admin-releases.png` should be — taken 2026-09-06 on a registry install running v0.2.0 with the real release notes.
 exists. The current shot is an instance that is already current, so the Available
 section reads as empty and neither the Targets table nor Apply history is in
 frame; the page is more useful when it has a release to show.
