@@ -24,6 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+## 0.2.4 — 2026-09-06
+
 ### Added
 
 - Steam preparation is enabled by default for supported Steam images, with a
