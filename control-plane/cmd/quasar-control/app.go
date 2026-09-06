@@ -489,6 +489,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	storageHandler := storage.NewHandler(homeProvider, auditStore)
 	cfgHandler := hostcfg.NewHandler(cfgStore, agentRegistry, sessionStore, auditStore)
 	settingsHandler := settings.NewHandler(settingsStore, auditStore)
+	settingsHandler.OnAllowedOriginsChanged = originResolver.Invalidate
 	invitesHandler := invites.NewHandler(invites.NewStore(pool), cfg.PublicBaseURL, auditStore)
 	enrollHandler := hostenroll.NewHandler(hostenroll.NewStore(pool), auditStore)
 	consoleHandler := console.NewHandler(consoleStore, agentRegistry, auditStore)

@@ -17,6 +17,10 @@ type Handler struct {
 	store                     *Store
 	OnSteamPreparationChanged func()
 
+	// Invalidate shared signaling/access-check policy after commit, before the
+	// PATCH response makes the new policy observable to the setup wizard.
+	OnAllowedOriginsChanged func()
+
 	// Called after a PATCH flips library_discovery_enabled false→true, and only
 	// then (wired in app.go to the discovery janitor's Nudge). A plain func
 	// field, not an import — internal/library imports settings, so importing
@@ -186,6 +190,10 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		slog.Error("update instance settings", "err", err)
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not update settings")
 		return
+	}
+
+	if patch.AllowedOrigins != nil && h.OnAllowedOriginsChanged != nil {
+		h.OnAllowedOriginsChanged()
 	}
 
 	// CHANGED KEY NAMES ONLY, never values. allowed_origins is operator text and

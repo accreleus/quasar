@@ -5,9 +5,16 @@ package settings
 
 import (
 	"context"
+	"encoding/json"
+	"github.com/accreleus/quasar/control-plane/internal/access"
+	"github.com/accreleus/quasar/control-plane/internal/auth"
+	"github.com/accreleus/quasar/control-plane/internal/origins"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestPatchAllowedOriginsRoundTrip — the operator path: a PATCH sets the
@@ -133,5 +140,77 @@ func assertOrigins(t *testing.T, what string, got, want []string) {
 	}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("%s: allowed_origins = %v, want %v", what, got, want)
+	}
+}
+
+// A browser reads the active policy, PATCHes its origin, and immediately reads
+// it again before leaving setup. No TTL sleep may be required in that sequence.
+func TestPatchAllowedOriginsImmediatelyUpdatesAccessCheck(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	store := NewStore(pool)
+	must(t, store.Seed(ctx, RegistrationClosed))
+	authSvc, err := auth.NewService(pool, auth.DefaultParams(), time.Hour)
+	must(t, err)
+	_, err = authSvc.Register(ctx, "origin-admin@t.local", "originadmin", "password12345")
+	must(t, err)
+	must(t, execT(ctx, pool, `UPDATE users SET role='admin' WHERE email='origin-admin@t.local'`))
+	token, err := authSvc.Login(ctx, "origin-admin@t.local", "password12345", "test")
+	must(t, err)
+	authHandler := auth.NewHandler(authSvc)
+	admin := func(next http.Handler) http.Handler { return authHandler.RequireAuth(authHandler.RequireAdmin(next)) }
+	resolver := origins.NewResolver("", false, store, slog.Default())
+	handler := NewHandler(store)
+	handler.OnAllowedOriginsChanged = resolver.Invalidate
+	mux := http.NewServeMux()
+	handler.Register(mux, admin)
+	access.NewService(nil, resolver, slog.Default()).Register(mux, admin)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	request := func(method, path, body string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(method, srv.URL+path, strings.NewReader(body))
+		must(t, err)
+		req.Header.Set("Authorization", "Bearer "+token.Plaintext)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		must(t, err)
+		return resp
+	}
+	check := func(want []string) {
+		t.Helper()
+		resp := request(http.MethodGet, "/v1/admin/access-check", "")
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("access check: %d", resp.StatusCode)
+		}
+		var body struct {
+			Origins struct {
+				Source  string   `json:"source"`
+				Allowed []string `json:"allowed"`
+			} `json:"origins"`
+		}
+		must(t, json.NewDecoder(resp.Body).Decode(&body))
+		if body.Origins.Source != "database" {
+			t.Fatalf("source = %q", body.Origins.Source)
+		}
+		assertOrigins(t, "immediate access check", body.Origins.Allowed, want)
+	}
+	check(nil) // primes the shared resolver cache with the previous policy
+	for _, tc := range []struct {
+		body   string
+		status int
+		want   []string
+	}{
+		{`{"allowed_origins":["https://play.example.test"]}`, http.StatusOK, []string{"https://play.example.test"}},
+		{`{"allowed_origins":["*"]}`, http.StatusBadRequest, []string{"https://play.example.test"}},
+		{`{"allowed_origins":[]}`, http.StatusOK, nil},
+	} {
+		resp := request(http.MethodPatch, "/v1/admin/settings", tc.body)
+		resp.Body.Close()
+		if resp.StatusCode != tc.status {
+			t.Fatalf("PATCH: got %d want %d", resp.StatusCode, tc.status)
+		}
+		check(tc.want)
 	}
 }
