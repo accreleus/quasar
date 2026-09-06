@@ -1,0 +1,71 @@
+---
+title: Preparing Steam for first launch
+description: Background preparation, per-host status and storage behavior for new Steam homes.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="note" title="Upcoming release">
+This describes the new Steam preparation policy. Earlier releases require
+advanced host flags and do not provide the complete source setting or status view.
+</Aside>
+
+## What preparation does
+
+Quasar starts Steam in a temporary home after installation or updates, allows its
+bootstrap work to settle, then publishes sanitized, account-independent files for
+new users' first launches. It runs in the background and yields to user sessions.
+A failed or unfinished preparation does not prevent launching Steam normally.
+
+Only explicitly supported Steam images are prepared automatically. Other apps
+keep their normal launch behavior. Preparing Steam does not install authenticated
+games, sign into your account, or share an existing user's home.
+
+## Control it from the Steam source
+
+Under **Library → Sources → Steam**, the **Prepare Steam for faster first launch**
+switch defaults to enabled. The switch controls preparation and use of prepared
+files together; it is separate from Steam discovery and importing games.
+
+Turning it off stops new preparation and seeding, and safely cancels preparation
+already running. Existing user homes, active sessions and published templates stay
+intact. Turning it on again checks images already installed and reuses a valid
+prepared version or schedules missing/stale preparation. You do not need to
+reinstall Steam to trigger that check.
+
+An older node agent may not understand the policy. Upgrade it before relying on
+the switch; a saved desired setting is not proof that every host has applied it.
+Explicit host opt-outs also remain effective after an upgrade. Check the effective
+per-host status when a saved enabled setting is not producing prepared homes.
+
+## Read the preparation status
+
+Image details report preparation per host, separately from image download
+readiness. Pending or running preparation is not a prepared home. Unsupported
+images and disabled policy are distinct; failed or skipped work carries a reason.
+A prepared version becomes ready only after successful publication.
+
+Quasar seeds only absent or empty managed homes. Each user gets an independent
+writable home, so changing one does not change another or the template. A home
+that already contains data is preserved and does not receive a fresh template.
+
+## Reflinks and full copies
+
+Clone mode defaults to **auto**. Quasar checks the filesystem through the paths
+it actually uses, selects reflinks when available, and otherwise performs a full
+copy. Image details identify the measured mode and fallback reason where known.
+Full-copy fallback still reuses prepared files, but does not promise reflink speed.
+
+A user-share filesystem can reject reflinks even when the underlying native pool
+supports them. If reflinks matter, use a suitable native filesystem path for the
+managed-home and template mounts when configuring deployment. Do not change those
+paths without planning preservation of existing user data. Quasar does not move
+that data, rewrite mounts or force reflinks automatically.
+
+## Advanced host opt-outs
+
+`QUASAR_TEMPLATE_WARMUP=0` disables template production on one host.
+`QUASAR_HOME_TEMPLATES=0` disables consumption there. An absent flag acquires the
+new enabled default; explicit opt-outs stay effective. Neither permission can
+force preparation when the Steam source switch is off or make another image
+supported. Ordinary deployments can use the source switch without these flags.

@@ -11,6 +11,7 @@ pub mod artifact;
 pub mod buildinfo;
 pub mod capacity;
 pub mod config;
+mod container_ownership;
 pub mod cp_http;
 pub mod cp_tls;
 /// Runtime-provisioned CUDA userspace (NVRTC) — what registers the `cuda*`
@@ -35,3 +36,5 @@ pub mod readiness;
 pub mod release;
 pub mod session;
 pub mod vram;
+
+pub mod source_policy;

@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"encoding/json"
 	"log/slog"
 	"net/http"
 
@@ -13,7 +14,8 @@ import (
 // Handler serves the admin instance-settings surface (LP-SEC-01 §B.1a):
 // GET / PATCH /v1/admin/settings. Both are RequireAuth→RequireAdmin.
 type Handler struct {
-	store *Store
+	store                     *Store
+	OnSteamPreparationChanged func()
 
 	// Called after a PATCH flips library_discovery_enabled false→true, and only
 	// then (wired in app.go to the discovery janitor's Nudge). A plain func
@@ -72,6 +74,8 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
+		SteamPreparationEnabled  json.RawMessage `json:"steam_preparation_enabled"`
+		SteamPreparationRevision json.RawMessage `json:"steam_preparation_revision"`
 		// Every field is a pointer: absence means unchanged, never a zero-value
 		// flip (a plain bool would silently switch discovery off on every
 		// unrelated save). Setting a library field does not lift an env
@@ -94,6 +98,19 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 	}
 	if !decodeJSON(w, r, &req) {
 		return
+	}
+	var steamPreparation *bool
+	if len(req.SteamPreparationRevision) > 0 {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "steam_preparation_revision is read-only")
+		return
+	}
+	if len(req.SteamPreparationEnabled) > 0 {
+		var value bool
+		if string(req.SteamPreparationEnabled) == "null" || json.Unmarshal(req.SteamPreparationEnabled, &value) != nil {
+			httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "steam_preparation_enabled must be a boolean")
+			return
+		}
+		steamPreparation = &value
 	}
 	// Validate every provided field up front so a bad value never applies a partial
 	// change (400 before any write).
@@ -137,6 +154,7 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 	// against, never the raw text — "what an admin saved" and "what /v1/signal
 	// enforces" cannot diverge. "*" and malformed entries are refused.
 	patch := Patch{
+		SteamPreparationEnabled:           steamPreparation,
 		RegistrationMode:                  req.RegistrationMode,
 		StorageProvider:                   req.StorageProvider,
 		LibraryDiscoveryEnabled:           req.LibraryDiscoveryEnabled,
@@ -176,6 +194,9 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 	audit.TryRecord(r.Context(), h.auditor, user.ID, "instance.settings.updated", "instance", "",
 		map[string]any{"keys": patch.ChangedKeys()})
 
+	if steamPreparation != nil && h.OnSteamPreparationChanged != nil {
+		h.OnSteamPreparationChanged()
+	}
 	// Side effects run only after commit, and only on the transition, not the
 	// value: a true→true re-save must not re-walk every home.
 	if req.LibraryDiscoveryEnabled != nil {

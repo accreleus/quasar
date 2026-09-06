@@ -7,12 +7,13 @@ package images
 import (
 	"context"
 	"errors"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
+	"github.com/accreleus/quasar/control-plane/internal/preparation"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // fakeEnqueuer records every warm-up enqueue an image_state produced.
@@ -64,269 +65,239 @@ func (q *fakeEnqueuer) count() int {
 	return len(q.calls)
 }
 
-// TestImageReadyEnqueuesTheWarmUp is the WP5 headline: this function is the ONE
-// place the control plane learns an image reached `ready` on a host, so it is
-// the one place the warm-up trigger belongs now that the schedule and the run
-// window live control-plane side.
-func TestImageReadyEnqueuesTheWarmUp(t *testing.T) {
-	pool := ensureDB(t)
+// Steam preparation is explicitly opted in by adopted identity, never HOME or
+// WorkingDir alone. These fixtures exercise the real policy migration/report path.
+const preparationRef = "ghcr.io/accreleus/quasar-steam@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+func seedPreparationImage(t *testing.T, pool *pgxpool.Pool, lazy bool) {
+	t.Helper()
 	seedCatalog(t, pool)
-	install(t, pool, false)
-	hostID := seedHost(t, pool, "host-a")
-
-	e := NewEnsurer(pool, newFleet(hostID), testLog())
-	defer e.Close()
-	q := newEnqueuer()
-	e.SetJobEnqueuer(q)
-
-	e.AgentImageState(context.Background(), hostID, agentws.ImageStateMsg{
-		ImageID: imgID, Version: imgVer, State: "ready",
-	})
-
-	c := q.wait(t)
-	if c.JobID != "template.warmup" {
-		t.Errorf("job id = %q, want template.warmup", c.JobID)
+	if _, err := pool.Exec(context.Background(), `INSERT INTO instance_settings(id) VALUES(true) ON CONFLICT DO NOTHING`); err != nil {
+		t.Fatal(err)
 	}
-	if c.HostID != hostID {
-		t.Errorf("host id = %q, want %q (the warm-up is host-scoped)", c.HostID, hostID)
+	if _, err := pool.Exec(context.Background(), `UPDATE image_catalog SET registry_ref=$1,library_provider='steam',runtime='{"managed_home":true,"home_container_path":"/home/quasar"}' WHERE id=$2`, preparationRef, imgID); err != nil {
+		t.Fatal(err)
 	}
-	// The params carry the ADOPTED ref, read back from installed_images rather
-	// than taken from the agent's report — the #440 lesson: a mutable tag must
-	// never be what a host boots.
-	if got := c.Params["registry_ref"]; got != imgRef {
-		t.Errorf("params registry_ref = %v, want the adopted ref %q", got, imgRef)
+	installAt(t, pool, lazy, imgVer, preparationRef)
+}
+func acknowledgePreparation(t *testing.T, pool *pgxpool.Pool, hostID string) string {
+	t.Helper()
+	ctx := preparation.ConnectionContext(context.Background())
+	store := preparation.New(pool)
+	if err := store.Register(ctx, hostID, map[string]int{"steam_preparation": 1}); err != nil {
+		t.Fatal(err)
 	}
-	if got := c.Params["image_id"]; got != imgID {
-		t.Errorf("params image_id = %v, want %q", got, imgID)
+	policy, err := store.Current(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := c.Params["version"]; got != imgVer {
-		t.Errorf("params version = %v, want %q", got, imgVer)
+	if len(policy.Images) != 1 {
+		t.Fatalf("expected one eligible adopted Steam image: %+v", policy)
+	}
+	if err = store.Report(ctx, hostID, &preparation.Reports{Steam: preparation.Report{PolicyRevision: policy.Revision, Images: []preparation.ImageReport{{Image: policy.Images[0], PreparationEnabled: true, ConsumptionEnabled: true, State: "waiting_image", Reason: "image_not_ready"}}}}); err != nil {
+		t.Fatal(err)
+	}
+	return policy.Revision
+}
+func expectPreparationParams(t *testing.T, c enqueueCall, hostID, revision string) {
+	t.Helper()
+	if c.JobID != "template.warmup" || c.HostID != hostID {
+		t.Fatalf("wrong scoped job: %+v", c)
+	}
+	if c.Params["image_id"] != imgID || c.Params["registry_ref"] != preparationRef || c.Params["version"] != imgVer || c.Params["policy_revision"] != revision {
+		t.Fatalf("job must carry exact adopted identity and acknowledged revision: %+v", c.Params)
 	}
 }
 
-// A template adoption carries a local_tag instead of a registry_ref, and the
-// warm-up must boot THAT — the same adoptedImageRef rule every dispatch uses.
-func TestImageReadyEnqueuesTheWarmUpWithATemplatesLocalTag(t *testing.T) {
-	pool := ensureDB(t)
-	seedTemplateCatalog(t, pool)
-	installTemplate(t, pool, false)
-	hostID := seedHost(t, pool, "host-a-tpl")
-
-	e := NewEnsurer(pool, newFleet(hostID), testLog())
-	defer e.Close()
-	q := newEnqueuer()
-	e.SetJobEnqueuer(q)
-
-	e.AgentImageState(context.Background(), hostID, agentws.ImageStateMsg{
-		ImageID: tplID, Version: tplVer, State: "ready",
-	})
-
-	c := q.wait(t)
-	if got := c.Params["registry_ref"]; got != tplLocalTag(tplVer) {
-		t.Errorf("params registry_ref = %v, want the frozen local tag %q", got, tplLocalTag(tplVer))
+func TestImageReadyEnqueuesTheWarmUp(t *testing.T) {
+	for _, lazy := range []bool{false, true} {
+		t.Run(map[bool]string{false: "ordinary", true: "already-present-lazy"}[lazy], func(t *testing.T) {
+			pool := ensureDB(t)
+			seedPreparationImage(t, pool, lazy)
+			hostID := seedHost(t, pool, "ready-steam")
+			revision := acknowledgePreparation(t, pool, hostID)
+			e := NewEnsurer(pool, newFleet(hostID), testLog())
+			defer e.Close()
+			q := newEnqueuer()
+			e.SetJobEnqueuer(q)
+			e.AgentImageState(context.Background(), hostID, agentws.ImageStateMsg{ImageID: imgID, Version: imgVer, State: "ready"})
+			expectPreparationParams(t, q.wait(t), hostID, revision)
+		})
 	}
 }
 
-// Only `ready` triggers a warm-up. A pull that is still running, or one that
-// failed, must not queue work for a host that has nothing to warm up.
+func TestUnsupportedReadyImagesDoNotPrepareEvenWithHomeMetadata(t *testing.T) {
+	for _, kind := range []string{"custom-repository", "template"} {
+		t.Run(kind, func(t *testing.T) {
+			pool := ensureDB(t)
+			ctx := context.Background()
+			if _, err := pool.Exec(ctx, `INSERT INTO instance_settings(id) VALUES(true) ON CONFLICT DO NOTHING`); err != nil {
+				t.Fatal(err)
+			}
+			imageID, version := imgID, imgVer
+			if kind == "template" {
+				seedTemplateCatalog(t, pool)
+				installTemplate(t, pool, false)
+				imageID, version = tplID, tplVer
+			} else {
+				seedCatalog(t, pool)
+				if _, err := pool.Exec(ctx, `UPDATE image_catalog SET library_provider='steam',runtime='{"managed_home":true,"home_container_path":"/home/quasar"}' WHERE id=$1`, imgID); err != nil {
+					t.Fatal(err)
+				}
+				installAt(t, pool, false, imgVer, "ghcr.io/example/custom-steam@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+			}
+			hostID := seedHost(t, pool, "unsupported-home")
+			if err := preparation.New(pool).Register(preparation.ConnectionContext(ctx), hostID, map[string]int{"steam_preparation": 1}); err != nil {
+				t.Fatal(err)
+			}
+			e := NewEnsurer(pool, newFleet(hostID), testLog())
+			defer e.Close()
+			q := newEnqueuer()
+			e.SetJobEnqueuer(q)
+			e.AgentImageState(ctx, hostID, agentws.ImageStateMsg{ImageID: imageID, Version: version, State: "ready"})
+			// Wait for the real decision without cancelling the lookup as Close would.
+			e.wg.Wait()
+			if q.count() != 0 {
+				t.Fatal("unsupported image queued preparation")
+			}
+			if _, err := e.WarmupParamsForHost(ctx, hostID); err == nil {
+				t.Fatal("manual trigger admitted unsupported image")
+			}
+		})
+	}
+}
+
+func TestPreparationReadyEventRequiresCurrentHostPermission(t *testing.T) {
+	cases := []struct{ name, change string }{
+		{"source-off", `UPDATE instance_settings SET steam_preparation_enabled=false,steam_preparation_revision=steam_preparation_revision+1`},
+		{"legacy-agent", `UPDATE hosts SET source_policy_versions=NULL`},
+		{"reconnected-unacknowledged", `UPDATE hosts SET source_preparation=NULL,source_preparation_reported_at=NULL`},
+		{"stale-acknowledgement", `UPDATE instance_settings SET steam_preparation_revision=steam_preparation_revision+1`},
+		{"host-opt-out", `UPDATE hosts SET source_preparation=jsonb_set(source_preparation,'{steam,images,0,preparation_enabled}','false')`},
+		{"offline", `UPDATE hosts SET status='offline'`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := ensureDB(t)
+			seedPreparationImage(t, pool, false)
+			hostID := seedHost(t, pool, "guarded-steam")
+			acknowledgePreparation(t, pool, hostID)
+			if _, err := pool.Exec(context.Background(), tc.change); err != nil {
+				t.Fatal(err)
+			}
+			e := NewEnsurer(pool, newFleet(hostID), testLog())
+			defer e.Close()
+			q := newEnqueuer()
+			e.SetJobEnqueuer(q)
+			e.AgentImageState(context.Background(), hostID, agentws.ImageStateMsg{ImageID: imgID, Version: imgVer, State: "ready"})
+			e.wg.Wait()
+			if q.count() != 0 {
+				t.Fatal("image ready bypassed source policy/host acknowledgement")
+			}
+			if _, err := e.WarmupParamsForHost(context.Background(), hostID); err == nil {
+				t.Fatal("manual trigger bypassed policy")
+			}
+		})
+	}
+}
+
 func TestNonReadyImageStatesDoNotEnqueueAWarmUp(t *testing.T) {
 	pool := ensureDB(t)
-	seedCatalog(t, pool)
-	install(t, pool, false)
-	hostID := seedHost(t, pool, "host-a-states")
-
-	// maxAttempts 0 so the `failed` state's retry path stays out of the way.
+	seedPreparationImage(t, pool, false)
+	hostID := seedHost(t, pool, "states-steam")
+	revision := acknowledgePreparation(t, pool, hostID)
 	e := NewEnsurer(pool, newFleet(hostID), testLog(), WithRetry(0, time.Second))
 	defer e.Close()
 	q := newEnqueuer()
 	e.SetJobEnqueuer(q)
-
-	ctx := context.Background()
 	for _, state := range []string{"pulling", "failed", "absent"} {
-		e.AgentImageState(ctx, hostID, agentws.ImageStateMsg{
-			ImageID: imgID, Version: imgVer, State: state,
-		})
+		e.AgentImageState(context.Background(), hostID, agentws.ImageStateMsg{ImageID: imgID, Version: imgVer, State: state})
+		e.wg.Wait()
+		if q.count() != 0 {
+			t.Fatalf("%s enqueued work before image ready", state)
+		}
 	}
-	// Then a real ready, whose enqueue is the synchronization point: if any of
-	// the three above had enqueued, it would be first out of the channel.
-	e.AgentImageState(ctx, hostID, agentws.ImageStateMsg{
-		ImageID: imgID, Version: imgVer, State: "ready",
-	})
-	c := q.wait(t)
-	if c.JobID != "template.warmup" {
-		t.Fatalf("first enqueue came from a non-ready state: %+v", c)
-	}
-	if n := q.count(); n != 1 {
-		t.Errorf("enqueue count = %d, want 1 (only `ready` triggers a warm-up)", n)
-	}
+	e.AgentImageState(context.Background(), hostID, agentws.ImageStateMsg{ImageID: imgID, Version: imgVer, State: "ready"})
+	expectPreparationParams(t, q.wait(t), hostID, revision)
 }
 
-// A LAZY adoption is never pushed to a host, so there is nothing to warm up —
-// and an image whose adoption vanished between the report and the lookup must
-// not resurrect a withdrawn ensure as a warm-up either.
-func TestALazyAdoptionDoesNotEnqueueAWarmUp(t *testing.T) {
-	pool := ensureDB(t)
-	seedCatalog(t, pool)
-	install(t, pool, true) // lazy
-	hostID := seedHost(t, pool, "host-a-lazy")
-
-	e := NewEnsurer(pool, newFleet(hostID), testLog())
-	defer e.Close()
-	q := newEnqueuer()
-	e.SetJobEnqueuer(q)
-
-	e.AgentImageState(context.Background(), hostID, agentws.ImageStateMsg{
-		ImageID: imgID, Version: imgVer, State: "ready",
-	})
-	// Close() waits for the trigger goroutine, so by the time it returns the
-	// decision has been made — no sleep needed.
-	e.Close()
-	if n := q.count(); n != 0 {
-		t.Errorf("enqueue count = %d, want 0 for a lazy adoption", n)
-	}
-}
-
-// THE BEST-EFFORT RULE. A warm-up is a background optimization: a dispatcher
-// that refuses the enqueue (jobs disabled, template.warmup not registered in
-// this build, a DB hiccup) must not affect the image_state ingest at all — the
-// host_images row still says ready.
 func TestAFailedWarmUpEnqueueDoesNotAffectTheImageState(t *testing.T) {
 	pool := ensureDB(t)
-	seedCatalog(t, pool)
-	install(t, pool, false)
-	hostID := seedHost(t, pool, "host-a-besteffort")
-
+	seedPreparationImage(t, pool, false)
+	hostID := seedHost(t, pool, "best-effort-steam")
+	acknowledgePreparation(t, pool, hostID)
 	e := NewEnsurer(pool, newFleet(hostID), testLog())
 	defer e.Close()
 	q := newEnqueuer()
-	q.err = errors.New("jobs: not found")
+	q.err = errors.New("jobs unavailable")
 	e.SetJobEnqueuer(q)
-
-	e.AgentImageState(context.Background(), hostID, agentws.ImageStateMsg{
-		ImageID: imgID, Version: imgVer, State: "ready",
-	})
+	e.AgentImageState(context.Background(), hostID, agentws.ImageStateMsg{ImageID: imgID, Version: imgVer, State: "ready"})
 	q.wait(t)
-
 	var state string
-	if err := pool.QueryRow(context.Background(),
-		`SELECT state FROM host_images WHERE host_id = $1::uuid AND image_id = $2`,
-		hostID, imgID).Scan(&state); err != nil {
-		t.Fatalf("read host_images: %v", err)
+	if err := pool.QueryRow(context.Background(), `SELECT state FROM host_images WHERE host_id=$1::uuid AND image_id=$2`, hostID, imgID).Scan(&state); err != nil {
+		t.Fatal(err)
 	}
 	if state != "ready" {
-		t.Errorf("host_images.state = %q, want ready — the warm-up trigger must never affect ingest", state)
+		t.Fatalf("background preparation changed installation readiness: %s", state)
 	}
 }
 
-// --- the MANUAL trigger's params resolver (jobs Definition.ResolveParams) ----
-
-// THE DEFECT THIS CLOSES: an admin's "Run now" on template.warmup carries no
-// image-ready event, so before the resolver the run was materialized with an
-// EMPTY params blob and the host failed it with `template.warmup params
-// incomplete (image_id="" registry_ref="" version="")`. The resolver reads the
-// same adoption rows the event path reads, so both send identical params.
 func TestWarmupParamsForHostResolvesTheAdoptedImage(t *testing.T) {
 	pool := ensureDB(t)
-	seedCatalog(t, pool)
-	install(t, pool, false)
-	hostID := seedHost(t, pool, "host-a-manual")
+	seedPreparationImage(t, pool, false)
+	hostID := seedHost(t, pool, "manual-steam")
+	revision := acknowledgePreparation(t, pool, hostID)
 	ctx := context.Background()
 	if _, err := upsertHostImage(ctx, pool, hostID, imgID, imgVer, "ready", "", nil); err != nil {
-		t.Fatalf("seed host_images ready: %v", err)
+		t.Fatal(err)
 	}
-
 	e := NewEnsurer(pool, newFleet(hostID), testLog())
 	defer e.Close()
-
 	got, err := e.WarmupParamsForHost(ctx, hostID)
 	if err != nil {
-		t.Fatalf("WarmupParamsForHost: %v", err)
+		t.Fatal(err)
 	}
-	p, ok := got.(map[string]any)
+	params, ok := got.(map[string]any)
 	if !ok {
-		t.Fatalf("params = %T, want map[string]any", got)
+		t.Fatalf("unexpected params type %T", got)
 	}
-	// Byte-for-byte the event path's three fields, including the ADOPTED ref
-	// (the #440 lesson: a mutable tag must never be what a host boots).
-	if p["image_id"] != imgID || p["registry_ref"] != imgRef || p["version"] != imgVer {
-		t.Errorf("params = %v, want image_id=%q registry_ref=%q version=%q",
-			p, imgID, imgRef, imgVer)
-	}
+	expectPreparationParams(t, enqueueCall{"template.warmup", hostID, params}, hostID, revision)
 }
 
-// A template adoption resolves to its frozen local tag here too — the manual
-// path must not diverge from the event path on the ref rule.
-func TestWarmupParamsForHostUsesATemplatesLocalTag(t *testing.T) {
-	pool := ensureDB(t)
-	seedTemplateCatalog(t, pool)
-	installTemplate(t, pool, false)
-	hostID := seedHost(t, pool, "host-a-manual-tpl")
-	ctx := context.Background()
-	if _, err := upsertHostImage(ctx, pool, hostID, tplID, tplVer, "ready", "", nil); err != nil {
-		t.Fatalf("seed host_images ready: %v", err)
-	}
-
-	e := NewEnsurer(pool, newFleet(hostID), testLog())
-	defer e.Close()
-
-	got, err := e.WarmupParamsForHost(ctx, hostID)
-	if err != nil {
-		t.Fatalf("WarmupParamsForHost: %v", err)
-	}
-	if ref := got.(map[string]any)["registry_ref"]; ref != tplLocalTag(tplVer) {
-		t.Errorf("registry_ref = %v, want the frozen local tag %q", ref, tplLocalTag(tplVer))
-	}
-}
-
-// A host with nothing ready REFUSES the trigger with a reason about the HOST,
-// rather than queueing a run that fails on the agent with a message about the
-// framework's own params.
 func TestWarmupParamsForHostRefusesAHostWithNothingReady(t *testing.T) {
 	pool := ensureDB(t)
-	seedCatalog(t, pool)
-	install(t, pool, false)
-	hostID := seedHost(t, pool, "host-a-manual-empty")
-
+	seedPreparationImage(t, pool, false)
+	hostID := seedHost(t, pool, "missing-steam")
+	acknowledgePreparation(t, pool, hostID)
+	ctx := context.Background()
 	e := NewEnsurer(pool, newFleet(hostID), testLog())
 	defer e.Close()
-
-	_, err := e.WarmupParamsForHost(context.Background(), hostID)
-	if err == nil {
-		t.Fatal("want an error for a host with no ready image")
+	if _, err := e.WarmupParamsForHost(ctx, hostID); err == nil {
+		t.Fatal("manual trigger accepted absent image")
 	}
-	if !strings.Contains(err.Error(), "nothing to warm up") {
-		t.Errorf("error = %q, want it to say there is nothing to warm up", err)
-	}
-	// And an image that is adopted but only PULLING is not ready either.
-	if _, err := upsertHostImage(context.Background(), pool, hostID, imgID, imgVer, "pulling", "", nil); err != nil {
-		t.Fatalf("seed host_images pulling: %v", err)
-	}
-	if _, err := e.WarmupParamsForHost(context.Background(), hostID); err == nil {
-		t.Error("a `pulling` image must not resolve as warm-up-able")
+	for _, state := range []string{"pulling", "failed"} {
+		if _, err := upsertHostImage(ctx, pool, hostID, imgID, imgVer, state, "", nil); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.WarmupParamsForHost(ctx, hostID); err == nil {
+			t.Fatalf("manual trigger accepted %s image", state)
+		}
 	}
 }
 
-// With no enqueuer wired (QUASAR_JOBS off, or a build that never registered the
-// job) the ingest path is byte-for-byte what it was before adoption.
 func TestNoEnqueuerWiredIsNotAnError(t *testing.T) {
 	pool := ensureDB(t)
-	seedCatalog(t, pool)
-	install(t, pool, false)
-	hostID := seedHost(t, pool, "host-a-noqueue")
-
+	seedPreparationImage(t, pool, false)
+	hostID := seedHost(t, pool, "no-queue-steam")
+	acknowledgePreparation(t, pool, hostID)
 	e := NewEnsurer(pool, newFleet(hostID), testLog())
 	defer e.Close()
-
-	e.AgentImageState(context.Background(), hostID, agentws.ImageStateMsg{
-		ImageID: imgID, Version: imgVer, State: "ready",
-	})
+	e.AgentImageState(context.Background(), hostID, agentws.ImageStateMsg{ImageID: imgID, Version: imgVer, State: "ready"})
 	var state string
-	if err := pool.QueryRow(context.Background(),
-		`SELECT state FROM host_images WHERE host_id = $1::uuid AND image_id = $2`,
-		hostID, imgID).Scan(&state); err != nil {
-		t.Fatalf("read host_images: %v", err)
+	if err := pool.QueryRow(context.Background(), `SELECT state FROM host_images WHERE host_id=$1::uuid AND image_id=$2`, hostID, imgID).Scan(&state); err != nil {
+		t.Fatal(err)
 	}
 	if state != "ready" {
-		t.Errorf("host_images.state = %q, want ready", state)
+		t.Fatalf("installation lost ready state without queue: %s", state)
 	}
 }

@@ -70,6 +70,8 @@ function renderImagesTab() {
 
 const settingsEnvelope: SettingsResponse = {
   settings: {
+    steam_preparation_enabled: true,
+    steam_preparation_revision: "1",
     registration_mode: "invite_only",
     storage_provider: "local",
     library_discovery_enabled: false,

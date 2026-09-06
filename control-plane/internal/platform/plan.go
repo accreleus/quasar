@@ -216,7 +216,7 @@ func controlPlaneReason(newest *Release, cp buildinfo.Identity, attemptOpen bool
 	if cp.SourceCommit == nil {
 		return ReasonIdentityUnknown
 	}
-	if commitsMatch(*cp.SourceCommit, newest.SourceCommit) {
+	if commitsMatch(*cp.SourceCommit, newest.SourceCommit) || edgeOlderThanInstalled(*newest, cp) {
 		return ReasonUpToDate
 	}
 	// Nothing beside this control plane could carry an apply out — and with no
@@ -243,6 +243,18 @@ func controlPlaneReason(newest *Release, cp buildinfo.Identity, attemptOpen bool
 		return ReasonRunActive
 	}
 	return ""
+}
+
+// edgeOlderThanInstalled refines ADR 0002 only within an equal schema version.
+// The installed binary's timestamp is authoritative even after switching from
+// stable: there may be no corresponding release row on the edge channel. Missing
+// timestamps preserve legacy advisory behavior, and newer schemas still win.
+func edgeOlderThanInstalled(release Release, cp buildinfo.Identity) bool {
+	if release.Channel != ChannelEdge || release.SchemaVersion != cp.SchemaVersion || cp.BuiltAt == nil {
+		return false
+	}
+	installedAt, err := time.Parse(time.RFC3339, *cp.BuiltAt)
+	return err == nil && !release.BuiltAt.IsZero() && release.BuiltAt.Before(installedAt)
 }
 
 // hostReason: "" means eligible. The contract fixes the precedence as the order

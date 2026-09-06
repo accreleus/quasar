@@ -31,6 +31,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/library"
 	"github.com/accreleus/quasar/control-plane/internal/origins"
 	"github.com/accreleus/quasar/control-plane/internal/platform"
+	"github.com/accreleus/quasar/control-plane/internal/preparation"
 	"github.com/accreleus/quasar/control-plane/internal/secrets"
 	"github.com/accreleus/quasar/control-plane/internal/session"
 	"github.com/accreleus/quasar/control-plane/internal/settings"
@@ -680,6 +681,9 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	imagesHandler := images.NewHandler(imagesStore, auditStore)
 	imagesEnsurer := images.NewEnsurer(pool, agentRegistry, log)
 	imagesStore.SetEnsurer(imagesEnsurer)
+	preparationStore := preparation.New(pool)
+	agentHandler.SetPreparation(preparationStore)
+	agentHandler.OnPreparationReport = imagesEnsurer.ReconcilePreparation
 	agentHandler.SetImageEvents(imagesEnsurer)
 
 	// Provider reconciliation. semantics: control-api.md §"P5 side effect".
@@ -794,7 +798,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	jobRegistry.MustRegister(jobs.Definition{
 		ID:          "template.warmup",
 		Name:        "Golden-home template warm-up",
-		Description: "Builds the per-image golden-home template by booting the app once into a throwaway scratch home. Host-side knob: QUASAR_TEMPLATE_WARMUP is opt-in (default off) and a host without it reports the run as skipped, naming the knob.",
+		Description: "Prepares the adopted official Steam image in a disposable home. Requires the Steam source policy, a ready image, and current host acknowledgement. Explicit host opt-outs remain authoritative.",
 		Plane:       jobs.PlaneAgent,
 		Scope:       jobs.ScopeHost,
 		Managed:     true,
@@ -806,7 +810,16 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		// in-memory ladder, which evaporated on every reconnect. An event run's params
 		// come from the image that reached `ready`; a manual run has none, so it must
 		// resolve them here or the host fails the run with `params incomplete`.
-		ResolveParams: imagesEnsurer.WarmupParamsForHost,
+		ResolveParams:  imagesEnsurer.WarmupParamsForHost,
+		ValidateParams: preparationStore.AllowJob,
+		OnTerminal: func(ctx context.Context, run jobs.Run) {
+			changed, err := preparationStore.ReconcileClosedJob(ctx, run.HostID, run.Params)
+			if err != nil {
+				log.Warn("Steam preparation closed-job reconciliation failed", "host_id", run.HostID, "err", err)
+			} else if changed {
+				imagesEnsurer.ReconcilePreparation(run.HostID)
+			}
+		},
 	})
 	jobRegistry.MustRegister(jobs.Definition{
 		ID:          homeGCJobID,
@@ -1017,6 +1030,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// Agent auth is homeProvider, the same storage.Manager passed to the storage and
 	// library handlers: one node_secret verification across all /v1/agent/* surfaces.
 	jobsAgentHandler := jobs.NewAgentHandler(jobStore, jobsDispatcher, homeProvider, log)
+	startPreparationPolicyDelivery(janitorCtx, preparationStore, agentRegistry, settingsHandler, imagesEnsurer.ReconcilePreparation, log)
 
 	return &Services{
 		cfg:              cfg,

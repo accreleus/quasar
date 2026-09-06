@@ -23,8 +23,9 @@ import { Table, type TableColumn } from "../../components/Table";
 import { useToast } from "../../components/Toast";
 import { useFleetContext } from "../../lib/fleet/FleetContext";
 import { useResource } from "../../lib/resource/react";
+import { SteamPreparationStatus } from "./library/SteamPreparationStatus";
 import { hostImageState, imgRollout, POLICY_COPY } from "./library/imageRollout";
-import { dominantInFlightState, HOST_STATE_COPY, isImageInFlight } from "./library/imageStatus";
+import { dominantInFlightState, HOST_STATE_COPY } from "./library/imageStatus";
 
 interface DetailData {
   images: CatalogImage[];
@@ -78,8 +79,8 @@ export function ImageDetail() {
           policy: settingsEnv.settings.image_update_policy ?? "notify",
         };
       },
-      // Poll only while something is mid-install, same as ImagesTab.
-      pollMs: (d) => (d?.images.some(isImageInFlight) ? 4000 : null),
+      // Preparation continues after image download reaches ready.
+      pollMs: 4000,
     },
     [id],
   );
@@ -220,6 +221,11 @@ export function ImageDetail() {
             }
             return <span className="num">{img.installed_version || img.version}</span>;
           },
+        },
+        {
+          key: "preparation",
+          header: "Steam preparation",
+          render: (h) => <SteamPreparationStatus status={img.hosts?.find((host) => host.host_id === h.id)?.steam_preparation} />,
         },
         {
           key: "sessions",

@@ -120,6 +120,23 @@ afterEach(() => {
 });
 
 describe("ImageDetail", () => {
+  it("keeps a downloaded image separate from its per-host preparation status", async () => {
+    const image: CatalogImage = { ...steam, hosts: [{
+      host_id: "h1", state: "ready", version: "2026.08.07",
+      steam_preparation: {
+        eligible: true, supported: true, desired_enabled: true, desired_revision: "1", applied_revision: "1",
+        policy_pending: false, preparation_enabled: true, consumption_enabled: true,
+        state: "preparing", reason: "none", detail: "", template: null, clone_mode: "copy",
+        clone_reason: "Mounted filesystem does not support reflinks", reported_at: "2026-09-06T12:00:00Z",
+      },
+    }] };
+    vi.mocked(adminApi.listImages).mockResolvedValue({ images: [image] } as never);
+    renderDetail();
+    expect(await screen.findByText("Preparing")).toBeInTheDocument();
+    expect(screen.queryByText("Prepared")).not.toBeInTheDocument();
+    expect(screen.getByText(/Home cloning: full copy/)).toHaveTextContent("does not support reflinks");
+  });
+
   it("renders the crumbs, head and facts", async () => {
     vi.mocked(adminApi.listImages).mockResolvedValue({ images: [steam] } as never);
     renderDetail();

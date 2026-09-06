@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
+	"github.com/accreleus/quasar/control-plane/internal/preparation"
 )
 
 // Ensure orchestration (image-management P2). The control plane never pulls an
@@ -651,34 +652,7 @@ func (e *Ensurer) WarmupParamsForHost(ctx context.Context, hostID string) (any, 
 	if strings.TrimSpace(hostID) == "" {
 		return nil, fmt.Errorf("a golden-home warm-up is host-scoped and needs a host_id")
 	}
-	ii, err := scanInstalledImage(e.pool.QueryRow(ctx, installedNonLazyQuery+`
-		JOIN host_images hi ON hi.image_id = ii.image_id
-		WHERE hi.host_id = $1::uuid
-		  AND hi.state = 'ready'
-		  AND ii.lazy = false
-		  AND (
-		        (ii.registry_ref IS NOT NULL AND ii.registry_ref <> '')
-		     OR (ii.local_tag IS NOT NULL AND ii.local_tag <> '')
-		      )
-		ORDER BY (ic.runtime->>'managed_home' = 'true') DESC, hi.updated_at DESC, ii.image_id
-		LIMIT 1`, hostID))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf(
-			"this host has no adopted image in the `ready` state, so there is nothing to warm up; "+
-				"install an image (Admin -> Images) and wait for it to reach ready on host %s", hostID)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("read the adopted images ready on host %s: %w", hostID, err)
-	}
-	ref := adoptedImageRef(ii.RegistryRef, ii.LocalTag)
-	if ref == "" {
-		return nil, fmt.Errorf("image %s is adopted on this host but has no dispatchable ref", ii.ImageID) // defensive; query already excludes this
-	}
-	return map[string]any{
-		"image_id":     ii.ImageID,
-		"registry_ref": ref,
-		"version":      ii.Version,
-	}, nil
+	return preparation.Params(ctx, e.pool, hostID)
 }
 
 // enqueueWarmup is the #488 golden-home warm-up trigger. Lives here because
@@ -704,30 +678,23 @@ func (e *Ensurer) enqueueWarmup(hostID, imageID string) {
 		ctx, cancel := context.WithTimeout(e.ctx, dbLookupTimeout)
 		defer cancel()
 
-		// Re-read the adoption rather than trust the reported version: the ref
-		// the warm-up must boot is the one frozen at adoption (#440 — a mutable
-		// tag must never reach a host).
-		img, state, err := adoptionFor(ctx, e.pool, imageID)
-		if err != nil {
-			e.log.Warn("warm-up trigger: adoption lookup failed", "host_id", hostID, "image_id", imageID, "err", err)
+		params, err := preparation.Params(ctx, e.pool, hostID)
+		if err != nil || imageID != "steam" {
 			return
 		}
-		if state != adoptionActive {
+		var finished bool
+		if err = e.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM hosts
+         WHERE id=$1::uuid AND source_preparation->'steam'->>'policy_revision'=$2
+         AND source_preparation->'steam'->'images'->0->>'registry_ref'=$3
+         AND source_preparation->'steam'->'images'->0->>'version'=$4
+         AND source_preparation->'steam'->'images'->0->>'state' IN ('ready','preparing'))`, hostID, params["policy_revision"], params["registry_ref"], params["version"]).Scan(&finished); err != nil || finished {
 			return
 		}
-		ref := adoptedImageRef(img.RegistryRef, img.LocalTag)
-		if ref == "" {
-			return
+
+		if err = q.EnqueueJob(ctx, warmupJobID, hostID, params); err != nil {
+			e.log.Debug("Steam preparation not enqueued", "host_id", hostID, "err", err)
 		}
-		if err := q.EnqueueJob(ctx, warmupJobID, hostID, map[string]any{
-			"image_id":     img.ImageID,
-			"registry_ref": ref,
-			"version":      img.Version,
-		}); err != nil {
-			e.log.Debug("warm-up trigger: not enqueued", "host_id", hostID, "image_id", imageID, "err", err) // jobs.ErrNotFound: this build didn't register template.warmup
-			return
-		}
-		e.log.Info("warm-up trigger: enqueued", "host_id", hostID, "image_id", img.ImageID, "version", img.Version)
+
 	}()
 }
 
@@ -921,3 +888,6 @@ func (e *Ensurer) reconcile(ctx context.Context, hostID string, imgs []agentws.R
 	}
 	return nil
 }
+
+// ReconcilePreparation retries admission after a policy acknowledgement.
+func (e *Ensurer) ReconcilePreparation(hostID string) { e.enqueueWarmup(hostID, "steam") }

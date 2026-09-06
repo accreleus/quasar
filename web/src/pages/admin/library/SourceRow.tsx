@@ -47,6 +47,7 @@ export function SourceRow({
       className="row"
       style={{
         display: "flex",
+        flexWrap: "wrap",
         gap: "var(--s5)",
         alignItems: "flex-start",
         padding: "var(--card-pad)",
@@ -66,7 +67,6 @@ export function SourceRow({
             {meta}
           </div>
         )}
-        {children}
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: "var(--s2)", flex: "none" }}>
         {actions}
@@ -79,6 +79,7 @@ export function SourceRow({
           />
         </span>
       </div>
+      {children && <div style={{ flexBasis: "100%", minWidth: 0 }}>{children}</div>}
     </div>
   );
 }

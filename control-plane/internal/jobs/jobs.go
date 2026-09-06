@@ -205,6 +205,10 @@ type Definition struct {
 	// An error refuses the trigger (ErrParamsUnavailable) rather than queueing
 	// a run that cannot succeed; nil materializes a manual run with no params.
 	ResolveParams ParamsResolver
+	// ValidateParams rechecks live admission at enqueue, manual reuse and final agent dispatch.
+	ValidateParams func(context.Context, string, json.RawMessage) error
+	// OnTerminal runs after an applied outcome/reaper close and deferred retry creation.
+	OnTerminal func(context.Context, Run)
 }
 
 // ParamsResolver builds the params blob for a manual run of one job on one

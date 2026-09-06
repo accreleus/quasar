@@ -917,3 +917,77 @@ func TestEnqueueDoesNotDisturbARunningRun(t *testing.T) {
 		t.Fatalf("run rows = %d, want 1", n)
 	}
 }
+
+func TestSourceAdmissionCannotBeBypassedByReusingOpenRun(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	host := newHost(t, pool, "source-admission")
+	allowed := true
+	def := hostDef("template.warmup")
+	def.Default = Schedule{Kind: KindEvent, Timezone: "UTC"}
+	def.ResolveParams = func(context.Context, string) (any, error) { return map[string]any{"policy_revision": "1"}, nil }
+	def.ValidateParams = func(context.Context, string, json.RawMessage) error {
+		if !allowed {
+			return errors.New("source disabled")
+		}
+		return nil
+	}
+	reg := NewRegistry()
+	if err := reg.Register(def); err != nil {
+		t.Fatal(err)
+	}
+	d, _ := newDispatcher(t, pool, reg, def)
+	if _, err := d.Enqueue(ctx, def.ID, host, map[string]any{"policy_revision": "1"}); err != nil {
+		t.Fatal(err)
+	}
+	allowed = false
+	if _, err := d.Enqueue(ctx, def.ID, host, map[string]any{"policy_revision": "1"}); !errors.Is(err, ErrParamsUnavailable) {
+		t.Fatalf("event reused disabled run: %v", err)
+	}
+	if _, err := d.RunNow(ctx, def.ID, host, ""); !errors.Is(err, ErrParamsUnavailable) {
+		t.Fatalf("manual reused disabled run: %v", err)
+	}
+}
+
+func TestTerminalCallbackRunsAfterDeferralRetryExists(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	host := newHost(t, pool, "terminal-generation")
+	def := hostDef("template.warmup")
+	def.Default = Schedule{Kind: KindEvent, Timezone: "UTC"}
+	var store *Store
+	calls := 0
+	def.OnTerminal = func(ctx context.Context, run Run) {
+		calls++
+		pending, found, err := store.OpenRun(ctx, run.JobID, run.HostID)
+		if err != nil || !found || pending.State != StatePending {
+			t.Errorf("callback preceded retry creation: %+v %v %v", pending, found, err)
+		}
+	}
+	reg := NewRegistry()
+	if err := reg.Register(def); err != nil {
+		t.Fatal(err)
+	}
+	d, s := newDispatcher(t, pool, reg, def)
+	store = s
+	queued, err := d.Enqueue(ctx, def.ID, host, map[string]any{"policy_revision": "1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimDue(ctx, ClaimOptions{Plane: PlaneAgent, HostID: host, Limit: 1})
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("claim: %v %v", claimed, err)
+	}
+	if _, err = d.Report(ctx, queued.ID, StateDeferred, Summary{"reason": "host_busy"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("callback count=%d", calls)
+	}
+	if _, err = d.Report(ctx, queued.ID, StateDeferred, Summary{"reason": "host_busy"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatal("duplicate report repeated reconciliation")
+	}
+}

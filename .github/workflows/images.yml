@@ -625,6 +625,7 @@ jobs:
             QUASAR_BASE_IMAGE=${{ needs.inputs.outputs.base_ref }}
             SOURCE_COMMIT=${{ github.sha }}
             BUILT_AT=${{ needs.inputs.outputs.built_at }}
+            QUASAR_VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
           # Explicit scope, one per published image. When two agent jobs shared this
           # Dockerfile's `build` stage, an unscoped cache had them write the SAME key and
           # evict each other on alternating runs; the scoping outlived the second job

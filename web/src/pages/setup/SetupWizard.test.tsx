@@ -30,6 +30,7 @@ vi.mock("../../api/setup", () => ({
 }));
 vi.mock("../../api/admin", () => ({
   getSettings: vi.fn(),
+  accessCheck: vi.fn(),
   updateSettings: vi.fn(),
   listHosts: vi.fn(),
   getHostGPUs: vi.fn(),
@@ -90,6 +91,10 @@ describe("SetupWizard — claim success advances to step 2", () => {
   beforeEach(() => {
     localStorage.clear();
     vi.mocked(setupApi.getSetupStatus).mockResolvedValue({ admin_exists: false, setup_completed: false });
+    vi.mocked(adminApi.accessCheck).mockResolvedValue({
+      request: { host: new URL(window.location.origin).host },
+      origins: { source: "database", allowed: [window.location.origin] },
+    } as never);
     vi.mocked(setupApi.completeSetup).mockResolvedValue({ admin_exists: true, setup_completed: true });
     vi.mocked(adminApi.getSettings).mockResolvedValue({
       settings: {

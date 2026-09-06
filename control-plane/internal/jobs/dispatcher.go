@@ -173,6 +173,7 @@ func (d *Dispatcher) reapAbandoned(ctx context.Context) {
 		return
 	}
 	for _, r := range reaped {
+		d.onTerminal(ctx, r)
 		age := time.Duration(0)
 		if r.ClaimedAt != nil {
 			age = d.now().Sub(*r.ClaimedAt)
@@ -457,6 +458,7 @@ func (d *Dispatcher) Report(ctx context.Context, runID string, state State, summ
 			"host_id", hostField(run.HostID), "state", string(run.State),
 			"dur_ms", dur, "summary", compactJSON(run.Summary))
 	}
+	d.onTerminal(ctx, run)
 	return run, nil
 }
 
@@ -521,6 +523,13 @@ func (d *Dispatcher) prune(ctx context.Context) {
 // future-dated pending one it is pulled forward to now, so an event never
 // waits out the interval of the schedule it coalesced onto (#92).
 func (d *Dispatcher) Enqueue(ctx context.Context, jobID, hostID string, params any) (Run, error) {
+	raw, encodeErr := json.Marshal(params)
+	if encodeErr != nil {
+		return Run{}, encodeErr
+	}
+	if err := d.validateParams(ctx, jobID, hostID, raw); err != nil {
+		return Run{}, fmt.Errorf("%w: %v", ErrParamsUnavailable, err)
+	}
 	job, err := d.store.Get(ctx, jobID)
 	if err != nil {
 		return Run{}, err
@@ -598,6 +607,9 @@ func (d *Dispatcher) manualParams(ctx context.Context, jobID, hostID string) (an
 	}
 	if open, found, err := d.store.OpenRun(ctx, jobID, hostID); err == nil && found {
 		if p := rawOrNil(open.Params); p != nil {
+			if err := d.validateParams(ctx, jobID, hostID, open.Params); err != nil {
+				return nil, fmt.Errorf("%w: %v", ErrParamsUnavailable, err)
+			}
 			return nil, nil
 		}
 	}
@@ -634,4 +646,25 @@ func rawOrNil(raw json.RawMessage) any {
 		return nil
 	}
 	return raw
+}
+
+func (d *Dispatcher) validateParams(ctx context.Context, jobID, hostID string, params json.RawMessage) error {
+	if d.reg == nil {
+		return nil
+	}
+	def, ok := d.reg.Get(jobID)
+	if !ok || def.ValidateParams == nil {
+		return nil
+	}
+	return def.ValidateParams(ctx, hostID, params)
+}
+
+func (d *Dispatcher) onTerminal(ctx context.Context, run Run) {
+	if d.reg == nil {
+		return
+	}
+	def, ok := d.reg.Get(run.JobID)
+	if ok && def.OnTerminal != nil {
+		def.OnTerminal(ctx, run)
+	}
 }

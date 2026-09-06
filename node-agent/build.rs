@@ -40,6 +40,9 @@ fn main() {
 fn stamp_build_identity() {
     println!("cargo:rerun-if-env-changed=QUASAR_SOURCE_COMMIT");
     println!("cargo:rerun-if-env-changed=QUASAR_BUILT_AT");
+    println!("cargo:rerun-if-env-changed=QUASAR_VERSION");
+    let version = std::env::var("QUASAR_VERSION").unwrap_or_default();
+    println!("cargo:rustc-env=QUASAR_STAMP_VERSION={}", version.trim());
 
     let commit = std::env::var("QUASAR_SOURCE_COMMIT")
         .ok()

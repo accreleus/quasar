@@ -54,8 +54,7 @@ pub use verify::{verify_template, TemplateStats, VerifyPolicy};
 /// happen?" without anyone reading the code — the runner stays registered on
 /// every host precisely so this line exists.
 pub const WARMUP_DISABLED_REASON: &str =
-    "QUASAR_TEMPLATE_WARMUP is not set on this host (warm-up builds are opt-in; \
-     set QUASAR_TEMPLATE_WARMUP=1 to allow this host to build templates)";
+    "QUASAR_TEMPLATE_WARMUP denies preparation on this host; remove the override or set it to true";
 
 /// The `failed` reason for the split-namespace refusal (see
 /// [`TemplateStoreApi::cross_filesystem`]).
@@ -109,6 +108,7 @@ pub struct TemplateMeta {
 /// The half of WP1's `template::TemplateStore` this job needs. Adapted onto
 /// this trait mechanically by [`StoreAdapter`] / [`StagingAdapter`] below.
 pub trait TemplateStoreApi: Send + Sync {
+    fn phase(&self, _detail: &str) {}
     /// The published template's commit record, or `None` for "absent" — which
     /// covers no template, a missing/corrupt/truncated `.meta.json`, and a
     /// schema mismatch. Never an error: an unreadable template is a template
@@ -234,14 +234,7 @@ impl Clock for SystemClock {
 /// §7.3 knobs, resolved once at agent startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WarmupConfig {
-    /// `QUASAR_TEMPLATE_WARMUP` — **opt-in, default OFF**. `1`/`true`/`yes`/`on`
-    /// ⇒ this host may BUILD templates; anything else (including unset) ⇒ it
-    /// only ever consumes templates built elsewhere on the same box.
-    ///
-    /// It defaults off because a build is a full session that takes the host's
-    /// single encode slot for minutes (#489 serializes it against every user
-    /// launch), and an unconfigured host was rebuilding a template on every
-    /// image `ready` without anyone asking for it.
+    /// Host permission, enabled when absent; source policy independently gates production.
     pub enabled: bool,
     /// `QUASAR_TEMPLATE_SETTLE_SECS`, default 60 (the §1.1 measured value).
     pub settle: Duration,
@@ -260,7 +253,7 @@ pub struct WarmupConfig {
 impl Default for WarmupConfig {
     fn default() -> Self {
         WarmupConfig {
-            enabled: false,
+            enabled: true,
             settle: Duration::from_secs(60),
             job_timeout: Some(Duration::from_secs(600)),
             min_free_bytes: DEFAULT_MIN_FREE_BYTES,
@@ -274,16 +267,9 @@ impl WarmupConfig {
     pub fn from_env() -> Self {
         let d = WarmupConfig::default();
         WarmupConfig {
-            // OPT-IN, not opt-out: an unset (or unparseable) value leaves this
-            // host a template CONSUMER. Flipping this to opt-out is what let an
-            // unconfigured host rebuild templates unasked.
-            enabled: matches!(
-                std::env::var("QUASAR_TEMPLATE_WARMUP")
-                    .map(|v| v.trim().to_ascii_lowercase())
-                    .ok()
-                    .as_deref(),
-                Some("1") | Some("true") | Some("yes") | Some("on")
-            ),
+            enabled: crate::source_policy::permission(
+                std::env::var("QUASAR_TEMPLATE_WARMUP").ok().as_deref(),
+            ) == crate::source_policy::Permission::Enabled,
             settle: env_secs("QUASAR_TEMPLATE_SETTLE_SECS", d.settle).unwrap_or(Duration::ZERO),
             job_timeout: env_secs(
                 "QUASAR_TEMPLATE_WARMUP_TIMEOUT_SECS",
@@ -499,6 +485,11 @@ impl WarmupJob<'_> {
                     agent_version: env!("CARGO_PKG_VERSION").to_string(),
                     schema: TEMPLATE_META_SCHEMA,
                 };
+                if let Err(error) = self.checkpoint(guard, deadline) {
+                    let _ = staging.discard();
+                    return Err(error);
+                }
+                self.store.phase("Publishing the sanitized Steam template");
                 staging
                     .publish(meta)
                     .map_err(|e| WarmupError::Failed(format!("publish: {e}")))?;
@@ -556,6 +547,8 @@ impl WarmupJob<'_> {
             scratch.display()
         );
 
+        self.store
+            .phase("Starting Steam in an isolated scratch home");
         let launch = WarmupLaunch {
             image_id: req.image_id.clone(),
             image: req.registry_ref.clone(),
@@ -577,6 +570,9 @@ impl WarmupJob<'_> {
 
         // §3.3 step 9: reached only after step 8's full teardown, before
         // anything reads the tree.
+        self.checkpoint(guard, deadline)?;
+        self.store
+            .phase("Sanitizing and verifying the prepared Steam home");
         let dest = staging.home_dir();
         std::fs::create_dir_all(&dest)
             .map_err(|e| WarmupError::Failed(format!("staging home {}: {e}", dest.display())))?;
@@ -651,6 +647,8 @@ impl WarmupJob<'_> {
             self.cfg.settle.as_secs()
         );
 
+        self.store
+            .phase("Steam presented; waiting for first-run updates to settle");
         // Step 7a: settle.
         let settle_until = presented_at + self.cfg.settle;
         while self.clock.now() < settle_until {
@@ -665,6 +663,8 @@ impl WarmupJob<'_> {
 
         // Step 7b: write quiescence. Settle-then-quiesce, not settle-alone, is
         // what keeps a mid-update Steam out of the snapshot.
+        self.store
+            .phase("Waiting for Steam writes to become quiescent");
         let quiesce_started = self.clock.now();
         let mut tracker = QuiescenceTracker::new(self.cfg.quiesce_window);
         loop {

@@ -307,13 +307,14 @@ func (h *ApplyHandler) internal(w http.ResponseWriter, what string, err error) {
 	httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not start the apply")
 }
 
-// offered reports whether the release is one the page is currently offering —
-// the same `available` list, so an apply can never reach a release the UI would
-// not show.
+// offered reports whether a listed release can be applied. Older same-schema
+// edge builds stay visible for explanation, but must never start a fleet or host
+// apply. In particular, up_to_date alone is insufficient: fleet apply normally
+// accepts that reason to update hosts after the control plane is already current.
 func offered(v View, releaseID string) bool {
 	for _, r := range v.Available {
 		if r.ID == releaseID {
-			return true
+			return !edgeOlderThanInstalled(r, v.Installed.ControlPlane)
 		}
 	}
 	return false

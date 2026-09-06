@@ -139,6 +139,12 @@ func (h *AgentHandler) handlePending(w http.ResponseWriter, r *http.Request) {
 	deadline := int(h.disp.Config().ClaimTimeout.Seconds())
 	out := make([]pendingRun, 0, len(runs))
 	for _, run := range runs {
+		if err := h.disp.validateParams(r.Context(), run.JobID, hostID, run.Params); err != nil {
+			if _, reportErr := h.disp.Report(r.Context(), run.ID, StateSkipped, Summary{"reason": "source_policy_gate"}, err.Error()); reportErr != nil {
+				h.log.Warn("source policy job rejection recording failed", "run_id", run.ID, "err", reportErr)
+			}
+			continue
+		}
 		params := run.Params
 		if len(params) == 0 {
 			params = json.RawMessage(`{}`)

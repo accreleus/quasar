@@ -137,7 +137,9 @@ services:
       # every origin that must keep working: dropping the LAN entries when you add
       # a public name is what breaks direct https://<lan-ip>:<tls-port> access.
       # The hardened Caddy overlay sets this itself from QUASAR_PUBLIC_HOST.
-      QUASAR_ALLOWED_ORIGINS: ${QUASAR_ALLOWED_ORIGINS:-}
+      # A null passthrough preserves UNSET; an explicitly empty .env value
+      # still pins same-origin policy and must not be replaced with a default.
+      QUASAR_ALLOWED_ORIGINS:
       # Networks whose X-Forwarded-For is honoured; unset is right for a direct
       # deployment. Behind a proxy it MUST name that proxy's network, or every
       # rate limiter keys on the proxy and all clients share one failure budget —
@@ -338,16 +340,18 @@ services:
       QUASAR_HOMES_GC: ${QUASAR_HOMES_GC:-}
       QUASAR_HOMES_GC_RETENTION_HOURS: ${QUASAR_HOMES_GC_RETENTION_HOURS:-}
       QUASAR_HOMES_GC_DRY_RUN: ${QUASAR_HOMES_GC_DRY_RUN:-}
-      # #488 golden-home templates. All SHIP-DARK (off unless set), and all
-      # host-local: QUASAR_HOME_TEMPLATES gates CONSUMPTION (seeding a cold home
+      # #145 Steam preparation defaults on for explicitly supported images.
+      # The Steam source policy controls both activities; host permissions
+      # below can opt out independently. Missing flags retain the default.
+      # Host-local: QUASAR_HOME_TEMPLATES gates CONSUMPTION (seeding a cold home
       # from a template), QUASAR_TEMPLATE_WARMUP gates PRODUCTION (building one).
       # QUASAR_TEMPLATE_ROOT must be the path bind-mounted below — the agent
       # writes templates there and later reflink-clones them into home root, so
       # the container must see the HOST's directory at the SAME path or every
       # build lands in the container overlay (and warm-up refuses; see
       # QUASAR_TEMPLATE_ALLOW_CROSSFS in docs/configuration.md).
-      QUASAR_HOME_TEMPLATES: ${QUASAR_HOME_TEMPLATES:-}
-      QUASAR_TEMPLATE_WARMUP: ${QUASAR_TEMPLATE_WARMUP:-}
+      QUASAR_HOME_TEMPLATES:
+      QUASAR_TEMPLATE_WARMUP:
       QUASAR_TEMPLATE_ROOT: ${QUASAR_TEMPLATE_ROOT:-}
       QUASAR_TEMPLATE_CLONE_MODE: ${QUASAR_TEMPLATE_CLONE_MODE:-}
       QUASAR_TEMPLATE_ALLOW_CROSSFS: ${QUASAR_TEMPLATE_ALLOW_CROSSFS:-}
@@ -527,6 +531,8 @@ services:
       # PulseAudio sidecar image. Follows the agent image by default — the sidecar
       # must come from the same runtime lineage or sessions run silent (2026-07-26:
       # a sidecar image with no `pulseaudio` binary muted every session).
+      # Advanced recovery override; normally Docker's named volume is discovered.
+      QUASAR_NVIDIA_DRIVER_HOST_PATH: ${QUASAR_NVIDIA_DRIVER_HOST_PATH:-}
       QUASAR_PULSE_IMAGE: ${QUASAR_PULSE_IMAGE:-${QUASAR_AGENT_IMAGE:-${QUASAR_NODE_IMAGE:-quasar-node-agent:latest}}}
       # --shm-size for app containers (tmpfs, allocated on use; Chromium/Steam
       # need >64MB, and big Steam titles benefit from more).

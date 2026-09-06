@@ -24,7 +24,27 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+
+- Steam preparation is enabled by default for supported Steam images, with a
+  separate switch under Library → Sources → Steam. Image details distinguish
+  preparation progress, host opt-outs and measured reflink/copy behavior. Turning
+  preparation off preserves existing homes, templates and running sessions (#145).
+
 ### Fixed
+
+- Agent startup cleanup only removes its own session and audio containers;
+  separate agents on the same Docker daemon preserve each other's sessions (#146).
+- First-run setup saves the browser origin while respecting explicit deployment
+  policy, and reports signaling failures separately from media connectivity (#131).
+- NVIDIA provisioning retry messages preserve the original failure instead of
+  recursively nesting backoff messages (#129).
+- An advanced NVIDIA driver host-path override verifies the actual shared
+  directory before app launch and reports wrong paths through readiness (#130).
+- Tagged agent images report their release version consistently with the control
+  plane; source builds report a development identity (#135).
+- Older same-schema edge builds are no longer offered or accepted as updates,
+  including forced apply requests (#136).
 
 - RTX 5090 hosts running NVIDIA 595.99.02 exclude the known-corrupt Vulkan AV1
   path and its unsafe NVENC AV1 fallback. Host readiness and setup explain the

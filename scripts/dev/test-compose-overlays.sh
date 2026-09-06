@@ -233,6 +233,14 @@ value=$(QUASAR_CONTROL_IMAGE=registry.example/cp@sha256:abc cp_field "svc['image
 # it), which left every client on one rate-limit budget — a pre-auth lockout on
 # POST /v1/setup/claim. Each var below is documented in deploy/README.md or
 # deploy/.env.example and must flow through the BASE chain.
+# Preserve deployment policy presence: missing is UI-editable, explicit empty
+# pins same-origin. Render against an empty dotenv so a local install cannot
+# contaminate the unset assertion.
+actual=$(unset QUASAR_ALLOWED_ORIGINS; cp_field "svc.get('environment', {}).get('QUASAR_ALLOWED_ORIGINS') is None" -- --env-file /dev/null "${BASE[@]}")
+[ "$actual" = "True" ] || fail "unset allowed origins must remain absent, not an empty environment pin"
+actual=$(export QUASAR_ALLOWED_ORIGINS=; cp_field "svc['environment']['QUASAR_ALLOWED_ORIGINS'] == ''" -- --env-file /dev/null "${BASE[@]}")
+[ "$actual" = "True" ] || fail "explicit empty allowed origins must remain an environment pin"
+
 for var in QUASAR_TRUSTED_PROXIES QUASAR_PUBLIC_HOST QUASAR_ALLOWED_ORIGINS \
            QUASAR_ICE_SERVERS PUBLIC_BASE_URL QUASAR_TLS_HOSTS \
            QUASAR_ARTWORK_MAX_BYTES QUASAR_ARTWORK_SWEEP_INTERVAL \

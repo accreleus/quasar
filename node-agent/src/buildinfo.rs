@@ -14,9 +14,38 @@ use tracing::{debug, info, warn};
 
 use crate::session::container::ContainerRuntime;
 
-/// The agent's semver. The Cargo package version, unchanged: a release is cut
-/// by bumping it, and nothing stamps over it.
-pub const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Release identity comes from the same tag stamp as the control plane. Branch
+/// builds stay `dev`; the Cargo package version is not a platform release.
+pub fn version() -> &'static str {
+    normalized_version(env!("QUASAR_STAMP_VERSION"))
+}
+
+fn normalized_version(raw: &str) -> &str {
+    let value = raw.trim().strip_prefix('v').unwrap_or(raw.trim());
+    if value.is_empty() || value == "unknown" {
+        "dev"
+    } else {
+        value
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    #[test]
+    fn release_and_source_versions_are_honest() {
+        for (raw, expected) in [
+            ("v0.2.4", "0.2.4"),
+            ("0.2.4", "0.2.4"),
+            ("v0.2.4-rc.1", "0.2.4-rc.1"),
+            (" v0.2.4 ", "0.2.4"),
+            ("", "dev"),
+            ("  ", "dev"),
+            ("unknown", "dev"),
+        ] {
+            assert_eq!(super::normalized_version(raw), expected);
+        }
+    }
+}
 
 /// Compile-time stamps from `build.rs`. Literally `"unknown"` on a build that
 /// had neither the env vars nor a git checkout.
@@ -277,7 +306,7 @@ pub fn install_facts() -> InstallFacts {
 pub fn log_startup_identity(facts: &InstallFacts) {
     info!(
         "build identity: version={} source_commit={} built_at={} install_mode={} updater_present={}",
-        AGENT_VERSION,
+        version(),
         source_commit().unwrap_or("unknown"),
         built_at().unwrap_or("unknown"),
         facts.install_mode.map(InstallMode::as_str).unwrap_or("unknown"),

@@ -330,3 +330,13 @@ test('optional securityfs does not become a required Docker bind source', () => 
   assert.ok(agent.volumes.includes('/sys/kernel:/host/sys/kernel:ro'));
   assert.ok(!agent.volumes.some(mount => typeof mount === 'string' && mount.startsWith('/sys/kernel/security:')));
 });
+
+
+test('Steam preparation inherits defaults and preserves advanced agent opt-outs', () => {
+  const { compose, env } = generate(full({ separateSaves: true, savesPath: '/mnt/pool/quasar/homes' }));
+  const agent = load(compose).services['quasar-node-agent'];
+  assert.equal(Object.hasOwn(agent.environment, 'QUASAR_HOME_TEMPLATES'), false);
+  assert.equal(Object.hasOwn(agent.environment, 'QUASAR_TEMPLATE_WARMUP'), false);
+  assert.ok(agent.env_file.some((entry) => entry.path === 'agent.env'));
+  assert.match(env, /QUASAR_TEMPLATE_ROOT=\/mnt\/pool\/quasar\/templates/);
+});
