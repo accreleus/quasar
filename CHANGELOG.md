@@ -24,6 +24,14 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+
+- **A fleet update no longer re-cordons each host moments after it finishes (#140,
+  second half).** The per-host apply inside a fleet run found the host already draining
+  — the run's own cordon — took it for an admin's, and restored it a few milliseconds
+  after the run had lifted it, so 0.2.2 still ended with the host `draining`. An apply
+  that belongs to a fleet run now leaves the restore to the run. Found on the 0.2.2 gate.
+
 ## 0.2.2 — 2026-09-06
 
 ### Fixed

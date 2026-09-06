@@ -237,7 +237,16 @@ func (r *Runner) drive(ctx context.Context, a Attempt) {
 			return
 		}
 	}
-	defer r.restoreCordon(hostID, wasCordoned)
+	// A fleet run owns the scheduling state of every host it touches: it
+	// cordoned the fleet before its control-plane step and restores every
+	// cordon from its own record when it finishes. This attempt still cordons
+	// a host that is serving (a disconnect/register cycle can have lifted the
+	// run's cordon), but the restore is the run's: done here too, it read the
+	// run's cordon as an admin's and re-applied it milliseconds after the run
+	// had lifted it (#140).
+	if a.RunID == nil {
+		defer r.restoreCordon(hostID, wasCordoned)
+	}
 
 	// A re-adopted attempt that was already sent skips straight to watching:
 	// its request id is persisted, so the relay can still resolve it.
