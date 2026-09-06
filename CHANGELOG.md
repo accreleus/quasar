@@ -24,6 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+## 0.2.3 — 2026-09-06
+
 ### Fixed
 
 - **A fleet update no longer re-cordons each host moments after it finishes (#140,
