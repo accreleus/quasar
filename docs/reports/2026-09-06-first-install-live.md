@@ -76,6 +76,10 @@ separate evidence-sufficiency correction.
 
 ## Evidence and limits
 
+The subsequent [AV1 driver comparison](2026-09-06-av1-vulkan-driver-comparison.md)
+reproduces the operator's visual corruption, isolates it to inter-frame encoding
+in a standalone test, and records the limits of the driver-update validation.
+
 Private, sanitized diagnostics are retained under
 `.diagnostics/first-install-live/` (gitignored); credential and browser-state files
 must not be published. Direct-LAN runs decoded 2,462 and 6,442 frames respectively
