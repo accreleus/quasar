@@ -324,8 +324,8 @@ func (f *FleetRunner) controlPlanePhase(ctx context.Context, run ApplyRun) bool 
 			f.log.Warn("fleet apply: could not record the current target", "run_id", run.ID, "err", err)
 		}
 		// The fleet is re-cordoned on adoption: the run holds it for the rest of
-		// its life, and the restart wiped the in-memory record of it.
-		f.cordonFleet(ctx, run.ID)
+		// its life, and the restart it caused may have lifted it underneath.
+		f.adoptCordons(ctx, run.ID)
 		if !f.self.Adopt(ctx, *cp, f.releaseCommit(ctx, run.ReleaseID)) {
 			if f.prepareFleet(ctx, run, *cp) {
 				f.self.Apply(ctx, *cp) // never sent; re-drive it
@@ -409,7 +409,8 @@ func (f *FleetRunner) prepareFleet(ctx context.Context, run ApplyRun, a Attempt)
 
 // cordonFleet takes every online host out of scheduling for the rest of the run,
 // remembering the ones it found already cordoned. Nothing must land on a host
-// that is about to lose its agent.
+// that is about to lose its agent. This is the FRESH-START half; adoptCordons is
+// the other, and a record already present means the run has been here before.
 func (f *FleetRunner) cordonFleet(ctx context.Context, runID string) {
 	// Written BEFORE the first cordon and never overwritten: the run's own
 	// control-plane step restarts this process, and a re-read afterwards would
@@ -426,9 +427,57 @@ func (f *FleetRunner) cordonFleet(ctx context.Context, runID string) {
 	for _, h := range hosts {
 		states = append(states, HostCordon{HostID: h.HostID, WasCordoned: h.Status != "online"})
 	}
+	f.recordAndCordon(ctx, runID, states)
+}
+
+// adoptCordons re-establishes the fleet cordon on a run this process did not
+// start. The record is authoritative — the live statuses are not, because the
+// process that cordoned the fleet is the one that just went away.
+func (f *FleetRunner) adoptCordons(ctx context.Context, runID string) {
+	states, err := f.store.CordonedHosts(ctx, runID)
+	if err != nil {
+		f.log.Error("fleet apply: could not read what this run cordoned", "run_id", runID, "err", err)
+		return
+	}
+	if len(states) == 0 {
+		// #140: a run started before migration 0076 has no record, and every
+		// host reads `draining` because THAT process cordoned it. Reading those
+		// statuses as the operator's intent re-cordons the whole fleet at finish
+		// with nothing left to lift it. An admin cordon predating such a run is
+		// lifted instead — one-time, and logged here.
+		f.log.Warn("fleet apply: this run predates the cordon record; treating every cordon as the run's own",
+			"run_id", runID)
+		hosts, err := f.store.Hosts(ctx)
+		if err != nil {
+			f.log.Error("fleet apply: could not read the host list to cordon it", "run_id", runID, "err", err)
+			return
+		}
+		states = make([]HostCordon, 0, len(hosts))
+		for _, h := range hosts {
+			states = append(states, HostCordon{HostID: h.HostID, WasCordoned: false})
+		}
+		f.recordAndCordon(ctx, runID, states)
+		return
+	}
+	// The run holds the fleet for the rest of its life, and between the two
+	// processes an admin (or an agent's re-register, historically) may have
+	// lifted a cordon. Cordon is idempotent on an already-draining host.
+	for _, st := range states {
+		if st.WasCordoned {
+			continue // an admin's cordon, restored rather than lifted
+		}
+		if err := f.cordons.Cordon(ctx, st.HostID); err != nil {
+			f.log.Warn("fleet apply: could not re-cordon a host", "run_id", runID, "host_id", st.HostID, "err", err)
+		}
+	}
+}
+
+// recordAndCordon persists what the run found, then cordons what it owns.
+// Cordoning without a record of what to undo is how a fleet is left out of
+// scheduling with nothing left that knows to lift it, so a failed write cordons
+// nothing.
+func (f *FleetRunner) recordAndCordon(ctx context.Context, runID string, states []HostCordon) {
 	if err := f.store.SetCordonedHosts(ctx, runID, states); err != nil {
-		// Cordoning without a record of what to undo is how a fleet is left out
-		// of scheduling with nothing left that knows to lift it.
 		f.log.Error("fleet apply: could not record the fleet's scheduling state; not cordoning",
 			"run_id", runID, "err", err)
 		return

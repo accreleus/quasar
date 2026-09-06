@@ -167,7 +167,7 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 		ON CONFLICT (node_name) DO UPDATE
 		    SET agent_version      = EXCLUDED.agent_version,
 		        node_secret_hash   = EXCLUDED.node_secret_hash,
-		        status             = 'online',
+		        status             = `+registerStatusSQL+`,
 		        last_registered_at = now(),
 		        pending_restart    = false
 		        ,capacity_detection = 'unavailable'
@@ -239,6 +239,14 @@ func (s *agentStore) reconnectHost(ctx context.Context, nodeName, agentVersion, 
 	return registerResult{HostID: hostID, AgentRestarted: isRestart}, nil
 }
 
+// registerStatusSQL is what a register does to the scheduling status: offline →
+// online, and a cordon is never lifted (#140). A `draining` row whose disconnect
+// was never observed — a control-plane restart drops every socket while the
+// column keeps its value — still carries the admin's or a fleet run's intent.
+// session.UncordonHost is what lifts it, and it already handles a connected
+// draining host. A fresh INSERT has no prior status and starts 'online'.
+const registerStatusSQL = `CASE WHEN hosts.status = 'draining' THEN 'draining' ELSE 'online' END`
+
 // Reconnect UPDATE with #429 restart classification (rationale at
 // agentRestartMinGap). The `old` CTE snapshots the pre-reconnect values under
 // FOR UPDATE so the CASEs and RETURNING read them regardless of what this same
@@ -255,7 +263,7 @@ const reconnectHostSQL = `
 		FOR UPDATE
 	)
 	UPDATE hosts SET
-		status              = 'online',
+		status              = ` + registerStatusSQL + `,
 		agent_version       = $2,
 		last_registered_at  = now(),
 		pending_restart     = false,

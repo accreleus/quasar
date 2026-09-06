@@ -442,3 +442,46 @@ func TestFleetRestoresTheCordonAcrossARestart(t *testing.T) {
 		t.Fatalf("the operator's cordon = %q (%v), want it left in place", status, err)
 	}
 }
+
+// The #140 incident: a v0.2.0 control plane started the run, cordoned the fleet
+// and recreated itself before migration 0076 existed, so the adopting process
+// finds every host draining and NO record. Inferring the operator's intent from
+// those statuses left the whole fleet out of scheduling at finish.
+func TestFleetAdoptedWithNoCordonRecordLeavesTheFleetOnline(t *testing.T) {
+	drivers := &succeedingDrivers{}
+	h := newFleetHarness(t, commitB, drivers)
+	drivers.store = h.store
+	ctx := context.Background()
+
+	other := seedHost(t, h.pool, "gpu-fleet-02", commitA, "online")
+
+	run, err := h.store.CreateRun(ctx, h.release.ID, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The old process cordoned the fleet and had no column to record it in.
+	mustExec(t, h.pool, `UPDATE hosts SET status='draining'`)
+	mustExec(t, h.pool, `UPDATE platform_apply_runs SET cordoned_hosts = '[]'::jsonb`)
+	if err := h.store.SetRunTarget(ctx, run.ID, TargetControlPlane, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Left open: the recreate is what ended that process.
+	if _, err := h.store.CreateControlPlaneAttempt(ctx, NewControlPlaneAttempt{
+		RunID: &run.ID, ReleaseID: &h.release.ID,
+		Requested: []ComponentDigest{{Name: ComponentControlPlane, Image: "x", Digest: "sha256:" + hex64}},
+		Previous:  []PreviousDigest{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	h.fleet.Adopt(ctx)
+	waitFor(t, "the adopted run to finish", func() bool {
+		r, err := h.store.Run(ctx, run.ID)
+		return err == nil && TerminalRunState(r.State)
+	})
+	waitFor(t, "the fleet to be back in scheduling", func() bool {
+		one, err1 := h.store.HostStatus(ctx, h.hostID)
+		two, err2 := h.store.HostStatus(ctx, other)
+		return err1 == nil && err2 == nil && one == "online" && two == "online"
+	})
+}

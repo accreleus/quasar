@@ -436,9 +436,10 @@ func (r *Runner) restoreCordon(hostID string, wasCordoned bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if wasCordoned {
-		// An admin's cordon is restored, not lifted — and the new agent's
-		// register flips the row back to online, so this is a real re-cordon
-		// rather than a no-op.
+		// An admin's cordon is restored, not lifted. The new agent's register
+		// keeps a draining row draining (#140), so this is usually a no-op —
+		// it is real when the agent's disconnect was observed and flipped the
+		// row offline before it came back online.
 		if err := r.deps.Cordon(ctx, hostID); err != nil {
 			r.log.Warn("apply: could not restore the admin cordon", "host_id", hostID, "err", err)
 		}
