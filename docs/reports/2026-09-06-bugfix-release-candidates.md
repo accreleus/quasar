@@ -147,7 +147,8 @@ The historical review above describes the baseline, not current completion.
 - [ ] #146: owner-scoped session/audio cleanup, restart and two-agent isolation.
 - [ ] #145: Steam preparation policy, lifecycle, UI, storage reporting and live cold/prepared comparisons.
   The concrete proposal is in [the design review](2026-09-06-steam-preparation-design-review.md);
-  frozen-interface review/sign-off is pending.
+  the operator approved implementation and the additive contract, and explicitly
+  waived the separate Opus review prerequisite. Live acceptance remains pending.
 - [ ] Complete component gates, image contracts, public documentation and live acceptance.
 - [ ] Record commit/build identities, test results and remaining limitations on each issue.
 - [ ] Publish the approved release and verify its artifacts and live update behavior.

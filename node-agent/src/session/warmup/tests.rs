@@ -377,6 +377,7 @@ fn a_warm_up_publishes_a_sanitized_verified_template() {
     let meta = &log.published[0];
     assert_eq!(meta.image_id, "steam");
     assert_eq!(meta.version, "v2");
+    assert_eq!(meta.agent_version, crate::buildinfo::version());
     assert_eq!(meta.schema, TEMPLATE_META_SCHEMA);
     assert_eq!(meta.files, outcome.stats.files);
     assert!(meta.built_at > 0);

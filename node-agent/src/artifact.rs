@@ -431,7 +431,7 @@ fn lock_body() -> String {
     format!(
         "pid={} agent={} heartbeat={} kernel_lock=1\n",
         std::process::id(),
-        env!("CARGO_PKG_VERSION"),
+        crate::buildinfo::version(),
         HEARTBEAT_INTERVAL.as_secs()
     )
 }
@@ -737,7 +737,8 @@ mod tests {
         let l = Lock::acquire(&p, "test").unwrap();
         let body = std::fs::read_to_string(&p).unwrap();
         assert!(
-            body.contains(&format!("heartbeat={}", HEARTBEAT_INTERVAL.as_secs())),
+            body.contains(&format!("agent={} ", crate::buildinfo::version()))
+                && body.contains(&format!("heartbeat={}", HEARTBEAT_INTERVAL.as_secs())),
             "body was {body:?}"
         );
         assert!(

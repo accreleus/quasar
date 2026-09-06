@@ -66,7 +66,7 @@ existing host and set only that on the new one. See below.
 | `QUASAR_TLS_KEY` | unset | Your own key. |
 | `QUASAR_TLS_DIR` | `/var/lib/quasar-control/tls` | Where the generated certificate is kept. |
 | `QUASAR_HTTP_REDIRECT` | `auto` | HTTP to HTTPS redirect for browser routes. |
-| `QUASAR_ALLOWED_ORIGINS` | unset | Authoritative override for signaling WebSocket origins. Leave unset for Admin, Settings and upcoming first-run setup to manage the saved list. Explicitly empty still overrides that list. With neither source set, same-origin is allowed. `*` is rejected. |
+| `QUASAR_ALLOWED_ORIGINS` | unset | Authoritative override for signaling WebSocket origins. Leave unset for Admin, Settings and first-run setup (Quasar 0.2.4+) to manage the saved list. Explicitly empty still overrides that list. With neither source set, same-origin is allowed. `*` is rejected. |
 | `QUASAR_TRUSTED_PROXIES` | unset | Proxy IPs or CIDRs whose forwarded client-address headers are trusted. Empty ignores forwarded addresses. |
 | `LISTEN_ADDR` | `:8080` | HTTP listener. |
 | `CONTROL_PORT` | `8080` | Compose. Host port for HTTP. |

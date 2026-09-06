@@ -370,7 +370,7 @@ pub enum WarmupError {
 impl std::fmt::Display for WarmupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WarmupError::Aborted => write!(f, "aborted for a user session launch"),
+            WarmupError::Aborted => write!(f, "warm-up cancelled"),
             WarmupError::TimedOut => write!(f, "job timeout expired"),
             WarmupError::Skipped(r) => write!(f, "skipped: {r}"),
             WarmupError::Failed(r) => write!(f, "{r}"),
@@ -482,7 +482,7 @@ impl WarmupJob<'_> {
                         .as_secs(),
                     bytes: stats.bytes,
                     files: stats.files,
-                    agent_version: env!("CARGO_PKG_VERSION").to_string(),
+                    agent_version: crate::buildinfo::version().to_string(),
                     schema: TEMPLATE_META_SCHEMA,
                 };
                 if let Err(error) = self.checkpoint(guard, deadline) {

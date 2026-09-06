@@ -230,6 +230,8 @@ jobs:
           # checkout, and a wrong answer here would either refuse a good release
           # or admit one built off a branch.
           fetch-depth: 0
+      - name: Verify publication dependencies
+        run: bash scripts/release/test-release-publication-gate.sh
       - name: Gate the ref
         id: gate
         env:
@@ -1070,16 +1072,10 @@ jobs:
   #
   # Same four phases as the other artifacts — build by digest, validate that
   # digest, promote tags onto it — but with its OWN promote job rather than a
-  # third arm of `promote` above. The updater is not part of a platform release:
-  # it is what APPLIES one, it is absent from the release manifest, and it is
-  # consumed by tag rather than by digest (docs/upgrading.md). Folding it into
-  # `promote` would couple "both release images ship or neither does" to an
-  # artifact that is not in the release, in both directions — a broken updater
-  # would block a release, and a release failure would withhold an updater fix.
-  #
-  # It is also not in `preflight`'s inputs and must not be: strict preflight
-  # asserts every RELEASE artifact is an exact digest reference, and this one is
-  # not a release artifact.
+  # third arm of `promote` above. The updater applies the two-component
+  # manifest and remains independently tagged; it is not a manifest component
+  # or a digest input to strict preflight. GitHub Release publication still
+  # waits for promote-updater, because its install footer advertises that tag.
   build-updater:
     name: build quasar-updater (digest only)
     needs: inputs
@@ -1281,7 +1277,9 @@ jobs:
   # to it: this job cannot move a tag.
   release:
     name: publish the GitHub Release
-    needs: [release-gate, inputs, build-control-plane, build-node-agent, promote]
+    # The release footer advertises the updater version too. Never publish a
+    # release until that independently built/validated image has been promoted.
+    needs: [release-gate, inputs, build-control-plane, build-node-agent, promote, promote-updater]
     if: needs.release-gate.outputs.is_release == 'true'
     runs-on: ubuntu-latest
     permissions:

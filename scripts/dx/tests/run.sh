@@ -3214,6 +3214,9 @@ else
   fail "manifest:bench-keys-not-drifted" "$BENCH_KEYS_OUT"
 fi
 
+# Release publication must wait for every image advertised in its install footer.
+rc_of 0 "release:publication-dependencies" -- bash "$ROOT/scripts/release/test-release-publication-gate.sh"
+
 # ── summary ──────────────────────────────────────────────────────────────────
 printf '\n'
 STATUS=ok

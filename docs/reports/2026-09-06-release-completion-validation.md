@@ -45,11 +45,10 @@ is executed by that parent test; it is not missing coverage.
 
 ## Final implementation gates
 
-- Rust: 1,244 library, 6 binary, 3 log-convention and 1 real-process lock
+- Rust: 1,245 library, 6 binary, 3 log-convention and 1 real-process lock
   tests passed; one child fixture is intentionally ignored by ordinary discovery.
-  Formatting, all-target Clippy and benchmark compilation passed. The subsequent
-  same-path storage-repair correction passed all 9 source-policy tests plus
-  formatting and Clippy.
+  Formatting, all-target Clippy and benchmark compilation passed. The final full run includes same-path storage repair and truthful version
+  provenance in templates, driver/CUDA metadata and artifact locks.
 - Go build, vet and non-database tests passed. Fresh **full** database suite
   passed with `make test-db` (`go test -p 1 -count=1 ./...`); database tests
   actually executed. Final lifecycle regressions also passed separately in the
@@ -60,7 +59,7 @@ is executed by that parent test; it is not missing coverage.
   Docker wrapper to place only this invocation's disposable PostgreSQL data on
   a 512 MiB tmpfs, matching the repository's existing devtools approach. The
   canonical test command, fresh credentials, assertions and cleanup were unchanged.
-- Web: 231 files / 2,931 tests, API schema drift, type checks and build passed.
+- Web: 231 files / 2,933 tests, API schema drift, type checks and build passed.
   Sources and image preparation states were visually checked at desktop/mobile
   sizes. Site: 28 tests and the 216-page build passed.
 - Preflight: 376 passes, 1 warning, 0 failures. The warning is missing host
@@ -73,6 +72,44 @@ is executed by that parent test; it is not missing coverage.
 
 These automated gates do not replace the live acceptance below.
 
+## Candidate image and isolation checks
+
+Candidate source `617db41248aefef2dc601ee00ceaceff963e473a` is pushed in
+[PR #147](https://github.com/accreleus/quasar/pull/147). The runtime image passed
+139/139 GPU-enabled contract checks and the control-plane image passed 23/23
+checks (162 total). Runtime image ID is
+`sha256:7ef38b34c98be739a6f1713530271b975487057df004405bdce02750704c7a9d`.
+Its startup reports `dev`, the correct source commit and build time
+`2026-09-06T13:35:26Z`, appropriate for this untagged source build. This does not
+replace verifying a published release's explicit version stamp.
+
+A separate control/database/agent stack started on that candidate. Its health
+listener and Docker healthcheck use a private port to avoid sharing the existing
+host-networked agent's default port. The test configuration initially omitted
+that override and was corrected before recording health acceptance.
+
+- **#130:** automatic discovery adopted the matching driver volume and passed
+  real sibling EGL startup. An explicit override to a different existing empty
+  directory produced a failed `nvidia_driver_mount` readiness check identifying
+  the same-directory validation failure. Pointing the override to the actual
+  test volume restored sibling EGL success. Driver replacement was not needed.
+  API snapshots and positive resolution logs are retained locally. This check
+  exercised readiness, not a negative app-launch attempt.
+- **#146:** 11/11 bounded real-Docker assertions passed. Two actual candidate agent
+  processes held distinct ownership leases; one removed its own two orphan
+  fixtures while preserving the other agent's running fixture, legacy/unowned
+  and malformed fixtures, and an unrelated name. Duplicate shared state and
+  malformed identity refused startup before cleanup. All disposable containers
+  were removed. These were sleep-container surrogates and explicitly injected
+  malformed Docker inspection data, not a live media-survival experiment.
+- **#145, in progress:** with no feature flags, the adopted official Steam image
+  scheduled preparation, and the host acknowledged production/consumption enabled.
+  Actual user-share mount probing reported full copy. Disabling the source reached
+  acknowledged disabled state. The first warm-up failed at audio pipeline READY;
+  diagnosis and successful preparation/consumption acceptance remain outstanding.
+  Live screenshots also exposed preparation-cell clipping and technical fallback
+  wording; those are being corrected before final candidate validation.
+
 ## Remaining release acceptance
 
 - Final candidate image contracts and provenance (#135).
@@ -83,7 +120,8 @@ These automated gates do not replace the live acceptance below.
 - Complete #145 policy, lifecycle, UI, storage, account isolation/sanitization,
   disable/re-enable and cold-versus-prepared real Steam measurements.
 - Required component gates, preflight, documentation and release evidence.
-- Approved main promotion, release publication and verified live update.
+- Main promotion, v0.2.4 publication and verified live update. The operator
+  explicitly authorized autonomous promotion/publication after validation.
 
 Raw captures remain in the worktree's ignored
 `.diagnostics/release-completion/` directory. Credential files in that directory

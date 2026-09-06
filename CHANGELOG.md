@@ -33,6 +33,8 @@ own; the two do not move together, and that is deliberate.
 
 ### Fixed
 
+- Release publication waits for the updater image to be validated and promoted,
+  so its installation instructions cannot advertise a missing updater tag.
 - Agent startup cleanup only removes its own session and audio containers;
   separate agents on the same Docker daemon preserve each other's sessions (#146).
 - First-run setup saves the browser origin while respecting explicit deployment

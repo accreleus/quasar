@@ -40,7 +40,7 @@ export function SteamPreparationStatus({ status, desiredEnabled }: { status?: St
   const state = !status.eligible ? "unsupported" : !status.supported ? "unknown" : pending ? "pending_policy" : status.state;
   const ready = state === "ready" && status.template !== null;
   return (
-    <div className="col gap2" data-testid="steam-preparation-status">
+    <div className="col gap2" data-testid="steam-preparation-status" style={{ whiteSpace: "normal", overflowWrap: "anywhere", minWidth: 0 }}>
       <span><Chip variant={ready ? "success" : state === "failed" ? "danger" : "neutral"}>
         {state === "ready" && !ready ? "Not reported" : STATES[state] ?? state}
       </Chip></span>
@@ -51,15 +51,21 @@ export function SteamPreparationStatus({ status, desiredEnabled }: { status?: St
           : " Effective host policy is not confirmed."}
       </p>
       {status.reason && status.reason !== "none" && <p className="hint" style={{ margin: 0 }}>{REASONS[status.reason] ?? status.reason}</p>}
+      {state === "deferred" && (!status.reason || status.reason === "none") && !status.detail && <p className="hint" style={{ margin: 0 }}>Preparation is deferred. This host has not reported why yet.</p>}
+      {state === "queued" && <p className="hint" style={{ margin: 0 }}>Waiting for this host to start preparation.</p>}
       {status.detail && !pending && <p className="hint" style={{ margin: 0, overflowWrap: "anywhere" }}>{status.detail}</p>}
       {ready && <p className="hint" style={{ margin: 0 }}>Prepared version: {status.template!.version}</p>}
       {pending && status.reported_at && <p className="hint" style={{ margin: 0 }}>Last observed {new Date(status.reported_at).toLocaleString()}; this report does not confirm the current setting.</p>}
       {status.clone_mode && (
         <p className="hint" style={{ margin: 0 }}>
           {pending ? "Last observed home cloning" : "Home cloning"}: {status.clone_mode === "reflink" ? "reflink" : status.clone_mode === "copy" ? "full copy" : status.clone_mode}.
-          {status.clone_reason ? ` ${status.clone_reason}` : ""}
+          {status.clone_mode === "copy" ? " Full copies use more storage and take longer to create than reflinks." : ""}
         </p>
       )}
+      {status.clone_reason && <details className="hint" onClick={(event) => event.stopPropagation()}>
+        <summary>{pending ? "Last observed cloning details" : "Cloning details"}</summary>
+        <p style={{ margin: "var(--s2) 0 0", overflowWrap: "anywhere" }}>{status.clone_reason}</p>
+      </details>}
     </div>
   );
 }

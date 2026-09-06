@@ -134,7 +134,8 @@ describe("ImageDetail", () => {
     renderDetail();
     expect(await screen.findByText("Preparing")).toBeInTheDocument();
     expect(screen.queryByText("Prepared")).not.toBeInTheDocument();
-    expect(screen.getByText(/Home cloning: full copy/)).toHaveTextContent("does not support reflinks");
+    expect(screen.getByText(/Home cloning: full copy/)).toHaveTextContent("Full copies use more storage");
+    expect(screen.getByText("Cloning details").closest("details")).toHaveTextContent("does not support reflinks");
   });
 
   it("renders the crumbs, head and facts", async () => {

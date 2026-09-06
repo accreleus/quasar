@@ -530,6 +530,10 @@ its place, commits that (`chore(release): x.y.z`), tags the commit `vX.Y.Z`
 release lane (`.github/workflows/images.yml`, #108): it builds and validates
 the images, then publishes them, a GitHub Release whose body is that
 version's changelog section, and a `platform-release-manifest.json` asset.
+Publication waits for the separately versioned updater image too, because the
+release notes link its tag. The manifest itself contains control-plane and
+node-agent only. Publish the public documentation from the released tree after
+this workflow succeeds (`pages.yml` is manually dispatched).
 
 It refuses — with a one-line reason, before touching anything — unless:
 

@@ -1127,7 +1127,7 @@ fn run_provision(volume: &Path, version: &str, _gap: Gap) -> Result<Manifest> {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
-        agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        agent_version: crate::buildinfo::version().to_string(),
         lib64_count: counts.0,
         lib32_count: counts.1,
         layout_version: CURRENT_LAYOUT_VERSION,

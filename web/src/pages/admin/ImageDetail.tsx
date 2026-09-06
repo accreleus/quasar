@@ -246,7 +246,7 @@ export function ImageDetail() {
   const inFlight = img ? dominantInFlightState(img) : null;
 
   return (
-    <section className="page">
+    <section className="page image-detail-page">
       <Breadcrumbs
         items={[
           { label: "Library", to: "/admin/library/apps" },
@@ -303,7 +303,7 @@ export function ImageDetail() {
           />
 
           <div className="editor">
-            <div style={{ display: "flex", flexDirection: "column", gap: "var(--s4)" }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: "var(--s4)", minWidth: 0 }}>
               <div className="card card-pad">
                 <p style={{ fontSize: "var(--t-sm)", color: "var(--text-2)", lineHeight: 1.55, margin: "0 0 var(--s4)", maxWidth: "70ch" }}>
                   {img.description}
