@@ -5,10 +5,11 @@
   "scripts": {
     "dev": "astro dev",
     "start": "astro dev",
-    "build": "astro build",
+    "build": "node scripts/compose-template.mjs --check && astro build",
     "preview": "astro preview",
     "astro": "astro",
-    "test": "node --test \"src/data/*.test.js\""
+    "test": "node scripts/compose-template.mjs --check && node --test \"src/data/*.test.js\"",
+    "compose:sync": "node scripts/compose-template.mjs"
   },
   "dependencies": {
     "@astrojs/starlight": "^0.41.10",
@@ -16,6 +17,7 @@
     "@fontsource/ibm-plex-sans": "^5.3.0",
     "@fontsource/michroma": "^5.3.0",
     "astro": "^7.2.9",
+    "js-yaml": "4.3.1",
     "sharp": "^0.35.4",
     "starlight-openapi": "^0.26.1"
   }

@@ -181,8 +181,16 @@ session memory `current-focus.md`, not this file.**
   whole fleet before the control-plane step because a control-plane restart ends every session
   today (#128). A **source-built host or control plane is never offered a release** — it shows
   the manual `redeploy.sh` recipe instead. Existing installs add the updater once
-  (`docs/upgrading.md` "The updater"). Publishing is a `vX.Y.Z` tag push on `main`
-  (`make release VERSION=`), still to be exercised live after the first main promotion.
+  (`docs/upgrading.md` "The updater"). **Publishing a release** (exercised live: 0.2.0 → 0.2.3, 2026-09-05/06) is
+  `make release VERSION=x.y.z` on a clean `main` — recipe and refusals in `docs/upgrading.md`
+  "Cutting a release". Two disciplines make it work: (1) **every change that lands on `develop`
+  adds its line to `CHANGELOG.md` `## Unreleased` in the same landing** — the cut refuses an
+  empty section and the section becomes the GitHub Release notes verbatim (Keep-a-Changelog
+  headings; the Releases tab parses them); (2) the develop→main promotion is a PR merged only
+  with the operator's sign-off, and only THEN is the cut run. After the tag push, watch the
+  Images run to success, verify `gh release view vX.Y.Z` (manifest asset, not prerelease), merge
+  `main` back into `develop` (the changelog cut), then run the live update on gpu-test from
+  Fleet ▸ Releases ("Check now" → apply) before calling the release done.
 - **ABR is ON by default, mode `smooth`** (SPT-10 #346, 2026-06-27). `smooth` is
   encoder-aware + smoothness-biased (under congestion: present σ p95 ~69→19 ms,
   freezes 14→2 vs `protective`; identical on a clean path; preserves the #68 emergency
@@ -193,8 +201,8 @@ session memory `current-focus.md`, not this file.**
   which also produced the #370 re-characterisation; no further operator soak is
   outstanding.
 - **Encoders:** AMD/Intel = VA (ZC-03 DMABuf zero-copy). **NVIDIA = Vulkan by
-  default** (2026-08-12): `docker-compose.nvidia.yml` sets
-  `QUASAR_ENCODER=${QUASAR_ENCODER:-vulkan}`, so H.264 and HEVC encode with
+  default** (2026-08-12): the agent detects NVIDIA when `QUASAR_ENCODER` is
+  unset or empty (Compose passes an operator override through), so H.264 and HEVC encode with
   `vulkanh264enc`/`vulkanh265enc`. Rationale:
   #489 is an NVIDIA-driver NVENC teardown UAF spanning the 595 **and** 610
   branches — no driver pin escapes it — and Vulkan is immune, so the default path
@@ -211,7 +219,12 @@ session memory `current-focus.md`, not this file.**
   with no vendor element the codec drops off the host — except h264, which is the
   floor and stays on `vulkanh264enc` with an error logged.
   `QUASAR_ENCODER=nvenc` in `deploy/.env` (or an admin host override) restores
-  the whole NVENC path.
+  the whole NVENC path, subject to compatibility exclusions.
+  **Driver compatibility precedes these knobs:** `encoder_compatibility.rs`
+  excludes AV1 for the measured RTX 5090 / 595.99.02 combination, including
+  NVENC fallback. Existing host/profile/client negotiation chooses eligible
+  HEVC/H.264; an explicitly forced unavailable codec fails. Readiness explains
+  the exclusion. See `docs/configuration.md` before changing that policy.
   **That NVENC fallback needs `libnvrtc`, which the agent now fetches at RUN TIME
   (#545, 2026-08-26) — there is no NVIDIA image any more.** `quasar-node-agent` is
   the universal agent image (CUDA-built like every lineage; `quasar-nv` is retired,

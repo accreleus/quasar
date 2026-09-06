@@ -51,8 +51,11 @@ these in `deploy/.env` before the first boot:
 ```bash
 BOOTSTRAP_ADMIN_EMAIL=you@example.com
 BOOTSTRAP_ADMIN_USERNAME=you
-BOOTSTRAP_ADMIN_PASSWORD=a-real-password
+BOOTSTRAP_ADMIN_PASSWORD=
 ```
+
+Replace the blank password with a strong password you choose before starting.
+The example deliberately contains no usable password.
 
 The control plane creates that account at startup. It is idempotent and does
 nothing once an admin exists. The Claim step is then skipped.
@@ -62,7 +65,7 @@ registration endpoint can only ever create ordinary users.
 
 ## Step 2: Basics
 
-Set the instance name and choose how new accounts are created:
+Choose how new accounts are created:
 
 | Mode | Behaviour |
 | --- | --- |
@@ -72,8 +75,19 @@ Set the instance name and choose how new accounts are created:
 
 You can change this later under Admin, People, Invites.
 
-The public URL and TLS notes on this step are informational. They describe what
-the browser is currently seeing, they do not configure anything.
+The public URL is detected from this browser. From Quasar 0.2.4, **Continue**
+saves that exact origin for streaming and preserves any addresses already allowed.
+Open setup through the address users will use, including your reverse proxy's
+public hostname. The wizard verifies that the saved origin is active before
+advancing; it does not configure DNS, proxy routing, or media connectivity.
+
+An explicit `QUASAR_ALLOWED_ORIGINS` environment override remains authoritative,
+even if empty. Setup checks it without changing it. If it rejects this browser
+address, setup explains how to add the origin to the override or remove the
+override to use the saved setting. Existing releases that only display the URL
+need the [manual allowed-origin configuration](/quasar/network/reverse-proxy/#allowed-origins)
+before stream testing. A successful login does not establish that signaling
+accepts that address.
 
 ## Step 3: Hosts
 
@@ -108,6 +122,11 @@ is added to the catalog, and an entitlement is created according to the
 visibility you choose.
 
 You choose who can see it: everyone, only you, or decide later.
+
+From Quasar 0.2.4, supported Steam images also prepare reusable files in
+the background for new users. Control this separately from discovery under
+Library → Sources → Steam; see [Steam preparation](/quasar/install/steam-preparation/).
+Preparation never gates a normal launch.
 
 The published Steam image is public. If installation fails, check the image job
 under Admin, Fleet, Jobs and see [Images](/quasar/admin/images/) rather than

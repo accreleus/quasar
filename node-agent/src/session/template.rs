@@ -167,6 +167,7 @@ pub struct TemplateStore {
     root: PathBuf,
     home_root: PathBuf,
     clone_mode: CloneMode,
+    clone_reason: Option<String>,
     /// Template root and home root are on different filesystems (`st_dev`
     /// differs). Recorded at resolve time because the WARM-UP needs it as a
     /// refusal input, not only as a clone-ladder input — see
@@ -208,7 +209,7 @@ impl TemplateStore {
             return None;
         }
 
-        let clone_mode = probe_clone_mode(&root, home_root, configured_mode);
+        let (clone_mode, clone_reason) = probe_clone_mode(&root, home_root, configured_mode);
         // A stat error reports NOT cross-fs: this flag gates a refusal, and a
         // stat failure is not evidence of a split.
         let cross_fs = matches!(same_filesystem(&root, home_root), Ok(false));
@@ -228,6 +229,7 @@ impl TemplateStore {
             root,
             home_root: home_root.to_path_buf(),
             clone_mode,
+            clone_reason,
             cross_fs,
         })
     }
@@ -245,8 +247,16 @@ impl TemplateStore {
         Self::resolve(home_root, configured.as_deref(), mode)
     }
 
+    pub fn home_root(&self) -> &Path {
+        &self.home_root
+    }
+
     pub fn template_root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn clone_reason(&self) -> Option<&str> {
+        self.clone_reason.as_deref()
     }
 
     pub fn clone_mode(&self) -> CloneMode {
@@ -501,7 +511,7 @@ fn probe_clone_mode(
     template_root: &Path,
     home_root: &Path,
     configured: TemplateCloneMode,
-) -> CloneMode {
+) -> (CloneMode, Option<String>) {
     let reflink = if matches!(configured, TemplateCloneMode::Copy | TemplateCloneMode::Off) {
         // No need to probe: the configured mode doesn't depend on the result.
         Err("not probed (mode fixed by configuration)".to_string())
@@ -521,7 +531,16 @@ fn probe_clone_mode(
         }
         (CloneMode::Off, None) => tracing::info!("clone mode: off"),
     }
-    mode
+    (
+        mode,
+        reason.or_else(|| match configured {
+            TemplateCloneMode::Copy => Some("Full copy explicitly selected on this host".into()),
+            TemplateCloneMode::Off => {
+                Some("Template cloning explicitly disabled on this host".into())
+            }
+            _ => None,
+        }),
+    )
 }
 
 /// Run `cp -a --reflink=<always|never>` (never `auto`, per §4.1) and check
@@ -1032,9 +1051,12 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let reader_store = store.clone();
         let reader_stop = Arc::clone(&stop);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || {
-            let mut saw_v1 = false;
+            assert_eq!(reader_store.meta("steam").unwrap().version, "1.0.0");
+            let mut saw_v1 = true;
             let mut saw_v2 = false;
+            ready_tx.send(()).unwrap();
             while !reader_stop.load(Ordering::Relaxed) {
                 match reader_store.meta("steam") {
                     Some(m) if m.version == "1.0.0" => saw_v1 = true,
@@ -1045,6 +1067,11 @@ mod tests {
             }
             (saw_v1, saw_v2)
         });
+
+        // Start publishing only after the reader has actually observed v1.
+        // Otherwise a busy test runner can finish the writer before the reader
+        // is scheduled at all, failing without exercising concurrent reads.
+        ready_rx.recv().unwrap();
 
         let b2 = store.begin_build("steam", "2.0.0").unwrap();
         fs::write(b2.home_dir().join("marker"), vec![b'2'; 4096]).unwrap();

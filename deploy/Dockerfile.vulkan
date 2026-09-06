@@ -731,9 +731,10 @@ COPY node-agent /src/node-agent
 # rebuild of a NEW commit changes the source anyway and recompiled regardless.
 ARG SOURCE_COMMIT=unknown
 ARG BUILT_AT=unknown
+ARG QUASAR_VERSION=
 RUN cd /src/node-agent \
     && QUASAR_SOURCE_COMMIT="${SOURCE_COMMIT}" QUASAR_BUILT_AT="${BUILT_AT}" \
-       cargo build --release \
+       QUASAR_VERSION="${QUASAR_VERSION}" cargo build --release \
         $( [ "$CUDA_ENABLE" = "1" ] && echo --features cuda ) \
     && install -Dm0755 target/release/quasar-node-agent /opt/agent/quasar-node-agent
 
@@ -957,6 +958,9 @@ ENV PATH=/opt/gst/bin:$PATH
 # override allowed (unset this if a future debug need actually wants lavapipe present).
 ENV VK_LOADER_DRIVERS_DISABLE="*lvp_icd*"
 ENV QUASAR_HEALTH_ADDR=127.0.0.1:9091
+ENV NODE_SECRET_PATH=/var/lib/quasar-agent/node-secret
+ENV XDG_RUNTIME_DIR=/run/quasar-agent
+ENV NVIDIA_DRIVER_CAPABILITIES=all
 
 # Docker CLI — the agent launches sibling app containers via the mounted socket
 # (same static-binary install as Dockerfile.agent.prod).
@@ -1005,6 +1009,7 @@ RUN set -eux; \
 RUN printf '%s\n' \
     '#!/bin/bash' \
     'set -e' \
+    'export LD_LIBRARY_PATH="/opt/quasar/nvidia-driver/lib64:/opt/quasar/nvidia-driver/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"' \
     '[ -n "$XDG_RUNTIME_DIR" ] && { mkdir -p "$XDG_RUNTIME_DIR"; chmod 0700 "$XDG_RUNTIME_DIR"; }' \
     '[ -z "$MESA_LOADER_DRIVER_OVERRIDE" ] && unset MESA_LOADER_DRIVER_OVERRIDE' \
     '[ -z "$LIBGL_ALWAYS_SOFTWARE" ] && unset LIBGL_ALWAYS_SOFTWARE' \

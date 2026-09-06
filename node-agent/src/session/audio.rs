@@ -102,14 +102,20 @@ impl PulseSidecar {
         let socket_dir = pulse_socket_dir(runtime_dir, session_id);
         let socket_path = socket_dir.join("native");
         let container_name = pulse_container_name(session_id);
-        let image = std::env::var("QUASAR_PULSE_IMAGE")
-            .unwrap_or_else(|_| "quasar-agent-dev:latest".to_string());
+        let image = match std::env::var("QUASAR_PULSE_IMAGE")
+            .ok()
+            .filter(|v| !v.is_empty())
+        {
+            Some(image) => image,
+            None => runtime.own_image().context("cannot select audio sidecar image; set QUASAR_PULSE_IMAGE when running outside a container")?,
+        };
 
         // Idempotent clean of any stale container from a prior crashed run.
-        runtime.force_remove(&container_name);
+        let owner = crate::container_ownership::token().map_err(anyhow::Error::msg)?;
+        runtime.remove_owned_container(&container_name)?;
 
         let socket_dir_s = socket_dir.to_string_lossy();
-        let args = pulse_run_args(&container_name, &socket_dir_s, &image);
+        let args = pulse_run_args(&container_name, &socket_dir_s, &image, &owner);
 
         // Create the socket dir before Docker uses it as a bind-mount source: Docker
         // creates missing ones as root, which would leave it root-owned and unwritable by
@@ -182,13 +188,15 @@ impl Drop for PulseSidecar {
     }
 }
 
-fn pulse_run_args(container_name: &str, socket_dir: &str, image: &str) -> Vec<String> {
+fn pulse_run_args(container_name: &str, socket_dir: &str, image: &str, owner: &str) -> Vec<String> {
     vec![
         "run".into(),
         "-d".into(),
         "--rm".into(),
         "--name".into(),
         container_name.into(),
+        "--label".into(),
+        format!("{}={owner}", crate::container_ownership::LABEL),
         "--network".into(),
         "none".into(),
         // The sidecar only needs its per-session Unix socket, so match the app
@@ -468,7 +476,12 @@ mod tests {
             QUASAR_MONITOR_SOURCE_NAME,
             format!("{QUASAR_SINK_NAME}.monitor")
         );
-        let args = pulse_run_args("quasar-pulse-test", "/run/quasar-agent/pulse-test", "img");
+        let args = pulse_run_args(
+            "quasar-pulse-test",
+            "/run/quasar-agent/pulse-test",
+            "img",
+            "owner",
+        );
         assert!(args
             .iter()
             .any(|arg| arg.contains(&format!("master={QUASAR_MIC_SINK_NAME}.monitor"))));
@@ -502,7 +515,11 @@ mod tests {
             "quasar-pulse-test",
             "/run/quasar-agent/pulse-test",
             "quasar-node-agent:latest",
+            "owner",
         );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--label", "io.quasar.agent-owner=owner"]));
         let entrypoint = args.iter().position(|arg| arg == "--entrypoint").unwrap();
         let no_healthcheck = args
             .iter()
@@ -545,7 +562,12 @@ mod tests {
     #[test]
     fn pulse_run_pins_shared_paths_outside_private_runtime_dir() {
         let dir = "/run/quasar-agent/pulse-test";
-        let args = pulse_run_args("quasar-pulse-test", dir, "quasar-node-agent:latest");
+        let args = pulse_run_args(
+            "quasar-pulse-test",
+            dir,
+            "quasar-node-agent:latest",
+            "owner",
+        );
 
         assert!(args
             .iter()

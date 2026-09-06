@@ -23,8 +23,9 @@ import { Table, type TableColumn } from "../../components/Table";
 import { useToast } from "../../components/Toast";
 import { useFleetContext } from "../../lib/fleet/FleetContext";
 import { useResource } from "../../lib/resource/react";
+import { SteamPreparationStatus } from "./library/SteamPreparationStatus";
 import { hostImageState, imgRollout, POLICY_COPY } from "./library/imageRollout";
-import { dominantInFlightState, HOST_STATE_COPY, isImageInFlight } from "./library/imageStatus";
+import { dominantInFlightState, HOST_STATE_COPY } from "./library/imageStatus";
 
 interface DetailData {
   images: CatalogImage[];
@@ -78,8 +79,8 @@ export function ImageDetail() {
           policy: settingsEnv.settings.image_update_policy ?? "notify",
         };
       },
-      // Poll only while something is mid-install, same as ImagesTab.
-      pollMs: (d) => (d?.images.some(isImageInFlight) ? 4000 : null),
+      // Preparation continues after image download reaches ready.
+      pollMs: 4000,
     },
     [id],
   );
@@ -222,6 +223,11 @@ export function ImageDetail() {
           },
         },
         {
+          key: "preparation",
+          header: "Steam preparation",
+          render: (h) => <SteamPreparationStatus status={img.hosts?.find((host) => host.host_id === h.id)?.steam_preparation} />,
+        },
+        {
           key: "sessions",
           header: "Sessions",
           align: "right",
@@ -240,7 +246,7 @@ export function ImageDetail() {
   const inFlight = img ? dominantInFlightState(img) : null;
 
   return (
-    <section className="page">
+    <section className="page image-detail-page">
       <Breadcrumbs
         items={[
           { label: "Library", to: "/admin/library/apps" },
@@ -297,7 +303,7 @@ export function ImageDetail() {
           />
 
           <div className="editor">
-            <div style={{ display: "flex", flexDirection: "column", gap: "var(--s4)" }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: "var(--s4)", minWidth: 0 }}>
               <div className="card card-pad">
                 <p style={{ fontSize: "var(--t-sm)", color: "var(--text-2)", lineHeight: 1.55, margin: "0 0 var(--s4)", maxWidth: "70ch" }}>
                   {img.description}

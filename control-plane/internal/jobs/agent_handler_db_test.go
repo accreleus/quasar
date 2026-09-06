@@ -439,3 +439,39 @@ func TestReportRejectsANonAgentState(t *testing.T) {
 		t.Fatalf("a rejected report must leave the run running, got %s", got.State)
 	}
 }
+
+// A pending job is not permission: disabling its source while it waits must
+// keep it off the authenticated pull channel and close the stale queue row.
+func TestLiveAdmissionRecheckedBeforeAgentDispatch(t *testing.T) {
+	def := hostDef("template.warmup")
+	closed := make(chan string, 1)
+	def.OnTerminal = func(_ context.Context, run Run) { closed <- run.ID }
+	def.ValidateParams = func(context.Context, string, json.RawMessage) error { return errors.New("Steam source disabled") }
+	f := newAgentFixture(t, def, hostDef("unrelated.job"))
+	blocked := f.materializeFor(t, "template.warmup", f.host, map[string]any{"policy_revision": "1"})
+	other := f.materializeFor(t, "unrelated.job", f.host, nil)
+	resp := agentReq(t, "GET", f.srv.URL+"/v1/agent/jobs/pending", "host-a", "secret-a", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("pending: %d", resp.StatusCode)
+	}
+	out := decodePending(t, resp)
+	if len(out.Runs) != 1 || out.Runs[0].RunID != other.ID {
+		t.Fatalf("source-gated run leaked or unrelated run blocked: %+v", out)
+	}
+	run, err := f.store.GetRun(context.Background(), blocked.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.State != StateSkipped {
+		t.Fatalf("stale job left %s", run.State)
+	}
+	select {
+	case id := <-closed:
+		if id != blocked.ID {
+			t.Fatal("wrong closure callback")
+		}
+	default:
+		t.Fatal("closed stale row did not notify generation reconciler")
+	}
+}

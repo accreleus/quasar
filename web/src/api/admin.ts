@@ -158,6 +158,7 @@ export function updateSettings(
     registration_mode?: RegistrationMode;
     storage_provider?: StorageProvider;
     library_discovery_enabled?: boolean;
+    steam_preparation_enabled?: boolean;
     library_discovery_interval_minutes?: number;
     library_discovery_appdetails_enabled?: boolean;
     image_update_policy?: ImageUpdatePolicy;
@@ -457,8 +458,8 @@ export function deleteRuntimePreset(token: string, id: string): Promise<void> {
 
 // ── App-image catalog (Spec A P1: read + sync only) ───────────────────────────
 
-export function listImages(token: string): Promise<ImageCatalogEnvelope> {
-  return apiFetch<ImageCatalogEnvelope>("/admin/images", { token });
+export function listImages(token: string, signal?: AbortSignal): Promise<ImageCatalogEnvelope> {
+  return apiFetch<ImageCatalogEnvelope>("/admin/images", { token, signal });
 }
 
 /** A manifest-fetch failure is reported as `sync_error` on a 200 with the cached

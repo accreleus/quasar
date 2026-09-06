@@ -128,6 +128,7 @@ pub enum AbortCause {
     /// session is involved: the warm-up must not run on into the next
     /// connection's first user session (#489).
     ConnectionLost,
+    PolicyChanged,
 }
 
 impl AbortCause {
@@ -135,6 +136,7 @@ impl AbortCause {
         match v {
             1 => AbortCause::UserLaunch,
             2 => AbortCause::ConnectionLost,
+            3 => AbortCause::PolicyChanged,
             _ => AbortCause::None,
         }
     }
@@ -144,6 +146,7 @@ impl AbortCause {
             AbortCause::None => 0,
             AbortCause::UserLaunch => 1,
             AbortCause::ConnectionLost => 2,
+            AbortCause::PolicyChanged => 3,
         }
     }
 
@@ -152,6 +155,7 @@ impl AbortCause {
         match self {
             AbortCause::UserLaunch => "aborted for a user session launch",
             AbortCause::ConnectionLost => "aborted: the control-plane connection was lost",
+            AbortCause::PolicyChanged => "aborted: Steam source policy or template storage changed",
             // Aborted with no recorded cause: stay neutral rather than guess.
             AbortCause::None => "warm-up aborted; it will retry",
         }
@@ -216,6 +220,10 @@ impl WarmupControl {
     /// session is involved, so the reason must not claim one.
     pub fn abort_for_connection_lost(&self) {
         self.abort_with(AbortCause::ConnectionLost);
+    }
+
+    pub fn abort_for_policy_change(&self) {
+        self.abort_with(AbortCause::PolicyChanged);
     }
 
     fn abort_with(&self, cause: AbortCause) {

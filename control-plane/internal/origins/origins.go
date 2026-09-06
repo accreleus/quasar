@@ -276,8 +276,8 @@ func (r *Resolver) Resolve(ctx context.Context) (list []string, source string) {
 	return out, SourceDatabase
 }
 
-// Invalidate drops the cached allow-list. Exported for dependent packages'
-// tests (internal/signal); production relies on the TTL instead.
+// Invalidate drops the cached allow-list after an admin policy change commits.
+// Both signaling and access-check observe the new policy on their next read.
 func (r *Resolver) Invalidate() {
 	r.mu.Lock()
 	r.cached, r.cachedAt = nil, time.Time{}

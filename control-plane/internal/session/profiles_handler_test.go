@@ -467,3 +467,39 @@ func TestProfilesEndpointPoorNetwork(t *testing.T) {
 		}
 	}
 }
+
+func TestProfilesEndpointUsesReportedHostCodecs(t *testing.T) {
+	pool := testDB(t)
+	s := seed(t, pool, 4)
+	srv, authSvc, _ := newMetricsServer(t, pool)
+	ctx := context.Background()
+	u, err := authSvc.Register(ctx, "host-codecs@test.local", "host-codecs", "quasar-fixture-pw-08")
+	must(t, err)
+	tok := loginTok(t, authSvc, "host-codecs@test.local", "quasar-fixture-pw-08")
+	enableChainCodecs(t, pool, "1440p60", "av1", "hevc", "h264")
+	upsertCodecProbe(t, pool, u.ID, true, true)
+	setHostCodecs(t, pool, s.hostID, `["h264","h265"]`)
+	url := srv.URL + "/v1/me/profiles?app_id=" + s.appID
+	_, body := getProfiles(t, url, tok)
+	av1 := rungByID(body, "1440p60-av1")
+	if av1 == nil || av1.Eligibility != "ineligible" || !hasReasonCode(av1.Reasons, "host_encoder_not_supported") {
+		t.Fatalf("AV1 must be excluded by reported host capability: %+v", av1)
+	}
+	if hevc := rungByID(body, "1440p60-hevc"); hevc == nil || hevc.Eligibility != "eligible" {
+		t.Fatalf("HEVC alternative must stay available: %+v", hevc)
+	}
+
+	// A newly reported codec is reflected immediately without a control-plane
+	// restart; a previous exclusion does not become a sticky user preference.
+	setHostCodecs(t, pool, s.hostID, `["h264","h265","av1"]`)
+	_, body = getProfiles(t, url, tok)
+	if r := rungByID(body, "1440p60-av1"); r == nil || r.Eligibility != "eligible" {
+		t.Fatalf("AV1 did not return after host re-report: %+v", r)
+	}
+	_, err = pool.Exec(ctx, `UPDATE hosts SET codecs = NULL WHERE id = $1`, s.hostID)
+	must(t, err)
+	_, body = getProfiles(t, url, tok)
+	if r := rungByID(body, "1440p60-av1"); r == nil || r.Eligibility != "eligible" {
+		t.Fatalf("legacy unreported capability should remain advisory: %+v", r)
+	}
+}

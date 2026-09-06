@@ -93,10 +93,22 @@ func SelfContainerID() string {
 }
 
 func containerIDFromMountinfo(body string) string {
+	// Overlay layer and Btrfs subvolume IDs are also 64 hex characters.
+	// Only Docker's per-container identity-file mounts identify this container.
 	for _, line := range strings.Split(body, "\n") {
-		for _, token := range strings.Split(line, "/") {
-			if len(token) == 64 && isHex(token) {
-				return token
+		fields := strings.Fields(line)
+		if len(fields) < 6 {
+			continue
+		}
+		switch fields[4] {
+		case "/etc/hosts", "/etc/hostname", "/etc/resolv.conf":
+		default:
+			continue
+		}
+		parts := strings.Split(fields[3], "/")
+		for i := 1; i < len(parts); i++ {
+			if parts[i-1] == "containers" && len(parts[i]) == 64 && isHex(parts[i]) {
+				return parts[i]
 			}
 		}
 	}

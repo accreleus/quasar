@@ -112,6 +112,8 @@ const ICE_BROKEN: readonly TransportState[] = ["failed"];
 export interface StallInputs {
   /** The phase derived from the live status string (`statusPhase`). */
   phase: LaunchPhase;
+  /** False means the signaling WebSocket has not opened. */
+  wsOpen?: boolean;
   /** Does the control plane say a host owns this session (`host_id` set)? */
   hostAssigned: boolean;
   /** Does the control plane say `state === "running"`? */
@@ -131,10 +133,16 @@ export interface StallInputs {
 
 export interface StallVerdict {
   /** `"transport"` verdicts are about the media path, never about scheduling. */
-  kind: "phase" | "transport";
+  kind: "phase" | "transport" | "signaling";
   title: string;
   message: string;
 }
+
+const signalingVerdict: StallVerdict = {
+  kind: "signaling",
+  title: "The signaling connection could not open",
+  message: "The browser could not open the session’s signaling connection to Quasar. Check the public address, reverse proxy WebSocket support, and allowed browser origins in instance settings. Media negotiation has not started, so this does not establish a UDP, STUN or TURN problem.",
+};
 
 const transportVerdict: StallVerdict = { kind: "transport", ...TRANSPORT_STALL_COPY };
 
@@ -149,6 +157,12 @@ const phaseVerdict = (phase: LaunchPhase): StallVerdict => ({
  *  known to own the session. */
 export function resolveStall(input: StallInputs): StallVerdict | null {
   const { phase, hostAssigned, sessionRunning, iceState, phaseElapsedMs, transportElapsedMs } = input;
+
+  // A running app is not evidence that signaling or media negotiation began.
+  if (input.wsOpen === false && (iceState === null || iceState === "new") && (sessionRunning || phase === "stream") && (
+    (sessionRunning && transportElapsedMs >= TRANSPORT_STALL_MS) ||
+    phaseElapsedMs >= (input.stallMs ?? PHASE_STALL_MS[phase])
+  )) return signalingVerdict;
 
   // 1. Terminal ICE (`failed` only), reported at once.
   if (iceState !== null && ICE_BROKEN.includes(iceState)) return transportVerdict;

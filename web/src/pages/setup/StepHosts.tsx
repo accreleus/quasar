@@ -17,7 +17,7 @@
 // `explainCodecGap` (lib/hostCodecs.ts) owns the wording, including the one
 // operator knob (QUASAR_VULKAN_HEVC=0 on a Vulkan host).
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import * as adminApi from "../../api/admin";
 import { ApiError } from "../../api/client";
@@ -25,6 +25,7 @@ import { useAuth } from "../../auth/context";
 import type { GPUAvailability, Host, HostSettingsResponse, StorageProvider } from "../../api/types";
 import { Button } from "../../components/Button";
 import { Chip } from "../../components/Chip";
+import { useResource } from "../../lib/resource/react";
 import { ReadinessCard } from "../../components/ReadinessCard";
 import { StatusChip, type StatusChipConfig } from "../../components/StatusChip";
 import { codecDisplayName } from "../../lib/codecDisplay";
@@ -68,57 +69,30 @@ function currentHomeRoot(settings: HostSettingsResponse): { root: string; isOver
 
 export function StepHosts({ onNext }: StepHostsProps) {
   const { token } = useAuth();
-  const [rows, setRows] = useState<HostRow[] | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [storageProvider, setStorageProvider] = useState<StorageProvider | null>(null);
-
-  useEffect(() => {
-    if (!token) return;
-    let cancelled = false;
-    // Read once, shared by every host card; a failure degrades to "driver
-    // unknown" per host rather than blocking the step.
-    adminApi.getSettings(token).then(
-      ({ settings }) => {
-        if (!cancelled) setStorageProvider(settings.storage_provider);
-      },
-      () => {
-        /* left null — host cards render without a driver verdict */
-      },
-    );
-    adminApi
-      .listHosts(token)
-      .then(async ({ items }) => {
-        const withDetail = await Promise.all(
-          items.map(async (host) => {
-            const [gpus, settings] = await Promise.all([
-              adminApi.getHostGPUs(token, host.id).then(
-                (r) => r.items,
-                () => null,
-              ),
-              adminApi.getHostSettings(token, host.id).then(
-                (s) => s,
-                () => null,
-              ),
-            ]);
-            return { host, gpus, settings };
-          }),
-        );
-        if (!cancelled) setRows(withDetail);
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setLoadError(err instanceof ApiError ? err.message : "Could not reach the control plane.");
-        setRows([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [token]);
+  const hostResource = useResource<HostRow[]>({
+    label: "setup hosts",
+    pollMs: 5000,
+    fetch: async ({ token }) => {
+      const { items } = await adminApi.listHosts(token);
+      return Promise.all(items.map(async (host) => {
+        const [gpus, settings] = await Promise.all([
+          adminApi.getHostGPUs(token, host.id).then(r => r.items, () => null),
+          adminApi.getHostSettings(token, host.id).then(r => r, () => null),
+        ]);
+        return { host, gpus, settings };
+      }));
+    },
+  });
+  const settingsResource = useResource<Awaited<ReturnType<typeof adminApi.getSettings>>>({
+    label: "setup storage settings",
+    fetch: ({ token, signal }) => adminApi.getSettings(token, signal),
+  });
+  const rows = hostResource.data ?? null;
+  const loadError = hostResource.errorMessage;
+  const storageProvider = settingsResource.data?.settings.storage_provider ?? null;
 
   function applySettingsUpdate(hostId: string, next: HostSettingsResponse) {
-    setRows((prev) =>
-      prev === null ? prev : prev.map((r) => (r.host.id === hostId ? { ...r, settings: next } : r)),
-    );
+    hostResource.setData(prev => prev.map(row => row.host.id === hostId ? { ...row, settings: next } : row));
   }
 
   const anyIssue =
@@ -139,9 +113,9 @@ export function StepHosts({ onNext }: StepHostsProps) {
       </div>
 
       <p className="login-error" role="note" style={{ color: "var(--info-text)", background: "var(--info-bg)", borderColor: "var(--info-line)" }}>
-        Media (WebRTC) is LAN/VPN-only in this release — there is no STUN/TURN
-        yet. A player connecting from outside your network needs a VPN into
-        it; this is a deliberate v1 posture, not a bug.
+        Media (WebRTC) needs a reachable host. For remote players, configure
+        STUN/TURN or use a shared VPN. A reverse proxy carries signaling but
+        does not relay video.
       </p>
 
       {loadError && (
@@ -211,21 +185,20 @@ export function StepHosts({ onNext }: StepHostsProps) {
                 </ul>
               )}
 
-              {/* First-run §S1 — never blocks Continue; fixes need an agent
-                  restart, hence the footnote instead of a recheck control. */}
+              {/* Readiness is refreshed by the agent and polled while this step is visible. */}
               <ReadinessCard
                 checks={host.readiness}
                 reportedAt={host.readiness_reported_at}
                 footnote={
                   <>
-                    Fixes here need the host's node-agent restarted (driver fixes need the agent
-                    container recreated) before this card updates — from{" "}
-                    <Link to="/admin/fleet/hosts">Admin → Hosts</Link> once setup is finished.
+                    Checks update automatically. Driver provisioning retries recoverable failures
+                    and restarts the agent when its new libraries require it. If a check requests
+                    container recreation, use <Link to="/admin/fleet/hosts">Admin → Hosts</Link>.
                   </>
                 }
               />
 
-              <CodecSection settings={settings} />
+              <CodecSection settings={settings} readiness={host.readiness} />
 
               {/* §S4b/§S4c — a rootless host is misconfigured, not blocking. */}
               {token && (
@@ -276,7 +249,7 @@ const dangerBoxStyle = {
  *  `codecs` null (pre-multi-codec agent — the API deliberately does not
  *  normalise to ["h264"]) → "not reported" plus the consequence, never an
  *  assertion; present → list them and explain any gap (explainCodecGap). */
-function CodecSection({ settings }: { settings: HostSettingsResponse | null }) {
+function CodecSection({ settings, readiness }: { settings: HostSettingsResponse | null; readiness: Host["readiness"] }) {
   if (!settings) {
     return (
       <p className="field-hint" style={{ margin: 0 }}>
@@ -301,7 +274,7 @@ function CodecSection({ settings }: { settings: HostSettingsResponse | null }) {
   // agent env and reads "openh264" on an un-overridden Vulkan host, which
   // would suppress the one gap with a real fix.
   const encoder = settings.effective?.["encoder"] ?? null;
-  const gap = explainCodecGap(codecs, encoder);
+  const gap = explainCodecGap(codecs, encoder, readiness);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "var(--s2)" }}>

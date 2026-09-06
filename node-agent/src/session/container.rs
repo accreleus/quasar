@@ -80,7 +80,11 @@ fn output_with_timeout(cmd: &mut Command, what: &str) -> Result<Output> {
     output_with_deadline(cmd, what, RUNTIME_CMD_TIMEOUT)
 }
 
-fn output_with_deadline(cmd: &mut Command, what: &str, timeout: Duration) -> Result<Output> {
+pub(crate) fn output_with_deadline(
+    cmd: &mut Command,
+    what: &str,
+    timeout: Duration,
+) -> Result<Output> {
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -161,9 +165,19 @@ const NVIDIA_LIB32_PROBE_IMAGES: [&str; 2] = ["busybox", "alpine:3"];
 
 /// POSIX `sh`: print the first 32-bit lib dir holding `libGLX_nvidia.so.*`, exit 0;
 /// else exit 1. The search list is exactly the 32-bit dirs — `/usr/lib64` and
-/// `/usr/lib/x86_64-linux-gnu` are never searched, and each glob is non-recursive so
+/// `/usr/lib/x86_64-linux-gnu` are never searched, and each lookup is non-recursive so
 /// `/host-usr/lib` cannot descend into a 64-bit multiarch subdir.
-const NVIDIA_LIB32_PROBE_SCRIPT: &str = "for d in /host-usr/lib /host-usr/lib32 /host-usr/lib/i386-linux-gnu; do for f in \"$d\"/libGLX_nvidia.so.*; do [ -e \"$f\" ] && printf %s \"$d\" && exit 0; done; done; exit 1";
+const NVIDIA_LIB32_PROBE_SCRIPT: &str = r#"
+root=${2:-/host-usr}
+for d in "$root/lib" "$root/lib32" "$root/lib/i386-linux-gnu"; do
+    f="$d/libGLX_nvidia.so.$1"
+    [ -f "$f" ] || continue
+    # ELF magic plus EI_CLASS=1: never mistake a 64-bit library for lib32.
+    header=$(od -An -tx1 -N5 "$f" | tr -d ' \n')
+    [ "$header" = 7f454c4601 ] && printf %s "$d" && exit 0
+done
+exit 1
+"#;
 
 /// #384: the display mode handed to the app container — the session's streamed
 /// `width`/`height`/`fps`. The compositor's `wl_output` advertises it, but an app that
@@ -314,14 +328,26 @@ pub struct ContainerRuntime {
 }
 
 impl ContainerRuntime {
+    #[cfg(test)]
+    pub(crate) fn test_runtime(bin: &str) -> Self {
+        Self {
+            bin: bin.to_string(),
+            nvidia: false,
+        }
+    }
+
     /// Knobs: `QUASAR_CONTAINER_RUNTIME`, `QUASAR_GPU_NVIDIA`.
     pub fn from_env() -> Self {
         let bin =
             std::env::var("QUASAR_CONTAINER_RUNTIME").unwrap_or_else(|_| "docker".to_string());
-        let nvidia = matches!(
-            std::env::var("QUASAR_GPU_NVIDIA").ok().as_deref(),
-            Some("1") | Some("true") | Some("TRUE")
-        );
+        let nvidia = match std::env::var("QUASAR_GPU_NVIDIA").ok().as_deref() {
+            Some("0" | "false" | "FALSE") => false,
+            Some("1" | "true" | "TRUE") => true,
+            _ => matches!(
+                crate::gpu_vendor::detect(),
+                Some((crate::gpu_vendor::GpuVendor::Nvidia, _))
+            ),
+        };
         ContainerRuntime { bin, nvidia }
     }
 
@@ -337,10 +363,26 @@ impl ContainerRuntime {
         &self.bin
     }
 
+    /// The exact locally running image, rather than a guessed development tag.
+    pub fn own_image(&self) -> Result<String> {
+        let id = crate::nvidia_volume::self_container_id()
+            .context("cannot determine the agent container identity")?;
+        let image = self.run_raw(&["inspect", "--format", "{{.Image}}", &id])?;
+        anyhow::ensure!(
+            !image.trim().is_empty(),
+            "agent image inspection returned no image"
+        );
+        Ok(image.trim().to_owned())
+    }
+
     /// Read one `ENV` value baked into an image. The S1 driver-volume wiring must
     /// APPEND to an image's own `LD_LIBRARY_PATH` rather than replace it (docker `-e`
     /// replaces). Best-effort: an inspect failure returns `None`.
     pub fn image_env(&self, image: &str, key: &str) -> Option<String> {
+        self.image_env_checked(image, key).ok().flatten()
+    }
+
+    fn image_env_checked(&self, image: &str, key: &str) -> Result<Option<String>> {
         let out = output_with_timeout(
             Command::new(&self.bin).args([
                 "image",
@@ -350,16 +392,16 @@ impl ContainerRuntime {
                 image,
             ]),
             "image env inspect",
-        )
-        .ok()?;
-        if !out.status.success() {
-            return None;
-        }
+        )?;
+        anyhow::ensure!(
+            out.status.success(),
+            "cannot inspect app image {image} before configuring its NVIDIA loader environment"
+        );
         let prefix = format!("{key}=");
-        String::from_utf8_lossy(&out.stdout)
+        Ok(String::from_utf8_lossy(&out.stdout)
             .lines()
             .find_map(|l| l.strip_prefix(&prefix).map(str::to_string))
-            .filter(|v| !v.is_empty())
+            .filter(|v| !v.is_empty()))
     }
 
     /// S5: follow an app container's log stream into a bounded [`AppLogRing`] from
@@ -463,26 +505,47 @@ impl ContainerRuntime {
     /// #375: locate the host dir holding the 32-bit NVIDIA driver libs, for read-only
     /// injection into NVIDIA app containers. The agent cannot see the host filesystem,
     /// so this runs a short-lived probe container that bind-mounts host `/usr` read-only
-    /// and globs `libGLX_nvidia.so.*` under `/usr/lib`, `/usr/lib32`,
-    /// `/usr/lib/i386-linux-gnu`, excluding the 64-bit dirs. Returns the first hit as a
-    /// host path.
+    /// and checks `libGLX_nvidia.so.<loaded driver version>` under `/usr/lib`,
+    /// `/usr/lib32`, and `/usr/lib/i386-linux-gnu`. Only an ELF32 library matching
+    /// the loaded kernel driver qualifies. Returns the first hit as a host path.
     ///
-    /// Fails open, never fatal: it tries `busybox` then `alpine:3`, moving on if a
-    /// pull/run fails (no network on a locked-down host). Script exit 1 ("ran, found
-    /// nothing") is definitive and returns `None` without trying further images. Any
-    /// failure ⇒ `None`, and the operator can set `QUASAR_NV_LIB32_PATH`.
+    /// Uses the running agent's exact local image; legacy/bare-metal agents whose
+    /// image cannot be identified try `busybox` then `alpine:3`. Script exit 1
+    /// ("ran, found nothing") is definitive. Failure returns `None`, allowing the
+    /// driver-volume provisioner to supply the libraries; an explicit
+    /// `QUASAR_NV_LIB32_PATH` remains available.
     pub fn probe_nvidia_lib32_path(&self) -> Option<String> {
-        for image in NVIDIA_LIB32_PROBE_IMAGES {
+        let version = crate::nvidia_volume::kernel_driver_version(Path::new("/"))?;
+        let images = self
+            .own_image()
+            .map(|image| vec![image])
+            .unwrap_or_else(|_| {
+                NVIDIA_LIB32_PROBE_IMAGES
+                    .iter()
+                    .map(|image| (*image).to_owned())
+                    .collect()
+            });
+        for image in &images {
             let out = output_with_deadline(
                 Command::new(&self.bin).args([
                     "run",
                     "--rm",
-                    "-v",
-                    "/usr:/host-usr:ro",
-                    image,
+                    "--network",
+                    "none",
+                    "--read-only",
+                    "--cap-drop",
+                    "ALL",
+                    "--security-opt",
+                    "no-new-privileges",
+                    "--mount",
+                    "type=bind,src=/usr,dst=/host-usr,readonly",
+                    "--entrypoint",
                     "sh",
+                    image,
                     "-c",
                     NVIDIA_LIB32_PROBE_SCRIPT,
+                    "quasar-lib32-probe",
+                    &version,
                 ]),
                 "nvidia lib32 probe",
                 NVIDIA_LIB32_PROBE_TIMEOUT,
@@ -564,55 +627,84 @@ impl ContainerRuntime {
         format!("{SESSION_NAME_PREFIX}{session_id}")
     }
 
-    /// Force-remove every container whose name contains any of `prefixes`. Called at
-    /// agent startup to reap session/sidecar containers orphaned by a previous agent
-    /// that died without a clean unwind: `docker run --rm` siblings survive a SIGKILL of
-    /// the agent (P2-05). Fails open — logged, never fatal, since a clean boot must not
-    /// hinge on the sweep. Returns the number removed.
+    /// Reap only this persistent agent's labelled session/audio siblings. Legacy
+    /// unlabelled containers remain untouched for operator review.
     pub fn sweep_orphans(&self, prefixes: &[&str]) -> usize {
+        match crate::container_ownership::token() {
+            Ok(owner) => self.sweep_orphans_for(&owner, prefixes),
+            Err(error) => {
+                tracing::warn!(token = "orphan-sweep-owner-unavailable", "{error}");
+                0
+            }
+        }
+    }
+
+    fn sweep_orphans_for(&self, owner: &str, prefixes: &[&str]) -> usize {
+        let filter = format!("label={}={owner}", crate::container_ownership::LABEL);
+        let output = match self.run_raw(&["ps", "-aq", "--no-trunc", "--filter", &filter]) {
+            Ok(output) => output,
+            Err(error) => {
+                tracing::warn!(token = "orphan-sweep-ps-failed", "{error}");
+                return 0;
+            }
+        };
         let mut removed = 0;
-        for prefix in prefixes {
-            // `--filter name=` matches as a substring; our names all start with the
-            // prefix and no other container carries it, so this selects exactly the
-            // orphans.
-            let out = output_with_timeout(
-                Command::new(&self.bin).args(["ps", "-aq", "--filter", &format!("name={prefix}")]),
-                "container ps",
-            );
-            let ids = match out {
-                Ok(o) if o.status.success() => {
-                    String::from_utf8_lossy(&o.stdout).trim().to_string()
-                }
-                Ok(o) => {
-                    tracing::warn!(
-                        token = "orphan-sweep-ps-failed",
-                        "orphan sweep: `{} ps` for {prefix} failed: {}",
-                        self.bin,
-                        String::from_utf8_lossy(&o.stderr).trim()
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        token = "orphan-sweep-ps-exec-failed",
-                        "orphan sweep: failed to exec `{} ps` for {prefix}: {e}",
-                        self.bin
-                    );
-                    continue;
-                }
-            };
-            for id in ids.lines().filter(|l| !l.is_empty()) {
-                tracing::info!("orphan sweep: removing stale container {id} (prefix {prefix})");
-                self.force_remove(id);
-                removed += 1;
+        for target in output.lines().filter(|id| !id.is_empty()) {
+            match self.owned_container_id(target, owner, prefixes) {
+                Ok(Some(id)) => match self.run_raw(&["rm", "-f", &id]) {
+                    Ok(_) => removed += 1,
+                    Err(error) => tracing::warn!(token = "orphan-sweep-rm-failed", "{error}"),
+                },
+                Ok(None) => {}
+                Err(error) => tracing::warn!(token = "orphan-sweep-preserved", "{error}"),
             }
         }
         removed
     }
 
+    fn owned_container_id(
+        &self,
+        target: &str,
+        owner: &str,
+        prefixes: &[&str],
+    ) -> Result<Option<String>> {
+        // Inspect only ownership fields, never container environment credentials.
+        let template =
+            r#"{"Id":{{json .Id}},"Name":{{json .Name}},"Labels":{{json .Config.Labels}}}"#;
+        let output = match self.run_raw(&["inspect", "--format", template, "--", target]) {
+            Ok(output) => output,
+            Err(error) if error.to_string().contains("No such") => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let value: serde_json::Value = serde_json::from_str(&output)?;
+        crate::container_ownership::owned_id(&value, owner, prefixes)
+            .map(Some)
+            .ok_or_else(|| anyhow!("Preserving container {target}: it is unowned, belongs to another agent, or has an unrelated name. Review legacy containers manually; this agent cannot remove them."))
+    }
+
+    fn managed_container_id(&self, target: &str) -> Result<Option<String>> {
+        let owner = crate::container_ownership::token().map_err(anyhow::Error::msg)?;
+        self.owned_container_id(
+            target,
+            &owner,
+            &[SESSION_NAME_PREFIX, super::audio::PULSE_NAME_PREFIX],
+        )
+    }
+
+    /// Prepare a managed name without ever deleting another agent's collision.
+    pub(crate) fn remove_owned_container(&self, name: &str) -> Result<()> {
+        if let Some(id) = self.managed_container_id(name)? {
+            self.run_raw(&["rm", "-f", &id])?;
+        }
+        Ok(())
+    }
+
     /// Launch the app container as a detached Wayland client of the session
     /// compositor. Returns a handle whose `Drop` guarantees teardown.
     pub fn run(&self, spec: &ContainerSpec, params: &LaunchParams) -> Result<RunningContainer> {
+        if let Some(error) = crate::readiness::sibling_mount_error() {
+            anyhow::bail!("Cannot launch an app with unverified host mounts: {error}");
+        }
         // A swap (P2-07) briefly runs the old and new app containers at once, so a
         // per-generation name override avoids a collision; the demo path passes None
         // and gets the stable per-session name.
@@ -625,8 +717,12 @@ impl ContainerRuntime {
         // fail the launch, never reach `docker run`.
         let network = resolve_network(spec.network.as_deref())?;
 
-        // Clear any stale same-named container first (idempotent prepare).
-        self.force_remove(&name);
+        anyhow::ensure!(
+            name.starts_with(SESSION_NAME_PREFIX),
+            "app container name must start with {SESSION_NAME_PREFIX}"
+        );
+        let owner = crate::container_ownership::token().map_err(anyhow::Error::msg)?;
+        self.remove_owned_container(&name)?;
 
         let mut args: Vec<String> = vec![
             "run".into(),
@@ -634,6 +730,8 @@ impl ContainerRuntime {
             "--rm".into(), // self-clean if it exits on its own (no orphan)
             "--name".into(),
             name.clone(),
+            "--label".into(),
+            format!("{}={owner}", crate::container_ownership::LABEL),
             // Isolated by default: `none` unless the app declares a requirement
             // (§S2: Steam's first boot must download steamui.so) or the operator sets
             // a host-wide default.
@@ -815,7 +913,7 @@ impl ContainerRuntime {
                 // container is as CUDA-only as the agent's was, so the app needs the
                 // same 64-bit GL/EGL/Vulkan set, vendor configs and loader path. Empty
                 // on every host with its own driver.
-                args.extend(nvidia_driver_volume_args(self, &spec.image));
+                args.extend(nvidia_driver_volume_args(self, &spec.image)?);
             }
             // AMD/Intel (and NVIDIA's render node for Vulkan/EGL) want the DRI nodes.
             args.push("--device".into());
@@ -1082,6 +1180,15 @@ impl ContainerRuntime {
     /// auto-removes and `force_remove` is the idempotent backstop. Knob:
     /// `QUASAR_APP_STOP_TIMEOUT_SECS`.
     pub fn graceful_remove(&self, name: &str) {
+        let id = match self.managed_container_id(name) {
+            Ok(Some(id)) => id,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(token = "container-graceful-cleanup-preserved", "{error}");
+                return;
+            }
+        };
+        let name = id.as_str();
         let secs: u64 = std::env::var("QUASAR_APP_STOP_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1120,6 +1227,22 @@ impl ContainerRuntime {
     /// `rm -f` a container by name. Idempotent and best-effort: a missing
     /// container is success (the orphan-free postcondition holds either way).
     pub fn force_remove(&self, name: &str) {
+        let owned_id;
+        let name = if crate::container_ownership::managed_name(name) {
+            match self.managed_container_id(name) {
+                Ok(Some(id)) => {
+                    owned_id = id;
+                    owned_id.as_str()
+                }
+                Ok(None) => return,
+                Err(error) => {
+                    tracing::warn!(token = "container-force-cleanup-preserved", "{error}");
+                    return;
+                }
+            }
+        } else {
+            name
+        };
         let res = output_with_timeout(
             Command::new(&self.bin).args(["rm", "-f", name]),
             "container rm",
@@ -1419,12 +1542,22 @@ const NVIDIA_DRIVER_VOLUME_DST: &str = "/opt/quasar/nvidia-driver";
 /// The mount + discovery env for the S1 driver volume, or empty when nothing is
 /// provisioned. Reads the image's own `LD_LIBRARY_PATH` because `-e` REPLACES it, and
 /// overwriting an app image's loader path trades one breakage for another.
-fn nvidia_driver_volume_args(runtime: &ContainerRuntime, image: &str) -> Vec<String> {
+fn nvidia_driver_volume_args(runtime: &ContainerRuntime, image: &str) -> Result<Vec<String>> {
+    crate::nvidia_volume::validate_host_path_for_launch(runtime.bin())
+        .map_err(anyhow::Error::msg)?;
+    crate::nvidia_volume::retry_mount_resolution(runtime.bin());
     let Some(info) = crate::nvidia_volume::current() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
+    anyhow::ensure!(info.host.is_some() || info.name.is_some(),
+        "NVIDIA driver is provisioned but its app-container mount is unresolved; check Docker socket and identity inspection or set QUASAR_NVIDIA_DRIVER_HOST_PATH to the existing host directory");
+    if let crate::nvidia_volume::EglRuntime::Broken { detail, .. } =
+        crate::nvidia_volume::probe_sibling_egl()
+    {
+        anyhow::bail!("NVIDIA driver failed the sibling-container EGL test: {detail}");
+    }
     let image_ld = runtime
-        .image_env(image, "LD_LIBRARY_PATH")
+        .image_env_checked(image, "LD_LIBRARY_PATH")?
         .unwrap_or_default();
     let args =
         crate::nvidia_volume::app_container_args(Some(&info), NVIDIA_DRIVER_VOLUME_DST, &image_ld);
@@ -1436,7 +1569,7 @@ fn nvidia_driver_volume_args(runtime: &ContainerRuntime, image: &str) -> Vec<Str
             info.manifest.driver_version
         );
     }
-    args
+    Ok(args)
 }
 
 /// Does the HOST have a `/dev/fuse` node?
@@ -1933,7 +2066,7 @@ impl RunningContainer {
     pub fn stop(&mut self) {
         // `swap`, not load+store: the idempotency check is itself the one-shot gate.
         if !self.removed.swap(true, Ordering::SeqCst) {
-            self.runtime.graceful_remove(&self.name);
+            self.runtime.graceful_remove(&self.container_id);
         }
     }
 
@@ -1968,6 +2101,42 @@ mod tests {
             mode,
             gid,
         }
+    }
+
+    #[test]
+    fn lib32_probe_requires_matching_version_and_elf_class() {
+        let root = tempfile::tempdir().unwrap();
+        let lib = root.path().join("lib");
+        std::fs::create_dir(&lib).unwrap();
+        let probe = || {
+            Command::new("sh")
+                .args([
+                    "-c",
+                    NVIDIA_LIB32_PROBE_SCRIPT,
+                    "test",
+                    "610.57.04",
+                    root.path().to_str().unwrap(),
+                ])
+                .output()
+                .unwrap()
+        };
+        std::fs::write(lib.join("libGLX_nvidia.so.595.1"), b"\x7fELF\x01").unwrap();
+        assert!(
+            !probe().status.success(),
+            "a stale driver must not be injected"
+        );
+        std::fs::write(lib.join("libGLX_nvidia.so.610.57.04"), b"\x7fELF\x02").unwrap();
+        assert!(
+            !probe().status.success(),
+            "a 64-bit library must not satisfy lib32"
+        );
+        std::fs::write(lib.join("libGLX_nvidia.so.610.57.04"), b"\x7fELF\x01").unwrap();
+        let out = probe();
+        assert!(out.status.success());
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            lib.to_string_lossy()
+        );
     }
 
     /// Ubuntu's `docker-default` denies mount inside a user namespace, which Steam's
@@ -2622,7 +2791,9 @@ mod tests {
             bin: "docker".to_string(),
             nvidia: true,
         };
-        assert!(nvidia_driver_volume_args(&rt, "quasar-steam:latest").is_empty());
+        assert!(nvidia_driver_volume_args(&rt, "quasar-steam:latest")
+            .unwrap()
+            .is_empty());
     }
 
     /// The mount destination must never be GOW's `/usr/nvidia`: upstream cont-init
@@ -2665,5 +2836,59 @@ mod tests {
             vec!["--device".to_string(), "/dev/fuse".to_string()]
         );
         assert!(fuse_device_args(false).is_empty());
+    }
+    #[test]
+    fn orphan_sweep_independently_checks_owner_and_prefix_before_removing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("docker");
+        let removed = dir.path().join("removed");
+        let one = "a".repeat(64);
+        let two = "b".repeat(64);
+        let legacy = "c".repeat(64);
+        let unrelated = "d".repeat(64);
+        let pulse = "e".repeat(64);
+        // Deliberately ignore Docker's filter: the independent inspect check must
+        // preserve foreign, unlabelled and substring-only names even then.
+        let body = format!(
+            r#"#!/bin/sh
+case "$1" in
+ps) printf '%s\n' '{one}' '{two}' '{legacy}' '{unrelated}' '{pulse}' ;;
+inspect)
+ for target do :; done
+ case "$target" in
+ {one}) name=quasar-sess-one; owner=one ;;
+ {two}) name=quasar-sess-two; owner=two ;;
+ {legacy}) name=quasar-sess-legacy; owner= ;;
+ {unrelated}) name=other-quasar-sess-one; owner=one ;;
+ {pulse}) name=quasar-pulse-one; owner=one ;;
+ *) echo 'No such container' >&2; exit 1 ;;
+ esac
+ printf '{{"Id":"%s","Name":"/%s","Labels":{{"io.quasar.agent-owner":"%s"}}}}\n' "$target" "$name" "$owner" ;;
+rm) printf '%s\n' "$3" >> '{}' ;;
+esac
+"#,
+            removed.display()
+        );
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = ContainerRuntime::test_runtime(script.to_str().unwrap());
+        let prefixes = [SESSION_NAME_PREFIX, super::super::audio::PULSE_NAME_PREFIX];
+        assert_eq!(runtime.sweep_orphans_for("one", &prefixes), 2);
+        assert_eq!(
+            std::fs::read_to_string(&removed).unwrap(),
+            format!("{one}\n{pulse}\n")
+        );
+        std::fs::write(&removed, "").unwrap();
+        assert_eq!(runtime.sweep_orphans_for("two", &prefixes), 1);
+        assert_eq!(
+            std::fs::read_to_string(&removed).unwrap(),
+            format!("{two}\n")
+        );
+        assert!(runtime.owned_container_id(&two, "one", &prefixes).is_err());
+        assert!(runtime
+            .owned_container_id("missing", "one", &prefixes)
+            .unwrap()
+            .is_none());
     }
 }

@@ -3742,6 +3742,8 @@ export interface paths {
             requestBody: {
                 content: {
                     "application/json": {
+                        /** @description Controls automatic preparation and template consumption for eligible adopted Steam images. Absent unchanged; null invalid. Revision is read-only. */
+                        steam_preparation_enabled?: boolean;
                         registration_mode?: components["schemas"]["RegistrationMode"];
                         storage_provider?: components["schemas"]["StorageProvider"];
                         /** @description Steam library discovery Phase 4. EVERY FIELD ON THIS BODY IS OPTIONAL AND ABSENCE MEANS UNCHANGED - a plain (non-pointer) decode of an absent library_discovery_enabled would read false and silently switch discovery off every time an admin changed the registration mode. A PATCH naming no known field is a no-op that returns current state. */
@@ -7198,7 +7200,31 @@ export interface components {
             applied: boolean;
             image: components["schemas"]["CatalogImage"];
         };
+        SteamPreparationStatus: {
+            detail: string;
+            eligible: boolean;
+            supported: boolean;
+            desired_enabled: boolean;
+            desired_revision: string;
+            applied_revision: string | null;
+            policy_pending: boolean;
+            preparation_enabled: boolean | null;
+            consumption_enabled: boolean | null;
+            /** @enum {string} */
+            state: "waiting_image" | "queued" | "preparing" | "ready" | "deferred" | "failed" | "disabled" | "unsupported" | "unknown" | "pending_policy";
+            reason: string;
+            template: {
+                registry_ref: string;
+                version: string;
+            } | null;
+            /** @enum {string|null} */
+            clone_mode: "reflink" | "copy" | null;
+            clone_reason: string | null;
+            /** Format: date-time */
+            reported_at: string | null;
+        } | null;
         ImageHostState: {
+            steam_preparation?: components["schemas"]["SteamPreparationStatus"];
             /** Format: uuid */
             host_id: string;
             node_name?: string;
@@ -7692,6 +7718,9 @@ export interface components {
         StorageProvider: "auto" | "local" | "volume";
         SettingsEnvelope: {
             settings: {
+                /** @default true */
+                steam_preparation_enabled: boolean;
+                readonly steam_preparation_revision: string;
                 registration_mode: components["schemas"]["RegistrationMode"];
                 storage_provider: components["schemas"]["StorageProvider"];
                 /**

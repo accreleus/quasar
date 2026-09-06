@@ -228,9 +228,13 @@ func (c *Config) HTTPRedirectEnabled() bool {
 // fails startup rather than defaulting: the quiet outcome is a deployment that
 // looks configured and is not.
 func Load() (*Config, error) {
+	dsn, err := databaseURL()
+	if err != nil {
+		return nil, err
+	}
 	c := &Config{
 		ListenAddr:   envOr("LISTEN_ADDR", ":8080"),
-		DatabaseURL:  os.Getenv("DATABASE_URL"),
+		DatabaseURL:  dsn,
 		LogLevel:     envOr("LOG_LEVEL", "info"),
 		AuthTokenTTL: 24 * time.Hour,
 	}

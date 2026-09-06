@@ -481,10 +481,8 @@ pub struct SessionConfig {
     /// `vulkanh264enc` `intra-refresh-period` in frames (`QUASAR_INTRA_REFRESH_PERIOD`,
     /// 0 = continuous back-to-back cycles). Ignored unless `intra_refresh`.
     pub intra_refresh_period: u32,
-    /// #488: the resolved golden-home template store, snapshotted from `agent.rs`
-    /// (`QUASAR_HOME_TEMPLATES` gate + `template::TemplateStore::resolve_from_env`).
-    /// `None` when off or misconfigured, and `provision_home_dirs` then does no seeding.
-    pub template_store: Option<template::TemplateStore>,
+    /// Connection-scoped authorization for preparing and consuming Steam templates.
+    pub source_policy: Option<std::sync::Arc<crate::source_policy::SourcePolicy>>,
     /// The `image_id` this session's container resolves to
     /// (`ImageManager::image_id_for_ref`; the wire's `AppSpec.image` carries none).
     /// `None` for test-src or an image never `image_ensure`'d, and seeding is then
@@ -569,7 +567,7 @@ impl SessionConfig {
             intra_refresh_period: env_u64("QUASAR_INTRA_REFRESH_PERIOD", 0) as u32,
             // No connection-level agent state to snapshot here; callers that want
             // seeding set these explicitly after construction.
-            template_store: None,
+            source_policy: None,
             image_id: None,
             mic_jitter_ms: env_mic_jitter_ms("QUASAR_MIC_JITTER_MS"),
         }
@@ -812,7 +810,7 @@ impl SessionConfig {
             intra_refresh_period: env_u64("QUASAR_INTRA_REFRESH_PERIOD", 0) as u32,
             // `agent.rs`'s SessionAssign handler sets these right after construction,
             // alongside `cfg.console_config` / `cfg.video_topology`.
-            template_store: None,
+            source_policy: None,
             image_id: None,
             mic_jitter_ms: env_mic_jitter_ms("QUASAR_MIC_JITTER_MS"),
         }

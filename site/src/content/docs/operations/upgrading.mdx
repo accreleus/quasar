@@ -139,7 +139,7 @@ Once, on each host:
 
    ```bash
    echo "QUASAR_STACK_DIR=$(cd deploy && pwd)" >> deploy/.env
-   echo "QUASAR_UPDATER_IMAGE=ghcr.io/accreleus/quasar/quasar-updater:latest" >> deploy/.env
+   # Set QUASAR_UPDATER_IMAGE in deploy/.env to the updater image for your release.
    ```
 
 3. **Bring it up**, touching nothing else.

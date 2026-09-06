@@ -80,6 +80,17 @@ beforeEach(() => {
 });
 
 describe("ReleasesTab on edge", () => {
+  it("labels an older same-schema edge candidate without suggesting a new update", async () => {
+    const view = edgeView({ built_at: "2026-08-18T09:14:02Z" });
+    view.targets[0] = { ...view.targets[0], eligible: false, reason: "up_to_date" };
+    mocked.getPlatformReleases.mockResolvedValue(view);
+    renderTab();
+    expect((await screen.findAllByText(/Older than installed/)).length).toBeGreaterThan(0);
+    expect(screen.queryByText("Latest")).not.toBeInTheDocument();
+    expect(screen.queryByText("Update available")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /apply update/i })).not.toBeInTheDocument();
+  });
+
   it("shows the commit and the compare link in place of a version and notes", async () => {
     mocked.getPlatformReleases.mockResolvedValue(edgeView());
     const { container } = renderTab();

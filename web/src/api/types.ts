@@ -490,6 +490,7 @@ export type ReadinessCheck = Schemas["ReadinessCheck"];
 export type CatalogImage = Schemas["CatalogImage"];
 
 export type ImageHostState = Schemas["ImageHostState"];
+export type SteamPreparationStatus = NonNullable<ImageHostState["steam_preparation"]>;
 
 /** Where the served catalog came from (#548). The manifest is fetched
  *  unauthenticated at a MUTABLE ref, so a force-push upstream silently changes

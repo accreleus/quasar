@@ -144,6 +144,21 @@ describe("StepFinishing", () => {
     expect(adminApi.forceLibraryScan).not.toHaveBeenCalled();
   });
 
+  it("requires operator confirmation before calling the first stream checked", async () => {
+    vi.mocked(adminApi.getSettings).mockResolvedValue(settings());
+    vi.mocked(adminApi.listSecrets).mockResolvedValue(secretsEnvelope());
+    renderStep();
+    await waitUntilReady();
+    expect(screen.getByText(/Streaming is not yet confirmed/)).toBeInTheDocument();
+    const link = screen.getByRole("link", { name: /Open library for a test stream/ });
+    expect(link).toHaveAttribute("href", "/app");
+    expect(link).toHaveAttribute("target", "_blank");
+    for (const name of [/I can see the app/, /I can hear sound/, /Keyboard, mouse or controller/]) {
+      fireEvent.click(screen.getByRole("checkbox", { name }));
+    }
+    expect(screen.getByText(/You have confirmed video, audio and input/)).toBeInTheDocument();
+  });
+
   // Item 4 (Alice PR #480 review): the requirement is that an air-gapped or
   // offline install can finish — and offline is precisely where
   // GET /v1/admin/secrets REJECTS, not where it happens to return an empty

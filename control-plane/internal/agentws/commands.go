@@ -2,6 +2,8 @@ package agentws
 
 import (
 	"encoding/json"
+
+	"github.com/accreleus/quasar/control-plane/internal/preparation"
 )
 
 // SignalingEnvelope is the agent-api.md relay wrapper: both directions use this
@@ -154,8 +156,9 @@ type CaptureParams struct {
 // (hostcfg.Resolve); the agent overlays it and applies live knobs on the next
 // session. Older agents ignore unknown message types.
 type ConfigUpdateCmd struct {
-	Type     string         `json:"type"` // "config_update"
-	Settings map[string]any `json:"settings"`
+	SourcePolicies *preparation.Policies `json:"source_policies,omitempty"`
+	Type           string                `json:"type"` // "config_update"
+	Settings       map[string]any        `json:"settings"`
 	// Resolved console-mode config (CM-01, agent-api.md
 	// `config_update.console_config`). Typed `any` rather than importing
 	// internal/console — only the JSON shape is load-bearing.

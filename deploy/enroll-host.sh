@@ -171,8 +171,10 @@ services:
       QUASAR_HOMES_GC: ${QUASAR_HOMES_GC:-}
       QUASAR_HOMES_GC_RETENTION_HOURS: ${QUASAR_HOMES_GC_RETENTION_HOURS:-}
       QUASAR_HOMES_GC_DRY_RUN: ${QUASAR_HOMES_GC_DRY_RUN:-}
-      QUASAR_HOME_TEMPLATES: ${QUASAR_HOME_TEMPLATES:-}
-      QUASAR_TEMPLATE_WARMUP: ${QUASAR_TEMPLATE_WARMUP:-}
+      # Steam source policy enables preparation by default; explicit host
+      # opt-outs below remain authoritative for their respective activity.
+      QUASAR_HOME_TEMPLATES:
+      QUASAR_TEMPLATE_WARMUP:
       QUASAR_TEMPLATE_ROOT: ${QUASAR_TEMPLATE_ROOT:-}
       QUASAR_TEMPLATE_CLONE_MODE: ${QUASAR_TEMPLATE_CLONE_MODE:-}
       QUASAR_TEMPLATE_ALLOW_CROSSFS: ${QUASAR_TEMPLATE_ALLOW_CROSSFS:-}
@@ -227,6 +229,7 @@ services:
       QUASAR_INPUT_CONTROLLER_NUDGE: ${QUASAR_INPUT_CONTROLLER_NUDGE:-}
       LIBGL_ALWAYS_SOFTWARE: ${LIBGL_ALWAYS_SOFTWARE-}
       MESA_LOADER_DRIVER_OVERRIDE: ${MESA_LOADER_DRIVER_OVERRIDE-}
+      QUASAR_NVIDIA_DRIVER_HOST_PATH: ${QUASAR_NVIDIA_DRIVER_HOST_PATH:-}
       QUASAR_PULSE_IMAGE: ${QUASAR_PULSE_IMAGE:-${QUASAR_AGENT_IMAGE:-${QUASAR_NODE_IMAGE:-quasar-node-agent:latest}}}
       QUASAR_APP_SHM_SIZE: ${QUASAR_APP_SHM_SIZE:-1g}
       QUASAR_APP_STOP_TIMEOUT_SECS: ${QUASAR_APP_STOP_TIMEOUT_SECS:-10}
@@ -241,7 +244,7 @@ services:
       - ${QUASAR_TEMPLATE_ROOT:-/var/lib/quasar/templates}:${QUASAR_TEMPLATE_ROOT:-/var/lib/quasar/templates}
       - /etc/os-release:/host/etc/os-release:ro
       - /dev:/host/dev:ro
-      - /sys/kernel/security:/host/sys/kernel/security:ro
+      - /sys/kernel:/host/sys/kernel:ro
       - quasar-agent-data:/var/lib/quasar-agent
       - quasar-updater-run:/run/quasar-updater
     devices:

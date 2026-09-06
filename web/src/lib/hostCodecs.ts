@@ -3,6 +3,7 @@
 // AV1 → HEVC → H.264 in every ≥1080p launch profile; the only gap was that
 // nothing said which codecs a HOST can produce.
 
+import type { ReadinessCheck } from "../api/types";
 import { codecDisplayName } from "./codecDisplay";
 
 const ALL_WIRE_CODECS = ["h264", "h265", "av1"] as const;
@@ -15,29 +16,34 @@ export interface CodecGap {
   reason: string;
 }
 
-/**
- * Explains a host's missing codecs (wire vocab h264|h265|av1, not the
- * catalog's `hevc`); null when complete or not-yet-reported. The one
- * operator-checkable knob is HEVC on a Vulkan host (QUASAR_VULKAN_HEVC,
- * default on — so h264-only means an explicit =0 or a missing element; the
- * agent's "vulkan codec plan" startup line says which). Every other gap is an
- * element/registry fact, never operator misconfiguration.
- */
+/** Explain the reported codec set without inferring driver compatibility from
+ * a missing element. The agent owns compatibility policy and its explanation. */
 export function explainCodecGap(
   codecs: string[] | null | undefined,
   encoder: string | null | undefined,
+  readiness?: readonly ReadinessCheck[] | null,
 ): CodecGap | null {
   if (!codecs || codecs.length === 0) return null; // "not reported", handled separately by the caller
   const have = new Set(codecs);
   const missing = ALL_WIRE_CODECS.filter((c) => !have.has(c));
   if (missing.length === 0) return null;
 
+  const compatibility = readiness?.find(
+    (check) => check.id === "nvidia_vulkan_av1_compatibility" && check.status === "warn",
+  );
+  if (missing.includes("av1") && compatibility) {
+    return {
+      missing,
+      reason: `${compatibility.summary} See Vulkan AV1 compatibility in Readiness for driver guidance.`,
+    };
+  }
+
   const missingLabel = missing.map((c) => codecDisplayName(c)).join(" and ");
 
   if (have.size === 1 && have.has("h264") && encoder === "vulkan" && missing.includes("h265")) {
     // The one real, findable, one-line fix (S5's specific example).
     const av1Note = missing.includes("av1")
-      ? " AV1 is on by default too; when a Vulkan host cannot produce it, sessions fall back to the vendor AV1 encoder, which this host does not have either."
+      ? " AV1 may also be unavailable because of driver compatibility. Check Readiness for the agent’s diagnosis."
       : "";
     return {
       missing,
@@ -51,9 +57,9 @@ export function explainCodecGap(
   return {
     missing,
     reason:
-      `This host does not report ${missingLabel}. That means the encoder or RTP payloader element ` +
-      `for ${missing.length > 1 ? "those codecs is" : "that codec is"} not registered on this host — ` +
-      `not a setting to flip. This is a host/driver capability gap, separate from the catalog (which ` +
+      `This host does not report ${missingLabel}. The encoder or RTP payloader element ` +
+      `for ${missing.length > 1 ? "those codecs may be" : "that codec may be"} unavailable, or a driver compatibility check may have disabled it. Check Readiness for the agent’s diagnosis. This is ` +
+      `a host/driver capability gap, separate from the catalog (which ` +
       `already chains AV1 → HEVC → H.264 and will simply skip what this host cannot produce).`,
   };
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/hostcfg"
 	"github.com/accreleus/quasar/control-plane/internal/hostenroll"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
+	"github.com/accreleus/quasar/control-plane/internal/preparation"
 	"github.com/accreleus/quasar/control-plane/internal/ratelimit"
 )
 
@@ -53,18 +54,20 @@ var upgrader = websocket.Upgrader{
 
 // Handler is the HTTP handler for the agent WebSocket endpoint (GET /agent/ws).
 type Handler struct {
-	store           *agentStore
-	log             *slog.Logger
-	enrollmentToken string
-	registry        *Registry
-	events          Events
-	relay           *RelayBus
-	cfgStore        *hostcfg.Store
-	consoleStore    *console.Store
-	consoleAuto     *consoleAutoState
-	failures        *ratelimit.FailureLimiter
-	diagnostics     *diagnosticQueue
-	vram            *vramQueue
+	preparation         *preparation.Store
+	OnPreparationReport func(string)
+	store               *agentStore
+	log                 *slog.Logger
+	enrollmentToken     string
+	registry            *Registry
+	events              Events
+	relay               *RelayBus
+	cfgStore            *hostcfg.Store
+	consoleStore        *console.Store
+	consoleAuto         *consoleAutoState
+	failures            *ratelimit.FailureLimiter
+	diagnostics         *diagnosticQueue
+	vram                *vramQueue
 	// Image-management P2 callback surface (images.go). Never nil — NewHandler
 	// installs a no-op — so dispatch needs no guard.
 	imageEvents ImageEvents
@@ -273,6 +276,8 @@ func (h *Handler) Close() {
 	}
 }
 
+func (h *Handler) SetPreparation(s *preparation.Store) { h.preparation = s }
+
 // Register wires the handler into mux at GET /agent/ws.
 func (h *Handler) Register(mux httpx.Router) {
 	mux.HandleFunc("GET /agent/ws", h.ServeHTTP)
@@ -314,7 +319,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	// Long-lived WS connections outlive the HTTP request context lifetime, so we
 	// use a background context for DB calls. The request context is used only to
 	// detect server shutdown (the HTTP server closes idle connections on shutdown).
-	bg := context.Background()
+	bg := preparation.ConnectionContext(context.Background())
 
 	// Step 1 — register
 	registerCtx, cancelRegister := context.WithTimeout(bg, handshakeTimeout)
@@ -366,8 +371,16 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	// Push settings + console config (agent-api.md `config_update`) before the
 	// capacity handshake can assign a session (see above). Fire-and-forget: a
 	// failure must never fail registration — the agent keeps its env baseline.
-	if h.cfgStore != nil || h.consoleStore != nil {
+	if h.cfgStore != nil || h.consoleStore != nil || h.preparation != nil {
 		cmd := ConfigUpdateCmd{Type: "config_update"}
+		if h.preparation != nil {
+			snapshot, err := h.preparation.Snapshot(bg, hostID)
+			if err != nil {
+				h.log.Warn("source policy snapshot failed", "host_id", hostID, "err", err)
+			} else {
+				cmd.SourcePolicies = snapshot
+			}
+		}
 		if h.cfgStore != nil {
 			if overrides, err := h.cfgStore.Get(bg, hostID); err != nil {
 				h.log.Warn("config_update snapshot: load host settings failed", "host_id", hostID, "err", err)
@@ -627,6 +640,11 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 	// fields become NULL (agent-api.md §register). A write failure is logged
 	// and swallowed: the control plane never refuses a registration over these
 	// fields, and a host that streams is worth more than a known build stamp.
+	if h.preparation != nil {
+		if err := h.preparation.Register(ctx, result.HostID, reg.SourcePolicyVersions); err != nil {
+			return fail(fmt.Errorf("reset source policy epoch: %w", err))
+		}
+	}
 	identity, droppedIdentity := identityFromRegister(reg)
 	if len(droppedIdentity) > 0 {
 		h.log.Warn("register: ignoring malformed identity fields",
@@ -701,6 +719,13 @@ func (h *Handler) processCapacity(ctx context.Context, hostID string, raw []byte
 	}
 	if err := h.store.upsertCapacityWithDetection(ctx, hostID, cap.Host, cap.EffectiveSettings, gpus, detection, reason); err != nil {
 		return err
+	}
+	if h.preparation != nil && cap.SourcePreparation != nil {
+		if changed, err := h.preparation.AcceptReport(ctx, hostID, cap.SourcePreparation); err != nil {
+			h.log.Warn("source preparation report rejected", "host_id", hostID, "err", err)
+		} else if changed && h.OnPreparationReport != nil {
+			h.OnPreparationReport(hostID)
+		}
 	}
 	// The remaining stores are all fire-and-forget: a failure is logged and
 	// must never break capacity handling.

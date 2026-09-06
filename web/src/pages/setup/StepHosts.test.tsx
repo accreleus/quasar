@@ -343,6 +343,28 @@ describe("StepHosts", () => {
     expect(screen.queryByRole("button", { name: /codec|enable|hevc|av1/i })).not.toBeInTheDocument();
   });
 
+  it("explains AV1 driver compatibility from host readiness instead of blaming a missing plugin", async () => {
+    vi.mocked(adminApi.listHosts).mockResolvedValue({ items: [makeHost({ readiness: [{
+      id: "nvidia_vulkan_av1_compatibility",
+      status: "warn",
+      summary: "NVIDIA 595.99.02 on RTX 5090 produces corrupted Vulkan AV1 video. AV1 is disabled.",
+      remediation: "610.57.04 is validated on this GPU.",
+    }] })] } as never);
+    vi.mocked(adminApi.getHostGPUs).mockResolvedValue({ items: [gpu] } as never);
+    vi.mocked(adminApi.getHostSettings).mockResolvedValue({
+      resolved: {}, overrides: {}, effective: { encoder: "vulkan" },
+      codecs: ["h264", "h265"], pending_restart: false,
+    } as never);
+    renderStep();
+    await waitFor(() => {
+      expect(screen.getByText(/See Vulkan AV1 compatibility in Readiness/)).toBeInTheDocument();
+    });
+    expect(screen.getByText("H.264")).toBeInTheDocument();
+    expect(screen.getByText("HEVC")).toBeInTheDocument();
+    expect(screen.queryByText(/^AV1$/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/vendor AV1 encoder|may be unavailable/)).not.toBeInTheDocument();
+  });
+
   it("§S5: an h264-only VULKAN host is told about the QUASAR_VULKAN_HEVC knob", async () => {
     vi.mocked(adminApi.listHosts).mockResolvedValue({ items: [makeHost()] } as never);
     vi.mocked(adminApi.getHostGPUs).mockResolvedValue({ items: [gpu] } as never);
@@ -360,7 +382,7 @@ describe("StepHosts", () => {
     });
   });
 
-  it("§S5: an h264-only NON-Vulkan host is told the element is missing, never that it is misconfigured", async () => {
+  it("§S5: an h264-only NON-Vulkan host sees possible capability causes, never a claim of misconfiguration", async () => {
     vi.mocked(adminApi.listHosts).mockResolvedValue({ items: [makeHost()] } as never);
     vi.mocked(adminApi.getHostGPUs).mockResolvedValue({ items: [gpu] } as never);
     vi.mocked(adminApi.getHostSettings).mockResolvedValue({
@@ -373,7 +395,7 @@ describe("StepHosts", () => {
     renderStep();
 
     await waitFor(() => {
-      expect(screen.getByText(/not registered on this host/i)).toBeInTheDocument();
+      expect(screen.getByText(/may be unavailable/i)).toBeInTheDocument();
     });
     expect(screen.queryByText(/QUASAR_VULKAN_HEVC/)).not.toBeInTheDocument();
     expect(screen.queryByText(/misconfigur/i)).not.toBeInTheDocument();

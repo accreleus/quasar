@@ -63,6 +63,8 @@ type fleetHarness struct {
 	// How this control plane got its own image; a source-built one is never
 	// offered a registry image.
 	cpInstallMode string
+	cpBuiltAt     *string
+	channel       string
 }
 
 // newFleetHarness wires the four fleet endpoints behind the real admin chain.
@@ -77,7 +79,7 @@ func newFleetHarness(t *testing.T, cpCommit string, drivers interface {
 	ctx := context.Background()
 	store := NewStore(pool)
 
-	h := &fleetHarness{pool: pool, store: store, cpCommit: cpCommit, cpInstallMode: InstallRegistry}
+	h := &fleetHarness{pool: pool, store: store, cpCommit: cpCommit, cpInstallMode: InstallRegistry, channel: ChannelStable}
 	h.release = seedRelease(t, store, commitB, buildinfo.Get().SchemaVersion)
 	h.hostID = seedHost(t, pool, "gpu-fleet-01", commitA, "online")
 
@@ -86,7 +88,7 @@ func newFleetHarness(t *testing.T, cpCommit string, drivers interface {
 		if err != nil {
 			return View{}, err
 		}
-		releases, err := store.Releases(ctx, ChannelStable)
+		releases, err := store.Releases(ctx, h.channel)
 		if err != nil {
 			return View{}, err
 		}
@@ -98,9 +100,11 @@ func newFleetHarness(t *testing.T, cpCommit string, drivers interface {
 		if err != nil {
 			return View{}, err
 		}
+		identity := cp(h.cpCommit, buildinfo.Get().SchemaVersion)
+		identity.BuiltAt = h.cpBuiltAt
 		return PlanRelease(PlanInputs{
-			Channel:                 ChannelStable,
-			ControlPlane:            cp(h.cpCommit, buildinfo.Get().SchemaVersion),
+			Channel:                 h.channel,
+			ControlPlane:            identity,
 			Hosts:                   hosts,
 			Releases:                releases,
 			OpenAttempts:            open,
@@ -480,4 +484,22 @@ func TestFleetAdoptedWithNoCordonRecordLeavesTheFleetOnline(t *testing.T) {
 		two, err2 := h.store.HostStatus(ctx, other)
 		return err1 == nil && err2 == nil && one == "online" && two == "online"
 	})
+}
+
+func TestFleetApplyRejectsOlderEdgeBeforeCreatingRun(t *testing.T) {
+	h := newFleetHarness(t, commitA, parkedDrivers{})
+	h.channel = ChannelEdge
+	h.cpBuiltAt = str(h.release.BuiltAt.Add(time.Hour).Format(time.RFC3339))
+	mustExec(t, h.pool, `UPDATE platform_releases SET channel = 'edge', version = NULL, manifest = NULL WHERE id = $1`, h.release.ID)
+	for _, force := range []bool{false, true} {
+		code, raw := h.do(t, http.MethodPost, "/v1/admin/platform/apply", h.admin,
+			FleetApplyRequest{ReleaseID: h.release.ID, Force: force})
+		if code != http.StatusConflict || errCode(t, raw) != CodeReleaseNotOffered {
+			t.Fatalf("force=%v: POST older edge = %d %s, want 409 release_not_offered", force, code, raw)
+		}
+	}
+	runs, err := h.store.ListRuns(context.Background(), 10)
+	if err != nil || len(runs) != 0 {
+		t.Fatalf("runs = %+v, err = %v; want no run created", runs, err)
+	}
 }

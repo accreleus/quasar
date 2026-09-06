@@ -111,3 +111,50 @@ func targetReason(v View, kind string) string {
 	}
 	return "no such target"
 }
+
+// #136: switching from a newer tagged install to a lagging edge branch must not
+// offer a downgrade in time. Keep the row visible, and guard apply independently
+// because a fleet apply normally accepts an up_to_date control-plane target.
+func TestOlderEdgeBuildIsListedButCannotBeApplied(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		channel   string
+		schema    int
+		built     time.Time
+		installed *string
+		blocked   bool
+	}{
+		{"older edge", ChannelEdge, 76, at(1), str(at(2).Format(time.RFC3339)), true},
+		{"newer edge", ChannelEdge, 76, at(3), str(at(2).Format(time.RFC3339)), false},
+		{"equal timestamps", ChannelEdge, 76, at(2), str(at(2).Format(time.RFC3339)), false},
+		{"newer schema takes precedence", ChannelEdge, 77, at(1), str(at(2).Format(time.RFC3339)), false},
+		{"stable unchanged", ChannelStable, 76, at(1), str(at(2).Format(time.RFC3339)), false},
+		{"missing installed time", ChannelEdge, 76, at(1), nil, false},
+		{"invalid installed time", ChannelEdge, 76, at(1), str("invalid"), false},
+		{"missing candidate time", ChannelEdge, 76, time.Time{}, str(at(2).Format(time.RFC3339)), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			installed := cp(commitB, 76)
+			installed.BuiltAt = tc.installed
+			release := rel("candidate", "0.2.3", commitA, tc.schema, tc.built)
+			release.Channel = tc.channel
+			view := PlanRelease(PlanInputs{
+				Channel: tc.channel, ControlPlane: installed, Releases: []Release{release},
+				UpdaterPresent: true, ControlPlaneInstallMode: str(InstallRegistry),
+			})
+			if len(view.Available) != 1 {
+				t.Fatal("candidate must remain visible")
+			}
+			wantReason := ""
+			if tc.blocked {
+				wantReason = ReasonUpToDate
+			}
+			if got := targetReason(view, TargetControlPlane); got != wantReason {
+				t.Fatalf("reason = %q, want %q", got, wantReason)
+			}
+			if offered(view, release.ID) == tc.blocked {
+				t.Fatalf("apply offered = %v, blocked = %v", offered(view, release.ID), tc.blocked)
+			}
+		})
+	}
+}

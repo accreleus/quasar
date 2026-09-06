@@ -41,7 +41,6 @@ use crate::session::vulkan_fault::{self, GpuGlobalFaultDetector};
 use crate::session::{EncoderChoice, SessionConfig, StreamParams};
 use crate::vram::{VramCache, VramTarget};
 
-const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CRITICAL_EVENT_CAPACITY: usize = 256;
 const DIAGNOSTIC_EVENT_CAPACITY: usize = 128;
 
@@ -129,6 +128,12 @@ pub async fn run(cfg: Config) {
     // exit rather than retry forever. Checked before any other startup work.
     if let Err(msg) = enrollment_reachable(&cfg) {
         error!(token = "boot-enrollment-unconfigured", "{msg}");
+        sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
+        std::process::exit(1);
+    }
+
+    if let Err(message) = crate::container_ownership::initialize(&cfg.node_secret_path) {
+        error!(token = "boot-container-ownership-unavailable", "{message}");
         sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
         std::process::exit(1);
     }
@@ -311,7 +316,7 @@ fn spawn_nvidia_volume_provisioner(runtime: &ContainerRuntime, nvidia_lib32_prob
     let nvidia_lib32_probed = nvidia_lib32_probed.to_string();
     std::thread::Builder::new()
         .name("quasar-nvvol".into())
-        .spawn(move || {
+        .spawn(move || loop {
             // ONE `ProbeEnv::live`: building it forks the EGL self-test, and the gap
             // and the card must answer about the same instant.
             let env = crate::readiness::ProbeEnv::live(true, &nvidia_lib32_probed);
@@ -335,8 +340,15 @@ fn spawn_nvidia_volume_provisioner(runtime: &ContainerRuntime, nvidia_lib32_prob
                          the next session launch; no agent restart needed"
                     );
                 }
+                crate::nvidia_volume::Outcome::Failed(_) => {
+                    // The artifact layer owns download backoff and integrity refusal.
+                    // Rechecking also recovers from another provisioner's stale lock.
+                    std::thread::sleep(Duration::from_secs(60));
+                    continue;
+                }
                 _ => {}
             }
+            return;
         })
         .map(|_| ())
         .unwrap_or_else(|e| {
@@ -909,8 +921,9 @@ async fn connect_and_run(
     .await;
     crate::buildinfo::set_install_facts(install.clone());
     let register_msg = AgentMsg::Register {
+        source_policy_versions: Some(serde_json::json!({"steam_preparation": 1})),
         node_name: cfg.node_name.clone(),
-        agent_version: AGENT_VERSION.to_string(),
+        agent_version: crate::buildinfo::version().to_string(),
         auth,
         images,
         source_commit: crate::buildinfo::source_commit().map(str::to_string),
@@ -1015,6 +1028,7 @@ async fn connect_and_run(
     };
     crate::readiness::log_report(&readiness);
     let capacity_msg = AgentMsg::Capacity {
+        source_preparation: None,
         host: cap.host,
         gpus: cap.gpus,
         gpu_detection: cap.gpu_detection,
@@ -1072,44 +1086,40 @@ async fn connect_and_run(
     let warmup_store = crate::session::warmup::resolve_store(&mgr.runtime_settings.home_root);
     let warmup_activity = Arc::new(crate::session::warmup::HostActivity::new());
     let warmup_control = Arc::new(crate::session::warmup::WarmupControl::new());
-    let warmup_runner = Arc::new(crate::session::warmup::WarmupJobRunner::new(
-        crate::session::warmup::WarmupConfig::from_env(),
-        warmup_store.clone(),
-        Arc::new(crate::session::warmup::host::AgentWarmupHost::new(
-            ContainerRuntime::from_env(),
-            mgr.runtime_settings.clone(),
-        )),
+    let source_policy = crate::source_policy::SourcePolicy::new(
+        &mgr.runtime_settings.home_root,
         warmup_control.clone(),
-        warmup_activity.clone(),
-        app_uid_gid(),
-    ));
+        image_mgr.clone(),
+    );
+    let _source_policy_guard = crate::source_policy::ConnectionGuard(source_policy.clone());
+    mgr.source_policy = Some(source_policy.clone());
+    let warmup_runner = Arc::new(
+        crate::session::warmup::WarmupJobRunner::new(
+            crate::session::warmup::WarmupConfig::from_env(),
+            warmup_store.clone(),
+            Arc::new(crate::session::warmup::host::AgentWarmupHost::new(
+                ContainerRuntime::from_env(),
+                mgr.runtime_settings.clone(),
+            )),
+            warmup_control.clone(),
+            warmup_activity.clone(),
+            app_uid_gid(),
+        )
+        .with_policy(source_policy.clone()),
+    );
     mgr.warmup_activity = Some(warmup_activity);
     mgr.warmup_control = Some(warmup_control.clone());
     mgr.note_session_count();
     // The one image-lifecycle duty that stayed agent-side: drop a template whose image
     // was uninstalled. Detached on disconnect (the ImageManager is process-wide); the
     // guard also aborts a warm-up that would otherwise outlive its connection (#489).
-    let _warmup_guard = warmup_store.as_ref().map(|store| {
-        image_mgr.set_lifecycle_observer(Some(Arc::new(
-            crate::session::warmup::TemplateReaper::new(store.clone()),
-        )));
-        info!("template: golden-home warm-up armed for this connection");
-        crate::session::warmup::WarmupConnectionGuard::new(warmup_control, image_mgr.clone())
-    });
-    // The seeding half, gated separately from the warm-up-building wiring above
-    // (`QUASAR_HOME_TEMPLATES` vs `QUASAR_TEMPLATE_WARMUP`): a host can consume
-    // already-built templates without ever building one, and vice versa. Off by
-    // default — `template_store` stays `None` and `provision_home_dirs` is unchanged.
-    mgr.template_store = if crate::session::env_bool("QUASAR_HOME_TEMPLATES") {
-        crate::session::template::TemplateStore::resolve_from_env(std::path::Path::new(
-            &mgr.runtime_settings.home_root,
-        ))
-    } else {
-        None
-    };
+    image_mgr.set_lifecycle_observer(Some(source_policy));
+    let _warmup_guard =
+        crate::session::warmup::WarmupConnectionGuard::new(warmup_control, image_mgr.clone());
     // Tracks the reservation across heartbeats so a flip triggers exactly one
     // capacity re-send.
     let mut last_warmup_reserved = false;
+    let mut last_source_report: Option<serde_json::Value> = None;
     let (evt_tx, evt_rx) = mpsc::channel::<(String, SessionEvent)>(CRITICAL_EVENT_CAPACITY);
     // `Option`-wrapped for `recv_or_disabled`, like the other four receiver arms.
     let mut evt_rx = Some(evt_rx);
@@ -1186,8 +1196,45 @@ async fn connect_and_run(
         }
     };
 
+    // Readiness observes filesystem and provisioning state, which can change while
+    // connected. Keep probes off the WebSocket loop and allow only one in flight.
+    let mut readiness_timer = tokio::time::interval(Duration::from_secs(15));
+    readiness_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let (readiness_tx, mut readiness_rx) = tokio::sync::mpsc::channel(1);
+    let mut readiness_busy = false;
+
     loop {
         tokio::select! {
+            _ = readiness_timer.tick(), if !readiness_busy => {
+                readiness_busy = true;
+                let sender = readiness_tx.clone();
+                let lib32 = mgr.runtime_settings.nvidia_lib32_path.clone();
+                let codecs = mgr.host_codec_report.as_ref().map(|r| r.codecs.clone());
+                tokio::spawn(async move {
+                    let checks = tokio::task::spawn_blocking(move || crate::readiness::probe(
+                        &crate::readiness::ProbeEnv::live(nvidia_host, &lib32)
+                            .with_gpu_present(gpu_present)
+                            .with_codec_probe(codecs.as_deref()),
+                    )).await;
+                    let _ = sender.send(checks).await;
+                });
+            }
+            Some(checks) = readiness_rx.recv() => {
+                readiness_busy = false;
+                match checks {
+                    Ok(checks) => mgr.readiness = checks,
+                    Err(error) => {
+                        warn!(token = "readiness-refresh-failed", "host readiness refresh failed: {error}");
+                        mgr.readiness = vec![crate::messages::ReadinessCheck {
+                            id: "readiness_probe".into(), status: "warn".into(),
+                            summary: "Host readiness could not be refreshed; previous results are no longer current".into(),
+                            remediation: "The agent will retry automatically. Check its logs if this persists.".into(),
+                        }];
+                    }
+                }
+                send_fresh_capacity(&mut tx, &mut mgr).await?;
+            }
+
             _ = hb_timer.tick() => {
                 let ts_unix_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -1220,6 +1267,11 @@ async fn connect_and_run(
                 // The reservation is taken and released by the warm-up thread, which
                 // cannot send on this socket, so the heartbeat notices the flip. A
                 // report one beat late costs nothing — the gate is what serializes.
+                let source_report = mgr.source_policy.as_ref().and_then(|p| p.report());
+                if source_report != last_source_report {
+                    last_source_report = source_report;
+                    send_fresh_capacity(&mut tx, &mut mgr).await?;
+                }
                 if mgr.warmup_reserved() != last_warmup_reserved {
                     last_warmup_reserved = mgr.warmup_reserved();
                     send_fresh_capacity(&mut tx, &mut mgr).await?;
@@ -1285,6 +1337,7 @@ async fn connect_and_run(
                                 mgr.warmup_reserved(),
                             );
                             let capacity_msg = AgentMsg::Capacity {
+            source_preparation: mgr.source_policy.as_ref().and_then(|p| p.report()),
                                 host: cap.host,
                                 gpus: cap_gpus,
                                 gpu_detection: cap.gpu_detection,
@@ -1338,6 +1391,7 @@ async fn connect_and_run(
                         mgr.warmup_reserved(),
                     );
                     let capacity_msg = AgentMsg::Capacity {
+            source_preparation: mgr.source_policy.as_ref().and_then(|p| p.report()),
                         host: cap.host,
                         gpus: cap_gpus,
                         gpu_detection: cap.gpu_detection,
@@ -1679,12 +1733,9 @@ struct SessionManager {
     /// `release_apply` dispatch target. Process-wide for the same reason as
     /// `image_mgr`: its poller outlives this connection.
     release_mgr: Arc<ReleaseManager>,
-    /// The resolved golden-home template store, or `None` when
-    /// `QUASAR_HOME_TEMPLATES` is off (the default) or the template root is
-    /// misconfigured. Independent of the warm-up store — a host can seed from
-    /// already-built templates without building one. Snapshotted onto each session's
-    /// `SessionConfig` at assignment.
-    template_store: Option<crate::session::template::TemplateStore>,
+    /// Connection-scoped source policy shared with workers and session seeding.
+    /// Its authorization is invalidated on disconnect even if sessions retain an Arc.
+    source_policy: Option<Arc<crate::source_policy::SourcePolicy>>,
 }
 
 /// The uid/gid an app container's entrypoint drops to
@@ -1774,7 +1825,7 @@ impl SessionManager {
             warmup_control: None,
             image_mgr,
             release_mgr,
-            template_store: None,
+            source_policy: None,
         }
     }
 
@@ -2051,7 +2102,7 @@ impl SessionManager {
                 // The wire carries no image_id on AppSpec, so resolve it from the
                 // launch ref via the ImageManager's map. `None` on either side means
                 // no seeding for this session, never an assignment failure.
-                cfg.template_store = self.template_store.clone();
+                cfg.source_policy = self.source_policy.clone();
                 cfg.image_id = container
                     .as_ref()
                     .and_then(|c| self.image_mgr.image_id_for_ref(&c.image));
@@ -2467,7 +2518,13 @@ impl SessionManager {
             ControlMsg::ConfigUpdate {
                 settings,
                 console_config,
+                source_policies,
             } => {
+                if let (Some(policy), Some(snapshot)) =
+                    (&self.source_policy, source_policies.as_ref())
+                {
+                    policy.apply(snapshot);
+                }
                 // #194: re-derive from the env baseline, then overlay the host's sparse
                 // overrides (agent-api.md `config_update` sends only those). An absent
                 // key keeps the env value, so a cleared override reverts to env rather
@@ -2479,6 +2536,9 @@ impl SessionManager {
                     next.apply_json(&settings);
                     seed_nvidia_lib32(&mut next, &self.nvidia_lib32_probed);
                     self.runtime_settings = next;
+                    if let Some(policy) = &self.source_policy {
+                        policy.update_root(&self.runtime_settings.home_root);
+                    }
                     info!(
                         "runtime settings updated: encoder={:?} gop={} abr_mode={} \
                          target_usage={} home_root={:?}",
@@ -3012,6 +3072,7 @@ where
     let mut cap_gpus = cap.gpus;
     crate::session::warmup::apply_encode_slot_reservation(&mut cap_gpus, mgr.warmup_reserved());
     let msg = AgentMsg::Capacity {
+        source_preparation: mgr.source_policy.as_ref().and_then(|p| p.report()),
         host: cap.host,
         gpus: cap_gpus,
         gpu_detection: cap.gpu_detection,
@@ -3754,6 +3815,7 @@ mod tests {
         );
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
         let msg = ControlMsg::ConfigUpdate {
+            source_policies: None,
             settings: serde_json::json!({ "gop": 120, "abr_enabled": true, "encoder": "va" }),
             console_config: None,
         };
@@ -3788,6 +3850,7 @@ mod tests {
 
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
+                source_policies: None,
                 settings: serde_json::json!({ "encoder": "va", "gop": 120 }),
                 console_config: None,
             },
@@ -3800,6 +3863,7 @@ mod tests {
         // Encoder override cleared, only gop set.
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
+                source_policies: None,
                 settings: serde_json::json!({ "gop": 90 }),
                 console_config: None,
             },
@@ -3815,6 +3879,7 @@ mod tests {
         // Empty push → full env baseline.
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
+                source_policies: None,
                 settings: serde_json::json!({}),
                 console_config: None,
             },
@@ -3844,6 +3909,7 @@ mod tests {
 
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
+                source_policies: None,
                 settings: serde_json::Value::Null,
                 console_config: None,
             },
@@ -3872,6 +3938,7 @@ mod tests {
              explicit clear, not 'nothing to say'"
         );
         let json = serde_json::to_value(AgentMsg::Capacity {
+            source_preparation: None,
             host: crate::messages::HostCapacity {
                 cpu_cores: 1,
                 mem_mb: 1,
@@ -3923,6 +3990,7 @@ mod tests {
         // Console-only push (settings null) leaves runtime settings — still fresh.
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
+                source_policies: None,
                 settings: serde_json::Value::Null,
                 console_config: None,
             },
@@ -3934,6 +4002,7 @@ mod tests {
         // Empty overrides rebaseline to env — same encoder, still fresh.
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
+                source_policies: None,
                 settings: serde_json::json!({}),
                 console_config: None,
             },
@@ -3950,6 +4019,7 @@ mod tests {
         };
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
+                source_policies: None,
                 settings: serde_json::json!({ "encoder": flip }),
                 console_config: None,
             },
@@ -3964,6 +4034,7 @@ mod tests {
         assert!(!mgr.host_codecs_stale());
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
+                source_policies: None,
                 settings: serde_json::json!({ "encoder": flip }),
                 console_config: None,
             },
@@ -4389,6 +4460,7 @@ mod tests {
         // Enabled push: nothing stops.
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
+                source_policies: None,
                 settings: serde_json::Value::Null,
                 console_config: Some(
                     serde_json::from_value(serde_json::json!({ "enabled": true })).unwrap(),
@@ -4403,6 +4475,7 @@ mod tests {
         // Disable push: the local-only session stops, the stream session doesn't.
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
+                source_policies: None,
                 settings: serde_json::Value::Null,
                 console_config: Some(
                     serde_json::from_value(serde_json::json!({ "enabled": false })).unwrap(),

@@ -24,6 +24,44 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+
+- Steam preparation is enabled by default for supported Steam images, with a
+  separate switch under Library → Sources → Steam. Image details distinguish
+  preparation progress, host opt-outs and measured reflink/copy behavior. Turning
+  preparation off preserves existing homes, templates and running sessions (#145).
+
+### Fixed
+
+- Release publication waits for the updater image to be validated and promoted,
+  so its installation instructions cannot advertise a missing updater tag.
+- Agent startup cleanup only removes its own session and audio containers;
+  separate agents on the same Docker daemon preserve each other's sessions (#146).
+- First-run setup saves the browser origin while respecting explicit deployment
+  policy, and reports signaling failures separately from media connectivity (#131).
+- NVIDIA provisioning retry messages preserve the original failure instead of
+  recursively nesting backoff messages (#129).
+- An advanced NVIDIA driver host-path override verifies the actual shared
+  directory before app launch and reports wrong paths through readiness (#130).
+- Tagged agent images report their release version consistently with the control
+  plane; source builds report a development identity (#135).
+- Older same-schema edge builds are no longer offered or accepted as updates,
+  including forced apply requests (#136).
+
+- RTX 5090 hosts running NVIDIA 595.99.02 exclude the known-corrupt Vulkan AV1
+  path and its unsafe NVENC AV1 fallback. Host readiness and setup explain the
+  restriction; the profile picker reflects reported host codecs and automatic
+  negotiation can select eligible HEVC/H.264 instead.
+- First-install Compose now includes the selected GPU wiring from repository
+  definitions, preserves generated credentials on reruns, and uses verified
+  image pins. Copied environment files carry blank credentials and instructions.
+- Control-plane state ownership preparation, NVIDIA provisioning recovery,
+  refreshed readiness and validated sibling mounts reduce delayed app-launch
+  failures. App shared memory remains 1 GiB by default.
+- Unraid deployments tolerate absent securityfs, including additional-host
+  enrollment, and the updater no longer mistakes Btrfs subvolume IDs for Docker
+  container IDs.
+
 ## 0.2.3 — 2026-09-06
 
 ### Fixed

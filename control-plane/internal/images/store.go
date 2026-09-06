@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/accreleus/quasar/control-plane/internal/preparation"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -49,12 +50,13 @@ type CatalogImage struct {
 // Part of the frozen response contract, so CatalogImage.Hosts is always a
 // non-nil empty slice, never omitted.
 type ImageHostState struct {
-	HostID   string  `json:"host_id"`
-	NodeName string  `json:"node_name"`
-	Version  *string `json:"version"`
-	State    string  `json:"state"`
-	Error    *string `json:"error"`
-	Bytes    *int64  `json:"bytes"`
+	SteamPreparation *preparation.Projection `json:"steam_preparation"`
+	HostID           string                  `json:"host_id"`
+	NodeName         string                  `json:"node_name"`
+	Version          *string                 `json:"version"`
+	State            string                  `json:"state"`
+	Error            *string                 `json:"error"`
+	Bytes            *int64                  `json:"bytes"`
 }
 
 // ManifestProvenance is where the served catalog came from (#548). The manifest
@@ -678,8 +680,16 @@ func (s *Store) upsert(ctx context.Context, m *Manifest, prov ManifestProvenance
 // with the catalog. version/error are pointers: NOT NULL columns store "" but
 // the wire type is nullable.
 func (s *Store) hostStates(ctx context.Context) (map[string][]ImageHostState, error) {
+	policy, err := preparation.Current(ctx, s.pool)
+	if errors.Is(err, pgx.ErrNoRows) {
+		policy = preparation.Policy{Revision: "1", Images: []preparation.Image{}}
+		err = nil
+	}
+	if err != nil {
+		return nil, err
+	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT hi.image_id, hi.host_id::text, h.node_name, hi.version, hi.state, hi.error, hi.bytes
+		SELECT hi.image_id, hi.host_id::text, h.node_name, hi.version, hi.state, hi.error, hi.bytes, h.source_policy_versions, h.source_preparation, h.source_preparation_reported_at, (h.status='online' AND h.agent_disconnected_at IS NULL)
 		FROM host_images hi
 		JOIN hosts h ON h.id = hi.host_id
 		ORDER BY h.node_name, hi.host_id
@@ -691,12 +701,15 @@ func (s *Store) hostStates(ctx context.Context) (map[string][]ImageHostState, er
 	out := make(map[string][]ImageHostState)
 	for rows.Next() {
 		var (
-			imageID       string
-			hs            ImageHostState
-			version, eMsg string
-			bytes         *int64
+			versions, report []byte
+			reportedAt       *time.Time
+			online           bool
+			imageID          string
+			hs               ImageHostState
+			version, eMsg    string
+			bytes            *int64
 		)
-		if err := rows.Scan(&imageID, &hs.HostID, &hs.NodeName, &version, &hs.State, &eMsg, &bytes); err != nil {
+		if err := rows.Scan(&imageID, &hs.HostID, &hs.NodeName, &version, &hs.State, &eMsg, &bytes, &versions, &report, &reportedAt, &online); err != nil {
 			return nil, fmt.Errorf("scan host_images row: %w", err)
 		}
 		if version != "" {
@@ -708,6 +721,8 @@ func (s *Store) hostStates(ctx context.Context) (map[string][]ImageHostState, er
 			hs.Error = &e
 		}
 		hs.Bytes = bytes
+		projection := preparation.Project(policy, imageID, versions, report, reportedAt, online)
+		hs.SteamPreparation = &projection
 		out[imageID] = append(out[imageID], hs)
 	}
 	if err := rows.Err(); err != nil {

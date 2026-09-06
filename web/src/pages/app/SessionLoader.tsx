@@ -184,6 +184,7 @@ export function SessionLoader({
       ? null
       : resolveStall({
           phase: launchPhase,
+          wsOpen,
           hostAssigned,
           sessionRunning,
           iceState,

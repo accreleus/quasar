@@ -377,6 +377,7 @@ fn a_warm_up_publishes_a_sanitized_verified_template() {
     let meta = &log.published[0];
     assert_eq!(meta.image_id, "steam");
     assert_eq!(meta.version, "v2");
+    assert_eq!(meta.agent_version, crate::buildinfo::version());
     assert_eq!(meta.schema, TEMPLATE_META_SCHEMA);
     assert_eq!(meta.files, outcome.stats.files);
     assert!(meta.built_at > 0);
@@ -839,13 +840,12 @@ fn a_host_with_the_warmup_knob_off_skips_without_taking_the_gate() {
     assert_eq!(host.launched.load(Ordering::SeqCst), 0);
 }
 
-/// THE DEFAULT IS OFF: a build takes the host's single encode slot for
-/// minutes, serialized against every user launch by #489.
+/// Host permission defaults on; the source policy and #489 gate still control admission.
 #[test]
-fn the_warmup_build_gate_defaults_off_and_is_opt_in() {
+fn the_warmup_host_permission_defaults_on_but_source_policy_is_required() {
     assert!(
-        !WarmupConfig::default().enabled,
-        "QUASAR_TEMPLATE_WARMUP must default OFF"
+        WarmupConfig::default().enabled,
+        "absent host permission must default ON"
     );
 }
 
@@ -1001,8 +1001,8 @@ fn the_reservation_never_reports_a_negative_slot_count() {
 #[test]
 fn the_config_defaults_match_the_design_doc() {
     let d = WarmupConfig::default();
-    // Build gate: OFF by default. See `the_warmup_build_gate_defaults_off_and_is_opt_in`.
-    assert!(!d.enabled);
+    // Host permission defaults on; the independent source policy must authorize work.
+    assert!(d.enabled);
     assert_eq!(d.settle, Duration::from_secs(60));
     assert_eq!(d.job_timeout, Some(Duration::from_secs(600)));
     assert_eq!(d.min_free_bytes, 21_474_836_480);

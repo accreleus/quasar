@@ -17,7 +17,7 @@ df -h /var/lib/docker
 On Fedora, the default 15 GB root logical volume is not enough. Grow it with
 `lvextend` and `xfs_growfs`.
 
-**Compose too old.** You need v2.20 or newer.
+**Compose too old.** The generated stack requires v2.30 or newer.
 
 ```bash
 docker compose version
@@ -118,10 +118,18 @@ Quasar can work around it automatically by provisioning a driver volume from the
 running kernel module, which is on by default. It closes the gap without
 installing anything on the host.
 
-<Aside type="caution" title="A driver-volume host cannot use the Vulkan encoder">
-The Vulkan driver interface in that volume is unusable on some driver versions.
-NVENC and VA are unaffected. Use NVENC on such a host.
-</Aside>
+Provisioning supplies container userspace libraries; it cannot install, upgrade
+or repair the host kernel module. The agent checks the loaded driver version on
+startup and prepares matching libraries when provisioning is needed. After a host
+driver update, recreate the agent container so Docker refreshes its injected
+libraries, then check readiness again.
+
+Provisioning progress and failures appear in the setup host checks and Admin,
+Fleet, Hosts. Temporary failures are retried; missing host permissions, unavailable
+files or a failed integrity check still need the action shown there. A driver
+volume does not by itself rule out Vulkan. See
+[AV1 driver compatibility](/quasar/tuning/encoders/#av1-driver-compatibility) for
+the confirmed RTX 5090 restriction.
 
 Fedora, installing the full stack properly:
 
@@ -186,7 +194,7 @@ or by hand:
 
 ```bash
 echo "QUASAR_STACK_DIR=$(cd deploy && pwd)" >> deploy/.env
-echo "QUASAR_UPDATER_IMAGE=ghcr.io/accreleus/quasar/quasar-updater:latest" >> deploy/.env
+# Set QUASAR_UPDATER_IMAGE in deploy/.env to the updater image for your release.
 docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-updater
 ```
 

@@ -11,12 +11,14 @@ pub mod artifact;
 pub mod buildinfo;
 pub mod capacity;
 pub mod config;
+mod container_ownership;
 pub mod cp_http;
 pub mod cp_tls;
 /// Runtime-provisioned CUDA userspace (NVRTC) — what registers the `cuda*`
 /// GStreamer elements on an NVIDIA host (#545).
 pub mod cuda_runtime;
 pub mod ddc;
+mod encoder_compatibility;
 pub mod enrollment;
 /// `host.xid` / `host.gpu_fault`: the kernel's own GPU fault records, off `/dev/kmsg`.
 pub mod gpu_kmsg;
@@ -34,3 +36,5 @@ pub mod readiness;
 pub mod release;
 pub mod session;
 pub mod vram;
+
+pub mod source_policy;

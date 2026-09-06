@@ -448,3 +448,28 @@ func TestHistoricalFailureBlocks(t *testing.T) {
 		t.Errorf("1080p60 missing historical_client_performance_failed")
 	}
 }
+
+func TestReportedHostCodecsGateRungsWithoutHidingFallback(t *testing.T) {
+	lp := chain()
+	lp.Rungs = []Profile{
+		rungAt(1440, 1440, CodecAV1, "av1"),
+		rungAt(1440, 1440, CodecHEVC, "hevc"),
+		rungAt(1080, 1080, CodecH264, "h264"),
+	}
+	in := EvalInput{HostCaps: HostCaps{Codecs: map[Codec]bool{CodecH264: true, CodecHEVC: true}}}
+	got := EvaluateLaunchProfile(lp, in)
+	if got.Rungs[0].Eligibility != EligibilityIneligible || !hasReason(got.Rungs[0], ReasonHostEncoderNotSupported) {
+		t.Fatalf("AV1 offered despite host exclusion: %+v", got.Rungs[0])
+	}
+	if got.Rungs[1].Eligibility != EligibilityEligible || got.Rungs[2].Eligibility != EligibilityEligible {
+		t.Fatalf("working alternatives rejected: %+v", got.Rungs)
+	}
+	if got.Eligibility != EligibilityRisky {
+		t.Fatalf("fallback chain should remain offered as risky: %+v", got)
+	}
+	// Legacy host telemetry is unknown, not an observed AV1 exclusion.
+	in.HostCaps.Codecs = nil
+	if got := EvaluateLaunchProfile(lp, in); got.Rungs[0].Eligibility != EligibilityEligible {
+		t.Fatalf("unreported host changed legacy advisory behavior: %+v", got)
+	}
+}

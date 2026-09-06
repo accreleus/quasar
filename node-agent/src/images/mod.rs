@@ -471,6 +471,18 @@ impl ImageManager {
     ///
     /// `None` (untracked launch, or a ref never ensured here) skips the template
     /// lookup; it is never a launch failure.
+    pub fn is_exact_ready(&self, image_id: &str, registry_ref: &str, version: &str) -> bool {
+        self.records
+            .lock()
+            .unwrap()
+            .get(image_id)
+            .is_some_and(|rec| {
+                rec.registry_ref == registry_ref
+                    && rec.wire_version() == version
+                    && rec.state.as_wire_str() == "ready"
+            })
+    }
+
     pub fn image_id_for_ref(&self, registry_ref: &str) -> Option<String> {
         self.records
             .lock()
@@ -1994,6 +2006,7 @@ mod tests {
         let m = mgr();
         assert!(m.register_images().is_empty());
         let msg = AgentMsg::Register {
+            source_policy_versions: None,
             node_name: "n".to_string(),
             agent_version: "v".to_string(),
             auth: crate::messages::Auth::Enrollment {
