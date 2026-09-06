@@ -1032,9 +1032,12 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let reader_store = store.clone();
         let reader_stop = Arc::clone(&stop);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let reader = std::thread::spawn(move || {
-            let mut saw_v1 = false;
+            assert_eq!(reader_store.meta("steam").unwrap().version, "1.0.0");
+            let mut saw_v1 = true;
             let mut saw_v2 = false;
+            ready_tx.send(()).unwrap();
             while !reader_stop.load(Ordering::Relaxed) {
                 match reader_store.meta("steam") {
                     Some(m) if m.version == "1.0.0" => saw_v1 = true,
@@ -1045,6 +1048,11 @@ mod tests {
             }
             (saw_v1, saw_v2)
         });
+
+        // Start publishing only after the reader has actually observed v1.
+        // Otherwise a busy test runner can finish the writer before the reader
+        // is scheduled at all, failing without exercising concurrent reads.
+        ready_rx.recv().unwrap();
 
         let b2 = store.begin_build("steam", "2.0.0").unwrap();
         fs::write(b2.home_dir().join("marker"), vec![b'2'; 4096]).unwrap();

@@ -24,6 +24,18 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+
+- First-install Compose now includes the selected GPU wiring from repository
+  definitions, preserves generated credentials on reruns, and uses verified
+  image pins. Copied environment files carry blank credentials and instructions.
+- Control-plane state ownership preparation, NVIDIA provisioning recovery,
+  refreshed readiness and validated sibling mounts reduce delayed app-launch
+  failures. App shared memory remains 1 GiB by default.
+- Unraid deployments tolerate absent securityfs, including additional-host
+  enrollment, and the updater no longer mistakes Btrfs subvolume IDs for Docker
+  container IDs.
+
 ## 0.2.3 — 2026-09-06
 
 ### Fixed

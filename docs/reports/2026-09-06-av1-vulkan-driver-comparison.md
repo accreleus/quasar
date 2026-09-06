@@ -1,5 +1,14 @@
 # Vulkan AV1 corruption: live comparison
 
+## Operator confirmation after this comparison
+
+The operator subsequently compiled and installed the required 610.57.04 driver
+components on Unraid and confirmed clean Vulkan AV1 streaming on that host.
+This is operator-reported live evidence, not a new automated run. It confirms
+that changing to the working driver combination also resolves the observed
+symptom on Unraid itself. No Quasar AV1 encoder change was needed for that result;
+it does not establish the exact underlying driver/API defect.
+
 ## Finding
 
 The reported corruption reproduces on the production Unraid host with NVIDIA
