@@ -37,7 +37,7 @@ test('copied env has blank credentials and instructions, never executable values
   assert.match(env, /paste each OUTPUT/);
   assert.ok(!env.includes('$('));
   assert.ok(script.includes("<<'ENV'"));
-  assert.ok(script.includes('if [ ! -e deploy/.env ]; then'));
+  assert.ok(script.includes('if [ ! -e "$stack_dir/.env" ]; then'));
   assert.ok(script.includes('postgres=$(openssl rand -hex 24)'));
 });
 
@@ -268,13 +268,16 @@ test('installer creates private credentials once and preserves them on rerun', a
   const dir = mkdtempSync(join(tmpdir(), 'quasar-credentials-test-'));
   try {
     mkdirSync(join(dir, 'deploy'));
-    const { script } = generate(full());
+    // stack_dir is absolute now (#148), so the fixture has to BE the base path
+    // rather than the working directory the installer happens to run from.
+    const { script } = generate(full({ basePath: dir }));
     const start = script.indexOf('echo "==> Environment file"');
     const end = script.indexOf('\ndocker compose ', start);
     const envStep = script.slice(start, end);
     const run = () => spawnSync('bash', ['-eu', '-c', envStep], {
       cwd: dir, encoding: 'utf8',
-      env: { ...process.env, control_image: 'control:test', agent_image: 'agent:test', updater_image: 'updater:test' },
+      // stack_dir is bound at the top of the script, outside this slice.
+      env: { ...process.env, stack_dir: join(dir, 'deploy'), control_image: 'control:test', agent_image: 'agent:test', updater_image: 'updater:test' },
     });
     assert.equal(run().status, 0);
     const path = join(dir, 'deploy', '.env');
@@ -339,4 +342,70 @@ test('Steam preparation inherits defaults and preserves advanced agent opt-outs'
   assert.equal(Object.hasOwn(agent.environment, 'QUASAR_TEMPLATE_WARMUP'), false);
   assert.ok(agent.env_file.some((entry) => entry.path === 'agent.env'));
   assert.match(env, /QUASAR_TEMPLATE_ROOT=\/mnt\/pool\/quasar\/templates/);
+});
+
+
+// --- the stack directory lives at an absolute path (#148) -----------------
+// The generated script used to write `deploy/` relative to the operator's
+// working directory. On Unraid the root shell starts in /root, which is a
+// ramdisk, so the compose file and the only copy of POSTGRES_PASSWORD,
+// QUASAR_SECRET_KEY and the enrollment token vanished at the first reboot.
+
+test('the script anchors the stack directory to basePath, never the working directory', () => {
+  const { script } = generate(full({ basePath: '/mnt/user/appdata/quasar' }));
+  assert.ok(
+    script.includes("install -d -m 0700"),
+    'the stack directory must be created explicitly, with credentials-only permissions'
+  );
+  assert.ok(
+    script.includes("'/mnt/user/appdata/quasar/deploy'"),
+    'the stack directory must be the absolute path derived from basePath'
+  );
+  assert.ok(!script.includes('mkdir -p deploy'), 'must not create a stack dir relative to $PWD');
+});
+
+// The embedded heredocs are separate artifacts with their own conventions: the
+// compose file's `Set POSTGRES_PASSWORD in deploy/.env` is advice to a human
+// about a file inside the stack directory, not a path the installer resolves.
+const shellOnly = (script) =>
+  script
+    .replace(/<<'COMPOSE'[\s\S]*?\nCOMPOSE\n/g, '\n')
+    .replace(/<<'NVIDIA'[\s\S]*?\nNVIDIA\n/g, '\n')
+    .replace(/<<'ENV'[\s\S]*?\nENV\n/g, '\n');
+
+test('no installer command addresses the stack by a working-directory-relative path', () => {
+  for (const platform of Object.keys(PLATFORMS)) {
+    const { script } = generate(full({ platform, basePath: '/srv/quasar' }));
+    // `deploy/` not preceded by a path separator is a CWD-relative reference.
+    const relative = /(?<![\w/.-])deploy\//g;
+    assert.deepEqual(
+      shellOnly(script).match(relative) ?? [],
+      [],
+      `${platform}: script still addresses deploy/ relative to $PWD`
+    );
+  }
+});
+
+test('QUASAR_STACK_DIR records the absolute stack path the updater will mount', () => {
+  const { script } = generate(full({ basePath: '/srv/quasar' }));
+  assert.ok(
+    !script.includes('$(cd deploy && pwd)'),
+    'QUASAR_STACK_DIR must not be resolved from the working directory'
+  );
+  assert.match(
+    script,
+    /^stack_dir='\/srv\/quasar\/deploy'$/m,
+    'the script must bind the stack directory to an absolute path up front'
+  );
+  assert.match(
+    script,
+    /QUASAR_STACK_DIR=%s[\s\S]*?"\$stack_dir"/,
+    'QUASAR_STACK_DIR must be written from that absolute path'
+  );
+});
+
+test('a trailing slash on basePath does not double up in the stack path', () => {
+  const { script } = generate(full({ basePath: '/srv/quasar///' }));
+  assert.ok(script.includes("'/srv/quasar/deploy'"));
+  assert.ok(!script.includes('quasar//deploy'));
 });

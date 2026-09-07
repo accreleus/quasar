@@ -39,6 +39,14 @@ changes, or use the instructions shipped with your chosen release. A merge into
    `deploy/docker-compose.yml` and `deploy/.env`, so matching that layout keeps
    the commands elsewhere in this documentation correct as written.
 
+   Run this somewhere that survives a reboot, and check that before you continue.
+   `deploy/.env` becomes the only copy of `POSTGRES_PASSWORD`,
+   `QUASAR_SECRET_KEY` and the enrollment token, and nothing regenerates them.
+   On Unraid in particular the root shell starts in `/root`, which is a ramdisk,
+   so a stack created there is gone at the next boot: use a path under
+   `/mnt/user/appdata/` instead. The quick start puts the stack under the base
+   path you give it for exactly this reason.
+
 2. **Save this as `deploy/docker-compose.yml`.**
 
    <Code code={files.compose} lang="yaml" />
@@ -170,6 +178,42 @@ rather than adapting anything above.
 
 There is no reverse proxy in the default deployment. For Caddy or an existing
 ingress, see [Behind a reverse proxy](/quasar/network/reverse-proxy/).
+
+## Recovering a stack written to a ramdisk
+
+If you installed into a directory that did not survive a reboot, the containers
+are probably still running: Compose restarts them from the Docker daemon's own
+state, so the stack looks healthy while `docker-compose.yml` and `.env` no longer
+exist. The next `docker compose` command or upgrade is where it surfaces.
+
+Container names carry the Compose project prefix, which varies, so address them
+by service label. Check whether the recorded stack directory is still present:
+
+```bash
+cp=$(docker ps -q --filter 'label=com.docker.compose.service=quasar-control-plane')
+docker inspect "$cp" --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}'
+```
+
+If that path is gone, recover the credentials from the running containers before
+stopping anything. They are irreplaceable, and removing a container takes its
+copy with it. They are not all in one place: the control plane holds the secret
+key and the enrollment token, while the database password is on the Postgres
+container.
+
+```bash
+docker inspect "$cp" --format '{{ range .Config.Env }}{{ println . }}{{ end }}' \
+  | grep -E '^(QUASAR_SECRET_KEY|ENROLLMENT_TOKEN)='
+
+pg=$(docker ps -q --filter 'label=com.docker.compose.service=quasar-postgres')
+docker inspect "$pg" --format '{{ range .Config.Env }}{{ println . }}{{ end }}' \
+  | grep -E '^POSTGRES_PASSWORD='
+```
+
+Write a fresh `deploy/` on persistent storage using the quick start or the steps
+above, paste those values into its `.env` rather than generating new ones, set
+`QUASAR_STACK_DIR` to the new absolute path, and bring the stack up from there.
+Generating new credentials instead will leave you unable to open the existing
+database.
 
 ## Stopping without losing data
 

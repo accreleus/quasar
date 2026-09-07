@@ -26,6 +26,16 @@ own; the two do not move together, and that is deliberate.
 
 ### Fixed
 
+- The quick-start installer writes the stack to an absolute path derived from the
+  base path you give it, instead of a `deploy/` directory beside wherever the
+  script was run. On Unraid the root shell starts on a ramdisk, so the previous
+  behavior lost `docker-compose.yml` and the only copy of `POSTGRES_PASSWORD`,
+  `QUASAR_SECRET_KEY` and the enrollment token at the next reboot, silently: the
+  containers restart from Docker's own state and look healthy until the next
+  compose command or upgrade. `QUASAR_STACK_DIR` records that absolute path, so
+  the updater keeps resolving it, and the stack directory is created `0700`.
+  Installing covers choosing persistent storage and recovering a stack already
+  written to a ramdisk (#148).
 - Intel GPUs are no longer dropped from a host's capacity inventory. Capacity
   detection required a dedicated-VRAM reading that only AMD and NVIDIA expose, so
   every Intel host reported zero GPUs, logged `gpu-capacity-unavailable`, and was
