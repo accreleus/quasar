@@ -200,9 +200,15 @@ session memory `current-focus.md`, not this file.**
   treat `smooth` as permanent.** It was soaked 2026-08-17→24 over 147 bench runs,
   which also produced the #370 re-characterisation; no further operator soak is
   outstanding.
-- **Encoders:** AMD/Intel = VA (ZC-03 DMABuf zero-copy). **NVIDIA = Vulkan by
-  default** (2026-08-12): the agent detects NVIDIA when `QUASAR_ENCODER` is
-  unset or empty (Compose passes an operator override through), so H.264 and HEVC encode with
+- **Encoders:** defaults are auto-detected per vendor. With `QUASAR_ENCODER`
+  unset or empty the agent resolves the GPU vendor and defaults **NVIDIA →
+  Vulkan, AMD → Vulkan, Intel → VA (ZC-03 DMABuf zero-copy), no GPU →
+  openh264** (`encoder_default_for_vendor` in
+  `node-agent/src/session/settings.rs`; the same table is in
+  `docs/configuration.md`). Compose passes an operator override through. AMD's
+  Vulkan default is provisional. `AMD_AUTO_DEFAULT` in that file is the one-line
+  flip back to VA if live validation on an AMD host fails.
+  **NVIDIA = Vulkan by default** (2026-08-12), so H.264 and HEVC encode with
   `vulkanh264enc`/`vulkanh265enc`. Rationale:
   #489 is an NVIDIA-driver NVENC teardown UAF spanning the 595 **and** 610
   branches — no driver pin escapes it — and Vulkan is immune, so the default path
