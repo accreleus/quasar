@@ -26,6 +26,10 @@ own; the two do not move together, and that is deliberate.
 
 ### Fixed
 
+- `deploy/redeploy.sh`'s header no longer claims that running sessions survive a
+  control-plane-only deploy. They do not, and have not: recreating the control
+  plane ends every session on the host (#128). Drain first if the sessions
+  matter; the fleet self-update run already does.
 - Pull-request CI now builds and tests `site/`, which generates the quick-start
   compose file, `.env` and install script. Those tests ran only in the manually
   dispatched docs workflow, so a regression in the operator-facing installer
