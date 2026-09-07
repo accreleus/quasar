@@ -225,21 +225,25 @@ func TestCertForRungMatchesPickCert(t *testing.T) {
 
 	// The bitrates probe exact hits, midpoints, and both extremes — including a
 	// value below the lowest row and one above the highest.
-	for _, rungID := range rungIDs {
-		for _, bw := range []int32{0, 3000, 3400, 3500, 3600, 6000, 7000, 8000, 10000, 99000} {
-			// encoder "" is the branch the launch path always took.
-			want, err := store.CertForRung(ctx, s.hostID, 0, "", rungID, bw, CertStaleness)
-			must(t, err)
-			got := pickCert(certs, rungID, bw, time.Now(), CertStaleness)
+	// Every encoder branch, because the launch path now passes the host's own
+	// (#144): "" is the unfiltered read, "va" matches every seeded row, and
+	// "vulkan" matches none. The two implementations must agree on all three.
+	for _, encoder := range []string{"", "va", "vulkan"} {
+		for _, rungID := range rungIDs {
+			for _, bw := range []int32{0, 3000, 3400, 3500, 3600, 6000, 7000, 8000, 10000, 99000} {
+				want, err := store.CertForRung(ctx, s.hostID, 0, encoder, rungID, bw, CertStaleness)
+				must(t, err)
+				got := pickCert(certs, rungID, bw, time.Now(), CertStaleness, encoder)
 
-			switch {
-			case want == nil && got != nil:
-				t.Errorf("rung=%s bw=%d: SQL found nothing, pickCert chose %d kbps", rungID, bw, got.BitrateKbps)
-			case want != nil && got == nil:
-				t.Errorf("rung=%s bw=%d: SQL chose %d kbps, pickCert found nothing", rungID, bw, want.BitrateKbps)
-			case want != nil && got != nil && want.ID != got.ID:
-				t.Errorf("rung=%s bw=%d: SQL chose id=%s (%d kbps), pickCert chose id=%s (%d kbps)",
-					rungID, bw, want.ID, want.BitrateKbps, got.ID, got.BitrateKbps)
+				switch {
+				case want == nil && got != nil:
+					t.Errorf("enc=%q rung=%s bw=%d: SQL found nothing, pickCert chose %d kbps", encoder, rungID, bw, got.BitrateKbps)
+				case want != nil && got == nil:
+					t.Errorf("enc=%q rung=%s bw=%d: SQL chose %d kbps, pickCert found nothing", encoder, rungID, bw, want.BitrateKbps)
+				case want != nil && got != nil && want.ID != got.ID:
+					t.Errorf("enc=%q rung=%s bw=%d: SQL chose id=%s (%d kbps), pickCert chose id=%s (%d kbps)",
+						encoder, rungID, bw, want.ID, want.BitrateKbps, got.ID, got.BitrateKbps)
+				}
 			}
 		}
 	}

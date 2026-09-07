@@ -100,7 +100,7 @@ func certCap(t *testing.T, store *Store, hostID string, gpu int, chainID, rungID
 	t.Helper()
 	certs, err := store.CertsForRungs(context.Background(), hostID, gpu, []string{rungID}, CertStaleness)
 	must(t, err)
-	cert := pickCert(certs, rungID, bitrate, time.Now(), CertStaleness)
+	cert := pickCert(certs, rungID, bitrate, time.Now(), CertStaleness, "")
 	if cert == nil || !certShouldCap(*cert) {
 		return false, ""
 	}
@@ -231,13 +231,13 @@ func TestCertsForRungs_batchAcrossChains(t *testing.T) {
 		t.Fatalf("expected both chains' certs in one read, got %d", len(certs))
 	}
 
-	if c := pickCert(certs, "1080p60-h264", 8000, time.Now(), CertStaleness); c == nil || !certShouldCap(*c) {
+	if c := pickCert(certs, "1080p60-h264", 8000, time.Now(), CertStaleness, ""); c == nil || !certShouldCap(*c) {
 		t.Error("the 1080p60 rung's own unsafe row must be the one selected")
 	}
-	if c := pickCert(certs, "720p60-h264", 4000, time.Now(), CertStaleness); c == nil || certShouldCap(*c) {
+	if c := pickCert(certs, "720p60-h264", 4000, time.Now(), CertStaleness, ""); c == nil || certShouldCap(*c) {
 		t.Error("the 720p60 rung's own ok row must be the one selected")
 	}
-	if c := pickCert(certs, "1440p60-h264", 8000, time.Now(), CertStaleness); c != nil {
+	if c := pickCert(certs, "1440p60-h264", 8000, time.Now(), CertStaleness, ""); c != nil {
 		t.Error("a rung with no row must select nothing")
 	}
 }

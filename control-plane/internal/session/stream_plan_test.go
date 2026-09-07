@@ -560,8 +560,40 @@ func TestPickCert(t *testing.T) {
 		rungID  string
 		bitrate int32
 		maxAge  time.Duration
+		encoder string // the host's current encoder; "" means unknown
 		want    string // cert ID; "" means nil
 	}{
+		{
+			// #144: the table is keyed on encoder but the batch read is not, so
+			// a measurement taken under one encoder could cap a session running
+			// on another. vulkanh265enc and nvcudah265enc are different silicon
+			// paths; their encode_ms do not transfer.
+			name: "a row measured under a different encoder is never selected",
+			certs: []EncoderCertRow{
+				{ID: "nvenc", Encoder: "nvenc", StreamProfileID: "r1", BitrateKbps: 7000, MeasuredAt: fixedNow},
+			},
+			rungID: "r1", bitrate: 7000, maxAge: CertStaleness, encoder: "vulkan",
+			want: "",
+		},
+		{
+			name: "the matching encoder is preferred over a closer bitrate on another",
+			certs: []EncoderCertRow{
+				{ID: "nvenc-exact", Encoder: "nvenc", StreamProfileID: "r1", BitrateKbps: 7000, MeasuredAt: fixedNow},
+				{ID: "vulkan-far", Encoder: "vulkan", StreamProfileID: "r1", BitrateKbps: 3000, MeasuredAt: fixedNow},
+			},
+			rungID: "r1", bitrate: 7000, maxAge: CertStaleness, encoder: "vulkan",
+			want: "vulkan-far",
+		},
+		{
+			// Fail open: an unreported encoder must not disable capping, which
+			// would launch at a rung the host may not sustain.
+			name: "an unknown host encoder keeps every row eligible",
+			certs: []EncoderCertRow{
+				{ID: "nvenc", Encoder: "nvenc", StreamProfileID: "r1", BitrateKbps: 7000, MeasuredAt: fixedNow},
+			},
+			rungID: "r1", bitrate: 7000, maxAge: CertStaleness, encoder: "",
+			want: "nvenc",
+		},
 		{
 			name: "closest bitrate wins",
 			certs: []EncoderCertRow{
@@ -605,7 +637,7 @@ func TestPickCert(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := pickCert(c.certs, c.rungID, c.bitrate, fixedNow, c.maxAge)
+			got := pickCert(c.certs, c.rungID, c.bitrate, fixedNow, c.maxAge, c.encoder)
 			gotID := ""
 			if got != nil {
 				gotID = got.ID

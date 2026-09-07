@@ -1117,23 +1117,26 @@ func parseCodecPixelRates(raw []byte) map[string]float64 {
 // known=false until the agent reports effective settings, and the caller then
 // SKIPS clamp 5 (unknown allows). Rejecting on unknown would break every
 // hardware-required launch against a host that has simply not reported yet.
-func (s *Store) HostHardwareEncoder(ctx context.Context, hostID string) (known bool, hardware bool, err error) {
+// The name is returned as well as the hardware verdict: certification rows are
+// keyed on the encoder, and a measurement taken under one does not describe
+// another (#144). Empty means the host has not reported one.
+func (s *Store) HostHardwareEncoder(ctx context.Context, hostID string) (known bool, hardware bool, encoder string, err error) {
 	if !isValidUUID(hostID) {
-		return false, false, nil
+		return false, false, "", nil
 	}
 	var enc *string
 	qErr := s.pool.QueryRow(ctx,
 		`SELECT effective_settings ->> 'encoder' FROM hosts WHERE id = $1::uuid`, hostID).Scan(&enc)
 	if errors.Is(qErr, pgx.ErrNoRows) {
-		return false, false, nil
+		return false, false, "", nil
 	}
 	if qErr != nil {
-		return false, false, fmt.Errorf("query host encoder: %w", qErr)
+		return false, false, "", fmt.Errorf("query host encoder: %w", qErr)
 	}
 	if enc == nil || *enc == "" {
-		return false, false, nil
+		return false, false, "", nil
 	}
-	return true, *enc != "openh264", nil
+	return true, *enc != "openh264", *enc, nil
 }
 
 // UpdateSessionCodec persists the resolved codec after placement, when

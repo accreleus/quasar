@@ -216,7 +216,7 @@ func (in StreamInputs) applyCertCap(
 	decision rungDecision,
 	stream resolvedStream,
 ) (profile.LaunchProfile, profile.Profile, rungDecision, resolvedStream) {
-	cert := pickCert(in.Certs, rung.ID, stream.bitrateKbps, in.Now, in.CertMaxAge)
+	cert := pickCert(in.Certs, rung.ID, stream.bitrateKbps, in.Now, in.CertMaxAge, in.HostEncoder.Name)
 	if cert == nil {
 		// No row, or all stale. Missing is not "unsafe": the table starts empty and
 		// an uncertified host proceeds optimistically.
@@ -276,12 +276,22 @@ func certShouldCap(cert EncoderCertRow) bool {
 //
 // maxAge is applied again even though CertsForRungs filters on it: the staleness
 // rule belongs to the decision, so a stale row handed over cannot be acted on.
-func pickCert(certs []EncoderCertRow, rungID string, bitrateKbps int32, now time.Time, maxAge time.Duration) *EncoderCertRow {
+// encoder is the host's current encode path. A certification row is keyed on
+// (host, gpu, encoder, rung, bitrate), but CertsForRungs reads the batch without
+// that filter, so rows measured under a different encoder arrive here and would
+// otherwise be ranked on bitrate alone (#144). Their encode_ms does not describe
+// this session: vulkanh265enc and nvcudah265enc are different silicon paths.
+// An empty encoder means the host reported none, and every row stays eligible —
+// dropping the cap entirely would launch at a rung the host may not sustain.
+func pickCert(certs []EncoderCertRow, rungID string, bitrateKbps int32, now time.Time, maxAge time.Duration, encoder string) *EncoderCertRow {
 	var best *EncoderCertRow
 	var bestDelta int32
 	for i := range certs {
 		c := &certs[i]
 		if c.StreamProfileID != rungID {
+			continue
+		}
+		if encoder != "" && c.Encoder != encoder {
 			continue
 		}
 		if maxAge > 0 && !now.IsZero() && now.Sub(c.MeasuredAt) > maxAge {
