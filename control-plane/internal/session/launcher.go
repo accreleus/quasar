@@ -399,12 +399,12 @@ func (c *Coordinator) gatherStreamInputs(
 		} else {
 			in.HostCodecs = hc
 		}
-		known, hw, err := c.store.HostHardwareEncoder(ctx, *sess.HostID)
+		known, hw, encName, err := c.store.HostHardwareEncoder(ctx, *sess.HostID)
 		if err != nil {
 			c.log.Warn("rung: host encoder capability load failed, skipping the hardware-encoder clamp",
 				"host_id", *sess.HostID, "err", err)
 		} else {
-			in.HostEncoder = hostEncoderCaps{Known: known, HardwareEncoder: hw}
+			in.HostEncoder = hostEncoderCaps{Known: known, HardwareEncoder: hw, Name: encName}
 		}
 		// The per-codec throughput hint for clamp 6, written onto the same
 		// HostEncoder struct clamp 5 reads. A read error leaves it nil, which is

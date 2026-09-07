@@ -124,6 +124,11 @@ type rungDecision struct {
 type hostEncoderCaps struct {
 	Known           bool
 	HardwareEncoder bool
+	// The host's current encoder (`vulkan`, `nvenc`, `va`, `openh264`), from
+	// effective_settings. Empty means unreported. Certification rows are keyed
+	// on it, so pickCert uses it to refuse a measurement taken under a
+	// different encode path (#144).
+	Name string
 	// Per-codec sustained throughput in Mpix/s, keyed by wire codec. Absence IS
 	// the unknown, per codec: nil map, missing key and non-positive rate all mean
 	// do not clamp, which is why Store.HostCodecPixelRates drops non-positive

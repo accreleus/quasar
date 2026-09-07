@@ -24,6 +24,18 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+
+- Encoder certification no longer caps a session using a measurement taken under
+  a different encoder. The certification table is keyed on the encoder, but the
+  batch read the launch path uses did not filter on it and the ranking compared
+  only rung, bitrate and age — so a row measured under NVENC could cap a Vulkan
+  session on the same rung, in either direction. `vulkanh265enc` and
+  `nvcudah265enc` are different silicon paths and their encode times do not
+  transfer. A host that has not reported an encoder still uses every row, since
+  dropping the cap outright would launch at a rung the host may not sustain.
+  Driver identity is a separate follow-up (#144).
+
 ## 0.2.5 — 2026-09-07
 
 ### Fixed
