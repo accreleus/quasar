@@ -3236,10 +3236,16 @@ done
 
 testdb_runner_line() { # testdb_runner_line <path> [env...]
   local path="$1"; shift
-  env PATH="$path" "$@" bash "$DX/testdb.sh" 2>&1 | grep -E '^(PASS|FAIL) runner' | head -n 1
+  # -u HOST: testdb.sh is local-only (dx_require_local), so an exported HOST
+  # turns every one of these into a guard failure with no runner line.
+  env -u HOST PATH="$path" "$@" bash "$DX/testdb.sh" 2>&1 | grep -E '^(PASS|FAIL) runner' | head -n 1
 }
 
-if env PATH="$STUB_BIN_NOGO:/usr/bin:/bin" command -v go >/dev/null 2>&1; then
+# `command` is a shell builtin, so `env PATH=... command -v go` execs a binary
+# that does not exist and always exits 127 — the skip would never fire and this
+# test would FAIL on any host with a distro Go in /usr/bin. It must run through
+# a shell.
+if env PATH="$STUB_BIN_NOGO:/usr/bin:/bin" bash -c 'command -v go' >/dev/null 2>&1; then
   warn "testdb:no-go-path" "go still resolves with a scrubbed PATH — SKIPPED"
 else
   line="$(testdb_runner_line "$STUB_BIN_NOGO:/usr/bin:/bin")"

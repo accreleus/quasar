@@ -94,6 +94,9 @@ fi
 # The containerised runner reaches Postgres by container name on a private
 # network, not through the published 127.0.0.1 port.
 PG_NET="qpgnet-${TESTDB_INSTANCE}"
+# Named so the trap can reap it. An unnamed --rm container survives a hard kill
+# of this script, and then holds an endpoint that blocks `docker network rm`.
+GO_NAME="qgo-${TESTDB_INSTANCE}"
 
 # Never printed, never persisted.
 if dx_have openssl; then
@@ -105,15 +108,24 @@ fi
 
 # shellcheck disable=SC2329  # invoked by the trap below, not by name
 cleanup() {
+  docker rm -f "$GO_NAME" >/dev/null 2>&1 || true
   docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
   docker network rm "$PG_NET" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM HUP
 
-# A stale container or network from a killed run would hold the name.
+# A stale container or network from a killed run would hold the name. Only
+# reachable with an operator-pinned QUASAR_INSTANCE, since an unpinned run mixes
+# pid+random into the id, but both names are derived so both are swept.
+docker rm -f "$GO_NAME" >/dev/null 2>&1 || true
 docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
 docker network rm "$PG_NET" >/dev/null 2>&1 || true
-docker network create "$PG_NET" >/dev/null 2>&1 || true
+# Not `|| true`: a create failure here would surface later as the retry loop's
+# misleading "no free port" verdict.
+if ! docker network create "$PG_NET" >/dev/null 2>&1; then
+  dx_fail network "could not create the per-run docker network $PG_NET"
+  dx_result "$TARGET"
+fi
 
 # Pick a port and start the container, retrying with the next port on
 # failure (#466): dx_free_port's bind-check happens before `docker run`
@@ -195,7 +207,7 @@ else
   # the HOST's loopback, which is not this container's. The module cache is the
   # named volume dev.sh already uses, so repeat runs do not re-download.
   testdb_rc=0
-  docker run --rm \
+  docker run --rm --name "$GO_NAME" \
     --network "$PG_NET" \
     -v "$DX_ROOT":/workspace \
     -v quasar-go-mod:/go/pkg/mod \
