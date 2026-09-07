@@ -34,6 +34,7 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -57,6 +58,23 @@ const HOME_DIR_NAME: &str = "home";
 
 /// Name of the metadata file inside a published template.
 const META_FILE_NAME: &str = ".meta.json";
+
+/// Serializes `publish` and `remove` across every [`TemplateStore`] in the
+/// process.
+///
+/// Between `publish_versioned`'s rename and `swap_symlink`'s symlink, the new
+/// version sits in `.versions/` with nothing pointing at it. A concurrent
+/// `reclaim_versions` for a DIFFERENT image that builds its live set in that
+/// window deletes it, and the publish then installs a dangling symlink — a
+/// whole warm-up build lost. Today only one publisher exists (the warm-up gate
+/// is process-wide single-flight) and `remove` only races it for the same image,
+/// so the window is not reachable with a bad outcome; it becomes reachable the
+/// moment a second warmable image exists. Closed here rather than left as a
+/// latent trap for whoever adds one.
+///
+/// Static, not a field: `TemplateStore` is `Clone` and the process holds several
+/// independent instances over the same root.
+static PUBLISH_LOCK: Mutex<()> = Mutex::new(());
 
 /// `.meta.json`: the commit record for a published template (§3.1, §6.3, written
 /// last). All fields required; a file that fails to parse is treated as absent.
@@ -337,61 +355,11 @@ impl TemplateStore {
     pub fn publish(&self, staging: StagingBuild, meta: TemplateMeta) -> io::Result<PathBuf> {
         write_meta(&staging.dir, &meta)?;
         let link = self.template_dir(&staging.image_id);
+        let _serialized = PUBLISH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let versioned = self.publish_versioned(&staging.dir, &staging.image_id, &meta.version)?;
         let superseded = swap_symlink(&link, &versioned)?;
-        self.reclaim_versions(superseded.as_deref());
+        self.reclaim_versions(superseded.as_deref(), Some(&versioned));
         Ok(link)
-    }
-
-    /// Reclaim published versions that nothing can still be reading.
-    ///
-    /// A versioned directory is live if some `<template_root>/<image-id>` symlink
-    /// points at it. `grace` spares one more — the version just superseded — so a
-    /// reader mid-resolve, or a clone mid-copy, keeps a valid tree for a full
-    /// publish generation (#150).
-    ///
-    /// Decided by REACHABILITY, never by name. Version directories are
-    /// `<image-id>-<version>-<ts>-<pid>-<seq>` and an image id may itself contain
-    /// dashes, so pruning `steam` by prefix would also delete every version of
-    /// `steam-beta`.
-    ///
-    /// Best-effort by design: this runs after the swap has already succeeded and
-    /// the template is live. A failure here leaks disk, which the next publish
-    /// retries; returning an error would fail a publish that actually worked.
-    fn reclaim_versions(&self, grace: Option<&Path>) {
-        let versions_root = self.root.join(VERSIONS_DIR_NAME);
-        let Ok(entries) = fs::read_dir(&versions_root) else {
-            return;
-        };
-
-        let mut live: HashSet<PathBuf> = HashSet::new();
-        if let Some(spared) = grace {
-            live.insert(spared.to_path_buf());
-        }
-        if let Ok(root_entries) = fs::read_dir(&self.root) {
-            // read_link errors on anything that is not a symlink, which skips
-            // `.versions` and `.staging` without naming them.
-            for entry in root_entries.flatten() {
-                if let Ok(target) = fs::read_link(entry.path()) {
-                    live.insert(target);
-                }
-            }
-        }
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if live.contains(&path) {
-                continue;
-            }
-            if let Err(e) = fs::remove_dir_all(&path) {
-                tracing::warn!(
-                    token = "template-reclaim-failed",
-                    path = %path.display(),
-                    error = %e,
-                    "could not reclaim a superseded template version; retried on the next publish"
-                );
-            }
-        }
     }
 
     /// Move a completed staging dir into `.versions/` under a fresh, unique
@@ -409,12 +377,114 @@ impl TemplateStore {
         Ok(dest)
     }
 
+    /// Reclaim published versions that nothing can still be reading.
+    ///
+    /// A versioned directory is live if some `<template_root>/<image-id>` symlink
+    /// points at it. `grace` spares one more — the version just superseded — so a
+    /// reader mid-resolve, or a clone mid-copy, keeps a valid tree for a full
+    /// publish generation (#150). `protect` is the caller's own just-published
+    /// version, live by construction rather than by what the scan happened to see.
+    ///
+    /// Liveness is compared by filesystem IDENTITY (`st_dev`/`st_ino`), not by
+    /// path string. Symlink targets are written with the root as spelled at
+    /// publish time, and nothing canonicalizes `self.root`, so `/data/templates`
+    /// and `/mnt/disk1/data/templates` (or a `..` segment) name the same directory
+    /// with unequal strings. String equality would find no match and reclaim every
+    /// live version in the store.
+    ///
+    /// Decided by reachability, never by name. Version directories are
+    /// `<image-id>-<version>-<ts>-<pid>-<seq>` and an image id may itself contain
+    /// dashes, so pruning `steam` by prefix would also delete every version of
+    /// `steam-beta`.
+    ///
+    /// FAILS SAFE: if the root cannot be scanned, nothing is reclaimed. Proceeding
+    /// with an empty live set would delete every version in the store, including
+    /// the one just published — an unreadable root (mode 0711, or owned by another
+    /// uid) turns each publish into a delete of its own output.
+    ///
+    /// Deletion errors ARE swallowed: this runs after the swap has succeeded and
+    /// the template is already live, so a failure here leaks disk that the next
+    /// publish retries. Returning an error would fail a publish that worked.
+    fn reclaim_versions(&self, grace: Option<&Path>, protect: Option<&Path>) {
+        let versions_root = self.root.join(VERSIONS_DIR_NAME);
+        let Ok(entries) = fs::read_dir(&versions_root) else {
+            return;
+        };
+        let root_entries = match fs::read_dir(&self.root) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    token = "template-reclaim-root-unreadable",
+                    root = %self.root.display(),
+                    error = %e,
+                    "could not scan the template root; reclaiming nothing this round"
+                );
+                return;
+            }
+        };
+
+        let mut live: HashSet<(u64, u64)> = HashSet::new();
+        for path in [grace, protect].into_iter().flatten() {
+            if let Some(id) = dev_ino(path) {
+                live.insert(id);
+            }
+        }
+
+        let own_tmp_suffix = format!("-{}", std::process::id());
+        for entry in root_entries.flatten() {
+            let path = entry.path();
+            // read_link errors on anything that is not a symlink, which skips
+            // `.versions` and `.staging` without naming them.
+            let Ok(target) = fs::read_link(&path) else {
+                continue;
+            };
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(".tmp-symlink-") && !name.ends_with(&own_tmp_suffix) {
+                // A crash between symlink() and rename() in another process's
+                // swap_symlink. Under reachability it would pin a whole version
+                // forever, so collect it rather than honour it.
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+            // A relative target is resolved against the root it was read from.
+            let resolved = if target.is_absolute() {
+                target
+            } else {
+                self.root.join(target)
+            };
+            if let Some(id) = dev_ino(&resolved) {
+                live.insert(id);
+            }
+        }
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(id) = dev_ino(&path) else {
+                // Cannot identify it, so cannot prove it is dead.
+                continue;
+            };
+            if live.contains(&id) {
+                continue;
+            }
+            if let Err(e) = fs::remove_dir_all(&path) {
+                tracing::warn!(
+                    token = "template-reclaim-failed",
+                    path = %path.display(),
+                    error = %e,
+                    "could not reclaim a superseded template version; retried on the next publish"
+                );
+            }
+        }
+    }
+
     /// Delete a template (§3.2 "image uninstalled"). A no-op, not an error,
     /// if no template exists for `image_id`. Removes the `<image_id>` symlink and
     /// the versioned directory it points to, then reclaims anything that leaves
     /// unreferenced — including the grace generation `publish` spared (#150),
     /// which no later publish of this image would be around to collect.
     pub fn remove(&self, image_id: &str) -> io::Result<()> {
+        let _serialized = PUBLISH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let link = self.template_dir(image_id);
         let link_meta = match fs::symlink_metadata(&link) {
             Ok(m) => m,
@@ -433,7 +503,7 @@ impl TemplateStore {
             // module owns the template root).
             fs::remove_dir_all(&link)?;
         }
-        self.reclaim_versions(None);
+        self.reclaim_versions(None, None);
         tracing::info!("template: removed {image_id} (image uninstalled)");
         Ok(())
     }
@@ -660,6 +730,12 @@ fn clone_tree(mode: CloneMode, source: &Path, dest: &Path) -> io::Result<()> {
 /// stays unique across multiple publishes of the same `(image_id, version)`
 /// within one process inside the same second.
 static VERSION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Filesystem identity of `path`, following symlinks. `None` if it cannot be
+/// stat'd (dangling symlink, races, permissions).
+fn dev_ino(path: &Path) -> Option<(u64, u64)> {
+    fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
 
 fn versioned_dir_name(image_id: &str, version: &str) -> String {
     let seq = VERSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1284,6 +1360,77 @@ mod tests {
         store.remove("steam").unwrap();
         assert_eq!(store.meta("steam"), None);
         assert!(!store.template_root().join("steam").exists());
+    }
+
+    #[test]
+    fn reclaim_never_deletes_the_version_it_was_told_to_protect() {
+        // Liveness is decided by scanning the template root for symlinks. If that
+        // scan finds nothing -- an unreadable root (0711, or another uid owning
+        // it), EMFILE between the two opendirs -- the version the caller just
+        // published must still survive. It is live by construction, not because
+        // a directory read happened to succeed.
+        let base = tempfile::tempdir().unwrap();
+        let home_root = base.path().join("homes");
+        fs::create_dir_all(&home_root).unwrap();
+        let store = TemplateStore::resolve(&home_root, None, TemplateCloneMode::Copy).unwrap();
+
+        let b = store.begin_build("steam", "1.0.0").unwrap();
+        fs::write(b.home_dir().join("marker"), b"v1").unwrap();
+        store.publish(b, sample_meta("steam", "1.0.0")).unwrap();
+
+        let current = fs::read_link(store.template_root().join("steam")).unwrap();
+        // Model the scan yielding nothing about this image.
+        fs::remove_file(store.template_root().join("steam")).unwrap();
+
+        store.reclaim_versions(None, Some(&current));
+
+        assert!(
+            current.is_dir(),
+            "reclaim deleted the version it was explicitly protecting"
+        );
+    }
+
+    #[test]
+    fn a_differently_spelled_root_does_not_reclaim_live_versions() {
+        // Symlink targets are written with the root as spelled at publish time.
+        // Comparing those strings against paths rebuilt from a differently
+        // spelled root finds no match and reclaims everything. Liveness must be
+        // decided by filesystem identity, not by how the path was typed.
+        let base = tempfile::tempdir().unwrap();
+        let home_root = base.path().join("homes");
+        fs::create_dir_all(&home_root).unwrap();
+        let real = base.path().join("templates");
+        fs::create_dir_all(&real).unwrap();
+        let alias = base.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+
+        let direct = TemplateStore::resolve(
+            &home_root,
+            Some(real.to_str().unwrap()),
+            TemplateCloneMode::Copy,
+        )
+        .unwrap();
+        let b = direct.begin_build("steam", "1.0.0").unwrap();
+        fs::write(b.home_dir().join("marker"), b"v1").unwrap();
+        direct.publish(b, sample_meta("steam", "1.0.0")).unwrap();
+        assert_eq!(direct.meta("steam").unwrap().version, "1.0.0");
+
+        // Same directory, reached through the alias.
+        let aliased = TemplateStore::resolve(
+            &home_root,
+            Some(alias.to_str().unwrap()),
+            TemplateCloneMode::Copy,
+        )
+        .unwrap();
+        let b = aliased.begin_build("other", "1.0.0").unwrap();
+        fs::write(b.home_dir().join("marker"), b"other").unwrap();
+        aliased.publish(b, sample_meta("other", "1.0.0")).unwrap();
+
+        assert_eq!(
+            direct.meta("steam").map(|m| m.version),
+            Some("1.0.0".to_string()),
+            "publishing through an aliased root reclaimed a live version"
+        );
     }
 
     #[test]
