@@ -26,6 +26,10 @@ own; the two do not move together, and that is deliberate.
 
 ### Fixed
 
+- Pull-request CI now builds and tests `site/`, which generates the quick-start
+  compose file, `.env` and install script. Those tests ran only in the manually
+  dispatched docs workflow, so a regression in the operator-facing installer
+  could reach `main` without anything failing.
 - `make test-db` now works on a host with no Go toolchain outside a container,
   which is every fleet host. It selects a containerised runner when `go` is
   absent (or when `TESTDB_CONTAINERISED=1` forces it), reaching the ephemeral
