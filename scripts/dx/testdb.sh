@@ -74,10 +74,26 @@ if ! dx_have docker || ! docker info >/dev/null 2>&1; then
   dx_fail docker "daemon not reachable — cannot start the ephemeral Postgres"
   dx_result "$TARGET"
 fi
-if ! dx_have go; then
-  dx_fail go "not on PATH — needed to run the control-plane tests"
-  dx_result "$TARGET"
+# How the suite runs. Every fleet host has docker but no Go toolchain outside a
+# container, and this target is the one that proves a DB-touching control-plane
+# change works — so an absent `go` selects the containerised runner instead of
+# failing the target (#125). TESTDB_CONTAINERISED=1 forces it where a host
+# toolchain does exist, to reproduce what a fleet host will do.
+GO_IMAGE="${GO_IMAGE:-golang:1.25}"
+if [ "${TESTDB_CONTAINERISED:-0}" = "1" ]; then
+  TESTDB_RUNNER=container
+  dx_pass runner "container ($GO_IMAGE) — TESTDB_CONTAINERISED=1"
+elif dx_have go; then
+  TESTDB_RUNNER=host
+  dx_pass runner "host go toolchain"
+else
+  TESTDB_RUNNER=container
+  dx_pass runner "container ($GO_IMAGE) — no host go toolchain"
 fi
+
+# The containerised runner reaches Postgres by container name on a private
+# network, not through the published 127.0.0.1 port.
+PG_NET="qpgnet-${TESTDB_INSTANCE}"
 
 # Never printed, never persisted.
 if dx_have openssl; then
@@ -90,11 +106,14 @@ fi
 # shellcheck disable=SC2329  # invoked by the trap below, not by name
 cleanup() {
   docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+  docker network rm "$PG_NET" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM HUP
 
-# A stale container from a killed run would hold the name.
+# A stale container or network from a killed run would hold the name.
 docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+docker network rm "$PG_NET" >/dev/null 2>&1 || true
+docker network create "$PG_NET" >/dev/null 2>&1 || true
 
 # Pick a port and start the container, retrying with the next port on
 # failure (#466): dx_free_port's bind-check happens before `docker run`
@@ -111,6 +130,7 @@ while [ "$PG_START_ATTEMPTS" -lt "$PG_START_MAX" ]; do
     dx_result "$TARGET"
   }
   if docker run -d --name "$PG_NAME" \
+       --network "$PG_NET" \
        -e POSTGRES_PASSWORD="$PG_PASS" \
        -e POSTGRES_USER="$PG_USER" \
        -e POSTGRES_DB="$PG_DB" \
@@ -166,11 +186,29 @@ fi
 # file outside its package — the drift test reads protocol/openapi.yaml — can
 # be served a stale pass. A verification target that can report a cached green
 # is not a verification target.
-cd "$DX_ROOT/control-plane"
-if go test -p 1 -count=1 ./...; then
+if [ "$TESTDB_RUNNER" = host ]; then
+  cd "$DX_ROOT/control-plane"
+  testdb_rc=0
+  go test -p 1 -count=1 ./... || testdb_rc=$?
+else
+  # Same database, reached by container name: the published 127.0.0.1 port is
+  # the HOST's loopback, which is not this container's. The module cache is the
+  # named volume dev.sh already uses, so repeat runs do not re-download.
+  testdb_rc=0
+  docker run --rm \
+    --network "$PG_NET" \
+    -v "$DX_ROOT":/workspace \
+    -v quasar-go-mod:/go/pkg/mod \
+    -e GOFLAGS=-buildvcs=false \
+    -e TEST_DATABASE_URL="postgres://${PG_USER}:${PG_PASS}@${PG_NAME}:5432/${PG_DB}?sslmode=disable" \
+    -w /workspace/control-plane \
+    "$GO_IMAGE" go test -p 1 -count=1 ./... || testdb_rc=$?
+fi
+
+if [ "$testdb_rc" -eq 0 ]; then
   dx_pass tests "control-plane go test -p 1 -count=1 ./... green (DB tests actually ran, no cache)"
 else
-  dx_fail tests "control-plane go test -p 1 -count=1 ./... failed"
+  dx_fail tests "control-plane go test -p 1 -count=1 ./... failed (rc=$testdb_rc)"
 fi
 
 dx_result "$TARGET" "pg_port=$PORT" "pg_name=$PG_NAME"

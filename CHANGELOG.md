@@ -26,6 +26,13 @@ own; the two do not move together, and that is deliberate.
 
 ### Fixed
 
+- `make test-db` now works on a host with no Go toolchain outside a container,
+  which is every fleet host. It selects a containerised runner when `go` is
+  absent (or when `TESTDB_CONTAINERISED=1` forces it), reaching the ephemeral
+  Postgres by container name on a private network instead of the published
+  loopback port. The target previously refused to run at all with
+  `FAIL go — not on PATH`, so the one gate that proves a DB-touching
+  control-plane change was unavailable exactly where changes get validated (#125).
 - Publishing a home template no longer deletes the version it supersedes while
   readers may still be inside it. The symlink swap was already atomic, but the
   previous versioned directory was reclaimed immediately after it, so a reader
