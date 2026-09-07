@@ -28,6 +28,7 @@
 //! location that is a SIBLING of the home root, never inside it — enforced here,
 //! not just documented (§7.3 `QUASAR_TEMPLATE_ROOT`, acceptance step A10).
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
@@ -322,8 +323,13 @@ impl TemplateStore {
     /// staging dir, moves it into `.versions/` as a uniquely-named entry, then
     /// atomically swaps the `<template_root>/<image_id>` symlink to point at it
     /// ([`swap_symlink`]) — a concurrent reader always sees a complete old or
-    /// new template, never neither and never a partial mix. The previous
-    /// version's directory is removed after the swap.
+    /// new template, never neither and never a partial mix.
+    ///
+    /// The superseded version is NOT deleted here. It is spared for one publish
+    /// generation and reclaimed by the next publish, so a reader that resolved
+    /// the symlink just before the swap, and a clone still copying out of the old
+    /// tree, both keep a valid directory (#150). Steady-state cost is one extra
+    /// generation per image in `.versions/`.
     ///
     /// The caller must sanitize and verify the staged content (§6.1/§6.3)
     /// *before* calling this; this function only writes the metadata commit
@@ -332,8 +338,60 @@ impl TemplateStore {
         write_meta(&staging.dir, &meta)?;
         let link = self.template_dir(&staging.image_id);
         let versioned = self.publish_versioned(&staging.dir, &staging.image_id, &meta.version)?;
-        swap_symlink(&link, &versioned)?;
+        let superseded = swap_symlink(&link, &versioned)?;
+        self.reclaim_versions(superseded.as_deref());
         Ok(link)
+    }
+
+    /// Reclaim published versions that nothing can still be reading.
+    ///
+    /// A versioned directory is live if some `<template_root>/<image-id>` symlink
+    /// points at it. `grace` spares one more — the version just superseded — so a
+    /// reader mid-resolve, or a clone mid-copy, keeps a valid tree for a full
+    /// publish generation (#150).
+    ///
+    /// Decided by REACHABILITY, never by name. Version directories are
+    /// `<image-id>-<version>-<ts>-<pid>-<seq>` and an image id may itself contain
+    /// dashes, so pruning `steam` by prefix would also delete every version of
+    /// `steam-beta`.
+    ///
+    /// Best-effort by design: this runs after the swap has already succeeded and
+    /// the template is live. A failure here leaks disk, which the next publish
+    /// retries; returning an error would fail a publish that actually worked.
+    fn reclaim_versions(&self, grace: Option<&Path>) {
+        let versions_root = self.root.join(VERSIONS_DIR_NAME);
+        let Ok(entries) = fs::read_dir(&versions_root) else {
+            return;
+        };
+
+        let mut live: HashSet<PathBuf> = HashSet::new();
+        if let Some(spared) = grace {
+            live.insert(spared.to_path_buf());
+        }
+        if let Ok(root_entries) = fs::read_dir(&self.root) {
+            // read_link errors on anything that is not a symlink, which skips
+            // `.versions` and `.staging` without naming them.
+            for entry in root_entries.flatten() {
+                if let Ok(target) = fs::read_link(entry.path()) {
+                    live.insert(target);
+                }
+            }
+        }
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if live.contains(&path) {
+                continue;
+            }
+            if let Err(e) = fs::remove_dir_all(&path) {
+                tracing::warn!(
+                    token = "template-reclaim-failed",
+                    path = %path.display(),
+                    error = %e,
+                    "could not reclaim a superseded template version; retried on the next publish"
+                );
+            }
+        }
     }
 
     /// Move a completed staging dir into `.versions/` under a fresh, unique
@@ -352,8 +410,10 @@ impl TemplateStore {
     }
 
     /// Delete a template (§3.2 "image uninstalled"). A no-op, not an error,
-    /// if no template exists for `image_id`. Removes the `<image_id>`
-    /// symlink and the versioned directory it points to.
+    /// if no template exists for `image_id`. Removes the `<image_id>` symlink and
+    /// the versioned directory it points to, then reclaims anything that leaves
+    /// unreferenced — including the grace generation `publish` spared (#150),
+    /// which no later publish of this image would be around to collect.
     pub fn remove(&self, image_id: &str) -> io::Result<()> {
         let link = self.template_dir(image_id);
         let link_meta = match fs::symlink_metadata(&link) {
@@ -373,6 +433,7 @@ impl TemplateStore {
             // module owns the template root).
             fs::remove_dir_all(&link)?;
         }
+        self.reclaim_versions(None);
         tracing::info!("template: removed {image_id} (image uninstalled)");
         Ok(())
     }
@@ -614,9 +675,14 @@ fn versioned_dir_name(image_id: &str, version: &str) -> String {
 ///
 /// Fix: build a new symlink under a temp name, then `rename(2)` it directly over
 /// `link` — both sides are symlinks (or `link` doesn't exist on first publish),
-/// so the syscall is one atomic directory-entry replace. The previous target is
-/// recorded before the swap and removed after.
-fn swap_symlink(link: &Path, target: &Path) -> io::Result<()> {
+/// so the syscall is one atomic directory-entry replace.
+///
+/// Returns the previous target for the caller to reclaim LATER. Deleting it here
+/// reintroduced the same "template absent" observation by another route (#150):
+/// the swap is atomic, but a reader that already resolved the link to the old
+/// directory, or a clone still copying out of it, is left holding a path that
+/// this function had just unlinked. Reclamation is [`TemplateStore::reclaim_versions`].
+fn swap_symlink(link: &Path, target: &Path) -> io::Result<Option<PathBuf>> {
     let parent = link
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "link has no parent"))?;
@@ -638,12 +704,7 @@ fn swap_symlink(link: &Path, target: &Path) -> io::Result<()> {
         return Err(e);
     }
 
-    if let Some(prev) = previous_target {
-        if prev != target {
-            let _ = fs::remove_dir_all(&prev);
-        }
-    }
-    Ok(())
+    Ok(previous_target.filter(|prev| prev != target))
 }
 
 /// Write `.meta.json`. Called by [`TemplateStore::publish`] last, before the
@@ -986,6 +1047,17 @@ mod tests {
         assert!(!build_dir_survives(store.template_root()));
     }
 
+    /// Every entry currently in `.versions/`, by directory name.
+    fn live_versions(store: &TemplateStore) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(store.template_root().join(VERSIONS_DIR_NAME))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
     fn build_dir_survives(template_root: &Path) -> bool {
         let staging = template_root.join(STAGING_DIR_NAME);
         fs::read_dir(&staging)
@@ -1019,20 +1091,134 @@ mod tests {
         )
         .unwrap();
         assert_eq!(marker, b"v2");
-        // Exactly one live version; v1's versioned directory was removed
-        // after the swap, no leak in .versions/.
+        // The current version, plus v1 spared for one generation so an in-flight
+        // reader or clone keeps a valid tree (#150). Bounded at two: a third
+        // publish reclaims v1, covered by
+        // publish_retains_the_previous_version_and_reclaims_older_ones.
         assert!(fs::symlink_metadata(store.template_root().join("steam"))
             .unwrap()
             .file_type()
             .is_symlink());
-        let versions = store.template_root().join(VERSIONS_DIR_NAME);
-        let live: Vec<_> = fs::read_dir(&versions)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(live.len(), 1, "expected exactly one live version: {live:?}");
-        assert!(live[0].starts_with("steam-2.0.0-"), "{live:?}");
+        let live = live_versions(&store);
+        assert_eq!(
+            live.len(),
+            2,
+            "expected current + one grace generation: {live:?}"
+        );
+        assert!(
+            live.iter().any(|n| n.starts_with("steam-2.0.0-")),
+            "{live:?}"
+        );
+        assert!(
+            live.iter().any(|n| n.starts_with("steam-1.0.0-")),
+            "{live:?}"
+        );
+    }
+
+    #[test]
+    fn seed_handed_out_before_a_republish_is_still_readable_after_it() {
+        // The serious form of the publish race: seed() resolves through the
+        // symlink and hands back a versioned directory, then clone_home_into
+        // reads that tree for as long as a 2.5 GiB copy takes. Reclaiming the
+        // previous version at swap time deletes it mid-clone.
+        let base = tempfile::tempdir().unwrap();
+        let home_root = base.path().join("homes");
+        fs::create_dir_all(&home_root).unwrap();
+        let store = TemplateStore::resolve(&home_root, None, TemplateCloneMode::Copy).unwrap();
+
+        let b1 = store.begin_build("steam", "1.0.0").unwrap();
+        fs::write(b1.home_dir().join("marker"), b"v1").unwrap();
+        store.publish(b1, sample_meta("steam", "1.0.0")).unwrap();
+
+        // A launch resolves its seed and starts cloning. seed() hands back the
+        // SYMLINK path, so what the copy is actually walking is whatever that
+        // resolved to when it opened it — this versioned directory.
+        let seed = store.seed("steam").unwrap();
+        let cloning_from = fs::canonicalize(&seed.home_path).unwrap();
+
+        let b2 = store.begin_build("steam", "2.0.0").unwrap();
+        fs::write(b2.home_dir().join("marker"), b"v2").unwrap();
+        store.publish(b2, sample_meta("steam", "2.0.0")).unwrap();
+
+        // The clone is still reading. Its source must not have been deleted.
+        assert!(
+            cloning_from.is_dir(),
+            "the version an in-flight clone resolved to was reclaimed by a concurrent republish"
+        );
+        assert_eq!(
+            fs::read(cloning_from.join("marker")).unwrap(),
+            b"v1",
+            "an in-flight clone's source changed underneath it"
+        );
+    }
+
+    #[test]
+    fn publish_retains_the_previous_version_and_reclaims_older_ones() {
+        let base = tempfile::tempdir().unwrap();
+        let home_root = base.path().join("homes");
+        fs::create_dir_all(&home_root).unwrap();
+        let store = TemplateStore::resolve(&home_root, None, TemplateCloneMode::Copy).unwrap();
+
+        for version in ["1.0.0", "2.0.0", "3.0.0"] {
+            let b = store.begin_build("steam", version).unwrap();
+            fs::write(b.home_dir().join("marker"), version.as_bytes()).unwrap();
+            store.publish(b, sample_meta("steam", version)).unwrap();
+        }
+
+        let live = live_versions(&store);
+        assert_eq!(
+            live.len(),
+            2,
+            "expected the current version plus one generation of grace: {live:?}"
+        );
+        assert!(
+            live.iter().any(|n| n.starts_with("steam-3.0.0-")),
+            "{live:?}"
+        );
+        assert!(
+            live.iter().any(|n| n.starts_with("steam-2.0.0-")),
+            "{live:?}"
+        );
+        assert_eq!(store.meta("steam").unwrap().version, "3.0.0");
+    }
+
+    #[test]
+    fn reclaiming_one_image_never_touches_a_similarly_named_one() {
+        // Version dirs are "<image-id>-<version>-...", and image ids may contain
+        // dashes, so "steam" must not reclaim "steam-beta" by prefix.
+        let base = tempfile::tempdir().unwrap();
+        let home_root = base.path().join("homes");
+        fs::create_dir_all(&home_root).unwrap();
+        let store = TemplateStore::resolve(&home_root, None, TemplateCloneMode::Copy).unwrap();
+
+        let b = store.begin_build("steam-beta", "1.0.0").unwrap();
+        fs::write(b.home_dir().join("marker"), b"beta").unwrap();
+        store
+            .publish(b, sample_meta("steam-beta", "1.0.0"))
+            .unwrap();
+
+        for version in ["1.0.0", "2.0.0", "3.0.0"] {
+            let b = store.begin_build("steam", version).unwrap();
+            fs::write(b.home_dir().join("marker"), version.as_bytes()).unwrap();
+            store.publish(b, sample_meta("steam", version)).unwrap();
+        }
+
+        assert_eq!(
+            store.meta("steam-beta").unwrap().version,
+            "1.0.0",
+            "publishing `steam` reclaimed `steam-beta`"
+        );
+        assert_eq!(
+            fs::read(
+                store
+                    .template_root()
+                    .join("steam-beta")
+                    .join(HOME_DIR_NAME)
+                    .join("marker")
+            )
+            .unwrap(),
+            b"beta"
+        );
     }
 
     #[test]
@@ -1098,6 +1284,56 @@ mod tests {
         store.remove("steam").unwrap();
         assert_eq!(store.meta("steam"), None);
         assert!(!store.template_root().join("steam").exists());
+    }
+
+    #[test]
+    fn remove_reclaims_the_grace_generation_too() {
+        // publish() spares the superseded version for one generation. remove()
+        // must not leave it behind: nothing points at it any more, and there may
+        // be no later publish to reclaim it.
+        let base = tempfile::tempdir().unwrap();
+        let home_root = base.path().join("homes");
+        fs::create_dir_all(&home_root).unwrap();
+        let store = TemplateStore::resolve(&home_root, None, TemplateCloneMode::Copy).unwrap();
+
+        for version in ["1.0.0", "2.0.0"] {
+            let b = store.begin_build("steam", version).unwrap();
+            fs::write(b.home_dir().join("marker"), version.as_bytes()).unwrap();
+            store.publish(b, sample_meta("steam", version)).unwrap();
+        }
+        assert_eq!(live_versions(&store).len(), 2);
+
+        store.remove("steam").unwrap();
+
+        let live = live_versions(&store);
+        assert!(live.is_empty(), "remove left versions behind: {live:?}");
+        assert!(store.meta("steam").is_none());
+    }
+
+    #[test]
+    fn remove_leaves_other_images_untouched() {
+        let base = tempfile::tempdir().unwrap();
+        let home_root = base.path().join("homes");
+        fs::create_dir_all(&home_root).unwrap();
+        let store = TemplateStore::resolve(&home_root, None, TemplateCloneMode::Copy).unwrap();
+
+        for image in ["steam", "steam-beta"] {
+            for version in ["1.0.0", "2.0.0"] {
+                let b = store.begin_build(image, version).unwrap();
+                fs::write(b.home_dir().join("marker"), version.as_bytes()).unwrap();
+                store.publish(b, sample_meta(image, version)).unwrap();
+            }
+        }
+
+        store.remove("steam").unwrap();
+
+        assert!(store.meta("steam").is_none());
+        assert_eq!(store.meta("steam-beta").unwrap().version, "2.0.0");
+        let live = live_versions(&store);
+        assert!(
+            live.iter().all(|n| n.starts_with("steam-beta-")),
+            "remove reclaimed another image's versions: {live:?}"
+        );
     }
 
     #[test]

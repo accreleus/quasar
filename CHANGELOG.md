@@ -26,6 +26,15 @@ own; the two do not move together, and that is deliberate.
 
 ### Fixed
 
+- Publishing a home template no longer deletes the version it supersedes while
+  readers may still be inside it. The symlink swap was already atomic, but the
+  previous versioned directory was reclaimed immediately after it, so a reader
+  mid-path-resolution could see the template as absent and an in-flight clone
+  could have its source removed underneath it. The superseded version is now
+  spared for one publish generation and reclaimed by the next publish, which
+  keeps `.versions/` bounded at two per image. Reclamation is decided by
+  reachability rather than by name, so an image id that is a prefix of another
+  cannot collect its neighbour's versions (#150).
 - The quick-start installer writes the stack to an absolute path derived from the
   base path you give it, instead of a `deploy/` directory beside wherever the
   script was run. On Unraid the root shell starts on a ramdisk, so the previous
