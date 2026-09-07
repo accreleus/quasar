@@ -24,6 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+## 0.2.5 — 2026-09-07
+
 ### Fixed
 
 - `deploy/redeploy.sh`'s header no longer claims that running sessions survive a
