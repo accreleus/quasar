@@ -54,8 +54,15 @@ own; the two do not move together, and that is deliberate.
   containers restart from Docker's own state and look healthy until the next
   compose command or upgrade. `QUASAR_STACK_DIR` records that absolute path, so
   the updater keeps resolving it, and the stack directory is created `0700`.
-  Installing covers choosing persistent storage and recovering a stack already
-  written to a ramdisk (#148).
+
+  The installer also now refuses to run on a host that already has a stack
+  deployed from somewhere else. Compose takes its project name from the stack
+  directory's name, which is `deploy` in both the old and new layouts, so
+  starting a second stack would have recreated the existing one's containers
+  with freshly generated credentials against its existing database volume --
+  which keeps the original password. Installing gained a "Moving an existing
+  stack" recipe for the case where the old directory still exists, and a by-hand
+  recovery recipe for the case where a reboot already took it (#148).
 - Intel GPUs are no longer dropped from a host's capacity inventory. Capacity
   detection required a dedicated-VRAM reading that only AMD and NVIDIA expose, so
   every Intel host reported zero GPUs, logged `gpu-capacity-unavailable`, and was
