@@ -403,8 +403,12 @@ type fakeDispatcher struct {
 	// lastCapture records the most recent session_capture (session-capture) so a
 	// test can assert the minted capture_id and the clamped budget/params.
 	lastCapture *agentws.SessionCaptureCmd
-	ackOK       bool
-	ackErr      string
+	// noAck records commands sent WITHOUT an ack. AgentHeartbeat's reverse
+	// reconcile must use Send, never SendWithAck: it runs inside the agent WS
+	// read loop, and that same loop is what would have to read the ack (#128).
+	noAck  []string
+	ackOK  bool
+	ackErr string
 	// ackSendErr, when set, makes SendWithAck fail outright (agent unreachable /
 	// no ack within the command timeout) instead of returning a nack. That is a
 	// distinct branch from ackOK=false for every caller that treats the two the
@@ -417,7 +421,21 @@ func newFakeDispatcher(ackOK bool) *fakeDispatcher {
 	return &fakeDispatcher{ackOK: ackOK, sawAssign: make(chan struct{}, 8)}
 }
 
-func (f *fakeDispatcher) Send(string, any) error { return nil }
+func (f *fakeDispatcher) Send(_ string, v any) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if c, ok := v.(agentws.SessionStopCmd); ok {
+		f.noAck = append(f.noAck, "stop:"+c.SessionID)
+	}
+	return nil
+}
+
+// noAckTypes is the ack-less Send log; see fakeDispatcher.noAck.
+func (f *fakeDispatcher) noAckTypes() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.noAck...)
+}
 
 func (f *fakeDispatcher) SendWithAck(_ context.Context, _ string, _ string, v any) (agentws.AckResult, error) {
 	f.mu.Lock()
@@ -531,7 +549,123 @@ func TestCoordinatorAssignRejected(t *testing.T) {
 	})
 }
 
-// TestCoordinatorHostDisconnected: a running session is reaped to failed.
+// TestAgentHeartbeatFailsUnlistedRunningSessions (#128): the agent's list is
+// ground truth for its own host. A running row it does not name is gone.
+func TestAgentHeartbeatFailsUnlistedRunningSessions(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	disp := newFakeDispatcher(true)
+	coord := newTestCoordinator(t, store, disp, testLogger())
+	ctx := context.Background()
+
+	kept, err := coord.Launch(ctx, s.userID, s.appID, StreamOverride{})
+	must(t, err)
+	waitFor(t, func() bool { return len(disp.types()) >= 2 })
+	coord.AgentState(ctx, s.hostID, agentws.SessionStateMsg{SessionID: kept.Session.ID, State: "running"})
+
+	gone, err := coord.Launch(ctx, s.userID, s.appID, StreamOverride{})
+	must(t, err)
+	waitFor(t, func() bool { return len(disp.types()) >= 4 })
+	coord.AgentState(ctx, s.hostID, agentws.SessionStateMsg{SessionID: gone.Session.ID, State: "running"})
+
+	coord.AgentHeartbeat(ctx, s.hostID, []string{kept.Session.ID})
+
+	if got, _ := store.Get(ctx, kept.Session.ID); got.State != StateRunning {
+		t.Errorf("listed session = %s, want running", got.State)
+	}
+	if got, _ := store.Get(ctx, gone.Session.ID); got.State != StateFailed {
+		t.Errorf("unlisted session = %s, want failed", got.State)
+	}
+}
+
+// TestAgentHeartbeatPreservesAcrossReconnect (#128): the reported case. A
+// session running before the control plane restarted must still be running once
+// the agent reconnects and names it — the reconnect itself must not reap it.
+func TestAgentHeartbeatPreservesAcrossReconnect(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	disp := newFakeDispatcher(true)
+	coord := newTestCoordinator(t, store, disp, testLogger())
+	ctx := context.Background()
+
+	res, err := coord.Launch(ctx, s.userID, s.appID, StreamOverride{})
+	must(t, err)
+	waitFor(t, func() bool { return len(disp.types()) >= 2 })
+	coord.AgentState(ctx, s.hostID, agentws.SessionStateMsg{SessionID: res.Session.ID, State: "running"})
+
+	coord.AgentReconnected(ctx, s.hostID)
+	if got, _ := store.Get(ctx, res.Session.ID); got.State != StateRunning {
+		t.Fatalf("after reconnect = %s, want running: reconnect must not reap what the agent may still hold", got.State)
+	}
+
+	coord.AgentHeartbeat(ctx, s.hostID, []string{res.Session.ID})
+	if got, _ := store.Get(ctx, res.Session.ID); got.State != StateRunning {
+		t.Errorf("after heartbeat = %s, want running", got.State)
+	}
+}
+
+// TestAgentHeartbeatStopsSessionTheControlPlaneLost (#128, reverse direction):
+// the agent reports running something we have no running row for. Left alone it
+// is an orphaned container — unbounded on a console host, where the runner's
+// idle reaper is disabled. It must be stopped, over Send and never SendWithAck.
+func TestAgentHeartbeatStopsSessionTheControlPlaneLost(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	disp := newFakeDispatcher(true)
+	coord := newTestCoordinator(t, store, disp, testLogger())
+	ctx := context.Background()
+
+	orphan := "3f1c2b7e-0000-4000-8000-00000000beef"
+	coord.AgentHeartbeat(ctx, s.hostID, []string{orphan})
+
+	want := "stop:" + orphan
+	for _, got := range disp.noAckTypes() {
+		if got == want {
+			return
+		}
+	}
+	t.Fatalf("no session_stop for the unknown session; noAck log = %v", disp.noAckTypes())
+}
+
+// TestReapHostExceptRunning (#128): a reconnecting agent's in-flight rows are
+// stale — their driving goroutine died with the old connection — but a `running`
+// row is the agent's OWN report and must survive for the heartbeat to reconcile
+// against. Reaping it here is what made a session die on a control-plane restart.
+func TestReapHostExceptRunning(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	disp := newFakeDispatcher(true)
+	coord := newTestCoordinator(t, store, disp, testLogger())
+	ctx := context.Background()
+
+	running, err := coord.Launch(ctx, s.userID, s.appID, StreamOverride{})
+	must(t, err)
+	waitFor(t, func() bool { return len(disp.types()) == 2 })
+	coord.AgentState(ctx, s.hostID, agentws.SessionStateMsg{SessionID: running.Session.ID, State: "running"})
+
+	inflight, err := coord.Launch(ctx, s.userID, s.appID, StreamOverride{})
+	must(t, err)
+
+	n, err := store.ReapHostExceptRunning(ctx, s.hostID, "agent reconnected")
+	must(t, err)
+	if n != 1 {
+		t.Fatalf("reaped %d rows, want 1 (the in-flight row only)", n)
+	}
+	if got, _ := store.Get(ctx, running.Session.ID); got.State != StateRunning {
+		t.Errorf("running session = %s, want it preserved as running", got.State)
+	}
+	if got, _ := store.Get(ctx, inflight.Session.ID); got.State != StateFailed {
+		t.Errorf("in-flight session = %s, want failed", got.State)
+	}
+}
+
+// TestCoordinatorHostDisconnected (#128): a disconnect no longer reaps a running
+// session. The agent may be holding it across a brief outage, and its heartbeat
+// on return decides. The stale-host sweep reaps if the host never comes back.
 func TestCoordinatorHostDisconnected(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool)
@@ -546,8 +680,8 @@ func TestCoordinatorHostDisconnected(t *testing.T) {
 
 	coord.HostDisconnected(ctx, s.hostID)
 	got, _ := store.Get(ctx, res.Session.ID)
-	if got.State != StateFailed {
-		t.Fatalf("after host disconnect: got %s want failed", got.State)
+	if got.State != StateRunning {
+		t.Fatalf("after host disconnect: got %s want running (held for the grace window)", got.State)
 	}
 }
 

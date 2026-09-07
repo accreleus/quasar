@@ -18,6 +18,15 @@ type Events interface {
 	// coordinator reconciles by failing the stale sessions the restarted agent is
 	// no longer running, releasing their reservations (P2-06).
 	AgentReconnected(ctx context.Context, hostID string)
+	// AgentHeartbeat carries the agent's authoritative list of the sessions it is
+	// actually running (agent-api.md §"Reconnection & reconciliation"). The
+	// coordinator fails `running` rows the agent no longer names, and stops
+	// sessions the agent runs that the control plane has no running row for.
+	//
+	// This is what lets a session survive a control-plane restart (#128): the
+	// control plane learns which sessions came back rather than assuming none
+	// did. Fire-and-forget, like AgentMetrics.
+	AgentHeartbeat(ctx context.Context, hostID string, running []string)
 	// AgentMetrics handles an agent's session_metrics telemetry sample (P4-01).
 	// Fire-and-forget: the coordinator validates the session belongs to this host
 	// (the same trust boundary as AgentState) and, on match, persists a
@@ -51,6 +60,7 @@ type noopEvents struct{}
 
 func (noopEvents) AgentState(context.Context, string, SessionStateMsg)           {}
 func (noopEvents) HostDisconnected(context.Context, string)                      {}
+func (noopEvents) AgentHeartbeat(context.Context, string, []string)              {}
 func (noopEvents) AgentReconnected(context.Context, string)                      {}
 func (noopEvents) AgentMetrics(context.Context, string, SessionMetricsMsg)       {}
 func (noopEvents) AgentTraceEvent(context.Context, string, SessionTraceEventMsg) {}

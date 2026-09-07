@@ -89,10 +89,14 @@ func TestStartReachesRunningBeforeTimeout(t *testing.T) {
 	}
 }
 
-// TestAgentReconnectReconciliation: a fresh agent connection (the agent restarted
-// and forgot its sessions) must reconcile — the control plane fails the stale
-// non-terminal sessions it still believes are on that host, releasing each
-// reservation.
+// TestAgentReconnectReconciliation: an agent that restarted and forgot its
+// sessions must still have them reconciled and their reservations released.
+//
+// Since #128 that happens on the agent's first HEARTBEAT, not on the reconnect
+// itself: the reconnect can no longer tell the difference between an agent that
+// forgot everything and one that held its sessions across a control-plane
+// restart, so it holds and lets the agent's own list decide ~5 s later. This
+// test pins both halves — reconnect preserves, heartbeat reconciles.
 func TestAgentReconnectReconciliation(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool)
@@ -117,8 +121,22 @@ func TestAgentReconnectReconciliation(t *testing.T) {
 		t.Fatalf("setup: expected 2 reserved slots, got %d", slots)
 	}
 
-	// The agent reconnects fresh (process restarted): reconcile.
+	// The agent reconnects fresh. Nothing is decided yet: it may equally be an
+	// agent that held these sessions across a control-plane restart.
 	coord.AgentReconnected(ctx, s.hostID)
+
+	for _, id := range []string{r1.Session.ID, r2.Session.ID} {
+		got, _ := store.Get(ctx, id)
+		if got.State != StateRunning {
+			t.Fatalf("session %s reaped on reconnect: state=%s, want running until the heartbeat decides", id, got.State)
+		}
+	}
+	if slots := reservedSlots(t, pool, s.gpuID); slots != 2 {
+		t.Fatalf("reservations released too early: %d slots held, want 2", slots)
+	}
+
+	// Its first heartbeat names nothing: the agent really did forget them.
+	coord.AgentHeartbeat(ctx, s.hostID, nil)
 
 	for _, id := range []string{r1.Session.ID, r2.Session.ID} {
 		got, _ := store.Get(ctx, id)

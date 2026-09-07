@@ -462,6 +462,14 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			} else {
 				h.log.Debug("heartbeat", "host_id", hostID, "running_sessions", len(hb.RunningSessions))
 			}
+			// #128: the agent's own list is ground truth for this host. Same
+			// connection-lifetime ctx + deadline as the heartbeat write above, so
+			// a stalled store drops the connection instead of parking this read
+			// loop. The coordinator dispatches any corrective stop over Send, not
+			// SendWithAck — THIS loop is what would read the ack.
+			rcCtx, rcCancel := context.WithTimeout(bg, agentDBCallTimeout)
+			h.events.AgentHeartbeat(rcCtx, hostID, hb.RunningSessions)
+			rcCancel()
 			// #383: VRAM telemetry, off the read loop (vramQueue). An absent
 			// gpu_vram key is a no-op — the stored sample ages out.
 			h.vram.enqueue(vramSampleBatch{hostID: hostID, agentMs: hb.TsUnixMs, samples: hb.GPUVram})

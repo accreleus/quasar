@@ -425,6 +425,11 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		},
 	})
 
+	// Captured BEFORE the coordinator exists, so the stale sweep's grace runs
+	// from this process's start. Without it a control plane restarting after a
+	// quiet period would reap every session in its first tick, before any agent
+	// could reconnect (#128).
+	bootedAt := time.Now()
 	coordinator := session.NewCoordinator(sessionStore, agentRegistry, log,
 		session.WithHomeProvider(homeProvider),
 		// The terminal-failure edge has no acting admin, so it is recorded here
@@ -448,6 +453,16 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 			}
 			return jobsDispatcher.ReclaimHostRuns(ctx, hostID, reason)
 		}))
+
+	// #128: the backstop for the grace window. HostDisconnected and
+	// AgentReconnected no longer reap `running` rows -- the agent may be holding
+	// them across a control-plane restart -- so something has to terminalise the
+	// sessions of a host that never comes back. Process-lifetime, like the other
+	// background loops here.
+	go coordinator.RunStaleSweep(context.Background(), bootedAt,
+		time.Duration(cfg.SessionGraceSecs)*time.Second)
+	log.Info("session stale-host sweep started",
+		"grace_secs", cfg.SessionGraceSecs, "booted_at", bootedAt.Format(time.RFC3339))
 
 	authHandler := auth.NewHandler(authSvc, auditStore).
 		WithVersionPolicy(cfg.MinClientVersion, cfg.LatestClientVersion).
