@@ -3217,6 +3217,64 @@ fi
 # Release publication must wait for every image advertised in its install footer.
 rc_of 0 "release:publication-dependencies" -- bash "$ROOT/scripts/release/test-release-publication-gate.sh"
 
+printf '\n== test-db runner selection (#125) ==\n'
+# make test-db must work on a host with no Go toolchain outside containers --
+# every fleet host. The Postgres side was already ephemeral and per-worktree;
+# only the `go test` invocation assumed a host toolchain.
+#
+# Daemon-free: the docker stub answers everything, so this exercises which
+# runner testdb.sh SELECTS, not a real Postgres or a real test run.
+
+# A stub bin without `go`, to model a fleet host. Real go must not leak in from
+# the surrounding PATH, so PATH is replaced rather than prepended.
+STUB_BIN_NOGO="$WORK/stubbin-nogo"
+mkdir -p "$STUB_BIN_NOGO"
+for stub in "$STUB_BIN"/*; do
+  [ "$(basename "$stub")" = go ] && continue
+  ln -sf "$stub" "$STUB_BIN_NOGO/$(basename "$stub")"
+done
+
+testdb_runner_line() { # testdb_runner_line <path> [env...]
+  local path="$1"; shift
+  # -u HOST: testdb.sh is local-only (dx_require_local), so an exported HOST
+  # turns every one of these into a guard failure with no runner line.
+  env -u HOST PATH="$path" "$@" bash "$DX/testdb.sh" 2>&1 | grep -E '^(PASS|FAIL) runner' | head -n 1
+}
+
+# `command` is a shell builtin, so `env PATH=... command -v go` execs a binary
+# that does not exist and always exits 127 — the skip would never fire and this
+# test would FAIL on any host with a distro Go in /usr/bin. It must run through
+# a shell.
+if env PATH="$STUB_BIN_NOGO:/usr/bin:/bin" bash -c 'command -v go' >/dev/null 2>&1; then
+  warn "testdb:no-go-path" "go still resolves with a scrubbed PATH — SKIPPED"
+else
+  line="$(testdb_runner_line "$STUB_BIN_NOGO:/usr/bin:/bin")"
+  case "$line" in
+    PASS\ runner*container*)
+      pass "testdb:no-go-uses-container" "$line" ;;
+    *)
+      fail "testdb:no-go-uses-container" "expected a containerised runner, got: ${line:-<no runner line>}" ;;
+  esac
+fi
+
+# The explicit override takes the same branch even where a host toolchain exists.
+line="$(testdb_runner_line "$STUB_BIN:$PATH" TESTDB_CONTAINERISED=1)"
+case "$line" in
+  PASS\ runner*container*)
+    pass "testdb:override-uses-container" "$line" ;;
+  *)
+    fail "testdb:override-uses-container" "expected a containerised runner, got: ${line:-<no runner line>}" ;;
+esac
+
+# With a toolchain and no override, the host path is unchanged.
+line="$(testdb_runner_line "$STUB_BIN:$PATH")"
+case "$line" in
+  PASS\ runner*host*)
+    pass "testdb:go-present-uses-host" "$line" ;;
+  *)
+    fail "testdb:go-present-uses-host" "expected the host runner, got: ${line:-<no runner line>}" ;;
+esac
+
 # ── summary ──────────────────────────────────────────────────────────────────
 printf '\n'
 STATUS=ok

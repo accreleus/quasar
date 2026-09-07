@@ -24,6 +24,58 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+
+- `deploy/redeploy.sh`'s header no longer claims that running sessions survive a
+  control-plane-only deploy. They do not, and have not: recreating the control
+  plane ends every session on the host (#128). Drain first if the sessions
+  matter; the fleet self-update run already does.
+- Pull-request CI now builds and tests `site/`, which generates the quick-start
+  compose file, `.env` and install script. Those tests ran only in the manually
+  dispatched docs workflow, so a regression in the operator-facing installer
+  could reach `main` without anything failing.
+- `make test-db` now works on a host with no Go toolchain outside a container,
+  which is every fleet host. It selects a containerised runner when `go` is
+  absent (or when `TESTDB_CONTAINERISED=1` forces it), reaching the ephemeral
+  Postgres by container name on a private network instead of the published
+  loopback port. The target previously refused to run at all with
+  `FAIL go — not on PATH`, so the one gate that proves a DB-touching
+  control-plane change was unavailable exactly where changes get validated (#125).
+- Publishing a home template no longer deletes the version it supersedes while
+  readers may still be inside it. The symlink swap was already atomic, but the
+  previous versioned directory was reclaimed immediately after it, so a reader
+  mid-path-resolution could see the template as absent and an in-flight clone
+  could have its source removed underneath it. The superseded version is now
+  spared for one publish generation and reclaimed by the next publish, which
+  keeps `.versions/` bounded at two per image. Reclamation is decided by
+  reachability rather than by name, so an image id that is a prefix of another
+  cannot collect its neighbour's versions (#150).
+- The quick-start installer writes the stack to an absolute path derived from the
+  base path you give it, instead of a `deploy/` directory beside wherever the
+  script was run. On Unraid the root shell starts on a ramdisk, so the previous
+  behavior lost `docker-compose.yml` and the only copy of `POSTGRES_PASSWORD`,
+  `QUASAR_SECRET_KEY` and the enrollment token at the next reboot, silently: the
+  containers restart from Docker's own state and look healthy until the next
+  compose command or upgrade. `QUASAR_STACK_DIR` records that absolute path, so
+  the updater keeps resolving it, and the stack directory is created `0700`.
+
+  The installer also now refuses to run on a host that already has a stack
+  deployed from somewhere else. Compose takes its project name from the stack
+  directory's name, which is `deploy` in both the old and new layouts, so
+  starting a second stack would have recreated the existing one's containers
+  with freshly generated credentials against its existing database volume --
+  which keeps the original password. Installing gained a "Moving an existing
+  stack" recipe for the case where the old directory still exists, and a by-hand
+  recovery recipe for the case where a reboot already took it (#148).
+- Intel GPUs are no longer dropped from a host's capacity inventory. Capacity
+  detection required a dedicated-VRAM reading that only AMD and NVIDIA expose, so
+  every Intel host reported zero GPUs, logged `gpu-capacity-unavailable`, and was
+  unschedulable while reporting "no GPU detected". Intel now reads i915
+  `lmem_total_bytes`, then per-tile `physical_vram_size_bytes`, and otherwise
+  budgets an explicit share of host RAM for an iGPU whose memory is shared.
+  Live free-VRAM stays unknown for Intel, which the admission veto already
+  abstains on (#126, PR #133).
+
 ## 0.2.4 — 2026-09-06
 
 ### Added

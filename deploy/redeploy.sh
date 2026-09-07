@@ -46,11 +46,18 @@
 #                      The SPA is NOT rebuilt; the served-bundle check reads the
 #                      hash already on disk, so it still catches a container that
 #                      came back up with a broken dist mount.
-#           Neither narrow scope touches the node-agent image or container, so
-#           running sessions survive the deploy. Both still WAIT for the
-#           control-plane to report healthy, which is what proves an embedded
-#           migration finished — the CP-only path is precisely the one that
-#           carries migrations, so that wait is not optional.
+#           Neither narrow scope touches the node-agent image or container.
+#           That is NOT enough for a running session to survive: recreating the
+#           control plane ends every session on the host today (#128). Three
+#           things each do it independently — the agent stops its sessions when
+#           its websocket drops, the control plane reaps them when the agent
+#           re-registers, and the browser gives up after one failed attempt to
+#           mint a replacement signalling token. Drain before a control-plane
+#           deploy if the sessions matter; the fleet self-update run already
+#           does. Both scopes still WAIT for the control-plane to report healthy,
+#           which is what proves an embedded migration finished — the CP-only
+#           path is precisely the one that carries migrations, so that wait is
+#           not optional.
 #
 # Exit status is 0 only if every post-deploy verification passes. The final
 # line is a machine-readable summary the drift-check (qstack sync) parses:

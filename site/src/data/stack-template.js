@@ -29,6 +29,22 @@ export function statePath(a) {
   return `${a.basePath.replace(/\/+$/, '')}/control`;
 }
 
+/**
+ * The stack directory: docker-compose.yml and .env, including the only copy of
+ * POSTGRES_PASSWORD, QUASAR_SECRET_KEY and the enrollment token.
+ *
+ * Derived from basePath and never from the operator's working directory (#148).
+ * Unraid runs / from a ramdisk and its shell starts in /root, so a stack written
+ * beside the invocation is gone at the next reboot, taking the credentials with
+ * it. The containers restart against the surviving Postgres volume, so nothing
+ * looks wrong until the first compose command or upgrade.
+ *
+ * Named `deploy` to match the layout every install page documents.
+ */
+export function stackPath(a) {
+  return `${a.basePath.replace(/\/+$/, '')}/deploy`;
+}
+
 /** Per-user home directories. This is the one that grows. */
 export function homePath(a) {
   if (a.separateSaves && a.savesPath.trim()) return a.savesPath.trim().replace(/\/+$/, '');
@@ -53,7 +69,7 @@ export function appUser(a) {
 
 /** The -f list every generated docker compose command carries. */
 export function composeFiles() {
-  return ['deploy/docker-compose.yml'];
+  return ['docker-compose.yml'];
 }
 
 function composeYaml(a) {
@@ -196,8 +212,7 @@ function envFile(a, installer = false) {
     if (line.startsWith('#') || !line.includes('=')) return line;
     const index = line.indexOf('=');
     const value = line.slice(index + 1);
-    if (/^[a-zA-Z0-9_./,:@%+-]*$/.test(value)) return line;
-    return line.slice(0, index + 1) + "'" + value.replaceAll("\\", "\\\\").replaceAll("'", "\\'") + "'";
+    return line.slice(0, index + 1) + envQuote(value);
   }).join('\n') + '\n';
 }
 
@@ -242,6 +257,17 @@ printf '%s' "$entrypoint" | jq -e '.[0] == "/usr/local/bin/quasar-control-entryp
 `;
 }
 
+/**
+ * Quote a value for Compose's dotenv parser.
+ *
+ * Unquoted, it expands `$VAR` and strips an inline ` #` comment, so a path
+ * containing either reaches Compose as something else entirely.
+ */
+export function envQuote(value) {
+  if (/^[a-zA-Z0-9_./,:@%+-]*$/.test(value)) return value;
+  return "'" + value.replaceAll("\\", "\\\\").replaceAll("'", "\\'") + "'";
+}
+
 function shellQuote(value) {
   return "'" + value.replaceAll("'", "'\"'\"'") + "'";
 }
@@ -250,7 +276,7 @@ function scriptText(a) {
   const { uid, gid } = appUser(a);
   const p = platform(a.platform);
   const files = composeFiles(a)
-    .map((f) => `-f ${f}`)
+    .map((f) => `-f "$stack_dir/${f}"`)
     .join(' ');
 
   const nvidiaBlock = a.gpu === 'nvidia' ? `
@@ -271,6 +297,43 @@ fi
 # Quasar quick start for ${p.label}. Generated in your browser; nothing was sent
 # anywhere. Read it before you run it.
 set -euo pipefail
+
+# Everything this installer writes lives here, at an absolute path. Never
+# relative to the working directory: on a host whose shell starts on a ramdisk
+# that loses the credentials at the next reboot (#148).
+# --- first-install guards ---
+stack_dir=${shellQuote(stackPath(a))}
+# The same path as Compose's dotenv parser must read it. Unquoted it would
+# expand a dollar-sign variable and drop an inline hash comment.
+stack_dir_env=${shellQuote(envQuote(stackPath(a)))}
+
+case "$stack_dir" in
+  /*) ;;
+  *) echo "The stack directory $stack_dir is not absolute. Re-run the wizard with an absolute base path." >&2; exit 1 ;;
+esac
+
+# Refuse to take over an existing install. Compose derives the project name from
+# the stack directory's NAME, which is deploy here and was deploy for every
+# earlier installer too. So an up -d from a new path drives the SAME project as
+# an existing stack: it would recreate those containers with the credentials
+# minted below, against a Postgres volume that ignores POSTGRES_PASSWORD once
+# initialised. The control plane would come back unable to open its own database,
+# and the containers holding the only copy of the old credentials would be gone.
+if command -v docker >/dev/null 2>&1; then
+  existing=$(docker ps -aq --filter 'label=com.docker.compose.service=quasar-control-plane' 2>/dev/null | head -n 1 || true)
+  if [ -n "\${existing:-}" ]; then
+    existing_dir=$(docker inspect "$existing" --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' 2>/dev/null || true)
+    if [ "$existing_dir" != "$stack_dir" ]; then
+      echo "This host already runs a Quasar stack, deployed from \${existing_dir:-an unknown directory}." >&2
+      echo "This script performs first installs only. Starting a second stack would recreate" >&2
+      echo "that one's containers with new credentials against its existing database volume," >&2
+      echo "and the control plane would no longer be able to open it." >&2
+      echo "To move an existing stack, see \"Moving an existing stack\" in the install guide." >&2
+      exit 1
+    fi
+  fi
+fi
+# --- end first-install guards ---
 
 echo "==> Host preflight"
 preflight_failed=0
@@ -301,16 +364,18 @@ if [ "$preflight_failed" != 0 ]; then
   echo "Correct the preflight problems above before starting Quasar." >&2
   exit 1
 fi
-if [ -e deploy/docker-compose.yml ] && ! grep -q '^# Quasar generated install v2$' deploy/docker-compose.yml; then
-  echo "This directory contains an existing stack. Keep its deployment commands; this first-install script will not rewrite it." >&2
+if [ -e "$stack_dir/docker-compose.yml" ] && ! grep -q '^# Quasar generated install v2$' "$stack_dir/docker-compose.yml"; then
+  echo "$stack_dir contains an existing stack. Keep its deployment commands; this first-install script will not rewrite it." >&2
   exit 1
 fi
-if [ ! -e deploy/.env ]; then
+if [ ! -e "$stack_dir/.env" ]; then
 ${releaseSelection()}fi
 
 echo "==> Directories"
 ${p.sudo}install -d -m 0755 -o ${uid} -g ${gid} ${shellQuote(homePath(a))}
-mkdir -p deploy
+# 0700 and owned by whoever runs this: the .env below holds every credential,
+# and the heredocs that follow are not privileged.
+${p.sudo}install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$stack_dir"
 
 echo "==> UDP send buffer"
 # libnice never calls setsockopt(SO_SNDBUF), so media sockets inherit the kernel
@@ -324,25 +389,25 @@ ${p.module()}
 [ -d /dev/dri ] || { echo "GPU device directory /dev/dri is unavailable; check the host graphics driver" >&2; exit 1; }
 
 echo "==> Compose file"
-if [ ! -e deploy/docker-compose.yml ]; then
-  cat > deploy/docker-compose.yml <<'COMPOSE'
+if [ ! -e "$stack_dir/docker-compose.yml" ]; then
+  cat > "$stack_dir/docker-compose.yml" <<'COMPOSE'
 ${composeYaml(a)}COMPOSE
 fi
 
 echo "==> Environment file"
 umask 077
-if [ ! -e deploy/.env ]; then
+if [ ! -e "$stack_dir/.env" ]; then
   postgres=$(openssl rand -hex 24)
   enrollment=$(openssl rand -hex 32)
   secret=$(openssl rand -base64 32)
-  env_tmp=$(mktemp deploy/.env.XXXXXX)
+  env_tmp=$(mktemp "$stack_dir/.env.XXXXXX")
   trap 'rm -f "$env_tmp"' EXIT
   cat > "$env_tmp" <<'ENV'
 ${envFile(a, true)}ENV
   sed -i "s|^POSTGRES_PASSWORD=$|POSTGRES_PASSWORD=$postgres|; s|^ENROLLMENT_TOKEN=$|ENROLLMENT_TOKEN=$enrollment|; s|^QUASAR_SECRET_KEY=$|QUASAR_SECRET_KEY=$secret|" "$env_tmp"
-  printf '\nQUASAR_STACK_DIR=%s\nQUASAR_CONTROL_IMAGE=%s\nQUASAR_AGENT_IMAGE=%s\nQUASAR_UPDATER_IMAGE=%s\n' "$(cd deploy && pwd)" "$control_image" "$agent_image" "$updater_image" >> "$env_tmp"
+  printf '\nQUASAR_STACK_DIR=%s\nQUASAR_CONTROL_IMAGE=%s\nQUASAR_AGENT_IMAGE=%s\nQUASAR_UPDATER_IMAGE=%s\n' "$stack_dir_env" "$control_image" "$agent_image" "$updater_image" >> "$env_tmp"
   # noclobber refuses a concurrent installer instead of replacing its credentials.
-  (set -o noclobber; cat "$env_tmp" > deploy/.env)
+  (set -o noclobber; cat "$env_tmp" > "$stack_dir/.env")
   rm -f "$env_tmp"
   trap - EXIT
 fi

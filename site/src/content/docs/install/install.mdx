@@ -39,6 +39,14 @@ changes, or use the instructions shipped with your chosen release. A merge into
    `deploy/docker-compose.yml` and `deploy/.env`, so matching that layout keeps
    the commands elsewhere in this documentation correct as written.
 
+   Run this somewhere that survives a reboot, and check that before you continue.
+   `deploy/.env` becomes the only copy of `POSTGRES_PASSWORD`,
+   `QUASAR_SECRET_KEY` and the enrollment token, and nothing regenerates them.
+   On Unraid in particular the root shell starts in `/root`, which is a ramdisk,
+   so a stack created there is gone at the next boot: use a path under
+   `/mnt/user/appdata/` instead. The quick start puts the stack under the base
+   path you give it for exactly this reason.
+
 2. **Save this as `deploy/docker-compose.yml`.**
 
    <Code code={files.compose} lang="yaml" />
@@ -170,6 +178,67 @@ rather than adapting anything above.
 
 There is no reverse proxy in the default deployment. For Caddy or an existing
 ingress, see [Behind a reverse proxy](/quasar/network/reverse-proxy/).
+
+## Moving an existing stack
+
+Do this if your stack directory is somewhere that will not survive a reboot, and it
+still exists. On Unraid that means anything under `/root`. It is a move, not a
+reinstall: the credentials in `.env` are irreplaceable, and the quick start will
+refuse to run against a host that already has a stack precisely so it cannot mint new
+ones over the top of yours.
+
+```bash
+cp=$(docker ps -q --filter 'label=com.docker.compose.service=quasar-control-plane')
+old=$(docker inspect "$cp" --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}')
+new=/mnt/user/appdata/quasar/deploy     # persistent storage on this host
+
+docker compose -f "$old/docker-compose.yml" down
+install -d -m 0700 "$(dirname "$new")"
+mv "$old" "$new"
+sed -i "s|^QUASAR_STACK_DIR=.*|QUASAR_STACK_DIR=$new|" "$new/.env"
+docker compose -f "$new/docker-compose.yml" up -d
+```
+
+Keep the directory named `deploy`. Compose takes the project name from it, so renaming
+it strands the existing containers and volumes under the old project. `down` without
+`-v` leaves the database and save data alone.
+
+## Recovering a stack written to a ramdisk
+
+If the directory is already gone, the containers are probably still running: Compose
+restarts them from the Docker daemon's own state, so the stack looks healthy while
+`docker-compose.yml` and `.env` no longer exist. The next `docker compose` command or
+upgrade is where it surfaces.
+
+**Recover the credentials before stopping or removing anything.** They exist only in
+the running containers now, and they are not all in one place: the control plane holds
+the secret key and the enrollment token, the database password is on Postgres. Address
+them by service label, since container names carry a project prefix.
+
+```bash
+cp=$(docker ps -q --filter 'label=com.docker.compose.service=quasar-control-plane')
+docker inspect "$cp" --format '{{ range .Config.Env }}{{ println . }}{{ end }}' \
+  | grep -E '^(QUASAR_SECRET_KEY|ENROLLMENT_TOKEN)='
+
+pg=$(docker ps -q --filter 'label=com.docker.compose.service=quasar-postgres')
+docker inspect "$pg" --format '{{ range .Config.Env }}{{ println . }}{{ end }}' \
+  | grep -E '^POSTGRES_PASSWORD='
+```
+
+Then rebuild the stack directory **by hand**, on persistent storage, reusing those
+values. Do not re-run the quick start for this: it generates fresh credentials and
+starts the stack in one pass, which would recreate your containers against a database
+that still expects the old password. It now refuses to run on a host that already has
+a stack, for this reason.
+
+1. `install -d -m 0700 /mnt/user/appdata/quasar/deploy`, keeping the directory named
+   `deploy` so the Compose project name is unchanged.
+2. Save the compose file from step 2 of this page into it.
+3. Write `.env` from step 3, pasting the **recovered** values rather than generating
+   new ones, and set `QUASAR_STACK_DIR` to the new absolute path.
+4. `docker compose -f /mnt/user/appdata/quasar/deploy/docker-compose.yml up -d`.
+
+Generating new credentials instead leaves you unable to open the existing database.
 
 ## Stopping without losing data
 
