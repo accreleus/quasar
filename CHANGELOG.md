@@ -24,6 +24,17 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Fixed
+
+- Intel GPUs are no longer dropped from a host's capacity inventory. Capacity
+  detection required a dedicated-VRAM reading that only AMD and NVIDIA expose, so
+  every Intel host reported zero GPUs, logged `gpu-capacity-unavailable`, and was
+  unschedulable while reporting "no GPU detected". Intel now reads i915
+  `lmem_total_bytes`, then per-tile `physical_vram_size_bytes`, and otherwise
+  budgets an explicit share of host RAM for an iGPU whose memory is shared.
+  Live free-VRAM stays unknown for Intel, which the admission veto already
+  abstains on (#126, PR #133).
+
 ## 0.2.4 — 2026-09-06
 
 ### Added
