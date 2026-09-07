@@ -212,8 +212,7 @@ function envFile(a, installer = false) {
     if (line.startsWith('#') || !line.includes('=')) return line;
     const index = line.indexOf('=');
     const value = line.slice(index + 1);
-    if (/^[a-zA-Z0-9_./,:@%+-]*$/.test(value)) return line;
-    return line.slice(0, index + 1) + "'" + value.replaceAll("\\", "\\\\").replaceAll("'", "\\'") + "'";
+    return line.slice(0, index + 1) + envQuote(value);
   }).join('\n') + '\n';
 }
 
@@ -258,6 +257,17 @@ printf '%s' "$entrypoint" | jq -e '.[0] == "/usr/local/bin/quasar-control-entryp
 `;
 }
 
+/**
+ * Quote a value for Compose's dotenv parser.
+ *
+ * Unquoted, it expands `$VAR` and strips an inline ` #` comment, so a path
+ * containing either reaches Compose as something else entirely.
+ */
+export function envQuote(value) {
+  if (/^[a-zA-Z0-9_./,:@%+-]*$/.test(value)) return value;
+  return "'" + value.replaceAll("\\", "\\\\").replaceAll("'", "\\'") + "'";
+}
+
 function shellQuote(value) {
   return "'" + value.replaceAll("'", "'\"'\"'") + "'";
 }
@@ -291,7 +301,39 @@ set -euo pipefail
 # Everything this installer writes lives here, at an absolute path. Never
 # relative to the working directory: on a host whose shell starts on a ramdisk
 # that loses the credentials at the next reboot (#148).
+# --- first-install guards ---
 stack_dir=${shellQuote(stackPath(a))}
+# The same path as Compose's dotenv parser must read it. Unquoted it would
+# expand a dollar-sign variable and drop an inline hash comment.
+stack_dir_env=${shellQuote(envQuote(stackPath(a)))}
+
+case "$stack_dir" in
+  /*) ;;
+  *) echo "The stack directory $stack_dir is not absolute. Re-run the wizard with an absolute base path." >&2; exit 1 ;;
+esac
+
+# Refuse to take over an existing install. Compose derives the project name from
+# the stack directory's NAME, which is deploy here and was deploy for every
+# earlier installer too. So an up -d from a new path drives the SAME project as
+# an existing stack: it would recreate those containers with the credentials
+# minted below, against a Postgres volume that ignores POSTGRES_PASSWORD once
+# initialised. The control plane would come back unable to open its own database,
+# and the containers holding the only copy of the old credentials would be gone.
+if command -v docker >/dev/null 2>&1; then
+  existing=$(docker ps -aq --filter 'label=com.docker.compose.service=quasar-control-plane' 2>/dev/null | head -n 1 || true)
+  if [ -n "\${existing:-}" ]; then
+    existing_dir=$(docker inspect "$existing" --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' 2>/dev/null || true)
+    if [ "$existing_dir" != "$stack_dir" ]; then
+      echo "This host already runs a Quasar stack, deployed from \${existing_dir:-an unknown directory}." >&2
+      echo "This script performs first installs only. Starting a second stack would recreate" >&2
+      echo "that one's containers with new credentials against its existing database volume," >&2
+      echo "and the control plane would no longer be able to open it." >&2
+      echo "To move an existing stack, see \"Moving an existing stack\" in the install guide." >&2
+      exit 1
+    fi
+  fi
+fi
+# --- end first-install guards ---
 
 echo "==> Host preflight"
 preflight_failed=0
@@ -363,7 +405,7 @@ if [ ! -e "$stack_dir/.env" ]; then
   cat > "$env_tmp" <<'ENV'
 ${envFile(a, true)}ENV
   sed -i "s|^POSTGRES_PASSWORD=$|POSTGRES_PASSWORD=$postgres|; s|^ENROLLMENT_TOKEN=$|ENROLLMENT_TOKEN=$enrollment|; s|^QUASAR_SECRET_KEY=$|QUASAR_SECRET_KEY=$secret|" "$env_tmp"
-  printf '\nQUASAR_STACK_DIR=%s\nQUASAR_CONTROL_IMAGE=%s\nQUASAR_AGENT_IMAGE=%s\nQUASAR_UPDATER_IMAGE=%s\n' "$stack_dir" "$control_image" "$agent_image" "$updater_image" >> "$env_tmp"
+  printf '\nQUASAR_STACK_DIR=%s\nQUASAR_CONTROL_IMAGE=%s\nQUASAR_AGENT_IMAGE=%s\nQUASAR_UPDATER_IMAGE=%s\n' "$stack_dir_env" "$control_image" "$agent_image" "$updater_image" >> "$env_tmp"
   # noclobber refuses a concurrent installer instead of replacing its credentials.
   (set -o noclobber; cat "$env_tmp" > "$stack_dir/.env")
   rm -f "$env_tmp"

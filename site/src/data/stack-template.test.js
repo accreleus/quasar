@@ -277,7 +277,7 @@ test('installer creates private credentials once and preserves them on rerun', a
     const run = () => spawnSync('bash', ['-eu', '-c', envStep], {
       cwd: dir, encoding: 'utf8',
       // stack_dir is bound at the top of the script, outside this slice.
-      env: { ...process.env, stack_dir: join(dir, 'deploy'), control_image: 'control:test', agent_image: 'agent:test', updater_image: 'updater:test' },
+      env: { ...process.env, stack_dir: join(dir, 'deploy'), stack_dir_env: join(dir, 'deploy'), control_image: 'control:test', agent_image: 'agent:test', updater_image: 'updater:test' },
     });
     assert.equal(run().status, 0);
     const path = join(dir, 'deploy', '.env');
@@ -399,7 +399,7 @@ test('QUASAR_STACK_DIR records the absolute stack path the updater will mount', 
   );
   assert.match(
     script,
-    /QUASAR_STACK_DIR=%s[\s\S]*?"\$stack_dir"/,
+    /QUASAR_STACK_DIR=%s[\s\S]*?"\$stack_dir_env"/,
     'QUASAR_STACK_DIR must be written from that absolute path'
   );
 });
@@ -408,4 +408,71 @@ test('a trailing slash on basePath does not double up in the stack path', () => 
   const { script } = generate(full({ basePath: '/srv/quasar///' }));
   assert.ok(script.includes("'/srv/quasar/deploy'"));
   assert.ok(!script.includes('quasar//deploy'));
+});
+
+
+// --- first-install guards (#148 follow-ups) -------------------------------
+// The stack directory is named `deploy`, and so was every earlier installer's.
+// Compose derives the project name from that directory name, so `up -d` from a
+// NEW path drives the SAME project as an existing install -- recreating its
+// containers with freshly minted credentials against its surviving Postgres
+// volume, which ignores POSTGRES_PASSWORD once initialised.
+
+// Run one guard block from the generated script in isolation.
+const runGuards = async (answers, env) => {
+  const { spawnSync } = await import('node:child_process');
+  const { script } = generate(full(answers));
+  const start = script.indexOf('# --- first-install guards ---');
+  const end = script.indexOf('# --- end first-install guards ---');
+  assert.ok(start > 0 && end > start, 'the guard block must be delimited for testing');
+  return spawnSync('bash', ['-c', script.slice(start, end)], { encoding: 'utf8', env: { ...process.env, ...env } });
+};
+
+test('the installer refuses to take over a stack deployed from elsewhere', async () => {
+  const { mkdtempSync, writeFileSync, chmodSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const bin = mkdtempSync(join(tmpdir(), 'quasar-guard-bin-'));
+  try {
+    // A docker that reports one existing control plane, deployed from /root/deploy.
+    writeFileSync(join(bin, 'docker'), `#!/usr/bin/env bash
+case "$1" in
+  ps) echo deadbeef ;;
+  inspect) echo "/root/deploy" ;;
+esac
+`);
+    chmodSync(join(bin, 'docker'), 0o755);
+
+    const foreign = await runGuards({ basePath: '/srv/quasar' }, { PATH: `${bin}:${process.env.PATH}` });
+    assert.equal(foreign.status, 1, `expected refusal, got ${foreign.status}: ${foreign.stdout}${foreign.stderr}`);
+    assert.match(foreign.stderr, /already runs a Quasar stack/);
+    assert.match(foreign.stderr, /\/root\/deploy/);
+
+    // Same host, same stack directory: that is a rerun, not a takeover.
+    const same = await runGuards({ basePath: '/root' }, { PATH: `${bin}:${process.env.PATH}` });
+    assert.equal(same.status, 0, `a rerun in place must be allowed: ${same.stderr}`);
+  } finally { rmSync(bin, { recursive: true, force: true }); }
+});
+
+test('the installer refuses a stack directory that is not absolute', async () => {
+  const r = await runGuards({ basePath: 'relative/quasar' }, {});
+  assert.equal(r.status, 1, `expected refusal, got ${r.status}`);
+  assert.match(r.stderr, /absolute/);
+});
+
+test('QUASAR_STACK_DIR is written so Compose cannot interpolate or truncate it', () => {
+  // Compose's dotenv parser expands $VAR and strips an inline ` #` comment from
+  // an unquoted value, so the updater would bind-mount the wrong path.
+  for (const basePath of ['/srv/$HOME/quasar', '/mnt/a #b/quasar', "/srv/it's here/quasar"]) {
+    const { script } = generate(full({ basePath }));
+    assert.match(
+      script,
+      /^stack_dir_env='/m,
+      `${basePath}: the .env form of the stack dir must be pre-quoted`
+    );
+    assert.ok(
+      script.includes('QUASAR_STACK_DIR=%s') && script.includes('"$stack_dir_env"'),
+      `${basePath}: QUASAR_STACK_DIR must be written from the quoted form`
+    );
+  }
 });
