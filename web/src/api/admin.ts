@@ -39,6 +39,7 @@ import type {
   PlatformApplyRunsResponse,
   PlatformIdentity,
   PlatformReleaseView,
+  PlatformWebhookTestResponse,
   ReleaseChannel,
   RegistrationMode,
   StorageProvider,
@@ -169,6 +170,11 @@ export function updateSettings(
     /** Rejected with 400 unless it is a git ref name: 1-255 characters, no
      *  whitespace, no "..", no leading "-". */
     release_edge_branch?: string;
+    /** "" clears the URL and disables the webhook in the same write; anything
+     *  else must be an absolute https URL with no credentials. */
+    release_webhook_url?: string;
+    /** Rejected with 400 when no URL is stored and none is sent with it. */
+    release_webhook_enabled?: boolean;
   },
 ): Promise<SettingsResponse> {
   return apiFetch<SettingsResponse>("/admin/settings", {
@@ -908,6 +914,15 @@ export function getPlatformReleases(
   signal?: AbortSignal,
 ): Promise<PlatformReleaseView> {
   return apiFetch<PlatformReleaseView>("/admin/platform/releases", { token, signal });
+}
+
+/** Send one test notification. A refused delivery is 200 with `ok: false` — the
+ *  request succeeded and the receiver's answer is the payload. */
+export function testReleaseWebhook(token: string): Promise<PlatformWebhookTestResponse> {
+  return apiFetch<PlatformWebhookTestResponse>("/admin/platform/release-webhook/test", {
+    method: "POST",
+    token,
+  });
 }
 
 /** Apply one release to one host. 202 with the attempt; the work is

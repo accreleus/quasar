@@ -318,6 +318,14 @@ host. Every apply produces one, whether it succeeded or failed, and it is the
 only durable record of what that target was on before. _Avoid_: "job" (an
 attempt is operator-initiated and rides no schedule), "task".
 
+**Release notification** — one outbound message announcing that a platform
+release this instance could move to has appeared. Sent once per release, to an
+admin-configured webhook URL, after a detection pass. It is a delivery, not a
+decision: nothing it does changes what is offered, and its failure is recorded
+rather than escalated. _Avoid_: "alert" (nothing is wrong), "announcement" (that
+is the upstream publish), "notification" unqualified (the console banner is also
+a notification, and it is the in-product one).
+
 **Fleet run** — one release applied across the whole instance: the control plane
 first, then every eligible host in sequence. At most one is active. A host that
 cannot take the release at its turn is **skipped**, which is not a failure; a

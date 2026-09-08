@@ -244,6 +244,7 @@ export function ReleasesTab() {
                 }}
               />
               <ChannelCard view={view} onSaved={() => void res.refresh()} />
+              <NotificationsCard view={view} onSaved={() => void res.refresh()} />
               <RailCard title="Apply history">
                 <ApplyHistory refreshKey={applied} />
               </RailCard>
@@ -580,6 +581,114 @@ function ChannelCard({ view, onSaved }: { view: PlatformReleaseView; onSaved: ()
           Save branch
         </Button>
       </div>
+    </RailCard>
+  );
+}
+
+/** Where a release is announced outside the console (#123). No v3 mock covers
+ *  this card, so it reuses the rail's existing primitives — RailCard, TextField,
+ *  Button, Chip — and adds no styling of its own. */
+function NotificationsCard({ view, onSaved }: { view: PlatformReleaseView; onSaved: () => void }) {
+  const { token } = useAuth();
+  const hook = view.release_webhook ?? null;
+  // A draft, so a half-typed URL is never a save.
+  const [draft, setDraft] = useState<string | null>(null);
+  const [tested, setTested] = useState<string | null>(null);
+
+  const save = useAdminAction(
+    async (patch: { release_webhook_url?: string; release_webhook_enabled?: boolean }) =>
+      adminApi.updateSettings(token ?? "", patch),
+    {
+      success: "Notification settings saved.",
+      failure: "Could not save the notification settings.",
+      onSuccess: () => {
+        setDraft(null);
+        setTested(null);
+        onSaved();
+      },
+    },
+  );
+
+  // A refused delivery comes back 200 with ok:false, so the outcome is read off
+  // the body rather than from a rejection.
+  const test = useAdminAction(async () => adminApi.testReleaseWebhook(token ?? ""), {
+    failure: "Could not send the test notification.",
+    onSuccess: (res) => {
+      setTested(
+        res.delivery.ok
+          ? `Delivered (${res.delivery.status_code ?? "2xx"}).`
+          : `Not delivered: ${res.delivery.error ?? "the receiver refused it"}`,
+      );
+      onSaved();
+    },
+  });
+
+  // A server that does not serve the notification surface renders no card at
+  // all, rather than a control that would save nowhere. After the hooks: the
+  // early return has to sit below them.
+  if (!hook) return null;
+  const url = draft ?? hook.url;
+  const dirty = url !== hook.url;
+  const busy = save.pending != null || test.pending != null;
+  const last = hook.last_delivery;
+
+  return (
+    <RailCard title="Notifications">
+      <TextField
+        label="Webhook URL"
+        name="release_webhook_url"
+        value={url}
+        mono
+        placeholder="https://hooks.example.com/…"
+        onChange={(e) => setDraft(e.target.value)}
+      />
+      <p className="hint mt2">
+        One POST when a release this instance could take appears. Works with Slack, Discord, ntfy
+        or your own endpoint. https only, and a private or loopback address is refused.
+      </p>
+      <div className="mt2 rowflex">
+        <Button
+          variant="ghost"
+          disabled={busy || !dirty}
+          onClick={() => void save.run({ release_webhook_url: url })}
+        >
+          {url === "" ? "Clear" : "Save URL"}
+        </Button>
+        <Button
+          variant="ghost"
+          disabled={busy || dirty || hook.url === ""}
+          onClick={() => void test.run()}
+        >
+          Send test
+        </Button>
+      </div>
+      <div className="mt3">
+        <Button
+          variant="ghost"
+          disabled={busy || (hook.url === "" && !hook.enabled)}
+          onClick={() => void save.run({ release_webhook_enabled: !hook.enabled })}
+        >
+          {hook.enabled ? "Turn notifications off" : "Turn notifications on"}
+        </Button>
+      </div>
+      <div className="mt3">
+        <Fact label="Status">
+          {hook.enabled ? <Chip variant="success" dot>On</Chip> : <Chip variant="neutral">Off</Chip>}
+        </Fact>
+        <Fact label="Signing">{hook.secret_configured ? "signed" : "unsigned"}</Fact>
+        {last && (
+          <Fact label="Last sent">
+            {last.status === "delivered" ? "delivered " : "failed "}
+            {relativeTime(last.attempted_at)}
+          </Fact>
+        )}
+      </div>
+      {tested && <p className="hint mt2">{tested}</p>}
+      {last?.status === "failed" && last.error && (
+        <p className="form-error mt2" role="alert">
+          Last notification failed: {last.error}
+        </p>
+      )}
     </RailCard>
   );
 }

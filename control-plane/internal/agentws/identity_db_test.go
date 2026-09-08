@@ -186,11 +186,20 @@ func TestMigration0074DownDropsEverythingItAdded(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 
-	// 0075's tables reference platform_releases, so its down runs first — the
-	// order golang-migrate itself uses.
-	down0075, err := migrations.FS.ReadFile("0075_platform_apply.down.sql")
-	if err != nil {
-		t.Fatalf("read down migration: %v", err)
+	// Every later table that references platform_releases has to go first — the
+	// order golang-migrate itself uses. A migration that adds another dependent
+	// belongs at the head of this list, or 0074's DROP TABLE fails with
+	// "other objects depend on it".
+	dependents := make([][]byte, 0, 2)
+	for _, name := range []string{
+		"0080_platform_release_webhook.down.sql",
+		"0075_platform_apply.down.sql",
+	} {
+		sql, err := migrations.FS.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read down migration %s: %v", name, err)
+		}
+		dependents = append(dependents, sql)
 	}
 	down, err := migrations.FS.ReadFile("0074_platform_release_identity.down.sql")
 	if err != nil {
@@ -203,8 +212,10 @@ func TestMigration0074DownDropsEverythingItAdded(t *testing.T) {
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	if _, err := tx.Exec(ctx, string(down0075)); err != nil {
-		t.Fatalf("down migration 0075: %v", err)
+	for _, sql := range dependents {
+		if _, err := tx.Exec(ctx, string(sql)); err != nil {
+			t.Fatalf("dependent down migration: %v", err)
+		}
 	}
 	if _, err := tx.Exec(ctx, string(down)); err != nil {
 		t.Fatalf("down migration: %v", err)

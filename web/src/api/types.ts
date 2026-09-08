@@ -84,6 +84,11 @@ export type PlatformIdentity = Schemas["PlatformIdentity"];
  *  verbatim rather than dropping the row (control-api.md). */
 export type EligibilityReason = Schemas["EligibilityReason"];
 
+/** Release notifications (#123, control-api.md §"Release notifications"). */
+export type PlatformReleaseWebhook = Schemas["PlatformReleaseWebhook"];
+export type PlatformWebhookDelivery = Schemas["PlatformWebhookDelivery"];
+export type PlatformWebhookTestResponse = Schemas["PlatformWebhookTestEnvelope"];
+
 export type PlatformApplyAttempt = Schemas["PlatformApplyAttempt"];
 export type PlatformApplyAttemptEnvelope = Schemas["PlatformApplyAttemptEnvelope"];
 export type PlatformApplyAttemptsResponse = Schemas["PlatformApplyAttemptsResponse"];

@@ -78,17 +78,31 @@ const (
 	// NameArtworkAPIKey is the third-party cover-artwork provider credential
 	// (SteamGridDB today). Env fallback: QUASAR_STEAMGRIDDB_API_KEY.
 	NameArtworkAPIKey = "artwork.steamgriddb.api_key"
+
+	// NameReleaseWebhookSecret signs the platform-release notification body
+	// (#123). Env fallback: QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET.
+	NameReleaseWebhookSecret = "platform.release_webhook.secret"
 )
 
 // DefaultRegistry declares every secret this build supports. Add a Descriptor
 // here and the admin API + UI pick it up with no other change.
 func DefaultRegistry() *Registry {
-	return NewRegistry(Descriptor{
-		Name:  NameArtworkAPIKey,
-		Label: "SteamGridDB API key",
-		Description: "Lets the control plane look up cover artwork for apps in your catalogue. " +
-			"Without it, artwork can still be uploaded by hand and every app falls back to its gradient tile.",
-		EnvVar:  "QUASAR_STEAMGRIDDB_API_KEY",
-		DocsURL: "https://www.steamgriddb.com/profile/preferences/api",
-	})
+	return NewRegistry(
+		Descriptor{
+			Name:  NameArtworkAPIKey,
+			Label: "SteamGridDB API key",
+			Description: "Lets the control plane look up cover artwork for apps in your catalogue. " +
+				"Without it, artwork can still be uploaded by hand and every app falls back to its gradient tile.",
+			EnvVar:  "QUASAR_STEAMGRIDDB_API_KEY",
+			DocsURL: "https://www.steamgriddb.com/profile/preferences/api",
+		},
+		Descriptor{
+			Name:  NameReleaseWebhookSecret,
+			Label: "Release notification signing secret",
+			Description: "Signs the release notification Quasar POSTs to your webhook, so the receiver can " +
+				"verify it came from this instance. Optional: Slack, Discord and ntfy authenticate by URL and need none.",
+			EnvVar:  "QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET",
+			DocsURL: "https://github.com/accreleus/quasar/blob/main/docs/upgrading.md#release-notifications",
+		},
+	)
 }

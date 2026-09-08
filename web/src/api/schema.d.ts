@@ -3777,6 +3777,10 @@ export interface paths {
                         release_channel?: "stable" | "beta" | "edge";
                         /** @description Platform-release amendment 1 (#104/#106, migration 0074). The branch the EDGE channel follows; default develop. Absent = unchanged. Validated as a git ref name component - non-empty, at most 255 characters, no whitespace, no "..", no leading "-", no control characters - 400 validation_failed otherwise. Validated and stored whatever the channel is, and NEVER CLEARED BY A CHANNEL SWITCH, so an operator who visits stable and comes back keeps their branch. */
                         release_edge_branch?: string;
+                        /** @description Release notifications, ADDITIVE (#123, migration 0080). Whether a newly detected platform release is POSTed to release_webhook_url. Absent = unchanged. Setting it TRUE is 400 validation_failed whenever the URL this request LEAVES BEHIND is empty - nothing stored and none supplied, or an explicit "" in the same body - because a switch that silently does nothing is worse than a refusal. Default false, so an instance that has never been configured announces nothing. */
+                        release_webhook_enabled?: boolean;
+                        /** @description Release notifications, ADDITIVE (#123, migration 0080). Where one release notification is POSTed. Absent = unchanged; an explicitly-sent "" CLEARS it AND SETS release_webhook_enabled false in the same write. Any other value must be an absolute https URL with no userinfo, at most 2048 characters, or 400 validation_failed - http, a credential in the URL and a relative reference are all refused. THE SERVER STILL CONTAINS THE REQUEST AT SEND TIME: delivery refuses any host that resolves to a loopback, private, link-local or multicast address, follows no redirect, and bounds the response body. THE URL IS TREATED AS A CREDENTIAL (a Slack or Discord webhook URL authenticates by being known), so it never appears in a log line, an audit record or a delivery error. */
+                        release_webhook_url?: string;
                     };
                 };
             };
@@ -3875,6 +3879,59 @@ export interface paths {
         };
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/platform/release-webhook/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Send a test release notification to the configured webhook (admin).
+         * @description Release notifications, ADDITIVE (#123). Sends ONE notification of the real shape, with the real signature and `event` `platform.release.test`, to the configured release_webhook_url. `release` is null in the test body: there may be no release to describe.
+         *     It IGNORES release_webhook_enabled - testing a URL before switching it on is the point - and it RECORDS NOTHING, so a test can never consume the dedupe record and suppress the real notification for a release.
+         *     A REFUSED DELIVERY IS 200 WITH ok false, not a 5xx: the request succeeded and the receiver's answer is the payload. Only a test with nowhere to send is a 400.
+         *     Where the notification goes is PATCH /v1/admin/settings (release_webhook_enabled / release_webhook_url); the optional signing secret is PUT /v1/admin/secrets/platform.release_webhook.secret. There is no route here for either, for the same reason the channel has none.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description The delivery outcome. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["PlatformWebhookTestEnvelope"];
+                    };
+                };
+                /** @description webhook_not_configured - no release_webhook_url is set, so there is nowhere to send. */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
         delete?: never;
         options?: never;
         head?: never;
@@ -7754,6 +7811,10 @@ export interface components {
                 release_channel?: "stable" | "beta" | "edge";
                 /** @description Platform-release amendment 1 (#104/#106, migration 0074). The branch the edge channel follows; default develop. Reported whatever the channel is (it selects nothing while the channel is stable) so a UI can render the control without a second read. Optional in the envelope so pre-amendment servers stay conformant. */
                 release_edge_branch?: string;
+                /** @description Release notifications, ADDITIVE (#123, migration 0080). Whether a detected platform release is announced to release_webhook_url. Default false. Optional in the envelope so a pre-#123 server stays conformant; a client reads absent as false. */
+                release_webhook_enabled?: boolean;
+                /** @description Release notifications, ADDITIVE (#123, migration 0080). The configured webhook URL, or "" when none is set. It is admin-only, as this whole envelope is. THE SIGNING SECRET IS NOT HERE and never will be: it is an instance_secrets row read through GET /v1/admin/secrets, which reports configured/readable and a masked hint, never a value. */
+                release_webhook_url?: string;
                 /** Format: uuid */
                 updated_by: string | null;
                 /** Format: date-time */
@@ -7896,6 +7957,53 @@ export interface components {
             faults: components["schemas"]["PlatformReleaseFault"][];
             /** @description Platform-release apply, AMENDMENT 2 (#104/#114), additive. What is in flight right now - the active fleet run, if any, plus EVERY open attempt including standalone per-host applies and reverts. null when nothing is in flight, and ALWAYS SERIALIZED by a server implementing amendment 2 (null is the answer, not the absence of one). Optional in the schema so a pre-amendment-2 server stays conformant. `targets` deliberately gains no field: the same attempt in two places in one response is a way for the two to disagree, and the join by host_id costs a client one line and cannot. */
             active_apply?: components["schemas"]["ActiveApply"] | null;
+            /** @description Release notifications, ADDITIVE (#123). How this instance announces a release outside the console, and how the last announcement went. null on a server that does not serve the notification surface. Optional in the schema so a pre-#123 server stays conformant. `enabled` and `url` MIRROR instance_settings, exactly as `channel` and `edge_branch` above already do, so the Releases page stays one read. */
+            release_webhook?: components["schemas"]["PlatformReleaseWebhook"] | null;
+        };
+        /** @description The instance's release-notification target and its last delivery. */
+        PlatformReleaseWebhook: {
+            /** @description Whether a detected release is announced. Mirrors instance_settings.release_webhook_enabled. */
+            enabled: boolean;
+            /** @description The configured https URL, or "" when none is set. Admin-only, as this whole view is. */
+            url: string;
+            /** @description Whether a signing secret is stored (instance_secrets `platform.release_webhook.secret`, or its environment fallback). A BOOLEAN AND NEVER THE VALUE. Signing is optional: Slack, Discord and ntfy authenticate by URL. */
+            secret_configured: boolean;
+            /** @description The most recent attempt on this instance, or null when nothing has ever been sent. */
+            last_delivery: components["schemas"]["PlatformWebhookDelivery"] | null;
+        };
+        /** @description One recorded delivery attempt (schema.md `platform_release_notifications`). */
+        PlatformWebhookDelivery: {
+            /**
+             * Format: uuid
+             * @description The platform_releases row this attempt announced.
+             */
+            release_id: string;
+            /** @description That release's version, or null on an edge build (which has none). */
+            release_version: string | null;
+            /**
+             * @description `delivered` is TERMINAL: the release is never announced again. `failed` is retried on the next detection pass until the attempt cap, after which the release is left un-notified rather than retried forever.
+             * @enum {string}
+             */
+            status: "delivered" | "failed";
+            /** @description How many detection PASSES this release has cost, not HTTP requests - the retries within one pass are the server's business. */
+            attempts: number;
+            /** Format: date-time */
+            attempted_at: string;
+            /** @description The receiver's HTTP status, or null when the request never got one (DNS, TLS, a refused dial, the egress allowlist). Those are different failures. */
+            status_code: number | null;
+            /** @description Bounded operator prose, null on success. IT NEVER CONTAINS THE WEBHOOK URL: that URL is itself the credential on every receiver that authenticates by URL. */
+            error: string | null;
+        };
+        PlatformWebhookTestEnvelope: {
+            delivery: {
+                /** @description true when the receiver answered 2xx. */
+                ok: boolean;
+                status_code: number | null;
+                /** @description Bounded prose when ok is false, null otherwise. Never contains the webhook URL. */
+                error: string | null;
+                /** @description Wall time for the whole send, retries included. */
+                duration_ms: number;
+            };
         };
         /**
          * @description A fleet run's state. A run succeeds only when EVERY target succeeded, and it STOPS AT ITS FIRST FAILED TARGET - past a failed control plane, continuing would move agents onto a release the control plane is not on (ADR 0002); past a failed host, it would march a known-bad digest set across the fleet. There is deliberately NO "partial": a failed run may have succeeded targets behind it, and the per-target attempts are where that is read.

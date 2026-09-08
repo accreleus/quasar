@@ -582,6 +582,114 @@ it was reverted from. A revert is itself recorded as an attempt
 
 ---
 
+## Release notifications
+
+The Releases page shows a banner when an update appears. That only helps
+someone who is looking at it. **Fleet ▸ Releases ▸ Notifications** takes a
+webhook URL and POSTs one message when the detector finds a release this
+instance could move to.
+
+A webhook rather than email on purpose: email would need SMTP credentials, a
+sender identity and somewhere for bounces to go before it delivered anything,
+while a URL and a POST already work with Slack, Discord, ntfy, or a script
+behind a reverse proxy.
+
+### Wiring one up
+
+1. Get an incoming-webhook URL from wherever you want the message. Slack:
+   *Incoming Webhooks* → *Add New Webhook to Workspace*. Discord: channel
+   *Settings* → *Integrations* → *Webhooks* → *New Webhook* → *Copy Webhook
+   URL*. ntfy: `https://ntfy.sh/<your-topic>`.
+2. Paste it into **Webhook URL** and press **Save URL**.
+3. Press **Send test**. A test goes out whether or not notifications are
+   switched on, and it records nothing — it can never use up the one
+   notification a real release gets.
+4. Press **Turn notifications on**.
+
+**The URL is a credential.** On Slack, Discord and ntfy, knowing the URL is
+what authorizes posting to that channel. Quasar treats it as one: it never
+appears in a log line, in the audit record of the setting change, or in a
+delivery error. Treat it the same way — it is admin-readable in the console
+because an admin has to be able to see what they configured.
+
+### What is delivered
+
+One `POST` with a JSON body:
+
+```json
+{
+  "event": "platform.release.detected",
+  "sent_at": "2026-09-08T02:00:11Z",
+  "text":    "Quasar 0.2.4 is available. This instance is on 0.2.3 — open Fleet ▸ Releases to apply it.",
+  "content": "Quasar 0.2.4 is available. This instance is on 0.2.3 — open Fleet ▸ Releases to apply it.",
+  "instance": { "version": "0.2.3", "source_commit": "abc1234", "schema_version": 78, "channel": "stable" },
+  "release":  { "id": "…", "channel": "stable", "version": "0.2.4", "source_commit": "def5678",
+                "built_at": "…", "schema_version": 79, "prerelease": false,
+                "compare_url": null, "notes_excerpt": "### Added\n- …" }
+}
+```
+
+`text` and `content` are the same sentence under the two field names Slack and
+Discord read, which is why those two render this body with no adapter in
+between. Everything structured sits beside them for a receiver that wants it.
+`notes_excerpt` is bounded — the full notes are on the Releases page.
+
+### Signing (optional)
+
+Slack, Discord and ntfy authenticate by URL and need nothing more. A receiver
+you wrote yourself can ask for proof: store a secret under **Secrets → Release
+notification signing secret** (or set
+`QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET`). Every delivery then carries
+
+```
+X-Quasar-Timestamp:     1757295611
+X-Quasar-Signature-256: sha256=<hex HMAC-SHA256(secret, "<timestamp>.<raw body>")>
+X-Quasar-Delivery:      <unique per POST; deduplicate on it if you like>
+```
+
+Verify by recomputing over the **raw** body you received and comparing in
+constant time. The timestamp is inside the signed material, so a captured
+delivery cannot be replayed under a new one.
+
+```python
+# flask, for illustration
+import hashlib, hmac, os, time
+secret = os.environ["QUASAR_WEBHOOK_SECRET"].encode()
+ts   = request.headers["X-Quasar-Timestamp"]
+want = "sha256=" + hmac.new(secret, ts.encode() + b"." + request.get_data(), hashlib.sha256).hexdigest()
+assert hmac.compare_digest(want, request.headers["X-Quasar-Signature-256"])
+assert abs(time.time() - int(ts)) < 300          # reject a stale replay
+```
+
+### Rules worth knowing before you rely on it
+
+- **The same release is announced once.** Detection runs weekly and whenever
+  someone presses *Check now*; the record of what has been announced is keyed
+  on the release, so re-detection is silent.
+- **A fresh install does not announce its back catalogue.** The trigger is the
+  same "an update is available" the banner uses, so at most one message goes
+  out, about the release you could actually move to.
+- **A failure retries, then stops.** A refused delivery is retried a few times
+  within the pass, then on each following detection pass, up to five passes.
+  After that the release is left un-announced rather than retried forever. The
+  Notifications card shows the last attempt and its error; the detection job's
+  run summary in **Fleet ▸ Jobs** carries `notify`, `notify_reason` and
+  `notify_status_code` for every pass.
+- **A failing webhook never fails detection.** The banner, the release list and
+  the apply button are unaffected by anything the receiver does.
+- **`https` only, and public addresses only.** Delivery refuses plain `http`, a
+  URL carrying credentials, and any host that resolves to a loopback, private
+  or link-local address — the same containment the image-digest resolver uses,
+  so this cannot become a probe of your own network. **A receiver on the LAN or
+  on localhost is therefore not reachable**; put a public https endpoint (a
+  tunnel, a reverse proxy) in front of it. `QUASAR_PLATFORM_WEBHOOK_HOSTS`
+  narrows the destination further if you want it pinned
+  (`docs/configuration.md`).
+- Clearing the URL switches notifications off in the same save. There is no
+  state where notifications are on with nowhere to send.
+
+---
+
 ## Cutting a release
 
 This is for a maintainer publishing a new Quasar version, not for a

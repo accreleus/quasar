@@ -213,6 +213,11 @@ services:
       QUASAR_PLATFORM_RELEASE_ASSET_HOSTS: ${QUASAR_PLATFORM_RELEASE_ASSET_HOSTS:-}
       QUASAR_PLATFORM_RELEASE_TOKEN: ${QUASAR_PLATFORM_RELEASE_TOKEN:-}
       QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL: ${QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL:-}
+      # Release notifications (#123). The webhook URL itself is an admin setting,
+      # not a knob; these two are the optional signing secret and the optional
+      # narrowing of where a notification may be sent.
+      QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET: ${QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET:-}
+      QUASAR_PLATFORM_WEBHOOK_HOSTS: ${QUASAR_PLATFORM_WEBHOOK_HOSTS:-}
       # The registry the edge channel resolves branch tags on, and the egress
       # allowlist every registry read passes.
       QUASAR_PLATFORM_REGISTRY: ${QUASAR_PLATFORM_REGISTRY:-}
