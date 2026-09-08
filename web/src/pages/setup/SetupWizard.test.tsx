@@ -71,6 +71,7 @@ function FakeAuthProvider({
     user: isAdmin ? { id: "u1", email: "admin@example.com", username: "admin", role: "admin" } : null,
     token: isAdmin ? "test-token" : null,
     isAdmin,
+    sessionExpired: false,
     login: vi.fn(),
     claim,
     logout: vi.fn(),
