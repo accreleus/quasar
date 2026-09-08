@@ -78,6 +78,21 @@ own; the two do not move together, and that is deliberate.
   rather than a flag day. Operator procedure, including the CI secret to create
   and how to rotate: `docs/upgrading.md` "Signing platform releases"; knobs in
   `docs/configuration.md`; decision record in `docs/adr/0003-release-signatures.md`.
+### Changed
+
+- A fleet update no longer empties the whole instance before it updates the control
+  plane (#153). That drain existed because a control-plane restart used to end every
+  session; #128 removed that, so a release carrying no database migration now takes the
+  control-plane step with sessions still streaming through it, and only each host's own
+  sessions end as that host is updated. A release that **does** carry a migration still
+  drains the fleet first — the held session's row is read back by a binary that has just
+  migrated the database under it, and no migration was ever written to survive that. The
+  confirmation says which of the two you are about to do, and the fleet is still cordoned
+  for the whole run either way. "Update now" on a migrating release now **stops** the
+  instance's sessions and waits for them to be gone, instead of skipping a wait that since
+  #128 nothing else would have satisfied. Even a non-migrating step gives a launch already
+  in flight a moment to land, because that is the one session a restart still loses.
+  Contract: `quasar-protocol` amendment 6.
 
 ### Fixed
 

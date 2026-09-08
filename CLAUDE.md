@@ -199,9 +199,15 @@ session memory `current-focus.md`, not this file.**
   job, weekly, Monday 02:00 UTC (editable in the Jobs tab; run-now = "Check now"). Applying goes
   through the per-host **updater** (`quasar-updater` in every compose stack), which only accepts
   digests under `QUASAR_UPDATER_ALLOWED_NAMESPACES` (default the org's GHCR namespace). Control
-  plane first, then hosts, never below the DB's migration (ADR 0002); the fleet run drains the
-  whole fleet before the control-plane step because a control-plane restart ends every session
-  today (#128). A **source-built host or control plane is never offered a release** — it shows
+  plane first, then hosts, never below the DB's migration (ADR 0002). The fleet run **cordons**
+  the whole fleet for its whole life, but since #128/#153 it **drains before the control-plane
+  step only when the release carries a migration** — otherwise live sessions ride straight
+  through the restart (the agent holds them, the browser keeps its media path). The migrating
+  case still drains because every migration was authored assuming no session was live while it
+  ran, not because of the restart; the decision is `platform.ReleaseRunsAMigration` and
+  `apply_fleet.go prepareFleet` carries the argument. Host steps drain as they always did — a
+  node-agent recreate genuinely ends that host's sessions. A **source-built host or control
+  plane is never offered a release** — it shows
   the manual `redeploy.sh` recipe instead. Existing installs add the updater once
   (`docs/upgrading.md` "The updater"). **Publishing a release** (exercised live: 0.2.0 → 0.2.3, 2026-09-05/06) is
   `make release VERSION=x.y.z` on a clean `main` — recipe and refusals in `docs/upgrading.md`

@@ -187,6 +187,31 @@ describe("FleetApplyButton", () => {
     expect(within(dialog).getByText(/lose contact for about 20 seconds/)).toBeInTheDocument();
   });
 
+  // #153. The fixture release is schema 75 against an installed 74, so it
+  // carries a migration and the control-plane step still empties the instance.
+  it("says a migrating release waits for every session on the instance", async () => {
+    renderButton(view());
+    screen.getByRole("button", { name: "Update Quasar" }).click();
+
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByText(/changes the database, so the update waits for every session/),
+    ).toBeInTheDocument();
+  });
+
+  // The same release at the installed schema runs no migration, so its restart
+  // carries the sessions rather than ending them (#128 made that true, #153
+  // stopped draining for it). Promising an outage that does not happen is as
+  // wrong as hiding one that does.
+  it("says a non-migrating release keeps live sessions streaming", async () => {
+    renderButton(view({ available: [release({ schema_version: 74 })] }));
+    screen.getByRole("button", { name: "Update Quasar" }).click();
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText(/Live sessions keep streaming through it/)).toBeInTheDocument();
+    expect(within(dialog).queryByText(/waits for every session on the instance/)).toBeNull();
+  });
+
   // Nothing moves before the control plane, so a run it cannot take is refused
   // by the server; the button must not offer it.
   it("is disabled, with the control plane's own reason, when the control plane cannot take it", () => {
@@ -292,8 +317,9 @@ describe("FleetRunPanel", () => {
     expect(screen.getByText("Pulling the image")).toBeInTheDocument();
   });
 
-  // A control-plane recreate ends every session on the instance, so its wait is
-  // fleet-wide and the panel must say so.
+  // When the control-plane step waits at all — since #153, only for a release
+  // carrying a migration — the wait is fleet-wide, not one host's, and the
+  // panel must say so.
   it("says the control-plane step is waiting on the whole fleet", () => {
     renderPanel(
       run({

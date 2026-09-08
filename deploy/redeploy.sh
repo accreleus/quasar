@@ -47,14 +47,17 @@
 #                      hash already on disk, so it still catches a container that
 #                      came back up with a broken dist mount.
 #           Neither narrow scope touches the node-agent image or container.
-#           That is NOT enough for a running session to survive: recreating the
-#           control plane ends every session on the host today (#128). Three
-#           things each do it independently — the agent stops its sessions when
-#           its websocket drops, the control plane reaps them when the agent
-#           re-registers, and the browser gives up after one failed attempt to
-#           mint a replacement signalling token. Drain before a control-plane
-#           deploy if the sessions matter; the fleet self-update run already
-#           does. Both scopes still WAIT for the control-plane to report healthy,
+#           Since #128 that IS normally enough for a running session to survive:
+#           the agent holds its sessions across the disconnect, the control plane
+#           no longer reaps a `running` row when the agent re-registers, and the
+#           browser retries the signalling-token mint instead of giving up. Two
+#           caveats remain. A session still mid-LAUNCH (assigned/starting) has no
+#           owner left to finish it and is failed on reconnect. And if the ref you
+#           are deploying carries a MIGRATION, drain first: the held row is read
+#           back by a binary that has just migrated the database under it, which
+#           is a case no migration here was written for (#153). The fleet
+#           self-update run makes exactly that distinction for you.
+#           Both scopes still WAIT for the control-plane to report healthy,
 #           which is what proves an embedded migration finished — the CP-only
 #           path is precisely the one that carries migrations, so that wait is
 #           not optional.
