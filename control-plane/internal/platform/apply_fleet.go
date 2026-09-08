@@ -444,12 +444,16 @@ func (f *FleetRunner) prepareFleet(ctx context.Context, run ApplyRun, a Attempt)
 		f.log.Warn("fleet apply: could not record sessions_remaining", "attempt_id", a.ID, "err", err)
 	}
 
-	if run.Force {
+	if run.Force && remaining > 0 {
 		// Stop what the operator agreed to end. Pre-#128 the recreate did this
 		// by itself and `force` only had to skip the wait; it no longer does, so
 		// a force that merely skipped would run the migration under the very
 		// sessions it claimed to end. The wait below still runs — it is just
 		// short now, because something is actually ending them.
+		//
+		// Guarded on the count: with nothing to end, force has nothing to
+		// discharge, and a fleet-wide session_stop is not a side effect to take
+		// for the sake of symmetry.
 		f.stopFleetSessions(ctx, run)
 		if remaining, err = f.store.FleetNonTerminalSessions(ctx); err != nil {
 			f.log.Warn("fleet apply: could not re-count sessions after the force drain",
