@@ -320,9 +320,62 @@ is not public. The compact verdicts survive in the session memory
 `quasar-phase-records.md`.
 
 ## Code exploration
-For structural code questions use `workspace_search` / `workspace_symbol` from the
-workspace-intelligence MCP below, plus Grep/Glob. (codebase-memory-mcp and graphify
-were both removed.)
+**Start with graft, not Grep.** The repo is indexed as a context graph under `graft/` —
+per-file markdown cards plus a wiring graph. Every query is local, needs no API key, and
+costs nothing:
+- `graft ask "<question>"` — ranked nodes with exact `file:line`; `--source` inlines the code
+- `graft grep "<regex>"` — hits grouped by enclosing symbol, ranked by coupling
+- `graft callers <symbol>` — who calls it; `--direction out` for callees, `--depth N` for blast radius
+- `graft skeleton <file>` — signatures only, a file's API surface for a fraction of the tokens
+- `graft map` — orientation in an unfamiliar area; `graft blast` — what a diff endangers
+
+**It indexes code only — `docs/`, `deploy/` and `protocol/` have ZERO coverage.** The frozen
+contracts, `docs/configuration.md`, and the compose/image files are invisible to it; use
+Grep/Glob and plain reads there, and never conclude a contract says nothing because graft
+found nothing. Coverage is 1,306 of 1,933 tracked files (web 572, control-plane 562,
+node-agent 98, scripts 54 — shell is thinly indexed).
+
+**The graph is local and regenerable, never committed.** `/graft/` is gitignored like
+`node_modules`; after a fresh clone or worktree, run `graft build`. In Claude Code the
+installed hooks keep it in sync as you edit. The MCP server (`graft_find_code`,
+`graft_trace_calls`, …) is wired through `.mcp.json`, which this repo deliberately gitignores
+as operator-local, so it is per-checkout rather than shared — as is `.claude/settings.json`.
+`.claude/skills/graft/SKILL.md` is the one piece of the wiring that travels with the repo;
+everyone else runs `graft init` themselves.
+
+**Install gotchas** (2026-09-09): the package is `@nanonets/graft` — the bare npm name `graft`
+is an unrelated dormant project. `tree-sitter-kotlin` ships no linux prebuild, so under an npm
+`allow-scripts` allowlist the CLI dies on even `--version` until installed with
+`npm install -g --allow-scripts=tree-sitter-kotlin @nanonets/graft`.
+
+**Only three agents are wired, deliberately: Claude Code, Codex and OpenCode** — the ones
+actually installed here. Re-wire with `graft init --agents claude agents` (ids are
+SPACE-separated; a comma-separated list is rejected as "unknown agent id"). The `agents` id
+covers Codex and OpenCode together, since both read the shared `AGENTS.md`. An `--all-agents`
+run also writes `.cursor/`, `.grok/`, `.kiro/`, `.windsurf/`, `.adal/`, `GEMINI.md` and
+`.github/copilot-instructions.md` for tools nobody here uses — don't.
+
+**The `graft` binary MUST be on PATH or the MCP server is dead.** Every generated MCP config
+(`.mcp.json`, `opencode.json`, `~/.codex/config.toml`) spawns the bare command `graft mcp`, so
+an off-PATH binary fails the whole server with `ENOENT: Executable not found in $PATH` and the
+`graft_*` tools silently never appear — while the Claude Code hooks and statusline keep working,
+because those resolve the package *directory* (a baked path plus an `npm root -g` fallback), not
+the binary. That split is why a session can look fine and still have no MCP. On this machine
+npm's prefix is `~/.hermes/node`, whose `bin/` is never on PATH; `~/.local/bin` is, and already
+holds hand-made `node`/`npm` symlinks, so graft is symlinked there too. **After any `npm i -g`
+of a new CLI here, symlink it into `~/.local/bin` or nothing will find it.**
+
+**Two `graft init` traps if you ever widen the agent list.** Its Cursor wiring bakes absolute
+`/home/<operator>/…` paths into `.cursor/hooks.json` + `.cursor/hooks/graft-hooks.cjs`, which
+are untracked but NOT gitignored — a `git add .cursor` would leak the operator path into this
+public repo, and `leak-scan.sh` won't warn because it only scans tracked content. Worse,
+**`graft uninstall` does not remove those two files** (it cleans `.cursor/rules/` and
+`.cursor/mcp.json` and stops), so they outlive the wiring that created them; delete `.cursor/`
+by hand. The files graft writes for Claude Code and `agents` are path-free by comparison, except
+the `.claude/helpers/*` shims, which the pre-existing `.claude/*` rule already ignores.
+
+(codebase-memory-mcp and graphify were both removed; workspace-intelligence is disabled — see
+below. graft replaces all three.)
 
 ## Container logs — access is configured per host, see hosts.json
 Log access is a per-host deployment detail, not a repo-wide fact. Where a host runs a
