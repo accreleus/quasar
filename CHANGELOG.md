@@ -26,17 +26,18 @@ own; the two do not move together, and that is deliberate.
 
 ### Fixed
 
-- A control plane restart no longer ends every running session on every host.
-  The agent holds its sessions for a bounded grace window instead of stopping
-  them when its websocket drops, the control plane reconciles against the
-  agent's own `heartbeat.running_sessions` on reconnect rather than assuming
-  none survived, and the browser retries its replacement signalling token with
-  backoff instead of giving up after one failed attempt. All three had to
-  change: each one alone was enough to end the session. Knobs
-  `QUASAR_SESSION_GRACE_SECS` on both the control plane (120 s) and the agent
-  (90 s). This also closes a pre-existing hole where a host that never came
-  back after a control-plane restart kept its sessions non-terminal and its
-  status online forever, still attracting placements (#128).
+- Groundwork for sessions surviving a control-plane restart (#128). The agent now
+  holds its sessions for a bounded grace window instead of stopping them when its
+  websocket drops, and the control plane reconciles against the agent's own
+  `heartbeat.running_sessions` on reconnect rather than assuming none survived,
+  with a stale-host sweep as the backstop. Both were confirmed on a live 72 s
+  outage. **This is not yet end to end**: the browser still re-seats its
+  signalling coordinates after the outage, which tears down the peer connection
+  that was still carrying media, so the session ends anyway. The user-visible fix
+  lands when that is resolved. Knobs `QUASAR_SESSION_GRACE_SECS` on the control
+  plane (120 s) and the agent (90 s). Also closes a pre-existing hole where a host
+  that never came back after a control-plane restart kept its sessions
+  non-terminal and its status online forever, still attracting placements.
 - Encoder certification no longer caps a session using a measurement taken under
   a different encoder. The certification table is keyed on the encoder, but the
   batch read the launch path uses did not filter on it and the ranking compared
