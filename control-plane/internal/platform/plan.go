@@ -3,6 +3,7 @@ package platform
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
@@ -166,21 +167,59 @@ func offerable(rows []Release, channel string, cp buildinfo.Identity) []Release 
 		}
 		out = append(out, r)
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		a, b := out[i], out[j]
-		if a.SchemaVersion != b.SchemaVersion {
-			return a.SchemaVersion > b.SchemaVersion
-		}
+	return sortOfferable(out, channel)
+}
+
+// ranked is one row with its precedence key computed ONCE, before the sort.
+// Consulting semver only for pairs where BOTH versions parse is not a total
+// order: with a parseable pair ordered by version and every mixed pair ordered
+// by built_at, three rows can form a cycle, and the winner then depends on the
+// scan order the rows arrived in (Store.Releases has no ORDER BY).
+type ranked struct {
+	release Release
+	version semver.Full
+	// parsed=false is "carries no version this build can order by", which ranks
+	// strictly below every row that does rather than comparing pairwise.
+	parsed bool
+}
+
+// sortOfferable is the ADR 0002 ordering: schema_version DESC, then built_at
+// DESC, with id as the last tiebreak so a list is stable across reads. Beta
+// inserts semver precedence between the first two keys — for beta only, so
+// stable and edge order exactly as they did before the channel existed.
+func sortOfferable(rows []Release, channel string) []Release {
+	keyed := make([]ranked, len(rows))
+	for i, r := range rows {
+		k := ranked{release: r}
 		if channel == ChannelBeta {
-			if c, ok := comparePrecedence(a.Version, b.Version); ok && c != 0 {
+			k.version, k.parsed = parseVersion(r.Version)
+		}
+		keyed[i] = k
+	}
+	sort.SliceStable(keyed, func(i, j int) bool {
+		a, b := keyed[i], keyed[j]
+		if a.release.SchemaVersion != b.release.SchemaVersion {
+			return a.release.SchemaVersion > b.release.SchemaVersion
+		}
+		// Every parseable row above every unparseable one, and built_at breaking
+		// ties INSIDE each group: that is what makes the comparator transitive.
+		if a.parsed != b.parsed {
+			return a.parsed
+		}
+		if a.parsed && b.parsed {
+			if c := semver.ComparePrecedence(a.version, b.version); c != 0 {
 				return c > 0
 			}
 		}
-		if !a.BuiltAt.Equal(b.BuiltAt) {
-			return a.BuiltAt.After(b.BuiltAt)
+		if !a.release.BuiltAt.Equal(b.release.BuiltAt) {
+			return a.release.BuiltAt.After(b.release.BuiltAt)
 		}
-		return a.ID > b.ID
+		return a.release.ID > b.release.ID
 	})
+	out := make([]Release, len(keyed))
+	for i := range keyed {
+		out[i] = keyed[i].release
+	}
 	return out
 }
 
@@ -188,15 +227,22 @@ func offerable(rows []Release, channel string, cp buildinfo.Identity) []Release 
 // ok=false when either is absent or does not parse, which is the caller's cue to
 // fall back to built_at rather than to invent an order.
 func comparePrecedence(a, b *string) (int, bool) {
-	if a == nil || b == nil {
-		return 0, false
-	}
-	va, okA := semver.ParseFull(*a)
-	vb, okB := semver.ParseFull(*b)
+	va, okA := parseVersion(a)
+	vb, okB := parseVersion(b)
 	if !okA || !okB {
 		return 0, false
 	}
 	return semver.ComparePrecedence(va, vb), true
+}
+
+// parseVersion is the one place a row's version becomes an ordering key.
+// ok=false covers absent, empty (edge rows) and unparseable alike, because all
+// three mean the same thing to every caller: there is no version to order by.
+func parseVersion(v *string) (semver.Full, bool) {
+	if v == nil || strings.TrimSpace(*v) == "" {
+		return semver.Full{}, false
+	}
+	return semver.ParseFull(*v)
 }
 
 // belowInstalledVersion is the switch-back rule: no channel offers a build that

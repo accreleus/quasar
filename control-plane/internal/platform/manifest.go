@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/accreleus/quasar/control-plane/internal/semver"
 )
 
 // `platform-release-manifest.json`, the asset a stable release carries.
@@ -80,6 +82,26 @@ func ParseManifest(raw []byte) (Manifest, error) {
 	}
 	if strings.HasPrefix(m.Version, "v") {
 		return Manifest{}, fmt.Errorf("manifest version %q carries a leading v", m.Version)
+	}
+	// The version is an ORDERING key on the beta channel (#121), so an
+	// unparseable one is a rejected manifest rather than a stored row the
+	// comparator then has to invent an order for.
+	version, ok := semver.ParseFull(m.Version)
+	if !ok {
+		return Manifest{}, fmt.Errorf("manifest version %q is not semver MAJOR.MINOR.PATCH[-prerelease]", m.Version)
+	}
+	// The flag and the version string are two statements of the same fact, and
+	// two rules read DIFFERENT ones: stable hides a release by the flag, while
+	// the switch-back rule protects an install by the version's prerelease part.
+	// A manifest where they disagree would be hidden on stable and unprotected
+	// once installed, so it is not a manifest this build accepts.
+	if m.Prerelease != version.IsPrerelease() {
+		has := "has no"
+		if version.IsPrerelease() {
+			has = "has"
+		}
+		return Manifest{}, fmt.Errorf("manifest prerelease=%v disagrees with version %q, which %s a prerelease part",
+			m.Prerelease, m.Version, has)
 	}
 	if !fullCommitRe.MatchString(m.SourceCommit) {
 		return Manifest{}, fmt.Errorf("manifest source_commit %q is not 40 lowercase hex", m.SourceCommit)

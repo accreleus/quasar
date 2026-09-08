@@ -138,6 +138,44 @@ func TestBetaOfferableListingAndOrdering(t *testing.T) {
 	}
 }
 
+// TestBetaOrderingIsATotalOrder is the guard on the comparator itself. When a
+// parseable version and an unparseable one mix, ordering the pair by built_at
+// while ordering parseable pairs by precedence is not transitive: 0.3.0 beats
+// 0.2.0 by version, the unparseable row beats 0.3.0 by build time, and 0.2.0
+// beats the unparseable row by build time — a cycle whose winner is whatever the
+// SQL scan happened to return first (Store.Releases has no ORDER BY). So the
+// answer must not depend on the input order at all.
+func TestBetaOrderingIsATotalOrder(t *testing.T) {
+	high := rel("high", "0.3.0", commitB, 74, at(1))
+	odd := rel("odd", "nightly-2", commitC, 74, at(2))
+	low := rel("low", "0.2.0", commitD, 74, at(3))
+
+	// Every parseable row above every unparseable one, precedence inside the
+	// parseable group: the highest version leads in all six permutations.
+	want := []string{"high", "low", "odd"}
+	for _, in := range [][]Release{
+		{high, odd, low},
+		{high, low, odd},
+		{odd, high, low},
+		{odd, low, high},
+		{low, odd, high},
+		{low, high, odd},
+	} {
+		order := make([]string, len(in))
+		for i, r := range in {
+			order[i] = r.ID
+		}
+		t.Run("input "+order[0]+order[1]+order[2], func(t *testing.T) {
+			got := PlanRelease(PlanInputs{
+				Channel:      ChannelBeta,
+				ControlPlane: cpAt(commitA, 74, "0.1.0"),
+				Releases:     in,
+			})
+			assertIDs(t, got.Available, want)
+		})
+	}
+}
+
 // TestStableOrderingIsUnchangedByBeta is the guard on "beta changes nothing
 // else": the same rows, read on stable, keep the ordering and the listing rules
 // they had before the channel existed.
