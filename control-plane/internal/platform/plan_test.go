@@ -40,6 +40,11 @@ func rel(id, version, commit string, schema int, built time.Time, opts ...func(*
 }
 
 func prerelease(r *Release) { r.Prerelease = true }
+
+// withVersion overrides the version a seeded release carries, for the rules that
+// read it rather than the flag.
+func withVersion(v string) func(*Release) { return func(r *Release) { r.Version = str(v) } }
+
 func noManifest(r *Release) { r.Manifest = nil }
 func onEdge(r *Release)     { r.Channel = ChannelEdge; r.Version = nil }
 func cp(commit string, schema int) buildinfo.Identity {

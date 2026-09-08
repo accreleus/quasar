@@ -316,6 +316,44 @@ func TestBetaAgentAheadUsesSemverPrecedenceNotBuildTime(t *testing.T) {
 	}
 }
 
+// A host is never moved past the control plane (ADR 0002), so a prerelease at the
+// head of the beta list holds every host at control_plane_not_first until the
+// control plane itself takes it — and then the same host is eligible, with
+// nothing else about it changed.
+func TestBetaHostWaitsForTheControlPlaneThenBecomesEligible(t *testing.T) {
+	releases := []Release{
+		rel("installed", "0.2.0", commitA, 74, at(1)),
+		rel("rc", "0.3.0-rc.1", commitC, 74, at(9), prerelease),
+	}
+	host := knownHost("h1", commitA)
+
+	held := PlanRelease(PlanInputs{
+		Channel:                 ChannelBeta,
+		ControlPlane:            cpAt(commitA, 74, "0.2.0"),
+		Releases:                releases,
+		Hosts:                   []HostIdentity{host},
+		UpdaterPresent:          true,
+		ControlPlaneInstallMode: str(InstallRegistry),
+	})
+	assertIDs(t, held.Available, []string{"rc", "installed"})
+	assertEligible(t, held, TargetControlPlane)
+	assertReason(t, held, TargetHost, ReasonControlPlaneNotFirst)
+
+	moved := PlanRelease(PlanInputs{
+		Channel:                 ChannelBeta,
+		ControlPlane:            cpAt(commitC, 74, "0.3.0-rc.1"),
+		Releases:                releases,
+		Hosts:                   []HostIdentity{host},
+		UpdaterPresent:          true,
+		ControlPlaneInstallMode: str(InstallRegistry),
+	})
+	// The 0.2.0 row drops out: no channel offers a build below the installed
+	// prerelease (the switch-back rule).
+	assertIDs(t, moved.Available, []string{"rc"})
+	assertReason(t, moved, TargetControlPlane, ReasonUpToDate)
+	assertEligible(t, moved, TargetHost)
+}
+
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 func knownHost(id, commit string) HostIdentity {
