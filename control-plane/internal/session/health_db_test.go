@@ -232,7 +232,9 @@ func TestHealthMapLeak_HeartbeatReconcileForgets(t *testing.T) {
 	}
 
 	// The agent comes back and does not list it: now it is gone.
-	coord.AgentHeartbeat(ctx, s.hostID, nil)
+	// []string{}, not nil: an empty list means "I am running nothing", while nil
+	// means the agent said nothing at all and is deliberately ignored.
+	coord.AgentHeartbeat(ctx, s.hostID, []string{})
 
 	got, err := store.Get(ctx, sess.ID)
 	if err != nil {

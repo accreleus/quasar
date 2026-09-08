@@ -93,11 +93,18 @@ func TestForgetterFiredOnHostDisconnect(t *testing.T) {
 		WithSessionForgetter(fg))
 	ctx := context.Background()
 
-	sess := runningSession(t, store, s)
+	// In-flight, because since #128 a RUNNING session is held across a disconnect
+	// and must keep its relay entry: forgetting it closes the browser's
+	// signalling connection as terminal and ends a live stream.
+	inflight := inFlightSession(t, store, s)
+	held := runningSession(t, store, s)
 	coord.HostDisconnected(ctx, s.hostID)
 
-	if !fg.sawSession(sess.ID) {
-		t.Fatalf("host disconnect reap did not forget the session: saw %v", fg.seen())
+	if !fg.sawSession(inflight.ID) {
+		t.Fatalf("host disconnect reap did not forget the in-flight session: saw %v", fg.seen())
+	}
+	if fg.sawSession(held.ID) {
+		t.Fatalf("host disconnect forgot a HELD running session (%s); its browser would be cut off", held.ID)
 	}
 }
 
@@ -112,7 +119,9 @@ func TestForgetterFiredOnAgentReconnect(t *testing.T) {
 		WithSessionForgetter(fg))
 	ctx := context.Background()
 
-	sess := runningSession(t, store, s)
+	// See TestForgetterFiredOnHostDisconnect: a held running session keeps its
+	// relay entry, an in-flight one does not.
+	sess := inFlightSession(t, store, s)
 	coord.AgentReconnected(ctx, s.hostID)
 
 	if !fg.sawSession(sess.ID) {

@@ -40,6 +40,24 @@ func runningSession(t *testing.T, store *Store, s seedIDs) Session {
 	return sess
 }
 
+// inFlightSession is a session whose launch never completed: `starting`, so its
+// driving goroutine died with the connection and the reap DOES take it. Since
+// #128 a `running` session is held instead, so a test that wants the reap path
+// must use this rather than runningSession.
+func inFlightSession(t *testing.T, store *Store, s seedIDs) Session {
+	t.Helper()
+	ctx := context.Background()
+	sess, err := store.ScheduleAndCreate(ctx, launchParams(s))
+	if err != nil {
+		t.Fatalf("schedule: %v", err)
+	}
+	sess, err = store.Transition(ctx, sess.ID, StateStarting, nil, nil)
+	if err != nil {
+		t.Fatalf("→ starting: %v", err)
+	}
+	return sess
+}
+
 // TestSwapRejectedNotRunning: a swap on a non-running session is rejected
 // ErrSessionNotSwappable and the session is left untouched.
 func TestSwapRejectedNotRunning(t *testing.T) {

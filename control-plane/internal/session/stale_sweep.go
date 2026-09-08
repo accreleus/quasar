@@ -78,8 +78,13 @@ func (c *Coordinator) sweepStaleHosts(ctx context.Context, bootedAt time.Time, g
 // RunStaleSweep ticks sweepStaleHosts until ctx is cancelled. bootedAt is this
 // process's start, captured by the caller before any agent could reconnect.
 func (c *Coordinator) RunStaleSweep(ctx context.Context, bootedAt time.Time, grace time.Duration) {
+	// 0 disables the sweep outright. It used to fall back to the default, which
+	// meant the boot log said "grace_secs 0" while the sweep ran on 120 -- an
+	// operator reaching for a kill switch would have got neither.
 	if grace <= 0 {
-		grace = DefaultSessionGrace
+		c.log.Warn("session stale-host sweep disabled by configuration; " +
+			"a host that never returns will hold its sessions and their reservations")
+		return
 	}
 	tick := grace / 4
 	if tick < 5*time.Second {

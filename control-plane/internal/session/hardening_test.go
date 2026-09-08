@@ -136,7 +136,9 @@ func TestAgentReconnectReconciliation(t *testing.T) {
 	}
 
 	// Its first heartbeat names nothing: the agent really did forget them.
-	coord.AgentHeartbeat(ctx, s.hostID, nil)
+	// []string{}, not nil: an empty list means "I am running nothing", while nil
+	// means the agent said nothing at all and is deliberately ignored.
+	coord.AgentHeartbeat(ctx, s.hostID, []string{})
 
 	for _, id := range []string{r1.Session.ID, r2.Session.ID} {
 		got, _ := store.Get(ctx, id)

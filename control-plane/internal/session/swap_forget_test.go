@@ -66,7 +66,9 @@ func TestSwapperForgetsOnHostDisconnect(t *testing.T) {
 	s := seed(t, pool, 4)
 	coord := newTestCoordinator(t, store, newFakeDispatcher(true), testLogger())
 
-	sess := runningSession(t, store, s)
+	// In-flight: since #128 a RUNNING session survives a disconnect, and so must
+	// its pending swap -- the session is still there to complete it.
+	sess := inFlightSession(t, store, s)
 	coord.swapper.mu.Lock()
 	coord.swapper.pendingSwaps[sess.ID] = "some-app"
 	coord.swapper.mu.Unlock()
@@ -85,7 +87,9 @@ func TestSwapperForgetsOnAgentReconnect(t *testing.T) {
 	s := seed(t, pool, 4)
 	coord := newTestCoordinator(t, store, newFakeDispatcher(true), testLogger())
 
-	sess := runningSession(t, store, s)
+	// In-flight: since #128 a RUNNING session survives a disconnect, and so must
+	// its pending swap -- the session is still there to complete it.
+	sess := inFlightSession(t, store, s)
 	coord.swapper.mu.Lock()
 	coord.swapper.pendingSwaps[sess.ID] = "some-app"
 	coord.swapper.mu.Unlock()
