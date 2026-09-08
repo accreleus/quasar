@@ -18,6 +18,7 @@ import {
 } from "./sessionRuntime";
 import type { TelemetrySnapshot } from "../../webrtc/telemetry";
 import type { ICEServer } from "../../api/types";
+import { ApiError } from "../../api/client";
 
 // ── fakes ───────────────────────────────────────────────────────────────────
 
@@ -454,6 +455,90 @@ describe("recovery and the replacement handoff (L4)", () => {
 
     h.runtime.destroy();
     expect(h.transport.closedWith).toEqual([true]);
+  });
+});
+
+// #128 phase 3 — a control-plane restart (~60-90s) fails the mint on the
+// network; a session must outlast that, not end at the first failed attempt.
+describe("mint retry with backoff (#128)", () => {
+  it("retries a network error with backoff, then succeeds without failing the session", async () => {
+    let calls = 0;
+    const mint = vi.fn(async () => {
+      calls++;
+      if (calls < 3) throw new TypeError("Failed to fetch");
+      return { signaling: { url: "wss://new", token: "tok-2" } };
+    });
+    const h = harness({ mint });
+    h.runtime.start();
+    h.transport.fireRecovery("failed");
+
+    await flush(); // attempt 1 rejects, schedules ~1s backoff
+    await vi.advanceTimersByTimeAsync(1_000); // attempt 2 rejects, schedules ~2s backoff
+    await vi.advanceTimersByTimeAsync(2_000); // attempt 3 succeeds
+
+    expect(mint).toHaveBeenCalledTimes(3);
+    expect(h.callbacks.onReplacementSignaling).toHaveBeenCalledTimes(1);
+    expect(h.callbacks.onReplacementSignaling).toHaveBeenCalledWith({
+      url: "wss://new",
+      token: "tok-2",
+      iceServers: [],
+    });
+    expect(h.callbacks.onReconnectFailed).not.toHaveBeenCalled();
+  });
+
+  it("fails fast on a 4xx ApiError, without retrying or burning the budget", async () => {
+    const mint = vi.fn(async () => {
+      throw new ApiError(404, "session_not_found", "session gone");
+    });
+    const h = harness({ mint });
+    h.runtime.start();
+    h.transport.fireRecovery("failed");
+
+    await flush();
+    await flush();
+
+    expect(mint).toHaveBeenCalledTimes(1);
+    expect(h.callbacks.onReconnectFailed).toHaveBeenCalledTimes(1);
+    expect(h.callbacks.onReconnectFailed).toHaveBeenCalledWith("session gone");
+    expect(h.callbacks.onReplacementSignaling).not.toHaveBeenCalled();
+  });
+
+  it("gives up after the retry budget is exhausted, calling onReconnectFailed exactly once", async () => {
+    const mint = vi.fn(async () => {
+      throw new ApiError(503, "internal", "control plane restarting");
+    });
+    const h = harness({ mint });
+    h.runtime.start();
+    h.transport.fireRecovery("failed");
+
+    await flush();
+    // Drain every scheduled backoff timer; the loop must stop on its own once
+    // the ~90s budget is spent rather than retrying forever.
+    await vi.runAllTimersAsync();
+
+    expect(h.callbacks.onReconnectFailed).toHaveBeenCalledTimes(1);
+    expect(h.callbacks.onReconnectFailed).toHaveBeenCalledWith("control plane restarting");
+    expect(h.callbacks.onReplacementSignaling).not.toHaveBeenCalled();
+    // the budget must have actually been spent retrying, not given up on attempt 1
+    expect(mint.mock.calls.length).toBeGreaterThan(1);
+  });
+
+  it("honours teardown mid-backoff: no callback fires and the timer does not resume the mint", async () => {
+    const mint = vi.fn(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    const h = harness({ mint });
+    h.runtime.start();
+    h.transport.fireRecovery("failed");
+
+    await flush(); // attempt 1 rejects, backoff timer armed
+
+    h.runtime.destroy();
+    await vi.runAllTimersAsync();
+
+    expect(mint).toHaveBeenCalledTimes(1);
+    expect(h.callbacks.onReconnectFailed).not.toHaveBeenCalled();
+    expect(h.callbacks.onReplacementSignaling).not.toHaveBeenCalled();
   });
 });
 
