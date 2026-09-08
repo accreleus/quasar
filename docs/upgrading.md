@@ -626,6 +626,13 @@ QUASAR_UPDATER_SIGNATURE_MODE=verify
 QUASAR_UPDATER_TRUSTED_KEYS=quasar-release-2026:<base64 public key>
 ```
 
+A stack whose `docker-compose.yml` predates this feature does not pass those
+variables through, so the updater would come back up in `off` and say so in its
+log. Take the current `quasar-updater` service block from
+`deploy/docker-compose.yml`, or add the four `QUASAR_UPDATER_SIGNATURE_MODE` /
+`_TRUSTED_KEYS` / `_MANIFEST_BASE_URL` / `_MANIFEST_TIMEOUT_S` lines to its
+`environment:`.
+
 **Go through `verify` first, not straight to `require`.** In `verify` a bad
 signature is refused and a release that publishes none is not, so a fleet can be
 configured before the first signed release exists, and again after it, with
