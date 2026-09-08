@@ -176,6 +176,11 @@ type GPUCapacity struct {
 	// wholesale-replaced per report.
 	RenderNode *string `json:"render_node"`
 	DevicePath *string `json:"device_path"`
+	// DriverIdentity (#144, agent-api.md `capacity.gpus[].driver_identity`): opaque
+	// fingerprint of this GPU's driver/encode stack. Stamped onto each certification
+	// row, which is refused at launch when it names a different one. Absent means
+	// unknown and matching then fails open. Wholesale-replaced with the gpus set.
+	DriverIdentity *string `json:"driver_identity"`
 }
 
 // HeartbeatMsg is sent periodically by the agent.

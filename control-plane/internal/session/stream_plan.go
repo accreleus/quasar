@@ -71,8 +71,19 @@ type StreamInputs struct {
 	Certs      []EncoderCertRow
 	CertMaxAge time.Duration
 
+	// GPUDriverIdentity is the placed GPU's driver/encode-stack fingerprint as the
+	// agent reports it now. Empty is unknown, which caps against every row.
+	GPUDriverIdentity string
+
 	// Now is the clock the staleness check reads, so a test can pin it.
 	Now time.Time
+}
+
+// certIdentity is the encode path a cert row must describe to be applicable to this
+// launch. Assembled from two reads that fail independently, either of which can be
+// unknown; see pickCert for what unknown does.
+func (in StreamInputs) certIdentity() CertIdentity {
+	return CertIdentity{Encoder: in.HostEncoder.Name, DriverIdentity: in.GPUDriverIdentity}
 }
 
 // rungWalk records one resolution of one chain; there are two only when the cap
@@ -216,7 +227,7 @@ func (in StreamInputs) applyCertCap(
 	decision rungDecision,
 	stream resolvedStream,
 ) (profile.LaunchProfile, profile.Profile, rungDecision, resolvedStream) {
-	cert := pickCert(in.Certs, rung.ID, stream.bitrateKbps, in.Now, in.CertMaxAge, in.HostEncoder.Name)
+	cert := pickCert(in.Certs, rung.ID, stream.bitrateKbps, in.Now, in.CertMaxAge, in.certIdentity())
 	if cert == nil {
 		// No row, or all stale. Missing is not "unsafe": the table starts empty and
 		// an uncertified host proceeds optimistically.
@@ -276,14 +287,20 @@ func certShouldCap(cert EncoderCertRow) bool {
 //
 // maxAge is applied again even though CertsForRungs filters on it: the staleness
 // rule belongs to the decision, so a stale row handed over cannot be acted on.
-// encoder is the host's current encode path. A certification row is keyed on
-// (host, gpu, encoder, rung, bitrate), but CertsForRungs reads the batch without
-// that filter, so rows measured under a different encoder arrive here and would
-// otherwise be ranked on bitrate alone (#144). Their encode_ms does not describe
-// this session: vulkanh265enc and nvcudah265enc are different silicon paths.
-// An empty encoder means the host reported none, and every row stays eligible —
+//
+// `id` is the encode path this session will actually run on, and a row that does not
+// describe it is skipped rather than ranked on bitrate (#144). CertsForRungs reads the
+// batch without either filter, so those rows do arrive here.
+//
+//   - Encoder: vulkanh265enc and nvcudah265enc are different silicon paths and their
+//     encode_ms do not transfer.
+//   - DriverIdentity: a measurement taken under a different driver describes software
+//     that is no longer installed. A row whose stored identity is NULL — every row
+//     written before migration 0078 — stays eligible.
+//
+// Either field empty means the host reports none, and every row stays eligible:
 // dropping the cap entirely would launch at a rung the host may not sustain.
-func pickCert(certs []EncoderCertRow, rungID string, bitrateKbps int32, now time.Time, maxAge time.Duration, encoder string) *EncoderCertRow {
+func pickCert(certs []EncoderCertRow, rungID string, bitrateKbps int32, now time.Time, maxAge time.Duration, id CertIdentity) *EncoderCertRow {
 	var best *EncoderCertRow
 	var bestDelta int32
 	for i := range certs {
@@ -291,7 +308,10 @@ func pickCert(certs []EncoderCertRow, rungID string, bitrateKbps int32, now time
 		if c.StreamProfileID != rungID {
 			continue
 		}
-		if encoder != "" && c.Encoder != encoder {
+		if id.Encoder != "" && c.Encoder != id.Encoder {
+			continue
+		}
+		if id.DriverIdentity != "" && c.DriverIdentity != nil && *c.DriverIdentity != id.DriverIdentity {
 			continue
 		}
 		if maxAge > 0 && !now.IsZero() && now.Sub(c.MeasuredAt) > maxAge {

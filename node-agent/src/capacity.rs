@@ -8,6 +8,7 @@
 //! `detect()` runs on the agent's select loop, so every external probe here must be bounded
 //! ([`crate::vram::run_bounded`]) or memoized for the process lifetime.
 
+use crate::gpu_identity::DriverIdentities;
 use crate::messages::{
     AudioSink, ConsoleCapabilities, DrmModeCapability, DrmOutputCapability, GpuCapacity,
     HostCapacity, InputDeviceInfo, StorageVolume,
@@ -39,6 +40,7 @@ pub fn detect() -> SystemCapacity {
         std::path::Path::new("/sys/class/drm"),
         allow_synthetic,
         mem_mb,
+        &DriverIdentities::detect(std::path::Path::new("/")),
     );
     SystemCapacity {
         host: HostCapacity {
@@ -476,6 +478,7 @@ fn detect_gpus_at(
     root: &std::path::Path,
     allow_synthetic: bool,
     mem_mb: i32,
+    identities: &DriverIdentities,
 ) -> (Vec<GpuCapacity>, Vec<VramTarget>, String, Option<String>) {
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
@@ -575,6 +578,16 @@ fn detect_gpus_at(
             total_mb: vram_mb_total,
         });
 
+        // Matched to a Vulkan physical device by PCI ids when the NVIDIA rung does not
+        // answer; None on either side simply means no identity.
+        let driver_identity = identities.for_gpu(
+            vendor,
+            crate::gpu_identity::parse_hex_id(&vendor_id),
+            std::fs::read_to_string(device_path.join("device"))
+                .ok()
+                .and_then(|raw| crate::gpu_identity::parse_hex_id(&raw)),
+        );
+
         gpus.push(GpuCapacity {
             index: index as i32,
             vendor: vendor.to_string(),
@@ -583,6 +596,7 @@ fn detect_gpus_at(
             encode_slots_total,
             render_node,
             device_path: resolved_device_path,
+            driver_identity,
         });
     }
 
@@ -1141,6 +1155,7 @@ fn detection_failure(
             encode_slots_total: 1,
             render_node: None,
             device_path: None,
+            driver_identity: None,
         }],
         vec![VramTarget {
             index: 0,
@@ -1176,6 +1191,7 @@ mod tests {
             std::path::Path::new("/definitely/not/a/drm/inventory"),
             false,
             16384,
+            &test_identities(),
         );
         assert!(gpus.is_empty());
         assert!(vram_targets.is_empty());
@@ -1186,7 +1202,8 @@ mod tests {
     #[test]
     fn empty_drm_inventory_is_unavailable() {
         let dir = tempfile::tempdir().unwrap();
-        let (gpus, vram_targets, status, _) = detect_gpus_at(dir.path(), false, 16384);
+        let (gpus, vram_targets, status, _) =
+            detect_gpus_at(dir.path(), false, 16384, &test_identities());
         assert!(gpus.is_empty());
         assert!(vram_targets.is_empty());
         assert_eq!(status, "unavailable");
@@ -1195,7 +1212,8 @@ mod tests {
     #[test]
     fn synthetic_capacity_requires_explicit_opt_in() {
         let dir = tempfile::tempdir().unwrap();
-        let (gpus, vram_targets, status, reason) = detect_gpus_at(dir.path(), true, 16384);
+        let (gpus, vram_targets, status, reason) =
+            detect_gpus_at(dir.path(), true, 16384, &test_identities());
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].vendor, "unknown");
         assert_eq!(vram_targets.len(), 1);
@@ -1526,11 +1544,49 @@ stepping\t: 2
     /// A `/sys/class/drm/<card>/device/{vendor,mem_info_vram_total}` fixture, the shape
     /// `detect_gpus_at` walks. AMD only: its VRAM read is a plain sysfs file, so these tests
     /// stay hermetic where the nvidia path would need `nvidia-smi`.
+    /// No identity sources. These tests are about the DRM inventory, and the real ladder
+    /// would read this machine's NVIDIA module version and spawn `vulkaninfo`.
+    fn test_identities() -> DriverIdentities {
+        DriverIdentities::with(None, Vec::new())
+    }
+
     fn fake_amd_card(root: &std::path::Path, card_name: &str) {
         let device_dir = root.join(card_name).join("device");
         std::fs::create_dir_all(&device_dir).unwrap();
         std::fs::write(device_dir.join("vendor"), "0x1002\n").unwrap();
         std::fs::write(device_dir.join("mem_info_vram_total"), "8589934592\n").unwrap();
+    }
+
+    #[test]
+    fn a_gpus_driver_identity_rides_the_capacity_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("card0/device");
+        std::fs::create_dir_all(&device).unwrap();
+        std::fs::write(device.join("vendor"), "0x1002\n").unwrap();
+        std::fs::write(device.join("device"), "0x1636\n").unwrap();
+        std::fs::write(device.join("mem_info_vram_total"), "8589934592\n").unwrap();
+
+        let matched = crate::gpu_identity::VulkanDriver {
+            vendor_id: 0x1002,
+            device_id: 0x1636,
+            driver_name: "radv".into(),
+            driver_info: "Mesa 25.3.6".into(),
+        };
+        let (gpus, _, _, _) = detect_gpus_at(
+            dir.path(),
+            false,
+            16384,
+            &DriverIdentities::with(None, vec![matched]),
+        );
+        assert_eq!(
+            gpus[0].driver_identity.as_deref(),
+            Some("vk:radv:Mesa 25.3.6")
+        );
+
+        // No source can name this GPU's driver: the field is omitted rather than
+        // filled with a placeholder, and the control plane's matching fails open.
+        let (gpus, _, _, _) = detect_gpus_at(dir.path(), false, 16384, &test_identities());
+        assert_eq!(gpus[0].driver_identity, None);
     }
 
     #[test]
@@ -1541,7 +1597,8 @@ stepping\t: 2
         std::fs::write(device.join("vendor"), "0x8086\n").unwrap();
         std::fs::write(device.join("device"), "0x4692\n").unwrap();
 
-        let (gpus, targets, status, reason) = detect_gpus_at(dir.path(), false, 16384);
+        let (gpus, targets, status, reason) =
+            detect_gpus_at(dir.path(), false, 16384, &test_identities());
         assert_eq!(status, "ok", "Intel iGPU discarded: {reason:?}");
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].vendor, "intel");
@@ -1630,7 +1687,8 @@ stepping\t: 2
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                 std::fs::write(path, value).unwrap();
             }
-            let (gpus, targets, status, _) = detect_gpus_at(dir.path(), false, *mem_mb);
+            let (gpus, targets, status, _) =
+                detect_gpus_at(dir.path(), false, *mem_mb, &test_identities());
             assert_eq!(gpus.first().map(|g| g.vram_mb_total), *expected, "{name}");
             assert_eq!(
                 status,
@@ -1653,7 +1711,8 @@ stepping\t: 2
         std::fs::write(device.join("vendor"), "0x8086").unwrap();
         std::fs::remove_file(device.join("mem_info_vram_total")).unwrap();
         fake_amd_card(dir.path(), "card1");
-        let (gpus, targets, status, _) = detect_gpus_at(dir.path(), false, 8192);
+        let (gpus, targets, status, _) =
+            detect_gpus_at(dir.path(), false, 8192, &test_identities());
         assert_eq!(status, "ok");
         assert_eq!(gpus.len(), 2);
         assert_eq!(gpus[0].vendor, "intel");
@@ -1684,7 +1743,8 @@ stepping\t: 2
         std::fs::create_dir_all(&drm_root).unwrap();
         fake_amd_card(&drm_root, "card0");
 
-        let (gpus, vram_targets, status, _) = detect_gpus_at(&drm_root, false, 16384);
+        let (gpus, vram_targets, status, _) =
+            detect_gpus_at(&drm_root, false, 16384, &test_identities());
         assert_eq!(status, "ok");
         assert_eq!(gpus.len(), 1);
         assert_eq!(vram_targets.len(), 1);
@@ -1726,7 +1786,7 @@ stepping\t: 2
 
         // Non-vulkan host: the knob is inert off the vulkan path.
         std::env::set_var("QUASAR_VULKAN_MAX_SESSIONS", "5");
-        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384);
+        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities());
         assert_eq!(gpus.len(), 1);
         assert_eq!(
             gpus[0].encode_slots_total, 2,
@@ -1736,14 +1796,14 @@ stepping\t: 2
         // Vulkan host honors the knob.
         std::env::set_var("QUASAR_ENCODER", "vulkan");
         std::env::set_var("QUASAR_VULKAN_MAX_SESSIONS", "5");
-        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384);
+        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities());
         assert_eq!(
             gpus[0].encode_slots_total, 5,
             "vulkan host honors QUASAR_VULKAN_MAX_SESSIONS"
         );
 
         std::env::remove_var("QUASAR_VULKAN_MAX_SESSIONS");
-        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384);
+        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities());
         assert_eq!(
             gpus[0].encode_slots_total, 2,
             "vulkan host with the knob unset defaults to 2"
@@ -1752,7 +1812,7 @@ stepping\t: 2
         // Malformed or non-positive values must never advertise a zero or negative capacity.
         for bad in ["0", "-1", "not-a-number", ""] {
             std::env::set_var("QUASAR_VULKAN_MAX_SESSIONS", bad);
-            let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384);
+            let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities());
             assert_eq!(
                 gpus[0].encode_slots_total, 2,
                 "invalid QUASAR_VULKAN_MAX_SESSIONS={bad:?} falls back to default 2"
@@ -1775,6 +1835,7 @@ stepping\t: 2
             encode_slots_total: slots,
             render_node: None,
             device_path: None,
+            driver_identity: None,
         }
     }
 
@@ -1867,6 +1928,7 @@ stepping\t: 2
             encode_slots_total: 2,
             render_node: None,
             device_path: Some(device_path),
+            driver_identity: None,
         };
         let base_gpus = vec![amd_gpu(card0_path), amd_gpu(card1_path)];
 

@@ -969,6 +969,7 @@ fn gpu(index: i32, slots: i32) -> crate::messages::GpuCapacity {
         encode_slots_total: slots,
         render_node: None,
         device_path: None,
+        driver_identity: None,
     }
 }
 

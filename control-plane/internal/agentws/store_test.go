@@ -362,6 +362,63 @@ func TestUpsertCapacityGPURenderNodePersists(t *testing.T) {
 	}
 }
 
+// TestUpsertCapacityGPUDriverIdentityPersists: the #144 identity rides the same
+// wholesale-replace GPU upsert, and a report that stops carrying one (an agent
+// downgrade) clears it rather than keeping a fingerprint of software nothing is
+// running — unknown is what makes certification matching fail open.
+func TestUpsertCapacityGPUDriverIdentityPersists(t *testing.T) {
+	pool := testPool(t)
+	s := &agentStore{pool: pool}
+	hostID := seedHost(t, pool)
+	ctx := context.Background()
+
+	gpus := []GPUCapacity{
+		{Index: 0, Vendor: "nvidia", Model: "RTX 5090", VRAMMBTotal: 32768, EncodeSlotsTotal: 3,
+			DriverIdentity: strPtr("nvidia:610.57.04")},
+		{Index: 1, Vendor: "amd", Model: "Radeon Pro V520", VRAMMBTotal: 16384, EncodeSlotsTotal: 2},
+	}
+	if err := s.upsertCapacity(ctx, hostID, HostCapacity{}, nil, gpus); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	read := func() []*string {
+		rows, err := pool.Query(ctx,
+			`SELECT driver_identity FROM gpus WHERE host_id::text = $1 ORDER BY index`, hostID)
+		if err != nil {
+			t.Fatalf("query gpus: %v", err)
+		}
+		defer rows.Close()
+		var out []*string
+		for rows.Next() {
+			var v *string
+			if err := rows.Scan(&v); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			out = append(out, v)
+		}
+		return out
+	}
+
+	got := read()
+	if len(got) != 2 {
+		t.Fatalf("gpus rows = %d, want 2", len(got))
+	}
+	if got[0] == nil || *got[0] != "nvidia:610.57.04" {
+		t.Errorf("gpu 0 driver_identity = %v, want the reported identity", got[0])
+	}
+	if got[1] != nil {
+		t.Errorf("gpu 1 driver_identity = %v, want nil (not reported)", got[1])
+	}
+
+	gpus[0].DriverIdentity = nil
+	if err := s.upsertCapacity(ctx, hostID, HostCapacity{}, nil, gpus); err != nil {
+		t.Fatalf("re-upsert: %v", err)
+	}
+	if got := read(); got[0] != nil {
+		t.Errorf("gpu 0 driver_identity = %v after a report without one, want nil", got[0])
+	}
+}
+
 func TestFailedCapacityReportRetainsHistoryButUnschedulesGPU(t *testing.T) {
 	pool := testPool(t)
 	s := &agentStore{pool: pool}

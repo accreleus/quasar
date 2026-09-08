@@ -37,6 +37,15 @@ const certThreshold = 0.70
 // absent (no cap applied).
 const CertStaleness = 7 * 24 * time.Hour
 
+// certColumns is the row shape scanEncoderCertRow scans, positionally. Every cert
+// read shares it so a new column cannot reach one query and miss another.
+const certColumns = `id::text, host_id::text, gpu_index, encoder, profile_id, stream_profile_id,
+	       width, height, fps, bitrate_kbps,
+	       verdict, encode_ms_p50, encode_ms_p95, encode_ms_max,
+	       output_fps, drop_rate, live_write_stable,
+	       sample_window_ms, sample_count, agent_version, driver_identity,
+	       measured_at, updated_at`
+
 // EncoderCertRow is the domain view of a host_encoder_certification row.
 type EncoderCertRow struct {
 	ID       string
@@ -60,8 +69,22 @@ type EncoderCertRow struct {
 	SampleWindowMs  int
 	SampleCount     int
 	AgentVersion    *string
-	MeasuredAt      time.Time
-	UpdatedAt       time.Time
+	// DriverIdentity is the GPU's driver/encode-stack fingerprint when the bench ran
+	// (`gpus.driver_identity`, from the agent). NULL on every row written before #144
+	// and on a host whose agent reports none; matching treats NULL as unknown and
+	// keeps the row eligible.
+	DriverIdentity *string
+	MeasuredAt     time.Time
+	UpdatedAt      time.Time
+}
+
+// CertIdentity is what a stored measurement must match to describe the encode path a
+// session will actually run on: the encoder family and the GPU's driver identity. An
+// EMPTY field is unknown and matches everything — the launch path must never lose its
+// cap because a host has not reported one (#144).
+type CertIdentity struct {
+	Encoder        string
+	DriverIdentity string
 }
 
 // CertFilter optionally restricts a GetEncoderCerts query.
@@ -114,6 +137,10 @@ func DeriveVerdict(p95Ms, budgetMs float64, outputFPS, targetFPS float64, dropRa
 // wins. `profile_id` rides along and refreshes on conflict but is not part of
 // the key: the same rung may be listed by more than one chain, and
 // re-certifying it under a different chain must update, not fork, the row.
+//
+// `driver_identity` is read off the `gpus` row in the same statement rather than taken
+// from the caller, so a measurement cannot be stamped with an identity the host was not
+// reporting when it was written (#144).
 func (s *Store) UpsertEncoderCert(ctx context.Context, row EncoderCertRow) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO host_encoder_certification
@@ -121,13 +148,14 @@ func (s *Store) UpsertEncoderCert(ctx context.Context, row EncoderCertRow) error
 		     width, height, fps, bitrate_kbps,
 		     verdict, encode_ms_p50, encode_ms_p95, encode_ms_max,
 		     output_fps, drop_rate, live_write_stable,
-		     sample_window_ms, sample_count, agent_version,
+		     sample_window_ms, sample_count, agent_version, driver_identity,
 		     measured_at, updated_at)
 		VALUES ($1::uuid, $2, $3, $4, $5,
 		        $6, $7, $8, $9,
 		        $10, $11, $12, $13,
 		        $14, $15, $16,
 		        $17, $18, $19,
+		        (SELECT driver_identity FROM gpus WHERE host_id = $1::uuid AND index = $2),
 		        $20, now())
 		ON CONFLICT (host_id, gpu_index, encoder, stream_profile_id, bitrate_kbps) DO UPDATE
 		    SET profile_id        = EXCLUDED.profile_id,
@@ -144,6 +172,7 @@ func (s *Store) UpsertEncoderCert(ctx context.Context, row EncoderCertRow) error
 		        sample_window_ms  = EXCLUDED.sample_window_ms,
 		        sample_count      = EXCLUDED.sample_count,
 		        agent_version     = EXCLUDED.agent_version,
+		        driver_identity   = EXCLUDED.driver_identity,
 		        measured_at       = EXCLUDED.measured_at,
 		        updated_at        = now()
 	`, row.HostID, row.GPUIndex, row.Encoder, row.ProfileID, row.StreamProfileID,
@@ -162,12 +191,7 @@ func (s *Store) UpsertEncoderCert(ctx context.Context, row EncoderCertRow) error
 // ordered by profile_id, stream_profile_id, gpu_index, encoder, bitrate_kbps.
 func (s *Store) GetEncoderCerts(ctx context.Context, hostID string, filter CertFilter) ([]EncoderCertRow, error) {
 	q := `
-		SELECT id::text, host_id::text, gpu_index, encoder, profile_id, stream_profile_id,
-		       width, height, fps, bitrate_kbps,
-		       verdict, encode_ms_p50, encode_ms_p95, encode_ms_max,
-		       output_fps, drop_rate, live_write_stable,
-		       sample_window_ms, sample_count, agent_version,
-		       measured_at, updated_at
+		SELECT ` + certColumns + `
 		FROM host_encoder_certification
 		WHERE host_id = $1::uuid
 	`
@@ -225,52 +249,42 @@ func (s *Store) GetEncoderCerts(ctx context.Context, hostID string, filter CertF
 }
 
 // CertForRung returns the most recently measured cert row for one rung at the
-// closest bench bitrate to bitrateKbps. encoder "" means any encoder. Returns
-// nil when no cert exists or all rows are stale (older than maxAge).
+// closest bench bitrate to bitrateKbps. Returns nil when no cert exists or all rows
+// are stale (older than maxAge).
 //
-// Keyed on the rung (migration 0041), not the launch profile — a verdict on
-// the h264 rung says nothing about the AV1 rung of the same chain. The caller
-// must have resolved the rung first; see applyPostPlacement.
-func (s *Store) CertForRung(ctx context.Context, hostID string, gpuIndex int, encoder, rungID string, bitrateKbps int32, maxAge time.Duration) (*EncoderCertRow, error) {
+// The SQL twin of pickCert (stream_plan.go), which the launch path uses: the two must
+// select the same row, and TestCertForRungMatchesPickCert holds them to it across
+// every branch of `id`.
+//
+// An empty CertIdentity field is unknown and filters nothing. A stored
+// `driver_identity` of NULL stays eligible even against a known identity — that is the
+// documented migration behaviour for every pre-#144 row (migration 0078).
+//
+// Keyed on the rung (migration 0041), not the launch profile — a verdict on the h264
+// rung says nothing about the AV1 rung of the same chain. The caller must have resolved
+// the rung first; see applyPostPlacement.
+func (s *Store) CertForRung(ctx context.Context, hostID string, gpuIndex int, id CertIdentity, rungID string, bitrateKbps int32, maxAge time.Duration) (*EncoderCertRow, error) {
 	cutoff := time.Now().Add(-maxAge)
 
-	var row pgx.Row
-	if encoder == "" {
-		row = s.pool.QueryRow(ctx, `
-			SELECT id::text, host_id::text, gpu_index, encoder, profile_id, stream_profile_id,
-			       width, height, fps, bitrate_kbps,
-			       verdict, encode_ms_p50, encode_ms_p95, encode_ms_max,
-			       output_fps, drop_rate, live_write_stable,
-			       sample_window_ms, sample_count, agent_version,
-			       measured_at, updated_at
-			FROM host_encoder_certification
-			WHERE host_id = $1::uuid
-			  AND gpu_index = $2
-			  AND stream_profile_id = $3
-			  AND measured_at >= $4
-			ORDER BY ABS(bitrate_kbps - $5) ASC, measured_at DESC
-			LIMIT 1
-		`, hostID, gpuIndex, rungID, cutoff, bitrateKbps)
-	} else {
-		row = s.pool.QueryRow(ctx, `
-			SELECT id::text, host_id::text, gpu_index, encoder, profile_id, stream_profile_id,
-			       width, height, fps, bitrate_kbps,
-			       verdict, encode_ms_p50, encode_ms_p95, encode_ms_max,
-			       output_fps, drop_rate, live_write_stable,
-			       sample_window_ms, sample_count, agent_version,
-			       measured_at, updated_at
-			FROM host_encoder_certification
-			WHERE host_id = $1::uuid
-			  AND gpu_index = $2
-			  AND encoder = $3
-			  AND stream_profile_id = $4
-			  AND measured_at >= $5
-			ORDER BY ABS(bitrate_kbps - $6) ASC, measured_at DESC
-			LIMIT 1
-		`, hostID, gpuIndex, encoder, rungID, cutoff, bitrateKbps)
+	q := `SELECT ` + certColumns + `
+		FROM host_encoder_certification
+		WHERE host_id = $1::uuid
+		  AND gpu_index = $2
+		  AND stream_profile_id = $3
+		  AND measured_at >= $4`
+	args := []any{hostID, gpuIndex, rungID, cutoff}
+	if id.Encoder != "" {
+		args = append(args, id.Encoder)
+		q += fmt.Sprintf("\n\t\t  AND encoder = $%d", len(args))
 	}
+	if id.DriverIdentity != "" {
+		args = append(args, id.DriverIdentity)
+		q += fmt.Sprintf("\n\t\t  AND (driver_identity IS NULL OR driver_identity = $%d)", len(args))
+	}
+	args = append(args, bitrateKbps)
+	q += fmt.Sprintf("\n\t\tORDER BY ABS(bitrate_kbps - $%d) ASC, measured_at DESC\n\t\tLIMIT 1", len(args))
 
-	cert, err := scanEncoderCertRow(row)
+	cert, err := scanEncoderCertRow(s.pool.QueryRow(ctx, q, args...))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil // no cert / stale — caller proceeds uncapped
 	}
@@ -278,6 +292,29 @@ func (s *Store) CertForRung(ctx context.Context, hostID string, gpuIndex int, en
 		return nil, fmt.Errorf("cert for rung: %w", err)
 	}
 	return &cert, nil
+}
+
+// GPUDriverIdentity is the driver identity a host's GPU reports RIGHT NOW, which the
+// launch path matches certification rows against. Empty means unknown (no such GPU row,
+// or an agent that reports none), and unknown filters nothing.
+func (s *Store) GPUDriverIdentity(ctx context.Context, hostID string, gpuIndex int) (string, error) {
+	if !isValidUUID(hostID) {
+		return "", nil
+	}
+	var identity *string
+	err := s.pool.QueryRow(ctx,
+		`SELECT driver_identity FROM gpus WHERE host_id = $1::uuid AND index = $2`,
+		hostID, gpuIndex).Scan(&identity)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("gpu driver identity: %w", err)
+	}
+	if identity == nil {
+		return "", nil
+	}
+	return *identity, nil
 }
 
 // CertsForRungs returns every fresh cert row this host+GPU holds for any of
@@ -289,8 +326,9 @@ func (s *Store) CertForRung(ctx context.Context, hostID string, gpuIndex int, en
 // restates this query's `ORDER BY ABS(bitrate_kbps - $n), measured_at DESC`;
 // the two must not drift.
 //
-// `encoder` is not a filter (a cert is keyed on the rung, which implies a
-// codec). Freshness is applied in SQL and again in pickCert.
+// Encoder and driver identity are NOT filtered here: pickCert owns both, so the cert
+// rule has one home and the guard test can feed it rows it must reject. Freshness is
+// applied in SQL and again in pickCert.
 func (s *Store) CertsForRungs(ctx context.Context, hostID string, gpuIndex int, rungIDs []string, maxAge time.Duration) ([]EncoderCertRow, error) {
 	if len(rungIDs) == 0 {
 		return nil, nil
@@ -298,12 +336,7 @@ func (s *Store) CertsForRungs(ctx context.Context, hostID string, gpuIndex int, 
 	cutoff := time.Now().Add(-maxAge)
 
 	rows, err := s.pool.Query(ctx, `
-		SELECT id::text, host_id::text, gpu_index, encoder, profile_id, stream_profile_id,
-		       width, height, fps, bitrate_kbps,
-		       verdict, encode_ms_p50, encode_ms_p95, encode_ms_max,
-		       output_fps, drop_rate, live_write_stable,
-		       sample_window_ms, sample_count, agent_version,
-		       measured_at, updated_at
+		SELECT `+certColumns+`
 		FROM host_encoder_certification
 		WHERE host_id = $1::uuid
 		  AND gpu_index = $2
@@ -634,7 +667,7 @@ func scanEncoderCertRow(row certScanner) (EncoderCertRow, error) {
 		&r.Width, &r.Height, &r.FPS, &r.BitrateKbps,
 		&r.Verdict, &r.EncodeP50, &r.EncodeP95, &r.EncodeMax,
 		&r.OutputFPS, &r.DropRate, &r.LiveWriteStable,
-		&r.SampleWindowMs, &r.SampleCount, &r.AgentVersion,
+		&r.SampleWindowMs, &r.SampleCount, &r.AgentVersion, &r.DriverIdentity,
 		&r.MeasuredAt, &r.UpdatedAt,
 	)
 	if err != nil {

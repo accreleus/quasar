@@ -3866,6 +3866,7 @@ mod tests {
             encode_slots_total: 2,
             render_node: render_node.map(str::to_string),
             device_path: render_node.map(crate::session::settings::canonicalize_render_node),
+            driver_identity: None,
         }
     }
 

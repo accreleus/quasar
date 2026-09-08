@@ -561,8 +561,57 @@ func TestPickCert(t *testing.T) {
 		bitrate int32
 		maxAge  time.Duration
 		encoder string // the host's current encoder; "" means unknown
+		driver  string // the placed GPU's driver identity; "" means unknown
 		want    string // cert ID; "" means nil
 	}{
+		{
+			// #144: a certification measures one silicon + driver + encode stack.
+			// After a driver change the numbers describe software that is no longer
+			// installed, so the row must not cap this session.
+			name: "a row measured under a different driver is never selected",
+			certs: []EncoderCertRow{
+				{ID: "old-driver", DriverIdentity: strptr("nvidia:595.99.02"), StreamProfileID: "r1", BitrateKbps: 7000, MeasuredAt: fixedNow},
+			},
+			rungID: "r1", bitrate: 7000, maxAge: CertStaleness, driver: "nvidia:610.57.04",
+			want: "",
+		},
+		{
+			name: "an unchanged driver identity keeps its measurement applicable",
+			certs: []EncoderCertRow{
+				{ID: "same-driver", DriverIdentity: strptr("nvidia:610.57.04"), StreamProfileID: "r1", BitrateKbps: 7000, MeasuredAt: fixedNow},
+			},
+			rungID: "r1", bitrate: 7000, maxAge: CertStaleness, driver: "nvidia:610.57.04",
+			want: "same-driver",
+		},
+		{
+			// The documented migration behaviour (0078): every legacy row stores NULL
+			// and stays usable until a measurement carrying an identity replaces it.
+			name: "a row with no stored identity stays eligible under a known one",
+			certs: []EncoderCertRow{
+				{ID: "legacy", StreamProfileID: "r1", BitrateKbps: 7000, MeasuredAt: fixedNow},
+			},
+			rungID: "r1", bitrate: 7000, maxAge: CertStaleness, driver: "nvidia:610.57.04",
+			want: "legacy",
+		},
+		{
+			name: "the current driver's row is preferred over a closer bitrate from another",
+			certs: []EncoderCertRow{
+				{ID: "old-exact", DriverIdentity: strptr("nvidia:595.99.02"), StreamProfileID: "r1", BitrateKbps: 7000, MeasuredAt: fixedNow},
+				{ID: "new-far", DriverIdentity: strptr("nvidia:610.57.04"), StreamProfileID: "r1", BitrateKbps: 3000, MeasuredAt: fixedNow},
+			},
+			rungID: "r1", bitrate: 7000, maxAge: CertStaleness, driver: "nvidia:610.57.04",
+			want: "new-far",
+		},
+		{
+			// Fail open, as for the encoder: an unreported identity must not disable
+			// capping, which would launch at a rung the host may not sustain.
+			name: "an unknown driver identity keeps every row eligible",
+			certs: []EncoderCertRow{
+				{ID: "old-driver", DriverIdentity: strptr("nvidia:595.99.02"), StreamProfileID: "r1", BitrateKbps: 7000, MeasuredAt: fixedNow},
+			},
+			rungID: "r1", bitrate: 7000, maxAge: CertStaleness, driver: "",
+			want: "old-driver",
+		},
 		{
 			// #144: the table is keyed on encoder but the batch read is not, so
 			// a measurement taken under one encoder could cap a session running
@@ -637,7 +686,8 @@ func TestPickCert(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := pickCert(c.certs, c.rungID, c.bitrate, fixedNow, c.maxAge, c.encoder)
+			got := pickCert(c.certs, c.rungID, c.bitrate, fixedNow, c.maxAge,
+				CertIdentity{Encoder: c.encoder, DriverIdentity: c.driver})
 			gotID := ""
 			if got != nil {
 				gotID = got.ID
