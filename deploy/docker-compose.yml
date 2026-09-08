@@ -329,6 +329,12 @@ services:
       # Explicit values (va | vulkan | nvenc | openh264) win. docs/configuration.md.
       QUASAR_ENCODER: ${QUASAR_ENCODER:-}
       QUASAR_RENDER_NODE: ${QUASAR_RENDER_NODE:-}
+      # #152: the health listener's bind address. Passed through so an operator
+      # can move it — the agent REFUSES TO START if it cannot bind, rather than
+      # let another process answer its health checks, and 9091 is a busy port
+      # (Prometheus Pushgateway's default). Empty disables the endpoint. The
+      # `-` (not `:-`) is deliberate: an explicitly empty value must stay empty.
+      QUASAR_HEALTH_ADDR: ${QUASAR_HEALTH_ADDR-127.0.0.1:9091}
       # P5-03 local-driver home root: when set, the agent pre-creates bind-mount
       # dirs under it and reports per-home bytes_used. Must be a path that is
       # the SAME on host and in this container.

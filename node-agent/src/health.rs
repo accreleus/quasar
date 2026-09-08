@@ -112,6 +112,24 @@ impl HealthState {
     }
 }
 
+/// #152 — who is answering. Two agents on one host share a network namespace and
+/// therefore a port; without this a probe cannot tell whose status it received,
+/// and on a real host that cost hours: a healthy agent was read as unhealthy
+/// because a decommissioned one held the port and answered for it.
+fn identity_fields() -> String {
+    identity_fields_for(crate::logging::host_name())
+}
+
+/// Split from [`identity_fields`] so a test can feed a hostile name without
+/// touching process-global env. `NODE_NAME` is NOT read directly here: the agent
+/// registers under `logging::host_name()`, which falls back to the detected
+/// hostname when `NODE_NAME` is unset, and an attribution field that disagrees
+/// with the name the control plane knows would defeat the purpose.
+fn identity_fields_for(node: &str) -> String {
+    let node_json = serde_json::to_string(node).unwrap_or_else(|_| "\"unknown\"".to_string());
+    format!(",\"node\":{node_json},\"pid\":{}", std::process::id())
+}
+
 /// Pure threshold decision, unit-testable without a `HealthState` or sockets.
 fn is_unhealthy(consecutive_failures: usize) -> bool {
     consecutive_failures >= UNHEALTHY_AFTER_CONSECUTIVE_FAILURES
@@ -130,31 +148,30 @@ pub fn addr_from_env() -> Option<String> {
     }
 }
 
-/// Spawn the health listener on a blocking thread if enabled by env. No-op
-/// (returns immediately, nothing spawned) when disabled.
-pub fn spawn_if_enabled(state: Arc<HealthState>) {
+/// Bind the configured health address, or report why not.
+///
+/// #152 — the bind is done HERE, synchronously and before anything is spawned,
+/// so the caller can decide what a failure means. Deciding inside the listener
+/// thread meant the process raced on: the agent would go on to connect and
+/// register while its health endpoint was answered by whatever else held the
+/// port. `Ok(None)` means the endpoint is deliberately disabled.
+pub fn bind_if_enabled() -> Result<Option<TcpListener>, (String, std::io::Error)> {
     let Some(addr) = addr_from_env() else {
         info!("health endpoint disabled (QUASAR_HEALTH_ADDR empty/0)");
-        return;
+        return Ok(None);
     };
-    std::thread::spawn(move || serve(&addr, state));
+    match TcpListener::bind(&addr) {
+        Ok(l) => {
+            info!("health endpoint listening on {addr}");
+            Ok(Some(l))
+        }
+        Err(e) => Err((addr, e)),
+    }
 }
 
-/// Blocking accept loop; one thread per connection (health checks are rare and
-/// tiny, so simplicity wins over pooling).
-fn serve(addr: &str, state: Arc<HealthState>) {
-    let listener = match TcpListener::bind(addr) {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!(
-                token = "health-bind-failed",
-                "health: failed to bind {addr}: {e}"
-            );
-            return;
-        }
-    };
-    info!("health endpoint listening on {addr}");
-    serve_listener(listener, state);
+/// Serve an already-bound listener on a blocking thread.
+pub fn spawn(listener: TcpListener, state: Arc<HealthState>) {
+    std::thread::spawn(move || serve_listener(listener, state));
 }
 
 /// The accept loop proper, split out from `serve` so the tests drive the real
@@ -216,13 +233,17 @@ fn handle_conn(mut stream: std::net::TcpStream, state: &HealthState) {
                 "HTTP/1.1 503 Service Unavailable",
                 format!(
                     "{{\"status\":\"unhealthy\",\"sessions\":{sessions},\"connected\":{connected},\
-                     \"consecutive_registration_failures\":{failures},\"reason\":{reason_json}}}"
+                     \"consecutive_registration_failures\":{failures},\"reason\":{reason_json}{id}}}",
+                    id = identity_fields()
                 ),
             )
         } else {
             (
                 "HTTP/1.1 200 OK",
-                format!("{{\"status\":\"ok\",\"sessions\":{sessions},\"connected\":{connected}}}"),
+                format!(
+                    "{{\"status\":\"ok\",\"sessions\":{sessions},\"connected\":{connected}{id}}}",
+                    id = identity_fields()
+                ),
             )
         };
         format!(
@@ -245,6 +266,63 @@ fn handle_conn(mut stream: std::net::TcpStream, state: &HealthState) {
 mod tests {
     use super::*;
     use std::net::TcpStream;
+
+    /// #152 — a probe must be able to tell WHOSE health it received. Two agents
+    /// on one host share a network namespace, and a probe answered by the wrong
+    /// one is indistinguishable from a true reading without this.
+    #[test]
+    fn health_response_identifies_the_agent_that_answered() {
+        let state = HealthState::new();
+        state.set_connected(true);
+        let addr = spawn_test_server(state);
+        let (_head, body) = get(&addr, "/health");
+
+        assert!(body.contains("\"pid\":"), "no pid in {body}");
+        assert!(body.contains("\"node\":"), "no node name in {body}");
+        // The pid must be THIS process — the whole point is attribution.
+        assert!(
+            body.contains(&format!("\"pid\":{}", std::process::id())),
+            "pid is not this process in {body}"
+        );
+    }
+
+    #[test]
+    fn an_unhealthy_response_is_identified_too() {
+        // The misleading case in the field was an UNHEALTHY body attributed to
+        // the wrong agent, so this arm matters more than the healthy one.
+        let state = HealthState::new();
+        for _ in 0..UNHEALTHY_AFTER_CONSECUTIVE_FAILURES {
+            state.record_registration_failure("boom");
+        }
+        let addr = spawn_test_server(state);
+        let (_head, body) = get(&addr, "/health");
+
+        assert!(body.contains("\"status\":\"unhealthy\""), "{body}");
+        assert!(
+            body.contains(&format!("\"pid\":{}", std::process::id())),
+            "{body}"
+        );
+    }
+
+    /// #152 — the decision the boot path acts on, now that it is separable from
+    /// the exit. This is the case that took a real host down for sixteen hours.
+    #[test]
+    fn binding_an_address_another_process_holds_is_an_error() {
+        let held = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = held.local_addr().expect("local_addr").to_string();
+
+        let err = TcpListener::bind(&addr).expect_err("second bind must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    }
+
+    /// A node name is operator-supplied, so it must not be able to break the
+    /// hand-rolled JSON.
+    #[test]
+    fn a_hostile_node_name_cannot_break_the_json() {
+        let body = format!("{{\"status\":\"ok\"{}}}", identity_fields_for("a\"b\\c\nd"));
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(v["node"], "a\"b\\c\nd");
+    }
 
     /// Ephemeral port, so tests are deterministic and parallel-safe. Runs the
     /// real accept loop so timeouts and the in-flight cap are under test.
@@ -274,7 +352,13 @@ mod tests {
         let addr = spawn_test_server(state);
         let (head, body) = get(&addr, "/health");
         assert!(head.starts_with("HTTP/1.1 200"), "head: {head}");
-        assert_eq!(body, r#"{"status":"ok","sessions":0,"connected":false}"#);
+        // Parsed rather than string-compared since #152 appended the identity
+        // fields: still exact about every value, but not about field order.
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["sessions"], 0);
+        assert_eq!(v["connected"], false);
+        assert_eq!(v["pid"], std::process::id());
     }
 
     #[test]
@@ -284,7 +368,11 @@ mod tests {
         state.set_connected(true);
         let addr = spawn_test_server(state);
         let (_head, body) = get(&addr, "/health");
-        assert_eq!(body, r#"{"status":"ok","sessions":3,"connected":true}"#);
+        // Parsed since #152 appended the identity fields; still exact on values.
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["sessions"], 3);
+        assert_eq!(v["connected"], true);
     }
 
     #[test]

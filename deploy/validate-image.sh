@@ -495,6 +495,27 @@ if [ -n "$ENTRY_WANT" ]; then
   else hemit FAIL "image.entrypoint" "neither Entrypoint nor Cmd mentions '$ENTRY_WANT': $CFG"; fi
 fi
 
+# #152: a healthcheck that is DECLARED but broken passes the assertion below and
+# then reports every container unhealthy in production. The runtime probe is a
+# script now (it resolves QUASAR_HEALTH_ADDR rather than hardcoding a port), so
+# exercise its two decisions directly — the class of failure this catches is a
+# missing `curl` or `sh` in the final stage, which has happened here before.
+if [ "$(scalar '.image_config.healthcheck_probe')" = "true" ]; then
+  probe=/usr/local/bin/quasar-node-agent-healthcheck
+  # Endpoint deliberately disabled => healthy, without contacting anything.
+  if docker run --rm --network none -e QUASAR_HEALTH_ADDR= "$IMAGE" "$probe" >/dev/null 2>&1; then
+    hemit PASS "image.healthcheck.disabled-is-healthy" "empty QUASAR_HEALTH_ADDR exits 0"
+  else
+    hemit FAIL "image.healthcheck.disabled-is-healthy" "empty QUASAR_HEALTH_ADDR did not exit 0 (missing sh/curl, or bad script)"
+  fi
+  # Nothing listening => unhealthy. Port 1 is never a health endpoint.
+  if docker run --rm --network none -e QUASAR_HEALTH_ADDR=127.0.0.1:1 "$IMAGE" "$probe" >/dev/null 2>&1; then
+    hemit FAIL "image.healthcheck.unreachable-is-unhealthy" "a dead address exited 0 — the probe cannot fail"
+  else
+    hemit PASS "image.healthcheck.unreachable-is-unhealthy" "a dead address exits non-zero"
+  fi
+fi
+
 if [ "$(scalar '.image_config.healthcheck_required')" = "true" ]; then
   HC="$(docker image inspect --format '{{json .Config.Healthcheck}}' "$IMAGE")"
   if [ "$HC" != "null" ] && [ -n "$HC" ]; then hemit PASS "image.healthcheck" "declared"

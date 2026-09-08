@@ -1109,8 +1109,24 @@ LABEL org.quasar.image.role="runtime" \
       org.quasar.source.commit="${SOURCE_COMMIT}" \
       org.quasar.built.at="${BUILT_AT}"
 
+# #152 — the probe must follow QUASAR_HEALTH_ADDR rather than hardcoding the
+# default. Two agents on one host share a network namespace, so the second needs
+# an address of its own; a probe pinned to 9091 would then read the FIRST agent's
+# status and report it as the second's. An empty/"0" address means the operator
+# disabled the endpoint deliberately, which is healthy, not broken.
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'addr="${QUASAR_HEALTH_ADDR-127.0.0.1:9091}"' \
+    '# Trim, to agree with the agent: addr_from_env() trims before deciding, so' \
+    '# a whitespace-only value disables the endpoint there and must here too.' \
+    'addr="$(printf %s "$addr" | tr -d "[:space:]")"' \
+    'if [ -z "$addr" ] || [ "$addr" = "0" ]; then exit 0; fi' \
+    'exec curl -fsS "http://$addr/health" -o /dev/null' \
+    > /usr/local/bin/quasar-node-agent-healthcheck \
+    && chmod 0755 /usr/local/bin/quasar-node-agent-healthcheck
+
 HEALTHCHECK --interval=30s --timeout=3s --start-period=15s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:9091/health || exit 1
+    CMD /usr/local/bin/quasar-node-agent-healthcheck
 
 ENTRYPOINT ["/usr/local/bin/quasar-node-agent-entrypoint"]
 
