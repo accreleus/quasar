@@ -69,6 +69,14 @@ const (
 	ReasonUpdaterUnreachable   = "updater_unreachable"
 	ReasonTimeout              = "timeout"
 	ReasonUnsupported          = "unsupported"
+
+	// Emitted by an updater with QUASAR_UPDATER_SIGNATURE_MODE on, which is off
+	// by default. Not yet in openapi.yaml's `ApplyFailureReason` enum — adding
+	// them is an additive amendment, Opus + sign-off; until then they travel the
+	// contract's own path for an unrecognised identifier, stored and rendered
+	// verbatim. Client copy: web/src/pages/admin/fleet/releasesCopy.ts.
+	ReasonSignatureMissing = "signature_missing"
+	ReasonSignatureInvalid = "signature_invalid"
 )
 
 // KnownFailureReason reports whether reason is one this build recognises. An
@@ -78,7 +86,8 @@ func KnownFailureReason(reason string) bool {
 	switch reason {
 	case ReasonUpdaterAbsentFailure, ReasonBusy, ReasonInvalid, ReasonNamespaceRejected,
 		ReasonDigestMalformed, ReasonPullFailed, ReasonRecreateFailed, ReasonNeverStarted,
-		ReasonUnhealthy, ReasonUpdaterUnreachable, ReasonTimeout, ReasonUnsupported:
+		ReasonUnhealthy, ReasonUpdaterUnreachable, ReasonTimeout, ReasonUnsupported,
+		ReasonSignatureMissing, ReasonSignatureInvalid:
 		return true
 	}
 	return false

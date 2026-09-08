@@ -24,6 +24,26 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+
+- Platform releases can be signed, and the updater can verify the signature
+  (#120). A release may now publish a second asset,
+  `platform-release-manifest.json.sig`: a detached ed25519 signature over the
+  release manifest's exact bytes, which covers every component image through the
+  digests the manifest already names. Hosts check it as a second gate beside the
+  registry-namespace allowlist, fetching the manifest and signature themselves so
+  a signature can never be supplied by the same party as the digests, and
+  refusing an apply whose signed manifest does not name the digests being asked
+  for. **Both halves are off by default and nothing changes for an existing
+  install**: publishing signs only once the `QUASAR_RELEASE_SIGNING_KEY` secret
+  exists, and hosts verify only once `QUASAR_UPDATER_SIGNATURE_MODE` is set to
+  `verify` or `require`. `verify` refuses a bad signature but accepts an unsigned
+  release, so a fleet can be configured before the first signed release exists;
+  `require` closes it. Several trusted keys at once make a key rotation a period
+  rather than a flag day. Operator procedure, including the CI secret to create
+  and how to rotate: `docs/upgrading.md` "Signing platform releases"; knobs in
+  `docs/configuration.md`; decision record in `docs/adr/0003-release-signatures.md`.
+
 ### Fixed
 
 - Sessions now survive a control-plane restart (#128), confirmed on a live 73 s

@@ -557,6 +557,141 @@ A prerelease tag (`v0.2.0-rc.1`) runs the same workflow and publishes a GitHub
 prerelease instead of a stable release — useful for exercising the publish
 lane before cutting the real version.
 
+---
+
+## Signing platform releases
+
+Optional, and off on both sides until someone turns it on. A release may publish
+a detached signature over its manifest, and a host may be configured to verify
+it before applying anything. Neither half changes what a release *is*: what gets
+installed is still the pinned digest (ADR 0001). The signature answers a
+different question — whether the digest set came from whoever holds the release
+key. Format: `scripts/release/platform-release-signature.md`. Decision record:
+`docs/adr/0003-release-signatures.md`.
+
+**What is signed is the manifest.** It names every component digest, so the
+signature covers the images through them. There is no per-image signature.
+
+### Turning it on: the publishing half
+
+Done once, by the maintainer who publishes releases.
+
+1. **Generate a key pair, off CI, on a machine you trust.** Not in the repo —
+   the script refuses to write inside the working tree.
+
+   ```bash
+   scripts/release/new-release-signing-key.sh \
+     --out ~/.config/quasar/release-signing-2026.pem \
+     --key-id quasar-release-2026
+   ```
+
+   It prints the public key as `quasar-release-2026:<base64>` and the exact
+   commands for step 2. Back the private key up somewhere you could restore a
+   release from; there is no recovery from losing it, only a rotation.
+
+2. **Create the CI secret and the label variable.** The *secret* holds the
+   private key, the *variable* holds its label:
+
+   ```bash
+   gh secret   set QUASAR_RELEASE_SIGNING_KEY    --repo <owner/name> < ~/.config/quasar/release-signing-2026.pem
+   gh variable set QUASAR_RELEASE_SIGNING_KEY_ID --repo <owner/name> --body 'quasar-release-2026'
+   ```
+
+   Both are required together: the release job fails loudly if the key is set
+   and the label is not, rather than publishing a signature nobody can name.
+
+3. **Cut a release as usual.** The `release` job signs the manifest right after
+   it validates it, verifies its own signature with the public half of the key
+   before uploading anything, and attaches
+   `platform-release-manifest.json.sig` beside the manifest. With no secret
+   configured the step prints one line and does nothing.
+
+4. **Check the release.** The asset should be there, and:
+
+   ```bash
+   gh release download vX.Y.Z --pattern 'platform-release-manifest.json*'
+   scripts/release/verify-platform-release-manifest.sh \
+     --manifest  platform-release-manifest.json \
+     --signature platform-release-manifest.json.sig \
+     --public-key quasar-release-2026:<base64>
+   ```
+
+### Turning it on: the verifying half
+
+Per host, in that stack's `deploy/.env`, then
+`docker compose up -d quasar-updater`.
+
+```bash
+QUASAR_UPDATER_SIGNATURE_MODE=verify
+QUASAR_UPDATER_TRUSTED_KEYS=quasar-release-2026:<base64 public key>
+```
+
+**Go through `verify` first, not straight to `require`.** In `verify` a bad
+signature is refused and a release that publishes none is not, so a fleet can be
+configured before the first signed release exists, and again after it, with
+nothing breaking in between. Once every release you intend to apply is signed:
+
+```bash
+QUASAR_UPDATER_SIGNATURE_MODE=require
+```
+
+Confirm what a host is actually doing:
+
+```bash
+curl --unix-socket /run/quasar-updater/updater.sock http://u/v1/self | jq '{signature_mode, trusted_key_ids, manifest_source}'
+```
+
+The full mode/outcome matrix, and the two things `require` refuses that `verify`
+does not, are in `docs/configuration.md` "Release signature verification". The
+important one: **under `require`, a revert to a build this instance can no
+longer name by release is refused**, because there is no published manifest to
+have signed it. Drop that host to `verify` for the revert, or use the manual
+recipe.
+
+### Rotating the key
+
+Both sides are lists, which is what makes this a period rather than a flag day.
+Never a same-day swap.
+
+1. **Generate the new key** (`--key-id quasar-release-2027`) and add its public
+   half to `QUASAR_UPDATER_TRUSTED_KEYS` on every host, *alongside* the old one:
+
+   ```bash
+   QUASAR_UPDATER_TRUSTED_KEYS=quasar-release-2026:<old>,quasar-release-2027:<new>
+   ```
+
+   Recreate each `quasar-updater` and confirm both labels in `/v1/self`. Nothing
+   has changed about which releases verify; the fleet has simply widened.
+
+2. **Sign the next release with both keys.** Set the CI secret and variable to
+   the new key, and sign with the old one as well by passing the previous
+   document to `--append`:
+
+   ```bash
+   scripts/release/sign-platform-release-manifest.sh \
+     --manifest platform-release-manifest.json --output platform-release-manifest.json.sig \
+     --key-id quasar-release-2027 --key-file <new key>
+   scripts/release/sign-platform-release-manifest.sh \
+     --manifest platform-release-manifest.json --output platform-release-manifest.json.sig \
+     --key-id quasar-release-2026 --key-file <old key> --append platform-release-manifest.json.sig
+   ```
+
+   A dual-signed release verifies on a host that trusts either key, so a host
+   that has not been updated yet is not stranded.
+
+3. **Drop the old key** from `QUASAR_UPDATER_TRUSTED_KEYS` on every host, once
+   every host carries the new one and every release you might still want to
+   apply or revert to is signed by it. Then stop passing `--append`.
+
+4. **Destroy the old private key.**
+
+If a key is **compromised** rather than rotated on schedule, step 3 comes first
+and immediately — remove it from every host — and any release signed only by it
+must be re-signed with the new key and its `.sig` asset replaced (the workflow
+uploads with `--clobber`, and `gh release upload` by hand does the same). Until
+a host has the new key, its applies fail closed with `signature_invalid`, which
+is the correct outcome.
+
 ## See also
 
 - [`../CHANGELOG.md`](../CHANGELOG.md): what changed in each released version

@@ -16,7 +16,7 @@ import (
 // The handlers are exercised over a REAL unix socket, because the socket is the
 // interface: its existence and its 0666 mode are what the agent and the control
 // plane depend on, and neither is visible through an httptest server.
-func serveOnSocket(t *testing.T, f *fakeEnv) *http.Client {
+func serveOnSocket(t *testing.T, f *fakeEnv, opts ...func(*Server)) *http.Client {
 	t.Helper()
 	// A socket path is capped at ~104 bytes on some platforms; t.TempDir() under
 	// a long test name can exceed it, so the socket lives in its own short dir.
@@ -28,6 +28,9 @@ func serveOnSocket(t *testing.T, f *fakeEnv) *http.Client {
 	sock := filepath.Join(dir, "u.sock")
 
 	srv := &Server{Store: f.store, Docker: f.docker, Cfg: f.cfg(), EnvPath: f.envPath, Version: "test"}
+	for _, opt := range opts {
+		opt(srv)
+	}
 	ln, err := Listen(sock)
 	if err != nil {
 		t.Fatal(err)

@@ -3217,6 +3217,10 @@ fi
 # Release publication must wait for every image advertised in its install footer.
 rc_of 0 "release:publication-dependencies" -- bash "$ROOT/scripts/release/test-release-publication-gate.sh"
 
+# The detached release signature: the shell producer must write what the
+# updater's Go verifier accepts, and refuse a tampered manifest or a wrong key.
+rc_of 0 "release:signature-contract" -- bash "$ROOT/scripts/release/test-platform-release-signature.sh"
+
 printf '\n== test-db runner selection (#125) ==\n'
 # make test-db must work on a host with no Go toolchain outside containers --
 # every fleet host. The Postgres side was already ephemeral and per-worktree;

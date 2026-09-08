@@ -299,6 +299,20 @@ notes and the digests cannot disagree. _Avoid_: "release body" (the notes are
 for people; the manifest is what the control plane reads), "catalog manifest"
 (that is the app catalog's file).
 
+**Release signature** — a detached signature over a release manifest's bytes,
+published beside it. It covers the images through the digests the manifest
+already names, so there is no per-image signature. Optional on both sides: a
+release may carry none, and a host may check none. _Avoid_: "signed image" (no
+image is signed), "attestation" (that is a different artifact with a different
+producer).
+
+**Trusted release key** — a public key a HOST has been configured to accept
+release signatures from. A host may trust several at once, which is what makes a
+key rotation a period rather than a flag day. The label beside a key is for
+people; any signature by any trusted key verifies. _Avoid_: "signing key" for
+the public half (the signing key is private and lives only in the release
+pipeline), "certificate" (there is no chain and no expiry).
+
 **Updater** — the per-host actor that pulls a platform release and recreates the
 containers it replaces, because a container cannot recreate itself. It acts only
 when told to, and only on the stack it sits beside. _Avoid_: "sidecar" in

@@ -49,7 +49,11 @@ LABEL org.quasar.image.role="updater" \
 # it (control.prod has curl and no wget, control has wget and no curl), busybox
 # wget cannot speak a unix socket at all, and the probe must work on both a
 # source-built and a registry host. deploy/image-contract.json asserts it.
-RUN apk add --no-cache curl
+#
+# ca-certificates: the updater fetches a release's signed manifest over HTTPS
+# when signature verification is on (docs/configuration.md). curl already pulls
+# the bundle in transitively; naming it makes that non-accidental.
+RUN apk add --no-cache curl ca-certificates
 
 COPY --from=builder /quasar-updater /usr/local/bin/quasar-updater
 
