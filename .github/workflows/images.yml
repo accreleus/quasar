@@ -1399,6 +1399,11 @@ jobs:
           # docs/upgrading.md "Signing platform releases".
           QUASAR_RELEASE_SIGNING_KEY: ${{ secrets.QUASAR_RELEASE_SIGNING_KEY }}
           KEY_ID: ${{ vars.QUASAR_RELEASE_SIGNING_KEY_ID }}
+          # The outgoing key during a rotation. Both set = the release is signed
+          # by both, which is what lets hosts move over one at a time
+          # (docs/upgrading.md "Rotating the key"). Unset in normal operation.
+          PREVIOUS_KEY: ${{ secrets.QUASAR_RELEASE_SIGNING_KEY_PREVIOUS }}
+          PREVIOUS_KEY_ID: ${{ vars.QUASAR_RELEASE_SIGNING_KEY_ID_PREVIOUS }}
           MANIFEST: ${{ steps.manifest.outputs.path }}
         run: |
           set -euo pipefail
@@ -1419,6 +1424,26 @@ jobs:
             --manifest "$MANIFEST" \
             --output "$MANIFEST.sig" \
             --key-id "$KEY_ID"
+          signed_by="$KEY_ID"
+
+          if [ -n "${PREVIOUS_KEY:-}" ]; then
+            if [ -z "${PREVIOUS_KEY_ID:-}" ]; then
+              echo "::error::QUASAR_RELEASE_SIGNING_KEY_PREVIOUS is set but QUASAR_RELEASE_SIGNING_KEY_ID_PREVIOUS is not."
+              exit 1
+            fi
+            # --append carries the first signature over, so the asset ends up
+            # with one entry per key rather than the second replacing the first.
+            printf '%s\n' "$PREVIOUS_KEY" > "$RUNNER_TEMP/previous.pem"
+            chmod 600 "$RUNNER_TEMP/previous.pem"
+            bash scripts/release/sign-platform-release-manifest.sh \
+              --manifest "$MANIFEST" \
+              --output "$MANIFEST.sig" \
+              --key-id "$PREVIOUS_KEY_ID" \
+              --key-file "$RUNNER_TEMP/previous.pem" \
+              --append "$MANIFEST.sig"
+            rm -f "$RUNNER_TEMP/previous.pem"
+            signed_by="$KEY_ID, $PREVIOUS_KEY_ID"
+          fi
 
           echo "path=$MANIFEST.sig" >> "$GITHUB_OUTPUT"
           {
@@ -1426,7 +1451,7 @@ jobs:
             echo ""
             echo "| field | value |"
             echo "| --- | --- |"
-            echo "| key_id | \`$KEY_ID\` |"
+            echo "| signed by | \`$signed_by\` |"
             echo "| asset | \`platform-release-manifest.json.sig\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 

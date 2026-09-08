@@ -663,25 +663,27 @@ Never a same-day swap.
    Recreate each `quasar-updater` and confirm both labels in `/v1/self`. Nothing
    has changed about which releases verify; the fleet has simply widened.
 
-2. **Sign the next release with both keys.** Set the CI secret and variable to
-   the new key, and sign with the old one as well by passing the previous
-   document to `--append`:
+2. **Sign the next releases with both keys.** Move the *new* key into the
+   primary secret and the *old* one into the previous-key pair; the release job
+   signs with both when both are set, and the asset carries one entry per key:
 
    ```bash
-   scripts/release/sign-platform-release-manifest.sh \
-     --manifest platform-release-manifest.json --output platform-release-manifest.json.sig \
-     --key-id quasar-release-2027 --key-file <new key>
-   scripts/release/sign-platform-release-manifest.sh \
-     --manifest platform-release-manifest.json --output platform-release-manifest.json.sig \
-     --key-id quasar-release-2026 --key-file <old key> --append platform-release-manifest.json.sig
+   gh secret   set QUASAR_RELEASE_SIGNING_KEY             --repo <owner/name> < <new key>
+   gh variable set QUASAR_RELEASE_SIGNING_KEY_ID          --repo <owner/name> --body 'quasar-release-2027'
+   gh secret   set QUASAR_RELEASE_SIGNING_KEY_PREVIOUS    --repo <owner/name> < <old key>
+   gh variable set QUASAR_RELEASE_SIGNING_KEY_ID_PREVIOUS --repo <owner/name> --body 'quasar-release-2026'
    ```
 
    A dual-signed release verifies on a host that trusts either key, so a host
-   that has not been updated yet is not stranded.
+   that has not been updated yet is not stranded. Signing an existing release's
+   manifest by hand does the same thing —
+   `sign-platform-release-manifest.sh … --append <the existing .sig>` — followed
+   by `gh release upload <tag> platform-release-manifest.json.sig --clobber`.
 
 3. **Drop the old key** from `QUASAR_UPDATER_TRUSTED_KEYS` on every host, once
    every host carries the new one and every release you might still want to
-   apply or revert to is signed by it. Then stop passing `--append`.
+   apply or revert to is signed by it. Then delete
+   `QUASAR_RELEASE_SIGNING_KEY_PREVIOUS` and its label variable.
 
 4. **Destroy the old private key.**
 
