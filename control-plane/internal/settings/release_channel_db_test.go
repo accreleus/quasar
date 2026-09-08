@@ -53,6 +53,33 @@ func TestPatchReleaseChannelAndBranch(t *testing.T) {
 	}
 }
 
+// Beta is a third value the migration-0079 CHECK must accept, and the branch it
+// never uses must survive the round trip.
+func TestPatchReleaseChannelBeta(t *testing.T) {
+	pool := testDB(t)
+	patch, get := newSettingsHarness(t, pool)
+
+	code, env := patch(t, `{"release_edge_branch":"feat/x"}`)
+	if code != 200 {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	code, env = patch(t, `{"release_channel":"beta"}`)
+	if code != 200 {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if env.Settings.ReleaseChannel != ReleaseChannelBeta || env.Settings.ReleaseEdgeBranch != "feat/x" {
+		t.Fatalf("settings = %+v, want beta / feat/x", env.Settings)
+	}
+	if get(t).Settings.ReleaseChannel != ReleaseChannelBeta {
+		t.Fatal("the switch to beta did not persist")
+	}
+
+	code, _ = patch(t, `{"release_channel":"stable"}`)
+	if code != 200 || get(t).Settings.ReleaseChannel != ReleaseChannelStable {
+		t.Fatalf("the switch back to stable did not persist: %d", code)
+	}
+}
+
 func TestPatchReleaseValidationFailures(t *testing.T) {
 	pool := testDB(t)
 	patch, get := newSettingsHarness(t, pool)

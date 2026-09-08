@@ -287,10 +287,13 @@ source checkout), "image version" (that is the catalog term), "build" (a build
 may never be published).
 
 **Channel** — which platform releases an admin is shown. `stable` is a tagged,
-noted release; `edge` is whatever was last published from a branch, with no
-notes. An instance follows one channel at a time. _Avoid_: "track", "branch"
-(edge follows a branch, but a channel is the admin-facing choice, not the git
-object).
+noted release; `beta` is those and the prereleases among them; `edge` is
+whatever was last published from a branch, with no notes. An instance follows
+one channel at a time. Beta stores no releases of its own — it lists the ones
+stable hides — so a switch selects differently rather than fetching again.
+_Avoid_: "track", "branch" (edge follows a branch, but a channel is the
+admin-facing choice, not the git object), "unstable" (that is `develop`, which
+is what `edge` follows).
 
 **Release manifest** — the machine-readable description of one stable platform
 release: which component images it contains, by digest, and the commit they were

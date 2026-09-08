@@ -141,6 +141,7 @@ func ValidLibraryDiscoveryIntervalMinutes(n int) bool {
 const (
 	ReleaseChannelStable = "stable"
 	ReleaseChannelEdge   = "edge"
+	ReleaseChannelBeta   = "beta"
 
 	DefaultReleaseEdgeBranch = "develop"
 
@@ -151,7 +152,7 @@ const (
 // ValidReleaseChannel mirrors the instance_settings CHECK so the PATCH handler
 // answers 400 validation_failed instead of a database error.
 func ValidReleaseChannel(c string) bool {
-	return c == ReleaseChannelStable || c == ReleaseChannelEdge
+	return c == ReleaseChannelStable || c == ReleaseChannelEdge || c == ReleaseChannelBeta
 }
 
 // ValidReleaseEdgeBranch enforces the contract's ref-name rule: non-empty, at

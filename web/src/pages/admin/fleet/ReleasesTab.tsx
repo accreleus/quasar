@@ -77,6 +77,7 @@ const DETECT_JOB_ID = "platform.release_detect";
 
 const CHANNEL_OPTIONS: { value: ReleaseChannel; label: string }[] = [
   { value: "stable", label: "Stable" },
+  { value: "beta", label: "Beta" },
   { value: "edge", label: "Edge" },
 ];
 
@@ -318,8 +319,7 @@ function ReleaseFeed({ view }: { view: PlatformReleaseView }) {
       {view.available.length === 0 ? (
         <Card className="card-pad mb4">
           <p className="muted">
-            Nothing at or above this control plane's schema has been detected on the {view.channel}{" "}
-            channel.
+            Nothing newer than this control plane has been detected on the {view.channel} channel.
           </p>
         </Card>
       ) : (
@@ -553,9 +553,16 @@ function ChannelCard({ view, onSaved }: { view: PlatformReleaseView; onSaved: ()
         onChange={(value) => void save.run({ release_channel: value })}
       />
       <p className="hint mt2">
-        Stable follows tagged releases with notes; edge follows a branch. Switching changes what is
-        listed, never what is installed, and never starts a check.
+        Stable follows tagged releases with notes; beta adds the pre-releases among them; edge
+        follows a branch. Switching changes what is listed, never what is installed, and never
+        starts a check.
       </p>
+      {view.channel === "beta" && (
+        <p className="hint mt2">
+          Leaving beta never rolls this instance back: it stays on its pre-release until a stable
+          release passes it.
+        </p>
+      )}
       <div className="mt3" style={{ opacity: view.channel === "edge" ? 1 : 0.6 }}>
         <TextField
           label="Edge branch"

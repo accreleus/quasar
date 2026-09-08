@@ -269,7 +269,7 @@ func (h *ApplyHandler) revertInputs(ctx context.Context, view View, hostID strin
 	if cpCommit := view.Installed.ControlPlane.SourceCommit; cpCommit != nil {
 		// With no row for the control plane, ordersAbove falls back to
 		// schema_version, the key that always exists.
-		in.ControlPlaneRelease = matchRelease(view.Available, view.Channel, *cpCommit)
+		in.ControlPlaneRelease = matchRelease(view.Available, rowChannel(view.Channel), *cpCommit)
 	}
 	last, err := h.store.LastSucceededAttempt(ctx, hostID)
 	if errors.Is(err, ErrAttemptNotFound) {

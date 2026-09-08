@@ -102,6 +102,38 @@ without them).
 | `QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL` | unset; job default `168h` (7 days) | Standard job `EnvOverride` for `platform.release_detect`, which by default runs weekly inside a one-hour window opening 02:00 Monday UTC. A Go duration that is authoritative over the admin Jobs page while set; `0` stops the job being scheduled at all. "Check now" (`POST /v1/admin/jobs/platform.release_detect/run`) bypasses the window as it does for every job. |
 | `QUASAR_TELEMETRY_RETAIN_INTERVAL` | unset; job default `5m` | How often the `telemetry.retain` job applies the two rules above. A standard job `EnvOverride`: a Go duration that is **authoritative over the admin Jobs page** while it is set (and shown as env-locked there), `0` is the kill switch that stops the job being scheduled at all, and a malformed value falls back to the job row rather than failing startup. One pass deletes in bounded batches, logs one `INFO` line with the counts, and `WARN`s if it took over 30s or could not drain its backlog. **This job is the only thing that deletes session telemetry** — no ingest path prunes, and reaching a terminal state prunes nothing, so with it disabled telemetry grows without bound. |
 
+### Platform release channel (`release_channel`, admin setting, not an env var)
+
+Which platform releases the admin console offers is an **instance setting**, not a
+knob in `deploy/.env`: Admin › Fleet › Releases › Channel, stored in
+`instance_settings.release_channel` and settable through
+`PATCH /v1/admin/settings`. Accepted values, **default `stable`**; anything else
+is `400 validation_failed`:
+
+| Value | What it offers | Source |
+|---|---|---|
+| `stable` | tagged releases with notes, **prereleases excluded** | GitHub Releases + the `platform-release-manifest.json` asset |
+| `beta` | the same tagged releases **and the prereleases among them** | the same — beta stores no rows of its own, it lists the ones stable hides |
+| `edge` | whatever was last published from `release_edge_branch` (default `develop`), with no notes | the registry (`QUASAR_PLATFORM_REGISTRY`), by image label |
+
+Switching channels **changes what is listed, never what is installed**, and never
+starts a check — detection is the `platform.release_detect` job, and "Check now"
+is that job's run-now action. `release_edge_branch` is stored and validated
+whatever the channel is, and selects nothing on `stable` or `beta`.
+
+**Ordering on `beta` is SemVer precedence, not publication order.** `available`
+is ordered by `schema_version`, then SemVer 2.0.0 §11 precedence, then
+`built_at`: `0.2.0-rc.2` is below `0.2.0`, which is below `0.2.1-rc.1`, and
+`0.3.0-rc.9` is below `0.3.0-rc.10`. Beta is the only channel that needs this,
+because an rc cut from `develop` and a patch cut from `main` arrive out of
+version order.
+
+**Leaving `beta` never rolls the instance back.** A release whose version orders
+below an installed prerelease at the same schema version is not listed on any
+channel, so an instance on `0.3.0-rc.1` that switches to `stable` is offered
+nothing until `0.3.0` ships — every target reads `no_release` and the instance
+stays where it is. See `docs/upgrading.md` "Release channels".
+
 ### Encrypted secrets — the master key, and what losing it costs
 
 Operator credentials that are set from the **admin UI** (today: the SteamGridDB

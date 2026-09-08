@@ -146,7 +146,7 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ReleaseChannel != nil && !ValidReleaseChannel(*req.ReleaseChannel) {
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,
-			"release_channel must be stable or edge")
+			"release_channel must be stable, beta, or edge")
 		return
 	}
 	if req.ReleaseEdgeBranch != nil && !ValidReleaseEdgeBranch(*req.ReleaseEdgeBranch) {

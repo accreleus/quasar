@@ -119,7 +119,8 @@ func (h *Handler) releaseView(ctx context.Context) (View, error) {
 	if err != nil {
 		return View{}, err
 	}
-	releases, err := h.deps.Releases(ctx, channel)
+	// rowChannel, not channel: beta selects the stable channel's rows (#121).
+	releases, err := h.deps.Releases(ctx, rowChannel(channel))
 	if err != nil {
 		return View{}, err
 	}

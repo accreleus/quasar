@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
+	"github.com/accreleus/quasar/control-plane/internal/semver"
 )
 
 // Everything the release view decides, decided in one pure function.
@@ -84,7 +85,9 @@ func PlanRelease(in PlanInputs) View {
 		},
 		Available: available,
 		Targets:   targets(available, in.ControlPlane, hosts, open, fleet),
-		Faults:    faults(in.Releases, channel, in.ControlPlane, hosts),
+		// Faults are read off the rows the channel SELECTS, which on beta are
+		// the stable channel's (rowChannel).
+		Faults: faults(in.Releases, rowChannel(channel), in.ControlPlane, hosts),
 		// Always serialized, `null` when nothing is in flight: null is the
 		// answer, not the absence of one.
 		ActiveApply: activeApply(in.ActiveRun, in.OpenAttempts),
@@ -127,29 +130,39 @@ func activeApply(run *ApplyRun, attempts []Attempt) *ActiveApply {
 	return &ActiveApply{Run: run, Attempts: attempts}
 }
 
-// offerable applies the three listing rules and the ordering: schema_version
-// then built_at, both DESC (ADR 0002). The built_at tiebreak matters because
-// edge produces many builds at one schema_version; id keeps a list stable
-// across reads rather than dependent on the scan order.
+// offerable applies the listing rules and the ordering: schema_version then
+// built_at, both DESC (ADR 0002). The built_at tiebreak matters because edge
+// produces many builds at one schema_version; id keeps a list stable across
+// reads rather than dependent on the scan order.
+//
+// Beta inserts semver precedence between those two keys, and only beta: it is
+// the only channel whose rows can arrive out of version order, because an rc is
+// cut from `develop` while a patch is cut from `main`, so 0.3.0-rc.1 can be
+// built before the 0.2.5 that orders below it. Edge builds have no version at
+// all.
 func offerable(rows []Release, channel string, cp buildinfo.Identity) []Release {
+	source := rowChannel(channel)
 	out := make([]Release, 0, len(rows))
 	for _, r := range rows {
-		if r.Channel != channel {
+		if r.Channel != source {
 			continue
 		}
 		// ADR 0002: a downgrade must be unrepresentable, not merely discouraged.
 		if r.SchemaVersion < cp.SchemaVersion {
 			continue
 		}
-		if channel == ChannelStable {
-			// Prereleases exist to be exercised; stable ignores them.
-			if r.Prerelease {
-				continue
-			}
-			// Nothing to pin it by (ADR 0001).
-			if len(r.Manifest) == 0 {
-				continue
-			}
+		if belowInstalledVersion(r, cp) {
+			continue
+		}
+		// Prereleases exist to be exercised; stable ignores them. Beta is the
+		// channel that does not.
+		if channel == ChannelStable && r.Prerelease {
+			continue
+		}
+		// Nothing to pin it by (ADR 0001). Edge is exempt because it publishes
+		// no manifest at all and resolves its digests at apply time.
+		if channel != ChannelEdge && len(r.Manifest) == 0 {
+			continue
 		}
 		out = append(out, r)
 	}
@@ -158,12 +171,60 @@ func offerable(rows []Release, channel string, cp buildinfo.Identity) []Release 
 		if a.SchemaVersion != b.SchemaVersion {
 			return a.SchemaVersion > b.SchemaVersion
 		}
+		if channel == ChannelBeta {
+			if c, ok := comparePrecedence(a.Version, b.Version); ok && c != 0 {
+				return c > 0
+			}
+		}
 		if !a.BuiltAt.Equal(b.BuiltAt) {
 			return a.BuiltAt.After(b.BuiltAt)
 		}
 		return a.ID > b.ID
 	})
 	return out
+}
+
+// comparePrecedence orders two release versions by SemVer 2.0.0 §11 precedence.
+// ok=false when either is absent or does not parse, which is the caller's cue to
+// fall back to built_at rather than to invent an order.
+func comparePrecedence(a, b *string) (int, bool) {
+	if a == nil || b == nil {
+		return 0, false
+	}
+	va, okA := semver.ParseFull(*a)
+	vb, okB := semver.ParseFull(*b)
+	if !okA || !okB {
+		return 0, false
+	}
+	return semver.ComparePrecedence(va, vb), true
+}
+
+// belowInstalledVersion is the switch-back rule: no channel offers a build that
+// orders below the installed one, so leaving beta waits for stable to catch up
+// rather than rolling the control plane back. Filtered here, not answered as an
+// eligibility reason, so the downgrade is unrepresentable: it never reaches
+// available[0] and apply_handler.offered reads the same list.
+//
+// Scoped to an installed PRERELEASE, which is the only way an install can be
+// above what its channel lists — `make release` cuts stable versions
+// monotonically from a clean `main` — so stable and edge see no change. Edge
+// rows carry no version; edgeOlderThanInstalled covers them. Equal
+// schema_version only: a newer schema still wins (ADR 0002).
+func belowInstalledVersion(r Release, cp buildinfo.Identity) bool {
+	if r.Version == nil || r.SchemaVersion != cp.SchemaVersion {
+		return false
+	}
+	installed, ok := semver.ParseFull(cp.Version)
+	if !ok || !installed.IsPrerelease() {
+		return false
+	}
+	candidate, ok := semver.ParseFull(*r.Version)
+	if !ok {
+		return false
+	}
+	// Strictly below: the equal version is the one the instance is running, and
+	// must stay listed for up_to_date to be evaluated against it.
+	return semver.ComparePrecedence(candidate, installed) < 0
 }
 
 // withDerivedIdentity fills identity_known, which is served, never re-derived.
@@ -310,14 +371,16 @@ func hostReason(newest *Release, cp buildinfo.Identity, h HostIdentity, attemptO
 // no trustworthy commit, built_at or schema_version, all three NOT NULL, so the
 // release is never stored and the detector reports the broken publish in its own
 // run record instead of inventing an identity (detect.go).
-func faults(rows []Release, channel string, cp buildinfo.Identity, hosts []HostIdentity) []Fault {
+// `source` is the platform_releases.channel value the instance's channel reads
+// (rowChannel), not the channel name itself: on beta those are not the same.
+func faults(rows []Release, source string, cp buildinfo.Identity, hosts []HostIdentity) []Fault {
 	out := make([]Fault, 0)
 
 	// What "above the control plane" is measured against, when it is known.
 	var cpRelease *Release
 	if cp.SourceCommit != nil {
 		for i := range rows {
-			if rows[i].Channel == channel && commitsMatch(rows[i].SourceCommit, *cp.SourceCommit) {
+			if rows[i].Channel == source && commitsMatch(rows[i].SourceCommit, *cp.SourceCommit) {
 				cpRelease = &rows[i]
 				break
 			}
@@ -336,7 +399,7 @@ func faults(rows []Release, channel string, cp buildinfo.Identity, hosts []HostI
 			})
 			continue
 		}
-		hostRelease := matchRelease(rows, channel, *h.SourceCommit)
+		hostRelease := matchRelease(rows, source, *h.SourceCommit)
 		// Unordered is not ahead: a commit matching no known release raises nothing.
 		if hostRelease == nil || !ordersAbove(*hostRelease, cpRelease, cp) {
 			continue
@@ -354,10 +417,11 @@ func faults(rows []Release, channel string, cp buildinfo.Identity, hosts []HostI
 	return out
 }
 
-// matchRelease finds the channel's row for a commit, tolerating a short one.
-func matchRelease(rows []Release, channel, commit string) *Release {
+// matchRelease finds the row for a commit among those a channel reads,
+// tolerating a short commit. `source` is a rowChannel value, never a raw channel.
+func matchRelease(rows []Release, source, commit string) *Release {
 	for i := range rows {
-		if rows[i].Channel == channel && commitsMatch(rows[i].SourceCommit, commit) {
+		if rows[i].Channel == source && commitsMatch(rows[i].SourceCommit, commit) {
 			return &rows[i]
 		}
 	}

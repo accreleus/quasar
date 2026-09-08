@@ -24,6 +24,25 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+
+- A **beta release channel** (#121). Admin ▸ Fleet ▸ Releases now offers a third
+  channel between stable and edge: beta lists the same tagged releases stable
+  does **and the prereleases among them**, so a release candidate can be applied
+  from the console through exactly the path a stable release takes. Beta stores
+  no releases of its own — a prerelease was already detected and cached, stable
+  simply hides it — so switching to or from it re-detects nothing and writes
+  nothing (migration 0079 widens one `CHECK`). Two rules come with it. Ordering
+  on beta is **SemVer precedence**, not publication order, because an rc cut from
+  `develop` and a patch cut from `main` arrive out of version order
+  (`0.2.0-rc.2` < `0.2.0` < `0.2.1-rc.1`; `0.3.0-rc.9` < `0.3.0-rc.10`). And
+  **leaving beta never rolls an instance back**: a release whose version orders
+  below an installed prerelease at the same schema version is not offered on any
+  channel, so an instance on `0.3.0-rc.1` that switches to stable waits, showing
+  `no_release`, until `0.3.0` ships. Contract: `control-api.md` §Platform-release
+  beta channel (amendment 3). Operator guide: `docs/upgrading.md` "Release
+  channels".
+
 ### Fixed
 
 - Sessions now survive a control-plane restart (#128), confirmed on a live 73 s
