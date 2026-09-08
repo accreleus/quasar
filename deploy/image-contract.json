@@ -206,7 +206,10 @@
       },
 
       "paths": {
-        "required": ["/usr/local/bin/quasar-updater"],
+        "required": ["/usr/local/bin/quasar-updater", "/etc/ssl/certs/ca-certificates.crt"],
+        "_required_notes": {
+          "/etc/ssl/certs/ca-certificates.crt": "Go's x509 reads this. With QUASAR_UPDATER_SIGNATURE_MODE on, the updater fetches a release's signed manifest over HTTPS; with no CA bundle every fetch fails and the gate reports signature_invalid, so nothing applies at all."
+        },
         "forbidden": ["/go", "/usr/local/go", "/src"]
       },
 
