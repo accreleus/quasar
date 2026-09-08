@@ -55,6 +55,11 @@ type Config struct {
 	// (silently fail-closed, inverting the intended fail-open). 0 omits the
 	// clause: admission becomes slots-only.
 	VramMinFreeMB int32 // QUASAR_VRAM_MIN_FREE_MB (default 1024)
+	// SessionGraceSecs is how long a silent host keeps its sessions before the
+	// stale sweep gives up on them (#128). It must exceed the AGENT's own grace
+	// plus its maximum reconnect backoff (30 s), or the control plane
+	// terminalises sessions the agent is still holding and would re-report.
+	SessionGraceSecs int32 // QUASAR_SESSION_GRACE_SECS (default 120)
 	// Debit for launches no sample reflects yet; split from the floor.
 	VramInflightEstimateMB int32 // QUASAR_VRAM_INFLIGHT_ESTIMATE_MB (default = floor)
 	// Freshness window (older sample => the veto abstains) and the in-flight
@@ -286,6 +291,11 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	c.VramMinFreeMB = minFree
+	grace, err := envInt32("QUASAR_SESSION_GRACE_SECS", 120, 0)
+	if err != nil {
+		return nil, err
+	}
+	c.SessionGraceSecs = grace
 	inflight, err := envInt32("QUASAR_VRAM_INFLIGHT_ESTIMATE_MB", minFree, 0)
 	if err != nil {
 		return nil, err

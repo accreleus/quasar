@@ -225,6 +225,76 @@ func (c *Coordinator) failSession(sessionID, reason string) {
 	c.failSessionWithDetail(sessionID, reason, nil)
 }
 
+// AgentHeartbeat reconciles this host against the agent's own list of running
+// sessions (#128; agent-api.md §"Reconnection & reconciliation"). It is the
+// other half of the grace window: the agent may keep sessions alive across a
+// control-plane restart, so the control plane must LEARN which survived instead
+// of assuming none did.
+//
+// Forward: a `running` row the agent no longer names is gone. Only `running` is
+// judged. A row reaches running only after the agent itself reported it
+// (agent_state.go), so a running row the agent has dropped is genuinely dead,
+// and assigned/starting rows belong to a launch in flight — the agent inserts a
+// session into its map at the session_start ack, BEFORE it reports running, so
+// it legitimately lists ids we still have as starting.
+//
+// Reverse: the agent runs something we have no running row for. Left alone that
+// is an orphaned container holding a GPU. The runner's own idle reaper bounds it
+// for ordinary sessions but is disabled for console sessions, so it would be
+// unbounded on a console host.
+//
+// Dispatched with Send, NEVER SendWithAck: this runs synchronously inside the
+// agent websocket read loop, and that same loop is what would have to read the
+// ack — so an ack here could only ever time out.
+func (c *Coordinator) AgentHeartbeat(ctx context.Context, hostID string, running []string) {
+	rows, err := c.store.RunningSessionIDsOnHost(ctx, hostID)
+	if err != nil {
+		c.log.Warn("heartbeat reconcile: list running sessions failed", "host_id", hostID, "err", err)
+		return
+	}
+
+	cpRunning := make(map[string]struct{}, len(rows))
+	for _, id := range rows {
+		cpRunning[id] = struct{}{}
+	}
+	live := make(map[string]struct{}, len(running))
+	for _, id := range running {
+		live[id] = struct{}{}
+	}
+
+	for _, sid := range rows {
+		if _, ok := live[sid]; ok {
+			continue
+		}
+		detail := "host_lost"
+		c.failSessionWithDetail(sid, "agent no longer running this session", &detail)
+	}
+
+	for sid := range live {
+		if _, ok := cpRunning[sid]; ok {
+			continue
+		}
+		hs, err := c.store.GetSessionHostState(ctx, sid)
+		switch {
+		case errors.Is(err, ErrNotFound):
+			// Unknown to us entirely: stop it.
+		case err != nil:
+			continue
+		case hs.State == StateAssigned || hs.State == StateStarting:
+			// A launch in flight on this connection; not an orphan.
+			continue
+		case hs.HostID != nil && *hs.HostID != hostID:
+			c.log.Warn("agent reports another host's session; stopping its copy",
+				"host_id", hostID, "session_id", sid)
+		}
+		cmd := agentws.SessionStopCmd{Type: "session_stop", ID: newCmdID(), SessionID: sid, Reason: "error"}
+		if err := c.dispatcher.Send(hostID, cmd); err != nil {
+			c.log.Warn("heartbeat reconcile: stop dispatch failed",
+				"host_id", hostID, "session_id", sid, "err", err)
+		}
+	}
+}
+
 // failSessionWithDetail also stamps state_detail, as the host_lost reap edge
 // does: web/src/lib/streamHealth.ts keys the client banner on a state_detail
 // prefix, not on error_message. A nil detail leaves it untouched (COALESCE).

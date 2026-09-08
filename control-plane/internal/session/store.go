@@ -751,6 +751,59 @@ func (s *Store) ReapHost(ctx context.Context, hostID, reason string) (int64, err
 	return tag.RowsAffected(), nil
 }
 
+// ReapHostExceptRunning fails a host's non-terminal sessions EXCEPT the
+// `running` ones (#128).
+//
+// A row reaches `running` only after the agent itself reported it (state.go), so
+// on reconnect it is the agent's heartbeat — not this function — that decides
+// whether it survived. Everything else non-terminal (assigned, starting,
+// stopping) was mid-flight in a goroutine that died with the old connection and
+// has no owner left to finish it, so it is failed here as before.
+//
+// The `running` exclusion is the whole point: reaping those was one of the three
+// independent reasons a session died on a control-plane restart.
+func (s *Store) ReapHostExceptRunning(ctx context.Context, hostID, reason string) (int64, error) {
+	if !isValidUUID(hostID) {
+		return 0, nil // no such host's sessions to reap
+	}
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE sessions SET
+		    state         = 'failed',
+		    state_detail  = 'host_lost',
+		    error_message = $2,
+		    ended_at      = now()
+		WHERE host_id = $1::uuid
+		  AND state NOT IN ('stopped','failed','running')
+	`, hostID, reason)
+	if err != nil {
+		return 0, fmt.Errorf("reap host sessions except running: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// RunningSessionIDsOnHost lists only the `running` rows — the exact set the
+// agent's heartbeat is authoritative over (#128).
+func (s *Store) RunningSessionIDsOnHost(ctx context.Context, hostID string) ([]string, error) {
+	if !isValidUUID(hostID) {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT id::text FROM sessions WHERE host_id = $1::uuid AND state = 'running'`, hostID)
+	if err != nil {
+		return nil, fmt.Errorf("list running sessions on host: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("list running sessions on host: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // Host mirrors the schema.md `hosts` columns; the response DTO is built from it.
 type Host struct {
 	ID             string
@@ -761,6 +814,35 @@ type Host struct {
 	MemMB          *int32
 	LastRegistered *time.Time
 	LastHeartbeat  *time.Time
+}
+
+// HostsWithActiveSessions lists every host that still owns a non-terminal
+// session, with the heartbeat stamp the stale-host sweep measures from (#128).
+//
+// LastHeartbeat is nullable and IS null for a host that has never heartbeated,
+// so the caller must fall back to the control plane's own boot time rather than
+// treating a zero value as "ancient".
+func (s *Store) HostsWithActiveSessions(ctx context.Context) ([]Host, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT h.id::text, h.node_name, h.status, h.last_heartbeat_at
+		FROM hosts h
+		WHERE EXISTS (
+		    SELECT 1 FROM sessions se
+		    WHERE se.host_id = h.id AND se.state NOT IN ('stopped','failed')
+		)`)
+	if err != nil {
+		return nil, fmt.Errorf("list hosts with active sessions: %w", err)
+	}
+	defer rows.Close()
+	var out []Host
+	for rows.Next() {
+		var h Host
+		if err := rows.Scan(&h.ID, &h.NodeName, &h.Status, &h.LastHeartbeat); err != nil {
+			return nil, fmt.Errorf("scan host with active sessions: %w", err)
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
 }
 
 // GetHost reads a host row. Returns ErrNotFound if absent.
