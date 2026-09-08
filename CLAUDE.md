@@ -30,6 +30,15 @@ Full rationale: `docs/architecture-and-plan.md`. Phases 0–5 are complete (reco
 - `protocol/agent-api.md`, `control-api.md`, `schema.md` (Phase 1–3 contracts) and all amendments
 These are load-bearing: cheap-model tickets on the client and host sides depend on them being stable. Implement against them freely; changing them requires Opus + explicit human sign-off. Additive, admin-gated extensions that change no existing shape are the documented exception (see `control-api.md §Authorization`) and still want sign-off. If a ticket seems to need a contract change, stop and escalate.
 
+## Issue numbers before and after the move
+**A `#NNN` above ~150 in this file, or in any doc or issue body carried over from
+before 2026-08-31, is a PRIVATE-repo number and does not mean what it says here.**
+Most simply fail to resolve on `accreleus/quasar`; the dangerous ones resolve to
+something unrelated — `#39` was the swap-disposition feature and is now a merged
+dependabot PR. Treat a high number in old prose as a historical marker, not a link,
+and check GitHub before citing one. The live backlog entries have been renumbered
+where they appear below.
+
 ## Repo map
 - `protocol/`     shared wire definitions (frozen interfaces) — **a git submodule of `quasar-protocol`** (the canonical contracts repo, also submoduled by `photon`, the native client — renamed from `quasar-client` in the 2026-08-20 org move). Run `git submodule update --init` after cloning/pulling. **Contract changes now happen in `quasar-protocol`** (Opus + sign-off as before), then bump the submodule pin here and in `photon`. Builds don't read `protocol/` (it's docs), so a deploy box with an un-init'd submodule still builds/runs — but **`go test ./...` does**: `TestOpenAPIDrift` reads `protocol/openapi.yaml` and fails with "no such file or directory" in a fresh worktree until you `git submodule update --init protocol`.
 - `node-agent/`   (Rust) real home; graduated out of the Phase-0 spike in Phase 1 (the `spike/` tree was retired 2026-07-17 — git history). **`session/pipeline.rs` is now a ~620-line facade over a `session/pipeline/` submodule tree** (`caps`/`encoders`/`source_branch`/`abr_glue`/`webrtc`/`rtp_ext`/`audio_branch`/`probes`.rs) — the gst-graph construction split (TD-01, review #5). Locate pipeline code by submodule, not one giant file.
@@ -292,9 +301,10 @@ session memory `current-focus.md`, not this file.**
   the public-release history squash; memory `vulkanscale-campaign`.
 - **Deep glass-to-glass trace is an always-on client (Chrome) capability** — the
   host-side overlay/probe was removed (#270; it could crash the stream).
-- Feature backlog: #39 (configurable swap disposition), #273 (per-session GPU routing +
-  admin GPU selection), #227 (LTR / intra-refresh for unstable-network recovery —
-  send-side ULPFEC shipped as `QUASAR_FEC_PERCENTAGE`, default off).
+- Feature backlog: #6 (configurable swap disposition), #7 (per-session GPU routing +
+  admin GPU selection), and LTR / intra-refresh for unstable-network recovery, which
+  has no public issue yet — send-side ULPFEC shipped as `QUASAR_FEC_PERCENTAGE`,
+  default off.
 
 ## Phase records — 0–5 + Optimization Spike/AS complete
 The full plans, execution records, latency reports, and per-phase verdicts lived at
