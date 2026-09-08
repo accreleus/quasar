@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // The dedupe record against a real database (migration 0080). The claim's
@@ -33,11 +35,26 @@ func seedNotifyRelease(t *testing.T, s *Store, version, commit string) string {
 	return ""
 }
 
+// expireClaimLease pushes a row's last_attempt_at back beyond notifyClaimLease,
+// which is what a real later pass sees. Done in SQL rather than by sleeping —
+// the lease is minutes long on purpose.
+func expireClaimLease(t *testing.T, pool *pgxpool.Pool, releaseID string) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), `
+		UPDATE platform_release_notifications
+		SET last_attempt_at = now() - make_interval(secs => $2)
+		WHERE release_id = $1::uuid
+	`, releaseID, notifyClaimLease.Seconds()*2); err != nil {
+		t.Fatalf("expire the claim lease: %v", err)
+	}
+}
+
 // TestClaimIsGrantedOnceThenTerminalOnDelivery — the second pass over a
 // delivered release sends nothing, which is the whole point of the table.
 func TestClaimIsGrantedOnceThenTerminalOnDelivery(t *testing.T) {
 	ctx := context.Background()
-	store := NewStore(testDB(t))
+	pool := testDB(t)
+	store := NewStore(pool)
 	id := seedNotifyRelease(t, store, "0.2.4", "aaaaaaaaaaaaaaaa")
 
 	attempts, claimed, err := store.ClaimNotification(ctx, id, MaxNotifyAttempts)
@@ -49,6 +66,9 @@ func TestClaimIsGrantedOnceThenTerminalOnDelivery(t *testing.T) {
 		t.Fatalf("record: %v", err)
 	}
 
+	// Past the lease, so the refusal below is about `delivered` being terminal
+	// rather than about the claim still being held.
+	expireClaimLease(t, pool, id)
 	if _, claimed, err := store.ClaimNotification(ctx, id, MaxNotifyAttempts); err != nil || claimed {
 		t.Fatalf("second claim on a delivered release = %v/%v, want false/nil", claimed, err)
 	}
@@ -68,7 +88,8 @@ func TestClaimIsGrantedOnceThenTerminalOnDelivery(t *testing.T) {
 // permanently-broken URL costs a bounded amount of noise.
 func TestAFailedDeliveryIsRetriedUntilTheCap(t *testing.T) {
 	ctx := context.Background()
-	store := NewStore(testDB(t))
+	pool := testDB(t)
+	store := NewStore(pool)
 	id := seedNotifyRelease(t, store, "0.2.5", "bbbbbbbbbbbbbbbb")
 
 	code := 500
@@ -84,6 +105,8 @@ func TestAFailedDeliveryIsRetriedUntilTheCap(t *testing.T) {
 			Delivery{StatusCode: &code, Error: "the webhook receiver answered 500"}, time.Now()); err != nil {
 			t.Fatalf("record %d: %v", i, err)
 		}
+		// Each iteration stands in for a separate later pass.
+		expireClaimLease(t, pool, id)
 	}
 	if _, claimed, err := store.ClaimNotification(ctx, id, MaxNotifyAttempts); err != nil || claimed {
 		t.Fatalf("claim past the cap = %v/%v, want false/nil", claimed, err)
@@ -105,7 +128,8 @@ func TestAFailedDeliveryIsRetriedUntilTheCap(t *testing.T) {
 // the normal case, and it must close the record out as terminal.
 func TestAFailedReleaseCanStillBeDeliveredLater(t *testing.T) {
 	ctx := context.Background()
-	store := NewStore(testDB(t))
+	pool := testDB(t)
+	store := NewStore(pool)
 	id := seedNotifyRelease(t, store, "0.2.6", "cccccccccccccccc")
 
 	if _, _, err := store.ClaimNotification(ctx, id, MaxNotifyAttempts); err != nil {
@@ -114,6 +138,9 @@ func TestAFailedReleaseCanStillBeDeliveredLater(t *testing.T) {
 	if err := store.RecordDelivery(ctx, id, Delivery{Error: "could not reach hooks.example.com"}, time.Now()); err != nil {
 		t.Fatalf("record failure: %v", err)
 	}
+	// "Later" is what the lease measures, so the row has to actually be older
+	// than it before the next pass can have the row.
+	expireClaimLease(t, pool, id)
 	attempts, claimed, err := store.ClaimNotification(ctx, id, MaxNotifyAttempts)
 	if err != nil || !claimed || attempts != 2 {
 		t.Fatalf("retry claim = %d/%v/%v, want 2/true/nil", attempts, claimed, err)
@@ -127,6 +154,40 @@ func TestAFailedReleaseCanStillBeDeliveredLater(t *testing.T) {
 	}
 	if rec.Status != NotifyDelivered || rec.Error != nil {
 		t.Fatalf("record = %+v, want delivered with the previous error cleared", rec)
+	}
+}
+
+// TestASecondClaimInsideTheLeaseIsRefused — the dedupe guarantee itself. A
+// send takes up to ~21 s and leaves the row at status='failed' the whole time,
+// so without the lease an overlapping pass would read that as "retry me", claim
+// it too, and the release would be POSTed twice.
+func TestASecondClaimInsideTheLeaseIsRefused(t *testing.T) {
+	ctx := context.Background()
+	pool := testDB(t)
+	store := NewStore(pool)
+	id := seedNotifyRelease(t, store, "0.3.0", "1111111111111111")
+
+	attempts, claimed, err := store.ClaimNotification(ctx, id, MaxNotifyAttempts)
+	if err != nil || !claimed || attempts != 1 {
+		t.Fatalf("first claim = %d/%v/%v, want 1/true/nil", attempts, claimed, err)
+	}
+	// No RecordDelivery yet: this is exactly the window the first send is in.
+	if got, claimed, err := store.ClaimNotification(ctx, id, MaxNotifyAttempts); err != nil || claimed {
+		t.Fatalf("a second claim inside the lease = %d/%v/%v, want 0/false/nil", got, claimed, err)
+	}
+	rec, found, err := store.Notification(ctx, id)
+	if err != nil || !found {
+		t.Fatalf("read record: %v/%v", found, err)
+	}
+	if rec.Attempts != 1 {
+		t.Errorf("attempts = %d after a refused claim, want 1 — a refusal must not bump it", rec.Attempts)
+	}
+
+	// Once the lease has run out the row is claimable again, which is what
+	// keeps a crashed pass from stranding the release.
+	expireClaimLease(t, pool, id)
+	if got, claimed, err := store.ClaimNotification(ctx, id, MaxNotifyAttempts); err != nil || !claimed || got != 2 {
+		t.Fatalf("claim after the lease = %d/%v/%v, want 2/true/nil", got, claimed, err)
 	}
 }
 

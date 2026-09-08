@@ -15,6 +15,18 @@ import (
 // maxStoredErrorLen bounds what a receiver's failure can write into the row.
 const maxStoredErrorLen = 500
 
+// notifyClaimLease is how long a granted claim keeps the row to itself.
+//
+// Between ClaimNotification and RecordDelivery the row sits at
+// status='failed', attempts=n — indistinguishable from "an earlier pass failed,
+// retry me" — so without a lease two overlapping passes both claim and both
+// POST. It MUST comfortably exceed one send's worst case: webhookHTTPAttempts
+// (3) requests at webhookRequestTimeout (5 s) plus the linear backoff between
+// them (2 s + 4 s) is ~21 s. Two minutes leaves that room; it is also the
+// longest a genuinely-crashed pass delays the retry, which is nothing next to
+// a weekly detection schedule.
+const notifyClaimLease = 2 * time.Minute
+
 // Notification is one platform_release_notifications row.
 type Notification struct {
 	ReleaseID     string     `json:"release_id"`
@@ -29,10 +41,19 @@ type Notification struct {
 // ClaimNotification takes the right to send this release's notification,
 // returning the attempt number it just recorded.
 //
-// One statement, so a scheduled pass and a "Check now" racing on the same
-// release cannot both win: the loser's ON CONFLICT UPDATE matches no row (the
-// WHERE fails) and it returns claimed=false. It is refused for a delivered
-// release and for one that has already cost maxAttempts passes.
+// One statement holding a LEASE, which is what makes a scheduled pass and a
+// "Check now" racing on the same release unable to both win. The single
+// statement alone is not enough: a claim leaves the row at status='failed' for
+// the whole send, which reads exactly like "an earlier pass failed, retry me",
+// so an overlapping pass would claim it too and both would POST. Bumping
+// last_attempt_at to now() and refusing any row touched inside
+// notifyClaimLease closes that window — the loser matches no row and sends
+// nothing. It is likewise refused for a delivered release and for one that has
+// already cost maxAttempts passes.
+//
+// The lease is the guarantee this package owns, so it does not depend on
+// internal/jobs single-flighting the detection job, and it still holds with a
+// second control-plane replica.
 func (s *Store) ClaimNotification(ctx context.Context, releaseID string, maxAttempts int) (attempts int, claimed bool, err error) {
 	err = s.pool.QueryRow(ctx, `
 		INSERT INTO platform_release_notifications
@@ -43,8 +64,9 @@ func (s *Store) ClaimNotification(ctx context.Context, releaseID string, maxAtte
 		    last_attempt_at = now()
 		WHERE platform_release_notifications.status = 'failed'
 		  AND platform_release_notifications.attempts < $2
+		  AND platform_release_notifications.last_attempt_at < now() - make_interval(secs => $3)
 		RETURNING attempts
-	`, releaseID, maxAttempts).Scan(&attempts)
+	`, releaseID, maxAttempts, notifyClaimLease.Seconds()).Scan(&attempts)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, false, nil
 	}
