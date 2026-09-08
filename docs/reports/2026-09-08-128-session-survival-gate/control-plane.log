@@ -1,0 +1,10 @@
+time=2026-09-08T12:17:59.415Z level=INFO msg="job: run started" job_id=devauth.reaper run_id=82042ff3-4b72-410d-a162-60598a34d5c9 host_id=- trigger=schedule attempt=1
+time=2026-09-08T12:17:59.419Z level=WARN msg="dev agent reaper: some identities could not be deleted" failed=1 err="reap ephemeral user 1f5537db-18ed-4dda-868d-1bc1c4bbd0da: cannot demote the last admin"
+time=2026-09-08T12:17:59.427Z level=INFO msg="job: run finished" job_id=devauth.reaper run_id=82042ff3-4b72-410d-a162-60598a34d5c9 host_id=- state=succeeded dur_ms=27 summary="{\"failed\": 1, \"deleted\": 0, \"in_session\": 0, \"hosts_nudged\": 0}"
+time=2026-09-08T12:19:09.405Z level=INFO msg="job: run started" job_id=devauth.reaper run_id=d4774ade-73e1-459c-894a-dae05fe576a5 host_id=- trigger=schedule attempt=1
+time=2026-09-08T12:19:09.443Z level=INFO msg="dev agent reaper" deleted=1 hosts_nudged=0
+time=2026-09-08T12:19:09.445Z level=INFO msg="job: run finished" job_id=devauth.reaper run_id=d4774ade-73e1-459c-894a-dae05fe576a5 host_id=- state=succeeded dur_ms=51 summary="{\"failed\": 0, \"deleted\": 1, \"in_session\": 0, \"hosts_nudged\": 0}"
+time=2026-09-08T12:19:19.786Z level=INFO msg="signaling WS established" session_id=bd8667f5-f7b3-42b8-a27d-7bfc0c2b40d3 host_id=44bd2118-66c1-4c46-a3bd-a5558dde5a91
+time=2026-09-08T12:21:12.608Z level=INFO msg="job: run started" job_id=devauth.reaper run_id=2416780a-0351-4687-aaf2-385d849a0682 host_id=- trigger=schedule attempt=1
+time=2026-09-08T12:21:12.622Z level=INFO msg="job: run finished" job_id=devauth.reaper run_id=2416780a-0351-4687-aaf2-385d849a0682 host_id=- state=succeeded dur_ms=32 summary="{\"failed\": 0, \"deleted\": 0, \"in_session\": 0, \"hosts_nudged\": 0}"
+time=2026-09-08T12:21:13.348Z level=INFO msg="signaling WS established" session_id=bd8667f5-f7b3-42b8-a27d-7bfc0c2b40d3 host_id=44bd2118-66c1-4c46-a3bd-a5558dde5a91

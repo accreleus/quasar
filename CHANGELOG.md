@@ -26,7 +26,9 @@ own; the two do not move together, and that is deliberate.
 
 ### Fixed
 
-- Sessions now survive a control-plane restart (#128). The browser treated any
+- Sessions now survive a control-plane restart (#128), confirmed on a live 73 s
+  outage with a real browser peer: the stream kept decoding at 60 fps throughout and
+  the session stayed `running` (`docs/reports/2026-09-08-128-session-survival-gate/`). The browser treated any
   signalling-socket close as a session failure and answered it by minting new
   coordinates and rebuilding its transport — which destroyed the peer connection
   that was still carrying the stream, so a session that had survived the outage
@@ -35,7 +37,7 @@ own; the two do not move together, and that is deliberate.
   signalling **in place**, keeping the peer connections, the input channel and
   telemetry untouched. Only a dead media path rebuilds the transport. A refused
   token (4401), an ended session (4404) and a takeover (4410) stay terminal.
-- Groundwork for sessions surviving a control-plane restart (#128). The agent now
+- The agent-side and control-plane-side groundwork for the above (#128). The agent now
   holds its sessions for a bounded grace window instead of stopping them when its
   websocket drops, and the control plane reconciles against the agent's own
   `heartbeat.running_sessions` on reconnect rather than assuming none survived,
