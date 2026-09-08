@@ -1390,6 +1390,71 @@ jobs:
             echo "  verified $name: $image:$VERSION == $digest"
           done
 
+      - name: Sign the platform release manifest
+        id: signature
+        env:
+          # OPTIONAL. With no signing key configured this step writes nothing
+          # and the release publishes unsigned, exactly as before. Creating the
+          # secret is the operator action that turns signing on —
+          # docs/upgrading.md "Signing platform releases".
+          QUASAR_RELEASE_SIGNING_KEY: ${{ secrets.QUASAR_RELEASE_SIGNING_KEY }}
+          KEY_ID: ${{ vars.QUASAR_RELEASE_SIGNING_KEY_ID }}
+          # The outgoing key during a rotation. Both set = the release is signed
+          # by both, which is what lets hosts move over one at a time
+          # (docs/upgrading.md "Rotating the key"). Unset in normal operation.
+          PREVIOUS_KEY: ${{ secrets.QUASAR_RELEASE_SIGNING_KEY_PREVIOUS }}
+          PREVIOUS_KEY_ID: ${{ vars.QUASAR_RELEASE_SIGNING_KEY_ID_PREVIOUS }}
+          MANIFEST: ${{ steps.manifest.outputs.path }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${QUASAR_RELEASE_SIGNING_KEY:-}" ]; then
+            echo "no QUASAR_RELEASE_SIGNING_KEY secret; publishing an unsigned release"
+            echo "path=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "${KEY_ID:-}" ]; then
+            echo "::error::QUASAR_RELEASE_SIGNING_KEY is set but the repository variable QUASAR_RELEASE_SIGNING_KEY_ID is not. The key_id labels the published signature and must be set alongside the key."
+            exit 1
+          fi
+
+          # The signer verifies its own output with the public half before
+          # exiting 0, so an unverifiable signature is never uploaded.
+          bash scripts/release/sign-platform-release-manifest.sh \
+            --manifest "$MANIFEST" \
+            --output "$MANIFEST.sig" \
+            --key-id "$KEY_ID"
+          signed_by="$KEY_ID"
+
+          if [ -n "${PREVIOUS_KEY:-}" ]; then
+            if [ -z "${PREVIOUS_KEY_ID:-}" ]; then
+              echo "::error::QUASAR_RELEASE_SIGNING_KEY_PREVIOUS is set but QUASAR_RELEASE_SIGNING_KEY_ID_PREVIOUS is not."
+              exit 1
+            fi
+            # --append carries the first signature over, so the asset ends up
+            # with one entry per key rather than the second replacing the first.
+            printf '%s\n' "$PREVIOUS_KEY" > "$RUNNER_TEMP/previous.pem"
+            chmod 600 "$RUNNER_TEMP/previous.pem"
+            bash scripts/release/sign-platform-release-manifest.sh \
+              --manifest "$MANIFEST" \
+              --output "$MANIFEST.sig" \
+              --key-id "$PREVIOUS_KEY_ID" \
+              --key-file "$RUNNER_TEMP/previous.pem" \
+              --append "$MANIFEST.sig"
+            rm -f "$RUNNER_TEMP/previous.pem"
+            signed_by="$KEY_ID, $PREVIOUS_KEY_ID"
+          fi
+
+          echo "path=$MANIFEST.sig" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Release signature"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| signed by | \`$signed_by\` |"
+            echo "| asset | \`platform-release-manifest.json.sig\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Extract the release notes from CHANGELOG.md
         id: notes
         env:
@@ -1439,6 +1504,7 @@ jobs:
           PRERELEASE: ${{ needs.release-gate.outputs.prerelease }}
           NOTES: ${{ steps.notes.outputs.path }}
           MANIFEST: ${{ steps.manifest.outputs.path }}
+          SIGNATURE: ${{ steps.signature.outputs.path }}
         run: |
           set -euo pipefail
 
@@ -1463,6 +1529,11 @@ jobs:
 
           # --clobber so a re-run replaces the asset instead of failing on it.
           gh release upload "$TAG" "$MANIFEST" --clobber
+          # The signature is a separate asset, uploaded only when one was made:
+          # a host in `verify` mode reads its absence as an unsigned release.
+          if [ -n "${SIGNATURE:-}" ]; then
+            gh release upload "$TAG" "$SIGNATURE" --clobber
+          fi
 
           url="$(gh release view "$TAG" --json url --jq .url)"
           echo "url=$url" >> "$GITHUB_OUTPUT"

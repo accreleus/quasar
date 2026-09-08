@@ -1018,10 +1018,59 @@ frozen: the updater's local socket").
 | `QUASAR_UPDATER_SOCKET` | `/run/quasar-updater/updater.sock` | Where the socket is created, mode 0666, in the volume shared with the control plane and the agent. Read by all three: an absent socket makes the control-plane target of an update `updater_absent` rather than an apply that fails halfway. |
 | `QUASAR_UPDATER_RESULTS_DIR` | `/run/quasar-updater/results` | One result file per request id, written tmp+rename. Directory is root-owned 0755: the other containers read, only the updater writes. |
 | `QUASAR_UPDATER_DOCKER_BIN` | `docker` | The CLI the updater drives. |
+| `QUASAR_UPDATER_SIGNATURE_MODE` | `off` | `off` · `verify` · `require`. See "Release signature verification" below. An unrecognised value is **fatal at startup**, never a silent fall back to `off`. **`verify` is a migration rung, not an enforcement boundary**: it catches a signed release that has been tampered with, but the apply request chooses which version's signature is looked for, so a request naming no version — or one never published — reads as "unsigned" and is applied. Only `require` refuses that. Each such apply logs a WARN naming the version. |
+| `QUASAR_UPDATER_TRUSTED_KEYS` | *(none)* | Comma-separated `key-id:base64`, each the raw 32 bytes of an ed25519 **public** key; a bare `base64` with no label is accepted. Several at once is how a key rotation avoids a flag day. A malformed entry is fatal at startup. |
+| `QUASAR_UPDATER_MANIFEST_BASE_URL` | `https://github.com/accreleus/quasar/releases/download/v{version}/` | Where the release manifest and its signature are fetched from. Must be **https** and must contain `{version}`; a trailing `/` is added if absent. A fork or an internal mirror points this at its own. |
+| `QUASAR_UPDATER_MANIFEST_TIMEOUT_S` | `15` | Wall-clock bound on **both** asset fetches together. It has to stay well under the agent's 30 s socket call, or a slow mirror reads as `updater_absent`. |
 
-The node agent reads the first two of those paths too, under the same names, to
+The node agent reads the socket and results paths too, under the same names, to
 find the socket it POSTs to and the result files it relays
 (`agent-api.md` `release_state`).
+
+### Release signature verification
+
+A platform release may publish a detached signature over its manifest
+(`scripts/release/platform-release-signature.md`). When verification is on, the
+updater fetches the manifest and the signature from
+`QUASAR_UPDATER_MANIFEST_BASE_URL` for the release's version, checks the
+signature against `QUASAR_UPDATER_TRUSTED_KEYS`, and checks that the signed
+manifest names the very images and digests the apply is asking for. It is a
+second gate beside the namespace allowlist, and it refuses in the same way.
+
+**Off by default.** Nothing is fetched and nothing is checked, which is ADR 0001
+trust: the pinned digest plus the namespace allowlist. Turning it on is an
+operator decision that also needs a signing key in the release pipeline —
+`docs/upgrading.md` "Signing platform releases".
+
+| Mode | What the release publishes | Outcome |
+|---|---|---|
+| `off` | anything | Applied. Nothing is fetched. |
+| `verify` | a good signature | Applied. |
+| `verify` | no signature (the asset is a definitive 404) | Applied. This is the transition rung: turn it on before the first signed release exists and nothing breaks. |
+| `verify` | a bad signature, an untrusted key, or a manifest that does not name this request's digests | Refused, `signature_invalid`. |
+| `verify` | a signature that could **not be fetched** (network, proxy, 5xx) | Refused, `signature_invalid`. "Could not tell" is never read as "unsigned". |
+| `require` | no signature | Refused, `signature_missing`. |
+| `require` | otherwise | As `verify`. |
+| `verify` or `require` | — with no `QUASAR_UPDATER_TRUSTED_KEYS` | Every apply refused, `signature_invalid`. Fail closed: a gate that is on but checking nothing is worse than one that is off. |
+
+Two consequences worth knowing before setting `require`:
+
+- **A release with no version is refused.** An edge-channel build, or a revert to
+  a build the instance can no longer name by release, carries no version, so
+  there is no published manifest to have signed it. Under `require` those are
+  refused; use the manual `redeploy.sh` recipe or drop the host to `verify`.
+- **The updater needs outbound HTTPS** to the manifest base URL. It does not,
+  when the mode is `off`.
+
+One hole `verify` cannot close: the fetch is unauthenticated, so on a **private**
+release repository every asset answers 404 and a host reads a signed release as
+an unsigned one. A fork publishing privately should run `require`, which refuses
+that case, or point `QUASAR_UPDATER_MANIFEST_BASE_URL` at a mirror its hosts can
+actually read.
+
+`curl --unix-socket /run/quasar-updater/updater.sock http://u/v1/self` reports
+`signature_mode`, `trusted_key_ids` and `manifest_source` — key labels, never key
+material.
 
 ---
 

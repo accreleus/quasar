@@ -24,6 +24,12 @@ target/
 !*.env.example
 !pins.env
 
+# Private keys, of any shape. A release signing key is generated OUTSIDE the tree
+# (scripts/release/new-release-signing-key.sh refuses to write inside it); this is
+# the second line of defence for one that lands here anyway.
+*.pem
+*.key
+
 # oh-my-claudecode agent state
 .omc/
 control-plane/bin/

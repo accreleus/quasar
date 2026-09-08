@@ -81,6 +81,8 @@ const FAILURE_TEXT: Record<string, string> = {
   updater_unreachable: "The updater could not be reached.",
   timeout: "The update did not finish in time.",
   unsupported: "This host's agent predates the update feature; update it another way.",
+  signature_missing: "This host requires a signed release and this one is not signed.",
+  signature_invalid: "The release's signature did not verify against this host's trusted keys.",
 };
 
 export function failureText(reason: string | null | undefined): string {

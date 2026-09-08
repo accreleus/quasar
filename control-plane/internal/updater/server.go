@@ -39,6 +39,15 @@ type Server struct {
 	PullTimeout     time.Duration
 	RecreateTimeout time.Duration
 
+	// Signatures fetches the release manifest and its detached signature for
+	// one apply (signature_source.go). Nil, or a policy of `off`, means nothing
+	// is fetched and nothing is graded.
+	Signatures interface {
+		Evidence(ctx context.Context, version *string) SignatureEvidence
+	}
+	// Reported by `/v1/self`; the fetch uses the source above.
+	ManifestBaseURL string
+
 	// Reported by `/v1/self`.
 	Version string
 }
@@ -68,6 +77,11 @@ type SelfResponse struct {
 	Components        []string `json:"components"`
 	WaitTimeoutS      int      `json:"wait_timeout_s"`
 	InFlight          *string  `json:"in_flight"`
+	// The release-signing policy, so "is this host verifying, against which
+	// keys, from where" is one curl. Key LABELS, never key material.
+	SignatureMode  string   `json:"signature_mode"`
+	TrustedKeyIDs  []string `json:"trusted_key_ids"`
+	ManifestSource string   `json:"manifest_source"`
 	// The image reference compose resolves for each component right now, or
 	// null when that component's service is not in this stack. Read by the
 	// control plane to classify its own install mode: a bare local tag is a
@@ -85,6 +99,9 @@ func (s *Server) handleSelf(w http.ResponseWriter, r *http.Request) {
 		AllowedNamespaces: s.Cfg.AllowedNamespaces,
 		Components:        []string{"control-plane", "node-agent"},
 		WaitTimeoutS:      s.Cfg.WaitTimeoutS,
+		SignatureMode:     signatureModeOrOff(s.Cfg.Signature.Mode),
+		TrustedKeyIDs:     s.Cfg.Signature.KeyIDs(),
+		ManifestSource:    s.ManifestBaseURL,
 		Images:            s.executor().EffectiveImages(r.Context()),
 	}
 	if id := s.Store.InFlight(); id != "" {
@@ -108,7 +125,8 @@ func statusFor(reason string) int {
 	switch reason {
 	case ReasonBusy:
 		return http.StatusConflict
-	case ReasonNamespaceRejected, ReasonDigestMalformed:
+	case ReasonNamespaceRejected, ReasonDigestMalformed,
+		ReasonSignatureMissing, ReasonSignatureInvalid:
 		return http.StatusUnprocessableEntity
 	default:
 		return http.StatusBadRequest
@@ -149,6 +167,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 
 	cfg := s.Cfg
 	cfg.InFlightRequestID = s.Store.InFlight()
+	cfg.SignatureEvidence = s.signatureEvidence(r.Context(), cfg, req)
 	plan, rej := Plan(req, priorEnv, cfg)
 	if rej != nil {
 		log.Printf("apply %s REJECTED: %s", req.RequestID, rej.Error())
@@ -189,6 +208,34 @@ func (s *Server) handleResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+// signatureEvidence fetches this release's manifest and signature, or nil when
+// nothing will be graded. Guarded on "not already busy" as well as on the
+// policy: a busy updater must answer in milliseconds, and a network fetch in
+// front of that answer would turn a concurrent apply into `updater_absent`.
+func (s *Server) signatureEvidence(ctx context.Context, cfg Config, req ApplyRequest) *SignatureEvidence {
+	if !cfg.Signature.Enabled() || s.Signatures == nil {
+		return nil
+	}
+	if cfg.InFlightRequestID != "" && cfg.InFlightRequestID != req.RequestID {
+		return nil
+	}
+	ev := s.Signatures.Evidence(ctx, req.Release.Version)
+	switch {
+	case ev.FetchError != "":
+		log.Printf("apply %s: release signature could not be retrieved: %s", req.RequestID, ev.FetchError)
+	case ev.Absent:
+		log.Printf("apply %s: no release signature to check (%s)", req.RequestID, ev.Why)
+	}
+	return &ev
+}
+
+func signatureModeOrOff(mode string) string {
+	if mode == "" {
+		return SignatureModeOff
+	}
+	return mode
 }
 
 // executor is built per use rather than held: it carries no state of its own

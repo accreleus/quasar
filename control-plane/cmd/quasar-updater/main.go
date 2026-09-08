@@ -64,15 +64,41 @@ func main() {
 		log.Fatalf("self-discovery failed: %v", err)
 	}
 
+	// FAIL CLOSED. A misconfigured signature policy exits rather than degrading
+	// to "off"; a crash-looping updater reads as `updater_absent`, so nothing
+	// is applied.
+	mode, err := updater.ParseSignatureMode(os.Getenv("QUASAR_UPDATER_SIGNATURE_MODE"))
+	if err != nil {
+		log.Fatalf("QUASAR_UPDATER_SIGNATURE_MODE: %v", err)
+	}
+	keys, err := updater.ParseTrustedKeys(os.Getenv("QUASAR_UPDATER_TRUSTED_KEYS"))
+	if err != nil {
+		log.Fatalf("QUASAR_UPDATER_TRUSTED_KEYS: %v", err)
+	}
+	manifestBase, err := updater.ParseManifestBaseURL(os.Getenv("QUASAR_UPDATER_MANIFEST_BASE_URL"))
+	if err != nil {
+		log.Fatalf("QUASAR_UPDATER_MANIFEST_BASE_URL: %v", err)
+	}
+
 	cfg := updater.Config{
 		Project:           project,
 		WorkingDir:        workingDir,
 		ConfigFiles:       configFiles,
 		AllowedNamespaces: updater.ParseNamespaces(os.Getenv("QUASAR_UPDATER_ALLOWED_NAMESPACES")),
 		WaitTimeoutS:      envInt("QUASAR_UPDATER_WAIT_TIMEOUT_S", updater.DefaultWaitTimeoutS),
+		Signature:         updater.SignaturePolicy{Mode: mode, Keys: keys},
 	}
 	log.Printf("compose project %q, working dir %s, files %v", cfg.Project, cfg.WorkingDir, cfg.ConfigFiles)
 	log.Printf("allowed namespaces: %v", cfg.AllowedNamespaces)
+	log.Printf("release signature mode: %s (trusted keys: %v)", cfg.Signature.Mode, cfg.Signature.KeyIDs())
+	if cfg.Signature.Enabled() {
+		if len(cfg.Signature.Keys) == 0 {
+			// Not fatal: the gate refuses every apply with a message that
+			// reaches the admin UI, which a log line would not.
+			log.Printf("WARNING: signature mode %q with no QUASAR_UPDATER_TRUSTED_KEYS — every apply will be refused", cfg.Signature.Mode)
+		}
+		log.Printf("release manifests are fetched from %s", manifestBase)
+	}
 
 	store, err := updater.NewStore(resultsDir)
 	if err != nil {
@@ -86,6 +112,11 @@ func main() {
 		EnvPath:         updater.EnvPathFor(cfg),
 		PullTimeout:     time.Duration(envInt("QUASAR_UPDATER_PULL_TIMEOUT_S", 3600)) * time.Second,
 		RecreateTimeout: time.Duration(envInt("QUASAR_UPDATER_RECREATE_TIMEOUT_S", 900)) * time.Second,
+		Signatures: updater.ReleaseAssetSource{
+			BaseURL: manifestBase,
+			Timeout: time.Duration(envInt("QUASAR_UPDATER_MANIFEST_TIMEOUT_S", int(updater.DefaultAssetTimeout/time.Second))) * time.Second,
+		},
+		ManifestBaseURL: manifestBase,
 		Version:         version,
 	}
 

@@ -672,6 +672,12 @@ services:
       # the org's own. docs/configuration.md.
       QUASAR_UPDATER_ALLOWED_NAMESPACES: ${QUASAR_UPDATER_ALLOWED_NAMESPACES:-}
       QUASAR_UPDATER_WAIT_TIMEOUT_S: ${QUASAR_UPDATER_WAIT_TIMEOUT_S:-}
+      # Release-signature verification. Empty = off, the default: nothing is
+      # fetched and trust is the pinned digest (ADR 0001). docs/configuration.md.
+      QUASAR_UPDATER_SIGNATURE_MODE: ${QUASAR_UPDATER_SIGNATURE_MODE:-}
+      QUASAR_UPDATER_TRUSTED_KEYS: ${QUASAR_UPDATER_TRUSTED_KEYS:-}
+      QUASAR_UPDATER_MANIFEST_BASE_URL: ${QUASAR_UPDATER_MANIFEST_BASE_URL:-}
+      QUASAR_UPDATER_MANIFEST_TIMEOUT_S: ${QUASAR_UPDATER_MANIFEST_TIMEOUT_S:-}
     volumes:
       # Podman: point QUASAR_DOCKER_SOCKET at /run/user/<uid>/podman/podman.sock.
       - ${QUASAR_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
