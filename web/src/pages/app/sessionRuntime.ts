@@ -36,7 +36,7 @@ import { mintSignalingToken } from "../../api/library";
 import { ApiError } from "../../api/client";
 import type { ICEServer } from "../../api/types";
 import { setupCapture } from "../../input/capture";
-import { QuasarSession } from "../../webrtc/session";
+import { QuasarSession, type RebindOutcome } from "../../webrtc/session";
 import type { RecoveryState } from "../../webrtc/recovery";
 import { PlayoutController, resolveInitialPlayoutMs } from "../../webrtc/playout";
 import {
@@ -117,6 +117,15 @@ const MINT_RETRY_BUDGET_MS = 120_000;
 const MINT_RETRY_BASE_DELAY_MS = 1_000;
 const MINT_RETRY_MAX_DELAY_MS = 16_000;
 
+/**
+ * #128: how many separate signalling outages one transport generation will
+ * re-attach through. Each successful rebind resets the retry budget (the
+ * control plane demonstrably answered), so without a cap a control plane that
+ * accepts an attach and immediately drops it would mint tokens forever. Twelve
+ * is far past any real restart and still bounded.
+ */
+const MAX_SIGNALING_EPISODES = 12;
+
 const TRANSPORT_STATES: readonly string[] = [
   "new",
   "checking",
@@ -179,6 +188,12 @@ export interface TransportLike {
   attachMicTrack(track: MediaStreamTrack): Promise<void>;
   detachMicTrack(): Promise<void>;
   cancelRecovery(): void;
+  /** #128 — re-attach signalling in place, keeping the peer connections and the
+   *  data channel. `retry` means the attach did not come up and another token
+   *  is worth spending; `terminal` means re-attaching cannot help. */
+  rebindSignaling(url: string, token: string): Promise<RebindOutcome>;
+  /** #128 — give up re-attaching; moves recovery to its terminal phase. */
+  signalingUnrecoverable(message: string): void;
   recoverMediaPath(): void;
   mediaPathFlowing(): void;
   close(notifyPeer?: boolean): void;
@@ -347,6 +362,26 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
   let handoff = false;
   /** Per-instance dedupe, so an old and a new runtime cannot double-mint. */
   let mintInFlight = false;
+  /**
+   * #128 — what the pending mint is FOR. `rebind` re-attaches signalling in
+   * place and keeps the peer connection; `reseat` hands new coords to the page,
+   * which destroys this runtime and builds the next one.
+   *
+   * Read when the mint RESOLVES, not when it is requested, and it only ever
+   * upgrades `rebind` -> `reseat`: a mint started because signalling dropped
+   * must re-seat if the media path died while it was in flight, because then a
+   * fresh peer connection really is needed.
+   */
+  let reconnectIntent: "rebind" | "reseat" = "rebind";
+  /** Read through a function: the loop mutates this ACROSS awaits, which
+   *  narrowing would otherwise optimise away. */
+  const currentIntent = (): "rebind" | "reseat" => reconnectIntent;
+  /** #128 — signalling outages re-attached through, bounded by
+   *  MAX_SIGNALING_EPISODES. */
+  let signalingEpisodes = 0;
+  /** #128 — set once reconnection has been abandoned, so the terminal phase it
+   *  emits cannot re-enter the escalation it just left. */
+  let reconnectGaveUp = false;
   /** The pending backoff wait between mint attempts (#128), so destroy() can
    *  cancel it instead of leaving a timer armed past teardown. */
   let mintRetryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -526,6 +561,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       reportBestEffortFailure("silent-debug", "session: mint replacement signaling token", err);
     }
     if (destroyed) return;
+    reconnectGaveUp = true;
     set({ status: "Reconnect failed — this session can no longer be resumed" });
     cfg.callbacks.onReconnectFailed(detail);
   }
@@ -565,15 +601,68 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
         failReconnect(new Error("malformed signaling envelope"));
         return;
       }
-      handoff = true; // L4 — latch BEFORE the page re-seats coords
-      cfg.callbacks.onReplacementSignaling({
-        url: signaling.url,
-        token: signaling.token,
-        // #509: from the mint that produced these coords, not the launch
-        iceServers: signaling.ice_servers ?? [],
-      });
-      return;
+      // L1' — the intent is read HERE, not where the mint was requested, so a
+      // rebind whose media path died mid-flight re-seats instead.
+      if (currentIntent() === "reseat") {
+        handoff = true; // L4 — latch BEFORE the page re-seats coords
+        cfg.callbacks.onReplacementSignaling({
+          url: signaling.url,
+          token: signaling.token,
+          // #509: from the mint that produced these coords, not the launch
+          iceServers: signaling.ice_servers ?? [],
+        });
+        return;
+      }
+
+      // #128 — signalling only. `handoff` is deliberately NOT latched: it
+      // suppresses the `bye` on destroy, and a rebind never destroys anything,
+      // so latching it here would leave the flag set for a LATER genuine
+      // unmount (L4).
+      const outcome: RebindOutcome = await (transport?.rebindSignaling(
+        signaling.url,
+        signaling.token,
+      ) ?? Promise.resolve<RebindOutcome>("terminal"));
+      if (destroyed) return;
+
+      // The recovery controller latches itself stopped on its terminal phase,
+      // so a media failure that arrived while this rebind was in flight was
+      // published exactly once and will never be republished. Re-read the
+      // intent HERE or that upgrade is lost and the session sits on a
+      // reconnected socket with a dead media path.
+      if (outcome === "open") {
+        if (currentIntent() === "reseat") continue;
+        return;
+      }
+      if (outcome === "terminal") {
+        // The session has its verdict from the close code itself (takeover,
+        // refused token, or a session the control plane already ended). Another
+        // token cannot change it, and re-attaching a takeover would displace
+        // the tab that displaced us — the #526 loop on a new path.
+        reconnectGaveUp = true;
+        return;
+      }
+
+      // `retry`: the attach did not come up — the agent may still be
+      // re-registering. Another attach needs another single-use token, so this
+      // loops back to the mint rather than reusing the one just spent.
+      const delay = Math.min(MINT_RETRY_BASE_DELAY_MS * 2 ** attempt, MINT_RETRY_MAX_DELAY_MS);
+      if (elapsedBackoffMs + delay > MINT_RETRY_BUDGET_MS) {
+        giveUpSignaling("The control plane did not come back; this session can no longer be resumed");
+        return;
+      }
+      elapsedBackoffMs += delay;
+      await mintRetryWait(delay);
+      if (destroyed) return;
     }
+  }
+
+  /** #128 — abandon signalling re-attachment and say so in one place. */
+  function giveUpSignaling(message: string): void {
+    if (destroyed) return;
+    reconnectGaveUp = true;
+    transport?.signalingUnrecoverable(message);
+    set({ status: message });
+    cfg.callbacks.onReconnectFailed(undefined);
   }
 
   function handleRecovery(next: RecoveryState): void {
@@ -584,7 +673,43 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       if (!destroyed) cfg.callbacks.onSessionTakenOver();
       return;
     }
-    if (next.phase !== "failed" || mintInFlight || destroyed) return;
+    if (destroyed || reconnectGaveUp) return;
+
+    // The ICE half of "is the host still there?" — a value, not prose. Both
+    // phases mean the media path stopped working, which is what the status poll
+    // exists to explain.
+    if (next.phase === "degraded" || next.phase === "failed") {
+      cfg.callbacks.onDisconnectSuspected();
+    }
+
+    // #128 / L1' — signalling is down but media is not. Re-attach in place.
+    if (next.phase === "signaling-lost") {
+      if (mintInFlight) return;
+      if (signalingEpisodes >= MAX_SIGNALING_EPISODES) {
+        giveUpSignaling("Signalling kept dropping; this session can no longer be resumed");
+        return;
+      }
+      signalingEpisodes += 1;
+      // Never downgrade: a pending re-seat outranks a new signalling outage.
+      // And before media is up there is nothing to protect — a silent
+      // re-attach sends no `restart_ice`, so no offer would ever arrive and
+      // the launch would hang. Re-seat, which requests one on open.
+      if (reconnectIntent !== "reseat") {
+        reconnectIntent = snapshot.pcConnected ? "rebind" : "reseat";
+      }
+      startReconnect();
+      return;
+    }
+
+    if (next.phase !== "failed") return;
+    // The media path is gone — only a fresh peer connection fixes that, so this
+    // upgrades any in-flight rebind.
+    reconnectIntent = "reseat";
+    if (mintInFlight) return;
+    startReconnect();
+  }
+
+  function startReconnect(): void {
     mintInFlight = true;
     void mintReplacementWithRetry().finally(() => {
       mintInFlight = false;
@@ -662,13 +787,16 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
 
         onStatus: (msg) => {
           set({ status: msg });
-          // The signaling relay closes with 4500 when the host goes offline;
-          // ICE also fails. Either is enough to warrant a poll.
-          const isDisconnect =
-            msg.includes("4500") ||
-            msg.includes("host offline") ||
-            msg === "ICE failed — network issue";
-          if (isDisconnect) cfg.callbacks.onDisconnectSuspected();
+          // The signaling relay closes with 4500 when the host goes offline,
+          // which is worth a status poll. Sniffing prose is the only signal for
+          // that one, because the close code reaches the runtime only as text.
+          // The ICE arm used to live here too, comparing a literal
+          // ("ICE failed — network issue") that session.ts has not emitted for
+          // some time — dead code. ICE now reports through the recovery phase
+          // instead, which is a value rather than prose.
+          if (msg.includes("4500") || msg.includes("host offline")) {
+            cfg.callbacks.onDisconnectSuspected();
+          }
         },
 
         onChannel: (ch) => {

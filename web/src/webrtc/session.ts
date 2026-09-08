@@ -34,6 +34,43 @@ const WS_CLOSE_REASONS: Record<number, string> = {
  */
 export const WS_CLOSE_TAKEN_OVER = 4410;
 
+/**
+ * #128 — the control plane refused the token (invalid / expired / already used).
+ * Unlike every other close code this is NOT worth re-attaching for: a rebind
+ * mints a fresh token and would be refused the same way, so it stays terminal.
+ */
+export const WS_CLOSE_TOKEN_REJECTED = 4401;
+
+/**
+ * #128 — close codes a fresh attach cannot fix, so they stay terminal instead
+ * of entering the re-attach loop.
+ *
+ *   4401  the token was refused; another minted token is refused the same way.
+ *   4404  the session is gone or terminal; the control plane sends this
+ *         mid-session the moment the row terminalises (signal/handler.go), and
+ *         a re-mint would only 409.
+ */
+const NON_REATTACHABLE_CLOSE_CODES: ReadonlySet<number> = new Set([4401, 4404]);
+
+/**
+ * #128 — how a {@link QuasarSession.rebindSignaling} attempt ended.
+ *
+ * `retry` and `terminal` must not be collapsed into one boolean: 4410 resolves
+ * an attempt just like a 4500 does, and retrying a takeover re-attaches with a
+ * new token, displacing the tab that just displaced us — the #526 loop, on a
+ * new path.
+ */
+export type RebindOutcome = "open" | "retry" | "terminal";
+
+/**
+ * #128 — how long a rebind waits for its socket to come up before treating the
+ * attempt as failed. A black-holed connect fires neither `open` nor `close` for
+ * minutes, which would hold the runtime's reconnect latch forever. Well under
+ * the signalling token's 60 s TTL, so a timed-out attempt never races a token
+ * that is about to expire anyway.
+ */
+const REBIND_OPEN_TIMEOUT_MS = 10_000;
+
 /** Which PeerConnection a signaling message belongs to (#304). */
 type PcId = "video" | "audio";
 
@@ -79,10 +116,16 @@ export function micMidFromOffer(offerSdp: string): string | null {
  * Callers create one instance per session and call close() on cleanup.
  */
 export class QuasarSession {
-  private ws: WebSocket;
+  private ws!: WebSocket;
   private pcVideo: RTCPeerConnection;
   private pcAudio: RTCPeerConnection | null = null;
   private closed = false;
+  /**
+   * #128 — set while a {@link rebindSignaling} attempt is outstanding. The next
+   * open/close on that socket is the attempt's verdict rather than a fresh
+   * signalling event, so the waiter and the recovery machine cannot both act.
+   */
+  private pendingRebind: ((outcome: RebindOutcome) => void) | null = null;
   /** Set when the track arrives; exposed so the AS-05 {@link PlayoutController}
    * can re-target playout over the session's lifetime. */
   videoReceiver: RTCRtpReceiver | null = null;
@@ -93,7 +136,7 @@ export class QuasarSession {
     signalingUrl: string,
     token: string,
     onTrack: TrackHandler,
-    onStatus: StatusHandler,
+    private readonly onStatus: StatusHandler,
     onChannel: ChannelHandler,
     /** `?playout=` override, else tier playout₀, else default; AS-05 controller
      * adapts from here. See {@link resolveInitialPlayoutMs}. */
@@ -109,8 +152,6 @@ export class QuasarSession {
      */
     private readonly iceServers: RTCIceServer[] = [],
   ) {
-    const wsUrl = `${signalingUrl}?token=${encodeURIComponent(token)}`;
-
     this.pcVideo = new RTCPeerConnection({
       iceServers: this.iceServers,
     });
@@ -171,33 +212,94 @@ export class QuasarSession {
       const s = this.pcVideo.connectionState;
       this.onWebRtcStateChange?.("connection", prevConnectionState, s);
       prevConnectionState = s;
+      // #128: a PC that fails while ICE does not is a DTLS failure. An ICE
+      // restart does not reset DTLS, so this is reported, not retried —
+      // previously it was forwarded to the tracer and nowhere else, leaving the
+      // user on a dead stream with no verdict.
+      if (s === "failed") {
+        this.recovery.terminal("Peer connection failed (DTLS) — the media path cannot be recovered");
+      }
     };
 
+    this.attachSocket(signalingUrl, token, requestOfferOnOpen);
+  }
+
+
+  /**
+   * Wire a signalling socket. Called once from the constructor and again by
+   * {@link rebindSignaling}, which is why it takes the coordinates rather than
+   * reading fields: a rebind arrives with a freshly minted single-use token.
+   */
+  private attachSocket(signalingUrl: string, token: string, requestOfferOnOpen: boolean): void {
+    const wsUrl = `${signalingUrl}?token=${encodeURIComponent(token)}`;
     this.ws = new WebSocket(wsUrl);
 
     this.ws.onopen = () => {
       // The launch screen's first step. A signal, not a status string: the
       // strings are prose and change.
       this.onSignalingOpen?.();
-      onStatus(requestOfferOnOpen ? "signaling restored — requesting media" : "ws open — waiting for offer");
+      this.onStatus(requestOfferOnOpen ? "signaling restored — requesting media" : "ws open — waiting for offer");
       if (requestOfferOnOpen) {
         this.wsSend({ type: "restart_ice", pc: "video" });
         this.wsSend({ type: "restart_ice", pc: "audio" });
       }
+      // #128: clear the signalling outage BEFORE resolving the waiter, so the
+      // runtime never observes a resolved rebind against a stale phase.
+      if (this.pendingRebind) {
+        // Anything wsSend() dropped while the socket was down is gone: ICE
+        // candidates and the recovery controller's own restart requests are
+        // silently discarded when the socket is not OPEN. One restart_ice
+        // regenerates all of it, and is only worth sending if media recovery
+        // was actually mid-flight.
+        if (this.recovery.mediaRetryPending()) this.wsSend({ type: "restart_ice", pc: "video" });
+        this.recovery.signalingRestored();
+        this.pendingRebind("open");
+      }
     };
 
     this.ws.onclose = (e) => {
-      // #526: terminal but not a fault, so it must not escalate. Close-code-driven,
-      // not heuristic — an ordinary blip closes 1006/1000 and recovers as before.
+      // #526: terminal but not a fault, so it must not escalate.
       if (e.code === WS_CLOSE_TAKEN_OVER) {
         this.recovery.superseded("This session was opened in another tab or window");
+        this.pendingRebind?.("terminal");
         return;
       }
+      // A rebind attempt that ended before it came up: the waiter owns the
+      // verdict, and must not also see this as a fresh signalling loss (that
+      // would start a second, competing episode). The verdict is tri-state —
+      // re-attaching cannot fix a refused token or a session the control plane
+      // has already ended, and retrying either would just spend tokens.
+      if (this.pendingRebind) {
+        if (NON_REATTACHABLE_CLOSE_CODES.has(e.code)) {
+          const why = WS_CLOSE_REASONS[e.code];
+          this.recovery.terminal(why ? `signaling: ${why}` : `signaling closed (${e.code})`);
+          this.pendingRebind("terminal");
+        } else {
+          this.pendingRebind("retry");
+        }
+        return;
+      }
+      // #128: the socket is NOT the session. Media and input are peer-to-peer
+      // and keep flowing while the control plane is away, so a signalling close
+      // is a recoverable signalling fault, not a terminal session fault. The
+      // runtime re-attaches signalling in place; only a dead media path
+      // escalates. 4401 is the exception below — a token the control plane
+      // refused cannot be re-minted into a working attach.
       const reason = WS_CLOSE_REASONS[e.code];
-      this.recovery.terminal(reason ? `signaling: ${reason}` : `signaling closed (${e.code})`);
+      const message = reason ? `signaling: ${reason}` : `signaling closed (${e.code})`;
+      if (NON_REATTACHABLE_CLOSE_CODES.has(e.code)) {
+        this.recovery.terminal(message);
+        return;
+      }
+      this.recovery.signalingLost(message);
     };
 
-    this.ws.onerror = () => this.recovery.terminal("Control-plane signaling connection failed");
+    this.ws.onerror = () => {
+      // Fires alongside onclose for a failed connect; onclose carries the code,
+      // so leave the verdict there rather than racing it with a terminal here.
+      if (this.ws.readyState === WebSocket.CLOSED) return;
+      this.recovery.signalingLost("Control-plane signaling connection interrupted");
+    };
 
     this.ws.onmessage = (ev: MessageEvent<string>) => {
       let msg: {
@@ -227,11 +329,11 @@ export class QuasarSession {
             await target.setLocalDescription(answer);
             this.wsSend({ type: "answer", pc, sdp: answer.sdp });
             if (pc === "video") {
-              onStatus("answer sent — awaiting ICE");
+              this.onStatus("answer sent — awaiting ICE");
             }
           } catch (e) {
             console.error(`[quasar] ${pc} PC offer/answer failed:`, e);
-            onStatus(`${pc} PC negotiation failed: ${e}`);
+            this.onStatus(`${pc} PC negotiation failed: ${e}`);
           }
         } else if (msg.type === "ice" && msg.candidate) {
           const target = this.pcFor(pc);
@@ -241,9 +343,9 @@ export class QuasarSession {
             /* ignore addIceCandidate failures — non-fatal trickle ICE errors */
           }
         } else if (msg.type === "error") {
-          onStatus(`host error: ${msg.message ?? ""}`);
+          this.onStatus(`host error: ${msg.message ?? ""}`);
         } else if (msg.type === "bye") {
-          onStatus("host ended the session");
+          this.onStatus("host ended the session");
         }
       })();
     };
@@ -350,6 +452,15 @@ export class QuasarSession {
       .some((extension) => extension.uri === uri) ?? false;
   }
 
+  /**
+   * #128 — the runtime exhausted its budget re-attaching signalling. Moves the
+   * recovery machine to its terminal phase with the real reason, rather than
+   * leaving the banner reporting an outage nobody is working on any more.
+   */
+  signalingUnrecoverable(message: string): void {
+    this.recovery.terminal(message);
+  }
+
   /** Stop bounded in-place recovery without tearing down the page first. */
   cancelRecovery(): void {
     this.recovery.cancel();
@@ -367,10 +478,64 @@ export class QuasarSession {
     this.recovery.connected();
   }
 
+  /**
+   * #128 — re-attach signalling in place, keeping BOTH peer connections, the
+   * tracks, the input DataChannel, telemetry and playout untouched.
+   *
+   * Media and input are agent<->browser; nothing in the media path needs a live
+   * control-plane socket. So a control-plane restart must not cost the session:
+   * only the socket is replaced. `requestOfferOnOpen` is deliberately false —
+   * the agent re-offers only on an explicit `restart_ice`
+   * (node-agent/src/session/server.rs), and media that never stopped needs no
+   * renegotiation.
+   *
+   * Resolves true once the socket is open, false if it closed first (the agent
+   * may not have finished re-registering, which the control plane answers with
+   * 4500). The caller owns the retry and its budget.
+   */
+  rebindSignaling(signalingUrl: string, token: string): Promise<RebindOutcome> {
+    if (this.closed) return Promise.resolve("terminal");
+    // Detach before closing: the old socket's handlers must not report this
+    // deliberate close as another signalling loss.
+    this.detachSocket(this.ws);
+    return new Promise<RebindOutcome>((resolve) => {
+      const timer = setTimeout(() => {
+        // Neither open nor close arrived. Abandon this socket explicitly —
+        // left attached, a late open would resolve an attempt the caller has
+        // already retried.
+        if (!this.pendingRebind) return;
+        this.pendingRebind = null;
+        this.detachSocket(this.ws);
+        resolve("retry");
+      }, REBIND_OPEN_TIMEOUT_MS);
+      this.pendingRebind = (outcome) => {
+        clearTimeout(timer);
+        this.pendingRebind = null;
+        resolve(outcome);
+      };
+      this.attachSocket(signalingUrl, token, false);
+    });
+  }
+
+  /** Silence and close a socket we are replacing: its handlers must not report
+   *  a deliberate close as another signalling loss. */
+  private detachSocket(ws: WebSocket): void {
+    ws.onopen = null;
+    ws.onclose = null;
+    ws.onerror = null;
+    ws.onmessage = null;
+    try {
+      ws.close();
+    } catch {
+      /* already closing */
+    }
+  }
+
   /** Close the WS and both peer connections. Safe to call multiple times. */
   close(notifyPeer = true): void {
     if (this.closed) return;
     this.closed = true;
+    this.pendingRebind?.("terminal");
     this.recovery.close();
     if (notifyPeer) this.wsSend({ type: "bye" });
     this.ws.close();

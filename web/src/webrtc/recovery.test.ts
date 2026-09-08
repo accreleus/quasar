@@ -137,4 +137,80 @@ describe("RecoveryController", () => {
     expect(retry).not.toHaveBeenCalled();
     expect(states.at(-1)?.message).toBe("Recovery cancelled");
   });
+
+  describe("#128 — signalling health is tracked apart from media health", () => {
+    const build = () => {
+      const retry = vi.fn();
+      const states: RecoveryState[] = [];
+      const recovery = new RecoveryController({
+        onRetry: retry,
+        onState: (state) => states.push(state),
+      });
+      return { retry, states, recovery };
+    };
+
+    it("holds the media retry ladder while signalling is down, and runs it after", () => {
+      // onRetry sends restart_ice over the signalling socket, and wsSend drops
+      // silently when that socket is closed. Running the ladder during an
+      // outage spends all three attempts on nothing in 15 s and terminalises a
+      // session the agent would have held for 120 s.
+      vi.useFakeTimers();
+      const { retry, recovery } = build();
+
+      recovery.signalingLost("signaling closed (1006)");
+      recovery.interrupted("media wobbled");
+      vi.advanceTimersByTime(60_000);
+      expect(retry).not.toHaveBeenCalled();
+
+      recovery.signalingRestored();
+      vi.advanceTimersByTime(1);
+      expect(retry).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not republish an unchanged signalling outage", () => {
+      // Media telemetry calls connected() every tick; re-emitting a fresh state
+      // object each time defeats the snapshot dedupe upstream.
+      vi.useFakeTimers();
+      const { states, recovery } = build();
+
+      recovery.signalingLost("signaling closed (1006)");
+      const after = states.length;
+      recovery.connected();
+      recovery.connected();
+      recovery.connected();
+
+      expect(states.length).toBe(after);
+      expect(states.at(-1)?.phase).toBe("signaling-lost");
+    });
+
+    it("emits one signalling outage however many closes arrive", () => {
+      vi.useFakeTimers();
+      const { states, recovery } = build();
+
+      recovery.signalingLost("first");
+      recovery.signalingLost("second");
+
+      expect(states.filter((s) => s.phase === "signaling-lost").length).toBe(1);
+    });
+
+    it("returns to connected once signalling is back and media never faltered", () => {
+      vi.useFakeTimers();
+      const { states, recovery } = build();
+
+      recovery.signalingLost("signaling closed (1006)");
+      recovery.signalingRestored();
+
+      expect(states.at(-1)?.phase).toBe("connected");
+    });
+
+    it("stays terminal: a signalling loss after `failed` changes nothing", () => {
+      vi.useFakeTimers();
+      const { states, recovery } = build();
+
+      recovery.terminal("media gone");
+      recovery.signalingLost("signaling closed (1006)");
+
+      expect(states.at(-1)?.phase).toBe("failed");
+    });
+  });
 });
