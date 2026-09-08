@@ -207,12 +207,11 @@ func platformDeps(store *platform.Store, set *settings.Store, jobStore *jobs.Sto
 			}
 			st := platform.WebhookStatus{Enabled: enabled, URL: rawURL}
 			// The status boolean, never the secret. A secrets read that fails
-			// leaves it false rather than failing the whole Releases page.
-			if status, err := sec.Status(ctx, secrets.NameReleaseWebhookSecret); err == nil {
-				st.SecretConfigured = status.Configured
-			} else if os.Getenv("QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET") != "" {
-				st.SecretConfigured = true
-			}
+			// leaves it to the environment rather than failing the whole
+			// Releases page.
+			status, statusErr := sec.Status(ctx, secrets.NameReleaseWebhookSecret)
+			st.SecretConfigured = releaseWebhookSecretConfigured(
+				status.Configured, statusErr, os.Getenv("QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET"))
 			last, err := store.LastDelivery(ctx)
 			if err != nil {
 				return nil, err
@@ -223,9 +222,27 @@ func platformDeps(store *platform.Store, set *settings.Store, jobStore *jobs.Sto
 	}
 }
 
+// releaseWebhookSecretConfigured folds the two places a signing secret can come
+// from into the view's `secret_configured` boolean (openapi.yaml defines it as
+// the stored secret "or its environment fallback").
+//
+// The environment counts on the SUCCESS path too, not only when the status read
+// errors: secrets.Store.Status answers about instance_secrets alone and reports
+// Configured=false with no error when there is no row, so an operator who set
+// only QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET — the path deploy/.env.example
+// documents — gets signed deliveries, and a card reading "unsigned" would be a
+// lie. A failed status read keeps its old behaviour: the environment alone
+// decides, because nothing is known about the stored row.
+func releaseWebhookSecretConfigured(stored bool, statusErr error, envSecret string) bool {
+	if statusErr != nil {
+		return envSecret != ""
+	}
+	return stored || envSecret != ""
+}
+
 // releaseWebhookConfig resolves where a release notification goes, per pass.
 // The secret is read at the point of use and dropped, never cached on a struct.
-func releaseWebhookConfig(set *settings.Store, sec *secrets.Store) func(context.Context) (platform.WebhookConfig, error) {
+func releaseWebhookConfig(set *settings.Store, sec *secrets.Store, log *slog.Logger) func(context.Context) (platform.WebhookConfig, error) {
 	return func(ctx context.Context) (platform.WebhookConfig, error) {
 		enabled, rawURL, err := set.ReleaseWebhook(ctx)
 		if err != nil {
@@ -233,9 +250,16 @@ func releaseWebhookConfig(set *settings.Store, sec *secrets.Store) func(context.
 		}
 		cfg := platform.WebhookConfig{Enabled: enabled, URL: rawURL}
 		// Signing is optional — Slack, Discord and ntfy authenticate by URL —
-		// so an unreadable secret sends unsigned rather than not at all.
-		if v, err := sec.Resolve(ctx, secrets.NameReleaseWebhookSecret,
-			os.Getenv("QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET")); err == nil {
+		// so an unreadable secret sends unsigned rather than not at all. It is
+		// logged because the console still calls that secret configured, and a
+		// silent downgrade to unsigned is undiagnosable from the outside: a
+		// missing or rotated QUASAR_SECRET_KEY is the usual cause.
+		v, err := sec.Resolve(ctx, secrets.NameReleaseWebhookSecret,
+			os.Getenv("QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET"))
+		if err != nil {
+			log.Warn("release notification: the stored signing secret could not be read — sending unsigned",
+				"secret", secrets.NameReleaseWebhookSecret, "err", err)
+		} else {
 			cfg.Secret = v.Secret
 		}
 		return cfg, nil
@@ -991,7 +1015,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// Outbound release notification (#123). The webhook is resolved per pass and
 	// the detection job calls Notify AFTER a successful pass: a failed delivery
 	// is a summary line, never a failed detection.
-	webhookConfig := releaseWebhookConfig(settingsStore, secretStore)
+	webhookConfig := releaseWebhookConfig(settingsStore, secretStore, log)
 	releaseNotifier := platform.NewNotifier(platformStore, platform.NotifyDeps{
 		View:   platformHandler.ReleaseView,
 		Config: webhookConfig,
