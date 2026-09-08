@@ -557,7 +557,7 @@ One `POST` with a JSON body:
   "text":    "Quasar 0.2.4 is available. This instance is on 0.2.3 — open Fleet ▸ Releases to apply it.",
   "content": "Quasar 0.2.4 is available. This instance is on 0.2.3 — open Fleet ▸ Releases to apply it.",
   "instance": { "version": "0.2.3", "source_commit": "abc1234", "schema_version": 78, "channel": "stable" },
-  "release":  { "id": "…", "version": "0.2.4", "source_commit": "def5678",
+  "release":  { "id": "…", "channel": "stable", "version": "0.2.4", "source_commit": "def5678",
                 "built_at": "…", "schema_version": 79, "prerelease": false,
                 "compare_url": null, "notes_excerpt": "### Added\n- …" }
 }

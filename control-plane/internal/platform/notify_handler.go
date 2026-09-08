@@ -65,6 +65,12 @@ type deliveryBody struct {
 // the receiver's answer is the payload. It ignores release_webhook_enabled, and
 // writes no platform_release_notifications row, so a test can never suppress
 // the real notification for a release.
+//
+// The send runs the full retry ladder synchronously inside the request, so an
+// unresponsive receiver holds it for up to ~21 s. That is deliberate: the admin
+// pressed "Send test" to find out whether the webhook works, and the whole
+// answer — including "it only worked on the third try" — is what they asked
+// for. Returning 202 and making them poll would tell them less.
 func (h *NotifyHandler) handleTest(w http.ResponseWriter, r *http.Request) {
 	if h.view == nil || h.config == nil {
 		h.log.Error("release webhook test has no dependencies wired")
