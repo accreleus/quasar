@@ -73,6 +73,66 @@ func get(t *testing.T, url, token string) (int, []byte) {
 	return resp.StatusCode, body
 }
 
+// Beta serves the prereleases stable hides, out of the SAME rows — the store is
+// asked for `stable` while the view reports `beta` (rowChannel). A row stored
+// under a `beta` channel would violate the platform_releases CHECK, so this is
+// the read that proves the lens works end to end.
+func TestReleaseViewOnBetaServesPrereleasesFromTheStableRows(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	store := NewStore(pool)
+	schema := buildinfo.Get().SchemaVersion
+
+	for _, r := range []Release{
+		{Channel: ChannelStable, Version: str("0.2.0"), SourceCommit: commitB,
+			BuiltAt: at(4), SchemaVersion: schema, Manifest: validManifest},
+		{Channel: ChannelStable, Version: str("0.3.0-rc.1"), SourceCommit: commitC, Prerelease: true,
+			// Built BEFORE the release above: only semver precedence puts it first.
+			BuiltAt: at(2), SchemaVersion: schema, Manifest: validManifest},
+	} {
+		if _, err := store.UpsertRelease(ctx, r); err != nil {
+			t.Fatalf("seed release: %v", err)
+		}
+	}
+
+	deps := &Deps{
+		Channel:   func(context.Context) (string, string, error) { return ChannelBeta, "develop", nil },
+		Hosts:     store.Hosts,
+		Releases:  store.Releases,
+		Detection: func(context.Context) (DetectionStatus, error) { return DetectionStatus{}, nil },
+	}
+	adminToken, _, url := newViewHarness(t, pool, deps)
+
+	code, body := get(t, url, adminToken)
+	if code != http.StatusOK {
+		t.Fatalf("admin = %d (%s), want 200", code, body)
+	}
+	var view struct {
+		Channel   string `json:"channel"`
+		Available []struct {
+			Channel    string `json:"channel"`
+			Version    string `json:"version"`
+			Prerelease bool   `json:"prerelease"`
+		} `json:"available"`
+	}
+	if err := json.Unmarshal(body, &view); err != nil {
+		t.Fatalf("decode: %v (%s)", err, body)
+	}
+	if view.Channel != ChannelBeta {
+		t.Errorf("channel = %q, want beta", view.Channel)
+	}
+	if len(view.Available) != 2 {
+		t.Fatalf("available = %+v, want both rows", view.Available)
+	}
+	if view.Available[0].Version != "0.3.0-rc.1" || !view.Available[0].Prerelease {
+		t.Errorf("available[0] = %+v, want the 0.3.0-rc.1 prerelease first", view.Available[0])
+	}
+	// The row still reports where it is STORED; the view reports the channel.
+	if view.Available[0].Channel != ChannelStable {
+		t.Errorf("available[0].channel = %q, want stable", view.Available[0].Channel)
+	}
+}
+
 func TestReleaseViewIsAdminOnlyAndServesThePlan(t *testing.T) {
 	pool := testDB(t)
 	ctx := context.Background()

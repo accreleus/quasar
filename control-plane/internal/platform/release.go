@@ -16,10 +16,30 @@ import (
 const (
 	ChannelStable = "stable"
 	ChannelEdge   = "edge"
+
+	// Beta offers stable's releases AND the prereleases among them. It stores
+	// no rows of its own: detection already caches every published release,
+	// prerelease or not, as a `stable` row carrying its `prerelease` flag, and
+	// stable declines to list the flagged ones. `platform_releases.channel`
+	// therefore stays CHECK IN ('stable','edge'), and switching to or from beta
+	// re-detects and writes nothing.
+	ChannelBeta = "beta"
 )
 
-// ValidChannel reports whether c is one of the two channels.
-func ValidChannel(c string) bool { return c == ChannelStable || c == ChannelEdge }
+// ValidChannel reports whether c is one of the three channels.
+func ValidChannel(c string) bool {
+	return c == ChannelStable || c == ChannelEdge || c == ChannelBeta
+}
+
+// rowChannel maps a channel to the `platform_releases.channel` value whose rows
+// it selects: beta reads stable's, every other channel its own. Every
+// channel-keyed read of a release row goes through here.
+func rowChannel(channel string) string {
+	if channel == ChannelBeta {
+		return ChannelStable
+	}
+	return channel
+}
 
 // Release is one `platform_releases` row and the `PlatformRelease` wire shape.
 type Release struct {

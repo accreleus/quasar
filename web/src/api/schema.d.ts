@@ -3771,10 +3771,10 @@ export interface paths {
                         /** @description First-run wizard v2 §S6e (migration 0064). The signaling origin allow-list. ABSENT = UNCHANGED; an explicitly-sent [] CLEARS the list. Those are different requests and the server distinguishes them (pointer decode), so a PATCH that only changes the registration mode can never wipe the allow-list. Each entry must be scheme + host only (http/https, no path, query, credentials or trailing slash); the server stores the NORMALIZED form, so what is saved is exactly what /v1/signal compares against. "*" IS REJECTED OUTRIGHT with 400 validation_failed - a wildcard would discard the layer entirely. A bad entry is 400 naming its position, and nothing is written. Setting this does NOT lift an environment override: when QUASAR_ALLOWED_ORIGINS is SET it wins, and GET /v1/admin/access-check reports which source is in force. */
                         allowed_origins?: string[];
                         /**
-                         * @description Platform-release amendment 1 (#104/#106, migration 0074). Which platform releases the admin console is shown. Absent = unchanged (pointer decode, the same rule every field on this body follows - a plain decode would read "" and silently reset the channel whenever an admin changed the registration mode). Any value outside the enum is 400 validation_failed. Takes effect immediately: the next GET /v1/admin/platform/releases reads the other channel's rows. IT DOES NOT TRIGGER DETECTION - that is a jobs-framework job, and "check now" is POST /v1/admin/jobs/{job_id}/run.
+                         * @description Platform-release amendment 1 (#104/#106, migration 0074); `beta` added by amendment 3 (#121, migration 0079). Which platform releases the admin console is shown. Absent = unchanged (pointer decode, the same rule every field on this body follows - a plain decode would read "" and silently reset the channel whenever an admin changed the registration mode). Any value outside the enum is 400 validation_failed. Takes effect immediately: the next GET /v1/admin/platform/releases reads the other channel's rows. IT DOES NOT TRIGGER DETECTION - that is a jobs-framework job, and "check now" is POST /v1/admin/jobs/{job_id}/run.
                          * @enum {string}
                          */
-                        release_channel?: "stable" | "edge";
+                        release_channel?: "stable" | "beta" | "edge";
                         /** @description Platform-release amendment 1 (#104/#106, migration 0074). The branch the EDGE channel follows; default develop. Absent = unchanged. Validated as a git ref name component - non-empty, at most 255 characters, no whitespace, no "..", no leading "-", no control characters - 400 validation_failed otherwise. Validated and stored whatever the channel is, and NEVER CLEARED BY A CHANNEL SWITCH, so an operator who visits stable and comes back keeps their branch. */
                         release_edge_branch?: string;
                     };
@@ -7748,10 +7748,10 @@ export interface components {
                 /** @description First-run wizard v2 §S6e (migration 0064). The admin-editable signaling origin allow-list, normalized (scheme + lowercased host). THIS IS THE DATABASE COLUMN, NOT NECESSARILY WHAT /v1/signal ENFORCES: QUASAR_ALLOWED_ORIGINS, when SET, overrides it outright - including when set to the empty string, which is how a hardened deployment pins the list off. That override rule is what makes the migration a behavioural no-op on upgrade for every existing deployment. GET /v1/admin/access-check reports the RESOLVED list plus which source won, so a UI can grey out a control the environment has pinned - the same shape library_discovery_interval_minutes uses. AN EMPTY LIST IS NOT "DENY ALL": /v1/signal still admits a same-origin request and a request with no Origin header at all, so a fresh instance with nothing configured works. Optional in the envelope so pre-amendment servers stay conformant. */
                 allowed_origins?: string[];
                 /**
-                 * @description Platform-release amendment 1 (#104/#106, migration 0074). The instance's platform- release channel: stable = tagged, noted releases; edge = whatever was last published from release_edge_branch, with no notes. DEFAULT stable - an instance that has never been configured is not shown branch builds. Read per request rather than at boot, so a switch needs no restart. Optional in the envelope so pre-amendment servers stay conformant.
+                 * @description Platform-release amendment 1 (#104/#106, migration 0074); `beta` added by amendment 3 (#121, migration 0079). The instance's platform- release channel: stable = tagged, noted releases; beta = those AND the prereleases among them; edge = whatever was last published from release_edge_branch, with no notes. DEFAULT stable - an instance that has never been configured is not shown prereleases or branch builds. Read per request rather than at boot, so a switch needs no restart. Optional in the envelope so pre-amendment servers stay conformant.
                  * @enum {string}
                  */
-                release_channel?: "stable" | "edge";
+                release_channel?: "stable" | "beta" | "edge";
                 /** @description Platform-release amendment 1 (#104/#106, migration 0074). The branch the edge channel follows; default develop. Reported whatever the channel is (it selects nothing while the channel is stable) so a UI can render the control without a second read. Optional in the envelope so pre-amendment servers stay conformant. */
                 release_edge_branch?: string;
                 /** Format: uuid */
@@ -7800,7 +7800,10 @@ export interface components {
              * @description Stable across detections; the handle amendment 2's apply will name.
              */
             id: string;
-            /** @enum {string} */
+            /**
+             * @description The channel this row is STORED on, which is not always the instance's channel: beta has no rows of its own and reads stable's, so a release listed while the instance is on beta reports `stable` here. Unchanged by amendment 3.
+             * @enum {string}
+             */
             channel: "stable" | "edge";
             /** @description Stable semver without a leading "v" ("0.2.0", "0.2.0-rc.1"). NULL ON EDGE - an edge build is a commit, not a version, and a synthesized one would be rendered to an operator as if it were real. */
             version: string | null;
@@ -7813,7 +7816,7 @@ export interface components {
             built_at: string;
             /** @description The highest migration the release's control-plane image embeds. The first ordering key and the ADR 0002 gate. */
             schema_version: number;
-            /** @description True for a prerelease tag. A stable-channel read never lists one; on edge it is reported as found. */
+            /** @description True for a prerelease tag. A stable-channel read never lists one, a BETA read lists it (that is what the channel is for); on edge it is reported as found. */
             prerelease: boolean;
             /** @description Release notes, MARKDOWN, verbatim from the GitHub Release's `body` field (which the publish workflow takes from the changelog section). "" ON EDGE - no notes exist and compare_url stands in for them. Never null, so a client renders one type. UNTRUSTED UPSTREAM TEXT: sanitize at render. */
             notes: string;
@@ -7867,10 +7870,10 @@ export interface components {
         /** @description The whole admin Releases page in one read (GET /v1/admin/platform/releases). */
         PlatformReleaseView: {
             /**
-             * @description The instance's channel. Everything in `available` is on it; the other channel's releases are never mixed in.
+             * @description The instance's channel. Everything in `available` is what it selects; another channel's releases are never mixed in. On `beta` the entries carry channel `stable`, because beta reads those rows rather than storing its own.
              * @enum {string}
              */
-            channel: "stable" | "edge";
+            channel: "stable" | "beta" | "edge";
             /** @description ADDITIVE (#104). The configured release repository as `owner/name` (QUASAR_PLATFORM_RELEASE_REPO, default `accreleus/quasar`), so a client can compose the GitHub links a release view needs - the release page, the commit, and the issues the notes reference - instead of hard-coding a repository the operator may have re-pointed. "" when detection is switched off, which a client reads as "render no links", never as the default. Optional in the schema so a pre-#104 server stays conformant; a client must read absent as "". */
             source_repo?: string;
             /** @description The branch the edge channel follows. Reported on BOTH channels so a UI can render the control without a second read; it selects nothing while channel is stable. */
@@ -7886,7 +7889,7 @@ export interface components {
                 control_plane: components["schemas"]["PlatformIdentity"];
                 hosts: components["schemas"]["PlatformHostIdentity"][];
             };
-            /** @description Releases on the configured channel that are still offerable, NEWEST FIRST (schema_version DESC, then built_at DESC - the tiebreak matters because an edge channel produces many builds at one schema_version). A release below the installed control plane's schema_version is NEVER here (ADR 0002); a prerelease is never here on stable; a stable release with a missing or invalid manifest is never here either (it is a manifest_invalid fault instead). */
+            /** @description Releases the configured channel selects that are still offerable, NEWEST FIRST (schema_version DESC, then built_at DESC - the tiebreak matters because an edge channel produces many builds at one schema_version). On BETA, SemVer 2.0.0 precedence is inserted between those two keys, because that channel is the only one whose rows can arrive out of version order: 0.2.0-rc.2 orders below 0.2.0, which orders below 0.2.1-rc.1, whatever order they were built in. A release below the installed control plane's schema_version is NEVER here (ADR 0002); neither is one whose VERSION orders below an installed prerelease at the same schema_version, which is what stops a switch back to stable offering a downgrade (amendment 3); a prerelease is never here on stable; a stable or beta release with a missing or invalid manifest is never here either (it is a manifest_invalid fault instead). */
             available: components["schemas"]["PlatformRelease"][];
             /** @description One entry per target - the control plane, then every registered host - each evaluated against available[0]. When available is empty every target is eligible:false with reason "no_release". */
             targets: components["schemas"]["PlatformReleaseTarget"][];

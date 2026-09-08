@@ -46,13 +46,17 @@ func seedHost(t *testing.T, pool *pgxpool.Pool, name, commit, status string) str
 	return id
 }
 
-func seedRelease(t *testing.T, store *Store, commit string, schema int) Release {
+func seedRelease(t *testing.T, store *Store, commit string, schema int, opts ...func(*Release)) Release {
 	t.Helper()
 	// A distinct version per commit: platform_releases_version_key is unique.
-	if _, err := store.UpsertRelease(context.Background(), Release{
+	r := Release{
 		Channel: ChannelStable, Version: str("0.9." + commit[:1]), SourceCommit: commit,
 		BuiltAt: at(4), SchemaVersion: schema, Manifest: applyManifest(commit, schema),
-	}); err != nil {
+	}
+	for _, o := range opts {
+		o(&r)
+	}
+	if _, err := store.UpsertRelease(context.Background(), r); err != nil {
 		t.Fatalf("seed release: %v", err)
 	}
 	rows, err := store.Releases(context.Background(), ChannelStable)
@@ -80,6 +84,9 @@ type applyHarness struct {
 	release     Release
 	hostCommit  string
 	viewOverlay func(*View)
+	// The instance's channel, as the settings store would answer it. Tests that
+	// exercise beta set it after construction; the view reads it per call.
+	channel string
 }
 
 // newApplyHarness wires the two endpoints behind the real admin chain, with a
@@ -92,7 +99,7 @@ func newApplyHarness(t *testing.T) *applyHarness {
 	ctx := context.Background()
 	store := NewStore(pool)
 
-	h := &applyHarness{pool: pool, store: store, hostCommit: commitA}
+	h := &applyHarness{pool: pool, store: store, hostCommit: commitA, channel: ChannelStable}
 	h.release = seedRelease(t, store, commitB, buildinfo.Get().SchemaVersion)
 	h.hostID = seedHost(t, pool, "gpu-01", h.hostCommit, "online")
 
@@ -105,7 +112,7 @@ func newApplyHarness(t *testing.T) *applyHarness {
 		if err != nil {
 			return View{}, err
 		}
-		releases, err := store.Releases(ctx, ChannelStable)
+		releases, err := store.Releases(ctx, rowChannel(h.channel))
 		if err != nil {
 			return View{}, err
 		}
@@ -114,7 +121,7 @@ func newApplyHarness(t *testing.T) *applyHarness {
 			return View{}, err
 		}
 		v := PlanRelease(PlanInputs{
-			Channel:      ChannelStable,
+			Channel:      h.channel,
 			EdgeBranch:   "develop",
 			ControlPlane: cp(commitB, buildinfo.Get().SchemaVersion),
 			Hosts:        hosts,
@@ -248,6 +255,43 @@ func TestApplyCreatesAnAttemptAndSendsOnlyTheNodeAgentComponent(t *testing.T) {
 	// The request id was persisted BEFORE the send: the row must resolve by it.
 	if _, err := h.store.AttemptByRequestID(context.Background(), sent.RequestID); err != nil {
 		t.Errorf("request id was not persisted before the send: %v", err)
+	}
+}
+
+// A prerelease is applied by naming its release id like any other release: on
+// beta it is what `available[0]` is, so `offered` accepts it and the digests that
+// reach the host are the prerelease's. On stable the same id is refused, because
+// that channel does not list it — the endpoint and the button agree.
+func TestApplyAcceptsAPrereleaseReleaseIDOnBetaAndRefusesItOnStable(t *testing.T) {
+	h := newApplyHarness(t)
+	// Upserts onto the harness's own row (channel, source_commit is the key), so
+	// the release the control plane is stamped with IS the prerelease.
+	rc := seedRelease(t, h.store, commitB, buildinfo.Get().SchemaVersion,
+		prerelease, withVersion("0.9.9-rc.1"))
+	if !rc.Prerelease || *rc.Version != "0.9.9-rc.1" {
+		t.Fatalf("seeded release = %+v, want the 0.9.9-rc.1 prerelease", rc)
+	}
+
+	if code, body := h.post(t, h.applyURL(), h.adminToken, HostApplyRequest{ReleaseID: rc.ID}); code != http.StatusConflict ||
+		errCode(t, body) != CodeReleaseNotOffered {
+		t.Fatalf("prerelease apply on stable = %d %s, want 409 release_not_offered", code, body)
+	}
+
+	h.channel = ChannelBeta
+	code, body := h.post(t, h.applyURL(), h.adminToken, HostApplyRequest{ReleaseID: rc.ID, Force: true})
+	if code != http.StatusAccepted {
+		t.Fatalf("prerelease apply on beta = %d (%s), want 202", code, body)
+	}
+	var env AttemptEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("decode: %v (%s)", err, body)
+	}
+	if env.Attempt.ReleaseID == nil || *env.Attempt.ReleaseID != rc.ID {
+		t.Errorf("attempt release_id = %v, want the prerelease's id", env.Attempt.ReleaseID)
+	}
+	waitFor(t, "release_apply to be sent", func() bool { return h.agent.sentCount() == 1 })
+	if sent := h.agent.sent[0]; sent.Release.SourceCommit != rc.SourceCommit {
+		t.Errorf("release provenance = %+v, want the prerelease's commit", sent.Release)
 	}
 }
 

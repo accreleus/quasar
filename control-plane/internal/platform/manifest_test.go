@@ -35,6 +35,20 @@ func TestParseManifestAcceptsTheDocumentedShape(t *testing.T) {
 	}
 }
 
+// A prerelease manifest is the beta channel's normal case: the flag and the
+// version agree, and both are carried through.
+func TestParseManifestAcceptsAPrerelease(t *testing.T) {
+	raw := strings.Replace(goodManifest, `"version": "0.2.0"`, `"version": "0.3.0-rc.1"`, 1)
+	raw = strings.Replace(raw, `"prerelease": false`, `"prerelease": true`, 1)
+	m, err := ParseManifest([]byte(raw))
+	if err != nil {
+		t.Fatalf("a consistent prerelease manifest was rejected: %v", err)
+	}
+	if m.Version != "0.3.0-rc.1" || !m.Prerelease {
+		t.Fatalf("decoded wrong: %+v", m)
+	}
+}
+
 func TestParseManifestRejections(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -96,6 +110,23 @@ func TestParseManifestRejections(t *testing.T) {
 		{"a version with a leading v",
 			func(s string) string { return strings.Replace(s, `"version": "0.2.0"`, `"version": "v0.2.0"`, 1) },
 			"leading v"},
+		// The version is the beta channel's ordering key, so one that cannot be
+		// parsed is a rejected manifest rather than a row nothing can order.
+		{"a version that is not semver",
+			func(s string) string { return strings.Replace(s, `"version": "0.2.0"`, `"version": "0.2"`, 1) },
+			"semver"},
+		{"a version with an empty prerelease part",
+			func(s string) string { return strings.Replace(s, `"version": "0.2.0"`, `"version": "0.2.0-"`, 1) },
+			"semver"},
+		// The flag and the version string state the same fact, and different
+		// rules read different ones, so a disagreement is not accepted either way
+		// round.
+		{"the prerelease flag set on a release version",
+			func(s string) string { return strings.Replace(s, `"prerelease": false`, `"prerelease": true`, 1) },
+			"prerelease"},
+		{"the prerelease flag clear on a prerelease version",
+			func(s string) string { return strings.Replace(s, `"version": "0.2.0"`, `"version": "0.2.0-rc.1"`, 1) },
+			"prerelease"},
 		{"trailing content after the object",
 			func(s string) string { return s + "\n{}" },
 			"trailing content"},

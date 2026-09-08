@@ -394,6 +394,72 @@ anything. If it starts and then fails, the updater leaves it failed and records
 the previous digests in the result, because a started container may already have
 migrated and the rule at the top of this section then applies.
 
+### Release channels: stable, beta, edge
+
+Which releases the console offers is one setting, Admin › Fleet › Releases ›
+**Channel**. It changes what is *listed*; it never installs anything and never
+starts a check.
+
+- **`stable`** (the default) — tagged releases with notes. **Prereleases are
+  hidden**, which is the point of the channel: `v0.3.0-rc.1` is published and
+  installable by hand, but stable will not offer it.
+- **`beta`** — the same tagged releases *and* the prereleases among them. This is
+  how you follow release candidates from the console: you get the rc as soon as
+  it is published, with its notes and its pinned digests, applied through exactly
+  the same path a stable release takes. Nothing else about an apply changes.
+- **`edge`** — whatever was last published from `release_edge_branch` (default
+  `develop`). No version, no notes, a compare link instead.
+
+Beta stores nothing of its own: a prerelease is already detected and cached
+alongside the stable releases, and beta is the channel that lists it. So
+switching to or from beta re-detects nothing and writes nothing — the next read
+simply selects a different set.
+
+**What beta costs you.** A prerelease is a build that has not been through a
+release cut. It can carry a migration that the next prerelease revises, and a
+migration is one-way (see "The one-way migration rule" above). Run beta on a
+host you can afford to have ahead of stable, and back Postgres up before an
+apply, exactly as you would for any upgrade.
+
+**Ordering is by version, not by publication date.** Release candidates are cut
+from the development branch while patches are cut from the release branch, so a
+`0.3.0-rc.1` can be *built before* the `0.2.5` that is *below* it. Beta orders
+its list by SemVer precedence — `0.2.0-rc.1 < 0.2.0-rc.2 < 0.2.0 < 0.2.1-rc.1`,
+and `0.3.0-rc.9 < 0.3.0-rc.10` — so the newest thing on the list is the highest
+version, never merely the most recently built.
+
+#### Switching back to stable: you wait, you are never rolled back
+
+This is the one rule to read before turning beta on.
+
+Suppose the instance is running `0.3.0-rc.1` and you switch the channel back to
+`stable`. Stable hides prereleases, so the newest release it can see may be
+`0.2.5` — *older than what you are running*. Quasar does not offer it. **No
+channel offers a build that orders below the one installed.**
+
+What you see instead:
+
+- **`0.3.0` has shipped** → it is listed, and Update Quasar moves you onto it
+  normally. The switch is complete.
+- **`0.3.0` has not shipped yet** → the Releases list is empty. In place of the
+  list you get *"Nothing newer than this control plane has been detected on the
+  stable channel."*, and each target on the Fleet update card reads *"Nothing
+  newer has been detected on this channel."* — the same fact said once for the
+  list and once per target. The instance stays on `0.3.0-rc.1` until stable
+  passes it. This is not a failure state and needs no action; switching back to
+  beta immediately restores the full list.
+
+The reason is the one-way migration rule. `0.3.0-rc.1` may have applied a
+migration that `0.2.5` does not embed, and a control plane booted below the
+database's applied version **crash-loops** with no console left to fix it from.
+Rather than checking that per release and sometimes offering a downgrade, the
+console offers none: a downgrade is unrepresentable here, not merely
+discouraged.
+
+If you genuinely need to go backwards, that is a manual redeploy, and it is
+subject to the same rule — run the down migrations and reset
+`schema_migrations` first, or you will land in the crash-loop described above.
+
 ### Applying from the console
 
 Admin › Fleet › Releases lists every target and, for an eligible host, offers

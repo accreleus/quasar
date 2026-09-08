@@ -307,7 +307,7 @@ describe("ReleasesTab", () => {
     renderTab();
 
     expect(
-      await screen.findByText(/Nothing at or above this control plane's schema/),
+      await screen.findByText(/Nothing newer than this control plane has been detected/),
     ).toBeInTheDocument();
   });
 
@@ -338,6 +338,18 @@ describe("ReleasesTab", () => {
       expect(mocked.updateSettings).toHaveBeenCalledWith("tok", { release_channel: "edge" }),
     );
     await waitFor(() => expect(mocked.getPlatformReleases).toHaveBeenCalledTimes(2));
+  });
+
+  it("offers beta as a third channel and PATCHes it", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(view());
+    mocked.updateSettings.mockResolvedValue({ settings: {} } as never);
+    renderTab();
+
+    (await screen.findByRole("tab", { name: "Beta" })).click();
+
+    await waitFor(() =>
+      expect(mocked.updateSettings).toHaveBeenCalledWith("tok", { release_channel: "beta" }),
+    );
   });
 
   it("Check now runs the detection job rather than the page's own read", async () => {
