@@ -112,6 +112,16 @@ impl HealthState {
     }
 }
 
+/// #152 — who is answering. Two agents on one host share a network namespace and
+/// therefore a port; without this a probe cannot tell whose status it received,
+/// and on a real host that cost hours: a healthy agent was read as unhealthy
+/// because a decommissioned one held the port and answered for it.
+fn identity_fields() -> String {
+    let node = std::env::var("NODE_NAME").unwrap_or_else(|_| "unknown".to_string());
+    let node_json = serde_json::to_string(&node).unwrap_or_else(|_| "\"unknown\"".to_string());
+    format!(",\"node\":{node_json},\"pid\":{}", std::process::id())
+}
+
 /// Pure threshold decision, unit-testable without a `HealthState` or sockets.
 fn is_unhealthy(consecutive_failures: usize) -> bool {
     consecutive_failures >= UNHEALTHY_AFTER_CONSECUTIVE_FAILURES
@@ -146,11 +156,24 @@ fn serve(addr: &str, state: Arc<HealthState>) {
     let listener = match TcpListener::bind(addr) {
         Ok(l) => l,
         Err(e) => {
+            // #152 — FATAL, not a warning. Carrying on leaves the container's
+            // HEALTHCHECK probing this address and being answered by whatever
+            // else holds it: on a real host that reported a perfectly healthy
+            // agent as unhealthy, with another process's failure reason, for
+            // sixteen hours. A container that will not start is a far better
+            // signal than one that reports someone else's state as its own.
+            //
+            // The escape hatch is deliberate and already documented: set
+            // QUASAR_HEALTH_ADDR to an empty string or "0" to run without a
+            // health endpoint, or give this agent an address of its own.
             tracing::error!(
                 token = "health-bind-failed",
-                "health: failed to bind {addr}: {e}"
+                "health: failed to bind {addr}: {e} — refusing to start, because a \
+                 health endpoint that another process answers is worse than none. \
+                 Give this agent its own QUASAR_HEALTH_ADDR, or set it empty to \
+                 disable the endpoint."
             );
-            return;
+            std::process::exit(1);
         }
     };
     info!("health endpoint listening on {addr}");
@@ -216,13 +239,17 @@ fn handle_conn(mut stream: std::net::TcpStream, state: &HealthState) {
                 "HTTP/1.1 503 Service Unavailable",
                 format!(
                     "{{\"status\":\"unhealthy\",\"sessions\":{sessions},\"connected\":{connected},\
-                     \"consecutive_registration_failures\":{failures},\"reason\":{reason_json}}}"
+                     \"consecutive_registration_failures\":{failures},\"reason\":{reason_json}{id}}}",
+                    id = identity_fields()
                 ),
             )
         } else {
             (
                 "HTTP/1.1 200 OK",
-                format!("{{\"status\":\"ok\",\"sessions\":{sessions},\"connected\":{connected}}}"),
+                format!(
+                    "{{\"status\":\"ok\",\"sessions\":{sessions},\"connected\":{connected}{id}}}",
+                    id = identity_fields()
+                ),
             )
         };
         format!(
@@ -245,6 +272,43 @@ fn handle_conn(mut stream: std::net::TcpStream, state: &HealthState) {
 mod tests {
     use super::*;
     use std::net::TcpStream;
+
+    /// #152 — a probe must be able to tell WHOSE health it received. Two agents
+    /// on one host share a network namespace, and a probe answered by the wrong
+    /// one is indistinguishable from a true reading without this.
+    #[test]
+    fn health_response_identifies_the_agent_that_answered() {
+        let state = HealthState::new();
+        state.set_connected(true);
+        let addr = spawn_test_server(state);
+        let (_head, body) = get(&addr, "/health");
+
+        assert!(body.contains("\"pid\":"), "no pid in {body}");
+        assert!(body.contains("\"node\":"), "no node name in {body}");
+        // The pid must be THIS process — the whole point is attribution.
+        assert!(
+            body.contains(&format!("\"pid\":{}", std::process::id())),
+            "pid is not this process in {body}"
+        );
+    }
+
+    #[test]
+    fn an_unhealthy_response_is_identified_too() {
+        // The misleading case in the field was an UNHEALTHY body attributed to
+        // the wrong agent, so this arm matters more than the healthy one.
+        let state = HealthState::new();
+        for _ in 0..UNHEALTHY_AFTER_CONSECUTIVE_FAILURES {
+            state.record_registration_failure("boom");
+        }
+        let addr = spawn_test_server(state);
+        let (_head, body) = get(&addr, "/health");
+
+        assert!(body.contains("\"status\":\"unhealthy\""), "{body}");
+        assert!(
+            body.contains(&format!("\"pid\":{}", std::process::id())),
+            "{body}"
+        );
+    }
 
     /// Ephemeral port, so tests are deterministic and parallel-safe. Runs the
     /// real accept loop so timeouts and the in-flight cap are under test.
@@ -274,7 +338,13 @@ mod tests {
         let addr = spawn_test_server(state);
         let (head, body) = get(&addr, "/health");
         assert!(head.starts_with("HTTP/1.1 200"), "head: {head}");
-        assert_eq!(body, r#"{"status":"ok","sessions":0,"connected":false}"#);
+        // Parsed rather than string-compared since #152 appended the identity
+        // fields: still exact about every value, but not about field order.
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["sessions"], 0);
+        assert_eq!(v["connected"], false);
+        assert_eq!(v["pid"], std::process::id());
     }
 
     #[test]
@@ -284,7 +354,11 @@ mod tests {
         state.set_connected(true);
         let addr = spawn_test_server(state);
         let (_head, body) = get(&addr, "/health");
-        assert_eq!(body, r#"{"status":"ok","sessions":3,"connected":true}"#);
+        // Parsed since #152 appended the identity fields; still exact on values.
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["sessions"], 3);
+        assert_eq!(v["connected"], true);
     }
 
     #[test]

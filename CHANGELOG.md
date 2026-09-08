@@ -26,6 +26,16 @@ own; the two do not move together, and that is deliberate.
 
 ### Fixed
 
+- A node agent no longer reports another agent's health as its own (#152). The stack
+  uses host networking, so two agents on one machine share `QUASAR_HEALTH_ADDR`; the
+  loser of that bind kept running while its container `HEALTHCHECK` — and any operator
+  probing by hand — was answered by the winner. In the field this reported a perfectly
+  healthy agent as unhealthy for sixteen hours, with a different process's failure
+  reason attached, and the log was the only thing that disagreed. The agent now refuses
+  to start if it cannot bind the address, `/health` identifies the answering agent by
+  `node` and `pid`, the image's `HEALTHCHECK` follows the configured address instead of
+  hardcoding the default, and the multi-agent overlay gives each extra agent its own.
+
 - Sessions now survive a control-plane restart (#128), confirmed on a live 73 s
   outage with a real browser peer: decode continued at 60 fps with no dropped samples
   and the session stayed `running` (`docs/reports/2026-09-08-128-session-survival-gate/`). The browser treated any

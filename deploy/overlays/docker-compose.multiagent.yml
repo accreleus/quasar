@@ -6,6 +6,12 @@
 #   - NODE_SECRET_PATH (under its own named volume; no secret collision)
 #   - XDG_RUNTIME_DIR (separate Wayland / PulseAudio socket dir on the host)
 #   - GST_REGISTRY (prevents simultaneous writes to the shared registry cache)
+#   - QUASAR_HEALTH_ADDR (#152: the stack uses host networking, so all three
+#     agents share one network namespace. Left at the default they contend for
+#     127.0.0.1:9091 — two lose the bind, and every probe is answered by
+#     whichever won, so `docker compose ps` reports one agent's state for all
+#     three. The agent now refuses to start rather than report someone else's
+#     health, so these MUST be distinct or the extra agents will not come up.)
 #
 # Usage:
 #   docker compose -f deploy/docker-compose.yml \
@@ -33,6 +39,7 @@ services:
       NODE_SECRET_PATH: /var/lib/quasar-agent-1/node-secret
       XDG_RUNTIME_DIR: /run/quasar-agent-1
       GST_REGISTRY: /var/lib/quasar-agent-1/.cache/gstreamer-1.0/registry.bin
+      QUASAR_HEALTH_ADDR: 127.0.0.1:9092
     volumes:
       - /run/quasar-agent-1:/run/quasar-agent-1
       - quasar-agent-1-data:/var/lib/quasar-agent-1
@@ -49,6 +56,7 @@ services:
       NODE_SECRET_PATH: /var/lib/quasar-agent-2/node-secret
       XDG_RUNTIME_DIR: /run/quasar-agent-2
       GST_REGISTRY: /var/lib/quasar-agent-2/.cache/gstreamer-1.0/registry.bin
+      QUASAR_HEALTH_ADDR: 127.0.0.1:9093
     volumes:
       - /run/quasar-agent-2:/run/quasar-agent-2
       - quasar-agent-2-data:/var/lib/quasar-agent-2
