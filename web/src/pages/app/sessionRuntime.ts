@@ -100,6 +100,12 @@ export { IDLE_SNAPSHOT };
 /** ICE states that mean the media path is up. */
 const ICE_UP: readonly string[] = ["connected", "completed"];
 
+/** #128: the replacement-token mint retry budget, sized to outlast a
+ *  control-plane recreate (measured ~70s). Exponential from ~1s, capped ~16s. */
+const MINT_RETRY_BUDGET_MS = 90_000;
+const MINT_RETRY_BASE_DELAY_MS = 1_000;
+const MINT_RETRY_MAX_DELAY_MS = 16_000;
+
 const TRANSPORT_STATES: readonly string[] = [
   "new",
   "checking",
@@ -330,6 +336,10 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
   let handoff = false;
   /** Per-instance dedupe, so an old and a new runtime cannot double-mint. */
   let mintInFlight = false;
+  /** The pending backoff wait between mint attempts (#128), so destroy() can
+   *  cancel it instead of leaving a timer armed past teardown. */
+  let mintRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  let mintRetryWake: (() => void) | null = null;
 
   const telemetrySubs = new Set<(snap: TelemetrySnapshot) => void>();
 
@@ -463,6 +473,98 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
     }
   }
 
+  // #128: an ApiError's status is the only faithful transient/terminal signal
+  // (see ApiError in api/client.ts). A non-ApiError rejection is the fetch
+  // itself failing (network down, which is exactly the control-plane-restart
+  // case) and is transient the same way. A 4xx means the token or session is
+  // genuinely rejected, so it must fail fast rather than burn the budget.
+  function isTransientMintError(err: unknown): boolean {
+    if (!(err instanceof ApiError)) return true;
+    return err.status >= 500 && err.status < 600;
+  }
+
+  /** Resolves after `ms`, or immediately once cancelMintRetryWait() runs (destroy
+   *  mid-backoff). The timer is cleared either way so nothing outlives destroy(). */
+  function mintRetryWait(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      mintRetryWake = resolve;
+      mintRetryTimer = setTimeout(() => {
+        mintRetryTimer = null;
+        mintRetryWake = null;
+        resolve();
+      }, ms);
+    });
+  }
+
+  function cancelMintRetryWait(): void {
+    if (mintRetryTimer !== null) {
+      clearTimeout(mintRetryTimer);
+      mintRetryTimer = null;
+    }
+    if (mintRetryWake !== null) {
+      const wake = mintRetryWake;
+      mintRetryWake = null;
+      wake();
+    }
+  }
+
+  function failReconnect(err: unknown): void {
+    // only server-authored text is ever shown
+    const detail = err instanceof ApiError ? err.message : undefined;
+    if (!(err instanceof ApiError)) {
+      reportBestEffortFailure("silent-debug", "session: mint replacement signaling token", err);
+    }
+    if (destroyed) return;
+    set({ status: "Reconnect failed — this session can no longer be resumed" });
+    cfg.callbacks.onReconnectFailed(detail);
+  }
+
+  // Bounded retry around the mint (#128): a control-plane restart fails the
+  // request on the network for ~60-90s, and one attempt used to end the
+  // session outright. Only the mint call is retried — a successful response
+  // with a malformed envelope is a local bug, not a transient condition, and
+  // stays a single, immediate failure (matches the pre-#128 behaviour).
+  async function mintReplacementWithRetry(): Promise<void> {
+    let elapsedBackoffMs = 0;
+    for (let attempt = 0; ; attempt++) {
+      if (destroyed) return;
+      let res: Awaited<ReturnType<typeof deps.mintSignalingToken>>;
+      try {
+        res = await deps.mintSignalingToken(cfg.authToken, cfg.sessionId);
+      } catch (err) {
+        if (destroyed) return;
+        const delay = Math.min(
+          MINT_RETRY_BASE_DELAY_MS * 2 ** attempt,
+          MINT_RETRY_MAX_DELAY_MS,
+        );
+        if (isTransientMintError(err) && elapsedBackoffMs + delay <= MINT_RETRY_BUDGET_MS) {
+          elapsedBackoffMs += delay;
+          await mintRetryWait(delay);
+          if (destroyed) return;
+          continue;
+        }
+        failReconnect(err);
+        return;
+      }
+      if (destroyed) return;
+      // apiFetch resolves a bodyless 2xx to undefined; a malformed reconnect
+      // response is a failed reconnect, not a TypeError at the user.
+      const signaling = res?.signaling;
+      if (!signaling?.url || !signaling?.token) {
+        failReconnect(new Error("malformed signaling envelope"));
+        return;
+      }
+      handoff = true; // L4 — latch BEFORE the page re-seats coords
+      cfg.callbacks.onReplacementSignaling({
+        url: signaling.url,
+        token: signaling.token,
+        // #509: from the mint that produced these coords, not the launch
+        iceServers: signaling.ice_servers ?? [],
+      });
+      return;
+    }
+  }
+
   function handleRecovery(next: RecoveryState): void {
     set({ recovery: next });
     // L6 — `superseded` must never reach the mint below; the controller has
@@ -473,35 +575,9 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
     }
     if (next.phase !== "failed" || mintInFlight || destroyed) return;
     mintInFlight = true;
-    void deps
-      .mintSignalingToken(cfg.authToken, cfg.sessionId)
-      .then((res) => {
-        // apiFetch resolves a bodyless 2xx to undefined; a malformed reconnect
-        // response is a failed reconnect, not a TypeError at the user.
-        const signaling = res?.signaling;
-        if (!signaling?.url || !signaling?.token) throw new Error("malformed signaling envelope");
-        if (destroyed) return;
-        handoff = true; // L4 — latch BEFORE the page re-seats coords
-        cfg.callbacks.onReplacementSignaling({
-          url: signaling.url,
-          token: signaling.token,
-          // #509: from the mint that produced these coords, not the launch
-          iceServers: signaling.ice_servers ?? [],
-        });
-      })
-      .catch((err: unknown) => {
-        // only server-authored text is ever shown
-        const detail = err instanceof ApiError ? err.message : undefined;
-        if (!(err instanceof ApiError)) {
-          reportBestEffortFailure("silent-debug", "session: mint replacement signaling token", err);
-        }
-        if (destroyed) return;
-        set({ status: "Reconnect failed — this session can no longer be resumed" });
-        cfg.callbacks.onReconnectFailed(detail);
-      })
-      .finally(() => {
-        mintInFlight = false;
-      });
+    void mintReplacementWithRetry().finally(() => {
+      mintInFlight = false;
+    });
   }
 
   return {
@@ -629,6 +705,9 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       if (destroyed) return;
       onChannelGone();
       destroyed = true; // after onChannelGone, so its snapshot reset publishes
+      // #128 — wakes a pending backoff wait so mintReplacementWithRetry sees
+      // `destroyed` and returns instead of leaving the timer armed.
+      cancelMintRetryWait();
       audioCleanup?.();
       audioCleanup = null;
       firstFrameCleanup?.();
