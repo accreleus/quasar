@@ -441,10 +441,13 @@ What you see instead:
 
 - **`0.3.0` has shipped** → it is listed, and Update Quasar moves you onto it
   normally. The switch is complete.
-- **`0.3.0` has not shipped yet** → the Releases list is empty and every target
-  reads *"Nothing newer has been detected on this channel."* The instance stays
-  on `0.3.0-rc.1` until stable passes it. This is not a failure state and needs
-  no action; switching back to beta immediately restores the full list.
+- **`0.3.0` has not shipped yet** → the Releases list is empty. In place of the
+  list you get *"Nothing newer than this control plane has been detected on the
+  stable channel."*, and each target on the Fleet update card reads *"Nothing
+  newer has been detected on this channel."* — the same fact said once for the
+  list and once per target. The instance stays on `0.3.0-rc.1` until stable
+  passes it. This is not a failure state and needs no action; switching back to
+  beta immediately restores the full list.
 
 The reason is the one-way migration rule. `0.3.0-rc.1` may have applied a
 migration that `0.2.5` does not embed, and a control plane booted below the
