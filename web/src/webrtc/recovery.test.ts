@@ -203,6 +203,54 @@ describe("RecoveryController", () => {
       expect(states.at(-1)?.phase).toBe("connected");
     });
 
+    it("reports a deferred ladder as NOT in flight, so the rebind sends one restart", () => {
+      // The session sends restart_ice for a ladder with requests already on the
+      // wire; a deferred ladder sends its own when signalingRestored() starts
+      // it. Counting deferred here puts two ICE-restart offers on the wire
+      // before either is answered, which the control plane cannot dedupe.
+      vi.useFakeTimers();
+      const { recovery } = build();
+
+      recovery.signalingLost("down");
+      recovery.interrupted("media wobbled");
+
+      expect(recovery.mediaRetryInFlight()).toBe(false);
+    });
+
+    it("stands a mid-flight ladder down when signalling drops, and resumes it after", () => {
+      vi.useFakeTimers();
+      const { retry, recovery } = build();
+
+      recovery.interrupted("media wobbled"); // ladder starts, attempt 1 fires at 0ms
+      vi.advanceTimersByTime(1);
+      expect(retry).toHaveBeenCalledTimes(1);
+
+      recovery.signalingLost("down"); // socket gone mid-ladder
+      vi.advanceTimersByTime(60_000);
+      expect(retry).toHaveBeenCalledTimes(1); // no attempt spent on a closed socket
+
+      // The resumed ladder keeps its place: attempt 2 waits the second rung's
+      // 5 s, it does not restart from zero.
+      recovery.signalingRestored();
+      vi.advanceTimersByTime(1);
+      expect(retry).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(5_000);
+      expect(retry).toHaveBeenCalledTimes(2);
+    });
+
+    it("drops a deferred ladder when media recovers on its own", () => {
+      vi.useFakeTimers();
+      const { retry, recovery } = build();
+
+      recovery.signalingLost("down");
+      recovery.interrupted("media wobbled");
+      recovery.connected(); // media healed while signalling was still down
+      recovery.signalingRestored();
+      vi.advanceTimersByTime(60_000);
+
+      expect(retry).not.toHaveBeenCalled();
+    });
+
     it("stays terminal: a signalling loss after `failed` changes nothing", () => {
       vi.useFakeTimers();
       const { states, recovery } = build();

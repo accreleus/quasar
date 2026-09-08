@@ -21,7 +21,12 @@ import { QuasarSession, WS_CLOSE_TAKEN_OVER, WS_CLOSE_TOKEN_REJECTED } from "./s
 import type { RecoveryState } from "./recovery";
 
 /** The minimum of RTCPeerConnection QuasarSession's constructor touches. */
+let lastPc: StubPeerConnection | null = null;
+
 class StubPeerConnection {
+  constructor() {
+    lastPc = this;
+  }
   iceConnectionState = "new";
   connectionState = "new";
   ontrack: unknown = null;
@@ -57,6 +62,7 @@ function startSession(): {
   states: RecoveryState[];
   ws: StubWebSocket;
   session: QuasarSession;
+  pc: StubPeerConnection;
 } {
   const states: RecoveryState[] = [];
   const session = new QuasarSession(
@@ -69,7 +75,7 @@ function startSession(): {
     (state) => states.push(state),
   );
   const ws = StubWebSocket.last!;
-  return { states, ws, session };
+  return { states, ws, session, pc: lastPc! };
 }
 
 const g = globalThis as unknown as Record<string, unknown>;
@@ -124,6 +130,30 @@ describe("QuasarSession WebSocket close handling (#526)", () => {
 
     expect(states.at(-1)?.phase).toBe("failed");
     expect(states.map((s) => s.phase)).not.toContain("signaling-lost");
+  });
+
+  // #128 MB2: `connectionState` goes `failed` when ANY transport fails, ICE
+  // included. Without the ICE guard this terminalises every ICE failure before
+  // the bounded in-place restart ladder gets its first attempt, turning a
+  // recoverable blip into a teardown.
+  it("does not terminalise an ICE failure through the connection-state arm", () => {
+    const { states, pc } = startSession();
+    pc.iceConnectionState = "failed";
+    (pc.oniceconnectionstatechange as () => void)();
+    pc.connectionState = "failed";
+    (pc.onconnectionstatechange as () => void)();
+
+    expect(states.map((s) => s.phase)).not.toContain("failed");
+    expect(states.at(-1)?.phase).toBe("degraded");
+  });
+
+  it("terminalises a DTLS failure, which an ICE restart cannot fix", () => {
+    const { states, pc } = startSession();
+    pc.connectionState = "failed"; // ICE is NOT failed
+    (pc.onconnectionstatechange as () => void)();
+
+    expect(states.at(-1)?.phase).toBe("failed");
+    expect(states.at(-1)?.message).toContain("DTLS");
   });
 
   // Media health is independent: ICE reporting connected must not paper over an

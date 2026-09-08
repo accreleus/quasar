@@ -126,6 +126,10 @@ const MINT_RETRY_MAX_DELAY_MS = 16_000;
  */
 const MAX_SIGNALING_EPISODES = 12;
 
+/** #128: signalling up this long means the outage is genuinely over, so the
+ *  episode count starts again. */
+const SIGNALING_STABLE_RESET_MS = 60_000;
+
 const TRANSPORT_STATES: readonly string[] = [
   "new",
   "checking",
@@ -377,8 +381,14 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
    *  narrowing would otherwise optimise away. */
   const currentIntent = (): "rebind" | "reseat" => reconnectIntent;
   /** #128 — signalling outages re-attached through, bounded by
-   *  MAX_SIGNALING_EPISODES. */
+   *  MAX_SIGNALING_EPISODES and forgiven after a spell of stable signalling. */
   let signalingEpisodes = 0;
+  /** Clears the episode count once signalling has held for
+   *  SIGNALING_STABLE_RESET_MS, so the cap catches a control plane that accepts
+   *  and immediately drops (which would otherwise burn all 12 in a second or
+   *  two) without ending a long, healthy session that saw a dozen unrelated
+   *  blips hours apart. */
+  let signalingStableTimer: ReturnType<typeof setTimeout> | null = null;
   /** #128 — set once reconnection has been abandoned, so the terminal phase it
    *  emits cannot re-enter the escalation it just left. */
   let reconnectGaveUp = false;
@@ -560,9 +570,26 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
     if (!(err instanceof ApiError)) {
       reportBestEffortFailure("silent-debug", "session: mint replacement signaling token", err);
     }
+    abandonReconnect("Reconnect failed — this session can no longer be resumed", detail);
+  }
+
+  /**
+   * #128 — the single exit for "we are not getting signalling back".
+   *
+   * It MUST terminalise the recovery controller, not just latch the runtime.
+   * On the rebind path the controller is sitting on `signaling-lost`, whose
+   * banner says the stream is still running and offers no action; and
+   * `reconnectGaveUp` then suppresses every later phase, so nothing would ever
+   * replace it. The user would be left reading "Reconnecting to the control
+   * plane" forever, with no way out. Before this change the mint was only ever
+   * reached THROUGH `failed`, so a terminal banner always already existed —
+   * which is exactly why it is easy to miss now.
+   */
+  function abandonReconnect(message: string, detail?: string): void {
     if (destroyed) return;
     reconnectGaveUp = true;
-    set({ status: "Reconnect failed — this session can no longer be resumed" });
+    transport?.signalingUnrecoverable(message);
+    set({ status: message });
     cfg.callbacks.onReconnectFailed(detail);
   }
 
@@ -631,6 +658,11 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       // reconnected socket with a dead media path.
       if (outcome === "open") {
         if (currentIntent() === "reseat") continue;
+        if (signalingStableTimer !== null) clearTimeout(signalingStableTimer);
+        signalingStableTimer = setTimeout(() => {
+          signalingStableTimer = null;
+          signalingEpisodes = 0;
+        }, SIGNALING_STABLE_RESET_MS);
         return;
       }
       if (outcome === "terminal") {
@@ -647,7 +679,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       // loops back to the mint rather than reusing the one just spent.
       const delay = Math.min(MINT_RETRY_BASE_DELAY_MS * 2 ** attempt, MINT_RETRY_MAX_DELAY_MS);
       if (elapsedBackoffMs + delay > MINT_RETRY_BUDGET_MS) {
-        giveUpSignaling("The control plane did not come back; this session can no longer be resumed");
+        abandonReconnect("The control plane did not come back; this session can no longer be resumed");
         return;
       }
       elapsedBackoffMs += delay;
@@ -656,14 +688,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
     }
   }
 
-  /** #128 — abandon signalling re-attachment and say so in one place. */
-  function giveUpSignaling(message: string): void {
-    if (destroyed) return;
-    reconnectGaveUp = true;
-    transport?.signalingUnrecoverable(message);
-    set({ status: message });
-    cfg.callbacks.onReconnectFailed(undefined);
-  }
+
 
   function handleRecovery(next: RecoveryState): void {
     set({ recovery: next });
@@ -686,7 +711,7 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
     if (next.phase === "signaling-lost") {
       if (mintInFlight) return;
       if (signalingEpisodes >= MAX_SIGNALING_EPISODES) {
-        giveUpSignaling("Signalling kept dropping; this session can no longer be resumed");
+        abandonReconnect("Signalling kept dropping; this session can no longer be resumed");
         return;
       }
       signalingEpisodes += 1;
@@ -847,6 +872,11 @@ export function createSessionRuntime(cfg: SessionRuntimeConfig): SessionRuntime 
       // #128 — wakes a pending backoff wait so mintReplacementWithRetry sees
       // `destroyed` and returns instead of leaving the timer armed.
       cancelMintRetryWait();
+      // #128 — nothing may outlive destroy (L5), including the episode-count reset.
+      if (signalingStableTimer !== null) {
+        clearTimeout(signalingStableTimer);
+        signalingStableTimer = null;
+      }
       audioCleanup?.();
       audioCleanup = null;
       firstFrameCleanup?.();

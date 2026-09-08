@@ -847,7 +847,10 @@ export function SessionPage() {
                 }
                 message={
                   recovery.phase === "signaling-lost"
-                    ? "Your stream is still running. Session controls are unavailable until this reconnects."
+                    ? // Lead with what the user cares about — the stream is
+                      // fine — but keep the controller's reason, which names
+                      // the close code and is what a bug report needs.
+                      `Your stream is still running. Session controls are unavailable until this reconnects. (${recovery.message})`
                     : recovery.message
                 }
                 actions={

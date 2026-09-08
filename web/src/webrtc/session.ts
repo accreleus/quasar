@@ -36,19 +36,25 @@ export const WS_CLOSE_TAKEN_OVER = 4410;
 
 /**
  * #128 — the control plane refused the token (invalid / expired / already used).
- * Unlike every other close code this is NOT worth re-attaching for: a rebind
- * mints a fresh token and would be refused the same way, so it stays terminal.
+ * Terminal for the in-place rebind: re-attaching the SAME media generation is
+ * pointless once the control plane has rejected our credential. It does not
+ * stop the runtime's ordinary re-seat, which mints a fresh token and can
+ * legitimately succeed against an expired one — that path is unchanged.
  */
 export const WS_CLOSE_TOKEN_REJECTED = 4401;
 
 /**
- * #128 — close codes a fresh attach cannot fix, so they stay terminal instead
- * of entering the re-attach loop.
+ * #128 — close codes that end the in-place re-attach loop, because another
+ * attach of THIS media generation cannot help.
  *
- *   4401  the token was refused; another minted token is refused the same way.
+ *   4401  the credential was refused.
  *   4404  the session is gone or terminal; the control plane sends this
  *         mid-session the moment the row terminalises (signal/handler.go), and
- *         a re-mint would only 409.
+ *         a re-mint only 409s.
+ *
+ * Both fall through to the recovery machine's terminal phase, which the runtime
+ * answers with its ordinary re-seat. That is deliberate: for 4401 a fresh token
+ * may well work, and for 4404 the mint fails fast.
  */
 const NON_REATTACHABLE_CLOSE_CODES: ReadonlySet<number> = new Set([4401, 4404]);
 
@@ -212,11 +218,16 @@ export class QuasarSession {
       const s = this.pcVideo.connectionState;
       this.onWebRtcStateChange?.("connection", prevConnectionState, s);
       prevConnectionState = s;
-      // #128: a PC that fails while ICE does not is a DTLS failure. An ICE
-      // restart does not reset DTLS, so this is reported, not retried —
-      // previously it was forwarded to the tracer and nowhere else, leaving the
-      // user on a dead stream with no verdict.
-      if (s === "failed") {
+      // #128: `connectionState` goes `failed` when ANY transport fails, ICE
+      // included, so the ICE guard is load-bearing — without it this fires on
+      // every ICE failure and terminalises the session before the bounded
+      // in-place restart ladder (oniceconnectionstatechange above) gets its
+      // first attempt, turning every recoverable network blip into a teardown.
+      // What is left once ICE is excluded is a DTLS failure, which an ICE
+      // restart does not reset, so it is reported rather than retried.
+      // Previously it went to the tracer and nowhere else, leaving the user on
+      // a dead stream with no verdict at all.
+      if (s === "failed" && this.pcVideo.iceConnectionState !== "failed") {
         this.recovery.terminal("Peer connection failed (DTLS) — the media path cannot be recovered");
       }
     };
@@ -238,7 +249,13 @@ export class QuasarSession {
       // The launch screen's first step. A signal, not a status string: the
       // strings are prose and change.
       this.onSignalingOpen?.();
-      this.onStatus(requestOfferOnOpen ? "signaling restored — requesting media" : "ws open — waiting for offer");
+      this.onStatus(
+        requestOfferOnOpen
+          ? "signaling restored — requesting media"
+          : this.pendingRebind
+            ? "signaling reattached — stream continuing"
+            : "ws open — waiting for offer",
+      );
       if (requestOfferOnOpen) {
         this.wsSend({ type: "restart_ice", pc: "video" });
         this.wsSend({ type: "restart_ice", pc: "audio" });
@@ -248,10 +265,13 @@ export class QuasarSession {
       if (this.pendingRebind) {
         // Anything wsSend() dropped while the socket was down is gone: ICE
         // candidates and the recovery controller's own restart requests are
-        // silently discarded when the socket is not OPEN. One restart_ice
-        // regenerates all of it, and is only worth sending if media recovery
-        // was actually mid-flight.
-        if (this.recovery.mediaRetryPending()) this.wsSend({ type: "restart_ice", pc: "video" });
+        // silently discarded when the socket is not OPEN. Regenerate them for a
+        // ladder that had requests IN FLIGHT — but not for one that was merely
+        // deferred, because signalingRestored() below starts that ladder and it
+        // sends its own. Sending both puts two ICE-restart offers on the wire
+        // before either is answered, which the control plane's dedupe cannot
+        // absorb (it arms on an agent offer, not on the request).
+        if (this.recovery.mediaRetryInFlight()) this.wsSend({ type: "restart_ice", pc: "video" });
         this.recovery.signalingRestored();
         this.pendingRebind("open");
       }
@@ -495,6 +515,10 @@ export class QuasarSession {
    */
   rebindSignaling(signalingUrl: string, token: string): Promise<RebindOutcome> {
     if (this.closed) return Promise.resolve("terminal");
+    // Settle any attempt still outstanding rather than overwriting its
+    // resolver: the orphan would never resolve, and its timeout would go on to
+    // detach the socket this call is about to open.
+    this.pendingRebind?.("retry");
     // Detach before closing: the old socket's handlers must not report this
     // deliberate close as another signalling loss.
     this.detachSocket(this.ws);

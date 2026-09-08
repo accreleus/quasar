@@ -562,6 +562,52 @@ describe("#128 — signalling loss does not destroy a healthy media path", () =>
     expect(h.callbacks.onReplacementSignaling).toHaveBeenCalledTimes(1);
   });
 
+  it("leaves a terminal, actionable state when the mint fails during a rebind (MB1)", async () => {
+    // The rebind path sits on `signaling-lost`, whose banner says the stream is
+    // still running and offers no action, and reconnectGaveUp then suppresses
+    // every later phase. Without terminalising the controller the user reads
+    // "Reconnecting to the control plane" forever with no way out.
+    const h = harness({
+      mint: (async () => {
+        throw new ApiError(409, "conflict", "session is not reconnectable");
+      }) as never,
+    });
+    h.runtime.start();
+    h.transport.fireIce("connected");
+    h.transport.fireRecovery("signaling-lost");
+    await flush();
+    await flush();
+
+    expect(h.transport.unrecoverable.length).toBe(1);
+    expect(h.callbacks.onReconnectFailed).toHaveBeenCalledTimes(1);
+  });
+
+  it("forgives the episode count once signalling has held (N4)", async () => {
+    // Without the reset, twelve unrelated blips over a long session end it; with
+    // no floor, a control plane that accepts then drops burns all twelve in
+    // seconds. This pins the reset half.
+    const h = harness();
+    h.runtime.start();
+    h.transport.fireIce("connected");
+    for (let i = 0; i < 3; i++) {
+      h.transport.fireRecovery("signaling-lost");
+      await flush();
+      await flush();
+    }
+    expect(h.transport.rebinds.length).toBe(3);
+
+    await vi.advanceTimersByTimeAsync(60_000); // signalling held
+    for (let i = 0; i < 11; i++) {
+      h.transport.fireRecovery("signaling-lost");
+      await flush();
+      await flush();
+    }
+
+    // Still re-attaching: the count restarted rather than carrying the first three.
+    expect(h.transport.rebinds.length).toBe(14);
+    expect(h.callbacks.onReconnectFailed).not.toHaveBeenCalled();
+  });
+
   it("still re-seats when the media path is what died", async () => {
     // The pre-existing escalation must survive: `failed` is the media verdict.
     const h = harness();

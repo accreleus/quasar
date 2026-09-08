@@ -86,7 +86,11 @@ export class RecoveryController {
     this.clearPending();
     const recovered = this.attempt > 0;
     this.attempt = 0;
-    // #128: media being healthy does not clear a signalling outage. Reporting
+    // #128: media recovered on its own, so a ladder held for it is no longer
+    // wanted. Left armed it fires a pointless ICE restart the moment signalling
+    // returns — a visible interruption on a path that was already working.
+    this.mediaRetryDeferred = false;
+    // Media being healthy does not clear a signalling outage, though. Reporting
     // "Connected" here would hide an in-progress re-attach behind a green state.
     if (this.signalingDown) {
       // Emitted only on change: media telemetry calls this every tick.
@@ -124,11 +128,17 @@ export class RecoveryController {
     this.emit("connected", "Connected");
   }
 
-  /** True while a media recovery is in flight or was deferred by an outage
-   *  (#128) — the session sends one `restart_ice` on rebind to regenerate what
-   *  a closed socket dropped. */
-  mediaRetryPending(): boolean {
-    return this.mediaRetryDeferred || this.timer != null || this.attempt > 0;
+  /**
+   * True while a media recovery has requests IN FLIGHT (#128) — a rebind sends
+   * one `restart_ice` for these, to regenerate what the closed socket dropped.
+   *
+   * Deliberately excludes `mediaRetryDeferred`: a deferred ladder has sent
+   * nothing yet and `signalingRestored()` starts it, which sends its own. If
+   * this counted deferred too, a rebind would put two ICE-restart offers on the
+   * wire before either was answered.
+   */
+  mediaRetryInFlight(): boolean {
+    return this.timer != null || this.attempt > 0;
   }
 
   /** True while the signalling socket is known to be down (#128). */
@@ -137,7 +147,7 @@ export class RecoveryController {
   }
 
   interrupted(reason = "Network path interrupted"): void {
-    if (this.stopped || this.timer || this.attempt > 0) return;
+    if (this.stopped || this.timer || this.attempt > 0 || this.mediaRetryDeferred) return;
     this.emit("degraded", reason);
     // #128: the retry ladder talks over the signalling socket. With that socket
     // down every attempt is a silent no-op, so hold the ladder and run it when
@@ -185,6 +195,15 @@ export class RecoveryController {
     this.timer = this.setTimer(() => {
       this.timer = null;
       if (this.stopped) return;
+      // #128: signalling went away while this ladder was mid-flight. `onRetry`
+      // sends restart_ice over that socket and wsSend drops it silently, so
+      // continuing here would spend the remaining attempts on nothing and
+      // terminalise a session the host is still holding. Stand down and let
+      // signalingRestored() resume.
+      if (this.signalingDown) {
+        this.mediaRetryDeferred = true;
+        return;
+      }
       this.attempt += 1;
       this.emit(
         "reconnecting",
