@@ -1149,11 +1149,15 @@ rc_of 2 "bench:run-bad-codec" -- env -u HOST bash "$DX/bench_run.sh" --profile 1
 rc_of 2 "bench:run-pulse-not-int" -- env -u HOST bash "$DX/bench_run.sh" --profile 1080p60-h264 --bench-mode --input-pulse-every abc
 # A pulse with no in-page instrument to answer it measures nothing.
 rc_of 2 "bench:run-pulse-without-bench" -- env -u HOST bash "$DX/bench_run.sh" --profile 1080p60-h264 --input-pulse-every 10
-# QUASAR_HOSTS_JSON, as everywhere else: qses resolves roles through the skills'
-# hosts.json, and without the override these read the OPERATOR's file — so they
-# fail in any checkout that does not have one, before reaching the guard.
-rc_of 2 "bench:qses-bad-codec" -- env QUASAR_HOSTS_JSON="$FIX_HOSTS" bash "$ROOT/.claude/skills/quasar-session/scripts/qses" run --codec vp9
-rc_of 2 "bench:qses-pulse-without-bench" -- env QUASAR_HOSTS_JSON="$FIX_HOSTS" bash "$ROOT/.claude/skills/quasar-session/scripts/qses" run --input-pulse-every 5
+# qses resolves roles through the SKILLS' hosts.json, whose schema is not the DX
+# fixture's. Without an override these read the OPERATOR's real file and fail in
+# any checkout without one, long before reaching the guard under test. Same
+# posture as qses_stop_case below: a synthetic file, never operator config.
+QSES_FIX_HOSTS="$WORK/qses-guard-hosts.json"
+printf '{"_schema":"quasar-skills/hosts@2","roles":{"aux-infra":"faked","gpu-test":"faked"},"hosts":{"faked":{"ssh_alias":"ignored","dir":"%s","api":"http://127.0.0.1:1","api_external":"http://127.0.0.1:1"}}}\n' \
+  "$WORK" > "$QSES_FIX_HOSTS"
+rc_of 2 "bench:qses-bad-codec" -- env QUASAR_HOSTS_JSON="$QSES_FIX_HOSTS" bash "$ROOT/.claude/skills/quasar-session/scripts/qses" run --codec vp9
+rc_of 2 "bench:qses-pulse-without-bench" -- env QUASAR_HOSTS_JSON="$QSES_FIX_HOSTS" bash "$ROOT/.claude/skills/quasar-session/scripts/qses" run --input-pulse-every 5
 
 # ── --peer (2026-08-19, docs/reports/2026-08-19-peer-path/REPORT.md) ─────────
 rc_of 2 "bench:run-peer-bogus" -- env -u HOST bash "$DX/bench_run.sh" --profile 1080p60-h264 --peer bogus
@@ -1249,7 +1253,7 @@ fi
 # --codec so the run still exits 2, but the failure text must be the codec
 # guard, not "unknown arg --peer-unlock-fps" (which would mean the parser
 # never reached the --peer-unlock-fps case at all).
-qses_punlock_out="$(env -u HOST QUASAR_HOSTS_JSON="$FIX_HOSTS" bash "$ROOT/.claude/skills/quasar-session/scripts/qses" run --peer-unlock-fps --codec vp9 2>&1 || true)"
+qses_punlock_out="$(env -u HOST QUASAR_HOSTS_JSON="$QSES_FIX_HOSTS" bash "$ROOT/.claude/skills/quasar-session/scripts/qses" run --peer-unlock-fps --codec vp9 2>&1 || true)"
 if printf '%s' "$qses_punlock_out" | grep -q -- '--codec must be' && ! printf '%s' "$qses_punlock_out" | grep -q 'unknown arg --peer-unlock-fps'; then
   pass "bench:qses-peer-unlock-fps-parses" "--peer-unlock-fps is recognized, parsing continues to the codec guard"
 else
