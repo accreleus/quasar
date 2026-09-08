@@ -316,7 +316,7 @@ pub async fn run(cfg: Config) {
                 }
                 error!(
                     token = "agent-connection-failed",
-                    "agent connection failed: {e:#}; reconnecting in {backoff:?}"
+                    "agent connection failed: {e:#}"
                 );
                 // One line on the cycle that crosses the threshold: every retry
                 // already logs above, so this fires only when transient becomes
@@ -338,12 +338,23 @@ pub async fn run(cfg: Config) {
                     sessions.registered_this_connection = false;
                     backoff = Duration::from_secs(1);
                 }
-                let cap = if sessions.running_count() > 0 {
+                // The tight cap exists to reach a returning control plane before the
+                // grace expires. Once it HAS expired there is nothing left to save,
+                // and `running` still holds the stopped sessions until the next
+                // connection prunes them -- so without the is_finished() term the
+                // agent would poll a dead control plane every 5 s forever.
+                let grace_spent = sessions
+                    .grace_timer
+                    .as_ref()
+                    .map(|t| t.is_finished())
+                    .unwrap_or(false);
+                let cap = if sessions.running_count() > 0 && !grace_spent {
                     HELD_SESSION_BACKOFF_CAP
                 } else {
                     Duration::from_secs(30)
                 };
                 let wait = backoff.min(cap);
+                info!("reconnecting in {wait:?}");
                 sleep(wait).await;
                 backoff = (wait * 2).min(Duration::from_secs(30));
             }
@@ -1035,11 +1046,23 @@ async fn connect_and_run(
     // fresh 90 s and a control plane that never returned never stopped anything.
     sessions.registered_this_connection = true;
     if let Some(t) = sessions.grace_timer.take() {
-        t.abort();
-        info!(
-            token = "session-grace-cleared",
-            "control plane returned within the grace window; held sessions continue"
-        );
+        // is_finished() distinguishes "we beat the deadline" from "we did not".
+        // Aborting a completed task is a no-op, so without this check a control
+        // plane returning at 91 s logged `session-grace-expired` and then
+        // `session-grace-cleared` while the sessions were being torn down --
+        // exactly the pair a live gate reads to decide whether this works.
+        if t.is_finished() {
+            warn!(
+                token = "session-grace-missed",
+                "control plane returned AFTER the grace window; the held sessions were already stopped"
+            );
+        } else {
+            t.abort();
+            info!(
+                token = "session-grace-cleared",
+                "control plane returned within the grace window; held sessions continue"
+            );
+        }
     }
     // Clear the failure streak before a stale count can flip /health unhealthy.
     health.record_registered();

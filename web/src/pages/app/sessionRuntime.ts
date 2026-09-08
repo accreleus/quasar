@@ -102,7 +102,18 @@ const ICE_UP: readonly string[] = ["connected", "completed"];
 
 /** #128: the replacement-token mint retry budget, sized to outlast a
  *  control-plane recreate (measured ~70s). Exponential from ~1s, capped ~16s. */
-const MINT_RETRY_BUDGET_MS = 90_000;
+// Must OUTLAST the agent's own grace window (QUASAR_SESSION_GRACE_SECS, 90 s by
+// default), because the host is the authority on whether the session still
+// exists: the client should still be asking at the moment the host decides.
+//
+// At 90 s the attempts landed at 0, 1, 3, 7, 15, 31, 47, 63, 79 s and the budget
+// expired before the next one, leaving 4-6 s of margin against a ~70 s
+// control-plane recreate -- so a slightly slower recreate (an image pull, a long
+// migration) ended the stream in the browser while the agent was still happily
+// holding it. 120 s puts the last attempt at 111 s, past the host's decision
+// point. Once the grace HAS expired the host answers 409, which fails fast, so
+// the larger budget costs nothing in the genuinely-dead case.
+const MINT_RETRY_BUDGET_MS = 120_000;
 const MINT_RETRY_BASE_DELAY_MS = 1_000;
 const MINT_RETRY_MAX_DELAY_MS = 16_000;
 

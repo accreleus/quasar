@@ -538,6 +538,13 @@ func (h *Handler) handleSignalingToken(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not get session")
 		return
 	}
+	// Terminal FIRST: a session the stale sweep already failed is dead whether or
+	// not its host is connected, and answering the retryable 503 below would make
+	// the client retry a corpse for its whole budget instead of failing fast.
+	if sess.State.IsTerminal() {
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "session is not reconnectable")
+		return
+	}
 	// #128: a session now SURVIVES a control-plane restart, so this row can be
 	// `running` while its agent is still reconnecting. Minting then would hand the
 	// browser fresh coordinates, and re-seating them destroys the peer connection

@@ -2968,6 +2968,15 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 404: components["responses"]["NotFound"];
                 409: components["responses"]["Conflict"];
+                /** @description agent_not_connected — the session's host agent is reconnecting. RETRYABLE: the session is alive and its media may still be flowing; retry with backoff rather than treating this as terminal. */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
             };
         };
         delete?: never;
