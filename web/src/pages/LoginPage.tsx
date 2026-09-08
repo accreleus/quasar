@@ -21,7 +21,7 @@ interface FromState {
 }
 
 export function LoginPage() {
-  const { status, login } = useAuth();
+  const { status, login, sessionExpired } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const redirectTo = (location.state as FromState | null)?.from?.pathname ?? "/app";
@@ -78,6 +78,15 @@ export function LoginPage() {
 
   return (
     <AuthCard>
+      {/* Why the user is back here, when they did not choose to be (#154). The
+          form-level alert style the register form already uses — nothing new is
+          styled, and `status` rather than `alert` because this is present at
+          first render rather than announced on a change. */}
+      {sessionExpired && (
+        <p className="error" role="status">
+          Your session expired. Sign in again to pick up where you left off.
+        </p>
+      )}
       <form onSubmit={onSubmit} noValidate>
         <div className="field">
           <label htmlFor="login-email">Email</label>
