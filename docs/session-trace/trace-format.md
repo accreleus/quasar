@@ -145,8 +145,9 @@ document records (§8, §9) were estimator confusion, one level apart.
 > documented as a live ping-as-input-marker interactive-latency metric but never emitted
 > by `buildMetrics()` in `web/src/webrtc/telemetry.ts` — a dead key, not a live metric.
 > Removed rather than backfilled with a synthesized value (the IL-0 finding was written up
-> in `docs/research/input-latency-analysis.md`, which did not survive the public-release
-> history squash; see §4 below for the parallel removal from the clock-fields note). A
+> in `docs/research/input-latency-analysis.md`, which was deliberately not carried over
+> to the public repository; see §4 below for the parallel removal from the clock-fields
+> note). A
 > future re-derivation is new work
 > against this doc, not a resurrection of this row.
 

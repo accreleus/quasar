@@ -7,8 +7,7 @@ conventions, gotchas). This file is the index to everything else.
 **Organizing principle (historical):** anything **complete** used to live under `completed/`,
 with `design/` holding live implementation plans and `research/` holding performance/latency
 write-ups. **None of `completed/`, `design/`, `research/`, `tech-debt/`, or the `phase6/`–`phase9/`
-scope stubs exist in this repo** — they did not survive the 2026-08-31 public-release history
-squash (commit `590abb4`) and are not recoverable from this repo's git history. What follows
+scope stubs exist in this repo** — they were deliberately not carried over to the public repository. What follows
 records what each of those held, for context; going forward, plans and specs are filed under
 [`superpowers/plans/`](superpowers/plans/) and `superpowers/specs/`, and dated write-ups under
 [`reports/`](reports/).
@@ -32,8 +31,7 @@ The browser transport is WebRTC (`webrtcbin`); a native UDP client is the planne
 
 The numbered-phase framing below is historical. Current work follows the
 **integrated roadmap spec v2** (a library-provider model + wave ladder). Its source
-document, `design/plans/2026-07-06-roadmap-spec-v2.html`, did not survive the
-public-release history squash and is not recoverable from this repo. What's on record:
+document, `design/plans/2026-07-06-roadmap-spec-v2.html`, was deliberately not carried over to the public repository. What's on record:
 W0 (image consolidation) and W1 (security wave) are merged; W2 is active: the
 console-mode work (local-display sessions on a host's attached monitor) in parallel
 with Phase 9 closure (the native client).
@@ -42,7 +40,7 @@ with Phase 9 closure (the native client).
 
 Per-phase archive directories (`completed/phaseN-*`, `phase6/`–`phase9/`) do not exist
 in this repo — see the note above. Status is on record here and in
-`architecture-and-plan.md`; per-phase detail is not recoverable.
+`architecture-and-plan.md`; per-phase detail is not public.
 
 | Phase | Status |
 |---|---|
@@ -80,11 +78,11 @@ above) — listed here for the record, with no working link:
 
 | Doc | What |
 |---|---|
-| [`../deploy/README.md`](../deploy/README.md) | Deploy / run the stack (the Phase-0 dev-env doc, `completed/phase0-setup.md`, did not survive the public-release history squash) |
+| [`../deploy/README.md`](../deploy/README.md) | Deploy / run the stack (the Phase-0 dev-env doc, `completed/phase0-setup.md`, was deliberately not carried over to the public repository) |
 | [`configuration.md`](configuration.md) | Every env var — default + accepted values |
 | [`third-party-pins.md`](third-party-pins.md) | The pinned `gst-wayland-display` / `gst-interpipe` commits and how to flip them to a release |
-| [`reports/`](reports/) | Dated investigation/validation write-ups (current archive; the pre-squash `research/` directory — perf summary, input-latency analysis — does not exist) |
-| [`superpowers/plans/`](superpowers/plans/) | Implementation plans (current location; the pre-squash `design/` directory does not exist) |
+| [`reports/`](reports/) | Dated investigation/validation write-ups (current archive; the non-public `research/` directory — perf summary, input-latency analysis — does not exist) |
+| [`superpowers/plans/`](superpowers/plans/) | Implementation plans (current location; the non-public `design/` directory does not exist) |
 | `../protocol/` | Frozen wire contracts (signaling, input, agent/control/native-client APIs) — a `quasar-protocol` submodule |
 
 ## Future / deferred
