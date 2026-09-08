@@ -419,3 +419,45 @@ func TestParseManifestBaseURL(t *testing.T) {
 		}
 	}
 }
+
+// The bypass, pinned. Under `verify` a request that names no published version
+// is applied without a single fetch — because the requester chooses the version
+// whose absence reads as "unsigned". This test exists so the behaviour cannot
+// change silently in either direction: it is intended (edge releases and
+// reverts legitimately carry no version), it is NOT integrity, and the warning
+// is the only trace it leaves.
+func TestVerifyModeAppliesAnUnpublishedVersionAndSaysSoLoudly(t *testing.T) {
+	key, _ := genKey(t, "k")
+	var warned []string
+	pol := SignaturePolicy{
+		Mode: SignatureModeVerify,
+		Keys: []TrustedKey{key},
+		Warn: func(m string) { warned = append(warned, m) },
+	}
+	ev := &SignatureEvidence{Absent: true, Why: "no signature asset published for v9.9.9"}
+
+	if rej := checkSignature(ApplyRequest{}, pol, ev); rej != nil {
+		t.Fatalf("verify must apply an unsigned release, got %v", rej)
+	}
+	if len(warned) != 1 {
+		t.Fatalf("an unverified apply must warn exactly once, got %d: %v", len(warned), warned)
+	}
+	if !strings.Contains(warned[0], "UNVERIFIED") || !strings.Contains(warned[0], "v9.9.9") {
+		t.Fatalf("the warning must name the state and the version, got %q", warned[0])
+	}
+}
+
+// The same evidence under `require` is a refusal — the enforcement boundary.
+func TestRequireModeRefusesTheSameUnpublishedVersion(t *testing.T) {
+	key, _ := genKey(t, "k")
+	pol := SignaturePolicy{
+		Mode: SignatureModeRequire,
+		Keys: []TrustedKey{key},
+	}
+	ev := &SignatureEvidence{Absent: true, Why: "no signature asset published for v9.9.9"}
+
+	rej := checkSignature(ApplyRequest{}, pol, ev)
+	if rej == nil {
+		t.Fatal("require must refuse an unsigned release")
+	}
+}

@@ -16,6 +16,23 @@ import (
 // compromised control plane can ask for a digest set and this host still
 // installs only what a signed release names.
 //
+// THAT SENTENCE IS TRUE ONLY UNDER `require`. It is worth being exact, because
+// the opposite belief is the dangerous one:
+//
+// The version whose signature we go looking for comes from the request, so the
+// party being constrained chooses it. A request naming no version at all, or a
+// version that was never published, produces "no signature exists" — and under
+// `verify` that applies. A compromised control plane therefore bypasses
+// `verify` completely, without touching the network, by simply not naming a
+// published version. A null version is not even anomalous: edge releases send
+// one (platform/detect.go) and so does a revert with no release id.
+//
+// So `verify` buys exactly one thing: it catches a SIGNED release that has been
+// tampered with. It is a migration rung — it lets a fleet turn signing on while
+// unsigned releases are still in flight — not an enforcement boundary.
+// `require` is the enforcement boundary. Anything that reads otherwise is a
+// documentation bug and should be fixed here first.
+//
 // It needs no contract change: `release_apply` already carries
 // `release.version` (agent-api.md), which is all the URL needs.
 

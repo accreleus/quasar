@@ -633,10 +633,20 @@ log. Take the current `quasar-updater` service block from
 `_TRUSTED_KEYS` / `_MANIFEST_BASE_URL` / `_MANIFEST_TIMEOUT_S` lines to its
 `environment:`.
 
-**Go through `verify` first, not straight to `require`.** In `verify` a bad
-signature is refused and a release that publishes none is not, so a fleet can be
-configured before the first signed release exists, and again after it, with
-nothing breaking in between. Once every release you intend to apply is signed:
+**Go through `verify` first, not straight to `require` — but do not stop there.**
+In `verify` a bad signature is refused and a release that publishes none is not,
+so a fleet can be configured before the first signed release exists, and again
+after it, with nothing breaking in between.
+
+Be clear about what that costs while you sit in it. **`verify` is a migration
+rung, not a security boundary.** The apply request chooses which version's
+signature the updater looks for, so a request naming no version, or one that was
+never published, reads as "unsigned" and is applied — no network request, no
+refusal. Anything able to drive an apply can therefore walk straight past
+`verify`. It catches a *signed* release that has been tampered with in transit,
+and nothing else. Every unverified apply logs a WARN naming the version, so
+`docker logs quasar-updater | grep UNVERIFIED` tells you whether a host is still
+relying on that leniency. Once every release you intend to apply is signed:
 
 ```bash
 QUASAR_UPDATER_SIGNATURE_MODE=require

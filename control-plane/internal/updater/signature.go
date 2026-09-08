@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/url"
 	"regexp"
 	"strings"
@@ -68,6 +69,20 @@ type TrustedKey struct {
 type SignaturePolicy struct {
 	Mode string
 	Keys []TrustedKey
+	// Warn receives the "applied unverified" line. A field rather than a direct
+	// log call so a test can assert the warning happened — the bypass it marks
+	// is exactly the thing a silent code path must not have.
+	Warn func(string)
+}
+
+// warnf emits through Warn, defaulting to the standard logger.
+func (p SignaturePolicy) warnf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if p.Warn != nil {
+		p.Warn(msg)
+		return
+	}
+	log.Printf("updater: %s", msg)
 }
 
 // Enabled reports whether anything is fetched or graded at all.
@@ -159,6 +174,14 @@ func checkSignature(req ApplyRequest, pol SignaturePolicy, ev *SignatureEvidence
 			return reject(ReasonSignatureMissing,
 				"this host requires a signed release and this one carries no signature: %s", ev.Why)
 		}
+		// Applied unverified. Logged at WARN every time, deliberately: under
+		// `verify` this is also the bypass — the requester chooses the version,
+		// so naming an unpublished one (or none) lands here. A fleet whose logs
+		// fill with this is either mid-migration or being walked past its own
+		// signature check, and those look identical from inside one host. The
+		// version is named so the two can be told apart from outside.
+		pol.warnf("applying an UNVERIFIED release: %s (mode=verify accepts this; "+
+			"mode=require would refuse it)", ev.Why)
 		return nil
 	}
 

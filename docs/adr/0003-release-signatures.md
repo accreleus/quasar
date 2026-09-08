@@ -85,6 +85,23 @@ verifies, because whoever writes the document chooses the label.
 - Default off. An existing install applies releases exactly as it did.
 - `verify` is the transition rung: a bad signature is refused, a release that
   publishes none is not. `require` closes it.
+- **`verify` is not an enforcement boundary, and must not be described as one.**
+  The version whose signature the updater goes looking for comes from the apply
+  request, so the party being constrained chooses it. A request naming no
+  version, or one never published, produces "no signature exists" — which
+  `verify` applies. A compromised control plane therefore bypasses `verify`
+  entirely without touching the network. A null version is not even anomalous:
+  edge releases carry one, and so does a revert with no release id. `verify`
+  buys exactly one thing — it catches a *signed* release that has been tampered
+  with — and it exists so a fleet can turn signing on while unsigned releases
+  are still in flight. `require` is the boundary. Every unverified apply under
+  `verify` logs a WARN naming the version, so the gap is visible from outside
+  the host rather than silent.
+- Under `require`, the digest set is bound to a signed manifest, but nothing
+  binds it to a *recent* one: a compromised control plane can still install an
+  older genuine signed release, including a known-vulnerable one. Reverts are a
+  feature, so this is inherent rather than an oversight — but it is the limit of
+  what signing alone buys.
 - Fail closed on ambiguity. A fetch that could not be completed is never read as
   "unsigned", and a host told to verify with no trusted keys refuses every apply
   rather than checking nothing.
