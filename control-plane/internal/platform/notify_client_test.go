@@ -102,7 +102,7 @@ func TestPostSignsTheBodyWhenASecretIsConfigured(t *testing.T) {
 
 	d := &stubDoer{statuses: []int{200}}
 	got := postOnce(context.Background(), d, WebhookConfig{URL: u.String(), Secret: "s3cret"},
-		NotifyEventRelease, body, u)
+		NotifyEventRelease, deliveryID(), body, u)
 	if !got.OK {
 		t.Fatalf("postOnce = %+v, want ok", got)
 	}
@@ -123,7 +123,7 @@ func TestPostSignsTheBodyWhenASecretIsConfigured(t *testing.T) {
 	}
 
 	unsigned := &stubDoer{statuses: []int{200}}
-	postOnce(context.Background(), unsigned, WebhookConfig{URL: u.String()}, NotifyEventRelease, body, u)
+	postOnce(context.Background(), unsigned, WebhookConfig{URL: u.String()}, NotifyEventRelease, deliveryID(), body, u)
 	if sig := unsigned.calls[0].Header.Get(HeaderSignature); sig != "" {
 		t.Errorf("%s = %q with no secret, want none", HeaderSignature, sig)
 	}
@@ -152,7 +152,7 @@ func TestRetryPolicy(t *testing.T) {
 
 	t.Run("a 4xx is answered once", func(t *testing.T) {
 		d := &stubDoer{statuses: []int{404}}
-		got := sendWith(context.Background(), d, cfg, NotifyEventRelease, []byte("{}"), u)
+		got := sendWith(context.Background(), d, cfg, NotifyEventRelease, deliveryID(), []byte("{}"), u)
 		if got.OK || len(d.calls) != 1 {
 			t.Fatalf("calls=%d ok=%v, want one attempt and a failure", len(d.calls), got.OK)
 		}
@@ -163,7 +163,7 @@ func TestRetryPolicy(t *testing.T) {
 
 	t.Run("a 5xx is retried to the attempt bound", func(t *testing.T) {
 		d := &stubDoer{statuses: []int{500}}
-		got := sendWith(context.Background(), d, cfg, NotifyEventRelease, []byte("{}"), u)
+		got := sendWith(context.Background(), d, cfg, NotifyEventRelease, deliveryID(), []byte("{}"), u)
 		if got.OK || len(d.calls) != webhookHTTPAttempts {
 			t.Fatalf("calls=%d, want %d", len(d.calls), webhookHTTPAttempts)
 		}
@@ -171,7 +171,7 @@ func TestRetryPolicy(t *testing.T) {
 
 	t.Run("a 429 that then succeeds is delivered", func(t *testing.T) {
 		d := &stubDoer{statuses: []int{429, 204}}
-		got := sendWith(context.Background(), d, cfg, NotifyEventRelease, []byte("{}"), u)
+		got := sendWith(context.Background(), d, cfg, NotifyEventRelease, deliveryID(), []byte("{}"), u)
 		if !got.OK || len(d.calls) != 2 {
 			t.Fatalf("calls=%d ok=%v, want two attempts ending delivered", len(d.calls), got.OK)
 		}
@@ -179,7 +179,7 @@ func TestRetryPolicy(t *testing.T) {
 
 	t.Run("a transport failure is retried", func(t *testing.T) {
 		d := &stubDoer{err: errors.New("dial tcp: connection refused")}
-		got := sendWith(context.Background(), d, cfg, NotifyEventRelease, []byte("{}"), u)
+		got := sendWith(context.Background(), d, cfg, NotifyEventRelease, deliveryID(), []byte("{}"), u)
 		if got.OK || len(d.calls) != webhookHTTPAttempts || got.StatusCode != nil {
 			t.Fatalf("calls=%d status=%v, want %d attempts and no status", len(d.calls), got.StatusCode, webhookHTTPAttempts)
 		}
@@ -194,7 +194,7 @@ func TestErrorNeverCarriesTheWebhookURL(t *testing.T) {
 	u := mustURL(t, "https://hooks.example.com"+secretPath)
 
 	d := &stubDoer{err: errors.New("dial tcp 93.184.216.34:443: i/o timeout")}
-	got := sendWith(context.Background(), d, WebhookConfig{URL: u.String()}, NotifyEventRelease, []byte("{}"), u)
+	got := sendWith(context.Background(), d, WebhookConfig{URL: u.String()}, NotifyEventRelease, deliveryID(), []byte("{}"), u)
 
 	if strings.Contains(got.Error, secretPath) || strings.Contains(got.Error, "SUPERSECRETTOKEN") {
 		t.Fatalf("delivery error leaked the webhook URL: %q", got.Error)
@@ -219,5 +219,35 @@ func TestParseWebhookHostsUnsetMeansNoNarrowing(t *testing.T) {
 	got := parseWebhookHosts()
 	if _, ok := got["hooks.example.com"]; !ok || len(got) != 1 {
 		t.Fatalf("%s = %v, want one lowercased host", WebhookHostsEnv, got)
+	}
+}
+
+// TestRetriesReuseOneDeliveryID — the header a receiver deduplicates on must
+// name the SEND, not the attempt, or a 5xx that later succeeds is delivered
+// twice under two ids and the deduplication does nothing.
+func TestRetriesReuseOneDeliveryID(t *testing.T) {
+	noBackoff(t)
+	u := mustURL(t, "https://hooks.example.com/abc")
+
+	d := &stubDoer{statuses: []int{500, 204}}
+	if out := sendWith(context.Background(), d, WebhookConfig{URL: u.String()},
+		NotifyEventRelease, deliveryID(), []byte("{}"), u); !out.OK {
+		t.Fatalf("sendWith = %+v, want the second attempt delivered", out)
+	}
+	if len(d.calls) != 2 {
+		t.Fatalf("calls = %d, want two attempts", len(d.calls))
+	}
+	first := d.calls[0].Header.Get(HeaderDelivery)
+	second := d.calls[1].Header.Get(HeaderDelivery)
+	if first == "" || len(first) != 32 {
+		t.Fatalf("%s = %q, want 32 hex", HeaderDelivery, first)
+	}
+	if first != second {
+		t.Errorf("%s changed across a retry: %q then %q", HeaderDelivery, first, second)
+	}
+	// The signature material is per-attempt even so, which is what keeps a
+	// captured delivery from being replayable.
+	if d.calls[0].Header.Get(HeaderTimestamp) == "" {
+		t.Error("no timestamp header on the first attempt")
 	}
 }

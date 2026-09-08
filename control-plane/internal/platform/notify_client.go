@@ -86,17 +86,20 @@ func SendWebhook(ctx context.Context, cfg WebhookConfig, ev Event) Delivery {
 		return done(Delivery{Error: "could not build the webhook client"})
 	}
 
-	return done(sendWith(ctx, client, cfg, ev.Event, body, u))
+	// One delivery id for the whole send, not one per attempt: a receiver is
+	// told to deduplicate on X-Quasar-Delivery, which only works if a 5xx that
+	// later succeeds arrives under the SAME id.
+	return done(sendWith(ctx, client, cfg, ev.Event, deliveryID(), body, u))
 }
 
 // sendWith is the retry policy over one Doer: bounded attempts, and only for a
 // failure that could plausibly answer differently later. Split from SendWebhook
 // so a test drives it without a live dial (outbound refuses loopback, so an
 // httptest server is not reachable from here by construction).
-func sendWith(ctx context.Context, d outbound.Doer, cfg WebhookConfig, event string, body []byte, u *url.URL) Delivery {
+func sendWith(ctx context.Context, d outbound.Doer, cfg WebhookConfig, event, delivery string, body []byte, u *url.URL) Delivery {
 	var last Delivery
 	for attempt := 1; attempt <= webhookHTTPAttempts; attempt++ {
-		last = postOnce(ctx, d, cfg, event, body, u)
+		last = postOnce(ctx, d, cfg, event, delivery, body, u)
 		if last.OK || !retryable(last.StatusCode) {
 			return last
 		}
@@ -106,13 +109,19 @@ func sendWith(ctx context.Context, d outbound.Doer, cfg WebhookConfig, event str
 		select {
 		case <-ctx.Done():
 			return last
+		// Deliberately our own linear backoff, ignoring a Retry-After on a 429:
+		// honouring one would let a receiver hold a detection pass open for as
+		// long as it likes, and the whole ladder is bounded at ~21 s so that it
+		// cannot. A rate-limited notification is retried by the NEXT pass.
 		case <-time.After(time.Duration(attempt) * webhookRetryBackoff):
 		}
 	}
 	return last
 }
 
-func postOnce(ctx context.Context, client outbound.Doer, cfg WebhookConfig, event string, body []byte, u *url.URL) Delivery {
+// postOnce is one HTTP attempt. `delivery` is the send's id, constant across
+// the retries, while the timestamp and therefore the signature are per-attempt.
+func postOnce(ctx context.Context, client outbound.Doer, cfg WebhookConfig, event, delivery string, body []byte, u *url.URL) Delivery {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
 	if err != nil {
 		return Delivery{Error: "could not build the webhook request"}
@@ -122,7 +131,7 @@ func postOnce(ctx context.Context, client outbound.Doer, cfg WebhookConfig, even
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "quasar-control-plane/"+buildinfo.Get().Version)
 	req.Header.Set(HeaderEvent, event)
-	req.Header.Set(HeaderDelivery, deliveryID())
+	req.Header.Set(HeaderDelivery, delivery)
 	req.Header.Set(HeaderTimestamp, ts)
 	if cfg.Secret != "" {
 		req.Header.Set(HeaderSignature, Signature(cfg.Secret, ts, body))
