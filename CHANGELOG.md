@@ -37,6 +37,16 @@ own; the two do not move together, and that is deliberate.
   signalling **in place**, keeping the peer connections, the input channel and
   telemetry untouched. Only a dead media path rebuilds the transport. A refused
   token (4401), an ended session (4404) and a takeover (4410) stay terminal.
+- Encoder certification no longer caps a session with a measurement taken under a
+  different GPU driver. A certification records `encode_ms` for one silicon + driver +
+  encode-stack combination, but nothing on the wire carried that combination, so an old
+  performance cap stayed applicable for its full week after a driver change. Agents now
+  report a per-GPU driver identity (NVIDIA kernel-module version, else the Vulkan
+  driver properties, which cover RADV/AMDVLK/ANV), the control plane stamps it onto each
+  certification row, and the launch path skips rows carrying a different one. A host
+  that reports no identity, and every certification measured before this shipped, stay
+  applicable exactly as before — dropping those caps would start sessions at rungs the
+  host may not sustain (#144, migration 0078).
 - The agent-side and control-plane-side groundwork for the above (#128). The agent now
   holds its sessions for a bounded grace window instead of stopping them when its
   websocket drops, and the control plane reconciles against the agent's own

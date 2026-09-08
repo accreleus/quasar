@@ -34,6 +34,14 @@ in which case the launch hops once to the next-lower *chain* and re-resolves.
 The lookup is per rung; the remedy is per chain. A missing cert row is
 optimism, not a refusal.
 
+**Driver identity** — the opaque per-GPU fingerprint of the driver and encode
+stack a host is running (`nvidia:610.57.04`, `vk:radv:Mesa 25.3.6`), reported on
+`capacity` and stamped onto every cert row written for that GPU. It says which
+measurements still describe reality: a cert measured before a driver change
+describes software that is no longer installed. Compared for equality, never
+parsed. _Unknown is a value_ — an agent that reports none, and every row written
+before it existed, keep their measurements applicable.
+
 **Stream plan** — the whole post-placement decision as one value: the resolved
 chain and rung, whether the cap fired, the decision record, and exactly what to
 persist. Computed from gathered inputs with no I/O, so the decision is

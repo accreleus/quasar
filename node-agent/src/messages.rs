@@ -473,6 +473,12 @@ pub struct GpuCapacity {
     /// `/dev/dri/renderD128`. Complements the by-path identity above.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_path: Option<String>,
+    /// Opaque fingerprint of this GPU's driver/encode stack (`crate::gpu_identity`),
+    /// e.g. `nvidia:595.99.02`, `vk:radv:Mesa 25.3.6`. The control plane stamps it onto
+    /// each encoder certification row and refuses a measurement carrying a different
+    /// one. Additive — absent means unknown, and matching then fails open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub driver_identity: Option<String>,
 }
 
 /// Per-session stream parameters in a `session_assign` (mirrors the sessions
@@ -1294,6 +1300,7 @@ mod tests {
                 encode_slots_total: 2,
                 render_node: None,
                 device_path: None,
+                driver_identity: None,
             }],
             gpu_detection: "ok".to_string(),
             gpu_detection_reason: None,
@@ -1343,6 +1350,7 @@ mod tests {
                 encode_slots_total: 2,
                 render_node: Some("/dev/dri/by-path/pci-0000:04:00.0-render".to_string()),
                 device_path: Some("/dev/dri/renderD128".to_string()),
+                driver_identity: None,
             }],
             gpu_detection: "ok".to_string(),
             gpu_detection_reason: None,

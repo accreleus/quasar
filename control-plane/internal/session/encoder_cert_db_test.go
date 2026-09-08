@@ -211,11 +211,18 @@ func TestCertForRungMatchesPickCert(t *testing.T) {
 	ctx := context.Background()
 
 	// Rows spread either side of the asked-for bitrates, on two rungs, so the
-	// distance ordering and the rung filter both have work to do.
+	// distance ordering and the rung filter both have work to do. The identity a row
+	// carries comes off the GPU row at write time, so it is set around the writes.
+	setGPUDriverIdentity(t, pool, s.hostID, 0, "drv-a")
 	for _, bw := range []int{3000, 4000, 8000, 12000} {
 		must(t, store.UpsertEncoderCert(ctx,
 			certSeedRow(s.hostID, 0, "va", "1080p60", "1080p60-h264", bw, VerdictOK)))
 	}
+	// Written while the host reported no identity: these two are the legacy shape
+	// (stored NULL), which must stay eligible under every identity.
+	setGPUDriverIdentity(t, pool, s.hostID, 0, "")
+	must(t, store.UpsertEncoderCert(ctx,
+		certSeedRow(s.hostID, 0, "va", "1080p60", "1080p60-h264", 6000, VerdictOK)))
 	must(t, store.UpsertEncoderCert(ctx,
 		certSeedRow(s.hostID, 0, "va", "720p60", "720p60-h264", 4500, VerdictUnsafe)))
 
@@ -225,26 +232,121 @@ func TestCertForRungMatchesPickCert(t *testing.T) {
 
 	// The bitrates probe exact hits, midpoints, and both extremes — including a
 	// value below the lowest row and one above the highest.
-	// Every encoder branch, because the launch path now passes the host's own
-	// (#144): "" is the unfiltered read, "va" matches every seeded row, and
-	// "vulkan" matches none. The two implementations must agree on all three.
+	//
+	// Every branch of the identity the launch path passes (#144), because both
+	// implementations filter on it and the guard is worthless if only one branch is
+	// walked. Encoder: "" is the unfiltered read, "va" matches every seeded row,
+	// "vulkan" matches none. Driver identity: "" is unknown, "drv-a" matches the
+	// stamped rows, "drv-b" matches none of them — and under all three the
+	// NULL-stored rows stay selectable.
 	for _, encoder := range []string{"", "va", "vulkan"} {
-		for _, rungID := range rungIDs {
-			for _, bw := range []int32{0, 3000, 3400, 3500, 3600, 6000, 7000, 8000, 10000, 99000} {
-				want, err := store.CertForRung(ctx, s.hostID, 0, encoder, rungID, bw, CertStaleness)
-				must(t, err)
-				got := pickCert(certs, rungID, bw, time.Now(), CertStaleness, encoder)
+		for _, driver := range []string{"", "drv-a", "drv-b"} {
+			id := CertIdentity{Encoder: encoder, DriverIdentity: driver}
+			for _, rungID := range rungIDs {
+				for _, bw := range []int32{0, 3000, 3400, 3500, 3600, 6000, 7000, 8000, 10000, 99000} {
+					want, err := store.CertForRung(ctx, s.hostID, 0, id, rungID, bw, CertStaleness)
+					must(t, err)
+					got := pickCert(certs, rungID, bw, time.Now(), CertStaleness, id)
 
-				switch {
-				case want == nil && got != nil:
-					t.Errorf("enc=%q rung=%s bw=%d: SQL found nothing, pickCert chose %d kbps", encoder, rungID, bw, got.BitrateKbps)
-				case want != nil && got == nil:
-					t.Errorf("enc=%q rung=%s bw=%d: SQL chose %d kbps, pickCert found nothing", encoder, rungID, bw, want.BitrateKbps)
-				case want != nil && got != nil && want.ID != got.ID:
-					t.Errorf("enc=%q rung=%s bw=%d: SQL chose id=%s (%d kbps), pickCert chose id=%s (%d kbps)",
-						encoder, rungID, bw, want.ID, want.BitrateKbps, got.ID, got.BitrateKbps)
+					switch {
+					case want == nil && got != nil:
+						t.Errorf("id=%+v rung=%s bw=%d: SQL found nothing, pickCert chose %d kbps", id, rungID, bw, got.BitrateKbps)
+					case want != nil && got == nil:
+						t.Errorf("id=%+v rung=%s bw=%d: SQL chose %d kbps, pickCert found nothing", id, rungID, bw, want.BitrateKbps)
+					case want != nil && got != nil && want.ID != got.ID:
+						t.Errorf("id=%+v rung=%s bw=%d: SQL chose id=%s (%d kbps), pickCert chose id=%s (%d kbps)",
+							id, rungID, bw, want.ID, want.BitrateKbps, got.ID, got.BitrateKbps)
+					}
 				}
 			}
+		}
+	}
+}
+
+// setGPUDriverIdentity writes what the agent would have reported for this GPU;
+// "" writes NULL, which is what a pre-#144 agent leaves behind.
+func setGPUDriverIdentity(t *testing.T, pool *pgxpool.Pool, hostID string, gpuIndex int, identity string) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE gpus SET driver_identity = NULLIF($3, '') WHERE host_id = $1::uuid AND index = $2`,
+		hostID, gpuIndex, identity); err != nil {
+		t.Fatalf("set gpu driver identity: %v", err)
+	}
+}
+
+// TestCertDriverIdentityLifecycle is the #144 acceptance, end to end against the DB:
+// a driver change stops an old measurement influencing the next stream plan, an
+// unchanged one keeps it, re-certifying REPLACES rather than forks, expiry still wins,
+// and a row written before any of this existed stays usable.
+func TestCertDriverIdentityLifecycle(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	ctx := context.Background()
+	oldDriver := CertIdentity{Encoder: "vulkan", DriverIdentity: "nvidia:595.99.02"}
+	newDriver := CertIdentity{Encoder: "vulkan", DriverIdentity: "nvidia:610.57.04"}
+
+	setGPUDriverIdentity(t, pool, s.hostID, 0, oldDriver.DriverIdentity)
+	must(t, store.UpsertEncoderCert(ctx,
+		certSeedRow(s.hostID, 0, "vulkan", "1080p60", "1080p60-h264", 8000, VerdictUnsafe)))
+
+	// The write path stamps the identity off the GPU row, not off the caller.
+	cert, err := store.CertForRung(ctx, s.hostID, 0, oldDriver, "1080p60-h264", 8000, CertStaleness)
+	must(t, err)
+	if cert == nil || cert.DriverIdentity == nil || *cert.DriverIdentity != oldDriver.DriverIdentity {
+		t.Fatalf("expected the row stamped %q, got %+v", oldDriver.DriverIdentity, cert)
+	}
+
+	// The driver changes: the measurement describes software that is gone.
+	cert, err = store.CertForRung(ctx, s.hostID, 0, newDriver, "1080p60-h264", 8000, CertStaleness)
+	must(t, err)
+	if cert != nil {
+		t.Errorf("a measurement from another driver must not apply, got %+v", cert)
+	}
+
+	// Re-certified on the new driver: the row is REPLACED (upsert-latest on the same
+	// key), so the old identity now matches nothing and there is still exactly one row.
+	setGPUDriverIdentity(t, pool, s.hostID, 0, newDriver.DriverIdentity)
+	must(t, store.UpsertEncoderCert(ctx,
+		certSeedRow(s.hostID, 0, "vulkan", "1080p60", "1080p60-h264", 8000, VerdictOK)))
+
+	cert, err = store.CertForRung(ctx, s.hostID, 0, newDriver, "1080p60-h264", 8000, CertStaleness)
+	must(t, err)
+	if cert == nil || cert.Verdict != VerdictOK {
+		t.Fatalf("expected the replacement measurement, got %+v", cert)
+	}
+	if cert, err = store.CertForRung(ctx, s.hostID, 0, oldDriver, "1080p60-h264", 8000, CertStaleness); err != nil {
+		t.Fatal(err)
+	} else if cert != nil {
+		t.Errorf("the replaced row must not resurface under the old driver, got %+v", cert)
+	}
+	var rows int
+	must(t, pool.QueryRow(ctx, `SELECT count(*) FROM host_encoder_certification WHERE host_id = $1::uuid`,
+		s.hostID).Scan(&rows))
+	if rows != 1 {
+		t.Errorf("re-certification must replace, not fork: got %d rows", rows)
+	}
+
+	// Expiry is unchanged by any of this: a stale row is absent under its OWN identity.
+	must(t, pool.QueryRow(ctx, `UPDATE host_encoder_certification
+		SET measured_at = now() - interval '30 days' WHERE host_id = $1::uuid
+		RETURNING 1`, s.hostID).Scan(new(int)))
+	cert, err = store.CertForRung(ctx, s.hostID, 0, newDriver, "1080p60-h264", 8000, CertStaleness)
+	must(t, err)
+	if cert != nil {
+		t.Errorf("a stale row must not cap, got %+v", cert)
+	}
+
+	// A host whose agent reports no identity (or a legacy row) is not left uncapped:
+	// unknown on either side keeps the row eligible.
+	setGPUDriverIdentity(t, pool, s.hostID, 0, "")
+	must(t, store.UpsertEncoderCert(ctx,
+		certSeedRow(s.hostID, 0, "vulkan", "720p60", "720p60-h264", 4000, VerdictUnsafe)))
+	for _, id := range []CertIdentity{newDriver, {Encoder: "vulkan"}, {}} {
+		cert, err = store.CertForRung(ctx, s.hostID, 0, id, "720p60-h264", 4000, CertStaleness)
+		must(t, err)
+		if cert == nil {
+			t.Errorf("id=%+v: a row with no stored identity must stay eligible", id)
 		}
 	}
 }
@@ -264,7 +366,7 @@ func TestCertForRung(t *testing.T) {
 	}
 
 	// Ask for the row closest to 7000 kbps — should return the 8000 row.
-	cert, err := store.CertForRung(ctx, s.hostID, 0, "va", "1080p60-h264", 7000, CertStaleness)
+	cert, err := store.CertForRung(ctx, s.hostID, 0, CertIdentity{Encoder: "va"}, "1080p60-h264", 7000, CertStaleness)
 	if err != nil {
 		t.Fatalf("cert for rung: %v", err)
 	}
@@ -276,7 +378,7 @@ func TestCertForRung(t *testing.T) {
 	}
 
 	// Ask for a non-existent rung — should return nil (no cap).
-	cert, err = store.CertForRung(ctx, s.hostID, 0, "va", "4k120-h264", 8000, CertStaleness)
+	cert, err = store.CertForRung(ctx, s.hostID, 0, CertIdentity{Encoder: "va"}, "4k120-h264", 8000, CertStaleness)
 	if err != nil {
 		t.Fatalf("cert for unknown rung: %v", err)
 	}
@@ -288,7 +390,7 @@ func TestCertForRung(t *testing.T) {
 	// for it as if it were a rung must find nothing, because a chain has no single
 	// encode cost. Before 0041 this same lookup returned the h264 measurement and
 	// the scheduler applied it to whatever codec the session resolved.
-	cert, err = store.CertForRung(ctx, s.hostID, 0, "va", "1080p60", 8000, CertStaleness)
+	cert, err = store.CertForRung(ctx, s.hostID, 0, CertIdentity{Encoder: "va"}, "1080p60", 8000, CertStaleness)
 	if err != nil {
 		t.Fatalf("cert for launch profile id: %v", err)
 	}
@@ -335,7 +437,7 @@ func TestCertIsCodecScoped(t *testing.T) {
 	}
 
 	// And each lookup returns ITS OWN verdict, not the other codec's.
-	gotH264, err := store.CertForRung(ctx, s.hostID, 0, "nvenc", chain.h264RungID, 8000, CertStaleness)
+	gotH264, err := store.CertForRung(ctx, s.hostID, 0, CertIdentity{Encoder: "nvenc"}, chain.h264RungID, 8000, CertStaleness)
 	if err != nil || gotH264 == nil {
 		t.Fatalf("cert for h264 rung: %v / %v", gotH264, err)
 	}
@@ -344,7 +446,7 @@ func TestCertIsCodecScoped(t *testing.T) {
 			gotH264.Verdict, VerdictOK)
 	}
 
-	gotAV1, err := store.CertForRung(ctx, s.hostID, 0, "nvenc", chain.av1RungID, 8000, CertStaleness)
+	gotAV1, err := store.CertForRung(ctx, s.hostID, 0, CertIdentity{Encoder: "nvenc"}, chain.av1RungID, 8000, CertStaleness)
 	if err != nil || gotAV1 == nil {
 		t.Fatalf("cert for av1 rung: %v / %v", gotAV1, err)
 	}
@@ -446,7 +548,7 @@ func TestCertStaleness(t *testing.T) {
 	}
 
 	// CertForRung with CertStaleness (7 days) must also return nil.
-	cert, err := store.CertForRung(ctx, s.hostID, 0, "va", "1080p60-h264", 8000, CertStaleness)
+	cert, err := store.CertForRung(ctx, s.hostID, 0, CertIdentity{Encoder: "va"}, "1080p60-h264", 8000, CertStaleness)
 	if err != nil {
 		t.Fatalf("cert for rung: %v", err)
 	}

@@ -357,8 +357,8 @@ func (s *agentStore) upsertCapacityWithDetection(ctx context.Context, hostID str
 	for i, g := range gpus {
 		reportedIndexes[i] = g.Index
 		_, err = tx.Exec(ctx, `
-			INSERT INTO gpus (host_id, index, vendor, model, vram_mb_total, encode_slots_total, render_node, device_path, reported)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)
+			INSERT INTO gpus (host_id, index, vendor, model, vram_mb_total, encode_slots_total, render_node, device_path, driver_identity, reported)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true)
 			ON CONFLICT (host_id, index) DO UPDATE
 			    SET vendor             = EXCLUDED.vendor,
 			        model              = EXCLUDED.model,
@@ -366,6 +366,7 @@ func (s *agentStore) upsertCapacityWithDetection(ctx context.Context, hostID str
 			        encode_slots_total = EXCLUDED.encode_slots_total,
 			        render_node        = EXCLUDED.render_node,
 			        device_path        = EXCLUDED.device_path,
+			        driver_identity    = EXCLUDED.driver_identity,
 			        reported           = true,
 			        -- Identity change at this index ⇒ the stored sample describes a
 			        -- DIFFERENT physical GPU (#383 §3.3, review finding #4). This is
@@ -392,7 +393,7 @@ func (s *agentStore) upsertCapacityWithDetection(ctx context.Context, hostID str
 			                                      OR gpus.model       IS DISTINCT FROM EXCLUDED.model
 			                                      OR gpus.render_node IS DISTINCT FROM EXCLUDED.render_node
 			                                    THEN NULL ELSE gpus.vram_sample_agent_ms END
-		`, hostID, g.Index, g.Vendor, g.Model, g.VRAMMBTotal, g.EncodeSlotsTotal, g.RenderNode, g.DevicePath)
+		`, hostID, g.Index, g.Vendor, g.Model, g.VRAMMBTotal, g.EncodeSlotsTotal, g.RenderNode, g.DevicePath, g.DriverIdentity)
 		if err != nil {
 			return fmt.Errorf("upsert gpu %d: %w", g.Index, err)
 		}
