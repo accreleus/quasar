@@ -459,7 +459,10 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// them across a control-plane restart -- so something has to terminalise the
 	// sessions of a host that never comes back. Process-lifetime, like the other
 	// background loops here.
-	go coordinator.RunStaleSweep(context.Background(), bootedAt,
+	// janitorCtx, not Background: Stop() cancels it, so the sweep does not keep
+	// running through shutdown and leak a goroutine per Services built (the DB
+	// tests construct several).
+	go coordinator.RunStaleSweep(janitorCtx, bootedAt,
 		time.Duration(cfg.SessionGraceSecs)*time.Second)
 	log.Info("session stale-host sweep started",
 		"grace_secs", cfg.SessionGraceSecs, "booted_at", bootedAt.Format(time.RFC3339))

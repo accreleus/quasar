@@ -49,6 +49,12 @@ type Events interface {
 	// StopConsoleSession stops a previously auto-started console session
 	// (CM-06 auto-stop on display disconnect).
 	StopConsoleSession(ctx context.Context, sessionID, reason string) error
+	// AdoptConsoleSession returns a non-terminal session on hostID owned by userID
+	// running appID, or "" if there is none. Since #128 a console session survives
+	// a control-plane restart, but the auto-start tracker is in-memory and does
+	// not, so the handler adopts the survivor instead of trying to launch a second
+	// one against a home the first still holds.
+	AdoptConsoleSession(ctx context.Context, hostID, userID, appID string) string
 	// ConsoleSessionActive reports whether a recorded auto-started console session
 	// is still non-terminal (CM-06). The auto-start tracker uses it to detect a
 	// self-terminated console session and relaunch it (level-triggered always-on).
@@ -58,13 +64,14 @@ type Events interface {
 // noopEvents is used when no coordinator is wired (e.g. focused tests).
 type noopEvents struct{}
 
-func (noopEvents) AgentState(context.Context, string, SessionStateMsg)           {}
-func (noopEvents) HostDisconnected(context.Context, string)                      {}
-func (noopEvents) AgentHeartbeat(context.Context, string, []string)              {}
-func (noopEvents) AgentReconnected(context.Context, string)                      {}
-func (noopEvents) AgentMetrics(context.Context, string, SessionMetricsMsg)       {}
-func (noopEvents) AgentTraceEvent(context.Context, string, SessionTraceEventMsg) {}
-func (noopEvents) AgentSignalingFailure(context.Context, string, string, string) {}
+func (noopEvents) AgentState(context.Context, string, SessionStateMsg)                {}
+func (noopEvents) HostDisconnected(context.Context, string)                           {}
+func (noopEvents) AgentHeartbeat(context.Context, string, []string)                   {}
+func (noopEvents) AdoptConsoleSession(context.Context, string, string, string) string { return "" }
+func (noopEvents) AgentReconnected(context.Context, string)                           {}
+func (noopEvents) AgentMetrics(context.Context, string, SessionMetricsMsg)            {}
+func (noopEvents) AgentTraceEvent(context.Context, string, SessionTraceEventMsg)      {}
+func (noopEvents) AgentSignalingFailure(context.Context, string, string, string)      {}
 func (noopEvents) LaunchConsoleSession(context.Context, string, string, string, string, int32, int32, int32) (string, error) {
 	return "", nil
 }

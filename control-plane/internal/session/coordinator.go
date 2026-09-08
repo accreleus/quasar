@@ -225,6 +225,17 @@ func (c *Coordinator) failSession(sessionID, reason string) {
 	c.failSessionWithDetail(sessionID, reason, nil)
 }
 
+// AdoptConsoleSession implements agentws.Events. See ConsoleSessionOnHost for
+// why a restart needs this (#128).
+func (c *Coordinator) AdoptConsoleSession(ctx context.Context, hostID, userID, appID string) string {
+	id, err := c.store.ConsoleSessionOnHost(ctx, hostID, userID, appID)
+	if err != nil {
+		c.log.Warn("console adopt: lookup failed", "host_id", hostID, "err", err)
+		return ""
+	}
+	return id
+}
+
 // AgentHeartbeat reconciles this host against the agent's own list of running
 // sessions (#128; agent-api.md §"Reconnection & reconciliation"). It is the
 // other half of the grace window: the agent may keep sessions alive across a
@@ -247,6 +258,13 @@ func (c *Coordinator) failSession(sessionID, reason string) {
 // agent websocket read loop, and that same loop is what would have to read the
 // ack — so an ack here could only ever time out.
 func (c *Coordinator) AgentHeartbeat(ctx context.Context, hostID string, running []string) {
+	// A nil list is "the agent said nothing", not "the agent runs nothing". Our
+	// agent always emits the field, but absent and [] decode identically to nil
+	// in Go, and treating the two the same would fail every running session on
+	// this host for a malformed or older heartbeat.
+	if running == nil {
+		return
+	}
 	rows, err := c.store.RunningSessionIDsOnHost(ctx, hostID)
 	if err != nil {
 		c.log.Warn("heartbeat reconcile: list running sessions failed", "host_id", hostID, "err", err)
@@ -281,7 +299,19 @@ func (c *Coordinator) AgentHeartbeat(ctx context.Context, hostID string, running
 		case err != nil:
 			continue
 		case hs.State == StateAssigned || hs.State == StateStarting:
-			// A launch in flight on this connection; not an orphan.
+			// A launch in flight on this connection; not an orphan. The agent
+			// inserts into its map at the session_start ack, before it reports
+			// running, so it legitimately lists these.
+			continue
+		case hs.State == StateStopping:
+			// A stop is already on its way. Re-sending one every heartbeat until
+			// teardown finishes would log an `error` stop over a user's own.
+			continue
+		case hs.State == StateRunning:
+			// Unreachable today: the only writer of `running` is AgentState on
+			// this same serialized read loop, so a running row would have been in
+			// cpRunning. Explicit anyway -- falling through to a stop is the wrong
+			// default for a live session if that ever changes.
 			continue
 		case hs.HostID != nil && *hs.HostID != hostID:
 			c.log.Warn("agent reports another host's session; stopping its copy",

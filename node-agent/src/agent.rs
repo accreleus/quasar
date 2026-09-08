@@ -246,24 +246,82 @@ pub async fn run(cfg: Config) {
     // running them concurrently is safe.
     spawn_cuda_runtime_provisioner(&runtime);
 
+    // #128: built ONCE, outside the reconnect loop. Everything a running session
+    // needs lives here, so a control-plane restart no longer takes the stream
+    // down with it.
+    let live_refs: LiveRefs = Arc::new(Mutex::new(HashSet::new()));
+    let mut sessions = HostSessions::new(
+        live_refs,
+        health.clone(),
+        nvidia_lib32_probed.to_string(),
+        image_mgr.clone(),
+        release_mgr.clone(),
+    );
+    let grace = session_grace();
+    // Armed when a connection ends, aborted on the next successful register. A
+    // timer rather than a check in the error arm below: `connect_and_run` can
+    // block for minutes against a black-holed control plane, so a deadline
+    // evaluated only when it returns would fire far too late.
+    let mut grace_timer: Option<tokio::task::JoinHandle<()>> = None;
+
     let mut backoff = Duration::from_secs(1);
     loop {
+        if let Some(t) = grace_timer.take() {
+            t.abort();
+        }
         match connect_and_run(
             &cfg,
             &health,
             &nvidia_lib32_probed,
             &image_mgr,
             &release_mgr,
+            &mut sessions,
         )
         .await
         {
             Ok(()) => {
-                // clean shutdown (shouldn't happen in normal operation)
+                // A clean shutdown IS the end of the agent, so nothing is coming
+                // back to reconcile against: stop the sessions rather than leave
+                // their containers behind.
+                sessions.mgr.stop_all();
                 info!("agent exiting cleanly");
                 return;
             }
             Err(e) => {
                 health.set_connected(false);
+                // #128: hold the running sessions instead of stopping them. The
+                // media path is agent-to-browser and needs nothing from the
+                // control plane while it is away, and on reconnect the control
+                // plane reconciles against the heartbeat rather than assuming
+                // they all died. Give up only if it does not come back.
+                let held = sessions.running_count();
+                if held > 0 {
+                    if grace.is_zero() {
+                        info!(
+                            token = "session-grace-disabled",
+                            "connection lost with {held} running session(s); grace window is 0, stopping them now"
+                        );
+                        sessions.mgr.stop_all();
+                    } else if grace_timer.is_none() {
+                        info!(
+                            token = "sessions-held-for-grace",
+                            "connection lost with {held} running session(s); holding them for {grace:?} \
+                             while the control plane comes back"
+                        );
+                        let flags = sessions.stop_flags();
+                        grace_timer = Some(tokio::spawn(async move {
+                            tokio::time::sleep(grace).await;
+                            warn!(
+                                token = "session-grace-expired",
+                                "control plane did not return within the grace window; stopping {} held session(s)",
+                                flags.len()
+                            );
+                            for f in flags {
+                                f.store(true, Ordering::Relaxed);
+                            }
+                        }));
+                    }
+                }
                 error!(
                     token = "agent-connection-failed",
                     "agent connection failed: {e:#}; reconnecting in {backoff:?}"
@@ -858,6 +916,7 @@ async fn connect_and_run(
     nvidia_lib32_probed: &str,
     image_mgr: &Arc<ImageManager>,
     release_mgr: &Arc<ReleaseManager>,
+    sessions: &mut HostSessions,
 ) -> anyhow::Result<()> {
     let url = cfg.ws_url();
     info!(policy = ?cfg.transport, "connecting to {url}");
@@ -1060,18 +1119,24 @@ async fn connect_and_run(
     let mut hb_timer = tokio::time::interval(interval);
     hb_timer.tick().await; // discard the immediate first tick
 
-    // #175: home refs mounted by live sessions. The GC reaper consults it so it can
-    // never reap a backing store an active session is using.
-    let live_refs: LiveRefs = Arc::new(Mutex::new(HashSet::new()));
-    let mut mgr = SessionManager::new(
-        live_refs.clone(),
-        health.clone(),
-        gpu_inventory,
-        vram_targets,
-        nvidia_lib32_probed.to_string(),
-        image_mgr.clone(),
-        release_mgr.clone(),
-    );
+    // #128: the session map, its channels and the home refs OUTLIVE this
+    // connection, so sessions survive a control-plane restart. Everything scoped
+    // to one connection is reset here instead of by the struct being rebuilt.
+    let HostSessions {
+        mgr,
+        evt_tx,
+        evt_rx,
+        diagnostic_tx,
+        diagnostic_rx,
+        diagnostic_dropped_interval,
+        diagnostic_dropped_total,
+    } = sessions;
+    mgr.begin_connection(gpu_inventory, vram_targets);
+    // #175: home refs mounted by live sessions. The GC reaper consults it so it
+    // can never reap a backing store an active session is using. Hoisted with the
+    // map: a fresh set would let the next connection's GC reap a home a surviving
+    // session still has mounted.
+    let live_refs: LiveRefs = mgr.live_refs.clone();
     // Cached with the encoder it was probed for, so capacity re-sends reuse it unless
     // a config_update flips the effective encoder and marks it stale.
     mgr.host_codec_report = host_codec_report.clone();
@@ -1120,9 +1185,6 @@ async fn connect_and_run(
     // capacity re-send.
     let mut last_warmup_reserved = false;
     let mut last_source_report: Option<serde_json::Value> = None;
-    let (evt_tx, evt_rx) = mpsc::channel::<(String, SessionEvent)>(CRITICAL_EVENT_CAPACITY);
-    // `Option`-wrapped for `recv_or_disabled`, like the other four receiver arms.
-    let mut evt_rx = Some(evt_rx);
     // Device-lost failures across sessions on this connection: ≥2 within
     // GPU_GLOBAL_WINDOW escalate to a GPU-global drain+restart; one stays per-session.
     let mut gpu_fault = GpuGlobalFaultDetector::default();
@@ -1132,15 +1194,6 @@ async fn connect_and_run(
     let (gpu_fault_tx, gpu_fault_rx) = mpsc::unbounded_channel::<crate::gpu_kmsg::GpuFault>();
     let mut gpu_fault_rx = Some(gpu_fault_rx);
     let _gpu_kmsg_thread = crate::gpu_kmsg::spawn(gpu_fault_tx);
-    let (diagnostic_raw_tx, diagnostic_rx) = mpsc::channel(DIAGNOSTIC_EVENT_CAPACITY);
-    let mut diagnostic_rx = Some(diagnostic_rx);
-    let diagnostic_dropped_interval = Arc::new(AtomicU64::new(0));
-    let diagnostic_dropped_total = Arc::new(AtomicU64::new(0));
-    let diagnostic_tx = DiagnosticEventTx::new(
-        diagnostic_raw_tx,
-        diagnostic_dropped_interval.clone(),
-        diagnostic_dropped_total.clone(),
-    );
 
     // Steam library discovery: the ACF manifest scanner. Per-connection lifetime
     // (aborted by `_library_scan_guard`'s Drop), node_secret auth, never fatal to the
@@ -1232,7 +1285,7 @@ async fn connect_and_run(
                         }];
                     }
                 }
-                send_fresh_capacity(&mut tx, &mut mgr).await?;
+                send_fresh_capacity(&mut tx, &mut *mgr).await?;
             }
 
             _ = hb_timer.tick() => {
@@ -1270,11 +1323,11 @@ async fn connect_and_run(
                 let source_report = mgr.source_policy.as_ref().and_then(|p| p.report());
                 if source_report != last_source_report {
                     last_source_report = source_report;
-                    send_fresh_capacity(&mut tx, &mut mgr).await?;
+                    send_fresh_capacity(&mut tx, &mut *mgr).await?;
                 }
                 if mgr.warmup_reserved() != last_warmup_reserved {
                     last_warmup_reserved = mgr.warmup_reserved();
-                    send_fresh_capacity(&mut tx, &mut mgr).await?;
+                    send_fresh_capacity(&mut tx, &mut *mgr).await?;
                     info!(
                         "re-sent capacity: warm-up encode-slot reservation {}",
                         if last_warmup_reserved { "taken" } else { "released" }
@@ -1307,7 +1360,7 @@ async fn connect_and_run(
                         // A config_update changes the reported effective settings; check
                         // before handle_control consumes ctrl.
                         let was_config_update = matches!(ctrl, ControlMsg::ConfigUpdate { .. });
-                        if let Some(reply) = mgr.handle_control(ctrl, &evt_tx, &diagnostic_tx) {
+                        if let Some(reply) = mgr.handle_control(ctrl, evt_tx, diagnostic_tx) {
                             send(&mut tx, &reply).await?;
                         }
                         if was_config_update {
@@ -1405,7 +1458,7 @@ async fn connect_and_run(
                     send(&mut tx, &capacity_msg).await?;
                 }
             }
-            evt = recv_or_disabled(&mut evt_rx) => {
+            evt = recv_or_disabled(&mut *evt_rx) => {
                 // `None` means every sender is gone — disable the arm.
                 let Some((session_id, event)) = evt else {
                     error!(
@@ -1413,7 +1466,7 @@ async fn connect_and_run(
                         "session-event sender dropped unexpectedly; disabling session-event \
                          handling for the rest of this connection"
                     );
-                    evt_rx = None;
+                    *evt_rx = None;
                     continue;
                 };
                 {
@@ -1450,14 +1503,14 @@ async fn connect_and_run(
                             }
                             // #503: get pending trace events out before the terminal
                             // state — the control plane drops them afterwards.
-                            flush_pending_diagnostics(&mut tx, &mut diagnostic_rx).await?;
+                            flush_pending_diagnostics(&mut tx, &mut *diagnostic_rx).await?;
                             let msg =
                                 mgr.on_event(&session_id, SessionEvent::Stopped { bytes_used, detail });
                             send(&mut tx, &msg).await?;
                             // Console auto-start is level-triggered by capacity, so
                             // re-send immediately after a terminal state rather than
                             // waiting on an unrelated connector/input/storage poll.
-                            send_fresh_capacity(&mut tx, &mut mgr).await?;
+                            send_fresh_capacity(&mut tx, &mut *mgr).await?;
                             info!("re-sent capacity after session stopped for console reconciliation");
                         }
                         SessionEvent::EffectiveMedia(payload) => {
@@ -1517,12 +1570,12 @@ async fn connect_and_run(
                             // `webrtc.remote_description_failed` is emitted by the
                             // runner immediately before this very event.
                             if terminal {
-                                flush_pending_diagnostics(&mut tx, &mut diagnostic_rx).await?;
+                                flush_pending_diagnostics(&mut tx, &mut *diagnostic_rx).await?;
                             }
                             let msg = mgr.on_event(&session_id, other);
                             send(&mut tx, &msg).await?;
                             if terminal {
-                                send_fresh_capacity(&mut tx, &mut mgr).await?;
+                                send_fresh_capacity(&mut tx, &mut *mgr).await?;
                                 info!("re-sent capacity after session failure for console reconciliation");
                             }
                             if gpu_global && !mgr.draining {
@@ -1551,7 +1604,7 @@ async fn connect_and_run(
                     }
                 }
             }
-            diagnostic = recv_or_disabled(&mut diagnostic_rx) => {
+            diagnostic = recv_or_disabled(&mut *diagnostic_rx) => {
                 // `None` means every sender is gone — disable the arm.
                 let Some((session_id, te)) = diagnostic else {
                     error!(
@@ -1559,7 +1612,7 @@ async fn connect_and_run(
                         "diagnostic-event sender dropped unexpectedly; disabling diagnostic \
                          trace forwarding for the rest of this connection"
                     );
-                    diagnostic_rx = None;
+                    *diagnostic_rx = None;
                     continue;
                 };
                 let msg = AgentMsg::SessionTraceEvent {
@@ -1665,6 +1718,100 @@ where
 /// start) and those started (with a stop flag + signaling channel). Owned by
 /// the connection loop — no locking. On disconnect the manager drops; the
 /// control plane reaps non-terminal sessions to failed (invariant #3).
+/// Default grace window: how long running sessions are held after the control
+/// plane goes away, before the agent gives up and stops them (#128).
+///
+/// 90 s covers the ~70 s a `docker compose up -d --force-recreate` of the
+/// control plane takes. It must stay BELOW the control plane's own
+/// `QUASAR_SESSION_GRACE_SECS` (120 s) minus this agent's maximum reconnect
+/// backoff (30 s), or the control plane would terminalise sessions this agent is
+/// still holding and about to re-report.
+const DEFAULT_SESSION_GRACE_SECS: u64 = 90;
+
+/// `QUASAR_SESSION_GRACE_SECS`, or the default. `0` disables the hold entirely,
+/// restoring the pre-#128 behaviour of stopping every session the moment the
+/// connection drops.
+fn session_grace() -> Duration {
+    let secs = std::env::var("QUASAR_SESSION_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SESSION_GRACE_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Session state that OUTLIVES a control-plane connection (#128).
+///
+/// Before this existed, `SessionManager` was built inside `connect_and_run` and
+/// dropped with it, and its `Drop` stopped every session. A control-plane
+/// restart therefore ended every stream on the host even though the media path
+/// is agent-to-browser and needs nothing from the control plane while it is
+/// away.
+///
+/// The channels move with the map, and that is not incidental: each runner
+/// thread captures a CLONE of `evt_tx`/`diagnostic_tx` when it is spawned. Keep
+/// the map but rebuild the channels and a survivor's terminal events go into a
+/// dead channel, leaving a finished session wedged in `running` until the
+/// reconcile sweep notices, reported with the wrong state. The dropped-event
+/// counters move for the same reason: the survivors' senders hold clones of
+/// those exact Arcs.
+struct HostSessions {
+    mgr: SessionManager,
+    evt_tx: mpsc::Sender<(String, SessionEvent)>,
+    /// `Option` for `recv_or_disabled`. The sender now lives here too, so the
+    /// "sender gone, disable the arm" path can no longer fire in practice.
+    evt_rx: Option<mpsc::Receiver<(String, SessionEvent)>>,
+    diagnostic_tx: DiagnosticEventTx,
+    diagnostic_rx: Option<mpsc::Receiver<(String, crate::session::runner::TraceEvent)>>,
+    diagnostic_dropped_interval: Arc<AtomicU64>,
+    diagnostic_dropped_total: Arc<AtomicU64>,
+}
+
+impl HostSessions {
+    fn new(
+        live_refs: LiveRefs,
+        health: Arc<HealthState>,
+        nvidia_lib32_probed: String,
+        image_mgr: Arc<ImageManager>,
+        release_mgr: Arc<ReleaseManager>,
+    ) -> Self {
+        let (evt_tx, evt_rx) = mpsc::channel::<(String, SessionEvent)>(CRITICAL_EVENT_CAPACITY);
+        let (diagnostic_raw_tx, diagnostic_rx) = mpsc::channel(DIAGNOSTIC_EVENT_CAPACITY);
+        let diagnostic_dropped_interval = Arc::new(AtomicU64::new(0));
+        let diagnostic_dropped_total = Arc::new(AtomicU64::new(0));
+        let diagnostic_tx = DiagnosticEventTx::new(
+            diagnostic_raw_tx,
+            diagnostic_dropped_interval.clone(),
+            diagnostic_dropped_total.clone(),
+        );
+        Self {
+            mgr: SessionManager::new(
+                live_refs,
+                health,
+                Vec::new(),
+                Vec::new(),
+                nvidia_lib32_probed,
+                image_mgr,
+                release_mgr,
+            ),
+            evt_tx,
+            evt_rx: Some(evt_rx),
+            diagnostic_tx,
+            diagnostic_rx: Some(diagnostic_rx),
+            diagnostic_dropped_interval,
+            diagnostic_dropped_total,
+        }
+    }
+
+    /// Every running session's stop flag, for the grace-window timer.
+    fn stop_flags(&self) -> Vec<Arc<AtomicBool>> {
+        self.mgr.running.values().map(|h| h.stop.clone()).collect()
+    }
+
+    fn running_count(&self) -> usize {
+        self.mgr.running.len()
+    }
+}
+
 struct SessionManager {
     /// Assigned but not yet started. Aged out by the heartbeat sweep — see
     /// [`PENDING_ASSIGNMENT_TTL`].
@@ -2020,14 +2167,57 @@ impl SessionManager {
         out
     }
 
-    /// Signal every running session to stop when the control-plane connection ends. On
-    /// reconnect the agent presents as fresh and the control plane reconciles its
-    /// sessions to failed, so the local pipelines must tear down too or their
-    /// containers and sidecars orphan.
+    /// Reset the state that belongs to ONE control-plane connection (#128).
+    ///
+    /// The manager now outlives a connection, so anything scoped to the old one
+    /// has to be dropped explicitly rather than by the struct going away.
+    /// `pending` is the load-bearing one: an assignment that never got its
+    /// `session_start` is owned by a control plane that has since restarted, and
+    /// it will re-drive the assign. Everything the caller re-derives per
+    /// connection (readiness, codec report, source policy, warm-up handles) is
+    /// assigned immediately after this and is not cleared here.
+    ///
+    /// `running` is deliberately NOT touched. Surviving those is the whole point.
+    fn begin_connection(
+        &mut self,
+        gpu_inventory: Vec<crate::messages::GpuCapacity>,
+        vram_targets: Vec<VramTarget>,
+    ) {
+        let dropped = self.pending.len();
+        self.pending.clear();
+        self.gpu_inventory = gpu_inventory;
+        self.vram_targets = vram_targets;
+        // The cache indexes by position over the inventory, so it must be
+        // invalidated in lockstep with vram_targets or a sample is attributed to
+        // the wrong physical GPU.
+        self.vram_cache.invalidate();
+        self.draining = false;
+        if dropped > 0 {
+            info!(
+                token = "pending-assignments-dropped",
+                "dropped {dropped} pending assignment(s) from the previous connection; \
+                 the control plane re-drives them"
+            );
+        }
+        if !self.running.is_empty() {
+            info!(
+                token = "sessions-survived-reconnect",
+                "carried {} running session(s) across the control-plane connection",
+                self.running.len()
+            );
+        }
+    }
+
+    /// Signal every running session to stop. Called when the grace window expires
+    /// with no control plane, and on a clean agent shutdown.
+    ///
+    /// Not called on an ordinary disconnect any more (#128): the control plane
+    /// reconciles against `heartbeat.running_sessions` on reconnect, so a session
+    /// the agent is still running is preserved rather than reaped.
     fn stop_all(&self) {
         for (id, h) in &self.running {
             h.stop.store(true, Ordering::Relaxed);
-            info!("connection ended: signalling session {id} to stop");
+            info!("signalling session {id} to stop");
         }
     }
 
@@ -2800,14 +2990,12 @@ impl SessionManager {
     }
 }
 
-impl Drop for SessionManager {
-    /// The manager drops exactly when `connect_and_run` returns, so stopping every
-    /// session here covers all exit paths (clean close, read error, write failure)
-    /// without threading a guard through the message loop.
-    fn drop(&mut self) {
-        self.stop_all();
-    }
-}
+// No `impl Drop for SessionManager`. It used to stop every session, on the
+// reasoning that the manager dropped exactly when `connect_and_run` returned so
+// this covered every exit path. That is precisely why a control-plane restart
+// ended every stream on the host (#128). The manager now outlives a connection,
+// and `run()` decides when to give up: sessions are held for a bounded grace
+// window and stopped only if the control plane does not come back within it.
 
 /// Turn the assign's `AppSpec` into a launchable container spec, or `None` when
 /// no image is set (a bare/compositor-only session).
@@ -4561,6 +4749,76 @@ mod tests {
                 "runner thread for {session_id} never finished"
             );
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// #128: a new connection must not disturb the sessions the agent carried
+    /// across the outage, and must drop the assignments it did not.
+    #[test]
+    fn begin_connection_clears_pending_but_keeps_running_sessions() {
+        // A runner that returns immediately. The handle stays in `running` until
+        // the event loop reconciles it, which this test never runs, so the map is
+        // still populated for the assertion. Deliberately NOT a sleeping runner:
+        // that leaks a live thread for the rest of the suite and it takes the
+        // agent's exclusive container-ownership lease with it, which fails an
+        // unrelated test.
+        let (mut mgr, _live_refs) = manager_with_runner(Arc::new(
+            |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics| {},
+        ));
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(8);
+        start_seam_session(&mut mgr, "survivor", &evt_tx);
+        assert_eq!(mgr.running.len(), 1, "setup: one running session");
+
+        // An assignment that never received its session_start.
+        mgr.pending.insert(
+            "orphan".to_string(),
+            PendingAssignment {
+                cfg: assignment_config(EncoderChoice::Openh264, "software"),
+                assigned_at: Instant::now(),
+            },
+        );
+        assert_eq!(mgr.pending.len(), 1, "setup: one pending assignment");
+
+        mgr.begin_connection(Vec::new(), Vec::new());
+
+        assert!(
+            mgr.running.contains_key("survivor"),
+            "a running session must survive the reconnect: that is the whole point of #128"
+        );
+        assert!(
+            mgr.pending.is_empty(),
+            "a pending assignment belongs to the old connection; the control plane re-drives it"
+        );
+    }
+
+    /// #128: the grace window is a knob, and 0 restores the old stop-on-drop
+    /// behaviour rather than meaning "no wait at all by accident".
+    #[test]
+    fn session_grace_reads_its_knob() {
+        let prev = std::env::var("QUASAR_SESSION_GRACE_SECS").ok();
+
+        std::env::remove_var("QUASAR_SESSION_GRACE_SECS");
+        assert_eq!(
+            session_grace(),
+            Duration::from_secs(DEFAULT_SESSION_GRACE_SECS)
+        );
+
+        std::env::set_var("QUASAR_SESSION_GRACE_SECS", "5");
+        assert_eq!(session_grace(), Duration::from_secs(5));
+
+        std::env::set_var("QUASAR_SESSION_GRACE_SECS", "0");
+        assert!(session_grace().is_zero(), "0 must disable the hold");
+
+        // Garbage falls back rather than disabling the hold silently.
+        std::env::set_var("QUASAR_SESSION_GRACE_SECS", "not-a-number");
+        assert_eq!(
+            session_grace(),
+            Duration::from_secs(DEFAULT_SESSION_GRACE_SECS)
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("QUASAR_SESSION_GRACE_SECS", v),
+            None => std::env::remove_var("QUASAR_SESSION_GRACE_SECS"),
         }
     }
 

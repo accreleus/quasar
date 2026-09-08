@@ -966,6 +966,23 @@ func (h *Handler) reevalConsole(ctx context.Context, hostID string, connectors [
 	// silent fallback to a different monitor.
 	nowPresent := connectorPresent(connectors, cfg.PinnedConnector())
 
+	// #128: a console session now SURVIVES a control-plane restart, but this
+	// tracker is in-memory and does not. Without adopting the survivor, the
+	// launch below is refused because that session still holds the home, nothing
+	// ends up tracked, and the terminal hook then ignores it -- leaving the
+	// console dark until a display hotplug. Only on the capacity path, which is
+	// the reconnect edge.
+	if !alreadyLaunched && isCapacityPath {
+		if sid := h.events.AdoptConsoleSession(ctx, hostID, *cfg.DefaultUser, *cfg.DefaultApp); sid != "" {
+			h.consoleAuto.mu.Lock()
+			h.consoleAuto.sessions[hostID] = sid
+			h.consoleAuto.mu.Unlock()
+			alreadyLaunched = true
+			h.log.Info("console auto-start: adopted the session that survived the control-plane restart",
+				"host_id", hostID, "session_id", sid)
+		}
+	}
+
 	switch {
 	case nowPresent && !alreadyLaunched:
 		h.attemptConsoleLaunch(ctx, hostID, cfg, isCapacityPath)

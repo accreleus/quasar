@@ -762,11 +762,16 @@ func (s *Store) ReapHost(ctx context.Context, hostID, reason string) (int64, err
 //
 // The `running` exclusion is the whole point: reaping those was one of the three
 // independent reasons a session died on a control-plane restart.
-func (s *Store) ReapHostExceptRunning(ctx context.Context, hostID, reason string) (int64, error) {
+// Returns the ids it actually failed. The caller drops those sessions' in-memory
+// state, and it must NOT drop it for the `running` rows this deliberately spared:
+// forgetting a live session's relay entry closes its browser's signalling
+// connection with "session is terminal" (#402's Forget path), which would end the
+// very stream the grace window exists to preserve.
+func (s *Store) ReapHostExceptRunning(ctx context.Context, hostID, reason string) ([]string, error) {
 	if !isValidUUID(hostID) {
-		return 0, nil // no such host's sessions to reap
+		return nil, nil // no such host's sessions to reap
 	}
-	tag, err := s.pool.Exec(ctx, `
+	rows, err := s.pool.Query(ctx, `
 		UPDATE sessions SET
 		    state         = 'failed',
 		    state_detail  = 'host_lost',
@@ -774,11 +779,21 @@ func (s *Store) ReapHostExceptRunning(ctx context.Context, hostID, reason string
 		    ended_at      = now()
 		WHERE host_id = $1::uuid
 		  AND state NOT IN ('stopped','failed','running')
+		RETURNING id::text
 	`, hostID, reason)
 	if err != nil {
-		return 0, fmt.Errorf("reap host sessions except running: %w", err)
+		return nil, fmt.Errorf("reap host sessions except running: %w", err)
 	}
-	return tag.RowsAffected(), nil
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("reap host sessions except running: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }
 
 // RunningSessionIDsOnHost lists only the `running` rows — the exact set the
@@ -814,6 +829,35 @@ type Host struct {
 	MemMB          *int32
 	LastRegistered *time.Time
 	LastHeartbeat  *time.Time
+}
+
+// ConsoleSessionOnHost finds a non-terminal session on hostID owned by userID
+// running appID -- the console session a PREVIOUS control-plane process
+// auto-started (#128).
+//
+// The console auto-start tracker is in-memory, so a control-plane restart
+// forgets which session it started, while the session itself now survives the
+// restart. Without this the next capacity report tries to launch a second
+// console session, is refused because the first still holds the home, and the
+// console stays dark until a display hotplug.
+func (s *Store) ConsoleSessionOnHost(ctx context.Context, hostID, userID, appID string) (string, error) {
+	if !isValidUUID(hostID) || !isValidUUID(userID) || !isValidUUID(appID) {
+		return "", nil
+	}
+	var id string
+	err := s.pool.QueryRow(ctx, `
+		SELECT id::text FROM sessions
+		WHERE host_id = $1::uuid AND user_id = $2::uuid AND app_id = $3::uuid
+		  AND state NOT IN ('stopped','failed')
+		ORDER BY created_at DESC
+		LIMIT 1`, hostID, userID, appID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("find console session on host: %w", err)
+	}
+	return id, nil
 }
 
 // HostsWithActiveSessions lists every host that still owns a non-terminal

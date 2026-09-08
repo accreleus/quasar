@@ -650,16 +650,44 @@ func TestReapHostExceptRunning(t *testing.T) {
 	inflight, err := coord.Launch(ctx, s.userID, s.appID, StreamOverride{})
 	must(t, err)
 
-	n, err := store.ReapHostExceptRunning(ctx, s.hostID, "agent reconnected")
+	reaped, err := store.ReapHostExceptRunning(ctx, s.hostID, "agent reconnected")
 	must(t, err)
-	if n != 1 {
-		t.Fatalf("reaped %d rows, want 1 (the in-flight row only)", n)
+	if len(reaped) != 1 || reaped[0] != inflight.Session.ID {
+		t.Fatalf("reaped %v, want exactly the in-flight row %s", reaped, inflight.Session.ID)
 	}
 	if got, _ := store.Get(ctx, running.Session.ID); got.State != StateRunning {
 		t.Errorf("running session = %s, want it preserved as running", got.State)
 	}
 	if got, _ := store.Get(ctx, inflight.Session.ID); got.State != StateFailed {
 		t.Errorf("in-flight session = %s, want failed", got.State)
+	}
+}
+
+// TestHostDisconnectedKeepsHeldSessionRegistered (#128): the disconnect path
+// must not drop the in-memory state of a session it deliberately kept alive.
+// forgetTerminalSession closes the browser's signalling connection as terminal
+// (#402), which would end the very stream the grace window exists to preserve.
+func TestHostDisconnectedKeepsHeldSessionRegistered(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	disp := newFakeDispatcher(true)
+	coord := newTestCoordinator(t, store, disp, testLogger())
+	ctx := context.Background()
+
+	res, err := coord.Launch(ctx, s.userID, s.appID, StreamOverride{})
+	must(t, err)
+	waitFor(t, func() bool { return len(disp.types()) >= 2 })
+	coord.AgentState(ctx, s.hostID, agentws.SessionStateMsg{SessionID: res.Session.ID, State: "running"})
+
+	coord.health.mu.Lock()
+	coord.health.healthRuns[res.Session.ID] = time.Now()
+	coord.health.mu.Unlock()
+
+	coord.HostDisconnected(ctx, s.hostID)
+
+	if inHR, _ := healthMapsContain(coord, res.Session.ID); !inHR {
+		t.Fatal("a held running session was forgotten on disconnect; its browser would be cut off as terminal")
 	}
 }
 
