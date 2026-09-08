@@ -87,8 +87,9 @@ func PlanRelease(in PlanInputs) View {
 		Available: available,
 		Targets:   targets(available, in.ControlPlane, hosts, open, fleet),
 		// Faults are read off the rows the channel SELECTS, which on beta are
-		// the stable channel's (rowChannel).
-		Faults: faults(in.Releases, rowChannel(channel), in.ControlPlane, hosts),
+		// the stable channel's (rowChannel), and ordered the way `available`
+		// orders them on that channel.
+		Faults: faults(in.Releases, channel, in.ControlPlane, hosts),
 		// Always serialized, `null` when nothing is in flight: null is the
 		// answer, not the absence of one.
 		ActiveApply: activeApply(in.ActiveRun, in.OpenAttempts),
@@ -417,10 +418,13 @@ func hostReason(newest *Release, cp buildinfo.Identity, h HostIdentity, attemptO
 // no trustworthy commit, built_at or schema_version, all three NOT NULL, so the
 // release is never stored and the detector reports the broken publish in its own
 // run record instead of inventing an identity (detect.go).
-// `source` is the platform_releases.channel value the instance's channel reads
-// (rowChannel), not the channel name itself: on beta those are not the same.
-func faults(rows []Release, source string, cp buildinfo.Identity, hosts []HostIdentity) []Fault {
+// `channel` is the instance's channel, not the platform_releases.channel value:
+// the rows come from rowChannel(channel) — on beta those are not the same — and
+// the channel itself is what decides the ordering the agent_ahead comparison
+// uses, so that a fault says the same thing `available` does.
+func faults(rows []Release, channel string, cp buildinfo.Identity, hosts []HostIdentity) []Fault {
 	out := make([]Fault, 0)
+	source := rowChannel(channel)
 
 	// What "above the control plane" is measured against, when it is known.
 	var cpRelease *Release
@@ -447,7 +451,7 @@ func faults(rows []Release, source string, cp buildinfo.Identity, hosts []HostId
 		}
 		hostRelease := matchRelease(rows, source, *h.SourceCommit)
 		// Unordered is not ahead: a commit matching no known release raises nothing.
-		if hostRelease == nil || !ordersAbove(*hostRelease, cpRelease, cp) {
+		if hostRelease == nil || !ordersAbove(*hostRelease, cpRelease, cp, channel) {
 			continue
 		}
 		hostID, nodeName := h.HostID, h.NodeName
@@ -474,15 +478,23 @@ func matchRelease(rows []Release, source, commit string) *Release {
 	return nil
 }
 
-// ordersAbove compares in the ordering `available` uses. With no known row for
-// the control plane there is no built_at to compare, so it falls back to
-// schema_version, the key that always exists.
-func ordersAbove(r Release, cpRelease *Release, cp buildinfo.Identity) bool {
+// ordersAbove compares in the ordering `available` uses — including on beta,
+// where that means semver precedence at an equal schema_version and NOT build
+// time: an rc cut from `develop` can be built before the patch release it orders
+// above, so comparing built_at would miss an agent that really is ahead. With no
+// known row for the control plane there is no built_at to compare, so it falls
+// back to schema_version, the key that always exists.
+func ordersAbove(r Release, cpRelease *Release, cp buildinfo.Identity, channel string) bool {
 	if cpRelease == nil {
 		return r.SchemaVersion > cp.SchemaVersion
 	}
 	if r.SchemaVersion != cpRelease.SchemaVersion {
 		return r.SchemaVersion > cpRelease.SchemaVersion
+	}
+	if channel == ChannelBeta {
+		if c, ok := comparePrecedence(r.Version, cpRelease.Version); ok && c != 0 {
+			return c > 0
+		}
 	}
 	return r.BuiltAt.After(cpRelease.BuiltAt)
 }

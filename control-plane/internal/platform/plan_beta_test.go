@@ -282,6 +282,40 @@ func TestBetaFaultsReadTheStableRows(t *testing.T) {
 	}
 }
 
+// A control plane moved BACKWARDS by hand — redeployed to an older patch release
+// while the fleet stayed on a prerelease — leaves its agents ahead of it, and the
+// fault must say so. On beta that comparison is semver precedence, not build
+// time: the rc was cut from `develop` before the patch was cut from `main`, so
+// built_at reads the wrong way round.
+func TestBetaAgentAheadUsesSemverPrecedenceNotBuildTime(t *testing.T) {
+	releases := []Release{
+		rel("rc", "0.3.0-rc.1", commitB, 74, at(3), prerelease),
+		// The build the control plane was manually put back onto: LOWER version,
+		// LATER build.
+		rel("patch", "0.2.5", commitC, 74, at(9)),
+	}
+	installed := cpAt(commitC, 74, "0.2.5")
+	hosts := []HostIdentity{knownHost("h1", commitB)}
+
+	got := PlanRelease(PlanInputs{
+		Channel: ChannelBeta, ControlPlane: installed, Releases: releases, Hosts: hosts,
+	})
+	if len(got.Faults) != 1 || got.Faults[0].Kind != FaultAgentAhead {
+		t.Fatalf("faults = %+v, want one agent_ahead_of_control_plane", got.Faults)
+	}
+	// The ordering the fault used is the one `available` used.
+	assertIDs(t, got.Available, []string{"rc", "patch"})
+
+	// Scoped to beta: on stable the rc is not even listed, and built_at — the
+	// ordering that channel really uses — puts the control plane's row on top.
+	onStable := PlanRelease(PlanInputs{
+		Channel: ChannelStable, ControlPlane: installed, Releases: releases, Hosts: hosts,
+	})
+	if len(onStable.Faults) != 0 {
+		t.Errorf("faults on stable = %+v, want none: built_at is that channel's ordering", onStable.Faults)
+	}
+}
+
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 func knownHost(id, commit string) HostIdentity {

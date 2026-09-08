@@ -37,6 +37,10 @@ type RevertInputs struct {
 	// measured against, as in plan.go's faults().
 	ControlPlaneRelease *Release
 	ControlPlane        buildinfo.Identity
+	// The instance's channel, because it decides how the two rows above are
+	// ordered (beta compares semver precedence, not build time). "" is the
+	// non-beta ordering, which is what every other channel uses.
+	Channel string
 }
 
 // RevertDecision is the attempt to create, or the refusal to write.
@@ -79,7 +83,7 @@ func PlanRevert(in RevertInputs) RevertDecision {
 	}
 	// ADR 0002's ceiling, reachable only if the control plane was moved
 	// backwards by hand: never create an agent-ahead-of-control-plane fault.
-	if in.PreviousRelease != nil && ordersAbove(*in.PreviousRelease, in.ControlPlaneRelease, in.ControlPlane) {
+	if in.PreviousRelease != nil && ordersAbove(*in.PreviousRelease, in.ControlPlaneRelease, in.ControlPlane, in.Channel) {
 		return RevertDecision{Code: CodeHostNotEligible, Reason: ReasonReleaseAboveControlPlane}
 	}
 
@@ -265,7 +269,7 @@ func (h *ApplyHandler) handleHostRevert(w http.ResponseWriter, r *http.Request) 
 
 // revertInputs is every read the decision needs.
 func (h *ApplyHandler) revertInputs(ctx context.Context, view View, hostID string) (RevertInputs, error) {
-	in := RevertInputs{ControlPlane: view.Installed.ControlPlane}
+	in := RevertInputs{ControlPlane: view.Installed.ControlPlane, Channel: view.Channel}
 	if cpCommit := view.Installed.ControlPlane.SourceCommit; cpCommit != nil {
 		// With no row for the control plane, ordersAbove falls back to
 		// schema_version, the key that always exists.
