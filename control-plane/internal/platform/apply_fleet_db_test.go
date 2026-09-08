@@ -503,3 +503,91 @@ func TestFleetApplyRejectsOlderEdgeBeforeCreatingRun(t *testing.T) {
 		t.Fatalf("runs = %+v, err = %v; want no run created", runs, err)
 	}
 }
+
+// sessionStates is every session row's state, so a test can say what a fleet
+// run did to the sessions that were live while it ran.
+func sessionStates(t *testing.T, pool *pgxpool.Pool) []string {
+	t.Helper()
+	rows, err := pool.Query(context.Background(), `SELECT state FROM sessions ORDER BY created_at`)
+	if err != nil {
+		t.Fatalf("read sessions: %v", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			t.Fatalf("scan session: %v", err)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// #153's acceptance line: a fleet apply whose release runs no migration leaves
+// running sessions running, and reports no `sessions_remaining` it is not
+// waiting on.
+func TestFleetHoldsRunningSessionsWhenTheReleaseRunsNoMigration(t *testing.T) {
+	drivers := &succeedingDrivers{}
+	// commitA is BEHIND the release, so the run really takes the control-plane
+	// step; the harness seeds that release at this binary's own schema version,
+	// which is the "runs no migration" case.
+	h := newFleetHarness(t, commitA, drivers)
+	drivers.store = h.store
+	seedSession(t, h.pool, h.hostID)
+
+	code, raw := h.do(t, http.MethodPost, "/v1/admin/platform/apply", h.admin,
+		FleetApplyRequest{ReleaseID: h.release.ID})
+	if code != http.StatusAccepted {
+		t.Fatalf("POST apply = %d %s, want 202", code, raw)
+	}
+	run := decodeRun(t, raw)
+
+	// Nothing ever ends that session, so terminating at all is the assertion.
+	waitFor(t, "the run to finish without the fleet emptying", func() bool {
+		r, err := h.store.Run(context.Background(), run.ID)
+		return err == nil && TerminalRunState(r.State)
+	})
+	final, err := h.store.Run(context.Background(), run.ID)
+	if err != nil || final.State != RunSucceeded {
+		t.Fatalf("run state = %q (%v), want succeeded", final.State, err)
+	}
+	if got := sessionStates(t, h.pool); len(got) != 1 || got[0] != "running" {
+		t.Fatalf("session states = %v, want the one that was running to still be running", got)
+	}
+	as, err := h.store.RunAttempts(context.Background(), run.ID)
+	if err != nil || len(as) == 0 || as[0].Target != TargetControlPlane {
+		t.Fatalf("attempts = %+v (%v), want the control plane's first", as, err)
+	}
+	if as[0].State != AttemptSucceeded {
+		t.Fatalf("control-plane attempt state = %q, want succeeded", as[0].State)
+	}
+	if as[0].SessionsRemaining != nil {
+		t.Fatalf("sessions_remaining = %d, want null: the step waited on nothing and ended nothing",
+			*as[0].SessionsRemaining)
+	}
+}
+
+// The other half: a release carrying a migration still drains the whole fleet
+// first, and waits rather than stopping anything.
+func TestFleetStillDrainsWhenTheReleaseCarriesAMigration(t *testing.T) {
+	h := newFleetHarness(t, commitA, parkedDrivers{})
+	migrating := seedRelease(t, h.store, commitC, buildinfo.Get().SchemaVersion+1)
+	seedSession(t, h.pool, h.hostID)
+
+	code, raw := h.do(t, http.MethodPost, "/v1/admin/platform/apply", h.admin,
+		FleetApplyRequest{ReleaseID: migrating.ID})
+	if code != http.StatusAccepted {
+		t.Fatalf("POST apply = %d %s, want 202", code, raw)
+	}
+	run := decodeRun(t, raw)
+
+	waitFor(t, "the control-plane attempt to wait on the whole fleet", func() bool {
+		as, err := h.store.RunAttempts(context.Background(), run.ID)
+		return err == nil && len(as) == 1 && as[0].State == AttemptWaitingSessions &&
+			as[0].SessionsRemaining != nil && *as[0].SessionsRemaining == 1
+	})
+	if got := sessionStates(t, h.pool); len(got) != 1 || got[0] != "running" {
+		t.Fatalf("session states = %v, want the drain to WAIT rather than stop anything", got)
+	}
+}

@@ -21,7 +21,13 @@ import { Modal } from "../../../components/Modal";
 import { Table, type TableColumn } from "../../../components/Table";
 import { useAdminAction } from "../../../lib/resource/action";
 import { AttemptProgress } from "./ApplyControls";
-import { eligibilityText, hasUpdate, releaseLabel, runStateText } from "./releasesCopy";
+import {
+  eligibilityText,
+  hasUpdate,
+  releaseLabel,
+  releaseRunsAMigration,
+  runStateText,
+} from "./releasesCopy";
 
 function eligibleHosts(targets: PlatformReleaseTarget[]): PlatformReleaseTarget[] {
   return targets.filter((t) => t.kind === "host" && t.eligible);
@@ -96,6 +102,9 @@ function FleetApplyModal({
   const [force, setForce] = useState(false);
   const newest = view.available[0];
   const hosts = eligibleHosts(view.targets).length;
+  // Consent has to name what actually happens: only a migrating release ends
+  // the instance's sessions before the control-plane step.
+  const migrates = releaseRunsAMigration(view, newest);
 
   const apply = useAdminAction(
     async () =>
@@ -133,18 +142,27 @@ function FleetApplyModal({
         Update the control plane, then {hosts} eligible host{hosts === 1 ? "" : "s"}, to{" "}
         <b>{releaseLabel(newest)}</b>.
       </p>
-      <p>
-        The control plane updates first and restarts; this page will lose contact for about 20
-        seconds. That restart ends every session on the instance, so the update waits for the
-        whole fleet to be empty before it starts.
-      </p>
+      {migrates ? (
+        <p>
+          The control plane updates first and restarts; this page will lose contact for about 20
+          seconds. This release changes the database, so the update waits for every session on the
+          instance to end before it starts.
+        </p>
+      ) : (
+        <p>
+          The control plane updates first and restarts; this page will lose contact for about 20
+          seconds. Live sessions keep streaming through it — each host's own sessions end when
+          that host is updated.
+        </p>
+      )}
       <label className="rowflex">
         <input type="checkbox" checked={force} onChange={(e) => setForce(e.target.checked)} />
         <span>Update now — ends every live session on {hostCount(hosts)}</span>
       </label>
       <p className="hint">
-        Without this, the update waits for every session on the instance to end on its own, and
-        then for each host's own sessions in turn.
+        {migrates
+          ? "Without this, the update waits for every session on the instance to end on its own, and then for each host's own sessions in turn."
+          : "Without this, the update waits for each host's own sessions to end on their own before it updates that host."}
       </p>
     </Modal>
   );
@@ -218,8 +236,9 @@ export function FleetRunPanel({
     {
       key: "state",
       header: "State",
-      // The control-plane step waits for the WHOLE fleet: its recreate drops
-      // every agent connection, and an agent stops its sessions when that drops.
+      // When the control-plane step waits at all it waits for the WHOLE fleet,
+      // not one host's sessions. Since #153 that is only a release carrying a
+      // migration; otherwise the step never enters this state.
       render: (a) =>
         a.target === "control_plane" && a.state === "waiting_sessions" ? (
           <span>

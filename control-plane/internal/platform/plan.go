@@ -127,6 +127,19 @@ func activeApply(run *ApplyRun, attempts []Attempt) *ActiveApply {
 	return &ActiveApply{Run: run, Attempts: attempts}
 }
 
+// ReleaseRunsAMigration reports whether moving a control plane at
+// schemaVersion onto r runs at least one migration. schema_version IS the
+// highest migration a build embeds (buildinfo.SchemaVersion) and DDL only
+// arrives as a numbered migration, so "above us" and "migrates the database"
+// are one fact. The other half of ADR 0002's schema rule from `offerable`,
+// which refuses a release BELOW the control plane. The fleet run's
+// control-plane drain branches on this (#153, apply_fleet.go prepareFleet).
+//
+// Client twin: web/src/pages/admin/fleet/releasesCopy.ts releaseRunsAMigration.
+func ReleaseRunsAMigration(r Release, schemaVersion int) bool {
+	return r.SchemaVersion > schemaVersion
+}
+
 // offerable applies the three listing rules and the ordering: schema_version
 // then built_at, both DESC (ADR 0002). The built_at tiebreak matters because
 // edge produces many builds at one schema_version; id keeps a list stable

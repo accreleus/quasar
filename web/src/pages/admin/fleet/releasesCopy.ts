@@ -138,6 +138,22 @@ export function hasUpdate(view: {
   return !commitsMatch(installed, newest.source_commit);
 }
 
+/** Whether applying this release runs a migration here: `schema_version` IS the
+ *  highest migration a build embeds, so "above the installed control plane" and
+ *  "migrates the database" are one fact. Only a migrating release makes the
+ *  control-plane step wait for every session on the instance to end (#153); the
+ *  rest carry them across the restart. An unknown installed schema reads as
+ *  migrating, as it does server-side. Server twin:
+ *  internal/platform.ReleaseRunsAMigration. */
+export function releaseRunsAMigration(
+  view: { installed: { control_plane: { schema_version?: number } } },
+  release: PlatformRelease | undefined,
+): boolean {
+  const installed = view.installed.control_plane.schema_version;
+  if (installed === undefined || !release) return true;
+  return release.schema_version > installed;
+}
+
 /** An agent stamps 7-40 hex while a manifest carries the full 40, so "the same
  *  commit" is a prefix match. Server twin: internal/platform.commitsMatch. */
 export function commitsMatch(a: string | null | undefined, b: string | null | undefined): boolean {

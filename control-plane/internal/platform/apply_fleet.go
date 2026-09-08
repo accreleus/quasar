@@ -6,23 +6,25 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
 )
 
 // The fleet sequencer: one release across the instance, the control plane first
 // and then every eligible host in sequence (ADR 0002).
 // semantics: control-api.md §"Platform-release apply"
 //
-// Three rules a plausible edit breaks:
+// Rules a plausible edit breaks:
 //   - A run STOPS at its first failed target. Past a failed control plane,
 //     continuing would move agents onto a release the control plane is not on;
 //     past a failed host, it would march a known-bad digest set across the fleet.
 //   - An ineligible host is SKIPPED, not failed: a run must not go `failed`
 //     because a host happened to be offline.
 //   - The cancel flag is read BETWEEN targets and never mid-attempt.
-//   - Recreating the CONTROL PLANE ends every session on the instance: an agent
-//     stops its sessions the moment its control-plane connection drops. So the
-//     control-plane target drains the whole fleet first, and the fleet stays
-//     cordoned until the run is terminal.
+//   - The fleet stays cordoned until the run is terminal, whatever the
+//     control-plane step does about sessions.
+//   - The control-plane target drains the fleet first only when the release
+//     carries a migration; prepareFleet has the argument.
 //
 // A fleet run survives the restart it causes: everything durable is in
 // Postgres, so the control plane that boots on the new image re-adopts the run
@@ -147,6 +149,11 @@ type FleetRunner struct {
 	Deadline time.Duration
 	// How long a re-adopted run waits for its agents to come back.
 	AdoptSettle time.Duration
+	// SchemaVersion is the highest migration this control plane embeds, which
+	// after boot is also the database's applied version. A field rather than a
+	// buildinfo call at the point of use, so a test can put a release on either
+	// side of it.
+	SchemaVersion int
 
 	mu sync.Mutex
 	// run id → cancel, bounded at one by the active-run index.
@@ -169,14 +176,15 @@ func NewFleetRunner(store fleetStore, hosts hostDriver, self selfDriver, resolve
 	return &FleetRunner{
 		store: store, hosts: hosts, self: self, resolve: resolve, cordons: cordons,
 		view: view, log: log,
-		PollWait:    DefaultApplyPoll,
-		Deadline:    DefaultApplyDeadline,
-		AdoptSettle: DefaultAdoptSettle,
-		running:     make(map[string]context.CancelFunc),
-		adopted:     make(map[string]bool),
-		skips:       make(map[string][]RunSkip),
-		baseCtx:     ctx,
-		stop:        cancel,
+		PollWait:      DefaultApplyPoll,
+		Deadline:      DefaultApplyDeadline,
+		AdoptSettle:   DefaultAdoptSettle,
+		SchemaVersion: buildinfo.SchemaVersion(),
+		running:       make(map[string]context.CancelFunc),
+		adopted:       make(map[string]bool),
+		skips:         make(map[string][]RunSkip),
+		baseCtx:       ctx,
+		stop:          cancel,
 	}
 }
 
@@ -353,12 +361,35 @@ func (f *FleetRunner) controlPlanePhase(ctx context.Context, run ApplyRun) bool 
 	}
 }
 
-// prepareFleet cordons the whole instance and waits for it to be empty, because
-// recreating the control plane ends every session on it. False means the attempt
-// resolved underneath (a cancel, a timeout) or the process is shutting down, and
-// there is nothing to send.
+// prepareFleet cordons the whole instance, and waits for it to be empty only
+// when this release carries a migration (#153). False means the attempt
+// resolved underneath (a cancel, a timeout) or the process is shutting down.
+//
+// Since #128 a control-plane recreate no longer ends sessions: the agent holds
+// them and the browser keeps its media path (live-gated 2026-09-08, 1080p60 at
+// 60 fps through a 73 s outage — docs/reports/2026-09-08-128-session-survival-gate/).
+// A migrating release still drains, for a different reason: the held row is
+// read back by a binary that has just migrated the database under it, and every
+// migration was authored assuming no session was live — 0027 moved the
+// signalling token out of `sessions` on exactly that assumption. Nothing checks
+// a migration for it and this code cannot read the SQL, so it must not gamble.
 func (f *FleetRunner) prepareFleet(ctx context.Context, run ApplyRun, a Attempt) bool {
+	// Cordon either way: every host in the run is about to be recreated, so a
+	// session that lands mid-run is one the run would end at that host's step.
 	f.cordonFleet(ctx, run.ID)
+
+	if !f.releaseRunsAMigration(ctx, run) {
+		// No SetWaitingSessions: it moves the attempt into `waiting_sessions`,
+		// and nothing here is waiting or being lost. Logged instead, because
+		// the count carried across the restart is this path's evidence.
+		n, err := f.store.FleetNonTerminalSessions(ctx)
+		if err != nil {
+			f.log.Warn("fleet apply: could not count sessions", "run_id", run.ID, "err", err)
+		}
+		f.log.Info("fleet apply: the control-plane step is holding live sessions; this release runs no migration",
+			"run_id", run.ID, "sessions", n, "token", "cp-step-holds-sessions")
+		return true
+	}
 
 	remaining, err := f.store.FleetNonTerminalSessions(ctx)
 	if err != nil {
@@ -405,6 +436,19 @@ func (f *FleetRunner) prepareFleet(ctx context.Context, run ApplyRun, a Attempt)
 		}
 	}
 	return true
+}
+
+// releaseRunsAMigration answers what prepareFleet branches on. An unreadable
+// release reads as migrating: an unnecessary drain costs sessions visibly, a
+// missing one runs a migration under live sessions and nothing sees it.
+func (f *FleetRunner) releaseRunsAMigration(ctx context.Context, run ApplyRun) bool {
+	release, err := f.store.Release(ctx, run.ReleaseID)
+	if err != nil {
+		f.log.Warn("fleet apply: could not read the release to decide the control-plane drain; draining the fleet",
+			"run_id", run.ID, "err", err)
+		return true
+	}
+	return ReleaseRunsAMigration(release, f.SchemaVersion)
 }
 
 // cordonFleet takes every online host out of scheduling for the rest of the run,

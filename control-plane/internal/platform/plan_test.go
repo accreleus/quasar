@@ -614,3 +614,32 @@ func TestAgentAheadIsAFaultAndStillATargetRow(t *testing.T) {
 		t.Fatalf("host target = %+v, want up_to_date", v.Targets[1])
 	}
 }
+
+// The #153 predicate. schema_version IS the highest migration a build embeds,
+// so "above this control plane" and "runs a migration here" are one fact — and
+// the control-plane step's fleet drain branches on it.
+func TestReleaseRunsAMigration(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema int
+		cpAt   int
+		want   bool
+	}{
+		{"one migration above", 79, 78, true},
+		{"several above", 90, 78, true},
+		{"level with the control plane", 78, 78, false},
+		// Unreachable past `offerable`, which never lists a release below the
+		// control plane (ADR 0002); false is still the right answer, because a
+		// binary already past that migration has nothing left to run.
+		{"below the control plane", 77, 78, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := rel("r", "0.9.0", commitC, c.schema, at(4))
+			if got := ReleaseRunsAMigration(r, c.cpAt); got != c.want {
+				t.Fatalf("ReleaseRunsAMigration(schema %d, cp %d) = %v, want %v",
+					c.schema, c.cpAt, got, c.want)
+			}
+		})
+	}
+}

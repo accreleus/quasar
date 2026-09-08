@@ -24,6 +24,18 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Changed
+
+- A fleet update no longer empties the whole instance before it updates the control
+  plane (#153). That drain existed because a control-plane restart used to end every
+  session; #128 removed that, so a release carrying no database migration now takes the
+  control-plane step with sessions still streaming through it, and only each host's own
+  sessions end as that host is updated. A release that **does** carry a migration still
+  drains the fleet first — the held session's row is read back by a binary that has just
+  migrated the database under it, and no migration was ever written to survive that. The
+  confirmation says which of the two you are about to do, and the fleet is still cordoned
+  for the whole run either way.
+
 ### Fixed
 
 - Sessions now survive a control-plane restart (#128), confirmed on a live 73 s

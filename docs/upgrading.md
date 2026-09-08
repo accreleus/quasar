@@ -435,13 +435,34 @@ only" button.
 
 What happens, step by step:
 
-1. **The whole fleet drains first.** Recreating the control plane drops every
-   agent's connection to it, and an agent stops its sessions the moment that
-   connection drops — so a control-plane update ends **every session on the
-   instance**, not none. The run cordons every host and sits in
-   **waiting_sessions**, showing the instance-wide count, until it reaches
-   zero. Force skips the wait and ends them. The cordons are released when the
-   run finishes, and a host an admin had already cordoned stays cordoned.
+1. **The whole fleet is cordoned, and drains first only if the release changes
+   the database.** Every host goes out of scheduling for the run — each one is
+   going to be recreated, so a session started mid-run is one the run would end
+   at that host's step. The cordons are released when the run finishes, and a
+   host an admin had already cordoned stays cordoned.
+
+   Whether the run also *waits* for those sessions to end depends on the
+   release:
+
+   - **A release that runs no migration does not wait.** Live sessions stream
+     straight through the control-plane restart: the agent holds its running
+     sessions across the outage and the browser keeps the media path it already
+     has, so the control plane's absence costs the stream nothing. Measured on a
+     real session: 1080p60 decoding at 60 fps throughout a 73-second
+     control-plane outage, still `running` afterwards.
+   - **A release that carries a migration waits for the instance to empty.** The
+     run cordons every host and sits in **waiting_sessions**, showing the
+     instance-wide count, until it reaches zero; force skips the wait and ends
+     them. The reason is not the restart — it is that the held session's row is
+     read back by a binary that has just migrated the database under it. Every
+     migration Quasar has ever shipped was written on the assumption that no
+     session was live while it ran, and one of them (0027) moved the signalling
+     token out of the `sessions` table entirely. Nothing checks a migration for
+     whether a live session survives it, so the update does not gamble on it.
+
+   You can tell the two apart before you press Update: the confirmation says
+   either that live sessions keep streaming, or that this release changes the
+   database and the update waits.
 2. **The control plane updates itself** through the updater sitting beside it,
    over that host's local socket — never through a node agent. It pulls, then
    recreates its own container, so **the API and the console go away for
@@ -460,9 +481,9 @@ What happens, step by step:
 
 **Force** applies to every target in the run, the control plane included, and
 the confirmation names how many hosts it will take sessions from. Without it
-the run waits for the instance to empty before the control-plane step, and then
-for each host's own sessions in turn, which means a run can sit for as long as
-someone is playing.
+the run waits for each host's own sessions in turn — and, on a release that
+carries a migration, for the whole instance to empty before the control-plane
+step as well — which means a run can sit for as long as someone is playing.
 
 **A source-built control plane is not offered an update from here.** The
 registry image is a different build with a different uid, and swapping one for
