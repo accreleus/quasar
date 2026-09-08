@@ -27,8 +27,9 @@ frame arriving in the browser can be attributed back to the frame the app
 submitted — which no opaque workload (Heaven, a game) can do.
 
 The reference decoder could not simply be injected by a test harness: the SPA's
-Content-Security-Policy blocks `page.addScriptTag` and in-page `eval`
-(`docs/design/research/2026-08-18-benchapp-bringup.md` §6). Decoding in the
+Content-Security-Policy blocks `page.addScriptTag` and in-page `eval` (§6 of the
+bring-up write-up, `docs/design/research/2026-08-18-benchapp-bringup.md`, which did not
+survive the public-release history squash). Decoding in the
 driver's Node process works, but only at ~1 Hz — and the two measurements that
 matter most, drop/duplicate detection and the app's 3-frame (~50 ms) input echo,
 need **every** displayed frame. So the decoder is vendored into
@@ -226,8 +227,9 @@ make bench-run HOST=devbox ARGS="--app 'Quasar Benchapp' --profile 1080p60 \
   default** (changed 2026-08-19): `QSES_PEER_ROLE` is set to the same role/host
   `bench_run.sh` resolved for `HOST`, so `qses` puts the peer on the stack host
   itself. `--peer aux` restores the pre-2026-08-19 default,
-  `QSES_PEER_ROLE=aux-infra` (hermes). The switch is a direct result of
-  `docs/reports/2026-08-19-peer-path/REPORT.md`: an otherwise identical cell
+  `QSES_PEER_ROLE=aux-infra` (hermes). The switch is a direct result of a
+  2026-08-19 measurement (write-up `docs/reports/2026-08-19-peer-path/REPORT.md`, which
+  did not survive the public-release history squash): an otherwise identical cell
   measured **0.000% missing indices with a local peer vs 2.7% through hermes**
   — hermes is a WiFi NIC doing software H.264 decode on a weaker CPU, and its
   RTT p95 (136-173 ms) alone is enough to blow the 50 ms jitter buffer, which
@@ -329,9 +331,10 @@ bench run ever fetches.
 
 ## The glass-to-glass budget (standing instrument)
 
-`docs/reports/2026-08-19-latency-budget/REPORT.md` measured every stage of a
-66 ms 1080p60 h264 glass-to-glass and made the budget close (section 1: 66.0 ms
-measured, 65.7 ms of stages, 0.3 ms residual). That was one report, run by
+A 2026-08-19 report (`docs/reports/2026-08-19-latency-budget/REPORT.md`, which did not
+survive the public-release history squash and is not recoverable from this repo)
+measured every stage of a 66 ms 1080p60 h264 glass-to-glass and made the budget close
+(section 1: 66.0 ms measured, 65.7 ms of stages, 0.3 ms residual). That was one report, run by
 hand. This section is the standing form of it: the same stages, captured on
 **every** bench-mode run and printed as a table you don't have to build
 yourself.
@@ -343,7 +346,7 @@ yourself.
 | `stage_host_to_receive_*`, `stage_receive_to_present_*`, `stage_decode_*`, `stage_wait_queue_*`, `stage_present_to_display_*`, `stage_render_queue_derived_*`, `stage_jb_*`, `stage_assembly_*`, `stage_reconcile_*` | `browser` | the RVFC-derived stage split, "The stage split" above — always emitted in bench mode |
 | `g2g_p50_ms`, `g2g_p95_ms` | `browser` | the headline glass-to-glass figure the stages reconcile against |
 | `render_p50_ms`, `repaint_wait_p50_ms`, `submit_to_present_p50_ms` (+ `_p95_ms`) | `app` | benchapp's `commit_ms` split, "The app -> compositor head, split by owner" above — needs a benchapp image built from a `commit_ms`-carrying `quasar-benchgame` (2026-08-19: `946da34`) |
-| `probe_capture_to_enc_in_*`, `probe_pts_to_emit_*`, `probe_enc_out_to_send_*`, `probe_pay_to_send_*` | `agent` | the host-stage latency probe (`QUASAR_LATENCY_PROBE` / hostcfg `latency_probe`) — **`bench_run.sh --bench-mode` now arms this automatically** for the run (PATCHes `overrides.latency_probe=true` on the session's host, verifies the read-back, restores the prior value on every exit path including Ctrl-C — same snapshot/PATCH/verify/restore-in-trap shape as `bench_suite.sh`'s ABR settings). Perturbation from the probe itself was measured and found nil: `docs/reports/2026-08-19-fps120-probe/REPORT.md` part 2 (drops Δ +0.143pp, g2g Δ +2.10ms, both inside the randomised-rerun PASS thresholds). Pass `--no-probe` to opt a run out. |
+| `probe_capture_to_enc_in_*`, `probe_pts_to_emit_*`, `probe_enc_out_to_send_*`, `probe_pay_to_send_*` | `agent` | the host-stage latency probe (`QUASAR_LATENCY_PROBE` / hostcfg `latency_probe`) — **`bench_run.sh --bench-mode` now arms this automatically** for the run (PATCHes `overrides.latency_probe=true` on the session's host, verifies the read-back, restores the prior value on every exit path including Ctrl-C — same snapshot/PATCH/verify/restore-in-trap shape as `bench_suite.sh`'s ABR settings). Perturbation from the probe itself was measured and found nil (part 2 of `docs/reports/2026-08-19-fps120-probe/REPORT.md`, which did not survive the public-release history squash: drops Δ +0.143pp, g2g Δ +2.10ms, both inside the randomised-rerun PASS thresholds). Pass `--no-probe` to opt a run out. |
 | `present_fps_median`, `present_interval_sd_ms`, `present_interval_max_ms`, `present_beat_fraction`, `present_long_frames`, `present_n` | `browser` | the AS-04/#108 present-cadence keys `docs/session-trace/metrics.json` defines (`present_fps_median` is what replaced the deprecated MEAN `present_fps` — a healthy 1440p120 session once read it as 88-108 fps). Rolled up on **every** run, not only bench-mode ones — `bench_submit.py`'s `ROLLUP_KEYS`/`ROLLUP_COUNTERS`. |
 | `encode_ms_max` | `agent` | the worst single per-frame encode in the window — the one agent key that can see a one-frame stall, which a mean or p95 both wash out over a 5 s window. Also rolled up on every run. |
 
@@ -365,10 +368,10 @@ A run whose suite/scenario/baseline name has no pinned baseline prints every sta
 
 ### Baseline policy — when to re-baseline
 
-The pinned baseline is `latency-budget/1080p60-h264-local`, set from the median of the three clean local cells in `docs/reports/2026-08-19-latency-budget/REPORT.md` (run `640d5b00`, g2g p50 66.0 ms — the report's own headline number). Re-baseline:
+The pinned baseline is `latency-budget/1080p60-h264-local`, set from the median of the three clean local cells in the (no-longer-recoverable) `docs/reports/2026-08-19-latency-budget/REPORT.md` (run `640d5b00`, g2g p50 66.0 ms — the report's own headline number). Re-baseline:
 
 - **After an intentional default change** that is expected to move a stage — an ABR-mode flip, a playout-floor change, a new compositor/encoder pin. The whole point of a threshold is to catch an *unintended* regression; re-pinning after a deliberate one is how the budget stays useful instead of permanently red.
-- **Never** to make a run that regressed for an unknown reason quietly green. Find out why first (`quasar-diagnose`, the stage table itself, `docs/reports/2026-08-19-latency-budget/REPORT.md` section 6 for the known-actionable levers).
+- **Never** to make a run that regressed for an unknown reason quietly green. Find out why first (`quasar-diagnose`, the stage table itself; section 6 of that same report had the known-actionable levers, but the report did not survive the public-release history squash).
 - `make bench-baseline RUN=<id> NAME=<suite/scenario>` pins a run as a named baseline (thin wrapper over `Bench.set_baseline`, `scripts/dx/bench_baseline.py`) — suite and scenario are read from the run itself, so a typo can't pin the wrong one. Omit `NAME` for the `<suite>/<scenario>` default; a different name lets more than one baseline coexist for the same suite+scenario (e.g. a `-clean` and a `-netem` variant).
 
 ### A nightly budget run — scheduled (Michael sign-off 2026-08-19)

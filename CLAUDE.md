@@ -5,7 +5,7 @@ This file is the durable context for every AI-agent session in this repo. Read i
 ## What Quasar is
 A self-hostable, multi-host cloud-gaming platform (a self-hosted GeForce Now). Built on the strongest components of `games-on-whales/wolf` (the Wayland compositor, virtual input) while taking a different direction: no discontinued NVIDIA GameStream / Moonlight protocol, WebRTC-to-browser first. (Wording note: never describe Quasar as a "clean-room successor" — Wolf is MIT and held in high regard here.)
 
-Full rationale: `docs/architecture-and-plan.md`. Phases 0–5 are complete (records below); their plans, execution records, and latency reports are archived under `docs/completed/`. Active work follows the roadmap-spec-v2 wave ladder — see "Current phase & standing defaults" below.
+Full rationale: `docs/architecture-and-plan.md`. Phases 0–5 are complete (records below); their detailed plans, execution records, and latency reports lived under `docs/completed/` but did not survive the 2026-08-31 public-release history squash (commit `590abb4`) — that directory does not exist in this repo and is not recoverable from its history. The phase summaries in `docs/architecture-and-plan.md` and the compact verdicts below are what remains. Active work follows the roadmap-spec-v2 wave ladder — see "Current phase & standing defaults" below.
 
 ## The one rule that matters
 **Design for the end state, not the current phase.** Wolf grew from a single-host, single-user core, so multi-host / K8s / multi-user were retrofitted onto it later. If a capability is on the roadmap, the architecture must anticipate it from the first commit. Do not introduce a workaround that a later phase will have to tear out.
@@ -51,7 +51,7 @@ These are load-bearing: cheap-model tickets on the client and host sides depend 
 - `deploy/`       compose now, k8s manifests later. **Build images with `deploy/build-images.sh`, never a hand-typed `docker build`** — it forces an explicit `--target` (a bare build takes the LAST stage regardless of `-t`), rejects a `--build-arg` for an undeclared ARG (Docker ignores those silently), and validates every artifact against `deploy/image-contract.json` before promoting `:latest`. The contract is the durable form of every image defect that reached production; **never relax an assertion to make a build green.** **`deploy/` is the OPERATOR front door: it holds only what someone installing Quasar needs.** Contributor tooling lives under `scripts/` — `dev/` (the dev container wrapper and dev seeders), `verify/` (verify stages + the devtools image), `harness/` (acceptance harnesses, `lib/`, `checks/`, the `apitest` module, `peer-driver.mjs`), `release/` (release-evidence gates), `dx/` (the Makefile's orchestration) — and non-operator compose overlays live in `deploy/overlays/`. Don't add a new development script to `deploy/`.
 - `third_party/`  vendored forks — **currently only a README**; gst-wayland-display/inputtino are built from upstream pins in `deploy/Dockerfile.vulkan` (the single image lineage: dev/runtime/nv targets on the `quasar-base` family), vendored only when modification is needed. Don't go looking for source here. Pins + flip instructions live in **`docs/third-party-pins.md`** — current: gst-wayland-display fork `310c03ec` (upstream base `43d4c25`), gst-interpipe `0c454917` (gow fork) + two vendored caps-leak patches, GStreamer `1.28.4` + vendored patches. **A pin bump on either fork is gated on a live exercise, not a green build** — see "Fork-bump verification policy" in `docs/third-party-pins.md`.
 - `CONTEXT.md`    the domain glossary (chain, rung, cert cap, stream plan, probe, envelope, entitlement, home, derived tile). Read it before naming things; add a term when work resolves one, rather than coining a synonym.
-- `docs/`         design docs (config knobs: `docs/configuration.md` — every env var, default, accepted values). **`docs/tech-debt/REVIEW-REMAINING.md`** is the scoped backlog of still-open review findings (#6/#8/#9/#10/#13/#14/#15; all low/subjective or a future spike — none are bugs); the executed TD-01/TD-02 refactor plans are archived in `docs/completed/tech-debt/`.
+- `docs/`         design docs (config knobs: `docs/configuration.md` — every env var, default, accepted values). The scoped backlog of still-open review findings (#6/#8/#9/#10/#13/#14/#15; all low/subjective or a future spike — none are bugs) and the executed TD-01/TD-02 refactor plans lived at `docs/tech-debt/REVIEW-REMAINING.md` and `docs/completed/tech-debt/` respectively; neither survived the public-release history squash (commit `590abb4`) — check the numbered issues directly on GitHub for current status.
 
 ## Conventions
 - Rust: 2021 edition, `cargo fmt` + `cargo clippy -- -D warnings` clean before done.
@@ -162,12 +162,16 @@ skipped the handoff produced a full UI that had to be redone.)
 Escalate to Opus when: a ticket is ambiguous, touches a frozen interface or the latency path, or a cheaper model has failed it twice.
 
 ## Current phase & standing defaults
-**Roadmap of record: integrated roadmap spec v2**
-(`docs/design/plans/2026-07-06-roadmap-spec-v2.html` — library-provider model + wave
-ladder), which supersedes the numbered-phase framing. W0 (image consolidation, #367)
-and W1 (security wave, PR #374: invite-gated registration + device binding, migration
-0020) are merged; W2 is active (console-mode ∥ Phase 9 closure; executed plans are
-archived under `docs/completed/plans/`, live ones stay in `docs/design/plans/`). **"What's active right now" lives in GitHub milestones + the
+**Roadmap of record: integrated roadmap spec v2** (a library-provider model + wave
+ladder), which supersedes the numbered-phase framing. The source document,
+`docs/design/plans/2026-07-06-roadmap-spec-v2.html`, did not survive the 2026-08-31
+public-release history squash (commit `590abb4`) and is not recoverable from this
+repo's history — the wave-ladder facts on record are what follow. W0 (image
+consolidation, #367) and W1 (security wave, PR #374: invite-gated registration +
+device binding, migration 0020) are merged; W2 is active (console-mode ∥ Phase 9
+closure). Executed plans were archived under `docs/completed/plans/` pre-squash —
+also gone; going forward, plans (live and executed) are filed under
+`docs/superpowers/plans/`. **"What's active right now" lives in GitHub milestones + the
 session memory `current-focus.md`, not this file.**
 
 **Standing operational defaults (knobs, not history):**
@@ -256,8 +260,9 @@ session memory `current-focus.md`, not this file.**
   `device-path` read or NULL→READY makes the encoder bind its own display.
 - **Multi-codec (2026-07-25): H.264 + HEVC + AV1, one codec per session, resolved
   server-side at launch** (profile codec list ∩ host encoder set ∩ client decode probe ∩
-  failure history, guaranteed h264 floor; migrations 0031/0032; spec
-  `docs/design/plans/2026-07-22-multi-codec-hevc-av1-spec.md`). SHIP-DARK: profiles
+  failure history, guaranteed h264 floor; migrations 0031/0032; the design spec,
+  `docs/design/plans/2026-07-22-multi-codec-hevc-av1-spec.md`, did not survive the
+  public-release history squash). SHIP-DARK: profiles
   default h264-only; admins enable per profile (list ORDER = preference; the admin API
   reorders, the UI only edits status). Wire vocab `h264|h265|av1` vs catalog vocab
   `hevc` — bridged ONLY in `control-plane/internal/session/codec.go`. Vulkan hosts:
@@ -283,7 +288,8 @@ session memory `current-focus.md`, not this file.**
   Vulkan session is an NVENC MMU fault (Xid 31), because the encoder kept the launch-size
   DPB. Each rung step on Vulkan is an encoder session restart (VRAM flat over 84 flips).
   `abr_ladder_resolution` is inert unless the master `abr_ladder` is also true.
-  Evidence `docs/reports/2026-08-22-vulkanscale-validation/`; memory `vulkanscale-campaign`.
+  Evidence lived at `docs/reports/2026-08-22-vulkanscale-validation/` but did not survive
+  the public-release history squash; memory `vulkanscale-campaign`.
 - **Deep glass-to-glass trace is an always-on client (Chrome) capability** — the
   host-side overlay/probe was removed (#270; it could crash the stream).
 - Feature backlog: #39 (configurable swap disposition), #273 (per-session GPU routing +
@@ -291,8 +297,10 @@ session memory `current-focus.md`, not this file.**
   send-side ULPFEC shipped as `QUASAR_FEC_PERCENTAGE`, default off).
 
 ## Phase records — 0–5 + Optimization Spike/AS complete
-Full plans, execution records, latency reports, and per-phase verdicts: `docs/completed/`
-(compact verdicts also in the session memory `quasar-phase-records.md`).
+The full plans, execution records, latency reports, and per-phase verdicts lived at
+`docs/completed/`; that directory did not survive the public-release history squash and
+is not recoverable from this repo. The compact verdicts survive in the session memory
+`quasar-phase-records.md`.
 
 ## Code exploration
 For structural code questions use `workspace_search` / `workspace_symbol` from the

@@ -116,39 +116,50 @@ Multiple node agents. Control plane schedules sessions across nodes and load-bal
 Productize the Phase 0 latency instrument into an end-to-end performance pipeline (host
 encode → wire → browser decode/present on one timeline), reproducible test apps, an
 automated troubleshooting harness, per-session telemetry surfaced in admin, and a client
-connection + decode-capability test at login stored per user/device. Scope stub:
-`docs/completed/phase4/`.
+connection + decode-capability test at login stored per user/device. Scope stub was
+`docs/completed/phase4/`, which did not survive the public-release history squash
+(commit `590abb4`) and is not recoverable from this repo — see the compact verdict in
+the session memory `quasar-phase-records.md`.
 
 **Phase 5 — Storage & state foundation.**
 Per-user persistent state (managed home mounted into the container) and the storage
 substrate the library needs. Two asymmetric problems — a read-only common content store
 and a read-write per-user home — behind a pluggable storage-provider abstraction.
 **Single-host now, multi-host-ready by design** (networked/shared storage is a later driver
-swap, not a re-model). Complete — records in `docs/completed/phase5/`.
+swap, not a re-model). Complete — the execution record (`docs/completed/phase5/`) did not
+survive the public-release history squash (commit `590abb4`) and is not recoverable from
+this repo — see the compact verdict in the session memory `quasar-phase-records.md`.
 
 **Phase 6 — Library & content management.**
 A real library: common deduplicated content store (overlayfs, write-once), a runtime-image
 catalog, Proton management, artwork/metadata (SteamGridDB/Steam/IGDB), entitlements, and
 admin-permissioned installs. Multi-source by design (Steam first). An "app" becomes
-*(content) + (runtime image) + (launch command)*, not a monolithic image. Scope stub:
-`docs/phase6/`.
+*(content) + (runtime image) + (launch command)*, not a monolithic image. Scope stub was
+`docs/phase6/`; that path does not exist in this repo (lost at the public-release history
+squash, commit `590abb4`) — this paragraph is the current scope record.
 
 **Phase 7 — User management & integrations.**
 Invite/redemption signup, device management, and **Steam via SteamKit2** — server-side QR
 auth + direct depot download into the common store, then direct-launch under Proton (no
-in-container Steam client, no per-user re-downloads). Scope stub: `docs/phase7/`.
+in-container Steam client, no per-user re-downloads). Scope stub was `docs/phase7/`;
+that path does not exist in this repo (lost at the public-release history squash,
+commit `590abb4`) — this paragraph is the current scope record.
 
 **Phase 8 — Networking edge (TURN/WAN).**
 Internet-facing media relay so GPU hosts stay private (outbound-only). Private hosts +
 public TURN edge; `ice_servers` flow through the contract; signaling shapes unchanged.
-Design: `docs/future/networking-edge.md`; scope stub: `docs/phase8/`. **Order flexible** —
-pull ahead if remote usability becomes the priority.
+Design: `docs/future/networking-edge.md`. Scope stub was `docs/phase8/`; that path does
+not exist in this repo (lost at the public-release history squash, commit `590abb4`) —
+this paragraph is the current scope record. **Order flexible** — pull ahead if remote
+usability becomes the priority.
 
 **Phase 9 — Native clients + client SDK.**
 Document the wire protocol; ship a reference native client (custom UDP transport — the lever
 that beats the browser's irreducible jitter-buffer floor) + input capture; open the
-community-contribution surface. Transparent reconnect/resume lands here. Scope stub:
-`docs/phase9/`.
+community-contribution surface. Transparent reconnect/resume lands here. Scope stub was
+`docs/phase9/` (it included native-client architecture/perf/macOS research); that path
+does not exist in this repo (lost at the public-release history squash, commit
+`590abb4`) and is not recoverable — this paragraph is the current scope record.
 
 **Deferred — Kubernetes-native.**
 Was the original Phase 4; **dropped from the active sequence** while the focus is
@@ -157,9 +168,12 @@ split has existed since Phase 1 — it is packaging, not re-architecture, when r
 `docs/future/kubernetes-native.md`.
 
 > **Roadmap note (updated 2026-07-17 — see `docs/README.md` for the live status).**
-> Phases 0–5 are complete (records in `docs/completed/`); active work follows the
-> roadmap-spec-v2 wave ladder (`docs/design/plans/2026-07-06-roadmap-spec-v2.html`),
-> which supersedes the numbered-phase framing. Phases 6–8 remain **scope stubs** —
+> Phases 0–5 are complete (their execution records lived at `docs/completed/`, which
+> did not survive the public-release history squash and is not recoverable from this
+> repo); active work follows the roadmap-spec-v2 wave ladder — a library-provider model
+> + wave ladder, whose source document `docs/design/plans/2026-07-06-roadmap-spec-v2.html`
+> likewise did not survive the squash — which supersedes the numbered-phase framing.
+> Phases 6–8 remain **scope stubs** —
 > each gets thorough exploration + detailed design + tickets **at phase start**, not
 > before. The order of Phases 6–9 is provisional; Phase 8 in particular can be
 > resequenced. Kubernetes is deferred.

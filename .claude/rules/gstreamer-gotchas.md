@@ -42,8 +42,9 @@ regression and was chased twice as one. The node-agent always pins `profile=main
 (`pipeline/caps.rs`), so live sessions are unaffected. Any hand-written probe must pin it too.
 Also: the `qses` headless Linux Chrome peer cannot decode HEVC and REJECTS the video m-line
 (`webrtcbin: Invalid bundle id 1`), which presents as an encode-src ring stall (#503/#504), so
-h265 live validation needs a macOS/Windows Chrome. Report:
-`docs/reports/2026-08-22-vulkanscale-validation/H265-PROFILE-CAPS.md`.
+h265 live validation needs a macOS/Windows Chrome. The report,
+`docs/reports/2026-08-22-vulkanscale-validation/H265-PROFILE-CAPS.md`, did not survive
+the public-release history squash and is not recoverable from this repo.
 
 ## Ad-hoc `docker exec gst-launch` in a compose-run agent container fails EGL (2026-08-28)
 The compose env passes blank-but-SET `MESA_LOADER_DRIVER_OVERRIDE=` (and friends); the agent
