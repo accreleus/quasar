@@ -35,9 +35,6 @@ function release(over: Partial<PlatformRelease> = {}): PlatformRelease {
     source_commit: NEW_COMMIT,
     built_at: "2026-09-04T12:00:00Z",
     schema_version: 75,
-    // Served by the control plane, not derived here (#153): schema 75 against
-    // the fixture's installed 74 means this release carries a migration.
-    migrates: true,
     prerelease: false,
     notes: "",
     compare_url: null,
@@ -190,8 +187,8 @@ describe("FleetApplyButton", () => {
     expect(within(dialog).getByText(/lose contact for about 20 seconds/)).toBeInTheDocument();
   });
 
-  // #153. The fixture release is served with migrates: true (schema 75 against
-  // an installed 74), so the control-plane step still empties the instance.
+  // #153. The fixture release is schema 75 against an installed 74, so it
+  // carries a migration and the control-plane step still empties the instance.
   it("says a migrating release waits for every session on the instance", async () => {
     renderButton(view());
     screen.getByRole("button", { name: "Update Quasar" }).click();
@@ -207,7 +204,7 @@ describe("FleetApplyButton", () => {
   // stopped draining for it). Promising an outage that does not happen is as
   // wrong as hiding one that does.
   it("says a non-migrating release keeps live sessions streaming", async () => {
-    renderButton(view({ available: [release({ schema_version: 74, migrates: false })] }));
+    renderButton(view({ available: [release({ schema_version: 74 })] }));
     screen.getByRole("button", { name: "Update Quasar" }).click();
 
     const dialog = await screen.findByRole("dialog");

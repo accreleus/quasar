@@ -21,7 +21,13 @@ import { Modal } from "../../../components/Modal";
 import { Table, type TableColumn } from "../../../components/Table";
 import { useAdminAction } from "../../../lib/resource/action";
 import { AttemptProgress } from "./ApplyControls";
-import { eligibilityText, hasUpdate, releaseLabel, runStateText } from "./releasesCopy";
+import {
+  eligibilityText,
+  hasUpdate,
+  releaseLabel,
+  releaseRunsAMigration,
+  runStateText,
+} from "./releasesCopy";
 
 function eligibleHosts(targets: PlatformReleaseTarget[]): PlatformReleaseTarget[] {
   return targets.filter((t) => t.kind === "host" && t.eligible);
@@ -96,11 +102,9 @@ function FleetApplyModal({
   const [force, setForce] = useState(false);
   const newest = view.available[0];
   const hosts = eligibleHosts(view.targets).length;
-  // Consent has to name what actually happens, so the SERVER decides this and
-  // serves it (#153): only a migrating release ends the instance's sessions
-  // before the control-plane step, and that policy must not be re-derived here.
-  // No release to apply reads as migrating — the cautious answer.
-  const migrates = newest?.migrates ?? true;
+  // Consent has to name what actually happens: only a migrating release ends
+  // the instance's sessions before the control-plane step.
+  const migrates = releaseRunsAMigration(view, newest);
 
   const apply = useAdminAction(
     async () =>
