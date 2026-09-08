@@ -320,6 +320,9 @@ first, then every eligible host in sequence. At most one is active. A host that
 cannot take the release at its turn is **skipped**, which is not a failure; a
 target that fails stops the run where it stands. _Avoid_: "rollout" (implies
 staging and percentages, of which there are none), "batch" (the run is strictly
-sequential), "deployment". Its control-plane step drains the WHOLE instance
-first: recreating the control plane drops every agent's connection, and an agent
-stops its sessions when that connection drops.
+sequential), "deployment". It cordons the whole instance for its whole life, but
+its control-plane step drains the instance first ONLY when the release carries a
+migration (`ReleaseRunsAMigration`): since #128 a recreate no longer ends a
+`running` session, so a non-migrating step lets live sessions ride through it and
+waits only for in-flight launches to settle (#153). Host steps drain as they
+always did — recreating an agent does end that host's sessions.

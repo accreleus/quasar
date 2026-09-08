@@ -25,6 +25,10 @@ import (
 //     control-plane step does about sessions.
 //   - The control-plane target drains the fleet first only when the release
 //     carries a migration; prepareFleet has the argument.
+//   - Even a non-migrating control-plane step waits for IN-FLIGHT sessions
+//     (non-terminal but not yet `running`) to settle: those are the rows the
+//     reconnecting agent fails, and the old fleet-wide drain used to make the
+//     set empty by accident.
 //
 // A fleet run survives the restart it causes: everything durable is in
 // Postgres, so the control plane that boots on the new image re-adopts the run
@@ -45,6 +49,7 @@ type fleetStore interface {
 	SetCordonedHosts(ctx context.Context, runID string, states []HostCordon) error
 	CordonedHosts(ctx context.Context, runID string) ([]HostCordon, error)
 	FleetNonTerminalSessions(ctx context.Context) (int, error)
+	FleetInFlightSessions(ctx context.Context) (int, error)
 	CreateHostAttempt(ctx context.Context, in NewHostAttempt) (Attempt, error)
 	CreateControlPlaneAttempt(ctx context.Context, in NewControlPlaneAttempt) (Attempt, error)
 	LastSucceededDigests(ctx context.Context, hostID string) ([]ComponentDigest, error)
@@ -59,6 +64,13 @@ type fleetStore interface {
 type FleetCordons struct {
 	Cordon   func(ctx context.Context, hostID string) error
 	Uncordon func(ctx context.Context, hostID string) error
+	// Drain STOPS a host's sessions as well as cordoning it. Only the migrating
+	// control-plane step under `force` uses it: `force` is the operator agreeing
+	// to end N live sessions, and since #128 the recreate no longer ends them as
+	// a side effect, so something has to (#153). Optional — a nil Drain makes
+	// that path behave as if force had not been sent, which is the safe default
+	// for a caller that has not wired it.
+	Drain func(ctx context.Context, hostID string) error
 }
 
 // HostCordon is what the run found for one host before it cordoned, persisted
@@ -68,6 +80,14 @@ type HostCordon struct {
 	// The host was ALREADY out of scheduling, so the run must leave it that way.
 	WasCordoned bool `json:"was_cordoned"`
 }
+
+// DefaultInFlightSettle bounds the non-migrating control-plane step's wait for
+// in-flight launches to finish arriving (#153). Short on purpose: the fleet is
+// already cordoned, so nothing new is being placed and the set converges in
+// seconds. Expiry PROCEEDS rather than failing the attempt — the cost of being
+// wrong is one launch that would have failed anyway, never a `running` session,
+// and stalling a release on a wedged `starting` row would be worse.
+const DefaultInFlightSettle = 45 * time.Second
 
 // DefaultAdoptSettle is how long a re-adopted run waits before its first host.
 // Agents re-register within a couple of seconds of the new control plane
@@ -149,6 +169,8 @@ type FleetRunner struct {
 	Deadline time.Duration
 	// How long a re-adopted run waits for its agents to come back.
 	AdoptSettle time.Duration
+	// How long a non-migrating control-plane step waits for in-flight launches.
+	InFlightSettle time.Duration
 	// SchemaVersion is the highest migration this control plane embeds, which
 	// after boot is also the database's applied version. A field rather than a
 	// buildinfo call at the point of use, so a test can put a release on either
@@ -176,15 +198,16 @@ func NewFleetRunner(store fleetStore, hosts hostDriver, self selfDriver, resolve
 	return &FleetRunner{
 		store: store, hosts: hosts, self: self, resolve: resolve, cordons: cordons,
 		view: view, log: log,
-		PollWait:      DefaultApplyPoll,
-		Deadline:      DefaultApplyDeadline,
-		AdoptSettle:   DefaultAdoptSettle,
-		SchemaVersion: buildinfo.SchemaVersion(),
-		running:       make(map[string]context.CancelFunc),
-		adopted:       make(map[string]bool),
-		skips:         make(map[string][]RunSkip),
-		baseCtx:       ctx,
-		stop:          cancel,
+		PollWait:       DefaultApplyPoll,
+		Deadline:       DefaultApplyDeadline,
+		AdoptSettle:    DefaultAdoptSettle,
+		InFlightSettle: DefaultInFlightSettle,
+		SchemaVersion:  buildinfo.SchemaVersion(),
+		running:        make(map[string]context.CancelFunc),
+		adopted:        make(map[string]bool),
+		skips:          make(map[string][]RunSkip),
+		baseCtx:        ctx,
+		stop:           cancel,
 	}
 }
 
@@ -361,34 +384,60 @@ func (f *FleetRunner) controlPlanePhase(ctx context.Context, run ApplyRun) bool 
 	}
 }
 
-// prepareFleet cordons the whole instance, and waits for it to be empty only
-// when this release carries a migration (#153). False means the attempt
-// resolved underneath (a cancel, a timeout) or the process is shutting down.
+// prepareFleet cordons the whole instance and decides what the control-plane
+// step owes its sessions. False means the attempt resolved underneath (a
+// cancel, a timeout) or the process is shutting down.
 //
-// Since #128 a control-plane recreate no longer ends sessions: the agent holds
-// them and the browser keeps its media path (live-gated 2026-09-08, 1080p60 at
-// 60 fps through a 73 s outage — docs/reports/2026-09-08-128-session-survival-gate/).
-// A migrating release still drains, for a different reason: the held row is
-// read back by a binary that has just migrated the database under it, and every
-// migration was authored assuming no session was live — 0027 moved the
-// signalling token out of `sessions` on exactly that assumption. Nothing checks
-// a migration for it and this code cannot read the SQL, so it must not gamble.
+// Since #128 a control-plane recreate no longer ends a RUNNING session: the
+// agent holds it and the browser keeps its media path (live-gated 2026-09-08,
+// 1080p60 at 60 fps through a 73 s outage —
+// docs/reports/2026-09-08-128-session-survival-gate/). Two things still follow
+// from that, and they are separate:
+//
+//   - A MIGRATING release drains the whole fleet, for a reason that was never
+//     the restart: the held row is read back by a binary that has just migrated
+//     the database under it, and every migration was authored assuming no
+//     session was live — 0027 moved the signalling token out of `sessions` on
+//     exactly that assumption. Nothing checks a migration for it and this code
+//     cannot read the SQL, so it must not gamble. Under `force` the sessions are
+//     STOPPED rather than waited for, because `force` is the operator agreeing
+//     to end them and nothing else ends them any more; the wait to zero still
+//     happens, it is just short.
+//   - Either way the step waits for IN-FLIGHT sessions — non-terminal but not
+//     yet `running` — to settle. Those are precisely the rows the reconnecting
+//     agent fails (session.Store.ReapHostExceptRunning), and the old fleet-wide
+//     drain made the set empty as a side effect. Without this a user who pressed
+//     Play two seconds before the admin pressed Update loses their launch.
 func (f *FleetRunner) prepareFleet(ctx context.Context, run ApplyRun, a Attempt) bool {
 	// Cordon either way: every host in the run is about to be recreated, so a
 	// session that lands mid-run is one the run would end at that host's step.
 	f.cordonFleet(ctx, run.ID)
 
 	if !f.releaseRunsAMigration(ctx, run) {
-		// No SetWaitingSessions: it moves the attempt into `waiting_sessions`,
-		// and nothing here is waiting or being lost. Logged instead, because
-		// the count carried across the restart is this path's evidence.
-		n, err := f.store.FleetNonTerminalSessions(ctx)
+		// No SetWaitingSessions on this path: it would move the attempt into
+		// `waiting_sessions`, and no `running` session is being waited on or
+		// lost. The count is logged instead, because what rode across the
+		// restart is this path's only evidence.
+		held, err := f.store.FleetNonTerminalSessions(ctx)
 		if err != nil {
 			f.log.Warn("fleet apply: could not count sessions", "run_id", run.ID, "err", err)
+			// Never log a count the read did not produce: this line is the
+			// evidence, and "sessions=0" would read as "there were none".
+			f.log.Info("fleet apply: the control-plane step is holding live sessions; this release runs no migration",
+				"run_id", run.ID, "sessions", "unknown", "token", "cp-step-holds-sessions")
+		} else {
+			f.log.Info("fleet apply: the control-plane step is holding live sessions; this release runs no migration",
+				"run_id", run.ID, "sessions", held, "token", "cp-step-holds-sessions")
 		}
-		f.log.Info("fleet apply: the control-plane step is holding live sessions; this release runs no migration",
-			"run_id", run.ID, "sessions", n, "token", "cp-step-holds-sessions")
-		return true
+		return f.settleInFlight(ctx, run, a)
+	}
+
+	if run.Force {
+		// Stop what the operator agreed to end. Pre-#128 the recreate did this
+		// by itself and `force` only skipped the wait; it no longer does, so a
+		// force that merely skipped the wait would run the migration under the
+		// very sessions it claimed to end.
+		f.stopFleetSessions(ctx, run)
 	}
 
 	remaining, err := f.store.FleetNonTerminalSessions(ctx)
@@ -400,9 +449,6 @@ func (f *FleetRunner) prepareFleet(ctx context.Context, run ApplyRun, a Attempt)
 	// forced or not.
 	if err := f.store.SetWaitingSessions(ctx, a.ID, remaining); err != nil {
 		f.log.Warn("fleet apply: could not record sessions_remaining", "attempt_id", a.ID, "err", err)
-	}
-	if run.Force {
-		return true
 	}
 
 	started := a.CreatedAt
@@ -449,6 +495,77 @@ func (f *FleetRunner) releaseRunsAMigration(ctx context.Context, run ApplyRun) b
 		return true
 	}
 	return ReleaseRunsAMigration(release, f.SchemaVersion)
+}
+
+// stopFleetSessions ends every session the run is about to disturb, on the
+// migrating-plus-`force` path only. It drains the hosts the run recorded rather
+// than the live host list: that record is what the run owns, and it is the same
+// set cordonFleet/adoptCordons act on, so a host an admin cordoned for their own
+// reasons is not handed a session_stop by this run.
+//
+// A nil Drain (a caller that has not wired it) leaves the sessions alone; the
+// wait below then behaves exactly as an unforced attempt, which is the safe
+// reading of "we were asked to end them and cannot".
+func (f *FleetRunner) stopFleetSessions(ctx context.Context, run ApplyRun) {
+	if f.cordons.Drain == nil {
+		f.log.Warn("fleet apply: force was requested but no drain is wired; waiting for the fleet to empty instead",
+			"run_id", run.ID)
+		return
+	}
+	states, err := f.store.CordonedHosts(ctx, run.ID)
+	if err != nil {
+		f.log.Error("fleet apply: could not read what this run cordoned, so nothing was force-drained",
+			"run_id", run.ID, "err", err)
+		return
+	}
+	for _, st := range states {
+		if err := f.cordons.Drain(ctx, st.HostID); err != nil {
+			f.log.Warn("fleet apply: could not force-drain a host", "run_id", run.ID, "host_id", st.HostID, "err", err)
+		}
+	}
+	f.log.Info("fleet apply: force-drained the fleet ahead of a migrating control-plane step",
+		"run_id", run.ID, "hosts", len(states), "token", "cp-step-force-drain")
+}
+
+// settleInFlight waits for the non-migrating control-plane step's in-flight
+// sessions to reach zero. It never touches the attempt's state: nothing here is
+// a drain the operator consented to, so `waiting_sessions` and
+// `sessions_remaining` stay out of it, and expiry proceeds with a warning
+// instead of failing the attempt (DefaultInFlightSettle explains why). `force`
+// skips it, consistent with every other wait on this path.
+//
+// Returns false only when the attempt resolved underneath or the process is
+// shutting down — the same contract as prepareFleet's own return.
+func (f *FleetRunner) settleInFlight(ctx context.Context, run ApplyRun, a Attempt) bool {
+	if run.Force {
+		return true
+	}
+	deadline := time.Now().Add(f.InFlightSettle)
+	for {
+		inFlight, err := f.store.FleetInFlightSessions(ctx)
+		if err != nil {
+			f.log.Warn("fleet apply: could not count in-flight sessions", "run_id", run.ID, "err", err)
+			return true // advisory; a failed count must not hold up the release
+		}
+		if inFlight == 0 {
+			return true
+		}
+		if time.Now().After(deadline) {
+			f.log.Warn("fleet apply: in-flight launches did not settle before the control-plane step; they will not survive it",
+				"run_id", run.ID, "in_flight", inFlight, "token", "cp-step-inflight-timeout")
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(f.PollWait):
+		}
+		// A cancel caught the attempt before it was sent, so it is already
+		// resolved and the caller finishes the run.
+		if cur, err := f.store.Attempt(ctx, a.ID); err == nil && TerminalAttemptState(cur.State) {
+			return false
+		}
+	}
 }
 
 // cordonFleet takes every online host out of scheduling for the rest of the run,

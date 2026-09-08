@@ -296,11 +296,11 @@ func (s *Store) CordonedHosts(ctx context.Context, runID string) ([]HostCordon, 
 	return out, nil
 }
 
-// FleetNonTerminalSessions counts what a CONTROL-PLANE apply would end: every
-// session on the instance, not one host's. Recreating the control plane drops
-// every agent's connection, and an agent stops its sessions when that
-// connection drops. Same state predicate as NonTerminalSessions, without the
-// host filter.
+// FleetNonTerminalSessions counts every session on the instance, not one
+// host's — a control-plane recreate is instance-wide. Same state predicate as
+// NonTerminalSessions, without the host filter. This is the count a MIGRATING
+// control-plane step drains to zero and reports as `sessions_remaining`; since
+// #128 a recreate on its own no longer ends any of them (#153).
 func (s *Store) FleetNonTerminalSessions(ctx context.Context) (int, error) {
 	var n int
 	err := s.pool.QueryRow(ctx, `
@@ -308,6 +308,29 @@ func (s *Store) FleetNonTerminalSessions(ctx context.Context) (int, error) {
 	`).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("count fleet sessions: %w", err)
+	}
+	return n, nil
+}
+
+// FleetInFlightSessions counts the sessions a control-plane recreate still
+// ends: everything non-terminal EXCEPT `running`.
+//
+// The predicate is deliberately character-for-character the one in
+// session.Store.ReapHostExceptRunning (#128). A `running` row survives a
+// recreate because the agent holds the session and the heartbeat re-adopts the
+// row; a row that is `pending`, `assigned`, `starting` or `stopping` was mid
+// flight in a goroutine that died with the old connection, so the reconnecting
+// agent's first act is to fail it. The fleet-wide wait used to make that set
+// provably empty at the recreate; a non-migrating step no longer drains, so it
+// waits on THIS count instead (#153) — a user who pressed Play two seconds
+// earlier should not have their launch reaped by an update.
+func (s *Store) FleetInFlightSessions(ctx context.Context) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `
+		SELECT count(*) FROM sessions WHERE state NOT IN ('stopped','failed','running')
+	`).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count fleet in-flight sessions: %w", err)
 	}
 	return n, nil
 }

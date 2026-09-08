@@ -125,10 +125,25 @@ func newFleetHarness(t *testing.T, cpCommit string, drivers interface {
 			_, err := pool.Exec(ctx, `UPDATE hosts SET status='online' WHERE id = $1::uuid`, hostID)
 			return err
 		},
+		// Stands in for coordinator.DrainHost(force=true). The real one dispatches
+		// session_stop and lets the agent report back; here the rows just end,
+		// which is all this package needs to observe.
+		Drain: func(ctx context.Context, hostID string) error {
+			if _, err := pool.Exec(ctx, `UPDATE hosts SET status='draining' WHERE id = $1::uuid`, hostID); err != nil {
+				return err
+			}
+			_, err := pool.Exec(ctx, `
+				UPDATE sessions SET state='stopped', ended_at=now()
+				WHERE host_id = $1::uuid AND state NOT IN ('stopped','failed')`, hostID)
+			return err
+		},
 	}
 	h.fleet = NewFleetRunner(store, drivers, drivers, ManifestOrEdge{}, cordons, view, testLogger())
 	h.fleet.AdoptSettle = time.Millisecond
 	h.fleet.PollWait = 5 * time.Millisecond
+	// Long enough that a test can observe the wait, short enough that a test
+	// which never settles is not a 45 s stall.
+	h.fleet.InFlightSettle = 3 * time.Second
 	t.Cleanup(h.fleet.Close)
 
 	authSvc, err := auth.NewService(pool, auth.DefaultParams(), time.Hour)
@@ -589,5 +604,93 @@ func TestFleetStillDrainsWhenTheReleaseCarriesAMigration(t *testing.T) {
 	})
 	if got := sessionStates(t, h.pool); len(got) != 1 || got[0] != "running" {
 		t.Fatalf("session states = %v, want the drain to WAIT rather than stop anything", got)
+	}
+}
+
+// force on a migrating release must END the sessions, not merely skip the wait:
+// since #128 the recreate no longer ends them, so nothing else would (#153).
+func TestFleetForceEndsSessionsBeforeAMigratingControlPlaneStep(t *testing.T) {
+	drivers := &succeedingDrivers{}
+	h := newFleetHarness(t, commitA, drivers)
+	drivers.store = h.store
+	migrating := seedRelease(t, h.store, commitC, buildinfo.Get().SchemaVersion+1)
+	seedSession(t, h.pool, h.hostID)
+
+	code, raw := h.do(t, http.MethodPost, "/v1/admin/platform/apply", h.admin,
+		FleetApplyRequest{ReleaseID: migrating.ID, Force: true})
+	if code != http.StatusAccepted {
+		t.Fatalf("POST apply = %d %s, want 202", code, raw)
+	}
+	run := decodeRun(t, raw)
+
+	waitFor(t, "the forced run to finish", func() bool {
+		r, err := h.store.Run(context.Background(), run.ID)
+		return err == nil && TerminalRunState(r.State)
+	})
+	final, err := h.store.Run(context.Background(), run.ID)
+	if err != nil || final.State != RunSucceeded {
+		t.Fatalf("run state = %q (%v), want succeeded", final.State, err)
+	}
+	// The session the operator agreed to lose is actually gone BEFORE the
+	// migration ran, which is the property the old fleet-wide drain provided.
+	if got := sessionStates(t, h.pool); len(got) != 1 || got[0] == "running" {
+		t.Fatalf("session states = %v, want the forced drain to have ended it", got)
+	}
+}
+
+// A non-migrating step no longer drains, but an in-flight launch is still
+// reaped by the reconnecting agent — so the step waits for it to settle (#153).
+func TestFleetWaitsForAnInFlightLaunchOnANonMigratingStep(t *testing.T) {
+	drivers := &succeedingDrivers{}
+	// commitA is behind the release, and the harness seeds the release at this
+	// binary's own schema version: the release runs no migration.
+	h := newFleetHarness(t, commitA, drivers)
+	drivers.store = h.store
+	seedSession(t, h.pool, h.hostID)
+	// Put it mid-launch: `starting` is what session.Store.ReapHostExceptRunning
+	// fails on the new binary's first agent reconnect.
+	mustExec(t, h.pool, `UPDATE sessions SET state='starting'`)
+
+	code, raw := h.do(t, http.MethodPost, "/v1/admin/platform/apply", h.admin,
+		FleetApplyRequest{ReleaseID: h.release.ID})
+	if code != http.StatusAccepted {
+		t.Fatalf("POST apply = %d %s, want 202", code, raw)
+	}
+	run := decodeRun(t, raw)
+
+	// The fleet is cordoned, and nothing has been sent while the launch is in
+	// flight — but the attempt is NOT in waiting_sessions: nothing is being lost
+	// and no operator consented to anything.
+	waitFor(t, "the fleet to be cordoned", func() bool {
+		var n int
+		if err := h.pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM hosts WHERE status='draining'`).Scan(&n); err != nil {
+			return false
+		}
+		return n > 0
+	})
+	as, err := h.store.RunAttempts(context.Background(), run.ID)
+	if err != nil || len(as) != 1 || as[0].Target != TargetControlPlane {
+		t.Fatalf("attempts = %+v (%v), want just the control plane's", as, err)
+	}
+	if as[0].State == AttemptWaitingSessions {
+		t.Fatal("a non-migrating step must not enter waiting_sessions: nothing is being lost")
+	}
+	if as[0].SessionsRemaining != nil {
+		t.Fatalf("sessions_remaining = %d, want null", *as[0].SessionsRemaining)
+	}
+
+	// The launch lands. It is `running` now, so it survives the recreate.
+	mustExec(t, h.pool, `UPDATE sessions SET state='running'`)
+	waitFor(t, "the run to finish once the launch settled", func() bool {
+		r, err := h.store.Run(context.Background(), run.ID)
+		return err == nil && TerminalRunState(r.State)
+	})
+	final, err := h.store.Run(context.Background(), run.ID)
+	if err != nil || final.State != RunSucceeded {
+		t.Fatalf("run state = %q (%v), want succeeded", final.State, err)
+	}
+	if got := sessionStates(t, h.pool); len(got) != 1 || got[0] != "running" {
+		t.Fatalf("session states = %v, want the launch to have survived", got)
 	}
 }

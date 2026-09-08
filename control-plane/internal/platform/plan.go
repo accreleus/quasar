@@ -164,6 +164,9 @@ func offerable(rows []Release, channel string, cp buildinfo.Identity) []Release 
 				continue
 			}
 		}
+		// Derived here because this is where the control plane's own schema
+		// version is in hand, and every served release comes through this filter.
+		r.Migrates = ReleaseRunsAMigration(r, cp.SchemaVersion)
 		out = append(out, r)
 	}
 	sort.SliceStable(out, func(i, j int) bool {

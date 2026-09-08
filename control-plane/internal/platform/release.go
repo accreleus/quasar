@@ -32,6 +32,16 @@ type Release struct {
 	Prerelease    bool      `json:"prerelease"`
 	Notes         string    `json:"notes"`
 	CompareURL    *string   `json:"compare_url"`
+	// Migrates is `schema_version` above the control plane's — i.e. applying
+	// this release runs at least one migration here, which is the ONLY case in
+	// which the fleet's control-plane step drains the instance (#153). DERIVED
+	// AND SERVED, never left to a client to re-derive, for the same reason
+	// HostIdentity.IdentityKnown is: the drain policy is the server's, and a
+	// client twin of it would go on telling an operator what they are consenting
+	// to after the policy moved. Set in `offerable`, which is where the control
+	// plane's own schema version is in hand; a Release read straight from the
+	// store and never served leaves it false.
+	Migrates bool `json:"migrates"`
 	// The asset verbatim: raw so a field this build does not read still reaches
 	// a client. nil marshals to `null` — the answer on edge.
 	Manifest     json.RawMessage `json:"manifest"`

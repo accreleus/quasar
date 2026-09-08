@@ -78,11 +78,14 @@ type fakeFleetStore struct {
 	release  Release
 	next     int
 	inFlight map[string]bool
-	// Fleet-wide non-terminal sessions, and the cordon calls the run made.
-	sessions int
-	hosts    []HostIdentity
-	cordon   []string
-	uncordon []string
+	// Fleet-wide non-terminal sessions, the subset of those not yet `running`,
+	// and the cordon/drain calls the run made.
+	sessions   int
+	inFlightN  int
+	hosts      []HostIdentity
+	cordon     []string
+	uncordon   []string
+	forceDrain []string
 	// The run's persisted record of what it found (migration 0076).
 	cordons_ []HostCordon
 	// Release-read fault injection: reads from the releaseErrFrom'th on fail.
@@ -140,10 +143,31 @@ func (f *fakeFleetStore) FleetNonTerminalSessions(context.Context) (int, error) 
 	return f.sessions, nil
 }
 
+func (f *fakeFleetStore) FleetInFlightSessions(context.Context) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.inFlightN, nil
+}
+
 func (f *fakeFleetStore) setSessions(n int) {
 	f.mu.Lock()
 	f.sessions = n
 	f.mu.Unlock()
+}
+
+// setInFlight sets the non-terminal-but-not-yet-`running` count — the rows a
+// reconnecting agent fails (#153).
+func (f *fakeFleetStore) setInFlight(n int) {
+	f.mu.Lock()
+	f.inFlightN = n
+	f.mu.Unlock()
+}
+
+// drained is which hosts the run force-drained, in order.
+func (f *fakeFleetStore) drained() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.forceDrain...)
 }
 
 func (f *fakeFleetStore) FailAttempt(_ context.Context, id, reason, _ string) error {
@@ -175,6 +199,18 @@ func (f *fakeFleetStore) cordons() FleetCordons {
 			defer f.mu.Unlock()
 			f.uncordon = append(f.uncordon, hostID)
 			f.setStatusLocked(hostID, "online")
+			return nil
+		},
+		// Stands in for coordinator.DrainHost(force=true): the sessions on that
+		// host actually end, which is the whole point of the fix — a force that
+		// records the count and ends nothing is what #153 had to correct.
+		Drain: func(_ context.Context, hostID string) error {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			f.forceDrain = append(f.forceDrain, hostID)
+			f.setStatusLocked(hostID, "draining")
+			f.sessions = 0
+			f.inFlightN = 0
 			return nil
 		},
 	}
@@ -429,6 +465,7 @@ func testFleet(t *testing.T, store *fakeFleetStore, d *fakeDrivers, view func(co
 	f.PollWait = time.Millisecond
 	f.Deadline = 2 * time.Second
 	f.AdoptSettle = time.Millisecond
+	f.InFlightSettle = 500 * time.Millisecond
 	// One below the fixture release's schema, so the default fixture is a
 	// MIGRATING release and every case that does not care about #153 keeps
 	// exercising the drain. A case that wants the holding path raises this to
@@ -740,7 +777,11 @@ func TestFleetDrainsWhenTheReleaseCannotBeRead(t *testing.T) {
 	}
 }
 
-func TestFleetForceSkipsTheDrain(t *testing.T) {
+// force on a MIGRATING release ENDS the sessions rather than merely skipping the
+// wait. Pre-#128 the recreate ended them as a side effect and skipping was
+// enough; it no longer does, so a force that only skipped would run the
+// migration under the very sessions it claimed to end (#153).
+func TestFleetForceStopsTheSessionsBeforeAMigratingControlPlaneStep(t *testing.T) {
 	store := newFakeFleetStore(true)
 	store.setSessions(3)
 	d := &fakeDrivers{store: store, outcome: map[string]string{}}
@@ -751,10 +792,107 @@ func TestFleetForceSkipsTheDrain(t *testing.T) {
 	if run.State != RunSucceeded {
 		t.Fatalf("run state = %q, want succeeded with force", run.State)
 	}
+	// Every host the run recorded was force-drained, and the fleet reached zero
+	// BEFORE the control plane was sent its release.
+	if drained := store.drained(); len(drained) != 2 || drained[0] != "h1" || drained[1] != "h2" {
+		t.Fatalf("force-drained hosts = %v, want both recorded hosts", drained)
+	}
+	if n, _ := store.FleetNonTerminalSessions(context.Background()); n != 0 {
+		t.Fatalf("fleet sessions after a forced migrating step = %d, want 0", n)
+	}
 	// force is the operator agreeing to lose them, and the N is still recorded.
 	as, _ := store.RunAttempts(context.Background(), testRunID)
-	if as[0].SessionsRemaining == nil || *as[0].SessionsRemaining != 3 {
-		t.Fatalf("sessions_remaining = %v, want the 3 the operator agreed to lose", as[0].SessionsRemaining)
+	if as[0].SessionsRemaining == nil || *as[0].SessionsRemaining != 0 {
+		t.Fatalf("sessions_remaining = %v, want the post-drain count", as[0].SessionsRemaining)
+	}
+}
+
+// With no Drain wired, force must NOT become "send it anyway": the safe reading
+// of "end them and we cannot" is to wait, exactly as an unforced attempt does.
+func TestFleetForceWithNoDrainWiredStillWaits(t *testing.T) {
+	store := newFakeFleetStore(true)
+	store.setSessions(2)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	cordons := store.cordons()
+	cordons.Drain = nil
+	f := NewFleetRunner(store, d, d, ManifestOrEdge{}, cordons,
+		fleetView("", hostTarget("h1", "gpu-01", "")), testLogger())
+	f.PollWait = time.Millisecond
+	f.Deadline = 300 * time.Millisecond
+	f.AdoptSettle = time.Millisecond
+	f.InFlightSettle = 50 * time.Millisecond
+	f.SchemaVersion = fakeReleaseSchema - 1
+	t.Cleanup(f.Close)
+
+	run := runToEnd(t, f, store)
+
+	if run.State != RunFailed {
+		t.Fatalf("run state = %q, want failed: nothing ended the sessions, so the wait must time out", run.State)
+	}
+	if steps := d.steps(); len(steps) != 0 {
+		t.Fatalf("targets reached = %v, want nothing sent: the migration must not run over live sessions", steps)
+	}
+}
+
+// A non-migrating step no longer drains, but it must still let an in-flight
+// launch land: those rows are what the reconnecting agent fails (#153, MAJOR 2).
+func TestFleetWaitsForInFlightLaunchesOnANonMigratingStep(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.setSessions(2)
+	store.setInFlight(1)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+	f.SchemaVersion = fakeReleaseSchema // not migrating
+
+	f.Start(store.run)
+	// Nothing is sent while a launch is still in flight, even though no
+	// `running` session is at stake.
+	waitFor(t, "the fleet to be cordoned", func() bool {
+		cordoned, _ := store.scheduling()
+		return len(cordoned) == 2
+	})
+	if steps := d.steps(); len(steps) != 0 {
+		t.Fatalf("targets reached = %v, want nothing sent while a launch is in flight", steps)
+	}
+
+	// The launch completes: it is `running` now, so it is no longer in flight and
+	// it survives the recreate.
+	store.setInFlight(0)
+	waitFor(t, "the run to finish", func() bool {
+		r, _ := store.Run(context.Background(), testRunID)
+		return TerminalRunState(r.State)
+	})
+	run, _ := store.Run(context.Background(), testRunID)
+
+	if run.State != RunSucceeded {
+		t.Fatalf("run state = %q, want succeeded", run.State)
+	}
+	// It waited: the attempt never entered waiting_sessions, because nothing
+	// was being lost and no operator consented to anything.
+	as, _ := store.RunAttempts(context.Background(), testRunID)
+	if as[0].SessionsRemaining != nil {
+		t.Fatalf("sessions_remaining = %v, want null on a non-migrating step", as[0].SessionsRemaining)
+	}
+	if n, _ := store.FleetNonTerminalSessions(context.Background()); n != 2 {
+		t.Fatalf("fleet sessions = %d, want the 2 running sessions untouched", n)
+	}
+}
+
+// The settle is bounded: a wedged in-flight row must not hold a release for
+// ever. Expiry proceeds, because the cost of being wrong is a launch that was
+// going to fail anyway.
+func TestFleetProceedsWhenInFlightLaunchesNeverSettle(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.setInFlight(1)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+	f.SchemaVersion = fakeReleaseSchema // not migrating
+	f.InFlightSettle = 20 * time.Millisecond
+
+	run := runToEnd(t, f, store)
+
+	if run.State != RunSucceeded {
+		t.Fatalf("run state = %q, want succeeded past the settle deadline", run.State)
 	}
 }
 

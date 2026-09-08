@@ -33,8 +33,13 @@ own; the two do not move together, and that is deliberate.
   sessions end as that host is updated. A release that **does** carry a migration still
   drains the fleet first — the held session's row is read back by a binary that has just
   migrated the database under it, and no migration was ever written to survive that. The
-  confirmation says which of the two you are about to do, and the fleet is still cordoned
-  for the whole run either way.
+  confirmation says which of the two you are about to do — and it reads a `migrates` flag
+  the server now serves, rather than working it out itself — and the fleet is still cordoned
+  for the whole run either way. "Update now" on a migrating release now **stops** the
+  instance's sessions and waits for them to be gone, instead of skipping a wait that since
+  #128 nothing else would have satisfied. Even a non-migrating step gives a launch already
+  in flight a moment to land, because that is the one session a restart still loses.
+  Contract: `quasar-protocol` amendment 6.
 
 ### Fixed
 

@@ -935,9 +935,9 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	pDeps.UpdaterPresent = selfApplier.UpdaterPresent
 	pDeps.ControlPlaneInstallMode = selfApplier.InstallMode
 	platformHandler := platform.NewHandler(pDeps, log)
-	// The fleet run cordons the WHOLE instance for its control-plane step:
-	// recreating the control plane drops every agent connection, and an agent
-	// stops its sessions when that drops.
+	// The fleet run cordons the WHOLE instance for its whole life: every host in
+	// it is about to be recreated at its own step. Whether the control-plane step
+	// also DRAINS is a per-release decision (#153) that lives in the sequencer.
 	fleetCordons := platform.FleetCordons{
 		Cordon: func(ctx context.Context, hostID string) error {
 			_, err := coordinator.DrainHost(ctx, hostID, false)
@@ -945,6 +945,12 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		},
 		Uncordon: func(ctx context.Context, hostID string) error {
 			_, err := coordinator.UncordonHost(ctx, hostID)
+			return err
+		},
+		// force=true: stop the sessions, do not merely stop new placement. Used
+		// only by a migrating control-plane step under `force` (#153).
+		Drain: func(ctx context.Context, hostID string) error {
+			_, err := coordinator.DrainHost(ctx, hostID, true)
 			return err
 		},
 	}

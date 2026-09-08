@@ -643,3 +643,30 @@ func TestReleaseRunsAMigration(t *testing.T) {
 		})
 	}
 }
+
+// `migrates` is DERIVED AND SERVED on every listed release, so the confirmation
+// an admin consents to cannot drift from the drain policy (#153). A client that
+// re-derived it would keep naming the old policy after this one moved.
+func TestAvailableReleasesCarryWhetherTheyMigrate(t *testing.T) {
+	v := PlanRelease(PlanInputs{
+		Channel: ChannelStable,
+		Releases: []Release{
+			rel("above", "0.4.0", commitC, 79, at(3)),
+			rel("level", "0.3.0", commitB, 78, at(2)),
+		},
+		ControlPlane: cp(commitA, 78),
+	})
+	if len(v.Available) != 2 {
+		t.Fatalf("available = %d releases, want both listed", len(v.Available))
+	}
+	byID := map[string]bool{}
+	for _, r := range v.Available {
+		byID[r.ID] = r.Migrates
+	}
+	if !byID["above"] {
+		t.Error("a release above the control plane's schema must be served migrates: true")
+	}
+	if byID["level"] {
+		t.Error("a release level with the control plane's schema must be served migrates: false")
+	}
+}
