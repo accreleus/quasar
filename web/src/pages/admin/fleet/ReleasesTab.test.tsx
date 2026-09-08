@@ -6,7 +6,7 @@
 // read, and the per-host apply: the button's gating, the force confirmation
 // naming N, live attempt state, a refused apply, and the history.
 
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as adminApi from "../../../api/admin";
@@ -615,5 +615,101 @@ describe("ReleasesTab › manual update paths", () => {
     expect((await screen.findAllByText("gpu-host-01")).length).toBeGreaterThan(0);
     expect(screen.queryByTestId("manual-h1")).not.toBeInTheDocument();
     expect(screen.queryByTestId("manual-control-plane")).not.toBeInTheDocument();
+  });
+});
+
+// ── Notifications card (#123) ────────────────────────────────────────────────
+// No v3 mock covers this card; it reuses the rail's existing primitives, so the
+// tests are about behaviour, not layout.
+
+function webhook(
+  over: Partial<NonNullable<PlatformReleaseView["release_webhook"]>> = {},
+): PlatformReleaseView {
+  return view({
+    release_webhook: {
+      enabled: false,
+      url: "",
+      secret_configured: false,
+      last_delivery: null,
+      ...over,
+    },
+  } as Partial<PlatformReleaseView>);
+}
+
+describe("ReleasesTab notifications", () => {
+  it("renders no card at all on a server that does not serve the surface", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(view());
+    renderTab();
+
+    expect(await screen.findByText("Channel")).toBeInTheDocument();
+    expect(screen.queryByText("Notifications")).not.toBeInTheDocument();
+  });
+
+  it("saves a URL and then offers the test send", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(webhook());
+    mocked.updateSettings.mockResolvedValue({ settings: {} } as never);
+    renderTab();
+
+    const field = await screen.findByLabelText("Webhook URL");
+    // Send test is gated until the field matches what is stored.
+    expect(screen.getByRole("button", { name: "Send test" })).toBeDisabled();
+
+    fireEvent.change(field, { target: { value: "https://hooks.example.com/a" } });
+    screen.getByRole("button", { name: "Save URL" }).click();
+
+    await waitFor(() =>
+      expect(mocked.updateSettings).toHaveBeenCalledWith("tok", {
+        release_webhook_url: "https://hooks.example.com/a",
+      }),
+    );
+  });
+
+  it("reports a refused test send from the 200 body rather than as a failure", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(webhook({ url: "https://hooks.example.com/a" }));
+    mocked.testReleaseWebhook.mockResolvedValue({
+      delivery: { ok: false, status_code: 404, error: "the webhook receiver answered 404 Not Found", duration_ms: 12 },
+    } as never);
+    renderTab();
+
+    (await screen.findByRole("button", { name: "Send test" })).click();
+
+    expect(await screen.findByText(/Not delivered: .*404/)).toBeInTheDocument();
+  });
+
+  it("surfaces the last failed delivery, and never the URL inside it", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(
+      webhook({
+        enabled: true,
+        url: "https://hooks.example.com/services/T/B/SECRET",
+        last_delivery: {
+          release_id: "r1",
+          release_version: "0.2.0",
+          status: "failed",
+          attempts: 2,
+          attempted_at: "2026-09-06T02:00:00Z",
+          status_code: 500,
+          error: "the webhook receiver answered 500 Internal Server Error",
+        },
+      }),
+    );
+    renderTab();
+
+    const alert = await screen.findByText(/Last notification failed/);
+    expect(alert).toHaveTextContent("500");
+    expect(alert).not.toHaveTextContent("SECRET");
+  });
+
+  it("toggles the switch through the settings PATCH", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(
+      webhook({ enabled: false, url: "https://hooks.example.com/a" }),
+    );
+    mocked.updateSettings.mockResolvedValue({ settings: {} } as never);
+    renderTab();
+
+    (await screen.findByRole("button", { name: "Turn notifications on" })).click();
+
+    await waitFor(() =>
+      expect(mocked.updateSettings).toHaveBeenCalledWith("tok", { release_webhook_enabled: true }),
+    );
   });
 });

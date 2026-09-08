@@ -99,6 +99,10 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		// read SELECTS, and "check now" stays the jobs run-now action.
 		ReleaseChannel    *string `json:"release_channel"`
 		ReleaseEdgeBranch *string `json:"release_edge_branch"`
+		// "" clears the URL; every other value must pass
+		// ValidReleaseWebhookURL (#123).
+		ReleaseWebhookEnabled *bool   `json:"release_webhook_enabled"`
+		ReleaseWebhookURL     *string `json:"release_webhook_url"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -154,6 +158,33 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 			"release_edge_branch must be a git ref name: 1-255 characters, no whitespace, no \"..\", no leading \"-\"")
 		return
 	}
+	if req.ReleaseWebhookURL != nil && *req.ReleaseWebhookURL != "" && !ValidReleaseWebhookURL(*req.ReleaseWebhookURL) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,
+			"release_webhook_url must be an absolute https URL with no credentials, at most 2048 characters")
+		return
+	}
+	// Enabling with no URL to send to would be a setting that silently does
+	// nothing, so it is refused. The URL this request LEAVES BEHIND decides:
+	// an explicit "" clears it, so enabling in the same body is still nowhere.
+	if req.ReleaseWebhookEnabled != nil && *req.ReleaseWebhookEnabled {
+		resulting := ""
+		if req.ReleaseWebhookURL != nil {
+			resulting = *req.ReleaseWebhookURL
+		} else {
+			current, err := h.store.Get(r.Context())
+			if err != nil {
+				slog.Error("read instance settings", "err", err)
+				httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not update settings")
+				return
+			}
+			resulting = current.ReleaseWebhookURL
+		}
+		if resulting == "" {
+			httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,
+				"release_webhook_url must be set before release_webhook_enabled can be true")
+			return
+		}
+	}
 	// The allow-list stores the canonical form the socket later compares
 	// against, never the raw text — "what an admin saved" and "what /v1/signal
 	// enforces" cannot diverge. "*" and malformed entries are refused.
@@ -168,6 +199,14 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		ImageUpdatePolicy:                 req.ImageUpdatePolicy,
 		ReleaseChannel:                    req.ReleaseChannel,
 		ReleaseEdgeBranch:                 req.ReleaseEdgeBranch,
+		ReleaseWebhookEnabled:             req.ReleaseWebhookEnabled,
+		ReleaseWebhookURL:                 req.ReleaseWebhookURL,
+	}
+	// Clearing the URL disables the webhook in the same write: "enabled, with
+	// nowhere to send" is a state no admin asked for and nothing can act on.
+	if req.ReleaseWebhookURL != nil && *req.ReleaseWebhookURL == "" && req.ReleaseWebhookEnabled == nil {
+		off := false
+		patch.ReleaseWebhookEnabled = &off
 	}
 	if req.AllowedOrigins != nil {
 		normalized, err := origins.ValidateList(*req.AllowedOrigins)

@@ -85,6 +85,7 @@ type Services struct {
 	// The apply half (#116). Nil in a route-recorder build; Register only takes
 	// method values, so the drift test still sees the routes.
 	platformApply  *platform.ApplyHandler
+	platformNotify *platform.NotifyHandler
 	applyRunner    *platform.Runner
 	fleetRunner    *platform.FleetRunner
 	auditHandler   *audit.Handler
@@ -163,7 +164,7 @@ func unmanagedDescription(desc, file, detail string) string {
 
 func ptrTimeOfDay(t jobs.TimeOfDay) *jobs.TimeOfDay { return &t }
 
-// platformDeps adapts three stores onto the release view's reads. It lives in
+// platformDeps adapts four stores onto the release view's reads. It lives in
 // main for the reason registrationGate does: internal/platform importing
 // settings and jobs (both of which sit above it) would be a cycle.
 //
@@ -171,7 +172,7 @@ func ptrTimeOfDay(t jobs.TimeOfDay) *jobs.TimeOfDay { return &t }
 // one, cleared once a later run succeeded — the two are read independently
 // because "failing since then" is a stale checked_at WITH an error, not one or
 // the other.
-func platformDeps(store *platform.Store, set *settings.Store, jobStore *jobs.Store) *platform.Deps {
+func platformDeps(store *platform.Store, set *settings.Store, jobStore *jobs.Store, sec *secrets.Store) *platform.Deps {
 	return &platform.Deps{
 		Channel:  set.ReleaseChannel,
 		Hosts:    store.Hosts,
@@ -199,6 +200,45 @@ func platformDeps(store *platform.Store, set *settings.Store, jobStore *jobs.Sto
 			}
 			return st, nil
 		},
+		Webhook: func(ctx context.Context) (*platform.WebhookStatus, error) {
+			enabled, rawURL, err := set.ReleaseWebhook(ctx)
+			if err != nil {
+				return nil, err
+			}
+			st := platform.WebhookStatus{Enabled: enabled, URL: rawURL}
+			// The status boolean, never the secret. A secrets read that fails
+			// leaves it false rather than failing the whole Releases page.
+			if status, err := sec.Status(ctx, secrets.NameReleaseWebhookSecret); err == nil {
+				st.SecretConfigured = status.Configured
+			} else if os.Getenv("QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET") != "" {
+				st.SecretConfigured = true
+			}
+			last, err := store.LastDelivery(ctx)
+			if err != nil {
+				return nil, err
+			}
+			st.LastDelivery = last
+			return &st, nil
+		},
+	}
+}
+
+// releaseWebhookConfig resolves where a release notification goes, per pass.
+// The secret is read at the point of use and dropped, never cached on a struct.
+func releaseWebhookConfig(set *settings.Store, sec *secrets.Store) func(context.Context) (platform.WebhookConfig, error) {
+	return func(ctx context.Context) (platform.WebhookConfig, error) {
+		enabled, rawURL, err := set.ReleaseWebhook(ctx)
+		if err != nil {
+			return platform.WebhookConfig{}, err
+		}
+		cfg := platform.WebhookConfig{Enabled: enabled, URL: rawURL}
+		// Signing is optional — Slack, Discord and ntfy authenticate by URL —
+		// so an unreadable secret sends unsigned rather than not at all.
+		if v, err := sec.Resolve(ctx, secrets.NameReleaseWebhookSecret,
+			os.Getenv("QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET")); err == nil {
+			cfg.Secret = v.Secret
+		}
+		return cfg, nil
 	}
 }
 
@@ -931,7 +971,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	updaterClient := platform.NewUpdaterClient(platform.ConfiguredUpdaterSocket())
 	selfApplier := platform.NewSelfApplier(platformStore, updaterClient, log)
 
-	pDeps := platformDeps(platformStore, settingsStore, jobStore)
+	pDeps := platformDeps(platformStore, settingsStore, jobStore, secretStore)
 	pDeps.UpdaterPresent = selfApplier.UpdaterPresent
 	pDeps.ControlPlaneInstallMode = selfApplier.InstallMode
 	platformHandler := platform.NewHandler(pDeps, log)
@@ -948,6 +988,17 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 			return err
 		},
 	}
+	// Outbound release notification (#123). The webhook is resolved per pass and
+	// the detection job calls Notify AFTER a successful pass: a failed delivery
+	// is a summary line, never a failed detection.
+	webhookConfig := releaseWebhookConfig(settingsStore, secretStore)
+	releaseNotifier := platform.NewNotifier(platformStore, platform.NotifyDeps{
+		View:   platformHandler.ReleaseView,
+		Config: webhookConfig,
+	}, log)
+	platformNotify := platform.NewNotifyHandler(
+		platformHandler.ReleaseView, webhookConfig, nil, auditStore, log)
+
 	fleetRunner := platform.NewFleetRunner(platformStore, applyRunner, selfApplier,
 		platform.ManifestOrEdge{Edge: edgeApply}, fleetCordons, platformHandler.ReleaseView, log)
 	platformApply := platform.NewApplyHandler(platformStore, applyRunner, platformHandler.ReleaseView, auditStore, log).
@@ -987,7 +1038,11 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 			if err != nil {
 				return jobs.Outcome{}, err
 			}
-			return jobs.Succeeded(rep.Summary()), nil
+			summary := rep.Summary()
+			for k, v := range releaseNotifier.Notify(ctx).Summary() {
+				summary[k] = v
+			}
+			return jobs.Succeeded(summary), nil
 		},
 	})
 
@@ -1072,6 +1127,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		fleetRunner:      fleetRunner,
 		auditHandler:     auditHandler,
 		artworkHandler:   artworkHandler,
+		platformNotify:   platformNotify,
 		secretsHandler:   secretsHandler,
 		libraryHandler:   libraryHandler,
 		imagesHandler:    imagesHandler,
@@ -1112,6 +1168,7 @@ func (s *Services) RegisterRoutes(mux httpx.Router) {
 	s.consoleHandler.Register(mux, admin)
 	s.platformHandler.Register(mux, admin)
 	s.platformApply.Register(mux, admin)
+	s.platformNotify.Register(mux, admin)
 	s.auditHandler.Register(mux, admin)
 	s.secretsHandler.Register(mux, admin)
 	s.artworkHandler.Register(mux, s.authHandler.RequireAuth, s.authHandler.RequireAdmin)

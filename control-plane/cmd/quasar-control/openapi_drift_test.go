@@ -75,6 +75,9 @@ func nilDepServices(t *testing.T) *Services {
 		// values, and every request path checks ready() and answers 500, so no
 		// route can panic in the recorder.
 		platformApply: platform.NewApplyHandler(nil, nil, nil, nil, log),
+		// Same rule: Register takes a method value, and the request path checks
+		// its deps before touching them.
+		platformNotify: platform.NewNotifyHandler(nil, nil, nil, nil, log),
 		// nil service/store: Register only needs the handler to exist. Every
 		// request path checks for it and answers 503, so no route can 500 here.
 		artworkHandler: artwork.NewHandler(nil, log),

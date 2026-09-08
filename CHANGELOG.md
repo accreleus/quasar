@@ -24,6 +24,28 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+
+- Quasar can now tell you a release is available without you looking at the
+  console (#123, migration 0080). **Fleet ▸ Releases ▸ Notifications** takes a
+  webhook URL and POSTs one message when the detector finds a release this
+  instance could move to; the body carries `text` and `content` alongside the
+  structured fields, so a Slack, Discord or ntfy incoming webhook renders it
+  with no adapter in between. A **Send test** button exercises the URL before
+  you switch it on, and records nothing, so it can never use up the one
+  notification a real release gets. An optional signing secret
+  (**Secrets → Release notification signing secret**, or
+  `QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET`) adds an HMAC-SHA256 signature over
+  a timestamped body for a receiver you wrote yourself; Slack, Discord and ntfy
+  authenticate by URL and need none. The same release is never announced twice,
+  a fresh install announces at most the one release it could take rather than
+  its whole back catalogue, and a refused webhook is a line in the detection
+  job's run summary — it never fails detection or holds back the banner.
+  Delivery is `https` only, follows no redirect and refuses any host resolving
+  to a loopback, private or link-local address, so it cannot become a probe of
+  your own network; a LAN receiver therefore needs a public https endpoint in
+  front of it. `docs/upgrading.md` "Release notifications".
+
 ### Fixed
 
 - Sessions now survive a control-plane restart (#128), confirmed on a live 73 s

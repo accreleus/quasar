@@ -42,6 +42,9 @@ type Deps struct {
 	// ControlPlaneInstallMode is this control plane's own install mode, read
 	// from its updater. Nil, or a nil answer, is unknown.
 	ControlPlaneInstallMode func() *string
+	// Webhook is the release-notification surface (#123). Optional: nil leaves
+	// `release_webhook` null rather than failing the view.
+	Webhook func(ctx context.Context) (*WebhookStatus, error)
 }
 
 // errNoDeps is what a handler built with no dependencies answers with, rather
@@ -145,6 +148,13 @@ func (h *Handler) releaseView(ctx context.Context) (View, error) {
 	if h.deps.ControlPlaneInstallMode != nil {
 		installMode = h.deps.ControlPlaneInstallMode()
 	}
+	var webhook *WebhookStatus
+	if h.deps.Webhook != nil {
+		webhook, err = h.deps.Webhook(ctx)
+		if err != nil {
+			return View{}, err
+		}
+	}
 	return PlanRelease(PlanInputs{
 		Channel:      channel,
 		SourceRepo:   ConfiguredReleaseRepo(),
@@ -159,5 +169,6 @@ func (h *Handler) releaseView(ctx context.Context) (View, error) {
 
 		UpdaterPresent:          h.deps.UpdaterPresent != nil && h.deps.UpdaterPresent(),
 		ControlPlaneInstallMode: installMode,
+		ReleaseWebhook:          webhook,
 	}), nil
 }

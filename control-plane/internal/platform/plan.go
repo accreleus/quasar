@@ -54,6 +54,10 @@ type PlanInputs struct {
 	// stale CheckedAt with an error is the normal "failing since then".
 	CheckedAt *time.Time
 	LastError *string
+
+	// Passed through untouched: the notification surface is config, not a
+	// release decision.
+	ReleaseWebhook *WebhookStatus
 }
 
 // PlanRelease computes the whole view.
@@ -87,7 +91,8 @@ func PlanRelease(in PlanInputs) View {
 		Faults:    faults(in.Releases, channel, in.ControlPlane, hosts),
 		// Always serialized, `null` when nothing is in flight: null is the
 		// answer, not the absence of one.
-		ActiveApply: activeApply(in.ActiveRun, in.OpenAttempts),
+		ActiveApply:    activeApply(in.ActiveRun, in.OpenAttempts),
+		ReleaseWebhook: in.ReleaseWebhook,
 	}
 	return v
 }

@@ -145,6 +145,35 @@ type View struct {
 	// Every open attempt on the instance, plus the active fleet run (#117).
 	// A client joins an attempt to a target by host_id.
 	ActiveApply *ActiveApply `json:"active_apply"`
+	// Outbound notification config + last delivery (#123). Null on a build with
+	// no notification store wired.
+	ReleaseWebhook *WebhookStatus `json:"release_webhook"`
+}
+
+// UpdateAvailable is the newest listed release when it is a step FORWARD from
+// the installed control plane, and false otherwise.
+//
+// `available` alone is not the answer: a current instance still lists the
+// release it is running, so that `up_to_date` can be evaluated against it.
+// Client twin: web/src/pages/admin/fleet/releasesCopy.ts hasUpdate.
+func (v View) UpdateAvailable() (*Release, bool) {
+	if len(v.Available) == 0 {
+		return nil, false
+	}
+	newest := v.Available[0]
+	cp := v.Installed.ControlPlane
+	if edgeOlderThanInstalled(newest, cp) {
+		return nil, false
+	}
+	// An unstamped build has no commit to be "already on it" about, so the
+	// listed release is news.
+	if cp.SourceCommit == nil {
+		return &newest, true
+	}
+	if commitsMatch(*cp.SourceCommit, newest.SourceCommit) {
+		return nil, false
+	}
+	return &newest, true
 }
 
 // An agent reports 7-40 hex (agent-api.md) while a manifest carries the full
