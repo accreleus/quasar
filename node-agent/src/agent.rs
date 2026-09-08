@@ -258,17 +258,9 @@ pub async fn run(cfg: Config) {
         release_mgr.clone(),
     );
     let grace = session_grace();
-    // Armed when a connection ends, aborted on the next successful register. A
-    // timer rather than a check in the error arm below: `connect_and_run` can
-    // block for minutes against a black-holed control plane, so a deadline
-    // evaluated only when it returns would fire far too late.
-    let mut grace_timer: Option<tokio::task::JoinHandle<()>> = None;
 
     let mut backoff = Duration::from_secs(1);
     loop {
-        if let Some(t) = grace_timer.take() {
-            t.abort();
-        }
         match connect_and_run(
             &cfg,
             &health,
@@ -302,14 +294,14 @@ pub async fn run(cfg: Config) {
                             "connection lost with {held} running session(s); grace window is 0, stopping them now"
                         );
                         sessions.mgr.stop_all();
-                    } else if grace_timer.is_none() {
+                    } else if sessions.grace_timer.is_none() {
                         info!(
                             token = "sessions-held-for-grace",
                             "connection lost with {held} running session(s); holding them for {grace:?} \
                              while the control plane comes back"
                         );
                         let flags = sessions.stop_flags();
-                        grace_timer = Some(tokio::spawn(async move {
+                        sessions.grace_timer = Some(tokio::spawn(async move {
                             tokio::time::sleep(grace).await;
                             warn!(
                                 token = "session-grace-expired",
@@ -339,8 +331,21 @@ pub async fn run(cfg: Config) {
                          validity and control-plane reachability"
                     );
                 }
-                sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(30));
+                // A connection that actually registered restarts the ramp, so a
+                // long-lived connection dropping does not inherit a 30 s delay
+                // from some earlier outage.
+                if sessions.registered_this_connection {
+                    sessions.registered_this_connection = false;
+                    backoff = Duration::from_secs(1);
+                }
+                let cap = if sessions.running_count() > 0 {
+                    HELD_SESSION_BACKOFF_CAP
+                } else {
+                    Duration::from_secs(30)
+                };
+                let wait = backoff.min(cap);
+                sleep(wait).await;
+                backoff = (wait * 2).min(Duration::from_secs(30));
             }
         }
     }
@@ -1024,6 +1029,18 @@ async fn connect_and_run(
         }
     };
     health.set_connected(true);
+    // #128: the control plane is back, so the sessions held across the outage are
+    // safe. Disarmed HERE rather than at the top of the reconnect loop: doing it
+    // there ran before each connection ATTEMPT, so every failed retry re-armed a
+    // fresh 90 s and a control plane that never returned never stopped anything.
+    sessions.registered_this_connection = true;
+    if let Some(t) = sessions.grace_timer.take() {
+        t.abort();
+        info!(
+            token = "session-grace-cleared",
+            "control plane returned within the grace window; held sessions continue"
+        );
+    }
     // Clear the failure streak before a stale count can flip /health unhealthy.
     health.record_registered();
 
@@ -1130,6 +1147,8 @@ async fn connect_and_run(
         diagnostic_rx,
         diagnostic_dropped_interval,
         diagnostic_dropped_total,
+        registered_this_connection: _,
+        grace_timer: _,
     } = sessions;
     mgr.begin_connection(gpu_inventory, vram_targets);
     // #175: home refs mounted by live sessions. The GC reaper consults it so it
@@ -1728,6 +1747,16 @@ where
 /// still holding and about to re-report.
 const DEFAULT_SESSION_GRACE_SECS: u64 = 90;
 
+/// Reconnect backoff cap WHILE sessions are being held (#128).
+///
+/// The ordinary cap is 30 s, which ramps cumulative attempt times to
+/// 1, 3, 7, 15, 31, 61, 91 s. A control plane back at ~70 s -- the measured
+/// recreate -- would not be contacted until 91 s, one second after the grace
+/// window stopped every session it was holding. Polling every 5 s while
+/// sessions are at stake closes that gap; the cost is a handful of extra
+/// connect attempts against a control plane that is coming back anyway.
+const HELD_SESSION_BACKOFF_CAP: Duration = Duration::from_secs(5);
+
 /// `QUASAR_SESSION_GRACE_SECS`, or the default. `0` disables the hold entirely,
 /// restoring the pre-#128 behaviour of stopping every session the moment the
 /// connection drops.
@@ -1764,6 +1793,15 @@ struct HostSessions {
     diagnostic_rx: Option<mpsc::Receiver<(String, crate::session::runner::TraceEvent)>>,
     diagnostic_dropped_interval: Arc<AtomicU64>,
     diagnostic_dropped_total: Arc<AtomicU64>,
+    /// True once a connection has registered. The reconnect ramp restarts from
+    /// 1 s after a working connection drops, instead of resuming wherever the
+    /// previous outage left it.
+    registered_this_connection: bool,
+    /// Armed at the FIRST disconnect and aborted only once a connection has
+    /// registered. Deliberately not re-armed per reconnect attempt: doing that
+    /// reset the window on every retry, so a control plane that never came back
+    /// meant the sessions were held forever.
+    grace_timer: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl HostSessions {
@@ -1799,6 +1837,8 @@ impl HostSessions {
             diagnostic_rx: Some(diagnostic_rx),
             diagnostic_dropped_interval,
             diagnostic_dropped_total,
+            registered_this_connection: false,
+            grace_timer: None,
         }
     }
 

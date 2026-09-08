@@ -831,35 +831,6 @@ type Host struct {
 	LastHeartbeat  *time.Time
 }
 
-// ConsoleSessionOnHost finds a non-terminal session on hostID owned by userID
-// running appID -- the console session a PREVIOUS control-plane process
-// auto-started (#128).
-//
-// The console auto-start tracker is in-memory, so a control-plane restart
-// forgets which session it started, while the session itself now survives the
-// restart. Without this the next capacity report tries to launch a second
-// console session, is refused because the first still holds the home, and the
-// console stays dark until a display hotplug.
-func (s *Store) ConsoleSessionOnHost(ctx context.Context, hostID, userID, appID string) (string, error) {
-	if !isValidUUID(hostID) || !isValidUUID(userID) || !isValidUUID(appID) {
-		return "", nil
-	}
-	var id string
-	err := s.pool.QueryRow(ctx, `
-		SELECT id::text FROM sessions
-		WHERE host_id = $1::uuid AND user_id = $2::uuid AND app_id = $3::uuid
-		  AND state NOT IN ('stopped','failed')
-		ORDER BY created_at DESC
-		LIMIT 1`, hostID, userID, appID).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", nil
-	}
-	if err != nil {
-		return "", fmt.Errorf("find console session on host: %w", err)
-	}
-	return id, nil
-}
-
 // HostsWithActiveSessions lists every host that still owns a non-terminal
 // session, with the heartbeat stamp the stale-host sweep measures from (#128).
 //

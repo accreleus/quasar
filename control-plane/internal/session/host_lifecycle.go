@@ -100,6 +100,17 @@ type AgentConnectivity interface {
 	IsConnected(hostID string) bool
 }
 
+// AgentConnected reports whether hostID's agent is currently connected. Unwired
+// connectivity answers true: callers use this to REFUSE work while a host is
+// away, and refusing everything because the check is missing would be worse than
+// the behaviour it guards.
+func (c *Coordinator) AgentConnected(hostID string) bool {
+	if c.agents == nil {
+		return true
+	}
+	return c.agents.IsConnected(hostID)
+}
+
 // WithAgentConnectivity wires the live-connection check UncordonHost needs.
 // Unwired (nil) trusts the status column instead.
 func WithAgentConnectivity(a AgentConnectivity) CoordinatorOption {

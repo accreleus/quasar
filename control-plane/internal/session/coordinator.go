@@ -225,17 +225,6 @@ func (c *Coordinator) failSession(sessionID, reason string) {
 	c.failSessionWithDetail(sessionID, reason, nil)
 }
 
-// AdoptConsoleSession implements agentws.Events. See ConsoleSessionOnHost for
-// why a restart needs this (#128).
-func (c *Coordinator) AdoptConsoleSession(ctx context.Context, hostID, userID, appID string) string {
-	id, err := c.store.ConsoleSessionOnHost(ctx, hostID, userID, appID)
-	if err != nil {
-		c.log.Warn("console adopt: lookup failed", "host_id", hostID, "err", err)
-		return ""
-	}
-	return id
-}
-
 // AgentHeartbeat reconciles this host against the agent's own list of running
 // sessions (#128; agent-api.md §"Reconnection & reconciliation"). It is the
 // other half of the grace window: the agent may keep sessions alive across a

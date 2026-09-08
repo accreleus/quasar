@@ -827,7 +827,18 @@ func (h *Handler) ConsoleSessionTerminated(ctx context.Context, hostID, sessionI
 	h.consoleAuto.mu.Lock()
 	recordedID, tracked := h.consoleAuto.sessions[hostID]
 	if !tracked || recordedID != sessionID {
+		untrackedConnectors := h.consoleAuto.lastConnectors[hostID]
 		h.consoleAuto.mu.Unlock()
+		// #128: a console session can now outlive the control-plane process that
+		// started it, so after a restart this tracker is empty while the session
+		// is still live. When that session eventually ends, nothing here
+		// recognises it, and before this the console stayed dark until a display
+		// hotplug. Re-evaluate instead of returning: reevalConsole is
+		// level-triggered, so it relaunches only if the display is still present
+		// and nothing is running, and its own backoff paces the retries.
+		if len(untrackedConnectors) > 0 {
+			h.reevalConsole(ctx, hostID, untrackedConnectors, false)
+		}
 		return
 	}
 	delete(h.consoleAuto.sessions, hostID)
@@ -965,23 +976,6 @@ func (h *Handler) reevalConsole(ctx context.Context, hostID string, connectors [
 	// A pinned connector missing from the report is simply not-present — never a
 	// silent fallback to a different monitor.
 	nowPresent := connectorPresent(connectors, cfg.PinnedConnector())
-
-	// #128: a console session now SURVIVES a control-plane restart, but this
-	// tracker is in-memory and does not. Without adopting the survivor, the
-	// launch below is refused because that session still holds the home, nothing
-	// ends up tracked, and the terminal hook then ignores it -- leaving the
-	// console dark until a display hotplug. Only on the capacity path, which is
-	// the reconnect edge.
-	if !alreadyLaunched && isCapacityPath {
-		if sid := h.events.AdoptConsoleSession(ctx, hostID, *cfg.DefaultUser, *cfg.DefaultApp); sid != "" {
-			h.consoleAuto.mu.Lock()
-			h.consoleAuto.sessions[hostID] = sid
-			h.consoleAuto.mu.Unlock()
-			alreadyLaunched = true
-			h.log.Info("console auto-start: adopted the session that survived the control-plane restart",
-				"host_id", hostID, "session_id", sid)
-		}
-	}
 
 	switch {
 	case nowPresent && !alreadyLaunched:
