@@ -107,6 +107,37 @@ never torn down. Note it resumes at 12:21:06, five seconds *before* the agent fi
 re-registering — the media path was never involved in the control plane's recovery at
 all, which is the entire point of the change.
 
+### Harness verdict, and one caveat that must not be glossed
+
+```
+DECODE OK fps=60 res=1920x1080
+LUMA mean=2.8 sd=0.00 (steady state; first content never)
+QSES_EXIT=0
+```
+
+`DECODE OK` is the decode gate and it passed. **`LUMA mean=2.8` is near-black, and
+"first content never" means the harness never saw the app present visible content — for
+the whole run, including well before the control plane was touched.**
+
+That is a real observation and it is recorded rather than buried. What it does and does
+not affect:
+
+- It does **not** undermine this gate. The claim under test is that the peer connection
+  survives a control-plane restart instead of being destroyed by the client's own
+  recovery. That is evidenced by decode continuing at 60 fps with no zero samples, by
+  the absence of any teardown, and by the session staying `running`. A black frame is
+  still a decoded frame arriving over the same transport, and the black predates the
+  outage, so nothing about it is caused by or attributable to the restart.
+- It **does** mean this run is not evidence about picture quality or app rendering, and
+  it should not be cited as such.
+
+The likely cause is the host: this is the **aux-infra** role, which CLAUDE.md
+explicitly designates infrastructure rather than a testing host ("do not run validation
+on it"), and stream quality is meant to be judged on **gpu-test**. gpu-test was
+unreachable for the duration of this work, which is why the gate ran here. Worth a
+re-run on gpu-test when it returns, both to confirm content renders and to repeat this
+gate on the NVIDIA/Vulkan path rather than integrated AMD.
+
 ## What this does and does not prove
 
 Proven: the agent holds a session across a control-plane outage and reconnects inside
@@ -114,7 +145,8 @@ its grace window; the control plane does not reap it; the browser re-attaches
 signalling **without** destroying the peer connection; and the session is still
 `running` afterwards. Those were the three actors #128 named, and all three now behave.
 
-Not proven by this run: the reconnect ordering where the browser's mint succeeds
+Not proven by this run: that the app was rendering visible content (see the luma
+caveat above); the reconnect ordering where the browser's mint succeeds
 *before* the agent has re-registered (the control plane answers 503 and the client
 retries; covered by unit tests, not exercised live here), and the recovery of a media
 path that fails *during* an outage. The second is worth a follow-up run with the

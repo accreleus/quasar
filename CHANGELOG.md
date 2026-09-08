@@ -27,8 +27,8 @@ own; the two do not move together, and that is deliberate.
 ### Fixed
 
 - Sessions now survive a control-plane restart (#128), confirmed on a live 73 s
-  outage with a real browser peer: the stream kept decoding at 60 fps throughout and
-  the session stayed `running` (`docs/reports/2026-09-08-128-session-survival-gate/`). The browser treated any
+  outage with a real browser peer: decode continued at 60 fps with no dropped samples
+  and the session stayed `running` (`docs/reports/2026-09-08-128-session-survival-gate/`). The browser treated any
   signalling-socket close as a session failure and answered it by minting new
   coordinates and rebuilding its transport — which destroyed the peer connection
   that was still carrying the stream, so a session that had survived the outage
