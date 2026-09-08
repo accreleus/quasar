@@ -86,6 +86,9 @@ type fakeFleetStore struct {
 	cordon     []string
 	uncordon   []string
 	forceDrain []string
+	// Every sessions_remaining the run recorded, in order: the final value is a
+	// single column, so only the sequence shows what was waited on.
+	remainingLog []int
 	// The run's persisted record of what it found (migration 0076).
 	cordons_ []HostCordon
 	// Release-read fault injection: reads from the releaseErrFrom'th on fail.
@@ -161,6 +164,13 @@ func (f *fakeFleetStore) setInFlight(n int) {
 	f.mu.Lock()
 	f.inFlightN = n
 	f.mu.Unlock()
+}
+
+// recordedRemaining is every sessions_remaining the run wrote, in order.
+func (f *fakeFleetStore) recordedRemaining() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.remainingLog...)
 }
 
 // drained is which hosts the run force-drained, in order.
@@ -354,6 +364,7 @@ func (f *fakeFleetStore) NonTerminalSessions(context.Context, string) (int, erro
 func (f *fakeFleetStore) SetWaitingSessions(_ context.Context, id string, n int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.remainingLog = append(f.remainingLog, n)
 	for _, a := range f.attempts {
 		if a.ID != id || TerminalAttemptState(a.State) {
 			continue
@@ -800,10 +811,15 @@ func TestFleetForceStopsTheSessionsBeforeAMigratingControlPlaneStep(t *testing.T
 	if n, _ := store.FleetNonTerminalSessions(context.Background()); n != 0 {
 		t.Fatalf("fleet sessions after a forced migrating step = %d, want 0", n)
 	}
-	// force is the operator agreeing to lose them, and the N is still recorded.
+	// force is the operator agreeing to lose them, and the N is recorded BEFORE
+	// anything ends it — a watcher that only ever saw the post-drain zero would
+	// never learn what the run cost.
 	as, _ := store.RunAttempts(context.Background(), testRunID)
-	if as[0].SessionsRemaining == nil || *as[0].SessionsRemaining != 0 {
-		t.Fatalf("sessions_remaining = %v, want the post-drain count", as[0].SessionsRemaining)
+	if as[0].SessionsRemaining == nil {
+		t.Fatal("sessions_remaining must be recorded on a forced migrating attempt")
+	}
+	if got := store.recordedRemaining(); len(got) == 0 || got[0] != 3 {
+		t.Fatalf("recorded sessions_remaining = %v, want the 3 that were live first", got)
 	}
 }
 

@@ -432,23 +432,29 @@ func (f *FleetRunner) prepareFleet(ctx context.Context, run ApplyRun, a Attempt)
 		return f.settleInFlight(ctx, run, a)
 	}
 
-	if run.Force {
-		// Stop what the operator agreed to end. Pre-#128 the recreate did this
-		// by itself and `force` only skipped the wait; it no longer does, so a
-		// force that merely skipped the wait would run the migration under the
-		// very sessions it claimed to end.
-		f.stopFleetSessions(ctx, run)
-	}
-
 	remaining, err := f.store.FleetNonTerminalSessions(ctx)
 	if err != nil {
 		f.log.Error("fleet apply: could not count sessions", "run_id", run.ID, "err", err)
 		return true // the count is advisory; refusing to update over it would be worse
 	}
-	// The N the operator agreed to lose is recorded before the apply is sent,
-	// forced or not.
+	// The N the operator agreed to lose is recorded BEFORE anything ends it,
+	// forced or not — on the forced path the count is about to be zero, and a
+	// watcher seeing only that would never learn what the run cost.
 	if err := f.store.SetWaitingSessions(ctx, a.ID, remaining); err != nil {
 		f.log.Warn("fleet apply: could not record sessions_remaining", "attempt_id", a.ID, "err", err)
+	}
+
+	if run.Force {
+		// Stop what the operator agreed to end. Pre-#128 the recreate did this
+		// by itself and `force` only had to skip the wait; it no longer does, so
+		// a force that merely skipped would run the migration under the very
+		// sessions it claimed to end. The wait below still runs — it is just
+		// short now, because something is actually ending them.
+		f.stopFleetSessions(ctx, run)
+		if remaining, err = f.store.FleetNonTerminalSessions(ctx); err != nil {
+			f.log.Warn("fleet apply: could not re-count sessions after the force drain",
+				"run_id", run.ID, "err", err)
+		}
 	}
 
 	started := a.CreatedAt
