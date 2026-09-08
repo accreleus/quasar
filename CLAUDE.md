@@ -35,15 +35,15 @@ The public repo starts at commit `590abb4`. Two kinds of reference in older pros
 therefore point somewhere other than where they look.
 
 **Docs.** `docs/completed/`, `docs/design/`, `docs/tech-debt/`, `docs/research/` and
-`docs/phase6-9/`, plus the dated report directories from before the move, were
-**deliberately** kept out of the public repository. They still exist in the project's
-private pre-move repo. They are not lost and they are not to be restored here — where
-this file or another doc names one, the surrounding prose carries the facts that
-mattered, and that prose is the record. Do not spend time hunting for the file.
+`docs/phase6-9/`, plus the dated report directories from before the move, are
+**deliberately** not part of this repository — they were early development plans and
+working records, and were not carried over. Where this file or another doc names one,
+the surrounding prose carries the facts that mattered, and that prose is the record.
+Don't go looking for the file, and don't reconstruct it.
 
 **Issue numbers.** A `#NNN` above ~150 in this file, or in any doc or issue body
-carried over from before the move, is a number on the private pre-move tracker, not on
-`accreleus/quasar`. Most simply fail to resolve; the dangerous ones resolve to
+carried over from before the move, is a pre-move number and does not refer to an issue
+on this repo. Most simply fail to resolve; the dangerous ones resolve to
 something unrelated — `#39` was the swap-disposition feature and on this repo is a
 merged dependabot PR. Treat a high number in old prose as a historical marker rather
 than a link, and check before citing one. The live backlog entries below have been
@@ -76,7 +76,7 @@ renumbered to their public issues.
 - Rust: 2021 edition, `cargo fmt` + `cargo clippy -- -D warnings` clean before done.
 - Go: `gofmt` + `go vet` clean; module path is `github.com/accreleus/quasar/control-plane`.
 - Commits: conventional-commits style (`feat:`, `fix:`, `docs:`, `chore:`).
-- No secrets in the repo. This is a private repo, but still: no keys, tokens, or `.env` committed.
+- No secrets in the repo. **`accreleus/quasar` is PUBLIC** — no keys, tokens or `.env` committed, and no real hostname, ssh alias, IP, or absolute path containing the operator's username in code, docs, commit messages, or the issue tracker. Speak in roles (`gpu-test`/`aux-infra`/`deploy-only`). `scripts/dev/leak-scan.sh` enforces it; `--issues` scans the tracker.
 
 ## Git branching & environments (operator policy — 2026-07-07)
 - **`main` = production.** Any merge INTO `main` requires **explicit human sign-off from the operator**. Never merge to `main` autonomously — not even a green feature branch.
