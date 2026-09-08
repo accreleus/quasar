@@ -11,16 +11,19 @@
 #     127.0.0.1:9091 — two lose the bind, and every probe is answered by
 #     whichever won, so `docker compose ps` reports one agent's state for all
 #     three. The agent now refuses to start rather than report someone else's
-#     health, so these MUST be distinct or the extra agents will not come up.)
+#     health, so these MUST be distinct or the extra agents will not come up.
+#     9591/9592 rather than 9092/9093: the 909x range is crowded — Prometheus
+#     is 9090, its Pushgateway 9091, Kafka 9092, Alertmanager 9093 — and these
+#     bind on a host-networked namespace.)
 #
 # Usage:
 #   docker compose -f deploy/docker-compose.yml \
 #                  -f deploy/overlays/docker-compose.multiagent.yml up -d
 #
-# Or via qstack:
-#   qstack multiup         # bring up base stack + both extra agents
-#   qstack multidown       # tear down everything
-#   qstack multiagent      # recompile node-agent + restart all three agents
+# Or via the host wrapper (the verbs moved from qstack to qhost):
+#   qhost multiup          # bring up base stack + both extra agents
+#   qhost multidown        # tear down everything
+#   qhost multiagent       # recompile node-agent + restart all three agents
 #
 # Encoder: software (openh264) so both agents can run without GPU contention.
 # Flip QUASAR_ENCODER and QUASAR_RENDER_NODE in deploy/.env if the host has
@@ -39,7 +42,7 @@ services:
       NODE_SECRET_PATH: /var/lib/quasar-agent-1/node-secret
       XDG_RUNTIME_DIR: /run/quasar-agent-1
       GST_REGISTRY: /var/lib/quasar-agent-1/.cache/gstreamer-1.0/registry.bin
-      QUASAR_HEALTH_ADDR: 127.0.0.1:9092
+      QUASAR_HEALTH_ADDR: 127.0.0.1:9591
     volumes:
       - /run/quasar-agent-1:/run/quasar-agent-1
       - quasar-agent-1-data:/var/lib/quasar-agent-1
@@ -56,7 +59,7 @@ services:
       NODE_SECRET_PATH: /var/lib/quasar-agent-2/node-secret
       XDG_RUNTIME_DIR: /run/quasar-agent-2
       GST_REGISTRY: /var/lib/quasar-agent-2/.cache/gstreamer-1.0/registry.bin
-      QUASAR_HEALTH_ADDR: 127.0.0.1:9093
+      QUASAR_HEALTH_ADDR: 127.0.0.1:9592
     volumes:
       - /run/quasar-agent-2:/run/quasar-agent-2
       - quasar-agent-2-data:/var/lib/quasar-agent-2

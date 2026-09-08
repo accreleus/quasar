@@ -117,8 +117,16 @@ impl HealthState {
 /// and on a real host that cost hours: a healthy agent was read as unhealthy
 /// because a decommissioned one held the port and answered for it.
 fn identity_fields() -> String {
-    let node = std::env::var("NODE_NAME").unwrap_or_else(|_| "unknown".to_string());
-    let node_json = serde_json::to_string(&node).unwrap_or_else(|_| "\"unknown\"".to_string());
+    identity_fields_for(crate::logging::host_name())
+}
+
+/// Split from [`identity_fields`] so a test can feed a hostile name without
+/// touching process-global env. `NODE_NAME` is NOT read directly here: the agent
+/// registers under `logging::host_name()`, which falls back to the detected
+/// hostname when `NODE_NAME` is unset, and an attribution field that disagrees
+/// with the name the control plane knows would defeat the purpose.
+fn identity_fields_for(node: &str) -> String {
+    let node_json = serde_json::to_string(node).unwrap_or_else(|_| "\"unknown\"".to_string());
     format!(",\"node\":{node_json},\"pid\":{}", std::process::id())
 }
 
@@ -140,44 +148,30 @@ pub fn addr_from_env() -> Option<String> {
     }
 }
 
-/// Spawn the health listener on a blocking thread if enabled by env. No-op
-/// (returns immediately, nothing spawned) when disabled.
-pub fn spawn_if_enabled(state: Arc<HealthState>) {
+/// Bind the configured health address, or report why not.
+///
+/// #152 — the bind is done HERE, synchronously and before anything is spawned,
+/// so the caller can decide what a failure means. Deciding inside the listener
+/// thread meant the process raced on: the agent would go on to connect and
+/// register while its health endpoint was answered by whatever else held the
+/// port. `Ok(None)` means the endpoint is deliberately disabled.
+pub fn bind_if_enabled() -> Result<Option<TcpListener>, (String, std::io::Error)> {
     let Some(addr) = addr_from_env() else {
         info!("health endpoint disabled (QUASAR_HEALTH_ADDR empty/0)");
-        return;
+        return Ok(None);
     };
-    std::thread::spawn(move || serve(&addr, state));
+    match TcpListener::bind(&addr) {
+        Ok(l) => {
+            info!("health endpoint listening on {addr}");
+            Ok(Some(l))
+        }
+        Err(e) => Err((addr, e)),
+    }
 }
 
-/// Blocking accept loop; one thread per connection (health checks are rare and
-/// tiny, so simplicity wins over pooling).
-fn serve(addr: &str, state: Arc<HealthState>) {
-    let listener = match TcpListener::bind(addr) {
-        Ok(l) => l,
-        Err(e) => {
-            // #152 — FATAL, not a warning. Carrying on leaves the container's
-            // HEALTHCHECK probing this address and being answered by whatever
-            // else holds it: on a real host that reported a perfectly healthy
-            // agent as unhealthy, with another process's failure reason, for
-            // sixteen hours. A container that will not start is a far better
-            // signal than one that reports someone else's state as its own.
-            //
-            // The escape hatch is deliberate and already documented: set
-            // QUASAR_HEALTH_ADDR to an empty string or "0" to run without a
-            // health endpoint, or give this agent an address of its own.
-            tracing::error!(
-                token = "health-bind-failed",
-                "health: failed to bind {addr}: {e} — refusing to start, because a \
-                 health endpoint that another process answers is worse than none. \
-                 Give this agent its own QUASAR_HEALTH_ADDR, or set it empty to \
-                 disable the endpoint."
-            );
-            std::process::exit(1);
-        }
-    };
-    info!("health endpoint listening on {addr}");
-    serve_listener(listener, state);
+/// Serve an already-bound listener on a blocking thread.
+pub fn spawn(listener: TcpListener, state: Arc<HealthState>) {
+    std::thread::spawn(move || serve_listener(listener, state));
 }
 
 /// The accept loop proper, split out from `serve` so the tests drive the real
@@ -308,6 +302,26 @@ mod tests {
             body.contains(&format!("\"pid\":{}", std::process::id())),
             "{body}"
         );
+    }
+
+    /// #152 — the decision the boot path acts on, now that it is separable from
+    /// the exit. This is the case that took a real host down for sixteen hours.
+    #[test]
+    fn binding_an_address_another_process_holds_is_an_error() {
+        let held = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = held.local_addr().expect("local_addr").to_string();
+
+        let err = TcpListener::bind(&addr).expect_err("second bind must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+    }
+
+    /// A node name is operator-supplied, so it must not be able to break the
+    /// hand-rolled JSON.
+    #[test]
+    fn a_hostile_node_name_cannot_break_the_json() {
+        let body = format!("{{\"status\":\"ok\"{}}}", identity_fields_for("a\"b\\c\nd"));
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(v["node"], "a\"b\\c\nd");
     }
 
     /// Ephemeral port, so tests are deterministic and parallel-safe. Runs the

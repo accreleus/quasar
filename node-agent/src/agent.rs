@@ -177,7 +177,27 @@ pub async fn run(cfg: Config) {
     crate::session::homes_gc::spawn_sweeper();
 
     let health = HealthState::new();
-    crate::health::spawn_if_enabled(health.clone());
+    // #152 — a health endpoint another process answers is worse than none. The
+    // stack uses host networking, so agents on one machine share this port; the
+    // loser of the bind used to carry on while its container HEALTHCHECK, and
+    // any operator probing by hand, read the winner's status. Bind before
+    // anything else starts, and treat failure like the other boot-fatal
+    // conditions above — same throttled exit, so a restart loop is bounded.
+    match crate::health::bind_if_enabled() {
+        Ok(Some(listener)) => crate::health::spawn(listener, health.clone()),
+        Ok(None) => {}
+        Err((addr, e)) => {
+            error!(
+                token = "health-bind-failed",
+                "health: failed to bind {addr}: {e} — refusing to start, because a \
+                 health endpoint answered by another process is worse than none. Set \
+                 QUASAR_HEALTH_ADDR to an address of this agent's own, or to an empty \
+                 value to run without the endpoint."
+            );
+            sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
+            std::process::exit(1);
+        }
+    }
 
     // Adopt an already-provisioned NVIDIA driver volume BEFORE anything can touch
     // EGL: the post-restart path (the provisioner exits so a fresh process lands

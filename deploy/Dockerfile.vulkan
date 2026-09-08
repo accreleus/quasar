@@ -1117,6 +1117,9 @@ LABEL org.quasar.image.role="runtime" \
 RUN printf '%s\n' \
     '#!/bin/sh' \
     'addr="${QUASAR_HEALTH_ADDR-127.0.0.1:9091}"' \
+    '# Trim, to agree with the agent: addr_from_env() trims before deciding, so' \
+    '# a whitespace-only value disables the endpoint there and must here too.' \
+    'addr="$(printf %s "$addr" | tr -d "[:space:]")"' \
     'if [ -z "$addr" ] || [ "$addr" = "0" ]; then exit 0; fi' \
     'exec curl -fsS "http://$addr/health" -o /dev/null' \
     > /usr/local/bin/quasar-node-agent-healthcheck \

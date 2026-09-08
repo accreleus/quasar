@@ -142,7 +142,8 @@
 
       "image_config": {
         "entrypoint_or_cmd_contains": "quasar-node-agent",
-        "healthcheck_required": true
+        "healthcheck_required": true,
+        "healthcheck_probe": true
       },
 
       "labels": {

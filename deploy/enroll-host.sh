@@ -167,6 +167,12 @@ services:
       XDG_RUNTIME_DIR: /run/quasar-agent
       QUASAR_ENCODER: ${QUASAR_ENCODER:-}
       QUASAR_RENDER_NODE: ${QUASAR_RENDER_NODE:-}
+      # #152: the health listener's bind address. Passed through so an operator
+      # can move it — the agent REFUSES TO START if it cannot bind, rather than
+      # let another process answer its health checks, and 9091 is a busy port
+      # (Prometheus Pushgateway's default). Empty disables the endpoint. The
+      # `-` (not `:-`) is deliberate: an explicitly empty value must stay empty.
+      QUASAR_HEALTH_ADDR: ${QUASAR_HEALTH_ADDR-127.0.0.1:9091}
       QUASAR_HOME_ROOT: ${QUASAR_HOME_ROOT:-}
       QUASAR_HOMES_GC: ${QUASAR_HOMES_GC:-}
       QUASAR_HOMES_GC_RETENTION_HOURS: ${QUASAR_HOMES_GC_RETENTION_HOURS:-}
@@ -286,6 +292,12 @@ services:
       QUASAR_GPU_NVIDIA: "1"
       QUASAR_CUDA_DEVICE: ${QUASAR_CUDA_DEVICE:-0}
       QUASAR_RENDER_NODE: ${QUASAR_RENDER_NODE:-/dev/dri/renderD128}
+      # #152: the health listener's bind address. Passed through so an operator
+      # can move it — the agent REFUSES TO START if it cannot bind, rather than
+      # let another process answer its health checks, and 9091 is a busy port
+      # (Prometheus Pushgateway's default). Empty disables the endpoint. The
+      # `-` (not `:-`) is deliberate: an explicitly empty value must stay empty.
+      QUASAR_HEALTH_ADDR: ${QUASAR_HEALTH_ADDR-127.0.0.1:9091}
       QUASAR_NVIDIA_DRIVER_VOLUME: ${QUASAR_NVIDIA_DRIVER_VOLUME:-1}
       QUASAR_CUDA_RUNTIME: ${QUASAR_CUDA_RUNTIME:-1}
       LD_LIBRARY_PATH: /opt/quasar/nvidia-driver/lib64:/opt/quasar/nvidia-driver/cuda/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
@@ -686,7 +698,7 @@ fi
 # The .env is the ONLY place the enrollment string lands, and it is written by
 # this shell (printf is a builtin: nothing below puts the token in an argv).
 # Re-runs keep every operator-added line and replace only the managed keys.
-managed='^(QUASAR_ENROLLMENT|NODE_NAME|QUASAR_AGENT_IMAGE|QUASAR_UPDATER_IMAGE|QUASAR_STACK_DIR|QUASAR_HOME_ROOT|QUASAR_RENDER_NODE|COMPOSE_FILE|COMPOSE_PROJECT_NAME)='
+managed='^(QUASAR_ENROLLMENT|NODE_NAME|QUASAR_AGENT_IMAGE|QUASAR_UPDATER_IMAGE|QUASAR_STACK_DIR|QUASAR_HOME_ROOT|QUASAR_RENDER_NODE|QUASAR_HEALTH_ADDR|COMPOSE_FILE|COMPOSE_PROJECT_NAME)='
 umask 077
 env_tmp="$(mktemp)"
 ENV_TMP="$env_tmp"
