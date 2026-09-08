@@ -3771,12 +3771,16 @@ export interface paths {
                         /** @description First-run wizard v2 §S6e (migration 0064). The signaling origin allow-list. ABSENT = UNCHANGED; an explicitly-sent [] CLEARS the list. Those are different requests and the server distinguishes them (pointer decode), so a PATCH that only changes the registration mode can never wipe the allow-list. Each entry must be scheme + host only (http/https, no path, query, credentials or trailing slash); the server stores the NORMALIZED form, so what is saved is exactly what /v1/signal compares against. "*" IS REJECTED OUTRIGHT with 400 validation_failed - a wildcard would discard the layer entirely. A bad entry is 400 naming its position, and nothing is written. Setting this does NOT lift an environment override: when QUASAR_ALLOWED_ORIGINS is SET it wins, and GET /v1/admin/access-check reports which source is in force. */
                         allowed_origins?: string[];
                         /**
-                         * @description Platform-release amendment 1 (#104/#106, migration 0074). Which platform releases the admin console is shown. Absent = unchanged (pointer decode, the same rule every field on this body follows - a plain decode would read "" and silently reset the channel whenever an admin changed the registration mode). Any value outside the enum is 400 validation_failed. Takes effect immediately: the next GET /v1/admin/platform/releases reads the other channel's rows. IT DOES NOT TRIGGER DETECTION - that is a jobs-framework job, and "check now" is POST /v1/admin/jobs/{job_id}/run.
+                         * @description Platform-release amendment 1 (#104/#106, migration 0074); `beta` added by amendment 3 (#121, migration 0079). Which platform releases the admin console is shown. Absent = unchanged (pointer decode, the same rule every field on this body follows - a plain decode would read "" and silently reset the channel whenever an admin changed the registration mode). Any value outside the enum is 400 validation_failed. Takes effect immediately: the next GET /v1/admin/platform/releases reads the other channel's rows. IT DOES NOT TRIGGER DETECTION - that is a jobs-framework job, and "check now" is POST /v1/admin/jobs/{job_id}/run.
                          * @enum {string}
                          */
-                        release_channel?: "stable" | "edge";
+                        release_channel?: "stable" | "beta" | "edge";
                         /** @description Platform-release amendment 1 (#104/#106, migration 0074). The branch the EDGE channel follows; default develop. Absent = unchanged. Validated as a git ref name component - non-empty, at most 255 characters, no whitespace, no "..", no leading "-", no control characters - 400 validation_failed otherwise. Validated and stored whatever the channel is, and NEVER CLEARED BY A CHANNEL SWITCH, so an operator who visits stable and comes back keeps their branch. */
                         release_edge_branch?: string;
+                        /** @description Release notifications, ADDITIVE (#123, migration 0080). Whether a newly detected platform release is POSTed to release_webhook_url. Absent = unchanged. Setting it TRUE is 400 validation_failed whenever the URL this request LEAVES BEHIND is empty - nothing stored and none supplied, or an explicit "" in the same body - because a switch that silently does nothing is worse than a refusal. Default false, so an instance that has never been configured announces nothing. */
+                        release_webhook_enabled?: boolean;
+                        /** @description Release notifications, ADDITIVE (#123, migration 0080). Where one release notification is POSTed. Absent = unchanged; an explicitly-sent "" CLEARS it AND SETS release_webhook_enabled false in the same write. Any other value must be an absolute https URL with no userinfo, at most 2048 characters, or 400 validation_failed - http, a credential in the URL and a relative reference are all refused. THE SERVER STILL CONTAINS THE REQUEST AT SEND TIME: delivery refuses any host that resolves to a loopback, private, link-local or multicast address, follows no redirect, and bounds the response body. THE URL IS TREATED AS A CREDENTIAL (a Slack or Discord webhook URL authenticates by being known), so it never appears in a log line, an audit record or a delivery error. */
+                        release_webhook_url?: string;
                     };
                 };
             };
@@ -3875,6 +3879,59 @@ export interface paths {
         };
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/platform/release-webhook/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Send a test release notification to the configured webhook (admin).
+         * @description Release notifications, ADDITIVE (#123). Sends ONE notification of the real shape, with the real signature and `event` `platform.release.test`, to the configured release_webhook_url. `release` is null in the test body: there may be no release to describe.
+         *     It IGNORES release_webhook_enabled - testing a URL before switching it on is the point - and it RECORDS NOTHING, so a test can never consume the dedupe record and suppress the real notification for a release.
+         *     A REFUSED DELIVERY IS 200 WITH ok false, not a 5xx: the request succeeded and the receiver's answer is the payload. Only a test with nowhere to send is a 400.
+         *     Where the notification goes is PATCH /v1/admin/settings (release_webhook_enabled / release_webhook_url); the optional signing secret is PUT /v1/admin/secrets/platform.release_webhook.secret. There is no route here for either, for the same reason the channel has none.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description The delivery outcome. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["PlatformWebhookTestEnvelope"];
+                    };
+                };
+                /** @description webhook_not_configured - no release_webhook_url is set, so there is nowhere to send. */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
         delete?: never;
         options?: never;
         head?: never;
@@ -7748,12 +7805,16 @@ export interface components {
                 /** @description First-run wizard v2 §S6e (migration 0064). The admin-editable signaling origin allow-list, normalized (scheme + lowercased host). THIS IS THE DATABASE COLUMN, NOT NECESSARILY WHAT /v1/signal ENFORCES: QUASAR_ALLOWED_ORIGINS, when SET, overrides it outright - including when set to the empty string, which is how a hardened deployment pins the list off. That override rule is what makes the migration a behavioural no-op on upgrade for every existing deployment. GET /v1/admin/access-check reports the RESOLVED list plus which source won, so a UI can grey out a control the environment has pinned - the same shape library_discovery_interval_minutes uses. AN EMPTY LIST IS NOT "DENY ALL": /v1/signal still admits a same-origin request and a request with no Origin header at all, so a fresh instance with nothing configured works. Optional in the envelope so pre-amendment servers stay conformant. */
                 allowed_origins?: string[];
                 /**
-                 * @description Platform-release amendment 1 (#104/#106, migration 0074). The instance's platform- release channel: stable = tagged, noted releases; edge = whatever was last published from release_edge_branch, with no notes. DEFAULT stable - an instance that has never been configured is not shown branch builds. Read per request rather than at boot, so a switch needs no restart. Optional in the envelope so pre-amendment servers stay conformant.
+                 * @description Platform-release amendment 1 (#104/#106, migration 0074); `beta` added by amendment 3 (#121, migration 0079). The instance's platform- release channel: stable = tagged, noted releases; beta = those AND the prereleases among them; edge = whatever was last published from release_edge_branch, with no notes. DEFAULT stable - an instance that has never been configured is not shown prereleases or branch builds. Read per request rather than at boot, so a switch needs no restart. Optional in the envelope so pre-amendment servers stay conformant.
                  * @enum {string}
                  */
-                release_channel?: "stable" | "edge";
+                release_channel?: "stable" | "beta" | "edge";
                 /** @description Platform-release amendment 1 (#104/#106, migration 0074). The branch the edge channel follows; default develop. Reported whatever the channel is (it selects nothing while the channel is stable) so a UI can render the control without a second read. Optional in the envelope so pre-amendment servers stay conformant. */
                 release_edge_branch?: string;
+                /** @description Release notifications, ADDITIVE (#123, migration 0080). Whether a detected platform release is announced to release_webhook_url. Default false. Optional in the envelope so a pre-#123 server stays conformant; a client reads absent as false. */
+                release_webhook_enabled?: boolean;
+                /** @description Release notifications, ADDITIVE (#123, migration 0080). The configured webhook URL, or "" when none is set. It is admin-only, as this whole envelope is. THE SIGNING SECRET IS NOT HERE and never will be: it is an instance_secrets row read through GET /v1/admin/secrets, which reports configured/readable and a masked hint, never a value. */
+                release_webhook_url?: string;
                 /** Format: uuid */
                 updated_by: string | null;
                 /** Format: date-time */
@@ -7800,7 +7861,10 @@ export interface components {
              * @description Stable across detections; the handle amendment 2's apply will name.
              */
             id: string;
-            /** @enum {string} */
+            /**
+             * @description The channel this row is STORED on, which is not always the instance's channel: beta has no rows of its own and reads stable's, so a release listed while the instance is on beta reports `stable` here. Unchanged by amendment 3.
+             * @enum {string}
+             */
             channel: "stable" | "edge";
             /** @description Stable semver without a leading "v" ("0.2.0", "0.2.0-rc.1"). NULL ON EDGE - an edge build is a commit, not a version, and a synthesized one would be rendered to an operator as if it were real. */
             version: string | null;
@@ -7813,7 +7877,7 @@ export interface components {
             built_at: string;
             /** @description The highest migration the release's control-plane image embeds. The first ordering key and the ADR 0002 gate. */
             schema_version: number;
-            /** @description True for a prerelease tag. A stable-channel read never lists one; on edge it is reported as found. */
+            /** @description True for a prerelease tag. A stable-channel read never lists one, a BETA read lists it (that is what the channel is for); on edge it is reported as found. */
             prerelease: boolean;
             /** @description Release notes, MARKDOWN, verbatim from the GitHub Release's `body` field (which the publish workflow takes from the changelog section). "" ON EDGE - no notes exist and compare_url stands in for them. Never null, so a client renders one type. UNTRUSTED UPSTREAM TEXT: sanitize at render. */
             notes: string;
@@ -7867,10 +7931,10 @@ export interface components {
         /** @description The whole admin Releases page in one read (GET /v1/admin/platform/releases). */
         PlatformReleaseView: {
             /**
-             * @description The instance's channel. Everything in `available` is on it; the other channel's releases are never mixed in.
+             * @description The instance's channel. Everything in `available` is what it selects; another channel's releases are never mixed in. On `beta` the entries carry channel `stable`, because beta reads those rows rather than storing its own.
              * @enum {string}
              */
-            channel: "stable" | "edge";
+            channel: "stable" | "beta" | "edge";
             /** @description ADDITIVE (#104). The configured release repository as `owner/name` (QUASAR_PLATFORM_RELEASE_REPO, default `accreleus/quasar`), so a client can compose the GitHub links a release view needs - the release page, the commit, and the issues the notes reference - instead of hard-coding a repository the operator may have re-pointed. "" when detection is switched off, which a client reads as "render no links", never as the default. Optional in the schema so a pre-#104 server stays conformant; a client must read absent as "". */
             source_repo?: string;
             /** @description The branch the edge channel follows. Reported on BOTH channels so a UI can render the control without a second read; it selects nothing while channel is stable. */
@@ -7886,13 +7950,60 @@ export interface components {
                 control_plane: components["schemas"]["PlatformIdentity"];
                 hosts: components["schemas"]["PlatformHostIdentity"][];
             };
-            /** @description Releases on the configured channel that are still offerable, NEWEST FIRST (schema_version DESC, then built_at DESC - the tiebreak matters because an edge channel produces many builds at one schema_version). A release below the installed control plane's schema_version is NEVER here (ADR 0002); a prerelease is never here on stable; a stable release with a missing or invalid manifest is never here either (it is a manifest_invalid fault instead). */
+            /** @description Releases the configured channel selects that are still offerable, NEWEST FIRST (schema_version DESC, then built_at DESC - the tiebreak matters because an edge channel produces many builds at one schema_version). On BETA, SemVer 2.0.0 precedence is inserted between those two keys, because that channel is the only one whose rows can arrive out of version order: 0.2.0-rc.2 orders below 0.2.0, which orders below 0.2.1-rc.1, whatever order they were built in. A release below the installed control plane's schema_version is NEVER here (ADR 0002); neither is one whose VERSION orders below an installed prerelease at the same schema_version, which is what stops a switch back to stable offering a downgrade (amendment 3); a prerelease is never here on stable; a stable or beta release with a missing or invalid manifest is never here either (it is a manifest_invalid fault instead). */
             available: components["schemas"]["PlatformRelease"][];
             /** @description One entry per target - the control plane, then every registered host - each evaluated against available[0]. When available is empty every target is eligible:false with reason "no_release". */
             targets: components["schemas"]["PlatformReleaseTarget"][];
             faults: components["schemas"]["PlatformReleaseFault"][];
             /** @description Platform-release apply, AMENDMENT 2 (#104/#114), additive. What is in flight right now - the active fleet run, if any, plus EVERY open attempt including standalone per-host applies and reverts. null when nothing is in flight, and ALWAYS SERIALIZED by a server implementing amendment 2 (null is the answer, not the absence of one). Optional in the schema so a pre-amendment-2 server stays conformant. `targets` deliberately gains no field: the same attempt in two places in one response is a way for the two to disagree, and the join by host_id costs a client one line and cannot. */
             active_apply?: components["schemas"]["ActiveApply"] | null;
+            /** @description Release notifications, ADDITIVE (#123). How this instance announces a release outside the console, and how the last announcement went. null on a server that does not serve the notification surface. Optional in the schema so a pre-#123 server stays conformant. `enabled` and `url` MIRROR instance_settings, exactly as `channel` and `edge_branch` above already do, so the Releases page stays one read. */
+            release_webhook?: components["schemas"]["PlatformReleaseWebhook"] | null;
+        };
+        /** @description The instance's release-notification target and its last delivery. */
+        PlatformReleaseWebhook: {
+            /** @description Whether a detected release is announced. Mirrors instance_settings.release_webhook_enabled. */
+            enabled: boolean;
+            /** @description The configured https URL, or "" when none is set. Admin-only, as this whole view is. */
+            url: string;
+            /** @description Whether a signing secret is stored (instance_secrets `platform.release_webhook.secret`, or its environment fallback). A BOOLEAN AND NEVER THE VALUE. Signing is optional: Slack, Discord and ntfy authenticate by URL. */
+            secret_configured: boolean;
+            /** @description The most recent attempt on this instance, or null when nothing has ever been sent. */
+            last_delivery: components["schemas"]["PlatformWebhookDelivery"] | null;
+        };
+        /** @description One recorded delivery attempt (schema.md `platform_release_notifications`). */
+        PlatformWebhookDelivery: {
+            /**
+             * Format: uuid
+             * @description The platform_releases row this attempt announced.
+             */
+            release_id: string;
+            /** @description That release's version, or null on an edge build (which has none). */
+            release_version: string | null;
+            /**
+             * @description `delivered` is TERMINAL: the release is never announced again. `failed` is retried on the next detection pass until the attempt cap, after which the release is left un-notified rather than retried forever.
+             * @enum {string}
+             */
+            status: "delivered" | "failed";
+            /** @description How many detection PASSES this release has cost, not HTTP requests - the retries within one pass are the server's business. */
+            attempts: number;
+            /** Format: date-time */
+            attempted_at: string;
+            /** @description The receiver's HTTP status, or null when the request never got one (DNS, TLS, a refused dial, the egress allowlist). Those are different failures. */
+            status_code: number | null;
+            /** @description Bounded operator prose, null on success. IT NEVER CONTAINS THE WEBHOOK URL: that URL is itself the credential on every receiver that authenticates by URL. */
+            error: string | null;
+        };
+        PlatformWebhookTestEnvelope: {
+            delivery: {
+                /** @description true when the receiver answered 2xx. */
+                ok: boolean;
+                status_code: number | null;
+                /** @description Bounded prose when ok is false, null otherwise. Never contains the webhook URL. */
+                error: string | null;
+                /** @description Wall time for the whole send, retries included. */
+                duration_ms: number;
+            };
         };
         /**
          * @description A fleet run's state. A run succeeds only when EVERY target succeeded, and it STOPS AT ITS FIRST FAILED TARGET - past a failed control plane, continuing would move agents onto a release the control plane is not on (ADR 0002); past a failed host, it would march a known-bad digest set across the fleet. There is deliberately NO "partial": a failed run may have succeeded targets behind it, and the per-target attempts are where that is read.
