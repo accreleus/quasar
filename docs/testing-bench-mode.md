@@ -454,4 +454,42 @@ spent hours on an "encode-src ring stall" had exactly this shape. To exercise HE
 you need a real macOS or Windows Chrome; to exercise HEVC *encode* without a decoder, use
 `probe-encoder --codec h265` above.
 
+## The luma probe is blind to sparse content, and the default bench app is sparse
+
+The peer's luma probe (`scripts/harness/peer-driver.mjs`) draws each displayed frame into a
+160x90 canvas and reports BT.709 luma as `mean` and `sd`. Its thresholds are **calibrated on
+full-frame content** — a Steam game, a desktop. It cannot see a small moving object.
+
+`Quasar Bench: Ball` is `videotestsrc pattern=ball`, whose ball is **20 px in radius**: about
+0.06% of a 1080p frame, and roughly 9 px of the probe's 14,400-pixel canvas. A perfectly
+healthy Ball stream therefore reads
+
+```
+LUMA mean=3.5 sd=0.00 (steady state; first content never)
+```
+
+**which is indistinguishable from a black stream, and is not one.** Measured on gpu-test
+2026-09-09: Ball read `mean=3.5 sd=0.00` while the same session carried a sustained
+~1650 kbps that varied sample to sample, and `Quasar Bench: Snow` on the same host, encoder
+and session path read `mean=48.0 sd=46.45` with content detected at 0.0 s.
+
+Two ways this has already cost time:
+
+- **It is the host default.** `bench_app` in `_shared/hosts.json` is Ball on more than one
+  host, so a `qses run` with no `--app` gets the one app the probe cannot judge.
+- **It looks reproducible.** The same reading appeared on the aux-infra AMD/VA path
+  (`mean=2.8`) and on the gpu-test 5090/Vulkan path (`mean=3.5`). Two encoders, two vendors,
+  one signature — which reads as a confirmed cross-platform black-frame defect and is in fact
+  just the same blind probe looking at the same tiny ball. It is what left #128's live gate
+  recording rendering as unproven.
+
+**So: never judge rendering from a Ball run.** For any verdict about whether the picture is
+real, use a full-frame app — `Quasar Bench: Snow` or `Quasar Bench: Colour Ripple` — and pass
+`--app` explicitly. If you only have a Ball run, the honest corroborating signal is the
+bitrate: `make session-metrics` and check that the *actual* kbps is substantial and varies
+between samples. A genuinely black, static 1080p60 frame encodes to a trickle and does not
+fluctuate. `encode_ms` is **not** a usable signal here — hardware encode at 1080p is nearly
+content-independent (p50 2.0 ms on the 5090 for real content), so a fast encode says nothing
+about what is in the frame.
+
 AV1 has no such gate: Chrome decodes it everywhere via `dav1d`.
