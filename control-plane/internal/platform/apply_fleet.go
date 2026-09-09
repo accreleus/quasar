@@ -612,7 +612,13 @@ func (f *FleetRunner) cordonFleet(ctx context.Context, runID string) {
 	}
 	states := make([]HostCordon, 0, len(hosts))
 	for _, h := range hosts {
-		states = append(states, HostCordon{HostID: h.HostID, WasCordoned: h.Status != "online"})
+		// `== "draining"`, not `!= "online"`. Only `draining` is a cordon. Treating
+		// `offline` as one meant an offline-at-start host that reconnected mid-run
+		// was recorded as the admin's: the run never cordoned it, so it could take
+		// placements the run then destroyed at its step, and `restoreCordons`
+		// CORDONED it at finish — leaving a host nobody cordoned `draining` with
+		// nothing to lift it. The #140 shape, by a different path (#170).
+		states = append(states, HostCordon{HostID: h.HostID, WasCordoned: h.Status == "draining"})
 	}
 	f.recordAndCordon(ctx, runID, states)
 }
@@ -711,7 +717,13 @@ func (f *FleetRunner) restoreCordons(runID string) {
 		if st.WasCordoned {
 			continue
 		}
-		if status, err := f.store.HostStatus(ctx, st.HostID); err == nil && status != "online" {
+		// `draining`, not `!= "online"`. UncordonHost lifts an agentless host's
+		// cordon to `offline` and returns nil — documented behaviour, and the
+		// cordon IS gone: a reconnect turns `offline` back into `online`. Reading
+		// that success as "still out of scheduling" made every run with an absent
+		// host end on an ERROR telling the operator to fix something that was
+		// already fine (#170).
+		if status, err := f.store.HostStatus(ctx, st.HostID); err == nil && status == "draining" {
 			f.log.Error("fleet apply: a host this run cordoned is still out of scheduling; uncordon it by hand",
 				"run_id", runID, "host_id", st.HostID, "status", status)
 		}

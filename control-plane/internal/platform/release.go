@@ -80,6 +80,22 @@ type HostIdentity struct {
 	InstallMode    *string `json:"install_mode"`
 	UpdaterPresent *bool   `json:"updater_present"`
 	IdentityKnown  bool    `json:"identity_known"`
+	// AgentConnected is whether this host's agent has a live socket to THIS
+	// control-plane process, as the agent registry sees it right now.
+	//
+	// NOT SERIALIZED, deliberately: `PlatformHostIdentity` is a frozen shape and
+	// this is an input to the eligibility decision, not a new field on the wire.
+	//
+	// It exists because `status` cannot answer the question. Nothing corrects an
+	// idle host's status across a control-plane restart: `markOffline` runs only
+	// from the connection goroutine's defer, so a control plane that exits never
+	// runs it, and the stale sweep only visits hosts WITH ACTIVE SESSIONS. Every
+	// fleet run contains a control-plane restart, so "the row says online but no
+	// agent is there" is the normal shape of a run, not an edge case (#169).
+	//
+	// nil = unknown (no registry wired), and the column is trusted instead —
+	// the same seam `UncordonHost` and the per-host apply runner already use.
+	AgentConnected *bool `json:"-"`
 }
 
 // Known is `identity_known`: all four fields present. A host with any of them

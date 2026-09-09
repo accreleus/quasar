@@ -998,6 +998,12 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	pDeps := platformDeps(platformStore, settingsStore, jobStore, secretStore)
 	pDeps.UpdaterPresent = selfApplier.UpdaterPresent
 	pDeps.ControlPlaneInstallMode = selfApplier.InstallMode
+	// #169: the live registry, not the `status` column, answers "is this host's
+	// agent there". The column is stale across every control-plane restart —
+	// and a fleet run contains one — and the run's own cordon then rewrites it
+	// to `draining`, which is not `offline`. Same function the per-host apply
+	// runner already waits on (`Connected` below).
+	pDeps.AgentConnected = agentRegistry.IsConnected
 	platformHandler := platform.NewHandler(pDeps, log)
 	// The fleet run cordons the WHOLE instance for its whole life: every host in
 	// it is about to be recreated at its own step. Whether the control-plane step
