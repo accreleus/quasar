@@ -257,6 +257,17 @@ export function FleetRunPanel({
       <div className="rowflex" style={{ alignItems: "center" }}>
         <Chip variant={RUN_STATE_CHIP[run.state] ?? "neutral"}>{run.state}</Chip>
         <span>{runStateText(run.state)}</span>
+        {/* #122: an admin finding a fleet run they did not start is owed the
+            explanation, and `requested_by` cannot give it — that is null both
+            for an unattended run and for one whose requesting admin was later
+            deleted. `control-api.md` says a client SHOULD say so. Reuses the
+            existing Chip; the v3 handoff has no mock for this marker, so nothing
+            new is styled. */}
+        {run.unattended && (
+          <Chip variant="neutral" title="Started automatically by release detection, not by an admin">
+            automatic
+          </Chip>
+        )}
         {current && <span className="muted">Now: {current}</span>}
         {active && (
           <Button

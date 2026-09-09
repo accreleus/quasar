@@ -1044,6 +1044,20 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	applyRunner.Adopt(context.Background())
 	fleetRunner.Adopt(context.Background())
 
+	// Unattended automatic apply (#122). Constructed here because it needs the
+	// fleet runner's Start and the view that reports the active run — it is a
+	// TRIGGER on the existing sequencer, not a second one. It never sends
+	// `force`: CreateUnattendedRun does not take it.
+	autoApplier := platform.NewAutoApplier(platformStore, platform.AutoApplyDeps{
+		Enabled: settingsStore.PlatformAutoApply,
+		View:    platformHandler.ReleaseView,
+		Start:   fleetRunner.Start,
+		Audit: func(ctx context.Context, action, targetID string, details map[string]any) {
+			// Empty actor: no admin did this.
+			audit.TryRecord(ctx, auditStore, "", action, "platform", targetID, details)
+		},
+	}, log)
+
 	jobRegistry.MustRegister(jobs.Definition{
 		ID:          platform.DetectJobID,
 		Name:        "Platform release detection",
@@ -1070,6 +1084,13 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 			}
 			summary := rep.Summary()
 			for k, v := range releaseNotifier.Notify(ctx).Summary() {
+				summary[k] = v
+			}
+			// The detection schedule IS the unattended-apply window (#122), so
+			// this is the trigger — it runs only on a pass that succeeded, and it
+			// never fails the job: a release the instance chose not to install is
+			// not a detection failure. Why it did or did not act is in the summary.
+			for k, v := range autoApplier.Consider(ctx).Summary() {
 				summary[k] = v
 			}
 			return jobs.Succeeded(summary), nil

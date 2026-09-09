@@ -603,6 +603,52 @@ it was reverted from. A revert is itself recorded as an attempt
 
 ---
 
+## Installing updates automatically
+
+**Off by default.** Settings ▸ Platform updates ▸ *Install updates automatically*
+(`platform_auto_apply`). With it on, Quasar applies a detected release without waiting for
+you — the control plane first, then every eligible host, through exactly the fleet run the
+**Update Quasar** button starts. It is a trigger on that machinery, not a second path.
+
+**A release that changes the database is never installed this way.** That is the one case
+where the control-plane step still empties the whole instance before it runs (see "What an
+apply does, and what it costs"), and ending every live session with nobody watching is not
+something to do on a schedule. Such a release is still detected, still listed, still
+banners; it waits for you to press the button. Everything else rides through the
+control-plane step with sessions still streaming, which is what makes automatic updates
+tolerable at all — a host's own sessions still end when that host is updated, as always.
+
+**There is no separate schedule to configure.** An automatic update happens when release
+detection next runs, so *that* job's schedule is the window: Jobs ▸ **Platform release
+detection**. Move the job and you move the update hour; run it now ("Check now") and an
+eligible release is applied now. One schedule, already yours, that cannot disagree with
+itself.
+
+**An automatic update is never forced.** "Update now" — the checkbox that ends live
+sessions — is an operator agreeing to lose them, and there is no operator here. An
+automatic run always waits.
+
+**A failure stops that release, not the feature.** If an automatic run fails on a host, the
+run stops there and restores its cordons exactly as a manual one does, and Quasar will not
+retry *that release* automatically. A newer release is still installed, and applying the
+failed one yourself clears the block — the rule is that the **most recent** run on a release
+decides, so any run you start yourself, whatever its outcome, resets it. One flaky host does
+not end automatic updates for the instance.
+
+**A run you cancel is not a failure**, so the same release is tried again on the next pass.
+Cancelling says "not now", not "never"; if you want it left alone, turn the setting off.
+
+**An automatic run is refused outright if the release would change the database**, even
+though such a release is never chosen in the first place. The check happens twice on purpose:
+once when the pass picks a release, and again at the control-plane step, because that step
+re-reads the release and a row it cannot read is treated as one that migrates. A refusal
+shows as a failed run whose message says so, and nothing is drained.
+
+**Where to read what happened.** Jobs ▸ Platform release detection ▸ its latest run. The
+summary carries `auto_apply` — `started` with the run id, or why not: `carries_migration`,
+`no_release`, `not_eligible` (with the reason), `in_flight`, `failed_before`. A run started
+this way is marked in Fleet ▸ Releases, so a fleet update you did not start explains itself.
+
 ## Release notifications
 
 The Releases page shows a banner when an update appears. That only helps

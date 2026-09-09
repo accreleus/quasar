@@ -103,6 +103,11 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		// ValidReleaseWebhookURL (#123).
 		ReleaseWebhookEnabled *bool   `json:"release_webhook_enabled"`
 		ReleaseWebhookURL     *string `json:"release_webhook_url"`
+		// Unattended automatic apply (#122). A plain boolean with no companion
+		// validation: unlike release_webhook_enabled it depends on nothing else
+		// being configured first — with nothing to apply it simply applies
+		// nothing, and says so in the detection run's summary.
+		PlatformAutoApply *bool `json:"platform_auto_apply"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -201,6 +206,7 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		ReleaseEdgeBranch:                 req.ReleaseEdgeBranch,
 		ReleaseWebhookEnabled:             req.ReleaseWebhookEnabled,
 		ReleaseWebhookURL:                 req.ReleaseWebhookURL,
+		PlatformAutoApply:                 req.PlatformAutoApply,
 	}
 	// Clearing the URL disables the webhook in the same write: "enabled, with
 	// nowhere to send" is a state no admin asked for and nothing can act on.
