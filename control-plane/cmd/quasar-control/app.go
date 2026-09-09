@@ -1052,6 +1052,10 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		Enabled: settingsStore.PlatformAutoApply,
 		View:    platformHandler.ReleaseView,
 		Start:   fleetRunner.Start,
+		Audit: func(ctx context.Context, action, targetID string, details map[string]any) {
+			// Empty actor: no admin did this.
+			audit.TryRecord(ctx, auditStore, "", action, "platform", targetID, details)
+		},
 	}, log)
 
 	jobRegistry.MustRegister(jobs.Definition{

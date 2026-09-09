@@ -631,8 +631,18 @@ automatic run always waits.
 **A failure stops that release, not the feature.** If an automatic run fails on a host, the
 run stops there and restores its cordons exactly as a manual one does, and Quasar will not
 retry *that release* automatically. A newer release is still installed, and applying the
-failed one yourself clears the block. One flaky host does not end automatic updates for the
-instance.
+failed one yourself clears the block — the rule is that the **most recent** run on a release
+decides, so any run you start yourself, whatever its outcome, resets it. One flaky host does
+not end automatic updates for the instance.
+
+**A run you cancel is not a failure**, so the same release is tried again on the next pass.
+Cancelling says "not now", not "never"; if you want it left alone, turn the setting off.
+
+**An automatic run is refused outright if the release would change the database**, even
+though such a release is never chosen in the first place. The check happens twice on purpose:
+once when the pass picks a release, and again at the control-plane step, because that step
+re-reads the release and a row it cannot read is treated as one that migrates. A refusal
+shows as a failed run whose message says so, and nothing is drained.
 
 **Where to read what happened.** Jobs ▸ Platform release detection ▸ its latest run. The
 summary carries `auto_apply` — `started` with the run id, or why not: `carries_migration`,

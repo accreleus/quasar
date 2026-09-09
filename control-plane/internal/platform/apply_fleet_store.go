@@ -92,23 +92,33 @@ func (s *Store) CreateUnattendedRun(ctx context.Context, releaseID string) (Appl
 	return s.Run(ctx, id)
 }
 
-// UnattendedFailedReleaseIDs is the failure suppression (#122): the releases an
-// unattended run has already failed on.
+// UnattendedFailedReleaseIDs is the failure suppression (#122): the releases
+// whose MOST RECENT run was a failed unattended one.
 //
-// Per RELEASE and not global, deliberately. A genuinely bad release must not be
+// "Most recent", not "any", and that is the whole implementation of the
+// operator's rule that an admin applying the release themselves clears the
+// suppression. A `DISTINCT release_id WHERE unattended AND state='failed'`
+// suppresses for ever — the admin's own successful run sits alongside the old
+// failure and changes nothing, so a host left behind by one bad pass never
+// updates again until a newer release appears. Ordering by `created_at DESC` per
+// release makes an admin run of ANY outcome reset it, and a second unattended
+// failure re-suppress it, which is what the contract says.
+//
+// Per RELEASE and not global, deliberately: a genuinely bad release must not be
 // re-attempted once a week for ever, but one flaky host must not end automatic
-// updates for the whole instance either — so a newer release is still tried, and
-// an admin applying the failed one themselves clears it (their run is not
-// `unattended`, and this only counts unattended ones).
+// updates for the whole instance either.
 //
 // `unattended` is what makes this answerable at all: requested_by is NULL for an
 // unattended run AND for a run whose requesting admin has since been deleted
 // (ON DELETE SET NULL), so it cannot stand in.
 func (s *Store) UnattendedFailedReleaseIDs(ctx context.Context) (map[string]bool, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT release_id::text
-		FROM platform_apply_runs
-		WHERE unattended AND state = 'failed'
+		SELECT release_id::text FROM (
+		    SELECT DISTINCT ON (release_id) release_id, unattended, state
+		    FROM platform_apply_runs
+		    ORDER BY release_id, created_at DESC, id DESC
+		) last
+		WHERE last.unattended AND last.state = 'failed'
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("read unattended failures: %w", err)

@@ -336,6 +336,22 @@ func (f *FleetRunner) controlPlanePhase(ctx context.Context, run ApplyRun) bool 
 			f.finish(run.ID, RunFailed, "the control plane cannot take this release: "+reason)
 			return false
 		}
+		// #122 decision 1, enforced HERE and not only where the run was
+		// decided. An unattended run must never drain the instance, and the
+		// drain decision below is re-made from the store row rather than from
+		// the view the scheduler read — so a `schema_version` that moved under
+		// us, or a release row that simply cannot be read (which
+		// releaseRunsAMigration deliberately treats AS migrating), would
+		// otherwise turn a run nobody is watching into a fleet-wide outage.
+		// The trigger's check is necessary, not sufficient.
+		if run.Unattended && f.releaseRunsAMigration(ctx, run) {
+			f.log.Warn("fleet apply: refusing an unattended run whose release would migrate the database",
+				"run_id", run.ID, "release_id", run.ReleaseID, "token", "unattended-refused-migrating")
+			f.finish(run.ID, RunFailed,
+				"unattended update refused: this release would migrate the database (or its row could not be read), "+
+					"which drains every session on the instance — apply it yourself when you are watching")
+			return false
+		}
 		a, err := f.createControlPlaneAttempt(ctx, run)
 		if err != nil {
 			f.finish(run.ID, RunFailed, "could not start the control-plane update: "+err.Error())

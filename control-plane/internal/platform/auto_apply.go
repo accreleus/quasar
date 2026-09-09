@@ -2,6 +2,7 @@ package platform
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 )
 
@@ -57,6 +58,13 @@ const (
 	// AutoApplyFailedBefore — an unattended run already failed on this release.
 	// Not retried until an admin looks at it, or a newer release appears.
 	AutoApplyFailedBefore = "failed_before"
+	// AutoApplyUpToDate — the newest offered release is the one already
+	// installed, so there is nothing to move. Distinct from `no_release`: the
+	// channel does offer something, we are simply on it.
+	AutoApplyUpToDate = "up_to_date"
+	// AutoApplyCreateFailed — the decision said apply, but the run row could
+	// not be inserted for a reason other than a run already being active.
+	AutoApplyCreateFailed = "create_failed"
 	// AutoApplyStarted — a fleet run was started.
 	AutoApplyStarted = "started"
 )
@@ -119,17 +127,49 @@ func PlanAutoApply(in AutoApplyInputs) AutoApplyDecision {
 	if in.SuppressedReleaseIDs[candidate.ID] {
 		return AutoApplyDecision{ReleaseID: candidate.ID, Reason: AutoApplyFailedBefore}
 	}
+	// The handler refuses a candidate `offered` rejects — today that is an edge
+	// row older than what is installed, which `Available` still lists so
+	// `up_to_date` can be evaluated against it. Without this the scheduler will
+	// happily start a run for a release the admin's own button refuses.
+	if !offered(in.View, candidate.ID) {
+		return AutoApplyDecision{ReleaseID: candidate.ID, Reason: AutoApplyUpToDate,
+			Detail: "the newest offered release is not applicable to this instance"}
+	}
 	// `up_to_date` is not a refusal for the fleet handler — the run then goes
 	// straight to the hosts — and it is not one here either. `run_active` is
-	// already collapsed to "" by fleetTargetReason, so the in-flight check
-	// below is what catches that.
-	if reason := fleetTargetReason(in.View, nil); reason != "" && reason != ReasonUpToDate {
+	// already collapsed to "" by fleetTargetReason, and `attempt_in_flight` has
+	// its own more specific check below, so both are excluded exactly as the
+	// handler excludes them.
+	if reason := fleetTargetReason(in.View, nil); reason != "" &&
+		reason != ReasonUpToDate && reason != ReasonAttemptInFlight {
 		return AutoApplyDecision{ReleaseID: candidate.ID, Reason: AutoApplyNotEligible, Detail: reason}
 	}
 	if in.AnyAttemptOpen || in.View.ActiveApply != nil && in.View.ActiveApply.Run != nil {
 		return AutoApplyDecision{ReleaseID: candidate.ID, Reason: AutoApplyInFlight}
 	}
+	// NOTHING TO DO IS NOT THE SAME AS DO IT. In steady state Available[0] IS
+	// the installed release (`belowInstalledVersion` keeps the equal version
+	// listed precisely so `up_to_date` can be evaluated against it), so without
+	// this the scheduler starts a fleet run on every single pass of a
+	// fully-updated instance: a `succeeded` run with zero attempts, weekly, for
+	// ever. The admin's button is hidden in that state by `hasUpdate`; this is
+	// the scheduler's equivalent of that gate.
+	if !anyTargetEligible(in.View) {
+		return AutoApplyDecision{ReleaseID: candidate.ID, Reason: AutoApplyUpToDate}
+	}
 	return AutoApplyDecision{Apply: true, ReleaseID: candidate.ID, Reason: AutoApplyStarted}
+}
+
+// anyTargetEligible reports whether the run would actually move anything: the
+// control plane, or at least one host. An instance where every target reads
+// `up_to_date` has nothing for a run to do.
+func anyTargetEligible(v View) bool {
+	for _, t := range v.Targets {
+		if t.Eligible {
+			return true
+		}
+	}
+	return false
 }
 
 // autoApplyStore is the I/O the applier needs, named narrowly so a test can
@@ -155,6 +195,11 @@ type AutoApplyDeps struct {
 	View func(ctx context.Context) (View, error)
 	// Start hands the run to the existing fleet sequencer.
 	Start func(run ApplyRun)
+	// Audit records the run, with an empty actor. The admin-triggered path
+	// writes `platform.apply.run`; without this the audit log has a gap exactly
+	// where a fleet-affecting action happened with NO human, which is the one
+	// place it most needs an entry. Optional: nil skips it.
+	Audit func(ctx context.Context, action, targetID string, details map[string]any)
 }
 
 // AutoApplier runs one unattended pass. Constructed once; Consider is called by
@@ -255,11 +300,27 @@ func (a *AutoApplier) Consider(ctx context.Context) AutoApplyOutcome {
 		// single-flight, and losing that race is not a failure worth escalating.
 		a.log.Warn("platform auto-apply: could not create the run",
 			"release_id", decision.ReleaseID, "err", err)
+		// Only ErrRunActive is genuinely "something else is running"; anything
+		// else is a failed insert and should not read as in-flight.
+		reason := AutoApplyCreateFailed
+		if errors.Is(err, ErrRunActive) {
+			reason = AutoApplyInFlight
+		}
 		return AutoApplyOutcome{Decision: AutoApplyDecision{
-			ReleaseID: decision.ReleaseID, Reason: AutoApplyInFlight}, Err: err}
+			ReleaseID: decision.ReleaseID, Reason: reason}, Err: err}
 	}
 	a.log.Info("platform auto-apply: starting a fleet run",
 		"release_id", decision.ReleaseID, "run_id", run.ID, "token", "auto-apply-started")
+	if a.deps.Audit != nil {
+		// Empty actor: the schedule did this, not a person. `unattended` on the
+		// details is what distinguishes it from the admin-triggered record.
+		a.deps.Audit(ctx, "platform.apply.run", decision.ReleaseID, map[string]any{
+			"release_id": decision.ReleaseID,
+			"run_id":     run.ID,
+			"force":      false,
+			"unattended": true,
+		})
+	}
 	a.deps.Start(run)
 	return AutoApplyOutcome{Decision: decision, RunID: run.ID}
 }

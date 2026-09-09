@@ -9,7 +9,7 @@
 -- history matters.
 BEGIN;
 
-DROP INDEX IF EXISTS platform_apply_runs_unattended_idx;
+DROP INDEX IF EXISTS platform_apply_runs_release_recent_idx;
 
 ALTER TABLE platform_apply_runs
     DROP COLUMN IF EXISTS unattended;

@@ -17,6 +17,8 @@
 -- an admin moves the update hour by moving the job they already own. A second
 -- time model here could disagree with that one, and would need its own
 -- validation, rendering and documentation to say the same thing twice.
+BEGIN;
+
 ALTER TABLE instance_settings
     ADD COLUMN IF NOT EXISTS platform_auto_apply BOOLEAN NOT NULL DEFAULT false;
 
@@ -36,8 +38,12 @@ ALTER TABLE instance_settings
 ALTER TABLE platform_apply_runs
     ADD COLUMN IF NOT EXISTS unattended BOOLEAN NOT NULL DEFAULT false;
 
--- Every read of this column asks "did an unattended run already fail on THIS
--- release", so that is the index.
-CREATE INDEX IF NOT EXISTS platform_apply_runs_unattended_idx
-    ON platform_apply_runs (release_id, state)
-    WHERE unattended;
+-- The suppression read asks "what was the MOST RECENT run on this release, and
+-- was it a failed unattended one" (DISTINCT ON (release_id) ORDER BY
+-- created_at DESC), so the index is the ordering that query walks. Not a partial
+-- index on `unattended`: the query has to see an ADMIN's later run to know the
+-- suppression is cleared, so it cannot filter unattended rows out at the index.
+CREATE INDEX IF NOT EXISTS platform_apply_runs_release_recent_idx
+    ON platform_apply_runs (release_id, created_at DESC, id DESC);
+
+COMMIT;

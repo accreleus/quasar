@@ -182,3 +182,59 @@ func TestAutoApplySummaryCarriesTheRefusal(t *testing.T) {
 		t.Fatalf("summary = %v", got)
 	}
 }
+
+// upToDateView is a fully-updated instance: the channel offers a release and it
+// is the one already installed, so every target reads `up_to_date`. This is the
+// steady state of every healthy instance, and it is what `Available[0]` looks
+// like there — `belowInstalledVersion` keeps the equal version listed precisely
+// so `up_to_date` can be evaluated against it.
+func upToDateView(rels ...Release) View {
+	up := ReasonUpToDate
+	return View{
+		Channel:   ChannelStable,
+		Available: rels,
+		Targets: []Target{
+			{Kind: TargetControlPlane, Eligible: false, Reason: &up},
+			{Kind: TargetHost, HostID: str("h1"), Eligible: false, Reason: &up},
+		},
+	}
+}
+
+// THE ONE THAT MATTERS FOR AN IDLE INSTANCE. Without this gate the scheduler
+// starts a fleet run on every pass of an up-to-date instance: a `succeeded` run
+// with zero attempts, weekly, for ever, with the Update button vanishing and the
+// active-run panel flashing each time. The admin's button is hidden in this
+// state by `hasUpdate`; this is the scheduler's equivalent.
+// (The sibling guard, `offered(view, candidate)`, mirrors the handler's own
+// refusal for an edge row older than what is installed. It is a one-line reuse
+// of the handler's helper and is covered by that helper's own tests; building the
+// edge-older-than-installed fixture here bought a brittle test rather than
+// confidence.)
+func TestPlanAutoApplyStartsNothingWhenEverythingIsUpToDate(t *testing.T) {
+	got := PlanAutoApply(AutoApplyInputs{
+		Enabled: true, View: upToDateView(offeredRelease("r1", false)),
+	})
+
+	if got.Apply {
+		t.Fatal("must not start a run when no target is eligible — nothing to do is not the same as do it")
+	}
+	if got.Reason != AutoApplyUpToDate {
+		t.Fatalf("reason = %q, want %q", got.Reason, AutoApplyUpToDate)
+	}
+}
+
+// `attempt_in_flight` must report as in-flight, not as a generic ineligibility —
+// exact parity with the handler, which excludes it from the durable gate and
+// catches it with its own more specific check.
+func TestPlanAutoApplyReportsAnInFlightAttemptAsSuch(t *testing.T) {
+	v := autoView(offeredRelease("r1", false))
+	reason := ReasonAttemptInFlight
+	v.Targets[0] = Target{Kind: TargetControlPlane, Eligible: false, Reason: &reason}
+
+	got := PlanAutoApply(AutoApplyInputs{Enabled: true, View: v, AnyAttemptOpen: true})
+
+	if got.Reason != AutoApplyInFlight {
+		t.Fatalf("reason = %q, want %q — attempt_in_flight is not a durable refusal",
+			got.Reason, AutoApplyInFlight)
+	}
+}
