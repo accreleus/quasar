@@ -173,6 +173,9 @@ func TestAgentReportedFailureIsAudited(t *testing.T) {
 	if r.Details["host_id"] != s.hostID {
 		t.Errorf("details.host_id = %v, want %s", r.Details["host_id"], s.hostID)
 	}
+	if r.Details["app_id"] != s.appID {
+		t.Errorf("details.app_id = %v, want %s (#171: a failure names its app)", r.Details["app_id"], s.appID)
+	}
 	// error_message is free agent text and stays on the session row.
 	if _, ok := r.Details["error_message"]; ok {
 		t.Errorf("details carries the free-text error_message: %v", r.Details)
@@ -251,6 +254,9 @@ func TestControlPlaneFailureIsAudited(t *testing.T) {
 	}
 	if _, ok := rows[0].Details["failure_code"]; ok {
 		t.Errorf("a control-plane fault has no agent failure_code: %v", rows[0].Details)
+	}
+	if rows[0].Details["app_id"] != s.appID {
+		t.Errorf("details.app_id = %v, want %s (#171: the control-plane path names its app too)", rows[0].Details["app_id"], s.appID)
 	}
 	// The reason IS carried here (bounded), because nothing else on this path
 	// explains the failure: there is no agent failure_code to read instead.

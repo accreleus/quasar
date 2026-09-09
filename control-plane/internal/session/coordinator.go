@@ -379,6 +379,13 @@ func truncateBytes(s string, n int) string {
 // session.failed with no explanation is a row an operator cannot act on.
 func (c *Coordinator) recordSessionFailed(ctx context.Context, sess Session, source string, failureCode *string, reason string) {
 	details := map[string]any{"reason_source": source}
+	// app_id (#171, quasar-protocol "session.failed app_id" amendment): which app failed. Without it
+	// an operator reading the audit feed cannot match a failure to its app;
+	// session.launched already carries it. Both callers pass the Session that
+	// store.Transition re-read, so AppID is always populated.
+	if sess.AppID != "" {
+		details["app_id"] = sess.AppID
+	}
 	if sess.HostID != nil {
 		details["host_id"] = *sess.HostID
 	}
