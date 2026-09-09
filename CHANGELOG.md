@@ -150,9 +150,17 @@ own; the two do not move together, and that is deliberate.
   the `encoder_codecs` readiness check reported. The agent now sets
   `ANV_DEBUG=video-decode,video-encode` on a detected Intel GPU before GStreamer
   initialises, merging with any operator-set value rather than replacing it, with
-  `QUASAR_INTEL_VULKAN_VIDEO=0` to opt back out. Note that Mesa gates encode on
-  Gen12.0 and earlier, so this gives Alder Lake class integrated graphics H.264 and
-  H.265, and gives a discrete Arc card decode only.
+  `QUASAR_INTEL_VULKAN_VIDEO=0` to opt back out. **This only changes anything on a
+  host whose encoder is `vulkan`.** Intel's vendor default is still VA, so an Intel
+  operator wanting the Vulkan path has to set `QUASAR_ENCODER=vulkan` (or an admin
+  host override) as well. Mesa gates encode on Gen12.0 parts, so Tiger, Rocket, Alder
+  and Raptor Lake integrated graphics should get H.264 and H.265 out of this, while
+  DG2/Arc and newer parts get decode only and still need VA to encode. Should, not
+  will: Mesa ships this off by default and does not treat the path as validated, which
+  is exactly what this release is asking Intel users to try. Pair it with
+  `QUASAR_VULKAN_AV1=0` on Intel: ANV has no AV1 encode at all, so leaving that knob on
+  makes every boot log a `vulkan-codec-plan-degraded` warning telling you to check the
+  image contract, which is the wrong place to look on an Intel host.
 
 - **Intel hosts now ship a VA driver** (#126). `mesa-va-drivers` is gallium only
   (radeonsi/nouveau/virtio/d3d12), so libva had nothing to load on an Intel GPU:
@@ -165,8 +173,6 @@ own; the two do not move together, and that is deliberate.
   asks for. Whether Fedora's in-distro iHD keeps the encode entrypoints is not yet
   confirmed on hardware; if `vainfo | grep EncSlice` comes back empty on a real
   Intel host, the replacement is `intel-media-driver` from RPM Fusion nonfree.
-  Vulkan encode on Intel is a separate, still-open question and is not addressed
-  here.
 
 - A node agent no longer reports another agent's health as its own (#152). The stack
   uses host networking, so two agents on one machine share `QUASAR_HEALTH_ADDR`; the
