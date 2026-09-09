@@ -47,8 +47,8 @@ describe("targetLabel", () => {
 });
 
 describe("actionSentence", () => {
-  it("says who did what to which thing", () => {
-    expect(actionSentence(LAUNCH)).toBe("Salty2011 launched session Steam · salty2011");
+  it("never sentence-cases the actor — a username is case-sensitive", () => {
+    expect(actionSentence(LAUNCH)).toBe("salty2011 launched session Steam · salty2011");
   });
 
   it("attributes an actorless row to the system", () => {
@@ -65,11 +65,33 @@ describe("actionSentence", () => {
 
   it("omits the target for an action that has none", () => {
     const synced = item({ action: "image.synced", target_type: "image", target_id: null });
-    expect(actionSentence(synced)).toBe("Salty2011 synced the image catalogue");
+    expect(actionSentence(synced)).toBe("salty2011 synced the image catalogue");
   });
 
   it("humanises an action it has never seen, rather than dropping it", () => {
     expect(actionVerb("widget.frobnicated")).toBe("widget frobnicated");
+  });
+
+  it("never repeats the object noun the target type already supplies", () => {
+    const minted = item({
+      action: "invite.minted",
+      target_type: "invite",
+      target_id: "2fc39454-0000-4000-8000-000000000001",
+      names: {},
+    });
+    expect(actionSentence(minted)).toBe("salty2011 minted invite 2fc39454");
+  });
+
+  it("omits the noun where the verb already names the object", () => {
+    const tombstoned = item({
+      action: "storage.home.tombstone",
+      target_type: "storage_home",
+      target_id: "3f2a1b9c-0000-4000-8000-000000000001",
+      details: { username: "kenji", app_name: "Steam" },
+      // The server seeds the target from the stamped name when the home is gone.
+      names: { "3f2a1b9c-0000-4000-8000-000000000001": "kenji" },
+    });
+    expect(actionSentence(tombstoned)).toBe("salty2011 marked a home for cleanup kenji");
   });
 });
 
@@ -104,7 +126,7 @@ describe("detailReadout", () => {
   it("opens with the sentence, then keeps every id in full beside its name", () => {
     expect(detailReadout(LAUNCH)).toBe(
       [
-        "Salty2011 launched session Steam · salty2011",
+        "salty2011 launched session Steam · salty2011",
         "",
         "action   session.launched",
         "actor    salty2011",

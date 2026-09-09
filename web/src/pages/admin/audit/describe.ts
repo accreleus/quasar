@@ -9,8 +9,9 @@ import type { AdminActivityItem } from "../../../api/admin";
 
 /** Verb phrases for the actions the control plane actually emits.
  *
- *  Lowercase past tense, composed after the actor: `salty2011` +
- *  `launched session` + `Steam · kenji`.
+ *  Lowercase past tense, and WITHOUT the object noun — the sentence supplies
+ *  that from the target type, so a verb that names it too reads "minted an
+ *  invite invite 2fc39454".
  *
  *  Keys must match the server's emitted strings exactly; a stale one falls
  *  through to `humanise()` unnoticed. To re-derive the live set:
@@ -23,60 +24,79 @@ const ACTION_VERBS: Record<string, string> = {
   "app.artwork.upload": "uploaded cover artwork for",
   "app.artwork.cleared": "cleared cover artwork for",
   "app.artwork.reresolve": "re-resolved cover artwork",
-  "app.delete": "deleted app",
+  "app.delete": "deleted",
   "app.entitlement.grant": "granted access to",
   "app.entitlement.revoke": "revoked access to",
   "app.entitlement.set_mode": "changed the entitlement mode for",
   "app.library.rule.set": "set a library rule on",
   "app.library.rule.delete": "removed a library rule from",
   "console.config.update": "updated console settings on",
-  "host.delete": "forgot host",
-  "host.drain": "drained host",
+  "host.delete": "forgot",
+  "host.drain": "drained",
   "host.restart": "restarted the agent on",
   "host.settings.update": "updated settings on",
   "host.uncordon": "resumed scheduling on",
-  "host_enrollment.minted": "minted a host enrollment token",
-  "host_enrollment.revoked": "revoked a host enrollment token",
-  "image.installed": "installed image",
-  "image.pinned": "pinned image",
-  "image.unpinned": "unpinned image",
-  "image.uninstalled": "uninstalled image",
-  "image.updated": "updated image",
+  "host_enrollment.minted": "minted",
+  "host_enrollment.revoked": "revoked",
+  "image.installed": "installed",
+  "image.pinned": "pinned",
+  "image.unpinned": "unpinned",
+  "image.uninstalled": "uninstalled",
+  "image.updated": "updated",
   "image.synced": "synced the image catalogue",
   "instance.secret.set": "set instance secret",
   "instance.secret.cleared": "cleared instance secret",
   "instance.settings.updated": "updated instance settings",
-  "invite.minted": "minted an invite",
-  "invite.revoked": "revoked an invite",
-  "job.run": "ran job",
-  "job.update": "updated job",
-  "launch_profile.create": "created launch profile",
-  "launch_profile.update": "updated launch profile",
-  "launch_profile.delete": "deleted launch profile",
+  "invite.minted": "minted",
+  "invite.revoked": "revoked",
+  "job.run": "ran",
+  "job.update": "updated",
+  "launch_profile.create": "created",
+  "launch_profile.update": "updated",
+  "launch_profile.delete": "deleted",
   "library.scan.force": "forced a library scan for",
   "platform.apply.run": "started a fleet update to",
   "platform.apply.cancel": "cancelled the fleet update to",
   "platform.apply.host": "applied a release to",
   "platform.revert.host": "reverted",
   "platform.release_webhook.tested": "sent a test release notification",
-  "runtime_preset.create": "created runtime preset",
-  "runtime_preset.update": "updated runtime preset",
-  "runtime_preset.delete": "deleted runtime preset",
-  "session.capture": "captured diagnostics from session",
-  "session.failed": "recorded a failure for session",
-  "session.launched": "launched session",
-  "session.stop": "stopped session",
+  "runtime_preset.create": "created",
+  "runtime_preset.update": "updated",
+  "runtime_preset.delete": "deleted",
+  "session.capture": "captured diagnostics from",
+  "session.failed": "recorded a failure for",
+  "session.launched": "launched",
+  "session.stop": "stopped",
   "storage.gc.confirm": "reclaimed storage on",
-  "storage.home.tombstone": "marked a home for cleanup —",
-  "stream_profile.create": "created stream profile",
-  "stream_profile.update": "updated stream profile",
-  "stream_profile.delete": "deleted stream profile",
-  "user.deleted": "deleted user",
-  "user.disabled": "disabled user",
-  "user.enabled": "enabled user",
+  "storage.home.tombstone": "marked a home for cleanup",
+  "stream_profile.create": "created",
+  "stream_profile.update": "updated",
+  "stream_profile.delete": "deleted",
+  "user.deleted": "deleted",
+  "user.disabled": "disabled",
+  "user.enabled": "enabled",
   "user.quota_changed": "changed the session quota for",
   "user.role_changed": "changed the role of",
 };
+
+/** The word a target type goes by in a sentence. `""` means the verb already
+ *  names the object ("marked a home for cleanup 3f2a…", "set instance secret
+ *  platform.release_webhook.secret"), so adding one would repeat it. */
+const TYPE_NOUNS: Record<string, string> = {
+  library: "app",
+  platform: "release",
+  host_enrollment: "enrollment",
+  runtime_preset: "runtime preset",
+  stream_profile: "stream profile",
+  launch_profile: "launch profile",
+  storage_home: "",
+  secret: "",
+  instance: "",
+};
+
+function typeNoun(targetType: string): string {
+  return TYPE_NOUNS[targetType] ?? targetType.replace(/_/g, " ");
+}
 
 /** Unmapped action: "thing.some_verb" → "thing some verb", so a new server
  *  action still reads as words. */
@@ -116,9 +136,12 @@ export function actionSentence(item: AdminActivityItem): string {
   // as a username here.
   const actor = item.actor_username ?? "The system";
   const verb = actionVerb(item.action);
-  const target = item.target_id ? ` ${targetLabel(item)}` : "";
-  const sentence = `${actor} ${verb}${target}`;
-  return sentence.charAt(0).toUpperCase() + sentence.slice(1);
+  // Not sentence-cased: a username is a case-sensitive identifier, and
+  // "salty2011" must not be rendered as "Salty2011".
+  if (!item.target_id) return `${actor} ${verb}`;
+  const noun = typeNoun(item.target_type);
+  const name = nameFor(item, item.target_id) ?? shortId(item.target_id);
+  return `${actor} ${verb} ${noun ? `${noun} ` : ""}${name}`;
 }
 
 /** Scalars as themselves, anything structured as compact JSON — so an unknown

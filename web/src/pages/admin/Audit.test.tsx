@@ -234,7 +234,7 @@ describe("Audit — copy entry", () => {
   // plain literal, not something reconstructed from Intl at assertion time.
   const EXPECTED_TEXT = [
     "09:00:00  salty2011  host.drain  gpu-test",
-    "Salty2011 drained host gpu-test",
+    "salty2011 drained host gpu-test",
     "",
     "action  host.drain",
     "actor   salty2011",
