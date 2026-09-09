@@ -301,6 +301,30 @@ export function Settings() {
         )}
       </SettingsSection>
 
+      <SettingsSection
+        title="Platform updates"
+        hint="How Quasar itself moves to a new release. What is available, and applying by hand, live in Fleet ▸ Releases."
+      >
+        <ResourceStates loading={settings.loading} error={settings.error} />
+        {!settings.loading && !settings.error && s && (
+          <SettingRow
+            label="Install updates automatically"
+            hint="Applies a detected release without waiting for a click — the control plane first, then each eligible host, exactly as the Update button does. A release that changes the database is never installed this way: that one empties the instance first, so it waits for you. Updates land when release detection next runs, so its schedule is the window (Jobs ▸ Platform release detection). Live sessions ride through the control-plane step; a host's own sessions end when that host is updated."
+          >
+            {/* Optional in the envelope so a pre-#122 server stays conformant;
+                absent reads as off, which is both the default and the safe
+                answer. */}
+            <Switch
+              id="platform-auto-apply"
+              checked={s.platform_auto_apply ?? false}
+              onChange={(v) => void settings.patch("platform_auto_apply", v)}
+              label={switchCaption(s.platform_auto_apply ?? false)}
+              disabled={settings.pending === "platform_auto_apply"}
+            />
+          </SettingRow>
+        )}
+      </SettingsSection>
+
       <SettingsSection title="Images" hint="How installed app images follow the catalog">
         <ResourceStates loading={settings.loading} error={settings.error} />
         {!settings.loading && !settings.error && s && (

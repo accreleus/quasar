@@ -26,6 +26,22 @@ own; the two do not move together, and that is deliberate.
 
 ### Added
 
+- **Quasar can install its own updates** (#122, migration 0081). Settings ▸ Platform updates
+  ▸ "Install updates automatically", off by default. When it is on, a detected release is
+  applied without a click — the control plane first, then every eligible host, through
+  exactly the fleet run the Update button starts. **A release that changes the database is
+  never installed this way**: that is the one case where the control-plane step still empties
+  the instance first, so it waits for a person. Everything else rides through with sessions
+  still streaming (#128/#153), which is what makes this safe to leave on. There is no second
+  schedule to configure — an automatic update happens when release detection next runs, so
+  that job's own schedule is the window. An automatic run is **never forced**: "Update now"
+  is an operator agreeing to end live sessions, and there is no operator. A failed automatic
+  run stops that **release**, not the feature — a newer one is still installed, and applying
+  the failed one by hand clears the block, so one flaky host cannot end automatic updates for
+  an instance. What a pass did, or why it did nothing, is in the detection job's run summary,
+  and a run started this way is marked in Fleet ▸ Releases. Contract: `quasar-protocol`
+  amendment 8.
+
 - A **beta release channel** (#121). Admin ▸ Fleet ▸ Releases now offers a third
   channel between stable and edge: beta lists the same tagged releases stable
   does **and the prereleases among them**, so a release candidate can be applied

@@ -190,10 +190,16 @@ type RunSkip struct {
 // control-plane target, so the restart a fleet run causes cannot lose them;
 // only a crash mid-fleet can, and then the list is empty rather than wrong.
 type ApplyRun struct {
-	ID                string     `json:"id"`
-	ReleaseID         string     `json:"release_id"`
-	State             string     `json:"state"`
-	Force             bool       `json:"force"`
+	ID        string `json:"id"`
+	ReleaseID string `json:"release_id"`
+	State     string `json:"state"`
+	Force     bool   `json:"force"`
+	// Unattended is true when the run was started by the detection schedule
+	// rather than by an admin pressing Update (#122). Served, because an admin
+	// finding a run they did not start is owed the explanation — and because
+	// `requested_by` is null for BOTH an unattended run and one whose requesting
+	// admin has since been deleted, so it cannot answer this.
+	Unattended        bool       `json:"unattended"`
 	RequestedBy       *string    `json:"requested_by"`
 	CancelRequested   bool       `json:"cancel_requested"`
 	CancelRequestedAt *time.Time `json:"cancel_requested_at"`

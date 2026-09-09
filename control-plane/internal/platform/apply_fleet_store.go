@@ -28,14 +28,14 @@ var (
 // TestTerminalRunSplitMatchesSQL.
 const terminalRunStatesSQL = `('succeeded','failed','cancelled')`
 
-const runColumns = `id::text, release_id::text, state, force, requested_by::text,
+const runColumns = `id::text, release_id::text, state, force, unattended, requested_by::text,
 	cancel_requested, cancel_requested_at, current_target, current_host_id::text,
 	error, created_at, started_at, finished_at`
 
 func scanRun(row pgx.Row) (ApplyRun, error) {
 	var r ApplyRun
 	var errText string
-	if err := row.Scan(&r.ID, &r.ReleaseID, &r.State, &r.Force, &r.RequestedBy,
+	if err := row.Scan(&r.ID, &r.ReleaseID, &r.State, &r.Force, &r.Unattended, &r.RequestedBy,
 		&r.CancelRequested, &r.CancelRequestedAt, &r.CurrentTarget, &r.CurrentHostID,
 		&errText, &r.CreatedAt, &r.StartedAt, &r.FinishedAt); err != nil {
 		return ApplyRun{}, err
@@ -65,6 +65,64 @@ func (s *Store) CreateRun(ctx context.Context, releaseID string, force bool, act
 		return ApplyRun{}, fmt.Errorf("insert platform_apply_run: %w", err)
 	}
 	return s.Run(ctx, id)
+}
+
+// CreateUnattendedRun is CreateRun for a run nobody clicked (#122): force is
+// false and there is no requesting admin.
+//
+// A separate method rather than two more arguments on CreateRun, so `force` is
+// not expressible on this path at all. `force` means an operator agreeing to end
+// N live sessions, and an unattended pass has no operator to agree; since #153 it
+// additionally STOPS sessions on a migrating release, which this path is never
+// allowed to reach. A bool argument would make the wrong call one typo away.
+func (s *Store) CreateUnattendedRun(ctx context.Context, releaseID string) (ApplyRun, error) {
+	var id string
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO platform_apply_runs (release_id, state, force, requested_by, unattended)
+		VALUES ($1::uuid, 'pending', false, NULL, true)
+		RETURNING id::text
+	`, releaseID).Scan(&id)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
+			return ApplyRun{}, ErrRunActive
+		}
+		return ApplyRun{}, fmt.Errorf("insert unattended platform_apply_run: %w", err)
+	}
+	return s.Run(ctx, id)
+}
+
+// UnattendedFailedReleaseIDs is the failure suppression (#122): the releases an
+// unattended run has already failed on.
+//
+// Per RELEASE and not global, deliberately. A genuinely bad release must not be
+// re-attempted once a week for ever, but one flaky host must not end automatic
+// updates for the whole instance either — so a newer release is still tried, and
+// an admin applying the failed one themselves clears it (their run is not
+// `unattended`, and this only counts unattended ones).
+//
+// `unattended` is what makes this answerable at all: requested_by is NULL for an
+// unattended run AND for a run whose requesting admin has since been deleted
+// (ON DELETE SET NULL), so it cannot stand in.
+func (s *Store) UnattendedFailedReleaseIDs(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT release_id::text
+		FROM platform_apply_runs
+		WHERE unattended AND state = 'failed'
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("read unattended failures: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("read unattended failures: %w", err)
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
 }
 
 // Run reads one run by id, without its attempts.

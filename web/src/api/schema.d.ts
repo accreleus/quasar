@@ -3781,6 +3781,8 @@ export interface paths {
                         release_webhook_enabled?: boolean;
                         /** @description Release notifications, ADDITIVE (#123, migration 0080). Where one release notification is POSTed. Absent = unchanged; an explicitly-sent "" CLEARS it AND SETS release_webhook_enabled false in the same write. Any other value must be an absolute https URL with no userinfo, at most 2048 characters, or 400 validation_failed - http, a credential in the URL and a relative reference are all refused. THE SERVER STILL CONTAINS THE REQUEST AT SEND TIME: delivery refuses any host that resolves to a loopback, private, link-local or multicast address, follows no redirect, and bounds the response body. THE URL IS TREATED AS A CREDENTIAL (a Slack or Discord webhook URL authenticates by being known), so it never appears in a log line, an audit record or a delivery error. */
                         release_webhook_url?: string;
+                        /** @description Unattended automatic apply, ADDITIVE (amendment 8, #122, migration 0081). Whether a detected platform release is applied WITHOUT a click. Absent = unchanged. Default false, so an instance that never opts in behaves exactly as before. It depends on nothing else being configured first, so unlike release_webhook_enabled there is no companion 400: with nothing to apply it applies nothing and records why. NO WINDOW FIELD ACCOMPANIES IT, deliberately - an unattended pass runs on a successful platform.release_detect job, so that job's own schedule IS the window, and it is already editable in the Jobs tab. */
+                        platform_auto_apply?: boolean;
                     };
                 };
             };
@@ -7815,6 +7817,8 @@ export interface components {
                 release_webhook_enabled?: boolean;
                 /** @description Release notifications, ADDITIVE (#123, migration 0080). The configured webhook URL, or "" when none is set. It is admin-only, as this whole envelope is. THE SIGNING SECRET IS NOT HERE and never will be: it is an instance_secrets row read through GET /v1/admin/secrets, which reports configured/readable and a masked hint, never a value. */
                 release_webhook_url?: string;
+                /** @description Unattended automatic apply, ADDITIVE (amendment 8, #122, migration 0081). Whether a detected platform release is applied without a click. Default false. Optional in the envelope so a pre-#122 server stays conformant; a client reads absent as false. */
+                platform_auto_apply?: boolean;
                 /** Format: uuid */
                 updated_by: string | null;
                 /** Format: date-time */
@@ -8102,6 +8106,8 @@ export interface components {
             state: components["schemas"]["ApplyRunState"];
             /** @description Applied to EVERY host target in this run. It exists on the fleet body, and not only on the per-host one, because a run whose every host target waits for a natural drain can otherwise stall indefinitely. */
             force: boolean;
+            /** @description ADDITIVE, amendment 8 (#122). True when the detection schedule started this run rather than an admin pressing Update. A CLIENT SHOULD SAY SO: an admin finding a fleet run they did not start is owed the explanation. requested_by cannot answer this - it is null for an unattended run AND for one whose requesting admin has since been deleted (ON DELETE SET NULL). Always false on a run an admin created, and false on a server predating this amendment. An unattended run NEVER carries force: force is an operator agreeing to end N live sessions and there is no operator, so an unattended run is only ever started for a release whose `migrates` is false (see the apply section). */
+            unattended: boolean;
             /** Format: uuid */
             requested_by: string | null;
             /** @description The cancel FLAG, not the cancel state. Read BETWEEN TARGETS and never mid-attempt. It is persisted rather than an in-memory signal so a cancel survives a control-plane restart - which matters here more than anywhere, because a fleet run's first target IS a control-plane restart. */

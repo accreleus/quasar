@@ -175,6 +175,9 @@ export function updateSettings(
     release_webhook_url?: string;
     /** Rejected with 400 when no URL is stored and none is sent with it. */
     release_webhook_enabled?: boolean;
+    /** Unattended automatic apply (#122). Refuses nothing: with nothing to
+     *  apply it applies nothing and records why in the detection run. */
+    platform_auto_apply?: boolean;
   },
 ): Promise<SettingsResponse> {
   return apiFetch<SettingsResponse>("/admin/settings", {
