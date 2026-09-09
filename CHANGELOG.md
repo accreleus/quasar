@@ -24,21 +24,7 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
-### Fixed
-
-- The bench harness no longer reports a healthy stream as black. The peer's luma probe
-  judges a 160x90 canvas with thresholds calibrated on full-frame content, and
-  `Quasar Bench: Ball` is a 20px-radius ball — about 0.06% of a 1080p frame — so a
-  perfectly good Ball stream read `mean=3.5 sd=0.00 "first content never"`, which is
-  indistinguishable from a black picture. Because Ball is the default bench app on more
-  than one host, the same false reading appeared on both the AMD/VA and the 5090/Vulkan
-  paths and looked like a confirmed cross-platform rendering defect; it is what left
-  #128's live gate recording rendering as unproven. Documented in
-  `docs/testing-bench-mode.md`, with the probe's own calibration comment corrected: judge
-  rendering from a full-frame app (Snow, Colour Ripple), and never from Ball.
-
 ### Added
-
 - **Quasar can install its own updates** (#122, migration 0081). Settings ▸ Platform updates
   ▸ "Install updates automatically", off by default. When it is on, a detected release is
   applied without a click — the control plane first, then every eligible host, through
@@ -107,8 +93,8 @@ own; the two do not move together, and that is deliberate.
   rather than a flag day. Operator procedure, including the CI secret to create
   and how to rotate: `docs/upgrading.md` "Signing platform releases"; knobs in
   `docs/configuration.md`; decision record in `docs/adr/0003-release-signatures.md`.
-### Changed
 
+### Changed
 - A fleet update no longer empties the whole instance before it updates the control
   plane (#153). That drain existed because a control-plane restart used to end every
   session; #128 removed that, so a release carrying no database migration now takes the
@@ -128,6 +114,18 @@ own; the two do not move together, and that is deliberate.
   Contract: `quasar-protocol` amendment 6.
 
 ### Fixed
+- The bench harness no longer reports a healthy stream as black. The peer's luma probe
+  judges a 160x90 canvas with thresholds calibrated on full-frame content, and
+  `Quasar Bench: Ball` is a 20px-radius ball — about 0.06% of a 1080p frame — so a
+  perfectly good Ball stream read `mean=3.5 sd=0.00 "first content never"`, which is
+  indistinguishable from a black picture. Because Ball is the default bench app on more
+  than one host, the same false reading appeared on both the AMD/VA and the 5090/Vulkan
+  paths and looked like a confirmed cross-platform rendering defect; it is what left
+  #128's live gate recording rendering as unproven. Documented in
+  `docs/testing-bench-mode.md`, with the probe's own calibration comment corrected: judge
+  rendering from a full-frame app (Snow, Colour Ripple), and never from Ball.
+
+
 
 - A node agent no longer reports another agent's health as its own (#152). The stack
   uses host networking, so two agents on one machine share `QUASAR_HEALTH_ADDR`; the
