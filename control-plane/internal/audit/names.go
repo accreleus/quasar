@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 )
 
 // Display names for the ids on an audit row. Derived at read time and never
@@ -288,11 +289,17 @@ func (s *Store) collectNames(ctx context.Context, out map[ref]string, k kind, qu
 }
 
 // trimName bounds a pathological name so one row cannot dominate a response.
+// Cut on a rune boundary: a byte slice through a multi-byte name would serialize
+// as a replacement character.
 func trimName(v string) string {
 	const max = 120
 	v = strings.TrimSpace(v)
-	if len(v) > max {
-		return v[:max]
+	if len(v) <= max {
+		return v
 	}
-	return v
+	cut := max
+	for cut > 0 && !utf8.RuneStart(v[cut]) {
+		cut--
+	}
+	return v[:cut]
 }

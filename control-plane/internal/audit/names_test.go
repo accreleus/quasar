@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func detailsOf(t *testing.T, v map[string]any) json.RawMessage {
@@ -222,5 +224,18 @@ func TestTrimNameBoundsAPathologicalName(t *testing.T) {
 	}
 	if got := trimName("  spaced  "); got != "spaced" {
 		t.Fatalf("trimName = %q", got)
+	}
+}
+
+func TestTrimNameCutsOnARuneBoundary(t *testing.T) {
+	// 3-byte runes: byte 120 lands mid-rune, and a byte slice there would
+	// serialize as U+FFFD.
+	long := strings.Repeat("日", 60)
+	got := trimName(long)
+	if !utf8.ValidString(got) {
+		t.Fatalf("trimName produced invalid UTF-8: %q", got)
+	}
+	if len(got) > 120 {
+		t.Fatalf("len = %d, want <= 120", len(got))
 	}
 }
