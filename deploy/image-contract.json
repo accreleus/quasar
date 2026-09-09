@@ -20,7 +20,7 @@
           "vulkan-loader", "vulkan-tools",
           "mesa-va-drivers", "libva",
           "mesa-vulkan-drivers-freeworld", "mesa-va-drivers-freeworld",
-          "libva-intel-media-driver", "libva-utils",
+          "intel-media-driver", "libva-utils",
           "libglvnd", "mesa-libEGL", "mesa-libGLES", "mesa-libGL", "mesa-dri-drivers",
           "alsa-lib", "pulseaudio-libs", "pulseaudio", "pulseaudio-utils",
           "pciutils-libs", "libsrtp",
@@ -34,7 +34,7 @@
           "pulseaudio": "THE DAEMON, not just pulseaudio-libs/-utils. QUASAR_PULSE_IMAGE points at this image; without the daemon binary the agent logs 'silent audio fallback' and every session is mute. This exact package was the 2026-07-26 Tower audio outage.",
           "mesa-vulkan-drivers-freeworld": "Stock Fedora Mesa strips the patent-encumbered encode entrypoints. Without freeworld, RADV has NO Vulkan encode queue and vulkanh264enc registers but cannot encode.",
           "mesa-va-drivers-freeworld": "Same, for the VA encode entrypoints (vah264enc/vah264lpenc).",
-          "libva-intel-media-driver": "iHD, the VA driver for Intel Gen9+. #126: mesa-va-drivers is GALLIUM ONLY (radeonsi/nouveau/virtio/d3d12), so before this package an Intel host had NO VA driver at all -- vaInitialize failed, vah264lpenc never registered, and the codec probe reported an empty set. That is the DEFAULT path on Intel (settings.rs encoder_default_for_vendor maps Intel to VA), so the documented default was unreachable on every Intel host. Whether Fedora's in-distro build keeps the encode entrypoints is unverified on hardware; if `vainfo | grep EncSlice` is empty on a real Intel host, the replacement is rpmfusion-NONFREE `intel-media-driver` and enabling that repo is an operator licensing decision. Do not drop this assertion to make a build green.",
+          "intel-media-driver": "iHD, the VA driver for Intel Gen9+, from rpmfusion-NONFREE. #126: mesa-va-drivers is GALLIUM ONLY (radeonsi/nouveau/virtio/d3d12), so before this an Intel host had NO VA driver at all -- vaInitialize failed, vah264lpenc never registered, and the codec probe reported an empty set. That is the DEFAULT path on Intel (settings.rs encoder_default_for_vendor maps Intel to VA), so the documented default was unreachable on every Intel host. The NONFREE build is the one asserted, not Fedora's in-distro libva-intel-media-driver: both are MIT and BSD, Fedora's source RPM is named intel-media-driver-free, and measured on fc43 Fedora's build is 11.6 MB with 123 AVC/HEVC encode symbol references against this one's 40.5 MB and 516 -- the same patent split already accepted for AMD via mesa-va-drivers-freeworld, on identically licensed code. libva needs no wiring to prefer it: Fedora's libva has /usr/lib64/dri-nonfree:/usr/lib64/dri-freeworld:/usr/lib64/dri compiled in as its search path. Do not drop this assertion to make a build green.",
           "libva-utils": "vainfo, inside the runtime image. It is what settles the iHD encode-entrypoint question above on real hardware, and the encoder_codecs readiness remediation now points at it as the GStreamer-independent way to see the VA entrypoints. The dev stage has carried it for a long time; the runtime stage is where an operator debugging a live host actually is.",
           "ddcutil": "Console local-output mode (CM-08).",
           "hwdata": "Ships /usr/share/hwdata/pci.ids -- the vendor/device id database host-observability GPU model detection falls back to.",
@@ -99,10 +99,12 @@
         "required": [
           "GST_PLUGIN_PATH=/opt/gst/lib64/gstreamer-1.0",
           "QUASAR_HEALTH_ADDR",
-          "VK_LOADER_DRIVERS_DISABLE"
+          "VK_LOADER_DRIVERS_DISABLE",
+          "ANV_DEBUG"
         ],
         "_required_notes": {
-          "VK_LOADER_DRIVERS_DISABLE": "Must exclude lvp_icd (lavapipe). Without it the Vulkan loader can select the software ICD and the encoder silently disappears."
+          "VK_LOADER_DRIVERS_DISABLE": "Must exclude lvp_icd (lavapipe). Without it the Vulkan loader can select the software ICD and the encoder silently disappears.",
+          "ANV_DEBUG": "#126. Mesa's Intel Vulkan driver advertises the whole Vulkan Video extension family ONLY while this is set; unset, an Intel device does not expose VK_KHR_video_queue, every other video extension depends on that one, and GStreamer registers no vulkan video element while vulkansink still appears. Must contain video-encode. It lives in the IMAGE and not only in the agent process so that a `docker exec ... gst-inspect-1.0 vulkanh264enc` sees what the agent sees; an agent-only set makes the first diagnostic anyone runs disagree with the running agent. Inert on AMD and NVIDIA -- no other driver reads it. The agent reconciles this against QUASAR_INTEL_VULKAN_VIDEO at startup, which is the supported way to turn it off."
         }
       },
 
