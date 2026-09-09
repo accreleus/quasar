@@ -1114,8 +1114,14 @@ mod tests {
     fn anv_debug_is_a_noop_when_both_flags_are_already_present() {
         // No set_var, so an operator who configured this themselves sees no log line and
         // no rewritten value.
-        assert_eq!(anv_debug_with_video(Some("video-decode,video-encode")), None);
-        assert_eq!(anv_debug_with_video(Some("video-encode,video-decode")), None);
+        assert_eq!(
+            anv_debug_with_video(Some("video-decode,video-encode")),
+            None
+        );
+        assert_eq!(
+            anv_debug_with_video(Some("video-encode,video-decode")),
+            None
+        );
         assert_eq!(
             anv_debug_with_video(Some("video-encode,no-gpl,video-decode")),
             None
