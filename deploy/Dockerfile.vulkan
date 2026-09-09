@@ -769,6 +769,12 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     systemd-libs libX11 \
     vulkan-loader vulkan-tools \
     mesa-va-drivers libva \
+    # vainfo. It is what settles the iHD encode-entrypoint question on real hardware, and the
+    # encoder_codecs readiness remediation points at it as the GStreamer-independent way to see
+    # the VA entrypoints. The dev stage has carried it for a long time; the runtime stage is
+    # where an operator debugging a live host actually is. (The Intel VA DRIVER itself is not
+    # here -- it needs a repo enabled further down; see the RPM Fusion block.)
+    libva-utils \
     libglvnd libglvnd-egl mesa-libEGL mesa-libGLES mesa-libGL mesa-dri-drivers \
     # The unified image also serves as the per-session PulseAudio sidecar.
     # pulseaudio-utils provides pactl/pacat but not the daemon executable;
@@ -822,19 +828,38 @@ RUN dnf install -y --setopt=install_weak_deps=False \
     #
     # `--allowerasing` REMOVES stock mesa-vulkan-drivers. That is why this is in the same
     # RUN as the install above: erased in a later layer, its ~153 MB would still ship.
+    #
+    # NONFREE IS ENABLED HERE TOO, FOR ONE PACKAGE: intel-media-driver, the Intel VA driver
+    # (#126). Two facts make that a smaller step than the repo name suggests. mesa-va-drivers
+    # is GALLIUM ONLY -- radeonsi/nouveau/virtio/d3d12 -- so before this an Intel host had NO
+    # VA driver at all: vaInitialize failed, vah264lpenc never registered, and the codec probe
+    # came back empty, on the path that IS Intel's vendor default (settings.rs
+    # encoder_default_for_vendor). And the split between Fedora's build and this one is the
+    # same patent question already answered "yes" for AMD one line up, on identically licensed
+    # code -- both packages are MIT and BSD, and Fedora's source RPM is literally named
+    # `intel-media-driver-free`. Measured on fc43, its build is 11.6 MB with 123 AVC/HEVC
+    # encode symbol references against this one's 40.5 MB and 516.
+    #
+    # libva needs no wiring to prefer it: Fedora's libva has the search path
+    #     /usr/lib64/dri-nonfree:/usr/lib64/dri-freeworld:/usr/lib64/dri
+    # compiled in, and this package installs into the first of those. iHD covers Gen9+
+    # (Skylake onward) and libva picks it by PCI id, so no LIBVA_DRIVER_NAME either.
+    # Confirm on real hardware with: docker exec <agent> vainfo | grep -i Enc
     dnf install -y "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm" \
+                   "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm" \
       && dnf install -y --allowerasing --skip-unavailable \
           mesa-vulkan-drivers-freeworld.x86_64 \
-          mesa-va-drivers-freeworld.x86_64 ; \
+          mesa-va-drivers-freeworld.x86_64 \
+          intel-media-driver.x86_64 ; \
     dnf clean all && rm -rf /var/cache/dnf ; \
     sed -i 's/^hosts:.*/hosts:      files myhostname mdns4_minimal [NOTFOUND=return] resolve [!UNAVAIL=return] dns/' /etc/nsswitch.conf ; \
     sed -i -e 's/^#*enable-dbus=.*/enable-dbus=no/' \
            -e 's/^#*disable-publishing=.*/disable-publishing=yes/' /etc/avahi/avahi-daemon.conf ; \
     # Fail LOUDLY if the single-layer restructure lost anything the contract requires.
-    # These four are the packages whose absence has actually caused an outage or a
+    # These are the packages whose absence has actually caused an outage or a
     # "no encoder found" report, so they are checked here, at the point of install,
     # in addition to deploy/image-contract.json checking the finished image.
-    rpm -q pulseaudio mesa-vulkan-drivers-freeworld mesa-va-drivers-freeworld avahi || exit 1 ; \
+    rpm -q pulseaudio mesa-vulkan-drivers-freeworld mesa-va-drivers-freeworld intel-media-driver avahi || exit 1 ; \
     # -- Runtime image trim (2026-08-20): ~250 MB, IN THIS LAYER --------------------
     # Three groups of packages that are pulled in as transitive dependencies, are
     # never used by any Quasar code path, and together weigh ~210 MB. Each is removed
@@ -957,6 +982,24 @@ ENV PATH=/opt/gst/bin:$PATH
 # it cannot encode video anyway, so there is never a reason to let it load in this image. Runtime
 # override allowed (unset this if a future debug need actually wants lavapipe present).
 ENV VK_LOADER_DRIVERS_DISABLE="*lvp_icd*"
+# Mesa's Intel Vulkan driver hides the ENTIRE Vulkan Video extension family behind this opt-in
+# instance debug flag (#126). Unset, an Intel physical device does not advertise
+# VK_KHR_video_queue; every other video extension declares that one as its dependency, so
+# GStreamer's device open logs "Could not enable extension VK_KHR_video_queue" and registers NO
+# vulkan video element -- while vulkansink still registers, because the device itself opened
+# fine. The host then looks like a healthy GPU whose encoder supports nothing.
+#
+# Set in the IMAGE, not only by the agent, for two reasons. A `docker exec ... gst-inspect-1.0
+# vulkanh264enc` inherits image env but not another process's env, so an agent-only set makes
+# the first diagnostic anyone runs disagree with the running agent. And it covers the case where
+# the agent cannot identify the vendor (no readable DRM node in the container). The agent still
+# reconciles this against QUASAR_INTEL_VULKAN_VIDEO at startup, which is how an operator turns
+# it back off.
+#
+# `video-encode` only: KHR_video_queue needs just one of the two bits, Quasar never decodes on
+# the host, and `video-decode` would register ANV's decode elements for nothing. Inert on AMD
+# and NVIDIA -- no driver but ANV reads this variable.
+ENV ANV_DEBUG="video-encode"
 ENV QUASAR_HEALTH_ADDR=127.0.0.1:9091
 ENV NODE_SECRET_PATH=/var/lib/quasar-agent/node-secret
 ENV XDG_RUNTIME_DIR=/run/quasar-agent
@@ -1175,10 +1218,15 @@ RUN rustup component add rustfmt clippy
 # Fedora Mesa strips the patent-encumbered encode entrypoints). Needed so a weston app-container
 # and the compose agent can drive the GPU. The `.x86_64` pin + --allowerasing are mandatory (see
 # the runtime stage's note) to avoid dnf silently resolving only the 32-bit driver.
+# intel-media-driver rides along for the same reason it is in the runtime stage: Mesa's VA
+# drivers are gallium-only, so without iHD an Intel host has no VA driver at all (#126). See
+# the runtime stage's RPM Fusion block for why the nonfree build is the one taken.
 RUN dnf install -y "https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm" \
+                   "https://mirrors.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm" \
     && dnf install -y --allowerasing --skip-unavailable \
         mesa-vulkan-drivers-freeworld.x86_64 \
         mesa-va-drivers-freeworld.x86_64 \
+        intel-media-driver.x86_64 \
     && dnf clean all
 
 # Weston + a visibly-rendering demo client (weston-terminal; the SHM flower/smoke clients render
@@ -1229,6 +1277,8 @@ RUN set -eux; \
 
 # Same lavapipe suppression as the runtime target (a software Vulkan ICD collides on init).
 ENV VK_LOADER_DRIVERS_DISABLE="*lvp_icd*"
+# Same Intel Vulkan Video opt-in as the runtime stage; see its note there.
+ENV ANV_DEBUG="video-encode"
 
 # Build-time verification: the dev image exposes the same device-free elements the runtime target
 # checks, PLUS the weston demo client and the toolchain (this image doubles as the cargo build env).
