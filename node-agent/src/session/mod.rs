@@ -1112,7 +1112,10 @@ mod tests {
     #[test]
     fn anv_debug_adds_the_encode_flag_when_absent() {
         assert_eq!(anv_debug_for(None, true).as_deref(), Some("video-encode"));
-        assert_eq!(anv_debug_for(Some(""), true).as_deref(), Some("video-encode"));
+        assert_eq!(
+            anv_debug_for(Some(""), true).as_deref(),
+            Some("video-encode")
+        );
     }
 
     #[test]
