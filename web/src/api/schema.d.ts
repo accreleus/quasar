@@ -7885,6 +7885,8 @@ export interface components {
             compare_url: string | null;
             /** @description The release manifest asset verbatim. NULL ON EDGE, which publishes no asset. */
             manifest: components["schemas"]["ReleaseManifest"] | null;
+            /** @description ADDITIVE, amendment 6 (#153). True when applying this release runs at least one migration on this instance - its schema_version is above the installed control plane's. THE ONE THING that decides whether a fleet apply's control-plane step drains the instance (see the apply section), so it is DERIVED AND SERVED rather than left to a client to re-derive, exactly as identity_known is: a client twin of the rule would keep naming the old policy after the rule moved. Always present. With no release to apply, read the cautious answer, true. */
+            migrates: boolean;
             /**
              * Format: date-time
              * @description When THIS instance first saw the release. Provenance, not ordering - two instances can legitimately disagree.
@@ -8016,10 +8018,10 @@ export interface components {
          */
         ApplyAttemptState: "queued" | "waiting_sessions" | "pending" | "pulling" | "recreating" | "verifying" | "succeeded" | "failed" | "cancelled";
         /**
-         * @description Why an attempt failed. A CLOSED vocabulary of STABLE IDENTIFIERS the UI maps to text, shared verbatim with agent-api.md release_state.reason and with the release_apply ack's error, so ONE client-side mapping serves the wire, this API and the history. Non-null exactly when the state is failed. "unsupported" is written by the control plane and never sent on the wire: no ack arrived within the 10s ack timeout, so the agent build predates the amendment. A client meeting an unrecognized value renders it verbatim. Full per-value semantics: agent-api.md §release_state.
+         * @description Why an attempt failed. A CLOSED vocabulary of STABLE IDENTIFIERS the UI maps to text, shared verbatim with agent-api.md release_state.reason and with the release_apply ack's error, so ONE client-side mapping serves the wire, this API and the history. Non-null exactly when the state is failed. "unsupported" is written by the control plane and never sent on the wire: no ack arrived within the 10s ack timeout, so the agent build predates the amendment. A client meeting an unrecognized value renders it verbatim. "signature_missing" and "signature_invalid" are amendment 5's two APPENDED values (#120): a host that requires a signed release met an unsigned one, and a manifest signature that did not verify (bad signature, untrusted key, digests not named by the signed manifest, a signature that could not be fetched, or verification on with no trusted keys - all fail closed). Signature verification is OFF BY DEFAULT (ADR 0003), so neither occurs unless an operator turns it on. Full per-value semantics: agent-api.md §release_state.
          * @enum {string}
          */
-        ApplyFailureReason: "updater_absent" | "busy" | "invalid" | "namespace_rejected" | "digest_malformed" | "pull_failed" | "recreate_failed" | "never_started" | "unhealthy" | "updater_unreachable" | "timeout" | "unsupported";
+        ApplyFailureReason: "updater_absent" | "busy" | "invalid" | "namespace_rejected" | "digest_malformed" | "pull_failed" | "recreate_failed" | "never_started" | "unhealthy" | "updater_unreachable" | "timeout" | "unsupported" | "signature_missing" | "signature_invalid";
         /** @description One component of a platform release, pinned. Same shape as ReleaseManifestComponent and as agent-api.md release_apply.components. */
         ApplyComponentDigest: {
             /** @description The component. Only "node-agent" is ever sent to a host; "control-plane" is applied by the updater beside the control plane and never over an agent connection. */
@@ -8076,7 +8078,7 @@ export interface components {
             state: components["schemas"]["ApplyAttemptState"];
             /** @description Non-null exactly when state is failed. */
             reason: components["schemas"]["ApplyFailureReason"] | null;
-            /** @description The N in "waiting on N sessions": the last observed non-terminal session count while state is waiting_sessions - ON THIS HOST for a host target, and FLEET-WIDE for the control-plane target, because recreating the control plane drops every agent's connection and an agent stops its sessions when that connection drops. A CLIENT MUST SHOW IT IN A FORCE CONFIRMATION - force is the operator agreeing to end N live sessions, and a confirmation that does not name N is not informed consent. Advisory and last-observed, never a gate. Null once the attempt has been sent. */
+            /** @description The N in "waiting on N sessions": the last observed non-terminal session count while state is waiting_sessions - ON THIS HOST for a host target, and FLEET-WIDE for the control-plane target, whose recreate is instance-wide. On a control-plane target it is set ONLY when the release's migrates is true (amendment 6, #153): a recreate alone no longer ends a running session, so a non-migrating control-plane attempt never enters waiting_sessions and leaves this null throughout. A CLIENT MUST SHOW IT IN A FORCE CONFIRMATION - force is the operator agreeing to end N live sessions, and a confirmation that does not name N is not informed consent. Advisory and last-observed, never a gate. Null once the attempt has been sent. */
             sessions_remaining: number | null;
             /** @description Skip the zero-sessions wait and stop what is running. The agent does no session logic on it: it records which decision the control plane made. */
             force: boolean;
@@ -8133,7 +8135,7 @@ export interface components {
              */
             release_id: string;
             /**
-             * @description Applies to EVERY target in this run, the control plane included: its recreate ends every session on the instance, so without force the control-plane step waits for the whole fleet to drain.
+             * @description Applies to EVERY target in this run, the control plane included. Skips each host's zero-sessions wait, and - on a release whose migrates is true - makes the control-plane step STOP the instance's sessions and wait for zero rather than wait for them to end on their own (amendment 6, #153; force still means the operator is agreeing to end N live sessions). A non-migrating control-plane step has no such wait to skip: a recreate alone no longer ends a running session.
              * @default false
              */
             force: boolean;

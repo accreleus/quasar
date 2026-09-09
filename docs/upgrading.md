@@ -665,7 +665,7 @@ notification signing secret** (or set
 ```
 X-Quasar-Timestamp:     1757295611
 X-Quasar-Signature-256: sha256=<hex HMAC-SHA256(secret, "<timestamp>.<raw body>")>
-X-Quasar-Delivery:      <unique per POST; deduplicate on it if you like>
+X-Quasar-Delivery:      <one per notification, repeated across its retries — dedupe on it>
 ```
 
 Verify by recomputing over the **raw** body you received and comparing in

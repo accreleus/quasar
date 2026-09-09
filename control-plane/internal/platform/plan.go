@@ -145,7 +145,10 @@ func activeApply(run *ApplyRun, attempts []Attempt) *ActiveApply {
 // which refuses a release BELOW the control plane. The fleet run's
 // control-plane drain branches on this (#153, apply_fleet.go prepareFleet).
 //
-// Client twin: web/src/pages/admin/fleet/releasesCopy.ts releaseRunsAMigration.
+// There is deliberately NO client twin: the answer is served on every listed
+// release as `migrates` (see Release.Migrates), because the drain policy is the
+// server's and a client re-deriving it would go on telling an operator what
+// they are consenting to after the policy moved.
 func ReleaseRunsAMigration(r Release, schemaVersion int) bool {
 	return r.SchemaVersion > schemaVersion
 }
@@ -184,6 +187,9 @@ func offerable(rows []Release, channel string, cp buildinfo.Identity) []Release 
 		if channel != ChannelEdge && len(r.Manifest) == 0 {
 			continue
 		}
+		// Derived here because this is where the control plane's own schema
+		// version is in hand, and every served release comes through this filter.
+		r.Migrates = ReleaseRunsAMigration(r, cp.SchemaVersion)
 		out = append(out, r)
 	}
 	return sortOfferable(out, channel)
