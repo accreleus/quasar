@@ -141,6 +141,20 @@ own; the two do not move together, and that is deliberate.
 
 
 
+- **Intel hosts now ship a VA driver** (#126). `mesa-va-drivers` is gallium only
+  (radeonsi/nouveau/virtio/d3d12), so libva had nothing to load on an Intel GPU:
+  `vaInitialize` failed, `vah264lpenc` never registered, and the agent's startup
+  codec probe reported an empty set — on the path that is the *documented default*
+  for Intel. The readiness card said the host had a GPU but advertised no codecs,
+  which was accurate and unhelpful. The runtime and dev images now carry
+  `libva-intel-media-driver` (iHD, Gen9+) plus `libva-utils`, so `vainfo` is
+  available inside the agent container for the check the readiness remediation
+  asks for. Whether Fedora's in-distro iHD keeps the encode entrypoints is not yet
+  confirmed on hardware; if `vainfo | grep EncSlice` comes back empty on a real
+  Intel host, the replacement is `intel-media-driver` from RPM Fusion nonfree.
+  Vulkan encode on Intel is a separate, still-open question and is not addressed
+  here.
+
 - A node agent no longer reports another agent's health as its own (#152). The stack
   uses host networking, so two agents on one machine share `QUASAR_HEALTH_ADDR`; the
   loser of that bind kept running while its container `HEALTHCHECK` — and any operator
