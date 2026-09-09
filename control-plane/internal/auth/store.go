@@ -633,32 +633,36 @@ func (s *store) updateUser(ctx context.Context, id string, role *string, disable
 //   - no non-terminal sessions may remain        → ErrUserHasActiveSessions
 //
 // Self-deletion is refused at the handler (it knows the caller identity).
-func (s *store) deleteUser(ctx context.Context, id string) ([]string, error) {
+//
+// Returns the hosts to nudge AND the deleted account's username: the audit row
+// the caller writes is the only place that name still exists once this commits,
+// and read-time resolution can never recover it.
+func (s *store) deleteUser(ctx context.Context, id string) ([]string, string, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("begin delete tx: %w", err)
+		return nil, "", fmt.Errorf("begin delete tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck — no-op after commit
 
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, adminDemoteAdvisoryLock); err != nil {
-		return nil, fmt.Errorf("delete advisory lock: %w", err)
+		return nil, "", fmt.Errorf("delete advisory lock: %w", err)
 	}
 
-	var role string
-	err = tx.QueryRow(ctx, `SELECT role FROM users WHERE id::text = $1`, id).Scan(&role)
+	var role, username string
+	err = tx.QueryRow(ctx, `SELECT role, username FROM users WHERE id::text = $1`, id).Scan(&role, &username)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrUserNotFound
+		return nil, "", ErrUserNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("check user: %w", err)
+		return nil, "", fmt.Errorf("check user: %w", err)
 	}
 	if role == RoleAdmin {
 		var admins int
 		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE role = 'admin'`).Scan(&admins); err != nil {
-			return nil, fmt.Errorf("count admins: %w", err)
+			return nil, "", fmt.Errorf("count admins: %w", err)
 		}
 		if admins <= 1 {
-			return nil, ErrLastAdmin
+			return nil, "", ErrLastAdmin
 		}
 	}
 
@@ -667,10 +671,10 @@ func (s *store) deleteUser(ctx context.Context, id string) ([]string, error) {
 		SELECT COUNT(*) FROM sessions
 		WHERE user_id::text = $1 AND state NOT IN ('stopped','failed')
 	`, id).Scan(&active); err != nil {
-		return nil, fmt.Errorf("count active sessions: %w", err)
+		return nil, "", fmt.Errorf("count active sessions: %w", err)
 	}
 	if active > 0 {
-		return nil, ErrUserHasActiveSessions
+		return nil, "", ErrUserHasActiveSessions
 	}
 
 	// Tombstone all of the user's homes before deleting the user row (P5-05).
@@ -690,14 +694,14 @@ func (s *store) deleteUser(ctx context.Context, id string) ([]string, error) {
 			ARRAY[]::text[])
 		FROM tombstoned
 	`, id).Scan(&hostIDs); err != nil {
-		return nil, fmt.Errorf("tombstone user homes: %w", err)
+		return nil, "", fmt.Errorf("tombstone user homes: %w", err)
 	}
 
 	if _, err := tx.Exec(ctx, `DELETE FROM users WHERE id::text = $1`, id); err != nil {
-		return nil, fmt.Errorf("delete user: %w", err)
+		return nil, "", fmt.Errorf("delete user: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return hostIDs, nil
+	return hostIDs, username, nil
 }

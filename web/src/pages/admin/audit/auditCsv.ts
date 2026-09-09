@@ -3,8 +3,11 @@
 
 import type { AdminActivityItem } from "../../../api/admin";
 import { actorLabel } from "./auditFilters";
+import { targetLabel } from "./describe";
 
-const HEADER = "time,actor,action,target_type,target_id,severity,details";
+// target_name sits beside target_id, never instead of it: a spreadsheet is read
+// by a human and pivoted by an id.
+const HEADER = "time,actor,action,target_type,target_id,target_name,severity,details";
 
 /** RFC 4180: quote only a field that needs it (holds a comma, quote or
  *  newline), doubling any embedded quote. */
@@ -20,6 +23,7 @@ function csvRow(item: AdminActivityItem): string {
     item.action,
     item.target_type,
     item.target_id ?? "",
+    item.target_id ? targetLabel(item) : "",
     item.severity,
     JSON.stringify(item.details ?? {}),
   ]

@@ -10,6 +10,7 @@
 import { useNavigate } from "react-router-dom";
 import type { AdminActivityItem } from "../../../api/admin";
 import { ResourceStates } from "../../../components/ResourceStates";
+import { targetLabel } from "../audit/describe";
 
 export interface RecentActivityCardProps {
   items: AdminActivityItem[];
@@ -73,13 +74,6 @@ export function clockTime(at: string): string {
     minute: "2-digit",
     second: "2-digit",
   });
-}
-
-/** `target_type` plus a short id — the full uuid would push the row off the
- *  card, and the Audit page carries it in full. */
-export function targetLabel(item: AdminActivityItem): string {
-  if (!item.target_id) return item.target_type;
-  return `${item.target_type} ${item.target_id.slice(0, 8)}`;
 }
 
 function severityColor(severity: AdminActivityItem["severity"]): string {

@@ -1,7 +1,7 @@
 // One audit-log row: the summary <tr> plus its hidden detail <tr>
-// (handoff-v3-spec §A.20). Action strings are server-authored and dotted
-// (`app.update`); known ones map to sentences, the rest are humanised so a
-// new action never vanishes from the Detail column.
+// (handoff-v3-spec §A.20). Everything that turns the row's ids into words —
+// the sentence, the key=value summary, the annotated readout — lives in
+// describe.ts; this file is the markup.
 
 import { useEffect, useRef, useState } from "react";
 import type { AdminActivityItem, AdminActivitySeverity } from "../../../api/admin";
@@ -9,70 +9,14 @@ import { Button } from "../../../components/Button";
 import type { ChipVariant } from "../../../components/Chip";
 import { Chip } from "../../../components/Chip";
 import { IconCheck, IconChevronRight, IconCopy } from "../../../components/icons";
-import { actorLabel, targetLabel } from "./auditFilters";
-
-const ACTION_LABELS: Record<string, string> = {
-  "app.create": "Created app",
-  "app.update": "Updated app",
-  "app.delete": "Deleted app",
-  "host.drain": "Drained host",
-  "host.uncordon": "Resumed scheduling",
-  "host.delete": "Forgot host",
-  "host.restart": "Restarted agent",
-  "host.settings.update": "Updated host settings",
-  "host.console.update": "Updated console settings",
-  "user.create": "Created user",
-  "user.update": "Updated user",
-  "user.delete": "Deleted user",
-  "invite.create": "Created invite",
-  "invite.revoke": "Revoked invite",
-  "session.force_stop": "Force-stopped session",
-  "settings.update": "Updated settings",
-  // Keys must match the server's emitted strings exactly (storage/handler.go
-  // etc.) — a stale key silently falls through to humanise().
-  "storage.home.tombstone": "Marked home for cleanup",
-  "stream_profile.create": "Created stream profile",
-  "stream_profile.update": "Updated stream profile",
-  "stream_profile.delete": "Deleted stream profile",
-  "launch_profile.create": "Created launch profile",
-  "launch_profile.update": "Updated launch profile",
-  "launch_profile.delete": "Deleted launch profile",
-};
-
-/** Humanise an unmapped action: "thing.some_verb" → "Thing some verb". */
-function humanise(action: string): string {
-  const words = action.replace(/[._]/g, " ").trim();
-  return words.charAt(0).toUpperCase() + words.slice(1);
-}
-
-export function actionLabel(action: string): string {
-  return ACTION_LABELS[action] ?? humanise(action);
-}
+import { actorLabel } from "./auditFilters";
+import { detailReadout, summaryLine, targetLabel } from "./describe";
 
 const SEVERITY_VARIANT: Record<AdminActivitySeverity, ChipVariant> = {
   err: "danger",
   warn: "warning",
   info: "neutral",
 };
-
-const NO_DETAIL = "No additional detail was recorded for this action.";
-
-function isEmptyDetail(details: unknown): boolean {
-  if (details === null || details === undefined) return true;
-  if (typeof details === "object" && !Array.isArray(details)) {
-    return Object.keys(details as Record<string, unknown>).length === 0;
-  }
-  return false;
-}
-
-function prettyDetail(details: unknown): string {
-  if (isEmptyDetail(details)) return NO_DETAIL;
-  try {
-    return JSON.stringify(details, null, 2);
-  } catch {
-    return String(details);
-  }
-}
 
 /** Local 24-hour HH:MM:SS — `hour12:false` so a PM row never grows an AM/PM
  *  suffix past the 88px Time column, and so the string is deterministic
@@ -86,17 +30,6 @@ function auditTime(iso: string): string {
     minute: "2-digit",
     second: "2-digit",
   });
-}
-
-/** The console readout's full text: the raw action/target/actor lines the
- *  mock's `detailFull` blocks open with, then the pretty-printed payload. */
-export function detailReadout(item: AdminActivityItem): string {
-  const lines = [
-    `action  ${item.action}`,
-    `target  ${targetLabel(item)}`,
-    `actor   ${actorLabel(item)}`,
-  ];
-  return `${lines.join("\n")}\n\n${prettyDetail(item.details)}`;
 }
 
 /** `copyAudit`'s clipboard text: "{time}  {actor}  {action}  {target}\n{pre}". */
@@ -173,7 +106,7 @@ export function AuditRow({ item, expanded, onToggle }: AuditRowProps) {
           </Chip>
         </td>
         <td className="primary">{targetLabel(item)}</td>
-        <td className="aud-summary mono">{actionLabel(item.action)}</td>
+        <td className="aud-summary mono">{summaryLine(item)}</td>
         <td onClick={(e) => e.stopPropagation()}>
           <div className="cell-actions">
             <button type="button" className="icon-btn" title="Copy entry" onClick={handleCopy}>

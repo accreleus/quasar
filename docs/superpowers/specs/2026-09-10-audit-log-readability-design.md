@@ -123,10 +123,11 @@ Six delete/tombstone sites already stamp a name. Two gaps:
 - `launch_profile.delete` stamps a name only when a pre-delete `Get` happened to
   succeed. Mirror what `stream_profile.delete` does.
 
-And one addition that is not a gap but is worth its two lines: `session.launched`
-stamps `app_name` and `host_name` alongside the ids it already writes. An app can
-be hard-deleted, and when it is, every historical launch of it should still say
-which app it was.
+Considered and rejected: stamping `app_name`/`host_name` on `session.launched`.
+`LaunchResult` carries neither, so it would mean an extra query on the launch
+path, which is latency-sensitive, to cover only the case where the app is later
+hard-deleted - and `app.delete` already stamps the name, so the log still holds
+the answer.
 
 No contract change — `details` is free-form jsonb.
 

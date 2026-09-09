@@ -7662,6 +7662,10 @@ export interface components {
              * @enum {string}
              */
             severity: "info" | "warn" | "err";
+            /** @description Display names for the identifiers on this row - `target_id` and the allowlisted id keys inside `details` - keyed by the raw id AS IT APPEARS on the row, so a client looks up `names[target_id]` or `names[details.app_id]` with no transformation. Always present, never null; `{}` when the row references nothing nameable. An id with no resolvable name is ABSENT: absence is the miss, there is no sentinel. DERIVED SERVER-SIDE at read time and never stored, for the same reason `actor_username` is - the log is append-only, so a rename must show the current name. Where read time cannot answer because the entity was hard-deleted, the value falls back to the name the emitter stamped into `details` at write time (`name` / `node_name` / `username` / `app_name`), for the TARGET only. So the guarantee is: the entity's current name, else the name it had when the event happened, else absent - and a client must not try to tell the first two apart. See control-api.md "Audit-log names" for which target types and detail keys resolve; that set is server-side detail and may grow without a schema change. */
+            names: {
+                [key: string]: string;
+            };
         };
         AdminActivityList: {
             items: components["schemas"]["AdminActivity"][];

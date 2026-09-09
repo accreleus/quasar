@@ -112,6 +112,23 @@ own; the two do not move together, and that is deliberate.
   #128 nothing else would have satisfied. Even a non-migrating step gives a launch already
   in flight a moment to land, because that is the one session a restart still loses.
   Contract: `quasar-protocol` amendment 6.
+- **The audit log names the things it is talking about.** Every row served by
+  `GET /v1/admin/activity` now carries a `names` map — id to display name — covering both
+  the row's target and the identifiers inside `details`, so a `session.launched` entry that
+  used to read `session 85d0b6a9` over `{"app_id": "8b1116c8-…", "host_id": "4daeaa27-…"}`
+  now says *Steam* and *gpu-test*. The ids are unchanged and still shown in full in the
+  expanded readout and the CSV: an id is what you paste into a query, a name is what tells
+  you what you are looking at, and the log now carries both. Resolved at read time, like
+  `actor_username`, so a rename shows the current name; where the entity has been deleted
+  the name the emitter stamped at write time is served instead, which is what lets a
+  `user.deleted` or `app.delete` row still say *whose* account or *which* app. Deleting a
+  user now records the username for exactly that reason. On the page: the Target column
+  shows the name, the Detail column shows the mock's `key=value` summary
+  (`app=Steam host=gpu-test`) instead of a repeat of the action, the expanded pane opens
+  with a plain-English sentence, and the action labels behind it were rebuilt from the
+  actions the server actually emits — nine of the old ones named actions that no longer
+  exist. CSV export gains a `target_name` column beside `target_id`.
+  Contract: `quasar-protocol` "Audit-log names" amendment (additive, no migration).
 
 ### Fixed
 - A fleet update no longer fails because a host was offline (#169, #170). Found by a

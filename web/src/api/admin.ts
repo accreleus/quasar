@@ -105,6 +105,13 @@ export interface AdminActivityItem {
   actor_username: string | null;
   /** Derived server-side from `action` — never stored, never client-supplied. */
   severity: AdminActivitySeverity;
+  /** Display names for the ids on this row — `target_id` and the allowlisted id
+   *  keys inside `details` — keyed by the raw id as it appears on the row.
+   *  Resolved at read time; an id with no name is ABSENT, there is no sentinel.
+   *  A present name is the entity's current name, or the one it had when the
+   *  event happened; those two are deliberately indistinguishable.
+   *  (control-api.md "Audit-log names".) */
+  names: Record<string, string>;
 }
 
 export type AdminActivitySeverity = "info" | "warn" | "err";
