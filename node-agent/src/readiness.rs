@@ -1588,7 +1588,9 @@ const ENCODER_CODECS_REMEDIATION: &str =
      (AMD/Intel), and check the agent log for the `codec support probed` line. `vainfo`, also in \
      the image, lists the VA entrypoints independently of GStreamer. On an Intel host the vulkan \
      elements additionally need `ANV_DEBUG=video-encode`, which this image bakes in — prefix the \
-     gst-inspect with it by hand if the agent is still running an older image.";
+     gst-inspect with it by hand if the agent is still running an older image. Either way point \
+     `GST_REGISTRY` at a scratch path for that gst-inspect: the image's registry was built with no \
+     GPU present, so device-probing elements are absent from it by construction.";
 
 // ── (#483) media reachability: host firewall vs WebRTC ICE UDP ─────────────────
 //

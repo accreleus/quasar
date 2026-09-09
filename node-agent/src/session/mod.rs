@@ -913,11 +913,26 @@ const INTEL_VULKAN_VIDEO_VAR: &str = "QUASAR_INTEL_VULKAN_VIDEO";
 /// registration, and Mesa reads the variable once, when the instance is created.
 ///
 /// Scope worth knowing before trusting the path. Mesa ships the flag off and does not
-/// treat ANV Vulkan Video as validated. And encode is `verx10 < 125`, so Gen12.0
-/// integrated parts qualify while DG2/Arc and newer do not and still need VA to encode.
+/// treat ANV Vulkan Video as validated. In the pinned Mesa the encode extensions are
+/// gated only on the flag and on the driver being built with the H.264/H.265 encode
+/// codecs (`anv_physical_device.c`), not on a platform generation; which Intel parts
+/// actually expose a usable encode queue is not established here, and nobody on the
+/// project has the hardware. Gen12 integrated parts are the expected target; DG2/Arc
+/// is untested.
 fn apply_intel_vulkan_video_knob() {
     let enabled = intel_vulkan_video_enabled(std::env::var(INTEL_VULKAN_VIDEO_VAR).ok().as_deref());
     let existing = std::env::var(ANV_DEBUG_VAR).ok();
+    if !enabled && anv_debug_has_all(existing.as_deref()) {
+        // Mesa's `all` turns on every flag, video included; the only way to honour the
+        // knob would be to guess the full flag list, so say so instead of no-op'ing.
+        tracing::warn!(
+            token = "intel-vulkan-video-all-flag",
+            prior = existing.as_deref().unwrap_or(""),
+            "{INTEL_VULKAN_VIDEO_VAR} is off but {ANV_DEBUG_VAR} contains `all`, which keeps \
+             Vulkan Video on; replace `all` with the specific flags you want"
+        );
+        return;
+    }
     let Some(value) = anv_debug_for(existing.as_deref(), enabled) else {
         return;
     };
@@ -931,17 +946,21 @@ fn apply_intel_vulkan_video_knob() {
         std::env::remove_var(ANV_DEBUG_VAR);
         return;
     }
-    let token = if enabled {
-        "intel-vulkan-video-enabled"
+    if enabled {
+        tracing::info!(
+            token = "intel-vulkan-video-enabled",
+            prior = existing.as_deref().unwrap_or(""),
+            "{ANV_DEBUG_VAR}={value} — Mesa's Intel Vulkan driver advertises Vulkan Video only \
+             while this is set, and no other driver reads it"
+        );
     } else {
-        "intel-vulkan-video-disabled"
-    };
-    tracing::info!(
-        token,
-        prior = existing.as_deref().unwrap_or(""),
-        "{ANV_DEBUG_VAR}={value} — Mesa's Intel Vulkan driver advertises Vulkan Video only while \
-         this is set, and no other driver reads it"
-    );
+        tracing::info!(
+            token = "intel-vulkan-video-disabled",
+            prior = existing.as_deref().unwrap_or(""),
+            "{INTEL_VULKAN_VIDEO_VAR} is off — {ANV_DEBUG_VAR}={value} keeps the other flags but \
+             drops the video ones; on an Intel host no vulkan encoder element can register"
+        );
+    }
     std::env::set_var(ANV_DEBUG_VAR, value);
 }
 
@@ -978,12 +997,7 @@ fn intel_vulkan_video_enabled(raw: Option<&str>) -> bool {
 /// silently lose it. Disabling removes BOTH video flags, including a `video-decode` this
 /// never adds, because the knob's promise is that Vulkan Video is off afterwards.
 fn anv_debug_for(existing: Option<&str>, enabled: bool) -> Option<String> {
-    let mut flags: Vec<&str> = existing
-        .unwrap_or("")
-        .split(',')
-        .map(str::trim)
-        .filter(|f| !f.is_empty())
-        .collect();
+    let mut flags: Vec<&str> = anv_debug_flags(existing);
     let before = flags.len();
     if enabled {
         if flags.contains(&ANV_VIDEO_FLAG) {
@@ -997,6 +1011,23 @@ fn anv_debug_for(existing: Option<&str>, enabled: bool) -> Option<String> {
         }
     }
     Some(flags.join(","))
+}
+
+/// Split `ANV_DEBUG` the way Mesa does (`u_debug.c`: comma, space or newline separated).
+/// Splitting on commas alone would let `ANV_DEBUG="no-sparse video-encode"` hide the
+/// video flag from the off-switch.
+fn anv_debug_flags(existing: Option<&str>) -> Vec<&str> {
+    existing
+        .unwrap_or("")
+        .split([',', ' ', '\n', '\t'])
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .collect()
+}
+
+/// Mesa's `all` token enables every flag, the video ones included.
+fn anv_debug_has_all(existing: Option<&str>) -> bool {
+    anv_debug_flags(existing).contains(&"all")
 }
 
 /// Parse an `i32` env var, keeping only strictly-positive values (empty/junk ⇒ default).
@@ -1137,6 +1168,29 @@ mod tests {
         // ...and disabling on a host that never had the flag is equally silent.
         assert_eq!(anv_debug_for(Some("no-sparse"), false), None);
         assert_eq!(anv_debug_for(None, false), None);
+    }
+
+    #[test]
+    fn anv_debug_splits_on_every_separator_mesa_accepts() {
+        // Mesa's parser splits on comma, space and newline; a hand-set value using
+        // spaces must not hide the video flag from the off-switch (or duplicate it on).
+        assert_eq!(
+            anv_debug_for(Some("no-sparse video-encode"), false).as_deref(),
+            Some("no-sparse")
+        );
+        assert_eq!(anv_debug_for(Some("no-sparse video-encode"), true), None);
+        assert_eq!(
+            anv_debug_for(Some("no-sparse\nvideo-decode"), false).as_deref(),
+            Some("no-sparse")
+        );
+    }
+
+    #[test]
+    fn anv_debug_all_is_detected_so_the_off_switch_can_warn_instead_of_noop() {
+        assert!(anv_debug_has_all(Some("all")));
+        assert!(anv_debug_has_all(Some("no-sparse,all")));
+        assert!(!anv_debug_has_all(Some("video-encode")));
+        assert!(!anv_debug_has_all(None));
     }
 
     #[test]

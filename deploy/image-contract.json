@@ -100,11 +100,11 @@
           "GST_PLUGIN_PATH=/opt/gst/lib64/gstreamer-1.0",
           "QUASAR_HEALTH_ADDR",
           "VK_LOADER_DRIVERS_DISABLE",
-          "ANV_DEBUG"
+          "ANV_DEBUG=video-encode"
         ],
         "_required_notes": {
           "VK_LOADER_DRIVERS_DISABLE": "Must exclude lvp_icd (lavapipe). Without it the Vulkan loader can select the software ICD and the encoder silently disappears.",
-          "ANV_DEBUG": "#126. Mesa's Intel Vulkan driver advertises the whole Vulkan Video extension family ONLY while this is set; unset, an Intel device does not expose VK_KHR_video_queue, every other video extension depends on that one, and GStreamer registers no vulkan video element while vulkansink still appears. Must contain video-encode. It lives in the IMAGE and not only in the agent process so that a `docker exec ... gst-inspect-1.0 vulkanh264enc` sees what the agent sees; an agent-only set makes the first diagnostic anyone runs disagree with the running agent. Inert on AMD and NVIDIA -- no other driver reads it. The agent reconciles this against QUASAR_INTEL_VULKAN_VIDEO at startup, which is the supported way to turn it off."
+          "ANV_DEBUG=video-encode": "#126. Asserted as an EXACT value, not mere presence: a bare name check passes `ANV_DEBUG=no-sparse`, which has no video flag. Mesa's Intel Vulkan driver advertises the whole Vulkan Video extension family ONLY while this is set; unset, an Intel device does not expose VK_KHR_video_queue, every other video extension depends on that one, and GStreamer registers no vulkan video element while vulkansink still appears. Must contain video-encode. It lives in the IMAGE and not only in the agent process so that a `docker exec ... gst-inspect-1.0 vulkanh264enc` sees what the agent sees; an agent-only set makes the first diagnostic anyone runs disagree with the running agent. Inert on AMD and NVIDIA -- no other driver reads it. The agent reconciles this against QUASAR_INTEL_VULKAN_VIDEO at startup, which is the supported way to turn it off."
         }
       },
 

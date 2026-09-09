@@ -156,11 +156,12 @@ own; the two do not move together, and that is deliberate.
   `QUASAR_ENCODER=vulkan` as well, and will also want `QUASAR_VULKAN_AV1=0`: ANV has
   no AV1 encode, so leaving that knob on makes every boot log a
   `vulkan-codec-plan-degraded` warning pointing at the image contract, which is the
-  wrong place to look on an Intel host. Mesa gates encode on Gen12.0 parts, so Tiger,
-  Rocket, Alder and Raptor Lake integrated graphics should get H.264 and H.265, while
-  DG2/Arc and newer get decode only and still need VA to encode. Should, not will:
-  Mesa ships this off by default and does not treat the path as validated, which is
-  what this release is asking Intel users to try.
+  wrong place to look on an Intel host. Which Intel parts actually expose a usable
+  encode queue is not established: the pinned Mesa gates the encode extensions on the
+  flag and on the driver's codec build, not on a generation, and nobody on the project
+  has the hardware. Gen12 integrated graphics is the expected target; DG2/Arc is
+  untested. Mesa ships this off by default and does not treat the path as validated,
+  which is what this release is asking Intel users to try.
 
 - **Intel hosts now ship a VA driver** (#126). `mesa-va-drivers` is gallium only
   (radeonsi/nouveau/virtio/d3d12), so libva had nothing to load on an Intel GPU:
