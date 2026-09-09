@@ -41,7 +41,13 @@ export interface AppDraft {
   runtimePresetId: string;
   managedHome: boolean;
   containerPath: string;
-  /** runtime_spec.gpu is inert but must round-trip; no control offers it. */
+  /**
+   * runtime_spec.gpu must round-trip; no control offers it. It is NOT inert: the
+   * agent passes the GPU into the container only when it is true. For an app on
+   * a managed preset the server stamps the image's declared value on every
+   * write (#171), so what the form sends for it does not matter there; for a
+   * custom-image app the stored value is what launches.
+   */
   gpu: boolean;
   /** runtime_spec keys the form does not edit. Dropping `no_new_privileges`
    *  once broke every GOW desktop launch. */

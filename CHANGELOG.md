@@ -114,6 +114,21 @@ own; the two do not move together, and that is deliberate.
   Contract: `quasar-protocol` amendment 6.
 
 ### Fixed
+- **A desktop app created in the admin console now launches** (#171, migration 0082).
+  Every app made in the console against a managed desktop preset (KDE, XFCE) failed in
+  seconds with `app_exited_early`; the app container's own log said
+  `software Vulkan renderer detected`. The image's launch requirements -- `gpu`,
+  `no_new_privileges`, `systempaths_unconfined` -- live on the image catalog entry and
+  reached an app row only when the library provider created the app; the managed preset
+  deliberately carries none of them, and the console's editor wrote `gpu: false` for
+  every new app while believing the flag inert. It is not: the agent passes the GPU into
+  the container only when it is true. The control plane now stamps the managed image's
+  declared values onto the app on every create or edit that touches its spec or preset,
+  and migration 0082 applies the same rule to existing rows. Hand-made presets,
+  preset-less apps and provider-created apps (whose values the provider copied at install)
+  store exactly what they are sent, as before. The `deploy/README.md` paragraph telling
+  operators to copy the three values by hand is gone.
+
 - A fleet update no longer fails because a host was offline (#169, #170). Found by a
   real update on hardware: a live 0.2.3 -> 0.2.5 fleet apply failed at its first host
   and stopped, leaving the rest of the fleet unattempted -- against the sequencer's own
