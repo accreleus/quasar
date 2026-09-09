@@ -296,12 +296,6 @@ services:
       QUASAR_GPU_NVIDIA: "1"
       QUASAR_CUDA_DEVICE: ${QUASAR_CUDA_DEVICE:-0}
       QUASAR_RENDER_NODE: ${QUASAR_RENDER_NODE:-/dev/dri/renderD128}
-      # #152: the health listener's bind address. Passed through so an operator
-      # can move it — the agent REFUSES TO START if it cannot bind, rather than
-      # let another process answer its health checks, and 9091 is a busy port
-      # (Prometheus Pushgateway's default). Empty disables the endpoint. The
-      # `-` (not `:-`) is deliberate: an explicitly empty value must stay empty.
-      QUASAR_HEALTH_ADDR: ${QUASAR_HEALTH_ADDR-127.0.0.1:9091}
       QUASAR_NVIDIA_DRIVER_VOLUME: ${QUASAR_NVIDIA_DRIVER_VOLUME:-1}
       QUASAR_CUDA_RUNTIME: ${QUASAR_CUDA_RUNTIME:-1}
       LD_LIBRARY_PATH: /opt/quasar/nvidia-driver/lib64:/opt/quasar/nvidia-driver/cuda/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
