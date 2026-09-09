@@ -411,7 +411,13 @@ func hostReason(newest *Release, cp buildinfo.Identity, h HostIdentity, attemptO
 	if !*h.UpdaterPresent {
 		return ReasonUpdaterAbsent
 	}
-	if h.Status == HostOffline {
+	// control-api.md defines this reason as "the host's agent is not connected".
+	// The status column was an inadequate implementation of that sentence: it is
+	// stale across every control-plane restart, and a run's own cordon then
+	// rewrites it to `draining`, which is not `offline` (#169). The live registry
+	// answers the question the contract actually asks; the column stays as the
+	// fallback for a caller that wires no registry.
+	if h.Status == HostOffline || (h.AgentConnected != nil && !*h.AgentConnected) {
 		return ReasonHostOffline
 	}
 	// A ceiling, not a queue: an agent is never moved past the control plane

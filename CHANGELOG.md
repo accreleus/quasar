@@ -114,6 +114,20 @@ own; the two do not move together, and that is deliberate.
   Contract: `quasar-protocol` amendment 6.
 
 ### Fixed
+- A fleet update no longer fails because a host was offline (#169, #170). Found by a
+  real update on hardware: a live 0.2.3 -> 0.2.5 fleet apply failed at its first host
+  and stopped, leaving the rest of the fleet unattempted -- against the sequencer's own
+  rule that an ineligible host is skipped, not failed. The cause is that `hosts.status`
+  is never corrected across a control-plane restart: the row is marked offline only from
+  the agent connection's own goroutine, so a control plane that exits never marks
+  anything, and the stale sweep only visits hosts with active sessions. Since every fleet
+  run restarts the control plane, "the row says online but no agent is there" is the
+  normal shape of a run rather than an edge case. Eligibility now reads whether the agent
+  is actually connected, not just the stored status, so such a host is skipped with
+  `host_offline` and the run continues. A separate defect fixed alongside it (#170): the
+  cordon restore treated every not-online host as one this run had cordoned, so a host
+  that was already offline before the run could be un-cordoned by it.
+
 - The bench harness no longer reports a healthy stream as black. The peer's luma probe
   judges a 160x90 canvas with thresholds calibrated on full-frame content, and
   `Quasar Bench: Ball` is a 20px-radius ball — about 0.06% of a 1080p frame — so a

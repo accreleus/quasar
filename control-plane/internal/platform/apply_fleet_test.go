@@ -91,6 +91,9 @@ type fakeFleetStore struct {
 	remainingLog []int
 	// The run's persisted record of what it found (migration 0076).
 	cordons_ []HostCordon
+	// Agent connectivity as the registry would report it, keyed by host id.
+	// Absent = connected: the fake's default host is a live one.
+	disconnected map[string]bool
 	// Release-read fault injection: reads from the releaseErrFrom'th on fail.
 	releaseReads   int
 	releaseErrFrom int
@@ -452,6 +455,47 @@ func (d *fakeDrivers) steps() []string {
 	out := make([]string, len(d.order))
 	copy(out, d.order)
 	return out
+}
+
+// planningView builds the view by running the REAL PlanRelease over the fake's
+// own host table, so cordoning a host actually moves its status and eligibility
+// is re-derived from it. Every other fleet test injects Target rows directly,
+// which is why #169 — where the run's own cordon changed what the planner saw —
+// could not be expressed before.
+func planningView(f *fakeFleetStore, cpSchema int) func(context.Context) (View, error) {
+	return func(ctx context.Context) (View, error) {
+		hosts, err := f.Hosts(ctx)
+		if err != nil {
+			return View{}, err
+		}
+		f.mu.Lock()
+		for i := range hosts {
+			connected := !f.disconnected[hosts[i].HostID]
+			hosts[i].AgentConnected = &connected
+			hosts[i].AgentVersion = str("0.1.0")
+			hosts[i].SourceCommit = str(commitA)
+			hosts[i].BuiltAt = str("2026-09-01T00:00:00Z")
+			hosts[i].InstallMode = str(InstallRegistry)
+			hosts[i].UpdaterPresent = boolp(true)
+		}
+		rel := f.release
+		f.mu.Unlock()
+		// The fake's release carries no channel or version — it is normally fed
+		// straight to the sequencer, never through `offerable`, which filters on
+		// both. Fill them so the real planner lists it.
+		rel.Channel = ChannelStable
+		if rel.Version == nil {
+			rel.Version = str("0.9.0")
+		}
+		return PlanRelease(PlanInputs{
+			Channel:                 ChannelStable,
+			ControlPlane:            cp(testCommit, cpSchema),
+			Hosts:                   hosts,
+			Releases:                []Release{rel},
+			UpdaterPresent:          true,
+			ControlPlaneInstallMode: str(InstallRegistry),
+		}), nil
+	}
 }
 
 // fleetView builds the view the sequencer reads: the control plane behind, and
@@ -1152,5 +1196,89 @@ func TestFleetAdoptedWithNoRecordTreatsEveryCordonAsItsOwn(t *testing.T) {
 		if st.WasCordoned {
 			t.Fatalf("recorded %s as the operator's cordon, want every cordon read as the run's own", st.HostID)
 		}
+	}
+}
+
+// #169, THE LIVE CASE, through the real planner and a real cordon.
+//
+// A host whose agent is gone but whose row still says `online` — the normal
+// state after any control-plane restart, because nothing corrects an idle host's
+// status across one — must be SKIPPED, not attempted. Before the fix the run
+// cordoned it (status -> draining, which is not `offline`), found it eligible,
+// created an attempt, waited for an agent that never came, failed `timeout`, and
+// stopped: every host behind it was never updated.
+//
+// The existing skip test injects ReasonHostOffline into the view directly, which
+// bypasses the cordon that masked it in production. This one does not.
+func TestFleetSkipsAHostWhoseAgentIsGoneEvenAfterItCordonsIt(t *testing.T) {
+	store := newFakeFleetStore(false)
+	// h1's row says online — stale — but no agent is there. h2 is live.
+	store.disconnected = map[string]bool{"h1": true}
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, planningView(store, fakeReleaseSchema))
+
+	run := runToEnd(t, f, store)
+
+	if run.State != RunSucceeded {
+		t.Fatalf("run state = %q, want succeeded — a run must not fail because a host happened to be offline", run.State)
+	}
+	// h2 was updated; h1 was skipped, not attempted.
+	if got := d.steps(); len(got) != 1 || got[0] != "h2" {
+		t.Fatalf("targets reached = %v, want only h2 — h1 has no agent to send to", got)
+	}
+	skips := f.Skips(testRunID)
+	if len(skips) != 1 || skips[0].HostID != "h1" || skips[0].Reason != ReasonHostOffline {
+		t.Fatalf("skipped = %+v, want h1 with %s", skips, ReasonHostOffline)
+	}
+	// And it is left in service, not cordoned: the run lifts what it imposed.
+	waitFor(t, "h1 to be uncordoned", func() bool {
+		st, err := store.HostStatus(context.Background(), "h1")
+		return err == nil && st != "draining"
+	})
+}
+
+// The mirror: a cordon on its own is NOT absence. A host the run has cordoned
+// whose agent is present must still be applied to — otherwise the fix would skip
+// the entire fleet, since a run cordons every host before it starts.
+func TestFleetStillAppliesToACordonedHostWhoseAgentIsPresent(t *testing.T) {
+	store := newFakeFleetStore(false)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, planningView(store, fakeReleaseSchema))
+
+	run := runToEnd(t, f, store)
+
+	if run.State != RunSucceeded {
+		t.Fatalf("run state = %q, want succeeded", run.State)
+	}
+	if got := d.steps(); len(got) != 2 {
+		t.Fatalf("targets reached = %v, want both hosts — cordoned is the condition an apply wants", got)
+	}
+	if skips := f.Skips(testRunID); len(skips) != 0 {
+		t.Fatalf("skipped = %+v, want none", skips)
+	}
+}
+
+// #170's real bug: only `draining` is a cordon. Recording an OFFLINE host as
+// "the admin cordoned it" meant the run never cordoned it — so it could take a
+// placement the run would destroy — and then CORDONED it at restore, leaving a
+// host nobody cordoned out of scheduling with nothing to lift it.
+func TestFleetDoesNotTreatAnOfflineHostAsAnAdminsCordon(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.hosts[0].Status = HostOffline
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, planningView(store, fakeReleaseSchema))
+
+	runToEnd(t, f, store)
+
+	recorded, _ := store.CordonedHosts(context.Background(), testRunID)
+	for _, st := range recorded {
+		if st.HostID == "h1" && st.WasCordoned {
+			t.Fatal("an offline host was recorded as the admin's cordon; the run will now cordon it at restore " +
+				"and leave a host nobody cordoned out of scheduling")
+		}
+	}
+	// And it must not be left draining.
+	if st, err := store.HostStatus(context.Background(), "h1"); err == nil && st == "draining" {
+		t.Fatal("an offline host was left draining by the run's own restore")
 	}
 }

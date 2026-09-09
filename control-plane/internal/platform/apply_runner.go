@@ -227,7 +227,11 @@ func (r *Runner) drive(ctx context.Context, a Attempt) {
 		r.fail(a.ID, ReasonUpdaterUnreachable, "")
 		return
 	}
-	wasCordoned := status != "online"
+	// Only `draining` is a cordon. `offline` is not one, and recording it as the
+	// admin's meant this attempt never cordoned the host and then CORDONED it on
+	// restore — leaving a host nobody cordoned out of scheduling (#170, the same
+	// conflation as the fleet run's).
+	wasCordoned := status == "draining"
 	if !wasCordoned {
 		if err := r.deps.Cordon(dctx, hostID); err != nil {
 			// A host that cannot be cordoned cannot be drained, and applying

@@ -181,6 +181,10 @@ func sourceInstall(h *HostIdentity) { h.InstallMode = str(InstallSource) }
 func noUpdater(h *HostIdentity)     { h.UpdaterPresent = boolp(false) }
 func offline(h *HostIdentity)       { h.Status = HostOffline }
 func draining(h *HostIdentity)      { h.Status = "draining" }
+
+// #169: connectivity as the registry sees it, independent of the status column.
+func disconnected(h *HostIdentity) { c := false; h.AgentConnected = &c }
+func connected(h *HostIdentity)    { c := true; h.AgentConnected = &c }
 func unknownIdentity(h *HostIdentity) {
 	h.SourceCommit, h.BuiltAt, h.InstallMode, h.UpdaterPresent = nil, nil, nil, nil
 }
@@ -280,6 +284,49 @@ func TestTargetEligibilityReasons(t *testing.T) {
 			host:       host("h1", "gpu-01", commitA, noUpdater),
 			wantCPRsn:  ReasonUpToDate,
 			wantHostRs: ReasonUpdaterAbsent,
+		},
+		{
+			// #169. THE LIVE CASE. Nothing corrects an idle host's status across
+			// a control-plane restart — markOffline runs only from the connection
+			// goroutine's defer, and the stale sweep visits only hosts WITH active
+			// sessions — so the row still says `online` for a host that is gone.
+			// Before this, the run attempted it and failed the whole fleet.
+			name:       "a host whose row says online but whose agent is gone",
+			releases:   []Release{newest},
+			cp:         cp(commitC, 74),
+			host:       host("h1", "gpu-01", commitA, disconnected),
+			wantCPRsn:  ReasonUpToDate,
+			wantHostRs: ReasonHostOffline,
+		},
+		{
+			// And the cordon case: a run cordons every host first, and `draining`
+			// is deliberately not `offline`, so the status column could never
+			// classify a host the run had already touched.
+			name:       "a cordoned host whose agent is gone",
+			releases:   []Release{newest},
+			cp:         cp(commitC, 74),
+			host:       host("h1", "gpu-01", commitA, draining, disconnected),
+			wantCPRsn:  ReasonUpToDate,
+			wantHostRs: ReasonHostOffline,
+		},
+		{
+			// A cordon on its own is not absence: a draining host with a live
+			// agent is exactly what an apply wants.
+			name:       "a cordoned host whose agent is present is still eligible",
+			releases:   []Release{newest},
+			cp:         cp(commitC, 74),
+			host:       host("h1", "gpu-01", commitA, draining, connected),
+			wantCPRsn:  ReasonUpToDate,
+			wantHostRs: "",
+		},
+		{
+			// No registry wired: the column decides, exactly as before.
+			name:       "with no connectivity known the status column still decides",
+			releases:   []Release{newest},
+			cp:         cp(commitC, 74),
+			host:       host("h1", "gpu-01", commitA, draining),
+			wantCPRsn:  ReasonUpToDate,
+			wantHostRs: "",
 		},
 		{
 			name:       "an offline host has nobody to tell",
