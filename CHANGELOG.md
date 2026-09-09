@@ -109,6 +109,15 @@ own; the two do not move together, and that is deliberate.
   to start if it cannot bind the address, `/health` identifies the answering agent by
   `node` and `pid`, the image's `HEALTHCHECK` follows the configured address instead of
   hardcoding the default, and the multi-agent overlay gives each extra agent its own.
+- An expired session now signs you out and returns you to the sign-in form, saying
+  so, instead of leaving your library on screen behind a red banner whose "Try
+  again" could not work (#154). The SPA handled a rejected token in exactly one
+  place — the check it makes when a page first loads — so a token that expired
+  while a tab sat open, or one an admin revoked, surfaced as an ordinary "could not
+  load" error over data that was already on screen. A 401 on any authenticated
+  request now ends the session everywhere: local credentials are cleared, so a
+  reload cannot resurrect them, and the signed-in page is unmounted rather than
+  left rendering what the dead token had fetched.
 
 - Sessions now survive a control-plane restart (#128), confirmed on a live 73 s
   outage with a real browser peer: decode continued at 60 fps with no dropped samples

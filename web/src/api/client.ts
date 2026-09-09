@@ -5,6 +5,7 @@
 // No base URL is ever baked into the bundle.
 
 import type { ApiErrorBody } from "./types";
+import { notifyUnauthorized } from "./unauthorized";
 
 const API_PREFIX = "/v1";
 
@@ -102,7 +103,18 @@ export async function apiFetch<T>(path: string, opts: RequestOptions = {}): Prom
     signal: opts.signal,
   });
 
-  if (!res.ok) throw await parseError(res);
+  if (!res.ok) {
+    // A 401 on a request that carried a bearer token means the SESSION is over:
+    // expired, or revoked out from under us. Announce it before throwing, so the
+    // app signs out and navigates rather than leaving a signed-in page on screen
+    // behind an error banner (#154). Deliberately narrow:
+    //   - only 401. A 403 is "you may not", which leaves the session valid.
+    //   - only with `opts.token`. The sign-in POST carries none, so a wrong
+    //     password stays a form error; the setup claim authenticates with
+    //     X-Quasar-Setup-Token and is likewise not a session.
+    if (res.status === 401 && opts.token) notifyUnauthorized();
+    throw await parseError(res);
+  }
   if (res.status === 204 || res.status === 205) return undefined as T;
 
   // Read as text first: an empty body is not valid JSON.

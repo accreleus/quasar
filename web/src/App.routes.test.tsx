@@ -67,6 +67,7 @@ const admin: AuthContextValue = {
   user: { id: "u1", email: "a@b.io", username: "admin", role: "admin" } as AuthContextValue["user"],
   token: "t",
   isAdmin: true,
+  sessionExpired: false,
   login: vi.fn(),
   claim: vi.fn(),
   logout: vi.fn(),

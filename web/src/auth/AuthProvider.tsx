@@ -5,6 +5,7 @@ import { useCallback, useEffect, useState, type ReactNode } from "react";
 import * as authApi from "../api/auth";
 import { claimSetup } from "../api/setup";
 import { ApiError } from "../api/client";
+import { onUnauthorized } from "../api/unauthorized";
 import type { User } from "../api/types";
 import { AuthContext, type AuthStatus, type AuthContextValue } from "./context";
 import { clearSession, isRemembered, loadSession, saveSession } from "./storage";
@@ -20,6 +21,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<AuthStatus>("loading");
   const [user, setUser] = useState<User | null>(null);
   const [token, setToken] = useState<string | null>(null);
+  // True when the session ended because the server rejected the token, as
+  // opposed to the user signing out. Read once by /login, then cleared.
+  const [sessionExpired, setSessionExpired] = useState(false);
 
   // On mount: rehydrate from storage, then confirm the token with GET /v1/me so
   // the role we act on is the server's, not the cached one. A 401 (revoked or
@@ -80,6 +84,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
+  // A rejected bearer token ANYWHERE ends the session, not just the one at mount
+  // (#154). Flipping status to `unauthenticated` is what makes RequireAuth
+  // navigate to /login, which unmounts the route subtree — so the page the
+  // expired token had already filled in goes away with it, instead of sitting
+  // there behind an error banner. Idempotent: several requests can fail at once.
+  //
+  // `sessionExpired` distinguishes this from an ordinary sign-out so /login can
+  // say why. It is deliberately NOT persisted: it describes this navigation.
+  useEffect(
+    () =>
+      onUnauthorized(() => {
+        if (!loadSession()) return; // already signed out; nothing to report
+        clearSession();
+        setToken(null);
+        setUser(null);
+        setSessionExpired(true);
+        setStatus("unauthenticated");
+      }),
+    [],
+  );
+
   const login = useCallback(async (email: string, password: string, remember = true) => {
     // Send the persistent device_key so the minted token is bound to this device
     // (LP-SEC-01 §B.5) and can later be revoked from the account → Devices area.
@@ -89,6 +114,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     saveSession({ token: res.access_token, expiresAt: res.expires_at, user: res.user }, { remember });
     setToken(res.access_token);
     setUser(res.user);
+    setSessionExpired(false);
     setStatus("authenticated");
 
     // Fire the device capability probe asynchronously AFTER setting
@@ -120,6 +146,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       saveSession({ token: res.access_token, expiresAt: res.expires_at, user: res.user }, { remember: true });
       setToken(res.access_token);
       setUser(res.user);
+      setSessionExpired(false);
       setStatus("authenticated");
 
       // Same best-effort capability probe as login(), fired AFTER the state
@@ -144,6 +171,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     clearSession();
     setToken(null);
     setUser(null);
+    // Signing out deliberately is not an expiry, so /login says nothing about one.
+    setSessionExpired(false);
     setStatus("unauthenticated");
     if (current) {
       // Best-effort revoke; local state is already cleared regardless of outcome.
@@ -160,6 +189,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     user,
     token,
     isAdmin: user?.role === "admin",
+    sessionExpired,
     login,
     claim,
     logout,

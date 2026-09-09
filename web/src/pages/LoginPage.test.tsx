@@ -19,12 +19,13 @@ import { AuthContext, type AuthContextValue } from "../auth/context";
 import { ThemeProvider } from "../settings/ThemeContext";
 import { ApiError } from "../api/client";
 
-function renderLogin(login: AuthContextValue["login"], from?: string) {
+function renderLogin(login: AuthContextValue["login"], from?: string, expired = false) {
   const value: AuthContextValue = {
     status: "unauthenticated",
     user: null,
     token: null,
     isAdmin: false,
+    sessionExpired: expired,
     login,
     claim: vi.fn(),
     logout: vi.fn(),
@@ -215,5 +216,19 @@ describe("LoginPage", () => {
         screen.getByText("Could not reach the server. Check your connection and try again."),
       ).toBeInTheDocument(),
     );
+  });
+});
+
+// #154: an expired token sends the user here, and the form has to say why —
+// otherwise the redirect reads as the app losing their place for no reason.
+describe("LoginPage after an expired session", () => {
+  it("says the session expired when it did", () => {
+    renderLogin(vi.fn(), undefined, true);
+    expect(screen.getByText(/Your session expired/)).toBeInTheDocument();
+  });
+
+  it("says nothing when the user signed out or arrived fresh", () => {
+    renderLogin(vi.fn());
+    expect(screen.queryByText(/Your session expired/)).toBeNull();
   });
 });

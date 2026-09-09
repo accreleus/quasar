@@ -20,6 +20,7 @@ function renderStepClaim(claim: AuthContextValue["claim"], onClaimed = vi.fn()) 
     user: null,
     token: null,
     isAdmin: false,
+    sessionExpired: false,
     login: vi.fn(),
     claim,
     logout: vi.fn(),
