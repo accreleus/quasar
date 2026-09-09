@@ -141,6 +141,19 @@ own; the two do not move together, and that is deliberate.
 
 
 
+- **Intel hosts can register a Vulkan encoder at all** (#126). Mesa's Intel Vulkan
+  driver hides the whole Vulkan Video extension family behind an opt-in instance
+  debug flag. Unset, the device does not advertise `VK_KHR_video_queue`, every other
+  video extension depends on that one, and GStreamer's device open therefore
+  registered no vulkan video element while `vulkansink` still appeared — so the host
+  looked like a working GPU whose encoder supported nothing, which is exactly what
+  the `encoder_codecs` readiness check reported. The agent now sets
+  `ANV_DEBUG=video-decode,video-encode` on a detected Intel GPU before GStreamer
+  initialises, merging with any operator-set value rather than replacing it, with
+  `QUASAR_INTEL_VULKAN_VIDEO=0` to opt back out. Note that Mesa gates encode on
+  Gen12.0 and earlier, so this gives Alder Lake class integrated graphics H.264 and
+  H.265, and gives a discrete Arc card decode only.
+
 - **Intel hosts now ship a VA driver** (#126). `mesa-va-drivers` is gallium only
   (radeonsi/nouveau/virtio/d3d12), so libva had nothing to load on an Intel GPU:
   `vaInitialize` failed, `vah264lpenc` never registered, and the agent's startup
