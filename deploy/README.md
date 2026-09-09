@@ -292,11 +292,6 @@ Sign in and go to **`/admin`**:
 
 Users then launch them from `/app`.
 
-> If you create an app **by hand** rather than from an image, copy the `gpu`,
-> `no_new_privileges` and `systempaths_unconfined` values from the image onto
-> the app. Without them a desktop-session image fails at launch with
-> `software Vulkan renderer detected`.
-
 Nothing streaming? The two usual causes are the host firewall and the network
 path — [Host firewall blocking WebRTC media](#host-firewall-blocking-webrtc-media)
 and [When the video never arrives](#when-the-video-never-arrives).
