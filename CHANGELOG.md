@@ -131,6 +131,15 @@ own; the two do not move together, and that is deliberate.
   Contract: `quasar-protocol` "Audit-log names" amendment (additive, no migration).
 
 ### Fixed
+- `docs/upgrading.md` "Adding it to an existing install" no longer leaves the control plane
+  without the updater's socket. Step 3 brought up only the updater; the compose file also
+  mounts its socket volume into the control plane and the node agent, and a container
+  created before the volume existed keeps running without the mount, so the console said
+  the updater was not installed for the control plane while the agent reported it present.
+  The step now recreates all three. The same page gains a "before applying" check for the
+  agent's health port: since #152 an updated agent refuses to start when `127.0.0.1:9091`
+  is already taken on the host, which an older agent tolerated, so a release apply is the
+  first place that shows.
 - **`redeploy.sh` no longer reports a deploy healthy on evidence it never saw (#177).**
   Host readiness and the codec plan were initialised to `ok` the moment the node-agent
   log came back non-empty, *before* anything looked for a verdict — so a log carrying no
