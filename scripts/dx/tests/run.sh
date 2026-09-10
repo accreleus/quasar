@@ -3394,6 +3394,67 @@ $PROBED"
 summary_is "codec-pending-first-boot" ok pending ok "$ALL_CLEAR
 $PENDING"
 
+# The persisted-log rule, through the summary boundary rather than the token
+# table: docker keeps a container's log across restarts, so the LATEST readiness
+# verdict has to win in both directions. A regression from `tail -1` to the first
+# match would leave every fixture above green.
+summary_is "readiness-latest-verdict-wins-recovered" ok ok ok 'token="boot-render-node-unopenable" gpu-host-sanity
+'"$ALL_CLEAR
+$PROBED"
+summary_is "readiness-latest-verdict-wins-new-failure" FAILED ok fail "$ALL_CLEAR"'
+token="boot-render-node-unopenable" gpu-host-sanity
+'"$PROBED"
+
+# A codec-plan line is only a candidate until a probe commits it, and a candidate
+# must not cross a process boundary: an agent that logged `degraded` and died
+# before its probe would otherwise have that state committed by the NEXT
+# process's healthy probe, which on a VA or openh264 host carries no plan line of
+# its own.
+AGENT_START='2026-09-11T02:00:00Z  INFO quasar_node_agent: quasar node-agent 0.2.6 starting (node_name=gpu-01, source_commit=abc1234, built_at=2026-09-11)'
+summary_is "codec-candidate-does-not-cross-a-restart" ok ok ok "$DEGRADED
+$AGENT_START
+$ALL_CLEAR
+$PROBED"
+
+# The poll waits for BOTH verdicts. A healthy agent logs its readiness summary
+# and its codec probe at different moments, and stopping at the first would
+# report a healthy host as half-unverified whenever a read landed between them.
+POLL_STATE="$WORK/poll-state"
+scripted_reader() { # emits a longer log on each successive call
+  local n
+  n="$(cat "$POLL_STATE" 2>/dev/null || echo 0)"
+  echo $((n + 1)) > "$POLL_STATE"
+  case "$n" in
+  0) printf '%s' 'INFO quasar_node_agent: capacity report sent' ;;
+  1) printf '%s' "$ALL_CLEAR" ;;
+  *) printf '%s' "$ALL_CLEAR
+$PROBED" ;;
+  esac
+}
+no_sleep() { :; }
+echo 0 > "$POLL_STATE"
+got="$(agent_summary "$(poll_agent_log scripted_reader 15 no_sleep)" | tr '\n' ' ')"
+if [ "$got" = "readiness=ok codecs=ok severity=ok " ]; then
+  pass "redeploy:poll-waits-for-both-verdicts" "$got"
+else
+  fail "redeploy:poll-waits-for-both-verdicts" "want readiness=ok codecs=ok severity=ok, got [$got]"
+fi
+if [ "$(cat "$POLL_STATE")" -ge 3 ]; then
+  pass "redeploy:poll-kept-reading" "$(cat "$POLL_STATE") reads"
+else
+  fail "redeploy:poll-kept-reading" "stopped after $(cat "$POLL_STATE") reads; the codec probe had not landed"
+fi
+
+# And it is still bounded: a log that never carries a verdict spends the tries
+# and answers unverified rather than looping.
+never_reader() { printf '%s' 'INFO quasar_node_agent: capacity report sent'; }
+got="$(agent_summary "$(poll_agent_log never_reader 4 no_sleep)" | tr '\n' ' ')"
+if [ "$got" = "readiness=unverified codecs=unverified severity=warn " ]; then
+  pass "redeploy:poll-is-bounded" "$got"
+else
+  fail "redeploy:poll-is-bounded" "want everything unverified, got [$got]"
+fi
+
 # grep -q exits at the first match; under `set -o pipefail` the SIGPIPE that
 # gives a piping writer makes the pipeline non-zero, so a present line can read
 # as absent on a long log. The library must not be written that way.

@@ -92,6 +92,7 @@ readiness_severity() {
 # readiness half made.
 codec_cause() {
   awk '
+    /quasar node-agent .* starting \(node_name=/ { candidate = ""; next }
     /vulkan-codec-plan-degraded/              { candidate = "degraded"; next }
     /vulkan-codec-plan-pending-driver-volume/ { candidate = "pending";  next }
     /codec support probed for/                { state = (candidate != "" ? candidate : "ok"); candidate = ""; next }
@@ -102,6 +103,35 @@ codec_cause() {
     }
   ' <<<"$1"
 }
+
+# agent_verdicts_seen <log> — whether BOTH halves have been observed yet. What
+# the poll below waits on: a healthy agent logs its readiness verdict and its
+# codec probe at different moments, so a read that lands between them would
+# otherwise stop the poll and report a perfectly healthy host as half-unverified.
+agent_verdicts_seen() {
+  [ -n "$(readiness_line "$1")" ] && [ "$(codec_cause "$1")" != unverified ]
+}
+
+# poll_agent_log <reader> <tries> [sleeper] — read the agent's log until both
+# verdicts are in, or the tries run out. Echoes the last log read.
+#
+# The reader and the sleeper are injected so this is testable without a stack
+# and without waiting: redeploy.sh passes its docker-compose reader and a real
+# `sleep 2`, the suite passes a scripted reader and a no-op. The bound is the
+# caller's; nothing here waits forever.
+poll_agent_log() {
+  local reader="$1" tries="$2" sleeper="${3:-__agent_sleep_2}" log="" i
+  for ((i = 0; i < tries; i++)); do
+    log="$("$reader")"
+    if [ -n "$log" ] && agent_verdicts_seen "$log"; then
+      break
+    fi
+    [ "$i" -lt "$((tries - 1))" ] && "$sleeper"
+  done
+  printf '%s' "$log"
+}
+
+__agent_sleep_2() { sleep 2; }
 
 # codec_severity <codec-cause> — `pending` is the expected first-boot state and
 # self-clears on the agent's own restart, so it is a note rather than a warning.

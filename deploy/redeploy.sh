@@ -1088,16 +1088,14 @@ fi
 # a verdict that has not arrived yet is a different thing from one that never
 # will. The tail is deep because the block is one line per check and a host that
 # restarted a few times pushes an older verdict past a short window.
-agent_log=""
-readiness_verdict=""
-for _ in $(seq 1 15); do
-  agent_log="$($DC logs --tail 2000 quasar-node-agent 2>/dev/null || true)"
-  if [ -n "$agent_log" ]; then
-    readiness_verdict="$(readiness_line "$agent_log")"
-    [ -n "$readiness_verdict" ] && break
-  fi
-  sleep 2
-done
+read_agent_log() { $DC logs --tail 2000 quasar-node-agent 2>/dev/null || true; }
+# BOTH verdicts, not just readiness: a healthy agent logs its readiness summary
+# and its codec probe at different moments, so a poll that stopped at the first
+# would report a healthy host as half-unverified whenever a read landed between
+# them. poll_agent_log is in the library, with the reader and the sleeper
+# injected, so the suite can drive it without a stack and without waiting.
+agent_log="$(poll_agent_log read_agent_log 15)"
+readiness_verdict="$(readiness_line "$agent_log")"
 
 if [ -z "$agent_log" ]; then
   # Was a `note:` that changed nothing, so a deploy with no agent logs at all
