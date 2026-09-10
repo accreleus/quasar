@@ -1088,7 +1088,27 @@ fi
 # a verdict that has not arrived yet is a different thing from one that never
 # will. The tail is deep because the block is one line per check and a host that
 # restarted a few times pushes an older verdict past a short window.
-read_agent_log() { $DC logs --tail 2000 quasar-node-agent 2>/dev/null || true; }
+# Reads the agent's log for ONE process lifetime, or nothing.
+#
+# The library treats a startup line as a hard boundary, but that only helps once
+# the new process has logged one. Between an agent exiting and its replacement
+# writing that line, a plain `logs` read returns the OLD process's verdicts with
+# nothing to mark them stale — and this agent restarts itself routinely (#98's
+# retry, the driver-volume provision, a config reload). So bracket the read with
+# the container's `StartedAt`: same value before and after, still running, and
+# logs `--since` that instant. A restart mid-read simply costs a poll attempt.
+read_agent_log() {
+  local cid before after
+  cid="$($DC ps -q quasar-node-agent 2>/dev/null || true)"
+  [ -n "$cid" ] || return 0
+  before="$(docker inspect -f '{{.State.StartedAt}} {{.State.Running}}' "$cid" 2>/dev/null || true)"
+  [ "${before##* }" = true ] || return 0
+  local log
+  log="$(docker logs --since "${before% *}" --tail 2000 "$cid" 2>&1 || true)"
+  after="$(docker inspect -f '{{.State.StartedAt}} {{.State.Running}}' "$cid" 2>/dev/null || true)"
+  [ "$before" = "$after" ] || return 0
+  printf '%s' "$log"
+}
 # BOTH verdicts, not just readiness: a healthy agent logs its readiness summary
 # and its codec probe at different moments, so a poll that stopped at the first
 # would report a healthy host as half-unverified whenever a read landed between
