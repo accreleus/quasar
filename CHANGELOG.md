@@ -155,6 +155,12 @@ own; the two do not move together, and that is deliberate.
   preset-less apps and provider-created apps (whose values the provider copied at install)
   store exactly what they are sent, as before. The `deploy/README.md` paragraph telling
   operators to copy the three values by hand is gone.
+- A `session.failed` audit entry now names its `app_id` (#171). The row carried the host,
+  the failure code and the state detail but not the app, so a failed launch could not be
+  matched to its app from the audit feed; `session.launched` already carried it. Additive.
+  Contract: `quasar-protocol` "session.failed app_id" amendment (additive, no migration).
+  The audit page's name resolution already covers `details.app_id`, so the row shows the
+  app's name beside it.
 
 - A fleet update no longer fails because a host was offline (#169, #170). Found by a
   real update on hardware: a live 0.2.3 -> 0.2.5 fleet apply failed at its first host
