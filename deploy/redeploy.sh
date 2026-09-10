@@ -1058,26 +1058,76 @@ else
   fail=1
 fi
 
+# readiness_cause <verdict-line> — the one PURE step in the block below: a
+# node-agent verdict line in, a cause word out. No docker, no clock, no I/O, so
+# scripts/dx/tests/run.sh can pin every branch including the one that matters
+# most — an unrecognised or empty line answering `unverified` rather than
+# falling through to a default of health (#177).
+readiness_cause() {
+  case "$1" in
+  *'host readiness: all checks passed or skipped'*) echo passed ;;
+  *'host readiness: no failures;'*) echo provisioning ;;
+  *boot-render-node-missing*) echo render-node-missing ;;
+  *boot-render-node-retry-deferred*) echo retry-deferred ;;
+  *boot-dri-modes-stale-cdi*) echo stale-cdi ;;
+  *boot-render-node-unopenable*) echo render-node-unopenable ;;
+  *boot-render-node-retries-spent* | *boot-host-render-node-missing*) echo sanity-failed ;;
+  *readiness-checks-failed*) echo checks-failed ;;
+  *) echo unverified ;;
+  esac
+}
+
 # The agent can be running, registered and healthy while the HOST is unusable for
 # streaming: a provision that died mid-flight leaves no Vulkan encode and failing
 # readiness checks behind it, and #66 was diagnosed on a deploy where this script
 # printed a confident result=OK through exactly that for 90 minutes. Read the agent's
 # own verdict rather than inferring one from liveness.
-readiness=unknown
-codecs=unknown
-agent_log="$($DC logs --tail 400 quasar-node-agent 2>/dev/null || true)"
+# `unverified` is a THIRD state beside ok and failed, and the default (#177).
+# This block used to set readiness=ok and codecs=ok the moment the log was
+# non-empty, BEFORE looking for a verdict — so a log that carried no verdict at
+# all, or one this grep did not know about, summarised as a confident result=OK.
+# Absence of evidence is not evidence of health; that conflation is the same one
+# that printed OK through a dead host for 90 minutes (#66).
+readiness=unverified
+codecs=unverified
+# The verdict lands a moment after registration, so poll for it on the same
+# bounded budget the registration check above uses rather than sampling once —
+# and read a deeper tail, because the block is one line per check and a host that
+# restarted a few times pushes an older verdict past a short window.
+# Token contract: node-agent/src/{readiness,agent}.rs.
+readiness_grep='boot-render-node-missing|boot-render-node-retry-deferred|boot-render-node-retries-spent|boot-render-node-unopenable|boot-dri-modes-stale-cdi|boot-host-render-node-missing|readiness-checks-failed|host readiness: no failures;|host readiness: all checks passed or skipped'
+agent_log=""
+readiness_line=""
+for _ in $(seq 1 15); do
+  agent_log="$($DC logs --tail 2000 quasar-node-agent 2>/dev/null || true)"
+  if [ -n "$agent_log" ]; then
+    # The LAST verdict, never the first. The #98 boot race exits on purpose and
+    # heals on the retry, and a restart-policy restart keeps the same container's
+    # log, so a healed host still carries the failing line from the boot before.
+    readiness_line="$(printf '%s' "$agent_log" | grep -E "$readiness_grep" | tail -1 || true)"
+    [ -n "$readiness_line" ] && break
+  fi
+  sleep 2
+done
 if [ -n "$agent_log" ]; then
-  readiness=ok
-  codecs=ok
-  # Classify the LAST readiness verdict in the log, never the first. The #98 boot race
-  # exits on purpose and heals on the retry, and a restart-policy restart keeps the same
-  # container's log, so a healed host still carries the failing line from the boot before.
-  # Token contract: node-agent/src/{readiness,agent}.rs.
-  readiness_line="$(printf '%s' "$agent_log" |
-    grep -E 'boot-render-node-missing|boot-render-node-retry-deferred|boot-render-node-retries-spent|boot-render-node-unopenable|boot-dri-modes-stale-cdi|boot-host-render-node-missing|readiness-checks-failed|host readiness: all checks passed or skipped' |
-    tail -1 || true)"
-  case "$readiness_line" in
-  *boot-render-node-missing*)
+  case "$(readiness_cause "$readiness_line")" in
+  passed)
+    # The only line that earns an `ok`, and it has to be matched to earn it.
+    readiness=ok
+    echo "  ok: node-agent reports all host readiness checks passed or skipped"
+    ;;
+  provisioning)
+    # The agent says so itself: no failures, and not usable yet. It was absent
+    # from this grep entirely, so a mid-provision first boot — the commonest
+    # redeploy there is — produced no verdict line and summarised as OK.
+    readiness=PROVISIONING
+    echo "  WARN: the node-agent reports no readiness FAILURES, but checks are still being"
+    echo "        remediated automatically and the host is NOT usable yet:"
+    printf '%s' "$readiness_line" | sed 's/^/        /'
+    echo "        Re-run this check once the provision completes."
+    degraded=1
+    ;;
+  render-node-missing)
     readiness=RETRYING
     echo "  FAIL: the node-agent is exiting on purpose because it cannot see a /dev/dri render"
     echo "        node the host kernel HAS (#98). A device list is fixed at container creation,"
@@ -1086,7 +1136,7 @@ if [ -n "$agent_log" ]; then
     echo "        check the node-agent service's devices:/gpus: entry, then recreate."
     fail=1
     ;;
-  *boot-render-node-retry-deferred*)
+  retry-deferred)
     # Transient by construction: the agent held the retry back only because a provision was
     # writing a shared volume, and it takes it on the next boot.
     readiness=RETRYING
@@ -1096,7 +1146,7 @@ if [ -n "$agent_log" ]; then
     echo "          $DC logs quasar-node-agent | grep gpu-host-sanity"
     degraded=1
     ;;
-  *boot-dri-modes-stale-cdi*)
+  stale-cdi)
     readiness=FAILED
     echo "  FAIL: the /dev/dri nodes inside the agent container cannot be opened by the app"
     echo "        user — the boot-time CDI spec baked the wrong modes, and no restart can fix"
@@ -1105,7 +1155,7 @@ if [ -n "$agent_log" ]; then
     echo "          $DC up -d --force-recreate"
     fail=1
     ;;
-  *boot-render-node-unopenable*)
+  render-node-unopenable)
     readiness=FAILED
     echo "  FAIL: a /dev/dri render node IS in the agent container but cannot be opened —"
     echo "        a mode/group/device-cgroup fault, which a restart reproduces exactly."
@@ -1113,21 +1163,43 @@ if [ -n "$agent_log" ]; then
     echo "        devices:/device_cgroup_rules: entries, then recreate the containers."
     fail=1
     ;;
-  *boot-render-node-retries-spent* | *boot-host-render-node-missing*)
+  sanity-failed)
     readiness=FAILED
     echo "  FAIL: the node-agent reports a boot sanity failure that no restart can fix:"
     printf '%s' "$readiness_line" | sed 's/^/        /'
     echo "        $DC logs quasar-node-agent | grep gpu-host-sanity"
     fail=1
     ;;
-  *readiness-checks-failed*)
+  checks-failed)
     readiness=FAILED
     echo "  WARN: the node-agent reports FAILING host readiness checks:"
     printf '%s' "$readiness_line" | sed 's/^/        /'
     echo "        Admin -> Hosts -> this host lists them with remediation."
     degraded=1
     ;;
+  unverified | *)
+    # Empty, or a verdict this build does not know. Either way nothing was
+    # observed, so nothing may be claimed.
+    readiness=unverified
+    echo "  WARN: the node-agent logs carry no readiness verdict after 30s, so this deploy is"
+    echo "        UNVERIFIED rather than healthy — the agent may not have reached its startup"
+    echo "        checks, or its log may have rolled past them. Look before trusting it:"
+    echo "          $DC logs quasar-node-agent | grep 'host readiness'"
+    degraded=1
+    ;;
   esac
+  # `codec support probed for` is emitted for EVERY encoder, so it is the one
+  # positive signal that codec probing happened at all — the vulkan codec-plan
+  # line below is absent by design on a VA or openh264 host, and treating that
+  # absence as `ok` was the same false claim as the readiness one (#177).
+  if printf '%s' "$agent_log" | grep -q 'codec support probed for'; then
+    codecs=ok
+  else
+    echo "  WARN: the node-agent never reported a codec probe, so what this host can encode is"
+    echo "        UNVERIFIED:"
+    echo "          $DC logs quasar-node-agent | grep 'codec support probed'"
+    degraded=1
+  fi
   # A codec plan that is merely waiting on the driver volume is the expected first-boot
   # state and self-clears on the agent's restart; only a genuinely degraded plan counts.
   if printf '%s' "$agent_log" | grep -q 'vulkan-codec-plan-degraded'; then
@@ -1151,7 +1223,12 @@ if [ -n "$agent_log" ]; then
     degraded=1
   fi
 else
-  echo "  note: could not read node-agent logs; readiness and codec plan not verified"
+  # Was a `note:` that changed nothing, so a deploy with no agent logs at all
+  # still summarised as result=OK (#177).
+  echo "  WARN: could not read node-agent logs, so host readiness and the codec plan are"
+  echo "        UNVERIFIED — this deploy is not confirmed usable for streaming:"
+  echo "          $DC logs quasar-node-agent"
+  degraded=1
 fi
 
 result=OK

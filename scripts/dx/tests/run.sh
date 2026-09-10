@@ -3286,6 +3286,65 @@ case "$line" in
     fail "testdb:go-present-uses-host" "expected the host runner, got: ${line:-<no runner line>}" ;;
 esac
 
+# ── redeploy readiness classification (#177) ─────────────────────────────────
+# deploy/redeploy.sh's aggregate used to initialise readiness=ok the moment the
+# node-agent log was non-empty, then look for a verdict — so a log with no
+# verdict in it, or a verdict this build did not recognise, summarised as a
+# confident result=OK. The classifier is a pure function precisely so this can
+# be pinned without a stack: line in, cause word out.
+readiness_fn="$(sed -n '/^readiness_cause() {$/,/^}$/p' "$ROOT/deploy/redeploy.sh")"
+if [ -z "$readiness_fn" ]; then
+  fail "redeploy:readiness-fn-present" \
+    "readiness_cause() is gone from deploy/redeploy.sh — this suite cannot pin a function it cannot find"
+else
+  eval "$readiness_fn"
+  cause_is() { # cause_is <id> <want> <line>
+    got="$(readiness_cause "$3")"
+    if [ "$got" = "$2" ]; then
+      pass "redeploy:readiness-$1" "$2"
+    else
+      fail "redeploy:readiness-$1" "want $2, got $got"
+    fi
+  }
+
+  # The two that must never be confused: absence of evidence answers
+  # `unverified`, and only the agent's own all-clear answers `passed`.
+  cause_is "empty-is-unverified" unverified ""
+  cause_is "unknown-line-is-unverified" unverified \
+    "2026-09-11T02:00:00Z  INFO quasar_node_agent: capacity report sent"
+  cause_is "all-clear" passed \
+    "2026-09-11T02:00:00Z  INFO quasar_node_agent::readiness: host readiness: all checks passed or skipped checks=17"
+
+  # The verdict this grep did not know about at all. A first boot mid-provision
+  # is the commonest redeploy there is, and the agent says in as many words that
+  # the host is not usable yet — which used to produce no match, and so OK.
+  cause_is "provisioning-not-usable-yet" provisioning \
+    "2026-09-11T02:00:00Z  INFO quasar_node_agent::readiness: host readiness: no failures; 2 check(s) are being remediated automatically and are not usable yet"
+
+  cause_is "checks-failed" checks-failed \
+    'token="readiness-checks-failed" failed=3 host readiness: 3 check(s) FAILED'
+  cause_is "render-node-missing" render-node-missing 'token="boot-render-node-missing" gpu-host-sanity'
+  cause_is "retry-deferred" retry-deferred 'token="boot-render-node-retry-deferred" gpu-host-sanity'
+  cause_is "retries-spent" sanity-failed 'token="boot-render-node-retries-spent" gpu-host-sanity'
+  cause_is "host-render-node-missing" sanity-failed 'token="boot-host-render-node-missing" gpu-host-sanity'
+  cause_is "stale-cdi" stale-cdi 'token="boot-dri-modes-stale-cdi" gpu-host-sanity'
+  cause_is "unopenable" render-node-unopenable 'token="boot-render-node-unopenable" gpu-host-sanity'
+fi
+
+# Every cause the classifier can answer must have a branch in the aggregate, or
+# a host state falls through to whatever `readiness` was last set to.
+missing_branch=""
+for cause in passed provisioning render-node-missing retry-deferred stale-cdi \
+             render-node-unopenable sanity-failed checks-failed unverified; do
+  grep -qE "^  ${cause}[)|]|^  ${cause} \|" "$ROOT/deploy/redeploy.sh" ||
+    missing_branch="$missing_branch $cause"
+done
+if [ -z "$missing_branch" ]; then
+  pass "redeploy:every-cause-has-a-branch" "9 causes, 9 branches"
+else
+  fail "redeploy:every-cause-has-a-branch" "no branch for:$missing_branch"
+fi
+
 # ── summary ──────────────────────────────────────────────────────────────────
 printf '\n'
 STATUS=ok

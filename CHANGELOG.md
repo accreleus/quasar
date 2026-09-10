@@ -131,6 +131,19 @@ own; the two do not move together, and that is deliberate.
   Contract: `quasar-protocol` "Audit-log names" amendment (additive, no migration).
 
 ### Fixed
+- **`redeploy.sh` no longer reports a deploy healthy on evidence it never saw (#177).**
+  Host readiness and the codec plan were initialised to `ok` the moment the node-agent
+  log came back non-empty, *before* anything looked for a verdict — so a log carrying no
+  readiness verdict at all summarised as a confident `result=OK`, and so did a log with
+  no agent logs to read. Worse, the verdict the agent emits mid-provision (`no failures;
+  N check(s) are being remediated automatically and are not usable yet`) was missing from
+  the classifier entirely, which is the commonest first-boot redeploy there is. Absence
+  of evidence is now its own state: the summary reports `readiness=unverified` /
+  `codecs=unverified` and downgrades the result to `WARN`, the mid-provision verdict is
+  classified and reported as `PROVISIONING`, and only the agent's own all-clear earns an
+  `ok`. The verdict is polled for on the same bounded 30s budget the registration check
+  already uses, over a deeper log tail, so a verdict that simply had not landed yet is
+  not mistaken for one that never will.
 - **A migrating fleet update can no longer run its migration on a session count it
   never read (#175).** `FleetNonTerminalSessions` answers a failed read with
   `(0, error)`, and the wait before the control-plane step was written against the
