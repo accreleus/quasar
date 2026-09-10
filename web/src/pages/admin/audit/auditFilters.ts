@@ -63,12 +63,9 @@ export function segmentCounts(items: AdminActivityItem[]): Record<AuditSegment, 
 }
 
 /** "actor_username or system" — the one label rule the row, the readout and
- *  the CSV export all share. */
+ *  the CSV export all share. `targetLabel` is its counterpart and lives in
+ *  describe.ts, where the resolved `names` map it needs already is. */
 export function actorLabel(item: Pick<AdminActivityItem, "actor_username">): string {
   return item.actor_username ?? "system";
 }
 
-/** "{target_type} {short id}" — short id omitted when there is none. */
-export function targetLabel(item: Pick<AdminActivityItem, "target_type" | "target_id">): string {
-  return item.target_id ? `${item.target_type} ${item.target_id.slice(0, 8)}` : item.target_type;
-}

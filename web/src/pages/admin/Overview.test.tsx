@@ -99,6 +99,7 @@ function activity(id: number, over: Partial<AdminActivityItem> = {}): AdminActiv
     details: {},
     created_at: "2026-08-29T11:02:11Z",
     severity: "warn",
+    names: {},
     ...over,
   };
 }

@@ -396,13 +396,17 @@ func (s *Service) UpdateUser(ctx context.Context, id string, role *string, disab
 // cascades; see store.deleteUser for the guard set. The user's homes are
 // tombstoned and orphaned by that call; the nudge here only shortens how long
 // the bytes survive their owner (#92).
-func (s *Service) DeleteUser(ctx context.Context, id string) error {
-	hosts, err := s.store.deleteUser(ctx, id)
+//
+// Returns the deleted account's username so the caller can record it: after
+// this returns, no read can recover it, so an audit row that carries only the
+// id names nobody forever.
+func (s *Service) DeleteUser(ctx context.Context, id string) (string, error) {
+	hosts, username, err := s.store.deleteUser(ctx, id)
 	if err != nil {
-		return err
+		return "", err
 	}
 	s.reapHomesOn(ctx, hosts)
-	return nil
+	return username, nil
 }
 
 // --- validation --------------------------------------------------------------

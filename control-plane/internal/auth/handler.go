@@ -346,11 +346,17 @@ func (h *Handler) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "cannot delete your own account")
 		return
 	}
-	err := h.svc.DeleteUser(r.Context(), id)
+	username, err := h.svc.DeleteUser(r.Context(), id)
 	switch {
 	case err == nil:
 		caller, _ := UserFromContext(r.Context())
-		audit.TryRecord(r.Context(), h.auditor, caller.ID, "user.deleted", "user", id, nil)
+		// Stamp the username: the row is gone, so this audit entry is the only
+		// thing that can still say whose account was deleted.
+		var details map[string]any
+		if username != "" {
+			details = map[string]any{"username": username}
+		}
+		audit.TryRecord(r.Context(), h.auditor, caller.ID, "user.deleted", "user", id, details)
 		w.WriteHeader(http.StatusNoContent)
 	case errors.Is(err, ErrUserNotFound):
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "user not found")

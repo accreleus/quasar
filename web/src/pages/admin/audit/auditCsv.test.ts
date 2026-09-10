@@ -13,6 +13,7 @@ function item(over: Partial<AdminActivityItem> = {}): AdminActivityItem {
     details: { reason: "maintenance" },
     created_at: "2026-08-08T14:02:11Z",
     severity: "warn",
+    names: {},
     ...over,
   };
 }
@@ -20,7 +21,7 @@ function item(over: Partial<AdminActivityItem> = {}): AdminActivityItem {
 describe("toCsv", () => {
   it("emits the header row", () => {
     expect(toCsv([]).split("\n")[0]).toBe(
-      "time,actor,action,target_type,target_id,severity,details",
+      "time,actor,action,target_type,target_id,target_name,severity,details",
     );
   });
 
@@ -52,10 +53,18 @@ describe("toCsv", () => {
     expect(csv).toContain('"{""a"":1,""b"":""two""}"');
   });
 
-  it("leaves target_id blank when absent", () => {
+  it("leaves target_id and target_name blank when there is no target", () => {
     const csv = toCsv([item({ target_id: null })]);
     const fields = csv.split("\n")[1].split(",");
-    // target_id is the 5th field (time,actor,action,target_type,target_id,…)
+    // fields 5 and 6 (time,actor,action,target_type,target_id,target_name,…)
     expect(fields[4]).toBe("");
+    expect(fields[5]).toBe("");
+  });
+
+  it("carries the resolved name beside the id, never instead of it", () => {
+    const csv = toCsv([item({ target_id: "h-1", names: { "h-1": "gpu-test" } })]);
+    const fields = csv.split("\n")[1].split(",");
+    expect(fields[4]).toBe("h-1");
+    expect(fields[5]).toBe("gpu-test");
   });
 });

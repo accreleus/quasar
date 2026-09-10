@@ -71,9 +71,13 @@ services:
       QUASAR_DEV_AGENT_AUTH: ${QUASAR_DEV_AGENT_AUTH:-}
       # First-admin bootstrap: idempotent, no-op once an admin exists. Set these
       # so a fresh local DB is immediately usable in the admin UI.
-      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@local.test}
-      BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-admin}
-      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-local-dev-admin}
+      # The password must not CONTAIN the username or the email local-part
+      # (auth.checkPasswordIdentity) - a default of "local-dev-admin" against
+      # username "admin" is refused at boot and crash-loops the container, so
+      # the default deliberately shares no substring with either identifier.
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-operator@local.test}
+      BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-operator}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-local-dev-secret}
       # The SPA is served by the control-plane from this path.
       QUASAR_WEB_ROOT: /app/web
       GOMEMLIMIT: ${GOMEMLIMIT:-1GiB}

@@ -29,7 +29,7 @@
 #
 # Admin credentials:
 #   local:  BOOTSTRAP_ADMIN_EMAIL/PASSWORD env (defaults match
-#           deploy/overlays/docker-compose.local.yml: admin@local.test / local-dev-admin)
+#           deploy/overlays/docker-compose.local.yml: operator@local.test / local-dev-secret)
 #   remote: read out of deploy/.env on the resolved host over ssh — same
 #           source qses's admin_exec() uses (each stack's creds live in ITS
 #           OWN deploy/.env; no other host can read them).
