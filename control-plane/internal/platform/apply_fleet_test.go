@@ -97,6 +97,12 @@ type fakeFleetStore struct {
 	// Release-read fault injection: reads from the releaseErrFrom'th on fail.
 	releaseReads   int
 	releaseErrFrom int
+	// Session-count fault injection (#175): reads in
+	// [sessionsErrFrom, sessionsErrTo] fail, and sessionsErrTo == 0 means "and
+	// every read after that". Counting from 1, as releaseErrFrom does.
+	sessionsReads   int
+	sessionsErrFrom int
+	sessionsErrTo   int
 }
 
 func newFakeFleetStore(force bool) *fakeFleetStore {
@@ -146,7 +152,22 @@ func (f *fakeFleetStore) CordonedHosts(context.Context, string) ([]HostCordon, e
 func (f *fakeFleetStore) FleetNonTerminalSessions(context.Context) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.sessionsReads++
+	if f.sessionsErrFrom > 0 && f.sessionsReads >= f.sessionsErrFrom &&
+		(f.sessionsErrTo == 0 || f.sessionsReads <= f.sessionsErrTo) {
+		// (0, err), exactly as the real store answers a failed count. The zero
+		// IS the defect in #175, so a sentinel here would test a store that
+		// does not exist.
+		return 0, errors.New("session count failed")
+	}
 	return f.sessions, nil
+}
+
+// countReads is how many times the run has asked for the fleet's session count.
+func (f *fakeFleetStore) countReads() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sessionsReads
 }
 
 func (f *fakeFleetStore) FleetInFlightSessions(context.Context) (int, error) {
@@ -1280,5 +1301,172 @@ func TestFleetDoesNotTreatAnOfflineHostAsAnAdminsCordon(t *testing.T) {
 	// And it must not be left draining.
 	if st, err := store.HostStatus(context.Background(), "h1"); err == nil && st == "draining" {
 		t.Fatal("an offline host was left draining by the run's own restore")
+	}
+}
+
+// #175. A migrating control-plane step is the one place a session count is
+// load-bearing rather than advisory: past it the database is migrated, and every
+// migration in this repo was authored assuming no session was live. The store
+// answers a failed count with `(0, error)` and every wait below is written
+// against `remaining`, so a read that fails at the wrong moment reads exactly
+// like "the fleet has drained".
+//
+// The four tests below pin the three places that could happen and the one place
+// it must not cost a healthy run anything.
+
+// The FIRST count fails. This used to `return true` — "the count is advisory;
+// refusing to update over it would be worse" — which sent the release.
+func TestFleetMigratingStepWillNotProceedOnAnUnreadableSessionCount(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.setSessions(2)
+	store.sessionsErrFrom = 1 // every read fails
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+	f.Deadline = 300 * time.Millisecond
+
+	run := runToEnd(t, f, store)
+
+	if run.State != RunFailed {
+		t.Fatalf("run state = %q, want failed: a migration must not run on a count nobody read", run.State)
+	}
+	if steps := d.steps(); len(steps) != 0 {
+		t.Fatalf("targets reached = %v, want nothing sent", steps)
+	}
+	as, _ := store.RunAttempts(context.Background(), testRunID)
+	if len(as) != 1 || as[0].Target != TargetControlPlane {
+		t.Fatalf("attempts = %+v, want one control-plane attempt", as)
+	}
+	if as[0].Reason == nil || *as[0].Reason != ReasonTimeout {
+		t.Fatalf("failure reason = %v, want %q", as[0].Reason, ReasonTimeout)
+	}
+	// Nothing may be reported as remaining: no read ever produced a number.
+	if got := store.recordedRemaining(); len(got) != 0 {
+		t.Fatalf("recorded sessions_remaining = %v, want none — every read failed", got)
+	}
+}
+
+// A count that fails DURING the wait must not end it. `remaining, err =
+// store.FleetNonTerminalSessions(ctx)` assigned the store's zero before the
+// error was even looked at, and `continue` then re-tested `remaining > 0`
+// against it — so the second poll of a fleet that never emptied sent the
+// release.
+func TestFleetMigratingStepKeepsWaitingWhenAPollCannotCount(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.setSessions(3)
+	store.sessionsErrFrom = 2 // the first read succeeds; every poll after fails
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+	f.Deadline = 300 * time.Millisecond
+
+	run := runToEnd(t, f, store)
+
+	if run.State != RunFailed {
+		t.Fatalf("run state = %q, want failed: the fleet never emptied", run.State)
+	}
+	if steps := d.steps(); len(steps) != 0 {
+		t.Fatalf("targets reached = %v, want nothing sent", steps)
+	}
+	// The one count that DID read is the one the operator was shown, and it is
+	// not zero.
+	if got := store.recordedRemaining(); len(got) != 1 || got[0] != 3 {
+		t.Fatalf("recorded sessions_remaining = %v, want just the 3 that read", got)
+	}
+}
+
+// The other half of the same rule: a transient count failure must cost a healthy
+// run nothing. Once a read succeeds and says zero, the step proceeds.
+func TestFleetMigratingStepProceedsOnceACountActuallyReadsZero(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.setSessions(1)
+	// The first read is good; the next five fail; then reads work again.
+	store.sessionsErrFrom, store.sessionsErrTo = 2, 6
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+
+	f.Start(store.run)
+	waitFor(t, "the failing polls to be spent", func() bool { return store.countReads() > 6 })
+	store.setSessions(0)
+	waitFor(t, "the run to finish", func() bool {
+		r, _ := store.Run(context.Background(), testRunID)
+		return TerminalRunState(r.State)
+	})
+
+	run, _ := store.Run(context.Background(), testRunID)
+	if run.State != RunSucceeded {
+		t.Fatalf("run state = %q, want succeeded: the count recovered and read zero", run.State)
+	}
+	if got := d.steps(); len(got) != 2 || got[0] != TargetControlPlane || got[1] != "h1" {
+		t.Fatalf("targets reached = %v, want the control plane then the host", got)
+	}
+}
+
+// force + migrating. `force` is the operator agreeing to lose the sessions, not
+// agreeing to migrate without knowing. The recount right after the drain used to
+// take the store's zero on failure and skip the wait entirely.
+//
+// Drain here succeeds without the count having reached zero, which is the
+// ordinary shape rather than a contrived one: coordinator.DrainHost ends
+// sessions asynchronously, so the rows are still non-terminal when it returns.
+func TestFleetForcedMigratingStepDoesNotReadAFailedRecountAsDrained(t *testing.T) {
+	store := newFakeFleetStore(true)
+	store.setSessions(2)
+	// 1 = the count recorded before the drain; 2 = the recount after it, and
+	// every poll from there.
+	store.sessionsErrFrom = 2
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	cordons := store.cordons()
+	cordons.Drain = func(context.Context, string) error { return nil }
+	f := NewFleetRunner(store, d, d, ManifestOrEdge{}, cordons,
+		fleetView("", hostTarget("h1", "gpu-01", "")), testLogger())
+	f.PollWait = time.Millisecond
+	f.Deadline = 300 * time.Millisecond
+	f.AdoptSettle = time.Millisecond
+	f.InFlightSettle = 50 * time.Millisecond
+	f.SchemaVersion = fakeReleaseSchema - 1
+	t.Cleanup(f.Close)
+
+	run := runToEnd(t, f, store)
+
+	if run.State != RunFailed {
+		t.Fatalf("run state = %q, want failed: the recount never proved the fleet empty", run.State)
+	}
+	if steps := d.steps(); len(steps) != 0 {
+		t.Fatalf("targets reached = %v, want nothing sent", steps)
+	}
+	// What force cost is still recorded, from the one read that worked.
+	if got := store.recordedRemaining(); len(got) != 1 || got[0] != 2 {
+		t.Fatalf("recorded sessions_remaining = %v, want the 2 that were live", got)
+	}
+}
+
+// The wait is bounded AND interruptible whatever the count says: an unknown
+// count must not make a run impossible to stop. The mechanism is the one the
+// loop already had — an attempt resolved from outside, which is how a cancel
+// reaches a step that has not been sent — and it still works while every count
+// read is failing (#175 acceptance).
+func TestFleetAWaitWhoseCountCannotBeReadStillStopsWhenTheAttemptResolves(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.setSessions(2)
+	store.sessionsErrFrom = 1 // every read fails; the wait cannot end on its own
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+	f.Deadline = time.Minute // far longer than this test: only the resolution can end it
+
+	f.Start(store.run)
+	waitFor(t, "the control-plane attempt to exist", func() bool {
+		as, _ := store.RunAttempts(context.Background(), testRunID)
+		return len(as) == 1
+	})
+	as, _ := store.RunAttempts(context.Background(), testRunID)
+	if err := store.FailAttempt(context.Background(), as[0].ID, ReasonTimeout, ""); err != nil {
+		t.Fatalf("resolve the attempt: %v", err)
+	}
+
+	waitFor(t, "the run to finish", func() bool {
+		r, _ := store.Run(context.Background(), testRunID)
+		return TerminalRunState(r.State)
+	})
+	if steps := d.steps(); len(steps) != 0 {
+		t.Fatalf("targets reached = %v, want nothing sent", steps)
 	}
 }

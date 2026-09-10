@@ -131,6 +131,19 @@ own; the two do not move together, and that is deliberate.
   Contract: `quasar-protocol` "Audit-log names" amendment (additive, no migration).
 
 ### Fixed
+- **A migrating fleet update can no longer run its migration on a session count it
+  never read (#175).** `FleetNonTerminalSessions` answers a failed read with
+  `(0, error)`, and the wait before the control-plane step was written against the
+  count, so a database error at the wrong moment read exactly like "the fleet has
+  drained". Three places could take it: the first count returned `true` outright
+  ("the count is advisory"), the recount after a forced drain assigned the zero
+  before the error was looked at, and the drain poll did the same and then re-tested
+  its own loop condition against it. Past that wait the database is migrated, and
+  every migration in this repo was authored assuming no session was live. An
+  unreadable count is now held distinct from zero, only a read that *succeeded* and
+  said zero lets the step proceed, and a store that never answers ends the attempt
+  as `timeout` within the existing deadline rather than as a migration over live
+  sessions. A transient failure still costs a healthy run nothing.
 - **The install page's compose template is no longer stale.** `deploy/docker-compose.yml`
   gained the release-webhook, agent health-address and updater signature knobs without
   `npm run compose:sync` being re-run, so the quick-start page handed operators a compose

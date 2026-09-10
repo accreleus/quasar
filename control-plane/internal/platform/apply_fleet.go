@@ -448,19 +448,22 @@ func (f *FleetRunner) prepareFleet(ctx context.Context, run ApplyRun, a Attempt)
 		return f.settleInFlight(ctx, run, a)
 	}
 
-	remaining, err := f.store.FleetNonTerminalSessions(ctx)
-	if err != nil {
-		f.log.Error("fleet apply: could not count sessions", "run_id", run.ID, "err", err)
-		return true // the count is advisory; refusing to update over it would be worse
-	}
-	// The N the operator agreed to lose is recorded BEFORE anything ends it,
-	// forced or not — on the forced path the count is about to be zero, and a
-	// watcher seeing only that would never learn what the run cost.
-	if err := f.store.SetWaitingSessions(ctx, a.ID, remaining); err != nil {
-		f.log.Warn("fleet apply: could not record sessions_remaining", "attempt_id", a.ID, "err", err)
+	// From here the count is not advisory. Past this wait the database is
+	// migrated, and only a read that SUCCEEDED and said zero is evidence that
+	// nothing is live to migrate under (#175).
+	remaining := f.countFleetSessions(ctx, run.ID, "before the control-plane step")
+	if remaining != unknownSessionCount {
+		// The N the operator agreed to lose is recorded BEFORE anything ends it,
+		// forced or not — on the forced path the count is about to be zero, and a
+		// watcher seeing only that would never learn what the run cost. A count
+		// that did not read is not recorded at all: `sessions_remaining` is a
+		// number a client shows an operator, and there is no honest number here.
+		if err := f.store.SetWaitingSessions(ctx, a.ID, remaining); err != nil {
+			f.log.Warn("fleet apply: could not record sessions_remaining", "attempt_id", a.ID, "err", err)
+		}
 	}
 
-	if run.Force && remaining > 0 {
+	if run.Force && remaining != 0 {
 		// Stop what the operator agreed to end. Pre-#128 the recreate did this
 		// by itself and `force` only had to skip the wait; it no longer does, so
 		// a force that merely skipped would run the migration under the very
@@ -469,12 +472,11 @@ func (f *FleetRunner) prepareFleet(ctx context.Context, run ApplyRun, a Attempt)
 		//
 		// Guarded on the count: with nothing to end, force has nothing to
 		// discharge, and a fleet-wide session_stop is not a side effect to take
-		// for the sake of symmetry.
+		// for the sake of symmetry. `!= 0` rather than `> 0`, so an unknown
+		// count drains rather than skipping — `force` is consent to end the
+		// sessions, and the unknown case is the one where they may still be there.
 		f.stopFleetSessions(ctx, run)
-		if remaining, err = f.store.FleetNonTerminalSessions(ctx); err != nil {
-			f.log.Warn("fleet apply: could not re-count sessions after the force drain",
-				"run_id", run.ID, "err", err)
-		}
+		remaining = f.countFleetSessions(ctx, run.ID, "after the force drain")
 	}
 
 	started := a.CreatedAt
@@ -482,9 +484,17 @@ func (f *FleetRunner) prepareFleet(ctx context.Context, run ApplyRun, a Attempt)
 		started = *a.StartedAt
 	}
 	deadline := started.Add(f.Deadline)
-	for remaining > 0 {
+	// `!= 0`, so an unknown count keeps waiting exactly as a positive one does.
+	// The deadline still bounds it: a store that never answers ends as a
+	// `timeout` failure, not as a migration over live sessions.
+	for remaining != 0 {
 		if time.Now().After(deadline) {
-			f.log.Warn("fleet apply: the fleet did not drain before the deadline", "run_id", run.ID)
+			if remaining == unknownSessionCount {
+				f.log.Error("fleet apply: the fleet's session count never read before the deadline; refusing the migrating step",
+					"run_id", run.ID, "token", "cp-step-count-unreadable")
+			} else {
+				f.log.Warn("fleet apply: the fleet did not drain before the deadline", "run_id", run.ID)
+			}
 			f.failAttempt(a.ID, ReasonTimeout)
 			return false
 		}
@@ -498,16 +508,40 @@ func (f *FleetRunner) prepareFleet(ctx context.Context, run ApplyRun, a Attempt)
 		if cur, err := f.store.Attempt(ctx, a.ID); err == nil && TerminalAttemptState(cur.State) {
 			return false
 		}
-		remaining, err = f.store.FleetNonTerminalSessions(ctx)
-		if err != nil {
-			f.log.Warn("fleet apply: session count failed while draining", "run_id", run.ID, "err", err)
+		// Assign only on a read that worked. The old code assigned the store's
+		// `(0, err)` zero and then looked at the error, so the `continue` below
+		// re-tested the loop condition against a zero no read had produced.
+		n := f.countFleetSessions(ctx, run.ID, "while draining")
+		if n == unknownSessionCount {
 			continue
 		}
+		remaining = n
 		if err := f.store.SetWaitingSessions(ctx, a.ID, remaining); err != nil {
 			f.log.Warn("fleet apply: could not record sessions_remaining", "attempt_id", a.ID, "err", err)
 		}
 	}
 	return true
+}
+
+// unknownSessionCount is what a failed fleet-wide session count answers with.
+// The store answers a failed read with `(0, error)`, and every wait on the
+// migrating path is written against the count — so a count taken straight from a
+// failed read says "the fleet has drained" at the one moment that claim is
+// load-bearing. This says the opposite, and `!= 0` is what the waits test (#175).
+const unknownSessionCount = -1
+
+// countFleetSessions reads the fleet's non-terminal session count, answering
+// unknownSessionCount rather than the store's zero when the read fails. `when`
+// names the moment for the log; a failed count on this path is an error rather
+// than a warning, because it is about to hold up a release.
+func (f *FleetRunner) countFleetSessions(ctx context.Context, runID, when string) int {
+	n, err := f.store.FleetNonTerminalSessions(ctx)
+	if err != nil {
+		f.log.Error("fleet apply: could not count the fleet's sessions",
+			"run_id", runID, "when", when, "err", err, "token", "cp-step-count-failed")
+		return unknownSessionCount
+	}
+	return n
 }
 
 // releaseRunsAMigration answers what prepareFleet branches on. An unreadable
