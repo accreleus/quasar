@@ -1470,3 +1470,62 @@ func TestFleetAWaitWhoseCountCannotBeReadStillStopsWhenTheAttemptResolves(t *tes
 		t.Fatalf("targets reached = %v, want nothing sent", steps)
 	}
 }
+
+// The initial-unknown branches, which the two above do not reach: they either
+// never let a count succeed, or let the FIRST one succeed. An implementation
+// that gave up (or proceeded) the moment the first read failed would still pass
+// both (#175 review).
+
+// Only the first count fails. The wait must keep polling and finish on the first
+// read that actually says zero.
+func TestFleetMigratingStepRetriesAnInitiallyUnreadableSessionCount(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.setSessions(1)
+	store.sessionsErrFrom, store.sessionsErrTo = 1, 1
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+
+	f.Start(store.run)
+	waitFor(t, "a retry after the initial failed count", func() bool { return store.countReads() > 1 })
+	store.setSessions(0)
+	waitFor(t, "the run to finish", func() bool {
+		r, _ := store.Run(context.Background(), testRunID)
+		return TerminalRunState(r.State)
+	})
+
+	run, _ := store.Run(context.Background(), testRunID)
+	if run.State != RunSucceeded {
+		t.Fatalf("run state = %q, want succeeded once a count read zero", run.State)
+	}
+	if got := d.steps(); len(got) != 2 || got[0] != TargetControlPlane || got[1] != "h1" {
+		t.Fatalf("targets reached = %v, want the control plane then the host", got)
+	}
+}
+
+// force with an unknown FIRST count still drains. This is the branch that reads
+// `!known || remaining != 0`: reverting it to "drain only when the count is
+// positive" would silently make a forced run skip the drain in exactly the case
+// where it cannot tell whether there is anything to drain.
+func TestFleetForcedMigratingStepDrainsWhenTheInitialCountIsUnreadable(t *testing.T) {
+	store := newFakeFleetStore(true)
+	store.setSessions(2)
+	store.sessionsErrFrom, store.sessionsErrTo = 1, 1
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+
+	run := runToEnd(t, f, store)
+
+	if run.State != RunSucceeded {
+		t.Fatalf("run state = %q, want succeeded after the drain and a successful recount", run.State)
+	}
+	if drained := store.drained(); len(drained) != 2 {
+		t.Fatalf("force-drained hosts = %v, want both recorded hosts", drained)
+	}
+	if got := d.steps(); len(got) != 2 || got[0] != TargetControlPlane || got[1] != "h1" {
+		t.Fatalf("targets reached = %v, want the control plane then the host", got)
+	}
+	// Nothing may be reported as remaining: the only count before the drain failed.
+	if got := store.recordedRemaining(); len(got) != 0 && got[0] != 0 {
+		t.Fatalf("recorded sessions_remaining = %v, want no pre-drain number", got)
+	}
+}
