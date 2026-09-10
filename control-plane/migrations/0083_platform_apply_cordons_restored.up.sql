@@ -15,10 +15,14 @@
 -- on a terminal run whose `cordoned_hosts` is non-empty means "this run's
 -- scheduling changes have not been proven undone", and the boot sweep retries it.
 ALTER TABLE platform_apply_runs
-    ADD COLUMN cordons_restored_at TIMESTAMPTZ;
+    ADD COLUMN cordons_restored_at TIMESTAMPTZ,
+    ADD COLUMN cordon_restore_attempted_at TIMESTAMPTZ;
 
 COMMENT ON COLUMN platform_apply_runs.cordons_restored_at IS
     'When this run''s scheduling changes were proven undone (every host it cordoned back in scheduling, every admin cordon it found put back). NULL on a terminal run with a non-empty cordoned_hosts is a recovery requirement the next boot retries. Not served.';
+
+COMMENT ON COLUMN platform_apply_runs.cordon_restore_attempted_at IS
+    'When the boot sweep last tried this run''s cleanup. Ordering key, not a record: the sweep is bounded per start, so without it a handful of permanently-failing runs would be re-selected forever and an older requirement behind them would never be looked at again. Not served.';
 
 -- Runs that are ALREADY terminal predate this column, so nothing recorded
 -- whether their cleanup finished. Stamp them rather than sweeping them: their

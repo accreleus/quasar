@@ -358,19 +358,35 @@ func (s *Store) MarkCordonsRestored(ctx context.Context, runID string) error {
 	return nil
 }
 
-// RunsWithUnrestoredCordons is every terminal run that cordoned something and
-// was never able to prove it put it back, newest first. Bounded by limit: this
-// is a boot sweep, not a backlog drain, and a run that keeps failing is retried
-// on the next boot rather than in a loop on this one.
-func (s *Store) RunsWithUnrestoredCordons(ctx context.Context, limit int) ([]string, error) {
+// ClaimUnrestoredCordons is every terminal run that cordoned something and was
+// never able to prove it put it back — least-recently-attempted first, and
+// stamped as attempted in the same statement.
+//
+// Bounded by limit: this is a boot sweep, not a backlog drain. The ordering is
+// what keeps the bound honest. A plain `created_at DESC LIMIT n` re-selects the
+// same newest n on every start, so a handful of permanently-failing runs would
+// hide every older requirement behind them forever and those hosts would stay
+// `draining` across unlimited restarts. Never-attempted rows go first (NULLS
+// FIRST), then the oldest attempt, so a persistent failure rotates to the back
+// instead of monopolising the window.
+func (s *Store) ClaimUnrestoredCordons(ctx context.Context, limit int) ([]string, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id::text FROM platform_apply_runs
-		 WHERE state IN `+terminalRunStatesSQL+`
-		   AND cordons_restored_at IS NULL
-		   AND jsonb_array_length(cordoned_hosts) > 0
-		 ORDER BY created_at DESC LIMIT $1`, limit)
+		WITH picked AS (
+			SELECT id FROM platform_apply_runs
+			 WHERE state IN `+terminalRunStatesSQL+`
+			   AND cordons_restored_at IS NULL
+			   AND jsonb_array_length(cordoned_hosts) > 0
+			 ORDER BY cordon_restore_attempted_at ASC NULLS FIRST, created_at DESC
+			 LIMIT $1
+			 FOR UPDATE SKIP LOCKED
+		)
+		UPDATE platform_apply_runs AS r
+		   SET cordon_restore_attempted_at = now()
+		  FROM picked
+		 WHERE r.id = picked.id
+		RETURNING r.id::text`, limit)
 	if err != nil {
-		return nil, fmt.Errorf("query unrestored cordons: %w", err)
+		return nil, fmt.Errorf("claim unrestored cordons: %w", err)
 	}
 	defer rows.Close()
 	out := make([]string, 0)
