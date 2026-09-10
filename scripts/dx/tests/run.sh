@@ -3288,59 +3288,130 @@ esac
 
 # ── redeploy readiness classification (#177) ─────────────────────────────────
 # deploy/redeploy.sh's aggregate used to initialise readiness=ok the moment the
-# node-agent log was non-empty, then look for a verdict — so a log with no
-# verdict in it, or a verdict this build did not recognise, summarised as a
-# confident result=OK. The classifier is a pure function precisely so this can
-# be pinned without a stack: line in, cause word out.
-readiness_fn="$(sed -n '/^readiness_cause() {$/,/^}$/p' "$ROOT/deploy/redeploy.sh")"
-if [ -z "$readiness_fn" ]; then
-  fail "redeploy:readiness-fn-present" \
-    "readiness_cause() is gone from deploy/redeploy.sh — this suite cannot pin a function it cannot find"
+# node-agent log was non-empty and only THEN look for a verdict, so a log with no
+# verdict in it — or one the classifier did not recognise — summarised as a
+# confident result=OK. Classification lives in a sourceable library precisely so
+# this is pinnable without a stack.
+# shellcheck source=../../../deploy/lib/agent-readiness.sh
+. "$ROOT/deploy/lib/agent-readiness.sh"
+
+# The verdict lines the agent actually emits. Kept as one table because two
+# checks read it: the cause each line classifies as, and that the pre-filter
+# lets each line through in the first place — a verdict the filter drops never
+# reaches the classifier, which is exactly how the mid-provision verdict went
+# unnoticed.
+READINESS_SAMPLES=(
+  'passed|2026-09-11T02:00:00Z  INFO quasar_node_agent::readiness: host readiness: all checks passed or skipped checks=17'
+  'provisioning|2026-09-11T02:00:00Z  INFO quasar_node_agent::readiness: host readiness: no failures; 2 check(s) are being remediated automatically and are not usable yet'
+  'checks-failed|token="readiness-checks-failed" failed=3 host readiness: 3 check(s) FAILED'
+  'render-node-missing|token="boot-render-node-missing" gpu-host-sanity'
+  'retry-deferred|token="boot-render-node-retry-deferred" gpu-host-sanity'
+  'sanity-failed-spent|token="boot-render-node-retries-spent" gpu-host-sanity'
+  'sanity-failed-host|token="boot-host-render-node-missing" gpu-host-sanity'
+  'stale-cdi|token="boot-dri-modes-stale-cdi" gpu-host-sanity'
+  'render-node-unopenable|token="boot-render-node-unopenable" gpu-host-sanity'
+)
+
+for sample in "${READINESS_SAMPLES[@]}"; do
+  id="${sample%%|*}"
+  line="${sample#*|}"
+  want="${id%%-spent}"; want="${want%%-host}"
+  case "$id" in sanity-failed-*) want=sanity-failed ;; esac
+  got="$(readiness_cause "$line")"
+  if [ "$got" = "$want" ]; then
+    pass "redeploy:readiness-cause-$id" "$want"
+  else
+    fail "redeploy:readiness-cause-$id" "want $want, got $got"
+  fi
+  # And the filter must reach it. This is the coupling that broke.
+  if grep -qE "$(readiness_filter_re)" <<<"$line"; then
+    pass "redeploy:readiness-filter-$id" "reaches the classifier"
+  else
+    fail "redeploy:readiness-filter-$id" "the pre-filter drops a line readiness_cause classifies"
+  fi
+done
+
+# Absence of evidence answers `unverified`, not health. Both halves of it.
+got="$(readiness_cause "$(readiness_line '')")"
+[ "$got" = unverified ] &&
+  pass "redeploy:readiness-empty-is-unverified" "unverified" ||
+  fail "redeploy:readiness-empty-is-unverified" "want unverified, got $got"
+got="$(readiness_cause "$(readiness_line 'INFO quasar_node_agent: capacity report sent')")"
+[ "$got" = unverified ] &&
+  pass "redeploy:readiness-unknown-line-is-unverified" "unverified" ||
+  fail "redeploy:readiness-unknown-line-is-unverified" "want unverified, got $got"
+
+# The behaviour the operator actually sees: a log in, the three summary fields
+# out. These are what a regression restoring the false OK would break — the
+# per-cause checks above would still pass.
+summary_is() { # summary_is <id> <want-readiness> <want-codecs> <want-severity> <log>
+  local out want
+  out="$(agent_summary "$5")"
+  want="readiness=$2
+codecs=$3
+severity=$4"
+  if [ "$out" = "$want" ]; then
+    pass "redeploy:summary-$1" "readiness=$2 codecs=$3 severity=$4"
+  else
+    fail "redeploy:summary-$1" "want [$(tr '\n' ' ' <<<"$want")], got [$(tr '\n' ' ' <<<"$out")]"
+  fi
+}
+
+ALL_CLEAR='2026-09-11T02:00:00Z  INFO quasar_node_agent::readiness: host readiness: all checks passed or skipped checks=17'
+PROBED='2026-09-11T02:00:01Z  INFO quasar_node_agent: codec support probed for Vulkan encoder'
+PENDING='token="vulkan-codec-plan-pending-driver-volume" first boot'
+DEGRADED='token="vulkan-codec-plan-degraded" av1 has no vulkan element'
+
+# No log at all, and a log with nothing in it we recognise. Both used to be OK.
+summary_is "no-log" unverified unverified warn ""
+summary_is "unrelated-log" unverified unverified warn 'INFO quasar_node_agent: capacity report sent'
+# The healthy host is still plainly healthy — the point is not to cry wolf.
+summary_is "healthy" ok ok ok "$ALL_CLEAR
+$PROBED"
+# A readiness verdict with no codec probe is half-observed, and says so.
+summary_is "readiness-without-codec-probe" ok unverified warn "$ALL_CLEAR"
+# The verdict that was missing from the classifier entirely.
+summary_is "mid-provision" PROVISIONING ok warn 'INFO quasar_node_agent::readiness: host readiness: no failures; 2 check(s) are being remediated automatically and are not usable yet
+'"$PROBED"
+# A boot-sanity failure fails the deploy; a failing readiness check degrades it.
+summary_is "sanity-fails-the-deploy" FAILED ok fail 'token="boot-render-node-unopenable" gpu-host-sanity
+'"$PROBED"
+summary_is "failing-checks-degrade" FAILED ok warn 'token="readiness-checks-failed" failed=3 host readiness: 3 check(s) FAILED
+'"$PROBED"
+
+# The LATEST probe decides. Docker keeps a container's log across restarts, so a
+# first boot's pending must not outlive the healthy probe that followed it — and
+# an older healthy probe must not outvote a newer degraded one.
+summary_is "codec-latest-probe-wins-healthy" ok ok ok "$PENDING
+$PROBED
+$ALL_CLEAR
+$PROBED"
+summary_is "codec-latest-probe-wins-degraded" ok degraded warn "$ALL_CLEAR
+$PROBED
+$DEGRADED
+$PROBED"
+# A plan line with no probe after it is still only a candidate, and reported.
+summary_is "codec-pending-first-boot" ok pending ok "$ALL_CLEAR
+$PENDING"
+
+# grep -q exits at the first match; under `set -o pipefail` the SIGPIPE that
+# gives a piping writer makes the pipeline non-zero, so a present line can read
+# as absent on a long log. The library must not be written that way.
+if grep -qE "printf '%s'[^|]*\| *grep" "$ROOT/deploy/lib/agent-readiness.sh"; then
+  fail "redeploy:no-pipefail-grep" "agent-readiness.sh pipes into grep; use a here-string"
 else
-  eval "$readiness_fn"
-  cause_is() { # cause_is <id> <want> <line>
-    got="$(readiness_cause "$3")"
-    if [ "$got" = "$2" ]; then
-      pass "redeploy:readiness-$1" "$2"
-    else
-      fail "redeploy:readiness-$1" "want $2, got $got"
-    fi
-  }
-
-  # The two that must never be confused: absence of evidence answers
-  # `unverified`, and only the agent's own all-clear answers `passed`.
-  cause_is "empty-is-unverified" unverified ""
-  cause_is "unknown-line-is-unverified" unverified \
-    "2026-09-11T02:00:00Z  INFO quasar_node_agent: capacity report sent"
-  cause_is "all-clear" passed \
-    "2026-09-11T02:00:00Z  INFO quasar_node_agent::readiness: host readiness: all checks passed or skipped checks=17"
-
-  # The verdict this grep did not know about at all. A first boot mid-provision
-  # is the commonest redeploy there is, and the agent says in as many words that
-  # the host is not usable yet — which used to produce no match, and so OK.
-  cause_is "provisioning-not-usable-yet" provisioning \
-    "2026-09-11T02:00:00Z  INFO quasar_node_agent::readiness: host readiness: no failures; 2 check(s) are being remediated automatically and are not usable yet"
-
-  cause_is "checks-failed" checks-failed \
-    'token="readiness-checks-failed" failed=3 host readiness: 3 check(s) FAILED'
-  cause_is "render-node-missing" render-node-missing 'token="boot-render-node-missing" gpu-host-sanity'
-  cause_is "retry-deferred" retry-deferred 'token="boot-render-node-retry-deferred" gpu-host-sanity'
-  cause_is "retries-spent" sanity-failed 'token="boot-render-node-retries-spent" gpu-host-sanity'
-  cause_is "host-render-node-missing" sanity-failed 'token="boot-host-render-node-missing" gpu-host-sanity'
-  cause_is "stale-cdi" stale-cdi 'token="boot-dri-modes-stale-cdi" gpu-host-sanity'
-  cause_is "unopenable" render-node-unopenable 'token="boot-render-node-unopenable" gpu-host-sanity'
+  pass "redeploy:no-pipefail-grep" "no writer piped into an early-exiting grep"
 fi
 
-# Every cause the classifier can answer must have a branch in the aggregate, or
-# a host state falls through to whatever `readiness` was last set to.
+# Every cause the classifier can answer must have a branch in the aggregate, or a
+# host state falls through to whatever `readiness` happened to be.
 missing_branch=""
 for cause in passed provisioning render-node-missing retry-deferred stale-cdi \
-             render-node-unopenable sanity-failed checks-failed unverified; do
-  grep -qE "^  ${cause}[)|]|^  ${cause} \|" "$ROOT/deploy/redeploy.sh" ||
-    missing_branch="$missing_branch $cause"
+             render-node-unopenable sanity-failed checks-failed; do
+  grep -qE "^  ${cause}\)" "$ROOT/deploy/redeploy.sh" || missing_branch="$missing_branch $cause"
 done
 if [ -z "$missing_branch" ]; then
-  pass "redeploy:every-cause-has-a-branch" "9 causes, 9 branches"
+  pass "redeploy:every-cause-has-a-branch" "8 named causes, 8 branches (unverified is the default arm)"
 else
   fail "redeploy:every-cause-has-a-branch" "no branch for:$missing_branch"
 fi
