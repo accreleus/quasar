@@ -347,8 +347,12 @@ echo "QUASAR_STACK_DIR=$(cd deploy && pwd)" >> deploy/.env
 #    A registry install also names the image (a tag, see below):
 echo "QUASAR_UPDATER_IMAGE=ghcr.io/accreleus/quasar/quasar-updater:latest" >> deploy/.env
 
-# 3. Bring it up. --no-deps so nothing else is touched.
-docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-updater
+# 3. Bring it up, AND recreate the two containers that talk to it. The compose
+#    file mounts the updater's socket volume into the control plane and the
+#    node agent; a container created before the volume existed does not have
+#    that mount until it is recreated, and until then the console reports the
+#    updater as not installed for that target even though it is running.
+docker compose -f deploy/docker-compose.yml up -d quasar-updater quasar-control-plane quasar-node-agent
 
 # 4. Verify it discovered the stack it is sitting beside.
 docker compose -f deploy/docker-compose.yml exec quasar-node-agent \
@@ -357,12 +361,36 @@ docker compose -f deploy/docker-compose.yml exec quasar-node-agent \
 
 That last command should print the compose project, the working directory, the
 `-f` files (**including every overlay you use**) and the namespace allowlist. If
+it fails with "no such file or directory" on the socket, the container you ran
+it in predates the volume: recreate it (step 3). If
 it instead reports that the stack directory is not visible in the container,
 `QUASAR_STACK_DIR` is wrong or unset — the updater fails closed rather than
 guessing at a compose invocation and recreating the wrong project's containers.
 
 `deploy/redeploy.sh` seeds `QUASAR_STACK_DIR` for you, so a source install that
 deploys through it only needs step 1 and step 3.
+
+### Before applying a release that carries an agent from 0.2.6 or later
+
+Since #152 the node agent **refuses to start** when it cannot bind its health
+address, instead of letting whatever already owns the port answer its health
+checks. The agent runs with host networking, so the default
+`127.0.0.1:9091` is shared with everything on the machine — Prometheus
+Pushgateway's default port among others. An older agent on the same host
+started anyway, so this surfaces for the first time when a release apply
+recreates the agent: the new container exits with `health-bind-failed` and the
+host shows as down. Check before you update:
+
+```bash
+ss -ltnp | grep ':9091 '      # anything listed that is not the node agent?
+```
+
+If something is there, set `QUASAR_HEALTH_ADDR=127.0.0.1:9191` (any free
+loopback port; the image's `HEALTHCHECK` follows it) or `QUASAR_HEALTH_ADDR=`
+(empty disables the endpoint) in `deploy/.env` first, then `docker compose up
+-d quasar-node-agent`, then apply the release. If you only find out
+afterwards, the same edit plus `docker compose up -d quasar-node-agent`
+recovers the host; nothing about the apply needs redoing.
 
 ### Updating the updater itself
 
