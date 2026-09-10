@@ -131,6 +131,21 @@ own; the two do not move together, and that is deliberate.
   Contract: `quasar-protocol` "Audit-log names" amendment (additive, no migration).
 
 ### Fixed
+- **A desktop app created in the admin console now launches** (#171, migration 0082).
+  Every app made in the console against a managed desktop preset (KDE, XFCE) failed in
+  seconds with `app_exited_early`; the app container's own log said
+  `software Vulkan renderer detected`. The image's launch requirements -- `gpu`,
+  `no_new_privileges`, `systempaths_unconfined` -- live on the image catalog entry and
+  reached an app row only when the library provider created the app; the managed preset
+  deliberately carries none of them, and the console's editor wrote `gpu: false` for
+  every new app while believing the flag inert. It is not: the agent passes the GPU into
+  the container only when it is true. The control plane now stamps the managed image's
+  declared values onto the app on every create or edit that touches its spec or preset,
+  and migration 0082 applies the same rule to existing rows. Hand-made presets,
+  preset-less apps and provider-created apps (whose values the provider copied at install)
+  store exactly what they are sent, as before. The `deploy/README.md` paragraph telling
+  operators to copy the three values by hand is gone.
+
 - A fleet update no longer fails because a host was offline (#169, #170). Found by a
   real update on hardware: a live 0.2.3 -> 0.2.5 fleet apply failed at its first host
   and stopped, leaving the rest of the fleet unattempted -- against the sequencer's own
@@ -157,6 +172,40 @@ own; the two do not move together, and that is deliberate.
   rendering from a full-frame app (Snow, Colour Ripple), and never from Ball.
 
 
+
+- **Intel hosts can register a Vulkan encoder at all** (#126). Mesa's Intel Vulkan
+  driver hides the whole Vulkan Video extension family behind an opt-in instance
+  debug flag. Unset, the device does not advertise `VK_KHR_video_queue`, every other
+  video extension depends on that one, and GStreamer therefore registered no vulkan
+  video element while `vulkansink` still appeared — so the host looked like a working
+  GPU whose encoder supported nothing, which is exactly what the `encoder_codecs`
+  readiness check reported. The image now bakes in `ANV_DEBUG=video-encode` (inert on
+  AMD and NVIDIA, since no other driver reads it), so a `docker exec … gst-inspect-1.0`
+  agrees with the running agent instead of contradicting it, and the agent reconciles
+  that variable against the new `QUASAR_INTEL_VULKAN_VIDEO` knob at startup.
+  **This only changes anything on a host whose encoder is `vulkan`.** Intel's vendor
+  default is still VA, so an Intel operator wanting the Vulkan path has to set
+  `QUASAR_ENCODER=vulkan` as well, and will also want `QUASAR_VULKAN_AV1=0`: ANV has
+  no AV1 encode, so leaving that knob on makes every boot log a
+  `vulkan-codec-plan-degraded` warning pointing at the image contract, which is the
+  wrong place to look on an Intel host. Which Intel parts actually expose a usable
+  encode queue is not established: the pinned Mesa gates the encode extensions on the
+  flag and on the driver's codec build, not on a generation, and nobody on the project
+  has the hardware. Gen12 integrated graphics is the expected target; DG2/Arc is
+  untested. Mesa ships this off by default and does not treat the path as validated,
+  which is what this release is asking Intel users to try.
+
+- **Intel hosts now ship a VA driver** (#126). `mesa-va-drivers` is gallium only
+  (radeonsi/nouveau/virtio/d3d12), so libva had nothing to load on an Intel GPU:
+  `vaInitialize` failed, `vah264lpenc` never registered, and the agent's startup
+  codec probe reported an empty set — on the path that is the *documented default*
+  for Intel. The images now carry `intel-media-driver` (iHD, Gen9+) from RPM Fusion
+  nonfree, plus `libva-utils` so `vainfo` is available inside the agent container.
+  Fedora's in-distro build was measured and rejected: both packages are MIT and BSD,
+  Fedora's source RPM is named `intel-media-driver-free`, and its build is 11.6 MB
+  with a quarter of the AVC/HEVC encode symbol references. That is the same patent
+  split already accepted for AMD via `mesa-va-drivers-freeworld`, on identically
+  licensed code.
 
 - A node agent no longer reports another agent's health as its own (#152). The stack
   uses host networking, so two agents on one machine share `QUASAR_HEALTH_ADDR`; the
