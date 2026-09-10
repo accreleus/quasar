@@ -131,6 +131,16 @@ own; the two do not move together, and that is deliberate.
   Contract: `quasar-protocol` "Audit-log names" amendment (additive, no migration).
 
 ### Fixed
+- **The install page's compose template is no longer stale.** `deploy/docker-compose.yml`
+  gained the release-webhook, agent health-address and updater signature knobs without
+  `npm run compose:sync` being re-run, so the quick-start page handed operators a compose
+  file missing knobs the running stack expects — and the `site` CI job failed on every
+  pull request against `develop`, which is what surfaced it.
+- **`make up` no longer crash-loops a fresh local stack.** The local dev overlay defaulted
+  `BOOTSTRAP_ADMIN_PASSWORD` to `local-dev-admin` against username `admin`, and the
+  password policy refuses a password containing its own username, so the control plane
+  died at boot on every new worktree. Contributor-facing only; no released image was
+  affected.
 - **A desktop app created in the admin console now launches** (#171, migration 0082).
   Every app made in the console against a managed desktop preset (KDE, XFCE) failed in
   seconds with `app_exited_early`; the app container's own log said
