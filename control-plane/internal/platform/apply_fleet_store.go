@@ -344,6 +344,46 @@ func (s *Store) SetCordonedHosts(ctx context.Context, runID string, states []Hos
 	return nil
 }
 
+// MarkCordonsRestored records that this run's scheduling changes have been
+// proven undone. Separate from FinishRun on purpose: the terminal write happens
+// first — a run stuck non-terminal is its own outage — so this column is what
+// tells the next boot whether the cleanup that follows it actually finished
+// (migration 0083, #176).
+func (s *Store) MarkCordonsRestored(ctx context.Context, runID string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE platform_apply_runs SET cordons_restored_at = now() WHERE id = $1::uuid`, runID)
+	if err != nil {
+		return fmt.Errorf("set cordons_restored_at: %w", err)
+	}
+	return nil
+}
+
+// RunsWithUnrestoredCordons is every terminal run that cordoned something and
+// was never able to prove it put it back, newest first. Bounded by limit: this
+// is a boot sweep, not a backlog drain, and a run that keeps failing is retried
+// on the next boot rather than in a loop on this one.
+func (s *Store) RunsWithUnrestoredCordons(ctx context.Context, limit int) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id::text FROM platform_apply_runs
+		 WHERE state IN `+terminalRunStatesSQL+`
+		   AND cordons_restored_at IS NULL
+		   AND jsonb_array_length(cordoned_hosts) > 0
+		 ORDER BY created_at DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query unrestored cordons: %w", err)
+	}
+	defer rows.Close()
+	out := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan unrestored cordon run: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // CordonedHosts reads that record back.
 func (s *Store) CordonedHosts(ctx context.Context, runID string) ([]HostCordon, error) {
 	var raw []byte

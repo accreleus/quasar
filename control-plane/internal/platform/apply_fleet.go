@@ -48,6 +48,8 @@ type fleetStore interface {
 	HostStatus(ctx context.Context, hostID string) (string, error)
 	SetCordonedHosts(ctx context.Context, runID string, states []HostCordon) error
 	CordonedHosts(ctx context.Context, runID string) ([]HostCordon, error)
+	MarkCordonsRestored(ctx context.Context, runID string) error
+	RunsWithUnrestoredCordons(ctx context.Context, limit int) ([]string, error)
 	FleetNonTerminalSessions(ctx context.Context) (int, error)
 	FleetInFlightSessions(ctx context.Context) (int, error)
 	CreateHostAttempt(ctx context.Context, in NewHostAttempt) (Attempt, error)
@@ -722,25 +724,75 @@ func (f *FleetRunner) recordAndCordon(ctx context.Context, runID string, states 
 // restoreCordons puts every host back to the scheduling state the run found.
 // Runs on every terminal path, including a failed one: a fleet left draining by
 // a failed run would silently drop out of scheduling entirely.
-func (f *FleetRunner) restoreCordons(runID string) {
+// MaxCordonRestoreSweep bounds ResumeCordonRestores. A boot sweep, not a backlog
+// drain: a run that keeps failing to settle is retried on the NEXT boot rather
+// than in a loop on this one.
+const MaxCordonRestoreSweep = 20
+
+// ResumeCordonRestores finishes the scheduling cleanup of runs that ended
+// without it. `finish` writes the terminal state before it restores cordons, so
+// a restore that failed — or a process that died in that window — leaves a
+// terminal run whose hosts are still `draining`, and `ActiveRun` selects only
+// non-terminal runs, so nothing else on this path would ever look at it again
+// (#176). Idempotent: a run whose hosts are already back settles on the first
+// pass and is stamped.
+func (f *FleetRunner) ResumeCordonRestores(ctx context.Context) {
+	ids, err := f.store.RunsWithUnrestoredCordons(ctx, MaxCordonRestoreSweep)
+	if err != nil {
+		f.log.Error("fleet apply: could not look for unfinished scheduling cleanup", "err", err)
+		return
+	}
+	for _, id := range ids {
+		f.log.Warn("fleet apply: resuming the scheduling cleanup of a run that finished without it",
+			"run_id", id, "token", "cordon-restore-resumed")
+		f.settleCordons(id)
+	}
+}
+
+// settleCordons restores what a run cordoned and RECORDS whether that worked.
+// The unfinished case is a recovery requirement rather than a log line: the
+// marker stays unset, and the next boot's ResumeCordonRestores retries it (#176).
+func (f *FleetRunner) settleCordons(runID string) {
+	if !f.restoreCordons(runID) {
+		f.log.Error("fleet apply: this run's scheduling cleanup is UNFINISHED; it will be retried on the next control-plane start",
+			"run_id", runID, "token", "cordon-restore-unfinished")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := f.store.MarkCordonsRestored(ctx, runID); err != nil {
+		// The work is done; only the record of it is missing, so the next boot
+		// re-does an idempotent restore rather than leaving a host cordoned.
+		f.log.Error("fleet apply: scheduling was restored but recording it failed; the next start will re-check",
+			"run_id", runID, "err", err)
+	}
+}
+
+// restoreCordons puts back what the run changed. It reports whether EVERY change
+// was proven undone — a false answer is what settleCordons turns into a durable
+// recovery requirement, so "could not tell" counts as not restored (#176).
+func (f *FleetRunner) restoreCordons(runID string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	states, err := f.store.CordonedHosts(ctx, runID)
 	if err != nil {
 		f.log.Error("fleet apply: could not read what to restore; hosts may be left out of scheduling",
 			"run_id", runID, "err", err)
-		return
+		return false
 	}
+	restored := true
 	for _, st := range states {
 		if st.WasCordoned {
 			if err := f.cordons.Cordon(ctx, st.HostID); err != nil {
 				f.log.Warn("fleet apply: could not restore an admin cordon", "host_id", st.HostID, "err", err)
+				restored = false
 			}
 			continue
 		}
 		if err := f.cordons.Uncordon(ctx, st.HostID); err != nil {
 			// An offline host cannot be uncordoned; it returns online on its
-			// agent's reconnect.
+			// agent's reconnect. Not counted against `restored` — the check
+			// below decides that from the host's actual status.
 			f.log.Info("fleet apply: host not uncordoned (it will return online on its agent's reconnect)",
 				"host_id", st.HostID, "err", err)
 		}
@@ -757,11 +809,22 @@ func (f *FleetRunner) restoreCordons(runID string) {
 		// that success as "still out of scheduling" made every run with an absent
 		// host end on an ERROR telling the operator to fix something that was
 		// already fine (#170).
-		if status, err := f.store.HostStatus(ctx, st.HostID); err == nil && status == "draining" {
-			f.log.Error("fleet apply: a host this run cordoned is still out of scheduling; uncordon it by hand",
+		status, err := f.store.HostStatus(ctx, st.HostID)
+		switch {
+		case errors.Is(err, ErrHostNotFound):
+			// Deleted since the run cordoned it. There is nothing to put back,
+			// and nothing to retry over for the rest of this instance's life.
+		case err != nil:
+			f.log.Warn("fleet apply: could not confirm a host is back in scheduling",
+				"run_id", runID, "host_id", st.HostID, "err", err)
+			restored = false
+		case status == "draining":
+			f.log.Error("fleet apply: a host this run cordoned is still out of scheduling",
 				"run_id", runID, "host_id", st.HostID, "status", status)
+			restored = false
 		}
 	}
+	return restored
 }
 
 func (f *FleetRunner) failAttempt(attemptID, reason string) {
@@ -964,7 +1027,7 @@ func (f *FleetRunner) cancelRequested(ctx context.Context, runID string) bool {
 func (f *FleetRunner) finish(runID, state, errText string) {
 	// Every terminal transition comes through here, which is what makes the
 	// fleet cordon impossible to leak.
-	defer f.restoreCordons(runID)
+	defer f.settleCordons(runID)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := f.store.FinishRun(ctx, runID, state, errText); err != nil {

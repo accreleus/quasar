@@ -1049,6 +1049,11 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// the same way — including after the restart its own first target caused.
 	applyRunner.Adopt(context.Background())
 	fleetRunner.Adopt(context.Background())
+	// A run that already ENDED can still owe the fleet its scheduling back: the
+	// terminal state is written before the cordons are lifted, so a failure — or
+	// a death — in that window leaves hosts `draining` with nothing non-terminal
+	// for Adopt to find. Bounded, idempotent, and once per start (#176).
+	fleetRunner.ResumeCordonRestores(context.Background())
 
 	// Unattended automatic apply (#122). Constructed here because it needs the
 	// fleet runner's Start and the view that reports the active run — it is a

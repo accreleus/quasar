@@ -131,6 +131,16 @@ own; the two do not move together, and that is deliberate.
   Contract: `quasar-protocol` "Audit-log names" amendment (additive, no migration).
 
 ### Fixed
+- **A fleet run that cannot put the fleet back into scheduling now leaves a recovery
+  requirement the next start acts on (#176, migration 0083).** The terminal state is
+  written before the cordons are lifted, and `ActiveRun` selects only non-terminal runs —
+  so an uncordon that failed, or a process that died in that window, left hosts
+  `draining` with a single ERROR line as the entire record and nothing that would ever
+  look again. Whether a run's scheduling changes were proven undone is now recorded
+  (`platform_apply_runs.cordons_restored_at`, not served), and the control plane sweeps
+  the unfinished ones once at start: bounded, idempotent, and still putting an admin's
+  own cordon back rather than lifting it. A failure that persists stays outstanding for
+  the next start instead of being swallowed.
 - **A migrating fleet update can no longer run its migration on a session count it
   never read (#175).** `FleetNonTerminalSessions` answers a failed read with
   `(0, error)`, and the wait before the control-plane step was written against the
