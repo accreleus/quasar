@@ -26,12 +26,27 @@ readiness_filter_re() {
   printf '%s' 'boot-render-node-missing|boot-render-node-retry-deferred|boot-render-node-retries-spent|boot-render-node-unopenable|boot-dri-modes-stale-cdi|boot-host-render-node-missing|readiness-checks-failed|host readiness: no failures;|host readiness: all checks passed or skipped'
 }
 
-# readiness_line <log> — the LAST candidate verdict, never the first. The #98
-# boot race exits on purpose and heals on the retry, and a restart-policy restart
-# keeps the same container's log, so a healed host still carries the failing line
-# from the boot before.
+# AGENT_START_RE marks one node-agent process start. main.rs logs it once, very
+# early, before anything else this file classifies.
+#
+# It is a HARD STATE BOUNDARY for everything below, because docker keeps a
+# container's log across restarts and the agent restarts itself routinely (the
+# #98 retry, the driver-volume provision, a config reload). Without it, a verdict
+# from a process that is no longer running can be combined with one from the
+# process that is — an old healthy probe outvoting the current process's degraded
+# plan, or an old all-clear paired with a current codec result to declare both
+# verdicts in. Only the LATEST process lifetime counts.
+AGENT_START_RE='quasar node-agent .* starting [(]node_name='
+
+# readiness_line <log> — the last candidate verdict of the CURRENT process, or
+# empty. Never the first: the #98 boot race exits on purpose and heals on the
+# retry, so a healed host still carries the failing line from the boot before.
 readiness_line() {
-  grep -E "$(readiness_filter_re)" <<<"$1" | tail -1 || true
+  awk -v re="$(readiness_filter_re)" -v start="$AGENT_START_RE" '
+    $0 ~ start { verdict = ""; next }
+    $0 ~ re    { verdict = $0 }
+    END { if (verdict != "") print verdict }
+  ' <<<"$1"
 }
 
 # readiness_cause <verdict-line> — one line in, one cause word out. An empty or
@@ -91,8 +106,8 @@ readiness_severity() {
 # openh264 host, so treating its absence as health was the same false claim the
 # readiness half made.
 codec_cause() {
-  awk '
-    /quasar node-agent .* starting \(node_name=/ { candidate = ""; next }
+  awk -v start="$AGENT_START_RE" '
+    $0 ~ start { state = ""; candidate = ""; next }
     /vulkan-codec-plan-degraded/              { candidate = "degraded"; next }
     /vulkan-codec-plan-pending-driver-volume/ { candidate = "pending";  next }
     /codec support probed for/                { state = (candidate != "" ? candidate : "ok"); candidate = ""; next }

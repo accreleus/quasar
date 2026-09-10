@@ -3361,6 +3361,7 @@ ALL_CLEAR='2026-09-11T02:00:00Z  INFO quasar_node_agent::readiness: host readine
 PROBED='2026-09-11T02:00:01Z  INFO quasar_node_agent: codec support probed for Vulkan encoder'
 PENDING='token="vulkan-codec-plan-pending-driver-volume" first boot'
 DEGRADED='token="vulkan-codec-plan-degraded" av1 has no vulkan element'
+AGENT_START='2026-09-11T02:00:00Z  INFO quasar_node_agent: quasar node-agent 0.2.6 starting (node_name=gpu-01, source_commit=abc1234, built_at=2026-09-11)'
 
 # No log at all, and a log with nothing in it we recognise. Both used to be OK.
 summary_is "no-log" unverified unverified warn ""
@@ -3410,10 +3411,27 @@ token="boot-render-node-unopenable" gpu-host-sanity
 # before its probe would otherwise have that state committed by the NEXT
 # process's healthy probe, which on a VA or openh264 host carries no plan line of
 # its own.
-AGENT_START='2026-09-11T02:00:00Z  INFO quasar_node_agent: quasar node-agent 0.2.6 starting (node_name=gpu-01, source_commit=abc1234, built_at=2026-09-11)'
 summary_is "codec-candidate-does-not-cross-a-restart" ok ok ok "$DEGRADED
 $AGENT_START
 $ALL_CLEAR
+$PROBED"
+
+# A process start is a hard boundary for BOTH verdicts, not just for the pending
+# codec candidate. Docker keeps the log across restarts and the agent restarts
+# itself routinely, so without this an old process's healthy probe outvotes the
+# current process's degraded plan, and an old all-clear pairs with a current
+# codec result to declare both verdicts in.
+summary_is "codec-state-does-not-cross-a-restart" ok degraded warn "$ALL_CLEAR
+$PROBED
+$AGENT_START
+$ALL_CLEAR
+$DEGRADED"
+summary_is "readiness-does-not-cross-a-restart" unverified ok warn "$ALL_CLEAR
+$PROBED
+$AGENT_START
+$PROBED"
+# A tail that began mid-process carries no start marker, and classifies as before.
+summary_is "no-start-marker-classifies-as-before" ok ok ok "$ALL_CLEAR
 $PROBED"
 
 # The poll waits for BOTH verdicts. A healthy agent logs its readiness summary
@@ -3445,14 +3463,28 @@ else
   fail "redeploy:poll-kept-reading" "stopped after $(cat "$POLL_STATE") reads; the codec probe had not landed"
 fi
 
-# And it is still bounded: a log that never carries a verdict spends the tries
-# and answers unverified rather than looping.
-never_reader() { printf '%s' 'INFO quasar_node_agent: capacity report sent'; }
+# And it is still bounded: a log that never carries a verdict SPENDS the tries —
+# counted, because a poll that gave up after one read would produce the same
+# unverified summary and reintroduce the premature WARN this whole change is
+# about — then answers unverified rather than looping.
+NEVER_STATE="$WORK/never-poll-state"
+never_reader() {
+  local n
+  n="$(cat "$NEVER_STATE" 2>/dev/null || echo 0)"
+  echo $((n + 1)) > "$NEVER_STATE"
+  printf '%s' 'INFO quasar_node_agent: capacity report sent'
+}
+echo 0 > "$NEVER_STATE"
 got="$(agent_summary "$(poll_agent_log never_reader 4 no_sleep)" | tr '\n' ' ')"
 if [ "$got" = "readiness=unverified codecs=unverified severity=warn " ]; then
   pass "redeploy:poll-is-bounded" "$got"
 else
   fail "redeploy:poll-is-bounded" "want everything unverified, got [$got]"
+fi
+if [ "$(cat "$NEVER_STATE")" -eq 4 ]; then
+  pass "redeploy:poll-spends-its-budget" "4 reads"
+else
+  fail "redeploy:poll-spends-its-budget" "want 4 reads, got $(cat "$NEVER_STATE")"
 fi
 
 # grep -q exits at the first match; under `set -o pipefail` the SIGPIPE that
