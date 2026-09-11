@@ -694,3 +694,76 @@ func TestFleetWaitsForAnInFlightLaunchOnANonMigratingStep(t *testing.T) {
 		t.Fatalf("session states = %v, want the launch to have survived", got)
 	}
 }
+
+// Migration 0083: the persisted skip list, the partial state and retry_of all
+// round-trip through the row, and a skip is recorded once per host however
+// many times a re-adopted run re-walks its list.
+func TestRunSkipsPartialStateAndRetryOfRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	h := newFleetHarness(t, commitA, parkedDrivers{})
+
+	first, err := h.store.CreateRun(ctx, h.release.ID, false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	skip := RunSkip{HostID: h.hostID, NodeName: "gpu-01", Reason: ReasonPreflightBlocked}
+	for i := 0; i < 2; i++ {
+		if err := h.store.RecordSkip(ctx, first.ID, skip); err != nil {
+			t.Fatalf("record skip: %v", err)
+		}
+	}
+	if err := h.store.FinishRun(ctx, first.ID, RunSucceededPartial, ""); err != nil {
+		t.Fatalf("finish partial: %v", err)
+	}
+	got, err := h.store.Run(ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != RunSucceededPartial || got.FinishedAt == nil {
+		t.Fatalf("run = %+v, want terminal succeeded_partial", got)
+	}
+	if len(got.Skipped) != 1 || got.Skipped[0] != skip {
+		t.Fatalf("skipped = %+v, want exactly one entry for the host", got.Skipped)
+	}
+	if got.RetryOf != nil {
+		t.Fatalf("retry_of = %v on a plain run, want null", *got.RetryOf)
+	}
+	// A terminal partial run no longer owns the fleet: a retry can start.
+	if active, err := h.store.ActiveRun(ctx); err != nil || active != nil {
+		t.Fatalf("active run after a partial finish = %v (err %v), want none", active, err)
+	}
+
+	retry, err := h.store.CreateRun(ctx, h.release.ID, false, nil, &first.ID)
+	if err != nil {
+		t.Fatalf("create retry: %v", err)
+	}
+	if retry.RetryOf == nil || *retry.RetryOf != first.ID {
+		t.Fatalf("retry_of = %v, want %s", retry.RetryOf, first.ID)
+	}
+	if err := h.store.FinishRun(ctx, retry.ID, RunSucceeded, ""); err != nil {
+		t.Fatal(err)
+	}
+	// Deleting the original leaves the retry standing, unlinked.
+	mustExec(t, h.pool, `DELETE FROM platform_apply_runs WHERE id = $1::uuid`, first.ID)
+	again, err := h.store.Run(ctx, retry.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.RetryOf != nil {
+		t.Fatalf("retry_of after the original was deleted = %v, want null", *again.RetryOf)
+	}
+
+	// And the attempt kind CHECK admits auto_revert.
+	a, err := h.store.CreateAutoRevertAttempt(ctx, NewAutoRevert{
+		Failed:    Attempt{HostID: &h.hostID, RunID: &retry.ID},
+		Requested: []ComponentDigest{{Name: ComponentNodeAgent, Image: "x", Digest: "sha256:" + hex64}},
+		Previous:  []PreviousDigest{{Name: ComponentNodeAgent}},
+		Succeeded: false, Output: "restore failed too",
+	})
+	if err != nil {
+		t.Fatalf("auto_revert row: %v", err)
+	}
+	if a.Kind != KindAutoRevert || a.State != AttemptFailed || a.Reason == nil {
+		t.Fatalf("row = %+v, want a failed auto_revert with a reason", a)
+	}
+}
