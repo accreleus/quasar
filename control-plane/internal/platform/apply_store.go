@@ -127,6 +127,50 @@ func (s *Store) CreateHostAttempt(ctx context.Context, in NewHostAttempt) (Attem
 	return s.Attempt(ctx, id)
 }
 
+// NewAutoRevert is the history row for a restore the updater performed itself
+// (amendment 9): the failed apply's previous digests are what it moved TO, and
+// the failed apply's requested digests are what it moved FROM.
+type NewAutoRevert struct {
+	Failed    Attempt
+	Requested []ComponentDigest
+	Previous  []PreviousDigest
+	Succeeded bool
+	Output    string
+}
+
+// CreateAutoRevertAttempt inserts the row already terminal: it was never driven
+// over the wire, so it never holds the open-target index. Inserted only after
+// the failed apply is terminal.
+func (s *Store) CreateAutoRevertAttempt(ctx context.Context, in NewAutoRevert) (Attempt, error) {
+	requested, err := json.Marshal(in.Requested)
+	if err != nil {
+		return Attempt{}, fmt.Errorf("encode requested_digests: %w", err)
+	}
+	previous, err := json.Marshal(in.Previous)
+	if err != nil {
+		return Attempt{}, fmt.Errorf("encode previous_digests: %w", err)
+	}
+	state, reason := AttemptSucceeded, (*string)(nil)
+	if !in.Succeeded {
+		state = AttemptFailed
+		r := ReasonRecreateFailed
+		reason = &r
+	}
+	var id string
+	err = s.pool.QueryRow(ctx, `
+		INSERT INTO platform_apply_attempts
+		    (run_id, kind, target, host_id, release_id, requested_digests, previous_digests,
+		     state, reason, force, output, requested_by, started_at, finished_at)
+		VALUES ($1::uuid, 'auto_revert', 'host', $2::uuid, NULL, $3::jsonb, $4::jsonb,
+		        $5, $6, false, $7, NULL, now(), now())
+		RETURNING id::text
+	`, in.Failed.RunID, in.Failed.HostID, requested, previous, state, reason, in.Output).Scan(&id)
+	if err != nil {
+		return Attempt{}, fmt.Errorf("insert auto_revert attempt: %w", err)
+	}
+	return s.Attempt(ctx, id)
+}
+
 // Attempt reads one row by id.
 func (s *Store) Attempt(ctx context.Context, id string) (Attempt, error) {
 	a, err := scanAttempt(s.pool.QueryRow(ctx,

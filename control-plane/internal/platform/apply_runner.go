@@ -52,6 +52,7 @@ type applyStore interface {
 	AttemptByRequestID(ctx context.Context, requestID string) (Attempt, error)
 	RecordReleaseState(ctx context.Context, attemptID, state string, previous []PreviousDigest, output string) error
 	SetPreviousDigests(ctx context.Context, attemptID string, previous []PreviousDigest) error
+	CreateAutoRevertAttempt(ctx context.Context, in NewAutoRevert) (Attempt, error)
 	OpenHostAttempt(ctx context.Context, hostID string) (Attempt, string, error)
 	OpenAttempts(ctx context.Context) ([]Attempt, error)
 	Release(ctx context.Context, id string) (Release, error)
@@ -526,12 +527,60 @@ func (r *Runner) HandleReleaseState(ctx context.Context, hostID string, rep Rele
 			r.log.Warn("release_state: could not record failure", "attempt_id", a.ID, "err", err)
 		} else {
 			r.log.Warn("apply failed", "attempt_id", a.ID, "host_id", hostID, "reason", reason)
+			if rep.Restored {
+				r.recordAutoRevert(ctx, a, rep)
+			}
 		}
 	default:
 		if err := r.store.RecordReleaseState(ctx, a.ID, rep.State, rep.Previous, rep.Output); err != nil {
 			r.log.Warn("release_state: could not record progress", "attempt_id", a.ID, "err", err)
 		}
 	}
+}
+
+// recordAutoRevert writes the history row for a restore the updater did
+// itself (amendment 9). Only after the apply is terminal, so the open-target
+// index is free; only for an apply, never for a revert that failed.
+func (r *Runner) recordAutoRevert(ctx context.Context, failed Attempt, rep ReleaseStateReport) {
+	if failed.Kind != KindApply {
+		return
+	}
+	requested := restoredDigests(failed.RequestedDigests, rep.Previous)
+	if len(requested) == 0 {
+		r.log.Warn("release_state says restored but named no previous digest; no auto_revert recorded",
+			"attempt_id", failed.ID, "host_id", orEmpty(failed.HostID))
+		return
+	}
+	previous := make([]PreviousDigest, 0, len(failed.RequestedDigests))
+	for _, c := range failed.RequestedDigests {
+		d := c.Digest
+		previous = append(previous, PreviousDigest{Name: c.Name, Digest: &d})
+	}
+	row, err := r.store.CreateAutoRevertAttempt(ctx, NewAutoRevert{
+		Failed: failed, Requested: requested, Previous: previous, Succeeded: true,
+		Output: "restored by the updater after the apply failed (" + orEmpty(rep.Reason) + ")",
+	})
+	if err != nil {
+		r.log.Error("could not record the updater's automatic restore", "attempt_id", failed.ID, "err", err)
+		return
+	}
+	r.log.Warn("apply automatically reverted by the updater", "attempt_id", failed.ID,
+		"auto_revert_id", row.ID, "host_id", orEmpty(failed.HostID), "token", "apply-auto-reverted")
+}
+
+// restoredDigests pairs the failed apply's components with the previous digests
+// the updater reported it went back to; a component whose previous digest was
+// unknown is left out.
+func restoredDigests(requested []ComponentDigest, previous []PreviousDigest) []ComponentDigest {
+	out := make([]ComponentDigest, 0, len(requested))
+	for _, c := range requested {
+		for _, p := range previous {
+			if p.Name == c.Name && p.Digest != nil && *p.Digest != "" {
+				out = append(out, ComponentDigest{Name: c.Name, Image: c.Image, Digest: *p.Digest})
+			}
+		}
+	}
+	return out
 }
 
 // HandleRegister is the success-evidence hook, on every agent register. A

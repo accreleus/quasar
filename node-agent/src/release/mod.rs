@@ -9,7 +9,7 @@
 //! The socket and the result file are NOT a frozen interface
 //! (protocol/schema.md §"Not frozen: the updater's local socket").
 
-mod unix_http;
+pub(crate) mod unix_http;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -46,7 +46,7 @@ const POLL_DEADLINE: Duration = Duration::from_secs(2 * 3600);
 const APPLIABLE_COMPONENTS: &[&str] = &["node-agent"];
 
 /// The updater's result file, which carries `release_state`'s fields under the
-/// same names. Extra fields (`restored`, `commands`, `release`) are ignored.
+/// same names. Extra fields (`commands`, `release`) are ignored.
 #[derive(Deserialize, Debug, Clone)]
 struct UpdaterResult {
     request_id: String,
@@ -65,6 +65,8 @@ struct UpdaterResult {
     updated_at: String,
     #[serde(default)]
     finished_at: Option<String>,
+    #[serde(default)]
+    restored: bool,
 }
 
 impl UpdaterResult {
@@ -79,6 +81,7 @@ impl UpdaterResult {
             started_at: self.started_at,
             updated_at: self.updated_at,
             finished_at: self.finished_at,
+            restored: self.restored,
         }
     }
 }
@@ -476,6 +479,7 @@ fn unreachable_msg(request_id: &str) -> AgentMsg {
         started_at: String::new(),
         updated_at: String::new(),
         finished_at: None,
+        restored: false,
     }
 }
 

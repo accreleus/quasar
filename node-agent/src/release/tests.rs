@@ -210,7 +210,31 @@ fn parsed(request_id: &str, state: &str, components: &[&str]) -> UpdaterResult {
         started_at: String::new(),
         updated_at: String::new(),
         finished_at: None,
+        restored: false,
     }
+}
+
+/// `restored` rides through the relay (agent-api.md, amendment 9): the control
+/// plane keys its auto_revert row off it. Omitted on the wire when false so an
+/// older control plane sees the shape it knows.
+#[test]
+fn restored_is_relayed_and_omitted_when_false() {
+    let mut res = parsed("11111111-1111-4111-8111-111111111111", "failed", &["node-agent"]);
+    res.restored = true;
+    let msg = res.into_msg();
+    let json = serde_json::to_string(&msg).unwrap();
+    assert!(json.contains("\"restored\":true"), "{json}");
+
+    let res = parsed("11111111-1111-4111-8111-111111111111", "failed", &["node-agent"]);
+    let json = serde_json::to_string(&res.into_msg()).unwrap();
+    assert!(!json.contains("restored"), "{json}");
+
+    // And the result file's field is read.
+    let file: UpdaterResult = serde_json::from_str(
+        r#"{"request_id":"x","state":"failed","reason":"unhealthy","restored":true}"#,
+    )
+    .unwrap();
+    assert!(file.restored);
 }
 
 #[tokio::test]

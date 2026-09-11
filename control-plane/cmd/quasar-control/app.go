@@ -287,6 +287,7 @@ func (a releaseEventsAdapter) AgentReleaseState(ctx context.Context, hostID stri
 		Components: components,
 		Previous:   previous,
 		Output:     m.Output,
+		Restored:   m.Restored,
 	})
 }
 

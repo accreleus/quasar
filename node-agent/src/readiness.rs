@@ -10,6 +10,9 @@
 //! host-side read is `/etc/os-release` (via `/host`), used purely to pick remediation wording;
 //! its absence degrades to generic wording, never a failed check.
 
+/// The update-path checks (preflight ids), with their collectors.
+pub mod platform_update;
+
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -167,6 +170,15 @@ pub struct ProbeEnv {
     /// Firewall detection's answer, computed once at [`ProbeEnv::live`] so every reader sees
     /// the same instant and the subprocess cost is paid once, not per check.
     pub firewall: FirewallPosture,
+    /// The update path's facts (platform_update.rs), collected once per probe.
+    pub updater: platform_update::UpdaterView,
+    /// Whether compose declares an updater service beside this agent (`register`'s
+    /// `updater_present`); `None` when discovery could not say.
+    pub updater_present: Option<bool>,
+    pub health: platform_update::HealthOwner,
+    /// This agent's own `/health` identity, to compare against who answers.
+    pub self_node: String,
+    pub self_pid: u32,
 }
 
 /// The driver-volume provisioner's state, as readiness sees it. Plain data, not a live call
@@ -255,6 +267,11 @@ impl ProbeEnv {
             },
             // Vendor/GPU-independent: a firewall problem is as real on a GPU-less box.
             firewall: detect_firewall_posture(),
+            updater: platform_update::collect_updater(&updater_socket_path()),
+            updater_present: crate::buildinfo::install_facts().updater_present,
+            health: platform_update::collect_health(crate::health::addr_from_env()),
+            self_node: crate::logging::host_name().to_string(),
+            self_pid: std::process::id(),
         }
     }
 
@@ -419,7 +436,21 @@ pub fn probe(env: &ProbeEnv) -> Vec<ReadinessCheck> {
             Some(error) => fail("host_container_mounts", error.clone(), "Use the generated bind mounts at identical host/container paths. Fix the Docker socket or mount configuration, then recreate the agent; checks refresh automatically.".to_string()),
             None => pass("host_container_mounts", "Required sibling-container paths agree with their host bind mounts".to_string()),
         },
+        // The update path (amendment 9): what preflight reads about this host.
+        platform_update::check_updater_socket(&env.updater, env.updater_present),
+        platform_update::check_updater_stack_dir(&env.updater),
+        platform_update::check_updater_overlays(&env.updater),
+        platform_update::check_health_addr_bindable(&env.health, &env.self_node, env.self_pid),
     ]
+}
+
+/// Twin of `release::ReleaseManager::from_env`'s socket resolution.
+fn updater_socket_path() -> PathBuf {
+    std::env::var("QUASAR_UPDATER_SOCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(crate::release::DEFAULT_SOCKET))
 }
 
 fn check_vulkan_av1_compatibility(env: &ProbeEnv) -> ReadinessCheck {
@@ -2455,6 +2486,11 @@ mod tests {
                 // `Unknown` means "not probed" and must never influence a verdict on its own.
                 egl_runtime: crate::nvidia_volume::EglRuntime::Unknown,
                 firewall: FirewallPosture::Unknown,
+                updater: platform_update::UpdaterView::default(),
+                updater_present: None,
+                health: platform_update::HealthOwner::default(),
+                self_node: "test".to_string(),
+                self_pid: 1,
             }
         }
 
