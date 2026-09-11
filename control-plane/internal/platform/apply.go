@@ -11,6 +11,10 @@ import "time"
 const (
 	KindApply  = "apply"
 	KindRevert = "revert"
+	// The updater put the previous digests back itself after a failed health
+	// wait (amendment 9, #188). Recorded terminal on insert by the control
+	// plane beside the failed apply; never driven over the wire.
+	KindAutoRevert = "auto_revert"
 )
 
 // `ApplyAttemptState`. The six middle values are exactly agent-api.md
@@ -154,24 +158,43 @@ type ActiveApply struct {
 	Attempts []Attempt `json:"attempts"`
 }
 
-// `ApplyRunState`. A run `succeeded` only when every target succeeded, and
-// stops at its first failed target: there is no `partial`.
+// `ApplyRunState`. A run `succeeded` only when every target it reached
+// succeeded and it passed over nothing that was behind; it stops at its first
+// failed target, and a FAILED run has no partial variant. `succeeded_partial`
+// (amendment 9, #190) is the other case: nothing failed, but a host that was
+// behind the release was skipped — RunOutcome decides.
 const (
-	RunPending   = "pending"
-	RunRunning   = "running"
-	RunSucceeded = "succeeded"
-	RunFailed    = "failed"
-	RunCancelled = "cancelled"
+	RunPending          = "pending"
+	RunRunning          = "running"
+	RunSucceeded        = "succeeded"
+	RunSucceededPartial = "succeeded_partial"
+	RunFailed           = "failed"
+	RunCancelled        = "cancelled"
 )
 
 // TerminalRunState reports whether a run in this state is resolved. SQL twin:
 // terminalRunStatesSQL.
 func TerminalRunState(state string) bool {
 	switch state {
-	case RunSucceeded, RunFailed, RunCancelled:
+	case RunSucceeded, RunSucceededPartial, RunFailed, RunCancelled:
 		return true
 	}
 	return false
+}
+
+// RunOutcome is the terminal state a run that reached the end of its host list
+// with nothing failed deserves: `succeeded_partial` when it passed over a host
+// that was BEHIND the release and could not take it — any skip except
+// `up_to_date`, which is a host that was done, not one that was passed over.
+// Pure: the run's persisted skips in, one state out, so the rule is a table
+// test and never re-derived by a client.
+func RunOutcome(skips []RunSkip) string {
+	for _, s := range skips {
+		if s.Reason != ReasonUpToDate {
+			return RunSucceededPartial
+		}
+	}
+	return RunSucceeded
 }
 
 // RunSkip is one `PlatformApplySkip`: a host the run passed over as ineligible
@@ -185,15 +208,17 @@ type RunSkip struct {
 
 // ApplyRun is the `PlatformApplyRun` shape.
 //
-// `skipped` has no column in migration 0075: it is held by the sequencer for
-// the life of the process. A run's skips are all computed AFTER its
-// control-plane target, so the restart a fleet run causes cannot lose them;
-// only a crash mid-fleet can, and then the list is empty rather than wrong.
+// `skipped` is persisted since migration 0083 (it was held in memory before):
+// `succeeded_partial` is decided from it, and a partial run whose explanation
+// was lost on a crash would be a state with no reason.
 type ApplyRun struct {
 	ID        string `json:"id"`
 	ReleaseID string `json:"release_id"`
 	State     string `json:"state"`
 	Force     bool   `json:"force"`
+	// RetryOf is the succeeded_partial run this one was started to finish
+	// (amendment 9). Provenance only: nothing reads it to choose a target.
+	RetryOf *string `json:"retry_of"`
 	// Unattended is true when the run was started by the detection schedule
 	// rather than by an admin pressing Update (#122). Served, because an admin
 	// finding a run they did not start is owed the explanation — and because
@@ -217,6 +242,8 @@ type ApplyRun struct {
 type FleetApplyRequest struct {
 	ReleaseID string `json:"release_id"`
 	Force     bool   `json:"force"`
+	// RetryOf links a "Retry skipped hosts" run to the partial run it finishes.
+	RetryOf *string `json:"retry_of"`
 }
 
 // RunEnvelope is the body of every run response.
@@ -264,6 +291,9 @@ type ReleaseStateReport struct {
 	Previous   []PreviousDigest
 	Output     string
 	FinishedAt *time.Time
+	// Restored is agent-api.md `release_state.restored` (amendment 9): the
+	// updater put the previous digests back itself after this failure.
+	Restored bool
 }
 
 // NodeAgentComponents extracts the components a HOST may be sent from a parsed

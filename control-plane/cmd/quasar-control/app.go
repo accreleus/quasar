@@ -987,9 +987,12 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// An edge release stores no manifest, so its digest is resolved from the
 	// commit's image tag at apply time, off the same allowlisted registry the
 	// edge detector reads.
-	edgeApply := platform.NewEdgeApplyResolver(
-		images.NewRegistryResolverForHosts(nil, images.RegistryEgressHosts(platform.ConfiguredPlatformRegistry())),
+	platformRegistryResolver := images.NewRegistryResolverForHosts(nil, images.RegistryEgressHosts(platform.ConfiguredPlatformRegistry()))
+	edgeApply := platform.NewEdgeApplyResolver(platformRegistryResolver,
 		platform.ConfiguredPlatformRegistry(), platform.ConfiguredReleaseRepo())
+	// Preflight's one network collector: do the release's digests resolve at
+	// the registry (amendment 9). Invalidated on "Check now" and before an apply.
+	imageResolver := platform.NewImageResolver(platformRegistryResolver, edgeApply, 0)
 	// The control plane applies ITSELF over the updater socket beside it, never
 	// over an agent connection (agent-api.md §release_apply).
 	updaterClient := platform.NewUpdaterClient(platform.ConfiguredUpdaterSocket())
@@ -998,6 +1001,8 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	pDeps := platformDeps(platformStore, settingsStore, jobStore, secretStore)
 	pDeps.UpdaterPresent = selfApplier.UpdaterPresent
 	pDeps.ControlPlaneInstallMode = selfApplier.InstallMode
+	pDeps.ControlPlanePreflight = selfApplier.PreflightFacts
+	pDeps.ImageFor = imageResolver.Check
 	// #169: the live registry, not the `status` column, answers "is this host's
 	// agent there". The column is stale across every control-plane restart —
 	// and a fleet run contains one — and the run's own cordon then rewrites it
@@ -1038,6 +1043,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	fleetRunner := platform.NewFleetRunner(platformStore, applyRunner, selfApplier,
 		platform.ManifestOrEdge{Edge: edgeApply}, fleetCordons, platformHandler.ReleaseView, log)
 	platformApply := platform.NewApplyHandler(platformStore, applyRunner, platformHandler.ReleaseView, auditStore, log).
+		WithPreflightRefresh(imageResolver.Invalidate).
 		WithEdgeResolver(edgeApply).
 		WithFleet(fleetRunner)
 	// Closed after construction: the view reports the active run, and the run's

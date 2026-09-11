@@ -42,6 +42,7 @@ type fleetStore interface {
 	RunAttempts(ctx context.Context, runID string) ([]Attempt, error)
 	SetRunTarget(ctx context.Context, runID, target string, hostID *string) error
 	FinishRun(ctx context.Context, runID, state, errText string) error
+	RecordSkip(ctx context.Context, runID string, skip RunSkip) error
 	Attempt(ctx context.Context, attemptID string) (Attempt, error)
 	FailAttempt(ctx context.Context, attemptID, reason, output string) error
 	Hosts(ctx context.Context) ([]HostIdentity, error)
@@ -183,8 +184,6 @@ type FleetRunner struct {
 	// run ids this process re-adopted rather than started, which is what the
 	// settle window keys on.
 	adopted map[string]bool
-	// run id → hosts passed over. No column holds these (apply.go says why).
-	skips map[string][]RunSkip
 
 	baseCtx context.Context
 	stop    context.CancelFunc
@@ -205,7 +204,6 @@ func NewFleetRunner(store fleetStore, hosts hostDriver, self selfDriver, resolve
 		SchemaVersion:  buildinfo.SchemaVersion(),
 		running:        make(map[string]context.CancelFunc),
 		adopted:        make(map[string]bool),
-		skips:          make(map[string][]RunSkip),
 		baseCtx:        ctx,
 		stop:           cancel,
 	}
@@ -263,24 +261,14 @@ func (f *FleetRunner) Close() {
 	f.wg.Wait()
 }
 
-// Skips is what a run passed over, for the run's `skipped` field.
-func (f *FleetRunner) Skips(runID string) []RunSkip {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]RunSkip, len(f.skips[runID]))
-	copy(out, f.skips[runID])
-	return out
-}
-
-func (f *FleetRunner) recordSkip(runID string, skip RunSkip) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for _, s := range f.skips[runID] {
-		if s.HostID == skip.HostID {
-			return
-		}
+// recordSkip persists one host the run passed over. Persisted, not held: the
+// run's terminal state is decided from this list (RunOutcome), and a list that
+// lived in memory was empty after any crash mid-fleet — a partial run with no
+// reason.
+func (f *FleetRunner) recordSkip(ctx context.Context, runID string, skip RunSkip) {
+	if err := f.store.RecordSkip(ctx, runID, skip); err != nil {
+		f.log.Warn("fleet apply: could not record a skipped host", "run_id", runID, "host_id", skip.HostID, "err", err)
 	}
-	f.skips[runID] = append(f.skips[runID], skip)
 }
 
 func (f *FleetRunner) drive(ctx context.Context, runID string) {
@@ -298,7 +286,21 @@ func (f *FleetRunner) drive(ctx context.Context, runID string) {
 	if !f.hostPhase(ctx, run) {
 		return
 	}
-	f.finish(runID, RunSucceeded, "")
+	// Re-read: the skips were written as the hosts were reached, and the
+	// outcome is decided from what was persisted, not from what this process
+	// remembers.
+	final, err := f.store.Run(ctx, runID)
+	if err != nil {
+		f.log.Error("fleet apply: could not re-read the run to decide its outcome", "run_id", runID, "err", err)
+		f.finish(runID, RunFailed, "could not re-read the run to decide its outcome: "+err.Error())
+		return
+	}
+	outcome := RunOutcome(final.Skipped)
+	if outcome == RunSucceededPartial {
+		f.log.Warn("fleet apply finished with hosts left behind", "run_id", runID,
+			"skipped", len(final.Skipped), "token", "fleet-apply-partial")
+	}
+	f.finish(runID, outcome, "")
 }
 
 // controlPlanePhase moves the control plane, or establishes that it needs no
@@ -829,13 +831,13 @@ func (f *FleetRunner) hostPhase(ctx context.Context, run ApplyRun) bool {
 			return false
 		}
 		if reason := fleetTargetReason(view, &hostID); reason != "" {
-			f.recordSkip(run.ID, RunSkip{HostID: hostID, NodeName: nodeName(t), Reason: reason})
+			f.recordSkip(ctx, run.ID, RunSkip{HostID: hostID, NodeName: nodeName(t), Reason: reason})
 			f.log.Info("fleet apply: host skipped", "run_id", run.ID, "host_id", hostID, "reason", reason)
 			continue
 		}
 		attempt, err := f.createHostAttempt(ctx, run, hostID)
 		if errors.Is(err, ErrAttemptInFlight) {
-			f.recordSkip(run.ID, RunSkip{HostID: hostID, NodeName: nodeName(t), Reason: ReasonAttemptInFlight})
+			f.recordSkip(ctx, run.ID, RunSkip{HostID: hostID, NodeName: nodeName(t), Reason: ReasonAttemptInFlight})
 			continue
 		}
 		if err != nil {

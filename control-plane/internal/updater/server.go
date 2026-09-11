@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -50,7 +51,15 @@ type Server struct {
 
 	// Reported by `/v1/self`.
 	Version string
+
+	// /v1/self runs two docker calls; the agent asks every 15 s and the control
+	// plane every 30 s, so the answer is reused for selfTTL.
+	selfMu sync.Mutex
+	selfAt time.Time
+	self   *SelfResponse
 }
+
+const selfTTL = 15 * time.Second
 
 // Handler wires the routes, separate from Listen so a test can serve it over a
 // temp socket.
@@ -87,27 +96,54 @@ type SelfResponse struct {
 	// control plane to classify its own install mode: a bare local tag is a
 	// source build, a `repo@sha256:…` is a registry install.
 	Images map[string]*string `json:"images"`
+	// Per service, the compose files its running container was started with;
+	// nil for a service with no running container. Read by preflight
+	// (`updater_overlays`, control-api.md §"Self-update hardening").
+	ServiceConfigFiles map[string][]string `json:"service_config_files"`
 }
 
 func (s *Server) handleSelf(w http.ResponseWriter, r *http.Request) {
-	resp := SelfResponse{
-		Version:           s.Version,
-		Project:           s.Cfg.Project,
-		WorkingDir:        s.Cfg.WorkingDir,
-		ConfigFiles:       s.Cfg.ConfigFiles,
-		EnvPath:           s.EnvPath,
-		AllowedNamespaces: s.Cfg.AllowedNamespaces,
-		Components:        []string{"control-plane", "node-agent"},
-		WaitTimeoutS:      s.Cfg.WaitTimeoutS,
-		SignatureMode:     signatureModeOrOff(s.Cfg.Signature.Mode),
-		TrustedKeyIDs:     s.Cfg.Signature.KeyIDs(),
-		ManifestSource:    s.ManifestBaseURL,
-		Images:            s.executor().EffectiveImages(r.Context()),
+	s.selfMu.Lock()
+	if s.self != nil && time.Since(s.selfAt) < selfTTL {
+		resp := *s.self
+		s.selfMu.Unlock()
+		if id := s.Store.InFlight(); id != "" {
+			resp.InFlight = &id
+		} else {
+			resp.InFlight = nil
+		}
+		writeJSON(w, http.StatusOK, resp)
+		return
 	}
+	s.selfMu.Unlock()
+
+	resp := s.selfReport(r.Context())
+	s.selfMu.Lock()
+	s.self, s.selfAt = &resp, time.Now()
+	s.selfMu.Unlock()
 	if id := s.Store.InFlight(); id != "" {
 		resp.InFlight = &id
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) selfReport(ctx context.Context) SelfResponse {
+	ex := s.executor()
+	return SelfResponse{
+		Version:            s.Version,
+		Project:            s.Cfg.Project,
+		WorkingDir:         s.Cfg.WorkingDir,
+		ConfigFiles:        s.Cfg.ConfigFiles,
+		EnvPath:            s.EnvPath,
+		AllowedNamespaces:  s.Cfg.AllowedNamespaces,
+		Components:         []string{"control-plane", "node-agent"},
+		WaitTimeoutS:       s.Cfg.WaitTimeoutS,
+		SignatureMode:      signatureModeOrOff(s.Cfg.Signature.Mode),
+		TrustedKeyIDs:      s.Cfg.Signature.KeyIDs(),
+		ManifestSource:     s.ManifestBaseURL,
+		Images:             ex.EffectiveImages(ctx),
+		ServiceConfigFiles: ex.ServiceConfigFiles(ctx),
+	}
 }
 
 // Every rejection: one closed-vocabulary identifier (what a caller keys on)

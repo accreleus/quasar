@@ -49,7 +49,7 @@ func TestUnattendedFailedReleaseIDsCountsOnlyUnattendedFailures(t *testing.T) {
 
 	// An ADMIN's run that failed on the other release. Not the schedule's doing,
 	// so it must not suppress anything.
-	manual, err := h.store.CreateRun(ctx, other.ID, false, nil)
+	manual, err := h.store.CreateRun(ctx, other.ID, false, nil, nil)
 	if err != nil {
 		t.Fatalf("create admin run: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestAnAdminsOwnRunClearsTheUnattendedSuppression(t *testing.T) {
 
 	// The admin then applies it themselves. created_at must be LATER, so the
 	// admin's run is the most recent one on this release.
-	manual, err := h.store.CreateRun(ctx, h.release.ID, false, nil)
+	manual, err := h.store.CreateRun(ctx, h.release.ID, false, nil, nil)
 	if err != nil {
 		t.Fatalf("create admin run: %v", err)
 	}

@@ -3951,7 +3951,7 @@ export interface paths {
         put?: never;
         /**
          * Fleet apply of one platform release (admin).
-         * @description Applies one release across the instance: THE CONTROL PLANE FIRST, then every eligible host in sequence (ADR 0002). Returns immediately with the run; the work is asynchronous and is watched through the run endpoints or through active_apply on GET /v1/admin/platform/releases. At most one fleet run is active per instance, enforced by a partial unique index rather than by a code check. Which hosts are targets is decided WHEN EACH TARGET IS REACHED, by amendment 1's eligibility rule; a host ineligible at its turn is SKIPPED (reported in run.skipped) and produces no attempt. A run STOPS AT ITS FIRST FAILED TARGET - there is no partial state, and the per-target attempts are where a partial outcome is read.
+         * @description Applies one release across the instance: THE CONTROL PLANE FIRST, then every eligible host in sequence (ADR 0002). Returns immediately with the run; the work is asynchronous and is watched through the run endpoints or through active_apply on GET /v1/admin/platform/releases. At most one fleet run is active per instance, enforced by a partial unique index rather than by a code check. Which hosts are targets is decided WHEN EACH TARGET IS REACHED, by amendment 1's eligibility rule; a host ineligible at its turn is SKIPPED (reported in run.skipped) and produces no attempt. A run STOPS AT ITS FIRST FAILED TARGET; a failed run has no partial variant, and the per-target attempts are where its outcome is read. A run that reached the end with nothing failed but skipped a host that was behind the release ends succeeded_partial (amendment 9, #185), never a bare succeeded.
          */
         post: {
             parameters: {
@@ -3979,7 +3979,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description release_not_offered (the release is not in the current release view's available - other channel, prerelease on stable, or manifest missing/invalid, ADR 0001), run_active (a fleet run is already pending or running), or attempt_in_flight (a standalone attempt is open on some target). */
+                /** @description release_not_offered (the release is not in the current release view's available - other channel, prerelease on stable, or manifest missing/invalid, ADR 0001), run_active (a fleet run is already pending or running), attempt_in_flight (a standalone attempt is open on some target), or preflight_blocked (amendment 9, #185: the control-plane target's preflight is `blocked`, so nothing can move; the message names the failing check and its fix - the same text the release view's targets[].preflight carries). */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -4188,7 +4188,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description release_not_offered; host_not_eligible (the body carries `reason`, one amendment-1 EligibilityReason, so the button's absence and this refusal are explained by the same string); attempt_in_flight (this host already has an open attempt - the database's partial unique index, not a code check); run_active. */
+                /** @description release_not_offered; host_not_eligible (the body carries `reason`, one amendment-1 EligibilityReason, so the button's absence and this refusal are explained by the same string - since amendment 9 that reason may be preflight_blocked, a stack-shape check this host fails); attempt_in_flight (this host already has an open attempt - the database's partial unique index, not a code check); run_active. */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -7902,10 +7902,10 @@ export interface components {
             discovered_at: string;
         };
         /**
-         * @description Why a target is not eligible for the newest listed release. A CLOSED vocabulary of STABLE IDENTIFIERS the UI maps to text - the server never sends the sentence, so wording can improve in the client with no contract change. Precedence is fixed and is the order listed here, so two implementations cannot disagree about which of several true reasons is reported. A client meeting an unrecognized value renders it verbatim rather than dropping the row. Full per-value semantics: control-api.md §"Platform releases". AMENDMENT 2 (#104/#114) APPENDS attempt_in_flight and run_active AT THE END, so no existing evaluation changes: they are the most transient facts on the list, and amendment 1's rule that durable reasons outrank transient ones fixes their position. attempt_in_flight precedes run_active because it is about THIS target.
+         * @description Why a target is not eligible for the newest listed release. A CLOSED vocabulary of STABLE IDENTIFIERS the UI maps to text - the server never sends the sentence, so wording can improve in the client with no contract change. Precedence is fixed and is the order listed here, so two implementations cannot disagree about which of several true reasons is reported. A client meeting an unrecognized value renders it verbatim rather than dropping the row. Full per-value semantics: control-api.md §"Platform releases". AMENDMENT 2 (#104/#114) APPENDS attempt_in_flight and run_active AT THE END, so no existing evaluation changes: they are the most transient facts on the list, and amendment 1's rule that durable reasons outrank transient ones fixes their position. attempt_in_flight precedes run_active because it is about THIS target. AMENDMENT 9 (#185) INSERTS preflight_blocked after control_plane_not_first and before the two transient ones: a stack shape (an unmounted socket volume, a squatted health port) is a durable fact, and the rule that durable reasons outrank transient ones is what fixes its position. The only target whose answer changes is one that is BOTH blocked and mid-apply, which now reads preflight_blocked. The failing check and its fix are on the same target's `preflight`. A preflight of `unknown` never produces this reason.
          * @enum {string}
          */
-        EligibilityReason: "no_release" | "identity_unknown" | "up_to_date" | "install_mode_source" | "updater_absent" | "host_offline" | "release_above_control_plane" | "control_plane_not_first" | "attempt_in_flight" | "run_active";
+        EligibilityReason: "no_release" | "identity_unknown" | "up_to_date" | "install_mode_source" | "updater_absent" | "host_offline" | "release_above_control_plane" | "control_plane_not_first" | "preflight_blocked" | "attempt_in_flight" | "run_active";
         /** @description One target's eligibility, EVALUATED AGAINST available[0] - the newest listed release - and against nothing else. This surface carries no per-release eligibility matrix and a client must not present one. */
         PlatformReleaseTarget: {
             /** @enum {string} */
@@ -7920,6 +7920,31 @@ export interface components {
             eligible: boolean;
             /** @description Null exactly when eligible is true; exactly one non-null reason when it is false. */
             reason: components["schemas"]["EligibilityReason"] | null;
+            /** @description ADDITIVE (amendment 9, #185). Whether this target's stack is SHAPED so that an apply can be carried out - a different question from `eligible` (may it take the release) and from a host's readiness (can it run sessions). Always serialized by a server implementing the amendment; absent on an older one, which a client reads as unknown. Evaluated whether or not a release is listed: the stack-shape checks are useful on their own, and only image_resolvable needs a release. state `blocked` is what produces the preflight_blocked eligibility reason; `unknown` never blocks anything. */
+            preflight: components["schemas"]["PlatformPreflight"];
+        };
+        /**
+         * @description The CLOSED vocabulary of pre-update checks (amendment 9, #185). The three a host's agent can answer about itself - updater_socket, updater_stack_dir, health_addr_bindable - are ALSO that agent's readiness check ids (agent-api.md `readiness`), so preflight and the host's readiness card say the same words about the same fact. Full per-value semantics: control-api.md §"Self-update hardening".
+         * @enum {string}
+         */
+        PreflightCheckId: "updater_socket" | "updater_stack_dir" | "updater_overlays" | "image_resolvable" | "agent_connected" | "health_addr_bindable";
+        PlatformPreflightCheck: {
+            id: components["schemas"]["PreflightCheckId"];
+            /** @description Known values: "pass", "fail", "unknown" - unknown means the collector could not look (an agent predating the check, an updater that did not answer), which is itself a finding but not a blocker. DELIBERATELY NOT AN ENUM, for the same reason ReadinessCheck.status is not: a consumer MUST pass an unrecognized value through rather than reject it. */
+            status: string;
+            /** @description Operator prose. On a fail it NAMES THE FIX (the command, the variable, the port). NEVER PARSED and never branched on - the id and status are what a client keys off. */
+            detail: string;
+        };
+        PlatformPreflight: {
+            /** @description "ok" when every check passed; "blocked" when at least one failed; "unknown" when none failed but at least one could not be evaluated. Not an enum, as above. */
+            state: string;
+            /**
+             * Format: date-time
+             * @description When the facts behind this evaluation were gathered - for a host, when its agent last reported readiness; for the control plane, when its updater was last asked. Null when nothing was gathered at all.
+             */
+            checked_at: string | null;
+            /** @description In the vocabulary's order; every check the target has, evaluated, so the card can name every fix at once. */
+            checks: components["schemas"]["PlatformPreflightCheck"][];
         };
         /**
          * @description Everything wrong that is not an ineligibility. A CLOSED vocabulary. A fault gates nothing anywhere - it is reported so a wrong state is visible instead of silent. Prefixed (rather than a bare FaultKind) because "fault" already names an unrelated thing in this system - an NVIDIA Xid is a GPU fault. Full semantics: control-api.md §"Platform releases".
@@ -8016,10 +8041,10 @@ export interface components {
             };
         };
         /**
-         * @description A fleet run's state. A run succeeds only when EVERY target succeeded, and it STOPS AT ITS FIRST FAILED TARGET - past a failed control plane, continuing would move agents onto a release the control plane is not on (ADR 0002); past a failed host, it would march a known-bad digest set across the fleet. There is deliberately NO "partial": a failed run may have succeeded targets behind it, and the per-target attempts are where that is read.
+         * @description A fleet run's state. A run succeeds only when EVERY target it reached succeeded, and it STOPS AT ITS FIRST FAILED TARGET - past a failed control plane, continuing would move agents onto a release the control plane is not on (ADR 0002); past a failed host, it would march a known-bad digest set across the fleet. A FAILED run has no partial variant: it may have succeeded targets behind it, and the per-target attempts are where that is read. AMENDMENT 9 (#185) APPENDS succeeded_partial: the run reached the end of its host list with nothing failed, but it PASSED OVER at least one host that was behind the release for a reason other than up_to_date (its agent was offline, its preflight was blocked, it is source-built, it has no updater) - so the fleet is on mixed versions. Terminal, and NOT a failure: it does not suppress an unattended release, and the next unattended pass or a "retry" (a plain fleet apply of the same release carrying retry_of) picks the host up once it can take the release. A client renders it distinctly from succeeded - the skipped list and its reasons are the outcome, not a footnote.
          * @enum {string}
          */
-        ApplyRunState: "pending" | "running" | "succeeded" | "failed" | "cancelled";
+        ApplyRunState: "pending" | "running" | "succeeded" | "failed" | "cancelled" | "succeeded_partial";
         /**
          * @description One target's attempt state. The six middle values are EXACTLY agent-api.md release_state.state, relayed unchanged. queued and waiting_sessions are control-plane-only and precede the wire (the command has not been sent); cancelled applies ONLY to an attempt a cancel caught in one of those two states - CANCEL NEVER INTERRUPTS AN ATTEMPT THAT HAS BEEN SENT.
          * @enum {string}
@@ -8062,10 +8087,10 @@ export interface components {
              */
             run_id: string | null;
             /**
-             * @description A REVERT IS AN APPLY WITH AN OLDER DIGEST SET - same wire message, same states, same reasons. This field exists so history can say which button was pressed, and for nothing else.
+             * @description A REVERT IS AN APPLY WITH AN OLDER DIGEST SET - same wire message, same states, same reasons. This field exists so history can say which button was pressed, and for nothing else. AMENDMENT 9 (#185) APPENDS auto_revert: no button was pressed - the host's UPDATER put the previous digests back itself after the new agent container failed its health wait (agent-api.md release_state `restored`), and the control plane wrote this row beside the failed apply so the history shows both steps. It is recorded terminal on insert (succeeded when the restore came up, failed otherwise), was never driven over the wire, and its requested_digests are the failed apply's previous_digests.
              * @enum {string}
              */
-            kind: "apply" | "revert";
+            kind: "apply" | "revert" | "auto_revert";
             /** @enum {string} */
             target: "control_plane" | "host";
             /**
@@ -8108,6 +8133,11 @@ export interface components {
             /** Format: uuid */
             release_id: string;
             state: components["schemas"]["ApplyRunState"];
+            /**
+             * Format: uuid
+             * @description ADDITIVE (amendment 9, #185). The run this one was started to finish - an admin pressed "Retry skipped hosts" on a succeeded_partial run. Provenance only: the retry is an ordinary fleet apply of the same release, and the hosts it moves are decided at their turn exactly as always (the already-updated ones read up_to_date and are skipped). Null on every other run, and on a server predating the amendment. ON DELETE SET NULL, so deleting the original leaves the retry standing.
+             */
+            retry_of: string | null;
             /** @description Applied to EVERY host target in this run. It exists on the fleet body, and not only on the per-host one, because a run whose every host target waits for a natural drain can otherwise stall indefinitely. */
             force: boolean;
             /** @description ADDITIVE, amendment 8 (#122). True when the detection schedule started this run rather than an admin pressing Update. A CLIENT SHOULD SAY SO: an admin finding a fleet run they did not start is owed the explanation. requested_by cannot answer this - it is null for an unattended run AND for one whose requesting admin has since been deleted (ON DELETE SET NULL). Always false on a run an admin created, and false on a server predating this amendment. An unattended run NEVER carries force: force is an operator agreeing to end N live sessions and there is no operator, so an unattended run is only ever started for a release whose `migrates` is false (see the apply section). */
@@ -8149,6 +8179,11 @@ export interface components {
              * @default false
              */
             force: boolean;
+            /**
+             * Format: uuid
+             * @description ADDITIVE (amendment 9, #185). The succeeded_partial run this apply is finishing; recorded on the new run as retry_of and nothing else changes. 404 not_found when no such run exists.
+             */
+            retry_of?: string;
         };
         PlatformHostApplyRequest: {
             /** Format: uuid */

@@ -59,17 +59,14 @@ func (h *ApplyHandler) ActiveRun(ctx context.Context) (*ApplyRun, error) {
 	return run, nil
 }
 
-// fillRun adds what no single row carries: the per-target attempts, and the
-// hosts the sequencer passed over.
+// fillRun adds what the run row does not carry: the per-target attempts. (The
+// skipped hosts are on the row since migration 0083.)
 func (h *ApplyHandler) fillRun(ctx context.Context, run *ApplyRun) {
 	attempts, err := h.store.RunAttempts(ctx, run.ID)
 	if err != nil {
 		h.log.Warn("platform apply: could not read a run's attempts", "run_id", run.ID, "err", err)
 	} else {
 		run.Attempts = attempts
-	}
-	if h.fleet != nil {
-		run.Skipped = h.fleet.Skips(run.ID)
 	}
 }
 
@@ -86,8 +83,24 @@ func (h *ApplyHandler) handleFleetApply(w http.ResponseWriter, r *http.Request) 
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "release_id must be a uuid")
 		return
 	}
+	if req.RetryOf != nil && !looksLikeUUID(*req.RetryOf) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "retry_of must be a uuid")
+		return
+	}
 
 	ctx := r.Context()
+	if req.RetryOf != nil {
+		// Provenance only, but it must name a run that exists: a link to
+		// nothing is worse than no link.
+		if _, err := h.store.Run(ctx, *req.RetryOf); err != nil {
+			if errors.Is(err, ErrRunNotFound) {
+				httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "no such run to retry")
+				return
+			}
+			h.internal(w, "read the run being retried", err)
+			return
+		}
+	}
 	release, err := h.store.Release(ctx, req.ReleaseID)
 	if err != nil {
 		if errors.Is(err, ErrReleaseNotFound) {
@@ -97,7 +110,7 @@ func (h *ApplyHandler) handleFleetApply(w http.ResponseWriter, r *http.Request) 
 		h.internal(w, "read release", err)
 		return
 	}
-	view, err := h.view(ctx)
+	view, err := h.freshView(ctx)
 	if err != nil {
 		h.internal(w, "build release view", err)
 		return
@@ -138,7 +151,7 @@ func (h *ApplyHandler) handleFleetApply(w http.ResponseWriter, r *http.Request) 
 	}
 
 	actor := actorID(r)
-	run, err := h.store.CreateRun(ctx, release.ID, req.Force, nilIfEmpty(actor))
+	run, err := h.store.CreateRun(ctx, release.ID, req.Force, nilIfEmpty(actor), req.RetryOf)
 	if err != nil {
 		if errors.Is(err, ErrRunActive) {
 			// The database's active-run index, not a code check: two admins
@@ -151,11 +164,15 @@ func (h *ApplyHandler) handleFleetApply(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	audit.TryRecord(ctx, h.auditor, actor, "platform.apply.run", "platform", release.ID, map[string]any{
+	details := map[string]any{
 		"release_id":    release.ID,
 		"source_commit": release.SourceCommit,
 		"force":         req.Force,
-	})
+	}
+	if req.RetryOf != nil {
+		details["retry_of"] = *req.RetryOf
+	}
+	audit.TryRecord(ctx, h.auditor, actor, "platform.apply.run", "platform", release.ID, details)
 	h.fleet.Start(run)
 	h.fillRun(ctx, &run)
 	httpx.WriteJSON(w, http.StatusAccepted, RunEnvelope{Run: run})

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -51,6 +52,8 @@ type UpdaterAPI interface {
 	// plane. False makes the control-plane target ineligible (`updater_absent`)
 	// rather than an apply that fails halfway.
 	Present() bool
+	// SocketState is the three-way #184 diagnosis behind Present.
+	SocketState() SocketState
 	// Self is what the updater discovered about the stack it sits beside.
 	Self(ctx context.Context) (UpdaterSelf, error)
 	Apply(ctx context.Context, req updater.ApplyRequest) (updater.Accepted, error)
@@ -61,6 +64,13 @@ type UpdaterAPI interface {
 // rather than imported so an older updater, whose answer carries no `images`,
 // decodes to "unknown" instead of failing.
 type UpdaterSelf struct {
+	Version     string   `json:"version"`
+	WorkingDir  string   `json:"working_dir"`
+	ConfigFiles []string `json:"config_files"`
+	// Per compose service, the compose-file set its running container carries
+	// in its own labels (preflight `updater_overlays`). Absent on an older
+	// updater, which preflight reads as unknown.
+	ServiceConfigFiles map[string][]string `json:"service_config_files"`
 	// Component name → the effective image reference compose would use for its
 	// service, defaults included.
 	Images map[string]string `json:"images"`
@@ -116,11 +126,23 @@ func NewUpdaterClient(socket string) *UpdaterClient {
 }
 
 func (c *UpdaterClient) Present() bool {
+	return c.SocketState().SocketExists
+}
+
+// SocketState stats the mount directory and then the socket, so "volume not
+// mounted" and "updater not running" are told apart (#184).
+func (c *UpdaterClient) SocketState() SocketState {
 	if c == nil || c.socket == "" {
-		return false
+		return SocketState{}
 	}
-	_, err := os.Stat(c.socket)
-	return err == nil
+	var st SocketState
+	if _, err := os.Stat(filepath.Dir(c.socket)); err == nil {
+		st.DirExists = true
+	}
+	if _, err := os.Stat(c.socket); err == nil {
+		st.SocketExists = true
+	}
+	return st
 }
 
 // updaterError carries the socket's rejection identifier, which is already the
@@ -240,15 +262,17 @@ type SelfApplier struct {
 	Identity     func() buildinfo.Identity
 	Deadline     time.Duration
 	PollInterval time.Duration
-	// How long a read install mode is reused. Short rather than cached at boot:
-	// the stack can be re-composed under a running control plane, and an
-	// install mode read once at start would then be a lie for its whole life.
+	// How long a read of the updater's self-report is reused. Short rather
+	// than cached at boot: the stack can be re-composed under a running control
+	// plane, and a report read once at start would then be a lie for its whole
+	// life.
 	InstallModeTTL time.Duration
 
-	mu             sync.Mutex
-	installMode    string
-	installModeAt  time.Time
-	installModeSet bool
+	mu      sync.Mutex
+	self    UpdaterSelf
+	selfErr error
+	selfAt  time.Time
+	selfSet bool
 }
 
 // NewSelfApplier builds the control-plane applier with the contract's timings.
@@ -279,36 +303,72 @@ func (s *SelfApplier) UpdaterPresent() bool {
 // other leaves a container that starts and then cannot write its own TLS volume
 // — a crash-loop with no console left to fix it from.
 func (s *SelfApplier) InstallMode() *string {
-	s.mu.Lock()
-	if s.installModeSet && time.Since(s.installModeAt) < s.InstallModeTTL {
-		mode := s.installMode
-		s.mu.Unlock()
-		if mode == "" {
-			return nil
-		}
-		return &mode
+	self, _, err := s.selfReport()
+	if err != nil {
+		return nil
 	}
-	s.mu.Unlock()
-
-	mode := ""
-	if s.updater != nil && s.updater.Present() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		self, err := s.updater.Self(ctx)
-		cancel()
-		if err != nil {
-			s.log.Warn("could not read this control plane's install mode from the updater", "err", err)
-		} else {
-			mode = ClassifyImageRef(self.Images[ComponentControlPlane])
-		}
-	}
-
-	s.mu.Lock()
-	s.installMode, s.installModeAt, s.installModeSet = mode, time.Now(), true
-	s.mu.Unlock()
+	mode := ClassifyImageRef(self.Images[ComponentControlPlane])
 	if mode == "" {
 		return nil
 	}
 	return &mode
+}
+
+// selfReport is `GET /v1/self` over the socket, reused for InstallModeTTL. The
+// error is cached too: a failing updater is asked once per TTL, not once per
+// view read.
+func (s *SelfApplier) selfReport() (UpdaterSelf, time.Time, error) {
+	s.mu.Lock()
+	if s.selfSet && time.Since(s.selfAt) < s.InstallModeTTL {
+		defer s.mu.Unlock()
+		return s.self, s.selfAt, s.selfErr
+	}
+	s.mu.Unlock()
+
+	var self UpdaterSelf
+	var err error
+	if s.updater == nil || !s.updater.Present() {
+		err = errors.New("no updater socket")
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		self, err = s.updater.Self(ctx)
+		cancel()
+		if err != nil {
+			s.log.Warn("could not read this control plane's updater self-report", "err", err)
+		}
+	}
+	now := time.Now()
+	s.mu.Lock()
+	s.self, s.selfErr, s.selfAt, s.selfSet = self, err, now, true
+	s.mu.Unlock()
+	return self, now, err
+}
+
+// PreflightFacts is what preflight can learn about this control plane's own
+// stack: the socket three-way, and the updater's self-report when it answers.
+func (s *SelfApplier) PreflightFacts(context.Context) PreflightFacts {
+	f := PreflightFacts{}
+	if s.updater == nil {
+		return f
+	}
+	st := s.updater.SocketState()
+	f.Socket = &st
+	if !st.SocketExists {
+		return f
+	}
+	self, at, err := s.selfReport()
+	f.CheckedAt = &at
+	facts := &UpdaterSelfFacts{}
+	if err != nil {
+		facts.Err = err.Error()
+	} else {
+		facts.Version = self.Version
+		facts.StackDir = self.WorkingDir
+		facts.ConfigFiles = self.ConfigFiles
+		facts.ServiceConfigFiles = self.ServiceConfigFiles
+	}
+	f.Self = facts
+	return f
 }
 
 // Apply drives one control-plane attempt to terminal — or, in the normal case,

@@ -303,6 +303,25 @@ func (f *fakeFleetStore) SetRunTarget(_ context.Context, _, target string, hostI
 	return nil
 }
 
+func (f *fakeFleetStore) RecordSkip(_ context.Context, _ string, skip RunSkip) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, s := range f.run.Skipped {
+		if s.HostID == skip.HostID {
+			return nil
+		}
+	}
+	f.run.Skipped = append(f.run.Skipped, skip)
+	return nil
+}
+
+// skips is what the run persisted as passed over, in order.
+func (f *fakeFleetStore) skips() []RunSkip {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]RunSkip(nil), f.run.Skipped...)
+}
+
 func (f *fakeFleetStore) FinishRun(_ context.Context, _, state, errText string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -524,7 +543,7 @@ func planningView(f *fakeFleetStore, cpSchema int) func(context.Context) (View, 
 func fleetView(cpReason string, hosts ...Target) func(context.Context) (View, error) {
 	return func(context.Context) (View, error) {
 		v := View{Channel: ChannelStable}
-		v.Targets = append(v.Targets, target(TargetControlPlane, nil, nil, cpReason))
+		v.Targets = append(v.Targets, target(TargetControlPlane, nil, nil, cpReason, Preflight{State: PreflightUnknown}))
 		v.Targets = append(v.Targets, hosts...)
 		return v, nil
 	}
@@ -532,7 +551,7 @@ func fleetView(cpReason string, hosts ...Target) func(context.Context) (View, er
 
 func hostTarget(id, name, reason string) Target {
 	hostID, nodeName := id, name
-	return target(TargetHost, &hostID, &nodeName, reason)
+	return target(TargetHost, &hostID, &nodeName, reason, Preflight{State: PreflightUnknown})
 }
 
 func testFleet(t *testing.T, store *fakeFleetStore, d *fakeDrivers, view func(context.Context) (View, error)) *FleetRunner {
@@ -652,11 +671,12 @@ func TestFleetReportsSkippedHostsAndSucceeds(t *testing.T) {
 	run := runToEnd(t, f, store)
 
 	// An ineligibility is not a failure: a run must not go failed because a
-	// host happened to be offline.
-	if run.State != RunSucceeded {
-		t.Fatalf("run state = %q, want succeeded", run.State)
+	// host happened to be offline. But two hosts were left behind, so it is not
+	// a clean success either (amendment 9).
+	if run.State != RunSucceededPartial {
+		t.Fatalf("run state = %q, want succeeded_partial", run.State)
 	}
-	skips := f.Skips(testRunID)
+	skips := store.skips()
 	if len(skips) != 2 {
 		t.Fatalf("skipped = %+v, want two", skips)
 	}
@@ -680,8 +700,8 @@ func TestFleetIgnoresItsOwnRunActiveReason(t *testing.T) {
 	if run.State != RunSucceeded {
 		t.Fatalf("run state = %q, want succeeded", run.State)
 	}
-	if len(f.Skips(testRunID)) != 0 {
-		t.Fatalf("skipped = %+v, want none", f.Skips(testRunID))
+	if len(store.skips()) != 0 {
+		t.Fatalf("skipped = %+v, want none", store.skips())
 	}
 }
 
@@ -1240,14 +1260,14 @@ func TestFleetSkipsAHostWhoseAgentIsGoneEvenAfterItCordonsIt(t *testing.T) {
 
 	run := runToEnd(t, f, store)
 
-	if run.State != RunSucceeded {
-		t.Fatalf("run state = %q, want succeeded — a run must not fail because a host happened to be offline", run.State)
+	if run.State != RunSucceededPartial {
+		t.Fatalf("run state = %q, want succeeded_partial — a run must not fail because a host happened to be offline, and must not read as clean either", run.State)
 	}
 	// h2 was updated; h1 was skipped, not attempted.
 	if got := d.steps(); len(got) != 1 || got[0] != "h2" {
 		t.Fatalf("targets reached = %v, want only h2 — h1 has no agent to send to", got)
 	}
-	skips := f.Skips(testRunID)
+	skips := store.skips()
 	if len(skips) != 1 || skips[0].HostID != "h1" || skips[0].Reason != ReasonHostOffline {
 		t.Fatalf("skipped = %+v, want h1 with %s", skips, ReasonHostOffline)
 	}
@@ -1274,7 +1294,7 @@ func TestFleetStillAppliesToACordonedHostWhoseAgentIsPresent(t *testing.T) {
 	if got := d.steps(); len(got) != 2 {
 		t.Fatalf("targets reached = %v, want both hosts — cordoned is the condition an apply wants", got)
 	}
-	if skips := f.Skips(testRunID); len(skips) != 0 {
+	if skips := store.skips(); len(skips) != 0 {
 		t.Fatalf("skipped = %+v, want none", skips)
 	}
 }
@@ -1527,5 +1547,61 @@ func TestFleetForcedMigratingStepDrainsWhenTheInitialCountIsUnreadable(t *testin
 	// Nothing may be reported as remaining: the only count before the drain failed.
 	if got := store.recordedRemaining(); len(got) != 0 && got[0] != 0 {
 		t.Fatalf("recorded sessions_remaining = %v, want no pre-drain number", got)
+	}
+}
+
+// RunOutcome: a skip for up_to_date is a host that was done; every other skip
+// is a host left behind, and that is what makes a run partial.
+func TestRunOutcome(t *testing.T) {
+	cases := []struct {
+		skips []RunSkip
+		want  string
+	}{
+		{nil, RunSucceeded},
+		{[]RunSkip{{HostID: "h1", Reason: ReasonUpToDate}}, RunSucceeded},
+		{[]RunSkip{{HostID: "h1", Reason: ReasonUpToDate}, {HostID: "h2", Reason: ReasonHostOffline}}, RunSucceededPartial},
+		{[]RunSkip{{HostID: "h1", Reason: ReasonPreflightBlocked}}, RunSucceededPartial},
+		{[]RunSkip{{HostID: "h1", Reason: ReasonInstallModeSource}}, RunSucceededPartial},
+		{[]RunSkip{{HostID: "h1", Reason: ReasonAttemptInFlight}}, RunSucceededPartial},
+	}
+	for _, tc := range cases {
+		if got := RunOutcome(tc.skips); got != tc.want {
+			t.Fatalf("RunOutcome(%+v) = %s, want %s", tc.skips, got, tc.want)
+		}
+	}
+}
+
+// A fleet whose every host is already on the release is a clean success: an
+// up_to_date skip is not a host left behind.
+func TestFleetUpToDateSkipsAreNotPartial(t *testing.T) {
+	store := newFakeFleetStore(false)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView(ReasonUpToDate,
+		hostTarget("h1", "gpu-01", ReasonUpToDate), hostTarget("h2", "gpu-02", ReasonUpToDate)))
+	run := runToEnd(t, f, store)
+	if run.State != RunSucceeded {
+		t.Fatalf("run state = %q, want succeeded", run.State)
+	}
+	if len(run.Skipped) != 2 {
+		t.Fatalf("skipped = %+v, want both hosts recorded", run.Skipped)
+	}
+}
+
+// A blocked preflight is skipped like any ineligibility, named, and makes the
+// run partial: the run never moves onto a host whose stack cannot take it.
+func TestFleetSkipsAPreflightBlockedHost(t *testing.T) {
+	store := newFakeFleetStore(false)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView(ReasonUpToDate,
+		hostTarget("h1", "gpu-01", ReasonPreflightBlocked), hostTarget("h2", "gpu-02", "")))
+	run := runToEnd(t, f, store)
+	if run.State != RunSucceededPartial {
+		t.Fatalf("run state = %q, want succeeded_partial", run.State)
+	}
+	if got := d.steps(); len(got) != 1 || got[0] != "h2" {
+		t.Fatalf("targets reached = %v, want only h2", got)
+	}
+	if skips := store.skips(); len(skips) != 1 || skips[0].Reason != ReasonPreflightBlocked {
+		t.Fatalf("skipped = %+v, want h1 with preflight_blocked", skips)
 	}
 }

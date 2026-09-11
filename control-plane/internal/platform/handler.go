@@ -53,6 +53,11 @@ type Deps struct {
 	// `internal/agentws` owns the registry and sits beside this package, not
 	// under it.
 	AgentConnected func(hostID string) bool
+	// ControlPlanePreflight is what the collectors found about this control
+	// plane's own stack (amendment 9). Optional: nil leaves every check unknown.
+	ControlPlanePreflight func(ctx context.Context) PreflightFacts
+	// ImageFor is the instance-wide registry check for one release. Optional.
+	ImageFor func(ctx context.Context, r Release) *ImageFact
 }
 
 // errNoDeps is what a handler built with no dependencies answers with, rather
@@ -173,17 +178,27 @@ func (h *Handler) releaseView(ctx context.Context) (View, error) {
 			return View{}, err
 		}
 	}
+	var cpPreflight PreflightFacts
+	if h.deps.ControlPlanePreflight != nil {
+		cpPreflight = h.deps.ControlPlanePreflight(ctx)
+	}
+	var imageFor func(Release) *ImageFact
+	if h.deps.ImageFor != nil {
+		imageFor = func(r Release) *ImageFact { return h.deps.ImageFor(ctx, r) }
+	}
 	return PlanRelease(PlanInputs{
-		Channel:      channel,
-		SourceRepo:   ConfiguredReleaseRepo(),
-		EdgeBranch:   edgeBranch,
-		ControlPlane: buildinfo.Get(),
-		Hosts:        hosts,
-		Releases:     releases,
-		CheckedAt:    status.CheckedAt,
-		LastError:    status.LastError,
-		OpenAttempts: open,
-		ActiveRun:    run,
+		Channel:               channel,
+		SourceRepo:            ConfiguredReleaseRepo(),
+		ControlPlanePreflight: cpPreflight,
+		ImageFor:              imageFor,
+		EdgeBranch:            edgeBranch,
+		ControlPlane:          buildinfo.Get(),
+		Hosts:                 hosts,
+		Releases:              releases,
+		CheckedAt:             status.CheckedAt,
+		LastError:             status.LastError,
+		OpenAttempts:          open,
+		ActiveRun:             run,
 
 		UpdaterPresent:          h.deps.UpdaterPresent != nil && h.deps.UpdaterPresent(),
 		ControlPlaneInstallMode: installMode,

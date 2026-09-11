@@ -355,7 +355,7 @@ func TestFleetRunIsAdoptedAfterARestart(t *testing.T) {
 
 	// The state a restart leaves behind: a run mid-flight with the
 	// control-plane attempt already resolved and no host reached.
-	run, err := h.store.CreateRun(ctx, h.release.ID, false, nil)
+	run, err := h.store.CreateRun(ctx, h.release.ID, false, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,7 +412,7 @@ func TestFleetRestoresTheCordonAcrossARestart(t *testing.T) {
 	// A second host, so the record has both shapes in it.
 	other := seedHost(t, h.pool, "gpu-fleet-02", commitA, "online")
 
-	run, err := h.store.CreateRun(ctx, h.release.ID, false, nil)
+	run, err := h.store.CreateRun(ctx, h.release.ID, false, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -470,7 +470,7 @@ func TestFleetAdoptedWithNoCordonRecordLeavesTheFleetOnline(t *testing.T) {
 
 	other := seedHost(t, h.pool, "gpu-fleet-02", commitA, "online")
 
-	run, err := h.store.CreateRun(ctx, h.release.ID, false, nil)
+	run, err := h.store.CreateRun(ctx, h.release.ID, false, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

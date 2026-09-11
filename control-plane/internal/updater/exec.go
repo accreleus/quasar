@@ -210,6 +210,46 @@ func (e *Executor) EffectiveImages(ctx context.Context) map[string]*string {
 	return out
 }
 
+// ServiceConfigFiles is, per compose service this program may recreate, the
+// compose-file set its RUNNING container was started with (its own
+// com.docker.compose.project.config_files label). A service with no running
+// container maps to nil. Preflight compares each against this updater's own set
+// (`updater_overlays`): a recreate uses the updater's, so a service brought up
+// with an overlay the updater does not know would silently lose it.
+func (e *Executor) ServiceConfigFiles(ctx context.Context) map[string][]string {
+	out := map[string][]string{}
+	for _, t := range componentTargets {
+		out[t.service] = nil
+	}
+	args := []string{"ps", "--filter", "label=" + labelProject + "=" + e.Cfg.Project,
+		"--format", `{{.Label "com.docker.compose.service"}}` + "\t" + `{{.Label "` + labelConfigFiles + `"}}`}
+	body, code, err := e.run(ctx, args, 30*time.Second)
+	if err != nil || code != 0 {
+		log.Printf("docker ps (service labels): exit %d: %s", code, TailOutput(body, 512))
+		return out
+	}
+	for _, line := range strings.Split(body, "\n") {
+		svc, files, ok := strings.Cut(strings.TrimSpace(line), "\t")
+		if !ok {
+			continue
+		}
+		if _, known := out[svc]; !known {
+			continue
+		}
+		var list []string
+		for _, f := range strings.Split(files, ",") {
+			if f = strings.TrimSpace(f); f != "" {
+				list = append(list, f)
+			}
+		}
+		if list == nil {
+			list = []string{}
+		}
+		out[svc] = list
+	}
+	return out
+}
+
 // composePS is one service's post-state as `docker compose ps --format json`
 // reports it. Only the fields that decide the verdict are named.
 type composePS struct {

@@ -47,6 +47,8 @@ type ApplyHandler struct {
 	edge ApplyComponentResolver
 	// The fleet sequencer (apply_fleet.go); nil on a build with no fleet half.
 	fleet *FleetRunner
+	// Drops the preflight caches before an apply decision; nil is a no-op.
+	refreshPreflight func()
 }
 
 // logger is the sliver of *slog.Logger this file uses.
@@ -66,6 +68,21 @@ func NewApplyHandler(store *Store, runner *Runner, view func(ctx context.Context
 func (h *ApplyHandler) WithEdgeResolver(r ApplyComponentResolver) *ApplyHandler {
 	h.edge = r
 	return h
+}
+
+// WithPreflightRefresh wires what the apply endpoints call before they read
+// the view: a stale preflight must not authorise a run (amendment 9).
+func (h *ApplyHandler) WithPreflightRefresh(refresh func()) *ApplyHandler {
+	h.refreshPreflight = refresh
+	return h
+}
+
+// freshView is the release view with every preflight cache dropped first.
+func (h *ApplyHandler) freshView(ctx context.Context) (View, error) {
+	if h.refreshPreflight != nil {
+		h.refreshPreflight()
+	}
+	return h.view(ctx)
 }
 
 // Register wires the apply routes. admin must compose RequireAuth→RequireAdmin:
@@ -146,7 +163,7 @@ func (h *ApplyHandler) handleHostApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	view, err := h.view(ctx)
+	view, err := h.freshView(ctx)
 	if err != nil {
 		h.internal(w, "build release view", err)
 		return
