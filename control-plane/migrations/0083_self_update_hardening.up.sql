@@ -1,4 +1,4 @@
--- 0083: self-update hardening (amendment 9, #185). PURELY ADDITIVE.
+-- 0083: self-update hardening (amendment 9, #185). Purely additive.
 --
 -- Two widened CHECKs and two columns on tables that already exist; no backfill,
 -- and no behaviour change for a run that skips nothing or an attempt that is
@@ -9,10 +9,9 @@
 --     behind the release (any skip except up_to_date). Terminal, not a failure.
 --   - platform_apply_runs.retry_of: the succeeded_partial run this one was
 --     started to finish. Provenance only — nothing reads it to choose a target.
---   - platform_apply_runs.skipped: the served `skipped` array, persisted. It
---     was held in memory before; succeeded_partial is DECIDED from it, and a
---     partial run whose explanation evaporated on a crash would be a state with
---     no reason.
+--   - platform_apply_runs.skipped: the served `skipped` array, persisted:
+--     succeeded_partial is decided from it, and a partial run whose explanation
+--     evaporated on a crash would be a state with no reason.
 --   - platform_apply_attempts.kind gains 'auto_revert': the host's updater put
 --     the previous digests back itself after a failed health wait, and the
 --     control plane recorded that beside the failed apply.

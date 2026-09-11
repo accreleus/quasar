@@ -184,6 +184,8 @@ type FleetRunner struct {
 	// run ids this process re-adopted rather than started, which is what the
 	// settle window keys on.
 	adopted map[string]bool
+	// run ids with a skip the store refused to record: fail towards partial.
+	unrecordedSkips map[string]bool
 
 	baseCtx context.Context
 	stop    context.CancelFunc
@@ -197,15 +199,16 @@ func NewFleetRunner(store fleetStore, hosts hostDriver, self selfDriver, resolve
 	return &FleetRunner{
 		store: store, hosts: hosts, self: self, resolve: resolve, cordons: cordons,
 		view: view, log: log,
-		PollWait:       DefaultApplyPoll,
-		Deadline:       DefaultApplyDeadline,
-		AdoptSettle:    DefaultAdoptSettle,
-		InFlightSettle: DefaultInFlightSettle,
-		SchemaVersion:  buildinfo.SchemaVersion(),
-		running:        make(map[string]context.CancelFunc),
-		adopted:        make(map[string]bool),
-		baseCtx:        ctx,
-		stop:           cancel,
+		PollWait:        DefaultApplyPoll,
+		Deadline:        DefaultApplyDeadline,
+		AdoptSettle:     DefaultAdoptSettle,
+		InFlightSettle:  DefaultInFlightSettle,
+		SchemaVersion:   buildinfo.SchemaVersion(),
+		running:         make(map[string]context.CancelFunc),
+		adopted:         make(map[string]bool),
+		unrecordedSkips: make(map[string]bool),
+		baseCtx:         ctx,
+		stop:            cancel,
 	}
 }
 
@@ -261,13 +264,17 @@ func (f *FleetRunner) Close() {
 	f.wg.Wait()
 }
 
-// recordSkip persists one host the run passed over. Persisted, not held: the
-// run's terminal state is decided from this list (RunOutcome), and a list that
-// lived in memory was empty after any crash mid-fleet — a partial run with no
-// reason.
+// recordSkip persists one host the run passed over: the run's terminal state
+// is decided from this list (RunOutcome), and it must survive the restart the
+// run itself causes. A skip that could not be written is remembered so the
+// outcome still reads partial rather than clean.
 func (f *FleetRunner) recordSkip(ctx context.Context, runID string, skip RunSkip) {
 	if err := f.store.RecordSkip(ctx, runID, skip); err != nil {
-		f.log.Warn("fleet apply: could not record a skipped host", "run_id", runID, "host_id", skip.HostID, "err", err)
+		f.log.Warn("fleet apply: could not record a skipped host", "run_id", runID,
+			"host_id", skip.HostID, "err", err, "token", "fleet-apply-skip-unrecorded")
+		f.mu.Lock()
+		f.unrecordedSkips[runID] = true
+		f.mu.Unlock()
 	}
 }
 
@@ -291,11 +298,19 @@ func (f *FleetRunner) drive(ctx context.Context, runID string) {
 	// remembers.
 	final, err := f.store.Run(ctx, runID)
 	if err != nil {
-		f.log.Error("fleet apply: could not re-read the run to decide its outcome", "run_id", runID, "err", err)
+		f.log.Error("fleet apply: could not re-read the run to decide its outcome",
+			"run_id", runID, "err", err, "token", "fleet-apply-outcome-unread")
 		f.finish(runID, RunFailed, "could not re-read the run to decide its outcome: "+err.Error())
 		return
 	}
 	outcome := RunOutcome(final.Skipped)
+	f.mu.Lock()
+	unrecorded := f.unrecordedSkips[runID]
+	delete(f.unrecordedSkips, runID)
+	f.mu.Unlock()
+	if unrecorded {
+		outcome = RunSucceededPartial
+	}
 	if outcome == RunSucceededPartial {
 		f.log.Warn("fleet apply finished with hosts left behind", "run_id", runID,
 			"skipped", len(final.Skipped), "token", "fleet-apply-partial")

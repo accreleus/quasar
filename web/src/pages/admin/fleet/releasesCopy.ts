@@ -19,7 +19,7 @@ const REASON_TEXT: Record<string, string> = {
   host_offline: "The host's agent is not connected.",
   release_above_control_plane: "Waiting on the control plane: this release carries a newer schema.",
   control_plane_not_first: "Waiting on the control plane, which moves first.",
-  preflight_blocked: "A pre-update check failed on this target; the check below names the fix.",
+  preflight_blocked: "A preflight check failed on this target; the check below names the fix.",
   attempt_in_flight: "An update is already in flight on this target.",
   run_active: "A fleet update is already running.",
 };
@@ -37,6 +37,20 @@ const PREFLIGHT_CHECK_TEXT: Record<string, string> = {
 
 export function preflightCheckText(id: string): string {
   return PREFLIGHT_CHECK_TEXT[id] ?? id;
+}
+
+/** A skip reason as the short phrase a sentence takes ("gpu-02 (offline)");
+ *  REASON_TEXT above is the same vocabulary as a full sentence. */
+const SKIP_PHRASE: Record<string, string> = {
+  host_offline: "offline",
+  preflight_blocked: "a preflight check failed",
+  install_mode_source: "built from source",
+  updater_absent: "no updater",
+  attempt_in_flight: "another update in flight",
+};
+
+export function skipReasonPhrase(reason: string): string {
+  return SKIP_PHRASE[reason] ?? reason;
 }
 
 /** Which button, or no button at all, produced an attempt. */

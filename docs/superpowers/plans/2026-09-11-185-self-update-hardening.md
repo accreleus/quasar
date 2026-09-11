@@ -26,7 +26,9 @@ Read these before executing; each one is a place where the issues' suggested fix
 8. **`pull_failed` restores `.env` only** (grilling Q24): the old container is still running, so no recreate; the file just stops naming an image that never arrived.
 9. **Live gates after the cut** (grilling Q20/Q25): the squatted-port scenario on gpu-test proves the double failure (a post-#152 restored agent fails the same bind); a request posted to the updater socket with a non-agent digest proves the clean restore and the `restored` replay; aux-infra's agent is stopped briefly for the partial-outcome gate and brought back for the retry.
 10. **Issue closing** (grilling Q26): #186–#190 and #184 close on the develop merge; #185 after the post-cut gates; #173 after its item 4.
-11. **Migration number is 0083.** PR #182 (#176, held for its own schema.md amendment) also claims 0083. Whichever lands second renumbers to 0084; golang-migrate only moves forward, so a stack that applied 0084 first would never apply 0083. Flag this at landing time.
+11. **An agent `skip` reads as a preflight `pass`** ("not applicable"), not `unknown` (in-session review, 2026-09-12): a disabled health endpoint has nothing to bind and a stack with no updater service is already `updater_absent`; neither should keep a target's preflight `unknown` for ever.
+12. **A restore that itself fails leaves no `auto_revert` row** (in-session review): `restored` is only ever `true` for a restore that came up, so a failed one is unrepresentable on the wire; both failures are in the failed apply's output and `previous` is the recipe.
+13. **Migration number is 0083.** PR #182 (#176, held for its own schema.md amendment) also claims 0083. Whichever lands second renumbers to 0084; golang-migrate only moves forward, so a stack that applied 0084 first would never apply 0083. Flag this at landing time.
 
 ## What the amendment (#186) contains
 
@@ -374,7 +376,7 @@ func RunOutcome(skips []RunSkip) string
 
 ### Task G1: Copy and preflight helpers
 
-- [ ] `releasesCopy.ts`: `preflight_blocked: "A pre-update check failed on this target — see the check below."`; `succeeded_partial: "Applied, but at least one host was skipped and is still on the old release."`; `PREFLIGHT_CHECK_TEXT` for the six ids; `attemptKindText` (`apply` → Apply, `revert` → Revert, `auto_revert` → "Reverted automatically").
+- [ ] `releasesCopy.ts`: `preflight_blocked: "A preflight check failed on this target — see the check below."`; `succeeded_partial: "Applied, but at least one host was skipped and is still on the old release."`; `PREFLIGHT_CHECK_TEXT` for the six ids; `attemptKindText` (`apply` → Apply, `revert` → Revert, `auto_revert` → "Reverted automatically").
 - [ ] `preflight.ts`: `blockingChecks(t: PlatformReleaseTarget): PlatformPreflightCheck[]` (status fail), `unknownChecks`. Tests.
 - [ ] Commit.
 

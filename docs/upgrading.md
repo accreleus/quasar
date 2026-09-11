@@ -362,7 +362,7 @@ docker compose -f deploy/docker-compose.yml exec quasar-node-agent \
 That last command should print the compose project, the working directory, the
 `-f` files (**including every overlay you use**) and the namespace allowlist.
 The console checks the same things for you: Admin › Fleet › Releases shows each
-target's pre-update checks, and a control plane or agent created before the
+target's preflight checks, and a control plane or agent created before the
 socket volume existed reads as **Blocked** with the recreate command beside
 it, rather than as "no updater". If the command
 instead reports that the stack directory is not visible in the container,
@@ -378,7 +378,7 @@ Since #152 the node agent **refuses to start** when it cannot bind its health
 address, instead of letting whatever already owns the port answer its health
 checks. The agent runs with host networking, so the default `127.0.0.1:9091` is
 shared with everything on the machine. The host's readiness card (Hosts tab ›
-Updates › "agent health port free") and the Releases page's pre-update checks
+Updates › "agent health port free") and the Releases page's preflight checks
 both report who answers that address, so a squatter shows up before an update
 rather than as a host that is down after one; an update that does hit it is
 put back on the previous agent by the updater (ADR 0004), with the
@@ -593,14 +593,14 @@ one it cannot determine, makes the target ineligible and refuses the run
 outright, since nothing moves before the control plane.
 
 **Hosts that cannot take the release are skipped, not failed** — an offline
-host, a source-built host, one with no updater, one whose pre-update checks
+host, a source-built host, one with no updater, one whose preflight checks
 fail. The run lists them under "Not updated" with the reason and finishes
 `succeeded_partial` (step 6). "Nothing was eligible" is a legitimate outcome,
 not an error; a fleet where every host is already on the release is a plain
 `succeeded`.
 
 **Every target is checked before Update is offered.** Beside each target the
-Releases page shows its pre-update checks: the updater is reachable (and the
+Releases page shows its preflight checks: the updater is reachable (and the
 console tells "socket volume not mounted — recreate the container" apart from
 "updater not running"), the updater sees the stack directory, the container was
 started with the same compose files the updater will recreate it with, the

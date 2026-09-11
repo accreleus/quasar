@@ -182,13 +182,9 @@ func (f *fakeStore) SetPreviousDigests(_ context.Context, id string, previous []
 func (f *fakeStore) CreateAutoRevertAttempt(_ context.Context, in NewAutoRevert) (Attempt, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	state := AttemptSucceeded
-	if !in.Succeeded {
-		state = AttemptFailed
-	}
 	row := Attempt{ID: "auto-" + in.Failed.ID, RunID: in.Failed.RunID, Kind: KindAutoRevert, Target: TargetHost,
 		HostID: in.Failed.HostID, RequestedDigests: in.Requested, PreviousDigests: in.Previous,
-		State: state, Output: in.Output}
+		State: AttemptSucceeded, Output: in.Output}
 	f.attempts[row.ID] = &row
 	return row, nil
 }

@@ -24,7 +24,9 @@ pub const CHECK_HEALTH_ADDR_BINDABLE: &str = "health_addr_bindable";
 /// The compose service this agent runs as, for the overlay comparison.
 const AGENT_SERVICE: &str = "quasar-node-agent";
 
-const IO_TIMEOUT: Duration = Duration::from_secs(3);
+/// Both peers are local (a unix socket, a loopback port). Short, because the
+/// collectors run inside the register-prep budget too (#191).
+const IO_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The sliver of the updater's `GET /v1/self` these checks read. Unknown fields
 /// are ignored; missing ones default, so an older updater still answers.
@@ -203,12 +205,12 @@ pub fn check_updater_overlays(v: &UpdaterView) -> ReadinessCheck {
     }
 }
 
-/// `health_addr_bindable`: the configured health address is answered by THIS
+/// `health_addr_bindable`: the configured health address is answered by this
 /// agent. A squatter can only take the port while the agent is down, so on a
 /// running post-#152 agent this passes by construction; its value is on an
 /// older, tolerant agent (which reports the squatter) and on the next start,
 /// which is exactly when an apply recreates the agent.
-pub fn check_health_addr_bindable(h: &HealthOwner, me_node: &str, me_pid: u32) -> ReadinessCheck {
+pub fn check_health_addr_bindable(h: &HealthOwner, me: &HealthIdentity) -> ReadinessCheck {
     let Some(addr) = &h.addr else {
         return skip(CHECK_HEALTH_ADDR_BINDABLE, "The health endpoint is disabled (QUASAR_HEALTH_ADDR)");
     };
@@ -217,12 +219,12 @@ pub fn check_health_addr_bindable(h: &HealthOwner, me_node: &str, me_pid: u32) -
         "Find the owner (ss -ltnp | grep {port}) and stop it, or set QUASAR_HEALTH_ADDR to a free address in deploy/.env and recreate the agent"
     );
     match &h.answer {
-        Some(Ok(id)) if id.node == me_node && id.pid == me_pid => {
+        Some(Ok(id)) if id == me => {
             pass(CHECK_HEALTH_ADDR_BINDABLE, format!("{addr} is answered by this agent"))
         }
         Some(Ok(id)) => fail(
             CHECK_HEALTH_ADDR_BINDABLE,
-            format!("{addr} is answered by node {} pid {}, not this agent (pid {me_pid}); the next agent start will fail to bind it", id.node, id.pid),
+            format!("{addr} is answered by node {} pid {}, not this agent (pid {}); the next agent start will fail to bind it", id.node, id.pid, me.pid),
             free_it,
         ),
         Some(Err(e)) => fail(
@@ -234,17 +236,7 @@ pub fn check_health_addr_bindable(h: &HealthOwner, me_node: &str, me_pid: u32) -
     }
 }
 
-fn pass(id: &str, summary: String) -> ReadinessCheck {
-    ReadinessCheck { id: id.into(), status: super::PASS.into(), summary, remediation: String::new() }
-}
-
-fn skip(id: &str, summary: &str) -> ReadinessCheck {
-    ReadinessCheck { id: id.into(), status: super::SKIP.into(), summary: summary.into(), remediation: String::new() }
-}
-
-fn fail(id: &str, summary: String, remediation: String) -> ReadinessCheck {
-    ReadinessCheck { id: id.into(), status: super::FAIL.into(), summary, remediation }
-}
+use super::{fail, pass, skip};
 
 #[cfg(test)]
 mod tests {
@@ -315,21 +307,21 @@ mod tests {
     fn health_owner_must_be_this_agent() {
         let me = HealthIdentity { node: "gpu-01".into(), pid: 4242 };
         let mine = HealthOwner { addr: Some("127.0.0.1:9091".into()), answer: Some(Ok(me.clone())) };
-        assert_eq!(check_health_addr_bindable(&mine, "gpu-01", 4242).status, super::super::PASS);
+        assert_eq!(check_health_addr_bindable(&mine, &me).status, super::super::PASS);
 
         let other = HealthOwner {
             addr: Some("127.0.0.1:9091".into()),
             answer: Some(Ok(HealthIdentity { node: "gpu-01".into(), pid: 4121 })),
         };
-        let c = check_health_addr_bindable(&other, "gpu-01", 4242);
+        let c = check_health_addr_bindable(&other, &me);
         assert_eq!(c.status, super::super::FAIL);
         assert!(c.summary.contains("pid 4121"), "{}", c.summary);
         assert!(c.remediation.contains("QUASAR_HEALTH_ADDR") && c.remediation.contains("9091"), "{}", c.remediation);
 
         let silent = HealthOwner { addr: Some("127.0.0.1:9091".into()), answer: Some(Err("nothing answers".into())) };
-        assert_eq!(check_health_addr_bindable(&silent, "gpu-01", 4242).status, super::super::FAIL);
+        assert_eq!(check_health_addr_bindable(&silent, &me).status, super::super::FAIL);
 
-        assert_eq!(check_health_addr_bindable(&HealthOwner::default(), "gpu-01", 4242).status, super::super::SKIP);
+        assert_eq!(check_health_addr_bindable(&HealthOwner::default(), &me).status, super::super::SKIP);
     }
 
     #[test]

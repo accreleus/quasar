@@ -3,22 +3,21 @@ package platform
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 )
 
-// Preflight: is a target's stack SHAPED so an apply can be carried out — an
-// unmounted socket volume, a stack directory the updater cannot see, a squatted
-// health port. A different question from eligibility (may it take the release),
-// answered beside it. semantics: control-api.md §"Self-update hardening"
+// Preflight (CONTEXT.md). semantics: control-api.md §"Self-update hardening"
 //
 // PlanPreflight is pure: the collectors (preflight_collect.go, the agent's
 // readiness report) gather facts, this decides. `unknown` never blocks — a fleet
 // of agents that predate the checks must keep updating.
 
 // The closed PreflightCheckId vocabulary. The three an agent answers about
-// itself are ALSO its readiness check ids (node-agent readiness/platform_update.rs).
+// itself are also its readiness check ids (node-agent readiness/platform_update.rs).
 const (
 	CheckUpdaterSocket      = "updater_socket"
 	CheckUpdaterStackDir    = "updater_stack_dir"
@@ -150,7 +149,7 @@ func cpSocketCheck(s *SocketState, self *UpdaterSelfFacts) PreflightCheck {
 	case !s.DirExists:
 		return fail(CheckUpdaterSocket,
 			"the updater's socket volume is not mounted in this container (no "+updaterSocketDir()+
-				"): this control plane was created before the volume existed. Recreate it: "+
+				"): the control plane was created before the volume existed. Recreate it: "+
 				"docker compose up -d --force-recreate --no-deps quasar-control-plane")
 	case !s.SocketExists:
 		return fail(CheckUpdaterSocket,
@@ -202,7 +201,7 @@ func cpOverlaysCheck(self *UpdaterSelfFacts) PreflightCheck {
 		if got == nil {
 			continue // no container for this service: nothing to compare
 		}
-		if !sameStrings(got, self.ConfigFiles) {
+		if !slices.Equal(got, self.ConfigFiles) {
 			return fail(CheckUpdaterOverlays, fmt.Sprintf(
 				"%s was started with [%s] but the updater with [%s]; an apply would recreate it with the updater's set. "+
 					"Bring both up with the same -f list, or recreate quasar-updater with the service's",
@@ -265,25 +264,7 @@ func unknown(id, detail string) PreflightCheck {
 	return PreflightCheck{ID: id, Status: CheckUnknown, Detail: detail}
 }
 
-func sameStrings(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func updaterSocketDir() string {
-	p := ConfiguredUpdaterSocket()
-	if i := strings.LastIndex(p, "/"); i > 0 {
-		return p[:i]
-	}
-	return p
-}
+func updaterSocketDir() string { return filepath.Dir(ConfiguredUpdaterSocket()) }
 
 // readinessCheckWire is agent-api.md `readiness[]` as stored in hosts.readiness.
 type readinessCheckWire struct {

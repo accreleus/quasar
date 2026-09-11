@@ -998,6 +998,9 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// over an agent connection (agent-api.md §release_apply).
 	updaterClient := platform.NewUpdaterClient(platform.ConfiguredUpdaterSocket())
 	selfApplier := platform.NewSelfApplier(platformStore, updaterClient, log)
+	// A stale preflight must not authorise a run: dropped before an apply
+	// decision and by "Check now".
+	refreshPreflight := func() { imageResolver.Invalidate(); selfApplier.InvalidateSelf() }
 
 	pDeps := platformDeps(platformStore, settingsStore, jobStore, secretStore)
 	pDeps.UpdaterPresent = selfApplier.UpdaterPresent
@@ -1044,7 +1047,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	fleetRunner := platform.NewFleetRunner(platformStore, applyRunner, selfApplier,
 		platform.ManifestOrEdge{Edge: edgeApply}, fleetCordons, platformHandler.ReleaseView, log)
 	platformApply := platform.NewApplyHandler(platformStore, applyRunner, platformHandler.ReleaseView, auditStore, log).
-		WithPreflightRefresh(imageResolver.Invalidate).
+		WithPreflightRefresh(refreshPreflight).
 		WithEdgeResolver(edgeApply).
 		WithFleet(fleetRunner)
 	// Closed after construction: the view reports the active run, and the run's
@@ -1091,6 +1094,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 			if releaseDetector == nil {
 				return jobs.Skipped("no platform release repository configured (QUASAR_PLATFORM_RELEASE_REPO)"), nil
 			}
+			refreshPreflight()
 			rep, err := releaseDetector.Detect(ctx)
 			if err != nil {
 				return jobs.Outcome{}, err

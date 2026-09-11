@@ -28,6 +28,8 @@ type ImageResolver struct {
 
 	mu    sync.Mutex
 	cache map[string]imageCheckEntry
+	// Held across a resolve; mu only guards the map.
+	resolveMu sync.Mutex
 }
 
 type imageCheckEntry struct {
@@ -54,11 +56,15 @@ func (r *ImageResolver) Invalidate() {
 	r.mu.Unlock()
 }
 
-// Check is the fact for one release, from the cache when fresh.
+// Check is the fact for one release, from the cache when fresh. Resolves are
+// serialised: concurrent view reads on a cold cache cost one registry round
+// trip, not one each.
 func (r *ImageResolver) Check(ctx context.Context, rel Release) *ImageFact {
 	if r == nil || r.inspect == nil {
 		return nil
 	}
+	r.resolveMu.Lock()
+	defer r.resolveMu.Unlock()
 	r.mu.Lock()
 	if e, ok := r.cache[rel.ID]; ok && time.Since(e.at) < r.ttl {
 		r.mu.Unlock()

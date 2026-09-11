@@ -753,17 +753,17 @@ func TestRunSkipsPartialStateAndRetryOfRoundTrip(t *testing.T) {
 		t.Fatalf("retry_of after the original was deleted = %v, want null", *again.RetryOf)
 	}
 
-	// And the attempt kind CHECK admits auto_revert.
+	// And the attempt kind CHECK admits auto_revert, inserted terminal.
 	a, err := h.store.CreateAutoRevertAttempt(ctx, NewAutoRevert{
 		Failed:    Attempt{HostID: &h.hostID, RunID: &retry.ID},
 		Requested: []ComponentDigest{{Name: ComponentNodeAgent, Image: "x", Digest: "sha256:" + hex64}},
 		Previous:  []PreviousDigest{{Name: ComponentNodeAgent}},
-		Succeeded: false, Output: "restore failed too",
+		Output:    "restored",
 	})
 	if err != nil {
 		t.Fatalf("auto_revert row: %v", err)
 	}
-	if a.Kind != KindAutoRevert || a.State != AttemptFailed || a.Reason == nil {
-		t.Fatalf("row = %+v, want a failed auto_revert with a reason", a)
+	if a.Kind != KindAutoRevert || a.State != AttemptSucceeded || a.FinishedAt == nil || a.RunID == nil || *a.RunID != retry.ID {
+		t.Fatalf("row = %+v, want a terminal succeeded auto_revert on the run", a)
 	}
 }

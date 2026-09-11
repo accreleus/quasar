@@ -61,7 +61,7 @@ type PlanInputs struct {
 	// release decision.
 	ReleaseWebhook *WebhookStatus
 
-	// ControlPlanePreflight is what the collectors found about THIS control
+	// ControlPlanePreflight is what the collectors found about this control
 	// plane's own stack (preflight_collect.go); a host's facts ride on its
 	// HostIdentity. ImageFor is the instance-wide registry check for one
 	// release, a closure because it is evaluated for available[0] only, which
@@ -385,8 +385,8 @@ func controlPlaneReason(newest *Release, cp buildinfo.Identity, attemptOpen bool
 	if *fleet.installMode == InstallSource {
 		return ReasonInstallModeSource
 	}
-	// A stack shape is durable, so it outranks the two transient reasons
-	// (amendment 9). `unknown` never lands here.
+	// A stack shape is durable, so it outranks the two transient reasons;
+	// `unknown` never lands here.
 	if pre.Blocked() {
 		return ReasonPreflightBlocked
 	}

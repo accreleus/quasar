@@ -8087,7 +8087,7 @@ export interface components {
              */
             run_id: string | null;
             /**
-             * @description A REVERT IS AN APPLY WITH AN OLDER DIGEST SET - same wire message, same states, same reasons. This field exists so history can say which button was pressed, and for nothing else. AMENDMENT 9 (#185) APPENDS auto_revert: no button was pressed - the host's UPDATER put the previous digests back itself after the new agent container failed its health wait (agent-api.md release_state `restored`), and the control plane wrote this row beside the failed apply so the history shows both steps. It is recorded terminal on insert (succeeded when the restore came up, failed otherwise), was never driven over the wire, and its requested_digests are the failed apply's previous_digests.
+             * @description A REVERT IS AN APPLY WITH AN OLDER DIGEST SET - same wire message, same states, same reasons. This field exists so history can say which button was pressed, and for nothing else. AMENDMENT 9 (#185) APPENDS auto_revert: no button was pressed - the host's UPDATER put the previous digests back itself after the new agent container failed its health wait (agent-api.md release_state `restored`), and the control plane wrote this row beside the failed apply so the history shows both steps. It is recorded succeeded on insert (the updater reports `restored` only for a restore that came up; a restore that itself failed leaves no row and both failures in the failed apply's output), was never driven over the wire, and its requested_digests are the failed apply's previous_digests.
              * @enum {string}
              */
             kind: "apply" | "revert" | "auto_revert";

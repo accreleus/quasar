@@ -10,7 +10,7 @@ import type {
   PlatformPreflightCheck,
   PlatformReleaseTarget,
 } from "../../../api/types";
-import { eligibilityText, preflightCheckText } from "./releasesCopy";
+import { eligibilityText, preflightCheckText, skipReasonPhrase } from "./releasesCopy";
 
 /** A server predating the amendment sends no `preflight`; that reads as unknown. */
 export function preflightChecks(target: PlatformReleaseTarget): PlatformPreflightCheck[] {
@@ -47,27 +47,9 @@ export function partialSummary(run: PlatformApplyRun): string {
   const hostsMoved = run.attempts.filter((a) => a.target === "host" && a.state === "succeeded").length;
   const behind = run.skipped.filter((s) => s.reason !== "up_to_date");
   const hostTotal = hostsMoved + behind.length;
-  const who = behind.map((s) => `${s.node_name} (${skipWord(s.reason)})`).join(", ");
+  const who = behind.map((s) => `${s.node_name} (${skipReasonPhrase(s.reason)})`).join(", ");
   const head = cpMoved
     ? `Applied to the control plane and ${hostsMoved} of ${hostTotal} hosts`
     : `Applied to ${hostsMoved} of ${hostTotal} hosts`;
   return `${head} — ${behind.length} skipped: ${who}`;
-}
-
-/** The short word a skip reason gets inside a sentence. */
-function skipWord(reason: string): string {
-  switch (reason) {
-    case "host_offline":
-      return "offline";
-    case "preflight_blocked":
-      return "a pre-update check failed";
-    case "install_mode_source":
-      return "built from source";
-    case "updater_absent":
-      return "no updater";
-    case "attempt_in_flight":
-      return "another update in flight";
-    default:
-      return reason;
-  }
 }

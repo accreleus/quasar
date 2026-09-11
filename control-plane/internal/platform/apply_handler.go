@@ -22,6 +22,7 @@ const (
 	CodeReleaseNotOffered         = "release_not_offered"          // 409
 	CodeHostNotEligible           = "host_not_eligible"            // 409
 	CodeAttemptInFlight           = "attempt_in_flight"            // 409
+	CodePreflightBlocked          = "preflight_blocked"            // 409
 	CodeRunActive                 = "run_active"                   // 409
 	CodeReleaseBelowSchemaVersion = "release_below_schema_version" // 422
 	CodeApplyUnsupported          = "apply_unsupported"            // 501

@@ -12,8 +12,8 @@ const (
 	KindApply  = "apply"
 	KindRevert = "revert"
 	// The updater put the previous digests back itself after a failed health
-	// wait (amendment 9, #188). Recorded terminal on insert by the control
-	// plane beside the failed apply; never driven over the wire.
+	// wait (ADR 0004). Recorded terminal on insert beside the failed apply;
+	// never driven over the wire.
 	KindAutoRevert = "auto_revert"
 )
 
@@ -160,9 +160,9 @@ type ActiveApply struct {
 
 // `ApplyRunState`. A run `succeeded` only when every target it reached
 // succeeded and it passed over nothing that was behind; it stops at its first
-// failed target, and a FAILED run has no partial variant. `succeeded_partial`
-// (amendment 9, #190) is the other case: nothing failed, but a host that was
-// behind the release was skipped — RunOutcome decides.
+// failed target, and a failed run has no partial variant. `succeeded_partial`
+// is the other case: nothing failed, but a host that was behind the release
+// was skipped — RunOutcome decides.
 const (
 	RunPending          = "pending"
 	RunRunning          = "running"
@@ -182,12 +182,10 @@ func TerminalRunState(state string) bool {
 	return false
 }
 
-// RunOutcome is the terminal state a run that reached the end of its host list
-// with nothing failed deserves: `succeeded_partial` when it passed over a host
-// that was BEHIND the release and could not take it — any skip except
-// `up_to_date`, which is a host that was done, not one that was passed over.
-// Pure: the run's persisted skips in, one state out, so the rule is a table
-// test and never re-derived by a client.
+// RunOutcome is the terminal state for a run that reached the end of its host
+// list with nothing failed: `succeeded_partial` when it passed over a host that
+// was behind the release — any skip except `up_to_date`, which is a host that
+// was done. Pure, so the rule is a table test and never re-derived by a client.
 func RunOutcome(skips []RunSkip) string {
 	for _, s := range skips {
 		if s.Reason != ReasonUpToDate {
@@ -206,18 +204,16 @@ type RunSkip struct {
 	Reason   string `json:"reason"`
 }
 
-// ApplyRun is the `PlatformApplyRun` shape.
-//
-// `skipped` is persisted since migration 0083 (it was held in memory before):
-// `succeeded_partial` is decided from it, and a partial run whose explanation
-// was lost on a crash would be a state with no reason.
+// ApplyRun is the `PlatformApplyRun` shape. `skipped` is persisted (migration
+// 0083): `succeeded_partial` is decided from it, and a partial run whose
+// explanation was lost on a crash would be a state with no reason.
 type ApplyRun struct {
 	ID        string `json:"id"`
 	ReleaseID string `json:"release_id"`
 	State     string `json:"state"`
 	Force     bool   `json:"force"`
-	// RetryOf is the succeeded_partial run this one was started to finish
-	// (amendment 9). Provenance only: nothing reads it to choose a target.
+	// RetryOf is the succeeded_partial run this one was started to finish.
+	// Provenance only: nothing reads it to choose a target.
 	RetryOf *string `json:"retry_of"`
 	// Unattended is true when the run was started by the detection schedule
 	// rather than by an admin pressing Update (#122). Served, because an admin
@@ -291,8 +287,8 @@ type ReleaseStateReport struct {
 	Previous   []PreviousDigest
 	Output     string
 	FinishedAt *time.Time
-	// Restored is agent-api.md `release_state.restored` (amendment 9): the
-	// updater put the previous digests back itself after this failure.
+	// Restored is agent-api.md `release_state.restored`: the updater put the
+	// previous digests back itself after this failure.
 	Restored bool
 }
 

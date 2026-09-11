@@ -177,8 +177,7 @@ pub struct ProbeEnv {
     pub updater_present: Option<bool>,
     pub health: platform_update::HealthOwner,
     /// This agent's own `/health` identity, to compare against who answers.
-    pub self_node: String,
-    pub self_pid: u32,
+    pub self_identity: platform_update::HealthIdentity,
 }
 
 /// The driver-volume provisioner's state, as readiness sees it. Plain data, not a live call
@@ -270,8 +269,10 @@ impl ProbeEnv {
             updater: platform_update::collect_updater(&updater_socket_path()),
             updater_present: crate::buildinfo::install_facts().updater_present,
             health: platform_update::collect_health(crate::health::addr_from_env()),
-            self_node: crate::logging::host_name().to_string(),
-            self_pid: std::process::id(),
+            self_identity: platform_update::HealthIdentity {
+                node: crate::logging::host_name().to_string(),
+                pid: std::process::id(),
+            },
         }
     }
 
@@ -436,11 +437,11 @@ pub fn probe(env: &ProbeEnv) -> Vec<ReadinessCheck> {
             Some(error) => fail("host_container_mounts", error.clone(), "Use the generated bind mounts at identical host/container paths. Fix the Docker socket or mount configuration, then recreate the agent; checks refresh automatically.".to_string()),
             None => pass("host_container_mounts", "Required sibling-container paths agree with their host bind mounts".to_string()),
         },
-        // The update path (amendment 9): what preflight reads about this host.
+        // The update path: what preflight reads about this host.
         platform_update::check_updater_socket(&env.updater, env.updater_present),
         platform_update::check_updater_stack_dir(&env.updater),
         platform_update::check_updater_overlays(&env.updater),
-        platform_update::check_health_addr_bindable(&env.health, &env.self_node, env.self_pid),
+        platform_update::check_health_addr_bindable(&env.health, &env.self_identity),
     ]
 }
 
@@ -2489,8 +2490,7 @@ mod tests {
                 updater: platform_update::UpdaterView::default(),
                 updater_present: None,
                 health: platform_update::HealthOwner::default(),
-                self_node: "test".to_string(),
-                self_pid: 1,
+                self_identity: platform_update::HealthIdentity { node: "test".to_string(), pid: 1 },
             }
         }
 

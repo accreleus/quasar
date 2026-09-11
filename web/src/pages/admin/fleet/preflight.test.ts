@@ -57,7 +57,7 @@ describe("preflight phrasing", () => {
       ],
     } as PlatformApplyRun;
     expect(partialSummary(run)).toBe(
-      "Applied to 2 of 4 hosts — 2 skipped: gpu-04 (built from source), gpu-05 (a pre-update check failed)",
+      "Applied to 2 of 4 hosts — 2 skipped: gpu-04 (built from source), gpu-05 (a preflight check failed)",
     );
   });
 });

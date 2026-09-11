@@ -97,10 +97,9 @@ type HostIdentity struct {
 	// the same seam `UncordonHost` and the per-host apply runner already use.
 	AgentConnected *bool `json:"-"`
 
-	// Readiness is the host's last stored readiness report (hosts.readiness,
-	// raw), and ReadinessReportedAt when it changed. NOT SERIALIZED: they are
-	// inputs to the preflight decision (the three checks an agent answers about
-	// itself), not fields on the frozen identity shape.
+	// The host's last stored readiness report (hosts.readiness, raw) and when
+	// it changed: inputs to the preflight decision, not fields on the frozen
+	// identity shape, hence unserialized like AgentConnected.
 	Readiness           json.RawMessage `json:"-"`
 	ReadinessReportedAt *time.Time      `json:"-"`
 }
@@ -140,9 +139,9 @@ const (
 	ReasonReleaseAboveControlPlane = "release_above_control_plane"
 	ReasonControlPlaneNotFirst     = "control_plane_not_first"
 
-	// Amendment 9 inserts this one before the two transient reasons: a stack
-	// shape is a durable fact. Produced only by a preflight whose state is
-	// `blocked`; `unknown` never blocks (preflight.go).
+	// Before the two transient reasons: a stack shape is a durable fact.
+	// Produced only by a preflight whose state is `blocked`; `unknown` never
+	// blocks (preflight.go).
 	ReasonPreflightBlocked = "preflight_blocked"
 
 	// Amendment 2 appends these two at the END of the order. They need apply
@@ -158,9 +157,7 @@ type Target struct {
 	NodeName *string `json:"node_name"`
 	Eligible bool    `json:"eligible"`
 	Reason   *string `json:"reason"`
-	// Preflight is whether this target's stack is SHAPED so an apply can be
-	// carried out (amendment 9): a different question from Eligible, answered
-	// beside it so the card can name the fix.
+	// Preflight: CONTEXT.md. Answered beside Eligible so the card can name the fix.
 	Preflight Preflight `json:"preflight"`
 }
 

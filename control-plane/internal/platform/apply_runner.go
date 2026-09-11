@@ -538,9 +538,9 @@ func (r *Runner) HandleReleaseState(ctx context.Context, hostID string, rep Rele
 	}
 }
 
-// recordAutoRevert writes the history row for a restore the updater did
-// itself (amendment 9). Only after the apply is terminal, so the open-target
-// index is free; only for an apply, never for a revert that failed.
+// recordAutoRevert writes the history row for a restore the updater did itself
+// (ADR 0004). Only after the apply is terminal, so the open-target index is
+// free; only for an apply, never for a revert that failed.
 func (r *Runner) recordAutoRevert(ctx context.Context, failed Attempt, rep ReleaseStateReport) {
 	if failed.Kind != KindApply {
 		return
@@ -548,7 +548,7 @@ func (r *Runner) recordAutoRevert(ctx context.Context, failed Attempt, rep Relea
 	requested := restoredDigests(failed.RequestedDigests, rep.Previous)
 	if len(requested) == 0 {
 		r.log.Warn("release_state says restored but named no previous digest; no auto_revert recorded",
-			"attempt_id", failed.ID, "host_id", orEmpty(failed.HostID))
+			"attempt_id", failed.ID, "host_id", orEmpty(failed.HostID), "token", "apply-auto-revert-unrecorded")
 		return
 	}
 	previous := make([]PreviousDigest, 0, len(failed.RequestedDigests))
@@ -557,11 +557,12 @@ func (r *Runner) recordAutoRevert(ctx context.Context, failed Attempt, rep Relea
 		previous = append(previous, PreviousDigest{Name: c.Name, Digest: &d})
 	}
 	row, err := r.store.CreateAutoRevertAttempt(ctx, NewAutoRevert{
-		Failed: failed, Requested: requested, Previous: previous, Succeeded: true,
+		Failed: failed, Requested: requested, Previous: previous,
 		Output: "restored by the updater after the apply failed (" + orEmpty(rep.Reason) + ")",
 	})
 	if err != nil {
-		r.log.Error("could not record the updater's automatic restore", "attempt_id", failed.ID, "err", err)
+		r.log.Error("could not record the updater's automatic restore", "attempt_id", failed.ID,
+			"err", err, "token", "apply-auto-revert-unrecorded")
 		return
 	}
 	r.log.Warn("apply automatically reverted by the updater", "attempt_id", failed.ID,

@@ -59,8 +59,7 @@ func (h *ApplyHandler) ActiveRun(ctx context.Context) (*ApplyRun, error) {
 	return run, nil
 }
 
-// fillRun adds what the run row does not carry: the per-target attempts. (The
-// skipped hosts are on the row since migration 0083.)
+// fillRun adds what the run row does not carry: the per-target attempts.
 func (h *ApplyHandler) fillRun(ctx context.Context, run *ApplyRun) {
 	attempts, err := h.store.RunAttempts(ctx, run.ID)
 	if err != nil {
@@ -125,6 +124,19 @@ func (h *ApplyHandler) handleFleetApply(w http.ResponseWriter, r *http.Request) 
 	if !offered(view, release.ID) {
 		httpx.WriteError(w, http.StatusConflict, CodeReleaseNotOffered,
 			"this release is not offered on this instance's channel")
+		return
+	}
+	// A blocked control plane has its own code, and the message names the
+	// check and its fix: it is the one refusal an operator fixes with a shell.
+	if cp := controlPlaneTarget(view); cp != nil && cp.Preflight.Blocked() {
+		msg := "the control plane's stack cannot take an update"
+		for _, c := range cp.Preflight.Checks {
+			if c.Status == CheckFail {
+				msg += ": " + c.ID + " — " + c.Detail
+				break
+			}
+		}
+		httpx.WriteError(w, http.StatusConflict, CodePreflightBlocked, msg)
 		return
 	}
 	// A run that cannot move the control plane must not start: ADR 0002 puts it
@@ -263,4 +275,13 @@ func (h *ApplyHandler) readRun(w http.ResponseWriter, r *http.Request) (ApplyRun
 	}
 	h.fillRun(r.Context(), &run)
 	return run, true
+}
+
+func controlPlaneTarget(v View) *Target {
+	for i := range v.Targets {
+		if v.Targets[i].Kind == TargetControlPlane {
+			return &v.Targets[i]
+		}
+	}
+	return nil
 }

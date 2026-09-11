@@ -159,6 +159,7 @@ beforeEach(() => {
   vi.resetAllMocks();
   mocked.listAllSessions.mockResolvedValue({ items: [], next_cursor: null } as never);
   mocked.listPlatformAttempts.mockResolvedValue({ attempts: [] });
+  mocked.listPlatformApplyRuns.mockResolvedValue({ runs: [] });
   // The head's "next check" fragment reads the detection job's schedule.
   mocked.listJobs.mockResolvedValue({ items: [], next_cursor: null } as never);
 });
@@ -537,5 +538,53 @@ describe("FleetApplyButton preflight (#187)", () => {
     expect(note).toHaveTextContent("pid 4121");
     expect(within(note).getByText("gpu-host-04")).toBeInTheDocument();
     expect(note).toHaveTextContent("The host's agent is not connected");
+  });
+});
+
+// A finished run leaves `active_apply`, so the page reads the run list for the
+// last outcome that needs attention and keeps the retry where it belongs.
+describe("LastRunPanel (#190)", () => {
+  const partialRun = run({
+    id: "run-1",
+    state: "succeeded_partial",
+    current_target: null,
+    current_host_id: null,
+    finished_at: "2026-09-05T11:20:00Z",
+    attempts: [attempt({ id: "at-h1", state: "succeeded" })],
+    skipped: [{ host_id: "h4", node_name: "gpu-host-04", reason: "host_offline" }],
+  });
+
+  it("shows the last partial run with Retry once the run is no longer active", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(view({ available: [release({ source_commit: CP_COMMIT })] }));
+    mocked.listPlatformApplyRuns.mockResolvedValue({ runs: [partialRun] });
+    renderTab();
+    expect(await screen.findByText("Last fleet update")).toBeInTheDocument();
+    expect(screen.getByTestId("fleet-partial")).toHaveTextContent("1 skipped: gpu-host-04 (offline)");
+    expect(screen.getByRole("button", { name: "Retry skipped hosts" })).toBeInTheDocument();
+  });
+
+  it("marks a retried run and withdraws Retry once a later run carries its id", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(view({ available: [release({ source_commit: CP_COMMIT })] }));
+    mocked.listPlatformApplyRuns.mockResolvedValue({
+      runs: [
+        run({ id: "run-2", state: "failed", current_target: null, retry_of: "run-1", attempts: [attempt({ state: "failed", reason: "unhealthy" })] } as Partial<PlatformApplyRun>),
+        partialRun,
+      ],
+    });
+    renderTab();
+    // The newest run is the one shown; it is a failed retry.
+    expect(await screen.findByText("Last fleet update")).toBeInTheDocument();
+    expect(screen.getByText("retry")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry skipped hosts" })).not.toBeInTheDocument();
+  });
+
+  it("shows nothing for a clean success", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(view({ available: [release({ source_commit: CP_COMMIT })] }));
+    mocked.listPlatformApplyRuns.mockResolvedValue({
+      runs: [run({ id: "run-3", state: "succeeded", current_target: null, attempts: [attempt({ state: "succeeded" })] })],
+    });
+    renderTab();
+    await screen.findByText(/Up to date/);
+    expect(screen.queryByText("Last fleet update")).not.toBeInTheDocument();
   });
 });

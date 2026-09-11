@@ -53,7 +53,7 @@ import {
   attemptForTarget,
   useHostSessionCounts,
 } from "./ApplyControls";
-import { ControlPlaneRestarting, FleetApplyButton, FleetRunPanel } from "./FleetApply";
+import { ControlPlaneRestarting, FleetApplyButton, FleetRunPanel, LastRunPanel } from "./FleetApply";
 import { blockingChecks, holdoutText, unknownChecks } from "./preflight";
 import {
   FailedAttemptPanel,
@@ -228,7 +228,17 @@ export function ReleasesTab() {
               </div>
             </Card>
           ) : (
-            <UpdateBanner view={view} />
+            <>
+              <UpdateBanner view={view} />
+              <LastRunPanel
+                key={applied}
+                targets={view.targets}
+                onChanged={() => {
+                  setApplied((n) => n + 1);
+                  void res.refresh();
+                }}
+              />
+            </>
           )}
           <div className="split rel-split">
             <div>
@@ -758,7 +768,7 @@ function TargetChip({ target, older = false }: { target: PlatformReleaseTarget; 
   return <Chip variant="neutral">Not ready</Chip>;
 }
 
-/** The pre-update checks a target fails, each with the fix its detail names,
+/** The preflight checks a target fails, each with the fix its detail names,
  *  and the ones nobody could evaluate as a warning (amendment 9). Rendered
  *  under the per-host detail; no v3 mock covers it, so it is a plain note. */
 function PreflightNote({ target }: { target: PlatformReleaseTarget }) {
@@ -771,7 +781,7 @@ function PreflightNote({ target }: { target: PlatformReleaseTarget }) {
       <div className="rowflex">
         <b>{name}</b>
         <span className="muted">
-          {failing.length > 0 ? "pre-update check failed" : "pre-update check not evaluated"}
+          {failing.length > 0 ? "preflight check failed" : "preflight check not evaluated"}
           {target.preflight?.checked_at && <> · checked {when(target.preflight.checked_at)}</>}
         </span>
       </div>

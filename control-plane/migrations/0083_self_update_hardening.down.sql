@@ -1,4 +1,4 @@
--- 0083 down. The new vocabulary is rewritten to its nearest old value BEFORE
+-- 0083 down. The new vocabulary is rewritten to its nearest old value before
 -- the CHECKs are narrowed — narrowing first fails on any live row in the new
 -- states — and the two columns are dropped. The loss is which runs were partial
 -- and which reverts were automatic: history becomes vaguer, never wrong about

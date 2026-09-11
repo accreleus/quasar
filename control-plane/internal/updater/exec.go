@@ -245,7 +245,7 @@ func (e *Executor) EffectiveImages(ctx context.Context) map[string]*string {
 }
 
 // ServiceConfigFiles is, per compose service this program may recreate, the
-// compose-file set its RUNNING container was started with (its own
+// compose-file set its running container was started with (its own
 // com.docker.compose.project.config_files label). A service with no running
 // container maps to nil. Preflight compares each against this updater's own set
 // (`updater_overlays`): a recreate uses the updater's, so a service brought up

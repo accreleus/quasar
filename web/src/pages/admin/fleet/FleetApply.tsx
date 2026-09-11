@@ -13,15 +13,18 @@ import { useState, type ReactNode } from "react";
 import * as adminApi from "../../../api/admin";
 import type {
   PlatformApplyRun,
+  PlatformApplyRunsResponse,
   PlatformReleaseTarget,
   PlatformReleaseView,
 } from "../../../api/types";
 import { useAuth } from "../../../auth/context";
 import { Button } from "../../../components/Button";
+import { Card } from "../../../components/Card";
 import { Chip, type ChipVariant } from "../../../components/Chip";
 import { Modal } from "../../../components/Modal";
 import { Table, type TableColumn } from "../../../components/Table";
 import { useAdminAction } from "../../../lib/resource/action";
+import { useResource } from "../../../lib/resource/react";
 import { AttemptProgress } from "./ApplyControls";
 import { blockingChecks, partialSummary, willBeSkipped } from "./preflight";
 import { eligibilityText, hasUpdate, preflightCheckText, releaseLabel, runStateText } from "./releasesCopy";
@@ -166,14 +169,14 @@ function FleetApplyModal({
             Will be skipped and stay on the old release ({skipped.length}):
           </p>
           <ul className="release-faults">
-            {skipped.map((t) => (
-              <li key={t.host_id}>
-                <b>{t.node_name}</b>{" "}
-                {t.reason === "preflight_blocked" && blockingChecks(t)[0]
-                  ? blockingChecks(t)[0].detail
-                  : eligibilityText(t.reason ?? null)}
-              </li>
-            ))}
+            {skipped.map((t) => {
+              const blocker = t.reason === "preflight_blocked" ? blockingChecks(t)[0] : undefined;
+              return (
+                <li key={t.host_id}>
+                  <b>{t.node_name}</b> {blocker ? blocker.detail : eligibilityText(t.reason ?? null)}
+                </li>
+              );
+            })}
           </ul>
         </div>
       )}
@@ -227,11 +230,14 @@ export function FleetRunPanel({
   run,
   targets,
   onChanged,
+  retriedBy,
 }: {
   run: PlatformApplyRun;
   /** The release view's targets, for the cancel gate. */
   targets?: PlatformReleaseTarget[];
   onChanged: () => void;
+  /** A later run that carries this run's id as retry_of, when the caller knows one. */
+  retriedBy?: PlatformApplyRun;
 }) {
   const { token } = useAuth();
   const active = run.state === "pending" || run.state === "running";
@@ -320,8 +326,13 @@ export function FleetRunPanel({
             retry
           </Chip>
         )}
+        {retriedBy && (
+          <Chip variant="neutral" title={`Retried by run ${retriedBy.id} (${retriedBy.state})`}>
+            retried
+          </Chip>
+        )}
         {current && <span className="muted">Now: {current}</span>}
-        {partial && (
+        {partial && !retriedBy && (
           <Button variant="ghost" disabled={retry.pending != null} onClick={() => void retry.run()}>
             Retry skipped hosts
           </Button>
@@ -385,5 +396,46 @@ export function ControlPlaneRestarting() {
     <p className="note" role="status">
       The control plane is restarting on the new release. This page will reconnect on its own.
     </p>
+  );
+}
+
+/**
+ * The most recent finished run, when it needs attention: `active_apply` only
+ * carries a run while it is pending or running, so without this a run that
+ * ended partial or failed vanished from the page the moment it finished, and
+ * the retry it asks for had nowhere to live. A clean success is not shown; the
+ * update banner already says the instance is current.
+ */
+export function LastRunPanel({
+  targets,
+  onChanged,
+}: {
+  targets: PlatformReleaseTarget[];
+  onChanged: () => void;
+}) {
+  const res = useResource<PlatformApplyRunsResponse>({
+    label: "fleet runs",
+    fetch: ({ token, signal }) => adminApi.listPlatformApplyRuns(token, { limit: 10 }, signal),
+  });
+  const runs = res.data?.runs ?? [];
+  const last = runs[0];
+  if (!last || (last.state !== "succeeded_partial" && last.state !== "failed")) return null;
+  // Newest first, so a later retry is earlier in the list than what it retries.
+  const retriedBy = runs.find((r) => r.retry_of === last.id);
+  return (
+    <Card className="card-pad mb4">
+      <div className="eyebrow">Last fleet update</div>
+      <div className="mt3">
+        <FleetRunPanel
+          run={last}
+          targets={targets}
+          retriedBy={retriedBy}
+          onChanged={() => {
+            void res.refresh();
+            onChanged();
+          }}
+        />
+      </div>
+    </Card>
   );
 }

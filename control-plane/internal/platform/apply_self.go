@@ -303,7 +303,7 @@ func (s *SelfApplier) UpdaterPresent() bool {
 // other leaves a container that starts and then cannot write its own TLS volume
 // — a crash-loop with no console left to fix it from.
 func (s *SelfApplier) InstallMode() *string {
-	self, _, err := s.selfReport()
+	self, _, err := s.selfReport(context.Background())
 	if err != nil {
 		return nil
 	}
@@ -317,7 +317,7 @@ func (s *SelfApplier) InstallMode() *string {
 // selfReport is `GET /v1/self` over the socket, reused for InstallModeTTL. The
 // error is cached too: a failing updater is asked once per TTL, not once per
 // view read.
-func (s *SelfApplier) selfReport() (UpdaterSelf, time.Time, error) {
+func (s *SelfApplier) selfReport(ctx context.Context) (UpdaterSelf, time.Time, error) {
 	s.mu.Lock()
 	if s.selfSet && time.Since(s.selfAt) < s.InstallModeTTL {
 		defer s.mu.Unlock()
@@ -330,8 +330,8 @@ func (s *SelfApplier) selfReport() (UpdaterSelf, time.Time, error) {
 	if s.updater == nil || !s.updater.Present() {
 		err = errors.New("no updater socket")
 	} else {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		self, err = s.updater.Self(ctx)
+		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		self, err = s.updater.Self(cctx)
 		cancel()
 		if err != nil {
 			s.log.Warn("could not read this control plane's updater self-report", "err", err)
@@ -344,9 +344,17 @@ func (s *SelfApplier) selfReport() (UpdaterSelf, time.Time, error) {
 	return self, now, err
 }
 
+// InvalidateSelf drops the cached self-report so the next read asks the
+// updater again: the apply endpoints call it before deciding.
+func (s *SelfApplier) InvalidateSelf() {
+	s.mu.Lock()
+	s.selfSet = false
+	s.mu.Unlock()
+}
+
 // PreflightFacts is what preflight can learn about this control plane's own
 // stack: the socket three-way, and the updater's self-report when it answers.
-func (s *SelfApplier) PreflightFacts(context.Context) PreflightFacts {
+func (s *SelfApplier) PreflightFacts(ctx context.Context) PreflightFacts {
 	f := PreflightFacts{}
 	if s.updater == nil {
 		return f
@@ -356,7 +364,7 @@ func (s *SelfApplier) PreflightFacts(context.Context) PreflightFacts {
 	if !st.SocketExists {
 		return f
 	}
-	self, at, err := s.selfReport()
+	self, at, err := s.selfReport(ctx)
 	f.CheckedAt = &at
 	facts := &UpdaterSelfFacts{}
 	if err != nil {

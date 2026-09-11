@@ -209,7 +209,7 @@ func TestRevertDerivationSkipsAutoRevert(t *testing.T) {
 		Failed:    failed,
 		Requested: []ComponentDigest{{Name: ComponentNodeAgent, Image: "ghcr.io/accreleus/quasar/quasar-node-agent", Digest: digestNew}},
 		Previous:  []PreviousDigest{{Name: ComponentNodeAgent, Digest: &digestBad}},
-		Succeeded: true, Output: "restored",
+		Output:    "restored",
 	})
 	if err != nil {
 		t.Fatalf("auto_revert row: %v", err)
