@@ -51,7 +51,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -69,10 +69,9 @@ const RUNTIME_CMD_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNTIME_PULL_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Per-stream cap on captured child stdout/stderr, so a pathological runtime cannot
-/// flood the agent's memory. Every consumer here reads a container id, a short
-/// `--format` line, an `OOMKilled` bool or a one-line error, so it never truncates real
-/// output. Reads run only after the child has exited (the `try_wait` → `Some` arm), so
-/// the writer is gone and draining the two pipes sequentially cannot deadlock.
+/// flood the agent's memory. It is a RETENTION cap only: the reader keeps draining past
+/// it and discards the excess (#194). Stopping at the cap would refill the pipe and
+/// block the writer — which is exactly the deadlock this bound must not cause.
 const MAX_CAPTURE_BYTES: u64 = 256 * 1024;
 
 /// `Command::output()` with a deadline: spawn, poll `try_wait`, kill on timeout.
@@ -80,6 +79,13 @@ fn output_with_timeout(cmd: &mut Command, what: &str) -> Result<Output> {
     output_with_deadline(cmd, what, RUNTIME_CMD_TIMEOUT)
 }
 
+/// `Command::output()` with a deadline. Both pipes are drained by their own thread
+/// CONCURRENTLY with the wait loop, because a child whose output exceeds the pipe buffer
+/// blocks in `write(2)` and never exits — draining only after exit deadlocks it (#194).
+/// That buffer is not reliably 64 KiB: once a uid is past `fs.pipe-user-pages-soft`,
+/// every new pipe opened by a process without `CAP_SYS_RESOURCE` (root in a container)
+/// gets the 8 KiB minimum, which a bare `docker image inspect`'s JSON clears easily. On
+/// timeout the child is killed, which is what gives the readers their EOF.
 pub(crate) fn output_with_deadline(
     cmd: &mut Command,
     what: &str,
@@ -91,20 +97,12 @@ pub(crate) fn output_with_deadline(
         .stdin(Stdio::null())
         .spawn()
         .with_context(|| format!("failed to exec {what}"))?;
+    let out_drain = Drain::spawn(child.stdout.take());
+    let err_drain = Drain::spawn(child.stderr.take());
     let deadline = Instant::now() + timeout;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                // Exited ⇒ both write ends are closed, so a sequential bounded drain
-                // sees EOF and cannot block.
-                let stdout = capped_read(child.stdout.take());
-                let stderr = capped_read(child.stderr.take());
-                return Ok(Output {
-                    status,
-                    stdout,
-                    stderr,
-                });
-            }
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
@@ -116,19 +114,82 @@ pub(crate) fn output_with_deadline(
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(anyhow!("wait for {what}: {e}")),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!("wait for {what}: {e}"));
+            }
+        }
+    };
+    // The child is gone, so its own write ends are closed and EOF is imminent; the grace
+    // floor keeps a child that exits right at the deadline from reporting empty output.
+    let collect_by = deadline.max(Instant::now() + Duration::from_secs(1));
+    Ok(Output {
+        status,
+        stdout: out_drain.take(collect_by),
+        stderr: err_drain.take(collect_by),
+    })
+}
+
+/// One child pipe being read to EOF on its own thread, into a shared capped buffer.
+struct Drain {
+    buf: Arc<Mutex<Vec<u8>>>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+impl Drain {
+    /// The reader thread is DETACHED, never joined: a process that inherited the pipe
+    /// (a shell's surviving grandchild) holds it open after the child is killed, and
+    /// joining there would let it extend the deadline at will. It exits at EOF, holding
+    /// at most [`MAX_CAPTURE_BYTES`] meanwhile.
+    fn spawn<R: Read + Send + 'static>(stream: Option<R>) -> Self {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&buf);
+        let (tx, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drain_capped(stream, &sink);
+            let _ = tx.send(());
+        });
+        Self { buf, done }
+    }
+
+    /// What was read by EOF, or by `deadline` — this never blocks past it.
+    fn take(self, deadline: Instant) -> Vec<u8> {
+        let _ = self
+            .done
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        std::mem::take(&mut *capture_lock(&self.buf))
+    }
+}
+
+/// Read `stream` to EOF, appending to `sink` until it holds [`MAX_CAPTURE_BYTES`] and
+/// discarding the rest — never stopping early (see that constant). A read error or a
+/// `None` stream leaves what was collected so far.
+fn drain_capped<R: Read>(stream: Option<R>, sink: &Mutex<Vec<u8>>) {
+    let Some(mut stream) = stream else { return };
+    let cap = MAX_CAPTURE_BYTES as usize;
+    let mut retained = 0usize;
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(n) => {
+                if retained < cap {
+                    let take = n.min(cap - retained);
+                    capture_lock(sink).extend_from_slice(&chunk[..take]);
+                    retained += take;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
         }
     }
 }
 
-/// Drain a child pipe into a `Vec`, capped at [`MAX_CAPTURE_BYTES`]. A read error or a
-/// `None` stream yields what was collected so far.
-fn capped_read(stream: Option<impl Read>) -> Vec<u8> {
-    let mut buf = Vec::new();
-    if let Some(s) = stream {
-        let _ = s.take(MAX_CAPTURE_BYTES).read_to_end(&mut buf);
-    }
-    buf
+/// A poisoned capture buffer is still readable: take the inner guard rather than
+/// panicking a teardown path.
+fn capture_lock(buf: &Mutex<Vec<u8>>) -> std::sync::MutexGuard<'_, Vec<u8>> {
+    buf.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Name prefix for per-session app containers, used to build a session's container
@@ -2890,5 +2951,87 @@ esac
             .owned_container_id("missing", "one", &prefixes)
             .unwrap()
             .is_none());
+    }
+
+    /// #194: a bare `docker image inspect` prints the whole inspect JSON, and on a host
+    /// that has exhausted `fs.pipe-user-pages-soft` a fresh pipe holds only 8 KiB. A
+    /// runner that drains the pipes only after the child exits wedges such a child in
+    /// `write(2)`, kills it at the deadline, and blames the runtime. The runner must
+    /// drain while it waits.
+    #[test]
+    fn a_child_that_floods_stdout_finishes_well_inside_the_deadline() {
+        let started = Instant::now();
+        let out = output_with_deadline(
+            Command::new("sh").args(["-c", "head -c 524288 /dev/zero"]),
+            "stdout flood",
+            Duration::from_secs(10),
+        )
+        .expect("a chatty child must not be reported as an unresponsive runtime");
+        let elapsed = started.elapsed();
+        assert!(out.status.success(), "status: {:?}", out.status);
+        assert_eq!(
+            out.stdout.len() as u64,
+            MAX_CAPTURE_BYTES,
+            "output past the cap is discarded, not left in the pipe"
+        );
+        assert!(out.stderr.is_empty());
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+    }
+
+    /// Same for the other pipe: `docker run` can print pull progress on stderr.
+    #[test]
+    fn a_child_that_floods_stderr_finishes_well_inside_the_deadline() {
+        let started = Instant::now();
+        let out = output_with_deadline(
+            Command::new("sh").args(["-c", "head -c 524288 /dev/zero >&2"]),
+            "stderr flood",
+            Duration::from_secs(10),
+        )
+        .expect("a chatty child must not be reported as an unresponsive runtime");
+        let elapsed = started.elapsed();
+        assert!(out.status.success(), "status: {:?}", out.status);
+        assert_eq!(out.stderr.len() as u64, MAX_CAPTURE_BYTES);
+        assert!(out.stdout.is_empty());
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+    }
+
+    /// The #149 guarantee survives the concurrent drain: a child that never exits is
+    /// still killed at the deadline, reported as a timeout, and reaped (no zombie). The
+    /// shell's `sleep` outlives the kill still holding the inherited pipe, which is
+    /// exactly why the readers are detached rather than joined — waiting for their EOF
+    /// would hand the deadline to whatever inherited the pipe.
+    #[test]
+    fn a_child_that_outlives_the_deadline_is_killed_reaped_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let script = format!(
+            "echo $$ > '{}'; head -c 524288 /dev/zero; sleep 10",
+            pidfile.display()
+        );
+        let started = Instant::now();
+        let err = output_with_deadline(
+            Command::new("sh").args(["-c", &script]),
+            "wedged runtime",
+            Duration::from_secs(2),
+        )
+        .expect_err("a child that never exits must still fail at the deadline");
+        let elapsed = started.elapsed();
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(
+            elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(8),
+            "took {elapsed:?}"
+        );
+        let pid = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .to_string();
+        // A reaped child has no /proc entry at all; a zombie has one in state `Z`
+        // (field 3 of `stat`, just past the `comm` field's closing paren).
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            let state = stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.trim_start().chars().next());
+            assert_ne!(state, Some('Z'), "child {pid} left as a zombie: {stat}");
+        }
     }
 }

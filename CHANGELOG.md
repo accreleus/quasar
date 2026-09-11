@@ -131,6 +131,18 @@ own; the two do not move together, and that is deliberate.
   Contract: `quasar-protocol` "Audit-log names" amendment (additive, no migration).
 
 ### Fixed
+- **A busy Docker host no longer makes the agent report its own container runtime as
+  unresponsive** (#194). Every container-runtime command the agent runs had its output
+  read only after the child exited, so a command printing more than one pipe buffer's
+  worth of output blocked in `write(2)`, never exited, and was killed at the 30 s deadline
+  with "container runtime unresponsive" — blaming a daemon that was answering that same
+  command in hundredths of a second. The buffer is 8 KiB rather than 64 KiB on a host whose
+  root uid has exhausted its pipe-page quota, which dozens of running containers will do,
+  and a bare `docker image inspect`'s JSON clears 8 KiB: an external reporter's agent burnt
+  30 s on every reconnect failing to reconcile one catalog image, and before #191 that cost
+  it its registration. Both pipes are now drained while the command runs — the capture cap
+  discards the excess instead of stalling the writer — and the deadline stays hard even when
+  a process that inherited the pipe outlives the command it came from.
 - **A reconnecting agent no longer replays every updater result it has ever seen** (#193).
   On each reconnect the node agent re-emitted a `release_state` for every result file in
   the updater's results directory, including the control plane's own steps (written to
