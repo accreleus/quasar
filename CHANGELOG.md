@@ -131,6 +131,15 @@ own; the two do not move together, and that is deliberate.
   Contract: `quasar-protocol` "Audit-log names" amendment (additive, no migration).
 
 ### Fixed
+- **A reconnecting agent no longer replays every updater result it has ever seen** (#193).
+  On each reconnect the node agent re-emitted a `release_state` for every result file in
+  the updater's results directory, including the control plane's own steps (written to
+  the same directory, never applied by the agent), and the control plane answered each of
+  those with a "names another host's attempt" warning — five per reconnect on a stack
+  with a few fleet runs behind it, drowning the warning that check exists to give. The
+  replay stays, narrowed to this agent's own results that are still live or finished
+  within the last two hours; a non-terminal result is always replayed, and a result whose
+  age cannot be read is kept rather than dropped. Nothing is deleted.
 - **An agent on a host whose Docker daemon answers slowly can register again** (#191). The
   agent opened its WebSocket to the control plane first and only then ran the two
   container-runtime probes `register` needs (the image reconcile and the install-mode probe,
