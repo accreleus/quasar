@@ -54,6 +54,7 @@ import {
   useHostSessionCounts,
 } from "./ApplyControls";
 import { ControlPlaneRestarting, FleetApplyButton, FleetRunPanel } from "./FleetApply";
+import { blockingChecks, holdoutText, unknownChecks } from "./preflight";
 import {
   FailedAttemptPanel,
   RevertConfirmModal,
@@ -62,10 +63,10 @@ import {
 } from "./RevertControls";
 import {
   commitsMatch,
-  eligibilityText,
   faultText,
   hasUpdate,
   olderEdgeCandidate,
+  preflightCheckText,
   releaseLabel,
   shortCommit,
 } from "./releasesCopy";
@@ -753,7 +754,42 @@ function TargetChip({ target, older = false }: { target: PlatformReleaseTarget; 
     );
   }
   if (target.reason === "up_to_date") return <Chip variant="neutral">{older ? "Older than installed" : "Up to date"}</Chip>;
+  if (target.reason === "preflight_blocked") return <Chip variant="danger">Blocked</Chip>;
   return <Chip variant="neutral">Not ready</Chip>;
+}
+
+/** The pre-update checks a target fails, each with the fix its detail names,
+ *  and the ones nobody could evaluate as a warning (amendment 9). Rendered
+ *  under the per-host detail; no v3 mock covers it, so it is a plain note. */
+function PreflightNote({ target }: { target: PlatformReleaseTarget }) {
+  const failing = blockingChecks(target);
+  const unknown = unknownChecks(target);
+  if (failing.length === 0 && unknown.length === 0) return null;
+  const name = target.kind === "control_plane" ? "Control plane" : (target.node_name ?? "Host");
+  return (
+    <div className="note" data-testid={`preflight-${target.host_id ?? "control-plane"}`}>
+      <div className="rowflex">
+        <b>{name}</b>
+        <span className="muted">
+          {failing.length > 0 ? "pre-update check failed" : "pre-update check not evaluated"}
+          {target.preflight?.checked_at && <> · checked {when(target.preflight.checked_at)}</>}
+        </span>
+      </div>
+      <ul className="release-faults">
+        {failing.map((c) => (
+          <li key={c.id}>
+            <Chip variant="danger">{preflightCheckText(c.id)}</Chip> {c.detail}
+          </li>
+        ))}
+        {failing.length === 0 &&
+          unknown.map((c) => (
+            <li key={c.id}>
+              <Chip variant="warning">{preflightCheckText(c.id)}</Chip> {c.detail}
+            </li>
+          ))}
+      </ul>
+    </div>
+  );
 }
 
 function TargetsCard({
@@ -800,7 +836,7 @@ function TargetsCard({
     {
       key: "why",
       header: "Why",
-      render: (t) => (attemptForTarget(attempts, t) ? "" : eligibilityText(t.reason ?? null)),
+      render: (t) => (attemptForTarget(attempts, t) ? "" : holdoutText(t)),
     },
     {
       key: "action",
@@ -859,7 +895,7 @@ function TargetsCard({
           {holdouts.map((t) => (
             <div className="rel-holdout" key={t.host_id ?? "cp"}>
               <span>{t.node_name}</span>
-              <span className="hint">{eligibilityText(t.reason ?? null)}</span>
+              <span className="hint">{holdoutText(t)}</span>
             </div>
           ))}
           {moreHoldouts > 0 && <div className="hint">+{moreHoldouts} more not ready</div>}
@@ -874,6 +910,9 @@ function TargetsCard({
           rowKey={(t) => t.host_id ?? "control-plane"}
           empty="No targets."
         />
+        {view.targets.map((t) => (
+          <PreflightNote key={`preflight-${t.host_id ?? "control-plane"}`} target={t} />
+        ))}
         {view.targets.map((t) => (
           <ManualPath
             key={t.host_id ?? "control-plane"}

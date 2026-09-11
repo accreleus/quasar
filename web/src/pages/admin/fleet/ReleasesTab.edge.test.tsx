@@ -11,6 +11,8 @@ import { FLEET_TABS } from "../../../components/shell/sectionTabs";
 import { ToastProvider } from "../../../components/Toast";
 import { ReleasesTab } from "./ReleasesTab";
 
+const PF = { state: "unknown", checked_at: null, checks: [] } as const;
+
 vi.mock("../../../auth/context", () => ({ useAuth: () => ({ token: "tok" }) }));
 vi.mock("../../../api/admin");
 
@@ -52,7 +54,7 @@ function edgeView(over: Partial<PlatformRelease> = {}): PlatformReleaseView {
     },
     available: [release],
     targets: [
-      { kind: "control_plane", host_id: null, node_name: null, eligible: true, reason: null },
+      { kind: "control_plane", host_id: null, node_name: null, eligible: true, reason: null, preflight: PF },
     ],
     faults: [],
   } as PlatformReleaseView;
@@ -82,7 +84,7 @@ beforeEach(() => {
 describe("ReleasesTab on edge", () => {
   it("labels an older same-schema edge candidate without suggesting a new update", async () => {
     const view = edgeView({ built_at: "2026-08-18T09:14:02Z" });
-    view.targets[0] = { ...view.targets[0], eligible: false, reason: "up_to_date" };
+    view.targets[0] = { ...view.targets[0], eligible: false, reason: "up_to_date", preflight: PF };
     mocked.getPlatformReleases.mockResolvedValue(view);
     renderTab();
     expect((await screen.findAllByText(/Older than installed/)).length).toBeGreaterThan(0);

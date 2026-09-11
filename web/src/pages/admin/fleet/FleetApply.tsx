@@ -4,7 +4,9 @@
  * own restart.
  *
  * No v3 mock covers this tab (ReleasesTab.tsx says why), so it composes the
- * same card/table/chip primitives the rest of the page uses.
+ * same card/table/chip primitives the rest of the page uses; the amendment-9
+ * additions (the skip list in the confirmation, the partial banner, Retry)
+ * likewise add no style of their own.
  */
 
 import { useState, type ReactNode } from "react";
@@ -21,7 +23,8 @@ import { Modal } from "../../../components/Modal";
 import { Table, type TableColumn } from "../../../components/Table";
 import { useAdminAction } from "../../../lib/resource/action";
 import { AttemptProgress } from "./ApplyControls";
-import { eligibilityText, hasUpdate, releaseLabel, runStateText } from "./releasesCopy";
+import { blockingChecks, partialSummary, willBeSkipped } from "./preflight";
+import { eligibilityText, hasUpdate, preflightCheckText, releaseLabel, runStateText } from "./releasesCopy";
 
 function eligibleHosts(targets: PlatformReleaseTarget[]): PlatformReleaseTarget[] {
   return targets.filter((t) => t.kind === "host" && t.eligible);
@@ -60,14 +63,17 @@ export function FleetApplyButton({
   // outright (409 release_not_offered). `up_to_date` is the one reason that is
   // not a refusal: the run then goes straight to the hosts.
   const blocked = controlPlaneBlocker(view.targets);
+  const cp = view.targets.find((t) => t.kind === "control_plane");
+  const blockingCheck = cp && blocked === "preflight_blocked" ? blockingChecks(cp)[0] : undefined;
+  const title = blockingCheck
+    ? `${preflightCheckText(blockingCheck.id)}: ${blockingCheck.detail}`
+    : blocked
+      ? eligibilityText(blocked)
+      : undefined;
 
   return (
     <>
-      <Button
-        onClick={() => setConfirming(true)}
-        disabled={blocked != null}
-        title={blocked ? eligibilityText(blocked) : undefined}
-      >
+      <Button onClick={() => setConfirming(true)} disabled={blocked != null} title={title}>
         {children ?? "Update Quasar"}
       </Button>
       {confirming && (
@@ -96,6 +102,9 @@ function FleetApplyModal({
   const [force, setForce] = useState(false);
   const newest = view.available[0];
   const hosts = eligibleHosts(view.targets).length;
+  // Consent names the partial outcome up front: the hosts this run will pass
+  // over, and why (amendment 9).
+  const skipped = willBeSkipped(view.targets);
   // Consent has to name what actually happens, so the SERVER decides this and
   // serves it (#153): only a migrating release ends the instance's sessions
   // before the control-plane step, and that policy must not be re-derived here.
@@ -151,6 +160,23 @@ function FleetApplyModal({
           that host is updated.
         </p>
       )}
+      {skipped.length > 0 && (
+        <div className="note" data-testid="fleet-will-skip">
+          <p>
+            Will be skipped and stay on the old release ({skipped.length}):
+          </p>
+          <ul className="release-faults">
+            {skipped.map((t) => (
+              <li key={t.host_id}>
+                <b>{t.node_name}</b>{" "}
+                {t.reason === "preflight_blocked" && blockingChecks(t)[0]
+                  ? blockingChecks(t)[0].detail
+                  : eligibilityText(t.reason ?? null)}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       <label className="rowflex">
         <input type="checkbox" checked={force} onChange={(e) => setForce(e.target.checked)} />
         <span>Update now — ends every live session on {hostCount(hosts)}</span>
@@ -168,6 +194,7 @@ const RUN_STATE_CHIP: Record<string, ChipVariant> = {
   pending: "info",
   running: "info",
   succeeded: "success",
+  succeeded_partial: "warning",
   failed: "danger",
   cancelled: "neutral",
 };
@@ -210,6 +237,26 @@ export function FleetRunPanel({
   const active = run.state === "pending" || run.state === "running";
   const blocked = run.cancel_requested || nothingLeftToStop(run, targets);
   const current = currentTargetName(run);
+  const partial = run.state === "succeeded_partial";
+  // Retry is a plain fleet apply of the same release carrying `retry_of`: the
+  // updated targets read up_to_date and are skipped, so only the hosts left
+  // behind move. Offered on a partial run only, never on a failed one.
+  const retry = useAdminAction(
+    async () =>
+      adminApi.applyPlatformReleaseToFleet(token ?? "", {
+        release_id: run.release_id,
+        force: false,
+        retry_of: run.id,
+      }),
+    {
+      success: "Retrying the hosts that were skipped.",
+      failure: (e) => ({
+        title: "Could not start the retry.",
+        body: e instanceof Error ? e.message : undefined,
+      }),
+      onSuccess: onChanged,
+    },
+  );
 
   const cancel = useAdminAction(
     async () => adminApi.cancelPlatformApplyRun(token ?? "", run.id),
@@ -268,7 +315,17 @@ export function FleetRunPanel({
             automatic
           </Chip>
         )}
+        {run.retry_of && (
+          <Chip variant="neutral" title={`Started to finish run ${run.retry_of}`}>
+            retry
+          </Chip>
+        )}
         {current && <span className="muted">Now: {current}</span>}
+        {partial && (
+          <Button variant="ghost" disabled={retry.pending != null} onClick={() => void retry.run()}>
+            Retry skipped hosts
+          </Button>
+        )}
         {active && (
           <Button
             variant="ghost"
@@ -292,6 +349,11 @@ export function FleetRunPanel({
       {run.error && (
         <p className="form-error" role="alert">
           {run.error}
+        </p>
+      )}
+      {partial && (
+        <p className="note" role="status" data-testid="fleet-partial">
+          {partialSummary(run)}
         </p>
       )}
       <Table

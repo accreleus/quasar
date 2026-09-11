@@ -21,6 +21,8 @@ import { FLEET_TABS } from "../../../components/shell/sectionTabs";
 import { ToastProvider } from "../../../components/Toast";
 import { ReleasesTab } from "./ReleasesTab";
 
+const PF = { state: "unknown", checked_at: null, checks: [] } as const;
+
 vi.mock("../../../auth/context", () => ({ useAuth: () => ({ token: "tok" }) }));
 vi.mock("../../../api/admin");
 
@@ -76,13 +78,14 @@ function view(over: Partial<PlatformReleaseView> = {}): PlatformReleaseView {
     },
     available: [release()],
     targets: [
-      { kind: "control_plane", host_id: null, node_name: null, eligible: true, reason: null },
+      { kind: "control_plane", host_id: null, node_name: null, eligible: true, reason: null, preflight: PF },
       {
         kind: "host",
         host_id: "h1",
         node_name: "gpu-host-01",
         eligible: false,
         reason: "release_above_control_plane",
+        preflight: PF,
       },
     ],
     faults: [],
@@ -137,8 +140,8 @@ function attempt(over: Partial<PlatformApplyAttempt> = {}): PlatformApplyAttempt
 function eligibleHostView(over: Partial<PlatformReleaseView> = {}): PlatformReleaseView {
   return view({
     targets: [
-      { kind: "control_plane", host_id: null, node_name: null, eligible: true, reason: null },
-      { kind: "host", host_id: "h1", node_name: "gpu-host-01", eligible: true, reason: null },
+      { kind: "control_plane", host_id: null, node_name: null, eligible: true, reason: null, preflight: PF },
+      { kind: "host", host_id: "h1", node_name: "gpu-host-01", eligible: true, reason: null, preflight: PF },
     ],
     ...over,
   });
@@ -282,8 +285,9 @@ describe("ReleasesTab", () => {
             node_name: null,
             eligible: false,
             reason: "up_to_date",
+            preflight: PF,
           },
-          { kind: "host", host_id: "h1", node_name: "gpu-host-01", eligible: true, reason: null },
+          { kind: "host", host_id: "h1", node_name: "gpu-host-01", eligible: true, reason: null, preflight: PF },
         ],
       }),
     );
@@ -564,7 +568,7 @@ describe("ReleasesTab › manual update paths", () => {
         hosts: [hostIdentity(identity)],
       },
       targets: [
-        { kind: "control_plane", host_id: null, node_name: null, eligible: true, reason: null },
+        { kind: "control_plane", host_id: null, node_name: null, eligible: true, reason: null, preflight: PF },
         { kind: "host", host_id: "h1", node_name: "gpu-host-01", eligible: false, reason },
       ],
     } as Partial<PlatformReleaseView>);
@@ -723,5 +727,70 @@ describe("ReleasesTab notifications", () => {
     await waitFor(() =>
       expect(mocked.updateSettings).toHaveBeenCalledWith("tok", { release_webhook_enabled: true }),
     );
+  });
+});
+
+// Amendment 9: a blocked target reads Blocked, and the check that blocks it is
+// shown with the fix its detail names.
+describe("preflight on the targets card (#187)", () => {
+  it("shows the blocking check and its fix for a blocked host", async () => {
+    const v = view();
+    v.targets = [
+      { kind: "control_plane", host_id: null, node_name: null, eligible: false, reason: "up_to_date", preflight: PF },
+      {
+        kind: "host",
+        host_id: "h1",
+        node_name: "gpu-host-01",
+        eligible: false,
+        reason: "preflight_blocked",
+        preflight: {
+          state: "blocked",
+          checked_at: "2026-09-05T11:00:00Z",
+          checks: [
+            { id: "agent_connected", status: "pass", detail: "the agent is connected" },
+            {
+              id: "health_addr_bindable",
+              status: "fail",
+              detail: "127.0.0.1:9091 is answered by node gpu-host-01 pid 4121, not this agent — free the port (ss -ltnp | grep 9091)",
+            },
+          ],
+        },
+      },
+    ] as PlatformReleaseView["targets"];
+    mocked.getPlatformReleases.mockResolvedValue(v);
+    renderTab();
+
+    expect(await screen.findByText("Blocked")).toBeInTheDocument();
+    const note = await screen.findByTestId("preflight-h1");
+    expect(note).toHaveTextContent("agent health port free");
+    expect(note).toHaveTextContent("ss -ltnp | grep 9091");
+    // The passing check is not listed: the note names fixes, not facts.
+    expect(note).not.toHaveTextContent("the agent is connected");
+    // The rollup line names the check rather than the generic reason.
+    expect((await screen.findAllByText("Blocked: agent health port free")).length).toBeGreaterThan(0);
+  });
+
+  it("shows an unevaluated check as a warning and keeps the host eligible", async () => {
+    const v = view();
+    v.targets = [
+      { kind: "control_plane", host_id: null, node_name: null, eligible: false, reason: "up_to_date", preflight: PF },
+      {
+        kind: "host",
+        host_id: "h1",
+        node_name: "gpu-host-01",
+        eligible: true,
+        reason: null,
+        preflight: {
+          state: "unknown",
+          checked_at: null,
+          checks: [{ id: "updater_overlays", status: "unknown", detail: "the agent has not reported this check" }],
+        },
+      },
+    ] as PlatformReleaseView["targets"];
+    mocked.getPlatformReleases.mockResolvedValue(v);
+    renderTab();
+
+    expect((await screen.findAllByText("Ready")).length).toBeGreaterThan(0);
+    expect(await screen.findByTestId("preflight-h1")).toHaveTextContent("not evaluated");
   });
 });
