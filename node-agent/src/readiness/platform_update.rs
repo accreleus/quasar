@@ -130,7 +130,8 @@ pub fn parse_health(body: &str) -> Result<HealthIdentity, String> {
         node: Option<String>,
         pid: Option<u32>,
     }
-    let b: Body = serde_json::from_str(body).map_err(|_| "answered, but not with an agent's /health body".to_string())?;
+    let b: Body = serde_json::from_str(body)
+        .map_err(|_| "answered, but not with an agent's /health body".to_string())?;
     match (b.node, b.pid) {
         (Some(node), Some(pid)) => Ok(HealthIdentity { node, pid }),
         _ => Err("answered, but without an agent identity (an agent older than #152, or another program)".to_string()),
@@ -166,7 +167,10 @@ pub fn check_updater_socket(v: &UpdaterView, updater_present: Option<bool>) -> R
 /// `updater_stack_dir`: the updater discovered the stack it sits beside.
 pub fn check_updater_stack_dir(v: &UpdaterView) -> ReadinessCheck {
     let Some(Ok(s)) = &v.self_report else {
-        return skip(CHECK_UPDATER_STACK_DIR, "Not evaluated: the updater did not answer");
+        return skip(
+            CHECK_UPDATER_STACK_DIR,
+            "Not evaluated: the updater did not answer",
+        );
     };
     if s.working_dir.is_empty() || s.config_files.is_empty() {
         return fail(
@@ -177,7 +181,11 @@ pub fn check_updater_stack_dir(v: &UpdaterView) -> ReadinessCheck {
     }
     pass(
         CHECK_UPDATER_STACK_DIR,
-        format!("Updater acts on {} ({} compose file(s))", s.working_dir, s.config_files.len()),
+        format!(
+            "Updater acts on {} ({} compose file(s))",
+            s.working_dir,
+            s.config_files.len()
+        ),
     )
 }
 
@@ -185,10 +193,16 @@ pub fn check_updater_stack_dir(v: &UpdaterView) -> ReadinessCheck {
 /// compose files the updater will recreate it with.
 pub fn check_updater_overlays(v: &UpdaterView) -> ReadinessCheck {
     let Some(Ok(s)) = &v.self_report else {
-        return skip(CHECK_UPDATER_OVERLAYS, "Not evaluated: the updater did not answer");
+        return skip(
+            CHECK_UPDATER_OVERLAYS,
+            "Not evaluated: the updater did not answer",
+        );
     };
     let Some(services) = &s.service_config_files else {
-        return skip(CHECK_UPDATER_OVERLAYS, "The updater does not report per-service compose files");
+        return skip(
+            CHECK_UPDATER_OVERLAYS,
+            "The updater does not report per-service compose files",
+        );
     };
     match services.get(AGENT_SERVICE) {
         Some(Some(mine)) if mine != &s.config_files => fail(
@@ -212,7 +226,10 @@ pub fn check_updater_overlays(v: &UpdaterView) -> ReadinessCheck {
 /// which is exactly when an apply recreates the agent.
 pub fn check_health_addr_bindable(h: &HealthOwner, me: &HealthIdentity) -> ReadinessCheck {
     let Some(addr) = &h.addr else {
-        return skip(CHECK_HEALTH_ADDR_BINDABLE, "The health endpoint is disabled (QUASAR_HEALTH_ADDR)");
+        return skip(
+            CHECK_HEALTH_ADDR_BINDABLE,
+            "The health endpoint is disabled (QUASAR_HEALTH_ADDR)",
+        );
     };
     let port = addr.rsplit(':').next().unwrap_or(addr);
     let free_it = format!(
@@ -244,7 +261,10 @@ mod tests {
 
     fn healthy_self() -> UpdaterSelf {
         let mut services = BTreeMap::new();
-        services.insert(AGENT_SERVICE.to_string(), Some(vec!["/srv/deploy/docker-compose.yml".to_string()]));
+        services.insert(
+            AGENT_SERVICE.to_string(),
+            Some(vec!["/srv/deploy/docker-compose.yml".to_string()]),
+        );
         UpdaterSelf {
             version: "0.2.5".into(),
             working_dir: "/srv/deploy".into(),
@@ -254,23 +274,39 @@ mod tests {
     }
 
     fn answered(s: UpdaterSelf) -> UpdaterView {
-        UpdaterView { socket_exists: true, self_report: Some(Ok(s)) }
+        UpdaterView {
+            socket_exists: true,
+            self_report: Some(Ok(s)),
+        }
     }
 
     #[test]
     fn socket_absent_is_skip_without_an_updater_service_and_fail_with_one() {
         let none = UpdaterView::default();
-        assert_eq!(check_updater_socket(&none, Some(false)).status, super::super::SKIP);
+        assert_eq!(
+            check_updater_socket(&none, Some(false)).status,
+            super::super::SKIP
+        );
         assert_eq!(check_updater_socket(&none, None).status, super::super::SKIP);
         let c = check_updater_socket(&none, Some(true));
         assert_eq!(c.status, super::super::FAIL);
-        assert!(c.remediation.contains("--force-recreate"), "{}", c.remediation);
+        assert!(
+            c.remediation.contains("--force-recreate"),
+            "{}",
+            c.remediation
+        );
     }
 
     #[test]
     fn socket_present_reports_the_answer() {
-        assert_eq!(check_updater_socket(&answered(healthy_self()), Some(true)).status, super::super::PASS);
-        let dead = UpdaterView { socket_exists: true, self_report: Some(Err("connection refused".into())) };
+        assert_eq!(
+            check_updater_socket(&answered(healthy_self()), Some(true)).status,
+            super::super::PASS
+        );
+        let dead = UpdaterView {
+            socket_exists: true,
+            self_report: Some(Err("connection refused".into())),
+        };
         let c = check_updater_socket(&dead, Some(true));
         assert_eq!(c.status, super::super::FAIL);
         assert!(c.summary.contains("connection refused"));
@@ -285,7 +321,10 @@ mod tests {
         let mut drift = healthy_self();
         drift.service_config_files.as_mut().unwrap().insert(
             AGENT_SERVICE.into(),
-            Some(vec!["/srv/deploy/docker-compose.yml".into(), "/srv/deploy/overlays/dev.yml".into()]),
+            Some(vec![
+                "/srv/deploy/docker-compose.yml".into(),
+                "/srv/deploy/overlays/dev.yml".into(),
+            ]),
         );
         let c = check_updater_overlays(&answered(drift));
         assert_eq!(c.status, super::super::FAIL);
@@ -299,36 +338,73 @@ mod tests {
 
         let mut old = healthy_self();
         old.service_config_files = None;
-        assert_eq!(check_updater_overlays(&answered(old)).status, super::super::SKIP);
-        assert_eq!(check_updater_overlays(&UpdaterView::default()).status, super::super::SKIP);
+        assert_eq!(
+            check_updater_overlays(&answered(old)).status,
+            super::super::SKIP
+        );
+        assert_eq!(
+            check_updater_overlays(&UpdaterView::default()).status,
+            super::super::SKIP
+        );
     }
 
     #[test]
     fn health_owner_must_be_this_agent() {
-        let me = HealthIdentity { node: "gpu-01".into(), pid: 4242 };
-        let mine = HealthOwner { addr: Some("127.0.0.1:9091".into()), answer: Some(Ok(me.clone())) };
-        assert_eq!(check_health_addr_bindable(&mine, &me).status, super::super::PASS);
+        let me = HealthIdentity {
+            node: "gpu-01".into(),
+            pid: 4242,
+        };
+        let mine = HealthOwner {
+            addr: Some("127.0.0.1:9091".into()),
+            answer: Some(Ok(me.clone())),
+        };
+        assert_eq!(
+            check_health_addr_bindable(&mine, &me).status,
+            super::super::PASS
+        );
 
         let other = HealthOwner {
             addr: Some("127.0.0.1:9091".into()),
-            answer: Some(Ok(HealthIdentity { node: "gpu-01".into(), pid: 4121 })),
+            answer: Some(Ok(HealthIdentity {
+                node: "gpu-01".into(),
+                pid: 4121,
+            })),
         };
         let c = check_health_addr_bindable(&other, &me);
         assert_eq!(c.status, super::super::FAIL);
         assert!(c.summary.contains("pid 4121"), "{}", c.summary);
-        assert!(c.remediation.contains("QUASAR_HEALTH_ADDR") && c.remediation.contains("9091"), "{}", c.remediation);
+        assert!(
+            c.remediation.contains("QUASAR_HEALTH_ADDR") && c.remediation.contains("9091"),
+            "{}",
+            c.remediation
+        );
 
-        let silent = HealthOwner { addr: Some("127.0.0.1:9091".into()), answer: Some(Err("nothing answers".into())) };
-        assert_eq!(check_health_addr_bindable(&silent, &me).status, super::super::FAIL);
+        let silent = HealthOwner {
+            addr: Some("127.0.0.1:9091".into()),
+            answer: Some(Err("nothing answers".into())),
+        };
+        assert_eq!(
+            check_health_addr_bindable(&silent, &me).status,
+            super::super::FAIL
+        );
 
-        assert_eq!(check_health_addr_bindable(&HealthOwner::default(), &me).status, super::super::SKIP);
+        assert_eq!(
+            check_health_addr_bindable(&HealthOwner::default(), &me).status,
+            super::super::SKIP
+        );
     }
 
     #[test]
     fn health_body_parsing() {
         assert_eq!(
-            parse_health(r#"{"status":"ok","sessions":0,"connected":true,"node":"gpu-01","pid":7}"#).unwrap(),
-            HealthIdentity { node: "gpu-01".into(), pid: 7 }
+            parse_health(
+                r#"{"status":"ok","sessions":0,"connected":true,"node":"gpu-01","pid":7}"#
+            )
+            .unwrap(),
+            HealthIdentity {
+                node: "gpu-01".into(),
+                pid: 7
+            }
         );
         assert!(parse_health(r#"{"status":"ok"}"#).is_err());
         assert!(parse_health("<html>").is_err());
@@ -336,7 +412,10 @@ mod tests {
 
     #[test]
     fn self_report_tolerates_an_older_updater() {
-        let s: UpdaterSelf = serde_json::from_str(r#"{"version":"0.2.4","working_dir":"/x","config_files":["/x/a.yml"],"images":{}}"#).unwrap();
+        let s: UpdaterSelf = serde_json::from_str(
+            r#"{"version":"0.2.4","working_dir":"/x","config_files":["/x/a.yml"],"images":{}}"#,
+        )
+        .unwrap();
         assert!(s.service_config_files.is_none());
     }
 }

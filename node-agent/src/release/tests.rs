@@ -219,13 +219,21 @@ fn parsed(request_id: &str, state: &str, components: &[&str]) -> UpdaterResult {
 /// older control plane sees the shape it knows.
 #[test]
 fn restored_is_relayed_and_omitted_when_false() {
-    let mut res = parsed("11111111-1111-4111-8111-111111111111", "failed", &["node-agent"]);
+    let mut res = parsed(
+        "11111111-1111-4111-8111-111111111111",
+        "failed",
+        &["node-agent"],
+    );
     res.restored = true;
     let msg = res.into_msg();
     let json = serde_json::to_string(&msg).unwrap();
     assert!(json.contains("\"restored\":true"), "{json}");
 
-    let res = parsed("11111111-1111-4111-8111-111111111111", "failed", &["node-agent"]);
+    let res = parsed(
+        "11111111-1111-4111-8111-111111111111",
+        "failed",
+        &["node-agent"],
+    );
     let json = serde_json::to_string(&res.into_msg()).unwrap();
     assert!(!json.contains("restored"), "{json}");
 

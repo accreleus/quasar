@@ -2490,7 +2490,10 @@ mod tests {
                 updater: platform_update::UpdaterView::default(),
                 updater_present: None,
                 health: platform_update::HealthOwner::default(),
-                self_identity: platform_update::HealthIdentity { node: "test".to_string(), pid: 1 },
+                self_identity: platform_update::HealthIdentity {
+                    node: "test".to_string(),
+                    pid: 1,
+                },
             }
         }
 
@@ -2578,6 +2581,22 @@ mod tests {
                 assert_eq!(
                     c.status, SKIP,
                     "native host needs no provisioned driver mount"
+                );
+                continue;
+            }
+            // The update-path checks read the fixture's empty collectors as not
+            // applicable (no updater service, health endpoint unprobed).
+            if matches!(
+                c.id.as_str(),
+                "updater_socket"
+                    | "updater_stack_dir"
+                    | "updater_overlays"
+                    | "health_addr_bindable"
+            ) {
+                assert_eq!(
+                    c.status, SKIP,
+                    "check {} should be not applicable here: {:?}",
+                    c.id, c
                 );
                 continue;
             }
