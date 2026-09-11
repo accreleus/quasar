@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -137,12 +137,25 @@ impl ReleaseManager {
     }
 
     /// Attach this connection's channel and re-emit the current state of every
-    /// result file still present, so a control plane that missed frames catches
-    /// up without asking and an agent replaced mid-apply still reports the
-    /// apply that replaced it.
+    /// result file this agent should still speak for, so a control plane that
+    /// missed frames catches up without asking and an agent replaced mid-apply
+    /// still reports the apply that replaced it.
+    ///
+    /// Both cases concern a recent, possibly non-terminal attempt of THIS
+    /// agent's, so two kinds of file are left alone (`replay_worthy`):
+    /// - results whose components are not all in [`APPLIABLE_COMPONENTS`] — the
+    ///   updater writes the control plane's own step results into the same
+    ///   directory, and the agent never applied those, so it has nothing to
+    ///   report (the control plane would drop each one with a WARN, since a host
+    ///   speaking about another target's attempt is a trust-boundary event);
+    /// - terminal results whose file is older than [`POLL_DEADLINE`] — the
+    ///   control plane resolved that attempt long ago, and a late duplicate is a
+    ///   documented no-op, so nothing is lost by not re-sending it. Nothing
+    ///   prunes the directory, so without this the replay grows by one per fleet
+    ///   run, forever.
     pub fn attach_upstream(self: &Arc<Self>, tx: mpsc::Sender<AgentMsg>) -> UpstreamGuard {
         *self.upstream.write().unwrap() = Some(tx);
-        for res in self.read_all_results() {
+        for res in self.replayable_results() {
             info!(
                 "release apply {}: re-emitting state {} after connect",
                 res.request_id, res.state
@@ -282,7 +295,7 @@ impl ReleaseManager {
                 match mgr.read_result(&request_id) {
                     Some(res) => {
                         last_seen = Instant::now();
-                        let terminal = matches!(res.state.as_str(), "succeeded" | "failed");
+                        let terminal = is_terminal(&res.state);
                         if last.as_deref() != Some(res.state.as_str()) {
                             last = Some(res.state.clone());
                             info!("release apply {request_id}: {}", res.state);
@@ -354,9 +367,11 @@ impl ReleaseManager {
         }
     }
 
-    /// Every result file present, one per request id, ordered so the re-emit is
-    /// deterministic.
-    fn read_all_results(&self) -> Vec<UpdaterResult> {
+    /// Every result file present that [`replay_worthy`] keeps, one per request
+    /// id, ordered so the re-emit is deterministic. Age is the file's mtime: the
+    /// updater rewrites the file on every state change, so it tracks
+    /// `updated_at` without parsing a timestamp.
+    fn replayable_results(&self) -> Vec<UpdaterResult> {
         let Ok(entries) = std::fs::read_dir(&self.results_dir) else {
             return Vec::new();
         };
@@ -366,9 +381,24 @@ impl ReleaseManager {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            if let Some(res) = self.read_result_file(&path) {
-                by_id.insert(res.request_id.clone(), res);
+            let Some(res) = self.read_result_file(&path) else {
+                continue;
+            };
+            let age = file_age(&path);
+            if !replay_worthy(&res, age) {
+                debug!(
+                    "release apply {}: not replaying {} result for [{}] (file age {age:?})",
+                    res.request_id,
+                    res.state,
+                    res.components
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                continue;
             }
+            by_id.insert(res.request_id.clone(), res);
         }
         by_id.into_values().collect()
     }
@@ -399,6 +429,40 @@ impl ReleaseManager {
             None => debug!("release_state not sent: no upstream attached"),
         }
     }
+}
+
+/// The `release_state` vocabulary's two terminal states (agent-api.md).
+fn is_terminal(state: &str) -> bool {
+    matches!(state, "succeeded" | "failed")
+}
+
+/// Whether a result file still on the volume is worth re-emitting on connect;
+/// `age` is the file's age by mtime, `None` when it could not be read. See
+/// [`ReleaseManager::attach_upstream`] for why the two exclusions exist.
+///
+/// Errs towards replaying: a duplicate is a documented no-op on the control
+/// plane, a dropped live attempt is not. So a non-terminal result is kept at any
+/// age, and a terminal one whose age is unknown is kept too.
+fn replay_worthy(res: &UpdaterResult, age: Option<Duration>) -> bool {
+    let all_ours = !res.components.is_empty()
+        && res
+            .components
+            .iter()
+            .all(|c| APPLIABLE_COMPONENTS.contains(&c.name.as_str()));
+    if !all_ours {
+        return false;
+    }
+    match age {
+        Some(age) if is_terminal(&res.state) => age <= POLL_DEADLINE,
+        _ => true,
+    }
+}
+
+/// `None` when the mtime is unreadable or in the future (clock skew), both of
+/// which [`replay_worthy`] treats as "unknown, keep".
+fn file_age(path: &Path) -> Option<Duration> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    SystemTime::now().duration_since(modified).ok()
 }
 
 fn unreachable_msg(request_id: &str) -> AgentMsg {
