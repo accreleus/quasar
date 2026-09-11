@@ -13,6 +13,7 @@ import * as adminApi from "../../../api/admin";
 import { ApiError } from "../../../api/client";
 import type {
   PlatformApplyAttempt,
+  PlatformPreflight,
   PlatformRelease,
   PlatformReleaseView,
 } from "../../../api/types";
@@ -21,7 +22,7 @@ import { FLEET_TABS } from "../../../components/shell/sectionTabs";
 import { ToastProvider } from "../../../components/Toast";
 import { ReleasesTab } from "./ReleasesTab";
 
-const PF = { state: "unknown", checked_at: null, checks: [] } as const;
+const PF: PlatformPreflight = { state: "unknown", checked_at: null, checks: [] };
 
 vi.mock("../../../auth/context", () => ({ useAuth: () => ({ token: "tok" }) }));
 vi.mock("../../../api/admin");
@@ -569,7 +570,7 @@ describe("ReleasesTab › manual update paths", () => {
       },
       targets: [
         { kind: "control_plane", host_id: null, node_name: null, eligible: true, reason: null, preflight: PF },
-        { kind: "host", host_id: "h1", node_name: "gpu-host-01", eligible: false, reason },
+        { kind: "host", host_id: "h1", node_name: "gpu-host-01", eligible: false, reason, preflight: PF },
       ],
     } as Partial<PlatformReleaseView>);
   }

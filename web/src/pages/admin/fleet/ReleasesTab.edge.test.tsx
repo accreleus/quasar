@@ -5,13 +5,13 @@ import { render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as adminApi from "../../../api/admin";
-import type { PlatformRelease, PlatformReleaseView } from "../../../api/types";
+import type { PlatformPreflight, PlatformRelease, PlatformReleaseView } from "../../../api/types";
 import { SectionHeadProvider } from "../../../components/shell/sectionHead";
 import { FLEET_TABS } from "../../../components/shell/sectionTabs";
 import { ToastProvider } from "../../../components/Toast";
 import { ReleasesTab } from "./ReleasesTab";
 
-const PF = { state: "unknown", checked_at: null, checks: [] } as const;
+const PF: PlatformPreflight = { state: "unknown", checked_at: null, checks: [] };
 
 vi.mock("../../../auth/context", () => ({ useAuth: () => ({ token: "tok" }) }));
 vi.mock("../../../api/admin");
