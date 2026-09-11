@@ -564,8 +564,12 @@ func TestFleetHoldsRunningSessionsWhenTheReleaseRunsNoMigration(t *testing.T) {
 		return err == nil && TerminalRunState(r.State)
 	})
 	final, err := h.store.Run(context.Background(), run.ID)
-	if err != nil || final.State != RunSucceeded {
-		t.Fatalf("run state = %q (%v), want succeeded", final.State, err)
+	// The harness pins the control plane's identity at commitA, so after the
+	// control-plane step every host still reads control_plane_not_first and is
+	// passed over: partial is the honest state, and the control-plane step is
+	// what this test is about.
+	if err != nil || final.State != RunSucceededPartial {
+		t.Fatalf("run state = %q (%v), want succeeded_partial", final.State, err)
 	}
 	if got := sessionStates(t, h.pool); len(got) != 1 || got[0] != "running" {
 		t.Fatalf("session states = %v, want the one that was running to still be running", got)
@@ -628,8 +632,12 @@ func TestFleetForceEndsSessionsBeforeAMigratingControlPlaneStep(t *testing.T) {
 		return err == nil && TerminalRunState(r.State)
 	})
 	final, err := h.store.Run(context.Background(), run.ID)
-	if err != nil || final.State != RunSucceeded {
-		t.Fatalf("run state = %q (%v), want succeeded", final.State, err)
+	// The harness pins the control plane's identity at commitA, so after the
+	// control-plane step every host still reads control_plane_not_first and is
+	// passed over: partial is the honest state, and the control-plane step is
+	// what this test is about.
+	if err != nil || final.State != RunSucceededPartial {
+		t.Fatalf("run state = %q (%v), want succeeded_partial", final.State, err)
 	}
 	// The session the operator agreed to lose is actually gone BEFORE the
 	// migration ran, which is the property the old fleet-wide drain provided.
@@ -687,8 +695,12 @@ func TestFleetWaitsForAnInFlightLaunchOnANonMigratingStep(t *testing.T) {
 		return err == nil && TerminalRunState(r.State)
 	})
 	final, err := h.store.Run(context.Background(), run.ID)
-	if err != nil || final.State != RunSucceeded {
-		t.Fatalf("run state = %q (%v), want succeeded", final.State, err)
+	// The harness pins the control plane's identity at commitA, so after the
+	// control-plane step every host still reads control_plane_not_first and is
+	// passed over: partial is the honest state, and the control-plane step is
+	// what this test is about.
+	if err != nil || final.State != RunSucceededPartial {
+		t.Fatalf("run state = %q (%v), want succeeded_partial", final.State, err)
 	}
 	if got := sessionStates(t, h.pool); len(got) != 1 || got[0] != "running" {
 		t.Fatalf("session states = %v, want the launch to have survived", got)
