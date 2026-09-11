@@ -794,6 +794,18 @@ pub(crate) fn advertised_codec_throughput(
     report.as_ref().map(|r| r.throughput.clone())
 }
 
+/// How long register preparation may take before the agent says so. Register
+/// preparation (the image reconcile and the install probe, both against the
+/// container runtime) runs before the socket is dialled, so it can no longer eat the
+/// control plane's handshake window — but the window is 15 s (agentws
+/// `handshakeTimeout`), and a runtime slow enough to approach it deserves a log line
+/// naming it rather than a slow, mysterious reconnect (#191).
+const REGISTER_PREP_BUDGET: Duration = Duration::from_secs(10);
+
+fn register_prep_over_budget(elapsed: Duration) -> bool {
+    elapsed > REGISTER_PREP_BUDGET
+}
+
 /// #531: run one synchronous host probe on the blocking pool, never on the runtime
 /// worker polling the agent's control future.
 ///
@@ -966,6 +978,46 @@ async fn connect_and_run(
         );
     }
 
+    // Everything `register` needs from the container runtime is gathered BEFORE the
+    // socket is opened (#191). The control plane gives a fresh connection its
+    // handshake window (agentws `handshakeTimeout`, 15 s) to send `register`; these
+    // two probes used to run after the dial, and on a host whose docker daemon
+    // answers `inspect` slowly (each is bounded at 30 s) they pushed `register` past
+    // that deadline. The control plane closed the socket without a close frame, the
+    // agent wrote `register` into a dead connection, and every reconnect repeated
+    // the same probes into the same wall.
+    let prep_started = Instant::now();
+
+    // agent-api.md: recorded images are verified against the docker daemon on startup
+    // AND reconnect — an image `docker rmi`'d out from under a long-lived agent must
+    // not keep reporting `ready`. Runs before the upstream attaches, so the
+    // attach-time flush reports post-reconciliation states.
+    let images = {
+        let mgr = image_mgr.clone();
+        tokio::task::spawn_blocking(move || mgr.refresh_register_images()).await?
+    };
+
+    // Re-discovered per connection, not once at boot: an updater that starts
+    // after the agent must not leave the host reporting updater_present=false
+    // forever. Offloaded because it shells out to docker.
+    let install = offload_probe(|| {
+        let runtime = ContainerRuntime::from_env();
+        crate::buildinfo::discover_install(&crate::buildinfo::DockerFacts::new(&runtime))
+    })
+    .await;
+    crate::buildinfo::set_install_facts(install.clone());
+
+    let prep = prep_started.elapsed();
+    if register_prep_over_budget(prep) {
+        warn!(
+            token = "register-prep-slow",
+            elapsed_ms = prep.as_millis() as u64,
+            "register preparation (image reconcile + install probe against the container \
+             runtime) took {prep:?} — the container runtime is answering slowly; \
+             registration still proceeds, but sessions on this host will feel it"
+        );
+    }
+
     // #12: the connector is chosen by policy, never by tokio-tungstenite's default — a
     // wss:// URL must not silently validate against the OS/bundled roots when a pin was
     // configured, and a ws:// URL is explicitly Plain.
@@ -977,15 +1029,6 @@ async fn connect_and_run(
     )
     .await?;
     let (mut tx, mut rx) = ws_stream.split();
-
-    // agent-api.md: recorded images are verified against the docker daemon on startup
-    // AND reconnect — an image `docker rmi`'d out from under a long-lived agent must
-    // not keep reporting `ready`. Runs before the upstream attaches, so the
-    // attach-time flush reports post-reconciliation states.
-    let images = {
-        let mgr = image_mgr.clone();
-        tokio::task::spawn_blocking(move || mgr.refresh_register_images()).await?
-    };
 
     // Attach this connection's upstream channel to the process-wide ImageManager.
     // Attaching also flushes every op-free record's current state (terminal states
@@ -1006,15 +1049,6 @@ async fn connect_and_run(
 
     // --- Step 1: send register ---
     let auth = choose_auth(cfg)?;
-    // Re-discovered per connection, not once at boot: an updater that starts
-    // after the agent must not leave the host reporting updater_present=false
-    // forever. Offloaded because it shells out to docker.
-    let install = offload_probe(|| {
-        let runtime = ContainerRuntime::from_env();
-        crate::buildinfo::discover_install(&crate::buildinfo::DockerFacts::new(&runtime))
-    })
-    .await;
-    crate::buildinfo::set_install_facts(install.clone());
     let register_msg = AgentMsg::Register {
         source_policy_versions: Some(serde_json::json!({"steam_preparation": 1})),
         node_name: cfg.node_name.clone(),
@@ -3925,6 +3959,19 @@ mod tests {
     fn diagnostic_sender() -> DiagnosticEventTx {
         let (tx, _rx) = mpsc::channel(1);
         DiagnosticEventTx::new(tx, Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+    }
+
+    // ---- #191: register preparation runs before the dial ----
+
+    #[test]
+    fn register_prep_budget_sits_inside_the_control_plane_handshake_window() {
+        // agentws handshakeTimeout is 15 s. The budget exists to NAME a slow runtime,
+        // so it must trip before the peer would have given up on a same-window dial.
+        assert!(REGISTER_PREP_BUDGET < Duration::from_secs(15));
+        assert!(!register_prep_over_budget(Duration::from_millis(800)));
+        assert!(register_prep_over_budget(Duration::from_secs(11)));
+        // The field case: one 30 s inspect timeout.
+        assert!(register_prep_over_budget(Duration::from_secs(30)));
     }
 
     /// A throwaway `ImageManager`: an empty state_path means `ImageManager::new`

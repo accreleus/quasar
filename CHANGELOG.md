@@ -131,6 +131,20 @@ own; the two do not move together, and that is deliberate.
   Contract: `quasar-protocol` "Audit-log names" amendment (additive, no migration).
 
 ### Fixed
+- **An agent on a host whose Docker daemon answers slowly can register again** (#191). The
+  agent opened its WebSocket to the control plane first and only then ran the two
+  container-runtime probes `register` needs (the image reconcile and the install-mode probe,
+  each `docker inspect` bounded at 30 s). The control plane gives a fresh connection 15 s to
+  send `register`, so on such a host it closed the socket before `register` was written, the
+  agent logged "connection reset without closing handshake", reconnected, repeated the same
+  probes, and never came back. Found live by an external reporter straight after a successful
+  control-plane update; the host showed as down with the agent container running. The probes
+  now run before the socket is opened, the agent warns (`register-prep-slow`) when they took
+  more than 10 s, and the control plane's log names the handshake timeout in words instead of
+  a bare `i/o timeout`. The cost: the probes now run on every dial attempt, including while
+  the control plane is down, so a reconnect loop on a slow-runtime host is slower than
+  before rather than impossible.
+
 - `docs/upgrading.md` "Adding it to an existing install" no longer leaves the control plane
   without the updater's socket. Step 3 brought up only the updater; the compose file also
   mounts its socket volume into the control plane and the node agent, and a container
