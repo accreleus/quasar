@@ -410,4 +410,28 @@ func RunOutcome(skips []RunSkip) string
 - [ ] Gates: `make test-go`, `make test-db`, `make test-rust`, `make test-web`, `scripts/dev/leak-scan.sh`. Run serially (devtools volume).
 - [ ] Review: `mcp__alice-review` on the branch; resolve; re-run gates.
 - [ ] Push `feat/185-self-update-hardening` to origin. Landing waits on the amendment sign-off: on sign-off, fast-forward `amend/self-update-hardening` into `quasar-protocol` `main`, verify the superproject pin sha is unchanged, merge to `develop`, push, and comment on #185–#190 with the merge sha. Renumber 0083 if PR #182 landed first.
-- [ ] Live gate (needs a published edge build carrying this, so it follows the landing): on `gpu-test`, (a) `docker compose exec quasar-node-agent nc -l 127.0.0.1 9091` before an edge apply → the run ends `failed`, the host is back on its previous digest, the attempt history shows `auto_revert`, the output carries `health-bind-failed`; (b) a control-plane container recreated without the socket volume → the card's `updater_socket` names the recreate; (c) one host's agent stopped → `succeeded_partial`, Retry after restart brings it current.
+- [x] Live gate, run 2026-09-12 on the operator's appliance stack (gpu-test was off) with the
+  branch published by an Images dispatch and the stack's updater pinned to the branch build
+  (the updater is not part of a release). Record:
+  - **Apply through the previous control plane:** fleet run `succeeded` in 40 s, schema 82 → 83,
+    every preflight check `pass` on both targets afterwards with its detail text.
+  - **(a) squatted health port, restore also fails:** host reverted to its previous agent, a
+    squatter took 127.0.0.1:9091 the moment the recreate freed it; the attempt ended
+    `failed / recreate_failed` in 34 s, its output carries the new container's
+    `health-bind-failed` lines, the restore's own failure and "apply the digests in `previous`
+    by hand"; the host came back on the previous digest once the port was freed and replayed
+    the result. No `auto_revert` row (decision 12).
+  - **(a') squatted port released as the restore begins:** the updater reported
+    `restored: true` in 23 s and the previous agent came up. **Defect found:** the restored
+    agent connected while the updater was still verifying the restore, re-emitted `verifying`
+    once (#193) and never relayed the end — the attempt sat `verifying`. Fixed in this branch
+    (the agent adopts a non-terminal result found on connect); until a host runs that agent,
+    restarting the restored agent after the updater finishes replays the terminal result.
+    The `auto_revert` row cannot appear while the *restored* agent predates amendment 9 — it
+    is the one that would say `restored`.
+  - **(b) blocked control plane:** stopping the updater flipped the control-plane target to
+    `preflight: blocked` on `updater_socket` within one refresh, and the fleet apply was
+    refused `409 preflight_blocked` with the check's remedy in the message.
+  - **Retry linkage:** a plain fleet apply with `retry_of` succeeded in 5 s and the run carries
+    the link. (c) partial run + retry, and the adopted-restore path, are exercised against the
+    fix build — see the session record on #185.
