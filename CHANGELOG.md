@@ -161,6 +161,21 @@ own; the two do not move together, and that is deliberate.
   the real reason in `/health`. The limiter itself is unchanged: an unknown `node_name` answers
   `host_not_found` where a known one answers `auth_failed`, so exempting it would make `/agent/ws`
   a free node-name enumeration oracle.
+- **Restarting the control plane mid-update no longer fails the update, and a long verdict no
+  longer strands one** (#202). An apply waiting for its host's agent to come back read a
+  shutdown as the host never coming back: the attempt was written `timeout`, which is terminal,
+  so the next boot could not resume it — and in the unattended lane a failed release is
+  suppressed, so two restarts in a row quietly blocked automatic updates until an admin applied
+  by hand. The wait now happens before the request id is minted, so a shutdown leaves the
+  attempt where the next boot's adoption picks it up — provided the control plane is back
+  inside the apply's own 15-minute deadline; a longer outage still expires it, as it does any
+  waiting attempt. Separately, an attempt's `output` column refuses an oversized value, a
+  half-a-character one, or one carrying a NUL, rather than truncating it — so a verdict whose
+  8 KiB tail began mid-character, or whose last log lines held binary, could not be written at
+  all and the attempt hung to its 15-minute deadline; every writer now bounds the output, and
+  the four places that spell the 8192 out are pinned to the migration by a test. A failed **revert** also stops borrowing an
+  apply's wording: the updater does restore, but the build it puts back is the one the revert
+  was leaving, and no automatic revert is recorded in the history.
 - **A fleet update that only moves hosts no longer risks leaving one out of scheduling**
   (#200). The instance-wide cordon a fleet run takes belongs to its control-plane step, so a
   run whose control plane was already on the release took none and recorded nothing — while

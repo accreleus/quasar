@@ -218,6 +218,26 @@ describe("hostAfterFailureText", () => {
     expect(hostAfterFailureText(null)).toBe("");
     expect(hostAfterFailureText(undefined)).toBe("");
   });
+
+  // The panel renders for a failed revert too (#202). The updater still
+  // restores — restoreWorthy keys on the reason, not on the kind — but "the
+  // previous build" is the build being reverted away from, and no auto_revert
+  // row is written for a revert.
+  it("names the right build, and no history row, for a failed revert", () => {
+    for (const reason of ["recreate_failed", "never_started", "unhealthy"]) {
+      const text = hostAfterFailureText(reason, "revert");
+      expect(text).toMatch(/the build this revert was leaving/);
+      expect(text).not.toMatch(/the previous build/);
+      expect(text).not.toMatch(/shows an automatic revert/);
+    }
+    // Every other sentence is true in either direction, and an omitted kind
+    // still reads as an apply.
+    expect(hostAfterFailureText("pull_failed", "revert")).toBe(hostAfterFailureText("pull_failed"));
+    expect(hostAfterFailureText("timeout", "revert")).toBe(hostAfterFailureText("timeout"));
+    expect(hostAfterFailureText("a_reason_from_the_future", "revert")).toBe("");
+    expect(hostAfterFailureText("unhealthy", "apply")).toMatch(/puts the previous build back itself/);
+    expect(hostAfterFailureText("unhealthy")).toMatch(/puts the previous build back itself/);
+  });
 });
 
 describe("Revert on the Releases page", () => {

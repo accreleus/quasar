@@ -11,8 +11,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -541,6 +543,95 @@ func TestAttemptHistoryOrderingAndFilter(t *testing.T) {
 			t.Errorf("%s = %d, want 400", bad, code)
 		}
 	}
+}
+
+// Postgres REFUSES an output the CHECK rejects — and refuses invalid UTF-8
+// outright — instead of truncating either, so a terminal write carrying a relay
+// tail cut mid-rune was simply lost and the attempt hung to its 15-minute
+// deadline (#202). The bound therefore lives in the store, where every writer
+// passes: this fixture is what reaches FailAttempt when the updater's tail
+// starts mid-rune, the JSON hop turns each bad byte into a 3-byte U+FFFD, and
+// the wire hop cuts it back by bytes.
+func TestAnOversizedMidRuneOutputStillResolvesTheAttempt(t *testing.T) {
+	h := newApplyHarness(t)
+	ctx := context.Background()
+
+	// A 4-byte rune straddling the cut: the front cut lands two bytes into it.
+	// The NUL is the other half of the fixture: it is VALID UTF-8, so a bound
+	// that only calls ToValidUTF8 keeps it — and Postgres refuses a `text`
+	// carrying 0x00 (SQLSTATE 22021), which loses the write exactly as an
+	// oversized one does. A container dying with binary in its log tail is the
+	// way it arrives.
+	output := strings.Repeat("x", 100) + "😀" + strings.Repeat("y", 4000) +
+		"\x00" + strings.Repeat("y", 4189)
+	if len(output) <= applyOutputLimit || len(output)-applyOutputLimit != 102 {
+		t.Fatalf("fixture no longer straddles the cut: len = %d", len(output))
+	}
+	if !strings.Contains(output[len(output)-applyOutputLimit:], "\x00") {
+		t.Fatal("fixture no longer carries a NUL past the cut")
+	}
+
+	newAttempt := func() Attempt {
+		a, err := h.store.CreateHostAttempt(ctx, NewHostAttempt{
+			Kind: KindApply, HostID: h.hostID, ReleaseID: &h.release.ID,
+			Requested: []ComponentDigest{{Name: ComponentNodeAgent, Image: "img", Digest: "sha256:" + hex64}},
+			Previous:  []PreviousDigest{{Name: ComponentNodeAgent}},
+		})
+		if err != nil {
+			t.Fatalf("create attempt: %v", err)
+		}
+		return a
+	}
+	check := func(t *testing.T, id, wantState string) {
+		t.Helper()
+		got, err := h.store.Attempt(ctx, id)
+		if err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		if got.State != wantState {
+			t.Fatalf("state = %q, want %q: the write was refused", got.State, wantState)
+		}
+		if len(got.Output) > applyOutputLimit {
+			t.Errorf("stored output = %d bytes, CHECK allows %d", len(got.Output), applyOutputLimit)
+		}
+		if !utf8.ValidString(got.Output) {
+			t.Error("stored output is not valid UTF-8")
+		}
+		if !strings.HasSuffix(got.Output, "yyy") {
+			t.Error("the cut kept the head; the error is at the end")
+		}
+		if strings.ContainsRune(got.Output, 0) {
+			t.Error("stored output still carries a NUL; Postgres would have refused this write")
+		}
+	}
+
+	failed := newAttempt()
+	if err := h.store.FailAttempt(ctx, failed.ID, ReasonUnhealthy, output); err != nil {
+		t.Fatalf("FailAttempt with an over-long mid-rune output: %v", err)
+	}
+	check(t, failed.ID, AttemptFailed)
+
+	// The same tail arrives on the progress path, and on the auto_revert row
+	// ADR 0004 writes beside a failed apply.
+	progressing := newAttempt()
+	if err := h.store.RecordReleaseState(ctx, progressing.ID, AttemptPulling, nil, output); err != nil {
+		t.Fatalf("RecordReleaseState with an over-long mid-rune output: %v", err)
+	}
+	check(t, progressing.ID, AttemptPulling)
+
+	if err := h.store.FailAttempt(ctx, progressing.ID, ReasonUnhealthy, ""); err != nil {
+		t.Fatal(err)
+	}
+	reverted, err := h.store.CreateAutoRevertAttempt(ctx, NewAutoRevert{
+		Failed:    progressing,
+		Requested: []ComponentDigest{{Name: ComponentNodeAgent, Image: "img", Digest: "sha256:" + hex64}},
+		Previous:  []PreviousDigest{{Name: ComponentNodeAgent}},
+		Output:    output,
+	})
+	if err != nil {
+		t.Fatalf("CreateAutoRevertAttempt with an over-long mid-rune output: %v", err)
+	}
+	check(t, reverted.ID, AttemptSucceeded)
 }
 
 // The state predicate lives in two places — Go and SQL — so they are pinned

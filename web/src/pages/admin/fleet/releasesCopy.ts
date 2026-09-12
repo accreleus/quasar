@@ -8,7 +8,7 @@
  * vanished would be worse than one labelled with a raw identifier.
  */
 
-import type { EligibilityReason, PlatformRelease } from "../../../api/types";
+import type { EligibilityReason, PlatformApplyAttempt, PlatformRelease } from "../../../api/types";
 
 const REASON_TEXT: Record<string, string> = {
   no_release: "Nothing newer has been detected on this channel.",
@@ -144,6 +144,15 @@ const RESTORE_ATTEMPTED =
   "The new container did not come up. The updater puts the previous build back itself when " +
   "that happens; the apply history shows an automatic revert when it worked.";
 
+/** The same restore, told for a failed REVERT (#202). The updater still
+ *  performs it — `restoreWorthy` keys on the reason and the components, not on
+ *  which button was pressed — but the build it puts back is the one the revert
+ *  was leaving, not "the previous build", and no history row records it:
+ *  recordAutoRevert writes an `auto_revert` only for an apply. */
+const RESTORE_ATTEMPTED_REVERT =
+  "The new container did not come up. The updater puts the build this revert was leaving back " +
+  "itself when that happens, and records nothing for it: the history shows only this failure.";
+
 const AFTER_FAILURE_TEXT: Record<string, string> = {
   updater_absent: UNTOUCHED,
   busy: UNTOUCHED,
@@ -173,8 +182,23 @@ const AFTER_FAILURE_TEXT: Record<string, string> = {
     "here — check the host itself.",
 };
 
-export function hostAfterFailureText(reason: string | null | undefined): string {
+/** The restore clauses, retold for a revert. Only the three reasons past the
+ *  health wait differ; every other sentence is true of either direction. */
+const AFTER_FAILURE_TEXT_REVERT: Record<string, string> = {
+  recreate_failed: RESTORE_ATTEMPTED_REVERT,
+  never_started: RESTORE_ATTEMPTED_REVERT,
+  unhealthy: RESTORE_ATTEMPTED_REVERT,
+};
+
+/** `kind` because the failed-attempt panel renders for a revert too, where the
+ *  apply wording named the wrong build and promised a history row that is never
+ *  written. Omitted reads as an apply. */
+export function hostAfterFailureText(
+  reason: string | null | undefined,
+  kind?: PlatformApplyAttempt["kind"],
+): string {
   if (!reason) return "";
+  if (kind === "revert") return AFTER_FAILURE_TEXT_REVERT[reason] ?? AFTER_FAILURE_TEXT[reason] ?? "";
   return AFTER_FAILURE_TEXT[reason] ?? "";
 }
 

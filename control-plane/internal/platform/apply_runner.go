@@ -305,6 +305,31 @@ func (r *Runner) prepareAndSend(ctx context.Context, a Attempt, hostID string) b
 		}
 	}
 
+	// An agent that is not on the wire yet is not an agent that failed: after a
+	// control-plane recreate every agent reconnects a beat later, and sending
+	// into that gap is what made a whole fleet run fail on its first host.
+	//
+	// BEFORE the mint, not after: nothing is persisted while this waits, so a
+	// shutdown here leaves the row `waiting_sessions` for the next boot's Adopt
+	// to re-drive from the top — and the `pending`-with-no-send window that
+	// apply_timeout.go can only call `reachUnknown` shrinks from a minute of
+	// connect wait to the milliseconds between the mint and the send.
+	if !r.waitConnected(ctx, hostID) {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			// A shutdown, not a host that never came back. Services.Stop
+			// cancels in-flight applies, it does not fail them: failing here
+			// wrote a terminal `timeout` no Adopt could resume, and in the
+			// unattended lane that suppressed the release for good.
+			r.log.Info("apply: shutting down while waiting for the host's agent; leaving the attempt to the next boot",
+				"attempt_id", a.ID, "host_id", hostID)
+			return false
+		}
+		r.log.Warn("apply: the host's agent did not reconnect in time", "attempt_id", a.ID, "host_id", hostID)
+		// Nothing was minted or sent, so no updater has a result: apply_timeout.go.
+		r.fail(a.ID, ReasonTimeout, applyNotSentOutput)
+		return false
+	}
+
 	// Persisted before the send, because the agent that receives the command is
 	// normally destroyed by carrying it out.
 	requestID, err := r.store.MintRequestID(ctx, a.ID)
@@ -326,16 +351,6 @@ func (r *Runner) prepareAndSend(ctx context.Context, a Attempt, hostID string) b
 			return false
 		}
 		release = ReleaseRef{ID: rel.ID, Version: rel.Version, SourceCommit: rel.SourceCommit}
-	}
-
-	// An agent that is not on the wire yet is not an agent that failed: after a
-	// control-plane recreate every agent reconnects a beat later, and sending
-	// into that gap is what made a whole fleet run fail on its first host.
-	if !r.waitConnected(ctx, hostID) {
-		r.log.Warn("apply: the host's agent did not reconnect in time", "attempt_id", a.ID, "host_id", hostID)
-		// Nothing was sent, so no updater has a result: apply_timeout.go.
-		r.fail(a.ID, ReasonTimeout, applyNotSentOutput)
-		return false
 	}
 
 	ackCtx, cancel := context.WithTimeout(ctx, r.AckTimeout)
@@ -380,8 +395,11 @@ func (r *Runner) prepareAndSend(ctx context.Context, a Attempt, hostID string) b
 	return true
 }
 
-// waitConnected blocks until the host's agent is on the wire, the deadline
-// passes, or the process shuts down. False means the attempt should be failed.
+// waitConnected blocks until the host's agent is on the wire, the connect wait
+// runs out, the apply deadline passes, or the process shuts down. False is all
+// three of those, so the caller must read ctx.Err() to tell them apart: a
+// cancel is a shutdown and must leave the attempt alone, while a nil or expired
+// ctx.Err() is a host that never came back and fails the attempt.
 func (r *Runner) waitConnected(ctx context.Context, hostID string) bool {
 	if r.deps.Connected == nil {
 		return true
