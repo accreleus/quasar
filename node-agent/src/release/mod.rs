@@ -156,6 +156,14 @@ impl ReleaseManager {
     ///   documented no-op, so nothing is lost by not re-sending it. Nothing
     ///   prunes the directory, so without this the replay grows by one per fleet
     ///   run, forever.
+    ///
+    /// A non-terminal result is not just re-emitted: it is adopted. The process
+    /// that handed it to the updater is gone (recreating the agent is what the
+    /// apply does), so nobody else will relay its final state — and with the
+    /// updater's automatic restore (ADR 0004) the restored agent normally
+    /// connects while the updater is still verifying that restore, so the
+    /// result it finds is `verifying` more often than not. Without a watcher
+    /// the attempt would sit `verifying` on the control plane for ever.
     pub fn attach_upstream(self: &Arc<Self>, tx: mpsc::Sender<AgentMsg>) -> UpstreamGuard {
         *self.upstream.write().unwrap() = Some(tx);
         for res in self.replayable_results() {
@@ -163,7 +171,33 @@ impl ReleaseManager {
                 "release apply {}: re-emitting state {} after connect",
                 res.request_id, res.state
             );
-            self.send(res.into_msg());
+            if is_terminal(&res.state) {
+                self.send(res.into_msg());
+                continue;
+            }
+            let adopt = {
+                let mut inflight = self.inflight.lock().unwrap();
+                match inflight.as_deref() {
+                    // This process's own poller is already relaying it (a
+                    // reconnect, not a restart); a second watcher would only
+                    // duplicate frames.
+                    Some(cur) if cur == res.request_id => false,
+                    Some(_) => false,
+                    None => {
+                        *inflight = Some(res.request_id.clone());
+                        true
+                    }
+                }
+            };
+            if adopt {
+                info!(
+                    "release apply {}: adopting the in-flight apply of the agent this one replaced",
+                    res.request_id
+                );
+                self.spawn_poller(res.request_id);
+            } else {
+                self.send(res.into_msg());
+            }
         }
         UpstreamGuard { mgr: self.clone() }
     }

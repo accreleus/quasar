@@ -58,5 +58,12 @@ running and the file merely stops naming an image that never arrived.
 - A fleet run behaves as before on a reverted host: it stops there. A second host failing
   the same way is likely the same cause, and continuing is the thing the stop rule
   exists to prevent.
+- The restored agent normally connects to the control plane before the updater has
+  finished verifying the restore, so the result it finds on connect is still
+  `verifying`. It therefore **adopts** that apply — watches the result to its terminal
+  state and relays it — rather than re-emitting the state once (the pre-amendment
+  replay, #193, which left the attempt `verifying` for ever on the first live gate).
+  An agent older than this amendment does re-emit only once; restarting it after the
+  updater has finished replays the terminal result.
 - The updater's result output now includes the failed container's log tail, bounded
   inside the 8 KiB the wire carries. It never includes environment values.

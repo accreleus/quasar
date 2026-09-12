@@ -36,7 +36,8 @@ own; the two do not move together, and that is deliberate.
   and a blocked host is skipped and named. A host's checks are its own readiness checks (Hosts
   tab ▸ Updates). When a host's new agent container fails its health wait, the **updater restores
   the previous digest itself**, the result carries the failed container's last log lines, and the
-  history shows an automatic revert beside the failed apply (ADR 0004). A run that skipped a host
+  history shows an automatic revert beside the failed apply (ADR 0004); the restored agent adopts
+  the apply that replaced it and relays its final state, found on the live gate. A run that skipped a host
   that was behind ends **`succeeded_partial`**, the banner says which host and why, and **Retry
   skipped hosts** starts a plain fleet apply linked to the first run.
 - **Quasar can install its own updates** (#122, migration 0081). Settings ▸ Platform updates
