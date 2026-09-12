@@ -516,6 +516,32 @@ docker compose -f deploy/docker-compose.yml exec quasar-node-agent \
   http://u/v1/results/<request-id>
 ```
 
+**A host step that ends in `timeout`.** The verdict of a host apply is the
+updater's, and it comes home over that host's agent. So when the new container
+fails its health wait *and* the updater's automatic restore fails too — one
+squatted health port does both, since neither the new container nor the previous
+one can bind it — no agent ever comes back to relay it, and the attempt can only
+expire on its apply deadline (15 minutes). The console shows *"the update did
+not finish in time"*, while the real verdict — `recreate_failed`, the failed
+container's last log lines, the digests to put back — sits in the updater's
+result file on that host.
+
+The failed attempt spells that out and carries the request id. Ask the
+**updater** container, not the node agent: the node agent is the one that is
+down.
+
+```bash
+docker compose -f deploy/docker-compose.yml exec quasar-updater \
+  curl -s --unix-socket /run/quasar-updater/updater.sock \
+  http://u/v1/results/<request-id>
+```
+
+`docker compose logs quasar-updater` carries the same verdict. A host that has
+simply gone off the network looks identical from here, so check Admin › Fleet ›
+Hosts before assuming the double failure. A `timeout` whose attempt says the
+release was *never sent* is the simpler case: that host's agent was not
+connected when its turn came, and nothing on it was changed.
+
 ### Update Quasar from the console
 
 Admin › Fleet › Releases offers **Update Quasar** when a newer release is

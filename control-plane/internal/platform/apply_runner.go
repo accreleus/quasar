@@ -50,6 +50,9 @@ type applyStore interface {
 	SucceedAttempt(ctx context.Context, attemptID string) (bool, error)
 	Attempt(ctx context.Context, attemptID string) (Attempt, error)
 	AttemptByRequestID(ctx context.Context, requestID string) (Attempt, error)
+	// Read on the deadline path, to name the request whose verdict is stranded
+	// on a host whose agent never came back: apply_timeout.go.
+	AttemptRequestID(ctx context.Context, attemptID string) (string, error)
 	RecordReleaseState(ctx context.Context, attemptID, state string, previous []PreviousDigest, output string) error
 	SetPreviousDigests(ctx context.Context, attemptID string, previous []PreviousDigest) error
 	CreateAutoRevertAttempt(ctx context.Context, in NewAutoRevert) (Attempt, error)
@@ -328,7 +331,8 @@ func (r *Runner) prepareAndSend(ctx context.Context, a Attempt, hostID string) b
 	// into that gap is what made a whole fleet run fail on its first host.
 	if !r.waitConnected(ctx, hostID) {
 		r.log.Warn("apply: the host's agent did not reconnect in time", "attempt_id", a.ID, "host_id", hostID)
-		r.fail(a.ID, ReasonTimeout, "")
+		// Nothing was sent, so no updater has a result: apply_timeout.go.
+		r.fail(a.ID, ReasonTimeout, applyNotSentOutput)
 		return false
 	}
 
@@ -428,7 +432,9 @@ func (r *Runner) watch(ctx context.Context, attemptID string) {
 func (r *Runner) deadlineOrCancel(ctx context.Context, attemptID string) bool {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		r.log.Warn("apply: deadline expired with no terminal state", "attempt_id", attemptID)
-		r.fail(attemptID, ReasonTimeout, "")
+		// An expiry with no agent on the wire is a verdict stranded on the
+		// host, not a mystery: apply_timeout.go.
+		r.fail(attemptID, ReasonTimeout, r.timeoutOutput(attemptID))
 	}
 	return false
 }

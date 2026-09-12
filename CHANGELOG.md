@@ -146,6 +146,15 @@ own; the two do not move together, and that is deliberate.
   Contract: `quasar-protocol` "Audit-log names" amendment (additive, no migration).
 
 ### Fixed
+- **An update whose host never came back now says where the verdict is** (#201). When a host's
+  new agent fails its health wait *and* the updater's automatic restore fails too — one squatted
+  health port does both — no agent is left to relay the updater's result, so the attempt could
+  only expire on its deadline and the console reported `timeout` with an empty output for a
+  double failure the updater had already diagnosed on the host. A timed-out host attempt whose
+  agent is not connected now records what that shape means and the exact command to read the
+  updater's own verdict there, request id included; one that expired before the release was ever
+  sent says so instead of pointing at a result that cannot exist. `docs/upgrading.md` carries the
+  same recipe.
 - **A busy Docker host no longer makes the agent report its own container runtime as
   unresponsive** (#194). Every container-runtime command the agent runs had its output
   read only after the child exited, so a command printing more than one pipe buffer's
