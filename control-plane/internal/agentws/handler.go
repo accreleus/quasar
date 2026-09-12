@@ -603,6 +603,18 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		h.failures.Failure(clientIP)
 		return "", nil, nil, err
 	}
+	// #199: a refusal that is NOT a credential attempt. The enrollment-failure
+	// budget exists to stop brute force against a credential; a node_secret for a
+	// node_name this control plane has never enrolled proves nothing about any
+	// secret, and it is the steady state of a machine whose agent data volume
+	// outlived an enrollment elsewhere. Counting it meant the operator's
+	// legitimate re-enrollment collected a 429 on top of the real error — a second
+	// fault that looked unrelated. Concurrency is still bounded by the in-flight
+	// reservation in ServeHTTP, and a WRONG secret for a KNOWN node_name is a
+	// guess and still goes through fail().
+	reject := func(err error) (string, []RegisterImage, *string, error) {
+		return "", nil, nil, err
+	}
 	conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	raw, err := readTextMessage(conn)
 	if err != nil {
@@ -637,7 +649,19 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 				"a live agent is already registered under this node name; stop it before re-enrolling, "+
 					"or enroll under a different node_name")
 		case errors.Is(err, ErrHostNotFound):
-			h.writeError(conn, "host_not_found", "node not enrolled; use enrollment_token to enroll first")
+			// Names the credential that was refused, not just the remedy: the old
+			// wording ("use enrollment_token to enroll first") is exactly what an
+			// operator re-enrolling a machine has already done, and it sent them
+			// looking at the token instead of at the saved secret that is quietly
+			// winning over it (#199). The agent recovers from this on its own when
+			// a token is configured; this text is for the case where none is.
+			h.writeError(conn, "host_not_found",
+				"the node_secret presented belongs to no host enrolled on this control plane — it "+
+					"was minted by a different control plane (an agent data volume that outlived an "+
+					"earlier enrollment), or this host was removed here. Clear the agent's saved "+
+					"identity (its NODE_SECRET_PATH file, in the quasar-agent-data volume) and enroll "+
+					"again with an enrollment token.")
+			return reject(err)
 		default:
 			h.writeError(conn, "internal_error", "registration failed")
 		}

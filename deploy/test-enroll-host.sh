@@ -13,7 +13,9 @@
 #   4. re-running updates the one installed agent instead of adding a second;
 #   5. the image is pinned from the ref the script was fetched at;
 #   6. the quasar-app AppArmor profile is written and loaded on an AppArmor host,
-#      and on no other (#76).
+#      and on no other (#76);
+#   7. the saved agent identity (the project's quasar-agent-data volume) is left
+#      alone by default and cleared only on request (#199).
 #
 # Run: bash deploy/test-enroll-host.sh
 set -euo pipefail
@@ -63,6 +65,12 @@ case "$1" in
     [ "$2" = inspect ] || exit 99
     [ "${MOCK_LOCAL_IMAGE:-0}" = 1 ] || { echo "mock: no such image" >&2; exit 1; }
     exit 0 ;;
+  volume)
+    case "$2" in
+      inspect) [ "${MOCK_VOLUME_EXISTS:-0}" = 1 ] || { echo "mock: no such volume" >&2; exit 1; }; exit 0 ;;
+      rm)      [ "${MOCK_VOLUME_RM_OK:-1}" = 1 ] || { echo "mock: volume is in use" >&2; exit 1; }; exit 0 ;;
+    esac
+    exit 0 ;;
   compose)
     shift
     for a in "$@"; do
@@ -111,7 +119,7 @@ run_installer() {
   env PATH="$tmp/bin:$PATH" MOCK_DOCKER_LOG="$log" MOCK_AA_LOG="$aalog" \
       QUASAR_ENROLL_ROOT="${ROOT_DIR:-$tmp/root}" \
       QUASAR_DIR="${INSTALL_DIR:-$tmp/install}" QUASAR_ENROLL_TAIL_SECS=1 \
-      "$@" sh < "$script" > "$tmp/$label.out" 2>&1
+      "$@" sh ${EXTRA_ARGS:-} < "$script" > "$tmp/$label.out" 2>&1
   RC=$?
   set -e
   OUT="$(cat "$tmp/$label.out")"
@@ -425,6 +433,100 @@ if [ "$RC" -eq 0 ] && diff -q "$tmp/root/etc/apparmor.d/quasar-app" "$root/deplo
   pass "QUASAR_ENROLL_APPARMOR_PERSIST=1: the profile is also installed 0644 in /etc/apparmor.d"
 else
   fail "apparmor persist" "rc=$RC $(grep -i apparmor <<<"$OUT" | head -3)"
+fi
+
+# ── 10. the saved agent identity (#199) ──────────────────────────────────────
+# The node secret lives in a project-scoped named volume that outlives a re-run,
+# and the agent presents it in preference to the enrollment token. A machine
+# enrolled to a DIFFERENT control plane therefore arrives holding a credential
+# the new one has never seen — the agent recovers from that itself, so this
+# script must NOT go behind its back and delete the volume. Clearing it is opt-in,
+# and the only thing the default does is say the volume is there.
+
+rm -rf "$tmp/install"; mk_root "$tmp/root"
+run_installer id-fresh QUASAR_ENROLLMENT="$WSS_BLOB" QUASAR_REF=v1.2.3 NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes" MOCK_AGENT_LOG="$ENROLLED_LOG"
+if [ "$RC" -eq 0 ] && ! grep -q 'volume rm' <<<"$DOCKER_LOG" && ! grep -q 'saved agent identity' <<<"$OUT"; then
+  pass "a machine with no saved identity: nothing is said about one and no volume is removed"
+else
+  fail "fresh identity" "rc=$RC docker=[$(grep volume <<<"$DOCKER_LOG")] out=$(grep -i identity <<<"$OUT")"
+fi
+
+rm -rf "$tmp/install"; mk_root "$tmp/root"
+run_installer id-keep QUASAR_ENROLLMENT="$WSS_BLOB" QUASAR_REF=v1.2.3 NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes" MOCK_AGENT_LOG="$ENROLLED_LOG" MOCK_VOLUME_EXISTS=1
+if [ "$RC" -eq 0 ] && ! grep -q 'volume rm' <<<"$DOCKER_LOG"    && grep -q 'quasar-agent_quasar-agent-data' <<<"$OUT" && grep -q 'QUASAR_RESET_IDENTITY=1' <<<"$OUT"; then
+  pass "an existing identity volume: kept, named, and the way to clear it offered"
+else
+  fail "existing identity kept" "rc=$RC docker=[$(grep volume <<<"$DOCKER_LOG")] out=$(grep -i identity <<<"$OUT")"
+fi
+
+rm -rf "$tmp/install"; mk_root "$tmp/root"
+run_installer id-reset QUASAR_ENROLLMENT="$WSS_BLOB" QUASAR_REF=v1.2.3 NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes" MOCK_AGENT_LOG="$ENROLLED_LOG" MOCK_VOLUME_EXISTS=1 QUASAR_RESET_IDENTITY=1
+if [ "$RC" -eq 0 ] && grep -qxF 'volume rm quasar-agent_quasar-agent-data' <<<"$DOCKER_LOG"    && grep -q 'rm -sf quasar-node-agent' <<<"$DOCKER_LOG" && grep -q 'cleared' <<<"$OUT"    && [ "$(grep -c 'volume rm' <<<"$DOCKER_LOG")" -eq 1 ]; then
+  pass "QUASAR_RESET_IDENTITY=1: the agent container goes first, then its identity volume, exactly once"
+else
+  fail "reset identity" "rc=$RC docker=[$(grep -E 'volume|rm -sf' <<<"$DOCKER_LOG")] out=$(grep -i identity <<<"$OUT")"
+fi
+
+# The container is removed BEFORE the volume: a volume a container still holds
+# cannot be removed, and getting this order wrong fails only on a real daemon.
+if [ "$(grep -n 'rm -sf quasar-node-agent' "$tmp/id-reset.docker.log" | head -1 | cut -d: -f1)"    -lt "$(grep -n 'volume rm' "$tmp/id-reset.docker.log" | head -1 | cut -d: -f1)" ]; then
+  pass "reset identity: the container is removed before the volume"
+else
+  fail "reset ordering" "$(grep -E 'volume|rm -sf' "$tmp/id-reset.docker.log")"
+fi
+
+rm -rf "$tmp/install"; mk_root "$tmp/root"
+EXTRA_ARGS="-s -- --reset-identity"   run_installer id-reset-argv QUASAR_ENROLLMENT="$WSS_BLOB" QUASAR_REF=v1.2.3 NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes" MOCK_AGENT_LOG="$ENROLLED_LOG" MOCK_VOLUME_EXISTS=1
+if [ "$RC" -eq 0 ] && grep -qxF 'volume rm quasar-agent_quasar-agent-data' <<<"$DOCKER_LOG"; then
+  pass "--reset-identity as an argument does the same as the environment variable"
+else
+  fail "--reset-identity argv" "rc=$RC docker=[$(grep volume <<<"$DOCKER_LOG")] out=$(tail -3 <<<"$OUT")"
+fi
+
+rm -rf "$tmp/install"; mk_root "$tmp/root"
+run_installer id-reset-busy QUASAR_ENROLLMENT="$WSS_BLOB" QUASAR_REF=v1.2.3 NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes" MOCK_AGENT_LOG="$ENROLLED_LOG" MOCK_VOLUME_EXISTS=1 QUASAR_RESET_IDENTITY=1 MOCK_VOLUME_RM_OK=0
+if [ "$RC" -eq 1 ] && grep -q 'could not remove the agent identity volume' <<<"$OUT" && grep -q 'down' <<<"$OUT"    && ! grep -q ' up -d quasar-node-agent' <<<"$DOCKER_LOG"; then
+  pass "a volume that cannot be removed: refused with the remedy, and no agent is started on a half-reset host"
+else
+  fail "reset identity blocked" "rc=$RC docker=[$DOCKER_LOG] out=$(tail -3 <<<"$OUT")"
+fi
+
+rm -rf "$tmp/install2"; mk_root "$tmp/root"
+INSTALL_DIR="$tmp/install2" run_installer id-project QUASAR_ENROLLMENT="$WSS_BLOB" QUASAR_REF=v1.2.3 NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes" MOCK_AGENT_LOG="$ENROLLED_LOG" MOCK_VOLUME_EXISTS=1 QUASAR_RESET_IDENTITY=1 QUASAR_PROJECT=quasar-agent-b
+if [ "$RC" -eq 0 ] && grep -qxF 'volume rm quasar-agent-b_quasar-agent-data' <<<"$DOCKER_LOG"    && grep -qxF 'COMPOSE_PROJECT_NAME=quasar-agent-b' "$tmp/install2/.env"; then
+  pass "QUASAR_PROJECT: the project name and its identity volume move together"
+else
+  fail "project override" "rc=$RC docker=[$(grep volume <<<"$DOCKER_LOG")] env=[$(grep COMPOSE_PROJECT "$tmp/install2/.env" || true)]"
+fi
+rm -rf "$tmp/install2"
+
+# The unrecoverable half of #199: the agent held a stale secret and had no token
+# to fall back on. The RECOVERABLE log line must not end the wait — the agent is
+# one attempt away from enrolling when it prints that.
+rm -rf "$tmp/install"; mk_root "$tmp/root"
+run_installer id-stale QUASAR_ENROLLMENT="$WSS_BLOB" QUASAR_REF=v1.2.3 NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes"   MOCK_AGENT_LOG='ERROR token="cp-register-stale-identity-unresolvable" the node secret saved at /var/lib/quasar-agent/node-secret identifies no host'
+if [ "$RC" -eq 1 ] && grep -q 'QUASAR_RESET_IDENTITY=1' <<<"$OUT" && grep -q 'quasar-agent_quasar-agent-data' <<<"$OUT"; then
+  pass "a stale identity the agent cannot resolve: rc=1, names the volume and the reset flag"
+else
+  fail "stale identity verdict" "rc=$RC out=$(tail -3 <<<"$OUT")"
+fi
+
+rm -rf "$tmp/install"; mk_root "$tmp/root"
+run_installer id-recovering QUASAR_ENROLLMENT="$WSS_BLOB" QUASAR_REF=v1.2.3 NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes"   MOCK_AGENT_LOG='WARN token="cp-register-stale-identity" registering again with the configured enrollment token
+'"$ENROLLED_LOG"
+if [ "$RC" -eq 0 ] && grep -q 'enrolled: this host is now' <<<"$OUT"; then
+  pass "the agent re-enrolling after a stale secret is a success, not a verdict"
+else
+  fail "recoverable stale identity" "rc=$RC out=$(tail -3 <<<"$OUT")"
+fi
+
+# --help must keep carrying what the script now documents; usage() prints a fixed
+# line range of the header, and a range that drifts silently drops knobs.
+help_out="$(sh "$script" --help)"
+if grep -q 'QUASAR_RESET_IDENTITY' <<<"$help_out" && grep -q -- '--reset-identity' <<<"$help_out"    && grep -q 'QUASAR_PROJECT' <<<"$help_out" && grep -q 'self-signed' <<<"$help_out"    && grep -q -- '--pinnedpubkey' <<<"$help_out"; then
+  pass "--help carries the identity knobs and the --pinnedpubkey/-k pairing"
+else
+  fail "help text" "$(tail -5 <<<"$help_out")"
 fi
 
 # Every run above must have kept the token off stdout/stderr.

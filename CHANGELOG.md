@@ -146,6 +146,26 @@ own; the two do not move together, and that is deliberate.
   Contract: `quasar-protocol` "Audit-log names" amendment (additive, no migration).
 
 ### Fixed
+- **Re-enrolling a machine that was enrolled to another control plane now works on the
+  first try** (#199). The node secret minted by the earlier control plane lives in the
+  agent's `quasar-agent-data` volume, which survives a re-run of the installer, and the
+  agent presented that secret in preference to the enrollment token the operator had just
+  pasted. The new control plane had never seen the node, so it answered `host_not_found`
+  forever — with a message ("use enrollment_token to enroll first") naming the very thing
+  the operator had already done — and ten rejects inside a minute then added a `429` that
+  read like a second, unrelated fault. Three changes: the agent, refused with
+  `host_not_found` while holding a saved secret, registers **again with the configured
+  enrollment token** (once per reject, so a control plane that is merely mid-restore still
+  gets the saved secret offered on the attempt after); with no token configured it names
+  the stale secret's path and the volume to clear instead of looping silently; and the
+  control plane no longer spends the enrollment-failure budget on a register refused for an
+  **unknown** node secret — guessing a *known* host's secret still spends it, which is what
+  that limiter is for. `deploy/enroll-host.sh` gains `--reset-identity` /
+  `QUASAR_RESET_IDENTITY=1` (clear the saved identity and enroll from scratch) and
+  `QUASAR_PROJECT` (a second, separate agent stack on one machine), says when an identity
+  volume is already present rather than silently reusing it, and its `--help` now states
+  that `--pinnedpubkey` needs `-k` on a self-signed control plane — alone it fails with
+  `self-signed certificate (18)` before the pin is ever checked.
 - **A busy Docker host no longer makes the agent report its own container runtime as
   unresponsive** (#194). Every container-runtime command the agent runs had its output
   read only after the child exited, so a command printing more than one pipe buffer's

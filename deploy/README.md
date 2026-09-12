@@ -733,7 +733,9 @@ never prompts; with a password-asking sudo it stops and says so — open a root 
 The control plane serves the script itself (`/enroll-host.sh`, copied into the SPA at
 build time from `deploy/enroll-host.sh`), so it is the script from the tree the control
 plane runs. With the default self-signed certificate the command carries
-`-k --pinnedpubkey 'sha256//…'`: curl then trusts nothing but that public key, whose hash
+`-k --pinnedpubkey 'sha256//…'` — both flags, never one: `--pinnedpubkey` alone still
+fails a self-signed certificate with `self-signed certificate (18)`, because curl
+validates the chain before it checks the pin. Together, curl trusts nothing but that public key, whose hash
 the dialog read from the same certificate it shows the fingerprint of — `-k` on its own
 would let anyone on the path feed the new host a root shell. With a real-CA certificate
 neither flag appears. `<ref>` is the tag or commit the control plane was built from and

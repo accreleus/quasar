@@ -9,7 +9,11 @@
 # construction the one that matches the running deployment. With a self-signed
 # control plane, curl trusts nothing but the pinned public key (`-k` alone would
 # hand anyone on the path a root shell; `--pinnedpubkey` is what makes `-k`
-# safe); with a real-CA certificate neither flag appears. The agent then pins the
+# safe). The two go TOGETHER: `--pinnedpubkey` on its own still fails a
+# self-signed certificate with `SSL certificate problem: self-signed
+# certificate (18)`, because curl validates the chain before it ever looks at the
+# pin. The console's one-liner prints both flags. With a real-CA certificate
+# neither appears. The agent then pins the
 # certificate fingerprint INSIDE the enrollment string (#12). The token travels in
 # an environment variable, never a URL: it is single-use and expires in an hour,
 # which is what makes a shell-history exposure bounded.
@@ -40,13 +44,25 @@
 #   NODE_NAME           this host's stable fleet name, default: its hostname
 #   QUASAR_HOME_ROOT    managed-home root, default /var/lib/quasar/homes
 #   QUASAR_RENDER_NODE  render node to use, default: the detected one
+#   QUASAR_PROJECT      compose project name, default quasar-agent. Change it
+#                       (with QUASAR_DIR) only to run a SECOND, separate agent
+#                       stack on one machine; the volumes are project-scoped, so
+#                       a new name is a new agent identity.
+#   QUASAR_RESET_IDENTITY=1   clear this host's saved agent identity (the
+#                       project's quasar-agent-data volume, which holds the node
+#                       secret) before starting, so it enrolls from scratch. Same
+#                       as the --reset-identity sub-command. Only needed when the
+#                       saved secret must go: a machine enrolled to a DIFFERENT
+#                       control plane re-enrolls on its own (#199), because the
+#                       agent falls back to this enrollment token once the old
+#                       control plane's secret is refused.
 #   QUASAR_ENROLL_DRY_RUN=1   print the plan; write and start nothing
 #   QUASAR_ENROLL_APPARMOR_PERSIST=1  also install the AppArmor profile into
 #                       /etc/apparmor.d so it survives a reboot; default is
 #                       load-now plus the copy beside the compose files
 #
 # Sub-commands (argv): --print-compose, --print-nvidia-overlay,
-# --print-apparmor-profile, --help.
+# --print-apparmor-profile, --reset-identity, --help.
 #
 # The compose text below is the node-agent service from deploy/docker-compose.yml
 # with the local-stack coupling removed (depends_on, CONTROL_PLANE_URL,
@@ -63,7 +79,13 @@ DIR="${QUASAR_DIR:-/opt/quasar-agent}"
 ROOT="${QUASAR_ENROLL_ROOT:-}"          # test seam: fake /proc,/sys,/dev,/etc root
 TAIL_SECS="${QUASAR_ENROLL_TAIL_SECS:-90}"
 DRY="${QUASAR_ENROLL_DRY_RUN:-0}"
-PROJECT="quasar-agent"
+# The compose project name, and with it the names of the project's volumes. The
+# default is what every install before #199 used and must not move: changing it
+# on an enrolled host orphans that host's agent identity volume.
+PROJECT="${QUASAR_PROJECT:-quasar-agent}"
+# Where the node secret lives. Compose names a project volume <project>_<volume>.
+IDENTITY_VOLUME="${PROJECT}_quasar-agent-data"
+RESET_IDENTITY="${QUASAR_RESET_IDENTITY:-0}"
 
 # ── rendering ────────────────────────────────────────────────────────────────
 # Two styles. `plain` is the log form: what goes into bug reports, CI output and
@@ -460,8 +482,11 @@ profile quasar-app flags=(attach_disconnected,mediate_deleted) {
 PROFILE
 }
 
+# The leading comment block, minus the shebang and the internal note after the
+# sub-command list. The range is checked by deploy/test-enroll-host.sh, which
+# asserts --help still carries the knobs it documents.
 usage() {
-  sed -n '2,47p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || true
+  sed -n '2,65p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || true
 }
 
 # ── sub-commands ─────────────────────────────────────────────────────────────
@@ -470,6 +495,10 @@ case "${1:-}" in
   --print-nvidia-overlay) nvidia_yaml; exit 0 ;;
   --print-apparmor-profile) apparmor_profile; exit 0 ;;
   --help|-h)              usage; exit 0 ;;
+  # Not a sub-command: it sets a flag and the install continues. Kept as argv as
+  # well as QUASAR_RESET_IDENTITY so it reads the same whether the script was
+  # downloaded or is being piped from curl (`… | sh -s -- --reset-identity`).
+  --reset-identity)       RESET_IDENTITY=1 ;;
   "") ;;
   *) usage_error "unknown argument '$1' (try --help)" ;;
 esac
@@ -784,6 +813,32 @@ compose() {
   $SUDO docker compose --project-directory "$DIR" --project-name "$PROJECT" \
     $(printf '%s' "$compose_files" | tr ':' '\n' | sed "s#^#-f $DIR/#" | tr '\n' ' ') "$@"
 }
+# #199: the agent's identity — the node secret minted by whichever control plane
+# enrolled this machine last — lives in a named volume that outlives every re-run
+# of this script, and the agent presents it in preference to the token in the
+# .env. A machine that was enrolled to a DIFFERENT control plane therefore
+# arrives here holding a credential the new one has never seen. That case now
+# fixes itself: the control plane answers host_not_found, and the agent registers
+# again with this enrollment token. Clearing the volume is for when the saved
+# identity must go regardless — a host being repurposed, or a stuck enrollment
+# being retried from a known-clean state.
+if $SUDO docker volume inspect "$IDENTITY_VOLUME" >/dev/null 2>&1; then
+  if [ "$RESET_IDENTITY" = 1 ]; then
+    # The container must be gone before the volume can be: a volume in use by a
+    # container cannot be removed, and the agent is recreated by the `up` below.
+    compose rm -sf quasar-node-agent >/dev/null 2>&1 || true
+    if $SUDO docker volume rm "$IDENTITY_VOLUME" >/dev/null 2>&1; then
+      ok "cleared this host's saved agent identity (volume $IDENTITY_VOLUME); it enrolls from scratch"
+    else
+      host_error "could not remove the agent identity volume $IDENTITY_VOLUME — something still holds it. Stop it ('docker compose --project-directory $DIR down') and re-run."
+    fi
+  else
+    dim "a saved agent identity is already here (volume $IDENTITY_VOLUME): the agent offers that node secret first and re-enrolls with this token if this control plane does not know it. QUASAR_RESET_IDENTITY=1 clears it instead."
+  fi
+elif [ "$RESET_IDENTITY" = 1 ]; then
+  ok "no saved agent identity to clear (volume $IDENTITY_VOLUME does not exist)"
+fi
+
 # The updater first: the agent reads updater presence once at boot, so an agent
 # started ahead of it registers updater_present=false and stays that way. Never
 # fatal and never --wait (it declares no healthcheck) — a host with a live agent
@@ -860,6 +915,13 @@ while :; do
     verdict=pin_mismatch; break
   elif printf '%s' "$logs" | grep -q 'boot-enrollment-unconfigured'; then
     verdict=unconfigured; break
+  elif printf '%s' "$logs" | grep -q 'cp-register-stale-identity-unresolvable'; then
+    # #199. Only reachable when the agent never saw an enrollment token, so the
+    # saved secret is all it has — it cannot recover on its own. Deliberately NOT
+    # matched on the recoverable 'cp-register-stale-identity', which is the agent
+    # about to re-enroll with the token from the .env; breaking on that would
+    # abort the wait one attempt before it succeeds.
+    verdict=stale_identity; break
   elif printf '%s' "$logs" | grep -q 'CONTROL_PLANE_URL is required'; then
     # An agent that never learned QUASAR_ENROLLMENT: the local image predates #12.
     verdict=stale_image; break
@@ -886,6 +948,8 @@ case "$verdict" in
     host_error "the certificate the control plane presented does not match the pin in the enrollment string (cp-tls-pin-mismatch). Mint a fresh string from the control plane's own page, or set CONTROL_PLANE_FINGERPRINT in $DIR/.env to the fingerprint= line from its startup log." ;;
   unconfigured)
     host_error "the agent started without an enrollment (boot-enrollment-unconfigured) — $DIR/.env did not reach it. Check 'docker compose --project-directory $DIR config'." ;;
+  stale_identity)
+    host_error "this host still holds a node secret from an earlier enrollment and the control plane does not recognise it, and the agent has no enrollment token to fall back on. Re-run this command with QUASAR_RESET_IDENTITY=1 to clear the saved identity (volume $IDENTITY_VOLUME) and enroll from scratch." ;;
   stale_image)
     host_error "the agent image on this host ($image) predates the enrollment string: it asks for CONTROL_PLANE_URL instead of reading QUASAR_ENROLLMENT. Give it a current image — QUASAR_AGENT_IMAGE=<published reference>, or build/copy quasar-node-agent:latest from the control plane's tree — then re-run this command." ;;
   exited)
