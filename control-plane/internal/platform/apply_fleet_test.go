@@ -91,6 +91,13 @@ type fakeFleetStore struct {
 	remainingLog []int
 	// The run's persisted record of what it found (migration 0076).
 	cordons_ []HostCordon
+	// Whether each run's scheduling cleanup was proven done (migration 0084),
+	// and faults to inject into recording it and into confirming a host's
+	// scheduling state (#176).
+	cordonsRestored map[string]bool
+	markRestoredErr error
+	hostStatusErr   error
+	claims          int
 	// Agent connectivity as the registry would report it, keyed by host id.
 	// Absent = connected: the fake's default host is a live one.
 	disconnected map[string]bool
@@ -128,6 +135,9 @@ func (f *fakeFleetStore) Hosts(context.Context) ([]HostIdentity, error) {
 func (f *fakeFleetStore) HostStatus(_ context.Context, hostID string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.hostStatusErr != nil {
+		return "", f.hostStatusErr
+	}
 	for _, h := range f.hosts {
 		if h.HostID == hostID {
 			return h.Status, nil
@@ -147,6 +157,65 @@ func (f *fakeFleetStore) CordonedHosts(context.Context, string) ([]HostCordon, e
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]HostCordon(nil), f.cordons_...), nil
+}
+
+func (f *fakeFleetStore) MarkCordonsRestored(_ context.Context, runID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.markRestoredErr != nil {
+		return f.markRestoredErr
+	}
+	if f.cordonsRestored == nil {
+		f.cordonsRestored = map[string]bool{}
+	}
+	f.cordonsRestored[runID] = true
+	return nil
+}
+
+// ClaimUnrestoredCordons mirrors the real store's predicate: terminal, with
+// something recorded in cordoned_hosts, and never stamped. The claim is counted
+// so a test can tell a sweep that ran from one that refused.
+func (f *fakeFleetStore) ClaimUnrestoredCordons(_ context.Context, limit int) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.claims++
+	if !TerminalRunState(f.run.State) || len(f.cordons_) == 0 || f.cordonsRestored[f.run.ID] || limit <= 0 {
+		return nil, nil
+	}
+	return []string{f.run.ID}, nil
+}
+
+// pending is the recovery requirement as the sweep would find it, WITHOUT
+// claiming it — assertions must not consume the queue they are inspecting.
+func (f *fakeFleetStore) pending() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !TerminalRunState(f.run.State) || len(f.cordons_) == 0 || f.cordonsRestored[f.run.ID] {
+		return nil
+	}
+	return []string{f.run.ID}
+}
+
+// pendingIsOutstanding is pending() as a yes/no, for a fixture guard.
+func (f *fakeFleetStore) pendingIsOutstanding() bool { return len(f.pending()) == 1 }
+
+func (f *fakeFleetStore) setRunState(state string) {
+	f.mu.Lock()
+	f.run.State = state
+	f.mu.Unlock()
+}
+
+func (f *fakeFleetStore) claimCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.claims
+}
+
+// restoredCordons is whether the run's cleanup was recorded as proven done.
+func (f *fakeFleetStore) restoredCordons(runID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cordonsRestored[runID]
 }
 
 func (f *fakeFleetStore) FleetNonTerminalSessions(context.Context) (int, error) {
@@ -256,6 +325,39 @@ func (f *fakeFleetStore) setStatusLocked(hostID, status string) {
 			f.hosts[i].Status = status
 		}
 	}
+}
+
+// setHostStatus and hostStatus read/write the fake's idea of a host's
+// scheduling state, which is what a cordon actually changes — `scheduling()`
+// below returns the CALL LOG, and a leaked cordon is a state, not a call.
+func (f *fakeFleetStore) setHostStatus(hostID, status string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.setStatusLocked(hostID, status)
+}
+
+func (f *fakeFleetStore) hostStatus(hostID string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, h := range f.hosts {
+		if h.HostID == hostID {
+			return h.Status
+		}
+	}
+	return ""
+}
+
+// draining is every host currently out of scheduling.
+func (f *fakeFleetStore) draining() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0)
+	for _, h := range f.hosts {
+		if h.Status == "draining" {
+			out = append(out, h.HostID)
+		}
+	}
+	return out
 }
 
 func (f *fakeFleetStore) scheduling() (cordoned, uncordoned []string) {
@@ -1603,5 +1705,248 @@ func TestFleetSkipsAPreflightBlockedHost(t *testing.T) {
 	}
 	if skips := store.skips(); len(skips) != 1 || skips[0].Reason != ReasonPreflightBlocked {
 		t.Fatalf("skipped = %+v, want h1 with preflight_blocked", skips)
+	}
+}
+
+// #176. `finish` writes the terminal state and only THEN restores the cordons
+// the run imposed, so a restore that fails — or a process that dies in that
+// window — leaves a terminal run whose hosts are still `draining`. `ActiveRun`
+// selects only NON-terminal runs, so nothing on the adoption path would ever
+// look at that run again: the host stays out of scheduling with one ERROR line
+// as the whole record.
+//
+// The recovery requirement is now persisted, and the next start acts on it.
+
+// newRestoreFleet builds a runner over `store` whose Uncordon behaviour the test
+// controls, so a cleanup failure can be injected and then lifted — which is what
+// "restart in that window" looks like from this package.
+func newRestoreFleet(t *testing.T, store *fakeFleetStore, d *fakeDrivers, uncordonFails *bool) *FleetRunner {
+	t.Helper()
+	cordons := store.cordons()
+	realUncordon := cordons.Uncordon
+	cordons.Uncordon = func(ctx context.Context, hostID string) error {
+		if *uncordonFails {
+			// Fails AND leaves the host draining, which is the shape that
+			// matters: an uncordon that errors but worked is not a leak.
+			return errors.New("uncordon failed")
+		}
+		return realUncordon(ctx, hostID)
+	}
+	// The control-plane path, because that is the one that cordons the whole
+	// fleet; and a NON-migrating release, so the run does not also wait for a
+	// drain this test is not about.
+	f := NewFleetRunner(store, d, d, ManifestOrEdge{}, cordons,
+		fleetView("", hostTarget("h1", "gpu-01", "")), testLogger())
+	f.PollWait = time.Millisecond
+	f.Deadline = 2 * time.Second
+	f.AdoptSettle = time.Millisecond
+	f.InFlightSettle = 50 * time.Millisecond
+	f.SchemaVersion = fakeReleaseSchema
+	t.Cleanup(f.Close)
+	return f
+}
+
+// An uncordon that fails after the terminal write leaves a durable recovery
+// requirement, not a log line.
+func TestFleetRecordsUnfinishedSchedulingCleanup(t *testing.T) {
+	store := newFakeFleetStore(false)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	uncordonFails := true
+	f := newRestoreFleet(t, store, d, &uncordonFails)
+
+	run := runToEnd(t, f, store)
+
+	if !TerminalRunState(run.State) {
+		t.Fatalf("run state = %q, want terminal: the run itself succeeded", run.State)
+	}
+	if store.restoredCordons(testRunID) {
+		t.Fatal("cleanup was recorded as done while every uncordon was failing")
+	}
+	// And it is findable, which is the whole point: a terminal run is invisible
+	// to ActiveRun.
+	pending := store.pending()
+	if len(pending) != 1 || pending[0] != testRunID {
+		t.Fatalf("pending cleanup = %v, want just this run", pending)
+	}
+	if len(store.draining()) == 0 {
+		t.Fatal("the fixture is wrong: this test needs a host actually left draining")
+	}
+}
+
+// The restart. A fresh runner sweeps the requirement, puts the fleet back, and
+// clears it — without re-running anything the update already did.
+func TestFleetResumesSchedulingCleanupOnTheNextStart(t *testing.T) {
+	store := newFakeFleetStore(false)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	uncordonFails := true
+	f := newRestoreFleet(t, store, d, &uncordonFails)
+	runToEnd(t, f, store)
+	stepsBefore := len(d.steps())
+
+	// The next control-plane start, with whatever broke the uncordon now fixed.
+	uncordonFails = false
+	f2 := newRestoreFleet(t, store, d, &uncordonFails)
+	f2.ResumeCordonRestores(context.Background())
+
+	if !store.restoredCordons(testRunID) {
+		t.Fatal("the resumed sweep did not clear the recovery requirement")
+	}
+	if left := store.draining(); len(left) != 0 {
+		t.Fatalf("still draining = %v, want the fleet back in scheduling", left)
+	}
+	if pending := store.pending(); len(pending) != 0 {
+		t.Fatalf("pending cleanup = %v, want none once it is settled", pending)
+	}
+	// Cleanup is cleanup. It must not re-drive the update itself.
+	if got := len(d.steps()); got != stepsBefore {
+		t.Fatalf("targets reached = %d, want the %d from the run itself", got, stepsBefore)
+	}
+}
+
+// An admin's own cordon is not this run's to lift, on the resumed path exactly as
+// on the ordinary one (#170's rule, re-pinned here because the sweep is a second
+// caller of it).
+func TestFleetResumedCleanupPutsBackAnAdminCordonRatherThanLiftingIt(t *testing.T) {
+	store := newFakeFleetStore(false)
+	// h2 was the operator's before the run ever started.
+	store.setHostStatus("h2", "draining")
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	uncordonFails := true
+	f := newRestoreFleet(t, store, d, &uncordonFails)
+	runToEnd(t, f, store)
+
+	uncordonFails = false
+	newRestoreFleet(t, store, d, &uncordonFails).ResumeCordonRestores(context.Background())
+
+	if !store.restoredCordons(testRunID) {
+		t.Fatal("the resumed sweep did not settle")
+	}
+	if got := store.hostStatus("h2"); got != "draining" {
+		t.Fatalf("h2 status = %q, want the admin's own cordon left alone", got)
+	}
+	if got := store.hostStatus("h1"); got != "online" {
+		t.Fatalf("h1 status = %q, want the run's own cordon lifted", got)
+	}
+}
+
+// A failure that persists stays a requirement rather than being swallowed, and
+// the sweep does not spin on it: one pass per start.
+func TestFleetResumedCleanupThatStillFailsStaysARequirement(t *testing.T) {
+	store := newFakeFleetStore(false)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	uncordonFails := true
+	f := newRestoreFleet(t, store, d, &uncordonFails)
+	runToEnd(t, f, store)
+
+	newRestoreFleet(t, store, d, &uncordonFails).ResumeCordonRestores(context.Background())
+
+	if store.restoredCordons(testRunID) {
+		t.Fatal("a cleanup that never succeeded was recorded as done")
+	}
+	if pending := store.pending(); len(pending) != 1 {
+		t.Fatalf("pending cleanup = %v, want it still outstanding for the next start", pending)
+	}
+}
+
+// The work is done even when recording it is not, so the next start re-runs an
+// idempotent restore rather than leaving a host cordoned.
+func TestFleetTreatsAnUnrecordedRestoreAsStillOutstanding(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.markRestoredErr = errors.New("mark failed")
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	uncordonFails := false
+	f := newRestoreFleet(t, store, d, &uncordonFails)
+
+	runToEnd(t, f, store)
+
+	if left := store.draining(); len(left) != 0 {
+		t.Fatalf("still draining = %v, want the restore itself to have worked", left)
+	}
+	if pending := store.pending(); len(pending) != 1 {
+		t.Fatalf("pending cleanup = %v, want the unrecorded restore re-checked next start", pending)
+	}
+}
+
+// The sweep replays a claim about a moment that has passed — "this host was not
+// cordoned when I found it" — so it must not run against a fleet a LIVE run has
+// deliberately cordoned, or it puts hosts back into scheduling mid-update
+// (#176 review, security finding).
+func TestFleetDoesNotSweepWhileAFleetRunIsActive(t *testing.T) {
+	store := newFakeFleetStore(false)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	uncordonFails := true
+	f := newRestoreFleet(t, store, d, &uncordonFails)
+	runToEnd(t, f, store)
+	if !store.pendingIsOutstanding() {
+		t.Fatal("the fixture is wrong: this test needs an outstanding requirement")
+	}
+
+	// A new run is in flight on the next start.
+	store.setRunState(RunRunning)
+	uncordonFails = false
+	claimsBefore := store.claimCount()
+	newRestoreFleet(t, store, d, &uncordonFails).ResumeCordonRestores(context.Background())
+
+	if store.claimCount() != claimsBefore {
+		t.Fatal("the sweep claimed work while a fleet run was active")
+	}
+	if store.restoredCordons(testRunID) {
+		t.Fatal("the sweep settled an old run's cordons underneath a live one")
+	}
+}
+
+// A `Cordon` that fails after taking effect, and a host deleted since the run
+// recorded it, are both settled — not requirements retried on every start for
+// the rest of the instance's life (#176 review).
+func TestFleetSettlesAnAdminCordonThatIsAlreadyInPlace(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.setHostStatus("h2", "draining") // h2 is the operator's
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	cordons := store.cordons()
+	realCordon := cordons.Cordon
+	cordons.Cordon = func(ctx context.Context, hostID string) error {
+		if hostID == "h2" {
+			// Takes effect, then loses the answer.
+			_ = realCordon(ctx, hostID)
+			return errors.New("cordon request failed after it applied")
+		}
+		return realCordon(ctx, hostID)
+	}
+	f := NewFleetRunner(store, d, d, ManifestOrEdge{}, cordons,
+		fleetView("", hostTarget("h1", "gpu-01", "")), testLogger())
+	f.PollWait = time.Millisecond
+	f.Deadline = 2 * time.Second
+	f.AdoptSettle = time.Millisecond
+	f.InFlightSettle = 50 * time.Millisecond
+	f.SchemaVersion = fakeReleaseSchema
+	t.Cleanup(f.Close)
+
+	runToEnd(t, f, store)
+
+	if !store.restoredCordons(testRunID) {
+		t.Fatal("a cordon that is demonstrably in place left an undischargeable requirement")
+	}
+	if got := store.hostStatus("h2"); got != "draining" {
+		t.Fatalf("h2 status = %q, want the admin's own cordon in place", got)
+	}
+}
+
+// A status read that fails is "could not tell", and could-not-tell is not
+// restored — the branch the recovery contract turns on, and the fake could not
+// reach it before (#176 review, testing finding).
+func TestFleetDoesNotSettleWhenAHostStatusCannotBeRead(t *testing.T) {
+	store := newFakeFleetStore(false)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	uncordonFails := false
+	f := newRestoreFleet(t, store, d, &uncordonFails)
+	store.hostStatusErr = errors.New("status read failed")
+
+	runToEnd(t, f, store)
+
+	if store.restoredCordons(testRunID) {
+		t.Fatal("cleanup was recorded as done although no host status could be confirmed")
+	}
+	if pending := store.pending(); len(pending) != 1 {
+		t.Fatalf("pending cleanup = %v, want the unconfirmed run outstanding", pending)
 	}
 }

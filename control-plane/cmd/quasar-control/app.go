@@ -1058,6 +1058,17 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// what still correlates the agent's release_state. A fleet run is re-adopted
 	// the same way — including after the restart its own first target caused.
 	applyRunner.Adopt(context.Background())
+	// A run that already ENDED can still owe the fleet its scheduling back: the
+	// terminal state is written before the cordons are lifted, so a failure — or
+	// a death — in that window leaves hosts `draining` with nothing non-terminal
+	// for Adopt to find. Bounded, idempotent, and once per start (#176).
+	//
+	// BEFORE Adopt, and it refuses to run while a fleet run is active. An old
+	// run's record is a claim about a moment that has passed, so replaying it
+	// against a fleet a live run has deliberately cordoned would put hosts back
+	// into scheduling mid-update. Here, nothing is active in the database, no run
+	// has been started by this process, and the API is not serving yet.
+	fleetRunner.ResumeCordonRestores(context.Background())
 	fleetRunner.Adopt(context.Background())
 
 	// Unattended automatic apply (#122). Constructed here because it needs the

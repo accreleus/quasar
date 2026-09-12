@@ -49,6 +49,8 @@ type fleetStore interface {
 	HostStatus(ctx context.Context, hostID string) (string, error)
 	SetCordonedHosts(ctx context.Context, runID string, states []HostCordon) error
 	CordonedHosts(ctx context.Context, runID string) ([]HostCordon, error)
+	MarkCordonsRestored(ctx context.Context, runID string) error
+	ClaimUnrestoredCordons(ctx context.Context, limit int) ([]string, error)
 	FleetNonTerminalSessions(ctx context.Context) (int, error)
 	FleetInFlightSessions(ctx context.Context) (int, error)
 	CreateHostAttempt(ctx context.Context, in NewHostAttempt) (Attempt, error)
@@ -737,28 +739,124 @@ func (f *FleetRunner) recordAndCordon(ctx context.Context, runID string, states 
 	}
 }
 
-// restoreCordons puts every host back to the scheduling state the run found.
-// Runs on every terminal path, including a failed one: a fleet left draining by
-// a failed run would silently drop out of scheduling entirely.
-func (f *FleetRunner) restoreCordons(runID string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// MaxCordonRestoreSweep bounds ResumeCordonRestores. A boot sweep, not a backlog
+// drain: a run that keeps failing to settle is retried on the NEXT boot rather
+// than in a loop on this one.
+const MaxCordonRestoreSweep = 20
+
+// CordonRestoreSweepBudget bounds the whole sweep, not each run in it. Startup
+// calls it synchronously, so an unreachable scheduling backend must not be able
+// to hold the control plane down for the sum of every run's own timeout.
+const CordonRestoreSweepBudget = 60 * time.Second
+
+// ResumeCordonRestores finishes the scheduling cleanup of runs that ended
+// without it. `finish` writes the terminal state before it restores cordons, so
+// a restore that failed — or a process that died in that window — leaves a
+// terminal run whose hosts are still `draining`, and `ActiveRun` selects only
+// non-terminal runs, so nothing else on this path would ever look at it again
+// (#176). Idempotent: a run whose hosts are already back settles on the first
+// pass and is stamped.
+//
+// IT REFUSES TO RUN WHILE A FLEET RUN IS ACTIVE, and it must be called BEFORE
+// Adopt. An old run's record says "this host was not cordoned when I found it",
+// which is a claim about a moment that has passed: replaying it against a fleet
+// a LIVE run has deliberately cordoned would put hosts back into scheduling in
+// the middle of an update. Ordering plus the refusal is what closes that at
+// startup — no run is active in the database and none has been started by this
+// process, and the API is not serving yet, so no new run can appear underneath.
+//
+// It does NOT close the case where an ADMIN cordoned the host after the failed
+// run: that record still reads as the run's to lift, because a cordon carries no
+// owner. See #183.
+func (f *FleetRunner) ResumeCordonRestores(parent context.Context) {
+	ctx, cancel := context.WithTimeout(parent, CordonRestoreSweepBudget)
+	defer cancel()
+
+	active, err := f.store.ActiveRun(ctx)
+	if err != nil {
+		f.log.Error("fleet apply: could not check for an active run before scheduling cleanup", "err", err)
+		return
+	}
+	if active != nil {
+		f.log.Info("fleet apply: deferring unfinished scheduling cleanup while a fleet run is active",
+			"run_id", active.ID, "token", "cordon-restore-deferred")
+		return
+	}
+
+	ids, err := f.store.ClaimUnrestoredCordons(ctx, MaxCordonRestoreSweep)
+	if err != nil {
+		f.log.Error("fleet apply: could not look for unfinished scheduling cleanup", "err", err)
+		return
+	}
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			f.log.Warn("fleet apply: the scheduling-cleanup sweep ran out of time; the rest wait for the next start",
+				"token", "cordon-restore-budget-spent")
+			return
+		}
+		f.log.Warn("fleet apply: resuming the scheduling cleanup of a run that finished without it",
+			"run_id", id, "token", "cordon-restore-resumed")
+		f.settleCordons(ctx, id)
+	}
+}
+
+// settleCordons restores what a run cordoned and RECORDS whether that worked.
+// The unfinished case is a recovery requirement rather than a log line: the
+// marker stays unset, and the next start's ResumeCordonRestores retries it (#176).
+func (f *FleetRunner) settleCordons(parent context.Context, runID string) {
+	if !f.restoreCordons(parent, runID) {
+		f.log.Error("fleet apply: this run's scheduling cleanup is UNFINISHED; it will be retried on the next control-plane start",
+			"run_id", runID, "token", "cordon-restore-unfinished")
+		return
+	}
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+	if err := f.store.MarkCordonsRestored(ctx, runID); err != nil {
+		// The work is done; only the record of it is missing, so the next start
+		// re-does an idempotent restore rather than leaving a host cordoned.
+		f.log.Error("fleet apply: scheduling was restored but recording it failed; the next start will re-check",
+			"run_id", runID, "err", err)
+	}
+}
+
+// restoreCordons puts back what the run changed. It reports whether EVERY change
+// was proven undone — a false answer is what settleCordons turns into a durable
+// recovery requirement, so "could not tell" counts as not restored (#176).
+func (f *FleetRunner) restoreCordons(parent context.Context, runID string) bool {
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
 	states, err := f.store.CordonedHosts(ctx, runID)
 	if err != nil {
 		f.log.Error("fleet apply: could not read what to restore; hosts may be left out of scheduling",
 			"run_id", runID, "err", err)
-		return
+		return false
 	}
+	restored := true
 	for _, st := range states {
 		if st.WasCordoned {
 			if err := f.cordons.Cordon(ctx, st.HostID); err != nil {
 				f.log.Warn("fleet apply: could not restore an admin cordon", "host_id", st.HostID, "err", err)
+				// Confirm rather than conclude, the same way the uncordon half
+				// does below: a request can fail after it took effect, and a
+				// host can have been deleted since the run recorded it. Reading
+				// the error as final would leave a requirement that can never be
+				// discharged, retried on every start for the rest of the
+				// instance's life.
+				switch status, serr := f.store.HostStatus(ctx, st.HostID); {
+				case errors.Is(serr, ErrHostNotFound):
+					// Gone. There is no cordon left to put back.
+				case serr == nil && status == "draining":
+					// The cordon is in place; only the answer was lost.
+				default:
+					restored = false
+				}
 			}
 			continue
 		}
 		if err := f.cordons.Uncordon(ctx, st.HostID); err != nil {
 			// An offline host cannot be uncordoned; it returns online on its
-			// agent's reconnect.
+			// agent's reconnect. Not counted against `restored` — the check
+			// below decides that from the host's actual status.
 			f.log.Info("fleet apply: host not uncordoned (it will return online on its agent's reconnect)",
 				"host_id", st.HostID, "err", err)
 		}
@@ -775,11 +873,22 @@ func (f *FleetRunner) restoreCordons(runID string) {
 		// that success as "still out of scheduling" made every run with an absent
 		// host end on an ERROR telling the operator to fix something that was
 		// already fine (#170).
-		if status, err := f.store.HostStatus(ctx, st.HostID); err == nil && status == "draining" {
-			f.log.Error("fleet apply: a host this run cordoned is still out of scheduling; uncordon it by hand",
+		status, err := f.store.HostStatus(ctx, st.HostID)
+		switch {
+		case errors.Is(err, ErrHostNotFound):
+			// Deleted since the run cordoned it. There is nothing to put back,
+			// and nothing to retry over for the rest of this instance's life.
+		case err != nil:
+			f.log.Warn("fleet apply: could not confirm a host is back in scheduling",
+				"run_id", runID, "host_id", st.HostID, "err", err)
+			restored = false
+		case status == "draining":
+			f.log.Error("fleet apply: a host this run cordoned is still out of scheduling",
 				"run_id", runID, "host_id", st.HostID, "status", status)
+			restored = false
 		}
 	}
+	return restored
 }
 
 func (f *FleetRunner) failAttempt(attemptID, reason string) {
@@ -982,7 +1091,7 @@ func (f *FleetRunner) cancelRequested(ctx context.Context, runID string) bool {
 func (f *FleetRunner) finish(runID, state, errText string) {
 	// Every terminal transition comes through here, which is what makes the
 	// fleet cordon impossible to leak.
-	defer f.restoreCordons(runID)
+	defer f.settleCordons(context.Background(), runID)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := f.store.FinishRun(ctx, runID, state, errText); err != nil {
