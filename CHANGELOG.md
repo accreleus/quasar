@@ -146,6 +146,14 @@ own; the two do not move together, and that is deliberate.
   Contract: `quasar-protocol` "Audit-log names" amendment (additive, no migration).
 
 ### Fixed
+- **A failed update no longer promises a rollback nobody tried — or denies one that ran**
+  (#201). The failed-attempt panel on Fleet ▸ Releases carried one fixed line, *"the host is
+  still running whatever it had; nothing was rolled back for it automatically"*, written before
+  the updater restored anything itself. Since ADR 0004 that is false for every failure past the
+  health wait, and a timed-out host is running neither build reliably. The line is now derived
+  from the failure: a rejected or un-pulled release says the host is untouched, a container that
+  did not come up says the updater puts the previous build back itself, a timeout says to look at
+  the host — and a reason this build does not recognise says nothing at all.
 - **An update whose host never came back now says where the verdict is** (#201). When a host's
   new agent fails its health wait *and* the updater's automatic restore fails too — one squatted
   health port does both — no agent is left to relay the updater's result, so the attempt could
