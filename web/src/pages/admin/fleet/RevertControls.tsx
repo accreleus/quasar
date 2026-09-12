@@ -24,7 +24,7 @@ import { Modal } from "../../../components/Modal";
 import { registryCommands } from "../../../lib/platform/manualUpdate";
 import { useAdminAction } from "../../../lib/resource/action";
 import { useResource } from "../../../lib/resource/react";
-import { failureText, releaseLabel, shortDigest } from "./releasesCopy";
+import { failureText, hostAfterFailureText, releaseLabel, shortDigest } from "./releasesCopy";
 
 const AGENT = "node-agent";
 
@@ -198,6 +198,9 @@ export function FailedAttemptPanel({
   // which is what an operator needs when the stack is half-moved.
   const restore = agentPrevious(attempt);
   const recipe = restore ? registryCommands(null, restore) : [];
+  // What this failure actually left running, which is not one sentence: the
+  // updater restores the previous build itself past the health wait (#201).
+  const after = hostAfterFailureText(attempt.reason);
 
   return (
     <div className="note" data-testid={`failed-${attempt.host_id}`}>
@@ -213,9 +216,7 @@ export function FailedAttemptPanel({
           </Button>
         )}
       </div>
-      <p className="hint">
-        The host is still running whatever it had; nothing was rolled back for it automatically.
-      </p>
+      {after && <p className="hint">{after}</p>}
       {previous.length > 0 && (
         <p className="muted">
           Previously{" "}

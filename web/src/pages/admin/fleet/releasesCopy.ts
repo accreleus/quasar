@@ -133,6 +133,51 @@ export function failureText(reason: string | null | undefined): string {
   return FAILURE_TEXT[reason] ?? reason;
 }
 
+/** What a failure left running on the host. Keyed on the same closed
+ *  vocabulary: a failure past the health wait IS restored by the updater
+ *  itself (ADR 0004), so one fixed "nothing was rolled back" line was false for
+ *  half of them (#201). "" for a reason this build does not know — no sentence
+ *  beats a guess about what a host is running. */
+const UNTOUCHED = "Nothing was applied: this host is still running the build it had.";
+
+const RESTORE_ATTEMPTED =
+  "The new container did not come up. The updater puts the previous build back itself when " +
+  "that happens; the apply history shows an automatic revert when it worked.";
+
+const AFTER_FAILURE_TEXT: Record<string, string> = {
+  updater_absent: UNTOUCHED,
+  busy: UNTOUCHED,
+  invalid: UNTOUCHED,
+  namespace_rejected: UNTOUCHED,
+  digest_malformed: UNTOUCHED,
+  unsupported: UNTOUCHED,
+  signature_missing: UNTOUCHED,
+  signature_invalid: UNTOUCHED,
+  // Nothing was recreated, so the old container is still the running one.
+  pull_failed:
+    "The image never arrived, so nothing was recreated: this host is still running the build it had.",
+  recreate_failed: RESTORE_ATTEMPTED,
+  never_started: RESTORE_ATTEMPTED,
+  unhealthy: RESTORE_ATTEMPTED,
+  // One identifier, two histories: the control plane writes it for an apply it
+  // never handed over, and the agent emits it for one the updater had already
+  // accepted and then stopped answering for — by which point the old container
+  // can be gone (agent-api.md). Neither may be claimed.
+  updater_unreachable:
+    "The updater stopped answering, so how far this apply got cannot be read from here — " +
+    "check the host itself.",
+  // Both builds are unaccounted for: the apply expired with no verdict, which
+  // is what the attempt's own output explains.
+  timeout:
+    "This host's agent has not reported back, so what it is running now cannot be read from " +
+    "here — check the host itself.",
+};
+
+export function hostAfterFailureText(reason: string | null | undefined): string {
+  if (!reason) return "";
+  return AFTER_FAILURE_TEXT[reason] ?? "";
+}
+
 /** A digest, short enough to read and long enough to identify. */
 export function shortDigest(digest: string | null | undefined): string {
   if (!digest) return "unknown";

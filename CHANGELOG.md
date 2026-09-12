@@ -190,6 +190,27 @@ own; the two do not move together, and that is deliberate.
   the pin, because it replaces the identity the old pin belonged to and the new pin has just
   verified a real handshake. A reconnect still never re-learns a pin, and neither path follows
   a symlink at the pin path.
+- **A failed update no longer promises a rollback nobody tried — or denies one that ran**
+  (#201). The failed-attempt panel on Fleet ▸ Releases carried one fixed line, *"the host is
+  still running whatever it had; nothing was rolled back for it automatically"*, written before
+  the updater restored anything itself. Since ADR 0004 that is false for every failure past the
+  health wait, and a timed-out host is running neither build reliably. The line is now derived
+  from the failure: a rejected or un-pulled release says the host is untouched, a container that
+  did not come up says the updater puts the previous build back itself, a timeout or an updater
+  that stopped answering says what is running there can only be read on the host — and a reason
+  this build does not recognise says nothing at all.
+- **An update whose host never came back now says where the verdict is** (#201). When a host's
+  new agent fails its health wait *and* the updater's automatic restore fails too — one squatted
+  health port does both — no agent is left to relay the updater's result, so the attempt could
+  only expire on its deadline and the console reported `timeout` with an empty output for a
+  double failure the updater had already diagnosed on the host. A timed-out host attempt whose
+  agent is not connected now records what that shape means and the exact command to read the
+  updater's own verdict there, request id included. It distinguishes three cases, because the
+  attempt row does: one that expired before the release was ever sent says so rather than pointing
+  at a result that cannot exist; one that was acked and then went silent says the control plane
+  cannot tell whether the updater received it, gives the read anyway, and explains that a 404
+  there means it never did; and one that got further names the double failure as the likeliest —
+  not the only — reading. `docs/upgrading.md` carries the same recipe.
 - **A busy Docker host no longer makes the agent report its own container runtime as
   unresponsive** (#194). Every container-runtime command the agent runs had its output
   read only after the child exited, so a command printing more than one pipe buffer's
