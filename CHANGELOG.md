@@ -25,6 +25,21 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Updating is checked before it starts, put back when it fails, and honest about what it
+  skipped** (#185: #186–#190, closes #184; migration 0083; protocol amendment 9). Every target on
+  Fleet ▸ Releases now carries a **preflight**: is the updater reachable (with the three-way
+  "socket volume not mounted / updater not running / updater not answering" diagnosis), does it
+  see the stack directory, was the container started with the same compose files the updater will
+  recreate it with, do the release's images resolve at the registry, and — for a host — is the
+  agent's health port answered by that agent. A failing check makes the target `preflight_blocked`
+  with the fix named on the card; the fleet Update is refused while the control plane is blocked,
+  and a blocked host is skipped and named. A host's checks are its own readiness checks (Hosts
+  tab ▸ Updates). When a host's new agent container fails its health wait, the **updater restores
+  the previous digest itself**, the result carries the failed container's last log lines, and the
+  history shows an automatic revert beside the failed apply (ADR 0004); the restored agent adopts
+  the apply that replaced it and relays its final state, found on the live gate. A run that skipped a host
+  that was behind ends **`succeeded_partial`**, the banner says which host and why, and **Retry
+  skipped hosts** starts a plain fleet apply linked to the first run.
 - **Quasar can install its own updates** (#122, migration 0081). Settings ▸ Platform updates
   ▸ "Install updates automatically", off by default. When it is on, a detected release is
   applied without a click — the control plane first, then every eligible host, through

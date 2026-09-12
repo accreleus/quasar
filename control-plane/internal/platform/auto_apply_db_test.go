@@ -49,7 +49,7 @@ func TestUnattendedFailedReleaseIDsCountsOnlyUnattendedFailures(t *testing.T) {
 
 	// An ADMIN's run that failed on the other release. Not the schedule's doing,
 	// so it must not suppress anything.
-	manual, err := h.store.CreateRun(ctx, other.ID, false, nil)
+	manual, err := h.store.CreateRun(ctx, other.ID, false, nil, nil)
 	if err != nil {
 		t.Fatalf("create admin run: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestAnAdminsOwnRunClearsTheUnattendedSuppression(t *testing.T) {
 
 	// The admin then applies it themselves. created_at must be LATER, so the
 	// admin's run is the most recent one on this release.
-	manual, err := h.store.CreateRun(ctx, h.release.ID, false, nil)
+	manual, err := h.store.CreateRun(ctx, h.release.ID, false, nil, nil)
 	if err != nil {
 		t.Fatalf("create admin run: %v", err)
 	}
@@ -179,5 +179,30 @@ func TestAnUnattendedRunIsRefusedWhenItsReleaseWouldMigrate(t *testing.T) {
 	as, err := h.store.RunAttempts(ctx, run.ID)
 	if err == nil && len(as) != 0 {
 		t.Fatalf("attempts = %d, want none: the refusal precedes the control-plane attempt", len(as))
+	}
+}
+
+// A succeeded_partial unattended run suppresses nothing (amendment 9): the
+// host it passed over is picked up on the next pass, which is the whole point
+// of the state not being a failure.
+func TestAPartialUnattendedRunSuppressesNothing(t *testing.T) {
+	ctx := context.Background()
+	h := newFleetHarness(t, commitA, parkedDrivers{})
+	auto, err := h.store.CreateUnattendedRun(ctx, h.release.ID)
+	if err != nil {
+		t.Fatalf("create unattended run: %v", err)
+	}
+	if err := h.store.RecordSkip(ctx, auto.ID, RunSkip{HostID: h.hostID, NodeName: "gpu-01", Reason: ReasonHostOffline}); err != nil {
+		t.Fatalf("record skip: %v", err)
+	}
+	if err := h.store.FinishRun(ctx, auto.ID, RunSucceededPartial, ""); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	got, err := h.store.UnattendedFailedReleaseIDs(ctx)
+	if err != nil {
+		t.Fatalf("read suppression set: %v", err)
+	}
+	if got[h.release.ID] {
+		t.Error("a partial run is not a failure and must not suppress the release")
 	}
 }

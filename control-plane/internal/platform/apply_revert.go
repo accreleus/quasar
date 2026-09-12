@@ -303,10 +303,14 @@ func (h *ApplyHandler) revertInputs(ctx context.Context, view View, hostID strin
 // ─── store reads ────────────────────────────────────────────────────────────
 
 // LastSucceededAttempt is the row whose `previous_digests` a revert restores.
+// An auto_revert row is skipped: its previous digests are the release that just
+// failed, and offering to go back onto it is the opposite of a revert. Client
+// twin: RevertControls.tsx revertStates; both pinned by
+// TestRevertDerivationSkipsAutoRevert.
 func (s *Store) LastSucceededAttempt(ctx context.Context, hostID string) (Attempt, error) {
 	a, err := scanAttempt(s.pool.QueryRow(ctx, `
 		SELECT `+attemptColumns+attemptFrom+`
-		 WHERE a.host_id = $1::uuid AND a.state = 'succeeded'
+		 WHERE a.host_id = $1::uuid AND a.state = 'succeeded' AND a.kind <> 'auto_revert'
 		 ORDER BY a.created_at DESC, a.id DESC LIMIT 1
 	`, hostID))
 	if errors.Is(err, pgx.ErrNoRows) {

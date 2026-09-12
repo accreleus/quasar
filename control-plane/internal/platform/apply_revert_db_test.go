@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -179,5 +180,57 @@ func TestRevertToAnUnnameableBuildIsAllowedAndCarriesNoRelease(t *testing.T) {
 	}
 	if a := decodeAttempt(t, body); a.ReleaseID != nil {
 		t.Errorf("release_id = %v, want null when no release row pins the digest", *a.ReleaseID)
+	}
+}
+
+// Amendment 9: an auto_revert row is history, never a revert target. Its
+// previous digests are the release that just failed, so both the server's
+// derivation (LastSucceededAttempt) and the console's (revertStates) skip it —
+// this pins the server half; RevertControls.test.tsx pins the client half.
+func TestRevertDerivationSkipsAutoRevert(t *testing.T) {
+	h := newApplyHarness(t)
+	ctx := context.Background()
+	// The operator's last real move: old → new.
+	seedSucceeded(t, h, KindApply, digestNew, digestOld, &h.release.ID)
+	// Then an apply to a third digest that failed and was restored by the
+	// updater: the auto_revert row moved new ← bad.
+	digestBad := "sha256:" + strings.Repeat("c", 64)
+	prevNew := digestNew
+	failed, err := h.store.CreateHostAttempt(ctx, NewHostAttempt{Kind: KindApply, HostID: h.hostID,
+		Requested: []ComponentDigest{{Name: ComponentNodeAgent, Image: "ghcr.io/accreleus/quasar/quasar-node-agent", Digest: digestBad}},
+		Previous:  []PreviousDigest{{Name: ComponentNodeAgent, Digest: &prevNew}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.FailAttempt(ctx, failed.ID, ReasonRecreateFailed, "health-bind-failed"); err != nil {
+		t.Fatal(err)
+	}
+	row, err := h.store.CreateAutoRevertAttempt(ctx, NewAutoRevert{
+		Failed:    failed,
+		Requested: []ComponentDigest{{Name: ComponentNodeAgent, Image: "ghcr.io/accreleus/quasar/quasar-node-agent", Digest: digestNew}},
+		Previous:  []PreviousDigest{{Name: ComponentNodeAgent, Digest: &digestBad}},
+		Output:    "restored",
+	})
+	if err != nil {
+		t.Fatalf("auto_revert row: %v", err)
+	}
+	if row.Kind != KindAutoRevert || row.State != AttemptSucceeded || row.FinishedAt == nil {
+		t.Fatalf("row = %+v, want a terminal auto_revert", row)
+	}
+
+	last, err := h.store.LastSucceededAttempt(ctx, h.hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last.Kind != KindApply || last.PreviousDigests[0].Digest == nil || *last.PreviousDigests[0].Digest != digestOld {
+		t.Fatalf("revert target derived from %+v, want the operator's last apply (previous %s)", last, digestOld)
+	}
+	// And the endpoint agrees: Revert offers old, never bad.
+	code, body := h.post(t, h.revertURL(), h.adminToken, map[string]any{"force": true})
+	if code != http.StatusAccepted {
+		t.Fatalf("revert = %d (%s)", code, body)
+	}
+	if a := decodeAttempt(t, body); a.RequestedDigests[0].Digest != digestOld {
+		t.Fatalf("revert requested %s, want %s", a.RequestedDigests[0].Digest, digestOld)
 	}
 }

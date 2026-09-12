@@ -210,7 +210,39 @@ fn parsed(request_id: &str, state: &str, components: &[&str]) -> UpdaterResult {
         started_at: String::new(),
         updated_at: String::new(),
         finished_at: None,
+        restored: false,
     }
+}
+
+/// `restored` rides through the relay (agent-api.md, amendment 9): the control
+/// plane keys its auto_revert row off it. Omitted on the wire when false so an
+/// older control plane sees the shape it knows.
+#[test]
+fn restored_is_relayed_and_omitted_when_false() {
+    let mut res = parsed(
+        "11111111-1111-4111-8111-111111111111",
+        "failed",
+        &["node-agent"],
+    );
+    res.restored = true;
+    let msg = res.into_msg();
+    let json = serde_json::to_string(&msg).unwrap();
+    assert!(json.contains("\"restored\":true"), "{json}");
+
+    let res = parsed(
+        "11111111-1111-4111-8111-111111111111",
+        "failed",
+        &["node-agent"],
+    );
+    let json = serde_json::to_string(&res.into_msg()).unwrap();
+    assert!(!json.contains("restored"), "{json}");
+
+    // And the result file's field is read.
+    let file: UpdaterResult = serde_json::from_str(
+        r#"{"request_id":"x","state":"failed","reason":"unhealthy","restored":true}"#,
+    )
+    .unwrap();
+    assert!(file.restored);
 }
 
 #[tokio::test]
@@ -369,6 +401,43 @@ async fn re_emits_every_result_on_attach() {
     let (state, _, previous) = state_of(&rx.recv().await.unwrap());
     assert_eq!(state, "succeeded");
     assert_eq!(previous[0].digest.as_deref(), Some(PREV));
+}
+
+/// A restored agent (ADR 0004) connects while the updater is still verifying
+/// the restore, so the result it finds on attach is `verifying`. The agent that
+/// posted the request is gone; this one adopts it and relays the terminal state
+/// when the updater writes it, instead of re-emitting `verifying` once and
+/// leaving the attempt there for ever.
+#[tokio::test]
+async fn adopts_a_non_terminal_result_on_attach_and_relays_its_end() {
+    let fake = FakeUpdater::start();
+    fake.set_result("verifying", None);
+    std::fs::write(
+        fake.results.join(format!("{REQ}.json")),
+        fake.result.lock().unwrap().clone().unwrap(),
+    )
+    .unwrap();
+
+    let mgr = fake.mgr();
+    let (tx, mut rx) = mpsc::channel(32);
+    let _guard = mgr.attach_upstream(tx);
+    let (state, _, _) = state_of(&rx.recv().await.unwrap());
+    assert_eq!(state, "verifying");
+
+    // The updater finishes after the connect: the adopted poller must see it.
+    fake.set_result("failed", Some("recreate_failed"));
+    std::fs::write(
+        fake.results.join(format!("{REQ}.json")),
+        fake.result.lock().unwrap().clone().unwrap(),
+    )
+    .unwrap();
+    let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("the adopted apply's terminal state is relayed")
+        .unwrap();
+    let (state, reason, _) = state_of(&msg);
+    assert_eq!(state, "failed");
+    assert_eq!(reason.as_deref(), Some("recreate_failed"));
 }
 
 const OLD: Duration = Duration::from_secs(3 * 24 * 3600);

@@ -60,6 +60,14 @@ type PlanInputs struct {
 	// Passed through untouched: the notification surface is config, not a
 	// release decision.
 	ReleaseWebhook *WebhookStatus
+
+	// ControlPlanePreflight is what the collectors found about this control
+	// plane's own stack (preflight_collect.go); a host's facts ride on its
+	// HostIdentity. ImageFor is the instance-wide registry check for one
+	// release, a closure because it is evaluated for available[0] only, which
+	// is decided here; nil means no resolver is wired (unknown, never blocked).
+	ControlPlanePreflight PreflightFacts
+	ImageFor              func(r Release) *ImageFact
 }
 
 // PlanRelease computes the whole view.
@@ -78,6 +86,13 @@ func PlanRelease(in PlanInputs) View {
 		installMode:    in.ControlPlaneInstallMode,
 	}
 
+	var image *ImageFact
+	if in.ImageFor != nil && len(available) > 0 {
+		image = in.ImageFor(available[0])
+	}
+	cpFacts := in.ControlPlanePreflight
+	cpFacts.Image = image
+
 	v := View{
 		Channel:    channel,
 		SourceRepo: in.SourceRepo,
@@ -89,7 +104,7 @@ func PlanRelease(in PlanInputs) View {
 			Hosts:        hosts,
 		},
 		Available: available,
-		Targets:   targets(available, in.ControlPlane, hosts, open, fleet),
+		Targets:   targets(available, in.ControlPlane, hosts, open, fleet, cpFacts, image),
 		// Faults are read off the rows the channel SELECTS, which on beta are
 		// the stable channel's (rowChannel), and ordered the way `available`
 		// orders them on that channel.
@@ -310,24 +325,27 @@ func withDerivedIdentity(hosts []HostIdentity) []HostIdentity {
 
 // targets evaluates every target against available[0] and nothing else: this
 // surface carries no per-release eligibility matrix.
-func targets(available []Release, cp buildinfo.Identity, hosts []HostIdentity, open map[string]bool, fleet fleetState) []Target {
+func targets(available []Release, cp buildinfo.Identity, hosts []HostIdentity, open map[string]bool, fleet fleetState,
+	cpFacts PreflightFacts, image *ImageFact) []Target {
 	var newest *Release
 	if len(available) > 0 {
 		newest = &available[0]
 	}
 
 	out := make([]Target, 0, len(hosts)+1)
-	out = append(out, target(TargetControlPlane, nil, nil, controlPlaneReason(newest, cp, open[""], fleet)))
+	cpPre := PlanPreflight(TargetControlPlane, cpFacts)
+	out = append(out, target(TargetControlPlane, nil, nil, controlPlaneReason(newest, cp, open[""], fleet, cpPre), cpPre))
 	for i := range hosts {
 		h := hosts[i]
 		hostID, nodeName := h.HostID, h.NodeName
-		out = append(out, target(TargetHost, &hostID, &nodeName, hostReason(newest, cp, h, open[hostID], fleet)))
+		pre := PlanPreflight(TargetHost, HostPreflightFacts(h, image))
+		out = append(out, target(TargetHost, &hostID, &nodeName, hostReason(newest, cp, h, open[hostID], fleet, pre), pre))
 	}
 	return out
 }
 
-func target(kind string, hostID, nodeName *string, reason string) Target {
-	t := Target{Kind: kind, HostID: hostID, NodeName: nodeName}
+func target(kind string, hostID, nodeName *string, reason string, pre Preflight) Target {
+	t := Target{Kind: kind, HostID: hostID, NodeName: nodeName, Preflight: pre}
 	if reason == "" {
 		t.Eligible = true
 		return t
@@ -340,7 +358,7 @@ func target(kind string, hostID, nodeName *string, reason string) Target {
 // controlPlaneReason: "" means eligible. Only the reasons that apply to every
 // target kind can appear here; the four host-only ones describe an install this
 // process does not have.
-func controlPlaneReason(newest *Release, cp buildinfo.Identity, attemptOpen bool, fleet fleetState) string {
+func controlPlaneReason(newest *Release, cp buildinfo.Identity, attemptOpen bool, fleet fleetState, pre Preflight) string {
 	if newest == nil {
 		return ReasonNoRelease
 	}
@@ -367,6 +385,11 @@ func controlPlaneReason(newest *Release, cp buildinfo.Identity, attemptOpen bool
 	if *fleet.installMode == InstallSource {
 		return ReasonInstallModeSource
 	}
+	// A stack shape is durable, so it outranks the two transient reasons;
+	// `unknown` never lands here.
+	if pre.Blocked() {
+		return ReasonPreflightBlocked
+	}
 	// The two most transient facts on the list, so they come last (amendment 2).
 	if attemptOpen {
 		return ReasonAttemptInFlight
@@ -392,7 +415,7 @@ func edgeOlderThanInstalled(release Release, cp buildinfo.Identity) bool {
 // hostReason: "" means eligible. The contract fixes the precedence as the order
 // below, durable facts outranking transient ones: an offline source-built host
 // reports install_mode_source, because reconnecting would not change it.
-func hostReason(newest *Release, cp buildinfo.Identity, h HostIdentity, attemptOpen bool, fleet fleetState) string {
+func hostReason(newest *Release, cp buildinfo.Identity, h HostIdentity, attemptOpen bool, fleet fleetState, pre Preflight) string {
 	if newest == nil {
 		return ReasonNoRelease
 	}
@@ -430,7 +453,10 @@ func hostReason(newest *Release, cp buildinfo.Identity, h HostIdentity, attemptO
 	if cp.SourceCommit == nil || !commitsMatch(*cp.SourceCommit, newest.SourceCommit) {
 		return ReasonControlPlaneNotFirst
 	}
-	// attempt_in_flight (9) then run_active (10) — the end of amendment 2's
+	if pre.Blocked() {
+		return ReasonPreflightBlocked
+	}
+	// attempt_in_flight then run_active — the end of amendment 2's
 	// precedence, because they are the most transient facts on it.
 	if attemptOpen {
 		return ReasonAttemptInFlight

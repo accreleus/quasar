@@ -56,6 +56,9 @@ type ReleaseStateMsg struct {
 	StartedAt  string             `json:"started_at"`
 	UpdatedAt  string             `json:"updated_at"`
 	FinishedAt *string            `json:"finished_at"`
+	// The updater put the previous digests back itself (agent-api.md
+	// `restored`, amendment 9). Absent on an older agent.
+	Restored bool `json:"restored"`
 }
 
 // validateReleaseState bounds m in place. False ⇒ drop the whole message

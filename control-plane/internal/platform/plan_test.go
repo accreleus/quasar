@@ -722,3 +722,76 @@ func TestAvailableReleasesCarryWhetherTheyMigrate(t *testing.T) {
 		t.Error("a release level with the control plane's schema must be served migrates: false")
 	}
 }
+
+// Amendment 9: a blocked preflight is an eligibility reason, inserted after the
+// durable reasons and before the two transient ones; `unknown` never blocks.
+func TestPlanPreflightBlockedIsAnEligibilityReason(t *testing.T) {
+	newest := Release{ID: "r1", Channel: ChannelStable, SourceCommit: commitC,
+		BuiltAt: at(3), SchemaVersion: 74, Manifest: []byte(`{}`)}
+	blocked := json.RawMessage(`[{"id":"health_addr_bindable","status":"fail","summary":"127.0.0.1:9091 is answered by pid 4121","remediation":"free the port"}]`)
+	fine := json.RawMessage(`[{"id":"health_addr_bindable","status":"pass","summary":"ok","remediation":""}]`)
+	in := PlanInputs{
+		Channel:      ChannelStable,
+		ControlPlane: cp(commitC, 74), // already on the release, so hosts are not waiting on it
+		Hosts: []HostIdentity{
+			host("h1", "gpu-01", commitB, func(h *HostIdentity) { h.Readiness = blocked; h.AgentConnected = boolp(true) }),
+			host("h2", "gpu-02", commitB, func(h *HostIdentity) { h.Readiness = fine; h.AgentConnected = boolp(true) }),
+			host("h3", "gpu-03", commitB), // no readiness at all: unknown
+		},
+		Releases:                []Release{newest},
+		UpdaterPresent:          true,
+		ControlPlaneInstallMode: str(InstallRegistry),
+		ControlPlanePreflight: PreflightFacts{
+			Socket: &SocketState{true, true}, Self: &UpdaterSelfFacts{Version: "x", StackDir: "/s", ConfigFiles: []string{"a"}}},
+	}
+	v := PlanRelease(in)
+	if got := *v.Targets[1].Reason; got != ReasonPreflightBlocked {
+		t.Fatalf("blocked host reason = %q, want preflight_blocked", got)
+	}
+	if !v.Targets[1].Preflight.Blocked() || v.Targets[1].Preflight.Checks[4].ID != CheckHealthAddrBindable {
+		t.Fatalf("the blocked target must carry its preflight: %+v", v.Targets[1].Preflight)
+	}
+	if !v.Targets[2].Eligible {
+		t.Fatalf("a host whose checks pass is eligible, got %v", v.Targets[2].Reason)
+	}
+	if !v.Targets[3].Eligible || v.Targets[3].Preflight.State != PreflightUnknown {
+		t.Fatalf("unknown must never block: eligible=%v state=%s", v.Targets[3].Eligible, v.Targets[3].Preflight.State)
+	}
+
+	// Durable before transient: a blocked host with an open attempt still
+	// reads preflight_blocked, not attempt_in_flight.
+	withAttempt := in
+	withAttempt.OpenAttempts = []Attempt{{ID: "a1", Target: TargetHost, HostID: str("h1"), State: AttemptPulling}}
+	if got := *PlanRelease(withAttempt).Targets[1].Reason; got != ReasonPreflightBlocked {
+		t.Fatalf("blocked + in flight = %q, want preflight_blocked", got)
+	}
+	// But an offline host reads host_offline first: it is earlier on the list.
+	offline := in
+	offline.Hosts = []HostIdentity{host("h1", "gpu-01", commitB, func(h *HostIdentity) { h.Readiness = blocked; h.AgentConnected = boolp(false) })}
+	if got := *PlanRelease(offline).Targets[1].Reason; got != ReasonHostOffline {
+		t.Fatalf("offline + blocked = %q, want host_offline", got)
+	}
+
+	// The control plane: a socket volume that is not mounted blocks it, and
+	// with it the whole fleet (nothing moves before the control plane).
+	cpBlocked := in
+	cpBlocked.ControlPlane = cp(commitA, 74)
+	cpBlocked.ControlPlanePreflight = PreflightFacts{Socket: &SocketState{}}
+	v = PlanRelease(cpBlocked)
+	if got := targetReason(v, TargetControlPlane); got != ReasonPreflightBlocked {
+		t.Fatalf("control plane reason = %q, want preflight_blocked", got)
+	}
+	if got := *v.Targets[2].Reason; got != ReasonControlPlaneNotFirst {
+		t.Fatalf("host behind a blocked control plane = %q, want control_plane_not_first", got)
+	}
+	// An unresolvable image blocks every target at once.
+	noImage := in
+	noImage.ImageFor = func(Release) *ImageFact { return &ImageFact{Err: "ghcr.io answered 404"} }
+	v = PlanRelease(noImage)
+	if targetReason(v, TargetControlPlane) != ReasonUpToDate {
+		t.Fatalf("up_to_date outranks a blocked preflight on the control plane: %s", targetReason(v, TargetControlPlane))
+	}
+	if got := *v.Targets[2].Reason; got != ReasonPreflightBlocked {
+		t.Fatalf("host with an unresolvable image = %q, want preflight_blocked", got)
+	}
+}

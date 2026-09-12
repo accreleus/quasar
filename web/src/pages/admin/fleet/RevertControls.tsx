@@ -56,7 +56,10 @@ export function revertStates(attempts: PlatformApplyAttempt[]): Map<string, Reve
   for (const a of attempts) {
     if (a.target !== "host" || !a.host_id) continue;
     if (!newest.has(a.host_id)) newest.set(a.host_id, a);
-    if (a.state !== "succeeded" || out.has(a.host_id)) continue;
+    // An auto_revert's previous digests are the release that just failed;
+    // offering to go back onto it is the opposite of a revert. Server twin:
+    // apply_revert.go LastSucceededAttempt.
+    if (a.state !== "succeeded" || a.kind === "auto_revert" || out.has(a.host_id)) continue;
     const prev = agentPrevious(a);
     if (prev) out.set(a.host_id, { ...prev, failed: null });
   }

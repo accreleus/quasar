@@ -96,6 +96,12 @@ type HostIdentity struct {
 	// nil = unknown (no registry wired), and the column is trusted instead —
 	// the same seam `UncordonHost` and the per-host apply runner already use.
 	AgentConnected *bool `json:"-"`
+
+	// The host's last stored readiness report (hosts.readiness, raw) and when
+	// it changed: inputs to the preflight decision, not fields on the frozen
+	// identity shape, hence unserialized like AgentConnected.
+	Readiness           json.RawMessage `json:"-"`
+	ReadinessReportedAt *time.Time      `json:"-"`
 }
 
 // Known is `identity_known`: all four fields present. A host with any of them
@@ -133,6 +139,11 @@ const (
 	ReasonReleaseAboveControlPlane = "release_above_control_plane"
 	ReasonControlPlaneNotFirst     = "control_plane_not_first"
 
+	// Before the two transient reasons: a stack shape is a durable fact.
+	// Produced only by a preflight whose state is `blocked`; `unknown` never
+	// blocks (preflight.go).
+	ReasonPreflightBlocked = "preflight_blocked"
+
 	// Amendment 2 appends these two at the END of the order. They need apply
 	// state this build has no table for; #116 evaluates them.
 	ReasonAttemptInFlight = "attempt_in_flight"
@@ -146,6 +157,8 @@ type Target struct {
 	NodeName *string `json:"node_name"`
 	Eligible bool    `json:"eligible"`
 	Reason   *string `json:"reason"`
+	// Preflight: CONTEXT.md. Answered beside Eligible so the card can name the fix.
+	Preflight Preflight `json:"preflight"`
 }
 
 // The closed `PlatformReleaseFaultKind` vocabulary. A fault gates nothing; it

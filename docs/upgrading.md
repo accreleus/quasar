@@ -360,37 +360,32 @@ docker compose -f deploy/docker-compose.yml exec quasar-node-agent \
 ```
 
 That last command should print the compose project, the working directory, the
-`-f` files (**including every overlay you use**) and the namespace allowlist. If
-it fails with "no such file or directory" on the socket, the container you ran
-it in predates the volume: recreate it (step 3). If
-it instead reports that the stack directory is not visible in the container,
+`-f` files (**including every overlay you use**) and the namespace allowlist.
+The console checks the same things for you: Admin › Fleet › Releases shows each
+target's preflight checks, and a control plane or agent created before the
+socket volume existed reads as **Blocked** with the recreate command beside
+it, rather than as "no updater". If the command
+instead reports that the stack directory is not visible in the container,
 `QUASAR_STACK_DIR` is wrong or unset — the updater fails closed rather than
 guessing at a compose invocation and recreating the wrong project's containers.
 
 `deploy/redeploy.sh` seeds `QUASAR_STACK_DIR` for you, so a source install that
 deploys through it only needs step 1 and step 3.
 
-### Before applying a release that carries an agent from 0.2.6 or later
+### The agent's health port
 
 Since #152 the node agent **refuses to start** when it cannot bind its health
 address, instead of letting whatever already owns the port answer its health
-checks. The agent runs with host networking, so the default
-`127.0.0.1:9091` is shared with everything on the machine — Prometheus
-Pushgateway's default port among others. An older agent on the same host
-started anyway, so this surfaces for the first time when a release apply
-recreates the agent: the new container exits with `health-bind-failed` and the
-host shows as down. Check before you update:
-
-```bash
-ss -ltnp | grep ':9091 '      # anything listed that is not the node agent?
-```
-
-If something is there, set `QUASAR_HEALTH_ADDR=127.0.0.1:9191` (any free
-loopback port; the image's `HEALTHCHECK` follows it) or `QUASAR_HEALTH_ADDR=`
-(empty disables the endpoint) in `deploy/.env` first, then `docker compose up
--d quasar-node-agent`, then apply the release. If you only find out
-afterwards, the same edit plus `docker compose up -d quasar-node-agent`
-recovers the host; nothing about the apply needs redoing.
+checks. The agent runs with host networking, so the default `127.0.0.1:9091` is
+shared with everything on the machine. The host's readiness card (Hosts tab ›
+Updates › "agent health port free") and the Releases page's preflight checks
+both report who answers that address, so a squatter shows up before an update
+rather than as a host that is down after one; an update that does hit it is
+put back on the previous agent by the updater (ADR 0004), with the
+`health-bind-failed` line in the failure. To move the agent off a busy port,
+set `QUASAR_HEALTH_ADDR=127.0.0.1:9191` (any free loopback port; the image's
+`HEALTHCHECK` follows it) or `QUASAR_HEALTH_ADDR=` (empty disables the
+endpoint) in `deploy/.env`, then `docker compose up -d quasar-node-agent`.
 
 ### Updating the updater itself
 
@@ -505,10 +500,13 @@ the recreate does.
 
 Success is the host registering again on the release's commit, which is why a
 successful apply is reported by the *new* agent and not by the one that carried
-it out. A failed apply leaves the host on whatever it is running, records the
-previous digests, and shows the reason; there is no automatic rollback for a
-host. The Apply history section below the targets is the durable record, and
-`GET /v1/admin/platform/attempts` is the same data.
+it out. A failed apply records the previous digests and shows the reason. If
+the new agent container never came up — it exited, or never became healthy —
+the updater puts the previous digest back itself and the history shows
+"Reverted automatically" beside the failed apply, with the failed container's
+last log lines in the failure (ADR 0004). A pull that failed leaves the old
+agent running. The Apply history section below the targets is the durable
+record, and `GET /v1/admin/platform/attempts` is the same data.
 
 Every result carries the previous digests, so the manual restore is copy-paste:
 
@@ -570,8 +568,15 @@ What happens, step by step:
 4. **Each host follows, in the fleet list's order.** Each is cordoned, drained,
    updated and uncordoned exactly as a per-host Apply is (above).
 5. **The run stops at the first target that fails**, and says which. Targets
-   behind it are already updated; targets ahead of it were never started. There
-   is no partial state to interpret: the per-target list is the outcome.
+   behind it are already updated; targets ahead of it were never started. A host
+   whose new agent did not come up is put back on its previous digest by its
+   updater before the run stops there (ADR 0004).
+6. **A run that passed a host over ends "succeeded_partial", not "succeeded".**
+   The banner says which hosts were skipped and why, and **Retry skipped hosts**
+   starts a plain fleet apply of the same release once the cause is fixed —
+   the updated targets are already on it and are skipped, so only the hosts
+   left behind move. An automatic update picks them up on its next pass by
+   itself.
 
 **Force** applies to every target in the run, the control plane included, and
 the confirmation names how many hosts it will take sessions from. Without it
@@ -588,9 +593,23 @@ one it cannot determine, makes the target ineligible and refuses the run
 outright, since nothing moves before the control plane.
 
 **Hosts that cannot take the release are skipped, not failed** — an offline
-host, a source-built host, one with no updater. The run lists them under "Not
-updated" with the reason, and still finishes `succeeded`. "Nothing was
-eligible" is a legitimate outcome, not an error.
+host, a source-built host, one with no updater, one whose preflight checks
+fail. The run lists them under "Not updated" with the reason and finishes
+`succeeded_partial` (step 6). "Nothing was eligible" is a legitimate outcome,
+not an error; a fleet where every host is already on the release is a plain
+`succeeded`.
+
+**Every target is checked before Update is offered.** Beside each target the
+Releases page shows its preflight checks: the updater is reachable (and the
+console tells "socket volume not mounted — recreate the container" apart from
+"updater not running"), the updater sees the stack directory, the container was
+started with the same compose files the updater will recreate it with, the
+release's images resolve at the registry, and — for a host — its agent's health
+port is answered by that agent. A failing check makes the target **Blocked**
+with the fix named; Update is refused while the control plane is blocked, and a
+blocked host is skipped and named. A check that could not be evaluated (an agent
+that predates the checks) warns and never blocks. A host's own checks are on
+the Hosts tab under **Updates**.
 
 **Cancel stops the run before its next target and never interrupts one in
 flight.** A pull or a recreate that has already started finishes; interrupting

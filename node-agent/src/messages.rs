@@ -325,6 +325,11 @@ pub enum AgentMsg {
         started_at: String,
         updated_at: String,
         finished_at: Option<String>,
+        /// The updater put the previous digests back itself after this failure
+        /// (agent-api.md `restored`, additive). Omitted when false so an older
+        /// control plane sees the shape it knows.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        restored: bool,
     },
 }
 
