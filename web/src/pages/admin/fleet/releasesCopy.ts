@@ -150,7 +150,6 @@ const AFTER_FAILURE_TEXT: Record<string, string> = {
   invalid: UNTOUCHED,
   namespace_rejected: UNTOUCHED,
   digest_malformed: UNTOUCHED,
-  updater_unreachable: UNTOUCHED,
   unsupported: UNTOUCHED,
   signature_missing: UNTOUCHED,
   signature_invalid: UNTOUCHED,
@@ -160,6 +159,13 @@ const AFTER_FAILURE_TEXT: Record<string, string> = {
   recreate_failed: RESTORE_ATTEMPTED,
   never_started: RESTORE_ATTEMPTED,
   unhealthy: RESTORE_ATTEMPTED,
+  // One identifier, two histories: the control plane writes it for an apply it
+  // never handed over, and the agent emits it for one the updater had already
+  // accepted and then stopped answering for — by which point the old container
+  // can be gone (agent-api.md). Neither may be claimed.
+  updater_unreachable:
+    "The updater stopped answering, so how far this apply got cannot be read from here — " +
+    "check the host itself.",
   // Both builds are unaccounted for: the apply expired with no verdict, which
   // is what the attempt's own output explains.
   timeout:

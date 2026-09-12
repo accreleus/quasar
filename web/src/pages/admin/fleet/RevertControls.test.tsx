@@ -195,8 +195,7 @@ describe("hostAfterFailureText", () => {
   it("says what each failure left running, and nothing at all when it cannot know", () => {
     // Rejected before anything was pulled: the host never moved.
     for (const reason of ["updater_absent", "busy", "invalid", "namespace_rejected",
-      "digest_malformed", "updater_unreachable", "unsupported", "signature_missing",
-      "signature_invalid"]) {
+      "digest_malformed", "unsupported", "signature_missing", "signature_invalid"]) {
       expect(hostAfterFailureText(reason)).toMatch(/still running the build it had/);
     }
     // The pull failed, so the old container was never replaced.
@@ -207,6 +206,10 @@ describe("hostAfterFailureText", () => {
       expect(hostAfterFailureText(reason)).toMatch(/puts the previous build back itself/);
       expect(hostAfterFailureText(reason)).not.toMatch(/still running the build it had/);
     }
+    // The updater may have accepted the apply and then stopped answering, past
+    // the point the old container is gone, so neither build may be claimed.
+    expect(hostAfterFailureText("updater_unreachable")).toMatch(/how far this apply got/);
+    expect(hostAfterFailureText("updater_unreachable")).not.toMatch(/still running the build it had/);
     // A timeout knows neither: both builds are unaccounted for (#201).
     expect(hostAfterFailureText("timeout")).toMatch(/has not reported back/);
     expect(hostAfterFailureText("timeout")).not.toMatch(/still running the build it had/);

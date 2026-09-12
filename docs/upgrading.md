@@ -517,16 +517,23 @@ docker compose -f deploy/docker-compose.yml exec quasar-node-agent \
 ```
 
 **A host step that ends in `timeout`.** The verdict of a host apply is the
-updater's, and it comes home over that host's agent. So when the new container
-fails its health wait *and* the updater's automatic restore fails too — one
-squatted health port does both, since neither the new container nor the previous
-one can bind it — no agent ever comes back to relay it, and the attempt can only
-expire on its apply deadline (15 minutes). The console shows *"the update did
-not finish in time"*, while the real verdict — `recreate_failed`, the failed
-container's last log lines, the digests to put back — sits in the updater's
-result file on that host.
+updater's, and it comes home over that host's agent. So when no agent comes back
+to relay it, the attempt can only expire on its apply deadline (15 minutes) and
+the console shows *"the update did not finish in time"* — while the real verdict
+sits in the updater's result file on that host.
 
-The failed attempt spells that out and carries the request id. Ask the
+The commonest cause is that the new container failed its health wait *and* the
+updater's automatic restore failed too: one squatted health port does both,
+since neither the new container nor the previous one can bind it. It is not the
+only one. The updater's own step timeouts are longer than the apply deadline
+(`QUASAR_UPDATER_PULL_TIMEOUT_S` defaults to 3600, `..._RECREATE_TIMEOUT_S` to
+900), so a slow pull can still land — on the *new* build, with no restore
+involved. A host that lost power part-way through, an agent stopped by hand, and
+a host simply off the network all look the same from here too. If the host is
+back in Admin › Fleet › Hosts, the version shown there says which build it came
+back on.
+
+The failed attempt spells this out and carries the request id. Ask the
 **updater** container, not the node agent: the node agent is the one that is
 down.
 
@@ -536,11 +543,13 @@ docker compose -f deploy/docker-compose.yml exec quasar-updater \
   http://u/v1/results/<request-id>
 ```
 
-`docker compose logs quasar-updater` carries the same verdict. A host that has
-simply gone off the network looks identical from here, so check Admin › Fleet ›
-Hosts before assuming the double failure. A `timeout` whose attempt says the
-release was *never sent* is the simpler case: that host's agent was not
-connected when its turn came, and nothing on it was changed.
+`docker compose logs quasar-updater` carries the same verdict. Two attempts read
+differently: one that says the release was *never sent* is the simple case —
+that host's agent was not connected when its turn came, and nothing on it was
+changed. One that says the control plane **cannot tell** whether the updater
+received it is the ambiguous middle: the apply was acked and then nothing
+further arrived, so only the read above settles it. A 404 there means the
+request never reached that updater and nothing on the host was changed.
 
 ### Update Quasar from the console
 
