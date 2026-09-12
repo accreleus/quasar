@@ -199,8 +199,9 @@ export function FailedAttemptPanel({
   const restore = agentPrevious(attempt);
   const recipe = restore ? registryCommands(null, restore) : [];
   // What this failure actually left running, which is not one sentence: the
-  // updater restores the previous build itself past the health wait (#201).
-  const after = hostAfterFailureText(attempt.reason);
+  // updater restores the previous build itself past the health wait (#201), and
+  // for a revert that build is the one being reverted away from (#202).
+  const after = hostAfterFailureText(attempt.reason, attempt.kind);
 
   return (
     <div className="note" data-testid={`failed-${attempt.host_id}`}>

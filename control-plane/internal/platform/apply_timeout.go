@@ -137,11 +137,8 @@ func (r *Runner) timeoutOutput(attemptID string) string {
 	return joinApplyOutput(a.Output, hint)
 }
 
-// applyOutputLimit is `platform_apply_attempts.output`'s CHECK (migration 0075).
-// An oversized output is REFUSED, not truncated, and a refused FailAttempt
-// leaves the attempt non-terminal for ever — so the cap is enforced here too.
-const applyOutputLimit = 8192
-
+// applyOutputLimit is the column's CHECK; it lives beside the writers that must
+// respect it, in apply_store.go.
 const applyOutputElision = "\n\n[…]\n\n"
 
 // joinApplyOutput adds the hint under whatever the agent already relayed. The

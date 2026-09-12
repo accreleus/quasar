@@ -642,6 +642,50 @@ func TestApplyTimesOutWhenTheAgentNeverReconnects(t *testing.T) {
 	}
 }
 
+// A control-plane shutdown during the connect wait is a cancel, not a verdict
+// (#202). Services.Stop documents in-flight applies as cancelled rather than
+// failed, and a terminal `timeout` written here could never be resumed: Adopt
+// skips terminal rows, and in the unattended lane a failed release is
+// suppressed, so a double bounce blocked auto-apply until an admin applied by
+// hand.
+func TestShutdownDuringTheConnectWaitLeavesTheAttemptResumable(t *testing.T) {
+	a := queuedAttempt(true)
+	store := newFakeStore(a)
+	agent := &fakeAgent{ack: Ack{OK: true}}
+	deps := agent.deps()
+	deps.Connected = func(string) bool { return false }
+	r := testRunner(store, deps)
+	// Long enough that nothing but the shutdown can end the wait.
+	r.ConnectWait = time.Minute
+
+	r.Start(a)
+	waitFor(t, "the attempt to be waiting for its host's agent", func() bool {
+		return store.snapshot(a.ID).State == AttemptWaitingSessions
+	})
+	r.Close() // main.go's `defer svc.Stop()`
+
+	got := store.snapshot(a.ID)
+	if got.State != AttemptWaitingSessions {
+		t.Fatalf("state = %q, want waiting_sessions: a shutdown must leave the row for the next boot", got.State)
+	}
+	if got.Reason != nil {
+		t.Errorf("reason = %q, want none: nothing failed", *got.Reason)
+	}
+	if agent.sentCount() != 0 {
+		t.Error("release_apply was sent to a host with no agent connected")
+	}
+
+	// The next boot, with the host's agent back: the same row is re-adopted and
+	// sent, which is what the terminal write used to make impossible.
+	agent2 := &fakeAgent{ack: Ack{OK: true}}
+	deps2 := agent2.deps()
+	deps2.Connected = func(string) bool { return true }
+	r2 := testRunner(store, deps2)
+	defer r2.Close()
+	r2.Adopt(context.Background())
+	waitFor(t, "the re-adopted apply to be sent", func() bool { return agent2.sentCount() == 1 })
+}
+
 func strPtr(s string) *string { return &s }
 
 // #140: an attempt that belongs to a fleet run leaves the cordon to the run.
