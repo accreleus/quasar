@@ -153,14 +153,17 @@ own; the two do not move together, and that is deliberate.
   pasted. The new control plane had never seen the node, so it answered `host_not_found`
   forever — with a message ("use enrollment_token to enroll first") naming the very thing
   the operator had already done — and ten rejects inside a minute then added a `429` that
-  read like a second, unrelated fault. Three changes: the agent, refused with
+  read like a second, unrelated fault. Two changes: the agent, refused with
   `host_not_found` while holding a saved secret, registers **again with the configured
   enrollment token** (once per reject, so a control plane that is merely mid-restore still
-  gets the saved secret offered on the attempt after); with no token configured it names
-  the stale secret's path and the volume to clear instead of looping silently; and the
-  control plane no longer spends the enrollment-failure budget on a register refused for an
-  **unknown** node secret — guessing a *known* host's secret still spends it, which is what
-  that limiter is for. `deploy/enroll-host.sh` gains `--reset-identity` /
+  gets the saved secret offered on the attempt after); and the refusal now names the
+  credential it refused rather than the remedy the operator had already applied — with no
+  token configured the agent names the stale secret's path and how to reset it instead of
+  looping silently. The `429` needs no separate fix: a working re-enrollment now costs one
+  reject rather than ten. The enrollment-failure budget deliberately still counts this
+  refusal, because an unknown `node_name` answers `host_not_found` where a known one
+  answers `auth_failed`, and an uncounted miss would make `/agent/ws` a free node-name
+  enumeration oracle. `deploy/enroll-host.sh` gains `--reset-identity` /
   `QUASAR_RESET_IDENTITY=1` (clear the saved identity and enroll from scratch) and
   `QUASAR_PROJECT` (the compose project name, which namespaces the identity volume and so
   selects which saved identity an install uses), says when an identity volume is already
