@@ -637,7 +637,29 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 				"a live agent is already registered under this node name; stop it before re-enrolling, "+
 					"or enroll under a different node_name")
 		case errors.Is(err, ErrHostNotFound):
-			h.writeError(conn, "host_not_found", "node not enrolled; use enrollment_token to enroll first")
+			// Names the credential that was refused, not just the remedy: the old
+			// wording ("use enrollment_token to enroll first") is exactly what an
+			// operator re-enrolling a machine has already done, and it sent them
+			// looking at the token instead of at the saved secret that is quietly
+			// winning over it (#199). Nothing about the peer's deployment shape
+			// goes in here — this is a pre-auth surface and the control plane
+			// cannot know whether the caller even runs in a container; the agent's
+			// own log names the file and the volume, because it is the one that
+			// knows where they are.
+			//
+			// This still spends the enrollment-failure budget, deliberately. The
+			// two reconnect outcomes are distinguishable by code (unknown
+			// node_name → host_not_found, known → auth_failed), so an uncounted
+			// miss would turn this endpoint into a free node-name enumeration
+			// oracle — the leak agent-api.md §Auth exists to avoid. The operator's
+			// case does not need the exemption: the agent re-registers with its
+			// enrollment token on the very next attempt (#199), so a working
+			// re-enrollment costs one counted reject, not ten.
+			h.writeError(conn, "host_not_found",
+				"the node_secret presented belongs to no host enrolled on this control plane — it "+
+					"was minted by a different control plane, or this host was removed here. Enroll "+
+					"again with an enrollment token, clearing the agent's saved node secret "+
+					"(NODE_SECRET_PATH) first if it has no token configured.")
 		default:
 			h.writeError(conn, "internal_error", "registration failed")
 		}

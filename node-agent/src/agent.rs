@@ -280,6 +280,8 @@ pub async fn run(cfg: Config) {
     let grace = session_grace();
 
     let mut backoff = Duration::from_secs(1);
+    // #199: see `EnrollmentFallback` — one token attempt per stale-secret reject.
+    let mut enrollment_fallback = EnrollmentFallback::default();
     loop {
         match connect_and_run(
             &cfg,
@@ -288,6 +290,7 @@ pub async fn run(cfg: Config) {
             &image_mgr,
             &release_mgr,
             &mut sessions,
+            enrollment_fallback.take_for_attempt(),
         )
         .await
         {
@@ -338,6 +341,9 @@ pub async fn run(cfg: Config) {
                     token = "agent-connection-failed",
                     "agent connection failed: {e:#}"
                 );
+                // #199: a stale-secret reject makes the next attempt present the
+                // enrollment token instead.
+                enrollment_fallback.observe(&e);
                 // One line on the cycle that crosses the threshold: every retry
                 // already logs above, so this fires only when transient becomes
                 // sustained.
@@ -965,6 +971,9 @@ async fn connect_and_run(
     image_mgr: &Arc<ImageManager>,
     release_mgr: &Arc<ReleaseManager>,
     sessions: &mut HostSessions,
+    // #199: set for exactly one attempt, by a previous attempt this control plane
+    // refused with `host_not_found`. See `stale_identity`.
+    prefer_enrollment_token: bool,
 ) -> anyhow::Result<()> {
     let url = cfg.ws_url();
     info!(policy = ?cfg.transport, "connecting to {url}");
@@ -1048,7 +1057,9 @@ async fn connect_and_run(
     let _release_upstream_guard = release_mgr.attach_upstream(release_tx);
 
     // --- Step 1: send register ---
-    let auth = choose_auth(cfg)?;
+    let auth = choose_auth(cfg, prefer_enrollment_token)?;
+    // Which credential this attempt carries decides what a reject means (#199).
+    let presented_saved_secret = matches!(auth, Auth::Reconnect { .. });
     let register_msg = AgentMsg::Register {
         source_policy_versions: Some(serde_json::json!({"steam_preparation": 1})),
         node_name: cfg.node_name.clone(),
@@ -1072,6 +1083,8 @@ async fn connect_and_run(
             node_secret,
             heartbeat_interval_ms,
         } => {
+            // A returned node_secret IS the enrollment signal: reconnect never mints one.
+            let enrolled = node_secret.is_some();
             if let Some(secret) = node_secret {
                 persist_node_secret(&cfg.node_secret_path, &secret)?;
                 info!(
@@ -1083,11 +1096,16 @@ async fn connect_and_run(
             }
             // #12: the pin that just verified this connection outlives the enrollment
             // string, so the operator can delete QUASAR_ENROLLMENT from the environment.
-            persist_pin_if_new(cfg);
+            persist_pin_if_new(cfg, enrolled);
             (host_id, heartbeat_interval_ms)
         }
         ControlMsg::Error { code, message } => {
-            anyhow::bail!("control plane rejected register: {code}: {message}");
+            return Err(register_reject_error(
+                cfg,
+                &code,
+                &message,
+                presented_saved_secret,
+            ));
         }
         _ => {
             anyhow::bail!("unexpected message type before registered");
@@ -3241,7 +3259,29 @@ fn enrollment_reachable(cfg: &Config) -> Result<(), String> {
     }
 }
 
-fn choose_auth(cfg: &Config) -> anyhow::Result<Auth> {
+/// The configured enrollment token, whitespace-only folded to `None` — the same
+/// view [`enrollment_reachable`] takes, so "can register" and "what to present"
+/// cannot disagree.
+fn configured_enrollment_token(cfg: &Config) -> Option<&str> {
+    cfg.enrollment_token
+        .as_deref()
+        .filter(|t| !t.trim().is_empty())
+}
+
+/// Pick the credential for one `register`.
+///
+/// A saved node secret normally wins: it is the steady-state credential, and
+/// enrolling again rotates it (and is refused outright against a live agent, #96).
+/// `prefer_enrollment_token` is the single #199 exception — see [`stale_identity`].
+/// It is a *preference*, never a way to make a registerable agent unregisterable:
+/// with no token configured the saved secret is still used.
+fn choose_auth(cfg: &Config, prefer_enrollment_token: bool) -> anyhow::Result<Auth> {
+    let token = configured_enrollment_token(cfg).map(str::to_string);
+    if prefer_enrollment_token {
+        if let Some(enrollment_token) = token.clone() {
+            return Ok(Auth::Enrollment { enrollment_token });
+        }
+    }
     if let Ok(secret) = std::fs::read_to_string(&cfg.node_secret_path) {
         let secret = secret.trim().to_string();
         if !secret.is_empty() {
@@ -3250,10 +3290,8 @@ fn choose_auth(cfg: &Config) -> anyhow::Result<Auth> {
             });
         }
     }
-    match &cfg.enrollment_token {
-        Some(token) => Ok(Auth::Enrollment {
-            enrollment_token: token.clone(),
-        }),
+    match token {
+        Some(enrollment_token) => Ok(Auth::Enrollment { enrollment_token }),
         None => anyhow::bail!(
             "no node_secret at {} and ENROLLMENT_TOKEN not set; cannot register",
             cfg.node_secret_path
@@ -3261,11 +3299,170 @@ fn choose_auth(cfg: &Config) -> anyhow::Result<Auth> {
     }
 }
 
+/// Log a refused `register` and produce the error `connect_and_run` returns.
+///
+/// A function rather than three `bail!`s inline so the #199 loop can be tested without
+/// a socket: this is the same call the live path makes, and its result is what
+/// [`EnrollmentFallback::observe`] reads.
+fn register_reject_error(
+    cfg: &Config,
+    code: &str,
+    message: &str,
+    presented_saved_secret: bool,
+) -> anyhow::Error {
+    // #199: `host_not_found` for a register carrying a SAVED secret is the one reject
+    // the agent can act on itself. The control plane's remedy ("enroll with an
+    // enrollment token") is exactly what the operator already did — the token just
+    // never gets presented while a secret exists on disk.
+    match stale_identity(
+        code,
+        presented_saved_secret,
+        configured_enrollment_token(cfg).is_some(),
+    ) {
+        Some(StaleIdentity::ReEnroll) => {
+            let detail = stale_identity_message(&cfg.node_secret_path, StaleIdentity::ReEnroll);
+            warn!(token = "cp-register-stale-identity", "{detail}");
+            anyhow::Error::new(StaleNodeSecret(format!(
+                "control plane rejected register: {code}: {message} — {detail}"
+            )))
+        }
+        Some(StaleIdentity::Unresolvable) => {
+            let detail = stale_identity_message(&cfg.node_secret_path, StaleIdentity::Unresolvable);
+            error!(
+                token = "cp-register-stale-identity-unresolvable",
+                "{detail}"
+            );
+            anyhow::anyhow!("control plane rejected register: {code}: {message} — {detail}")
+        }
+        None => anyhow::anyhow!("control plane rejected register: {code}: {message}"),
+    }
+}
+
+/// The one piece of credential state the reconnect loop carries between attempts (#199).
+///
+/// Armed by a stale-secret reject, consumed by the very next attempt. The consumption is
+/// the whole point: a latch would keep presenting the enrollment token forever, and a
+/// single-use token that has already been spent would then leave a host that a returning
+/// control plane could still have re-admitted on its saved secret with nothing to offer
+/// it. Alternating costs one extra attempt on the backoff ramp and gives both
+/// credentials a turn.
+#[derive(Default)]
+struct EnrollmentFallback {
+    armed: bool,
+}
+
+impl EnrollmentFallback {
+    /// Hand the arming to the attempt about to be made, and disarm. The attempt AFTER
+    /// this one goes back to the saved secret unless another reject arms it again.
+    fn take_for_attempt(&mut self) -> bool {
+        std::mem::take(&mut self.armed)
+    }
+
+    /// Arm iff this failure was the stale-secret reject. Every other failure — a dead
+    /// socket, a bad token, a TLS pin mismatch — leaves the preference where it is.
+    fn observe(&mut self, err: &anyhow::Error) {
+        if err.downcast_ref::<StaleNodeSecret>().is_some() {
+            self.armed = true;
+        }
+    }
+}
+
+/// The control plane's answer to a reconnect naming a host it has never heard of.
+/// Not an enum value in `agent-api.md` — matched as the string the handler writes.
+const HOST_NOT_FOUND: &str = "host_not_found";
+
+/// What a `host_not_found` reject means for the credential this agent holds (#199).
+///
+/// The reject is *correct* whenever an agent data volume outlives the enrollment
+/// that filled it: the secret inside was minted by a DIFFERENT control plane (or
+/// this host row was deleted), so the new one has never seen the node. What the
+/// control plane cannot know is that the operator already did what its message
+/// asks — an enrollment token is sitting right there in the environment, losing
+/// to the saved secret on every attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleIdentity {
+    /// A token is configured: present it on the next attempt instead. Enrollment
+    /// mints a fresh identity here and overwrites the saved secret, so the
+    /// following reconnect is ordinary.
+    ReEnroll,
+    /// No token: nothing this process can do makes the saved secret valid here.
+    Unresolvable,
+}
+
+/// Classify a rejected `register`. `None` for anything that is not "the saved
+/// secret is unknown here" — notably a `host_not_found` answering a register that
+/// already carried the enrollment token, where re-sending it would be a loop
+/// rather than a recovery.
+fn stale_identity(
+    code: &str,
+    presented_saved_secret: bool,
+    has_enrollment_token: bool,
+) -> Option<StaleIdentity> {
+    if code != HOST_NOT_FOUND || !presented_saved_secret {
+        return None;
+    }
+    Some(if has_enrollment_token {
+        StaleIdentity::ReEnroll
+    } else {
+        StaleIdentity::Unresolvable
+    })
+}
+
+/// The operator-facing line for each case. The control plane's own message cannot
+/// carry this: only the agent knows where its secret is kept.
+fn stale_identity_message(node_secret_path: &str, kind: StaleIdentity) -> String {
+    let cause = format!(
+        "the node secret saved at {node_secret_path} identifies no host on this control plane. \
+         That is what a saved identity from a DIFFERENT control plane looks like — an agent data \
+         volume that outlived an earlier enrollment — or a host row that was deleted here"
+    );
+    match kind {
+        // What is about to happen, not how it will turn out. The enrollment token is
+        // single-use and expiring: a spent one is refused too, and a line promising the
+        // operator that nothing is needed would then repeat next to every failure.
+        StaleIdentity::ReEnroll => format!(
+            "{cause}. Presenting the configured enrollment token on the next attempt instead of \
+             the saved secret. If the control plane accepts it this host gets a fresh identity \
+             there and {node_secret_path} is replaced; if the token has already been used or has \
+             expired, that attempt is refused too and a fresh enrollment string is needed."
+        ),
+        // The volume is NOT named: it is the compose project that decides its name, the
+        // agent cannot see one, and an agent that is not in a container has none.
+        StaleIdentity::Unresolvable => format!(
+            "{cause}, and no enrollment token is configured — every reconnect will be refused the \
+             same way. Clear the saved identity and enroll again: the command from \
+             Admin -> Fleet -> Enroll host does the clearing with QUASAR_RESET_IDENTITY=1, or \
+             stop this agent and delete {node_secret_path} yourself (in a container install that \
+             file is inside the agent's data volume, so removing that volume is the same thing)."
+        ),
+    }
+}
+
+/// `connect_and_run`'s error when a register was refused as [`StaleIdentity::ReEnroll`].
+/// Typed rather than a string so the run loop can act on it without matching prose:
+/// it forces exactly the NEXT attempt to present the enrollment token.
+#[derive(Debug)]
+struct StaleNodeSecret(String);
+
+impl std::fmt::Display for StaleNodeSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StaleNodeSecret {}
+
 /// Write the verified pin beside the node secret the first time a pinned connection
-/// registers. Never overwrites what a reconnect merely re-learned — the single exception
-/// is a rotation the operator drove through CONTROL_PLANE_FINGERPRINT, which is the one
-/// pin that both differs from the file and has just verified a real handshake.
-fn persist_pin_if_new(cfg: &Config) {
+/// registers. Never overwrites what a reconnect merely re-learned; two cases do
+/// overwrite, and both are a pin that differs from the file AND has just verified a real
+/// handshake:
+///   - a rotation the operator drove through CONTROL_PLANE_FINGERPRINT;
+///   - `enrolled` — this register minted a NEW node identity (#199). The saved pin
+///     belongs to the identity that was just replaced: on the re-enrollment path it is a
+///     DIFFERENT control plane's certificate, and leaving it would strand the host the
+///     moment `QUASAR_ENROLLMENT` is removed from the environment — which is exactly what
+///     the docs tell operators to do once enrolled.
+fn persist_pin_if_new(cfg: &Config, enrolled: bool) {
     let crate::enrollment::TransportPolicy::Pinned(fp) = &cfg.transport else {
         return;
     };
@@ -3279,7 +3476,8 @@ fn persist_pin_if_new(cfg: &Config) {
         return;
     }
     let occupied = std::fs::symlink_metadata(&path).is_ok();
-    let rotating = occupied && cfg.pin_source == Some(crate::enrollment::PinSource::Env);
+    let rotating =
+        occupied && (enrolled || cfg.pin_source == Some(crate::enrollment::PinSource::Env));
     if occupied && !rotating {
         return;
     }
@@ -3632,7 +3830,7 @@ mod tests {
             pin_fixture(0xAB),
             crate::enrollment::PinSource::Blob,
         );
-        persist_pin_if_new(&cfg);
+        persist_pin_if_new(&cfg, false);
 
         let written = std::fs::read_to_string(cfg.pin_path()).unwrap();
         assert_eq!(written.trim(), pin_fixture(0xAB).to_colon_hex());
@@ -3655,7 +3853,7 @@ mod tests {
             let cfg = pinned_cfg(secret_path.to_str().unwrap(), pin_fixture(0xAB), source);
             std::fs::write(cfg.pin_path(), "not-a-fingerprint\n").unwrap();
 
-            persist_pin_if_new(&cfg);
+            persist_pin_if_new(&cfg, false);
             assert_eq!(
                 std::fs::read_to_string(cfg.pin_path()).unwrap(),
                 "not-a-fingerprint\n",
@@ -3677,7 +3875,7 @@ mod tests {
         );
         std::fs::write(cfg.pin_path(), format!("{}\n", pin_fixture(0xAB))).unwrap();
 
-        persist_pin_if_new(&cfg);
+        persist_pin_if_new(&cfg, false);
         assert_eq!(
             std::fs::read_to_string(cfg.pin_path()).unwrap().trim(),
             pin_fixture(0xCD).to_colon_hex()
@@ -3708,7 +3906,7 @@ mod tests {
         );
         std::fs::write(cfg.pin_path(), &lowercase).unwrap();
 
-        persist_pin_if_new(&cfg);
+        persist_pin_if_new(&cfg, false);
         assert_eq!(std::fs::read_to_string(cfg.pin_path()).unwrap(), lowercase);
     }
 
@@ -3720,18 +3918,48 @@ mod tests {
             crate::enrollment::PinSource::Blob,
             crate::enrollment::PinSource::Env,
         ] {
-            let dir = tempfile::tempdir().unwrap();
-            let secret_path = dir.path().join("node-secret");
-            let cfg = pinned_cfg(secret_path.to_str().unwrap(), pin_fixture(0xAB), source);
-            let target = dir.path().join("victim");
-            std::os::unix::fs::symlink(&target, cfg.pin_path()).unwrap();
+            // Both write paths, including the #199 enrollment refresh.
+            for enrolled in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let secret_path = dir.path().join("node-secret");
+                let cfg = pinned_cfg(secret_path.to_str().unwrap(), pin_fixture(0xAB), source);
+                let target = dir.path().join("victim");
+                std::os::unix::fs::symlink(&target, cfg.pin_path()).unwrap();
 
-            persist_pin_if_new(&cfg);
-            assert!(
-                !target.exists(),
-                "{source:?} wrote through the symlink to {target:?}"
-            );
+                persist_pin_if_new(&cfg, enrolled);
+                assert!(
+                    !target.exists(),
+                    "{source:?} enrolled={enrolled} wrote through the symlink to {target:?}"
+                );
+            }
         }
+    }
+
+    /// #199: the re-enrollment fallback mints a new identity on a control plane that is
+    /// not the one whose certificate is pinned in the file beside the old node secret.
+    /// The pin that just verified THIS handshake is the one that must survive.
+    #[test]
+    fn enrolling_again_refreshes_a_pin_left_by_a_previous_control_plane() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        let cfg = pinned_cfg(
+            secret_path.to_str().unwrap(),
+            pin_fixture(0xCD),
+            crate::enrollment::PinSource::Blob,
+        );
+        std::fs::write(cfg.pin_path(), format!("{}\n", pin_fixture(0xAB))).unwrap();
+
+        persist_pin_if_new(&cfg, true);
+        assert_eq!(
+            std::fs::read_to_string(cfg.pin_path()).unwrap().trim(),
+            pin_fixture(0xCD).to_colon_hex()
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     /// Fixture manifest for `nvidia_volume::Status::Provisioned` — field values
@@ -3909,6 +4137,296 @@ mod tests {
         std::fs::write(&secret_path, "   \n").unwrap();
         let cfg = test_cfg(secret_path.to_str().unwrap(), None);
         assert!(enrollment_reachable(&cfg).is_err());
+    }
+
+    // ── #199: a saved node secret this control plane never minted ───────────
+    //
+    // The reported failure: a machine enrolled to control plane A is re-enrolled
+    // against control plane B, the agent data volume survives, and `choose_auth`
+    // keeps presenting A's node secret. B answers `host_not_found` forever and the
+    // enrollment token the operator just pasted is never tried.
+
+    #[test]
+    fn stale_identity_re_enrolls_when_a_token_is_configured() {
+        assert_eq!(
+            stale_identity("host_not_found", true, true),
+            Some(StaleIdentity::ReEnroll)
+        );
+    }
+
+    #[test]
+    fn stale_identity_is_unresolvable_without_a_token() {
+        assert_eq!(
+            stale_identity("host_not_found", true, false),
+            Some(StaleIdentity::Unresolvable)
+        );
+    }
+
+    #[test]
+    fn stale_identity_ignores_a_reject_of_an_enrollment_register() {
+        // The fallback already ran (or this was a first enrollment): re-sending the
+        // same token is a loop, not a recovery.
+        assert_eq!(stale_identity("host_not_found", false, true), None);
+    }
+
+    #[test]
+    fn stale_identity_ignores_every_other_code() {
+        for code in ["auth_failed", "protocol_error", "internal_error", ""] {
+            assert_eq!(stale_identity(code, true, true), None, "code {code}");
+        }
+    }
+
+    #[test]
+    fn stale_identity_message_names_the_secret_and_the_remedy() {
+        let re_enroll = stale_identity_message("/var/lib/x/node-secret", StaleIdentity::ReEnroll);
+        assert!(re_enroll.contains("/var/lib/x/node-secret"), "{re_enroll}");
+        assert!(
+            re_enroll.contains("enrollment token"),
+            "the re-enroll line must say what it is about to do: {re_enroll}"
+        );
+        let stuck = stale_identity_message("/var/lib/x/node-secret", StaleIdentity::Unresolvable);
+        assert!(stuck.contains("/var/lib/x/node-secret"), "{stuck}");
+        assert!(
+            stuck.contains("QUASAR_RESET_IDENTITY"),
+            "the unrecoverable line must name the way to clear the identity: {stuck}"
+        );
+    }
+
+    /// Neither line may promise an outcome that has not happened yet. The enrollment
+    /// token is single-use and expiring: when it has been spent the fallback is refused
+    /// too, and a reassuring line would then print beside every failure forever.
+    #[test]
+    fn the_re_enroll_line_does_not_promise_success() {
+        let re_enroll = stale_identity_message("/var/lib/x/node-secret", StaleIdentity::ReEnroll);
+        let lower = re_enroll.to_lowercase();
+        assert!(
+            !lower.contains("no operator action") && !lower.contains("nothing is needed"),
+            "the line promises an outcome it cannot know: {re_enroll}"
+        );
+        assert!(
+            lower.contains("expired") || lower.contains("already been used"),
+            "the line must admit the token can be refused too: {re_enroll}"
+        );
+    }
+
+    /// The agent cannot know its data volume's name — the compose project decides it
+    /// (`QUASAR_PROJECT`), and an agent outside a container has none. Naming one would
+    /// be a remedy that silently points at the wrong volume.
+    #[test]
+    fn no_stale_identity_line_asserts_a_volume_name() {
+        for kind in [StaleIdentity::ReEnroll, StaleIdentity::Unresolvable] {
+            let msg = stale_identity_message("/var/lib/x/node-secret", kind);
+            assert!(
+                !msg.contains("quasar-agent-data") && !msg.contains("docker volume rm"),
+                "{kind:?} asserts a volume name the agent cannot know: {msg}"
+            );
+        }
+    }
+
+    /// The run loop arms the one-shot token fallback by downcasting the error out of
+    /// `connect_and_run`. That only works if `anyhow` keeps the concrete type across the
+    /// bail, which is easy to break by "simplifying" the bail into a formatted string.
+    #[test]
+    fn a_stale_secret_reject_survives_the_anyhow_boundary() {
+        fn rejected() -> anyhow::Result<()> {
+            anyhow::bail!(StaleNodeSecret(
+                "the saved secret is unknown here".to_string()
+            ));
+        }
+        let err = rejected().expect_err("should be an error");
+        assert!(
+            err.downcast_ref::<StaleNodeSecret>().is_some(),
+            "the run loop cannot see the stale-secret reject: {err:#}"
+        );
+        assert!(format!("{err:#}").contains("the saved secret is unknown here"));
+    }
+
+    // ── the reconnect loop's one-shot alternation (#199) ────────────────────
+    //
+    // `EnrollmentFallback` is the loop semantics the commit message, the CHANGELOG and
+    // docs/configuration.md all describe: one token attempt per reject, never a latch.
+    // These drive the same `register_reject_error` the live path calls.
+
+    /// The reported scenario, end to end without a socket: the saved secret goes out,
+    /// the control plane refuses it, the NEXT attempt carries the token.
+    #[test]
+    fn a_stale_secret_reject_makes_the_next_attempt_present_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        std::fs::write(&secret_path, "secret-from-the-other-control-plane\n").unwrap();
+        let cfg = test_cfg(secret_path.to_str().unwrap(), Some("tok-123"));
+        let mut fallback = EnrollmentFallback::default();
+
+        let first = choose_auth(&cfg, fallback.take_for_attempt()).unwrap();
+        assert!(
+            matches!(first, Auth::Reconnect { .. }),
+            "the saved secret goes first: {first:?}"
+        );
+
+        let err = register_reject_error(
+            &cfg,
+            "host_not_found",
+            "node not enrolled",
+            matches!(first, Auth::Reconnect { .. }),
+        );
+        fallback.observe(&err);
+
+        let second = choose_auth(&cfg, fallback.take_for_attempt()).unwrap();
+        assert!(
+            matches!(second, Auth::Enrollment { .. }),
+            "the reject did not arm the token fallback: {second:?}"
+        );
+    }
+
+    /// The arming is CONSUMED, not latched. A spent single-use token is refused too, and
+    /// a latch would leave a host that a returning control plane could still have
+    /// re-admitted on its saved secret with nothing else to offer.
+    #[test]
+    fn the_token_fallback_is_consumed_by_one_attempt_and_does_not_latch() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        std::fs::write(&secret_path, "saved-secret\n").unwrap();
+        let cfg = test_cfg(secret_path.to_str().unwrap(), Some("tok-123"));
+        let mut fallback = EnrollmentFallback::default();
+
+        fallback.observe(&register_reject_error(&cfg, "host_not_found", "", true));
+        assert!(fallback.take_for_attempt(), "the reject should arm it");
+        // The token attempt is refused in its turn — the control plane says nothing
+        // about a saved secret, because none was presented.
+        fallback.observe(&register_reject_error(
+            &cfg,
+            "auth_failed",
+            "authentication failed",
+            false,
+        ));
+        assert!(
+            !fallback.take_for_attempt(),
+            "the token preference latched; the saved secret would never be offered again"
+        );
+        assert!(
+            matches!(choose_auth(&cfg, false).unwrap(), Auth::Reconnect { .. }),
+            "the attempt after a spent token must go back to the saved secret"
+        );
+    }
+
+    /// Two takes on one arming: the second is already false even with no failure in
+    /// between. Pins `take_for_attempt` against being rewritten as a plain read.
+    #[test]
+    fn one_arming_survives_exactly_one_attempt() {
+        let mut fallback = EnrollmentFallback::default();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(
+            dir.path().join("node-secret").to_str().unwrap(),
+            Some("tok-123"),
+        );
+        fallback.observe(&register_reject_error(&cfg, "host_not_found", "", true));
+        assert!(fallback.take_for_attempt());
+        assert!(
+            !fallback.take_for_attempt(),
+            "the arming outlived its attempt"
+        );
+    }
+
+    /// Only the stale-secret reject arms it. Everything else the loop meets — a dropped
+    /// socket, a bad token, a pin mismatch, and a `host_not_found` answering a register
+    /// that already carried the token — must leave the preference alone.
+    #[test]
+    fn nothing_but_a_stale_secret_reject_arms_the_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        let cfg = test_cfg(secret_path.to_str().unwrap(), Some("tok-123"));
+
+        let cases: Vec<anyhow::Error> = vec![
+            anyhow::anyhow!("connection reset without closing handshake"),
+            register_reject_error(&cfg, "auth_failed", "authentication failed", true),
+            register_reject_error(&cfg, "protocol_error", "expected register", true),
+            // The fallback already ran: re-sending the token is a loop, not a recovery.
+            register_reject_error(&cfg, "host_not_found", "node not enrolled", false),
+        ];
+        for err in cases {
+            let mut fallback = EnrollmentFallback::default();
+            fallback.observe(&err);
+            assert!(
+                !fallback.take_for_attempt(),
+                "armed the token fallback on: {err:#}"
+            );
+        }
+    }
+
+    /// With no token configured there is nothing to fall back to, so the reject must not
+    /// arm anything — the agent reports the stale identity instead.
+    #[test]
+    fn a_stale_secret_reject_arms_nothing_without_a_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        std::fs::write(&secret_path, "saved-secret\n").unwrap();
+        let cfg = test_cfg(secret_path.to_str().unwrap(), None);
+        let mut fallback = EnrollmentFallback::default();
+
+        let err = register_reject_error(&cfg, "host_not_found", "node not enrolled", true);
+        fallback.observe(&err);
+        assert!(!fallback.take_for_attempt());
+        assert!(
+            format!("{err:#}").contains(secret_path.to_str().unwrap()),
+            "the unresolvable reject must name the saved secret: {err:#}"
+        );
+    }
+
+    #[test]
+    fn choose_auth_prefers_the_saved_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        std::fs::write(&secret_path, "saved-secret\n").unwrap();
+        let cfg = test_cfg(secret_path.to_str().unwrap(), Some("tok-123"));
+        match choose_auth(&cfg, false).unwrap() {
+            Auth::Reconnect { node_secret } => assert_eq!(node_secret, "saved-secret"),
+            other => panic!("want Reconnect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn choose_auth_forced_presents_the_token_over_the_saved_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        std::fs::write(&secret_path, "stale-secret\n").unwrap();
+        let cfg = test_cfg(secret_path.to_str().unwrap(), Some("tok-123"));
+        match choose_auth(&cfg, true).unwrap() {
+            Auth::Enrollment { enrollment_token } => assert_eq!(enrollment_token, "tok-123"),
+            other => panic!("want Enrollment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn choose_auth_forced_without_a_token_still_uses_the_saved_secret() {
+        // The force flag is a preference, never a way to make a registerable agent
+        // unregisterable: with no token there is nothing to prefer.
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        std::fs::write(&secret_path, "saved-secret\n").unwrap();
+        let cfg = test_cfg(secret_path.to_str().unwrap(), None);
+        match choose_auth(&cfg, true).unwrap() {
+            Auth::Reconnect { node_secret } => assert_eq!(node_secret, "saved-secret"),
+            other => panic!("want Reconnect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn choose_auth_falls_back_to_the_token_with_no_saved_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        let cfg = test_cfg(secret_path.to_str().unwrap(), Some("tok-123"));
+        match choose_auth(&cfg, false).unwrap() {
+            Auth::Enrollment { enrollment_token } => assert_eq!(enrollment_token, "tok-123"),
+            other => panic!("want Enrollment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn choose_auth_errs_with_neither_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        let cfg = test_cfg(secret_path.to_str().unwrap(), None);
+        assert!(choose_auth(&cfg, false).is_err());
     }
 
     fn gpu(index: i32, vendor: &str, render_node: Option<&str>) -> crate::messages::GpuCapacity {

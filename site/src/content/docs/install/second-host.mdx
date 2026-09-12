@@ -51,7 +51,10 @@ whole; it is meant to be pasted, not typed.
 with `--pinnedpubkey`, so `curl` trusts nothing except the control plane's own public
 key, whose hash the dialog read from the same certificate it shows the fingerprint of.
 Anyone on the path presenting another certificate is refused. With a real-CA
-certificate neither flag appears and `curl` verifies normally. The agent then pins the
+certificate neither flag appears and `curl` verifies normally. The pairing also runs the
+other way: `--pinnedpubkey` **on its own** fails a self-signed control plane with
+`SSL certificate problem: self-signed certificate (18)`, because `curl` validates the
+chain before it ever looks at the pin. Keep both flags, or neither. The agent then pins the
 fingerprint inside the string. A token in a URL would land in proxy logs and browser
 history; in an environment variable, on a disposable credential, the only trace is your
 shell history, and the token is dead within the hour anyway.
@@ -108,6 +111,14 @@ The last line names the reason.
   certificate rotation, set `CONTROL_PLANE_FINGERPRINT` in `/opt/quasar-agent/.env`.
 - **A preflight** — the fix is printed with it. Apply it and re-run the same command; the
   string is still unused.
+- **A saved identity this control plane does not know** — the machine was enrolled to a
+  *different* control plane before, and the node secret from that enrollment lives in a
+  Docker volume that outlives a re-run. The agent handles this itself: the control plane
+  refuses the old secret, the agent registers again with the token from the command, and
+  enrollment completes. You only see it in the log. If the agent is running without an
+  enrollment token at all it cannot do that, and the script stops and tells you to re-run
+  with `QUASAR_RESET_IDENTITY=1`, which clears the saved identity first. Repurposing a
+  machine is the other reason to use that flag.
 - **`still connecting`** — the agent has not reached the control plane yet. Follow its
   log with `docker compose --project-directory /opt/quasar-agent logs -f quasar-node-agent`;
   the usual cause is that the control plane's address in the string is not reachable from
@@ -121,6 +132,12 @@ Compose file and `--print-nvidia-overlay` the NVIDIA overlay. Put them in a dire
 with a `.env` that sets `QUASAR_ENROLLMENT`, `NODE_NAME`, `QUASAR_HOME_ROOT` and
 `QUASAR_AGENT_IMAGE`, and `docker compose up -d`. Every knob the agent reads is in the
 [environment reference](/quasar/reference/environment/).
+
+`--help` lists the knobs the script itself reads, including `QUASAR_RESET_IDENTITY`
+(clear this host's saved agent identity, then enroll from scratch) and `QUASAR_PROJECT`
+— the Compose project name. Compose scopes volume names to it, so it is what selects
+which saved agent identity an install uses: an enrolled host must keep the name it has,
+and a new name is a new identity. It is not a way to run two agents on one machine.
 
 The base `deploy/docker-compose.yml` is not a second-host install: its agent depends on
 the local stack. The service the installer prints and the base file's node-agent service
