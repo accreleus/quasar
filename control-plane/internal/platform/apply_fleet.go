@@ -739,9 +739,6 @@ func (f *FleetRunner) recordAndCordon(ctx context.Context, runID string, states 
 	}
 }
 
-// restoreCordons puts every host back to the scheduling state the run found.
-// Runs on every terminal path, including a failed one: a fleet left draining by
-// a failed run would silently drop out of scheduling entirely.
 // MaxCordonRestoreSweep bounds ResumeCordonRestores. A boot sweep, not a backlog
 // drain: a run that keeps failing to settle is retried on the NEXT boot rather
 // than in a loop on this one.

@@ -1,7 +1,7 @@
 -- 0084 — a fleet run's scheduling cleanup is a recorded fact, not an inference
 -- (#176).
 --
--- PURELY ADDITIVE: one nullable column, no existing column touched, and nothing
+-- PURELY ADDITIVE: two nullable columns, no existing column touched, and nothing
 -- on the wire — `PlatformApplyRun` gains no field, so this is invisible to
 -- control-api.md and to every client.
 --
