@@ -531,7 +531,12 @@ What happens, step by step:
    the database.** Every host goes out of scheduling for the run — each one is
    going to be recreated, so a session started mid-run is one the run would end
    at that host's step. The cordons are released when the run finishes, and a
-   host an admin had already cordoned stays cordoned.
+   host an admin had already cordoned stays cordoned. **A run with no
+   control-plane step to take — one whose control plane is already on the
+   release — cordons each host as it reaches it instead**, one at a time: only
+   that host is being recreated, so the rest of the fleet keeps taking sessions.
+   Either way every cordon the run takes is recorded on the run, which is what
+   lets a control plane that restarts mid-run still put the fleet back.
 
    Whether the run also *waits* for those sessions to end depends on the
    release:

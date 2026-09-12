@@ -146,6 +146,17 @@ own; the two do not move together, and that is deliberate.
   Contract: `quasar-protocol` "Audit-log names" amendment (additive, no migration).
 
 ### Fixed
+- **A fleet update that only moves hosts no longer risks leaving one out of scheduling**
+  (#200). The instance-wide cordon a fleet run takes belongs to its control-plane step, so a
+  run whose control plane was already on the release took none and recorded nothing — while
+  the host step it drove still cordoned the host it was about to recreate, leaving the
+  restore to the run that held no record of it. The returning agent's registration masked
+  it: a host whose update was refused **before** any recreate (`updater_absent`, a busy
+  updater, a rejected image namespace) has no agent going away and no registration coming
+  back, and stayed `draining` with nothing that knew to lift it. Such a run now records and
+  takes the cordon for each host as it reaches it — one host, not the fleet — so the run's
+  own finish lifts it, and a control plane that dies mid-run leaves a requirement the next
+  start finds and settles.
 - **A busy Docker host no longer makes the agent report its own container runtime as
   unresponsive** (#194). Every container-runtime command the agent runs had its output
   read only after the child exited, so a command printing more than one pipe buffer's
