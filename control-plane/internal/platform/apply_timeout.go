@@ -41,10 +41,12 @@ func applyTimeoutOutput(agentConnected, sent bool, requestID, socket string) str
 	var b strings.Builder
 	b.WriteString("This apply expired without a verdict and the host's agent has not come back, so the ")
 	b.WriteString("updater's own result could not be relayed to the control plane.\n\n")
-	b.WriteString("That shape means the new container failed its health wait AND the updater's automatic ")
-	b.WriteString("restore of the previous one failed too (ADR 0004): a restore that worked would have ")
-	b.WriteString("brought an agent back to report the failure. A host that has gone off the network ")
-	b.WriteString("entirely looks the same from here.\n\n")
+	b.WriteString("That most often means the new container failed its health wait and the updater's ")
+	b.WriteString("automatic restore of the previous one (ADR 0004) failed too. It is not proof: a ")
+	b.WriteString("restore still running when the deadline fell, a host that lost power part-way ")
+	b.WriteString("through one, an agent stopped by hand and a host off the network all look the same ")
+	b.WriteString("from here. If this host is back in Fleet ▸ Hosts, the restore finished after the ")
+	b.WriteString("apply gave up.\n\n")
 	b.WriteString("The verdict is on that host — the real reason, the failed container's last log lines, ")
 	b.WriteString("and the `previous` digests to put back by hand. Read it in the stack directory there. ")
 	b.WriteString("Ask the updater container, not the node agent: the node agent is the one that is down.\n\n")
@@ -53,8 +55,8 @@ func applyTimeoutOutput(agentConnected, sent bool, requestID, socket string) str
 	b.WriteString(" http://u/v1/results/")
 	b.WriteString(requestID)
 	b.WriteString("\n\n")
-	b.WriteString("`docker compose logs quasar-updater` carries the same verdict. A 404 there means the ")
-	b.WriteString("agent went away before it could hand the request over, so nothing was applied.")
+	b.WriteString("`docker compose logs quasar-updater` carries the same verdict, and says whether the ")
+	b.WriteString("restore finished.")
 	return b.String()
 }
 
@@ -66,7 +68,12 @@ func (r *Runner) timeoutOutput(attemptID string) string {
 	defer cancel()
 
 	a, err := r.store.Attempt(ctx, attemptID)
-	if err != nil || a.HostID == nil {
+	if err != nil {
+		r.log.Warn("apply: could not re-read the attempt for the timeout hint",
+			"attempt_id", attemptID, "err", err)
+		return ""
+	}
+	if a.HostID == nil {
 		return ""
 	}
 	if r.deps.Connected == nil || r.deps.Connected(*a.HostID) {
@@ -79,8 +86,16 @@ func (r *Runner) timeoutOutput(attemptID string) string {
 			"attempt_id", attemptID, "err", err)
 		return ""
 	}
-	return joinApplyOutput(a.Output,
-		applyTimeoutOutput(false, requestID != "", requestID, ConfiguredUpdaterSocket()))
+	// MintRequestID writes `pending` BEFORE the send, so a row still in it may
+	// never have been handed over: a restart inside the connect/ack window is
+	// re-adopted straight into watch. Any state the agent relayed has moved the
+	// row off `pending`, so reading `pending` as unsent only ever errs towards
+	// the text that promises nothing.
+	sent := requestID != "" && a.State != AttemptPending
+	// NOT ConfiguredUpdaterSocket: that is THIS container's override, and the
+	// command runs in a different host's updater container, which compose
+	// passes no QUASAR_UPDATER_SOCKET.
+	return joinApplyOutput(a.Output, applyTimeoutOutput(false, sent, requestID, UpdaterSocketPath))
 }
 
 // applyOutputLimit is `platform_apply_attempts.output`'s CHECK (migration 0075).

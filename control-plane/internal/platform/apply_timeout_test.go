@@ -61,16 +61,28 @@ func TestJoinApplyOutputStaysWithinTheColumnCheck(t *testing.T) {
 	})
 
 	t.Run("an over-long relay gives way, on a rune boundary", func(t *testing.T) {
-		// Multi-byte throughout, so a byte-wise cut lands mid-rune.
-		got := joinApplyOutput(strings.Repeat("é", 6000), hint)
-		if len(got) > applyOutputLimit {
-			t.Errorf("output is %d bytes, over the %d-byte CHECK", len(got), applyOutputLimit)
+		// Three hint lengths, so `keep` covers every residue mod 3 and a
+		// 3-byte rune is cut mid-sequence in two of them: a test pinned to one
+		// length stays green with the trim deleted.
+		for n := 100; n < 103; n++ {
+			short := strings.Repeat("x", n)
+			got := joinApplyOutput(strings.Repeat("€", 6000), short)
+			if len(got) > applyOutputLimit {
+				t.Errorf("hint %d: output is %d bytes, over the %d-byte CHECK",
+					n, len(got), applyOutputLimit)
+			}
+			if !utf8.ValidString(got) {
+				t.Errorf("hint %d: output is not valid UTF-8; Postgres would reject it", n)
+			}
+			if !strings.HasSuffix(got, short) {
+				t.Errorf("hint %d: the hint — the new information — was the part that was cut", n)
+			}
 		}
-		if !utf8.ValidString(got) {
-			t.Error("output is not valid UTF-8; Postgres would reject it")
-		}
-		if !strings.HasSuffix(got, hint) {
-			t.Error("the hint — the new information — was the part that was cut")
+		// And the real hint, at its real length.
+		got := joinApplyOutput(strings.Repeat("€", 6000), hint)
+		if len(got) > applyOutputLimit || !utf8.ValidString(got) || !strings.HasSuffix(got, hint) {
+			t.Errorf("the production hint does not join within the CHECK: %d bytes, valid=%v",
+				len(got), utf8.ValidString(got))
 		}
 	})
 
@@ -99,6 +111,12 @@ func TestTimeoutWithNoAgentPointsAtTheUpdatersResult(t *testing.T) {
 
 	r.Start(a)
 	waitFor(t, "release_apply to be sent", func() bool { return agent.sentCount() == 1 })
+	// The agent relayed its progress and then died with the container it was
+	// recreating: the G-B shape, and what moves the row off `pending`.
+	r.HandleReleaseState(context.Background(), testHostID, ReleaseStateReport{
+		RequestID: agent.sent[0].RequestID, State: AttemptRecreating,
+	})
+	waitFor(t, "the relayed state", func() bool { return store.snapshot(a.ID).State == AttemptRecreating })
 	waitFor(t, "the deadline to fire", func() bool { return store.snapshot(a.ID).State == AttemptFailed })
 
 	final := store.snapshot(a.ID)
@@ -109,7 +127,7 @@ func TestTimeoutWithNoAgentPointsAtTheUpdatersResult(t *testing.T) {
 		t.Fatal("output is empty: the operator is told 'timeout' and nothing else (#201)")
 	}
 	requestID := agent.sent[0].RequestID
-	for _, want := range []string{requestID, ConfiguredUpdaterSocket(), "/v1/results/"} {
+	for _, want := range []string{requestID, UpdaterSocketPath, "/v1/results/"} {
 		if !strings.Contains(final.Output, want) {
 			t.Errorf("output %q does not mention %q", final.Output, want)
 		}
@@ -159,5 +177,36 @@ func TestTimeoutBeforeTheSendSaysNothingWasApplied(t *testing.T) {
 	}
 	if strings.Contains(final.Output, "/v1/results/") {
 		t.Errorf("output %q sends the operator after a result that cannot exist", final.Output)
+	}
+}
+
+// A control-plane restart inside the connect/ack window leaves a `pending` row
+// with a minted request id that was never handed to any updater. Adopt drives
+// it straight to watch, so the deadline must not offer a read command for a
+// request no updater ever received.
+func TestReadoptedPendingAttemptIsNotTreatedAsSent(t *testing.T) {
+	a := queuedAttempt(true)
+	a.State = AttemptPending
+	store := newFakeStore(a)
+	store.requests["req-orphan"] = a.ID // minted before the restart
+	agent := &fakeAgent{ack: Ack{OK: true}}
+	deps := agent.deps()
+	deps.Connected = func(string) bool { return false }
+	r := testRunner(store, deps)
+	r.Deadline = 80 * time.Millisecond
+	defer r.Close()
+
+	r.Start(a)
+	waitFor(t, "the attempt to fail", func() bool { return store.snapshot(a.ID).State == AttemptFailed })
+
+	final := store.snapshot(a.ID)
+	if agent.sentCount() != 0 {
+		t.Fatal("an adopted attempt must not be re-sent")
+	}
+	if strings.Contains(final.Output, "/v1/results/") {
+		t.Errorf("output %q offers a read command for a request no updater received", final.Output)
+	}
+	if final.Output == "" {
+		t.Error("output is empty: the operator is owed the reason")
 	}
 }
