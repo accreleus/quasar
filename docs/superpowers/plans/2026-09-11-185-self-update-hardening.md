@@ -404,12 +404,12 @@ func RunOutcome(skips []RunSkip) string
 
 ## Phase H — docs, changelog, gates, landing
 
-- [ ] `docs/upgrading.md`: "Adding it to an existing install" step 3 keeps the recreate (it is still the fix) but loses the paragraph telling the operator to diagnose it by hand — the card names it now; the "before applying, check 9091" paragraph goes, replaced by one sentence pointing at the host's readiness card; the "there is no automatic rollback for a host" sentences in "Applying from the console" and "Update Quasar from the console" are rewritten; step 5 gains the partial outcome and Retry.
-- [ ] `CONTEXT.md` "Platform releases": **Preflight** — the per-target set of stack-shape checks evaluated on the release view before an apply is offered; distinct from eligibility (may this target take it) and from readiness (can this host run sessions).
-- [ ] `CHANGELOG.md` `## Unreleased`: Added — preflight (#187/#184/#186), automatic agent restore (#188), partial outcome + retry (#190), readiness update checks (#189); note migration 0083.
-- [ ] Gates: `make test-go`, `make test-db`, `make test-rust`, `make test-web`, `scripts/dev/leak-scan.sh`. Run serially (devtools volume).
-- [ ] Review: `mcp__alice-review` on the branch; resolve; re-run gates.
-- [ ] Push `feat/185-self-update-hardening` to origin. Landing waits on the amendment sign-off: on sign-off, fast-forward `amend/self-update-hardening` into `quasar-protocol` `main`, verify the superproject pin sha is unchanged, merge to `develop`, push, and comment on #185–#190 with the merge sha. Renumber 0083 if PR #182 landed first.
+- [x] `docs/upgrading.md`: "Adding it to an existing install" step 3 keeps the recreate (it is still the fix) but loses the paragraph telling the operator to diagnose it by hand — the card names it now; the "before applying, check 9091" paragraph goes, replaced by one sentence pointing at the host's readiness card; the "there is no automatic rollback for a host" sentences in "Applying from the console" and "Update Quasar from the console" are rewritten; step 5 gains the partial outcome and Retry.
+- [x] `CONTEXT.md` "Platform releases": **Preflight** — the per-target set of stack-shape checks evaluated on the release view before an apply is offered; distinct from eligibility (may this target take it) and from readiness (can this host run sessions).
+- [x] `CHANGELOG.md` `## Unreleased`: Added — preflight (#187/#184/#186), automatic agent restore (#188), partial outcome + retry (#190), readiness update checks (#189); note migration 0083.
+- [x] Gates: `make test-go`, `make test-db`, `make test-rust`, `make test-web`, `scripts/dev/leak-scan.sh`. Run serially (devtools volume).
+- [x] Review: `mcp__alice-review` on the branch; resolve; re-run gates.
+- [x] Push `feat/185-self-update-hardening` to origin. **Landed:** develop `2196ab2` (2026-09-12), amendment 9 on quasar-protocol main `8a6aed2`; #182 followed as `9a3267a` with migration 0084 and amendment 10. Landing waits on the amendment sign-off: on sign-off, fast-forward `amend/self-update-hardening` into `quasar-protocol` `main`, verify the superproject pin sha is unchanged, merge to `develop`, push, and comment on #185–#190 with the merge sha. Renumber 0083 if PR #182 landed first.
 - [x] Live gate, run 2026-09-12 on the operator's appliance stack (gpu-test was off) with the
   branch published by an Images dispatch and the stack's updater pinned to the branch build
   (the updater is not part of a release). Record:
