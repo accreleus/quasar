@@ -146,6 +146,21 @@ own; the two do not move together, and that is deliberate.
   Contract: `quasar-protocol` "Audit-log names" amendment (additive, no migration).
 
 ### Fixed
+- **A `429` from the control plane no longer reads as a second, unrelated fault** (#199). When an
+  agent's saved node secret belongs to a control plane that has never seen it, a run of refused
+  registers trips the enrollment-failure limiter and the WebSocket upgrade is refused — and the
+  agent logged that as a bare `agent connection failed: ... HTTP error: 429 Too Many Requests`,
+  with nothing tying it to the refusals above it. It now explains the 429 as the consequence it
+  is, under its own `cp-connect-rate-limited` token: ten refused registers with no minute's gap
+  between them trip it, it lifts a minute after the last refusal, the agent is admitted again on
+  its own backoff, and the fault to act on is whatever the refusals reported. The line also names
+  the other thing that answers 429 — more than ten handshakes in flight from one address, which a
+  fleet behind one NAT can do on a simultaneous reconnect, and where there will be no refusals
+  above it at all. A rate-limited upgrade is also no longer counted as a
+  registration failure once the agent is already reporting unhealthy, so the 429 cannot overwrite
+  the real reason in `/health`. The limiter itself is unchanged: an unknown `node_name` answers
+  `host_not_found` where a known one answers `auth_failed`, so exempting it would make `/agent/ws`
+  a free node-name enumeration oracle.
 - **A fleet update that only moves hosts no longer risks leaving one out of scheduling**
   (#200). The instance-wide cordon a fleet run takes belongs to its control-plane step, so a
   run whose control plane was already on the release took none and recorded nothing — while

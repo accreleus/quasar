@@ -99,6 +99,13 @@ impl HealthState {
         }
     }
 
+    /// Whether `/health` is currently answering 503. The reconnect loop reads it to
+    /// stop re-counting a rate-limited upgrade once the verdict is already out (#199
+    /// follow-up) — see `agent::counts_as_registration_failure`.
+    pub fn unhealthy(&self) -> bool {
+        is_unhealthy(self.consecutive_registration_failures())
+    }
+
     fn consecutive_registration_failures(&self) -> usize {
         self.consecutive_registration_failures
             .load(Ordering::Relaxed)

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message};
+use tokio_tungstenite::{connect_async_tls_with_config, tungstenite, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
 use crate::capacity;
@@ -337,25 +337,44 @@ pub async fn run(cfg: Config) {
                         }));
                     }
                 }
-                error!(
-                    token = "agent-connection-failed",
-                    "agent connection failed: {e:#}"
-                );
+                // #199 follow-up: a rate-limited upgrade is downstream of the
+                // refused registers already logged, so it gets its own token and
+                // WARN rather than reading as a fresh, unrelated ERROR.
+                // ONE predicate drives both the token and the counting gate below:
+                // split, the next status added to describe_upgrade_refusal would be
+                // counted-suppressed while still logging as an unexplained ERROR.
+                let explained_refusal = e
+                    .downcast_ref::<UpgradeRefused>()
+                    .is_some_and(|r| describe_upgrade_refusal(r.status).is_some());
+                if explained_refusal {
+                    warn!(
+                        token = "cp-connect-rate-limited",
+                        "agent connection failed: {e:#}"
+                    );
+                } else {
+                    error!(
+                        token = "agent-connection-failed",
+                        "agent connection failed: {e:#}"
+                    );
+                }
                 // #199: a stale-secret reject makes the next attempt present the
-                // enrollment token instead.
+                // enrollment token instead. A refused upgrade carried no credential
+                // at all, so it cannot (and must not) arm this.
                 enrollment_fallback.observe(&e);
                 // One line on the cycle that crosses the threshold: every retry
                 // already logs above, so this fires only when transient becomes
                 // sustained.
-                let failures = health.record_registration_failure(&format!("{e:#}"));
-                if failures == crate::health::UNHEALTHY_AFTER_CONSECUTIVE_FAILURES {
-                    error!(
-                        token = "agent-registration-unhealthy",
-                        "agent has failed to connect/register {failures} times in a row with no \
-                         successful registration since; the health endpoint now reports \
-                         unhealthy so `docker compose ps` surfaces this — check ENROLLMENT_TOKEN \
-                         validity and control-plane reachability"
-                    );
+                if counts_as_registration_failure(explained_refusal, health.unhealthy()) {
+                    let failures = health.record_registration_failure(&format!("{e:#}"));
+                    if failures == crate::health::UNHEALTHY_AFTER_CONSECUTIVE_FAILURES {
+                        error!(
+                            token = "agent-registration-unhealthy",
+                            "agent has failed to connect/register {failures} times in a row with no \
+                             successful registration since; the health endpoint now reports \
+                             unhealthy so `docker compose ps` surfaces this — check ENROLLMENT_TOKEN \
+                             validity and control-plane reachability"
+                        );
+                    }
                 }
                 // A connection that actually registered restarts the ramp, so a
                 // long-lived connection dropping does not inherit a 30 s delay
@@ -1030,13 +1049,17 @@ async fn connect_and_run(
     // #12: the connector is chosen by policy, never by tokio-tungstenite's default — a
     // wss:// URL must not silently validate against the OS/bundled roots when a pin was
     // configured, and a ws:// URL is explicitly Plain.
+    // A refused upgrade never reaches `register`, so its status is all the agent gets
+    // to explain the failure with (#199 follow-up); `upgrade_error` is where that
+    // explanation is attached.
     let (ws_stream, _) = connect_async_tls_with_config(
         &url,
         None,
         false,
         Some(crate::cp_tls::ws_connector(&cfg.transport)),
     )
-    .await?;
+    .await
+    .map_err(upgrade_error)?;
     let (mut tx, mut rx) = ws_stream.split();
 
     // Attach this connection's upstream channel to the process-wide ImageManager.
@@ -3452,6 +3475,94 @@ impl std::fmt::Display for StaleNodeSecret {
 
 impl std::error::Error for StaleNodeSecret {}
 
+/// What the agent has to say about an HTTP status the control plane answered the
+/// WebSocket upgrade with, before any `register` was sent (#199 follow-up).
+///
+/// `429` is the one status the agent can explain better than the transport can: it
+/// is the control plane's enrollment-failure limiter, and by construction the agent
+/// has just watched its own registers be refused ten times in a minute. Logged bare
+/// — `HTTP error: 429 Too Many Requests` — it reads as a second, unrelated fault,
+/// which is exactly how it was reported. Everything else gets `None` and stays an
+/// ordinary connection failure: inventing prose for a status the agent has no
+/// insight into is how a log line starts lying.
+///
+/// The *accounting* deliberately did not change. Not counting the `host_not_found`
+/// rejects that trip the limiter would make `/agent/ws` a rate-unbounded node-name
+/// oracle (an unknown name answers `host_not_found`, a known one `auth_failed`, so
+/// misses would be free), so the limiter keeps counting them and this is presentation.
+fn describe_upgrade_refusal(status: u16) -> Option<&'static str> {
+    match status {
+        429 => Some(
+            "the control plane is rate-limiting this address. Usually that is its \
+             enrollment-failure limiter, tripped by the refused registers above: ten refused \
+             registers with no minute's gap between them, lifting a minute after the LAST \
+             refusal — so a run of refusals on a backoff that never idles a full minute trips it \
+             however long it takes. It also answers 429 when more than ten handshakes from this \
+             address are in flight at once, which is what a fleet of agents behind one NAT can do \
+             on a simultaneous reconnect; in that case there will be no refusals above. Either \
+             way this is a consequence of something else, not a separate fault: the agent keeps \
+             retrying on its backoff and is admitted again once the window passes. Act on what \
+             the refusals said — if a line above reports the saved identity is unresolvable here, \
+             that is the fault to fix; the 429 needs nothing done about it on its own.",
+        ),
+        _ => None,
+    }
+}
+
+/// A WebSocket upgrade the control plane refused with a status
+/// [`describe_upgrade_refusal`] has an explanation for. Carried as a concrete type so
+/// the reconnect loop can recognise it through `anyhow` — the same trick
+/// [`StaleNodeSecret`] uses — and pick its log token and its counting by status.
+#[derive(Debug)]
+struct UpgradeRefused {
+    status: u16,
+    detail: &'static str,
+}
+
+impl std::fmt::Display for UpgradeRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "control plane refused the connection with HTTP {}: {}",
+            self.status, self.detail
+        )
+    }
+}
+
+impl std::error::Error for UpgradeRefused {}
+
+/// Turn a failed WebSocket connect into the error `connect_and_run` returns.
+///
+/// Only an [`Error::Http`](tungstenite::Error::Http) — the upgrade reaching the control
+/// plane and being answered with a plain HTTP response — can carry a status, and only a
+/// status this agent can explain becomes an [`UpgradeRefused`]. Everything else (a dead
+/// socket, a TLS pin mismatch, DNS) passes through unchanged.
+fn upgrade_error(err: tungstenite::Error) -> anyhow::Error {
+    if let tungstenite::Error::Http(resp) = &err {
+        let status = resp.status().as_u16();
+        if let Some(detail) = describe_upgrade_refusal(status) {
+            return anyhow::Error::new(UpgradeRefused { status, detail });
+        }
+    }
+    anyhow::Error::new(err)
+}
+
+/// Whether a failed connect/register cycle should bump
+/// `consecutive_registration_failures` (#199 follow-up).
+///
+/// A refused upgrade is not a registration attempt — no `register` was sent — and the
+/// refusals that caused it were each counted already. Letting it count again buries the
+/// cause: `/health`'s `reason` is the LAST recorded failure, so the 429 would overwrite
+/// the stale-identity line that says what to actually fix.
+///
+/// It is suppressed only once the verdict is already out. An agent that sees nothing
+/// *but* 429s — its own counter reset by a restart, or another agent behind the same
+/// address having spent the budget — has to be able to reach unhealthy, or a host that
+/// never connects would answer `/health` with `ok` forever.
+fn counts_as_registration_failure(refused_upgrade: bool, already_unhealthy: bool) -> bool {
+    !(refused_upgrade && already_unhealthy)
+}
+
 /// Write the verified pin beside the node secret the first time a pinned connection
 /// registers. Never overwrites what a reconnect merely re-learned; two cases do
 /// overwrite, and both are a pin that differs from the file AND has just verified a real
@@ -4239,6 +4350,130 @@ mod tests {
             "the run loop cannot see the stale-secret reject: {err:#}"
         );
         assert!(format!("{err:#}").contains("the saved secret is unknown here"));
+    }
+
+    // ── #199 follow-up: the 429 that follows the refused registers ──────────
+    //
+    // Ten refused registers with no minute's gap between them trip the control
+    // plane's enrollment-failure limiter (its window slides off the LAST
+    // refusal, so a backoff that never idles a full minute trips it however long
+    // it takes), and the WebSocket upgrade is then refused with 429 before any
+    // register is sent. The same 429 also answers an address with more than ten
+    // handshakes in flight, where there are no refusals above it at all. The
+    // operator's complaint was that this reads as a second, unrelated fault. It
+    // is not accounting that is wrong — an uncounted `host_not_found` would turn
+    // `/agent/ws` into a rate-unbounded node-name oracle — it is the presentation.
+
+    #[test]
+    fn a_rate_limited_upgrade_is_explained_as_a_consequence() {
+        let line = describe_upgrade_refusal(429).expect("429 must be explained");
+        let lower = line.to_lowercase();
+        assert!(
+            lower.contains("rate-limit"),
+            "the line must name what the control plane is doing: {line}"
+        );
+        assert!(
+            lower.contains("consequence"),
+            "the line must say this is downstream of the refusals, not a new fault: {line}"
+        );
+        assert!(
+            lower.contains("minute"),
+            "the line must say when it lifts: {line}"
+        );
+        assert!(
+            lower.contains("unresolvable"),
+            "the line must point at the reject above as the thing to act on: {line}"
+        );
+        // The limiter's window slides off the LAST refusal, so "ten inside a
+        // minute" is false — and false in the direction that sends an operator
+        // hunting for another client, which is the misreading this line exists
+        // to stop. An agent on a 30 s backoff trips it in about three minutes.
+        assert!(
+            lower.contains("no minute's gap"),
+            "the line must state the limiter's real rule, not 'ten inside a minute': {line}"
+        );
+        // A 429 is not proof of refused registers: the in-flight cap answers the
+        // same status for a fleet behind one NAT reconnecting together.
+        assert!(
+            lower.contains("in flight"),
+            "the line must name the other thing that answers 429: {line}"
+        );
+    }
+
+    #[test]
+    fn an_unexplained_upgrade_status_gets_no_line() {
+        for status in [503, 502, 500, 401, 404, 200] {
+            assert_eq!(
+                describe_upgrade_refusal(status),
+                None,
+                "status {status} has no explanation to offer"
+            );
+        }
+    }
+
+    /// The run loop reads the status back off the error to choose its token, so the
+    /// refusal has to survive the `anyhow` boundary the same way `StaleNodeSecret` does.
+    #[test]
+    fn a_rate_limited_upgrade_survives_the_anyhow_boundary() {
+        let err = upgrade_error(tungstenite::Error::Http(Box::new(
+            http_response_with_status(429),
+        )));
+        let refusal = err
+            .downcast_ref::<UpgradeRefused>()
+            .expect("the run loop cannot see the refusal");
+        assert_eq!(refusal.status, 429);
+        assert!(
+            format!("{err:#}").contains("429"),
+            "the logged line must still name the status: {err:#}"
+        );
+    }
+
+    /// An upgrade refused with a status the agent has nothing to say about stays an
+    /// ordinary connection failure — generic token, ordinary counting.
+    #[test]
+    fn an_unexplained_upgrade_refusal_stays_an_ordinary_failure() {
+        let err = upgrade_error(tungstenite::Error::Http(Box::new(
+            http_response_with_status(503),
+        )));
+        assert!(
+            err.downcast_ref::<UpgradeRefused>().is_none(),
+            "503 must not be dressed up as an explained refusal: {err:#}"
+        );
+    }
+
+    /// The 429 is not a register: it must not arm the #199 one-shot token fallback,
+    /// or every rate-limited reconnect would spend a single-use enrollment string.
+    #[test]
+    fn a_rate_limited_upgrade_does_not_arm_the_enrollment_fallback() {
+        let mut fallback = EnrollmentFallback::default();
+        fallback.observe(&upgrade_error(tungstenite::Error::Http(Box::new(
+            http_response_with_status(429),
+        ))));
+        assert!(
+            !fallback.take_for_attempt(),
+            "a refused upgrade carried no credential, so it cannot tell the agent to \
+             switch credentials"
+        );
+    }
+
+    /// Counting a rate-limited upgrade as one more registration failure would overwrite
+    /// `/health`'s `reason` with the 429 and bury the reject that caused it. Suppressed
+    /// only once the verdict is already out: a cold agent that sees nothing BUT 429s
+    /// (its own counter reset by a restart, or another agent behind the same address
+    /// spent the budget) must still reach unhealthy rather than report `ok` forever.
+    #[test]
+    fn a_rate_limited_upgrade_stops_counting_once_the_agent_is_already_unhealthy() {
+        assert!(!counts_as_registration_failure(true, true));
+        assert!(counts_as_registration_failure(true, false));
+        assert!(counts_as_registration_failure(false, true));
+        assert!(counts_as_registration_failure(false, false));
+    }
+
+    fn http_response_with_status(status: u16) -> tungstenite::http::Response<Option<Vec<u8>>> {
+        tungstenite::http::Response::builder()
+            .status(status)
+            .body(None)
+            .expect("build response")
     }
 
     // ── the reconnect loop's one-shot alternation (#199) ────────────────────
