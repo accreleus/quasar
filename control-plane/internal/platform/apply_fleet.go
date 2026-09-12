@@ -23,6 +23,11 @@ import (
 //   - The cancel flag is read BETWEEN targets and never mid-attempt.
 //   - The fleet stays cordoned until the run is terminal, whatever the
 //     control-plane step does about sessions.
+//   - EVERY cordon the run takes is recorded before it is taken, and restored
+//     from that record when the run ends: the fleet-wide one before the
+//     control-plane step, the per-host one before each host step. A run whose
+//     control plane is already current takes no fleet cordon at all, and a
+//     cordon with no record is one nothing will ever lift (#200).
 //   - The control-plane target drains the fleet first only when the release
 //     carries a migration; prepareFleet has the argument.
 //   - Even a non-migrating control-plane step waits for IN-FLIGHT sessions
@@ -739,6 +744,76 @@ func (f *FleetRunner) recordAndCordon(ctx context.Context, runID string, states 
 	}
 }
 
+// cordonForHostStep records and takes the cordon for the ONE host a run is
+// about to update, and answers whether the run may proceed to it.
+//
+// It exists because the fleet cordon is the control-plane step's (cordonFleet
+// runs inside prepareFleet): a run whose control plane is already on the
+// release never takes one, and recorded `cordoned_hosts: []` while its host
+// steps cordoned hosts that only the returning agent's register put back. An
+// attempt the updater refuses before any recreate — `updater_absent`, `busy`,
+// a rejected namespace — has no returning agent, so that host stayed `draining`
+// with nothing that knew to lift it (#200).
+//
+// It is deliberately NOT cordonFleet on this path. A host-only run recreates one
+// host at a time; taking the whole instance out of scheduling for the life of
+// the run — including hosts it will skip as up-to-date — would cost availability
+// the run does not need. The control-plane step is the instance-wide event, and
+// it keeps the instance-wide cordon.
+//
+// A host already in the record is left alone: re-reading its status now would
+// read the RUN's own cordon as the operator's, which is the #140/#170
+// conflation. The record is written BEFORE the cordon and a failed write takes
+// no cordon at all — recordAndCordon's rule, for the same reason: a cordon with
+// no record of what to undo is the leak this whole path exists to avoid. That
+// is why a failed write stops the run here rather than applying to an
+// unrecorded host.
+//
+// The resume path does not call this: the record is written before the attempt
+// exists, so an attempt there is to resume already has one. A run adopted from a
+// control plane older than this fix can hold a host attempt with no record, and
+// nothing here can tell that attempt's cordon from an operator's — the same
+// one-time window adoptCordons documents for #140.
+func (f *FleetRunner) cordonForHostStep(ctx context.Context, runID, hostID string) bool {
+	states, err := f.store.CordonedHosts(ctx, runID)
+	if err != nil {
+		f.log.Error("fleet apply: could not read what this run has cordoned",
+			"run_id", runID, "host_id", hostID, "err", err)
+		return false
+	}
+	for _, st := range states {
+		if st.HostID == hostID {
+			return true // already the run's to restore, whoever recorded it
+		}
+	}
+	status, err := f.store.HostStatus(ctx, hostID)
+	if err != nil {
+		f.log.Error("fleet apply: could not read a host's scheduling state before updating it",
+			"run_id", runID, "host_id", hostID, "err", err)
+		return false
+	}
+	// `== "draining"`, not `!= "online"`: only draining is a cordon, and an
+	// offline host recorded as the operator's would be CORDONED at restore
+	// (#170).
+	st := HostCordon{HostID: hostID, WasCordoned: status == "draining"}
+	if err := f.store.SetCordonedHosts(ctx, runID, append(states, st)); err != nil {
+		f.log.Error("fleet apply: could not record a host's scheduling state; not cordoning it",
+			"run_id", runID, "host_id", hostID, "err", err)
+		return false
+	}
+	if st.WasCordoned {
+		return true // the operator's cordon: already out of scheduling, and restored rather than lifted
+	}
+	if err := f.cordons.Cordon(ctx, hostID); err != nil {
+		// Not fatal here: the attempt cordons too, and fails itself if it
+		// cannot (a host that cannot be cordoned cannot be drained). The record
+		// is already written either way, so whatever ends up cordoned is lifted.
+		f.log.Warn("fleet apply: could not cordon a host before its step",
+			"run_id", runID, "host_id", hostID, "err", err)
+	}
+	return true
+}
+
 // MaxCordonRestoreSweep bounds ResumeCordonRestores. A boot sweep, not a backlog
 // drain: a run that keeps failing to settle is retried on the NEXT boot rather
 // than in a loop on this one.
@@ -958,6 +1033,18 @@ func (f *FleetRunner) hostPhase(ctx context.Context, run ApplyRun) bool {
 			f.recordSkip(ctx, run.ID, RunSkip{HostID: hostID, NodeName: nodeName(t), Reason: reason})
 			f.log.Info("fleet apply: host skipped", "run_id", run.ID, "host_id", hostID, "reason", reason)
 			continue
+		}
+		// Before the attempt, because the attempt cordons this host and leaves
+		// the restore to the run (apply_runner.go `drive`, #140). A run that
+		// skipped its control-plane step never went through prepareFleet, so
+		// without this it holds no record for the host it is about to take out
+		// of scheduling (#200). A host skipped below because an attempt is
+		// already in flight keeps the cordon recorded here — recorded is
+		// exactly what makes the run's own finish lift it.
+		if !f.cordonForHostStep(ctx, run.ID, hostID) {
+			f.finish(run.ID, RunFailed,
+				"could not record the scheduling state of "+nodeName(t)+" before updating it")
+			return false
 		}
 		attempt, err := f.createHostAttempt(ctx, run, hostID)
 		if errors.Is(err, ErrAttemptInFlight) {

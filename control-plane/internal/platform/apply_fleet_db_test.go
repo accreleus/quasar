@@ -48,6 +48,18 @@ func (d *succeedingDrivers) Adopt(ctx context.Context, a Attempt, _ string) bool
 	return true
 }
 
+// runnerDrivers drive the host half with the REAL per-host machine
+// (apply_runner.go), so a fleet test sees the cordon that machine actually
+// takes and the restore rule it actually applies. The control-plane half is
+// parked: every case that wants this has a control plane already on the
+// release, so it is never asked to apply.
+type runnerDrivers struct {
+	parkedDrivers
+	runner *Runner
+}
+
+func (d *runnerDrivers) Start(a Attempt) { d.runner.Start(a) }
+
 type fleetHarness struct {
 	pool    *pgxpool.Pool
 	store   *Store
@@ -499,6 +511,74 @@ func TestFleetAdoptedWithNoCordonRecordLeavesTheFleetOnline(t *testing.T) {
 		two, err2 := h.store.HostStatus(ctx, other)
 		return err1 == nil && err2 == nil && one == "online" && two == "online"
 	})
+}
+
+// #200, end to end against the real per-host machine. The control plane is
+// already on the release, so the run never goes through prepareFleet and takes
+// no fleet cordon — but the host step still cordons the host it is about to
+// recreate, and leaves the restore to the run (#140). Here the updater refuses
+// the request outright: nothing is recreated, the agent never goes away, so
+// nothing flips the host back. Before the fix it ended `draining` with no
+// record of why and nothing that knew to lift it.
+func TestFleetHostOnlyRunLeavesNoStrandedCordon(t *testing.T) {
+	drivers := &runnerDrivers{}
+	// commitB: this control plane is already on the release, so the only target
+	// is the host.
+	h := newFleetHarness(t, commitB, drivers)
+	ctx := context.Background()
+	drivers.runner = testRunner(h.store, ApplyDeps{
+		Cordon: func(ctx context.Context, hostID string) error {
+			_, err := h.pool.Exec(ctx, `UPDATE hosts SET status='draining' WHERE id = $1::uuid`, hostID)
+			return err
+		},
+		Uncordon: func(ctx context.Context, hostID string) error {
+			_, err := h.pool.Exec(ctx, `UPDATE hosts SET status='online' WHERE id = $1::uuid`, hostID)
+			return err
+		},
+		// The updater refuses before anything is recreated, which is the whole
+		// point: the agent is still there and still connected, so no register
+		// comes along to put the host back.
+		Send: func(context.Context, string, ApplyCommand) (Ack, error) {
+			return Ack{OK: false, Error: ReasonUpdaterAbsent}, nil
+		},
+		Connected: func(string) bool { return true },
+	})
+	t.Cleanup(drivers.runner.Close)
+
+	code, raw := h.do(t, http.MethodPost, "/v1/admin/platform/apply", h.admin,
+		FleetApplyRequest{ReleaseID: h.release.ID})
+	if code != http.StatusAccepted {
+		t.Fatalf("POST apply = %d %s, want 202", code, raw)
+	}
+	run := decodeRun(t, raw)
+
+	waitFor(t, "the run to stop at the failed host", func() bool {
+		r, err := h.store.Run(ctx, run.ID)
+		return err == nil && TerminalRunState(r.State)
+	})
+	final, err := h.store.Run(ctx, run.ID)
+	if err != nil || final.State != RunFailed {
+		t.Fatalf("run state = %q (%v), want failed", final.State, err)
+	}
+	as, err := h.store.RunAttempts(ctx, run.ID)
+	if err != nil || len(as) != 1 || as[0].Target != TargetHost {
+		t.Fatalf("attempts = %+v (%v), want the one host attempt", as, err)
+	}
+	if as[0].Reason == nil || *as[0].Reason != ReasonUpdaterAbsent {
+		t.Fatalf("attempt reason = %v, want %s", as[0].Reason, ReasonUpdaterAbsent)
+	}
+	// The acceptance line: the host is back in scheduling.
+	waitFor(t, "the host to be back in scheduling", func() bool {
+		status, err := h.store.HostStatus(ctx, h.hostID)
+		return err == nil && status == "online"
+	})
+	// And it got there through the run's own record, which is also what a
+	// control plane that died mid-run would have found (ClaimUnrestoredCordons
+	// selects on a non-empty cordoned_hosts).
+	recorded, err := h.store.CordonedHosts(ctx, run.ID)
+	if err != nil || len(recorded) != 1 || recorded[0].HostID != h.hostID || recorded[0].WasCordoned {
+		t.Fatalf("cordon record = %+v (%v), want the host recorded as this run's own", recorded, err)
+	}
 }
 
 func TestFleetApplyRejectsOlderEdgeBeforeCreatingRun(t *testing.T) {
