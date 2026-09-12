@@ -238,3 +238,25 @@ func TestPlanAutoApplyReportsAnInFlightAttemptAsSuch(t *testing.T) {
 			got.Reason, AutoApplyInFlight)
 	}
 }
+
+// Amendment 9: a blocked control plane refuses the pass, naming
+// preflight_blocked; a blocked host does not — the run starts and skips it
+// at its turn, which is what makes the outcome partial rather than a
+// mid-run discovery.
+func TestPlanAutoApplyTreatsPreflightLikeAnyEligibility(t *testing.T) {
+	v := autoView(offeredRelease("r1", false))
+	reason := ReasonPreflightBlocked
+	v.Targets[0] = Target{Kind: TargetControlPlane, Eligible: false, Reason: &reason,
+		Preflight: Preflight{State: PreflightBlocked}}
+	got := PlanAutoApply(AutoApplyInputs{Enabled: true, View: v})
+	if got.Apply || got.Reason != AutoApplyNotEligible || got.Detail != ReasonPreflightBlocked {
+		t.Fatalf("blocked control plane: got %+v", got)
+	}
+
+	v = autoView(offeredRelease("r1", false))
+	v.Targets[1] = Target{Kind: TargetHost, HostID: str("h1"), Eligible: false, Reason: &reason,
+		Preflight: Preflight{State: PreflightBlocked}}
+	if got := PlanAutoApply(AutoApplyInputs{Enabled: true, View: v}); !got.Apply {
+		t.Fatalf("a blocked host must not stop the pass (the run skips it): %+v", got)
+	}
+}

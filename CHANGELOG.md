@@ -25,6 +25,21 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Updating is checked before it starts, put back when it fails, and honest about what it
+  skipped** (#185: #186–#190, closes #184; migration 0083; protocol amendment 9). Every target on
+  Fleet ▸ Releases now carries a **preflight**: is the updater reachable (with the three-way
+  "socket volume not mounted / updater not running / updater not answering" diagnosis), does it
+  see the stack directory, was the container started with the same compose files the updater will
+  recreate it with, do the release's images resolve at the registry, and — for a host — is the
+  agent's health port answered by that agent. A failing check makes the target `preflight_blocked`
+  with the fix named on the card; the fleet Update is refused while the control plane is blocked,
+  and a blocked host is skipped and named. A host's checks are its own readiness checks (Hosts
+  tab ▸ Updates). When a host's new agent container fails its health wait, the **updater restores
+  the previous digest itself**, the result carries the failed container's last log lines, and the
+  history shows an automatic revert beside the failed apply (ADR 0004); the restored agent adopts
+  the apply that replaced it and relays its final state, found on the live gate. A run that skipped a host
+  that was behind ends **`succeeded_partial`**, the banner says which host and why, and **Retry
+  skipped hosts** starts a plain fleet apply linked to the first run.
 - **Quasar can install its own updates** (#122, migration 0081). Settings ▸ Platform updates
   ▸ "Install updates automatically", off by default. When it is on, a detected release is
   applied without a click — the control plane first, then every eligible host, through
@@ -131,8 +146,65 @@ own; the two do not move together, and that is deliberate.
   Contract: `quasar-protocol` "Audit-log names" amendment (additive, no migration).
 
 ### Fixed
+- **A busy Docker host no longer makes the agent report its own container runtime as
+  unresponsive** (#194). Every container-runtime command the agent runs had its output
+  read only after the child exited, so a command printing more than one pipe buffer's
+  worth of output blocked in `write(2)`, never exited, and was killed at the 30 s deadline
+  with "container runtime unresponsive" — blaming a daemon that was answering that same
+  command in hundredths of a second. The buffer is 8 KiB rather than 64 KiB on a host whose
+  root uid has exhausted its pipe-page quota, which dozens of running containers will do,
+  and a bare `docker image inspect`'s JSON clears 8 KiB: an external reporter's agent burnt
+  30 s on every reconnect failing to reconcile one catalog image, and before #191 that cost
+  it its registration. Both pipes are now drained while the command runs — the capture cap
+  discards the excess instead of stalling the writer — and the deadline stays hard even when
+  a process that inherited the pipe outlives the command it came from.
+- **A reconnecting agent no longer replays every updater result it has ever seen** (#193).
+  On each reconnect the node agent re-emitted a `release_state` for every result file in
+  the updater's results directory, including the control plane's own steps (written to
+  the same directory, never applied by the agent), and the control plane answered each of
+  those with a "names another host's attempt" warning — five per reconnect on a stack
+  with a few fleet runs behind it, drowning the warning that check exists to give. The
+  replay stays, narrowed to this agent's own results that are still live or finished
+  within the last two hours; a non-terminal result is always replayed, and a result whose
+  age cannot be read is kept rather than dropped. Nothing is deleted.
+- **An agent on a host whose Docker daemon answers slowly can register again** (#191). The
+  agent opened its WebSocket to the control plane first and only then ran the two
+  container-runtime probes `register` needs (the image reconcile and the install-mode probe,
+  each `docker inspect` bounded at 30 s). The control plane gives a fresh connection 15 s to
+  send `register`, so on such a host it closed the socket before `register` was written, the
+  agent logged "connection reset without closing handshake", reconnected, repeated the same
+  probes, and never came back. Found live by an external reporter straight after a successful
+  control-plane update; the host showed as down with the agent container running. The probes
+  now run before the socket is opened, the agent warns (`register-prep-slow`) when they took
+  more than 10 s, and the control plane's log names the handshake timeout in words instead of
+  a bare `i/o timeout`. The cost: the probes now run on every dial attempt, including while
+  the control plane is down, so a reconnect loop on a slow-runtime host is slower than
+  before rather than impossible.
+
+- `docs/upgrading.md` "Adding it to an existing install" no longer leaves the control plane
+  without the updater's socket. Step 3 brought up only the updater; the compose file also
+  mounts its socket volume into the control plane and the node agent, and a container
+  created before the volume existed keeps running without the mount, so the console said
+  the updater was not installed for the control plane while the agent reported it present.
+  The step now recreates all three. The same page gains a "before applying" check for the
+  agent's health port: since #152 an updated agent refuses to start when `127.0.0.1:9091`
+  is already taken on the host, which an older agent tolerated, so a release apply is the
+  first place that shows.
+- **`redeploy.sh` no longer reports a deploy healthy on evidence it never saw (#177).**
+  Host readiness and the codec plan were initialised to `ok` the moment the node-agent
+  log came back non-empty, *before* anything looked for a verdict — so a log carrying no
+  readiness verdict at all summarised as a confident `result=OK`, and so did a log with
+  no agent logs to read. Worse, the verdict the agent emits mid-provision (`no failures;
+  N check(s) are being remediated automatically and are not usable yet`) was missing from
+  the classifier entirely, which is the commonest first-boot redeploy there is. Absence
+  of evidence is now its own state: the summary reports `readiness=unverified` /
+  `codecs=unverified` and downgrades the result to `WARN`, the mid-provision verdict is
+  classified and reported as `PROVISIONING`, and only the agent's own all-clear earns an
+  `ok`. The verdict is polled for on the same bounded 30s budget the registration check
+  already uses, over a deeper log tail, so a verdict that simply had not landed yet is
+  not mistaken for one that never will.
 - **A fleet run that cannot put the fleet back into scheduling now leaves a recovery
-  requirement the next start acts on (#176, migration 0083).** The terminal state is
+  requirement the next start acts on (#176, migration 0084).** The terminal state is
   written before the cordons are lifted, and `ActiveRun` selects only non-terminal runs —
   so an uncordon that failed, or a process that died in that window, left hosts
   `draining` with a single ERROR line as the entire record and nothing that would ever

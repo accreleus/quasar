@@ -332,6 +332,17 @@ host. Every apply produces one, whether it succeeded or failed, and it is the
 only durable record of what that target was on before. _Avoid_: "job" (an
 attempt is operator-initiated and rides no schedule), "task".
 
+**Preflight** — the per-target evaluation, on the release view, of whether the
+stack around a target is shaped so an apply can be carried out at all: the
+updater reachable, the stack directory and overlays it will act on the ones the
+target was started with, the health port the next agent start needs, the
+release's images resolvable. Distinct from *eligibility* (may this target take
+the release) and from a host's *readiness* (can it run sessions); a host's own
+readiness checks are inputs to its preflight. A blocked preflight is one
+eligibility reason among the others. _Avoid_: "conformance check" (the checks
+are readiness checks; preflight is the evaluation that reads them), "health
+check" (that is the container's), "precheck".
+
 **Release notification** — one outbound message announcing that a platform
 release this instance could move to has appeared. Sent once per release, to an
 admin-configured webhook URL, after a detection pass. It is a delivery, not a

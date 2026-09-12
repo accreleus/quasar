@@ -5,11 +5,13 @@ import { render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as adminApi from "../../../api/admin";
-import type { PlatformRelease, PlatformReleaseView } from "../../../api/types";
+import type { PlatformPreflight, PlatformRelease, PlatformReleaseView } from "../../../api/types";
 import { SectionHeadProvider } from "../../../components/shell/sectionHead";
 import { FLEET_TABS } from "../../../components/shell/sectionTabs";
 import { ToastProvider } from "../../../components/Toast";
 import { ReleasesTab } from "./ReleasesTab";
+
+const PF: PlatformPreflight = { state: "unknown", checked_at: null, checks: [] };
 
 vi.mock("../../../auth/context", () => ({ useAuth: () => ({ token: "tok" }) }));
 vi.mock("../../../api/admin");
@@ -52,7 +54,7 @@ function edgeView(over: Partial<PlatformRelease> = {}): PlatformReleaseView {
     },
     available: [release],
     targets: [
-      { kind: "control_plane", host_id: null, node_name: null, eligible: true, reason: null },
+      { kind: "control_plane", host_id: null, node_name: null, eligible: true, reason: null, preflight: PF },
     ],
     faults: [],
   } as PlatformReleaseView;
@@ -75,6 +77,7 @@ beforeEach(() => {
   // The page also reads sessions (for the force count) and the apply history.
   mocked.listAllSessions.mockResolvedValue({ items: [], next_cursor: null } as never);
   mocked.listPlatformAttempts.mockResolvedValue({ attempts: [] });
+  mocked.listPlatformApplyRuns.mockResolvedValue({ runs: [] });
   // The head's "next check" fragment reads the detection job's schedule.
   mocked.listJobs.mockResolvedValue({ items: [], next_cursor: null } as never);
 });
@@ -82,7 +85,7 @@ beforeEach(() => {
 describe("ReleasesTab on edge", () => {
   it("labels an older same-schema edge candidate without suggesting a new update", async () => {
     const view = edgeView({ built_at: "2026-08-18T09:14:02Z" });
-    view.targets[0] = { ...view.targets[0], eligible: false, reason: "up_to_date" };
+    view.targets[0] = { ...view.targets[0], eligible: false, reason: "up_to_date", preflight: PF };
     mocked.getPlatformReleases.mockResolvedValue(view);
     renderTab();
     expect((await screen.findAllByText(/Older than installed/)).length).toBeGreaterThan(0);

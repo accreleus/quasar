@@ -606,7 +606,7 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 	conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	raw, err := readTextMessage(conn)
 	if err != nil {
-		return fail(fmt.Errorf("read: %w", err))
+		return fail(fmt.Errorf("read: %w", describeHandshakeRead(err)))
 	}
 
 	var reg RegisterMsg
@@ -696,6 +696,22 @@ func (h *Handler) handleCapacity(ctx context.Context, conn *websocket.Conn, host
 	}
 
 	return h.processCapacity(ctx, hostID, raw)
+}
+
+// describeHandshakeRead names the one register-read failure operators meet in the
+// field: the agent opened the socket and then sent nothing for handshakeTimeout.
+// Before #191 the agent ran its container-runtime probes INSIDE that window, so a
+// slow docker daemon on the host surfaced here as a bare i/o timeout and, on the
+// agent, as "connection reset without closing handshake" — two logs that did not
+// look like the same event. Everything else passes through unchanged.
+func describeHandshakeRead(err error) error {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return fmt.Errorf("no register within %s of the connection opening — an agent "+
+			"whose container runtime answers slowly can take longer than this to prepare "+
+			"its register (#191): %w", handshakeTimeout, err)
+	}
+	return err
 }
 
 func readTextMessage(conn *websocket.Conn) ([]byte, error) {

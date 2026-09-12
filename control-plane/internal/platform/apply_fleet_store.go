@@ -26,37 +26,44 @@ var (
 
 // terminalRunStatesSQL is TerminalRunState in SQL; pinned to its Go twin by
 // TestTerminalRunSplitMatchesSQL.
-const terminalRunStatesSQL = `('succeeded','failed','cancelled')`
+const terminalRunStatesSQL = `('succeeded','succeeded_partial','failed','cancelled')`
 
 const runColumns = `id::text, release_id::text, state, force, unattended, requested_by::text,
 	cancel_requested, cancel_requested_at, current_target, current_host_id::text,
-	error, created_at, started_at, finished_at`
+	error, created_at, started_at, finished_at, retry_of::text, skipped`
 
 func scanRun(row pgx.Row) (ApplyRun, error) {
 	var r ApplyRun
 	var errText string
+	var skipped []byte
 	if err := row.Scan(&r.ID, &r.ReleaseID, &r.State, &r.Force, &r.Unattended, &r.RequestedBy,
 		&r.CancelRequested, &r.CancelRequestedAt, &r.CurrentTarget, &r.CurrentHostID,
-		&errText, &r.CreatedAt, &r.StartedAt, &r.FinishedAt); err != nil {
+		&errText, &r.CreatedAt, &r.StartedAt, &r.FinishedAt, &r.RetryOf, &skipped); err != nil {
 		return ApplyRun{}, err
 	}
 	if errText != "" {
 		r.Error = &errText
 	}
 	r.Skipped = make([]RunSkip, 0)
+	if len(skipped) > 0 {
+		if err := json.Unmarshal(skipped, &r.Skipped); err != nil {
+			return ApplyRun{}, fmt.Errorf("decode platform_apply_runs.skipped: %w", err)
+		}
+	}
 	r.Attempts = make([]Attempt, 0)
 	return r, nil
 }
 
 // CreateRun inserts a `pending` run. A second active run raises the partial
-// unique index and comes back as ErrRunActive — the refusal, unraced.
-func (s *Store) CreateRun(ctx context.Context, releaseID string, force bool, actor *string) (ApplyRun, error) {
+// unique index and comes back as ErrRunActive — the refusal, unraced. retryOf
+// is the succeeded_partial run this one finishes, or nil (amendment 9).
+func (s *Store) CreateRun(ctx context.Context, releaseID string, force bool, actor, retryOf *string) (ApplyRun, error) {
 	var id string
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO platform_apply_runs (release_id, state, force, requested_by)
-		VALUES ($1::uuid, 'pending', $2, $3::uuid)
+		INSERT INTO platform_apply_runs (release_id, state, force, requested_by, retry_of)
+		VALUES ($1::uuid, 'pending', $2, $3::uuid, $4::uuid)
 		RETURNING id::text
-	`, releaseID, force, actor).Scan(&id)
+	`, releaseID, force, actor, retryOf).Scan(&id)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
@@ -181,6 +188,27 @@ func (s *Store) ListRuns(ctx context.Context, limit int) ([]ApplyRun, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// RecordSkip appends one host the run passed over to its persisted `skipped`
+// list (migration 0083). Idempotent per host: a re-adopted run re-walks its
+// host list, and a host it already recorded must not appear twice.
+func (s *Store) RecordSkip(ctx context.Context, runID string, skip RunSkip) error {
+	entry, err := json.Marshal([]RunSkip{skip})
+	if err != nil {
+		return fmt.Errorf("encode skip: %w", err)
+	}
+	_, err = s.pool.Exec(ctx, `
+		UPDATE platform_apply_runs
+		   SET skipped = skipped || $2::jsonb
+		 WHERE id = $1::uuid
+		   AND NOT EXISTS (
+		       SELECT 1 FROM jsonb_array_elements(skipped) e
+		        WHERE e->>'host_id' = $3)`, runID, entry, skip.HostID)
+	if err != nil {
+		return fmt.Errorf("record skip: %w", err)
+	}
+	return nil
 }
 
 // RunAttempts reads one run's attempts in the order the run reached them.
@@ -348,7 +376,7 @@ func (s *Store) SetCordonedHosts(ctx context.Context, runID string, states []Hos
 // proven undone. Separate from FinishRun on purpose: the terminal write happens
 // first — a run stuck non-terminal is its own outage — so this column is what
 // tells the next boot whether the cleanup that follows it actually finished
-// (migration 0083, #176).
+// (migration 0084, #176).
 func (s *Store) MarkCordonsRestored(ctx context.Context, runID string) error {
 	_, err := s.pool.Exec(ctx,
 		`UPDATE platform_apply_runs SET cordons_restored_at = now() WHERE id = $1::uuid`, runID)

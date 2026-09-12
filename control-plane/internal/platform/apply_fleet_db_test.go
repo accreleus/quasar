@@ -355,7 +355,7 @@ func TestFleetRunIsAdoptedAfterARestart(t *testing.T) {
 
 	// The state a restart leaves behind: a run mid-flight with the
 	// control-plane attempt already resolved and no host reached.
-	run, err := h.store.CreateRun(ctx, h.release.ID, false, nil)
+	run, err := h.store.CreateRun(ctx, h.release.ID, false, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,7 +412,7 @@ func TestFleetRestoresTheCordonAcrossARestart(t *testing.T) {
 	// A second host, so the record has both shapes in it.
 	other := seedHost(t, h.pool, "gpu-fleet-02", commitA, "online")
 
-	run, err := h.store.CreateRun(ctx, h.release.ID, false, nil)
+	run, err := h.store.CreateRun(ctx, h.release.ID, false, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -470,7 +470,7 @@ func TestFleetAdoptedWithNoCordonRecordLeavesTheFleetOnline(t *testing.T) {
 
 	other := seedHost(t, h.pool, "gpu-fleet-02", commitA, "online")
 
-	run, err := h.store.CreateRun(ctx, h.release.ID, false, nil)
+	run, err := h.store.CreateRun(ctx, h.release.ID, false, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -564,8 +564,12 @@ func TestFleetHoldsRunningSessionsWhenTheReleaseRunsNoMigration(t *testing.T) {
 		return err == nil && TerminalRunState(r.State)
 	})
 	final, err := h.store.Run(context.Background(), run.ID)
-	if err != nil || final.State != RunSucceeded {
-		t.Fatalf("run state = %q (%v), want succeeded", final.State, err)
+	// The harness pins the control plane's identity at commitA, so after the
+	// control-plane step every host still reads control_plane_not_first and is
+	// passed over: partial is the honest state, and the control-plane step is
+	// what this test is about.
+	if err != nil || final.State != RunSucceededPartial {
+		t.Fatalf("run state = %q (%v), want succeeded_partial", final.State, err)
 	}
 	if got := sessionStates(t, h.pool); len(got) != 1 || got[0] != "running" {
 		t.Fatalf("session states = %v, want the one that was running to still be running", got)
@@ -628,8 +632,12 @@ func TestFleetForceEndsSessionsBeforeAMigratingControlPlaneStep(t *testing.T) {
 		return err == nil && TerminalRunState(r.State)
 	})
 	final, err := h.store.Run(context.Background(), run.ID)
-	if err != nil || final.State != RunSucceeded {
-		t.Fatalf("run state = %q (%v), want succeeded", final.State, err)
+	// The harness pins the control plane's identity at commitA, so after the
+	// control-plane step every host still reads control_plane_not_first and is
+	// passed over: partial is the honest state, and the control-plane step is
+	// what this test is about.
+	if err != nil || final.State != RunSucceededPartial {
+		t.Fatalf("run state = %q (%v), want succeeded_partial", final.State, err)
 	}
 	// The session the operator agreed to lose is actually gone BEFORE the
 	// migration ran, which is the property the old fleet-wide drain provided.
@@ -687,10 +695,87 @@ func TestFleetWaitsForAnInFlightLaunchOnANonMigratingStep(t *testing.T) {
 		return err == nil && TerminalRunState(r.State)
 	})
 	final, err := h.store.Run(context.Background(), run.ID)
-	if err != nil || final.State != RunSucceeded {
-		t.Fatalf("run state = %q (%v), want succeeded", final.State, err)
+	// The harness pins the control plane's identity at commitA, so after the
+	// control-plane step every host still reads control_plane_not_first and is
+	// passed over: partial is the honest state, and the control-plane step is
+	// what this test is about.
+	if err != nil || final.State != RunSucceededPartial {
+		t.Fatalf("run state = %q (%v), want succeeded_partial", final.State, err)
 	}
 	if got := sessionStates(t, h.pool); len(got) != 1 || got[0] != "running" {
 		t.Fatalf("session states = %v, want the launch to have survived", got)
+	}
+}
+
+// Migration 0083: the persisted skip list, the partial state and retry_of all
+// round-trip through the row, and a skip is recorded once per host however
+// many times a re-adopted run re-walks its list.
+func TestRunSkipsPartialStateAndRetryOfRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	h := newFleetHarness(t, commitA, parkedDrivers{})
+
+	first, err := h.store.CreateRun(ctx, h.release.ID, false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	skip := RunSkip{HostID: h.hostID, NodeName: "gpu-01", Reason: ReasonPreflightBlocked}
+	for i := 0; i < 2; i++ {
+		if err := h.store.RecordSkip(ctx, first.ID, skip); err != nil {
+			t.Fatalf("record skip: %v", err)
+		}
+	}
+	if err := h.store.FinishRun(ctx, first.ID, RunSucceededPartial, ""); err != nil {
+		t.Fatalf("finish partial: %v", err)
+	}
+	got, err := h.store.Run(ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != RunSucceededPartial || got.FinishedAt == nil {
+		t.Fatalf("run = %+v, want terminal succeeded_partial", got)
+	}
+	if len(got.Skipped) != 1 || got.Skipped[0] != skip {
+		t.Fatalf("skipped = %+v, want exactly one entry for the host", got.Skipped)
+	}
+	if got.RetryOf != nil {
+		t.Fatalf("retry_of = %v on a plain run, want null", *got.RetryOf)
+	}
+	// A terminal partial run no longer owns the fleet: a retry can start.
+	if active, err := h.store.ActiveRun(ctx); err != nil || active != nil {
+		t.Fatalf("active run after a partial finish = %v (err %v), want none", active, err)
+	}
+
+	retry, err := h.store.CreateRun(ctx, h.release.ID, false, nil, &first.ID)
+	if err != nil {
+		t.Fatalf("create retry: %v", err)
+	}
+	if retry.RetryOf == nil || *retry.RetryOf != first.ID {
+		t.Fatalf("retry_of = %v, want %s", retry.RetryOf, first.ID)
+	}
+	if err := h.store.FinishRun(ctx, retry.ID, RunSucceeded, ""); err != nil {
+		t.Fatal(err)
+	}
+	// Deleting the original leaves the retry standing, unlinked.
+	mustExec(t, h.pool, `DELETE FROM platform_apply_runs WHERE id = $1::uuid`, first.ID)
+	again, err := h.store.Run(ctx, retry.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.RetryOf != nil {
+		t.Fatalf("retry_of after the original was deleted = %v, want null", *again.RetryOf)
+	}
+
+	// And the attempt kind CHECK admits auto_revert, inserted terminal.
+	a, err := h.store.CreateAutoRevertAttempt(ctx, NewAutoRevert{
+		Failed:    Attempt{HostID: &h.hostID, RunID: &retry.ID},
+		Requested: []ComponentDigest{{Name: ComponentNodeAgent, Image: "x", Digest: "sha256:" + hex64}},
+		Previous:  []PreviousDigest{{Name: ComponentNodeAgent}},
+		Output:    "restored",
+	})
+	if err != nil {
+		t.Fatalf("auto_revert row: %v", err)
+	}
+	if a.Kind != KindAutoRevert || a.State != AttemptSucceeded || a.FinishedAt == nil || a.RunID == nil || *a.RunID != retry.ID {
+		t.Fatalf("row = %+v, want a terminal succeeded auto_revert on the run", a)
 	}
 }

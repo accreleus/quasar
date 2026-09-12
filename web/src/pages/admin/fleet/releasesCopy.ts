@@ -19,9 +19,50 @@ const REASON_TEXT: Record<string, string> = {
   host_offline: "The host's agent is not connected.",
   release_above_control_plane: "Waiting on the control plane: this release carries a newer schema.",
   control_plane_not_first: "Waiting on the control plane, which moves first.",
+  preflight_blocked: "A preflight check failed on this target; the check below names the fix.",
   attempt_in_flight: "An update is already in flight on this target.",
   run_active: "A fleet update is already running.",
 };
+
+/** The closed preflight check vocabulary (amendment 9), as short labels. An
+ *  unknown id renders verbatim. */
+const PREFLIGHT_CHECK_TEXT: Record<string, string> = {
+  updater_socket: "updater reachable",
+  updater_stack_dir: "updater sees the stack directory",
+  updater_overlays: "compose files match the updater's",
+  image_resolvable: "release images resolve at the registry",
+  agent_connected: "agent connected",
+  health_addr_bindable: "agent health port free",
+};
+
+export function preflightCheckText(id: string): string {
+  return PREFLIGHT_CHECK_TEXT[id] ?? id;
+}
+
+/** A skip reason as the short phrase a sentence takes ("gpu-02 (offline)");
+ *  REASON_TEXT above is the same vocabulary as a full sentence. */
+const SKIP_PHRASE: Record<string, string> = {
+  host_offline: "offline",
+  preflight_blocked: "a preflight check failed",
+  install_mode_source: "built from source",
+  updater_absent: "no updater",
+  attempt_in_flight: "another update in flight",
+};
+
+export function skipReasonPhrase(reason: string): string {
+  return SKIP_PHRASE[reason] ?? reason;
+}
+
+/** Which button, or no button at all, produced an attempt. */
+const ATTEMPT_KIND_TEXT: Record<string, string> = {
+  apply: "Apply",
+  revert: "Revert",
+  auto_revert: "Reverted automatically",
+};
+
+export function attemptKindText(kind: string): string {
+  return ATTEMPT_KIND_TEXT[kind] ?? kind;
+}
 
 export function eligibilityText(reason: EligibilityReason | string | null): string {
   if (!reason) return "Ready to update.";
@@ -51,12 +92,14 @@ export function attemptStateText(state: string): string {
   return ATTEMPT_STATE_TEXT[state] ?? state;
 }
 
-/** A fleet run's state. There is no `partial`: a failed run stops at its first
- *  failed target and the per-target attempts carry the rest. */
+/** A fleet run's state. A failed run stops at its first failed target and the
+ *  per-target attempts carry the rest; a partial one failed nothing but left a
+ *  host behind (amendment 9). */
 const RUN_STATE_TEXT: Record<string, string> = {
   pending: "Queued.",
   running: "Updating.",
   succeeded: "Every target is on the new release.",
+  succeeded_partial: "Applied, but at least one host was skipped and is still on the old release.",
   failed: "Stopped at the first target that failed.",
   cancelled: "Cancelled; nothing further was started.",
 };

@@ -66,14 +66,26 @@
 # line is a machine-readable summary the drift-check (qstack sync) parses:
 #   REDEPLOY env=<> scope=<> ref=<> sha=<short> bundle=<index-hash.js> \
 #            health=<ok|FAIL> catalog=<code> agent=<registered|MISSING> \
-#            readiness=<ok|FAILED|unknown> codecs=<ok|degraded|pending|unknown> \
+#            readiness=<ok|RETRYING|PROVISIONING|FAILED|unverified> \
+#            codecs=<ok|degraded|pending|unverified> \
 #            updater=<ok|FAIL|absent> result=<OK|WARN|FAIL>
 #
-# result=WARN means the deploy mechanically succeeded but the host is degraded
-# (failing readiness checks, a degraded codec plan, or a refused provisioning lock).
+# `unverified` is not a synonym for ok: it means this script found no verdict to
+# read, so nothing about the host was observed either way (#177). It degrades the
+# result exactly as a bad verdict does, because a deploy nobody checked is not a
+# deploy that passed.
+#
+# result=WARN means the deploy mechanically succeeded but the host is degraded or
+# unverified (failing readiness checks, readiness still being remediated, a
+# degraded codec plan, a refused provisioning lock, or no verdict at all).
 # The exit status stays 0 there — the redeploy did what it was asked — so automation
 # that gates on the exit code is unchanged, while anything reading result= sees it.
 set -euo pipefail
+
+# What a node-agent's log says about the host. Pure classification, sourced
+# rather than duplicated, so scripts/dx/tests/run.sh can pin it without a stack.
+# shellcheck source=lib/agent-readiness.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/agent-readiness.sh"
 
 ENV="${1:-}"
 REF="${2:-origin/main}"
@@ -1062,96 +1074,160 @@ fi
 # streaming: a provision that died mid-flight leaves no Vulkan encode and failing
 # readiness checks behind it, and #66 was diagnosed on a deploy where this script
 # printed a confident result=OK through exactly that for 90 minutes. Read the agent's
-# own verdict rather than inferring one from liveness.
-readiness=unknown
-codecs=unknown
-agent_log="$($DC logs --tail 400 quasar-node-agent 2>/dev/null || true)"
-if [ -n "$agent_log" ]; then
-  readiness=ok
-  codecs=ok
-  # Classify the LAST readiness verdict in the log, never the first. The #98 boot race
-  # exits on purpose and heals on the retry, and a restart-policy restart keeps the same
-  # container's log, so a healed host still carries the failing line from the boot before.
-  # Token contract: node-agent/src/{readiness,agent}.rs.
-  readiness_line="$(printf '%s' "$agent_log" |
-    grep -E 'boot-render-node-missing|boot-render-node-retry-deferred|boot-render-node-retries-spent|boot-render-node-unopenable|boot-dri-modes-stale-cdi|boot-host-render-node-missing|readiness-checks-failed|host readiness: all checks passed or skipped' |
-    tail -1 || true)"
-  case "$readiness_line" in
-  *boot-render-node-missing*)
-    readiness=RETRYING
+# own verdict rather than inferring one from liveness — and never invent one.
+#
+# `unverified` is a THIRD state beside ok and failed, and it is the DEFAULT. This
+# block used to set readiness=ok and codecs=ok the moment the log was non-empty,
+# BEFORE looking for a verdict, so a log that carried no verdict at all, or one
+# the classifier did not recognise, summarised as a confident OK (#177).
+# Classification itself lives in deploy/lib/agent-readiness.sh, sourced above:
+# pure, and pinned branch by branch in scripts/dx/tests/run.sh.
+#
+# The verdict lands a moment after registration, so poll for it on the same
+# bounded budget the registration check above uses rather than sampling once —
+# a verdict that has not arrived yet is a different thing from one that never
+# will. The tail is deep because the block is one line per check and a host that
+# restarted a few times pushes an older verdict past a short window.
+# Reads the agent's log for ONE process lifetime, or nothing.
+#
+# The library treats a startup line as a hard boundary, but that only helps once
+# the new process has logged one. Between an agent exiting and its replacement
+# writing that line, a plain `logs` read returns the OLD process's verdicts with
+# nothing to mark them stale — and this agent restarts itself routinely (#98's
+# retry, the driver-volume provision, a config reload). So bracket the read with
+# the container's `StartedAt`: same value before and after, still running, and
+# logs `--since` that instant. A restart mid-read simply costs a poll attempt.
+read_agent_log() {
+  local cid before after
+  cid="$($DC ps -q quasar-node-agent 2>/dev/null || true)"
+  [ -n "$cid" ] || return 0
+  before="$(docker inspect -f '{{.State.StartedAt}} {{.State.Running}}' "$cid" 2>/dev/null || true)"
+  [ "${before##* }" = true ] || return 0
+  local log
+  log="$(docker logs --since "${before% *}" --tail 2000 "$cid" 2>&1 || true)"
+  after="$(docker inspect -f '{{.State.StartedAt}} {{.State.Running}}' "$cid" 2>/dev/null || true)"
+  [ "$before" = "$after" ] || return 0
+  printf '%s' "$log"
+}
+# BOTH verdicts, not just readiness: a healthy agent logs its readiness summary
+# and its codec probe at different moments, so a poll that stopped at the first
+# would report a healthy host as half-unverified whenever a read landed between
+# them. poll_agent_log is in the library, with the reader and the sleeper
+# injected, so the suite can drive it without a stack and without waiting.
+agent_log="$(poll_agent_log read_agent_log 15)"
+readiness_verdict="$(readiness_line "$agent_log")"
+
+if [ -z "$agent_log" ]; then
+  # Was a `note:` that changed nothing, so a deploy with no agent logs at all
+  # still summarised as result=OK.
+  readiness=unverified
+  codecs=unverified
+  echo "  WARN: could not read node-agent logs, so host readiness and the codec plan are"
+  echo "        UNVERIFIED — this deploy is not confirmed usable for streaming:"
+  echo "          $DC logs quasar-node-agent"
+  degraded=1
+else
+  # ONE composition of the three fields, `agent_summary`, and it is the same
+  # function scripts/dx/tests/run.sh asserts against — so what the tests pin and
+  # what this line prints cannot drift apart. The cause below is used only to
+  # choose the operator text.
+  summary="$(agent_summary "$agent_log")"
+  readiness="$(sed -n 's/^readiness=//p' <<<"$summary")"
+  codecs="$(sed -n 's/^codecs=//p' <<<"$summary")"
+  case "$(sed -n 's/^severity=//p' <<<"$summary")" in
+  fail) fail=1 ;;
+  warn) degraded=1 ;;
+  esac
+  cause="$(readiness_cause "$readiness_verdict")"
+
+  case "$cause" in
+  passed)
+    echo "  ok: node-agent reports all host readiness checks passed or skipped"
+    ;;
+  provisioning)
+    # The agent says so itself: no failures, and not usable yet. This verdict was
+    # absent from the classifier entirely, so a mid-provision first boot — the
+    # commonest redeploy there is — produced no verdict line and summarised as OK.
+    echo "  WARN: the node-agent reports no readiness FAILURES, but checks are still being"
+    echo "        remediated automatically and the host is NOT usable yet:"
+    printf '%s\n' "$readiness_verdict" | sed 's/^/        /'
+    echo "        Re-check once the provision completes."
+    ;;
+  render-node-missing)
     echo "  FAIL: the node-agent is exiting on purpose because it cannot see a /dev/dri render"
     echo "        node the host kernel HAS (#98). A device list is fixed at container creation,"
     echo "        so the restart policy re-creating it is the fix, and it normally settles on"
     echo "        the next boot. If it does not, /dev/dri is not reaching the agent at all:"
     echo "        check the node-agent service's devices:/gpus: entry, then recreate."
-    fail=1
     ;;
-  *boot-render-node-retry-deferred*)
+  retry-deferred)
     # Transient by construction: the agent held the retry back only because a provision was
     # writing a shared volume, and it takes it on the next boot.
-    readiness=RETRYING
     echo "  WARN: the node-agent cannot see a /dev/dri render node yet and is holding its"
     echo "        restart back until a driver/CUDA provision finishes (#66/#98). It retries on"
     echo "        the next agent start; re-check once the provision completes:"
     echo "          $DC logs quasar-node-agent | grep gpu-host-sanity"
-    degraded=1
     ;;
-  *boot-dri-modes-stale-cdi*)
-    readiness=FAILED
+  stale-cdi)
     echo "  FAIL: the /dev/dri nodes inside the agent container cannot be opened by the app"
     echo "        user — the boot-time CDI spec baked the wrong modes, and no restart can fix"
     echo "        it (CDI edits are applied when a container is created). On the HOST:"
     echo "          sudo nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml"
     echo "          $DC up -d --force-recreate"
-    fail=1
     ;;
-  *boot-render-node-unopenable*)
-    readiness=FAILED
+  render-node-unopenable)
     echo "  FAIL: a /dev/dri render node IS in the agent container but cannot be opened —"
     echo "        a mode/group/device-cgroup fault, which a restart reproduces exactly."
     echo "        Check the nodes on the HOST ('ls -l /dev/dri') and the node-agent service's"
     echo "        devices:/device_cgroup_rules: entries, then recreate the containers."
-    fail=1
     ;;
-  *boot-render-node-retries-spent* | *boot-host-render-node-missing*)
-    readiness=FAILED
+  sanity-failed)
     echo "  FAIL: the node-agent reports a boot sanity failure that no restart can fix:"
-    printf '%s' "$readiness_line" | sed 's/^/        /'
+    printf '%s\n' "$readiness_verdict" | sed 's/^/        /'
     echo "        $DC logs quasar-node-agent | grep gpu-host-sanity"
-    fail=1
     ;;
-  *readiness-checks-failed*)
-    readiness=FAILED
+  checks-failed)
     echo "  WARN: the node-agent reports FAILING host readiness checks:"
-    printf '%s' "$readiness_line" | sed 's/^/        /'
+    printf '%s\n' "$readiness_verdict" | sed 's/^/        /'
     echo "        Admin -> Hosts -> this host lists them with remediation."
-    degraded=1
+    ;;
+  *)
+    echo "  WARN: the node-agent logs carry no readiness verdict after 30s, so this deploy is"
+    echo "        UNVERIFIED rather than healthy — the agent may not have reached its startup"
+    echo "        checks, or its log may have rolled past them. Look before trusting it:"
+    echo "          $DC logs quasar-node-agent | grep 'host readiness'"
     ;;
   esac
-  # A codec plan that is merely waiting on the driver volume is the expected first-boot
-  # state and self-clears on the agent's restart; only a genuinely degraded plan counts.
-  if printf '%s' "$agent_log" | grep -q 'vulkan-codec-plan-degraded'; then
-    codecs=degraded
+
+  case "$codecs" in
+  degraded)
     echo "  WARN: the vulkan codec plan is DEGRADED — at least one enabled codec is not"
     echo "        on the Vulkan encoder. Sessions still run (per-codec vendor fallback),"
     echo "        but this host is not serving what it advertises."
-    degraded=1
-  elif printf '%s' "$agent_log" | grep -q 'vulkan-codec-plan-pending-driver-volume'; then
-    codecs=pending
+    ;;
+  pending)
     echo "  note: codec plan pending the NVIDIA driver volume (expected on a first boot);"
     echo "        the agent re-probes after it self-restarts."
-  fi
+    ;;
+  unverified)
+    echo "  WARN: the node-agent never reported a codec probe, so what this host can encode is"
+    echo "        UNVERIFIED:"
+    echo "          $DC logs quasar-node-agent | grep 'codec support probed'"
+    ;;
+  esac
+
   # A provision that was killed mid-write strands its lockfile, and every later attempt
   # refuses until the takeover window passes. That is the #66 failure in one line.
-  if printf '%s' "$agent_log" | grep -q 'already provisioning this artifact'; then
+  # A here-string rather than a pipe: `grep -q` exits at the first match, and under
+  # `set -o pipefail` the SIGPIPE that gives the writer makes the whole pipeline
+  # non-zero — so on a long log a present line can read as absent.
+  if grep -q 'already provisioning this artifact' <<<"$agent_log"; then
     echo "  WARN: a provisioning lock is being refused — a previous agent may have died"
     echo "        mid-provision. The holder is taken over once its lockfile goes untouched;"
     echo "        if nothing is actually downloading, remove the stale .provision.lock in"
     echo "        the driver volume to reclaim it now."
     degraded=1
   fi
-else
-  echo "  note: could not read node-agent logs; readiness and codec plan not verified"
 fi
 
 result=OK

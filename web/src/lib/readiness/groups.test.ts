@@ -6,9 +6,14 @@ function c(id: string, status = "pass", summary = id): ReadinessCheck {
   return { id, status, summary, remediation: "" } as ReadinessCheck;
 }
 
-// Every `const ID: &str = "…"` in node-agent/src/readiness.rs. A check added or
-// renamed there must be placed here, or it lands in "Other" unnoticed.
+// Every `const ID: &str = "…"` in node-agent/src/readiness.rs and
+// readiness/platform_update.rs. A check added or renamed there must be placed
+// here, or it lands in "Other" unnoticed.
 const AGENT_CHECK_IDS = [
+  "updater_socket",
+  "updater_stack_dir",
+  "updater_overlays",
+  "health_addr_bindable",
   "xid_visibility",
   "nvidia_egl_vendor_json",
   "nvidia_eglcore_library",

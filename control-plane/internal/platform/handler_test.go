@@ -1,9 +1,11 @@
 package platform
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
@@ -63,5 +65,37 @@ func TestRegisterWiresIdentityThroughTheAdminMiddleware(t *testing.T) {
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/admin/platform/identity", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("route not reachable: status %d", rec.Code)
+	}
+}
+
+// #184 through the view: a control plane whose socket volume is not mounted
+// reads Blocked on its own target, with the recreate named — the diagnosis the
+// bare "not installed" used to hide.
+func TestReleaseViewNamesTheUnmountedSocketVolume(t *testing.T) {
+	h := NewHandler(&Deps{
+		Channel:  func(context.Context) (string, string, error) { return ChannelStable, "develop", nil },
+		Hosts:    func(context.Context) ([]HostIdentity, error) { return nil, nil },
+		Releases: func(context.Context, string) ([]Release, error) { return nil, nil },
+		Detection: func(context.Context) (DetectionStatus, error) {
+			return DetectionStatus{}, nil
+		},
+		UpdaterPresent:        func() bool { return false },
+		ControlPlanePreflight: func(context.Context) PreflightFacts { return PreflightFacts{Socket: &SocketState{}} },
+	}, nil)
+	v, err := h.ReleaseView(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp := v.Targets[0]
+	if cp.Kind != TargetControlPlane || cp.Preflight.State != PreflightBlocked {
+		t.Fatalf("control-plane target = %+v, want a blocked preflight", cp)
+	}
+	sock := cp.Preflight.Checks[0]
+	if sock.ID != CheckUpdaterSocket || sock.Status != CheckFail || !strings.Contains(sock.Detail, "--force-recreate --no-deps quasar-control-plane") {
+		t.Fatalf("updater_socket = %+v, want the recreate named", sock)
+	}
+	// With no release listed the image check is unknown, not a fault.
+	if img := cp.Preflight.Checks[len(cp.Preflight.Checks)-1]; img.ID != CheckImageResolvable || img.Status != CheckUnknown {
+		t.Fatalf("image check = %+v", img)
 	}
 }

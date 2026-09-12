@@ -1,4 +1,4 @@
--- 0083 — a fleet run's scheduling cleanup is a recorded fact, not an inference
+-- 0084 — a fleet run's scheduling cleanup is a recorded fact, not an inference
 -- (#176).
 --
 -- PURELY ADDITIVE: one nullable column, no existing column touched, and nothing
@@ -30,6 +30,9 @@ COMMENT ON COLUMN platform_apply_runs.cordon_restore_attempted_at IS
 -- already-offline host as one the run had cordoned, and acting on that would
 -- lift an operator's own cordon. #170 fixed the ordinary case for live runs;
 -- this migration deliberately does not reinterpret history.
+-- Every terminal state, INCLUDING the 'succeeded_partial' that 0083 added: a
+-- partial run cordons and restores exactly like a clean one, so leaving it out
+-- would hand the boot sweep the very history this backfill exists to not act on.
 UPDATE platform_apply_runs
    SET cordons_restored_at = COALESCE(finished_at, created_at)
- WHERE state IN ('succeeded', 'failed', 'cancelled');
+ WHERE state IN ('succeeded', 'succeeded_partial', 'failed', 'cancelled');

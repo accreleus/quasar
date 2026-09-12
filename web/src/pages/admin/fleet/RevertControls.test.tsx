@@ -128,6 +128,7 @@ beforeEach(() => {
   vi.resetAllMocks();
   mocked.listAllSessions.mockResolvedValue({ items: [], next_cursor: null } as never);
   mocked.listPlatformAttempts.mockResolvedValue({ attempts: [] });
+  mocked.listPlatformApplyRuns.mockResolvedValue({ runs: [] });
   // The head's "next check" fragment reads the detection job's schedule.
   mocked.listJobs.mockResolvedValue({ items: [], next_cursor: null } as never);
   mocked.getPlatformReleases.mockResolvedValue(view());
@@ -146,6 +147,23 @@ describe("revertStates", () => {
 
     const states = revertStates([attempt()]);
     expect(states.get("h1")).toEqual({ digest: OLD_DIGEST, image: AGENT_IMAGE, failed: null });
+  });
+
+  it("never derives a revert target from an auto_revert row", () => {
+    // Newest first: the updater's own restore sits above the failed apply and
+    // the operator's earlier succeeded one. Its previous digests are the
+    // release that just failed, so it must not become the Revert target.
+    const restored = attempt({
+      id: "a3",
+      kind: "auto_revert",
+      requested_digests: [{ name: "node-agent", image: AGENT_IMAGE, digest: OLD_DIGEST }],
+      previous_digests: [{ name: "node-agent", digest: NEW_DIGEST }],
+      created_at: "2026-09-05T12:00:00Z",
+    });
+    const failed = attempt({ id: "a2", state: "failed", reason: "recreate_failed", created_at: "2026-09-05T11:59:00Z" });
+    const states = revertStates([restored, failed, attempt()]);
+    expect(states.get("h1")?.digest).toBe(OLD_DIGEST);
+    expect(states.get("h1")?.failed).toBeNull();
   });
 
   it("takes the newest succeeded attempt, and reports the newest attempt's failure", () => {
