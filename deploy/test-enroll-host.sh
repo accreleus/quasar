@@ -461,7 +461,9 @@ fi
 
 rm -rf "$tmp/install"; mk_root "$tmp/root"
 run_installer id-reset QUASAR_ENROLLMENT="$WSS_BLOB" QUASAR_REF=v1.2.3 NODE_NAME=gpu-b QUASAR_HOME_ROOT="$tmp/homes" MOCK_AGENT_LOG="$ENROLLED_LOG" MOCK_VOLUME_EXISTS=1 QUASAR_RESET_IDENTITY=1
-if [ "$RC" -eq 0 ] && grep -qxF 'volume rm quasar-agent_quasar-agent-data' <<<"$DOCKER_LOG"    && grep -q 'rm -sf quasar-node-agent' <<<"$DOCKER_LOG" && grep -q 'cleared' <<<"$OUT"    && [ "$(grep -c 'volume rm' <<<"$DOCKER_LOG")" -eq 1 ]; then
+if [ "$RC" -eq 0 ] && grep -qxF 'volume rm quasar-agent_quasar-agent-data' <<<"$DOCKER_LOG" \
+   && grep -q 'rm -sf quasar-node-agent' <<<"$DOCKER_LOG" && grep -q 'cleared' <<<"$OUT" \
+   && [ "$(grep -c 'volume rm' <<<"$DOCKER_LOG")" -eq 1 ]; then
   pass "QUASAR_RESET_IDENTITY=1: the agent container goes first, then its identity volume, exactly once"
 else
   fail "reset identity" "rc=$RC docker=[$(grep -E 'volume|rm -sf' <<<"$DOCKER_LOG")] out=$(grep -i identity <<<"$OUT")"
@@ -523,8 +525,8 @@ fi
 # --help must keep carrying what the script now documents; usage() prints a fixed
 # line range of the header, and a range that drifts silently drops knobs.
 help_out="$(sh "$script" --help)"
-if grep -q 'QUASAR_RESET_IDENTITY' <<<"$help_out" && grep -q -- '--reset-identity' <<<"$help_out"    && grep -q 'QUASAR_PROJECT' <<<"$help_out" && grep -q 'self-signed' <<<"$help_out"    && grep -q -- '--pinnedpubkey' <<<"$help_out"; then
-  pass "--help carries the identity knobs and the --pinnedpubkey/-k pairing"
+if grep -q 'QUASAR_RESET_IDENTITY' <<<"$help_out" && grep -q -- '--reset-identity' <<<"$help_out" && grep -q 'QUASAR_PROJECT' <<<"$help_out" && grep -q 'self-signed' <<<"$help_out" && grep -q -- '--pinnedpubkey' <<<"$help_out" && ! grep -q 'TestEnrollHostComposeMatchesBase' <<<"$help_out"; then
+  pass "--help carries the identity knobs and the --pinnedpubkey/-k pairing, and stops before the internal note"
 else
   fail "help text" "$(tail -5 <<<"$help_out")"
 fi

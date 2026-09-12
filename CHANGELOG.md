@@ -162,10 +162,20 @@ own; the two do not move together, and that is deliberate.
   **unknown** node secret — guessing a *known* host's secret still spends it, which is what
   that limiter is for. `deploy/enroll-host.sh` gains `--reset-identity` /
   `QUASAR_RESET_IDENTITY=1` (clear the saved identity and enroll from scratch) and
-  `QUASAR_PROJECT` (a second, separate agent stack on one machine), says when an identity
-  volume is already present rather than silently reusing it, and its `--help` now states
-  that `--pinnedpubkey` needs `-k` on a self-signed control plane — alone it fails with
+  `QUASAR_PROJECT` (the compose project name, which namespaces the identity volume and so
+  selects which saved identity an install uses), says when an identity volume is already
+  present rather than silently reusing it, and its `--help` now states that
+  `--pinnedpubkey` needs `-k` on a self-signed control plane — alone it fails with
   `self-signed certificate (18)` before the pin is ever checked.
+- **A re-enrollment now saves the certificate pin of the control plane it actually joined**
+  (#199). The pin file beside the node secret was only ever overwritten for an operator-driven
+  `CONTROL_PLANE_FINGERPRINT` rotation, so a host that re-enrolled onto a *second* control
+  plane kept the *first* one's fingerprint: it connected only while the enrollment string was
+  still in its environment, and was stranded the moment that was removed — which is what the
+  docs tell operators to do once enrolled. A register that mints a node secret now refreshes
+  the pin, because it replaces the identity the old pin belonged to and the new pin has just
+  verified a real handshake. A reconnect still never re-learns a pin, and neither path follows
+  a symlink at the pin path.
 - **A busy Docker host no longer makes the agent report its own container runtime as
   unresponsive** (#194). Every container-runtime command the agent runs had its output
   read only after the child exited, so a command printing more than one pipe buffer's

@@ -128,13 +128,16 @@ The last line names the reason.
 
 The dialog keeps the bare enrollment string behind **Show the enrollment string**.
 `sh deploy/enroll-host.sh --print-compose` (from any checkout) prints the agent-only
-Compose file and `--print-nvidia-overlay` the NVIDIA overlay. `--help` lists every
-environment knob the script reads, including `QUASAR_RESET_IDENTITY` and
-`QUASAR_PROJECT` (a second, separate agent stack on one machine — the volumes holding
-the agent's identity are project-scoped, so a new project name is a new identity). Put them in a directory
+Compose file and `--print-nvidia-overlay` the NVIDIA overlay. Put them in a directory
 with a `.env` that sets `QUASAR_ENROLLMENT`, `NODE_NAME`, `QUASAR_HOME_ROOT` and
 `QUASAR_AGENT_IMAGE`, and `docker compose up -d`. Every knob the agent reads is in the
 [environment reference](/quasar/reference/environment/).
+
+`--help` lists the knobs the script itself reads, including `QUASAR_RESET_IDENTITY`
+(clear this host's saved agent identity, then enroll from scratch) and `QUASAR_PROJECT`
+— the Compose project name. Compose scopes volume names to it, so it is what selects
+which saved agent identity an install uses: an enrolled host must keep the name it has,
+and a new name is a new identity. It is not a way to run two agents on one machine.
 
 The base `deploy/docker-compose.yml` is not a second-host install: its agent depends on
 the local stack. The service the installer prints and the base file's node-agent service

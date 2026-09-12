@@ -188,15 +188,26 @@ func registerWithNodeSecret(t *testing.T, url, nodeName, secret string) map[stri
 	return reply
 }
 
-// #199: a node_secret this control plane never minted is NOT a bad-token
-// enrollment attempt, and must not spend the enrollment-failure budget.
+// #199: what a node_secret this control plane never minted gets told, and what it
+// costs.
 //
-// The reported failure: a machine enrolled to another control plane keeps its
-// agent data volume, so its agent presents the old secret on every reconnect.
-// Ten rejects inside a minute used to exhaust the limiter, and the operator —
-// who had already pasted a fresh enrollment token — got a 429 that looked like a
-// second, unrelated fault on top of a `host_not_found` naming the wrong remedy.
-func TestUnknownNodeSecretDoesNotSpendTheEnrollmentBudget(t *testing.T) {
+// The message names the credential that was refused. The old wording ("node not
+// enrolled; use enrollment_token to enroll first") named a remedy the operator had
+// already applied — the token was in the environment all along, losing to the saved
+// secret on every attempt — which is what sent the reported investigation at the
+// token instead of at the volume. It carries nothing about the peer's deployment
+// shape: this is a pre-auth surface, and the agent's own log is where the file and
+// the volume are named.
+//
+// It also still spends the enrollment-failure budget. That is deliberate and worth a
+// test, because the obvious "a stale secret is not a bad token, don't count it" reads
+// like a kindness and is an enumeration oracle: unknown node_name answers
+// host_not_found and a known one answers auth_failed, so free misses let an
+// unauthenticated caller walk a hostname dictionary and learn the fleet's node names.
+// agent-api.md §Auth takes the same line for the token. The operator's case does not
+// need the exemption — with a token configured the agent re-registers with it on the
+// next attempt, so a working re-enrollment costs one counted reject.
+func TestUnknownNodeSecretIsRefusedByCredentialAndStillCounted(t *testing.T) {
 	pool := testPool(t)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := NewHandler(pool, "test-token", log, nil, nil, nil, nil, nil)
@@ -205,9 +216,7 @@ func TestUnknownNodeSecretDoesNotSpendTheEnrollmentBudget(t *testing.T) {
 	t.Cleanup(srv.Close)
 	url := "ws" + strings.TrimPrefix(srv.URL, "http")
 
-	// Comfortably past enrollmentFailureLimit: every one of these is refused, and
-	// none of them may count.
-	for i := 0; i < enrollmentFailureLimit+3; i++ {
+	for i := 0; i < enrollmentFailureLimit; i++ {
 		reply := registerWithNodeSecret(t, url, "never-enrolled-here", "deadbeef")
 		if reply["code"] != "host_not_found" {
 			t.Fatalf("attempt %d: code=%v message=%v, want host_not_found", i, reply["code"], reply["message"])
@@ -216,27 +225,22 @@ func TestUnknownNodeSecretDoesNotSpendTheEnrollmentBudget(t *testing.T) {
 		if !strings.Contains(msg, "node_secret") {
 			t.Errorf("attempt %d: message %q should name the credential that was refused", i, msg)
 		}
+		// Nothing the control plane cannot know about this peer.
+		for _, leaked := range []string{"quasar-agent-data", "docker", "volume", "compose"} {
+			if strings.Contains(strings.ToLower(msg), leaked) {
+				t.Errorf("attempt %d: message %q assumes the peer's deployment shape (%q)", i, msg, leaked)
+			}
+		}
 	}
 
-	// The budget is untouched, so a genuine enrollment still gets in.
-	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
-	if err != nil {
-		t.Fatalf("dial after the stale-secret rejects: %v", err)
+	// Counted like any other refused credential: the budget is spent and the next
+	// upgrade is refused before it can become another probe.
+	_, resp, err := websocket.DefaultDialer.Dial(url, nil)
+	if err == nil {
+		t.Fatal("walking unknown node names was not rate limited — /agent/ws is a node-name oracle")
 	}
-	defer conn.Close()
-	if err := conn.WriteJSON(map[string]any{
-		"type": "register", "node_name": "enrolls-after-stale", "agent_version": "test",
-		"auth": map[string]string{"enrollment_token": "test-token"},
-	}); err != nil {
-		t.Fatalf("write register: %v", err)
-	}
-	var registered map[string]any
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	if err := conn.ReadJSON(&registered); err != nil {
-		t.Fatalf("read registered: %v", err)
-	}
-	if registered["type"] != "registered" {
-		t.Fatalf("reply=%v, want registered", registered)
+	if resp == nil || resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status=%v, want 429", resp)
 	}
 }
 

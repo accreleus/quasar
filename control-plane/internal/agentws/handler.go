@@ -603,18 +603,6 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		h.failures.Failure(clientIP)
 		return "", nil, nil, err
 	}
-	// #199: a refusal that is NOT a credential attempt. The enrollment-failure
-	// budget exists to stop brute force against a credential; a node_secret for a
-	// node_name this control plane has never enrolled proves nothing about any
-	// secret, and it is the steady state of a machine whose agent data volume
-	// outlived an enrollment elsewhere. Counting it meant the operator's
-	// legitimate re-enrollment collected a 429 on top of the real error — a second
-	// fault that looked unrelated. Concurrency is still bounded by the in-flight
-	// reservation in ServeHTTP, and a WRONG secret for a KNOWN node_name is a
-	// guess and still goes through fail().
-	reject := func(err error) (string, []RegisterImage, *string, error) {
-		return "", nil, nil, err
-	}
 	conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	raw, err := readTextMessage(conn)
 	if err != nil {
@@ -653,15 +641,25 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 			// wording ("use enrollment_token to enroll first") is exactly what an
 			// operator re-enrolling a machine has already done, and it sent them
 			// looking at the token instead of at the saved secret that is quietly
-			// winning over it (#199). The agent recovers from this on its own when
-			// a token is configured; this text is for the case where none is.
+			// winning over it (#199). Nothing about the peer's deployment shape
+			// goes in here — this is a pre-auth surface and the control plane
+			// cannot know whether the caller even runs in a container; the agent's
+			// own log names the file and the volume, because it is the one that
+			// knows where they are.
+			//
+			// This still spends the enrollment-failure budget, deliberately. The
+			// two reconnect outcomes are distinguishable by code (unknown
+			// node_name → host_not_found, known → auth_failed), so an uncounted
+			// miss would turn this endpoint into a free node-name enumeration
+			// oracle — the leak agent-api.md §Auth exists to avoid. The operator's
+			// case does not need the exemption: the agent re-registers with its
+			// enrollment token on the very next attempt (#199), so a working
+			// re-enrollment costs one counted reject, not ten.
 			h.writeError(conn, "host_not_found",
 				"the node_secret presented belongs to no host enrolled on this control plane — it "+
-					"was minted by a different control plane (an agent data volume that outlived an "+
-					"earlier enrollment), or this host was removed here. Clear the agent's saved "+
-					"identity (its NODE_SECRET_PATH file, in the quasar-agent-data volume) and enroll "+
-					"again with an enrollment token.")
-			return reject(err)
+					"was minted by a different control plane, or this host was removed here. Enroll "+
+					"again with an enrollment token, clearing the agent's saved node secret "+
+					"(NODE_SECRET_PATH) first if it has no token configured.")
 		default:
 			h.writeError(conn, "internal_error", "registration failed")
 		}

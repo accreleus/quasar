@@ -44,18 +44,24 @@
 #   NODE_NAME           this host's stable fleet name, default: its hostname
 #   QUASAR_HOME_ROOT    managed-home root, default /var/lib/quasar/homes
 #   QUASAR_RENDER_NODE  render node to use, default: the detected one
-#   QUASAR_PROJECT      compose project name, default quasar-agent. Change it
-#                       (with QUASAR_DIR) only to run a SECOND, separate agent
-#                       stack on one machine; the volumes are project-scoped, so
-#                       a new name is a new agent identity.
-#   QUASAR_RESET_IDENTITY=1   clear this host's saved agent identity (the
-#                       project's quasar-agent-data volume, which holds the node
-#                       secret) before starting, so it enrolls from scratch. Same
-#                       as the --reset-identity sub-command. Only needed when the
-#                       saved secret must go: a machine enrolled to a DIFFERENT
-#                       control plane re-enrolls on its own (#199), because the
-#                       agent falls back to this enrollment token once the old
-#                       control plane's secret is refused.
+#   QUASAR_PROJECT      compose project name, default quasar-agent. Compose scopes
+#                       volume names to it, so this is really the namespace of the
+#                       agent's saved identity: it selects WHICH stored node secret
+#                       this install uses, and a new name means a new identity. An
+#                       already-enrolled host must keep the name it has. It is NOT
+#                       a way to run two agents on one machine — the compose text
+#                       below uses host networking, one fixed health port and the
+#                       hostname as NODE_NAME, so a second stack would collide on
+#                       the port and then be refused as a takeover of the first
+#                       host's node_name.
+#   QUASAR_RESET_IDENTITY=1   clear this host's saved agent identity (the project
+#                       volume holding the node secret) before starting, so it
+#                       enrolls from scratch. Same as the --reset-identity
+#                       sub-command. Only needed when the saved secret must go: a
+#                       machine enrolled to a DIFFERENT control plane re-enrolls on
+#                       its own (#199), because the agent falls back to this
+#                       enrollment token once the old control plane's secret is
+#                       refused.
 #   QUASAR_ENROLL_DRY_RUN=1   print the plan; write and start nothing
 #   QUASAR_ENROLL_APPARMOR_PERSIST=1  also install the AppArmor profile into
 #                       /etc/apparmor.d so it survives a reboot; default is
@@ -79,9 +85,10 @@ DIR="${QUASAR_DIR:-/opt/quasar-agent}"
 ROOT="${QUASAR_ENROLL_ROOT:-}"          # test seam: fake /proc,/sys,/dev,/etc root
 TAIL_SECS="${QUASAR_ENROLL_TAIL_SECS:-90}"
 DRY="${QUASAR_ENROLL_DRY_RUN:-0}"
-# The compose project name, and with it the names of the project's volumes. The
-# default is what every install before #199 used and must not move: changing it
-# on an enrolled host orphans that host's agent identity volume.
+# The compose project name, and with it the names of the project's volumes — so it
+# is what selects which saved agent identity this install uses. The default is what
+# every install before #199 used and must not move: changing it on an enrolled host
+# orphans that host's identity volume and makes the agent enroll from scratch.
 PROJECT="${QUASAR_PROJECT:-quasar-agent}"
 # Where the node secret lives. Compose names a project volume <project>_<volume>.
 IDENTITY_VOLUME="${PROJECT}_quasar-agent-data"
@@ -486,7 +493,7 @@ PROFILE
 # sub-command list. The range is checked by deploy/test-enroll-host.sh, which
 # asserts --help still carries the knobs it documents.
 usage() {
-  sed -n '2,65p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || true
+  sed -n '2,71p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || true
 }
 
 # ── sub-commands ─────────────────────────────────────────────────────────────
