@@ -54,3 +54,35 @@ luma 94.7.
   its session at the end. A luma-sampling hold mode in `peer-driver.mjs` would save re-patching.
 - Two-host gates (skip-then-continue; an offline host's cordon left alone while another host
   proceeds) follow in the next section once a second host is enrolled.
+
+## Two-host gates (the `aux-infra` host enrolled temporarily, then restored)
+
+Release under test: develop `752d6c2` (schema 84, non-migrating). Host A = the aux-infra node,
+host B = the appliance's own node; both registry installs on `67f072b`, both `online`, every
+preflight check `pass`.
+
+**#169 — skip, then continue to the next eligible host. PASS.** A's agent stopped (A
+`offline`). Run `2c086004`: control plane `sha256:8846cd3…` → `sha256:5219864…`; A skipped
+`host_offline`; **B attempted and succeeded** (`sha256:6be3617…` → `sha256:d795769…`); state
+`succeeded_partial`, `skipped: [{A, host_offline}]`; `cordoned_hosts` both `was_cordoned: false`,
+`cordons_restored_at` stamped. Afterwards A was `offline`, not `draining`; A's agent started and
+registered `online` with no manual uncordon; Retry (`retry_of`) ended `succeeded` with A applied
+and B `up_to_date`.
+
+**#170 — a run that fails at one host while another was already offline. PASS.** Both hosts
+reverted to `sha256:6be3617…`, A's agent stopped, a squatter holding B's health port. Run
+`a2bac317`: A skipped `host_offline`; B's new agent logged `health-bind-failed`, the updater's
+restore failed on the same held port (`recreate_failed`, then the restore's own failure); run
+`failed`. Through the failure A and B read `offline`; **neither was left `draining`**. Port
+freed → B's agent came back on its previous digest and registered `online` in 27 s with no
+manual uncordon; A's agent started → `online`. A plain fleet apply `778b487b` then brought both
+current (`succeeded`).
+
+Two deviations, both explained by the code: the B attempt's reason is `timeout`, because with
+no agent left to relay it the updater's `recreate_failed` never reaches the control plane
+(#201); and the run's `cordoned_hosts` was `[]`, because a run whose control plane is already
+current takes no fleet cordon (#200, a latent stranded-cordon path). Enrolment also surfaced
+#199 (a stale node secret defeats re-enrolment and the error names the wrong remedy).
+
+The aux-infra host was restored to its prior config byte for byte (its `.env` hash unchanged,
+backup kept) and the temporary enrolled stack removed with its volumes.
