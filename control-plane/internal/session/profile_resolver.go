@@ -30,7 +30,7 @@ func (c *Coordinator) resolveLaunchProfile(ctx context.Context, userID string, l
 	if p.Visibility != profile.VisibilityUser {
 		return profile.LaunchProfile{}, ErrProfileIneligible
 	}
-	pe := profile.EvaluateLaunchProfile(p, c.probeEvalInput(ctx, userID))
+	pe := profile.EvaluateLaunchProfile(p, c.probeEvalInput(ctx, userID, lp.DeviceID))
 	if pe.Eligibility == profile.EligibilityIneligible {
 		c.log.Info("AS10-03: launch profile rejected as ineligible", "user_id", userID, "profile", p.ID)
 		return profile.LaunchProfile{}, ErrProfileIneligible
@@ -38,32 +38,29 @@ func (c *Coordinator) resolveLaunchProfile(ctx context.Context, userID string, l
 	return p, nil
 }
 
-// probeEvalInput builds the eligibility input from the caller's latest fresh
-// probe plus their chain-level performance history. A read error or absent probe
-// degrades to an empty input (unknown allows), never to a rejection.
-func (c *Coordinator) probeEvalInput(ctx context.Context, userID string) profile.EvalInput {
+// probeEvalInput builds the eligibility input from the launching device's probe
+// and its chain-level performance history. Any read failure degrades to an empty
+// input (unknown allows), never to a rejection.
+func (c *Coordinator) probeEvalInput(ctx context.Context, userID, deviceID string) profile.EvalInput {
 	in := profile.EvalInput{}
 
-	deviceKey, _ := c.store.LatestDeviceKey(ctx, userID)
-	if hf, err := c.store.ProfileFailures(ctx, userID, deviceKey); err != nil {
+	scope, err := c.store.ResolveDeviceScope(ctx, userID, deviceID, scopeSiteEligibility)
+	if err != nil {
+		c.log.Warn("AS10-03: device scope load failed, gating without probe or history", "user_id", userID, "err", err)
+		return in
+	}
+	if hf, err := c.store.ProfileFailures(ctx, userID, scope.DeviceKey); err != nil {
 		c.log.Warn("AS10-03: profile failure history load failed, gating without it", "user_id", userID, "err", err)
 	} else {
 		in.HistoricalFailures = hf
 	}
-
-	dp, err := c.store.LatestProbe(ctx, userID)
-	if err != nil {
-		c.log.Warn("AS10-03: probe load failed, gating profile without probe", "user_id", userID, "err", err)
-		return in
-	}
-	if dp == nil {
-		return in
-	}
-	in.Probe = &profile.Probe{
-		BandwidthKbps:    dp.BandwidthKbps,
-		RTTMs:            dp.RTTMs,
-		MaxDecodeHeight:  dp.MaxDecodeHeight,
-		DisplayRefreshHz: dp.DisplayRefreshHz,
+	if dp := scope.Probe; dp != nil {
+		in.Probe = &profile.Probe{
+			BandwidthKbps:    dp.BandwidthKbps,
+			RTTMs:            dp.RTTMs,
+			MaxDecodeHeight:  dp.MaxDecodeHeight,
+			DisplayRefreshHz: dp.DisplayRefreshHz,
+		}
 	}
 	return in
 }

@@ -83,12 +83,18 @@ func (h *Handler) handleListProfiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// (nil, nil) means no usable probe (absent or stale); a read error degrades to no-probe.
+	// This endpoint answers "what can this client run", so it is scoped to the
+	// device the bearer token was minted for.
+	deviceID, _ := auth.TokenDeviceIDFromContext(r.Context())
+	scope, scopeErr := h.store.ResolveDeviceScope(r.Context(), user.ID, deviceID, scopeSiteProfiles)
+	if scopeErr != nil {
+		slog.Warn("AS10-02: device scope load failed, evaluating without probe or history",
+			"user_id", user.ID, "err", scopeErr)
+	}
+
+	// A nil probe is absent or stale; either way eligibility runs without one.
 	var pr *profile.Probe
-	dp, err := h.store.LatestProbe(r.Context(), user.ID)
-	if err != nil {
-		slog.Warn("AS10-02: probe load failed, evaluating without probe", "user_id", user.ID, "err", err)
-	} else if dp != nil {
+	if dp := scope.Probe; dp != nil {
 		pr = &profile.Probe{
 			BandwidthKbps:    dp.BandwidthKbps,
 			RTTMs:            dp.RTTMs,
@@ -106,13 +112,15 @@ func (h *Handler) handleListProfiles(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Historical failures at launch-profile grain; rung-level decode failures feed
-	// the launch resolver's clamp 4 instead.
+	// the launch resolver's clamp 4 instead. An unresolved scope means no history,
+	// never the coarse per-user key.
 	var historical map[string]bool
-	deviceKey, _ := h.store.LatestDeviceKey(r.Context(), user.ID)
-	if hf, err := h.store.ProfileFailures(r.Context(), user.ID, deviceKey); err != nil {
-		slog.Warn("AS10-11: profile failures load failed, evaluating without history", "user_id", user.ID, "err", err)
-	} else {
-		historical = hf
+	if scopeErr == nil {
+		if hf, err := h.store.ProfileFailures(r.Context(), user.ID, scope.DeviceKey); err != nil {
+			slog.Warn("AS10-11: profile failures load failed, evaluating without history", "user_id", user.ID, "err", err)
+		} else {
+			historical = hf
+		}
 	}
 
 	// No in-code fallback catalog: guessing one would answer an eligibility

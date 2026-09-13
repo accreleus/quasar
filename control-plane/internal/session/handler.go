@@ -415,6 +415,9 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	if req.ClientType != nil {
 		lp.ClientType = *req.ClientType
 	}
+	// The device this token was minted for: it scopes everything the launch reads
+	// about the client, and is stamped on the session row for later reads.
+	lp.DeviceID, _ = auth.TokenDeviceIDFromContext(r.Context())
 	lp.Mic = req.Mic
 
 	res, err := h.coord.LaunchByProfile(r.Context(), user.ID, lp)

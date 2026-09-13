@@ -146,6 +146,18 @@ own; the two do not move together, and that is deliberate.
   Contract: `quasar-protocol` "Audit-log names" amendment (additive, no migration).
 
 ### Fixed
+- **Codec eligibility and decode history now follow the device that asked, not the account's
+  newest one** (#203). With a browser and the native client signed into one account, every read
+  of a device's capability probe and of its decode-failure history was keyed on whichever
+  `user_devices` row had been seen most recently — so AV1 disappeared from Chrome's launch panel
+  after a native session (the native probe reports no AV1 decode), and a rung a native client
+  could not keep up with was marked "this device couldn't keep up last time" in the browser too.
+  Every one of those reads is now keyed on the requesting device: a request's bearer token
+  already carries its device binding, and a launch stamps that device on the session, so the rung
+  a launch resolves to, the eligibility on `GET /v1/me/profiles`, and the pass/fail a live session
+  records all describe the client in front of the user. A token or session with no binding (a
+  pre-binding token, or a login that declared no device key) keeps the previous account-wide
+  behaviour, logged as a `device-scope fallback`. No schema change and no re-login needed.
 - **A `429` from the control plane no longer reads as a second, unrelated fault** (#199). When an
   agent's saved node secret belongs to a control plane that has never seen it, a run of refused
   registers trips the enrollment-failure limiter and the WebSocket upgrade is refused — and the

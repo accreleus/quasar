@@ -46,10 +46,14 @@ type LaunchParams struct {
 	Override  StreamOverride // optional explicit stream params
 	IsAdmin   bool           // bypasses the eligibility gate
 	// ClientType is the launching client's own declaration ("native" ⇒ can decode
-	// main/high H.264). The profile lift keys on THIS, not the stored probe's
-	// client_type: a native probe becomes the account's latest, so keying on it
-	// would let a native session poison a later browser launch.
+	// main/high H.264). The profile lift keys on this claim as well as on the
+	// device's measured probe; both must agree.
 	ClientType string
+	// DeviceID is the user_devices id the caller's token is bound to, "" when it
+	// carries no binding. It scopes this launch's probe and history reads and is
+	// stamped onto sessions.device_id. Never an authorization input: ownership is
+	// users.id.
+	DeviceID string
 	// Mic is the launch REQUEST, not the granted state: the launcher ANDs it with
 	// the instance setting to resolve what is dispatched and persisted
 	// (Session.Mic). A request against a disabled instance proceeds with no mic.

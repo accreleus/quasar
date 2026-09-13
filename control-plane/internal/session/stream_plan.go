@@ -11,7 +11,7 @@
 // The second decision's facts are gathered once into StreamInputs; planStream
 // then decides with no I/O, logger or clock, and the caller logs, performs the
 // single UpdateSessionStream, then mutates the session. Hoisting the reads is
-// what stops one launch's two walks from seeing different LatestProbe rows, and
+// what stops one launch's two walks from seeing different probe rows, and
 // makes every clamp reachable from a struct literal with no database.
 //
 // The cap needs no I/O because lowerProfileRung (cert_handler.go) is a
