@@ -40,9 +40,13 @@ func withPolicy(pol SignaturePolicy, src *stubSource) func(*Server) {
 	}
 }
 
+// signingRequestID is the request every apply in this file posts, so a test that
+// is accepted can wait for that request's result before it returns.
+const signingRequestID = "11111111-2222-3333-4444-555555555555"
+
 func applyBody(version string) map[string]any {
 	return map[string]any{
-		"request_id": "11111111-2222-3333-4444-555555555555",
+		"request_id": signingRequestID,
 		"components": []map[string]string{
 			{"name": "node-agent", "image": testAgentImage, "digest": testAgentDigest},
 		},
@@ -101,6 +105,7 @@ func TestServerAcceptsAMissingSignatureUnderVerify(t *testing.T) {
 	if status, body := post(t, c, "/v1/apply", applyBody("0.3.0")); status != http.StatusAccepted {
 		t.Fatalf("status %d body %v, want 202: verify must not break an unsigned release", status, body)
 	}
+	waitTerminal(t, c, signingRequestID)
 }
 
 func TestServerAcceptsAGoodSignature(t *testing.T) {
@@ -115,6 +120,7 @@ func TestServerAcceptsAGoodSignature(t *testing.T) {
 	if status, body := post(t, c, "/v1/apply", applyBody("0.3.0")); status != http.StatusAccepted {
 		t.Fatalf("status %d body %v, want 202", status, body)
 	}
+	waitTerminal(t, c, signingRequestID)
 }
 
 func TestServerFetchesNothingWhenSigningIsOff(t *testing.T) {
@@ -128,6 +134,11 @@ func TestServerFetchesNothingWhenSigningIsOff(t *testing.T) {
 	if src.called != 0 {
 		t.Fatalf("mode off must fetch nothing, fetched %d times", src.called)
 	}
+	// An accepted apply keeps writing results and compose files into this
+	// test's temp dirs from a detached goroutine. Returning before it reaches a
+	// terminal result let t.TempDir's cleanup race those writes ("unlinkat ...:
+	// directory not empty"), which failed CI on a slow runner.
+	waitTerminal(t, c, signingRequestID)
 }
 
 func TestSelfReportsTheSignaturePolicy(t *testing.T) {
