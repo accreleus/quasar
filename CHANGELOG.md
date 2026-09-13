@@ -127,7 +127,7 @@ own; the two do not move together, and that is deliberate.
   #128 nothing else would have satisfied. Even a non-migrating step gives a launch already
   in flight a moment to land, because that is the one session a restart still loses.
   Contract: `quasar-protocol` amendment 6.
-- **The audit log names the things it is talking about.** Every row served by
+- **The audit log names the things it is talking about** (#172). Every row served by
   `GET /v1/admin/activity` now carries a `names` map — id to display name — covering both
   the row's target and the identifiers inside `details`, so a `session.launched` entry that
   used to read `session 85d0b6a9` over `{"app_id": "8b1116c8-…", "host_id": "4daeaa27-…"}`
