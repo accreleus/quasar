@@ -24,6 +24,15 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Changed
+- **`scripts/dev/leak-scan.sh` no longer lists the fingerprints it guards.** The script now
+  carries only generic shapes; the patterns that identify a particular operator's network are
+  loaded at run time from an untracked `.claude/skills/_shared/leak-patterns.local` locally, and
+  from the `LEAK_SCAN_OPERATOR_PATTERNS` repository secret in CI, which requires them wherever the
+  secret is available so a missing one cannot read as clean. The test fixtures use documentation
+  stand-ins, and the scan no longer skips `docs/reports` and `docs/superpowers`, which it had
+  treated as private although they are published.
+
 ### Fixed
 - **Codec eligibility and decode history now follow the device that asked, not the account's
   newest one** (#203). With a browser and the native client signed into one account, every read

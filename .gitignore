@@ -43,6 +43,7 @@ control-plane/bin/
 # OPERATOR CONFIG — real host addresses, ssh aliases and key paths. NEVER committed.
 # Every skill reads it locally; hosts.example.json is the tracked schema template.
 .claude/skills/_shared/hosts.json
+.claude/skills/_shared/leak-patterns.local
 
 # Repo-scoped MCP wiring is operator-local tooling (endpoints on the operator's
 # own network), not a property of the project. Keep it working, don't publish it.

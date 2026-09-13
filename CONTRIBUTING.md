@@ -55,6 +55,15 @@ as permanently archived as a commit, and issues arrive from agents working in
 other repos that have no such guard. It runs daily in CI; run it by hand after
 filing anything built from real host output.
 
+The script itself carries only generic shapes, such as absolute home-directory
+paths. The patterns that identify a particular operator's network — an address
+range, a domain, key and host names — are **not committed**, because a public
+file that lists them publishes the inventory it guards. Locally they are read
+from `.claude/skills/_shared/leak-patterns.local` (untracked; the format is in
+the script header), and CI reads them from the `LEAK_SCAN_OPERATOR_PATTERNS`
+repository secret. A clone with neither still runs the generic checks, and says
+so.
+
 `scripts/dev/leak-scan.sh` enforces this over git-tracked content. **The
 authority is `.github/workflows/leak-scan.yml`**, which runs it on every push and
 pull request and is the one gate a contributor branch cannot rewrite. Everything
