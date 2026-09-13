@@ -771,7 +771,19 @@ printf '\n== leak-scan (issue tracker) ==\n'
 # nothing about detection.
 LS="$(cd "$TESTS_DIR/../../dev" && pwd)/leak-scan.sh"
 
-ls_dirty="$(LEAK_SCAN_ISSUES_JSON="$FIXTURES/leak-issues-dirty.json" bash "$LS" --issues 2>&1)"
+# The operator's own patterns are not in the repo (see the script header), so
+# these tests inject STAND-INS in the same format: documentation addresses and
+# invented names that identify no one. The real set is never read here — every
+# run names its pattern source explicitly.
+LS_TEST_PATTERNS='# stand-ins only
+tree:203\.0\.113\.77
+tree:[A-Za-z0-9.-]*standin\.example\.invalid
+tree:id_ed25519_standin
+issues:\bstandin-nas\b
+issues:\bstandin-box\b'
+LS_NO_FILE="$WORK/no-such-leak-patterns.local"
+
+ls_dirty="$(LEAK_SCAN_OPERATOR_PATTERNS="$LS_TEST_PATTERNS" LEAK_SCAN_ISSUES_JSON="$FIXTURES/leak-issues-dirty.json" bash "$LS" --issues 2>&1)"
 ls_dirty_rc=$?
 if [ "$ls_dirty_rc" -eq 1 ] &&
   printf '%s' "$ls_dirty" | grep -q 'issue#101 title' &&
@@ -780,12 +792,12 @@ if [ "$ls_dirty_rc" -eq 1 ] &&
   printf '%s' "$ls_dirty" | grep -q 'issue#104 body' &&
   printf '%s' "$ls_dirty" | grep -q 'issue#104 comment\[1\]' &&
   ! printf '%s' "$ls_dirty" | grep -q 'issue#103'; then
-  pass "leakscan:issues-detects" "LAN IP in a title, domain in a body, home path + key name in a comment, bare hostnames + the appliance path in a fourth; the clean issue is not flagged"
+  pass "leakscan:issues-detects" "an operator address in a title, an operator domain in a body, a home path + key name in a comment, operator host names in a fourth; the clean issue is not flagged"
 else
   fail "leakscan:issues-detects" "rc=$ls_dirty_rc, output: $(printf '%s' "$ls_dirty" | head -n 6)"
 fi
 
-ls_clean="$(LEAK_SCAN_ISSUES_JSON="$FIXTURES/leak-issues-clean.json" bash "$LS" --issues 2>&1)"
+ls_clean="$(LEAK_SCAN_OPERATOR_PATTERNS="$LS_TEST_PATTERNS" LEAK_SCAN_ISSUES_JSON="$FIXTURES/leak-issues-clean.json" bash "$LS" --issues 2>&1)"
 ls_clean_rc=$?
 if [ "$ls_clean_rc" -eq 0 ]; then
   pass "leakscan:issues-clean" "role names and RFC 5737 stand-ins do not trip the guard"
@@ -793,8 +805,40 @@ else
   fail "leakscan:issues-clean" "rc=$ls_clean_rc, output: $(printf '%s' "$ls_clean" | head -n 6)"
 fi
 
+# With no operator patterns the generic shapes still run: the home path is still
+# caught and the operator-only address is not, which proves the sets are separate.
+ls_generic="$(LEAK_SCAN_OPERATOR_PATTERNS= LEAK_SCAN_PATTERNS_FILE="$LS_NO_FILE" LEAK_SCAN_ISSUES_JSON="$FIXTURES/leak-issues-dirty.json" bash "$LS" --issues 2>&1)"
+ls_generic_rc=$?
+if [ "$ls_generic_rc" -eq 1 ] &&
+  printf '%s' "$ls_generic" | grep -q 'issue#102 comment\[1\]' &&
+  ! printf '%s' "$ls_generic" | grep -q 'issue#101 title' &&
+  printf '%s' "$ls_generic" | grep -q 'no operator patterns loaded'; then
+  pass "leakscan:generic-without-operator-patterns" "home paths are still caught, operator-only values are not, and the run says it was generic-only"
+else
+  fail "leakscan:generic-without-operator-patterns" "rc=$ls_generic_rc, output: $(printf '%s' "$ls_generic" | head -n 6)"
+fi
+
+# CI requires the operator set wherever its secret exists. Absent must fail, never pass.
+LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS=1 LEAK_SCAN_OPERATOR_PATTERNS= LEAK_SCAN_PATTERNS_FILE="$LS_NO_FILE" \
+  LEAK_SCAN_ISSUES_JSON="$FIXTURES/leak-issues-clean.json" bash "$LS" --issues >/dev/null 2>&1
+ls_req_rc=$?
+if [ "$ls_req_rc" -eq 2 ]; then
+  pass "leakscan:required-patterns-missing-fails" "a required but absent operator set exits 2, not a clean 0"
+else
+  fail "leakscan:required-patterns-missing-fails" "expected rc=2, got rc=$ls_req_rc"
+fi
+
+# A broken pattern fails loudly and never echoes its text, which in CI is a secret.
+ls_bad="$(LEAK_SCAN_OPERATOR_PATTERNS='tree:secret-looking-(' LEAK_SCAN_ISSUES_JSON="$FIXTURES/leak-issues-clean.json" bash "$LS" --issues 2>&1)"
+ls_bad_rc=$?
+if [ "$ls_bad_rc" -eq 2 ] && ! printf '%s' "$ls_bad" | grep -qF 'secret-looking'; then
+  pass "leakscan:invalid-pattern-fails-without-echo" "an invalid regex exits 2 and its text is not printed"
+else
+  fail "leakscan:invalid-pattern-fails-without-echo" "rc=$ls_bad_rc, output: $(printf '%s' "$ls_bad" | head -n 3)"
+fi
+
 # A guard that reads 'clean' when it could not look is worse than no guard.
-LEAK_SCAN_ISSUES_JSON="$WORK/definitely-absent.json" bash "$LS" --issues >/dev/null 2>&1
+LEAK_SCAN_OPERATOR_PATTERNS="$LS_TEST_PATTERNS" LEAK_SCAN_ISSUES_JSON="$WORK/definitely-absent.json" bash "$LS" --issues >/dev/null 2>&1
 ls_missing_rc=$?
 if [ "$ls_missing_rc" -eq 2 ]; then
   pass "leakscan:issues-fetch-failure-is-not-clean" "an unreadable payload exits 2, not 0"

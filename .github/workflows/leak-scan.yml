@@ -48,7 +48,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      # The operator's own patterns are not committed (a public file listing them
+      # publishes what they guard); they come from this repository secret. It is
+      # REQUIRED on every event that can see secrets, so a missing or broken secret
+      # fails the run instead of passing a generic-only scan. A pull_request from a
+      # fork gets no secrets and runs the generic shapes; the push that lands it
+      # runs everything.
       - name: Scan tracked content
+        env:
+          LEAK_SCAN_OPERATOR_PATTERNS: ${{ secrets.LEAK_SCAN_OPERATOR_PATTERNS }}
+          LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS: ${{ github.event_name == 'pull_request' && '0' || '1' }}
         run: bash scripts/dev/leak-scan.sh
 
       # Never on a pull_request: a fork PR's token cannot read issues, and a
@@ -57,4 +66,6 @@ jobs:
         if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LEAK_SCAN_OPERATOR_PATTERNS: ${{ secrets.LEAK_SCAN_OPERATOR_PATTERNS }}
+          LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS: '1'
         run: bash scripts/dev/leak-scan.sh --issues
