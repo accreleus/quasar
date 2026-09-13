@@ -24,6 +24,8 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+## 0.3.0 — 2026-09-13
+
 ### Added
 - **Updating is checked before it starts, put back when it fails, and honest about what it
   skipped** (#185: #186–#190, closes #184; migration 0083; protocol amendment 9). Every target on
