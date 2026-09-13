@@ -13,6 +13,15 @@ export interface AuthContextValue {
   /** True once the server has confirmed the user's role is "admin". */
   isAdmin: boolean;
   /**
+   * True when the session ended because the SERVER rejected the bearer token —
+   * expired, or revoked — rather than because the user signed out (#154).
+   *
+   * Set by the provider's 401 subscription, cleared by the next successful
+   * sign-in or an explicit logout. It exists so /login can say why the user is
+   * back there; it is never persisted and never an authorization input.
+   */
+  sessionExpired: boolean;
+  /**
    * Authenticate against control-api.md and persist the session. Throws ApiError.
    *
    * `remember` is the sign-in form's "Keep me signed in on this device": true

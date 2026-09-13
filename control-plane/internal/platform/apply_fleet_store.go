@@ -26,37 +26,44 @@ var (
 
 // terminalRunStatesSQL is TerminalRunState in SQL; pinned to its Go twin by
 // TestTerminalRunSplitMatchesSQL.
-const terminalRunStatesSQL = `('succeeded','failed','cancelled')`
+const terminalRunStatesSQL = `('succeeded','succeeded_partial','failed','cancelled')`
 
-const runColumns = `id::text, release_id::text, state, force, requested_by::text,
+const runColumns = `id::text, release_id::text, state, force, unattended, requested_by::text,
 	cancel_requested, cancel_requested_at, current_target, current_host_id::text,
-	error, created_at, started_at, finished_at`
+	error, created_at, started_at, finished_at, retry_of::text, skipped`
 
 func scanRun(row pgx.Row) (ApplyRun, error) {
 	var r ApplyRun
 	var errText string
-	if err := row.Scan(&r.ID, &r.ReleaseID, &r.State, &r.Force, &r.RequestedBy,
+	var skipped []byte
+	if err := row.Scan(&r.ID, &r.ReleaseID, &r.State, &r.Force, &r.Unattended, &r.RequestedBy,
 		&r.CancelRequested, &r.CancelRequestedAt, &r.CurrentTarget, &r.CurrentHostID,
-		&errText, &r.CreatedAt, &r.StartedAt, &r.FinishedAt); err != nil {
+		&errText, &r.CreatedAt, &r.StartedAt, &r.FinishedAt, &r.RetryOf, &skipped); err != nil {
 		return ApplyRun{}, err
 	}
 	if errText != "" {
 		r.Error = &errText
 	}
 	r.Skipped = make([]RunSkip, 0)
+	if len(skipped) > 0 {
+		if err := json.Unmarshal(skipped, &r.Skipped); err != nil {
+			return ApplyRun{}, fmt.Errorf("decode platform_apply_runs.skipped: %w", err)
+		}
+	}
 	r.Attempts = make([]Attempt, 0)
 	return r, nil
 }
 
 // CreateRun inserts a `pending` run. A second active run raises the partial
-// unique index and comes back as ErrRunActive — the refusal, unraced.
-func (s *Store) CreateRun(ctx context.Context, releaseID string, force bool, actor *string) (ApplyRun, error) {
+// unique index and comes back as ErrRunActive — the refusal, unraced. retryOf
+// is the succeeded_partial run this one finishes, or nil (amendment 9).
+func (s *Store) CreateRun(ctx context.Context, releaseID string, force bool, actor, retryOf *string) (ApplyRun, error) {
 	var id string
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO platform_apply_runs (release_id, state, force, requested_by)
-		VALUES ($1::uuid, 'pending', $2, $3::uuid)
+		INSERT INTO platform_apply_runs (release_id, state, force, requested_by, retry_of)
+		VALUES ($1::uuid, 'pending', $2, $3::uuid, $4::uuid)
 		RETURNING id::text
-	`, releaseID, force, actor).Scan(&id)
+	`, releaseID, force, actor, retryOf).Scan(&id)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
@@ -65,6 +72,74 @@ func (s *Store) CreateRun(ctx context.Context, releaseID string, force bool, act
 		return ApplyRun{}, fmt.Errorf("insert platform_apply_run: %w", err)
 	}
 	return s.Run(ctx, id)
+}
+
+// CreateUnattendedRun is CreateRun for a run nobody clicked (#122): force is
+// false and there is no requesting admin.
+//
+// A separate method rather than two more arguments on CreateRun, so `force` is
+// not expressible on this path at all. `force` means an operator agreeing to end
+// N live sessions, and an unattended pass has no operator to agree; since #153 it
+// additionally STOPS sessions on a migrating release, which this path is never
+// allowed to reach. A bool argument would make the wrong call one typo away.
+func (s *Store) CreateUnattendedRun(ctx context.Context, releaseID string) (ApplyRun, error) {
+	var id string
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO platform_apply_runs (release_id, state, force, requested_by, unattended)
+		VALUES ($1::uuid, 'pending', false, NULL, true)
+		RETURNING id::text
+	`, releaseID).Scan(&id)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
+			return ApplyRun{}, ErrRunActive
+		}
+		return ApplyRun{}, fmt.Errorf("insert unattended platform_apply_run: %w", err)
+	}
+	return s.Run(ctx, id)
+}
+
+// UnattendedFailedReleaseIDs is the failure suppression (#122): the releases
+// whose MOST RECENT run was a failed unattended one.
+//
+// "Most recent", not "any", and that is the whole implementation of the
+// operator's rule that an admin applying the release themselves clears the
+// suppression. A `DISTINCT release_id WHERE unattended AND state='failed'`
+// suppresses for ever — the admin's own successful run sits alongside the old
+// failure and changes nothing, so a host left behind by one bad pass never
+// updates again until a newer release appears. Ordering by `created_at DESC` per
+// release makes an admin run of ANY outcome reset it, and a second unattended
+// failure re-suppress it, which is what the contract says.
+//
+// Per RELEASE and not global, deliberately: a genuinely bad release must not be
+// re-attempted once a week for ever, but one flaky host must not end automatic
+// updates for the whole instance either.
+//
+// `unattended` is what makes this answerable at all: requested_by is NULL for an
+// unattended run AND for a run whose requesting admin has since been deleted
+// (ON DELETE SET NULL), so it cannot stand in.
+func (s *Store) UnattendedFailedReleaseIDs(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT release_id::text FROM (
+		    SELECT DISTINCT ON (release_id) release_id, unattended, state
+		    FROM platform_apply_runs
+		    ORDER BY release_id, created_at DESC, id DESC
+		) last
+		WHERE last.unattended AND last.state = 'failed'
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("read unattended failures: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("read unattended failures: %w", err)
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
 }
 
 // Run reads one run by id, without its attempts.
@@ -113,6 +188,27 @@ func (s *Store) ListRuns(ctx context.Context, limit int) ([]ApplyRun, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// RecordSkip appends one host the run passed over to its persisted `skipped`
+// list (migration 0083). Idempotent per host: a re-adopted run re-walks its
+// host list, and a host it already recorded must not appear twice.
+func (s *Store) RecordSkip(ctx context.Context, runID string, skip RunSkip) error {
+	entry, err := json.Marshal([]RunSkip{skip})
+	if err != nil {
+		return fmt.Errorf("encode skip: %w", err)
+	}
+	_, err = s.pool.Exec(ctx, `
+		UPDATE platform_apply_runs
+		   SET skipped = skipped || $2::jsonb
+		 WHERE id = $1::uuid
+		   AND NOT EXISTS (
+		       SELECT 1 FROM jsonb_array_elements(skipped) e
+		        WHERE e->>'host_id' = $3)`, runID, entry, skip.HostID)
+	if err != nil {
+		return fmt.Errorf("record skip: %w", err)
+	}
+	return nil
 }
 
 // RunAttempts reads one run's attempts in the order the run reached them.
@@ -276,6 +372,62 @@ func (s *Store) SetCordonedHosts(ctx context.Context, runID string, states []Hos
 	return nil
 }
 
+// MarkCordonsRestored records that this run's scheduling changes have been
+// proven undone. Separate from FinishRun on purpose: the terminal write happens
+// first — a run stuck non-terminal is its own outage — so this column is what
+// tells the next boot whether the cleanup that follows it actually finished
+// (migration 0084, #176).
+func (s *Store) MarkCordonsRestored(ctx context.Context, runID string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE platform_apply_runs SET cordons_restored_at = now() WHERE id = $1::uuid`, runID)
+	if err != nil {
+		return fmt.Errorf("set cordons_restored_at: %w", err)
+	}
+	return nil
+}
+
+// ClaimUnrestoredCordons is every terminal run that cordoned something and was
+// never able to prove it put it back — least-recently-attempted first, and
+// stamped as attempted in the same statement.
+//
+// Bounded by limit: this is a boot sweep, not a backlog drain. The ordering is
+// what keeps the bound honest. A plain `created_at DESC LIMIT n` re-selects the
+// same newest n on every start, so a handful of permanently-failing runs would
+// hide every older requirement behind them forever and those hosts would stay
+// `draining` across unlimited restarts. Never-attempted rows go first (NULLS
+// FIRST), then the oldest attempt, so a persistent failure rotates to the back
+// instead of monopolising the window.
+func (s *Store) ClaimUnrestoredCordons(ctx context.Context, limit int) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		WITH picked AS (
+			SELECT id FROM platform_apply_runs
+			 WHERE state IN `+terminalRunStatesSQL+`
+			   AND cordons_restored_at IS NULL
+			   AND jsonb_array_length(cordoned_hosts) > 0
+			 ORDER BY cordon_restore_attempted_at ASC NULLS FIRST, created_at DESC
+			 LIMIT $1
+			 FOR UPDATE SKIP LOCKED
+		)
+		UPDATE platform_apply_runs AS r
+		   SET cordon_restore_attempted_at = now()
+		  FROM picked
+		 WHERE r.id = picked.id
+		RETURNING r.id::text`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("claim unrestored cordons: %w", err)
+	}
+	defer rows.Close()
+	out := make([]string, 0)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan unrestored cordon run: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // CordonedHosts reads that record back.
 func (s *Store) CordonedHosts(ctx context.Context, runID string) ([]HostCordon, error) {
 	var raw []byte
@@ -296,11 +448,11 @@ func (s *Store) CordonedHosts(ctx context.Context, runID string) ([]HostCordon, 
 	return out, nil
 }
 
-// FleetNonTerminalSessions counts what a CONTROL-PLANE apply would end: every
-// session on the instance, not one host's. Recreating the control plane drops
-// every agent's connection, and an agent stops its sessions when that
-// connection drops. Same state predicate as NonTerminalSessions, without the
-// host filter.
+// FleetNonTerminalSessions counts every session on the instance, not one
+// host's — a control-plane recreate is instance-wide. Same state predicate as
+// NonTerminalSessions, without the host filter. This is the count a MIGRATING
+// control-plane step drains to zero and reports as `sessions_remaining`; since
+// #128 a recreate on its own no longer ends any of them (#153).
 func (s *Store) FleetNonTerminalSessions(ctx context.Context) (int, error) {
 	var n int
 	err := s.pool.QueryRow(ctx, `
@@ -308,6 +460,29 @@ func (s *Store) FleetNonTerminalSessions(ctx context.Context) (int, error) {
 	`).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("count fleet sessions: %w", err)
+	}
+	return n, nil
+}
+
+// FleetInFlightSessions counts the sessions a control-plane recreate still
+// ends: everything non-terminal EXCEPT `running`.
+//
+// The predicate is deliberately character-for-character the one in
+// session.Store.ReapHostExceptRunning (#128). A `running` row survives a
+// recreate because the agent holds the session and the heartbeat re-adopts the
+// row; a row that is `pending`, `assigned`, `starting` or `stopping` was mid
+// flight in a goroutine that died with the old connection, so the reconnecting
+// agent's first act is to fail it. The fleet-wide wait used to make that set
+// provably empty at the recreate; a non-migrating step no longer drains, so it
+// waits on THIS count instead (#153) — a user who pressed Play two seconds
+// earlier should not have their launch reaped by an update.
+func (s *Store) FleetInFlightSessions(ctx context.Context) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `
+		SELECT count(*) FROM sessions WHERE state NOT IN ('stopped','failed','running')
+	`).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count fleet in-flight sessions: %w", err)
 	}
 	return n, nil
 }

@@ -106,7 +106,8 @@ func TestAgentReconnectReconcilesSessionsWhenReclaimFails(t *testing.T) {
 		WithJobReclaimer(rec.reclaim), WithSessionForgetter(fg))
 	ctx := context.Background()
 
-	sess := runningSession(t, store, s)
+	// In-flight: since #128 a running session is held across a reconnect.
+	sess := inFlightSession(t, store, s)
 	coord.AgentReconnected(ctx, s.hostID)
 
 	if !fg.sawSession(sess.ID) {

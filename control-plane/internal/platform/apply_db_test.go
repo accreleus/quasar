@@ -11,8 +11,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -46,13 +48,17 @@ func seedHost(t *testing.T, pool *pgxpool.Pool, name, commit, status string) str
 	return id
 }
 
-func seedRelease(t *testing.T, store *Store, commit string, schema int) Release {
+func seedRelease(t *testing.T, store *Store, commit string, schema int, opts ...func(*Release)) Release {
 	t.Helper()
 	// A distinct version per commit: platform_releases_version_key is unique.
-	if _, err := store.UpsertRelease(context.Background(), Release{
+	r := Release{
 		Channel: ChannelStable, Version: str("0.9." + commit[:1]), SourceCommit: commit,
 		BuiltAt: at(4), SchemaVersion: schema, Manifest: applyManifest(commit, schema),
-	}); err != nil {
+	}
+	for _, o := range opts {
+		o(&r)
+	}
+	if _, err := store.UpsertRelease(context.Background(), r); err != nil {
 		t.Fatalf("seed release: %v", err)
 	}
 	rows, err := store.Releases(context.Background(), ChannelStable)
@@ -80,6 +86,9 @@ type applyHarness struct {
 	release     Release
 	hostCommit  string
 	viewOverlay func(*View)
+	// The instance's channel, as the settings store would answer it. Tests that
+	// exercise beta set it after construction; the view reads it per call.
+	channel string
 }
 
 // newApplyHarness wires the two endpoints behind the real admin chain, with a
@@ -92,7 +101,7 @@ func newApplyHarness(t *testing.T) *applyHarness {
 	ctx := context.Background()
 	store := NewStore(pool)
 
-	h := &applyHarness{pool: pool, store: store, hostCommit: commitA}
+	h := &applyHarness{pool: pool, store: store, hostCommit: commitA, channel: ChannelStable}
 	h.release = seedRelease(t, store, commitB, buildinfo.Get().SchemaVersion)
 	h.hostID = seedHost(t, pool, "gpu-01", h.hostCommit, "online")
 
@@ -105,7 +114,7 @@ func newApplyHarness(t *testing.T) *applyHarness {
 		if err != nil {
 			return View{}, err
 		}
-		releases, err := store.Releases(ctx, ChannelStable)
+		releases, err := store.Releases(ctx, rowChannel(h.channel))
 		if err != nil {
 			return View{}, err
 		}
@@ -114,7 +123,7 @@ func newApplyHarness(t *testing.T) *applyHarness {
 			return View{}, err
 		}
 		v := PlanRelease(PlanInputs{
-			Channel:      ChannelStable,
+			Channel:      h.channel,
 			EdgeBranch:   "develop",
 			ControlPlane: cp(commitB, buildinfo.Get().SchemaVersion),
 			Hosts:        hosts,
@@ -248,6 +257,43 @@ func TestApplyCreatesAnAttemptAndSendsOnlyTheNodeAgentComponent(t *testing.T) {
 	// The request id was persisted BEFORE the send: the row must resolve by it.
 	if _, err := h.store.AttemptByRequestID(context.Background(), sent.RequestID); err != nil {
 		t.Errorf("request id was not persisted before the send: %v", err)
+	}
+}
+
+// A prerelease is applied by naming its release id like any other release: on
+// beta it is what `available[0]` is, so `offered` accepts it and the digests that
+// reach the host are the prerelease's. On stable the same id is refused, because
+// that channel does not list it — the endpoint and the button agree.
+func TestApplyAcceptsAPrereleaseReleaseIDOnBetaAndRefusesItOnStable(t *testing.T) {
+	h := newApplyHarness(t)
+	// Upserts onto the harness's own row (channel, source_commit is the key), so
+	// the release the control plane is stamped with IS the prerelease.
+	rc := seedRelease(t, h.store, commitB, buildinfo.Get().SchemaVersion,
+		prerelease, withVersion("0.9.9-rc.1"))
+	if !rc.Prerelease || *rc.Version != "0.9.9-rc.1" {
+		t.Fatalf("seeded release = %+v, want the 0.9.9-rc.1 prerelease", rc)
+	}
+
+	if code, body := h.post(t, h.applyURL(), h.adminToken, HostApplyRequest{ReleaseID: rc.ID}); code != http.StatusConflict ||
+		errCode(t, body) != CodeReleaseNotOffered {
+		t.Fatalf("prerelease apply on stable = %d %s, want 409 release_not_offered", code, body)
+	}
+
+	h.channel = ChannelBeta
+	code, body := h.post(t, h.applyURL(), h.adminToken, HostApplyRequest{ReleaseID: rc.ID, Force: true})
+	if code != http.StatusAccepted {
+		t.Fatalf("prerelease apply on beta = %d (%s), want 202", code, body)
+	}
+	var env AttemptEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("decode: %v (%s)", err, body)
+	}
+	if env.Attempt.ReleaseID == nil || *env.Attempt.ReleaseID != rc.ID {
+		t.Errorf("attempt release_id = %v, want the prerelease's id", env.Attempt.ReleaseID)
+	}
+	waitFor(t, "release_apply to be sent", func() bool { return h.agent.sentCount() == 1 })
+	if sent := h.agent.sent[0]; sent.Release.SourceCommit != rc.SourceCommit {
+		t.Errorf("release provenance = %+v, want the prerelease's commit", sent.Release)
 	}
 }
 
@@ -497,6 +543,95 @@ func TestAttemptHistoryOrderingAndFilter(t *testing.T) {
 			t.Errorf("%s = %d, want 400", bad, code)
 		}
 	}
+}
+
+// Postgres REFUSES an output the CHECK rejects — and refuses invalid UTF-8
+// outright — instead of truncating either, so a terminal write carrying a relay
+// tail cut mid-rune was simply lost and the attempt hung to its 15-minute
+// deadline (#202). The bound therefore lives in the store, where every writer
+// passes: this fixture is what reaches FailAttempt when the updater's tail
+// starts mid-rune, the JSON hop turns each bad byte into a 3-byte U+FFFD, and
+// the wire hop cuts it back by bytes.
+func TestAnOversizedMidRuneOutputStillResolvesTheAttempt(t *testing.T) {
+	h := newApplyHarness(t)
+	ctx := context.Background()
+
+	// A 4-byte rune straddling the cut: the front cut lands two bytes into it.
+	// The NUL is the other half of the fixture: it is VALID UTF-8, so a bound
+	// that only calls ToValidUTF8 keeps it — and Postgres refuses a `text`
+	// carrying 0x00 (SQLSTATE 22021), which loses the write exactly as an
+	// oversized one does. A container dying with binary in its log tail is the
+	// way it arrives.
+	output := strings.Repeat("x", 100) + "😀" + strings.Repeat("y", 4000) +
+		"\x00" + strings.Repeat("y", 4189)
+	if len(output) <= applyOutputLimit || len(output)-applyOutputLimit != 102 {
+		t.Fatalf("fixture no longer straddles the cut: len = %d", len(output))
+	}
+	if !strings.Contains(output[len(output)-applyOutputLimit:], "\x00") {
+		t.Fatal("fixture no longer carries a NUL past the cut")
+	}
+
+	newAttempt := func() Attempt {
+		a, err := h.store.CreateHostAttempt(ctx, NewHostAttempt{
+			Kind: KindApply, HostID: h.hostID, ReleaseID: &h.release.ID,
+			Requested: []ComponentDigest{{Name: ComponentNodeAgent, Image: "img", Digest: "sha256:" + hex64}},
+			Previous:  []PreviousDigest{{Name: ComponentNodeAgent}},
+		})
+		if err != nil {
+			t.Fatalf("create attempt: %v", err)
+		}
+		return a
+	}
+	check := func(t *testing.T, id, wantState string) {
+		t.Helper()
+		got, err := h.store.Attempt(ctx, id)
+		if err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		if got.State != wantState {
+			t.Fatalf("state = %q, want %q: the write was refused", got.State, wantState)
+		}
+		if len(got.Output) > applyOutputLimit {
+			t.Errorf("stored output = %d bytes, CHECK allows %d", len(got.Output), applyOutputLimit)
+		}
+		if !utf8.ValidString(got.Output) {
+			t.Error("stored output is not valid UTF-8")
+		}
+		if !strings.HasSuffix(got.Output, "yyy") {
+			t.Error("the cut kept the head; the error is at the end")
+		}
+		if strings.ContainsRune(got.Output, 0) {
+			t.Error("stored output still carries a NUL; Postgres would have refused this write")
+		}
+	}
+
+	failed := newAttempt()
+	if err := h.store.FailAttempt(ctx, failed.ID, ReasonUnhealthy, output); err != nil {
+		t.Fatalf("FailAttempt with an over-long mid-rune output: %v", err)
+	}
+	check(t, failed.ID, AttemptFailed)
+
+	// The same tail arrives on the progress path, and on the auto_revert row
+	// ADR 0004 writes beside a failed apply.
+	progressing := newAttempt()
+	if err := h.store.RecordReleaseState(ctx, progressing.ID, AttemptPulling, nil, output); err != nil {
+		t.Fatalf("RecordReleaseState with an over-long mid-rune output: %v", err)
+	}
+	check(t, progressing.ID, AttemptPulling)
+
+	if err := h.store.FailAttempt(ctx, progressing.ID, ReasonUnhealthy, ""); err != nil {
+		t.Fatal(err)
+	}
+	reverted, err := h.store.CreateAutoRevertAttempt(ctx, NewAutoRevert{
+		Failed:    progressing,
+		Requested: []ComponentDigest{{Name: ComponentNodeAgent, Image: "img", Digest: "sha256:" + hex64}},
+		Previous:  []PreviousDigest{{Name: ComponentNodeAgent}},
+		Output:    output,
+	})
+	if err != nil {
+		t.Fatalf("CreateAutoRevertAttempt with an over-long mid-rune output: %v", err)
+	}
+	check(t, reverted.ID, AttemptSucceeded)
 }
 
 // The state predicate lives in two places — Go and SQL — so they are pinned

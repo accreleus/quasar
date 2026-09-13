@@ -34,6 +34,14 @@ in which case the launch hops once to the next-lower *chain* and re-resolves.
 The lookup is per rung; the remedy is per chain. A missing cert row is
 optimism, not a refusal.
 
+**Driver identity** — the opaque per-GPU fingerprint of the driver and encode
+stack a host is running (`nvidia:610.57.04`, `vk:radv:Mesa 25.3.6`), reported on
+`capacity` and stamped onto every cert row written for that GPU. It says which
+measurements still describe reality: a cert measured before a driver change
+describes software that is no longer installed. Compared for equality, never
+parsed. _Unknown is a value_ — an agent that reports none, and every row written
+before it existed, keep their measurements applicable.
+
 **Stream plan** — the whole post-placement decision as one value: the resolved
 chain and rung, whether the cap fired, the decision record, and exactly what to
 persist. Computed from gathered inputs with no I/O, so the decision is
@@ -279,10 +287,13 @@ source checkout), "image version" (that is the catalog term), "build" (a build
 may never be published).
 
 **Channel** — which platform releases an admin is shown. `stable` is a tagged,
-noted release; `edge` is whatever was last published from a branch, with no
-notes. An instance follows one channel at a time. _Avoid_: "track", "branch"
-(edge follows a branch, but a channel is the admin-facing choice, not the git
-object).
+noted release; `beta` is those and the prereleases among them; `edge` is
+whatever was last published from a branch, with no notes. An instance follows
+one channel at a time. Beta stores no releases of its own — it lists the ones
+stable hides — so a switch selects differently rather than fetching again.
+_Avoid_: "track", "branch" (edge follows a branch, but a channel is the
+admin-facing choice, not the git object), "unstable" (that is `develop`, which
+is what `edge` follows).
 
 **Release manifest** — the machine-readable description of one stable platform
 release: which component images it contains, by digest, and the commit they were
@@ -290,6 +301,20 @@ built from. Published with the release, from the same tag, so the human-readable
 notes and the digests cannot disagree. _Avoid_: "release body" (the notes are
 for people; the manifest is what the control plane reads), "catalog manifest"
 (that is the app catalog's file).
+
+**Release signature** — a detached signature over a release manifest's bytes,
+published beside it. It covers the images through the digests the manifest
+already names, so there is no per-image signature. Optional on both sides: a
+release may carry none, and a host may check none. _Avoid_: "signed image" (no
+image is signed), "attestation" (that is a different artifact with a different
+producer).
+
+**Trusted release key** — a public key a HOST has been configured to accept
+release signatures from. A host may trust several at once, which is what makes a
+key rotation a period rather than a flag day. The label beside a key is for
+people; any signature by any trusted key verifies. _Avoid_: "signing key" for
+the public half (the signing key is private and lives only in the release
+pipeline), "certificate" (there is no chain and no expiry).
 
 **Updater** — the per-host actor that pulls a platform release and recreates the
 containers it replaces, because a container cannot recreate itself. It acts only
@@ -307,11 +332,33 @@ host. Every apply produces one, whether it succeeded or failed, and it is the
 only durable record of what that target was on before. _Avoid_: "job" (an
 attempt is operator-initiated and rides no schedule), "task".
 
+**Preflight** — the per-target evaluation, on the release view, of whether the
+stack around a target is shaped so an apply can be carried out at all: the
+updater reachable, the stack directory and overlays it will act on the ones the
+target was started with, the health port the next agent start needs, the
+release's images resolvable. Distinct from *eligibility* (may this target take
+the release) and from a host's *readiness* (can it run sessions); a host's own
+readiness checks are inputs to its preflight. A blocked preflight is one
+eligibility reason among the others. _Avoid_: "conformance check" (the checks
+are readiness checks; preflight is the evaluation that reads them), "health
+check" (that is the container's), "precheck".
+
+**Release notification** — one outbound message announcing that a platform
+release this instance could move to has appeared. Sent once per release, to an
+admin-configured webhook URL, after a detection pass. It is a delivery, not a
+decision: nothing it does changes what is offered, and its failure is recorded
+rather than escalated. _Avoid_: "alert" (nothing is wrong), "announcement" (that
+is the upstream publish), "notification" unqualified (the console banner is also
+a notification, and it is the in-product one).
+
 **Fleet run** — one release applied across the whole instance: the control plane
 first, then every eligible host in sequence. At most one is active. A host that
 cannot take the release at its turn is **skipped**, which is not a failure; a
 target that fails stops the run where it stands. _Avoid_: "rollout" (implies
 staging and percentages, of which there are none), "batch" (the run is strictly
-sequential), "deployment". Its control-plane step drains the WHOLE instance
-first: recreating the control plane drops every agent's connection, and an agent
-stops its sessions when that connection drops.
+sequential), "deployment". It cordons the whole instance for its whole life, but
+its control-plane step drains the instance first ONLY when the release carries a
+migration (`ReleaseRunsAMigration`): since #128 a recreate no longer ends a
+`running` session, so a non-migrating step lets live sessions ride through it and
+waits only for in-flight launches to settle (#153). Host steps drain as they
+always did — recreating an agent does end that host's sessions.

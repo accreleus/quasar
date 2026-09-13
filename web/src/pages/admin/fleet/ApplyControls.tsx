@@ -24,7 +24,7 @@ import { ResourceStates } from "../../../components/ResourceStates";
 import { relativeTime } from "../../../lib/format/relativeTime";
 import { useAdminAction } from "../../../lib/resource/action";
 import { useResource } from "../../../lib/resource/react";
-import { attemptStateText, failureText, releaseLabel, shortDigest } from "./releasesCopy";
+import { attemptStateText, failureText, releaseLabel, shortDigest, attemptKindText } from "./releasesCopy";
 
 /** The open attempt for one target — null host_id is the control plane. */
 export function attemptForTarget(
@@ -193,7 +193,7 @@ function ApplyHistoryRow({ attempt: a }: { attempt: PlatformApplyAttempt }) {
         {from} → {to}
       </span>
       <span className="hint">
-        <span>{a.kind === "revert" ? "Revert" : "Apply"}</span> · {attemptStateText(a.state)}
+        <span>{attemptKindText(a.kind)}</span> · {attemptStateText(a.state)}
         {a.reason && ` · ${failureText(a.reason)}`}
       </span>
     </div>

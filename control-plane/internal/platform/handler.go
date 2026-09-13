@@ -42,6 +42,22 @@ type Deps struct {
 	// ControlPlaneInstallMode is this control plane's own install mode, read
 	// from its updater. Nil, or a nil answer, is unknown.
 	ControlPlaneInstallMode func() *string
+	// Webhook is the release-notification surface (#123). Optional: nil leaves
+	// `release_webhook` null rather than failing the view.
+	Webhook func(ctx context.Context) (*WebhookStatus, error)
+	// AgentConnected reports whether a host's agent has a live socket to THIS
+	// process. Optional: nil leaves every host's connectivity unknown and the
+	// `status` column decides, which is exactly today's behaviour (#169).
+	//
+	// A function field for the same reason Cordon and UpdaterPresent are:
+	// `internal/agentws` owns the registry and sits beside this package, not
+	// under it.
+	AgentConnected func(hostID string) bool
+	// ControlPlanePreflight is what the collectors found about this control
+	// plane's own stack (amendment 9). Optional: nil leaves every check unknown.
+	ControlPlanePreflight func(ctx context.Context) PreflightFacts
+	// ImageFor is the instance-wide registry check for one release. Optional.
+	ImageFor func(ctx context.Context, r Release) *ImageFact
 }
 
 // errNoDeps is what a handler built with no dependencies answers with, rather
@@ -119,7 +135,17 @@ func (h *Handler) releaseView(ctx context.Context) (View, error) {
 	if err != nil {
 		return View{}, err
 	}
-	releases, err := h.deps.Releases(ctx, channel)
+	// Liveness is read HERE, with every other input, so `PlanRelease` stays pure
+	// and the page, the fleet run and the standalone apply all judge a host by
+	// the same fact (#169).
+	if h.deps.AgentConnected != nil {
+		for i := range hosts {
+			connected := h.deps.AgentConnected(hosts[i].HostID)
+			hosts[i].AgentConnected = &connected
+		}
+	}
+	// rowChannel, not channel: beta selects the stable channel's rows (#121).
+	releases, err := h.deps.Releases(ctx, rowChannel(channel))
 	if err != nil {
 		return View{}, err
 	}
@@ -145,19 +171,37 @@ func (h *Handler) releaseView(ctx context.Context) (View, error) {
 	if h.deps.ControlPlaneInstallMode != nil {
 		installMode = h.deps.ControlPlaneInstallMode()
 	}
+	var webhook *WebhookStatus
+	if h.deps.Webhook != nil {
+		webhook, err = h.deps.Webhook(ctx)
+		if err != nil {
+			return View{}, err
+		}
+	}
+	var cpPreflight PreflightFacts
+	if h.deps.ControlPlanePreflight != nil {
+		cpPreflight = h.deps.ControlPlanePreflight(ctx)
+	}
+	var imageFor func(Release) *ImageFact
+	if h.deps.ImageFor != nil {
+		imageFor = func(r Release) *ImageFact { return h.deps.ImageFor(ctx, r) }
+	}
 	return PlanRelease(PlanInputs{
-		Channel:      channel,
-		SourceRepo:   ConfiguredReleaseRepo(),
-		EdgeBranch:   edgeBranch,
-		ControlPlane: buildinfo.Get(),
-		Hosts:        hosts,
-		Releases:     releases,
-		CheckedAt:    status.CheckedAt,
-		LastError:    status.LastError,
-		OpenAttempts: open,
-		ActiveRun:    run,
+		Channel:               channel,
+		SourceRepo:            ConfiguredReleaseRepo(),
+		ControlPlanePreflight: cpPreflight,
+		ImageFor:              imageFor,
+		EdgeBranch:            edgeBranch,
+		ControlPlane:          buildinfo.Get(),
+		Hosts:                 hosts,
+		Releases:              releases,
+		CheckedAt:             status.CheckedAt,
+		LastError:             status.LastError,
+		OpenAttempts:          open,
+		ActiveRun:             run,
 
 		UpdaterPresent:          h.deps.UpdaterPresent != nil && h.deps.UpdaterPresent(),
 		ControlPlaneInstallMode: installMode,
+		ReleaseWebhook:          webhook,
 	}), nil
 }

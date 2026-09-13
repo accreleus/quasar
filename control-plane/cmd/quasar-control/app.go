@@ -85,6 +85,7 @@ type Services struct {
 	// The apply half (#116). Nil in a route-recorder build; Register only takes
 	// method values, so the drift test still sees the routes.
 	platformApply  *platform.ApplyHandler
+	platformNotify *platform.NotifyHandler
 	applyRunner    *platform.Runner
 	fleetRunner    *platform.FleetRunner
 	auditHandler   *audit.Handler
@@ -163,7 +164,7 @@ func unmanagedDescription(desc, file, detail string) string {
 
 func ptrTimeOfDay(t jobs.TimeOfDay) *jobs.TimeOfDay { return &t }
 
-// platformDeps adapts three stores onto the release view's reads. It lives in
+// platformDeps adapts four stores onto the release view's reads. It lives in
 // main for the reason registrationGate does: internal/platform importing
 // settings and jobs (both of which sit above it) would be a cycle.
 //
@@ -171,7 +172,7 @@ func ptrTimeOfDay(t jobs.TimeOfDay) *jobs.TimeOfDay { return &t }
 // one, cleared once a later run succeeded — the two are read independently
 // because "failing since then" is a stale checked_at WITH an error, not one or
 // the other.
-func platformDeps(store *platform.Store, set *settings.Store, jobStore *jobs.Store) *platform.Deps {
+func platformDeps(store *platform.Store, set *settings.Store, jobStore *jobs.Store, sec *secrets.Store) *platform.Deps {
 	return &platform.Deps{
 		Channel:  set.ReleaseChannel,
 		Hosts:    store.Hosts,
@@ -199,6 +200,69 @@ func platformDeps(store *platform.Store, set *settings.Store, jobStore *jobs.Sto
 			}
 			return st, nil
 		},
+		Webhook: func(ctx context.Context) (*platform.WebhookStatus, error) {
+			enabled, rawURL, err := set.ReleaseWebhook(ctx)
+			if err != nil {
+				return nil, err
+			}
+			st := platform.WebhookStatus{Enabled: enabled, URL: rawURL}
+			// The status boolean, never the secret. A secrets read that fails
+			// leaves it to the environment rather than failing the whole
+			// Releases page.
+			status, statusErr := sec.Status(ctx, secrets.NameReleaseWebhookSecret)
+			st.SecretConfigured = releaseWebhookSecretConfigured(
+				status.Configured, statusErr, os.Getenv("QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET"))
+			last, err := store.LastDelivery(ctx)
+			if err != nil {
+				return nil, err
+			}
+			st.LastDelivery = last
+			return &st, nil
+		},
+	}
+}
+
+// releaseWebhookSecretConfigured folds the two places a signing secret can come
+// from into the view's `secret_configured` boolean (openapi.yaml defines it as
+// the stored secret "or its environment fallback").
+//
+// The environment counts on the SUCCESS path too, not only when the status read
+// errors: secrets.Store.Status answers about instance_secrets alone and reports
+// Configured=false with no error when there is no row, so an operator who set
+// only QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET — the path deploy/.env.example
+// documents — gets signed deliveries, and a card reading "unsigned" would be a
+// lie. A failed status read keeps its old behaviour: the environment alone
+// decides, because nothing is known about the stored row.
+func releaseWebhookSecretConfigured(stored bool, statusErr error, envSecret string) bool {
+	if statusErr != nil {
+		return envSecret != ""
+	}
+	return stored || envSecret != ""
+}
+
+// releaseWebhookConfig resolves where a release notification goes, per pass.
+// The secret is read at the point of use and dropped, never cached on a struct.
+func releaseWebhookConfig(set *settings.Store, sec *secrets.Store, log *slog.Logger) func(context.Context) (platform.WebhookConfig, error) {
+	return func(ctx context.Context) (platform.WebhookConfig, error) {
+		enabled, rawURL, err := set.ReleaseWebhook(ctx)
+		if err != nil {
+			return platform.WebhookConfig{}, err
+		}
+		cfg := platform.WebhookConfig{Enabled: enabled, URL: rawURL}
+		// Signing is optional — Slack, Discord and ntfy authenticate by URL —
+		// so an unreadable secret sends unsigned rather than not at all. It is
+		// logged because the console still calls that secret configured, and a
+		// silent downgrade to unsigned is undiagnosable from the outside: a
+		// missing or rotated QUASAR_SECRET_KEY is the usual cause.
+		v, err := sec.Resolve(ctx, secrets.NameReleaseWebhookSecret,
+			os.Getenv("QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET"))
+		if err != nil {
+			log.Warn("release notification: the stored signing secret could not be read — sending unsigned",
+				"secret", secrets.NameReleaseWebhookSecret, "err", err)
+		} else {
+			cfg.Secret = v.Secret
+		}
+		return cfg, nil
 	}
 }
 
@@ -223,6 +287,7 @@ func (a releaseEventsAdapter) AgentReleaseState(ctx context.Context, hostID stri
 		Components: components,
 		Previous:   previous,
 		Output:     m.Output,
+		Restored:   m.Restored,
 	})
 }
 
@@ -425,6 +490,11 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		},
 	})
 
+	// Captured BEFORE the coordinator exists, so the stale sweep's grace runs
+	// from this process's start. Without it a control plane restarting after a
+	// quiet period would reap every session in its first tick, before any agent
+	// could reconnect (#128).
+	bootedAt := time.Now()
 	coordinator := session.NewCoordinator(sessionStore, agentRegistry, log,
 		session.WithHomeProvider(homeProvider),
 		// The terminal-failure edge has no acting admin, so it is recorded here
@@ -448,6 +518,19 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 			}
 			return jobsDispatcher.ReclaimHostRuns(ctx, hostID, reason)
 		}))
+
+	// #128: the backstop for the grace window. HostDisconnected and
+	// AgentReconnected no longer reap `running` rows -- the agent may be holding
+	// them across a control-plane restart -- so something has to terminalise the
+	// sessions of a host that never comes back. Process-lifetime, like the other
+	// background loops here.
+	// janitorCtx, not Background: Stop() cancels it, so the sweep does not keep
+	// running through shutdown and leak a goroutine per Services built (the DB
+	// tests construct several).
+	go coordinator.RunStaleSweep(janitorCtx, bootedAt,
+		time.Duration(cfg.SessionGraceSecs)*time.Second)
+	log.Info("session stale-host sweep started",
+		"grace_secs", cfg.SessionGraceSecs, "booted_at", bootedAt.Format(time.RFC3339))
 
 	authHandler := auth.NewHandler(authSvc, auditStore).
 		WithVersionPolicy(cfg.MinClientVersion, cfg.LatestClientVersion).
@@ -905,21 +988,35 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// An edge release stores no manifest, so its digest is resolved from the
 	// commit's image tag at apply time, off the same allowlisted registry the
 	// edge detector reads.
-	edgeApply := platform.NewEdgeApplyResolver(
-		images.NewRegistryResolverForHosts(nil, images.RegistryEgressHosts(platform.ConfiguredPlatformRegistry())),
+	platformRegistryResolver := images.NewRegistryResolverForHosts(nil, images.RegistryEgressHosts(platform.ConfiguredPlatformRegistry()))
+	edgeApply := platform.NewEdgeApplyResolver(platformRegistryResolver,
 		platform.ConfiguredPlatformRegistry(), platform.ConfiguredReleaseRepo())
+	// Preflight's one network collector: do the release's digests resolve at
+	// the registry (amendment 9). Invalidated on "Check now" and before an apply.
+	imageResolver := platform.NewImageResolver(platformRegistryResolver, edgeApply, 0)
 	// The control plane applies ITSELF over the updater socket beside it, never
 	// over an agent connection (agent-api.md §release_apply).
 	updaterClient := platform.NewUpdaterClient(platform.ConfiguredUpdaterSocket())
 	selfApplier := platform.NewSelfApplier(platformStore, updaterClient, log)
+	// A stale preflight must not authorise a run: dropped before an apply
+	// decision and by "Check now".
+	refreshPreflight := func() { imageResolver.Invalidate(); selfApplier.InvalidateSelf() }
 
-	pDeps := platformDeps(platformStore, settingsStore, jobStore)
+	pDeps := platformDeps(platformStore, settingsStore, jobStore, secretStore)
 	pDeps.UpdaterPresent = selfApplier.UpdaterPresent
 	pDeps.ControlPlaneInstallMode = selfApplier.InstallMode
+	pDeps.ControlPlanePreflight = selfApplier.PreflightFacts
+	pDeps.ImageFor = imageResolver.Check
+	// #169: the live registry, not the `status` column, answers "is this host's
+	// agent there". The column is stale across every control-plane restart —
+	// and a fleet run contains one — and the run's own cordon then rewrites it
+	// to `draining`, which is not `offline`. Same function the per-host apply
+	// runner already waits on (`Connected` below).
+	pDeps.AgentConnected = agentRegistry.IsConnected
 	platformHandler := platform.NewHandler(pDeps, log)
-	// The fleet run cordons the WHOLE instance for its control-plane step:
-	// recreating the control plane drops every agent connection, and an agent
-	// stops its sessions when that drops.
+	// The fleet run cordons the WHOLE instance for its whole life: every host in
+	// it is about to be recreated at its own step. Whether the control-plane step
+	// also DRAINS is a per-release decision (#153) that lives in the sequencer.
 	fleetCordons := platform.FleetCordons{
 		Cordon: func(ctx context.Context, hostID string) error {
 			_, err := coordinator.DrainHost(ctx, hostID, false)
@@ -929,10 +1026,28 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 			_, err := coordinator.UncordonHost(ctx, hostID)
 			return err
 		},
+		// force=true: stop the sessions, do not merely stop new placement. Used
+		// only by a migrating control-plane step under `force` (#153).
+		Drain: func(ctx context.Context, hostID string) error {
+			_, err := coordinator.DrainHost(ctx, hostID, true)
+			return err
+		},
 	}
+	// Outbound release notification (#123). The webhook is resolved per pass and
+	// the detection job calls Notify AFTER a successful pass: a failed delivery
+	// is a summary line, never a failed detection.
+	webhookConfig := releaseWebhookConfig(settingsStore, secretStore, log)
+	releaseNotifier := platform.NewNotifier(platformStore, platform.NotifyDeps{
+		View:   platformHandler.ReleaseView,
+		Config: webhookConfig,
+	}, log)
+	platformNotify := platform.NewNotifyHandler(
+		platformHandler.ReleaseView, webhookConfig, nil, auditStore, log)
+
 	fleetRunner := platform.NewFleetRunner(platformStore, applyRunner, selfApplier,
 		platform.ManifestOrEdge{Edge: edgeApply}, fleetCordons, platformHandler.ReleaseView, log)
 	platformApply := platform.NewApplyHandler(platformStore, applyRunner, platformHandler.ReleaseView, auditStore, log).
+		WithPreflightRefresh(refreshPreflight).
 		WithEdgeResolver(edgeApply).
 		WithFleet(fleetRunner)
 	// Closed after construction: the view reports the active run, and the run's
@@ -943,7 +1058,32 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// what still correlates the agent's release_state. A fleet run is re-adopted
 	// the same way — including after the restart its own first target caused.
 	applyRunner.Adopt(context.Background())
+	// A run that already ENDED can still owe the fleet its scheduling back: the
+	// terminal state is written before the cordons are lifted, so a failure — or
+	// a death — in that window leaves hosts `draining` with nothing non-terminal
+	// for Adopt to find. Bounded, idempotent, and once per start (#176).
+	//
+	// BEFORE Adopt, and it refuses to run while a fleet run is active. An old
+	// run's record is a claim about a moment that has passed, so replaying it
+	// against a fleet a live run has deliberately cordoned would put hosts back
+	// into scheduling mid-update. Here, nothing is active in the database, no run
+	// has been started by this process, and the API is not serving yet.
+	fleetRunner.ResumeCordonRestores(context.Background())
 	fleetRunner.Adopt(context.Background())
+
+	// Unattended automatic apply (#122). Constructed here because it needs the
+	// fleet runner's Start and the view that reports the active run — it is a
+	// TRIGGER on the existing sequencer, not a second one. It never sends
+	// `force`: CreateUnattendedRun does not take it.
+	autoApplier := platform.NewAutoApplier(platformStore, platform.AutoApplyDeps{
+		Enabled: settingsStore.PlatformAutoApply,
+		View:    platformHandler.ReleaseView,
+		Start:   fleetRunner.Start,
+		Audit: func(ctx context.Context, action, targetID string, details map[string]any) {
+			// Empty actor: no admin did this.
+			audit.TryRecord(ctx, auditStore, "", action, "platform", targetID, details)
+		},
+	}, log)
 
 	jobRegistry.MustRegister(jobs.Definition{
 		ID:          platform.DetectJobID,
@@ -965,11 +1105,23 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 			if releaseDetector == nil {
 				return jobs.Skipped("no platform release repository configured (QUASAR_PLATFORM_RELEASE_REPO)"), nil
 			}
+			refreshPreflight()
 			rep, err := releaseDetector.Detect(ctx)
 			if err != nil {
 				return jobs.Outcome{}, err
 			}
-			return jobs.Succeeded(rep.Summary()), nil
+			summary := rep.Summary()
+			for k, v := range releaseNotifier.Notify(ctx).Summary() {
+				summary[k] = v
+			}
+			// The detection schedule IS the unattended-apply window (#122), so
+			// this is the trigger — it runs only on a pass that succeeded, and it
+			// never fails the job: a release the instance chose not to install is
+			// not a detection failure. Why it did or did not act is in the summary.
+			for k, v := range autoApplier.Consider(ctx).Summary() {
+				summary[k] = v
+			}
+			return jobs.Succeeded(summary), nil
 		},
 	})
 
@@ -1054,6 +1206,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		fleetRunner:      fleetRunner,
 		auditHandler:     auditHandler,
 		artworkHandler:   artworkHandler,
+		platformNotify:   platformNotify,
 		secretsHandler:   secretsHandler,
 		libraryHandler:   libraryHandler,
 		imagesHandler:    imagesHandler,
@@ -1094,6 +1247,7 @@ func (s *Services) RegisterRoutes(mux httpx.Router) {
 	s.consoleHandler.Register(mux, admin)
 	s.platformHandler.Register(mux, admin)
 	s.platformApply.Register(mux, admin)
+	s.platformNotify.Register(mux, admin)
 	s.auditHandler.Register(mux, admin)
 	s.secretsHandler.Register(mux, admin)
 	s.artworkHandler.Register(mux, s.authHandler.RequireAuth, s.authHandler.RequireAdmin)

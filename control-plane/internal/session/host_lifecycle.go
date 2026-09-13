@@ -100,6 +100,17 @@ type AgentConnectivity interface {
 	IsConnected(hostID string) bool
 }
 
+// AgentConnected reports whether hostID's agent is currently connected. Unwired
+// connectivity answers true: callers use this to REFUSE work while a host is
+// away, and refusing everything because the check is missing would be worse than
+// the behaviour it guards.
+func (c *Coordinator) AgentConnected(hostID string) bool {
+	if c.agents == nil {
+		return true
+	}
+	return c.agents.IsConnected(hostID)
+}
+
 // WithAgentConnectivity wires the live-connection check UncordonHost needs.
 // Unwired (nil) trusts the status column instead.
 func WithAgentConnectivity(a AgentConnectivity) CoordinatorOption {
@@ -145,24 +156,25 @@ func (c *Coordinator) UncordonHost(ctx context.Context, hostID string) (Host, er
 	return h, nil
 }
 
-// HostDisconnected reaps a disconnected host's non-terminal sessions to failed,
-// releasing their reservations (schema.md invariant #3 — the authority of last
-// resort that does not depend on a callback a dead agent can't send).
+// HostDisconnected fails a disconnected host's IN-FLIGHT sessions, releasing
+// their reservations (schema.md invariant #3 — the authority of last resort that
+// does not depend on a callback a dead agent can't send).
+//
+// `running` rows are NOT reaped here since #128: the agent holds them for its own
+// grace window, so a brief websocket blip must not end a live stream. If the host
+// never comes back, sweepStaleHosts is the backstop.
 func (c *Coordinator) HostDisconnected(ctx context.Context, hostID string) {
-	// Capture the ids before the reap: ReapHost is a bulk UPDATE with no
-	// per-session hook, so this is the only chance to drop their in-memory state.
-	ids, idsErr := c.store.NonTerminalSessionIDsOnHost(ctx, hostID)
-	if idsErr != nil {
-		c.log.Warn("list host sessions before reap failed", "host_id", hostID, "err", idsErr)
-	}
-
-	n, err := c.store.ReapHost(ctx, hostID, "host agent connection lost")
+	// The reap RETURNS the ids it failed, and only those get their in-memory
+	// state dropped. Forgetting a HELD running session here would close its
+	// browser's signalling connection as terminal and end the stream the grace
+	// window exists to keep alive (#128).
+	ids, err := c.store.ReapHostExceptRunning(ctx, hostID, "host agent connection lost")
 	if err != nil {
 		c.log.Error("reap host sessions failed", "host_id", hostID, "err", err)
 		return
 	}
-	if n > 0 {
-		c.log.Warn("reaped sessions on host disconnect", "host_id", hostID, "count", n)
+	if len(ids) > 0 {
+		c.log.Warn("reaped in-flight sessions on host disconnect", "host_id", hostID, "count", len(ids))
 	}
 	for _, sid := range ids {
 		c.health.forget(sid)
@@ -172,24 +184,25 @@ func (c *Coordinator) HostDisconnected(ctx context.Context, hostID string) {
 	}
 }
 
-// AgentReconnected reconciles a host whose agent connected fresh (P2-06). The
-// node-agent rebuilds its session state from nothing every connection, so a new
-// connection means it is running NONE of the sessions the control plane believes
-// are here. Failing them releases each reservation in the same transaction
-// rather than leaking capacity to rows stuck at `running`. A no-op on first
-// enrollment; the agent sweeps its own orphaned containers on startup.
+// AgentReconnected reconciles a host whose agent connected fresh (P2-06).
+//
+// It fails the rows whose driving goroutine died with the old connection —
+// assigned, starting, stopping — and DELIBERATELY LEAVES `running` rows alone.
+// Since #128 the agent may have held those sessions across the outage, and its
+// first heartbeat (AgentHeartbeat, ~5 s later) is what decides which survived.
+// Reaping them here is what ended every session on a control-plane restart, and
+// doing so would defeat the whole grace window.
+//
+// A no-op on first enrollment; the agent sweeps its own orphaned containers on
+// startup.
 //
 // The same argument closes the host's job runs (#492): left open they hold the
 // job_runs_open_per_target single-flight slot until the claim-timeout reaper
 // fires (an hour by default), 409ing every "Run now" in the meantime.
 func (c *Coordinator) AgentReconnected(ctx context.Context, hostID string) {
-	// Capture ids before the bulk reap; see HostDisconnected.
-	ids, idsErr := c.store.NonTerminalSessionIDsOnHost(ctx, hostID)
-	if idsErr != nil {
-		c.log.Warn("list host sessions before reconcile failed", "host_id", hostID, "err", idsErr)
-	}
-
-	n, err := c.store.ReapHost(ctx, hostID, "agent reconnected; prior sessions not recovered")
+	// Only the ids actually reaped; see HostDisconnected for why a held running
+	// session must keep its in-memory state.
+	ids, err := c.store.ReapHostExceptRunning(ctx, hostID, "agent reconnected; in-flight launch not recovered")
 	if err != nil {
 		c.log.Error("reconcile host sessions failed", "host_id", hostID, "err", err)
 		// The reconcile is the load-bearing half (it releases GPU reservations),
@@ -198,8 +211,8 @@ func (c *Coordinator) AgentReconnected(ctx context.Context, hostID string) {
 		c.reclaimHostJobRuns(ctx, hostID)
 		return
 	}
-	if n > 0 {
-		c.log.Warn("reconciled stale sessions on agent reconnect", "host_id", hostID, "count", n)
+	if len(ids) > 0 {
+		c.log.Warn("reconciled in-flight sessions on agent reconnect", "host_id", hostID, "count", len(ids))
 	}
 	for _, sid := range ids {
 		c.health.forget(sid)

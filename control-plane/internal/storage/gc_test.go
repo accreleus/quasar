@@ -308,7 +308,8 @@ func TestDeleteUser_TombstonesOrphansHomes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("auth service: %v", err)
 	}
-	must(t, authSvc.DeleteUser(ctx, u))
+	_, delErr := authSvc.DeleteUser(ctx, u)
+	must(t, delErr)
 
 	// The user row is gone.
 	var n int

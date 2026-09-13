@@ -24,7 +24,7 @@ import { Modal } from "../../../components/Modal";
 import { registryCommands } from "../../../lib/platform/manualUpdate";
 import { useAdminAction } from "../../../lib/resource/action";
 import { useResource } from "../../../lib/resource/react";
-import { failureText, releaseLabel, shortDigest } from "./releasesCopy";
+import { failureText, hostAfterFailureText, releaseLabel, shortDigest } from "./releasesCopy";
 
 const AGENT = "node-agent";
 
@@ -56,7 +56,10 @@ export function revertStates(attempts: PlatformApplyAttempt[]): Map<string, Reve
   for (const a of attempts) {
     if (a.target !== "host" || !a.host_id) continue;
     if (!newest.has(a.host_id)) newest.set(a.host_id, a);
-    if (a.state !== "succeeded" || out.has(a.host_id)) continue;
+    // An auto_revert's previous digests are the release that just failed;
+    // offering to go back onto it is the opposite of a revert. Server twin:
+    // apply_revert.go LastSucceededAttempt.
+    if (a.state !== "succeeded" || a.kind === "auto_revert" || out.has(a.host_id)) continue;
     const prev = agentPrevious(a);
     if (prev) out.set(a.host_id, { ...prev, failed: null });
   }
@@ -195,6 +198,10 @@ export function FailedAttemptPanel({
   // which is what an operator needs when the stack is half-moved.
   const restore = agentPrevious(attempt);
   const recipe = restore ? registryCommands(null, restore) : [];
+  // What this failure actually left running, which is not one sentence: the
+  // updater restores the previous build itself past the health wait (#201), and
+  // for a revert that build is the one being reverted away from (#202).
+  const after = hostAfterFailureText(attempt.reason, attempt.kind);
 
   return (
     <div className="note" data-testid={`failed-${attempt.host_id}`}>
@@ -210,9 +217,7 @@ export function FailedAttemptPanel({
           </Button>
         )}
       </div>
-      <p className="hint">
-        The host is still running whatever it had; nothing was rolled back for it automatically.
-      </p>
+      {after && <p className="hint">{after}</p>}
       {previous.length > 0 && (
         <p className="muted">
           Previously{" "}

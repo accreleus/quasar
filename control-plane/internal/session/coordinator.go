@@ -225,6 +225,95 @@ func (c *Coordinator) failSession(sessionID, reason string) {
 	c.failSessionWithDetail(sessionID, reason, nil)
 }
 
+// AgentHeartbeat reconciles this host against the agent's own list of running
+// sessions (#128; agent-api.md §"Reconnection & reconciliation"). It is the
+// other half of the grace window: the agent may keep sessions alive across a
+// control-plane restart, so the control plane must LEARN which survived instead
+// of assuming none did.
+//
+// Forward: a `running` row the agent no longer names is gone. Only `running` is
+// judged. A row reaches running only after the agent itself reported it
+// (agent_state.go), so a running row the agent has dropped is genuinely dead,
+// and assigned/starting rows belong to a launch in flight — the agent inserts a
+// session into its map at the session_start ack, BEFORE it reports running, so
+// it legitimately lists ids we still have as starting.
+//
+// Reverse: the agent runs something we have no running row for. Left alone that
+// is an orphaned container holding a GPU. The runner's own idle reaper bounds it
+// for ordinary sessions but is disabled for console sessions, so it would be
+// unbounded on a console host.
+//
+// Dispatched with Send, NEVER SendWithAck: this runs synchronously inside the
+// agent websocket read loop, and that same loop is what would have to read the
+// ack — so an ack here could only ever time out.
+func (c *Coordinator) AgentHeartbeat(ctx context.Context, hostID string, running []string) {
+	// A nil list is "the agent said nothing", not "the agent runs nothing". Our
+	// agent always emits the field, but absent and [] decode identically to nil
+	// in Go, and treating the two the same would fail every running session on
+	// this host for a malformed or older heartbeat.
+	if running == nil {
+		return
+	}
+	rows, err := c.store.RunningSessionIDsOnHost(ctx, hostID)
+	if err != nil {
+		c.log.Warn("heartbeat reconcile: list running sessions failed", "host_id", hostID, "err", err)
+		return
+	}
+
+	cpRunning := make(map[string]struct{}, len(rows))
+	for _, id := range rows {
+		cpRunning[id] = struct{}{}
+	}
+	live := make(map[string]struct{}, len(running))
+	for _, id := range running {
+		live[id] = struct{}{}
+	}
+
+	for _, sid := range rows {
+		if _, ok := live[sid]; ok {
+			continue
+		}
+		detail := "host_lost"
+		c.failSessionWithDetail(sid, "agent no longer running this session", &detail)
+	}
+
+	for sid := range live {
+		if _, ok := cpRunning[sid]; ok {
+			continue
+		}
+		hs, err := c.store.GetSessionHostState(ctx, sid)
+		switch {
+		case errors.Is(err, ErrNotFound):
+			// Unknown to us entirely: stop it.
+		case err != nil:
+			continue
+		case hs.State == StateAssigned || hs.State == StateStarting:
+			// A launch in flight on this connection; not an orphan. The agent
+			// inserts into its map at the session_start ack, before it reports
+			// running, so it legitimately lists these.
+			continue
+		case hs.State == StateStopping:
+			// A stop is already on its way. Re-sending one every heartbeat until
+			// teardown finishes would log an `error` stop over a user's own.
+			continue
+		case hs.State == StateRunning:
+			// Unreachable today: the only writer of `running` is AgentState on
+			// this same serialized read loop, so a running row would have been in
+			// cpRunning. Explicit anyway -- falling through to a stop is the wrong
+			// default for a live session if that ever changes.
+			continue
+		case hs.HostID != nil && *hs.HostID != hostID:
+			c.log.Warn("agent reports another host's session; stopping its copy",
+				"host_id", hostID, "session_id", sid)
+		}
+		cmd := agentws.SessionStopCmd{Type: "session_stop", ID: newCmdID(), SessionID: sid, Reason: "error"}
+		if err := c.dispatcher.Send(hostID, cmd); err != nil {
+			c.log.Warn("heartbeat reconcile: stop dispatch failed",
+				"host_id", hostID, "session_id", sid, "err", err)
+		}
+	}
+}
+
 // failSessionWithDetail also stamps state_detail, as the host_lost reap edge
 // does: web/src/lib/streamHealth.ts keys the client banner on a state_detail
 // prefix, not on error_message. A nil detail leaves it untouched (COALESCE).
@@ -290,6 +379,13 @@ func truncateBytes(s string, n int) string {
 // session.failed with no explanation is a row an operator cannot act on.
 func (c *Coordinator) recordSessionFailed(ctx context.Context, sess Session, source string, failureCode *string, reason string) {
 	details := map[string]any{"reason_source": source}
+	// app_id (#171, quasar-protocol "session.failed app_id" amendment): which app failed. Without it
+	// an operator reading the audit feed cannot match a failure to its app;
+	// session.launched already carries it. Both callers pass the Session that
+	// store.Transition re-read, so AppID is always populated.
+	if sess.AppID != "" {
+		details["app_id"] = sess.AppID
+	}
 	if sess.HostID != nil {
 		details["host_id"] = *sess.HostID
 	}

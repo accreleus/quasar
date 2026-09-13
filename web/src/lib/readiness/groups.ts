@@ -30,6 +30,12 @@ export const READINESS_GROUPS: readonly ReadinessGroupDef[] = [
   },
   { key: "input", label: "Input & sandbox", ids: ["uinput", "user_namespaces", "app_apparmor_profile"] },
   { key: "network", label: "Network", ids: ["media_reachability"] },
+  // The update path (amendment 9): the same ids the Releases tab's preflight reads.
+  {
+    key: "platform_update",
+    label: "Updates",
+    ids: ["updater_socket", "updater_stack_dir", "updater_overlays", "health_addr_bindable"],
+  },
 ];
 
 export const OTHER_GROUP: ReadinessGroupDef = { key: "other", label: "Other", ids: [] };

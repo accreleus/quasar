@@ -94,6 +94,14 @@ unparseable is a release it does not offer. From the manifest it takes:
   the updater, so a host pulls exactly the bytes the control plane resolved and
   never a floating tag (ADR 0001).
 
+## The detached signature
+
+A release may carry a second asset, `platform-release-manifest.json.sig`: a
+detached signature over this file's exact bytes. It is optional, it changes
+nothing here — no field, no `format_version` bump — and a consumer that has
+never heard of it keeps parsing the manifest as before. Schema and verification:
+`scripts/release/platform-release-signature.md`.
+
 ## Versioning rule
 
 Adding, removing or re-typing any key is a `format_version` bump. Consumers must

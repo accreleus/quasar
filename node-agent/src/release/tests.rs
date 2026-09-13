@@ -168,6 +168,83 @@ fn state_of(msg: &AgentMsg) -> (String, Option<String>, Vec<ReleasePrevious>) {
     }
 }
 
+fn request_id_of(msg: &AgentMsg) -> String {
+    match msg {
+        AgentMsg::ReleaseState { request_id, .. } => request_id.clone(),
+        other => panic!("expected a release_state, got {other:?}"),
+    }
+}
+
+/// A result as the updater writes it, for one component, `finished_at` unset:
+/// the replay decision must not depend on it.
+fn result_json(request_id: &str, state: &str, component: &str) -> String {
+    serde_json::json!({
+        "request_id": request_id,
+        "state": state,
+        "reason": null,
+        "components": [{"name": component, "image": "ghcr.io/accreleus/quasar/x", "digest": DIGEST}],
+        "previous": [{"name": component, "digest": PREV}],
+        "output": "",
+        "started_at": "2026-09-05T11:04:02Z",
+        "updated_at": "2026-09-05T11:04:02Z",
+        "finished_at": null,
+    })
+    .to_string()
+}
+
+fn parsed(request_id: &str, state: &str, components: &[&str]) -> UpdaterResult {
+    UpdaterResult {
+        request_id: request_id.into(),
+        state: state.into(),
+        reason: None,
+        components: components
+            .iter()
+            .map(|name| ReleaseComponent {
+                name: (*name).into(),
+                image: "ghcr.io/accreleus/quasar/x".into(),
+                digest: DIGEST.into(),
+            })
+            .collect(),
+        previous: Vec::new(),
+        output: String::new(),
+        started_at: String::new(),
+        updated_at: String::new(),
+        finished_at: None,
+        restored: false,
+    }
+}
+
+/// `restored` rides through the relay (agent-api.md, amendment 9): the control
+/// plane keys its auto_revert row off it. Omitted on the wire when false so an
+/// older control plane sees the shape it knows.
+#[test]
+fn restored_is_relayed_and_omitted_when_false() {
+    let mut res = parsed(
+        "11111111-1111-4111-8111-111111111111",
+        "failed",
+        &["node-agent"],
+    );
+    res.restored = true;
+    let msg = res.into_msg();
+    let json = serde_json::to_string(&msg).unwrap();
+    assert!(json.contains("\"restored\":true"), "{json}");
+
+    let res = parsed(
+        "11111111-1111-4111-8111-111111111111",
+        "failed",
+        &["node-agent"],
+    );
+    let json = serde_json::to_string(&res.into_msg()).unwrap();
+    assert!(!json.contains("restored"), "{json}");
+
+    // And the result file's field is read.
+    let file: UpdaterResult = serde_json::from_str(
+        r#"{"request_id":"x","state":"failed","reason":"unhealthy","restored":true}"#,
+    )
+    .unwrap();
+    assert!(file.restored);
+}
+
 #[tokio::test]
 async fn accepts_and_relays_every_state_change() {
     let fake = FakeUpdater::start();
@@ -305,8 +382,9 @@ async fn reports_updater_unreachable_when_the_result_stops_advancing() {
 }
 
 /// On reconnect the agent re-emits the current state of every result file still
-/// present, so a control plane that missed frames catches up without asking —
-/// including the frames the recreate destroyed the previous agent mid-send.
+/// present that is its own and recent, so a control plane that missed frames
+/// catches up without asking — including the frames the recreate destroyed the
+/// previous agent mid-send. The file here is freshly written, so it is replayed.
 #[tokio::test]
 async fn re_emits_every_result_on_attach() {
     let fake = FakeUpdater::start();
@@ -323,6 +401,139 @@ async fn re_emits_every_result_on_attach() {
     let (state, _, previous) = state_of(&rx.recv().await.unwrap());
     assert_eq!(state, "succeeded");
     assert_eq!(previous[0].digest.as_deref(), Some(PREV));
+}
+
+/// A restored agent (ADR 0004) connects while the updater is still verifying
+/// the restore, so the result it finds on attach is `verifying`. The agent that
+/// posted the request is gone; this one adopts it and relays the terminal state
+/// when the updater writes it, instead of re-emitting `verifying` once and
+/// leaving the attempt there for ever.
+#[tokio::test]
+async fn adopts_a_non_terminal_result_on_attach_and_relays_its_end() {
+    let fake = FakeUpdater::start();
+    fake.set_result("verifying", None);
+    std::fs::write(
+        fake.results.join(format!("{REQ}.json")),
+        fake.result.lock().unwrap().clone().unwrap(),
+    )
+    .unwrap();
+
+    let mgr = fake.mgr();
+    let (tx, mut rx) = mpsc::channel(32);
+    let _guard = mgr.attach_upstream(tx);
+    let (state, _, _) = state_of(&rx.recv().await.unwrap());
+    assert_eq!(state, "verifying");
+
+    // The updater finishes after the connect: the adopted poller must see it.
+    fake.set_result("failed", Some("recreate_failed"));
+    std::fs::write(
+        fake.results.join(format!("{REQ}.json")),
+        fake.result.lock().unwrap().clone().unwrap(),
+    )
+    .unwrap();
+    let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("the adopted apply's terminal state is relayed")
+        .unwrap();
+    let (state, reason, _) = state_of(&msg);
+    assert_eq!(state, "failed");
+    assert_eq!(reason.as_deref(), Some("recreate_failed"));
+}
+
+const OLD: Duration = Duration::from_secs(3 * 24 * 3600);
+const RECENT: Duration = Duration::from_secs(5 * 60);
+
+/// The replay decision, without a filesystem. It errs towards replaying: only a
+/// result that is provably not this agent's, or provably long resolved, is
+/// dropped (#193).
+#[test]
+fn replay_worthy_keeps_only_this_agents_live_or_recent_results() {
+    // Not this agent's: the control plane's own step, written to the same dir.
+    assert!(!replay_worthy(
+        &parsed(REQ, "succeeded", &["control-plane"]),
+        Some(RECENT)
+    ));
+    assert!(!replay_worthy(
+        &parsed(REQ, "pulling", &["control-plane"]),
+        Some(RECENT)
+    ));
+    // Not all ours is not ours.
+    assert!(!replay_worthy(
+        &parsed(REQ, "succeeded", &["node-agent", "control-plane"]),
+        Some(RECENT)
+    ));
+    // Nothing to speak for.
+    assert!(!replay_worthy(&parsed(REQ, "succeeded", &[]), Some(RECENT)));
+
+    // Terminal + older than the poll deadline: resolved long ago.
+    assert!(!replay_worthy(
+        &parsed(REQ, "succeeded", &["node-agent"]),
+        Some(OLD)
+    ));
+    assert!(!replay_worthy(
+        &parsed(REQ, "failed", &["node-agent"]),
+        Some(OLD)
+    ));
+    // Terminal + recent: the control plane may have missed the final frame.
+    assert!(replay_worthy(
+        &parsed(REQ, "succeeded", &["node-agent"]),
+        Some(RECENT)
+    ));
+    assert!(replay_worthy(
+        &parsed(REQ, "failed", &["node-agent"]),
+        Some(RECENT)
+    ));
+    // Non-terminal is live at any age.
+    assert!(replay_worthy(
+        &parsed(REQ, "recreating", &["node-agent"]),
+        Some(OLD)
+    ));
+    // Unknown age: keep — a duplicate is a no-op, a dropped live one is not.
+    assert!(replay_worthy(
+        &parsed(REQ, "succeeded", &["node-agent"]),
+        None
+    ));
+}
+
+/// The issue's acceptance case (#193): a results dir holding the control
+/// plane's own result, a node-agent result finished days ago, and a node-agent
+/// result just written re-emits exactly the last one. `attach_upstream` sends
+/// synchronously, so an empty channel after the first receive proves nothing
+/// else was queued.
+#[tokio::test]
+async fn replays_only_this_agents_recent_results_on_attach() {
+    let fake = FakeUpdater::start();
+    let cp = "aaaaaaaa-0000-4000-8000-000000000001";
+    let old = "bbbbbbbb-0000-4000-8000-000000000002";
+    std::fs::write(
+        fake.results.join(format!("{cp}.json")),
+        result_json(cp, "succeeded", "control-plane"),
+    )
+    .unwrap();
+    let old_path = fake.results.join(format!("{old}.json"));
+    std::fs::write(&old_path, result_json(old, "succeeded", "node-agent")).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&old_path)
+        .unwrap()
+        .set_modified(SystemTime::now() - OLD)
+        .unwrap();
+    std::fs::write(
+        fake.results.join(format!("{REQ}.json")),
+        result_json(REQ, "succeeded", "node-agent"),
+    )
+    .unwrap();
+
+    let mgr = fake.mgr();
+    let (tx, mut rx) = mpsc::channel(32);
+    let _guard = mgr.attach_upstream(tx);
+    let msg = rx.recv().await.expect("the recent node-agent result");
+    assert_eq!(request_id_of(&msg), REQ);
+    assert_eq!(state_of(&msg).0, "succeeded");
+    assert!(
+        rx.try_recv().is_err(),
+        "the control-plane result and the days-old one must not be replayed"
+    );
 }
 
 #[test]

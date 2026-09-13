@@ -30,6 +30,14 @@ type Item struct {
 	ActorUsername *string `json:"actor_username"`
 	// Severity is derived from Action (severity.go), never stored.
 	Severity string `json:"severity"`
+	// Names maps every id this row references - its target, plus the
+	// allowlisted ids inside Details - to that entity's display name. Resolved
+	// at read time (names.go) and never stored, for the same reason
+	// ActorUsername is; falls back to the name the emitter stamped into Details
+	// when the entity has since been hard-deleted. Always non-nil, so a client
+	// can index it without a guard; an id with no resolvable name is simply
+	// absent.
+	Names map[string]string `json:"names"`
 }
 
 // Recorder is the write seam handlers take. Named form of the anonymous
@@ -174,5 +182,25 @@ func (s *Store) List(ctx context.Context, cursor int64, limit int, f ListFilter)
 		next = &n
 		items = items[:limit]
 	}
+	s.nameItems(ctx, items)
 	return items, next, nil
+}
+
+// nameItems fills every row's Names. Trimming to the page FIRST matters: the
+// over-fetched cursor probe row is discarded, so it must not cost a lookup.
+//
+// A resolution failure is SWALLOWED, logged, and leaves Names empty: a name is
+// a convenience beside an id that is already on the row, and the audit log
+// failing to render is a far worse outcome than rendering without names.
+func (s *Store) nameItems(ctx context.Context, items []Item) {
+	refs := collectRefs(items)
+	var resolved map[ref]string
+	if len(refs) > 0 {
+		var err error
+		if resolved, err = s.resolveNames(ctx, refs); err != nil {
+			slog.Warn("resolve audit names failed", "err", err, "refs", len(refs))
+			resolved = nil
+		}
+	}
+	attachNames(items, resolved)
 }

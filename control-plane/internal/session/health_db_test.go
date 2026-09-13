@@ -197,10 +197,14 @@ func TestHealthMapLeak_FailSessionWithDetailForgets(t *testing.T) {
 	}
 }
 
-// TestHealthMapLeak_HostDisconnectedForgets pins the reap-path forget: a session
-// that goes terminal via HostDisconnected's ReapHost (not via evaluateHealth's own
-// delete) must also have its health-run tracking dropped.
-func TestHealthMapLeak_HostDisconnectedForgets(t *testing.T) {
+// TestHealthMapLeak_HeartbeatReconcileForgets pins the reconcile-path forget: a
+// session that goes terminal because the agent stopped listing it (not via
+// evaluateHealth's own delete) must also have its health-run tracking dropped.
+//
+// This used to go through HostDisconnected's blanket reap. Since #128 a
+// disconnect HOLDS running rows, so the path that terminalises one is the
+// heartbeat reconcile — the leak invariant is the same, the trigger moved.
+func TestHealthMapLeak_HeartbeatReconcileForgets(t *testing.T) {
 	pool := testDB(t)
 	store, coord, _ := newCoord(t, pool)
 	s := seed(t, pool, 4)
@@ -221,7 +225,16 @@ func TestHealthMapLeak_HostDisconnectedForgets(t *testing.T) {
 	coord.health.healthRuns[sess.ID] = time.Now().Add(-time.Minute)
 	coord.health.mu.Unlock()
 
+	// A disconnect alone must NOT terminalise it any more.
 	coord.HostDisconnected(ctx, s.hostID)
+	if got, _ := store.Get(ctx, sess.ID); got.State != StateRunning {
+		t.Fatalf("state after disconnect: got %s want running (held for the grace window)", got.State)
+	}
+
+	// The agent comes back and does not list it: now it is gone.
+	// []string{}, not nil: an empty list means "I am running nothing", while nil
+	// means the agent said nothing at all and is deliberately ignored.
+	coord.AgentHeartbeat(ctx, s.hostID, []string{})
 
 	got, err := store.Get(ctx, sess.ID)
 	if err != nil {
@@ -231,7 +244,7 @@ func TestHealthMapLeak_HostDisconnectedForgets(t *testing.T) {
 		t.Fatalf("state: got %s want failed", got.State)
 	}
 	if inHR, inCR := healthMapsContain(coord, sess.ID); inHR || inCR {
-		t.Fatalf("leak: session %s still tracked after host-disconnect reap: healthRuns=%v clientRuns=%v", sess.ID, inHR, inCR)
+		t.Fatalf("leak: session %s still tracked after heartbeat reconcile: healthRuns=%v clientRuns=%v", sess.ID, inHR, inCR)
 	}
 }
 

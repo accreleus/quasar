@@ -747,7 +747,8 @@ export function SessionPage() {
   const bannerOn =
     health != null ||
     clientUnsupported ||
-    (recovery != null && ["degraded", "reconnecting", "failed"].includes(recovery.phase));
+    (recovery != null &&
+      ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase));
 
   // Same shape, for the mic "hot" pill vs the toast host (`.session-root.mic-on`).
   const rootClassName =
@@ -830,26 +831,41 @@ export function SessionPage() {
             />
           )}
 
-          {recovery && ["degraded", "reconnecting", "failed"].includes(recovery.phase) && (
-            <SessionBanner
-              variant={recovery.phase === "failed" ? "critical" : "warning"}
-              title={
-                recovery.phase === "failed" ? "Connection recovery stopped" : "Recovering connection"
-              }
-              message={recovery.message}
-              actions={
-                recovery.phase === "failed" ? (
-                  <Button variant="primary" onClick={() => navigate("/app")}>
-                    Back to library
-                  </Button>
-                ) : (
-                  <Button variant="ghost" onClick={() => runtimeRef.current?.cancelRecovery()}>
-                    Cancel
-                  </Button>
-                )
-              }
-            />
-          )}
+          {recovery &&
+            ["degraded", "reconnecting", "failed", "signaling-lost"].includes(recovery.phase) && (
+              <SessionBanner
+                variant={recovery.phase === "failed" ? "critical" : "warning"}
+                title={
+                  recovery.phase === "failed"
+                    ? "Connection recovery stopped"
+                    : // #128: signalling and media are independent. While only
+                      // signalling is down the stream is still playing, so the
+                      // banner must not imply the picture is at risk.
+                      recovery.phase === "signaling-lost"
+                      ? "Reconnecting to the control plane"
+                      : "Recovering connection"
+                }
+                message={
+                  recovery.phase === "signaling-lost"
+                    ? // Lead with what the user cares about — the stream is
+                      // fine — but keep the controller's reason, which names
+                      // the close code and is what a bug report needs.
+                      `Your stream is still running. Session controls are unavailable until this reconnects. (${recovery.message})`
+                    : recovery.message
+                }
+                actions={
+                  recovery.phase === "failed" ? (
+                    <Button variant="primary" onClick={() => navigate("/app")}>
+                      Back to library
+                    </Button>
+                  ) : recovery.phase === "signaling-lost" ? null : (
+                    <Button variant="ghost" onClick={() => runtimeRef.current?.cancelRecovery()}>
+                      Cancel
+                    </Button>
+                  )
+                }
+              />
+            )}
         </SessionBannerHost>
       )}
 

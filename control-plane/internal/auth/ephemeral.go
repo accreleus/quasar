@@ -103,7 +103,9 @@ func (s *Service) ReapEphemeral(ctx context.Context) (ReapReport, error) {
 	seen := map[string]bool{}
 	var hosts []string
 	for _, id := range ids {
-		switch hostIDs, err := s.store.deleteUser(ctx, id); {
+		// The username is discarded here: an expired ephemeral account's reap is
+		// a sweep, not an operator action, and writes no audit row.
+		switch hostIDs, _, err := s.store.deleteUser(ctx, id); {
 		case err == nil:
 			rep.Deleted++
 			for _, h := range hostIDs {

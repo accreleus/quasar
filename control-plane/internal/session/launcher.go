@@ -399,12 +399,12 @@ func (c *Coordinator) gatherStreamInputs(
 		} else {
 			in.HostCodecs = hc
 		}
-		known, hw, err := c.store.HostHardwareEncoder(ctx, *sess.HostID)
+		known, hw, encName, err := c.store.HostHardwareEncoder(ctx, *sess.HostID)
 		if err != nil {
 			c.log.Warn("rung: host encoder capability load failed, skipping the hardware-encoder clamp",
 				"host_id", *sess.HostID, "err", err)
 		} else {
-			in.HostEncoder = hostEncoderCaps{Known: known, HardwareEncoder: hw}
+			in.HostEncoder = hostEncoderCaps{Known: known, HardwareEncoder: hw, Name: encName}
 		}
 		// The per-codec throughput hint for clamp 6, written onto the same
 		// HostEncoder struct clamp 5 reads. A read error leaves it nil, which is
@@ -465,6 +465,16 @@ func (c *Coordinator) gatherStreamInputs(
 		}
 	}
 
+	// The placed GPU's current driver identity, which pickCert refuses a measurement
+	// from another driver against. A read error leaves it empty, i.e. unknown, which
+	// caps against every row exactly as before the identity existed.
+	if identity, err := c.store.GPUDriverIdentity(ctx, *sess.HostID, int(*sess.GPUIndex)); err != nil {
+		c.log.Warn("rung: GPU driver identity load failed, matching certs without it",
+			"host_id", *sess.HostID, "gpu_index", *sess.GPUIndex, "err", err)
+	} else {
+		in.GPUDriverIdentity = identity
+	}
+
 	certs, err := c.store.CertsForRungs(ctx, *sess.HostID, int(*sess.GPUIndex), rungIDs, CertStaleness)
 	if err != nil {
 		c.log.Warn("SPT-06: cert lookup error, proceeding uncapped",
@@ -516,10 +526,14 @@ func (c *Coordinator) logStreamPlan(in StreamInputs, plan StreamPlan) {
 
 	switch plan.CapOutcome {
 	case capApplied:
+		// encoder/driver_identity say which measurements were eligible at all —
+		// without them a cap that fired (or did not) cannot be explained after a
+		// driver change.
 		c.log.Info("SPT-06: cert cap applied",
 			"session_id", in.SessionID, "original_profile", in.Chain.ID,
 			"original_rung", plan.Walks[0].Decision.ResultRung,
-			"capped_profile", plan.ChainID, "capped_rung", plan.RungID)
+			"capped_profile", plan.ChainID, "capped_rung", plan.RungID,
+			"encoder", in.HostEncoder.Name, "driver_identity", in.GPUDriverIdentity)
 	case capLowerUnreadable:
 		c.log.Warn("SPT-06: cert cap target launch profile unreadable, proceeding uncapped",
 			"session_id", in.SessionID, "profile_id", in.Chain.ID,

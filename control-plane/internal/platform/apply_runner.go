@@ -50,8 +50,12 @@ type applyStore interface {
 	SucceedAttempt(ctx context.Context, attemptID string) (bool, error)
 	Attempt(ctx context.Context, attemptID string) (Attempt, error)
 	AttemptByRequestID(ctx context.Context, requestID string) (Attempt, error)
+	// Read on the deadline path, to name the request whose verdict is stranded
+	// on a host whose agent never came back: apply_timeout.go.
+	AttemptRequestID(ctx context.Context, attemptID string) (string, error)
 	RecordReleaseState(ctx context.Context, attemptID, state string, previous []PreviousDigest, output string) error
 	SetPreviousDigests(ctx context.Context, attemptID string, previous []PreviousDigest) error
+	CreateAutoRevertAttempt(ctx context.Context, in NewAutoRevert) (Attempt, error)
 	OpenHostAttempt(ctx context.Context, hostID string) (Attempt, string, error)
 	OpenAttempts(ctx context.Context) ([]Attempt, error)
 	Release(ctx context.Context, id string) (Release, error)
@@ -227,7 +231,11 @@ func (r *Runner) drive(ctx context.Context, a Attempt) {
 		r.fail(a.ID, ReasonUpdaterUnreachable, "")
 		return
 	}
-	wasCordoned := status != "online"
+	// Only `draining` is a cordon. `offline` is not one, and recording it as the
+	// admin's meant this attempt never cordoned the host and then CORDONED it on
+	// restore — leaving a host nobody cordoned out of scheduling (#170, the same
+	// conflation as the fleet run's).
+	wasCordoned := status == "draining"
 	if !wasCordoned {
 		if err := r.deps.Cordon(dctx, hostID); err != nil {
 			// A host that cannot be cordoned cannot be drained, and applying
@@ -238,12 +246,14 @@ func (r *Runner) drive(ctx context.Context, a Attempt) {
 		}
 	}
 	// A fleet run owns the scheduling state of every host it touches: it
-	// cordoned the fleet before its control-plane step and restores every
-	// cordon from its own record when it finishes. This attempt still cordons
-	// a host that is serving (a disconnect/register cycle can have lifted the
-	// run's cordon), but the restore is the run's: done here too, it read the
-	// run's cordon as an admin's and re-applied it milliseconds after the run
-	// had lifted it (#140).
+	// records this host's cordon before the attempt exists — fleet-wide before
+	// its control-plane step, per host before each host step when it had no
+	// control-plane step to take one (#200) — and restores every cordon from
+	// that record when it finishes. This attempt still cordons a host that is
+	// serving (a disconnect/register cycle can have lifted the run's cordon),
+	// but the restore is the run's: done here too, it read the run's cordon as
+	// an admin's and re-applied it milliseconds after the run had lifted it
+	// (#140).
 	if a.RunID == nil {
 		defer r.restoreCordon(hostID, wasCordoned)
 	}
@@ -295,6 +305,31 @@ func (r *Runner) prepareAndSend(ctx context.Context, a Attempt, hostID string) b
 		}
 	}
 
+	// An agent that is not on the wire yet is not an agent that failed: after a
+	// control-plane recreate every agent reconnects a beat later, and sending
+	// into that gap is what made a whole fleet run fail on its first host.
+	//
+	// BEFORE the mint, not after: nothing is persisted while this waits, so a
+	// shutdown here leaves the row `waiting_sessions` for the next boot's Adopt
+	// to re-drive from the top — and the `pending`-with-no-send window that
+	// apply_timeout.go can only call `reachUnknown` shrinks from a minute of
+	// connect wait to the milliseconds between the mint and the send.
+	if !r.waitConnected(ctx, hostID) {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			// A shutdown, not a host that never came back. Services.Stop
+			// cancels in-flight applies, it does not fail them: failing here
+			// wrote a terminal `timeout` no Adopt could resume, and in the
+			// unattended lane that suppressed the release for good.
+			r.log.Info("apply: shutting down while waiting for the host's agent; leaving the attempt to the next boot",
+				"attempt_id", a.ID, "host_id", hostID)
+			return false
+		}
+		r.log.Warn("apply: the host's agent did not reconnect in time", "attempt_id", a.ID, "host_id", hostID)
+		// Nothing was minted or sent, so no updater has a result: apply_timeout.go.
+		r.fail(a.ID, ReasonTimeout, applyNotSentOutput)
+		return false
+	}
+
 	// Persisted before the send, because the agent that receives the command is
 	// normally destroyed by carrying it out.
 	requestID, err := r.store.MintRequestID(ctx, a.ID)
@@ -316,15 +351,6 @@ func (r *Runner) prepareAndSend(ctx context.Context, a Attempt, hostID string) b
 			return false
 		}
 		release = ReleaseRef{ID: rel.ID, Version: rel.Version, SourceCommit: rel.SourceCommit}
-	}
-
-	// An agent that is not on the wire yet is not an agent that failed: after a
-	// control-plane recreate every agent reconnects a beat later, and sending
-	// into that gap is what made a whole fleet run fail on its first host.
-	if !r.waitConnected(ctx, hostID) {
-		r.log.Warn("apply: the host's agent did not reconnect in time", "attempt_id", a.ID, "host_id", hostID)
-		r.fail(a.ID, ReasonTimeout, "")
-		return false
 	}
 
 	ackCtx, cancel := context.WithTimeout(ctx, r.AckTimeout)
@@ -369,8 +395,11 @@ func (r *Runner) prepareAndSend(ctx context.Context, a Attempt, hostID string) b
 	return true
 }
 
-// waitConnected blocks until the host's agent is on the wire, the deadline
-// passes, or the process shuts down. False means the attempt should be failed.
+// waitConnected blocks until the host's agent is on the wire, the connect wait
+// runs out, the apply deadline passes, or the process shuts down. False is all
+// three of those, so the caller must read ctx.Err() to tell them apart: a
+// cancel is a shutdown and must leave the attempt alone, while a nil or expired
+// ctx.Err() is a host that never came back and fails the attempt.
 func (r *Runner) waitConnected(ctx context.Context, hostID string) bool {
 	if r.deps.Connected == nil {
 		return true
@@ -423,7 +452,9 @@ func (r *Runner) watch(ctx context.Context, attemptID string) {
 func (r *Runner) deadlineOrCancel(ctx context.Context, attemptID string) bool {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		r.log.Warn("apply: deadline expired with no terminal state", "attempt_id", attemptID)
-		r.fail(attemptID, ReasonTimeout, "")
+		// An expiry with no agent on the wire is a verdict stranded on the
+		// host, not a mystery: apply_timeout.go.
+		r.fail(attemptID, ReasonTimeout, r.timeoutOutput(attemptID))
 	}
 	return false
 }
@@ -522,12 +553,61 @@ func (r *Runner) HandleReleaseState(ctx context.Context, hostID string, rep Rele
 			r.log.Warn("release_state: could not record failure", "attempt_id", a.ID, "err", err)
 		} else {
 			r.log.Warn("apply failed", "attempt_id", a.ID, "host_id", hostID, "reason", reason)
+			if rep.Restored {
+				r.recordAutoRevert(ctx, a, rep)
+			}
 		}
 	default:
 		if err := r.store.RecordReleaseState(ctx, a.ID, rep.State, rep.Previous, rep.Output); err != nil {
 			r.log.Warn("release_state: could not record progress", "attempt_id", a.ID, "err", err)
 		}
 	}
+}
+
+// recordAutoRevert writes the history row for a restore the updater did itself
+// (ADR 0004). Only after the apply is terminal, so the open-target index is
+// free; only for an apply, never for a revert that failed.
+func (r *Runner) recordAutoRevert(ctx context.Context, failed Attempt, rep ReleaseStateReport) {
+	if failed.Kind != KindApply {
+		return
+	}
+	requested := restoredDigests(failed.RequestedDigests, rep.Previous)
+	if len(requested) == 0 {
+		r.log.Warn("release_state says restored but named no previous digest; no auto_revert recorded",
+			"attempt_id", failed.ID, "host_id", orEmpty(failed.HostID), "token", "apply-auto-revert-unrecorded")
+		return
+	}
+	previous := make([]PreviousDigest, 0, len(failed.RequestedDigests))
+	for _, c := range failed.RequestedDigests {
+		d := c.Digest
+		previous = append(previous, PreviousDigest{Name: c.Name, Digest: &d})
+	}
+	row, err := r.store.CreateAutoRevertAttempt(ctx, NewAutoRevert{
+		Failed: failed, Requested: requested, Previous: previous,
+		Output: "restored by the updater after the apply failed (" + orEmpty(rep.Reason) + ")",
+	})
+	if err != nil {
+		r.log.Error("could not record the updater's automatic restore", "attempt_id", failed.ID,
+			"err", err, "token", "apply-auto-revert-unrecorded")
+		return
+	}
+	r.log.Warn("apply automatically reverted by the updater", "attempt_id", failed.ID,
+		"auto_revert_id", row.ID, "host_id", orEmpty(failed.HostID), "token", "apply-auto-reverted")
+}
+
+// restoredDigests pairs the failed apply's components with the previous digests
+// the updater reported it went back to; a component whose previous digest was
+// unknown is left out.
+func restoredDigests(requested []ComponentDigest, previous []PreviousDigest) []ComponentDigest {
+	out := make([]ComponentDigest, 0, len(requested))
+	for _, c := range requested {
+		for _, p := range previous {
+			if p.Name == c.Name && p.Digest != nil && *p.Digest != "" {
+				out = append(out, ComponentDigest{Name: c.Name, Image: c.Image, Digest: *p.Digest})
+			}
+		}
+	}
+	return out
 }
 
 // HandleRegister is the success-evidence hook, on every agent register. A

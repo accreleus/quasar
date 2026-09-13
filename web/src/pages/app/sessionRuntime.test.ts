@@ -18,6 +18,8 @@ import {
 } from "./sessionRuntime";
 import type { TelemetrySnapshot } from "../../webrtc/telemetry";
 import type { ICEServer } from "../../api/types";
+import type { RebindOutcome } from "../../webrtc/session";
+import { ApiError } from "../../api/client";
 
 // ── fakes ───────────────────────────────────────────────────────────────────
 
@@ -43,6 +45,14 @@ class FakeTransport implements TransportLike {
   flowingCalls = 0;
   cancelCalls = 0;
   micSlot = true;
+  /** #128 — coords handed to each in-place signalling rebind. */
+  rebinds: { url: string; token: string }[] = [];
+  /** What the next rebind resolves to. */
+  rebindResult: RebindOutcome = "open";
+  /** When set, rebinds park here instead of resolving, so a test can fire other
+   *  events while one is provably in flight. */
+  rebindGate: Promise<void> | null = null;
+  unrecoverable: string[] = [];
 
   constructor(readonly opts: TransportFactoryOptions) {}
 
@@ -62,6 +72,14 @@ class FakeTransport implements TransportLike {
   };
   close = (notifyPeer?: boolean) => {
     this.closedWith.push(notifyPeer);
+  };
+  rebindSignaling = async (url: string, token: string): Promise<RebindOutcome> => {
+    this.rebinds.push({ url, token });
+    if (this.rebindGate) await this.rebindGate;
+    return this.rebindResult;
+  };
+  signalingUnrecoverable = (message: string) => {
+    this.unrecoverable.push(message);
   };
 
   // ── drive the runtime from the outside ──
@@ -356,10 +374,13 @@ describe("telemetry wiring", () => {
 });
 
 describe("status routing", () => {
+  // The 4500 close code reaches the runtime only as prose, so this arm still
+  // sniffs strings. The ICE arm used to as well, comparing a literal session.ts
+  // had stopped emitting — dead code that this test was pinning. ICE now
+  // reports through the recovery PHASE, covered below.
   it.each([
     ["signaling relay closed: 4500", true],
     ["host offline", true],
-    ["ICE failed — network issue", true],
     ["connected", false],
   ])("%s → disconnect suspected: %s", (msg, expected) => {
     const h = harness();
@@ -368,6 +389,235 @@ describe("status routing", () => {
 
     expect(h.runtime.getSnapshot().status).toBe(msg);
     expect(h.callbacks.onDisconnectSuspected).toHaveBeenCalledTimes(expected ? 1 : 0);
+  });
+
+  it.each([
+    ["degraded", true],
+    ["failed", true],
+    ["signaling-lost", false],
+    ["connected", false],
+  ])("recovery phase %s → disconnect suspected: %s", (phase, expected) => {
+    // `signaling-lost` deliberately does NOT poll: the host is fine, the
+    // control plane is the thing that went away.
+    const h = harness();
+    h.runtime.start();
+    h.transport.fireIce("connected");
+    h.transport.fireRecovery(phase);
+
+    expect(h.callbacks.onDisconnectSuspected).toHaveBeenCalledTimes(expected ? 1 : 0);
+  });
+});
+
+describe("#128 — signalling loss does not destroy a healthy media path", () => {
+  it("re-attaches signalling IN PLACE and never re-seats the page", async () => {
+    // The live-gate failure this exists to prevent: the control plane restarted,
+    // the agent held the session, and then the client's own recovery re-seated
+    // its coords, destroying the peer connection that was still carrying media.
+    const h = harness();
+    h.runtime.start();
+    h.transport.fireIce("connected"); // media is up — that is what a rebind protects
+    h.transport.fireRecovery("signaling-lost", "signaling closed (1006)");
+    await flush();
+    await flush();
+
+    expect(h.transport.rebinds).toEqual([{ url: "wss://new", token: "tok-2" }]);
+    // The three things that used to happen and must not:
+    expect(h.callbacks.onReplacementSignaling).not.toHaveBeenCalled();
+    expect(h.transport.closedWith).toEqual([]);
+    expect(h.callbacks.onReconnectFailed).not.toHaveBeenCalled();
+  });
+
+  it("does not latch the handoff on a rebind, so a later unmount still says bye", async () => {
+    // `handoff` suppresses the `bye`. A rebind destroys nothing, so latching it
+    // would orphan the host session on the next genuine unmount.
+    const h = harness();
+    h.runtime.start();
+    h.transport.fireIce("connected");
+    h.transport.fireRecovery("signaling-lost");
+    await flush();
+    await flush();
+    h.runtime.destroy();
+
+    expect(h.transport.closedWith).toEqual([true]);
+  });
+
+  it("keeps minting a fresh token while the attach itself keeps failing", async () => {
+    // A single-use token is spent by each attach, so a 4500 (agent still
+    // re-registering) must loop back to the mint rather than reuse it.
+    const h = harness();
+    h.runtime.start();
+    h.transport.fireIce("connected");
+    h.transport.rebindResult = "retry";
+    h.transport.fireRecovery("signaling-lost");
+    await flush();
+    await flush();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await flush();
+    await flush();
+
+    expect(h.transport.rebinds.length).toBeGreaterThanOrEqual(2);
+    expect(h.callbacks.onReplacementSignaling).not.toHaveBeenCalled();
+  });
+
+  it("gives up once the rebind budget is spent, and says so terminally", async () => {
+    const h = harness();
+    h.runtime.start();
+    h.transport.fireIce("connected");
+    h.transport.rebindResult = "retry";
+    h.transport.fireRecovery("signaling-lost");
+    for (let i = 0; i < 40; i++) {
+      await flush();
+      await vi.advanceTimersByTimeAsync(16_000);
+      await flush();
+    }
+
+    expect(h.transport.unrecoverable.length).toBe(1);
+    expect(h.callbacks.onReconnectFailed).toHaveBeenCalledTimes(1);
+    expect(h.callbacks.onReplacementSignaling).not.toHaveBeenCalled();
+  });
+
+  it("upgrades an in-flight rebind to a re-seat when the media path dies", async () => {
+    // The intent is read when the mint RESOLVES. Media dying mid-flight means a
+    // fresh peer connection really is needed, so the rebind must not win.
+    // A deferred the test releases, so the mint is provably still in flight when
+    // the media path dies. (`let release = ...` inside the executor narrows to
+    // `null` for TS, hence the object.)
+    const gate: { release: (() => void) | undefined } = { release: undefined };
+    const minted = new Promise<void>((r) => {
+      gate.release = r;
+    });
+    const h = harness({
+      mint: (async () => {
+        await minted;
+        return { signaling: { url: "wss://new", token: "tok-2" } };
+      }) as never,
+    });
+    h.runtime.start();
+    h.transport.fireIce("connected");
+    h.transport.fireRecovery("signaling-lost");
+    await flush();
+    h.transport.fireRecovery("failed"); // media gone while the mint was in flight
+    gate.release?.();
+    await flush();
+    await flush();
+
+    expect(h.transport.rebinds).toEqual([]);
+    expect(h.callbacks.onReplacementSignaling).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-seats when the media path dies while a rebind is already in flight (B1)", async () => {
+    // The RecoveryController latches itself stopped on `failed` and publishes it
+    // exactly once. If the loop does not RE-READ the intent after the rebind
+    // resolves, that upgrade is lost forever and the session sits on a
+    // reconnected socket with a dead media path.
+    const gate: { release: (() => void) | undefined } = { release: undefined };
+    const parked = new Promise<void>((r) => {
+      gate.release = r;
+    });
+    const h = harness();
+    h.runtime.start();
+    h.transport.fireIce("connected");
+    h.transport.rebindGate = parked;
+    h.transport.fireRecovery("signaling-lost");
+    await flush();
+    await flush();
+    expect(h.transport.rebinds.length).toBe(1);
+
+    h.transport.fireRecovery("failed"); // media dies mid-rebind
+    gate.release?.();
+    await flush();
+    await flush();
+    await flush();
+
+    expect(h.callbacks.onReplacementSignaling).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not re-attach after a takeover close ends the attempt (B2)", async () => {
+    // Retrying a takeover displaces the tab that displaced us — the #526 loop,
+    // on a new path. A terminal outcome must stop the episode dead.
+    const h = harness();
+    h.runtime.start();
+    h.transport.fireIce("connected");
+    h.transport.rebindResult = "terminal";
+    h.transport.fireRecovery("signaling-lost");
+    await flush();
+    await flush();
+    await vi.advanceTimersByTimeAsync(60_000);
+    await flush();
+
+    expect(h.transport.rebinds.length).toBe(1);
+    expect(h.callbacks.onReplacementSignaling).not.toHaveBeenCalled();
+  });
+
+  it("re-seats a signalling loss that happens before media is up", async () => {
+    // A silent re-attach sends no restart_ice, so no offer would ever arrive
+    // and the launch would hang. Nothing is protected yet, so re-seat.
+    const h = harness();
+    h.runtime.start();
+    h.transport.fireRecovery("signaling-lost");
+    await flush();
+    await flush();
+
+    expect(h.transport.rebinds).toEqual([]);
+    expect(h.callbacks.onReplacementSignaling).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves a terminal, actionable state when the mint fails during a rebind (MB1)", async () => {
+    // The rebind path sits on `signaling-lost`, whose banner says the stream is
+    // still running and offers no action, and reconnectGaveUp then suppresses
+    // every later phase. Without terminalising the controller the user reads
+    // "Reconnecting to the control plane" forever with no way out.
+    const h = harness({
+      mint: (async () => {
+        throw new ApiError(409, "conflict", "session is not reconnectable");
+      }) as never,
+    });
+    h.runtime.start();
+    h.transport.fireIce("connected");
+    h.transport.fireRecovery("signaling-lost");
+    await flush();
+    await flush();
+
+    expect(h.transport.unrecoverable.length).toBe(1);
+    expect(h.callbacks.onReconnectFailed).toHaveBeenCalledTimes(1);
+  });
+
+  it("forgives the episode count once signalling has held (N4)", async () => {
+    // Without the reset, twelve unrelated blips over a long session end it; with
+    // no floor, a control plane that accepts then drops burns all twelve in
+    // seconds. This pins the reset half.
+    const h = harness();
+    h.runtime.start();
+    h.transport.fireIce("connected");
+    for (let i = 0; i < 3; i++) {
+      h.transport.fireRecovery("signaling-lost");
+      await flush();
+      await flush();
+    }
+    expect(h.transport.rebinds.length).toBe(3);
+
+    await vi.advanceTimersByTimeAsync(60_000); // signalling held
+    for (let i = 0; i < 11; i++) {
+      h.transport.fireRecovery("signaling-lost");
+      await flush();
+      await flush();
+    }
+
+    // Still re-attaching: the count restarted rather than carrying the first three.
+    expect(h.transport.rebinds.length).toBe(14);
+    expect(h.callbacks.onReconnectFailed).not.toHaveBeenCalled();
+  });
+
+  it("still re-seats when the media path is what died", async () => {
+    // The pre-existing escalation must survive: `failed` is the media verdict.
+    const h = harness();
+    h.runtime.start();
+    h.transport.fireRecovery("failed");
+    await flush();
+    await flush();
+
+    expect(h.transport.rebinds).toEqual([]);
+    expect(h.callbacks.onReplacementSignaling).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -454,6 +704,90 @@ describe("recovery and the replacement handoff (L4)", () => {
 
     h.runtime.destroy();
     expect(h.transport.closedWith).toEqual([true]);
+  });
+});
+
+// #128 phase 3 — a control-plane restart (~60-90s) fails the mint on the
+// network; a session must outlast that, not end at the first failed attempt.
+describe("mint retry with backoff (#128)", () => {
+  it("retries a network error with backoff, then succeeds without failing the session", async () => {
+    let calls = 0;
+    const mint = vi.fn(async () => {
+      calls++;
+      if (calls < 3) throw new TypeError("Failed to fetch");
+      return { signaling: { url: "wss://new", token: "tok-2" } };
+    });
+    const h = harness({ mint });
+    h.runtime.start();
+    h.transport.fireRecovery("failed");
+
+    await flush(); // attempt 1 rejects, schedules ~1s backoff
+    await vi.advanceTimersByTimeAsync(1_000); // attempt 2 rejects, schedules ~2s backoff
+    await vi.advanceTimersByTimeAsync(2_000); // attempt 3 succeeds
+
+    expect(mint).toHaveBeenCalledTimes(3);
+    expect(h.callbacks.onReplacementSignaling).toHaveBeenCalledTimes(1);
+    expect(h.callbacks.onReplacementSignaling).toHaveBeenCalledWith({
+      url: "wss://new",
+      token: "tok-2",
+      iceServers: [],
+    });
+    expect(h.callbacks.onReconnectFailed).not.toHaveBeenCalled();
+  });
+
+  it("fails fast on a 4xx ApiError, without retrying or burning the budget", async () => {
+    const mint = vi.fn(async () => {
+      throw new ApiError(404, "session_not_found", "session gone");
+    });
+    const h = harness({ mint });
+    h.runtime.start();
+    h.transport.fireRecovery("failed");
+
+    await flush();
+    await flush();
+
+    expect(mint).toHaveBeenCalledTimes(1);
+    expect(h.callbacks.onReconnectFailed).toHaveBeenCalledTimes(1);
+    expect(h.callbacks.onReconnectFailed).toHaveBeenCalledWith("session gone");
+    expect(h.callbacks.onReplacementSignaling).not.toHaveBeenCalled();
+  });
+
+  it("gives up after the retry budget is exhausted, calling onReconnectFailed exactly once", async () => {
+    const mint = vi.fn(async () => {
+      throw new ApiError(503, "internal", "control plane restarting");
+    });
+    const h = harness({ mint });
+    h.runtime.start();
+    h.transport.fireRecovery("failed");
+
+    await flush();
+    // Drain every scheduled backoff timer; the loop must stop on its own once
+    // the ~90s budget is spent rather than retrying forever.
+    await vi.runAllTimersAsync();
+
+    expect(h.callbacks.onReconnectFailed).toHaveBeenCalledTimes(1);
+    expect(h.callbacks.onReconnectFailed).toHaveBeenCalledWith("control plane restarting");
+    expect(h.callbacks.onReplacementSignaling).not.toHaveBeenCalled();
+    // the budget must have actually been spent retrying, not given up on attempt 1
+    expect(mint.mock.calls.length).toBeGreaterThan(1);
+  });
+
+  it("honours teardown mid-backoff: no callback fires and the timer does not resume the mint", async () => {
+    const mint = vi.fn(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    const h = harness({ mint });
+    h.runtime.start();
+    h.transport.fireRecovery("failed");
+
+    await flush(); // attempt 1 rejects, backoff timer armed
+
+    h.runtime.destroy();
+    await vi.runAllTimersAsync();
+
+    expect(mint).toHaveBeenCalledTimes(1);
+    expect(h.callbacks.onReconnectFailed).not.toHaveBeenCalled();
+    expect(h.callbacks.onReplacementSignaling).not.toHaveBeenCalled();
   });
 });
 

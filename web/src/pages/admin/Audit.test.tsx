@@ -25,6 +25,7 @@ function item(over: Partial<AdminActivityItem>): AdminActivityItem {
     details: { reason: "maintenance" },
     created_at: new Date(2026, 7, 8, 9, 0, 0).toISOString(),
     severity: "info",
+    names: {},
     ...over,
   };
 }
@@ -37,6 +38,7 @@ const TODAY_WARN = item({
   actor_user_id: "u-1",
   target_type: "host",
   target_id: "h-1234567890",
+  names: { "h-1234567890": "gpu-test" },
   created_at: new Date(2026, 7, 8, 9, 0, 0).toISOString(),
 });
 const TODAY_ERR_SYSTEM = item({
@@ -47,16 +49,21 @@ const TODAY_ERR_SYSTEM = item({
   actor_user_id: null,
   target_type: "session",
   target_id: "s-abcdef1234",
+  details: { failure_code: "agent_gone" },
+  names: { "s-abcdef1234": "Steam · kenji" },
   created_at: new Date(2026, 7, 8, 13, 0, 0).toISOString(),
 });
 const YESTERDAY_INFO = item({
   id: 3,
-  action: "app.update",
-  severity: "info",
+  action: "app.delete",
+  severity: "warn",
   actor_username: "priya",
   actor_user_id: "u-2",
   target_type: "app",
   target_id: "a-1",
+  // No `names` entry: the app is gone, so the stamped write-time name is the
+  // only thing that can still say which app was deleted.
+  details: { name: "Blender" },
   created_at: new Date(2026, 7, 7, 10, 0, 0).toISOString(),
 });
 
@@ -94,9 +101,13 @@ describe("Audit — loading rows and day cards", () => {
     expect(screen.getByText("2 entries")).toBeInTheDocument();
     expect(screen.getByText("1 entry")).toBeInTheDocument();
 
-    // Raw action strings render as mono chips; the humanised label sits in Detail.
+    // Raw action strings render as mono chips; the Target column carries the
+    // resolved name and Detail the key=value summary.
     expect(screen.getByText("host.drain")).toBeInTheDocument();
-    expect(screen.getByText("Drained host")).toBeInTheDocument();
+    expect(screen.getByText("gpu-test")).toBeInTheDocument();
+    expect(screen.getByText("reason=maintenance")).toBeInTheDocument();
+    // The deleted app still names itself, from the stamped detail.
+    expect(screen.getByText("name=Blender")).toBeInTheDocument();
     // System actor shows the S tile and "system" label.
     expect(screen.getByText("system")).toBeInTheDocument();
     expect(screen.getByText("salty2011")).toBeInTheDocument();
@@ -222,12 +233,13 @@ describe("Audit — copy entry", () => {
   // 09:00:00), and auditTime() is hour12:false — so the composed string is a
   // plain literal, not something reconstructed from Intl at assertion time.
   const EXPECTED_TEXT = [
-    "09:00:00  salty2011  host.drain  host h-123456",
-    "action  host.drain",
-    "target  host h-123456",
-    "actor   salty2011",
+    "09:00:00  salty2011  host.drain  gpu-test",
+    "salty2011 drained host gpu-test",
     "",
-    JSON.stringify({ reason: "maintenance" }, null, 2),
+    "action  host.drain",
+    "actor   salty2011",
+    "target  host h-1234567890 (gpu-test)",
+    "reason  maintenance",
   ].join("\n");
   // IconCheck's path `d` — the tick glyph the row's icon button swaps to.
   const TICK_PATH = 'svg path[d="M3.2 8.4l3 3 6.6-7"]';
@@ -304,7 +316,7 @@ describe("Audit — Load more", () => {
     mocked.listAdminActivity.mockResolvedValueOnce(page([YESTERDAY_INFO], null));
     fireEvent.click(screen.getByRole("button", { name: "Load more" }));
 
-    await screen.findByText("app.update");
+    await screen.findByText("app.delete");
     expect(screen.getByText("host.drain")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Load more" })).not.toBeInTheDocument();
     const [, secondOpts] = mocked.listAdminActivity.mock.calls.at(-1)!;
@@ -326,7 +338,7 @@ describe("Audit — Load more", () => {
 
     mocked.listAdminActivity.mockResolvedValueOnce(page([YESTERDAY_INFO], null));
     fireEvent.click(screen.getByRole("button", { name: "Load more" }));
-    await screen.findByText("app.update");
+    await screen.findByText("app.delete");
 
     const [, secondOpts] = mocked.listAdminActivity.mock.calls.at(-1)!;
     expect(secondOpts?.since).toBe(firstOpts?.since);
@@ -349,7 +361,7 @@ describe("Audit — Load more", () => {
       fireEvent.click(loadMoreBtn);
       fireEvent.click(loadMoreBtn);
     });
-    await screen.findByText("app.update");
+    await screen.findByText("app.delete");
 
     expect(mocked.listAdminActivity).toHaveBeenCalledTimes(1);
   });
@@ -386,7 +398,9 @@ describe("Audit — Export CSV", () => {
 
     expect(createObjectURL).toHaveBeenCalledTimes(1);
     const lines = csvFromBlobCall(BlobStub as unknown as ReturnType<typeof vi.fn>).trim().split("\n");
-    expect(lines[0]).toBe("time,actor,action,target_type,target_id,severity,details");
+    expect(lines[0]).toBe(
+      "time,actor,action,target_type,target_id,target_name,severity,details",
+    );
     expect(lines).toHaveLength(4); // header + 3 rows
     expect(clickSpy).toHaveBeenCalledTimes(1);
 

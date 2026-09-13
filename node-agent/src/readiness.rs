@@ -10,6 +10,9 @@
 //! host-side read is `/etc/os-release` (via `/host`), used purely to pick remediation wording;
 //! its absence degrades to generic wording, never a failed check.
 
+/// The update-path checks (preflight ids), with their collectors.
+pub mod platform_update;
+
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -167,6 +170,14 @@ pub struct ProbeEnv {
     /// Firewall detection's answer, computed once at [`ProbeEnv::live`] so every reader sees
     /// the same instant and the subprocess cost is paid once, not per check.
     pub firewall: FirewallPosture,
+    /// The update path's facts (platform_update.rs), collected once per probe.
+    pub updater: platform_update::UpdaterView,
+    /// Whether compose declares an updater service beside this agent (`register`'s
+    /// `updater_present`); `None` when discovery could not say.
+    pub updater_present: Option<bool>,
+    pub health: platform_update::HealthOwner,
+    /// This agent's own `/health` identity, to compare against who answers.
+    pub self_identity: platform_update::HealthIdentity,
 }
 
 /// The driver-volume provisioner's state, as readiness sees it. Plain data, not a live call
@@ -255,6 +266,13 @@ impl ProbeEnv {
             },
             // Vendor/GPU-independent: a firewall problem is as real on a GPU-less box.
             firewall: detect_firewall_posture(),
+            updater: platform_update::collect_updater(&updater_socket_path()),
+            updater_present: crate::buildinfo::install_facts().updater_present,
+            health: platform_update::collect_health(crate::health::addr_from_env()),
+            self_identity: platform_update::HealthIdentity {
+                node: crate::logging::host_name().to_string(),
+                pid: std::process::id(),
+            },
         }
     }
 
@@ -419,7 +437,21 @@ pub fn probe(env: &ProbeEnv) -> Vec<ReadinessCheck> {
             Some(error) => fail("host_container_mounts", error.clone(), "Use the generated bind mounts at identical host/container paths. Fix the Docker socket or mount configuration, then recreate the agent; checks refresh automatically.".to_string()),
             None => pass("host_container_mounts", "Required sibling-container paths agree with their host bind mounts".to_string()),
         },
+        // The update path: what preflight reads about this host.
+        platform_update::check_updater_socket(&env.updater, env.updater_present),
+        platform_update::check_updater_stack_dir(&env.updater),
+        platform_update::check_updater_overlays(&env.updater),
+        platform_update::check_health_addr_bindable(&env.health, &env.self_identity),
     ]
+}
+
+/// Twin of `release::ReleaseManager::from_env`'s socket resolution.
+fn updater_socket_path() -> PathBuf {
+    std::env::var("QUASAR_UPDATER_SOCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(crate::release::DEFAULT_SOCKET))
 }
 
 fn check_vulkan_av1_compatibility(env: &ProbeEnv) -> ReadinessCheck {
@@ -1585,7 +1617,12 @@ const ENCODER_CODECS_REMEDIATION: &str =
      (driver_volume_version) or a missing render node (host_render_node) both produce exactly \
      this. Then confirm the encoder elements register inside the agent container: \
      `docker exec <agent> gst-inspect-1.0 nvh264enc` (NVIDIA) or `vah264enc` / `vah264lpenc` \
-     (AMD/Intel), and check the agent log for the `codec support probed` line.";
+     (AMD/Intel), and check the agent log for the `codec support probed` line. `vainfo`, also in \
+     the image, lists the VA entrypoints independently of GStreamer. On an Intel host the vulkan \
+     elements additionally need `ANV_DEBUG=video-encode`, which this image bakes in — prefix the \
+     gst-inspect with it by hand if the agent is still running an older image. Either way point \
+     `GST_REGISTRY` at a scratch path for that gst-inspect: the image's registry was built with no \
+     GPU present, so device-probing elements are absent from it by construction.";
 
 // ── (#483) media reachability: host firewall vs WebRTC ICE UDP ─────────────────
 //
@@ -2450,6 +2487,13 @@ mod tests {
                 // `Unknown` means "not probed" and must never influence a verdict on its own.
                 egl_runtime: crate::nvidia_volume::EglRuntime::Unknown,
                 firewall: FirewallPosture::Unknown,
+                updater: platform_update::UpdaterView::default(),
+                updater_present: None,
+                health: platform_update::HealthOwner::default(),
+                self_identity: platform_update::HealthIdentity {
+                    node: "test".to_string(),
+                    pid: 1,
+                },
             }
         }
 
@@ -2537,6 +2581,22 @@ mod tests {
                 assert_eq!(
                     c.status, SKIP,
                     "native host needs no provisioned driver mount"
+                );
+                continue;
+            }
+            // The update-path checks read the fixture's empty collectors as not
+            // applicable (no updater service, health endpoint unprobed).
+            if matches!(
+                c.id.as_str(),
+                "updater_socket"
+                    | "updater_stack_dir"
+                    | "updater_overlays"
+                    | "health_addr_bindable"
+            ) {
+                assert_eq!(
+                    c.status, SKIP,
+                    "check {} should be not applicable here: {:?}",
+                    c.id, c
                 );
                 continue;
             }

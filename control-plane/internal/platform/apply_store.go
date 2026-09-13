@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -41,6 +42,35 @@ const attemptFrom = ` FROM platform_apply_attempts a LEFT JOIN hosts h ON h.id =
 // terminalStatesSQL is the open/terminal split, in SQL. Go twin:
 // TerminalAttemptState; pinned together by TestTerminalSplitMatchesSQL.
 const terminalStatesSQL = `('succeeded','failed','cancelled')`
+
+// applyOutputLimit is `platform_apply_attempts.output`'s CHECK (migration
+// 0075). Pinned against the migration by TestApplyOutputLimitMatchesSQL; the
+// same number is agentws.maxReleaseOutputLen and updater.OutputTailBytes.
+const applyOutputLimit = 8192
+
+// boundApplyOutput makes an output writable. Postgres REFUSES a value the CHECK
+// rejects — and refuses invalid UTF-8 outright — rather than truncating, and a
+// refused terminal write leaves the attempt non-terminal until its deadline. So
+// every writer of `output` passes through here rather than each trusting its
+// own upstream: the relay cuts a byte tail that can start mid-rune, the JSON
+// hop can substitute a 3-byte U+FFFD per bad byte and push a bounded output
+// past the cap, and the control plane's own apply (apply_self.go) reads its
+// result straight off the updater's socket with no bound at all.
+//
+// The cut is from the FRONT, like the wire hop's: the error is at the end.
+func boundApplyOutput(s string) string {
+	if len(s) > applyOutputLimit {
+		s = s[len(s)-applyOutputLimit:]
+	}
+	// NUL is valid UTF-8 and Postgres still refuses it in a `text` value
+	// (SQLSTATE 22021), which is the same lost-terminal-write this function
+	// exists to prevent. Nothing upstream strips it: the updater tails bytes,
+	// JSON carries \u0000 end to end, and the wire hop only cuts for length. A
+	// container that dies with binary in its last log lines is all it takes.
+	s = strings.ReplaceAll(s, "\x00", "")
+	// Never grows the string: an invalid byte is dropped, not replaced.
+	return strings.ToValidUTF8(s, "")
+}
 
 func scanAttempt(row pgx.Row) (Attempt, error) {
 	var a Attempt
@@ -123,6 +153,44 @@ func (s *Store) CreateHostAttempt(ctx context.Context, in NewHostAttempt) (Attem
 			return Attempt{}, ErrAttemptInFlight
 		}
 		return Attempt{}, fmt.Errorf("insert platform_apply_attempt: %w", err)
+	}
+	return s.Attempt(ctx, id)
+}
+
+// NewAutoRevert is the history row for a restore the updater performed itself
+// (ADR 0004): the failed apply's previous digests are what it moved to, its
+// requested digests what it moved from.
+type NewAutoRevert struct {
+	Failed    Attempt
+	Requested []ComponentDigest
+	Previous  []PreviousDigest
+	Output    string
+}
+
+// CreateAutoRevertAttempt inserts the row already succeeded: the updater only
+// reports `restored` for a restore that came up, and the row was never driven
+// over the wire, so it never holds the open-target index. Inserted only after
+// the failed apply is terminal.
+func (s *Store) CreateAutoRevertAttempt(ctx context.Context, in NewAutoRevert) (Attempt, error) {
+	requested, err := json.Marshal(in.Requested)
+	if err != nil {
+		return Attempt{}, fmt.Errorf("encode requested_digests: %w", err)
+	}
+	previous, err := json.Marshal(in.Previous)
+	if err != nil {
+		return Attempt{}, fmt.Errorf("encode previous_digests: %w", err)
+	}
+	var id string
+	err = s.pool.QueryRow(ctx, `
+		INSERT INTO platform_apply_attempts
+		    (run_id, kind, target, host_id, release_id, requested_digests, previous_digests,
+		     state, reason, force, output, requested_by, started_at, finished_at)
+		VALUES ($1::uuid, 'auto_revert', 'host', $2::uuid, NULL, $3::jsonb, $4::jsonb,
+		        'succeeded', NULL, false, $5, NULL, now(), now())
+		RETURNING id::text
+	`, in.Failed.RunID, in.Failed.HostID, requested, previous, boundApplyOutput(in.Output)).Scan(&id)
+	if err != nil {
+		return Attempt{}, fmt.Errorf("insert auto_revert attempt: %w", err)
 	}
 	return s.Attempt(ctx, id)
 }
@@ -222,7 +290,7 @@ func (s *Store) FailAttempt(ctx context.Context, attemptID, reason, output strin
 		   SET state = 'failed', reason = $2, sessions_remaining = NULL,
 		       output = CASE WHEN $3 = '' THEN output ELSE $3 END,
 		       finished_at = now()
-		 WHERE id = $1::uuid AND state NOT IN `+terminalStatesSQL, attemptID, reason, output)
+		 WHERE id = $1::uuid AND state NOT IN `+terminalStatesSQL, attemptID, reason, boundApplyOutput(output))
 	if err != nil {
 		return fmt.Errorf("fail platform_apply_attempt: %w", err)
 	}
@@ -272,7 +340,7 @@ func (s *Store) RecordReleaseState(ctx context.Context, attemptID, state string,
 		   SET state = $2,
 		       previous_digests = CASE WHEN $3::jsonb = '[]'::jsonb THEN previous_digests ELSE $3::jsonb END,
 		       output = CASE WHEN $4 = '' THEN output ELSE $4 END
-		 WHERE id = $1::uuid AND state NOT IN `+terminalStatesSQL, attemptID, state, prev, output)
+		 WHERE id = $1::uuid AND state NOT IN `+terminalStatesSQL, attemptID, state, prev, boundApplyOutput(output))
 	if err != nil {
 		return fmt.Errorf("record release_state: %w", err)
 	}

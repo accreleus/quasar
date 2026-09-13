@@ -177,23 +177,12 @@ func providerRuntimeSpec(runtimeRaw []byte, ref string, needsImage bool) (json.R
 	}
 
 	spec := map[string]any{}
-	// Defaults true when the manifest is silent: a provider app is a streamed,
-	// GPU-composited session by construction.
-	gpu := true
-	if rt.GPU != nil {
-		gpu = *rt.GPU
-	}
-	spec["gpu"] = gpu
-	// Written only when the manifest states it; absent means the agent's hardened
-	// default (true). Steam states false: its startup re-escalates via sudo (#432).
-	if rt.NoNewPrivileges != nil {
-		spec["no_new_privileges"] = *rt.NoNewPrivileges
-	}
-	// Written only when stated; absent means the agent's default (false). Desktop
-	// images (KDE) state true so flatpak's bwrap can remount its own fresh /proc.
-	if rt.SystempathsUnconfined != nil {
-		spec["systempaths_unconfined"] = *rt.SystempathsUnconfined
-	}
+	// gpu defaults true when the manifest is silent (a provider app is a
+	// streamed, GPU-composited session by construction); no_new_privileges and
+	// systempaths_unconfined only when stated (#432: Steam re-escalates via sudo;
+	// KDE's flatpak needs an unmasked /proc). The rule is shared with the
+	// console-created-app path — launch_profile.go (#171).
+	applyLaunchProfile(spec, rt)
 	if needsImage && ref != "" {
 		spec["image"] = ref
 	}

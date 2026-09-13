@@ -83,7 +83,7 @@ func TestDeleteUserNudgesEveryHostHoldingAHome(t *testing.T) {
 
 	fake := &fakeReaper{}
 	svc.SetHomeReaper(fake)
-	if err := svc.DeleteUser(ctx, u.ID); err != nil {
+	if _, err := svc.DeleteUser(ctx, u.ID); err != nil {
 		t.Fatalf("delete user: %v", err)
 	}
 
@@ -128,7 +128,7 @@ func TestDeleteUserWithNoHomesDoesNotNudge(t *testing.T) {
 	}
 	fake := &fakeReaper{}
 	svc.SetHomeReaper(fake)
-	if err := svc.DeleteUser(ctx, u.ID); err != nil {
+	if _, err := svc.DeleteUser(ctx, u.ID); err != nil {
 		t.Fatalf("delete user: %v", err)
 	}
 	if len(fake.hosts) != 0 {

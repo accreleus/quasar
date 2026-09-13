@@ -22,6 +22,7 @@ function renderRegister(login: AuthContextValue["login"], path = "/register") {
     user: null,
     token: null,
     isAdmin: false,
+    sessionExpired: false,
     login,
     claim: vi.fn(),
     logout: vi.fn(),

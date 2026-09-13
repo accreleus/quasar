@@ -213,6 +213,11 @@ services:
       QUASAR_PLATFORM_RELEASE_ASSET_HOSTS: ${QUASAR_PLATFORM_RELEASE_ASSET_HOSTS:-}
       QUASAR_PLATFORM_RELEASE_TOKEN: ${QUASAR_PLATFORM_RELEASE_TOKEN:-}
       QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL: ${QUASAR_PLATFORM_RELEASE_DETECT_INTERVAL:-}
+      # Release notifications (#123). The webhook URL itself is an admin setting,
+      # not a knob; these two are the optional signing secret and the optional
+      # narrowing of where a notification may be sent.
+      QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET: ${QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET:-}
+      QUASAR_PLATFORM_WEBHOOK_HOSTS: ${QUASAR_PLATFORM_WEBHOOK_HOSTS:-}
       # The registry the edge channel resolves branch tags on, and the egress
       # allowlist every registry read passes.
       QUASAR_PLATFORM_REGISTRY: ${QUASAR_PLATFORM_REGISTRY:-}
@@ -329,6 +334,12 @@ services:
       # Explicit values (va | vulkan | nvenc | openh264) win. docs/configuration.md.
       QUASAR_ENCODER: ${QUASAR_ENCODER:-}
       QUASAR_RENDER_NODE: ${QUASAR_RENDER_NODE:-}
+      # #152: the health listener's bind address. Passed through so an operator
+      # can move it — the agent REFUSES TO START if it cannot bind, rather than
+      # let another process answer its health checks, and 9091 is a busy port
+      # (Prometheus Pushgateway's default). Empty disables the endpoint. The
+      # `-` (not `:-`) is deliberate: an explicitly empty value must stay empty.
+      QUASAR_HEALTH_ADDR: ${QUASAR_HEALTH_ADDR-127.0.0.1:9091}
       # P5-03 local-driver home root: when set, the agent pre-creates bind-mount
       # dirs under it and reports per-home bytes_used. Must be a path that is
       # the SAME on host and in this container.
@@ -661,6 +672,12 @@ services:
       # the org's own. docs/configuration.md.
       QUASAR_UPDATER_ALLOWED_NAMESPACES: ${QUASAR_UPDATER_ALLOWED_NAMESPACES:-}
       QUASAR_UPDATER_WAIT_TIMEOUT_S: ${QUASAR_UPDATER_WAIT_TIMEOUT_S:-}
+      # Release-signature verification. Empty = off, the default: nothing is
+      # fetched and trust is the pinned digest (ADR 0001). docs/configuration.md.
+      QUASAR_UPDATER_SIGNATURE_MODE: ${QUASAR_UPDATER_SIGNATURE_MODE:-}
+      QUASAR_UPDATER_TRUSTED_KEYS: ${QUASAR_UPDATER_TRUSTED_KEYS:-}
+      QUASAR_UPDATER_MANIFEST_BASE_URL: ${QUASAR_UPDATER_MANIFEST_BASE_URL:-}
+      QUASAR_UPDATER_MANIFEST_TIMEOUT_S: ${QUASAR_UPDATER_MANIFEST_TIMEOUT_S:-}
     volumes:
       # Podman: point QUASAR_DOCKER_SOCKET at /run/user/<uid>/podman/podman.sock.
       - ${QUASAR_DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock

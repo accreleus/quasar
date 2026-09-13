@@ -219,8 +219,15 @@ pub struct Inputs<'a> {
     pub allow_plaintext: bool,
 }
 
-/// Which input named the pin in force. `agent.rs` refreshes the persisted pin file only
-/// for [`PinSource::Env`] — the operator-driven rotation — and never for the others.
+/// Which input named the pin in force.
+///
+/// `agent.rs` refreshes the persisted pin file on a RECONNECT only for [`PinSource::Env`]
+/// — the operator-driven rotation. The source stops deciding on a register that MINTS a
+/// node secret (a first enrollment or a re-enrollment, #199): that register replaces the
+/// identity the old pin belonged to, so whichever pin just verified the handshake is
+/// written whatever named it. Without that, an agent re-enrolled onto a second control
+/// plane kept the first one's fingerprint and could never connect once `QUASAR_ENROLLMENT`
+/// was removed from its environment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PinSource {
     /// `CONTROL_PLANE_FINGERPRINT`.

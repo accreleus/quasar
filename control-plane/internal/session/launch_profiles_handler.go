@@ -287,16 +287,26 @@ func (h *Handler) handleAdminDeleteLaunchProfile(w http.ResponseWriter, r *http.
 	} else {
 		widened = apps
 	}
+	// Read the name before the delete, like handleAdminDeleteStreamProfile:
+	// after it there is nothing left to resolve, so the audit row is the only
+	// place the chain's name can still be recovered.
+	var name string
+	if existing, getErr := h.store.GetLaunchProfile(r.Context(), id); getErr == nil {
+		name = existing.DisplayName
+	}
 	err := h.store.DeleteLaunchProfile(r.Context(), id)
 	switch {
 	case err == nil:
-		var details map[string]any
+		details := map[string]any{}
+		if name != "" {
+			details["name"] = name
+		}
 		if len(widened) > 0 {
 			names := make([]string, 0, len(widened))
 			for _, a := range widened {
 				names = append(names, a.Name)
 			}
-			details = map[string]any{"allow_list_widened_apps": names}
+			details["allow_list_widened_apps"] = names
 		}
 		h.recordActivity(r.Context(), actorFromRequest(r), "launch_profile.delete", "launch_profile", id, details)
 		w.WriteHeader(http.StatusNoContent)

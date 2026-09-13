@@ -21,6 +21,7 @@ pub mod ddc;
 mod encoder_compatibility;
 pub mod enrollment;
 /// `host.xid` / `host.gpu_fault`: the kernel's own GPU fault records, off `/dev/kmsg`.
+pub mod gpu_identity;
 pub mod gpu_kmsg;
 /// GPU-vendor detection backing the `QUASAR_ENCODER` auto-default.
 pub mod gpu_vendor;

@@ -3,9 +3,11 @@ package platform
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
+	"github.com/accreleus/quasar/control-plane/internal/semver"
 )
 
 // Everything the release view decides, decided in one pure function.
@@ -54,6 +56,18 @@ type PlanInputs struct {
 	// stale CheckedAt with an error is the normal "failing since then".
 	CheckedAt *time.Time
 	LastError *string
+
+	// Passed through untouched: the notification surface is config, not a
+	// release decision.
+	ReleaseWebhook *WebhookStatus
+
+	// ControlPlanePreflight is what the collectors found about this control
+	// plane's own stack (preflight_collect.go); a host's facts ride on its
+	// HostIdentity. ImageFor is the instance-wide registry check for one
+	// release, a closure because it is evaluated for available[0] only, which
+	// is decided here; nil means no resolver is wired (unknown, never blocked).
+	ControlPlanePreflight PreflightFacts
+	ImageFor              func(r Release) *ImageFact
 }
 
 // PlanRelease computes the whole view.
@@ -72,6 +86,13 @@ func PlanRelease(in PlanInputs) View {
 		installMode:    in.ControlPlaneInstallMode,
 	}
 
+	var image *ImageFact
+	if in.ImageFor != nil && len(available) > 0 {
+		image = in.ImageFor(available[0])
+	}
+	cpFacts := in.ControlPlanePreflight
+	cpFacts.Image = image
+
 	v := View{
 		Channel:    channel,
 		SourceRepo: in.SourceRepo,
@@ -83,11 +104,15 @@ func PlanRelease(in PlanInputs) View {
 			Hosts:        hosts,
 		},
 		Available: available,
-		Targets:   targets(available, in.ControlPlane, hosts, open, fleet),
-		Faults:    faults(in.Releases, channel, in.ControlPlane, hosts),
+		Targets:   targets(available, in.ControlPlane, hosts, open, fleet, cpFacts, image),
+		// Faults are read off the rows the channel SELECTS, which on beta are
+		// the stable channel's (rowChannel), and ordered the way `available`
+		// orders them on that channel.
+		Faults: faults(in.Releases, channel, in.ControlPlane, hosts),
 		// Always serialized, `null` when nothing is in flight: null is the
 		// answer, not the absence of one.
-		ActiveApply: activeApply(in.ActiveRun, in.OpenAttempts),
+		ActiveApply:    activeApply(in.ActiveRun, in.OpenAttempts),
+		ReleaseWebhook: in.ReleaseWebhook,
 	}
 	return v
 }
@@ -127,43 +152,165 @@ func activeApply(run *ApplyRun, attempts []Attempt) *ActiveApply {
 	return &ActiveApply{Run: run, Attempts: attempts}
 }
 
-// offerable applies the three listing rules and the ordering: schema_version
-// then built_at, both DESC (ADR 0002). The built_at tiebreak matters because
-// edge produces many builds at one schema_version; id keeps a list stable
-// across reads rather than dependent on the scan order.
+// ReleaseRunsAMigration reports whether moving a control plane at
+// schemaVersion onto r runs at least one migration. schema_version IS the
+// highest migration a build embeds (buildinfo.SchemaVersion) and DDL only
+// arrives as a numbered migration, so "above us" and "migrates the database"
+// are one fact. The other half of ADR 0002's schema rule from `offerable`,
+// which refuses a release BELOW the control plane. The fleet run's
+// control-plane drain branches on this (#153, apply_fleet.go prepareFleet).
+//
+// There is deliberately NO client twin: the answer is served on every listed
+// release as `migrates` (see Release.Migrates), because the drain policy is the
+// server's and a client re-deriving it would go on telling an operator what
+// they are consenting to after the policy moved.
+func ReleaseRunsAMigration(r Release, schemaVersion int) bool {
+	return r.SchemaVersion > schemaVersion
+}
+
+// offerable applies the listing rules and the ordering: schema_version then
+// built_at, both DESC (ADR 0002). The built_at tiebreak matters because edge
+// produces many builds at one schema_version; id keeps a list stable across
+// reads rather than dependent on the scan order.
+//
+// Beta inserts semver precedence between those two keys, and only beta: it is
+// the only channel whose rows can arrive out of version order, because an rc is
+// cut from `develop` while a patch is cut from `main`, so 0.3.0-rc.1 can be
+// built before the 0.2.5 that orders below it. Edge builds have no version at
+// all.
 func offerable(rows []Release, channel string, cp buildinfo.Identity) []Release {
+	source := rowChannel(channel)
 	out := make([]Release, 0, len(rows))
 	for _, r := range rows {
-		if r.Channel != channel {
+		if r.Channel != source {
 			continue
 		}
 		// ADR 0002: a downgrade must be unrepresentable, not merely discouraged.
 		if r.SchemaVersion < cp.SchemaVersion {
 			continue
 		}
-		if channel == ChannelStable {
-			// Prereleases exist to be exercised; stable ignores them.
-			if r.Prerelease {
-				continue
-			}
-			// Nothing to pin it by (ADR 0001).
-			if len(r.Manifest) == 0 {
-				continue
-			}
+		if belowInstalledVersion(r, cp) {
+			continue
 		}
+		// Prereleases exist to be exercised; stable ignores them. Beta is the
+		// channel that does not.
+		if channel == ChannelStable && r.Prerelease {
+			continue
+		}
+		// Nothing to pin it by (ADR 0001). Edge is exempt because it publishes
+		// no manifest at all and resolves its digests at apply time.
+		if channel != ChannelEdge && len(r.Manifest) == 0 {
+			continue
+		}
+		// Derived here because this is where the control plane's own schema
+		// version is in hand, and every served release comes through this filter.
+		r.Migrates = ReleaseRunsAMigration(r, cp.SchemaVersion)
 		out = append(out, r)
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		a, b := out[i], out[j]
-		if a.SchemaVersion != b.SchemaVersion {
-			return a.SchemaVersion > b.SchemaVersion
+	return sortOfferable(out, channel)
+}
+
+// ranked is one row with its precedence key computed ONCE, before the sort.
+// Consulting semver only for pairs where BOTH versions parse is not a total
+// order: with a parseable pair ordered by version and every mixed pair ordered
+// by built_at, three rows can form a cycle, and the winner then depends on the
+// scan order the rows arrived in (Store.Releases has no ORDER BY).
+type ranked struct {
+	release Release
+	version semver.Full
+	// parsed=false is "carries no version this build can order by", which ranks
+	// strictly below every row that does rather than comparing pairwise.
+	parsed bool
+}
+
+// sortOfferable is the ADR 0002 ordering: schema_version DESC, then built_at
+// DESC, with id as the last tiebreak so a list is stable across reads. Beta
+// inserts semver precedence between the first two keys — for beta only, so
+// stable and edge order exactly as they did before the channel existed.
+func sortOfferable(rows []Release, channel string) []Release {
+	keyed := make([]ranked, len(rows))
+	for i, r := range rows {
+		k := ranked{release: r}
+		if channel == ChannelBeta {
+			k.version, k.parsed = parseVersion(r.Version)
 		}
-		if !a.BuiltAt.Equal(b.BuiltAt) {
-			return a.BuiltAt.After(b.BuiltAt)
+		keyed[i] = k
+	}
+	sort.SliceStable(keyed, func(i, j int) bool {
+		a, b := keyed[i], keyed[j]
+		if a.release.SchemaVersion != b.release.SchemaVersion {
+			return a.release.SchemaVersion > b.release.SchemaVersion
 		}
-		return a.ID > b.ID
+		// Every parseable row above every unparseable one, and built_at breaking
+		// ties INSIDE each group: that is what makes the comparator transitive.
+		if a.parsed != b.parsed {
+			return a.parsed
+		}
+		if a.parsed && b.parsed {
+			if c := semver.ComparePrecedence(a.version, b.version); c != 0 {
+				return c > 0
+			}
+		}
+		if !a.release.BuiltAt.Equal(b.release.BuiltAt) {
+			return a.release.BuiltAt.After(b.release.BuiltAt)
+		}
+		return a.release.ID > b.release.ID
 	})
+	out := make([]Release, len(keyed))
+	for i := range keyed {
+		out[i] = keyed[i].release
+	}
 	return out
+}
+
+// comparePrecedence orders two release versions by SemVer 2.0.0 §11 precedence.
+// ok=false when either is absent or does not parse, which is the caller's cue to
+// fall back to built_at rather than to invent an order.
+func comparePrecedence(a, b *string) (int, bool) {
+	va, okA := parseVersion(a)
+	vb, okB := parseVersion(b)
+	if !okA || !okB {
+		return 0, false
+	}
+	return semver.ComparePrecedence(va, vb), true
+}
+
+// parseVersion is the one place a row's version becomes an ordering key.
+// ok=false covers absent, empty (edge rows) and unparseable alike, because all
+// three mean the same thing to every caller: there is no version to order by.
+func parseVersion(v *string) (semver.Full, bool) {
+	if v == nil || strings.TrimSpace(*v) == "" {
+		return semver.Full{}, false
+	}
+	return semver.ParseFull(*v)
+}
+
+// belowInstalledVersion is the switch-back rule: no channel offers a build that
+// orders below the installed one, so leaving beta waits for stable to catch up
+// rather than rolling the control plane back. Filtered here, not answered as an
+// eligibility reason, so the downgrade is unrepresentable: it never reaches
+// available[0] and apply_handler.offered reads the same list.
+//
+// Scoped to an installed PRERELEASE, which is the only way an install can be
+// above what its channel lists — `make release` cuts stable versions
+// monotonically from a clean `main` — so stable and edge see no change. Edge
+// rows carry no version; edgeOlderThanInstalled covers them. Equal
+// schema_version only: a newer schema still wins (ADR 0002).
+func belowInstalledVersion(r Release, cp buildinfo.Identity) bool {
+	if r.Version == nil || r.SchemaVersion != cp.SchemaVersion {
+		return false
+	}
+	installed, ok := semver.ParseFull(cp.Version)
+	if !ok || !installed.IsPrerelease() {
+		return false
+	}
+	candidate, ok := semver.ParseFull(*r.Version)
+	if !ok {
+		return false
+	}
+	// Strictly below: the equal version is the one the instance is running, and
+	// must stay listed for up_to_date to be evaluated against it.
+	return semver.ComparePrecedence(candidate, installed) < 0
 }
 
 // withDerivedIdentity fills identity_known, which is served, never re-derived.
@@ -178,24 +325,27 @@ func withDerivedIdentity(hosts []HostIdentity) []HostIdentity {
 
 // targets evaluates every target against available[0] and nothing else: this
 // surface carries no per-release eligibility matrix.
-func targets(available []Release, cp buildinfo.Identity, hosts []HostIdentity, open map[string]bool, fleet fleetState) []Target {
+func targets(available []Release, cp buildinfo.Identity, hosts []HostIdentity, open map[string]bool, fleet fleetState,
+	cpFacts PreflightFacts, image *ImageFact) []Target {
 	var newest *Release
 	if len(available) > 0 {
 		newest = &available[0]
 	}
 
 	out := make([]Target, 0, len(hosts)+1)
-	out = append(out, target(TargetControlPlane, nil, nil, controlPlaneReason(newest, cp, open[""], fleet)))
+	cpPre := PlanPreflight(TargetControlPlane, cpFacts)
+	out = append(out, target(TargetControlPlane, nil, nil, controlPlaneReason(newest, cp, open[""], fleet, cpPre), cpPre))
 	for i := range hosts {
 		h := hosts[i]
 		hostID, nodeName := h.HostID, h.NodeName
-		out = append(out, target(TargetHost, &hostID, &nodeName, hostReason(newest, cp, h, open[hostID], fleet)))
+		pre := PlanPreflight(TargetHost, HostPreflightFacts(h, image))
+		out = append(out, target(TargetHost, &hostID, &nodeName, hostReason(newest, cp, h, open[hostID], fleet, pre), pre))
 	}
 	return out
 }
 
-func target(kind string, hostID, nodeName *string, reason string) Target {
-	t := Target{Kind: kind, HostID: hostID, NodeName: nodeName}
+func target(kind string, hostID, nodeName *string, reason string, pre Preflight) Target {
+	t := Target{Kind: kind, HostID: hostID, NodeName: nodeName, Preflight: pre}
 	if reason == "" {
 		t.Eligible = true
 		return t
@@ -208,7 +358,7 @@ func target(kind string, hostID, nodeName *string, reason string) Target {
 // controlPlaneReason: "" means eligible. Only the reasons that apply to every
 // target kind can appear here; the four host-only ones describe an install this
 // process does not have.
-func controlPlaneReason(newest *Release, cp buildinfo.Identity, attemptOpen bool, fleet fleetState) string {
+func controlPlaneReason(newest *Release, cp buildinfo.Identity, attemptOpen bool, fleet fleetState, pre Preflight) string {
 	if newest == nil {
 		return ReasonNoRelease
 	}
@@ -235,6 +385,11 @@ func controlPlaneReason(newest *Release, cp buildinfo.Identity, attemptOpen bool
 	if *fleet.installMode == InstallSource {
 		return ReasonInstallModeSource
 	}
+	// A stack shape is durable, so it outranks the two transient reasons;
+	// `unknown` never lands here.
+	if pre.Blocked() {
+		return ReasonPreflightBlocked
+	}
 	// The two most transient facts on the list, so they come last (amendment 2).
 	if attemptOpen {
 		return ReasonAttemptInFlight
@@ -260,7 +415,7 @@ func edgeOlderThanInstalled(release Release, cp buildinfo.Identity) bool {
 // hostReason: "" means eligible. The contract fixes the precedence as the order
 // below, durable facts outranking transient ones: an offline source-built host
 // reports install_mode_source, because reconnecting would not change it.
-func hostReason(newest *Release, cp buildinfo.Identity, h HostIdentity, attemptOpen bool, fleet fleetState) string {
+func hostReason(newest *Release, cp buildinfo.Identity, h HostIdentity, attemptOpen bool, fleet fleetState, pre Preflight) string {
 	if newest == nil {
 		return ReasonNoRelease
 	}
@@ -279,7 +434,13 @@ func hostReason(newest *Release, cp buildinfo.Identity, h HostIdentity, attemptO
 	if !*h.UpdaterPresent {
 		return ReasonUpdaterAbsent
 	}
-	if h.Status == HostOffline {
+	// control-api.md defines this reason as "the host's agent is not connected".
+	// The status column was an inadequate implementation of that sentence: it is
+	// stale across every control-plane restart, and a run's own cordon then
+	// rewrites it to `draining`, which is not `offline` (#169). The live registry
+	// answers the question the contract actually asks; the column stays as the
+	// fallback for a caller that wires no registry.
+	if h.Status == HostOffline || (h.AgentConnected != nil && !*h.AgentConnected) {
 		return ReasonHostOffline
 	}
 	// A ceiling, not a queue: an agent is never moved past the control plane
@@ -292,7 +453,10 @@ func hostReason(newest *Release, cp buildinfo.Identity, h HostIdentity, attemptO
 	if cp.SourceCommit == nil || !commitsMatch(*cp.SourceCommit, newest.SourceCommit) {
 		return ReasonControlPlaneNotFirst
 	}
-	// attempt_in_flight (9) then run_active (10) — the end of amendment 2's
+	if pre.Blocked() {
+		return ReasonPreflightBlocked
+	}
+	// attempt_in_flight then run_active — the end of amendment 2's
 	// precedence, because they are the most transient facts on it.
 	if attemptOpen {
 		return ReasonAttemptInFlight
@@ -310,14 +474,19 @@ func hostReason(newest *Release, cp buildinfo.Identity, h HostIdentity, attemptO
 // no trustworthy commit, built_at or schema_version, all three NOT NULL, so the
 // release is never stored and the detector reports the broken publish in its own
 // run record instead of inventing an identity (detect.go).
+// `channel` is the instance's channel, not the platform_releases.channel value:
+// the rows come from rowChannel(channel) — on beta those are not the same — and
+// the channel itself is what decides the ordering the agent_ahead comparison
+// uses, so that a fault says the same thing `available` does.
 func faults(rows []Release, channel string, cp buildinfo.Identity, hosts []HostIdentity) []Fault {
 	out := make([]Fault, 0)
+	source := rowChannel(channel)
 
 	// What "above the control plane" is measured against, when it is known.
 	var cpRelease *Release
 	if cp.SourceCommit != nil {
 		for i := range rows {
-			if rows[i].Channel == channel && commitsMatch(rows[i].SourceCommit, *cp.SourceCommit) {
+			if rows[i].Channel == source && commitsMatch(rows[i].SourceCommit, *cp.SourceCommit) {
 				cpRelease = &rows[i]
 				break
 			}
@@ -336,9 +505,9 @@ func faults(rows []Release, channel string, cp buildinfo.Identity, hosts []HostI
 			})
 			continue
 		}
-		hostRelease := matchRelease(rows, channel, *h.SourceCommit)
+		hostRelease := matchRelease(rows, source, *h.SourceCommit)
 		// Unordered is not ahead: a commit matching no known release raises nothing.
-		if hostRelease == nil || !ordersAbove(*hostRelease, cpRelease, cp) {
+		if hostRelease == nil || !ordersAbove(*hostRelease, cpRelease, cp, channel) {
 			continue
 		}
 		hostID, nodeName := h.HostID, h.NodeName
@@ -354,25 +523,34 @@ func faults(rows []Release, channel string, cp buildinfo.Identity, hosts []HostI
 	return out
 }
 
-// matchRelease finds the channel's row for a commit, tolerating a short one.
-func matchRelease(rows []Release, channel, commit string) *Release {
+// matchRelease finds the row for a commit among those a channel reads,
+// tolerating a short commit. `source` is a rowChannel value, never a raw channel.
+func matchRelease(rows []Release, source, commit string) *Release {
 	for i := range rows {
-		if rows[i].Channel == channel && commitsMatch(rows[i].SourceCommit, commit) {
+		if rows[i].Channel == source && commitsMatch(rows[i].SourceCommit, commit) {
 			return &rows[i]
 		}
 	}
 	return nil
 }
 
-// ordersAbove compares in the ordering `available` uses. With no known row for
-// the control plane there is no built_at to compare, so it falls back to
-// schema_version, the key that always exists.
-func ordersAbove(r Release, cpRelease *Release, cp buildinfo.Identity) bool {
+// ordersAbove compares in the ordering `available` uses — including on beta,
+// where that means semver precedence at an equal schema_version and NOT build
+// time: an rc cut from `develop` can be built before the patch release it orders
+// above, so comparing built_at would miss an agent that really is ahead. With no
+// known row for the control plane there is no built_at to compare, so it falls
+// back to schema_version, the key that always exists.
+func ordersAbove(r Release, cpRelease *Release, cp buildinfo.Identity, channel string) bool {
 	if cpRelease == nil {
 		return r.SchemaVersion > cp.SchemaVersion
 	}
 	if r.SchemaVersion != cpRelease.SchemaVersion {
 		return r.SchemaVersion > cpRelease.SchemaVersion
+	}
+	if channel == ChannelBeta {
+		if c, ok := comparePrecedence(r.Version, cpRelease.Version); ok && c != 0 {
+			return c > 0
+		}
 	}
 	return r.BuiltAt.After(cpRelease.BuiltAt)
 }

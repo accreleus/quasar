@@ -538,6 +538,24 @@ func (h *Handler) handleSignalingToken(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not get session")
 		return
 	}
+	// Terminal FIRST: a session the stale sweep already failed is dead whether or
+	// not its host is connected, and answering the retryable 503 below would make
+	// the client retry a corpse for its whole budget instead of failing fast.
+	if sess.State.IsTerminal() {
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "session is not reconnectable")
+		return
+	}
+	// #128: a session now SURVIVES a control-plane restart, so this row can be
+	// `running` while its agent is still reconnecting. Minting then would hand the
+	// browser fresh coordinates, and re-seating them destroys the peer connection
+	// that is still carrying media — then the attach fails 4500 because the agent
+	// is not back, and the client starts over with no delay. Refuse with a
+	// RETRYABLE status so the client keeps backing off and keeps its stream.
+	if sess.HostID != nil && !h.coord.AgentConnected(*sess.HostID) {
+		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeAgentNotConnected,
+			"the host agent is reconnecting; retry shortly")
+		return
+	}
 	token, err := h.store.MintSignalingToken(r.Context(), id)
 	if errors.Is(err, ErrSessionTerminal) {
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "session is not reconnectable")

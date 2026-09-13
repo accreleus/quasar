@@ -115,6 +115,12 @@ type Config struct {
 	// refuse, never queue (agent-api.md `busy`). An input rather than a mutex
 	// the decision reaches for, so "is this busy?" stays a table row.
 	InFlightRequestID string
+
+	// The host's release-signing policy (signature.go). Zero value is `off`.
+	Signature SignaturePolicy
+	// What the source found for this request's release: request-scoped like
+	// InFlightRequestID, gathered by the caller so the decision stays pure.
+	SignatureEvidence *SignatureEvidence
 }
 
 // Rejection carries one identifier from the closed `reason` vocabulary plus an
@@ -240,6 +246,13 @@ func Plan(req ApplyRequest, env string, cfg Config) (*ApplyPlan, *Rejection) {
 				c.Name, c.Image, strings.Join(cfg.AllowedNamespaces, ","))
 		}
 		targets = append(targets, t)
+	}
+
+	// The second gate beside the namespace allowlist above, and last because it
+	// grades a document fetched over the network. Off by default: an install
+	// that has not opted in passes straight through.
+	if rej := checkSignature(req, cfg.Signature, cfg.SignatureEvidence); rej != nil {
+		return nil, rej
 	}
 
 	// Env rewrite + previous digests, in request order so `components` and

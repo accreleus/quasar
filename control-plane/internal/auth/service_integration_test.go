@@ -339,7 +339,7 @@ func TestDeleteUser(t *testing.T) {
 
 	t.Run("deletes a plain user and cascades history", func(t *testing.T) {
 		id := reg("del1@test.local", "del1")
-		if err := svc.DeleteUser(ctx, id); err != nil {
+		if _, err := svc.DeleteUser(ctx, id); err != nil {
 			t.Fatalf("delete: %v", err)
 		}
 		var n int
@@ -352,7 +352,7 @@ func TestDeleteUser(t *testing.T) {
 	})
 
 	t.Run("unknown id → ErrUserNotFound", func(t *testing.T) {
-		err := svc.DeleteUser(ctx, "00000000-0000-0000-0000-000000000000")
+		_, err := svc.DeleteUser(ctx, "00000000-0000-0000-0000-000000000000")
 		if !errors.Is(err, ErrUserNotFound) {
 			t.Errorf("got %v, want ErrUserNotFound", err)
 		}
@@ -364,7 +364,7 @@ func TestDeleteUser(t *testing.T) {
 			t.Fatalf("promote: %v", err)
 		}
 		// This is the only admin in the truncated test DB.
-		if err := svc.DeleteUser(ctx, id); !errors.Is(err, ErrLastAdmin) {
+		if _, err := svc.DeleteUser(ctx, id); !errors.Is(err, ErrLastAdmin) {
 			t.Errorf("got %v, want ErrLastAdmin", err)
 		}
 	})
@@ -380,14 +380,14 @@ func TestDeleteUser(t *testing.T) {
 			VALUES ($1::uuid, $2::uuid, 'running', 1280, 720, 30, 2000)`, id, appID); err != nil {
 			t.Fatalf("seed session: %v", err)
 		}
-		if err := svc.DeleteUser(ctx, id); !errors.Is(err, ErrUserHasActiveSessions) {
+		if _, err := svc.DeleteUser(ctx, id); !errors.Is(err, ErrUserHasActiveSessions) {
 			t.Errorf("got %v, want ErrUserHasActiveSessions", err)
 		}
 		// Stop the session → delete succeeds and history cascades.
 		if _, err := pool.Exec(ctx, `UPDATE sessions SET state='stopped' WHERE user_id::text=$1`, id); err != nil {
 			t.Fatalf("stop session: %v", err)
 		}
-		if err := svc.DeleteUser(ctx, id); err != nil {
+		if _, err := svc.DeleteUser(ctx, id); err != nil {
 			t.Fatalf("delete after stop: %v", err)
 		}
 		var n int
@@ -423,7 +423,7 @@ func TestDeleteUser(t *testing.T) {
 			t.Fatalf("seed policy updated_by: %v", err)
 		}
 
-		if err := svc.DeleteUser(ctx, delID); err != nil {
+		if _, err := svc.DeleteUser(ctx, delID); err != nil {
 			t.Fatalf("delete admin referenced by policy: %v", err)
 		}
 

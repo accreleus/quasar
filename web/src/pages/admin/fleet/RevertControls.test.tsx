@@ -15,6 +15,7 @@ import { SectionHeadProvider } from "../../../components/shell/sectionHead";
 import { FLEET_TABS } from "../../../components/shell/sectionTabs";
 import { ToastProvider } from "../../../components/Toast";
 import { ReleasesTab } from "./ReleasesTab";
+import { hostAfterFailureText } from "./releasesCopy";
 import { revertStates } from "./RevertControls";
 
 vi.mock("../../../auth/context", () => ({ useAuth: () => ({ token: "tok" }) }));
@@ -128,6 +129,7 @@ beforeEach(() => {
   vi.resetAllMocks();
   mocked.listAllSessions.mockResolvedValue({ items: [], next_cursor: null } as never);
   mocked.listPlatformAttempts.mockResolvedValue({ attempts: [] });
+  mocked.listPlatformApplyRuns.mockResolvedValue({ runs: [] });
   // The head's "next check" fragment reads the detection job's schedule.
   mocked.listJobs.mockResolvedValue({ items: [], next_cursor: null } as never);
   mocked.getPlatformReleases.mockResolvedValue(view());
@@ -146,6 +148,23 @@ describe("revertStates", () => {
 
     const states = revertStates([attempt()]);
     expect(states.get("h1")).toEqual({ digest: OLD_DIGEST, image: AGENT_IMAGE, failed: null });
+  });
+
+  it("never derives a revert target from an auto_revert row", () => {
+    // Newest first: the updater's own restore sits above the failed apply and
+    // the operator's earlier succeeded one. Its previous digests are the
+    // release that just failed, so it must not become the Revert target.
+    const restored = attempt({
+      id: "a3",
+      kind: "auto_revert",
+      requested_digests: [{ name: "node-agent", image: AGENT_IMAGE, digest: OLD_DIGEST }],
+      previous_digests: [{ name: "node-agent", digest: NEW_DIGEST }],
+      created_at: "2026-09-05T12:00:00Z",
+    });
+    const failed = attempt({ id: "a2", state: "failed", reason: "recreate_failed", created_at: "2026-09-05T11:59:00Z" });
+    const states = revertStates([restored, failed, attempt()]);
+    expect(states.get("h1")?.digest).toBe(OLD_DIGEST);
+    expect(states.get("h1")?.failed).toBeNull();
   });
 
   it("takes the newest succeeded attempt, and reports the newest attempt's failure", () => {
@@ -169,6 +188,55 @@ describe("revertStates", () => {
     expect(
       revertStates([attempt({ target: "control_plane", host_id: null })]).size,
     ).toBe(0);
+  });
+});
+
+describe("hostAfterFailureText", () => {
+  it("says what each failure left running, and nothing at all when it cannot know", () => {
+    // Rejected before anything was pulled: the host never moved.
+    for (const reason of ["updater_absent", "busy", "invalid", "namespace_rejected",
+      "digest_malformed", "unsupported", "signature_missing", "signature_invalid"]) {
+      expect(hostAfterFailureText(reason)).toMatch(/still running the build it had/);
+    }
+    // The pull failed, so the old container was never replaced.
+    expect(hostAfterFailureText("pull_failed")).toMatch(/nothing was recreated/);
+    // Past the health wait the updater restores the previous build itself
+    // (ADR 0004), so none of these may claim no rollback was tried.
+    for (const reason of ["recreate_failed", "never_started", "unhealthy"]) {
+      expect(hostAfterFailureText(reason)).toMatch(/puts the previous build back itself/);
+      expect(hostAfterFailureText(reason)).not.toMatch(/still running the build it had/);
+    }
+    // The updater may have accepted the apply and then stopped answering, past
+    // the point the old container is gone, so neither build may be claimed.
+    expect(hostAfterFailureText("updater_unreachable")).toMatch(/how far this apply got/);
+    expect(hostAfterFailureText("updater_unreachable")).not.toMatch(/still running the build it had/);
+    // A timeout knows neither: both builds are unaccounted for (#201).
+    expect(hostAfterFailureText("timeout")).toMatch(/has not reported back/);
+    expect(hostAfterFailureText("timeout")).not.toMatch(/still running the build it had/);
+    // An unknown or absent reason claims nothing.
+    expect(hostAfterFailureText("a_reason_from_the_future")).toBe("");
+    expect(hostAfterFailureText(null)).toBe("");
+    expect(hostAfterFailureText(undefined)).toBe("");
+  });
+
+  // The panel renders for a failed revert too (#202). The updater still
+  // restores — restoreWorthy keys on the reason, not on the kind — but "the
+  // previous build" is the build being reverted away from, and no auto_revert
+  // row is written for a revert.
+  it("names the right build, and no history row, for a failed revert", () => {
+    for (const reason of ["recreate_failed", "never_started", "unhealthy"]) {
+      const text = hostAfterFailureText(reason, "revert");
+      expect(text).toMatch(/the build this revert was leaving/);
+      expect(text).not.toMatch(/the previous build/);
+      expect(text).not.toMatch(/shows an automatic revert/);
+    }
+    // Every other sentence is true in either direction, and an omitted kind
+    // still reads as an apply.
+    expect(hostAfterFailureText("pull_failed", "revert")).toBe(hostAfterFailureText("pull_failed"));
+    expect(hostAfterFailureText("timeout", "revert")).toBe(hostAfterFailureText("timeout"));
+    expect(hostAfterFailureText("a_reason_from_the_future", "revert")).toBe("");
+    expect(hostAfterFailureText("unhealthy", "apply")).toMatch(/puts the previous build back itself/);
+    expect(hostAfterFailureText("unhealthy")).toMatch(/puts the previous build back itself/);
   });
 });
 
@@ -245,6 +313,10 @@ describe("Revert on the Releases page", () => {
 
     const panel = await screen.findByTestId("failed-h1");
     expect(within(panel).getByText(/never became healthy/)).toBeInTheDocument();
+    // The updater restores the previous build itself past the health wait, so
+    // the panel must not tell the operator nothing was rolled back (#201).
+    expect(within(panel).queryByText(/nothing was rolled back/i)).toBeNull();
+    expect(within(panel).getByText(/puts the previous build back itself/)).toBeInTheDocument();
     expect(within(panel).getByTestId("failed-output-h1")).toHaveTextContent("exit 1");
     expect(within(panel).getByText(new RegExp(`node-agent ${OLD_DIGEST.slice(7, 19)}`))).toBeInTheDocument();
     // The manual path is the same registry recipe, pinned to the previous digest.
@@ -253,6 +325,74 @@ describe("Revert on the Releases page", () => {
     ).toBeInTheDocument();
     // And the panel offers the action that does it for the operator.
     expect(within(panel).getByRole("button", { name: /^Revert$/ })).toBeInTheDocument();
+  });
+
+  // #201: one fixed sentence could not be true for every reason. A timeout is
+  // the shape where BOTH builds are unaccounted for, so the panel must not
+  // claim the host is still running what it had.
+  it("tells a timed-out host's operator to look at the host, not at this page", async () => {
+    mocked.listPlatformAttempts.mockResolvedValue({
+      attempts: [
+        attempt({
+          id: "a10",
+          state: "failed",
+          reason: "timeout",
+          output: "the updater's own result could not be relayed",
+          created_at: "2026-09-05T13:00:00Z",
+        }),
+        attempt(),
+      ],
+    });
+    renderTab();
+
+    const panel = await screen.findByTestId("failed-h1");
+    expect(within(panel).getByText(/has not reported back/)).toBeInTheDocument();
+    expect(within(panel).queryByText(/still running the build it had/)).toBeNull();
+    expect(within(panel).getByTestId("failed-output-h1")).toHaveTextContent("could not be relayed");
+  });
+
+  // A failure the updater rejected outright never reached the host's containers.
+  it("says the host is untouched when nothing was applied", async () => {
+    mocked.listPlatformAttempts.mockResolvedValue({
+      attempts: [
+        attempt({
+          id: "a11",
+          state: "failed",
+          reason: "namespace_rejected",
+          created_at: "2026-09-05T13:00:00Z",
+        }),
+        attempt(),
+      ],
+    });
+    renderTab();
+
+    const panel = await screen.findByTestId("failed-h1");
+    expect(within(panel).getByText(/Nothing was applied: this host is still running the build it had\./))
+      .toBeInTheDocument();
+  });
+
+  // An identifier this build does not know says nothing at all: a guess about
+  // what a host is running is worse than no sentence. The cast is the point —
+  // the generated enum is closed, the wire is not, and the server stores an
+  // unrecognised reason verbatim (agent-api.md).
+  it("offers no aftermath sentence for a reason it does not know", async () => {
+    mocked.listPlatformAttempts.mockResolvedValue({
+      attempts: [
+        attempt({
+          id: "a12",
+          state: "failed",
+          reason: "a_reason_from_the_future" as PlatformApplyAttempt["reason"],
+          created_at: "2026-09-05T13:00:00Z",
+        }),
+        attempt(),
+      ],
+    });
+    renderTab();
+
+    const panel = await screen.findByTestId("failed-h1");
+    expect(within(panel).getByText(/a_reason_from_the_future/)).toBeInTheDocument();
+    expect(within(panel).queryByText(/still running the build it had/)).toBeNull();
+    expect(within(panel).queryByText(/nothing was rolled back/i)).toBeNull();
   });
 
   it("labels each history row with the button that was pressed", async () => {

@@ -1,0 +1,11 @@
+2026-09-08T12:04:07.245737Z  INFO quasar_node_agent::agent: sent register (node_name=quasar-node-1)
+2026-09-08T12:04:07.282235Z  INFO quasar_node_agent::agent: reconnected as host 44bd2118-66c1-4c46-a3bd-a5558dde5a91
+2026-09-08T12:08:04.856644Z  INFO quasar_node_agent::agent: sent register (node_name=quasar-node-1)
+2026-09-08T12:08:04.872599Z  INFO quasar_node_agent::agent: reconnected as host 44bd2118-66c1-4c46-a3bd-a5558dde5a91
+2026-09-08T12:17:47.291565Z  INFO quasar_node_agent::agent: sent register (node_name=quasar-node-1)
+2026-09-08T12:17:47.316799Z  INFO quasar_node_agent::agent: reconnected as host 44bd2118-66c1-4c46-a3bd-a5558dde5a91
+2026-09-08T12:19:53.946465Z  INFO quasar_node_agent::agent: connection lost with 1 running session(s); holding them for 90s while the control plane comes back token="sessions-held-for-grace"
+2026-09-08T12:21:11.228231Z  INFO quasar_node_agent::agent: sent register (node_name=quasar-node-1)
+2026-09-08T12:21:11.257787Z  INFO quasar_node_agent::agent: reconnected as host 44bd2118-66c1-4c46-a3bd-a5558dde5a91
+2026-09-08T12:21:11.258044Z  INFO quasar_node_agent::agent: control plane returned within the grace window; held sessions continue token="session-grace-cleared"
+2026-09-08T12:21:11.367801Z  INFO quasar_node_agent::agent: carried 1 running session(s) across the control-plane connection token="sessions-survived-reconnect"

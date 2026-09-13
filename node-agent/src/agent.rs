@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-use tokio_tungstenite::{connect_async_tls_with_config, tungstenite::Message};
+use tokio_tungstenite::{connect_async_tls_with_config, tungstenite, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
 use crate::capacity;
@@ -177,7 +177,27 @@ pub async fn run(cfg: Config) {
     crate::session::homes_gc::spawn_sweeper();
 
     let health = HealthState::new();
-    crate::health::spawn_if_enabled(health.clone());
+    // #152 — a health endpoint another process answers is worse than none. The
+    // stack uses host networking, so agents on one machine share this port; the
+    // loser of the bind used to carry on while its container HEALTHCHECK, and
+    // any operator probing by hand, read the winner's status. Bind before
+    // anything else starts, and treat failure like the other boot-fatal
+    // conditions above — same throttled exit, so a restart loop is bounded.
+    match crate::health::bind_if_enabled() {
+        Ok(Some(listener)) => crate::health::spawn(listener, health.clone()),
+        Ok(None) => {}
+        Err((addr, e)) => {
+            error!(
+                token = "health-bind-failed",
+                "health: failed to bind {addr}: {e} — refusing to start, because a \
+                 health endpoint answered by another process is worse than none. Set \
+                 QUASAR_HEALTH_ADDR to an address of this agent's own, or to an empty \
+                 value to run without the endpoint."
+            );
+            sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
+            std::process::exit(1);
+        }
+    }
 
     // Adopt an already-provisioned NVIDIA driver volume BEFORE anything can touch
     // EGL: the post-restart path (the provisioner exits so a fresh process lands
@@ -246,7 +266,22 @@ pub async fn run(cfg: Config) {
     // running them concurrently is safe.
     spawn_cuda_runtime_provisioner(&runtime);
 
+    // #128: built ONCE, outside the reconnect loop. Everything a running session
+    // needs lives here, so a control-plane restart no longer takes the stream
+    // down with it.
+    let live_refs: LiveRefs = Arc::new(Mutex::new(HashSet::new()));
+    let mut sessions = HostSessions::new(
+        live_refs,
+        health.clone(),
+        nvidia_lib32_probed.to_string(),
+        image_mgr.clone(),
+        release_mgr.clone(),
+    );
+    let grace = session_grace();
+
     let mut backoff = Duration::from_secs(1);
+    // #199: see `EnrollmentFallback` — one token attempt per stale-secret reject.
+    let mut enrollment_fallback = EnrollmentFallback::default();
     loop {
         match connect_and_run(
             &cfg,
@@ -254,35 +289,119 @@ pub async fn run(cfg: Config) {
             &nvidia_lib32_probed,
             &image_mgr,
             &release_mgr,
+            &mut sessions,
+            enrollment_fallback.take_for_attempt(),
         )
         .await
         {
             Ok(()) => {
-                // clean shutdown (shouldn't happen in normal operation)
+                // A clean shutdown IS the end of the agent, so nothing is coming
+                // back to reconcile against: stop the sessions rather than leave
+                // their containers behind.
+                sessions.mgr.stop_all();
                 info!("agent exiting cleanly");
                 return;
             }
             Err(e) => {
                 health.set_connected(false);
-                error!(
-                    token = "agent-connection-failed",
-                    "agent connection failed: {e:#}; reconnecting in {backoff:?}"
-                );
+                // #128: hold the running sessions instead of stopping them. The
+                // media path is agent-to-browser and needs nothing from the
+                // control plane while it is away, and on reconnect the control
+                // plane reconciles against the heartbeat rather than assuming
+                // they all died. Give up only if it does not come back.
+                let held = sessions.running_count();
+                if held > 0 {
+                    if grace.is_zero() {
+                        info!(
+                            token = "session-grace-disabled",
+                            "connection lost with {held} running session(s); grace window is 0, stopping them now"
+                        );
+                        sessions.mgr.stop_all();
+                    } else if sessions.grace_timer.is_none() {
+                        info!(
+                            token = "sessions-held-for-grace",
+                            "connection lost with {held} running session(s); holding them for {grace:?} \
+                             while the control plane comes back"
+                        );
+                        let flags = sessions.stop_flags();
+                        sessions.grace_timer = Some(tokio::spawn(async move {
+                            tokio::time::sleep(grace).await;
+                            warn!(
+                                token = "session-grace-expired",
+                                "control plane did not return within the grace window; stopping {} held session(s)",
+                                flags.len()
+                            );
+                            for f in flags {
+                                f.store(true, Ordering::Relaxed);
+                            }
+                        }));
+                    }
+                }
+                // #199 follow-up: a rate-limited upgrade is downstream of the
+                // refused registers already logged, so it gets its own token and
+                // WARN rather than reading as a fresh, unrelated ERROR.
+                // ONE predicate drives both the token and the counting gate below:
+                // split, the next status added to describe_upgrade_refusal would be
+                // counted-suppressed while still logging as an unexplained ERROR.
+                let explained_refusal = e
+                    .downcast_ref::<UpgradeRefused>()
+                    .is_some_and(|r| describe_upgrade_refusal(r.status).is_some());
+                if explained_refusal {
+                    warn!(
+                        token = "cp-connect-rate-limited",
+                        "agent connection failed: {e:#}"
+                    );
+                } else {
+                    error!(
+                        token = "agent-connection-failed",
+                        "agent connection failed: {e:#}"
+                    );
+                }
+                // #199: a stale-secret reject makes the next attempt present the
+                // enrollment token instead. A refused upgrade carried no credential
+                // at all, so it cannot (and must not) arm this.
+                enrollment_fallback.observe(&e);
                 // One line on the cycle that crosses the threshold: every retry
                 // already logs above, so this fires only when transient becomes
                 // sustained.
-                let failures = health.record_registration_failure(&format!("{e:#}"));
-                if failures == crate::health::UNHEALTHY_AFTER_CONSECUTIVE_FAILURES {
-                    error!(
-                        token = "agent-registration-unhealthy",
-                        "agent has failed to connect/register {failures} times in a row with no \
-                         successful registration since; the health endpoint now reports \
-                         unhealthy so `docker compose ps` surfaces this — check ENROLLMENT_TOKEN \
-                         validity and control-plane reachability"
-                    );
+                if counts_as_registration_failure(explained_refusal, health.unhealthy()) {
+                    let failures = health.record_registration_failure(&format!("{e:#}"));
+                    if failures == crate::health::UNHEALTHY_AFTER_CONSECUTIVE_FAILURES {
+                        error!(
+                            token = "agent-registration-unhealthy",
+                            "agent has failed to connect/register {failures} times in a row with no \
+                             successful registration since; the health endpoint now reports \
+                             unhealthy so `docker compose ps` surfaces this — check ENROLLMENT_TOKEN \
+                             validity and control-plane reachability"
+                        );
+                    }
                 }
-                sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(30));
+                // A connection that actually registered restarts the ramp, so a
+                // long-lived connection dropping does not inherit a 30 s delay
+                // from some earlier outage.
+                if sessions.registered_this_connection {
+                    sessions.registered_this_connection = false;
+                    backoff = Duration::from_secs(1);
+                }
+                // The tight cap exists to reach a returning control plane before the
+                // grace expires. Once it HAS expired there is nothing left to save,
+                // and `running` still holds the stopped sessions until the next
+                // connection prunes them -- so without the is_finished() term the
+                // agent would poll a dead control plane every 5 s forever.
+                let grace_spent = sessions
+                    .grace_timer
+                    .as_ref()
+                    .map(|t| t.is_finished())
+                    .unwrap_or(false);
+                let cap = if sessions.running_count() > 0 && !grace_spent {
+                    HELD_SESSION_BACKOFF_CAP
+                } else {
+                    Duration::from_secs(30)
+                };
+                let wait = backoff.min(cap);
+                info!("reconnecting in {wait:?}");
+                sleep(wait).await;
+                backoff = (wait * 2).min(Duration::from_secs(30));
             }
         }
     }
@@ -700,6 +819,18 @@ pub(crate) fn advertised_codec_throughput(
     report.as_ref().map(|r| r.throughput.clone())
 }
 
+/// How long register preparation may take before the agent says so. Register
+/// preparation (the image reconcile and the install probe, both against the
+/// container runtime) runs before the socket is dialled, so it can no longer eat the
+/// control plane's handshake window — but the window is 15 s (agentws
+/// `handshakeTimeout`), and a runtime slow enough to approach it deserves a log line
+/// naming it rather than a slow, mysterious reconnect (#191).
+const REGISTER_PREP_BUDGET: Duration = Duration::from_secs(10);
+
+fn register_prep_over_budget(elapsed: Duration) -> bool {
+    elapsed > REGISTER_PREP_BUDGET
+}
+
 /// #531: run one synchronous host probe on the blocking pool, never on the runtime
 /// worker polling the agent's control future.
 ///
@@ -858,6 +989,10 @@ async fn connect_and_run(
     nvidia_lib32_probed: &str,
     image_mgr: &Arc<ImageManager>,
     release_mgr: &Arc<ReleaseManager>,
+    sessions: &mut HostSessions,
+    // #199: set for exactly one attempt, by a previous attempt this control plane
+    // refused with `host_not_found`. See `stale_identity`.
+    prefer_enrollment_token: bool,
 ) -> anyhow::Result<()> {
     let url = cfg.ws_url();
     info!(policy = ?cfg.transport, "connecting to {url}");
@@ -871,17 +1006,15 @@ async fn connect_and_run(
         );
     }
 
-    // #12: the connector is chosen by policy, never by tokio-tungstenite's default — a
-    // wss:// URL must not silently validate against the OS/bundled roots when a pin was
-    // configured, and a ws:// URL is explicitly Plain.
-    let (ws_stream, _) = connect_async_tls_with_config(
-        &url,
-        None,
-        false,
-        Some(crate::cp_tls::ws_connector(&cfg.transport)),
-    )
-    .await?;
-    let (mut tx, mut rx) = ws_stream.split();
+    // Everything `register` needs from the container runtime is gathered BEFORE the
+    // socket is opened (#191). The control plane gives a fresh connection its
+    // handshake window (agentws `handshakeTimeout`, 15 s) to send `register`; these
+    // two probes used to run after the dial, and on a host whose docker daemon
+    // answers `inspect` slowly (each is bounded at 30 s) they pushed `register` past
+    // that deadline. The control plane closed the socket without a close frame, the
+    // agent wrote `register` into a dead connection, and every reconnect repeated
+    // the same probes into the same wall.
+    let prep_started = Instant::now();
 
     // agent-api.md: recorded images are verified against the docker daemon on startup
     // AND reconnect — an image `docker rmi`'d out from under a long-lived agent must
@@ -891,6 +1024,43 @@ async fn connect_and_run(
         let mgr = image_mgr.clone();
         tokio::task::spawn_blocking(move || mgr.refresh_register_images()).await?
     };
+
+    // Re-discovered per connection, not once at boot: an updater that starts
+    // after the agent must not leave the host reporting updater_present=false
+    // forever. Offloaded because it shells out to docker.
+    let install = offload_probe(|| {
+        let runtime = ContainerRuntime::from_env();
+        crate::buildinfo::discover_install(&crate::buildinfo::DockerFacts::new(&runtime))
+    })
+    .await;
+    crate::buildinfo::set_install_facts(install.clone());
+
+    let prep = prep_started.elapsed();
+    if register_prep_over_budget(prep) {
+        warn!(
+            token = "register-prep-slow",
+            elapsed_ms = prep.as_millis() as u64,
+            "register preparation (image reconcile + install probe against the container \
+             runtime) took {prep:?} — the container runtime is answering slowly; \
+             registration still proceeds, but sessions on this host will feel it"
+        );
+    }
+
+    // #12: the connector is chosen by policy, never by tokio-tungstenite's default — a
+    // wss:// URL must not silently validate against the OS/bundled roots when a pin was
+    // configured, and a ws:// URL is explicitly Plain.
+    // A refused upgrade never reaches `register`, so its status is all the agent gets
+    // to explain the failure with (#199 follow-up); `upgrade_error` is where that
+    // explanation is attached.
+    let (ws_stream, _) = connect_async_tls_with_config(
+        &url,
+        None,
+        false,
+        Some(crate::cp_tls::ws_connector(&cfg.transport)),
+    )
+    .await
+    .map_err(upgrade_error)?;
+    let (mut tx, mut rx) = ws_stream.split();
 
     // Attach this connection's upstream channel to the process-wide ImageManager.
     // Attaching also flushes every op-free record's current state (terminal states
@@ -910,16 +1080,9 @@ async fn connect_and_run(
     let _release_upstream_guard = release_mgr.attach_upstream(release_tx);
 
     // --- Step 1: send register ---
-    let auth = choose_auth(cfg)?;
-    // Re-discovered per connection, not once at boot: an updater that starts
-    // after the agent must not leave the host reporting updater_present=false
-    // forever. Offloaded because it shells out to docker.
-    let install = offload_probe(|| {
-        let runtime = ContainerRuntime::from_env();
-        crate::buildinfo::discover_install(&crate::buildinfo::DockerFacts::new(&runtime))
-    })
-    .await;
-    crate::buildinfo::set_install_facts(install.clone());
+    let auth = choose_auth(cfg, prefer_enrollment_token)?;
+    // Which credential this attempt carries decides what a reject means (#199).
+    let presented_saved_secret = matches!(auth, Auth::Reconnect { .. });
     let register_msg = AgentMsg::Register {
         source_policy_versions: Some(serde_json::json!({"steam_preparation": 1})),
         node_name: cfg.node_name.clone(),
@@ -943,6 +1106,8 @@ async fn connect_and_run(
             node_secret,
             heartbeat_interval_ms,
         } => {
+            // A returned node_secret IS the enrollment signal: reconnect never mints one.
+            let enrolled = node_secret.is_some();
             if let Some(secret) = node_secret {
                 persist_node_secret(&cfg.node_secret_path, &secret)?;
                 info!(
@@ -954,17 +1119,46 @@ async fn connect_and_run(
             }
             // #12: the pin that just verified this connection outlives the enrollment
             // string, so the operator can delete QUASAR_ENROLLMENT from the environment.
-            persist_pin_if_new(cfg);
+            persist_pin_if_new(cfg, enrolled);
             (host_id, heartbeat_interval_ms)
         }
         ControlMsg::Error { code, message } => {
-            anyhow::bail!("control plane rejected register: {code}: {message}");
+            return Err(register_reject_error(
+                cfg,
+                &code,
+                &message,
+                presented_saved_secret,
+            ));
         }
         _ => {
             anyhow::bail!("unexpected message type before registered");
         }
     };
     health.set_connected(true);
+    // #128: the control plane is back, so the sessions held across the outage are
+    // safe. Disarmed HERE rather than at the top of the reconnect loop: doing it
+    // there ran before each connection ATTEMPT, so every failed retry re-armed a
+    // fresh 90 s and a control plane that never returned never stopped anything.
+    sessions.registered_this_connection = true;
+    if let Some(t) = sessions.grace_timer.take() {
+        // is_finished() distinguishes "we beat the deadline" from "we did not".
+        // Aborting a completed task is a no-op, so without this check a control
+        // plane returning at 91 s logged `session-grace-expired` and then
+        // `session-grace-cleared` while the sessions were being torn down --
+        // exactly the pair a live gate reads to decide whether this works.
+        if t.is_finished() {
+            warn!(
+                token = "session-grace-missed",
+                "control plane returned AFTER the grace window; the held sessions were already stopped"
+            );
+        } else {
+            t.abort();
+            info!(
+                token = "session-grace-cleared",
+                "control plane returned within the grace window; held sessions continue"
+            );
+        }
+    }
     // Clear the failure streak before a stale count can flip /health unhealthy.
     health.record_registered();
 
@@ -1060,18 +1254,26 @@ async fn connect_and_run(
     let mut hb_timer = tokio::time::interval(interval);
     hb_timer.tick().await; // discard the immediate first tick
 
-    // #175: home refs mounted by live sessions. The GC reaper consults it so it can
-    // never reap a backing store an active session is using.
-    let live_refs: LiveRefs = Arc::new(Mutex::new(HashSet::new()));
-    let mut mgr = SessionManager::new(
-        live_refs.clone(),
-        health.clone(),
-        gpu_inventory,
-        vram_targets,
-        nvidia_lib32_probed.to_string(),
-        image_mgr.clone(),
-        release_mgr.clone(),
-    );
+    // #128: the session map, its channels and the home refs OUTLIVE this
+    // connection, so sessions survive a control-plane restart. Everything scoped
+    // to one connection is reset here instead of by the struct being rebuilt.
+    let HostSessions {
+        mgr,
+        evt_tx,
+        evt_rx,
+        diagnostic_tx,
+        diagnostic_rx,
+        diagnostic_dropped_interval,
+        diagnostic_dropped_total,
+        registered_this_connection: _,
+        grace_timer: _,
+    } = sessions;
+    mgr.begin_connection(gpu_inventory, vram_targets);
+    // #175: home refs mounted by live sessions. The GC reaper consults it so it
+    // can never reap a backing store an active session is using. Hoisted with the
+    // map: a fresh set would let the next connection's GC reap a home a surviving
+    // session still has mounted.
+    let live_refs: LiveRefs = mgr.live_refs.clone();
     // Cached with the encoder it was probed for, so capacity re-sends reuse it unless
     // a config_update flips the effective encoder and marks it stale.
     mgr.host_codec_report = host_codec_report.clone();
@@ -1120,9 +1322,6 @@ async fn connect_and_run(
     // capacity re-send.
     let mut last_warmup_reserved = false;
     let mut last_source_report: Option<serde_json::Value> = None;
-    let (evt_tx, evt_rx) = mpsc::channel::<(String, SessionEvent)>(CRITICAL_EVENT_CAPACITY);
-    // `Option`-wrapped for `recv_or_disabled`, like the other four receiver arms.
-    let mut evt_rx = Some(evt_rx);
     // Device-lost failures across sessions on this connection: ≥2 within
     // GPU_GLOBAL_WINDOW escalate to a GPU-global drain+restart; one stays per-session.
     let mut gpu_fault = GpuGlobalFaultDetector::default();
@@ -1132,15 +1331,6 @@ async fn connect_and_run(
     let (gpu_fault_tx, gpu_fault_rx) = mpsc::unbounded_channel::<crate::gpu_kmsg::GpuFault>();
     let mut gpu_fault_rx = Some(gpu_fault_rx);
     let _gpu_kmsg_thread = crate::gpu_kmsg::spawn(gpu_fault_tx);
-    let (diagnostic_raw_tx, diagnostic_rx) = mpsc::channel(DIAGNOSTIC_EVENT_CAPACITY);
-    let mut diagnostic_rx = Some(diagnostic_rx);
-    let diagnostic_dropped_interval = Arc::new(AtomicU64::new(0));
-    let diagnostic_dropped_total = Arc::new(AtomicU64::new(0));
-    let diagnostic_tx = DiagnosticEventTx::new(
-        diagnostic_raw_tx,
-        diagnostic_dropped_interval.clone(),
-        diagnostic_dropped_total.clone(),
-    );
 
     // Steam library discovery: the ACF manifest scanner. Per-connection lifetime
     // (aborted by `_library_scan_guard`'s Drop), node_secret auth, never fatal to the
@@ -1232,7 +1422,7 @@ async fn connect_and_run(
                         }];
                     }
                 }
-                send_fresh_capacity(&mut tx, &mut mgr).await?;
+                send_fresh_capacity(&mut tx, &mut *mgr).await?;
             }
 
             _ = hb_timer.tick() => {
@@ -1270,11 +1460,11 @@ async fn connect_and_run(
                 let source_report = mgr.source_policy.as_ref().and_then(|p| p.report());
                 if source_report != last_source_report {
                     last_source_report = source_report;
-                    send_fresh_capacity(&mut tx, &mut mgr).await?;
+                    send_fresh_capacity(&mut tx, &mut *mgr).await?;
                 }
                 if mgr.warmup_reserved() != last_warmup_reserved {
                     last_warmup_reserved = mgr.warmup_reserved();
-                    send_fresh_capacity(&mut tx, &mut mgr).await?;
+                    send_fresh_capacity(&mut tx, &mut *mgr).await?;
                     info!(
                         "re-sent capacity: warm-up encode-slot reservation {}",
                         if last_warmup_reserved { "taken" } else { "released" }
@@ -1307,7 +1497,7 @@ async fn connect_and_run(
                         // A config_update changes the reported effective settings; check
                         // before handle_control consumes ctrl.
                         let was_config_update = matches!(ctrl, ControlMsg::ConfigUpdate { .. });
-                        if let Some(reply) = mgr.handle_control(ctrl, &evt_tx, &diagnostic_tx) {
+                        if let Some(reply) = mgr.handle_control(ctrl, evt_tx, diagnostic_tx) {
                             send(&mut tx, &reply).await?;
                         }
                         if was_config_update {
@@ -1405,7 +1595,7 @@ async fn connect_and_run(
                     send(&mut tx, &capacity_msg).await?;
                 }
             }
-            evt = recv_or_disabled(&mut evt_rx) => {
+            evt = recv_or_disabled(&mut *evt_rx) => {
                 // `None` means every sender is gone — disable the arm.
                 let Some((session_id, event)) = evt else {
                     error!(
@@ -1413,7 +1603,7 @@ async fn connect_and_run(
                         "session-event sender dropped unexpectedly; disabling session-event \
                          handling for the rest of this connection"
                     );
-                    evt_rx = None;
+                    *evt_rx = None;
                     continue;
                 };
                 {
@@ -1450,14 +1640,14 @@ async fn connect_and_run(
                             }
                             // #503: get pending trace events out before the terminal
                             // state — the control plane drops them afterwards.
-                            flush_pending_diagnostics(&mut tx, &mut diagnostic_rx).await?;
+                            flush_pending_diagnostics(&mut tx, &mut *diagnostic_rx).await?;
                             let msg =
                                 mgr.on_event(&session_id, SessionEvent::Stopped { bytes_used, detail });
                             send(&mut tx, &msg).await?;
                             // Console auto-start is level-triggered by capacity, so
                             // re-send immediately after a terminal state rather than
                             // waiting on an unrelated connector/input/storage poll.
-                            send_fresh_capacity(&mut tx, &mut mgr).await?;
+                            send_fresh_capacity(&mut tx, &mut *mgr).await?;
                             info!("re-sent capacity after session stopped for console reconciliation");
                         }
                         SessionEvent::EffectiveMedia(payload) => {
@@ -1517,12 +1707,12 @@ async fn connect_and_run(
                             // `webrtc.remote_description_failed` is emitted by the
                             // runner immediately before this very event.
                             if terminal {
-                                flush_pending_diagnostics(&mut tx, &mut diagnostic_rx).await?;
+                                flush_pending_diagnostics(&mut tx, &mut *diagnostic_rx).await?;
                             }
                             let msg = mgr.on_event(&session_id, other);
                             send(&mut tx, &msg).await?;
                             if terminal {
-                                send_fresh_capacity(&mut tx, &mut mgr).await?;
+                                send_fresh_capacity(&mut tx, &mut *mgr).await?;
                                 info!("re-sent capacity after session failure for console reconciliation");
                             }
                             if gpu_global && !mgr.draining {
@@ -1551,7 +1741,7 @@ async fn connect_and_run(
                     }
                 }
             }
-            diagnostic = recv_or_disabled(&mut diagnostic_rx) => {
+            diagnostic = recv_or_disabled(&mut *diagnostic_rx) => {
                 // `None` means every sender is gone — disable the arm.
                 let Some((session_id, te)) = diagnostic else {
                     error!(
@@ -1559,7 +1749,7 @@ async fn connect_and_run(
                         "diagnostic-event sender dropped unexpectedly; disabling diagnostic \
                          trace forwarding for the rest of this connection"
                     );
-                    diagnostic_rx = None;
+                    *diagnostic_rx = None;
                     continue;
                 };
                 let msg = AgentMsg::SessionTraceEvent {
@@ -1665,6 +1855,121 @@ where
 /// start) and those started (with a stop flag + signaling channel). Owned by
 /// the connection loop — no locking. On disconnect the manager drops; the
 /// control plane reaps non-terminal sessions to failed (invariant #3).
+/// Default grace window: how long running sessions are held after the control
+/// plane goes away, before the agent gives up and stops them (#128).
+///
+/// 90 s covers the ~70 s a `docker compose up -d --force-recreate` of the
+/// control plane takes. It must stay BELOW the control plane's own
+/// `QUASAR_SESSION_GRACE_SECS` (120 s) minus this agent's maximum reconnect
+/// backoff (30 s), or the control plane would terminalise sessions this agent is
+/// still holding and about to re-report.
+const DEFAULT_SESSION_GRACE_SECS: u64 = 90;
+
+/// Reconnect backoff cap WHILE sessions are being held (#128).
+///
+/// The ordinary cap is 30 s, which ramps cumulative attempt times to
+/// 1, 3, 7, 15, 31, 61, 91 s. A control plane back at ~70 s -- the measured
+/// recreate -- would not be contacted until 91 s, one second after the grace
+/// window stopped every session it was holding. Polling every 5 s while
+/// sessions are at stake closes that gap; the cost is a handful of extra
+/// connect attempts against a control plane that is coming back anyway.
+const HELD_SESSION_BACKOFF_CAP: Duration = Duration::from_secs(5);
+
+/// `QUASAR_SESSION_GRACE_SECS`, or the default. `0` disables the hold entirely,
+/// restoring the pre-#128 behaviour of stopping every session the moment the
+/// connection drops.
+fn session_grace() -> Duration {
+    let secs = std::env::var("QUASAR_SESSION_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SESSION_GRACE_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Session state that OUTLIVES a control-plane connection (#128).
+///
+/// Before this existed, `SessionManager` was built inside `connect_and_run` and
+/// dropped with it, and its `Drop` stopped every session. A control-plane
+/// restart therefore ended every stream on the host even though the media path
+/// is agent-to-browser and needs nothing from the control plane while it is
+/// away.
+///
+/// The channels move with the map, and that is not incidental: each runner
+/// thread captures a CLONE of `evt_tx`/`diagnostic_tx` when it is spawned. Keep
+/// the map but rebuild the channels and a survivor's terminal events go into a
+/// dead channel, leaving a finished session wedged in `running` until the
+/// reconcile sweep notices, reported with the wrong state. The dropped-event
+/// counters move for the same reason: the survivors' senders hold clones of
+/// those exact Arcs.
+struct HostSessions {
+    mgr: SessionManager,
+    evt_tx: mpsc::Sender<(String, SessionEvent)>,
+    /// `Option` for `recv_or_disabled`. The sender now lives here too, so the
+    /// "sender gone, disable the arm" path can no longer fire in practice.
+    evt_rx: Option<mpsc::Receiver<(String, SessionEvent)>>,
+    diagnostic_tx: DiagnosticEventTx,
+    diagnostic_rx: Option<mpsc::Receiver<(String, crate::session::runner::TraceEvent)>>,
+    diagnostic_dropped_interval: Arc<AtomicU64>,
+    diagnostic_dropped_total: Arc<AtomicU64>,
+    /// True once a connection has registered. The reconnect ramp restarts from
+    /// 1 s after a working connection drops, instead of resuming wherever the
+    /// previous outage left it.
+    registered_this_connection: bool,
+    /// Armed at the FIRST disconnect and aborted only once a connection has
+    /// registered. Deliberately not re-armed per reconnect attempt: doing that
+    /// reset the window on every retry, so a control plane that never came back
+    /// meant the sessions were held forever.
+    grace_timer: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl HostSessions {
+    fn new(
+        live_refs: LiveRefs,
+        health: Arc<HealthState>,
+        nvidia_lib32_probed: String,
+        image_mgr: Arc<ImageManager>,
+        release_mgr: Arc<ReleaseManager>,
+    ) -> Self {
+        let (evt_tx, evt_rx) = mpsc::channel::<(String, SessionEvent)>(CRITICAL_EVENT_CAPACITY);
+        let (diagnostic_raw_tx, diagnostic_rx) = mpsc::channel(DIAGNOSTIC_EVENT_CAPACITY);
+        let diagnostic_dropped_interval = Arc::new(AtomicU64::new(0));
+        let diagnostic_dropped_total = Arc::new(AtomicU64::new(0));
+        let diagnostic_tx = DiagnosticEventTx::new(
+            diagnostic_raw_tx,
+            diagnostic_dropped_interval.clone(),
+            diagnostic_dropped_total.clone(),
+        );
+        Self {
+            mgr: SessionManager::new(
+                live_refs,
+                health,
+                Vec::new(),
+                Vec::new(),
+                nvidia_lib32_probed,
+                image_mgr,
+                release_mgr,
+            ),
+            evt_tx,
+            evt_rx: Some(evt_rx),
+            diagnostic_tx,
+            diagnostic_rx: Some(diagnostic_rx),
+            diagnostic_dropped_interval,
+            diagnostic_dropped_total,
+            registered_this_connection: false,
+            grace_timer: None,
+        }
+    }
+
+    /// Every running session's stop flag, for the grace-window timer.
+    fn stop_flags(&self) -> Vec<Arc<AtomicBool>> {
+        self.mgr.running.values().map(|h| h.stop.clone()).collect()
+    }
+
+    fn running_count(&self) -> usize {
+        self.mgr.running.len()
+    }
+}
+
 struct SessionManager {
     /// Assigned but not yet started. Aged out by the heartbeat sweep — see
     /// [`PENDING_ASSIGNMENT_TTL`].
@@ -2020,14 +2325,57 @@ impl SessionManager {
         out
     }
 
-    /// Signal every running session to stop when the control-plane connection ends. On
-    /// reconnect the agent presents as fresh and the control plane reconciles its
-    /// sessions to failed, so the local pipelines must tear down too or their
-    /// containers and sidecars orphan.
+    /// Reset the state that belongs to ONE control-plane connection (#128).
+    ///
+    /// The manager now outlives a connection, so anything scoped to the old one
+    /// has to be dropped explicitly rather than by the struct going away.
+    /// `pending` is the load-bearing one: an assignment that never got its
+    /// `session_start` is owned by a control plane that has since restarted, and
+    /// it will re-drive the assign. Everything the caller re-derives per
+    /// connection (readiness, codec report, source policy, warm-up handles) is
+    /// assigned immediately after this and is not cleared here.
+    ///
+    /// `running` is deliberately NOT touched. Surviving those is the whole point.
+    fn begin_connection(
+        &mut self,
+        gpu_inventory: Vec<crate::messages::GpuCapacity>,
+        vram_targets: Vec<VramTarget>,
+    ) {
+        let dropped = self.pending.len();
+        self.pending.clear();
+        self.gpu_inventory = gpu_inventory;
+        self.vram_targets = vram_targets;
+        // The cache indexes by position over the inventory, so it must be
+        // invalidated in lockstep with vram_targets or a sample is attributed to
+        // the wrong physical GPU.
+        self.vram_cache.invalidate();
+        self.draining = false;
+        if dropped > 0 {
+            info!(
+                token = "pending-assignments-dropped",
+                "dropped {dropped} pending assignment(s) from the previous connection; \
+                 the control plane re-drives them"
+            );
+        }
+        if !self.running.is_empty() {
+            info!(
+                token = "sessions-survived-reconnect",
+                "carried {} running session(s) across the control-plane connection",
+                self.running.len()
+            );
+        }
+    }
+
+    /// Signal every running session to stop. Called when the grace window expires
+    /// with no control plane, and on a clean agent shutdown.
+    ///
+    /// Not called on an ordinary disconnect any more (#128): the control plane
+    /// reconciles against `heartbeat.running_sessions` on reconnect, so a session
+    /// the agent is still running is preserved rather than reaped.
     fn stop_all(&self) {
         for (id, h) in &self.running {
             h.stop.store(true, Ordering::Relaxed);
-            info!("connection ended: signalling session {id} to stop");
+            info!("signalling session {id} to stop");
         }
     }
 
@@ -2800,14 +3148,12 @@ impl SessionManager {
     }
 }
 
-impl Drop for SessionManager {
-    /// The manager drops exactly when `connect_and_run` returns, so stopping every
-    /// session here covers all exit paths (clean close, read error, write failure)
-    /// without threading a guard through the message loop.
-    fn drop(&mut self) {
-        self.stop_all();
-    }
-}
+// No `impl Drop for SessionManager`. It used to stop every session, on the
+// reasoning that the manager dropped exactly when `connect_and_run` returned so
+// this covered every exit path. That is precisely why a control-plane restart
+// ended every stream on the host (#128). The manager now outlives a connection,
+// and `run()` decides when to give up: sessions are held for a bounded grace
+// window and stopped only if the control plane does not come back within it.
 
 /// Turn the assign's `AppSpec` into a launchable container spec, or `None` when
 /// no image is set (a bare/compositor-only session).
@@ -2936,7 +3282,29 @@ fn enrollment_reachable(cfg: &Config) -> Result<(), String> {
     }
 }
 
-fn choose_auth(cfg: &Config) -> anyhow::Result<Auth> {
+/// The configured enrollment token, whitespace-only folded to `None` — the same
+/// view [`enrollment_reachable`] takes, so "can register" and "what to present"
+/// cannot disagree.
+fn configured_enrollment_token(cfg: &Config) -> Option<&str> {
+    cfg.enrollment_token
+        .as_deref()
+        .filter(|t| !t.trim().is_empty())
+}
+
+/// Pick the credential for one `register`.
+///
+/// A saved node secret normally wins: it is the steady-state credential, and
+/// enrolling again rotates it (and is refused outright against a live agent, #96).
+/// `prefer_enrollment_token` is the single #199 exception — see [`stale_identity`].
+/// It is a *preference*, never a way to make a registerable agent unregisterable:
+/// with no token configured the saved secret is still used.
+fn choose_auth(cfg: &Config, prefer_enrollment_token: bool) -> anyhow::Result<Auth> {
+    let token = configured_enrollment_token(cfg).map(str::to_string);
+    if prefer_enrollment_token {
+        if let Some(enrollment_token) = token.clone() {
+            return Ok(Auth::Enrollment { enrollment_token });
+        }
+    }
     if let Ok(secret) = std::fs::read_to_string(&cfg.node_secret_path) {
         let secret = secret.trim().to_string();
         if !secret.is_empty() {
@@ -2945,10 +3313,8 @@ fn choose_auth(cfg: &Config) -> anyhow::Result<Auth> {
             });
         }
     }
-    match &cfg.enrollment_token {
-        Some(token) => Ok(Auth::Enrollment {
-            enrollment_token: token.clone(),
-        }),
+    match token {
+        Some(enrollment_token) => Ok(Auth::Enrollment { enrollment_token }),
         None => anyhow::bail!(
             "no node_secret at {} and ENROLLMENT_TOKEN not set; cannot register",
             cfg.node_secret_path
@@ -2956,11 +3322,258 @@ fn choose_auth(cfg: &Config) -> anyhow::Result<Auth> {
     }
 }
 
+/// Log a refused `register` and produce the error `connect_and_run` returns.
+///
+/// A function rather than three `bail!`s inline so the #199 loop can be tested without
+/// a socket: this is the same call the live path makes, and its result is what
+/// [`EnrollmentFallback::observe`] reads.
+fn register_reject_error(
+    cfg: &Config,
+    code: &str,
+    message: &str,
+    presented_saved_secret: bool,
+) -> anyhow::Error {
+    // #199: `host_not_found` for a register carrying a SAVED secret is the one reject
+    // the agent can act on itself. The control plane's remedy ("enroll with an
+    // enrollment token") is exactly what the operator already did — the token just
+    // never gets presented while a secret exists on disk.
+    match stale_identity(
+        code,
+        presented_saved_secret,
+        configured_enrollment_token(cfg).is_some(),
+    ) {
+        Some(StaleIdentity::ReEnroll) => {
+            let detail = stale_identity_message(&cfg.node_secret_path, StaleIdentity::ReEnroll);
+            warn!(token = "cp-register-stale-identity", "{detail}");
+            anyhow::Error::new(StaleNodeSecret(format!(
+                "control plane rejected register: {code}: {message} — {detail}"
+            )))
+        }
+        Some(StaleIdentity::Unresolvable) => {
+            let detail = stale_identity_message(&cfg.node_secret_path, StaleIdentity::Unresolvable);
+            error!(
+                token = "cp-register-stale-identity-unresolvable",
+                "{detail}"
+            );
+            anyhow::anyhow!("control plane rejected register: {code}: {message} — {detail}")
+        }
+        None => anyhow::anyhow!("control plane rejected register: {code}: {message}"),
+    }
+}
+
+/// The one piece of credential state the reconnect loop carries between attempts (#199).
+///
+/// Armed by a stale-secret reject, consumed by the very next attempt. The consumption is
+/// the whole point: a latch would keep presenting the enrollment token forever, and a
+/// single-use token that has already been spent would then leave a host that a returning
+/// control plane could still have re-admitted on its saved secret with nothing to offer
+/// it. Alternating costs one extra attempt on the backoff ramp and gives both
+/// credentials a turn.
+#[derive(Default)]
+struct EnrollmentFallback {
+    armed: bool,
+}
+
+impl EnrollmentFallback {
+    /// Hand the arming to the attempt about to be made, and disarm. The attempt AFTER
+    /// this one goes back to the saved secret unless another reject arms it again.
+    fn take_for_attempt(&mut self) -> bool {
+        std::mem::take(&mut self.armed)
+    }
+
+    /// Arm iff this failure was the stale-secret reject. Every other failure — a dead
+    /// socket, a bad token, a TLS pin mismatch — leaves the preference where it is.
+    fn observe(&mut self, err: &anyhow::Error) {
+        if err.downcast_ref::<StaleNodeSecret>().is_some() {
+            self.armed = true;
+        }
+    }
+}
+
+/// The control plane's answer to a reconnect naming a host it has never heard of.
+/// Not an enum value in `agent-api.md` — matched as the string the handler writes.
+const HOST_NOT_FOUND: &str = "host_not_found";
+
+/// What a `host_not_found` reject means for the credential this agent holds (#199).
+///
+/// The reject is *correct* whenever an agent data volume outlives the enrollment
+/// that filled it: the secret inside was minted by a DIFFERENT control plane (or
+/// this host row was deleted), so the new one has never seen the node. What the
+/// control plane cannot know is that the operator already did what its message
+/// asks — an enrollment token is sitting right there in the environment, losing
+/// to the saved secret on every attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleIdentity {
+    /// A token is configured: present it on the next attempt instead. Enrollment
+    /// mints a fresh identity here and overwrites the saved secret, so the
+    /// following reconnect is ordinary.
+    ReEnroll,
+    /// No token: nothing this process can do makes the saved secret valid here.
+    Unresolvable,
+}
+
+/// Classify a rejected `register`. `None` for anything that is not "the saved
+/// secret is unknown here" — notably a `host_not_found` answering a register that
+/// already carried the enrollment token, where re-sending it would be a loop
+/// rather than a recovery.
+fn stale_identity(
+    code: &str,
+    presented_saved_secret: bool,
+    has_enrollment_token: bool,
+) -> Option<StaleIdentity> {
+    if code != HOST_NOT_FOUND || !presented_saved_secret {
+        return None;
+    }
+    Some(if has_enrollment_token {
+        StaleIdentity::ReEnroll
+    } else {
+        StaleIdentity::Unresolvable
+    })
+}
+
+/// The operator-facing line for each case. The control plane's own message cannot
+/// carry this: only the agent knows where its secret is kept.
+fn stale_identity_message(node_secret_path: &str, kind: StaleIdentity) -> String {
+    let cause = format!(
+        "the node secret saved at {node_secret_path} identifies no host on this control plane. \
+         That is what a saved identity from a DIFFERENT control plane looks like — an agent data \
+         volume that outlived an earlier enrollment — or a host row that was deleted here"
+    );
+    match kind {
+        // What is about to happen, not how it will turn out. The enrollment token is
+        // single-use and expiring: a spent one is refused too, and a line promising the
+        // operator that nothing is needed would then repeat next to every failure.
+        StaleIdentity::ReEnroll => format!(
+            "{cause}. Presenting the configured enrollment token on the next attempt instead of \
+             the saved secret. If the control plane accepts it this host gets a fresh identity \
+             there and {node_secret_path} is replaced; if the token has already been used or has \
+             expired, that attempt is refused too and a fresh enrollment string is needed."
+        ),
+        // The volume is NOT named: it is the compose project that decides its name, the
+        // agent cannot see one, and an agent that is not in a container has none.
+        StaleIdentity::Unresolvable => format!(
+            "{cause}, and no enrollment token is configured — every reconnect will be refused the \
+             same way. Clear the saved identity and enroll again: the command from \
+             Admin -> Fleet -> Enroll host does the clearing with QUASAR_RESET_IDENTITY=1, or \
+             stop this agent and delete {node_secret_path} yourself (in a container install that \
+             file is inside the agent's data volume, so removing that volume is the same thing)."
+        ),
+    }
+}
+
+/// `connect_and_run`'s error when a register was refused as [`StaleIdentity::ReEnroll`].
+/// Typed rather than a string so the run loop can act on it without matching prose:
+/// it forces exactly the NEXT attempt to present the enrollment token.
+#[derive(Debug)]
+struct StaleNodeSecret(String);
+
+impl std::fmt::Display for StaleNodeSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StaleNodeSecret {}
+
+/// What the agent has to say about an HTTP status the control plane answered the
+/// WebSocket upgrade with, before any `register` was sent (#199 follow-up).
+///
+/// `429` is the one status the agent can explain better than the transport can: it
+/// is the control plane's enrollment-failure limiter, and by construction the agent
+/// has just watched its own registers be refused ten times in a minute. Logged bare
+/// — `HTTP error: 429 Too Many Requests` — it reads as a second, unrelated fault,
+/// which is exactly how it was reported. Everything else gets `None` and stays an
+/// ordinary connection failure: inventing prose for a status the agent has no
+/// insight into is how a log line starts lying.
+///
+/// The *accounting* deliberately did not change. Not counting the `host_not_found`
+/// rejects that trip the limiter would make `/agent/ws` a rate-unbounded node-name
+/// oracle (an unknown name answers `host_not_found`, a known one `auth_failed`, so
+/// misses would be free), so the limiter keeps counting them and this is presentation.
+fn describe_upgrade_refusal(status: u16) -> Option<&'static str> {
+    match status {
+        429 => Some(
+            "the control plane is rate-limiting this address. Usually that is its \
+             enrollment-failure limiter, tripped by the refused registers above: ten refused \
+             registers with no minute's gap between them, lifting a minute after the LAST \
+             refusal — so a run of refusals on a backoff that never idles a full minute trips it \
+             however long it takes. It also answers 429 when more than ten handshakes from this \
+             address are in flight at once, which is what a fleet of agents behind one NAT can do \
+             on a simultaneous reconnect; in that case there will be no refusals above. Either \
+             way this is a consequence of something else, not a separate fault: the agent keeps \
+             retrying on its backoff and is admitted again once the window passes. Act on what \
+             the refusals said — if a line above reports the saved identity is unresolvable here, \
+             that is the fault to fix; the 429 needs nothing done about it on its own.",
+        ),
+        _ => None,
+    }
+}
+
+/// A WebSocket upgrade the control plane refused with a status
+/// [`describe_upgrade_refusal`] has an explanation for. Carried as a concrete type so
+/// the reconnect loop can recognise it through `anyhow` — the same trick
+/// [`StaleNodeSecret`] uses — and pick its log token and its counting by status.
+#[derive(Debug)]
+struct UpgradeRefused {
+    status: u16,
+    detail: &'static str,
+}
+
+impl std::fmt::Display for UpgradeRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "control plane refused the connection with HTTP {}: {}",
+            self.status, self.detail
+        )
+    }
+}
+
+impl std::error::Error for UpgradeRefused {}
+
+/// Turn a failed WebSocket connect into the error `connect_and_run` returns.
+///
+/// Only an [`Error::Http`](tungstenite::Error::Http) — the upgrade reaching the control
+/// plane and being answered with a plain HTTP response — can carry a status, and only a
+/// status this agent can explain becomes an [`UpgradeRefused`]. Everything else (a dead
+/// socket, a TLS pin mismatch, DNS) passes through unchanged.
+fn upgrade_error(err: tungstenite::Error) -> anyhow::Error {
+    if let tungstenite::Error::Http(resp) = &err {
+        let status = resp.status().as_u16();
+        if let Some(detail) = describe_upgrade_refusal(status) {
+            return anyhow::Error::new(UpgradeRefused { status, detail });
+        }
+    }
+    anyhow::Error::new(err)
+}
+
+/// Whether a failed connect/register cycle should bump
+/// `consecutive_registration_failures` (#199 follow-up).
+///
+/// A refused upgrade is not a registration attempt — no `register` was sent — and the
+/// refusals that caused it were each counted already. Letting it count again buries the
+/// cause: `/health`'s `reason` is the LAST recorded failure, so the 429 would overwrite
+/// the stale-identity line that says what to actually fix.
+///
+/// It is suppressed only once the verdict is already out. An agent that sees nothing
+/// *but* 429s — its own counter reset by a restart, or another agent behind the same
+/// address having spent the budget — has to be able to reach unhealthy, or a host that
+/// never connects would answer `/health` with `ok` forever.
+fn counts_as_registration_failure(refused_upgrade: bool, already_unhealthy: bool) -> bool {
+    !(refused_upgrade && already_unhealthy)
+}
+
 /// Write the verified pin beside the node secret the first time a pinned connection
-/// registers. Never overwrites what a reconnect merely re-learned — the single exception
-/// is a rotation the operator drove through CONTROL_PLANE_FINGERPRINT, which is the one
-/// pin that both differs from the file and has just verified a real handshake.
-fn persist_pin_if_new(cfg: &Config) {
+/// registers. Never overwrites what a reconnect merely re-learned; two cases do
+/// overwrite, and both are a pin that differs from the file AND has just verified a real
+/// handshake:
+///   - a rotation the operator drove through CONTROL_PLANE_FINGERPRINT;
+///   - `enrolled` — this register minted a NEW node identity (#199). The saved pin
+///     belongs to the identity that was just replaced: on the re-enrollment path it is a
+///     DIFFERENT control plane's certificate, and leaving it would strand the host the
+///     moment `QUASAR_ENROLLMENT` is removed from the environment — which is exactly what
+///     the docs tell operators to do once enrolled.
+fn persist_pin_if_new(cfg: &Config, enrolled: bool) {
     let crate::enrollment::TransportPolicy::Pinned(fp) = &cfg.transport else {
         return;
     };
@@ -2974,7 +3587,8 @@ fn persist_pin_if_new(cfg: &Config) {
         return;
     }
     let occupied = std::fs::symlink_metadata(&path).is_ok();
-    let rotating = occupied && cfg.pin_source == Some(crate::enrollment::PinSource::Env);
+    let rotating =
+        occupied && (enrolled || cfg.pin_source == Some(crate::enrollment::PinSource::Env));
     if occupied && !rotating {
         return;
     }
@@ -3327,7 +3941,7 @@ mod tests {
             pin_fixture(0xAB),
             crate::enrollment::PinSource::Blob,
         );
-        persist_pin_if_new(&cfg);
+        persist_pin_if_new(&cfg, false);
 
         let written = std::fs::read_to_string(cfg.pin_path()).unwrap();
         assert_eq!(written.trim(), pin_fixture(0xAB).to_colon_hex());
@@ -3350,7 +3964,7 @@ mod tests {
             let cfg = pinned_cfg(secret_path.to_str().unwrap(), pin_fixture(0xAB), source);
             std::fs::write(cfg.pin_path(), "not-a-fingerprint\n").unwrap();
 
-            persist_pin_if_new(&cfg);
+            persist_pin_if_new(&cfg, false);
             assert_eq!(
                 std::fs::read_to_string(cfg.pin_path()).unwrap(),
                 "not-a-fingerprint\n",
@@ -3372,7 +3986,7 @@ mod tests {
         );
         std::fs::write(cfg.pin_path(), format!("{}\n", pin_fixture(0xAB))).unwrap();
 
-        persist_pin_if_new(&cfg);
+        persist_pin_if_new(&cfg, false);
         assert_eq!(
             std::fs::read_to_string(cfg.pin_path()).unwrap().trim(),
             pin_fixture(0xCD).to_colon_hex()
@@ -3403,7 +4017,7 @@ mod tests {
         );
         std::fs::write(cfg.pin_path(), &lowercase).unwrap();
 
-        persist_pin_if_new(&cfg);
+        persist_pin_if_new(&cfg, false);
         assert_eq!(std::fs::read_to_string(cfg.pin_path()).unwrap(), lowercase);
     }
 
@@ -3415,18 +4029,48 @@ mod tests {
             crate::enrollment::PinSource::Blob,
             crate::enrollment::PinSource::Env,
         ] {
-            let dir = tempfile::tempdir().unwrap();
-            let secret_path = dir.path().join("node-secret");
-            let cfg = pinned_cfg(secret_path.to_str().unwrap(), pin_fixture(0xAB), source);
-            let target = dir.path().join("victim");
-            std::os::unix::fs::symlink(&target, cfg.pin_path()).unwrap();
+            // Both write paths, including the #199 enrollment refresh.
+            for enrolled in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let secret_path = dir.path().join("node-secret");
+                let cfg = pinned_cfg(secret_path.to_str().unwrap(), pin_fixture(0xAB), source);
+                let target = dir.path().join("victim");
+                std::os::unix::fs::symlink(&target, cfg.pin_path()).unwrap();
 
-            persist_pin_if_new(&cfg);
-            assert!(
-                !target.exists(),
-                "{source:?} wrote through the symlink to {target:?}"
-            );
+                persist_pin_if_new(&cfg, enrolled);
+                assert!(
+                    !target.exists(),
+                    "{source:?} enrolled={enrolled} wrote through the symlink to {target:?}"
+                );
+            }
         }
+    }
+
+    /// #199: the re-enrollment fallback mints a new identity on a control plane that is
+    /// not the one whose certificate is pinned in the file beside the old node secret.
+    /// The pin that just verified THIS handshake is the one that must survive.
+    #[test]
+    fn enrolling_again_refreshes_a_pin_left_by_a_previous_control_plane() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        let cfg = pinned_cfg(
+            secret_path.to_str().unwrap(),
+            pin_fixture(0xCD),
+            crate::enrollment::PinSource::Blob,
+        );
+        std::fs::write(cfg.pin_path(), format!("{}\n", pin_fixture(0xAB))).unwrap();
+
+        persist_pin_if_new(&cfg, true);
+        assert_eq!(
+            std::fs::read_to_string(cfg.pin_path()).unwrap().trim(),
+            pin_fixture(0xCD).to_colon_hex()
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .filter(|n| n.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     /// Fixture manifest for `nvidia_volume::Status::Provisioned` — field values
@@ -3606,6 +4250,420 @@ mod tests {
         assert!(enrollment_reachable(&cfg).is_err());
     }
 
+    // ── #199: a saved node secret this control plane never minted ───────────
+    //
+    // The reported failure: a machine enrolled to control plane A is re-enrolled
+    // against control plane B, the agent data volume survives, and `choose_auth`
+    // keeps presenting A's node secret. B answers `host_not_found` forever and the
+    // enrollment token the operator just pasted is never tried.
+
+    #[test]
+    fn stale_identity_re_enrolls_when_a_token_is_configured() {
+        assert_eq!(
+            stale_identity("host_not_found", true, true),
+            Some(StaleIdentity::ReEnroll)
+        );
+    }
+
+    #[test]
+    fn stale_identity_is_unresolvable_without_a_token() {
+        assert_eq!(
+            stale_identity("host_not_found", true, false),
+            Some(StaleIdentity::Unresolvable)
+        );
+    }
+
+    #[test]
+    fn stale_identity_ignores_a_reject_of_an_enrollment_register() {
+        // The fallback already ran (or this was a first enrollment): re-sending the
+        // same token is a loop, not a recovery.
+        assert_eq!(stale_identity("host_not_found", false, true), None);
+    }
+
+    #[test]
+    fn stale_identity_ignores_every_other_code() {
+        for code in ["auth_failed", "protocol_error", "internal_error", ""] {
+            assert_eq!(stale_identity(code, true, true), None, "code {code}");
+        }
+    }
+
+    #[test]
+    fn stale_identity_message_names_the_secret_and_the_remedy() {
+        let re_enroll = stale_identity_message("/var/lib/x/node-secret", StaleIdentity::ReEnroll);
+        assert!(re_enroll.contains("/var/lib/x/node-secret"), "{re_enroll}");
+        assert!(
+            re_enroll.contains("enrollment token"),
+            "the re-enroll line must say what it is about to do: {re_enroll}"
+        );
+        let stuck = stale_identity_message("/var/lib/x/node-secret", StaleIdentity::Unresolvable);
+        assert!(stuck.contains("/var/lib/x/node-secret"), "{stuck}");
+        assert!(
+            stuck.contains("QUASAR_RESET_IDENTITY"),
+            "the unrecoverable line must name the way to clear the identity: {stuck}"
+        );
+    }
+
+    /// Neither line may promise an outcome that has not happened yet. The enrollment
+    /// token is single-use and expiring: when it has been spent the fallback is refused
+    /// too, and a reassuring line would then print beside every failure forever.
+    #[test]
+    fn the_re_enroll_line_does_not_promise_success() {
+        let re_enroll = stale_identity_message("/var/lib/x/node-secret", StaleIdentity::ReEnroll);
+        let lower = re_enroll.to_lowercase();
+        assert!(
+            !lower.contains("no operator action") && !lower.contains("nothing is needed"),
+            "the line promises an outcome it cannot know: {re_enroll}"
+        );
+        assert!(
+            lower.contains("expired") || lower.contains("already been used"),
+            "the line must admit the token can be refused too: {re_enroll}"
+        );
+    }
+
+    /// The agent cannot know its data volume's name — the compose project decides it
+    /// (`QUASAR_PROJECT`), and an agent outside a container has none. Naming one would
+    /// be a remedy that silently points at the wrong volume.
+    #[test]
+    fn no_stale_identity_line_asserts_a_volume_name() {
+        for kind in [StaleIdentity::ReEnroll, StaleIdentity::Unresolvable] {
+            let msg = stale_identity_message("/var/lib/x/node-secret", kind);
+            assert!(
+                !msg.contains("quasar-agent-data") && !msg.contains("docker volume rm"),
+                "{kind:?} asserts a volume name the agent cannot know: {msg}"
+            );
+        }
+    }
+
+    /// The run loop arms the one-shot token fallback by downcasting the error out of
+    /// `connect_and_run`. That only works if `anyhow` keeps the concrete type across the
+    /// bail, which is easy to break by "simplifying" the bail into a formatted string.
+    #[test]
+    fn a_stale_secret_reject_survives_the_anyhow_boundary() {
+        fn rejected() -> anyhow::Result<()> {
+            anyhow::bail!(StaleNodeSecret(
+                "the saved secret is unknown here".to_string()
+            ));
+        }
+        let err = rejected().expect_err("should be an error");
+        assert!(
+            err.downcast_ref::<StaleNodeSecret>().is_some(),
+            "the run loop cannot see the stale-secret reject: {err:#}"
+        );
+        assert!(format!("{err:#}").contains("the saved secret is unknown here"));
+    }
+
+    // ── #199 follow-up: the 429 that follows the refused registers ──────────
+    //
+    // Ten refused registers with no minute's gap between them trip the control
+    // plane's enrollment-failure limiter (its window slides off the LAST
+    // refusal, so a backoff that never idles a full minute trips it however long
+    // it takes), and the WebSocket upgrade is then refused with 429 before any
+    // register is sent. The same 429 also answers an address with more than ten
+    // handshakes in flight, where there are no refusals above it at all. The
+    // operator's complaint was that this reads as a second, unrelated fault. It
+    // is not accounting that is wrong — an uncounted `host_not_found` would turn
+    // `/agent/ws` into a rate-unbounded node-name oracle — it is the presentation.
+
+    #[test]
+    fn a_rate_limited_upgrade_is_explained_as_a_consequence() {
+        let line = describe_upgrade_refusal(429).expect("429 must be explained");
+        let lower = line.to_lowercase();
+        assert!(
+            lower.contains("rate-limit"),
+            "the line must name what the control plane is doing: {line}"
+        );
+        assert!(
+            lower.contains("consequence"),
+            "the line must say this is downstream of the refusals, not a new fault: {line}"
+        );
+        assert!(
+            lower.contains("minute"),
+            "the line must say when it lifts: {line}"
+        );
+        assert!(
+            lower.contains("unresolvable"),
+            "the line must point at the reject above as the thing to act on: {line}"
+        );
+        // The limiter's window slides off the LAST refusal, so "ten inside a
+        // minute" is false — and false in the direction that sends an operator
+        // hunting for another client, which is the misreading this line exists
+        // to stop. An agent on a 30 s backoff trips it in about three minutes.
+        assert!(
+            lower.contains("no minute's gap"),
+            "the line must state the limiter's real rule, not 'ten inside a minute': {line}"
+        );
+        // A 429 is not proof of refused registers: the in-flight cap answers the
+        // same status for a fleet behind one NAT reconnecting together.
+        assert!(
+            lower.contains("in flight"),
+            "the line must name the other thing that answers 429: {line}"
+        );
+    }
+
+    #[test]
+    fn an_unexplained_upgrade_status_gets_no_line() {
+        for status in [503, 502, 500, 401, 404, 200] {
+            assert_eq!(
+                describe_upgrade_refusal(status),
+                None,
+                "status {status} has no explanation to offer"
+            );
+        }
+    }
+
+    /// The run loop reads the status back off the error to choose its token, so the
+    /// refusal has to survive the `anyhow` boundary the same way `StaleNodeSecret` does.
+    #[test]
+    fn a_rate_limited_upgrade_survives_the_anyhow_boundary() {
+        let err = upgrade_error(tungstenite::Error::Http(Box::new(
+            http_response_with_status(429),
+        )));
+        let refusal = err
+            .downcast_ref::<UpgradeRefused>()
+            .expect("the run loop cannot see the refusal");
+        assert_eq!(refusal.status, 429);
+        assert!(
+            format!("{err:#}").contains("429"),
+            "the logged line must still name the status: {err:#}"
+        );
+    }
+
+    /// An upgrade refused with a status the agent has nothing to say about stays an
+    /// ordinary connection failure — generic token, ordinary counting.
+    #[test]
+    fn an_unexplained_upgrade_refusal_stays_an_ordinary_failure() {
+        let err = upgrade_error(tungstenite::Error::Http(Box::new(
+            http_response_with_status(503),
+        )));
+        assert!(
+            err.downcast_ref::<UpgradeRefused>().is_none(),
+            "503 must not be dressed up as an explained refusal: {err:#}"
+        );
+    }
+
+    /// The 429 is not a register: it must not arm the #199 one-shot token fallback,
+    /// or every rate-limited reconnect would spend a single-use enrollment string.
+    #[test]
+    fn a_rate_limited_upgrade_does_not_arm_the_enrollment_fallback() {
+        let mut fallback = EnrollmentFallback::default();
+        fallback.observe(&upgrade_error(tungstenite::Error::Http(Box::new(
+            http_response_with_status(429),
+        ))));
+        assert!(
+            !fallback.take_for_attempt(),
+            "a refused upgrade carried no credential, so it cannot tell the agent to \
+             switch credentials"
+        );
+    }
+
+    /// Counting a rate-limited upgrade as one more registration failure would overwrite
+    /// `/health`'s `reason` with the 429 and bury the reject that caused it. Suppressed
+    /// only once the verdict is already out: a cold agent that sees nothing BUT 429s
+    /// (its own counter reset by a restart, or another agent behind the same address
+    /// spent the budget) must still reach unhealthy rather than report `ok` forever.
+    #[test]
+    fn a_rate_limited_upgrade_stops_counting_once_the_agent_is_already_unhealthy() {
+        assert!(!counts_as_registration_failure(true, true));
+        assert!(counts_as_registration_failure(true, false));
+        assert!(counts_as_registration_failure(false, true));
+        assert!(counts_as_registration_failure(false, false));
+    }
+
+    fn http_response_with_status(status: u16) -> tungstenite::http::Response<Option<Vec<u8>>> {
+        tungstenite::http::Response::builder()
+            .status(status)
+            .body(None)
+            .expect("build response")
+    }
+
+    // ── the reconnect loop's one-shot alternation (#199) ────────────────────
+    //
+    // `EnrollmentFallback` is the loop semantics the commit message, the CHANGELOG and
+    // docs/configuration.md all describe: one token attempt per reject, never a latch.
+    // These drive the same `register_reject_error` the live path calls.
+
+    /// The reported scenario, end to end without a socket: the saved secret goes out,
+    /// the control plane refuses it, the NEXT attempt carries the token.
+    #[test]
+    fn a_stale_secret_reject_makes_the_next_attempt_present_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        std::fs::write(&secret_path, "secret-from-the-other-control-plane\n").unwrap();
+        let cfg = test_cfg(secret_path.to_str().unwrap(), Some("tok-123"));
+        let mut fallback = EnrollmentFallback::default();
+
+        let first = choose_auth(&cfg, fallback.take_for_attempt()).unwrap();
+        assert!(
+            matches!(first, Auth::Reconnect { .. }),
+            "the saved secret goes first: {first:?}"
+        );
+
+        let err = register_reject_error(
+            &cfg,
+            "host_not_found",
+            "node not enrolled",
+            matches!(first, Auth::Reconnect { .. }),
+        );
+        fallback.observe(&err);
+
+        let second = choose_auth(&cfg, fallback.take_for_attempt()).unwrap();
+        assert!(
+            matches!(second, Auth::Enrollment { .. }),
+            "the reject did not arm the token fallback: {second:?}"
+        );
+    }
+
+    /// The arming is CONSUMED, not latched. A spent single-use token is refused too, and
+    /// a latch would leave a host that a returning control plane could still have
+    /// re-admitted on its saved secret with nothing else to offer.
+    #[test]
+    fn the_token_fallback_is_consumed_by_one_attempt_and_does_not_latch() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        std::fs::write(&secret_path, "saved-secret\n").unwrap();
+        let cfg = test_cfg(secret_path.to_str().unwrap(), Some("tok-123"));
+        let mut fallback = EnrollmentFallback::default();
+
+        fallback.observe(&register_reject_error(&cfg, "host_not_found", "", true));
+        assert!(fallback.take_for_attempt(), "the reject should arm it");
+        // The token attempt is refused in its turn — the control plane says nothing
+        // about a saved secret, because none was presented.
+        fallback.observe(&register_reject_error(
+            &cfg,
+            "auth_failed",
+            "authentication failed",
+            false,
+        ));
+        assert!(
+            !fallback.take_for_attempt(),
+            "the token preference latched; the saved secret would never be offered again"
+        );
+        assert!(
+            matches!(choose_auth(&cfg, false).unwrap(), Auth::Reconnect { .. }),
+            "the attempt after a spent token must go back to the saved secret"
+        );
+    }
+
+    /// Two takes on one arming: the second is already false even with no failure in
+    /// between. Pins `take_for_attempt` against being rewritten as a plain read.
+    #[test]
+    fn one_arming_survives_exactly_one_attempt() {
+        let mut fallback = EnrollmentFallback::default();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_cfg(
+            dir.path().join("node-secret").to_str().unwrap(),
+            Some("tok-123"),
+        );
+        fallback.observe(&register_reject_error(&cfg, "host_not_found", "", true));
+        assert!(fallback.take_for_attempt());
+        assert!(
+            !fallback.take_for_attempt(),
+            "the arming outlived its attempt"
+        );
+    }
+
+    /// Only the stale-secret reject arms it. Everything else the loop meets — a dropped
+    /// socket, a bad token, a pin mismatch, and a `host_not_found` answering a register
+    /// that already carried the token — must leave the preference alone.
+    #[test]
+    fn nothing_but_a_stale_secret_reject_arms_the_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        let cfg = test_cfg(secret_path.to_str().unwrap(), Some("tok-123"));
+
+        let cases: Vec<anyhow::Error> = vec![
+            anyhow::anyhow!("connection reset without closing handshake"),
+            register_reject_error(&cfg, "auth_failed", "authentication failed", true),
+            register_reject_error(&cfg, "protocol_error", "expected register", true),
+            // The fallback already ran: re-sending the token is a loop, not a recovery.
+            register_reject_error(&cfg, "host_not_found", "node not enrolled", false),
+        ];
+        for err in cases {
+            let mut fallback = EnrollmentFallback::default();
+            fallback.observe(&err);
+            assert!(
+                !fallback.take_for_attempt(),
+                "armed the token fallback on: {err:#}"
+            );
+        }
+    }
+
+    /// With no token configured there is nothing to fall back to, so the reject must not
+    /// arm anything — the agent reports the stale identity instead.
+    #[test]
+    fn a_stale_secret_reject_arms_nothing_without_a_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        std::fs::write(&secret_path, "saved-secret\n").unwrap();
+        let cfg = test_cfg(secret_path.to_str().unwrap(), None);
+        let mut fallback = EnrollmentFallback::default();
+
+        let err = register_reject_error(&cfg, "host_not_found", "node not enrolled", true);
+        fallback.observe(&err);
+        assert!(!fallback.take_for_attempt());
+        assert!(
+            format!("{err:#}").contains(secret_path.to_str().unwrap()),
+            "the unresolvable reject must name the saved secret: {err:#}"
+        );
+    }
+
+    #[test]
+    fn choose_auth_prefers_the_saved_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        std::fs::write(&secret_path, "saved-secret\n").unwrap();
+        let cfg = test_cfg(secret_path.to_str().unwrap(), Some("tok-123"));
+        match choose_auth(&cfg, false).unwrap() {
+            Auth::Reconnect { node_secret } => assert_eq!(node_secret, "saved-secret"),
+            other => panic!("want Reconnect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn choose_auth_forced_presents_the_token_over_the_saved_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        std::fs::write(&secret_path, "stale-secret\n").unwrap();
+        let cfg = test_cfg(secret_path.to_str().unwrap(), Some("tok-123"));
+        match choose_auth(&cfg, true).unwrap() {
+            Auth::Enrollment { enrollment_token } => assert_eq!(enrollment_token, "tok-123"),
+            other => panic!("want Enrollment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn choose_auth_forced_without_a_token_still_uses_the_saved_secret() {
+        // The force flag is a preference, never a way to make a registerable agent
+        // unregisterable: with no token there is nothing to prefer.
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        std::fs::write(&secret_path, "saved-secret\n").unwrap();
+        let cfg = test_cfg(secret_path.to_str().unwrap(), None);
+        match choose_auth(&cfg, true).unwrap() {
+            Auth::Reconnect { node_secret } => assert_eq!(node_secret, "saved-secret"),
+            other => panic!("want Reconnect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn choose_auth_falls_back_to_the_token_with_no_saved_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        let cfg = test_cfg(secret_path.to_str().unwrap(), Some("tok-123"));
+        match choose_auth(&cfg, false).unwrap() {
+            Auth::Enrollment { enrollment_token } => assert_eq!(enrollment_token, "tok-123"),
+            other => panic!("want Enrollment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn choose_auth_errs_with_neither_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret_path = dir.path().join("node-secret");
+        let cfg = test_cfg(secret_path.to_str().unwrap(), None);
+        assert!(choose_auth(&cfg, false).is_err());
+    }
+
     fn gpu(index: i32, vendor: &str, render_node: Option<&str>) -> crate::messages::GpuCapacity {
         crate::messages::GpuCapacity {
             index,
@@ -3615,6 +4673,7 @@ mod tests {
             encode_slots_total: 2,
             render_node: render_node.map(str::to_string),
             device_path: render_node.map(crate::session::settings::canonicalize_render_node),
+            driver_identity: None,
         }
     }
 
@@ -3653,6 +4712,19 @@ mod tests {
     fn diagnostic_sender() -> DiagnosticEventTx {
         let (tx, _rx) = mpsc::channel(1);
         DiagnosticEventTx::new(tx, Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+    }
+
+    // ---- #191: register preparation runs before the dial ----
+
+    #[test]
+    fn register_prep_budget_sits_inside_the_control_plane_handshake_window() {
+        // agentws handshakeTimeout is 15 s. The budget exists to NAME a slow runtime,
+        // so it must trip before the peer would have given up on a same-window dial.
+        assert!(REGISTER_PREP_BUDGET < Duration::from_secs(15));
+        assert!(!register_prep_over_budget(Duration::from_millis(800)));
+        assert!(register_prep_over_budget(Duration::from_secs(11)));
+        // The field case: one 30 s inspect timeout.
+        assert!(register_prep_over_budget(Duration::from_secs(30)));
     }
 
     /// A throwaway `ImageManager`: an empty state_path means `ImageManager::new`
@@ -4561,6 +5633,76 @@ mod tests {
                 "runner thread for {session_id} never finished"
             );
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// #128: a new connection must not disturb the sessions the agent carried
+    /// across the outage, and must drop the assignments it did not.
+    #[test]
+    fn begin_connection_clears_pending_but_keeps_running_sessions() {
+        // A runner that returns immediately. The handle stays in `running` until
+        // the event loop reconciles it, which this test never runs, so the map is
+        // still populated for the assertion. Deliberately NOT a sleeping runner:
+        // that leaks a live thread for the rest of the suite and it takes the
+        // agent's exclusive container-ownership lease with it, which fails an
+        // unrelated test.
+        let (mut mgr, _live_refs) = manager_with_runner(Arc::new(
+            |_sid, _cfg, _evt, _diag, _stop, _sig, _swap, _display, _capture, _metrics| {},
+        ));
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(8);
+        start_seam_session(&mut mgr, "survivor", &evt_tx);
+        assert_eq!(mgr.running.len(), 1, "setup: one running session");
+
+        // An assignment that never received its session_start.
+        mgr.pending.insert(
+            "orphan".to_string(),
+            PendingAssignment {
+                cfg: assignment_config(EncoderChoice::Openh264, "software"),
+                assigned_at: Instant::now(),
+            },
+        );
+        assert_eq!(mgr.pending.len(), 1, "setup: one pending assignment");
+
+        mgr.begin_connection(Vec::new(), Vec::new());
+
+        assert!(
+            mgr.running.contains_key("survivor"),
+            "a running session must survive the reconnect: that is the whole point of #128"
+        );
+        assert!(
+            mgr.pending.is_empty(),
+            "a pending assignment belongs to the old connection; the control plane re-drives it"
+        );
+    }
+
+    /// #128: the grace window is a knob, and 0 restores the old stop-on-drop
+    /// behaviour rather than meaning "no wait at all by accident".
+    #[test]
+    fn session_grace_reads_its_knob() {
+        let prev = std::env::var("QUASAR_SESSION_GRACE_SECS").ok();
+
+        std::env::remove_var("QUASAR_SESSION_GRACE_SECS");
+        assert_eq!(
+            session_grace(),
+            Duration::from_secs(DEFAULT_SESSION_GRACE_SECS)
+        );
+
+        std::env::set_var("QUASAR_SESSION_GRACE_SECS", "5");
+        assert_eq!(session_grace(), Duration::from_secs(5));
+
+        std::env::set_var("QUASAR_SESSION_GRACE_SECS", "0");
+        assert!(session_grace().is_zero(), "0 must disable the hold");
+
+        // Garbage falls back rather than disabling the hold silently.
+        std::env::set_var("QUASAR_SESSION_GRACE_SECS", "not-a-number");
+        assert_eq!(
+            session_grace(),
+            Duration::from_secs(DEFAULT_SESSION_GRACE_SECS)
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("QUASAR_SESSION_GRACE_SECS", v),
+            None => std::env::remove_var("QUASAR_SESSION_GRACE_SECS"),
         }
     }
 

@@ -24,6 +24,457 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+- **Updating is checked before it starts, put back when it fails, and honest about what it
+  skipped** (#185: #186–#190, closes #184; migration 0083; protocol amendment 9). Every target on
+  Fleet ▸ Releases now carries a **preflight**: is the updater reachable (with the three-way
+  "socket volume not mounted / updater not running / updater not answering" diagnosis), does it
+  see the stack directory, was the container started with the same compose files the updater will
+  recreate it with, do the release's images resolve at the registry, and — for a host — is the
+  agent's health port answered by that agent. A failing check makes the target `preflight_blocked`
+  with the fix named on the card; the fleet Update is refused while the control plane is blocked,
+  and a blocked host is skipped and named. A host's checks are its own readiness checks (Hosts
+  tab ▸ Updates). When a host's new agent container fails its health wait, the **updater restores
+  the previous digest itself**, the result carries the failed container's last log lines, and the
+  history shows an automatic revert beside the failed apply (ADR 0004); the restored agent adopts
+  the apply that replaced it and relays its final state, found on the live gate. A run that skipped a host
+  that was behind ends **`succeeded_partial`**, the banner says which host and why, and **Retry
+  skipped hosts** starts a plain fleet apply linked to the first run.
+- **Quasar can install its own updates** (#122, migration 0081). Settings ▸ Platform updates
+  ▸ "Install updates automatically", off by default. When it is on, a detected release is
+  applied without a click — the control plane first, then every eligible host, through
+  exactly the fleet run the Update button starts. **A release that changes the database is
+  never installed this way**: that is the one case where the control-plane step still empties
+  the instance first, so it waits for a person. Everything else rides through with sessions
+  still streaming (#128/#153), which is what makes this safe to leave on. There is no second
+  schedule to configure — an automatic update happens when release detection next runs, so
+  that job's own schedule is the window. An automatic run is **never forced**: "Update now"
+  is an operator agreeing to end live sessions, and there is no operator. A failed automatic
+  run stops that **release**, not the feature — a newer one is still installed, and applying
+  the failed one by hand clears the block, so one flaky host cannot end automatic updates for
+  an instance. What a pass did, or why it did nothing, is in the detection job's run summary,
+  and a run started this way is marked in Fleet ▸ Releases. Contract: `quasar-protocol`
+  amendment 8.
+
+- A **beta release channel** (#121). Admin ▸ Fleet ▸ Releases now offers a third
+  channel between stable and edge: beta lists the same tagged releases stable
+  does **and the prereleases among them**, so a release candidate can be applied
+  from the console through exactly the path a stable release takes. Beta stores
+  no releases of its own — a prerelease was already detected and cached, stable
+  simply hides it — so switching to or from it re-detects nothing and writes
+  nothing (migration 0079 widens one `CHECK`). Two rules come with it. Ordering
+  on beta is **SemVer precedence**, not publication order, because an rc cut from
+  `develop` and a patch cut from `main` arrive out of version order
+  (`0.2.0-rc.2` < `0.2.0` < `0.2.1-rc.1`; `0.3.0-rc.9` < `0.3.0-rc.10`). And
+  **leaving beta never rolls an instance back**: a release whose version orders
+  below an installed prerelease at the same schema version is not offered on any
+  channel, so an instance on `0.3.0-rc.1` that switches to stable waits, showing
+  `no_release`, until `0.3.0` ships. Contract: `control-api.md` §Platform-release
+  beta channel (amendment 3). Operator guide: `docs/upgrading.md` "Release
+  channels".
+- Quasar can now tell you a release is available without you looking at the
+  console (#123, migration 0080). **Fleet ▸ Releases ▸ Notifications** takes a
+  webhook URL and POSTs one message when the detector finds a release this
+  instance could move to; the body carries `text` and `content` alongside the
+  structured fields, so a Slack, Discord or ntfy incoming webhook renders it
+  with no adapter in between. A **Send test** button exercises the URL before
+  you switch it on, and records nothing, so it can never use up the one
+  notification a real release gets. An optional signing secret
+  (**Secrets → Release notification signing secret**, or
+  `QUASAR_PLATFORM_RELEASE_WEBHOOK_SECRET`) adds an HMAC-SHA256 signature over
+  a timestamped body for a receiver you wrote yourself; Slack, Discord and ntfy
+  authenticate by URL and need none. The same release is never announced twice,
+  a fresh install announces at most the one release it could take rather than
+  its whole back catalogue, and a refused webhook is a line in the detection
+  job's run summary — it never fails detection or holds back the banner.
+  Delivery is `https` only, follows no redirect and refuses any host resolving
+  to a loopback, private or link-local address, so it cannot become a probe of
+  your own network; a LAN receiver therefore needs a public https endpoint in
+  front of it. `docs/upgrading.md` "Release notifications".
+- Platform releases can be signed, and the updater can verify the signature
+  (#120). A release may now publish a second asset,
+  `platform-release-manifest.json.sig`: a detached ed25519 signature over the
+  release manifest's exact bytes, which covers every component image through the
+  digests the manifest already names. Hosts check it as a second gate beside the
+  registry-namespace allowlist, fetching the manifest and signature themselves so
+  a signature can never be supplied by the same party as the digests, and
+  refusing an apply whose signed manifest does not name the digests being asked
+  for. **Both halves are off by default and nothing changes for an existing
+  install**: publishing signs only once the `QUASAR_RELEASE_SIGNING_KEY` secret
+  exists, and hosts verify only once `QUASAR_UPDATER_SIGNATURE_MODE` is set to
+  `verify` or `require`. `verify` refuses a bad signature but accepts an unsigned
+  release, so a fleet can be configured before the first signed release exists;
+  `require` closes it. Several trusted keys at once make a key rotation a period
+  rather than a flag day. Operator procedure, including the CI secret to create
+  and how to rotate: `docs/upgrading.md` "Signing platform releases"; knobs in
+  `docs/configuration.md`; decision record in `docs/adr/0003-release-signatures.md`.
+
+### Changed
+- A fleet update no longer empties the whole instance before it updates the control
+  plane (#153). That drain existed because a control-plane restart used to end every
+  session; #128 removed that, so a release carrying no database migration now takes the
+  control-plane step with sessions still streaming through it, and only each host's own
+  sessions end as that host is updated. A release that **does** carry a migration still
+  drains the fleet first — the held session's row is read back by a binary that has just
+  migrated the database under it, and no migration was ever written to survive that. The
+  confirmation says which of the two you are about to do — and it reads a `migrates` flag
+  the server now serves, rather than working it out itself — and the fleet is still cordoned
+  for the whole run either way. "Update now" on a migrating release now **stops** the
+  instance's sessions and waits for them to be gone, instead of skipping a wait that since
+  #128 nothing else would have satisfied. Even a non-migrating step gives a launch already
+  in flight a moment to land, because that is the one session a restart still loses. "Update now" on a migrating release now **stops** the
+  instance's sessions and waits for them to be gone, instead of skipping a wait that since
+  #128 nothing else would have satisfied. Even a non-migrating step gives a launch already
+  in flight a moment to land, because that is the one session a restart still loses.
+  Contract: `quasar-protocol` amendment 6.
+- **The audit log names the things it is talking about** (#172). Every row served by
+  `GET /v1/admin/activity` now carries a `names` map — id to display name — covering both
+  the row's target and the identifiers inside `details`, so a `session.launched` entry that
+  used to read `session 85d0b6a9` over `{"app_id": "8b1116c8-…", "host_id": "4daeaa27-…"}`
+  now says *Steam* and *gpu-test*. The ids are unchanged and still shown in full in the
+  expanded readout and the CSV: an id is what you paste into a query, a name is what tells
+  you what you are looking at, and the log now carries both. Resolved at read time, like
+  `actor_username`, so a rename shows the current name; where the entity has been deleted
+  the name the emitter stamped at write time is served instead, which is what lets a
+  `user.deleted` or `app.delete` row still say *whose* account or *which* app. Deleting a
+  user now records the username for exactly that reason. On the page: the Target column
+  shows the name, the Detail column shows the mock's `key=value` summary
+  (`app=Steam host=gpu-test`) instead of a repeat of the action, the expanded pane opens
+  with a plain-English sentence, and the action labels behind it were rebuilt from the
+  actions the server actually emits — nine of the old ones named actions that no longer
+  exist. CSV export gains a `target_name` column beside `target_id`.
+  Contract: `quasar-protocol` "Audit-log names" amendment (additive, no migration).
+
+### Fixed
+- **A `429` from the control plane no longer reads as a second, unrelated fault** (#199). When an
+  agent's saved node secret belongs to a control plane that has never seen it, a run of refused
+  registers trips the enrollment-failure limiter and the WebSocket upgrade is refused — and the
+  agent logged that as a bare `agent connection failed: ... HTTP error: 429 Too Many Requests`,
+  with nothing tying it to the refusals above it. It now explains the 429 as the consequence it
+  is, under its own `cp-connect-rate-limited` token: ten refused registers with no minute's gap
+  between them trip it, it lifts a minute after the last refusal, the agent is admitted again on
+  its own backoff, and the fault to act on is whatever the refusals reported. The line also names
+  the other thing that answers 429 — more than ten handshakes in flight from one address, which a
+  fleet behind one NAT can do on a simultaneous reconnect, and where there will be no refusals
+  above it at all. A rate-limited upgrade is also no longer counted as a
+  registration failure once the agent is already reporting unhealthy, so the 429 cannot overwrite
+  the real reason in `/health`. The limiter itself is unchanged: an unknown `node_name` answers
+  `host_not_found` where a known one answers `auth_failed`, so exempting it would make `/agent/ws`
+  a free node-name enumeration oracle.
+- **Restarting the control plane mid-update no longer fails the update, and a long verdict no
+  longer strands one** (#202). An apply waiting for its host's agent to come back read a
+  shutdown as the host never coming back: the attempt was written `timeout`, which is terminal,
+  so the next boot could not resume it — and in the unattended lane a failed release is
+  suppressed, so two restarts in a row quietly blocked automatic updates until an admin applied
+  by hand. The wait now happens before the request id is minted, so a shutdown leaves the
+  attempt where the next boot's adoption picks it up — provided the control plane is back
+  inside the apply's own 15-minute deadline; a longer outage still expires it, as it does any
+  waiting attempt. Separately, an attempt's `output` column refuses an oversized value, a
+  half-a-character one, or one carrying a NUL, rather than truncating it — so a verdict whose
+  8 KiB tail began mid-character, or whose last log lines held binary, could not be written at
+  all and the attempt hung to its 15-minute deadline; every writer now bounds the output, and
+  the four places that spell the 8192 out are pinned to the migration by a test. A failed **revert** also stops borrowing an
+  apply's wording: the updater does restore, but the build it puts back is the one the revert
+  was leaving, and no automatic revert is recorded in the history.
+- **A fleet update that only moves hosts no longer risks leaving one out of scheduling**
+  (#200). The instance-wide cordon a fleet run takes belongs to its control-plane step, so a
+  run whose control plane was already on the release took none and recorded nothing — while
+  the host step it drove still cordoned the host it was about to recreate, leaving the
+  restore to the run that held no record of it. The returning agent's registration masked
+  it: a host whose update was refused **before** any recreate (`updater_absent`, a busy
+  updater, a rejected image namespace) has no agent going away and no registration coming
+  back, and stayed `draining` with nothing that knew to lift it. Such a run now records and
+  takes the cordon for each host as it reaches it — one host, not the fleet — so the run's
+  own finish lifts it, and a control plane that dies mid-run leaves a requirement the next
+  start finds and settles.
+- **Re-enrolling a machine that was enrolled to another control plane now works on the
+  first try** (#199). The node secret minted by the earlier control plane lives in the
+  agent's `quasar-agent-data` volume, which survives a re-run of the installer, and the
+  agent presented that secret in preference to the enrollment token the operator had just
+  pasted. The new control plane had never seen the node, so it answered `host_not_found`
+  forever — with a message ("use enrollment_token to enroll first") naming the very thing
+  the operator had already done — and ten rejects inside a minute then added a `429` that
+  read like a second, unrelated fault. Two changes: the agent, refused with
+  `host_not_found` while holding a saved secret, registers **again with the configured
+  enrollment token** (once per reject, so a control plane that is merely mid-restore still
+  gets the saved secret offered on the attempt after); and the refusal now names the
+  credential it refused rather than the remedy the operator had already applied — with no
+  token configured the agent names the stale secret's path and how to reset it instead of
+  looping silently. The `429` needs no separate fix: a working re-enrollment now costs one
+  reject rather than ten. The enrollment-failure budget deliberately still counts this
+  refusal, because an unknown `node_name` answers `host_not_found` where a known one
+  answers `auth_failed`, and an uncounted miss would make `/agent/ws` a free node-name
+  enumeration oracle. `deploy/enroll-host.sh` gains `--reset-identity` /
+  `QUASAR_RESET_IDENTITY=1` (clear the saved identity and enroll from scratch) and
+  `QUASAR_PROJECT` (the compose project name, which namespaces the identity volume and so
+  selects which saved identity an install uses), says when an identity volume is already
+  present rather than silently reusing it, and its `--help` now states that
+  `--pinnedpubkey` needs `-k` on a self-signed control plane — alone it fails with
+  `self-signed certificate (18)` before the pin is ever checked.
+- **A re-enrollment now saves the certificate pin of the control plane it actually joined**
+  (#199). The pin file beside the node secret was only ever overwritten for an operator-driven
+  `CONTROL_PLANE_FINGERPRINT` rotation, so a host that re-enrolled onto a *second* control
+  plane kept the *first* one's fingerprint: it connected only while the enrollment string was
+  still in its environment, and was stranded the moment that was removed — which is what the
+  docs tell operators to do once enrolled. A register that mints a node secret now refreshes
+  the pin, because it replaces the identity the old pin belonged to and the new pin has just
+  verified a real handshake. A reconnect still never re-learns a pin, and neither path follows
+  a symlink at the pin path.
+- **A failed update no longer promises a rollback nobody tried — or denies one that ran**
+  (#201). The failed-attempt panel on Fleet ▸ Releases carried one fixed line, *"the host is
+  still running whatever it had; nothing was rolled back for it automatically"*, written before
+  the updater restored anything itself. Since ADR 0004 that is false for every failure past the
+  health wait, and a timed-out host is running neither build reliably. The line is now derived
+  from the failure: a rejected or un-pulled release says the host is untouched, a container that
+  did not come up says the updater puts the previous build back itself, a timeout or an updater
+  that stopped answering says what is running there can only be read on the host — and a reason
+  this build does not recognise says nothing at all.
+- **An update whose host never came back now says where the verdict is** (#201). When a host's
+  new agent fails its health wait *and* the updater's automatic restore fails too — one squatted
+  health port does both — no agent is left to relay the updater's result, so the attempt could
+  only expire on its deadline and the console reported `timeout` with an empty output for a
+  double failure the updater had already diagnosed on the host. A timed-out host attempt whose
+  agent is not connected now records what that shape means and the exact command to read the
+  updater's own verdict there, request id included. It distinguishes three cases, because the
+  attempt row does: one that expired before the release was ever sent says so rather than pointing
+  at a result that cannot exist; one that was acked and then went silent says the control plane
+  cannot tell whether the updater received it, gives the read anyway, and explains that a 404
+  there means it never did; and one that got further names the double failure as the likeliest —
+  not the only — reading. `docs/upgrading.md` carries the same recipe.
+- **A busy Docker host no longer makes the agent report its own container runtime as
+  unresponsive** (#194). Every container-runtime command the agent runs had its output
+  read only after the child exited, so a command printing more than one pipe buffer's
+  worth of output blocked in `write(2)`, never exited, and was killed at the 30 s deadline
+  with "container runtime unresponsive" — blaming a daemon that was answering that same
+  command in hundredths of a second. The buffer is 8 KiB rather than 64 KiB on a host whose
+  root uid has exhausted its pipe-page quota, which dozens of running containers will do,
+  and a bare `docker image inspect`'s JSON clears 8 KiB: an external reporter's agent burnt
+  30 s on every reconnect failing to reconcile one catalog image, and before #191 that cost
+  it its registration. Both pipes are now drained while the command runs — the capture cap
+  discards the excess instead of stalling the writer — and the deadline stays hard even when
+  a process that inherited the pipe outlives the command it came from.
+- **A reconnecting agent no longer replays every updater result it has ever seen** (#193).
+  On each reconnect the node agent re-emitted a `release_state` for every result file in
+  the updater's results directory, including the control plane's own steps (written to
+  the same directory, never applied by the agent), and the control plane answered each of
+  those with a "names another host's attempt" warning — five per reconnect on a stack
+  with a few fleet runs behind it, drowning the warning that check exists to give. The
+  replay stays, narrowed to this agent's own results that are still live or finished
+  within the last two hours; a non-terminal result is always replayed, and a result whose
+  age cannot be read is kept rather than dropped. Nothing is deleted.
+- **An agent on a host whose Docker daemon answers slowly can register again** (#191). The
+  agent opened its WebSocket to the control plane first and only then ran the two
+  container-runtime probes `register` needs (the image reconcile and the install-mode probe,
+  each `docker inspect` bounded at 30 s). The control plane gives a fresh connection 15 s to
+  send `register`, so on such a host it closed the socket before `register` was written, the
+  agent logged "connection reset without closing handshake", reconnected, repeated the same
+  probes, and never came back. Found live by an external reporter straight after a successful
+  control-plane update; the host showed as down with the agent container running. The probes
+  now run before the socket is opened, the agent warns (`register-prep-slow`) when they took
+  more than 10 s, and the control plane's log names the handshake timeout in words instead of
+  a bare `i/o timeout`. The cost: the probes now run on every dial attempt, including while
+  the control plane is down, so a reconnect loop on a slow-runtime host is slower than
+  before rather than impossible.
+
+- `docs/upgrading.md` "Adding it to an existing install" no longer leaves the control plane
+  without the updater's socket. Step 3 brought up only the updater; the compose file also
+  mounts its socket volume into the control plane and the node agent, and a container
+  created before the volume existed keeps running without the mount, so the console said
+  the updater was not installed for the control plane while the agent reported it present.
+  The step now recreates all three. The same page gains a "before applying" check for the
+  agent's health port: since #152 an updated agent refuses to start when `127.0.0.1:9091`
+  is already taken on the host, which an older agent tolerated, so a release apply is the
+  first place that shows.
+- **`redeploy.sh` no longer reports a deploy healthy on evidence it never saw (#177).**
+  Host readiness and the codec plan were initialised to `ok` the moment the node-agent
+  log came back non-empty, *before* anything looked for a verdict — so a log carrying no
+  readiness verdict at all summarised as a confident `result=OK`, and so did a log with
+  no agent logs to read. Worse, the verdict the agent emits mid-provision (`no failures;
+  N check(s) are being remediated automatically and are not usable yet`) was missing from
+  the classifier entirely, which is the commonest first-boot redeploy there is. Absence
+  of evidence is now its own state: the summary reports `readiness=unverified` /
+  `codecs=unverified` and downgrades the result to `WARN`, the mid-provision verdict is
+  classified and reported as `PROVISIONING`, and only the agent's own all-clear earns an
+  `ok`. The verdict is polled for on the same bounded 30s budget the registration check
+  already uses, over a deeper log tail, so a verdict that simply had not landed yet is
+  not mistaken for one that never will.
+- **A fleet run that cannot put the fleet back into scheduling now leaves a recovery
+  requirement the next start acts on (#176, migration 0084).** The terminal state is
+  written before the cordons are lifted, and `ActiveRun` selects only non-terminal runs —
+  so an uncordon that failed, or a process that died in that window, left hosts
+  `draining` with a single ERROR line as the entire record and nothing that would ever
+  look again. Whether a run's scheduling changes were proven undone is now recorded
+  (`platform_apply_runs.cordons_restored_at`, not served), and the control plane sweeps
+  the unfinished ones once at start: bounded, idempotent, and still putting an admin's
+  own cordon back rather than lifting it. A failure that persists stays outstanding for
+  the next start instead of being swallowed.
+- **A migrating fleet update can no longer run its migration on a session count it
+  never read (#175).** `FleetNonTerminalSessions` answers a failed read with
+  `(0, error)`, and the wait before the control-plane step was written against the
+  count, so a database error at the wrong moment read exactly like "the fleet has
+  drained". Three places could take it: the first count returned `true` outright
+  ("the count is advisory"), the recount after a forced drain assigned the zero
+  before the error was looked at, and the drain poll did the same and then re-tested
+  its own loop condition against it. Past that wait the database is migrated, and
+  every migration in this repo was authored assuming no session was live. An
+  unreadable count is now held distinct from zero, only a read that *succeeded* and
+  said zero lets the step proceed, and a store that never answers ends the attempt
+  as `timeout` within the existing deadline rather than as a migration over live
+  sessions. A transient failure still costs a healthy run nothing.
+- **The install page's compose template is no longer stale.** `deploy/docker-compose.yml`
+  gained the release-webhook, agent health-address and updater signature knobs without
+  `npm run compose:sync` being re-run, so the quick-start page handed operators a compose
+  file missing knobs the running stack expects — and the `site` CI job failed on every
+  pull request against `develop`, which is what surfaced it.
+- **`make up` no longer crash-loops a fresh local stack.** The local dev overlay defaulted
+  `BOOTSTRAP_ADMIN_PASSWORD` to `local-dev-admin` against username `admin`, and the
+  password policy refuses a password containing its own username, so the control plane
+  died at boot on every new worktree. Contributor-facing only; no released image was
+  affected.
+- **A desktop app created in the admin console now launches** (#171, migration 0082).
+  Every app made in the console against a managed desktop preset (KDE, XFCE) failed in
+  seconds with `app_exited_early`; the app container's own log said
+  `software Vulkan renderer detected`. The image's launch requirements -- `gpu`,
+  `no_new_privileges`, `systempaths_unconfined` -- live on the image catalog entry and
+  reached an app row only when the library provider created the app; the managed preset
+  deliberately carries none of them, and the console's editor wrote `gpu: false` for
+  every new app while believing the flag inert. It is not: the agent passes the GPU into
+  the container only when it is true. The control plane now stamps the managed image's
+  declared values onto the app on every create or edit that touches its spec or preset,
+  and migration 0082 applies the same rule to existing rows. Hand-made presets,
+  preset-less apps and provider-created apps (whose values the provider copied at install)
+  store exactly what they are sent, as before. The `deploy/README.md` paragraph telling
+  operators to copy the three values by hand is gone.
+- A `session.failed` audit entry now names its `app_id` (#171). The row carried the host,
+  the failure code and the state detail but not the app, so a failed launch could not be
+  matched to its app from the audit feed; `session.launched` already carried it. Additive.
+  Contract: `quasar-protocol` "session.failed app_id" amendment (additive, no migration).
+  The audit page's name resolution already covers `details.app_id`, so the row shows the
+  app's name beside it.
+
+- A fleet update no longer fails because a host was offline (#169, #170). Found by a
+  real update on hardware: a live 0.2.3 -> 0.2.5 fleet apply failed at its first host
+  and stopped, leaving the rest of the fleet unattempted -- against the sequencer's own
+  rule that an ineligible host is skipped, not failed. The cause is that `hosts.status`
+  is never corrected across a control-plane restart: the row is marked offline only from
+  the agent connection's own goroutine, so a control plane that exits never marks
+  anything, and the stale sweep only visits hosts with active sessions. Since every fleet
+  run restarts the control plane, "the row says online but no agent is there" is the
+  normal shape of a run rather than an edge case. Eligibility now reads whether the agent
+  is actually connected, not just the stored status, so such a host is skipped with
+  `host_offline` and the run continues. A separate defect fixed alongside it (#170): the
+  cordon restore treated every not-online host as one this run had cordoned, so a host
+  that was already offline before the run could be un-cordoned by it.
+
+- The bench harness no longer reports a healthy stream as black. The peer's luma probe
+  judges a 160x90 canvas with thresholds calibrated on full-frame content, and
+  `Quasar Bench: Ball` is a 20px-radius ball — about 0.06% of a 1080p frame — so a
+  perfectly good Ball stream read `mean=3.5 sd=0.00 "first content never"`, which is
+  indistinguishable from a black picture. Because Ball is the default bench app on more
+  than one host, the same false reading appeared on both the AMD/VA and the 5090/Vulkan
+  paths and looked like a confirmed cross-platform rendering defect; it is what left
+  #128's live gate recording rendering as unproven. Documented in
+  `docs/testing-bench-mode.md`, with the probe's own calibration comment corrected: judge
+  rendering from a full-frame app (Snow, Colour Ripple), and never from Ball.
+
+
+
+- **Intel hosts can register a Vulkan encoder at all** (#126). Mesa's Intel Vulkan
+  driver hides the whole Vulkan Video extension family behind an opt-in instance
+  debug flag. Unset, the device does not advertise `VK_KHR_video_queue`, every other
+  video extension depends on that one, and GStreamer therefore registered no vulkan
+  video element while `vulkansink` still appeared — so the host looked like a working
+  GPU whose encoder supported nothing, which is exactly what the `encoder_codecs`
+  readiness check reported. The image now bakes in `ANV_DEBUG=video-encode` (inert on
+  AMD and NVIDIA, since no other driver reads it), so a `docker exec … gst-inspect-1.0`
+  agrees with the running agent instead of contradicting it, and the agent reconciles
+  that variable against the new `QUASAR_INTEL_VULKAN_VIDEO` knob at startup.
+  **This only changes anything on a host whose encoder is `vulkan`.** Intel's vendor
+  default is still VA, so an Intel operator wanting the Vulkan path has to set
+  `QUASAR_ENCODER=vulkan` as well, and will also want `QUASAR_VULKAN_AV1=0`: ANV has
+  no AV1 encode, so leaving that knob on makes every boot log a
+  `vulkan-codec-plan-degraded` warning pointing at the image contract, which is the
+  wrong place to look on an Intel host. Which Intel parts actually expose a usable
+  encode queue is not established: the pinned Mesa gates the encode extensions on the
+  flag and on the driver's codec build, not on a generation, and nobody on the project
+  has the hardware. Gen12 integrated graphics is the expected target; DG2/Arc is
+  untested. Mesa ships this off by default and does not treat the path as validated,
+  which is what this release is asking Intel users to try.
+
+- **Intel hosts now ship a VA driver** (#126). `mesa-va-drivers` is gallium only
+  (radeonsi/nouveau/virtio/d3d12), so libva had nothing to load on an Intel GPU:
+  `vaInitialize` failed, `vah264lpenc` never registered, and the agent's startup
+  codec probe reported an empty set — on the path that is the *documented default*
+  for Intel. The images now carry `intel-media-driver` (iHD, Gen9+) from RPM Fusion
+  nonfree, plus `libva-utils` so `vainfo` is available inside the agent container.
+  Fedora's in-distro build was measured and rejected: both packages are MIT and BSD,
+  Fedora's source RPM is named `intel-media-driver-free`, and its build is 11.6 MB
+  with a quarter of the AVC/HEVC encode symbol references. That is the same patent
+  split already accepted for AMD via `mesa-va-drivers-freeworld`, on identically
+  licensed code.
+
+- A node agent no longer reports another agent's health as its own (#152). The stack
+  uses host networking, so two agents on one machine share `QUASAR_HEALTH_ADDR`; the
+  loser of that bind kept running while its container `HEALTHCHECK` — and any operator
+  probing by hand — was answered by the winner. In the field this reported a perfectly
+  healthy agent as unhealthy for sixteen hours, with a different process's failure
+  reason attached, and the log was the only thing that disagreed. The agent now refuses
+  to start if it cannot bind the address, `/health` identifies the answering agent by
+  `node` and `pid`, the image's `HEALTHCHECK` follows the configured address instead of
+  hardcoding the default, and the multi-agent overlay gives each extra agent its own.
+- An expired session now signs you out and returns you to the sign-in form, saying
+  so, instead of leaving your library on screen behind a red banner whose "Try
+  again" could not work (#154). The SPA handled a rejected token in exactly one
+  place — the check it makes when a page first loads — so a token that expired
+  while a tab sat open, or one an admin revoked, surfaced as an ordinary "could not
+  load" error over data that was already on screen. A 401 on any authenticated
+  request now ends the session everywhere: local credentials are cleared, so a
+  reload cannot resurrect them, and the signed-in page is unmounted rather than
+  left rendering what the dead token had fetched.
+
+- Sessions now survive a control-plane restart (#128), confirmed on a live 73 s
+  outage with a real browser peer: decode continued at 60 fps with no dropped samples
+  and the session stayed `running` (`docs/reports/2026-09-08-128-session-survival-gate/`). The browser treated any
+  signalling-socket close as a session failure and answered it by minting new
+  coordinates and rebuilding its transport — which destroyed the peer connection
+  that was still carrying the stream, so a session that had survived the outage
+  was killed by its own recovery. Signalling health and media health are now
+  tracked separately: while media is still flowing the client re-attaches
+  signalling **in place**, keeping the peer connections, the input channel and
+  telemetry untouched. Only a dead media path rebuilds the transport. A refused
+  token (4401), an ended session (4404) and a takeover (4410) stay terminal.
+- Encoder certification no longer caps a session with a measurement taken under a
+  different GPU driver. A certification records `encode_ms` for one silicon + driver +
+  encode-stack combination, but nothing on the wire carried that combination, so an old
+  performance cap stayed applicable for its full week after a driver change. Agents now
+  report a per-GPU driver identity (NVIDIA kernel-module version, else the Vulkan
+  driver properties, which cover RADV/AMDVLK/ANV), the control plane stamps it onto each
+  certification row, and the launch path skips rows carrying a different one. A host
+  that reports no identity, and every certification measured before this shipped, stay
+  applicable exactly as before — dropping those caps would start sessions at rungs the
+  host may not sustain (#144, migration 0078).
+- The agent-side and control-plane-side groundwork for the above (#128). The agent now
+  holds its sessions for a bounded grace window instead of stopping them when its
+  websocket drops, and the control plane reconciles against the agent's own
+  `heartbeat.running_sessions` on reconnect rather than assuming none survived,
+  with a stale-host sweep as the backstop. Both were confirmed on a live 72 s
+  outage. **This is not yet end to end**: the browser still re-seats its
+  signalling coordinates after the outage, which tears down the peer connection
+  that was still carrying media, so the session ends anyway. The user-visible fix
+  lands when that is resolved. Knobs `QUASAR_SESSION_GRACE_SECS` on the control
+  plane (120 s) and the agent (90 s). Also closes a pre-existing hole where a host
+  that never came back after a control-plane restart kept its sessions
+  non-terminal and its status online forever, still attracting placements.
+- Encoder certification no longer caps a session using a measurement taken under
+  a different encoder. The certification table is keyed on the encoder, but the
+  batch read the launch path uses did not filter on it and the ranking compared
+  only rung, bitrate and age — so a row measured under NVENC could cap a Vulkan
+  session on the same rung, in either direction. `vulkanh265enc` and
+  `nvcudah265enc` are different silicon paths and their encode times do not
+  transfer. A host that has not reported an encoder still uses every row, since
+  dropping the cap outright would launch at a rung the host may not sustain.
+  Driver identity is a separate follow-up (#144).
+
 ## 0.2.5 — 2026-09-07
 
 ### Fixed

@@ -7,7 +7,6 @@ import {
   segmentCounts,
   segmentPredicate,
   sinceFor,
-  targetLabel,
 } from "./auditFilters";
 
 function item(over: Partial<AdminActivityItem> = {}): AdminActivityItem {
@@ -21,6 +20,7 @@ function item(over: Partial<AdminActivityItem> = {}): AdminActivityItem {
     details: {},
     created_at: "2026-08-08T14:02:11Z",
     severity: "info",
+    names: {},
     ...over,
   };
 }
@@ -108,12 +108,3 @@ describe("actorLabel", () => {
   });
 });
 
-describe("targetLabel", () => {
-  it("is type + short id when an id is present", () => {
-    expect(targetLabel({ target_type: "host", target_id: "h-1234567890" })).toBe("host h-123456");
-  });
-
-  it("is bare type when there is no id", () => {
-    expect(targetLabel({ target_type: "instance", target_id: null })).toBe("instance");
-  });
-});

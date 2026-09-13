@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 	"unicode"
@@ -119,6 +120,19 @@ type Settings struct {
 	ReleaseChannel    string `json:"release_channel"`
 	ReleaseEdgeBranch string `json:"release_edge_branch"`
 
+	// Where a detected platform release is announced outside the console
+	// (migration 0080, #123). The URL is operator-supplied and https-only; the
+	// optional shared secret is NOT here — it is an instance_secrets row, so a
+	// settings read can never carry a credential.
+	ReleaseWebhookEnabled bool   `json:"release_webhook_enabled"`
+	ReleaseWebhookURL     string `json:"release_webhook_url"`
+
+	// Whether a detected platform release is applied without a click (migration
+	// 0081, #122). Off by default. There is deliberately no window setting
+	// beside it: unattended apply fires on a successful platform.release_detect
+	// pass, so the detection job's own schedule is the window.
+	PlatformAutoApply bool `json:"platform_auto_apply"`
+
 	UpdatedBy *string   `json:"updated_by"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -141,6 +155,7 @@ func ValidLibraryDiscoveryIntervalMinutes(n int) bool {
 const (
 	ReleaseChannelStable = "stable"
 	ReleaseChannelEdge   = "edge"
+	ReleaseChannelBeta   = "beta"
 
 	DefaultReleaseEdgeBranch = "develop"
 
@@ -151,7 +166,32 @@ const (
 // ValidReleaseChannel mirrors the instance_settings CHECK so the PATCH handler
 // answers 400 validation_failed instead of a database error.
 func ValidReleaseChannel(c string) bool {
-	return c == ReleaseChannelStable || c == ReleaseChannelEdge
+	return c == ReleaseChannelStable || c == ReleaseChannelEdge || c == ReleaseChannelBeta
+}
+
+// The column is TEXT with no CHECK; this is the contract's bound.
+const MaxReleaseWebhookURLLen = 2048
+
+// ValidReleaseWebhookURL mirrors internal/outbound.CheckURL's first two rules —
+// https only, no userinfo — at the point an admin can still be told, rather
+// than only at send time. The host allowlist cannot be checked here: it is
+// built FROM the configured host, and the dial guard is what contains it.
+//
+// "" is not valid: clearing the URL is the handler's own explicit path.
+func ValidReleaseWebhookURL(raw string) bool {
+	if raw == "" || len(raw) > MaxReleaseWebhookURLLen {
+		return false
+	}
+	if strings.TrimSpace(raw) != raw {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || !u.IsAbs() || u.Scheme != "https" || u.User != nil {
+		return false
+	}
+	// A URL with no host is a request that cannot be built, and Hostname()
+	// strips the port so "https://:8443/x" is caught here rather than at dial.
+	return u.Hostname() != ""
 }
 
 // ValidReleaseEdgeBranch enforces the contract's ref-name rule: non-empty, at
@@ -223,7 +263,11 @@ func (s *Store) Get(ctx context.Context) (Settings, error) {
 			AllowedOrigins:    []string{},
 			ReleaseChannel:    ReleaseChannelStable,
 			ReleaseEdgeBranch: DefaultReleaseEdgeBranch,
-			UpdatedAt:         time.Now().UTC(),
+			// The column defaults: an unconfigured instance announces nothing.
+			ReleaseWebhookEnabled: false,
+			ReleaseWebhookURL:     "",
+			PlatformAutoApply:     false,
+			UpdatedAt:             time.Now().UTC(),
 		}, nil
 	}
 	if err != nil {
@@ -355,6 +399,26 @@ func (s *Store) ReleaseChannel(ctx context.Context) (channel, edgeBranch string,
 	return st.ReleaseChannel, st.ReleaseEdgeBranch, nil
 }
 
+// ReleaseWebhook is the notifier's per-pass read (#123): never cached at boot,
+// so disabling it stops delivery with no restart. A read error reports disabled
+// alongside the error, so a caller that ignores it still fails closed.
+func (s *Store) ReleaseWebhook(ctx context.Context) (enabled bool, rawURL string, err error) {
+	st, err := s.Get(ctx)
+	if err != nil {
+		return false, "", err
+	}
+	return st.ReleaseWebhookEnabled, st.ReleaseWebhookURL, nil
+}
+
+// PlatformAutoApply is the unattended-apply opt-in (#122).
+func (s *Store) PlatformAutoApply(ctx context.Context) (bool, error) {
+	st, err := s.Get(ctx)
+	if err != nil {
+		return false, err
+	}
+	return st.PlatformAutoApply, nil
+}
+
 // --- the single write path ----------------------------------------------------
 
 // settingsColumns is the column list, written once. Adding a column is one
@@ -364,6 +428,7 @@ const settingsColumns = `registration_mode, storage_provider, library_discovery_
 	library_discovery_interval_minutes, library_discovery_appdetails_enabled,
 	mic_capture_enabled, image_update_policy, allowed_origins,
 	release_channel, release_edge_branch,
+	release_webhook_enabled, release_webhook_url, platform_auto_apply,
 	steam_preparation_enabled, steam_preparation_revision::text, updated_by::text, updated_at`
 
 // scanner is the shared surface of pgx.Row and pgx.Rows.
@@ -375,6 +440,7 @@ func scanSettings(row scanner) (Settings, error) {
 		&st.LibraryDiscoveryIntervalMinutes, &st.LibraryDiscoveryAppDetailsEnabled,
 		&st.MicCaptureEnabled, &st.ImageUpdatePolicy, &st.AllowedOrigins,
 		&st.ReleaseChannel, &st.ReleaseEdgeBranch,
+		&st.ReleaseWebhookEnabled, &st.ReleaseWebhookURL, &st.PlatformAutoApply,
 		&st.SteamPreparationEnabled, &st.SteamPreparationRevision, &st.UpdatedBy, &st.UpdatedAt)
 	if err != nil {
 		return Settings{}, err
@@ -401,6 +467,11 @@ type Patch struct {
 	AllowedOrigins                    *[]string
 	ReleaseChannel                    *string
 	ReleaseEdgeBranch                 *string
+	ReleaseWebhookEnabled             *bool
+	// A pointer to a string, and "" is the CLEAR — unlike release_edge_branch,
+	// which is never cleared. "No webhook configured" has to be expressible.
+	ReleaseWebhookURL *string
+	PlatformAutoApply *bool
 }
 
 // ChangedKeys lists the fields this patch sets, for the audit row. Names only —
@@ -422,6 +493,9 @@ func (p Patch) ChangedKeys() []string {
 		{"allowed_origins", p.AllowedOrigins != nil},
 		{"release_channel", p.ReleaseChannel != nil},
 		{"release_edge_branch", p.ReleaseEdgeBranch != nil},
+		{"release_webhook_enabled", p.ReleaseWebhookEnabled != nil},
+		{"release_webhook_url", p.ReleaseWebhookURL != nil},
+		{"platform_auto_apply", p.PlatformAutoApply != nil},
 	} {
 		if f.set {
 			keys = append(keys, f.name)
@@ -435,7 +509,9 @@ func (p Patch) Empty() bool {
 	return p.SteamPreparationEnabled == nil && p.RegistrationMode == nil && p.StorageProvider == nil && p.LibraryDiscoveryEnabled == nil &&
 		p.LibraryDiscoveryIntervalMinutes == nil && p.LibraryDiscoveryAppDetailsEnabled == nil &&
 		p.MicCaptureEnabled == nil && p.ImageUpdatePolicy == nil && p.AllowedOrigins == nil &&
-		p.ReleaseChannel == nil && p.ReleaseEdgeBranch == nil
+		p.ReleaseChannel == nil && p.ReleaseEdgeBranch == nil &&
+		p.ReleaseWebhookEnabled == nil && p.ReleaseWebhookURL == nil &&
+		p.PlatformAutoApply == nil
 }
 
 // Apply writes every provided field in one statement inside one transaction —
@@ -492,6 +568,9 @@ func (s *Store) Apply(ctx context.Context, p Patch, updatedBy string) (st Settin
 		    allowed_origins                      = COALESCE($8::text[],  s.allowed_origins),
 		    release_channel                      = COALESCE($9::text,    s.release_channel),
 		    release_edge_branch                  = COALESCE($10::text,   s.release_edge_branch),
+		    release_webhook_enabled              = COALESCE($13::boolean, s.release_webhook_enabled),
+		    release_webhook_url                  = COALESCE($14::text,    s.release_webhook_url),
+		    platform_auto_apply                  = COALESCE($15::boolean, s.platform_auto_apply),
 		    steam_preparation_enabled = COALESCE($12::boolean, s.steam_preparation_enabled),
  steam_preparation_revision = s.steam_preparation_revision + CASE WHEN $12::boolean IS NOT NULL AND $12::boolean IS DISTINCT FROM s.steam_preparation_enabled THEN 1 ELSE 0 END,
  updated_by                           = $11::uuid
@@ -500,7 +579,8 @@ func (s *Store) Apply(ctx context.Context, p Patch, updatedBy string) (st Settin
 	`, p.RegistrationMode, p.StorageProvider, p.LibraryDiscoveryEnabled,
 		p.LibraryDiscoveryIntervalMinutes, p.LibraryDiscoveryAppDetailsEnabled,
 		p.MicCaptureEnabled, p.ImageUpdatePolicy, origins,
-		p.ReleaseChannel, p.ReleaseEdgeBranch, updatedBy, p.SteamPreparationEnabled))
+		p.ReleaseChannel, p.ReleaseEdgeBranch, updatedBy, p.SteamPreparationEnabled,
+		p.ReleaseWebhookEnabled, p.ReleaseWebhookURL, p.PlatformAutoApply))
 	if err != nil {
 		return Settings{}, false, fmt.Errorf("update instance_settings: %w", err)
 	}

@@ -462,6 +462,14 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			} else {
 				h.log.Debug("heartbeat", "host_id", hostID, "running_sessions", len(hb.RunningSessions))
 			}
+			// #128: the agent's own list is ground truth for this host. Same
+			// connection-lifetime ctx + deadline as the heartbeat write above, so
+			// a stalled store drops the connection instead of parking this read
+			// loop. The coordinator dispatches any corrective stop over Send, not
+			// SendWithAck — THIS loop is what would read the ack.
+			rcCtx, rcCancel := context.WithTimeout(bg, agentDBCallTimeout)
+			h.events.AgentHeartbeat(rcCtx, hostID, hb.RunningSessions)
+			rcCancel()
 			// #383: VRAM telemetry, off the read loop (vramQueue). An absent
 			// gpu_vram key is a no-op — the stored sample ages out.
 			h.vram.enqueue(vramSampleBatch{hostID: hostID, agentMs: hb.TsUnixMs, samples: hb.GPUVram})
@@ -598,7 +606,7 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 	conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	raw, err := readTextMessage(conn)
 	if err != nil {
-		return fail(fmt.Errorf("read: %w", err))
+		return fail(fmt.Errorf("read: %w", describeHandshakeRead(err)))
 	}
 
 	var reg RegisterMsg
@@ -629,7 +637,29 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 				"a live agent is already registered under this node name; stop it before re-enrolling, "+
 					"or enroll under a different node_name")
 		case errors.Is(err, ErrHostNotFound):
-			h.writeError(conn, "host_not_found", "node not enrolled; use enrollment_token to enroll first")
+			// Names the credential that was refused, not just the remedy: the old
+			// wording ("use enrollment_token to enroll first") is exactly what an
+			// operator re-enrolling a machine has already done, and it sent them
+			// looking at the token instead of at the saved secret that is quietly
+			// winning over it (#199). Nothing about the peer's deployment shape
+			// goes in here — this is a pre-auth surface and the control plane
+			// cannot know whether the caller even runs in a container; the agent's
+			// own log names the file and the volume, because it is the one that
+			// knows where they are.
+			//
+			// This still spends the enrollment-failure budget, deliberately. The
+			// two reconnect outcomes are distinguishable by code (unknown
+			// node_name → host_not_found, known → auth_failed), so an uncounted
+			// miss would turn this endpoint into a free node-name enumeration
+			// oracle — the leak agent-api.md §Auth exists to avoid. The operator's
+			// case does not need the exemption: the agent re-registers with its
+			// enrollment token on the very next attempt (#199), so a working
+			// re-enrollment costs one counted reject, not ten.
+			h.writeError(conn, "host_not_found",
+				"the node_secret presented belongs to no host enrolled on this control plane — it "+
+					"was minted by a different control plane, or this host was removed here. Enroll "+
+					"again with an enrollment token, clearing the agent's saved node secret "+
+					"(NODE_SECRET_PATH) first if it has no token configured.")
 		default:
 			h.writeError(conn, "internal_error", "registration failed")
 		}
@@ -688,6 +718,22 @@ func (h *Handler) handleCapacity(ctx context.Context, conn *websocket.Conn, host
 	}
 
 	return h.processCapacity(ctx, hostID, raw)
+}
+
+// describeHandshakeRead names the one register-read failure operators meet in the
+// field: the agent opened the socket and then sent nothing for handshakeTimeout.
+// Before #191 the agent ran its container-runtime probes INSIDE that window, so a
+// slow docker daemon on the host surfaced here as a bare i/o timeout and, on the
+// agent, as "connection reset without closing handshake" — two logs that did not
+// look like the same event. Everything else passes through unchanged.
+func describeHandshakeRead(err error) error {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return fmt.Errorf("no register within %s of the connection opening — an agent "+
+			"whose container runtime answers slowly can take longer than this to prepare "+
+			"its register (#191): %w", handshakeTimeout, err)
+	}
+	return err
 }
 
 func readTextMessage(conn *websocket.Conn) ([]byte, error) {
@@ -819,7 +865,18 @@ func (h *Handler) ConsoleSessionTerminated(ctx context.Context, hostID, sessionI
 	h.consoleAuto.mu.Lock()
 	recordedID, tracked := h.consoleAuto.sessions[hostID]
 	if !tracked || recordedID != sessionID {
+		untrackedConnectors := h.consoleAuto.lastConnectors[hostID]
 		h.consoleAuto.mu.Unlock()
+		// #128: a console session can now outlive the control-plane process that
+		// started it, so after a restart this tracker is empty while the session
+		// is still live. When that session eventually ends, nothing here
+		// recognises it, and before this the console stayed dark until a display
+		// hotplug. Re-evaluate instead of returning: reevalConsole is
+		// level-triggered, so it relaunches only if the display is still present
+		// and nothing is running, and its own backoff paces the retries.
+		if len(untrackedConnectors) > 0 {
+			h.reevalConsole(ctx, hostID, untrackedConnectors, false)
+		}
 		return
 	}
 	delete(h.consoleAuto.sessions, hostID)

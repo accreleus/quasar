@@ -13,6 +13,7 @@ function item(id: number, created_at: string): AdminActivityItem {
     details: {},
     created_at,
     severity: "info",
+    names: {},
   };
 }
 

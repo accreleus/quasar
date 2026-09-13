@@ -2,6 +2,7 @@ package platform
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +13,11 @@ import (
 // §"Platform-release apply".
 
 const testRunID = "33333333-3333-4333-8333-333333333333"
+
+// The schema version the fake store's release carries. Tests place the
+// runner's own version on one side of it or the other to choose whether the
+// release runs a migration (#153).
+const fakeReleaseSchema = 75
 
 // The two reasons amendment 2 appends, at the END of the precedence order.
 func TestPlanReportsRunActiveAndTheControlPlanesOwnUpdater(t *testing.T) {
@@ -72,19 +78,44 @@ type fakeFleetStore struct {
 	release  Release
 	next     int
 	inFlight map[string]bool
-	// Fleet-wide non-terminal sessions, and the cordon calls the run made.
-	sessions int
-	hosts    []HostIdentity
-	cordon   []string
-	uncordon []string
+	// Fleet-wide non-terminal sessions, the subset of those not yet `running`,
+	// and the cordon/drain calls the run made.
+	sessions   int
+	inFlightN  int
+	hosts      []HostIdentity
+	cordon     []string
+	uncordon   []string
+	forceDrain []string
+	// Every sessions_remaining the run recorded, in order: the final value is a
+	// single column, so only the sequence shows what was waited on.
+	remainingLog []int
 	// The run's persisted record of what it found (migration 0076).
 	cordons_ []HostCordon
+	// Whether each run's scheduling cleanup was proven done (migration 0084),
+	// and faults to inject into recording it and into confirming a host's
+	// scheduling state (#176).
+	cordonsRestored map[string]bool
+	markRestoredErr error
+	hostStatusErr   error
+	claims          int
+	// Agent connectivity as the registry would report it, keyed by host id.
+	// Absent = connected: the fake's default host is a live one.
+	disconnected map[string]bool
+	// Release-read fault injection: reads from the releaseErrFrom'th on fail.
+	releaseReads   int
+	releaseErrFrom int
+	// Session-count fault injection (#175): reads in
+	// [sessionsErrFrom, sessionsErrTo] fail, and sessionsErrTo == 0 means "and
+	// every read after that". Counting from 1, as releaseErrFrom does.
+	sessionsReads   int
+	sessionsErrFrom int
+	sessionsErrTo   int
 }
 
 func newFakeFleetStore(force bool) *fakeFleetStore {
 	return &fakeFleetStore{
 		run:      ApplyRun{ID: testRunID, ReleaseID: testReleaseID, State: RunPending, Force: force},
-		release:  Release{ID: testReleaseID, SourceCommit: testCommit, SchemaVersion: 75, Manifest: applyManifest(testCommit, 75)},
+		release:  Release{ID: testReleaseID, SourceCommit: testCommit, SchemaVersion: fakeReleaseSchema, Manifest: applyManifest(testCommit, fakeReleaseSchema)},
 		inFlight: map[string]bool{},
 		hosts: []HostIdentity{
 			{HostID: "h1", NodeName: "gpu-01", Status: "online"},
@@ -104,6 +135,9 @@ func (f *fakeFleetStore) Hosts(context.Context) ([]HostIdentity, error) {
 func (f *fakeFleetStore) HostStatus(_ context.Context, hostID string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.hostStatusErr != nil {
+		return "", f.hostStatusErr
+	}
 	for _, h := range f.hosts {
 		if h.HostID == hostID {
 			return h.Status, nil
@@ -125,16 +159,118 @@ func (f *fakeFleetStore) CordonedHosts(context.Context, string) ([]HostCordon, e
 	return append([]HostCordon(nil), f.cordons_...), nil
 }
 
+func (f *fakeFleetStore) MarkCordonsRestored(_ context.Context, runID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.markRestoredErr != nil {
+		return f.markRestoredErr
+	}
+	if f.cordonsRestored == nil {
+		f.cordonsRestored = map[string]bool{}
+	}
+	f.cordonsRestored[runID] = true
+	return nil
+}
+
+// ClaimUnrestoredCordons mirrors the real store's predicate: terminal, with
+// something recorded in cordoned_hosts, and never stamped. The claim is counted
+// so a test can tell a sweep that ran from one that refused.
+func (f *fakeFleetStore) ClaimUnrestoredCordons(_ context.Context, limit int) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.claims++
+	if !TerminalRunState(f.run.State) || len(f.cordons_) == 0 || f.cordonsRestored[f.run.ID] || limit <= 0 {
+		return nil, nil
+	}
+	return []string{f.run.ID}, nil
+}
+
+// pending is the recovery requirement as the sweep would find it, WITHOUT
+// claiming it — assertions must not consume the queue they are inspecting.
+func (f *fakeFleetStore) pending() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !TerminalRunState(f.run.State) || len(f.cordons_) == 0 || f.cordonsRestored[f.run.ID] {
+		return nil
+	}
+	return []string{f.run.ID}
+}
+
+// pendingIsOutstanding is pending() as a yes/no, for a fixture guard.
+func (f *fakeFleetStore) pendingIsOutstanding() bool { return len(f.pending()) == 1 }
+
+func (f *fakeFleetStore) setRunState(state string) {
+	f.mu.Lock()
+	f.run.State = state
+	f.mu.Unlock()
+}
+
+func (f *fakeFleetStore) claimCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.claims
+}
+
+// restoredCordons is whether the run's cleanup was recorded as proven done.
+func (f *fakeFleetStore) restoredCordons(runID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cordonsRestored[runID]
+}
+
 func (f *fakeFleetStore) FleetNonTerminalSessions(context.Context) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.sessionsReads++
+	if f.sessionsErrFrom > 0 && f.sessionsReads >= f.sessionsErrFrom &&
+		(f.sessionsErrTo == 0 || f.sessionsReads <= f.sessionsErrTo) {
+		// (0, err), exactly as the real store answers a failed count. The zero
+		// IS the defect in #175, so a sentinel here would test a store that
+		// does not exist.
+		return 0, errors.New("session count failed")
+	}
 	return f.sessions, nil
+}
+
+// countReads is how many times the run has asked for the fleet's session count.
+func (f *fakeFleetStore) countReads() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sessionsReads
+}
+
+func (f *fakeFleetStore) FleetInFlightSessions(context.Context) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.inFlightN, nil
 }
 
 func (f *fakeFleetStore) setSessions(n int) {
 	f.mu.Lock()
 	f.sessions = n
 	f.mu.Unlock()
+}
+
+// setInFlight sets the non-terminal-but-not-yet-`running` count — the rows a
+// reconnecting agent fails (#153).
+func (f *fakeFleetStore) setInFlight(n int) {
+	f.mu.Lock()
+	f.inFlightN = n
+	f.mu.Unlock()
+}
+
+// recordedRemaining is every sessions_remaining the run wrote, in order.
+func (f *fakeFleetStore) recordedRemaining() []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.remainingLog...)
+}
+
+// drained is which hosts the run force-drained, in order.
+func (f *fakeFleetStore) drained() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.forceDrain...)
 }
 
 func (f *fakeFleetStore) FailAttempt(_ context.Context, id, reason, _ string) error {
@@ -168,6 +304,18 @@ func (f *fakeFleetStore) cordons() FleetCordons {
 			f.setStatusLocked(hostID, "online")
 			return nil
 		},
+		// Stands in for coordinator.DrainHost(force=true): the sessions on that
+		// host actually end, which is the whole point of the fix — a force that
+		// records the count and ends nothing is what #153 had to correct.
+		Drain: func(_ context.Context, hostID string) error {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			f.forceDrain = append(f.forceDrain, hostID)
+			f.setStatusLocked(hostID, "draining")
+			f.sessions = 0
+			f.inFlightN = 0
+			return nil
+		},
 	}
 }
 
@@ -177,6 +325,39 @@ func (f *fakeFleetStore) setStatusLocked(hostID, status string) {
 			f.hosts[i].Status = status
 		}
 	}
+}
+
+// setHostStatus and hostStatus read/write the fake's idea of a host's
+// scheduling state, which is what a cordon actually changes — `scheduling()`
+// below returns the CALL LOG, and a leaked cordon is a state, not a call.
+func (f *fakeFleetStore) setHostStatus(hostID, status string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.setStatusLocked(hostID, status)
+}
+
+func (f *fakeFleetStore) hostStatus(hostID string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, h := range f.hosts {
+		if h.HostID == hostID {
+			return h.Status
+		}
+	}
+	return ""
+}
+
+// draining is every host currently out of scheduling.
+func (f *fakeFleetStore) draining() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0)
+	for _, h := range f.hosts {
+		if h.Status == "draining" {
+			out = append(out, h.HostID)
+		}
+	}
+	return out
 }
 
 func (f *fakeFleetStore) scheduling() (cordoned, uncordoned []string) {
@@ -222,6 +403,25 @@ func (f *fakeFleetStore) SetRunTarget(_ context.Context, _, target string, hostI
 	f.run.CurrentTarget = &t
 	f.run.CurrentHostID = hostID
 	return nil
+}
+
+func (f *fakeFleetStore) RecordSkip(_ context.Context, _ string, skip RunSkip) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, s := range f.run.Skipped {
+		if s.HostID == skip.HostID {
+			return nil
+		}
+	}
+	f.run.Skipped = append(f.run.Skipped, skip)
+	return nil
+}
+
+// skips is what the run persisted as passed over, in order.
+func (f *fakeFleetStore) skips() []RunSkip {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]RunSkip(nil), f.run.Skipped...)
 }
 
 func (f *fakeFleetStore) FinishRun(_ context.Context, _, state, errText string) error {
@@ -295,6 +495,12 @@ func (f *fakeFleetStore) LastSucceededControlPlaneDigests(context.Context) ([]Co
 func (f *fakeFleetStore) Release(context.Context, string) (Release, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.releaseReads++
+	// Fail from the Nth read on, so a test can let the attempt be created and
+	// still make the drain decision's own read fail.
+	if f.releaseErrFrom > 0 && f.releaseReads >= f.releaseErrFrom {
+		return Release{}, errors.New("release read failed")
+	}
 	return f.release, nil
 }
 
@@ -303,6 +509,7 @@ func (f *fakeFleetStore) NonTerminalSessions(context.Context, string) (int, erro
 func (f *fakeFleetStore) SetWaitingSessions(_ context.Context, id string, n int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.remainingLog = append(f.remainingLog, n)
 	for _, a := range f.attempts {
 		if a.ID != id || TerminalAttemptState(a.State) {
 			continue
@@ -352,13 +559,28 @@ type fakeDrivers struct {
 	// the control-plane attempt's outcome; "" means succeeded.
 	cpOutcome string
 	cpApplied bool
+	// onApply runs at the control-plane step, before it resolves. The fleet
+	// cordon is prepareFleet's, so this is the ONLY moment at which "was the
+	// fleet cordoned for this step" can be asked: by the end of the run the
+	// host steps have cordoned and recorded their own hosts anyway (#200).
+	onApply func()
+	// cordonsLikeTheRunner makes Start take the cordon the REAL per-host
+	// machine takes (apply_runner.go `drive`): cordon unless the host is
+	// already draining, and leave the restore to the run, because this attempt
+	// belongs to one (#140). Without it no fleet test can see the cordon a host
+	// step imposes, which is how #200 stayed invisible here.
+	cordonsLikeTheRunner bool
 }
 
 func (d *fakeDrivers) Start(a Attempt) {
 	d.mu.Lock()
 	d.order = append(d.order, *a.HostID)
 	state := d.outcome[*a.HostID]
+	mirror := d.cordonsLikeTheRunner
 	d.mu.Unlock()
+	if mirror && d.store.hostStatus(*a.HostID) != "draining" {
+		_ = d.store.cordons().Cordon(context.Background(), *a.HostID)
+	}
 	if state == "" {
 		state = AttemptSucceeded
 	}
@@ -372,7 +594,11 @@ func (d *fakeDrivers) Apply(_ context.Context, a Attempt) {
 	d.order = append(d.order, TargetControlPlane)
 	d.cpApplied = true
 	state := d.cpOutcome
+	hook := d.onApply
 	d.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	if state == "" {
 		state = AttemptSucceeded
 	}
@@ -392,12 +618,53 @@ func (d *fakeDrivers) steps() []string {
 	return out
 }
 
+// planningView builds the view by running the REAL PlanRelease over the fake's
+// own host table, so cordoning a host actually moves its status and eligibility
+// is re-derived from it. Every other fleet test injects Target rows directly,
+// which is why #169 — where the run's own cordon changed what the planner saw —
+// could not be expressed before.
+func planningView(f *fakeFleetStore, cpSchema int) func(context.Context) (View, error) {
+	return func(ctx context.Context) (View, error) {
+		hosts, err := f.Hosts(ctx)
+		if err != nil {
+			return View{}, err
+		}
+		f.mu.Lock()
+		for i := range hosts {
+			connected := !f.disconnected[hosts[i].HostID]
+			hosts[i].AgentConnected = &connected
+			hosts[i].AgentVersion = str("0.1.0")
+			hosts[i].SourceCommit = str(commitA)
+			hosts[i].BuiltAt = str("2026-09-01T00:00:00Z")
+			hosts[i].InstallMode = str(InstallRegistry)
+			hosts[i].UpdaterPresent = boolp(true)
+		}
+		rel := f.release
+		f.mu.Unlock()
+		// The fake's release carries no channel or version — it is normally fed
+		// straight to the sequencer, never through `offerable`, which filters on
+		// both. Fill them so the real planner lists it.
+		rel.Channel = ChannelStable
+		if rel.Version == nil {
+			rel.Version = str("0.9.0")
+		}
+		return PlanRelease(PlanInputs{
+			Channel:                 ChannelStable,
+			ControlPlane:            cp(testCommit, cpSchema),
+			Hosts:                   hosts,
+			Releases:                []Release{rel},
+			UpdaterPresent:          true,
+			ControlPlaneInstallMode: str(InstallRegistry),
+		}), nil
+	}
+}
+
 // fleetView builds the view the sequencer reads: the control plane behind, and
 // one target per host with the reason the test wants.
 func fleetView(cpReason string, hosts ...Target) func(context.Context) (View, error) {
 	return func(context.Context) (View, error) {
 		v := View{Channel: ChannelStable}
-		v.Targets = append(v.Targets, target(TargetControlPlane, nil, nil, cpReason))
+		v.Targets = append(v.Targets, target(TargetControlPlane, nil, nil, cpReason, Preflight{State: PreflightUnknown}))
 		v.Targets = append(v.Targets, hosts...)
 		return v, nil
 	}
@@ -405,7 +672,7 @@ func fleetView(cpReason string, hosts ...Target) func(context.Context) (View, er
 
 func hostTarget(id, name, reason string) Target {
 	hostID, nodeName := id, name
-	return target(TargetHost, &hostID, &nodeName, reason)
+	return target(TargetHost, &hostID, &nodeName, reason, Preflight{State: PreflightUnknown})
 }
 
 func testFleet(t *testing.T, store *fakeFleetStore, d *fakeDrivers, view func(context.Context) (View, error)) *FleetRunner {
@@ -414,6 +681,12 @@ func testFleet(t *testing.T, store *fakeFleetStore, d *fakeDrivers, view func(co
 	f.PollWait = time.Millisecond
 	f.Deadline = 2 * time.Second
 	f.AdoptSettle = time.Millisecond
+	f.InFlightSettle = 500 * time.Millisecond
+	// One below the fixture release's schema, so the default fixture is a
+	// MIGRATING release and every case that does not care about #153 keeps
+	// exercising the drain. A case that wants the holding path raises this to
+	// the release's own version.
+	f.SchemaVersion = fakeReleaseSchema - 1
 	t.Cleanup(f.Close)
 	return f
 }
@@ -519,11 +792,12 @@ func TestFleetReportsSkippedHostsAndSucceeds(t *testing.T) {
 	run := runToEnd(t, f, store)
 
 	// An ineligibility is not a failure: a run must not go failed because a
-	// host happened to be offline.
-	if run.State != RunSucceeded {
-		t.Fatalf("run state = %q, want succeeded", run.State)
+	// host happened to be offline. But two hosts were left behind, so it is not
+	// a clean success either (amendment 9).
+	if run.State != RunSucceededPartial {
+		t.Fatalf("run state = %q, want succeeded_partial", run.State)
 	}
-	skips := f.Skips(testRunID)
+	skips := store.skips()
 	if len(skips) != 2 {
 		t.Fatalf("skipped = %+v, want two", skips)
 	}
@@ -547,8 +821,8 @@ func TestFleetIgnoresItsOwnRunActiveReason(t *testing.T) {
 	if run.State != RunSucceeded {
 		t.Fatalf("run state = %q, want succeeded", run.State)
 	}
-	if len(f.Skips(testRunID)) != 0 {
-		t.Fatalf("skipped = %+v, want none", f.Skips(testRunID))
+	if len(store.skips()) != 0 {
+		t.Fatalf("skipped = %+v, want none", store.skips())
 	}
 }
 
@@ -615,9 +889,9 @@ func TestFleetResumesAnOpenControlPlaneAttempt(t *testing.T) {
 	}
 }
 
-// The live #117 finding: recreating the control plane ends every session on the
-// instance, so the control-plane target drains the WHOLE fleet first.
-func TestFleetDrainsEverySessionBeforeTheControlPlaneStep(t *testing.T) {
+// A release carrying a migration drains the whole fleet before the
+// control-plane step (prepareFleet has the argument).
+func TestFleetDrainsEverySessionBeforeAMigratingControlPlaneStep(t *testing.T) {
 	store := newFakeFleetStore(false)
 	store.setSessions(2)
 	d := &fakeDrivers{store: store, outcome: map[string]string{}}
@@ -657,7 +931,74 @@ func TestFleetDrainsEverySessionBeforeTheControlPlaneStep(t *testing.T) {
 	})
 }
 
-func TestFleetForceSkipsTheDrain(t *testing.T) {
+// A release that runs no migration takes the control-plane step under live
+// sessions: the run finishes with them still running, and still holds the fleet
+// out of scheduling.
+func TestFleetHoldsSessionsAcrossANonMigratingControlPlaneStep(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.setSessions(3)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+	// Level with the release: it embeds no migration this control plane has
+	// not already run.
+	f.SchemaVersion = fakeReleaseSchema
+
+	// Nothing ever sets the count to zero, so reaching a terminal state at all
+	// is the assertion: the step did not wait.
+	run := runToEnd(t, f, store)
+
+	if run.State != RunSucceeded {
+		t.Fatalf("run state = %q, want succeeded without the fleet ever emptying", run.State)
+	}
+	if got := d.steps(); len(got) != 2 || got[0] != TargetControlPlane || got[1] != "h1" {
+		t.Fatalf("targets reached = %v, want the control plane then the host", got)
+	}
+	if n, _ := store.FleetNonTerminalSessions(context.Background()); n != 3 {
+		t.Fatalf("sessions = %d, want the 3 that were running to still be running", n)
+	}
+	// `sessions_remaining` is what a client tells the operator they are about to
+	// lose, so a step that waits on nothing must not report one.
+	as, _ := store.RunAttempts(context.Background(), testRunID)
+	if len(as) == 0 || as[0].Target != TargetControlPlane {
+		t.Fatalf("attempts = %+v, want the control-plane attempt first", as)
+	}
+	if as[0].SessionsRemaining != nil {
+		t.Fatalf("sessions_remaining = %v, want null: the step waited on nothing", *as[0].SessionsRemaining)
+	}
+	// The fleet is still cordoned for the run's whole life: every host in it is
+	// about to be recreated.
+	if cordoned, _ := store.scheduling(); len(cordoned) != 2 {
+		t.Fatalf("cordoned = %v, want both hosts", cordoned)
+	}
+}
+
+// A release this process cannot read is treated as migrating. Draining a fleet
+// that did not need it costs sessions the operator can see; running a migration
+// under live sessions is the failure nobody sees until later.
+func TestFleetDrainsWhenTheReleaseCannotBeRead(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.setSessions(1)
+	// The first read builds the attempt; the drain decision's read fails.
+	store.releaseErrFrom = 2
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+	f.SchemaVersion = fakeReleaseSchema // would otherwise hold
+
+	f.Start(store.run)
+	waitFor(t, "the control-plane attempt to wait on the fleet", func() bool {
+		as, _ := store.RunAttempts(context.Background(), testRunID)
+		return len(as) == 1 && as[0].State == AttemptWaitingSessions
+	})
+	if steps := d.steps(); len(steps) != 0 {
+		t.Fatalf("targets reached = %v, want nothing sent while the fleet is busy", steps)
+	}
+}
+
+// force on a MIGRATING release ENDS the sessions rather than merely skipping the
+// wait. Pre-#128 the recreate ended them as a side effect and skipping was
+// enough; it no longer does, so a force that only skipped would run the
+// migration under the very sessions it claimed to end (#153).
+func TestFleetForceStopsTheSessionsBeforeAMigratingControlPlaneStep(t *testing.T) {
 	store := newFakeFleetStore(true)
 	store.setSessions(3)
 	d := &fakeDrivers{store: store, outcome: map[string]string{}}
@@ -668,10 +1009,112 @@ func TestFleetForceSkipsTheDrain(t *testing.T) {
 	if run.State != RunSucceeded {
 		t.Fatalf("run state = %q, want succeeded with force", run.State)
 	}
-	// force is the operator agreeing to lose them, and the N is still recorded.
+	// Every host the run recorded was force-drained, and the fleet reached zero
+	// BEFORE the control plane was sent its release.
+	if drained := store.drained(); len(drained) != 2 || drained[0] != "h1" || drained[1] != "h2" {
+		t.Fatalf("force-drained hosts = %v, want both recorded hosts", drained)
+	}
+	if n, _ := store.FleetNonTerminalSessions(context.Background()); n != 0 {
+		t.Fatalf("fleet sessions after a forced migrating step = %d, want 0", n)
+	}
+	// force is the operator agreeing to lose them, and the N is recorded BEFORE
+	// anything ends it — a watcher that only ever saw the post-drain zero would
+	// never learn what the run cost.
 	as, _ := store.RunAttempts(context.Background(), testRunID)
-	if as[0].SessionsRemaining == nil || *as[0].SessionsRemaining != 3 {
-		t.Fatalf("sessions_remaining = %v, want the 3 the operator agreed to lose", as[0].SessionsRemaining)
+	if as[0].SessionsRemaining == nil {
+		t.Fatal("sessions_remaining must be recorded on a forced migrating attempt")
+	}
+	if got := store.recordedRemaining(); len(got) == 0 || got[0] != 3 {
+		t.Fatalf("recorded sessions_remaining = %v, want the 3 that were live first", got)
+	}
+}
+
+// With no Drain wired, force must NOT become "send it anyway": the safe reading
+// of "end them and we cannot" is to wait, exactly as an unforced attempt does.
+func TestFleetForceWithNoDrainWiredStillWaits(t *testing.T) {
+	store := newFakeFleetStore(true)
+	store.setSessions(2)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	cordons := store.cordons()
+	cordons.Drain = nil
+	f := NewFleetRunner(store, d, d, ManifestOrEdge{}, cordons,
+		fleetView("", hostTarget("h1", "gpu-01", "")), testLogger())
+	f.PollWait = time.Millisecond
+	f.Deadline = 300 * time.Millisecond
+	f.AdoptSettle = time.Millisecond
+	f.InFlightSettle = 50 * time.Millisecond
+	f.SchemaVersion = fakeReleaseSchema - 1
+	t.Cleanup(f.Close)
+
+	run := runToEnd(t, f, store)
+
+	if run.State != RunFailed {
+		t.Fatalf("run state = %q, want failed: nothing ended the sessions, so the wait must time out", run.State)
+	}
+	if steps := d.steps(); len(steps) != 0 {
+		t.Fatalf("targets reached = %v, want nothing sent: the migration must not run over live sessions", steps)
+	}
+}
+
+// A non-migrating step no longer drains, but it must still let an in-flight
+// launch land: those rows are what the reconnecting agent fails (#153, MAJOR 2).
+func TestFleetWaitsForInFlightLaunchesOnANonMigratingStep(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.setSessions(2)
+	store.setInFlight(1)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+	f.SchemaVersion = fakeReleaseSchema // not migrating
+
+	f.Start(store.run)
+	// Nothing is sent while a launch is still in flight, even though no
+	// `running` session is at stake.
+	waitFor(t, "the fleet to be cordoned", func() bool {
+		cordoned, _ := store.scheduling()
+		return len(cordoned) == 2
+	})
+	if steps := d.steps(); len(steps) != 0 {
+		t.Fatalf("targets reached = %v, want nothing sent while a launch is in flight", steps)
+	}
+
+	// The launch completes: it is `running` now, so it is no longer in flight and
+	// it survives the recreate.
+	store.setInFlight(0)
+	waitFor(t, "the run to finish", func() bool {
+		r, _ := store.Run(context.Background(), testRunID)
+		return TerminalRunState(r.State)
+	})
+	run, _ := store.Run(context.Background(), testRunID)
+
+	if run.State != RunSucceeded {
+		t.Fatalf("run state = %q, want succeeded", run.State)
+	}
+	// It waited: the attempt never entered waiting_sessions, because nothing
+	// was being lost and no operator consented to anything.
+	as, _ := store.RunAttempts(context.Background(), testRunID)
+	if as[0].SessionsRemaining != nil {
+		t.Fatalf("sessions_remaining = %v, want null on a non-migrating step", as[0].SessionsRemaining)
+	}
+	if n, _ := store.FleetNonTerminalSessions(context.Background()); n != 2 {
+		t.Fatalf("fleet sessions = %d, want the 2 running sessions untouched", n)
+	}
+}
+
+// The settle is bounded: a wedged in-flight row must not hold a release for
+// ever. Expiry proceeds, because the cost of being wrong is a launch that was
+// going to fail anyway.
+func TestFleetProceedsWhenInFlightLaunchesNeverSettle(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.setInFlight(1)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+	f.SchemaVersion = fakeReleaseSchema // not migrating
+	f.InFlightSettle = 20 * time.Millisecond
+
+	run := runToEnd(t, f, store)
+
+	if run.State != RunSucceeded {
+		t.Fatalf("run state = %q, want succeeded past the settle deadline", run.State)
 	}
 }
 
@@ -720,9 +1163,179 @@ func TestFleetDoesNotDrainWhenTheControlPlaneIsUpToDate(t *testing.T) {
 	if run.State != RunSucceeded {
 		t.Fatalf("run state = %q, want succeeded", run.State)
 	}
-	if cordoned, _ := store.scheduling(); len(cordoned) != 0 {
-		t.Fatalf("cordoned = %v, want none: the per-host machine cordons its own", cordoned)
+	// The cordon is per host, not fleet-wide: h2 is in the fake's host table but
+	// not in this run's view, and nothing about a host-only run justifies taking
+	// it out of scheduling.
+	cordoned, _ := store.scheduling()
+	if len(cordoned) != 1 || cordoned[0] != "h1" {
+		t.Fatalf("cordoned = %v, want just the host this run applies to", cordoned)
 	}
+}
+
+// #200. A run whose control plane is already current never goes through
+// prepareFleet, so before this it recorded NOTHING — while the host step it
+// drove still cordoned the host it touched and left the restore to the run
+// (#140). An attempt the updater refuses outright never recreates the agent, so
+// nothing flips the host back: it stays `draining` with nothing that knows to
+// lift it. This is the issue's acceptance line.
+func TestFleetHostOnlyRunRestoresTheCordonOfAFailedHost(t *testing.T) {
+	store := newFakeFleetStore(false)
+	d := &fakeDrivers{store: store, outcome: map[string]string{"h1": AttemptFailed}, cordonsLikeTheRunner: true}
+	f := testFleet(t, store, d, fleetView(ReasonUpToDate, hostTarget("h1", "gpu-01", "")))
+
+	run := runToEnd(t, f, store)
+
+	if run.State != RunFailed {
+		t.Fatalf("run state = %q, want failed", run.State)
+	}
+	// The cordon the run owns is recorded, which is what makes it restorable at
+	// all — by this run's own finish, or by a later start's sweep.
+	recorded, _ := store.CordonedHosts(context.Background(), testRunID)
+	if len(recorded) != 1 || recorded[0].HostID != "h1" || recorded[0].WasCordoned {
+		t.Fatalf("cordon record = %+v, want h1 recorded as this run's own", recorded)
+	}
+	waitFor(t, "h1 to be back in scheduling", func() bool {
+		st, err := store.HostStatus(context.Background(), "h1")
+		return err == nil && st != "draining"
+	})
+}
+
+// The same run against a host the operator had already cordoned: that cordon is
+// not the run's to lift, on this path exactly as on the fleet-wide one (#170).
+func TestFleetHostOnlyRunLeavesAnAdminCordonInPlace(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.hosts[0].Status = "draining"
+	d := &fakeDrivers{store: store, outcome: map[string]string{}, cordonsLikeTheRunner: true}
+	f := testFleet(t, store, d, fleetView(ReasonUpToDate, hostTarget("h1", "gpu-01", "")))
+
+	runToEnd(t, f, store)
+
+	recorded, _ := store.CordonedHosts(context.Background(), testRunID)
+	if len(recorded) != 1 || !recorded[0].WasCordoned {
+		t.Fatalf("cordon record = %+v, want h1 recorded as the operator's", recorded)
+	}
+	if st, _ := store.HostStatus(context.Background(), "h1"); st != "draining" {
+		t.Fatalf("the operator's cordon = %q, want it left in place", st)
+	}
+}
+
+// An OFFLINE host is not a cordon (#170), on this path too: recording it as the
+// operator's would make the run cordon it at restore.
+func TestFleetHostOnlyRunDoesNotReadOfflineAsACordon(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.hosts[0].Status = HostOffline
+	d := &fakeDrivers{store: store, outcome: map[string]string{}, cordonsLikeTheRunner: true}
+	f := testFleet(t, store, d, fleetView(ReasonUpToDate, hostTarget("h1", "gpu-01", "")))
+
+	runToEnd(t, f, store)
+
+	recorded, _ := store.CordonedHosts(context.Background(), testRunID)
+	if len(recorded) != 1 || recorded[0].WasCordoned {
+		t.Fatalf("cordon record = %+v, want h1 recorded as this run's own", recorded)
+	}
+	// The restore is `finish`'s deferred step, after the terminal write.
+	waitFor(t, "h1 to be back in scheduling", func() bool {
+		st, err := store.HostStatus(context.Background(), "h1")
+		return err == nil && st != "draining"
+	})
+}
+
+// Finding 1 of the #200 review. The run reaches a host a STANDALONE attempt
+// (an admin apply or revert, so `RunID == nil`) already holds: that attempt has
+// cordoned it and will restore its own cordon when it ends. The step's record
+// would say `was_cordoned: true` — "the operator had it out of scheduling" —
+// and restoreCordons does not LIFT such an entry, it re-applies it. The run
+// would cordon the host minutes after the other attempt put it back, with
+// nothing left that knows to lift it: #140's shape on a new path. The step
+// undoes itself instead.
+func TestFleetHostOnlyRunDropsTheCordonOfAHostItDoesNotApplyTo(t *testing.T) {
+	store := newFakeFleetStore(false)
+	// Cordoned and owned by an attempt this run did not start.
+	store.hosts[0].Status = "draining"
+	store.inFlight["h1"] = true
+	d := &fakeDrivers{store: store, outcome: map[string]string{}, cordonsLikeTheRunner: true}
+	f := testFleet(t, store, d, fleetView(ReasonUpToDate, hostTarget("h1", "gpu-01", "")))
+
+	run := runToEnd(t, f, store)
+
+	if skips := store.skips(); len(skips) != 1 || skips[0].Reason != ReasonAttemptInFlight {
+		t.Fatalf("skipped = %+v, want h1 with %s", skips, ReasonAttemptInFlight)
+	}
+	if recorded, _ := store.CordonedHosts(context.Background(), testRunID); len(recorded) != 0 {
+		t.Fatalf("cordon record = %+v, want nothing: the run never applied to h1, and an entry here "+
+			"is one restoreCordons would CORDON at finish", recorded)
+	}
+	if !TerminalRunState(run.State) {
+		t.Fatalf("run state = %q, want terminal", run.State)
+	}
+	cordoned, uncordoned := store.scheduling()
+	for _, id := range cordoned {
+		if id == "h1" {
+			t.Fatalf("the run cordoned h1 (calls: %v); its scheduling state belongs to the attempt already in flight", cordoned)
+		}
+	}
+	for _, id := range uncordoned {
+		if id == "h1" {
+			t.Fatalf("the run uncordoned h1 (calls: %v); it never cordoned it", uncordoned)
+		}
+	}
+}
+
+// Finding 2 of the #200 review. A host-only run is interrupted mid-host-phase,
+// and by the time it is adopted a newer release means the control plane is no
+// longer up to date — so this run DOES take a control-plane step. cordonFleet
+// used to skip on any non-empty record, which since #200 can be the single host
+// a host step recorded, and the instance-wide cordon the control-plane step
+// needs would never be taken.
+func TestFleetCordonsTheRestOfTheFleetForALaterControlPlaneStep(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.run.State = RunRunning
+	// What the interrupted host phase left behind: h1 recorded and cordoned by
+	// this run, h2 untouched.
+	if err := store.SetCordonedHosts(context.Background(), testRunID,
+		[]HostCordon{{HostID: "h1", WasCordoned: false}}); err != nil {
+		t.Fatal(err)
+	}
+	store.hosts[0].Status = "draining"
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	// The state AT the control-plane step, which is the only moment that can
+	// answer this: by the end of the run each host step has recorded and
+	// cordoned its own host regardless.
+	var atCPStep []HostCordon
+	var drainingAtCPStep []string
+	d.onApply = func() {
+		atCPStep, _ = store.CordonedHosts(context.Background(), testRunID)
+		drainingAtCPStep = store.draining()
+	}
+	f := testFleet(t, store, d, fleetView("",
+		hostTarget("h1", "gpu-01", ""), hostTarget("h2", "gpu-02", "")))
+	// Non-migrating, so the step does not also wait for a drain.
+	f.SchemaVersion = fakeReleaseSchema
+
+	f.Adopt(context.Background())
+	waitFor(t, "the adopted run to finish", func() bool {
+		r, _ := store.Run(context.Background(), testRunID)
+		return TerminalRunState(r.State)
+	})
+
+	if len(atCPStep) != 2 {
+		t.Fatalf("cordon record at the control-plane step = %+v, want every host: the step is instance-wide, "+
+			"and a record holding one host from an earlier host step is not a recorded fleet", atCPStep)
+	}
+	for _, st := range atCPStep {
+		// h1's entry must survive untouched: re-deriving it from a live status
+		// that reads `draining` records the run's OWN cordon as the operator's
+		// (#140), and it would never be lifted.
+		if st.WasCordoned {
+			t.Fatalf("cordon record = %+v, want no host read as the operator's", atCPStep)
+		}
+	}
+	if len(drainingAtCPStep) != 2 {
+		t.Fatalf("draining at the control-plane step = %v, want the whole fleet out of scheduling", drainingAtCPStep)
+	}
+	waitFor(t, "the fleet to be back in scheduling", func() bool {
+		return len(store.draining()) == 0
+	})
 }
 
 // The run restarts mid-flight, so the fleet cordon is re-established from what
@@ -915,5 +1528,660 @@ func TestFleetAdoptedWithNoRecordTreatsEveryCordonAsItsOwn(t *testing.T) {
 		if st.WasCordoned {
 			t.Fatalf("recorded %s as the operator's cordon, want every cordon read as the run's own", st.HostID)
 		}
+	}
+}
+
+// #169, THE LIVE CASE, through the real planner and a real cordon.
+//
+// A host whose agent is gone but whose row still says `online` — the normal
+// state after any control-plane restart, because nothing corrects an idle host's
+// status across one — must be SKIPPED, not attempted. Before the fix the run
+// cordoned it (status -> draining, which is not `offline`), found it eligible,
+// created an attempt, waited for an agent that never came, failed `timeout`, and
+// stopped: every host behind it was never updated.
+//
+// The existing skip test injects ReasonHostOffline into the view directly, which
+// bypasses the cordon that masked it in production. This one does not.
+func TestFleetSkipsAHostWhoseAgentIsGoneEvenAfterItCordonsIt(t *testing.T) {
+	store := newFakeFleetStore(false)
+	// h1's row says online — stale — but no agent is there. h2 is live.
+	store.disconnected = map[string]bool{"h1": true}
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, planningView(store, fakeReleaseSchema))
+
+	run := runToEnd(t, f, store)
+
+	if run.State != RunSucceededPartial {
+		t.Fatalf("run state = %q, want succeeded_partial — a run must not fail because a host happened to be offline, and must not read as clean either", run.State)
+	}
+	// h2 was updated; h1 was skipped, not attempted.
+	if got := d.steps(); len(got) != 1 || got[0] != "h2" {
+		t.Fatalf("targets reached = %v, want only h2 — h1 has no agent to send to", got)
+	}
+	skips := store.skips()
+	if len(skips) != 1 || skips[0].HostID != "h1" || skips[0].Reason != ReasonHostOffline {
+		t.Fatalf("skipped = %+v, want h1 with %s", skips, ReasonHostOffline)
+	}
+	// And it is left in service, not cordoned: the run lifts what it imposed.
+	waitFor(t, "h1 to be uncordoned", func() bool {
+		st, err := store.HostStatus(context.Background(), "h1")
+		return err == nil && st != "draining"
+	})
+}
+
+// The mirror: a cordon on its own is NOT absence. A host the run has cordoned
+// whose agent is present must still be applied to — otherwise the fix would skip
+// the entire fleet, since a run cordons every host before it starts.
+func TestFleetStillAppliesToACordonedHostWhoseAgentIsPresent(t *testing.T) {
+	store := newFakeFleetStore(false)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, planningView(store, fakeReleaseSchema))
+
+	run := runToEnd(t, f, store)
+
+	if run.State != RunSucceeded {
+		t.Fatalf("run state = %q, want succeeded", run.State)
+	}
+	if got := d.steps(); len(got) != 2 {
+		t.Fatalf("targets reached = %v, want both hosts — cordoned is the condition an apply wants", got)
+	}
+	if skips := store.skips(); len(skips) != 0 {
+		t.Fatalf("skipped = %+v, want none", skips)
+	}
+}
+
+// #170's real bug: only `draining` is a cordon. Recording an OFFLINE host as
+// "the admin cordoned it" meant the run never cordoned it — so it could take a
+// placement the run would destroy — and then CORDONED it at restore, leaving a
+// host nobody cordoned out of scheduling with nothing to lift it.
+func TestFleetDoesNotTreatAnOfflineHostAsAnAdminsCordon(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.hosts[0].Status = HostOffline
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, planningView(store, fakeReleaseSchema))
+
+	runToEnd(t, f, store)
+
+	recorded, _ := store.CordonedHosts(context.Background(), testRunID)
+	for _, st := range recorded {
+		if st.HostID == "h1" && st.WasCordoned {
+			t.Fatal("an offline host was recorded as the admin's cordon; the run will now cordon it at restore " +
+				"and leave a host nobody cordoned out of scheduling")
+		}
+	}
+	// And it must not be left draining.
+	if st, err := store.HostStatus(context.Background(), "h1"); err == nil && st == "draining" {
+		t.Fatal("an offline host was left draining by the run's own restore")
+	}
+}
+
+// #175. A migrating control-plane step is the one place a session count is
+// load-bearing rather than advisory: past it the database is migrated, and every
+// migration in this repo was authored assuming no session was live. The store
+// answers a failed count with `(0, error)` and every wait below is written
+// against `remaining`, so a read that fails at the wrong moment reads exactly
+// like "the fleet has drained".
+//
+// The four tests below pin the three places that could happen and the one place
+// it must not cost a healthy run anything.
+
+// The FIRST count fails. This used to `return true` — "the count is advisory;
+// refusing to update over it would be worse" — which sent the release.
+func TestFleetMigratingStepWillNotProceedOnAnUnreadableSessionCount(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.setSessions(2)
+	store.sessionsErrFrom = 1 // every read fails
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+	f.Deadline = 300 * time.Millisecond
+
+	run := runToEnd(t, f, store)
+
+	if run.State != RunFailed {
+		t.Fatalf("run state = %q, want failed: a migration must not run on a count nobody read", run.State)
+	}
+	if steps := d.steps(); len(steps) != 0 {
+		t.Fatalf("targets reached = %v, want nothing sent", steps)
+	}
+	as, _ := store.RunAttempts(context.Background(), testRunID)
+	if len(as) != 1 || as[0].Target != TargetControlPlane {
+		t.Fatalf("attempts = %+v, want one control-plane attempt", as)
+	}
+	if as[0].Reason == nil || *as[0].Reason != ReasonTimeout {
+		t.Fatalf("failure reason = %v, want %q", as[0].Reason, ReasonTimeout)
+	}
+	// Nothing may be reported as remaining: no read ever produced a number.
+	if got := store.recordedRemaining(); len(got) != 0 {
+		t.Fatalf("recorded sessions_remaining = %v, want none — every read failed", got)
+	}
+}
+
+// A count that fails DURING the wait must not end it. `remaining, err =
+// store.FleetNonTerminalSessions(ctx)` assigned the store's zero before the
+// error was even looked at, and `continue` then re-tested `remaining > 0`
+// against it — so the second poll of a fleet that never emptied sent the
+// release.
+func TestFleetMigratingStepKeepsWaitingWhenAPollCannotCount(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.setSessions(3)
+	store.sessionsErrFrom = 2 // the first read succeeds; every poll after fails
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+	f.Deadline = 300 * time.Millisecond
+
+	run := runToEnd(t, f, store)
+
+	if run.State != RunFailed {
+		t.Fatalf("run state = %q, want failed: the fleet never emptied", run.State)
+	}
+	if steps := d.steps(); len(steps) != 0 {
+		t.Fatalf("targets reached = %v, want nothing sent", steps)
+	}
+	// The one count that DID read is the one the operator was shown, and it is
+	// not zero.
+	if got := store.recordedRemaining(); len(got) != 1 || got[0] != 3 {
+		t.Fatalf("recorded sessions_remaining = %v, want just the 3 that read", got)
+	}
+}
+
+// The other half of the same rule: a transient count failure must cost a healthy
+// run nothing. Once a read succeeds and says zero, the step proceeds.
+func TestFleetMigratingStepProceedsOnceACountActuallyReadsZero(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.setSessions(1)
+	// The first read is good; the next five fail; then reads work again.
+	store.sessionsErrFrom, store.sessionsErrTo = 2, 6
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+
+	f.Start(store.run)
+	waitFor(t, "the failing polls to be spent", func() bool { return store.countReads() > 6 })
+	store.setSessions(0)
+	waitFor(t, "the run to finish", func() bool {
+		r, _ := store.Run(context.Background(), testRunID)
+		return TerminalRunState(r.State)
+	})
+
+	run, _ := store.Run(context.Background(), testRunID)
+	if run.State != RunSucceeded {
+		t.Fatalf("run state = %q, want succeeded: the count recovered and read zero", run.State)
+	}
+	if got := d.steps(); len(got) != 2 || got[0] != TargetControlPlane || got[1] != "h1" {
+		t.Fatalf("targets reached = %v, want the control plane then the host", got)
+	}
+}
+
+// force + migrating. `force` is the operator agreeing to lose the sessions, not
+// agreeing to migrate without knowing. The recount right after the drain used to
+// take the store's zero on failure and skip the wait entirely.
+//
+// Drain here succeeds without the count having reached zero, which is the
+// ordinary shape rather than a contrived one: coordinator.DrainHost ends
+// sessions asynchronously, so the rows are still non-terminal when it returns.
+func TestFleetForcedMigratingStepDoesNotReadAFailedRecountAsDrained(t *testing.T) {
+	store := newFakeFleetStore(true)
+	store.setSessions(2)
+	// 1 = the count recorded before the drain; 2 = the recount after it, and
+	// every poll from there.
+	store.sessionsErrFrom = 2
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	cordons := store.cordons()
+	cordons.Drain = func(context.Context, string) error { return nil }
+	f := NewFleetRunner(store, d, d, ManifestOrEdge{}, cordons,
+		fleetView("", hostTarget("h1", "gpu-01", "")), testLogger())
+	f.PollWait = time.Millisecond
+	f.Deadline = 300 * time.Millisecond
+	f.AdoptSettle = time.Millisecond
+	f.InFlightSettle = 50 * time.Millisecond
+	f.SchemaVersion = fakeReleaseSchema - 1
+	t.Cleanup(f.Close)
+
+	run := runToEnd(t, f, store)
+
+	if run.State != RunFailed {
+		t.Fatalf("run state = %q, want failed: the recount never proved the fleet empty", run.State)
+	}
+	if steps := d.steps(); len(steps) != 0 {
+		t.Fatalf("targets reached = %v, want nothing sent", steps)
+	}
+	// What force cost is still recorded, from the one read that worked.
+	if got := store.recordedRemaining(); len(got) != 1 || got[0] != 2 {
+		t.Fatalf("recorded sessions_remaining = %v, want the 2 that were live", got)
+	}
+}
+
+// The wait is bounded AND interruptible whatever the count says: an unknown
+// count must not make a run impossible to stop. The mechanism is the one the
+// loop already had — an attempt resolved from outside, which is how a cancel
+// reaches a step that has not been sent — and it still works while every count
+// read is failing (#175 acceptance).
+func TestFleetAWaitWhoseCountCannotBeReadStillStopsWhenTheAttemptResolves(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.setSessions(2)
+	store.sessionsErrFrom = 1 // every read fails; the wait cannot end on its own
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+	f.Deadline = time.Minute // far longer than this test: only the resolution can end it
+
+	f.Start(store.run)
+	waitFor(t, "the control-plane attempt to exist", func() bool {
+		as, _ := store.RunAttempts(context.Background(), testRunID)
+		return len(as) == 1
+	})
+	as, _ := store.RunAttempts(context.Background(), testRunID)
+	if err := store.FailAttempt(context.Background(), as[0].ID, ReasonTimeout, ""); err != nil {
+		t.Fatalf("resolve the attempt: %v", err)
+	}
+
+	waitFor(t, "the run to finish", func() bool {
+		r, _ := store.Run(context.Background(), testRunID)
+		return TerminalRunState(r.State)
+	})
+	if steps := d.steps(); len(steps) != 0 {
+		t.Fatalf("targets reached = %v, want nothing sent", steps)
+	}
+}
+
+// The initial-unknown branches, which the two above do not reach: they either
+// never let a count succeed, or let the FIRST one succeed. An implementation
+// that gave up (or proceeded) the moment the first read failed would still pass
+// both (#175 review).
+
+// Only the first count fails. The wait must keep polling and finish on the first
+// read that actually says zero.
+func TestFleetMigratingStepRetriesAnInitiallyUnreadableSessionCount(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.setSessions(1)
+	store.sessionsErrFrom, store.sessionsErrTo = 1, 1
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+
+	f.Start(store.run)
+	waitFor(t, "a retry after the initial failed count", func() bool { return store.countReads() > 1 })
+	store.setSessions(0)
+	waitFor(t, "the run to finish", func() bool {
+		r, _ := store.Run(context.Background(), testRunID)
+		return TerminalRunState(r.State)
+	})
+
+	run, _ := store.Run(context.Background(), testRunID)
+	if run.State != RunSucceeded {
+		t.Fatalf("run state = %q, want succeeded once a count read zero", run.State)
+	}
+	if got := d.steps(); len(got) != 2 || got[0] != TargetControlPlane || got[1] != "h1" {
+		t.Fatalf("targets reached = %v, want the control plane then the host", got)
+	}
+}
+
+// force with an unknown FIRST count still drains. This is the branch that reads
+// `!known || remaining != 0`: reverting it to "drain only when the count is
+// positive" would silently make a forced run skip the drain in exactly the case
+// where it cannot tell whether there is anything to drain.
+func TestFleetForcedMigratingStepDrainsWhenTheInitialCountIsUnreadable(t *testing.T) {
+	store := newFakeFleetStore(true)
+	store.setSessions(2)
+	store.sessionsErrFrom, store.sessionsErrTo = 1, 1
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView("", hostTarget("h1", "gpu-01", "")))
+
+	run := runToEnd(t, f, store)
+
+	if run.State != RunSucceeded {
+		t.Fatalf("run state = %q, want succeeded after the drain and a successful recount", run.State)
+	}
+	if drained := store.drained(); len(drained) != 2 {
+		t.Fatalf("force-drained hosts = %v, want both recorded hosts", drained)
+	}
+	if got := d.steps(); len(got) != 2 || got[0] != TargetControlPlane || got[1] != "h1" {
+		t.Fatalf("targets reached = %v, want the control plane then the host", got)
+	}
+	// Nothing may be reported as remaining: the only count before the drain failed.
+	if got := store.recordedRemaining(); len(got) != 0 && got[0] != 0 {
+		t.Fatalf("recorded sessions_remaining = %v, want no pre-drain number", got)
+	}
+}
+
+// RunOutcome: a skip for up_to_date is a host that was done; every other skip
+// is a host left behind, and that is what makes a run partial.
+func TestRunOutcome(t *testing.T) {
+	cases := []struct {
+		skips []RunSkip
+		want  string
+	}{
+		{nil, RunSucceeded},
+		{[]RunSkip{{HostID: "h1", Reason: ReasonUpToDate}}, RunSucceeded},
+		{[]RunSkip{{HostID: "h1", Reason: ReasonUpToDate}, {HostID: "h2", Reason: ReasonHostOffline}}, RunSucceededPartial},
+		{[]RunSkip{{HostID: "h1", Reason: ReasonPreflightBlocked}}, RunSucceededPartial},
+		{[]RunSkip{{HostID: "h1", Reason: ReasonInstallModeSource}}, RunSucceededPartial},
+		{[]RunSkip{{HostID: "h1", Reason: ReasonAttemptInFlight}}, RunSucceededPartial},
+	}
+	for _, tc := range cases {
+		if got := RunOutcome(tc.skips); got != tc.want {
+			t.Fatalf("RunOutcome(%+v) = %s, want %s", tc.skips, got, tc.want)
+		}
+	}
+}
+
+// A fleet whose every host is already on the release is a clean success: an
+// up_to_date skip is not a host left behind.
+func TestFleetUpToDateSkipsAreNotPartial(t *testing.T) {
+	store := newFakeFleetStore(false)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView(ReasonUpToDate,
+		hostTarget("h1", "gpu-01", ReasonUpToDate), hostTarget("h2", "gpu-02", ReasonUpToDate)))
+	run := runToEnd(t, f, store)
+	if run.State != RunSucceeded {
+		t.Fatalf("run state = %q, want succeeded", run.State)
+	}
+	if len(run.Skipped) != 2 {
+		t.Fatalf("skipped = %+v, want both hosts recorded", run.Skipped)
+	}
+}
+
+// A blocked preflight is skipped like any ineligibility, named, and makes the
+// run partial: the run never moves onto a host whose stack cannot take it.
+func TestFleetSkipsAPreflightBlockedHost(t *testing.T) {
+	store := newFakeFleetStore(false)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	f := testFleet(t, store, d, fleetView(ReasonUpToDate,
+		hostTarget("h1", "gpu-01", ReasonPreflightBlocked), hostTarget("h2", "gpu-02", "")))
+	run := runToEnd(t, f, store)
+	if run.State != RunSucceededPartial {
+		t.Fatalf("run state = %q, want succeeded_partial", run.State)
+	}
+	if got := d.steps(); len(got) != 1 || got[0] != "h2" {
+		t.Fatalf("targets reached = %v, want only h2", got)
+	}
+	if skips := store.skips(); len(skips) != 1 || skips[0].Reason != ReasonPreflightBlocked {
+		t.Fatalf("skipped = %+v, want h1 with preflight_blocked", skips)
+	}
+}
+
+// #176. `finish` writes the terminal state and only THEN restores the cordons
+// the run imposed, so a restore that fails — or a process that dies in that
+// window — leaves a terminal run whose hosts are still `draining`. `ActiveRun`
+// selects only NON-terminal runs, so nothing on the adoption path would ever
+// look at that run again: the host stays out of scheduling with one ERROR line
+// as the whole record.
+//
+// The recovery requirement is now persisted, and the next start acts on it.
+
+// newRestoreFleet builds a runner over `store` whose Uncordon behaviour the test
+// controls, so a cleanup failure can be injected and then lifted — which is what
+// "restart in that window" looks like from this package.
+func newRestoreFleet(t *testing.T, store *fakeFleetStore, d *fakeDrivers, uncordonFails *bool) *FleetRunner {
+	t.Helper()
+	// The control-plane path, because that is the one that cordons the whole
+	// fleet; and a NON-migrating release, so the run does not also wait for a
+	// drain this test is not about.
+	return newRestoreFleetOver(t, store, d, uncordonFails, fleetView("", hostTarget("h1", "gpu-01", "")))
+}
+
+// newRestoreFleetOver is newRestoreFleet with the view chosen by the caller, so
+// the same injected cleanup failure can be run against a host-only run (#200).
+func newRestoreFleetOver(t *testing.T, store *fakeFleetStore, d *fakeDrivers, uncordonFails *bool,
+	view func(context.Context) (View, error)) *FleetRunner {
+	t.Helper()
+	cordons := store.cordons()
+	realUncordon := cordons.Uncordon
+	cordons.Uncordon = func(ctx context.Context, hostID string) error {
+		if *uncordonFails {
+			// Fails AND leaves the host draining, which is the shape that
+			// matters: an uncordon that errors but worked is not a leak.
+			return errors.New("uncordon failed")
+		}
+		return realUncordon(ctx, hostID)
+	}
+	f := NewFleetRunner(store, d, d, ManifestOrEdge{}, cordons, view, testLogger())
+	f.PollWait = time.Millisecond
+	f.Deadline = 2 * time.Second
+	f.AdoptSettle = time.Millisecond
+	f.InFlightSettle = 50 * time.Millisecond
+	f.SchemaVersion = fakeReleaseSchema
+	t.Cleanup(f.Close)
+	return f
+}
+
+// An uncordon that fails after the terminal write leaves a durable recovery
+// requirement, not a log line.
+func TestFleetRecordsUnfinishedSchedulingCleanup(t *testing.T) {
+	store := newFakeFleetStore(false)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	uncordonFails := true
+	f := newRestoreFleet(t, store, d, &uncordonFails)
+
+	run := runToEnd(t, f, store)
+
+	if !TerminalRunState(run.State) {
+		t.Fatalf("run state = %q, want terminal: the run itself succeeded", run.State)
+	}
+	if store.restoredCordons(testRunID) {
+		t.Fatal("cleanup was recorded as done while every uncordon was failing")
+	}
+	// And it is findable, which is the whole point: a terminal run is invisible
+	// to ActiveRun.
+	pending := store.pending()
+	if len(pending) != 1 || pending[0] != testRunID {
+		t.Fatalf("pending cleanup = %v, want just this run", pending)
+	}
+	if len(store.draining()) == 0 {
+		t.Fatal("the fixture is wrong: this test needs a host actually left draining")
+	}
+}
+
+// The restart. A fresh runner sweeps the requirement, puts the fleet back, and
+// clears it — without re-running anything the update already did.
+func TestFleetResumesSchedulingCleanupOnTheNextStart(t *testing.T) {
+	store := newFakeFleetStore(false)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	uncordonFails := true
+	f := newRestoreFleet(t, store, d, &uncordonFails)
+	runToEnd(t, f, store)
+	stepsBefore := len(d.steps())
+
+	// The next control-plane start, with whatever broke the uncordon now fixed.
+	uncordonFails = false
+	f2 := newRestoreFleet(t, store, d, &uncordonFails)
+	f2.ResumeCordonRestores(context.Background())
+
+	if !store.restoredCordons(testRunID) {
+		t.Fatal("the resumed sweep did not clear the recovery requirement")
+	}
+	if left := store.draining(); len(left) != 0 {
+		t.Fatalf("still draining = %v, want the fleet back in scheduling", left)
+	}
+	if pending := store.pending(); len(pending) != 0 {
+		t.Fatalf("pending cleanup = %v, want none once it is settled", pending)
+	}
+	// Cleanup is cleanup. It must not re-drive the update itself.
+	if got := len(d.steps()); got != stepsBefore {
+		t.Fatalf("targets reached = %d, want the %d from the run itself", got, stepsBefore)
+	}
+}
+
+// #200 + #176 together: the cordon a HOST-ONLY run takes must be durable enough
+// that a control plane which dies between the terminal write and the restore —
+// or simply cannot uncordon — leaves a requirement the next start finds.
+// `ClaimUnrestoredCordons` selects on a NON-EMPTY `cordoned_hosts`, so a run
+// that cordoned a host and recorded nothing is invisible to the sweep for the
+// rest of the instance's life.
+func TestFleetHostOnlyRunLeavesARecoveryRequirementTheNextStartFinds(t *testing.T) {
+	store := newFakeFleetStore(false)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}, cordonsLikeTheRunner: true}
+	uncordonFails := true
+	hostOnly := fleetView(ReasonUpToDate, hostTarget("h1", "gpu-01", ""))
+	f := newRestoreFleetOver(t, store, d, &uncordonFails, hostOnly)
+
+	run := runToEnd(t, f, store)
+
+	if !TerminalRunState(run.State) {
+		t.Fatalf("run state = %q, want terminal", run.State)
+	}
+	if len(store.draining()) == 0 {
+		t.Fatal("the fixture is wrong: this test needs a host actually left draining")
+	}
+	pending := store.pending()
+	if len(pending) != 1 || pending[0] != testRunID {
+		t.Fatalf("pending cleanup = %v, want just this run — a host-only run's cordon must be recorded, "+
+			"or nothing will ever lift it", pending)
+	}
+
+	// The next control-plane start, with whatever broke the uncordon now fixed.
+	uncordonFails = false
+	newRestoreFleetOver(t, store, d, &uncordonFails, hostOnly).ResumeCordonRestores(context.Background())
+
+	if !store.restoredCordons(testRunID) {
+		t.Fatal("the resumed sweep did not clear the recovery requirement")
+	}
+	if left := store.draining(); len(left) != 0 {
+		t.Fatalf("still draining = %v, want the host back in scheduling", left)
+	}
+}
+
+// An admin's own cordon is not this run's to lift, on the resumed path exactly as
+// on the ordinary one (#170's rule, re-pinned here because the sweep is a second
+// caller of it).
+func TestFleetResumedCleanupPutsBackAnAdminCordonRatherThanLiftingIt(t *testing.T) {
+	store := newFakeFleetStore(false)
+	// h2 was the operator's before the run ever started.
+	store.setHostStatus("h2", "draining")
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	uncordonFails := true
+	f := newRestoreFleet(t, store, d, &uncordonFails)
+	runToEnd(t, f, store)
+
+	uncordonFails = false
+	newRestoreFleet(t, store, d, &uncordonFails).ResumeCordonRestores(context.Background())
+
+	if !store.restoredCordons(testRunID) {
+		t.Fatal("the resumed sweep did not settle")
+	}
+	if got := store.hostStatus("h2"); got != "draining" {
+		t.Fatalf("h2 status = %q, want the admin's own cordon left alone", got)
+	}
+	if got := store.hostStatus("h1"); got != "online" {
+		t.Fatalf("h1 status = %q, want the run's own cordon lifted", got)
+	}
+}
+
+// A failure that persists stays a requirement rather than being swallowed, and
+// the sweep does not spin on it: one pass per start.
+func TestFleetResumedCleanupThatStillFailsStaysARequirement(t *testing.T) {
+	store := newFakeFleetStore(false)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	uncordonFails := true
+	f := newRestoreFleet(t, store, d, &uncordonFails)
+	runToEnd(t, f, store)
+
+	newRestoreFleet(t, store, d, &uncordonFails).ResumeCordonRestores(context.Background())
+
+	if store.restoredCordons(testRunID) {
+		t.Fatal("a cleanup that never succeeded was recorded as done")
+	}
+	if pending := store.pending(); len(pending) != 1 {
+		t.Fatalf("pending cleanup = %v, want it still outstanding for the next start", pending)
+	}
+}
+
+// The work is done even when recording it is not, so the next start re-runs an
+// idempotent restore rather than leaving a host cordoned.
+func TestFleetTreatsAnUnrecordedRestoreAsStillOutstanding(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.markRestoredErr = errors.New("mark failed")
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	uncordonFails := false
+	f := newRestoreFleet(t, store, d, &uncordonFails)
+
+	runToEnd(t, f, store)
+
+	if left := store.draining(); len(left) != 0 {
+		t.Fatalf("still draining = %v, want the restore itself to have worked", left)
+	}
+	if pending := store.pending(); len(pending) != 1 {
+		t.Fatalf("pending cleanup = %v, want the unrecorded restore re-checked next start", pending)
+	}
+}
+
+// The sweep replays a claim about a moment that has passed — "this host was not
+// cordoned when I found it" — so it must not run against a fleet a LIVE run has
+// deliberately cordoned, or it puts hosts back into scheduling mid-update
+// (#176 review, security finding).
+func TestFleetDoesNotSweepWhileAFleetRunIsActive(t *testing.T) {
+	store := newFakeFleetStore(false)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	uncordonFails := true
+	f := newRestoreFleet(t, store, d, &uncordonFails)
+	runToEnd(t, f, store)
+	if !store.pendingIsOutstanding() {
+		t.Fatal("the fixture is wrong: this test needs an outstanding requirement")
+	}
+
+	// A new run is in flight on the next start.
+	store.setRunState(RunRunning)
+	uncordonFails = false
+	claimsBefore := store.claimCount()
+	newRestoreFleet(t, store, d, &uncordonFails).ResumeCordonRestores(context.Background())
+
+	if store.claimCount() != claimsBefore {
+		t.Fatal("the sweep claimed work while a fleet run was active")
+	}
+	if store.restoredCordons(testRunID) {
+		t.Fatal("the sweep settled an old run's cordons underneath a live one")
+	}
+}
+
+// A `Cordon` that fails after taking effect, and a host deleted since the run
+// recorded it, are both settled — not requirements retried on every start for
+// the rest of the instance's life (#176 review).
+func TestFleetSettlesAnAdminCordonThatIsAlreadyInPlace(t *testing.T) {
+	store := newFakeFleetStore(false)
+	store.setHostStatus("h2", "draining") // h2 is the operator's
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	cordons := store.cordons()
+	realCordon := cordons.Cordon
+	cordons.Cordon = func(ctx context.Context, hostID string) error {
+		if hostID == "h2" {
+			// Takes effect, then loses the answer.
+			_ = realCordon(ctx, hostID)
+			return errors.New("cordon request failed after it applied")
+		}
+		return realCordon(ctx, hostID)
+	}
+	f := NewFleetRunner(store, d, d, ManifestOrEdge{}, cordons,
+		fleetView("", hostTarget("h1", "gpu-01", "")), testLogger())
+	f.PollWait = time.Millisecond
+	f.Deadline = 2 * time.Second
+	f.AdoptSettle = time.Millisecond
+	f.InFlightSettle = 50 * time.Millisecond
+	f.SchemaVersion = fakeReleaseSchema
+	t.Cleanup(f.Close)
+
+	runToEnd(t, f, store)
+
+	if !store.restoredCordons(testRunID) {
+		t.Fatal("a cordon that is demonstrably in place left an undischargeable requirement")
+	}
+	if got := store.hostStatus("h2"); got != "draining" {
+		t.Fatalf("h2 status = %q, want the admin's own cordon in place", got)
+	}
+}
+
+// A status read that fails is "could not tell", and could-not-tell is not
+// restored — the branch the recovery contract turns on, and the fake could not
+// reach it before (#176 review, testing finding).
+func TestFleetDoesNotSettleWhenAHostStatusCannotBeRead(t *testing.T) {
+	store := newFakeFleetStore(false)
+	d := &fakeDrivers{store: store, outcome: map[string]string{}}
+	uncordonFails := false
+	f := newRestoreFleet(t, store, d, &uncordonFails)
+	store.hostStatusErr = errors.New("status read failed")
+
+	runToEnd(t, f, store)
+
+	if store.restoredCordons(testRunID) {
+		t.Fatal("cleanup was recorded as done although no host status could be confirmed")
+	}
+	if pending := store.pending(); len(pending) != 1 {
+		t.Fatalf("pending cleanup = %v, want the unconfirmed run outstanding", pending)
 	}
 }

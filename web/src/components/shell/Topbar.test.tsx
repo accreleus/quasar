@@ -18,6 +18,7 @@ function auth(role: "user" | "admin"): AuthContextValue {
     user: { id: "u1", email: "a@b.io", username: "salty2011", role } as AuthContextValue["user"],
     token: "t",
     isAdmin: role === "admin",
+    sessionExpired: false,
     login: vi.fn(),
     claim: vi.fn(),
     logout: vi.fn(),

@@ -40,6 +40,11 @@ func rel(id, version, commit string, schema int, built time.Time, opts ...func(*
 }
 
 func prerelease(r *Release) { r.Prerelease = true }
+
+// withVersion overrides the version a seeded release carries, for the rules that
+// read it rather than the flag.
+func withVersion(v string) func(*Release) { return func(r *Release) { r.Version = str(v) } }
+
 func noManifest(r *Release) { r.Manifest = nil }
 func onEdge(r *Release)     { r.Channel = ChannelEdge; r.Version = nil }
 func cp(commit string, schema int) buildinfo.Identity {
@@ -176,6 +181,10 @@ func sourceInstall(h *HostIdentity) { h.InstallMode = str(InstallSource) }
 func noUpdater(h *HostIdentity)     { h.UpdaterPresent = boolp(false) }
 func offline(h *HostIdentity)       { h.Status = HostOffline }
 func draining(h *HostIdentity)      { h.Status = "draining" }
+
+// #169: connectivity as the registry sees it, independent of the status column.
+func disconnected(h *HostIdentity) { c := false; h.AgentConnected = &c }
+func connected(h *HostIdentity)    { c := true; h.AgentConnected = &c }
 func unknownIdentity(h *HostIdentity) {
 	h.SourceCommit, h.BuiltAt, h.InstallMode, h.UpdaterPresent = nil, nil, nil, nil
 }
@@ -275,6 +284,49 @@ func TestTargetEligibilityReasons(t *testing.T) {
 			host:       host("h1", "gpu-01", commitA, noUpdater),
 			wantCPRsn:  ReasonUpToDate,
 			wantHostRs: ReasonUpdaterAbsent,
+		},
+		{
+			// #169. THE LIVE CASE. Nothing corrects an idle host's status across
+			// a control-plane restart — markOffline runs only from the connection
+			// goroutine's defer, and the stale sweep visits only hosts WITH active
+			// sessions — so the row still says `online` for a host that is gone.
+			// Before this, the run attempted it and failed the whole fleet.
+			name:       "a host whose row says online but whose agent is gone",
+			releases:   []Release{newest},
+			cp:         cp(commitC, 74),
+			host:       host("h1", "gpu-01", commitA, disconnected),
+			wantCPRsn:  ReasonUpToDate,
+			wantHostRs: ReasonHostOffline,
+		},
+		{
+			// And the cordon case: a run cordons every host first, and `draining`
+			// is deliberately not `offline`, so the status column could never
+			// classify a host the run had already touched.
+			name:       "a cordoned host whose agent is gone",
+			releases:   []Release{newest},
+			cp:         cp(commitC, 74),
+			host:       host("h1", "gpu-01", commitA, draining, disconnected),
+			wantCPRsn:  ReasonUpToDate,
+			wantHostRs: ReasonHostOffline,
+		},
+		{
+			// A cordon on its own is not absence: a draining host with a live
+			// agent is exactly what an apply wants.
+			name:       "a cordoned host whose agent is present is still eligible",
+			releases:   []Release{newest},
+			cp:         cp(commitC, 74),
+			host:       host("h1", "gpu-01", commitA, draining, connected),
+			wantCPRsn:  ReasonUpToDate,
+			wantHostRs: "",
+		},
+		{
+			// No registry wired: the column decides, exactly as before.
+			name:       "with no connectivity known the status column still decides",
+			releases:   []Release{newest},
+			cp:         cp(commitC, 74),
+			host:       host("h1", "gpu-01", commitA, draining),
+			wantCPRsn:  ReasonUpToDate,
+			wantHostRs: "",
 		},
 		{
 			name:       "an offline host has nobody to tell",
@@ -612,5 +664,134 @@ func TestAgentAheadIsAFaultAndStillATargetRow(t *testing.T) {
 	// different things about the same host on purpose — a fault gates nothing.
 	if v.Targets[1].Reason == nil || *v.Targets[1].Reason != ReasonUpToDate {
 		t.Fatalf("host target = %+v, want up_to_date", v.Targets[1])
+	}
+}
+
+// The #153 predicate. schema_version IS the highest migration a build embeds,
+// so "above this control plane" and "runs a migration here" are one fact — and
+// the control-plane step's fleet drain branches on it.
+func TestReleaseRunsAMigration(t *testing.T) {
+	cases := []struct {
+		name   string
+		schema int
+		cpAt   int
+		want   bool
+	}{
+		{"one migration above", 79, 78, true},
+		{"several above", 90, 78, true},
+		{"level with the control plane", 78, 78, false},
+		// Unreachable past `offerable`, which never lists a release below the
+		// control plane (ADR 0002); false is still the right answer, because a
+		// binary already past that migration has nothing left to run.
+		{"below the control plane", 77, 78, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := rel("r", "0.9.0", commitC, c.schema, at(4))
+			if got := ReleaseRunsAMigration(r, c.cpAt); got != c.want {
+				t.Fatalf("ReleaseRunsAMigration(schema %d, cp %d) = %v, want %v",
+					c.schema, c.cpAt, got, c.want)
+			}
+		})
+	}
+}
+
+// `migrates` is DERIVED AND SERVED on every listed release, so the confirmation
+// an admin consents to cannot drift from the drain policy (#153). A client that
+// re-derived it would keep naming the old policy after this one moved.
+func TestAvailableReleasesCarryWhetherTheyMigrate(t *testing.T) {
+	v := PlanRelease(PlanInputs{
+		Channel: ChannelStable,
+		Releases: []Release{
+			rel("above", "0.4.0", commitC, 79, at(3)),
+			rel("level", "0.3.0", commitB, 78, at(2)),
+		},
+		ControlPlane: cp(commitA, 78),
+	})
+	if len(v.Available) != 2 {
+		t.Fatalf("available = %d releases, want both listed", len(v.Available))
+	}
+	byID := map[string]bool{}
+	for _, r := range v.Available {
+		byID[r.ID] = r.Migrates
+	}
+	if !byID["above"] {
+		t.Error("a release above the control plane's schema must be served migrates: true")
+	}
+	if byID["level"] {
+		t.Error("a release level with the control plane's schema must be served migrates: false")
+	}
+}
+
+// Amendment 9: a blocked preflight is an eligibility reason, inserted after the
+// durable reasons and before the two transient ones; `unknown` never blocks.
+func TestPlanPreflightBlockedIsAnEligibilityReason(t *testing.T) {
+	newest := Release{ID: "r1", Channel: ChannelStable, SourceCommit: commitC,
+		BuiltAt: at(3), SchemaVersion: 74, Manifest: []byte(`{}`)}
+	blocked := json.RawMessage(`[{"id":"health_addr_bindable","status":"fail","summary":"127.0.0.1:9091 is answered by pid 4121","remediation":"free the port"}]`)
+	fine := json.RawMessage(`[{"id":"health_addr_bindable","status":"pass","summary":"ok","remediation":""}]`)
+	in := PlanInputs{
+		Channel:      ChannelStable,
+		ControlPlane: cp(commitC, 74), // already on the release, so hosts are not waiting on it
+		Hosts: []HostIdentity{
+			host("h1", "gpu-01", commitB, func(h *HostIdentity) { h.Readiness = blocked; h.AgentConnected = boolp(true) }),
+			host("h2", "gpu-02", commitB, func(h *HostIdentity) { h.Readiness = fine; h.AgentConnected = boolp(true) }),
+			host("h3", "gpu-03", commitB), // no readiness at all: unknown
+		},
+		Releases:                []Release{newest},
+		UpdaterPresent:          true,
+		ControlPlaneInstallMode: str(InstallRegistry),
+		ControlPlanePreflight: PreflightFacts{
+			Socket: &SocketState{true, true}, Self: &UpdaterSelfFacts{Version: "x", StackDir: "/s", ConfigFiles: []string{"a"}}},
+	}
+	v := PlanRelease(in)
+	if got := *v.Targets[1].Reason; got != ReasonPreflightBlocked {
+		t.Fatalf("blocked host reason = %q, want preflight_blocked", got)
+	}
+	if !v.Targets[1].Preflight.Blocked() || v.Targets[1].Preflight.Checks[4].ID != CheckHealthAddrBindable {
+		t.Fatalf("the blocked target must carry its preflight: %+v", v.Targets[1].Preflight)
+	}
+	if !v.Targets[2].Eligible {
+		t.Fatalf("a host whose checks pass is eligible, got %v", v.Targets[2].Reason)
+	}
+	if !v.Targets[3].Eligible || v.Targets[3].Preflight.State != PreflightUnknown {
+		t.Fatalf("unknown must never block: eligible=%v state=%s", v.Targets[3].Eligible, v.Targets[3].Preflight.State)
+	}
+
+	// Durable before transient: a blocked host with an open attempt still
+	// reads preflight_blocked, not attempt_in_flight.
+	withAttempt := in
+	withAttempt.OpenAttempts = []Attempt{{ID: "a1", Target: TargetHost, HostID: str("h1"), State: AttemptPulling}}
+	if got := *PlanRelease(withAttempt).Targets[1].Reason; got != ReasonPreflightBlocked {
+		t.Fatalf("blocked + in flight = %q, want preflight_blocked", got)
+	}
+	// But an offline host reads host_offline first: it is earlier on the list.
+	offline := in
+	offline.Hosts = []HostIdentity{host("h1", "gpu-01", commitB, func(h *HostIdentity) { h.Readiness = blocked; h.AgentConnected = boolp(false) })}
+	if got := *PlanRelease(offline).Targets[1].Reason; got != ReasonHostOffline {
+		t.Fatalf("offline + blocked = %q, want host_offline", got)
+	}
+
+	// The control plane: a socket volume that is not mounted blocks it, and
+	// with it the whole fleet (nothing moves before the control plane).
+	cpBlocked := in
+	cpBlocked.ControlPlane = cp(commitA, 74)
+	cpBlocked.ControlPlanePreflight = PreflightFacts{Socket: &SocketState{}}
+	v = PlanRelease(cpBlocked)
+	if got := targetReason(v, TargetControlPlane); got != ReasonPreflightBlocked {
+		t.Fatalf("control plane reason = %q, want preflight_blocked", got)
+	}
+	if got := *v.Targets[2].Reason; got != ReasonControlPlaneNotFirst {
+		t.Fatalf("host behind a blocked control plane = %q, want control_plane_not_first", got)
+	}
+	// An unresolvable image blocks every target at once.
+	noImage := in
+	noImage.ImageFor = func(Release) *ImageFact { return &ImageFact{Err: "ghcr.io answered 404"} }
+	v = PlanRelease(noImage)
+	if targetReason(v, TargetControlPlane) != ReasonUpToDate {
+		t.Fatalf("up_to_date outranks a blocked preflight on the control plane: %s", targetReason(v, TargetControlPlane))
+	}
+	if got := *v.Targets[2].Reason; got != ReasonPreflightBlocked {
+		t.Fatalf("host with an unresolvable image = %q, want preflight_blocked", got)
 	}
 }

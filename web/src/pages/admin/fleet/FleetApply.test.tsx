@@ -35,6 +35,9 @@ function release(over: Partial<PlatformRelease> = {}): PlatformRelease {
     source_commit: NEW_COMMIT,
     built_at: "2026-09-04T12:00:00Z",
     schema_version: 75,
+    // Served by the control plane, not derived here (#153): schema 75 against
+    // the fixture's installed 74 means this release carries a migration.
+    migrates: true,
     prerelease: false,
     notes: "",
     compare_url: null,
@@ -156,6 +159,7 @@ beforeEach(() => {
   vi.resetAllMocks();
   mocked.listAllSessions.mockResolvedValue({ items: [], next_cursor: null } as never);
   mocked.listPlatformAttempts.mockResolvedValue({ attempts: [] });
+  mocked.listPlatformApplyRuns.mockResolvedValue({ runs: [] });
   // The head's "next check" fragment reads the detection job's schedule.
   mocked.listJobs.mockResolvedValue({ items: [], next_cursor: null } as never);
 });
@@ -185,6 +189,31 @@ describe("FleetApplyButton", () => {
     expect(within(dialog).getByText("0.3.0")).toBeInTheDocument();
     expect(within(dialog).getByText(/ends every live session on 3 hosts/)).toBeInTheDocument();
     expect(within(dialog).getByText(/lose contact for about 20 seconds/)).toBeInTheDocument();
+  });
+
+  // #153. The fixture release is served with migrates: true (schema 75 against
+  // an installed 74), so the control-plane step still empties the instance.
+  it("says a migrating release waits for every session on the instance", async () => {
+    renderButton(view());
+    screen.getByRole("button", { name: "Update Quasar" }).click();
+
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByText(/changes the database, so the update waits for every session/),
+    ).toBeInTheDocument();
+  });
+
+  // The same release at the installed schema runs no migration, so its restart
+  // carries the sessions rather than ending them (#128 made that true, #153
+  // stopped draining for it). Promising an outage that does not happen is as
+  // wrong as hiding one that does.
+  it("says a non-migrating release keeps live sessions streaming", async () => {
+    renderButton(view({ available: [release({ schema_version: 74, migrates: false })] }));
+    screen.getByRole("button", { name: "Update Quasar" }).click();
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText(/Live sessions keep streaming through it/)).toBeInTheDocument();
+    expect(within(dialog).queryByText(/waits for every session on the instance/)).toBeNull();
   });
 
   // Nothing moves before the control plane, so a run it cannot take is refused
@@ -292,8 +321,9 @@ describe("FleetRunPanel", () => {
     expect(screen.getByText("Pulling the image")).toBeInTheDocument();
   });
 
-  // A control-plane recreate ends every session on the instance, so its wait is
-  // fleet-wide and the panel must say so.
+  // When the control-plane step waits at all — since #153, only for a release
+  // carrying a migration — the wait is fleet-wide, not one host's, and the
+  // panel must say so.
   it("says the control-plane step is waiting on the whole fleet", () => {
     renderPanel(
       run({
@@ -399,5 +429,162 @@ describe("ReleasesTab › fleet run", () => {
       await screen.findByText(/The control plane is restarting on the new release/),
     ).toBeInTheDocument();
     expect(screen.getByText("Fleet update")).toBeInTheDocument();
+  });
+});
+
+// Amendment 9: a run that passed a host over is partial, says so in one
+// sentence, and offers to retry just those hosts; a failed run is unchanged.
+describe("FleetRunPanel partial outcome (#190)", () => {
+  const partial = () =>
+    run({
+      state: "succeeded_partial",
+      current_target: null,
+      current_host_id: null,
+      finished_at: "2026-09-05T11:20:00Z",
+      attempts: [
+        attempt({ id: "at-cp", target: "control_plane", host_id: null, node_name: null, state: "succeeded" }),
+        attempt({ id: "at-h1", host_id: "h1", node_name: "gpu-host-01", state: "succeeded" }),
+        attempt({ id: "at-h2", host_id: "h2", node_name: "gpu-host-02", state: "succeeded" }),
+      ],
+      skipped: [
+        { host_id: "h3", node_name: "gpu-host-03", reason: "up_to_date" },
+        { host_id: "h4", node_name: "gpu-host-04", reason: "host_offline" },
+      ],
+    });
+
+  it("reads as partial, in a sentence that counts the hosts and names the skipped one", () => {
+    renderPanel(partial());
+    expect(screen.getByText("succeeded_partial")).toBeInTheDocument();
+    expect(screen.getByTestId("fleet-partial")).toHaveTextContent(
+      "Applied to the control plane and 2 of 3 hosts — 1 skipped: gpu-host-04 (offline)",
+    );
+    expect(screen.getByRole("button", { name: "Retry skipped hosts" })).toBeInTheDocument();
+  });
+
+  it("retry is a plain fleet apply of the same release carrying retry_of", async () => {
+    mocked.applyPlatformReleaseToFleet.mockResolvedValue({ run: run({ id: "run-2", retry_of: "run-1" }) } as never);
+    const onChanged = vi.fn();
+    render(
+      <ToastProvider>
+        <FleetRunPanel run={partial()} targets={view().targets} onChanged={onChanged} />
+      </ToastProvider>,
+    );
+    screen.getByRole("button", { name: "Retry skipped hosts" }).click();
+    await waitFor(() =>
+      expect(mocked.applyPlatformReleaseToFleet).toHaveBeenCalledWith("tok", {
+        release_id: "r1",
+        force: false,
+        retry_of: "run-1",
+      }),
+    );
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+  });
+
+  it("marks a retry run, and never offers Retry on a failed run", () => {
+    renderPanel(run({ retry_of: "run-0" } as Partial<PlatformApplyRun>));
+    expect(screen.getByText("retry")).toBeInTheDocument();
+    render(
+      <ToastProvider>
+        <FleetRunPanel
+          run={run({ state: "failed", current_target: null, attempts: [attempt({ state: "failed", reason: "unhealthy" })] })}
+          targets={view().targets}
+          onChanged={() => {}}
+        />
+      </ToastProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "Retry skipped hosts" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("fleet-partial")).not.toBeInTheDocument();
+  });
+});
+
+describe("FleetApplyButton preflight (#187)", () => {
+  const blockedCheck = {
+    id: "updater_socket",
+    status: "fail",
+    detail: "the updater's socket volume is not mounted in this container; recreate the control plane",
+  };
+
+  it("names the failing check and its fix when the control plane is blocked", () => {
+    const v = view();
+    v.targets[0] = {
+      ...v.targets[0],
+      eligible: false,
+      reason: "preflight_blocked",
+      preflight: { state: "blocked", checked_at: "2026-09-05T11:00:00Z", checks: [blockedCheck] },
+    } as PlatformReleaseView["targets"][number];
+    renderButton(v);
+    const button = screen.getByRole("button", { name: "Update Quasar" });
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("title", expect.stringContaining("recreate the control plane"));
+  });
+
+  it("lists the hosts a run will skip, with the fix for a blocked one, before asking for consent", async () => {
+    const v = view();
+    v.targets[2] = {
+      ...v.targets[2],
+      eligible: false,
+      reason: "preflight_blocked",
+      preflight: {
+        state: "blocked",
+        checked_at: null,
+        checks: [{ id: "health_addr_bindable", status: "fail", detail: "127.0.0.1:9091 is answered by pid 4121, not this agent" }],
+      },
+    } as PlatformReleaseView["targets"][number];
+    renderButton(v);
+    screen.getByRole("button", { name: "Update Quasar" }).click();
+    const note = await screen.findByTestId("fleet-will-skip");
+    expect(note).toHaveTextContent("Will be skipped and stay on the old release (2)");
+    expect(within(note).getByText("gpu-host-02")).toBeInTheDocument();
+    expect(note).toHaveTextContent("pid 4121");
+    expect(within(note).getByText("gpu-host-04")).toBeInTheDocument();
+    expect(note).toHaveTextContent("The host's agent is not connected");
+  });
+});
+
+// A finished run leaves `active_apply`, so the page reads the run list for the
+// last outcome that needs attention and keeps the retry where it belongs.
+describe("LastRunPanel (#190)", () => {
+  const partialRun = run({
+    id: "run-1",
+    state: "succeeded_partial",
+    current_target: null,
+    current_host_id: null,
+    finished_at: "2026-09-05T11:20:00Z",
+    attempts: [attempt({ id: "at-h1", state: "succeeded" })],
+    skipped: [{ host_id: "h4", node_name: "gpu-host-04", reason: "host_offline" }],
+  });
+
+  it("shows the last partial run with Retry once the run is no longer active", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(view({ available: [release({ source_commit: CP_COMMIT })] }));
+    mocked.listPlatformApplyRuns.mockResolvedValue({ runs: [partialRun] });
+    renderTab();
+    expect(await screen.findByText("Last fleet update")).toBeInTheDocument();
+    expect(screen.getByTestId("fleet-partial")).toHaveTextContent("1 skipped: gpu-host-04 (offline)");
+    expect(screen.getByRole("button", { name: "Retry skipped hosts" })).toBeInTheDocument();
+  });
+
+  it("marks a retried run and withdraws Retry once a later run carries its id", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(view({ available: [release({ source_commit: CP_COMMIT })] }));
+    mocked.listPlatformApplyRuns.mockResolvedValue({
+      runs: [
+        run({ id: "run-2", state: "failed", current_target: null, retry_of: "run-1", attempts: [attempt({ state: "failed", reason: "unhealthy" })] } as Partial<PlatformApplyRun>),
+        partialRun,
+      ],
+    });
+    renderTab();
+    // The newest run is the one shown; it is a failed retry.
+    expect(await screen.findByText("Last fleet update")).toBeInTheDocument();
+    expect(screen.getByText("retry")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry skipped hosts" })).not.toBeInTheDocument();
+  });
+
+  it("shows nothing for a clean success", async () => {
+    mocked.getPlatformReleases.mockResolvedValue(view({ available: [release({ source_commit: CP_COMMIT })] }));
+    mocked.listPlatformApplyRuns.mockResolvedValue({
+      runs: [run({ id: "run-3", state: "succeeded", current_target: null, attempts: [attempt({ state: "succeeded" })] })],
+    });
+    renderTab();
+    await screen.findByText(/Up to date/);
+    expect(screen.queryByText("Last fleet update")).not.toBeInTheDocument();
   });
 });

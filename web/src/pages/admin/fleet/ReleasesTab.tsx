@@ -53,7 +53,8 @@ import {
   attemptForTarget,
   useHostSessionCounts,
 } from "./ApplyControls";
-import { ControlPlaneRestarting, FleetApplyButton, FleetRunPanel } from "./FleetApply";
+import { ControlPlaneRestarting, FleetApplyButton, FleetRunPanel, LastRunPanel } from "./FleetApply";
+import { blockingChecks, holdoutText, unknownChecks } from "./preflight";
 import {
   FailedAttemptPanel,
   RevertConfirmModal,
@@ -62,10 +63,10 @@ import {
 } from "./RevertControls";
 import {
   commitsMatch,
-  eligibilityText,
   faultText,
   hasUpdate,
   olderEdgeCandidate,
+  preflightCheckText,
   releaseLabel,
   shortCommit,
 } from "./releasesCopy";
@@ -77,6 +78,7 @@ const DETECT_JOB_ID = "platform.release_detect";
 
 const CHANNEL_OPTIONS: { value: ReleaseChannel; label: string }[] = [
   { value: "stable", label: "Stable" },
+  { value: "beta", label: "Beta" },
   { value: "edge", label: "Edge" },
 ];
 
@@ -226,7 +228,17 @@ export function ReleasesTab() {
               </div>
             </Card>
           ) : (
-            <UpdateBanner view={view} />
+            <>
+              <UpdateBanner view={view} />
+              <LastRunPanel
+                key={applied}
+                targets={view.targets}
+                onChanged={() => {
+                  setApplied((n) => n + 1);
+                  void res.refresh();
+                }}
+              />
+            </>
           )}
           <div className="split rel-split">
             <div>
@@ -243,6 +255,7 @@ export function ReleasesTab() {
                 }}
               />
               <ChannelCard view={view} onSaved={() => void res.refresh()} />
+              <NotificationsCard view={view} onSaved={() => void res.refresh()} />
               <RailCard title="Apply history">
                 <ApplyHistory refreshKey={applied} />
               </RailCard>
@@ -318,8 +331,7 @@ function ReleaseFeed({ view }: { view: PlatformReleaseView }) {
       {view.available.length === 0 ? (
         <Card className="card-pad mb4">
           <p className="muted">
-            Nothing at or above this control plane's schema has been detected on the {view.channel}{" "}
-            channel.
+            Nothing newer than this control plane has been detected on the {view.channel} channel.
           </p>
         </Card>
       ) : (
@@ -553,9 +565,16 @@ function ChannelCard({ view, onSaved }: { view: PlatformReleaseView; onSaved: ()
         onChange={(value) => void save.run({ release_channel: value })}
       />
       <p className="hint mt2">
-        Stable follows tagged releases with notes; edge follows a branch. Switching changes what is
-        listed, never what is installed, and never starts a check.
+        Stable follows tagged releases with notes; beta adds the pre-releases among them; edge
+        follows a branch. Switching changes what is listed, never what is installed, and never
+        starts a check.
       </p>
+      {view.channel === "beta" && (
+        <p className="hint mt2">
+          Leaving beta never rolls this instance back: it stays on its pre-release until a stable
+          release passes it.
+        </p>
+      )}
       <div className="mt3" style={{ opacity: view.channel === "edge" ? 1 : 0.6 }}>
         <TextField
           label="Edge branch"
@@ -573,6 +592,114 @@ function ChannelCard({ view, onSaved }: { view: PlatformReleaseView; onSaved: ()
           Save branch
         </Button>
       </div>
+    </RailCard>
+  );
+}
+
+/** Where a release is announced outside the console (#123). No v3 mock covers
+ *  this card, so it reuses the rail's existing primitives — RailCard, TextField,
+ *  Button, Chip — and adds no styling of its own. */
+function NotificationsCard({ view, onSaved }: { view: PlatformReleaseView; onSaved: () => void }) {
+  const { token } = useAuth();
+  const hook = view.release_webhook ?? null;
+  // A draft, so a half-typed URL is never a save.
+  const [draft, setDraft] = useState<string | null>(null);
+  const [tested, setTested] = useState<string | null>(null);
+
+  const save = useAdminAction(
+    async (patch: { release_webhook_url?: string; release_webhook_enabled?: boolean }) =>
+      adminApi.updateSettings(token ?? "", patch),
+    {
+      success: "Notification settings saved.",
+      failure: "Could not save the notification settings.",
+      onSuccess: () => {
+        setDraft(null);
+        setTested(null);
+        onSaved();
+      },
+    },
+  );
+
+  // A refused delivery comes back 200 with ok:false, so the outcome is read off
+  // the body rather than from a rejection.
+  const test = useAdminAction(async () => adminApi.testReleaseWebhook(token ?? ""), {
+    failure: "Could not send the test notification.",
+    onSuccess: (res) => {
+      setTested(
+        res.delivery.ok
+          ? `Delivered (${res.delivery.status_code ?? "2xx"}).`
+          : `Not delivered: ${res.delivery.error ?? "the receiver refused it"}`,
+      );
+      onSaved();
+    },
+  });
+
+  // A server that does not serve the notification surface renders no card at
+  // all, rather than a control that would save nowhere. After the hooks: the
+  // early return has to sit below them.
+  if (!hook) return null;
+  const url = draft ?? hook.url;
+  const dirty = url !== hook.url;
+  const busy = save.pending != null || test.pending != null;
+  const last = hook.last_delivery;
+
+  return (
+    <RailCard title="Notifications">
+      <TextField
+        label="Webhook URL"
+        name="release_webhook_url"
+        value={url}
+        mono
+        placeholder="https://hooks.example.com/…"
+        onChange={(e) => setDraft(e.target.value)}
+      />
+      <p className="hint mt2">
+        One POST when a release this instance could take appears. Works with Slack, Discord, ntfy
+        or your own endpoint. https only, and a private or loopback address is refused.
+      </p>
+      <div className="mt2 rowflex">
+        <Button
+          variant="ghost"
+          disabled={busy || !dirty}
+          onClick={() => void save.run({ release_webhook_url: url })}
+        >
+          {url === "" ? "Clear" : "Save URL"}
+        </Button>
+        <Button
+          variant="ghost"
+          disabled={busy || dirty || hook.url === ""}
+          onClick={() => void test.run()}
+        >
+          Send test
+        </Button>
+      </div>
+      <div className="mt3">
+        <Button
+          variant="ghost"
+          disabled={busy || (hook.url === "" && !hook.enabled)}
+          onClick={() => void save.run({ release_webhook_enabled: !hook.enabled })}
+        >
+          {hook.enabled ? "Turn notifications off" : "Turn notifications on"}
+        </Button>
+      </div>
+      <div className="mt3">
+        <Fact label="Status">
+          {hook.enabled ? <Chip variant="success" dot>On</Chip> : <Chip variant="neutral">Off</Chip>}
+        </Fact>
+        <Fact label="Signing">{hook.secret_configured ? "signed" : "unsigned"}</Fact>
+        {last && (
+          <Fact label="Last sent">
+            {last.status === "delivered" ? "delivered " : "failed "}
+            {relativeTime(last.attempted_at)}
+          </Fact>
+        )}
+      </div>
+      {tested && <p className="hint mt2">{tested}</p>}
+      {last?.status === "failed" && last.error && (
+        <p className="form-error mt2" role="alert">
+          Last notification failed: {last.error}
+        </p>
+      )}
     </RailCard>
   );
 }
@@ -637,7 +764,42 @@ function TargetChip({ target, older = false }: { target: PlatformReleaseTarget; 
     );
   }
   if (target.reason === "up_to_date") return <Chip variant="neutral">{older ? "Older than installed" : "Up to date"}</Chip>;
+  if (target.reason === "preflight_blocked") return <Chip variant="danger">Blocked</Chip>;
   return <Chip variant="neutral">Not ready</Chip>;
+}
+
+/** The preflight checks a target fails, each with the fix its detail names,
+ *  and the ones nobody could evaluate as a warning (amendment 9). Rendered
+ *  under the per-host detail; no v3 mock covers it, so it is a plain note. */
+function PreflightNote({ target }: { target: PlatformReleaseTarget }) {
+  const failing = blockingChecks(target);
+  const unknown = unknownChecks(target);
+  if (failing.length === 0 && unknown.length === 0) return null;
+  const name = target.kind === "control_plane" ? "Control plane" : (target.node_name ?? "Host");
+  return (
+    <div className="note" data-testid={`preflight-${target.host_id ?? "control-plane"}`}>
+      <div className="rowflex">
+        <b>{name}</b>
+        <span className="muted">
+          {failing.length > 0 ? "preflight check failed" : "preflight check not evaluated"}
+          {target.preflight?.checked_at && <> · checked {when(target.preflight.checked_at)}</>}
+        </span>
+      </div>
+      <ul className="release-faults">
+        {failing.map((c) => (
+          <li key={c.id}>
+            <Chip variant="danger">{preflightCheckText(c.id)}</Chip> {c.detail}
+          </li>
+        ))}
+        {failing.length === 0 &&
+          unknown.map((c) => (
+            <li key={c.id}>
+              <Chip variant="warning">{preflightCheckText(c.id)}</Chip> {c.detail}
+            </li>
+          ))}
+      </ul>
+    </div>
+  );
 }
 
 function TargetsCard({
@@ -684,7 +846,7 @@ function TargetsCard({
     {
       key: "why",
       header: "Why",
-      render: (t) => (attemptForTarget(attempts, t) ? "" : eligibilityText(t.reason ?? null)),
+      render: (t) => (attemptForTarget(attempts, t) ? "" : holdoutText(t)),
     },
     {
       key: "action",
@@ -743,7 +905,7 @@ function TargetsCard({
           {holdouts.map((t) => (
             <div className="rel-holdout" key={t.host_id ?? "cp"}>
               <span>{t.node_name}</span>
-              <span className="hint">{eligibilityText(t.reason ?? null)}</span>
+              <span className="hint">{holdoutText(t)}</span>
             </div>
           ))}
           {moreHoldouts > 0 && <div className="hint">+{moreHoldouts} more not ready</div>}
@@ -758,6 +920,9 @@ function TargetsCard({
           rowKey={(t) => t.host_id ?? "control-plane"}
           empty="No targets."
         />
+        {view.targets.map((t) => (
+          <PreflightNote key={`preflight-${t.host_id ?? "control-plane"}`} target={t} />
+        ))}
         {view.targets.map((t) => (
           <ManualPath
             key={t.host_id ?? "control-plane"}

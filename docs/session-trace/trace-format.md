@@ -144,9 +144,11 @@ document records (§8, §9) were estimator confusion, one level apart.
 > **`client.interactive_ms` removed from this table (IL-0 follow-up cleanup).** It was
 > documented as a live ping-as-input-marker interactive-latency metric but never emitted
 > by `buildMetrics()` in `web/src/webrtc/telemetry.ts` — a dead key, not a live metric.
-> Removed rather than backfilled with a synthesized value (see
-> `docs/research/input-latency-analysis.md` for the IL-0 finding, and §4 below for the
-> parallel removal from the clock-fields note). A future re-derivation is new work
+> Removed rather than backfilled with a synthesized value (the IL-0 finding was written up
+> in `docs/research/input-latency-analysis.md`, which was deliberately not carried over
+> to the public repository; see §4 below for the parallel removal from the clock-fields
+> note). A
+> future re-derivation is new work
 > against this doc, not a resurrection of this row.
 
 > **`frames_dropped` is source-scoped, never blind-overlaid.** It exists under **both**

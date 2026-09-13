@@ -98,7 +98,13 @@ func (e *Executor) Apply(ctx context.Context, req ApplyRequest, plan *ApplyPlan,
 	e.save(res)
 	out, code, err := e.run(ctx, plan.Commands[0], e.PullTimeout)
 	if err != nil || code != 0 {
-		e.fail(res, ReasonPullFailed, outputOrErr(out, err))
+		// Nothing was recreated, so the old container still runs: put `.env`
+		// back so it stops naming an image that never arrived. No `up`.
+		body := outputOrErr(out, err)
+		if e.restoreEnv() {
+			body = strings.TrimRight(body, "\n") + "\n.env restored from .env.prev; nothing was recreated\n"
+		}
+		e.fail(res, ReasonPullFailed, body)
 		return
 	}
 
@@ -108,7 +114,7 @@ func (e *Executor) Apply(ctx context.Context, req ApplyRequest, plan *ApplyPlan,
 
 	res.State = StateVerifying
 	e.save(res)
-	reason, detail := e.verify(ctx, plan.Services, upCode != 0 || upErr != nil)
+	reason, detail, failedID := e.verify(ctx, plan.Services, upCode != 0 || upErr != nil)
 	if reason == "" {
 		res.Output = ""
 		res.Reason = nil
@@ -118,29 +124,49 @@ func (e *Executor) Apply(ctx context.Context, req ApplyRequest, plan *ApplyPlan,
 	}
 
 	// Report the recreate's output, not the probe's: the operator needs what
-	// compose said, with the post-state as one added line.
+	// compose said, with the post-state as one added line — and the failed
+	// container's own last lines, which is where an agent's refusal to start
+	// (health-bind-failed, #152) is written.
 	body := outputOrErr(upOut, upErr)
 	if detail != "" {
 		body = strings.TrimRight(body, "\n") + "\n" + detail + "\n"
 	}
+	if tail := e.containerLogTail(ctx, failedID); tail != "" {
+		body = strings.TrimRight(body, "\n") + "\n--- last lines of the failed container ---\n" + tail + "\n"
+	}
 
-	// The only automatic restore: control-plane target, never started, so no
-	// migration can have run (ADR 0002) and no console is left to click
-	// "Revert". A node-agent apply is NEVER auto-restored — it carries no
-	// migrations, and a host that silently reverts hides the failure.
-	if reason == ReasonNeverStarted && targetsControlPlane(req.Components) {
+	// The automatic restore (restoreWorthy): a never-started control plane,
+	// because no migration can have run (ADR 0002) and no console is left to
+	// press Revert in; and a node agent whose new container failed its health
+	// wait, because the agent that would carry an operator's revert is the one
+	// that is down (ADR 0004). A control plane that STARTED is never restored.
+	if restoreWorthy(reason, req.Components) {
 		res.Restored = e.restore(ctx, plan)
 		if res.Restored {
 			body = strings.TrimRight(body, "\n") +
-				"\nthe new container never started; .env restored from .env.prev and the previous digest brought back up\n"
+				"\nthe new container did not come up; .env restored from .env.prev and the previous digest brought back up\n"
 		} else {
 			body = strings.TrimRight(body, "\n") +
-				"\nthe new container never started and the automatic restore ALSO failed; apply the digests in `previous` by hand\n"
+				"\nthe new container did not come up and the automatic restore ALSO failed; apply the digests in `previous` by hand\n"
 		}
 	}
 
 	res.Output = TailOutput(body, OutputTailBytes)
 	e.fail(res, reason, res.Output)
+}
+
+// restoreWorthy is the pure restore decision. semantics: agent-api.md
+// §release_state (`restored`), control-api.md §"Self-update hardening".
+func restoreWorthy(reason string, components []Component) bool {
+	switch reason {
+	case ReasonNeverStarted:
+		return true
+	case ReasonRecreateFailed, ReasonUnhealthy:
+		// A started control plane may have migrated; a node agent carries no
+		// migration, so going back is always safe.
+		return !targetsControlPlane(components)
+	}
+	return false
 }
 
 func targetsControlPlane(components []Component) bool {
@@ -152,8 +178,8 @@ func targetsControlPlane(components []Component) bool {
 	return false
 }
 
-// restore puts `.env.prev` back and re-runs `up` for the same services.
-func (e *Executor) restore(ctx context.Context, plan *ApplyPlan) bool {
+// restoreEnv puts `.env.prev` back, and nothing else.
+func (e *Executor) restoreEnv() bool {
 	prev, err := os.ReadFile(e.prevPath())
 	if err != nil {
 		log.Printf("restore: cannot read %s: %v", e.prevPath(), err)
@@ -161,6 +187,14 @@ func (e *Executor) restore(ctx context.Context, plan *ApplyPlan) bool {
 	}
 	if err := os.WriteFile(e.EnvPath, prev, 0o600); err != nil {
 		log.Printf("restore: cannot write %s: %v", e.EnvPath, err)
+		return false
+	}
+	return true
+}
+
+// restore puts `.env.prev` back and re-runs `up` for the same services.
+func (e *Executor) restore(ctx context.Context, plan *ApplyPlan) bool {
+	if !e.restoreEnv() {
 		return false
 	}
 	out, code, err := e.run(ctx, plan.Commands[1], e.RecreateTimeout)
@@ -210,6 +244,46 @@ func (e *Executor) EffectiveImages(ctx context.Context) map[string]*string {
 	return out
 }
 
+// ServiceConfigFiles is, per compose service this program may recreate, the
+// compose-file set its running container was started with (its own
+// com.docker.compose.project.config_files label). A service with no running
+// container maps to nil. Preflight compares each against this updater's own set
+// (`updater_overlays`): a recreate uses the updater's, so a service brought up
+// with an overlay the updater does not know would silently lose it.
+func (e *Executor) ServiceConfigFiles(ctx context.Context) map[string][]string {
+	out := map[string][]string{}
+	for _, t := range componentTargets {
+		out[t.service] = nil
+	}
+	args := []string{"ps", "--filter", "label=" + labelProject + "=" + e.Cfg.Project,
+		"--format", `{{.Label "com.docker.compose.service"}}` + "\t" + `{{.Label "` + labelConfigFiles + `"}}`}
+	body, code, err := e.run(ctx, args, 30*time.Second)
+	if err != nil || code != 0 {
+		log.Printf("docker ps (service labels): exit %d: %s", code, TailOutput(body, 512))
+		return out
+	}
+	for _, line := range strings.Split(body, "\n") {
+		svc, files, ok := strings.Cut(strings.TrimSpace(line), "\t")
+		if !ok {
+			continue
+		}
+		if _, known := out[svc]; !known {
+			continue
+		}
+		var list []string
+		for _, f := range strings.Split(files, ",") {
+			if f = strings.TrimSpace(f); f != "" {
+				list = append(list, f)
+			}
+		}
+		if list == nil {
+			list = []string{}
+		}
+		out[svc] = list
+	}
+	return out
+}
+
 // composePS is one service's post-state as `docker compose ps --format json`
 // reports it. Only the fields that decide the verdict are named.
 type composePS struct {
@@ -221,17 +295,18 @@ type composePS struct {
 }
 
 // verify returns "" when every named service is running and healthy-or-
-// health-less, else a reason plus one line of detail.
-func (e *Executor) verify(ctx context.Context, services []string, upFailed bool) (string, string) {
+// health-less, else a reason, one line of detail, and the failed container's
+// id ("" when there is none to read logs from).
+func (e *Executor) verify(ctx context.Context, services []string, upFailed bool) (string, string, string) {
 	args := append(ComposeArgs(e.Cfg), "ps", "-a", "--format", "json")
 	args = append(args, services...)
 	out, code, err := e.run(ctx, args, 60*time.Second)
 	if err != nil || code != 0 {
 		// Cannot see the stack, which is not evidence of success.
 		if upFailed {
-			return ReasonRecreateFailed, "post-state could not be read: " + strings.TrimSpace(out)
+			return ReasonRecreateFailed, "post-state could not be read: " + strings.TrimSpace(out), ""
 		}
-		return ReasonUnhealthy, "post-state could not be read: " + strings.TrimSpace(out)
+		return ReasonUnhealthy, "post-state could not be read: " + strings.TrimSpace(out), ""
 	}
 	byService := map[string]composePS{}
 	for _, p := range parseComposePS(out) {
@@ -242,7 +317,7 @@ func (e *Executor) verify(ctx context.Context, services []string, upFailed bool)
 		p, found := byService[svc]
 		if !found || p.ID == "" {
 			// No container at all, so there is nothing to have started.
-			return ReasonRecreateFailed, fmt.Sprintf("service %s has no container after the recreate", svc)
+			return ReasonRecreateFailed, fmt.Sprintf("service %s has no container after the recreate", svc), ""
 		}
 		running := strings.EqualFold(p.State, "running")
 		healthy := p.Health == "" || strings.EqualFold(p.Health, "healthy")
@@ -252,12 +327,12 @@ func (e *Executor) verify(ctx context.Context, services []string, upFailed bool)
 		// Checked first: it is the one failure in which nothing the new image
 		// would have done can have happened, which is what makes a restore safe.
 		if e.neverStarted(ctx, p.ID) {
-			return ReasonNeverStarted, fmt.Sprintf("service %s: container %s never started (State.StartedAt is zero)", svc, p.Name)
+			return ReasonNeverStarted, fmt.Sprintf("service %s: container %s never started (State.StartedAt is zero)", svc, p.Name), p.ID
 		}
 		if upFailed {
-			return ReasonRecreateFailed, fmt.Sprintf("service %s: state=%s health=%s", svc, p.State, p.Health)
+			return ReasonRecreateFailed, fmt.Sprintf("service %s: state=%s health=%s", svc, p.State, p.Health), p.ID
 		}
-		return ReasonUnhealthy, fmt.Sprintf("service %s: state=%s health=%s", svc, p.State, p.Health)
+		return ReasonUnhealthy, fmt.Sprintf("service %s: state=%s health=%s", svc, p.State, p.Health), p.ID
 	}
 	if upFailed {
 		// Everything is running and healthy but compose exited non-zero. Trust
@@ -265,7 +340,21 @@ func (e *Executor) verify(ctx context.Context, services []string, upFailed bool)
 		// read — but say so.
 		log.Printf("verify: compose exited non-zero yet every service is running and healthy; treating the stack as authoritative")
 	}
-	return "", ""
+	return "", "", ""
+}
+
+// containerLogTail is the failed container's last lines, "" when there is no
+// container or docker cannot read it. Bounded: it lands inside the 8 KiB
+// output the wire carries.
+func (e *Executor) containerLogTail(ctx context.Context, containerID string) string {
+	if containerID == "" {
+		return ""
+	}
+	out, code, err := e.run(ctx, []string{"logs", "--tail", "40", "--", containerID}, 30*time.Second)
+	if err != nil || code != 0 {
+		return ""
+	}
+	return TailOutput(strings.TrimRight(out, "\n"), 3072)
 }
 
 // zeroStartedAt is what docker prints for a container that has never run.

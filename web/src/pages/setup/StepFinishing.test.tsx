@@ -94,6 +94,7 @@ function renderStep(onFinish = vi.fn()) {
     user: { id: "u1", email: "admin@example.com", username: "admin", role: "admin" },
     token: "tok",
     isAdmin: true,
+    sessionExpired: false,
     login: vi.fn(),
     claim: vi.fn(),
     logout: vi.fn(),

@@ -317,6 +317,10 @@ func TestInstallModeComesFromTheUpdater(t *testing.T) {
 // fakeUpdater doubles as an UpdaterAPI for the cases that need no socket.
 func (u *fakeUpdater) Present() bool { return true }
 
+func (u *fakeUpdater) SocketState() SocketState {
+	return SocketState{DirExists: true, SocketExists: true}
+}
+
 func (u *fakeUpdater) Self(context.Context) (UpdaterSelf, error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()

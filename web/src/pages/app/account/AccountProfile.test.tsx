@@ -29,6 +29,7 @@ function authValue(role: "user" | "admin" = "admin"): AuthContextValue {
     },
     token: "t0k3n",
     isAdmin: role === "admin",
+    sessionExpired: false,
     login: vi.fn(),
     claim: vi.fn(),
     logout: vi.fn(),

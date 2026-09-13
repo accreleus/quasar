@@ -473,6 +473,19 @@ func (s *store) createApp(ctx context.Context, name, desc string, coverURL, kind
 	if profilePolicy == "" {
 		profilePolicy = "inherit"
 	}
+	// #171: an app on an image-managed preset carries that image's declared
+	// launch profile (gpu / no_new_privileges / systempaths_unconfined),
+	// whatever the request said. Never a derived tile (its spec must stay {})
+	// and never a provider app (the provider copied the values at install).
+	isTile := parentAppID != nil && *parentAppID != ""
+	isProvider := libraryProvider != nil && *libraryProvider != ""
+	if runtimePresetID != nil && !isTile && !isProvider {
+		stamped, _, err := s.stampLaunchProfile(ctx, runtimeSpec, *runtimePresetID)
+		if err != nil {
+			return App{}, err
+		}
+		runtimeSpec = stamped
+	}
 
 	cols := []string{"name", "description", "cover_url", "runtime_spec", "enabled",
 		"managed_home", "home_container_path", "default_profile_id", "profile_policy",
@@ -598,6 +611,47 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 			return App{}, ErrCoverURLOwnedByArtwork
 		}
 	}
+	// #171: when the patch touches the spec or the preset, re-stamp the managed
+	// image's launch profile onto the EFFECTIVE spec (the request's, else the
+	// stored one) for the EFFECTIVE preset. The console re-emits gpu on every
+	// save, so this must run on every spec write, not only on a preset change.
+	// Only when the result is a managed preset; switching to a plain preset or
+	// none leaves the spec exactly as sent. Never a derived tile or a provider
+	// app (launch_profile.go).
+	if len(runtimeSpec) > 0 || runtimePresetID != nil {
+		cur, err := s.appRuntimeRefs(ctx, id)
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			return App{}, err
+		}
+		if err == nil {
+			effPreset := cur.RuntimePresetID
+			if runtimePresetID != nil {
+				effPreset = *runtimePresetID
+			}
+			effSpec := cur.RuntimeSpec
+			if len(runtimeSpec) > 0 {
+				effSpec = runtimeSpec
+			}
+			isTile := cur.ParentAppID != nil && *cur.ParentAppID != ""
+			if parentAppID != nil && *parentAppID != nil && **parentAppID != "" {
+				isTile = true
+			}
+			isProvider := cur.LibraryProvider != ""
+			if libraryProvider != nil && *libraryProvider != "" {
+				isProvider = true
+			}
+			if effPreset != nil && !isTile && !isProvider {
+				stamped, ok, err := s.stampLaunchProfile(ctx, effSpec, *effPreset)
+				if err != nil {
+					return App{}, err
+				}
+				if ok {
+					runtimeSpec = stamped
+				}
+			}
+		}
+	}
+
 	query := `UPDATE apps SET `
 	var args []any
 	var setClauses []string

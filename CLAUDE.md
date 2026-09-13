@@ -5,7 +5,7 @@ This file is the durable context for every AI-agent session in this repo. Read i
 ## What Quasar is
 A self-hostable, multi-host cloud-gaming platform (a self-hosted GeForce Now). Built on the strongest components of `games-on-whales/wolf` (the Wayland compositor, virtual input) while taking a different direction: no discontinued NVIDIA GameStream / Moonlight protocol, WebRTC-to-browser first. (Wording note: never describe Quasar as a "clean-room successor" — Wolf is MIT and held in high regard here.)
 
-Full rationale: `docs/architecture-and-plan.md`. Phases 0–5 are complete (records below); their plans, execution records, and latency reports are archived under `docs/completed/`. Active work follows the roadmap-spec-v2 wave ladder — see "Current phase & standing defaults" below.
+Full rationale: `docs/architecture-and-plan.md`. Phases 0–5 are complete (records below); their detailed plans, execution records, and latency reports lived under `docs/completed/` but was deliberately not carried over to the public repository — that directory does not exist in this repo and is not public. The phase summaries in `docs/architecture-and-plan.md` and the compact verdicts below are what remains. Active work follows the roadmap-spec-v2 wave ladder — see "Current phase & standing defaults" below.
 
 ## The one rule that matters
 **Design for the end state, not the current phase.** Wolf grew from a single-host, single-user core, so multi-host / K8s / multi-user were retrofitted onto it later. If a capability is on the roadmap, the architecture must anticipate it from the first commit. Do not introduce a workaround that a later phase will have to tear out.
@@ -30,6 +30,25 @@ Full rationale: `docs/architecture-and-plan.md`. Phases 0–5 are complete (reco
 - `protocol/agent-api.md`, `control-api.md`, `schema.md` (Phase 1–3 contracts) and all amendments
 These are load-bearing: cheap-model tickets on the client and host sides depend on them being stable. Implement against them freely; changing them requires Opus + explicit human sign-off. Additive, admin-gated extensions that change no existing shape are the documented exception (see `control-api.md §Authorization`) and still want sign-off. If a ticket seems to need a contract change, stop and escalate.
 
+## What came across at the 2026-08-31 public move, and what did not
+The public repo starts at commit `590abb4`. Two kinds of reference in older prose
+therefore point somewhere other than where they look.
+
+**Docs.** `docs/completed/`, `docs/design/`, `docs/tech-debt/`, `docs/research/` and
+`docs/phase6-9/`, plus the dated report directories from before the move, are
+**deliberately** not part of this repository — they were early development plans and
+working records, and were not carried over. Where this file or another doc names one,
+the surrounding prose carries the facts that mattered, and that prose is the record.
+Don't go looking for the file, and don't reconstruct it.
+
+**Issue numbers.** A `#NNN` above ~150 in this file, or in any doc or issue body
+carried over from before the move, is a pre-move number and does not refer to an issue
+on this repo. Most simply fail to resolve; the dangerous ones resolve to
+something unrelated — `#39` was the swap-disposition feature and on this repo is a
+merged dependabot PR. Treat a high number in old prose as a historical marker rather
+than a link, and check before citing one. The live backlog entries below have been
+renumbered to their public issues.
+
 ## Repo map
 - `protocol/`     shared wire definitions (frozen interfaces) — **a git submodule of `quasar-protocol`** (the canonical contracts repo, also submoduled by `photon`, the native client — renamed from `quasar-client` in the 2026-08-20 org move). Run `git submodule update --init` after cloning/pulling. **Contract changes now happen in `quasar-protocol`** (Opus + sign-off as before), then bump the submodule pin here and in `photon`. Builds don't read `protocol/` (it's docs), so a deploy box with an un-init'd submodule still builds/runs — but **`go test ./...` does**: `TestOpenAPIDrift` reads `protocol/openapi.yaml` and fails with "no such file or directory" in a fresh worktree until you `git submodule update --init protocol`.
 - `node-agent/`   (Rust) real home; graduated out of the Phase-0 spike in Phase 1 (the `spike/` tree was retired 2026-07-17 — git history). **`session/pipeline.rs` is now a ~620-line facade over a `session/pipeline/` submodule tree** (`caps`/`encoders`/`source_branch`/`abr_glue`/`webrtc`/`rtp_ext`/`audio_branch`/`probes`.rs) — the gst-graph construction split (TD-01, review #5). Locate pipeline code by submodule, not one giant file.
@@ -51,13 +70,13 @@ These are load-bearing: cheap-model tickets on the client and host sides depend 
 - `deploy/`       compose now, k8s manifests later. **Build images with `deploy/build-images.sh`, never a hand-typed `docker build`** — it forces an explicit `--target` (a bare build takes the LAST stage regardless of `-t`), rejects a `--build-arg` for an undeclared ARG (Docker ignores those silently), and validates every artifact against `deploy/image-contract.json` before promoting `:latest`. The contract is the durable form of every image defect that reached production; **never relax an assertion to make a build green.** **`deploy/` is the OPERATOR front door: it holds only what someone installing Quasar needs.** Contributor tooling lives under `scripts/` — `dev/` (the dev container wrapper and dev seeders), `verify/` (verify stages + the devtools image), `harness/` (acceptance harnesses, `lib/`, `checks/`, the `apitest` module, `peer-driver.mjs`), `release/` (release-evidence gates), `dx/` (the Makefile's orchestration) — and non-operator compose overlays live in `deploy/overlays/`. Don't add a new development script to `deploy/`.
 - `third_party/`  vendored forks — **currently only a README**; gst-wayland-display/inputtino are built from upstream pins in `deploy/Dockerfile.vulkan` (the single image lineage: dev/runtime/nv targets on the `quasar-base` family), vendored only when modification is needed. Don't go looking for source here. Pins + flip instructions live in **`docs/third-party-pins.md`** — current: gst-wayland-display fork `310c03ec` (upstream base `43d4c25`), gst-interpipe `0c454917` (gow fork) + two vendored caps-leak patches, GStreamer `1.28.4` + vendored patches. **A pin bump on either fork is gated on a live exercise, not a green build** — see "Fork-bump verification policy" in `docs/third-party-pins.md`.
 - `CONTEXT.md`    the domain glossary (chain, rung, cert cap, stream plan, probe, envelope, entitlement, home, derived tile). Read it before naming things; add a term when work resolves one, rather than coining a synonym.
-- `docs/`         design docs (config knobs: `docs/configuration.md` — every env var, default, accepted values). **`docs/tech-debt/REVIEW-REMAINING.md`** is the scoped backlog of still-open review findings (#6/#8/#9/#10/#13/#14/#15; all low/subjective or a future spike — none are bugs); the executed TD-01/TD-02 refactor plans are archived in `docs/completed/tech-debt/`.
+- `docs/`         design docs (config knobs: `docs/configuration.md` — every env var, default, accepted values). The scoped backlog of still-open review findings (all low/subjective or a future spike — none are bugs) and the executed TD-01/TD-02 refactor plans lived at `docs/tech-debt/REVIEW-REMAINING.md` and `docs/completed/tech-debt/`; both were deliberately not carried over to the public repository. **The finding numbers this bullet used to list were review-finding IDs from the pre-move tracker, not issues on this repo** — several of them collide with unrelated public issues, so they have been removed rather than left to mislead.
 
 ## Conventions
 - Rust: 2021 edition, `cargo fmt` + `cargo clippy -- -D warnings` clean before done.
 - Go: `gofmt` + `go vet` clean; module path is `github.com/accreleus/quasar/control-plane`.
 - Commits: conventional-commits style (`feat:`, `fix:`, `docs:`, `chore:`).
-- No secrets in the repo. This is a private repo, but still: no keys, tokens, or `.env` committed.
+- No secrets in the repo. **`accreleus/quasar` is PUBLIC** — no keys, tokens or `.env` committed, and no real hostname, ssh alias, IP, or absolute path containing the operator's username in code, docs, commit messages, or the issue tracker. Speak in roles (`gpu-test`/`aux-infra`/`deploy-only`). `scripts/dev/leak-scan.sh` enforces it; `--issues` scans the tracker.
 
 ## Git branching & environments (operator policy — 2026-07-07)
 - **`main` = production.** Any merge INTO `main` requires **explicit human sign-off from the operator**. Never merge to `main` autonomously — not even a green feature branch.
@@ -162,12 +181,15 @@ skipped the handoff produced a full UI that had to be redone.)
 Escalate to Opus when: a ticket is ambiguous, touches a frozen interface or the latency path, or a cheaper model has failed it twice.
 
 ## Current phase & standing defaults
-**Roadmap of record: integrated roadmap spec v2**
-(`docs/design/plans/2026-07-06-roadmap-spec-v2.html` — library-provider model + wave
-ladder), which supersedes the numbered-phase framing. W0 (image consolidation, #367)
-and W1 (security wave, PR #374: invite-gated registration + device binding, migration
-0020) are merged; W2 is active (console-mode ∥ Phase 9 closure; executed plans are
-archived under `docs/completed/plans/`, live ones stay in `docs/design/plans/`). **"What's active right now" lives in GitHub milestones + the
+**Roadmap of record: integrated roadmap spec v2** (a library-provider model + wave
+ladder), which supersedes the numbered-phase framing. The source document,
+`docs/design/plans/2026-07-06-roadmap-spec-v2.html`, did not survive the 2026-08-31
+public repository deliberately, and is not in this
+repo's history — the wave-ladder facts on record are what follow. W0 (image
+consolidation, #367) and W1 (security wave, PR #374: invite-gated registration +
+device binding, migration 0020) are merged; W2 is active (console-mode ∥ Phase 9
+closure). Executed plans were archived under `docs/completed/plans/`, also non-public; going forward, plans (live and executed) are filed under
+`docs/superpowers/plans/`. **"What's active right now" lives in GitHub milestones + the
 session memory `current-focus.md`, not this file.**
 
 **Standing operational defaults (knobs, not history):**
@@ -177,9 +199,15 @@ session memory `current-focus.md`, not this file.**
   job, weekly, Monday 02:00 UTC (editable in the Jobs tab; run-now = "Check now"). Applying goes
   through the per-host **updater** (`quasar-updater` in every compose stack), which only accepts
   digests under `QUASAR_UPDATER_ALLOWED_NAMESPACES` (default the org's GHCR namespace). Control
-  plane first, then hosts, never below the DB's migration (ADR 0002); the fleet run drains the
-  whole fleet before the control-plane step because a control-plane restart ends every session
-  today (#128). A **source-built host or control plane is never offered a release** — it shows
+  plane first, then hosts, never below the DB's migration (ADR 0002). The fleet run **cordons**
+  the whole fleet for its whole life, but since #128/#153 it **drains before the control-plane
+  step only when the release carries a migration** — otherwise live sessions ride straight
+  through the restart (the agent holds them, the browser keeps its media path). The migrating
+  case still drains because every migration was authored assuming no session was live while it
+  ran, not because of the restart; the decision is `platform.ReleaseRunsAMigration` and
+  `apply_fleet.go prepareFleet` carries the argument. Host steps drain as they always did — a
+  node-agent recreate genuinely ends that host's sessions. A **source-built host or control
+  plane is never offered a release** — it shows
   the manual `redeploy.sh` recipe instead. Existing installs add the updater once
   (`docs/upgrading.md` "The updater"). **Publishing a release** (exercised live: 0.2.0 → 0.2.3, 2026-09-05/06) is
   `make release VERSION=x.y.z` on a clean `main` — recipe and refusals in `docs/upgrading.md`
@@ -256,8 +284,8 @@ session memory `current-focus.md`, not this file.**
   `device-path` read or NULL→READY makes the encoder bind its own display.
 - **Multi-codec (2026-07-25): H.264 + HEVC + AV1, one codec per session, resolved
   server-side at launch** (profile codec list ∩ host encoder set ∩ client decode probe ∩
-  failure history, guaranteed h264 floor; migrations 0031/0032; spec
-  `docs/design/plans/2026-07-22-multi-codec-hevc-av1-spec.md`). SHIP-DARK: profiles
+  failure history, guaranteed h264 floor; migrations 0031/0032; the design spec,
+  `docs/design/plans/2026-07-22-multi-codec-hevc-av1-spec.md`, was deliberately not carried over to the public repository). SHIP-DARK: profiles
   default h264-only; admins enable per profile (list ORDER = preference; the admin API
   reorders, the UI only edits status). Wire vocab `h264|h265|av1` vs catalog vocab
   `hevc` — bridged ONLY in `control-plane/internal/session/codec.go`. Vulkan hosts:
@@ -283,16 +311,19 @@ session memory `current-focus.md`, not this file.**
   Vulkan session is an NVENC MMU fault (Xid 31), because the encoder kept the launch-size
   DPB. Each rung step on Vulkan is an encoder session restart (VRAM flat over 84 flips).
   `abr_ladder_resolution` is inert unless the master `abr_ladder` is also true.
-  Evidence `docs/reports/2026-08-22-vulkanscale-validation/`; memory `vulkanscale-campaign`.
+  Evidence lived at `docs/reports/2026-08-22-vulkanscale-validation/` but was deliberately not carried over to the public repository; memory `vulkanscale-campaign`.
 - **Deep glass-to-glass trace is an always-on client (Chrome) capability** — the
   host-side overlay/probe was removed (#270; it could crash the stream).
-- Feature backlog: #39 (configurable swap disposition), #273 (per-session GPU routing +
-  admin GPU selection), #227 (LTR / intra-refresh for unstable-network recovery —
-  send-side ULPFEC shipped as `QUASAR_FEC_PERCENTAGE`, default off).
+- Feature backlog: #6 (configurable swap disposition), #7 (per-session GPU routing +
+  admin GPU selection), and LTR / intra-refresh for unstable-network recovery, which
+  has no public issue yet — send-side ULPFEC shipped as `QUASAR_FEC_PERCENTAGE`,
+  default off.
 
 ## Phase records — 0–5 + Optimization Spike/AS complete
-Full plans, execution records, latency reports, and per-phase verdicts: `docs/completed/`
-(compact verdicts also in the session memory `quasar-phase-records.md`).
+The full plans, execution records, latency reports, and per-phase verdicts lived at
+`docs/completed/`; that directory was deliberately not carried over to the public repository and
+is not public. The compact verdicts survive in the session memory
+`quasar-phase-records.md`.
 
 ## Code exploration
 For structural code questions use `workspace_search` / `workspace_symbol` from the

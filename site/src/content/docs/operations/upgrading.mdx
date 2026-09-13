@@ -170,6 +170,50 @@ docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-updater
 ```
 </Aside>
 
+## Verify release signatures
+
+**Optional, and off unless you turn it on.** What gets installed is always the
+digest the release manifest pins, whether or not anything is signed. A release
+may additionally publish a detached signature over that manifest — which covers
+every component image, because the manifest names each one by digest — and a
+host may be configured to check it before applying anything.
+
+Set two variables in that host's `deploy/.env` and recreate the updater:
+
+```bash
+QUASAR_UPDATER_SIGNATURE_MODE=verify
+QUASAR_UPDATER_TRUSTED_KEYS=<key-id>:<base64 public key>
+docker compose -f deploy/docker-compose.yml up -d --no-deps quasar-updater
+```
+
+`verify` refuses a release whose signature does not check out, and accepts one
+that publishes no signature — so you can turn it on before the releases you
+follow are signed, and nothing breaks. `require` also refuses an unsigned
+release; move to it once every release you intend to apply is signed.
+
+<Aside type="caution" title="require refuses two things verify does not">
+An **edge** release and a **revert** to a build this instance can no longer name
+by release both carry no version, so no published manifest could have signed
+them. Under `require` they are refused. Drop that host back to `verify` for such
+a revert, or use the by-hand upgrade above.
+</Aside>
+
+Confirm what a host is actually doing, from that host:
+
+```bash
+docker compose -f deploy/docker-compose.yml exec quasar-updater \
+  curl -s --unix-socket /run/quasar-updater/updater.sock http://u/v1/self
+```
+
+`signature_mode`, `trusted_key_ids` and `manifest_source` are in the answer. A
+host that comes back up reporting `off` after you set the variables has a
+compose file predating the feature — refresh `deploy/docker-compose.yml`.
+
+Enabling either mode with no trusted keys refuses **every** update, on purpose: a
+gate that is on but checking nothing is worse than one that is off. Publishing
+signed releases from your own fork, and rotating a key without a flag day, are in
+the repository's `docs/upgrading.md`.
+
 ## If your install ever ran a source build
 
 **Only if your stack was built from source before this change, and only once.**

@@ -408,7 +408,14 @@ if (HOLD_SECS > 0) {
 // (160x90 — cheap) offscreen canvas and computes ITU-R BT.709 luma
 // (0.2126R+0.7152G+0.0722B): a black/frozen stream reads mean~16 sd~0, real
 // motion reads mean>40 or sd>2 across samples (the pairing used by the #378
-// test matrix's content-live gate). Every failure mode (no <video>, no 2D
+// test matrix's content-live gate).
+//
+// THOSE THRESHOLDS ASSUME FULL-FRAME CONTENT and are wrong for a sparse scene.
+// `videotestsrc pattern=ball` is a 20px-radius ball — ~0.06% of a 1080p frame,
+// ~9 px of this 160x90 canvas — so a perfectly healthy Ball stream reads
+// mean~3 sd=0.00 "first content never", which is indistinguishable here from
+// black. Do not judge rendering from a Ball run; use a full-frame bench app.
+// See docs/testing-bench-mode.md "The luma probe is blind to sparse content". Every failure mode (no <video>, no 2D
 // context, tainted canvas, page teardown) is caught and turned into `{ error }`
 // rather than throwing — this must never fail the run, only report
 // "unavailable".

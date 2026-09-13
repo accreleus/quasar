@@ -16,10 +16,30 @@ import (
 const (
 	ChannelStable = "stable"
 	ChannelEdge   = "edge"
+
+	// Beta offers stable's releases AND the prereleases among them. It stores
+	// no rows of its own: detection already caches every published release,
+	// prerelease or not, as a `stable` row carrying its `prerelease` flag, and
+	// stable declines to list the flagged ones. `platform_releases.channel`
+	// therefore stays CHECK IN ('stable','edge'), and switching to or from beta
+	// re-detects and writes nothing.
+	ChannelBeta = "beta"
 )
 
-// ValidChannel reports whether c is one of the two channels.
-func ValidChannel(c string) bool { return c == ChannelStable || c == ChannelEdge }
+// ValidChannel reports whether c is one of the three channels.
+func ValidChannel(c string) bool {
+	return c == ChannelStable || c == ChannelEdge || c == ChannelBeta
+}
+
+// rowChannel maps a channel to the `platform_releases.channel` value whose rows
+// it selects: beta reads stable's, every other channel its own. Every
+// channel-keyed read of a release row goes through here.
+func rowChannel(channel string) string {
+	if channel == ChannelBeta {
+		return ChannelStable
+	}
+	return channel
+}
 
 // Release is one `platform_releases` row and the `PlatformRelease` wire shape.
 type Release struct {
@@ -32,6 +52,16 @@ type Release struct {
 	Prerelease    bool      `json:"prerelease"`
 	Notes         string    `json:"notes"`
 	CompareURL    *string   `json:"compare_url"`
+	// Migrates is `schema_version` above the control plane's — i.e. applying
+	// this release runs at least one migration here, which is the ONLY case in
+	// which the fleet's control-plane step drains the instance (#153). DERIVED
+	// AND SERVED, never left to a client to re-derive, for the same reason
+	// HostIdentity.IdentityKnown is: the drain policy is the server's, and a
+	// client twin of it would go on telling an operator what they are consenting
+	// to after the policy moved. Set in `offerable`, which is where the control
+	// plane's own schema version is in hand; a Release read straight from the
+	// store and never served leaves it false.
+	Migrates bool `json:"migrates"`
 	// The asset verbatim: raw so a field this build does not read still reaches
 	// a client. nil marshals to `null` — the answer on edge.
 	Manifest     json.RawMessage `json:"manifest"`
@@ -50,6 +80,28 @@ type HostIdentity struct {
 	InstallMode    *string `json:"install_mode"`
 	UpdaterPresent *bool   `json:"updater_present"`
 	IdentityKnown  bool    `json:"identity_known"`
+	// AgentConnected is whether this host's agent has a live socket to THIS
+	// control-plane process, as the agent registry sees it right now.
+	//
+	// NOT SERIALIZED, deliberately: `PlatformHostIdentity` is a frozen shape and
+	// this is an input to the eligibility decision, not a new field on the wire.
+	//
+	// It exists because `status` cannot answer the question. Nothing corrects an
+	// idle host's status across a control-plane restart: `markOffline` runs only
+	// from the connection goroutine's defer, so a control plane that exits never
+	// runs it, and the stale sweep only visits hosts WITH ACTIVE SESSIONS. Every
+	// fleet run contains a control-plane restart, so "the row says online but no
+	// agent is there" is the normal shape of a run, not an edge case (#169).
+	//
+	// nil = unknown (no registry wired), and the column is trusted instead —
+	// the same seam `UncordonHost` and the per-host apply runner already use.
+	AgentConnected *bool `json:"-"`
+
+	// The host's last stored readiness report (hosts.readiness, raw) and when
+	// it changed: inputs to the preflight decision, not fields on the frozen
+	// identity shape, hence unserialized like AgentConnected.
+	Readiness           json.RawMessage `json:"-"`
+	ReadinessReportedAt *time.Time      `json:"-"`
 }
 
 // Known is `identity_known`: all four fields present. A host with any of them
@@ -87,6 +139,11 @@ const (
 	ReasonReleaseAboveControlPlane = "release_above_control_plane"
 	ReasonControlPlaneNotFirst     = "control_plane_not_first"
 
+	// Before the two transient reasons: a stack shape is a durable fact.
+	// Produced only by a preflight whose state is `blocked`; `unknown` never
+	// blocks (preflight.go).
+	ReasonPreflightBlocked = "preflight_blocked"
+
 	// Amendment 2 appends these two at the END of the order. They need apply
 	// state this build has no table for; #116 evaluates them.
 	ReasonAttemptInFlight = "attempt_in_flight"
@@ -100,6 +157,8 @@ type Target struct {
 	NodeName *string `json:"node_name"`
 	Eligible bool    `json:"eligible"`
 	Reason   *string `json:"reason"`
+	// Preflight: CONTEXT.md. Answered beside Eligible so the card can name the fix.
+	Preflight Preflight `json:"preflight"`
 }
 
 // The closed `PlatformReleaseFaultKind` vocabulary. A fault gates nothing; it
@@ -145,6 +204,35 @@ type View struct {
 	// Every open attempt on the instance, plus the active fleet run (#117).
 	// A client joins an attempt to a target by host_id.
 	ActiveApply *ActiveApply `json:"active_apply"`
+	// Outbound notification config + last delivery (#123). Null on a build with
+	// no notification store wired.
+	ReleaseWebhook *WebhookStatus `json:"release_webhook"`
+}
+
+// UpdateAvailable is the newest listed release when it is a step FORWARD from
+// the installed control plane, and false otherwise.
+//
+// `available` alone is not the answer: a current instance still lists the
+// release it is running, so that `up_to_date` can be evaluated against it.
+// Client twin: web/src/pages/admin/fleet/releasesCopy.ts hasUpdate.
+func (v View) UpdateAvailable() (*Release, bool) {
+	if len(v.Available) == 0 {
+		return nil, false
+	}
+	newest := v.Available[0]
+	cp := v.Installed.ControlPlane
+	if edgeOlderThanInstalled(newest, cp) {
+		return nil, false
+	}
+	// An unstamped build has no commit to be "already on it" about, so the
+	// listed release is news.
+	if cp.SourceCommit == nil {
+		return &newest, true
+	}
+	if commitsMatch(*cp.SourceCommit, newest.SourceCommit) {
+		return nil, false
+	}
+	return &newest, true
 }
 
 // An agent reports 7-40 hex (agent-api.md) while a manifest carries the full

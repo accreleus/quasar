@@ -24,7 +24,7 @@ printf '%s\n' "$*" >> "$d/argv.log"
 verb=""
 for a in "$@"; do
   case "$a" in
-    pull|up|ps|inspect|config) verb="$a"; break ;;
+    pull|up|ps|inspect|config|logs) verb="$a"; break ;;
   esac
 done
 [ -n "$verb" ] || { echo "fake docker: no verb in: $*" >&2; exit 99; }
@@ -169,20 +169,31 @@ func TestExecutorPullFailureDoesNotRecreate(t *testing.T) {
 	if !strings.Contains(res.Output, "mismatched image rootfs") {
 		t.Fatalf("output = %q", res.Output)
 	}
+	// Nothing was recreated, so the old container still runs and `.env` must
+	// not go on naming an image that never arrived.
+	got, _ := os.ReadFile(f.envPath)
+	if strings.Contains(string(got), goodDigest) {
+		t.Fatalf(".env must be put back after a failed pull: %s", got)
+	}
+	if !strings.Contains(res.Output, ".env restored") {
+		t.Fatalf("output must say the file was put back: %q", res.Output)
+	}
 }
 
+// With no container at all there is nothing to read logs from, and the restore
+// still runs: the old agent is what an operator wants back.
 func TestExecutorRecreateFailureWhenNoContainerExists(t *testing.T) {
-	f := newFakeEnv(t, "")
-	f.canned("up.code", "1")
-	f.canned("up.out", "service quasar-node-agent: no such image\n")
+	f := newFakeEnv(t, "QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@"+prevDigest+"\n")
+	f.canned("up.1.code", "1")
+	f.canned("up.1.out", "service quasar-node-agent: no such image\n")
 	f.canned("ps.out", "")
 
 	res := f.apply(agentReq())
 	if res.State != StateFailed || *res.Reason != ReasonRecreateFailed {
 		t.Fatalf("state=%s reason=%v", res.State, res.Reason)
 	}
-	if res.Restored {
-		t.Fatal("a node-agent apply is never auto-restored")
+	if !res.Restored {
+		t.Fatalf("a node-agent recreate failure is restored (ADR 0004); output=%s", res.Output)
 	}
 }
 
@@ -211,9 +222,12 @@ func TestExecutorNeverStartedControlPlaneIsRestored(t *testing.T) {
 	}
 }
 
-func TestExecutorNeverStartedAgentIsNotRestored(t *testing.T) {
+// ADR 0004: a node agent whose new container never started is restored too —
+// it carries no migration, and the agent that would carry an operator's revert
+// is the one that is down.
+func TestExecutorNeverStartedAgentIsRestored(t *testing.T) {
 	f := newFakeEnv(t, "QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@"+prevDigest+"\n")
-	f.canned("up.code", "1")
+	f.canned("up.1.code", "1")
 	f.canned("ps.out", psJSON("quasar-node-agent", "na1", "created", ""))
 	f.canned("inspect.out", zeroStartedAt+"\n")
 
@@ -221,12 +235,102 @@ func TestExecutorNeverStartedAgentIsNotRestored(t *testing.T) {
 	if *res.Reason != ReasonNeverStarted {
 		t.Fatalf("reason = %v", res.Reason)
 	}
-	if res.Restored {
-		t.Fatal("a node-agent apply is NEVER auto-restored")
+	if !res.Restored {
+		t.Fatalf("a never-started node-agent apply is restored; output=%s", res.Output)
 	}
 	got, _ := os.ReadFile(f.envPath)
-	if !strings.Contains(string(got), goodDigest) {
-		t.Fatalf(".env must keep the new digest so the failure stays visible: %s", got)
+	if !strings.Contains(string(got), prevDigest) || strings.Contains(string(got), goodDigest) {
+		t.Fatalf(".env was not restored from .env.prev: %s", got)
+	}
+}
+
+// The #152 field case: the new agent exits because its health port is taken.
+// The updater restores the old one, and the result carries the failed
+// container's own last lines — which is where `health-bind-failed` is — so the
+// card can say why, and `restored: true` so the control plane can record it.
+func TestExecutorUnhealthyAgentIsRestoredWithItsLogTail(t *testing.T) {
+	f := newFakeEnv(t, "QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@"+prevDigest+"\n")
+	f.canned("up.1.code", "1")
+	f.canned("up.1.out", "container deploy-quasar-node-agent-1 is unhealthy\n")
+	f.canned("ps.out", psJSON("quasar-node-agent", "na1", "exited", ""))
+	f.canned("inspect.out", "2026-09-05T11:04:31Z\n")
+	f.canned("logs.out", "ERROR health-bind-failed: cannot bind 127.0.0.1:9091: address in use\n")
+
+	res := f.apply(agentReq())
+	if res.State != StateFailed || *res.Reason != ReasonRecreateFailed {
+		t.Fatalf("state=%s reason=%v", res.State, res.Reason)
+	}
+	if !res.Restored {
+		t.Fatalf("restored=false; output=%s", res.Output)
+	}
+	for _, want := range []string{"health-bind-failed", "previous digest brought back up", "last lines of the failed container"} {
+		if !strings.Contains(res.Output, want) {
+			t.Fatalf("output lacks %q:\n%s", want, res.Output)
+		}
+	}
+	// The log read names the failed container, and the restore is a second up.
+	log := f.argv()
+	if !strings.Contains(log, "logs --tail 40 -- na1") || strings.Count(log, " up ") != 2 {
+		t.Fatalf("argv:\n%s", log)
+	}
+	got, _ := os.ReadFile(f.envPath)
+	if !strings.Contains(string(got), prevDigest) {
+		t.Fatalf(".env was not restored: %s", got)
+	}
+}
+
+// A control plane that STARTED may have migrated: never restored (ADR 0002).
+func TestExecutorUnhealthyControlPlaneIsNotRestored(t *testing.T) {
+	f := newFakeEnv(t, "QUASAR_CONTROL_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@"+prevDigest+"\n")
+	f.canned("ps.out", psJSON("quasar-control-plane", "cp1", "running", "unhealthy"))
+	f.canned("inspect.out", "2026-09-05T11:04:31Z\n")
+
+	req := agentReq()
+	req.Components = []Component{{Name: "control-plane", Image: "ghcr.io/accreleus/quasar/quasar-control-plane", Digest: goodDigest}}
+	res := f.apply(req)
+	if *res.Reason != ReasonUnhealthy || res.Restored {
+		t.Fatalf("reason=%v restored=%v", res.Reason, res.Restored)
+	}
+	if strings.Count(f.argv(), " up ") != 1 {
+		t.Fatalf("a started control plane must not be re-upped:\n%s", f.argv())
+	}
+}
+
+// If the restore itself fails, both failures are in the output and the host is
+// where a failed recreate always left it.
+func TestExecutorRestoreFailureSurfacesBoth(t *testing.T) {
+	f := newFakeEnv(t, "QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@"+prevDigest+"\n")
+	f.canned("up.code", "1")
+	f.canned("up.out", "container exited\n")
+	f.canned("ps.out", psJSON("quasar-node-agent", "na1", "exited", ""))
+	f.canned("inspect.out", "2026-09-05T11:04:31Z\n")
+
+	res := f.apply(agentReq())
+	if res.Restored {
+		t.Fatal("the second up failed too, so nothing was restored")
+	}
+	if !strings.Contains(res.Output, "restore ALSO failed") {
+		t.Fatalf("output = %q", res.Output)
+	}
+}
+
+func TestRestoreWorthy(t *testing.T) {
+	agent := []Component{{Name: "node-agent"}}
+	cp := []Component{{Name: "control-plane"}}
+	cases := []struct {
+		reason string
+		comps  []Component
+		want   bool
+	}{
+		{ReasonNeverStarted, agent, true}, {ReasonNeverStarted, cp, true},
+		{ReasonRecreateFailed, agent, true}, {ReasonRecreateFailed, cp, false},
+		{ReasonUnhealthy, agent, true}, {ReasonUnhealthy, cp, false},
+		{ReasonPullFailed, agent, false}, {ReasonInvalid, agent, false},
+	}
+	for _, tc := range cases {
+		if got := restoreWorthy(tc.reason, tc.comps); got != tc.want {
+			t.Fatalf("restoreWorthy(%s, %s) = %v, want %v", tc.reason, tc.comps[0].Name, got, tc.want)
+		}
 	}
 }
 

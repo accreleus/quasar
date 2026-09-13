@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -176,6 +177,29 @@ func (f *fakeStore) SetPreviousDigests(_ context.Context, id string, previous []
 		a.PreviousDigests = previous
 	}
 	return nil
+}
+
+func (f *fakeStore) CreateAutoRevertAttempt(_ context.Context, in NewAutoRevert) (Attempt, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row := Attempt{ID: "auto-" + in.Failed.ID, RunID: in.Failed.RunID, Kind: KindAutoRevert, Target: TargetHost,
+		HostID: in.Failed.HostID, RequestedDigests: in.Requested, PreviousDigests: in.Previous,
+		State: AttemptSucceeded, Output: in.Output}
+	f.attempts[row.ID] = &row
+	return row, nil
+}
+
+// autoReverts is every auto_revert row the runner recorded.
+func (f *fakeStore) autoReverts() []Attempt {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []Attempt
+	for _, a := range f.attempts {
+		if a.Kind == KindAutoRevert {
+			out = append(out, *a)
+		}
+	}
+	return out
 }
 
 func (f *fakeStore) OpenHostAttempt(_ context.Context, hostID string) (Attempt, string, error) {
@@ -618,6 +642,50 @@ func TestApplyTimesOutWhenTheAgentNeverReconnects(t *testing.T) {
 	}
 }
 
+// A control-plane shutdown during the connect wait is a cancel, not a verdict
+// (#202). Services.Stop documents in-flight applies as cancelled rather than
+// failed, and a terminal `timeout` written here could never be resumed: Adopt
+// skips terminal rows, and in the unattended lane a failed release is
+// suppressed, so a double bounce blocked auto-apply until an admin applied by
+// hand.
+func TestShutdownDuringTheConnectWaitLeavesTheAttemptResumable(t *testing.T) {
+	a := queuedAttempt(true)
+	store := newFakeStore(a)
+	agent := &fakeAgent{ack: Ack{OK: true}}
+	deps := agent.deps()
+	deps.Connected = func(string) bool { return false }
+	r := testRunner(store, deps)
+	// Long enough that nothing but the shutdown can end the wait.
+	r.ConnectWait = time.Minute
+
+	r.Start(a)
+	waitFor(t, "the attempt to be waiting for its host's agent", func() bool {
+		return store.snapshot(a.ID).State == AttemptWaitingSessions
+	})
+	r.Close() // main.go's `defer svc.Stop()`
+
+	got := store.snapshot(a.ID)
+	if got.State != AttemptWaitingSessions {
+		t.Fatalf("state = %q, want waiting_sessions: a shutdown must leave the row for the next boot", got.State)
+	}
+	if got.Reason != nil {
+		t.Errorf("reason = %q, want none: nothing failed", *got.Reason)
+	}
+	if agent.sentCount() != 0 {
+		t.Error("release_apply was sent to a host with no agent connected")
+	}
+
+	// The next boot, with the host's agent back: the same row is re-adopted and
+	// sent, which is what the terminal write used to make impossible.
+	agent2 := &fakeAgent{ack: Ack{OK: true}}
+	deps2 := agent2.deps()
+	deps2.Connected = func(string) bool { return true }
+	r2 := testRunner(store, deps2)
+	defer r2.Close()
+	r2.Adopt(context.Background())
+	waitFor(t, "the re-adopted apply to be sent", func() bool { return agent2.sentCount() == 1 })
+}
+
 func strPtr(s string) *string { return &s }
 
 // #140: an attempt that belongs to a fleet run leaves the cordon to the run.
@@ -672,5 +740,75 @@ func TestARunOwnedAttemptStillCordonsAServingHost(t *testing.T) {
 	defer agent.mu.Unlock()
 	if agent.cordons != 1 || agent.uncordon != 0 {
 		t.Fatalf("cordon calls = %d cordon / %d uncordon, want 1 / 0", agent.cordons, agent.uncordon)
+	}
+}
+
+// Amendment 9: a failed report carrying `restored` records the updater's own
+// restore as an auto_revert row with the digest sets swapped; without the flag
+// no row is written.
+func TestRestoredReleaseStateRecordsAnAutoRevert(t *testing.T) {
+	for _, restored := range []bool{true, false} {
+		a := queuedAttempt(true)
+		store := newFakeStore(a)
+		agent := &fakeAgent{ack: Ack{OK: true}}
+		r := testRunner(store, agent.deps())
+		r.Start(a)
+		waitFor(t, "release_apply to be sent", func() bool { return agent.sentCount() == 1 })
+
+		prev := "sha256:" + strings.Repeat("b", 64)
+		failed := ReasonRecreateFailed
+		r.HandleReleaseState(context.Background(), testHostID, ReleaseStateReport{
+			RequestID: agent.sent[0].RequestID, State: AttemptFailed, Reason: &failed,
+			Previous: []PreviousDigest{{Name: ComponentNodeAgent, Digest: &prev}},
+			Output:   "health-bind-failed", Restored: restored,
+		})
+		r.Close()
+
+		if got := store.snapshot(a.ID); got.State != AttemptFailed {
+			t.Fatalf("restored=%v: apply state = %q, want failed", restored, got.State)
+		}
+		rows := store.autoReverts()
+		if !restored {
+			if len(rows) != 0 {
+				t.Fatalf("no restore was reported, yet %d auto_revert rows", len(rows))
+			}
+			continue
+		}
+		if len(rows) != 1 {
+			t.Fatalf("auto_revert rows = %d, want 1", len(rows))
+		}
+		row := rows[0]
+		if row.State != AttemptSucceeded || row.HostID == nil || *row.HostID != testHostID {
+			t.Fatalf("row = %+v", row)
+		}
+		// Moved TO the previous digest, FROM the failed release's.
+		if len(row.RequestedDigests) != 1 || row.RequestedDigests[0].Digest != prev ||
+			row.RequestedDigests[0].Image != a.RequestedDigests[0].Image {
+			t.Fatalf("requested = %+v, want the previous digest under the same image", row.RequestedDigests)
+		}
+		if len(row.PreviousDigests) != 1 || row.PreviousDigests[0].Digest == nil ||
+			*row.PreviousDigests[0].Digest != a.RequestedDigests[0].Digest {
+			t.Fatalf("previous = %+v, want the failed release's digest", row.PreviousDigests)
+		}
+	}
+}
+
+// A report that says restored but names no previous digest is a row with no
+// digest to move to: nothing is written, and the failure still stands.
+func TestRestoredWithoutAPreviousDigestRecordsNothing(t *testing.T) {
+	a := queuedAttempt(true)
+	store := newFakeStore(a)
+	agent := &fakeAgent{ack: Ack{OK: true}}
+	r := testRunner(store, agent.deps())
+	r.Start(a)
+	waitFor(t, "release_apply to be sent", func() bool { return agent.sentCount() == 1 })
+	failed := ReasonUnhealthy
+	r.HandleReleaseState(context.Background(), testHostID, ReleaseStateReport{
+		RequestID: agent.sent[0].RequestID, State: AttemptFailed, Reason: &failed,
+		Previous: []PreviousDigest{{Name: ComponentNodeAgent}}, Restored: true,
+	})
+	r.Close()
+	if n := len(store.autoReverts()); n != 0 {
+		t.Fatalf("auto_revert rows = %d, want none", n)
 	}
 }

@@ -39,6 +39,7 @@ import type {
   PlatformApplyRunsResponse,
   PlatformIdentity,
   PlatformReleaseView,
+  PlatformWebhookTestResponse,
   ReleaseChannel,
   RegistrationMode,
   StorageProvider,
@@ -104,6 +105,13 @@ export interface AdminActivityItem {
   actor_username: string | null;
   /** Derived server-side from `action` — never stored, never client-supplied. */
   severity: AdminActivitySeverity;
+  /** Display names for the ids on this row — `target_id` and the allowlisted id
+   *  keys inside `details` — keyed by the raw id as it appears on the row.
+   *  Resolved at read time; an id with no name is ABSENT, there is no sentinel.
+   *  A present name is the entity's current name, or the one it had when the
+   *  event happened; those two are deliberately indistinguishable.
+   *  (control-api.md "Audit-log names".) */
+  names: Record<string, string>;
 }
 
 export type AdminActivitySeverity = "info" | "warn" | "err";
@@ -169,6 +177,14 @@ export function updateSettings(
     /** Rejected with 400 unless it is a git ref name: 1-255 characters, no
      *  whitespace, no "..", no leading "-". */
     release_edge_branch?: string;
+    /** "" clears the URL and disables the webhook in the same write; anything
+     *  else must be an absolute https URL with no credentials. */
+    release_webhook_url?: string;
+    /** Rejected with 400 when no URL is stored and none is sent with it. */
+    release_webhook_enabled?: boolean;
+    /** Unattended automatic apply (#122). Refuses nothing: with nothing to
+     *  apply it applies nothing and records why in the detection run. */
+    platform_auto_apply?: boolean;
   },
 ): Promise<SettingsResponse> {
   return apiFetch<SettingsResponse>("/admin/settings", {
@@ -908,6 +924,15 @@ export function getPlatformReleases(
   signal?: AbortSignal,
 ): Promise<PlatformReleaseView> {
   return apiFetch<PlatformReleaseView>("/admin/platform/releases", { token, signal });
+}
+
+/** Send one test notification. A refused delivery is 200 with `ok: false` — the
+ *  request succeeded and the receiver's answer is the payload. */
+export function testReleaseWebhook(token: string): Promise<PlatformWebhookTestResponse> {
+  return apiFetch<PlatformWebhookTestResponse>("/admin/platform/release-webhook/test", {
+    method: "POST",
+    token,
+  });
 }
 
 /** Apply one release to one host. 202 with the attempt; the work is

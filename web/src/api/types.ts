@@ -77,12 +77,19 @@ export type ReleaseChannel = NonNullable<InstanceSettings["release_channel"]>;
 export type PlatformReleaseView = Schemas["PlatformReleaseView"];
 export type PlatformRelease = Schemas["PlatformRelease"];
 export type PlatformReleaseTarget = Schemas["PlatformReleaseTarget"];
+export type PlatformPreflight = Schemas["PlatformPreflight"];
+export type PlatformPreflightCheck = Schemas["PlatformPreflightCheck"];
 export type PlatformReleaseFault = Schemas["PlatformReleaseFault"];
 export type PlatformHostIdentity = Schemas["PlatformHostIdentity"];
 export type PlatformIdentity = Schemas["PlatformIdentity"];
 /** Closed vocabulary the UI maps to text; an unrecognised value is rendered
  *  verbatim rather than dropping the row (control-api.md). */
 export type EligibilityReason = Schemas["EligibilityReason"];
+
+/** Release notifications (#123, control-api.md §"Release notifications"). */
+export type PlatformReleaseWebhook = Schemas["PlatformReleaseWebhook"];
+export type PlatformWebhookDelivery = Schemas["PlatformWebhookDelivery"];
+export type PlatformWebhookTestResponse = Schemas["PlatformWebhookTestEnvelope"];
 
 export type PlatformApplyAttempt = Schemas["PlatformApplyAttempt"];
 export type PlatformApplyAttemptEnvelope = Schemas["PlatformApplyAttemptEnvelope"];

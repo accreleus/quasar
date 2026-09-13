@@ -2968,6 +2968,15 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 404: components["responses"]["NotFound"];
                 409: components["responses"]["Conflict"];
+                /** @description agent_not_connected — the session's host agent is reconnecting. RETRYABLE: the session is alive and its media may still be flowing; retry with backoff rather than treating this as terminal. */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
             };
         };
         delete?: never;
@@ -3762,12 +3771,18 @@ export interface paths {
                         /** @description First-run wizard v2 §S6e (migration 0064). The signaling origin allow-list. ABSENT = UNCHANGED; an explicitly-sent [] CLEARS the list. Those are different requests and the server distinguishes them (pointer decode), so a PATCH that only changes the registration mode can never wipe the allow-list. Each entry must be scheme + host only (http/https, no path, query, credentials or trailing slash); the server stores the NORMALIZED form, so what is saved is exactly what /v1/signal compares against. "*" IS REJECTED OUTRIGHT with 400 validation_failed - a wildcard would discard the layer entirely. A bad entry is 400 naming its position, and nothing is written. Setting this does NOT lift an environment override: when QUASAR_ALLOWED_ORIGINS is SET it wins, and GET /v1/admin/access-check reports which source is in force. */
                         allowed_origins?: string[];
                         /**
-                         * @description Platform-release amendment 1 (#104/#106, migration 0074). Which platform releases the admin console is shown. Absent = unchanged (pointer decode, the same rule every field on this body follows - a plain decode would read "" and silently reset the channel whenever an admin changed the registration mode). Any value outside the enum is 400 validation_failed. Takes effect immediately: the next GET /v1/admin/platform/releases reads the other channel's rows. IT DOES NOT TRIGGER DETECTION - that is a jobs-framework job, and "check now" is POST /v1/admin/jobs/{job_id}/run.
+                         * @description Platform-release amendment 1 (#104/#106, migration 0074); `beta` added by amendment 3 (#121, migration 0079). Which platform releases the admin console is shown. Absent = unchanged (pointer decode, the same rule every field on this body follows - a plain decode would read "" and silently reset the channel whenever an admin changed the registration mode). Any value outside the enum is 400 validation_failed. Takes effect immediately: the next GET /v1/admin/platform/releases reads the other channel's rows. IT DOES NOT TRIGGER DETECTION - that is a jobs-framework job, and "check now" is POST /v1/admin/jobs/{job_id}/run.
                          * @enum {string}
                          */
-                        release_channel?: "stable" | "edge";
+                        release_channel?: "stable" | "beta" | "edge";
                         /** @description Platform-release amendment 1 (#104/#106, migration 0074). The branch the EDGE channel follows; default develop. Absent = unchanged. Validated as a git ref name component - non-empty, at most 255 characters, no whitespace, no "..", no leading "-", no control characters - 400 validation_failed otherwise. Validated and stored whatever the channel is, and NEVER CLEARED BY A CHANNEL SWITCH, so an operator who visits stable and comes back keeps their branch. */
                         release_edge_branch?: string;
+                        /** @description Release notifications, ADDITIVE (#123, migration 0080). Whether a newly detected platform release is POSTed to release_webhook_url. Absent = unchanged. Setting it TRUE is 400 validation_failed whenever the URL this request LEAVES BEHIND is empty - nothing stored and none supplied, or an explicit "" in the same body - because a switch that silently does nothing is worse than a refusal. Default false, so an instance that has never been configured announces nothing. */
+                        release_webhook_enabled?: boolean;
+                        /** @description Release notifications, ADDITIVE (#123, migration 0080). Where one release notification is POSTed. Absent = unchanged; an explicitly-sent "" CLEARS it AND SETS release_webhook_enabled false in the same write. Any other value must be an absolute https URL with no userinfo, at most 2048 characters, or 400 validation_failed - http, a credential in the URL and a relative reference are all refused. THE SERVER STILL CONTAINS THE REQUEST AT SEND TIME: delivery refuses any host that resolves to a loopback, private, link-local or multicast address, follows no redirect, and bounds the response body. THE URL IS TREATED AS A CREDENTIAL (a Slack or Discord webhook URL authenticates by being known), so it never appears in a log line, an audit record or a delivery error. */
+                        release_webhook_url?: string;
+                        /** @description Unattended automatic apply, ADDITIVE (amendment 8, #122, migration 0081). Whether a detected platform release is applied WITHOUT a click. Absent = unchanged. Default false, so an instance that never opts in behaves exactly as before. It depends on nothing else being configured first, so unlike release_webhook_enabled there is no companion 400: with nothing to apply it applies nothing and records why. NO WINDOW FIELD ACCOMPANIES IT, deliberately - an unattended pass runs on a successful platform.release_detect job, so that job's own schedule IS the window, and it is already editable in the Jobs tab. */
+                        platform_auto_apply?: boolean;
                     };
                 };
             };
@@ -3872,6 +3887,59 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/admin/platform/release-webhook/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Send a test release notification to the configured webhook (admin).
+         * @description Release notifications, ADDITIVE (#123). Sends ONE notification of the real shape, with the real signature and `event` `platform.release.test`, to the configured release_webhook_url. `release` is null in the test body: there may be no release to describe.
+         *     It IGNORES release_webhook_enabled - testing a URL before switching it on is the point - and it RECORDS NOTHING, so a test can never consume the dedupe record and suppress the real notification for a release.
+         *     A REFUSED DELIVERY IS 200 WITH ok false, not a 5xx: the request succeeded and the receiver's answer is the payload. Only a test with nowhere to send is a 400.
+         *     Where the notification goes is PATCH /v1/admin/settings (release_webhook_enabled / release_webhook_url); the optional signing secret is PUT /v1/admin/secrets/platform.release_webhook.secret. There is no route here for either, for the same reason the channel has none.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description The delivery outcome. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["PlatformWebhookTestEnvelope"];
+                    };
+                };
+                /** @description webhook_not_configured - no release_webhook_url is set, so there is nowhere to send. */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/admin/platform/apply": {
         parameters: {
             query?: never;
@@ -3883,7 +3951,7 @@ export interface paths {
         put?: never;
         /**
          * Fleet apply of one platform release (admin).
-         * @description Applies one release across the instance: THE CONTROL PLANE FIRST, then every eligible host in sequence (ADR 0002). Returns immediately with the run; the work is asynchronous and is watched through the run endpoints or through active_apply on GET /v1/admin/platform/releases. At most one fleet run is active per instance, enforced by a partial unique index rather than by a code check. Which hosts are targets is decided WHEN EACH TARGET IS REACHED, by amendment 1's eligibility rule; a host ineligible at its turn is SKIPPED (reported in run.skipped) and produces no attempt. A run STOPS AT ITS FIRST FAILED TARGET - there is no partial state, and the per-target attempts are where a partial outcome is read.
+         * @description Applies one release across the instance: THE CONTROL PLANE FIRST, then every eligible host in sequence (ADR 0002). Returns immediately with the run; the work is asynchronous and is watched through the run endpoints or through active_apply on GET /v1/admin/platform/releases. At most one fleet run is active per instance, enforced by a partial unique index rather than by a code check. Which hosts are targets is decided WHEN EACH TARGET IS REACHED, by amendment 1's eligibility rule; a host ineligible at its turn is SKIPPED (reported in run.skipped) and produces no attempt. A run STOPS AT ITS FIRST FAILED TARGET; a failed run has no partial variant, and the per-target attempts are where its outcome is read. A run that reached the end with nothing failed but skipped a host that was behind the release ends succeeded_partial (amendment 9, #185), never a bare succeeded.
          */
         post: {
             parameters: {
@@ -3911,7 +3979,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description release_not_offered (the release is not in the current release view's available - other channel, prerelease on stable, or manifest missing/invalid, ADR 0001), run_active (a fleet run is already pending or running), or attempt_in_flight (a standalone attempt is open on some target). */
+                /** @description release_not_offered (the release is not in the current release view's available - other channel, prerelease on stable, or manifest missing/invalid, ADR 0001), run_active (a fleet run is already pending or running), attempt_in_flight (a standalone attempt is open on some target), or preflight_blocked (amendment 9, #185: the control-plane target's preflight is `blocked`, so nothing can move; the message names the failing check and its fix - the same text the release view's targets[].preflight carries). */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -4120,7 +4188,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description release_not_offered; host_not_eligible (the body carries `reason`, one amendment-1 EligibilityReason, so the button's absence and this refusal are explained by the same string); attempt_in_flight (this host already has an open attempt - the database's partial unique index, not a code check); run_active. */
+                /** @description release_not_offered; host_not_eligible (the body carries `reason`, one amendment-1 EligibilityReason, so the button's absence and this refusal are explained by the same string - since amendment 9 that reason may be preflight_blocked, a stack-shape check this host fails); attempt_in_flight (this host already has an open attempt - the database's partial unique index, not a code check); run_active. */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -7594,6 +7662,10 @@ export interface components {
              * @enum {string}
              */
             severity: "info" | "warn" | "err";
+            /** @description Display names for the identifiers on this row - `target_id` and the allowlisted id keys inside `details` - keyed by the raw id AS IT APPEARS on the row, so a client looks up `names[target_id]` or `names[details.app_id]` with no transformation. Always present, never null; `{}` when the row references nothing nameable. An id with no resolvable name is ABSENT: absence is the miss, there is no sentinel. DERIVED SERVER-SIDE at read time and never stored, for the same reason `actor_username` is - the log is append-only, so a rename must show the current name. Where read time cannot answer because the entity was hard-deleted, the value falls back to the name the emitter stamped into `details` at write time (`name` / `node_name` / `username` / `app_name`), for the TARGET only. So the guarantee is: the entity's current name, else the name it had when the event happened, else absent - and a client must not try to tell the first two apart. See control-api.md "Audit-log names" for which target types and detail keys resolve; that set is server-side detail and may grow without a schema change. */
+            names: {
+                [key: string]: string;
+            };
         };
         AdminActivityList: {
             items: components["schemas"]["AdminActivity"][];
@@ -7739,12 +7811,18 @@ export interface components {
                 /** @description First-run wizard v2 §S6e (migration 0064). The admin-editable signaling origin allow-list, normalized (scheme + lowercased host). THIS IS THE DATABASE COLUMN, NOT NECESSARILY WHAT /v1/signal ENFORCES: QUASAR_ALLOWED_ORIGINS, when SET, overrides it outright - including when set to the empty string, which is how a hardened deployment pins the list off. That override rule is what makes the migration a behavioural no-op on upgrade for every existing deployment. GET /v1/admin/access-check reports the RESOLVED list plus which source won, so a UI can grey out a control the environment has pinned - the same shape library_discovery_interval_minutes uses. AN EMPTY LIST IS NOT "DENY ALL": /v1/signal still admits a same-origin request and a request with no Origin header at all, so a fresh instance with nothing configured works. Optional in the envelope so pre-amendment servers stay conformant. */
                 allowed_origins?: string[];
                 /**
-                 * @description Platform-release amendment 1 (#104/#106, migration 0074). The instance's platform- release channel: stable = tagged, noted releases; edge = whatever was last published from release_edge_branch, with no notes. DEFAULT stable - an instance that has never been configured is not shown branch builds. Read per request rather than at boot, so a switch needs no restart. Optional in the envelope so pre-amendment servers stay conformant.
+                 * @description Platform-release amendment 1 (#104/#106, migration 0074); `beta` added by amendment 3 (#121, migration 0079). The instance's platform- release channel: stable = tagged, noted releases; beta = those AND the prereleases among them; edge = whatever was last published from release_edge_branch, with no notes. DEFAULT stable - an instance that has never been configured is not shown prereleases or branch builds. Read per request rather than at boot, so a switch needs no restart. Optional in the envelope so pre-amendment servers stay conformant.
                  * @enum {string}
                  */
-                release_channel?: "stable" | "edge";
+                release_channel?: "stable" | "beta" | "edge";
                 /** @description Platform-release amendment 1 (#104/#106, migration 0074). The branch the edge channel follows; default develop. Reported whatever the channel is (it selects nothing while the channel is stable) so a UI can render the control without a second read. Optional in the envelope so pre-amendment servers stay conformant. */
                 release_edge_branch?: string;
+                /** @description Release notifications, ADDITIVE (#123, migration 0080). Whether a detected platform release is announced to release_webhook_url. Default false. Optional in the envelope so a pre-#123 server stays conformant; a client reads absent as false. */
+                release_webhook_enabled?: boolean;
+                /** @description Release notifications, ADDITIVE (#123, migration 0080). The configured webhook URL, or "" when none is set. It is admin-only, as this whole envelope is. THE SIGNING SECRET IS NOT HERE and never will be: it is an instance_secrets row read through GET /v1/admin/secrets, which reports configured/readable and a masked hint, never a value. */
+                release_webhook_url?: string;
+                /** @description Unattended automatic apply, ADDITIVE (amendment 8, #122, migration 0081). Whether a detected platform release is applied without a click. Default false. Optional in the envelope so a pre-#122 server stays conformant; a client reads absent as false. */
+                platform_auto_apply?: boolean;
                 /** Format: uuid */
                 updated_by: string | null;
                 /** Format: date-time */
@@ -7791,7 +7869,10 @@ export interface components {
              * @description Stable across detections; the handle amendment 2's apply will name.
              */
             id: string;
-            /** @enum {string} */
+            /**
+             * @description The channel this row is STORED on, which is not always the instance's channel: beta has no rows of its own and reads stable's, so a release listed while the instance is on beta reports `stable` here. Unchanged by amendment 3.
+             * @enum {string}
+             */
             channel: "stable" | "edge";
             /** @description Stable semver without a leading "v" ("0.2.0", "0.2.0-rc.1"). NULL ON EDGE - an edge build is a commit, not a version, and a synthesized one would be rendered to an operator as if it were real. */
             version: string | null;
@@ -7804,7 +7885,7 @@ export interface components {
             built_at: string;
             /** @description The highest migration the release's control-plane image embeds. The first ordering key and the ADR 0002 gate. */
             schema_version: number;
-            /** @description True for a prerelease tag. A stable-channel read never lists one; on edge it is reported as found. */
+            /** @description True for a prerelease tag. A stable-channel read never lists one, a BETA read lists it (that is what the channel is for); on edge it is reported as found. */
             prerelease: boolean;
             /** @description Release notes, MARKDOWN, verbatim from the GitHub Release's `body` field (which the publish workflow takes from the changelog section). "" ON EDGE - no notes exist and compare_url stands in for them. Never null, so a client renders one type. UNTRUSTED UPSTREAM TEXT: sanitize at render. */
             notes: string;
@@ -7812,6 +7893,8 @@ export interface components {
             compare_url: string | null;
             /** @description The release manifest asset verbatim. NULL ON EDGE, which publishes no asset. */
             manifest: components["schemas"]["ReleaseManifest"] | null;
+            /** @description ADDITIVE, amendment 6 (#153). True when applying this release runs at least one migration on this instance - its schema_version is above the installed control plane's. THE ONE THING that decides whether a fleet apply's control-plane step drains the instance (see the apply section), so it is DERIVED AND SERVED rather than left to a client to re-derive, exactly as identity_known is: a client twin of the rule would keep naming the old policy after the rule moved. Always present. With no release to apply, read the cautious answer, true. */
+            migrates: boolean;
             /**
              * Format: date-time
              * @description When THIS instance first saw the release. Provenance, not ordering - two instances can legitimately disagree.
@@ -7819,10 +7902,10 @@ export interface components {
             discovered_at: string;
         };
         /**
-         * @description Why a target is not eligible for the newest listed release. A CLOSED vocabulary of STABLE IDENTIFIERS the UI maps to text - the server never sends the sentence, so wording can improve in the client with no contract change. Precedence is fixed and is the order listed here, so two implementations cannot disagree about which of several true reasons is reported. A client meeting an unrecognized value renders it verbatim rather than dropping the row. Full per-value semantics: control-api.md §"Platform releases". AMENDMENT 2 (#104/#114) APPENDS attempt_in_flight and run_active AT THE END, so no existing evaluation changes: they are the most transient facts on the list, and amendment 1's rule that durable reasons outrank transient ones fixes their position. attempt_in_flight precedes run_active because it is about THIS target.
+         * @description Why a target is not eligible for the newest listed release. A CLOSED vocabulary of STABLE IDENTIFIERS the UI maps to text - the server never sends the sentence, so wording can improve in the client with no contract change. Precedence is fixed and is the order listed here, so two implementations cannot disagree about which of several true reasons is reported. A client meeting an unrecognized value renders it verbatim rather than dropping the row. Full per-value semantics: control-api.md §"Platform releases". AMENDMENT 2 (#104/#114) APPENDS attempt_in_flight and run_active AT THE END, so no existing evaluation changes: they are the most transient facts on the list, and amendment 1's rule that durable reasons outrank transient ones fixes their position. attempt_in_flight precedes run_active because it is about THIS target. AMENDMENT 9 (#185) INSERTS preflight_blocked after control_plane_not_first and before the two transient ones: a stack shape (an unmounted socket volume, a squatted health port) is a durable fact, and the rule that durable reasons outrank transient ones is what fixes its position. The only target whose answer changes is one that is BOTH blocked and mid-apply, which now reads preflight_blocked. The failing check and its fix are on the same target's `preflight`. A preflight of `unknown` never produces this reason.
          * @enum {string}
          */
-        EligibilityReason: "no_release" | "identity_unknown" | "up_to_date" | "install_mode_source" | "updater_absent" | "host_offline" | "release_above_control_plane" | "control_plane_not_first" | "attempt_in_flight" | "run_active";
+        EligibilityReason: "no_release" | "identity_unknown" | "up_to_date" | "install_mode_source" | "updater_absent" | "host_offline" | "release_above_control_plane" | "control_plane_not_first" | "preflight_blocked" | "attempt_in_flight" | "run_active";
         /** @description One target's eligibility, EVALUATED AGAINST available[0] - the newest listed release - and against nothing else. This surface carries no per-release eligibility matrix and a client must not present one. */
         PlatformReleaseTarget: {
             /** @enum {string} */
@@ -7837,6 +7920,31 @@ export interface components {
             eligible: boolean;
             /** @description Null exactly when eligible is true; exactly one non-null reason when it is false. */
             reason: components["schemas"]["EligibilityReason"] | null;
+            /** @description ADDITIVE (amendment 9, #185). Whether this target's stack is SHAPED so that an apply can be carried out - a different question from `eligible` (may it take the release) and from a host's readiness (can it run sessions). Always serialized by a server implementing the amendment; absent on an older one, which a client reads as unknown. Evaluated whether or not a release is listed: the stack-shape checks are useful on their own, and only image_resolvable needs a release. state `blocked` is what produces the preflight_blocked eligibility reason; `unknown` never blocks anything. */
+            preflight: components["schemas"]["PlatformPreflight"];
+        };
+        /**
+         * @description The CLOSED vocabulary of pre-update checks (amendment 9, #185). The three a host's agent can answer about itself - updater_socket, updater_stack_dir, health_addr_bindable - are ALSO that agent's readiness check ids (agent-api.md `readiness`), so preflight and the host's readiness card say the same words about the same fact. Full per-value semantics: control-api.md §"Self-update hardening".
+         * @enum {string}
+         */
+        PreflightCheckId: "updater_socket" | "updater_stack_dir" | "updater_overlays" | "image_resolvable" | "agent_connected" | "health_addr_bindable";
+        PlatformPreflightCheck: {
+            id: components["schemas"]["PreflightCheckId"];
+            /** @description Known values: "pass", "fail", "unknown" - unknown means the collector could not look (an agent predating the check, an updater that did not answer), which is itself a finding but not a blocker. DELIBERATELY NOT AN ENUM, for the same reason ReadinessCheck.status is not: a consumer MUST pass an unrecognized value through rather than reject it. */
+            status: string;
+            /** @description Operator prose. On a fail it NAMES THE FIX (the command, the variable, the port). NEVER PARSED and never branched on - the id and status are what a client keys off. */
+            detail: string;
+        };
+        PlatformPreflight: {
+            /** @description "ok" when every check passed; "blocked" when at least one failed; "unknown" when none failed but at least one could not be evaluated. Not an enum, as above. */
+            state: string;
+            /**
+             * Format: date-time
+             * @description When the facts behind this evaluation were gathered - for a host, when its agent last reported readiness; for the control plane, when its updater was last asked. Null when nothing was gathered at all.
+             */
+            checked_at: string | null;
+            /** @description In the vocabulary's order; every check the target has, evaluated, so the card can name every fix at once. */
+            checks: components["schemas"]["PlatformPreflightCheck"][];
         };
         /**
          * @description Everything wrong that is not an ineligibility. A CLOSED vocabulary. A fault gates nothing anywhere - it is reported so a wrong state is visible instead of silent. Prefixed (rather than a bare FaultKind) because "fault" already names an unrelated thing in this system - an NVIDIA Xid is a GPU fault. Full semantics: control-api.md §"Platform releases".
@@ -7858,10 +7966,10 @@ export interface components {
         /** @description The whole admin Releases page in one read (GET /v1/admin/platform/releases). */
         PlatformReleaseView: {
             /**
-             * @description The instance's channel. Everything in `available` is on it; the other channel's releases are never mixed in.
+             * @description The instance's channel. Everything in `available` is what it selects; another channel's releases are never mixed in. On `beta` the entries carry channel `stable`, because beta reads those rows rather than storing its own.
              * @enum {string}
              */
-            channel: "stable" | "edge";
+            channel: "stable" | "beta" | "edge";
             /** @description ADDITIVE (#104). The configured release repository as `owner/name` (QUASAR_PLATFORM_RELEASE_REPO, default `accreleus/quasar`), so a client can compose the GitHub links a release view needs - the release page, the commit, and the issues the notes reference - instead of hard-coding a repository the operator may have re-pointed. "" when detection is switched off, which a client reads as "render no links", never as the default. Optional in the schema so a pre-#104 server stays conformant; a client must read absent as "". */
             source_repo?: string;
             /** @description The branch the edge channel follows. Reported on BOTH channels so a UI can render the control without a second read; it selects nothing while channel is stable. */
@@ -7877,29 +7985,76 @@ export interface components {
                 control_plane: components["schemas"]["PlatformIdentity"];
                 hosts: components["schemas"]["PlatformHostIdentity"][];
             };
-            /** @description Releases on the configured channel that are still offerable, NEWEST FIRST (schema_version DESC, then built_at DESC - the tiebreak matters because an edge channel produces many builds at one schema_version). A release below the installed control plane's schema_version is NEVER here (ADR 0002); a prerelease is never here on stable; a stable release with a missing or invalid manifest is never here either (it is a manifest_invalid fault instead). */
+            /** @description Releases the configured channel selects that are still offerable, NEWEST FIRST (schema_version DESC, then built_at DESC - the tiebreak matters because an edge channel produces many builds at one schema_version). On BETA, SemVer 2.0.0 precedence is inserted between those two keys, because that channel is the only one whose rows can arrive out of version order: 0.2.0-rc.2 orders below 0.2.0, which orders below 0.2.1-rc.1, whatever order they were built in. A release below the installed control plane's schema_version is NEVER here (ADR 0002); neither is one whose VERSION orders below an installed prerelease at the same schema_version, which is what stops a switch back to stable offering a downgrade (amendment 3); a prerelease is never here on stable; a stable or beta release with a missing or invalid manifest is never here either (it is a manifest_invalid fault instead). */
             available: components["schemas"]["PlatformRelease"][];
             /** @description One entry per target - the control plane, then every registered host - each evaluated against available[0]. When available is empty every target is eligible:false with reason "no_release". */
             targets: components["schemas"]["PlatformReleaseTarget"][];
             faults: components["schemas"]["PlatformReleaseFault"][];
             /** @description Platform-release apply, AMENDMENT 2 (#104/#114), additive. What is in flight right now - the active fleet run, if any, plus EVERY open attempt including standalone per-host applies and reverts. null when nothing is in flight, and ALWAYS SERIALIZED by a server implementing amendment 2 (null is the answer, not the absence of one). Optional in the schema so a pre-amendment-2 server stays conformant. `targets` deliberately gains no field: the same attempt in two places in one response is a way for the two to disagree, and the join by host_id costs a client one line and cannot. */
             active_apply?: components["schemas"]["ActiveApply"] | null;
+            /** @description Release notifications, ADDITIVE (#123). How this instance announces a release outside the console, and how the last announcement went. null on a server that does not serve the notification surface. Optional in the schema so a pre-#123 server stays conformant. `enabled` and `url` MIRROR instance_settings, exactly as `channel` and `edge_branch` above already do, so the Releases page stays one read. */
+            release_webhook?: components["schemas"]["PlatformReleaseWebhook"] | null;
+        };
+        /** @description The instance's release-notification target and its last delivery. */
+        PlatformReleaseWebhook: {
+            /** @description Whether a detected release is announced. Mirrors instance_settings.release_webhook_enabled. */
+            enabled: boolean;
+            /** @description The configured https URL, or "" when none is set. Admin-only, as this whole view is. */
+            url: string;
+            /** @description Whether a signing secret is stored (instance_secrets `platform.release_webhook.secret`, or its environment fallback). A BOOLEAN AND NEVER THE VALUE. Signing is optional: Slack, Discord and ntfy authenticate by URL. */
+            secret_configured: boolean;
+            /** @description The most recent attempt on this instance, or null when nothing has ever been sent. */
+            last_delivery: components["schemas"]["PlatformWebhookDelivery"] | null;
+        };
+        /** @description One recorded delivery attempt (schema.md `platform_release_notifications`). */
+        PlatformWebhookDelivery: {
+            /**
+             * Format: uuid
+             * @description The platform_releases row this attempt announced.
+             */
+            release_id: string;
+            /** @description That release's version, or null on an edge build (which has none). */
+            release_version: string | null;
+            /**
+             * @description `delivered` is TERMINAL: the release is never announced again. `failed` is retried on the next detection pass until the attempt cap, after which the release is left un-notified rather than retried forever.
+             * @enum {string}
+             */
+            status: "delivered" | "failed";
+            /** @description How many detection PASSES this release has cost, not HTTP requests - the retries within one pass are the server's business. */
+            attempts: number;
+            /** Format: date-time */
+            attempted_at: string;
+            /** @description The receiver's HTTP status, or null when the request never got one (DNS, TLS, a refused dial, the egress allowlist). Those are different failures. */
+            status_code: number | null;
+            /** @description Bounded operator prose, null on success. IT NEVER CONTAINS THE WEBHOOK URL: that URL is itself the credential on every receiver that authenticates by URL. */
+            error: string | null;
+        };
+        PlatformWebhookTestEnvelope: {
+            delivery: {
+                /** @description true when the receiver answered 2xx. */
+                ok: boolean;
+                status_code: number | null;
+                /** @description Bounded prose when ok is false, null otherwise. Never contains the webhook URL. */
+                error: string | null;
+                /** @description Wall time for the whole send, retries included. */
+                duration_ms: number;
+            };
         };
         /**
-         * @description A fleet run's state. A run succeeds only when EVERY target succeeded, and it STOPS AT ITS FIRST FAILED TARGET - past a failed control plane, continuing would move agents onto a release the control plane is not on (ADR 0002); past a failed host, it would march a known-bad digest set across the fleet. There is deliberately NO "partial": a failed run may have succeeded targets behind it, and the per-target attempts are where that is read.
+         * @description A fleet run's state. A run succeeds only when EVERY target it reached succeeded, and it STOPS AT ITS FIRST FAILED TARGET - past a failed control plane, continuing would move agents onto a release the control plane is not on (ADR 0002); past a failed host, it would march a known-bad digest set across the fleet. A FAILED run has no partial variant: it may have succeeded targets behind it, and the per-target attempts are where that is read. AMENDMENT 9 (#185) APPENDS succeeded_partial: the run reached the end of its host list with nothing failed, but it PASSED OVER at least one host that was behind the release for a reason other than up_to_date (its agent was offline, its preflight was blocked, it is source-built, it has no updater) - so the fleet is on mixed versions. Terminal, and NOT a failure: it does not suppress an unattended release, and the next unattended pass or a "retry" (a plain fleet apply of the same release carrying retry_of) picks the host up once it can take the release. A client renders it distinctly from succeeded - the skipped list and its reasons are the outcome, not a footnote.
          * @enum {string}
          */
-        ApplyRunState: "pending" | "running" | "succeeded" | "failed" | "cancelled";
+        ApplyRunState: "pending" | "running" | "succeeded" | "failed" | "cancelled" | "succeeded_partial";
         /**
          * @description One target's attempt state. The six middle values are EXACTLY agent-api.md release_state.state, relayed unchanged. queued and waiting_sessions are control-plane-only and precede the wire (the command has not been sent); cancelled applies ONLY to an attempt a cancel caught in one of those two states - CANCEL NEVER INTERRUPTS AN ATTEMPT THAT HAS BEEN SENT.
          * @enum {string}
          */
         ApplyAttemptState: "queued" | "waiting_sessions" | "pending" | "pulling" | "recreating" | "verifying" | "succeeded" | "failed" | "cancelled";
         /**
-         * @description Why an attempt failed. A CLOSED vocabulary of STABLE IDENTIFIERS the UI maps to text, shared verbatim with agent-api.md release_state.reason and with the release_apply ack's error, so ONE client-side mapping serves the wire, this API and the history. Non-null exactly when the state is failed. "unsupported" is written by the control plane and never sent on the wire: no ack arrived within the 10s ack timeout, so the agent build predates the amendment. A client meeting an unrecognized value renders it verbatim. Full per-value semantics: agent-api.md §release_state.
+         * @description Why an attempt failed. A CLOSED vocabulary of STABLE IDENTIFIERS the UI maps to text, shared verbatim with agent-api.md release_state.reason and with the release_apply ack's error, so ONE client-side mapping serves the wire, this API and the history. Non-null exactly when the state is failed. "unsupported" is written by the control plane and never sent on the wire: no ack arrived within the 10s ack timeout, so the agent build predates the amendment. A client meeting an unrecognized value renders it verbatim. "signature_missing" and "signature_invalid" are amendment 5's two APPENDED values (#120): a host that requires a signed release met an unsigned one, and a manifest signature that did not verify (bad signature, untrusted key, digests not named by the signed manifest, a signature that could not be fetched, or verification on with no trusted keys - all fail closed). Signature verification is OFF BY DEFAULT (ADR 0003), so neither occurs unless an operator turns it on. Full per-value semantics: agent-api.md §release_state.
          * @enum {string}
          */
-        ApplyFailureReason: "updater_absent" | "busy" | "invalid" | "namespace_rejected" | "digest_malformed" | "pull_failed" | "recreate_failed" | "never_started" | "unhealthy" | "updater_unreachable" | "timeout" | "unsupported";
+        ApplyFailureReason: "updater_absent" | "busy" | "invalid" | "namespace_rejected" | "digest_malformed" | "pull_failed" | "recreate_failed" | "never_started" | "unhealthy" | "updater_unreachable" | "timeout" | "unsupported" | "signature_missing" | "signature_invalid";
         /** @description One component of a platform release, pinned. Same shape as ReleaseManifestComponent and as agent-api.md release_apply.components. */
         ApplyComponentDigest: {
             /** @description The component. Only "node-agent" is ever sent to a host; "control-plane" is applied by the updater beside the control plane and never over an agent connection. */
@@ -7932,10 +8087,10 @@ export interface components {
              */
             run_id: string | null;
             /**
-             * @description A REVERT IS AN APPLY WITH AN OLDER DIGEST SET - same wire message, same states, same reasons. This field exists so history can say which button was pressed, and for nothing else.
+             * @description A REVERT IS AN APPLY WITH AN OLDER DIGEST SET - same wire message, same states, same reasons. This field exists so history can say which button was pressed, and for nothing else. AMENDMENT 9 (#185) APPENDS auto_revert: no button was pressed - the host's UPDATER put the previous digests back itself after the new agent container failed its health wait (agent-api.md release_state `restored`), and the control plane wrote this row beside the failed apply so the history shows both steps. It is recorded succeeded on insert (the updater reports `restored` only for a restore that came up; a restore that itself failed leaves no row and both failures in the failed apply's output), was never driven over the wire, and its requested_digests are the failed apply's previous_digests.
              * @enum {string}
              */
-            kind: "apply" | "revert";
+            kind: "apply" | "revert" | "auto_revert";
             /** @enum {string} */
             target: "control_plane" | "host";
             /**
@@ -7956,7 +8111,7 @@ export interface components {
             state: components["schemas"]["ApplyAttemptState"];
             /** @description Non-null exactly when state is failed. */
             reason: components["schemas"]["ApplyFailureReason"] | null;
-            /** @description The N in "waiting on N sessions": the last observed non-terminal session count while state is waiting_sessions - ON THIS HOST for a host target, and FLEET-WIDE for the control-plane target, because recreating the control plane drops every agent's connection and an agent stops its sessions when that connection drops. A CLIENT MUST SHOW IT IN A FORCE CONFIRMATION - force is the operator agreeing to end N live sessions, and a confirmation that does not name N is not informed consent. Advisory and last-observed, never a gate. Null once the attempt has been sent. */
+            /** @description The N in "waiting on N sessions": the last observed non-terminal session count while state is waiting_sessions - ON THIS HOST for a host target, and FLEET-WIDE for the control-plane target, whose recreate is instance-wide. On a control-plane target it is set ONLY when the release's migrates is true (amendment 6, #153): a recreate alone no longer ends a running session, so a non-migrating control-plane attempt never enters waiting_sessions and leaves this null throughout. A CLIENT MUST SHOW IT IN A FORCE CONFIRMATION - force is the operator agreeing to end N live sessions, and a confirmation that does not name N is not informed consent. Advisory and last-observed, never a gate. Null once the attempt has been sent. */
             sessions_remaining: number | null;
             /** @description Skip the zero-sessions wait and stop what is running. The agent does no session logic on it: it records which decision the control plane made. */
             force: boolean;
@@ -7978,8 +8133,15 @@ export interface components {
             /** Format: uuid */
             release_id: string;
             state: components["schemas"]["ApplyRunState"];
+            /**
+             * Format: uuid
+             * @description ADDITIVE (amendment 9, #185). The run this one was started to finish - an admin pressed "Retry skipped hosts" on a succeeded_partial run. Provenance only: the retry is an ordinary fleet apply of the same release, and the hosts it moves are decided at their turn exactly as always (the already-updated ones read up_to_date and are skipped). Null on every other run, and on a server predating the amendment. ON DELETE SET NULL, so deleting the original leaves the retry standing.
+             */
+            retry_of: string | null;
             /** @description Applied to EVERY host target in this run. It exists on the fleet body, and not only on the per-host one, because a run whose every host target waits for a natural drain can otherwise stall indefinitely. */
             force: boolean;
+            /** @description ADDITIVE, amendment 8 (#122). True when the detection schedule started this run rather than an admin pressing Update. A CLIENT SHOULD SAY SO: an admin finding a fleet run they did not start is owed the explanation. requested_by cannot answer this - it is null for an unattended run AND for one whose requesting admin has since been deleted (ON DELETE SET NULL). Always false on a run an admin created, and false on a server predating this amendment. An unattended run NEVER carries force: force is an operator agreeing to end N live sessions and there is no operator, so an unattended run is only ever started for a release whose `migrates` is false (see the apply section). */
+            unattended: boolean;
             /** Format: uuid */
             requested_by: string | null;
             /** @description The cancel FLAG, not the cancel state. Read BETWEEN TARGETS and never mid-attempt. It is persisted rather than an in-memory signal so a cancel survives a control-plane restart - which matters here more than anywhere, because a fleet run's first target IS a control-plane restart. */
@@ -8013,10 +8175,15 @@ export interface components {
              */
             release_id: string;
             /**
-             * @description Applies to EVERY target in this run, the control plane included: its recreate ends every session on the instance, so without force the control-plane step waits for the whole fleet to drain.
+             * @description Applies to EVERY target in this run, the control plane included. Skips each host's zero-sessions wait, and - on a release whose migrates is true - makes the control-plane step STOP the instance's sessions and wait for zero rather than wait for them to end on their own (amendment 6, #153; force still means the operator is agreeing to end N live sessions). A non-migrating control-plane step has no such wait to skip: a recreate alone no longer ends a running session.
              * @default false
              */
             force: boolean;
+            /**
+             * Format: uuid
+             * @description ADDITIVE (amendment 9, #185). The succeeded_partial run this apply is finishing; recorded on the new run as retry_of and nothing else changes. 404 not_found when no such run exists.
+             */
+            retry_of?: string;
         };
         PlatformHostApplyRequest: {
             /** Format: uuid */
