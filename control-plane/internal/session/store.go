@@ -221,7 +221,12 @@ type Session struct {
 	NegotiatedCodec *string
 	// Mic is the GRANTED state (migration 0049): request AND instance setting at
 	// launch, sent as session_assign.stream.mic.
-	Mic           bool
+	Mic bool
+	// DeviceID is the user_devices row the launching token was bound to
+	// (migration 0020), nil for an unbound token or a clientless launch (console,
+	// cert bench). It scopes this session's later probe and history reads; it is
+	// no part of scheduling, the state machine or the agent wire.
+	DeviceID      *string
 	ReservedVram  int32
 	ReservedSlots int32
 	Playout0Ms    int32
@@ -1038,26 +1043,10 @@ type DeviceProbe struct {
 	AV1  bool
 }
 
-// LatestProbe is the parsed probe from the user's most recently seen
-// user_devices row, or nil when none is fresh (measured_at within
-// probeMaxAgeDays). Missing, stale and unparseable all return (nil, nil); the
-// caller falls back to the default tier.
-func (s *Store) LatestProbe(ctx context.Context, userID string) (*DeviceProbe, error) {
-	var rawCaps []byte
-	err := s.pool.QueryRow(ctx, `
-		SELECT capabilities
-		FROM user_devices
-		WHERE user_id = $1::uuid
-		ORDER BY last_seen_at DESC
-		LIMIT 1
-	`, userID).Scan(&rawCaps)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil // no device row at all → no probe
-	}
-	if err != nil {
-		return nil, fmt.Errorf("query latest probe: %w", err)
-	}
-
+// parseDeviceProbe projects user_devices.capabilities onto DeviceProbe. Missing,
+// stale and unparseable all yield nil, an absent probe rather than an error: the
+// caller degrades to the default tier rather than refusing a launch.
+func parseDeviceProbe(rawCaps []byte) *DeviceProbe {
 	var caps struct {
 		BandwidthKbps   *float64 `json:"bandwidth_kbps"`
 		RTTMs           *float64 `json:"rtt_ms"`
@@ -1083,19 +1072,19 @@ func (s *Store) LatestProbe(ctx context.Context, userID string) (*DeviceProbe, e
 	}
 	if err := json.Unmarshal(rawCaps, &caps); err != nil {
 		// Malformed JSON: an absent probe, not an error worth propagating.
-		return nil, nil
+		return nil
 	}
 
 	// measured_at is server-stamped RFC3339; empty or unparseable counts as stale.
 	if caps.MeasuredAt == "" {
-		return nil, nil
+		return nil
 	}
 	measuredAt, err := time.Parse(time.RFC3339, caps.MeasuredAt)
 	if err != nil {
-		return nil, nil
+		return nil
 	}
 	if time.Since(measuredAt) > time.Duration(probeMaxAgeDays)*24*time.Hour {
-		return nil, nil // stale probe → no-op → default tier
+		return nil // stale probe → no-op → default tier
 	}
 
 	p := &DeviceProbe{}
@@ -1123,7 +1112,7 @@ func (s *Store) LatestProbe(ctx context.Context, userID string) (*DeviceProbe, e
 	p.H264DecodeProfiles = caps.Decode.H264.Profiles
 	p.HEVC = caps.Codecs.HEVC
 	p.AV1 = caps.Codecs.AV1
-	return p, nil
+	return p
 }
 
 // HostCodecs is the wire codec set the host's encoder path can produce
@@ -1281,6 +1270,7 @@ const sessionCols = `id::text, user_id::text, app_id::text, host_id::text, gpu_i
 	stream_profile_id,
 	codec_decision, negotiated_codec,
 	mic,
+	device_id::text,
 	reserved_vram_mb, reserved_encode_slots,
 	playout0_ms,
 	health_state, health_state_reason, health_state_changed_at,
@@ -1337,6 +1327,7 @@ func scanSessionRow(r row, extra ...any) (Session, error) {
 		&s.StreamProfileID,
 		&s.CodecDecision, &s.NegotiatedCodec,
 		&s.Mic,
+		&s.DeviceID,
 		&s.ReservedVram, &s.ReservedSlots,
 		&s.Playout0Ms,
 		&hs, &s.HealthReason, &s.HealthChangedAt,

@@ -192,17 +192,23 @@ func (h *healthEvaluator) EvaluateClientHealth(ctx context.Context, sessionID st
 	}
 
 	// Record or clear profile-certification history, latest-outcome-wins, keyed by
-	// the device that posted the sample ("" falls back to a coarse per-user key).
-	// Both fails and passes carry the session's wire codec (migration 0032), so a
-	// codec-specific decode failure never blanks a profile that works on another.
+	// this session's device ("" is the coarse per-user key). Both fails and passes
+	// carry the session's wire codec (migration 0032), so a codec-specific decode
+	// failure never blanks a profile that works on another.
 	//
-	// Grain split (§4.4): a DECODE-side fail is written against the resolved RUNG
+	// Grain split (§4.4): a decode-side fail is written against the resolved rung
 	// id, since decode failure is resolution-dependent too and a 4K AV1 failure
 	// must not ban the 1080p AV1 rung of the same chain. A presentation-side fail
 	// and every pass keep the launch-profile-level row, which is what feeds
 	// ProfileFailures. No resolved rung (legacy/console) falls back to that row.
+	//
+	// Return before resolving the key: it costs a read, and most samples record
+	// nothing.
+	if dec.RecordFail == "" && !dec.RecordPass {
+		return
+	}
 	launchProfileID := *sess.ProfileID
-	deviceKey := sample.DeviceKey
+	deviceKey := h.outcomeDeviceKey(ctx, sess, sample)
 	if dec.RecordFail != "" {
 		fr := dec.RecordFail
 		codec := certFailCodec(dec.RecordFail, sess.Codec)
@@ -218,6 +224,23 @@ func (h *healthEvaluator) EvaluateClientHealth(ctx context.Context, sessionID st
 			h.log.Warn("record profile pass failed", "session_id", sessionID, "err", err)
 		}
 	}
+}
+
+// outcomeDeviceKey is the key this session's history is written under: the device
+// it launched from, which is the device the launch resolver reads that history
+// back for. The sample's self-declared device_key is used only for an unbound
+// session — where a binding exists it wins, so a client cannot write history
+// against a device it is not.
+func (h *healthEvaluator) outcomeDeviceKey(ctx context.Context, sess Session, sample ClientHealthSample) string {
+	deviceID := deref(sess.DeviceID)
+	if deviceID == "" {
+		return sample.DeviceKey
+	}
+	scope, err := h.store.ResolveDeviceScope(ctx, sess.UserID, deviceID, scopeSiteHealth)
+	if err != nil || scope.Fallback {
+		return sample.DeviceKey
+	}
+	return scope.DeviceKey
 }
 
 // logGPUUtilization makes the chosen GPU's accounting observable in the logs.

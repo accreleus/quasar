@@ -2,11 +2,7 @@ package session
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"log/slog"
-
-	"github.com/jackc/pgx/v5"
 
 	"github.com/accreleus/quasar/control-plane/internal/profile"
 )
@@ -206,27 +202,4 @@ func (s *Store) RungFailures(ctx context.Context, userID, deviceKey string, lp p
 		}
 	}
 	return out, nil
-}
-
-// LatestDeviceKey returns the user's most-recently-seen device_key (P4-08), or
-// "" when absent. GET /v1/me/profiles has no device_key in context, so it keys
-// historical-failure lookup on the same latest device it loads for eligibility.
-func (s *Store) LatestDeviceKey(ctx context.Context, userID string) (string, error) {
-	var key string
-	err := s.pool.QueryRow(ctx, `
-		SELECT device_key
-		FROM user_devices
-		WHERE user_id = $1::uuid
-		ORDER BY last_seen_at DESC
-		LIMIT 1
-	`, userID).Scan(&key)
-	if err != nil {
-		// No device row is expected (never posted a probe); degrade silently.
-		// Any other error is unexpected — still degrade, but log it.
-		if !errors.Is(err, pgx.ErrNoRows) {
-			slog.Default().Warn("latest device key lookup failed", "user_id", userID, "err", err)
-		}
-		return "", nil
-	}
-	return key, nil
 }

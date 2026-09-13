@@ -27,6 +27,10 @@ type CreateParams struct {
 	// The GRANTED mic state, resolved by the caller before it reaches here.
 	// Console/local_only launches never set it: no WebRTC pipeline.
 	Mic bool
+	// DeviceID is the user_devices id the caller's token is bound to, "" for an
+	// unbound token or a clientless launch (console, cert bench). Persisted as
+	// NULL when empty; read back as Session.DeviceID.
+	DeviceID string
 	// The selected launch-profile id, "" for a legacy/tier/override launch.
 	// Persisted as NULL when empty.
 	ProfileID  string
@@ -293,6 +297,13 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		return Session{}, true, nil // raced; retry from scratch
 	}
 
+	// A malformed device id is dropped, not fatal: it scopes later reads and is
+	// never an authorization input, but the ::uuid cast below would 500 on it.
+	deviceID := p.DeviceID
+	if !isValidUUID(deviceID) {
+		deviceID = ""
+	}
+
 	// (6) Insert placed + reserved, as `assigned`: the reservation exists by this
 	// row's active state being counted in the availability sums above, and the
 	// per-GPU lock keeps anyone else from reserving here until we commit.
@@ -309,6 +320,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		    reserved_encode_slots,
 		    signaling_token_hash, signaling_token_expires_at,
 		    mic,
+		    device_id,
 		    assigned_at
 		) VALUES (
 		    $1, $2, $3, $4, 'assigned',
@@ -319,6 +331,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		    $11,
 		    NULLIF($12, ''), $13,
 		    $16,
+		    NULLIF($17, '')::uuid,
 		    now()
 		)
 		RETURNING `+sessionCols,
@@ -330,6 +343,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		p.ProfileID,
 		p.Codec,
 		p.Mic,
+		deviceID,
 	))
 	if err != nil {
 		return Session{}, false, fmt.Errorf("insert session: %w", err)

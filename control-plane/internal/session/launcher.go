@@ -91,7 +91,7 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		// Narrow BEFORE evaluating, or the implicit path resolves profiles the
 		// explicit path is rejected for and the allow-list binds only clients that
 		// bother to name a profile.
-		ev := profile.EvaluateLaunchProfiles(restriction.Filter(catalog), c.probeEvalInput(ctx, userID))
+		ev := profile.EvaluateLaunchProfiles(restriction.Filter(catalog), c.probeEvalInput(ctx, userID, lp.DeviceID))
 		resolved, err := c.store.ResolveDefaultProfile(ctx, userID, app, ev.RecommendedID, restriction)
 		if err != nil {
 			return LaunchResult{}, err
@@ -137,19 +137,17 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		// on VA and NVENC), so the rung's preference is negotiated down for the
 		// browser transport. An explicit override wins.
 		//
-		// The lift back needs BOTH the launching client declaring itself native AND
-		// this account's latest native probe decoding it. Keying on the launching
-		// client is the identity binding: LatestProbe is per-account and returns
-		// whichever device was seen last, so a native session otherwise poisons a
-		// later browser launch into a black stream. It sets no StreamOverride
-		// field, so the envelope and cert-cap blocks below still run.
+		// The lift needs both the launching client declaring itself native and the
+		// launching device's own probe decoding it: the declaration is a claim, the
+		// probe is a measurement. It sets no StreamOverride field, so the envelope
+		// and cert-cap blocks below still run.
 		h264 = pickProfile(ov.H264Profile)
 		if !ov.any() && lp.isNativeClient() {
-			dp, err := c.store.LatestProbe(ctx, userID)
+			scope, err := c.store.ResolveDeviceScope(ctx, userID, lp.DeviceID, scopeSiteH264Lift)
 			if err != nil {
 				// A probe read failure must never block a launch; keep the floor.
 				c.log.Warn("SPT Path-B: probe load failed, keeping H.264 floor", "user_id", userID, "err", err)
-			} else if nativeHighEligible(dp, top.H264Profile) {
+			} else if nativeHighEligible(scope.Probe, top.H264Profile) {
 				h264 = top.H264Profile
 				c.log.Info("SPT Path-B: native high-eligible, lifting H.264 profile",
 					"user_id", userID, "profile_id", resolved.ID,
@@ -164,7 +162,7 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		// apps.default_width/height/fps/bitrate_kbps are load-bearing here, not
 		// dead columns: any app reaches this path via a stream override with no
 		// profile_id, and it is in the frozen contract.
-		selected := c.selectTier(ctx, userID)
+		selected := c.selectTier(ctx, userID, lp.DeviceID)
 		width = capAndPick(ov.Width, selected.Width, app.DefaultWidth)
 		height = capAndPick(ov.Height, selected.Height, app.DefaultHeight)
 		fps = capAndPick(ov.FPS, selected.FPS, app.DefaultFPS)
@@ -181,11 +179,12 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	// resolved rung's bitrate.
 	env := ProbeEnvelope{}
 	if !lp.IsAdmin && !ov.any() {
-		dp, err := c.store.LatestProbe(ctx, userID)
+		scope, err := c.store.ResolveDeviceScope(ctx, userID, lp.DeviceID, scopeSiteEnvelope)
 		if err != nil {
 			// A probe read failure must never block a launch; proceed with defaults.
 			c.log.Warn("SPT-07: probe load failed, launching without envelope", "user_id", userID, "err", err)
 		} else {
+			dp := scope.Probe
 			env = buildProbeEnvelope(dp)
 			if env.SafeCeilingKbps > 0 {
 				newBitrate := applyEnvelopeToBitrate(bitrateKbps, env)
@@ -217,7 +216,10 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	micGranted := c.resolveMicGrant(ctx, lp)
 
 	p := CreateParams{
-		UserID:      userID,
+		UserID: userID,
+		// Persisted so post-placement and in-session reads resolve against the same
+		// client the launch was gated on.
+		DeviceID:    lp.DeviceID,
 		AppID:       app.ID,
 		Width:       width,
 		Height:      height,
@@ -319,7 +321,7 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 // Gather, plan, apply: reads first (gatherStreamInputs), a pure decision
 // (planStream, stream_plan.go), then log, write once, apply. Hoisting the reads
 // is load-bearing — when the cert cap fires the decision walks a second chain,
-// and re-reading would let one launch's two walks see different LatestProbe rows.
+// and re-reading would let one launch's two walks see different probe rows.
 //
 // On the legacy/tier path there are no rungs; only a codec override can change
 // anything, handled with the host clamp alone.
@@ -418,26 +420,22 @@ func (c *Coordinator) gatherStreamInputs(
 		}
 	}
 
-	// Device decode probe. A read error or absent/stale probe is non-fatal: HEVC
-	// and AV1 stay hard-gated off and the decode-height clamp is skipped.
-	dp, err := c.store.LatestProbe(ctx, sess.UserID)
-	if err != nil {
-		c.log.Warn("rung: probe load failed, gating without decode capabilities",
-			"user_id", sess.UserID, "err", err)
-		dp = nil
-	}
-	in.Probe = dp
-
-	// Clamp 4 at rung grain (§4.4). RungFailures unions rung-level rows with the
-	// legacy launch-profile-level ones, keyed on the same device the probe above
-	// came from (LatestProbe and LatestDeviceKey share the last_seen_at ordering).
-	// A read error skips the clamp.
-	deviceKey, _ := c.store.LatestDeviceKey(ctx, sess.UserID)
-	if fr, err := c.store.RungFailures(ctx, sess.UserID, deviceKey, chain); err != nil {
-		c.log.Warn("rung: decode-failure history load failed, resolving without it",
-			"user_id", sess.UserID, "profile_id", chain.ID, "err", err)
+	// The launching device's decode probe and its clamp-4 history (§4.4), from the
+	// one scope so both describe the same client. An unresolved scope is non-fatal:
+	// HEVC and AV1 stay hard-gated off, the decode-height clamp and clamp 4 are
+	// skipped, and no coarse per-user history stands in.
+	scope, scopeErr := c.store.ResolveDeviceScope(ctx, sess.UserID, deref(sess.DeviceID), scopeSiteRung)
+	if scopeErr != nil {
+		c.log.Warn("rung: device scope load failed, resolving without decode capabilities or history",
+			"user_id", sess.UserID, "err", scopeErr)
 	} else {
-		in.FailedRungs = fr
+		in.Probe = scope.Probe
+		if fr, err := c.store.RungFailures(ctx, sess.UserID, scope.DeviceKey, chain); err != nil {
+			c.log.Warn("rung: decode-failure history load failed, resolving without it",
+				"user_id", sess.UserID, "profile_id", chain.ID, "err", err)
+		} else {
+			in.FailedRungs = fr
+		}
 	}
 
 	if !in.capEligible() {
@@ -456,11 +454,13 @@ func (c *Coordinator) gatherStreamInputs(
 		} else {
 			in.LowerChain = lower
 			rungIDs = append(rungIDs, rungIDsOf(lower)...)
-			if fr, err := c.store.RungFailures(ctx, sess.UserID, deviceKey, lower); err != nil {
-				c.log.Warn("rung: decode-failure history load failed for the cap target, resolving without it",
-					"user_id", sess.UserID, "profile_id", lower.ID, "err", err)
-			} else {
-				in.LowerFailed = fr
+			if scopeErr == nil {
+				if fr, err := c.store.RungFailures(ctx, sess.UserID, scope.DeviceKey, lower); err != nil {
+					c.log.Warn("rung: decode-failure history load failed for the cap target, resolving without it",
+						"user_id", sess.UserID, "profile_id", lower.ID, "err", err)
+				} else {
+					in.LowerFailed = fr
+				}
 			}
 		}
 	}
@@ -736,15 +736,16 @@ func (c *Coordinator) watchStartToRunning(sessionID, hostID string) {
 	}
 }
 
-// selectTier intersects the user's most-recent device probe against the tier
-// ladder, falling back to Default() on any error or missing probe. A probe read
-// failure must never be fatal to a launch, so errors are logged, not propagated.
-func (c *Coordinator) selectTier(ctx context.Context, userID string) tier.Tier {
-	dp, err := c.store.LatestProbe(ctx, userID)
+// selectTier intersects the launching device's probe against the tier ladder,
+// falling back to Default() on any error or missing probe. A probe read failure
+// must never be fatal to a launch, so errors are logged, not propagated.
+func (c *Coordinator) selectTier(ctx context.Context, userID, deviceID string) tier.Tier {
+	scope, err := c.store.ResolveDeviceScope(ctx, userID, deviceID, scopeSiteTier)
 	if err != nil {
 		c.log.Warn("AS-02: probe load failed, using default tier", "user_id", userID, "err", err)
 		return tier.Default()
 	}
+	dp := scope.Probe
 	if dp == nil {
 		return tier.Default()
 	}
