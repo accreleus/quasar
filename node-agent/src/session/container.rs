@@ -1213,24 +1213,16 @@ impl ContainerRuntime {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
-    /// Classify a `docker image inspect` for the image-management reconciliation paths
+    /// Inspect through the Quasar API interface for image-management reconciliation
     /// (`ImageManager::new`, `refresh_register_images`). A plain `.is_ok()` on `run_raw`
     /// conflates "the image is gone" with "the daemon hiccuped", which would demote
     /// every managed image to `absent` — and persist that — on one transient error.
     /// `Ok(true)` present, `Ok(false)` the daemon's definitive "no such image", `Err`
     /// anything else (leave the existing record untouched and warn).
     pub fn image_present(&self, registry_ref: &str) -> Result<bool, String> {
-        match self.run_raw(&["image", "inspect", "--", registry_ref]) {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.to_lowercase().contains("no such image") {
-                    Ok(false)
-                } else {
-                    Err(msg)
-                }
-            }
-        }
+        crate::runtime::configured()
+            .and_then(|runtime| runtime.image_present(registry_ref).wait())
+            .map_err(|error| error.to_string())
     }
 
     /// Graceful teardown: `docker stop -t N` (SIGTERM then SIGKILL after N seconds),

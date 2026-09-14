@@ -7,6 +7,7 @@ license = "MIT"
 [dependencies]
 tempfile = "3"
 anyhow = "1"
+bollard = { version = "=0.21.1", default-features = false, features = ["pipe"] }
 tokio = { version = "1", features = ["full"] }
 # #12: TLS on the control-plane link. `rustls-tls-webpki-roots` — never native roots: the
 # OS store must not be in the pinned path. The ring provider is selected explicitly (the

@@ -143,6 +143,13 @@ pub async fn run(cfg: Config) {
     // Best-effort — a sweep failure never blocks startup.
     let (runtime, swept) = offload_probe(|| {
         let runtime = ContainerRuntime::from_env();
+        match crate::runtime::configured().and_then(|api| api.discover().wait()) {
+            Ok(engine) => info!(token = "runtime-engine-discovered", engine = %engine.name,
+                version = %engine.version, api = %engine.api_version,
+                "container engine discovered; capability support requires separate validation"),
+            Err(error) => warn!(token = "runtime-engine-unavailable", %error,
+                "engine discovery failed; check Docker Unix socket configuration and access"),
+        }
         let swept = runtime.sweep_orphans(&[
             crate::session::container::SESSION_NAME_PREFIX,
             crate::session::audio::PULSE_NAME_PREFIX,

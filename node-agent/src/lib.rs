@@ -38,4 +38,5 @@ pub mod release;
 pub mod session;
 pub mod vram;
 
+pub mod runtime;
 pub mod source_policy;
