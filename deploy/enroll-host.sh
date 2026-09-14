@@ -102,7 +102,7 @@ RESET_IDENTITY="${QUASAR_RESET_IDENTITY:-0}"
 # both — tty only changes how, never what.
 STYLE="${QUASAR_ENROLL_STYLE:-}"
 if [ -z "$STYLE" ]; then
-  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then STYLE=tty; else STYLE=plain; fi
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then STYLE="tty"; else STYLE="plain"; fi
 fi
 case "$STYLE" in tty|plain) ;; *) STYLE=plain ;; esac
 UNICODE=0
@@ -115,9 +115,9 @@ else
   C_OK=""; C_WARN=""; C_ERR=""; C_DIM=""; C_BOLD=""; C_OFF=""; CLR=""
 fi
 if [ "$UNICODE" = 1 ]; then
-  G_OK="✔"; G_FAIL="✘"; G_WARN="!"; SPIN_FRAMES="⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏"
+  G_OK="✔"; G_FAIL="✘"; G_WARN="!"
 else
-  G_OK="[ok]"; G_FAIL="[!!]"; G_WARN="[!]"; SPIN_FRAMES="- \\ | /"
+  G_OK="[ok]"; G_FAIL="[!!]"; G_WARN="[!]"
 fi
 
 # A spinner is a background loop rewriting one line; it MUST be stopped before
@@ -128,8 +128,11 @@ spin_start() { # spin_start <label>
   spin_stop
   (
     set +e
-    # shellcheck disable=SC2086
-    set -- $SPIN_FRAMES
+    if [ "$UNICODE" = 1 ]; then
+      set -- ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏
+    else
+      set -- '-' '\' '|' '/'
+    fi
     while :; do
       printf '%s  %s %s' "$CLR" "$1" "$SPIN_LABEL"
       f="$1"; shift; set -- "$@" "$f"
@@ -815,11 +818,21 @@ step "Starting the node agent"
 # RFC 3339 with the Z: without it docker parses the stamp in the daemon's local
 # zone and `logs --since` reaches back into a previous run's lines.
 started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-compose() {
+compose() (
+  # Prepend from the end to retain overlay order and each path as one argument.
+  pending_files=$compose_files
+  while [ -n "$pending_files" ]; do
+    compose_file=${pending_files##*:}
+    set -- -f "$DIR/$compose_file" "$@"
+    case "$pending_files" in
+      *:*) pending_files=${pending_files%:*} ;;
+      *) pending_files="" ;;
+    esac
+  done
   # shellcheck disable=SC2086
   $SUDO docker compose --project-directory "$DIR" --project-name "$PROJECT" \
-    $(printf '%s' "$compose_files" | tr ':' '\n' | sed "s#^#-f $DIR/#" | tr '\n' ' ') "$@"
-}
+    "$@"
+)
 # #199: the agent's identity — the node secret minted by whichever control plane
 # enrolled this machine last — lives in a named volume that outlives every re-run
 # of this script, and the agent presents it in preference to the token in the
@@ -898,9 +911,17 @@ tick=0
 wait_beat() {
   if [ "$STYLE" = tty ]; then
     for _ in 1 2 3 4; do
-      # shellcheck disable=SC2086
-      set -- $SPIN_FRAMES
-      eval "frame=\${$((tick % 10 + 1))}"
+      if [ "$UNICODE" = 1 ]; then
+        set -- ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏
+      else
+        set -- '-' '\' '|' '/'
+      fi
+      frame_index=$((tick % $#))
+      while [ "$frame_index" -gt 0 ]; do
+        shift
+        frame_index=$((frame_index - 1))
+      done
+      frame=$1
       printf '%s  %s waiting for the agent to enroll… %ss' "$CLR" "$frame" "$elapsed"
       tick=$((tick + 1))
       sleep 0.5

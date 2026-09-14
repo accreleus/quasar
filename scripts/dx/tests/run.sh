@@ -807,7 +807,7 @@ fi
 
 # With no operator patterns the generic shapes still run: the home path is still
 # caught and the operator-only address is not, which proves the sets are separate.
-ls_generic="$(LEAK_SCAN_OPERATOR_PATTERNS= LEAK_SCAN_PATTERNS_FILE="$LS_NO_FILE" LEAK_SCAN_ISSUES_JSON="$FIXTURES/leak-issues-dirty.json" bash "$LS" --issues 2>&1)"
+ls_generic="$(LEAK_SCAN_OPERATOR_PATTERNS='' LEAK_SCAN_PATTERNS_FILE="$LS_NO_FILE" LEAK_SCAN_ISSUES_JSON="$FIXTURES/leak-issues-dirty.json" bash "$LS" --issues 2>&1)"
 ls_generic_rc=$?
 if [ "$ls_generic_rc" -eq 1 ] &&
   printf '%s' "$ls_generic" | grep -q 'issue#102 comment\[1\]' &&
@@ -819,7 +819,7 @@ else
 fi
 
 # CI requires the operator set wherever its secret exists. Absent must fail, never pass.
-LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS=1 LEAK_SCAN_OPERATOR_PATTERNS= LEAK_SCAN_PATTERNS_FILE="$LS_NO_FILE" \
+LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS=1 LEAK_SCAN_OPERATOR_PATTERNS='' LEAK_SCAN_PATTERNS_FILE="$LS_NO_FILE" \
   LEAK_SCAN_ISSUES_JSON="$FIXTURES/leak-issues-clean.json" bash "$LS" --issues >/dev/null 2>&1
 ls_req_rc=$?
 if [ "$ls_req_rc" -eq 2 ]; then
