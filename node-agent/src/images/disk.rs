@@ -2,11 +2,11 @@
 //! rather than letting a full docker filesystem kill the pull obscurely
 //! (agent-api.md image-management P2 amendment).
 //!
-//! `statvfs` the daemon's own data root (`docker info --format '{{.DockerRootDir}}'`),
-//! which stays correct when the agent is a sibling container whose filesystem is
-//! unrelated. Not `docker system df`: that reports image SIZE usage, not free headroom.
-//! Fail-open: if the path is not visible from this mount namespace the guard logs and
-//! lets the pull proceed — "cannot tell" must never block an operator's dev box.
+//! Read the daemon's own data root through the runtime API. A containerized agent
+//! `statvfs`s it only after inspected bind mounts prove the translated agent path
+//! names that filesystem; `/host` and same-looking paths establish nothing. The
+//! supported native-agent deployment shares the daemon host namespace. Otherwise
+//! the guard fails open: "cannot tell" must never block an operator's dev box.
 
 use crate::session::container::ContainerRuntime;
 
@@ -18,16 +18,18 @@ pub const MIN_FREE_MB: u64 = 2048;
 /// layer + the final image), so higher than [`MIN_FREE_MB`].
 pub const MIN_BUILD_FREE_MB: u64 = 4096;
 
-fn docker_root_dir(runtime: &ContainerRuntime) -> Option<String> {
-    let out = runtime
-        .run_raw(&["info", "--format", "{{.DockerRootDir}}"])
-        .ok()?;
-    let p = out.trim().to_string();
-    if p.is_empty() {
-        None
-    } else {
-        Some(p)
+fn agent_visible_engine_root(_runtime: &ContainerRuntime) -> Option<std::path::PathBuf> {
+    let runtime = crate::runtime::configured().ok()?;
+    let root = runtime.engine_storage().wait().ok()?.root.0;
+    if !(std::path::Path::new("/.dockerenv").exists()
+        || std::path::Path::new("/run/.containerenv").exists())
+    {
+        // Supported native-agent deployment: agent and daemon run on this host.
+        return Some(root);
     }
+    let self_id = crate::nvidia_volume::self_container_id()?;
+    let self_mounts = runtime.inspect_container(self_id).wait().ok()??.mounts;
+    crate::runtime::agent_path_for_daemon_path(&self_mounts, &root)
 }
 
 /// Available space at `path` in MiB; `None` on any failure.
@@ -63,11 +65,14 @@ pub fn verdict(free_mb: u64, known_image_mb: Option<u64>) -> Result<(), String> 
 /// Free space at the daemon's data root in MiB; `None` drives the shared
 /// "cannot tell, don't block" degradation in [`check`] and [`check_build`].
 fn resolve_free_mb(runtime: &ContainerRuntime) -> Option<u64> {
-    let root = docker_root_dir(runtime)?;
-    match free_space_mb(&root) {
+    let root = agent_visible_engine_root(runtime)?;
+    match free_space_mb(&root.to_string_lossy()) {
         Some(mb) => Some(mb),
         None => {
-            tracing::debug!("disk guard: statvfs({root}) failed; skipping check");
+            tracing::debug!(
+                "disk guard: statvfs({}) failed; skipping check",
+                root.display()
+            );
             None
         }
     }

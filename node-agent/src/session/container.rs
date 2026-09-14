@@ -424,11 +424,11 @@ impl ContainerRuntime {
     pub fn own_image(&self) -> Result<String> {
         let id = crate::nvidia_volume::self_container_id()
             .context("cannot determine the agent container identity")?;
-        let image = self.run_raw(&["inspect", "--format", "{{.Image}}", &id])?;
-        anyhow::ensure!(
-            !image.trim().is_empty(),
-            "agent image inspection returned no image"
-        );
+        let image = crate::runtime::configured()?
+            .inspect_container(id)
+            .wait()?
+            .ok_or_else(|| anyhow::anyhow!("agent container disappeared during image inspection"))?
+            .image_id;
         Ok(image.trim().to_owned())
     }
 
@@ -440,23 +440,13 @@ impl ContainerRuntime {
     }
 
     fn image_env_checked(&self, image: &str, key: &str) -> Result<Option<String>> {
-        let out = output_with_timeout(
-            Command::new(&self.bin).args([
-                "image",
-                "inspect",
-                "--format",
-                "{{range .Config.Env}}{{println .}}{{end}}",
-                image,
-            ]),
-            "image env inspect",
-        )?;
-        anyhow::ensure!(
-            out.status.success(),
-            "cannot inspect app image {image} before configuring its NVIDIA loader environment"
-        );
+        let metadata = crate::runtime::configured()?
+            .inspect_image_metadata(image).wait()?
+            .ok_or_else(|| anyhow::anyhow!("cannot inspect app image {image} before configuring its NVIDIA loader environment"))?;
         let prefix = format!("{key}=");
-        Ok(String::from_utf8_lossy(&out.stdout)
-            .lines()
+        Ok(metadata
+            .baked_env
+            .iter()
             .find_map(|l| l.strip_prefix(&prefix).map(str::to_string))
             .filter(|v| !v.is_empty()))
     }

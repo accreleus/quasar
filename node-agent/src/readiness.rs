@@ -352,13 +352,11 @@ pub(crate) fn sibling_mount_error() -> Option<String> {
     let Some(id) = crate::nvidia_volume::self_container_id() else {
         return Some("Cannot identify the agent container to validate app mounts".into());
     };
-    let docker = std::env::var("QUASAR_CONTAINER_RUNTIME").unwrap_or_else(|_| "docker".into());
-    let Some(body) = run_with_timeout(&docker, &["inspect", "--format", "{{json .Mounts}}", &id])
-    else {
+    let Ok(runtime) = crate::runtime::configured() else {
         return Some("Docker could not inspect the agent's mounts; check socket access".into());
     };
-    let Ok(mounts) = serde_json::from_str::<Vec<serde_json::Value>>(&body) else {
-        return Some("Docker returned invalid agent mount data".into());
+    let Ok(Some(container)) = runtime.inspect_container(id).wait() else {
+        return Some("Docker could not inspect the agent's mounts; check socket access".into());
     };
     let mut paths =
         vec![std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/quasar-agent".into())];
@@ -378,18 +376,21 @@ pub(crate) fn sibling_mount_error() -> Option<String> {
             });
         paths.push(template);
     }
-    validate_sibling_mounts(&mounts, &paths)
+    validate_sibling_mounts(&container.mounts, &paths)
 }
 
-fn validate_sibling_mounts(mounts: &[serde_json::Value], paths: &[String]) -> Option<String> {
+fn validate_sibling_mounts(mounts: &[crate::runtime::Mount], paths: &[String]) -> Option<String> {
     let broken: Vec<_> = paths
         .iter()
         .filter(|path| {
             !mounts.iter().any(|mount| {
-                mount["Type"].as_str() == Some("bind")
-                    && mount["Source"].as_str() == Some(path.as_str())
-                    && mount["Destination"].as_str() == Some(path.as_str())
-                    && mount["RW"].as_bool() == Some(true)
+                mount.kind == crate::runtime::MountKind::Bind
+                    && mount
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| source.0 == Path::new(path))
+                    && mount.destination == **path
+                    && mount.read_only == Some(false)
             })
         })
         .cloned()
@@ -1822,14 +1823,15 @@ fn detect_firewall_posture() -> FirewallPosture {
     // A bridged container can have an empty local ruleset while the host filters
     // every packet. Only host-networked agents may report this as host evidence.
     if is_containerized() {
-        let docker = std::env::var("QUASAR_CONTAINER_RUNTIME").unwrap_or_else(|_| "docker".into());
         let network = crate::nvidia_volume::self_container_id().and_then(|id| {
-            run_with_timeout(
-                &docker,
-                &["inspect", "--format", "{{.HostConfig.NetworkMode}}", &id],
-            )
+            crate::runtime::configured()
+                .ok()?
+                .inspect_container(id)
+                .wait()
+                .ok()??
+                .network_mode
         });
-        if network.as_deref().map(str::trim) != Some("host") {
+        if network.as_deref() != Some("host") {
             return FirewallPosture::Unknown;
         }
     }
@@ -2535,13 +2537,21 @@ mod tests {
     #[test]
     fn wrong_mount_source_is_not_treated_as_a_valid_app_path() {
         let paths = vec!["/run/quasar-agent".to_string()];
-        let good = serde_json::json!({"Type":"bind", "Source":"/run/quasar-agent", "Destination":"/run/quasar-agent", "RW":true});
+        let good = crate::runtime::Mount {
+            kind: crate::runtime::MountKind::Bind,
+            source: Some(crate::runtime::DaemonHostPath("/run/quasar-agent".into())),
+            name: None,
+            destination: "/run/quasar-agent".into(),
+            read_only: Some(false),
+        };
         assert!(validate_sibling_mounts(std::slice::from_ref(&good), &paths).is_none());
         let mut wrong = good.clone();
-        wrong["Source"] = serde_json::json!("/some/other/directory");
+        wrong.source = Some(crate::runtime::DaemonHostPath(
+            "/some/other/directory".into(),
+        ));
         assert!(validate_sibling_mounts(&[wrong], &paths).is_some());
         let mut readonly = good;
-        readonly["RW"] = serde_json::json!(false);
+        readonly.read_only = Some(true);
         assert!(validate_sibling_mounts(&[readonly], &paths).is_some());
         assert!(validate_sibling_mounts(&[], &paths).is_some());
     }

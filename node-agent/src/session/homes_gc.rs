@@ -46,6 +46,7 @@ use tracing::{debug, info, warn};
 
 use crate::session::container::ContainerRuntime;
 use crate::session::home;
+use crate::session::storage_liveness::StorageLiveness;
 
 /// Prefix of the temporary name a home is renamed to before removal. Also the
 /// marker the next sweep purges, so an interrupted removal self-heals.
@@ -169,27 +170,43 @@ pub struct SweepReport {
 
 /// Run one sweep. Blocking; never panics, never returns an error, never
 /// touches anything outside `cfg.root`.
-pub fn sweep(cfg: &HomesGcSettings, runtime: &ContainerRuntime) -> SweepReport {
-    let mut rep = SweepReport::default();
-    if let Err(reason) = check_root(&cfg.root) {
-        warn!(
-            token = "homes-gc-root-refused",
-            "homes-gc: refusing to sweep {}: {reason}",
-            cfg.root.display()
-        );
-        return rep;
+pub fn sweep(cfg: &HomesGcSettings, _runtime: &ContainerRuntime) -> SweepReport {
+    if !valid_root(&cfg.root) {
+        return SweepReport::default();
     }
-    let live = match live_mount_sources(runtime) {
+    sweep_with_capture(cfg, StorageLiveness::capture())
+}
+
+/// Apply a captured liveness result.  The production caller captures through
+/// the runtime API; tests exercise this boundary without a CLI/SDK double.
+fn sweep_with_capture(
+    cfg: &HomesGcSettings,
+    captured: anyhow::Result<StorageLiveness>,
+) -> SweepReport {
+    let live = match captured {
         Ok(live) => live,
         Err(e) => {
             warn!(
                 token = "homes-gc-liveness-unavailable",
                 "homes-gc: skipping sweep because live mounts cannot be established: {e}"
             );
-            rep.errors += 1;
-            return rep;
+            return SweepReport {
+                errors: 1,
+                ..SweepReport::default()
+            };
         }
     };
+    sweep_with_liveness(cfg, &live)
+}
+
+/// Sweep against an already-captured Quasar liveness snapshot.  This makes the
+/// deletion policy testable without a fake Docker CLI and ensures callers that
+/// have captured liveness can keep one coherent point-in-time guard.
+fn sweep_with_liveness(cfg: &HomesGcSettings, live: &StorageLiveness) -> SweepReport {
+    let mut rep = SweepReport::default();
+    if !valid_root(&cfg.root) {
+        return rep;
+    }
     let now = SystemTime::now();
 
     let entries = match std::fs::read_dir(&cfg.root) {
@@ -210,6 +227,25 @@ pub fn sweep(cfg: &HomesGcSettings, runtime: &ContainerRuntime) -> SweepReport {
         let path = entry.path();
 
         if name.starts_with(TRASH_PREFIX) {
+            if cfg.dry_run {
+                continue;
+            }
+            match live.protects(&path) {
+                Ok(true) => {
+                    rep.skipped_live += 1;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    rep.errors += 1;
+                    warn!(
+                        token = "homes-gc-trash-liveness-unknown",
+                        "homes-gc: cannot establish liveness for {}: {e}",
+                        path.display()
+                    );
+                    continue;
+                }
+            }
             match std::fs::remove_dir_all(&path) {
                 Ok(()) => {
                     rep.trash_purged += 1;
@@ -247,13 +283,25 @@ pub fn sweep(cfg: &HomesGcSettings, runtime: &ContainerRuntime) -> SweepReport {
         }
         rep.candidates += 1;
 
-        if is_live(&path, &live) {
-            debug!(
-                "homes-gc: {} is mounted by a live container — keeping",
-                path.display()
-            );
-            rep.skipped_live += 1;
-            continue;
+        match live.protects(&path) {
+            Ok(true) => {
+                debug!(
+                    "homes-gc: {} is mounted by a live container — keeping",
+                    path.display()
+                );
+                rep.skipped_live += 1;
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                rep.errors += 1;
+                warn!(
+                    token = "homes-gc-candidate-liveness-unknown",
+                    "homes-gc: cannot establish liveness for {}: {e}",
+                    path.display()
+                );
+                continue;
+            }
         }
 
         let age = last_use_age(&path, now);
@@ -436,6 +484,22 @@ fn mtime(p: &Path) -> SystemTime {
 
 // ── guards ──────────────────────────────────────────────────────────────────
 
+/// Validate and report an invalid root before a runtime capture or filesystem
+/// walk can proceed.
+fn valid_root(root: &Path) -> bool {
+    match check_root(root) {
+        Ok(()) => true,
+        Err(reason) => {
+            warn!(
+                token = "homes-gc-root-refused",
+                "homes-gc: refusing to sweep {}: {reason}",
+                root.display()
+            );
+            false
+        }
+    }
+}
+
 /// Does this look like OUR home root? Absolute, a real directory (not a
 /// symlink), at least two path components deep, and not a system directory.
 pub fn check_root(root: &Path) -> Result<(), String> {
@@ -494,54 +558,19 @@ fn delete_home(root: &Path, path: &Path) -> std::io::Result<()> {
     }
 }
 
-// ── liveness ────────────────────────────────────────────────────────────────
-
-/// Liveness is mandatory: an old home may still be mounted by a running app.
-fn live_mount_sources(runtime: &ContainerRuntime) -> anyhow::Result<HashSet<PathBuf>> {
-    let mut set = HashSet::new();
-    let output = runtime.run_raw(&["ps", "-q"])?;
-    let ids: Vec<_> = output
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    if !ids.is_empty() {
-        let mut args = vec![
-            "inspect",
-            "--format",
-            "{{range .Mounts}}{{println .Source}}{{end}}",
-        ];
-        args.extend(ids);
-        set.extend(parse_paths(&runtime.run_raw(&args)?));
-    }
-    set.extend(parse_proc_mounts(&std::fs::read_to_string("/proc/mounts")?));
-    Ok(set)
-}
-
-/// Absolute paths, one per line, ignoring blanks.
-fn parse_paths(out: &str) -> Vec<PathBuf> {
-    out.lines()
-        .map(str::trim)
-        .filter(|l| l.starts_with('/'))
-        .map(PathBuf::from)
-        .collect()
-}
-
-/// The mount POINTS (field 2) of `/proc/mounts`. A bind mount of a home into
-/// this process's own namespace shows up here even when docker cannot be asked.
-fn parse_proc_mounts(text: &str) -> Vec<PathBuf> {
-    text.lines()
-        .filter_map(|l| l.split_whitespace().nth(1))
-        .filter(|p| p.starts_with('/'))
-        // /proc/mounts octal-escapes spaces; only that one matters in practice.
-        .map(|p| PathBuf::from(p.replace("\\040", " ")))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::storage_liveness::Snapshot;
     use std::fs;
+
+    fn empty_liveness() -> StorageLiveness {
+        StorageLiveness::from_snapshot(Snapshot {
+            own_mounts: None,
+            foreign: vec![],
+            proc_mounts: vec![],
+        })
+    }
 
     #[test]
     fn throwaway_names_are_matched_exactly() {
@@ -617,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_docker_liveness_preserves_aged_homes() {
+    fn snapshot_liveness_is_required_by_the_runtime_caller() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("var/lib/quasar/homes");
         let home = root.join("agent-0bdc5920-fc5182ea");
@@ -627,7 +656,23 @@ mod tests {
             retention: Duration::ZERO,
             dry_run: false,
         };
-        let report = sweep(&cfg, &ContainerRuntime::test_runtime("/bin/false"));
+        let report = sweep_with_liveness(&cfg, &empty_liveness());
+        assert!(!home.exists());
+        assert_eq!(report.deleted, 1);
+    }
+
+    #[test]
+    fn failed_capture_keeps_an_aged_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("var/lib/quasar/homes");
+        let home = root.join("agent-0bdc5920-fc5182ea");
+        fs::create_dir_all(&home).unwrap();
+        let cfg = HomesGcSettings {
+            root,
+            retention: Duration::ZERO,
+            dry_run: false,
+        };
+        let report = sweep_with_capture(&cfg, Err(anyhow::anyhow!("daemon unavailable")));
         assert!(home.exists());
         assert_eq!(report.deleted, 0);
         assert_eq!(report.errors, 1);
@@ -661,7 +706,7 @@ mod tests {
             retention: Duration::ZERO,
             dry_run: false,
         };
-        let rep = sweep(&cfg, &ContainerRuntime::test_runtime("/bin/true"));
+        let rep = sweep_with_liveness(&cfg, &empty_liveness());
 
         assert!(!old_a.exists(), "an aged throwaway home must be deleted");
         assert!(!old_b.exists());
@@ -689,7 +734,7 @@ mod tests {
             retention: Duration::from_secs(72 * 3600),
             dry_run: false,
         };
-        let rep = sweep(&cfg, &ContainerRuntime::test_runtime("/bin/true"));
+        let rep = sweep_with_liveness(&cfg, &empty_liveness());
         assert!(home.exists());
         assert_eq!(rep.skipped_young, 1);
         assert_eq!(rep.deleted, 0);
@@ -700,7 +745,7 @@ mod tests {
             dry_run: true,
             ..cfg
         };
-        let rep = sweep(&cfg, &ContainerRuntime::test_runtime("/bin/true"));
+        let rep = sweep_with_liveness(&cfg, &empty_liveness());
         assert!(home.exists(), "a dry run must never delete");
         assert_eq!(rep.deleted, 1);
     }
@@ -723,10 +768,7 @@ mod tests {
             retention: Duration::ZERO,
             dry_run: true,
         };
-        assert_eq!(
-            sweep(&cfg, &ContainerRuntime::test_runtime("/bin/true")).deleted,
-            1
-        );
+        assert_eq!(sweep_with_liveness(&cfg, &empty_liveness()).deleted, 1);
     }
 
     #[test]
@@ -737,33 +779,8 @@ mod tests {
             dry_run: false,
         };
         assert_eq!(
-            sweep(&cfg, &ContainerRuntime::test_runtime("/bin/true")),
+            sweep_with_liveness(&cfg, &empty_liveness()),
             SweepReport::default()
-        );
-    }
-
-    #[test]
-    fn proc_mounts_points_are_parsed() {
-        let text = "/dev/sda1 / ext4 rw 0 0\n\
-                    tmpfs /run/user/1000 tmpfs rw 0 0\n\
-                    /dev/sdb /var/lib/quasar/homes/agent-0bdc5920-fc5182ea ext4 rw 0 0\n";
-        let got = parse_proc_mounts(text);
-        assert!(got.contains(&PathBuf::from(
-            "/var/lib/quasar/homes/agent-0bdc5920-fc5182ea"
-        )));
-        assert!(got.contains(&PathBuf::from("/")));
-    }
-
-    #[test]
-    fn docker_mount_sources_are_parsed() {
-        let out = "/var/lib/quasar/homes/agent-0bdc5920-fc5182ea/kde-desktop\n\
-                   \n/run/quasar-agent\nnamed-volume\n";
-        assert_eq!(
-            parse_paths(out),
-            vec![
-                PathBuf::from("/var/lib/quasar/homes/agent-0bdc5920-fc5182ea/kde-desktop"),
-                PathBuf::from("/run/quasar-agent"),
-            ]
         );
     }
 
@@ -836,7 +853,7 @@ mod tests {
             retention: Duration::from_secs(72 * 3600),
             dry_run: false,
         };
-        let rep = sweep(&cfg, &ContainerRuntime::test_runtime("/bin/true"));
+        let rep = sweep_with_liveness(&cfg, &empty_liveness());
         assert!(!emptied.exists(), "an aged empty home must be collected");
         assert!(
             populated.exists(),

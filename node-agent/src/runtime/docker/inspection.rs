@@ -1,0 +1,207 @@
+//! SDK details for read-only installation and storage facts.
+use super::{classify, discover};
+use crate::runtime::{ErrorKind, RuntimeConfig, RuntimeError};
+use bollard::{errors::Error, Docker};
+
+fn mount_kind(value: &str) -> crate::runtime::MountKind {
+    match value {
+        "bind" => crate::runtime::MountKind::Bind,
+        "volume" => crate::runtime::MountKind::Volume,
+        "tmpfs" => crate::runtime::MountKind::Tmpfs,
+        other => crate::runtime::MountKind::Other(other.to_owned()),
+    }
+}
+
+fn container_inspection(
+    info: bollard::models::ContainerInspectResponse,
+) -> Result<crate::runtime::ContainerInspection, RuntimeError> {
+    let id = info
+        .id
+        .filter(|value| !value.is_empty())
+        .ok_or(ErrorKind::Protocol)?;
+    let image_id = info
+        .image
+        .filter(|value| !value.is_empty())
+        .ok_or(ErrorKind::Protocol)?;
+    let config = info.config.ok_or(ErrorKind::Protocol)?;
+    let configured_image = config
+        .image
+        .filter(|value| !value.is_empty())
+        .ok_or(ErrorKind::Protocol)?;
+    let labels = config.labels.unwrap_or_default().into_iter().collect();
+    let network_mode = info
+        .host_config
+        .and_then(|host| host.network_mode)
+        .filter(|value| !value.is_empty());
+    let mounts = info
+        .mounts
+        .ok_or(ErrorKind::Protocol)?
+        .into_iter()
+        .map(|mount| {
+            let typ = mount
+                .typ
+                .filter(|value| !value.is_empty())
+                .ok_or(ErrorKind::Protocol)?;
+            let kind = mount_kind(&typ);
+            let destination = mount
+                .destination
+                .filter(|value| !value.is_empty())
+                .ok_or(ErrorKind::Protocol)?;
+            if !std::path::Path::new(&destination).is_absolute()
+                || std::path::Path::new(&destination)
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return Err(ErrorKind::Protocol.into());
+            }
+            let source = mount
+                .source
+                .filter(|value| !value.is_empty())
+                .map(|value| crate::runtime::DaemonHostPath(value.into()));
+            let usable_source = source.as_ref().is_some_and(|source| {
+                source.0.is_absolute()
+                    && !source
+                        .0
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir))
+            });
+            if matches!(
+                kind,
+                crate::runtime::MountKind::Bind
+                    | crate::runtime::MountKind::Volume
+                    | crate::runtime::MountKind::Other(_)
+            ) && !usable_source
+            {
+                return Err(ErrorKind::Protocol.into());
+            }
+            let name = mount.name.filter(|value| !value.is_empty());
+            if matches!(kind, crate::runtime::MountKind::Volume) && name.is_none() {
+                return Err(ErrorKind::Protocol.into());
+            }
+            Ok(crate::runtime::Mount {
+                kind,
+                source,
+                name,
+                destination,
+                read_only: mount.rw.map(|writable| !writable),
+            })
+        })
+        .collect::<Result<Vec<_>, RuntimeError>>()?;
+    Ok(crate::runtime::ContainerInspection {
+        id,
+        image_id,
+        configured_image,
+        labels,
+        mounts,
+        network_mode,
+    })
+}
+
+pub(crate) async fn inspect_container(
+    config: &RuntimeConfig,
+    id: &str,
+) -> Result<Option<crate::runtime::ContainerInspection>, RuntimeError> {
+    if id.trim().is_empty() || id.contains(['/', '?', '#', '\0']) {
+        return Err(ErrorKind::InvalidConfiguration.into());
+    }
+    let (docker, _) = discover(config).await?;
+    inspect_container_with(&docker, id).await
+}
+
+async fn inspect_container_with(
+    docker: &Docker,
+    id: &str,
+) -> Result<Option<crate::runtime::ContainerInspection>, RuntimeError> {
+    match docker.inspect_container(id, None).await {
+        Ok(info) => Ok(Some(container_inspection(info)?)),
+        Err(Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => Ok(None),
+        Err(error) => Err(classify(error)),
+    }
+}
+
+pub(crate) async fn live_containers(
+    config: &RuntimeConfig,
+) -> Result<Vec<crate::runtime::ContainerInspection>, RuntimeError> {
+    let (docker, _) = discover(config).await?;
+    let listed = docker
+        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+            all: true,
+            ..Default::default()
+        }))
+        .await
+        .map_err(classify)?;
+    let mut inspected = Vec::with_capacity(listed.len());
+    for summary in listed {
+        let id = summary
+            .id
+            .filter(|value| !value.is_empty())
+            .ok_or(ErrorKind::Protocol)?;
+        let detail = match docker.inspect_container(&id, None).await {
+            Ok(detail) => detail,
+            // A race means the snapshot cannot prove a home is safe to remove.
+            Err(Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Err(ErrorKind::Missing.into()),
+            Err(error) => return Err(classify(error)),
+        };
+        let inspection = container_inspection(detail.clone())?;
+        if inspection.id != id {
+            return Err(ErrorKind::Protocol.into());
+        }
+        let state = detail.state.as_ref().ok_or(ErrorKind::Protocol)?;
+        let running = state.running.ok_or(ErrorKind::Protocol)?;
+        let paused = state.paused.ok_or(ErrorKind::Protocol)?;
+        let restarting = state.restarting.ok_or(ErrorKind::Protocol)?;
+        if !running && !paused && !restarting {
+            continue;
+        }
+        inspected.push(inspection);
+    }
+    Ok(inspected)
+}
+
+pub(crate) async fn engine_storage(
+    config: &RuntimeConfig,
+) -> Result<crate::runtime::EngineStorage, RuntimeError> {
+    let (docker, _) = discover(config).await?;
+    let root = docker
+        .info()
+        .await
+        .map_err(classify)?
+        .docker_root_dir
+        .filter(|value| !value.is_empty())
+        .filter(|value| std::path::Path::new(value).is_absolute())
+        .ok_or(ErrorKind::Protocol)?;
+    Ok(crate::runtime::EngineStorage {
+        root: crate::runtime::DaemonHostPath(root.into()),
+    })
+}
+
+pub(crate) async fn inspect_image_metadata(
+    config: &RuntimeConfig,
+    image: &str,
+) -> Result<Option<crate::runtime::ImageMetadata>, RuntimeError> {
+    if image.trim().is_empty() {
+        return Err(ErrorKind::InvalidConfiguration.into());
+    }
+    let (docker, _) = discover(config).await?;
+    match docker.inspect_image(image).await {
+        Ok(info) => Ok(Some(crate::runtime::ImageMetadata {
+            id: info
+                .id
+                .filter(|value| !value.is_empty())
+                .ok_or(ErrorKind::Protocol)?,
+            baked_env: info
+                .config
+                .ok_or(ErrorKind::Protocol)?
+                .env
+                .unwrap_or_default(),
+        })),
+        Err(Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => Ok(None),
+        Err(error) => Err(classify(error)),
+    }
+}

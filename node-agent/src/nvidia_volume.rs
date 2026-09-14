@@ -362,38 +362,53 @@ pub fn locate_host_path(docker: &str) -> (Option<PathBuf>, Option<String>) {
     let Some(id) = self_container_id() else {
         return unresolved("could not identify the agent container");
     };
-    let Some(out) = crate::readiness::run_with_timeout(
-        docker,
-        &["inspect", "--format", "{{json .Mounts}}", &id],
-    ) else {
+    let Ok(runtime) = crate::runtime::configured() else {
         return unresolved("Docker could not inspect the agent's mounts");
     };
-    let Ok(mounts) = serde_json::from_str::<Vec<serde_json::Value>>(&out) else {
-        return unresolved("Docker returned invalid mount data");
+    let Ok(Some(container)) = runtime.inspect_container(id).wait() else {
+        return unresolved("Docker could not inspect the agent's mounts");
     };
+    match driver_mount_location(container.mounts) {
+        Ok(location) => {
+            set_mount_error(None);
+            location
+        }
+        Err(detail) => unresolved(detail),
+    }
+}
+
+fn driver_mount_location(
+    mounts: Vec<crate::runtime::Mount>,
+) -> std::result::Result<(Option<PathBuf>, Option<String>), &'static str> {
     for mount in mounts {
-        if mount["Destination"].as_str() != Some(VOLUME_MOUNT) {
+        if mount.destination != VOLUME_MOUNT {
             continue;
         }
-        let host = mount["Source"]
-            .as_str()
-            .filter(|src| src.starts_with('/'))
-            .map(PathBuf::from);
-        let name = if mount["Type"].as_str() == Some("volume") {
-            mount["Name"]
-                .as_str()
-                .filter(|name| !name.is_empty())
-                .map(str::to_owned)
+        if !matches!(
+            mount.kind,
+            crate::runtime::MountKind::Bind | crate::runtime::MountKind::Volume
+        ) {
+            return Err(
+                "the driver destination uses an unsupported mount type; use a bind or named volume",
+            );
+        }
+        if mount.kind == crate::runtime::MountKind::Volume
+            && mount.name.as_deref().is_none_or(str::is_empty)
+        {
+            return Err("the driver volume has no usable name");
+        }
+        let host = mount.source.map(|source| source.0);
+        let name = if mount.kind == crate::runtime::MountKind::Volume {
+            mount.name
         } else {
             None
         };
-        if host.is_none() && name.is_none() {
-            return unresolved("the driver mount has no usable source or volume name");
+        if host.is_none() {
+            return Err("the driver mount has no usable source or volume name");
         }
-        set_mount_error(None);
-        return (host, name);
+        return Ok((host, name));
     }
-    unresolved("the agent mount list has no NVIDIA driver destination")
+    Err("the agent mount list has no NVIDIA driver destination")
 }
 
 /// Our own container id, from `/proc/self/mountinfo` with `$HOSTNAME` as fallback. Both
@@ -2276,6 +2291,40 @@ pub fn debug_map() -> BTreeMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn driver_mount_rejects_unknown_semantics_and_preserves_named_volumes() {
+        use crate::runtime::{DaemonHostPath, Mount, MountKind};
+        let mount = |kind, name| Mount {
+            kind,
+            source: Some(DaemonHostPath("/daemon/driver".into())),
+            name,
+            destination: super::VOLUME_MOUNT.into(),
+            read_only: Some(false),
+        };
+        assert!(
+            super::driver_mount_location(vec![mount(MountKind::Other("opaque".into()), None)])
+                .is_err()
+        );
+        assert!(super::driver_mount_location(vec![mount(MountKind::Tmpfs, None)]).is_err());
+        assert_eq!(
+            super::driver_mount_location(vec![mount(MountKind::Bind, Some("unrelated".into()))])
+                .unwrap(),
+            (Some(std::path::PathBuf::from("/daemon/driver")), None)
+        );
+        assert_eq!(
+            super::driver_mount_location(vec![mount(
+                MountKind::Volume,
+                Some("driver-volume".into())
+            )])
+            .unwrap(),
+            (
+                Some(std::path::PathBuf::from("/daemon/driver")),
+                Some("driver-volume".into())
+            )
+        );
+        assert!(super::driver_mount_location(vec![mount(MountKind::Volume, None)]).is_err());
+    }
+
     use super::*;
     use std::fs;
 

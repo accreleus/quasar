@@ -31,6 +31,7 @@ pub mod home;
 // #500: sweep of ephemeral (`agent-<8hex>-<8hex>`) managed homes that are unmounted
 // and past retention. A floor under `gc` (#175), which only reaps tracked homes.
 pub mod homes_gc;
+mod storage_liveness;
 // Steam ACF manifest scanner. Same HTTP-pull/report shape and node-secret auth as
 // `gc`; never fatal to the agent.
 pub mod library_scan;

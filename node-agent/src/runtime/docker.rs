@@ -4,6 +4,10 @@ use bollard::{errors::Error, Docker};
 use futures_util::StreamExt;
 mod build;
 mod credentials;
+mod inspection;
+pub(super) use inspection::{
+    engine_storage, inspect_container, inspect_image_metadata, live_containers,
+};
 pub(super) mod helpers;
 pub(super) use build::build as build_image;
 

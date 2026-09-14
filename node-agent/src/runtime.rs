@@ -18,6 +18,11 @@ pub use helpers::{
 pub(crate) use helpers::{HelperIntent, HelperJournal};
 mod images;
 pub use images::{ImageInfo, ImageOperation, ImageProgress};
+mod inspection;
+pub use inspection::{
+    agent_path_for_daemon_path, daemon_path_for_agent_path, ContainerInspection, DaemonHostPath,
+    EngineStorage, ImageMetadata, Mount, MountKind,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -340,6 +345,40 @@ impl RuntimeClient {
         self.submit(async move { docker::discover(&config).await.map(|(_, info)| info) })
     }
 
+    /// Read one container's daemon-authoritative configuration. `Ok(None)` is
+    /// only a conclusively missing container; inaccessible engines are errors.
+    pub fn inspect_container(
+        &self,
+        id: impl Into<String>,
+    ) -> Operation<Option<ContainerInspection>> {
+        let config = self.config.clone();
+        let id = id.into();
+        self.submit(async move { docker::inspect_container(&config, &id).await })
+    }
+
+    /// Snapshot every live container, including containers Quasar does not own.
+    /// Every listed ID is re-inspected so an incomplete liveness fact fails closed.
+    pub fn live_containers(&self) -> Operation<Vec<ContainerInspection>> {
+        let config = self.config.clone();
+        self.submit(async move { docker::live_containers(&config).await })
+    }
+
+    /// Filesystem location in the container engine daemon's host namespace.
+    pub fn engine_storage(&self) -> Operation<EngineStorage> {
+        let config = self.config.clone();
+        self.submit(async move { docker::engine_storage(&config).await })
+    }
+
+    /// Image identity and its baked environment. `Ok(None)` is a missing image.
+    pub fn inspect_image_metadata(
+        &self,
+        image: impl Into<String>,
+    ) -> Operation<Option<ImageMetadata>> {
+        let config = self.config.clone();
+        let image = image.into();
+        self.submit(async move { docker::inspect_image_metadata(&config, &image).await })
+    }
+
     /// Create and explicitly start one owned diagnostic helper. Dropping the
     /// returned operation detaches its observer; it never stops the helper.
     pub fn run_diagnostic(
@@ -393,6 +432,9 @@ impl RuntimeClient {
         )
     }
 }
+
+#[cfg(test)]
+mod inspection_tests;
 
 #[cfg(test)]
 mod tests {

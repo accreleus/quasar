@@ -811,6 +811,28 @@ An absent image alone cannot establish that an old pull has stopped, and a chang
 removal target cannot authorize deleting its replacement. Those cases fail with
 `image operation outcome unknown` instead of repeating the mutation.
 
+Installation metadata, image environment, engine storage information and live
+container mounts are read through the same runtime API. Missing Compose labels
+leave the corresponding Compose facts unknown; Quasar does not infer a project or updater from
+container names. The configured image reference and the running image ID remain
+separate facts.
+
+Docker mount sources and its storage root are **daemon-host paths**. A containerized
+agent must map them through its own inspected mounts before accessing the backing
+filesystem. Matching path strings alone are not evidence of a shared directory;
+nested mounts may hide a parent bind. An unresolved disk-space check retains the
+existing logged, fail-open behavior and never substitutes free space from an
+unrelated agent filesystem.
+
+Both tracked-home GC and the throwaway-home sweep inspect mounts from all live
+containers, including workloads not owned by Quasar. A foreign mount of the home,
+a child directory or a parent directory protects that data. The agent's own mounts
+provide namespace mapping; its shared home-root bind does not by itself prevent
+all cleanup. Unavailable or incomplete runtime inspection, an unknown path mapping,
+or an unavailable in-process session-reference set defers deletion. Tracked-home GC
+confirms only homes actually removed or already absent. Liveness is a point-in-time
+observation; this does not lock other container managers against concurrent changes.
+
 The explicit NVIDIA host-path check uses an API-managed diagnostic helper. Its
 read-only bind names a **Docker daemon-host** directory, while the fresh marker is
 written through the agent's existing mount. The helper must read that marker and

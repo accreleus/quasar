@@ -23,6 +23,7 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::session::home;
+use crate::session::storage_liveness::StorageLiveness;
 
 /// One reapable home as returned by GET /v1/agent/storage/gc-pending. Built from
 /// the wire shape via [`PendingHome::from_wire`] (the wire field `ref` is a Rust
@@ -93,6 +94,8 @@ pub struct GcPass {
     /// The reaping happened but the confirm did not land; the rows are re-pulled
     /// next pass (the reap is idempotent, so this is safe, not lost work).
     pub confirm_error: Option<String>,
+    /// Liveness could not be established, so no store was touched or confirmed.
+    pub liveness_error: Option<String>,
 }
 
 /// Configuration the reaper needs, captured once after registration. Holds no
@@ -116,6 +119,13 @@ impl GcClient {
     /// never returns Err. The returned [`GcPass`] is the jobs framework's run
     /// summary (WP6); it is additive context, not a replacement for the logging.
     pub fn run_pass(&self) -> GcPass {
+        self.run_pass_internal(|| StorageLiveness::capture().map_err(|e| e.to_string()))
+    }
+
+    fn run_pass_internal(
+        &self,
+        capture: impl FnOnce() -> Result<StorageLiveness, String>,
+    ) -> GcPass {
         let mut pass = GcPass::default();
         let homes = match self.fetch_pending() {
             Ok(h) => h,
@@ -132,14 +142,64 @@ impl GcClient {
         }
         info!("gc: {} home(s) pending reaping", homes.len());
 
-        let live = self.live_snapshot();
+        let live = match self.live_snapshot() {
+            Ok(live) => live,
+            Err(e) => {
+                warn!(
+                    token = "gc-live-refs-poisoned",
+                    "gc: refusing reap pass: {e}"
+                );
+                pass.liveness_error = Some(e);
+                return pass;
+            }
+        };
+        let liveness = match capture() {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                warn!(
+                    token = "gc-runtime-liveness-unavailable",
+                    "gc: refusing reap pass: {e}"
+                );
+                pass.liveness_error = Some(e);
+                return pass;
+            }
+        };
         let mut reaped: Vec<String> = Vec::new();
         for h in &homes {
             // A backing store an active session has mounted is never reaped; it
             // is retried next pass and counted in a SUCCEEDED summary, not a
             // deferral — a pass that reaped some and skipped others did its job
             // (design §8.4).
-            if live.contains(&h.ref_) {
+            let path = Path::new(&h.ref_);
+            let protected = if live.contains(&h.ref_) {
+                Ok(true)
+            } else {
+                live.iter()
+                    .try_fold(false, |protected, reference| {
+                        Ok::<_, anyhow::Error>(
+                            protected || liveness.matches_local_ref(path, reference)?,
+                        )
+                    })
+                    .and_then(|local| {
+                        if local {
+                            Ok(true)
+                        } else {
+                            liveness.protects(path)
+                        }
+                    })
+            };
+            let protected = match protected {
+                Ok(value) => value,
+                Err(e) => {
+                    pass.unreaped += 1;
+                    warn!(
+                        token = "gc-liveness-unknown",
+                        "gc: cannot establish liveness for home {}: {e}", h.id
+                    );
+                    continue;
+                }
+            };
+            if protected {
                 debug!(
                     token = "gc-home-live-skipped",
                     "gc: home {} ref {} is live — skipping this pass", h.id, h.ref_
@@ -174,11 +234,11 @@ impl GcClient {
         pass
     }
 
-    fn live_snapshot(&self) -> HashSet<String> {
+    fn live_snapshot(&self) -> Result<HashSet<String>, String> {
         self.live
             .lock()
             .map(|g| g.clone())
-            .unwrap_or_else(|_| HashSet::new())
+            .map_err(|_| "in-process live-reference lock is poisoned".to_string())
     }
 
     /// Reap one home's backing store. Returns true iff the store is now gone (so
@@ -352,6 +412,9 @@ fn summarize(pass: GcPass) -> crate::jobs::JobOutcome {
     use crate::jobs::JobOutcome;
     if let Some(e) = pass.fetch_error {
         return JobOutcome::Failed(format!("could not pull pending homes: {e}"));
+    }
+    if let Some(e) = pass.liveness_error {
+        return JobOutcome::Failed(format!("could not establish home liveness: {e}"));
     }
     if pass.pending == 0 {
         return JobOutcome::Skipped("no homes are past their GC grace period".into());

@@ -3,7 +3,7 @@
 //! Two halves, because they are learned differently. The **build stamps**
 //! (`SOURCE_COMMIT`, `BUILT_AT`) come from `build.rs` at compile time; the
 //! **install mode** and **updater presence** are discovered at run time from
-//! the agent's own container through the docker CLI it already wraps. All four
+//! the agent's own container through the Quasar runtime API. All four
 //! ride the optional identity fields on `register` (agent-api.md), and the
 //! control plane stores them wholesale — an absent field is stored NULL, so
 //! reporting nothing is always safe and never a lie.
@@ -105,14 +105,12 @@ const LABEL_PROJECT: &str = "com.docker.compose.project";
 /// The service name the updater is deployed under (`CONTEXT.md` "Updater").
 const UPDATER_SERVICE: &str = "quasar-updater";
 
-/// The docker reads install discovery needs, behind a trait so the logic above
-/// it is testable with no daemon. The production implementation is the
-/// `ContainerRuntime` the agent already wraps: no second docker dependency
-/// (the rule in `images/mod.rs`).
+/// Read-only facts needed by installation discovery. Production uses the shared
+/// Quasar runtime interface; the trait keeps classification independent of a daemon.
 pub trait ContainerFacts {
     /// This container's own id, as docker would accept it.
     fn self_reference(&self) -> Option<String>;
-    /// `docker inspect --format '{{.Config.Image}}'` for one container.
+    /// The configured image reference of one container, distinct from its image ID.
     fn image_reference(&self, container: &str) -> Option<String>;
     /// The compose labels on one container.
     fn labels(&self, container: &str) -> Option<BTreeMap<String, String>>;
@@ -120,18 +118,16 @@ pub trait ContainerFacts {
     fn services_in_project(&self, project: &str) -> Option<Vec<String>>;
 }
 
-/// `ContainerFacts` over the agent's docker CLI wrapper.
-pub struct DockerFacts<'a> {
-    runtime: &'a ContainerRuntime,
-}
+/// Installation facts from the configured Quasar runtime API.
+pub struct DockerFacts;
 
-impl<'a> DockerFacts<'a> {
-    pub fn new(runtime: &'a ContainerRuntime) -> Self {
-        Self { runtime }
+impl DockerFacts {
+    pub fn new(_runtime: &ContainerRuntime) -> Self {
+        Self
     }
 }
 
-impl ContainerFacts for DockerFacts<'_> {
+impl ContainerFacts for DockerFacts {
     /// `/proc/self/mountinfo` first, `$HOSTNAME` only when it LOOKS like a
     /// container id. A compose stack that sets `hostname:` makes `$HOSTNAME` a
     /// DNS name (`quasar-dev.local`), and `docker inspect -- quasar-dev.local`
@@ -142,55 +138,51 @@ impl ContainerFacts for DockerFacts<'_> {
     }
 
     fn image_reference(&self, container: &str) -> Option<String> {
-        self.runtime
-            .run_raw(&["inspect", "--format", "{{.Config.Image}}", "--", container])
-            .ok()
-            .filter(|s| !s.is_empty())
+        Some(
+            crate::runtime::configured()
+                .ok()?
+                .inspect_container(container)
+                .wait()
+                .ok()??
+                .configured_image,
+        )
     }
 
     fn labels(&self, container: &str) -> Option<BTreeMap<String, String>> {
-        // One line per label, `key=value`. `range` over `.Config.Labels` rather
-        // than a JSON dump so nothing here has to parse JSON.
-        let out = self
-            .runtime
-            .run_raw(&[
-                "inspect",
-                "--format",
-                "{{range $k, $v := .Config.Labels}}{{$k}}={{$v}}\n{{end}}",
-                "--",
-                container,
-            ])
-            .ok()?;
-        Some(parse_labels(&out))
+        Some(
+            crate::runtime::configured()
+                .ok()?
+                .inspect_container(container)
+                .wait()
+                .ok()??
+                .labels,
+        )
     }
 
     fn services_in_project(&self, project: &str) -> Option<Vec<String>> {
-        let filter = format!("label={LABEL_PROJECT}={project}");
-        let out = self
-            .runtime
-            .run_raw(&[
-                "ps",
-                "--filter",
-                &filter,
-                "--format",
-                &format!("{{{{.Label \"{LABEL_SERVICE}\"}}}}"),
-            ])
-            .ok()?;
         Some(
-            out.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_string)
+            crate::runtime::configured()
+                .ok()?
+                .live_containers()
+                .wait()
+                .ok()?
+                .into_iter()
+                .filter(|container| {
+                    container
+                        .labels
+                        .get(LABEL_PROJECT)
+                        .is_some_and(|value| value == project)
+                })
+                .filter_map(|container| {
+                    container
+                        .labels
+                        .get(LABEL_SERVICE)
+                        .filter(|value| !value.is_empty())
+                        .cloned()
+                })
                 .collect(),
         )
     }
-}
-
-fn parse_labels(out: &str) -> BTreeMap<String, String> {
-    out.lines()
-        .filter_map(|line| line.split_once('='))
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-        .collect()
 }
 
 /// Classify an image reference. Registry when it names a registry host
@@ -483,21 +475,6 @@ mod tests {
         assert_eq!(
             discover_install(&FakeFacts::default()),
             InstallFacts::default()
-        );
-    }
-
-    #[test]
-    fn labels_parse_from_the_inspect_range_format() {
-        let parsed = parse_labels(
-            "com.docker.compose.project=quasar\ncom.docker.compose.service=quasar-node-agent\n",
-        );
-        assert_eq!(
-            parsed.get(LABEL_PROJECT).map(String::as_str),
-            Some("quasar")
-        );
-        assert_eq!(
-            parsed.get(LABEL_SERVICE).map(String::as_str),
-            Some("quasar-node-agent")
         );
     }
 
