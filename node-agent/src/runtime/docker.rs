@@ -2,7 +2,9 @@
 use super::{ApiVersion, EngineInfo, ErrorKind, RuntimeConfig, RuntimeError};
 use bollard::{errors::Error, Docker};
 use futures_util::StreamExt;
+mod build;
 mod credentials;
+pub(super) use build::build as build_image;
 
 fn classify(error: Error) -> RuntimeError {
     let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
@@ -56,19 +58,35 @@ fn image_error(error: Error) -> RuntimeError {
 async fn reconcile_image(
     config: &RuntimeConfig,
     image: &str,
-) -> Result<(Docker, super::images::Journal, Option<super::ImageInfo>), RuntimeError> {
+) -> Result<
+    (
+        Docker,
+        super::images::Journal,
+        Option<super::ImageInfo>,
+        Option<String>,
+    ),
+    RuntimeError,
+> {
     use super::images::Journal;
     if image.is_empty() || image.len() > 2048 || image.contains(['?', '#', '\0']) {
         return Err(ErrorKind::InvalidConfiguration.into());
     }
     let (docker, _) = discover(config).await?;
     let journal = Journal::acquire(config, image).await?;
-    let existing = image_info(&docker, image).await?;
+    let state = image_state(&docker, image).await?;
+    let existing = state.as_ref().map(|s| s.info.clone());
+    let mut recovered_build = None;
     if let Some(intent) = journal.pending()? {
         if intent.image != image || intent.socket != config.socket {
             return Err(ErrorKind::UnknownOutcome.into());
         }
-        if intent.remove_id.is_some() && existing.is_none()
+        if let Some(id) = intent.build_id {
+            if state.as_ref().and_then(|s| s.build_id.as_deref()) != Some(&id) {
+                return Err(ErrorKind::UnknownOutcome.into());
+            }
+            recovered_build = Some(intent.build_fingerprint.ok_or(ErrorKind::UnknownOutcome)?);
+            journal.clear()?;
+        } else if intent.remove_id.is_some() && existing.is_none()
             || intent.remove_id.is_none() && existing.is_some()
         {
             journal.clear()?;
@@ -76,7 +94,7 @@ async fn reconcile_image(
             return Err(ErrorKind::UnknownOutcome.into());
         }
     }
-    Ok((docker, journal, existing))
+    Ok((docker, journal, existing, recovered_build))
 }
 
 pub(super) async fn ensure_image(
@@ -85,7 +103,7 @@ pub(super) async fn ensure_image(
     progress: tokio::sync::watch::Sender<super::ImageProgress>,
 ) -> Result<super::ImageInfo, RuntimeError> {
     use super::images::Intent;
-    let (docker, journal, existing) = reconcile_image(config, image).await?;
+    let (docker, journal, existing, _) = reconcile_image(config, image).await?;
     if let Some(info) = existing {
         return Ok(info);
     }
@@ -94,6 +112,8 @@ pub(super) async fn ensure_image(
         image: image.into(),
         socket: config.socket.clone(),
         remove_id: None,
+        build_id: None,
+        build_fingerprint: None,
     })?;
     let tag = if image.contains('@') || image.rsplit('/').next().unwrap_or(image).contains(':') {
         None
@@ -156,7 +176,7 @@ pub(super) async fn ensure_image(
 
 pub(super) async fn remove_image(config: &RuntimeConfig, image: &str) -> Result<(), RuntimeError> {
     use super::images::Intent;
-    let (docker, journal, existing) = reconcile_image(config, image).await?;
+    let (docker, journal, existing, _) = reconcile_image(config, image).await?;
     let Some(existing) = existing else {
         return Ok(());
     };
@@ -179,6 +199,8 @@ pub(super) async fn remove_image(config: &RuntimeConfig, image: &str) -> Result<
         image: image.into(),
         socket: config.socket.clone(),
         remove_id: Some(existing.id),
+        build_id: None,
+        build_fingerprint: None,
     })?;
     let result = docker
         .remove_image(
@@ -319,23 +341,34 @@ pub(super) async fn inspect_image(
     Ok(image_info(&docker, image).await?.is_some())
 }
 
-pub(super) async fn image_info(
-    docker: &Docker,
-    image: &str,
-) -> Result<Option<super::ImageInfo>, RuntimeError> {
+struct ImageState {
+    info: super::ImageInfo,
+    build_id: Option<String>,
+}
+async fn image_state(docker: &Docker, image: &str) -> Result<Option<ImageState>, RuntimeError> {
     match docker.inspect_image(image).await {
-        Ok(info) if info.id.as_ref().is_some_and(|id| !id.is_empty()) => {
-            Ok(Some(super::ImageInfo {
+        Ok(info) if info.id.as_ref().is_some_and(|id| !id.is_empty()) => Ok(Some(ImageState {
+            build_id: info
+                .config
+                .and_then(|c| c.labels)
+                .and_then(|labels| labels.get(build::BUILD_LABEL).cloned()),
+            info: super::ImageInfo {
                 id: info.id.unwrap(),
                 bytes: info.size.unwrap_or(0).max(0) as u64,
-            }))
-        }
+            },
+        })),
         Ok(_) => Err(ErrorKind::Protocol.into()),
         Err(Error::DockerResponseServerError {
             status_code: 404, ..
         }) => Ok(None),
         Err(e) => Err(classify(e)),
     }
+}
+pub(super) async fn image_info(
+    docker: &Docker,
+    image: &str,
+) -> Result<Option<super::ImageInfo>, RuntimeError> {
+    Ok(image_state(docker, image).await?.map(|s| s.info))
 }
 
 #[cfg(test)]

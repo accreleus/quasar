@@ -1,4 +1,4 @@
-//! Image-state progress throttling and the remaining classic build parser.
+//! Image-state progress throttling.
 use std::time::{Duration, Instant};
 
 const THROTTLE_INTERVAL: Duration = Duration::from_secs(2);
@@ -33,20 +33,6 @@ impl ProgressThrottle {
         }
         emit
     }
-}
-
-/// Percent from a classic-builder (`DOCKER_BUILDKIT=0`) `Step 3/14 : ...` line.
-/// Best-effort per agent-api.md `image_build`: omit `progress_pct` when absent.
-pub fn parse_build_step(line: &str) -> Option<u8> {
-    let rest = line.trim().strip_prefix("Step ")?;
-    let frac = rest.split_whitespace().next()?;
-    let (n, m) = frac.split_once('/')?;
-    let n: u64 = n.parse().ok()?;
-    let m: u64 = m.parse().ok()?;
-    if m == 0 {
-        return None;
-    }
-    Some(((n.min(m) as f64 / m as f64) * 100.0) as u8)
 }
 
 #[cfg(test)]
@@ -109,24 +95,5 @@ mod tests {
         let t0 = Instant::now();
         assert!(t.should_emit(t0, 40));
         assert!(t.should_emit(t0 + Duration::from_secs(3), 30));
-    }
-
-    #[test]
-    fn parses_build_step_fraction() {
-        assert_eq!(parse_build_step("Step 1/10 : FROM alpine:3"), Some(10));
-        assert_eq!(parse_build_step("Step 5/10 : RUN echo hi"), Some(50));
-        assert_eq!(parse_build_step("Step 10/10 : CMD [\"sh\"]"), Some(100));
-        // Leading indentation is tolerated.
-        assert_eq!(parse_build_step("  Step 2/4 : COPY . ."), Some(50));
-    }
-
-    #[test]
-    fn ignores_non_step_build_lines() {
-        assert!(parse_build_step("Successfully built abc123").is_none());
-        assert!(parse_build_step("Successfully tagged quasar-local/x:1").is_none());
-        assert!(parse_build_step(" ---> a1b2c3d4").is_none());
-        assert!(parse_build_step("Step /10 : bad").is_none());
-        assert!(parse_build_step("Step 3/0 : divzero").is_none());
-        assert!(parse_build_step("Sending build context to Docker daemon").is_none());
     }
 }

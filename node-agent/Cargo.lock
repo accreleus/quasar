@@ -1557,6 +1557,7 @@ dependencies = [
  "input-linux",
  "libc",
  "pkg-config",
+ "regex",
  "rustls",
  "rustls-pki-types",
  "serde",

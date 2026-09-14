@@ -58,6 +58,23 @@ impl<T> ImageOperation<T> {
 }
 
 impl RuntimeClient {
+    pub fn build_image(
+        &self,
+        request: BuildRequest,
+        budget: Duration,
+    ) -> ImageOperation<ImageInfo> {
+        let config = self.config.clone();
+        let (send, progress) = watch::channel(ImageProgress::default());
+        ImageOperation {
+            operation: self.submit_owned(
+                async move { docker::build_image(&config, request, send, budget).await },
+                budget,
+                true,
+            ),
+            progress,
+        }
+    }
+
     /// Remove a managed reference without forcing deletion of an in-use image.
     pub fn remove_image(&self, image: impl Into<String>, deadline: Duration) -> Operation<()> {
         let image = image.into();
@@ -95,6 +112,10 @@ pub(super) struct Intent {
     pub image: String,
     pub socket: PathBuf,
     pub remove_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_fingerprint: Option<String>,
 }
 
 pub(super) struct Journal {

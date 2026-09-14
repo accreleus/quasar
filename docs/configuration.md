@@ -755,7 +755,7 @@ they never bypass the #68 emergency descent.
 
 
 On the runtime-API initiative branch, engine discovery, image inspection, assignment
-pulls and managed-image pull/removal use Bollard behind Quasar-owned types. Other runtime operations and the Go
+pulls and managed-image pull/build/removal use Bollard behind Quasar-owned types. Other runtime operations and the Go
 updater retain their existing implementations until their migration tickets land.
 There is no API-to-CLI fallback. A failed inspection leaves managed image records
 unchanged rather than marking images absent.
@@ -797,7 +797,7 @@ host mutations; the daemon's own conflict checks remain the final guard.
 Pull credentials come from the agent's existing Docker login configuration
 (`DOCKER_CONFIG/config.json`, otherwise `$HOME/.docker/config.json`). Inline auth
 and installed Docker credential helpers are supported. Helpers retrieve credentials
-only; pull/removal never invoke the Docker CLI. Credential errors are fixed messages
+only; pull/build/removal never invoke the Docker engine CLI. Credential errors are fixed messages
 and never include credential contents. A host-side login must be made available
 inside the agent just as it was for the previous containerized CLI.
 
@@ -810,6 +810,28 @@ resolves an uncertain pull; an absent reference resolves an uncertain removal.
 An absent image alone cannot establish that an old pull has stopped, and a changed
 removal target cannot authorize deleting its replacement. Those cases fail with
 `image operation outcome unknown` instead of repeating the mutation.
+
+Managed builds keep the classic builder (`version=1`, equivalent to the previous
+`DOCKER_BUILDKIT=0`), cache enabled, successful intermediate containers removed and
+failed intermediate containers retained. No BuildKit backend is introduced. The
+one-hour job deadline covers the existing HTTPS context download and extraction,
+local context packaging, upload and build. Existing source allowlisting, archive
+limits and link/path rejection remain in place. Root `.dockerignore` rules filter
+the uploaded tar, including ordered negation and recursive wildcards; the selected
+Dockerfile and `.dockerignore` remain available to the builder. Ignore files are
+bounded to 1 MiB and individual patterns to 64 KiB. The owned temporary tar streams
+in 64 KiB chunks; classic progress is coalesced and local failure diagnostics retain
+only a 4 KiB tail. Raw build output never becomes a wire error. Registry logins,
+including credential-store enumeration, are supplied for private base images.
+
+A build becomes ready only when inspection confirms the unique
+`io.quasar.build-operation` label written by that request. The intent also records
+a fingerprint of the packaged context, Dockerfile, tag and build arguments. After
+an interrupted response, the matching label proves completion; a matching request
+fingerprint reuses that result. An old image or an absent tag cannot prove that the
+build finished, so neither authorizes retrying an uncertain mutation. A definitive
+build failure clears its intent and permits a corrected retry. Deadline expiry or
+observer cancellation does not promise daemon rollback or intermediate cleanup.
 
 If observation cannot resolve an intent, an operator must confirm that the old
 engine operation has finished before clearing that specific JSON intent with the

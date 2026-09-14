@@ -7,7 +7,9 @@ use std::{
 };
 use tokio::sync::{watch, Semaphore};
 
+mod builds;
 mod docker;
+pub use builds::BuildRequest;
 mod images;
 pub use images::{ImageInfo, ImageOperation, ImageProgress};
 
@@ -27,6 +29,8 @@ pub enum ErrorKind {
     RegistryDenied,
     ManifestMissing,
     InsufficientDisk,
+    InvalidBuildContext,
+    BuildFailed,
 }
 
 /// Safe to surface to callers. Raw daemon messages never become public errors.
@@ -678,3 +682,6 @@ mod tests {
 
 #[cfg(test)]
 mod image_tests;
+
+#[cfg(test)]
+mod build_tests;

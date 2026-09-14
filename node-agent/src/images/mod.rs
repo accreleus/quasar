@@ -1,7 +1,7 @@
 //! Agent-side image ensure/build/remove: pull, build or rmi catalog images in this
 //! host's docker daemon, reporting progress via `image_state`. Wire contract:
 //! agent-api.md image-management. Pull/removal use the Quasar runtime API;
-//! build and disk metadata retain their CLI paths until their migration slices.
+//! builds also use the runtime API; disk metadata retains its CLI path until #238.
 //!
 //! One operation per `image_id` at a time. Every op for an image serializes through
 //! a per-image slot: one running, plus the single latest pending (a newer request
@@ -10,7 +10,7 @@
 //! commit stale state — each carries the slot generation it started under and
 //! re-checks it in [`ImageManager::commit`].
 
-mod build;
+pub(crate) mod build;
 mod disk;
 mod errors;
 mod progress;
@@ -18,9 +18,7 @@ mod semaphore;
 mod state;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -45,9 +43,6 @@ const MAX_CONCURRENT_PULLS: usize = 2;
 /// Assignment preparation uses a shorter ten-minute budget.
 const PULL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// Polling tick for the remaining CLI build watchdog. API pulls own their deadlines.
-const PULL_POLL_INTERVAL: Duration = Duration::from_millis(100);
-
 /// Field bounds. The control plane is trusted, but these strings become map keys,
 /// log lines, persisted JSON and argv, and an unbounded one is unbounded memory.
 /// Generous versus any real value; a violation is a loud `ack{ok:false}`.
@@ -68,41 +63,12 @@ const MAX_DOCKERFILE_LEN: usize = 512;
 const MAX_BUILD_ARGS: usize = 128;
 const MAX_BUILD_ARG_LEN: usize = 4096;
 
-/// Wall-clock bound on one `docker build`, enforced by the same output-independent
-/// watchdog as [`PULL_TIMEOUT`].
+/// Whole-job budget across download, extraction, packaging and the classic API build.
 const BUILD_TIMEOUT: Duration = Duration::from_secs(60 * 60);
-
-/// Tail of each `docker build` stream kept for failure classification and the local
-/// failure log. A tail, not a prefix: the failing step's error is the LAST thing docker
-/// prints. Both streams are still drained to EOF past this so a verbose build never
-/// wedges on a full pipe; what is kept is never sent upstream.
-const BUILD_LOG_KEEP_BYTES: usize = 64 * 1024;
-
-/// Per-stream cap on the tail included in the local `image-build-output` log line.
-const BUILD_LOG_LOG_BYTES: usize = 4096;
 
 /// Build-context staging dir under the state file's parent. Each build gets a unique
 /// child, removed on completion either way.
 const BUILD_SCRATCH_DIR: &str = "image-build-scratch";
-
-/// Drop bytes from the front so `buf` holds at most the last `cap` bytes.
-fn keep_tail(buf: &mut Vec<u8>, cap: usize) {
-    if buf.len() > cap {
-        buf.drain(..buf.len() - cap);
-    }
-}
-
-/// Last `cap` bytes of `s`, advanced to a char boundary.
-fn tail(s: &str, cap: usize) -> &str {
-    if s.len() <= cap {
-        return s;
-    }
-    let mut i = s.len() - cap;
-    while !s.is_char_boundary(i) {
-        i += 1;
-    }
-    &s[i..]
-}
 
 /// One managed-image operation: at most one running per `image_id`, at most one
 /// pending behind it.
@@ -1120,8 +1086,7 @@ impl ImageManager {
             build_args,
             deadline,
         ) {
-            Ok(()) => {
-                let bytes = self.image_size_bytes(local_tag).unwrap_or(0);
+            Ok(bytes) => {
                 self.commit(image_id, generation, |rec| rec.mark_ready(bytes));
                 info!("image {image_id} ({local_tag}) built: ready ({bytes} bytes), version {version}");
                 self.notify_ready(image_id, local_tag, version);
@@ -1151,7 +1116,7 @@ impl ImageManager {
         dockerfile: &str,
         build_args: &BTreeMap<String, String>,
         deadline: Instant,
-    ) -> Result<(), String> {
+    ) -> Result<u64, String> {
         let scratch = self.build_scratch_dir(image_id, generation);
         // Clear any stale dir from a crashed prior build.
         let _ = std::fs::remove_dir_all(&scratch);
@@ -1180,11 +1145,16 @@ impl ImageManager {
         if !df_meta.is_file() {
             return Err("dockerfile not found in build context".to_string());
         }
-        let df_str = df_path.to_string_lossy().into_owned();
-        let ctx_str = ctx.to_string_lossy().into_owned();
-
         self.build_with_progress(
-            image_id, generation, local_tag, &df_str, &ctx_str, build_args, deadline,
+            image_id,
+            generation,
+            crate::runtime::BuildRequest {
+                tag: local_tag.into(),
+                context_dir: ctx,
+                dockerfile: df_rel,
+                build_args: build_args.clone(),
+            },
+            deadline,
         )
     }
 
@@ -1213,175 +1183,27 @@ impl ImageManager {
             .join(format!("{safe_id}-{generation}"))
     }
 
-    /// `docker build` (classic builder), translating `Step N/M` into throttled
-    /// `building` emits. Mirrors [`Self::pull_with_progress`]: output-independent
-    /// [`BUILD_TIMEOUT`] watchdog that kills and reaps, separate bounded reader
-    /// threads, and a mapped, never-raw error string.
-    #[allow(clippy::too_many_arguments)]
+    /// The runtime owns the classic build stream and final image verification.
+    /// Reporting is coalesced, so a disconnected control plane cannot stall it.
     fn build_with_progress(
         &self,
         image_id: &str,
         generation: u64,
-        local_tag: &str,
-        dockerfile_path: &str,
-        context_dir: &str,
-        build_args: &BTreeMap<String, String>,
+        request: crate::runtime::BuildRequest,
         deadline: Instant,
-    ) -> Result<(), String> {
-        let mut cmd =
-            self.runtime
-                .build_command(local_tag, dockerfile_path, context_dir, build_args);
-        cmd.stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null());
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("failed to exec docker build: {e}"))?;
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
-
-        // Both streams must be drained to EOF: a reader that stops at its byte cap
-        // leaves the pipe full, giving the child a broken pipe mid-build. Each thread
-        // keeps only the last BUILD_LOG_KEEP_BYTES (the failing step's error is the
-        // last thing docker prints) and discards the rest.
-        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<u8>();
-        let stdout_buf = Arc::new(Mutex::new(String::new()));
-        let stdout_buf2 = stdout_buf.clone();
-        let stdout_thread = std::thread::spawn(move || {
-            let mut kept: Vec<u8> = Vec::new();
-            for line in std::io::BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                if let Some(pct) = progress::parse_build_step(&line) {
-                    // Keep draining past a send error: the pipe must reach EOF whether
-                    // or not progress is still wanted.
-                    let _ = progress_tx.send(pct);
-                }
-                kept.extend_from_slice(line.as_bytes());
-                kept.push(b'\n');
-                keep_tail(&mut kept, BUILD_LOG_KEEP_BYTES);
-            }
-            *stdout_buf2.lock().unwrap() = String::from_utf8_lossy(&kept).into_owned();
-        });
-        let stderr_buf = Arc::new(Mutex::new(String::new()));
-        let stderr_buf2 = stderr_buf.clone();
-        let stderr_thread = std::thread::spawn(move || {
-            use std::io::Read;
-            let mut reader = std::io::BufReader::new(stderr);
-            let mut kept: Vec<u8> = Vec::new();
-            let mut chunk = [0u8; 8192];
-            loop {
-                match reader.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        kept.extend_from_slice(&chunk[..n]);
-                        keep_tail(&mut kept, BUILD_LOG_KEEP_BYTES);
-                    }
-                    Err(_) => break,
-                }
-            }
-            *stderr_buf2.lock().unwrap() = String::from_utf8_lossy(&kept).into_owned();
-        });
-
+    ) -> Result<u64, String> {
+        let runtime = crate::runtime::configured().map_err(errors::map_runtime_error)?;
         let mut throttle = ProgressThrottle::new();
-        let mut wait_err: Option<String> = None;
-        let mut timed_out = false;
-        let status = loop {
-            let mut latest = None;
-            while let Ok(pct) = progress_rx.try_recv() {
-                latest = Some(pct);
-            }
-            if let Some(pct) = latest {
-                if throttle.should_emit(Instant::now(), pct) {
-                    self.set_building(image_id, generation, Some(pct));
+        runtime
+            .build_image(request, deadline.saturating_duration_since(Instant::now()))
+            .wait(|sample| {
+                if throttle.should_emit(Instant::now(), sample.percent) {
+                    self.set_building(image_id, generation, Some(sample.percent));
                     self.emit(image_id);
                 }
-            }
-
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) => {}
-                Err(e) => {
-                    wait_err = Some(format!("failed to wait on docker build: {e}"));
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break None;
-                }
-            }
-            if Instant::now() >= deadline {
-                warn!(
-                    token = "image-build-timeout",
-                    "image {image_id}: docker build exceeded {}s — killing the child",
-                    BUILD_TIMEOUT.as_secs()
-                );
-                let _ = child.kill();
-                let _ = child.wait();
-                timed_out = true;
-                break None;
-            }
-            std::thread::sleep(PULL_POLL_INTERVAL);
-        };
-
-        let _ = stdout_thread.join();
-        let _ = stderr_thread.join();
-
-        // Local-only diagnostics for any failed/killed build: exit status, resolved
-        // context path, and the tail of both streams. The wire error stays the short
-        // mapped string (agent-api.md: "never a raw build-log blob"); the raw tail is
-        // exactly what "inspect node-agent logs" promises the operator will be here.
-        let log_output = |what: &str| {
-            let out = stdout_buf.lock().unwrap();
-            let err = stderr_buf.lock().unwrap();
-            tracing::error!(
-                token = "image-build-output",
-                "image {image_id}: docker build {what} (dockerfile {dockerfile_path}, \
-                 context {context_dir}); stdout tail:\n{}\nstderr tail:\n{}",
-                tail(&out, BUILD_LOG_LOG_BYTES),
-                tail(&err, BUILD_LOG_LOG_BYTES),
-            );
-        };
-
-        if timed_out {
-            log_output("timed out");
-            return Err("docker build timed out".to_string());
-        }
-        if let Some(e) = wait_err {
-            log_output("wait failed");
-            return Err(e);
-        }
-        let status = status.expect("loop breaks with a status, an error, or a timeout");
-        if status.success() {
-            Ok(())
-        } else {
-            log_output(&format!("exited with {status}"));
-            // The wire error is classified from both buffers (docker writes
-            // diagnostics to either), never the raw text.
-            let combined = {
-                let out = stdout_buf.lock().unwrap();
-                let err = stderr_buf.lock().unwrap();
-                format!("{out}\n{err}")
-            };
-            let mapped = errors::map_build_error(&combined);
-            tracing::error!(
-                token = "image-build-failed-mapped",
-                "image {image_id}: docker build failed: {mapped}"
-            );
-            Err(mapped)
-        }
-    }
-
-    fn image_size_bytes(&self, registry_ref: &str) -> Option<u64> {
-        let out = self
-            .runtime
-            .run_raw(&[
-                "image",
-                "inspect",
-                "--format",
-                "{{.Size}}",
-                "--",
-                registry_ref,
-            ])
-            .ok()?;
-        out.trim().parse().ok()
+            })
+            .map(|image| image.bytes)
+            .map_err(errors::map_runtime_error)
     }
 
     /// Apply a transition only if this worker still owns the slot at its generation.
@@ -1532,26 +1354,6 @@ fn stage_building(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn keep_tail_keeps_the_last_cap_bytes() {
-        let mut buf = b"abcdefgh".to_vec();
-        keep_tail(&mut buf, 3);
-        assert_eq!(buf, b"fgh");
-        let mut small = b"ab".to_vec();
-        keep_tail(&mut small, 3);
-        assert_eq!(small, b"ab");
-    }
-
-    #[test]
-    fn tail_respects_char_boundaries() {
-        assert_eq!(tail("hello", 10), "hello");
-        assert_eq!(tail("hello", 3), "llo");
-        // "é" is 2 bytes; a cut landing mid-char advances past it.
-        let s = "aéb";
-        assert_eq!(tail(s, 2), "b");
-        assert_eq!(tail(s, 3), "éb");
-    }
 
     fn mgr() -> Arc<ImageManager> {
         // An empty state_path means no file touched and no docker call.
@@ -2368,6 +2170,49 @@ mod tests {
     }
 
     // serialization bookkeeping (no threads, no docker)
+
+    #[test]
+    fn completed_builds_replay_ready_or_fixed_failure_after_control_plane_disconnect() {
+        for failure in [
+            None,
+            Some(crate::runtime::ErrorKind::BuildFailed),
+            Some(crate::runtime::ErrorKind::InvalidBuildContext),
+        ] {
+            let m = mgr();
+            let (tx, rx) = mpsc::channel(1);
+            let guard = m.attach_upstream(tx);
+            assert!(m.plan_build("tmpl", build_op("v1", TAG1), TAG1, "v1"));
+            drop(guard);
+            drop(rx);
+            let generation = m.ops.lock().unwrap()["tmpl"].generation;
+            m.commit("tmpl", generation, |rec| match failure {
+                Some(kind) => rec.mark_failed(&errors::map_runtime_error(kind.into())),
+                None => rec.mark_ready(42),
+            });
+            m.emit_terminal("tmpl");
+            finish_op(&m, "tmpl");
+            let (tx, mut rx) = mpsc::channel(8);
+            let _guard = m.attach_upstream(tx);
+            match rx.try_recv().unwrap() {
+                AgentMsg::ImageState {
+                    state,
+                    bytes,
+                    error,
+                    ..
+                } => match failure {
+                    None => {
+                        assert_eq!(state, "ready");
+                        assert_eq!(bytes, 42);
+                    }
+                    Some(kind) => {
+                        assert_eq!(state, "failed");
+                        assert_eq!(error, errors::map_runtime_error(kind.into()));
+                    }
+                },
+                other => panic!("expected build result, got {other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn plan_build_stages_a_building_record_synchronously() {

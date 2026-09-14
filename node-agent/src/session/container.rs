@@ -1124,28 +1124,6 @@ impl ContainerRuntime {
         })
     }
 
-    /// The remaining CLI template-build path, migrated separately in #232.
-    /// `DOCKER_BUILDKIT=0` keeps progress in classic `Step N/M` form.
-    /// Arguments are separate argv elements; `--` terminates option parsing.
-    pub fn build_command(
-        &self,
-        local_tag: &str,
-        dockerfile_path: &str,
-        context_dir: &str,
-        build_args: &BTreeMap<String, String>,
-    ) -> Command {
-        let mut cmd = Command::new(&self.bin);
-        cmd.env("DOCKER_BUILDKIT", "0");
-        cmd.args(["build", "-f", dockerfile_path, "-t", local_tag]);
-        for (k, v) in build_args {
-            cmd.arg("--build-arg");
-            cmd.arg(format!("{k}={v}"));
-        }
-        cmd.arg("--");
-        cmd.arg(context_dir);
-        cmd
-    }
-
     /// Run an arbitrary `docker <args>` command and return stdout on success.
     /// Used by the PulseAudio sidecar and other agent-managed containers that
     /// don't follow the full app-container spec path.

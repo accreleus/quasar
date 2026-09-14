@@ -7,6 +7,8 @@ license = "MIT"
 [dependencies]
 tempfile = "3"
 anyhow = "1"
+# Docker context ignore matching (already pinned transitively in Cargo.lock).
+regex = "1"
 bollard = { version = "=0.21.1", default-features = false, features = ["pipe"] }
 tokio = { version = "1", features = ["full"] }
 # #12: TLS on the control-plane link. `rustls-tls-webpki-roots` — never native roots: the

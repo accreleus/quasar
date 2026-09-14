@@ -236,3 +236,83 @@ fn real_docker_pull_reuse_in_use_refusal_and_remove() {
     runtime.remove_image(&alias, budget).wait().unwrap();
     println!("Docker {} API {}: pull, offline reuse, multi-tag in-use refusal, removal and absent removal passed",engine.version,engine.api_version);
 }
+
+#[test]
+#[ignore = "requires explicit local test Docker socket; classic builder, unique disposable image only"]
+fn real_docker_classic_build_context_args_failure_and_verification() {
+    use crate::runtime::BuildRequest;
+    let socket =
+        std::env::var("QUASAR_TEST_RUNTIME_SOCKET").expect("set explicit local test socket");
+    let unique = format!("quasar-build-test-{}", crate::runtime::builds::build_id());
+    let reference = format!("{unique}:test");
+    let dir = tempfile::tempdir().unwrap();
+    let context = dir.path().join("context");
+    std::fs::create_dir(&context).unwrap();
+    std::fs::write(
+        context.join("Dockerfile"),
+        "FROM scratch\nARG MESSAGE\nLABEL fixture.message=$MESSAGE\nCOPY payload /payload\n",
+    )
+    .unwrap();
+    std::fs::write(context.join("payload"), &unique).unwrap();
+    std::fs::write(context.join("secret"), "excluded").unwrap();
+    std::fs::write(context.join(".dockerignore"), "secret\n").unwrap();
+    let mut config = RuntimeConfig::unix(socket);
+    config.image_state_path = Some(dir.path().join("operations"));
+    let executor = tokio::runtime::Runtime::new().unwrap();
+    let (docker, engine) = executor.block_on(discover(&config)).unwrap();
+    let assets = Assets {
+        executor,
+        docker,
+        container: None,
+        references: vec![reference.clone()],
+    };
+    let runtime = RuntimeClient::new(config).unwrap();
+    let request = BuildRequest {
+        tag: reference.clone(),
+        context_dir: context.clone(),
+        dockerfile: "Dockerfile".into(),
+        build_args: std::collections::BTreeMap::from([("MESSAGE".into(), "hello API".into())]),
+    };
+    let result = runtime
+        .build_image(request.clone(), Duration::from_secs(60))
+        .wait(|_| {})
+        .unwrap();
+    let image = assets
+        .executor
+        .block_on(assets.docker.inspect_image(&reference))
+        .unwrap();
+    assert_eq!(image.id.as_deref(), Some(result.id.as_str()));
+    assert!(result.bytes > 0);
+    let labels = image.config.unwrap().labels.unwrap();
+    assert_eq!(labels["fixture.message"], "hello API");
+    assert!(labels.contains_key("io.quasar.build-operation"));
+    // Missing COPY source must fail; an old tag cannot turn failure into readiness.
+    std::fs::write(
+        context.join("Dockerfile"),
+        "FROM scratch\nCOPY secret /secret\n",
+    )
+    .unwrap();
+    assert_eq!(
+        runtime
+            .build_image(request.clone(), Duration::from_secs(60))
+            .wait(|_| {})
+            .unwrap_err()
+            .kind,
+        ErrorKind::BuildFailed
+    );
+    std::fs::write(context.join("Dockerfile"), "THIS_IS_INVALID\n").unwrap();
+    assert_eq!(
+        runtime
+            .build_image(request, Duration::from_secs(60))
+            .wait(|_| {})
+            .unwrap_err()
+            .kind,
+        ErrorKind::BuildFailed
+    );
+    runtime
+        .remove_image(&reference, Duration::from_secs(30))
+        .wait()
+        .unwrap();
+    assert!(!runtime.image_present(&reference).wait().unwrap());
+    eprintln!("classic build acceptance passed: engine={engine:?}");
+}
