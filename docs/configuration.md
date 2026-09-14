@@ -754,8 +754,8 @@ they never bypass the #68 emergency descent.
 ## Node agent — app container & runtime
 
 
-On the runtime-API initiative branch, engine discovery and managed-image presence
-checks use Bollard behind Quasar-owned types. Other runtime operations and the Go
+On the runtime-API initiative branch, engine discovery, image inspection, assignment
+pulls and managed-image pull/removal use Bollard behind Quasar-owned types. Other runtime operations and the Go
 updater retain their existing implementations until their migration tickets land.
 There is no API-to-CLI fallback. A failed inspection leaves managed image records
 unchanged rather than marking images absent.
@@ -764,15 +764,59 @@ Discovery reports the engine name/version and selected API version. The inspecti
 contract accepts API 1.40 through the pinned client's ceiling (1.53), intersected
 with the daemon's advertised range. Missing/malformed version facts or an empty
 intersection fail explicitly. This range is a protocol requirement, not a claim
-that every engine configuration was tested. Each operation has a 30-second total
-deadline; one process-owned executor admits at most four simultaneous read
-operations and reports busy rather than accumulating an unbounded queue.
+that every engine configuration was tested. Read operations have a 30-second total
+deadline; one process-owned executor admits at most four simultaneous operations
+and reports busy rather than accumulating an unbounded queue. Assignment pulls
+have a ten-minute budget, catalog pulls thirty minutes and removals one minute.
+The existing catalog queue still admits two simultaneous pulls/builds, serializes
+each image ID and retains only its latest pending replacement.
 
 The API uses the Unix socket at `DOCKER_HOST`, defaulting to the standard mounted
 Docker socket. Nonempty `DOCKER_CONTEXT`, `DOCKER_TLS`, `DOCKER_TLS_VERIFY` or
 `DOCKER_API_VERSION` overrides are rejected instead of silently ignored. A saved nondefault Docker CLI context is also rejected unless an explicit Unix
 `DOCKER_HOST` selects the engine. Environment
 configuration is read once per agent process; restart the agent after changing it.
+
+Image mutations run independently of the control-plane connection. Progress is a
+single replaceable snapshot (at most 1,024 bounded layer IDs contribute), and a
+pull becomes ready only after the stream ends successfully and image inspection
+confirms its ID and size. Dropping an observer does not stop the mutation; its
+wall-clock budget still applies. Terminal catalog results replay on reconnect; a coalesced pending set retries on
+heartbeats if the connection remains attached but its channel fills. Image workers
+never wait for that channel. Assignment preparation is retained through
+`session_start`: the runner waits for verified success, fails on preparation errors
+and can stop observing promptly if the session is cancelled. API-prepared assignment launches
+use `--pull=never` so they cannot bypass an uncertain API pull. Swap, warm-up and
+standalone launch callers retain their existing CLI policy until their migration
+slices; this is an explicit caller boundary, not an error-triggered fallback.
+Local images are reused without a registry request. Removal checks running and
+stopped container references, uses non-forced deletion, avoids parent pruning and
+verifies that the requested reference is absent. External tools can still race
+host mutations; the daemon's own conflict checks remain the final guard.
+
+Pull credentials come from the agent's existing Docker login configuration
+(`DOCKER_CONFIG/config.json`, otherwise `$HOME/.docker/config.json`). Inline auth
+and installed Docker credential helpers are supported. Helpers retrieve credentials
+only; pull/removal never invoke the Docker CLI. Credential errors are fixed messages
+and never include credential contents. A host-side login must be made available
+inside the agent just as it was for the previous containerized CLI.
+
+Mutation intents are synced under `<NODE_SECRET_PATH>.runtime-images` before an
+engine mutation. Keep this directory with the node's persistent identity. Each
+reference has a persistent lock file and, while uncertain, a JSON intent containing
+the reference, engine socket and original removal ID. Transport loss, a deadline
+or an ambiguous engine failure leaves the intent intact. On retry, a present image
+resolves an uncertain pull; an absent reference resolves an uncertain removal.
+An absent image alone cannot establish that an old pull has stopped, and a changed
+removal target cannot authorize deleting its replacement. Those cases fail with
+`image operation outcome unknown` instead of repeating the mutation.
+
+If observation cannot resolve an intent, an operator must confirm that the old
+engine operation has finished before clearing that specific JSON intent with the
+agent stopped. Do not remove the `.lock` files or clear the entire directory while
+work might still be active. A daemon restart is one way to establish that no old
+request remains; it is not performed automatically. This conservative recovery
+path preserves uncertainty across agent restarts without adding a compose setting.
 
 For a future rootless configuration, the API endpoint is the socket visible inside
 the agent, while bind-mount source paths belong to the daemon host. Socket access,
@@ -789,8 +833,8 @@ app's catalog `runtime_spec` (image/args/env/mounts/gpu) is used instead.
 
 | Variable | Default | Values / notes |
 |---|---|---|
-| `QUASAR_CONTAINER_RUNTIME` | `docker` | CLI for callers still awaiting API migration. This branch validates Docker; migrated discovery/image-presence checks require the Docker selection. Changing this to `podman` does not establish Quasar Podman support. |
-| `DOCKER_HOST` | `unix:///var/run/docker.sock` | Explicit Unix engine endpoint shared by API discovery/image-presence checks and remaining Docker CLI callers. The socket must be mounted and accessible inside the agent. TCP, SSH, Docker contexts, TLS overrides and forced API-version overrides are not supported by this migration slice. |
+| `QUASAR_CONTAINER_RUNTIME` | `docker` | CLI for callers still awaiting API migration. This branch validates Docker; migrated runtime API operations require the Docker selection. Changing this to `podman` does not establish Quasar Podman support. |
+| `DOCKER_HOST` | `unix:///var/run/docker.sock` | Explicit Unix engine endpoint shared by migrated runtime API operations and remaining Docker CLI callers. The socket must be mounted and accessible inside the agent. TCP, SSH, Docker contexts, TLS overrides and forced API-version overrides are not supported by this migration slice. |
 | `QUASAR_CONTAINER_NETWORK` | `none` | Host-wide fallback `--network` for app containers, applied only when the app itself states none. **Prefer the per-app knob below** — the network is an app requirement, so setting it here to fix one title (Steam sign-in/downloads) opens the network for every app on the host. Accepted: `none` \| `bridge` \| `host`; anything else fails the session with a named error rather than being handed to the runtime. **This is the only place `host` can be selected**, deliberately: it is set by the operator of one specific machine and travels nowhere. `--network host` removes the container's network namespace — the app then reaches every service on host loopback (control plane, Postgres, any admin-only port) and can bind host ports — so it is a host-administration decision, not an app property. |
 | *(per-app)* `runtime_spec.network` / preset `network` | inherit | Not an env var — the per-app container network (first-run experience §S2). Resolved at launch as **app `runtime_spec.network` → its runtime preset's `network` column → `QUASAR_CONTAINER_NETWORK` → `none`**. Accepted at every layer: `""` (inherit) \| `none` \| `bridge`. **`host` is refused here even though the env knob above accepts it** — these values are portable (a preset is materialized from a catalog image manifest authored elsewhere), so an app-authored `host` would dissolve container network isolation on every host that installs the image. A rejected value is a 400 from the admin preset API, a failed image install from a manifest `runtime` block, a failed launch from an app's `runtime_spec`, and a failed session at the agent. Steam's catalog image declares `bridge` because its first boot must download `steamui.so` — without it the app clean-exits and the session surfaces as "media path interrupted" (#463). |
 | `QUASAR_APP_PUID` | unset | Run-as **user** id for app containers, forwarded as `PUID` (not docker `--user`, which would bypass the images' root init). The quasar-images base entrypoint starts as root, then drops to `PUID`/`PGID`. Unset ⇒ image default (unchanged). Unraid convention: `99`. An app-catalog `PUID` in the app's `runtime_spec.env` overrides this host default. |

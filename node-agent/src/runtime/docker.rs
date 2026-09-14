@@ -1,6 +1,8 @@
 //! Bollard types and protocol details stay private to this adapter.
 use super::{ApiVersion, EngineInfo, ErrorKind, RuntimeConfig, RuntimeError};
 use bollard::{errors::Error, Docker};
+use futures_util::StreamExt;
+mod credentials;
 
 fn classify(error: Error) -> RuntimeError {
     let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
@@ -27,6 +29,199 @@ fn classify(error: Error) -> RuntimeError {
         _ => ErrorKind::Protocol,
     }
     .into()
+}
+
+fn image_error(error: Error) -> RuntimeError {
+    let message = match &error {
+        Error::DockerStreamError { error } => error.as_str(),
+        Error::DockerResponseServerError { message, .. } => message.as_str(),
+        _ => return ErrorKind::UnknownOutcome.into(),
+    }
+    .to_lowercase();
+    if message.contains("no space left") {
+        ErrorKind::InsufficientDisk.into()
+    } else if message.contains("unauthorized")
+        || message.contains("denied")
+        || message.contains("authentication required")
+    {
+        ErrorKind::RegistryDenied.into()
+    } else if message.contains("manifest unknown") || message.contains("manifest not found") {
+        ErrorKind::ManifestMissing.into()
+    } else {
+        classify(error)
+    }
+}
+
+/// One reconciliation policy for every mutation of a reference.
+async fn reconcile_image(
+    config: &RuntimeConfig,
+    image: &str,
+) -> Result<(Docker, super::images::Journal, Option<super::ImageInfo>), RuntimeError> {
+    use super::images::Journal;
+    if image.is_empty() || image.len() > 2048 || image.contains(['?', '#', '\0']) {
+        return Err(ErrorKind::InvalidConfiguration.into());
+    }
+    let (docker, _) = discover(config).await?;
+    let journal = Journal::acquire(config, image).await?;
+    let existing = image_info(&docker, image).await?;
+    if let Some(intent) = journal.pending()? {
+        if intent.image != image || intent.socket != config.socket {
+            return Err(ErrorKind::UnknownOutcome.into());
+        }
+        if intent.remove_id.is_some() && existing.is_none()
+            || intent.remove_id.is_none() && existing.is_some()
+        {
+            journal.clear()?;
+        } else {
+            return Err(ErrorKind::UnknownOutcome.into());
+        }
+    }
+    Ok((docker, journal, existing))
+}
+
+pub(super) async fn ensure_image(
+    config: &RuntimeConfig,
+    image: &str,
+    progress: tokio::sync::watch::Sender<super::ImageProgress>,
+) -> Result<super::ImageInfo, RuntimeError> {
+    use super::images::Intent;
+    let (docker, journal, existing) = reconcile_image(config, image).await?;
+    if let Some(info) = existing {
+        return Ok(info);
+    }
+    let credentials = credentials::load(config, image).await?;
+    journal.begin(Intent {
+        image: image.into(),
+        socket: config.socket.clone(),
+        remove_id: None,
+    })?;
+    let tag = if image.contains('@') || image.rsplit('/').next().unwrap_or(image).contains(':') {
+        None
+    } else {
+        Some("latest".to_owned())
+    };
+    let options = bollard::query_parameters::CreateImageOptions {
+        from_image: Some(image.to_owned()),
+        tag,
+        ..Default::default()
+    };
+    let mut stream = docker.create_image(Some(options), None, credentials);
+    let mut layers = std::collections::BTreeMap::<String, (u64, u64)>::new();
+    while let Some(event) = stream.next().await {
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                let definite = matches!(error, Error::DockerStreamError { .. } | Error::DockerResponseServerError { status_code: 400..=407 | 409..=499, .. });
+                if definite {
+                    journal.clear()?;
+                    return Err(image_error(error));
+                }
+                return Err(ErrorKind::UnknownOutcome.into());
+            }
+        };
+        if event.error_detail.is_some() {
+            journal.clear()?;
+            return Err(ErrorKind::Engine.into());
+        }
+        if let (Some(id), Some(detail)) = (event.id, event.progress_detail) {
+            if id.len() <= 128 && (layers.len() < 1024 || layers.contains_key(&id)) {
+                layers.insert(
+                    id,
+                    (
+                        detail.current.unwrap_or(0).max(0) as u64,
+                        detail.total.unwrap_or(0).max(0) as u64,
+                    ),
+                );
+                let (current, total) = layers.values().fold((0u64, 0u64), |(c, t), (nc, nt)| {
+                    (c.saturating_add(*nc), t.saturating_add(*nt))
+                });
+                progress.send_replace(super::ImageProgress {
+                    percent: if total == 0 {
+                        0
+                    } else {
+                        ((current as f64 / total as f64) * 100.).clamp(0., 99.) as u8
+                    },
+                    bytes: current,
+                });
+            }
+        }
+    }
+    let info = image_info(&docker, image)
+        .await
+        .map_err(|_| ErrorKind::UnknownOutcome)?
+        .ok_or(ErrorKind::UnknownOutcome)?;
+    journal.clear()?;
+    Ok(info)
+}
+
+pub(super) async fn remove_image(config: &RuntimeConfig, image: &str) -> Result<(), RuntimeError> {
+    use super::images::Intent;
+    let (docker, journal, existing) = reconcile_image(config, image).await?;
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    // Docker can untag a multi-tagged image even when a container references it.
+    // Check all containers as well as asking the daemon for non-forced removal.
+    let containers = docker
+        .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+            all: true,
+            ..Default::default()
+        }))
+        .await
+        .map_err(classify)?;
+    if containers
+        .iter()
+        .any(|c| c.image_id.as_deref() == Some(&existing.id))
+    {
+        return Err(ErrorKind::ImageInUse.into());
+    }
+    journal.begin(Intent {
+        image: image.into(),
+        socket: config.socket.clone(),
+        remove_id: Some(existing.id),
+    })?;
+    let result = docker
+        .remove_image(
+            image,
+            Some(bollard::query_parameters::RemoveImageOptions {
+                force: false,
+                noprune: true,
+                ..Default::default()
+            }),
+            None,
+        )
+        .await;
+    match result {
+        Ok(_)
+        | Err(Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => {
+            if image_info(&docker, image)
+                .await
+                .map_err(|_| ErrorKind::UnknownOutcome)?
+                .is_some()
+            {
+                return Err(ErrorKind::UnknownOutcome.into());
+            }
+            journal.clear()?;
+            Ok(())
+        }
+        Err(Error::DockerResponseServerError {
+            status_code: 409, ..
+        }) => {
+            journal.clear()?;
+            Err(ErrorKind::ImageInUse.into())
+        }
+        Err(error) => {
+            if matches!(error, Error::DockerResponseServerError { status_code: 400..=407 | 409..=499, .. })
+            {
+                journal.clear()?;
+                Err(classify(error))
+            } else {
+                Err(ErrorKind::UnknownOutcome.into())
+            }
+        }
+    }
 }
 
 fn version(raw: Option<&str>) -> Result<ApiVersion, RuntimeError> {
@@ -121,12 +316,27 @@ pub(super) async fn inspect_image(
         return Err(ErrorKind::InvalidConfiguration.into());
     }
     let (docker, _) = discover(config).await?;
+    Ok(image_info(&docker, image).await?.is_some())
+}
+
+pub(super) async fn image_info(
+    docker: &Docker,
+    image: &str,
+) -> Result<Option<super::ImageInfo>, RuntimeError> {
     match docker.inspect_image(image).await {
-        Ok(info) if info.id.as_ref().is_some_and(|id| !id.is_empty()) => Ok(true),
+        Ok(info) if info.id.as_ref().is_some_and(|id| !id.is_empty()) => {
+            Ok(Some(super::ImageInfo {
+                id: info.id.unwrap(),
+                bytes: info.size.unwrap_or(0).max(0) as u64,
+            }))
+        }
         Ok(_) => Err(ErrorKind::Protocol.into()),
         Err(Error::DockerResponseServerError {
             status_code: 404, ..
-        }) => Ok(false),
+        }) => Ok(None),
         Err(e) => Err(classify(e)),
     }
 }
+
+#[cfg(test)]
+mod real_tests;

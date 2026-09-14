@@ -1,7 +1,7 @@
 //! Agent-side image ensure/build/remove: pull, build or rmi catalog images in this
 //! host's docker daemon, reporting progress via `image_state`. Wire contract:
-//! agent-api.md image-management; docker goes through
-//! `session::container::ContainerRuntime`, never a second docker dependency.
+//! agent-api.md image-management. Pull/removal use the Quasar runtime API;
+//! build and disk metadata retain their CLI paths until their migration slices.
 //!
 //! One operation per `image_id` at a time. Every op for an image serializes through
 //! a per-image slot: one running, plus the single latest pending (a newer request
@@ -17,7 +17,7 @@ mod progress;
 mod semaphore;
 mod state;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -33,7 +33,7 @@ use crate::session::container::ContainerRuntime;
 
 pub use state::ImageState;
 
-use progress::{ProgressThrottle, PullProgressTracker};
+use progress::ProgressThrottle;
 use semaphore::CountingSemaphore;
 use state::{ImageRecord, StagedTarget};
 
@@ -41,13 +41,11 @@ use state::{ImageRecord, StagedTarget};
 /// (agent-api.md).
 const MAX_CONCURRENT_PULLS: usize = 2;
 
-/// Wall-clock bound on one pull. Wider than `container::RUNTIME_PULL_TIMEOUT`: an
-/// ensure storm can leave a pull queued behind the semaphore before it starts.
+/// Wall-clock bound after a catalog pull acquires its shared pull/build permit.
+/// Assignment preparation uses a shorter ten-minute budget.
 const PULL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// Watchdog tick. The deadline must be enforced by that loop, not by the stdout
-/// reader: a registry that connects then goes silent emits no line, so a per-line
-/// check never fires and the child runs forever holding a pull permit.
+/// Polling tick for the remaining CLI build watchdog. API pulls own their deadlines.
 const PULL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Field bounds. The control plane is trusted, but these strings become map keys,
@@ -337,6 +335,8 @@ pub struct ImageManager {
     generations: AtomicU64,
     semaphore: Arc<CountingSemaphore>,
     upstream: RwLock<Option<mpsc::Sender<AgentMsg>>>,
+    /// At most one undelivered terminal per existing image record.
+    terminal_pending: Mutex<HashSet<String>>,
     /// The golden-home warm-up scheduler, attached per connection alongside
     /// `upstream`; `None` on a host with the feature off.
     lifecycle: RwLock<Option<Arc<dyn ImageLifecycleObserver>>>,
@@ -395,6 +395,7 @@ impl ImageManager {
             generations: AtomicU64::new(0),
             semaphore: CountingSemaphore::new(MAX_CONCURRENT_PULLS),
             upstream: RwLock::new(None),
+            terminal_pending: Mutex::new(HashSet::new()),
             lifecycle: RwLock::new(None),
         })
     }
@@ -431,7 +432,7 @@ impl ImageManager {
 
     /// The delivery half of the terminal-state guarantee, and a resync for a
     /// reconnecting control plane. On the async connect path, so it must use the
-    /// non-blocking emit; anything that still fails waits for the next attach.
+    /// non-blocking emit; undelivered states also retry on later heartbeats.
     fn flush_op_free_states(&self) {
         let ids: Vec<String> = {
             let ops = self.ops.lock().unwrap();
@@ -443,7 +444,7 @@ impl ImageManager {
                 .collect()
         };
         for id in ids {
-            self.emit(&id);
+            self.emit_terminal(&id);
         }
     }
 
@@ -593,28 +594,23 @@ impl ImageManager {
         self.send_upstream(msg)
     }
 
-    /// Emit a terminal (`ready`/`failed`/`absent`) state. Worker threads only: it
-    /// blocks while the channel is full, which the async connection task must never
-    /// do. An undelivered terminal is only logged — the next
-    /// [`Self::attach_upstream`] re-emits every op-free record.
+    /// Never retain an operation slot or pull permit for control-plane backpressure.
+    /// The record is already persisted; coalesce undelivered states by image ID.
     fn emit_terminal(&self, image_id: &str) {
-        let Some(msg) = self.state_msg(image_id) else {
-            return;
-        };
-        // Clone the sender OUT of the lock: blocking under the read guard would wedge
-        // a connection teardown, which takes the write lock.
-        let tx = self.upstream.read().unwrap().clone();
-        match tx {
-            // Errs as soon as the receiver is gone, so this cannot block forever.
-            Some(tx) => {
-                if let Err(e) = tx.blocking_send(msg) {
-                    debug!("image {image_id}: terminal image_state undeliverable ({e}); the next attach will resync it");
-                }
-            }
-            None => {
-                debug!("image {image_id}: terminal image_state not sent (no upstream attached); the next attach will resync it");
-            }
+        let mut pending = self.terminal_pending.lock().unwrap();
+        if self.emit(image_id) {
+            pending.remove(image_id);
+        } else {
+            pending.insert(image_id.to_string());
         }
+    }
+
+    /// Retry on heartbeat, independently of image workers. Reconnect also resyncs
+    /// every op-free record, including terminal results from before process restart.
+    pub fn flush_terminal_states(&self) {
+        let mut pending = self.terminal_pending.lock().unwrap();
+        let ops = self.ops.lock().unwrap();
+        pending.retain(|id| ops.contains_key(id) || !self.emit(id));
     }
 
     fn state_msg(&self, image_id: &str) -> Option<AgentMsg> {
@@ -1001,32 +997,21 @@ impl ImageManager {
             self.emit_terminal(image_id);
             return;
         }
-        // NEVER force: agent-api.md forbids removing an image backing a live
-        // container, so no `-f`. `--` stops a ref being parsed as a flag.
-        match self.runtime.run_raw(&["rmi", "--", &registry_ref]) {
-            Ok(_) => {
+        let result = crate::runtime::configured().and_then(|runtime| {
+            runtime
+                .remove_image(&registry_ref, Duration::from_secs(60))
+                .wait()
+        });
+        match result {
+            Ok(()) => {
                 self.commit(image_id, generation, |rec| rec.mark_absent());
                 info!("image {image_id} ({registry_ref}) removed");
                 self.notify_removed(image_id);
             }
-            Err(e) => {
-                // `run_raw`'s error embeds the docker command line, so it is
-                // classified here and never forwarded upstream verbatim.
-                let raw = e.to_string();
-                let msg = errors::map_rmi_error(&raw);
-                warn!(
-                    token = "image-rmi-failed",
-                    "image {image_id} ({registry_ref}) rmi failed: {raw}"
-                );
-                if msg == errors::RMI_ALREADY_ABSENT {
-                    self.commit(image_id, generation, |rec| rec.mark_absent());
-                } else {
-                    self.commit(image_id, generation, |rec| rec.mark_failed(&msg));
-                    tracing::error!(
-                        token = "image-remove-failed",
-                        "image {image_id} ({registry_ref}) remove failed: {msg}"
-                    );
-                }
+            Err(error) => {
+                let message = errors::map_runtime_error(error);
+                self.commit(image_id, generation, |rec| rec.mark_failed(&message));
+                tracing::error!(token = "image-remove-failed", "image {image_id}: {message}");
             }
         }
         self.persist();
@@ -1051,8 +1036,7 @@ impl ImageManager {
         self.emit(image_id);
 
         match self.pull_with_progress(image_id, generation, registry_ref) {
-            Ok(()) => {
-                let bytes = self.image_size_bytes(registry_ref).unwrap_or(0);
+            Ok(bytes) => {
                 self.commit(image_id, generation, |rec| rec.mark_ready(bytes));
                 info!("image {image_id} ({registry_ref}) pulled: ready ({bytes} bytes), version {version}");
                 // The one choke-point where an image becomes usable on this host, so
@@ -1071,126 +1055,25 @@ impl ImageManager {
         self.emit_terminal(image_id);
     }
 
-    /// `docker pull`, translating per-layer progress into throttled `image_state`.
-    ///
-    /// stdout and stderr each get their own draining thread: a full pipe must never
-    /// wedge the other or the watchdog. [`PULL_TIMEOUT`] is enforced independently of
-    /// output — a registry that connects then goes silent emits no line, so a per-line
-    /// check never fires and two such stalls would deadlock every later pull with the
-    /// control plane stuck at `pulling`. On expiry the watchdog kills AND reaps.
+    /// Observe coalesced API progress; engine work outlives control-plane reconnects.
     fn pull_with_progress(
         &self,
         image_id: &str,
         generation: u64,
         registry_ref: &str,
-    ) -> Result<(), String> {
-        // `ContainerRuntime` owns the command; building it here would duplicate its
-        // `QUASAR_CONTAINER_RUNTIME` resolution and drift from it.
-        let mut cmd = self.runtime.pull_command(registry_ref);
-        cmd.stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null());
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("failed to exec docker pull: {e}"))?;
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
-
-        // The scraper thread only reports samples; record mutation stays on this
-        // worker thread.
-        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<(u8, u64)>();
-        let stdout_thread = std::thread::spawn(move || {
-            let mut tracker = PullProgressTracker::new();
-            for line in std::io::BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                if let Some((layer_id, p)) = progress::parse_pull_line(&line) {
-                    tracker.observe(layer_id, p);
-                    if progress_tx.send(tracker.snapshot()).is_err() {
-                        break;
-                    }
-                }
-            }
-        });
-        let stderr_buf = Arc::new(Mutex::new(String::new()));
-        let stderr_buf2 = stderr_buf.clone();
-        let stderr_thread = std::thread::spawn(move || {
-            use std::io::Read;
-            let mut buf = String::new();
-            // Bounded: an unbounded read lets a misbehaving registry pin memory for
-            // the whole PULL_TIMEOUT window by emitting stderr the entire time.
-            let _ = std::io::BufReader::new(stderr)
-                .take(64 * 1024)
-                .read_to_string(&mut buf);
-            *stderr_buf2.lock().unwrap() = buf;
-        });
-
-        let deadline = Instant::now() + PULL_TIMEOUT;
+    ) -> Result<u64, String> {
+        let runtime = crate::runtime::configured().map_err(errors::map_runtime_error)?;
         let mut throttle = ProgressThrottle::new();
-        let mut wait_err: Option<String> = None;
-        let mut timed_out = false;
-        let status = loop {
-            let mut latest = None;
-            while let Ok(sample) = progress_rx.try_recv() {
-                latest = Some(sample);
-            }
-            if let Some((pct, bytes)) = latest {
-                if throttle.should_emit(Instant::now(), pct) {
-                    self.set_pulling(image_id, generation, pct, bytes);
+        runtime
+            .ensure_image(registry_ref, PULL_TIMEOUT)
+            .wait(|sample| {
+                if throttle.should_emit(Instant::now(), sample.percent) {
+                    self.set_pulling(image_id, generation, sample.percent, sample.bytes);
                     self.emit(image_id);
                 }
-            }
-
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) => {}
-                Err(e) => {
-                    wait_err = Some(format!("failed to wait on docker pull: {e}"));
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break None;
-                }
-            }
-            if Instant::now() >= deadline {
-                warn!(
-                    token = "image-pull-timeout",
-                    "image {image_id}: docker pull exceeded {}s — killing the child",
-                    PULL_TIMEOUT.as_secs()
-                );
-                let _ = child.kill();
-                // Reap: a permit-holding worker must never leave a zombie.
-                let _ = child.wait();
-                timed_out = true;
-                break None;
-            }
-            std::thread::sleep(PULL_POLL_INTERVAL);
-        };
-
-        // Both readers hit EOF once the child closes its pipes, so these joins are
-        // bounded by the child's lifetime above.
-        let _ = stdout_thread.join();
-        let _ = stderr_thread.join();
-
-        if timed_out {
-            return Err("registry pull timed out".to_string());
-        }
-        if let Some(e) = wait_err {
-            return Err(e);
-        }
-        let status = status.expect("loop breaks with a status, an error, or a timeout");
-        if status.success() {
-            Ok(())
-        } else {
-            let raw = stderr_buf.lock().unwrap().clone();
-            // Raw docker output is logged locally, never sent upstream. ERROR, not
-            // debug: the mapped wire error tells the operator to inspect this log,
-            // and the default filter is `info` — at debug this line never exists.
-            tracing::error!(
-                token = "image-pull-stderr",
-                "image {image_id}: docker pull stderr: {}",
-                raw.trim()
-            );
-            Err(errors::map_pull_error(&raw))
-        }
+            })
+            .map(|info| info.bytes)
+            .map_err(errors::map_runtime_error)
     }
 
     /// Run a template build: take a shared pull/build permit, disk-guard, download +
@@ -1680,6 +1563,7 @@ mod tests {
             generations: AtomicU64::new(0),
             semaphore: CountingSemaphore::new(MAX_CONCURRENT_PULLS),
             upstream: RwLock::new(None),
+            terminal_pending: Mutex::new(HashSet::new()),
             lifecycle: RwLock::new(None),
         })
     }
@@ -2096,6 +1980,55 @@ mod tests {
     /// The cleared slot `run_worker` leaves behind.
     fn finish_op(m: &Arc<ImageManager>, image_id: &str) {
         m.ops.lock().unwrap().remove(image_id);
+    }
+
+    #[test]
+    fn terminal_delivery_does_not_hold_a_worker_when_the_connection_is_full() {
+        let m = mgr();
+        let (tx, rx) = mpsc::channel(1);
+        let guard = m.attach_upstream(tx);
+        assert!(m.plan_ensure("steam", REF1, "v1")); // fills the channel
+        let generation = m.ops.lock().unwrap()["steam"].generation;
+        m.commit("steam", generation, |rec| rec.mark_ready(4242));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_mgr = m.clone();
+        let worker = std::thread::spawn(move || {
+            worker_mgr.emit_terminal("steam");
+            finish_op(&worker_mgr, "steam");
+            let _ = done_tx.send(());
+        });
+        let completed = done_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+        drop(rx); // also releases a regressed blocking worker before asserting
+        worker.join().unwrap();
+        drop(guard);
+        assert!(completed, "control-plane backpressure retained the worker");
+        let (tx, mut rx) = mpsc::channel(8);
+        let _guard = m.attach_upstream(tx);
+        assert!(
+            matches!(rx.try_recv().unwrap(), AgentMsg::ImageState { state, bytes:4242, .. } if state == "ready")
+        );
+    }
+
+    #[test]
+    fn a_full_connection_replays_terminal_state_after_capacity_returns() {
+        let m = mgr();
+        let (tx, mut rx) = mpsc::channel(1);
+        let _guard = m.attach_upstream(tx);
+        assert!(m.plan_ensure("steam", REF1, "v1"));
+        let generation = m.ops.lock().unwrap()["steam"].generation;
+        m.commit("steam", generation, |rec| rec.mark_ready(4242));
+        m.emit_terminal("steam");
+        finish_op(&m, "steam");
+        let _progress = rx.try_recv().unwrap();
+        m.flush_terminal_states();
+        assert!(
+            matches!(rx.try_recv().unwrap(),AgentMsg::ImageState { state, bytes:4242, .. } if state == "ready")
+        );
+        m.flush_terminal_states();
+        assert!(
+            rx.try_recv().is_err(),
+            "delivered terminal was replayed again"
+        );
     }
 
     #[test]

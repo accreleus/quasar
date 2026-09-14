@@ -1,4 +1,4 @@
-//! Quasar-owned engine discovery and image inspection.
+//! Quasar-owned engine discovery and bounded image operations.
 
 use std::{
     path::PathBuf,
@@ -8,6 +8,8 @@ use std::{
 use tokio::sync::{watch, Semaphore};
 
 mod docker;
+mod images;
+pub use images::{ImageInfo, ImageOperation, ImageProgress};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -20,6 +22,11 @@ pub enum ErrorKind {
     Timeout,
     Cancelled,
     Busy,
+    UnknownOutcome,
+    ImageInUse,
+    RegistryDenied,
+    ManifestMissing,
+    InsufficientDisk,
 }
 
 /// Safe to surface to callers. Raw daemon messages never become public errors.
@@ -44,6 +51,8 @@ pub struct RuntimeConfig {
     pub socket: PathBuf,
     pub deadline: Duration,
     pub max_in_flight: usize,
+    pub image_state_path: Option<PathBuf>,
+    pub registry_config_path: Option<PathBuf>,
 }
 impl RuntimeConfig {
     pub fn unix(socket: impl Into<PathBuf>) -> Self {
@@ -51,6 +60,8 @@ impl RuntimeConfig {
             socket: socket.into(),
             deadline: Duration::from_secs(30),
             max_in_flight: 4,
+            image_state_path: None,
+            registry_config_path: None,
         }
     }
 
@@ -124,11 +135,25 @@ impl RuntimeConfig {
 }
 
 /// One executor per agent process, shared across the existing runtime facades.
+static IMAGE_STATE_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+pub(crate) fn initialize_image_state(path: PathBuf) {
+    let _ = IMAGE_STATE_PATH.set(path);
+}
+
 pub(crate) fn configured() -> Result<&'static RuntimeClient, RuntimeError> {
     static CLIENT: std::sync::OnceLock<Result<RuntimeClient, RuntimeError>> =
         std::sync::OnceLock::new();
     CLIENT
-        .get_or_init(|| RuntimeClient::new(RuntimeConfig::from_environment()?))
+        .get_or_init(|| {
+            let mut config = RuntimeConfig::from_environment()?;
+            config.image_state_path = IMAGE_STATE_PATH.get().cloned();
+            config.registry_config_path = std::env::var_os("DOCKER_CONFIG")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|v| PathBuf::from(v).join(".docker")))
+                .map(|directory| directory.join("config.json"));
+            RuntimeClient::new(config)
+        })
         .as_ref()
         .map_err(Clone::clone)
 }
@@ -168,7 +193,8 @@ impl Drop for Executor {
     }
 }
 
-/// A bounded read operation. Dropping or cancelling it stops observation only.
+/// A bounded operation. Dropping or cancelling reads stops them; image mutations
+/// continue under their own deadline and retain uncertainty when interrupted.
 /// `wait` bridges existing blocking callers; it must not be used on a media path.
 pub struct Operation<T> {
     result: mpsc::Receiver<Result<T, RuntimeError>>,
@@ -229,6 +255,15 @@ impl RuntimeClient {
         &self,
         work: impl std::future::Future<Output = Result<T, RuntimeError>> + Send + 'static,
     ) -> Operation<T> {
+        self.submit_owned(work, self.config.deadline, false)
+    }
+
+    fn submit_owned<T: Send + 'static>(
+        &self,
+        work: impl std::future::Future<Output = Result<T, RuntimeError>> + Send + 'static,
+        budget: Duration,
+        detached: bool,
+    ) -> Operation<T> {
         let (send, result) = mpsc::sync_channel(1);
         let (cancel, mut cancelled) = watch::channel(false);
         let operation = Operation {
@@ -236,23 +271,29 @@ impl RuntimeClient {
             cancel,
             _executor: self.executor.clone(),
         };
+        if budget.is_zero() || std::time::Instant::now().checked_add(budget).is_none() {
+            let _ = send.send(Err(ErrorKind::InvalidConfiguration.into()));
+            return operation;
+        }
         match self.executor.slots.clone().try_acquire_owned() {
             Err(_) => {
                 let _ = send.send(Err(ErrorKind::Busy.into()));
             }
             Ok(permit) => {
-                let deadline = tokio::time::Instant::now() + self.config.deadline;
+                let deadline = tokio::time::Instant::now() + budget;
+                let owner = detached.then(|| self.executor.clone());
                 self.executor
                     .runtime
                     .as_ref()
                     .expect("live executor")
                     .spawn(async move {
                         let _permit = permit;
+                        let _owner = owner;
                         let result = tokio::select! {
                             biased;
-                            _ = cancelled.changed() => Err(ErrorKind::Cancelled.into()),
+                            _ = cancelled.changed(), if !detached => Err(ErrorKind::Cancelled.into()),
                             result = tokio::time::timeout_at(deadline, work) =>
-                                result.unwrap_or_else(|_| Err(ErrorKind::Timeout.into())),
+                                result.unwrap_or_else(|_| Err(if detached { ErrorKind::UnknownOutcome } else { ErrorKind::Timeout }.into())),
                         };
                         let _ = send.send(result);
                     });
@@ -301,8 +342,17 @@ mod tests {
                     socket.read_exact(&mut byte).unwrap();
                     request.push(byte[0]);
                 }
-                assert!(String::from_utf8_lossy(&request)
-                    .starts_with(&format!("GET {expected_path} HTTP/1.1")));
+                let expected =
+                    if expected_path.starts_with("POST ") || expected_path.starts_with("DELETE ") {
+                        expected_path.to_owned()
+                    } else {
+                        format!("GET {expected_path}")
+                    };
+                assert!(
+                    String::from_utf8_lossy(&request).starts_with(&format!("{expected} HTTP/1.1")),
+                    "{}",
+                    String::from_utf8_lossy(&request)
+                );
                 write!(socket, "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
         });
@@ -325,6 +375,80 @@ mod tests {
     }
 
     const VERSION: &str = r#"{"Platform":{"Name":"Docker Engine - Community"},"Version":"28.0.0","ApiVersion":"1.48","MinAPIVersion":"1.24"}"#;
+
+    #[test]
+    fn ensure_image_reuses_a_local_image_without_a_registry_request() {
+        let (dir, client, server) = fixture(vec![
+            ("/version", 200, VERSION),
+            (
+                "/v1.48/images/test/json",
+                200,
+                r#"{"Id":"sha256:abc","Size":123}"#,
+            ),
+        ]);
+        let mut config = client.config.clone();
+        config.image_state_path = Some(dir.path().join("operations"));
+        let runtime = RuntimeClient::new(config).unwrap();
+        let image = runtime
+            .ensure_image("test", Duration::from_secs(2))
+            .wait(|_| {})
+            .unwrap();
+        assert_eq!(image.id, "sha256:abc");
+        assert_eq!(image.bytes, 123);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_pull_verifies_the_image_after_consuming_progress() {
+        let (dir, client, server) = fixture(vec![
+            ("/version", 200, VERSION),
+            ("/v1.48/images/test/json", 404, r#"{"message":"No such image"}"#),
+            ("POST /v1.48/images/create?fromImage=test&tag=latest&platform=", 200,
+             "{\"id\":\"layer\",\"status\":\"Downloading\",\"progressDetail\":{\"current\":50,\"total\":100}}\n"),
+            ("/v1.48/images/test/json", 200, r#"{"Id":"sha256:new","Size":100}"#),
+        ]);
+        let mut config = client.config.clone();
+        config.image_state_path = Some(dir.path().join("operations"));
+        let runtime = RuntimeClient::new(config).unwrap();
+        assert_eq!(
+            runtime
+                .ensure_image("test", Duration::from_secs(2))
+                .wait(|_| {})
+                .unwrap()
+                .id,
+            "sha256:new"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn removal_refuses_an_image_referenced_by_a_container() {
+        let (dir, client, server) = fixture(vec![
+            ("/version", 200, VERSION),
+            (
+                "/v1.48/images/test/json",
+                200,
+                r#"{"Id":"sha256:abc","Size":123}"#,
+            ),
+            (
+                "/v1.48/containers/json?all=true&size=false",
+                200,
+                r#"[{"ImageID":"sha256:abc"}]"#,
+            ),
+        ]);
+        let mut config = client.config.clone();
+        config.image_state_path = Some(dir.path().join("operations"));
+        let runtime = RuntimeClient::new(config).unwrap();
+        assert_eq!(
+            runtime
+                .remove_image("test", Duration::from_secs(2))
+                .wait()
+                .unwrap_err()
+                .kind,
+            ErrorKind::ImageInUse
+        );
+        server.join().unwrap();
+    }
 
     #[test]
     fn image_inspection_uses_negotiated_version_and_rejects_invalid_metadata() {
@@ -551,3 +675,6 @@ mod tests {
         assert!(!runtime.image_present(absent).wait().unwrap());
     }
 }
+
+#[cfg(test)]
+mod image_tests;

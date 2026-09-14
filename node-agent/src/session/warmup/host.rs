@@ -152,6 +152,7 @@ impl WarmupHost for AgentWarmupHost {
             // Steam-only today; no desktop-session image goes through this
             // path, so it never needs an unmasked /proc.
             systempaths_unconfined: false,
+            require_local_image: false,
         };
 
         let mut cfg = SessionConfig::for_assignment_with(

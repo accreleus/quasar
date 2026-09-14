@@ -138,6 +138,10 @@ pub async fn run(cfg: Config) {
         std::process::exit(1);
     }
 
+    crate::runtime::initialize_image_state(
+        format!("{}.runtime-images", cfg.node_secret_path).into(),
+    );
+
     // Startup orphan sweep (P2-06): `docker run --rm` survives a SIGKILL of the
     // agent, so a prior run can leave session/pulse sibling containers behind.
     // Best-effort — a sweep failure never blocks startup.
@@ -1433,6 +1437,7 @@ async fn connect_and_run(
             }
 
             _ = hb_timer.tick() => {
+                image_mgr.flush_terminal_states();
                 let ts_unix_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -2068,6 +2073,7 @@ pub(crate) fn app_uid_gid() -> Option<(u32, u32)> {
 struct PendingAssignment {
     cfg: SessionConfig,
     assigned_at: Instant,
+    preparation: Option<crate::runtime::ImageOperation<crate::runtime::ImageInfo>>,
 }
 
 /// The per-running-session handles the agent loop holds.
@@ -2473,30 +2479,34 @@ impl SessionManager {
                      image={image}, reserved vram={vram}MB slots={slots}",
                     cfg.stream.width, cfg.stream.height, cfg.stream.fps
                 );
-                // Prepare step of reserve→prepare→go-live: pull now, off the agent
-                // loop, so session_start is fast.
-                if let Some(spec) = container {
-                    let runtime = ContainerRuntime::from_env();
-                    std::thread::spawn(move || {
-                        if let Err(e) = runtime.pull(&spec.image) {
-                            warn!(
-                                token = "assign-image-pull-failed",
-                                "assign-time pull of {} failed: {e:#}", spec.image
-                            );
+                // Preparation belongs to the runtime executor, not this connection.
+                // Retain its observation so session_start cannot race or ignore it.
+                let preparation = if let Some(spec) = container {
+                    match crate::runtime::configured() {
+                        Ok(runtime) => {
+                            Some(runtime.ensure_image(spec.image, Duration::from_secs(600)))
                         }
-                    });
-                }
+                        Err(error) => return Some(ack(id, false, Some(error.to_string()))),
+                    }
+                } else {
+                    None
+                };
                 self.pending.insert(
                     session_id,
                     PendingAssignment {
                         cfg,
                         assigned_at: Instant::now(),
+                        preparation,
                     },
                 );
                 Some(ack(id, true, None))
             }
             ControlMsg::SessionStart { id, session_id } => match self.pending.remove(&session_id) {
-                Some(PendingAssignment { cfg, .. }) => {
+                Some(PendingAssignment {
+                    mut cfg,
+                    preparation,
+                    ..
+                }) => {
                     // The assign already raised this, but a `session_start` for an
                     // assignment that landed on a previous connection would not have.
                     self.abort_any_warmup();
@@ -2539,8 +2549,39 @@ impl SessionManager {
                     let panic_tx = evt_tx.clone();
                     let panic_sid = session_id.clone();
                     let thread = std::thread::spawn(move || {
-                        let outcome =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            || {
+                                if let Some(preparation) = preparation {
+                                    if let Err(error) = preparation
+                                        .wait_with_cancel(|_| {}, || stop.load(Ordering::Relaxed))
+                                    {
+                                        let event = if error.kind
+                                            == crate::runtime::ErrorKind::Cancelled
+                                        {
+                                            SessionEvent::Stopped {
+                                                bytes_used: None,
+                                                detail: None,
+                                            }
+                                        } else {
+                                            SessionEvent::Failed(format!("image preparation failed: {error}; reconcile engine state before retrying"))
+                                        };
+                                        let _ = evt_tx2.try_send((panic_sid.clone(), event));
+                                        return;
+                                    }
+                                    if let Some(container) = cfg.container.as_mut() {
+                                        container.require_local_image = true;
+                                    }
+                                }
+                                if stop.load(Ordering::Relaxed) {
+                                    let _ = evt_tx2.try_send((
+                                        panic_sid.clone(),
+                                        SessionEvent::Stopped {
+                                            bytes_used: None,
+                                            detail: None,
+                                        },
+                                    ));
+                                    return;
+                                }
                                 runner(
                                     panic_sid.clone(),
                                     cfg,
@@ -2553,7 +2594,8 @@ impl SessionManager {
                                     capture_rx,
                                     metrics,
                                 );
-                            }));
+                            },
+                        ));
                         if let Err(payload) = outcome {
                             let text = panic_payload_text(payload.as_ref());
                             error!(
@@ -3183,6 +3225,7 @@ fn app_to_container(app: AppSpec, mounts: &MountPolicy) -> anyhow::Result<Option
         on_app_exit: app.on_app_exit,
         network: app.network,
         systempaths_unconfined: app.systempaths_unconfined,
+        require_local_image: false,
     }))
 }
 
@@ -5595,6 +5638,7 @@ mod tests {
             PendingAssignment {
                 cfg: assignment_config(EncoderChoice::Openh264, "software"),
                 assigned_at: Instant::now(),
+                preparation: None,
             },
         );
         mgr.handle_control(
@@ -5643,6 +5687,134 @@ mod tests {
         }
     }
 
+    #[test]
+    fn verified_assignment_preparation_requires_a_local_image_at_launch() {
+        use std::io::{Read, Write};
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("engine.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let engine = std::thread::spawn(move || {
+            for (path, body) in [
+                (
+                    "/version",
+                    r#"{"Version":"28.0.0","ApiVersion":"1.48","MinAPIVersion":"1.40"}"#,
+                ),
+                (
+                    "/v1.48/images/test/json",
+                    r#"{"Id":"sha256:fixture","Size":100}"#,
+                ),
+            ] {
+                let until = Instant::now() + Duration::from_secs(3);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < until =>
+                        {
+                            std::thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(e) => panic!("image preparation did not inspect: {e}"),
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                assert!(
+                    String::from_utf8_lossy(&request).starts_with(&format!("GET {path} HTTP/1.1"))
+                );
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let mut runtime_config = crate::runtime::RuntimeConfig::unix(socket_path);
+        runtime_config.image_state_path = Some(directory.path().join("operations"));
+        let runtime = crate::runtime::RuntimeClient::new(runtime_config).unwrap();
+        let observed = Arc::new(AtomicBool::new(false));
+        let result = observed.clone();
+        let (mut mgr, _refs) =
+            manager_with_runner(Arc::new(move |_, cfg, _, _, _, _, _, _, _, _| {
+                result.store(cfg.container.unwrap().require_local_image, Ordering::SeqCst);
+            }));
+        let mut cfg = assignment_config(EncoderChoice::Openh264, "software");
+        cfg.container = Some(ContainerSpec {
+            image: "test".into(),
+            ..Default::default()
+        });
+        mgr.pending.insert(
+            "prepared".into(),
+            PendingAssignment {
+                cfg,
+                assigned_at: Instant::now(),
+                preparation: Some(runtime.ensure_image("test", Duration::from_secs(2))),
+            },
+        );
+        let (tx, _rx) = mpsc::channel(8);
+        mgr.handle_control(
+            ControlMsg::SessionStart {
+                id: "start".into(),
+                session_id: "prepared".into(),
+            },
+            &tx,
+            &diagnostic_sender(),
+        );
+        wait_for_finished_thread(&mgr, "prepared");
+        engine.join().unwrap();
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "prepared assignment could implicitly pull through CLI"
+        );
+    }
+
+    #[test]
+    fn image_preparation_failure_prevents_the_session_runner_from_launching() {
+        let called = Arc::new(AtomicBool::new(false));
+        let observed = called.clone();
+        let (mut mgr, _refs) =
+            manager_with_runner(Arc::new(move |_, _, _, _, _, _, _, _, _, _| {
+                observed.store(true, Ordering::SeqCst);
+            }));
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = crate::runtime::RuntimeClient::new(crate::runtime::RuntimeConfig::unix(
+            directory.path().join("missing.sock"),
+        ))
+        .unwrap();
+        mgr.pending.insert(
+            "preparing".into(),
+            PendingAssignment {
+                cfg: assignment_config(EncoderChoice::Openh264, "software"),
+                assigned_at: Instant::now(),
+                preparation: Some(runtime.ensure_image("test", Duration::from_secs(2))),
+            },
+        );
+        let (tx, mut rx) = mpsc::channel(8);
+        mgr.handle_control(
+            ControlMsg::SessionStart {
+                id: "start".into(),
+                session_id: "preparing".into(),
+            },
+            &tx,
+            &diagnostic_sender(),
+        );
+        let event = recv_event_within(&mut rx, Duration::from_secs(3));
+        wait_for_finished_thread(&mgr, "preparing");
+        assert!(!called.load(Ordering::SeqCst));
+        assert!(
+            matches!(event,Some((_,SessionEvent::Failed(message))) if message.contains("image preparation failed"))
+        );
+    }
+
     /// #128: a new connection must not disturb the sessions the agent carried
     /// across the outage, and must drop the assignments it did not.
     #[test]
@@ -5666,6 +5838,7 @@ mod tests {
             PendingAssignment {
                 cfg: assignment_config(EncoderChoice::Openh264, "software"),
                 assigned_at: Instant::now(),
+                preparation: None,
             },
         );
         assert_eq!(mgr.pending.len(), 1, "setup: one pending assignment");
@@ -5834,6 +6007,7 @@ mod tests {
             PendingAssignment {
                 cfg: assignment_config(EncoderChoice::Openh264, "software"),
                 assigned_at: Instant::now(),
+                preparation: None,
             },
         );
         mgr.reconcile(Instant::now(), RUNNER_REAP_GRACE, PENDING_ASSIGNMENT_TTL);

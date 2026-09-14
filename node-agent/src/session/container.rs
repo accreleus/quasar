@@ -64,10 +64,6 @@ use crate::messages::AppExitPolicy;
 /// path surfaces it and the control plane can reap the reservation.
 const RUNTIME_CMD_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Image pulls legitimately take minutes (multi-GB layers) and run off the agent loop
-/// on a spawned thread, so this bound only guards a wedged daemon.
-const RUNTIME_PULL_TIMEOUT: Duration = Duration::from_secs(600);
-
 /// Per-stream cap on captured child stdout/stderr, so a pathological runtime cannot
 /// flood the agent's memory. It is a RETENTION cap only: the reader keeps draining past
 /// it and discards the excess (#194). Stopping at the cap would refill the pipe and
@@ -648,39 +644,6 @@ impl ContainerRuntime {
         None
     }
 
-    /// Pull the image, on `session_assign` so `session_start` is fast (the
-    /// reserve→prepare→go-live split). Idempotent; a present image is a no-op.
-    ///
-    /// Must inspect before pulling: a locally-built image has no registry to pull from,
-    /// so a plain `docker pull` fails with "pull access denied" even though the image is
-    /// present, turning the intended no-op into a spurious assign-time warning.
-    pub fn pull(&self, image: &str) -> Result<()> {
-        let present = output_with_timeout(
-            Command::new(&self.bin).args(["image", "inspect", image]),
-            "image inspect",
-        )
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-        if present {
-            tracing::debug!("image {image} already present locally — skipping pull");
-            return Ok(());
-        }
-        tracing::info!("pulling image {image} via {}", self.bin);
-        let out = output_with_deadline(
-            Command::new(&self.bin).args(["pull", image]),
-            "image pull",
-            RUNTIME_PULL_TIMEOUT,
-        )?;
-        if !out.status.success() {
-            return Err(anyhow!(
-                "`{} pull {image}` failed: {}",
-                self.bin,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        Ok(())
-    }
-
     /// Deterministic container name for a session, so a stale container from a
     /// crashed prior run is found and removed before we launch (no orphans, no
     /// name collision). Docker names allow `[a-zA-Z0-9_.-]`; a UUID qualifies.
@@ -840,6 +803,10 @@ impl ContainerRuntime {
             "--shm-size".into(),
             std::env::var("QUASAR_APP_SHM_SIZE").unwrap_or_else(|_| "1g".into()),
         ]);
+
+        if spec.require_local_image {
+            args.push("--pull=never".into());
+        }
 
         // Both privilege opt-outs below ride the wire, so a catalog manifest chooses
         // them. `deny` makes this host ignore both and keep the hardened posture, for
@@ -1157,24 +1124,9 @@ impl ContainerRuntime {
         })
     }
 
-    /// A `docker pull -- <image>` for a caller that wants to STREAM the pull's output
-    /// (the image-management P2 progress scraper) rather than take `pull`'s
-    /// wait-for-completion behaviour. Exists so the executable name resolves in one
-    /// place: a caller building its own `Command` would re-read
-    /// `QUASAR_CONTAINER_RUNTIME` and could drift. `--` ends option parsing so a ref can
-    /// never be read as a flag.
-    pub fn pull_command(&self, image: &str) -> Command {
-        let mut cmd = Command::new(&self.bin);
-        cmd.args(["pull", "--", image]);
-        cmd
-    }
-
-    /// The image-management P4 template-build command, the analogue of
-    /// [`Self::pull_command`] and resolving the runtime executable in the same single
-    /// place. `DOCKER_BUILDKIT=0` forces the classic builder so progress is the
-    /// line-oriented `Step N/M : ...` form the scraper parses. `--` ends option parsing
-    /// so the context path can never be read as a flag; each build arg is one argv
-    /// element (`K=V`), so a value cannot inject one either.
+    /// The remaining CLI template-build path, migrated separately in #232.
+    /// `DOCKER_BUILDKIT=0` keeps progress in classic `Step N/M` form.
+    /// Arguments are separate argv elements; `--` terminates option parsing.
     pub fn build_command(
         &self,
         local_tag: &str,
@@ -1410,6 +1362,9 @@ fn short_id(id: &str) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct ContainerSpec {
     pub image: String,
+    /// Internal launch policy after verified API preparation. Unmigrated swap,
+    /// warm-up and standalone callers retain their CLI policy until #237.
+    pub require_local_image: bool,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub mounts: Vec<String>,
@@ -1549,6 +1504,7 @@ impl ContainerSpec {
             // QUASAR_CONTAINER_NETWORK-else-none chain, and the profile knob stays off.
             network: None,
             systempaths_unconfined: false,
+            require_local_image: false,
         })
     }
 }
