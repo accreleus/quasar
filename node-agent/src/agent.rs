@@ -154,6 +154,10 @@ pub async fn run(cfg: Config) {
             Err(error) => warn!(token = "runtime-engine-unavailable", %error,
                 "engine discovery failed; check Docker Unix socket configuration and access"),
         }
+        if let Err(error) = crate::runtime::configured().and_then(|api| api.recover_diagnostics().wait()) {
+            warn!(token = "runtime-diagnostic-recovery-pending", %error,
+                "diagnostic recovery remains pending; host-path validation will retry before launching another helper");
+        }
         let swept = runtime.sweep_orphans(&[
             crate::session::container::SESSION_NAME_PREFIX,
             crate::session::audio::PULSE_NAME_PREFIX,

@@ -811,6 +811,28 @@ An absent image alone cannot establish that an old pull has stopped, and a chang
 removal target cannot authorize deleting its replacement. Those cases fail with
 `image operation outcome unknown` instead of repeating the mutation.
 
+The explicit NVIDIA host-path check uses an API-managed diagnostic helper. Its
+read-only bind names a **Docker daemon-host** directory, while the fresh marker is
+written through the agent's existing mount. The helper must read that marker and
+exit successfully before the path is accepted. It never creates the host directory,
+pulls an image implicitly, or falls back to the Docker CLI after an API error.
+
+Helper operations retain their identity and cleanup state in the `helpers`
+subdirectory of `<NODE_SECRET_PATH>.runtime-images`. Preserve that directory with
+the node identity. Recovery verifies the original owner, operation, requested
+configuration and immutable container ID before continuing. A missing response is
+not proof that Docker rejected a request; an uncertain operation blocks a fresh
+probe until it can be reconciled. Reconciliation errors separately report missing
+resources, access failures or engine unavailability without treating them as proof
+that an uncertain mutation was rejected. Stopped helpers retain final logs and exit evidence
+before explicit removal. Cleanup never requests volume deletion. Dropping an
+observer or disconnecting the control plane does not terminate a helper.
+An explicit stop request is recorded separately so recovery can finish it after a
+restart. Final results and completed-operation records prevent a disconnected
+caller from accidentally repeating an already completed operation. Each output
+stream retains up to 4 KiB of raw log bytes while consuming the stream to its end;
+requests that cannot leave room for the final evidence are rejected before create.
+
 Managed builds keep the classic builder (`version=1`, equivalent to the previous
 `DOCKER_BUILDKIT=0`), cache enabled, successful intermediate containers removed and
 failed intermediate containers retained. No BuildKit backend is introduced. The

@@ -4,6 +4,7 @@ use bollard::{errors::Error, Docker};
 use futures_util::StreamExt;
 mod build;
 mod credentials;
+pub(super) mod helpers;
 pub(super) use build::build as build_image;
 
 fn classify(error: Error) -> RuntimeError {

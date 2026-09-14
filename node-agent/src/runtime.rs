@@ -9,7 +9,13 @@ use tokio::sync::{watch, Semaphore};
 
 mod builds;
 mod docker;
+mod helpers;
 pub use builds::BuildRequest;
+pub use helpers::{
+    DiagnosticDevices, DiagnosticHelper, DiagnosticNetwork, DiagnosticRequirements, DiagnosticRun,
+    DiagnosticSecurity, HelperResult, OwnedHelperId, ReadOnlyHostBind,
+};
+pub(crate) use helpers::{HelperIntent, HelperJournal};
 mod images;
 pub use images::{ImageInfo, ImageOperation, ImageProgress};
 
@@ -17,6 +23,7 @@ pub use images::{ImageInfo, ImageOperation, ImageProgress};
 pub enum ErrorKind {
     InvalidConfiguration,
     PermissionDenied,
+    Missing,
     Unavailable,
     IncompatibleApi,
     Protocol,
@@ -37,16 +44,26 @@ pub enum ErrorKind {
 #[derive(Debug, Clone)]
 pub struct RuntimeError {
     pub kind: ErrorKind,
+    /// A sanitized read-only observation that explains why a mutation outcome
+    /// remains unknown. No daemon text or SDK type crosses this boundary.
+    pub reconciliation: Option<ErrorKind>,
 }
 impl std::fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "container runtime: {:?}", self.kind)
+        write!(f, "container runtime: {:?}", self.kind)?;
+        if let Some(reconciliation) = self.reconciliation {
+            write!(f, " (reconciliation: {:?})", reconciliation)?;
+        }
+        Ok(())
     }
 }
 impl std::error::Error for RuntimeError {}
 impl From<ErrorKind> for RuntimeError {
     fn from(kind: ErrorKind) -> Self {
-        Self { kind }
+        Self {
+            kind,
+            reconciliation: None,
+        }
     }
 }
 
@@ -57,6 +74,10 @@ pub struct RuntimeConfig {
     pub max_in_flight: usize,
     pub image_state_path: Option<PathBuf>,
     pub registry_config_path: Option<PathBuf>,
+    /// Test-only injection keeps HTTP fixtures independent of process-global
+    /// ownership state; production always resolves the persisted owner lease.
+    #[cfg(test)]
+    pub diagnostic_owner: Option<String>,
 }
 impl RuntimeConfig {
     pub fn unix(socket: impl Into<PathBuf>) -> Self {
@@ -66,6 +87,8 @@ impl RuntimeConfig {
             max_in_flight: 4,
             image_state_path: None,
             registry_config_path: None,
+            #[cfg(test)]
+            diagnostic_owner: None,
         }
     }
 
@@ -316,6 +339,59 @@ impl RuntimeClient {
         let config = self.config.clone();
         self.submit(async move { docker::discover(&config).await.map(|(_, info)| info) })
     }
+
+    /// Create and explicitly start one owned diagnostic helper. Dropping the
+    /// returned operation detaches its observer; it never stops the helper.
+    pub fn run_diagnostic(
+        &self,
+        helper: DiagnosticHelper,
+        run: DiagnosticRun,
+    ) -> Operation<OwnedHelperId> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::helpers::run(&config, helper, run).await },
+            self.config.deadline,
+            true,
+        )
+    }
+
+    /// Wait for a helper and collect its final bounded logs. Cancellation only
+    /// stops this observation; `stop_diagnostic` owns termination.
+    pub fn observe_diagnostic(&self, id: OwnedHelperId) -> Operation<HelperResult> {
+        let config = self.config.clone();
+        self.submit(async move { docker::helpers::observe(&config, id).await })
+    }
+
+    pub fn stop_diagnostic(&self, id: OwnedHelperId) -> Operation<()> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::helpers::stop(&config, id).await },
+            self.config.deadline,
+            true,
+        )
+    }
+
+    /// Preserve final logs and exit evidence before removing the owned
+    /// container. This operation never force-removes containers or volumes.
+    pub fn cleanup_diagnostic(&self, id: OwnedHelperId) -> Operation<()> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::helpers::cleanup(&config, id).await },
+            self.config.deadline,
+            true,
+        )
+    }
+
+    /// Recover durable helpers after agent restart. Unresolved records remain
+    /// on disk and the returned error blocks a fresh probe.
+    pub fn recover_diagnostics(&self) -> Operation<()> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::helpers::recover(&config).await },
+            self.config.deadline,
+            true,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -346,6 +422,18 @@ mod tests {
                     socket.read_exact(&mut byte).unwrap();
                     request.push(byte[0]);
                 }
+                let body_length = String::from_utf8_lossy(&request)
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if body_length > 0 {
+                    let mut body = vec![0; body_length];
+                    socket.read_exact(&mut body).unwrap();
+                }
                 let expected =
                     if expected_path.starts_with("POST ") || expected_path.starts_with("DELETE ") {
                         expected_path.to_owned()
@@ -360,7 +448,9 @@ mod tests {
                 write!(socket, "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
         });
-        let client = RuntimeClient::new(RuntimeConfig::unix(path)).unwrap();
+        let mut config = RuntimeConfig::unix(path);
+        config.image_state_path = Some(dir.path().join("operations"));
+        let client = RuntimeClient::new(config).unwrap();
         (dir, client, thread)
     }
 
@@ -685,3 +775,6 @@ mod image_tests;
 
 #[cfg(test)]
 mod build_tests;
+
+#[cfg(test)]
+mod helper_tests;
