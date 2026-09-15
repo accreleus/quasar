@@ -1,0 +1,551 @@
+{
+  "stages": {
+    "baseline": {
+      "amd": {
+        "media": {
+          "content_luma": 127.69,
+          "audio_passed": true,
+          "encoder": "vah264enc",
+          "teardown_seconds": 12.777,
+          "terminal_state": "stopped",
+          "remaining_containers": [],
+          "remaining_paths": []
+        },
+        "input": {
+          "content_luma": 72.91,
+          "audio_passed": true,
+          "encoder": "vah264enc",
+          "teardown_seconds": 12.157,
+          "terminal_state": "stopped",
+          "remaining_containers": [],
+          "remaining_paths": [],
+          "mouse_selection_passed": true,
+          "application_received": "quasar"
+        },
+        "nativegpu": {
+          "content_luma": 59.75,
+          "audio_passed": true,
+          "encoder": "vah264enc",
+          "teardown_seconds": 11.549,
+          "terminal_state": "stopped",
+          "remaining_containers": [],
+          "remaining_paths": [],
+          "renderer": "AMD Radeon Graphics (RADV RENOIR)",
+          "renderer_type": "IntegratedGpu"
+        },
+        "concurrent": {
+          "passed": true,
+          "distinct_session_mounts": true,
+          "teardown_seconds": [
+            10.881,
+            10.705
+          ]
+        },
+        "swap": {
+          "passed": true,
+          "swaps": [
+            {
+              "no_running_overlap": true,
+              "same_home": true,
+              "old_generation_absent_when_replacement_accepted": true
+            },
+            {
+              "no_running_overlap": true,
+              "same_home": false,
+              "old_generation_absent_when_replacement_accepted": true
+            },
+            {
+              "no_running_overlap": true,
+              "same_home": true,
+              "old_generation_absent_when_replacement_accepted": true
+            }
+          ],
+          "browser_passed": true,
+          "teardown_seconds": 13.616
+        },
+        "failedswap": {
+          "passed": true,
+          "rollback_detail": "swap failed; rolled back: replacement app produced no frame within 45s (app_surface_commits=Some(0)); previous app was restarted",
+          "seconds_from_swap_request_to_rollback": 59.09,
+          "replacement_observed_by_sampling": null,
+          "replacement_exit_reported_by_its_own_generation": null,
+          "exit_lines_for_session": 1,
+          "browser_passed": true,
+          "teardown_seconds": 11.124
+        },
+        "warmup": {
+          "passed": true,
+          "run": {
+            "mib": 2632,
+            "bytes": 2759894789,
+            "files": 23696,
+            "version": "2026.09.02",
+            "image_id": "steam",
+            "elapsed_secs": 251,
+            "presented_after_ms": 90080
+          },
+          "template_meta": {
+            "image_id": "steam",
+            "version": "2026.09.02",
+            "digest": "",
+            "built_at": 1789513650,
+            "bytes": 2759894789,
+            "files": 23696,
+            "agent_version": "dev",
+            "schema": 1
+          },
+          "staging_entries_after_publish": 0,
+          "preparation": {
+            "state": "ready",
+            "reason": "none",
+            "detail": "Matching sanitized template published",
+            "template": {
+              "registry_ref": "ghcr.io/accreleus/quasar-steam@sha256:586c67412921821287a5cf68c390aebbaf00fc750ce390170f219b465460bde5",
+              "version": "2026.09.02"
+            },
+            "clone_mode": "copy"
+          },
+          "presented_after_ms": 90080,
+          "cell_seconds": 281.984
+        }
+      },
+      "nvidia": {
+        "media": {
+          "content_luma": 127.26,
+          "audio_passed": true,
+          "encoder": "vulkanh264enc",
+          "teardown_seconds": 11.088,
+          "terminal_state": "stopped",
+          "remaining_containers": [],
+          "remaining_paths": []
+        },
+        "input": {
+          "content_luma": 64.85,
+          "audio_passed": true,
+          "encoder": "vulkanh264enc",
+          "teardown_seconds": 11.101,
+          "terminal_state": "stopped",
+          "remaining_containers": [],
+          "remaining_paths": [],
+          "mouse_selection_passed": true,
+          "application_received": "quasar"
+        },
+        "nativegpu": {
+          "content_luma": 55.99,
+          "audio_passed": true,
+          "encoder": "vulkanh264enc",
+          "teardown_seconds": 11.215,
+          "terminal_state": "stopped",
+          "remaining_containers": [],
+          "remaining_paths": [],
+          "renderer": "NVIDIA GeForce RTX 5090",
+          "renderer_type": "DiscreteGpu"
+        },
+        "concurrent": {
+          "passed": true,
+          "distinct_session_mounts": true,
+          "teardown_seconds": [
+            2.848,
+            10.746
+          ]
+        },
+        "swap": {
+          "passed": true,
+          "swaps": [
+            {
+              "no_running_overlap": true,
+              "same_home": true,
+              "old_generation_absent_when_replacement_accepted": true
+            },
+            {
+              "no_running_overlap": true,
+              "same_home": false,
+              "old_generation_absent_when_replacement_accepted": true
+            },
+            {
+              "no_running_overlap": true,
+              "same_home": true,
+              "old_generation_absent_when_replacement_accepted": true
+            }
+          ],
+          "browser_passed": true,
+          "teardown_seconds": 10.901
+        },
+        "failedswap": {
+          "passed": true,
+          "rollback_detail": "swap failed; rolled back: replacement app produced no frame within 45s (app_surface_commits=Some(0)); previous app was restarted",
+          "seconds_from_swap_request_to_rollback": 56.696,
+          "replacement_observed_by_sampling": null,
+          "replacement_exit_reported_by_its_own_generation": null,
+          "exit_lines_for_session": 1,
+          "browser_passed": true,
+          "teardown_seconds": 11.047,
+          "cell_seconds": 134.126
+        },
+        "warmup": {
+          "passed": true,
+          "run": {
+            "mib": 2632,
+            "bytes": 2759891296,
+            "files": 23701,
+            "version": "2026.09.02",
+            "image_id": "steam",
+            "elapsed_secs": 125,
+            "presented_after_ms": 37289
+          },
+          "template_meta": {
+            "image_id": "steam",
+            "version": "2026.09.02",
+            "digest": "",
+            "built_at": 1789512340,
+            "bytes": 2759891296,
+            "files": 23701,
+            "agent_version": "dev",
+            "schema": 1
+          },
+          "staging_entries_after_publish": 0,
+          "preparation": {
+            "state": "ready",
+            "reason": "none",
+            "detail": "Matching sanitized template published",
+            "template": {
+              "registry_ref": "ghcr.io/accreleus/quasar-steam@sha256:586c67412921821287a5cf68c390aebbaf00fc750ce390170f219b465460bde5",
+              "version": "2026.09.02"
+            },
+            "clone_mode": "reflink"
+          },
+          "presented_after_ms": 37289,
+          "cell_seconds": 161.734
+        }
+      }
+    },
+    "candidate": {
+      "amd": {
+        "media": {
+          "content_luma": 127.44,
+          "audio_passed": true,
+          "encoder": "vah264enc",
+          "teardown_seconds": 12.664,
+          "terminal_state": "stopped",
+          "remaining_containers": [],
+          "remaining_paths": []
+        },
+        "input": {
+          "content_luma": 72.91,
+          "audio_passed": true,
+          "encoder": "vah264enc",
+          "teardown_seconds": 12.628,
+          "terminal_state": "stopped",
+          "remaining_containers": [],
+          "remaining_paths": [],
+          "mouse_selection_passed": true,
+          "application_received": "quasar"
+        },
+        "nativegpu": {
+          "content_luma": 59.63,
+          "audio_passed": true,
+          "encoder": "vah264enc",
+          "teardown_seconds": 12.636,
+          "terminal_state": "stopped",
+          "remaining_containers": [],
+          "remaining_paths": [],
+          "renderer": "AMD Radeon Graphics (RADV RENOIR)",
+          "renderer_type": "IntegratedGpu"
+        },
+        "concurrent": {
+          "passed": true,
+          "distinct_session_mounts": true,
+          "teardown_seconds": [
+            10.782,
+            11.237
+          ],
+          "cell_seconds": 53.03
+        },
+        "swap": {
+          "passed": true,
+          "swaps": [
+            {
+              "no_running_overlap": true,
+              "same_home": true,
+              "old_generation_absent_when_replacement_accepted": true
+            },
+            {
+              "no_running_overlap": true,
+              "same_home": false,
+              "old_generation_absent_when_replacement_accepted": true
+            },
+            {
+              "no_running_overlap": true,
+              "same_home": true,
+              "old_generation_absent_when_replacement_accepted": true
+            }
+          ],
+          "browser_passed": true,
+          "teardown_seconds": 11.355,
+          "cell_seconds": 102.709
+        },
+        "failedswap": {
+          "passed": true,
+          "rollback_detail": "swap failed; rolled back: replacement app exited before presenting (Code(37)); previous app was restarted",
+          "seconds_from_swap_request_to_rollback": 11.269,
+          "replacement_observed_by_sampling": true,
+          "replacement_exit_reported_by_its_own_generation": true,
+          "exit_lines_for_session": 1,
+          "browser_passed": true,
+          "teardown_seconds": 11.084,
+          "cell_seconds": 131.148
+        },
+        "warmup": {
+          "passed": true,
+          "run": {
+            "mib": 2632,
+            "bytes": 2759890732,
+            "files": 23696,
+            "version": "2026.09.02",
+            "image_id": "steam",
+            "elapsed_secs": 216,
+            "presented_after_ms": 84583
+          },
+          "template_meta": {
+            "image_id": "steam",
+            "version": "2026.09.02",
+            "digest": "",
+            "built_at": 1789514651,
+            "bytes": 2759890732,
+            "files": 23696,
+            "agent_version": "dev",
+            "schema": 1
+          },
+          "staging_entries_after_publish": 0,
+          "preparation": {
+            "state": "ready",
+            "reason": "none",
+            "detail": "Matching sanitized template published",
+            "template": {
+              "registry_ref": "ghcr.io/accreleus/quasar-steam@sha256:586c67412921821287a5cf68c390aebbaf00fc750ce390170f219b465460bde5",
+              "version": "2026.09.02"
+            },
+            "clone_mode": "copy"
+          },
+          "presented_after_ms": 84583,
+          "cell_seconds": 259.409
+        }
+      },
+      "nvidia": {
+        "media": {
+          "content_luma": 127.26,
+          "audio_passed": true,
+          "encoder": "vulkanh264enc",
+          "teardown_seconds": 10.827,
+          "terminal_state": "stopped",
+          "remaining_containers": [],
+          "remaining_paths": []
+        },
+        "input": {
+          "content_luma": 64.85,
+          "audio_passed": true,
+          "encoder": "vulkanh264enc",
+          "teardown_seconds": 11.062,
+          "terminal_state": "stopped",
+          "remaining_containers": [],
+          "remaining_paths": [],
+          "mouse_selection_passed": true,
+          "application_received": "quasar"
+        },
+        "nativegpu": {
+          "content_luma": 55.91,
+          "audio_passed": true,
+          "encoder": "vulkanh264enc",
+          "teardown_seconds": 11.134,
+          "terminal_state": "stopped",
+          "remaining_containers": [],
+          "remaining_paths": [],
+          "renderer": "NVIDIA GeForce RTX 5090",
+          "renderer_type": "DiscreteGpu"
+        },
+        "concurrent": {
+          "passed": true,
+          "distinct_session_mounts": true,
+          "teardown_seconds": [
+            10.934,
+            11.138
+          ]
+        },
+        "swap": {
+          "passed": true,
+          "swaps": [
+            {
+              "no_running_overlap": true,
+              "same_home": true,
+              "old_generation_absent_when_replacement_accepted": true
+            },
+            {
+              "no_running_overlap": true,
+              "same_home": false,
+              "old_generation_absent_when_replacement_accepted": true
+            },
+            {
+              "no_running_overlap": true,
+              "same_home": true,
+              "old_generation_absent_when_replacement_accepted": true
+            }
+          ],
+          "browser_passed": true,
+          "teardown_seconds": 4.484
+        },
+        "failedswap": {
+          "passed": true,
+          "rollback_detail": "swap failed; rolled back: replacement app exited before presenting (Code(37)); previous app was restarted",
+          "seconds_from_swap_request_to_rollback": 11.763,
+          "replacement_observed_by_sampling": false,
+          "replacement_exit_reported_by_its_own_generation": true,
+          "exit_lines_for_session": 1,
+          "browser_passed": true,
+          "teardown_seconds": 11.184,
+          "cell_seconds": 132.603
+        },
+        "warmup": {
+          "passed": true,
+          "run": {
+            "mib": 2632,
+            "bytes": 2759891494,
+            "files": 23701,
+            "version": "2026.09.02",
+            "image_id": "steam",
+            "elapsed_secs": 144,
+            "presented_after_ms": 39790
+          },
+          "template_meta": {
+            "image_id": "steam",
+            "version": "2026.09.02",
+            "digest": "",
+            "built_at": 1789514044,
+            "bytes": 2759891494,
+            "files": 23701,
+            "agent_version": "dev",
+            "schema": 1
+          },
+          "staging_entries_after_publish": 0,
+          "preparation": {
+            "state": "ready",
+            "reason": "none",
+            "detail": "Matching sanitized template published",
+            "template": {
+              "registry_ref": "ghcr.io/accreleus/quasar-steam@sha256:586c67412921821287a5cf68c390aebbaf00fc750ce390170f219b465460bde5",
+              "version": "2026.09.02"
+            },
+            "clone_mode": "reflink"
+          },
+          "presented_after_ms": 39790,
+          "cell_seconds": 191.106
+        }
+      }
+    }
+  },
+  "candidate": {
+    "tag": "quasar-node-agent:20260915-2256-rh01-237",
+    "image_id": "sha256:1b862aa3c5b67baf0e79b2fe5f77702d112ec6b574729e6015e54f528c893d68",
+    "source_commit": "e1d551c9f5595bdfb275a62c03187a21f18a85ec"
+  },
+  "deployment": {
+    "amd": {
+      "reviewed_source": "e1d551c9f5595bdfb275a62c03187a21f18a85ec",
+      "image_id": "sha256:1b862aa3c5b67baf0e79b2fe5f77702d112ec6b574729e6015e54f528c893d68",
+      "image_tag": "quasar-node-agent:20260915-2256-rh01-237",
+      "idle": true,
+      "before_image_tag": "quasar-node-agent:20260915-1615-rh01-236",
+      "mounts_preserved": true,
+      "environment_preserved": true,
+      "running": true
+    },
+    "nvidia": {
+      "reviewed_source": "e1d551c9f5595bdfb275a62c03187a21f18a85ec",
+      "image_id": "sha256:1b862aa3c5b67baf0e79b2fe5f77702d112ec6b574729e6015e54f528c893d68",
+      "image_tag": "quasar-node-agent:20260915-2256-rh01-237",
+      "idle": true,
+      "before_image_tag": "quasar-node-agent:20260915-1615-rh01-236",
+      "mounts_preserved": true,
+      "environment_preserved": true,
+      "running": true
+    }
+  },
+  "contracts": {
+    "amd": {
+      "image": "quasar-node-agent:20260915-2256-rh01-237",
+      "gpu_attached": true,
+      "passed": 145,
+      "failed": 0,
+      "verdict": "PASS",
+      "gpu_skipped_elements": []
+    },
+    "nvidia": {
+      "image": "quasar-node-agent:20260915-2256-rh01-237",
+      "gpu_attached": true,
+      "passed": 141,
+      "failed": 0,
+      "verdict": "PASS",
+      "gpu_skipped_elements": []
+    }
+  },
+  "build": {
+    "generation": "20260915-2256-rh01-237",
+    "source_commit": "e1d551c9f5595bdfb275a62c03187a21f18a85ec",
+    "source_dirty": false,
+    "validated": true,
+    "build_seconds": 204
+  },
+  "amd_roots_change": {
+    "before_agent_id": "dcaf860c680a6228fc47045e3d15d7abe7c4933f1fd4db6ab60ab3f6bb6930b2",
+    "after_agent_id": "08dd61fa1bb0895564016c2cc74e4f7810071e569196747ecd2354f5ec18dcbe",
+    "image": "sha256:55a1bed3f9293f5cbb1a6f34d5aef25e95a8eac4c46611e92729b00ecf4e1540",
+    "env_delta": {
+      "QUASAR_HOME_TEMPLATES": [
+        null,
+        "1"
+      ],
+      "QUASAR_TEMPLATE_ROOT": [
+        "/tmp/q234-8e5ebb00-templates",
+        "/var/tmp/q237-8e5ebb00-templates"
+      ],
+      "QUASAR_TEMPLATE_WARMUP": [
+        null,
+        "1"
+      ],
+      "QUASAR_HOME_ROOT": [
+        "/tmp/q234-8e5ebb00-homes",
+        "/var/tmp/q237-8e5ebb00-homes"
+      ]
+    },
+    "mount_delta": [
+      [
+        "bind",
+        "/tmp/q234-8e5ebb00-homes",
+        "/tmp/q234-8e5ebb00-homes",
+        true
+      ],
+      [
+        "bind",
+        "/tmp/q234-8e5ebb00-templates",
+        "/tmp/q234-8e5ebb00-templates",
+        true
+      ],
+      [
+        "bind",
+        "/var/tmp/q237-8e5ebb00-homes",
+        "/var/tmp/q237-8e5ebb00-homes",
+        true
+      ],
+      [
+        "bind",
+        "/var/tmp/q237-8e5ebb00-templates",
+        "/var/tmp/q237-8e5ebb00-templates",
+        true
+      ]
+    ]
+  },
+  "bollard_version": "0.21.1",
+  "engine_versions": {
+    "amd": "Docker 29.8.0 / API 1.56 / Linux 7.0.0-31",
+    "nvidia": "Docker 29.7.2 / API 1.55 / Linux 7.1.7-200"
+  }
+}
