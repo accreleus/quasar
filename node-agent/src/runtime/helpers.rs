@@ -70,6 +70,24 @@ pub struct DiagnosticRun {
     pub bind: ReadOnlyHostBind,
 }
 
+/// The fixed, long-running PulseAudio sibling profile.  This is deliberately
+/// not a general container request: the only writable mount is the
+/// session-private socket directory and its environment is fixed by the
+/// profile.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AudioRun {
+    pub socket_dir: PathBuf,
+    pub entrypoint: Vec<String>,
+    pub command: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
+pub(crate) enum HelperProfile {
+    #[default]
+    Diagnostic,
+    Audio,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HelperResult {
     /// `None` is deliberately unknown; it is never converted into success.
@@ -80,6 +98,10 @@ pub struct HelperResult {
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub(crate) enum HelperPhase {
+    /// Audio-only: durable directory preparation before any Docker create can
+    /// have been submitted.  This makes a marker-creation interruption
+    /// conclusively local rather than an unknown daemon mutation.
+    Preparing,
     Creating,
     Created,
     Starting,
@@ -102,6 +124,22 @@ pub(crate) struct HelperIntent {
     pub request_fingerprint: String,
     #[serde(default)]
     pub run: Option<DiagnosticRun>,
+    /// Kept separate from `run` so journals written by the diagnostic-only
+    /// implementation continue to decode as the diagnostic profile.
+    #[serde(default)]
+    pub profile: HelperProfile,
+    #[serde(default)]
+    pub audio: Option<AudioRun>,
+    #[serde(default)]
+    pub audio_dir_created: bool,
+    #[serde(default)]
+    pub audio_retired_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub audio_dir_device: Option<u64>,
+    #[serde(default)]
+    pub audio_dir_inode: Option<u64>,
+    #[serde(default)]
+    pub audio_dir_renamed: bool,
     #[serde(default = "default_phase")]
     pub phase: HelperPhase,
     #[serde(default)]

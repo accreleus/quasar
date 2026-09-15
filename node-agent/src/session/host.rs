@@ -78,7 +78,7 @@ impl SessionHost {
 
         // Both no-sidecar outcomes are recorded with a reason (rationale:
         // `SessionResources::prepare` in source.rs): `Err` means it could not
-        // start at all, `Ok(None)` means its socket never appeared. Either way
+        // start at all, `Ok(None)` means its socket never became ready. Either way
         // the session streams silence, and that must not be invisible.
         let mut audio_degraded: Option<String> = None;
         let pulse = if cfg.use_test_audio {
@@ -88,7 +88,7 @@ impl SessionHost {
                 Ok(Some(s)) => Some(s),
                 Ok(None) => {
                     audio_degraded = Some(
-                        "PulseAudio sidecar started but its socket never appeared".to_string(),
+                        "PulseAudio sidecar started but its socket never became ready".to_string(),
                     );
                     None
                 }

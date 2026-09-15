@@ -12,8 +12,8 @@ mod docker;
 mod helpers;
 pub use builds::BuildRequest;
 pub use helpers::{
-    DiagnosticDevices, DiagnosticHelper, DiagnosticNetwork, DiagnosticRequirements, DiagnosticRun,
-    DiagnosticSecurity, HelperResult, OwnedHelperId, ReadOnlyHostBind,
+    AudioRun, DiagnosticDevices, DiagnosticHelper, DiagnosticNetwork, DiagnosticRequirements,
+    DiagnosticRun, DiagnosticSecurity, HelperResult, OwnedHelperId, ReadOnlyHostBind,
 };
 pub(crate) use helpers::{HelperIntent, HelperJournal};
 mod images;
@@ -178,7 +178,12 @@ pub(crate) fn configured() -> Result<&'static RuntimeClient, RuntimeError> {
     CLIENT
         .get_or_init(|| {
             let mut config = RuntimeConfig::from_environment()?;
-            config.image_state_path = IMAGE_STATE_PATH.get().cloned();
+            config.image_state_path = IMAGE_STATE_PATH.get().cloned().or_else(|| {
+                Some(std::path::PathBuf::from(format!(
+                    "{}.runtime-images",
+                    crate::container_ownership::standalone_secret_path()
+                )))
+            });
             config.registry_config_path = std::env::var_os("DOCKER_CONFIG")
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from)
@@ -389,6 +394,66 @@ impl RuntimeClient {
         let config = self.config.clone();
         self.submit_owned(
             async move { docker::helpers::run(&config, helper, run).await },
+            self.config.deadline,
+            true,
+        )
+    }
+
+    /// Start a fixed-profile PulseAudio sibling.  The returned identity is
+    /// available while the daemon runs; observing it never terminates it.
+    pub fn run_audio_sidecar(
+        &self,
+        helper: DiagnosticHelper,
+        run: AudioRun,
+    ) -> Operation<OwnedHelperId> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::helpers::run_audio(&config, helper, run).await },
+            self.config.deadline,
+            true,
+        )
+    }
+
+    pub fn observe_audio_sidecar(&self, id: OwnedHelperId) -> Operation<HelperResult> {
+        self.observe_diagnostic(id)
+    }
+
+    pub fn stop_audio_sidecar(&self, id: OwnedHelperId) -> Operation<()> {
+        self.stop_diagnostic(id)
+    }
+
+    pub fn cleanup_audio_sidecar(&self, id: OwnedHelperId) -> Operation<()> {
+        self.cleanup_diagnostic(id)
+    }
+
+    /// Audio is intentionally excluded from routine diagnostic recovery:
+    /// startup migration owns explicit audio recovery and termination policy.
+    pub fn recover_audio_sidecars(&self) -> Operation<()> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::helpers::recover_audio(&config).await },
+            self.config.deadline,
+            true,
+        )
+    }
+
+    /// Boot-only retirement of journals left by a prior agent process.
+    pub fn retire_audio_sidecars(&self) -> Operation<()> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::helpers::retire_audio(&config).await },
+            self.config.deadline,
+            true,
+        )
+    }
+
+    /// Persist explicit abandonment of an audio launch whose start result was
+    /// lost, then reconcile and remove only that recorded operation.
+    pub fn abandon_audio_sidecar(&self, operation: impl Into<String>) -> Operation<()> {
+        let config = self.config.clone();
+        let operation = operation.into();
+        self.submit_owned(
+            async move { docker::helpers::abandon_audio(&config, &operation).await },
             self.config.deadline,
             true,
         )

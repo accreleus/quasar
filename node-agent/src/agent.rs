@@ -142,9 +142,9 @@ pub async fn run(cfg: Config) {
         format!("{}.runtime-images", cfg.node_secret_path).into(),
     );
 
-    // Startup orphan sweep (P2-06): `docker run --rm` survives a SIGKILL of the
-    // agent, so a prior run can leave session/pulse sibling containers behind.
-    // Best-effort — a sweep failure never blocks startup.
+    // A prior process can leave siblings behind after SIGKILL. Audio uses its
+    // journalled API lifecycle; the remaining application sweep stays CLI-owned.
+    // Best-effort — a cleanup failure never blocks startup.
     let (runtime, swept) = offload_probe(|| {
         let runtime = ContainerRuntime::from_env();
         match crate::runtime::configured().and_then(|api| api.discover().wait()) {
@@ -158,9 +158,14 @@ pub async fn run(cfg: Config) {
             warn!(token = "runtime-diagnostic-recovery-pending", %error,
                 "diagnostic recovery remains pending; host-path validation will retry before launching another helper");
         }
+        // This is boot-only retirement, after acquiring the persistent owner
+        // lease. Routine recovery never stops an active audio sibling.
+        if let Err(error) = crate::runtime::configured().and_then(|api| api.retire_audio_sidecars().wait()) {
+            warn!(token = "runtime-audio-retirement-pending", %error,
+                "previous audio cleanup remains journalled; retry runtime recovery when Docker is available");
+        }
         let swept = runtime.sweep_orphans(&[
             crate::session::container::SESSION_NAME_PREFIX,
-            crate::session::audio::PULSE_NAME_PREFIX,
         ]);
         (runtime, swept)
     })

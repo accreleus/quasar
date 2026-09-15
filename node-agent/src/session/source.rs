@@ -143,7 +143,7 @@ impl SessionResources {
                 Ok(Some(s)) => Some(s),
                 Ok(None) => {
                     audio_degraded = Some(
-                        "PulseAudio sidecar started but its socket never appeared".to_string(),
+                        "PulseAudio sidecar started but its socket never became ready".to_string(),
                     );
                     None
                 }

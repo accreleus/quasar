@@ -691,6 +691,15 @@ impl ContainerRuntime {
             Err(error) => return Err(error),
         };
         let value: serde_json::Value = serde_json::from_str(&output)?;
+        // Audio lifecycle and recovery belong exclusively to the runtime API.
+        // Even an old caller explicitly supplying the pulse prefix cannot bypass
+        // its durable cleanup journal. Legacy sidecars require operator review.
+        if value["Name"].as_str().is_some_and(|name| {
+            name.trim_start_matches('/')
+                .starts_with(super::audio::PULSE_NAME_PREFIX)
+        }) {
+            anyhow::bail!("Preserving audio container {target}: use runtime audio recovery");
+        }
         crate::container_ownership::owned_id(&value, owner, prefixes)
             .map(Some)
             .ok_or_else(|| anyhow!("Preserving container {target}: it is unowned, belongs to another agent, or has an unrelated name. Review legacy containers manually; this agent cannot remove them."))
@@ -2815,7 +2824,7 @@ mod tests {
         assert!(fuse_device_args(false).is_empty());
     }
     #[test]
-    fn orphan_sweep_independently_checks_owner_and_prefix_before_removing() {
+    fn orphan_sweep_preserves_api_audio_and_checks_application_owner() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("docker");
@@ -2851,10 +2860,10 @@ esac
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let runtime = ContainerRuntime::test_runtime(script.to_str().unwrap());
         let prefixes = [SESSION_NAME_PREFIX, super::super::audio::PULSE_NAME_PREFIX];
-        assert_eq!(runtime.sweep_orphans_for("one", &prefixes), 2);
+        assert_eq!(runtime.sweep_orphans_for("one", &prefixes), 1);
         assert_eq!(
             std::fs::read_to_string(&removed).unwrap(),
-            format!("{one}\n{pulse}\n")
+            format!("{one}\n")
         );
         std::fs::write(&removed, "").unwrap();
         assert_eq!(runtime.sweep_orphans_for("two", &prefixes), 1);

@@ -1733,3 +1733,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod audio_docker_tests;

@@ -27,11 +27,7 @@ pub(crate) fn initialize(secret_path: &str) -> Result<(), String> {
 /// diagnostic commands that launch no managed siblings never acquire ownership.
 pub(crate) fn token() -> Result<String, String> {
     if OWNER.get().is_none() {
-        let path = std::env::var("NODE_SECRET_PATH").unwrap_or_else(|_| {
-            let name =
-                std::env::var("NODE_NAME").unwrap_or_else(|_| crate::config::detect_hostname());
-            format!("/tmp/quasar-{name}-secret")
-        });
+        let path = standalone_secret_path();
         initialize(&path)?;
     }
     OWNER
@@ -40,6 +36,15 @@ pub(crate) fn token() -> Result<String, String> {
         .as_ref()
         .map(|owner| owner.token.clone())
         .map_err(Clone::clone)
+}
+
+/// Standalone session tools use the same identity and runtime-state namespace
+/// as their ownership lease. The normal agent supplies its configured path.
+pub(crate) fn standalone_secret_path() -> String {
+    std::env::var("NODE_SECRET_PATH").unwrap_or_else(|_| {
+        let name = std::env::var("NODE_NAME").unwrap_or_else(|_| crate::config::detect_hostname());
+        format!("/tmp/quasar-{name}-secret")
+    })
 }
 
 fn acquire(path: &Path) -> Result<Owner, String> {

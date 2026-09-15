@@ -17,6 +17,8 @@
 //   CHROME         path to Chrome-for-Testing binary
 //   SECS           measurement window in seconds (default 35)
 //   WARMUP         seconds to wait for decode before starting measurement (default 8)
+//   AUDIO_PROBE=1  require advancing audio RTP and nonzero decoded energy over 2s
+//                  (normal mode only; emit audio_probe evidence; exit 4 on failure)
 //   CONNECT_TIMEOUT_MS  millis before giving up on video decode (default 45000)
 //
 // Task-10 (adaptive external resolution harness) — HOLD MODE, CLI flags:
@@ -61,6 +63,9 @@ function parseCliArgs(argv) {
 }
 const CLI_ARGS = parseCliArgs(process.argv);
 const HOLD_SECS = Number.isFinite(CLI_ARGS.hold) ? CLI_ARGS.hold : 0;
+if (process.env.AUDIO_PROBE === '1' && HOLD_SECS > 0) {
+  throw new Error('AUDIO_PROBE requires normal measurement mode, not --hold');
+}
 const PROBE_EVERY_MS = Number.isFinite(CLI_ARGS.probeEvery) ? CLI_ARGS.probeEvery : 1000;
 
 // Import playwright-core from the T8 driver dir where it was npm-installed.
@@ -1028,7 +1033,46 @@ console.error(`[peer-driver] ice: ${JSON.stringify(iceDiagnostics)}`);
 // ── end QICE_MARKER ─────────────────────────────────────────────────────────
 
 
+// Optional #234 acceptance: silence also sends RTP, so require decoded energy
+// from the same inbound stream, not merely a negotiated audio m-line.
+const audioProbe = process.env.AUDIO_PROBE === '1' ? await page.evaluate(async () => {
+  async function sample() {
+    const streams = [];
+    for (const [peer, pc] of (window.__quasarHarnessPCs || []).entries()) {
+      const live = pc.getReceivers().some((receiver) =>
+        receiver.track?.kind === 'audio' && receiver.track.readyState === 'live');
+      const stats = await pc.getStats();
+      stats.forEach((stat) => {
+        if (stat.type !== 'inbound-rtp' || (stat.kind ?? stat.mediaType) !== 'audio') return;
+        streams.push({ peer, id: stat.id, state: pc.connectionState, live,
+          bytes: stat.bytesReceived ?? null, packets: stat.packetsReceived ?? null,
+          duration: stat.totalSamplesDuration ?? null, energy: stat.totalAudioEnergy ?? null });
+      });
+    }
+    return streams;
+  }
+  const before = await sample();
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+  const after = await sample();
+  const receivedTone = after.some((last) => {
+    const first = before.find((entry) => entry.peer === last.peer && entry.id === last.id);
+    return first && last.live && last.state === 'connected' &&
+      ['bytes', 'packets', 'duration', 'energy'].every((key) =>
+        Number.isFinite(first[key]) && Number.isFinite(last[key]) && last[key] > first[key]);
+  });
+  const playback = Array.from(document.querySelectorAll('audio'))
+    .map((element) => ({ paused: element.paused, muted: element.muted,
+      volume: element.volume, readyState: element.readyState,
+      live: element.srcObject instanceof MediaStream && element.srcObject.getAudioTracks()
+        .some((track) => track.readyState === 'live'),
+      error: element.error?.code ?? null }));
+  const playing = playback.some((element) => element.live && !element.paused &&
+    !element.muted && element.volume > 0 && element.readyState >= 2 && element.error === null);
+  return { passed: receivedTone && playing, receivedTone, playing, before, after, playback };
+}) : null;
+
 const result = {
+  ...(audioProbe ? { audio_probe: audioProbe } : {}),
   ice: iceDiagnostics,
   ice_elapsed_s: +((Date.now() - t0) / 1000).toFixed(2),
   ...(BENCH_MODE ? { bench } : {}),
@@ -1065,3 +1109,5 @@ const result = {
 
 console.log(JSON.stringify(result));
 await browser.close();
+
+if (audioProbe && !audioProbe.passed) process.exitCode = 4;

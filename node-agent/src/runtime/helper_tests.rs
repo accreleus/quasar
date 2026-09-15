@@ -1,5 +1,6 @@
 //! Behavioral engine fixtures at the public RuntimeClient boundary.
 use super::*;
+use crate::runtime::helpers::HelperPhase;
 use serde_json::{json, Value};
 use std::{
     io::{Read, Write},
@@ -185,7 +186,7 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
         }
     } else if method == "GET" && route.ends_with("/json") {
         if let Some(body) = &s.body {
-            let mounts: Vec<Value> = body["HostConfig"]["Mounts"].as_array().into_iter().flatten().map(|mount| json!({"Type":"bind","Source":mount["Source"],"Destination":mount["Target"],"RW":false})).collect();
+            let mounts: Vec<Value> = body["HostConfig"]["Mounts"].as_array().into_iter().flatten().map(|mount| json!({"Type":"bind","Source":mount["Source"],"Destination":mount["Target"],"RW":!mount["ReadOnly"].as_bool().unwrap_or(false)})).collect();
             let mut host_config = body["HostConfig"].clone();
             if let Some(mounts) = &s.host_mount_override {
                 host_config["Mounts"] = mounts.clone();
@@ -292,6 +293,714 @@ fn request() -> (DiagnosticHelper, DiagnosticRun) {
             },
         },
     )
+}
+
+fn audio_request(engine: &Engine) -> (DiagnosticHelper, AudioRun) {
+    let socket_dir = engine
+        .config
+        .image_state_path
+        .as_ref()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("pulse-fixture");
+    (
+        DiagnosticHelper {
+            operation: "pulse-fixture".into(),
+            name: "quasar-pulse-fixture".into(),
+            image: "quasar-agent:test".into(),
+        },
+        AudioRun {
+            socket_dir: socket_dir.clone(),
+            entrypoint: vec!["pulseaudio".into()],
+            command: vec![
+                "--daemonize=no".into(),
+                "--system=no".into(),
+                "--disable-shm=true".into(),
+                "--exit-idle-time=-1".into(),
+                "--log-target=stderr".into(),
+                "-n".into(),
+                "--load=module-null-sink sink_name=quasar_output".into(),
+                "--load=module-null-sink sink_name=quasar_mic".into(),
+                "--load=module-remap-source master=quasar_mic.monitor source_name=quasar_mic_src"
+                    .into(),
+                format!(
+                    "--load=module-native-protocol-unix socket={}/native auth-anonymous=1",
+                    socket_dir.display()
+                ),
+            ],
+        },
+    )
+}
+
+#[test]
+fn audio_sidecar_uses_the_fixed_writable_pulse_profile_at_the_public_boundary() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let (helper, run) = audio_request(&engine);
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    let body = engine.state.lock().unwrap().body.clone().unwrap();
+    assert_eq!(body["Entrypoint"], json!(["pulseaudio"]));
+    assert_eq!(body["HostConfig"]["NetworkMode"], json!("none"));
+    assert_eq!(body["HostConfig"]["ReadonlyRootfs"], json!(false));
+    assert_eq!(body["HostConfig"]["CapDrop"], json!(["ALL"]));
+    assert_eq!(
+        body["HostConfig"]["SecurityOpt"],
+        json!(["no-new-privileges"])
+    );
+    assert_eq!(body["HostConfig"]["PidsLimit"], json!(512));
+    assert_eq!(body["Healthcheck"]["Test"], json!(["NONE"]));
+    let socket = engine
+        .config
+        .image_state_path
+        .as_ref()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("pulse-fixture");
+    assert_eq!(
+        body["Env"],
+        json!([
+            format!("HOME={}", socket.display()),
+            format!("PULSE_RUNTIME_PATH={}/.runtime", socket.display())
+        ])
+    );
+    assert_eq!(body["HostConfig"]["Mounts"][0]["Source"], json!(socket));
+    assert_eq!(body["HostConfig"]["Mounts"][0]["Target"], json!(socket));
+    assert_eq!(body["HostConfig"]["Mounts"][0]["ReadOnly"], json!(false));
+    assert_eq!(
+        engine
+            .client()
+            .observe_audio_sidecar(id.clone())
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Timeout
+    );
+    engine.finish();
+    engine.client().cleanup_audio_sidecar(id).wait().unwrap();
+    assert!(
+        !socket.exists(),
+        "runtime removes only its marker-owned socket directory after confirmed container removal"
+    );
+}
+
+#[test]
+fn diagnostic_recovery_never_touches_a_running_audio_sidecar() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let (helper, run) = audio_request(&engine);
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    engine.client().recover_diagnostics().wait().unwrap();
+    assert!(engine.state.lock().unwrap().running);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 0);
+    engine.finish();
+    engine.client().cleanup_audio_sidecar(id).wait().unwrap();
+}
+
+#[test]
+fn audio_profile_accepts_dockers_omitted_false_read_only_field() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let (helper, run) = audio_request(&engine);
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    engine.state.lock().unwrap().body.as_mut().unwrap()["HostConfig"]["Mounts"][0]["ReadOnly"] =
+        Value::Null;
+    engine.finish();
+    engine.client().cleanup_audio_sidecar(id).wait().unwrap();
+}
+
+#[test]
+fn audio_cleanup_retires_populated_directory_and_never_touches_a_replacement_source() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let (helper, run) = audio_request(&engine);
+    let socket = run.socket_dir.clone();
+    let retired = socket
+        .parent()
+        .unwrap()
+        .join(".quasar-audio-retired-pulse-fixture");
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    std::fs::create_dir(socket.join(".runtime")).unwrap();
+    std::fs::create_dir(socket.join(".config")).unwrap();
+    std::fs::write(socket.join("native"), b"socket payload").unwrap();
+    // A symlink payload is rejected after the source is renamed, retaining the
+    // persisted tombstone identity for an explicit retry.
+    std::os::unix::fs::symlink("/tmp", socket.join("unsafe")).unwrap();
+    engine.finish();
+    assert!(engine
+        .client()
+        .cleanup_audio_sidecar(id.clone())
+        .wait()
+        .is_err());
+    assert!(!socket.exists());
+    assert!(retired.exists());
+    std::fs::create_dir(&socket).unwrap();
+    std::fs::write(socket.join("replacement"), b"do not remove").unwrap();
+    std::fs::remove_file(retired.join("unsafe")).unwrap();
+    engine.client().cleanup_audio_sidecar(id).wait().unwrap();
+    assert_eq!(
+        std::fs::read(socket.join("replacement")).unwrap(),
+        b"do not remove"
+    );
+    assert!(!retired.exists());
+}
+
+#[test]
+fn audio_lost_create_is_abandoned_through_its_recorded_operation_only() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().lose_create = true;
+    let (helper, run) = audio_request(&engine);
+    assert_eq!(
+        engine
+            .client()
+            .run_audio_sidecar(helper.clone(), run)
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    engine
+        .client()
+        .abandon_audio_sidecar(helper.operation)
+        .wait()
+        .unwrap();
+    assert_eq!(engine.requests("POST /containers/create"), 1);
+    assert!(engine.state.lock().unwrap().body.is_none());
+}
+
+#[test]
+fn audio_lost_remove_retries_tombstone_cleanup_without_touching_a_replacement() {
+    let engine = Engine::new();
+    let (helper, run) = audio_request(&engine);
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    engine.state.lock().unwrap().lose_remove = true;
+    assert_eq!(
+        engine
+            .client()
+            .cleanup_audio_sidecar(id.clone())
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    engine.client().cleanup_audio_sidecar(id).wait().unwrap();
+}
+
+#[test]
+fn ordinary_audio_recovery_preserves_live_work_but_boot_retirement_stops_it() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let (helper, run) = audio_request(&engine);
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    engine.client().recover_audio_sidecars().wait().unwrap();
+    assert!(engine.state.lock().unwrap().running);
+    engine.client().retire_audio_sidecars().wait().unwrap();
+    assert!(!engine.state.lock().unwrap().running);
+    assert_eq!(
+        engine
+            .client()
+            .observe_audio_sidecar(id)
+            .wait()
+            .unwrap()
+            .exit_code,
+        Some(23)
+    );
+}
+
+#[test]
+fn audio_socket_directory_collision_is_preserved_without_a_container_mutation() {
+    let engine = Engine::new();
+    let (helper, run) = audio_request(&engine);
+    std::fs::create_dir(&run.socket_dir).unwrap();
+    std::fs::write(run.socket_dir.join("foreign"), b"keep").unwrap();
+    assert_eq!(
+        engine
+            .client()
+            .run_audio_sidecar(helper, run.clone())
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    assert_eq!(
+        std::fs::read(run.socket_dir.join("foreign")).unwrap(),
+        b"keep"
+    );
+    assert_eq!(engine.requests("POST /containers/create"), 0);
+}
+
+#[test]
+fn audio_profile_initializes_a_missing_parent_without_removing_it_on_cleanup() {
+    let engine = Engine::new();
+    let (helper, mut run) = audio_request(&engine);
+    let parent = run.socket_dir.parent().unwrap().join("missing-parent");
+    run.socket_dir = parent.join("pulse-fixture");
+    *run.command.last_mut().unwrap() = format!(
+        "--load=module-native-protocol-unix socket={}/native auth-anonymous=1",
+        run.socket_dir.display()
+    );
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    assert!(parent.exists());
+    engine.client().cleanup_audio_sidecar(id).wait().unwrap();
+    assert!(parent.exists());
+}
+
+fn rewrite_helper_intent(engine: &Engine, operation: &str, change: impl FnOnce(&mut HelperIntent)) {
+    let path = helper_intent_path(engine, operation);
+    let mut intent: HelperIntent = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    change(&mut intent);
+    std::fs::write(path, serde_json::to_vec(&intent).unwrap()).unwrap();
+}
+
+fn helper_intent_path(engine: &Engine, operation: &str) -> std::path::PathBuf {
+    let helpers = engine
+        .config
+        .image_state_path
+        .as_ref()
+        .unwrap()
+        .join("helpers");
+    std::fs::read_dir(helpers)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            std::fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<HelperIntent>(&bytes).ok())
+                .is_some_and(|intent| intent.operation == operation)
+        })
+        .unwrap()
+}
+
+fn helper_intent(engine: &Engine, operation: &str) -> HelperIntent {
+    serde_json::from_slice(&std::fs::read(helper_intent_path(engine, operation)).unwrap()).unwrap()
+}
+
+#[test]
+fn preparing_before_rename_reconciles_original_and_never_removes_a_replacement() {
+    use std::os::unix::fs::MetadataExt;
+    let engine = Engine::new();
+    let (helper, run) = audio_request(&engine);
+    let operation = helper.operation.clone();
+    let socket = run.socket_dir.clone();
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    let metadata = std::fs::metadata(&socket).unwrap();
+    let retired = socket
+        .parent()
+        .unwrap()
+        .join(format!(".quasar-audio-retired-{operation}"));
+    rewrite_helper_intent(&engine, &operation, |intent| {
+        intent.phase = HelperPhase::Preparing;
+        intent.audio_dir_created = true;
+        intent.audio_retired_dir = Some(retired);
+        intent.audio_dir_device = Some(metadata.dev());
+        intent.audio_dir_inode = Some(metadata.ino());
+        intent.audio_dir_renamed = false;
+    });
+    engine.finish();
+    engine
+        .client()
+        .abandon_audio_sidecar(operation)
+        .wait()
+        .unwrap();
+    assert!(!socket.exists());
+    drop(id);
+}
+
+#[test]
+fn preparing_after_rename_retries_tombstone_without_touching_new_original() {
+    use std::os::unix::fs::MetadataExt;
+    let engine = Engine::new();
+    let (helper, run) = audio_request(&engine);
+    let operation = helper.operation.clone();
+    let socket = run.socket_dir.clone();
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    let metadata = std::fs::metadata(&socket).unwrap();
+    let retired = socket
+        .parent()
+        .unwrap()
+        .join(format!(".quasar-audio-retired-{operation}"));
+    std::fs::rename(&socket, &retired).unwrap();
+    std::os::unix::fs::symlink("/tmp", retired.join("interrupted")).unwrap();
+    rewrite_helper_intent(&engine, &operation, |intent| {
+        intent.phase = HelperPhase::Preparing;
+        intent.audio_dir_created = true;
+        intent.audio_retired_dir = Some(retired.clone());
+        intent.audio_dir_device = Some(metadata.dev());
+        intent.audio_dir_inode = Some(metadata.ino());
+        intent.audio_dir_renamed = true;
+    });
+    engine.finish();
+    assert!(engine
+        .client()
+        .abandon_audio_sidecar(operation.clone())
+        .wait()
+        .is_err());
+    std::fs::create_dir(&socket).unwrap();
+    std::fs::write(socket.join("replacement"), b"keep").unwrap();
+    std::fs::remove_file(retired.join("interrupted")).unwrap();
+    engine
+        .client()
+        .abandon_audio_sidecar(operation)
+        .wait()
+        .unwrap();
+    assert_eq!(std::fs::read(socket.join("replacement")).unwrap(), b"keep");
+    assert!(!retired.exists());
+    drop(id);
+}
+
+#[test]
+fn cleanup_finishes_when_reboot_has_removed_the_runtime_socket_directory() {
+    let engine = Engine::new();
+    let (helper, run) = audio_request(&engine);
+    let socket = run.socket_dir.clone();
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    engine.finish();
+    std::fs::remove_dir_all(&socket).unwrap();
+    engine.client().cleanup_audio_sidecar(id).wait().unwrap();
+}
+
+#[test]
+fn cleanup_finishes_when_reboot_has_removed_the_whole_runtime_parent() {
+    let engine = Engine::new();
+    let (helper, mut run) = audio_request(&engine);
+    let runtime_parent = engine
+        .config
+        .image_state_path
+        .as_ref()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("volatile-runtime");
+    run.socket_dir = runtime_parent.join("pulse-fixture");
+    *run.command.last_mut().unwrap() = format!(
+        "--load=module-native-protocol-unix socket={}/native auth-anonymous=1",
+        run.socket_dir.display()
+    );
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    engine.finish();
+    std::fs::remove_dir_all(runtime_parent).unwrap();
+
+    engine
+        .client()
+        .cleanup_audio_sidecar(id.clone())
+        .wait()
+        .unwrap();
+    assert_eq!(
+        engine
+            .client()
+            .observe_audio_sidecar(id)
+            .wait()
+            .unwrap()
+            .exit_code,
+        Some(23)
+    );
+}
+
+#[test]
+fn repeated_audio_stop_preserves_completed_cleanup_evidence() {
+    let engine = Engine::new();
+    let (helper, run) = audio_request(&engine);
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    engine
+        .client()
+        .cleanup_audio_sidecar(id.clone())
+        .wait()
+        .unwrap();
+    engine
+        .client()
+        .stop_audio_sidecar(id.clone())
+        .wait()
+        .unwrap();
+    assert_eq!(
+        engine
+            .client()
+            .observe_audio_sidecar(id)
+            .wait()
+            .unwrap()
+            .exit_code,
+        Some(23)
+    );
+}
+
+#[test]
+fn audio_shared_bind_propagation_is_rejected_before_any_delete() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let (helper, run) = audio_request(&engine);
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    engine.state.lock().unwrap().body.as_mut().unwrap()["HostConfig"]["Mounts"][0]["BindOptions"] =
+        json!({"Propagation":"shared"});
+    assert!(engine.client().cleanup_audio_sidecar(id).wait().is_err());
+    assert_eq!(engine.requests("DELETE /containers/"), 0);
+}
+
+#[test]
+fn audio_fifo_marker_is_rejected_without_blocking_cleanup() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let engine = Engine::new();
+    let (helper, run) = audio_request(&engine);
+    let socket = run.socket_dir.clone();
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    let marker = socket.join(".quasar-runtime-audio-owner");
+    std::fs::remove_file(&marker).unwrap();
+    let marker = std::ffi::CString::new(marker.as_os_str().as_bytes()).unwrap();
+    // SAFETY: the C string is a NUL-terminated local path and the fixture
+    // owns this session directory.
+    assert_eq!(unsafe { libc::mkfifo(marker.as_ptr(), 0o600) }, 0);
+    engine.finish();
+
+    assert_eq!(
+        engine
+            .client()
+            .cleanup_audio_sidecar(id)
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol
+    );
+    assert!(socket.exists());
+}
+
+#[test]
+fn audio_definitive_create_rejection_removes_its_directory_and_allows_retry() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().refuse_create = true;
+    let (helper, run) = audio_request(&engine);
+    let socket = run.socket_dir.clone();
+    assert_eq!(
+        engine
+            .client()
+            .run_audio_sidecar(helper.clone(), run.clone())
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Engine
+    );
+    assert!(!socket.exists());
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    engine.client().cleanup_audio_sidecar(id).wait().unwrap();
+}
+
+#[test]
+fn boot_retirement_continues_past_a_nonregular_journal_and_retires_valid_audio() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let (helper, run) = audio_request(&engine);
+    let socket = run.socket_dir.clone();
+    engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    std::fs::create_dir(
+        engine
+            .config
+            .image_state_path
+            .as_ref()
+            .unwrap()
+            .join("helpers")
+            .join("corrupt-entry"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        engine
+            .client()
+            .retire_audio_sidecars()
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol
+    );
+    assert!(engine.state.lock().unwrap().body.is_none());
+    assert!(!socket.exists());
+}
+
+#[test]
+fn boot_retirement_marks_lost_create_stopping_before_an_unavailable_daemon() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().lose_create = true;
+    let (helper, run) = audio_request(&engine);
+    let operation = helper.operation.clone();
+    assert_eq!(
+        engine
+            .client()
+            .run_audio_sidecar(helper, run)
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    engine.state.lock().unwrap().inspect_code = Some(500);
+
+    assert!(engine.client().retire_audio_sidecars().wait().is_err());
+    assert_eq!(
+        helper_intent(&engine, &operation).phase,
+        HelperPhase::Stopping
+    );
+}
+
+#[test]
+fn definitive_rejection_directory_cleanup_retries_without_container_inspection() {
+    let engine = Engine::new();
+    let (helper, run) = audio_request(&engine);
+    let operation = helper.operation.clone();
+    let socket = run.socket_dir.clone();
+    engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    rewrite_helper_intent(&engine, &operation, |intent| {
+        intent.id = None;
+        intent.phase = HelperPhase::CleanupPending;
+        intent.result = None;
+    });
+    std::os::unix::fs::symlink("/tmp", socket.join("interrupted")).unwrap();
+
+    assert_eq!(
+        engine
+            .client()
+            .recover_audio_sidecars()
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol
+    );
+    let before = engine.requests("GET /containers/");
+    std::fs::remove_file(
+        socket
+            .parent()
+            .unwrap()
+            .join(format!(".quasar-audio-retired-{operation}/interrupted")),
+    )
+    .unwrap();
+    engine.client().recover_audio_sidecars().wait().unwrap();
+    assert_eq!(engine.requests("GET /containers/"), before);
+    assert!(!socket.exists());
+}
+
+/// Exercises the caller's real socket-readiness fallback against the same
+/// public Unix-engine fixture. Run explicitly: it mutates process globals and
+/// waits for the two-second readiness budget twice.
+#[test]
+#[ignore]
+fn pulse_sidecar_socket_readiness_fallback_keeps_final_evidence_and_cleans() {
+    let engine = Engine::new();
+    let root = engine
+        .config
+        .image_state_path
+        .as_ref()
+        .unwrap()
+        .parent()
+        .unwrap();
+    std::env::set_var(
+        "DOCKER_HOST",
+        format!("unix://{}", engine.config.socket.display()),
+    );
+    std::env::set_var("NODE_SECRET_PATH", root.join("audio-owner"));
+    std::env::set_var("QUASAR_PULSE_IMAGE", "quasar-agent:test");
+    crate::runtime::initialize_image_state(root.join("runtime-state"));
+    let runtime = crate::session::container::ContainerRuntime::test_runtime("unused");
+    for keep_running in [false, true] {
+        engine.state.lock().unwrap().keep_running = keep_running;
+        let session = if keep_running {
+            "runtime-timeout"
+        } else {
+            "runtime-exit"
+        };
+        assert!(crate::session::audio::PulseSidecar::start(
+            session,
+            &runtime,
+            root.to_str().unwrap()
+        )
+        .unwrap()
+        .is_none());
+        assert!(engine.state.lock().unwrap().body.is_none());
+        assert!(!root.join(format!("pulse-{session}")).exists());
+        if !keep_running {
+            let helpers = root.join("runtime-state/helpers");
+            let evidence = std::fs::read_dir(helpers)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|entry| std::fs::read(entry.path()).ok())
+                .any(|bytes| {
+                    serde_json::from_slice::<HelperIntent>(&bytes)
+                        .ok()
+                        .and_then(|intent| intent.result)
+                        .is_some_and(|result| {
+                            result.exit_code == Some(23) && result.stdout == "final stdout"
+                        })
+                });
+            assert!(
+                evidence,
+                "early exit evidence must survive readiness fallback"
+            );
+        }
+    }
 }
 
 #[test]
