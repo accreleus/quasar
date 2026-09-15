@@ -1,0 +1,704 @@
+{
+  "baseline": {
+    "stage": "baseline",
+    "complete": true,
+    "expected_cells": 22,
+    "observed_cells": 22,
+    "missing_cells": [],
+    "results": {
+      "amd-va": {
+        "content_luma": 127.53,
+        "audio_passed": true,
+        "teardown_seconds": 10.941
+      },
+      "amd-vulkan": {
+        "content_luma": 127.39,
+        "audio_passed": true,
+        "teardown_seconds": 13.065
+      },
+      "nvidia": {
+        "content_luma": 127.34,
+        "audio_passed": true,
+        "teardown_seconds": 11.309
+      },
+      "input-amd": {
+        "content_luma": 72.91,
+        "audio_passed": true,
+        "teardown_seconds": 10.922
+      },
+      "input-nvidia": {
+        "content_luma": 64.85,
+        "audio_passed": true,
+        "teardown_seconds": 11.203
+      },
+      "home-amd": {
+        "content_luma": 127.38,
+        "audio_passed": true,
+        "teardown_seconds": 17.764
+      },
+      "home-nvidia": {
+        "content_luma": 127.25,
+        "audio_passed": true,
+        "teardown_seconds": 11.546
+      },
+      "gpu-amd": {
+        "content_luma": 127.45,
+        "audio_passed": true,
+        "teardown_seconds": 11.391
+      },
+      "gpu-nvidia": {
+        "content_luma": 127.25,
+        "audio_passed": true,
+        "teardown_seconds": 11.157
+      },
+      "nativegpu-amd": {
+        "content_luma": 59.63,
+        "audio_passed": true,
+        "teardown_seconds": 12.853
+      },
+      "nativegpu-nvidia": {
+        "content_luma": 55.96,
+        "audio_passed": true,
+        "teardown_seconds": 11.439
+      },
+      "gpu-amd-vulkan": {
+        "content_luma": 127.39,
+        "audio_passed": true,
+        "teardown_seconds": 12.232
+      },
+      "nativegpu-amd-vulkan": {
+        "content_luma": 55.87,
+        "audio_passed": true,
+        "teardown_seconds": 11.292
+      },
+      "nativegpu-desktop-nvidia": {
+        "content_luma": 55.92,
+        "audio_passed": true,
+        "teardown_seconds": 11.48
+      },
+      "concurrent-amd": {
+        "passed": true
+      },
+      "concurrent-nvidia": {
+        "passed": true
+      },
+      "swap-amd": {
+        "passed": true
+      },
+      "swap-nvidia": {
+        "passed": true
+      },
+      "failures-amd": {
+        "failed_as_expected": [
+          "early-exit",
+          "mount-rejected",
+          "start-error"
+        ]
+      },
+      "failures-nvidia": {
+        "failed_as_expected": [
+          "early-exit",
+          "mount-rejected",
+          "start-error"
+        ]
+      },
+      "readiness-amd": {
+        "failed_as_expected": [
+          "never-presented"
+        ]
+      },
+      "readiness-nvidia": {
+        "failed_as_expected": [
+          "never-presented"
+        ]
+      }
+    }
+  },
+  "candidate": {
+    "stage": "candidate",
+    "complete": true,
+    "expected_cells": 22,
+    "observed_cells": 22,
+    "missing_cells": [],
+    "results": {
+      "amd-va": {
+        "content_luma": 127.46,
+        "audio_passed": true,
+        "teardown_seconds": 10.708
+      },
+      "amd-vulkan": {
+        "content_luma": 127.38,
+        "audio_passed": true,
+        "teardown_seconds": 10.719
+      },
+      "nvidia": {
+        "content_luma": 127.27,
+        "audio_passed": true,
+        "teardown_seconds": 10.829
+      },
+      "input-amd": {
+        "content_luma": 72.91,
+        "audio_passed": true,
+        "teardown_seconds": 10.731
+      },
+      "input-nvidia": {
+        "content_luma": 64.85,
+        "audio_passed": true,
+        "teardown_seconds": 11.146
+      },
+      "home-amd": {
+        "content_luma": 127.43,
+        "audio_passed": true,
+        "teardown_seconds": 10.685
+      },
+      "home-nvidia": {
+        "content_luma": 127.26,
+        "audio_passed": true,
+        "teardown_seconds": 11.067
+      },
+      "gpu-amd": {
+        "content_luma": 127.54,
+        "audio_passed": true,
+        "teardown_seconds": 10.898
+      },
+      "gpu-nvidia": {
+        "content_luma": 127.27,
+        "audio_passed": true,
+        "teardown_seconds": 11.186
+      },
+      "nativegpu-amd": {
+        "content_luma": 59.6,
+        "audio_passed": true,
+        "teardown_seconds": 11.144
+      },
+      "nativegpu-nvidia": {
+        "content_luma": 55.95,
+        "audio_passed": true,
+        "teardown_seconds": 11.226
+      },
+      "gpu-amd-vulkan": {
+        "content_luma": 127.38,
+        "audio_passed": true,
+        "teardown_seconds": 10.683
+      },
+      "nativegpu-amd-vulkan": {
+        "content_luma": 55.81,
+        "audio_passed": true,
+        "teardown_seconds": 11.601
+      },
+      "nativegpu-desktop-nvidia": {
+        "content_luma": 55.87,
+        "audio_passed": true,
+        "teardown_seconds": 11.222
+      },
+      "concurrent-amd": {
+        "passed": true
+      },
+      "concurrent-nvidia": {
+        "passed": true
+      },
+      "swap-amd": {
+        "passed": true
+      },
+      "swap-nvidia": {
+        "passed": true
+      },
+      "failures-amd": {
+        "failed_as_expected": [
+          "early-exit",
+          "mount-rejected",
+          "start-error"
+        ]
+      },
+      "failures-nvidia": {
+        "failed_as_expected": [
+          "early-exit",
+          "mount-rejected",
+          "start-error"
+        ]
+      },
+      "readiness-amd": {
+        "failed_as_expected": [
+          "never-presented"
+        ]
+      },
+      "readiness-nvidia": {
+        "failed_as_expected": [
+          "never-presented"
+        ]
+      }
+    }
+  },
+  "source_commit": "8e2ec2761bba9a450cbf6facbff50b4f87d860a4",
+  "image_id": "sha256:55a1bed3f9293f5cbb1a6f34d5aef25e95a8eac4c46611e92729b00ecf4e1540",
+  "contracts": {
+    "amd": {
+      "passed": 144,
+      "failed": 0,
+      "gpu_attached": true,
+      "verdict": "PASS"
+    },
+    "nvidia": {
+      "passed": 144,
+      "failed": 0,
+      "gpu_attached": true,
+      "verdict": "PASS"
+    }
+  },
+  "details": {
+    "baseline-amd": {
+      "application_received": "quasar",
+      "mouse": {
+        "passed": true,
+        "idle_delta": 0.0043055555555555555,
+        "mouse_selection_delta": 6.491666666666666
+      },
+      "home_identity": [
+        "rh01-236-preserved",
+        "12345",
+        "12346",
+        "12345:12346"
+      ],
+      "duplicate_home": "rejected",
+      "prelaunch_marker_preserved": null,
+      "concurrent": {
+        "distinct_session_mounts": true,
+        "first_teardown_seconds": 13.14,
+        "second_survives_first_stop": true,
+        "second_teardown_seconds": 11.55,
+        "passed": true,
+        "distinct_input_nodes": true
+      },
+      "both_decoded_overlap_seconds": null,
+      "switching": {
+        "generation_count": 4,
+        "distinct_generation_ids_observed": true,
+        "old_ids_absent_at_replacement_acceptance": null,
+        "passed": true,
+        "browser_passed": true,
+        "teardown_seconds": 10.974,
+        "observation_limit": "Container sampling does not exclude sub-sample overlap; owned-interface tests verify stop-before-replacement ordering."
+      },
+      "readiness": {
+        "failure_code": "app_never_presented",
+        "elapsed_seconds": 316.198,
+        "final_marker_preserved": true,
+        "remaining_containers": 0,
+        "remaining_paths": 0
+      },
+      "failures": [
+        {
+          "scenario": "early-exit",
+          "failure_code": null,
+          "reported_exit_code": 37,
+          "start_error_executable_marker": false,
+          "state": "failed",
+          "remaining_containers": 0,
+          "stdout_marker": false,
+          "stderr_marker": false
+        },
+        {
+          "scenario": "start-error",
+          "failure_code": null,
+          "reported_exit_code": 127,
+          "start_error_executable_marker": true,
+          "state": "failed",
+          "remaining_containers": 0,
+          "stdout_marker": false,
+          "stderr_marker": false
+        },
+        {
+          "scenario": "mount-rejected",
+          "failure_code": null,
+          "reported_exit_code": null,
+          "start_error_executable_marker": false,
+          "state": "failed",
+          "remaining_containers": 0,
+          "stdout_marker": false,
+          "stderr_marker": false
+        }
+      ]
+    },
+    "candidate-amd": {
+      "application_received": "quasar",
+      "mouse": {
+        "passed": true,
+        "idle_delta": 0.0035416666666666665,
+        "mouse_selection_delta": 6.49125
+      },
+      "home_identity": [
+        "rh01-236-preserved",
+        "12345",
+        "12346",
+        "12345:12346"
+      ],
+      "duplicate_home": "rejected",
+      "prelaunch_marker_preserved": true,
+      "concurrent": {
+        "distinct_session_mounts": true,
+        "first_teardown_seconds": 10.848,
+        "second_survives_first_stop": true,
+        "second_teardown_seconds": 10.686,
+        "passed": true,
+        "distinct_input_nodes": true
+      },
+      "both_decoded_overlap_seconds": 3.003012274974026,
+      "switching": {
+        "generation_count": 4,
+        "distinct_generation_ids_observed": true,
+        "old_ids_absent_at_replacement_acceptance": true,
+        "passed": true,
+        "browser_passed": true,
+        "teardown_seconds": 11.388,
+        "observation_limit": "Container sampling does not exclude sub-sample overlap; owned-interface tests verify stop-before-replacement ordering."
+      },
+      "readiness": {
+        "failure_code": "app_never_presented",
+        "elapsed_seconds": 311.831,
+        "final_marker_preserved": true,
+        "remaining_containers": 0,
+        "remaining_paths": 0
+      },
+      "failures": [
+        {
+          "scenario": "early-exit",
+          "failure_code": "app_exited_early",
+          "reported_exit_code": 37,
+          "start_error_executable_marker": false,
+          "state": "failed",
+          "remaining_containers": 0,
+          "stdout_marker": true,
+          "stderr_marker": true
+        },
+        {
+          "scenario": "start-error",
+          "failure_code": "app_exited_early",
+          "reported_exit_code": 127,
+          "start_error_executable_marker": true,
+          "state": "failed",
+          "remaining_containers": 0,
+          "stdout_marker": false,
+          "stderr_marker": false
+        },
+        {
+          "scenario": "mount-rejected",
+          "failure_code": null,
+          "reported_exit_code": null,
+          "start_error_executable_marker": false,
+          "state": "failed",
+          "remaining_containers": 0,
+          "stdout_marker": false,
+          "stderr_marker": false
+        }
+      ]
+    },
+    "baseline-nvidia": {
+      "application_received": "quasar",
+      "mouse": {
+        "passed": true,
+        "idle_delta": 0,
+        "mouse_selection_delta": 6.4882175925925925
+      },
+      "home_identity": [
+        "rh01-236-preserved",
+        "12345",
+        "12346",
+        "12345:12346"
+      ],
+      "duplicate_home": "rejected",
+      "prelaunch_marker_preserved": null,
+      "concurrent": {
+        "distinct_session_mounts": true,
+        "first_teardown_seconds": 10.888,
+        "second_survives_first_stop": true,
+        "second_teardown_seconds": 11.197,
+        "passed": true,
+        "distinct_input_nodes": true
+      },
+      "both_decoded_overlap_seconds": null,
+      "switching": {
+        "generation_count": 4,
+        "distinct_generation_ids_observed": true,
+        "old_ids_absent_at_replacement_acceptance": null,
+        "passed": true,
+        "browser_passed": true,
+        "teardown_seconds": 11.074,
+        "observation_limit": "Container sampling does not exclude sub-sample overlap; owned-interface tests verify stop-before-replacement ordering."
+      },
+      "readiness": {
+        "failure_code": "app_never_presented",
+        "elapsed_seconds": 314.35,
+        "final_marker_preserved": true,
+        "remaining_containers": 0,
+        "remaining_paths": 0
+      },
+      "failures": [
+        {
+          "scenario": "early-exit",
+          "failure_code": null,
+          "reported_exit_code": 37,
+          "start_error_executable_marker": false,
+          "state": "failed",
+          "remaining_containers": 0,
+          "stdout_marker": false,
+          "stderr_marker": false
+        },
+        {
+          "scenario": "start-error",
+          "failure_code": null,
+          "reported_exit_code": 127,
+          "start_error_executable_marker": false,
+          "state": "failed",
+          "remaining_containers": 0,
+          "stdout_marker": false,
+          "stderr_marker": false
+        },
+        {
+          "scenario": "mount-rejected",
+          "failure_code": null,
+          "reported_exit_code": null,
+          "start_error_executable_marker": false,
+          "state": "failed",
+          "remaining_containers": 0,
+          "stdout_marker": false,
+          "stderr_marker": false
+        }
+      ],
+      "encoder": "vulkanh264enc"
+    },
+    "candidate-nvidia": {
+      "application_received": "quasar",
+      "mouse": {
+        "passed": true,
+        "idle_delta": 0.08766203703703704,
+        "mouse_selection_delta": 6.548842592592592
+      },
+      "home_identity": [
+        "rh01-236-preserved",
+        "12345",
+        "12346",
+        "12345:12346"
+      ],
+      "duplicate_home": "rejected",
+      "prelaunch_marker_preserved": true,
+      "concurrent": {
+        "distinct_session_mounts": true,
+        "first_teardown_seconds": 10.886,
+        "second_survives_first_stop": true,
+        "second_teardown_seconds": 10.979,
+        "passed": true,
+        "distinct_input_nodes": true
+      },
+      "both_decoded_overlap_seconds": 3.0004633070202544,
+      "switching": {
+        "generation_count": 4,
+        "distinct_generation_ids_observed": true,
+        "old_ids_absent_at_replacement_acceptance": true,
+        "passed": true,
+        "browser_passed": true,
+        "teardown_seconds": 10.856,
+        "observation_limit": "Container sampling does not exclude sub-sample overlap; owned-interface tests verify stop-before-replacement ordering."
+      },
+      "readiness": {
+        "failure_code": "app_never_presented",
+        "elapsed_seconds": 313.108,
+        "final_marker_preserved": true,
+        "remaining_containers": 0,
+        "remaining_paths": 0
+      },
+      "failures": [
+        {
+          "scenario": "early-exit",
+          "failure_code": "app_exited_early",
+          "reported_exit_code": 37,
+          "start_error_executable_marker": false,
+          "state": "failed",
+          "remaining_containers": 0,
+          "stdout_marker": true,
+          "stderr_marker": true
+        },
+        {
+          "scenario": "start-error",
+          "failure_code": "app_exited_early",
+          "reported_exit_code": 127,
+          "start_error_executable_marker": true,
+          "state": "failed",
+          "remaining_containers": 0,
+          "stdout_marker": false,
+          "stderr_marker": false
+        },
+        {
+          "scenario": "mount-rejected",
+          "failure_code": null,
+          "reported_exit_code": null,
+          "start_error_executable_marker": false,
+          "state": "failed",
+          "remaining_containers": 0,
+          "stdout_marker": false,
+          "stderr_marker": false
+        }
+      ],
+      "encoder": "vulkanh264enc"
+    },
+    "baseline-amd-va": {
+      "encoder": "vah264enc"
+    },
+    "candidate-amd-va": {
+      "encoder": "vah264enc"
+    },
+    "baseline-amd-vulkan": {
+      "encoder": "vulkanh264enc"
+    },
+    "candidate-amd-vulkan": {
+      "encoder": "vulkanh264enc"
+    },
+    "baseline-nativegpu-amd": {
+      "encoder": "vah264enc",
+      "renderer": "AMD Radeon Graphics (RADV RENOIR)"
+    },
+    "candidate-nativegpu-amd": {
+      "encoder": "vah264enc",
+      "renderer": "AMD Radeon Graphics (RADV RENOIR)"
+    },
+    "baseline-nativegpu-amd-vulkan": {
+      "encoder": "vulkanh264enc",
+      "renderer": "AMD Radeon Graphics (RADV RENOIR)"
+    },
+    "candidate-nativegpu-amd-vulkan": {
+      "encoder": "vulkanh264enc",
+      "renderer": "AMD Radeon Graphics (RADV RENOIR)"
+    },
+    "baseline-nativegpu-nvidia": {
+      "encoder": "vulkanh264enc",
+      "renderer": "NVIDIA GeForce RTX 5090"
+    },
+    "candidate-nativegpu-nvidia": {
+      "encoder": "vulkanh264enc",
+      "renderer": "NVIDIA GeForce RTX 5090"
+    },
+    "baseline-nativegpu-desktop-nvidia": {
+      "encoder": "vulkanh264enc",
+      "renderer": "NVIDIA GeForce RTX 5090"
+    },
+    "candidate-nativegpu-desktop-nvidia": {
+      "encoder": "vulkanh264enc",
+      "renderer": "NVIDIA GeForce RTX 5090"
+    },
+    "baseline-input-amd": {
+      "encoder": "vah264enc"
+    },
+    "candidate-input-amd": {
+      "encoder": "vah264enc"
+    },
+    "baseline-input-nvidia": {
+      "encoder": "vulkanh264enc"
+    },
+    "candidate-input-nvidia": {
+      "encoder": "vulkanh264enc"
+    }
+  },
+  "cleanup": {
+    "owned_catalog_assets_removed": 18,
+    "owned_managed_homes_removed": 2,
+    "preexisting_catalog_assets_preserved": true
+  },
+  "deployment": {
+    "amd": {
+      "idle": true,
+      "running": true,
+      "registered_source_verified": true,
+      "image_id_verified": true,
+      "host_identity_preserved": true,
+      "owned_application_containers_remaining": 0,
+      "owned_audio_containers_remaining": 0,
+      "journal_phases": {
+        "Completed": 17
+      },
+      "source_commit": "8e2ec2761bba9a450cbf6facbff50b4f87d860a4",
+      "image_id": "sha256:55a1bed3f9293f5cbb1a6f34d5aef25e95a8eac4c46611e92729b00ecf4e1540",
+      "mounts_preserved": true,
+      "environment_preserved": true,
+      "service_configuration_checked": true
+    },
+    "nvidia": {
+      "idle": true,
+      "running": true,
+      "registered_source_verified": true,
+      "image_id_verified": true,
+      "host_identity_preserved": true,
+      "owned_application_containers_remaining": 0,
+      "owned_audio_containers_remaining": 0,
+      "journal_phases": {
+        "Completed": 15
+      },
+      "source_commit": "8e2ec2761bba9a450cbf6facbff50b4f87d860a4",
+      "image_id": "sha256:55a1bed3f9293f5cbb1a6f34d5aef25e95a8eac4c46611e92729b00ecf4e1540",
+      "mounts_preserved": true,
+      "environment_preserved": true,
+      "service_configuration_checked": true
+    }
+  },
+  "engine_versions": {
+    "amd": {
+      "Version": "29.8.0",
+      "ApiVersion": "1.56",
+      "MinAPIVersion": "1.40",
+      "KernelVersion": "7.0.0-31-generic",
+      "Os": "linux",
+      "Arch": "amd64"
+    },
+    "nvidia": {
+      "Version": "29.7.2",
+      "ApiVersion": "1.55",
+      "MinAPIVersion": "1.40",
+      "KernelVersion": "7.1.7-200.fc44.x86_64",
+      "Os": "linux",
+      "Arch": "amd64"
+    }
+  },
+  "bollard_version": "0.21.1",
+  "gpu_realization": {
+    "gpu-amd": {
+      "dri_present": true,
+      "supplemental_groups_present": true
+    },
+    "gpu-amd-vulkan": {
+      "dri_present": true,
+      "supplemental_groups_present": true
+    },
+    "gpu-nvidia": {
+      "dri_present": true,
+      "supplemental_groups_present": true,
+      "all_gpu_request": true,
+      "driver_volume_read_only": true,
+      "baseline_driver_identity_match": true
+    },
+    "nativegpu-amd": {
+      "dri_present": true,
+      "supplemental_groups_present": true
+    },
+    "nativegpu-amd-vulkan": {
+      "dri_present": true,
+      "supplemental_groups_present": true
+    },
+    "nativegpu-nvidia": {
+      "dri_present": true,
+      "supplemental_groups_present": true,
+      "all_gpu_request": true,
+      "driver_volume_read_only": true,
+      "baseline_driver_identity_match": true
+    },
+    "nativegpu-desktop-nvidia": {
+      "dri_present": true,
+      "supplemental_groups_present": true,
+      "all_gpu_request": true,
+      "driver_volume_read_only": true,
+      "baseline_driver_identity_match": true,
+      "proc_params_removed": true,
+      "nonroot_bwrap_passed": true,
+      "masked_paths_empty": true,
+      "readonly_paths_empty": true,
+      "no_new_privileges_absent": true
+    }
+  }
+}
