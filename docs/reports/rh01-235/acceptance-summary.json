@@ -1,0 +1,261 @@
+{
+  "source_commit": "7fc0b58142415c79c2cdb641628c5902a00c9a7a",
+  "image_id": "sha256:5add43038cb90b0c800134496e422c2df1f9cc8fcaa8b229c987291092e2b7f9",
+  "media_runs": [
+    {
+      "case": "amd-va",
+      "actual_encoder": "vah264enc",
+      "luma": 127.48,
+      "browser_audio": true,
+      "teardown_seconds": 10.91491325298557,
+      "containers_remaining": false,
+      "paths_remaining": 0
+    },
+    {
+      "case": "amd-vulkan",
+      "actual_encoder": "vulkanh264enc",
+      "luma": 127.4,
+      "browser_audio": true,
+      "teardown_seconds": 10.958344047015999,
+      "containers_remaining": false,
+      "paths_remaining": 0
+    },
+    {
+      "case": "nvidia",
+      "actual_encoder": "vulkanh264enc",
+      "luma": 127.27,
+      "browser_audio": true,
+      "teardown_seconds": 11.497677829000168,
+      "containers_remaining": false,
+      "paths_remaining": 0
+    },
+    {
+      "case": "nvidia-fresh",
+      "actual_encoder": "vulkanh264enc",
+      "luma": 127.26,
+      "browser_audio": true,
+      "teardown_seconds": 11.512295652006287,
+      "containers_remaining": false,
+      "paths_remaining": 0
+    }
+  ],
+  "input_runs": {
+    "amd": {
+      "mouse": {
+        "passed": true,
+        "idle_delta": 0.003958333333333334,
+        "mouse_selection_delta": 6.491388888888889,
+        "keyboard_sent": "quasar + Enter"
+      },
+      "application_received": "quasar",
+      "teardown_seconds": 10.906098057050258,
+      "containers_remaining": false,
+      "paths_remaining": 0
+    },
+    "nvidia": {
+      "mouse": {
+        "passed": true,
+        "idle_delta": 0.03777777777777778,
+        "mouse_selection_delta": 6.505972222222222,
+        "keyboard_sent": "quasar + Enter"
+      },
+      "application_received": "quasar",
+      "teardown_seconds": 11.383098089019768,
+      "containers_remaining": false,
+      "paths_remaining": 0
+    }
+  },
+  "final_hosts": {
+    "amd": [
+      {
+        "status": "online",
+        "source_commit": "7fc0b58142415c79c2cdb641628c5902a00c9a7a",
+        "readiness": [
+          {
+            "id": "nvidia_egl_vendor_json",
+            "status": "skip"
+          },
+          {
+            "id": "nvidia_eglcore_library",
+            "status": "skip"
+          },
+          {
+            "id": "nvidia_lib32_gl",
+            "status": "skip"
+          },
+          {
+            "id": "render_node",
+            "status": "pass"
+          },
+          {
+            "id": "uinput",
+            "status": "pass"
+          },
+          {
+            "id": "user_namespaces",
+            "status": "pass"
+          },
+          {
+            "id": "app_apparmor_profile",
+            "status": "pass"
+          },
+          {
+            "id": "host_render_node",
+            "status": "pass"
+          },
+          {
+            "id": "dri_node_app_access",
+            "status": "pass"
+          },
+          {
+            "id": "driver_volume_version",
+            "status": "skip"
+          },
+          {
+            "id": "nvidia_sibling_egl",
+            "status": "skip"
+          },
+          {
+            "id": "nvidia_driver_mount",
+            "status": "skip"
+          },
+          {
+            "id": "encoder_codecs",
+            "status": "pass"
+          },
+          {
+            "id": "nvidia_vulkan_av1_compatibility",
+            "status": "skip"
+          },
+          {
+            "id": "xid_visibility",
+            "status": "skip"
+          },
+          {
+            "id": "media_reachability",
+            "status": "skip"
+          },
+          {
+            "id": "host_container_mounts",
+            "status": "pass"
+          },
+          {
+            "id": "updater_socket",
+            "status": "skip"
+          },
+          {
+            "id": "updater_stack_dir",
+            "status": "skip"
+          },
+          {
+            "id": "updater_overlays",
+            "status": "skip"
+          },
+          {
+            "id": "health_addr_bindable",
+            "status": "pass"
+          }
+        ]
+      }
+    ],
+    "amd_active_sessions": 0,
+    "nvidia": [
+      {
+        "status": "online",
+        "source_commit": "7fc0b58142415c79c2cdb641628c5902a00c9a7a",
+        "readiness": [
+          {
+            "id": "nvidia_egl_vendor_json",
+            "status": "pass"
+          },
+          {
+            "id": "nvidia_eglcore_library",
+            "status": "pass"
+          },
+          {
+            "id": "nvidia_lib32_gl",
+            "status": "pass"
+          },
+          {
+            "id": "render_node",
+            "status": "pass"
+          },
+          {
+            "id": "uinput",
+            "status": "pass"
+          },
+          {
+            "id": "user_namespaces",
+            "status": "pass"
+          },
+          {
+            "id": "app_apparmor_profile",
+            "status": "skip"
+          },
+          {
+            "id": "host_render_node",
+            "status": "pass"
+          },
+          {
+            "id": "dri_node_app_access",
+            "status": "pass"
+          },
+          {
+            "id": "driver_volume_version",
+            "status": "pass"
+          },
+          {
+            "id": "nvidia_sibling_egl",
+            "status": "pass"
+          },
+          {
+            "id": "nvidia_driver_mount",
+            "status": "skip"
+          },
+          {
+            "id": "encoder_codecs",
+            "status": "pass"
+          },
+          {
+            "id": "nvidia_vulkan_av1_compatibility",
+            "status": "pass"
+          },
+          {
+            "id": "xid_visibility",
+            "status": "pass"
+          },
+          {
+            "id": "media_reachability",
+            "status": "pass"
+          },
+          {
+            "id": "host_container_mounts",
+            "status": "pass"
+          },
+          {
+            "id": "updater_socket",
+            "status": "pass"
+          },
+          {
+            "id": "updater_stack_dir",
+            "status": "pass"
+          },
+          {
+            "id": "updater_overlays",
+            "status": "skip"
+          },
+          {
+            "id": "health_addr_bindable",
+            "status": "pass"
+          }
+        ]
+      }
+    ],
+    "nvidia_active_sessions": 0
+  },
+  "driver_fixture_cleanup": {
+    "restored_installed_volume": true,
+    "fixture_removed": true,
+    "no_fixture_container_references": true
+  }
+}
