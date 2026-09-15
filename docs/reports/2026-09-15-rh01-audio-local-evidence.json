@@ -1,0 +1,100 @@
+{
+  "source_commit": "65a53b0b62f1885311ea601d7dc88af2dc3f1a72",
+  "image": "quasar-node-agent:20260915-0811-rh01-234",
+  "image_id": "sha256:45cd2cec88e11a4fc022e5e0347f1c4e7a173d1d1b90f14c25dc8b593f9387a4",
+  "target": "isolated local AMD Docker stack",
+  "gpu_contract": {
+    "passed": 145,
+    "failed": 0,
+    "gpu_attached": true,
+    "gpu_skipped_elements": []
+  },
+  "browser_driver_sha256": "cd6fe67ef9bd17cfde5171e3a098d9e557419f953e5491363dfc10bb3c9ce1df",
+  "audio_probe": {
+    "passed": true,
+    "receivedTone": true,
+    "playing": true,
+    "before": [
+      {
+        "peer": 1,
+        "id": "ITaudio01A997237877",
+        "state": "connected",
+        "live": true,
+        "bytes": 102400,
+        "packets": 1280,
+        "duration": 12.90999999999977,
+        "energy": 1.1621686940690041
+      }
+    ],
+    "after": [
+      {
+        "peer": 1,
+        "id": "ITaudio01A997237877",
+        "state": "connected",
+        "live": true,
+        "bytes": 118560,
+        "packets": 1482,
+        "duration": 14.929999999999726,
+        "energy": 1.3475603688869198
+      }
+    ],
+    "playback": [
+      {
+        "paused": false,
+        "muted": false,
+        "volume": 1,
+        "readyState": 4,
+        "live": true,
+        "error": null
+      }
+    ]
+  },
+  "teardown": {
+    "sid": "b115b892-81aa-42f1-b054-e9ebec96dc0d",
+    "stop_ack_seconds": 0.005936301022302359,
+    "after_ack_seconds": 10.92080199701013,
+    "remaining_containers": []
+  },
+  "runtime_directory_empty": true,
+  "containers": [
+    {
+      "id": "75d4bd3437ef4d1726e134dd8126abf4a85a3837b3d298ac7bde91a7b5a4c7fa",
+      "name": "/quasar-sess-b115b892-81aa-42f1-b054-e9ebec96dc0d-g0",
+      "image_id": "sha256:45cd2cec88e11a4fc022e5e0347f1c4e7a173d1d1b90f14c25dc8b593f9387a4"
+    },
+    {
+      "id": "34f68cd675ffab3d3774fa80a0f8913b3f3030c64bbbb57445809b26afe493d5",
+      "name": "/quasar-pulse-b115b892-81aa-42f1-b054-e9ebec96dc0d",
+      "image_id": "sha256:45cd2cec88e11a4fc022e5e0347f1c4e7a173d1d1b90f14c25dc8b593f9387a4"
+    }
+  ],
+  "journal": {
+    "phase": "Completed",
+    "id": "34f68cd675ffab3d3774fa80a0f8913b3f3030c64bbbb57445809b26afe493d5",
+    "result": {
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": "W: [pulseaudio] main.c: This program is not intended to be run as root (unless --system is specified).\nE: [pulseaudio] core-util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nE: [pulseaudio] core-util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nE: [pulseaudio] core-util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nE: [pulseaudio] core-util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nE: [pulseaudio] core-util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nE: [pulseaudio] core-util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nE: [pulseaudio] core-util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nE: [pulseaudio] core-util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nE: [pulseaudio] core-util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nE: [pulseaudio] core-util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nE: [pulseaudio] core-util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nE: [null-sink] util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nE: [null-sink] util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nE: [null-sink] util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nE: [null-sink] util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nE: [null-sink] util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nE: [null-sink] util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nE: [null-sink] util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nE: [null-sink] util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nE: [null-sink] util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nE: [null-sink] util.c: Failed to connect to system bus: Failed to connect to socket /run/dbus/system_bus_socket: No such file or directory\nW: [pulseaudio] module-remap-source.c: No remapping configured, proceeding nonetheless!\nW: [pulseaudio] authkey.c: Failed to open cookie file '/run/q234-8e5ebb00/pulse-b115b892-81aa-42f1-b054-e9ebec96dc0d/.config/pulse/cookie': No such file or directory\nW: [pulseaudio] authkey.c: Failed to load authentication key '/run/q234-8e5ebb00/pulse-b115b892-81aa-42f1-b054-e9ebec96dc0d/.config/pulse/cookie': No such file or directory\nW: [pulseaudio] authkey.c: Failed to open cookie file '/run/q234-8e5ebb00/pulse-b115b892-81aa-42f1-b054-e9ebec96dc0d/.pulse-cookie': No such file or directory\nW: [pulseaudio] authkey.c: Failed to load authentication key '/run/q234-8e5ebb00/pulse-b115b892-81aa-42f1-b054-e9ebec96dc0d/.pulse-cookie': No such file or directory\nW: [pulseaudio] server-lookup.c: Unable to contact D-Bus: org.freedesktop.DBus.Error.NotSupported: Unable to autolaunch a dbus-daemon without a $DISPLAY for X11\nW: [pulseaudio] main.c: Unable to contact D-Bus: org.freedesktop.DBus.Error.NotSupported: Unabl"
+    },
+    "audio_dir_renamed": true
+  },
+  "tone_origin": {
+    "container_id": "75d4bd3437ef4d1726e134dd8126abf4a85a3837b3d298ac7bde91a7b5a4c7fa",
+    "command": [
+      "sh",
+      "-c",
+      "gst-launch-1.0 -q audiotestsrc is-live=true wave=sine volume=0.3 ! audioconvert ! audioresample ! pulsesink & exec weston-terminal"
+    ],
+    "pulse_environment": [
+      "PULSE_SINK=quasar_output",
+      "PULSE_SERVER=unix:/run/q234-8e5ebb00/pulse-b115b892-81aa-42f1-b054-e9ebec96dc0d/native"
+    ],
+    "pulse_bind_mounts": [
+      {
+        "source": "/run/q234-8e5ebb00/pulse-b115b892-81aa-42f1-b054-e9ebec96dc0d",
+        "destination": "/run/q234-8e5ebb00/pulse-b115b892-81aa-42f1-b054-e9ebec96dc0d",
+        "rw": true
+      }
+    ]
+  }
+}
