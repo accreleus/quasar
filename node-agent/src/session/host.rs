@@ -227,8 +227,15 @@ impl SessionHost {
     /// Tear everything down (idempotent). `Drop` is the backstop.
     /// Order: app container first (stops producing audio), then PulseAudio sidecar.
     pub fn teardown(&mut self) {
-        if let Some(mut c) = self.container.take() {
-            c.stop();
+        if let Some(c) = self.container.as_mut() {
+            if let Err(error) = c.stop() {
+                tracing::warn!(
+                    token = "application-host-teardown-pending",
+                    "application teardown remains durable: {error}"
+                );
+                return;
+            }
+            self.container.take();
         }
         if let Some(mut p) = self.pulse.take() {
             p.stop();

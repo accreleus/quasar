@@ -142,10 +142,10 @@ pub async fn run(cfg: Config) {
         format!("{}.runtime-images", cfg.node_secret_path).into(),
     );
 
-    // A prior process can leave siblings behind after SIGKILL. Audio uses its
-    // journalled API lifecycle; the remaining application sweep stays CLI-owned.
-    // Best-effort — a cleanup failure never blocks startup.
-    let (runtime, swept) = offload_probe(|| {
+    // A prior process can leave an application holding a managed home after
+    // SIGKILL. Retire it through the durable API before audio/home GC or any
+    // control-plane registration; failure is fail-closed for supervisor retry.
+    let (runtime, swept, applications_retired) = offload_probe(|| {
         let runtime = ContainerRuntime::from_env();
         match crate::runtime::configured().and_then(|api| api.discover().wait()) {
             Ok(engine) => info!(token = "runtime-engine-discovered", engine = %engine.name,
@@ -158,18 +158,43 @@ pub async fn run(cfg: Config) {
             warn!(token = "runtime-diagnostic-recovery-pending", %error,
                 "diagnostic recovery remains pending; host-path validation will retry before launching another helper");
         }
-        // This is boot-only retirement, after acquiring the persistent owner
-        // lease. Routine recovery never stops an active audio sibling.
-        if let Err(error) = crate::runtime::configured().and_then(|api| api.retire_audio_sidecars().wait()) {
-            warn!(token = "runtime-audio-retirement-pending", %error,
-                "previous audio cleanup remains journalled; retry runtime recovery when Docker is available");
+        if let Err(error) = crate::runtime::configured().and_then(|api| api.recover_application_cleanup().wait()) {
+            warn!(token = "runtime-application-cleanup-pending", %error,
+                "stopped application cleanup remains journalled; active applications were preserved");
         }
-        let swept = runtime.sweep_orphans(&[
-            crate::session::container::SESSION_NAME_PREFIX,
-        ]);
-        (runtime, swept)
+        let applications_retired = match crate::runtime::configured().and_then(|api| api.retire_applications().wait()) {
+            Ok(()) => true,
+            Err(error) => {
+                error!(token = "runtime-application-retirement-pending", %error,
+                    "previous application retirement is unresolved; refusing startup to protect managed homes");
+                false
+            }
+        };
+        let Some(swept) = post_application_retirement(
+            applications_retired,
+            || {
+                // This is boot-only retirement, after acquiring the persistent owner
+                // lease. Routine recovery never stops an active audio sibling.
+                if let Err(error) = crate::runtime::configured()
+                    .and_then(|api| api.retire_audio_sidecars().wait())
+                {
+                    warn!(token = "runtime-audio-retirement-pending", %error,
+                        "previous audio cleanup remains journalled; retry runtime recovery when Docker is available");
+                }
+            },
+            || runtime.sweep_orphans(&[crate::session::container::SESSION_NAME_PREFIX]),
+        ) else {
+            // Do not touch audio or use the legacy sweep while an API-owned
+            // application may still own a managed home.
+            return (runtime, 0, false);
+        };
+        (runtime, swept, true)
     })
     .await;
+    if !applications_retired {
+        sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
+        std::process::exit(1);
+    }
     if swept > 0 {
         info!("startup sweep removed {swept} orphaned container(s) from a prior run");
     }
@@ -298,6 +323,11 @@ pub async fn run(cfg: Config) {
         release_mgr.clone(),
     );
     let grace = session_grace();
+
+    // Only records that already asked for terminal cleanup are eligible here.
+    // This task never adopts or stops a running application; boot retirement above
+    // remains the fail-closed policy for applications left by a previous agent.
+    let _application_cleanup_guard = spawn_application_cleanup_recovery();
 
     let mut backoff = Duration::from_secs(1);
     // #199: see `EnrollmentFallback` — one token attempt per stale-secret reject.
@@ -3264,6 +3294,100 @@ fn ack(id: String, ok: bool, error: Option<String>) -> AgentMsg {
     AgentMsg::Ack { id, ok, error }
 }
 
+/// Run startup work which is only safe after API-owned applications have retired.
+/// A failed retirement blocks this process before it can sweep legacy containers or
+/// register with the control plane, so a supervisor retries without releasing a home.
+fn post_application_retirement<F, G>(
+    applications_retired: bool,
+    retire_audio: F,
+    sweep_legacy: G,
+) -> Option<usize>
+where
+    F: FnOnce(),
+    G: FnOnce() -> usize,
+{
+    if !applications_retired {
+        return None;
+    }
+    retire_audio();
+    Some(sweep_legacy())
+}
+
+/// Aborts the process-lifetime application cleanup maintenance task on orderly shutdown.
+struct ApplicationCleanupGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for ApplicationCleanupGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// One maintenance pass. Caller obligations run first because runtime recovery correctly
+/// skips `Running` records; a caller-map error never starves durable journal cleanup.
+fn application_cleanup_maintenance_tick<F, G>(
+    pending: F,
+    journal: G,
+) -> Result<(), crate::runtime::RuntimeError>
+where
+    F: FnOnce() -> anyhow::Result<()>,
+    G: FnOnce() -> Result<(), crate::runtime::RuntimeError>,
+{
+    if let Err(error) = pending() {
+        tracing::warn!(
+            token = "application-pending-map-unavailable",
+            "caller application pending map could not be scanned: {error}"
+        );
+    }
+    journal()
+}
+
+/// Retry only durable `CleanupPending`/terminal application records. A live application
+/// has no cleanup intent and is therefore invisible to this maintenance pass.
+fn spawn_application_cleanup_recovery() -> ApplicationCleanupGuard {
+    let handle = tokio::spawn(async move {
+        // Startup already performed a bounded pass. Delay the first maintenance retry
+        // so it cannot immediately duplicate that boot work, then keep the steady cadence.
+        sleep(Duration::from_secs(30)).await;
+        let mut ticker = tokio::time::interval(Duration::from_secs(30));
+        ticker.tick().await; // discard interval's immediate tick
+        loop {
+            let outcome = tokio::task::spawn_blocking(|| {
+                application_cleanup_maintenance_tick(
+                    || {
+                        crate::session::container::recover_pending_application_operations(
+                            |operation| {
+                                crate::runtime::configured()
+                                    .and_then(|api| {
+                                        api.abandon_application(operation.to_owned()).wait()
+                                    })
+                                    .map_err(|error| anyhow::anyhow!(error))
+                            },
+                        )
+                    },
+                    || {
+                        crate::runtime::configured()
+                            .and_then(|api| api.recover_application_cleanup().wait())
+                    },
+                )
+            })
+            .await;
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(
+                    token = "runtime-application-cleanup-maintenance-pending",
+                    "application cleanup maintenance remains pending: {error}"
+                ),
+                Err(error) => warn!(
+                    token = "runtime-application-cleanup-maintenance-join",
+                    "application cleanup maintenance task failed: {error}"
+                ),
+            }
+            ticker.tick().await;
+        }
+    });
+    ApplicationCleanupGuard(handle)
+}
+
 /// Aborts the library-scan task when this connection ends: a stale scanner must never
 /// outlive its node_secret.
 struct LibraryScanGuard(tokio::task::JoinHandle<()>);
@@ -3793,6 +3917,52 @@ where
 mod tests {
     use super::*;
     use crate::session::{AbrMode, EncoderChoice};
+
+    #[test]
+    fn failed_application_retirement_prevents_audio_and_legacy_sweep_before_admission() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        assert_eq!(
+            post_application_retirement(
+                false,
+                || calls.borrow_mut().push("audio"),
+                || {
+                    calls.borrow_mut().push("sweep");
+                    1
+                },
+            ),
+            None
+        );
+        assert!(calls.borrow().is_empty());
+        assert_eq!(
+            post_application_retirement(
+                true,
+                || calls.borrow_mut().push("audio"),
+                || {
+                    calls.borrow_mut().push("sweep");
+                    1
+                },
+            ),
+            Some(1)
+        );
+        assert_eq!(&*calls.borrow(), &["audio", "sweep"]);
+    }
+
+    #[test]
+    fn application_maintenance_runs_journal_recovery_after_a_pending_map_error() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        application_cleanup_maintenance_tick(
+            || {
+                calls.borrow_mut().push("pending");
+                anyhow::bail!("map poisoned")
+            },
+            || {
+                calls.borrow_mut().push("journal");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(&*calls.borrow(), &["pending", "journal"]);
+    }
 
     /// A `Config` on a scratch `node_secret_path`, so these tests never touch a real
     /// `/tmp/quasar-*-secret` left by another test or a live agent.

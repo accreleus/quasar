@@ -3528,7 +3528,16 @@ fn perform_swap(
     // ── Step 2: stop the outgoing app and WAIT for it to exit ────────────────
     // Past this line a failure costs the previous app's process state, so everything
     // cheaply validatable must already have been validated above.
-    let stopped_previous_app = current_source.stop_app_container();
+    let stopped_previous_app =
+        current_source
+            .stop_app_container()
+            .map_err(|error| SwapFailure {
+                // The stop request may have reached Docker before its cleanup reply was lost.
+                // We cannot honestly claim the old process was rolled back or start another
+                // managed-home writer while that exact teardown remains unresolved.
+                reason: format!("previous application teardown remains unproven: {error}"),
+                fatal: true,
+            })?;
     if stopped_previous_app {
         tracing::info!(
             "swap: previous app container stopped and reaped (gen {} -> {gen}); its compositor \
@@ -3636,7 +3645,7 @@ fn perform_swap(
     // whatever exit it observes and it is never misclassified as an app failure. Its
     // `exit_result` slot drops with it, so the caller's `take_container_exit` poll only
     // ever sees the new generation. The old app container is already gone (step 2), so
-    // this drop only NULLs its compositor and runs the idempotent `force_remove` backstop.
+    // this drop only NULLs its compositor; application cleanup remains an owned durable API obligation.
     *current_source = new_source;
     Ok(())
 }

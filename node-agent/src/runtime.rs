@@ -7,9 +7,14 @@ use std::{
 };
 use tokio::sync::{watch, Semaphore};
 
+mod application;
 mod builds;
 mod docker;
 mod helpers;
+pub use application::{
+    ApplicationId, ApplicationLogTail, ApplicationMount, ApplicationRequest, ApplicationResult,
+    ApplicationSecurity,
+};
 pub use builds::BuildRequest;
 pub use helpers::{
     AudioRun, DiagnosticDevices, DiagnosticHelper, DiagnosticNetwork, DiagnosticRequirements,
@@ -385,6 +390,91 @@ impl RuntimeClient {
         self.submit(async move { docker::inspect_image_metadata(&config, &image).await })
     }
 
+    /// Create and start one session application under a durable, owned
+    /// operation. Repeated calls reconcile the same operation; they never
+    /// create a second container after an uncertain response.
+    pub fn start_application(&self, request: ApplicationRequest) -> Operation<ApplicationId> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::application::start(&config, request).await },
+            self.config.deadline,
+            true,
+        )
+    }
+
+    /// Observe an application exit and collect its final retained logs. Dropping
+    /// this observer only cancels observation; explicit stop owns termination.
+    pub fn observe_application(&self, id: ApplicationId) -> Operation<ApplicationResult> {
+        let config = self.config.clone();
+        self.submit(async move { docker::application::observe(&config, id).await })
+    }
+
+    /// Read a bounded current application log tail for readiness diagnostics.
+    /// This is observation only: cancellation and transport failure cannot
+    /// request a stop or alter the durable lifecycle intent.
+    pub fn application_log_tail(&self, id: ApplicationId) -> Operation<ApplicationLogTail> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::application::log_tail(&config, id).await },
+            std::cmp::min(self.config.deadline, Duration::from_secs(2)),
+            false,
+        )
+    }
+
+    pub fn stop_application(&self, id: ApplicationId, timeout: Duration) -> Operation<()> {
+        let config = self.config.clone();
+        let seconds = timeout.as_secs().min(i32::MAX as u64) as i32;
+        self.submit_owned(
+            async move { docker::application::stop(&config, id, seconds).await },
+            self.config.deadline,
+            true,
+        )
+    }
+
+    /// Persist final exit and log evidence before deleting the owned container.
+    pub fn cleanup_application(&self, id: ApplicationId) -> Operation<()> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::application::cleanup(&config, id).await },
+            self.config.deadline,
+            true,
+        )
+    }
+
+    /// Retry durable terminal application cleanup at startup or a safe
+    /// maintenance tick. Running applications are never adopted or stopped.
+    pub fn recover_application_cleanup(&self) -> Operation<()> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::application::recover_cleanup(&config).await },
+            self.config.deadline.saturating_mul(4),
+            true,
+        )
+    }
+
+    /// Boot-only retirement of application records from a prior agent. This
+    /// is an explicit teardown policy, never adoption of a running session.
+    pub fn retire_applications(&self) -> Operation<()> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::application::retire(&config).await },
+            self.config.deadline.saturating_mul(4),
+            true,
+        )
+    }
+
+    /// Persist abandonment for a launch whose caller lost its returned handle.
+    /// It reconciles only this stable operation and never discovers by prefix.
+    pub fn abandon_application(&self, operation: impl Into<String>) -> Operation<()> {
+        let config = self.config.clone();
+        let operation = operation.into();
+        self.submit_owned(
+            async move { docker::application::abandon(&config, &operation).await },
+            self.config.deadline,
+            true,
+        )
+    }
+
     /// Create and explicitly start one owned diagnostic helper. Dropping the
     /// returned operation detaches its observer; it never stops the helper.
     pub fn run_diagnostic(
@@ -516,6 +606,8 @@ impl RuntimeClient {
     }
 }
 
+#[cfg(test)]
+mod application_tests;
 #[cfg(test)]
 mod inspection_tests;
 

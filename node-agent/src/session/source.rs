@@ -48,7 +48,7 @@ use gstreamer::prelude::*;
 use super::audio::PulseSidecar;
 use super::container::{
     AppDisplayMode, AppExitStatus, AppLogRing, ContainerRuntime, ContainerSpec, LaunchParams,
-    RunningContainer, APP_LOG_DRAIN_BUDGET,
+    RunningContainer,
 };
 use super::host::wayland_display_from_message;
 use super::input::InputState;
@@ -79,6 +79,13 @@ fn app_presented_since_launch(baseline: Option<u64>, now: u64) -> bool {
 /// from one rendered output into an inflated source cadence.
 fn source_commit_advanced(current: u64, previous: u64) -> u64 {
     u64::from(current > previous)
+}
+
+/// Runtime observation errors are not terminal application evidence. The observer
+/// keeps its own bounded retry loop for every error kind; only a verified
+/// `ApplicationResult` may publish an application exit.
+fn retry_application_observation(_kind: crate::runtime::ErrorKind) -> bool {
+    true
 }
 
 /// Session-level resources shared across app swaps: the virtual input devices and the
@@ -270,20 +277,16 @@ pub struct AppSource {
     /// semantics via [`Self::take_launch_error`], so the caller fails the session exactly
     /// once per occurrence rather than on every poll.
     launch_error: Option<String>,
-    /// The app container's terminal exit status, written once by the `docker wait` thread
-    /// spawned in [`Self::launch`] and consumed by [`Self::take_container_exit`]. `None`
+    /// The app container's terminal exit status, written once by the RuntimeClient
+    /// observer spawned in [`Self::launch`] and consumed by [`Self::take_container_exit`]. `None`
     /// while still running. A legitimate teardown (swap, session stop) is filtered out
     /// BEFORE this is written — see the waiter closure in `launch`.
     exit_result: Arc<Mutex<Option<AppExitStatus>>>,
-    /// The app container's own last ~100 log lines, filled by the follower threads in
-    /// [`Self::launch`] and read only on the failure path ([`Self::app_log_tail`]).
+    /// The app container's own last ~100 log lines, filled by bounded RuntimeClient
+    /// log snapshots and read on the failure path ([`Self::app_log_tail`]).
     /// #463: an app that exits before producing a frame surfaces as "media path
     /// interrupted" unless its own final words travel with the failure.
     app_logs: AppLogRing,
-    /// The log follower's supervising thread for the CURRENT container, retained so the
-    /// failure path can drain it before snapshotting the ring rather than racing it.
-    /// `None` before the first launch and once consumed by [`Self::app_log_tail`].
-    log_follower: Option<std::thread::JoinHandle<()>>,
     /// `app-surface-commits` as it stood immediately BEFORE the current container
     /// launched. The counter is a lifetime total on a compositor element that OUTLIVES
     /// its app container, so after a rollback or retry the previous container's commits
@@ -356,7 +359,6 @@ impl AppSource {
             launch_error: None,
             exit_result: Arc::new(Mutex::new(None)),
             app_logs: AppLogRing::new(),
-            log_follower: None,
             app_commits_at_launch: None,
         })
     }
@@ -665,15 +667,10 @@ impl AppSource {
     /// The app container's retained log lines, oldest first. Empty when nothing was
     /// captured (no container, follower failed to start, or a silent app).
     ///
-    /// Drains the follower first, within a bounded budget: the exit waiter and the log
-    /// follower are independent threads watching the same container, and `docker wait`
-    /// routinely returns before the log stream is fully read, so snapshotting immediately
-    /// would systematically drop the final lines — the only ones anybody reads. `&mut
-    /// self` because the handle is consumed and the drain happens exactly once.
+    /// RuntimeClient supplies this bounded ring from its owned API log reads. Terminal
+    /// observation replaces the running snapshot before it publishes an exit, preserving
+    /// the application's final lines even when cleanup follows immediately.
     pub fn app_log_tail(&mut self) -> Vec<String> {
-        if let Some(handle) = self.log_follower.take() {
-            ContainerRuntime::await_log_drain(handle, APP_LOG_DRAIN_BUDGET);
-        }
         self.app_logs.tail()
     }
 
@@ -737,9 +734,8 @@ impl AppSource {
     /// the split matters twice:
     ///  - the container must be GONE, not merely signalled, before the replacement
     ///    launches, because the exit is what releases the lock in the shared managed
-    ///    home. `RunningContainer::stop` → `ContainerRuntime::graceful_remove` issues
-    ///    `docker stop -t N`, which returns only once the container has exited or been
-    ///    killed, then `rm -f`. So this call is the wait-for-exit as well as the stop.
+    ///    home. `RunningContainer::stop` uses the owned RuntimeClient stop and cleanup
+    ///    operations; it returns only after that exact durable identity proves removal.
     ///  - the compositor keeps running, so the encode pipeline keeps being fed real (now
     ///    app-less) frames for the whole gap: the encoder never starves, PTS stay
     ///    continuous, and GCC never sees a dead media path. The user sees the empty
@@ -748,13 +744,14 @@ impl AppSource {
     /// Returns `true` if a container was running and has now been reaped. The waiter
     /// thread's observation of this exit is discarded (the shared `removed` flag is set
     /// first), so it is never misreported as an app-liveness failure.
-    pub fn stop_app_container(&mut self) -> bool {
-        match self.container.take() {
-            Some(mut c) => {
-                c.stop();
-                true
+    pub fn stop_app_container(&mut self) -> Result<bool, String> {
+        match self.container.as_mut() {
+            Some(c) => {
+                c.stop().map_err(|error| error.to_string())?;
+                self.container.take();
+                Ok(true)
             }
-            None => false,
+            None => Ok(false),
         }
     }
 
@@ -847,13 +844,9 @@ impl AppSource {
                 // words as the replacement app's failure. The old follower keeps its own
                 // `Arc` to the retired ring and drains into it harmlessly.
                 self.app_logs = AppLogRing::new();
-                // Follow the app's log BEFORE spawning the exit waiter, so a container
-                // that dies immediately still has its final lines captured. Both are
-                // cheap and non-blocking.
-                self.log_follower = self
-                    .runtime
-                    .spawn_log_follower(c.container_id().to_string(), self.app_logs.clone());
-                self.spawn_exit_waiter(c.container_id().to_string(), c.removed_flag());
+                // The RuntimeClient observer fills final API log evidence before it
+                // publishes terminal status, including an application that dies immediately.
+                self.spawn_exit_waiter(c.application_id(), c.removed_flag(), self.app_logs.clone());
                 self.container = Some(c);
             }
             Err(e) => {
@@ -871,20 +864,16 @@ impl AppSource {
         }
     }
 
-    /// Spawn the dedicated `docker wait` thread for a just-launched container. One thread
-    /// per container generation, named for diagnosability; it exits the moment `docker
-    /// wait` returns, so a session never accumulates more than one live waiter per
-    /// generation (a swap's old generation is dropped with its `AppSource`).
-    ///
-    /// Must not use `output_with_timeout` (see `ContainerRuntime::wait_for_exit`), which
-    /// is why this needs its own OS thread rather than running inline on the poll loop.
-    ///
-    /// Accepted leak: `docker wait` has no deadline, so if the container-runtime daemon
-    /// itself wedges, this thread parks forever inside the blocking `Command::output()`
-    /// and is never joined. Bounded at one leaked thread per session generation, and a
-    /// wedged daemon already fails every other container operation on the host.
-    fn spawn_exit_waiter(&self, container_id: String, removed_flag: Arc<AtomicBool>) {
-        let runtime = self.runtime.clone();
+    /// Spawn the dedicated RuntimeClient observer for a just-launched container. One thread
+    /// per generation owns only observation: each request is bounded, the intentional-stop
+    /// marker ends the loop, and cancellation never asks the engine to stop the workload.
+    /// A verified terminal result supplies final logs before this thread publishes status.
+    fn spawn_exit_waiter(
+        &self,
+        application: crate::runtime::ApplicationId,
+        removed_flag: Arc<AtomicBool>,
+        logs: AppLogRing,
+    ) {
         let slot = self.exit_result.clone();
         let sink_name = self.sink_name.clone();
         let thread_sink_name = sink_name.clone();
@@ -894,7 +883,56 @@ impl AppSource {
             // Re-enter the session span so this thread's lines carry session=<id>.
             let _log_span = log_span.enter();
             let sink_name = thread_sink_name;
-            let status = runtime.wait_for_exit(&container_id);
+            // A bounded runtime observation is not terminal evidence. Keep
+            // observing a silent, healthy game after its per-request deadline;
+            // only a daemon answer for a stopped container becomes an exit.
+            let status = loop {
+                if removed_flag.load(Ordering::SeqCst) {
+                    return;
+                }
+                match crate::runtime::configured()
+                    .and_then(|api| api.observe_application(application.clone()).wait())
+                {
+                    Ok(result) if result.oom_killed == Some(true) => {
+                        for line in result.stdout.lines().chain(result.stderr.lines()) {
+                            logs.push(line.to_owned());
+                        }
+                        break AppExitStatus::OomKilled;
+                    }
+                    Ok(result) => {
+                        for line in result.stdout.lines().chain(result.stderr.lines()) {
+                            logs.push(line.to_owned());
+                        }
+                        break result
+                            .exit_code
+                            .and_then(|code| i32::try_from(code).ok())
+                            .map(AppExitStatus::Code)
+                            .unwrap_or(AppExitStatus::Unknown);
+                    }
+                    Err(error) if retry_application_observation(error.kind) => {
+                        // Readiness needs evidence while a game is still alive.
+                        // This bounded read is observational and cannot alter its
+                        // lifecycle; final logs replace it on terminal observe.
+                        if let Ok(api) = crate::runtime::configured() {
+                            if let Ok(tail) = api.application_log_tail(application.clone()).wait() {
+                                for line in tail.stdout.lines().chain(tail.stderr.lines()) {
+                                    logs.push(line.to_owned());
+                                }
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            token = "application-wait-failed",
+                            "runtime application wait failed: {error}"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        continue;
+                    }
+                }
+            };
             // A deliberate stop (swap teardown, session stop) sets the shared `removed`
             // flag BEFORE issuing `docker stop`/`rm` (`RunningContainer::stop`), so if it
             // is set here the exit just observed is our own teardown, not an app failure.
@@ -924,15 +962,16 @@ impl AppSource {
     /// Tear down (idempotent): remove the app container, then NULL the pipeline.
     /// `Drop` is the backstop.
     pub fn teardown(&mut self) {
-        if let Some(mut c) = self.container.take() {
-            c.stop();
+        if let Some(c) = self.container.as_mut() {
+            if let Err(error) = c.stop() {
+                tracing::warn!(
+                    token = "application-teardown-pending",
+                    "runtime application teardown remains durable: {error}"
+                );
+            } else {
+                self.container.take();
+            }
         }
-        // Orphan backstop: force-remove by the deterministic container name. The tracked
-        // handle above covers the normal case, but a mid-flight launch (a slow image pull
-        // racing the 20 s swap first-frame deadline) or a partial failure can leave an
-        // untracked `quasar-sess-*-g{n}` container. `force_remove` is idempotent and
-        // best-effort, so this is a safe no-op when the handle already removed it.
-        self.runtime.force_remove(&self.container_name);
         let _ = self.pipeline.set_state(gst::State::Null);
     }
 }
@@ -945,7 +984,10 @@ impl Drop for AppSource {
 
 #[cfg(test)]
 mod tests {
-    use super::{app_presented_since_launch, source_commit_advanced};
+    use super::{
+        app_presented_since_launch, retry_application_observation, source_commit_advanced,
+    };
+    use crate::runtime::ErrorKind;
 
     // `app-surface-commits` is a LIFETIME total on a compositor that outlives its app
     // container. Scoping "did it ever draw?" to the current container is what keeps a
@@ -962,6 +1004,25 @@ mod tests {
         );
         // One frame past the baseline IS the replacement drawing.
         assert!(app_presented_since_launch(Some(400), 401));
+    }
+
+    #[test]
+    fn no_observation_error_is_published_as_an_application_exit() {
+        for kind in [
+            ErrorKind::Timeout,
+            ErrorKind::Unavailable,
+            ErrorKind::Busy,
+            ErrorKind::UnknownOutcome,
+            ErrorKind::Cancelled,
+            ErrorKind::Protocol,
+            ErrorKind::Engine,
+            ErrorKind::InvalidConfiguration,
+        ] {
+            assert!(
+                retry_application_observation(kind),
+                "{kind:?} is missing terminal evidence and must leave a live app alone"
+            );
+        }
     }
 
     #[test]

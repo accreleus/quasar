@@ -2,6 +2,7 @@
 use super::{ApiVersion, EngineInfo, ErrorKind, RuntimeConfig, RuntimeError};
 use bollard::{errors::Error, Docker};
 use futures_util::StreamExt;
+pub(super) mod application;
 mod build;
 mod credentials;
 mod inspection;

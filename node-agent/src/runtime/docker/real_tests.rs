@@ -1,5 +1,6 @@
 //! Opt-in Docker acceptance. Only uniquely named assets created here are mutated.
 use super::*;
+use crate::runtime::ApplicationRequest;
 use crate::runtime::RuntimeClient;
 use std::io::{Read, Write};
 use std::sync::{
@@ -235,6 +236,86 @@ fn real_docker_pull_reuse_in_use_refusal_and_remove() {
     runtime.remove_image(&reference, budget).wait().unwrap();
     runtime.remove_image(&alias, budget).wait().unwrap();
     println!("Docker {} API {}: pull, offline reuse, multi-tag in-use refusal, removal and absent removal passed",engine.version,engine.api_version);
+}
+
+/// Keep the exact-operation journal if teardown cannot be proved, including
+/// assertion unwinding after a lost create reply. The parent is explicitly
+/// host-backed so an ephemeral test runner cannot erase cleanup obligations.
+struct ApplicationAssets {
+    runtime: RuntimeClient,
+    operation: String,
+    journal: Option<tempfile::TempDir>,
+    cleaned: bool,
+}
+
+impl Drop for ApplicationAssets {
+    fn drop(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        if let Err(error) = self
+            .runtime
+            .abandon_application(self.operation.clone())
+            .wait()
+        {
+            if let Some(journal) = self.journal.take() {
+                let retained = journal.keep();
+                eprintln!(
+                    "application smoke cleanup pending: {error}; operation={}, journal={}",
+                    self.operation,
+                    retained.display()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires explicit test socket, application image, and host-backed QUASAR_TEST_APPLICATION_STATE_DIR; creates one unique owned application"]
+fn real_docker_application_runtime_lifecycle() {
+    let socket =
+        std::env::var("QUASAR_TEST_RUNTIME_SOCKET").expect("set explicit local test socket");
+    let image =
+        std::env::var("QUASAR_TEST_APPLICATION_IMAGE").expect("set explicit local test image");
+    let state_dir = std::env::var("QUASAR_TEST_APPLICATION_STATE_DIR")
+        .expect("set an existing host-backed directory for durable test cleanup");
+    let unique = format!(
+        "quasar-sess-runtime-smoke-{}",
+        crate::runtime::builds::build_id()
+    );
+    let dir = tempfile::Builder::new()
+        .prefix("application-smoke-")
+        .tempdir_in(state_dir)
+        .unwrap();
+    let mut config = RuntimeConfig::unix(socket);
+    config.image_state_path = Some(dir.path().join("operations"));
+    config.diagnostic_owner = Some(format!("runtime-smoke-{unique}"));
+    config.deadline = Duration::from_secs(20);
+    let runtime = RuntimeClient::new(config).unwrap();
+    let request = ApplicationRequest {
+        operation: format!("application-{unique}"),
+        name: unique,
+        image,
+        pull_never: true,
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "echo runtime-smoke-final; exit 0".into(),
+        ],
+        ..Default::default()
+    };
+    let mut assets = ApplicationAssets {
+        runtime: runtime.clone(),
+        operation: request.operation.clone(),
+        journal: Some(dir),
+        cleaned: false,
+    };
+    let id = runtime.start_application(request).wait().unwrap();
+    let result = runtime.observe_application(id.clone()).wait().unwrap();
+    assert_eq!(result.exit_code, Some(0));
+    assert!(result.stdout.contains("runtime-smoke-final"));
+    runtime.cleanup_application(id).wait().unwrap();
+    assets.cleaned = true;
 }
 
 #[test]

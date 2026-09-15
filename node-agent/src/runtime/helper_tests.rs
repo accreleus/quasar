@@ -26,6 +26,7 @@ struct State {
     running: bool,
     exited: bool,
     exit: Option<i64>,
+    oom_killed: bool,
     keep_running: bool,
     logs: Vec<(u8, Vec<u8>)>,
     lose_logs: bool,
@@ -38,10 +39,29 @@ struct State {
     refuse_create: bool,
     replace_id: bool,
     inspect_code: Option<u16>,
+    inspect_after_start_code: Option<u16>,
+    pause_mutation_reply: Option<(String, Arc<LogGate>)>,
     host_mount_override: Option<Value>,
+    host_config_patch: Option<Value>,
     realized_mount_override: Option<Value>,
     host_device_requests_override: Option<Value>,
     host_security_opt_override: Option<Value>,
+    host_devices_override: Option<Value>,
+    host_group_add_override: Option<Value>,
+    config_entrypoint_override: Option<Value>,
+    config_cmd_override: Option<Value>,
+    config_user_override: Option<Value>,
+    image_missing: bool,
+    image_volumes: Option<Vec<String>>,
+    exec_created: bool,
+    exec_started: bool,
+    exec_running: bool,
+    lose_exec_create: bool,
+    lose_exec_start: bool,
+    lose_exec_start_before_effect: bool,
+    exec_create_delay: Option<Duration>,
+    exec_foreign: bool,
+    exec_exit: Option<Option<i64>>,
     inherited_env: Vec<String>,
     requests: Vec<String>,
     pause_first_log: Option<Arc<LogGate>>,
@@ -167,6 +187,21 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
     let mut gate = None;
     if route == "/version" {
         response = json!({"Platform":{"Name":"Docker"},"Version":"28.0.0","ApiVersion":"1.48","MinAPIVersion":"1.40"});
+    } else if method == "GET" && route.starts_with("/images/") && route.contains("/json") {
+        if s.image_missing {
+            code = 404;
+            response = json!({"message":"missing"});
+        } else {
+            let volumes = s.image_volumes.as_ref().map(|targets| {
+                Value::Object(
+                    targets
+                        .iter()
+                        .map(|target| (target.clone(), json!({})))
+                        .collect(),
+                )
+            });
+            response = json!({"Id":"sha256:fixture-image","Config":{"Env":[],"Entrypoint":["/image-entry"],"Cmd":["image-command"],"User":null,"Volumes":volumes}});
+        }
     } else if method == "POST" && route.starts_with("/containers/create?") {
         if s.refuse_create {
             s.refuse_create = false;
@@ -189,12 +224,65 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
                 return;
             }
         }
+    } else if method == "POST" && route.starts_with("/containers/") && route.ends_with("/exec") {
+        assert!(
+            route.contains(ID),
+            "exec must use verified immutable application ID"
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"AttachStderr":false,"AttachStdout":false,"Privileged":true,"User":"root","Cmd":["umount","/proc/driver/nvidia/params"]})
+        );
+        assert!(!s.exec_created, "duplicate repair exec");
+        s.exec_created = true;
+        response = json!({"Id":"repair-exec"});
+        if let Some(delay) = s.exec_create_delay {
+            std::thread::sleep(delay);
+        }
+        if std::mem::take(&mut s.lose_exec_create) {
+            return;
+        }
+    } else if method == "POST" && route == "/exec/repair-exec/start" {
+        assert!(s.exec_created, "exec start without create");
+        assert!(!s.exec_started, "duplicate repair exec start");
+        if std::mem::take(&mut s.lose_exec_start_before_effect) {
+            return;
+        }
+        s.exec_started = true;
+        raw = Some(Vec::new());
+        if std::mem::take(&mut s.lose_exec_start) {
+            return;
+        }
+    } else if method == "GET" && route == "/exec/repair-exec/json" {
+        response = json!({"ID":"repair-exec","ContainerID":if s.exec_foreign { "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } else { ID },"Running":s.exec_running,"ExitCode":if s.exec_running || !s.exec_started { Value::Null } else { s.exec_exit.unwrap_or(Some(0)).map_or(Value::Null, Value::from) }});
     } else if method == "GET" && route.ends_with("/json") {
         if let Some(body) = &s.body {
-            let mounts: Vec<Value> = body["HostConfig"]["Mounts"].as_array().into_iter().flatten().map(|mount| {
+            let mut mounts: Vec<Value> = body["HostConfig"]["Mounts"].as_array().into_iter().flatten().map(|mount| {
                 let volume = mount["Type"].as_str() == Some("volume");
                 json!({"Type":mount["Type"],"Source":mount["Source"],"Name":if volume { mount["Source"].clone() } else { Value::Null },"Destination":mount["Target"],"RW":!mount["ReadOnly"].as_bool().unwrap_or(false)})
             }).collect();
+            // Docker inspect exposes legacy `-v` mounts only through Mounts;
+            // Binds retains the requested suffixes but not the realized RW bit.
+            mounts.extend(body["HostConfig"]["Binds"].as_array().into_iter().flatten().filter_map(|bind| {
+                let bind = bind.as_str()?;
+                let mut parts = bind.splitn(3, ':');
+                let source = parts.next()?;
+                let destination = parts.next()?;
+                let read_only = parts.next().is_some_and(|options| options.split(',').any(|option| option == "ro" || option == "readonly"));
+                let volume = !source.starts_with('/');
+                Some(json!({"Type":if volume { "volume" } else { "bind" }, "Source":if volume { Value::Null } else { json!(source) }, "Name":if volume { json!(source) } else { Value::Null }, "Destination":destination,"RW":!read_only}))
+            }));
+            let explicit_targets = mounts
+                .iter()
+                .filter_map(|mount| mount["Destination"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>();
+            mounts.extend(
+                s.image_volumes
+                    .iter()
+                    .flatten()
+                    .filter(|target| !explicit_targets.contains(*target))
+                    .map(|target| json!({"Type":"volume","Source":format!("/var/lib/docker/volumes/fixture-{target}/_data"),"Name":format!("fixture-{target}"),"Destination":target,"RW":true})),
+            );
             let realized_mounts = s
                 .realized_mount_override
                 .clone()
@@ -203,19 +291,52 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
             if let Some(mounts) = &s.host_mount_override {
                 host_config["Mounts"] = mounts.clone();
             }
+            if let Some(Value::Object(patch)) = &s.host_config_patch {
+                for (key, value) in patch {
+                    host_config[key] = value.clone();
+                }
+            }
             if let Some(requests) = &s.host_device_requests_override {
                 host_config["DeviceRequests"] = requests.clone();
             }
             if let Some(security) = &s.host_security_opt_override {
                 host_config["SecurityOpt"] = security.clone();
             }
+            if let Some(devices) = &s.host_devices_override {
+                host_config["Devices"] = devices.clone();
+            }
+            if let Some(groups) = &s.host_group_add_override {
+                host_config["GroupAdd"] = groups.clone();
+            }
             let mut config = body.clone();
+            if config["Entrypoint"].is_null() {
+                config["Entrypoint"] = json!(["/image-entry"]);
+            }
+            if config["Cmd"].is_null() {
+                config["Cmd"] = json!(["image-command"]);
+            }
+            if config["User"].is_null() {
+                config["User"] = json!("");
+            }
+            if let Some(user) = &s.config_user_override {
+                config["User"] = user.clone();
+            }
+            if let Some(entrypoint) = &s.config_entrypoint_override {
+                config["Entrypoint"] = entrypoint.clone();
+            }
+            if let Some(cmd) = &s.config_cmd_override {
+                config["Cmd"] = cmd.clone();
+            }
             if !s.inherited_env.is_empty() {
                 let env = config["Env"].as_array_mut().unwrap();
                 env.extend(s.inherited_env.iter().cloned().map(Value::String));
             }
-            response = json!({"Id":if s.replace_id { "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } else {ID},"Name":format!("/{}",s.name),"Config":config,"HostConfig":host_config,"Mounts":realized_mounts,"State":{"Running":s.running,"Status":if s.running {"running"} else if s.exited {"exited"} else {"created"},"ExitCode":s.exit}});
-            if let Some(inspect_code) = s.inspect_code {
+            response = json!({"Id":if s.replace_id { "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } else {ID},"Image":"sha256:fixture-image","Name":format!("/{}",s.name),"Config":config,"HostConfig":host_config,"Mounts":realized_mounts,"State":{"Running":s.running,"Status":if s.running {"running"} else if s.exited {"exited"} else {"created"},"ExitCode":s.exit,"OOMKilled":s.oom_killed}});
+            if let Some(inspect_code) = s.inspect_code.or_else(|| {
+                (s.running || s.exited)
+                    .then_some(s.inspect_after_start_code)
+                    .flatten()
+            }) {
                 code = inspect_code;
                 response = json!({"message":"fixture inspect"});
             }
@@ -223,7 +344,7 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
             code = 404;
             response = json!({"message":"missing"});
         }
-    } else if method == "POST" && route.ends_with("/start") {
+    } else if method == "POST" && route.contains("/start") {
         assert!(route.contains(ID), "mutation must use immutable id");
         s.running = s.keep_running;
         s.exited = !s.keep_running;
@@ -246,8 +367,15 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
         if std::mem::take(&mut s.lose_logs) {
             return;
         }
+        let tail = route
+            .split("tail=")
+            .nth(1)
+            .and_then(|value| value.split('&').next())
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(usize::MAX);
+        let first = s.logs.len().saturating_sub(tail);
         let mut bytes = Vec::new();
-        for (kind, log) in &s.logs {
+        for (kind, log) in &s.logs[first..] {
             bytes.extend_from_slice(&[*kind, 0, 0, 0]);
             bytes.extend_from_slice(&(log.len() as u32).to_be_bytes());
             bytes.extend_from_slice(log);
@@ -273,7 +401,23 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
     } else {
         panic!("unexpected fixture request: {method} {route}");
     }
+    let mutation_gate = if s
+        .pause_mutation_reply
+        .as_ref()
+        .is_some_and(|(prefix, _)| format!("{method} {route}").starts_with(prefix))
+    {
+        s.pause_mutation_reply.take().map(|(_, gate)| gate)
+    } else {
+        None
+    };
     drop(s);
+    if let Some(gate) = mutation_gate {
+        gate.entered.store(true, Ordering::SeqCst);
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        while !gate.released.load(Ordering::SeqCst) && std::time::Instant::now() < until {
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
     let bytes = raw.unwrap_or_else(|| {
         if code == 204 {
             Vec::new()
@@ -336,6 +480,1743 @@ fn nvidia_request() -> (DiagnosticHelper, NvidiaGpuRun) {
             has_gbm_backend: true,
         },
     )
+}
+
+#[test]
+fn application_failed_realization_retires_its_verified_created_id() {
+    for rejected in ["mount", "device", "security"] {
+        let engine = Engine::new();
+        {
+            let mut state = engine.state.lock().unwrap();
+            match rejected {
+                "mount" => state.realized_mount_override = Some(json!([])),
+                "device" => state.host_devices_override = Some(json!([])),
+                "security" => state.host_security_opt_override = Some(json!([])),
+                _ => unreachable!(),
+            }
+        }
+        let request = realized_requirements_request(&format!("rejected-{rejected}"));
+        assert!(
+            engine
+                .client()
+                .start_application(request.clone())
+                .wait()
+                .is_err(),
+            "{rejected}"
+        );
+        assert_eq!(engine.requests("POST /containers/create"), 1, "{rejected}");
+        assert_eq!(
+            engine.requests(&format!("POST /containers/{ID}/start")),
+            0,
+            "{rejected}"
+        );
+        // The full ID was durably returned by this create. Refusing to run a
+        // weakened request must not also refuse its ownership-verified cleanup.
+        engine
+            .client()
+            .abandon_application(request.operation)
+            .wait()
+            .unwrap();
+        assert_eq!(engine.requests("DELETE /containers/"), 1, "{rejected}");
+        assert!(engine.state.lock().unwrap().body.is_none(), "{rejected}");
+    }
+}
+
+#[test]
+fn application_abandon_before_intent_is_a_noop_without_opening_docker_and_allows_retry() {
+    let engine = Engine::new();
+    let operation = "session-fixture-preflight-no-intent";
+    let request = ApplicationRequest {
+        operation: operation.into(),
+        name: "quasar-sess-fixture-preflight-no-intent".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    let mut unavailable = engine.config.clone();
+    unavailable.socket = "/tmp/quasar-preflight-engine-unavailable.sock".into();
+    let unavailable_client = RuntimeClient::new(unavailable).unwrap();
+    assert!(unavailable_client
+        .start_application(request.clone())
+        .wait()
+        .is_err());
+    // Opening Docker failed before start could fsync a submission intent. Abandonment
+    // is therefore a proven no-op and must not attempt a second Docker connection.
+    unavailable_client
+        .abandon_application(operation)
+        .wait()
+        .unwrap();
+    assert!(engine.state.lock().unwrap().requests.is_empty());
+    engine.client().start_application(request).wait().unwrap();
+    assert_eq!(engine.requests("POST /containers/create"), 1);
+}
+
+#[test]
+fn saturated_application_admission_leaves_no_intent_so_abandon_releases_the_retry() {
+    let engine = Engine::new();
+    let gate = Arc::new(LogGate::default());
+    engine.state.lock().unwrap().pause_mutation_reply =
+        Some(("POST /containers/create".into(), gate.clone()));
+    let mut config = engine.config.clone();
+    config.max_in_flight = 1;
+    let client = RuntimeClient::new(config).unwrap();
+    let first = client.start_application(ApplicationRequest {
+        operation: "application-admission-slot-first".into(),
+        name: "quasar-sess-admission-slot-first".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    });
+    wait_for_mutation_reply(&gate);
+    let retry = ApplicationRequest {
+        operation: "application-admission-slot-retry".into(),
+        name: "quasar-sess-admission-slot-retry".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        client
+            .start_application(retry.clone())
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Busy,
+        "a saturated executor must fail before this retry writes an application intent"
+    );
+    gate.released.store(true, Ordering::SeqCst);
+    first.wait().unwrap();
+    // The caller may retain a same-home retry gate for this Busy response. Once the
+    // slot is free, a successful no-intent abandon proves that gate can be cleared.
+    client
+        .abandon_application(retry.operation.clone())
+        .wait()
+        .unwrap();
+    assert_eq!(
+        engine.requests("POST /containers/create"),
+        1,
+        "the Busy retry left no durable intent or daemon mutation behind"
+    );
+}
+
+#[test]
+fn application_abandon_with_a_corrupt_journal_stays_uncertain_without_opening_docker() {
+    let engine = Engine::new();
+    let operation = "session-fixture-corrupt-abandon";
+    let key = Sha256::digest(operation.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let journal = engine
+        .config
+        .image_state_path
+        .as_ref()
+        .unwrap()
+        .join("applications")
+        .join(key);
+    std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+    std::fs::write(journal, b"not-json").unwrap();
+    assert!(engine
+        .client()
+        .abandon_application(operation)
+        .wait()
+        .is_err());
+    assert!(engine.state.lock().unwrap().requests.is_empty());
+}
+
+#[test]
+fn application_abandon_with_an_inaccessible_journal_stays_uncertain_without_opening_docker() {
+    let engine = Engine::new();
+    let blocked = engine._dir.path().join("application-journal-file");
+    std::fs::write(&blocked, b"not a directory").unwrap();
+    let mut config = engine.config.clone();
+    config.image_state_path = Some(blocked);
+    assert!(RuntimeClient::new(config)
+        .unwrap()
+        .abandon_application("session-fixture-inaccessible-abandon")
+        .wait()
+        .is_err());
+    assert!(engine.state.lock().unwrap().requests.is_empty());
+}
+
+#[test]
+fn application_lost_create_cannot_adopt_a_name_with_rejected_requirements() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().lose_create = true;
+    let request = realized_requirements_request("lost-create-rejected-device");
+    assert_eq!(
+        engine
+            .client()
+            .start_application(request.clone())
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    engine.state.lock().unwrap().host_devices_override = Some(json!([]));
+    // A failed retry must not persist an ID learned only from an unverified
+    // name lookup, then let cleanup treat it as create-response authority.
+    assert!(engine
+        .client()
+        .start_application(request.clone())
+        .wait()
+        .is_err());
+    assert!(engine
+        .client()
+        .abandon_application(request.operation)
+        .wait()
+        .is_err());
+    assert_eq!(engine.requests("POST /containers/create"), 1);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/start")), 0);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 0);
+    assert_eq!(engine.requests("DELETE /containers/"), 0);
+}
+
+#[test]
+fn application_foreign_name_collision_never_authorizes_a_mutation() {
+    let engine = Engine::new();
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.name = "quasar-sess-foreign-name".into();
+        state.body = Some(json!({"Labels": {"io.quasar.agent-owner":"foreign-owner"}}));
+    }
+    let result = engine
+        .client()
+        .start_application(ApplicationRequest {
+            operation: "foreign-name-collision".into(),
+            name: "quasar-sess-foreign-name".into(),
+            image: "quasar-app:test".into(),
+            ..Default::default()
+        })
+        .wait();
+    assert_eq!(result.unwrap_err().kind, ErrorKind::UnknownOutcome);
+    assert_eq!(engine.requests("POST /containers/"), 0);
+    assert_eq!(engine.requests("DELETE /containers/"), 0);
+    assert!(engine.state.lock().unwrap().body.is_some());
+}
+
+#[test]
+fn application_changed_ownership_or_id_refuses_stop_and_cleanup() {
+    for changed in ["owner", "operation", "id"] {
+        let engine = Engine::new();
+        engine.state.lock().unwrap().keep_running = true;
+        let id = engine
+            .client()
+            .start_application(ApplicationRequest {
+                operation: format!("ownership-{changed}"),
+                name: format!("quasar-sess-ownership-{changed}"),
+                image: "quasar-app:test".into(),
+                ..Default::default()
+            })
+            .wait()
+            .unwrap();
+        {
+            let mut state = engine.state.lock().unwrap();
+            match changed {
+                "owner" => {
+                    state.body.as_mut().unwrap()["Labels"][crate::container_ownership::LABEL] =
+                        json!("foreign-owner")
+                }
+                "operation" => {
+                    state.body.as_mut().unwrap()["Labels"]["io.quasar.application-operation"] =
+                        json!("foreign-operation")
+                }
+                "id" => state.replace_id = true,
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(
+            engine
+                .client()
+                .stop_application(id.clone(), Duration::from_secs(1))
+                .wait()
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnknownOutcome,
+            "{changed}"
+        );
+        assert_eq!(
+            engine
+                .client()
+                .cleanup_application(id)
+                .wait()
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnknownOutcome,
+            "{changed}"
+        );
+        assert_eq!(
+            engine.requests(&format!("POST /containers/{ID}/stop")),
+            0,
+            "{changed}"
+        );
+        assert_eq!(engine.requests("DELETE /containers/"), 0, "{changed}");
+        assert!(engine.state.lock().unwrap().running, "{changed}");
+    }
+}
+
+fn wait_for_mutation_reply(gate: &LogGate) {
+    let until = std::time::Instant::now() + Duration::from_secs(1);
+    while !gate.entered.load(Ordering::SeqCst) && std::time::Instant::now() < until {
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        gate.entered.load(Ordering::SeqCst),
+        "mutation never reached daemon"
+    );
+}
+
+#[test]
+fn application_cancelled_create_or_start_observer_does_not_roll_back_or_duplicate() {
+    for mutation in [
+        "POST /containers/create".to_owned(),
+        format!("POST /containers/{ID}/start"),
+    ] {
+        let engine = Engine::new();
+        let gate = Arc::new(LogGate::default());
+        {
+            let mut state = engine.state.lock().unwrap();
+            state.keep_running = true;
+            state.pause_mutation_reply = Some((mutation.clone(), gate.clone()));
+        }
+        let request = ApplicationRequest {
+            operation: "cancelled-launch".into(),
+            name: "quasar-sess-cancelled-launch".into(),
+            image: "quasar-app:test".into(),
+            ..Default::default()
+        };
+        let client = engine.client();
+        let cancelled = client.start_application(request.clone());
+        wait_for_mutation_reply(&gate);
+        cancelled.cancel();
+        drop(cancelled);
+        gate.released.store(true, Ordering::SeqCst);
+        let id = engine.client().start_application(request).wait().unwrap();
+        assert_eq!(id.as_str(), ID);
+        assert!(engine.state.lock().unwrap().running);
+        assert_eq!(engine.requests("POST /containers/create"), 1);
+        assert_eq!(engine.requests(&format!("POST /containers/{ID}/start")), 1);
+        assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 0);
+        assert_eq!(engine.requests("DELETE /containers/"), 0);
+    }
+}
+
+#[test]
+fn application_cancelled_stop_and_remove_observers_preserve_cleanup_and_evidence() {
+    let engine = Engine::new();
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.keep_running = true;
+        state.exit = Some(0);
+    }
+    let client = engine.client();
+    let id = client
+        .start_application(ApplicationRequest {
+            operation: "cancelled-cleanup".into(),
+            name: "quasar-sess-cancelled-cleanup".into(),
+            image: "quasar-app:test".into(),
+            ..Default::default()
+        })
+        .wait()
+        .unwrap();
+    let stop_gate = Arc::new(LogGate::default());
+    engine.state.lock().unwrap().pause_mutation_reply =
+        Some((format!("POST /containers/{ID}/stop"), stop_gate.clone()));
+    let stop = client.stop_application(id.clone(), Duration::from_secs(1));
+    wait_for_mutation_reply(&stop_gate);
+    stop.cancel();
+    drop(stop);
+    stop_gate.released.store(true, Ordering::SeqCst);
+    engine
+        .client()
+        .stop_application(id.clone(), Duration::from_secs(1))
+        .wait()
+        .unwrap();
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 1);
+
+    let remove_gate = Arc::new(LogGate::default());
+    engine.state.lock().unwrap().pause_mutation_reply =
+        Some((format!("DELETE /containers/{ID}"), remove_gate.clone()));
+    let cleanup = client.cleanup_application(id.clone());
+    wait_for_mutation_reply(&remove_gate);
+    cleanup.cancel();
+    drop(cleanup);
+    remove_gate.released.store(true, Ordering::SeqCst);
+    let restarted = engine.client();
+    restarted.cleanup_application(id.clone()).wait().unwrap();
+    let result = restarted.observe_application(id).wait().unwrap();
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(result.oom_killed, Some(false));
+    assert_eq!(result.stdout, "final stdout");
+    assert_eq!(result.stderr, "final stderr");
+    assert_eq!(engine.requests("DELETE /containers/"), 1);
+}
+
+#[test]
+fn application_lifecycle_creates_an_owned_container_without_auto_remove() {
+    let engine = Engine::new();
+    let request = ApplicationRequest {
+        operation: "session-fixture-generation-1".into(),
+        name: "quasar-sess-fixture-g1".into(),
+        image: "quasar-app:test".into(),
+        environment: vec!["PULSE_SERVER=unix:/run/pulse/native".into()],
+        mounts: vec!["/daemon/session.sock:/run/user/1000/wayland-0:Z,cached".into()],
+        devices: vec!["/dev/dri".into()],
+        group_add: vec!["44".into()],
+        gpu: true,
+        nvidia_gpu: true,
+        security: ApplicationSecurity {
+            cap_add: vec!["SYS_NICE".into()],
+            security_opt: vec!["seccomp=unconfined".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let id = engine.client().start_application(request).wait().unwrap();
+    let body = engine.state.lock().unwrap().body.clone().unwrap();
+    assert_eq!(
+        body["Labels"][crate::container_ownership::LABEL],
+        "fixture-owner"
+    );
+    assert_eq!(body["HostConfig"]["AutoRemove"], false);
+    assert_eq!(body["HostConfig"]["NetworkMode"], "none");
+    assert_eq!(
+        body["HostConfig"]["Binds"][0],
+        "/daemon/session.sock:/run/user/1000/wayland-0:Z,cached"
+    );
+    assert_eq!(body["HostConfig"]["DeviceRequests"][0]["Driver"], "nvidia");
+    assert_eq!(id.as_str(), ID);
+}
+
+#[test]
+fn application_starts_a_created_container_even_when_docker_reports_exit_zero() {
+    let engine = Engine::new();
+    {
+        let mut state = engine.state.lock().unwrap();
+        // Docker reports ExitCode=0 for a freshly created container. Status,
+        // not that incidental field, decides whether start is still required.
+        state.exit = Some(0);
+        state.keep_running = true;
+    }
+    let id = engine
+        .client()
+        .start_application(ApplicationRequest {
+            operation: "session-fixture-created-zero".into(),
+            name: "quasar-sess-fixture-created-zero".into(),
+            image: "quasar-app:test".into(),
+            ..Default::default()
+        })
+        .wait()
+        .unwrap();
+    assert_eq!(id.as_str(), ID);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/start")), 1);
+}
+
+#[test]
+fn application_verifies_inherited_image_entrypoint_command_and_user() {
+    let engine = Engine::new();
+    let request = ApplicationRequest {
+        operation: "session-fixture-image-defaults".into(),
+        name: "quasar-sess-fixture-image-defaults".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    engine
+        .client()
+        .start_application(request.clone())
+        .wait()
+        .unwrap();
+    let rejected_entrypoint = Engine::new();
+    rejected_entrypoint
+        .state
+        .lock()
+        .unwrap()
+        .config_entrypoint_override = Some(json!(["/changed-entrypoint"]));
+    assert_eq!(
+        rejected_entrypoint
+            .client()
+            .start_application(ApplicationRequest {
+                operation: "session-fixture-image-entrypoint-bad".into(),
+                name: "quasar-sess-fixture-image-entrypoint-bad".into(),
+                image: "quasar-app:test".into(),
+                ..Default::default()
+            })
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol
+    );
+    let rejected = Engine::new();
+    rejected.state.lock().unwrap().config_cmd_override = Some(json!(["changed"]));
+    assert_eq!(
+        rejected
+            .client()
+            .start_application(ApplicationRequest {
+                operation: "session-fixture-image-defaults-bad".into(),
+                name: "quasar-sess-fixture-image-defaults-bad".into(),
+                ..request
+            })
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol
+    );
+    let rejected_user = Engine::new();
+    rejected_user.state.lock().unwrap().config_user_override = Some(json!("1001"));
+    assert_eq!(
+        rejected_user
+            .client()
+            .start_application(ApplicationRequest {
+                operation: "session-fixture-image-user-bad".into(),
+                name: "quasar-sess-fixture-image-user-bad".into(),
+                image: "quasar-app:test".into(),
+                ..Default::default()
+            })
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol
+    );
+}
+
+fn realized_requirements_request(operation: &str) -> ApplicationRequest {
+    ApplicationRequest {
+        operation: operation.into(),
+        name: format!("quasar-sess-{operation}"),
+        image: "quasar-app:test".into(),
+        entrypoint: Some(vec!["/init".into()]),
+        command: vec!["game".into(), "--safe".into()],
+        environment: vec!["PULSE_SERVER=unix:/run/pulse/native".into()],
+        mounts: vec!["/host/home:/home/quasar:Z,nocopy".into()],
+        typed_mounts: vec![ApplicationMount::Bind {
+            source: "/host/wayland".into(),
+            target: "/run/wayland-0".into(),
+            read_only: true,
+            consistency: None,
+        }],
+        devices: vec!["/dev/dri/renderD128".into()],
+        group_add: vec!["44".into()],
+        nvidia_gpu: true,
+        security: ApplicationSecurity {
+            cap_add: vec!["SYS_NICE".into()],
+            no_new_privileges: false,
+            security_opt: vec!["seccomp=unconfined".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn application_rejects_mismatched_realized_mount_device_and_security_requirements() {
+    type RealizationCase = (&'static str, Box<dyn Fn(&mut State)>);
+    let cases: Vec<RealizationCase> = vec![
+        (
+            "mount",
+            Box::new(|s| s.realized_mount_override = Some(json!([]))),
+        ),
+        (
+            "device",
+            Box::new(|s| s.host_devices_override = Some(json!([]))),
+        ),
+        (
+            "security",
+            Box::new(|s| s.host_security_opt_override = Some(json!([]))),
+        ),
+        (
+            "group",
+            Box::new(|s| s.host_group_add_override = Some(json!([]))),
+        ),
+        (
+            "nvidia",
+            Box::new(|s| s.host_device_requests_override = Some(json!([]))),
+        ),
+        (
+            "entrypoint",
+            Box::new(|s| s.config_entrypoint_override = Some(json!(["/wrong"]))),
+        ),
+        (
+            "command",
+            Box::new(|s| s.config_cmd_override = Some(json!(["wrong"]))),
+        ),
+    ];
+    for (kind, change) in cases {
+        let engine = Engine::new();
+        change(&mut engine.state.lock().unwrap());
+        assert_eq!(
+            engine
+                .client()
+                .start_application(realized_requirements_request(&format!("fixture-{kind}")))
+                .wait()
+                .unwrap_err()
+                .kind,
+            ErrorKind::Protocol,
+            "{kind} realization must be rejected"
+        );
+    }
+}
+
+#[test]
+fn application_accepts_normalized_typed_mount_defaults() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().host_mount_override = Some(json!([{
+        "Type":"bind", "Source":"/host/wayland", "Target":"/run/wayland-0",
+        "ReadOnly":true,
+        "BindOptions":{"CreateMountpoint":false,"NonRecursive":false,
+            "ReadOnlyNonRecursive":false,"ReadOnlyForceRecursive":false,
+            "Propagation":"rprivate"}
+    }]));
+    engine.state.lock().unwrap().host_config_patch = Some(json!({
+        "CapAdd":["CAP_SYS_NICE"], "CapDrop":["CAP_ALL"]
+    }));
+    assert!(engine
+        .client()
+        .start_application(realized_requirements_request("fixture-mount-defaults"))
+        .wait()
+        .is_ok());
+}
+
+#[test]
+fn application_rejects_weakened_typed_and_legacy_mount_realization() {
+    let typed_cases: Vec<(&str, Value)> = vec![
+        (
+            "create",
+            json!([{"Type":"bind","Source":"/host/wayland","Target":"/run/wayland-0","ReadOnly":true,"BindOptions":{"CreateMountpoint":true}}]),
+        ),
+        (
+            "consistency",
+            json!([{"Type":"bind","Source":"/host/wayland","Target":"/run/wayland-0","ReadOnly":true,"Consistency":"delegated","BindOptions":{"CreateMountpoint":false}}]),
+        ),
+        (
+            "propagation",
+            json!([{"Type":"bind","Source":"/host/wayland","Target":"/run/wayland-0","ReadOnly":true,"BindOptions":{"CreateMountpoint":false,"Propagation":"rshared"}}]),
+        ),
+    ];
+    for (kind, mounts) in typed_cases {
+        let engine = Engine::new();
+        engine.state.lock().unwrap().host_mount_override = Some(mounts);
+        assert_eq!(
+            engine
+                .client()
+                .start_application(realized_requirements_request(&format!(
+                    "fixture-typed-{kind}"
+                )))
+                .wait()
+                .unwrap_err()
+                .kind,
+            ErrorKind::Protocol
+        );
+    }
+
+    let engine = Engine::new();
+    engine.state.lock().unwrap().realized_mount_override = Some(json!([
+        {"Type":"bind","Source":"/host/wayland","Name":null,"Destination":"/run/wayland-0","RW":false},
+        {"Type":"bind","Source":"/foreign/home","Name":null,"Destination":"/home/quasar","RW":true}
+    ]));
+    assert_eq!(
+        engine
+            .client()
+            .start_application(realized_requirements_request("fixture-legacy-realized"))
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol
+    );
+}
+
+#[test]
+fn application_rejects_weakened_volume_nocopy_and_unexpected_host_grants() {
+    let volume_request = ApplicationRequest {
+        operation: "fixture-volume-nocopy".into(),
+        name: "quasar-sess-fixture-volume-nocopy".into(),
+        image: "quasar-app:test".into(),
+        typed_mounts: vec![ApplicationMount::Volume {
+            source: "quasar-driver".into(),
+            target: "/opt/quasar-driver".into(),
+            read_only: true,
+            no_copy: true,
+        }],
+        ..Default::default()
+    };
+    let engine = Engine::new();
+    engine.state.lock().unwrap().host_mount_override = Some(json!([{
+        "Type":"volume", "Source":"quasar-driver", "Target":"/opt/quasar-driver",
+        "ReadOnly":true, "VolumeOptions":{"NoCopy":false}
+    }]));
+    assert_eq!(
+        engine
+            .client()
+            .start_application(volume_request)
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol
+    );
+
+    for (kind, patch) in [
+        ("privileged", json!({"Privileged":true})),
+        ("pid", json!({"PidMode":"host"})),
+        ("ipc", json!({"IpcMode":"host"})),
+        ("uts", json!({"UTSMode":"host"})),
+        ("userns", json!({"UsernsMode":"host"})),
+        ("cgroupns", json!({"CgroupnsMode":"host"})),
+        ("network", json!({"NetworkMode":"host"})),
+        ("runtime", json!({"Runtime":"foreign-runtime"})),
+        (
+            "extra-gpu",
+            json!({"DeviceRequests":[
+                {"Driver":"nvidia","Count":-1,"Capabilities":[["gpu"]]},
+                {"Driver":"nvidia","Count":1,"Capabilities":[["gpu"]]}
+            ]}),
+        ),
+    ] {
+        let engine = Engine::new();
+        engine.state.lock().unwrap().host_config_patch = Some(patch);
+        assert_eq!(
+            engine
+                .client()
+                .start_application(realized_requirements_request(&format!(
+                    "fixture-host-{kind}"
+                )))
+                .wait()
+                .unwrap_err()
+                .kind,
+            ErrorKind::Protocol,
+            "{kind}"
+        );
+    }
+}
+
+#[test]
+fn application_rejects_duplicate_lexical_mount_targets_before_create() {
+    let engine = Engine::new();
+    let request = ApplicationRequest {
+        operation: "fixture-duplicate-target".into(),
+        name: "quasar-sess-fixture-duplicate-target".into(),
+        image: "quasar-app:test".into(),
+        typed_mounts: vec![
+            ApplicationMount::Bind {
+                source: "/host/one".into(),
+                target: "/same".into(),
+                read_only: true,
+                consistency: None,
+            },
+            ApplicationMount::Volume {
+                source: "named".into(),
+                target: "/same/.".into(),
+                read_only: true,
+                no_copy: true,
+            },
+        ],
+        ..Default::default()
+    };
+    assert_eq!(
+        engine
+            .client()
+            .start_application(request)
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidConfiguration
+    );
+    assert!(engine.state.lock().unwrap().body.is_none());
+}
+
+#[test]
+fn application_accepts_image_declared_volumes_and_binds_their_identity() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().image_volumes = Some(vec!["/image-storage".into()]);
+    let request = ApplicationRequest {
+        operation: "fixture-image-volume".into(),
+        name: "quasar-sess-fixture-image-volume".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    engine
+        .client()
+        .start_application(request.clone())
+        .wait()
+        .unwrap();
+    engine.state.lock().unwrap().realized_mount_override = Some(json!([{
+        "Type":"volume", "Source":"/var/lib/docker/volumes/foreign/_data",
+        "Name":"foreign", "Destination":"/image-storage", "RW":true
+    }]));
+    assert_eq!(
+        engine
+            .client()
+            .start_application(request)
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol
+    );
+}
+
+#[test]
+fn application_rejects_unwritable_or_unidentified_image_declared_volume() {
+    for (kind, mount) in [
+        (
+            "readonly",
+            json!({"Type":"volume","Source":"/var/lib/docker/volumes/fixture/_data","Name":"fixture","Destination":"/image-storage","RW":false}),
+        ),
+        (
+            "unknown-identity",
+            json!({"Type":"volume","Source":null,"Name":null,"Destination":"/image-storage","RW":true}),
+        ),
+    ] {
+        let engine = Engine::new();
+        let mut state = engine.state.lock().unwrap();
+        state.image_volumes = Some(vec!["/image-storage".into()]);
+        state.realized_mount_override = Some(json!([mount]));
+        drop(state);
+        let request = ApplicationRequest {
+            operation: format!("fixture-image-volume-{kind}"),
+            name: format!("quasar-sess-fixture-image-volume-{kind}"),
+            image: "quasar-app:test".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            engine
+                .client()
+                .start_application(request)
+                .wait()
+                .unwrap_err()
+                .kind,
+            ErrorKind::Protocol,
+            "{kind}"
+        );
+    }
+}
+
+#[test]
+fn application_explicit_mount_overrides_image_declared_volume_and_rejects_foreign_extra() {
+    let request = ApplicationRequest {
+        operation: "fixture-image-volume-override".into(),
+        name: "quasar-sess-fixture-image-volume-override".into(),
+        image: "quasar-app:test".into(),
+        typed_mounts: vec![ApplicationMount::Volume {
+            source: "quasar-owned".into(),
+            target: "/image-storage".into(),
+            read_only: true,
+            no_copy: true,
+        }],
+        ..Default::default()
+    };
+    let engine = Engine::new();
+    engine.state.lock().unwrap().image_volumes = Some(vec!["/image-storage".into()]);
+    assert!(engine.client().start_application(request).wait().is_ok());
+
+    let foreign = Engine::new();
+    foreign.state.lock().unwrap().image_volumes = Some(vec!["/image-storage".into()]);
+    foreign.state.lock().unwrap().realized_mount_override = Some(json!([{
+        "Type":"volume", "Source":"/var/lib/docker/volumes/foreign/_data",
+        "Name":"foreign", "Destination":"/not-image-storage", "RW":true
+    }]));
+    let request = ApplicationRequest {
+        operation: "fixture-image-volume-foreign".into(),
+        name: "quasar-sess-fixture-image-volume-foreign".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        foreign
+            .client()
+            .start_application(request)
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol
+    );
+}
+
+#[test]
+fn application_normalizes_mount_paths_without_accepting_a_wrong_target() {
+    let request = ApplicationRequest {
+        operation: "fixture-mount-path".into(),
+        name: "quasar-sess-fixture-mount-path".into(),
+        image: "quasar-app:test".into(),
+        typed_mounts: vec![ApplicationMount::Bind {
+            source: "/host/wayland/.".into(),
+            target: "/run/wayland-0/".into(),
+            read_only: true,
+            consistency: None,
+        }],
+        ..Default::default()
+    };
+    let engine = Engine::new();
+    engine.state.lock().unwrap().realized_mount_override = Some(json!([{
+        "Type":"bind", "Source":"/host/wayland", "Name":null,
+        "Destination":"/run/wayland-0", "RW":false
+    }]));
+    assert!(engine
+        .client()
+        .start_application(request.clone())
+        .wait()
+        .is_ok());
+
+    let wrong = Engine::new();
+    wrong.state.lock().unwrap().realized_mount_override = Some(json!([{
+        "Type":"bind", "Source":"/host/wayland", "Name":null,
+        "Destination":"/run/other", "RW":false
+    }]));
+    let request = ApplicationRequest {
+        operation: "fixture-mount-path-wrong".into(),
+        name: "quasar-sess-fixture-mount-path-wrong".into(),
+        ..request
+    };
+    assert_eq!(
+        wrong
+            .client()
+            .start_application(request)
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol
+    );
+}
+
+#[test]
+fn application_rejects_invalid_typed_bind_source_before_create() {
+    let engine = Engine::new();
+    let request = ApplicationRequest {
+        operation: "fixture-invalid-bind-source".into(),
+        name: "quasar-sess-fixture-invalid-bind-source".into(),
+        image: "quasar-app:test".into(),
+        typed_mounts: vec![ApplicationMount::Bind {
+            source: "relative-source".into(),
+            target: "/target".into(),
+            read_only: true,
+            consistency: None,
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        engine
+            .client()
+            .start_application(request)
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidConfiguration
+    );
+    assert!(engine.state.lock().unwrap().body.is_none());
+}
+
+fn nvidia_params_repair_request(operation: &str) -> ApplicationRequest {
+    ApplicationRequest {
+        operation: operation.into(),
+        name: format!("quasar-sess-{operation}"),
+        image: "quasar-app:test".into(),
+        nvidia_gpu: true,
+        unmount_nvidia_params: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn application_nvidia_params_repair_uses_the_owned_api_exec_and_completes() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let id = engine
+        .client()
+        .start_application(nvidia_params_repair_request("fixture-nvidia-repair"))
+        .wait()
+        .unwrap();
+    assert_eq!(id.as_str(), ID);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/exec")), 1);
+    assert_eq!(engine.requests("POST /exec/repair-exec/start"), 1);
+    assert_eq!(engine.requests("GET /exec/repair-exec/json"), 2);
+}
+
+#[test]
+fn application_systempaths_unconfined_uses_realized_path_lists_not_securityopt() {
+    let engine = Engine::new();
+    let mut request = nvidia_params_repair_request("fixture-systempaths");
+    request.unmount_nvidia_params = false;
+    request.security.security_opt = vec!["seccomp=unconfined".into()];
+    request.security.systempaths_unconfined = true;
+    engine.client().start_application(request).wait().unwrap();
+    let body = engine.state.lock().unwrap().body.clone().unwrap();
+    assert_eq!(
+        body["HostConfig"]["SecurityOpt"],
+        json!(["seccomp=unconfined"])
+    );
+    assert_eq!(body["HostConfig"]["MaskedPaths"], json!([]));
+    assert_eq!(body["HostConfig"]["ReadonlyPaths"], json!([]));
+
+    let rejected = Engine::new();
+    rejected.state.lock().unwrap().host_config_patch = Some(json!({
+        "MaskedPaths":["/proc/acpi"], "ReadonlyPaths":["/proc/asound"]
+    }));
+    let mut request = nvidia_params_repair_request("fixture-systempaths-rejected");
+    request.unmount_nvidia_params = false;
+    request.security.systempaths_unconfined = true;
+    assert_eq!(
+        rejected
+            .client()
+            .start_application(request)
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol
+    );
+}
+
+#[test]
+fn application_nvidia_params_repair_reconciles_lost_exec_replies_without_duplicates() {
+    for (kind, create_lost, start_lost) in [("create", true, false), ("start", false, true)] {
+        let engine = Engine::new();
+        {
+            let mut state = engine.state.lock().unwrap();
+            state.keep_running = true;
+            state.lose_exec_create = create_lost;
+            state.lose_exec_start = start_lost;
+        }
+        let request = nvidia_params_repair_request(&format!("fixture-nvidia-repair-lost-{kind}"));
+        assert!(engine
+            .client()
+            .start_application(request.clone())
+            .wait()
+            .is_ok());
+        assert!(engine.client().start_application(request).wait().is_ok());
+        assert_eq!(
+            engine.requests(&format!("POST /containers/{ID}/exec")),
+            1,
+            "{kind}"
+        );
+        assert_eq!(
+            engine.requests("POST /exec/repair-exec/start"),
+            if create_lost { 0 } else { 1 },
+            "{kind}"
+        );
+    }
+}
+
+#[test]
+fn application_nvidia_params_repair_never_recreates_a_crash_gap_exec() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let request = nvidia_params_repair_request("fixture-nvidia-repair-crash-gap");
+    engine
+        .client()
+        .start_application(request.clone())
+        .wait()
+        .unwrap();
+    let key = Sha256::digest(request.operation.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let path = engine
+        .config
+        .image_state_path
+        .as_ref()
+        .unwrap()
+        .join("applications")
+        .join(key);
+    let mut journal: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    journal["nvidia_params_repair"] = json!({"attempted":true,"exec_id":null,"start_attempted":false,"completed":false,"outcome":null});
+    std::fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    engine.client().start_application(request).wait().unwrap();
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/exec")), 1);
+}
+
+#[test]
+fn application_nvidia_params_repair_allows_a_busy_daemon_response() {
+    let mut engine = Engine::new();
+    engine.config.deadline = Duration::from_secs(8);
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.keep_running = true;
+        state.exec_create_delay = Some(Duration::from_millis(250));
+    }
+    assert!(engine
+        .client()
+        .start_application(nvidia_params_repair_request(
+            "fixture-nvidia-repair-delayed"
+        ))
+        .wait()
+        .is_ok());
+}
+
+#[test]
+fn application_nvidia_params_repair_does_not_complete_or_restart_unstarted_exec() {
+    let engine = Engine::new();
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.keep_running = true;
+        state.lose_exec_start_before_effect = true;
+        state.exec_exit = Some(None);
+    }
+    let request = nvidia_params_repair_request("fixture-nvidia-repair-before-effect");
+    assert!(engine
+        .client()
+        .start_application(request.clone())
+        .wait()
+        .is_ok());
+    assert!(engine.client().start_application(request).wait().is_ok());
+    assert_eq!(engine.requests("POST /exec/repair-exec/start"), 1);
+}
+
+#[test]
+fn application_nvidia_params_repair_refuses_a_foreign_exec_parent() {
+    let engine = Engine::new();
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.keep_running = true;
+        state.exec_foreign = true;
+    }
+    assert!(engine
+        .client()
+        .start_application(nvidia_params_repair_request(
+            "fixture-nvidia-repair-foreign"
+        ))
+        .wait()
+        .is_ok());
+    assert_eq!(engine.requests("POST /exec/repair-exec/start"), 0);
+}
+
+#[test]
+fn application_nvidia_params_repair_timeout_keeps_the_running_handle() {
+    let mut engine = Engine::new();
+    engine.config.deadline = Duration::from_secs(8);
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.keep_running = true;
+        state.exec_running = true;
+    }
+    let started = std::time::Instant::now();
+    let id = engine
+        .client()
+        .start_application(nvidia_params_repair_request("fixture-nvidia-repair-hung"))
+        .wait()
+        .unwrap();
+    assert_eq!(id.as_str(), ID);
+    assert!(started.elapsed() < Duration::from_secs(6));
+}
+
+#[test]
+fn application_running_recovery_attempts_an_unrecorded_nvidia_repair() {
+    let engine = Engine::new();
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.running = true;
+        state.keep_running = true;
+    }
+    assert!(engine
+        .client()
+        .start_application(nvidia_params_repair_request(
+            "fixture-nvidia-repair-recovered"
+        ))
+        .wait()
+        .is_ok());
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/exec")), 1);
+}
+
+#[test]
+fn application_rejects_an_environment_value_shadowed_by_the_image() {
+    let engine = Engine::new();
+    engine
+        .state
+        .lock()
+        .unwrap()
+        .inherited_env
+        .push("PULSE_SERVER=unix:/wrong".into());
+    assert_eq!(
+        engine
+            .client()
+            .start_application(realized_requirements_request("fixture-shadowed-env"))
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol
+    );
+}
+
+#[test]
+fn application_reconciles_a_lost_create_reply_without_a_second_create() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().lose_create = true;
+    let request = ApplicationRequest {
+        operation: "session-fixture-lost-create".into(),
+        name: "quasar-sess-fixture-lost-create".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        engine
+            .client()
+            .start_application(request.clone())
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    engine.state.lock().unwrap().image_missing = true;
+    let id = engine.client().start_application(request).wait().unwrap();
+    assert_eq!(id.as_str(), ID);
+    assert_eq!(engine.requests("POST /containers/create"), 1);
+}
+
+#[test]
+fn application_cleanup_recovers_a_lost_remove_reply_without_losing_final_logs() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().oom_killed = true;
+    let request = ApplicationRequest {
+        operation: "session-fixture-lost-remove".into(),
+        name: "quasar-sess-fixture-lost-remove".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    let id = engine.client().start_application(request).wait().unwrap();
+    engine.state.lock().unwrap().lose_remove = true;
+    assert_eq!(
+        engine
+            .client()
+            .cleanup_application(id.clone())
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    // A new client has no in-memory result. The only evidence is the fsynced
+    // operation journal: Docker already removed this exact container.
+    let restarted = engine.client();
+    let evidence = restarted.observe_application(id.clone()).wait().unwrap();
+    assert_eq!(evidence.exit_code, Some(23));
+    assert_eq!(evidence.oom_killed, Some(true));
+    assert_eq!(evidence.stdout, "final stdout");
+    assert_eq!(evidence.stderr, "final stderr");
+    restarted.cleanup_application(id.clone()).wait().unwrap();
+    assert_eq!(restarted.observe_application(id).wait().unwrap(), evidence);
+    assert_eq!(engine.requests("DELETE /containers/"), 1);
+}
+
+#[test]
+fn application_cleanup_retries_after_a_runtime_restart_without_touching_active_work() {
+    let engine = Engine::new();
+    let request = ApplicationRequest {
+        operation: "session-fixture-restart".into(),
+        name: "quasar-sess-fixture-restart".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    let id = engine.client().start_application(request).wait().unwrap();
+    engine.state.lock().unwrap().lose_remove = true;
+    assert_eq!(
+        engine
+            .client()
+            .cleanup_application(id)
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    RuntimeClient::new(engine.config.clone())
+        .unwrap()
+        .recover_application_cleanup()
+        .wait()
+        .unwrap();
+    assert_eq!(engine.requests("DELETE /containers/"), 1);
+}
+
+#[test]
+fn application_lost_start_reconciles_the_same_operation_without_a_second_start() {
+    let engine = Engine::new();
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.lose_start = true;
+        state.keep_running = true;
+    }
+    let request = ApplicationRequest {
+        operation: "session-fixture-lost-start".into(),
+        name: "quasar-sess-fixture-lost-start".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    // A dropped reply after Docker mutated the verified ID is successful once
+    // reinspection proves the operation is running.
+    let id = engine
+        .client()
+        .start_application(request.clone())
+        .wait()
+        .unwrap();
+    assert_eq!(id.as_str(), ID);
+    // A retry must reconcile the journaled pinned image and operation; the
+    // mutable tag may have disappeared after Docker accepted the first start.
+    engine.state.lock().unwrap().image_missing = true;
+    let retry = engine.client().start_application(request).wait().unwrap();
+    assert_eq!(retry.as_str(), ID);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/start")), 1);
+}
+
+#[test]
+fn application_recovers_post_start_inspection_failure_under_the_original_operation() {
+    let engine = Engine::new();
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.inspect_after_start_code = Some(500);
+        state.keep_running = true;
+    }
+    let request = ApplicationRequest {
+        operation: "session-fixture-inspect-failure".into(),
+        name: "quasar-sess-fixture-inspect-failure".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        engine
+            .client()
+            .start_application(request.clone())
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    assert_eq!(engine.requests("POST /containers/create"), 1);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/start")), 1);
+    engine.state.lock().unwrap().inspect_after_start_code = None;
+    let restarted = engine.client();
+    let id = restarted.start_application(request.clone()).wait().unwrap();
+    assert_eq!(id.as_str(), ID);
+    restarted
+        .abandon_application(request.operation)
+        .wait()
+        .unwrap();
+    assert_eq!(engine.requests("POST /containers/create"), 1);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/start")), 1);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 1);
+    assert_eq!(engine.requests("DELETE /containers/"), 1);
+    assert_eq!(
+        restarted.observe_application(id).wait().unwrap().stdout,
+        "final stdout"
+    );
+}
+
+#[test]
+fn application_observation_cancellation_never_stops_a_live_application() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let request = ApplicationRequest {
+        operation: "session-fixture-observe-cancel".into(),
+        name: "quasar-sess-fixture-observe-cancel".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    let id = engine.client().start_application(request).wait().unwrap();
+    let observation = engine.client().observe_application(id);
+    observation.cancel();
+    assert_eq!(observation.wait().unwrap_err().kind, ErrorKind::Cancelled);
+    assert!(engine.state.lock().unwrap().running);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 0);
+}
+
+#[test]
+fn application_readiness_log_tail_observes_a_running_application_without_stopping_it() {
+    let engine = Engine::new();
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.keep_running = true;
+        state.logs = vec![(1, b"RH01-236-readiness-marker".to_vec())];
+    }
+    let request = ApplicationRequest {
+        operation: "session-fixture-readiness-tail".into(),
+        name: "quasar-sess-fixture-readiness-tail".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    let client = engine.client();
+    let id = client.start_application(request).wait().unwrap();
+    assert!(client
+        .application_log_tail(id)
+        .wait()
+        .unwrap()
+        .stdout
+        .contains("RH01-236-readiness-marker"));
+    assert!(engine.state.lock().unwrap().running);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 0);
+}
+
+#[test]
+fn application_stop_proves_exit_then_preserves_final_oom_tail_before_cleanup() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let request = ApplicationRequest {
+        operation: "session-fixture-stop-tail".into(),
+        name: "quasar-sess-fixture-stop-tail".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    let client = engine.client();
+    let id = client.start_application(request).wait().unwrap();
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.oom_killed = true;
+        state.logs = vec![(1, vec![b'x'; 20 * 1024]), (1, b"RH01-final-tail".to_vec())];
+    }
+    client
+        .stop_application(id.clone(), Duration::from_secs(1))
+        .wait()
+        .unwrap();
+    let result = client.observe_application(id.clone()).wait().unwrap();
+    assert_eq!(result.exit_code, Some(23));
+    assert_eq!(result.oom_killed, Some(true));
+    assert!(result.stdout.contains("RH01-final-tail"));
+    client.cleanup_application(id).wait().unwrap();
+}
+
+#[test]
+fn application_logs_request_a_bounded_recent_tail_and_keep_final_exit_evidence() {
+    let engine = Engine::new();
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.logs = (0..250)
+            .map(|line| (1, format!("old-history-{line}\n").into_bytes()))
+            .chain(std::iter::once((2, b"RH01-236-final-stderr".to_vec())))
+            .collect();
+    }
+    let request = ApplicationRequest {
+        operation: "session-fixture-bounded-final-tail".into(),
+        name: "quasar-sess-fixture-bounded-final-tail".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    let client = engine.client();
+    let id = client.start_application(request).wait().unwrap();
+    let result = client.observe_application(id.clone()).wait().unwrap();
+    assert_eq!(result.exit_code, Some(23));
+    assert!(result.stderr.contains("RH01-236-final-stderr"));
+    assert!(!result.stdout.contains("old-history-0\n"));
+    assert!(result.stdout.contains("old-history-249\n"));
+    let requests = engine.state.lock().unwrap().requests.clone();
+    assert!(requests.iter().any(|route| route.contains("/logs?")));
+    assert!(!requests
+        .iter()
+        .any(|route| route.contains("/logs?") && route.contains("tail=all")));
+    client.cleanup_application(id).wait().unwrap();
+}
+
+#[test]
+fn application_escaped_final_logs_fit_the_durable_journal_without_losing_the_tail() {
+    let engine = Engine::new();
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.logs = vec![
+            (1, vec![1; 20 * 1024]),
+            (2, vec![2; 20 * 1024]),
+            (1, b"RH01-escaped-final-tail".to_vec()),
+        ];
+    }
+    let request = ApplicationRequest {
+        operation: "session-fixture-escaped-tail".into(),
+        name: "quasar-sess-fixture-escaped-tail".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    let id = engine.client().start_application(request).wait().unwrap();
+    let result = engine.client().observe_application(id).wait().unwrap();
+    assert!(result.stdout.contains("RH01-escaped-final-tail"));
+    let journal = std::fs::read_dir(
+        engine
+            .config
+            .image_state_path
+            .as_ref()
+            .unwrap()
+            .join("applications"),
+    )
+    .unwrap()
+    .filter_map(Result::ok)
+    .map(|entry| std::fs::metadata(entry.path()).unwrap().len())
+    .max()
+    .unwrap();
+    assert!(journal <= 64 * 1024);
+}
+
+#[test]
+fn application_startup_retirement_reconciles_lost_create_without_adopting_active_records() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().lose_create = true;
+    let request = ApplicationRequest {
+        operation: "session-fixture-retire-partial".into(),
+        name: "quasar-sess-fixture-retire-partial".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        engine
+            .client()
+            .start_application(request)
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    RuntimeClient::new(engine.config.clone())
+        .unwrap()
+        .retire_applications()
+        .wait()
+        .unwrap();
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 0);
+    assert_eq!(engine.requests("DELETE /containers/"), 1);
+}
+
+#[test]
+fn application_verified_terminal_without_exit_code_is_persisted_replayed_and_cleaned() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().exit = None;
+    let request = ApplicationRequest {
+        operation: "session-fixture-unknown-exit".into(),
+        name: "quasar-sess-fixture-unknown-exit".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    let id = engine.client().start_application(request).wait().unwrap();
+    let result = engine
+        .client()
+        .observe_application(id.clone())
+        .wait()
+        .unwrap();
+    assert_eq!(result.exit_code, None);
+    assert_eq!(result.oom_killed, Some(false));
+    assert_eq!(
+        engine
+            .client()
+            .observe_application(id.clone())
+            .wait()
+            .unwrap(),
+        result
+    );
+    engine.client().cleanup_application(id).wait().unwrap();
+    assert_eq!(engine.requests("DELETE /containers/"), 1);
+}
+
+#[test]
+fn application_lost_stop_reply_retries_the_same_durable_stopping_intent() {
+    let engine = Engine::new();
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.keep_running = true;
+        state.lose_stop = true;
+    }
+    let request = ApplicationRequest {
+        operation: "session-fixture-lost-stop".into(),
+        name: "quasar-sess-fixture-lost-stop".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    let client = engine.client();
+    let id = client.start_application(request).wait().unwrap();
+    assert_eq!(
+        client
+            .stop_application(id.clone(), Duration::from_secs(1))
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    client
+        .stop_application(id.clone(), Duration::from_secs(1))
+        .wait()
+        .unwrap();
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 1);
+    client.cleanup_application(id).wait().unwrap();
+}
+
+#[test]
+fn application_stop_preserves_completed_and_delegates_cleanup_pending() {
+    let engine = Engine::new();
+    let request = ApplicationRequest {
+        operation: "session-fixture-stop-terminal".into(),
+        name: "quasar-sess-fixture-stop-terminal".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    let client = engine.client();
+    let id = client.start_application(request).wait().unwrap();
+    engine.state.lock().unwrap().lose_remove = true;
+    assert_eq!(
+        client
+            .cleanup_application(id.clone())
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    // A late stop must finish the already-recorded removal rather than writing
+    // Stopping over retained terminal evidence.
+    client
+        .stop_application(id.clone(), Duration::from_secs(1))
+        .wait()
+        .unwrap();
+    client
+        .stop_application(id, Duration::from_secs(1))
+        .wait()
+        .unwrap();
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 0);
+    assert_eq!(engine.requests("DELETE /containers/"), 1);
+}
+
+#[test]
+fn periodic_recovery_resumes_interrupted_no_id_abandonment_without_creating() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().lose_create = true;
+    let request = ApplicationRequest {
+        operation: "session-fixture-periodic-no-id".into(),
+        name: "quasar-sess-fixture-periodic-no-id".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        engine
+            .client()
+            .start_application(request)
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    engine.state.lock().unwrap().inspect_code = Some(500);
+    assert_eq!(
+        engine
+            .client()
+            .abandon_application("session-fixture-periodic-no-id")
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    engine.state.lock().unwrap().inspect_code = None;
+    RuntimeClient::new(engine.config.clone())
+        .unwrap()
+        .recover_application_cleanup()
+        .wait()
+        .unwrap();
+    assert_eq!(engine.requests("POST /containers/create"), 1);
+    assert_eq!(engine.requests("DELETE /containers/"), 1);
+}
+
+#[test]
+fn application_recovery_skips_a_locked_record_and_cleans_a_later_obligation() {
+    use crate::runtime::application::{ApplicationIntent, ApplicationPhase};
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+
+    let engine = Engine::new();
+    let second = ApplicationRequest {
+        operation: "session-fixture-later-cleanup".into(),
+        name: "quasar-sess-fixture-later-cleanup".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    let second_id = engine.client().start_application(second).wait().unwrap();
+    engine.state.lock().unwrap().lose_remove = true;
+    assert_eq!(
+        engine
+            .client()
+            .cleanup_application(second_id)
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+
+    let first_operation = "session-fixture-locked-recovery";
+    let state_root = engine
+        .config
+        .image_state_path
+        .as_ref()
+        .unwrap()
+        .join("applications");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let key = Sha256::digest(first_operation.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let intent = ApplicationIntent {
+        request: ApplicationRequest {
+            operation: first_operation.into(),
+            name: "quasar-sess-fixture-locked-recovery".into(),
+            image: "quasar-app:test".into(),
+            ..Default::default()
+        },
+        owner: "fixture-owner".into(),
+        socket: engine.config.socket.clone(),
+        id: None,
+        image_id: None,
+        image_entrypoint: None,
+        image_cmd: None,
+        image_user: None,
+        image_volumes: None,
+        image_volume_identities: None,
+        nvidia_params_repair: None,
+        phase: ApplicationPhase::Running,
+        result: None,
+    };
+    std::fs::write(state_root.join(&key), serde_json::to_vec(&intent).unwrap()).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(state_root.join(format!("{key}.lock")))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    RuntimeClient::new(engine.config.clone())
+        .unwrap()
+        .recover_application_cleanup()
+        .wait()
+        .unwrap_err();
+    assert_eq!(engine.requests("DELETE /containers/"), 1);
+}
+
+#[test]
+fn periodic_application_recovery_does_not_retire_a_running_unrequested_record() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let request = ApplicationRequest {
+        operation: "session-fixture-periodic-active".into(),
+        name: "quasar-sess-fixture-periodic-active".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    engine.client().start_application(request).wait().unwrap();
+    RuntimeClient::new(engine.config.clone())
+        .unwrap()
+        .recover_application_cleanup()
+        .wait()
+        .unwrap();
+    assert!(engine.state.lock().unwrap().running);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 0);
+    assert_eq!(engine.requests("DELETE /containers/"), 0);
+}
+
+#[test]
+fn late_application_observer_cannot_resurrect_completed_cleanup() {
+    let engine = Engine::new();
+    let request = ApplicationRequest {
+        operation: "session-fixture-observe-race".into(),
+        name: "quasar-sess-fixture-observe-race".into(),
+        image: "quasar-app:test".into(),
+        ..Default::default()
+    };
+    let client = engine.client();
+    let id = client.start_application(request).wait().unwrap();
+    let gate = Arc::new(LogGate::default());
+    engine.state.lock().unwrap().pause_first_log = Some(gate.clone());
+    let observation = client.observe_application(id.clone());
+    let until = std::time::Instant::now() + Duration::from_secs(1);
+    while !gate.entered.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < until,
+            "application observer must reach final logs"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+    client.cleanup_application(id.clone()).wait().unwrap();
+    gate.released.store(true, Ordering::SeqCst);
+    assert_eq!(observation.wait().unwrap().exit_code, Some(23));
+    client.recover_application_cleanup().wait().unwrap();
+    client.cleanup_application(id).wait().unwrap();
+    assert_eq!(engine.requests("DELETE /containers/"), 1);
 }
 
 #[test]

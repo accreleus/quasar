@@ -46,17 +46,18 @@
 //!     `--group-add` per group owning a passed DRM node. The image registers the
 //!     runtime-injected driver itself, never baked.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 
 use crate::messages::AppExitPolicy;
+use crate::runtime::{ApplicationId, ApplicationMount, ApplicationRequest};
 
 /// Upper bound on any single container-runtime CLI invocation (#149). A wedged docker
 /// daemon otherwise blocks the session thread forever (`run` at launch, `rm -f` at
@@ -64,11 +65,374 @@ use crate::messages::AppExitPolicy;
 /// path surfaces it and the control plane can reap the reservation.
 const RUNTIME_CMD_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A launch whose response or retirement is uncertain. The operation is the only
+/// identity allowed to reconcile it. Writable bind sources are retained as well as the
+/// generated name: a later generation can have a new name while still targeting the
+/// same managed home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingApplication {
+    operation: String,
+    writable_sources: BTreeSet<String>,
+}
+
+/// Failed launch/stop paths retain their exact durable operation until RuntimeClient
+/// proves retirement. This blocks a new writer with either the same container name or
+/// a matching normalized writable host source.
+fn pending_application_operations() -> &'static Mutex<HashMap<String, PendingApplication>> {
+    static PENDING: OnceLock<Mutex<HashMap<String, PendingApplication>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lexical_mount_source(source: &str) -> Option<String> {
+    let path = Path::new(source);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let mut normalized = PathBuf::from("/");
+    for part in path.components() {
+        if let std::path::Component::Normal(part) = part {
+            normalized.push(part);
+        }
+    }
+    Some(normalized.to_string_lossy().into_owned())
+}
+
+fn writable_application_sources(request: &ApplicationRequest) -> BTreeSet<String> {
+    let mut sources = BTreeSet::new();
+    for mount in &request.typed_mounts {
+        match mount {
+            ApplicationMount::Bind {
+                source,
+                read_only: false,
+                ..
+            } => {
+                if let Some(source) = lexical_mount_source(source) {
+                    sources.insert(source);
+                }
+            }
+            ApplicationMount::Volume {
+                source,
+                read_only: false,
+                ..
+            } => {
+                if !source.is_empty() {
+                    sources.insert(format!("volume:{source}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    for mount in &request.mounts {
+        let mut fields = mount.split(':');
+        let Some(source) = fields.next() else {
+            continue;
+        };
+        let _target = fields.next();
+        let options = fields.next().unwrap_or_default();
+        let read_only = options
+            .split(',')
+            .any(|option| matches!(option, "ro" | "readonly"));
+        if read_only {
+            continue;
+        }
+        if let Some(source) = lexical_mount_source(source) {
+            sources.insert(source);
+        } else if !source.is_empty() && !source.contains('/') {
+            // Legacy `-v name:/target` names a writable volume, not a relative bind.
+            sources.insert(format!("volume:{source}"));
+        }
+    }
+    sources
+}
+
+fn pending_matches(
+    request: &ApplicationRequest,
+    name: &str,
+    pending_name: &str,
+    pending: &PendingApplication,
+) -> bool {
+    pending_name == name
+        || !pending
+            .writable_sources
+            .is_disjoint(&writable_application_sources(request))
+}
+
+fn retain_pending_application(name: String, request: &ApplicationRequest, operation: String) {
+    retain_pending_application_sources(name, writable_application_sources(request), operation);
+}
+
+fn retain_pending_application_sources(
+    name: String,
+    writable_sources: BTreeSet<String>,
+    operation: String,
+) {
+    if let Ok(mut pending) = pending_application_operations().lock() {
+        pending.insert(
+            name,
+            PendingApplication {
+                operation,
+                writable_sources,
+            },
+        );
+    }
+}
+
+fn clear_pending_application(name: &str, operation: &str) {
+    if let Ok(mut pending) = pending_application_operations().lock() {
+        if pending
+            .get(name)
+            .is_some_and(|entry| entry.operation == operation)
+        {
+            pending.remove(name);
+        }
+    }
+}
+
+/// Snapshot explicit caller cleanup obligations without holding the mutex across Docker.
+/// A running container enters this set only after its caller requested abandonment or stop.
+fn pending_application_operation_snapshot() -> Result<Vec<(String, String)>> {
+    Ok(pending_application_operations()
+        .lock()
+        .map_err(|_| anyhow!("application pending-operation lock poisoned"))?
+        .iter()
+        .map(|(name, pending)| (name.clone(), pending.operation.clone()))
+        .collect())
+}
+
+/// Retry each explicit caller obligation independently. A failed operation stays in the
+/// map for its exact identity, while a healthy later operation still gets its chance.
+pub(crate) fn recover_pending_application_operations<F>(mut retire: F) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    for (name, operation) in pending_application_operation_snapshot()? {
+        match retire(&operation) {
+            Ok(()) => clear_pending_application(&name, &operation),
+            Err(error) => tracing::warn!(
+                token = "application-pending-operation-retry",
+                operation = %operation,
+                "explicit application cleanup remains pending: {error}"
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn retire_matching_pending_applications<F>(
+    name: &str,
+    request: &ApplicationRequest,
+    mut retire: F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    let matches = pending_application_operations()
+        .lock()
+        .map_err(|_| anyhow!("application pending-operation lock poisoned"))?
+        .iter()
+        .filter(|(pending_name, pending)| pending_matches(request, name, pending_name, pending))
+        .map(|(pending_name, pending)| (pending_name.clone(), pending.operation.clone()))
+        .collect::<Vec<_>>();
+    for (pending_name, operation) in matches {
+        retire(&operation).with_context(|| {
+            format!("previous application operation {operation} remains unresolved")
+        })?;
+        // A concurrent uncertain launch can replace this name while the old operation
+        // is being retired outside the lock. Remove only the exact operation we proved.
+        clear_pending_application(&pending_name, &operation);
+    }
+    Ok(())
+}
+
 /// Per-stream cap on captured child stdout/stderr, so a pathological runtime cannot
 /// flood the agent's memory. It is a RETENTION cap only: the reader keeps draining past
 /// it and discards the excess (#194). Stopping at the cap would refill the pipe and
 /// block the writer — which is exactly the deadlock this bound must not cause.
 const MAX_CAPTURE_BYTES: u64 = 256 * 1024;
+
+/// Translate the agent's already-validated launch policy into the Quasar runtime
+/// request. This is intentionally strict: a new internal Docker flag must be
+/// represented here before an application can launch through the API.
+fn application_request_from_args(args: &[String], operation: String) -> Result<ApplicationRequest> {
+    let mut request = ApplicationRequest {
+        operation,
+        ..Default::default()
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if !request.image.is_empty() {
+            request.command.push(arg.clone());
+            i += 1;
+            continue;
+        }
+        let next = || {
+            args.get(i + 1)
+                .ok_or_else(|| anyhow!("missing value for {arg}"))
+        };
+        match arg.as_str() {
+            "run" | "-d" | "--rm" => {}
+            "--name" => {
+                request.name = next()?.clone();
+                i += 1;
+            }
+            "--label" => {
+                let _ = next()?;
+                i += 1;
+            }
+            "--network" => {
+                request.network = next()?.clone();
+                i += 1;
+            }
+            "--cap-drop" => {
+                if next()? != "ALL" {
+                    anyhow::bail!("unsupported cap-drop");
+                }
+                request.security.cap_drop_all = true;
+                i += 1;
+            }
+            "--cap-add" => {
+                request.security.cap_add.push(next()?.clone());
+                i += 1;
+            }
+            "--pids-limit" => {
+                request.security.pids_limit = next()?.parse()?;
+                i += 1;
+            }
+            "--shm-size" => {
+                request.security.shm_size = parse_size(next()?)?;
+                i += 1;
+            }
+            "--pull=never" => request.pull_never = true,
+            "--security-opt" => {
+                let mut option = next()?.clone();
+                i += 1;
+                if let Some(path) = option
+                    .strip_prefix("seccomp=")
+                    .filter(|v| *v != "unconfined")
+                {
+                    option = format!(
+                        "seccomp={}",
+                        std::fs::read_to_string(path)
+                            .with_context(|| format!("read seccomp profile {path}"))?
+                    );
+                }
+                if option == "no-new-privileges:true" {
+                    request.security.no_new_privileges = true;
+                } else if option == "systempaths=unconfined" {
+                    request.security.systempaths_unconfined = true;
+                } else {
+                    request.security.security_opt.push(option);
+                }
+            }
+            "--read-only" => request.security.read_only_rootfs = true,
+            "--device" => {
+                request.devices.push(next()?.clone());
+                i += 1;
+            }
+            "--group-add" => {
+                request.group_add.push(next()?.clone());
+                i += 1;
+            }
+            "--gpus" => {
+                if next()? != "all" {
+                    anyhow::bail!("unsupported GPU request");
+                }
+                request.nvidia_gpu = true;
+                request.gpu = true;
+                i += 1;
+            }
+            "-e" => {
+                request.environment.push(next()?.clone());
+                i += 1;
+            }
+            "-v" => {
+                request.mounts.push(next()?.clone());
+                i += 1;
+            }
+            "--mount" => {
+                let raw = next()?;
+                i += 1;
+                let parts = raw.split(',').collect::<Vec<_>>();
+                let get = |key| parts.iter().find_map(|part| part.strip_prefix(key));
+                let src = get("src=")
+                    .or_else(|| get("source="))
+                    .ok_or_else(|| anyhow!("mount source missing"))?;
+                let dst = get("dst=")
+                    .or_else(|| get("target="))
+                    .ok_or_else(|| anyhow!("mount target missing"))?;
+                let read_only = parts.contains(&"readonly") || parts.contains(&"ro");
+                match get("type=") {
+                    Some("bind") => {
+                        if parts.iter().any(|part| {
+                            !matches!(*part, "type=bind" | "readonly" | "ro")
+                                && !part.starts_with("src=")
+                                && !part.starts_with("source=")
+                                && !part.starts_with("dst=")
+                                && !part.starts_with("target=")
+                                && !part.starts_with("consistency=")
+                        }) {
+                            anyhow::bail!("unsupported bind mount option {raw}");
+                        }
+                        request.typed_mounts.push(ApplicationMount::Bind {
+                            source: src.to_owned(),
+                            target: dst.to_owned(),
+                            read_only,
+                            consistency: get("consistency=").map(str::to_owned),
+                        })
+                    }
+                    Some("volume") => {
+                        if parts.iter().any(|part| {
+                            !matches!(
+                                *part,
+                                "type=volume" | "readonly" | "ro" | "volume-nocopy" | "nocopy"
+                            ) && !part.starts_with("src=")
+                                && !part.starts_with("source=")
+                                && !part.starts_with("dst=")
+                                && !part.starts_with("target=")
+                        }) {
+                            anyhow::bail!("unsupported volume mount option {raw}");
+                        }
+                        request.typed_mounts.push(ApplicationMount::Volume {
+                            source: src.to_owned(),
+                            target: dst.to_owned(),
+                            read_only,
+                            no_copy: parts.contains(&"volume-nocopy") || parts.contains(&"nocopy"),
+                        })
+                    }
+                    _ => anyhow::bail!("unsupported mount type {raw}"),
+                }
+            }
+            value if value.starts_with('-') => {
+                anyhow::bail!("unrepresented application runtime argument {value}")
+            }
+            image if request.image.is_empty() => request.image = image.to_owned(),
+            value => request.command.push(value.to_owned()),
+        }
+        i += 1;
+    }
+    if !request.is_valid() {
+        anyhow::bail!("invalid application runtime request");
+    }
+    Ok(request)
+}
+
+fn parse_size(value: &str) -> Result<i64> {
+    let (number, factor) = match value.as_bytes().last().copied() {
+        Some(b'g' | b'G') => (&value[..value.len() - 1], 1024_i64.pow(3)),
+        Some(b'm' | b'M') => (&value[..value.len() - 1], 1024_i64.pow(2)),
+        Some(b'k' | b'K') => (&value[..value.len() - 1], 1024),
+        _ => (value, 1),
+    };
+    number
+        .parse::<i64>()?
+        .checked_mul(factor)
+        .ok_or_else(|| anyhow!("size overflow"))
+}
 
 /// `Command::output()` with a deadline: spawn, poll `try_wait`, kill on timeout.
 fn output_with_timeout(cmd: &mut Command, what: &str) -> Result<Output> {
@@ -752,6 +1116,14 @@ impl ContainerRuntime {
             Err(error) => return Err(error),
         };
         let value: serde_json::Value = serde_json::from_str(&output)?;
+        if value["Labels"]
+            .as_object()
+            .is_some_and(|labels| labels.contains_key("io.quasar.application-operation"))
+        {
+            anyhow::bail!(
+                "Preserving API-owned application {target}: use runtime application recovery"
+            );
+        }
         // Audio lifecycle and recovery belong exclusively to the runtime API.
         // Even an old caller explicitly supplying the pulse prefix cannot bypass
         // its durable cleanup journal. Legacy sidecars require operator review.
@@ -773,14 +1145,6 @@ impl ContainerRuntime {
             &owner,
             &[SESSION_NAME_PREFIX, super::audio::PULSE_NAME_PREFIX],
         )
-    }
-
-    /// Prepare a managed name without ever deleting another agent's collision.
-    pub(crate) fn remove_owned_container(&self, name: &str) -> Result<()> {
-        if let Some(id) = self.managed_container_id(name)? {
-            self.run_raw(&["rm", "-f", &id])?;
-        }
-        Ok(())
     }
 
     /// Launch the app container as a detached Wayland client of the session
@@ -806,7 +1170,8 @@ impl ContainerRuntime {
             "app container name must start with {SESSION_NAME_PREFIX}"
         );
         let owner = crate::container_ownership::token().map_err(anyhow::Error::msg)?;
-        self.remove_owned_container(&name)?;
+        // API-owned applications are recovered by their durable operation
+        // journal. The legacy CLI sweep must never delete them by name.
 
         let mut args: Vec<String> = vec![
             "run".into(),
@@ -1091,96 +1456,69 @@ impl ContainerRuntime {
         args.push(spec.image.clone());
         args.extend(spec.args.iter().cloned());
 
-        tracing::info!("launching container: {} {}", self.bin, args.join(" "));
-        let out = output_with_timeout(Command::new(&self.bin).args(&args), "container run")?;
-        if !out.status.success() {
-            return Err(anyhow!(
-                "`{} run` failed for image {}: {}",
-                self.bin,
-                spec.image,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+        // A lifecycle operation names one launch attempt, not a generation. A
+        // failed/retired attempt cannot authorize a later rollback launch, but
+        // retries inside RuntimeClient retain this exact identity.
+        let operation = format!(
+            "application-{name}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let mut request = application_request_from_args(&args, operation.clone())?;
+        request.unmount_nvidia_params = systempaths_unconfined;
+        let runtime = crate::runtime::configured().map_err(|error| anyhow!(error))?;
+        // Do not mint this attempt until every older writer for this name or
+        // normalized managed-home source has been explicitly retired. RuntimeClient
+        // reconciles only the recorded stable operation.
+        retire_matching_pending_applications(&name, &request, |operation| {
+            runtime
+                .abandon_application(operation.to_owned())
+                .wait()
+                .map_err(|error| anyhow!(error))
+        })?;
+        if request.pull_never {
+            anyhow::ensure!(
+                runtime.image_present(&request.image).wait()?,
+                "required local application image is missing"
+            );
+        } else {
+            runtime
+                .ensure_image(request.image.clone(), Duration::from_secs(300))
+                .wait(|_| {})?;
         }
-        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        tracing::info!("container {name} started (id={})", short_id(&id));
-
-        // Desktop launch-profile post-start fixup, NVIDIA hosts in practice (verified
-        // 2026-08-14). The kernel treats a container's /proc as "fully visible" — a
-        // precondition bwrap's fresh `--proc` mount checks — only when nothing under it
-        // is bind-mounted over, and the nvidia container runtime overmounts exactly one
-        // file, `/proc/driver/nvidia/params`, in every GPU container (`--gpus all` and
-        // CDI both). That trips the check even with `systempaths=unconfined`, so bwrap
-        // fails "Can't mount proc" until it is cleared. The privileged umount's elevated
-        // caps apply to that one exec'd process, never to the app container, whose
-        // posture is unchanged. Gated on `systempaths_unconfined` and best-effort: a
-        // non-GPU or AMD host has nothing mounted there, so a non-zero `umount` is the
-        // expected silent case, not a launch failure.
-        if systempaths_unconfined {
-            match output_with_timeout(
-                Command::new(&self.bin).args([
-                    "exec",
-                    "--privileged",
-                    "--user",
-                    "root",
-                    &name,
-                    "umount",
-                    "/proc/driver/nvidia/params",
-                ]),
-                "container nvidia params unmount",
-            ) {
-                Ok(out) if out.status.success() => {
-                    tracing::info!(
-                        "container {name}: cleared /proc/driver/nvidia/params overmount \
-                         (nvidia GPU host, desktop launch profile)"
-                    );
+        let application = match runtime.start_application(request.clone()).wait() {
+            Ok(application) => application,
+            Err(error) => {
+                // Start may have created or started the exact operation before
+                // its reply was lost. Persist retirement by operation rather
+                // than falling back to a name-based CLI removal.
+                let abandon = runtime.abandon_application(operation.clone()).wait().err();
+                if abandon.is_some() {
+                    retain_pending_application(name.clone(), &request, operation);
                 }
-                Ok(out) => {
-                    tracing::debug!(
-                        "container {name}: no nvidia params overmount to clear ({})",
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    );
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        "container {name}: no nvidia params overmount to clear (exec failed: {e})"
-                    );
-                }
-            }
-        }
-
-        // When the app contract requests GPU access, verify the daemon actually realized
-        // the device mapping: a parsed command line is not enough, runtime policy can
-        // discard it. Fail the launch rather than run a GPU app on software rendering.
-        if spec.gpu {
-            let inspect = output_with_timeout(
-                Command::new(&self.bin).args([
-                    "inspect",
-                    "--format",
-                    "{{json .HostConfig.Devices}} {{json .HostConfig.DeviceRequests}}",
-                    &name,
-                ]),
-                "container GPU inspect",
-            )?;
-            let realized = String::from_utf8_lossy(&inspect.stdout);
-            let dri_realized = inspect.status.success() && realized.contains("/dev/dri");
-            let nvidia_realized = !self.nvidia
-                || (realized.contains("DeviceRequests")
-                    || realized.contains("\"Driver\":\"nvidia\"")
-                    || realized.contains("\"Capabilities\":[[\"gpu\"]]"));
-            if !dri_realized || !nvidia_realized {
-                self.force_remove(&name);
                 return Err(anyhow!(
-                    "app requested GPU access but container runtime did not realize the expected devices (dri={dri_realized}, nvidia={nvidia_realized})"
+                    "application launch failed: {error}; durable cleanup {}",
+                    abandon
+                        .map(|pending| pending.to_string())
+                        .unwrap_or_else(|| "completed".into())
                 ));
             }
-            tracing::info!("container {name} GPU access verified from runtime inspect");
-        }
+        };
+        let id = application.as_str().to_owned();
+        tracing::info!(
+            "container {name} started through runtime API (id={})",
+            short_id(&id)
+        );
 
         Ok(RunningContainer {
-            runtime: self.clone(),
             name,
             container_id: id,
+            application,
             removed: Arc::new(AtomicBool::new(false)),
+            cleanup_proven: false,
+            writable_sources: writable_application_sources(&request),
         })
     }
 
@@ -1984,7 +2322,7 @@ impl AppLogRing {
     /// `from_utf8_lossy` can EXPAND one past the cap (an invalid byte becomes a
     /// three-byte replacement char). Guarded by
     /// `a_multibyte_char_straddling_the_cap_does_not_panic`.
-    fn push(&self, line: String) {
+    pub(crate) fn push(&self, line: String) {
         let mut line = line;
         if line.len() > APP_LOG_MAX_LINE {
             let mut end = APP_LOG_MAX_LINE;
@@ -2095,35 +2433,82 @@ fn push_record(ring: &AppLogRing, record: Vec<u8>, overflowed: bool) {
 /// A launched container whose `Drop` tears it down — so any early return / panic
 /// / dropped session on the agent side cannot leak a container.
 pub struct RunningContainer {
-    runtime: ContainerRuntime,
     name: String,
-    /// Lets the app-liveness waiter (`source.rs`) `docker wait` THIS container without
-    /// racing a same-named replacement (app-liveness spec §3.1).
+    /// Lets the app-liveness observer bind exact RuntimeClient evidence to THIS container
+    /// without racing a same-named replacement (app-liveness spec §3.1).
     container_id: String,
-    /// Shared with the app-liveness waiter: set BEFORE the `docker stop`/`rm` call, so a
-    /// thread blocked in `docker wait` can tell "we tore this down ourselves" (swap,
+    application: ApplicationId,
+    /// Shared with the app-liveness observer: set before the API stop/cleanup request, so
+    /// an observer can tell "we tore this down ourselves" (swap,
     /// session stop) from a genuine app exit. A deliberate stop must never be
     /// misclassified as an app failure (spec §3 G5 swap safety).
     removed: Arc<AtomicBool>,
+    cleanup_proven: bool,
+    /// Normalized writable sources retained so an uncertain stop survives this
+    /// handle being dropped and blocks a later generation's shared-home launch.
+    writable_sources: BTreeSet<String>,
 }
 
 impl RunningContainer {
     /// Tear the container down (idempotent) on the normal stop/failure path; `Drop` is
-    /// the backstop. TERM first (`graceful_remove`) so the app can exit cleanly.
-    pub fn stop(&mut self) {
-        // `swap`, not load+store: the idempotency check is itself the one-shot gate.
-        if !self.removed.swap(true, Ordering::SeqCst) {
-            self.runtime.graceful_remove(&self.container_id);
+    /// the backstop. Intentional stop is deliberately separate from removal proof: a
+    /// lost stop/remove reply retains the same handle and requires another exact-ID
+    /// reconciliation before any replacement may use its managed home.
+    pub fn stop(&mut self) -> Result<()> {
+        let seconds: u64 = std::env::var("QUASAR_APP_STOP_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        self.stop_with(|application| {
+            let api = crate::runtime::configured().map_err(|error| anyhow!(error))?;
+            api.stop_application(application.clone(), Duration::from_secs(seconds))
+                .wait()
+                .map_err(|error| anyhow!(error))?;
+            api.cleanup_application(application.clone())
+                .wait()
+                .map_err(|error| anyhow!(error))
+        })
+    }
+
+    fn stop_with<F>(&mut self, mut retire: F) -> Result<()>
+    where
+        F: FnMut(&ApplicationId) -> Result<()>,
+    {
+        if self.cleanup_proven {
+            return Ok(());
         }
+        // Intent is visible to the observer before Docker sees a mutation, but it is
+        // never removal proof. Any error keeps `cleanup_proven=false`, so the caller
+        // must retry this exact durable application identity.
+        self.removed.store(true, Ordering::SeqCst);
+        if let Err(error) = retire(&self.application) {
+            retain_pending_application_sources(
+                self.name.clone(),
+                self.writable_sources.clone(),
+                self.application.operation.clone(),
+            );
+            tracing::warn!(
+                token = "application-stop-pending",
+                "runtime application stop remains journalled: {error}"
+            );
+            return Err(error);
+        }
+        self.cleanup_proven = true;
+        clear_pending_application(&self.name, &self.application.operation);
+        Ok(())
     }
 
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// The daemon-assigned container id (for `docker wait`).
+    /// The daemon-assigned container id retained for exact ownership diagnostics.
     pub fn container_id(&self) -> &str {
         &self.container_id
+    }
+
+    pub fn application_id(&self) -> ApplicationId {
+        self.application.clone()
     }
 
     /// A clone of the shared teardown marker — see the field doc comment.
@@ -2134,13 +2519,120 @@ impl RunningContainer {
 
 impl Drop for RunningContainer {
     fn drop(&mut self) {
-        self.stop();
+        if let Err(error) = self.stop() {
+            tracing::warn!(
+                token = "application-drop-cleanup-pending",
+                "runtime application cleanup remains durable: {error}"
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_request_preserves_bind_options_and_embeds_seccomp_profile_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("seccomp.json");
+        std::fs::write(&profile, "{\"defaultAction\":\"SCMP_ACT_ERRNO\"}").unwrap();
+        let args = vec![
+            "run".into(),
+            "-d".into(),
+            "--name".into(),
+            "quasar-sess-s1".into(),
+            "--network".into(),
+            "none".into(),
+            "--security-opt".into(),
+            format!("seccomp={}", profile.display()),
+            "-v".into(),
+            "/home/a:/home/a:Z,nocopy,cached".into(),
+            "image:test".into(),
+            "--arg".into(),
+        ];
+        let request =
+            application_request_from_args(&args, "application-quasar-sess-s1".into()).unwrap();
+        assert_eq!(request.mounts, vec!["/home/a:/home/a:Z,nocopy,cached"]);
+        assert_eq!(
+            request.security.security_opt,
+            vec!["seccomp={\"defaultAction\":\"SCMP_ACT_ERRNO\"}"]
+        );
+        assert_eq!(request.command, vec!["--arg"]);
+    }
+
+    #[test]
+    fn runtime_request_keeps_typed_mounts_volumes_and_catalog_security_optout() {
+        let args = vec![
+            "run".into(),
+            "-d".into(),
+            "--name".into(),
+            "quasar-sess-s1".into(),
+            "--security-opt".into(),
+            "seccomp=unconfined".into(),
+            "--mount".into(),
+            "type=bind,src=/missing-on-host,dst=/run/wayland-0,readonly".into(),
+            "--mount".into(),
+            "type=volume,src=quasar-driver,dst=/opt/quasar/nvidia-driver,readonly,volume-nocopy"
+                .into(),
+            "image:test".into(),
+        ];
+        let request =
+            application_request_from_args(&args, "application-quasar-sess-s1".into()).unwrap();
+        assert!(!request.security.no_new_privileges);
+        assert!(!request.pull_never);
+        assert_eq!(request.command, Vec::<String>::new());
+        assert_eq!(
+            request.typed_mounts,
+            vec![
+                ApplicationMount::Bind {
+                    source: "/missing-on-host".into(),
+                    target: "/run/wayland-0".into(),
+                    read_only: true,
+                    consistency: None
+                },
+                ApplicationMount::Volume {
+                    source: "quasar-driver".into(),
+                    target: "/opt/quasar/nvidia-driver".into(),
+                    read_only: true,
+                    no_copy: true
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_request_rejects_unrepresented_typed_mount_options() {
+        let args = vec![
+            "run".into(),
+            "-d".into(),
+            "--name".into(),
+            "quasar-sess-s1".into(),
+            "--mount".into(),
+            "type=bind,src=/host,dst=/guest,bind-nonrecursive".into(),
+            "image:test".into(),
+        ];
+        assert!(application_request_from_args(&args, "application-quasar-sess-s1".into()).is_err());
+    }
+
+    #[test]
+    fn runtime_request_maps_systempaths_to_api_path_lists_not_security_opt() {
+        let args = vec![
+            "run".into(),
+            "-d".into(),
+            "--name".into(),
+            "quasar-sess-s1".into(),
+            "--security-opt".into(),
+            "seccomp=unconfined".into(),
+            "--security-opt".into(),
+            "systempaths=unconfined".into(),
+            "image:test".into(),
+        ];
+        let request =
+            application_request_from_args(&args, "application-quasar-sess-s1".into()).unwrap();
+        assert!(request.security.systempaths_unconfined);
+        assert_eq!(request.security.security_opt, vec!["seccomp=unconfined"]);
+    }
 
     fn node(name: &str, mode: u32, gid: u32) -> DrmNodeOwner {
         DrmNodeOwner {
@@ -2779,6 +3271,272 @@ mod tests {
     }
 
     #[test]
+    fn intentional_stop_retries_exact_identity_until_cleanup_is_proven() {
+        let mut container = RunningContainer {
+            name: "quasar-sess-stop-retry".into(),
+            container_id: "container-id".into(),
+            application: ApplicationId {
+                id: "container-id".into(),
+                operation: "operation-stop-retry".into(),
+            },
+            removed: Arc::new(AtomicBool::new(false)),
+            cleanup_proven: false,
+            writable_sources: BTreeSet::from(["/managed/home-stop".into()]),
+        };
+        clear_pending_application("quasar-sess-stop-retry", "operation-stop-retry");
+        let calls = std::cell::RefCell::new(Vec::new());
+        for reason in ["lost remove reply", "still unavailable"] {
+            assert!(container
+                .stop_with(|application| {
+                    calls.borrow_mut().push(application.operation.clone());
+                    anyhow::bail!("{reason}")
+                })
+                .is_err());
+            assert!(
+                !container.cleanup_proven,
+                "an uncertain stop cannot authorize a replacement"
+            );
+            assert!(
+                container.removed.load(Ordering::SeqCst),
+                "intentional stop must silence the observer"
+            );
+        }
+        container
+            .stop_with(|application| {
+                calls.borrow_mut().push(application.operation.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert!(container.cleanup_proven);
+        container
+            .stop_with(|_| panic!("proven cleanup must be idempotent"))
+            .unwrap();
+        assert_eq!(
+            &*calls.borrow(),
+            &[
+                "operation-stop-retry",
+                "operation-stop-retry",
+                "operation-stop-retry"
+            ]
+        );
+    }
+
+    #[test]
+    fn periodic_pending_recovery_retries_only_explicit_operations_and_continues_after_failure() {
+        let stuck = PendingApplication {
+            operation: "application-pending-stuck".into(),
+            writable_sources: BTreeSet::from(["/managed/pending-stuck".into()]),
+        };
+        let healthy = PendingApplication {
+            operation: "application-pending-healthy".into(),
+            writable_sources: BTreeSet::from(["/managed/pending-healthy".into()]),
+        };
+        let active = PendingApplication {
+            operation: "application-active-unrequested".into(),
+            writable_sources: BTreeSet::new(),
+        };
+        let pending = pending_application_operations();
+        for (name, operation) in [
+            ("quasar-sess-pending-stuck", &stuck.operation),
+            ("quasar-sess-pending-healthy", &healthy.operation),
+            ("quasar-sess-active-unrequested", &active.operation),
+        ] {
+            clear_pending_application(name, operation);
+        }
+        pending
+            .lock()
+            .unwrap()
+            .insert("quasar-sess-pending-stuck".into(), stuck.clone());
+        pending
+            .lock()
+            .unwrap()
+            .insert("quasar-sess-pending-healthy".into(), healthy.clone());
+        // This represents an active app absent from the caller's explicit-stop snapshot;
+        // it must not be offered to abandonment at all.
+        let calls = std::cell::RefCell::new(Vec::new());
+        recover_pending_application_operations(|operation| {
+            calls.borrow_mut().push(operation.to_owned());
+            if operation == stuck.operation {
+                anyhow::bail!("daemon busy")
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls.borrow().len(), 2);
+        assert!(calls
+            .borrow()
+            .contains(&"application-pending-stuck".to_string()));
+        assert!(calls
+            .borrow()
+            .contains(&"application-pending-healthy".to_string()));
+        assert_eq!(
+            pending.lock().unwrap().get("quasar-sess-pending-stuck"),
+            Some(&stuck)
+        );
+        assert!(!pending
+            .lock()
+            .unwrap()
+            .contains_key("quasar-sess-pending-healthy"));
+        assert!(!pending
+            .lock()
+            .unwrap()
+            .contains_key("quasar-sess-active-unrequested"));
+        clear_pending_application("quasar-sess-pending-stuck", &stuck.operation);
+    }
+
+    #[test]
+    fn uncertain_launch_blocks_same_home_until_its_exact_operation_retires() {
+        let old = ApplicationRequest {
+            operation: "application-old-stable-operation-home-a".into(),
+            name: "quasar-sess-old-home-a".into(),
+            mounts: vec!["/managed/home-a:/home/quasar:rw".into()],
+            ..Default::default()
+        };
+        clear_pending_application(&old.name, &old.operation);
+        retain_pending_application(old.name.clone(), &old, old.operation.clone());
+        let replacement = ApplicationRequest {
+            operation: "application-new-attempt-home-a".into(),
+            name: "quasar-sess-new-home-a".into(),
+            mounts: vec!["/managed/home-a/.:/home/quasar:rw".into()],
+            ..Default::default()
+        };
+        let calls = std::cell::RefCell::new(Vec::new());
+        assert!(retire_matching_pending_applications(
+            &replacement.name,
+            &replacement,
+            |operation| {
+                calls.borrow_mut().push(operation.to_owned());
+                anyhow::bail!("lost cleanup reply")
+            }
+        )
+        .is_err());
+        assert_eq!(
+            &*calls.borrow(),
+            &["application-old-stable-operation-home-a"]
+        );
+        assert!(pending_application_operations()
+            .lock()
+            .unwrap()
+            .contains_key(&old.name));
+        assert!(retire_matching_pending_applications(
+            &replacement.name,
+            &replacement,
+            |_operation| anyhow::bail!("still pending")
+        )
+        .is_err());
+        retire_matching_pending_applications(&replacement.name, &replacement, |operation| {
+            assert_eq!(operation, "application-old-stable-operation-home-a");
+            Ok(())
+        })
+        .unwrap();
+        assert!(!pending_application_operations()
+            .lock()
+            .unwrap()
+            .contains_key(&old.name));
+    }
+
+    #[test]
+    fn retiring_an_old_operation_never_erases_a_concurrent_newer_operation() {
+        let old = ApplicationRequest {
+            operation: "application-old-race".into(),
+            name: "quasar-sess-race".into(),
+            mounts: vec!["/managed/race:/home/quasar:rw".into()],
+            ..Default::default()
+        };
+        clear_pending_application(&old.name, &old.operation);
+        retain_pending_application(old.name.clone(), &old, old.operation.clone());
+        let newer = PendingApplication {
+            operation: "application-new-race".into(),
+            writable_sources: BTreeSet::from(["/managed/race".into()]),
+        };
+        retire_matching_pending_applications(&old.name, &old, |_| {
+            pending_application_operations()
+                .lock()
+                .unwrap()
+                .insert(old.name.clone(), newer.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            pending_application_operations()
+                .lock()
+                .unwrap()
+                .get(&old.name),
+            Some(&newer)
+        );
+        clear_pending_application(&old.name, &newer.operation);
+    }
+
+    #[test]
+    fn uncertain_launch_does_not_block_an_unrelated_writable_home() {
+        let old = ApplicationRequest {
+            operation: "application-old-home-unrelated".into(),
+            name: "quasar-sess-old-unrelated".into(),
+            mounts: vec!["/managed/home-unrelated-a:/home/quasar:rw".into()],
+            ..Default::default()
+        };
+        clear_pending_application(&old.name, &old.operation);
+        retain_pending_application(old.name.clone(), &old, old.operation.clone());
+        let unrelated = ApplicationRequest {
+            name: "quasar-sess-other-unrelated".into(),
+            mounts: vec!["/managed/home-unrelated-b:/home/quasar:rw".into()],
+            ..Default::default()
+        };
+        let calls = std::cell::Cell::new(0);
+        retire_matching_pending_applications(&unrelated.name, &unrelated, |_| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 0);
+        clear_pending_application(&old.name, &old.operation);
+    }
+
+    #[test]
+    fn writable_legacy_and_typed_volumes_share_a_pending_writer_key() {
+        let old = ApplicationRequest {
+            operation: "application-volume-writer".into(),
+            name: "quasar-sess-volume-writer".into(),
+            mounts: vec!["managed-home:/home/quasar".into()],
+            ..Default::default()
+        };
+        let typed = ApplicationRequest {
+            name: "quasar-sess-volume-next".into(),
+            typed_mounts: vec![ApplicationMount::Volume {
+                source: "managed-home".into(),
+                target: "/home/quasar".into(),
+                read_only: false,
+                no_copy: false,
+            }],
+            ..Default::default()
+        };
+        clear_pending_application(&old.name, &old.operation);
+        retain_pending_application(old.name.clone(), &old, old.operation.clone());
+        assert!(
+            retire_matching_pending_applications(&typed.name, &typed, |operation| {
+                assert_eq!(operation, "application-volume-writer");
+                anyhow::bail!("still pending")
+            })
+            .is_err()
+        );
+        clear_pending_application(&old.name, &old.operation);
+    }
+
+    #[test]
+    fn readonly_volume_aliases_do_not_block_a_writable_launch() {
+        for mount in [
+            "managed-readonly:/home/quasar:ro",
+            "managed-readonly:/home/quasar:readonly",
+        ] {
+            let request = ApplicationRequest {
+                mounts: vec![mount.into()],
+                ..Default::default()
+            };
+            assert!(writable_application_sources(&request).is_empty(), "{mount}");
+        }
+    }
+
+    #[test]
     fn wayland_mount_exposes_only_the_session_socket() {
         let params = LaunchParams {
             session_id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
@@ -2895,12 +3653,13 @@ mod tests {
         let legacy = "c".repeat(64);
         let unrelated = "d".repeat(64);
         let pulse = "e".repeat(64);
+        let application = "f".repeat(64);
         // Deliberately ignore Docker's filter: the independent inspect check must
         // preserve foreign, unlabelled and substring-only names even then.
         let body = format!(
             r#"#!/bin/sh
 case "$1" in
-ps) printf '%s\n' '{one}' '{two}' '{legacy}' '{unrelated}' '{pulse}' ;;
+ps) printf '%s\n' '{one}' '{two}' '{legacy}' '{unrelated}' '{pulse}' '{application}' ;;
 inspect)
  for target do :; done
  case "$target" in
@@ -2909,9 +3668,14 @@ inspect)
  {legacy}) name=quasar-sess-legacy; owner= ;;
  {unrelated}) name=other-quasar-sess-one; owner=one ;;
  {pulse}) name=quasar-pulse-one; owner=one ;;
+ {application}) name=quasar-sess-api-owned; owner=one; application_operation=api-operation ;;
  *) echo 'No such container' >&2; exit 1 ;;
  esac
- printf '{{"Id":"%s","Name":"/%s","Labels":{{"io.quasar.agent-owner":"%s"}}}}\n' "$target" "$name" "$owner" ;;
+ if [ -n "$application_operation" ]; then
+   printf '{{"Id":"%s","Name":"/%s","Labels":{{"io.quasar.agent-owner":"%s","io.quasar.application-operation":"%s"}}}}\n' "$target" "$name" "$owner" "$application_operation"
+ else
+   printf '{{"Id":"%s","Name":"/%s","Labels":{{"io.quasar.agent-owner":"%s"}}}}\n' "$target" "$name" "$owner"
+ fi ;;
 rm) printf '%s\n' "$3" >> '{}' ;;
 esac
 "#,
@@ -2924,7 +3688,8 @@ esac
         assert_eq!(runtime.sweep_orphans_for("one", &prefixes), 1);
         assert_eq!(
             std::fs::read_to_string(&removed).unwrap(),
-            format!("{one}\n")
+            format!("{one}\n"),
+            "the API-owned application label must add no legacy rm call"
         );
         std::fs::write(&removed, "").unwrap();
         assert_eq!(runtime.sweep_orphans_for("two", &prefixes), 1);
