@@ -28,6 +28,9 @@ const SHARED_TOKENS: &[&str] = &[
     "knob-invalid-nvenc-max-sessions",
     "knob-invalid-vulkan-max-sessions",
     "session-assign-rejected",
+    // One condition, two paths (`path = "job"` / `path = "drop"`): the warm-up
+    // container's teardown could not be proven after the exact operation was retried.
+    "template-warmup-teardown-unproven",
     "udev-export-failed",
     "vulkan-encoder-rearm-not-found",
     "webrtc-duplicate-answer",

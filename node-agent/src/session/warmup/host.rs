@@ -70,23 +70,17 @@ impl AgentWarmupHost {
     pub fn new(runtime: ContainerRuntime, settings: RuntimeSettings) -> Self {
         AgentWarmupHost { runtime, settings }
     }
+}
 
-    /// `docker image inspect --format {{.Config.WorkingDir}}`.
-    fn image_workdir(&self, image: &str) -> Option<String> {
-        let out = self
-            .runtime
-            .run_raw(&[
-                "image",
-                "inspect",
-                "--format",
-                "{{.Config.WorkingDir}}",
-                "--",
-                image,
-            ])
-            .ok()?;
-        let dir = out.trim().to_string();
-        (!dir.is_empty() && dir != "/").then_some(dir)
-    }
+/// Resolve a usable image home from its baked HOME and working-directory facts.
+pub(crate) fn container_home_from(
+    env_home: Option<&str>,
+    working_dir: Option<&str>,
+) -> Option<String> {
+    env_home
+        .filter(|home| home.starts_with('/') && *home != "/")
+        .or_else(|| working_dir.filter(|dir| dir.starts_with('/') && *dir != "/"))
+        .map(str::to_string)
 }
 
 impl WarmupHost for AgentWarmupHost {
@@ -98,19 +92,45 @@ impl WarmupHost for AgentWarmupHost {
     /// job per `ready`, forever, on an unwarmable image. §3.3 states the skip
     /// explicitly ("skipped with a WARN" when the image exposes neither).
     fn container_home(&self, image: &str) -> Option<String> {
-        if let Some(home) = self.runtime.image_env(image, "HOME") {
-            let home = home.trim().to_string();
+        // ONE metadata read, so HOME and WorkingDir describe the same image identity
+        // and an inspection failure is a logged failure rather than "no home".
+        let metadata = match self.runtime.image_metadata(image) {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => {
+                warn!(
+                    token = "template-image-missing",
+                    "template: {image} is not present on this host; skipping the warm-up"
+                );
+                return None;
+            }
+            Err(error) => {
+                warn!(
+                    token = "template-image-inspect-failed",
+                    "template: could not inspect {image} for its container home: {error:#}; \
+                     skipping the warm-up"
+                );
+                return None;
+            }
+        };
+        let env_home = metadata
+            .baked_env
+            .iter()
+            .find_map(|entry| entry.strip_prefix("HOME="))
+            .map(str::trim)
+            .filter(|home| !home.is_empty());
+        let working_dir = metadata.working_dir.as_deref().map(str::trim);
+        if let Some(home) = env_home {
             if home.starts_with('/') && home != "/" {
                 debug!("template: {image} container home from Config.Env HOME: {home}");
-                return Some(home);
+                return Some(home.to_string());
             }
             info!(
                 token = "template-home-from-workingdir",
                 "template: {image} declares an unusable HOME={home:?}; trying WorkingDir"
             );
         }
-        match self.image_workdir(image) {
-            Some(dir) if dir.starts_with('/') => {
+        match container_home_from(env_home, working_dir) {
+            Some(dir) => {
                 info!("template: {image} has no HOME; using Config.WorkingDir {dir}");
                 Some(dir)
             }
@@ -226,6 +246,7 @@ impl WarmupHost for AgentWarmupHost {
         );
         Ok(Box::new(RunnerWarmupSession {
             session_id,
+            scratch_home: req.scratch_home.clone(),
             stop,
             evt_rx,
             thread: Some(thread),
@@ -240,6 +261,7 @@ impl WarmupHost for AgentWarmupHost {
 /// the #484 `app presented` signal arrives on.
 struct RunnerWarmupSession {
     session_id: String,
+    scratch_home: std::path::PathBuf,
     stop: Arc<AtomicBool>,
     evt_rx: mpsc::Receiver<(String, SessionEvent)>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -292,7 +314,7 @@ impl WarmupSession for RunnerWarmupSession {
     /// worth surfacing as a stuck thread rather than snapshotting a tree still
     /// being written, and it cannot stall the agent's control-plane loop (a
     /// different thread). The gate stays held for the duration.
-    fn stop_and_wait(&mut self) {
+    fn stop_and_wait(&mut self) -> Result<(), String> {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
             if t.join().is_err() {
@@ -303,6 +325,17 @@ impl WarmupSession for RunnerWarmupSession {
             }
         }
         debug!("template: warm-up session {} torn down", self.session_id);
+        // Joining the runner is not teardown proof: its stop/cleanup reply may have been
+        // lost, leaving the exact operation pending. Retry that operation once here,
+        // before the host gate is released, and report it if it is still unresolved so
+        // the job never snapshots or publishes a tree a container may still be writing.
+        crate::session::container::prove_source_teardown(&self.scratch_home, |operation| {
+            crate::runtime::configured()
+                .map_err(|error| anyhow::anyhow!(error))?
+                .abandon_application(operation.to_owned())
+                .wait()
+                .map_err(|error| anyhow::anyhow!(error))
+        })
     }
 }
 
@@ -317,7 +350,14 @@ impl Drop for RunnerWarmupSession {
                 "template: warm-up session {} was dropped without a stop; stopping now",
                 self.session_id
             );
-            self.stop_and_wait();
+            if let Err(reason) = self.stop_and_wait() {
+                warn!(
+                    token = "template-warmup-teardown-unproven",
+                    path = "drop",
+                    "template: warm-up session {} teardown remains unproven: {reason}",
+                    self.session_id
+                );
+            }
         }
     }
 }
@@ -342,5 +382,19 @@ mod tests {
             mount,
             "/var/lib/quasar/templates/.staging/steam/scratch-home:/home/quasar"
         );
+    }
+
+    #[test]
+    fn container_home_resolution_prefers_a_usable_home_then_working_directory() {
+        assert_eq!(
+            container_home_from(Some("/home/quasar"), Some("/work")),
+            Some("/home/quasar".into())
+        );
+        assert_eq!(
+            container_home_from(Some("relative"), Some("/work")),
+            Some("/work".into())
+        );
+        assert_eq!(container_home_from(Some("/"), Some("/")), None);
+        assert_eq!(container_home_from(None, None), None);
     }
 }

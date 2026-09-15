@@ -73,6 +73,32 @@ tile discovered inside a parent app's library. It inherits the parent's
 runtime, image, and resource demand; a handful of fields (default profile,
 profile policy) stay on the tile.
 
+**Generation** — one app container launched into one session: the gen-0
+container the session boots with, and each replacement a swap launches after
+it. Its container name carries the number (`quasar-sess-<sid>-g<n>`), and its
+exit slot, log ring, presented-baseline and intentional-stop marker belong to
+it alone, so nothing an earlier generation's observer reports late can be
+attributed to its replacement. The runtime API knows nothing of generations:
+each launch attempt is its own durable operation, and stop/cleanup act only on
+that exact identity. _Avoid_: "retry count" (a rolled-back swap relaunches the
+previous app under the previous generation's name; the counter is a name, not
+a tally of what is running), and the unrelated policy epoch in `source_policy`.
+
+**Intentional stop** — the agent's own teardown of a generation (a swap's step
+2, a session stop, a drop). The marker is set on the container handle BEFORE
+the engine sees the stop, so an exit the observer sees afterwards is discarded
+rather than reported as an app failure. It is not proof of removal: a stop or
+cleanup whose reply was lost keeps the handle and its durable operation pending
+until that exact identity is reconciled. _Avoid_: "user stop" (a user can only
+ask the control plane; the agent stops).
+
+**Scratch home** — the empty, throwaway directory a warm-up bind-mounts at the
+image's own home path so the app can populate it. It lives inside the staging
+tree, is never seeded from a template, and becomes the template only after the
+warm-up container's teardown has been proven; an unproven teardown fails the
+build and publishes nothing. _Avoid_: "throwaway home" (the `agent-…` per-user
+homes the homes GC reaps) and the `scratch_mount()` tempdir in the home tests.
+
 ## Stream health
 
 **Verdict** — the single stream-health judgement, as a value: the state (a

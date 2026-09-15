@@ -39,6 +39,9 @@ impl Clock for FakeClock {
 #[derive(Default)]
 struct StoreLog {
     published: Vec<TemplateMeta>,
+    published_stopped_marker: bool,
+    /// Whether the staging `home/` held any snapshot content when it was discarded.
+    discard_saw_snapshot: bool,
     discarded: usize,
     removed: Vec<String>,
 }
@@ -100,11 +103,18 @@ impl StagingBuildApi for FakeStaging {
         self.root.join("home")
     }
     fn publish(self: Box<Self>, meta: TemplateMeta) -> io::Result<PathBuf> {
-        self.log.lock().unwrap().published.push(meta);
+        let mut log = self.log.lock().unwrap();
+        log.published_stopped_marker = self.root.join("home/.stopped-marker").is_file();
+        log.published.push(meta);
         Ok(self.root.clone())
     }
     fn discard(self: Box<Self>) -> io::Result<()> {
-        self.log.lock().unwrap().discarded += 1;
+        let mut log = self.log.lock().unwrap();
+        log.discard_saw_snapshot = std::fs::read_dir(self.root.join("home"))
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+        log.discarded += 1;
+        drop(log);
         let _ = std::fs::remove_dir_all(&self.root);
         Ok(())
     }
@@ -123,6 +133,7 @@ struct FakeHost {
     populate: Option<Populate>,
     launched: Arc<AtomicUsize>,
     stopped: Arc<AtomicUsize>,
+    teardown_unproven: bool,
 }
 
 impl FakeHost {
@@ -135,6 +146,7 @@ impl FakeHost {
             populate: None,
             launched: Arc::new(AtomicUsize::new(0)),
             stopped: Arc::new(AtomicUsize::new(0)),
+            teardown_unproven: false,
         }
     }
 }
@@ -146,6 +158,7 @@ struct FakeSession {
     scratch: PathBuf,
     populate: Option<Populate>,
     stopped: Arc<AtomicUsize>,
+    teardown_unproven: bool,
 }
 
 impl WarmupHost for FakeHost {
@@ -164,6 +177,7 @@ impl WarmupHost for FakeHost {
             scratch: req.scratch_home.clone(),
             populate: self.populate.clone(),
             stopped: self.stopped.clone(),
+            teardown_unproven: self.teardown_unproven,
         }))
     }
 }
@@ -185,14 +199,18 @@ impl WarmupSession for FakeSession {
             WarmupSessionState::Booting
         }
     }
-    fn stop_and_wait(&mut self) {
+    fn stop_and_wait(&mut self) -> Result<(), String> {
         self.stopped.fetch_add(1, Ordering::SeqCst);
         // §3.3 step 8: the snapshot must happen strictly after teardown. This
         // marker written on the way down proves the ordering in the published
         // template.
+        if self.teardown_unproven {
+            return Err("application teardown remains unproven (operation fake-rh01)".into());
+        }
         if self.scratch.is_dir() {
             let _ = std::fs::write(self.scratch.join(".stopped-marker"), b"flushed on exit");
         }
+        Ok(())
     }
 }
 
@@ -374,6 +392,7 @@ fn a_warm_up_publishes_a_sanitized_verified_template() {
     let log = log.lock().unwrap();
     assert_eq!(log.discarded, 0);
     assert_eq!(log.published.len(), 1);
+    assert!(log.published_stopped_marker);
     let meta = &log.published[0];
     assert_eq!(meta.image_id, "steam");
     assert_eq!(meta.version, "v2");
@@ -381,6 +400,64 @@ fn a_warm_up_publishes_a_sanitized_verified_template() {
     assert_eq!(meta.schema, TEMPLATE_META_SCHEMA);
     assert_eq!(meta.files, outcome.stats.files);
     assert!(meta.built_at > 0);
+}
+
+#[test]
+fn an_unproven_teardown_never_publishes_or_snapshots() {
+    let mut store = FakeStore::new();
+    let existing = meta_at("existing", &req().registry_ref);
+    store.existing = Some(existing.clone());
+    let log = store.log.clone();
+    let mut host = FakeHost::new();
+    host.populate = Some(Arc::new(steam_like_home));
+    host.teardown_unproven = true;
+    let stopped = host.stopped.clone();
+    let clock = FakeClock::new();
+    let control = WarmupControl::new();
+    let activity = HostActivity::new();
+    let guard = control
+        .try_acquire(&activity, Duration::ZERO, clock.now())
+        .unwrap();
+    let job = WarmupJob {
+        cfg: &test_cfg(),
+        store: &store,
+        host: &host,
+        clock: &clock,
+        app_uid_gid: None,
+    };
+
+    match job.run(&req(), &guard) {
+        Err(WarmupError::TeardownUnproven(reason)) => {
+            assert!(reason.contains("fake-rh01"), "{reason}")
+        }
+        other => panic!("expected an unproven-teardown failure, got {other:?}"),
+    }
+    assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    let log = log.lock().unwrap();
+    assert!(log.published.is_empty());
+    assert!(
+        !log.published_stopped_marker,
+        "the snapshot marker was not copied"
+    );
+    // The staging tree, and the scratch home inside it, are RETAINED: a container whose
+    // teardown is unproven may still hold that directory, and a pathname that stays
+    // occupied keeps the launch-time pending guard meaningful.
+    assert_eq!(
+        log.discarded, 0,
+        "an unproven teardown never discards staging"
+    );
+    let staging = store.root.path().join(".staging/steam");
+    let scratch = staging.join("scratch-home");
+    assert!(scratch.is_dir(), "scratch home retained");
+    assert!(
+        std::fs::read_dir(&scratch).unwrap().next().is_some(),
+        "scratch content retained"
+    );
+    let snapshot = std::fs::read_dir(staging.join("home"))
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    assert!(!snapshot, "no snapshot was written into the staging home");
+    assert_eq!(store.meta("steam"), Some(existing));
 }
 
 /// §3.3 step 7: the job does not snapshot until the tree has been still for the

@@ -233,6 +233,105 @@ impl SessionResources {
 
 /// One generation of the swappable source: the source `gst::Pipeline`
 /// (`compositor → interpipesink`) plus the app container launched into its compositor.
+/// Observation state for ONE launch attempt: the terminal-exit slot the runner polls and
+/// the log ring the observer fills.
+///
+/// Transition rule: `AppSource::launch` installs a fresh record as the current one
+/// immediately before it asks the engine for a container, and the observer thread it
+/// spawns on success captures only that record's [`GenerationObserver`] handles. So an
+/// observer from a previous generation can never publish a late exit or a dying log line
+/// into the state the runner reads for the replacement; a launch attempt that fails
+/// exposes an empty tail and no exit rather than the retired generation's evidence. That
+/// matters on a rolled-back swap, where the previous app is relaunched into the SAME
+/// `AppSource`: a shared slot would report the old process's exit as the relaunched
+/// app's failure.
+pub(crate) struct GenerationObservation {
+    exit_result: Arc<Mutex<Option<AppExitStatus>>>,
+    logs: AppLogRing,
+    /// This generation's intentional-stop marker, once a container exists. Read again
+    /// at take time: the observer checks it before publishing, but a stop that begins
+    /// between that check and the write would otherwise reach the runner as an exit.
+    removed: Option<Arc<AtomicBool>>,
+}
+
+impl GenerationObservation {
+    pub(crate) fn new() -> Self {
+        GenerationObservation {
+            exit_result: Arc::new(Mutex::new(None)),
+            logs: AppLogRing::new(),
+            removed: None,
+        }
+    }
+
+    /// The handles an observer thread for this generation owns. `removed` is the
+    /// container's intentional-stop marker (`RunningContainer::removed_flag`).
+    pub(crate) fn observer(&mut self, removed: Arc<AtomicBool>) -> GenerationObserver {
+        self.removed = Some(removed.clone());
+        GenerationObserver {
+            exit_result: self.exit_result.clone(),
+            logs: self.logs.clone(),
+            removed,
+        }
+    }
+
+    /// Take semantics: the runner acts on a given exit exactly once. An exit is never
+    /// handed out once our own teardown of this generation has begun, whichever side
+    /// of the observer's marker check the stop landed on.
+    pub(crate) fn take_exit(&self) -> Option<AppExitStatus> {
+        let mut guard = match self.exit_result.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let status = guard.take()?;
+        if self
+            .removed
+            .as_ref()
+            .is_some_and(|removed| removed.load(Ordering::SeqCst))
+        {
+            return None;
+        }
+        Some(status)
+    }
+
+    pub(crate) fn log_tail(&self) -> Vec<String> {
+        self.logs.tail()
+    }
+}
+
+/// The observer-side handles of one [`GenerationObservation`].
+pub(crate) struct GenerationObserver {
+    exit_result: Arc<Mutex<Option<AppExitStatus>>>,
+    logs: AppLogRing,
+    removed: Arc<AtomicBool>,
+}
+
+impl GenerationObserver {
+    pub(crate) fn record_line(&self, line: String) {
+        self.logs.push(line);
+    }
+
+    /// Whether our own teardown (swap, session stop) has begun for this container. Set
+    /// BEFORE the engine sees a stop, so an exit observed afterwards is never an app
+    /// failure.
+    pub(crate) fn stopped_intentionally(&self) -> bool {
+        self.removed.load(Ordering::SeqCst)
+    }
+
+    /// Publish a terminal status for this generation unless the stop was ours. Returns
+    /// whether the status was published.
+    pub(crate) fn publish(&self, status: AppExitStatus) -> bool {
+        if self.stopped_intentionally() {
+            return false;
+        }
+        let mut guard = match self.exit_result.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Some(status);
+        true
+    }
+}
+
 /// Dropping it stops the pipeline and removes the container, so a rolled-back or
 /// superseded source leaves no orphan.
 pub struct AppSource {
@@ -277,16 +376,14 @@ pub struct AppSource {
     /// semantics via [`Self::take_launch_error`], so the caller fails the session exactly
     /// once per occurrence rather than on every poll.
     launch_error: Option<String>,
-    /// The app container's terminal exit status, written once by the RuntimeClient
-    /// observer spawned in [`Self::launch`] and consumed by [`Self::take_container_exit`]. `None`
-    /// while still running. A legitimate teardown (swap, session stop) is filtered out
-    /// BEFORE this is written — see the waiter closure in `launch`.
-    exit_result: Arc<Mutex<Option<AppExitStatus>>>,
-    /// The app container's own last ~100 log lines, filled by bounded RuntimeClient
-    /// log snapshots and read on the failure path ([`Self::app_log_tail`]).
-    /// #463: an app that exits before producing a frame surfaces as "media path
-    /// interrupted" unless its own final words travel with the failure.
-    app_logs: AppLogRing,
+    /// The CURRENT container's exit slot and log ring, replaced on every launch. The
+    /// exit status is written once by the RuntimeClient observer spawned in
+    /// [`Self::launch`] and consumed by [`Self::take_container_exit`]; `None` while still
+    /// running. A legitimate teardown (swap, session stop) is filtered out BEFORE it is
+    /// written. The last ~100 log lines are read on the failure path
+    /// ([`Self::app_log_tail`]): #463, an app that exits before producing a frame surfaces
+    /// as "media path interrupted" unless its own final words travel with the failure.
+    observation: GenerationObservation,
     /// `app-surface-commits` as it stood immediately BEFORE the current container
     /// launched. The counter is a lifetime total on a compositor element that OUTLIVES
     /// its app container, so after a rollback or retry the previous container's commits
@@ -357,8 +454,7 @@ impl AppSource {
             wl_display: None,
             metrics_probe: None,
             launch_error: None,
-            exit_result: Arc::new(Mutex::new(None)),
-            app_logs: AppLogRing::new(),
+            observation: GenerationObservation::new(),
             app_commits_at_launch: None,
         })
     }
@@ -640,11 +736,7 @@ impl AppSource {
     /// [`Self::launch`] has observed one since the last call. Take semantics mirror
     /// [`Self::take_launch_error`]: the runner must act on a given exit exactly once.
     pub fn take_container_exit(&self) -> Option<AppExitStatus> {
-        let mut guard = match self.exit_result.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.take()
+        self.observation.take_exit()
     }
 
     /// Whether the CURRENT app container has presented a frame. Built on
@@ -671,7 +763,7 @@ impl AppSource {
     /// observation replaces the running snapshot before it publishes an exit, preserving
     /// the application's final lines even when cleanup follows immediately.
     pub fn app_log_tail(&mut self) -> Vec<String> {
-        self.app_logs.tail()
+        self.observation.log_tail()
     }
 
     /// The app's configured exit policy. `fail` when no app is configured at all, where
@@ -831,6 +923,14 @@ impl AppSource {
         // before `run`, never after: the app can commit its first surface while `docker
         // run` is still returning.
         self.app_commits_at_launch = self.app_surface_commits();
+        // A FRESH observation record per launch attempt, installed BEFORE the engine is
+        // asked for a container. `AppSource` outlives its container across a rollback
+        // relaunch, so a shared exit slot or log ring would report the previous
+        // container's exit or dying words as the replacement app's failure — and a
+        // launch that fails must not expose the retired generation's evidence either.
+        // The previous observer keeps only its own retired handles and publishes into
+        // them harmlessly.
+        self.observation = GenerationObservation::new();
         match self.runtime.run(&effective_spec, &params) {
             Ok(c) => {
                 tracing::info!(
@@ -839,14 +939,11 @@ impl AppSource {
                     c.name(),
                     wl_display
                 );
-                // A FRESH ring per launch. `AppSource` outlives its container across a
-                // relaunch, so a shared ring would report the previous container's dying
-                // words as the replacement app's failure. The old follower keeps its own
-                // `Arc` to the retired ring and drains into it harmlessly.
-                self.app_logs = AppLogRing::new();
                 // The RuntimeClient observer fills final API log evidence before it
                 // publishes terminal status, including an application that dies immediately.
-                self.spawn_exit_waiter(c.application_id(), c.removed_flag(), self.app_logs.clone());
+                // It receives only THIS launch's observation handles.
+                let observer = self.observation.observer(c.removed_flag());
+                self.spawn_exit_waiter(c.application_id(), observer);
                 self.container = Some(c);
             }
             Err(e) => {
@@ -871,10 +968,8 @@ impl AppSource {
     fn spawn_exit_waiter(
         &self,
         application: crate::runtime::ApplicationId,
-        removed_flag: Arc<AtomicBool>,
-        logs: AppLogRing,
+        observer: GenerationObserver,
     ) {
-        let slot = self.exit_result.clone();
         let sink_name = self.sink_name.clone();
         let thread_sink_name = sink_name.clone();
         let builder = std::thread::Builder::new().name("quasar-app-wait".to_string());
@@ -887,7 +982,7 @@ impl AppSource {
             // observing a silent, healthy game after its per-request deadline;
             // only a daemon answer for a stopped container becomes an exit.
             let status = loop {
-                if removed_flag.load(Ordering::SeqCst) {
+                if observer.stopped_intentionally() {
                     return;
                 }
                 match crate::runtime::configured()
@@ -895,13 +990,13 @@ impl AppSource {
                 {
                     Ok(result) if result.oom_killed == Some(true) => {
                         for line in result.stdout.lines().chain(result.stderr.lines()) {
-                            logs.push(line.to_owned());
+                            observer.record_line(line.to_owned());
                         }
                         break AppExitStatus::OomKilled;
                     }
                     Ok(result) => {
                         for line in result.stdout.lines().chain(result.stderr.lines()) {
-                            logs.push(line.to_owned());
+                            observer.record_line(line.to_owned());
                         }
                         break result
                             .exit_code
@@ -916,7 +1011,7 @@ impl AppSource {
                         if let Ok(api) = crate::runtime::configured() {
                             if let Ok(tail) = api.application_log_tail(application.clone()).wait() {
                                 for line in tail.stdout.lines().chain(tail.stderr.lines()) {
-                                    logs.push(line.to_owned());
+                                    observer.record_line(line.to_owned());
                                 }
                             }
                         }
@@ -934,22 +1029,17 @@ impl AppSource {
                 }
             };
             // A deliberate stop (swap teardown, session stop) sets the shared `removed`
-            // flag BEFORE issuing `docker stop`/`rm` (`RunningContainer::stop`), so if it
-            // is set here the exit just observed is our own teardown, not an app failure.
-            // Discard it.
-            if removed_flag.load(Ordering::SeqCst) {
+            // flag BEFORE the engine sees the stop (`RunningContainer::stop`), so if it is
+            // set here the exit just observed is our own teardown, not an app failure.
+            // `publish` discards it; and it can only ever reach THIS generation's slot.
+            if observer.publish(status) {
+                tracing::info!("source '{sink_name}': app container exited: {status:?}");
+            } else {
                 tracing::debug!(
                     "source '{sink_name}': app container exit observed after our own teardown \
                      (status={status:?}) — ignoring, not a liveness failure"
                 );
-                return;
             }
-            tracing::info!("source '{sink_name}': app container exited: {status:?}");
-            let mut guard = match slot.lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            *guard = Some(status);
         }) {
             tracing::warn!(
                 token = "app-liveness-waiter-spawn-failed",
@@ -986,8 +1076,69 @@ impl Drop for AppSource {
 mod tests {
     use super::{
         app_presented_since_launch, retry_application_observation, source_commit_advanced,
+        GenerationObservation,
     };
     use crate::runtime::ErrorKind;
+    use crate::session::container::AppExitStatus;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    // One observation record per launched generation. The observer thread of a
+    // generation holds only that generation's handles, so nothing it publishes late can
+    // land in the state the runner polls for the replacement (a rolled-back swap
+    // relaunches into the same `AppSource`).
+
+    #[test]
+    fn a_previous_generations_late_exit_is_never_reported_for_the_replacement() {
+        let mut previous = GenerationObservation::new();
+        let previous_observer = previous.observer(Arc::new(AtomicBool::new(false)));
+        // The rollback relaunch replaces the observation record before it spawns a new
+        // observer, exactly as `AppSource::launch` does.
+        let replacement = GenerationObservation::new();
+        assert!(previous_observer.publish(AppExitStatus::Code(0)));
+        assert_eq!(replacement.take_exit(), None);
+        assert_eq!(previous.take_exit(), Some(AppExitStatus::Code(0)));
+        assert_eq!(previous.take_exit(), None, "take semantics: reported once");
+    }
+
+    #[test]
+    fn an_intentional_stop_suppresses_the_exit_publication() {
+        let mut generation = GenerationObservation::new();
+        let removed = Arc::new(AtomicBool::new(false));
+        let observer = generation.observer(removed.clone());
+        // `RunningContainer::stop_with` sets the marker BEFORE the engine sees a stop.
+        removed.store(true, Ordering::SeqCst);
+        assert!(observer.stopped_intentionally());
+        assert!(!observer.publish(AppExitStatus::OomKilled));
+        assert_eq!(generation.take_exit(), None);
+    }
+
+    #[test]
+    fn an_exit_published_just_before_the_stop_marker_is_discarded_at_read_time() {
+        // The observer checked the marker, found it clear, and published; the stop set the
+        // marker a moment later, before the runner polled. The runner must not see it.
+        let mut generation = GenerationObservation::new();
+        let removed = Arc::new(AtomicBool::new(false));
+        let observer = generation.observer(removed.clone());
+        assert!(observer.publish(AppExitStatus::Code(0)));
+        removed.store(true, Ordering::SeqCst);
+        assert_eq!(generation.take_exit(), None);
+    }
+
+    #[test]
+    fn a_previous_generations_log_lines_never_reach_the_replacement_tail() {
+        let mut previous = GenerationObservation::new();
+        let previous_observer = previous.observer(Arc::new(AtomicBool::new(false)));
+        let mut replacement = GenerationObservation::new();
+        let replacement_observer = replacement.observer(Arc::new(AtomicBool::new(false)));
+        previous_observer.record_line("Steam needs to be online to update".into());
+        replacement_observer.record_line("replacement booting".into());
+        assert_eq!(
+            previous.log_tail(),
+            vec!["Steam needs to be online to update"]
+        );
+        assert_eq!(replacement.log_tail(), vec!["replacement booting"]);
+    }
 
     // `app-surface-commits` is a LIFETIME total on a compositor that outlives its app
     // container. Scoping "did it ever draw?" to the current container is what keeps a

@@ -205,7 +205,7 @@ pub trait WarmupSession: Send {
     /// §3.3 step 8: stop the container and wait for **full** teardown before the
     /// caller touches the tree — both for #489 and because Steam flushes on
     /// exit.
-    fn stop_and_wait(&mut self);
+    fn stop_and_wait(&mut self) -> Result<(), String>;
 }
 
 /// Injected clock, so the job's timing is exercised in tests without sleeping.
@@ -365,6 +365,13 @@ pub enum WarmupError {
     Skipped(String),
     /// The job ran and failed. The previous template (if any) is untouched.
     Failed(String),
+    /// The warm-up container's teardown could not be proven after the exact
+    /// operation was retried. Nothing was snapshotted or published, and the
+    /// staging tree (with the scratch home) is deliberately RETAINED: a
+    /// container that may still hold that directory must not have it removed
+    /// under it, and an occupied pathname keeps the launch-time pending-writer
+    /// guard meaningful. Periodic maintenance keeps retrying the operation.
+    TeardownUnproven(String),
 }
 
 impl std::fmt::Display for WarmupError {
@@ -374,6 +381,7 @@ impl std::fmt::Display for WarmupError {
             WarmupError::TimedOut => write!(f, "job timeout expired"),
             WarmupError::Skipped(r) => write!(f, "skipped: {r}"),
             WarmupError::Failed(r) => write!(f, "{r}"),
+            WarmupError::TeardownUnproven(r) => write!(f, "teardown unproven: {r}"),
         }
     }
 }
@@ -501,6 +509,16 @@ impl WarmupJob<'_> {
                     presented_after,
                 })
             }
+            Err(WarmupError::TeardownUnproven(reason)) => {
+                warn!(
+                    token = "template-staging-retained",
+                    "template: staging for {} retained at {} because the warm-up container's \
+                     teardown is unproven ({reason}); it is not a template and is never seeded",
+                    req.image_id,
+                    staging.path().display()
+                );
+                Err(WarmupError::TeardownUnproven(reason))
+            }
             Err(e) => {
                 if let Err(err) = staging.discard() {
                     warn!(
@@ -564,7 +582,15 @@ impl WarmupJob<'_> {
         // returning, or a warm-up container outlives its job and overlaps the
         // next user launch (#489).
         let result = self.drive(req, session.as_mut(), &scratch, guard, started, deadline);
-        session.stop_and_wait();
+        if let Err(reason) = session.stop_and_wait() {
+            warn!(
+                token = "template-warmup-teardown-unproven",
+                path = "job",
+                "template: warm-up teardown is unproven for {}: {reason}",
+                req.image_id
+            );
+            return Err(WarmupError::TeardownUnproven(reason));
+        }
 
         let presented_after = result?;
 

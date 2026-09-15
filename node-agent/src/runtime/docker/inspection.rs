@@ -188,17 +188,17 @@ pub(crate) async fn inspect_image_metadata(
     }
     let (docker, _) = discover(config).await?;
     match docker.inspect_image(image).await {
-        Ok(info) => Ok(Some(crate::runtime::ImageMetadata {
-            id: info
-                .id
-                .filter(|value| !value.is_empty())
-                .ok_or(ErrorKind::Protocol)?,
-            baked_env: info
-                .config
-                .ok_or(ErrorKind::Protocol)?
-                .env
-                .unwrap_or_default(),
-        })),
+        Ok(info) => {
+            let config = info.config.ok_or(ErrorKind::Protocol)?;
+            Ok(Some(crate::runtime::ImageMetadata {
+                id: info
+                    .id
+                    .filter(|value| !value.is_empty())
+                    .ok_or(ErrorKind::Protocol)?,
+                baked_env: config.env.unwrap_or_default(),
+                working_dir: config.working_dir.filter(|value| !value.is_empty()),
+            }))
+        }
         Err(Error::DockerResponseServerError {
             status_code: 404, ..
         }) => Ok(None),

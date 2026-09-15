@@ -25,6 +25,14 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Changed
+- **Application switching, warm-up and teardown are generation-safe on the owned runtime
+  API (#237).** Each app-container launch attempt now owns its own exit slot and log ring,
+  so a previous generation's late exit or dying log lines can never be reported for the
+  replacement after a swap or a rolled-back swap. The Steam warm-up resolves the image's
+  home through the runtime API instead of a `docker image inspect` subprocess, and a warm-up
+  whose container teardown is unproven retries that exact operation and then fails the build
+  without snapshotting, publishing or trusting the scratch home. `CONTEXT.md` gains
+  *generation*, *intentional stop* and *scratch home*.
 - **`scripts/dev/leak-scan.sh` no longer lists the fingerprints it guards.** The script now
   carries only generic shapes; the patterns that identify a particular operator's network are
   loaded at run time from an untracked `.claude/skills/_shared/leak-patterns.local` locally, and

@@ -192,6 +192,71 @@ fn clear_pending_application(name: &str, operation: &str) {
     }
 }
 
+/// Return the unresolved application operation retaining a writable source. Paths are
+/// compared in the same lexical form used by launch-time exclusion; a path that cannot
+/// take that form can never be a pending key. `Err` means the pending state itself
+/// could not be read — never "no writer".
+pub(crate) fn pending_writer_for_source(source: &Path) -> Result<Option<String>> {
+    let Some(source) = lexical_mount_source(&source.to_string_lossy()) else {
+        return Ok(None);
+    };
+    Ok(pending_application_operations()
+        .lock()
+        .map_err(|_| anyhow!("application pending-operation lock poisoned"))?
+        .values()
+        .find(|pending| pending.writable_sources.contains(&source))
+        .map(|pending| pending.operation.clone()))
+}
+
+/// How many times [`prove_source_teardown`] retries the exact pending operation before
+/// reporting it unresolved. Each attempt is bounded by the runtime client's own deadline.
+const TEARDOWN_PROOF_ATTEMPTS: usize = 3;
+
+/// Prove that no unresolved application writer still holds `source` (a warm-up scratch
+/// home or a managed home). While one does, that entry's exact durable operation — never
+/// a name, never an unrelated entry — is retried through `retire`, a bounded number of
+/// times, and the source is re-checked. `Err` names the operation that remains
+/// unresolved or says the pending state could not be read; it makes no claim about
+/// whether the workload is alive, only that its teardown is unproven. Unreadable state
+/// is unproven, never proof.
+pub(crate) fn prove_source_teardown<F>(source: &Path, mut retire: F) -> Result<(), String>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    let unreadable = |error: anyhow::Error| format!("application teardown unproven: {error}");
+    for attempt in 0..TEARDOWN_PROOF_ATTEMPTS {
+        let Some(operation) = pending_writer_for_source(source).map_err(unreadable)? else {
+            return Ok(());
+        };
+        let names = pending_application_operations()
+            .lock()
+            .map_err(|_| unreadable(anyhow!("application pending-operation lock poisoned")))?
+            .iter()
+            .filter(|(_, pending)| pending.operation == operation)
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        match retire(&operation) {
+            Ok(()) => {
+                for name in &names {
+                    clear_pending_application(name, &operation);
+                }
+            }
+            Err(error) => tracing::warn!(
+                token = "application-teardown-proof-retry",
+                operation = %operation,
+                attempt = attempt + 1,
+                "application teardown remains unproven: {error}"
+            ),
+        }
+    }
+    match pending_writer_for_source(source).map_err(unreadable)? {
+        None => Ok(()),
+        Some(operation) => Err(format!(
+            "application teardown remains unproven (operation {operation})"
+        )),
+    }
+}
+
 /// Snapshot explicit caller cleanup obligations without holding the mutex across Docker.
 /// A running container enters this set only after its caller requested abandonment or stop.
 fn pending_application_operation_snapshot() -> Result<Vec<(String, String)>> {
@@ -803,6 +868,16 @@ impl ContainerRuntime {
     /// replaces). Best-effort: an inspect failure returns `None`.
     pub fn image_env(&self, image: &str, key: &str) -> Option<String> {
         self.image_env_checked(image, key).ok().flatten()
+    }
+
+    /// One coherent read of an image's baked facts (id, environment, working directory)
+    /// through the owned runtime API. `Ok(None)` is a missing image; `Err` is an
+    /// inspection failure the caller must not mistake for absence.
+    pub fn image_metadata(&self, image: &str) -> Result<Option<crate::runtime::ImageMetadata>> {
+        crate::runtime::configured()?
+            .inspect_image_metadata(image)
+            .wait()
+            .map_err(|error| anyhow!(error))
     }
 
     fn image_env_checked(&self, image: &str, key: &str) -> Result<Option<String>> {
@@ -1738,8 +1813,11 @@ fn short_id(id: &str) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct ContainerSpec {
     pub image: String,
-    /// Internal launch policy after verified API preparation. Unmigrated swap,
-    /// warm-up and standalone callers retain their CLI policy until #237.
+    /// Internal launch policy after verified API preparation: the control plane's
+    /// `image_ensure` step has already verified the image locally, so the launch must
+    /// not pull. Every launch — gen 0, a swap's replacement, a rollback relaunch and a
+    /// warm-up — goes through the same owned runtime request; swap and warm-up simply
+    /// leave this `false` because nothing verified the image for them.
     pub require_local_image: bool,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
@@ -3520,6 +3598,86 @@ mod tests {
             .is_err()
         );
         clear_pending_application(&old.name, &old.operation);
+    }
+
+    #[test]
+    fn pending_writer_lookup_normalizes_sources_and_clears_the_exact_operation() {
+        let name = "quasar-rh01-pending-writer";
+        let operation = "rh01-pending-writer-operation";
+        clear_pending_application(name, operation);
+        retain_pending_application_sources(
+            name.into(),
+            BTreeSet::from(["/managed/rh01-home".into()]),
+            operation.into(),
+        );
+
+        assert_eq!(
+            pending_writer_for_source(Path::new("/managed/rh01-home/")).unwrap(),
+            Some(operation.into())
+        );
+        assert_eq!(
+            pending_writer_for_source(Path::new("/managed/rh01-other")).unwrap(),
+            None
+        );
+
+        clear_pending_application(name, operation);
+        assert_eq!(
+            pending_writer_for_source(Path::new("/managed/rh01-home")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn proving_a_source_teardown_retries_the_exact_pending_operation_once() {
+        let name = "quasar-rh01-prove-teardown";
+        let operation = "rh01-prove-teardown-operation";
+        let source = Path::new("/staging/rh01-prove/scratch-home");
+        clear_pending_application(name, operation);
+        // An unrelated pending writer must be neither retried nor cleared by this proof.
+        let unrelated = (
+            "quasar-rh01-prove-unrelated",
+            "rh01-prove-unrelated-operation",
+        );
+        retain_pending_application_sources(
+            unrelated.0.into(),
+            BTreeSet::from(["/managed/rh01-prove-unrelated".into()]),
+            unrelated.1.into(),
+        );
+        assert_eq!(
+            prove_source_teardown(source, |_| panic!("nothing pending")),
+            Ok(())
+        );
+
+        // Retirement that still fails: the exact operation is retried, remains pending,
+        // and the caller learns which operation is unresolved.
+        retain_pending_application_sources(
+            name.into(),
+            BTreeSet::from([source.to_string_lossy().into_owned()]),
+            operation.into(),
+        );
+        let mut retired = Vec::new();
+        let unresolved = prove_source_teardown(source, |op| {
+            retired.push(op.to_owned());
+            Err(anyhow!("reply lost"))
+        })
+        .unwrap_err();
+        assert!(unresolved.contains(operation), "{unresolved}");
+        assert!(!retired.is_empty());
+        assert!(retired.iter().all(|op| op == operation), "{retired:?}");
+        assert_eq!(
+            pending_writer_for_source(source).unwrap(),
+            Some(operation.into())
+        );
+
+        // Retirement that succeeds on the retry: proven, and the entry is gone.
+        assert_eq!(prove_source_teardown(source, |_| Ok(())), Ok(()));
+        assert_eq!(pending_writer_for_source(source).unwrap(), None);
+        assert_eq!(
+            pending_writer_for_source(Path::new("/managed/rh01-prove-unrelated")).unwrap(),
+            Some(unrelated.1.into()),
+            "unrelated pending writers are untouched"
+        );
+        clear_pending_application(unrelated.0, unrelated.1);
     }
 
     #[test]

@@ -3591,6 +3591,24 @@ fn perform_swap(
             }
             break Ok(());
         }
+        // A replacement that exits before it ever presents: its own generation's observer
+        // reports the exit with its final lines, so the swap fails NOW with the real cause
+        // rather than sitting out the budget and reporting "no frame". Checked AFTER the
+        // readiness gate so an app that presented and then exited is adopted and handled
+        // by the normal exit policy, never rolled back as "never presented".
+        if let Some(status) = new_source.take_container_exit() {
+            let tail = new_source.app_log_tail();
+            tracing::warn!(
+                token = "swap-replacement-exited-before-presenting",
+                status = ?status,
+                lines = tail.len(),
+                "swap: replacement app exited before presenting; its final lines: {}",
+                tail.join(" | ")
+            );
+            break Err(format!(
+                "replacement app exited before presenting ({status:?})"
+            ));
+        }
         if Instant::now() >= deadline {
             break Err(format!(
                 "replacement app produced no frame within {budget:?} \

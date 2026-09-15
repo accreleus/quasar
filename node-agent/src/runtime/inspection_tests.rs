@@ -348,13 +348,13 @@ fn unavailable_socket_is_not_a_missing_container() {
 }
 
 #[test]
-fn image_environment_and_daemon_storage_root_are_read_as_daemon_facts() {
+fn image_environment_working_directory_and_daemon_storage_root_are_read_as_daemon_facts() {
     let (_dir, runtime, server) = fixture(vec![
         discovery(),
         (
             "GET /v1.48/images/app/json",
             200,
-            r#"{"Id":"sha256:app","Config":{"Env":["A=1","B=two"]}}"#,
+            r#"{"Id":"sha256:app","Config":{"Env":["A=1","B=two"],"WorkingDir":"/home/quasar"}}"#,
         ),
         discovery(),
         (
@@ -363,18 +363,38 @@ fn image_environment_and_daemon_storage_root_are_read_as_daemon_facts() {
             r#"{"DockerRootDir":"/var/lib/docker"}"#,
         ),
     ]);
+    let metadata = runtime
+        .inspect_image_metadata("app")
+        .wait()
+        .unwrap()
+        .unwrap();
+    assert_eq!(metadata.baked_env, ["A=1", "B=two"]);
+    assert_eq!(metadata.working_dir.as_deref(), Some("/home/quasar"));
+    assert_eq!(
+        runtime.engine_storage().wait().unwrap().root,
+        DaemonHostPath("/var/lib/docker".into())
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn image_metadata_without_a_working_directory_reports_none() {
+    let (_dir, runtime, server) = fixture(vec![
+        discovery(),
+        (
+            "GET /v1.48/images/app/json",
+            200,
+            r#"{"Id":"sha256:app","Config":{"Env":[]}}"#,
+        ),
+    ]);
     assert_eq!(
         runtime
             .inspect_image_metadata("app")
             .wait()
             .unwrap()
             .unwrap()
-            .baked_env,
-        ["A=1", "B=two"]
-    );
-    assert_eq!(
-        runtime.engine_storage().wait().unwrap().root,
-        DaemonHostPath("/var/lib/docker".into())
+            .working_dir,
+        None
     );
     server.join().unwrap();
 }

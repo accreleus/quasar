@@ -46,6 +46,8 @@ pub struct EngineStorage {
 pub struct ImageMetadata {
     pub id: String,
     pub baked_env: Vec<String>,
+    /// Image-configured working directory, when Docker reports a usable value.
+    pub working_dir: Option<String>,
 }
 
 /// Translate a path across the agent/daemon namespace boundary. A result is

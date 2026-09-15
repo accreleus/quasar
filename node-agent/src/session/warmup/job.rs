@@ -350,6 +350,9 @@ fn outcome_of(
             req.image_id, req.version
         )),
         Err(WarmupError::Failed(reason)) => JobOutcome::Failed(reason),
+        Err(WarmupError::TeardownUnproven(reason)) => {
+            JobOutcome::Failed(format!("teardown unproven: {reason}"))
+        }
     }
 }
 
