@@ -13,7 +13,8 @@ mod helpers;
 pub use builds::BuildRequest;
 pub use helpers::{
     AudioRun, DiagnosticDevices, DiagnosticHelper, DiagnosticNetwork, DiagnosticRequirements,
-    DiagnosticRun, DiagnosticSecurity, HelperResult, OwnedHelperId, ReadOnlyHostBind,
+    DiagnosticRun, DiagnosticSecurity, HelperResult, NvidiaDriverMount, NvidiaGpuRun,
+    OwnedHelperId, ReadOnlyHostBind,
 };
 pub(crate) use helpers::{HelperIntent, HelperJournal};
 mod images;
@@ -394,6 +395,23 @@ impl RuntimeClient {
         let config = self.config.clone();
         self.submit_owned(
             async move { docker::helpers::run(&config, helper, run).await },
+            self.config.deadline,
+            true,
+        )
+    }
+
+    /// Create and explicitly start an owned NVIDIA GPU diagnostic.  The
+    /// profile requests Docker's all-NVIDIA-GPUs semantics and validates its
+    /// realized driver mount, loader environment, security posture and device
+    /// request before execution.
+    pub fn run_nvidia_gpu_diagnostic(
+        &self,
+        helper: DiagnosticHelper,
+        run: NvidiaGpuRun,
+    ) -> Operation<OwnedHelperId> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::helpers::run_nvidia_gpu(&config, helper, run).await },
             self.config.deadline,
             true,
         )

@@ -4,15 +4,16 @@ use crate::{
     container_ownership,
     runtime::{
         AudioRun, DiagnosticHelper, DiagnosticRequirements, DiagnosticRun, ErrorKind, HelperIntent,
-        HelperJournal, HelperResult, OwnedHelperId, RuntimeConfig, RuntimeError,
+        HelperJournal, HelperResult, NvidiaDriverMount, NvidiaGpuRun, OwnedHelperId, RuntimeConfig,
+        RuntimeError,
     },
 };
 use bollard::{
     container::LogOutput,
     errors::Error,
     models::{
-        ContainerCreateBody, ContainerStateStatusEnum, HealthConfig, HostConfig, Mount,
-        MountBindOptions, MountType,
+        ContainerCreateBody, ContainerStateStatusEnum, DeviceRequest, HealthConfig, HostConfig,
+        Mount, MountBindOptions, MountType,
     },
     query_parameters::{
         CreateContainerOptions, LogsOptions, RemoveContainerOptions, StartContainerOptions,
@@ -347,6 +348,38 @@ fn valid_run(run: &DiagnosticRun) -> bool {
         && run.entrypoint.iter().chain(run.command.iter()).map(String::len).sum::<usize>() <= 8 * 1024
         && run.bind.source.as_os_str().len() + run.bind.target.len() <= 4 * 1024
 }
+fn valid_nvidia_gpu(run: &NvidiaGpuRun) -> bool {
+    let mount_valid = match &run.driver_mount {
+        NvidiaDriverMount::ReadOnlyBind(bind) => {
+            bind.source.is_absolute()
+                && bind.target.starts_with('/')
+                && !bind.target.contains(['\0', ':'])
+                && bind.source.as_os_str().len() + bind.target.len() <= 4 * 1024
+        }
+        NvidiaDriverMount::NamedVolume { name, target } => {
+            !name.is_empty()
+                && name.len() <= 255
+                && !name.contains(['/', '\0', ':'])
+                && target.starts_with('/')
+                && !target.contains(['\0', ':'])
+        }
+    };
+    mount_valid
+        && !run.entrypoint.is_empty()
+        && run
+            .entrypoint
+            .iter()
+            .chain(run.command.iter())
+            .all(|v| !v.is_empty() && !v.contains('\0'))
+        && run
+            .entrypoint
+            .iter()
+            .chain(run.command.iter())
+            .map(String::len)
+            .sum::<usize>()
+            <= 8 * 1024
+        && !run.image_ld_library_path.contains('\0')
+}
 fn valid_audio(run: &AudioRun, name: &str) -> bool {
     let socket = run.socket_dir.to_str();
     let suffix = name.strip_prefix("quasar-pulse-");
@@ -396,12 +429,15 @@ fn valid_audio(run: &AudioRun, name: &str) -> bool {
 fn fingerprint(
     helper: &DiagnosticHelper,
     run: Option<&DiagnosticRun>,
+    nvidia_gpu: Option<&NvidiaGpuRun>,
     audio: Option<&AudioRun>,
 ) -> Result<String, RuntimeError> {
     // Existing diagnostic journals fingerprint exactly this two-tuple.  Keep
     // it stable so records written before the audio profile remain replayable.
     let bytes = if let Some(audio) = audio {
         serde_json::to_vec(&(helper, run, audio))
+    } else if nvidia_gpu.is_some() {
+        serde_json::to_vec(&(helper, run, nvidia_gpu))
     } else {
         serde_json::to_vec(&(helper, run))
     }
@@ -447,6 +483,7 @@ fn matches(
     intent: &HelperIntent,
     helper: &DiagnosticHelper,
     run: Option<&DiagnosticRun>,
+    nvidia_gpu: Option<&NvidiaGpuRun>,
     audio: Option<&AudioRun>,
     owner: &str,
     config: &RuntimeConfig,
@@ -456,7 +493,7 @@ fn matches(
         && intent.image == helper.image
         && intent.owner == owner
         && intent.socket == config.socket
-        && intent.request_fingerprint == fingerprint(helper, run, audio)?)
+        && intent.request_fingerprint == fingerprint(helper, run, nvidia_gpu, audio)?)
 }
 fn helper(intent: &HelperIntent) -> DiagnosticHelper {
     DiagnosticHelper {
@@ -474,6 +511,142 @@ fn owned(intent: &HelperIntent) -> Result<OwnedHelperId, RuntimeError> {
             .ok_or(ErrorKind::UnknownOutcome)?,
         operation: intent.operation.clone(),
     })
+}
+
+fn nvidia_mount(run: &NvidiaGpuRun) -> Mount {
+    match &run.driver_mount {
+        NvidiaDriverMount::ReadOnlyBind(bind) => Mount {
+            typ: Some(MountType::BIND),
+            source: bind.source.to_str().map(str::to_owned),
+            target: Some(bind.target.clone()),
+            read_only: Some(true),
+            bind_options: Some(MountBindOptions {
+                create_mountpoint: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        NvidiaDriverMount::NamedVolume { name, target } => Mount {
+            typ: Some(MountType::VOLUME),
+            source: Some(name.clone()),
+            target: Some(target.clone()),
+            read_only: Some(true),
+            ..Default::default()
+        },
+    }
+}
+fn nvidia_env(run: &NvidiaGpuRun) -> Vec<String> {
+    let target = match &run.driver_mount {
+        NvidiaDriverMount::ReadOnlyBind(bind) => &bind.target,
+        NvidiaDriverMount::NamedVolume { target, .. } => target,
+    };
+    let mut ld = vec![format!("{target}/lib64")];
+    ld.extend(
+        run.image_ld_library_path
+            .split(':')
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned),
+    );
+    let mut env = vec![
+        format!("LD_LIBRARY_PATH={}", ld.join(":")),
+        format!("__EGL_VENDOR_LIBRARY_DIRS={target}/glvnd/egl_vendor.d:/etc/glvnd/egl_vendor.d:/usr/share/glvnd/egl_vendor.d"),
+        format!("__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS={target}/egl_external_platform.d:/usr/share/egl/egl_external_platform.d"),
+        format!("VK_ADD_DRIVER_FILES={target}/vulkan/icd.d/nvidia_icd.json"),
+    ];
+    if run.has_gbm_backend {
+        env.push(format!("GBM_BACKENDS_PATH={target}/gbm"));
+    }
+    env
+}
+/// Docker inspect includes the image's inherited environment as well as the
+/// values supplied at create.  Require each Quasar-controlled loader key once
+/// and byte-for-byte, while leaving unrelated image defaults intact.
+fn has_nvidia_env(env: &[String], run: &NvidiaGpuRun) -> bool {
+    let expected = nvidia_env(run);
+    let controlled = [
+        "LD_LIBRARY_PATH",
+        "__EGL_VENDOR_LIBRARY_DIRS",
+        "__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS",
+        "VK_ADD_DRIVER_FILES",
+        "GBM_BACKENDS_PATH",
+    ];
+    expected.iter().all(|required| {
+        let (key, _) = required
+            .split_once('=')
+            .expect("fixed environment assignment");
+        env.iter()
+            .filter(|value| value.starts_with(&format!("{key}=")))
+            .collect::<Vec<_>>()
+            == vec![required]
+    }) && controlled.iter().all(|key| {
+        let expected_value = expected
+            .iter()
+            .find(|value| value.starts_with(&format!("{key}=")));
+        let actual = env
+            .iter()
+            .filter(|value| value.starts_with(&format!("{key}=")))
+            .collect::<Vec<_>>();
+        match expected_value {
+            Some(value) => actual == vec![value],
+            None => actual.is_empty(),
+        }
+    })
+}
+fn is_nvidia_all_request(request: &DeviceRequest) -> bool {
+    request.driver.as_deref() == Some("nvidia")
+        && request.count == Some(-1)
+        && request.device_ids.as_ref().is_none_or(Vec::is_empty)
+        && request.capabilities.as_deref() == Some(&[vec!["gpu".to_owned()]])
+        && request
+            .options
+            .as_ref()
+            .is_none_or(std::collections::HashMap::is_empty)
+}
+fn matches_nvidia_mount(mount: &bollard::models::MountPoint, run: &NvidiaGpuRun) -> bool {
+    let (typ, source, name, target) = match &run.driver_mount {
+        NvidiaDriverMount::ReadOnlyBind(bind) => ("bind", bind.source.to_str(), None, &bind.target),
+        NvidiaDriverMount::NamedVolume { name, target } => {
+            // Docker realizes a named volume source as a daemon storage path;
+            // the stable volume identity is `Name`, not that host-private path.
+            ("volume", None, Some(name.as_str()), target)
+        }
+    };
+    mount.typ.as_deref() == Some(typ)
+        && (source.is_none() || mount.source.as_deref() == source)
+        && mount.name.as_deref() == name
+        && mount.destination.as_deref() == Some(target)
+        && mount.rw == Some(false)
+}
+fn requested_nvidia_mount(mount: &Mount, run: &NvidiaGpuRun) -> bool {
+    let expected = nvidia_mount(run);
+    mount.typ == expected.typ
+        && mount.source == expected.source
+        && mount.target == expected.target
+        && mount.read_only == Some(true)
+        && match &run.driver_mount {
+            NvidiaDriverMount::ReadOnlyBind(_) => {
+                safe_readonly_bind_options(mount.bind_options.as_ref())
+            }
+            NvidiaDriverMount::NamedVolume { .. } => mount.bind_options.is_none(),
+        }
+}
+fn safe_readonly_bind_options(options: Option<&MountBindOptions>) -> bool {
+    let Some(options) = options else {
+        return true;
+    };
+    let safe_propagation = options.propagation.is_none()
+        || matches!(
+            options.propagation,
+            Some(
+                bollard::models::MountBindOptionsPropagationEnum::PRIVATE
+                    | bollard::models::MountBindOptionsPropagationEnum::RPRIVATE
+            )
+        );
+    options.create_mountpoint != Some(true)
+        && safe_propagation
+        && options.non_recursive != Some(true)
+        && options.read_only_non_recursive != Some(true)
+        && options.read_only_force_recursive != Some(true)
 }
 
 fn inspect_owned(
@@ -496,12 +669,13 @@ fn inspect_owned(
     }
     let host = info.host_config.ok_or(ErrorKind::Protocol)?;
     if host.network_mode.as_deref() != Some("none")
-        || host.readonly_rootfs != Some(intent.profile == HelperProfile::Diagnostic)
+        || host.readonly_rootfs != Some(intent.profile != HelperProfile::Audio)
         || host.privileged != Some(false)
         || host.auto_remove != Some(false)
         || host.cap_add.as_ref().is_some_and(|v| !v.is_empty())
         || host.devices.as_ref().is_some_and(|v| !v.is_empty())
-        || host.device_requests.as_ref().is_some_and(|v| !v.is_empty())
+        || (intent.profile != HelperProfile::NvidiaGpu
+            && host.device_requests.as_ref().is_some_and(|v| !v.is_empty()))
         || host.volumes_from.as_ref().is_some_and(|v| !v.is_empty())
         || host.binds.as_ref().is_some_and(|v| !v.is_empty())
         || host.pid_mode.as_deref().is_some_and(|v| !v.is_empty())
@@ -520,111 +694,134 @@ fn inspect_owned(
     {
         return Err(ErrorKind::Protocol.into());
     }
-    if let Some(run) = &intent.run {
-        if c.entrypoint.as_ref() != Some(&run.entrypoint) || c.cmd.as_ref() != Some(&run.command) {
-            return Err(ErrorKind::Protocol.into());
-        }
-        let mounts = info.mounts.unwrap_or_default();
-        if mounts.len() != 1
-            || mounts[0].typ.as_deref() != Some("bind")
-            || mounts[0].source.as_deref() != run.bind.source.to_str()
-            || mounts[0].destination.as_deref() != Some(&run.bind.target)
-            || mounts[0].rw != Some(false)
+    if intent.profile == HelperProfile::NvidiaGpu {
+        let run = intent.nvidia_gpu.as_ref().ok_or(ErrorKind::Protocol)?;
+        if !matches!(host.device_requests.as_deref(), Some([request]) if is_nvidia_all_request(request))
+            || c.entrypoint.as_ref() != Some(&run.entrypoint)
+            || c.cmd.as_ref() != Some(&run.command)
+            || !c.env.as_deref().is_some_and(|env| has_nvidia_env(env, run))
         {
             return Err(ErrorKind::Protocol.into());
         }
-        // `Mounts` in HostConfig is the requested realization. Inspecting only
-        // the resulting mountpoint would miss an option such as host-path
-        // creation that weakens this fixed profile.
+        let mounts = info.mounts.as_deref().unwrap_or(&[]);
         let requested = host.mounts.as_deref().unwrap_or(&[]);
-        if requested.len() != 1
-            || requested[0].typ != Some(MountType::BIND)
-            || requested[0].source.as_deref() != run.bind.source.to_str()
-            || requested[0].target.as_deref() != Some(&run.bind.target)
-            || requested[0].read_only != Some(true)
+        if mounts.len() != 1
+            || !matches_nvidia_mount(&mounts[0], run)
+            || requested.len() != 1
+            || !requested_nvidia_mount(&requested[0], run)
         {
             return Err(ErrorKind::Protocol.into());
         }
-        if let Some(options) = &requested[0].bind_options {
-            let safe_propagation = options.propagation.is_none()
-                || matches!(
-                    options.propagation,
-                    Some(
-                        bollard::models::MountBindOptionsPropagationEnum::PRIVATE
-                            | bollard::models::MountBindOptionsPropagationEnum::RPRIVATE
-                    )
-                );
-            if options.create_mountpoint == Some(true)
-                || !safe_propagation
-                || options.non_recursive == Some(true)
-                || options.read_only_non_recursive == Some(true)
-                || options.read_only_force_recursive == Some(true)
+    }
+    if intent.profile != HelperProfile::NvidiaGpu {
+        if let Some(run) = &intent.run {
+            if c.entrypoint.as_ref() != Some(&run.entrypoint)
+                || c.cmd.as_ref() != Some(&run.command)
             {
                 return Err(ErrorKind::Protocol.into());
             }
-        }
-    } else if let Some(audio) = &intent.audio {
-        let env = c.env.as_deref().unwrap_or(&[]);
-        let expected_home = format!("HOME={}", audio.socket_dir.display());
-        let expected_runtime =
-            format!("PULSE_RUNTIME_PATH={}/.runtime", audio.socket_dir.display());
-        if c.entrypoint.as_ref() != Some(&audio.entrypoint)
-            || c.cmd.as_ref() != Some(&audio.command)
-            || env.iter().filter(|v| v.starts_with("HOME=")).count() != 1
-            || !env.iter().any(|v| v == &expected_home)
-            || env
-                .iter()
-                .filter(|v| v.starts_with("PULSE_RUNTIME_PATH="))
-                .count()
-                != 1
-            || !env.iter().any(|v| v == &expected_runtime)
-            || c.healthcheck
-                .as_ref()
-                .and_then(|h| h.test.as_ref())
-                .map(Vec::as_slice)
-                != Some(&["NONE".to_owned()])
-        {
-            return Err(ErrorKind::Protocol.into());
-        }
-        let mounts = info.mounts.unwrap_or_default();
-        if mounts.len() != 1
-            || mounts[0].typ.as_deref() != Some("bind")
-            || mounts[0].source.as_deref() != audio.socket_dir.to_str()
-            || mounts[0].destination.as_deref() != audio.socket_dir.to_str()
-            || mounts[0].rw != Some(true)
-        {
-            return Err(ErrorKind::Protocol.into());
-        }
-        let requested = host.mounts.as_deref().unwrap_or(&[]);
-        if requested.len() != 1 || requested[0].typ != Some(MountType::BIND)
+            let mounts = info.mounts.unwrap_or_default();
+            if mounts.len() != 1
+                || mounts[0].typ.as_deref() != Some("bind")
+                || mounts[0].source.as_deref() != run.bind.source.to_str()
+                || mounts[0].destination.as_deref() != Some(&run.bind.target)
+                || mounts[0].rw != Some(false)
+            {
+                return Err(ErrorKind::Protocol.into());
+            }
+            // `Mounts` in HostConfig is the requested realization. Inspecting only
+            // the resulting mountpoint would miss an option such as host-path
+            // creation that weakens this fixed profile.
+            let requested = host.mounts.as_deref().unwrap_or(&[]);
+            if requested.len() != 1
+                || requested[0].typ != Some(MountType::BIND)
+                || requested[0].source.as_deref() != run.bind.source.to_str()
+                || requested[0].target.as_deref() != Some(&run.bind.target)
+                || requested[0].read_only != Some(true)
+            {
+                return Err(ErrorKind::Protocol.into());
+            }
+            if let Some(options) = &requested[0].bind_options {
+                let safe_propagation = options.propagation.is_none()
+                    || matches!(
+                        options.propagation,
+                        Some(
+                            bollard::models::MountBindOptionsPropagationEnum::PRIVATE
+                                | bollard::models::MountBindOptionsPropagationEnum::RPRIVATE
+                        )
+                    );
+                if options.create_mountpoint == Some(true)
+                    || !safe_propagation
+                    || options.non_recursive == Some(true)
+                    || options.read_only_non_recursive == Some(true)
+                    || options.read_only_force_recursive == Some(true)
+                {
+                    return Err(ErrorKind::Protocol.into());
+                }
+            }
+        } else if let Some(audio) = &intent.audio {
+            let env = c.env.as_deref().unwrap_or(&[]);
+            let expected_home = format!("HOME={}", audio.socket_dir.display());
+            let expected_runtime =
+                format!("PULSE_RUNTIME_PATH={}/.runtime", audio.socket_dir.display());
+            if c.entrypoint.as_ref() != Some(&audio.entrypoint)
+                || c.cmd.as_ref() != Some(&audio.command)
+                || env.iter().filter(|v| v.starts_with("HOME=")).count() != 1
+                || !env.iter().any(|v| v == &expected_home)
+                || env
+                    .iter()
+                    .filter(|v| v.starts_with("PULSE_RUNTIME_PATH="))
+                    .count()
+                    != 1
+                || !env.iter().any(|v| v == &expected_runtime)
+                || c.healthcheck
+                    .as_ref()
+                    .and_then(|h| h.test.as_ref())
+                    .map(Vec::as_slice)
+                    != Some(&["NONE".to_owned()])
+            {
+                return Err(ErrorKind::Protocol.into());
+            }
+            let mounts = info.mounts.unwrap_or_default();
+            if mounts.len() != 1
+                || mounts[0].typ.as_deref() != Some("bind")
+                || mounts[0].source.as_deref() != audio.socket_dir.to_str()
+                || mounts[0].destination.as_deref() != audio.socket_dir.to_str()
+                || mounts[0].rw != Some(true)
+            {
+                return Err(ErrorKind::Protocol.into());
+            }
+            let requested = host.mounts.as_deref().unwrap_or(&[]);
+            if requested.len() != 1 || requested[0].typ != Some(MountType::BIND)
             || requested[0].source.as_deref() != audio.socket_dir.to_str()
             || requested[0].target.as_deref() != audio.socket_dir.to_str()
             // Docker omits `ReadOnly` when false in inspect output; the
             // realized mount's RW=true remains mandatory for this profile.
             || requested[0].read_only == Some(true)
             || requested[0].bind_options.as_ref().is_some_and(|o| o.create_mountpoint == Some(true))
-        {
-            return Err(ErrorKind::Protocol.into());
-        }
-        if let Some(options) = &requested[0].bind_options {
-            let safe_propagation = options.propagation.is_none()
-                || matches!(
-                    options.propagation,
-                    Some(
-                        bollard::models::MountBindOptionsPropagationEnum::PRIVATE
-                            | bollard::models::MountBindOptionsPropagationEnum::RPRIVATE
-                    )
-                );
-            if !safe_propagation
-                || options.non_recursive == Some(true)
-                || options.read_only_non_recursive == Some(true)
-                || options.read_only_force_recursive == Some(true)
             {
                 return Err(ErrorKind::Protocol.into());
             }
+            if let Some(options) = &requested[0].bind_options {
+                let safe_propagation = options.propagation.is_none()
+                    || matches!(
+                        options.propagation,
+                        Some(
+                            bollard::models::MountBindOptionsPropagationEnum::PRIVATE
+                                | bollard::models::MountBindOptionsPropagationEnum::RPRIVATE
+                        )
+                    );
+                if !safe_propagation
+                    || options.non_recursive == Some(true)
+                    || options.read_only_non_recursive == Some(true)
+                    || options.read_only_force_recursive == Some(true)
+                {
+                    return Err(ErrorKind::Protocol.into());
+                }
+            }
+        } else if info.mounts.as_ref().is_some_and(|m| !m.is_empty()) {
+            return Err(ErrorKind::Protocol.into());
         }
-    } else if info.mounts.as_ref().is_some_and(|m| !m.is_empty()) {
-        return Err(ErrorKind::Protocol.into());
     }
     let state = info.state.ok_or(ErrorKind::Protocol)?;
     let running = state.running.ok_or(ErrorKind::Protocol)?;
@@ -681,14 +878,16 @@ async fn create_or_adopt_inner(
     config: &RuntimeConfig,
     helper: DiagnosticHelper,
     run: Option<DiagnosticRun>,
+    nvidia_gpu: Option<NvidiaGpuRun>,
     audio: Option<AudioRun>,
 ) -> Result<(bollard::Docker, HelperJournal, HelperIntent), RuntimeError> {
     if !valid_helper(&helper)
         || run.as_ref().is_some_and(|r| !valid_run(r))
+        || nvidia_gpu.as_ref().is_some_and(|r| !valid_nvidia_gpu(r))
         || audio
             .as_ref()
             .is_some_and(|r| !valid_audio(r, &helper.name))
-        || run.is_some() == audio.is_some()
+        || (run.is_some() as u8 + nvidia_gpu.is_some() as u8 + audio.is_some() as u8) != 1
     {
         return Err(ErrorKind::InvalidConfiguration.into());
     }
@@ -700,6 +899,7 @@ async fn create_or_adopt_inner(
             &intent,
             &helper,
             run.as_ref(),
+            nvidia_gpu.as_ref(),
             audio.as_ref(),
             &owner,
             config,
@@ -741,6 +941,7 @@ async fn create_or_adopt_inner(
         Err(e) => return Err(super::classify(e)),
     }
     let is_audio = audio.is_some();
+    let is_nvidia_gpu = nvidia_gpu.is_some();
     let mut intent = HelperIntent {
         operation: helper.operation.clone(),
         name: helper.name.clone(),
@@ -748,10 +949,18 @@ async fn create_or_adopt_inner(
         owner,
         socket: config.socket.clone(),
         id: None,
-        request_fingerprint: fingerprint(&helper, run.as_ref(), audio.as_ref())?,
+        request_fingerprint: fingerprint(
+            &helper,
+            run.as_ref(),
+            nvidia_gpu.as_ref(),
+            audio.as_ref(),
+        )?,
         run,
+        nvidia_gpu,
         profile: if is_audio {
             HelperProfile::Audio
+        } else if is_nvidia_gpu {
+            HelperProfile::NvidiaGpu
         } else {
             HelperProfile::Diagnostic
         },
@@ -782,35 +991,41 @@ async fn create_or_adopt_inner(
     labels.insert(container_ownership::LABEL.to_owned(), intent.owner.clone());
     labels.insert(OPERATION_LABEL.to_owned(), helper.operation.clone());
     let mounts = intent
-        .run
+        .nvidia_gpu
         .as_ref()
-        .map(|r| {
-            vec![Mount {
-                typ: Some(MountType::BIND),
-                source: r.bind.source.to_str().map(str::to_owned),
-                target: Some(r.bind.target.clone()),
-                read_only: Some(true),
-                bind_options: Some(MountBindOptions {
-                    create_mountpoint: Some(false),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }]
-        })
+        .map(|r| vec![nvidia_mount(r)])
         .or_else(|| {
-            intent.audio.as_ref().map(|r| {
-                vec![Mount {
-                    typ: Some(MountType::BIND),
-                    source: r.socket_dir.to_str().map(str::to_owned),
-                    target: r.socket_dir.to_str().map(str::to_owned),
-                    read_only: Some(false),
-                    bind_options: Some(MountBindOptions {
-                        create_mountpoint: Some(false),
+            intent
+                .run
+                .as_ref()
+                .map(|r| {
+                    vec![Mount {
+                        typ: Some(MountType::BIND),
+                        source: r.bind.source.to_str().map(str::to_owned),
+                        target: Some(r.bind.target.clone()),
+                        read_only: Some(true),
+                        bind_options: Some(MountBindOptions {
+                            create_mountpoint: Some(false),
+                            ..Default::default()
+                        }),
                         ..Default::default()
-                    }),
-                    ..Default::default()
-                }]
-            })
+                    }]
+                })
+                .or_else(|| {
+                    intent.audio.as_ref().map(|r| {
+                        vec![Mount {
+                            typ: Some(MountType::BIND),
+                            source: r.socket_dir.to_str().map(str::to_owned),
+                            target: r.socket_dir.to_str().map(str::to_owned),
+                            read_only: Some(false),
+                            bind_options: Some(MountBindOptions {
+                                create_mountpoint: Some(false),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }]
+                    })
+                })
         });
     let requirements = DiagnosticRequirements::FIXED;
     let devices = match requirements.devices {
@@ -832,20 +1047,34 @@ async fn create_or_adopt_inner(
         labels: Some(labels),
         user: Some(user.into()),
         entrypoint: intent
-            .run
+            .nvidia_gpu
             .as_ref()
             .map(|r| r.entrypoint.clone())
-            .or_else(|| intent.audio.as_ref().map(|r| r.entrypoint.clone())),
+            .or_else(|| {
+                intent
+                    .run
+                    .as_ref()
+                    .map(|r| r.entrypoint.clone())
+                    .or_else(|| intent.audio.as_ref().map(|r| r.entrypoint.clone()))
+            }),
         cmd: intent
-            .run
+            .nvidia_gpu
             .as_ref()
             .map(|r| r.command.clone())
-            .or_else(|| intent.audio.as_ref().map(|r| r.command.clone())),
-        env: intent.audio.as_ref().map(|r| {
-            vec![
-                format!("HOME={}", r.socket_dir.display()),
-                format!("PULSE_RUNTIME_PATH={}/.runtime", r.socket_dir.display()),
-            ]
+            .or_else(|| {
+                intent
+                    .run
+                    .as_ref()
+                    .map(|r| r.command.clone())
+                    .or_else(|| intent.audio.as_ref().map(|r| r.command.clone()))
+            }),
+        env: intent.nvidia_gpu.as_ref().map(nvidia_env).or_else(|| {
+            intent.audio.as_ref().map(|r| {
+                vec![
+                    format!("HOME={}", r.socket_dir.display()),
+                    format!("PULSE_RUNTIME_PATH={}/.runtime", r.socket_dir.display()),
+                ]
+            })
         }),
         healthcheck: intent.audio.as_ref().map(|_| HealthConfig {
             test: Some(vec!["NONE".into()]),
@@ -863,6 +1092,15 @@ async fn create_or_adopt_inner(
             cap_drop: Some(cap_drop),
             security_opt: Some(security_opt),
             devices: Some(devices),
+            device_requests: intent.nvidia_gpu.as_ref().map(|_| {
+                vec![DeviceRequest {
+                    driver: Some("nvidia".into()),
+                    count: Some(-1),
+                    device_ids: None,
+                    capabilities: Some(vec![vec!["gpu".into()]]),
+                    options: None,
+                }]
+            }),
             mounts,
             pids_limit: intent.audio.as_ref().map(|_| 512),
             ..Default::default()
@@ -917,16 +1155,26 @@ pub(crate) async fn run(
     helper: DiagnosticHelper,
     run: DiagnosticRun,
 ) -> Result<OwnedHelperId, RuntimeError> {
-    run_inner(config, helper, Some(run), None).await
+    run_inner(config, helper, Some(run), None, None).await
+}
+
+pub(crate) async fn run_nvidia_gpu(
+    config: &RuntimeConfig,
+    helper: DiagnosticHelper,
+    run: NvidiaGpuRun,
+) -> Result<OwnedHelperId, RuntimeError> {
+    run_inner(config, helper, None, Some(run), None).await
 }
 
 async fn run_inner(
     config: &RuntimeConfig,
     helper: DiagnosticHelper,
     run: Option<DiagnosticRun>,
+    nvidia_gpu: Option<NvidiaGpuRun>,
     audio: Option<AudioRun>,
 ) -> Result<OwnedHelperId, RuntimeError> {
-    let (docker, journal, mut intent) = create_or_adopt_inner(config, helper, run, audio).await?;
+    let (docker, journal, mut intent) =
+        create_or_adopt_inner(config, helper, run, nvidia_gpu, audio).await?;
     if intent.phase == HelperPhase::Completed {
         return owned(&intent);
     }
@@ -1006,7 +1254,7 @@ pub(crate) async fn run_audio(
     helper: DiagnosticHelper,
     run: AudioRun,
 ) -> Result<OwnedHelperId, RuntimeError> {
-    run_inner(config, helper, None, Some(run)).await
+    run_inner(config, helper, None, None, Some(run)).await
 }
 
 fn append_raw_bounded(dst: &mut Vec<u8>, bytes: &[u8]) {
@@ -1094,6 +1342,7 @@ pub(crate) async fn observe(
         || latest.name != intent.name
         || latest.image != intent.image
         || latest.run != intent.run
+        || latest.nvidia_gpu != intent.nvidia_gpu
         || latest.profile != intent.profile
         || latest.audio != intent.audio
     {
@@ -1319,7 +1568,12 @@ pub(crate) async fn cleanup(config: &RuntimeConfig, id: OwnedHelperId) -> Result
 }
 
 pub(crate) async fn recover(config: &RuntimeConfig) -> Result<(), RuntimeError> {
-    recover_profile(config, HelperProfile::Diagnostic).await
+    // One stalled legacy diagnostic must not strand a separately journaled GPU
+    // helper. Both reconciliations are bounded; return the first failure only
+    // after attempting each independent profile.
+    let diagnostic = recover_profile(config, HelperProfile::Diagnostic).await;
+    let nvidia_gpu = recover_profile(config, HelperProfile::NvidiaGpu).await;
+    diagnostic.and(nvidia_gpu)
 }
 
 pub(crate) async fn recover_audio(config: &RuntimeConfig) -> Result<(), RuntimeError> {

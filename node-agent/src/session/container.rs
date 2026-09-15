@@ -52,7 +52,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -214,7 +214,9 @@ const APP_CONTAINER_CAP_ADDS: [&str; 8] = [
 /// matching `ld.so.conf.d` entry for this path.
 const NVIDIA_LIB32_MOUNT_DST: &str = "/opt/quasar/nvidia-lib32";
 
-/// Upper bound on the #375 startup probe container (a small image pull + a glob).
+/// The legacy CLI probe allowed a minute for image availability and the
+/// bounded shell check.  Keep that caller-level image budget while each owned
+/// lifecycle operation remains under the runtime's configured deadline.
 const NVIDIA_LIB32_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Minimal images the #375 probe tries in order; both ship `sh`.
@@ -563,6 +565,23 @@ impl ContainerRuntime {
     /// `QUASAR_NV_LIB32_PATH` remains available.
     pub fn probe_nvidia_lib32_path(&self) -> Option<String> {
         let version = crate::nvidia_volume::kernel_driver_version(Path::new("/"))?;
+        let api = match crate::runtime::configured() {
+            Ok(api) => api,
+            Err(error) => {
+                tracing::debug!(
+                    token = "nvidia-lib32-probe-runtime-unavailable",
+                    "nvidia lib32 probe cannot start owned diagnostic: {error}"
+                );
+                return None;
+            }
+        };
+        if let Err(error) = api.recover_diagnostics().wait() {
+            tracing::debug!(
+                token = "nvidia-lib32-probe-recovery-pending",
+                "nvidia lib32 probe has pending owned cleanup: {error}"
+            );
+            return None;
+        }
         let images = self
             .own_image()
             .map(|image| vec![image])
@@ -573,34 +592,77 @@ impl ContainerRuntime {
                     .collect()
             });
         for image in &images {
-            let out = output_with_deadline(
-                Command::new(&self.bin).args([
-                    "run",
-                    "--rm",
-                    "--network",
-                    "none",
-                    "--read-only",
-                    "--cap-drop",
-                    "ALL",
-                    "--security-opt",
-                    "no-new-privileges",
-                    "--mount",
-                    "type=bind,src=/usr,dst=/host-usr,readonly",
-                    "--entrypoint",
-                    "sh",
-                    image,
-                    "-c",
-                    NVIDIA_LIB32_PROBE_SCRIPT,
-                    "quasar-lib32-probe",
-                    &version,
-                ]),
-                "nvidia lib32 probe",
-                NVIDIA_LIB32_PROBE_TIMEOUT,
-            );
+            if let Err(error) = api
+                .ensure_image(image, NVIDIA_LIB32_PROBE_TIMEOUT)
+                .wait(|_| {})
+            {
+                tracing::debug!(token = "nvidia-lib32-probe-image-unavailable", "nvidia lib32 probe image {image} is unavailable through the owned runtime: {error}");
+                match error.kind {
+                    crate::runtime::ErrorKind::Missing
+                    | crate::runtime::ErrorKind::RegistryDenied => continue,
+                    _ => return None,
+                }
+            }
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let helper = crate::runtime::DiagnosticHelper {
+                operation: format!("nvidia-lib32-{nonce}"),
+                name: format!("quasar-lib32-probe-{}-{nonce}", std::process::id()),
+                image: image.clone(),
+            };
+            let run = crate::runtime::DiagnosticRun {
+                // Both the agent image and busybox/alpine compatibility
+                // images provide `timeout`; keep an in-container deadline so
+                // a lost observer cannot leave the `/usr` scan running.
+                entrypoint: vec!["timeout".into()],
+                command: vec![
+                    "20s".into(),
+                    "sh".into(),
+                    "-c".into(),
+                    NVIDIA_LIB32_PROBE_SCRIPT.into(),
+                    "quasar-lib32-probe".into(),
+                    version.clone(),
+                ],
+                bind: crate::runtime::ReadOnlyHostBind {
+                    source: "/usr".into(),
+                    target: "/host-usr".into(),
+                },
+            };
+            let id = match api.run_diagnostic(helper, run).wait() {
+                Ok(id) => id,
+                Err(error) => {
+                    tracing::debug!(token = "nvidia-lib32-probe-indeterminate", "nvidia lib32 probe via {image} has uncertain creation/start outcome: {error}");
+                    return None;
+                }
+            };
+            let out = match api.observe_diagnostic(id.clone()).wait() {
+                Ok(result) => result,
+                Err(error) => {
+                    // This is an explicit termination of the identified helper,
+                    // followed by its tracked cleanup.  Never try a fresh name
+                    // while the original operation remains uncertain.
+                    let _ = api.stop_diagnostic(id.clone()).wait();
+                    let _ = api.cleanup_diagnostic(id).wait();
+                    tracing::debug!(
+                        token = "nvidia-lib32-probe-indeterminate",
+                        "nvidia lib32 probe via {image} has uncertain observation outcome: {error}"
+                    );
+                    return None;
+                }
+            };
+            if let Err(error) = api.cleanup_diagnostic(id).wait() {
+                tracing::debug!(
+                    token = "nvidia-lib32-probe-cleanup-pending",
+                    "nvidia lib32 probe via {image} has cleanup pending: {error}"
+                );
+                return None;
+            }
             match out {
                 // exit 0: the script printed the container-path dir it found libs in.
-                Ok(o) if o.status.success() => {
-                    let container_dir = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                o if o.exit_code == Some(0) => {
+                    let container_dir = o.stdout.trim().to_string();
                     // Container view back to host path: /host-usr/lib -> /usr/lib.
                     if let Some(rest) = container_dir.strip_prefix("/host-usr") {
                         let host_path = format!("/usr{rest}");
@@ -615,18 +677,17 @@ impl ContainerRuntime {
                     return None;
                 }
                 // exit 1: ran, found nothing. Definitive; another image won't differ.
-                Ok(o) if o.status.code() == Some(1) => return None,
-                // Any other non-zero (125 = couldn't run/pull): try the next image.
-                Ok(o) => {
+                o if o.exit_code == Some(1) => return None,
+                // A confirmed non-zero result may be image-specific; the
+                // helper's final logs and cleanup were retained before trying
+                // the compatibility fallback. Uncertain lifecycles returned
+                // above and never reach this branch.
+                o => {
                     tracing::debug!(
                         "nvidia lib32 probe via {image}: exit {:?}: {}",
-                        o.status.code(),
-                        String::from_utf8_lossy(&o.stderr).trim()
+                        o.exit_code,
+                        o.stderr.trim()
                     );
-                    continue;
-                }
-                Err(e) => {
-                    tracing::debug!("nvidia lib32 probe via {image} failed to run: {e}");
                     continue;
                 }
             }

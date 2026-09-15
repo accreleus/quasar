@@ -1915,42 +1915,66 @@ pub fn probe_sibling_egl() -> EglRuntime {
         .unwrap_or_default()
         .as_nanos();
     let name = format!("quasar-driver-probe-{}-{nonce}", std::process::id());
-    let mut args: Vec<String> = [
-        "run",
-        "--rm",
-        "--name",
-        &name,
-        "--network",
-        "none",
-        "--read-only",
-        "--cap-drop",
-        "ALL",
-        "--security-opt",
-        "no-new-privileges",
-        "--gpus",
-        "all",
-        "--entrypoint",
-        "/usr/bin/timeout",
-    ]
-    .iter()
-    .map(|s| (*s).to_owned())
-    .collect();
-    args.extend(app_container_args(Some(&info), VOLUME_MOUNT, ""));
-    args.extend([
+    let driver_mount = match (&info.name, &info.host) {
+        (Some(name), _) => crate::runtime::NvidiaDriverMount::NamedVolume {
+            name: name.clone(),
+            target: VOLUME_MOUNT.into(),
+        },
+        (None, Some(source)) => {
+            crate::runtime::NvidiaDriverMount::ReadOnlyBind(crate::runtime::ReadOnlyHostBind {
+                source: source.clone(),
+                target: VOLUME_MOUNT.into(),
+            })
+        }
+        (None, None) => unreachable!("checked above"),
+    };
+    let run = crate::runtime::NvidiaGpuRun {
+        entrypoint: vec!["/usr/bin/timeout".into()],
+        command: vec![
+            "20s".into(),
+            "/usr/local/bin/quasar-node-agent".into(),
+            EGL_SELFTEST_ARG.into(),
+            format!("{VOLUME_MOUNT}/lib64/libEGL_nvidia.so.0"),
+        ],
+        driver_mount,
+        // The previous CLI sibling passed an empty image loader suffix.  Keep
+        // that precedence exactly; this probe is the agent image, not an app
+        // image whose baked loader path needs appending.
+        image_ld_library_path: String::new(),
+        has_gbm_backend: info
+            .local
+            .join(layout::GBM_DIR)
+            .join("nvidia-drm_gbm.so")
+            .is_file(),
+    };
+    let helper = crate::runtime::DiagnosticHelper {
+        operation: format!("nvidia-egl-{nonce}"),
+        name,
         image,
-        "20s".into(),
-        "/usr/local/bin/quasar-node-agent".into(),
-        EGL_SELFTEST_ARG.into(),
-        format!("{VOLUME_MOUNT}/lib64/libEGL_nvidia.so.0"),
-    ]);
-    let output = runtime.run_raw(&args.iter().map(String::as_str).collect::<Vec<_>>());
-    // Also clean up after a daemon/client timeout. The in-container timeout
-    // bounds the probe even if the agent itself is killed during this call.
-    runtime.force_remove(&name);
+    };
+    let output = crate::runtime::configured().and_then(|api| {
+        api.recover_diagnostics().wait()?;
+        let id = api.run_nvidia_gpu_diagnostic(helper, run).wait()?;
+        let observed = api.observe_diagnostic(id.clone()).wait();
+        if observed.is_err() {
+            let _ = api.stop_diagnostic(id.clone()).wait();
+        }
+        let cleanup = api.cleanup_diagnostic(id).wait();
+        observed.and_then(|value| cleanup.map(|()| value))
+    });
     let result = match output {
-        Ok(body) => parse_egl_selftest(&body),
+        Ok(body) if body.exit_code == Some(0) => parse_egl_selftest(&body.stdout),
+        Ok(body) => EglRuntime::Indeterminate {
+            detail: format!(
+                "sibling EGL test exited {:?}: {}",
+                body.exit_code,
+                body.stderr.trim()
+            ),
+        },
         Err(error) => EglRuntime::Indeterminate {
-            detail: format!("sibling EGL test could not complete: {error}"),
+            detail: format!(
+                "sibling EGL test could not complete through owned runtime lifecycle: {error}"
+            ),
         },
     };
     *cached = Some((key, Instant::now(), result.clone()));
@@ -2838,6 +2862,87 @@ mod tests {
             v.is_indeterminate(),
             "a self-test child that produces no verdict must be Indeterminate, got {v:?}"
         );
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly prepared NVIDIA candidate container, disposable driver volume, and Docker socket"]
+    fn live_owned_gpu_helpers_cover_provisioned_driver_volume() {
+        if std::env::var("QUASAR_TEST_NVIDIA_GPU_HELPERS").as_deref() != Ok("1") {
+            eprintln!("SKIP: set QUASAR_TEST_NVIDIA_GPU_HELPERS=1 after mounting a disposable provisioned driver volume");
+            return;
+        }
+        assert_eq!(
+            std::env::var("QUASAR_TEST_NVIDIA_TEST_IDENTITY").as_deref(),
+            Ok("1"),
+            "set QUASAR_TEST_NVIDIA_TEST_IDENTITY=1 to acknowledge the test-only ownership lease"
+        );
+        let secret = std::env::var("NODE_SECRET_PATH")
+            .expect("set a unique test NODE_SECRET_PATH; never share the running agent lease");
+        assert!(
+            secret.starts_with("/tmp/quasar-gpu-helper-"),
+            "NODE_SECRET_PATH must be a unique /tmp/quasar-gpu-helper-* test path"
+        );
+        let name = std::env::var("QUASAR_TEST_NVIDIA_DRIVER_VOLUME")
+            .expect("set the uniquely owned disposable Docker volume name");
+        let version =
+            kernel_driver_version(Path::new("/")).expect("NVIDIA kernel driver must be loaded");
+        let manifest = match volume_state(Path::new(VOLUME_MOUNT), &version) {
+            VolumeState::Current(manifest) => manifest,
+            other => panic!(
+                "mounted disposable volume is not a current provisioned driver volume: {other:?}"
+            ),
+        };
+        set_current(Some(VolumeInfo {
+            local: VOLUME_MOUNT.into(),
+            host: None,
+            name: Some(name),
+            manifest,
+        }));
+        let runtime = crate::session::container::ContainerRuntime::from_env();
+        // A CUDA-only host deliberately has no compatible host `/usr` lib32
+        // directory. The migrated public probe must report that absence so
+        // session launch uses the provisioned named volume instead; mutating
+        // host `/usr` would not prove the fallback and is forbidden here.
+        assert!(
+            runtime.probe_nvidia_lib32_path().is_none(),
+            "CUDA-only host lib32 probe must leave volume fallback selected"
+        );
+        let helper_journals = PathBuf::from(format!("{secret}.runtime-images/helpers"));
+        let terminal_absence = std::fs::read_dir(helper_journals)
+            .expect("owned lib32 helper journal must be present")
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read(entry.path()).ok())
+            .filter_map(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+            .any(|intent| {
+                intent["operation"]
+                    .as_str()
+                    .is_some_and(|op| op.starts_with("nvidia-lib32-"))
+                    && intent["phase"] == "Completed"
+                    && intent["result"]["exit_code"] == 1
+            });
+        assert!(
+            terminal_absence,
+            "lib32 None must record owned terminal exit 1, not a runtime failure"
+        );
+        let current = current().expect("test installed the disposable volume state");
+        assert!(
+            current.manifest.lib32_count > 0,
+            "fresh provision must contain lib32 libraries"
+        );
+        let lib = std::fs::read_dir(current.local.join(layout::LIB32))
+            .expect("provisioned lib32 directory must be readable")
+            .filter_map(Result::ok)
+            .find_map(|entry| std::fs::read(entry.path()).ok())
+            .expect("provisioned lib32 directory must contain a library");
+        assert!(
+            lib.starts_with(b"\x7fELF\x01"),
+            "provisioned driver volume must contain ELF32 userspace"
+        );
+        assert!(
+            matches!(probe_sibling_egl(), EglRuntime::Ok { .. }),
+            "owned GPU helper must load the provisioned NVIDIA EGL stack"
+        );
+        set_current(None);
     }
 
     // ── installer integrity (#476) ──────────────────────────────────────────

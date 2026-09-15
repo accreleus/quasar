@@ -70,6 +70,28 @@ pub struct DiagnosticRun {
     pub bind: ReadOnlyHostBind,
 }
 
+/// One read-only NVIDIA userspace mount accepted by the GPU diagnostic
+/// profile.  Keeping the daemon-host bind and named-volume forms distinct is
+/// important: a host path is meaningful only to the engine daemon, while a
+/// volume name is the stable identity Docker resolves itself.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum NvidiaDriverMount {
+    ReadOnlyBind(ReadOnlyHostBind),
+    NamedVolume { name: String, target: String },
+}
+
+/// Fixed NVIDIA GPU/EGL diagnostic.  This is intentionally narrower than an
+/// application container: no caller-controlled device list, security options,
+/// or arbitrary environment crosses the runtime boundary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NvidiaGpuRun {
+    pub entrypoint: Vec<String>,
+    pub command: Vec<String>,
+    pub driver_mount: NvidiaDriverMount,
+    pub image_ld_library_path: String,
+    pub has_gbm_backend: bool,
+}
+
 /// The fixed, long-running PulseAudio sibling profile.  This is deliberately
 /// not a general container request: the only writable mount is the
 /// session-private socket directory and its environment is fixed by the
@@ -85,6 +107,7 @@ pub struct AudioRun {
 pub(crate) enum HelperProfile {
     #[default]
     Diagnostic,
+    NvidiaGpu,
     Audio,
 }
 
@@ -124,6 +147,8 @@ pub(crate) struct HelperIntent {
     pub request_fingerprint: String,
     #[serde(default)]
     pub run: Option<DiagnosticRun>,
+    #[serde(default)]
+    pub nvidia_gpu: Option<NvidiaGpuRun>,
     /// Kept separate from `run` so journals written by the diagnostic-only
     /// implementation continue to decode as the diagnostic profile.
     #[serde(default)]

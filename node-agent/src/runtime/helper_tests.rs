@@ -2,6 +2,7 @@
 use super::*;
 use crate::runtime::helpers::HelperPhase;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     io::{Read, Write},
     os::unix::net::{UnixListener, UnixStream},
@@ -38,6 +39,10 @@ struct State {
     replace_id: bool,
     inspect_code: Option<u16>,
     host_mount_override: Option<Value>,
+    realized_mount_override: Option<Value>,
+    host_device_requests_override: Option<Value>,
+    host_security_opt_override: Option<Value>,
+    inherited_env: Vec<String>,
     requests: Vec<String>,
     pause_first_log: Option<Arc<LogGate>>,
 }
@@ -186,12 +191,30 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
         }
     } else if method == "GET" && route.ends_with("/json") {
         if let Some(body) = &s.body {
-            let mounts: Vec<Value> = body["HostConfig"]["Mounts"].as_array().into_iter().flatten().map(|mount| json!({"Type":"bind","Source":mount["Source"],"Destination":mount["Target"],"RW":!mount["ReadOnly"].as_bool().unwrap_or(false)})).collect();
+            let mounts: Vec<Value> = body["HostConfig"]["Mounts"].as_array().into_iter().flatten().map(|mount| {
+                let volume = mount["Type"].as_str() == Some("volume");
+                json!({"Type":mount["Type"],"Source":mount["Source"],"Name":if volume { mount["Source"].clone() } else { Value::Null },"Destination":mount["Target"],"RW":!mount["ReadOnly"].as_bool().unwrap_or(false)})
+            }).collect();
+            let realized_mounts = s
+                .realized_mount_override
+                .clone()
+                .unwrap_or_else(|| Value::Array(mounts.clone()));
             let mut host_config = body["HostConfig"].clone();
             if let Some(mounts) = &s.host_mount_override {
                 host_config["Mounts"] = mounts.clone();
             }
-            response = json!({"Id":if s.replace_id { "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } else {ID},"Name":format!("/{}",s.name),"Config":body,"HostConfig":host_config,"Mounts":mounts,"State":{"Running":s.running,"Status":if s.running {"running"} else if s.exited {"exited"} else {"created"},"ExitCode":s.exit}});
+            if let Some(requests) = &s.host_device_requests_override {
+                host_config["DeviceRequests"] = requests.clone();
+            }
+            if let Some(security) = &s.host_security_opt_override {
+                host_config["SecurityOpt"] = security.clone();
+            }
+            let mut config = body.clone();
+            if !s.inherited_env.is_empty() {
+                let env = config["Env"].as_array_mut().unwrap();
+                env.extend(s.inherited_env.iter().cloned().map(Value::String));
+            }
+            response = json!({"Id":if s.replace_id { "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } else {ID},"Name":format!("/{}",s.name),"Config":config,"HostConfig":host_config,"Mounts":realized_mounts,"State":{"Running":s.running,"Status":if s.running {"running"} else if s.exited {"exited"} else {"created"},"ExitCode":s.exit}});
             if let Some(inspect_code) = s.inspect_code {
                 code = inspect_code;
                 response = json!({"message":"fixture inspect"});
@@ -293,6 +316,330 @@ fn request() -> (DiagnosticHelper, DiagnosticRun) {
             },
         },
     )
+}
+
+fn nvidia_request() -> (DiagnosticHelper, NvidiaGpuRun) {
+    (
+        DiagnosticHelper {
+            operation: "nvidia-fixture".into(),
+            name: "quasar-nvidia-fixture".into(),
+            image: "quasar-agent:test".into(),
+        },
+        NvidiaGpuRun {
+            entrypoint: vec!["/usr/bin/timeout".into()],
+            command: vec!["5s".into(), "/bin/sh".into(), "-c".into(), "exit 23".into()],
+            driver_mount: NvidiaDriverMount::NamedVolume {
+                name: "quasar-driver-fixture".into(),
+                target: "/opt/quasar/nvidia-driver".into(),
+            },
+            image_ld_library_path: "/image/lib".into(),
+            has_gbm_backend: true,
+        },
+    )
+}
+
+#[test]
+fn nvidia_gpu_helper_requires_the_owned_all_gpu_driver_volume_profile() {
+    let engine = Engine::new();
+    let client = engine.client();
+    let (helper, run) = nvidia_request();
+    let id = client
+        .run_nvidia_gpu_diagnostic(helper, run)
+        .wait()
+        .unwrap();
+    let body = engine.state.lock().unwrap().body.clone().unwrap();
+    assert_eq!(body["HostConfig"]["NetworkMode"], json!("none"));
+    assert_eq!(body["HostConfig"]["ReadonlyRootfs"], json!(true));
+    assert_eq!(body["HostConfig"]["CapDrop"], json!(["ALL"]));
+    assert_eq!(
+        body["HostConfig"]["SecurityOpt"],
+        json!(["no-new-privileges"])
+    );
+    assert_eq!(
+        body["HostConfig"]["DeviceRequests"],
+        json!([{"Driver":"nvidia","Count":-1,"Capabilities":[["gpu"]]}])
+    );
+    assert_eq!(body["HostConfig"]["Mounts"][0]["Type"], json!("volume"));
+    assert_eq!(
+        body["HostConfig"]["Mounts"][0]["Source"],
+        json!("quasar-driver-fixture")
+    );
+    assert_eq!(body["HostConfig"]["Mounts"][0]["ReadOnly"], json!(true));
+    assert_eq!(body["Env"], json!([
+        "LD_LIBRARY_PATH=/opt/quasar/nvidia-driver/lib64:/image/lib",
+        "__EGL_VENDOR_LIBRARY_DIRS=/opt/quasar/nvidia-driver/glvnd/egl_vendor.d:/etc/glvnd/egl_vendor.d:/usr/share/glvnd/egl_vendor.d",
+        "__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS=/opt/quasar/nvidia-driver/egl_external_platform.d:/usr/share/egl/egl_external_platform.d",
+        "VK_ADD_DRIVER_FILES=/opt/quasar/nvidia-driver/vulkan/icd.d/nvidia_icd.json",
+        "GBM_BACKENDS_PATH=/opt/quasar/nvidia-driver/gbm",
+    ]));
+    assert_eq!(
+        client
+            .observe_diagnostic(id.clone())
+            .wait()
+            .unwrap()
+            .exit_code,
+        Some(23)
+    );
+    client.cleanup_diagnostic(id).wait().unwrap();
+}
+
+#[test]
+fn nvidia_gpu_helper_keeps_unrelated_inherited_image_environment() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().inherited_env = vec![
+        "PATH=/usr/local/bin:/usr/bin".into(),
+        "GST_PLUGIN_PATH=/image/plugins".into(),
+    ];
+    let (helper, run) = nvidia_request();
+    let id = engine
+        .client()
+        .run_nvidia_gpu_diagnostic(helper, run)
+        .wait()
+        .unwrap();
+    engine
+        .client()
+        .observe_diagnostic(id.clone())
+        .wait()
+        .unwrap();
+    engine.client().cleanup_diagnostic(id).wait().unwrap();
+}
+
+#[test]
+fn nvidia_gpu_helper_rejects_an_inherited_driver_override() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().inherited_env = vec!["GBM_BACKENDS_PATH=/foreign/gbm".into()];
+    let (helper, mut run) = nvidia_request();
+    run.has_gbm_backend = false;
+    assert_eq!(
+        engine
+            .client()
+            .run_nvidia_gpu_diagnostic(helper, run)
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol
+    );
+}
+
+#[test]
+fn nvidia_gpu_helper_supports_a_readonly_driver_bind_without_gbm() {
+    let engine = Engine::new();
+    let (helper, mut run) = nvidia_request();
+    run.driver_mount = NvidiaDriverMount::ReadOnlyBind(ReadOnlyHostBind {
+        source: "/daemon-only/nvidia-driver".into(),
+        target: "/opt/quasar/nvidia-driver".into(),
+    });
+    run.has_gbm_backend = false;
+    engine.state.lock().unwrap().host_mount_override = Some(json!([{
+        "Type":"bind", "Source":"/daemon-only/nvidia-driver", "Target":"/opt/quasar/nvidia-driver", "ReadOnly":true
+    }]));
+    let id = engine
+        .client()
+        .run_nvidia_gpu_diagnostic(helper, run)
+        .wait()
+        .unwrap();
+    let body = engine.state.lock().unwrap().body.clone().unwrap();
+    assert_eq!(body["HostConfig"]["Mounts"][0]["Type"], json!("bind"));
+    assert_eq!(body["HostConfig"]["Mounts"][0]["ReadOnly"], json!(true));
+    assert!(body["Env"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|v| !v.as_str().unwrap().starts_with("GBM_BACKENDS_PATH=")));
+    engine
+        .client()
+        .observe_diagnostic(id.clone())
+        .wait()
+        .unwrap();
+    engine.client().cleanup_diagnostic(id).wait().unwrap();
+}
+
+#[test]
+fn nvidia_gpu_helper_rejects_unsafe_driver_bind_options() {
+    let engine = Engine::new();
+    let (helper, mut run) = nvidia_request();
+    run.driver_mount = NvidiaDriverMount::ReadOnlyBind(ReadOnlyHostBind {
+        source: "/daemon-only/nvidia-driver".into(),
+        target: "/opt/quasar/nvidia-driver".into(),
+    });
+    engine.state.lock().unwrap().host_mount_override = Some(json!([{
+        "Type":"bind", "Source":"/daemon-only/nvidia-driver", "Target":"/opt/quasar/nvidia-driver", "ReadOnly":true,
+        "BindOptions":{"CreateMountpoint":true,"Propagation":"rshared","NonRecursive":true}
+    }]));
+    assert_eq!(
+        engine
+            .client()
+            .run_nvidia_gpu_diagnostic(helper, run)
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol
+    );
+}
+
+#[test]
+fn nvidia_gpu_helper_refuses_missing_gpu_or_weakened_driver_security_before_start() {
+    for (requests, security) in [
+        (Some(json!([])), None),
+        (
+            Some(json!([{"Driver":"nvidia","Count":1,"Capabilities":[["gpu"]]}])),
+            None,
+        ),
+        (None, Some(json!([]))),
+    ] {
+        let engine = Engine::new();
+        engine.state.lock().unwrap().host_device_requests_override = requests;
+        engine.state.lock().unwrap().host_security_opt_override = security;
+        let (helper, run) = nvidia_request();
+        assert_eq!(
+            engine
+                .client()
+                .run_nvidia_gpu_diagnostic(helper, run)
+                .wait()
+                .unwrap_err()
+                .kind,
+            ErrorKind::Protocol
+        );
+        assert_eq!(engine.requests(&format!("POST /containers/{ID}/start")), 0);
+    }
+}
+
+#[test]
+fn nvidia_gpu_helper_refuses_a_wrong_realized_driver_volume_and_keeps_cleanup_tracked() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().host_mount_override = Some(json!([{
+        "Type":"volume", "Source":"another-driver", "Target":"/opt/quasar/nvidia-driver", "ReadOnly":true
+    }]));
+    let (helper, run) = nvidia_request();
+    assert_eq!(
+        engine
+            .client()
+            .run_nvidia_gpu_diagnostic(helper, run)
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol
+    );
+    assert!(
+        engine.state.lock().unwrap().body.is_some(),
+        "rejected realization remains journaled for explicit recovery"
+    );
+    engine.state.lock().unwrap().host_mount_override = None;
+    engine.client().recover_diagnostics().wait().unwrap();
+    assert!(engine.state.lock().unwrap().body.is_none());
+}
+
+#[test]
+fn nvidia_gpu_helper_rejects_a_writable_realized_driver_mount() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().realized_mount_override = Some(json!([{
+        "Type":"volume", "Source":"/var/lib/docker/volumes/quasar-driver-fixture/_data",
+        "Name":"quasar-driver-fixture", "Destination":"/opt/quasar/nvidia-driver", "RW":true
+    }]));
+    let (helper, run) = nvidia_request();
+    assert_eq!(
+        engine
+            .client()
+            .run_nvidia_gpu_diagnostic(helper, run)
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol
+    );
+}
+
+#[test]
+fn nvidia_gpu_lost_create_reconciles_the_same_owned_operation() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().lose_create = true;
+    let (helper, run) = nvidia_request();
+    let client = engine.client();
+    assert_eq!(
+        client
+            .run_nvidia_gpu_diagnostic(helper.clone(), run.clone())
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    let id = engine
+        .client()
+        .run_nvidia_gpu_diagnostic(helper, run)
+        .wait()
+        .unwrap();
+    assert_eq!(
+        client
+            .observe_diagnostic(id.clone())
+            .wait()
+            .unwrap()
+            .exit_code,
+        Some(23)
+    );
+    client.cleanup_diagnostic(id).wait().unwrap();
+    assert_eq!(engine.requests("POST /containers/create"), 1);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/start")), 1);
+}
+
+#[test]
+fn nvidia_gpu_lost_start_reconciles_the_original_without_a_second_start() {
+    let engine = Engine::new();
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.lose_start = true;
+        state.keep_running = true;
+    }
+    let (helper, run) = nvidia_request();
+    let client = engine.client();
+    assert_eq!(
+        client
+            .run_nvidia_gpu_diagnostic(helper.clone(), run.clone())
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    engine.finish();
+    let id = engine
+        .client()
+        .run_nvidia_gpu_diagnostic(helper, run)
+        .wait()
+        .unwrap();
+    assert_eq!(
+        client
+            .observe_diagnostic(id.clone())
+            .wait()
+            .unwrap()
+            .exit_code,
+        Some(23)
+    );
+    client.cleanup_diagnostic(id).wait().unwrap();
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/start")), 1);
+}
+
+#[test]
+fn failed_generic_recovery_still_recovers_the_nvidia_profile() {
+    let engine = Engine::new();
+    let client = engine.client();
+    let (diagnostic_helper, diagnostic_run) = request();
+    client
+        .run_diagnostic(diagnostic_helper, diagnostic_run)
+        .wait()
+        .unwrap();
+    // Make the generic journal unreconcilable while leaving its record in
+    // place. A separate GPU operation then proves recovery tries both
+    // profiles before returning the generic failure.
+    engine.state.lock().unwrap().body = None;
+    let (gpu_helper, gpu_run) = nvidia_request();
+    let gpu = client
+        .run_nvidia_gpu_diagnostic(gpu_helper, gpu_run)
+        .wait()
+        .unwrap();
+    assert!(client.recover_diagnostics().wait().is_err());
+    assert!(engine.state.lock().unwrap().body.is_none());
+    assert_eq!(
+        client.observe_diagnostic(gpu).wait().unwrap().exit_code,
+        Some(23)
+    );
 }
 
 fn audio_request(engine: &Engine) -> (DiagnosticHelper, AudioRun) {
@@ -603,6 +950,39 @@ fn helper_intent_path(engine: &Engine, operation: &str) -> std::path::PathBuf {
 
 fn helper_intent(engine: &Engine, operation: &str) -> HelperIntent {
     serde_json::from_slice(&std::fs::read(helper_intent_path(engine, operation)).unwrap()).unwrap()
+}
+
+#[test]
+fn audio_journal_with_the_pre_gpu_fingerprint_replays_without_a_second_create() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let (helper, run) = audio_request(&engine);
+    let operation = helper.operation.clone();
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper.clone(), run.clone())
+        .wait()
+        .unwrap();
+    let prior_fingerprint = Sha256::digest(
+        serde_json::to_vec(&(&helper, Option::<&DiagnosticRun>::None, &run)).unwrap(),
+    )
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect();
+    rewrite_helper_intent(&engine, &operation, |intent| {
+        intent.request_fingerprint = prior_fingerprint;
+    });
+    assert_eq!(
+        engine
+            .client()
+            .run_audio_sidecar(helper, run)
+            .wait()
+            .unwrap(),
+        id
+    );
+    assert_eq!(engine.requests("POST /containers/create"), 1);
+    engine.finish();
+    engine.client().cleanup_audio_sidecar(id).wait().unwrap();
 }
 
 #[test]
