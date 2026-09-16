@@ -895,6 +895,15 @@ For an existing host, the socket mount remains unchanged; a host using the defau
 socket needs no compose change. Podman operators may point `DOCKER_HOST` at Podman's
 Docker-compatible Unix socket, but that configuration is not certified.
 
+Every application, helper and audio journal records the endpoint it was written
+against. Changing `DOCKER_HOST` is safe while every record is terminal (`Completed`):
+those records are proof of absence and are not touched. A non-terminal record written
+against the previous endpoint cannot be reconciled through the new one, so boot refuses
+to start (`runtime-application-retirement-pending`, exit and supervisor restart) rather
+than guess whether a container on the old engine still holds a managed home. Recovery
+is to restore the previous `DOCKER_HOST`, let one boot retire the records, and switch
+again.
+
 At boot, after discovering the engine, the agent first retries journalled diagnostic
 helper cleanup, then retries journalled application cleanup and retires every
 non-terminal application record, then retires journalled audio sidecars, and only

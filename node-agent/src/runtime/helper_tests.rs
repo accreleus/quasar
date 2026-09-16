@@ -4303,3 +4303,153 @@ fn urlencoding(value: &str) -> String {
         })
         .collect()
 }
+
+// ---------------------------------------------------------------------------
+// #239: the endpoint can move under a journal. A proxy socket in front of the
+// same daemon, or a `DOCKER_HOST` an operator edited, changes the recorded
+// socket without changing what happened. A record whose outcome was already
+// PROVEN needs no engine and must survive that; anything still unfinished must
+// stay uncertain, because this agent cannot prove what the other endpoint did.
+
+/// The same journals, reached through a different endpoint. Deliberately a dead
+/// socket: any engine call at all fails loudly instead of quietly succeeding.
+fn client_on_another_endpoint(engine: &Engine) -> RuntimeClient {
+    let mut config = engine.config.clone();
+    config.socket = engine.config.socket.with_file_name("proxy.sock");
+    RuntimeClient::new(config).unwrap()
+}
+
+fn served(engine: &Engine) -> usize {
+    engine.state.lock().unwrap().requests.len()
+}
+
+#[test]
+fn boot_retirement_accepts_completed_applications_recorded_against_another_endpoint() {
+    let engine = Engine::new();
+    let client = engine.client();
+    let id = client
+        .start_application(ApplicationRequest {
+            operation: "session-fixture-endpoint-completed".into(),
+            name: "quasar-sess-fixture-endpoint-completed".into(),
+            image: "quasar-app:test".into(),
+            ..Default::default()
+        })
+        .wait()
+        .unwrap();
+    client.cleanup_application(id).wait().unwrap();
+    let before = served(&engine);
+    client_on_another_endpoint(&engine)
+        .retire_applications()
+        .wait()
+        .expect("a proven-terminal record must not block startup from a new endpoint");
+    assert_eq!(
+        served(&engine),
+        before,
+        "a terminal record has nothing left to mutate; it must ask no engine anything"
+    );
+}
+
+#[test]
+fn boot_retirement_keeps_an_unfinished_application_uncertain_across_an_endpoint_change() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().lose_remove = true;
+    let client = engine.client();
+    let id = client
+        .start_application(ApplicationRequest {
+            operation: "session-fixture-endpoint-pending".into(),
+            name: "quasar-sess-fixture-endpoint-pending".into(),
+            image: "quasar-app:test".into(),
+            ..Default::default()
+        })
+        .wait()
+        .unwrap();
+    assert_eq!(
+        client.cleanup_application(id).wait().unwrap_err().kind,
+        ErrorKind::UnknownOutcome
+    );
+    let before = served(&engine);
+    assert_eq!(
+        client_on_another_endpoint(&engine)
+            .retire_applications()
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome,
+        "an unfinished record from another endpoint stays fail-closed"
+    );
+    assert_eq!(served(&engine), before, "and mutates nothing on the way");
+}
+
+#[test]
+fn boot_retirement_and_recovery_accept_completed_audio_recorded_against_another_endpoint() {
+    let engine = Engine::new();
+    let (helper, run) = audio_request(&engine);
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    engine.client().cleanup_audio_sidecar(id).wait().unwrap();
+    let before = served(&engine);
+    let moved = client_on_another_endpoint(&engine);
+    moved
+        .retire_audio_sidecars()
+        .wait()
+        .expect("a completed audio tombstone must not block startup from a new endpoint");
+    moved
+        .recover_audio_sidecars()
+        .wait()
+        .expect("nor routine audio recovery");
+    moved
+        .recover_diagnostics()
+        .wait()
+        .expect("nor diagnostic recovery, which scans the same journals");
+    assert_eq!(served(&engine), before);
+}
+
+#[test]
+fn boot_retirement_keeps_an_unfinished_audio_record_uncertain_across_an_endpoint_change() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let (helper, run) = audio_request(&engine);
+    engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    let before = served(&engine);
+    assert_eq!(
+        client_on_another_endpoint(&engine)
+            .retire_audio_sidecars()
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome,
+        "boot retirement stops a sidecar; one recorded elsewhere is not ours to stop"
+    );
+    assert_eq!(served(&engine), before, "and nothing was mutated");
+    assert!(engine.state.lock().unwrap().running);
+
+    // Routine recovery, on a record that is neither live nor terminal: the
+    // removal was refused, so its cleanup obligation is still open and only the
+    // endpoint that recorded it may finish it.
+    let pending = Engine::new();
+    pending.state.lock().unwrap().refuse_remove = true;
+    let (helper, run) = audio_request(&pending);
+    let id = pending
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    assert!(pending.client().cleanup_audio_sidecar(id).wait().is_err());
+    let before = served(&pending);
+    assert_eq!(
+        client_on_another_endpoint(&pending)
+            .recover_audio_sidecars()
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    assert_eq!(served(&pending), before);
+}

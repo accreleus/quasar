@@ -1531,12 +1531,18 @@ pub(crate) async fn abandon(config: &RuntimeConfig, operation: &str) -> Result<(
     let Some(mut intent) = journal.read()? else {
         return Ok(());
     };
+    // Terminal evidence outranks the endpoint. Completed was written only after
+    // absence of the exact immutable ID was proven, so there is nothing left to
+    // mutate and nothing an ownership check could protect. Checking `owns` first
+    // made a moved DOCKER_HOST (a proxy socket in front of the same daemon)
+    // refuse every boot with UnknownOutcome, forever. Every NON-terminal phase
+    // below still has to prove it owns the endpoint it would mutate.
+    if intent.phase == ApplicationPhase::Completed {
+        return Ok(());
+    }
     let owner_value = owner(config)?;
     if !owns(&intent, config, &owner_value) || intent.request.operation != operation {
         return Err(ErrorKind::UnknownOutcome.into());
-    }
-    if intent.phase == ApplicationPhase::Completed {
-        return Ok(());
     }
     if intent.phase == ApplicationPhase::CleanupPending {
         if let Some(id) = intent.id.as_ref().filter(|value| valid_id(value)) {
@@ -1730,6 +1736,10 @@ pub(crate) async fn recover_cleanup(config: &RuntimeConfig) -> Result<(), Runtim
 /// records are explicitly retired before a new agent starts sibling services.
 pub(crate) async fn retire(config: &RuntimeConfig) -> Result<(), RuntimeError> {
     let (operations, mut failure) = scanned_operations(config)?;
+    // Records this pass proved terminal under their lease: they need no
+    // abandonment, and asking for one would re-read them through checks that
+    // only a still-mutable record needs.
+    let mut terminal = std::collections::HashSet::new();
     // First record every retirement request. A stuck first Docker call cannot
     // prevent later prior-agent workloads from becoming durable obligations.
     for operation in &operations {
@@ -1751,7 +1761,10 @@ pub(crate) async fn retire(config: &RuntimeConfig) -> Result<(), RuntimeError> {
             }
         };
         match journal.read() {
-            Ok(Some(mut intent)) if intent.phase != ApplicationPhase::Completed => {
+            Ok(Some(intent)) if intent.phase == ApplicationPhase::Completed => {
+                terminal.insert(operation.clone());
+            }
+            Ok(Some(mut intent)) => {
                 let owner_value = owner(config)?;
                 if !owns(&intent, config, &owner_value) {
                     failure = Some(ErrorKind::UnknownOutcome);
@@ -1767,6 +1780,9 @@ pub(crate) async fn retire(config: &RuntimeConfig) -> Result<(), RuntimeError> {
         }
     }
     for operation in operations {
+        if terminal.contains(&operation) {
+            continue;
+        }
         let result =
             tokio::time::timeout(recovery_record_budget(config), abandon(config, &operation))
                 .await

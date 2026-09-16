@@ -1442,13 +1442,15 @@ pub(crate) async fn abandon_audio(
 ) -> Result<(), RuntimeError> {
     let journal = HelperJournal::acquire(config, operation).await?;
     let mut intent = journal.read()?.ok_or(ErrorKind::UnknownOutcome)?;
-    current_intent(config, &intent)?;
     if intent.profile != HelperProfile::Audio {
         return Err(ErrorKind::UnknownOutcome.into());
     }
+    // A completed tombstone is proven terminal; the endpoint it was recorded
+    // against no longer decides anything about it (see `application::abandon`).
     if intent.phase == HelperPhase::Completed {
         return Ok(());
     }
+    current_intent(config, &intent)?;
     if intent.phase == HelperPhase::Preparing {
         cleanup_preparing_audio(&mut intent, &journal)?;
         journal.discard_definitive()?;
@@ -1646,11 +1648,14 @@ pub(crate) async fn retire_audio(config: &RuntimeConfig) -> Result<(), RuntimeEr
                 continue;
             }
         };
+        if intent.phase == HelperPhase::Completed {
+            continue;
+        }
         if current_intent(config, &intent).is_err() {
             failure = Some(ErrorKind::UnknownOutcome);
             continue;
         }
-        if intent.profile == HelperProfile::Audio && intent.phase != HelperPhase::Completed {
+        if intent.profile == HelperProfile::Audio {
             operations.push(intent.operation);
         }
     }
@@ -1659,7 +1664,7 @@ pub(crate) async fn retire_audio(config: &RuntimeConfig) -> Result<(), RuntimeEr
     for operation in &operations {
         match HelperJournal::acquire(config, operation).await {
             Ok(journal) => match journal.read() {
-                Ok(Some(mut intent)) => {
+                Ok(Some(mut intent)) if intent.phase != HelperPhase::Completed => {
                     // The scan raced with another lifecycle action.  Recheck
                     // the durable record while holding its lease before
                     // recording an irreversible boot-retirement request.
@@ -1678,7 +1683,9 @@ pub(crate) async fn retire_audio(config: &RuntimeConfig) -> Result<(), RuntimeEr
                         }
                     }
                 }
-                Ok(None) => {}
+                // Nothing to record: no journal, or one that became terminal
+                // between the scan and this lease.
+                Ok(_) => {}
                 Err(error) => failure = Some(error.kind),
             },
             Err(error) => failure = Some(error.kind),
@@ -1751,18 +1758,18 @@ async fn recover_profile(
             // Pending recovery is never a hidden stop request for live audio.
             continue;
         }
-        current_intent(config, &scanned)?;
         if scanned.phase == HelperPhase::Completed {
             continue;
         }
+        current_intent(config, &scanned)?;
         // Re-read while holding the per-operation lease: recovery must not
         // race a caller that is reconciling the same lost create.
         let journal = HelperJournal::acquire(config, &scanned.operation).await?;
         let mut intent = journal.read()?.ok_or(ErrorKind::UnknownOutcome)?;
-        current_intent(config, &intent)?;
         if intent.phase == HelperPhase::Completed {
             continue;
         }
+        current_intent(config, &intent)?;
         if profile == HelperProfile::Audio
             && matches!(
                 intent.phase,

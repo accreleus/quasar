@@ -196,7 +196,7 @@ pub async fn run(cfg: Config) {
         std::process::exit(1);
     }
     if swept > 0 {
-        info!("startup sweep removed {swept} orphaned container(s) from a prior run");
+        info!("startup sweep removed {swept} legacy container(s) from a prior run");
     }
 
     // Install mode + updater presence, for the startup identity banner;
