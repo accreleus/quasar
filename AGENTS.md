@@ -31,6 +31,17 @@ compose project name, its own 10-port block, its own ephemeral test database. Tw
 two worktrees cannot collide on containers, volumes, ports, or Postgres. Don't hardcode
 ports or container names in new tooling — go through `scripts/dx/common.sh`.
 
+## Shared-host version preflight
+
+Before testing or deploying on the local GPU development host or `gpu-test`,
+record the deployed control-plane source/image and database schema, agent
+source/image, stack identity and active sessions. Multiple agents use these hosts;
+read live identities rather than assuming the checkout or previous report matches
+the stack. Resolve version/schema mismatches before interpreting test failures,
+and record a schema-compatible rollback target before deployment. Recheck identities
+and session ownership immediately before mutation; if another worker changed them,
+refresh the baseline and coordinate use of the target.
+
 ## Start, stop, rebuild
 
 ```

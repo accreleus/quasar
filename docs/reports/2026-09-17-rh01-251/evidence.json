@@ -1,0 +1,1557 @@
+{
+  "baseline_amd": {
+    "passed": true,
+    "agent_image_id": "sha256:2d6455dd0d37ae553ccd5ca65f0e520884d20263b9f5ca4f50cfc4012bc7012b",
+    "registration_count_during_observation": 1,
+    "observations": [
+      {
+        "elapsed_s": 0.051,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 0.306,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 0.561,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 0.817,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 1.073,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 1.328,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 1.585,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 1.84,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 2.097,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 2.353,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 2.609,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 2.864,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 3.119,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 3.376,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 3.632,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 3.887,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 4.143,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 4.399,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 4.655,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 4.911,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 5.167,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 5.423,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 5.679,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 5.935,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 6.191,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 6.447,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 6.702,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 6.956,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 7.211,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 7.467,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 7.722,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 7.976,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 8.233,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 8.489,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 8.745,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 9.001,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 9.257,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 9.511,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 9.765,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 10.021,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 10.275,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 10.531,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 10.785,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 11.041,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 11.297,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 11.552,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 11.809,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 12.063,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 12.316,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 12.572,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 12.828,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 13.084,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 13.339,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 13.6,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 13.856,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 14.111,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 14.367,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 14.623,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 14.878,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 15.131,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 15.387,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 15.643,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 15.899,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 16.155,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 16.411,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 16.665,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 16.921,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 17.175,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 17.431,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 17.686,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 17.943,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 18.199,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 18.456,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 18.713,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 18.967,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 19.223,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 19.478,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 19.736,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 19.991,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 20.247,
+        "state": "stopping",
+        "detail": "stop requested"
+      }
+    ],
+    "terminal_or_stuck_state": "stopping",
+    "state_detail": "stop requested",
+    "error_message": null,
+    "failure_code": null,
+    "cleanup": {
+      "journal_phases": [
+        "Completed"
+      ],
+      "containers_absent": true
+    },
+    "home_marker_preserved": true,
+    "identity_preserved": true,
+    "owned_boot_runtime_paths_cleaned_count": 3,
+    "home_reuse": {
+      "running": true,
+      "marker_preserved": true,
+      "stop": {
+        "stop_ack_seconds": 0.009408420999534428,
+        "after_ack_seconds": 12.190169469999091,
+        "remaining_containers": [],
+        "remaining_paths": [],
+        "terminal_state": "stopped",
+        "error_message": null
+      }
+    }
+  },
+  "baseline_nvidia": {
+    "passed": true,
+    "agent_image_id": "sha256:2d6455dd0d37ae553ccd5ca65f0e520884d20263b9f5ca4f50cfc4012bc7012b",
+    "registration_count_during_observation": 1,
+    "observations": [
+      {
+        "elapsed_s": 0.072,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 0.328,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 0.582,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 0.839,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 1.096,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 1.351,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 1.606,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 1.861,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 2.115,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 2.371,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 2.624,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 2.88,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 3.134,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 3.389,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 3.643,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 3.898,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 4.153,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 4.407,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 4.661,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 4.915,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 5.17,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 5.425,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 5.679,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 5.934,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 6.19,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 6.444,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 6.699,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 6.955,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 7.209,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 7.463,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 7.719,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 7.974,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 8.23,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 8.485,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 8.741,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 8.997,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 9.253,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 9.508,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 9.763,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 10.019,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 10.273,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 10.529,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 10.783,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 11.04,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 11.294,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 11.548,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 11.804,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 12.059,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 12.313,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 12.567,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 12.822,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 13.076,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 13.331,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 13.586,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 13.84,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 14.094,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 14.349,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 14.604,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 14.859,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 15.115,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 15.371,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 15.626,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 15.881,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 16.136,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 16.392,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 16.647,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 16.9,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 17.156,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 17.411,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 17.667,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 17.922,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 18.177,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 18.431,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 18.692,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 18.948,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 19.203,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 19.459,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 19.715,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 19.971,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 20.226,
+        "state": "stopping",
+        "detail": "stop requested"
+      }
+    ],
+    "terminal_or_stuck_state": "stopping",
+    "state_detail": "stop requested",
+    "error_message": null,
+    "failure_code": null,
+    "cleanup": {
+      "journal_phases": [
+        "Completed"
+      ],
+      "containers_absent": true
+    },
+    "home_marker_preserved": true,
+    "identity_preserved": true,
+    "owned_boot_runtime_paths_cleaned_count": 3,
+    "home_reuse": {
+      "running": true,
+      "marker_preserved": true,
+      "stop": {
+        "stop_ack_seconds": 0.014726875997439492,
+        "after_ack_seconds": 10.678850246000366,
+        "remaining_containers": [],
+        "remaining_paths": [],
+        "terminal_state": "stopped",
+        "error_message": null
+      }
+    }
+  },
+  "candidate_amd": {
+    "passed": true,
+    "agent_image_id": "sha256:2d6455dd0d37ae553ccd5ca65f0e520884d20263b9f5ca4f50cfc4012bc7012b",
+    "registration_count_during_observation": 1,
+    "observations": [
+      {
+        "elapsed_s": 0.017,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 0.27,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 0.527,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 0.79,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 1.046,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 1.302,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 1.557,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 1.813,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 2.069,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 2.326,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 2.582,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 2.838,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 3.094,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 3.35,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 3.606,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 3.86,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 4.116,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 4.373,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 4.63,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 4.888,
+        "state": "stopped",
+        "detail": "host_lost"
+      }
+    ],
+    "terminal_or_stuck_state": "stopped",
+    "state_detail": "host_lost",
+    "error_message": null,
+    "failure_code": null,
+    "cleanup": {
+      "journal_phases": [
+        "Completed"
+      ],
+      "containers_absent": true
+    },
+    "home_marker_preserved": true,
+    "identity_preserved": true,
+    "owned_boot_runtime_paths_cleaned_count": 3,
+    "home_reuse": {
+      "running": true,
+      "marker_preserved": true,
+      "stop": {
+        "seconds": 10.961,
+        "home_blocked_while_stopping": true,
+        "observations": [
+          {
+            "elapsed_s": 0.052,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 0.34,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 0.642,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 0.942,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 1.243,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 1.549,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 1.84,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 2.153,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 2.446,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 2.735,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 3.026,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 3.331,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 3.619,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 3.911,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 4.199,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 4.49,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 4.787,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 5.087,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 5.388,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 5.685,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 5.986,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 6.289,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 6.601,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 6.894,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 7.194,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 7.493,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 7.796,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 8.098,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 8.389,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 8.693,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 8.993,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 9.296,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 9.589,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 9.882,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 10.239,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 10.541,
+            "state": "stopped",
+            "containers_remaining": 1
+          },
+          {
+            "elapsed_s": 10.863,
+            "state": "stopped",
+            "containers_remaining": 0
+          }
+        ],
+        "terminal_state": "stopped",
+        "cleanup_completed": true
+      }
+    }
+  },
+  "candidate_nvidia": {
+    "passed": true,
+    "agent_image_id": "sha256:2d6455dd0d37ae553ccd5ca65f0e520884d20263b9f5ca4f50cfc4012bc7012b",
+    "registration_count_during_observation": 1,
+    "observations": [
+      {
+        "elapsed_s": 0.025,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 0.282,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 0.54,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 0.796,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 1.05,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 1.304,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 1.557,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 1.813,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 2.068,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 2.323,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 2.579,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 2.835,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 3.088,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 3.344,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 3.6,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 3.856,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 4.112,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 4.367,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 4.621,
+        "state": "stopping",
+        "detail": "stop requested"
+      },
+      {
+        "elapsed_s": 4.875,
+        "state": "stopped",
+        "detail": "host_lost"
+      }
+    ],
+    "terminal_or_stuck_state": "stopped",
+    "state_detail": "host_lost",
+    "error_message": null,
+    "failure_code": null,
+    "cleanup": {
+      "journal_phases": [
+        "Completed"
+      ],
+      "containers_absent": true
+    },
+    "home_marker_preserved": true,
+    "identity_preserved": true,
+    "owned_boot_runtime_paths_cleaned_count": 3,
+    "home_reuse": {
+      "running": true,
+      "marker_preserved": true,
+      "stop": {
+        "seconds": 10.66,
+        "home_blocked_while_stopping": true,
+        "observations": [
+          {
+            "elapsed_s": 0.095,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 0.412,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 0.728,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 1.044,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 1.359,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 1.676,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 1.996,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 2.311,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 2.622,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 2.929,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 3.241,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 3.56,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 3.879,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 4.189,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 4.498,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 4.818,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 5.126,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 5.445,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 5.765,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 6.085,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 6.404,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 6.724,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 7.047,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 7.367,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 7.681,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 7.99,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 8.301,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 8.623,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 8.943,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 9.264,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 9.584,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 9.911,
+            "state": "stopping",
+            "containers_remaining": 2
+          },
+          {
+            "elapsed_s": 10.223,
+            "state": "stopping",
+            "containers_remaining": 1
+          },
+          {
+            "elapsed_s": 10.555,
+            "state": "stopped",
+            "containers_remaining": 0
+          }
+        ],
+        "terminal_state": "stopped",
+        "cleanup_completed": true
+      }
+    }
+  },
+  "deployment": {
+    "amd": {
+      "reviewed_source": "64083f2558001d50cb43eaf604d6470c7a8c084d",
+      "control_image_id": "sha256:6c4708a794c3d468a6713f7979f9bc9a17e3fbb9a07a4e84e6223b5e808b542e",
+      "control_identity": {
+        "version": "dev",
+        "source_commit": "64083f2558001d50cb43eaf604d6470c7a8c084d",
+        "built_at": "2026-09-16T22:37:05Z",
+        "schema_version": 84
+      },
+      "agent_image_id": "sha256:2d6455dd0d37ae553ccd5ca65f0e520884d20263b9f5ca4f50cfc4012bc7012b",
+      "agent_source": "fc5505806d4f5f37d3af455b4ebf14e7692b18fb",
+      "agent_not_restarted_by_deployment": true,
+      "mounts_and_endpoints_preserved": true,
+      "idle_before_deployment": true,
+      "healthy": true
+    },
+    "nvidia": {
+      "reviewed_source": "64083f2558001d50cb43eaf604d6470c7a8c084d",
+      "control_image_id": "sha256:20d863f520febf6caa5daaff7be9d8f0163be1b6298ae6baecc52fa0727564ed",
+      "control_identity": {
+        "version": "dev",
+        "source_commit": "64083f2558001d50cb43eaf604d6470c7a8c084d",
+        "built_at": "2026-09-16T22:37:10Z",
+        "schema_version": 84
+      },
+      "agent_image_id": "sha256:2d6455dd0d37ae553ccd5ca65f0e520884d20263b9f5ca4f50cfc4012bc7012b",
+      "agent_source": "fc5505806d4f5f37d3af455b4ebf14e7692b18fb",
+      "agent_not_restarted_by_deployment": true,
+      "mounts_and_endpoints_preserved": true,
+      "idle_before_deployment": true,
+      "healthy": true
+    }
+  },
+  "final_cleanup": {
+    "amd": {
+      "idle": true,
+      "disposable_catalog_removed": true,
+      "disposable_homes_removed": 1,
+      "unrelated_catalog_preserved": 2,
+      "settings_preserved": true,
+      "agent_container_image_mounts_preserved": true,
+      "host_identity_preserved": true,
+      "owned_application_audio_containers_remaining": 0,
+      "journal_phases": {
+        "Completed": 97
+      }
+    },
+    "nvidia": {
+      "idle": true,
+      "disposable_catalog_removed": true,
+      "disposable_homes_removed": 2,
+      "unrelated_catalog_preserved": 5,
+      "settings_preserved": true,
+      "agent_container_image_mounts_preserved": true,
+      "host_identity_preserved": true,
+      "owned_application_audio_containers_remaining": 0,
+      "journal_phases": {
+        "Completed": 65
+      }
+    }
+  },
+  "validation": {
+    "make_verify": "PASS: 428 checks, zero warnings/failures",
+    "make_test_go": "PASS",
+    "make_test_db": "PASS: full fresh PostgreSQL database suite, no cache",
+    "focused_session_race": "PASS: 6.638 s",
+    "registry_race_20_runs": "PASS: 3.731 s",
+    "fixed_diff_sha256": "7ace586bc90fe846ebf041554b5b6bf3ef0ad146204dd9e9fe538f2831f93aa6",
+    "primary_standards_correctness": "PASS",
+    "independent_specification": "PASS (gpt-5.6-sol)"
+  }
+}
