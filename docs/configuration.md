@@ -921,6 +921,13 @@ touched.
 
 To return to a known-good image, use `deploy/redeploy.sh` or Compose with the
 previous agent tag. Data and identity remain in the agent data volume and home roots.
+One caveat, live-verified during the #239 acceptance: an agent build older than the
+#239 fix refuses to boot while any journal — even a `Completed` one — was recorded
+against a different `DOCKER_HOST`. Before rolling such a host back after an endpoint
+change, remove the `Completed` records under `<node-secret>.runtime-images/
+{applications,helpers}/` whose `socket` is not the endpoint the older agent will use;
+they are terminal evidence with nothing left to reconcile. Leave every non-terminal
+record in place.
 Runtime journals under `<node-secret>.runtime-images/` are read by every RH-01 agent
 build (unknown fields are ignored); a pre-RH-01 agent does not read them and retires
 owner-labelled containers by name prefix at boot as it always did. The updater is unchanged by #239: its separate
