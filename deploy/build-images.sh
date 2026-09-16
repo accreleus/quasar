@@ -74,7 +74,8 @@
 #   --base-image REF        --gst-version REF        --gwd-repo URL
 #   --gwd-ref SHA           --interpipe-ref SHA      --plugins-rs-ref SHA
 #   --rust-version V        --cargo-c-version V      --cuda-pkg-version V
-#   --docker-version V      --cuda-enable 0|1        --gst-tests enabled|disabled
+#   --docker-version V      dev stage only; static Docker CLI version
+#   --cuda-enable 0|1        --gst-tests enabled|disabled
 #   --build-arg KEY=VALUE   (repeatable escape hatch for anything not listed)
 #
 #   Every override is checked against the ARGs the Dockerfile actually declares and
@@ -597,8 +598,8 @@ check_args_declared() { # check_args_declared <role> <dockerfile-abs> <KEY=VALUE
 # 2026-08-20 the four compositor/codec pins were declared TWICE in the Dockerfile --
 # build stage and runtime stage -- and a Python guard here asserted the two copies
 # agreed and that there were exactly two of them. That guard was load-bearing
-# precisely because the duplication existed; DOCKER_VERSION and CUDA_PKG_VERSION were
-# duplicated with no guard at all and could drift silently. Removing the duplication
+# precisely because the duplication existed; CUDA_PKG_VERSION was duplicated with no
+# guard at all and could drift silently. Removing the duplication
 # removes the failure mode, so the guard is now the stronger pair of assertions:
 #
 #   1. every pin in pins.env is declared EXACTLY ONCE in the Dockerfile, and

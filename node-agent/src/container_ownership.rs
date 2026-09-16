@@ -118,12 +118,6 @@ fn acquire(path: &Path) -> Result<Owner, String> {
     })
 }
 
-pub(crate) fn managed_name(name: &str) -> bool {
-    let name = name.strip_prefix('/').unwrap_or(name);
-    name.starts_with(crate::session::container::SESSION_NAME_PREFIX)
-        || name.starts_with(crate::session::audio::PULSE_NAME_PREFIX)
-}
-
 /// Inspect data is verified independently of Docker's listing filters. A label
 /// alone never authorizes deletion of an unrelated prefix; a prefix alone never
 /// authorizes deletion of another agent's or legacy unlabelled containers.

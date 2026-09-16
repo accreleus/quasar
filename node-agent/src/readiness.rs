@@ -224,9 +224,7 @@ impl ProbeEnv {
     /// `/host/etc/os-release` when the compose mount is present.
     pub fn live(nvidia: bool, nvidia_lib32_path: &str) -> Self {
         if nvidia {
-            let docker =
-                std::env::var("QUASAR_CONTAINER_RUNTIME").unwrap_or_else(|_| "docker".into());
-            crate::nvidia_volume::retry_mount_resolution(&docker);
+            crate::nvidia_volume::retry_mount_resolution();
         }
         let host_root =
             if is_containerized() || Path::new(HOST_ROOT).join("etc/os-release").exists() {

@@ -281,8 +281,8 @@ fn chown_recursive(root: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
 /// driver is active.
 ///
 /// Bounded: stops at `DU_TIMEOUT` wall time / `DU_DEPTH_CAP` depth, returning
-/// whatever accumulated so far (`container.rs`'s `output_with_timeout`
-/// discipline, #149).
+/// whatever accumulated so far — the same #149 discipline every engine call
+/// inherits from the runtime client's per-operation deadline.
 pub fn measure_home_dirs(mounts: &[String], home_root: &str) -> Option<u64> {
     let root = resolve_root(home_root)?;
     let deadline = Instant::now() + DU_TIMEOUT;

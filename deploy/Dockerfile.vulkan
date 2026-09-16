@@ -963,11 +963,10 @@ RUN dnf install -y --setopt=install_weak_deps=False \
 
 # ── Agent-INDEPENDENT half of this stage ──────────────────────────────────────
 # Everything from here down to the agent-binary COPY is keyed on the toolchain and
-# on DOCKER_VERSION only. It is above the binary on purpose (2026-08-26 layer-key
-# audit): with the binary copied first, a one-character node-agent change re-ran the
-# gst-inspect sweep, the registry drop, the entrypoint write AND a fresh network
-# download of the static Docker CLI, every time. Keep agent-keyed steps below this
-# line and pin-keyed steps above it.
+# its pins. It is above the binary on purpose (2026-08-26 layer-key audit): with
+# the binary copied first, a one-character node-agent change re-ran the
+# gst-inspect sweep, the registry drop, and the entrypoint write every time. Keep
+# agent-keyed steps below this line and pin-keyed steps above it.
 #
 # `COPY --from=build /opt/gst` stays cached across agent changes on its own merits:
 # BuildKit keys a COPY on the CONTENT of what is copied, and `build` adds nothing to
@@ -1004,31 +1003,6 @@ ENV QUASAR_HEALTH_ADDR=127.0.0.1:9091
 ENV NODE_SECRET_PATH=/var/lib/quasar-agent/node-secret
 ENV XDG_RUNTIME_DIR=/run/quasar-agent
 ENV NVIDIA_DRIVER_CAPABILITIES=all
-
-# Docker CLI — the agent launches sibling app containers via the mounted socket
-# (same static-binary install as Dockerfile.agent.prod).
-#
-# ABOVE the agent binary since 2026-08-26: this is a network download keyed on
-# DOCKER_VERSION alone, and it used to sit below the binary COPY, so every
-# node-agent edit re-fetched it. Nothing about it depends on the agent.
-ARG DOCKER_VERSION
-ARG DOCKER_CLI_SHA256_X86_64
-ARG DOCKER_CLI_SHA256_AARCH64
-# Checked before the tarball is unpacked: this binary drives the mounted host docker
-# socket, so a substituted payload is host-level code execution.
-RUN set -eux; \
-    arch="$(uname -m)"; \
-    case "$arch" in \
-      x86_64) darch=x86_64;  want="${DOCKER_CLI_SHA256_X86_64}" ;; \
-      aarch64) darch=aarch64; want="${DOCKER_CLI_SHA256_AARCH64}" ;; \
-      *) echo "unsupported arch $arch" >&2; exit 1 ;; \
-    esac; \
-    curl -fsSL "https://download.docker.com/linux/static/stable/${darch}/docker-${DOCKER_VERSION}.tgz" \
-      -o /tmp/docker.tgz; \
-    echo "${want}  /tmp/docker.tgz" | sha256sum -c -; \
-    tar -xzf /tmp/docker.tgz -C /tmp; \
-    install -m0755 /tmp/docker/docker /usr/local/bin/docker; \
-    rm -rf /tmp/docker /tmp/docker.tgz
 
 # Entrypoint wrapper — copied VERBATIM from Dockerfile.agent.prod (learned live during the
 # 2026-07-04 soak): compose deployments pass Mesa knobs as EMPTY-BUT-SET vars on the GPU path, and
@@ -1123,8 +1097,8 @@ RUN rm -rf /root/.cache/gstreamer-1.0 /home/quasar/.cache/gstreamer-1.0
 # string and would silently ship a real label key with an empty value.
 #
 # Until 2026-08-20 these repeated the build stage's defaults by hand instead, kept
-# in step by a Python guard in build-images.sh; DOCKER_VERSION and
-# CUDA_PKG_VERSION were repeated with no guard at all. Do not reintroduce a
+# in step by a Python guard in build-images.sh; CUDA_PKG_VERSION was repeated
+# with no guard at all. Do not reintroduce a
 # `=value` here — build-images.sh now REFUSES to build when a pin has more than
 # one default in this file.
 #
@@ -1134,8 +1108,7 @@ RUN rm -rf /root/.cache/gstreamer-1.0 /home/quasar/.cache/gstreamer-1.0
 # stage, and a LABEL creates a new build state, so everything below it inherited the
 # miss. Measured on devbox with an otherwise fully-cached tree: changing only
 # BUILT_AT re-ran runtime steps 6/9 through 9/9 — the gst-inspect sweep, the registry
-# drop, the Docker CLI download and the entrypoint write. Nothing that costs anything
-# may sit below this block.
+# drop, and the entrypoint write. Nothing that costs anything may sit below this block.
 ARG GST_WAYLAND_DISPLAY_REF
 ARG GST_VERSION
 ARG GST_PLUGINS_RS_REF
@@ -1184,7 +1157,8 @@ ENTRYPOINT ["/usr/local/bin/quasar-node-agent-entrypoint"]
 #      videotestsrc/waylandsink (in /opt/gst), wayland + pulse client libs.
 #   3. Base-compose agent-service image — runs the repo-built target/release binary with the repo
 #      mounted; needs the GPU runtime driver stacks + /dev/dri (freeworld VA/Vulkan, same as the
-#      runtime target) and the docker CLI to launch sibling app containers.
+#      runtime target). Its Docker CLI is developer tooling for compose and harness workflows,
+#      not a node-agent dependency.
 # Built with the same CUDA_ENABLE as every other stage — 1 by default since 2026-07-26 — so its
 # /opt/gst is identical to quasar-node-agent's, CUDA plugins included. (This line used to claim
 # CUDA_ENABLE=0; that was already false when it was written, and believing it is what made the
@@ -1194,8 +1168,8 @@ ENTRYPOINT ["/usr/local/bin/quasar-node-agent-entrypoint"]
 # option A). `build` is `COPY node-agent` + `cargo build --release`, so while `dev` was its child
 # EVERY one-character edit under node-agent/ invalidated the COPY, which invalidated the cargo
 # build, which invalidated every layer below — the rustup components, three dnf transactions
-# (RPM Fusion freeworld drivers, weston/seatd/ddcutil/vulkan-tools, avahi), and the docker CLI
-# download. Not one of those reads node-agent source; the dependency was stage ordering, not
+# (RPM Fusion freeworld drivers, weston/seatd/ddcutil/vulkan-tools, avahi), and the dev-only
+# Docker CLI download. Not one of those reads node-agent source; the dependency was stage ordering, not
 # content. `runtime` never had the defect because it is FROM the base and pulls the binary in with
 # a single trailing `COPY --from=build`. This stage now has that same shape: the environment is
 # built on the pin-keyed toolchain, and the one source-keyed thing it carries — the release binary
@@ -1254,8 +1228,8 @@ RUN dnf install -y --setopt=install_weak_deps=False avahi nss-mdns \
     && sed -i -e 's/^#*enable-dbus=.*/enable-dbus=no/' \
               -e 's/^#*disable-publishing=.*/disable-publishing=yes/' /etc/avahi/avahi-daemon.conf
 
-# Docker CLI — the agent launches sibling app containers via the mounted socket (same static-binary
-# install as the runtime stage / the retired Dockerfile.dev).
+# Docker CLI — dev-only tooling for compose and harness workflows. The runtime
+# image deliberately contains no engine CLI.
 ARG DOCKER_VERSION
 ARG DOCKER_CLI_SHA256_X86_64
 ARG DOCKER_CLI_SHA256_AARCH64
@@ -1331,8 +1305,8 @@ CMD ["bash"]
 # it. That is not the contract being weakened; it is this image never claiming to be a
 # shipped artifact.
 #
-# FROM `dev`, so it inherits the toolchain, both freeworld driver stacks, weston, the
-# docker CLI and mDNS — everything needed to run a real session and profile it.
+# FROM `dev`, so it inherits the toolchain, both freeworld driver stacks, weston,
+# dev-only Docker tooling and mDNS — everything needed to run a real session and profile it.
 #
 # Build:  deploy/build-images.sh profiling
 # Use:    docs/profiling-rust.md  (needs perf_event_paranoid <= 1 on the host,

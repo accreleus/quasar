@@ -548,8 +548,8 @@ services:
       # --shm-size for app containers (tmpfs, allocated on use; Chromium/Steam
       # need >64MB, and big Steam titles benefit from more).
       QUASAR_APP_SHM_SIZE: ${QUASAR_APP_SHM_SIZE:-1g}
-      # Graceful-stop window (docker stop -t N) before the rm -f backstop on
-      # session teardown; 0 = kill-only. See docs/configuration.md.
+      # Graceful-stop window for the runtime-API stop before the force-remove
+      # backstop on session teardown; 0 = kill-only. See docs/configuration.md.
       QUASAR_APP_STOP_TIMEOUT_SECS: ${QUASAR_APP_STOP_TIMEOUT_SECS:-10}
       # App-container network mode (docker `--network`). Default `none` keeps
       # tenant apps isolated; set `bridge` in deploy/.env for titles that need
@@ -562,8 +562,8 @@ services:
       QUASAR_APP_PGID: ${QUASAR_APP_PGID:-}
     volumes:
       # Docker socket: required for sibling-container launches (game containers,
-      # PulseAudio sidecar). The agent never dials Docker on the network;
-      # it shells out to the docker CLI via this socket.
+      # PulseAudio sidecar). The agent never dials Docker on the network; it
+      # uses the Unix-socket Engine API through this mount.
       - /var/run/docker.sock:/var/run/docker.sock
       # XDG_RUNTIME_DIR: Wayland compositor + PulseAudio sockets land here.
       # MUST be a host bind-mount (not a named volume) so that docker-out-of-docker

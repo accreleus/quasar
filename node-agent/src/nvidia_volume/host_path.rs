@@ -15,7 +15,7 @@ pub fn configured() -> bool {
     std::env::var(ENV).is_ok_and(|value| !value.is_empty())
 }
 
-pub fn resolve(_docker: &str, force: bool) -> Option<Result<PathBuf, String>> {
+pub fn resolve(force: bool) -> Option<Result<PathBuf, String>> {
     let raw = std::env::var(ENV).ok().filter(|value| !value.is_empty())?;
     let mut cache = match CACHE.lock() {
         Ok(cache) => cache,

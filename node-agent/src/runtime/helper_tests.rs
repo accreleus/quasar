@@ -65,6 +65,42 @@ struct State {
     inherited_env: Vec<String>,
     requests: Vec<String>,
     pause_first_log: Option<Arc<LogGate>>,
+    /// Pre-API siblings this engine knows about, visible only to the legacy
+    /// boot sweep: a label listing, an inspect by immutable ID, a forced remove.
+    legacy: Vec<LegacyContainer>,
+    /// The listing fails, so the sweep can prove no mutation follows.
+    refuse_legacy_list: bool,
+    /// This legacy ID's DELETE reply is dropped WITHOUT applying the removal, so
+    /// a pass that treated a lost reply as success would be caught by the next
+    /// listing still returning it.
+    lose_legacy_remove: Option<String>,
+    /// This legacy ID's DELETE succeeds but the container is still there.
+    legacy_remove_has_no_effect: Option<String>,
+    /// The engine is unreachable: every request is accepted and then reset,
+    /// which is what a restarting or wedged daemon looks like to the client.
+    unreachable: bool,
+}
+
+/// One pre-API container as the fixture engine reports it.
+#[derive(Clone)]
+struct LegacyContainer {
+    id: String,
+    name: String,
+    labels: Value,
+    /// Removed by this fixture's engine: it disappears from the listing and
+    /// inspects 404, which is the only proof of removal the sweep accepts.
+    gone: bool,
+}
+fn legacy(id: char, name: &str, labels: Value) -> LegacyContainer {
+    LegacyContainer {
+        id: std::iter::repeat_n(id, 64).collect(),
+        name: name.into(),
+        labels,
+        gone: false,
+    }
+}
+fn owner_label(owner: &str) -> Value {
+    json!({ crate::container_ownership::LABEL: owner })
 }
 struct Engine {
     state: Arc<Mutex<State>>,
@@ -181,6 +217,9 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
     }
     let mut s = state.lock().unwrap();
     s.requests.push(format!("{method} {route}"));
+    if s.unreachable {
+        return;
+    }
     let mut code = 200;
     let mut response = json!({});
     let mut raw = None;
@@ -255,6 +294,80 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
         }
     } else if method == "GET" && route == "/exec/repair-exec/json" {
         response = json!({"ID":"repair-exec","ContainerID":if s.exec_foreign { "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } else { ID },"Running":s.exec_running,"ExitCode":if s.exec_running || !s.exec_started { Value::Null } else { s.exec_exit.unwrap_or(Some(0)).map_or(Value::Null, Value::from) }});
+    } else if method == "GET" && route.starts_with("/containers/json") {
+        assert!(
+            route.contains("all=true"),
+            "the legacy sweep must see stopped containers too: {route}"
+        );
+        assert!(
+            route.contains("label") && route.contains("agent-owner"),
+            "the legacy listing must be filtered by this agent's owner label: {route}"
+        );
+        if s.refuse_legacy_list {
+            code = 500;
+            response = json!({"message":"fixture list failure"});
+        } else {
+            // Deliberately ignore the requested filter: the independent inspect
+            // check must preserve foreign, unlabelled and substring-only names
+            // even when the daemon answers with more than was asked for.
+            response = Value::Array(
+                s.legacy
+                    .iter()
+                    .filter(|container| !container.gone)
+                    .map(|container| json!({"Id":container.id,"Names":[container.name.clone()]}))
+                    .chain(
+                        s.body
+                            .is_some()
+                            .then(|| json!({"Id":ID,"Names":[format!("/{}", s.name)]})),
+                    )
+                    .collect(),
+            );
+        }
+    } else if method == "GET"
+        && route.ends_with("/json")
+        && s.legacy
+            .iter()
+            .any(|container| route.contains(&container.id))
+    {
+        let container = s
+            .legacy
+            .iter()
+            .find(|container| route.contains(&container.id))
+            .unwrap();
+        if container.gone {
+            code = 404;
+            response = json!({"message":"No such container"});
+        } else {
+            response = json!({"Id":container.id,"Name":container.name,
+                "Image":"sha256:fixture-image","Config":{"Labels":container.labels},
+                "State":{"Running":false,"Status":"exited","ExitCode":0,"OOMKilled":false}});
+        }
+    } else if method == "DELETE"
+        && s.legacy
+            .iter()
+            .any(|container| route.contains(&container.id))
+    {
+        let id = s
+            .legacy
+            .iter()
+            .find(|container| route.contains(&container.id))
+            .unwrap()
+            .id
+            .clone();
+        assert!(
+            route.contains("force=true") && route.contains("v=false"),
+            "a legacy removal may force, but never deletes volumes: {route}"
+        );
+        code = 204;
+        if s.lose_legacy_remove.as_deref() == Some(id.as_str()) {
+            s.lose_legacy_remove = None;
+            return;
+        }
+        if s.legacy_remove_has_no_effect.as_deref() != Some(id.as_str()) {
+            for container in s.legacy.iter_mut().filter(|c| c.id == id) {
+                container.gone = true;
+            }
+        }
     } else if method == "GET" && route.ends_with("/json") {
         if let Some(body) = &s.body {
             let mut mounts: Vec<Value> = body["HostConfig"]["Mounts"].as_array().into_iter().flatten().map(|mount| {
@@ -3225,7 +3338,7 @@ fn pulse_sidecar_socket_readiness_fallback_keeps_final_evidence_and_cleans() {
     std::env::set_var("NODE_SECRET_PATH", root.join("audio-owner"));
     std::env::set_var("QUASAR_PULSE_IMAGE", "quasar-agent:test");
     crate::runtime::initialize_image_state(root.join("runtime-state"));
-    let runtime = crate::session::container::ContainerRuntime::test_runtime("unused");
+    let runtime = crate::session::container::ContainerRuntime::new(false);
     for keep_running in [false, true] {
         engine.state.lock().unwrap().keep_running = keep_running;
         let session = if keep_running {
@@ -3861,4 +3974,332 @@ fn restart_retries_an_explicit_stop_intent_but_does_not_stop_unrequested_work() 
     );
     untouched.finish();
     observer.cleanup_diagnostic(id).wait().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// #239: the boot-only legacy sweep. It replaces the CLI `ps`/`inspect`/`rm -f`
+// pass, so it must keep that pass's preservation rules exactly: an owner label
+// alone never authorizes a removal, and neither does a name.
+
+/// The six shapes an older agent can leave behind. Only the first is ours.
+fn legacy_population() -> Vec<LegacyContainer> {
+    vec![
+        legacy('a', "/quasar-sess-one", owner_label("fixture-owner")),
+        legacy('b', "/quasar-sess-two", owner_label("other-agent")),
+        legacy('c', "/quasar-sess-unlabelled", json!({})),
+        legacy('d', "/other-quasar-sess-one", owner_label("fixture-owner")),
+        legacy('e', "/quasar-pulse-one", owner_label("fixture-owner")),
+        legacy(
+            'f',
+            "/quasar-sess-api-owned",
+            json!({crate::container_ownership::LABEL: "fixture-owner",
+                   "io.quasar.application-operation": "api-operation"}),
+        ),
+    ]
+}
+
+fn prefixes() -> Vec<String> {
+    vec![crate::session::container::SESSION_NAME_PREFIX.to_owned()]
+}
+
+fn deleted_ids(engine: &Engine) -> Vec<String> {
+    engine
+        .state
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter_map(|request| request.strip_prefix("DELETE /containers/"))
+        .map(|rest| rest.split('?').next().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn legacy_sweep_removes_only_the_owned_prefixed_container() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().legacy = legacy_population();
+    let outcome = engine
+        .client()
+        .retire_legacy_containers(prefixes())
+        .wait()
+        .unwrap();
+    assert_eq!(
+        outcome,
+        LegacyRetirement {
+            removed: 1,
+            preserved: 5,
+            unresolved: 0
+        }
+    );
+    assert_eq!(deleted_ids(&engine), vec!["a".repeat(64)]);
+    // A foreign owner, an unlabelled legacy container, a substring-only name, an
+    // audio sidecar and an API-owned application all survive the pass.
+    let survivors = engine.state.lock().unwrap().legacy.clone();
+    assert!(survivors
+        .iter()
+        .all(|container| container.gone == container.id.starts_with('a')));
+}
+
+#[test]
+fn legacy_sweep_lost_remove_reply_is_unresolved_and_the_next_boot_retries_it() {
+    let engine = Engine::new();
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.legacy = legacy_population();
+        state.lose_legacy_remove = Some("a".repeat(64));
+    }
+    let outcome = engine
+        .client()
+        .retire_legacy_containers(prefixes())
+        .wait()
+        .unwrap();
+    assert_eq!(
+        outcome,
+        LegacyRetirement {
+            removed: 0,
+            preserved: 5,
+            unresolved: 1
+        }
+    );
+    // Exactly one removal was attempted, and nothing else was touched.
+    assert_eq!(deleted_ids(&engine), vec!["a".repeat(64)]);
+    assert!(engine
+        .state
+        .lock()
+        .unwrap()
+        .legacy
+        .iter()
+        .all(|container| !container.gone));
+    // The next boot reconciles the same container, with no duplicate work.
+    let outcome = engine
+        .client()
+        .retire_legacy_containers(prefixes())
+        .wait()
+        .unwrap();
+    assert_eq!(outcome.removed, 1);
+    assert_eq!(outcome.unresolved, 0);
+    assert_eq!(deleted_ids(&engine).len(), 2);
+}
+
+#[test]
+fn legacy_sweep_without_proof_of_absence_does_not_remove_twice() {
+    let engine = Engine::new();
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.legacy = vec![legacy(
+            'a',
+            "/quasar-sess-one",
+            owner_label("fixture-owner"),
+        )];
+        state.legacy_remove_has_no_effect = Some("a".repeat(64));
+    }
+    let outcome = engine
+        .client()
+        .retire_legacy_containers(prefixes())
+        .wait()
+        .unwrap();
+    assert_eq!(
+        outcome,
+        LegacyRetirement {
+            removed: 0,
+            preserved: 0,
+            unresolved: 1
+        }
+    );
+    assert_eq!(deleted_ids(&engine).len(), 1);
+}
+
+#[test]
+fn legacy_sweep_listing_failure_is_an_error_without_any_mutation() {
+    let engine = Engine::new();
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.legacy = legacy_population();
+        state.refuse_legacy_list = true;
+    }
+    assert_eq!(
+        engine
+            .client()
+            .retire_legacy_containers(prefixes())
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Engine
+    );
+    assert!(deleted_ids(&engine).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// #239 criterion 3: observation is inspect-polling by exact identity, so a gap
+// in engine reachability must reconcile from inspection evidence rather than be
+// mistaken for an application exit. There is deliberately no event stream to
+// resubscribe to.
+
+/// The ENGINE-side half of the observation gap: what the daemon is asked for, and
+/// what it is never asked for, while an application exits during an outage. The
+/// caller-side half — that the observer loop publishes no exit during the gap and
+/// exactly one afterwards — is
+/// `session::source::tests::the_observer_rides_out_an_engine_gap_and_publishes_the_true_exit_once`.
+#[test]
+fn application_observation_survives_an_engine_gap_and_reports_the_true_exit_once() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let client = engine.client();
+    let id = client
+        .start_application(ApplicationRequest {
+            operation: "session-fixture-observation-gap".into(),
+            name: "quasar-sess-fixture-observation-gap".into(),
+            image: "quasar-app:test".into(),
+            ..Default::default()
+        })
+        .wait()
+        .unwrap();
+    // The engine goes away, and the application exits while it is away — the
+    // exit no observer was watching for.
+    {
+        let mut state = engine.state.lock().unwrap();
+        state.unreachable = true;
+        state.keep_running = false;
+        state.running = false;
+        state.exited = true;
+        state.exit = Some(7);
+    }
+    for _ in 0..3 {
+        assert_eq!(
+            client
+                .observe_application(id.clone())
+                .wait()
+                .unwrap_err()
+                .kind,
+            ErrorKind::Unavailable,
+            "an unreachable engine is never terminal application evidence"
+        );
+    }
+    engine.state.lock().unwrap().unreachable = false;
+    let observed = client.observe_application(id.clone()).wait().unwrap();
+    assert_eq!(observed.exit_code, Some(7));
+    // The exit is derived from inspection once and then persisted: replaying the
+    // observation asks the engine for nothing more and cannot report it twice.
+    let inspections = engine.requests("GET /containers/");
+    assert_eq!(client.observe_application(id).wait().unwrap(), observed);
+    assert_eq!(engine.requests("GET /containers/"), inspections);
+    // Observation across the whole gap started and stopped nothing.
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/start")), 1);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 0);
+    assert!(deleted_ids(&engine).is_empty());
+}
+
+/// #239 criterion 4: the agent is killed with a cleanup obligation journalled
+/// but unproven, and comes back to a foreign container sharing its name prefix
+/// and a managed home full of user data. Boot must finish exactly its own
+/// obligation, and must still be the same owner afterwards — the create label
+/// and the label the legacy listing filters on are the same token on both sides
+/// of the restart. Preservation of the on-disk owner LEASE is not provable here
+/// (this fixture injects `diagnostic_owner` and never reads the file); it is
+/// `container_ownership::tests::ownership_survives_restart_and_distinct_agents_are_isolated`
+/// and the live interruption exercise. (The uncertain-mutation half — a lost stop
+/// reply reconciled by the same operation — is
+/// `application_lost_stop_reply_retries_the_same_durable_stopping_intent` and
+/// `application_cleanup_retries_after_a_runtime_restart_without_touching_active_work`.)
+#[test]
+fn boot_finishes_pending_cleanup_without_touching_a_foreign_sibling_or_the_home() {
+    let engine = Engine::new();
+    let root = engine
+        .config
+        .image_state_path
+        .as_ref()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_owned();
+    let home = root.join("homes/agent-1a2b3c4d-5e6f7a8b");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("save.dat"), b"user data").unwrap();
+    engine.state.lock().unwrap().legacy = vec![legacy(
+        'b',
+        "/quasar-sess-foreign",
+        owner_label("another-agent"),
+    )];
+    let id = engine
+        .client()
+        .start_application(ApplicationRequest {
+            operation: "session-fixture-boot-cleanup".into(),
+            name: "quasar-sess-fixture-boot-cleanup".into(),
+            image: "quasar-app:test".into(),
+            typed_mounts: vec![ApplicationMount::Bind {
+                source: home.to_string_lossy().into_owned(),
+                target: "/home/quasar".into(),
+                read_only: false,
+                consistency: None,
+            }],
+            ..Default::default()
+        })
+        .wait()
+        .unwrap();
+    let created_owner = engine.state.lock().unwrap().body.as_ref().unwrap()["Labels"]
+        [crate::container_ownership::LABEL]
+        .as_str()
+        .expect("the create carried an owner label")
+        .to_owned();
+    // SIGKILL between the remove and its reply: the obligation is durable, the
+    // outcome is not.
+    engine.state.lock().unwrap().lose_remove = true;
+    assert_eq!(
+        engine
+            .client()
+            .cleanup_application(id)
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    // Boot, in the order agent.rs performs it.
+    let booted = engine.client();
+    booted.recover_application_cleanup().wait().unwrap();
+    booted.retire_applications().wait().unwrap();
+    assert_eq!(
+        booted.retire_legacy_containers(prefixes()).wait().unwrap(),
+        LegacyRetirement {
+            removed: 0,
+            preserved: 1,
+            unresolved: 0
+        }
+    );
+    // Exactly the owned container, exactly once.
+    assert_eq!(deleted_ids(&engine), vec![ID.to_owned()]);
+    assert!(engine
+        .state
+        .lock()
+        .unwrap()
+        .legacy
+        .iter()
+        .all(|container| !container.gone));
+    assert_eq!(std::fs::read(home.join("save.dat")).unwrap(), b"user data");
+    // Same owner on both sides of the restart: the token the pre-kill create
+    // labelled the container with is the token the post-boot legacy listing
+    // filtered on. A regenerated identity would orphan every prior container.
+    let requests = engine.state.lock().unwrap().requests.clone();
+    let listing = requests
+        .iter()
+        .find(|request| request.starts_with("GET /containers/json"))
+        .expect("the legacy sweep listed containers");
+    assert!(
+        listing.contains(&urlencoding(&format!(
+            "{}={created_owner}",
+            crate::container_ownership::LABEL
+        ))),
+        "the post-boot listing filtered on a different owner than the create labelled: \
+         {created_owner} vs {listing}"
+    );
+}
+
+/// The subset of percent-encoding bollard applies to a filter's JSON value.
+fn urlencoding(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            '.' | '-' | '_' | '~' | '0'..='9' | 'a'..='z' | 'A'..='Z' => c.to_string(),
+            other => format!("%{:02X}", other as u8),
+        })
+        .collect()
 }

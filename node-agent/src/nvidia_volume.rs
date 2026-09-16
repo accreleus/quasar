@@ -261,8 +261,8 @@ pub fn mount_resolution_error() -> Option<String> {
 
 /// Recheck an explicit bind immediately before launching an app: a host directory
 /// replaced after startup must not silently become a different driver volume.
-pub fn validate_host_path_for_launch(docker: &str) -> Result<(), String> {
-    if let Some(result) = host_path::resolve(docker, true) {
+pub fn validate_host_path_for_launch() -> Result<(), String> {
+    if let Some(result) = host_path::resolve(true) {
         match result {
             Ok(_) => set_mount_error(None),
             Err(error) => {
@@ -303,7 +303,7 @@ fn set_current(info: Option<VolumeInfo>) {
 }
 
 /// Retry a transient Docker inspection failure without restarting or re-downloading.
-pub fn retry_mount_resolution(docker: &str) {
+pub fn retry_mount_resolution() {
     let explicit = host_path::configured();
     let info = current();
     if !explicit
@@ -313,7 +313,7 @@ pub fn retry_mount_resolution(docker: &str) {
     {
         return;
     }
-    let (host, name) = locate_host_path(docker);
+    let (host, name) = locate_host_path();
     let Some(info) = info else {
         return;
     };
@@ -342,8 +342,8 @@ pub fn enabled() -> bool {
 
 /// Prefer a validated explicit host bind when supplied. Otherwise discover the
 /// agent's structured Docker mount, preserving named-volume injection by default.
-pub fn locate_host_path(docker: &str) -> (Option<PathBuf>, Option<String>) {
-    if let Some(result) = host_path::resolve(docker, false) {
+pub fn locate_host_path() -> (Option<PathBuf>, Option<String>) {
+    if let Some(result) = host_path::resolve(false) {
         return match result {
             Ok(host) => {
                 set_mount_error(None);
@@ -525,12 +525,12 @@ pub fn decide(
     Ok(())
 }
 
-/// Adopt an already-provisioned volume at process start: one file read, one `docker
-/// inspect` on a hit, never a download.
+/// Adopt an already-provisioned volume at process start: one file read, one owned
+/// inspect on a hit, never a download.
 ///
 /// MUST run before `gst::init` — the fresh process has to set its EGL/Vulkan discovery
 /// env before anything touches EGL. Also the steady-state path on every later boot.
-pub fn adopt_current(docker: &str) -> Option<Manifest> {
+pub fn adopt_current() -> Option<Manifest> {
     let volume = PathBuf::from(VOLUME_MOUNT);
     if !volume.is_dir() {
         return None;
@@ -546,7 +546,7 @@ pub fn adopt_current(docker: &str) -> Option<Manifest> {
                 lib32 = m.lib32_count,
                 "adopting the Quasar-provisioned NVIDIA driver volume for this process"
             );
-            publish(&volume, m.clone(), docker);
+            publish(&volume, m.clone());
             set_status(Status::Provisioned(m.clone()));
             Some(m)
         }
@@ -575,11 +575,11 @@ pub fn adopt_current(docker: &str) -> Option<Manifest> {
 }
 
 /// Run the provisioner. Blocking — call it on a dedicated thread.
-pub fn provision_blocking(nvidia_present: bool, gap: Gap, docker: &str) -> Outcome {
+pub fn provision_blocking(nvidia_present: bool, gap: Gap) -> Outcome {
     let volume = PathBuf::from(VOLUME_MOUNT);
     let volume_mounted = volume.is_dir();
     if nvidia_present && gap.any() && enabled() {
-        let (host, name) = locate_host_path(docker);
+        let (host, name) = locate_host_path();
         if host.is_none() && name.is_none() {
             let error = mount_resolution_error().unwrap_or_else(|| format!("Cannot verify a persistent NVIDIA driver mount. Check Docker socket and mount inspection, or set {HOST_PATH_ENV} to the host directory mounted at {VOLUME_MOUNT}; provisioning retries automatically."));
             set_status(Status::Failed(error.clone()));
@@ -601,7 +601,7 @@ pub fn provision_blocking(nvidia_present: bool, gap: Gap, docker: &str) -> Outco
         tracing::debug!(target: T, "driver-volume provisioning not needed: {reason}");
         // Not provisioning still has to publish a CURRENT volume, so the agent and app
         // containers consume what a previous run created.
-        publish_if_current(&volume, &state, docker);
+        publish_if_current(&volume, &state);
         return Outcome::NotNeeded(reason);
     }
 
@@ -611,7 +611,7 @@ pub fn provision_blocking(nvidia_present: bool, gap: Gap, docker: &str) -> Outco
             version = %m.driver_version,
             "driver volume already provisioned for the loaded kernel module — reusing it"
         );
-        publish_if_current(&volume, &state, docker);
+        publish_if_current(&volume, &state);
         return Outcome::AlreadyCurrent(m.clone());
     }
 
@@ -658,7 +658,7 @@ pub fn provision_blocking(nvidia_present: bool, gap: Gap, docker: &str) -> Outco
                 "driver volume provisioned successfully"
             );
             set_status(Status::Provisioned(manifest.clone()));
-            publish(&volume, manifest.clone(), docker);
+            publish(&volume, manifest.clone());
             Outcome::Provisioned {
                 restart_required: gap.egl,
                 manifest,
@@ -679,15 +679,15 @@ pub fn provision_blocking(nvidia_present: bool, gap: Gap, docker: &str) -> Outco
     }
 }
 
-fn publish_if_current(volume: &Path, state: &VolumeState, docker: &str) {
+fn publish_if_current(volume: &Path, state: &VolumeState) {
     if let Some(m) = state.usable() {
-        publish(volume, m.clone(), docker);
+        publish(volume, m.clone());
         set_status(Status::Provisioned(m.clone()));
     }
 }
 
-fn publish(volume: &Path, manifest: Manifest, docker: &str) {
-    let (host, name) = locate_host_path(docker);
+fn publish(volume: &Path, manifest: Manifest) {
+    let (host, name) = locate_host_path();
     match &host {
         Some(p) => tracing::info!(
             target: T,

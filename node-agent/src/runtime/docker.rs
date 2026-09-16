@@ -10,6 +10,7 @@ pub(super) use inspection::{
     engine_storage, inspect_container, inspect_image_metadata, live_containers,
 };
 pub(super) mod helpers;
+pub(super) mod legacy;
 pub(super) use build::build as build_image;
 
 fn classify(error: Error) -> RuntimeError {

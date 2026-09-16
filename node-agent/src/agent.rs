@@ -182,7 +182,7 @@ pub async fn run(cfg: Config) {
                         "previous audio cleanup remains journalled; retry runtime recovery when Docker is available");
                 }
             },
-            || runtime.sweep_orphans(&[crate::session::container::SESSION_NAME_PREFIX]),
+            legacy_container_sweep,
         ) else {
             // Do not touch audio or use the legacy sweep while an API-owned
             // application may still own a managed home.
@@ -249,7 +249,7 @@ pub async fn run(cfg: Config) {
     // here) and the steady state on a provisioned host.
     let (runtime, nvidia_lib32_probed) = offload_probe(move || {
         if runtime.is_nvidia() {
-            crate::nvidia_volume::adopt_current(runtime.bin());
+            crate::nvidia_volume::adopt_current();
             crate::nvidia_volume::apply_process_env();
             crate::cuda_runtime::adopt_current();
         }
@@ -481,7 +481,6 @@ fn spawn_nvidia_volume_provisioner(runtime: &ContainerRuntime, nvidia_lib32_prob
     if !runtime.is_nvidia() {
         return;
     }
-    let docker = runtime.bin().to_string();
     let nvidia_lib32_probed = nvidia_lib32_probed.to_string();
     std::thread::Builder::new()
         .name("quasar-nvvol".into())
@@ -493,7 +492,7 @@ fn spawn_nvidia_volume_provisioner(runtime: &ContainerRuntime, nvidia_lib32_prob
             if !gap.any() {
                 return;
             }
-            match crate::nvidia_volume::provision_blocking(true, gap, &docker) {
+            match crate::nvidia_volume::provision_blocking(true, gap) {
                 crate::nvidia_volume::Outcome::Provisioned {
                     restart_required: true,
                     ..
@@ -3311,6 +3310,44 @@ where
     }
     retire_audio();
     Some(sweep_legacy())
+}
+
+/// The boot-only legacy sweep: remove this agent's own pre-API `quasar-sess-*`
+/// siblings through the runtime API, and report how many were removed. Foreign,
+/// unlabelled and API-owned containers are preserved and only counted — they are
+/// somebody else's to reap. A listing failure is logged and the boot continues,
+/// exactly as the CLI sweep's `ps` failure did: a legacy container left behind is
+/// retried next boot, while refusing to start would strand the host.
+fn legacy_container_sweep() -> usize {
+    match crate::runtime::configured().and_then(|api| {
+        api.retire_legacy_containers(vec![
+            crate::session::container::SESSION_NAME_PREFIX.to_owned()
+        ])
+        .wait()
+    }) {
+        Ok(outcome) => {
+            if outcome.preserved > 0 || outcome.unresolved > 0 {
+                info!(
+                    token = "legacy-container-sweep-summary",
+                    removed = outcome.removed,
+                    preserved = outcome.preserved,
+                    unresolved = outcome.unresolved,
+                    "startup legacy sweep finished; preserved containers this agent cannot \
+                     prove it owns were left for operator review"
+                );
+            }
+            outcome.removed
+        }
+        Err(error) => {
+            warn!(
+                token = "legacy-container-list-failed",
+                %error,
+                "the startup legacy container listing failed; pre-API containers from an \
+                 older agent may remain and will be retried on the next boot"
+            );
+            0
+        }
+    }
 }
 
 /// Aborts the process-lifetime application cleanup maintenance task on orderly shutdown.

@@ -978,68 +978,22 @@ impl AppSource {
             // Re-enter the session span so this thread's lines carry session=<id>.
             let _log_span = log_span.enter();
             let sink_name = thread_sink_name;
-            // A bounded runtime observation is not terminal evidence. Keep
-            // observing a silent, healthy game after its per-request deadline;
-            // only a daemon answer for a stopped container becomes an exit.
-            let status = loop {
-                if observer.stopped_intentionally() {
-                    return;
-                }
-                match crate::runtime::configured()
-                    .and_then(|api| api.observe_application(application.clone()).wait())
-                {
-                    Ok(result) if result.oom_killed == Some(true) => {
-                        for line in result.stdout.lines().chain(result.stderr.lines()) {
-                            observer.record_line(line.to_owned());
-                        }
-                        break AppExitStatus::OomKilled;
-                    }
-                    Ok(result) => {
-                        for line in result.stdout.lines().chain(result.stderr.lines()) {
-                            observer.record_line(line.to_owned());
-                        }
-                        break result
-                            .exit_code
-                            .and_then(|code| i32::try_from(code).ok())
-                            .map(AppExitStatus::Code)
-                            .unwrap_or(AppExitStatus::Unknown);
-                    }
-                    Err(error) if retry_application_observation(error.kind) => {
-                        // Readiness needs evidence while a game is still alive.
-                        // This bounded read is observational and cannot alter its
-                        // lifecycle; final logs replace it on terminal observe.
-                        if let Ok(api) = crate::runtime::configured() {
-                            if let Ok(tail) = api.application_log_tail(application.clone()).wait() {
-                                for line in tail.stdout.lines().chain(tail.stderr.lines()) {
-                                    observer.record_line(line.to_owned());
-                                }
-                            }
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(250));
-                        continue;
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            token = "application-wait-failed",
-                            "runtime application wait failed: {error}"
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(250));
-                        continue;
-                    }
-                }
-            };
-            // A deliberate stop (swap teardown, session stop) sets the shared `removed`
-            // flag BEFORE the engine sees the stop (`RunningContainer::stop`), so if it is
-            // set here the exit just observed is our own teardown, not an app failure.
-            // `publish` discards it; and it can only ever reach THIS generation's slot.
-            if observer.publish(status) {
-                tracing::info!("source '{sink_name}': app container exited: {status:?}");
-            } else {
-                tracing::debug!(
-                    "source '{sink_name}': app container exit observed after our own teardown \
-                     (status={status:?}) — ignoring, not a liveness failure"
-                );
-            }
+            let observed = application.clone();
+            let tailed = application;
+            observe_until_exit(
+                &observer,
+                &sink_name,
+                || {
+                    crate::runtime::configured()
+                        .and_then(|api| api.observe_application(observed.clone()).wait())
+                },
+                || {
+                    crate::runtime::configured()
+                        .and_then(|api| api.application_log_tail(tailed.clone()).wait())
+                        .ok()
+                },
+                || std::thread::sleep(OBSERVATION_RETRY_DELAY),
+            );
         }) {
             tracing::warn!(
                 token = "app-liveness-waiter-spawn-failed",
@@ -1066,6 +1020,83 @@ impl AppSource {
     }
 }
 
+/// How long the observer waits before re-inspecting after a non-terminal answer.
+/// The engine is polled by exact identity — there is no event stream to resubscribe
+/// to — so this is also the reconciliation interval after an engine gap.
+const OBSERVATION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The observer loop for one generation, with its engine calls injected.
+///
+/// A bounded runtime observation is not terminal evidence: keep observing a silent,
+/// healthy game past its per-request deadline, and treat every error — including a
+/// daemon that has gone away entirely — as "ask again", never as an exit. Only a
+/// verified `ApplicationResult` ends the loop, and it publishes exactly once into this
+/// generation's slot, after its final logs are recorded.
+///
+/// `observe` and `log_tail` are the RuntimeClient calls in production. `stopped` is
+/// checked before every observation so our own teardown ends the loop without
+/// publishing anything. What this function cannot show — that no observation ever
+/// asks the engine to start or stop the workload — is proven engine-side by
+/// `runtime::helper_tests::application_observation_survives_an_engine_gap_and_reports_the_true_exit_once`.
+fn observe_until_exit(
+    observer: &GenerationObserver,
+    sink_name: &str,
+    mut observe: impl FnMut() -> Result<crate::runtime::ApplicationResult, crate::runtime::RuntimeError>,
+    mut log_tail: impl FnMut() -> Option<crate::runtime::ApplicationLogTail>,
+    mut backoff: impl FnMut(),
+) {
+    let status = loop {
+        if observer.stopped_intentionally() {
+            return;
+        }
+        match observe() {
+            Ok(result) => {
+                for line in result.stdout.lines().chain(result.stderr.lines()) {
+                    observer.record_line(line.to_owned());
+                }
+                if result.oom_killed == Some(true) {
+                    break AppExitStatus::OomKilled;
+                }
+                break result
+                    .exit_code
+                    .and_then(|code| i32::try_from(code).ok())
+                    .map(AppExitStatus::Code)
+                    .unwrap_or(AppExitStatus::Unknown);
+            }
+            Err(error) if retry_application_observation(error.kind) => {
+                // Readiness needs evidence while a game is still alive. This bounded
+                // read is observational and cannot alter its lifecycle; final logs
+                // replace it on terminal observe.
+                if let Some(tail) = log_tail() {
+                    for line in tail.stdout.lines().chain(tail.stderr.lines()) {
+                        observer.record_line(line.to_owned());
+                    }
+                }
+                backoff();
+            }
+            Err(error) => {
+                tracing::warn!(
+                    token = "application-wait-failed",
+                    "runtime application wait failed: {error}"
+                );
+                backoff();
+            }
+        }
+    };
+    // A deliberate stop (swap teardown, session stop) sets the shared `removed` flag
+    // BEFORE the engine sees the stop (`RunningContainer::stop`), so if it is set here
+    // the exit just observed is our own teardown, not an app failure. `publish`
+    // discards it; and it can only ever reach THIS generation's slot.
+    if observer.publish(status) {
+        tracing::info!("source '{sink_name}': app container exited: {status:?}");
+    } else {
+        tracing::debug!(
+            "source '{sink_name}': app container exit observed after our own teardown \
+             (status={status:?}) — ignoring, not a liveness failure"
+        );
+    }
+}
+
 impl Drop for AppSource {
     fn drop(&mut self) {
         self.teardown();
@@ -1075,10 +1106,10 @@ impl Drop for AppSource {
 #[cfg(test)]
 mod tests {
     use super::{
-        app_presented_since_launch, retry_application_observation, source_commit_advanced,
-        GenerationObservation,
+        app_presented_since_launch, observe_until_exit, retry_application_observation,
+        source_commit_advanced, GenerationObservation,
     };
-    use crate::runtime::ErrorKind;
+    use crate::runtime::{ApplicationResult, ErrorKind, RuntimeError};
     use crate::session::container::AppExitStatus;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -1174,6 +1205,79 @@ mod tests {
                 "{kind:?} is missing terminal evidence and must leave a live app alone"
             );
         }
+    }
+
+    /// The engine goes away mid-session and the application exits during the gap.
+    /// There is no event stream to resubscribe to, so the observer must keep asking
+    /// and reconcile the true exit from the first answer it gets back — publishing
+    /// nothing meanwhile, and exactly once afterwards. Nothing in this loop asks the
+    /// engine to start or stop anything; that half is proven engine-side by
+    /// `runtime::helper_tests::application_observation_survives_an_engine_gap_and_reports_the_true_exit_once`.
+    #[test]
+    fn the_observer_rides_out_an_engine_gap_and_publishes_the_true_exit_once() {
+        let mut generation = GenerationObservation::new();
+        let observer = generation.observer(Arc::new(AtomicBool::new(false)));
+        let observations = std::cell::Cell::new(0usize);
+        let gap = std::cell::Cell::new(0usize);
+        observe_until_exit(
+            &observer,
+            "gap-source",
+            || {
+                observations.set(observations.get() + 1);
+                if observations.get() <= 3 {
+                    // Each failed answer is also the runner's chance to see there is
+                    // still no exit: a published error would end the session here.
+                    assert_eq!(generation.take_exit(), None, "an engine gap is not an exit");
+                    return Err(RuntimeError::from(ErrorKind::Unavailable));
+                }
+                assert_eq!(observations.get(), 4, "observed after the terminal result");
+                Ok(ApplicationResult {
+                    exit_code: Some(7),
+                    oom_killed: Some(false),
+                    stdout: "last words".into(),
+                    stderr: String::new(),
+                })
+            },
+            || {
+                gap.set(gap.get() + 1);
+                None
+            },
+            || {},
+        );
+        assert_eq!(
+            observations.get(),
+            4,
+            "the terminal answer must end the loop"
+        );
+        assert_eq!(
+            gap.get(),
+            3,
+            "each gap observation still feeds readiness a tail"
+        );
+        assert_eq!(generation.take_exit(), Some(AppExitStatus::Code(7)));
+        assert_eq!(
+            generation.take_exit(),
+            None,
+            "take semantics: reported once"
+        );
+        assert_eq!(generation.log_tail(), vec!["last words"]);
+    }
+
+    /// The same loop against our OWN teardown: the marker is set before the engine
+    /// sees the stop, so the observer must leave without asking or publishing.
+    #[test]
+    fn the_observer_publishes_nothing_once_our_own_teardown_has_begun() {
+        let mut generation = GenerationObservation::new();
+        let removed = Arc::new(AtomicBool::new(true));
+        let observer = generation.observer(removed);
+        observe_until_exit(
+            &observer,
+            "stopped-source",
+            || panic!("an intentional stop must not observe again"),
+            || None,
+            || panic!("no backoff after an intentional stop"),
+        );
+        assert_eq!(generation.take_exit(), None);
     }
 
     #[test]

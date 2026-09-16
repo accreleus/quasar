@@ -754,11 +754,15 @@ they never bypass the #68 emergency descent.
 ## Node agent — app container & runtime
 
 
-On the runtime-API initiative branch, engine discovery, image inspection, assignment
-pulls and managed-image pull/build/removal use Bollard behind Quasar-owned types. Other runtime operations and the Go
-updater retain their existing implementations until their migration tickets land.
-There is no API-to-CLI fallback. A failed inspection leaves managed image records
-unchanged rather than marking images absent.
+Every node-agent runtime operation uses the Docker Engine API over its Unix socket
+through Bollard and Quasar-owned types: discovery; image presence, pull, build and
+removal; application launch, observation, stop and cleanup; the audio sidecar;
+diagnostic and driver helpers; warm-up metadata; home liveness; engine storage; and
+the startup legacy sweep. The runtime image contains neither a `docker` nor a
+`podman` executable. There is no API-to-CLI fallback and users have no raw engine
+passthrough. An administrator or operator who needs raw engine access uses the
+host's own Docker CLI, outside the agent. A failed inspection leaves managed image
+records unchanged rather than marking images absent.
 
 Discovery reports the engine name/version and selected API version. The inspection
 contract accepts API 1.40 through the pinned client's ceiling (1.53), intersected
@@ -771,11 +775,14 @@ have a ten-minute budget, catalog pulls thirty minutes and removals one minute.
 The existing catalog queue still admits two simultaneous pulls/builds, serializes
 each image ID and retains only its latest pending replacement.
 
-The API uses the Unix socket at `DOCKER_HOST`, defaulting to the standard mounted
-Docker socket. Nonempty `DOCKER_CONTEXT`, `DOCKER_TLS`, `DOCKER_TLS_VERIFY` or
-`DOCKER_API_VERSION` overrides are rejected instead of silently ignored. A saved nondefault Docker CLI context is also rejected unless an explicit Unix
-`DOCKER_HOST` selects the engine. Environment
-configuration is read once per agent process; restart the agent after changing it.
+The API uses `DOCKER_HOST`, the only endpoint knob. It must be a `unix://` absolute
+path and defaults to `unix:///var/run/docker.sock`; the compose file mounts the host
+socket at that path. Nonempty `DOCKER_CONTEXT`, `DOCKER_TLS`, `DOCKER_TLS_VERIFY` or
+`DOCKER_API_VERSION` overrides are rejected instead of silently ignored. A saved
+non-default Docker CLI context is also rejected: an operator who switched context
+expects it honoured, and the agent cannot do that, so it refuses rather than silently
+talking to another engine. Environment configuration is read once per agent process;
+restart the agent after changing it.
 
 Image mutations run independently of the control-plane connection. Progress is a
 single replaceable snapshot (at most 1,024 bounded layer IDs contribute), and a
@@ -786,10 +793,8 @@ heartbeats if the connection remains attached but its channel fills. Image worke
 never wait for that channel. Assignment preparation is retained through
 `session_start`: the runner waits for verified success, fails on preparation errors
 and can stop observing promptly if the session is cancelled. API-prepared assignment launches
-use `--pull=never` so they cannot bypass an uncertain API pull. Swap, warm-up and
-standalone launch callers retain their existing CLI policy until their migration
-slices; this is an explicit caller boundary, not an error-triggered fallback.
-Local images are reused without a registry request. Removal checks running and
+require the image to be present locally, so they cannot bypass an uncertain API pull. Local images are
+reused without a registry request. Removal checks running and
 stopped container references, uses non-forced deletion, avoids parent pruning and
 verifies that the requested reference is absent. External tools can still race
 host mutations; the daemon's own conflict checks remain the final guard.
@@ -812,9 +817,9 @@ removal target cannot authorize deleting its replacement. Those cases fail with
 `image operation outcome unknown` instead of repeating the mutation.
 
 Installation metadata, image environment, engine storage information and live
-container mounts are read through the same runtime API. Missing Compose labels
-leave the corresponding Compose facts unknown; Quasar does not infer a project or updater from
-container names. The configured image reference and the running image ID remain
+container mounts are read through the same runtime API. Missing Compose labels leave
+the corresponding Compose facts unknown; Quasar does not infer a project or updater
+from container names. The configured image reference and the running image ID remain
 separate facts.
 
 Docker mount sources and its storage root are **daemon-host paths**. A containerized
@@ -884,6 +889,30 @@ work might still be active. A daemon restart is one way to establish that no old
 request remains; it is not performed automatically. This conservative recovery
 path preserves uncertainty across agent restarts without adding a compose setting.
 
+### Runtime endpoint, migration and recovery
+
+For an existing host, the socket mount remains unchanged; a host using the default
+socket needs no compose change. Podman operators may point `DOCKER_HOST` at Podman's
+Docker-compatible Unix socket, but that configuration is not certified.
+
+At boot, after discovering the engine, the agent first retries journalled diagnostic
+helper cleanup, then retries journalled application cleanup and retires every
+non-terminal application record, then retires journalled audio sidecars, and only
+then performs the legacy sweep of owner-labelled pre-API `quasar-sess-*` containers.
+Application retirement is fail-closed: when it cannot be proven the agent exits
+before touching audio, the legacy sweep or the control plane, and the supervisor
+restarts it. Diagnostic and audio recovery failures are logged and retried by later
+maintenance; an unresolved legacy removal is logged and retried on the next boot.
+Foreign or unlabelled containers, user homes, and the node identity are never
+touched.
+
+To return to a known-good image, use `deploy/redeploy.sh` or Compose with the
+previous agent tag. Data and identity remain in the agent data volume and home roots.
+Runtime journals under `<node-secret>.runtime-images/` are read by every RH-01 agent
+build (unknown fields are ignored); a pre-RH-01 agent does not read them and retires
+owner-labelled containers by name prefix at boot as it always did. The updater is unchanged by #239: its separate
+image retains its own Docker CLI and Compose workflow.
+
 For a future rootless configuration, the API endpoint is the socket visible inside
 the agent, while bind-mount source paths belong to the daemon host. Socket access,
 subordinate UID/GID mappings, supplementary groups and persistent-home ownership
@@ -899,14 +928,14 @@ app's catalog `runtime_spec` (image/args/env/mounts/gpu) is used instead.
 
 | Variable | Default | Values / notes |
 |---|---|---|
-| `QUASAR_CONTAINER_RUNTIME` | `docker` | CLI for callers still awaiting API migration. This branch validates Docker; migrated runtime API operations require the Docker selection. Changing this to `podman` does not establish Quasar Podman support. |
-| `DOCKER_HOST` | `unix:///var/run/docker.sock` | Explicit Unix engine endpoint shared by migrated runtime API operations and remaining Docker CLI callers. The socket must be mounted and accessible inside the agent. TCP, SSH, Docker contexts, TLS overrides and forced API-version overrides are not supported by this migration slice. |
+| `QUASAR_CONTAINER_RUNTIME` | retired (#239) | Ignored. If set, startup emits `runtime-cli-knob-retired`; select the engine only with `DOCKER_HOST`. |
+| `DOCKER_HOST` | `unix:///var/run/docker.sock` | The only endpoint knob. A `unix://` absolute path to the engine socket, mounted and accessible inside the agent; the default compose file mounts the host socket at this path. TCP, SSH, Docker contexts, TLS overrides and forced API-version overrides are rejected. |
 | `QUASAR_CONTAINER_NETWORK` | `none` | Host-wide fallback `--network` for app containers, applied only when the app itself states none. **Prefer the per-app knob below** — the network is an app requirement, so setting it here to fix one title (Steam sign-in/downloads) opens the network for every app on the host. Accepted: `none` \| `bridge` \| `host`; anything else fails the session with a named error rather than being handed to the runtime. **This is the only place `host` can be selected**, deliberately: it is set by the operator of one specific machine and travels nowhere. `--network host` removes the container's network namespace — the app then reaches every service on host loopback (control plane, Postgres, any admin-only port) and can bind host ports — so it is a host-administration decision, not an app property. |
 | *(per-app)* `runtime_spec.network` / preset `network` | inherit | Not an env var — the per-app container network (first-run experience §S2). Resolved at launch as **app `runtime_spec.network` → its runtime preset's `network` column → `QUASAR_CONTAINER_NETWORK` → `none`**. Accepted at every layer: `""` (inherit) \| `none` \| `bridge`. **`host` is refused here even though the env knob above accepts it** — these values are portable (a preset is materialized from a catalog image manifest authored elsewhere), so an app-authored `host` would dissolve container network isolation on every host that installs the image. A rejected value is a 400 from the admin preset API, a failed image install from a manifest `runtime` block, a failed launch from an app's `runtime_spec`, and a failed session at the agent. Steam's catalog image declares `bridge` because its first boot must download `steamui.so` — without it the app clean-exits and the session surfaces as "media path interrupted" (#463). |
 | `QUASAR_APP_PUID` | unset | Run-as **user** id for app containers, forwarded as `PUID` (not docker `--user`, which would bypass the images' root init). The quasar-images base entrypoint starts as root, then drops to `PUID`/`PGID`. Unset ⇒ image default (unchanged). Unraid convention: `99`. An app-catalog `PUID` in the app's `runtime_spec.env` overrides this host default. |
 | `QUASAR_APP_PGID` | unset | Run-as **group** id for app containers, forwarded as `PGID` (see `QUASAR_APP_PUID`). Unraid convention: `100`. |
 | `QUASAR_APP_SHM_SIZE` | `1g` | `--shm-size` for app containers. Docker's 64 MB default breaks Chromium-embedding apps (Steam's UI renders black/flashing on failed GPU command buffers). shm is tmpfs — allocated on use, so the roomy default is free for small apps. |
-| `QUASAR_APP_STOP_TIMEOUT_SECS` | `10` | Graceful-stop window for app containers: session teardown runs `docker stop -t N` (SIGTERM, SIGKILL after N s) before the `rm -f` backstop, so apps can exit cleanly (Steam otherwise marks its install unclean and re-verifies every executable checksum on the next launch, ~9 s). `0` restores kill-only teardown. Well-behaved apps exit on TERM immediately, so the window costs nothing for them. |
+| `QUASAR_APP_STOP_TIMEOUT_SECS` | `10` | Graceful-stop window for app containers: session teardown asks the runtime API to stop with SIGTERM, then SIGKILL after N seconds before the force-remove backstop, so apps can exit cleanly (Steam otherwise marks its install unclean and re-verifies every executable checksum on the next launch, ~9 s). `0` restores kill-only teardown. Well-behaved apps exit on TERM immediately, so the window costs nothing for them. |
 | `QUASAR_SWAP_APP_READY_TIMEOUT_MS` | `45000` | How long a quick-switch (session app swap) waits for the **replacement app** to actually present a frame before rolling back. The swap is serialised (2026-08-05): the outgoing app container is stopped and reaped first — both generations bind-mount the same managed home, and a second instance of a home-locking app (Steam) hands off to the first and exits 0 — so this budget covers container start + app startup, not just a first frame. Generous by default because a Steam-derived image needs 4.5–10.6 s just to reach its ready gate (#384) and a cold image pull is on top. A separate, fixed 20 s budget covers the earlier compositor-startup phase. Non-numeric or `0` ⇒ the default (a typo must not make every swap fail instantly). Raise it for very slow titles; lowering it only makes rollback happen sooner. |
 | `QUASAR_APP_MOUNT_ALLOW` | unset (managed-home root only) | Comma-separated list of host directories an app's `runtime_spec.mounts` / preset `mounts` may bind on **this** host, each optionally suffixed `:rw` (default read-only, and an entry's `:ro` is honoured verbatim). The managed-home root (`QUASAR_HOME_ROOT`, or the per-host root pushed from Admin → Hosts) is always allowed read-write and needs no entry, so the shipped catalog — whose images mount nothing else — works with this unset. Enforced by the node agent at assign and at app swap, because it is the agent that spawns the container and a mount string originates in a manifest authored on another machine; a mount naming anything else fails the assign with `session-assign-rejected` and nothing is spawned. A **deny list beats this allowlist**: `/`, `/proc`, `/sys`, `/dev`, `/etc`, `/root`, `/boot`, `/run`, `/var/run`, `/var/lib/docker` (and the other container-runtime state dirs), `/lib/modules`, any directory containing a container-runtime socket, and any source containing `..` are refused whatever is listed here — binding any of them hands the session the host daemon and therefore host root. Sources are matched component-wise, so `/opt/games` does not allow `/opt/gamesecret`. The control plane applies the same deny list at image install and at admin preset writes (400), but that is a second line only: the host decides which of its own paths a session sees. |
 | `QUASAR_APP_PRIVILEGE_OPTOUT` | `allow` | Whether this host honours an app's `runtime_spec.no_new_privileges: false` and `runtime_spec.systempaths_unconfined: true` (both rows below). `deny` ignores both, keeping `no-new-privileges` on and `/proc`/`/sys` masked, and logs `token="app-privilege-optout-denied"` — for an operator running a catalog they do not author. It is not the default because the shipped catalog needs both (Steam re-escalates via `sudo`, KDE needs an unmasked `/proc` for `bwrap`), so denying by default would break the default library out of the box; an unrecognised value warns and stays permissive rather than silently hardening a working host. |
@@ -915,7 +944,7 @@ app's catalog `runtime_spec` (image/args/env/mounts/gpu) is used instead.
 | *(per-app)* `runtime_spec.no_new_privileges` | `true` | Not an env var — an additive boolean key in an app's `runtime_spec` (admin app catalog). `false` drops `--security-opt no-new-privileges` for that app only: upstream GOW desktop images (e.g. `ghcr.io/games-on-whales/xfce`) `sudo` inside their startup scripts, which the flag turns into a container exit 1 — the session then streams the bare (black) compositor. Leave the default for everything else. A host can refuse this opt-out with `QUASAR_APP_PRIVILEGE_OPTOUT=deny`. |
 | *(per-app)* `runtime_spec.systempaths_unconfined` | `false` | Not an env var — an additive boolean key in an app's `runtime_spec` (admin app catalog). `true` adds `--security-opt systempaths=unconfined` for that app only, unmasking `/proc`/`/sys` paths Docker hides by default. Needed for desktop-session images (KDE Plasma with a user Flatpak install): Flatpak's sandbox helper (`bwrap`) mounts a fresh `/proc` inside the app's own mount namespace, which Docker's masked paths block even with `seccomp=unconfined` already set — `flatpak install` works today, `flatpak run` does not without this (live-verified 2026-08-13). Leave the default off for everything else. A host can refuse this opt-out with `QUASAR_APP_PRIVILEGE_OPTOUT=deny`. |
 | *(per-app)* `runtime_spec.mounts` / preset `mounts` | `[]` | Not an env var — the host paths an app binds. Both the control plane (image install, admin preset write) and the node agent vet them; what a given host actually permits is `QUASAR_APP_MOUNT_ALLOW` above, which is default-deny apart from the managed-home root. |
-| *(per-app)* `runtime_spec.on_app_exit` | `fail` | Not an env var — an additive string key (`"fail"` \| `"keep"`) in an app's `runtime_spec` (admin app catalog). App-liveness: policy for a steady-state app-container exit (crash, OOM, or a clean quit), detected via a dedicated `docker wait` on the container. `fail` (default) ends the session — a dead app streaming a stale frame forever is the bug this closes. `keep` logs the exit and lets the session continue; set it explicitly on catalog rows whose app legitimately exits mid-session (e.g. a console/local_only desktop process). A container torn down by Quasar itself (session stop, launcher↔game swap) is never misclassified as an app exit either way. |
+| *(per-app)* `runtime_spec.on_app_exit` | `fail` | Not an env var — an additive string key (`"fail"` \| `"keep"`) in an app's `runtime_spec` (admin app catalog). App-liveness: policy for a steady-state app-container exit (crash, OOM, or a clean quit), detected through runtime-API observation by immutable container identity. `fail` (default) ends the session — a dead app streaming a stale frame forever is the bug this closes. `keep` logs the exit and lets the session continue; set it explicitly on catalog rows whose app legitimately exits mid-session (e.g. a console/local_only desktop process). A container torn down by Quasar itself (session stop, launcher↔game swap) is never misclassified as an app exit either way. |
 | `QUASAR_APP_EXIT_POLICY` | `fail` | Host default for `runtime_spec.on_app_exit` on the dev/standalone `QUASAR_APP_*` launch path (`from_env`). `keep` restores the pre-liveness behaviour of ignoring app exits; any other value (including unset) is `fail`. A catalog app's own `runtime_spec.on_app_exit` always wins on a control-plane assignment — this only affects the direct demo/dev path. |
 | `QUASAR_GPU_NVIDIA` | off | `1`/`true` → NVIDIA passthrough (`--gpus all` / CDI); otherwise `--device /dev/dri` (AMD/Intel). |
 | `QUASAR_NV_LIB32_PATH` | unset (auto-detect) | #375: host directory holding the **32-bit** NVIDIA driver libs (e.g. `/usr/lib` on unraid), bind-mounted read-only into NVIDIA app containers at `/opt/quasar/nvidia-lib32` so native 32-bit Linux titles resolve `libGLX_nvidia.so.*` (the container ships only 64-bit driver libs; the container toolkit/CDI spec never injects 32-bit). Must be empty or an absolute path. Empty ⇒ the agent auto-detects at startup via a short-lived probe container that globs the host `/usr` (`busybox`/`alpine`), and failing that falls back to the `lib32/` half of the Quasar-provisioned driver volume (`QUASAR_NVIDIA_DRIVER_VOLUME`) — which reuses this exact mount mechanism, just pointed at the volume's host path; if both fail (no network on a locked-down host), set this explicitly. Also a per-host `nvidia_lib32_path` admin knob (live-class); the override wins over auto-detect. **NVIDIA-only** — inert on VA/AMD hosts. Requires the quasar-images `ld.so.conf.d` entry for `/opt/quasar/nvidia-lib32` (the mount deliberately avoids GOW's `/usr/nvidia` driver-volume path — upstream GOW images' cont-init treats that as a full driver volume and exits 1 when it isn't one). |

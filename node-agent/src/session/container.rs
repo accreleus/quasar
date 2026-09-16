@@ -3,14 +3,18 @@
 //! no orphans on every terminal transition (a leaked container is leaked GPU/VRAM the
 //! control plane already released — P1-6 reservation-release depends on it).
 //!
-//! ## Runtime: Docker, shelled out to the CLI
-//! `games-on-whales/wolf`'s published app images are Docker images; it fits invariant
-//! #1 (in production the agent runs on the host and talks to the local daemon, in dev
-//! it runs inside `quasar-agent-dev` and launches SIBLING containers via the mounted
-//! `/var/run/docker.sock`, same code path); and the exact `docker run` line is then
-//! logged and copy-pasteable. Podman is a drop-in (`QUASAR_CONTAINER_RUNTIME`); Docker
-//! is the tested default. The end-state K8s model replaces this module with a CRI/pod
-//! spec, threading the same inputs.
+//! ## Runtime: the Docker Engine API over a Unix socket
+//! `games-on-whales/wolf`'s published app images are Docker images, and this module
+//! launches them as SIBLING containers of the agent through the engine's HTTP API on
+//! the mounted `/var/run/docker.sock` (`crate::runtime`) — the same code path whether
+//! the agent runs on the host or inside `quasar-agent-dev`, which fits invariant #1.
+//! Since #239 the agent runs no engine executable at all: there is no CLI in the
+//! image and no API-to-CLI fallback. The argument vector built in `run()` below is
+//! still written in `docker run` spelling because that is the readable, reviewable
+//! form of the launch contract; `application_request_from_args` translates it into an
+//! owned `ApplicationRequest`, and an argument with no representation there is a
+//! launch error rather than an unchecked flag. The end-state K8s model replaces this
+//! module with a CRI/pod spec, threading the same inputs.
 //!
 //! ## App-container launch contract (what `run()` guarantees, and why)
 //! Not independent knobs: the minimum set that lets a real Steam/Proton title run
@@ -47,23 +51,15 @@
 //!     runtime-injected driver itself, never baked.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 
 use crate::messages::AppExitPolicy;
 use crate::runtime::{ApplicationId, ApplicationMount, ApplicationRequest};
-
-/// Upper bound on any single container-runtime CLI invocation (#149). A wedged docker
-/// daemon otherwise blocks the session thread forever (`run` at launch, `rm -f` at
-/// teardown). On timeout the child is killed and the call fails, so the caller's error
-/// path surfaces it and the control plane can reap the reservation.
-const RUNTIME_CMD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A launch whose response or retirement is uncertain. The operation is the only
 /// identity allowed to reconcile it. Writable bind sources are retained as well as the
@@ -313,12 +309,6 @@ where
     Ok(())
 }
 
-/// Per-stream cap on captured child stdout/stderr, so a pathological runtime cannot
-/// flood the agent's memory. It is a RETENTION cap only: the reader keeps draining past
-/// it and discards the excess (#194). Stopping at the cap would refill the pipe and
-/// block the writer — which is exactly the deadlock this bound must not cause.
-const MAX_CAPTURE_BYTES: u64 = 256 * 1024;
-
 /// Translate the agent's already-validated launch policy into the Quasar runtime
 /// request. This is intentionally strict: a new internal Docker flag must be
 /// represented here before an application can launch through the API.
@@ -499,124 +489,6 @@ fn parse_size(value: &str) -> Result<i64> {
         .ok_or_else(|| anyhow!("size overflow"))
 }
 
-/// `Command::output()` with a deadline: spawn, poll `try_wait`, kill on timeout.
-fn output_with_timeout(cmd: &mut Command, what: &str) -> Result<Output> {
-    output_with_deadline(cmd, what, RUNTIME_CMD_TIMEOUT)
-}
-
-/// `Command::output()` with a deadline. Both pipes are drained by their own thread
-/// CONCURRENTLY with the wait loop, because a child whose output exceeds the pipe buffer
-/// blocks in `write(2)` and never exits — draining only after exit deadlocks it (#194).
-/// That buffer is not reliably 64 KiB: once a uid is past `fs.pipe-user-pages-soft`,
-/// every new pipe opened by a process without `CAP_SYS_RESOURCE` (root in a container)
-/// gets the 8 KiB minimum, which a bare `docker image inspect`'s JSON clears easily. On
-/// timeout the child is killed, which is what gives the readers their EOF.
-pub(crate) fn output_with_deadline(
-    cmd: &mut Command,
-    what: &str,
-    timeout: Duration,
-) -> Result<Output> {
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .spawn()
-        .with_context(|| format!("failed to exec {what}"))?;
-    let out_drain = Drain::spawn(child.stdout.take());
-    let err_drain = Drain::spawn(child.stderr.take());
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(anyhow!(
-                        "{what} timed out after {}s — container runtime unresponsive",
-                        timeout.as_secs()
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(anyhow!("wait for {what}: {e}"));
-            }
-        }
-    };
-    // The child is gone, so its own write ends are closed and EOF is imminent; the grace
-    // floor keeps a child that exits right at the deadline from reporting empty output.
-    let collect_by = deadline.max(Instant::now() + Duration::from_secs(1));
-    Ok(Output {
-        status,
-        stdout: out_drain.take(collect_by),
-        stderr: err_drain.take(collect_by),
-    })
-}
-
-/// One child pipe being read to EOF on its own thread, into a shared capped buffer.
-struct Drain {
-    buf: Arc<Mutex<Vec<u8>>>,
-    done: std::sync::mpsc::Receiver<()>,
-}
-
-impl Drain {
-    /// The reader thread is DETACHED, never joined: a process that inherited the pipe
-    /// (a shell's surviving grandchild) holds it open after the child is killed, and
-    /// joining there would let it extend the deadline at will. It exits at EOF, holding
-    /// at most [`MAX_CAPTURE_BYTES`] meanwhile.
-    fn spawn<R: Read + Send + 'static>(stream: Option<R>) -> Self {
-        let buf = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&buf);
-        let (tx, done) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            drain_capped(stream, &sink);
-            let _ = tx.send(());
-        });
-        Self { buf, done }
-    }
-
-    /// What was read by EOF, or by `deadline` — this never blocks past it.
-    fn take(self, deadline: Instant) -> Vec<u8> {
-        let _ = self
-            .done
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()));
-        std::mem::take(&mut *capture_lock(&self.buf))
-    }
-}
-
-/// Read `stream` to EOF, appending to `sink` until it holds [`MAX_CAPTURE_BYTES`] and
-/// discarding the rest — never stopping early (see that constant). A read error or a
-/// `None` stream leaves what was collected so far.
-fn drain_capped<R: Read>(stream: Option<R>, sink: &Mutex<Vec<u8>>) {
-    let Some(mut stream) = stream else { return };
-    let cap = MAX_CAPTURE_BYTES as usize;
-    let mut retained = 0usize;
-    let mut chunk = [0u8; 8 * 1024];
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => return,
-            Ok(n) => {
-                if retained < cap {
-                    let take = n.min(cap - retained);
-                    capture_lock(sink).extend_from_slice(&chunk[..take]);
-                    retained += take;
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return,
-        }
-    }
-}
-
-/// A poisoned capture buffer is still readable: take the inner guard rather than
-/// panicking a teardown path.
-fn capture_lock(buf: &Mutex<Vec<u8>>) -> std::sync::MutexGuard<'_, Vec<u8>> {
-    buf.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 /// Name prefix for per-session app containers, used to build a session's container
 /// name and to sweep orphans on startup.
 pub const SESSION_NAME_PREFIX: &str = "quasar-sess-";
@@ -643,9 +515,9 @@ const APP_CONTAINER_CAP_ADDS: [&str; 8] = [
 /// matching `ld.so.conf.d` entry for this path.
 const NVIDIA_LIB32_MOUNT_DST: &str = "/opt/quasar/nvidia-lib32";
 
-/// The legacy CLI probe allowed a minute for image availability and the
-/// bounded shell check.  Keep that caller-level image budget while each owned
-/// lifecycle operation remains under the runtime's configured deadline.
+/// The probe's caller-level budget, covering image availability plus the bounded
+/// shell check. Each owned lifecycle operation inside it remains under the
+/// runtime's own configured deadline.
 const NVIDIA_LIB32_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Minimal images the #375 probe tries in order; both ship `sh`.
@@ -806,28 +678,26 @@ fn env_disabled(var: &str) -> bool {
     )
 }
 
-/// The container runtime CLI (docker by default; podman is compatible).
+/// This host's app-container launch POLICY, plus the thin shims the launch path
+/// reads image facts through. It runs no engine CLI: every operation below is
+/// the Docker Engine API over the configured Unix socket (#239). The one piece
+/// of per-host state it carries is the GPU vendor decision.
 #[derive(Debug, Clone)]
 pub struct ContainerRuntime {
-    bin: String,
     /// Request an NVIDIA GPU via `--gpus all` (AMD/Intel use `--device /dev/dri`).
     /// Knob: `QUASAR_GPU_NVIDIA`.
     nvidia: bool,
 }
 
 impl ContainerRuntime {
-    #[cfg(test)]
-    pub(crate) fn test_runtime(bin: &str) -> Self {
-        Self {
-            bin: bin.to_string(),
-            nvidia: false,
-        }
+    /// An explicit policy, for callers that already know the vendor answer —
+    /// notably tests, which must not depend on the host's real GPU.
+    pub fn new(nvidia: bool) -> Self {
+        Self { nvidia }
     }
 
-    /// Knobs: `QUASAR_CONTAINER_RUNTIME`, `QUASAR_GPU_NVIDIA`.
+    /// Knob: `QUASAR_GPU_NVIDIA`; unset means detect the host's GPU vendor.
     pub fn from_env() -> Self {
-        let bin =
-            std::env::var("QUASAR_CONTAINER_RUNTIME").unwrap_or_else(|_| "docker".to_string());
         let nvidia = match std::env::var("QUASAR_GPU_NVIDIA").ok().as_deref() {
             Some("0" | "false" | "FALSE") => false,
             Some("1" | "true" | "TRUE") => true,
@@ -836,19 +706,13 @@ impl ContainerRuntime {
                 Some((crate::gpu_vendor::GpuVendor::Nvidia, _))
             ),
         };
-        ContainerRuntime { bin, nvidia }
+        ContainerRuntime { nvidia }
     }
 
     /// The "NVIDIA in play" signal: gates the #375 startup probe for the host's 32-bit
     /// driver libs and the mount in [`ContainerRuntime::run`].
     pub fn is_nvidia(&self) -> bool {
         self.nvidia
-    }
-
-    /// The container-runtime binary. Exposed for the S1 driver-volume provisioner,
-    /// which resolves the agent's own mounts to find the volume's host path.
-    pub fn bin(&self) -> &str {
-        &self.bin
     }
 
     /// The exact locally running image, rather than a guessed development tag.
@@ -890,104 +754,6 @@ impl ContainerRuntime {
             .iter()
             .find_map(|l| l.strip_prefix(&prefix).map(str::to_string))
             .filter(|v| !v.is_empty()))
-    }
-
-    /// S5: follow an app container's log stream into a bounded [`AppLogRing`] from
-    /// launch. Returns the thread handle so the exit path can drain it before
-    /// snapshotting ([`ContainerRuntime::await_log_drain`]).
-    ///
-    /// A follower, not a `docker logs` at exit: containers run `--rm`, so the daemon
-    /// reaps the container and its logs the moment it exits, losing exactly the case
-    /// that matters (#463: Steam prints "Steam needs to be online to update" and exits 0
-    /// in under a second). `--tail 100`, not `--tail 0`, because the follower attaches a
-    /// few ms after `docker run` returns and `--tail 0` skips precisely the lines a
-    /// container that died in that window already wrote; the ring's cap makes the replay
-    /// overlap free.
-    ///
-    /// Residual race, accepted: a container reaped before this thread's `docker logs`
-    /// reaches the daemon leaves an empty tail. Closing it means dropping `--rm` and
-    /// reaping ourselves, real orphan-leak risk for a sub-attach-latency window; the
-    /// failure still reports its exit code.
-    ///
-    /// Two threads per generation, one per stream, since the daemon keeps stdout and
-    /// stderr separate and nothing here merges them: interleaving BETWEEN streams is
-    /// approximate, each stream's own order exact. Both end when the streams close.
-    pub fn spawn_log_follower(
-        &self,
-        container_id: String,
-        ring: AppLogRing,
-    ) -> Option<std::thread::JoinHandle<()>> {
-        let bin = self.bin.clone();
-        let builder = std::thread::Builder::new().name("quasar-app-logs".to_string());
-        let tail = APP_LOG_TAIL_LINES.to_string();
-        let log_span = tracing::Span::current();
-        let spawned = builder.spawn(move || {
-            // C9: re-enter the session span so this thread's lines carry session=<id>.
-            let _log_span = log_span.enter();
-            let child = Command::new(&bin)
-                .args(["logs", "-f", "--tail", &tail, &container_id])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .stdin(Stdio::null())
-                .spawn();
-            let mut child = match child {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::debug!("app log follower: failed to exec `{bin} logs`: {e}");
-                    return;
-                }
-            };
-            let stderr = child.stderr.take();
-            let err_ring = ring.clone();
-            let err_thread = stderr.and_then(|s| {
-                std::thread::Builder::new()
-                    .name("quasar-app-logs-err".to_string())
-                    .spawn(move || drain_into_ring(s, &err_ring))
-                    .ok()
-            });
-            if let Some(out) = child.stdout.take() {
-                drain_into_ring(out, &ring);
-            }
-            if let Some(t) = err_thread {
-                let _ = t.join();
-            }
-            // The child is `docker logs`, not the app: reap it so it cannot zombie.
-            let _ = child.wait();
-        });
-        match spawned {
-            Ok(h) => Some(h),
-            Err(e) => {
-                tracing::warn!(
-                    token = "app-log-follower-spawn-failed",
-                    "app log follower: could not spawn reader thread: {e} — an early app exit \
-                     will be reported without its log tail"
-                );
-                None
-            }
-        }
-    }
-
-    /// Wait briefly for a log follower to finish draining, so a snapshot taken right
-    /// after the container exited sees its LAST lines rather than whatever had arrived
-    /// when the exit waiter fired.
-    ///
-    /// Bounded, never a plain join: `JoinHandle` has no timed join, so this polls
-    /// `is_finished` against [`APP_LOG_DRAIN_BUDGET`] rather than blocking teardown
-    /// behind an unresponsive runtime. Giving up drops the handle — the thread detaches
-    /// and ends when the stream closes, and the ring is shared, so a late line is missed,
-    /// never corrupt.
-    pub fn await_log_drain(handle: std::thread::JoinHandle<()>, budget: Duration) {
-        let deadline = Instant::now() + budget;
-        while !handle.is_finished() {
-            if Instant::now() >= deadline {
-                tracing::debug!(
-                    "app log follower still draining after {budget:?}; snapshotting the tail as-is"
-                );
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let _ = handle.join();
     }
 
     /// #375: locate the host dir holding the 32-bit NVIDIA driver libs, for read-only
@@ -1141,87 +907,6 @@ impl ContainerRuntime {
         format!("{SESSION_NAME_PREFIX}{session_id}")
     }
 
-    /// Reap only this persistent agent's labelled session/audio siblings. Legacy
-    /// unlabelled containers remain untouched for operator review.
-    pub fn sweep_orphans(&self, prefixes: &[&str]) -> usize {
-        match crate::container_ownership::token() {
-            Ok(owner) => self.sweep_orphans_for(&owner, prefixes),
-            Err(error) => {
-                tracing::warn!(token = "orphan-sweep-owner-unavailable", "{error}");
-                0
-            }
-        }
-    }
-
-    fn sweep_orphans_for(&self, owner: &str, prefixes: &[&str]) -> usize {
-        let filter = format!("label={}={owner}", crate::container_ownership::LABEL);
-        let output = match self.run_raw(&["ps", "-aq", "--no-trunc", "--filter", &filter]) {
-            Ok(output) => output,
-            Err(error) => {
-                tracing::warn!(token = "orphan-sweep-ps-failed", "{error}");
-                return 0;
-            }
-        };
-        let mut removed = 0;
-        for target in output.lines().filter(|id| !id.is_empty()) {
-            match self.owned_container_id(target, owner, prefixes) {
-                Ok(Some(id)) => match self.run_raw(&["rm", "-f", &id]) {
-                    Ok(_) => removed += 1,
-                    Err(error) => tracing::warn!(token = "orphan-sweep-rm-failed", "{error}"),
-                },
-                Ok(None) => {}
-                Err(error) => tracing::warn!(token = "orphan-sweep-preserved", "{error}"),
-            }
-        }
-        removed
-    }
-
-    fn owned_container_id(
-        &self,
-        target: &str,
-        owner: &str,
-        prefixes: &[&str],
-    ) -> Result<Option<String>> {
-        // Inspect only ownership fields, never container environment credentials.
-        let template =
-            r#"{"Id":{{json .Id}},"Name":{{json .Name}},"Labels":{{json .Config.Labels}}}"#;
-        let output = match self.run_raw(&["inspect", "--format", template, "--", target]) {
-            Ok(output) => output,
-            Err(error) if error.to_string().contains("No such") => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let value: serde_json::Value = serde_json::from_str(&output)?;
-        if value["Labels"]
-            .as_object()
-            .is_some_and(|labels| labels.contains_key("io.quasar.application-operation"))
-        {
-            anyhow::bail!(
-                "Preserving API-owned application {target}: use runtime application recovery"
-            );
-        }
-        // Audio lifecycle and recovery belong exclusively to the runtime API.
-        // Even an old caller explicitly supplying the pulse prefix cannot bypass
-        // its durable cleanup journal. Legacy sidecars require operator review.
-        if value["Name"].as_str().is_some_and(|name| {
-            name.trim_start_matches('/')
-                .starts_with(super::audio::PULSE_NAME_PREFIX)
-        }) {
-            anyhow::bail!("Preserving audio container {target}: use runtime audio recovery");
-        }
-        crate::container_ownership::owned_id(&value, owner, prefixes)
-            .map(Some)
-            .ok_or_else(|| anyhow!("Preserving container {target}: it is unowned, belongs to another agent, or has an unrelated name. Review legacy containers manually; this agent cannot remove them."))
-    }
-
-    fn managed_container_id(&self, target: &str) -> Result<Option<String>> {
-        let owner = crate::container_ownership::token().map_err(anyhow::Error::msg)?;
-        self.owned_container_id(
-            target,
-            &owner,
-            &[SESSION_NAME_PREFIX, super::audio::PULSE_NAME_PREFIX],
-        )
-    }
-
     /// Launch the app container as a detached Wayland client of the session
     /// compositor. Returns a handle whose `Drop` guarantees teardown.
     pub fn run(&self, spec: &ContainerSpec, params: &LaunchParams) -> Result<RunningContainer> {
@@ -1237,7 +922,7 @@ impl ContainerRuntime {
             .unwrap_or_else(|| Self::container_name(params.session_id));
 
         // Validate the network BEFORE anything is spawned: an out-of-set value must
-        // fail the launch, never reach `docker run`.
+        // fail the launch, never reach the engine.
         let network = resolve_network(spec.network.as_deref())?;
 
         anyhow::ensure!(
@@ -1245,8 +930,8 @@ impl ContainerRuntime {
             "app container name must start with {SESSION_NAME_PREFIX}"
         );
         let owner = crate::container_ownership::token().map_err(anyhow::Error::msg)?;
-        // API-owned applications are recovered by their durable operation
-        // journal. The legacy CLI sweep must never delete them by name.
+        // Every application is recovered by its durable operation journal; the
+        // boot-only legacy sweep must never delete one of these by name.
 
         let mut args: Vec<String> = vec![
             "run".into(),
@@ -1568,7 +1253,7 @@ impl ContainerRuntime {
             Err(error) => {
                 // Start may have created or started the exact operation before
                 // its reply was lost. Persist retirement by operation rather
-                // than falling back to a name-based CLI removal.
+                // than removing by name, which could hit somebody else's container.
                 let abandon = runtime.abandon_application(operation.clone()).wait().err();
                 if abandon.is_some() {
                     retain_pending_application(name.clone(), &request, operation);
@@ -1597,29 +1282,10 @@ impl ContainerRuntime {
         })
     }
 
-    /// Run an arbitrary `docker <args>` command and return stdout on success.
-    /// Used by the PulseAudio sidecar and other agent-managed containers that
-    /// don't follow the full app-container spec path.
-    pub fn run_raw(&self, args: &[&str]) -> anyhow::Result<String> {
-        let out = output_with_timeout(
-            Command::new(&self.bin).args(args),
-            &format!("`{} {}`", self.bin, args.join(" ")),
-        )?;
-        if !out.status.success() {
-            return Err(anyhow!(
-                "`{} {}` failed: {}",
-                self.bin,
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    }
-
     /// Inspect through the Quasar API interface for image-management reconciliation
-    /// (`ImageManager::new`, `refresh_register_images`). A plain `.is_ok()` on `run_raw`
-    /// conflates "the image is gone" with "the daemon hiccuped", which would demote
-    /// every managed image to `absent` — and persist that — on one transient error.
+    /// (`ImageManager::new`, `refresh_register_images`). Conflating "the image is gone"
+    /// with "the daemon hiccuped" would demote every managed image to `absent` — and
+    /// persist that — on one transient error.
     /// `Ok(true)` present, `Ok(false)` the daemon's definitive "no such image", `Err`
     /// anything else (leave the existing record untouched and warn).
     pub fn image_present(&self, registry_ref: &str) -> Result<bool, String> {
@@ -1627,180 +1293,22 @@ impl ContainerRuntime {
             .and_then(|runtime| runtime.image_present(registry_ref).wait())
             .map_err(|error| error.to_string())
     }
-
-    /// Graceful teardown: `docker stop -t N` (SIGTERM then SIGKILL after N seconds),
-    /// then the `rm -f` backstop. The TERM window lets app images shut down cleanly —
-    /// Steam marks its install unclean when killed and re-verifies every executable
-    /// checksum on the next launch (~9 s measured), so kill-only teardown taxes every
-    /// subsequent session start. Containers run `--rm`, so a successful stop
-    /// auto-removes and `force_remove` is the idempotent backstop. Knob:
-    /// `QUASAR_APP_STOP_TIMEOUT_SECS`.
-    pub fn graceful_remove(&self, name: &str) {
-        let id = match self.managed_container_id(name) {
-            Ok(Some(id)) => id,
-            Ok(None) => return,
-            Err(error) => {
-                tracing::warn!(token = "container-graceful-cleanup-preserved", "{error}");
-                return;
-            }
-        };
-        let name = id.as_str();
-        let secs: u64 = std::env::var("QUASAR_APP_STOP_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10);
-        if secs > 0 {
-            let res = output_with_deadline(
-                Command::new(&self.bin).args(["stop", "-t", &secs.to_string(), name]),
-                "container stop",
-                Duration::from_secs(secs + 20),
-            );
-            match res {
-                Ok(out) if out.status.success() => {
-                    tracing::debug!("stopped container {name} gracefully");
-                }
-                Ok(out) => {
-                    let err = String::from_utf8_lossy(&out.stderr);
-                    if !err.contains("No such container") {
-                        tracing::warn!(
-                            token = "container-stop-failed",
-                            "`{} stop {name}` reported: {}",
-                            self.bin,
-                            err.trim()
-                        );
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    token = "container-stop-exec-failed",
-                    "failed to exec `{} stop {name}`: {e}",
-                    self.bin
-                ),
-            }
-        }
-        self.force_remove(name);
-    }
-
-    /// `rm -f` a container by name. Idempotent and best-effort: a missing
-    /// container is success (the orphan-free postcondition holds either way).
-    pub fn force_remove(&self, name: &str) {
-        let owned_id;
-        let name = if crate::container_ownership::managed_name(name) {
-            match self.managed_container_id(name) {
-                Ok(Some(id)) => {
-                    owned_id = id;
-                    owned_id.as_str()
-                }
-                Ok(None) => return,
-                Err(error) => {
-                    tracing::warn!(token = "container-force-cleanup-preserved", "{error}");
-                    return;
-                }
-            }
-        } else {
-            name
-        };
-        let res = output_with_timeout(
-            Command::new(&self.bin).args(["rm", "-f", name]),
-            "container rm",
-        );
-        match res {
-            Ok(out) if out.status.success() => {
-                tracing::debug!("removed container {name}");
-            }
-            Ok(out) => {
-                let err = String::from_utf8_lossy(&out.stderr);
-                // "No such container" = already gone; "removal ... in progress" = the
-                // --rm auto-removal racing us after a graceful stop. Both satisfy the
-                // orphan-free postcondition.
-                if !err.contains("No such container") && !err.contains("is already in progress") {
-                    tracing::warn!(
-                        token = "container-rm-failed",
-                        "`{} rm -f {name}` reported: {}",
-                        self.bin,
-                        err.trim()
-                    );
-                }
-            }
-            Err(e) => tracing::warn!(
-                token = "container-rm-exec-failed",
-                "failed to exec `{} rm -f {name}`: {e}",
-                self.bin
-            ),
-        }
-    }
-
-    /// Block until `id` exits, then classify it (app-liveness spec §3 D1=b).
-    ///
-    /// MUST be called from a dedicated thread, never the session poll loop: `docker
-    /// wait` blocks for the container's entire remaining lifetime, so routing it through
-    /// `output_with_timeout`'s 30 s cap would falsely kill every long-lived session.
-    /// Hence `Command::output()` directly, with no deadline.
-    ///
-    /// `docker wait` gives the exit code but not whether the cgroup OOM killer caused
-    /// it, so a follow-up `docker inspect` runs immediately after — before the `--rm`
-    /// auto-removal races it away — to read `OOMKilled`. That call IS bounded, being a
-    /// single-shot inspect; a miss falls back to the wait exit code alone.
-    pub fn wait_for_exit(&self, id: &str) -> AppExitStatus {
-        let out = match Command::new(&self.bin)
-            .args(["wait", id])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null())
-            .output()
-        {
-            Ok(o) if o.status.success() => o,
-            Ok(o) => {
-                tracing::warn!(
-                    token = "container-wait-failed",
-                    "`{} wait {id}` failed: {}",
-                    self.bin,
-                    String::from_utf8_lossy(&o.stderr).trim()
-                );
-                return AppExitStatus::Unknown;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    token = "container-wait-exec-failed",
-                    "failed to exec `{} wait {id}`: {e}",
-                    self.bin
-                );
-                return AppExitStatus::Unknown;
-            }
-        };
-        let Ok(code) = String::from_utf8_lossy(&out.stdout).trim().parse::<i32>() else {
-            tracing::warn!(
-                token = "container-wait-nonnumeric",
-                "`{} wait {id}` printed a non-numeric exit code: {:?}",
-                self.bin,
-                String::from_utf8_lossy(&out.stdout)
-            );
-            return AppExitStatus::Unknown;
-        };
-        if let Ok(inspect) = output_with_timeout(
-            Command::new(&self.bin).args(["inspect", "--format", "{{.State.OOMKilled}}", id]),
-            "container exit inspect",
-        ) {
-            if inspect.status.success() && String::from_utf8_lossy(&inspect.stdout).trim() == "true"
-            {
-                return AppExitStatus::OomKilled;
-            }
-        }
-        AppExitStatus::Code(code)
-    }
 }
 
 /// A terminal app-container exit, classified for the app-liveness policy (spec §2/§3).
+/// Built from the owned runtime's [`crate::runtime::ApplicationResult`], which is the
+/// only evidence allowed to end a generation: the observer in `source.rs` retries every
+/// transport error rather than publishing one as an exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppExitStatus {
     /// Exited with this code (0 = clean exit).
     Code(i32),
-    /// The cgroup OOM-killed the container (`docker inspect` `OOMKilled=true`).
+    /// The cgroup OOM-killed the container (`ApplicationResult::oom_killed`).
     OomKilled,
-    /// `docker wait`/`inspect` could not be read (daemon hiccup, or the `--rm`
-    /// auto-removal raced the inspect away). The runner's `fail` policy ends the session
-    /// as for any other exit: fail-closed on purpose, because a session stuck on a
-    /// frozen frame with no way to tell whether the app is alive is worse than an
-    /// occasional false-positive failure.
+    /// The daemon proved the application terminal but reported no usable exit code.
+    /// The runner's `fail` policy ends the session as for any other exit: fail-closed
+    /// on purpose, because a session stuck on a frozen frame with no way to tell
+    /// whether the app is alive is worse than an occasional false-positive failure.
     Unknown,
 }
 
@@ -2006,9 +1514,8 @@ const NVIDIA_DRIVER_VOLUME_DST: &str = "/opt/quasar/nvidia-driver";
 /// provisioned. Reads the image's own `LD_LIBRARY_PATH` because `-e` REPLACES it, and
 /// overwriting an app image's loader path trades one breakage for another.
 fn nvidia_driver_volume_args(runtime: &ContainerRuntime, image: &str) -> Result<Vec<String>> {
-    crate::nvidia_volume::validate_host_path_for_launch(runtime.bin())
-        .map_err(anyhow::Error::msg)?;
-    crate::nvidia_volume::retry_mount_resolution(runtime.bin());
+    crate::nvidia_volume::validate_host_path_for_launch().map_err(anyhow::Error::msg)?;
+    crate::nvidia_volume::retry_mount_resolution();
     let Some(info) = crate::nvidia_volume::current() else {
         return Ok(Vec::new());
     };
@@ -2356,27 +1863,21 @@ fn wayland_mount_args(params: &LaunchParams<'_>) -> Vec<String> {
 /// `session_state` message and sits in a `TEXT` column with no truncation policy.
 pub const APP_LOG_TAIL_LINES: usize = 100;
 
-/// Hard cap on the bytes retained for a single log RECORD: an app printing a megabyte
-/// with no newline must not be able to make the failure report, or the agent's heap,
-/// unbounded. The ring bounds how many records are kept; this bounds each one, and
-/// [`drain_into_ring`] enforces it INCREMENTALLY so the excess is never accumulated.
+/// Hard cap on the bytes retained for a single log line: an app printing a megabyte
+/// must not be able to make the failure report, or the agent's heap, unbounded. The
+/// ring bounds how many lines are kept; this bounds each one.
 const APP_LOG_MAX_LINE: usize = 2000;
 
 /// Appended to a record that hit [`APP_LOG_MAX_LINE`], so a reader can tell a
 /// clipped line from a short one.
 const APP_LOG_TRUNCATION_MARKER: &str = " …[truncated]";
 
-/// How long the exit path waits for the log follower to drain before snapshotting the
-/// ring (S5). A budget, not a join: this runs on the session's own thread and teardown
-/// must never hang on a wedged runtime. `docker logs` closes its stream promptly once
-/// the container is gone, so the timeout only bites on an unresponsive daemon, where a
-/// partial tail beats a stuck teardown.
-pub const APP_LOG_DRAIN_BUDGET: Duration = Duration::from_millis(750);
-
-/// A bounded, newest-wins ring of an app container's log lines (S5). Cloneable and
-/// internally synchronised: the source generation holds one handle, the two follower
-/// threads the others. A poisoned mutex is recovered from, never propagated — this is
-/// diagnostic, and a lost log line must never fail a session.
+/// A bounded, newest-wins ring of an app container's log lines (S5). One ring per
+/// generation: the source holds the reading handle and its observer thread the writing
+/// one, and lines arrive already split, as the `stdout`/`stderr` strings of a runtime
+/// `ApplicationResult` or `ApplicationLogTail`. Cloneable and internally synchronised.
+/// A poisoned mutex is recovered from, never propagated — this is diagnostic, and a
+/// lost log line must never fail a session.
 #[derive(Clone, Default)]
 pub struct AppLogRing {
     inner: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
@@ -2430,82 +1931,6 @@ impl AppLogRing {
         };
         g.iter().cloned().collect()
     }
-}
-
-/// Append `chunk` to `record`, never letting it exceed [`APP_LOG_MAX_LINE`].
-/// Sets `overflowed` once anything has been dropped.
-fn append_bounded(record: &mut Vec<u8>, chunk: &[u8], overflowed: &mut bool) {
-    let room = APP_LOG_MAX_LINE.saturating_sub(record.len());
-    if chunk.len() <= room {
-        record.extend_from_slice(chunk);
-        return;
-    }
-    record.extend_from_slice(&chunk[..room]);
-    *overflowed = true;
-}
-
-/// Read `stream` into `ring`, one newline-delimited record at a time, until EOF.
-///
-/// Must stay bounded BY CONSTRUCTION: `BufRead::split(b'\n')` buys the whole record into
-/// a `Vec` before any cap can apply, so a container writing forever without a newline
-/// grows an unbounded allocation inside the agent. This drives `fill_buf`/`consume`
-/// directly and keeps at most [`APP_LOG_MAX_LINE`] bytes per record, discarding the rest
-/// as it streams past; peak memory is the cap plus one `BufReader` buffer. Guarded by
-/// `a_newline_less_flood_stays_bounded`.
-///
-/// Non-UTF8 bytes are lossily replaced rather than aborting the drain: a stray byte must
-/// not cost the surrounding lines.
-fn drain_into_ring<R: std::io::Read>(stream: R, ring: &AppLogRing) {
-    use std::io::BufRead;
-    let mut reader = std::io::BufReader::new(stream);
-    let mut record: Vec<u8> = Vec::new();
-    let mut overflowed = false;
-
-    loop {
-        // The `fill_buf` borrow must end before `consume`: decide inside, act outside.
-        let (consumed, complete) = {
-            let buf = match reader.fill_buf() {
-                Ok(b) => b,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            };
-            if buf.is_empty() {
-                break; // EOF
-            }
-            match buf.iter().position(|&b| b == b'\n') {
-                Some(i) => {
-                    append_bounded(&mut record, &buf[..i], &mut overflowed);
-                    (i + 1, true)
-                }
-                None => {
-                    let n = buf.len();
-                    append_bounded(&mut record, buf, &mut overflowed);
-                    (n, false)
-                }
-            }
-        };
-        reader.consume(consumed);
-        if complete {
-            push_record(ring, std::mem::take(&mut record), overflowed);
-            overflowed = false;
-        }
-    }
-
-    // A final record with no trailing newline: the shape a crashing app leaves behind,
-    // and precisely the line worth keeping.
-    if !record.is_empty() {
-        push_record(ring, record, overflowed);
-    }
-}
-
-fn push_record(ring: &AppLogRing, record: Vec<u8>, overflowed: bool) {
-    let mut text = String::from_utf8_lossy(&record)
-        .trim_end_matches('\r')
-        .to_string();
-    if overflowed {
-        text.push_str(APP_LOG_TRUNCATION_MARKER);
-    }
-    ring.push(text);
 }
 
 /// A launched container whose `Drop` tears it down — so any early return / panic
@@ -2608,7 +2033,9 @@ impl Drop for RunningContainer {
 
 #[cfg(test)]
 mod tests {
+    // `sh` here is the #375 probe SCRIPT under test, not an engine binary.
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn runtime_request_preserves_bind_options_and_embeds_seccomp_profile_content() {
@@ -2929,57 +2356,20 @@ mod tests {
     // This runs inside the agent, fed by an untrusted container's stdout, so "bounded"
     // must mean bounded against a hostile app, not tidy for a well-behaved one.
 
-    /// `BufRead::split(b'\n')` materialises a whole record before any cap can apply, so
-    /// a container writing forever without a newline grows an unbounded `Vec` inside the
-    /// agent. Feed that shape; the retained record must be capped.
+    /// An app log line arrives through `ApplicationResult`, so it can be arbitrarily
+    /// long; the ring, not a reader, is what bounds it.
     #[test]
-    fn a_newline_less_flood_stays_bounded() {
-        let flood = vec![b'x'; APP_LOG_MAX_LINE * 50];
+    fn an_oversized_line_is_clipped_and_says_so() {
         let ring = AppLogRing::new();
-        drain_into_ring(std::io::Cursor::new(flood), &ring);
-
+        ring.push("x".repeat(APP_LOG_MAX_LINE * 50));
         let tail = ring.tail();
-        assert_eq!(tail.len(), 1, "one unterminated record, got {}", tail.len());
+        assert_eq!(tail.len(), 1);
         assert!(
             tail[0].len() <= APP_LOG_MAX_LINE + APP_LOG_TRUNCATION_MARKER.len(),
-            "retained {} bytes for a {}-byte flood — the cap did not hold",
-            tail[0].len(),
-            APP_LOG_MAX_LINE * 50
+            "retained {} bytes — the cap did not hold",
+            tail[0].len()
         );
-        assert!(
-            tail[0].ends_with(APP_LOG_TRUNCATION_MARKER),
-            "a clipped record must say it was clipped: {:?}",
-            &tail[0][tail[0].len().saturating_sub(40)..]
-        );
-    }
-
-    /// The bound must hold across MANY oversized records: per-record state is reset, so
-    /// record N+1 does not inherit N's exhausted budget and silently drop every later
-    /// line.
-    #[test]
-    fn each_record_gets_its_own_budget() {
-        let mut input: Vec<u8> = Vec::new();
-        for _ in 0..5 {
-            input.extend(std::iter::repeat_n(b'y', APP_LOG_MAX_LINE * 3));
-            input.push(b'\n');
-        }
-        input.extend_from_slice(b"short tail line\n");
-        let ring = AppLogRing::new();
-        drain_into_ring(std::io::Cursor::new(input), &ring);
-
-        let tail = ring.tail();
-        assert_eq!(tail.len(), 6);
-        for (i, line) in tail.iter().take(5).enumerate() {
-            assert!(
-                line.len() <= APP_LOG_MAX_LINE + APP_LOG_TRUNCATION_MARKER.len(),
-                "record {i} exceeded the cap at {} bytes",
-                line.len()
-            );
-        }
-        assert_eq!(
-            tail[5], "short tail line",
-            "a later short record must survive intact"
-        );
+        assert!(tail[0].ends_with(APP_LOG_TRUNCATION_MARKER));
     }
 
     /// `String::truncate` panics if the index lands inside a multi-byte char, which
@@ -3002,55 +2392,18 @@ mod tests {
         assert!(tail[0].ends_with(APP_LOG_TRUNCATION_MARKER));
     }
 
-    /// The byte reader must also survive a multi-byte char split across the cap, where
-    /// `from_utf8_lossy` replaces the orphaned half.
-    #[test]
-    fn the_reader_survives_a_multibyte_char_split_by_the_cap() {
-        let mut bytes = vec![b'a'];
-        while bytes.len() < APP_LOG_MAX_LINE + 20 {
-            bytes.extend_from_slice("é".as_bytes());
-        }
-        bytes.push(b'\n');
-        let ring = AppLogRing::new();
-        drain_into_ring(std::io::Cursor::new(bytes), &ring);
-        assert_eq!(ring.tail().len(), 1);
-    }
-
     /// A crashing app's last words are the point, so overflow evicts from the front.
     #[test]
     fn the_ring_keeps_the_newest_lines() {
         let ring = AppLogRing::new();
-        let input: String = (0..APP_LOG_TAIL_LINES + 50)
-            .map(|i| format!("line {i}\n"))
-            .collect();
-        drain_into_ring(std::io::Cursor::new(input.into_bytes()), &ring);
+        for i in 0..APP_LOG_TAIL_LINES + 50 {
+            ring.push(format!("line {i}"));
+        }
 
         let tail = ring.tail();
         assert_eq!(tail.len(), APP_LOG_TAIL_LINES);
         assert_eq!(tail[APP_LOG_TAIL_LINES - 1], "line 149");
         assert_eq!(tail[0], "line 50");
-    }
-
-    /// A final record with no trailing newline is what a crashing app leaves behind, and
-    /// the single most valuable line in the capture.
-    #[test]
-    fn an_unterminated_final_record_is_retained() {
-        let ring = AppLogRing::new();
-        drain_into_ring(
-            std::io::Cursor::new(b"first\nSteam needs to be online to update".to_vec()),
-            &ring,
-        );
-        let tail = ring.tail();
-        assert_eq!(tail, vec!["first", "Steam needs to be online to update"]);
-    }
-
-    /// A stray \r from a CRLF image must not ride into the stored line: it renders as a
-    /// mangled overwrite in the admin UI.
-    #[test]
-    fn carriage_returns_are_trimmed() {
-        let ring = AppLogRing::new();
-        drain_into_ring(std::io::Cursor::new(b"crlf line\r\n".to_vec()), &ring);
-        assert_eq!(ring.tail(), vec!["crlf line"]);
     }
 
     /// Generation isolation: `AppSource` outlives its container across a relaunch, so a
@@ -3059,7 +2412,7 @@ mod tests {
     #[test]
     fn a_fresh_ring_does_not_inherit_the_previous_generations_lines() {
         let first = AppLogRing::new();
-        drain_into_ring(std::io::Cursor::new(b"old app: fatal\n".to_vec()), &first);
+        first.push("old app: fatal".into());
         assert_eq!(first.tail(), vec!["old app: fatal"]);
 
         // What `launch` does for every generation.
@@ -3069,49 +2422,13 @@ mod tests {
             "a new generation must start with an empty capture"
         );
 
-        // The retired ring stays writable for its own detached follower without
+        // The retired ring stays writable for its own retired observer without
         // touching the new generation's capture.
-        drain_into_ring(std::io::Cursor::new(b"old app: more\n".to_vec()), &first);
+        first.push("old app: more".into());
         assert_eq!(first.tail().len(), 2);
         assert!(
             second.tail().is_empty(),
             "the retired follower leaked into the new ring"
-        );
-    }
-
-    /// A follower that never finishes must never hang session teardown.
-    #[test]
-    fn await_log_drain_gives_up_within_its_budget() {
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        let handle = std::thread::spawn(move || {
-            // Parks until released: stands in for a wedged `docker logs`.
-            let _ = rx.recv();
-        });
-        let started = Instant::now();
-        ContainerRuntime::await_log_drain(handle, Duration::from_millis(80));
-        let waited = started.elapsed();
-        assert!(
-            waited < Duration::from_millis(1000),
-            "teardown blocked for {waited:?} on a wedged follower"
-        );
-        let _ = tx.send(());
-    }
-
-    /// …and it DOES wait for a follower about to finish, the reason it exists:
-    /// `docker wait` routinely returns before the log stream has been read out.
-    #[test]
-    fn await_log_drain_waits_for_a_follower_that_finishes() {
-        let ring = AppLogRing::new();
-        let writer = ring.clone();
-        let handle = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(40));
-            drain_into_ring(std::io::Cursor::new(b"final words\n".to_vec()), &writer);
-        });
-        ContainerRuntime::await_log_drain(handle, Duration::from_secs(5));
-        assert_eq!(
-            ring.tail(),
-            vec!["final words"],
-            "the snapshot raced the follower instead of draining it"
         );
     }
 
@@ -3750,10 +3067,7 @@ mod tests {
             crate::nvidia_volume::current().is_none(),
             "unit tests must never see a provisioned volume"
         );
-        let rt = ContainerRuntime {
-            bin: "docker".to_string(),
-            nvidia: true,
-        };
+        let rt = ContainerRuntime::new(true);
         assert!(nvidia_driver_volume_args(&rt, "quasar-steam:latest")
             .unwrap()
             .is_empty());
@@ -3799,148 +3113,5 @@ mod tests {
             vec!["--device".to_string(), "/dev/fuse".to_string()]
         );
         assert!(fuse_device_args(false).is_empty());
-    }
-    #[test]
-    fn orphan_sweep_preserves_api_audio_and_checks_application_owner() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("docker");
-        let removed = dir.path().join("removed");
-        let one = "a".repeat(64);
-        let two = "b".repeat(64);
-        let legacy = "c".repeat(64);
-        let unrelated = "d".repeat(64);
-        let pulse = "e".repeat(64);
-        let application = "f".repeat(64);
-        // Deliberately ignore Docker's filter: the independent inspect check must
-        // preserve foreign, unlabelled and substring-only names even then.
-        let body = format!(
-            r#"#!/bin/sh
-case "$1" in
-ps) printf '%s\n' '{one}' '{two}' '{legacy}' '{unrelated}' '{pulse}' '{application}' ;;
-inspect)
- for target do :; done
- case "$target" in
- {one}) name=quasar-sess-one; owner=one ;;
- {two}) name=quasar-sess-two; owner=two ;;
- {legacy}) name=quasar-sess-legacy; owner= ;;
- {unrelated}) name=other-quasar-sess-one; owner=one ;;
- {pulse}) name=quasar-pulse-one; owner=one ;;
- {application}) name=quasar-sess-api-owned; owner=one; application_operation=api-operation ;;
- *) echo 'No such container' >&2; exit 1 ;;
- esac
- if [ -n "$application_operation" ]; then
-   printf '{{"Id":"%s","Name":"/%s","Labels":{{"io.quasar.agent-owner":"%s","io.quasar.application-operation":"%s"}}}}\n' "$target" "$name" "$owner" "$application_operation"
- else
-   printf '{{"Id":"%s","Name":"/%s","Labels":{{"io.quasar.agent-owner":"%s"}}}}\n' "$target" "$name" "$owner"
- fi ;;
-rm) printf '%s\n' "$3" >> '{}' ;;
-esac
-"#,
-            removed.display()
-        );
-        std::fs::write(&script, body).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let runtime = ContainerRuntime::test_runtime(script.to_str().unwrap());
-        let prefixes = [SESSION_NAME_PREFIX, super::super::audio::PULSE_NAME_PREFIX];
-        assert_eq!(runtime.sweep_orphans_for("one", &prefixes), 1);
-        assert_eq!(
-            std::fs::read_to_string(&removed).unwrap(),
-            format!("{one}\n"),
-            "the API-owned application label must add no legacy rm call"
-        );
-        std::fs::write(&removed, "").unwrap();
-        assert_eq!(runtime.sweep_orphans_for("two", &prefixes), 1);
-        assert_eq!(
-            std::fs::read_to_string(&removed).unwrap(),
-            format!("{two}\n")
-        );
-        assert!(runtime.owned_container_id(&two, "one", &prefixes).is_err());
-        assert!(runtime
-            .owned_container_id("missing", "one", &prefixes)
-            .unwrap()
-            .is_none());
-    }
-
-    /// #194: a bare `docker image inspect` prints the whole inspect JSON, and on a host
-    /// that has exhausted `fs.pipe-user-pages-soft` a fresh pipe holds only 8 KiB. A
-    /// runner that drains the pipes only after the child exits wedges such a child in
-    /// `write(2)`, kills it at the deadline, and blames the runtime. The runner must
-    /// drain while it waits.
-    #[test]
-    fn a_child_that_floods_stdout_finishes_well_inside_the_deadline() {
-        let started = Instant::now();
-        let out = output_with_deadline(
-            Command::new("sh").args(["-c", "head -c 524288 /dev/zero"]),
-            "stdout flood",
-            Duration::from_secs(10),
-        )
-        .expect("a chatty child must not be reported as an unresponsive runtime");
-        let elapsed = started.elapsed();
-        assert!(out.status.success(), "status: {:?}", out.status);
-        assert_eq!(
-            out.stdout.len() as u64,
-            MAX_CAPTURE_BYTES,
-            "output past the cap is discarded, not left in the pipe"
-        );
-        assert!(out.stderr.is_empty());
-        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
-    }
-
-    /// Same for the other pipe: `docker run` can print pull progress on stderr.
-    #[test]
-    fn a_child_that_floods_stderr_finishes_well_inside_the_deadline() {
-        let started = Instant::now();
-        let out = output_with_deadline(
-            Command::new("sh").args(["-c", "head -c 524288 /dev/zero >&2"]),
-            "stderr flood",
-            Duration::from_secs(10),
-        )
-        .expect("a chatty child must not be reported as an unresponsive runtime");
-        let elapsed = started.elapsed();
-        assert!(out.status.success(), "status: {:?}", out.status);
-        assert_eq!(out.stderr.len() as u64, MAX_CAPTURE_BYTES);
-        assert!(out.stdout.is_empty());
-        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
-    }
-
-    /// The #149 guarantee survives the concurrent drain: a child that never exits is
-    /// still killed at the deadline, reported as a timeout, and reaped (no zombie). The
-    /// shell's `sleep` outlives the kill still holding the inherited pipe, which is
-    /// exactly why the readers are detached rather than joined — waiting for their EOF
-    /// would hand the deadline to whatever inherited the pipe.
-    #[test]
-    fn a_child_that_outlives_the_deadline_is_killed_reaped_and_reported() {
-        let dir = tempfile::tempdir().unwrap();
-        let pidfile = dir.path().join("pid");
-        let script = format!(
-            "echo $$ > '{}'; head -c 524288 /dev/zero; sleep 10",
-            pidfile.display()
-        );
-        let started = Instant::now();
-        let err = output_with_deadline(
-            Command::new("sh").args(["-c", &script]),
-            "wedged runtime",
-            Duration::from_secs(2),
-        )
-        .expect_err("a child that never exits must still fail at the deadline");
-        let elapsed = started.elapsed();
-        assert!(err.to_string().contains("timed out"), "{err}");
-        assert!(
-            elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(8),
-            "took {elapsed:?}"
-        );
-        let pid = std::fs::read_to_string(&pidfile)
-            .unwrap()
-            .trim()
-            .to_string();
-        // A reaped child has no /proc entry at all; a zombie has one in state `Z`
-        // (field 3 of `stat`, just past the `comm` field's closing paren).
-        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            let state = stat
-                .rsplit_once(')')
-                .and_then(|(_, rest)| rest.trim_start().chars().next());
-            assert_ne!(state, Some('Z'), "child {pid} left as a zombie: {stat}");
-        }
     }
 }

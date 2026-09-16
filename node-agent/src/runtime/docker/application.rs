@@ -292,7 +292,7 @@ async fn repair_nvidia_params(
 fn valid_id(id: &str) -> bool {
     id.len() == 64 && id.bytes().all(|v| v.is_ascii_hexdigit())
 }
-fn owner(config: &RuntimeConfig) -> Result<String, RuntimeError> {
+pub(super) fn owner(config: &RuntimeConfig) -> Result<String, RuntimeError> {
     #[cfg(test)]
     if let Some(owner) = &config.diagnostic_owner {
         return Ok(owner.clone());

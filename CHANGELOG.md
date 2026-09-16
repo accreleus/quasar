@@ -24,7 +24,25 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Removed
+- **The node agent no longer needs a `docker` or `podman` executable (#239).** Every
+  runtime operation it performs — discovery, image presence/pull/build/removal,
+  application launch/observe/stop/cleanup, the audio sidecar, diagnostic and driver
+  helpers, warm-up metadata, home liveness, engine storage and the startup sweep — goes
+  through the Docker Engine API over the configured Unix socket, and the runtime image
+  ships no engine CLI. There is no API-to-CLI fallback, and no raw engine passthrough for
+  users. `QUASAR_CONTAINER_RUNTIME` is retired: it is ignored, with one startup warning
+  (`token=runtime-cli-knob-retired`) telling an operator to select the engine with
+  `DOCKER_HOST` instead.
+
 ### Changed
+- **The startup sweep of pre-API containers runs through the runtime API (#239).** A
+  *legacy container* — a sibling from an older agent, identified only by this agent's
+  owner label plus an allowed name prefix — is re-inspected by its immutable ID before
+  any removal, and removed only when both hold. Foreign, unlabelled, API-owned and audio
+  containers are preserved and counted rather than deleted, and a removal this pass
+  cannot prove is left for the next boot instead of being retried immediately.
+  `CONTEXT.md` gains *legacy container*.
 - **Application switching, warm-up and teardown are generation-safe on the owned runtime
   API (#237).** Each app-container launch attempt now owns its own exit slot and log ring,
   so a previous generation's late exit or dying log lines can never be reported for the

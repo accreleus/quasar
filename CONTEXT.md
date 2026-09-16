@@ -99,6 +99,19 @@ warm-up container's teardown has been proven; an unproven teardown fails the
 build and publishes nothing. _Avoid_: "throwaway home" (the `agent-…` per-user
 homes the homes GC reaps) and the `scratch_mount()` tempdir in the home tests.
 
+**Legacy container** — an app or audio sibling left behind by a *pre-API* agent,
+one that shell-launched `docker run --rm`. It carries this agent's owner label
+and an allowed name prefix but has no durable operation journal, so it can only
+be identified, never reconciled: the boot sweep re-inspects each candidate by
+its immutable ID and removes it only when the exact owner label AND an allowed
+prefix both hold. Everything else — a foreign owner, an unlabelled container, a
+name that merely contains the prefix, an API-owned application, an audio sidecar
+— is *preserved and counted* for operator review, and a removal this pass cannot
+prove is left to the next boot rather than retried immediately. Removal is
+boot-only, behind the persistent owner lease. _Avoid_: "orphan" (the old CLI
+sweep's word; it suggested anything unclaimed was ours to delete), and "adoption"
+— nothing here resumes or observes a prior session.
+
 ## Stream health
 
 **Verdict** — the single stream-health judgement, as a value: the state (a

@@ -9,7 +9,7 @@
     "runtime": {
       "_role": "Vendor-neutral node-agent runtime (quasar-node-agent tag; quasar-vulkan before the 2026-08-26 role rename, still written as a transition alias). AMD/Intel VA + Vulkan encode. Also serves as the per-session PulseAudio sidecar image and the default app image on some stacks.",
       "size_max_mb": 2000,
-      "_size_note": "quasar-nv:prev (the same lineage built --target runtime) measured 1.57GB on 2026-07-26. 2000MB leaves headroom for the docker CLI + entrypoint moving into this stage per spec 5.3. If a legitimate addition breaks the ceiling, raise it deliberately in a commit that says why -- do not raise it to make a red build green.",
+      "_size_note": "quasar-nv:prev (the same lineage built --target runtime) measured 1.57GB on 2026-07-26. 2000MB leaves headroom for the runtime's media, GPU and diagnostic dependencies. If a legitimate addition breaks the ceiling, raise it deliberately in a commit that says why -- do not raise it to make a red build green.",
 
       "packages": {
         "required": [
@@ -58,15 +58,18 @@
           "curl", "gst-inspect-1.0", "gst-launch-1.0",
           "pulseaudio", "pactl",
           "avahi-daemon", "weston", "seatd",
-          "docker", "nft",
+          "nft",
           "quasar-node-agent", "quasar-node-agent-entrypoint"
         ],
         "_required_notes": {
-          "docker": "Static docker CLI -- the agent launches sibling app containers over the mounted socket.",
           "nft": "#527: the nftables client readiness.rs's detect_firewall_posture shells out to. See the nftables package note above.",
           "quasar-node-agent": "The BAKED binary. Its presence is what lets the deployment stop compiling the agent inside the container."
         },
-        "forbidden": ["cargo", "rustc", "rustup", "cc", "gcc", "meson", "ninja"]
+        "forbidden": ["cargo", "rustc", "rustup", "cc", "gcc", "meson", "ninja", "docker", "podman"],
+        "_forbidden_notes": {
+          "docker": "#239: the agent talks to the engine only through its Unix-socket API; a CLI in the image would be an un-owned mutation path.",
+          "podman": "#239: the agent talks to the engine only through its Unix-socket API; a CLI in the image would be an un-owned mutation path."
+        }
       },
 
       "paths": {

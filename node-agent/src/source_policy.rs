@@ -423,7 +423,7 @@ pub(crate) mod tests {
         let image = identity();
         std::fs::write(&path,json!({"images":{"steam":{"registry_ref":image.registry_ref,"version":image.version,"state":"ready"}}}).to_string()).unwrap();
         let images = crate::images::ImageManager::new(
-            crate::session::container::ContainerRuntime::test_runtime("/bin/true"),
+            crate::session::container::ContainerRuntime::new(false),
             path.to_str().unwrap().into(),
         );
         let policy = SourcePolicy::new(

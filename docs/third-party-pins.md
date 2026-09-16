@@ -18,7 +18,8 @@ change (or a `--build-arg`), with no Dockerfile surgery.
 >
 > **Cost note:** the pins marked TOOLCHAIN in `pins.env` feed the `quasar-gst-toolchain:<hash>`
 > artefact tag. Moving one means a ~40-minute toolchain rebuild (once, then reused by every
-> agent image); moving `DOCKER_VERSION` or `SAMPLY_VERSION` costs a ~5-minute image build.
+> agent image); moving `DOCKER_VERSION` (dev-image tooling only) or `SAMPLY_VERSION` costs a
+> ~5-minute image build.
 
 > **History:** the Ubuntu-based `Dockerfile.dev` / `Dockerfile.nv` (gst-1.24, pins `cbfdfe5` /
 > `c49af96`) and their GW-02 in-compositor-NV12 runtime knobs were cut over and deleted
@@ -68,7 +69,7 @@ a version alone says nothing about the bytes. Both are checked against a sha256 
 | Pin | Value | Why the digest, not just the version |
 |---|---|---|
 | `RUSTUP_VERSION` + `RUSTUP_INIT_SHA256_X86_64` / `_AARCH64` | `1.29.0` | The build used to `curl https://sh.rustup.rs \| sh`. That URL serves an **unversioned** script, so there was nothing to pin and whatever the origin returned was piped into a shell in the toolchain stage. It now fetches `static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/<triple>/rustup-init`, which is immutable per version, and `sha256sum -c`s it first. Both digests were confirmed against the vendor's own published `rustup-init.sha256`. |
-| `DOCKER_VERSION` + `DOCKER_CLI_SHA256_X86_64` / `_AARCH64` | `27.5.1` | This static CLI is what the agent runs **against the mounted host docker socket**, so a substituted tarball is host-level code execution. Docker publishes no checksum beside these tarballs; the digests were recorded from the fetched bytes, which freezes them — a later change to a released version's tarball becomes a build failure instead of a silent swap. |
+| `DOCKER_VERSION` + `DOCKER_CLI_SHA256_X86_64` / `_AARCH64` | `27.5.1` | This static CLI is dev-image tooling for compose and harness workflows. Since #239 the runtime image ships no engine CLI; the agent uses its Unix-socket API instead. A substituted dev tarball is still host-level code execution, so Docker's unpublished tarball checksums are recorded from fetched bytes: a later change to a released version's tarball becomes a build failure instead of a silent swap. |
 
 Bumping either version means re-recording **both** architectures' digests in the same commit;
 `deploy/build-images.sh`'s `check_pins_agree` only checks that `pins.env` and the Dockerfile ARG
@@ -304,7 +305,8 @@ deploy/build-images.sh nv --gwd-ref <sha>   # test a compositor re-pin
 
 The three consolidation ARGs (`CUDA_ENABLE`, `CUDA_PKG_VERSION`) join the existing pin ARGs
 (`GST_WAYLAND_DISPLAY_REF`, `GST_INTERPIPE_REF`, `GST_PLUGINS_RS_REF`, `CARGO_C_VERSION`,
-`RUST_VERSION`, `DOCKER_VERSION`) already documented in the `Dockerfile.vulkan` pins table above.
+`RUST_VERSION`, `DOCKER_VERSION`; dev-image tooling only) already documented in the
+`Dockerfile.vulkan` pins table above.
 
 ### Legacy cutover — DONE (2026-07-17)
 

@@ -103,8 +103,8 @@ impl RuntimeConfig {
         }
     }
 
-    /// Use the same explicit Unix endpoint as the still-unmigrated Docker CLI.
-    /// Context/TLS/version overrides are not silently ignored.
+    /// Resolve the one explicit Unix endpoint this agent talks to. Context, TLS
+    /// and API-version overrides are refused rather than silently ignored.
     pub fn from_environment() -> Result<Self, RuntimeError> {
         for key in [
             "DOCKER_CONTEXT",
@@ -116,19 +116,23 @@ impl RuntimeConfig {
                 return Err(ErrorKind::InvalidConfiguration.into());
             }
         }
-        let cli = std::env::var("QUASAR_CONTAINER_RUNTIME").unwrap_or_else(|_| "docker".into());
-        if std::path::Path::new(&cli)
-            .file_name()
-            .is_none_or(|v| v != "docker")
-        {
-            return Err(ErrorKind::InvalidConfiguration.into());
+        // Retired by #239: the agent no longer runs an engine CLI, so there is
+        // nothing left for this knob to select. Say so once rather than failing
+        // an upgraded host whose .env still carries it.
+        if std::env::var_os("QUASAR_CONTAINER_RUNTIME").is_some() {
+            tracing::warn!(
+                token = "runtime-cli-knob-retired",
+                "QUASAR_CONTAINER_RUNTIME is ignored: the agent no longer runs an engine CLI; \
+                 select the engine with DOCKER_HOST (unix://)"
+            );
         }
         match std::env::var("DOCKER_HOST") {
             Ok(host) if !host.is_empty() => Self::from_endpoint(&host),
             Ok(_) | Err(std::env::VarError::NotPresent) => {
-                // Docker CLI also remembers `docker context use` in its config.
-                // Without an explicit endpoint, that could split API reads from
-                // still-unmigrated CLI writes onto two different engines.
+                // The Docker CLI remembers `docker context use` in its config.
+                // An operator who switched context expects it to be honoured;
+                // this agent cannot honour it, so refuse rather than silently
+                // talking to a different engine than the one they selected.
                 let directory = std::env::var_os("DOCKER_CONFIG")
                     .filter(|v| !v.is_empty())
                     .map(PathBuf::from)
@@ -210,6 +214,19 @@ impl std::fmt::Display for ApiVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}.{}", self.major, self.minor)
     }
+}
+
+/// What one boot-only legacy sweep did (see
+/// [`RuntimeClient::retire_legacy_containers`]). `preserved` counts containers
+/// this agent could not prove it owns and therefore left alone — a foreign
+/// owner, an unrelated name, an API-owned application, an audio sidecar.
+/// `unresolved` counts owned containers whose removal this pass could not
+/// prove; the next boot retries them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LegacyRetirement {
+    pub removed: usize,
+    pub preserved: usize,
+    pub unresolved: usize,
 }
 
 /// Discovery facts are not a claim that GPU/rootless capabilities were tested.
@@ -458,6 +475,21 @@ impl RuntimeClient {
         let config = self.config.clone();
         self.submit_owned(
             async move { docker::application::retire(&config).await },
+            self.config.deadline.saturating_mul(4),
+            true,
+        )
+    }
+
+    /// Boot-only retirement of LEGACY containers — pre-API siblings an older
+    /// agent shell-launched, which carry this agent's owner label and an
+    /// allowed name prefix but no operation journal. Each candidate is
+    /// re-inspected by its immutable ID before any removal; anything not proven
+    /// owned is preserved and counted. This is a teardown policy, never
+    /// adoption: nothing here observes or resumes a prior session.
+    pub fn retire_legacy_containers(&self, prefixes: Vec<String>) -> Operation<LegacyRetirement> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::legacy::retire_legacy(&config, &prefixes).await },
             self.config.deadline.saturating_mul(4),
             true,
         )
@@ -925,7 +957,6 @@ mod tests {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "runtime::tests::environment_rejects_persisted_cli_context_without_explicit_endpoint"])
             .env("QUASAR_RUNTIME_CONTEXT_CHILD", "1").env("DOCKER_CONFIG", dir.path())
-            .env("QUASAR_CONTAINER_RUNTIME", "docker")
             .env_remove("DOCKER_HOST").env_remove("DOCKER_CONTEXT")
             .env_remove("DOCKER_TLS")
             .env_remove("DOCKER_TLS_VERIFY").env_remove("DOCKER_API_VERSION")
