@@ -1531,9 +1531,11 @@ pub(crate) async fn abandon(config: &RuntimeConfig, operation: &str) -> Result<(
     let Some(mut intent) = journal.read()? else {
         return Ok(());
     };
-    // Terminal evidence outranks the endpoint. Completed was written only after
-    // absence of the exact immutable ID was proven, so there is nothing left to
-    // mutate and nothing an ownership check could protect. Checking `owns` first
+    // Terminal evidence outranks the endpoint. Completed is durable proof that no
+    // container of this operation remains: normally the exact immutable ID was
+    // inspected absent after removal, otherwise the durable unique name was absent
+    // before an ID was ever learned. Either way there is nothing left to mutate
+    // and nothing an ownership check could protect. Checking `owns` first
     // made a moved DOCKER_HOST (a proxy socket in front of the same daemon)
     // refuse every boot with UnknownOutcome, forever. Every NON-terminal phase
     // below still has to prove it owns the endpoint it would mutate.

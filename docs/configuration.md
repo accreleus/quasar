@@ -897,12 +897,16 @@ Docker-compatible Unix socket, but that configuration is not certified.
 
 Every application, helper and audio journal records the endpoint it was written
 against. Changing `DOCKER_HOST` is safe while every record is terminal (`Completed`):
-those records are proof of absence and are not touched. A non-terminal record written
-against the previous endpoint cannot be reconciled through the new one, so boot refuses
-to start (`runtime-application-retirement-pending`, exit and supervisor restart) rather
-than guess whether a container on the old engine still holds a managed home. Recovery
-is to restore the previous `DOCKER_HOST`, let one boot retire the records, and switch
-again.
+those records are proof that no container of that operation remains, and they are not
+touched. A non-terminal record written against the previous endpoint cannot be
+reconciled through the new one. For an application record that means boot refuses to
+start (`runtime-application-retirement-pending`, exit and supervisor restart) rather
+than guess whether a container on the old engine still holds a managed home. A
+non-terminal diagnostic-helper or audio record only logs
+`runtime-diagnostic-recovery-pending` / `runtime-audio-retirement-pending` and stays
+unresolved; the agent still registers, and later maintenance keeps retrying it.
+Recovery in either case is to restore the previous `DOCKER_HOST`, let one boot retire
+the records, and switch again.
 
 At boot, after discovering the engine, the agent first retries journalled diagnostic
 helper cleanup, then retries journalled application cleanup and retires every
