@@ -4494,7 +4494,12 @@ fn routine_audio_recovery_finishes_a_stop_whose_reply_was_lost_and_retires_its_s
     assert_eq!(
         engine.requests(&format!("POST /containers/{ID}/stop")),
         2,
-        "the same durable intent, retried once — never a second sidecar"
+        "the same durable intent, retried once"
+    );
+    assert_eq!(
+        engine.requests("POST /containers/create"),
+        1,
+        "recovery reconciles the recorded sidecar; it never creates a second one"
     );
     assert_eq!(
         maintenance
@@ -4512,4 +4517,61 @@ fn routine_audio_recovery_finishes_a_stop_whose_reply_was_lost_and_retires_its_s
     let settled = engine.state.lock().unwrap().requests.len();
     maintenance.recover_audio_sidecars().wait().unwrap();
     assert_eq!(engine.state.lock().unwrap().requests.len(), settled);
+    assert_eq!(engine.requests("POST /containers/create"), 1);
+}
+
+/// One record this agent cannot reconcile must not hide every obligation behind
+/// it. Recovery scans in a stable order, so a bad entry is met FIRST on every
+/// 30 s pass — aborting there would leave a stopped-but-unremoved sidecar running
+/// forever, which is the same failure mode as having no maintenance pass at all.
+#[test]
+fn routine_recovery_finishes_later_obligations_past_an_unreadable_journal() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let (helper, run) = audio_request(&engine);
+    let socket_dir = run.socket_dir.clone();
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    engine.state.lock().unwrap().lose_stop_before_effect = true;
+    assert_eq!(
+        engine
+            .client()
+            .stop_audio_sidecar(id.clone())
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    // A journal whose bytes are not a record at all, named so it sorts first.
+    let helpers = helper_intent_path(&engine, "pulse-fixture")
+        .parent()
+        .unwrap()
+        .to_owned();
+    std::fs::write(helpers.join("0".repeat(64)), b"not a journal").unwrap();
+    let maintenance = engine.client();
+    assert_eq!(
+        maintenance
+            .recover_audio_sidecars()
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Protocol,
+        "the unreadable record is still reported as an open obligation"
+    );
+    assert!(
+        !engine.state.lock().unwrap().running,
+        "the recoverable record behind the bad one was reconciled anyway"
+    );
+    assert_eq!(
+        maintenance
+            .observe_audio_sidecar(id)
+            .wait()
+            .unwrap()
+            .exit_code,
+        Some(23)
+    );
+    assert!(!socket_dir.exists());
 }

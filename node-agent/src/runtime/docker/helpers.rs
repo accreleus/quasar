@@ -1713,126 +1713,156 @@ async fn recover_profile(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(_) => return Err(ErrorKind::Unavailable.into()),
     };
+    // Sorted, so recovery order is a property of the records rather than of the
+    // directory's internal layout, and a failing entry is reproducible.
+    let mut paths = Vec::new();
+    let mut failure = None;
     for entry in entries {
-        let entry = entry.map_err(|_| ErrorKind::Unavailable)?;
+        match entry {
+            Ok(entry) => paths.push(entry),
+            Err(_) => failure = failure.or(Some(ErrorKind::Unavailable)),
+        }
+    }
+    paths.sort_by_key(|entry| entry.path());
+    // Each record is its own obligation. One this agent cannot reconcile — an
+    // unreadable journal, a lease it cannot take, a container it cannot prove —
+    // must not hide the ones after it: every pass meets the same bad record
+    // first, so aborting there would leave a stopped sidecar running until the
+    // next agent restart. Keep the FIRST failure and report it once the whole
+    // profile has been walked.
+    for entry in paths {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) == Some("lock")
             || path.extension().and_then(|s| s.to_str()) == Some("new")
         {
             continue;
         }
-        if !entry
-            .file_type()
-            .map_err(|_| ErrorKind::Unavailable)?
-            .is_file()
-        {
-            return Err(ErrorKind::Protocol.into());
+        if let Err(error) = recover_entry(config, profile, &entry).await {
+            failure = failure.or(Some(error.kind));
         }
-        use std::{io::Read, os::unix::fs::OpenOptionsExt};
-        let mut bytes = Vec::new();
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|_| ErrorKind::Unavailable)?
-            .take((crate::runtime::helpers::MAX_JOURNAL_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|_| ErrorKind::Unavailable)?;
-        if bytes.len() > crate::runtime::helpers::MAX_JOURNAL_BYTES {
-            return Err(ErrorKind::Protocol.into());
-        }
-        let scanned: HelperIntent =
-            serde_json::from_slice(&bytes).map_err(|_| ErrorKind::Protocol)?;
-        // NVIDIA readiness calls diagnostic recovery.  An active audio sibling
-        // is a long-running workload and must neither make that path Busy nor
-        // be stopped by it.
-        if scanned.profile != profile {
-            continue;
-        }
-        if profile == HelperProfile::Audio
-            && matches!(
-                scanned.phase,
-                HelperPhase::Running | HelperPhase::Starting | HelperPhase::Creating
-            )
-        {
-            // Pending recovery is never a hidden stop request for live audio.
-            continue;
-        }
-        if scanned.phase == HelperPhase::Completed {
-            continue;
-        }
-        current_intent(config, &scanned)?;
-        // Re-read while holding the per-operation lease: recovery must not
-        // race a caller that is reconciling the same lost create.
-        let journal = HelperJournal::acquire(config, &scanned.operation).await?;
-        let mut intent = journal.read()?.ok_or(ErrorKind::UnknownOutcome)?;
-        if intent.phase == HelperPhase::Completed {
-            continue;
-        }
-        current_intent(config, &intent)?;
-        if profile == HelperProfile::Audio
-            && matches!(
-                intent.phase,
-                HelperPhase::Running | HelperPhase::Starting | HelperPhase::Creating
-            )
-        {
-            // Re-check under the operation lease: a stop/start transition can
-            // race the initial scan, and routine recovery never terminates it.
-            continue;
-        }
-        if profile == HelperProfile::Audio && intent.phase == HelperPhase::Preparing {
-            // No Docker create was submitted in this phase. A marker proves a
-            // partial local mkdir belongs to this operation; absence means the
-            // preparation never reached the filesystem.
-            cleanup_preparing_audio(&mut intent, &journal)?;
-            journal.discard_definitive()?;
-            continue;
-        }
-        if profile == HelperProfile::Audio
-            && intent.phase == HelperPhase::CleanupPending
-            && intent.id.is_none()
-        {
-            // A definitive create rejection has no container to inspect.  Its
-            // marker-backed directory obligation is completed directly.
-            retire_audio_dir(&mut intent, &journal)?;
-            cleanup_audio_dir(&intent)?;
-            intent.phase = HelperPhase::Completed;
-            journal.write(&intent)?;
-            continue;
-        }
-        if intent.id.is_none() {
-            // POST /create may have succeeded although its response was lost.
-            // This is read-only name inspection, followed by full immutable
-            // configuration/ownership validation before recording the ID.
-            let docker = open(config).await?;
-            let info = docker
-                .inspect_container(&intent.name, None)
-                .await
-                .map_err(uncertain_inspection)?;
-            let immutable_id = info
-                .id
-                .clone()
-                .filter(|v| valid_id(v))
-                .ok_or(ErrorKind::UnknownOutcome)?;
-            intent.id = Some(immutable_id);
-            let _ = inspect_owned(info, &intent)?;
-            journal.write(&intent)?;
-        }
-        let id = owned(&intent)?;
-        let requested_stop = intent.phase == HelperPhase::Stopping;
-        drop(journal);
-        if requested_stop {
-            // `stop` takes this same per-operation lease before it verifies
-            // and retries the explicitly authorized termination.
-            stop(config, id.clone()).await?;
-        }
-        // A recovery pass never launches/recreates. Its bounded observation either
-        // proves a stopped helper can be collected or leaves uncertainty durable.
-        let _ = tokio::time::timeout(Duration::from_secs(5), async {
-            let _ = observe(config, id.clone()).await;
-        })
-        .await;
-        cleanup(config, id).await?;
     }
+    failure.map_or(Ok(()), |kind| Err(kind.into()))
+}
+
+/// Reconcile ONE helper journal. `Ok(())` covers both "finished it" and "this
+/// record is not mine to touch"; the skip rules, profile filter and lease re-read
+/// are identical to the boot-time pass this was extracted from.
+async fn recover_entry(
+    config: &RuntimeConfig,
+    profile: HelperProfile,
+    entry: &std::fs::DirEntry,
+) -> Result<(), RuntimeError> {
+    let path = entry.path();
+    if !entry
+        .file_type()
+        .map_err(|_| ErrorKind::Unavailable)?
+        .is_file()
+    {
+        return Err(ErrorKind::Protocol.into());
+    }
+    use std::{io::Read, os::unix::fs::OpenOptionsExt};
+    let mut bytes = Vec::new();
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|_| ErrorKind::Unavailable)?
+        .take((crate::runtime::helpers::MAX_JOURNAL_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ErrorKind::Unavailable)?;
+    if bytes.len() > crate::runtime::helpers::MAX_JOURNAL_BYTES {
+        return Err(ErrorKind::Protocol.into());
+    }
+    let scanned: HelperIntent = serde_json::from_slice(&bytes).map_err(|_| ErrorKind::Protocol)?;
+    // NVIDIA readiness calls diagnostic recovery.  An active audio sibling
+    // is a long-running workload and must neither make that path Busy nor
+    // be stopped by it.
+    if scanned.profile != profile {
+        return Ok(());
+    }
+    if profile == HelperProfile::Audio
+        && matches!(
+            scanned.phase,
+            HelperPhase::Running | HelperPhase::Starting | HelperPhase::Creating
+        )
+    {
+        // Pending recovery is never a hidden stop request for live audio.
+        return Ok(());
+    }
+    if scanned.phase == HelperPhase::Completed {
+        return Ok(());
+    }
+    current_intent(config, &scanned)?;
+    // Re-read while holding the per-operation lease: recovery must not
+    // race a caller that is reconciling the same lost create.
+    let journal = HelperJournal::acquire(config, &scanned.operation).await?;
+    let mut intent = journal.read()?.ok_or(ErrorKind::UnknownOutcome)?;
+    if intent.phase == HelperPhase::Completed {
+        return Ok(());
+    }
+    current_intent(config, &intent)?;
+    if profile == HelperProfile::Audio
+        && matches!(
+            intent.phase,
+            HelperPhase::Running | HelperPhase::Starting | HelperPhase::Creating
+        )
+    {
+        // Re-check under the operation lease: a stop/start transition can
+        // race the initial scan, and routine recovery never terminates it.
+        return Ok(());
+    }
+    if profile == HelperProfile::Audio && intent.phase == HelperPhase::Preparing {
+        // No Docker create was submitted in this phase. A marker proves a
+        // partial local mkdir belongs to this operation; absence means the
+        // preparation never reached the filesystem.
+        cleanup_preparing_audio(&mut intent, &journal)?;
+        journal.discard_definitive()?;
+        return Ok(());
+    }
+    if profile == HelperProfile::Audio
+        && intent.phase == HelperPhase::CleanupPending
+        && intent.id.is_none()
+    {
+        // A definitive create rejection has no container to inspect.  Its
+        // marker-backed directory obligation is completed directly.
+        retire_audio_dir(&mut intent, &journal)?;
+        cleanup_audio_dir(&intent)?;
+        intent.phase = HelperPhase::Completed;
+        journal.write(&intent)?;
+        return Ok(());
+    }
+    if intent.id.is_none() {
+        // POST /create may have succeeded although its response was lost.
+        // This is read-only name inspection, followed by full immutable
+        // configuration/ownership validation before recording the ID.
+        let docker = open(config).await?;
+        let info = docker
+            .inspect_container(&intent.name, None)
+            .await
+            .map_err(uncertain_inspection)?;
+        let immutable_id = info
+            .id
+            .clone()
+            .filter(|v| valid_id(v))
+            .ok_or(ErrorKind::UnknownOutcome)?;
+        intent.id = Some(immutable_id);
+        let _ = inspect_owned(info, &intent)?;
+        journal.write(&intent)?;
+    }
+    let id = owned(&intent)?;
+    let requested_stop = intent.phase == HelperPhase::Stopping;
+    drop(journal);
+    if requested_stop {
+        // `stop` takes this same per-operation lease before it verifies
+        // and retries the explicitly authorized termination.
+        stop(config, id.clone()).await?;
+    }
+    // A recovery pass never launches/recreates. Its bounded observation either
+    // proves a stopped helper can be collected or leaves uncertainty durable.
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        let _ = observe(config, id.clone()).await;
+    })
+    .await;
+    cleanup(config, id).await?;
     Ok(())
 }
