@@ -361,11 +361,13 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 		// non-terminal sessions to failed — but only if this connection is
 		// still the current one. A displaced connection must not reap the live
 		// sessions the newer connection now owns (P2-06 race).
-		if h.registry.remove(ac) {
-			h.events.HostDisconnected(bg, hostID)
+		h.registry.removeWithLifecycle(ac, func() {
+			ctx, cancel := context.WithTimeout(bg, agentDBCallTimeout)
+			defer cancel()
+			h.events.HostDisconnected(ctx, hostID)
 			// Bounds the rate-limiter map by the live connection set.
 			h.imageLimiter.evict(hostID)
-		}
+		})
 	}()
 
 	// Push settings + console config (agent-api.md `config_update`) before the
@@ -408,7 +410,9 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	// Reconcile before processing capacity: handleCapacity may auto-start a
 	// console session, and reaping after that launch would mark it stale and
 	// let the next refresh launch a duplicate compositor.
-	h.events.AgentReconnected(bg, hostID)
+	reconnectCtx, reconnectCancel := context.WithTimeout(bg, agentDBCallTimeout)
+	h.registry.withCurrent(ac, func() { h.events.AgentReconnected(reconnectCtx, hostID) })
+	reconnectCancel()
 
 	// Image-management P2: reconcile host_images against the agent's snapshot,
 	// then re-ensure what's missing. Fire-and-forget — an image problem must
@@ -468,7 +472,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			// loop. The coordinator dispatches any corrective stop over Send, not
 			// SendWithAck — THIS loop is what would read the ack.
 			rcCtx, rcCancel := context.WithTimeout(bg, agentDBCallTimeout)
-			h.events.AgentHeartbeat(rcCtx, hostID, hb.RunningSessions)
+			h.registry.withCurrent(ac, func() { h.events.AgentHeartbeat(rcCtx, hostID, hb.RunningSessions) })
 			rcCancel()
 			// #383: VRAM telemetry, off the read loop (vramQueue). An absent
 			// gpu_vram key is a no-op — the stored sample ages out.
@@ -489,7 +493,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 				return fmt.Errorf("decode session_state: %w", err)
 			}
 			stateCtx, stateCancel := context.WithTimeout(bg, agentDBCallTimeout)
-			h.events.AgentState(stateCtx, hostID, m)
+			h.registry.withCurrent(ac, func() { h.events.AgentState(stateCtx, hostID, m) })
 			stateCancel()
 		case "session_metrics":
 			// Fire-and-forget; malformed drops the message, never the connection

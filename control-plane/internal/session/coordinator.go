@@ -231,12 +231,10 @@ func (c *Coordinator) failSession(sessionID, reason string) {
 // control-plane restart, so the control plane must LEARN which survived instead
 // of assuming none did.
 //
-// Forward: a `running` row the agent no longer names is gone. Only `running` is
-// judged. A row reaches running only after the agent itself reported it
-// (agent_state.go), so a running row the agent has dropped is genuinely dead,
-// and assigned/starting rows belong to a launch in flight — the agent inserts a
-// session into its map at the session_start ack, BEFORE it reports running, so
-// it legitimately lists ids we still have as starting.
+// Forward: a `running` row the agent no longer names is host-lost; a stopping
+// row which had reached running is terminally stopped. Assigned/starting and
+// pre-running stops remain launch-in-flight because the agent may legitimately
+// list them before it reports running.
 //
 // Reverse: the agent runs something we have no running row for. Left alone that
 // is an orphaned container holding a GPU. The runner's own idle reaper bounds it
@@ -247,10 +245,7 @@ func (c *Coordinator) failSession(sessionID, reason string) {
 // agent websocket read loop, and that same loop is what would have to read the
 // ack — so an ack here could only ever time out.
 func (c *Coordinator) AgentHeartbeat(ctx context.Context, hostID string, running []string) {
-	// A nil list is "the agent said nothing", not "the agent runs nothing". Our
-	// agent always emits the field, but absent and [] decode identically to nil
-	// in Go, and treating the two the same would fail every running session on
-	// this host for a malformed or older heartbeat.
+	// Missing/null is unknown; an explicit [] reports no live sessions.
 	if running == nil {
 		return
 	}
@@ -258,6 +253,27 @@ func (c *Coordinator) AgentHeartbeat(ctx context.Context, hostID string, running
 	if err != nil {
 		c.log.Warn("heartbeat reconcile: list running sessions failed", "host_id", hostID, "err", err)
 		return
+	}
+	reaped, err := c.store.ReapHeartbeatMissing(ctx, hostID, running)
+	if err != nil {
+		c.log.Warn("heartbeat reconcile: reap missing sessions failed", "host_id", hostID, "err", err)
+		return
+	}
+	for _, sess := range reaped {
+		if sess.State == StateFailed {
+			c.recordSessionFailed(ctx, sess, "control_plane", nil, "agent no longer running this session")
+		}
+		c.log.Info("session ended",
+			"session_id", sess.ID,
+			"state", sess.State,
+			"state_detail", deref(sess.StateDetail),
+			"reason_source", "heartbeat_reconcile",
+		)
+		c.health.forget(sess.ID)
+		c.display.forget(sess.ID)
+		c.swapper.forget(sess.ID)
+		c.forgetTerminalSession(sess.ID)
+		c.fireConsoleReeval(sess.HostID, sess.ID)
 	}
 
 	cpRunning := make(map[string]struct{}, len(rows))
@@ -267,14 +283,6 @@ func (c *Coordinator) AgentHeartbeat(ctx context.Context, hostID string, running
 	live := make(map[string]struct{}, len(running))
 	for _, id := range running {
 		live[id] = struct{}{}
-	}
-
-	for _, sid := range rows {
-		if _, ok := live[sid]; ok {
-			continue
-		}
-		detail := "host_lost"
-		c.failSessionWithDetail(sid, "agent no longer running this session", &detail)
 	}
 
 	for sid := range live {

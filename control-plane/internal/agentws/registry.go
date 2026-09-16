@@ -39,14 +39,23 @@ type AckResult struct {
 // the session coordinator dispatches through; the coordinator never touches a
 // websocket directly.
 type Registry struct {
+	mu         sync.Mutex
+	conns      map[string]*conn // hostID → live connection
+	lifecycles map[string]*hostLifecycle
+	log        *slog.Logger
+}
+
+// hostLifecycle serializes only callbacks which can change a host's session
+// lifecycle. It is reference-counted so a queued stale callback cannot race a
+// replacement through a newly allocated lock after the old connection leaves.
+type hostLifecycle struct {
 	mu    sync.Mutex
-	conns map[string]*conn // hostID → live connection
-	log   *slog.Logger
+	users int
 }
 
 // NewRegistry builds an empty Registry.
 func NewRegistry(log *slog.Logger) *Registry {
-	return &Registry{conns: make(map[string]*conn), log: log}
+	return &Registry{conns: make(map[string]*conn), lifecycles: make(map[string]*hostLifecycle), log: log}
 }
 
 // conn is one live agent connection. A single writer goroutine drains out; all
@@ -72,9 +81,36 @@ func newConn(hostID string, ws *websocket.Conn) *conn {
 	}
 }
 
+// acquireLifecycle holds a per-host lifecycle callback gate without retaining
+// Registry.mu while the callback can dispatch.
+func (r *Registry) acquireLifecycle(hostID string) *hostLifecycle {
+	r.mu.Lock()
+	gate := r.lifecycles[hostID]
+	if gate == nil {
+		gate = &hostLifecycle{}
+		r.lifecycles[hostID] = gate
+	}
+	gate.users++
+	r.mu.Unlock()
+	gate.mu.Lock()
+	return gate
+}
+
+func (r *Registry) releaseLifecycle(hostID string, gate *hostLifecycle) {
+	gate.mu.Unlock()
+	r.mu.Lock()
+	gate.users--
+	if gate.users == 0 && r.lifecycles[hostID] == gate {
+		delete(r.lifecycles, hostID)
+	}
+	r.mu.Unlock()
+}
+
 // add registers c as the live connection for its host, displacing (and closing)
 // any prior one — a reconnect supersedes the stale connection.
 func (r *Registry) add(c *conn) {
+	gate := r.acquireLifecycle(c.hostID)
+	defer r.releaseLifecycle(c.hostID, gate)
 	r.mu.Lock()
 	old := r.conns[c.hostID]
 	r.conns[c.hostID] = c
@@ -84,12 +120,35 @@ func (r *Registry) add(c *conn) {
 	}
 }
 
+// withCurrent serializes lifecycle callbacks with reconnect replacement. It
+// never holds Registry.mu across callback work, so callbacks may dispatch.
+func (r *Registry) withCurrent(c *conn, callback func()) bool {
+	gate := r.acquireLifecycle(c.hostID)
+	defer r.releaseLifecycle(c.hostID, gate)
+	r.mu.Lock()
+	current := r.conns[c.hostID] == c
+	r.mu.Unlock()
+	if !current {
+		return false
+	}
+	callback()
+	return true
+}
+
 // remove drops c iff it is still the registered connection for its host (a
 // newer reconnect must not be evicted by an older connection's teardown). It
 // returns whether c was the current connection: false means c was already
 // displaced by a reconnect, so its teardown must NOT trigger the host-disconnect
 // reaper — the newer connection now owns the host's sessions (P2-06 race fix).
 func (r *Registry) remove(c *conn) bool {
+	return r.removeWithLifecycle(c, func() {})
+}
+
+// removeWithLifecycle linearizes removal and its HostDisconnected callback with
+// reconnect and inbound lifecycle work for this host.
+func (r *Registry) removeWithLifecycle(c *conn, callback func()) bool {
+	gate := r.acquireLifecycle(c.hostID)
+	defer r.releaseLifecycle(c.hostID, gate)
 	r.mu.Lock()
 	current := r.conns[c.hostID] == c
 	if current {
@@ -97,6 +156,9 @@ func (r *Registry) remove(c *conn) bool {
 	}
 	r.mu.Unlock()
 	c.close()
+	if current {
+		callback()
+	}
 	return current
 }
 

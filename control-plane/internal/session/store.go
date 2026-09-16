@@ -801,6 +801,52 @@ func (s *Store) ReapHostExceptRunning(ctx context.Context, hostID, reason string
 	return out, rows.Err()
 }
 
+// ReapHeartbeatMissing atomically terminalizes running rows and started stops
+// omitted by an explicit heartbeat; pre-running stops remain launch-in-flight.
+func (s *Store) ReapHeartbeatMissing(ctx context.Context, hostID string, running []string) ([]Session, error) {
+	if !isValidUUID(hostID) {
+		return nil, nil
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin heartbeat-reap tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck — no-op after commit
+
+	rows, err := tx.Query(ctx, `
+		UPDATE sessions SET
+		    state = CASE WHEN state = 'stopping' THEN 'stopped' ELSE 'failed' END,
+		    state_detail = 'host_lost',
+		    error_message = CASE WHEN state = 'stopping' THEN NULL ELSE 'agent no longer running this session' END,
+		    ended_at = now()
+		WHERE host_id = $1::uuid
+		  AND (state = 'running' OR (state = 'stopping' AND started_at IS NOT NULL))
+		  AND NOT (id::text = ANY($2::text[]))
+		RETURNING `+sessionCols+`
+	`, hostID, running)
+	if err != nil {
+		return nil, fmt.Errorf("reap heartbeat-missing sessions: %w", err)
+	}
+	var out []Session
+	for rows.Next() {
+		sess, err := scanSessionRow(rows)
+		if err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan heartbeat-reaped session: %w", err)
+		}
+		out = append(out, sess)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("iterate heartbeat-reaped sessions: %w", err)
+	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit heartbeat-reap tx: %w", err)
+	}
+	return out, nil
+}
+
 // RunningSessionIDsOnHost lists only the `running` rows — the exact set the
 // agent's heartbeat is authoritative over (#128).
 func (s *Store) RunningSessionIDsOnHost(ctx context.Context, hostID string) ([]string, error) {
@@ -949,7 +995,7 @@ const liveHomeSessionSQL = `
 	WHERE s.user_id = $1::uuid
 	  AND COALESCE(a.parent_app_id, a.id) = $2::uuid
 	  AND ($3 = '' OR s.id != $3::uuid)
-	  AND s.state IN ('pending','assigned','starting','running')
+	  AND s.state IN ('pending','assigned','starting','running','stopping')
 	LIMIT 1`
 
 // HasLiveUserAppSession is the swap-path single-writer guard (P5-04): the id of
