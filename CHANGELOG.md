@@ -41,8 +41,10 @@ own; the two do not move together, and that is deliberate.
   owner label plus an allowed name prefix — is re-inspected by its immutable ID before
   any removal, and removed only when both hold. Foreign, unlabelled, API-owned and audio
   containers are preserved and counted rather than deleted, and a removal this pass
-  cannot prove is left for the next boot instead of being retried immediately.
-  `CONTEXT.md` gains *legacy container*.
+  cannot prove is left for the next boot instead of being retried immediately. The 30 s
+  cleanup maintenance pass now retries the audio-sidecar and diagnostic-helper journals as
+  well as the application journal, so a teardown that ran while the engine was unreachable
+  is finished without an agent restart. `CONTEXT.md` gains *legacy container*.
 - **Application switching, warm-up and teardown are generation-safe on the owned runtime
   API (#237).** Each app-container launch attempt now owns its own exit slot and log ring,
   so a previous generation's late exit or dying log lines can never be reported for the

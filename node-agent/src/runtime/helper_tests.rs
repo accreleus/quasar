@@ -4453,3 +4453,63 @@ fn boot_retirement_keeps_an_unfinished_audio_record_uncertain_across_an_endpoint
     );
     assert_eq!(served(&pending), before);
 }
+
+/// #239/#228: an interrupted teardown stays tracked FOR RETRY, at runtime and not
+/// only at the next boot. The engine goes away between a sidecar's stop request and
+/// its reply, so the teardown is durable (`Stopping`) and the container untouched;
+/// the agent's periodic maintenance pass must finish it as soon as the engine is
+/// reachable again. Before that pass existed the sidecar simply ran on until a
+/// restart. Routine recovery still leaves a LIVE sidecar alone —
+/// `ordinary_audio_recovery_preserves_live_work_but_boot_retirement_stops_it`; what
+/// makes this one ours to finish is the recorded stop, not the pass that finds it.
+#[test]
+fn routine_audio_recovery_finishes_a_stop_whose_reply_was_lost_and_retires_its_socket_dir() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let (helper, run) = audio_request(&engine);
+    let socket_dir = run.socket_dir.clone();
+    let id = engine
+        .client()
+        .run_audio_sidecar(helper, run)
+        .wait()
+        .unwrap();
+    assert!(socket_dir.is_dir());
+    engine.state.lock().unwrap().lose_stop_before_effect = true;
+    assert_eq!(
+        engine
+            .client()
+            .stop_audio_sidecar(id.clone())
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    assert!(
+        engine.state.lock().unwrap().running,
+        "the stop never reached the daemon; the record is the only evidence it was asked for"
+    );
+    let maintenance = engine.client();
+    maintenance.recover_audio_sidecars().wait().unwrap();
+    assert!(!engine.state.lock().unwrap().running);
+    assert_eq!(
+        engine.requests(&format!("POST /containers/{ID}/stop")),
+        2,
+        "the same durable intent, retried once — never a second sidecar"
+    );
+    assert_eq!(
+        maintenance
+            .observe_audio_sidecar(id)
+            .wait()
+            .unwrap()
+            .exit_code,
+        Some(23)
+    );
+    assert!(
+        !socket_dir.exists(),
+        "the socket directory is retired with the sidecar it belonged to"
+    );
+    // Idempotent: the next tick finds nothing left to finish.
+    let settled = engine.state.lock().unwrap().requests.len();
+    maintenance.recover_audio_sidecars().wait().unwrap();
+    assert_eq!(engine.state.lock().unwrap().requests.len(), settled);
+}

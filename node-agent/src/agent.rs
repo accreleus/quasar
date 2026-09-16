@@ -3359,15 +3359,27 @@ impl Drop for ApplicationCleanupGuard {
     }
 }
 
-/// One maintenance pass. Caller obligations run first because runtime recovery correctly
-/// skips `Running` records; a caller-map error never starves durable journal cleanup.
-fn application_cleanup_maintenance_tick<F, G>(
+/// One maintenance pass over every durable journal an interrupted teardown can leave
+/// behind: the caller's pending map, then the application, audio and diagnostic
+/// journals. Caller obligations run first because runtime recovery correctly skips
+/// `Running` records; a caller-map error never starves durable journal cleanup.
+///
+/// Each journal is recovered INDEPENDENTLY and its failure is aggregated, never
+/// propagated early: a wedged application record must not leave an audio sidecar
+/// running until the next agent restart, which is exactly the shape of the defect
+/// this pass exists to close. `audio` is the ROUTINE variant, which never stops a
+/// live sidecar — `runtime::helper_tests::ordinary_audio_recovery_preserves_live_work_but_boot_retirement_stops_it`.
+fn application_cleanup_maintenance_tick<F, G, H, I>(
     pending: F,
     journal: G,
+    audio: H,
+    diagnostics: I,
 ) -> Result<(), crate::runtime::RuntimeError>
 where
     F: FnOnce() -> anyhow::Result<()>,
     G: FnOnce() -> Result<(), crate::runtime::RuntimeError>,
+    H: FnOnce() -> Result<(), crate::runtime::RuntimeError>,
+    I: FnOnce() -> Result<(), crate::runtime::RuntimeError>,
 {
     if let Err(error) = pending() {
         tracing::warn!(
@@ -3375,11 +3387,27 @@ where
             "caller application pending map could not be scanned: {error}"
         );
     }
-    journal()
+    let mut failure = journal().err();
+    if let Err(error) = audio() {
+        tracing::warn!(
+            token = "runtime-audio-cleanup-maintenance-pending",
+            "audio sidecar cleanup maintenance remains pending: {error}"
+        );
+        failure = failure.or(Some(error));
+    }
+    if let Err(error) = diagnostics() {
+        tracing::warn!(
+            token = "runtime-diagnostic-cleanup-maintenance-pending",
+            "diagnostic helper cleanup maintenance remains pending: {error}"
+        );
+        failure = failure.or(Some(error));
+    }
+    failure.map_or(Ok(()), Err)
 }
 
-/// Retry only durable `CleanupPending`/terminal application records. A live application
-/// has no cleanup intent and is therefore invisible to this maintenance pass.
+/// Retry every durable cleanup obligation a teardown can leave unproven: application,
+/// audio-sidecar and diagnostic-helper journals. A live workload has no cleanup intent
+/// and is therefore invisible to this pass; boot retirement, not this, ends prior work.
 fn spawn_application_cleanup_recovery() -> ApplicationCleanupGuard {
     let handle = tokio::spawn(async move {
         // Startup already performed a bounded pass. Delay the first maintenance retry
@@ -3404,6 +3432,14 @@ fn spawn_application_cleanup_recovery() -> ApplicationCleanupGuard {
                     || {
                         crate::runtime::configured()
                             .and_then(|api| api.recover_application_cleanup().wait())
+                    },
+                    || {
+                        crate::runtime::configured()
+                            .and_then(|api| api.recover_audio_sidecars().wait())
+                    },
+                    || {
+                        crate::runtime::configured()
+                            .and_then(|api| api.recover_diagnostics().wait())
                     },
                 )
             })
@@ -3996,9 +4032,65 @@ mod tests {
                 calls.borrow_mut().push("journal");
                 Ok(())
             },
+            || {
+                calls.borrow_mut().push("audio");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("diagnostics");
+                Ok(())
+            },
         )
         .unwrap();
-        assert_eq!(&*calls.borrow(), &["pending", "journal"]);
+        assert_eq!(
+            &*calls.borrow(),
+            &["pending", "journal", "audio", "diagnostics"]
+        );
+    }
+
+    /// Every journal is its own obligation. An application record this agent cannot
+    /// finish must not leave a stopped-but-unremoved audio sidecar running until the
+    /// next restart — the live defect this pass closes — so one failure never skips
+    /// the journals after it, and the pass still reports that something is pending.
+    #[test]
+    fn a_failed_journal_never_starves_the_ones_after_it_and_the_tick_still_reports_it() {
+        for failing in ["journal", "audio", "diagnostics"] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let run = |name: &'static str| {
+                calls.borrow_mut().push(name);
+                if name == failing {
+                    Err(crate::runtime::RuntimeError::from(
+                        crate::runtime::ErrorKind::Unavailable,
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+            let outcome = application_cleanup_maintenance_tick(
+                || {
+                    calls.borrow_mut().push("pending");
+                    anyhow::bail!("map poisoned")
+                },
+                || run("journal"),
+                || run("audio"),
+                || run("diagnostics"),
+            );
+            assert_eq!(
+                &*calls.borrow(),
+                &["pending", "journal", "audio", "diagnostics"],
+                "{failing} failing must not skip the journals after it"
+            );
+            assert_eq!(
+                outcome.unwrap_err().kind,
+                crate::runtime::ErrorKind::Unavailable,
+                "a pass with an unfinished obligation is not a clean pass"
+            );
+        }
+        // All clean is still clean.
+        assert!(
+            application_cleanup_maintenance_tick(|| Ok(()), || Ok(()), || Ok(()), || Ok(()))
+                .is_ok()
+        );
     }
 
     /// A `Config` on a scratch `node_secret_path`, so these tests never touch a real
