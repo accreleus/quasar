@@ -372,3 +372,32 @@ sub-issues of #210/#211 with blocking edges:
 | Readiness override | #263 | #262 |
 | Fault-injection acceptance harness | #264 | #256, #262 |
 | Hardware and fresh-install evidence | #265 | #263, #264 |
+
+## Agent coordination for implementation
+
+The primary agent (Fable) owns coordination, test design, review of every diff,
+integration and publication. It delegates bounded work to cheaper models and
+escalates per `CLAUDE.md` "Model tiering". Workers never commit, push, merge or
+touch the tracker; each gets one deliverable and explicit file ownership, and no
+two workers edit the same files at once.
+
+| Slice | Implementer | Why |
+| --- | --- | --- |
+| #255 report merge | Sonnet | small, pure, clear spec |
+| #253 storage checks | Sonnet (web group: Haiku) | routine check plus a pinned list |
+| #254 runtime/CDI checks, wording | Sonnet (wording and web group: Haiku) | reads existing discovery |
+| #258 GPU probe profile | Opus | ownership, journals, uncertain outcomes |
+| #256 diagnostic registration | Opus | startup safety, home protection |
+| #257 input and media probes | Opus for the media path, Sonnet for scheduling and mapping | GStreamer pipeline, crash isolation |
+| #259 app-GPU and audio probes | Sonnet, Opus review of lifecycle | built on #258 |
+| #260 amendment | Opus drafts, owner signs | frozen contract |
+| #261 card provenance | Sonnet (card tests: Haiku) | pass-through plus rendering |
+| #262 admission gate | Opus | scheduling, concurrency, migration |
+| #263 override | Sonnet, Opus review of authorization | server-enforced admin surface |
+| #264 harness | Sonnet | shell harness on existing conventions |
+| #265 evidence | primary agent | live hosts, judgment, owner contact |
+
+A slice escalates to Opus when its ticket is ambiguous, when it touches a frozen
+interface, security or concurrency, or when a cheaper model has failed it twice.
+The model actually used is reported; an unavailable model is reported, never
+silently substituted.
