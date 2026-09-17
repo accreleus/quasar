@@ -351,3 +351,24 @@ in later.
 `initiative/resilient-host-architecture`. Promotion to `develop` needs the owner's
 separate approval after acceptance. No release tag, image publication or
 deployed-stack change is part of this specification.
+
+## Implementation sequence
+
+Published 2026-09-18 as #252 (this specification) and thirteen slices, native
+sub-issues of #210/#211 with blocking edges:
+
+| Slice | Issue | Blocked by |
+| --- | --- | --- |
+| Report merge (first) | #255 | — |
+| Storage checks | #253 | — |
+| Runtime and CDI checks, host-local wording | #254 | — |
+| GPU probe profile in the runtime interface | #258 | — |
+| Protocol amendment (owner sign-off) | #260 | — |
+| Diagnostic registration | #256 | #254, #255 |
+| Input and media host probes | #257 | #255 |
+| Application-GPU and audio host probes | #259 | #255, #258 |
+| Provenance and freshness on the card | #261 | #260 |
+| Admission gate and `host_not_ready` | #262 | #257, #259, #260, #261 |
+| Readiness override | #263 | #262 |
+| Fault-injection acceptance harness | #264 | #256, #262 |
+| Hardware and fresh-install evidence | #265 | #263, #264 |
