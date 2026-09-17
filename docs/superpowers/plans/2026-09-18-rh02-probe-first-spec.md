@@ -25,9 +25,10 @@ can reach the host, which the host cannot know.
 ## Solution
 
 The admin sees, before anyone launches anything, whether the host can really do
-the work. After the agent starts it runs host probes: short disposable containers,
-given exactly what a session would be given, that composite and encode a few
-frames, start the audio path and create a virtual input device. Their results
+the work. After the agent starts it runs host probes: short disposable jobs, each
+run where the real path runs, that composite and encode a few frames, open the
+GPU the way an application container will, start the audio path and create a
+virtual input device. Their results
 join the existing readiness checks on the existing readiness card, each with its
 source and observation time. A check that rests on evidence and fails blocks the
 launches it affects, and the person launching is told the host needs its admin's
@@ -118,9 +119,9 @@ passes again. Nothing on the card claims that a browser can reach the host.
     sessions.
 36. As an operator, I want no engine CLI fallback for probes, so that container
     ownership stays with one interface.
-37. As an operator, I want host probes to keep GPU and media libraries out of the
-    resident agent process, so that the later split into a light host agent and
-    media workers needs no readiness redesign.
+37. As an operator, I want the media probe to be a separate bounded process with
+    one stable meaning, so that the later split into a light host agent and media
+    workers moves it into the worker without a readiness redesign.
 38. As an external Intel tester, I want the readiness card to report what my
     hardware exposes without Quasar claiming it certified, so that my results are
     read honestly.
@@ -151,58 +152,105 @@ versioned facts and desired/applied generations stay with #216.
 | --- | --- |
 | Container runtime unreachable, or startup cleanup not yet succeeded | every launch on the host (agent-enforced, not overridable) |
 | Homes root not writable as the app identity, or homes storage exhausted | every launch that mounts a home |
-| Media host probe fails on a GPU | launches placed on that GPU |
+| Media or application-GPU host probe fails on a GPU | launches placed on that GPU |
 | Input host probe fails | every launch on the host |
 | Audio host probe fails | every launch on the host |
 
-**Enforcement.** Control-plane admission excludes a host or GPU whose stored
-readiness carries an unoverridden blocking check for the requested workload. The
-decision is a pure function over stored readiness, overrides and report
-freshness, placed beside the live free-VRAM veto and failing open the same way
-when the report is stale or absent. When readiness is the only reason no host
-qualified, the launch is refused with a new retryable `503 host_not_ready`;
-otherwise the existing refusals stand. The agent does not evaluate the same
-checks a second time. It refuses launches only for its own safety states.
+**Enforcement.** Control-plane admission excludes a host or GPU that readiness
+blocks for the requested workload. The verdict is computed once per readiness
+report (and once per override change) by a pure Go function over the report and
+the host's overrides, and stored as derived blocked scopes for the host and its
+GPUs. Admission reads those derived values through the one filter renderer its
+candidate and recheck queries already share, so the two cannot disagree, and it
+ignores them when the report is stale or absent, failing open as the live
+free-VRAM veto does. The totals query includes the gate so that the reject
+classifier can tell readiness from emptiness: when readiness is the only reason
+no host qualified, the launch is refused with a new retryable
+`503 host_not_ready`; otherwise the existing refusals stand. The agent does not
+evaluate the same checks a second time. It refuses launches only for its own
+safety states.
 
-**Readiness override.** Per host and per check id, stored as control-plane policy
-with the host's settings, admin-only through the existing middleware, audited,
-always rendered with the failing check, and cleared by the control plane when a
-later report shows that check passing.
+**Readiness override.** Per host and per check id, in its own table (the next
+migration after 0084; the host-settings knob catalog has no map type and is not
+stretched to hold one). Admin-only through the existing middleware, audited,
+always rendered with the failing check, and deleted by the control plane when a
+later report shows that check passing. Check ids are agent-owned and may be
+renamed; an override for an id the host no longer reports is inert and is shown
+as such, so a rename re-blocks until the admin decides again. That is the safe
+direction and is accepted.
 
-**Host probe.** A subcommand of the image that does the media work, run in a
-sibling container through the Quasar runtime interface. It receives its devices,
-driver volume, groups and environment from the same code that prepares a session
-launch, so the probe cannot drift from the launch. Three probes: media
-(composite and encode a few frames per GPU with the effective encoder), audio
-(the audio sidecar starts and its socket appears) and input (a virtual input
-device can be created). The existing sibling EGL test and 32-bit library
-discovery stay as they are. The runtime interface gains one closed probe
-requirement profile (the session device set, read-only mounts, a scratch tmpfs,
-environment, no network, a caller deadline). It is not an open-ended request
-type, and the existing locked-down diagnostic profile is unchanged.
+**Host probes.** A host probe runs where the path it proves runs. Today the
+compositor, encoder and virtual input live in the agent's own container and only
+the application and the audio sidecar are sibling containers; #212/#213 move the
+media path into worker containers later. Four probes:
 
-**Probe lifecycle.** A probe is a journaled helper operation with a stable
-operation identity, verified ownership and tracked cleanup. One probe runs at a
-time per host. The deadline is enforced by an explicit stop, then cleanup; a stop
-or cleanup whose outcome is unknown is reconciled under the same identity. No new
-probe of a kind starts while an earlier one of that kind is unreconciled.
-Dropping observation never stops, removes or rolls back anything. Startup
-recovery finishes interrupted probe cleanup. An indeterminate outcome reports
-`unknown` with a reason and leaves the last definitive result in force. There is
-no engine CLI fallback.
+- **Media** — composites and encodes a few frames per GPU, using the production
+  GPU binding and effective-encoder resolution (an encode-only headless path
+  already exists and is extended with the compositor source). It runs as a
+  bounded child process of the agent from the agent's own binary, as the EGL
+  self-test does, so a driver crash cannot take the agent down and the result
+  describes the container sessions really use. When workers exist the same
+  subcommand runs in the worker container through the runtime interface; the
+  check id and meaning do not change. *(This placement revises the approved
+  "sibling container" answer on a fact found in review and is put to the owner
+  as Q16.)*
+- **Application GPU access** — a disposable sibling container through the runtime
+  interface, given GPU access by the same code that prepares a session's
+  application container, running the existing EGL self-test. It generalises
+  today's NVIDIA-only sibling EGL test to every vendor. The runtime interface's
+  NVIDIA GPU diagnostic profile is widened into one closed GPU probe profile
+  (vendor device access, groups, driver volume, no network); the locked-down
+  general profile is unchanged and no open-ended request type is added. The
+  session application request type is not reused: its naming and home
+  bookkeeping belong to sessions.
+- **Audio** — the existing audio sidecar profile started under a probe identity:
+  the sidecar starts and its socket appears, then it is stopped and removed.
+- **Input** — the existing virtual-input self-test run as a bounded child
+  process, because the agent itself opens the input device and publishes the
+  nodes into its own namespace; a sibling container would prove nothing.
+
+The agent binary rejects an unknown subcommand with an error instead of starting
+as an agent, and a container probe always uses the running agent's own image
+identity, so a probe can never boot a second agent. Probe container names get
+their own owned prefix, added to ownership verification and startup recovery.
+
+**Probe lifecycle.** A container probe is a journaled helper operation with a
+stable operation identity, verified ownership and tracked cleanup. One probe
+runs at a time per host, and the audio probe's recovery of stale sidecars is
+part of that single flight. The agent's probe orchestrator owns the deadline:
+the command is bounded inside the container as today, and past the deadline the
+orchestrator issues an explicit stop and then cleanup. A timeout while
+*observing* is not the container's outcome and is never read as one. A stop or
+cleanup whose outcome is unknown is reconciled under the same identity, and no
+new probe of that kind starts while an earlier one is unreconciled. Dropping
+observation never stops, removes or rolls back anything. Startup recovery
+finishes interrupted probe cleanup. There is no engine CLI fallback. A child
+process probe is killed at its deadline and leaves nothing behind. Any
+inconclusive outcome reports `unknown` with a reason and leaves the last
+definitive result in force.
+
+**Probe results survive the periodic report.** The 15-second local refresh
+merges into the last probe-derived and safety checks; it no longer replaces the
+whole report. If the refresh itself fails, earlier blocking checks are kept, so
+a refresh error can never unblock a host.
 
 **When probes run.** After agent start, outside the registration handshake
 window, reporting on a later capacity message. Again when a probe input changes
-(runtime image identity, driver version or driver-volume identity, GPU device
-set, relevant host settings) and after a launch failure a probe could explain.
-Never on a GPU with a live session. No timer. No admin re-check action in RH-02;
-an agent restart re-runs probes.
+(agent image identity, driver version or driver-volume identity, GPU device set,
+relevant host settings) and after a launch failure a probe could explain. A
+media probe takes the same local encode reservation a session takes, so it
+cannot overlap a session on that GPU; a launch that arrives during a probe
+pre-empts it, and the pre-empted probe is indeterminate. No timer. No admin
+re-check action in RH-02; an agent restart re-runs probes.
 
 **Diagnostic registration.** A failed startup cleanup or an unusable runtime no
-longer ends the process. The agent registers, reports the runtime fact as a
-blocking check, refuses every launch itself, and retries the cleanup under the
-original operation identities. It accepts launches only after the cleanup has
-succeeded. The protection of managed homes is unchanged.
+longer ends the process. The agent enters a diagnostic mode that withholds
+everything the exit used to prevent: homes garbage collection, the driver-volume
+and CUDA provisioners, image pulls and pruning, and host probes. Its health
+endpoint reports not ready. It registers, reports the runtime fact as a blocking
+check, refuses every launch itself, and retries the cleanup under the original
+operation identities. When the cleanup succeeds it resumes normal startup. The
+protection of managed homes is unchanged.
 
 **Storage.** Two new checks computed on the agent: homes root writable as the app
 identity (a write test, blocking), and homes free space (`warn` under a
@@ -230,10 +278,14 @@ change through the shared card. The user-facing launch error gets wording for
 
 **Contract amendment.** One `quasar-protocol` amendment, requiring Opus review
 and the owner's explicit sign-off before any gating code lands: reword the
-advisory clauses to the evidence rule, add the three optional check fields and
-the `unknown` status, add `host_not_ready`, and add the additive admin-gated
-override field. Facts, host probes, storage checks, CDI and diagnostic
-registration need no amendment and do not wait for it.
+advisory clauses to the evidence rule in all three contracts; add the three
+optional check fields to the documented and OpenAPI check shape; regularise the
+status vocabulary to what agents already send (`warn`, `provisioning`) plus
+`unknown`, noting that release preflight already treats an unrecognised status
+as unknown and never blocks on it; add `host_not_ready` to the enumerated
+errors; add the admin-gated override endpoints and table. Facts, host probes,
+storage checks, CDI and diagnostic registration need no amendment and do not
+wait for it.
 
 **Fact and policy separation in existing code.** Where RH-02 touches a check that
 mixes the two, the observation is separated from the verdict. It does not
@@ -249,17 +301,19 @@ which function produced it. Boundaries, confirmed by the owner, all existing:
 1. **Agent checks** — the fake-root boundary the readiness checks already use: a
    pure function of the probe environment. New facts, storage, CDI, runtime checks
    and the mapping from a host-probe outcome to a check are tested here.
-2. **Host-probe lifecycle** — the scripted Docker Engine API double used by the
+2. **Container-probe lifecycle** — the scripted Docker Engine API double used by the
    helper tests: deadline then stop then cleanup, lost create/start/stop/remove
    replies, dropped observation, journal recovery after restart, ownership
    refusal, single-flight. The existing ignored real-Docker tests gain one case
    for the probe profile.
 3. **Gate decision** — a pure Go function tested like the stream plan and release
    plan, plus one DB-backed admission test showing a blocked host skipped, another
-   host chosen, and `host_not_ready` when none remains. Override lapse gets a
-   DB-backed test. The OpenAPI drift test covers the amendment.
+   host chosen, `host_not_ready` when none remains, and candidate and recheck
+   agreeing. Override lapse gets a DB-backed test. The OpenAPI drift test covers
+   only the route surface, so the new error code and check fields are asserted
+   by handler tests.
 4. **Console** — the readiness card's component tests and the group-membership pin
-   test.
+   test, which lists every check id and must gain each new one.
 5. **End to end** — one new acceptance harness that injects each fault on
    disposable fixtures (runtime stopped, homes root read-only, input device
    withheld, GPU withheld from the probe) and asserts the check, the block and the

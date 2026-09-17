@@ -329,9 +329,9 @@ the only thing that can block a launch. _Avoid_: "health check" (the
 container's), "preflight check" (preflight is the release evaluation that reads
 some readiness checks).
 
-**Host probe** — a bounded, disposable container the host agent runs to
-exercise a real path (compositing and encoding, audio, virtual input) with
-exactly what a session would be given, producing host facts. Distinct from a
+**Host probe** — a bounded, disposable job the host agent runs to exercise a
+real path (compositing and encoding, application GPU access, audio, virtual
+input) where that path really runs, producing host facts. Distinct from a
 *device probe*, which measures a client. _Avoid_: "preflight" (releases),
 "self-test" (that is one process checking itself), bare "probe".
 
