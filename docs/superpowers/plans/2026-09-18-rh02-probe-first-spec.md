@@ -191,9 +191,9 @@ media path into worker containers later. Four probes:
   self-test does, so a driver crash cannot take the agent down and the result
   describes the container sessions really use. When workers exist the same
   subcommand runs in the worker container through the runtime interface; the
-  check id and meaning do not change. *(This placement revises the approved
-  "sibling container" answer on a fact found in review and is put to the owner
-  as Q16.)*
+  check id and meaning do not change. (The owner approved this placement on
+  2026-09-18, revising the earlier "sibling container" answer after review
+  showed where the media path really runs.)
 - **Application GPU access** — a disposable sibling container through the runtime
   interface, given GPU access by the same code that prepares a session's
   application container, running the existing EGL self-test. It generalises
