@@ -902,6 +902,39 @@ where
     }
 }
 
+/// What the readiness refresh task reports to the control loop.
+#[derive(Debug, PartialEq)]
+enum ReadinessRefresh {
+    /// The probe ended. `Err` is a panic.
+    Done(Result<Vec<crate::messages::ReadinessCheck>, String>),
+    /// The probe is past its deadline and still running. `Done` follows when it ends,
+    /// and the control loop must not start another refresh before then: a blocking
+    /// probe cannot be cancelled, so a second one would stack behind a hung first.
+    Overdue,
+}
+
+const READINESS_REFRESH_DEADLINE: Duration = Duration::from_secs(60);
+
+async fn run_readiness_refresh<F>(
+    probe: F,
+    deadline: Duration,
+    sender: mpsc::Sender<ReadinessRefresh>,
+) where
+    F: FnOnce() -> Vec<crate::messages::ReadinessCheck> + Send + 'static,
+{
+    let mut probe = tokio::task::spawn_blocking(probe);
+    let result = match tokio::time::timeout(deadline, &mut probe).await {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = sender.send(ReadinessRefresh::Overdue).await;
+            probe.await
+        }
+    };
+    let _ = sender
+        .send(ReadinessRefresh::Done(result.map_err(|e| e.to_string())))
+        .await;
+}
+
 /// The blocking half of every capacity re-detect: `capacity::detect()` plus an
 /// unconditional warm of the memoized `nvidia-smi` row table.
 ///
@@ -1270,6 +1303,7 @@ async fn connect_and_run(
         .await
     };
     crate::readiness::log_report(&readiness);
+    sessions.mgr.readiness.refreshed(readiness.clone());
     let capacity_msg = AgentMsg::Capacity {
         source_preparation: None,
         host: cap.host,
@@ -1280,7 +1314,7 @@ async fn connect_and_run(
         effective_settings: Some(first_settings.effective_map()),
         codecs: advertised_codecs(&host_codec_report),
         codec_throughput: advertised_codec_throughput(&host_codec_report),
-        readiness: Some(readiness.clone()),
+        readiness: Some(sessions.mgr.readiness.merged()),
     };
     send(&mut tx, &capacity_msg).await?;
     info!("capacity report sent");
@@ -1326,7 +1360,6 @@ async fn connect_and_run(
     // Cached with the encoder it was probed for, so capacity re-sends reuse it unless
     // a config_update flips the effective encoder and marks it stale.
     mgr.host_codec_report = host_codec_report.clone();
-    mgr.readiness = readiness;
     mgr.probed_encoder = Some(first_settings.encoder);
 
     // #488: the golden-home warm-up. Scheduled by the control plane and claimed over
@@ -1449,26 +1482,31 @@ async fn connect_and_run(
                 let sender = readiness_tx.clone();
                 let lib32 = mgr.runtime_settings.nvidia_lib32_path.clone();
                 let codecs = mgr.host_codec_report.as_ref().map(|r| r.codecs.clone());
-                tokio::spawn(async move {
-                    let checks = tokio::task::spawn_blocking(move || crate::readiness::probe(
+                tokio::spawn(run_readiness_refresh(
+                    move || crate::readiness::probe(
                         &crate::readiness::ProbeEnv::live(nvidia_host, &lib32)
                             .with_gpu_present(gpu_present)
                             .with_codec_probe(codecs.as_deref()),
-                    )).await;
-                    let _ = sender.send(checks).await;
-                });
+                    ),
+                    READINESS_REFRESH_DEADLINE,
+                    sender,
+                ));
             }
-            Some(checks) = readiness_rx.recv() => {
-                readiness_busy = false;
-                match checks {
-                    Ok(checks) => mgr.readiness = checks,
-                    Err(error) => {
+            Some(refresh) = readiness_rx.recv() => {
+                match refresh {
+                    ReadinessRefresh::Done(Ok(checks)) => {
+                        readiness_busy = false;
+                        mgr.readiness.refreshed(checks);
+                    }
+                    ReadinessRefresh::Done(Err(error)) => {
+                        readiness_busy = false;
                         warn!(token = "readiness-refresh-failed", "host readiness refresh failed: {error}");
-                        mgr.readiness = vec![crate::messages::ReadinessCheck {
-                            id: "readiness_probe".into(), status: "warn".into(),
-                            summary: "Host readiness could not be refreshed; previous results are no longer current".into(),
-                            remediation: "The agent will retry automatically. Check its logs if this persists.".into(),
-                        }];
+                        mgr.readiness.refresh_failed();
+                    }
+                    // Still busy: `Done` follows when the probe ends.
+                    ReadinessRefresh::Overdue => {
+                        warn!(token = "readiness-refresh-overdue", "host readiness refresh is past its {} s deadline and still running", READINESS_REFRESH_DEADLINE.as_secs());
+                        mgr.readiness.refresh_failed();
                     }
                 }
                 send_fresh_capacity(&mut tx, &mut *mgr).await?;
@@ -1586,7 +1624,7 @@ async fn connect_and_run(
                                 effective_settings: Some(mgr.runtime_settings.effective_map()),
                                 codecs: advertised_codecs(&mgr.host_codec_report),
                                 codec_throughput: advertised_codec_throughput(&mgr.host_codec_report),
-                                readiness: Some(mgr.readiness.clone()),
+                                readiness: Some(mgr.readiness.merged()),
                             };
                             send(&mut tx, &capacity_msg).await?;
                             info!("re-sent capacity after config_update (fresh effective_settings)");
@@ -1640,7 +1678,7 @@ async fn connect_and_run(
                         effective_settings: Some(mgr.runtime_settings.effective_map()),
                         codecs: advertised_codecs(&mgr.host_codec_report),
                         codec_throughput: advertised_codec_throughput(&mgr.host_codec_report),
-                        readiness: Some(mgr.readiness.clone()),
+                        readiness: Some(mgr.readiness.merged()),
                     };
                     send(&mut tx, &capacity_msg).await?;
                 }
@@ -2060,12 +2098,10 @@ struct SessionManager {
     /// overlay is live-class. `None` ⇒ probe skipped/failed, so the control plane
     /// defaults the host to `["h264"]`.
     host_codec_report: Option<HostCodecReport>,
-    /// The host readiness check set, computed once per CONNECTION and repeated
-    /// verbatim in every capacity re-send on it. Per connection because every input is
-    /// fixed for the container's life: driver libraries and device nodes are injected
-    /// at create time, and the 32-bit GL answer costs a throwaway container. Applying
-    /// a host fix means recreating the container anyway.
-    readiness: Vec<crate::messages::ReadinessCheck>,
+    /// Every capacity message carries `merged()`. Outlives a connection, so retained
+    /// checks survive a control-plane restart; registration and the 15 s refresh only
+    /// replace the locally computed set.
+    readiness: crate::readiness::report::ReadinessReport,
     /// The encoder `host_codec_report` was probed for; compared against
     /// `runtime_settings.encoder` to decide staleness.
     probed_encoder: Option<crate::session::EncoderChoice>,
@@ -2173,7 +2209,7 @@ impl SessionManager {
             health,
             nvidia_lib32_probed,
             host_codec_report: None,
-            readiness: Vec::new(),
+            readiness: Default::default(),
             probed_encoder: None,
             draining: false,
             runner: default_runner(),
@@ -3951,7 +3987,7 @@ where
         effective_settings: Some(mgr.runtime_settings.effective_map()),
         codecs: advertised_codecs(&mgr.host_codec_report),
         codec_throughput: advertised_codec_throughput(&mgr.host_codec_report),
-        readiness: Some(mgr.readiness.clone()),
+        readiness: Some(mgr.readiness.merged()),
     };
     send(sink, &msg).await
 }
@@ -4559,6 +4595,73 @@ mod tests {
     #[should_panic(expected = "probe exploded")]
     async fn offload_probe_repropagates_a_panic() {
         let _: () = offload_probe(|| panic!("probe exploded")).await;
+    }
+
+    fn refresh_check(id: &str) -> crate::messages::ReadinessCheck {
+        crate::messages::ReadinessCheck {
+            id: id.into(),
+            status: crate::readiness::PASS.into(),
+            summary: String::new(),
+            remediation: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_readiness_refresh_inside_its_deadline_reports_its_checks() {
+        let (tx, mut rx) = mpsc::channel(1);
+        run_readiness_refresh(|| vec![refresh_check("uinput")], Duration::from_secs(5), tx).await;
+
+        assert_eq!(
+            rx.recv().await,
+            Some(ReadinessRefresh::Done(Ok(vec![refresh_check("uinput")])))
+        );
+        assert_eq!(rx.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn a_readiness_refresh_that_panics_is_a_refresh_error() {
+        let (tx, mut rx) = mpsc::channel(1);
+        run_readiness_refresh(|| panic!("probe exploded"), Duration::from_secs(5), tx).await;
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(ReadinessRefresh::Done(Err(_)))
+        ));
+        assert_eq!(rx.recv().await, None);
+    }
+
+    /// Overdue first, so the report gains its warning while the probe is still hung;
+    /// then exactly one `Done` when it ends, which is what frees the next refresh.
+    #[tokio::test]
+    async fn a_readiness_refresh_past_its_deadline_is_overdue_then_done() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let task = tokio::spawn(run_readiness_refresh(
+            move || {
+                let _ = held.recv();
+                vec![refresh_check("uinput")]
+            },
+            Duration::from_millis(20),
+            tx,
+        ));
+
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert_eq!(first, Ok(Some(ReadinessRefresh::Overdue)));
+        // Nothing more while the probe is still running.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "the refresh must stay in flight until its probe ends"
+        );
+
+        release.send(()).unwrap();
+        assert_eq!(
+            rx.recv().await,
+            Some(ReadinessRefresh::Done(Ok(vec![refresh_check("uinput")])))
+        );
+        task.await.unwrap();
+        assert_eq!(rx.recv().await, None);
     }
 
     #[test]

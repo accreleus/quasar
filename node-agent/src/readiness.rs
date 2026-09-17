@@ -12,6 +12,7 @@
 
 /// The update-path checks (preflight ids), with their collectors.
 pub mod platform_update;
+pub mod report;
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -4892,4 +4893,6 @@ table ip raw {
             }
         }
     }
+
+    mod report;
 }

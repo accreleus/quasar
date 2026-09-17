@@ -62,6 +62,15 @@ own; the two do not move together, and that is deliberate.
   treated as private although they are published.
 
 ### Fixed
+- **A failed readiness refresh no longer wipes the host's readiness checks (#255).** The
+  node agent's 15-second refresh used to replace the whole report, and a refresh that failed
+  replaced it with a single warning, so every failing check vanished from the card until the
+  next good refresh. The report is now a merge: a failed refresh keeps every earlier check
+  and adds the warning, and checks the refresh does not compute are kept between refreshes
+  until a newer result for the same check id replaces them. A refresh still running after
+  60 s now counts as failed (`token=readiness-refresh-overdue`) instead of leaving the card
+  silently stale, and no second refresh starts until it ends. Check ids and the wire shape
+  are unchanged.
 - **Codec eligibility and decode history now follow the device that asked, not the account's
   newest one** (#203). With a browser and the native client signed into one account, every read
   of a device's capability probe and of its decode-failure history was keyed on whichever
