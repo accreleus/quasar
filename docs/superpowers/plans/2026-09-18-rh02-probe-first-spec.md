@@ -1,0 +1,299 @@
+# RH-02 specification — probe-first host readiness
+
+Specification for #210 and #211 under initiative #207. It builds on RH-01 as
+promoted to `develop` at `b134085`. The reconciliation of existing behaviour is in
+`2026-09-17-rh02-probe-first-reconciliation.md`; the gating decision is ADR 0005;
+the vocabulary is in `CONTEXT.md` under "Host readiness". #210 and #211 keep their
+own acceptance and stay the tracking issues; this document is what they are built
+against.
+
+## Problem Statement
+
+Someone installing Quasar at home learns that their host cannot stream by
+launching a game and watching it fail. The console has a readiness card with
+about 25 checks, but the checks read proxies: a render node exists, an encoder
+element is registered, a firewall rule parses. None of them composites a frame,
+encodes one, starts audio or creates an input device. By contract every check is
+advisory, so a host that cannot encode still accepts launches, and in a fleet the
+scheduler keeps choosing it. A host whose container runtime is missing or
+unreachable never registers at all, so the console shows nothing where it should
+show the most basic fault. Checks carry no record of where an observation came
+from or how old it is. Storage is reported as numbers nobody judges. The word
+"reachability" on a host-local firewall check invites the reading that a browser
+can reach the host, which the host cannot know.
+
+## Solution
+
+The admin sees, before anyone launches anything, whether the host can really do
+the work. After the agent starts it runs host probes: short disposable containers,
+given exactly what a session would be given, that composite and encode a few
+frames, start the audio path and create a virtual input device. Their results
+join the existing readiness checks on the existing readiness card, each with its
+source and observation time. A check that rests on evidence and fails blocks the
+launches it affects, and the person launching is told the host needs its admin's
+attention instead of meeting a black screen. Proxy checks keep informing and
+never block. A host with no usable runtime still appears in the console, says
+why, and refuses launches until it has recovered. An admin can override a named
+failing check for a host; the override stays visible and ends when the check
+passes again. Nothing on the card claims that a browser can reach the host.
+
+## User Stories
+
+1. As a self-hoster, I want the console to tell me my GPU cannot encode before I
+   launch a game, so that I fix the host instead of debugging a black stream.
+2. As a self-hoster, I want each failing readiness check to give me the exact fix,
+   so that I do not have to search logs.
+3. As a self-hoster, I want a host whose container runtime is missing or
+   unreachable to appear in the console with that fault named, so that I know the
+   install got as far as the agent.
+4. As a self-hoster, I want a host that has not finished its startup cleanup to
+   refuse launches, so that my game homes are never mounted twice.
+5. As a self-hoster, I want to see when each check was last observed, so that I
+   can tell a current result from an old one.
+6. As a self-hoster, I want to see where a check's observation came from (a host
+   probe, a local read, the container runtime, my own configuration), so that I
+   know how much to trust it.
+7. As a self-hoster, I want a missing virtual input device reported before launch,
+   so that I do not start a game I cannot control.
+8. As a self-hoster, I want a failing audio path reported before launch, so that I
+   do not discover a silent game mid-session.
+9. As a self-hoster, I want an unwritable homes root reported before launch, so
+   that a game does not lose its saves.
+10. As a self-hoster, I want a warning when homes storage is running low and a
+    block only when it is exhausted, so that a nearly full disk does not take my
+    host offline.
+11. As a self-hoster, I want missing NVIDIA drivers reported, not silently
+    installed or worked around, so that I stay in control of my host.
+12. As a self-hoster with an NVIDIA card, I want the existing driver-volume path to
+    keep working exactly as before, so that RH-02 does not break a working host.
+13. As a self-hoster, I want to see whether my container runtime has CDI enabled
+    and which devices it discovered, so that I understand how my GPU is exposed.
+14. As a self-hoster, I want the network check worded as what my host's firewall
+    allows, so that I do not mistake it for proof my browser can connect.
+15. As an admin, I want a failing evidence-based check to block only the launches
+    it affects, so that one bad GPU does not stop sessions on another.
+16. As an admin of several hosts, I want placement to skip a host that is not
+    ready and use one that is, so that users are not sent to a broken machine.
+17. As an admin, I want proxy checks never to block a launch, so that a false
+    negative cannot cause an outage.
+18. As an admin, I want to override one named failing check on one host, so that I
+    can keep running when I know the check is wrong for my setup.
+19. As an admin, I want an overridden check to stay visible with its failure and an
+    override marker, so that nobody forgets it is there.
+20. As an admin, I want an override to lapse when its check passes again, so that
+    it cannot hide a later regression.
+21. As an admin, I want overrides written to the audit log, so that I can see who
+    decided to launch despite a failure.
+22. As an admin, I want the agent's own safety refusals to be beyond any override,
+    so that no console action can endanger user data.
+23. As an admin, I want an inconclusive host probe shown as indeterminate with its
+    reason, so that I do not read a timeout as a broken GPU.
+24. As an admin, I want an indeterminate probe to leave an existing block or pass
+    as it was, so that a flaky runtime neither blocks nor unblocks my host.
+25. As an admin, I want host probes never to run on a GPU with a live session, so
+    that checking the host never degrades someone's game.
+26. As an admin, I want host probes to run again when the runtime image, the
+    driver, the GPU set or relevant host settings change, so that results follow
+    the host.
+27. As an admin, I want a probe to run after a launch fails in a way a probe could
+    explain, so that the card catches up with reality.
+28. As an admin, I want the setup wizard's host step to show the same readiness
+    card, so that first-run and day-two use one vocabulary.
+29. As an admin, I want the release preflight to keep reading the same stored
+    readiness, so that the Releases and Hosts tabs never disagree.
+30. As a user, I want a launch refused for readiness to tell me the host needs its
+    admin's attention, so that I do not retry pointlessly or blame my browser.
+31. As a user, I want a launch to succeed on another host when mine is not ready,
+    so that I can still play.
+32. As an operator, I want every host-probe container to be verifiably Quasar-owned
+    and removed after its result is captured, so that probes never litter my host
+    or touch containers that are not Quasar's.
+33. As an operator, I want an interrupted probe reconciled under its original
+    operation identity before any new probe runs, so that a lost reply cannot leave
+    two probes or an orphan.
+34. As an operator, I want an agent restart to finish a previous probe's cleanup,
+    so that cleanup survives crashes.
+35. As an operator, I want stopping the observation of a probe not to be treated
+    as rolling it back, so that the runtime contract holds for probes as for
+    sessions.
+36. As an operator, I want no engine CLI fallback for probes, so that container
+    ownership stays with one interface.
+37. As an operator, I want host probes to keep GPU and media libraries out of the
+    resident agent process, so that the later split into a light host agent and
+    media workers needs no readiness redesign.
+38. As an external Intel tester, I want the readiness card to report what my
+    hardware exposes without Quasar claiming it certified, so that my results are
+    read honestly.
+39. As a maintainer, I want one acceptance harness that injects each prerequisite
+    fault on disposable fixtures, so that "appears before launch" is evidence.
+40. As a maintainer, I want fresh-install evidence recorded per host class with
+    exact images and commits, so that support claims match what was run.
+
+## Implementation Decisions
+
+**Vocabulary.** Host fact, readiness check, host probe, evidence, indeterminate,
+readiness override and diagnostic registration are defined in the glossary. The
+client measurement formerly called "probe" is a device probe. "Preflight" stays
+the release evaluation.
+
+**The readiness check remains the single reported unit.** No second vocabulary
+and no new table. Host facts ride on the check they support. The check gains
+three optional fields: when it was observed, its source (`host_probe`, `local`,
+`runtime`, `operator`), and the workload scope it blocks when failing (absent for
+every proxy check). Check ids and statuses stay open strings. `unknown` joins the
+status vocabulary for indeterminate results; `skip` keeps meaning "not
+applicable". The control plane keeps storing the report verbatim. Durable,
+versioned facts and desired/applied generations stay with #216.
+
+**Only evidence gates (ADR 0005).** Blocking scopes:
+
+| Failed evidence | Blocks |
+| --- | --- |
+| Container runtime unreachable, or startup cleanup not yet succeeded | every launch on the host (agent-enforced, not overridable) |
+| Homes root not writable as the app identity, or homes storage exhausted | every launch that mounts a home |
+| Media host probe fails on a GPU | launches placed on that GPU |
+| Input host probe fails | every launch on the host |
+| Audio host probe fails | every launch on the host |
+
+**Enforcement.** Control-plane admission excludes a host or GPU whose stored
+readiness carries an unoverridden blocking check for the requested workload. The
+decision is a pure function over stored readiness, overrides and report
+freshness, placed beside the live free-VRAM veto and failing open the same way
+when the report is stale or absent. When readiness is the only reason no host
+qualified, the launch is refused with a new retryable `503 host_not_ready`;
+otherwise the existing refusals stand. The agent does not evaluate the same
+checks a second time. It refuses launches only for its own safety states.
+
+**Readiness override.** Per host and per check id, stored as control-plane policy
+with the host's settings, admin-only through the existing middleware, audited,
+always rendered with the failing check, and cleared by the control plane when a
+later report shows that check passing.
+
+**Host probe.** A subcommand of the image that does the media work, run in a
+sibling container through the Quasar runtime interface. It receives its devices,
+driver volume, groups and environment from the same code that prepares a session
+launch, so the probe cannot drift from the launch. Three probes: media
+(composite and encode a few frames per GPU with the effective encoder), audio
+(the audio sidecar starts and its socket appears) and input (a virtual input
+device can be created). The existing sibling EGL test and 32-bit library
+discovery stay as they are. The runtime interface gains one closed probe
+requirement profile (the session device set, read-only mounts, a scratch tmpfs,
+environment, no network, a caller deadline). It is not an open-ended request
+type, and the existing locked-down diagnostic profile is unchanged.
+
+**Probe lifecycle.** A probe is a journaled helper operation with a stable
+operation identity, verified ownership and tracked cleanup. One probe runs at a
+time per host. The deadline is enforced by an explicit stop, then cleanup; a stop
+or cleanup whose outcome is unknown is reconciled under the same identity. No new
+probe of a kind starts while an earlier one of that kind is unreconciled.
+Dropping observation never stops, removes or rolls back anything. Startup
+recovery finishes interrupted probe cleanup. An indeterminate outcome reports
+`unknown` with a reason and leaves the last definitive result in force. There is
+no engine CLI fallback.
+
+**When probes run.** After agent start, outside the registration handshake
+window, reporting on a later capacity message. Again when a probe input changes
+(runtime image identity, driver version or driver-volume identity, GPU device
+set, relevant host settings) and after a launch failure a probe could explain.
+Never on a GPU with a live session. No timer. No admin re-check action in RH-02;
+an agent restart re-runs probes.
+
+**Diagnostic registration.** A failed startup cleanup or an unusable runtime no
+longer ends the process. The agent registers, reports the runtime fact as a
+blocking check, refuses every launch itself, and retries the cleanup under the
+original operation identities. It accepts launches only after the cleanup has
+succeeded. The protection of managed homes is unchanged.
+
+**Storage.** Two new checks computed on the agent: homes root writable as the app
+identity (a write test, blocking), and homes free space (`warn` under a
+configurable floor defaulting to 5 GiB, `fail` and blocking only when
+exhausted). Template and image storage warn only.
+
+**Runtime and CDI facts.** New checks report the runtime endpoint's reachability,
+negotiated API version and the capabilities RH-01 already discovers, and whether
+CDI is enabled with which devices the engine discovered. CDI is observed only.
+GPU injection keeps the NVIDIA device request plus the Quasar driver volume, with
+host-injected drivers taking precedence. Missing drivers are reported; nothing is
+installed or bypassed beyond the existing driver-volume provisioner.
+
+**Host readiness is not browser reachability.** The firewall check keeps its id
+and is reworded as the host's inbound firewall posture. The card states that
+readiness is host-local. Browser connectivity diagnostics remain #223.
+
+**Console.** The existing readiness card is extended in its current idioms:
+observation time and source per check, a "blocks launches" marker, the override
+control and marker, and groups for runtime, storage and audio. No design mock
+covers readiness; the owner approved extending the card without a restyle, with a
+design pass possible later. The setup wizard and Fleet surfaces inherit the
+change through the shared card. The user-facing launch error gets wording for
+`host_not_ready`.
+
+**Contract amendment.** One `quasar-protocol` amendment, requiring Opus review
+and the owner's explicit sign-off before any gating code lands: reword the
+advisory clauses to the evidence rule, add the three optional check fields and
+the `unknown` status, add `host_not_ready`, and add the additive admin-gated
+override field. Facts, host probes, storage checks, CDI and diagnostic
+registration need no amendment and do not wait for it.
+
+**Fact and policy separation in existing code.** Where RH-02 touches a check that
+mixes the two, the observation is separated from the verdict. It does not
+refactor the rest: encoder default selection, the driver-volume provisioning
+trigger and the boot gate keep their behaviour.
+
+## Testing Decisions
+
+A good test here states a prerequisite fault or a runtime event and asserts what
+an operator, a launching user or the runtime would observe. It does not assert
+which function produced it. Boundaries, confirmed by the owner, all existing:
+
+1. **Agent checks** — the fake-root boundary the readiness checks already use: a
+   pure function of the probe environment. New facts, storage, CDI, runtime checks
+   and the mapping from a host-probe outcome to a check are tested here.
+2. **Host-probe lifecycle** — the scripted Docker Engine API double used by the
+   helper tests: deadline then stop then cleanup, lost create/start/stop/remove
+   replies, dropped observation, journal recovery after restart, ownership
+   refusal, single-flight. The existing ignored real-Docker tests gain one case
+   for the probe profile.
+3. **Gate decision** — a pure Go function tested like the stream plan and release
+   plan, plus one DB-backed admission test showing a blocked host skipped, another
+   host chosen, and `host_not_ready` when none remains. Override lapse gets a
+   DB-backed test. The OpenAPI drift test covers the amendment.
+4. **Console** — the readiness card's component tests and the group-membership pin
+   test.
+5. **End to end** — one new acceptance harness that injects each fault on
+   disposable fixtures (runtime stopped, homes root read-only, input device
+   withheld, GPU withheld from the probe) and asserts the check, the block and the
+   refusal through the control-plane API.
+
+TDD applies to every slice: the failing behavioural test first, at these
+boundaries. Hardware acceptance begins with AGENTS.md's shared-host version
+preflight: record deployed component identities, schema, stack identity and
+active sessions, and recheck before any mutation.
+
+## Out of Scope
+
+Worker extraction (#212/#213), running-session adoption (#214), pinned session
+versions (#215), durable versioned host facts and desired state (#216/#217),
+updater redesign (#218/#219), Podman and rootless certification (#220/#221), TURN
+and browser connectivity diagnostics (#222/#223). Using CDI for injection. An
+admin re-check action. A readiness redesign. Intel certification: Intel paths are
+preserved and reported, validated only by external testers under the existing
+procedure, and no Intel coverage is claimed.
+
+## Further Notes
+
+**Evidence plan for #211.** The owner made these hosts available: `gpu-test`
+(NVIDIA, a Linux VM) and the maintainer workstation (AMD, standard Linux), plus a
+fresh deployment on the Unraid appliance, which has an AMD card and also hosts
+the `gpu-test` VM. That gives NVIDIA on standard Linux, AMD on standard Linux and
+AMD on Unraid. A native Unraid/NVIDIA install is not available, because the
+NVIDIA card is passed through to the VM. #211's "fresh Unraid/NVIDIA" line is
+therefore met only in part, and the record must say so. The Unraid run is best
+effort and does not block the increment; any switch of the appliance between its
+own stack and the VM is asked of the owner first. Outside testers may be brought
+in later.
+
+**Delivery.** Work branches from and integrates only into
+`initiative/resilient-host-architecture`. Promotion to `develop` needs the owner's
+separate approval after acceptance. No release tag, image publication or
+deployed-stack change is part of this specification.

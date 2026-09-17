@@ -143,7 +143,7 @@ group decision; `encode_slots_total` as a vendor guess reported as capacity.
    from earlier work, but none of it used RH-02's checks, and no standard Linux
    distribution install outside an appliance or a development host is on record.
 
-## Proposed direction (recommendation, pending the decisions below)
+## Proposed direction (as recommended; since approved)
 
 - Keep the readiness check as the one unit the console shows. Add to it, do not
   build a parallel vocabulary.
@@ -163,9 +163,10 @@ group decision; `encode_slots_total` as a vendor guess reported as capacity.
 - Word every network check as host-local. Browser reachability stays with the
   browser side and #223.
 
-## Decisions for the owner
+## Decisions put to the owner
 
-See the grilling round on #210's planning thread / the session record. They are:
+Settled with the owner on 2026-09-18; the outcomes are in the specification
+(`2026-09-18-rh02-probe-first-spec.md`) and ADR 0005. They were:
 gating and the contract amendment it needs; where a block is enforced; which
 failures block which workloads; override semantics; when probes run; what an
 uncertain probe means; diagnostic registration without a runtime; CDI scope;

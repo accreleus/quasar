@@ -47,13 +47,14 @@ chain and rung, whether the cap fired, the decision record, and exactly what to
 persist. Computed from gathered inputs with no I/O, so the decision is
 separable from the reads that feed it and the write that records it.
 
-**Probe** — a device-capability measurement reported by a client (bandwidth,
-RTT, max decode height, refresh rate, decode matrix). Per account, not per
-launching client: the latest probe may describe a different device than the one
-launching now, which is why the H.264 lift is keyed on the request's declared
-client type as well as the probe.
+**Device probe** — a device-capability measurement reported by a client
+(bandwidth, RTT, max decode height, refresh rate, decode matrix). Per account,
+not per launching client: the latest device probe may describe a different
+device than the one launching now, which is why the H.264 lift is keyed on the
+request's declared client type as well as the device probe. _Avoid_: bare
+"probe" in new prose (a *host probe* is a different thing, see Host readiness).
 
-**Envelope** — the conservative ceiling derived from a probe: a safe bitrate
+**Envelope** — the conservative ceiling derived from a device probe: a safe bitrate
 cap and a playout₀ bump. It only ever lowers. It is applied to the *final*
 rung's bitrate, not just the pre-placement one, or a fall-through to a lower
 rung would restore an unclamped number.
@@ -314,6 +315,49 @@ page and logged (`token=catalog-manifest-changed`). _Avoid_: "manifest
 signature" and "manifest verification" (nothing is verified), "manifest digest"
 on its own when the ref/commit/URL are also meant (the digest is one field of
 the record).
+
+## Host readiness
+
+**Host fact** — something observed about a host, carried with where the
+observation came from and when it was made. A fact states what is there; it
+never says what should be done about it. _Avoid_: "capability" (that is what a
+runtime or encoder advertises), "setting" (that is policy).
+
+**Readiness check** — a named verdict over one or more host facts, worded for
+the operator, with the fix when it fails. It is the unit the console shows and
+the only thing that can block a launch. _Avoid_: "health check" (the
+container's), "preflight check" (preflight is the release evaluation that reads
+some readiness checks).
+
+**Host probe** — a bounded, disposable container the host agent runs to
+exercise a real path (compositing and encoding, audio, virtual input) with
+exactly what a session would be given, producing host facts. Distinct from a
+*device probe*, which measures a client. _Avoid_: "preflight" (releases),
+"self-test" (that is one process checking itself), bare "probe".
+
+**Evidence** — a host fact that came from exercising the real path, or a
+definitive local observation such as an unreachable container runtime. Only
+evidence may block a launch; a *proxy* (a file that exists, a firewall rule
+that parses) informs the operator and never blocks.
+
+**Indeterminate** — the outcome of a host probe that could not be concluded: a
+deadline passed, a reply was lost, the runtime went away. It neither sets nor
+clears a block; the last definitive result stands, with its own observation
+time. _Avoid_: reporting it as a failure, or as "skip" (skip means not
+applicable to this host).
+
+**Readiness override** — an admin's recorded decision to launch on a host
+despite one named failing readiness check. It never hides the check, applies to
+that check only, and ends when the check next passes. _Avoid_: "ignore",
+"suppress", "acknowledge".
+
+**Diagnostic registration** — a host that is connected and visible in the
+console while it refuses every launch, because its container runtime is
+unusable or its startup cleanup has not yet succeeded.
+
+**Host readiness vs browser reachability** — readiness is what the host can
+establish about itself. Whether a given browser can reach the host's media path
+is evidence only that browser can supply; no readiness check claims it.
 
 ## Platform releases
 
