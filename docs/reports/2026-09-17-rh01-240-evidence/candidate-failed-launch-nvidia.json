@@ -1,0 +1,11 @@
+{
+  "sid": "59176f4e-ea95-4f55-96c0-4dbe1edf54cc",
+  "state": "failed",
+  "failure_code": "app_exited_early",
+  "error_message": "the app exited with code 37 before producing any video. Check the app container log.",
+  "app_log_tail": "RH01-240-final-stdout\nRH01-240-final-stderr",
+  "cleanup_seconds": 7.908622912000283,
+  "containers_absent": true,
+  "paths_absent": true,
+  "passed": true
+}

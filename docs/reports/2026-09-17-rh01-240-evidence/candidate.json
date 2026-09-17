@@ -1,0 +1,5 @@
+{
+  "image_tag": "quasar-node-agent:20260917-0813-rh01-240",
+  "image_id": "sha256:9f6eef5b8dc56abcc5c659a987d58bacf64a14691849731727fa777f33394779",
+  "source_commit": "71e77f8d02acf6dfbf51abaee40efb16dd349910"
+}

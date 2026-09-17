@@ -1,0 +1,14 @@
+{
+  "started": "2026-09-17T08:22:45.661782+00:00",
+  "nonce": "465f6563",
+  "present_after_restart": {
+    "quasar-sess-legacy239-465f6563": false,
+    "quasar-sess-legacy239s-465f6563": false,
+    "quasar-sess-legacy239f-465f6563": true,
+    "quasar-sess-legacy239u-465f6563": true,
+    "quasar-sess-legacy239a-465f6563": true
+  },
+  "agent_identity_preserved": true,
+  "node_secret_preserved": true,
+  "passed": true
+}

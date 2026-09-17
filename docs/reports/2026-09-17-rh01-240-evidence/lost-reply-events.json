@@ -1,0 +1,28 @@
+[
+  {
+    "at": 1789634648.1029036,
+    "event": "application-create-submitted",
+    "operation": "application-quasar-sess-979ebe16-804e-4e53-b0ed-fcefc1ccabc4-g0-1789634648050007852"
+  },
+  {
+    "at": 1789634648.2123907,
+    "event": "reply-discarded",
+    "mutation": "POST",
+    "status": 201,
+    "operation": "application-quasar-sess-979ebe16-804e-4e53-b0ed-fcefc1ccabc4-g0-1789634648050007852",
+    "container_id": "0ddb62314cd049f7b2c744ab9149aa782574272f3503ff9fe10713cafcb5b8a5"
+  },
+  {
+    "at": 1789634673.9343557,
+    "event": "application-create-submitted",
+    "operation": "application-quasar-sess-e7ce35a7-ac8a-41fc-a3f4-8793bf5b1f03-g0-1789634673837631432"
+  },
+  {
+    "at": 1789634691.4991698,
+    "event": "reply-discarded",
+    "mutation": "DELETE",
+    "status": 204,
+    "operation": null,
+    "container_id": "c9f568b3440770ef215ab8091d3f4ecc1a2fd3f2d75f6be18f17ae3476a20158"
+  }
+]

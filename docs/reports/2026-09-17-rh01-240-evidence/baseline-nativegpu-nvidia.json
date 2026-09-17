@@ -1,0 +1,67 @@
+{
+  "luma": {
+    "mean": 55.92,
+    "sd": 0.14,
+    "samples": 10,
+    "samples_total": 17,
+    "mean_whole_run": 55.92,
+    "first_content_s": 0
+  },
+  "audio": {
+    "passed": true,
+    "receivedTone": true,
+    "playing": true,
+    "before": [
+      {
+        "peer": 1,
+        "id": "ITaudio01A1475438391",
+        "state": "connected",
+        "live": true,
+        "bytes": 90720,
+        "packets": 1134,
+        "duration": 13.989999999999746,
+        "energy": 0.9193137283764569
+      }
+    ],
+    "after": [
+      {
+        "peer": 1,
+        "id": "ITaudio01A1475438391",
+        "state": "connected",
+        "live": true,
+        "bytes": 106800,
+        "packets": 1335,
+        "duration": 16.009999999999703,
+        "energy": 1.1038169543390066
+      }
+    ],
+    "playback": [
+      {
+        "paused": false,
+        "muted": false,
+        "volume": 1,
+        "readyState": 4,
+        "live": true,
+        "error": null
+      }
+    ]
+  },
+  "encoder-evidence": {
+    "sid": "3753f4d0-58ee-4979-ae97-438a7b6514f7",
+    "encoder": "vulkanh264enc"
+  },
+  "renderer-evidence": {
+    "container_id": "2a905d7cbbd82f42bc589a04229c64a270b9aef0424626fe414479e3f191bc90",
+    "renderer": "NVIDIA GeForce RTX 5090",
+    "type": "DiscreteGpu"
+  },
+  "teardown": {
+    "sid": "3753f4d0-58ee-4979-ae97-438a7b6514f7",
+    "stop_ack_seconds": 0.009210425996570848,
+    "after_ack_seconds": 11.00257063699246,
+    "remaining_containers": [],
+    "remaining_paths": [],
+    "terminal_state": "stopped",
+    "error_message": null
+  }
+}

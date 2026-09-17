@@ -1,0 +1,71 @@
+{
+  "luma": {
+    "mean": 72.91,
+    "sd": 5.67,
+    "samples": 10,
+    "samples_total": 22,
+    "mean_whole_run": 64.09,
+    "first_content_s": 0
+  },
+  "audio": {
+    "passed": true,
+    "receivedTone": true,
+    "playing": true,
+    "before": [
+      {
+        "peer": 1,
+        "id": "ITaudio01A4157397634",
+        "state": "connected",
+        "live": true,
+        "bytes": 147040,
+        "packets": 1838,
+        "duration": 18.510000000000094,
+        "energy": 1.6691811247402752
+      }
+    ],
+    "after": [
+      {
+        "peer": 1,
+        "id": "ITaudio01A4157397634",
+        "state": "connected",
+        "live": true,
+        "bytes": 163200,
+        "packets": 2040,
+        "duration": 20.520000000000408,
+        "energy": 1.8527336067211742
+      }
+    ],
+    "playback": [
+      {
+        "paused": false,
+        "muted": false,
+        "volume": 1,
+        "readyState": 4,
+        "live": true,
+        "error": null
+      }
+    ]
+  },
+  "encoder-evidence": {
+    "sid": "8220a485-819c-41f3-aa53-6b9c03554861",
+    "encoder": "vah264enc"
+  },
+  "input-result": {
+    "mouse": {
+      "passed": true,
+      "idle_delta": 0.0035416666666666665,
+      "mouse_selection_delta": 6.491388888888889,
+      "keyboard_sent": "quasar + Enter"
+    },
+    "application_received": "quasar"
+  },
+  "teardown": {
+    "sid": "8220a485-819c-41f3-aa53-6b9c03554861",
+    "stop_ack_seconds": 0.04412647199933417,
+    "after_ack_seconds": 16.138801142005832,
+    "remaining_containers": [],
+    "remaining_paths": [],
+    "terminal_state": "stopped",
+    "error_message": null
+  }
+}

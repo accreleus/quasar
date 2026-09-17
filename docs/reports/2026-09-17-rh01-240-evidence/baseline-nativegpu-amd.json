@@ -1,0 +1,67 @@
+{
+  "luma": {
+    "mean": 59.48,
+    "sd": 0.1,
+    "samples": 10,
+    "samples_total": 14,
+    "mean_whole_run": 59.5,
+    "first_content_s": 0
+  },
+  "audio": {
+    "passed": true,
+    "receivedTone": true,
+    "playing": true,
+    "before": [
+      {
+        "peer": 1,
+        "id": "ITaudio01A3018180579",
+        "state": "connected",
+        "live": true,
+        "bytes": 75760,
+        "packets": 947,
+        "duration": 12.999999999999767,
+        "energy": 0.7887209852596435
+      }
+    ],
+    "after": [
+      {
+        "peer": 1,
+        "id": "ITaudio01A3018180579",
+        "state": "connected",
+        "live": true,
+        "bytes": 91920,
+        "packets": 1149,
+        "duration": 15.009999999999724,
+        "energy": 0.972555247971947
+      }
+    ],
+    "playback": [
+      {
+        "paused": false,
+        "muted": false,
+        "volume": 1,
+        "readyState": 4,
+        "live": true,
+        "error": null
+      }
+    ]
+  },
+  "encoder-evidence": {
+    "sid": "6b959f9a-bf35-4dc0-b769-61fd8a9b6529",
+    "encoder": "vah264enc"
+  },
+  "renderer-evidence": {
+    "container_id": "f5d0546a7ed44e600bacd6246851c7e3851eca1e594905886101b9a9a6b372c2",
+    "renderer": "AMD Radeon Graphics (RADV RENOIR)",
+    "type": "IntegratedGpu"
+  },
+  "teardown": {
+    "sid": "6b959f9a-bf35-4dc0-b769-61fd8a9b6529",
+    "stop_ack_seconds": 0.16715318799833767,
+    "after_ack_seconds": 17.0516332660045,
+    "remaining_containers": [],
+    "remaining_paths": [],
+    "terminal_state": "stopped",
+    "error_message": null
+  }
+}

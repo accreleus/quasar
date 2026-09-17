@@ -1,0 +1,359 @@
+{
+  "stage": "candidate",
+  "vendor": "nvidia",
+  "started": "2026-09-17T08:28:35.767891+00:00",
+  "agent_container_id": "f74bbc0fecd13b78d3443afd41a5ba4089c45f55c310652621141bb3994c76bb",
+  "agent_image_id": "sha256:9f6eef5b8dc56abcc5c659a987d58bacf64a14691849731727fa777f33394779",
+  "sessions": [
+    "f0607986-9b8d-4617-aa99-245df11c563c",
+    "931b511b-e9df-4f17-97b8-a05dfd599d5e"
+  ],
+  "observations": [
+    {
+      "elapsed_s": 0.022,
+      "state": "stopping",
+      "detail": "stop requested"
+    },
+    {
+      "elapsed_s": 0.278,
+      "state": "stopping",
+      "detail": "stop requested"
+    },
+    {
+      "elapsed_s": 0.534,
+      "state": "stopping",
+      "detail": "stop requested"
+    },
+    {
+      "elapsed_s": 0.789,
+      "state": "stopping",
+      "detail": "stop requested"
+    },
+    {
+      "elapsed_s": 1.043,
+      "state": "stopping",
+      "detail": "stop requested"
+    },
+    {
+      "elapsed_s": 1.299,
+      "state": "stopping",
+      "detail": "stop requested"
+    },
+    {
+      "elapsed_s": 1.555,
+      "state": "stopping",
+      "detail": "stop requested"
+    },
+    {
+      "elapsed_s": 1.809,
+      "state": "stopping",
+      "detail": "stop requested"
+    },
+    {
+      "elapsed_s": 2.064,
+      "state": "stopping",
+      "detail": "stop requested"
+    },
+    {
+      "elapsed_s": 2.317,
+      "state": "stopping",
+      "detail": "stop requested"
+    },
+    {
+      "elapsed_s": 2.573,
+      "state": "stopping",
+      "detail": "stop requested"
+    },
+    {
+      "elapsed_s": 2.827,
+      "state": "stopping",
+      "detail": "stop requested"
+    },
+    {
+      "elapsed_s": 3.083,
+      "state": "stopping",
+      "detail": "stop requested"
+    },
+    {
+      "elapsed_s": 3.338,
+      "state": "stopping",
+      "detail": "stop requested"
+    },
+    {
+      "elapsed_s": 3.594,
+      "state": "stopping",
+      "detail": "stop requested"
+    },
+    {
+      "elapsed_s": 3.849,
+      "state": "stopping",
+      "detail": "stop requested"
+    },
+    {
+      "elapsed_s": 4.103,
+      "state": "stopping",
+      "detail": "stop requested"
+    },
+    {
+      "elapsed_s": 4.358,
+      "state": "stopping",
+      "detail": "stop requested"
+    },
+    {
+      "elapsed_s": 4.613,
+      "state": "stopping",
+      "detail": "stop requested"
+    },
+    {
+      "elapsed_s": 4.868,
+      "state": "stopped",
+      "detail": "host_lost"
+    }
+  ],
+  "after_heartbeat": {
+    "id": "f0607986-9b8d-4617-aa99-245df11c563c",
+    "user_id": "ff5d4479-4cf2-4d25-a1a2-065d9db26bd0",
+    "app_id": "c0bf4d52-3f74-48c3-b832-07c2c55d9fb3",
+    "host_id": "4aafb9cd-bb3d-426c-863f-2ad4ff87a1d9",
+    "state": "stopped",
+    "state_detail": "host_lost",
+    "error_message": null,
+    "failure_code": null,
+    "app_log_tail": null,
+    "profile_id": "720p60",
+    "stream_profile_id": "720p60-h264",
+    "stream": {
+      "width": 1280,
+      "height": 720,
+      "fps": 60,
+      "bitrate_kbps": 4500,
+      "h264_profile": "constrained-baseline",
+      "codec": "h264",
+      "playout0_ms": 75,
+      "mic": false,
+      "rungs": [
+        [
+          1280,
+          720
+        ]
+      ]
+    },
+    "codec_decision": {
+      "floor": false,
+      "override": null,
+      "considered": [
+        {
+          "codec": "h264",
+          "rung_id": "720p60-h264",
+          "selected": true,
+          "rejected_by": null,
+          "clamps_bypassed": false
+        }
+      ],
+      "result_rung": "720p60-h264",
+      "result_codec": "h264"
+    },
+    "negotiated_codec": null,
+    "health_state": "healthy",
+    "created_at": "2026-09-17T08:28:35.824633Z",
+    "started_at": "2026-09-17T08:28:37.704589Z",
+    "ended_at": "2026-09-17T08:28:58.595781Z"
+  },
+  "cleanup": {
+    "journal_phases": [
+      "Completed"
+    ],
+    "containers_absent": true
+  },
+  "home_marker_preserved": true,
+  "identity_preserved": true,
+  "registration_count": 1,
+  "reuse": {
+    "running": true,
+    "marker_preserved": true,
+    "stop": {
+      "seconds": 10.878,
+      "home_blocked_while_stopping": true,
+      "observations": [
+        {
+          "elapsed_s": 0.073,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 0.386,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 0.695,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 1.006,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 1.321,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 1.637,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 1.949,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 2.263,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 2.573,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 2.887,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 3.203,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 3.52,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 3.836,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 4.153,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 4.472,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 4.782,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 5.093,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 5.404,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 5.718,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 6.026,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 6.339,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 6.654,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 6.969,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 7.281,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 7.59,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 7.903,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 8.211,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 8.524,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 8.84,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 9.157,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 9.474,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 9.791,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 10.131,
+          "state": "stopping",
+          "containers_remaining": 2
+        },
+        {
+          "elapsed_s": 10.452,
+          "state": "stopped",
+          "containers_remaining": 1
+        },
+        {
+          "elapsed_s": 10.781,
+          "state": "stopped",
+          "containers_remaining": 0
+        }
+      ],
+      "terminal_state": "stopped",
+      "cleanup_completed": true
+    }
+  },
+  "passed": true
+}

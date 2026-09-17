@@ -1,0 +1,17 @@
+{
+  "target": "nvidia",
+  "control_source": "64083f2558001d50cb43eaf604d6470c7a8c084d",
+  "schema": 84,
+  "control_image": "sha256:20d863f520febf6caa5daaff7be9d8f0163be1b6298ae6baecc52fa0727564ed",
+  "agent_image": "sha256:2d6455dd0d37ae553ccd5ca65f0e520884d20263b9f5ca4f50cfc4012bc7012b",
+  "agent_source": [
+    "fc5505806d4f5f37d3af455b4ebf14e7692b18fb"
+  ],
+  "active_sessions": 0,
+  "host_status": [
+    "online"
+  ],
+  "engine": "29.7.2",
+  "api": "1.55",
+  "client": "29.7.2"
+}

@@ -1,0 +1,16 @@
+{
+  "known_good_image": "sha256:2d6455dd0d37ae553ccd5ca65f0e520884d20263b9f5ca4f50cfc4012bc7012b",
+  "known_good_source": "fc5505806d4f5f37d3af455b4ebf14e7692b18fb",
+  "host_identity_preserved": true,
+  "node_secret_preserved": true,
+  "mounts_preserved": true,
+  "user_marker_preserved": true,
+  "known_good_relaunch": true,
+  "known_good_teardown_seconds": 10.755266565000056,
+  "control_schema": 84,
+  "control_source": "71e77f8d02acf6dfbf51abaee40efb16dd349910",
+  "returned_to_candidate": "sha256:9f6eef5b8dc56abcc5c659a987d58bacf64a14691849731727fa777f33394779",
+  "candidate_relaunch": true,
+  "candidate_teardown_seconds": 10.673961223001243,
+  "passed": true
+}

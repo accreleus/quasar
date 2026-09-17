@@ -1,0 +1,16 @@
+{
+  "started": "2026-09-17T08:21:24.542622+00:00",
+  "agent_image_id": "sha256:9f6eef5b8dc56abcc5c659a987d58bacf64a14691849731727fa777f33394779",
+  "agent_image_tag": "quasar-node-agent:20260917-0813-rh01-240",
+  "source_commit": "71e77f8d02acf6dfbf51abaee40efb16dd349910",
+  "probe_lines": [
+    "absent:docker",
+    "absent:podman",
+    "ls: cannot access '/usr/local/bin/docker': No such file or directory",
+    "ls: cannot access '/usr/bin/docker': No such file or directory",
+    "ls: cannot access '/usr/bin/podman': No such file or directory"
+  ],
+  "engine_discovered_logged": true,
+  "host_online": true,
+  "passed": true
+}

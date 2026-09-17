@@ -1,0 +1,25 @@
+{
+  "swaps": [
+    {
+      "old_id": "3f048dffaca6ae26c4e592390f8a591189f9080c099389ca940ad10558a66076",
+      "new_id": "19c9c3abccbb2b06b4209c948190b63a6012c879f3c3e736c2fd6c7067615528",
+      "no_running_overlap": true,
+      "same_home": true
+    },
+    {
+      "old_id": "19c9c3abccbb2b06b4209c948190b63a6012c879f3c3e736c2fd6c7067615528",
+      "new_id": "7e0671171d3a732b33089112fbe59571d52dedd6c7d6114f634c9c6abc5bd5f0",
+      "no_running_overlap": true,
+      "same_home": false
+    },
+    {
+      "old_id": "7e0671171d3a732b33089112fbe59571d52dedd6c7d6114f634c9c6abc5bd5f0",
+      "new_id": "2e2f2988ec253c5e1a831fbc169b297b065200240ee8432b4df9104afc41228d",
+      "no_running_overlap": true,
+      "same_home": true
+    }
+  ],
+  "browser_passed": true,
+  "teardown_seconds": 12.07,
+  "passed": true
+}

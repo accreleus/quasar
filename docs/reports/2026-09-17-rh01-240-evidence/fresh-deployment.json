@@ -1,0 +1,11 @@
+{
+  "passed": true,
+  "fresh_database": true,
+  "fresh_agent_identity_and_journals": true,
+  "schema": 84,
+  "source": "71e77f8d02acf6dfbf51abaee40efb16dd349910",
+  "agent_image": "sha256:9f6eef5b8dc56abcc5c659a987d58bacf64a14691849731727fa777f33394779",
+  "control_image": "sha256:f7b4726c197c7d87dd906e7ee81384ca38bfe4c4bc05b5dbc2941d6fddf1ee65",
+  "registered_online": true,
+  "media_and_home": true
+}

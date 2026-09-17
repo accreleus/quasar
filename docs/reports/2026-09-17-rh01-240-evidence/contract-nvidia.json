@@ -1,0 +1,16 @@
+{
+  "image": "quasar-node-agent:20260917-0813-rh01-240",
+  "image_id": "sha256:9f6eef5b8dc56abcc5c659a987d58bacf64a14691849731727fa777f33394779",
+  "role": "runtime",
+  "chain": [
+    "runtime"
+  ],
+  "size_mb": 349,
+  "size_max_mb": 2000,
+  "gpu_attached": true,
+  "gpu_skipped_elements": [],
+  "passed": 145,
+  "failed": 0,
+  "verdict": "PASS",
+  "source_commit": "71e77f8d02acf6dfbf51abaee40efb16dd349910"
+}

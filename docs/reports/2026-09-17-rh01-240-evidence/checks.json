@@ -1,0 +1,178 @@
+{
+  "binary_source": "71e77f8d02acf6dfbf51abaee40efb16dd349910",
+  "reviewed_test_diff_sha256": "1d9984605279622a2a0e655360e712ae555ab7e966ffda1c2a176e46915a4614",
+  "checks": {
+    "make-verify": {
+      "result": "PASS",
+      "private_log_sha256": "d2ce6c76cceaf67257ac9ec76fdcf0458127645e09ef00a4a4e68a95eccacf30",
+      "summary": [
+        "RESULT status=ok target=verify pass=428 warn=0 fail=0"
+      ]
+    },
+    "make-test-rust": {
+      "result": "PASS",
+      "private_log_sha256": "7f377f651a332e320ef72615a0f217d34cd0216ed5f09ea52cca9161065cd5df",
+      "summary": [
+        "PASS \u2014 Rust formatting",
+        "PASS \u2014 Rust clippy",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1504 filtered out; finished in 0.03s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1504 filtered out; finished in 0.03s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1504 filtered out; finished in 0.00s",
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1504 filtered out; finished in 0.00s",
+        "test result: ok. 1497 passed; 0 failed; 8 ignored; 0 measured; 0 filtered out; finished in 8.47s",
+        "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s",
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s",
+        "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.21s",
+        "test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+        "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "PASS \u2014 Rust Linux unit tests"
+      ]
+    },
+    "make-test-go": {
+      "result": "PASS",
+      "private_log_sha256": "12e1d4cff2d2e518780717359906ba922812f227b0309f7f2167b18d55c8b164",
+      "summary": [
+        "PASS \u2014 Go formatting and syntax",
+        "PASS \u2014 Go build",
+        "PASS \u2014 Go vet",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/cmd/quasar-control\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/access\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/agentws\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/artwork\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/audit\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/auth\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/buildinfo\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/config\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/console\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/crud\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/db\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/devauth\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/devices\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/hostcfg\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/hostenroll\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/httpx\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/ice\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/images\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/invites\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/jobs\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/library\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/migrate\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/mountpolicy\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/origins\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/outbound\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/platform\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/preparation\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/profile\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/ratelimit\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/runtimeconfig\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/secrets\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/semver\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/session\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/settings\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/setup\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/signal\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/storage\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/telemetry\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/tier\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/tlsx\t(cached)",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/updater\t2.050s",
+        "PASS \u2014 Go unit and OpenAPI drift tests"
+      ]
+    },
+    "make-test-db": {
+      "result": "PASS",
+      "private_log_sha256": "4473a0fc8d4079f00e15022bf3c665735e9dc3c0b003a4a4e985f63706b4caed",
+      "summary": [
+        "ok  \tgithub.com/accreleus/quasar/control-plane/cmd/quasar-control\t11.290s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/access\t0.017s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/agentws\t11.248s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/artwork\t37.181s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/audit\t1.159s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/auth\t34.396s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/buildinfo\t0.004s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/config\t0.006s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/console\t0.003s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/crud\t55.496s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/db\t0.010s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/devauth\t10.968s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/devices\t7.148s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/hostcfg\t1.246s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/hostenroll\t4.681s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/httpx\t0.116s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/ice\t0.002s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/images\t171.591s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/invites\t6.764s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/jobs\t38.127s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/library\t56.339s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/migrate\t0.005s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/mountpolicy\t0.002s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/origins\t0.003s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/outbound\t0.003s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/platform\t81.874s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/preparation\t3.255s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/profile\t0.003s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/ratelimit\t0.002s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/runtimeconfig\t0.002s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/secrets\t10.784s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/semver\t0.002s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/session\t118.441s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/settings\t39.521s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/setup\t7.114s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/signal\t2.660s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/storage\t5.096s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/telemetry\t1.046s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/tier\t0.004s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/tlsx\t0.003s",
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/updater\t0.902s",
+        "RESULT status=ok target=test-db host=local instance=dx-8e5ebb00 pass=4 warn=0 fail=0 pg_port=25490 pg_name=qpg-dx-8e5ebb00-2081862-e4384354"
+      ]
+    },
+    "make-preflight": {
+      "result": "PASS",
+      "private_log_sha256": "1cbbd351e9855547b3962b1c79218c35e5270809f15e42b662f85a72996d3089",
+      "summary": [
+        "RESULT status=degraded target=doctor host=local instance=dx-8e5ebb00 pass=4 warn=2 fail=0 cp_port=25460 pg_port=25462",
+        "RESULT status=degraded target=config-check host=local instance=dx-8e5ebb00 pass=10 warn=3 fail=0",
+        "RESULT status=ok target=verify pass=428 warn=0 fail=0",
+        "preflight complete \u2014 see the RESULT lines above"
+      ]
+    },
+    "real-docker-existing-final": {
+      "result": "PASS",
+      "private_log_sha256": "5ce71fe180f748fab50c93140e8da5a258588f7da124bb4c94da3dca59c73be5",
+      "summary": [
+        "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 1500 filtered out; finished in 9.04s"
+      ]
+    },
+    "real-docker-application-final": {
+      "result": "PASS",
+      "private_log_sha256": "8c8028684d35b9c98c775bcf45c5f6f58b03641f366df97645844a90637cd5c1",
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.43s"
+      ]
+    },
+    "real-docker-inspection-quiet": {
+      "result": "PASS",
+      "private_log_sha256": "e8ace00ec8046ddb41651d6f815f43d9842c4806775deef6bc82d8c2cd7bccfc",
+      "summary": [
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.91s"
+      ]
+    },
+    "focused-reconnect-race": {
+      "result": "PASS",
+      "private_log_sha256": "41fa096a58411aba29adacaa71b88203605ec20f1de33f2bc21ccdcb3048a3e4",
+      "summary": [
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/session\t7.577s"
+      ]
+    },
+    "registry-race": {
+      "result": "PASS",
+      "private_log_sha256": "dffb7c080e9e17be36439cfe3db596d7693ed71e845de452192e4e05e9379a08",
+      "summary": [
+        "ok  \tgithub.com/accreleus/quasar/control-plane/internal/agentws\t2.844s"
+      ]
+    }
+  }
+}

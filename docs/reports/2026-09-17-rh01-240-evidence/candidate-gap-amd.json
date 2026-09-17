@@ -1,0 +1,28 @@
+{
+  "started": "2026-09-17T08:34:21.261003+00:00",
+  "gap_while_running": {
+    "session_state_during_gap": "running",
+    "app_running_during_gap": true,
+    "session_state_after_gap": "running",
+    "browser_content_luma": 127.69,
+    "browser_audio_passed": true,
+    "agent_lines_during_gap": 33,
+    "teardown_seconds": 12.355
+  },
+  "exit_during_gap": {
+    "session_state_while_cut": "running",
+    "terminal_seconds_after_engine_back": 1.0,
+    "cleanup_seconds_after_terminal": 0.8,
+    "terminal_state": "failed",
+    "error_message": "app exited with code 137",
+    "exit_line_count": 2
+  },
+  "stop_during_gap": {
+    "state_while_cut": "stopped",
+    "container_present_while_cut": true,
+    "terminal_state": "stopped",
+    "seconds_to_terminal_and_clean": 30.887,
+    "journals_completed": 124
+  },
+  "passed": true
+}

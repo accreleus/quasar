@@ -1,0 +1,25 @@
+{
+  "swaps": [
+    {
+      "old_id": "2506417944e58fc829cdc353b8e7af9ba1faf786a12db8f8310d71f270563bed",
+      "new_id": "878da1b9af7be794f22008a3b5a9f9e349dae5556afffadd4ce84580ac55549f",
+      "no_running_overlap": true,
+      "same_home": true
+    },
+    {
+      "old_id": "878da1b9af7be794f22008a3b5a9f9e349dae5556afffadd4ce84580ac55549f",
+      "new_id": "b4097949b8c7302db4e73f7a85fdd4734a65ba52f23534089d4a82583fdc21a8",
+      "no_running_overlap": true,
+      "same_home": false
+    },
+    {
+      "old_id": "b4097949b8c7302db4e73f7a85fdd4734a65ba52f23534089d4a82583fdc21a8",
+      "new_id": "2475171892b6f944b559efa45f4ec663f62e3cdc25794a0575b25ff57f6e803d",
+      "no_running_overlap": true,
+      "same_home": true
+    }
+  ],
+  "browser_passed": true,
+  "teardown_seconds": 10.87,
+  "passed": true
+}

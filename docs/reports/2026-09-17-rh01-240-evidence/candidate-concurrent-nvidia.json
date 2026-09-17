@@ -1,0 +1,14 @@
+{
+  "sessions": [
+    "aaab99e2-3447-4e12-a397-9ca432f99b29",
+    "b5c5f5d2-76e3-4bab-9860-d69e264c35d6"
+  ],
+  "distinct_session_mounts": true,
+  "both_decoded_overlap_seconds": 3.0003408239863347,
+  "both_application_keyboard_effects": true,
+  "first_teardown_seconds": 11.125,
+  "both_application_mouse_effects": true,
+  "second_survives_first_stop": true,
+  "second_teardown_seconds": 10.711,
+  "passed": true
+}

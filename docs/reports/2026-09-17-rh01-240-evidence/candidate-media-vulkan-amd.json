@@ -1,0 +1,62 @@
+{
+  "luma": {
+    "mean": 127.38,
+    "sd": 0.42,
+    "samples": 10,
+    "samples_total": 22,
+    "mean_whole_run": 127.27,
+    "first_content_s": 0
+  },
+  "audio": {
+    "passed": true,
+    "receivedTone": true,
+    "playing": true,
+    "before": [
+      {
+        "peer": 1,
+        "id": "ITaudio01A1328414506",
+        "state": "connected",
+        "live": true,
+        "bytes": 105840,
+        "packets": 1323,
+        "duration": 13.34999999999976,
+        "energy": 1.186018751122862
+      }
+    ],
+    "after": [
+      {
+        "peer": 1,
+        "id": "ITaudio01A1328414506",
+        "state": "connected",
+        "live": true,
+        "bytes": 121920,
+        "packets": 1524,
+        "duration": 15.359999999999717,
+        "energy": 1.3687969922189738
+      }
+    ],
+    "playback": [
+      {
+        "paused": false,
+        "muted": false,
+        "volume": 1,
+        "readyState": 4,
+        "live": true,
+        "error": null
+      }
+    ]
+  },
+  "encoder-evidence": {
+    "sid": "571784ee-36f3-4715-8791-177643849a82",
+    "encoder": "vulkanh264enc"
+  },
+  "teardown": {
+    "sid": "571784ee-36f3-4715-8791-177643849a82",
+    "stop_ack_seconds": 0.026157601998420432,
+    "after_ack_seconds": 10.901535461001913,
+    "remaining_containers": [],
+    "remaining_paths": [],
+    "terminal_state": "stopped",
+    "error_message": null
+  }
+}

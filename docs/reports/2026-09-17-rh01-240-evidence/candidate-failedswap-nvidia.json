@@ -1,0 +1,19 @@
+{
+  "gen0": "801d47b483b1accf2ce8360213dedbbbaed731b0239ac457eb2f6d83e595db0c",
+  "failed_generation": [],
+  "replacement_observed_by_sampling": false,
+  "relaunched": "2d9c9e7d201a9879a8f872b342654e40524effda5dbd1f31e96c0eda8f33eb77",
+  "rollback_detail": "swap failed; rolled back: replacement app exited before presenting (Code(37)); previous app was restarted",
+  "rollback_seconds": 12.169,
+  "state_details": [
+    "swapping",
+    "app booting",
+    "swap failed; rolled back: replacement app exited before presenting (Code(37)); previous app was restarted"
+  ],
+  "exit_lines_for_session": [
+    "2026-09-17T08:26:13.759718Z  INFO session{id=7b116eaa-e527-42bb-b35a-ef97ad3c1fb0 host=\"gpu-test\"}: quasar_node_agent::session::source: source 'quasar-ipsink-7b116eaa-e527-42bb-b35a-ef97ad3c1fb0-1': app container exited: Code(37)"
+  ],
+  "browser_passed": true,
+  "teardown_seconds": 11.086,
+  "passed": true
+}

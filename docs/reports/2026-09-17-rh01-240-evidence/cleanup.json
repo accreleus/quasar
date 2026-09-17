@@ -1,0 +1,34 @@
+{
+  "amd": {
+    "owned_catalog_assets_removed": 5,
+    "owned_home_removed": true,
+    "unrelated_catalog_preserved": 2,
+    "settings_restored": true,
+    "persistent_agent_mounts_preserved": true,
+    "host_identity_preserved": true,
+    "agent_image": "sha256:9f6eef5b8dc56abcc5c659a987d58bacf64a14691849731727fa777f33394779",
+    "control_source": "71e77f8d02acf6dfbf51abaee40efb16dd349910",
+    "schema": 84,
+    "idle": true,
+    "all_user_active_sessions": 0,
+    "application_journals_all_completed": true,
+    "helper_journals_all_completed": true,
+    "helper_journals_checked": 127
+  },
+  "nvidia": {
+    "owned_catalog_assets_removed": 5,
+    "owned_home_removed": true,
+    "unrelated_catalog_preserved": 5,
+    "settings_restored": true,
+    "persistent_agent_mounts_preserved": true,
+    "host_identity_preserved": true,
+    "agent_image": "sha256:9f6eef5b8dc56abcc5c659a987d58bacf64a14691849731727fa777f33394779",
+    "control_source": "71e77f8d02acf6dfbf51abaee40efb16dd349910",
+    "schema": 84,
+    "idle": true,
+    "all_user_active_sessions": 0,
+    "application_journals_all_completed": true,
+    "helper_journals_all_completed": true,
+    "helper_journals_checked": 2261
+  }
+}

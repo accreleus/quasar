@@ -1,0 +1,28 @@
+{
+  "started": "2026-09-17T08:45:35.650007+00:00",
+  "phases": {
+    "launch_interrupt_cp": {
+      "state_after_reconnect_window": "failed",
+      "state_detail": "host_lost",
+      "error_message": "agent no longer running this session"
+    },
+    "launch_interrupt": {
+      "killed_after_s": 1.919,
+      "containers_seen": 2,
+      "journals_completed": 127,
+      "control_plane_state": "failed",
+      "error_message": "agent no longer running this session"
+    },
+    "teardown_interrupt": {
+      "journals_completed": 128,
+      "marker_preserved": true,
+      "control_plane_state": "failed",
+      "error_message": "host agent connection lost"
+    }
+  },
+  "foreign_container_preserved": true,
+  "node_secret_preserved": true,
+  "owner_token_preserved": true,
+  "agent_container_id_preserved": true,
+  "passed": true
+}
