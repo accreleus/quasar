@@ -106,7 +106,7 @@ impl ProbeHandle {
     }
 
     /// A handle with no scheduler behind it, for a caller (`agent.rs`'s tests) that
-    /// only wants to assert what it SENT — a tiny forwarding task un-wraps `Msg` back
+    /// only wants to assert what it sent — a tiny forwarding task un-wraps `Msg` back
     /// to the `Event` a real scheduler would have consumed.
     #[cfg(test)]
     pub(crate) fn detached() -> (ProbeHandle, mpsc::UnboundedReceiver<Event>) {

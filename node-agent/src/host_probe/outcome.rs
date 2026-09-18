@@ -40,16 +40,18 @@ pub fn indeterminate_status() -> &'static str {
     crate::readiness::WARN
 }
 
-fn signal_name(signal: i32) -> String {
+/// Signals a process raises against itself by crashing. Anything else (SIGKILL from the
+/// OOM killer, SIGTERM from an operator) says nothing about the path under test.
+fn fault_signal(signal: i32) -> Option<&'static str> {
     match signal {
-        libc::SIGSEGV => "SIGSEGV".into(),
-        libc::SIGABRT => "SIGABRT".into(),
-        libc::SIGBUS => "SIGBUS".into(),
-        libc::SIGILL => "SIGILL".into(),
-        libc::SIGFPE => "SIGFPE".into(),
-        libc::SIGKILL => "SIGKILL".into(),
-        libc::SIGTERM => "SIGTERM".into(),
-        other => format!("signal {other}"),
+        libc::SIGSEGV => Some("SIGSEGV"),
+        libc::SIGABRT => Some("SIGABRT"),
+        libc::SIGBUS => Some("SIGBUS"),
+        libc::SIGILL => Some("SIGILL"),
+        libc::SIGFPE => Some("SIGFPE"),
+        libc::SIGSYS => Some("SIGSYS"),
+        libc::SIGTRAP => Some("SIGTRAP"),
+        _ => None,
     }
 }
 
@@ -109,16 +111,25 @@ pub fn child_outcome(target: ProbeTarget, end: ChildEnd) -> ProbeOutcome {
         ChildEnd::Exited { code: 0, stdout } => ProbeOutcome::Pass {
             summary: format!("{passed}: {stdout}"),
         },
-        ChildEnd::Exited { stdout, .. } => ProbeOutcome::Fail {
+        ChildEnd::Exited { code: 1, stdout } => ProbeOutcome::Fail {
             summary: format!("{failed}: {stdout}"),
             remediation: remediation(target.kind),
         },
-        ChildEnd::Signaled(signal) => ProbeOutcome::Fail {
-            summary: format!(
-                "The host probe of {exercising} crashed with {}",
-                signal_name(signal)
-            ),
-            remediation: remediation(target.kind),
+        // The child's contract is 0 pass, 1 fail. Anything else (2 is bad argv) is
+        // not a statement about the host.
+        ChildEnd::Exited { code, stdout } => ProbeOutcome::Indeterminate {
+            reason: format!("The host probe of {exercising} exited {code}: {stdout}"),
+        },
+        ChildEnd::Signaled(signal) => match fault_signal(signal) {
+            Some(name) => ProbeOutcome::Fail {
+                summary: format!("The host probe of {exercising} crashed with {name}"),
+                remediation: remediation(target.kind),
+            },
+            None => ProbeOutcome::Indeterminate {
+                reason: format!(
+                    "The host probe of {exercising} was killed from outside (signal {signal})"
+                ),
+            },
         },
         ChildEnd::Deadline(deadline) => ProbeOutcome::Indeterminate {
             reason: format!(
@@ -137,7 +148,7 @@ pub fn child_outcome(target: ProbeTarget, end: ChildEnd) -> ProbeOutcome {
     }
 }
 
-/// Indeterminate never replaces a held pass or fail.
+/// Indeterminate never replaces a held pass, fail or skip.
 pub fn record(
     report: &mut ReadinessReport,
     target: ProbeTarget,
@@ -181,6 +192,7 @@ pub fn record(
                 report.retained(&id).map(|c| c.status.as_str()),
                 Some(status) if status == crate::readiness::PASS
                     || status == crate::readiness::FAIL
+                    || status == crate::readiness::SKIP
             );
             if stands {
                 return;

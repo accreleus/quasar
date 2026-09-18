@@ -1,8 +1,4 @@
-//! The production [`ProbeRunner`]: wires probe targets to the child-process paths in
-//! `child.rs`/`media.rs`. #257 slice: only [`ProbeKind::Input`] and
-//! [`ProbeKind::Media`] are ever asked for (see `agent::ENABLED_KINDS`); the other two
-//! kinds report indeterminate rather than panicking, so a future slice can widen
-//! `ENABLED_KINDS` without also touching this file.
+//! The production [`ProbeRunner`]: one probe target to one bounded run.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -225,7 +221,7 @@ impl ProbeRunner for HostProbeRunner {
             ProbeKind::Audio | ProbeKind::ApplicationGpu => Box::pin(async move {
                 RunEnd::Concluded {
                     outcome: ProbeOutcome::Indeterminate {
-                        reason: "not implemented in this agent".into(),
+                        reason: "This agent version does not run this host probe".into(),
                     },
                     reconciled: true,
                 }

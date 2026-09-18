@@ -1,15 +1,9 @@
-//! `quasar-node-agent media-probe` — the CHILD half of the media host probe (spec #252
-//! "Host probes"): composite and encode a few frames on one GPU and say so in one line.
+//! `quasar-node-agent media-probe`, the child half of the media host probe (spec #252
+//! "Host probes"): composite and encode a few frames on one GPU, answer in one line.
 //!
-//! The graph is the production one minus everything a verdict does not need: the
-//! compositor source ([`pipeline::build_video_source`]), the production GPU convert stage,
-//! [`pipeline::resolve_effective_encoder`], the production encoder element and bitstream
-//! chain, then `fakesink`. No virtual input, app container, webrtc or interpipe — the
-//! question is "can this GPU composite and encode", and every element a probe adds is a
-//! failure mode the session path does not have.
-//!
-//! The parent half (the `ChildSpec`, the GPU binding, the argv/env contract) is
-//! `crate::host_probe::media`.
+//! Built from the production source, convert, encoder and bitstream builders. Anything a
+//! probe adds that a session lacks is a failure mode sessions do not have.
+//! Parent half: `crate::host_probe::media`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

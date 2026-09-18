@@ -1089,9 +1089,7 @@ async fn recv_or_disabled_unbounded<T>(rx: &mut Option<mpsc::UnboundedReceiver<T
     }
 }
 
-// One more parameter than the default clippy threshold (#257's `agent_image_identity`,
-// resolved once in `run` and threaded through rather than re-probed here); every
-// argument is a distinct process-lifetime handle, not a bundle worth a struct.
+// Each argument is a distinct process-lifetime handle.
 #[allow(clippy::too_many_arguments)]
 async fn connect_and_run(
     cfg: &Config,
@@ -1405,6 +1403,11 @@ async fn connect_and_run(
     let warmup_store = crate::session::warmup::resolve_store(&mgr.runtime_settings.home_root);
     let warmup_activity = Arc::new(crate::session::warmup::HostActivity::new());
     let warmup_control = Arc::new(crate::session::warmup::WarmupControl::new());
+    if let Some(handle) = mgr.probe_handle.clone() {
+        // A probe's own release fires this too; the scheduler ignores it when
+        // nothing waits on the gate.
+        warmup_control.set_release_listener(move || handle.encode_gate_freed());
+    }
     let source_policy = crate::source_policy::SourcePolicy::new(
         &mgr.runtime_settings.home_root,
         warmup_control.clone(),
@@ -1429,7 +1432,7 @@ async fn connect_and_run(
     mgr.warmup_activity = Some(warmup_activity);
     mgr.warmup_control = Some(warmup_control.clone());
     mgr.note_session_count();
-    // #257: outside the registration handshake window (it closed with the capacity
+    // Outside the registration handshake window (it closed with the capacity
     // message sent above) and after `warmup_control` is set, so a `Start` the
     // orchestrator issues right away sees this connection's real gate.
     mgr.set_probe_context();
@@ -1445,7 +1448,6 @@ async fn connect_and_run(
     // Tracks the reservation across heartbeats so a flip triggers exactly one
     // capacity re-send.
     let mut last_warmup_reserved = false;
-    let mut last_encode_gate_active = false;
     let mut last_source_report: Option<serde_json::Value> = None;
     // Device-lost failures across sessions on this connection: ≥2 within
     // GPU_GLOBAL_WINDOW escalate to a GPU-global drain+restart; one stays per-session.
@@ -1601,16 +1603,6 @@ async fn connect_and_run(
                         if last_warmup_reserved { "taken" } else { "released" }
                     );
                 }
-                // #257: a media probe holds this same gate, so a flip caused by the
-                // probe finishing also fires this; harmless, the scheduler ignores it
-                // when nothing is waiting on it.
-                let encode_gate_active = mgr.warmup_control.as_ref().is_some_and(|c| c.active());
-                if !encode_gate_active && last_encode_gate_active {
-                    if let Some(handle) = &mgr.probe_handle {
-                        handle.encode_gate_freed();
-                    }
-                }
-                last_encode_gate_active = encode_gate_active;
                 let dropped = diagnostic_dropped_interval.swap(0, Ordering::Relaxed);
                 if dropped > 0 {
                     let dropped_total = diagnostic_dropped_total.load(Ordering::Relaxed);
@@ -1984,7 +1976,7 @@ async fn connect_and_run(
                 send(&mut tx, &msg).await?;
             }
             // A host probe concluded, was deferred, or its check went not-applicable /
-            // forgotten (#257). Applying is pure in-memory work; the result reaches the
+            // forgotten. Applying is pure in-memory work; the result reaches the
             // control plane on the next capacity message, per spec #252.
             Some(update) = probe_updates.recv() => {
                 host_probe::orchestrator::apply(&mut mgr.readiness, update);
@@ -2094,13 +2086,13 @@ struct HostSessions {
     /// reset the window on every retry, so a control plane that never came back
     /// meant the sessions were held forever.
     grace_timer: Option<tokio::task::JoinHandle<()>>,
-    /// Host-probe results (#257). Process lifetime, like the orchestrator that feeds
+    /// Host-probe results. Process lifetime, like the orchestrator that feeds
     /// it — a result produced while disconnected is applied when the next
     /// connection's loop runs.
     probe_updates: mpsc::UnboundedReceiver<crate::host_probe::orchestrator::ReportUpdate>,
 }
 
-/// The probe kinds this agent runs (#257 slice: input + media only). Widening this to
+/// The host-probe kinds this agent runs (#257: input and media). Widening this to
 /// [`crate::host_probe::ProbeKind::ALL`] is the whole of a later slice.
 const ENABLED_KINDS: [crate::host_probe::ProbeKind; 2] = [
     crate::host_probe::ProbeKind::Input,
@@ -2231,7 +2223,7 @@ struct SessionManager {
     /// Connection-scoped source policy shared with workers and session seeding.
     /// Its authorization is invalidated on disconnect even if sessions retain an Arc.
     source_policy: Option<Arc<crate::source_policy::SourcePolicy>>,
-    /// Process-lifetime host-probe orchestrator handle (#257). `None` only in tests
+    /// Process-lifetime host-probe orchestrator handle. `None` only in tests
     /// that build a `SessionManager` directly — every send on it is a non-blocking
     /// unbounded-channel push, so nothing on the launch path can be delayed by it.
     probe_handle: Option<crate::host_probe::orchestrator::ProbeHandle>,
@@ -3407,8 +3399,7 @@ fn probe_relevant_settings(map: &std::collections::BTreeMap<String, String>) -> 
         .join(",")
 }
 
-/// What decides whether a host probe's earlier result still applies (#257,
-/// `host_probe::decision::ProbeInputs`).
+/// What decides whether a host probe's earlier result still applies.
 fn probe_inputs(
     agent_image: &str,
     mgr: &SessionManager,
@@ -6970,8 +6961,6 @@ mod tests {
         );
     }
 
-    // ── host-probe wiring (#257) ──────────────────────────────────────────────
-
     fn session_assign_msg(session_id: &str, gpu_index: i32) -> ControlMsg {
         serde_json::from_value(serde_json::json!({
             "type": "session_assign",
@@ -7126,7 +7115,7 @@ mod tests {
 
     #[test]
     fn a_probe_handle_of_none_leaves_session_assign_behaviour_unchanged() {
-        // #257: every pre-existing test builds a `SessionManager` with no probe
+        // Every pre-existing test builds a `SessionManager` with no probe
         // wiring, so this is really a proof that `note_session_count` and the two
         // `launch_arrived` call sites are no-ops rather than panics with no handle.
         let (mut mgr, _live_refs) = manager_with_runner(default_runner());

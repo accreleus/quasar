@@ -164,7 +164,7 @@ impl AbortCause {
 
 /// The host-global warm-up lock plus the abort flag, shared (behind an `Arc`)
 /// between the agent loop and the warm-up scheduler.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct WarmupControl {
     held: AtomicBool,
     abort: AtomicBool,
@@ -173,6 +173,19 @@ pub struct WarmupControl {
     /// Whether a warm-up currently holds an encode-slot reservation, so
     /// `capacity` can report one fewer free slot for the duration (§3.3 step 2).
     reserved: AtomicBool,
+    /// Called whenever a guard releases the gate. A polled `active()` misses a holder
+    /// that came and went between two reads.
+    on_release: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for WarmupControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WarmupControl")
+            .field("held", &self.held)
+            .field("abort", &self.abort)
+            .field("reserved", &self.reserved)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WarmupControl {
@@ -194,6 +207,18 @@ impl WarmupControl {
                 live: activity.live(),
             });
         }
+        self.take_gate()
+    }
+
+    /// The gate for a media host probe. No host-quiet precondition: the probe encodes
+    /// in a child process, and the probe scheduler already keeps it off a GPU with a
+    /// live session. No capacity reservation either: a launch pre-empts the probe, so
+    /// reporting one fewer slot could only turn a launch away.
+    pub fn try_acquire_probe(&self) -> Result<WarmupGuard<'_>, GateRefusal> {
+        self.take_gate()
+    }
+
+    fn take_gate(&self) -> Result<WarmupGuard<'_>, GateRefusal> {
         if self
             .held
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -209,24 +234,9 @@ impl WarmupControl {
         Ok(WarmupGuard { control: self })
     }
 
-    /// The gate for a media host probe. No host-quiet precondition: the probe encodes
-    /// in a child process, and the probe scheduler already keeps it off a GPU with a
-    /// live session. No capacity reservation either: a launch pre-empts the probe, so
-    /// reporting one fewer slot could only turn a launch away.
-    pub fn try_acquire_probe(&self) -> Result<WarmupGuard<'_>, GateRefusal> {
-        if self
-            .held
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err(GateRefusal::Busy);
-        }
-        // Cleared only once we own the gate, as in `try_acquire`: earlier would swallow
-        // an abort aimed at a still-unwinding holder.
-        self.abort_cause
-            .store(AbortCause::None.as_u8(), Ordering::SeqCst);
-        self.abort.store(false, Ordering::SeqCst);
-        Ok(WarmupGuard { control: self })
+    /// Must not block: it runs in a guard's `Drop`.
+    pub fn set_release_listener(&self, listener: impl Fn() + Send + Sync + 'static) {
+        *self.on_release.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(listener));
     }
 
     /// A user session launch arrived: whatever warm-up is running must abort.
@@ -303,6 +313,14 @@ impl Drop for WarmupGuard<'_> {
     fn drop(&mut self) {
         self.control.set_reserved(false);
         self.control.held.store(false, Ordering::SeqCst);
+        if let Some(listener) = &*self
+            .control
+            .on_release
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            listener();
+        }
     }
 }
 
@@ -430,6 +448,31 @@ mod tests {
         drop(probe);
         assert!(!control.active());
         assert!(control.try_acquire(&activity, Duration::ZERO, now).is_ok());
+    }
+
+    #[test]
+    fn every_release_of_the_gate_is_announced_however_brief_the_hold() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        let control = WarmupControl::new();
+        let released = Arc::new(AtomicUsize::new(0));
+        let seen = released.clone();
+        control.set_release_listener(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        let activity = HostActivity::new();
+        drop(
+            control
+                .try_acquire(&activity, Duration::ZERO, Instant::now())
+                .unwrap(),
+        );
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        drop(control.try_acquire_probe().unwrap());
+        assert_eq!(released.load(Ordering::SeqCst), 2);
+        assert!(
+            control.try_acquire_probe().is_ok(),
+            "the listener ran after the release"
+        );
     }
 
     #[test]

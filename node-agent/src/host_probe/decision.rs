@@ -151,6 +151,8 @@ impl Scheduler {
         match event {
             Event::Registered(inputs) => {
                 self.registered = true;
+                // Each connection has its own encode gate; the one waited on is gone.
+                self.pending.append(&mut self.gate_waiting);
                 if self.inputs.is_none() {
                     self.queue_kinds(&ProbeKind::ALL, &inputs, &mut actions);
                     self.inputs = Some(inputs);
@@ -851,6 +853,18 @@ mod tests {
         assert_eq!(
             s.step(Event::InputsObserved(inputs(&[]))),
             vec![Action::Forget(gpu(Media, 0)), Action::NotApplicable(Media)]
+        );
+    }
+
+    #[test]
+    fn a_probe_deferred_on_one_connection_runs_on_the_next() {
+        let mut s = Scheduler::with_kinds(&[Media]);
+        s.step(Event::Registered(one_gpu()));
+        s.step(Event::ProbeDeferred(gpu(Media, 0)));
+        assert_eq!(s.step(Event::Disconnected), vec![]);
+        assert_eq!(
+            s.step(Event::Registered(one_gpu())),
+            vec![Action::Start(gpu(Media, 0))]
         );
     }
 

@@ -492,9 +492,9 @@ fn run_inject_selftest() {
 /// Proves the uinput path end-to-end (device creation, fake-udev node, event write) with no
 /// compositor, GPU or browser. Needs `/dev/uinput`.
 ///
-/// The devices MUST be dropped (destroyed) before the caller exits, so no `exit` inside:
+/// The devices must be dropped (destroyed) before the caller exits, so no `exit` inside:
 /// each failure returns its one-line reason instead. Shared with `input-probe`.
-fn vinput_selftest_body() -> Result<(), String> {
+fn exercise_virtual_input() -> Result<(), String> {
     let devices = session::virtual_input::VirtualDevices::create("selftest")
         .map_err(|e| format!("virtual device creation failed: {e:#}"))?;
     tracing::info!(
@@ -534,7 +534,7 @@ fn vinput_selftest_body() -> Result<(), String> {
 
 fn run_vinput_selftest() {
     tracing::info!("quasar node-agent — virtual input self-test");
-    if let Err(e) = vinput_selftest_body() {
+    if let Err(e) = exercise_virtual_input() {
         tracing::error!(token = "vinput-selftest-failed", "{e}");
         std::process::exit(1);
     }
@@ -545,7 +545,7 @@ fn run_vinput_selftest() {
 /// (the probe contract, `host_probe::outcome`); everything else goes to the log.
 fn run_input_probe() {
     tracing::info!("quasar node-agent — input host probe");
-    match vinput_selftest_body() {
+    match exercise_virtual_input() {
         Ok(()) => println!("created keyboard, mouse and gamepad devices and wrote events"),
         Err(e) => {
             println!("{e}");

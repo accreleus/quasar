@@ -14,7 +14,7 @@ const AGENT_CHECK_IDS = [
   "updater_stack_dir",
   "updater_overlays",
   "health_addr_bindable",
-  // #257: host probes (host_probe.rs).
+  // Host probes (host_probe.rs).
   "media_probe",
   "input_probe",
   "xid_visibility",
@@ -114,7 +114,7 @@ describe("readiness groups (#102)", () => {
     expect(groups[0].checks.map((x) => x.id)).toEqual(["dri_node_app_access", "host_render_node", "render_node"]);
   });
 
-  // #257: per-GPU host-probe ids land in their base id's group.
+  // Per-GPU host-probe ids land in their base id's group.
   it("places per-GPU media_probe checks in the gpu group alongside their base id", () => {
     const { groups } = groupChecks([c("media_probe_gpu0"), c("media_probe_gpu1"), c("render_node")]);
     const gpu = groups.find((g) => g.key === "gpu");

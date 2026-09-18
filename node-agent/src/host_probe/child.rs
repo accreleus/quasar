@@ -168,8 +168,7 @@ pub async fn run_child(spec: ChildSpec, mut preempt: watch::Receiver<bool>) -> C
             };
         }
     };
-    // Reaped: anything else in the group is a leak the child left behind.
-    group.kill();
+    // Reaped, so the pgid may be recycled: no group kill from here on.
     group.disarm();
 
     let stdout = match drain {

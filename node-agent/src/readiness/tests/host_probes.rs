@@ -1,4 +1,4 @@
-//! Host-probe outcomes as the operator sees them (#257, #259): recorded into the
+//! Host-probe outcomes as the operator sees them: recorded into the
 //! report, merged with the local checks from `probe` over a fake root.
 
 use super::super::report::ReadinessReport;
@@ -159,11 +159,27 @@ fn a_crash_is_a_failure_that_names_the_signal() {
     assert!(!check.remediation.is_empty());
 }
 
+/// The OOM killer or an operator ended it: no evidence about the GPU.
 #[test]
-fn an_unnamed_signal_is_reported_by_number() {
-    match child_outcome(MEDIA_GPU0, ChildEnd::Signaled(63)) {
-        ProbeOutcome::Fail { summary, .. } => assert!(summary.contains("63"), "{summary}"),
-        other => panic!("{other:?}"),
+fn a_kill_from_outside_is_indeterminate_not_a_crash() {
+    for signal in [libc::SIGKILL, libc::SIGTERM, 63] {
+        match child_outcome(MEDIA_GPU0, ChildEnd::Signaled(signal)) {
+            ProbeOutcome::Indeterminate { reason } => {
+                assert!(reason.contains(&signal.to_string()), "{reason}")
+            }
+            other => panic!("signal {signal}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn only_exit_1_is_a_failing_verdict() {
+    for code in [2, 101, 127] {
+        let outcome = child_outcome(MEDIA_GPU0, exited(code, "media-probe: bad --size"));
+        assert!(
+            matches!(outcome, ProbeOutcome::Indeterminate { .. }),
+            "exit {code}: {outcome:?}"
+        );
     }
 }
 
@@ -244,6 +260,30 @@ fn a_gpu_sessions_are_never_placed_on_is_skipped_not_failed() {
     let check = find(&merged, "media_probe_gpu1").expect("media check");
     assert_eq!(check.status, SKIP);
     assert!(check.summary.contains("renderD128"));
+}
+
+#[test]
+fn indeterminate_never_replaces_not_applicable() {
+    let (_root, mut report) = refreshed_report("hp-skip-stands");
+    let gpu1 = ProbeTarget::gpu(ProbeKind::Media, 1);
+    record(
+        &mut report,
+        gpu1,
+        ProbeOutcome::NotApplicable {
+            summary: "pinned elsewhere".into(),
+        },
+        at(100),
+    );
+    record(
+        &mut report,
+        gpu1,
+        child_outcome(gpu1, ChildEnd::Preempted),
+        at(200),
+    );
+    assert_eq!(
+        find(&report.merged(), "media_probe_gpu1").unwrap().status,
+        SKIP
+    );
 }
 
 #[test]

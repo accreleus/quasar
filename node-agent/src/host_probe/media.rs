@@ -1,16 +1,10 @@
-//! The PARENT half of the media host probe: the `ChildSpec` for one GPU, and the gated
-//! run. The child is `session::probe_media` (`quasar-node-agent media-probe`).
+//! The parent half of the media host probe; the child is `session::probe_media`.
 //!
-//! The child reconstructs the agent's effective config from env, not from its own
-//! detection: `RuntimeSettings` carries control-plane overlays (`config_update`) that a
-//! freshly-spawned process cannot see, so every setting that decides the encoder, the
-//! render node or the CUDA ordinal is written into [`ChildSpec::env`] here. The Vulkan
-//! per-codec knobs are process env, not `RuntimeSettings`, so they reach the child by
-//! ordinary inheritance.
+//! The child cannot see `config_update` overlays, so every setting that decides the
+//! encoder, render node or CUDA ordinal travels in [`ChildSpec::env`]. The Vulkan
+//! per-codec knobs are process env and are inherited.
 //!
-//! Reservation interlock: the caller must hold the [`WarmupControl::try_acquire_probe`]
-//! guard for the whole child run and drop it after `run_child` returns on every path.
-//! [`run`] is that discipline — use it rather than acquiring the gate by hand.
+//! The encode gate must be held for the child's whole life: use [`run`].
 
 use std::time::Duration;
 
@@ -105,17 +99,38 @@ pub fn child_spec(
 
 /// Hold the probe gate for exactly the child's life. `Err(GateRefusal)` means a warm-up
 /// (or another probe) holds it and nothing was spawned.
+///
+/// The compositor creates its Wayland socket under `XDG_RUNTIME_DIR`. The child gets a
+/// private one, removed here on every path, so a child killed at its deadline leaves
+/// no socket behind in the agent's own runtime dir.
 pub async fn run(
     control: Option<&WarmupControl>,
-    spec: ChildSpec,
+    mut spec: ChildSpec,
     preempt: watch::Receiver<bool>,
 ) -> Result<ChildEnd, GateRefusal> {
-    // The guard borrows `control` and releases on every exit path, panic and drop
-    // included. Held across the await deliberately: the gate must cover the child.
     let _guard = match control {
         Some(control) => Some(control.try_acquire_probe()?),
         None => None,
     };
+    let parent = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    let runtime_dir = match tempfile::Builder::new()
+        .prefix("quasar-media-probe-")
+        .tempdir_in(parent)
+    {
+        Ok(dir) => dir,
+        Err(e) => {
+            return Ok(ChildEnd::SpawnFailed(format!(
+                "cannot create a runtime directory for the media probe: {e}"
+            )))
+        }
+    };
+    spec.env.push((
+        "XDG_RUNTIME_DIR".into(),
+        runtime_dir.path().to_string_lossy().into_owned(),
+    ));
     Ok(run_child(spec, preempt).await)
 }
 
@@ -311,5 +326,39 @@ mod tests {
         assert_eq!(end, Err(GateRefusal::Busy));
         assert!(!marker.exists(), "a refused probe must not spawn a child");
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn the_child_gets_a_private_runtime_dir_that_is_gone_afterwards_even_when_killed() {
+        let out = tempfile::tempdir().unwrap();
+        let note = out.path().join("dir");
+        let (_tx, rx) = watch::channel(false);
+        let script = format!(
+            "echo \"$XDG_RUNTIME_DIR\" > {}; touch \"$XDG_RUNTIME_DIR/wayland-1\"; sleep 300",
+            note.display()
+        );
+        let end = tokio::time::timeout(
+            Duration::from_secs(20),
+            run(None, sh(&script, Duration::from_millis(500)), rx),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(end, ChildEnd::Deadline(Duration::from_millis(500)));
+
+        let dir = std::fs::read_to_string(&note).unwrap();
+        let dir = std::path::Path::new(dir.trim());
+        assert!(dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("quasar-media-probe-"));
+        assert_ne!(
+            Some(dir),
+            std::env::var_os("XDG_RUNTIME_DIR")
+                .as_deref()
+                .map(std::path::Path::new)
+        );
+        assert!(!dir.exists(), "{dir:?} was left behind");
     }
 }
