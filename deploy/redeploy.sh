@@ -1153,6 +1153,15 @@ else
     printf '%s\n' "$readiness_verdict" | sed 's/^/        /'
     echo "        Re-check once the provision completes."
     ;;
+  diagnostic)
+    echo "  FAIL: the node-agent is in DIAGNOSTIC MODE: its startup cleanup did not resolve, so"
+    echo "        it registers and reports but REFUSES EVERY LAUNCH on this host. Nothing was"
+    echo "        lost — managed homes, journals and any leftover containers are preserved:"
+    printf '%s\n' "$readiness_verdict" | sed 's/^/        /'
+    echo "        Usually the container runtime is not answering the agent. Once it does, the"
+    echo "        agent finishes the cleanup and resumes on its own — no restart needed. Watch:"
+    echo "          $DC logs -f quasar-node-agent | grep -E 'boot-diagnostic-(mode|retry-pending|resumed)'"
+    ;;
   render-node-missing)
     echo "  FAIL: the node-agent is exiting on purpose because it cannot see a /dev/dri render"
     echo "        node the host kernel HAS (#98). A device list is fixed at container creation,"

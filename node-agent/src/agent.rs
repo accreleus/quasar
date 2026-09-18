@@ -145,67 +145,44 @@ pub async fn run(cfg: Config) {
 
     // A prior process can leave an application holding a managed home after
     // SIGKILL. Retire it through the durable API before audio/home GC or any
-    // control-plane registration; failure is fail-closed for supervisor retry.
-    let (runtime, swept, applications_retired) = offload_probe(|| {
+    // control-plane registration. An unresolved pass no longer exits: it enters
+    // diagnostic mode below, which withholds the same work without losing the host.
+    let (runtime, first_cleanup) = offload_probe(|| {
         let runtime = ContainerRuntime::from_env();
-        match crate::runtime::configured().and_then(|api| api.discover().wait()) {
-            Ok(engine) => info!(token = "runtime-engine-discovered", engine = %engine.name,
-                version = %engine.version, api = %engine.api_version,
-                "container engine discovered; capability support requires separate validation"),
-            Err(error) => warn!(token = "runtime-engine-unavailable", %error,
-                "engine discovery failed; check Docker Unix socket configuration and access"),
-        }
-        if let Err(error) = crate::runtime::configured().and_then(|api| api.recover_diagnostics().wait()) {
-            warn!(token = "runtime-diagnostic-recovery-pending", %error,
-                "diagnostic recovery remains pending; host-path validation will retry before launching another helper");
-        }
-        if let Err(error) = crate::runtime::configured().and_then(|api| api.recover_application_cleanup().wait()) {
-            warn!(token = "runtime-application-cleanup-pending", %error,
-                "stopped application cleanup remains journalled; active applications were preserved");
-        }
-        let applications_retired = match crate::runtime::configured().and_then(|api| api.retire_applications().wait()) {
-            Ok(()) => true,
-            Err(error) => {
-                error!(token = "runtime-application-retirement-pending", %error,
-                    "previous application retirement is unresolved; refusing startup to protect managed homes");
-                false
-            }
-        };
-        let Some(swept) = post_application_retirement(
-            applications_retired,
-            || {
-                // This is boot-only retirement, after acquiring the persistent owner
-                // lease. Routine recovery never stops an active audio sibling.
-                if let Err(error) = crate::runtime::configured()
-                    .and_then(|api| api.retire_audio_sidecars().wait())
-                {
-                    warn!(token = "runtime-audio-retirement-pending", %error,
-                        "previous audio cleanup remains journalled; retry runtime recovery when Docker is available");
-                }
-                // A probe's deadline died with the previous process; boot is the one
-                // pass allowed to stop one still running.
-                if let Err(error) = crate::runtime::configured()
-                    .and_then(|api| api.retire_gpu_probes().wait())
-                {
-                    warn!(token = "runtime-probe-retirement-pending", %error,
-                        "previous host-probe cleanup remains journalled; the maintenance pass and the next probe retry it");
-                }
-            },
-            legacy_container_sweep,
-        ) else {
-            // Do not touch audio or use the legacy sweep while an API-owned
-            // application may still own a managed home.
-            return (runtime, 0, false);
-        };
-        (runtime, swept, true)
+        let attempt = crate::diagnostic::startup_cleanup_configured();
+        (runtime, attempt)
     })
     .await;
-    if !applications_retired {
-        sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
-        std::process::exit(1);
+
+    let health = HealthState::new();
+    // #152 — a health endpoint another process answers is worse than none. The
+    // stack uses host networking, so agents on one machine share this port; the
+    // loser of the bind used to carry on while its container HEALTHCHECK, and
+    // any operator probing by hand, read the winner's status. Bind before
+    // anything else starts, and treat failure like the other boot-fatal
+    // conditions above — same throttled exit, so a restart loop is bounded.
+    // Also before the homes GC below, so diagnostic mode has an endpoint to be
+    // not-ready on.
+    match crate::health::bind_if_enabled() {
+        Ok(Some(listener)) => crate::health::spawn(listener, health.clone()),
+        Ok(None) => {}
+        Err((addr, e)) => {
+            error!(
+                token = "health-bind-failed",
+                "health: failed to bind {addr}: {e} — refusing to start, because a \
+                 health endpoint answered by another process is worse than none. Set \
+                 QUASAR_HEALTH_ADDR to an address of this agent's own, or to an empty \
+                 value to run without the endpoint."
+            );
+            sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
+            std::process::exit(1);
+        }
     }
-    if swept > 0 {
-        info!("startup sweep removed {swept} legacy container(s) from a prior run");
+
+    // #256: an unresolved first pass registers, reports and refuses instead of exiting.
+    // Normal startup resumes below, in this same process, once the cleanup succeeds.
+    if let Some(station) = crate::diagnostic::Station::enter(&first_cleanup) {
+        run_diagnostic_mode(&cfg, &health, &station).await;
     }
 
     // Install mode + updater presence, for the startup identity banner;
@@ -229,29 +206,6 @@ pub async fn run(cfg: Config) {
     // past the retention window — a real account's home is never a candidate.
     // Process-level: it must run whether or not this agent reaches the control plane.
     crate::session::homes_gc::spawn_sweeper();
-
-    let health = HealthState::new();
-    // #152 — a health endpoint another process answers is worse than none. The
-    // stack uses host networking, so agents on one machine share this port; the
-    // loser of the bind used to carry on while its container HEALTHCHECK, and
-    // any operator probing by hand, read the winner's status. Bind before
-    // anything else starts, and treat failure like the other boot-fatal
-    // conditions above — same throttled exit, so a restart loop is bounded.
-    match crate::health::bind_if_enabled() {
-        Ok(Some(listener)) => crate::health::spawn(listener, health.clone()),
-        Ok(None) => {}
-        Err((addr, e)) => {
-            error!(
-                token = "health-bind-failed",
-                "health: failed to bind {addr}: {e} — refusing to start, because a \
-                 health endpoint answered by another process is worse than none. Set \
-                 QUASAR_HEALTH_ADDR to an address of this agent's own, or to an empty \
-                 value to run without the endpoint."
-            );
-            sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
-            std::process::exit(1);
-        }
-    }
 
     // Adopt an already-provisioned NVIDIA driver volume BEFORE anything can touch
     // EGL: the post-restart path (the provisioner exits so a fresh process lands
@@ -1089,6 +1043,282 @@ async fn recv_or_disabled_unbounded<T>(rx: &mut Option<mpsc::UnboundedReceiver<T
     }
 }
 
+/// The two lines that say what this agent is about to connect to and how. Emitted
+/// before the register preparation, so a slow prep is visible as a gap after them.
+fn log_connect_intent(cfg: &Config) {
+    info!(policy = ?cfg.transport, "connecting to {}", cfg.ws_url());
+    if cfg.webpki_from_blob {
+        // `qenr1..` (a mispaste that dropped the fingerprint) and a real CA deployment
+        // produce the same policy; only this line tells them apart in a log.
+        info!(
+            token = "cp-tls-webpki-from-blob",
+            "the enrollment string carried an empty fingerprint segment: verifying the control \
+             plane against the WebPKI roots, not a pin"
+        );
+    }
+}
+
+type CpSink = futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    Message,
+>;
+type CpStream = futures_util::stream::SplitStream<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+>;
+
+/// Open the control-plane socket and split it.
+///
+/// #12: the connector is chosen by policy, never by tokio-tungstenite's default — a
+/// wss:// URL must not silently validate against the OS/bundled roots when a pin was
+/// configured, and a ws:// URL is explicitly Plain.
+/// A refused upgrade never reaches `register`, so its status is all the agent gets
+/// to explain the failure with (#199 follow-up); `upgrade_error` is where that
+/// explanation is attached.
+async fn dial(cfg: &Config) -> anyhow::Result<(CpSink, CpStream)> {
+    let (ws_stream, _) = connect_async_tls_with_config(
+        &cfg.ws_url(),
+        None,
+        false,
+        Some(crate::cp_tls::ws_connector(&cfg.transport)),
+    )
+    .await
+    .map_err(upgrade_error)?;
+    Ok(ws_stream.split())
+}
+
+/// The `register` this connection presents. `images` differs by caller: the normal path
+/// reconciles against the daemon first, diagnostic mode reads the state file.
+fn register_message(
+    cfg: &Config,
+    prefer_enrollment_token: bool,
+    images: Vec<crate::messages::RegisterImageEntry>,
+    install: &crate::buildinfo::InstallFacts,
+) -> anyhow::Result<AgentMsg> {
+    Ok(AgentMsg::Register {
+        source_policy_versions: Some(serde_json::json!({"steam_preparation": 1})),
+        node_name: cfg.node_name.clone(),
+        agent_version: crate::buildinfo::version().to_string(),
+        auth: choose_auth(cfg, prefer_enrollment_token)?,
+        images,
+        source_commit: crate::buildinfo::source_commit().map(str::to_string),
+        built_at: crate::buildinfo::built_at().map(str::to_string),
+        install_mode: install.install_mode.map(|m| m.as_str().to_string()),
+        updater_present: install.updater_present,
+    })
+}
+
+/// `register` + the `registered` reply, with the identity persistence a successful
+/// handshake owes. Shared by the normal connect loop and the diagnostic one; everything
+/// after it differs between them.
+async fn register_and_await_registered<S, R>(
+    cfg: &Config,
+    tx: &mut S,
+    rx: &mut R,
+    register_msg: AgentMsg,
+) -> anyhow::Result<(String, u64)>
+where
+    S: SinkExt<Message, Error = tungstenite::Error> + Unpin,
+    R: StreamExt<Item = Result<Message, tungstenite::Error>> + Unpin,
+{
+    // Which credential this attempt carries decides what a reject means (#199).
+    let presented_saved_secret = matches!(
+        &register_msg,
+        AgentMsg::Register {
+            auth: Auth::Reconnect { .. },
+            ..
+        }
+    );
+    send(tx, &register_msg).await?;
+    info!("sent register (node_name={})", cfg.node_name);
+
+    let raw = recv(rx).await?;
+    let ctrl_msg: ControlMsg = serde_json::from_str(&raw)?;
+    match ctrl_msg {
+        ControlMsg::Registered {
+            host_id,
+            node_secret,
+            heartbeat_interval_ms,
+        } => {
+            // A returned node_secret IS the enrollment signal: reconnect never mints one.
+            let enrolled = node_secret.is_some();
+            if let Some(secret) = node_secret {
+                persist_node_secret(&cfg.node_secret_path, &secret)?;
+                info!(
+                    "enrolled as host {host_id}; node_secret saved to {}",
+                    cfg.node_secret_path
+                );
+            } else {
+                info!("reconnected as host {host_id}");
+            }
+            // #12: the pin that just verified this connection outlives the enrollment
+            // string, so the operator can delete QUASAR_ENROLLMENT from the environment.
+            persist_pin_if_new(cfg, enrolled);
+            Ok((host_id, heartbeat_interval_ms))
+        }
+        ControlMsg::Error { code, message } => Err(register_reject_error(
+            cfg,
+            &code,
+            &message,
+            presented_saved_secret,
+        )),
+        _ => anyhow::bail!("unexpected message type before registered"),
+    }
+}
+
+/// How often a diagnostic connection re-detects capacity and re-probes readiness. Slower
+/// than the normal path's event-driven re-sends: nothing here can change but the host
+/// itself, and every pass forks the same probes a normal refresh does.
+const DIAGNOSTIC_CAPACITY_REFRESH: Duration = Duration::from_secs(60);
+
+/// Hold this process in diagnostic registration until its startup cleanup succeeds
+/// (#256). Returns only on resume, after which normal startup continues in `run`.
+async fn run_diagnostic_mode(
+    cfg: &Config,
+    health: &Arc<HealthState>,
+    station: &Arc<crate::diagnostic::Station>,
+) {
+    crate::diagnostic::install_process_wide(station);
+    let phase = station.phase();
+    let fault = match &phase {
+        crate::diagnostic::Phase::Diagnostic(fault) => fault.code(),
+        crate::diagnostic::Phase::Normal => "none",
+    };
+    error!(
+        token = "boot-diagnostic-mode",
+        fault,
+        "the startup cleanup did not resolve, so this host enters DIAGNOSTIC MODE: it \
+         registers and reports, and refuses every launch. Withheld until it resumes: \
+         managed-home GC, the NVIDIA driver-volume and CUDA-runtime provisioners, image \
+         pulls and pruning, and host probes. {} The agent retries the cleanup on its own \
+         and resumes without a restart.",
+        phase.launch_refusal().unwrap_or_default()
+    );
+    health.set_not_ready(phase.launch_refusal());
+
+    // Independent of the control plane by construction: this task is what resumes the
+    // host, and it never reads a connection.
+    let retry = tokio::spawn(crate::diagnostic::retry_until_resumed(
+        station.clone(),
+        crate::diagnostic::startup_cleanup_configured,
+        crate::diagnostic::RetryPace::PRODUCTION,
+    ));
+
+    let mut backoff = Duration::from_secs(1);
+    // #199: see `EnrollmentFallback` — one token attempt per stale-secret reject.
+    let mut enrollment_fallback = EnrollmentFallback::default();
+    loop {
+        let attempt = tokio::select! {
+            biased;
+            () = station.resumed() => break,
+            attempt = diagnostic_connection(
+                cfg, health, station, enrollment_fallback.take_for_attempt(),
+            ) => attempt,
+        };
+        let Err(error) = attempt else { break };
+        health.set_connected(false);
+        error!(
+            token = "diagnostic-connection-failed",
+            "diagnostic connection failed: {error:#}"
+        );
+        enrollment_fallback.observe(&error);
+        if counts_as_registration_failure(
+            error
+                .downcast_ref::<UpgradeRefused>()
+                .is_some_and(|r| describe_upgrade_refusal(r.status).is_some()),
+            health.unhealthy(),
+        ) {
+            health.record_registration_failure(&format!("{error:#}"));
+        }
+        let wait = backoff.min(Duration::from_secs(30));
+        info!("reconnecting in {wait:?}");
+        // A dead control plane must never delay the resume.
+        tokio::select! {
+            biased;
+            () = station.resumed() => break,
+            () = sleep(wait) => {}
+        }
+        backoff = (wait * 2).min(Duration::from_secs(30));
+    }
+    retry.abort();
+    info!(
+        token = "boot-diagnostic-resumed",
+        "the startup cleanup succeeded; leaving diagnostic mode and continuing normal startup"
+    );
+    health.set_ready();
+    health.set_connected(false);
+}
+
+/// One diagnostic control-plane connection. Reads nothing from the container runtime it
+/// could mutate: the images come from the persisted state file and the install facts from
+/// read-only inspections that already degrade to `None` on a dead engine.
+async fn diagnostic_connection(
+    cfg: &Config,
+    health: &Arc<HealthState>,
+    station: &Arc<crate::diagnostic::Station>,
+    prefer_enrollment_token: bool,
+) -> anyhow::Result<crate::diagnostic::ConnectionEnd> {
+    log_connect_intent(cfg);
+    let images = crate::images::register_images_from_state(&cfg.image_state_path());
+    let install = offload_probe(|| {
+        let runtime = ContainerRuntime::from_env();
+        crate::buildinfo::discover_install(&crate::buildinfo::DockerFacts::new(&runtime))
+    })
+    .await;
+    crate::buildinfo::set_install_facts(install.clone());
+
+    let (mut tx, mut rx) = dial(cfg).await?;
+    let (_host_id, heartbeat_interval_ms) = register_and_await_registered(
+        cfg,
+        &mut tx,
+        &mut rx,
+        register_message(cfg, prefer_enrollment_token, images, &install)?,
+    )
+    .await?;
+    health.set_connected(true);
+    // Clear the failure streak before a stale count can flip /health unhealthy; the
+    // diagnostic not-ready state is separate and stays.
+    health.record_registered();
+
+    crate::diagnostic::serve_registered(
+        &mut tx,
+        &mut rx,
+        heartbeat_interval_ms,
+        station,
+        diagnostic_observe,
+        DIAGNOSTIC_CAPACITY_REFRESH,
+    )
+    .await
+}
+
+/// What a diagnostic capacity message reports: the host as detected, and the local
+/// readiness checks. No codec probe (it would initialise GStreamer) and no effective
+/// settings (no session may start). Blocking; the caller offloads it.
+fn diagnostic_observe() -> (AgentMsg, Vec<crate::messages::ReadinessCheck>) {
+    let cap = detect_capacity_blocking();
+    let nvidia_host = cap.gpus.iter().any(|g| g.vendor == "nvidia");
+    let gpu_present = !cap.gpus.is_empty();
+    let checks = crate::readiness::probe(
+        &crate::readiness::ProbeEnv::live(nvidia_host, "")
+            .with_gpu_present(gpu_present)
+            .with_codec_probe(None),
+    );
+    (
+        AgentMsg::Capacity {
+            source_preparation: None,
+            host: cap.host,
+            gpus: cap.gpus,
+            gpu_detection: cap.gpu_detection,
+            gpu_detection_reason: cap.gpu_detection_reason,
+            console_capabilities: Some(cap.console),
+            effective_settings: None,
+            codecs: None,
+            codec_throughput: None,
+            readiness: None,
+        },
+        checks,
+    )
+}
+
 // Each argument is a distinct process-lifetime handle.
 #[allow(clippy::too_many_arguments)]
 async fn connect_and_run(
@@ -1103,17 +1333,7 @@ async fn connect_and_run(
     // refused with `host_not_found`. See `stale_identity`.
     prefer_enrollment_token: bool,
 ) -> anyhow::Result<()> {
-    let url = cfg.ws_url();
-    info!(policy = ?cfg.transport, "connecting to {url}");
-    if cfg.webpki_from_blob {
-        // `qenr1..` (a mispaste that dropped the fingerprint) and a real CA deployment
-        // produce the same policy; only this line tells them apart in a log.
-        info!(
-            token = "cp-tls-webpki-from-blob",
-            "the enrollment string carried an empty fingerprint segment: verifying the control \
-             plane against the WebPKI roots, not a pin"
-        );
-    }
+    log_connect_intent(cfg);
 
     // Everything `register` needs from the container runtime is gathered BEFORE the
     // socket is opened (#191). The control plane gives a fresh connection its
@@ -1155,21 +1375,7 @@ async fn connect_and_run(
         );
     }
 
-    // #12: the connector is chosen by policy, never by tokio-tungstenite's default — a
-    // wss:// URL must not silently validate against the OS/bundled roots when a pin was
-    // configured, and a ws:// URL is explicitly Plain.
-    // A refused upgrade never reaches `register`, so its status is all the agent gets
-    // to explain the failure with (#199 follow-up); `upgrade_error` is where that
-    // explanation is attached.
-    let (ws_stream, _) = connect_async_tls_with_config(
-        &url,
-        None,
-        false,
-        Some(crate::cp_tls::ws_connector(&cfg.transport)),
-    )
-    .await
-    .map_err(upgrade_error)?;
-    let (mut tx, mut rx) = ws_stream.split();
+    let (mut tx, mut rx) = dial(cfg).await?;
 
     // Attach this connection's upstream channel to the process-wide ImageManager.
     // Attaching also flushes every op-free record's current state (terminal states
@@ -1188,61 +1394,14 @@ async fn connect_and_run(
     let mut release_rx = Some(release_rx);
     let _release_upstream_guard = release_mgr.attach_upstream(release_tx);
 
-    // --- Step 1: send register ---
-    let auth = choose_auth(cfg, prefer_enrollment_token)?;
-    // Which credential this attempt carries decides what a reject means (#199).
-    let presented_saved_secret = matches!(auth, Auth::Reconnect { .. });
-    let register_msg = AgentMsg::Register {
-        source_policy_versions: Some(serde_json::json!({"steam_preparation": 1})),
-        node_name: cfg.node_name.clone(),
-        agent_version: crate::buildinfo::version().to_string(),
-        auth,
-        images,
-        source_commit: crate::buildinfo::source_commit().map(str::to_string),
-        built_at: crate::buildinfo::built_at().map(str::to_string),
-        install_mode: install.install_mode.map(|m| m.as_str().to_string()),
-        updater_present: install.updater_present,
-    };
-    send(&mut tx, &register_msg).await?;
-    info!("sent register (node_name={})", cfg.node_name);
-
-    // --- Step 2: receive registered ---
-    let raw = recv(&mut rx).await?;
-    let ctrl_msg: ControlMsg = serde_json::from_str(&raw)?;
-    let (host_id, heartbeat_interval_ms) = match ctrl_msg {
-        ControlMsg::Registered {
-            host_id,
-            node_secret,
-            heartbeat_interval_ms,
-        } => {
-            // A returned node_secret IS the enrollment signal: reconnect never mints one.
-            let enrolled = node_secret.is_some();
-            if let Some(secret) = node_secret {
-                persist_node_secret(&cfg.node_secret_path, &secret)?;
-                info!(
-                    "enrolled as host {host_id}; node_secret saved to {}",
-                    cfg.node_secret_path
-                );
-            } else {
-                info!("reconnected as host {host_id}");
-            }
-            // #12: the pin that just verified this connection outlives the enrollment
-            // string, so the operator can delete QUASAR_ENROLLMENT from the environment.
-            persist_pin_if_new(cfg, enrolled);
-            (host_id, heartbeat_interval_ms)
-        }
-        ControlMsg::Error { code, message } => {
-            return Err(register_reject_error(
-                cfg,
-                &code,
-                &message,
-                presented_saved_secret,
-            ));
-        }
-        _ => {
-            anyhow::bail!("unexpected message type before registered");
-        }
-    };
+    // --- Steps 1 and 2: send register, receive registered ---
+    let (host_id, heartbeat_interval_ms) = register_and_await_registered(
+        cfg,
+        &mut tx,
+        &mut rx,
+        register_message(cfg, prefer_enrollment_token, images, &install)?,
+    )
+    .await?;
     health.set_connected(true);
     // #128: the control plane is back, so the sessions held across the outage are
     // safe. Disarmed HERE rather than at the top of the reconnect loop: doing it
@@ -3497,7 +3656,7 @@ fn ack(id: String, ok: bool, error: Option<String>) -> AgentMsg {
 /// Run startup work which is only safe after API-owned applications have retired.
 /// A failed retirement blocks this process before it can sweep legacy containers or
 /// register with the control plane, so a supervisor retries without releasing a home.
-fn post_application_retirement<F, G>(
+pub(crate) fn post_application_retirement<F, G>(
     applications_retired: bool,
     retire_audio: F,
     sweep_legacy: G,
@@ -3519,13 +3678,13 @@ where
 /// somebody else's to reap. A listing failure is logged and the boot continues,
 /// exactly as the CLI sweep's `ps` failure did: a legacy container left behind is
 /// retried next boot, while refusing to start would strand the host.
-fn legacy_container_sweep() -> usize {
-    match crate::runtime::configured().and_then(|api| {
-        api.retire_legacy_containers(vec![
+pub(crate) fn legacy_container_sweep(api: &crate::runtime::RuntimeClient) -> usize {
+    match api
+        .retire_legacy_containers(vec![
             crate::session::container::SESSION_NAME_PREFIX.to_owned()
         ])
         .wait()
-    }) {
+    {
         Ok(outcome) => {
             if outcome.preserved > 0 || outcome.unresolved > 0 {
                 info!(
@@ -4157,7 +4316,7 @@ where
     send(sink, &msg).await
 }
 
-async fn send<S>(sink: &mut S, msg: &AgentMsg) -> anyhow::Result<()>
+pub(crate) async fn send<S>(sink: &mut S, msg: &AgentMsg) -> anyhow::Result<()>
 where
     S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
@@ -4166,7 +4325,7 @@ where
     Ok(())
 }
 
-async fn recv<S>(stream: &mut S) -> anyhow::Result<String>
+pub(crate) async fn recv<S>(stream: &mut S) -> anyhow::Result<String>
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {

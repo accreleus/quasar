@@ -62,6 +62,11 @@ pub struct HealthState {
     /// #519: most recent registration-failure reason, surfaced in `/health` so
     /// an operator sees why without a log tail. `None` once registered again.
     last_registration_error: Mutex<Option<String>>,
+    /// #256: the agent is up and registered but refuses every launch. Takes
+    /// precedence over the registration verdict — a host in diagnostic mode is
+    /// not ready whatever its connection is doing.
+    not_ready: AtomicBool,
+    not_ready_reason: Mutex<Option<String>>,
 }
 
 impl HealthState {
@@ -97,6 +102,28 @@ impl HealthState {
         if let Ok(mut slot) = self.last_registration_error.lock() {
             *slot = None;
         }
+    }
+
+    /// #256: answer `/health` with 503 `diagnostic` until [`Self::set_ready`].
+    pub fn set_not_ready(&self, reason: Option<String>) {
+        if let Ok(mut slot) = self.not_ready_reason.lock() {
+            *slot = reason;
+        }
+        self.not_ready.store(true, Ordering::Relaxed);
+    }
+
+    pub fn set_ready(&self) {
+        self.not_ready.store(false, Ordering::Relaxed);
+        if let Ok(mut slot) = self.not_ready_reason.lock() {
+            *slot = None;
+        }
+    }
+
+    fn not_ready_reason(&self) -> Option<String> {
+        self.not_ready
+            .load(Ordering::Relaxed)
+            .then(|| self.not_ready_reason.lock().ok().and_then(|g| g.clone()))
+            .map(Option::unwrap_or_default)
     }
 
     /// Whether `/health` is currently answering 503. The reconnect loop reads it to
@@ -233,7 +260,19 @@ fn handle_conn(mut stream: std::net::TcpStream, state: &HealthState) {
         let failures = state.consecutive_registration_failures();
         // Sustained failure flips both the status word and the HTTP status line —
         // the prod HEALTHCHECK's `curl -f` treats any >=400 as unhealthy.
-        let (status_line, body) = if is_unhealthy(failures) {
+        let (status_line, body) = if let Some(reason) = state.not_ready_reason() {
+            // #256: diagnostic mode outranks the registration verdict — the host
+            // refuses every launch regardless of how its connection is doing.
+            let reason_json = serde_json::to_string(&reason).unwrap_or_else(|_| "\"\"".to_string());
+            (
+                "HTTP/1.1 503 Service Unavailable",
+                format!(
+                    "{{\"status\":\"diagnostic\",\"ready\":false,\"reason\":{reason_json},\
+                     \"sessions\":{sessions},\"connected\":{connected}{id}}}",
+                    id = identity_fields()
+                ),
+            )
+        } else if is_unhealthy(failures) {
             let reason = state.last_registration_error().unwrap_or_default();
             let reason_json = serde_json::to_string(&reason).unwrap_or_else(|_| "\"\"".to_string());
             (
@@ -499,6 +538,46 @@ mod tests {
             "expected a 503 beyond the cap of {MAX_INFLIGHT}, got: {resp}"
         );
         drop(held);
+    }
+
+    // --- #256: diagnostic mode is not ready ---
+
+    #[test]
+    fn diagnostic_mode_answers_503_and_clears_on_resume() {
+        let state = HealthState::new();
+        state.set_connected(true);
+        state.set_not_ready(Some("host in diagnostic mode (runtime_unusable)".into()));
+        let addr = spawn_test_server(state.clone());
+
+        let (head, body) = get(&addr, "/health");
+        assert!(head.starts_with("HTTP/1.1 503"), "head: {head}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(v["status"], "diagnostic");
+        assert_eq!(v["ready"], false);
+        assert_eq!(v["reason"], "host in diagnostic mode (runtime_unusable)");
+        assert_eq!(v["connected"], true);
+        assert_eq!(v["pid"], std::process::id());
+
+        state.set_ready();
+        let (head, body) = get(&addr, "/health");
+        assert!(head.starts_with("HTTP/1.1 200"), "head: {head}");
+        assert!(body.contains(r#""status":"ok""#), "body: {body}");
+    }
+
+    /// The registration streak must not be able to hide diagnostic mode.
+    #[test]
+    fn diagnostic_mode_outranks_the_registration_verdict() {
+        let state = HealthState::new();
+        for _ in 0..UNHEALTHY_AFTER_CONSECUTIVE_FAILURES {
+            state.record_registration_failure("boom");
+        }
+        state.set_not_ready(None);
+        let addr = spawn_test_server(state);
+        let (head, body) = get(&addr, "/health");
+        assert!(head.starts_with("HTTP/1.1 503"), "head: {head}");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(v["status"], "diagnostic");
+        assert_eq!(v["reason"], "");
     }
 
     #[test]

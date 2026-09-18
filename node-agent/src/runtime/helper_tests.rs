@@ -226,6 +226,10 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
     let mut gate = None;
     if route == "/version" {
         response = json!({"Platform":{"Name":"Docker"},"Version":"28.0.0","ApiVersion":"1.48","MinAPIVersion":"1.40"});
+    } else if route == "/info" {
+        // `inspect_engine`, which the runtime readiness checks call. Every field it
+        // folds is optional, so an empty object is a complete answer.
+        response = json!({});
     } else if method == "GET" && route.starts_with("/images/") && route.contains("/json") {
         if s.image_missing {
             code = 404;
@@ -5542,4 +5546,5 @@ fn gpu_probe_stop_is_durable_across_an_unreachable_engine_and_recovery_finishes_
     );
 }
 
+mod diagnostic_registration;
 mod host_probes;

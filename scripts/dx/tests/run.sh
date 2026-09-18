@@ -3348,6 +3348,7 @@ READINESS_SAMPLES=(
   'passed|2026-09-11T02:00:00Z  INFO quasar_node_agent::readiness: host readiness: all checks passed or skipped checks=17'
   'provisioning|2026-09-11T02:00:00Z  INFO quasar_node_agent::readiness: host readiness: no failures; 2 check(s) are being remediated automatically and are not usable yet'
   'checks-failed|token="readiness-checks-failed" failed=3 host readiness: 3 check(s) FAILED'
+  'diagnostic|token="boot-diagnostic-mode" fault=runtime_unusable the startup cleanup did not resolve'
   'render-node-missing|token="boot-render-node-missing" gpu-host-sanity'
   'retry-deferred|token="boot-render-node-retry-deferred" gpu-host-sanity'
   'sanity-failed-spent|token="boot-render-node-retries-spent" gpu-host-sanity'
@@ -3423,6 +3424,14 @@ summary_is "sanity-fails-the-deploy" FAILED ok fail 'token="boot-render-node-uno
 '"$PROBED"
 summary_is "failing-checks-degrade" FAILED ok warn 'token="readiness-checks-failed" failed=3 host readiness: 3 check(s) FAILED
 '"$PROBED"
+# #256: a host in diagnostic mode refuses every launch, so the deploy is not green. It
+# never reaches the codec probe either, which is what `unverified` here records.
+summary_is "diagnostic-fails-the-deploy" FAILED unverified fail 'token="boot-diagnostic-mode" fault=runtime_unusable the startup cleanup did not resolve'
+# The resume is not a verdict: normal startup's own verdict, logged later, supersedes it.
+summary_is "diagnostic-resumed-then-healthy" ok ok ok 'token="boot-diagnostic-mode" fault=runtime_unusable the startup cleanup did not resolve
+token="boot-diagnostic-resumed" leaving diagnostic mode
+'"$ALL_CLEAR
+$PROBED"
 
 # The LATEST probe decides. Docker keeps a container's log across restarts, so a
 # first boot's pending must not outlive the healthy probe that followed it — and
