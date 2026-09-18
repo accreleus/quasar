@@ -2192,17 +2192,25 @@ unsafe fn egl_symbol(handle: *mut libc::c_void, name: &str) -> *mut libc::c_void
 }
 
 /// `wanted` by exact render-node match, or the first hardware device when `None`.
-fn pick_device(hardware: &[String], wanted: Option<&str>) -> Result<usize, DevicePick> {
+/// Every hardware device worth opening, in EGL's order. Two vendors can claim one render
+/// node (on NVIDIA, Mesa lists the same node and cannot initialize it), so a node is
+/// open when any device that names it opens.
+fn pick_devices(hardware: &[String], wanted: Option<&str>) -> Result<Vec<usize>, DevicePick> {
     if hardware.is_empty() {
         return Err(DevicePick::NoHardware);
     }
-    match wanted {
-        None => Ok(0),
-        Some(node) => hardware
-            .iter()
-            .position(|n| n == node)
-            .ok_or_else(|| DevicePick::Unmatched(node.to_string())),
+    let Some(node) = wanted else {
+        return Ok((0..hardware.len()).collect());
+    };
+    let matching: Vec<usize> = hardware
+        .iter()
+        .enumerate()
+        .filter_map(|(i, n)| (n == node).then_some(i))
+        .collect();
+    if matching.is_empty() {
+        return Err(DevicePick::Unmatched(node.to_string()));
     }
+    Ok(matching)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2304,14 +2312,14 @@ unsafe fn report_device_open(handle: *mut libc::c_void, wanted: Option<&str>) {
             .collect::<Vec<_>>()
             .join(",")
     );
-    let index = match pick_device(
+    let candidates = match pick_devices(
         &hardware
             .iter()
             .map(|(_, node)| node.clone())
             .collect::<Vec<_>>(),
         wanted,
     ) {
-        Ok(index) => index,
+        Ok(candidates) => candidates,
         Err(DevicePick::NoHardware) => {
             println!("DEVICE_ERROR=no hardware EGL device (only software rendering is available)");
             return;
@@ -2321,28 +2329,30 @@ unsafe fn report_device_open(handle: *mut libc::c_void, wanted: Option<&str>) {
             return;
         }
     };
-    let (device, node) = &hardware[index];
-    // Querying a software device's DRM file leaves EGL_BAD_ATTRIBUTE latched, and the
-    // error is sticky: clear it or the first real failure below reports the wrong code.
-    get_error();
-    let display = get_platform_display(EGL_PLATFORM_DEVICE_EXT, *device, std::ptr::null());
-    if display.is_null() {
-        println!(
-            "DEVICE_ERROR=no EGL display for {node} (egl error {})",
-            last_error()
-        );
+    let mut last_failure = String::new();
+    for index in candidates {
+        let (device, node) = &hardware[index];
+        // Querying a software device's DRM file, or a failed attempt above, leaves an
+        // error latched: clear it or this attempt reports the wrong code.
+        get_error();
+        let display = get_platform_display(EGL_PLATFORM_DEVICE_EXT, *device, std::ptr::null());
+        if display.is_null() {
+            last_failure = format!("no EGL display for {node} (egl error {})", last_error());
+            continue;
+        }
+        let (mut major, mut minor) = (0, 0);
+        if initialize(display, &mut major, &mut minor) == 0 {
+            last_failure = format!(
+                "eglInitialize failed for {node} (egl error {})",
+                last_error()
+            );
+            continue;
+        }
+        println!("OPENED={node}");
+        terminate(display);
         return;
     }
-    let (mut major, mut minor) = (0, 0);
-    if initialize(display, &mut major, &mut minor) == 0 {
-        println!(
-            "DEVICE_ERROR=eglInitialize failed for {node} (egl error {})",
-            last_error()
-        );
-        return;
-    }
-    println!("OPENED={node}");
-    terminate(display);
+    println!("DEVICE_ERROR={last_failure}");
 }
 
 /// SAFETY: `dlerror` returns either NULL or a pointer to a NUL-terminated
@@ -3088,21 +3098,30 @@ mod tests {
     /// The application-GPU host probe pins the exact GPU it was placed on; unpinned
     /// stays "first hardware device", byte-identical to every other caller.
     #[test]
-    fn pick_device_selects_the_wanted_node_or_the_first_hardware_device() {
+    fn every_device_naming_the_wanted_node_is_a_candidate_in_egl_order() {
+        // As enumerated on an NVIDIA host: Mesa and NVIDIA both claim renderD128.
         let hardware = vec![
             "/dev/dri/renderD128".to_string(),
             "/dev/dri/renderD129".to_string(),
+            "/dev/dri/renderD128".to_string(),
         ];
-        assert_eq!(pick_device(&hardware, None), Ok(0));
-        assert_eq!(pick_device(&hardware, Some("/dev/dri/renderD129")), Ok(1));
         assert_eq!(
-            pick_device(&hardware, Some("/dev/dri/renderD130")),
+            pick_devices(&hardware, Some("/dev/dri/renderD128")),
+            Ok(vec![0, 2])
+        );
+        assert_eq!(
+            pick_devices(&hardware, Some("/dev/dri/renderD129")),
+            Ok(vec![1])
+        );
+        assert_eq!(pick_devices(&hardware, None), Ok(vec![0, 1, 2]));
+        assert_eq!(
+            pick_devices(&hardware, Some("/dev/dri/renderD130")),
             Err(DevicePick::Unmatched("/dev/dri/renderD130".into()))
         );
         // No hardware device is evidence whatever was asked for.
-        assert_eq!(pick_device(&[], None), Err(DevicePick::NoHardware));
+        assert_eq!(pick_devices(&[], None), Err(DevicePick::NoHardware));
         assert_eq!(
-            pick_device(&[], Some("/dev/dri/renderD128")),
+            pick_devices(&[], Some("/dev/dri/renderD128")),
             Err(DevicePick::NoHardware)
         );
     }
