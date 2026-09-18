@@ -163,9 +163,10 @@ the host's overrides, and stored as derived blocked scopes for the host and its
 GPUs. Admission reads those derived values through the one filter renderer its
 candidate and recheck queries already share, so the two cannot disagree, and it
 ignores them when the report is stale or absent, failing open as the live
-free-VRAM veto does. The totals query includes the gate so that the reject
-classifier can tell readiness from emptiness: when readiness is the only reason
-no host qualified, the launch is refused with a new retryable
+free-VRAM veto does. The filter is not part of the totals probe: as with the
+free-VRAM veto, a readiness-only rejection is diagnosed by a second query (the
+candidate query with only the readiness filter removed). When that finds a GPU,
+readiness is the sole reason and the launch is refused with a new retryable
 `503 host_not_ready`; otherwise the existing refusals stand. The agent does not
 evaluate the same checks a second time. It refuses launches only for its own
 safety states.
@@ -276,7 +277,11 @@ design pass possible later. The setup wizard and Fleet surfaces inherit the
 change through the shared card. The user-facing launch error gets wording for
 `host_not_ready`.
 
-**Contract amendment.** One `quasar-protocol` amendment, requiring Opus review
+**Contract amendment.** Drafted as amendment 11 (`quasar-protocol` PR 22, awaiting
+the owner's sign-off; the contract text wins where it is more precise than this
+section — it also settles that swap is not gated, that freshness is the report's
+age, and that the host body's verdict field is `readiness_gate.blocking`). One
+`quasar-protocol` amendment, requiring Opus review
 and the owner's explicit sign-off before any gating code lands: reword the
 advisory clauses to the evidence rule in all three contracts; add the three
 optional check fields to the documented and OpenAPI check shape; regularise the
