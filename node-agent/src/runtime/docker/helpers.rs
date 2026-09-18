@@ -3,17 +3,17 @@ use crate::runtime::helpers::{HelperPhase, HelperProfile, MAX_JOURNAL_BYTES, MAX
 use crate::{
     container_ownership,
     runtime::{
-        AudioRun, DiagnosticHelper, DiagnosticRequirements, DiagnosticRun, ErrorKind, HelperIntent,
-        HelperJournal, HelperResult, NvidiaDriverMount, NvidiaGpuRun, OwnedHelperId, RuntimeConfig,
-        RuntimeError,
+        AudioRun, DiagnosticHelper, DiagnosticRequirements, DiagnosticRun, ErrorKind, GpuProbeRun,
+        HelperIntent, HelperJournal, HelperResult, NvidiaDriverAccess, NvidiaDriverMount,
+        NvidiaGpuRun, OwnedHelperId, RuntimeConfig, RuntimeError,
     },
 };
 use bollard::{
     container::LogOutput,
     errors::Error,
     models::{
-        ContainerCreateBody, ContainerStateStatusEnum, DeviceRequest, HealthConfig, HostConfig,
-        Mount, MountBindOptions, MountType,
+        ContainerCreateBody, ContainerStateStatusEnum, DeviceMapping, DeviceRequest, HealthConfig,
+        HostConfig, Mount, MountBindOptions, MountType,
     },
     query_parameters::{
         CreateContainerOptions, LogsOptions, RemoveContainerOptions, StartContainerOptions,
@@ -348,8 +348,8 @@ fn valid_run(run: &DiagnosticRun) -> bool {
         && run.entrypoint.iter().chain(run.command.iter()).map(String::len).sum::<usize>() <= 8 * 1024
         && run.bind.source.as_os_str().len() + run.bind.target.len() <= 4 * 1024
 }
-fn valid_nvidia_gpu(run: &NvidiaGpuRun) -> bool {
-    let mount_valid = match &run.driver_mount {
+fn valid_driver_access(access: &NvidiaDriverAccess) -> bool {
+    let mount_valid = match &access.driver_mount {
         NvidiaDriverMount::ReadOnlyBind(bind) => {
             bind.source.is_absolute()
                 && bind.target.starts_with('/')
@@ -364,21 +364,40 @@ fn valid_nvidia_gpu(run: &NvidiaGpuRun) -> bool {
                 && !target.contains(['\0', ':'])
         }
     };
-    mount_valid
-        && !run.entrypoint.is_empty()
-        && run
-            .entrypoint
+    mount_valid && !access.image_ld_library_path.contains('\0')
+}
+fn valid_execution(entrypoint: &[String], command: &[String]) -> bool {
+    !entrypoint.is_empty()
+        && entrypoint
             .iter()
-            .chain(run.command.iter())
+            .chain(command.iter())
             .all(|v| !v.is_empty() && !v.contains('\0'))
-        && run
-            .entrypoint
+        && entrypoint
             .iter()
-            .chain(run.command.iter())
+            .chain(command.iter())
             .map(String::len)
             .sum::<usize>()
             <= 8 * 1024
-        && !run.image_ld_library_path.contains('\0')
+}
+/// `/dev/dri` itself, or one node directly beneath it. Nothing else is a GPU
+/// node this profile may pass through, and no component may escape the
+/// directory.
+fn valid_dri_device(device: &str) -> bool {
+    device == "/dev/dri"
+        || device.strip_prefix("/dev/dri/").is_some_and(|node| {
+            !node.is_empty() && !node.contains(['/', '\0']) && node != "." && node != ".."
+        })
+}
+fn valid_gpu_probe(run: &GpuProbeRun, name: &str) -> bool {
+    name.starts_with(container_ownership::PROBE_NAME_PREFIX)
+        && valid_execution(&run.entrypoint, &run.command)
+        && run.devices.len() <= 64
+        && run.devices.iter().all(|device| valid_dri_device(device))
+        // Sorted and distinct, so one set of groups has one fingerprint.
+        && run.groups.first().is_none_or(|first| *first != 0)
+        && run.groups.windows(2).all(|pair| pair[0] < pair[1])
+        && (!run.devices.is_empty() || run.nvidia.is_some())
+        && run.nvidia.as_ref().is_none_or(valid_driver_access)
 }
 fn valid_audio(run: &AudioRun, name: &str) -> bool {
     let socket = run.socket_dir.to_str();
@@ -429,15 +448,15 @@ fn valid_audio(run: &AudioRun, name: &str) -> bool {
 fn fingerprint(
     helper: &DiagnosticHelper,
     run: Option<&DiagnosticRun>,
-    nvidia_gpu: Option<&NvidiaGpuRun>,
+    gpu_probe: Option<&GpuProbeRun>,
     audio: Option<&AudioRun>,
 ) -> Result<String, RuntimeError> {
     // Existing diagnostic journals fingerprint exactly this two-tuple.  Keep
     // it stable so records written before the audio profile remain replayable.
     let bytes = if let Some(audio) = audio {
         serde_json::to_vec(&(helper, run, audio))
-    } else if nvidia_gpu.is_some() {
-        serde_json::to_vec(&(helper, run, nvidia_gpu))
+    } else if gpu_probe.is_some() {
+        serde_json::to_vec(&(helper, run, gpu_probe))
     } else {
         serde_json::to_vec(&(helper, run))
     }
@@ -483,7 +502,7 @@ fn matches(
     intent: &HelperIntent,
     helper: &DiagnosticHelper,
     run: Option<&DiagnosticRun>,
-    nvidia_gpu: Option<&NvidiaGpuRun>,
+    gpu_probe: Option<&GpuProbeRun>,
     audio: Option<&AudioRun>,
     owner: &str,
     config: &RuntimeConfig,
@@ -493,7 +512,7 @@ fn matches(
         && intent.image == helper.image
         && intent.owner == owner
         && intent.socket == config.socket
-        && intent.request_fingerprint == fingerprint(helper, run, nvidia_gpu, audio)?)
+        && intent.request_fingerprint == fingerprint(helper, run, gpu_probe, audio)?)
 }
 fn helper(intent: &HelperIntent) -> DiagnosticHelper {
     DiagnosticHelper {
@@ -513,8 +532,26 @@ fn owned(intent: &HelperIntent) -> Result<OwnedHelperId, RuntimeError> {
     })
 }
 
-fn nvidia_mount(run: &NvidiaGpuRun) -> Mount {
-    match &run.driver_mount {
+/// The pre-#258 request carried the driver fields inline; read it as the same
+/// access so one realization serves the legacy journal and the probe profile.
+fn legacy_access(run: &NvidiaGpuRun) -> NvidiaDriverAccess {
+    NvidiaDriverAccess {
+        driver_mount: run.driver_mount.clone(),
+        image_ld_library_path: run.image_ld_library_path.clone(),
+        has_gbm_backend: run.has_gbm_backend,
+    }
+}
+/// NVIDIA access of whichever profile this intent records, if it has any.
+fn intent_access(intent: &HelperIntent) -> Option<NvidiaDriverAccess> {
+    intent
+        .gpu_probe
+        .as_ref()
+        .and_then(|probe| probe.nvidia.clone())
+        .or_else(|| intent.nvidia_gpu.as_ref().map(legacy_access))
+}
+
+fn nvidia_mount(access: &NvidiaDriverAccess) -> Mount {
+    match &access.driver_mount {
         NvidiaDriverMount::ReadOnlyBind(bind) => Mount {
             typ: Some(MountType::BIND),
             source: bind.source.to_str().map(str::to_owned),
@@ -535,14 +572,15 @@ fn nvidia_mount(run: &NvidiaGpuRun) -> Mount {
         },
     }
 }
-fn nvidia_env(run: &NvidiaGpuRun) -> Vec<String> {
-    let target = match &run.driver_mount {
+fn nvidia_env(access: &NvidiaDriverAccess) -> Vec<String> {
+    let target = match &access.driver_mount {
         NvidiaDriverMount::ReadOnlyBind(bind) => &bind.target,
         NvidiaDriverMount::NamedVolume { target, .. } => target,
     };
     let mut ld = vec![format!("{target}/lib64")];
     ld.extend(
-        run.image_ld_library_path
+        access
+            .image_ld_library_path
             .split(':')
             .filter(|v| !v.is_empty())
             .map(str::to_owned),
@@ -553,7 +591,7 @@ fn nvidia_env(run: &NvidiaGpuRun) -> Vec<String> {
         format!("__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS={target}/egl_external_platform.d:/usr/share/egl/egl_external_platform.d"),
         format!("VK_ADD_DRIVER_FILES={target}/vulkan/icd.d/nvidia_icd.json"),
     ];
-    if run.has_gbm_backend {
+    if access.has_gbm_backend {
         env.push(format!("GBM_BACKENDS_PATH={target}/gbm"));
     }
     env
@@ -561,8 +599,8 @@ fn nvidia_env(run: &NvidiaGpuRun) -> Vec<String> {
 /// Docker inspect includes the image's inherited environment as well as the
 /// values supplied at create.  Require each Quasar-controlled loader key once
 /// and byte-for-byte, while leaving unrelated image defaults intact.
-fn has_nvidia_env(env: &[String], run: &NvidiaGpuRun) -> bool {
-    let expected = nvidia_env(run);
+fn has_nvidia_env(env: &[String], access: &NvidiaDriverAccess) -> bool {
+    let expected = nvidia_env(access);
     let controlled = [
         "LD_LIBRARY_PATH",
         "__EGL_VENDOR_LIBRARY_DIRS",
@@ -602,8 +640,8 @@ fn is_nvidia_all_request(request: &DeviceRequest) -> bool {
             .as_ref()
             .is_none_or(std::collections::HashMap::is_empty)
 }
-fn matches_nvidia_mount(mount: &bollard::models::MountPoint, run: &NvidiaGpuRun) -> bool {
-    let (typ, source, name, target) = match &run.driver_mount {
+fn matches_nvidia_mount(mount: &bollard::models::MountPoint, access: &NvidiaDriverAccess) -> bool {
+    let (typ, source, name, target) = match &access.driver_mount {
         NvidiaDriverMount::ReadOnlyBind(bind) => ("bind", bind.source.to_str(), None, &bind.target),
         NvidiaDriverMount::NamedVolume { name, target } => {
             // Docker realizes a named volume source as a daemon storage path;
@@ -617,13 +655,13 @@ fn matches_nvidia_mount(mount: &bollard::models::MountPoint, run: &NvidiaGpuRun)
         && mount.destination.as_deref() == Some(target)
         && mount.rw == Some(false)
 }
-fn requested_nvidia_mount(mount: &Mount, run: &NvidiaGpuRun) -> bool {
-    let expected = nvidia_mount(run);
+fn requested_nvidia_mount(mount: &Mount, access: &NvidiaDriverAccess) -> bool {
+    let expected = nvidia_mount(access);
     mount.typ == expected.typ
         && mount.source == expected.source
         && mount.target == expected.target
         && mount.read_only == Some(true)
-        && match &run.driver_mount {
+        && match &access.driver_mount {
             NvidiaDriverMount::ReadOnlyBind(_) => {
                 safe_readonly_bind_options(mount.bind_options.as_ref())
             }
@@ -667,15 +705,20 @@ fn inspect_owned(
     {
         return Err(ErrorKind::UnknownOutcome.into());
     }
+    let probe = match intent.profile {
+        HelperProfile::GpuProbe => Some(intent.gpu_probe.as_ref().ok_or(ErrorKind::Protocol)?),
+        _ => None,
+    };
+    let access = intent_access(intent);
     let host = info.host_config.ok_or(ErrorKind::Protocol)?;
     if host.network_mode.as_deref() != Some("none")
         || host.readonly_rootfs != Some(intent.profile != HelperProfile::Audio)
         || host.privileged != Some(false)
         || host.auto_remove != Some(false)
         || host.cap_add.as_ref().is_some_and(|v| !v.is_empty())
-        || host.devices.as_ref().is_some_and(|v| !v.is_empty())
-        || (intent.profile != HelperProfile::NvidiaGpu
-            && host.device_requests.as_ref().is_some_and(|v| !v.is_empty()))
+        || (probe.is_none() && host.devices.as_ref().is_some_and(|v| !v.is_empty()))
+        || (probe.is_none() && host.group_add.as_ref().is_some_and(|v| !v.is_empty()))
+        || (access.is_none() && host.device_requests.as_ref().is_some_and(|v| !v.is_empty()))
         || host.volumes_from.as_ref().is_some_and(|v| !v.is_empty())
         || host.binds.as_ref().is_some_and(|v| !v.is_empty())
         || host.pid_mode.as_deref().is_some_and(|v| !v.is_empty())
@@ -696,24 +739,60 @@ fn inspect_owned(
     }
     if intent.profile == HelperProfile::NvidiaGpu {
         let run = intent.nvidia_gpu.as_ref().ok_or(ErrorKind::Protocol)?;
-        if !matches!(host.device_requests.as_deref(), Some([request]) if is_nvidia_all_request(request))
+        if c.entrypoint.as_ref() != Some(&run.entrypoint) || c.cmd.as_ref() != Some(&run.command) {
+            return Err(ErrorKind::Protocol.into());
+        }
+    }
+    if let Some(run) = probe {
+        let devices = host.devices.as_deref().unwrap_or(&[]);
+        if devices.len() != run.devices.len()
+            || devices
+                .iter()
+                .zip(run.devices.iter())
+                .any(|(realized, path)| {
+                    realized.path_on_host.as_deref() != Some(path.as_str())
+                        || realized.path_in_container.as_deref() != Some(path.as_str())
+                        || realized.cgroup_permissions.as_deref() != Some("rwm")
+                })
+        {
+            return Err(ErrorKind::Protocol.into());
+        }
+        let mut realized_groups = host.group_add.clone().unwrap_or_default();
+        let mut requested_groups = run.groups.iter().map(u32::to_string).collect::<Vec<_>>();
+        realized_groups.sort();
+        requested_groups.sort();
+        if realized_groups != requested_groups
             || c.entrypoint.as_ref() != Some(&run.entrypoint)
             || c.cmd.as_ref() != Some(&run.command)
-            || !c.env.as_deref().is_some_and(|env| has_nvidia_env(env, run))
+        {
+            return Err(ErrorKind::Protocol.into());
+        }
+    }
+    if let Some(access) = &access {
+        if !matches!(host.device_requests.as_deref(), Some([request]) if is_nvidia_all_request(request))
+            || !c
+                .env
+                .as_deref()
+                .is_some_and(|env| has_nvidia_env(env, access))
         {
             return Err(ErrorKind::Protocol.into());
         }
         let mounts = info.mounts.as_deref().unwrap_or(&[]);
         let requested = host.mounts.as_deref().unwrap_or(&[]);
         if mounts.len() != 1
-            || !matches_nvidia_mount(&mounts[0], run)
+            || !matches_nvidia_mount(&mounts[0], access)
             || requested.len() != 1
-            || !requested_nvidia_mount(&requested[0], run)
+            || !requested_nvidia_mount(&requested[0], access)
         {
             return Err(ErrorKind::Protocol.into());
         }
+    } else if probe.is_some()
+        && (info.mounts.as_ref().is_some_and(|m| !m.is_empty())
+            || host.mounts.as_ref().is_some_and(|m| !m.is_empty()))
+    {
+        return Err(ErrorKind::Protocol.into());
     }
-    if intent.profile != HelperProfile::NvidiaGpu {
+    if probe.is_none() && intent.profile != HelperProfile::NvidiaGpu {
         if let Some(run) = &intent.run {
             if c.entrypoint.as_ref() != Some(&run.entrypoint)
                 || c.cmd.as_ref() != Some(&run.command)
@@ -878,16 +957,18 @@ async fn create_or_adopt_inner(
     config: &RuntimeConfig,
     helper: DiagnosticHelper,
     run: Option<DiagnosticRun>,
-    nvidia_gpu: Option<NvidiaGpuRun>,
+    gpu_probe: Option<GpuProbeRun>,
     audio: Option<AudioRun>,
 ) -> Result<(bollard::Docker, HelperJournal, HelperIntent), RuntimeError> {
     if !valid_helper(&helper)
         || run.as_ref().is_some_and(|r| !valid_run(r))
-        || nvidia_gpu.as_ref().is_some_and(|r| !valid_nvidia_gpu(r))
+        || gpu_probe
+            .as_ref()
+            .is_some_and(|r| !valid_gpu_probe(r, &helper.name))
         || audio
             .as_ref()
             .is_some_and(|r| !valid_audio(r, &helper.name))
-        || (run.is_some() as u8 + nvidia_gpu.is_some() as u8 + audio.is_some() as u8) != 1
+        || (run.is_some() as u8 + gpu_probe.is_some() as u8 + audio.is_some() as u8) != 1
     {
         return Err(ErrorKind::InvalidConfiguration.into());
     }
@@ -899,7 +980,7 @@ async fn create_or_adopt_inner(
             &intent,
             &helper,
             run.as_ref(),
-            nvidia_gpu.as_ref(),
+            gpu_probe.as_ref(),
             audio.as_ref(),
             &owner,
             config,
@@ -932,6 +1013,11 @@ async fn create_or_adopt_inner(
         let _ = inspect(&docker, &intent).await?;
         return Ok((docker, journal, intent));
     }
+    // One probe at a time per host: a second one would contend for the same
+    // GPU while the first is still unaccounted for. Refused before any create.
+    if gpu_probe.is_some() && another_probe_unreconciled(config)? {
+        return Err(ErrorKind::Busy.into());
+    }
     // A foreign (or unjournalled old) name is only read, never changed by name.
     match docker.inspect_container(&helper.name, None).await {
         Ok(_) => return Err(ErrorKind::UnknownOutcome.into()),
@@ -941,7 +1027,7 @@ async fn create_or_adopt_inner(
         Err(e) => return Err(super::classify(e)),
     }
     let is_audio = audio.is_some();
-    let is_nvidia_gpu = nvidia_gpu.is_some();
+    let is_gpu_probe = gpu_probe.is_some();
     let mut intent = HelperIntent {
         operation: helper.operation.clone(),
         name: helper.name.clone(),
@@ -952,16 +1038,16 @@ async fn create_or_adopt_inner(
         request_fingerprint: fingerprint(
             &helper,
             run.as_ref(),
-            nvidia_gpu.as_ref(),
+            gpu_probe.as_ref(),
             audio.as_ref(),
         )?,
         run,
-        nvidia_gpu,
-        gpu_probe: None,
+        nvidia_gpu: None,
+        gpu_probe,
         profile: if is_audio {
             HelperProfile::Audio
-        } else if is_nvidia_gpu {
-            HelperProfile::NvidiaGpu
+        } else if is_gpu_probe {
+            HelperProfile::GpuProbe
         } else {
             HelperProfile::Diagnostic
         },
@@ -991,20 +1077,31 @@ async fn create_or_adopt_inner(
     let mut labels = HashMap::new();
     labels.insert(container_ownership::LABEL.to_owned(), intent.owner.clone());
     labels.insert(OPERATION_LABEL.to_owned(), helper.operation.clone());
-    let mounts = intent
-        .nvidia_gpu
-        .as_ref()
-        .map(|r| vec![nvidia_mount(r)])
-        .or_else(|| {
-            intent
-                .run
-                .as_ref()
-                .map(|r| {
+    let access = intent_access(&intent);
+    let mounts = access.as_ref().map(|a| vec![nvidia_mount(a)]).or_else(|| {
+        intent
+            .run
+            .as_ref()
+            .map(|r| {
+                vec![Mount {
+                    typ: Some(MountType::BIND),
+                    source: r.bind.source.to_str().map(str::to_owned),
+                    target: Some(r.bind.target.clone()),
+                    read_only: Some(true),
+                    bind_options: Some(MountBindOptions {
+                        create_mountpoint: Some(false),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]
+            })
+            .or_else(|| {
+                intent.audio.as_ref().map(|r| {
                     vec![Mount {
                         typ: Some(MountType::BIND),
-                        source: r.bind.source.to_str().map(str::to_owned),
-                        target: Some(r.bind.target.clone()),
-                        read_only: Some(true),
+                        source: r.socket_dir.to_str().map(str::to_owned),
+                        target: r.socket_dir.to_str().map(str::to_owned),
+                        read_only: Some(false),
                         bind_options: Some(MountBindOptions {
                             create_mountpoint: Some(false),
                             ..Default::default()
@@ -1012,26 +1109,29 @@ async fn create_or_adopt_inner(
                         ..Default::default()
                     }]
                 })
-                .or_else(|| {
-                    intent.audio.as_ref().map(|r| {
-                        vec![Mount {
-                            typ: Some(MountType::BIND),
-                            source: r.socket_dir.to_str().map(str::to_owned),
-                            target: r.socket_dir.to_str().map(str::to_owned),
-                            read_only: Some(false),
-                            bind_options: Some(MountBindOptions {
-                                create_mountpoint: Some(false),
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        }]
-                    })
-                })
-        });
+            })
+    });
     let requirements = DiagnosticRequirements::FIXED;
     let devices = match requirements.devices {
         crate::runtime::DiagnosticDevices::None => Vec::new(),
     };
+    // Same path inside and out: a probe reads the node it was told to read.
+    let devices = intent.gpu_probe.as_ref().map_or(devices, |probe| {
+        probe
+            .devices
+            .iter()
+            .map(|path| DeviceMapping {
+                path_on_host: Some(path.clone()),
+                path_in_container: Some(path.clone()),
+                cgroup_permissions: Some("rwm".into()),
+            })
+            .collect()
+    });
+    let group_add = intent
+        .gpu_probe
+        .as_ref()
+        .filter(|probe| !probe.groups.is_empty())
+        .map(|probe| probe.groups.iter().map(u32::to_string).collect::<Vec<_>>());
     let (user, readonly_rootfs, cap_drop, security_opt) = match requirements.security {
         crate::runtime::DiagnosticSecurity::LockedDownRoot => (
             "0:0",
@@ -1048,7 +1148,7 @@ async fn create_or_adopt_inner(
         labels: Some(labels),
         user: Some(user.into()),
         entrypoint: intent
-            .nvidia_gpu
+            .gpu_probe
             .as_ref()
             .map(|r| r.entrypoint.clone())
             .or_else(|| {
@@ -1059,7 +1159,7 @@ async fn create_or_adopt_inner(
                     .or_else(|| intent.audio.as_ref().map(|r| r.entrypoint.clone()))
             }),
         cmd: intent
-            .nvidia_gpu
+            .gpu_probe
             .as_ref()
             .map(|r| r.command.clone())
             .or_else(|| {
@@ -1069,7 +1169,7 @@ async fn create_or_adopt_inner(
                     .map(|r| r.command.clone())
                     .or_else(|| intent.audio.as_ref().map(|r| r.command.clone()))
             }),
-        env: intent.nvidia_gpu.as_ref().map(nvidia_env).or_else(|| {
+        env: access.as_ref().map(nvidia_env).or_else(|| {
             intent.audio.as_ref().map(|r| {
                 vec![
                     format!("HOME={}", r.socket_dir.display()),
@@ -1093,7 +1193,8 @@ async fn create_or_adopt_inner(
             cap_drop: Some(cap_drop),
             security_opt: Some(security_opt),
             devices: Some(devices),
-            device_requests: intent.nvidia_gpu.as_ref().map(|_| {
+            group_add,
+            device_requests: access.as_ref().map(|_| {
                 vec![DeviceRequest {
                     driver: Some("nvidia".into()),
                     count: Some(-1),
@@ -1159,23 +1260,15 @@ pub(crate) async fn run(
     run_inner(config, helper, Some(run), None, None).await
 }
 
-pub(crate) async fn run_nvidia_gpu(
-    config: &RuntimeConfig,
-    helper: DiagnosticHelper,
-    run: NvidiaGpuRun,
-) -> Result<OwnedHelperId, RuntimeError> {
-    run_inner(config, helper, None, Some(run), None).await
-}
-
 async fn run_inner(
     config: &RuntimeConfig,
     helper: DiagnosticHelper,
     run: Option<DiagnosticRun>,
-    nvidia_gpu: Option<NvidiaGpuRun>,
+    gpu_probe: Option<GpuProbeRun>,
     audio: Option<AudioRun>,
 ) -> Result<OwnedHelperId, RuntimeError> {
     let (docker, journal, mut intent) =
-        create_or_adopt_inner(config, helper, run, nvidia_gpu, audio).await?;
+        create_or_adopt_inner(config, helper, run, gpu_probe, audio).await?;
     if intent.phase == HelperPhase::Completed {
         return owned(&intent);
     }
@@ -1253,17 +1346,9 @@ async fn run_inner(
 pub(crate) async fn run_gpu_probe(
     config: &RuntimeConfig,
     helper: DiagnosticHelper,
-    run: crate::runtime::GpuProbeRun,
+    run: GpuProbeRun,
 ) -> Result<OwnedHelperId, RuntimeError> {
-    // #258: implemented by the GPU probe profile.
-    let _ = (config, helper, run);
-    Err(ErrorKind::Unavailable.into())
-}
-
-pub(crate) async fn retire_gpu_probes(config: &RuntimeConfig) -> Result<(), RuntimeError> {
-    // #258: implemented by the GPU probe profile.
-    let _ = config;
-    Err(ErrorKind::Unavailable.into())
+    run_inner(config, helper, None, Some(run), None).await
 }
 
 pub(crate) async fn run_audio(
@@ -1360,6 +1445,7 @@ pub(crate) async fn observe(
         || latest.image != intent.image
         || latest.run != intent.run
         || latest.nvidia_gpu != intent.nvidia_gpu
+        || latest.gpu_probe != intent.gpu_probe
         || latest.profile != intent.profile
         || latest.audio != intent.audio
     {
@@ -1385,17 +1471,21 @@ pub(crate) async fn stop(config: &RuntimeConfig, id: OwnedHelperId) -> Result<()
     if owned(&intent)? != id {
         return Err(ErrorKind::UnknownOutcome.into());
     }
-    if intent.profile == HelperProfile::Audio && intent.phase == HelperPhase::Completed {
+    // Stopping a sidecar or a probe is a durable teardown request: record it
+    // before touching a daemon that may be unavailable, so recovery reconciles
+    // the same immutable container. Diagnostic behavior stays byte-for-byte.
+    let durable_stop = matches!(
+        intent.profile,
+        HelperProfile::Audio | HelperProfile::GpuProbe | HelperProfile::NvidiaGpu
+    );
+    if durable_stop && intent.phase == HelperPhase::Completed {
         return Ok(());
     }
-    if intent.profile == HelperProfile::Audio && intent.phase == HelperPhase::CleanupPending {
+    if durable_stop && intent.phase == HelperPhase::CleanupPending {
         drop(journal);
         return cleanup(config, id).await;
     }
-    // Audio stop is a durable teardown request.  Record it before touching an
-    // unavailable daemon so the next startup can reconcile the same immutable
-    // sidecar; diagnostic behavior remains byte-for-byte compatible.
-    if intent.profile == HelperProfile::Audio && intent.phase != HelperPhase::Stopped {
+    if durable_stop && intent.phase != HelperPhase::Stopped {
         intent.phase = HelperPhase::Stopping;
         journal.write(&intent)?;
     }
@@ -1413,6 +1503,28 @@ pub(crate) async fn stop(config: &RuntimeConfig, id: OwnedHelperId) -> Result<()
         intent.phase = HelperPhase::Stopped;
         journal.write(&intent)?;
         return Ok(());
+    }
+    if is_probe_profile(intent.profile)
+        && !running
+        && exit.is_none()
+        && intent.phase == HelperPhase::Stopping
+    {
+        // A probe whose create reply was lost is never started by anyone, so
+        // boot retirement must be able to collect it. Only Docker's `created`
+        // status proves it never ran; every other status stays unknown, and
+        // cleanup keeps `None` rather than reading it as success.
+        let created = docker
+            .inspect_container(id.as_str(), None)
+            .await
+            .map_err(uncertain_inspection)?
+            .state
+            .and_then(|state| state.status)
+            == Some(ContainerStateStatusEnum::CREATED);
+        if created {
+            intent.phase = HelperPhase::Stopped;
+            journal.write(&intent)?;
+            return Ok(());
+        }
     }
     if running {
         // Explicit termination is durable intent, separate from cancellation
@@ -1588,21 +1700,24 @@ pub(crate) async fn cleanup(config: &RuntimeConfig, id: OwnedHelperId) -> Result
 
 pub(crate) async fn recover(config: &RuntimeConfig) -> Result<(), RuntimeError> {
     // One stalled legacy diagnostic must not strand a separately journaled GPU
-    // helper. Both reconciliations are bounded; return the first failure only
+    // helper. Every reconciliation is bounded; return the first failure only
     // after attempting each independent profile.
     let diagnostic = recover_profile(config, HelperProfile::Diagnostic).await;
     let nvidia_gpu = recover_profile(config, HelperProfile::NvidiaGpu).await;
-    diagnostic.and(nvidia_gpu)
+    let gpu_probe = recover_profile(config, HelperProfile::GpuProbe).await;
+    diagnostic.and(nvidia_gpu).and(gpu_probe)
 }
 
-pub(crate) async fn recover_audio(config: &RuntimeConfig) -> Result<(), RuntimeError> {
-    recover_profile(config, HelperProfile::Audio).await
+fn is_probe_profile(profile: HelperProfile) -> bool {
+    matches!(profile, HelperProfile::GpuProbe | HelperProfile::NvidiaGpu)
 }
 
-/// Boot-only retirement of the previous agent's recorded audio workloads.
-/// This deliberately enumerates journals, never Docker names, then delegates
-/// each operation to the durable abandonment path.
-pub(crate) async fn retire_audio(config: &RuntimeConfig) -> Result<(), RuntimeError> {
+/// Every helper journal under this state root, with the first failure met while
+/// reading them. A record that cannot be read or parsed is reported, never
+/// silently skipped: callers decide what an unknown record means.
+fn scan_journals(
+    config: &RuntimeConfig,
+) -> Result<(Vec<HelperIntent>, Option<ErrorKind>), RuntimeError> {
     let root = config
         .image_state_path
         .as_ref()
@@ -1610,32 +1725,35 @@ pub(crate) async fn retire_audio(config: &RuntimeConfig) -> Result<(), RuntimeEr
         .join("helpers");
     let entries = match std::fs::read_dir(root) {
         Ok(v) => v,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), None)),
         Err(_) => return Err(ErrorKind::Unavailable.into()),
     };
-    let mut operations = Vec::new();
+    let mut records = Vec::new();
     let mut failure = None;
+    let mut fail = |kind| failure = failure.or(Some(kind));
     for entry in entries {
         let entry = match entry {
             Ok(v) => v,
             Err(_) => {
-                failure = Some(ErrorKind::Unavailable);
+                fail(ErrorKind::Unavailable);
                 continue;
             }
         };
         let path = entry.path();
-        if path.extension().and_then(|v| v.to_str()) == Some("lock")
-            || path.extension().and_then(|v| v.to_str()) == Some("new")
-        {
+        let extension = path.extension().and_then(|v| v.to_str());
+        if extension == Some("lock") || extension == Some("new") {
             continue;
         }
-        if !entry
-            .file_type()
-            .map_err(|_| ErrorKind::Unavailable)?
-            .is_file()
-        {
-            failure = Some(ErrorKind::Protocol);
-            continue;
+        match entry.file_type() {
+            Ok(file_type) if file_type.is_file() => {}
+            Ok(_) => {
+                fail(ErrorKind::Protocol);
+                continue;
+            }
+            Err(_) => {
+                fail(ErrorKind::Unavailable);
+                continue;
+            }
         }
         use std::{io::Read, os::unix::fs::OpenOptionsExt};
         let mut bytes = Vec::new();
@@ -1643,38 +1761,121 @@ pub(crate) async fn retire_audio(config: &RuntimeConfig) -> Result<(), RuntimeEr
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
-            .map_err(|_| ErrorKind::Unavailable)
             .and_then(|file| {
                 file.take((MAX_JOURNAL_BYTES + 1) as u64)
                     .read_to_end(&mut bytes)
-                    .map_err(|_| ErrorKind::Unavailable)
             })
             .is_err()
         {
-            failure = Some(ErrorKind::Unavailable);
+            fail(ErrorKind::Unavailable);
             continue;
         }
         if bytes.len() > MAX_JOURNAL_BYTES {
-            failure = Some(ErrorKind::Protocol);
+            fail(ErrorKind::Protocol);
             continue;
         }
-        let intent: HelperIntent = match serde_json::from_slice(&bytes) {
-            Ok(v) => v,
-            Err(_) => {
-                failure = Some(ErrorKind::Protocol);
-                continue;
-            }
-        };
-        if intent.phase == HelperPhase::Completed {
+        match serde_json::from_slice(&bytes) {
+            Ok(intent) => records.push(intent),
+            Err(_) => fail(ErrorKind::Protocol),
+        }
+    }
+    Ok((records, failure))
+}
+
+/// Fail closed: a record this agent cannot read could be an unreconciled probe,
+/// so it counts as one. The caller's own operation has no journal yet.
+fn another_probe_unreconciled(config: &RuntimeConfig) -> Result<bool, RuntimeError> {
+    let (records, failure) = scan_journals(config)?;
+    Ok(failure.is_some()
+        || records.iter().any(|intent| {
+            is_probe_profile(intent.profile) && intent.phase != HelperPhase::Completed
+        }))
+}
+
+/// Boot-only retirement of the previous agent's recorded GPU probes. A probe's
+/// deadline died with the process that owned it, so one still running is
+/// stopped here; routine recovery never does that. Journals of any other
+/// profile are left untouched.
+pub(crate) async fn retire_gpu_probes(config: &RuntimeConfig) -> Result<(), RuntimeError> {
+    let (records, mut failure) = scan_journals(config)?;
+    let mut operations = Vec::new();
+    for intent in records {
+        if intent.phase == HelperPhase::Completed || !is_probe_profile(intent.profile) {
             continue;
         }
         if current_intent(config, &intent).is_err() {
             failure = Some(ErrorKind::UnknownOutcome);
             continue;
         }
-        if intent.profile == HelperProfile::Audio {
-            operations.push(intent.operation);
+        operations.push(intent.operation);
+    }
+    // Persist every termination request before a daemon call can block later
+    // records behind an unavailable engine.
+    for operation in &operations {
+        match HelperJournal::acquire(config, operation).await {
+            Ok(journal) => match journal.read() {
+                Ok(Some(mut intent)) if intent.phase != HelperPhase::Completed => {
+                    // The scan raced with another lifecycle action. Recheck the
+                    // durable record under its lease before recording an
+                    // irreversible boot-retirement request.
+                    if let Err(error) = current_intent(config, &intent) {
+                        failure = Some(error.kind);
+                    } else if matches!(
+                        intent.phase,
+                        HelperPhase::Running
+                            | HelperPhase::Starting
+                            | HelperPhase::Creating
+                            | HelperPhase::Created
+                    ) {
+                        intent.phase = HelperPhase::Stopping;
+                        if journal.write(&intent).is_err() {
+                            failure = Some(ErrorKind::Unavailable);
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => failure = Some(error.kind),
+            },
+            Err(error) => failure = Some(error.kind),
         }
+    }
+    for operation in operations {
+        if let Err(error) = reconcile_probe(config, &operation).await {
+            failure = Some(error.kind);
+        }
+    }
+    failure.map_or(Ok(()), |kind| Err(kind.into()))
+}
+
+async fn reconcile_probe(config: &RuntimeConfig, operation: &str) -> Result<(), RuntimeError> {
+    let journal = HelperJournal::acquire(config, operation).await?;
+    let intent = journal.read()?.ok_or(ErrorKind::UnknownOutcome)?;
+    if intent.phase == HelperPhase::Completed {
+        return Ok(());
+    }
+    current_intent(config, &intent)?;
+    finish_recorded(config, journal, intent).await
+}
+
+pub(crate) async fn recover_audio(config: &RuntimeConfig) -> Result<(), RuntimeError> {
+    recover_profile(config, HelperProfile::Audio).await
+}
+
+/// Boot-only retirement of the previous agent's recorded audio workloads.
+/// Enumerates journals, never Docker names, then delegates each operation to
+/// the durable abandonment path.
+pub(crate) async fn retire_audio(config: &RuntimeConfig) -> Result<(), RuntimeError> {
+    let (records, mut failure) = scan_journals(config)?;
+    let mut operations = Vec::new();
+    for intent in records {
+        if intent.phase == HelperPhase::Completed || intent.profile != HelperProfile::Audio {
+            continue;
+        }
+        if current_intent(config, &intent).is_err() {
+            failure = Some(ErrorKind::UnknownOutcome);
+            continue;
+        }
+        operations.push(intent.operation);
     }
     // Persist every termination request before a daemon call can block later
     // records behind an unavailable engine.
@@ -1848,6 +2049,18 @@ async fn recover_entry(
         journal.write(&intent)?;
         return Ok(());
     }
+    finish_recorded(config, journal, intent).await
+}
+
+/// Carry one verified record to a terminal state under its own identity: adopt
+/// a lost create, retry an explicitly requested stop, observe within a bound,
+/// then collect. Never launches or recreates anything. The caller holds the
+/// operation's lease and has already proven the record is this agent's.
+async fn finish_recorded(
+    config: &RuntimeConfig,
+    journal: HelperJournal,
+    mut intent: HelperIntent,
+) -> Result<(), RuntimeError> {
     if intent.id.is_none() {
         // POST /create may have succeeded although its response was lost.
         // This is read-only name inspection, followed by full immutable
@@ -1874,8 +2087,6 @@ async fn recover_entry(
         // and retries the explicitly authorized termination.
         stop(config, id.clone()).await?;
     }
-    // A recovery pass never launches/recreates. Its bounded observation either
-    // proves a stopped helper can be collected or leaves uncertainty durable.
     let _ = tokio::time::timeout(Duration::from_secs(5), async {
         let _ = observe(config, id.clone()).await;
     })

@@ -60,6 +60,21 @@ own; the two do not move together, and that is deliberate.
   secret is available so a missing one cannot read as clean. The test fixtures use documentation
   stand-ins, and the scan no longer skips `docs/reports` and `docs/superpowers`, which it had
   treated as private although they are published.
+- **The node agent's runtime interface has one closed GPU probe profile for every vendor
+  (#258).** It widens the NVIDIA-only GPU diagnostic profile: a probe container is given
+  exactly what a session's application container gets for GPU access — the DRM nodes under
+  `/dev/dri` and the numeric groups owning them, plus the NVIDIA device request and driver
+  volume when the host has one — with no network, a read-only root and no other mounts. Probe
+  containers carry their own owned name prefix, `quasar-probe-`, which the boot legacy sweep
+  never removes because probe teardown belongs to the durable helper journal; probe journals
+  are recovered at startup and by the maintenance pass, a probe still running when the agent
+  restarts is stopped and removed at boot, and a stop requested while the engine is unreachable
+  is finished by the next pass. Lost create/start/stop/remove replies reconcile under the same
+  operation identity, an observation timeout is never read as the probe's outcome, no second
+  probe of the kind starts while an earlier one is unreconciled, an unsupported requirement is
+  refused before any engine request, and a missing exit status stays unknown. The NVIDIA
+  sibling EGL self-test now runs through this profile with an identical container
+  configuration. There are no probe callers yet (#259).
 
 ### Fixed
 - **A failed readiness refresh no longer wipes the host's readiness checks (#255).** The

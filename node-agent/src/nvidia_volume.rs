@@ -1914,7 +1914,11 @@ pub fn probe_sibling_egl() -> EglRuntime {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let name = format!("quasar-driver-probe-{}-{nonce}", std::process::id());
+    let name = format!(
+        "{}egl-{}-{nonce}",
+        crate::container_ownership::PROBE_NAME_PREFIX,
+        std::process::id()
+    );
     let driver_mount = match (&info.name, &info.host) {
         (Some(name), _) => crate::runtime::NvidiaDriverMount::NamedVolume {
             name: name.clone(),
@@ -1928,7 +1932,7 @@ pub fn probe_sibling_egl() -> EglRuntime {
         }
         (None, None) => unreachable!("checked above"),
     };
-    let run = crate::runtime::NvidiaGpuRun {
+    let run = crate::runtime::GpuProbeRun {
         entrypoint: vec!["/usr/bin/timeout".into()],
         command: vec![
             "20s".into(),
@@ -1936,16 +1940,21 @@ pub fn probe_sibling_egl() -> EglRuntime {
             EGL_SELFTEST_ARG.into(),
             format!("{VOLUME_MOUNT}/lib64/libEGL_nvidia.so.0"),
         ],
-        driver_mount,
-        // The previous CLI sibling passed an empty image loader suffix.  Keep
-        // that precedence exactly; this probe is the agent image, not an app
-        // image whose baked loader path needs appending.
-        image_ld_library_path: String::new(),
-        has_gbm_backend: info
-            .local
-            .join(layout::GBM_DIR)
-            .join("nvidia-drm_gbm.so")
-            .is_file(),
+        // This probe reads the driver userspace, not a DRM node.
+        devices: Vec::new(),
+        groups: Vec::new(),
+        nvidia: Some(crate::runtime::NvidiaDriverAccess {
+            driver_mount,
+            // The previous CLI sibling passed an empty image loader suffix.  Keep
+            // that precedence exactly; this probe is the agent image, not an app
+            // image whose baked loader path needs appending.
+            image_ld_library_path: String::new(),
+            has_gbm_backend: info
+                .local
+                .join(layout::GBM_DIR)
+                .join("nvidia-drm_gbm.so")
+                .is_file(),
+        }),
     };
     let helper = crate::runtime::DiagnosticHelper {
         operation: format!("nvidia-egl-{nonce}"),
@@ -1954,12 +1963,12 @@ pub fn probe_sibling_egl() -> EglRuntime {
     };
     let output = crate::runtime::configured().and_then(|api| {
         api.recover_diagnostics().wait()?;
-        let id = api.run_nvidia_gpu_diagnostic(helper, run).wait()?;
-        let observed = api.observe_diagnostic(id.clone()).wait();
+        let id = api.run_gpu_probe(helper, run).wait()?;
+        let observed = api.observe_gpu_probe(id.clone()).wait();
         if observed.is_err() {
-            let _ = api.stop_diagnostic(id.clone()).wait();
+            let _ = api.stop_gpu_probe(id.clone()).wait();
         }
-        let cleanup = api.cleanup_diagnostic(id).wait();
+        let cleanup = api.cleanup_gpu_probe(id).wait();
         observed.and_then(|value| cleanup.map(|()| value))
     });
     let result = match output {

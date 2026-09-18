@@ -181,6 +181,14 @@ pub async fn run(cfg: Config) {
                     warn!(token = "runtime-audio-retirement-pending", %error,
                         "previous audio cleanup remains journalled; retry runtime recovery when Docker is available");
                 }
+                // A probe's deadline died with the previous process; boot is the one
+                // pass allowed to stop one still running.
+                if let Err(error) = crate::runtime::configured()
+                    .and_then(|api| api.retire_gpu_probes().wait())
+                {
+                    warn!(token = "runtime-probe-retirement-pending", %error,
+                        "previous host-probe cleanup remains journalled; the maintenance pass and the next probe retry it");
+                }
             },
             legacy_container_sweep,
         ) else {

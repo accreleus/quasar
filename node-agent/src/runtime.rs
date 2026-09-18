@@ -522,23 +522,6 @@ impl RuntimeClient {
         )
     }
 
-    /// Create and explicitly start an owned NVIDIA GPU diagnostic.  The
-    /// profile requests Docker's all-NVIDIA-GPUs semantics and validates its
-    /// realized driver mount, loader environment, security posture and device
-    /// request before execution.
-    pub fn run_nvidia_gpu_diagnostic(
-        &self,
-        helper: DiagnosticHelper,
-        run: NvidiaGpuRun,
-    ) -> Operation<OwnedHelperId> {
-        let config = self.config.clone();
-        self.submit_owned(
-            async move { docker::helpers::run_nvidia_gpu(&config, helper, run).await },
-            self.config.deadline,
-            true,
-        )
-    }
-
     /// Create and explicitly start one owned GPU probe container (#258): the
     /// closed profile that gives a probe what a session's application container
     /// gets for GPU access, for every vendor. Refused before any engine request
@@ -547,7 +530,11 @@ impl RuntimeClient {
     /// Dropping the returned operation detaches its observer; it never stops
     /// the probe. The orchestrator owns the deadline: past it, `stop_gpu_probe`
     /// then `cleanup_gpu_probe`.
-    pub fn run_gpu_probe(&self, helper: DiagnosticHelper, run: GpuProbeRun) -> Operation<OwnedHelperId> {
+    pub fn run_gpu_probe(
+        &self,
+        helper: DiagnosticHelper,
+        run: GpuProbeRun,
+    ) -> Operation<OwnedHelperId> {
         let config = self.config.clone();
         self.submit_owned(
             async move { docker::helpers::run_gpu_probe(&config, helper, run).await },

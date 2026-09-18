@@ -141,9 +141,11 @@ fn owned_legacy_id(
         return None;
     }
     let name = detail.name.clone().unwrap_or_default();
-    if name
-        .trim_start_matches('/')
-        .starts_with(crate::session::audio::PULSE_NAME_PREFIX)
+    let name_trimmed = name.trim_start_matches('/');
+    // A GPU probe's teardown belongs to its helper journal, exactly as an audio
+    // sibling's does, even when the caller asks for the probe prefix.
+    if name_trimmed.starts_with(crate::session::audio::PULSE_NAME_PREFIX)
+        || name_trimmed.starts_with(crate::container_ownership::PROBE_NAME_PREFIX)
     {
         return None;
     }
