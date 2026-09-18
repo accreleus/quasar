@@ -1322,8 +1322,10 @@ fn diagnostic_observe() -> (AgentMsg, Vec<crate::messages::ReadinessCheck>) {
             .with_codec_probe(None),
     )
     .into_iter()
-    // The 32-bit GL path is resolved through the engine, which this mode cannot ask.
-    .filter(|check| check.id != "nvidia_lib32_gl")
+    // Not observed in this mode, so not reported: the 32-bit GL path is resolved through
+    // the engine, and the codec probe would initialise GStreamer before the driver
+    // volume is adopted.
+    .filter(|check| !matches!(check.id.as_str(), "nvidia_lib32_gl" | "encoder_codecs"))
     .collect();
     (
         AgentMsg::Capacity {
