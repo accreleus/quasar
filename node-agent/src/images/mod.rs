@@ -278,7 +278,7 @@ pub trait ImageLifecycleObserver: Send + Sync {
 /// The `register.images` list read straight off the persisted state file: no engine call,
 /// no write, no [`ImageManager`]. The twin of [`ImageManager::register_images`]; a change
 /// to one belongs in the other. For a register this process must send before it may touch
-/// the container runtime (#256 diagnostic mode).
+/// the container runtime (diagnostic mode).
 pub fn register_images_from_state(state_path: &str) -> Vec<RegisterImageEntry> {
     state::load(state_path)
         .iter()

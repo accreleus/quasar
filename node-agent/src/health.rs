@@ -62,7 +62,7 @@ pub struct HealthState {
     /// #519: most recent registration-failure reason, surfaced in `/health` so
     /// an operator sees why without a log tail. `None` once registered again.
     last_registration_error: Mutex<Option<String>>,
-    /// #256: the agent is up and registered but refuses every launch. Takes
+    /// Diagnostic registration: the agent is up and registered but refuses every launch. Takes
     /// precedence over the registration verdict — a host in diagnostic mode is
     /// not ready whatever its connection is doing.
     not_ready: AtomicBool,
@@ -104,7 +104,7 @@ impl HealthState {
         }
     }
 
-    /// #256: answer `/health` with 503 `diagnostic` until [`Self::set_ready`].
+    /// Answer `/health` with 503 `diagnostic` until [`Self::set_ready`].
     pub fn set_not_ready(&self, reason: Option<String>) {
         if let Ok(mut slot) = self.not_ready_reason.lock() {
             *slot = reason;
@@ -261,7 +261,7 @@ fn handle_conn(mut stream: std::net::TcpStream, state: &HealthState) {
         // Sustained failure flips both the status word and the HTTP status line —
         // the prod HEALTHCHECK's `curl -f` treats any >=400 as unhealthy.
         let (status_line, body) = if let Some(reason) = state.not_ready_reason() {
-            // #256: diagnostic mode outranks the registration verdict — the host
+            // Diagnostic mode outranks the registration verdict — the host
             // refuses every launch regardless of how its connection is doing.
             let reason_json = serde_json::to_string(&reason).unwrap_or_else(|_| "\"\"".to_string());
             (
@@ -540,7 +540,7 @@ mod tests {
         drop(held);
     }
 
-    // --- #256: diagnostic mode is not ready ---
+    // --- diagnostic mode is not ready ---
 
     #[test]
     fn diagnostic_mode_answers_503_and_clears_on_resume() {

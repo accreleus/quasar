@@ -145,8 +145,7 @@ pub async fn run(cfg: Config) {
 
     // A prior process can leave an application holding a managed home after
     // SIGKILL. Retire it through the durable API before audio/home GC or any
-    // control-plane registration. An unresolved pass no longer exits: it enters
-    // diagnostic mode below, which withholds the same work without losing the host.
+    // control-plane registration. An unresolved pass enters diagnostic mode below.
     let (runtime, first_cleanup) = offload_probe(|| {
         let runtime = ContainerRuntime::from_env();
         let attempt = crate::diagnostic::startup_cleanup_configured();
@@ -179,8 +178,7 @@ pub async fn run(cfg: Config) {
         }
     }
 
-    // #256: an unresolved first pass registers, reports and refuses instead of exiting.
-    // Normal startup resumes below, in this same process, once the cleanup succeeds.
+    // Returns only once the cleanup has succeeded; everything below is withheld until then.
     if let Some(station) = crate::diagnostic::Station::enter(&first_cleanup) {
         run_diagnostic_mode(&cfg, &health, &station).await;
     }
@@ -205,7 +203,9 @@ pub async fn run(cfg: Config) {
     // (the ephemeral-username shape) that no live container mounts and that are
     // past the retention window — a real account's home is never a candidate.
     // Process-level: it must run whether or not this agent reaches the control plane.
-    crate::session::homes_gc::spawn_sweeper();
+    if crate::diagnostic::may_start(crate::diagnostic::Work::HomesGc) {
+        crate::session::homes_gc::spawn_sweeper();
+    }
 
     // Adopt an already-provisioned NVIDIA driver volume BEFORE anything can touch
     // EGL: the post-restart path (the provisioner exits so a fresh process lands
@@ -266,13 +266,17 @@ pub async fn run(cfg: Config) {
     // Materialise a missing NVIDIA graphics userspace into the driver volume. The
     // trigger is the readiness check set itself, so what provisions and what the
     // admin card shows can never disagree.
-    spawn_nvidia_volume_provisioner(&runtime, &nvidia_lib32_probed);
+    if crate::diagnostic::may_start(crate::diagnostic::Work::DriverVolumeProvisioner) {
+        spawn_nvidia_volume_provisioner(&runtime, &nvidia_lib32_probed);
+    }
 
     // #545: the CUDA half. NOT chained onto the driver volume — that one returns
     // immediately on a CDI-injected host, and NVRTC is needed on those too. The two
     // share the volume and nothing else (separate lock, manifest, backoff), so
     // running them concurrently is safe.
-    spawn_cuda_runtime_provisioner(&runtime);
+    if crate::diagnostic::may_start(crate::diagnostic::Work::CudaRuntimeProvisioner) {
+        spawn_cuda_runtime_provisioner(&runtime);
+    }
 
     // The host-probe input "agent image". A new image is a new process, which re-runs
     // every probe anyway, so the build identity is enough and costs no engine call.
@@ -1171,7 +1175,7 @@ where
 const DIAGNOSTIC_CAPACITY_REFRESH: Duration = Duration::from_secs(60);
 
 /// Hold this process in diagnostic registration until its startup cleanup succeeds
-/// (#256). Returns only on resume, after which normal startup continues in `run`.
+/// (CONTEXT.md). Returns only on resume, after which normal startup continues in `run`.
 async fn run_diagnostic_mode(
     cfg: &Config,
     health: &Arc<HealthState>,
@@ -1216,17 +1220,23 @@ async fn run_diagnostic_mode(
         };
         let Err(error) = attempt else { break };
         health.set_connected(false);
-        error!(
-            token = "diagnostic-connection-failed",
-            "diagnostic connection failed: {error:#}"
-        );
+        // Same predicate for the token and the counting gate, as in the normal loop.
+        let explained_refusal = error
+            .downcast_ref::<UpgradeRefused>()
+            .is_some_and(|r| describe_upgrade_refusal(r.status).is_some());
+        if explained_refusal {
+            warn!(
+                token = "cp-connect-rate-limited",
+                "agent connection failed: {error:#}"
+            );
+        } else {
+            error!(
+                token = "diagnostic-connection-failed",
+                "diagnostic connection failed: {error:#}"
+            );
+        }
         enrollment_fallback.observe(&error);
-        if counts_as_registration_failure(
-            error
-                .downcast_ref::<UpgradeRefused>()
-                .is_some_and(|r| describe_upgrade_refusal(r.status).is_some()),
-            health.unhealthy(),
-        ) {
+        if counts_as_registration_failure(explained_refusal, health.unhealthy()) {
             health.record_registration_failure(&format!("{error:#}"));
         }
         let wait = backoff.min(Duration::from_secs(30));
@@ -1284,7 +1294,16 @@ async fn diagnostic_connection(
         &mut rx,
         heartbeat_interval_ms,
         station,
-        diagnostic_observe,
+        {
+            let (health, station) = (health.clone(), station.clone());
+            move || {
+                // Keeps `/health`'s reason on the current fault; never re-arms after a resume.
+                if let Some(reason) = station.phase().launch_refusal() {
+                    health.set_not_ready(Some(reason));
+                }
+                diagnostic_observe()
+            }
+        },
         DIAGNOSTIC_CAPACITY_REFRESH,
     )
     .await
@@ -1301,7 +1320,11 @@ fn diagnostic_observe() -> (AgentMsg, Vec<crate::messages::ReadinessCheck>) {
         &crate::readiness::ProbeEnv::live(nvidia_host, "")
             .with_gpu_present(gpu_present)
             .with_codec_probe(None),
-    );
+    )
+    .into_iter()
+    // The 32-bit GL path is resolved through the engine, which this mode cannot ask.
+    .filter(|check| check.id != "nvidia_lib32_gl")
+    .collect();
     (
         AgentMsg::Capacity {
             source_preparation: None,

@@ -18,7 +18,7 @@ use crate::runtime::RuntimeClient;
 /// `ReadinessReport`, so no local refresh can drop it; no override lifts the refusal.
 pub const STARTUP_CLEANUP_ID: &str = "startup_cleanup";
 
-/// Work the pre-#256 boot exit prevented. None of it may start in diagnostic mode.
+/// Work that must not start while the startup cleanup is unresolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Work {
     HomesGc,
@@ -182,6 +182,13 @@ impl Startup {
 
 static PROCESS_STATION: std::sync::OnceLock<std::sync::Arc<Station>> = std::sync::OnceLock::new();
 
+/// Whether `work` may start in this process: always, unless it is in diagnostic mode.
+pub fn may_start(work: Work) -> bool {
+    PROCESS_STATION
+        .get()
+        .is_none_or(|station| station.phase().may_start(work))
+}
+
 /// The one flag the host-probe orchestrator reads before starting a probe. False when
 /// this process never entered diagnostic mode.
 pub fn host_probes_withheld() -> bool {
@@ -274,12 +281,12 @@ pub fn startup_cleanup_configured() -> CleanupAttempt {
 /// The process's diagnostic mode: the startup phase, the readiness card entry that
 /// outlives every local refresh, and the one-shot resume signal every waiter selects on.
 ///
-/// Created only by a first pass that failed, so its existence IS "this process is in
+/// Created only by a first pass that failed, so its existence is "this process is in
 /// diagnostic mode".
 #[derive(Debug)]
 pub struct Station {
     startup: Mutex<Startup>,
-    /// The safety check is RETAINED, so no local refresh can drop it.
+    /// Holds the safety check as retained, so no local refresh can drop it.
     readiness: Mutex<ReadinessReport>,
     resumes: AtomicUsize,
     resumed: tokio::sync::watch::Sender<bool>,
@@ -443,6 +450,7 @@ pub enum ConnectionEnd {
 /// A caller that must persist what the handshake returned (an enrollment mints a
 /// `node_secret` exactly once) does its own `register`/`registered` exchange and calls
 /// [`serve_registered`]; production does.
+#[cfg(test)]
 pub async fn serve_connection<S, R, F>(
     sink: &mut S,
     stream: &mut R,
