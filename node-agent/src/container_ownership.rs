@@ -8,6 +8,12 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 pub(crate) const LABEL: &str = "io.quasar.agent-owner";
+/// Name prefix of every host-probe container (#258). Alongside the session
+/// (`quasar-sess-`) and audio (`quasar-pulse-`) prefixes, it is one of the
+/// three owned prefixes: the runtime refuses a probe request outside it, and
+/// the boot legacy sweep never removes a container carrying it, because probe
+/// teardown belongs to the durable helper journal.
+pub(crate) const PROBE_NAME_PREFIX: &str = "quasar-probe-";
 static OWNER: OnceLock<Result<Owner, String>> = OnceLock::new();
 
 struct Owner {

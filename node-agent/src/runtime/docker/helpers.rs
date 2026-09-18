@@ -957,6 +957,7 @@ async fn create_or_adopt_inner(
         )?,
         run,
         nvidia_gpu,
+        gpu_probe: None,
         profile: if is_audio {
             HelperProfile::Audio
         } else if is_nvidia_gpu {
@@ -1247,6 +1248,22 @@ async fn run_inner(
     };
     journal.write(&intent)?;
     Ok(verified)
+}
+
+pub(crate) async fn run_gpu_probe(
+    config: &RuntimeConfig,
+    helper: DiagnosticHelper,
+    run: crate::runtime::GpuProbeRun,
+) -> Result<OwnedHelperId, RuntimeError> {
+    // #258: implemented by the GPU probe profile.
+    let _ = (config, helper, run);
+    Err(ErrorKind::Unavailable.into())
+}
+
+pub(crate) async fn retire_gpu_probes(config: &RuntimeConfig) -> Result<(), RuntimeError> {
+    // #258: implemented by the GPU probe profile.
+    let _ = config;
+    Err(ErrorKind::Unavailable.into())
 }
 
 pub(crate) async fn run_audio(

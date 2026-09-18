@@ -397,3 +397,97 @@ fn real_docker_classic_build_context_args_failure_and_verification() {
     assert!(!runtime.image_present(&reference).wait().unwrap());
     eprintln!("classic build acceptance passed: engine={engine:?}");
 }
+
+/// The groups a session's application container is given for the daemon host's
+/// DRM nodes, by the same rule the launcher applies (`dri_group_granted`).
+fn local_dri_groups() -> Vec<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let mut groups: Vec<u32> = std::fs::read_dir("/dev/dri")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("renderD") || name.starts_with("card")
+        })
+        .filter_map(|entry| std::fs::metadata(entry.path()).ok())
+        .filter(|md| crate::session::container::dri_group_granted(md.mode(), md.gid()))
+        .map(|md| md.gid())
+        .collect();
+    groups.sort_unstable();
+    groups.dedup();
+    groups
+}
+
+#[test]
+#[ignore = "requires explicit local test Docker socket, QUASAR_TEST_APPLICATION_IMAGE and /dev/dri on the daemon host; creates and removes one unique owned probe container"]
+fn real_docker_gpu_probe_profile_runs_with_dri_access_and_cleans_up() {
+    use crate::runtime::{DiagnosticHelper, GpuProbeRun};
+    let socket =
+        std::env::var("QUASAR_TEST_RUNTIME_SOCKET").expect("set explicit local test socket");
+    let image =
+        std::env::var("QUASAR_TEST_APPLICATION_IMAGE").expect("set explicit local test image");
+    assert!(
+        std::path::Path::new("/dev/dri").is_dir(),
+        "the daemon host must expose /dev/dri for the DRI arm of the profile"
+    );
+    let groups = local_dri_groups();
+    let unique = format!("gpu-probe-smoke-{}", crate::runtime::builds::build_id());
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = RuntimeConfig::unix(socket);
+    config.image_state_path = Some(dir.path().join("operations"));
+    config.diagnostic_owner = Some(format!("runtime-smoke-{unique}"));
+    config.deadline = Duration::from_secs(20);
+    let executor = tokio::runtime::Runtime::new().unwrap();
+    let (docker, _) = executor.block_on(discover(&config)).unwrap();
+    let runtime = RuntimeClient::new(config).unwrap();
+    let helper = DiagnosticHelper {
+        operation: unique.clone(),
+        name: format!("{}{unique}", crate::container_ownership::PROBE_NAME_PREFIX),
+        image,
+    };
+    let run = GpuProbeRun {
+        entrypoint: vec!["timeout".into()],
+        command: vec![
+            "20s".into(),
+            "sh".into(),
+            "-c".into(),
+            "ls /dev/dri >/dev/null && id -G && exit 23".into(),
+        ],
+        devices: vec!["/dev/dri".into()],
+        groups: groups.clone(),
+        nvidia: None,
+    };
+    let id = runtime.run_gpu_probe(helper, run).wait().unwrap();
+    let container = id.as_str().to_owned();
+    let result = runtime.observe_gpu_probe(id.clone()).wait();
+    let cleanup = runtime.cleanup_gpu_probe(id).wait();
+    // Whatever happened above, never leave the fixture behind.
+    let gone = executor.block_on(async {
+        let _ = docker
+            .remove_container(
+                &container,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        docker.inspect_container(&container, None).await.is_err()
+    });
+    let result = result.unwrap();
+    assert_eq!(result.exit_code, Some(23), "stderr: {}", result.stderr);
+    for gid in groups {
+        assert!(
+            result
+                .stdout
+                .split_whitespace()
+                .any(|v| v == gid.to_string()),
+            "the probe runs with group {gid}: {}",
+            result.stdout
+        );
+    }
+    cleanup.unwrap();
+    assert!(gone, "the owned probe container was removed");
+}

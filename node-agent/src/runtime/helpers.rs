@@ -80,11 +80,48 @@ pub enum NvidiaDriverMount {
     NamedVolume { name: String, target: String },
 }
 
-/// Fixed NVIDIA GPU/EGL diagnostic.  This is intentionally narrower than an
-/// application container: no caller-controlled device list, security options,
-/// or arbitrary environment crosses the runtime boundary.
+/// NVIDIA driver access for a GPU probe: Docker's all-NVIDIA-GPUs device
+/// request, the read-only driver mount and the loader environment. This is
+/// exactly what the NVIDIA GPU diagnostic realized before it was widened into
+/// the GPU probe profile (#258); the realized create body is byte-for-byte the
+/// same.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct NvidiaGpuRun {
+pub struct NvidiaDriverAccess {
+    pub driver_mount: NvidiaDriverMount,
+    pub image_ld_library_path: String,
+    pub has_gbm_backend: bool,
+}
+
+/// The one closed GPU probe profile, for every vendor (#258, spec #252 "Host
+/// probes"). A probe container is given what a session's application
+/// container is given for GPU access, and nothing else: the DRM nodes and the
+/// groups owning them (AMD, Intel, and NVIDIA's render node), plus the NVIDIA
+/// device request and driver volume when the host has one. No network, a
+/// read-only root, no capabilities, no other mounts, and no caller-controlled
+/// environment. The container name carries
+/// [`crate::container_ownership::PROBE_NAME_PREFIX`].
+///
+/// An unsupported requirement — a device outside `/dev/dri`, group 0, a probe
+/// with no GPU access at all — is refused before any engine request. Nothing
+/// is ever weakened to make a request fit.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GpuProbeRun {
+    pub entrypoint: Vec<String>,
+    pub command: Vec<String>,
+    /// `/dev/dri` itself or device nodes directly beneath it, realized as
+    /// `rwm` device mappings at the same path.
+    pub devices: Vec<String>,
+    /// Numeric supplementary groups owning those nodes: never 0, sorted, no
+    /// duplicates, so one request has one fingerprint.
+    pub groups: Vec<u32>,
+    /// `None` on a host without NVIDIA driver access.
+    pub nvidia: Option<NvidiaDriverAccess>,
+}
+
+/// The NVIDIA GPU/EGL diagnostic as recorded by agents before #258. Journals of
+/// this shape are still loaded and recovered; nothing writes one any more.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct NvidiaGpuRun {
     pub entrypoint: Vec<String>,
     pub command: Vec<String>,
     pub driver_mount: NvidiaDriverMount,
@@ -107,8 +144,10 @@ pub struct AudioRun {
 pub(crate) enum HelperProfile {
     #[default]
     Diagnostic,
+    /// Pre-#258 journals only; see [`NvidiaGpuRun`].
     NvidiaGpu,
     Audio,
+    GpuProbe,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -149,6 +188,9 @@ pub(crate) struct HelperIntent {
     pub run: Option<DiagnosticRun>,
     #[serde(default)]
     pub nvidia_gpu: Option<NvidiaGpuRun>,
+    /// Absent in every journal written before #258; part of the fingerprint.
+    #[serde(default)]
+    pub gpu_probe: Option<GpuProbeRun>,
     /// Kept separate from `run` so journals written by the diagnostic-only
     /// implementation continue to decode as the diagnostic profile.
     #[serde(default)]

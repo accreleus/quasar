@@ -1,6 +1,6 @@
 //! Behavioral engine fixtures at the public RuntimeClient boundary.
 use super::*;
-use crate::runtime::helpers::HelperPhase;
+use crate::runtime::helpers::{HelperPhase, HelperProfile};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -4574,4 +4574,749 @@ fn routine_recovery_finishes_later_obligations_past_an_unreadable_journal() {
         Some(23)
     );
     assert!(!socket_dir.exists());
+}
+
+// ---------------------------------------------------------------------------
+// #258: the closed GPU probe profile. One profile for every vendor — DRM nodes
+// and their owning groups for AMD/Intel, the all-GPUs device request plus the
+// driver volume for NVIDIA — journaled, owned and recovered like every helper.
+// The NVIDIA arm must realize byte-for-byte what the NVIDIA GPU diagnostic
+// realized before it was widened into this profile.
+
+fn nvidia_access() -> NvidiaDriverAccess {
+    NvidiaDriverAccess {
+        driver_mount: NvidiaDriverMount::NamedVolume {
+            name: "quasar-driver-fixture".into(),
+            target: "/opt/quasar/nvidia-driver".into(),
+        },
+        image_ld_library_path: "/image/lib".into(),
+        has_gbm_backend: true,
+    }
+}
+
+fn gpu_probe_helper(operation: &str) -> DiagnosticHelper {
+    DiagnosticHelper {
+        operation: operation.into(),
+        name: format!("{}{operation}", crate::container_ownership::PROBE_NAME_PREFIX),
+        image: "quasar-agent:test".into(),
+    }
+}
+
+/// The NVIDIA arm, under the operation the pre-#258 NVIDIA fixture used so the
+/// realized labels are comparable byte-for-byte.
+fn nvidia_probe_request() -> (DiagnosticHelper, GpuProbeRun) {
+    (
+        gpu_probe_helper("nvidia-fixture"),
+        GpuProbeRun {
+            entrypoint: vec!["/usr/bin/timeout".into()],
+            command: vec!["5s".into(), "/bin/sh".into(), "-c".into(), "exit 23".into()],
+            devices: Vec::new(),
+            groups: Vec::new(),
+            nvidia: Some(nvidia_access()),
+        },
+    )
+}
+
+/// The AMD/Intel arm: the DRM directory and the groups owning its nodes, as a
+/// session's application container is given them.
+fn dri_probe_request(operation: &str) -> (DiagnosticHelper, GpuProbeRun) {
+    (
+        gpu_probe_helper(operation),
+        GpuProbeRun {
+            entrypoint: vec!["/usr/bin/timeout".into()],
+            command: vec!["5s".into(), "/bin/sh".into(), "-c".into(), "exit 23".into()],
+            devices: vec!["/dev/dri".into()],
+            groups: vec![44, 991],
+            nvidia: None,
+        },
+    )
+}
+
+#[test]
+fn gpu_probe_nvidia_access_realizes_the_previous_nvidia_profile_byte_for_byte() {
+    let engine = Engine::new();
+    let client = engine.client();
+    let (helper, run) = nvidia_probe_request();
+    let id = client.run_gpu_probe(helper, run).wait().unwrap();
+    let body = engine.state.lock().unwrap().body.clone().unwrap();
+    // Captured from `nvidia_gpu_helper_requires_the_owned_all_gpu_driver_volume_profile`
+    // on the commit before this profile existed (b373c2f). Not derived from the
+    // code under test: any drift here is a change to what NVIDIA hosts run.
+    let before: Value = serde_json::from_str(r#"{"Cmd":["5s","/bin/sh","-c","exit 23"],"Entrypoint":["/usr/bin/timeout"],"Env":["LD_LIBRARY_PATH=/opt/quasar/nvidia-driver/lib64:/image/lib","__EGL_VENDOR_LIBRARY_DIRS=/opt/quasar/nvidia-driver/glvnd/egl_vendor.d:/etc/glvnd/egl_vendor.d:/usr/share/glvnd/egl_vendor.d","__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS=/opt/quasar/nvidia-driver/egl_external_platform.d:/usr/share/egl/egl_external_platform.d","VK_ADD_DRIVER_FILES=/opt/quasar/nvidia-driver/vulkan/icd.d/nvidia_icd.json","GBM_BACKENDS_PATH=/opt/quasar/nvidia-driver/gbm"],"HostConfig":{"AutoRemove":false,"CapDrop":["ALL"],"DeviceRequests":[{"Capabilities":[["gpu"]],"Count":-1,"Driver":"nvidia"}],"Devices":[],"Mounts":[{"ReadOnly":true,"Source":"quasar-driver-fixture","Target":"/opt/quasar/nvidia-driver","Type":"volume"}],"NetworkMode":"none","Privileged":false,"ReadonlyRootfs":true,"SecurityOpt":["no-new-privileges"]},"Image":"quasar-agent:test","Labels":{"io.quasar.agent-owner":"fixture-owner","io.quasar.runtime-operation":"nvidia-fixture"},"User":"0:0"}"#).unwrap();
+    assert_eq!(body, before);
+    assert_eq!(
+        client.observe_gpu_probe(id.clone()).wait().unwrap().exit_code,
+        Some(23)
+    );
+    client.cleanup_gpu_probe(id).wait().unwrap();
+    assert!(engine.state.lock().unwrap().body.is_none());
+}
+
+#[test]
+fn gpu_probe_dri_access_realizes_devices_and_groups_without_network_or_privilege() {
+    let engine = Engine::new();
+    let client = engine.client();
+    let (helper, run) = dri_probe_request("dri-fixture");
+    let id = client.run_gpu_probe(helper, run).wait().unwrap();
+    let body = engine.state.lock().unwrap().body.clone().unwrap();
+    assert_eq!(
+        body["HostConfig"]["Devices"],
+        json!([{"PathOnHost":"/dev/dri","PathInContainer":"/dev/dri","CgroupPermissions":"rwm"}])
+    );
+    assert_eq!(body["HostConfig"]["GroupAdd"], json!(["44", "991"]));
+    assert!(body["HostConfig"]["DeviceRequests"]
+        .as_array()
+        .is_none_or(Vec::is_empty));
+    assert!(body["HostConfig"]["Mounts"]
+        .as_array()
+        .is_none_or(Vec::is_empty));
+    assert!(body["Env"].as_array().is_none_or(Vec::is_empty));
+    assert_eq!(body["HostConfig"]["NetworkMode"], json!("none"));
+    assert_eq!(body["HostConfig"]["ReadonlyRootfs"], json!(true));
+    assert_eq!(body["HostConfig"]["Privileged"], json!(false));
+    assert_eq!(body["HostConfig"]["AutoRemove"], json!(false));
+    assert_eq!(body["HostConfig"]["CapDrop"], json!(["ALL"]));
+    assert_eq!(
+        body["HostConfig"]["SecurityOpt"],
+        json!(["no-new-privileges"])
+    );
+    assert_eq!(body["User"], json!("0:0"));
+    assert_eq!(body["Entrypoint"], json!(["/usr/bin/timeout"]));
+    assert_eq!(body["Cmd"], json!(["5s", "/bin/sh", "-c", "exit 23"]));
+    assert_eq!(
+        body["Labels"],
+        json!({"io.quasar.agent-owner":"fixture-owner","io.quasar.runtime-operation":"dri-fixture"})
+    );
+    let result = client.observe_gpu_probe(id.clone()).wait().unwrap();
+    assert_eq!(result.exit_code, Some(23));
+    assert_eq!(result.stdout, "final stdout");
+    client.cleanup_gpu_probe(id).wait().unwrap();
+    assert!(engine.state.lock().unwrap().body.is_none());
+}
+
+#[test]
+fn gpu_probe_refuses_unsupported_requirements_before_any_engine_request() {
+    let cases: Vec<(&str, Box<dyn Fn(&mut DiagnosticHelper, &mut GpuProbeRun)>)> = vec![
+        ("device outside /dev/dri", Box::new(|_, run| run.devices = vec!["/dev/kfd".into()])),
+        (
+            "device escaping /dev/dri",
+            Box::new(|_, run| run.devices = vec!["/dev/dri/../sda".into()]),
+        ),
+        (
+            "device with a NUL byte",
+            Box::new(|_, run| run.devices = vec!["/dev/dri/card\0".into()]),
+        ),
+        ("root group", Box::new(|_, run| run.groups = vec![0])),
+        ("unsorted groups", Box::new(|_, run| run.groups = vec![991, 44])),
+        ("duplicate groups", Box::new(|_, run| run.groups = vec![44, 44])),
+        (
+            "no GPU access at all",
+            Box::new(|_, run| {
+                run.devices.clear();
+                run.groups.clear();
+                run.nvidia = None;
+            }),
+        ),
+        ("empty entrypoint", Box::new(|_, run| run.entrypoint.clear())),
+        (
+            "name outside the probe prefix",
+            Box::new(|helper, _| helper.name = "quasar-diagnostic-dri".into()),
+        ),
+        (
+            "session name prefix",
+            Box::new(|helper, _| helper.name = "quasar-sess-dri".into()),
+        ),
+        (
+            "driver volume with a path separator",
+            Box::new(|_, run| {
+                run.nvidia = Some(NvidiaDriverAccess {
+                    driver_mount: NvidiaDriverMount::NamedVolume {
+                        name: "../etc".into(),
+                        target: "/opt/quasar/nvidia-driver".into(),
+                    },
+                    ..nvidia_access()
+                })
+            }),
+        ),
+    ];
+    for (label, change) in cases {
+        let engine = Engine::new();
+        let (mut helper, mut run) = dri_probe_request("dri-invalid");
+        change(&mut helper, &mut run);
+        assert_eq!(
+            engine.client().run_gpu_probe(helper, run).wait().unwrap_err().kind,
+            ErrorKind::InvalidConfiguration,
+            "{label}"
+        );
+        assert_eq!(engine.requests(""), 0, "{label}: no engine request at all");
+        assert!(
+            std::fs::read_dir(engine.config.image_state_path.as_ref().unwrap().join("helpers"))
+                .map(|entries| entries.count() == 0)
+                .unwrap_or(true),
+            "{label}: no journal is written for a refused request"
+        );
+    }
+}
+
+#[test]
+fn gpu_probe_refuses_weakened_device_group_or_driver_realization_before_start() {
+    let cases: Vec<(&str, Box<dyn Fn(&mut State)>)> = vec![
+        ("devices dropped", Box::new(|s| s.host_devices_override = Some(json!([])))),
+        (
+            "device permissions narrowed",
+            Box::new(|s| {
+                s.host_devices_override = Some(json!([{"PathOnHost":"/dev/dri","PathInContainer":"/dev/dri","CgroupPermissions":"r"}]))
+            }),
+        ),
+        (
+            "device remapped",
+            Box::new(|s| {
+                s.host_devices_override = Some(json!([{"PathOnHost":"/dev/dri","PathInContainer":"/dev/gpu","CgroupPermissions":"rwm"}]))
+            }),
+        ),
+        ("groups dropped", Box::new(|s| s.host_group_add_override = Some(json!([])))),
+        (
+            "one group dropped",
+            Box::new(|s| s.host_group_add_override = Some(json!(["44"]))),
+        ),
+        (
+            "a group added",
+            Box::new(|s| s.host_group_add_override = Some(json!(["0", "44", "991"]))),
+        ),
+        (
+            "an unrequested nvidia device request",
+            Box::new(|s| {
+                s.host_device_requests_override =
+                    Some(json!([{"Driver":"nvidia","Count":-1,"Capabilities":[["gpu"]]}]))
+            }),
+        ),
+        (
+            "security weakened",
+            Box::new(|s| s.host_security_opt_override = Some(json!([]))),
+        ),
+    ];
+    for (label, change) in cases {
+        let engine = Engine::new();
+        change(&mut engine.state.lock().unwrap());
+        let (helper, run) = dri_probe_request("dri-weakened");
+        assert_eq!(
+            engine.client().run_gpu_probe(helper, run).wait().unwrap_err().kind,
+            ErrorKind::Protocol,
+            "{label}"
+        );
+        assert_eq!(
+            engine.requests(&format!("POST /containers/{ID}/start")),
+            0,
+            "{label}: never started"
+        );
+        assert!(
+            engine.state.lock().unwrap().body.is_some(),
+            "{label}: the rejected realization stays journaled for explicit recovery"
+        );
+        {
+            let mut s = engine.state.lock().unwrap();
+            s.host_devices_override = None;
+            s.host_group_add_override = None;
+            s.host_device_requests_override = None;
+            s.host_security_opt_override = None;
+        }
+        engine.client().recover_diagnostics().wait().unwrap();
+        assert!(engine.state.lock().unwrap().body.is_none(), "{label}: recovered");
+    }
+    // The NVIDIA arm keeps its own realization guards.
+    for (label, requests) in [
+        ("nvidia device request dropped", json!([])),
+        (
+            "nvidia device request narrowed",
+            json!([{"Driver":"nvidia","Count":1,"Capabilities":[["gpu"]]}]),
+        ),
+    ] {
+        let engine = Engine::new();
+        engine.state.lock().unwrap().host_device_requests_override = Some(requests);
+        let (helper, run) = nvidia_probe_request();
+        assert_eq!(
+            engine.client().run_gpu_probe(helper, run).wait().unwrap_err().kind,
+            ErrorKind::Protocol,
+            "{label}"
+        );
+        assert_eq!(engine.requests(&format!("POST /containers/{ID}/start")), 0);
+    }
+}
+
+#[test]
+fn gpu_probe_observation_timeout_is_not_an_outcome_and_explicit_stop_then_cleanup_follow() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let client = engine.client();
+    let (helper, run) = dri_probe_request("dri-deadline");
+    let id = client.run_gpu_probe(helper, run).wait().unwrap();
+    // The orchestrator's deadline (#259) is what expires here; the runtime
+    // reports a timeout of the OBSERVATION and nothing else changes.
+    assert_eq!(
+        client.observe_gpu_probe(id.clone()).wait().unwrap_err().kind,
+        ErrorKind::Timeout
+    );
+    assert!(engine.state.lock().unwrap().running);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 0);
+    assert_eq!(engine.requests("DELETE /containers/"), 0);
+    let intent = helper_intent(&engine, "dri-deadline");
+    assert!(intent.result.is_none(), "a timeout is never recorded as a result");
+    assert_eq!(intent.phase, HelperPhase::Running);
+    // Past the deadline the orchestrator issues the explicit stop, then cleanup.
+    client.stop_gpu_probe(id.clone()).wait().unwrap();
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 1);
+    assert!(!engine.state.lock().unwrap().running);
+    assert_eq!(
+        client.observe_gpu_probe(id.clone()).wait().unwrap().exit_code,
+        Some(23)
+    );
+    client.cleanup_gpu_probe(id).wait().unwrap();
+    assert_eq!(engine.requests("DELETE /containers/"), 1);
+    assert!(engine.state.lock().unwrap().body.is_none());
+    assert_eq!(
+        helper_intent(&engine, "dri-deadline").phase,
+        HelperPhase::Completed
+    );
+}
+
+#[test]
+fn gpu_probe_dropped_observation_stops_and_removes_nothing() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let client = engine.client();
+    let (helper, run) = dri_probe_request("dri-dropped");
+    let id = client.run_gpu_probe(helper, run).wait().unwrap();
+    let observer = client.observe_gpu_probe(id.clone());
+    thread::sleep(Duration::from_millis(100));
+    observer.cancel();
+    drop(observer);
+    thread::sleep(Duration::from_millis(100));
+    assert!(engine.state.lock().unwrap().running);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 0);
+    assert_eq!(engine.requests("DELETE /containers/"), 0);
+    assert_eq!(
+        helper_intent(&engine, "dri-dropped").phase,
+        HelperPhase::Running
+    );
+    // Only the explicit operations end it.
+    client.stop_gpu_probe(id.clone()).wait().unwrap();
+    client.cleanup_gpu_probe(id).wait().unwrap();
+    assert!(engine.state.lock().unwrap().body.is_none());
+}
+
+#[test]
+fn gpu_probe_lost_create_reply_is_reconciled_under_the_same_operation() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().lose_create = true;
+    let client = engine.client();
+    let (helper, run) = dri_probe_request("dri-lost-create");
+    assert_eq!(
+        client
+            .run_gpu_probe(helper.clone(), run.clone())
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    let id = client.run_gpu_probe(helper, run).wait().unwrap();
+    assert_eq!(
+        client.observe_gpu_probe(id.clone()).wait().unwrap().exit_code,
+        Some(23)
+    );
+    client.cleanup_gpu_probe(id).wait().unwrap();
+    assert_eq!(engine.requests("POST /containers/create"), 1);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/start")), 1);
+}
+
+#[test]
+fn gpu_probe_lost_start_reply_is_reconciled_without_a_second_start() {
+    let engine = Engine::new();
+    {
+        let mut s = engine.state.lock().unwrap();
+        s.lose_start = true;
+        s.keep_running = true;
+    }
+    let client = engine.client();
+    let (helper, run) = dri_probe_request("dri-lost-start");
+    assert_eq!(
+        client
+            .run_gpu_probe(helper.clone(), run.clone())
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownOutcome
+    );
+    engine.finish();
+    let id = client.run_gpu_probe(helper, run).wait().unwrap();
+    assert_eq!(
+        client.observe_gpu_probe(id.clone()).wait().unwrap().exit_code,
+        Some(23)
+    );
+    client.cleanup_gpu_probe(id).wait().unwrap();
+    assert_eq!(engine.requests("POST /containers/create"), 1);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/start")), 1);
+}
+
+#[test]
+fn gpu_probe_lost_stop_reply_is_reconciled_without_a_second_stop() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let client = engine.client();
+    let (helper, run) = dri_probe_request("dri-lost-stop");
+    let id = client.run_gpu_probe(helper, run).wait().unwrap();
+    engine.state.lock().unwrap().lose_stop = true;
+    assert_eq!(
+        client.stop_gpu_probe(id.clone()).wait().unwrap_err().kind,
+        ErrorKind::UnknownOutcome
+    );
+    assert_eq!(
+        helper_intent(&engine, "dri-lost-stop").phase,
+        HelperPhase::Stopping,
+        "the termination request is durable"
+    );
+    client.stop_gpu_probe(id.clone()).wait().unwrap();
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 1);
+    assert_eq!(
+        client.observe_gpu_probe(id.clone()).wait().unwrap().exit_code,
+        Some(23)
+    );
+    client.cleanup_gpu_probe(id).wait().unwrap();
+    assert!(engine.state.lock().unwrap().body.is_none());
+}
+
+#[test]
+fn gpu_probe_lost_remove_reply_is_reconciled_by_absence_of_the_same_id_and_keeps_evidence() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().lose_remove = true;
+    let client = engine.client();
+    let (helper, run) = dri_probe_request("dri-lost-remove");
+    let id = client.run_gpu_probe(helper, run).wait().unwrap();
+    assert_eq!(
+        client.observe_gpu_probe(id.clone()).wait().unwrap().exit_code,
+        Some(23)
+    );
+    assert_eq!(
+        client.cleanup_gpu_probe(id.clone()).wait().unwrap_err().kind,
+        ErrorKind::UnknownOutcome
+    );
+    let intent = helper_intent(&engine, "dri-lost-remove");
+    assert_eq!(intent.phase, HelperPhase::CleanupPending);
+    assert_eq!(intent.result.as_ref().unwrap().exit_code, Some(23));
+    client.cleanup_gpu_probe(id.clone()).wait().unwrap();
+    assert_eq!(engine.requests("DELETE /containers/"), 1);
+    assert_eq!(
+        helper_intent(&engine, "dri-lost-remove").phase,
+        HelperPhase::Completed
+    );
+    let replay = client.observe_gpu_probe(id).wait().unwrap();
+    assert_eq!(replay.exit_code, Some(23));
+    assert_eq!(replay.stderr, "final stderr");
+}
+
+#[test]
+fn gpu_probe_journal_recovers_an_interrupted_stop_after_a_simulated_restart() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let client = engine.client();
+    let (helper, run) = dri_probe_request("dri-restart");
+    let id = client.run_gpu_probe(helper, run).wait().unwrap();
+    engine.state.lock().unwrap().lose_stop_before_effect = true;
+    assert_eq!(
+        client.stop_gpu_probe(id.clone()).wait().unwrap_err().kind,
+        ErrorKind::UnknownOutcome
+    );
+    assert!(engine.state.lock().unwrap().running);
+    drop(client);
+    let restarted = engine.client();
+    restarted.recover_diagnostics().wait().unwrap();
+    assert_eq!(engine.requests("POST /containers/create"), 1);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 2);
+    assert_eq!(engine.requests("DELETE /containers/"), 1);
+    assert!(engine.state.lock().unwrap().body.is_none());
+    assert_eq!(
+        helper_intent(&engine, "dri-restart").phase,
+        HelperPhase::Completed
+    );
+    assert_eq!(
+        restarted.observe_gpu_probe(id).wait().unwrap().exit_code,
+        Some(23)
+    );
+}
+
+#[test]
+fn boot_retirement_finishes_a_running_probe_whose_orchestrator_died_but_routine_recovery_does_not() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let client = engine.client();
+    let (helper, run) = dri_probe_request("dri-orphan");
+    let id = client.run_gpu_probe(helper, run).wait().unwrap();
+    drop(client);
+    // Routine recovery never terminates work nobody asked to stop.
+    let restarted = engine.client();
+    assert!(restarted.recover_diagnostics().wait().is_err());
+    assert!(engine.state.lock().unwrap().running);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 0);
+    // Boot retirement does: the deadline's owner is gone with the process.
+    restarted.retire_gpu_probes().wait().unwrap();
+    assert!(!engine.state.lock().unwrap().running);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 1);
+    assert_eq!(engine.requests("DELETE /containers/"), 1);
+    assert!(engine.state.lock().unwrap().body.is_none());
+    assert_eq!(
+        helper_intent(&engine, "dri-orphan").phase,
+        HelperPhase::Completed
+    );
+    assert_eq!(
+        restarted.observe_gpu_probe(id).wait().unwrap().exit_code,
+        Some(23)
+    );
+    // Probe retirement leaves a live audio sidecar and a running generic
+    // diagnostic alone: they are not its kind.
+    let other = Engine::new();
+    other.state.lock().unwrap().keep_running = true;
+    let observer = other.client();
+    let (helper, run) = request();
+    let diagnostic = observer.run_diagnostic(helper, run).wait().unwrap();
+    observer.retire_gpu_probes().wait().unwrap();
+    assert!(other.state.lock().unwrap().running);
+    assert_eq!(other.requests(&format!("POST /containers/{ID}/stop")), 0);
+    other.finish();
+    observer.cleanup_diagnostic(diagnostic).wait().unwrap();
+}
+
+#[test]
+fn older_nvidia_gpu_journals_still_load_and_recover() {
+    let engine = Engine::new();
+    let client = engine.client();
+    let (helper, run) = nvidia_probe_request();
+    let id = client.run_gpu_probe(helper.clone(), run.clone()).wait().unwrap();
+    // Rewrite the record to the shape the pre-#258 agent wrote: profile
+    // `NvidiaGpu`, the request under `nvidia_gpu`, no `gpu_probe` field at all,
+    // and the three-tuple fingerprint of that implementation.
+    let legacy_run = NvidiaGpuRun {
+        entrypoint: run.entrypoint.clone(),
+        command: run.command.clone(),
+        driver_mount: nvidia_access().driver_mount,
+        image_ld_library_path: nvidia_access().image_ld_library_path,
+        has_gbm_backend: true,
+    };
+    let legacy_fingerprint = Sha256::digest(
+        serde_json::to_vec(&(&helper, None::<&DiagnosticRun>, Some(&legacy_run))).unwrap(),
+    )
+    .iter()
+    .map(|b| format!("{b:02x}"))
+    .collect::<String>();
+    let path = helper_intent_path(&engine, "nvidia-fixture");
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let object = record.as_object_mut().unwrap();
+    object.remove("gpu_probe");
+    object.insert("profile".into(), json!("NvidiaGpu"));
+    object.insert("nvidia_gpu".into(), serde_json::to_value(&legacy_run).unwrap());
+    object.insert("request_fingerprint".into(), json!(legacy_fingerprint));
+    object.insert("phase".into(), json!("Stopped"));
+    object.insert("result".into(), Value::Null);
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let loaded = helper_intent(&engine, "nvidia-fixture");
+    assert_eq!(loaded.profile, HelperProfile::NvidiaGpu);
+    assert!(loaded.gpu_probe.is_none(), "the new field defaults when absent");
+    assert_eq!(loaded.nvidia_gpu, Some(legacy_run));
+    // The same request under the new profile is a DIFFERENT request: the old
+    // record is never adopted by it, and no second container is created.
+    assert_eq!(
+        client.run_gpu_probe(helper, run).wait().unwrap_err().kind,
+        ErrorKind::UnknownOutcome
+    );
+    assert_eq!(engine.requests("POST /containers/create"), 1);
+    // Recovery finishes the old record under its own identity.
+    client.recover_diagnostics().wait().unwrap();
+    assert_eq!(engine.requests("DELETE /containers/"), 1);
+    assert!(engine.state.lock().unwrap().body.is_none());
+    assert_eq!(
+        helper_intent(&engine, "nvidia-fixture").phase,
+        HelperPhase::Completed
+    );
+    assert_eq!(
+        client.observe_gpu_probe(id).wait().unwrap().exit_code,
+        Some(23)
+    );
+}
+
+#[test]
+fn gpu_probe_fingerprint_covers_devices_groups_and_driver_access() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let client = engine.client();
+    let (helper, run) = dri_probe_request("dri-fingerprint");
+    let id = client.run_gpu_probe(helper.clone(), run.clone()).wait().unwrap();
+    let changes: Vec<Box<dyn Fn(&mut GpuProbeRun)>> = vec![
+        Box::new(|run| run.groups = vec![44]),
+        Box::new(|run| run.devices = vec!["/dev/dri/renderD128".into()]),
+        Box::new(|run| run.nvidia = Some(nvidia_access())),
+        Box::new(|run| run.command.push("changed".into())),
+    ];
+    for change in changes {
+        let mut changed = run.clone();
+        change(&mut changed);
+        assert_eq!(
+            client
+                .run_gpu_probe(helper.clone(), changed)
+                .wait()
+                .unwrap_err()
+                .kind,
+            ErrorKind::UnknownOutcome
+        );
+    }
+    // The identical request replays the recorded operation.
+    assert_eq!(client.run_gpu_probe(helper, run).wait().unwrap(), id);
+    assert_eq!(engine.requests("POST /containers/create"), 1);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/start")), 1);
+    engine.finish();
+    client.cleanup_gpu_probe(id).wait().unwrap();
+}
+
+#[test]
+fn gpu_probe_without_verified_ownership_is_refused() {
+    // A foreign container already holds the name: read, never mutated, no create.
+    let collision = Engine::new();
+    {
+        let mut s = collision.state.lock().unwrap();
+        s.body = Some(json!({"HostConfig":{},"Env":[]}));
+        s.name = format!("{}dri-foreign", crate::container_ownership::PROBE_NAME_PREFIX);
+    }
+    let (helper, run) = dri_probe_request("dri-foreign");
+    assert_eq!(
+        collision.client().run_gpu_probe(helper, run).wait().unwrap_err().kind,
+        ErrorKind::UnknownOutcome
+    );
+    assert_eq!(collision.requests("POST /containers/create"), 0);
+    assert_eq!(collision.requests("POST /containers/"), 0);
+    assert_eq!(collision.requests("DELETE /containers/"), 0);
+
+    // The recorded ID now resolves to another container: no stop, no remove.
+    let replaced = Engine::new();
+    replaced.state.lock().unwrap().keep_running = true;
+    let client = replaced.client();
+    let (helper, run) = dri_probe_request("dri-replaced");
+    let id = client.run_gpu_probe(helper, run).wait().unwrap();
+    replaced.state.lock().unwrap().replace_id = true;
+    assert_eq!(
+        client.stop_gpu_probe(id.clone()).wait().unwrap_err().kind,
+        ErrorKind::UnknownOutcome
+    );
+    assert_eq!(
+        client.cleanup_gpu_probe(id.clone()).wait().unwrap_err().kind,
+        ErrorKind::UnknownOutcome
+    );
+    assert_eq!(replaced.requests(&format!("POST /containers/{ID}/stop")), 0);
+    assert_eq!(replaced.requests("DELETE /containers/"), 0);
+
+    // Another owner reading the same journals cannot act on them either.
+    let mut foreign = replaced.config.clone();
+    foreign.diagnostic_owner = Some("another-agent".into());
+    let other = RuntimeClient::new(foreign).unwrap();
+    assert_eq!(
+        other.stop_gpu_probe(id.clone()).wait().unwrap_err().kind,
+        ErrorKind::UnknownOutcome
+    );
+    assert_eq!(
+        other.cleanup_gpu_probe(id.clone()).wait().unwrap_err().kind,
+        ErrorKind::UnknownOutcome
+    );
+    assert!(other.retire_gpu_probes().wait().is_err());
+    assert_eq!(replaced.requests(&format!("POST /containers/{ID}/stop")), 0);
+    assert_eq!(replaced.requests("DELETE /containers/"), 0);
+    assert!(replaced.state.lock().unwrap().running);
+    replaced.state.lock().unwrap().replace_id = false;
+    client.stop_gpu_probe(id.clone()).wait().unwrap();
+    client.cleanup_gpu_probe(id).wait().unwrap();
+}
+
+#[test]
+fn no_second_gpu_probe_starts_while_an_earlier_one_is_unreconciled() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let client = engine.client();
+    let (first_helper, first_run) = dri_probe_request("dri-first");
+    let first = client.run_gpu_probe(first_helper, first_run).wait().unwrap();
+    engine.state.lock().unwrap().lose_stop_before_effect = true;
+    assert_eq!(
+        client.stop_gpu_probe(first.clone()).wait().unwrap_err().kind,
+        ErrorKind::UnknownOutcome
+    );
+    // A different probe of the same kind is refused before any create.
+    let (second_helper, second_run) = nvidia_probe_request();
+    assert_eq!(
+        client
+            .run_gpu_probe(second_helper.clone(), second_run.clone())
+            .wait()
+            .unwrap_err()
+            .kind,
+        ErrorKind::Busy
+    );
+    assert_eq!(engine.requests("POST /containers/create"), 1);
+    // The earlier one reconciles under its own identity; then the next may start.
+    client.stop_gpu_probe(first.clone()).wait().unwrap();
+    assert_eq!(
+        client.run_gpu_probe(second_helper.clone(), second_run.clone()).wait().unwrap_err().kind,
+        ErrorKind::Busy,
+        "stopped but not yet removed is still unreconciled"
+    );
+    client.cleanup_gpu_probe(first).wait().unwrap();
+    assert_eq!(engine.requests("POST /containers/create"), 1);
+    engine.state.lock().unwrap().keep_running = false;
+    let second = client.run_gpu_probe(second_helper, second_run).wait().unwrap();
+    assert_eq!(engine.requests("POST /containers/create"), 2);
+    assert_eq!(
+        client.observe_gpu_probe(second.clone()).wait().unwrap().exit_code,
+        Some(23)
+    );
+    client.cleanup_gpu_probe(second).wait().unwrap();
+}
+
+#[test]
+fn gpu_probe_missing_exit_status_reads_as_unknown_never_success() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let client = engine.client();
+    let (helper, run) = dri_probe_request("dri-no-exit");
+    let id = client.run_gpu_probe(helper, run).wait().unwrap();
+    engine.finish();
+    engine.state.lock().unwrap().exit = None;
+    assert_eq!(
+        client.observe_gpu_probe(id.clone()).wait().unwrap_err().kind,
+        ErrorKind::UnknownOutcome
+    );
+    assert_eq!(
+        client.stop_gpu_probe(id.clone()).wait().unwrap_err().kind,
+        ErrorKind::UnknownOutcome
+    );
+    assert_eq!(engine.requests("DELETE /containers/"), 0);
+    client.cleanup_gpu_probe(id.clone()).wait().unwrap();
+    let replay = client.observe_gpu_probe(id).wait().unwrap();
+    assert_eq!(replay.exit_code, None);
+    assert_eq!(replay.stdout, "final stdout");
+}
+
+#[test]
+fn legacy_sweep_preserves_probe_prefixed_containers_even_when_asked_for_the_prefix() {
+    let engine = Engine::new();
+    let mut population = legacy_population();
+    population.push(legacy(
+        '9',
+        &format!("/{}old", crate::container_ownership::PROBE_NAME_PREFIX),
+        owner_label("fixture-owner"),
+    ));
+    engine.state.lock().unwrap().legacy = population;
+    let outcome = engine
+        .client()
+        .retire_legacy_containers(vec![
+            crate::session::container::SESSION_NAME_PREFIX.to_owned(),
+            crate::container_ownership::PROBE_NAME_PREFIX.to_owned(),
+        ])
+        .wait()
+        .unwrap();
+    assert_eq!(outcome.removed, 1);
+    assert_eq!(outcome.preserved, 6);
+    assert_eq!(outcome.unresolved, 0);
+    assert_eq!(deleted_ids(&engine), vec!["a".repeat(64)]);
 }

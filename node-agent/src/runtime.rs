@@ -18,10 +18,10 @@ pub use application::{
 pub use builds::BuildRequest;
 pub use helpers::{
     AudioRun, DiagnosticDevices, DiagnosticHelper, DiagnosticNetwork, DiagnosticRequirements,
-    DiagnosticRun, DiagnosticSecurity, HelperResult, NvidiaDriverMount, NvidiaGpuRun,
-    OwnedHelperId, ReadOnlyHostBind,
+    DiagnosticRun, DiagnosticSecurity, GpuProbeRun, HelperResult, NvidiaDriverAccess,
+    NvidiaDriverMount, OwnedHelperId, ReadOnlyHostBind,
 };
-pub(crate) use helpers::{HelperIntent, HelperJournal};
+pub(crate) use helpers::{HelperIntent, HelperJournal, NvidiaGpuRun};
 mod images;
 pub use images::{ImageInfo, ImageOperation, ImageProgress};
 mod inspection;
@@ -534,6 +534,53 @@ impl RuntimeClient {
         let config = self.config.clone();
         self.submit_owned(
             async move { docker::helpers::run_nvidia_gpu(&config, helper, run).await },
+            self.config.deadline,
+            true,
+        )
+    }
+
+    /// Create and explicitly start one owned GPU probe container (#258): the
+    /// closed profile that gives a probe what a session's application container
+    /// gets for GPU access, for every vendor. Refused before any engine request
+    /// when a requirement is unsupported, when the name is outside the probe
+    /// prefix, or while an earlier probe of this kind is unreconciled (`Busy`).
+    /// Dropping the returned operation detaches its observer; it never stops
+    /// the probe. The orchestrator owns the deadline: past it, `stop_gpu_probe`
+    /// then `cleanup_gpu_probe`.
+    pub fn run_gpu_probe(&self, helper: DiagnosticHelper, run: GpuProbeRun) -> Operation<OwnedHelperId> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::helpers::run_gpu_probe(&config, helper, run).await },
+            self.config.deadline,
+            true,
+        )
+    }
+
+    /// Wait for a probe and collect its final bounded logs. A timeout here is a
+    /// timeout of the observation, never the probe's outcome; cancellation only
+    /// stops observing.
+    pub fn observe_gpu_probe(&self, id: OwnedHelperId) -> Operation<HelperResult> {
+        self.observe_diagnostic(id)
+    }
+
+    /// Explicit, durable termination of one owned probe.
+    pub fn stop_gpu_probe(&self, id: OwnedHelperId) -> Operation<()> {
+        self.stop_diagnostic(id)
+    }
+
+    /// Preserve exit and log evidence, then remove the owned probe container.
+    pub fn cleanup_gpu_probe(&self, id: OwnedHelperId) -> Operation<()> {
+        self.cleanup_diagnostic(id)
+    }
+
+    /// Boot-only: finish every probe a previous agent process left behind,
+    /// stopping one still running — its deadline died with that process — and
+    /// completing tracked cleanup. Routine recovery (`recover_diagnostics`)
+    /// covers probe journals too but never stops unrequested work.
+    pub fn retire_gpu_probes(&self) -> Operation<()> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::helpers::retire_gpu_probes(&config).await },
             self.config.deadline,
             true,
         )
