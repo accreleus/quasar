@@ -53,6 +53,9 @@ pub mod physical_input;
 pub mod pipeline;
 /// `probe-encoder`: what the encode branch negotiates, through the production builders.
 pub mod probe_encoder;
+/// `media-probe`: the media host probe's child half (compositor source + production
+/// encode chain).
+pub mod probe_media;
 /// Adaptive external resolution rung ladder. Mirror of the control plane's
 /// `internal/profile/rungs.go`; advertised to the guest compositor and checked
 /// against `session_display_update.stream_*`.

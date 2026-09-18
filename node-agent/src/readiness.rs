@@ -4969,6 +4969,7 @@ table ip raw {
         }
     }
 
+    mod host_probes;
     mod report;
     mod runtime_checks;
     mod storage_checks;

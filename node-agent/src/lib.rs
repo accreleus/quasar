@@ -26,6 +26,7 @@ pub mod gpu_kmsg;
 /// GPU-vendor detection backing the `QUASAR_ENCODER` auto-default.
 pub mod gpu_vendor;
 pub mod health;
+pub mod host_probe;
 pub mod images;
 pub mod jobs;
 /// Log spans + the WARN/ERROR `token=` convention (`.claude/rules/agent-logging.md`).

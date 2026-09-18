@@ -57,6 +57,21 @@ impl ReadinessReport {
         }
     }
 
+    /// The held retained check for `id`, if any. Local (refreshed) checks are not
+    /// visible here — only what [`Self::retain`] put in.
+    pub fn retained(&self, id: &str) -> Option<&ReadinessCheck> {
+        self.retained
+            .iter()
+            .find(|r| r.check.id == id)
+            .map(|r| &r.check)
+    }
+
+    /// Drops the retained check for `id`, if any. Not a tombstone: a later
+    /// [`Self::retain`] for the same id is accepted regardless of `observed_at`.
+    pub fn forget(&mut self, id: &str) {
+        self.retained.retain(|r| r.check.id != id);
+    }
+
     /// What every capacity message carries: local checks, then retained checks not
     /// shadowed by a local id, then the refresh warning if the last refresh failed.
     /// A shared id shows the retained result, except a local FAIL is never hidden by a

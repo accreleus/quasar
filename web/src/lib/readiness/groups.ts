@@ -23,14 +23,14 @@ export const READINESS_GROUPS: readonly ReadinessGroupDef[] = [
   {
     key: "gpu",
     label: "GPU & display",
-    ids: ["render_node", "host_render_node", "dri_node_app_access", "xid_visibility", "encoder_codecs"],
+    ids: ["media_probe", "render_node", "host_render_node", "dri_node_app_access", "xid_visibility", "encoder_codecs"],
   },
   {
     key: "nvidia",
     label: "NVIDIA driver",
     ids: ["nvidia_egl_vendor_json", "nvidia_eglcore_library", "nvidia_lib32_gl", "driver_volume_version", "nvidia_vulkan_av1_compatibility"],
   },
-  { key: "input", label: "Input & sandbox", ids: ["uinput", "user_namespaces", "app_apparmor_profile"] },
+  { key: "input", label: "Input & sandbox", ids: ["input_probe", "uinput", "user_namespaces", "app_apparmor_profile"] },
   // #253: storage; homes first — the two that can block a launch later.
   { key: "storage", label: "Storage", ids: ["homes_root_writable", "homes_free_space", "template_free_space", "image_free_space"] },
   { key: "network", label: "Network", ids: ["media_reachability"] },
@@ -61,6 +61,11 @@ function rank(status: string): number {
   }
 }
 
+// Per-GPU host-probe ids (<base>_gpu<N>, node-agent/src/host_probe.rs) group under their base id.
+export function baseCheckId(id: string): string {
+  return id.replace(/_gpu\d+$/, "");
+}
+
 export interface ReadinessGroup {
   key: string;
   label: string;
@@ -82,7 +87,7 @@ export function groupChecks(checks: readonly ReadinessCheck[]): GroupedReadiness
 
   const buckets = new Map<string, ReadinessCheck[]>();
   for (const c of applicable) {
-    const g = groupOf.get(c.id) ?? OTHER_GROUP;
+    const g = groupOf.get(c.id) ?? groupOf.get(baseCheckId(c.id)) ?? OTHER_GROUP;
     const list = buckets.get(g.key) ?? [];
     list.push(c);
     buckets.set(g.key, list);
@@ -96,7 +101,9 @@ export function groupChecks(checks: readonly ReadinessCheck[]): GroupedReadiness
     const sorted = [...list].sort((a, b) => {
       const r = rank(a.status) - rank(b.status);
       if (r !== 0) return r;
-      return (order.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (order.get(b.id) ?? Number.MAX_SAFE_INTEGER);
+      const aOrder = order.get(a.id) ?? order.get(baseCheckId(a.id)) ?? Number.MAX_SAFE_INTEGER;
+      const bOrder = order.get(b.id) ?? order.get(baseCheckId(b.id)) ?? Number.MAX_SAFE_INTEGER;
+      return aOrder - bOrder;
     });
     groups.push({ key: g.key, label: g.label, checks: sorted });
   }

@@ -209,6 +209,26 @@ impl WarmupControl {
         Ok(WarmupGuard { control: self })
     }
 
+    /// The gate for a media host probe. No host-quiet precondition: the probe encodes
+    /// in a child process, and the probe scheduler already keeps it off a GPU with a
+    /// live session. No capacity reservation either: a launch pre-empts the probe, so
+    /// reporting one fewer slot could only turn a launch away.
+    pub fn try_acquire_probe(&self) -> Result<WarmupGuard<'_>, GateRefusal> {
+        if self
+            .held
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(GateRefusal::Busy);
+        }
+        // Cleared only once we own the gate, as in `try_acquire`: earlier would swallow
+        // an abort aimed at a still-unwinding holder.
+        self.abort_cause
+            .store(AbortCause::None.as_u8(), Ordering::SeqCst);
+        self.abort.store(false, Ordering::SeqCst);
+        Ok(WarmupGuard { control: self })
+    }
+
     /// A user session launch arrived: whatever warm-up is running must abort.
     /// Idempotent, and safe to call when no warm-up is running (the flag is
     /// cleared when the next one takes the gate).
@@ -387,6 +407,57 @@ mod tests {
             "aborted for a user session launch"
         );
         drop(next);
+    }
+
+    #[test]
+    fn a_media_probe_and_a_warmup_exclude_each_other() {
+        let now = Instant::now();
+        let activity = HostActivity::new();
+        let control = WarmupControl::new();
+
+        let warmup = control.try_acquire(&activity, Duration::ZERO, now).unwrap();
+        assert_eq!(control.try_acquire_probe().unwrap_err(), GateRefusal::Busy);
+        drop(warmup);
+
+        let probe = control.try_acquire_probe().unwrap();
+        assert_eq!(
+            control
+                .try_acquire(&activity, Duration::ZERO, now)
+                .unwrap_err(),
+            GateRefusal::Busy
+        );
+        assert_eq!(control.try_acquire_probe().unwrap_err(), GateRefusal::Busy);
+        drop(probe);
+        assert!(!control.active());
+        assert!(control.try_acquire(&activity, Duration::ZERO, now).is_ok());
+    }
+
+    #[test]
+    fn a_media_probe_never_reports_a_reserved_encode_slot() {
+        let control = WarmupControl::new();
+        let probe = control.try_acquire_probe().unwrap();
+        assert!(control.active());
+        assert!(!control.reserved());
+        drop(probe);
+    }
+
+    #[test]
+    fn a_media_probe_takes_the_gate_while_another_gpu_has_a_session() {
+        let control = WarmupControl::new();
+        let activity = HostActivity::new();
+        activity.set_live(1, Instant::now());
+        assert!(control.try_acquire_probe().is_ok());
+    }
+
+    #[test]
+    fn a_probe_gate_panic_still_releases_it() {
+        let control = WarmupControl::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = control.try_acquire_probe().unwrap();
+            panic!("probe task died");
+        }));
+        assert!(result.is_err());
+        assert!(!control.active());
     }
 
     #[test]

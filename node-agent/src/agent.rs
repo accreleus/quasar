@@ -20,6 +20,7 @@ use tracing::{debug, error, info, warn};
 use crate::capacity;
 use crate::config::Config;
 use crate::health::HealthState;
+use crate::host_probe;
 use crate::images::ImageManager;
 use crate::messages::{
     AgentMsg, AppSpec, Auth, CodecThroughput, ControlMsg, StreamSpec, VideoTopology,
@@ -319,6 +320,14 @@ pub async fn run(cfg: Config) {
     // running them concurrently is safe.
     spawn_cuda_runtime_provisioner(&runtime);
 
+    // The host-probe input "agent image". A new image is a new process, which re-runs
+    // every probe anyway, so the build identity is enough and costs no engine call.
+    let agent_image_identity = format!(
+        "{}@{}",
+        crate::buildinfo::source_commit().unwrap_or(crate::buildinfo::version()),
+        crate::buildinfo::built_at().unwrap_or("unknown"),
+    );
+
     // #128: built ONCE, outside the reconnect loop. Everything a running session
     // needs lives here, so a control-plane restart no longer takes the stream
     // down with it.
@@ -345,6 +354,7 @@ pub async fn run(cfg: Config) {
             &cfg,
             &health,
             &nvidia_lib32_probed,
+            &agent_image_identity,
             &image_mgr,
             &release_mgr,
             &mut sessions,
@@ -356,11 +366,17 @@ pub async fn run(cfg: Config) {
                 // A clean shutdown IS the end of the agent, so nothing is coming
                 // back to reconcile against: stop the sessions rather than leave
                 // their containers behind.
+                if let Some(handle) = &sessions.mgr.probe_handle {
+                    handle.disconnected();
+                }
                 sessions.mgr.stop_all();
                 info!("agent exiting cleanly");
                 return;
             }
             Err(e) => {
+                if let Some(handle) = &sessions.mgr.probe_handle {
+                    handle.disconnected();
+                }
                 health.set_connected(false);
                 // #128: hold the running sessions instead of stopping them. The
                 // media path is agent-to-browser and needs nothing from the
@@ -1073,10 +1089,15 @@ async fn recv_or_disabled_unbounded<T>(rx: &mut Option<mpsc::UnboundedReceiver<T
     }
 }
 
+// One more parameter than the default clippy threshold (#257's `agent_image_identity`,
+// resolved once in `run` and threaded through rather than re-probed here); every
+// argument is a distinct process-lifetime handle, not a bundle worth a struct.
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_run(
     cfg: &Config,
     health: &Arc<HealthState>,
     nvidia_lib32_probed: &str,
+    agent_image_identity: &str,
     image_mgr: &Arc<ImageManager>,
     release_mgr: &Arc<ReleaseManager>,
     sessions: &mut HostSessions,
@@ -1312,6 +1333,11 @@ async fn connect_and_run(
     };
     crate::readiness::log_report(&readiness);
     sessions.mgr.readiness.refreshed(readiness.clone());
+    // A host-probe result produced while disconnected: pure in-memory work, so it is
+    // safe inside the handshake window, unlike everything above it.
+    while let Ok(update) = sessions.probe_updates.try_recv() {
+        crate::host_probe::orchestrator::apply(&mut sessions.mgr.readiness, update);
+    }
     let capacity_msg = AgentMsg::Capacity {
         source_preparation: None,
         host: cap.host,
@@ -1356,6 +1382,7 @@ async fn connect_and_run(
         diagnostic_rx,
         diagnostic_dropped_interval,
         diagnostic_dropped_total,
+        probe_updates,
         registered_this_connection: _,
         grace_timer: _,
     } = sessions;
@@ -1402,6 +1429,13 @@ async fn connect_and_run(
     mgr.warmup_activity = Some(warmup_activity);
     mgr.warmup_control = Some(warmup_control.clone());
     mgr.note_session_count();
+    // #257: outside the registration handshake window (it closed with the capacity
+    // message sent above) and after `warmup_control` is set, so a `Start` the
+    // orchestrator issues right away sees this connection's real gate.
+    mgr.set_probe_context();
+    if let Some(handle) = &mgr.probe_handle {
+        handle.registered(probe_inputs(agent_image_identity, mgr));
+    }
     // The one image-lifecycle duty that stayed agent-side: drop a template whose image
     // was uninstalled. Detached on disconnect (the ImageManager is process-wide); the
     // guard also aborts a warm-up that would otherwise outlive its connection (#489).
@@ -1411,6 +1445,7 @@ async fn connect_and_run(
     // Tracks the reservation across heartbeats so a flip triggers exactly one
     // capacity re-send.
     let mut last_warmup_reserved = false;
+    let mut last_encode_gate_active = false;
     let mut last_source_report: Option<serde_json::Value> = None;
     // Device-lost failures across sessions on this connection: ≥2 within
     // GPU_GLOBAL_WINDOW escalate to a GPU-global drain+restart; one stays per-session.
@@ -1566,6 +1601,16 @@ async fn connect_and_run(
                         if last_warmup_reserved { "taken" } else { "released" }
                     );
                 }
+                // #257: a media probe holds this same gate, so a flip caused by the
+                // probe finishing also fires this; harmless, the scheduler ignores it
+                // when nothing is waiting on it.
+                let encode_gate_active = mgr.warmup_control.as_ref().is_some_and(|c| c.active());
+                if !encode_gate_active && last_encode_gate_active {
+                    if let Some(handle) = &mgr.probe_handle {
+                        handle.encode_gate_freed();
+                    }
+                }
+                last_encode_gate_active = encode_gate_active;
                 let dropped = diagnostic_dropped_interval.swap(0, Ordering::Relaxed);
                 if dropped > 0 {
                     let dropped_total = diagnostic_dropped_total.load(Ordering::Relaxed);
@@ -1616,6 +1661,9 @@ async fn connect_and_run(
                             mgr.vram_targets = cap.vram_targets;
             // Must ride every `vram_targets` reassignment — see `vram_cache`'s doc.
             mgr.vram_cache.invalidate();
+                            // A `config_update` can move the encoder/render node/GPU set a
+                            // probe result depended on.
+                            mgr.notify_probe_inputs(agent_image_identity);
                             // Reported-copy only — see `send_fresh_capacity`.
                             let mut cap_gpus = cap.gpus;
                             crate::session::warmup::apply_encode_slot_reservation(
@@ -1664,6 +1712,8 @@ async fn connect_and_run(
                     mgr.vram_targets = cap.vram_targets;
             // Must ride every `vram_targets` reassignment — see `vram_cache`'s doc.
             mgr.vram_cache.invalidate();
+                    // A hotplug can change the GPU set a probe result depended on.
+                    mgr.notify_probe_inputs(agent_image_identity);
                     info!(
                         "console hotplug: {reason}; re-sending capacity ({} connector(s), {} audio sink(s), {} input device(s))",
                         cap.console.connectors.len(),
@@ -1799,6 +1849,16 @@ async fn connect_and_run(
                                 }
                                 _ => false,
                             };
+                            // Which host probes could explain this, and the GPU it ran
+                            // on — captured before `on_event` drops the `running` entry.
+                            let launch_failure = match &other {
+                                SessionEvent::Failed(reason) => Some((reason.clone(), false)),
+                                SessionEvent::AppFailed { reason, .. } => {
+                                    Some((reason.clone(), true))
+                                }
+                                _ => None,
+                            };
+                            let failed_gpu = mgr.running.get(&session_id).map(|h| h.gpu_index);
                             // #503: same pre-terminal flush as the `Stopped` arm —
                             // `webrtc.remote_description_failed` is emitted by the
                             // runner immediately before this very event.
@@ -1810,6 +1870,17 @@ async fn connect_and_run(
                             if terminal {
                                 send_fresh_capacity(&mut tx, &mut *mgr).await?;
                                 info!("re-sent capacity after session failure for console reconciliation");
+                            }
+                            if let (Some((reason, app_failed)), Some(gpu)) =
+                                (launch_failure, failed_gpu)
+                            {
+                                let explains =
+                                    host_probe::launch_failure::explains(&reason, app_failed);
+                                if !explains.is_empty() {
+                                    if let Some(handle) = &mgr.probe_handle {
+                                        handle.launch_failed(gpu, explains);
+                                    }
+                                }
                             }
                             if gpu_global && !mgr.draining {
                                 error!(
@@ -1911,6 +1982,13 @@ async fn connect_and_run(
                     continue;
                 };
                 send(&mut tx, &msg).await?;
+            }
+            // A host probe concluded, was deferred, or its check went not-applicable /
+            // forgotten (#257). Applying is pure in-memory work; the result reaches the
+            // control plane on the next capacity message, per spec #252.
+            Some(update) = probe_updates.recv() => {
+                host_probe::orchestrator::apply(&mut mgr.readiness, update);
+                send_fresh_capacity(&mut tx, &mut *mgr).await?;
             }
         }
     }
@@ -2016,7 +2094,18 @@ struct HostSessions {
     /// reset the window on every retry, so a control plane that never came back
     /// meant the sessions were held forever.
     grace_timer: Option<tokio::task::JoinHandle<()>>,
+    /// Host-probe results (#257). Process lifetime, like the orchestrator that feeds
+    /// it — a result produced while disconnected is applied when the next
+    /// connection's loop runs.
+    probe_updates: mpsc::UnboundedReceiver<crate::host_probe::orchestrator::ReportUpdate>,
 }
+
+/// The probe kinds this agent runs (#257 slice: input + media only). Widening this to
+/// [`crate::host_probe::ProbeKind::ALL`] is the whole of a later slice.
+const ENABLED_KINDS: [crate::host_probe::ProbeKind; 2] = [
+    crate::host_probe::ProbeKind::Input,
+    crate::host_probe::ProbeKind::Media,
+];
 
 impl HostSessions {
     fn new(
@@ -2035,22 +2124,29 @@ impl HostSessions {
             diagnostic_dropped_interval.clone(),
             diagnostic_dropped_total.clone(),
         );
+        let probe_runner = Arc::new(crate::host_probe::runner::HostProbeRunner::new());
+        let (probe_handle, probe_updates) =
+            crate::host_probe::orchestrator::spawn_with_kinds(probe_runner.clone(), &ENABLED_KINDS);
+        let mut mgr = SessionManager::new(
+            live_refs,
+            health,
+            Vec::new(),
+            Vec::new(),
+            nvidia_lib32_probed,
+            image_mgr,
+            release_mgr,
+        );
+        mgr.probe_handle = Some(probe_handle);
+        mgr.probe_runner = Some(probe_runner);
         Self {
-            mgr: SessionManager::new(
-                live_refs,
-                health,
-                Vec::new(),
-                Vec::new(),
-                nvidia_lib32_probed,
-                image_mgr,
-                release_mgr,
-            ),
+            mgr,
             evt_tx,
             evt_rx: Some(evt_rx),
             diagnostic_tx,
             diagnostic_rx: Some(diagnostic_rx),
             diagnostic_dropped_interval,
             diagnostic_dropped_total,
+            probe_updates,
             registered_this_connection: false,
             grace_timer: None,
         }
@@ -2135,6 +2231,13 @@ struct SessionManager {
     /// Connection-scoped source policy shared with workers and session seeding.
     /// Its authorization is invalidated on disconnect even if sessions retain an Arc.
     source_policy: Option<Arc<crate::source_policy::SourcePolicy>>,
+    /// Process-lifetime host-probe orchestrator handle (#257). `None` only in tests
+    /// that build a `SessionManager` directly — every send on it is a non-blocking
+    /// unbounded-channel push, so nothing on the launch path can be delayed by it.
+    probe_handle: Option<crate::host_probe::orchestrator::ProbeHandle>,
+    /// The runner the orchestrator drives, so `set_context` can be refreshed before
+    /// `registered`/`inputs_observed` without threading it through every call site.
+    probe_runner: Option<Arc<crate::host_probe::runner::HostProbeRunner>>,
 }
 
 /// The uid/gid an app container's entrypoint drops to
@@ -2156,6 +2259,10 @@ struct PendingAssignment {
     cfg: SessionConfig,
     assigned_at: Instant,
     preparation: Option<crate::runtime::ImageOperation<crate::runtime::ImageInfo>>,
+    /// Carried to `RunningHandle` at `session_start`: `LaunchArrived` needs the GPU a
+    /// probe might be running on, and a `session_start` cannot re-derive it (the wire
+    /// message carries no `gpu_index`).
+    gpu_index: i32,
 }
 
 /// The per-running-session handles the agent loop holds.
@@ -2191,6 +2298,9 @@ struct RunningHandle {
     /// [`RUNNER_REAP_GRACE`] past this so the ordinary terminal path is never mistaken
     /// for an abandoned slot.
     finished_seen_at: Option<Instant>,
+    /// The GPU this session is bound to, for the host-probe scheduler's live-GPU set
+    /// and a launch failure's `launch_failed(gpu, ..)`.
+    gpu_index: i32,
 }
 
 impl SessionManager {
@@ -2226,14 +2336,27 @@ impl SessionManager {
             image_mgr,
             release_mgr,
             source_policy: None,
+            probe_handle: None,
+            probe_runner: None,
         }
     }
 
-    /// Publish the live-session count to the warm-up gate. Called from every site that
-    /// updates `/health`'s count, so the two can never disagree about host busyness.
+    /// Publish the live-session count to the warm-up gate, and the live-GPU set (every
+    /// pending-or-running assignment's GPU — the GPU is spoken for either way) to the
+    /// host-probe scheduler. Called from every site that changes `pending` or
+    /// `running`, so the two views can never disagree about host busyness.
     fn note_session_count(&self) {
         if let Some(a) = &self.warmup_activity {
             a.set_live(self.running.len(), Instant::now());
+        }
+        if let Some(handle) = &self.probe_handle {
+            let live_gpus: std::collections::BTreeSet<i32> = self
+                .pending
+                .values()
+                .map(|p| p.gpu_index)
+                .chain(self.running.values().map(|h| h.gpu_index))
+                .collect();
+            handle.sessions_changed(live_gpus);
         }
     }
 
@@ -2243,6 +2366,28 @@ impl SessionManager {
             .as_ref()
             .map(|c| c.reserved())
             .unwrap_or(false)
+    }
+
+    /// Refresh what a probe run reads. Called before every `registered`/
+    /// `inputs_observed` send so a `Start` the orchestrator issues right after always
+    /// sees the settings/inventory this exact message describes.
+    fn set_probe_context(&self) {
+        if let Some(runner) = &self.probe_runner {
+            runner.set_context(crate::host_probe::runner::ProbeContext {
+                settings: self.runtime_settings.clone(),
+                inventory: self.gpu_inventory.clone(),
+                warmup: self.warmup_control.clone(),
+            });
+        }
+    }
+
+    /// A probe input changed (capacity re-detection, a `config_update`): refresh the
+    /// context and tell the scheduler. A no-op with no probe handle wired (tests).
+    fn notify_probe_inputs(&self, agent_image: &str) {
+        self.set_probe_context();
+        if let Some(handle) = &self.probe_handle {
+            handle.inputs_observed(probe_inputs(agent_image, self));
+        }
     }
 
     /// Built per assign/swap rather than cached: `settings.home_root` is a live-class
@@ -2281,76 +2426,7 @@ impl SessionManager {
     }
 
     fn bind_assignment(&self, gpu_index: i32, cfg: &mut SessionConfig) -> anyhow::Result<()> {
-        let gpu = self
-            .gpu_inventory
-            .iter()
-            .find(|gpu| gpu.index == gpu_index)
-            .ok_or_else(|| anyhow::anyhow!(
-                "scheduled GPU index {gpu_index} is absent from the agent's latest capacity inventory"
-            ))?;
-
-        if cfg.encoder == EncoderChoice::Openh264 {
-            return Ok(());
-        }
-
-        // `app.gpu=false` is not invalid: a benchmark app may feed a hardware
-        // compositor without needing GPU access itself, and the app contract has no
-        // separate "this workload requires a GPU" signal to validate against.
-
-        let reported = gpu.render_node.as_deref().ok_or_else(|| anyhow::anyhow!(
-            "scheduled GPU {gpu_index} ({} {}) has no reported render node; hardware encode cannot be pinned safely",
-            gpu.vendor, gpu.model
-        ))?;
-        if cfg.render_node == "software" {
-            anyhow::bail!(
-                "hardware encoder {:?} cannot run with render_node=software; configure the reported node {reported}",
-                cfg.encoder
-            );
-        }
-        // Accept either exact identity capacity carries: the stable by-path
-        // `render_node` or the in-container `device_path`. Never resolve the host's
-        // by-path symlink here — it is not necessarily mounted even when the
-        // corresponding renderD node is. An empty render_node (QUASAR_RENDER_NODE
-        // unset) is unpinned: adopt the scheduled GPU's node below, matching the
-        // scheduler's schedulableBindingSQL — the two resolvers must not diverge.
-        let resolved_reported = gpu.device_path.as_deref().unwrap_or(reported);
-        if !cfg.render_node.is_empty()
-            && cfg.render_node != reported
-            && cfg.render_node != resolved_reported
-        {
-            anyhow::bail!(
-                "configured render node {} does not match scheduled GPU {gpu_index} node {reported} (resolved {resolved_reported})",
-                cfg.render_node
-            );
-        }
-
-        match cfg.encoder {
-            EncoderChoice::Va if !matches!(gpu.vendor.as_str(), "amd" | "intel") => {
-                anyhow::bail!(
-                    "VA encoder is incompatible with scheduled {} GPU {gpu_index}",
-                    gpu.vendor
-                )
-            }
-            EncoderChoice::Nvenc if gpu.vendor != "nvidia" => {
-                anyhow::bail!(
-                    "NVENC is incompatible with scheduled {} GPU {gpu_index}",
-                    gpu.vendor
-                )
-            }
-            EncoderChoice::Nvenc => {
-                cfg.cuda_device_id = capacity::nvidia_cuda_index_for_render_node(reported)
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "cannot map scheduled NVIDIA GPU {gpu_index} node {reported} to a CUDA device by PCI identity"
-                    ))?;
-            }
-            // Vulkan is pinned by the compositor-created GstVulkanDevice —
-            // waylanddisplaysrc selects it from this render node and interpipe
-            // forwards the context query — so it needs no ordinal.
-            EncoderChoice::Vulkan => {}
-            _ => {}
-        }
-        cfg.render_node = resolved_reported.to_string();
-        Ok(())
+        bind_gpu(&self.gpu_inventory, gpu_index, cfg)
     }
 
     /// Home refs (volume names / host paths) for a session's container mounts.
@@ -2508,6 +2584,12 @@ impl SessionManager {
                 // teardown must never overlap the encoder this session is about to
                 // create (#489). The assign→start gap is the abort's budget.
                 self.abort_any_warmup();
+                // A probe running on this GPU must yield the moment a launch could
+                // need it, well before the config below can fail — never delayed by,
+                // or delaying, anything else in this arm (an unbounded channel send).
+                if let Some(handle) = &self.probe_handle {
+                    handle.launch_arrived(gpu_index);
+                }
                 let container = match app_to_container(app, &self.mount_policy()) {
                     Ok(c) => c,
                     Err(error) => {
@@ -2515,6 +2597,9 @@ impl SessionManager {
                             token = "session-assign-rejected",
                             "session {session_id} assignment rejected: {error:#}"
                         );
+                        // Nothing was inserted into `pending`: tell the probe scheduler
+                        // this GPU was never really claimed.
+                        self.note_session_count();
                         return Some(ack(id, false, Some(error.to_string())));
                     }
                 };
@@ -2525,6 +2610,7 @@ impl SessionManager {
                             token = "session-assign-rejected",
                             "session {session_id} assignment rejected: {error:#}"
                         );
+                        self.note_session_count();
                         return Some(ack(id, false, Some(error.to_string())));
                     }
                 };
@@ -2538,6 +2624,7 @@ impl SessionManager {
                         token = "session-assign-rejected",
                         "session {session_id} assignment rejected: {error:#}"
                     );
+                    self.note_session_count();
                     return Some(ack(id, false, Some(error.to_string())));
                 }
                 cfg.console_config = self.console_config.clone();
@@ -2568,7 +2655,10 @@ impl SessionManager {
                         Ok(runtime) => {
                             Some(runtime.ensure_image(spec.image, Duration::from_secs(600)))
                         }
-                        Err(error) => return Some(ack(id, false, Some(error.to_string()))),
+                        Err(error) => {
+                            self.note_session_count();
+                            return Some(ack(id, false, Some(error.to_string())));
+                        }
                     }
                 } else {
                     None
@@ -2579,19 +2669,25 @@ impl SessionManager {
                         cfg,
                         assigned_at: Instant::now(),
                         preparation,
+                        gpu_index,
                     },
                 );
+                self.note_session_count();
                 Some(ack(id, true, None))
             }
             ControlMsg::SessionStart { id, session_id } => match self.pending.remove(&session_id) {
                 Some(PendingAssignment {
                     mut cfg,
                     preparation,
+                    gpu_index,
                     ..
                 }) => {
                     // The assign already raised this, but a `session_start` for an
                     // assignment that landed on a previous connection would not have.
                     self.abort_any_warmup();
+                    if let Some(handle) = &self.probe_handle {
+                        handle.launch_arrived(gpu_index);
+                    }
                     let stop = Arc::new(AtomicBool::new(false));
                     let (sig_in_tx, sig_in_rx) = std::sync::mpsc::channel::<SignalMsg>();
                     let (swap_tx, swap_rx) = std::sync::mpsc::channel::<SwapRequest>();
@@ -2714,6 +2810,7 @@ impl SessionManager {
                             video_topology,
                             thread: Some(thread),
                             finished_seen_at: None,
+                            gpu_index,
                         },
                     );
                     self.health.set_sessions(self.running.len());
@@ -2741,7 +2838,9 @@ impl SessionManager {
                 session_id,
                 reason,
             } => {
-                self.pending.remove(&session_id);
+                if self.pending.remove(&session_id).is_some() {
+                    self.note_session_count();
+                }
                 if let Some(h) = self.running.get(&session_id) {
                     h.stop.store(true, Ordering::Relaxed);
                     info!("session {session_id} stop requested (reason={reason})");
@@ -3177,13 +3276,16 @@ impl SessionManager {
             .filter(|(_, p)| now.duration_since(p.assigned_at) >= pending_ttl)
             .map(|(sid, _)| sid.clone())
             .collect();
-        for sid in stale {
-            warn!(
-                token = "session-assign-never-started",
-                "session {sid}: assignment never started within {pending_ttl:?}; \
-                 dropping the orphaned pending config"
-            );
-            self.pending.remove(&sid);
+        if !stale.is_empty() {
+            for sid in &stale {
+                warn!(
+                    token = "session-assign-never-started",
+                    "session {sid}: assignment never started within {pending_ttl:?}; \
+                     dropping the orphaned pending config"
+                );
+                self.pending.remove(sid);
+            }
+            self.note_session_count();
         }
         out
     }
@@ -3285,6 +3387,65 @@ impl SessionManager {
 // ended every stream on the host (#128). The manager now outlives a connection,
 // and `run()` decides when to give up: sessions are held for a bounded grace
 // window and stopped only if the control plane does not come back within it.
+
+/// `RuntimeSettings::effective_map()` keys that select the media path a host probe
+/// exercises. Anything containing `vulkan` or `cuda` is included too (the Vulkan
+/// per-codec knobs are process env, not in this map, so today that adds only
+/// `cuda_device`; a future settings key needs no change here).
+const PROBE_SETTINGS_KEYS: &[&str] = &["encoder", "render_node", "zerocopy"];
+
+/// The media-relevant settings, as one comparable string (`host_probe::decision`'s
+/// `ProbeInputs::settings`): an unrelated setting (e.g. `home_root`) must not cause a
+/// probe re-run.
+fn probe_relevant_settings(map: &std::collections::BTreeMap<String, String>) -> String {
+    map.iter()
+        .filter(|(k, _)| {
+            PROBE_SETTINGS_KEYS.contains(&k.as_str()) || k.contains("vulkan") || k.contains("cuda")
+        })
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// What decides whether a host probe's earlier result still applies (#257,
+/// `host_probe::decision::ProbeInputs`).
+fn probe_inputs(
+    agent_image: &str,
+    mgr: &SessionManager,
+) -> crate::host_probe::decision::ProbeInputs {
+    let mut driver_parts: Vec<String> = mgr
+        .gpu_inventory
+        .iter()
+        .filter_map(|g| g.driver_identity.clone())
+        .collect();
+    if let Some(volume) = crate::nvidia_volume::current() {
+        driver_parts.push(format!(
+            "{}:{}",
+            volume.name.as_deref().unwrap_or(""),
+            volume.manifest.sha256
+        ));
+    }
+
+    let gpus = mgr
+        .gpu_inventory
+        .iter()
+        .map(|g| {
+            let identity = g
+                .render_node
+                .clone()
+                .or_else(|| g.device_path.clone())
+                .unwrap_or_else(|| format!("{} {}", g.vendor, g.model));
+            (g.index, identity)
+        })
+        .collect();
+
+    crate::host_probe::decision::ProbeInputs {
+        agent_image: agent_image.to_string(),
+        driver: driver_parts.join(","),
+        gpus,
+        settings: probe_relevant_settings(&mgr.runtime_settings.effective_map()),
+    }
+}
 
 /// Turn the assign's `AppSpec` into a launchable container spec, or `None` when
 /// no image is set (a bare/compositor-only session).
@@ -4028,6 +4189,87 @@ where
             }
         }
     }
+}
+
+/// Validate the scheduled GPU against `inventory` and pin the session to it: render node,
+/// and the CUDA ordinal on the NVENC path. The media host probe binds through this same
+/// function (`host_probe::media`), so a probe exercises the binding a session gets.
+pub(crate) fn bind_gpu(
+    inventory: &[crate::messages::GpuCapacity],
+    gpu_index: i32,
+    cfg: &mut SessionConfig,
+) -> anyhow::Result<()> {
+    let gpu = inventory
+        .iter()
+        .find(|gpu| gpu.index == gpu_index)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+            "scheduled GPU index {gpu_index} is absent from the agent's latest capacity inventory"
+        )
+        })?;
+
+    if cfg.encoder == EncoderChoice::Openh264 {
+        return Ok(());
+    }
+
+    // `app.gpu=false` is not invalid: a benchmark app may feed a hardware
+    // compositor without needing GPU access itself, and the app contract has no
+    // separate "this workload requires a GPU" signal to validate against.
+
+    let reported = gpu.render_node.as_deref().ok_or_else(|| anyhow::anyhow!(
+        "scheduled GPU {gpu_index} ({} {}) has no reported render node; hardware encode cannot be pinned safely",
+        gpu.vendor, gpu.model
+    ))?;
+    if cfg.render_node == "software" {
+        anyhow::bail!(
+            "hardware encoder {:?} cannot run with render_node=software; configure the reported node {reported}",
+            cfg.encoder
+        );
+    }
+    // Accept either exact identity capacity carries: the stable by-path
+    // `render_node` or the in-container `device_path`. Never resolve the host's
+    // by-path symlink here — it is not necessarily mounted even when the
+    // corresponding renderD node is. An empty render_node (QUASAR_RENDER_NODE
+    // unset) is unpinned: adopt the scheduled GPU's node below, matching the
+    // scheduler's schedulableBindingSQL — the two resolvers must not diverge.
+    let resolved_reported = gpu.device_path.as_deref().unwrap_or(reported);
+    if !cfg.render_node.is_empty()
+        && cfg.render_node != reported
+        && cfg.render_node != resolved_reported
+    {
+        anyhow::bail!(
+            "configured render node {} does not match scheduled GPU {gpu_index} node {reported} (resolved {resolved_reported})",
+            cfg.render_node
+        );
+    }
+
+    match cfg.encoder {
+        EncoderChoice::Va if !matches!(gpu.vendor.as_str(), "amd" | "intel") => {
+            anyhow::bail!(
+                "VA encoder is incompatible with scheduled {} GPU {gpu_index}",
+                gpu.vendor
+            )
+        }
+        EncoderChoice::Nvenc if gpu.vendor != "nvidia" => {
+            anyhow::bail!(
+                "NVENC is incompatible with scheduled {} GPU {gpu_index}",
+                gpu.vendor
+            )
+        }
+        EncoderChoice::Nvenc => {
+            cfg.cuda_device_id = capacity::nvidia_cuda_index_for_render_node(reported)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "cannot map scheduled NVIDIA GPU {gpu_index} node {reported} to a CUDA device by PCI identity"
+                ))?;
+        }
+        // Vulkan is pinned by the compositor-created GstVulkanDevice —
+        // waylanddisplaysrc selects it from this render node and interpipe
+        // forwards the context query — so it needs no ordinal.
+        EncoderChoice::Vulkan => {}
+        _ => {}
+    }
+    cfg.render_node = resolved_reported.to_string();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -5607,6 +5849,7 @@ mod tests {
                 video_topology: topology,
                 thread: None,
                 finished_seen_at: None,
+                gpu_index: 0,
             },
             stop,
         )
@@ -5654,6 +5897,7 @@ mod tests {
                 video_topology: crate::messages::VideoTopology::StreamOnly,
                 thread: None,
                 finished_seen_at: None,
+                gpu_index: 0,
             },
             display_rx,
         )
@@ -6058,6 +6302,7 @@ mod tests {
                 cfg: assignment_config(EncoderChoice::Openh264, "software"),
                 assigned_at: Instant::now(),
                 preparation: None,
+                gpu_index: 0,
             },
         );
         mgr.handle_control(
@@ -6177,6 +6422,7 @@ mod tests {
                 cfg,
                 assigned_at: Instant::now(),
                 preparation: Some(runtime.ensure_image("test", Duration::from_secs(2))),
+                gpu_index: 0,
             },
         );
         let (tx, _rx) = mpsc::channel(8);
@@ -6215,6 +6461,7 @@ mod tests {
                 cfg: assignment_config(EncoderChoice::Openh264, "software"),
                 assigned_at: Instant::now(),
                 preparation: Some(runtime.ensure_image("test", Duration::from_secs(2))),
+                gpu_index: 0,
             },
         );
         let (tx, mut rx) = mpsc::channel(8);
@@ -6258,6 +6505,7 @@ mod tests {
                 cfg: assignment_config(EncoderChoice::Openh264, "software"),
                 assigned_at: Instant::now(),
                 preparation: None,
+                gpu_index: 0,
             },
         );
         assert_eq!(mgr.pending.len(), 1, "setup: one pending assignment");
@@ -6427,6 +6675,7 @@ mod tests {
                 cfg: assignment_config(EncoderChoice::Openh264, "software"),
                 assigned_at: Instant::now(),
                 preparation: None,
+                gpu_index: 0,
             },
         );
         mgr.reconcile(Instant::now(), RUNNER_REAP_GRACE, PENDING_ASSIGNMENT_TTL);
@@ -6464,6 +6713,7 @@ mod tests {
                 video_topology: topology,
                 thread: None,
                 finished_seen_at: None,
+                gpu_index: 0,
             },
             capture_rx,
         )
@@ -6718,5 +6968,175 @@ mod tests {
             "the closed-channel arm resolved more than once — it is being \
              re-polled instead of staying disabled, i.e. it is spinning (#530)"
         );
+    }
+
+    // ── host-probe wiring (#257) ──────────────────────────────────────────────
+
+    fn session_assign_msg(session_id: &str, gpu_index: i32) -> ControlMsg {
+        serde_json::from_value(serde_json::json!({
+            "type": "session_assign",
+            "id": "c1",
+            "session_id": session_id,
+            "gpu_index": gpu_index,
+            "stream": {"width": 1920, "height": 1080, "fps": 60,
+                "bitrate_kbps": 15000, "h264_profile": "constrained-baseline"}
+        }))
+        .unwrap()
+    }
+
+    async fn next_probe_event(
+        rx: &mut mpsc::UnboundedReceiver<crate::host_probe::decision::Event>,
+    ) -> crate::host_probe::decision::Event {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no probe event")
+            .expect("probe handle's forwarding task ended")
+    }
+
+    #[tokio::test]
+    async fn a_session_assign_sends_launch_arrived_and_a_rejection_corrects_the_live_set() {
+        use crate::host_probe::decision::Event;
+        use crate::host_probe::orchestrator::ProbeHandle;
+
+        let (mut mgr, _live_refs) = manager_with_runner(default_runner());
+        let (handle, mut rx) = ProbeHandle::detached();
+        mgr.probe_handle = Some(handle);
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+
+        // gpu_index 9 is absent from this manager's (empty) inventory, so
+        // `bind_assignment` rejects it — after `abort_any_warmup`/`launch_arrived`,
+        // which is the point: a probe must be told the GPU is wanted before the
+        // config below can possibly fail.
+        let reply = mgr.handle_control(
+            session_assign_msg("rejected", 9),
+            &evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(matches!(reply, Some(AgentMsg::Ack { ok: false, .. })));
+
+        assert_eq!(
+            next_probe_event(&mut rx).await,
+            Event::LaunchArrived { gpu: 9 }
+        );
+        match next_probe_event(&mut rx).await {
+            Event::SessionsChanged { live_gpus } => {
+                assert!(
+                    !live_gpus.contains(&9),
+                    "a rejected assign must not leave the GPU marked live: {live_gpus:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_accepted_assign_marks_its_gpu_live() {
+        use crate::host_probe::decision::Event;
+        use crate::host_probe::orchestrator::ProbeHandle;
+        use crate::messages::GpuCapacity;
+
+        let (mut mgr, _live_refs) = manager_with_runner(default_runner());
+        mgr.gpu_inventory = vec![GpuCapacity {
+            index: 0,
+            vendor: "software".into(),
+            model: "test".into(),
+            vram_mb_total: 0,
+            encode_slots_total: 0,
+            render_node: None,
+            device_path: None,
+            driver_identity: None,
+        }];
+        let (handle, mut rx) = ProbeHandle::detached();
+        mgr.probe_handle = Some(handle);
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+
+        // openh264 (this manager's default) never needs a render node, so
+        // `bind_assignment` accepts GPU 0 with no further configuration.
+        let reply = mgr.handle_control(
+            session_assign_msg("accepted", 0),
+            &evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(matches!(reply, Some(AgentMsg::Ack { ok: true, .. })));
+
+        assert_eq!(
+            next_probe_event(&mut rx).await,
+            Event::LaunchArrived { gpu: 0 }
+        );
+        match next_probe_event(&mut rx).await {
+            Event::SessionsChanged { live_gpus } => {
+                assert!(live_gpus.contains(&0), "{live_gpus:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_inputs_lists_every_gpu_and_reacts_only_to_media_relevant_settings() {
+        let (mut mgr, _live_refs) = manager_with_runner(default_runner());
+        mgr.gpu_inventory = vec![
+            crate::messages::GpuCapacity {
+                index: 0,
+                vendor: "amd".into(),
+                model: "test".into(),
+                vram_mb_total: 0,
+                encode_slots_total: 0,
+                render_node: Some("/dev/dri/renderD128".into()),
+                device_path: None,
+                driver_identity: Some("amd:1.2.3".into()),
+            },
+            crate::messages::GpuCapacity {
+                index: 1,
+                vendor: "amd".into(),
+                model: "test2".into(),
+                vram_mb_total: 0,
+                encode_slots_total: 0,
+                render_node: Some("/dev/dri/renderD129".into()),
+                device_path: None,
+                driver_identity: Some("amd:1.2.3".into()),
+            },
+        ];
+        let inputs = probe_inputs("sha256:agent", &mgr);
+        assert_eq!(inputs.agent_image, "sha256:agent");
+        assert_eq!(inputs.gpus.len(), 2);
+        assert_eq!(
+            inputs.gpus.get(&0).map(String::as_str),
+            Some("/dev/dri/renderD128")
+        );
+        assert_eq!(
+            inputs.gpus.get(&1).map(String::as_str),
+            Some("/dev/dri/renderD129")
+        );
+
+        let baseline = probe_inputs("sha256:agent", &mgr).settings;
+        mgr.runtime_settings.encoder = EncoderChoice::Vulkan;
+        let after_encoder_change = probe_inputs("sha256:agent", &mgr).settings;
+        assert_ne!(
+            baseline, after_encoder_change,
+            "an encoder change must be visible to the probe scheduler"
+        );
+
+        mgr.runtime_settings.home_root = "/mnt/unrelated".into();
+        let after_unrelated_change = probe_inputs("sha256:agent", &mgr).settings;
+        assert_eq!(
+            after_encoder_change, after_unrelated_change,
+            "home_root does not select the media path and must not trigger a re-probe"
+        );
+    }
+
+    #[test]
+    fn a_probe_handle_of_none_leaves_session_assign_behaviour_unchanged() {
+        // #257: every pre-existing test builds a `SessionManager` with no probe
+        // wiring, so this is really a proof that `note_session_count` and the two
+        // `launch_arrived` call sites are no-ops rather than panics with no handle.
+        let (mut mgr, _live_refs) = manager_with_runner(default_runner());
+        assert!(mgr.probe_handle.is_none());
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+        let reply = mgr.handle_control(
+            session_assign_msg("no-probe", 9),
+            &evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(matches!(reply, Some(AgentMsg::Ack { ok: false, .. })));
     }
 }

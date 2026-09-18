@@ -25,6 +25,14 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Host probes, first slice (#257).** After it registers, the agent creates virtual input
+  devices and, per GPU, composites and encodes a few frames in a bounded child process, and
+  reports the results as the `input_probe` and `media_probe_gpu<N>` readiness checks. They run
+  again when the agent image, driver, GPU set or relevant host settings change and after a launch
+  failure they could explain, never on a GPU with a live session; a launch pre-empts a running
+  probe, whose result is then indeterminate (shown as a warning that leaves the last definitive
+  result in force). Advisory only: nothing blocks a launch yet. The agent binary now refuses an
+  unknown subcommand instead of starting as an agent.
 - **Storage readiness checks (#253).** The host readiness card gains a Storage group: `homes_root_writable` performs a real write test (a test home created under `QUASAR_HOME_ROOT`, handed to the app identity, written and removed), and `homes_free_space` warns below a floor (`QUASAR_HOMES_FREE_SPACE_FLOOR_GIB`, default 5) and fails only when exhausted; `template_free_space` and `image_free_space` warn only. Advisory in this slice; blocking arrives with the RH-02 admission gate.
 - **Container runtime and CDI readiness checks (#254).** The readiness card gains a Container runtime group: `runtime_endpoint` (reachable, or why not, with the fix), `runtime_api_version` (the negotiated engine API and the engine's range), `runtime_capabilities` (what the engine states about itself) and `runtime_cdi` (whether CDI is enabled and which devices the engine discovered). Observed only: GPU injection is unchanged. The firewall check `media_reachability` keeps its id and is reworded as the host's inbound firewall posture, and the card states that readiness is host-local and never implies a browser can reach the host.
 

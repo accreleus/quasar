@@ -72,7 +72,9 @@ pub(crate) const VIDEO_ENCODER_NAME: &str = "quasar-video-encoder";
 /// the runner without threading a handle through every builder.
 pub(crate) const VIDEO_PAYLOADER_NAME: &str = "quasar-video-payloader";
 mod source_branch;
-use source_branch::{build_gpu_convert_stage, build_video_source};
+// Also the media host probe's source + convert stage (`session::probe_media`): the probe
+// must build the compositor arm production builds, not a stand-in.
+pub(crate) use source_branch::{build_gpu_convert_stage, build_video_source};
 mod scale_stage;
 use scale_stage::build_scale_stage;
 pub use scale_stage::ScaleStage;

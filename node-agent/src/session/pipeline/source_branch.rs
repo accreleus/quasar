@@ -63,7 +63,7 @@ fn pin_vulkan_encode_ring() {
 ///
 /// With `devices`, `waylanddisplaysrc` is pointed at the virtual mouse + keyboard evdev
 /// paths. The gamepad is excluded: libinput ignores joypads.
-pub(super) fn build_video_source(
+pub(crate) fn build_video_source(
     pipeline: &gst::Pipeline,
     cfg: &SessionConfig,
     devices: Option<&VirtualDevices>,
@@ -257,7 +257,7 @@ pub(super) fn make_vapostproc(
 /// A thin view over [`super::scale_stage::build_scale_stage`], which also exposes the tail
 /// capsfilter as the live resolution lever. Only the demo pipeline uses this element-list
 /// view; the split encode pipeline keeps the whole `ScaleStage` so the runner can retarget.
-pub(super) fn build_gpu_convert_stage(
+pub(crate) fn build_gpu_convert_stage(
     cfg: &SessionConfig,
     va_ctx: Option<&gst::Context>,
 ) -> Result<Vec<gst::Element>> {

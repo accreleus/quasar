@@ -1,19 +1,22 @@
 import { describe, expect, it } from "vitest";
 import type { ReadinessCheck } from "../../api/types";
-import { groupChecks, KNOWN_CHECK_IDS, READINESS_GROUPS } from "./groups";
+import { baseCheckId, groupChecks, KNOWN_CHECK_IDS, READINESS_GROUPS } from "./groups";
 
 function c(id: string, status = "pass", summary = id): ReadinessCheck {
   return { id, status, summary, remediation: "" } as ReadinessCheck;
 }
 
-// Every `const ID: &str = "…"` in node-agent/src/readiness.rs and
-// readiness/platform_update.rs. A check added or renamed there must be placed
-// here, or it lands in "Other" unnoticed.
+// Every `const ID: &str = "…"` in node-agent/src/readiness.rs,
+// readiness/platform_update.rs, and node-agent/src/host_probe.rs. A check added
+// or renamed there must be placed here, or it lands in "Other" unnoticed.
 const AGENT_CHECK_IDS = [
   "updater_socket",
   "updater_stack_dir",
   "updater_overlays",
   "health_addr_bindable",
+  // #257: host probes (host_probe.rs).
+  "media_probe",
+  "input_probe",
   "xid_visibility",
   "nvidia_egl_vendor_json",
   "nvidia_eglcore_library",
@@ -109,5 +112,36 @@ describe("readiness groups (#102)", () => {
     const { groups, notApplicable } = groupChecks([c("render_node"), c("host_render_node", "mystery"), c("dri_node_app_access", "fail")]);
     expect(notApplicable).toEqual([]);
     expect(groups[0].checks.map((x) => x.id)).toEqual(["dri_node_app_access", "host_render_node", "render_node"]);
+  });
+
+  // #257: per-GPU host-probe ids land in their base id's group.
+  it("places per-GPU media_probe checks in the gpu group alongside their base id", () => {
+    const { groups } = groupChecks([c("media_probe_gpu0"), c("media_probe_gpu1"), c("render_node")]);
+    const gpu = groups.find((g) => g.key === "gpu");
+    expect(gpu?.checks.map((x) => x.id)).toEqual(["media_probe_gpu0", "media_probe_gpu1", "render_node"]);
+    const other = groups.find((g) => g.key === "other");
+    expect(other).toBeUndefined();
+  });
+
+  it("places input_probe in the input group", () => {
+    const { groups } = groupChecks([c("input_probe"), c("uinput")]);
+    const input = groups.find((g) => g.key === "input");
+    expect(input?.checks.map((x) => x.id)).toEqual(["input_probe", "uinput"]);
+  });
+
+  it("places an unknown id ending in _gpu<N> in the other group, not its would-be base", () => {
+    const { groups } = groupChecks([c("mystery_gpu3"), c("render_node")]);
+    const gpu = groups.find((g) => g.key === "gpu");
+    expect(gpu?.checks.map((x) => x.id)).toEqual(["render_node"]);
+    const other = groups.find((g) => g.key === "other");
+    expect(other?.checks.map((x) => x.id)).toEqual(["mystery_gpu3"]);
+  });
+
+  it("baseCheckId strips the _gpu<N> suffix and leaves others unchanged", () => {
+    expect(baseCheckId("media_probe_gpu0")).toBe("media_probe");
+    expect(baseCheckId("media_probe_gpu12")).toBe("media_probe");
+    expect(baseCheckId("application_gpu_probe_gpu1")).toBe("application_gpu_probe");
+    expect(baseCheckId("render_node")).toBe("render_node");
+    expect(baseCheckId("input_probe")).toBe("input_probe");
   });
 });

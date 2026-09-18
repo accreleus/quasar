@@ -3,6 +3,7 @@ use quasar_node_agent::{agent, config, memstat, session};
 use session::SessionConfig;
 
 /// What this invocation should do.
+#[derive(Debug)]
 enum Mode {
     /// The production role: connect to the control plane (register / capacity / heartbeat).
     Agent,
@@ -21,6 +22,12 @@ enum Mode {
     InjectSelfTest,
     /// Create the uinput devices, print their evdev nodes, emit events. Needs /dev/uinput.
     VirtualInputSelfTest,
+    /// The input host probe: [`Mode::VirtualInputSelfTest`] under the probe stdout
+    /// contract (one final line, exit 0 pass / 1 fail).
+    InputProbe,
+    /// The media host probe: composite + encode a few frames on one GPU, same stdout
+    /// contract. Spawned as a child of the agent (`host_probe::media`).
+    MediaProbe(session::probe_media::MediaProbeRequest),
     /// EGL dispatcher self-test. Spawned as a CHILD by the readiness probe
     /// (`nvidia_volume::probe_egl_runtime`) so a segfault in a broken vendor stack cannot
     /// take the agent down.
@@ -61,15 +68,27 @@ fn parse_size(raw: Option<&str>) -> (i32, i32, i32) {
     (w, h, fps)
 }
 
+/// Refuses an unknown argv instead of falling through to agent mode: a probe container
+/// runs the agent's own image with a subcommand, and an image that does not know it would
+/// otherwise boot a second agent on the host (spec #252 "Host probes").
 fn parse_args() -> Mode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    match parse_mode(&args) {
+        Ok(mode) => mode,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    }
+}
 
-    match args.first().map(String::as_str) {
+fn parse_mode(args: &[String]) -> Result<Mode, String> {
+    let mode = match args.first().map(String::as_str) {
         Some("session") => {
-            let addr = arg_value(&args, "--addr").unwrap_or_else(|| "0.0.0.0:8443".to_string());
-            let stun = arg_value(&args, "--stun");
+            let addr = arg_value(args, "--addr").unwrap_or_else(|| "0.0.0.0:8443".to_string());
+            let stun = arg_value(args, "--stun");
             let use_test_src = args.iter().any(|a| a == "--test-src");
-            let image = arg_value(&args, "--image");
+            let image = arg_value(args, "--image");
             Mode::Session {
                 addr,
                 use_test_src,
@@ -92,13 +111,13 @@ fn parse_args() -> Mode {
             dry_run: args.iter().any(|a| a == "--dry-run"),
         },
         Some("probe-encoder") => {
-            let (width, height, fps) = parse_size(arg_value(&args, "--size").as_deref());
+            let (width, height, fps) = parse_size(arg_value(args, "--size").as_deref());
             Mode::ProbeEncoder {
-                codec: arg_value(&args, "--codec").unwrap_or_else(|| "h264".to_string()),
+                codec: arg_value(args, "--codec").unwrap_or_else(|| "h264".to_string()),
                 width,
                 height,
                 fps,
-                seconds: arg_value(&args, "--seconds")
+                seconds: arg_value(args, "--seconds")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(2),
                 json: args.iter().any(|a| a == "--json"),
@@ -106,8 +125,34 @@ fn parse_args() -> Mode {
         }
         Some("inject-selftest") => Mode::InjectSelfTest,
         Some("vinput-selftest") => Mode::VirtualInputSelfTest,
-        _ => Mode::Agent,
-    }
+        Some("input-probe") => Mode::InputProbe,
+        Some("media-probe") => {
+            let d = session::probe_media::MediaProbeRequest::default();
+            let (width, height, fps) = match arg_value(args, "--size") {
+                Some(raw) => parse_size(Some(&raw)),
+                None => (d.width, d.height, d.fps),
+            };
+            Mode::MediaProbe(session::probe_media::MediaProbeRequest {
+                gpu: arg_value(args, "--gpu")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(d.gpu),
+                codec: arg_value(args, "--codec").unwrap_or(d.codec),
+                width,
+                height,
+                fps,
+                frames: arg_value(args, "--frames")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(d.frames),
+                budget: arg_value(args, "--budget-secs")
+                    .and_then(|s| s.parse().ok())
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or(d.budget),
+            })
+        }
+        None => Mode::Agent,
+        Some(other) => return Err(format!("unknown subcommand: {other}")),
+    };
+    Ok(mode)
 }
 
 /// Fetch the value following `flag` (e.g. `--addr 0.0.0.0:8443`).
@@ -162,6 +207,8 @@ async fn main() {
         } => run_probe_encoder(&codec, width, height, fps, seconds, json),
         Mode::InjectSelfTest => run_inject_selftest(),
         Mode::VirtualInputSelfTest => run_vinput_selftest(),
+        Mode::InputProbe => run_input_probe(),
+        Mode::MediaProbe(request) => run_media_probe(request),
         // Handled above, before the subscriber is installed.
         Mode::EglSelfTest { .. } => unreachable!(),
     }
@@ -444,18 +491,12 @@ fn run_inject_selftest() {
 
 /// Proves the uinput path end-to-end (device creation, fake-udev node, event write) with no
 /// compositor, GPU or browser. Needs `/dev/uinput`.
-fn run_vinput_selftest() {
-    tracing::info!("quasar node-agent — virtual input self-test");
-    let devices = match session::virtual_input::VirtualDevices::create("selftest") {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!(
-                token = "vinput-selftest-failed",
-                "virtual device creation failed: {e:#}"
-            );
-            std::process::exit(1);
-        }
-    };
+///
+/// The devices MUST be dropped (destroyed) before the caller exits, so no `exit` inside:
+/// each failure returns its one-line reason instead. Shared with `input-probe`.
+fn vinput_selftest_body() -> Result<(), String> {
+    let devices = session::virtual_input::VirtualDevices::create("selftest")
+        .map_err(|e| format!("virtual device creation failed: {e:#}"))?;
     tracing::info!(
         "created: keyboard={}, mouse={}, gamepad={}",
         devices.keyboard_path.display(),
@@ -463,30 +504,64 @@ fn run_vinput_selftest() {
         devices.gamepad_path.display()
     );
 
-    let report = |name: &str, result: anyhow::Result<()>| match result {
-        Ok(()) => tracing::info!("  ✅ {name}"),
-        Err(e) => {
-            tracing::error!(token = "selftest-check-failed", "  ❌ {name}: {e:#}");
-            std::process::exit(1);
+    let step = |name: &str, result: anyhow::Result<()>| -> Result<(), String> {
+        match result {
+            Ok(()) => {
+                tracing::info!("  ✅ {name}");
+                Ok(())
+            }
+            Err(e) => Err(format!("{name} failed: {e:#}")),
         }
     };
-    report(
+    step(
         "key A down+up",
         devices.key(30, true).and_then(|_| devices.key(30, false)),
-    );
-    report(
+    )?;
+    step(
         "mouse move + left click",
         devices
             .mouse_move_rel(10.0, -5.0)
             .and_then(|_| devices.mouse_button(0x110, true))
             .and_then(|_| devices.mouse_button(0x110, false)),
-    );
-    report("scroll", devices.scroll(0.0, 120.0));
-    report(
+    )?;
+    step("scroll", devices.scroll(0.0, 120.0))?;
+    step(
         "gamepad A + left stick",
         devices.gamepad(&[1.0], &[0.5, -0.5]),
-    );
+    )?;
+    Ok(())
+}
+
+fn run_vinput_selftest() {
+    tracing::info!("quasar node-agent — virtual input self-test");
+    if let Err(e) = vinput_selftest_body() {
+        tracing::error!(token = "vinput-selftest-failed", "{e}");
+        std::process::exit(1);
+    }
     tracing::info!("✅ virtual input self-test PASS");
+}
+
+/// `quasar-node-agent input-probe` — the input host probe. Stdout is exactly one line
+/// (the probe contract, `host_probe::outcome`); everything else goes to the log.
+fn run_input_probe() {
+    tracing::info!("quasar node-agent — input host probe");
+    match vinput_selftest_body() {
+        Ok(()) => println!("created keyboard, mouse and gamepad devices and wrote events"),
+        Err(e) => {
+            println!("{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `quasar-node-agent media-probe [--gpu N] [--codec h264|h265|av1] [--size WxH@FPS]
+/// [--frames N] [--budget-secs N]`. The GPU binding and encoder selection arrive as env
+/// from the parent (`host_probe::media`). One stdout line; exit 0 pass, 1 fail, 2 usage.
+fn run_media_probe(request: session::probe_media::MediaProbeRequest) {
+    tracing::info!("quasar node-agent — media host probe");
+    let verdict = session::probe_media::run(&request);
+    println!("{}", verdict.line());
+    std::process::exit(verdict.exit_code());
 }
 
 #[cfg(test)]
@@ -495,6 +570,83 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The production role: no arguments at all.
+    #[test]
+    fn no_arguments_is_agent_mode() {
+        assert!(matches!(parse_mode(&[]), Ok(Mode::Agent)));
+    }
+
+    /// Falling through to agent mode on an unrecognised argv would boot a second agent
+    /// inside a probe container (spec #252).
+    #[test]
+    fn an_unknown_first_argument_is_never_agent_mode() {
+        for args in [
+            vec!["media-probe-from-the-future"],
+            vec!["--gpu", "0"],
+            vec![""],
+            vec!["session-answerer-typo"],
+            vec!["Agent"],
+        ] {
+            let e = parse_mode(&argv(&args)).expect_err(&format!("{args:?} must be refused"));
+            assert!(e.starts_with("unknown subcommand: "), "{args:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn every_known_subcommand_still_parses() {
+        // The mode's Debug name, so one list covers "parses" and "parses as itself".
+        for (arg, expected) in [
+            ("session", "Session"),
+            ("session-answerer", "SessionAnswerer"),
+            (
+                quasar_node_agent::nvidia_volume::EGL_SELFTEST_ARG,
+                "EglSelfTest",
+            ),
+            ("homes-gc", "HomesGc"),
+            ("probe-encoder", "ProbeEncoder"),
+            ("inject-selftest", "InjectSelfTest"),
+            ("vinput-selftest", "VirtualInputSelfTest"),
+            ("input-probe", "InputProbe"),
+            ("media-probe", "MediaProbe"),
+        ] {
+            let mode = parse_mode(&argv(&[arg])).unwrap_or_else(|e| panic!("{arg}: {e}"));
+            assert!(
+                format!("{mode:?}").starts_with(expected),
+                "{arg} parsed as {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn media_probe_flags_override_the_defaults_and_absent_ones_do_not() {
+        let Ok(Mode::MediaProbe(req)) = parse_mode(&argv(&[
+            "media-probe",
+            "--gpu",
+            "1",
+            "--size",
+            "640x360@30",
+            "--frames",
+            "5",
+            "--budget-secs",
+            "7",
+        ])) else {
+            panic!("media-probe did not parse");
+        };
+        assert_eq!((req.gpu, req.width, req.height, req.fps), (1, 640, 360, 30));
+        assert_eq!(req.frames, 5);
+        assert_eq!(req.budget, std::time::Duration::from_secs(7));
+        assert_eq!(req.codec, "h264");
+
+        let Ok(Mode::MediaProbe(bare)) = parse_mode(&argv(&["media-probe"])) else {
+            panic!("bare media-probe did not parse");
+        };
+        assert_eq!(bare, session::probe_media::MediaProbeRequest::default());
+    }
 
     /// #94 regression: a set-but-empty var is removed.
     #[test]
