@@ -88,8 +88,11 @@ impl ProbeHandle {
         self.send(Event::LaunchArrived { gpu });
     }
 
-    pub fn sessions_changed(&self, live_gpus: std::collections::BTreeSet<i32>) {
-        self.send(Event::SessionsChanged { live_gpus });
+    pub fn sessions_changed(&self, live_gpus: std::collections::BTreeSet<i32>, launching: bool) {
+        self.send(Event::SessionsChanged {
+            live_gpus,
+            launching,
+        });
     }
 
     pub fn launch_failed(&self, gpu: i32, explains: std::collections::BTreeSet<ProbeKind>) {
@@ -483,6 +486,9 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        // Nothing restarts while the launch is in flight.
+        rig.nothing_starts().await;
+        rig.handle.sessions_changed([0].into(), false);
         let again = rig.next_start().await;
         assert_eq!(again.target, ProbeTarget::host(Input));
         assert!(!*again.preempt.borrow(), "a fresh run starts un-pre-empted");

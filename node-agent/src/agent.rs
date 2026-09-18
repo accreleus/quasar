@@ -2286,6 +2286,9 @@ struct RunningHandle {
     /// The GPU this session is bound to, for the host-probe scheduler's live-GPU set
     /// and a launch failure's `launch_failed(gpu, ..)`.
     gpu_index: i32,
+    /// Set by `SessionEvent::Running`. Until then the launch is in flight and no host
+    /// probe starts.
+    reached_running: bool,
 }
 
 impl SessionManager {
@@ -2341,7 +2344,9 @@ impl SessionManager {
                 .map(|p| p.gpu_index)
                 .chain(self.running.values().map(|h| h.gpu_index))
                 .collect();
-            handle.sessions_changed(live_gpus);
+            let launching =
+                !self.pending.is_empty() || self.running.values().any(|h| !h.reached_running);
+            handle.sessions_changed(live_gpus, launching);
         }
     }
 
@@ -2796,6 +2801,7 @@ impl SessionManager {
                             thread: Some(thread),
                             finished_seen_at: None,
                             gpu_index,
+                            reached_running: false,
                         },
                     );
                     self.health.set_sessions(self.running.len());
@@ -3314,11 +3320,17 @@ impl SessionManager {
         let (state, detail, error) = match event {
             SessionEvent::Starting => ("starting", Some("building pipeline".to_string()), None),
             SessionEvent::Progress(detail) => ("starting", Some(detail.to_string()), None),
-            SessionEvent::Running => (
-                "running",
-                Some("pipeline live; offer ready".to_string()),
-                None,
-            ),
+            SessionEvent::Running => {
+                if let Some(handle) = self.running.get_mut(session_id) {
+                    handle.reached_running = true;
+                }
+                self.note_session_count();
+                (
+                    "running",
+                    Some("pipeline live; offer ready".to_string()),
+                    None,
+                )
+            }
             SessionEvent::Stopping => ("stopping", Some("tearing down".to_string()), None),
             // A clean stop never carries an `error_message`. `detail` carries a reason
             // on a peer disconnect, recorded as `state_detail`, so operators see why it
@@ -5834,6 +5846,7 @@ mod tests {
                 thread: None,
                 finished_seen_at: None,
                 gpu_index: 0,
+                reached_running: true,
             },
             stop,
         )
@@ -5882,6 +5895,7 @@ mod tests {
                 thread: None,
                 finished_seen_at: None,
                 gpu_index: 0,
+                reached_running: true,
             },
             display_rx,
         )
@@ -6698,6 +6712,7 @@ mod tests {
                 thread: None,
                 finished_seen_at: None,
                 gpu_index: 0,
+                reached_running: true,
             },
             capture_rx,
         )
@@ -7001,7 +7016,7 @@ mod tests {
             Event::LaunchArrived { gpu: 9 }
         );
         match next_probe_event(&mut rx).await {
-            Event::SessionsChanged { live_gpus } => {
+            Event::SessionsChanged { live_gpus, .. } => {
                 assert!(
                     !live_gpus.contains(&9),
                     "a rejected assign must not leave the GPU marked live: {live_gpus:?}"
@@ -7046,7 +7061,7 @@ mod tests {
             Event::LaunchArrived { gpu: 0 }
         );
         match next_probe_event(&mut rx).await {
-            Event::SessionsChanged { live_gpus } => {
+            Event::SessionsChanged { live_gpus, .. } => {
                 assert!(live_gpus.contains(&0), "{live_gpus:?}");
             }
             other => panic!("{other:?}"),

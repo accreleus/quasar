@@ -30,9 +30,11 @@ pub enum Event {
     LaunchArrived {
         gpu: i32,
     },
-    /// GPUs with an assigned, starting, running or tearing-down session.
+    /// GPUs with an assigned, starting, running or tearing-down session, and whether
+    /// any session is still on its way to running.
     SessionsChanged {
         live_gpus: BTreeSet<i32>,
+        launching: bool,
     },
     /// A launch failed in a way these probe kinds could explain.
     LaunchFailed {
@@ -86,6 +88,9 @@ pub struct Scheduler {
     pending: BTreeSet<ProbeTarget>,
     running: Option<Running>,
     live_gpus: BTreeSet<i32>,
+    /// A launch is in flight. Nothing starts: even a host-wide probe would compete with
+    /// it for the container runtime.
+    launching: bool,
     /// Kinds with a container whose stop or cleanup is unaccounted for. No probe of
     /// that kind starts, so no new operation identity is issued over the old one.
     unreconciled: BTreeSet<ProbeKind>,
@@ -113,6 +118,7 @@ impl Scheduler {
             pending: BTreeSet::new(),
             running: None,
             live_gpus: BTreeSet::new(),
+            launching: false,
             unreconciled: BTreeSet::new(),
             reconciling: None,
             gate_waiting: BTreeSet::new(),
@@ -170,10 +176,17 @@ impl Scheduler {
                 }
             }
             Event::LaunchArrived { gpu } => {
+                self.launching = true;
                 self.live_gpus.insert(gpu);
                 self.preempt(&mut actions);
             }
-            Event::SessionsChanged { live_gpus } => self.live_gpus = live_gpus,
+            Event::SessionsChanged {
+                live_gpus,
+                launching,
+            } => {
+                self.live_gpus = live_gpus;
+                self.launching = launching;
+            }
             Event::LaunchFailed { gpu, explains } => {
                 for kind in explains {
                     let target = if kind.per_gpu() {
@@ -297,7 +310,11 @@ impl Scheduler {
     }
 
     fn dispatch(&mut self, reconcile_failed: Option<ProbeKind>, actions: &mut Vec<Action>) {
-        if !self.registered || self.running.is_some() || self.reconciling.is_some() {
+        if !self.registered
+            || self.launching
+            || self.running.is_some()
+            || self.reconciling.is_some()
+        {
             return;
         }
         let candidates: Vec<ProbeTarget> = self.pending.iter().copied().collect();
@@ -361,6 +378,14 @@ mod tests {
     fn live(gpus: &[i32]) -> Event {
         Event::SessionsChanged {
             live_gpus: gpus.iter().copied().collect(),
+            launching: false,
+        }
+    }
+
+    fn launching(gpus: &[i32]) -> Event {
+        Event::SessionsChanged {
+            live_gpus: gpus.iter().copied().collect(),
+            launching: true,
         }
     }
 
@@ -711,6 +736,36 @@ mod tests {
             drain(&mut s, after),
             vec![gpu(Media, 0), gpu(ApplicationGpu, 0)]
         );
+    }
+
+    #[test]
+    fn nothing_starts_while_a_launch_is_in_flight() {
+        let mut s = Scheduler::new();
+        s.step(Event::Registered(one_gpu()));
+        assert_eq!(
+            s.step(Event::LaunchArrived { gpu: 0 }),
+            vec![Action::Preempt(host(Input))]
+        );
+        // Pending in the agent, then started but not yet running.
+        assert_eq!(s.step(launching(&[0])), vec![]);
+        assert_eq!(
+            s.step(finished(host(Input))),
+            vec![],
+            "not even a host probe"
+        );
+        assert_eq!(s.step(launching(&[0])), vec![]);
+        // Running: host probes resume, the GPU's probes wait for the session to end.
+        let resumed = s.step(live(&[0]));
+        assert_eq!(drain(&mut s, resumed), vec![host(Input), host(Audio)]);
+    }
+
+    #[test]
+    fn a_rejected_launch_lets_probes_resume_at_once() {
+        let mut s = Scheduler::new();
+        s.step(Event::Registered(one_gpu()));
+        s.step(Event::LaunchArrived { gpu: 0 });
+        s.step(finished(host(Input)));
+        assert_eq!(s.step(live(&[])), vec![Action::Start(host(Input))]);
     }
 
     #[test]
