@@ -13,6 +13,7 @@
 /// The update-path checks (preflight ids), with their collectors.
 pub mod platform_update;
 pub mod report;
+pub mod storage;
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -179,6 +180,8 @@ pub struct ProbeEnv {
     pub health: platform_update::HealthOwner,
     /// This agent's own `/health` identity, to compare against who answers.
     pub self_identity: platform_update::HealthIdentity,
+    /// The storage roots and their free space (#253), read once per probe.
+    pub storage: storage::StorageView,
 }
 
 /// The driver-volume provisioner's state, as readiness sees it. Plain data, not a live call
@@ -272,6 +275,7 @@ impl ProbeEnv {
                 node: crate::logging::host_name().to_string(),
                 pid: std::process::id(),
             },
+            storage: storage::StorageView::live(),
         }
     }
 
@@ -362,20 +366,26 @@ pub(crate) fn sibling_mount_error() -> Option<String> {
     let home = std::env::var("QUASAR_HOME_ROOT").unwrap_or_default();
     if !home.is_empty() {
         paths.push(home.clone());
-        let template = std::env::var("QUASAR_TEMPLATE_ROOT")
-            .ok()
-            .filter(|p| !p.is_empty())
-            .unwrap_or_else(|| {
-                Path::new(&home)
-                    .parent()
-                    .unwrap_or(Path::new("/var/lib/quasar"))
-                    .join("templates")
-                    .to_string_lossy()
-                    .into_owned()
-            });
-        paths.push(template);
+        paths.push(
+            template_root_for(Path::new(&home))
+                .to_string_lossy()
+                .into_owned(),
+        );
     }
     validate_sibling_mounts(&container.mounts, &paths)
+}
+
+/// `QUASAR_TEMPLATE_ROOT`, or the sibling-of-homes default (`{home}/../templates`).
+pub(super) fn template_root_for(home: &Path) -> PathBuf {
+    std::env::var("QUASAR_TEMPLATE_ROOT")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            home.parent()
+                .unwrap_or(Path::new("/var/lib/quasar"))
+                .join("templates")
+        })
 }
 
 fn validate_sibling_mounts(mounts: &[crate::runtime::Mount], paths: &[String]) -> Option<String> {
@@ -437,6 +447,10 @@ pub fn probe(env: &ProbeEnv) -> Vec<ReadinessCheck> {
             Some(error) => fail("host_container_mounts", error.clone(), "Use the generated bind mounts at identical host/container paths. Fix the Docker socket or mount configuration, then recreate the agent; checks refresh automatically.".to_string()),
             None => pass("host_container_mounts", "Required sibling-container paths agree with their host bind mounts".to_string()),
         },
+        storage::check_homes_root_writable(&env.storage, storage::WriteIdentity::from_env_pair(env.app_uid, env.app_gid)),
+        storage::check_homes_free_space(&env.storage),
+        storage::check_template_free_space(&env.storage),
+        storage::check_image_free_space(&env.storage),
         // The update path: what preflight reads about this host.
         platform_update::check_updater_socket(&env.updater, env.updater_present),
         platform_update::check_updater_stack_dir(&env.updater),
@@ -2495,6 +2509,7 @@ mod tests {
                     node: "test".to_string(),
                     pid: 1,
                 },
+                storage: storage::StorageView::default(),
             }
         }
 
@@ -2595,12 +2610,18 @@ mod tests {
             }
             // The update-path checks read the fixture's empty collectors as not
             // applicable (no updater service, health endpoint unprobed).
+            // Storage roots are unconfigured in the fixture (#253), so those are not
+            // applicable either.
             if matches!(
                 c.id.as_str(),
                 "updater_socket"
                     | "updater_stack_dir"
                     | "updater_overlays"
                     | "health_addr_bindable"
+                    | "homes_root_writable"
+                    | "homes_free_space"
+                    | "template_free_space"
+                    | "image_free_space"
             ) {
                 assert_eq!(
                     c.status, SKIP,
@@ -4895,4 +4916,5 @@ table ip raw {
     }
 
     mod report;
+    mod storage_checks;
 }

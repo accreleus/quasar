@@ -28,6 +28,11 @@ const AGENT_CHECK_IDS = [
   "encoder_codecs",
   "media_reachability",
   "nvidia_vulkan_av1_compatibility",
+  // #253: storage (readiness/storage.rs).
+  "homes_root_writable",
+  "homes_free_space",
+  "template_free_space",
+  "image_free_space",
 ];
 
 describe("readiness groups (#102)", () => {
@@ -41,6 +46,13 @@ describe("readiness groups (#102)", () => {
   it("keeps NVIDIA-related checks together, driver_volume_version included", () => {
     const nvidia = READINESS_GROUPS.find((g) => g.key === "nvidia");
     expect(nvidia?.ids).toEqual(["nvidia_egl_vendor_json", "nvidia_eglcore_library", "nvidia_lib32_gl", "driver_volume_version", "nvidia_vulkan_av1_compatibility"]);
+  });
+
+  // #253: the storage checks sit together, homes first — the two that can block later.
+  it("groups the storage checks under Storage, homes first", () => {
+    const storage = READINESS_GROUPS.find((g) => g.key === "storage");
+    expect(storage?.label).toBe("Storage");
+    expect(storage?.ids).toEqual(["homes_root_writable", "homes_free_space", "template_free_space", "image_free_space"]);
   });
 
   it("demotes skipped checks to not-applicable and omits a group with nothing left to show", () => {

@@ -117,6 +117,35 @@ describe("ReadinessCard", () => {
     expect(screen.getByRole("img", { name: "Provisioning" })).toBeInTheDocument();
   });
 
+  // #253: storage has its own group; a warn there carries the fix like any other warn.
+  it("shows the storage checks under a Storage group with their fix", () => {
+    render(
+      <ReadinessCard
+        checks={[
+          check({ id: "render_node" }),
+          check({ id: "homes_root_writable", status: "pass", summary: "the app identity (uid 1000) wrote a test home under /var/lib/quasar/homes" }),
+          check({
+            id: "homes_free_space",
+            status: "warn",
+            summary: "1.2 GiB free under /var/lib/quasar/homes, below the 5 GiB floor",
+            remediation: "Free space on the filesystem holding /var/lib/quasar/homes, or set QUASAR_HOMES_FREE_SPACE_FLOOR_GIB.",
+          }),
+        ]}
+      />,
+    );
+    const main = screen.getByTestId("readiness-checks");
+    expect(within(main).getAllByTestId("readiness-group").map((g) => g.getAttribute("data-group"))).toEqual(["gpu", "storage"]);
+    const storage = main.querySelector('[data-group="storage"]') as HTMLElement;
+    expect(within(storage).getByText("Storage")).toBeInTheDocument();
+    expect([...storage.querySelectorAll('[data-testid^="readiness-check-"]')].map((e) => e.getAttribute("data-testid"))).toEqual([
+      "readiness-check-homes_free_space",
+      "readiness-check-homes_root_writable",
+    ]);
+    expect(within(storage).getByRole("heading", { name: "homes free space" })).toBeInTheDocument();
+    expect(within(storage).getByText(/QUASAR_HOMES_FREE_SPACE_FLOOR_GIB/)).toBeInTheDocument();
+    expect(screen.queryByText("Needs attention")).not.toBeInTheDocument();
+  });
+
   it("says 'check' in the singular when one is not applicable", () => {
     render(<ReadinessCard checks={[check({ id: "render_node" }), check({ id: "nvidia_lib32_gl", status: "skip" })]} />);
     expect(screen.getByText("1 check not applicable to this host")).toBeInTheDocument();

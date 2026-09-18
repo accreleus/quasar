@@ -351,6 +351,7 @@ services:
       QUASAR_HOMES_GC: ${QUASAR_HOMES_GC:-}
       QUASAR_HOMES_GC_RETENTION_HOURS: ${QUASAR_HOMES_GC_RETENTION_HOURS:-}
       QUASAR_HOMES_GC_DRY_RUN: ${QUASAR_HOMES_GC_DRY_RUN:-}
+      QUASAR_HOMES_FREE_SPACE_FLOOR_GIB: ${QUASAR_HOMES_FREE_SPACE_FLOOR_GIB:-}
       # #145 Steam preparation defaults on for explicitly supported images.
       # The Steam source policy controls both activities; host permissions
       # below can opt out independently. Missing flags retain the default.

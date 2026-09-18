@@ -11,7 +11,7 @@
 //! re-checks it in [`ImageManager::commit`].
 
 pub(crate) mod build;
-mod disk;
+pub(crate) mod disk;
 mod errors;
 mod progress;
 mod semaphore;

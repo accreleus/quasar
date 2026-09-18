@@ -24,6 +24,9 @@ own; the two do not move together, and that is deliberate.
 
 ## Unreleased
 
+### Added
+- **Storage readiness checks (#253).** The host readiness card gains a Storage group: `homes_root_writable` performs a real write test (a test home created under `QUASAR_HOME_ROOT`, handed to the app identity, written and removed), and `homes_free_space` warns below a floor (`QUASAR_HOMES_FREE_SPACE_FLOOR_GIB`, default 5) and fails only when exhausted; `template_free_space` and `image_free_space` warn only. Advisory in this slice; blocking arrives with the RH-02 admission gate.
+
 ### Removed
 - **The node agent no longer needs a `docker` or `podman` executable (#239).** Every
   runtime operation it performs — discovery, image presence/pull/build/removal,
