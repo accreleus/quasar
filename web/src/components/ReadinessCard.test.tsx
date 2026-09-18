@@ -117,6 +117,44 @@ describe("ReadinessCard", () => {
     expect(screen.getByRole("img", { name: "Provisioning" })).toBeInTheDocument();
   });
 
+  // #254: readiness is what the host can establish about itself; the card says so on
+  // every render and never claims a browser can reach the host.
+  it("carries the host-local note whether or not checks were reported", () => {
+    const { unmount } = render(<ReadinessCard checks={null} />);
+    expect(screen.getByTestId("readiness-host-local-note")).toHaveTextContent(/what this host can establish about itself/i);
+    expect(screen.getByTestId("readiness-host-local-note")).toHaveTextContent(/does not show whether a browser can reach/i);
+    unmount();
+    render(<ReadinessCard checks={[check({ id: "render_node" })]} />);
+    expect(screen.getByTestId("readiness-host-local-note")).toBeInTheDocument();
+  });
+
+  it("shows the runtime checks first under Container runtime, an unreachable engine with its fix", () => {
+    render(
+      <ReadinessCard
+        checks={[
+          check({ id: "render_node" }),
+          check({ id: "runtime_cdi", status: "skip", summary: "the engine did not report CDI" }),
+          check({
+            id: "runtime_endpoint",
+            status: "fail",
+            summary: "the container runtime at unix:///var/run/docker.sock is unreachable: connection refused",
+            remediation: "Check that Docker is running on the host and that /var/run/docker.sock is mounted into the agent container.",
+          }),
+          check({ id: "runtime_api_version", status: "skip", summary: "no engine answered" }),
+        ]}
+      />,
+    );
+    const main = screen.getByTestId("readiness-checks");
+    expect(within(main).getAllByTestId("readiness-group").map((g) => g.getAttribute("data-group"))).toEqual(["runtime", "gpu"]);
+    const runtime = main.querySelector('[data-group="runtime"]') as HTMLElement;
+    expect(within(runtime).getByText("Container runtime")).toBeInTheDocument();
+    expect(within(runtime).getByRole("heading", { name: "runtime endpoint" })).toBeInTheDocument();
+    expect(within(runtime).getByText(/is unreachable/)).toBeInTheDocument();
+    expect(within(runtime).getByRole("button", { name: /copy/i })).toBeInTheDocument();
+    expect(screen.getByText("Needs attention")).toBeInTheDocument();
+    expect(screen.getByText("2 checks not applicable to this host")).toBeInTheDocument();
+  });
+
   // #253: storage has its own group; a warn there carries the fix like any other warn.
   it("shows the storage checks under a Storage group with their fix", () => {
     render(

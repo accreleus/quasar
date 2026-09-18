@@ -28,6 +28,11 @@ const AGENT_CHECK_IDS = [
   "encoder_codecs",
   "media_reachability",
   "nvidia_vulkan_av1_compatibility",
+  // #254: the container runtime (readiness/runtime_facts.rs).
+  "runtime_endpoint",
+  "runtime_api_version",
+  "runtime_capabilities",
+  "runtime_cdi",
   // #253: storage (readiness/storage.rs).
   "homes_root_writable",
   "homes_free_space",
@@ -46,6 +51,13 @@ describe("readiness groups (#102)", () => {
   it("keeps NVIDIA-related checks together, driver_volume_version included", () => {
     const nvidia = READINESS_GROUPS.find((g) => g.key === "nvidia");
     expect(nvidia?.ids).toEqual(["nvidia_egl_vendor_json", "nvidia_eglcore_library", "nvidia_lib32_gl", "driver_volume_version", "nvidia_vulkan_av1_compatibility"]);
+  });
+
+  // #254: the runtime is the most basic fault, so it is the first group.
+  it("puts the container runtime checks first, endpoint before what it negotiated", () => {
+    expect(READINESS_GROUPS[0].key).toBe("runtime");
+    expect(READINESS_GROUPS[0].label).toBe("Container runtime");
+    expect(READINESS_GROUPS[0].ids).toEqual(["runtime_endpoint", "runtime_api_version", "runtime_capabilities", "runtime_cdi"]);
   });
 
   // #253: the storage checks sit together, homes first — the two that can block later.

@@ -18,6 +18,8 @@ export interface ReadinessGroupDef {
 }
 
 export const READINESS_GROUPS: readonly ReadinessGroupDef[] = [
+  // #254: the runtime is the most basic fault, so it comes first; observed only.
+  { key: "runtime", label: "Container runtime", ids: ["runtime_endpoint", "runtime_api_version", "runtime_capabilities", "runtime_cdi"] },
   {
     key: "gpu",
     label: "GPU & display",

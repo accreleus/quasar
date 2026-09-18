@@ -13,6 +13,7 @@
 /// The update-path checks (preflight ids), with their collectors.
 pub mod platform_update;
 pub mod report;
+pub mod runtime_facts;
 pub mod storage;
 
 use std::io::Read as _;
@@ -182,6 +183,8 @@ pub struct ProbeEnv {
     pub self_identity: platform_update::HealthIdentity,
     /// The storage roots and their free space (#253), read once per probe.
     pub storage: storage::StorageView,
+    /// The container engine as one inspection saw it (#254), read once per probe.
+    pub runtime: runtime_facts::RuntimeView,
 }
 
 /// The driver-volume provisioner's state, as readiness sees it. Plain data, not a live call
@@ -276,6 +279,7 @@ impl ProbeEnv {
                 pid: std::process::id(),
             },
             storage: storage::StorageView::live(),
+            runtime: runtime_facts::RuntimeView::live(),
         }
     }
 
@@ -416,6 +420,10 @@ fn validate_sibling_mounts(mounts: &[crate::runtime::Mount], paths: &[String]) -
 pub fn probe(env: &ProbeEnv) -> Vec<ReadinessCheck> {
     let distro = detect_distro(env);
     vec![
+        runtime_facts::check_runtime_endpoint(&env.runtime),
+        runtime_facts::check_runtime_api_version(&env.runtime),
+        runtime_facts::check_runtime_capabilities(&env.runtime),
+        runtime_facts::check_runtime_cdi(&env.runtime),
         // Runtime veto: files present but the stack not loading must never read green.
         veto_if_egl_broken(check_nvidia_egl_vendor(env, distro), env),
         veto_if_egl_broken(check_nvidia_eglcore(env, distro), env),
@@ -1673,21 +1681,21 @@ fn check_media_reachability(env: &ProbeEnv, distro: Distro) -> ReadinessCheck {
     match &env.firewall {
         FirewallPosture::Unknown => skip(
             ID,
-            "could not determine whether a host firewall would block WebRTC media — no \
-             firewalld or nft client tool answered from inside the agent container (nft is in \
-             the image and needs CAP_NET_ADMIN, which the compose file grants)",
+            "could not determine this host's inbound firewall posture — no firewalld or nft \
+             client tool answered from inside the agent container (nft is in the image and needs \
+             CAP_NET_ADMIN, which the compose file grants)",
         ),
         FirewallPosture::Unfiltered { detail, .. } => pass(
             ID,
             format!(
-                "no host firewall filters inbound traffic ({detail}) — nothing here would block \
-                 WebRTC media"
+                "this host's inbound firewall filters nothing ({detail}) — the host itself would \
+                 not block inbound WebRTC media"
             ),
         ),
         FirewallPosture::Open => pass(
             ID,
-            "the detected host firewall reports a default-accept posture — no evidence it would \
-             block WebRTC media"
+            "this host's firewall reports a default-accept inbound posture — the host itself \
+             would not block inbound WebRTC media"
                 .to_string(),
         ),
         FirewallPosture::Filtering {
@@ -1721,28 +1729,27 @@ fn filtering_check(
         MediaAllow::Covered { evidence } => pass(
             id,
             format!(
-                "a host firewall with a default-deny/input-filtering posture is active \
-                 ({detail}), and its own rules already accept the WebRTC media path — UDP \
-                 {lo}-{hi} and UDP/{MDNS_PORT} (mDNS) are both covered by: {evidence}. If video \
-                 still never arrives, check those rules' SOURCE scope covers the client's \
-                 subnet — that is the one thing this check cannot judge"
+                "this host's inbound firewall filters by default ({detail}), and its own rules \
+                 already accept the WebRTC media path — UDP {lo}-{hi} and UDP/{MDNS_PORT} (mDNS) \
+                 are both covered by: {evidence}. If video still never arrives, check those \
+                 rules' SOURCE scope covers the client's subnet — that is the one thing this \
+                 host-local check cannot judge"
             ),
         ),
         MediaAllow::Partial { evidence, gap } => warn_check(
             id,
             format!(
-                "a host firewall with a default-deny/input-filtering posture is active \
-                 ({detail}) and its rules accept only part of the WebRTC media path (matched: \
-                 {evidence}) — {gap}. {SYMPTOM}"
+                "this host's inbound firewall filters by default ({detail}) and its rules accept \
+                 only part of the WebRTC media path (matched: {evidence}) — {gap}. {SYMPTOM}"
             ),
             firewall_remediation(env, tool, distro),
         ),
         MediaAllow::Absent => warn_check(
             id,
             format!(
-                "a host firewall with a default-deny/input-filtering posture is active \
-                 ({detail}), and no accept rule covering UDP {lo}-{hi} or UDP/{MDNS_PORT} \
-                 (mDNS) was found in its active rule set. {SYMPTOM}"
+                "this host's inbound firewall filters by default ({detail}), and no accept rule \
+                 covering UDP {lo}-{hi} or UDP/{MDNS_PORT} (mDNS) was found in its active rule \
+                 set. {SYMPTOM}"
             ),
             firewall_remediation(env, tool, distro),
         ),
@@ -2510,6 +2517,7 @@ mod tests {
                     pid: 1,
                 },
                 storage: storage::StorageView::default(),
+                runtime: runtime_facts::RuntimeView::NotObserved,
             }
         }
 
@@ -2610,8 +2618,8 @@ mod tests {
             }
             // The update-path checks read the fixture's empty collectors as not
             // applicable (no updater service, health endpoint unprobed).
-            // Storage roots are unconfigured in the fixture (#253), so those are not
-            // applicable either.
+            // Storage roots are unconfigured and the engine unobserved in the fixture
+            // (#253, #254), so those are not applicable either.
             if matches!(
                 c.id.as_str(),
                 "updater_socket"
@@ -2622,6 +2630,10 @@ mod tests {
                     | "homes_free_space"
                     | "template_free_space"
                     | "image_free_space"
+                    | "runtime_endpoint"
+                    | "runtime_api_version"
+                    | "runtime_capabilities"
+                    | "runtime_cdi"
             ) {
                 assert_eq!(
                     c.status, SKIP,
@@ -4307,9 +4319,9 @@ table ip raw {
         assert_eq!(c.status, SKIP);
         assert_eq!(
             c.summary,
-            "could not determine whether a host firewall would block WebRTC media — no \
-             firewalld or nft client tool answered from inside the agent container (nft is in \
-             the image and needs CAP_NET_ADMIN, which the compose file grants)"
+            "could not determine this host's inbound firewall posture — no firewalld or nft \
+             client tool answered from inside the agent container (nft is in the image and \
+             needs CAP_NET_ADMIN, which the compose file grants)"
         );
         assert!(c.remediation.is_empty());
     }
@@ -4327,8 +4339,8 @@ table ip raw {
         assert_eq!(c.status, PASS);
         assert_eq!(
             c.summary,
-            "no host firewall filters inbound traffic (nft answered: no input hook chain in the \
-             ruleset) — nothing here would block WebRTC media"
+            "this host's inbound firewall filters nothing (nft answered: no input hook chain in \
+             the ruleset) — the host itself would not block inbound WebRTC media"
         );
         assert!(c.remediation.is_empty());
     }
@@ -4340,6 +4352,48 @@ table ip raw {
         let c = check_media_reachability(&env, Distro::Fedora);
         assert_eq!(c.status, PASS);
         assert!(c.remediation.is_empty());
+        assert!(c.summary.starts_with("this host's"), "{}", c.summary);
+    }
+
+    /// #254: every arm describes the host's own inbound firewall posture and none claims a
+    /// browser can reach the host — the host cannot know that.
+    #[test]
+    fn media_reachability_wording_is_host_local_in_every_arm() {
+        let root = FakeRoot::new("firewall-wording");
+        let postures = [
+            FirewallPosture::Unknown,
+            FirewallPosture::Open,
+            FirewallPosture::Unfiltered {
+                tool: FirewallTool::Nftables,
+                detail: NFT_NO_INPUT_CHAIN_DETAIL.to_string(),
+            },
+            FirewallPosture::Filtering {
+                tool: FirewallTool::Firewalld,
+                detail: "firewalld zone target=default".to_string(),
+                media_allow: MediaAllow::Absent,
+            },
+            FirewallPosture::Filtering {
+                tool: FirewallTool::Nftables,
+                detail: "nftables input policy=drop".to_string(),
+                media_allow: MediaAllow::Covered {
+                    evidence: "udp dport 32768-60999 accept".to_string(),
+                },
+            },
+        ];
+        for posture in postures {
+            let c = check_media_reachability(&root.env_firewall(posture.clone()), Distro::Fedora);
+            let text = c.summary.to_lowercase();
+            assert!(
+                text.contains("this host's") || text.contains("the host itself"),
+                "{posture:?}: {}",
+                c.summary
+            );
+            assert!(
+                !text.contains("reachab") && !text.contains("browser can"),
+                "{posture:?} must not imply browser reachability: {}",
+                c.summary
+            );
+        }
     }
 
     /// A filtering firewall is `warn` with the symptom and a real command, NEVER `fail` — a
@@ -4916,5 +4970,6 @@ table ip raw {
     }
 
     mod report;
+    mod runtime_checks;
     mod storage_checks;
 }
