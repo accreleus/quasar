@@ -165,7 +165,6 @@ pub struct ProbeEnv {
     /// Can the runtime pass the provisioned driver into sibling app containers?
     pub driver_mount_error: Option<String>,
     pub container_mount_error: Option<String>,
-    pub sibling_egl: crate::nvidia_volume::EglRuntime,
     /// Does the EGL stack this container loads actually WORK, as opposed to being present on
     /// disk? A file-presence pass that is green while the compositor cannot init EGL sends the
     /// operator elsewhere, so this runtime verdict VETOES it (loop-3 guard).
@@ -254,7 +253,6 @@ impl ProbeEnv {
             nvidia_lib32_path: nvidia_lib32_path.to_string(),
             nvidia_volume: VolumeView::live(),
             container_mount_error: sibling_mount_error(),
-            sibling_egl: if nvidia { crate::nvidia_volume::probe_sibling_egl() } else { crate::nvidia_volume::EglRuntime::Unknown },
             driver_mount_error: crate::nvidia_volume::mount_resolution_error().or_else(|| crate::nvidia_volume::current().and_then(|info| {
                 if info.host.is_none() && info.name.is_none() {
                     Some(format!("The agent can read its NVIDIA driver volume but cannot resolve its Docker mount. App launches are blocked; check Docker socket and identity inspection, or set {} to the host directory already mounted at /opt/quasar/nvidia-driver.", crate::nvidia_volume::HOST_PATH_ENV))
@@ -436,12 +434,6 @@ pub fn probe(env: &ProbeEnv) -> Vec<ReadinessCheck> {
         check_host_render_node(env, distro),
         check_dri_node_app_access(env, distro),
         check_driver_volume_version(env, distro),
-        match &env.sibling_egl {
-            crate::nvidia_volume::EglRuntime::Ok { .. } => pass("nvidia_sibling_egl", "Provisioned NVIDIA driver loads in a sibling container".into()),
-            crate::nvidia_volume::EglRuntime::Broken { detail, .. } => fail("nvidia_sibling_egl", detail.clone(), "The agent's driver works locally but failed the sibling-container EGL test. Check the driver mount and libraries; the test retries automatically.".into()),
-            crate::nvidia_volume::EglRuntime::Indeterminate { detail } => warn_check("nvidia_sibling_egl", detail.clone(), "Driver loading in a sibling container is not confirmed. Check Docker runtime access; the test retries automatically.".into()),
-            crate::nvidia_volume::EglRuntime::Unknown => skip("nvidia_sibling_egl", "No provisioned driver requires a sibling-container test"),
-        },
         match &env.driver_mount_error {
             Some(error) => fail("nvidia_driver_mount", error.clone(), "Check Docker socket and container mount inspection, or set QUASAR_NVIDIA_DRIVER_HOST_PATH to the host directory already mounted at /opt/quasar/nvidia-driver. Explicit paths must pass the same-directory sibling check. Recreate the agent after changing environment settings; reinstalling drivers will not fix mount resolution.".to_string()),
             None => skip("nvidia_driver_mount", "No unresolved NVIDIA app driver mount"),
@@ -2505,7 +2497,6 @@ mod tests {
                 nvidia_volume: VolumeView::None,
                 driver_mount_error: None,
                 container_mount_error: None,
-                sibling_egl: crate::nvidia_volume::EglRuntime::Unknown,
                 // `Unknown` means "not probed" and must never influence a verdict on its own.
                 egl_runtime: crate::nvidia_volume::EglRuntime::Unknown,
                 firewall: FirewallPosture::Unknown,
@@ -2609,7 +2600,7 @@ mod tests {
             ..root.env(true, "/usr/lib")
         });
         for c in &checks {
-            if matches!(c.id.as_str(), "nvidia_driver_mount" | "nvidia_sibling_egl") {
+            if c.id.as_str() == "nvidia_driver_mount" {
                 assert_eq!(
                     c.status, SKIP,
                     "native host needs no provisioned driver mount"

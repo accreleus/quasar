@@ -1,7 +1,10 @@
 //! Host probes (spec #252): bounded, disposable jobs that exercise a real path and
 //! report the result as a retained readiness check. Glossary: `CONTEXT.md` "Host readiness".
 
+pub mod app_gpu;
+pub mod audio;
 pub mod child;
+pub mod container;
 pub mod decision;
 pub mod launch_failure;
 pub mod media;

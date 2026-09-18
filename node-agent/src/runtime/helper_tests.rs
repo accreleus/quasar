@@ -4937,6 +4937,55 @@ fn gpu_probe_dropped_observation_stops_and_removes_nothing() {
     assert!(engine.state.lock().unwrap().body.is_none());
 }
 
+/// A launch pre-empts a probe, or its deadline passes: the orchestrator stops WAITING
+/// and nothing else. Only the explicit stop and cleanup end the container.
+#[test]
+fn gpu_probe_cancelled_wait_stops_and_removes_nothing_and_explicit_teardown_still_works() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().keep_running = true;
+    let client = engine.client();
+    let (helper, run) = dri_probe_request("dri-cancelled-wait");
+    let id = client.run_gpu_probe(helper, run).wait().unwrap();
+    // A timeout would report `Timeout`, so the kind alone proves it did not just
+    // sit until the deadline.
+    assert_eq!(
+        client
+            .observe_gpu_probe(id.clone())
+            .wait_with_cancel(|| true)
+            .unwrap_err()
+            .kind,
+        ErrorKind::Cancelled
+    );
+    assert!(engine.state.lock().unwrap().running);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 0);
+    assert_eq!(engine.requests("DELETE /containers/"), 0);
+    assert_eq!(
+        helper_intent(&engine, "dri-cancelled-wait").phase,
+        HelperPhase::Running
+    );
+    client.stop_gpu_probe(id.clone()).wait().unwrap();
+    client.cleanup_gpu_probe(id).wait().unwrap();
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 1);
+    assert_eq!(engine.requests("DELETE /containers/"), 1);
+    assert!(engine.state.lock().unwrap().body.is_none());
+}
+
+#[test]
+fn gpu_probe_that_finishes_before_any_cancel_returns_its_outcome() {
+    let engine = Engine::new();
+    let client = engine.client();
+    let (helper, run) = dri_probe_request("dri-uncancelled-wait");
+    let id = client.run_gpu_probe(helper, run).wait().unwrap();
+    let result = client
+        .observe_gpu_probe(id.clone())
+        .wait_with_cancel(|| false)
+        .unwrap();
+    assert_eq!(result.exit_code, Some(23));
+    assert_eq!(result.stdout, "final stdout");
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 0);
+    client.cleanup_gpu_probe(id).wait().unwrap();
+}
+
 #[test]
 fn gpu_probe_lost_create_reply_is_reconciled_under_the_same_operation() {
     let engine = Engine::new();
@@ -5492,3 +5541,5 @@ fn gpu_probe_stop_is_durable_across_an_unreachable_engine_and_recovery_finishes_
         Some(23)
     );
 }
+
+mod host_probes;

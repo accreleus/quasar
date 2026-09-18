@@ -295,6 +295,27 @@ impl<T> Operation<T> {
             .recv()
             .unwrap_or_else(|_| Err(ErrorKind::Unavailable.into()))
     }
+
+    /// Stop waiting when a host probe's deadline passes or a launch pre-empts it, then
+    /// keep waiting for the executor's own answer: dropping an observation must never
+    /// stop, remove or roll back anything, and the race the cancellation lost still
+    /// carries the real result.
+    pub fn wait_with_cancel(self, mut cancelled: impl FnMut() -> bool) -> Result<T, RuntimeError> {
+        let mut sent = false;
+        loop {
+            if !sent && cancelled() {
+                self.cancel();
+                sent = true;
+            }
+            match self.result.recv_timeout(Duration::from_millis(50)) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ErrorKind::Unavailable.into())
+                }
+            }
+        }
+    }
 }
 impl<T> Drop for Operation<T> {
     fn drop(&mut self) {

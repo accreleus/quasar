@@ -42,7 +42,7 @@ pub fn indeterminate_status() -> &'static str {
 
 /// Signals a process raises against itself by crashing. Anything else (SIGKILL from the
 /// OOM killer, SIGTERM from an operator) says nothing about the path under test.
-fn fault_signal(signal: i32) -> Option<&'static str> {
+pub(super) fn fault_signal(signal: i32) -> Option<&'static str> {
     match signal {
         libc::SIGSEGV => Some("SIGSEGV"),
         libc::SIGABRT => Some("SIGABRT"),
@@ -56,7 +56,7 @@ fn fault_signal(signal: i32) -> Option<&'static str> {
 }
 
 /// (what passed, what failed, what was being exercised) for operator sentences.
-fn wording(target: ProbeTarget) -> (String, String, String) {
+pub(super) fn wording(target: ProbeTarget) -> (String, String, String) {
     let gpu = target
         .gpu
         .map_or("The GPU".to_string(), |i| format!("GPU {i}"));

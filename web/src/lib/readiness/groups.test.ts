@@ -16,7 +16,9 @@ const AGENT_CHECK_IDS = [
   "health_addr_bindable",
   // Host probes (host_probe.rs).
   "media_probe",
+  "application_gpu_probe",
   "input_probe",
+  "audio_probe",
   "xid_visibility",
   "nvidia_egl_vendor_json",
   "nvidia_eglcore_library",
@@ -143,5 +145,25 @@ describe("readiness groups (#102)", () => {
     expect(baseCheckId("application_gpu_probe_gpu1")).toBe("application_gpu_probe");
     expect(baseCheckId("render_node")).toBe("render_node");
     expect(baseCheckId("input_probe")).toBe("input_probe");
+  });
+
+  it("places per-GPU application_gpu_probe checks in the gpu group and sorts after media_probe_gpu<N>", () => {
+    const { groups } = groupChecks([c("media_probe_gpu0"), c("application_gpu_probe_gpu0"), c("render_node")]);
+    const gpu = groups.find((g) => g.key === "gpu");
+    expect(gpu?.checks.map((x) => x.id)).toEqual(["media_probe_gpu0", "application_gpu_probe_gpu0", "render_node"]);
+  });
+
+  it("places audio_probe in the audio group", () => {
+    const { groups } = groupChecks([c("audio_probe"), c("uinput")]);
+    const audio = groups.find((g) => g.key === "audio");
+    expect(audio?.label).toBe("Audio");
+    expect(audio?.checks.map((x) => x.id)).toEqual(["audio_probe"]);
+  });
+
+  it("places the audio group after input and before storage in READINESS_GROUPS order", () => {
+    const inputIdx = READINESS_GROUPS.findIndex((g) => g.key === "input");
+    const audioIdx = READINESS_GROUPS.findIndex((g) => g.key === "audio");
+    const storageIdx = READINESS_GROUPS.findIndex((g) => g.key === "storage");
+    expect(inputIdx < audioIdx && audioIdx < storageIdx).toBe(true);
   });
 });

@@ -33,6 +33,15 @@ own; the two do not move together, and that is deliberate.
   probe, whose result is then indeterminate (shown as a warning that leaves the last definitive
   result in force). Advisory only: nothing blocks a launch yet. The agent binary now refuses an
   unknown subcommand instead of starting as an agent.
+- **Host probes, second slice (#259).** The agent proves the two paths that are sibling
+  containers. Application GPU access: a disposable container, given GPU access by the same code
+  that prepares a session's application container, opens the GPU through EGL from the agent's
+  own image (`application_gpu_probe_gpu<N>`); this replaces the NVIDIA-only `nvidia_sibling_egl`
+  readiness check on every vendor. Audio: the audio sidecar profile is started under a probe
+  identity, its socket appears, and it is stopped and removed (`audio_probe`). One probe runs at
+  a time per host, a launch pre-empts it, and an interrupted probe container is reconciled under
+  its original identity before another starts. The readiness card gains an Audio group. Advisory
+  only.
 - **Storage readiness checks (#253).** The host readiness card gains a Storage group: `homes_root_writable` performs a real write test (a test home created under `QUASAR_HOME_ROOT`, handed to the app identity, written and removed), and `homes_free_space` warns below a floor (`QUASAR_HOMES_FREE_SPACE_FLOOR_GIB`, default 5) and fails only when exhausted; `template_free_space` and `image_free_space` warn only. Advisory in this slice; blocking arrives with the RH-02 admission gate.
 - **Container runtime and CDI readiness checks (#254).** The readiness card gains a Container runtime group: `runtime_endpoint` (reachable, or why not, with the fix), `runtime_api_version` (the negotiated engine API and the engine's range), `runtime_capabilities` (what the engine states about itself) and `runtime_cdi` (whether CDI is enabled and which devices the engine discovered). Observed only: GPU injection is unchanged. The firewall check `media_reachability` keeps its id and is reworded as the host's inbound firewall posture, and the card states that readiness is host-local and never implies a browser can reach the host.
 

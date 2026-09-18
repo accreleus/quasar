@@ -23,7 +23,7 @@ export const READINESS_GROUPS: readonly ReadinessGroupDef[] = [
   {
     key: "gpu",
     label: "GPU & display",
-    ids: ["media_probe", "render_node", "host_render_node", "dri_node_app_access", "xid_visibility", "encoder_codecs"],
+    ids: ["media_probe", "application_gpu_probe", "render_node", "host_render_node", "dri_node_app_access", "xid_visibility", "encoder_codecs"],
   },
   {
     key: "nvidia",
@@ -31,6 +31,8 @@ export const READINESS_GROUPS: readonly ReadinessGroupDef[] = [
     ids: ["nvidia_egl_vendor_json", "nvidia_eglcore_library", "nvidia_lib32_gl", "driver_volume_version", "nvidia_vulkan_av1_compatibility"],
   },
   { key: "input", label: "Input & sandbox", ids: ["input_probe", "uinput", "user_namespaces", "app_apparmor_profile"] },
+  // #259: the audio sidecar host probe.
+  { key: "audio", label: "Audio", ids: ["audio_probe"] },
   // #253: storage; homes first — the two that can block a launch later.
   { key: "storage", label: "Storage", ids: ["homes_root_writable", "homes_free_space", "template_free_space", "image_free_space"] },
   { key: "network", label: "Network", ids: ["media_reachability"] },

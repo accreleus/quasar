@@ -31,7 +31,15 @@ enum Mode {
     /// EGL dispatcher self-test. Spawned as a CHILD by the readiness probe
     /// (`nvidia_volume::probe_egl_runtime`) so a segfault in a broken vendor stack cannot
     /// take the agent down.
-    EglSelfTest { vendor_lib: Option<String> },
+    EglSelfTest {
+        vendor_lib: Option<String>,
+        /// `--open-device`: also open a GPU, which is what the application-GPU host
+        /// probe asks. Absent keeps the dispatcher-only stdout its other callers parse.
+        open_device: bool,
+        /// `--render-node <path>`: open that hardware device rather than the first
+        /// enumerated one.
+        render_node: Option<String>,
+    },
     /// #500: one throwaway-home sweep, then exit. Same knobs, guards and code path as the
     /// daily timer; `make homes-gc` execs it in the running agent container.
     HomesGc { dry_run: bool },
@@ -106,6 +114,8 @@ fn parse_mode(args: &[String]) -> Result<Mode, String> {
         }
         Some(quasar_node_agent::nvidia_volume::EGL_SELFTEST_ARG) => Mode::EglSelfTest {
             vendor_lib: args.get(1).filter(|s| !s.starts_with("--")).cloned(),
+            open_device: args.iter().any(|a| a == "--open-device"),
+            render_node: arg_value(args, "--render-node"),
         },
         Some("homes-gc") => Mode::HomesGc {
             dry_run: args.iter().any(|a| a == "--dry-run"),
@@ -165,9 +175,16 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
 async fn main() {
     // Must run before the subscriber and any other setup: its stdout contract is
     // `KEY=value` lines only, and it must observe the loader in a virgin process.
-    if let Mode::EglSelfTest { vendor_lib } = parse_args() {
+    if let Mode::EglSelfTest {
+        vendor_lib,
+        open_device,
+        render_node,
+    } = parse_args()
+    {
         std::process::exit(quasar_node_agent::nvidia_volume::egl_selftest_main(
             vendor_lib.as_deref(),
+            open_device,
+            render_node.as_deref(),
         ));
     }
 
@@ -620,6 +637,56 @@ mod tests {
                 "{arg} parsed as {mode:?}"
             );
         }
+    }
+
+    /// The readiness and launch-gate callers pass no flag and must keep the dispatcher
+    /// stdout contract; only the application-GPU probe asks for a device.
+    #[test]
+    fn egl_selftest_opens_a_device_only_when_asked() {
+        let egl = quasar_node_agent::nvidia_volume::EGL_SELFTEST_ARG;
+        let vendor = "/vendor/libEGL_nvidia.so.0";
+        for (args, expected) in [
+            (vec![egl], (None, false)),
+            (vec![egl, vendor], (Some(vendor), false)),
+            (vec![egl, "--open-device"], (None, true)),
+            (vec![egl, vendor, "--open-device"], (Some(vendor), true)),
+        ] {
+            let Ok(Mode::EglSelfTest {
+                vendor_lib,
+                open_device,
+                ..
+            }) = parse_mode(&argv(&args))
+            else {
+                panic!("{args:?} did not parse as the EGL self-test");
+            };
+            assert_eq!((vendor_lib.as_deref(), open_device), expected, "{args:?}");
+        }
+    }
+
+    /// The application-GPU probe pins the exact GPU it was placed on.
+    #[test]
+    fn egl_selftest_render_node_is_optional_and_travels_with_open_device() {
+        let egl = quasar_node_agent::nvidia_volume::EGL_SELFTEST_ARG;
+        let Ok(Mode::EglSelfTest {
+            open_device,
+            render_node,
+            ..
+        }) = parse_mode(&argv(&[
+            egl,
+            "--open-device",
+            "--render-node",
+            "/dev/dri/renderD129",
+        ]))
+        else {
+            panic!("did not parse as the EGL self-test");
+        };
+        assert!(open_device);
+        assert_eq!(render_node.as_deref(), Some("/dev/dri/renderD129"));
+
+        let Ok(Mode::EglSelfTest { render_node, .. }) = parse_mode(&argv(&[egl])) else {
+            panic!("did not parse as the EGL self-test");
+        };
+        assert_eq!(render_node, None);
     }
 
     #[test]

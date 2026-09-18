@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::watch;
 
@@ -10,7 +10,10 @@ use crate::messages::GpuCapacity;
 use crate::session::settings::RuntimeSettings;
 use crate::session::warmup::gate::{GateRefusal, WarmupControl};
 
+use super::app_gpu;
+use super::audio;
 use super::child::{run_child, ChildSpec};
+use super::container::{ContainerProbeEnd, Observed};
 use super::media;
 use super::orchestrator::{BoxFuture, ProbeRunner, RunEnd};
 use super::outcome::{child_outcome, remediation, ChildEnd, ProbeOutcome};
@@ -19,6 +22,36 @@ use super::{ProbeKind, ProbeTarget};
 const INPUT_DEADLINE: Duration = Duration::from_secs(20);
 /// Must exceed the media child's own 15 s encode budget plus GStreamer init.
 const MEDIA_DEADLINE: Duration = Duration::from_secs(45);
+/// Must exceed the application-GPU probe's own 20 s in-container timeout.
+const APPLICATION_GPU_DEADLINE: Duration = Duration::from_secs(30);
+
+/// A fresh identity for one probe run: never minted over an unreconciled one, since the
+/// runner never starts a container probe of a kind still waiting on `reconcile`.
+fn probe_nonce() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    )
+}
+
+/// `None` when the host is unpinned or pinned to `gpu` itself; `Some(summary)` when a
+/// probe there would be a false alarm because the scheduler never places a session on
+/// any other GPU.
+fn pin_mismatch(settings: &RuntimeSettings, inventory: &[GpuCapacity], gpu: i32) -> Option<String> {
+    let gpu_cap = inventory.iter().find(|g| g.index == gpu)?;
+    let pinned = &settings.render_node;
+    if pinned.is_empty() || pinned == "software" {
+        return None;
+    }
+    let matches_pin = gpu_cap.render_node.as_deref() == Some(pinned.as_str())
+        || gpu_cap.device_path.as_deref() == Some(pinned.as_str());
+    (!matches_pin)
+        .then(|| format!("This host is pinned to {pinned}; sessions are never placed on GPU {gpu}"))
+}
 
 /// What a probe run needs from the agent loop. Refreshed before every `registered` /
 /// `inputs_observed` send, so a `Start` the orchestrator issues right after always sees
@@ -155,7 +188,7 @@ async fn run_media(
     let Some((settings, inventory, warmup)) = snapshot else {
         return RunEnd::Concluded {
             outcome: ProbeOutcome::Indeterminate {
-                reason: "the agent has no GPU inventory yet".into(),
+                reason: "The agent has no GPU inventory yet".into(),
             },
             reconciled: true,
         };
@@ -163,22 +196,11 @@ async fn run_media(
 
     // The host pins one render node: the scheduler never places a session on any
     // other GPU, so a bind failure there would be a false alarm, not evidence.
-    if let Some(gpu_cap) = inventory.iter().find(|g| g.index == gpu) {
-        let pinned = &settings.render_node;
-        if !pinned.is_empty() && pinned != "software" {
-            let matches_pin = gpu_cap.render_node.as_deref() == Some(pinned.as_str())
-                || gpu_cap.device_path.as_deref() == Some(pinned.as_str());
-            if !matches_pin {
-                return RunEnd::Concluded {
-                    outcome: ProbeOutcome::NotApplicable {
-                        summary: format!(
-                            "This host is pinned to {pinned}; sessions are never placed on GPU {gpu}"
-                        ),
-                    },
-                    reconciled: true,
-                };
-            }
-        }
+    if let Some(summary) = pin_mismatch(&settings, &inventory, gpu) {
+        return RunEnd::Concluded {
+            outcome: ProbeOutcome::NotApplicable { summary },
+            reconciled: true,
+        };
     }
 
     let spec = match media::child_spec(&settings, &inventory, gpu, MEDIA_DEADLINE) {
@@ -203,6 +225,165 @@ async fn run_media(
     }
 }
 
+/// Everything blocking (`own_image`, `app_gpu_access_live`, `runtime::configured`) runs
+/// inside `spawn_blocking`, never on the orchestrator loop.
+async fn run_application_gpu(
+    snapshot: Option<(
+        RuntimeSettings,
+        Vec<GpuCapacity>,
+        Option<Arc<WarmupControl>>,
+    )>,
+    gpu: i32,
+    preempt: watch::Receiver<bool>,
+) -> RunEnd {
+    let target = ProbeTarget::gpu(ProbeKind::ApplicationGpu, gpu);
+    let Some((settings, inventory, _warmup)) = snapshot else {
+        return RunEnd::Concluded {
+            outcome: ProbeOutcome::Indeterminate {
+                reason: "The agent has no GPU inventory yet".into(),
+            },
+            reconciled: true,
+        };
+    };
+    let Some(gpu_cap) = inventory.iter().find(|g| g.index == gpu) else {
+        return RunEnd::Concluded {
+            outcome: ProbeOutcome::Indeterminate {
+                reason: format!("GPU {gpu} is absent from the agent's latest capacity report"),
+            },
+            reconciled: true,
+        };
+    };
+    if let Some(summary) = pin_mismatch(&settings, &inventory, gpu) {
+        return RunEnd::Concluded {
+            outcome: ProbeOutcome::NotApplicable { summary },
+            reconciled: true,
+        };
+    }
+    let Some(device_path) = gpu_cap.device_path.clone() else {
+        return RunEnd::Concluded {
+            outcome: ProbeOutcome::Indeterminate {
+                reason: format!("GPU {gpu} has no reported device path"),
+            },
+            reconciled: true,
+        };
+    };
+
+    let watch_preempt = preempt.clone();
+    let end = tokio::task::spawn_blocking(move || {
+        let is_preempted = || *watch_preempt.borrow();
+        let api = crate::runtime::configured().ok()?;
+        let runtime = crate::session::container::ContainerRuntime::from_env();
+        let access = runtime.app_gpu_access_live();
+        let image = match runtime.own_image() {
+            Ok(image) => image,
+            Err(error) => {
+                return Some(ContainerProbeEnd {
+                    observed: Observed::RuntimeError(format!(
+                        "identifying the agent's own image: {error}"
+                    )),
+                    reconciled: true,
+                });
+            }
+        };
+        let mut command = vec![
+            "20s".to_string(),
+            "/usr/local/bin/quasar-node-agent".to_string(),
+            "egl-selftest".to_string(),
+        ];
+        if access.carries_driver_volume() {
+            command.push(format!(
+                "{}/lib64/libEGL_nvidia.so.0",
+                crate::nvidia_volume::VOLUME_MOUNT
+            ));
+        }
+        command.push("--open-device".to_string());
+        command.push("--render-node".to_string());
+        command.push(device_path.clone());
+        let gpu_run = access.probe_run(vec!["/usr/bin/timeout".to_string()], command);
+        let nonce = probe_nonce();
+        Some(app_gpu::run(
+            api,
+            &image,
+            gpu_run,
+            &nonce,
+            APPLICATION_GPU_DEADLINE,
+            &is_preempted,
+        ))
+    })
+    .await;
+
+    match end {
+        Ok(Some(end)) => RunEnd::Concluded {
+            outcome: app_gpu::outcome(target, &end),
+            reconciled: end.reconciled,
+        },
+        Ok(None) => RunEnd::Concluded {
+            outcome: ProbeOutcome::Indeterminate {
+                reason: "The agent's container runtime is not configured".into(),
+            },
+            reconciled: true,
+        },
+        Err(_) => RunEnd::Concluded {
+            outcome: ProbeOutcome::Indeterminate {
+                reason: "The host probe task ended unexpectedly".into(),
+            },
+            reconciled: false,
+        },
+    }
+}
+
+async fn run_audio(preempt: watch::Receiver<bool>) -> RunEnd {
+    let watch_preempt = preempt.clone();
+    let end = tokio::task::spawn_blocking(move || {
+        let is_preempted = || *watch_preempt.borrow();
+        let api = crate::runtime::configured().ok()?;
+        let runtime = crate::session::container::ContainerRuntime::from_env();
+        let image = match crate::session::audio::sidecar_image(&runtime) {
+            Ok(image) => image,
+            Err(error) => {
+                return Some(ContainerProbeEnd {
+                    observed: Observed::RuntimeError(format!(
+                        "selecting the audio probe image: {error}"
+                    )),
+                    reconciled: true,
+                });
+            }
+        };
+        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let nonce = probe_nonce();
+        Some(audio::run(
+            api,
+            &image,
+            &runtime_dir.to_string_lossy(),
+            &nonce,
+            &is_preempted,
+        ))
+    })
+    .await;
+
+    match end {
+        Ok(Some(end)) => RunEnd::Concluded {
+            outcome: audio::outcome(&end),
+            reconciled: end.reconciled,
+        },
+        Ok(None) => RunEnd::Concluded {
+            outcome: ProbeOutcome::Indeterminate {
+                reason: "The agent's container runtime is not configured".into(),
+            },
+            reconciled: true,
+        },
+        Err(_) => RunEnd::Concluded {
+            outcome: ProbeOutcome::Indeterminate {
+                reason: "The host probe task ended unexpectedly".into(),
+            },
+            reconciled: false,
+        },
+    }
+}
+
 impl ProbeRunner for HostProbeRunner {
     fn run(&self, target: ProbeTarget, preempt: watch::Receiver<bool>) -> BoxFuture<RunEnd> {
         match target.kind {
@@ -218,20 +399,32 @@ impl ProbeRunner for HostProbeRunner {
                 let snapshot = self.snapshot();
                 Box::pin(run_media(exec, snapshot, gpu, preempt))
             }
-            ProbeKind::Audio | ProbeKind::ApplicationGpu => Box::pin(async move {
-                RunEnd::Concluded {
-                    outcome: ProbeOutcome::Indeterminate {
-                        reason: "This agent version does not run this host probe".into(),
-                    },
-                    reconciled: true,
-                }
-            }),
+            ProbeKind::ApplicationGpu => {
+                let gpu = target
+                    .gpu
+                    .expect("an ApplicationGpu ProbeTarget always carries a GPU index");
+                let snapshot = self.snapshot();
+                Box::pin(run_application_gpu(snapshot, gpu, preempt))
+            }
+            ProbeKind::Audio => Box::pin(run_audio(preempt)),
         }
     }
 
-    fn reconcile(&self, _kind: ProbeKind) -> BoxFuture<bool> {
-        // Child-process probes leave nothing to reconcile.
-        Box::pin(async { true })
+    fn reconcile(&self, kind: ProbeKind) -> BoxFuture<bool> {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let Ok(api) = crate::runtime::configured() else {
+                    return false;
+                };
+                match kind {
+                    ProbeKind::ApplicationGpu => api.recover_diagnostics().wait().is_ok(),
+                    ProbeKind::Audio => api.recover_audio_sidecars().wait().is_ok(),
+                    ProbeKind::Input | ProbeKind::Media => true,
+                }
+            })
+            .await
+            .unwrap_or(false)
+        })
     }
 }
 
@@ -486,31 +679,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audio_and_application_gpu_targets_are_indeterminate_not_a_panic() {
+    async fn application_gpu_with_no_context_is_indeterminate_and_never_panics() {
         let (runner, _exec) = runner_with(FakeExec::returning(ChildEnd::Exited {
             code: 0,
             stdout: "ok".into(),
         }));
-        for target in [
-            ProbeTarget::host(ProbeKind::Audio),
-            ProbeTarget::gpu(ProbeKind::ApplicationGpu, 0),
-        ] {
-            let end = tokio::time::timeout(BOUND, runner.run(target, never()))
-                .await
-                .unwrap();
-            assert!(matches!(
-                end,
-                RunEnd::Concluded {
-                    outcome: ProbeOutcome::Indeterminate { .. },
-                    reconciled: true,
-                }
-            ));
-        }
+        let end = tokio::time::timeout(
+            BOUND,
+            runner.run(ProbeTarget::gpu(ProbeKind::ApplicationGpu, 0), never()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            end,
+            RunEnd::Concluded {
+                outcome: ProbeOutcome::Indeterminate { .. },
+                reconciled: true,
+            }
+        ));
+    }
+
+    /// This process has no reachable container runtime, so the probe cannot get past
+    /// its own recovery step — never a panic, always an indeterminate verdict.
+    #[tokio::test]
+    async fn audio_target_never_panics_with_no_reachable_runtime() {
+        let (runner, _exec) = runner_with(FakeExec::returning(ChildEnd::Exited {
+            code: 0,
+            stdout: "ok".into(),
+        }));
+        let end = tokio::time::timeout(
+            BOUND,
+            runner.run(ProbeTarget::host(ProbeKind::Audio), never()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            end,
+            RunEnd::Concluded {
+                outcome: ProbeOutcome::Indeterminate { .. },
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
-    async fn reconcile_never_panics_and_reports_done() {
+    async fn reconcile_never_panics_for_every_kind() {
         let runner = HostProbeRunner::new();
-        assert!(runner.reconcile(ProbeKind::Audio).await);
+        // Child-process kinds have nothing to reconcile and always report done; the
+        // container kinds depend on a reachable runtime, which this process has none
+        // of — the assertion here is "never panics", not a specific verdict.
+        assert!(runner.reconcile(ProbeKind::Input).await);
+        assert!(runner.reconcile(ProbeKind::Media).await);
+        for kind in [ProbeKind::Audio, ProbeKind::ApplicationGpu] {
+            let _ = runner.reconcile(kind).await;
+        }
     }
 }

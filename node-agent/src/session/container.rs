@@ -59,6 +59,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 
 use crate::messages::AppExitPolicy;
+use crate::nvidia_volume::VolumeInfo;
 use crate::runtime::{ApplicationId, ApplicationMount, ApplicationRequest};
 
 /// A launch whose response or retirement is uncertain. The operation is the only
@@ -715,6 +716,34 @@ impl ContainerRuntime {
         self.nvidia
     }
 
+    /// Observe this host's GPU access as a launch would. On the launch path it must run
+    /// after [`nvidia_driver_volume_gate`], which is what can still resolve the mount.
+    pub fn app_gpu_access_live(&self) -> AppGpuAccess {
+        let nodes = dri_node_owners(Path::new(DRI_DIR));
+        let access = app_gpu_access(self.nvidia, crate::nvidia_volume::current(), &nodes);
+        // The nodes arrive 0660 root:render, and the app user (PUID, no supplementary
+        // groups) is neither — so RADV fails `Could not open device
+        // /dev/dri/renderD128: Permission denied`, Vulkan enumerates llvmpipe only, and
+        // gamescope aborts with "physical device doesn't support
+        // VK_EXT_physical_device_drm" (desktop images degrade silently to software
+        // rendering instead). NVIDIA never hit it: its ICD opens the 0666 /dev/nvidia*
+        // nodes. Grants nothing the passed device did not already imply.
+        let group_add = access.group_add_args();
+        if !group_add.is_empty() {
+            tracing::info!(
+                token = "app-dri-group-add",
+                nodes = %nodes
+                    .iter()
+                    .map(|n| format!("{}:{:o}:{}", n.name, n.mode & 0o777, n.gid))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                "app container joins DRM node groups: {}",
+                group_add.join(" ")
+            );
+        }
+        access
+    }
+
     /// The exact locally running image, rather than a guessed development tag.
     pub fn own_image(&self) -> Result<String> {
         let id = crate::nvidia_volume::self_container_id()
@@ -1104,56 +1133,32 @@ impl ContainerRuntime {
 
         // ── GPU passthrough ───────────────────────────────────────────────────
         if spec.gpu {
+            // #375: bind the host's 32-bit NVIDIA driver libs read-only so native
+            // 32-bit titles resolve libGLX_nvidia.so.* — the container ships only
+            // 64-bit libs and the toolkit/CDI spec never injects 32-bit. NVIDIA
+            // only; empty path ⇒ no mount. Falls back to the driver volume's
+            // 32-bit half, resolved live so a provision completed after startup
+            // takes effect on the next launch with no agent restart.
+            let mut lib32 = String::new();
+            // First-run S1: on a host whose NVIDIA userspace came from the
+            // Quasar-provisioned driver volume, the CDI injection into this app
+            // container is as CUDA-only as the agent's was, so the app needs the
+            // same 64-bit GL/EGL/Vulkan set, vendor configs and loader path. Empty
+            // on every host with its own driver.
+            let mut image_ld = String::new();
             if self.nvidia {
-                args.push("--gpus".into());
-                args.push("all".into());
-                // #375: bind the host's 32-bit NVIDIA driver libs read-only so native
-                // 32-bit titles resolve libGLX_nvidia.so.* — the container ships only
-                // 64-bit libs and the toolkit/CDI spec never injects 32-bit. NVIDIA
-                // only; empty path ⇒ no mount. Falls back to the driver volume's
-                // 32-bit half, resolved live so a provision completed after startup
-                // takes effect on the next launch with no agent restart.
-                let lib32 = if params.nvidia_lib32_path.is_empty() {
+                lib32 = if params.nvidia_lib32_path.is_empty() {
                     crate::nvidia_volume::lib32_host_path(crate::nvidia_volume::current().as_ref())
                         .unwrap_or_default()
                 } else {
                     params.nvidia_lib32_path.to_string()
                 };
-                args.extend(nvidia_lib32_mount_args(&lib32));
-
-                // First-run S1: on a host whose NVIDIA userspace came from the
-                // Quasar-provisioned driver volume, the CDI injection into this app
-                // container is as CUDA-only as the agent's was, so the app needs the
-                // same 64-bit GL/EGL/Vulkan set, vendor configs and loader path. Empty
-                // on every host with its own driver.
-                args.extend(nvidia_driver_volume_args(self, &spec.image)?);
+                image_ld = nvidia_driver_volume_gate(self, &spec.image)?.unwrap_or_default();
             }
-            // AMD/Intel (and NVIDIA's render node for Vulkan/EGL) want the DRI nodes.
-            args.push("--device".into());
-            args.push(DRI_DIR.into());
-
-            // The nodes arrive 0660 root:render, and the app user (PUID, no supplementary
-            // groups) is neither — so RADV fails `Could not open device
-            // /dev/dri/renderD128: Permission denied`, Vulkan enumerates llvmpipe only,
-            // and gamescope aborts with "physical device doesn't support
-            // VK_EXT_physical_device_drm" (desktop images degrade silently to software
-            // rendering instead). NVIDIA never hit it: its ICD opens the 0666
-            // /dev/nvidia* nodes. Grants nothing the passed device did not already imply.
-            let dri_nodes = dri_node_owners(Path::new(DRI_DIR));
-            let group_add = dri_group_add_args(&dri_nodes);
-            if !group_add.is_empty() {
-                tracing::info!(
-                    token = "app-dri-group-add",
-                    nodes = %dri_nodes
-                        .iter()
-                        .map(|n| format!("{}:{:o}:{}", n.name, n.mode & 0o777, n.gid))
-                        .collect::<Vec<_>>()
-                        .join(","),
-                    "app container joins DRM node groups: {}",
-                    group_add.join(" ")
-                );
-            }
-            args.extend(group_add);
+            args.extend(
+                self.app_gpu_access_live()
+                    .session_args(&image_ld, &nvidia_lib32_mount_args(&lib32)),
+            );
         }
 
         // ── Virtual input device nodes (mouse/keyboard for evdev-native apps,
@@ -1508,16 +1513,19 @@ fn nvidia_lib32_mount_args(path: &str) -> Vec<String> {
 /// Container mount destination for the S1 driver volume in an APP container. Same path
 /// as in the agent so a log line means the same thing on both sides. Must never be
 /// `/usr/nvidia` — see [`NVIDIA_LIB32_MOUNT_DST`].
-const NVIDIA_DRIVER_VOLUME_DST: &str = "/opt/quasar/nvidia-driver";
+const NVIDIA_DRIVER_VOLUME_DST: &str = crate::nvidia_volume::VOLUME_MOUNT;
 
-/// The mount + discovery env for the S1 driver volume, or empty when nothing is
-/// provisioned. Reads the image's own `LD_LIBRARY_PATH` because `-e` REPLACES it, and
-/// overwriting an app image's loader path trades one breakage for another.
-fn nvidia_driver_volume_args(runtime: &ContainerRuntime, image: &str) -> Result<Vec<String>> {
+/// Launch policy for the S1 driver volume: everything that may refuse a launch, plus the
+/// app image's own `LD_LIBRARY_PATH` (docker `-e` REPLACES it, and overwriting an image's
+/// loader path trades one breakage for another). `None` when nothing is provisioned.
+///
+/// Must run before the access facts are gathered: `retry_mount_resolution` is what can
+/// still resolve the mount a launch is about to be given.
+fn nvidia_driver_volume_gate(runtime: &ContainerRuntime, image: &str) -> Result<Option<String>> {
     crate::nvidia_volume::validate_host_path_for_launch().map_err(anyhow::Error::msg)?;
     crate::nvidia_volume::retry_mount_resolution();
     let Some(info) = crate::nvidia_volume::current() else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     anyhow::ensure!(info.host.is_some() || info.name.is_some(),
         "NVIDIA driver is provisioned but its app-container mount is unresolved; check Docker socket and identity inspection or set QUASAR_NVIDIA_DRIVER_HOST_PATH to the existing host directory");
@@ -1526,20 +1534,137 @@ fn nvidia_driver_volume_args(runtime: &ContainerRuntime, image: &str) -> Result<
     {
         anyhow::bail!("NVIDIA driver failed the sibling-container EGL test: {detail}");
     }
-    let image_ld = runtime
-        .image_env_checked(image, "LD_LIBRARY_PATH")?
-        .unwrap_or_default();
-    let args =
-        crate::nvidia_volume::app_container_args(Some(&info), NVIDIA_DRIVER_VOLUME_DST, &image_ld);
-    if !args.is_empty() {
-        tracing::info!(
-            target: "quasar.nvidia_volume",
-            image,
-            "app container receives the Quasar-provisioned NVIDIA driver volume (v{})",
-            info.manifest.driver_version
-        );
+    tracing::info!(
+        target: "quasar.nvidia_volume",
+        image,
+        "app container receives the Quasar-provisioned NVIDIA driver volume (v{})",
+        info.manifest.driver_version
+    );
+    Ok(Some(
+        runtime
+            .image_env_checked(image, "LD_LIBRARY_PATH")?
+            .unwrap_or_default(),
+    ))
+}
+
+/// What a GPU-enabled application container is given for GPU access (#259). Gathered
+/// once and realized two ways — a session's docker argv, and a host probe's closed
+/// profile — so a probe cannot be given more or less than the launch it stands for.
+pub struct AppGpuAccess {
+    nvidia: bool,
+    /// Never set on a non-NVIDIA host, whatever the provisioner published.
+    driver_volume: Option<VolumeInfo>,
+    /// Non-zero, ascending and distinct, as the GPU probe profile requires.
+    dri_groups: Vec<u32>,
+}
+
+/// Decide from observed facts; the live gathering is [`ContainerRuntime::app_gpu_access_live`].
+fn app_gpu_access(
+    nvidia: bool,
+    volume: Option<VolumeInfo>,
+    nodes: &[DrmNodeOwner],
+) -> AppGpuAccess {
+    AppGpuAccess {
+        nvidia,
+        driver_volume: volume.filter(|_| nvidia),
+        dri_groups: granted_dri_gids(nodes),
     }
-    Ok(args)
+}
+
+impl AppGpuAccess {
+    /// Numeric only: `render`/`video` do not exist in the app images, and a name that
+    /// does not resolve fails the whole `docker run`.
+    fn group_add_args(&self) -> Vec<String> {
+        self.dri_groups
+            .iter()
+            .flat_map(|gid| ["--group-add".to_string(), gid.to_string()])
+            .collect()
+    }
+
+    /// `docker run` arguments. Order is load-bearing: `nvidia_lib32_mount` must precede
+    /// the driver volume or the two swap places in the realized `Mounts`.
+    pub fn session_args(
+        &self,
+        image_ld_library_path: &str,
+        nvidia_lib32_mount: &[String],
+    ) -> Vec<String> {
+        let mut args = Vec::new();
+        if self.nvidia {
+            args.push("--gpus".into());
+            args.push("all".into());
+            args.extend(nvidia_lib32_mount.iter().cloned());
+            args.extend(crate::nvidia_volume::app_container_args(
+                self.driver_volume.as_ref(),
+                NVIDIA_DRIVER_VOLUME_DST,
+                image_ld_library_path,
+            ));
+        }
+        // AMD/Intel, and NVIDIA's render node for Vulkan/EGL, all want the DRM nodes.
+        args.push("--device".into());
+        args.push(DRI_DIR.into());
+        args.extend(self.group_add_args());
+        args
+    }
+
+    /// Whether the probe container mounts the Quasar driver volume, so its EGL test can
+    /// name the vendor library inside it.
+    pub fn carries_driver_volume(&self) -> bool {
+        self.driver_volume
+            .as_ref()
+            .and_then(nvidia_driver_access)
+            .is_some()
+    }
+
+    /// The same access as the closed GPU probe profile (#258).
+    ///
+    /// Known limit: that profile carries the NVIDIA device request only together with the
+    /// Quasar driver volume, so on an NVIDIA host running its own driver the probe gets
+    /// DRM access only.
+    pub fn probe_run(
+        &self,
+        entrypoint: Vec<String>,
+        command: Vec<String>,
+    ) -> crate::runtime::GpuProbeRun {
+        crate::runtime::GpuProbeRun {
+            entrypoint,
+            command,
+            devices: vec![DRI_DIR.into()],
+            groups: self.dri_groups.clone(),
+            nvidia: self.driver_volume.as_ref().and_then(nvidia_driver_access),
+        }
+    }
+}
+
+/// The NVIDIA half of GPU access: the all-GPUs device request, the read-only driver
+/// mount and the loader environment. `None` when the provisioned volume has neither a
+/// resolved host path nor a volume name, which is what a session refuses to launch on.
+///
+/// The probe runs the agent's own image, so it appends no image loader path.
+pub(crate) fn nvidia_driver_access(
+    info: &VolumeInfo,
+) -> Option<crate::runtime::NvidiaDriverAccess> {
+    let driver_mount = match (&info.name, &info.host) {
+        (Some(name), _) => crate::runtime::NvidiaDriverMount::NamedVolume {
+            name: name.clone(),
+            target: NVIDIA_DRIVER_VOLUME_DST.into(),
+        },
+        (None, Some(source)) => {
+            crate::runtime::NvidiaDriverMount::ReadOnlyBind(crate::runtime::ReadOnlyHostBind {
+                source: source.clone(),
+                target: NVIDIA_DRIVER_VOLUME_DST.into(),
+            })
+        }
+        (None, None) => return None,
+    };
+    Some(crate::runtime::NvidiaDriverAccess {
+        driver_mount,
+        image_ld_library_path: String::new(),
+        has_gbm_backend: info
+            .local
+            .join(crate::nvidia_volume::layout::GBM_DIR)
+            .join("nvidia-drm_gbm.so")
+            .is_file(),
+    })
 }
 
 /// Does the HOST have a `/dev/fuse` node?
@@ -1790,12 +1915,9 @@ fn dri_node_owners(dir: &Path) -> Vec<DrmNodeOwner> {
     owners
 }
 
-/// One `--group-add <gid>` per distinct group owning a DRM node the app cannot already
-/// open through the node's `other` bits. Sorted and deduped so the argv is stable.
-///
-/// Numeric only: `render`/`video` do not exist in the app images, and a name that does
-/// not resolve fails the whole `docker run`.
-fn dri_group_add_args(nodes: &[DrmNodeOwner]) -> Vec<String> {
+/// Every distinct group owning a DRM node the app cannot already open through the node's
+/// `other` bits. Ascending and deduped, so one set of nodes has one fingerprint.
+fn granted_dri_gids(nodes: &[DrmNodeOwner]) -> Vec<u32> {
     let mut gids: Vec<u32> = nodes
         .iter()
         .filter(|n| dri_group_granted(n.mode, n.gid))
@@ -1803,9 +1925,7 @@ fn dri_group_add_args(nodes: &[DrmNodeOwner]) -> Vec<String> {
         .collect();
     gids.sort_unstable();
     gids.dedup();
-    gids.iter()
-        .flat_map(|gid| ["--group-add".to_string(), gid.to_string()])
-        .collect()
+    gids
 }
 
 /// Does the launcher hand the app container this node's owning group? Readiness
@@ -2300,33 +2420,39 @@ mod tests {
     /// fail to open renderD128, so Vulkan enumerates llvmpipe and gamescope exits 1.
     #[test]
     fn dri_group_add_covers_every_node_the_app_cannot_open_otherwise() {
+        let group_add = |nodes: &[DrmNodeOwner]| {
+            flag_values(
+                &app_gpu_access(false, None, nodes).session_args("", &[]),
+                "--group-add",
+            )
+        };
         // hermes: renderD128 root:render(991), card0 root:video(44).
         assert_eq!(
-            dri_group_add_args(&[node("renderD128", 0o660, 991), node("card0", 0o660, 44)]),
-            vec!["--group-add", "44", "--group-add", "991"],
+            group_add(&[node("renderD128", 0o660, 991), node("card0", 0o660, 44)]),
+            vec!["44", "991"],
             "both owning gids, ascending"
         );
 
         // Deduped across nodes sharing a group, and ordered independently of readdir.
         assert_eq!(
-            dri_group_add_args(&[
+            group_add(&[
                 node("renderD129", 0o660, 991),
                 node("renderD128", 0o660, 991),
                 node("card1", 0o660, 44),
             ]),
-            vec!["--group-add", "44", "--group-add", "991"]
+            vec!["44", "991"]
         );
 
         // Nothing to grant: world-rw needs no group, a groupless mode has none to give,
         // and gid 0 is never handed out.
-        assert!(dri_group_add_args(&[
+        assert!(group_add(&[
             node("renderD128", 0o666, 991),
             node("card0", 0o600, 44),
             node("renderD129", 0o660, 0),
         ])
         .is_empty());
 
-        assert!(dri_group_add_args(&[]).is_empty());
+        assert!(group_add(&[]).is_empty());
     }
 
     /// Readiness predicts app access with this same predicate; a divergence is how the
@@ -2335,9 +2461,186 @@ mod tests {
     fn a_granted_group_is_exactly_what_the_args_contain() {
         for (mode, gid) in [(0o660, 991), (0o666, 991), (0o600, 44), (0o660, 0)] {
             let granted = dri_group_granted(mode, gid);
-            let args = dri_group_add_args(&[node("renderD128", mode, gid)]);
-            assert_eq!(granted, !args.is_empty(), "mode {mode:o} gid {gid}");
+            let gids = granted_dri_gids(&[node("renderD128", mode, gid)]);
+            assert_eq!(granted, !gids.is_empty(), "mode {mode:o} gid {gid}");
         }
+    }
+
+    fn volume(local: &Path, name: Option<&str>, host: Option<&str>) -> VolumeInfo {
+        VolumeInfo {
+            local: local.to_path_buf(),
+            host: host.map(PathBuf::from),
+            name: name.map(str::to_string),
+            manifest: crate::nvidia_volume::Manifest {
+                driver_version: "610.57.04".into(),
+                sha256: "f".repeat(64),
+                url: "https://example.invalid/driver.run".into(),
+                provisioned_at_unix: 0,
+                agent_version: "test".into(),
+                lib64_count: 1,
+                lib32_count: 0,
+                layout_version: crate::nvidia_volume::CURRENT_LAYOUT_VERSION,
+            },
+        }
+    }
+
+    /// Values of `--flag value` pairs in a docker argv.
+    fn flag_values(args: &[String], flag: &str) -> Vec<String> {
+        args.windows(2)
+            .filter(|w| w[0] == flag)
+            .map(|w| w[1].clone())
+            .collect()
+    }
+
+    fn mount_field(mount: &str, key: &str) -> Option<String> {
+        mount
+            .split(',')
+            .find_map(|f| f.strip_prefix(&format!("{key}=")))
+            .map(str::to_string)
+    }
+
+    /// One `AppGpuAccess`, two realizations: a probe must be given what a session's
+    /// application container is given. Editing one realization alone fails here.
+    #[test]
+    fn probe_and_session_gpu_access_cannot_diverge() {
+        let with_gbm = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(with_gbm.path().join(crate::nvidia_volume::layout::GBM_DIR))
+            .unwrap();
+        std::fs::write(
+            with_gbm
+                .path()
+                .join(crate::nvidia_volume::layout::GBM_DIR)
+                .join("nvidia-drm_gbm.so"),
+            b"x",
+        )
+        .unwrap();
+        let no_gbm = tempfile::tempdir().unwrap();
+        let amd_nodes = || vec![node("renderD128", 0o660, 991), node("card0", 0o660, 44)];
+        let cases: Vec<(&str, bool, Option<VolumeInfo>, Vec<DrmNodeOwner>)> = vec![
+            ("amd", false, None, amd_nodes()),
+            (
+                "root-owned node is never granted",
+                false,
+                None,
+                vec![node("renderD128", 0o660, 0)],
+            ),
+            ("no nodes", false, None, Vec::new()),
+            (
+                "nvidia named volume",
+                true,
+                Some(volume(with_gbm.path(), Some("quasar-nvidia-driver"), None)),
+                amd_nodes(),
+            ),
+            (
+                "nvidia host bind",
+                true,
+                Some(volume(no_gbm.path(), None, Some("/srv/quasar/driver"))),
+                amd_nodes(),
+            ),
+            ("nvidia without a volume", true, None, amd_nodes()),
+        ];
+        for (label, nvidia, volume, nodes) in cases {
+            let access = app_gpu_access(nvidia, volume, &nodes);
+            let session = access.session_args("/image/lib", &[]);
+            let probe = access.probe_run(
+                vec!["/usr/bin/timeout".into()],
+                vec!["20s".into(), "/usr/local/bin/quasar-node-agent".into()],
+            );
+
+            assert_eq!(
+                flag_values(&session, "--group-add"),
+                probe
+                    .groups
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<String>>(),
+                "{label}: groups"
+            );
+            assert!(
+                probe.groups.first().is_none_or(|g| *g != 0)
+                    && probe.groups.windows(2).all(|p| p[0] < p[1]),
+                "{label}: the probe profile requires non-zero, ascending, distinct gids"
+            );
+            assert_eq!(
+                flag_values(&session, "--device").contains(&DRI_DIR.to_string()),
+                probe.devices == vec![DRI_DIR.to_string()],
+                "{label}: DRM nodes"
+            );
+
+            let gpus_all = flag_values(&session, "--gpus") == ["all"];
+            let mount = flag_values(&session, "--mount").into_iter().next();
+            assert_eq!(
+                gpus_all && mount.is_some(),
+                probe.nvidia.is_some(),
+                "{label}: NVIDIA driver access"
+            );
+            let Some(nvidia_access) = probe.nvidia else {
+                continue;
+            };
+            let mount = mount.unwrap();
+            let (source, target) = match &nvidia_access.driver_mount {
+                crate::runtime::NvidiaDriverMount::NamedVolume { name, target } => {
+                    (name.clone(), target.clone())
+                }
+                crate::runtime::NvidiaDriverMount::ReadOnlyBind(bind) => {
+                    (bind.source.display().to_string(), bind.target.clone())
+                }
+            };
+            assert_eq!(mount_field(&mount, "src"), Some(source), "{label}: source");
+            assert_eq!(mount_field(&mount, "dst"), Some(target.clone()), "{label}");
+            let ld = flag_values(&session, "-e")
+                .into_iter()
+                .find_map(|e| e.strip_prefix("LD_LIBRARY_PATH=").map(str::to_string))
+                .expect("the driver volume prepends its lib64 to the loader path");
+            assert_eq!(
+                ld.split(':').next(),
+                Some(format!("{target}/lib64").as_str()),
+                "{label}: loader path"
+            );
+            assert_eq!(
+                flag_values(&session, "-e")
+                    .iter()
+                    .any(|e| e.starts_with("GBM_BACKENDS_PATH=")),
+                nvidia_access.has_gbm_backend,
+                "{label}: gbm backend"
+            );
+        }
+    }
+
+    /// The realized create body depends on argv order: the 32-bit bind must precede the
+    /// driver volume, or the two swap places in `Mounts`.
+    #[test]
+    fn session_gpu_args_keep_their_launch_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let access = app_gpu_access(
+            true,
+            Some(volume(dir.path(), Some("quasar-nvidia-driver"), None)),
+            &[node("renderD128", 0o660, 991)],
+        );
+        let args = access.session_args("/image/lib", &nvidia_lib32_mount_args("/usr/lib32"));
+        assert_eq!(
+            args,
+            vec![
+                "--gpus".to_string(),
+                "all".into(),
+                "-v".into(),
+                format!("/usr/lib32:{NVIDIA_LIB32_MOUNT_DST}:ro"),
+                "--mount".into(),
+                format!("type=volume,src=quasar-nvidia-driver,dst={NVIDIA_DRIVER_VOLUME_DST},readonly"),
+                "-e".into(),
+                format!("LD_LIBRARY_PATH={NVIDIA_DRIVER_VOLUME_DST}/lib64:/image/lib"),
+                "-e".into(),
+                format!("__EGL_VENDOR_LIBRARY_DIRS={NVIDIA_DRIVER_VOLUME_DST}/glvnd/egl_vendor.d:/etc/glvnd/egl_vendor.d:/usr/share/glvnd/egl_vendor.d"),
+                "-e".into(),
+                format!("__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS={NVIDIA_DRIVER_VOLUME_DST}/egl_external_platform.d:/usr/share/egl/egl_external_platform.d"),
+                "-e".into(),
+                format!("VK_ADD_DRIVER_FILES={NVIDIA_DRIVER_VOLUME_DST}/vulkan/icd.d/nvidia_icd.json"),
+                "--device".into(),
+                DRI_DIR.into(),
+                "--group-add".into(),
+                "991".into(),
+            ]
+        );
     }
 
     // `deny` is the only value that hardens; everything else, including a typo, keeps
@@ -3068,9 +3371,14 @@ mod tests {
             "unit tests must never see a provisioned volume"
         );
         let rt = ContainerRuntime::new(true);
-        assert!(nvidia_driver_volume_args(&rt, "quasar-steam:latest")
+        assert!(nvidia_driver_volume_gate(&rt, "quasar-steam:latest")
             .unwrap()
-            .is_empty());
+            .is_none());
+        assert!(rt
+            .app_gpu_access_live()
+            .session_args("", &[])
+            .iter()
+            .all(|a| !a.starts_with("type=")));
     }
 
     /// The mount destination must never be GOW's `/usr/nvidia`: upstream cont-init

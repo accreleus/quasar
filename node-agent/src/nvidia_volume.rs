@@ -1875,6 +1875,40 @@ pub fn parse_egl_selftest(stdout: &str) -> EglRuntime {
     }
 }
 
+/// Parse the `--open-device` self-test. The dispatcher verdict comes first and still
+/// wins; on top of it, a run that reached no hardware GPU is `Broken` — that is the
+/// question the application-GPU host probe asks, and the one the dispatcher check cannot
+/// answer (a container with `/dev/dri` withheld still loads libEGL and finds Mesa's
+/// software device).
+pub fn parse_egl_device_open(stdout: &str) -> EglRuntime {
+    let dispatch = parse_egl_selftest(stdout);
+    let EglRuntime::Ok { loaded } = dispatch else {
+        return dispatch;
+    };
+    let field = |k: &str| {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(k).map(|v| v.trim().to_string()))
+            .filter(|s| !s.is_empty())
+    };
+    if let Some(node) = field("OPENED=") {
+        return EglRuntime::Ok {
+            loaded: format!("{loaded} (opened {node})"),
+        };
+    }
+    if let Some(error) = field("DEVICE_ERROR=") {
+        return EglRuntime::Broken {
+            detail: format!("the EGL stack loads but no GPU could be opened: {error}"),
+            loaded: Some(loaded),
+        };
+    }
+    EglRuntime::Indeterminate {
+        detail: format!(
+            "the EGL device test produced no result (it crashed or was killed); loaded={loaded}"
+        ),
+    }
+}
+
 static SIBLING_EGL: Mutex<Option<(String, Instant, EglRuntime)>> = Mutex::new(None);
 
 /// Validate the driver through Docker's sibling-container namespace using the
@@ -1919,19 +1953,6 @@ pub fn probe_sibling_egl() -> EglRuntime {
         crate::container_ownership::PROBE_NAME_PREFIX,
         std::process::id()
     );
-    let driver_mount = match (&info.name, &info.host) {
-        (Some(name), _) => crate::runtime::NvidiaDriverMount::NamedVolume {
-            name: name.clone(),
-            target: VOLUME_MOUNT.into(),
-        },
-        (None, Some(source)) => {
-            crate::runtime::NvidiaDriverMount::ReadOnlyBind(crate::runtime::ReadOnlyHostBind {
-                source: source.clone(),
-                target: VOLUME_MOUNT.into(),
-            })
-        }
-        (None, None) => unreachable!("checked above"),
-    };
     let run = crate::runtime::GpuProbeRun {
         entrypoint: vec!["/usr/bin/timeout".into()],
         command: vec![
@@ -1940,21 +1961,11 @@ pub fn probe_sibling_egl() -> EglRuntime {
             EGL_SELFTEST_ARG.into(),
             format!("{VOLUME_MOUNT}/lib64/libEGL_nvidia.so.0"),
         ],
-        // This probe reads the driver userspace, not a DRM node.
+        // This launch gate reads the driver userspace, not a DRM node — unlike the
+        // application-GPU host probe, which takes the whole of `AppGpuAccess`.
         devices: Vec::new(),
         groups: Vec::new(),
-        nvidia: Some(crate::runtime::NvidiaDriverAccess {
-            driver_mount,
-            // The previous CLI sibling passed an empty image loader suffix.  Keep
-            // that precedence exactly; this probe is the agent image, not an app
-            // image whose baked loader path needs appending.
-            image_ld_library_path: String::new(),
-            has_gbm_backend: info
-                .local
-                .join(layout::GBM_DIR)
-                .join("nvidia-drm_gbm.so")
-                .is_file(),
-        }),
+        nvidia: crate::session::container::nvidia_driver_access(&info),
     };
     let helper = crate::runtime::DiagnosticHelper {
         operation: format!("nvidia-egl-{nonce}"),
@@ -2083,7 +2094,17 @@ const EGL_SELFTEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// reports the resolved file, the client extension string, and optionally whether the
 /// NVIDIA vendor library dlopens. Prints `KEY=value` and always exits 0 — the parent
 /// reads the text, so a non-zero exit would only lose information.
-pub fn egl_selftest_main(vendor_lib: Option<&str>) -> i32 {
+///
+/// `open_device` adds the device lines [`parse_egl_device_open`] reads. Without it the
+/// stdout is byte-identical to what the readiness and launch-gate callers parse.
+/// `render_node` (only meaningful with `open_device`) pins which hardware device to open —
+/// the application-GPU host probe asks for the GPU it was placed on rather than whichever
+/// device EGL enumerates first.
+pub fn egl_selftest_main(
+    vendor_lib: Option<&str>,
+    open_device: bool,
+    render_node: Option<&str>,
+) -> i32 {
     // SAFETY: all four calls are plain libdl/EGL C entry points with the
     // documented signatures; every pointer handed in is either NULL or a
     // NUL-terminated CString that outlives the call, and every pointer read
@@ -2134,9 +2155,183 @@ pub fn egl_selftest_main(vendor_lib: Option<&str>) -> i32 {
                 }
             }
         }
+        if open_device {
+            report_device_open(handle, render_node);
+        }
         libc::dlclose(handle);
     }
     0
+}
+
+/// Resolve an EGL entry point. glvnd exports the core calls, but an extension entry
+/// point may only exist behind `eglGetProcAddress`, so a null dlsym is not yet an answer.
+///
+/// SAFETY: `handle` is a live `dlopen` handle; both lookups take a NUL-terminated name
+/// that outlives the call and return either NULL or a function pointer owned by the
+/// library, and every caller null-checks the result before transmuting it.
+unsafe fn egl_symbol(handle: *mut libc::c_void, name: &str) -> *mut libc::c_void {
+    let Ok(c) = std::ffi::CString::new(name) else {
+        return std::ptr::null_mut();
+    };
+    let direct = libc::dlsym(handle, c.as_ptr());
+    if !direct.is_null() {
+        return direct;
+    }
+    let proc_address = std::ffi::CString::new("eglGetProcAddress").unwrap();
+    let f = libc::dlsym(handle, proc_address.as_ptr());
+    if f.is_null() {
+        return std::ptr::null_mut();
+    }
+    let get_proc: extern "C" fn(*const libc::c_char) -> *mut libc::c_void = std::mem::transmute(f);
+    get_proc(c.as_ptr())
+}
+
+/// Open the GPU the way a session's application will, and say which node it was.
+///
+/// The client extension string alone proves nothing about GPU access: with `/dev/dri`
+/// withheld a container still loads libEGL and still enumerates Mesa's software device,
+/// so the application-GPU host probe needs a device actually initialized.
+///
+/// Choose which hardware device to open: `wanted` by exact render-node match, or the
+/// first hardware device when `None`. Pure so the selection logic has its own unit test
+/// independent of any EGL call.
+fn pick_device(hardware: &[String], wanted: Option<&str>) -> Result<usize, String> {
+    match wanted {
+        None => {
+            if hardware.is_empty() {
+                Err("no hardware EGL device (only software rendering is available)".into())
+            } else {
+                Ok(0)
+            }
+        }
+        Some(node) => hardware.iter().position(|n| n == node).ok_or_else(|| {
+            format!(
+                "{node} is not among the EGL hardware devices ({})",
+                hardware.join(",")
+            )
+        }),
+    }
+}
+
+/// SAFETY: every symbol is null-checked before it is transmuted to its documented EGL
+/// signature; the device pointers come from `eglQueryDevicesEXT` and are read back only
+/// within the count it reported; every string pointer is null-checked before
+/// `CStr::from_ptr`; the display is terminated on the success path and never used after.
+unsafe fn report_device_open(handle: *mut libc::c_void, wanted: Option<&str>) {
+    const EGL_PLATFORM_DEVICE_EXT: u32 = 0x313F;
+    const EGL_DRM_DEVICE_FILE_EXT: i32 = 0x3233;
+    const EGL_DRM_RENDER_NODE_FILE_EXT: i32 = 0x3377;
+    const MAX_DEVICES: i32 = 32;
+
+    let devices_sym = egl_symbol(handle, "eglQueryDevicesEXT");
+    let device_string_sym = egl_symbol(handle, "eglQueryDeviceStringEXT");
+    let mut display_sym = egl_symbol(handle, "eglGetPlatformDisplayEXT");
+    if display_sym.is_null() {
+        display_sym = egl_symbol(handle, "eglGetPlatformDisplay");
+    }
+    let initialize_sym = egl_symbol(handle, "eglInitialize");
+    let terminate_sym = egl_symbol(handle, "eglTerminate");
+    let error_sym = egl_symbol(handle, "eglGetError");
+    for (name, symbol) in [
+        ("eglQueryDevicesEXT", devices_sym),
+        ("eglQueryDeviceStringEXT", device_string_sym),
+        ("eglGetPlatformDisplay", display_sym),
+        ("eglInitialize", initialize_sym),
+        ("eglTerminate", terminate_sym),
+        ("eglGetError", error_sym),
+    ] {
+        if symbol.is_null() {
+            println!("DEVICE_ERROR=libEGL.so.1 resolves no {name}");
+            return;
+        }
+    }
+    let query_devices: extern "C" fn(i32, *mut *mut libc::c_void, *mut i32) -> u32 =
+        std::mem::transmute(devices_sym);
+    let query_device_string: extern "C" fn(*mut libc::c_void, i32) -> *const libc::c_char =
+        std::mem::transmute(device_string_sym);
+    let get_platform_display: extern "C" fn(
+        u32,
+        *mut libc::c_void,
+        *const isize,
+    ) -> *mut libc::c_void = std::mem::transmute(display_sym);
+    let initialize: extern "C" fn(*mut libc::c_void, *mut i32, *mut i32) -> u32 =
+        std::mem::transmute(initialize_sym);
+    let terminate: extern "C" fn(*mut libc::c_void) -> u32 = std::mem::transmute(terminate_sym);
+    let get_error: extern "C" fn() -> i32 = std::mem::transmute(error_sym);
+    let last_error = || format!("0x{:04x}", get_error());
+
+    let mut devices = [std::ptr::null_mut::<libc::c_void>(); MAX_DEVICES as usize];
+    let mut found = 0i32;
+    if query_devices(MAX_DEVICES, devices.as_mut_ptr(), &mut found) == 0 || found <= 0 {
+        println!(
+            "DEVICES=0\nDEVICE_ERROR=eglQueryDevicesEXT enumerated no EGL device (egl error {})",
+            last_error()
+        );
+        return;
+    }
+    println!("DEVICES={found}");
+    // A device with no DRM file is a software device: Mesa's llvmpipe answers every
+    // query but is not GPU access.
+    let hardware: Vec<(*mut libc::c_void, String)> = devices[..found as usize]
+        .iter()
+        .filter_map(|device| {
+            let mut file = query_device_string(*device, EGL_DRM_RENDER_NODE_FILE_EXT);
+            if file.is_null() {
+                file = query_device_string(*device, EGL_DRM_DEVICE_FILE_EXT);
+            }
+            (!file.is_null()).then(|| {
+                (
+                    *device,
+                    std::ffi::CStr::from_ptr(file)
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            })
+        })
+        .collect();
+    println!(
+        "RENDER_NODES={}",
+        hardware
+            .iter()
+            .map(|(_, node)| node.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let index = match pick_device(
+        &hardware
+            .iter()
+            .map(|(_, node)| node.clone())
+            .collect::<Vec<_>>(),
+        wanted,
+    ) {
+        Ok(index) => index,
+        Err(error) => {
+            println!("DEVICE_ERROR={error}");
+            return;
+        }
+    };
+    let (device, node) = &hardware[index];
+    // Querying a software device's DRM file leaves EGL_BAD_ATTRIBUTE latched, and the
+    // error is sticky: clear it or the first real failure below reports the wrong code.
+    get_error();
+    let display = get_platform_display(EGL_PLATFORM_DEVICE_EXT, *device, std::ptr::null());
+    if display.is_null() {
+        println!(
+            "DEVICE_ERROR=no EGL display for {node} (egl error {})",
+            last_error()
+        );
+        return;
+    }
+    let (mut major, mut minor) = (0, 0);
+    if initialize(display, &mut major, &mut minor) == 0 {
+        println!(
+            "DEVICE_ERROR=eglInitialize failed for {node} (egl error {})",
+            last_error()
+        );
+        return;
+    }
+    println!("OPENED={node}");
+    terminate(display);
 }
 
 /// SAFETY: `dlerror` returns either NULL or a pointer to a NUL-terminated
@@ -2828,6 +3023,74 @@ mod tests {
 
         // A crashed child produces nothing: not a pass, and not `Broken` either.
         assert!(!matches!(parse_egl_selftest(""), EglRuntime::Ok { .. }));
+    }
+
+    /// `--open-device` asks the harder question the dispatcher check cannot: with the
+    /// GPU withheld, a container still loads libEGL and still finds Mesa's software
+    /// device.
+    #[test]
+    fn egl_device_open_verdicts() {
+        const DISPATCH_OK: &str = "LOADED=/usr/lib64/libEGL.so.1.1.0\n\
+             EXTENSIONS=EGL_EXT_device_base EGL_EXT_device_enumeration\n";
+
+        let opened = parse_egl_device_open(&format!(
+            "{DISPATCH_OK}DEVICES=2\nRENDER_NODES=/dev/dri/renderD128\n\
+             OPENED=/dev/dri/renderD128\n"
+        ));
+        assert!(
+            matches!(&opened, EglRuntime::Ok { loaded } if loaded.contains("renderD128")),
+            "{opened:?}"
+        );
+
+        let failed = parse_egl_device_open(&format!(
+            "{DISPATCH_OK}DEVICES=1\nRENDER_NODES=/dev/dri/renderD128\n\
+             DEVICE_ERROR=eglInitialize failed (0x3003)\n"
+        ));
+        assert!(
+            matches!(&failed, EglRuntime::Broken { detail, .. } if detail.contains("0x3003")),
+            "{failed:?}"
+        );
+
+        // The withheld-GPU case the hardware acceptance injects.
+        let software = parse_egl_device_open(&format!(
+            "{DISPATCH_OK}DEVICES=1\nRENDER_NODES=\n\
+             DEVICE_ERROR=no hardware EGL device (only software rendering is available)\n"
+        ));
+        assert!(
+            matches!(&software, EglRuntime::Broken { detail, .. } if detail.contains("software")),
+            "{software:?}"
+        );
+
+        // Killed between the extension string and any device line: no information.
+        let truncated = parse_egl_device_open(&format!("{DISPATCH_OK}DEVICES=2\n"));
+        assert!(truncated.is_indeterminate(), "{truncated:?}");
+
+        // A dispatcher failure is still the diagnosis, whatever follows it.
+        let dispatch =
+            parse_egl_device_open("DISPATCH_ERROR=no such file\nOPENED=/dev/dri/renderD128\n");
+        assert!(
+            matches!(&dispatch, EglRuntime::Broken { detail, .. } if detail.contains("libEGL")),
+            "{dispatch:?}"
+        );
+    }
+
+    /// The application-GPU host probe pins the exact GPU it was placed on; unpinned
+    /// stays "first hardware device", byte-identical to every other caller.
+    #[test]
+    fn pick_device_selects_the_wanted_node_or_the_first_hardware_device() {
+        let hardware = vec![
+            "/dev/dri/renderD128".to_string(),
+            "/dev/dri/renderD129".to_string(),
+        ];
+        assert_eq!(pick_device(&hardware, None), Ok(0));
+        assert_eq!(pick_device(&hardware, Some("/dev/dri/renderD129")), Ok(1));
+        let err = pick_device(&hardware, Some("/dev/dri/renderD130")).unwrap_err();
+        assert!(err.contains("/dev/dri/renderD130 is not among the EGL hardware devices"));
+        assert!(err.contains("/dev/dri/renderD128,/dev/dri/renderD129"));
+
+        assert!(pick_device(&[], None).is_err());
+        let empty_err = pick_device(&[], Some("/dev/dri/renderD128")).unwrap_err();
+        assert!(empty_err.contains("is not among the EGL hardware devices ()"));
     }
 
     /// An infrastructure failure of the self-test (crashed child, no verdict line, and

@@ -2092,13 +2092,6 @@ struct HostSessions {
     probe_updates: mpsc::UnboundedReceiver<crate::host_probe::orchestrator::ReportUpdate>,
 }
 
-/// The host-probe kinds this agent runs (#257: input and media). Widening this to
-/// [`crate::host_probe::ProbeKind::ALL`] is the whole of a later slice.
-const ENABLED_KINDS: [crate::host_probe::ProbeKind; 2] = [
-    crate::host_probe::ProbeKind::Input,
-    crate::host_probe::ProbeKind::Media,
-];
-
 impl HostSessions {
     fn new(
         live_refs: LiveRefs,
@@ -2118,7 +2111,7 @@ impl HostSessions {
         );
         let probe_runner = Arc::new(crate::host_probe::runner::HostProbeRunner::new());
         let (probe_handle, probe_updates) =
-            crate::host_probe::orchestrator::spawn_with_kinds(probe_runner.clone(), &ENABLED_KINDS);
+            crate::host_probe::orchestrator::spawn(probe_runner.clone());
         let mut mgr = SessionManager::new(
             live_refs,
             health,

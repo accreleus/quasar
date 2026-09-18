@@ -70,7 +70,7 @@ pub fn pulse_socket_dir(runtime_dir: &str, session_id: &str) -> PathBuf {
 }
 
 /// How long to wait for the socket file to appear before giving up.
-const PULSE_WAIT_TOTAL: Duration = Duration::from_secs(2);
+pub(crate) const PULSE_WAIT_TOTAL: Duration = Duration::from_secs(2);
 const PULSE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// A per-session PulseAudio sidecar container owning a Unix socket (`{dir}/native`) that
@@ -81,6 +81,18 @@ pub struct PulseSidecar {
     operation: String,
     removed: bool,
     cleanup_attempted: bool,
+}
+
+/// `QUASAR_PULSE_IMAGE`, or the running agent's own image. Shared by the per-session
+/// sidecar and the audio host probe (#259), so a probe proves the exact image a session
+/// would use.
+pub(crate) fn sidecar_image(runtime: &ContainerRuntime) -> Result<String> {
+    match std::env::var("QUASAR_PULSE_IMAGE").ok().filter(|v| !v.is_empty()) {
+        Some(image) => Ok(image),
+        None => runtime.own_image().context(
+            "cannot select audio sidecar image; set QUASAR_PULSE_IMAGE when running outside a container",
+        ),
+    }
 }
 
 impl PulseSidecar {
@@ -94,10 +106,7 @@ impl PulseSidecar {
         runtime_dir: &str,
     ) -> Result<Option<Self>> {
         let socket_dir = pulse_socket_dir(runtime_dir, session_id);
-        let image = match std::env::var("QUASAR_PULSE_IMAGE").ok().filter(|v| !v.is_empty()) {
-            Some(image) => image,
-            None => runtime.own_image().context("cannot select audio sidecar image; set QUASAR_PULSE_IMAGE when running outside a container")?,
-        };
+        let image = sidecar_image(runtime)?;
         let api = crate::runtime::configured()?.clone();
         if let Err(error) = api.recover_audio_sidecars().wait() {
             tracing::warn!(token = "audio-pulse-recovery-pending", %error,
@@ -188,7 +197,7 @@ impl Drop for PulseSidecar {
     }
 }
 
-fn pulse_command(socket_dir: &str) -> Vec<String> {
+pub(crate) fn pulse_command(socket_dir: &str) -> Vec<String> {
     // Runtime profile owns Docker settings, HOME and private PULSE_RUNTIME_PATH.
     // Only the Pulse daemon command and device topology belong to this caller.
     vec![
@@ -294,7 +303,7 @@ fn socket_accepts_connection(path: &Path) -> bool {
 }
 
 /// Poll for a connectable socket at 100 ms intervals up to `PULSE_WAIT_TOTAL`.
-fn wait_for_socket(path: &Path) -> bool {
+pub(crate) fn wait_for_socket(path: &Path) -> bool {
     let steps = (PULSE_WAIT_TOTAL.as_millis() / PULSE_POLL_INTERVAL.as_millis()) as u32;
     for _ in 0..steps {
         if socket_accepts_connection(path) {
