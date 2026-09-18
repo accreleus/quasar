@@ -18,6 +18,8 @@ export interface ReadinessGroupDef {
 }
 
 export const READINESS_GROUPS: readonly ReadinessGroupDef[] = [
+  // #254: the runtime is the most basic fault, so it comes first; observed only.
+  { key: "runtime", label: "Container runtime", ids: ["runtime_endpoint", "runtime_api_version", "runtime_capabilities", "runtime_cdi"] },
   {
     key: "gpu",
     label: "GPU & display",
@@ -29,6 +31,8 @@ export const READINESS_GROUPS: readonly ReadinessGroupDef[] = [
     ids: ["nvidia_egl_vendor_json", "nvidia_eglcore_library", "nvidia_lib32_gl", "driver_volume_version", "nvidia_vulkan_av1_compatibility"],
   },
   { key: "input", label: "Input & sandbox", ids: ["uinput", "user_namespaces", "app_apparmor_profile"] },
+  // #253: storage; homes first — the two that can block a launch later.
+  { key: "storage", label: "Storage", ids: ["homes_root_writable", "homes_free_space", "template_free_space", "image_free_space"] },
   { key: "network", label: "Network", ids: ["media_reachability"] },
   // The update path (amendment 9): the same ids the Releases tab's preflight reads.
   {

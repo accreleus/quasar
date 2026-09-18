@@ -18,6 +18,13 @@ pub const MIN_FREE_MB: u64 = 2048;
 /// layer + the final image), so higher than [`MIN_FREE_MB`].
 pub const MIN_BUILD_FREE_MB: u64 = 4096;
 
+/// Same computation, for callers outside the disk guard (readiness storage checks, #253) that
+/// have no `ContainerRuntime` in hand — the parameter below is unused, so this asks
+/// `ContainerRuntime::from_env()` on their behalf rather than duplicating the body.
+pub(crate) fn engine_root_visible_to_agent() -> Option<std::path::PathBuf> {
+    agent_visible_engine_root(&ContainerRuntime::from_env())
+}
+
 fn agent_visible_engine_root(_runtime: &ContainerRuntime) -> Option<std::path::PathBuf> {
     let runtime = crate::runtime::configured().ok()?;
     let root = runtime.engine_storage().wait().ok()?.root.0;

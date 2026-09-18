@@ -239,6 +239,31 @@ pub struct EngineInfo {
     pub server_max_api: ApiVersion,
 }
 
+/// What one engine inspection reports beyond [`EngineInfo`]: the engine's own statements
+/// about itself, observed and passed through. None of it is a claim that a capability was
+/// exercised (#254).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineFacts {
+    pub info: EngineInfo,
+    pub operating_system: Option<String>,
+    pub architecture: Option<String>,
+    pub cgroup_version: Option<String>,
+    pub security_options: Vec<String>,
+    /// Configured OCI runtimes by name, sorted.
+    pub runtimes: Vec<String>,
+    pub default_runtime: Option<String>,
+    /// `None` when the engine does not report CDI at all (pre-CDI API).
+    pub cdi: Option<CdiFacts>,
+}
+
+/// The engine's CDI statement. An empty `spec_dirs` means CDI injection is disabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CdiFacts {
+    pub spec_dirs: Vec<String>,
+    /// `"<id> (<source>)"` per discovered device.
+    pub devices: Vec<String>,
+}
+
 // Own the executor independently of any control-plane connection. Background
 // shutdown is safe even when the last caller lives on another Tokio executor.
 struct Executor {
@@ -395,6 +420,23 @@ impl RuntimeClient {
     pub fn engine_storage(&self) -> Operation<EngineStorage> {
         let config = self.config.clone();
         self.submit(async move { docker::engine_storage(&config).await })
+    }
+
+    /// One bounded, read-only inspection of the engine: discovery plus `/info`, folded
+    /// into [`EngineFacts`]. Budgeted below the client deadline so a readiness refresh
+    /// on a wedged daemon does not spend the whole refresh window here.
+    pub fn inspect_engine(&self) -> Operation<EngineFacts> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::inspect_engine(&config).await },
+            std::cmp::min(self.config.deadline, Duration::from_secs(10)),
+            false,
+        )
+    }
+
+    /// The endpoint this client speaks to, for readiness wording.
+    pub fn endpoint(&self) -> String {
+        format!("unix://{}", self.config.socket.display())
     }
 
     /// Image identity and its baked environment. `Ok(None)` is a missing image.
@@ -749,6 +791,92 @@ mod tests {
         assert_eq!(info.version, "28.0.0");
         assert_eq!(info.api_version.to_string(), "1.48");
         server.join().unwrap();
+    }
+
+    const INFO_WITH_CDI: &str = r#"{"OperatingSystem":"Ubuntu 24.04","OSType":"linux","Architecture":"x86_64","CgroupVersion":"2","SecurityOptions":["name=seccomp,profile=builtin","name=cgroupns"],"Runtimes":{"runc":{"path":"runc"},"nvidia":{"path":"nvidia-container-runtime"}},"DefaultRuntime":"runc","CDISpecDirs":["/etc/cdi","/var/run/cdi"],"DiscoveredDevices":[{"Source":"cdi","ID":"nvidia.com/gpu=0"}]}"#;
+
+    /// #254: one inspection carries the negotiated identity, the engine's stated
+    /// capabilities and its CDI facts. Nothing is mutated: two GETs, no more.
+    #[test]
+    fn engine_inspection_reports_identity_capabilities_and_cdi() {
+        let (_dir, runtime, server) = fixture(vec![
+            ("/version", 200, VERSION),
+            ("/v1.48/info", 200, INFO_WITH_CDI),
+        ]);
+        let facts = runtime.inspect_engine().wait().unwrap();
+        assert_eq!(facts.info.version, "28.0.0");
+        assert_eq!(facts.info.api_version.to_string(), "1.48");
+        assert_eq!(facts.operating_system.as_deref(), Some("Ubuntu 24.04"));
+        assert_eq!(facts.architecture.as_deref(), Some("x86_64"));
+        assert_eq!(facts.cgroup_version.as_deref(), Some("2"));
+        assert_eq!(
+            facts.security_options,
+            vec!["name=seccomp,profile=builtin", "name=cgroupns"]
+        );
+        // Sorted, so the wording is stable across engines.
+        assert_eq!(facts.runtimes, vec!["nvidia", "runc"]);
+        assert_eq!(facts.default_runtime.as_deref(), Some("runc"));
+        let cdi = facts.cdi.expect("engine reported CDI");
+        assert_eq!(cdi.spec_dirs, vec!["/etc/cdi", "/var/run/cdi"]);
+        assert_eq!(cdi.devices, vec!["nvidia.com/gpu=0 (cdi)"]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn engine_inspection_distinguishes_cdi_disabled_from_cdi_unreported() {
+        let (_dir, runtime, server) = fixture(vec![
+            ("/version", 200, VERSION),
+            (
+                "/v1.48/info",
+                200,
+                r#"{"OperatingSystem":"Ubuntu 24.04","CDISpecDirs":[]}"#,
+            ),
+        ]);
+        let facts = runtime.inspect_engine().wait().unwrap();
+        assert_eq!(
+            facts.cdi,
+            Some(CdiFacts {
+                spec_dirs: vec![],
+                devices: vec![]
+            })
+        );
+        assert!(facts.runtimes.is_empty());
+        server.join().unwrap();
+
+        let (_dir, runtime, server) = fixture(vec![
+            ("/version", 200, VERSION),
+            ("/v1.48/info", 200, r#"{"OperatingSystem":"Ubuntu 20.04"}"#),
+        ]);
+        let facts = runtime.inspect_engine().wait().unwrap();
+        assert_eq!(facts.cdi, None);
+        server.join().unwrap();
+    }
+
+    /// A silent engine is a timeout, bounded by the client's deadline; the readiness
+    /// layer reads that as unreachable.
+    #[test]
+    fn engine_inspection_of_a_silent_engine_times_out_within_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("silent.sock");
+        let _listener = UnixListener::bind(&path).unwrap();
+        let mut config = RuntimeConfig::unix(path);
+        config.deadline = Duration::from_millis(200);
+        let runtime = RuntimeClient::new(config).unwrap();
+        let started = std::time::Instant::now();
+        let error = runtime.inspect_engine().wait().unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Timeout);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn engine_inspection_of_a_missing_socket_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime =
+            RuntimeClient::new(RuntimeConfig::unix(dir.path().join("missing.sock"))).unwrap();
+        assert_eq!(
+            runtime.inspect_engine().wait().unwrap_err().kind,
+            ErrorKind::Unavailable
+        );
     }
 
     const VERSION: &str = r#"{"Platform":{"Name":"Docker Engine - Community"},"Version":"28.0.0","ApiVersion":"1.48","MinAPIVersion":"1.24"}"#;

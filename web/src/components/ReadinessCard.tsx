@@ -104,6 +104,12 @@ export function ReadinessCard({
         )}
       </div>
 
+      {/* #254: host-local by definition — never a claim about browser reachability
+       (CONTEXT.md "Host readiness vs browser reachability"). */}
+      <p className="muted" style={{ fontSize: "var(--t-xs)", marginBottom: 0 }} data-testid="readiness-host-local-note">
+        Readiness is what this host can establish about itself. It does not show whether a browser can reach the host; that depends on the network between them.
+      </p>
+
       {advisoryNote}
 
       {!hasChecks && (

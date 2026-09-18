@@ -378,5 +378,49 @@ pub(super) async fn image_info(
     Ok(image_state(docker, image).await?.map(|s| s.info))
 }
 
+/// One read-only `/info`, folded into [`super::EngineFacts`]. No CDI spec dir reported by
+/// the engine (`None`) is distinct from CDI reported but disabled (empty `spec_dirs`).
+pub(super) async fn inspect_engine(
+    config: &RuntimeConfig,
+) -> Result<super::EngineFacts, RuntimeError> {
+    let (docker, info) = discover(config).await?;
+    let sys = docker.info().await.map_err(classify)?;
+    let cgroup_version = sys.cgroup_version.and_then(|v| {
+        let v = v.to_string();
+        (!v.is_empty()).then_some(v)
+    });
+    let mut runtimes: Vec<String> = sys.runtimes.unwrap_or_default().into_keys().collect();
+    runtimes.sort();
+    let cdi = sys.cdi_spec_dirs.map(|spec_dirs| {
+        let devices = sys
+            .discovered_devices
+            .unwrap_or_default()
+            .into_iter()
+            .map(|device| {
+                let id = device
+                    .id
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| "unknown".into());
+                let source = device
+                    .source
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| "unknown".into());
+                format!("{id} ({source})")
+            })
+            .collect();
+        super::CdiFacts { spec_dirs, devices }
+    });
+    Ok(super::EngineFacts {
+        info,
+        operating_system: sys.operating_system,
+        architecture: sys.architecture,
+        cgroup_version,
+        security_options: sys.security_options.unwrap_or_default(),
+        runtimes,
+        default_runtime: sys.default_runtime,
+        cdi,
+    })
+}
+
 #[cfg(test)]
 mod real_tests;
