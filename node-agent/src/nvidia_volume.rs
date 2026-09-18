@@ -1896,6 +1896,11 @@ pub fn parse_egl_device_open(stdout: &str) -> EglRuntime {
             loaded: format!("{loaded} (opened {node})"),
         };
     }
+    if let Some(mismatch) = field("DEVICE_UNMATCHED=") {
+        return EglRuntime::Indeterminate {
+            detail: format!("the GPU could not be identified among the EGL devices: {mismatch}"),
+        };
+    }
     if let Some(error) = field("DEVICE_ERROR=") {
         return EglRuntime::Broken {
             detail: format!("the EGL stack loads but no GPU could be opened: {error}"),
@@ -2186,33 +2191,35 @@ unsafe fn egl_symbol(handle: *mut libc::c_void, name: &str) -> *mut libc::c_void
     get_proc(c.as_ptr())
 }
 
+/// `wanted` by exact render-node match, or the first hardware device when `None`.
+fn pick_device(hardware: &[String], wanted: Option<&str>) -> Result<usize, DevicePick> {
+    if hardware.is_empty() {
+        return Err(DevicePick::NoHardware);
+    }
+    match wanted {
+        None => Ok(0),
+        Some(node) => hardware
+            .iter()
+            .position(|n| n == node)
+            .ok_or_else(|| DevicePick::Unmatched(node.to_string())),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DevicePick {
+    /// Only software rendering: the container cannot reach a GPU.
+    NoHardware,
+    /// EGL names its devices differently from the capacity report (a driver without
+    /// `EGL_DRM_RENDER_NODE_FILE_EXT` answers `cardN`). Says nothing about GPU access.
+    Unmatched(String),
+}
+
 /// Open the GPU the way a session's application will, and say which node it was.
 ///
 /// The client extension string alone proves nothing about GPU access: with `/dev/dri`
 /// withheld a container still loads libEGL and still enumerates Mesa's software device,
 /// so the application-GPU host probe needs a device actually initialized.
 ///
-/// Choose which hardware device to open: `wanted` by exact render-node match, or the
-/// first hardware device when `None`. Pure so the selection logic has its own unit test
-/// independent of any EGL call.
-fn pick_device(hardware: &[String], wanted: Option<&str>) -> Result<usize, String> {
-    match wanted {
-        None => {
-            if hardware.is_empty() {
-                Err("no hardware EGL device (only software rendering is available)".into())
-            } else {
-                Ok(0)
-            }
-        }
-        Some(node) => hardware.iter().position(|n| n == node).ok_or_else(|| {
-            format!(
-                "{node} is not among the EGL hardware devices ({})",
-                hardware.join(",")
-            )
-        }),
-    }
-}
-
 /// SAFETY: every symbol is null-checked before it is transmuted to its documented EGL
 /// signature; the device pointers come from `eglQueryDevicesEXT` and are read back only
 /// within the count it reported; every string pointer is null-checked before
@@ -2272,7 +2279,7 @@ unsafe fn report_device_open(handle: *mut libc::c_void, wanted: Option<&str>) {
     println!("DEVICES={found}");
     // A device with no DRM file is a software device: Mesa's llvmpipe answers every
     // query but is not GPU access.
-    let hardware: Vec<(*mut libc::c_void, String)> = devices[..found as usize]
+    let hardware: Vec<(*mut libc::c_void, String)> = devices[..found.min(MAX_DEVICES) as usize]
         .iter()
         .filter_map(|device| {
             let mut file = query_device_string(*device, EGL_DRM_RENDER_NODE_FILE_EXT);
@@ -2305,8 +2312,12 @@ unsafe fn report_device_open(handle: *mut libc::c_void, wanted: Option<&str>) {
         wanted,
     ) {
         Ok(index) => index,
-        Err(error) => {
-            println!("DEVICE_ERROR={error}");
+        Err(DevicePick::NoHardware) => {
+            println!("DEVICE_ERROR=no hardware EGL device (only software rendering is available)");
+            return;
+        }
+        Err(DevicePick::Unmatched(node)) => {
+            println!("DEVICE_UNMATCHED={node} is not among the EGL device names listed above");
             return;
         }
     };
@@ -3084,13 +3095,28 @@ mod tests {
         ];
         assert_eq!(pick_device(&hardware, None), Ok(0));
         assert_eq!(pick_device(&hardware, Some("/dev/dri/renderD129")), Ok(1));
-        let err = pick_device(&hardware, Some("/dev/dri/renderD130")).unwrap_err();
-        assert!(err.contains("/dev/dri/renderD130 is not among the EGL hardware devices"));
-        assert!(err.contains("/dev/dri/renderD128,/dev/dri/renderD129"));
+        assert_eq!(
+            pick_device(&hardware, Some("/dev/dri/renderD130")),
+            Err(DevicePick::Unmatched("/dev/dri/renderD130".into()))
+        );
+        // No hardware device is evidence whatever was asked for.
+        assert_eq!(pick_device(&[], None), Err(DevicePick::NoHardware));
+        assert_eq!(
+            pick_device(&[], Some("/dev/dri/renderD128")),
+            Err(DevicePick::NoHardware)
+        );
+    }
 
-        assert!(pick_device(&[], None).is_err());
-        let empty_err = pick_device(&[], Some("/dev/dri/renderD128")).unwrap_err();
-        assert!(empty_err.contains("is not among the EGL hardware devices ()"));
+    /// A driver that names its device `card0` is not a GPU the container cannot open.
+    #[test]
+    fn a_device_name_mismatch_is_indeterminate_not_broken() {
+        let verdict = parse_egl_device_open(
+            "LOADED=/usr/lib64/libEGL.so.1\n\
+             EXTENSIONS=EGL_EXT_device_base EGL_EXT_device_enumeration\n\
+             DEVICES=1\nRENDER_NODES=/dev/dri/card0\n\
+             DEVICE_UNMATCHED=/dev/dri/renderD128 is not among the EGL device names listed above\n",
+        );
+        assert!(verdict.is_indeterminate(), "{verdict:?}");
     }
 
     /// An infrastructure failure of the self-test (crashed child, no verdict line, and

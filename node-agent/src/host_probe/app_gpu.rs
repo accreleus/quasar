@@ -50,7 +50,9 @@ pub fn run(
         }
         Err(error) => {
             return ContainerProbeEnd {
-                observed: Observed::RuntimeError(format!("starting the probe container: {error}")),
+                observed: Observed::RuntimeError(format!(
+                    "starting the host probe container: {error}"
+                )),
                 reconciled: false,
             };
         }
@@ -69,7 +71,7 @@ pub fn run(
             } else if Instant::now() >= deadline_at {
                 Observed::Deadline
             } else {
-                Observed::RuntimeError(format!("observing the probe container: {error}"))
+                Observed::RuntimeError(format!("observing the host probe container: {error}"))
             };
             // The container may still be running; an explicit stop always follows a lost
             // or cut-short observation.

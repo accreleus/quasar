@@ -349,18 +349,9 @@ async fn run_audio(preempt: watch::Receiver<bool>) -> RunEnd {
                 });
             }
         };
-        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .filter(|p| p.is_dir())
-            .unwrap_or_else(std::env::temp_dir);
+        let runtime_dir = crate::session::default_runtime_dir();
         let nonce = probe_nonce();
-        Some(audio::run(
-            api,
-            &image,
-            &runtime_dir.to_string_lossy(),
-            &nonce,
-            &is_preempted,
-        ))
+        Some(audio::run(api, &image, &runtime_dir, &nonce, &is_preempted))
     })
     .await;
 

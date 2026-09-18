@@ -4,8 +4,8 @@
 use crate::runtime::{AudioRun, DiagnosticHelper, ErrorKind, RuntimeClient};
 
 use super::container::{ContainerProbeEnd, Observed};
-use super::outcome::{remediation, ProbeOutcome};
-use super::ProbeKind;
+use super::outcome::{remediation, wording, ProbeOutcome};
+use super::{ProbeKind, ProbeTarget};
 
 /// Run one probe sidecar to a socket-ready/timeout verdict, always stopping and
 /// cleaning up whatever it created. Recovery of a stale prior sidecar runs inside this
@@ -53,7 +53,7 @@ pub fn run(
         Err(error) => {
             return ContainerProbeEnd {
                 observed: Observed::RuntimeError(format!(
-                    "starting the audio probe sidecar: {error}"
+                    "starting the audio host probe sidecar: {error}"
                 )),
                 reconciled: false,
             };
@@ -85,26 +85,31 @@ pub fn run(
 }
 
 pub fn outcome(end: &ContainerProbeEnd) -> ProbeOutcome {
+    let (passed, failed, exercising) = wording(ProbeTarget::host(ProbeKind::Audio));
     match &end.observed {
         Observed::SocketReady => ProbeOutcome::Pass {
-            summary: "The audio sidecar started: its socket appeared".into(),
+            summary: format!("{passed}: its socket appeared"),
         },
         Observed::SocketTimeout => ProbeOutcome::Fail {
-            summary: "The audio sidecar did not start: its socket did not appear within 2 s".into(),
+            summary: format!(
+                "{failed}: its socket did not appear within {} s",
+                crate::session::audio::PULSE_WAIT_TOTAL.as_secs()
+            ),
             remediation: remediation(ProbeKind::Audio),
         },
         Observed::Preempted => ProbeOutcome::Indeterminate {
-            reason: "A session launch took priority over the audio host probe; it will run again"
-                .into(),
+            reason: format!(
+                "A session launch took priority over the host probe of {exercising}; it will run again"
+            ),
         },
         Observed::Busy => ProbeOutcome::Indeterminate {
             reason: "An earlier host probe container is still being cleaned up".into(),
         },
         Observed::RuntimeError(detail) => ProbeOutcome::Indeterminate {
-            reason: format!("The audio host probe could not run: {detail}"),
+            reason: format!("The host probe of {exercising} could not run: {detail}"),
         },
         Observed::Deadline | Observed::Exited(_) => ProbeOutcome::Indeterminate {
-            reason: "The audio host probe reported a result that is not an audio result".into(),
+            reason: format!("The host probe of {exercising} reported a result that is not an audio result"),
         },
     }
 }

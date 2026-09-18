@@ -500,7 +500,7 @@ pub struct SessionConfig {
 }
 
 /// Default `XDG_RUNTIME_DIR` for the Wayland socket. Matches the deploy run scripts.
-fn default_runtime_dir() -> String {
+pub(crate) fn default_runtime_dir() -> String {
     std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp/runtime-quasar".to_string())
 }
 

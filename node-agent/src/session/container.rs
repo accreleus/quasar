@@ -716,11 +716,16 @@ impl ContainerRuntime {
         self.nvidia
     }
 
-    /// Observe this host's GPU access as a launch would. On the launch path it must run
-    /// after [`nvidia_driver_volume_gate`], which is what can still resolve the mount.
+    /// This host's GPU access as a host probe sees it.
     pub fn app_gpu_access_live(&self) -> AppGpuAccess {
+        self.app_gpu_access_with(crate::nvidia_volume::current())
+    }
+
+    /// A launch passes the volume its gate validated, never a second read: a provision
+    /// completing in between would mount a volume no check had seen.
+    fn app_gpu_access_with(&self, volume: Option<VolumeInfo>) -> AppGpuAccess {
         let nodes = dri_node_owners(Path::new(DRI_DIR));
-        let access = app_gpu_access(self.nvidia, crate::nvidia_volume::current(), &nodes);
+        let access = app_gpu_access(self.nvidia, volume, &nodes);
         // The nodes arrive 0660 root:render, and the app user (PUID, no supplementary
         // groups) is neither — so RADV fails `Could not open device
         // /dev/dri/renderD128: Permission denied`, Vulkan enumerates llvmpipe only, and
@@ -1146,6 +1151,7 @@ impl ContainerRuntime {
             // same 64-bit GL/EGL/Vulkan set, vendor configs and loader path. Empty
             // on every host with its own driver.
             let mut image_ld = String::new();
+            let mut gated_volume = None;
             if self.nvidia {
                 lib32 = if params.nvidia_lib32_path.is_empty() {
                     crate::nvidia_volume::lib32_host_path(crate::nvidia_volume::current().as_ref())
@@ -1153,10 +1159,13 @@ impl ContainerRuntime {
                 } else {
                     params.nvidia_lib32_path.to_string()
                 };
-                image_ld = nvidia_driver_volume_gate(self, &spec.image)?.unwrap_or_default();
+                if let Some((volume, ld)) = nvidia_driver_volume_gate(self, &spec.image)? {
+                    gated_volume = Some(volume);
+                    image_ld = ld;
+                }
             }
             args.extend(
-                self.app_gpu_access_live()
+                self.app_gpu_access_with(gated_volume)
                     .session_args(&image_ld, &nvidia_lib32_mount_args(&lib32)),
             );
         }
@@ -1521,7 +1530,10 @@ const NVIDIA_DRIVER_VOLUME_DST: &str = crate::nvidia_volume::VOLUME_MOUNT;
 ///
 /// Must run before the access facts are gathered: `retry_mount_resolution` is what can
 /// still resolve the mount a launch is about to be given.
-fn nvidia_driver_volume_gate(runtime: &ContainerRuntime, image: &str) -> Result<Option<String>> {
+fn nvidia_driver_volume_gate(
+    runtime: &ContainerRuntime,
+    image: &str,
+) -> Result<Option<(VolumeInfo, String)>> {
     crate::nvidia_volume::validate_host_path_for_launch().map_err(anyhow::Error::msg)?;
     crate::nvidia_volume::retry_mount_resolution();
     let Some(info) = crate::nvidia_volume::current() else {
@@ -1540,11 +1552,10 @@ fn nvidia_driver_volume_gate(runtime: &ContainerRuntime, image: &str) -> Result<
         "app container receives the Quasar-provisioned NVIDIA driver volume (v{})",
         info.manifest.driver_version
     );
-    Ok(Some(
-        runtime
-            .image_env_checked(image, "LD_LIBRARY_PATH")?
-            .unwrap_or_default(),
-    ))
+    let image_ld = runtime
+        .image_env_checked(image, "LD_LIBRARY_PATH")?
+        .unwrap_or_default();
+    Ok(Some((info, image_ld)))
 }
 
 /// What a GPU-enabled application container is given for GPU access (#259). Gathered

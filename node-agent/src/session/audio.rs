@@ -84,7 +84,7 @@ pub struct PulseSidecar {
 }
 
 /// `QUASAR_PULSE_IMAGE`, or the running agent's own image. Shared by the per-session
-/// sidecar and the audio host probe (#259), so a probe proves the exact image a session
+/// sidecar and the audio host probe, so a probe proves the exact image a session
 /// would use.
 pub(crate) fn sidecar_image(runtime: &ContainerRuntime) -> Result<String> {
     match std::env::var("QUASAR_PULSE_IMAGE").ok().filter(|v| !v.is_empty()) {

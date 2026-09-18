@@ -4937,7 +4937,7 @@ fn gpu_probe_dropped_observation_stops_and_removes_nothing() {
     assert!(engine.state.lock().unwrap().body.is_none());
 }
 
-/// A launch pre-empts a probe, or its deadline passes: the orchestrator stops WAITING
+/// A launch pre-empts a probe, or its deadline passes: the orchestrator stops waiting
 /// and nothing else. Only the explicit stop and cleanup end the container.
 #[test]
 fn gpu_probe_cancelled_wait_stops_and_removes_nothing_and_explicit_teardown_still_works() {

@@ -1,4 +1,4 @@
-//! The shared result shape for the two container host probes (#259): application-GPU
+//! The shared result shape for the two container host probes: application-GPU
 //! access and audio. Kept here rather than duplicated in each so their outcome mapping
 //! stays comparable.
 
