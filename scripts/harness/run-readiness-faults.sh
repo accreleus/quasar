@@ -78,7 +78,7 @@ for a in "$@"; do
     --results-dir=*) HARNESS_RESULTS_DIR="${a#*=}" ;;
     --allow-cohabit) ALLOW_COHABIT=1 ;;
     -h | --help)
-      sed -n '2,60p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      sed -n '2,54p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -100,12 +100,18 @@ unperformed() {
 
 # only_run <id> — true if --only was not given, or names this id
 only_run() {
-  local id="$1"
+  local id="$1" tok
   [ -z "$ONLY" ] && return 0
-  case ",$ONLY," in
-    *",$id,"*) return 0 ;;
-    *) return 1 ;;
-  esac
+  local IFS=,
+  for tok in $ONLY; do
+    [ "$tok" = "$id" ] && return 0
+    # A bare scenario number selects all of its rows: --only=7 runs 7a..7h.
+    case "$tok" in
+      *[!0-9]*) ;;
+      *) case "$id" in "$tok"[a-z]*) return 0 ;; esac ;;
+    esac
+  done
+  return 1
 }
 any_of() { # any_of id... — true if any is selected
   local id
@@ -299,7 +305,7 @@ ENROLLMENT_TOKEN="${RID}-enroll-$(rand_hex 8)"
 ADMIN_EMAIL="${RID}-admin@quasar.local"
 ADMIN_PASS="Rh02Harness!$(rand_hex 4)"
 
-# ── (E) GPU vendor pre-detection — BEFORE the stack comes up, so the right
+# ── GPU vendor pre-detection — BEFORE the stack comes up, so the right
 # compose overlay is included from the first `up`. Only NVIDIA needs its own
 # overlay; everything else (AMD, Intel, none) uses the base file unmodified,
 # so "not nvidia" is all this needs to decide, and is confirmed against the
@@ -384,8 +390,8 @@ poll_until() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════
-# (P) Small jq-based helpers factoring out the repeated inline
-# `bash -c "curl … | python3 -c …"` polls, and (O) freshness of
+# Small jq-based helpers factoring out the repeated inline
+# `bash -c "curl … | python3 -c …"` polls, and freshness of
 # readiness_reported_at relative to a recreate/injection time so a stale
 # stored report from before it cannot satisfy a wait.
 # ══════════════════════════════════════════════════════════════════════════
@@ -408,12 +414,11 @@ host_reported_at_epoch() { host_json "$1" | jq -r '.host.readiness_reported_at /
 check_field() { host_json "$1" | jq -r --arg id "$2" --arg f "$3" '.host.readiness[]? | select(.id==$id) | (.[$f] // "" | tostring)'; } # $1 host $2 check_id $3 field
 gate_state() { host_json "$1" | jq -r '.host.readiness_gate.state // ""'; }
 blocking_len() { host_json "$1" | jq -r '.host.readiness_gate.blocking | length'; }
-blocking_entry_field() { host_json "$1" | jq -r --arg id "$2" --arg f "$3" '.host.readiness_gate.blocking[]? | select(.check_id==$id) | (.[$f] // "" | tostring)'; }
 
 # wait_check_status <host_id> <check_id> <status> <bound> [since_epoch]
 # Polls until the named check reports the given status AND (if since_epoch
 # given) readiness_reported_at is strictly newer than it, so a report stored
-# before a fault injection/recovery cannot satisfy the wait (spec item O).
+# before a fault injection/recovery cannot satisfy the wait.
 wait_check_status() {
   local host="$1" check="$2" want="$3" bound="$4" since="${5:-0}"
   local waited=0 st ra
@@ -513,6 +518,30 @@ collect_readiness_checks() { # $1 host_id — appends every readiness check this
   [ -n "$hid" ] || return 0
   host_json "$hid" | jq -c '.host.readiness[]?' >>"$ALL_CHECK_IDS_FILE" 2>/dev/null || true
 }
+# A scan over the collected checks proves nothing when the collection is empty
+# or thin: fewer ids than any real agent reports means the collector failed.
+MIN_CHECK_CORPUS=10
+check_corpus_size() { jq -r '.id // empty' "$ALL_CHECK_IDS_FILE" 2>/dev/null | sort -u | wc -l; }
+
+# assert_names_no_check <label> <text> — pass/fail/unperformed for "this text
+# names no readiness check", against every check id any host reported so far.
+assert_names_no_check() {
+  local label="$1" text="$2" n named
+  n=$(check_corpus_size)
+  if [ "$n" -lt "$MIN_CHECK_CORPUS" ]; then
+    unperformed "$label: only $n check id(s) were collected, too few to judge the message against"
+    return
+  fi
+  named=$(jq -r '.id // empty' "$ALL_CHECK_IDS_FILE" | sort -u | while IFS= read -r cid; do
+    case "$text" in *"$cid"*) printf '%s ' "$cid" ;; esac
+  done)
+  if [ -z "$named" ]; then
+    pass "$label: the message names none of the $n check ids reported in this run"
+  else
+    fail "$label: the message names check id(s): $named"
+  fi
+}
+
 dedupe_check_ids_file() {
   sort -u "$ALL_CHECK_IDS_FILE" -o "$ALL_CHECK_IDS_FILE" 2>/dev/null || true
 }
@@ -577,9 +606,9 @@ DOCKER
 }
 
 relay_rule() { curl -sS -X PUT "$RELAY_CONTROL/rule" -H 'Content-Type: application/json' -d "$1" >/dev/null 2>&1; } # $1 JSON rule body
-relay_stats() { curl -sS "$RELAY_CONTROL/stats" 2>/dev/null || echo '{}'; } # diagnostic only — never used to judge a wait (letter B)
+relay_stats() { curl -sS "$RELAY_CONTROL/stats" 2>/dev/null || echo '{}'; } # diagnostic only — never used to judge a wait
 
-# (A) The fixture image is built once, up front, and is fatal-on-failure for
+# The fixture image is built once, up front, and is fatal-on-failure for
 # the whole run — so by the time any scenario runs, `readiness-fixture host`
 # is known to exist. This helper is kept only as a defensive per-call guard
 # in case a scenario runs against an image built from a tree whose fixture
@@ -594,7 +623,7 @@ fixture_supports_host() {
   [ "$rc" != "127" ]
 }
 
-# ── (H helper) delete every $RID-* host row via the API, asserting 204 each,
+# ── Delete every $RID-* host row via the API, asserting 204 each,
 # rather than relying only on locally-tracked ids (a scripted/nested host
 # that this run created may not be in a local array on every code path). ────
 delete_all_rid_hosts() {
@@ -638,7 +667,7 @@ preflight_cohabit_check() {
     fail "preflight: $RID_ROOT already exists (RID collision?)"
     exit 1
   fi
-  # (H) snapshot of pre-existing container names, so scenario 9's sweep for
+  # Snapshot of pre-existing container names, so scenario 9's sweep for
   # quasar-sess-*/quasar-pulse-*/quasar-probe-* under --allow-cohabit compares
   # against this baseline instead of assuming the engine started empty.
   docker ps -a --format '{{.Names}}' 2>/dev/null >"$PREFLIGHT_FOREIGN_NAMES_FILE" || true
@@ -678,7 +707,7 @@ assert_agent_image_clean() {
 }
 assert_agent_image_clean
 
-# ── /dev/kmsg / /dev/input auto-detect (LXC test hosts lack both) — (Q):
+# ── /dev/kmsg / /dev/input auto-detect (LXC test hosts lack both) —
 # only remove /dev/input in cleanup if THIS run created it, and only if empty.
 if [ ! -e /dev/kmsg ]; then
   NEEDS_DEVICE_OVERRIDE=1
@@ -702,7 +731,7 @@ TEMPLATE_ROOT="$RID_ROOT/templates"
 sudo mkdir -p "$TEMPLATE_ROOT"
 sudo chown -R "$(id -u):$(id -g)" "$RID_ROOT" 2>/dev/null || true
 
-# ── (A) Build the fixture image and start the relay BEFORE `compose up` —
+# ── Build the fixture image and start the relay BEFORE `compose up` —
 # fatal for the whole run if the image cannot be built (not per-scenario
 # unperformed): every scenario from 2 onward launches through it once the
 # base override below points the real agent at it from first boot. ─────────
@@ -730,7 +759,7 @@ relay_rule '{"mode":"off"}'
 pass "fixture: relay running, rule off (transparent)"
 
 # ── Base compose override: ownership labels, homes/template roots, device
-#    fix, content-addressed images, and (A) the real agent pointed at the
+#    fix, content-addressed images, and the real agent pointed at the
 #    relay from first boot. ──────────────────────────────────────────────────
 BASE_OVERRIDE="$WORKDIR/override.base.yml"
 cat >"$BASE_OVERRIDE" <<YAML
@@ -771,7 +800,7 @@ QUASAR_TEMPLATE_ROOT=$TEMPLATE_ROOT
 ENV
 
 # ── Cleanup (idempotent; verified by scenario 9) ────────────────────────────
-# (H) order: stop sessions and wait stopped -> stop every agent/scripted
+# Order: stop sessions and wait stopped -> stop every agent/scripted
 # host/nested agent -> delete every $RID-* host row via the API (asserting
 # 204 each) -> compose down -v -> label sweep -> umount/rm -> verify.
 CREATED_SESSION_IDS=()
@@ -827,7 +856,7 @@ cleanup() {
 
   sudo umount "$HOMES_ROOT" >/dev/null 2>&1 || true
   sudo rm -rf "$RID_ROOT" >/dev/null 2>&1 || true
-  # (Q) remove /dev/input only if THIS run created it and it is still empty.
+  # Remove /dev/input only if THIS run created it and it is still empty.
   if [ "$CREATED_DEV_INPUT" = "1" ] && [ -d /dev/input ] && [ -z "$(ls -A /dev/input 2>/dev/null)" ]; then
     sudo rmdir /dev/input 2>/dev/null || true
   fi
@@ -873,7 +902,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ── Bring the stack up — ONLY the three services under test (I): never
+# ── Bring the stack up — ONLY the three services under test: never
 # quasar-updater, which touches nothing this harness exercises. ────────────
 echo "== starting stack (RID=$RID, compose files: ${COMPOSE_FILES[*]}) =="
 compose_cmd up -d quasar-postgres quasar-control-plane quasar-node-agent
@@ -892,7 +921,7 @@ ADMIN_TOK=$(http_body "$LOGIN_RAW" | json_get access_token)
 [ -n "$ADMIN_TOK" ] || { fail "login: admin token not obtained"; exit 1; }
 pass "login: admin token obtained"
 
-# (J) image source-commit labels (org.quasar.source.commit) and the real
+# Image source-commit labels (org.quasar.source.commit) and the real
 # schema version (control-plane's own Postgres schema_migrations.version) —
 # kept as two separate, correctly-named facts rather than one guessed field.
 CONTROL_IMAGE_COMMIT=$(docker inspect "$CONTROL_IMAGE" -f '{{index .Config.Labels "org.quasar.source.commit"}}' 2>/dev/null || echo "")
@@ -928,7 +957,7 @@ provision_nonadmin() {
 provision_nonadmin || true
 
 # ── Fixture apps: app-nohome, app-home (fedora:43 + sleep, default_vram_mb=256)
-# (K) non-subshell: fail() called inside a `$(...)` subshell is invisible to
+# Non-subshell: fail() called inside a `$(...)` subshell is invisible to
 # the parent's counters, so this sets globals directly instead and treats a
 # create failure as fatal (nothing downstream is meaningful without both apps).
 APP_NOHOME_ID=""
@@ -952,10 +981,9 @@ if [ -z "$APP_NOHOME_ID" ] || [ -z "$APP_HOME_ID" ]; then
   exit 1
 fi
 
-# ── (L) Baseline: require the REAL host to exist, be online, gate active,
-# and blocking empty — an empty host list must never satisfy this (the old
-# `all(...)` over [] bug would let the baseline launch fire before the agent
-# even registered). ──────────────────────────────────────────────────────────
+# ── Baseline: require the REAL host to exist, be online, gate active,
+# and blocking empty — an empty host list must never satisfy this (ensure all
+# checks pass before launching, not just when the list is empty). ──────────────────────────────────────────────────────────
 BASELINE_OK=0
 REAL_HOST_ID=""
 if REAL_HOST_ID=$(wait_host_registered "${RID}-real" 120); then
@@ -1051,7 +1079,7 @@ scenario_2b() {
   only_run 2b || return 0
   local fill="$HOMES_ROOT/${RID}-fill" since; since=$(now_epoch)
   dd if=/dev/zero of="$fill" bs=1M count=512 2>/dev/null || true
-  # (D) dd exits non-zero on ENOSPC — that IS the expected way to reach zero
+  # dd exits non-zero on ENOSPC — that IS the expected way to reach zero
   # free on a tmpfs; judge readiness by actual free space, not dd's exit code.
   local avail
   avail=$(df --output=avail "$HOMES_ROOT" 2>/dev/null | tail -1 | tr -d ' ')
@@ -1081,10 +1109,21 @@ scenario_2b() {
   fi
   since=$(now_epoch)
   rm -f "$fill"
-  if wait_check_status "$REAL_HOST_ID" homes_free_space pass 90 "$since" || [ "$(check_field "$REAL_HOST_ID" homes_free_space status)" != "fail" ]; then
-    pass "2b: homes_free_space check not fail after removing the fill file"
+  # The harness tmpfs is far below the free-space floor, so the recovered status
+  # is `warn`, not `pass`. An ABSENT check is not a recovery: name the status.
+  if wait_check_status "$REAL_HOST_ID" homes_free_space warn 90 "$since" || wait_check_status "$REAL_HOST_ID" homes_free_space pass 15 "$since"; then
+    pass "2b: homes_free_space no longer fails after removing the fill file (status '$(check_field "$REAL_HOST_ID" homes_free_space status)')"
   else
-    fail "2b: homes_free_space still fail after removing the fill file"
+    fail "2b: homes_free_space is '$(check_field "$REAL_HOST_ID" homes_free_space status)' after removing the fill file (want warn or pass)"
+  fi
+  res=$(launch_app "$APP_HOME_ID" "$ADMIN_TOK"); st="${res%%$'\t'*}"
+  if [ "$st" = "201" ]; then
+    local sid2; sid2=$(printf '%s' "${res#*$'\t'}" | json_get session.id)
+    CREATED_SESSION_IDS+=("$sid2")
+    if wait_session_state "$sid2" running 90; then pass "2b: app-home launch reaches running after recovery"; else fail "2b: app-home launch did not reach running after recovery — $LAST_SESSION_DIAG"; fi
+    stop_and_wait "$sid2"
+  else
+    fail "2b: app-home launch after recovery got HTTP $st (want 201)$(launch_diag "$res")"
   fi
 }
 
@@ -1127,7 +1166,7 @@ YAML
 
 # ══════════════════════════════════════════════════════════════════════════
 # Scenario 4 — GPU path broken (+ 4c placed-elsewhere, run INSIDE the fault
-# window of 4a/4b, before it clears — per coordinator letter F).
+# window of 4a/4b, before it clears).
 # ══════════════════════════════════════════════════════════════════════════
 gpu_probe_check_ids() { echo "media_probe_gpu${GPU_INDEX}"; echo "application_gpu_probe_gpu${GPU_INDEX}"; }
 
@@ -1139,7 +1178,10 @@ assert_4_common() { # $1 label $2 since_epoch
   for id in $(gpu_probe_check_ids); do
     local status scope gidx
     status=$(printf '%s' "$hb" | jq -r --arg id "$id" '.host.readiness[]? | select(.id==$id) | .status // ""')
-    [ -n "$status" ] || continue
+    if [ -z "$status" ]; then
+      fail "$label: $id is not reported at all under the fault"
+      continue
+    fi
     scope=$(printf '%s' "$hb" | jq -r --arg id "$id" '.host.readiness[]? | select(.id==$id) | .blocks.scope // ""')
     gidx=$(printf '%s' "$hb" | jq -r --arg id "$id" '.host.readiness[]? | select(.id==$id) | (.blocks.gpu_index // "" | tostring)')
     if [ "$status" = "fail" ]; then
@@ -1172,7 +1214,7 @@ assert_4_recovery() { # $1 label $2 since_epoch
   fi
 }
 
-# scenario_4c_inside_fault <label> — (F) run 4c inside the caller's fault
+# scenario_4c_inside_fault <label> — run 4c inside the caller's fault
 # window: start a ready scripted host with a free slot, wait for it online
 # with an active gate, launch, assert 201 + session.host_id == it, tear it
 # down. Called from 4a/4b before they clear their own fault.
@@ -1296,7 +1338,7 @@ scenario_4b() {
     fi
     return
   fi
-  # (E) Override the driver volume to a fresh, harness-labelled empty volume
+  # Override the driver volume to a fresh, harness-labelled empty volume
   # by NAME (the nvidia overlay's own volume is `quasar-nvidia-driver`,
   # mounted at /opt/quasar/nvidia-driver — see deploy/docker-compose.nvidia.yml).
   local fresh_vol="${RID}-empty-driver" since; since=$(now_epoch)
@@ -1404,7 +1446,11 @@ YAML
   if wait_check_status "$REAL_HOST_ID" audio_probe unknown 60 "$since"; then
     pass "5b: audio_probe reports unknown"
   else
-    unperformed "5b: audio_probe did not report unknown within bound"
+    # The image is certainly missing, so this is not a fault that could not be
+    # injected: it is the wrong answer. Nothing below may be asserted on it.
+    fail "5b: audio_probe is '$(check_field "$REAL_HOST_ID" audio_probe status)' with its sidecar image missing (want unknown)"
+    recreate_agent_with_override >/dev/null 2>&1 || true
+    return
   fi
   local blocking; blocking=$(host_json "$REAL_HOST_ID" | jq -r '[.host.readiness_gate.blocking[]? | select(.check_id=="audio_probe")] | length')
   if [ "$blocking" = "0" ]; then pass "5b: audio_probe absent from blocking"; else fail "5b: audio_probe present in blocking"; fi
@@ -1425,7 +1471,7 @@ YAML
 
 # ══════════════════════════════════════════════════════════════════════════
 # Scenario 6 — capacity vs readiness precedence, via two scripted hosts.
-# (G) both host ids are tracked; each wait requires online AND gate active
+# Both host ids are tracked; each wait requires online AND gate active
 # (deliberate — this is what fails on a pre-RH-02 control plane, per the
 # matrix's "Baseline proof"); B's own check keeps the harness_synthetic_
 # prefix (scripts/verify's guard keys on it) even though it is delivered via
@@ -1468,6 +1514,7 @@ scenario_6() {
         if [ "$st1" = "201" ]; then
           sid1=$(printf '%s' "${res1#*$'\t'}" | json_get session.id)
           CREATED_SESSION_IDS+=("$sid1")
+          if [ "$(printf '%s' "${res1#*$'\t'}" | json_get session.host_id)" = "$hid_a" ]; then pass "6a: the first launch fills the ready host"; else fail "6a: the first launch was not placed on the ready host"; fi
           local res2 st2 code2
           res2=$(launch_app "$APP_NOHOME_ID" "$ADMIN_TOK"); st2="${res2%%$'\t'*}"; code2=$(printf '%s' "${res2#*$'\t'}" | json_get error.code)
           if [ "$st2" = "503" ] && [ "$code2" = "capacity_exhausted" ]; then
@@ -1477,7 +1524,7 @@ scenario_6() {
           fi
           stop_and_wait "$sid1"
         else
-          fail "6a: first launch (against the ready scripted host) got HTTP $st1 (want 201)$(launch_diag "$res")"
+          fail "6a: first launch (against the ready scripted host) got HTTP $st1 (want 201)$(launch_diag "$res1")"
         fi
       else
         unperformed "6a: scripted host B never reached online+active-gate+blocking"
@@ -1511,16 +1558,12 @@ scenario_6() {
         st=$(http_status "$raw"); body=$(http_body "$raw")
         if [ "$st" = "503" ] && [ "$(printf '%s' "$body" | json_get error.code)" = "host_not_ready" ]; then pass "6c: launch refused host_not_ready with only the blocked host online"; else fail "6c: expected 503 host_not_ready, got $st"; fi
         if http_has_header "$raw" "Retry-After"; then fail "6c: response carried a Retry-After header"; else pass "6c: no Retry-After header"; fi
-        local msg leak=0
-        msg=$(printf '%s' "$body" | json_get error.message)
-        while IFS= read -r line; do
-          [ -z "$line" ] && continue
-          local cid; cid=$(echo "$line" | jq -r '.id // empty' 2>/dev/null)
-          [ -n "$cid" ] && echo "$msg" | grep -qF "$cid" && leak=1
-        done <"$ALL_CHECK_IDS_FILE"
-        if [ "$leak" = "0" ]; then pass "6c: error.message names no check id"; else fail "6c: error.message leaks a check id"; fi
+        # The real agent is stopped, but its stored report still serves every
+        # id a real host uses: that is the list the message is judged against.
+        collect_readiness_checks "$REAL_HOST_ID"
+        assert_names_no_check "6c" "$(printf '%s' "$body" | json_get error.message)"
       fi
-      # (G) 6d MUST run inside this same state (only the blocked host online)
+      # 6d MUST run inside this same state (only the blocked host online)
       # — running it after the real agent is back online would let the
       # non-admin launch succeed and leak a session, proving nothing about
       # the no-detail rule.
@@ -1529,17 +1572,11 @@ scenario_6() {
           local raw st body
           raw=$(http_raw POST sessions "$NONADMIN_TOK" "{\"app_id\":\"$APP_NOHOME_ID\"}")
           st=$(http_status "$raw"); body=$(http_body "$raw")
-          if [ "$st" = "503" ]; then
-            local msg leak=0
-            msg=$(printf '%s' "$body" | json_get error.message)
-            while IFS= read -r line; do
-              [ -z "$line" ] && continue
-              local cid; cid=$(echo "$line" | jq -r '.id // empty' 2>/dev/null)
-              [ -n "$cid" ] && echo "$msg" | grep -qF "$cid" && leak=1
-            done <"$ALL_CHECK_IDS_FILE"
-            if [ "$leak" = "0" ]; then pass "6d: non-admin body names no check"; else fail "6d: non-admin body leaks a check id"; fi
+          if [ "$st" = "503" ] && [ "$(printf '%s' "$body" | json_get error.code)" = "host_not_ready" ]; then
+            collect_readiness_checks "$REAL_HOST_ID"
+            assert_names_no_check "6d" "$body"
           else
-            unperformed "6d: could not reproduce a 503 for the non-admin caller (got $st)"
+            fail "6d: the non-admin launch got $st code=$(printf '%s' "$body" | json_get error.code) (want 503 host_not_ready)"
           fi
           local h1 h2
           h1=$(http_raw GET hosts "$NONADMIN_TOK")
@@ -1563,14 +1600,14 @@ scenario_6() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════
-# Scenario 7 — control-plane readiness override, via the whole-run relay
-# (A: relay is already running and the real agent already points at it from
-# first boot — no per-scenario relay start or agent recreate here).
-# (B: waits are state-based on the host body, never on a cumulative counter.)
+# Scenario 7 — control-plane readiness override, via the whole-run relay.
+# Relay is already running and the real agent already points at it from
+# first boot — no per-scenario relay start or agent recreate here.
+# Waits are state-based on the host body, never on a cumulative counter.
 # ══════════════════════════════════════════════════════════════════════════
 scenario_7() {
   any_of 7a 7b 7c 7d 7e 7f 7g 7h || return 0
-  local check_id="harness_synthetic_gate"
+  local check_id="harness_synthetic_gate" override_was_set=0
 
   if ! poll_until 60 3 bash -c "curl -sS '$RELAY_CONTROL/stats' | jq -e '.agent_connections>0' >/dev/null 2>&1"; then
     for id in 7a 7b 7c 7d 7e 7f 7g 7h; do unperformed "$id: the real agent never connected through the relay (diagnostic: $(relay_stats))"; done
@@ -1598,12 +1635,17 @@ scenario_7() {
       else
         fail "7a: repeat PUT status $(http_status "$put2"), audit $audit_before -> $audit_after"
       fi
-      # (M) select the row by check_id in details, not by index 0 — the feed
+      # Select the row by check_id in details, not by index 0 — the feed
       # is newest-first and this run may not be the only actor.
       local sev
       sev=$(http_body "$(http_raw GET "admin/activity?action=host.readiness_override.set" "$ADMIN_TOK")" \
         | jq -r --arg cid "$check_id" '[.items[] | select((.details.check_id // "")==$cid)][0].severity // ""')
       if [ "$sev" = "warn" ]; then pass "7a: audit host.readiness_override.set severity warn"; else fail "7a: audit severity '$sev' (want warn)"; fi
+      local audit_node
+      audit_node=$(http_body "$(http_raw GET "admin/activity?action=host.readiness_override.set" "$ADMIN_TOK")" \
+        | jq -r --arg cid "$check_id" '[.items[] | select((.details.check_id // "")==$cid)][0].details.node_name // ""')
+      if [ "$audit_node" = "${RID}-real" ]; then pass "7a: the audit detail carries check_id and node_name"; else fail "7a: audit detail node_name='$audit_node' (want ${RID}-real)"; fi
+      override_was_set=1
     else
       unperformed "7a: relay rule never reached the control plane's stored readiness (diagnostic: $(relay_stats))"
     fi
@@ -1635,16 +1677,26 @@ scenario_7() {
     fi
   fi
 
-  if only_run 7d; then
+  if only_run 7d && [ "$override_was_set" != "1" ]; then
+    # "Gone" and "actor null" are both true of an override that never existed.
+    fail "7d: no override was set by 7a, so a lapse cannot be shown"
+  elif only_run 7d; then
     relay_rule "{\"mode\":\"inject\",\"check\":{\"id\":\"$check_id\",\"status\":\"pass\",\"summary\":\"cleared\",\"source\":\"host_probe\"}}"
     if wait_check_status "$REAL_HOST_ID" "$check_id" pass 90 0; then
       pass "7d: check reads pass in readiness[]"
       if poll_until 60 3 bash -c "curl -sS -H 'Authorization: Bearer $ADMIN_TOK' '$API/v1/hosts/$REAL_HOST_ID' | jq -e '[.host.readiness_overrides[]? | select(.check_id==\"$check_id\")] | length == 0' >/dev/null 2>&1"; then
         pass "7d: override lapsed (gone from readiness_overrides)"
-        local actor
-        actor=$(http_body "$(http_raw GET "admin/activity?action=host.readiness_override.lapsed" "$ADMIN_TOK")" \
-          | jq -r --arg cid "$check_id" '[.items[] | select((.details.check_id // "")==$cid)][0].actor_user_id // "null"')
-        if [ "$actor" = "null" ]; then pass "7d: audit .lapsed has actor null"; else fail "7d: audit .lapsed actor='$actor' (want null)"; fi
+        local lapsed_rows actor
+        lapsed_rows=$(http_body "$(http_raw GET "admin/activity?action=host.readiness_override.lapsed" "$ADMIN_TOK")" \
+          | jq -c --arg cid "$check_id" '[.items[] | select((.details.check_id // "")==$cid)]')
+        actor=$(printf '%s' "$lapsed_rows" | jq -r '.[0].actor_user_id // "null"')
+        if [ "$(printf '%s' "$lapsed_rows" | jq -r 'length')" = "0" ]; then
+          fail "7d: no host.readiness_override.lapsed audit row for $check_id"
+        elif [ "$actor" = "null" ]; then
+          pass "7d: audit .lapsed exists with actor null"
+        else
+          fail "7d: audit .lapsed actor='$actor' (want null)"
+        fi
       else
         fail "7d: override did not lapse after the check reported pass"
       fi
@@ -1656,22 +1708,33 @@ scenario_7() {
   if only_run 7e; then
     relay_rule "{\"mode\":\"inject\",\"check\":{\"id\":\"$check_id\",\"status\":\"fail\",\"summary\":\"harness synthetic gate\",\"remediation\":\"clear via relay rule\",\"source\":\"host_probe\",\"blocks\":{\"scope\":\"host\",\"enforced_by\":\"control_plane\"}}}"
     wait_check_status "$REAL_HOST_ID" "$check_id" fail 90 0 || true
-    http_raw PUT "admin/hosts/$REAL_HOST_ID/readiness-overrides/$check_id" "$ADMIN_TOK" >/dev/null
+    local put_e; put_e=$(http_raw PUT "admin/hosts/$REAL_HOST_ID/readiness-overrides/$check_id" "$ADMIN_TOK")
+    if [ "$(http_status "$put_e")" = "200" ]; then pass "7e: override set again -> 200"; else fail "7e: override PUT got $(http_status "$put_e") (want 200)"; fi
     local d1 d2
     d1=$(http_raw DELETE "admin/hosts/$REAL_HOST_ID/readiness-overrides/$check_id" "$ADMIN_TOK")
     if [ "$(http_status "$d1")" = "204" ]; then pass "7e: DELETE -> 204"; else fail "7e: DELETE got $(http_status "$d1") (want 204)"; fi
     d2=$(http_raw DELETE "admin/hosts/$REAL_HOST_ID/readiness-overrides/$check_id" "$ADMIN_TOK")
     if [ "$(http_status "$d2")" = "204" ]; then pass "7e: repeat DELETE -> 204 (idempotent)"; else fail "7e: repeat DELETE got $(http_status "$d2") (want 204)"; fi
     local cleared
-    cleared=$(http_body "$(http_raw GET "admin/activity?action=host.readiness_override.cleared" "$ADMIN_TOK")" | jq -r '.items | length')
-    if [ "${cleared:-0}" -gt 0 ]; then pass "7e: audit has .cleared"; else fail "7e: no .cleared audit row found"; fi
+    cleared=$(http_body "$(http_raw GET "admin/activity?action=host.readiness_override.cleared" "$ADMIN_TOK")" \
+      | jq -r --arg cid "$check_id" '[.items[] | select((.details.check_id // "")==$cid)] | length')
+    if [ "${cleared:-0}" = "1" ]; then
+      pass "7e: exactly one .cleared audit row for this check (the idempotent repeat wrote none)"
+    else
+      fail "7e: ${cleared:-0} .cleared audit row(s) for $check_id (want exactly 1)"
+    fi
     local res st
     res=$(launch_app "$APP_NOHOME_ID" "$ADMIN_TOK"); st="${res%%$'\t'*}"
-    if [ "$st" = "503" ]; then pass "7e: launch refused again after clearing"; else fail "7e: launch got HTTP $st after clearing (want 503)"; fi
+    if [ "$st" = "503" ] && [ "$(printf '%s' "${res#*$'\t'}" | json_get error.code)" = "host_not_ready" ]; then
+      pass "7e: launch refused host_not_ready again after clearing"
+    else
+      fail "7e: launch after clearing got $st (want 503 host_not_ready)$(launch_diag "$res")"
+    fi
   fi
 
   if only_run 7f; then
-    http_raw PUT "admin/hosts/$REAL_HOST_ID/readiness-overrides/$check_id" "$ADMIN_TOK" >/dev/null
+    local put_f; put_f=$(http_raw PUT "admin/hosts/$REAL_HOST_ID/readiness-overrides/$check_id" "$ADMIN_TOK")
+    if [ "$(http_status "$put_f")" = "200" ]; then pass "7f: override set before the rename -> 200"; else fail "7f: override PUT got $(http_status "$put_f") (want 200)"; fi
     relay_rule "{\"mode\":\"inject\",\"check\":{\"id\":\"${check_id}_v2\",\"status\":\"fail\",\"summary\":\"renamed\",\"remediation\":\"n/a\",\"source\":\"host_probe\",\"blocks\":{\"scope\":\"host\",\"enforced_by\":\"control_plane\"}}}"
     if wait_blocking_has "$REAL_HOST_ID" "${check_id}_v2" 90; then
       local hb inert overridden_new
@@ -1742,7 +1805,7 @@ scenario_7() {
 
 # ══════════════════════════════════════════════════════════════════════════
 # Scenario 8 — host-local honesty scan over every readiness check seen.
-# (N) collect_readiness_checks is called from every scenario at the moment
+# collect_readiness_checks is called from every scenario at the moment
 # its fault is visible (inline above), not only once at the end; this final
 # pass just adds one more sweep of the current real/known hosts and
 # de-duplicates before scanning.
@@ -1779,7 +1842,9 @@ with open('$ALL_CHECK_IDS_FILE', encoding='utf-8') as fh:
                 leaks.append(f'{c.get(\"id\")}.{field}: {v!r}')
 print('\n'.join(leaks))
 ")
-  if [ -z "$hit" ]; then
+  if [ "$(check_corpus_size)" -lt "$MIN_CHECK_CORPUS" ]; then
+    unperformed "8: only $(check_corpus_size) check id(s) were collected in this run, too few to scan"
+  elif [ -z "$hit" ]; then
     pass "8: no readiness check id/summary/remediation implies browser-reachability without an allow-listed negation"
   else
     fail "8: host-local honesty violation(s): $hit"
@@ -1796,7 +1861,7 @@ print('\n'.join(leaks))
 # ══════════════════════════════════════════════════════════════════════════
 dind_exec() { docker exec "${RID}-dind" "$@"; } # $@ command to run against the NESTED engine's shell
 dind_docker() { docker exec "${RID}-dind" docker "$@"; }
-dind_load() { docker save "$1" | docker exec -i "${RID}-dind" docker load >/dev/null 2>&1; } # $1 image — exec needs -i or the piped archive never arrives # $@ docker subcommand against the NESTED dockerd
+dind_load() { docker save "$1" | docker exec -i "${RID}-dind" docker load >/dev/null 2>&1; } # $1 image — exec needs -i or the piped archive never arrives
 
 scenario_1() {
   any_of 1a 1b 1c 1d 1e || return 0

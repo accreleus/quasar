@@ -222,6 +222,10 @@ func pumpVerbatim(src, dst *websocket.Conn) {
 
 // forwardClose propagates a close from whichever side saw it first to the
 // other side, so an agent disconnect closes the upstream leg and vice versa.
+// It runs on one pump while the other pump may be writing data frames to the
+// same connection. That is sound only because gorilla/websocket allows
+// WriteControl concurrently with the single data writer; a data write here
+// would not be.
 func forwardClose(peer, source *websocket.Conn, err error) {
 	code := websocket.CloseNormalClosure
 	text := "closed"

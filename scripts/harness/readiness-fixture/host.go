@@ -188,7 +188,7 @@ func (h *Host) Run(ctx context.Context) error {
 
 	state := newSessionState()
 
-	if err := h.sendCapacity(conn, state); err != nil {
+	if err := h.sendCapacity(conn); err != nil {
 		return fmt.Errorf("send capacity: %w", err)
 	}
 
@@ -256,7 +256,7 @@ func (h *Host) readReadinessFile() json.RawMessage {
 	return json.RawMessage(data)
 }
 
-func (h *Host) sendCapacity(conn *websocket.Conn, state *sessionState) error {
+func (h *Host) sendCapacity(conn *websocket.Conn) error {
 	msg := capacityMsg{
 		Type:   "capacity",
 		Host:   hostCapacity{CPUCores: 4, MemMB: 8192},
@@ -299,7 +299,7 @@ func (h *Host) reportLoop(ctx context.Context, conn *websocket.Conn, state *sess
 			writeMu.Unlock()
 		case <-capTicker.C:
 			writeMu.Lock()
-			_ = h.sendCapacity(conn, state)
+			_ = h.sendCapacity(conn)
 			writeMu.Unlock()
 		}
 	}

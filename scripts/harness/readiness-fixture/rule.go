@@ -1,6 +1,3 @@
-// Package main implements the RH-02 readiness fixture: a relay that can rewrite
-// an agent's capacity.readiness array on the wire, and a scripted agent that can
-// stand in as an extra host. Test-only — see README.md.
 package main
 
 import (

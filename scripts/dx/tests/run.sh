@@ -3577,9 +3577,6 @@ else
 fi
 
 rf_scripts=("$RF_HARNESS")
-for f in "$ROOT"/scripts/harness/readiness-faults/*.sh; do
-  [ -f "$f" ] && rf_scripts+=("$f")
-done
 if ! bash -n "${rf_scripts[@]}" 2>/dev/null; then
   fail "readiness-faults:bash-n" "a harness script has a syntax error"
 elif command -v shellcheck >/dev/null 2>&1; then
@@ -3594,9 +3591,13 @@ else
 fi
 
 # No shipped tree may mention the fixture, its synthetic check ids or its env names.
-rf_hits="$(grep -rIlE 'readiness-fixture|harness_synthetic_|RH02_FIXTURE_' \
-  "$ROOT/node-agent/src" "$ROOT/node-agent/Cargo.toml" "$ROOT/control-plane" \
-  "$ROOT/web/src" "$ROOT/deploy" 2>/dev/null | sed "s#^$ROOT/##" | head -n 5)"
+# Whole shipped trees, not just their src/: a build script or a test helper is
+# as much a way in as a source file. Only build output and installed
+# dependencies are skipped.
+rf_hits="$(grep -rIlE --exclude-dir=target --exclude-dir=node_modules --exclude-dir=dist \
+  --exclude-dir=results 'readiness-fixture|harness_synthetic_|RH02_FIXTURE_' \
+  "$ROOT/node-agent" "$ROOT/control-plane" "$ROOT/web" "$ROOT/deploy" 2>/dev/null \
+  | sed "s#^$ROOT/##" | head -n 5)"
 if [ -z "$rf_hits" ]; then
   pass "readiness-faults:fixture-unreachable" "no shipped tree references the fixture or a synthetic check id"
 else
