@@ -1748,7 +1748,13 @@ scenario_7() {
     local put_f; put_f=$(http_raw PUT "admin/hosts/$REAL_HOST_ID/readiness-overrides/$check_id" "$ADMIN_TOK")
     if [ "$(http_status "$put_f")" = "200" ]; then pass "7f: override set before the rename -> 200"; else fail "7f: override PUT got $(http_status "$put_f") (want 200)"; fi
     relay_rule "{\"mode\":\"inject\",\"check\":{\"id\":\"${check_id}_v2\",\"status\":\"fail\",\"summary\":\"renamed\",\"remediation\":\"n/a\",\"source\":\"host_probe\",\"blocks\":{\"scope\":\"host\",\"enforced_by\":\"control_plane\"}}}"
-    if wait_blocking_has "$REAL_HOST_ID" "${check_id}_v2" 90; then
+    # Two separate facts: the renamed check ARRIVED (else the fault was not
+    # injected: unperformed), and the gate LISTS it (else the product is wrong).
+    if ! wait_check_status "$REAL_HOST_ID" "${check_id}_v2" fail 90 0; then
+      unperformed "7f: the renamed check never reached the control plane's stored readiness (diagnostic: $(relay_stats))"
+    elif ! wait_blocking_has "$REAL_HOST_ID" "${check_id}_v2" 30; then
+      fail "7f: the renamed check is reported as fail with blocks but readiness_gate.blocking does not list it"
+    else
       local hb inert overridden_new
       hb=$(host_json "$REAL_HOST_ID")
       inert=$(printf '%s' "$hb" | jq -r --arg id "$check_id" '.host.readiness_overrides[]? | select(.check_id==$id) | .inert')
@@ -1762,8 +1768,6 @@ scenario_7() {
       else
         fail "7f: expected 503 host_not_ready, got $st"
       fi
-    else
-      unperformed "7f: renamed check never surfaced in blocking within bound"
     fi
     relay_rule '{"mode":"off"}'
     http_raw DELETE "admin/hosts/$REAL_HOST_ID/readiness-overrides/$check_id" "$ADMIN_TOK" >/dev/null
