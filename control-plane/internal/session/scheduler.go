@@ -88,6 +88,11 @@ const maxPlacementAttempts = 50
 // unset) means unpinned — any vendor-compatible GPU — and the agent adopts the
 // scheduled GPU's node; the two resolvers must not diverge. A non-empty value
 // exact-matches, so 'software' stays unschedulable for hardware encoders.
+// The vulkan arm resolves by render node alone (#268): bind_gpu sets no ordinal
+// for Vulkan — the compositor creates the GstVulkanDevice from the bound render
+// node — and every vendor with a Vulkan encoder qualifies, so it tests neither
+// g.index nor g.vendor. The agent numbers GPUs by DRM card position, so a host
+// whose only usable GPU sits at index 1 must still schedule.
 const schedulableBindingSQL = ` AND (
 	COALESCE(h.effective_settings->>'encoder', '') = ''
 	OR h.effective_settings->>'encoder' = 'openh264'
@@ -102,7 +107,6 @@ const schedulableBindingSQL = ` AND (
 			OR g.render_node = h.effective_settings->>'render_node'
 			OR g.device_path = h.effective_settings->>'render_node'))
 	OR (h.effective_settings->>'encoder' = 'vulkan'
-		AND g.index = 0
 		AND (COALESCE(h.effective_settings->>'render_node', '') = ''
 			OR g.render_node = h.effective_settings->>'render_node'
 			OR g.device_path = h.effective_settings->>'render_node'))

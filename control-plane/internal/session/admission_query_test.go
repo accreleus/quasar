@@ -72,6 +72,11 @@ func admissionMatrix() map[string][]string {
 // and both placement policies. Every one of them must still be producible by the
 // new renderers, with identical placeholder numbering.
 //
+// One mechanical edit since the capture: #268 deleted ` AND g.index = 0` from
+// the Vulkan arm of schedulableBindingSQL, and that exact fragment — nothing
+// else — was removed from all 15 statements here. The file is therefore a
+// byte-pure pre-refactor capture except for that one condition.
+//
 // If this fails, the extraction changed what the scheduler asks Postgres. That
 // is the failure mode the whole exercise exists to prevent: the divergence class
 // here is silent in production (50 burned retries and a spurious capacity error

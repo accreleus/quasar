@@ -109,6 +109,11 @@ own; the two do not move together, and that is deliberate.
   configuration. There are no probe callers yet (#259).
 
 ### Fixed
+- **A host whose only GPU is not at index 0 can launch on the Vulkan encoder (#268).** Admission
+  accepted only GPU index 0 on the Vulkan path, while the agent numbers GPUs by DRM card
+  position, so such a host refused every launch with `no_host_available` on the default
+  encoder. The scheduler now follows the render node for Vulkan as it does for VA and NVENC,
+  which is what the agent's own GPU binding always did.
 - **A failed readiness refresh no longer wipes the host's readiness checks (#255).** The
   node agent's 15-second refresh used to replace the whole report, and a refresh that failed
   replaced it with a single warning, so every failing check vanished from the card until the

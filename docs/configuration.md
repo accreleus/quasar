@@ -348,6 +348,12 @@ Read in `node-agent/src/session/mod.rs` (`SessionConfig::from_env`). Apply to ev
 session the agent runs. Integer knobs use a parser that **ignores junk/≤0 and falls
 back to the default** (except `QUASAR_CUDA_DEVICE`, which allows `0`).
 
+**Multi-GPU and the Vulkan path (#268).** For Vulkan the scheduler follows
+`QUASAR_RENDER_NODE` / the host's reported render node exactly as it does for VA and
+NVENC — there is no GPU-ordinal condition, so a host whose only usable GPU sits at a
+non-zero index schedules normally. A host with **two** usable GPUs on the Vulkan path
+has not been validated live; only the single-GPU-at-a-non-zero-index case has.
+
 | Variable | Default | Values / notes |
 |---|---|---|
 | `QUASAR_ENCODER` | unset → **auto-detect** | Unset or empty → the agent detects the GPU vendor (configured render node's sysfs vendor, then `/dev/nvidia*` device nodes, then a `/dev/dri/renderD*` scan) and defaults **nvidia → `vulkan`, amd → `vulkan`, intel → `va`, no GPU → `openh264`** (logged at startup as `token=encoder-autodetect`). Explicit values select the encoder family (codec compatibility exclusions still apply): `va`/`vaapi` → AMD/Intel VA-API HW; `nvenc`/`nvidia` → NVENC HW; `vulkan` → `vulkanh264enc` (zero-copy NV12 `memory:VulkanImage` from `waylanddisplaysrc vulkan=true`); `openh264` → software. Any other non-empty value falls back to `openh264` with a `token=encoder-env-unrecognized` warn. Compose passes the var through unset by default (`docker-compose.yml`; the NVIDIA overlay sets nothing — see [NVIDIA hosts default to Vulkan](#nvidia-hosts-default-to-vulkan)). An explicit `QUASAR_ENCODER=nvenc` in `deploy/.env` (or an admin host override) selects NVENC for eligible codecs; it does not bypass the known RTX 5090 / 595.99.02 AV1 exclusion below. |
