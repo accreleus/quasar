@@ -1,0 +1,324 @@
+{
+  "name": "readiness-faults",
+  "timestamp": "2026-09-19T11:39:27Z",
+  "counts": {
+    "pass": 19,
+    "fail": 54,
+    "skip": 1
+  },
+  "checks": [
+    {
+      "result": "pass",
+      "message": "preflight: engine clear (foreign_quasar_projects=0, port 18080 free, /var/lib/rh02h-f3ef5689 free)"
+    },
+    {
+      "result": "pass",
+      "message": "image-clean: agent image carries no readiness-fixture path"
+    },
+    {
+      "result": "pass",
+      "message": "image-clean: agent binary has no harness_synthetic_ string"
+    },
+    {
+      "result": "pass",
+      "message": "fixture: readiness-fixture image built"
+    },
+    {
+      "result": "pass",
+      "message": "fixture: relay running, rule off (transparent)"
+    },
+    {
+      "result": "pass",
+      "message": "stack: control plane answering /health"
+    },
+    {
+      "result": "pass",
+      "message": "login: admin token obtained"
+    },
+    {
+      "result": "pass",
+      "message": "nonadmin: user provisioned"
+    },
+    {
+      "result": "pass",
+      "message": "seed: app 'rh02h-f3ef5689: app-nohome' ready (9a76fc2e-015f-4ed8-be97-ea53d66af1b8)"
+    },
+    {
+      "result": "pass",
+      "message": "seed: app 'rh02h-f3ef5689: app-home' ready (2cc50239-c2df-45b6-9a7e-218b24951306)"
+    },
+    {
+      "result": "fail",
+      "message": "baseline: host never reached online+active-gate+empty-blocking within bound (pre-#264 image, or a real fault)"
+    },
+    {
+      "result": "fail",
+      "message": "1a: runtime_endpoint never reported fail within 120s of the engine stopping (status='')"
+    },
+    {
+      "result": "fail",
+      "message": "1b: runtime_endpoint never reported fail within 120s of the engine stopping (status='')"
+    },
+    {
+      "result": "fail",
+      "message": "1c: runtime_endpoint never reported fail within 120s of the engine stopping (status='')"
+    },
+    {
+      "result": "fail",
+      "message": "1d: runtime_endpoint never reported fail within 120s of the engine stopping (status='')"
+    },
+    {
+      "result": "fail",
+      "message": "1e: runtime_endpoint never reported fail within 120s of the engine stopping (status='')"
+    },
+    {
+      "result": "pass",
+      "message": "1: nested host row deleted 204"
+    },
+    {
+      "result": "fail",
+      "message": "2a: homes_root_writable never reported fail within 90s"
+    },
+    {
+      "result": "fail",
+      "message": "2a: app-home launch got HTTP 503 code=no_host_available (want 503 host_not_ready)"
+    },
+    {
+      "result": "fail",
+      "message": "2a: app-nohome launch got HTTP 503 (want 201) code=no_host_available real_host_blocking=[] real_host={\"status\":\"online\",\"gate\":null,\"capacity_detection\":\"ok\"} gpus=[{\"gpu_index\":1,\"slots_total\":2,\"slots_reserved\":0,\"vram_mb_total\":2048}]"
+    },
+    {
+      "result": "fail",
+      "message": "2a: homes_root_writable did not recover to pass"
+    },
+    {
+      "result": "fail",
+      "message": "2a: app-home launch after recovery got HTTP 503 (want 201) code=no_host_available real_host_blocking=[] real_host={\"status\":\"online\",\"gate\":null,\"capacity_detection\":\"ok\"} gpus=[{\"gpu_index\":1,\"slots_total\":2,\"slots_reserved\":0,\"vram_mb_total\":2048}]"
+    },
+    {
+      "result": "fail",
+      "message": "2b: homes_free_space never reported fail within 90s"
+    },
+    {
+      "result": "fail",
+      "message": "2b: app-home launch got HTTP 503 code=no_host_available (want 503 host_not_ready)"
+    },
+    {
+      "result": "fail",
+      "message": "2b: app-nohome launch got HTTP 503 (want 201) code=no_host_available real_host_blocking=[] real_host={\"status\":\"online\",\"gate\":null,\"capacity_detection\":\"ok\"} gpus=[{\"gpu_index\":1,\"slots_total\":2,\"slots_reserved\":0,\"vram_mb_total\":2048}]"
+    },
+    {
+      "result": "fail",
+      "message": "2b: homes_free_space is '' after removing the fill file (want warn or pass)"
+    },
+    {
+      "result": "fail",
+      "message": "2b: app-home launch after recovery got HTTP 503 (want 201) code=no_host_available real_host_blocking=[] real_host={\"status\":\"online\",\"gate\":null,\"capacity_detection\":\"ok\"} gpus=[{\"gpu_index\":1,\"slots_total\":2,\"slots_reserved\":0,\"vram_mb_total\":2048}]"
+    },
+    {
+      "result": "fail",
+      "message": "3: input_probe never reported fail within 90s"
+    },
+    {
+      "result": "fail",
+      "message": "3: launch expected 503 host_not_ready, got 503 code=no_host_available"
+    },
+    {
+      "result": "fail",
+      "message": "3: input_probe did not recover to pass"
+    },
+    {
+      "result": "fail",
+      "message": "3: recovery launch got HTTP 503 (want 201) code=no_host_available real_host_blocking=[] real_host={\"status\":\"online\",\"gate\":null,\"capacity_detection\":\"ok\"} gpus=[{\"gpu_index\":1,\"slots_total\":2,\"slots_reserved\":0,\"vram_mb_total\":2048}]"
+    },
+    {
+      "result": "fail",
+      "message": "4a: media_probe_gpu1 is not reported at all under the fault"
+    },
+    {
+      "result": "fail",
+      "message": "4a: application_gpu_probe_gpu1 is not reported at all under the fault"
+    },
+    {
+      "result": "fail",
+      "message": "4a: media_probe_gpu1 status='' (want fail)"
+    },
+    {
+      "result": "fail",
+      "message": "4a: launch expected 503 host_not_ready, got 503 code=no_host_available"
+    },
+    {
+      "result": "fail",
+      "message": "4c (4a): scripted host never reached online+active-gate"
+    },
+    {
+      "result": "pass",
+      "message": "4c (4a): scripted host row deleted 204"
+    },
+    {
+      "result": "fail",
+      "message": "4a: probes did not recover to pass"
+    },
+    {
+      "result": "fail",
+      "message": "4a: recovery launch got HTTP 503 (want 201) code=no_host_available real_host_blocking=[] real_host={\"status\":\"online\",\"gate\":null,\"capacity_detection\":\"ok\"} gpus=[{\"gpu_index\":1,\"slots_total\":2,\"slots_reserved\":0,\"vram_mb_total\":2048}]"
+    },
+    {
+      "result": "fail",
+      "message": "4a': media_probe_gpu1 not pass with only Vulkan ICD gone"
+    },
+    {
+      "result": "fail",
+      "message": "4a': blocking has absent entries (want 0)"
+    },
+    {
+      "result": "fail",
+      "message": "4a': launch got HTTP 503 (want 201) code=no_host_available real_host_blocking=[] real_host={\"status\":\"online\",\"gate\":null,\"capacity_detection\":\"ok\"} gpus=[{\"gpu_index\":1,\"slots_total\":2,\"slots_reserved\":0,\"vram_mb_total\":2048}]"
+    },
+    {
+      "result": "skip",
+      "message": "UNPERFORMED 4b: host GPU vendor is 'amd', not nvidia"
+    },
+    {
+      "result": "pass",
+      "message": "5a: dri_node_app_access fail carries no blocks"
+    },
+    {
+      "result": "fail",
+      "message": "5a: dri_node_app_access in readiness_gate.blocking: absent (want 0)"
+    },
+    {
+      "result": "fail",
+      "message": "5a: launch got HTTP 503 (want 201, dri_node_app_access must never block) code=no_host_available real_host_blocking=[] real_host={\"status\":\"online\",\"gate\":null,\"capacity_detection\":\"ok\"} gpus=[{\"gpu_index\":1,\"slots_total\":2,\"slots_reserved\":0,\"vram_mb_total\":2048}]"
+    },
+    {
+      "result": "fail",
+      "message": "5b: audio_probe is not pass before the fault (status=''), so an unknown would prove nothing"
+    },
+    {
+      "result": "fail",
+      "message": "6a: scripted host A is 'online' but its readiness gate never became active (state '')"
+    },
+    {
+      "result": "pass",
+      "message": "6b: launch refused 503 no_host_available with nothing online"
+    },
+    {
+      "result": "fail",
+      "message": "6c/6d: scripted host B is 'online' with gate '' and never listed its failing check in blocking"
+    },
+    {
+      "result": "fail",
+      "message": "7a: expected 503 host_not_ready before override, got 503"
+    },
+    {
+      "result": "fail",
+      "message": "7a: override PUT got 404 (want 200)"
+    },
+    {
+      "result": "fail",
+      "message": "7a: repeat PUT status 404, audit 0 -> 0"
+    },
+    {
+      "result": "fail",
+      "message": "7a: audit severity '' (want warn)"
+    },
+    {
+      "result": "fail",
+      "message": "7a: audit detail node_name='' (want rh02h-f3ef5689-real)"
+    },
+    {
+      "result": "fail",
+      "message": "7b: blocking=0 overridden= readiness=fail"
+    },
+    {
+      "result": "fail",
+      "message": "7c: launch got HTTP 503 (want 201, override in effect) code=no_host_available real_host_blocking=[] real_host={\"status\":\"online\",\"gate\":null,\"capacity_detection\":\"ok\"} gpus=[{\"gpu_index\":1,\"slots_total\":2,\"slots_reserved\":0,\"vram_mb_total\":2048}]"
+    },
+    {
+      "result": "fail",
+      "message": "7d: no override was set by 7a, so a lapse cannot be shown"
+    },
+    {
+      "result": "fail",
+      "message": "7e: override PUT got 404 (want 200)"
+    },
+    {
+      "result": "fail",
+      "message": "7e: DELETE got 404 (want 204)"
+    },
+    {
+      "result": "fail",
+      "message": "7e: repeat DELETE got 404 (want 204)"
+    },
+    {
+      "result": "fail",
+      "message": "7e: 0 .cleared audit row(s) for harness_synthetic_gate (want exactly 1)"
+    },
+    {
+      "result": "fail",
+      "message": "7e: launch after clearing got 503 (want 503 host_not_ready) code=no_host_available real_host_blocking=[] real_host={\"status\":\"online\",\"gate\":null,\"capacity_detection\":\"ok\"} gpus=[{\"gpu_index\":1,\"slots_total\":2,\"slots_reserved\":0,\"vram_mb_total\":2048}]"
+    },
+    {
+      "result": "fail",
+      "message": "7f: override PUT got 404 (want 200)"
+    },
+    {
+      "result": "fail",
+      "message": "7f: the renamed check is reported as fail with blocks but readiness_gate.blocking does not list it"
+    },
+    {
+      "result": "fail",
+      "message": "7f: blocking not empty after clearing"
+    },
+    {
+      "result": "fail",
+      "message": "7g: got 404 (want 403)"
+    },
+    {
+      "result": "fail",
+      "message": "7h: bad check_id got 404 (want 400 validation_failed)"
+    },
+    {
+      "result": "fail",
+      "message": "7h: 129-byte check_id got 404 (want 400 validation_failed)"
+    },
+    {
+      "result": "pass",
+      "message": "8: no readiness check id/summary/remediation implies browser-reachability without an allow-listed negation"
+    },
+    {
+      "result": "pass",
+      "message": "9: host row rh02h-f3ef5689-real deleted 204"
+    },
+    {
+      "result": "pass",
+      "message": "9: ownership cleanup \u2014 zero labelled containers/volumes/networks, /var/lib/rh02h-f3ef5689 gone"
+    },
+    {
+      "result": "pass",
+      "message": "9: no volume exists that was not there at preflight (labelled or anonymous)"
+    },
+    {
+      "result": "pass",
+      "message": "9: zero quasar-sess-*/quasar-pulse-*/quasar-probe-* containers remain"
+    }
+  ],
+  "notes": {
+    "rid": "rh02h-f3ef5689",
+    "role": "gpu-test-amd-baseline-b134085",
+    "control_image": "<registry>/quasar-control-plane:dev-b134085",
+    "agent_image": "<registry>/quasar-node-agent:dev-b134085",
+    "control_port": "18080",
+    "pre_detected_vendor": "non-nvidia",
+    "preflight_foreign_quasar_projects": "0",
+    "device_override": "true (no /dev/kmsg on this host)",
+    "control_image_commit": "b134085201a70fe5cc149dbfdf812832dbc2d28d",
+    "agent_image_commit": "b134085201a70fe5cc149dbfdf812832dbc2d28d",
+    "schema_migrations_version": "84",
+    "baseline_ok": "0",
+    "gpu_vendor": "amd",
+    "gpu_index": "1",
+    "verdict": "fail"
+  }
+}
