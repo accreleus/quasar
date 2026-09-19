@@ -18,6 +18,9 @@ pub mod cp_tls;
 /// GStreamer elements on an NVIDIA host (#545).
 pub mod cuda_runtime;
 pub mod ddc;
+/// Diagnostic registration (#256): what a host withholds while its startup cleanup is
+/// unresolved, and when it resumes. See `CONTEXT.md` "Diagnostic registration".
+pub mod diagnostic;
 mod encoder_compatibility;
 pub mod enrollment;
 /// `host.xid` / `host.gpu_fault`: the kernel's own GPU fault records, off `/dev/kmsg`.

@@ -275,6 +275,21 @@ pub trait ImageLifecycleObserver: Send + Sync {
     fn image_removed(&self, image_id: &str);
 }
 
+/// The `register.images` list read straight off the persisted state file: no engine call,
+/// no write, no [`ImageManager`]. The twin of [`ImageManager::register_images`]; a change
+/// to one belongs in the other. For a register this process must send before it may touch
+/// the container runtime (diagnostic mode).
+pub fn register_images_from_state(state_path: &str) -> Vec<RegisterImageEntry> {
+    state::load(state_path)
+        .iter()
+        .map(|(image_id, rec)| RegisterImageEntry {
+            image_id: image_id.clone(),
+            version: rec.wire_version().to_string(),
+            state: rec.state.as_wire_str().to_string(),
+        })
+        .collect()
+}
+
 /// Owns the managed-image record map, the per-image op serialization, and the pull
 /// concurrency cap.
 ///

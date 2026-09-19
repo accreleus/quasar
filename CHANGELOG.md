@@ -57,6 +57,17 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **Diagnostic registration replaces exit on startup failure (#256).** When the agent's
+  startup cleanup cannot retire applications from the previous agent, or the container
+  runtime is missing, unreachable, refused, or misconfigured, the agent no longer exits.
+  It enters diagnostic mode: it registers with the control plane, publishes the fault in
+  the `startup_cleanup` and `runtime_endpoint` readiness checks, refuses every launch with
+  a readable reason, and retries the cleanup on a doubling backoff (5 s to 60 s). When
+  the cleanup succeeds the agent resumes normal startup
+  in the same process and reconnects normally. The health endpoint (`/health`) returns
+  `503 {"status":"diagnostic","ready":false}` while in this mode. Withheld in diagnostic
+  mode: managed-home garbage collection, NVIDIA driver and CUDA provisioners, image pulls
+  and pruning, and host probes.
 - **The startup sweep of pre-API containers runs through the runtime API (#239).** A
   *legacy container* — a sibling from an older agent, identified only by this agent's
   owner label plus an allowed name prefix — is re-inspected by its immutable ID before

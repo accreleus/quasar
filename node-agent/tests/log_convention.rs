@@ -23,6 +23,8 @@ const SHARED_TOKENS: &[&str] = &[
     "audio-fallback-silent",
     "audio-unavailable-silent",
     "console-weston-exit-timeout",
+    // A rate-limited upgrade, from the normal and the diagnostic reconnect loops.
+    "cp-connect-rate-limited",
     "datachannel-create-returned-nothing",
     "image-op-error",
     "knob-invalid-nvenc-max-sessions",

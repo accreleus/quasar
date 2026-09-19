@@ -44,7 +44,8 @@ can run with the schema-84 control plane.
    and actual encoder. Verify the actual image
    ID and reported source, unchanged host identity, and preserved mounts. Startup
    retires owned work from the previous agent; it does not adopt sessions. Unresolved
-   retirement must block admission rather than permit another writer to a home.
+   retirement must block admission rather than permit another writer to a home. If
+   it is unresolved the agent enters diagnostic mode (below) rather than exiting.
 5. Call `POST /v1/hosts/{id}/uncordon` and verify the connected host is online.
    Launch a disposable application, verify rendered content, audio and application
    input, then stop it and verify cleanup. Check a marker in its managed home before
@@ -85,6 +86,26 @@ agent after changing the socket has an additional prerequisite documented in
 [configuration](configuration.md#runtime-endpoint-migration-and-recovery). Prefer the
 recorded #239-or-newer known-good image; never discard a nonterminal journal to
 make an older agent start.
+
+## Diagnostic mode
+
+If the agent's startup cleanup fails (unable to retire applications from the previous
+agent) or the container runtime is unreachable, misconfigured, or missing, the agent
+enters diagnostic mode instead of exiting. The host appears online in the console and
+shows the fault on the readiness card: the retained `startup_cleanup` check fails with
+the fix, beside whichever Container runtime check observed the fault. Launches are refused with reason
+`host in diagnostic mode (startup_cleanup_unresolved)` or `(runtime_unusable)`. The
+health endpoint returns `503 {"status":"diagnostic","ready":false,"reason":"..."}`,
+causing `docker compose ps` to report the container unhealthy. Withheld during
+diagnostic mode: managed-home garbage collection, NVIDIA driver provisioner, CUDA
+runtime provisioner, image pulls and pruning, and host probes. To recover: restore the
+container runtime to the configured endpoint (preserve journals, homes and driver
+volumes, and do not change the endpoint or delete a journal to get past it). A restart
+is not needed: the agent retries the cleanup on its own, from 5 s doubling to 60 s,
+under the identities the obligations were journalled with, whether or not the control
+plane is reachable. When successful, watch the logs for the
+`boot-diagnostic-resumed` token and verify the health endpoint returns `200` and the
+`startup_cleanup` check is gone from the readiness card.
 
 ## Uncertainty and failure handling
 
