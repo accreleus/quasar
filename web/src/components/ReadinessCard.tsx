@@ -180,30 +180,6 @@ export function ReadinessCard({
                 </Chip>
               </span>
             )}
-            {canSetOverride && (
-              <Button
-                variant="danger"
-                size="sm"
-                data-testid={`readiness-override-set-${c.id}`}
-                disabled={overridePending === c.id}
-                onClick={() => onSetOverride?.(c.id)}
-                title="Let sessions launch on this host although this check is failing. The check stays visible, and the override ends when the check next passes."
-              >
-                Launch anyway
-              </Button>
-            )}
-            {overridden && onClearOverride && (
-              <Button
-                variant="ghost"
-                size="sm"
-                data-testid={`readiness-override-clear-${c.id}`}
-                disabled={overridePending === c.id}
-                onClick={() => onClearOverride(c.id)}
-                title="Withdraw the override; this check goes back to blocking launches as normal."
-              >
-                Withdraw override
-              </Button>
-            )}
           </div>
           <p>{c.summary}</p>
           {provenance && (
@@ -218,6 +194,35 @@ export function ReadinessCard({
               check (here's exactly what to run) is invisible. */}
           {(c.status === "fail" || c.status === "warn") && c.remediation && (
             <CopyableCommand text={c.remediation} />
+          )}
+          {/* Below the text, not in the heading row: a narrow grid tile has no room for a button beside the title. */}
+          {(canSetOverride || (overridden && onClearOverride)) && (
+            <div className="row gap2">
+              {canSetOverride && (
+                <Button
+                  variant="danger"
+                  size="sm"
+                  data-testid={`readiness-override-set-${c.id}`}
+                  disabled={overridePending === c.id}
+                  onClick={() => onSetOverride?.(c.id)}
+                  title="Let sessions launch on this host although this check is failing. The check stays visible, and the override ends when the check next passes."
+                >
+                  Launch anyway
+                </Button>
+              )}
+              {overridden && onClearOverride && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  data-testid={`readiness-override-clear-${c.id}`}
+                  disabled={overridePending === c.id}
+                  onClick={() => onClearOverride(c.id)}
+                  title="Withdraw the override; this check goes back to blocking launches as normal."
+                >
+                  Withdraw override
+                </Button>
+              )}
+            </div>
           )}
         </div>
       </div>
