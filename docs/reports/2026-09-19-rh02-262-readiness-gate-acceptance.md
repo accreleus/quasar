@@ -109,13 +109,35 @@ and the media probe passed, as it should.
 | Two hosts: a second agent enrolled on the same stack, healthy, the first still faulted | The launch is placed on the second host and runs. |
 | The ready host then refuses a second launch (its GPU is VRAM-vetoed) while the other host is still blocked | `503 capacity_exhausted` with `Retry-After: 5`, not `host_not_ready`. The veto diagnostic names only the ready host's GPU. This is the ruled case, live. |
 
+## Live evidence: NVIDIA test host, 2026-09-19
+
+Run after the first version of this record, at `901058f` (the control-plane image rebuilt
+from it, contract 23 passed, 0 failed; the agent image still #261's). The host had no NVIDIA
+container toolkit, so the NVIDIA compose overlay's `gpus: all` could not start an agent. With
+the owner's go-ahead the toolkit was installed from NVIDIA's repository, the engine's runtime
+configured with `nvidia-ctk` and the engine restarted; the previous engine configuration is
+kept beside it. No kernel module or driver was touched. Preflight before each mutation: zero
+containers, zero compose projects. The stack was disposable and removed afterwards; the
+toolkit stays. dnf reported skipping per-package signature checks: NVIDIA's repository file
+verifies the signed repository metadata instead of each package.
+
+| Step | Observed |
+|---|---|
+| First boot, no fault injected | Before the agent had provisioned its NVIDIA userspace, `media_probe_gpu0` and `application_gpu_probe_gpu0` failed definitively and the gate blocked GPU 0. About 20 s later the driver volume was provisioned, the agent restarted itself as designed, both probes passed and the block cleared. A launch in that window is refused cleanly instead of dying on the host. |
+| Healthy | Launch `201`, `running` on GPU 0 with `vulkanh264enc` on the RTX 5090. |
+| Fault: an empty driver volume with provisioning off | Two proxies fail with no `blocks` (`nvidia_egl_vendor_json`, `nvidia_lib32_gl`) and are absent from the gate. Both evidence checks fail and both name GPU 0. `gpus.readiness_blocked = t` for index 0. |
+| Launch | `503 host_not_ready`, no `Retry-After`. The host's second GPU row is unblocked but is not the bound render node, so it is not a candidate and readiness is still the sole reason. |
+| One of the two checks overridden | GPU 0 stays blocked and the launch is still `503`: a scope stays blocked until every unoverridden failing check naming it is gone. |
+| Both overridden | `readiness_blocked = f`; `blocking` still lists both, `overridden: true`; launch `201`, placed on GPU 0, then failed on the host, as the evidence said it would. |
+| Fault cleared | Both probes pass and both overrides lapse by themselves: two `host.readiness_override.lapsed` rows, actor null, `info`, after the two `set` rows (`warn`). Launch `201`, `running`. |
+
+The card was not screenshotted here; it is the same vendor-neutral component captured on the
+AMD host. One thing seen and not this work's: the NVIDIA host reports a second GPU row for
+the machine's other card, whose device node it does not have, because `/sys/class/drm` is not
+namespaced. Its binding never matches, so it takes no launches.
+
 ## Not verified
 
-- **NVIDIA test host: not run.** It is reachable, idle and has the GPU, but it has no NVIDIA
-  container toolkit, so the NVIDIA compose overlay (`gpus: all`) cannot start an agent there
-  and an application container could not be given the GPU. Installing packages and changing
-  the engine's configuration on a lab host was not done without the owner's say. The gate is
-  vendor-neutral control-plane code; what NVIDIA would add is the same walk on a second vendor.
 - The launch toast on a live stack: the headless Chromium used for screenshots has no H.264
   decoder, so the client disables Play before any launch is sent (captured). The wording is
   unit-tested and the API response was captured live.
