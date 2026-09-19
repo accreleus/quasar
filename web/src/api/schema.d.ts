@@ -7069,7 +7069,7 @@ export interface components {
         /** @enum {string} */
         SessionState: "pending" | "assigned" | "starting" | "running" | "stopping" | "stopped" | "failed";
         Error: {
-            /** @description e.g. validation_failed, unauthorized, forbidden, not_found, conflict, session_quota_exceeded, home_in_use, home_not_provisioned, parent_app_disabled, profile_ineligible, profile_not_launchable_for_app, no_host_available, capacity_exhausted, restart_required, rate_limited, internal. Open string, not an enum: new codes are additive and an unknown one falls through to a client's generic per-status branch. */
+            /** @description e.g. validation_failed, unauthorized, forbidden, not_found, conflict, session_quota_exceeded, home_in_use, home_not_provisioned, parent_app_disabled, profile_ineligible, profile_not_launchable_for_app, no_host_available, capacity_exhausted, host_not_ready, restart_required, rate_limited, internal. Open string, not an enum: new codes are additive and an unknown one falls through to a client's generic per-status branch. */
             code: string;
             message: string;
             /** @description Present on restart_required. */
@@ -7697,9 +7697,12 @@ export interface components {
             readiness: components["schemas"]["ReadinessCheck"][] | null;
             /**
              * Format: date-time
-             * @description When the stored readiness value last changed; null until reported.
+             * @description When the agent last reported readiness (stamped on every real report); null until reported. The readiness gate abstains when this is older than the staleness window.
              */
             readiness_reported_at: string | null;
+            readiness_gate: components["schemas"]["ReadinessGate"];
+            /** @description Amendment 11 (#260). Every readiness override stored for this host. ALWAYS SERIALIZED; [] when none. */
+            readiness_overrides: components["schemas"]["ReadinessOverride"][];
             /** @description The git commit the running agent binary was built from: 7-40 lowercase hex, stored exactly as sent. */
             source_commit: string | null;
             /**
@@ -7736,12 +7739,54 @@ export interface components {
         ReadinessCheck: {
             /** @description Stable machine key, e.g. "nvidia_egl_vendor_json". */
             id: string;
-            /** @description Known values: "pass", "fail", "skip" — "skip" means "not applicable to this host" (an NVIDIA check on an AMD box), never "we could not tell". DELIBERATELY NOT AN ENUM: the check set (and its status vocabulary) is agent-owned and forward-compatible, so a closed schema type would force every generated client to reject a value the contract requires it to pass through. Consumers MUST render/store an unrecognized value rather than reject it. */
+            /**
+             * Format: date-time
+             * @description Amendment 11, optional. When the observation behind this check was made; for a retained host-probe result this is earlier than the report. Absent on an older agent.
+             */
+            observed_at?: string;
+            /** @description Amendment 11, optional, OPEN STRING. Known values: host_probe, local, runtime, operator. */
+            source?: string;
+            blocks?: components["schemas"]["ReadinessBlocks"];
+            /** @description Known values: "pass", "fail", "warn", "skip", "provisioning", "unknown" — "skip" means "not applicable to this host" (an NVIDIA check on an AMD box), never "we could not tell"; that is "unknown" (amendment 11: an indeterminate host probe), which never blocks. Only "fail" on a check carrying `blocks` blocks. DELIBERATELY NOT AN ENUM: the check set (and its status vocabulary) is agent-owned and forward-compatible, so a closed schema type would force every generated client to reject a value the contract requires it to pass through. Consumers MUST render/store an unrecognized value rather than reject it. */
             status: string;
             /** @description One sentence an operator can act on, in plain language. */
             summary: string;
-            /** @description Exact commands to fix it, distro-aware where cheaply knowable. Empty for pass/skip. */
+            /** @description Exact commands to fix it, distro-aware where cheaply knowable. Empty unless the check asks the operator for something (so: empty for pass and skip, and usually for unknown and provisioning). */
             remediation: string;
+        };
+        /** @description Amendment 11 (#260). Present only on a readiness check that rests on evidence (a host probe or a definitive local observation); declares what the check blocks when, and only when, its status is "fail". A proxy check never carries it. */
+        ReadinessBlocks: {
+            /** @description OPEN STRING. Known: host (every launch on the host), homes (launches that mount a managed home), gpu (launches placed on gpu_index). An unrecognized scope never blocks. */
+            scope: string;
+            /** @description Only when scope is gpu: the capacity.gpus[].index it names. */
+            gpu_index?: number;
+            /** @description OPEN STRING. control_plane, or agent (the agent's own safety state: it refuses those launches itself and no override lifts them). */
+            enforced_by: string;
+        };
+        /** @description Amendment 11 (#260). The control plane's current readiness verdict for this host. ALWAYS SERIALIZED. */
+        ReadinessGate: {
+            /** @description OPEN STRING. active, or abstaining (never reported, or the report is stale — nothing is excluded). */
+            state: string;
+            /** @description One entry per check carrying `blocks` with status fail, INCLUDING overridden ones, so a failing check is never hidden. Populated whatever `state` is; while abstaining nothing is excluded from admission. */
+            blocking: {
+                check_id: string;
+                scope: string;
+                gpu_index: number | null;
+                enforced_by: string;
+                /** @description true = an admin override excludes this check from the verdict. */
+                overridden: boolean;
+            }[];
+        };
+        /** @description Amendment 11 (#260). An admin's decision to launch on a host despite one named failing readiness check. */
+        ReadinessOverride: {
+            check_id: string;
+            /** Format: uuid */
+            created_by: string | null;
+            created_by_username: string | null;
+            /** Format: date-time */
+            created_at: string;
+            /** @description true = the host's current report has no check with this id; the override excludes nothing. */
+            inert: boolean;
         };
         StorageVolume: {
             label: string;
@@ -10124,7 +10169,7 @@ export interface components {
                 "application/json": components["schemas"]["ClientTooOldError"];
             };
         };
-        /** @description no_host_available / capacity_exhausted — well-formed but no room to place now (retryable). */
+        /** @description no_host_available / capacity_exhausted / host_not_ready (amendment 11: a failing evidence-based readiness check is the only reason no host qualified) — well-formed but cannot be placed now (retryable). */
         Unavailable: {
             headers: {
                 [name: string]: unknown;
