@@ -22,7 +22,7 @@ fn refreshed_report(name: &str) -> (FakeRoot, ReadinessReport) {
         .file("proc/sys/user/max_user_namespaces", "15000\n")
         .file("etc/os-release", "ID=fedora\n");
     let mut report = ReadinessReport::default();
-    report.refreshed(probe(&root.env(false, "")));
+    report.refreshed(probe(&root.env(false, "")), at(0));
     (root, report)
 }
 
@@ -54,7 +54,7 @@ fn a_passing_probe_is_a_passing_check_that_survives_the_refresh() {
         ),
         at(100),
     );
-    report.refreshed(probe(&root.env(false, "")));
+    report.refreshed(probe(&root.env(false, "")), at(200));
 
     let merged = report.merged();
     let check = find(&merged, "media_probe_gpu0").expect("media check");
@@ -120,10 +120,10 @@ fn a_deadline_is_indeterminate_with_its_reason_not_a_failure_and_not_a_skip() {
     assert!(check.summary.contains("30"), "{}", check.summary);
 }
 
-/// No `unknown` on the wire before the #260 amendment is signed.
+/// #261 (amendment 11): an indeterminate host probe reports `unknown`, not `warn`.
 #[test]
-fn indeterminate_is_reported_as_warn_until_the_contract_amendment() {
-    assert_eq!(indeterminate_status(), WARN);
+fn indeterminate_is_reported_as_unknown_since_the_contract_amendment() {
+    assert_eq!(indeterminate_status(), UNKNOWN);
 }
 
 #[test]
@@ -304,7 +304,7 @@ fn a_vanished_gpu_takes_its_check_with_it() {
     );
 
     forget(&mut report, gpu1);
-    report.refreshed(probe(&root.env(false, "")));
+    report.refreshed(probe(&root.env(false, "")), at(200));
 
     let merged = report.merged();
     assert!(find(&merged, "media_probe_gpu1").is_none());

@@ -45,6 +45,9 @@ const AGENT_CHECK_IDS = [
   "homes_free_space",
   "template_free_space",
   "image_free_space",
+  // #261: host container mounts and NVIDIA driver mount.
+  "host_container_mounts",
+  "nvidia_driver_mount",
 ];
 
 describe("readiness groups (#102)", () => {
@@ -57,14 +60,14 @@ describe("readiness groups (#102)", () => {
 
   it("keeps NVIDIA-related checks together, driver_volume_version included", () => {
     const nvidia = READINESS_GROUPS.find((g) => g.key === "nvidia");
-    expect(nvidia?.ids).toEqual(["nvidia_egl_vendor_json", "nvidia_eglcore_library", "nvidia_lib32_gl", "driver_volume_version", "nvidia_vulkan_av1_compatibility"]);
+    expect(nvidia?.ids).toEqual(["nvidia_egl_vendor_json", "nvidia_eglcore_library", "nvidia_lib32_gl", "driver_volume_version", "nvidia_vulkan_av1_compatibility", "nvidia_driver_mount"]);
   });
 
   // #254: the runtime is the most basic fault, so it is the first group.
   it("puts the container runtime checks first, endpoint before what it negotiated", () => {
     expect(READINESS_GROUPS[0].key).toBe("runtime");
     expect(READINESS_GROUPS[0].label).toBe("Container runtime");
-    expect(READINESS_GROUPS[0].ids).toEqual(["startup_cleanup", "runtime_endpoint", "runtime_api_version", "runtime_capabilities", "runtime_cdi"]);
+    expect(READINESS_GROUPS[0].ids).toEqual(["startup_cleanup", "runtime_endpoint", "runtime_api_version", "runtime_capabilities", "runtime_cdi", "host_container_mounts"]);
   });
 
   // #256: diagnostic mode's safety check explains the refusal, so it leads the runtime group.
@@ -72,6 +75,19 @@ describe("readiness groups (#102)", () => {
     const { groups } = groupChecks([c("runtime_endpoint", "fail"), c("startup_cleanup", "fail")]);
     expect(groups.map((g) => g.key)).toEqual(["runtime"]);
     expect(groups[0].checks.map((check) => check.id)).toContain("startup_cleanup");
+  });
+
+  // #261: host_container_mounts and nvidia_driver_mount.
+  it("places host_container_mounts in the runtime group", () => {
+    const { groups } = groupChecks([c("host_container_mounts"), c("render_node")]);
+    const runtime = groups.find((g) => g.key === "runtime");
+    expect(runtime?.checks.map((x) => x.id)).toContain("host_container_mounts");
+  });
+
+  it("places nvidia_driver_mount in the nvidia group", () => {
+    const { groups } = groupChecks([c("nvidia_driver_mount"), c("render_node")]);
+    const nvidia = groups.find((g) => g.key === "nvidia");
+    expect(nvidia?.checks.map((x) => x.id)).toContain("nvidia_driver_mount");
   });
 
   // #253: the storage checks sit together, homes first — the two that can block later.
@@ -123,6 +139,22 @@ describe("readiness groups (#102)", () => {
     const { groups, notApplicable } = groupChecks([c("render_node"), c("host_render_node", "mystery"), c("dri_node_app_access", "fail")]);
     expect(notApplicable).toEqual([]);
     expect(groups[0].checks.map((x) => x.id)).toEqual(["dri_node_app_access", "host_render_node", "render_node"]);
+  });
+
+  it("places unknown status after fail and warn but before pass, never in not-applicable", () => {
+    const { groups, notApplicable } = groupChecks([
+      c("render_node", "pass"),
+      c("application_gpu_probe", "unknown"),
+      c("dri_node_app_access", "fail"),
+      c("xid_visibility", "warn"),
+    ]);
+    expect(notApplicable).toEqual([]);
+    expect(groups[0].checks.map((x) => x.id)).toEqual([
+      "dri_node_app_access",
+      "xid_visibility",
+      "application_gpu_probe",
+      "render_node",
+    ]);
   });
 
   // Per-GPU host-probe ids land in their base id's group.

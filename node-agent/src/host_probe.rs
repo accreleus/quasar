@@ -77,6 +77,19 @@ impl ProbeTarget {
             None => self.kind.check_id().to_string(),
         }
     }
+
+    /// What a `fail` on this target's check blocks (protocol/agent-api.md `readiness`).
+    /// A GPU-scoped kind with no index names nothing to block, so it carries none.
+    pub fn blocks(self) -> Option<crate::messages::ReadinessBlocks> {
+        match self.kind {
+            ProbeKind::Media | ProbeKind::ApplicationGpu => self
+                .gpu
+                .map(|index| crate::messages::ReadinessBlocks::gpu(index, "control_plane")),
+            ProbeKind::Input | ProbeKind::Audio => {
+                Some(crate::messages::ReadinessBlocks::host("control_plane"))
+            }
+        }
+    }
 }
 
 #[cfg(test)]

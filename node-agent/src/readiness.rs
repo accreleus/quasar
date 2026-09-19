@@ -34,6 +34,9 @@ pub const PROVISIONING: &str = "provisioning";
 /// A named risk that is never `fail` (#483): detection can prove a default-deny posture is
 /// active, never that it actually drops the agent's ICE UDP.
 pub const WARN: &str = "warn";
+/// Indeterminate: a host probe could not be concluded. Never blocks, never clears a block
+/// (protocol/agent-api.md `readiness`).
+pub const UNKNOWN: &str = "unknown";
 
 /// Where the host's `/etc/os-release` is bind-mounted in the agent container
 /// (reference compose). Absent ⇒ generic remediation wording.
@@ -522,6 +525,9 @@ fn check_xid_visibility(env: &ProbeEnv) -> ReadinessCheck {
                 crate::gpu_kmsg::KMSG_PATH,
                 crate::gpu_kmsg::KMSG_PATH
             ),
+            observed_at: None,
+            source: Some("local".to_string()),
+            blocks: None,
         },
     }
 }
@@ -575,6 +581,16 @@ pub fn log_report(checks: &[ReadinessCheck]) -> usize {
             token = "readiness-check-warn",
             check = %c.id,
             "host readiness WARN: {} — remediation: {}",
+            c.summary,
+            c.remediation
+        );
+    }
+    // An indeterminate host probe is not a failure, but an operator should see it.
+    for c in checks.iter().filter(|c| c.status == UNKNOWN) {
+        tracing::warn!(
+            token = "readiness-check-unknown",
+            check = %c.id,
+            "host readiness UNKNOWN: {} — remediation: {}",
             c.summary,
             c.remediation
         );
@@ -771,12 +787,17 @@ pub fn boot_action(input: BootInputs<'_>) -> BootAction {
 
 // ── individual checks ────────────────────────────────────────────────────────
 
+/// These constructors make proxy checks: source `local`, never `blocks`. A check that
+/// rests on evidence adds its own after construction (runtime_facts, storage, host_probe).
 fn pass(id: &str, summary: String) -> ReadinessCheck {
     ReadinessCheck {
         id: id.to_string(),
         status: PASS.to_string(),
         summary,
         remediation: String::new(),
+        observed_at: None,
+        source: Some("local".to_string()),
+        blocks: None,
     }
 }
 
@@ -786,6 +807,9 @@ fn skip(id: &str, summary: &str) -> ReadinessCheck {
         status: SKIP.to_string(),
         summary: summary.to_string(),
         remediation: String::new(),
+        observed_at: None,
+        source: Some("local".to_string()),
+        blocks: None,
     }
 }
 
@@ -795,6 +819,9 @@ fn fail(id: &str, summary: String, remediation: String) -> ReadinessCheck {
         status: FAIL.to_string(),
         summary,
         remediation,
+        observed_at: None,
+        source: Some("local".to_string()),
+        blocks: None,
     }
 }
 
@@ -806,6 +833,9 @@ fn warn_check(id: &str, summary: String, remediation: String) -> ReadinessCheck 
         status: WARN.to_string(),
         summary,
         remediation,
+        observed_at: None,
+        source: Some("local".to_string()),
+        blocks: None,
     }
 }
 
@@ -817,6 +847,9 @@ fn provisioning(id: &str, summary: String) -> ReadinessCheck {
         // Empty on purpose: a `dnf install` line next to "we are fixing this for you" is how
         // an operator ends up doing both.
         remediation: String::new(),
+        observed_at: None,
+        source: Some("local".to_string()),
+        blocks: None,
     }
 }
 
@@ -3723,6 +3756,9 @@ mod tests {
             status: status.to_string(),
             summary: format!("{id} is {status}"),
             remediation: format!("fix {id}"),
+            observed_at: None,
+            source: None,
+            blocks: None,
         }
     }
 
@@ -4961,6 +4997,7 @@ table ip raw {
     }
 
     mod host_probes;
+    mod provenance;
     mod report;
     mod runtime_checks;
     mod storage_checks;

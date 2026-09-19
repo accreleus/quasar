@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::messages::ReadinessCheck;
+use crate::messages::{ReadinessBlocks, ReadinessCheck};
 
 /// `QUASAR_HOMES_FREE_SPACE_FLOOR_GIB`: below this much free space the homes,
 /// template and image storage checks warn. Homes storage fails only when exhausted.
@@ -367,6 +367,11 @@ fn stage_words(stage: WriteStage) -> &'static str {
 }
 
 pub fn check_homes_root_writable(view: &StorageView, identity: WriteIdentity) -> ReadinessCheck {
+    check_homes_root_writable_inner(view, identity)
+        .with_blocks(ReadinessBlocks::homes("control_plane"))
+}
+
+fn check_homes_root_writable_inner(view: &StorageView, identity: WriteIdentity) -> ReadinessCheck {
     let Some(root) = &view.homes else {
         return super::skip(HOMES_WRITABLE_ID, HOMES_NOT_CONFIGURED);
     };
@@ -442,6 +447,10 @@ pub fn check_homes_root_writable(view: &StorageView, identity: WriteIdentity) ->
 }
 
 pub fn check_homes_free_space(view: &StorageView) -> ReadinessCheck {
+    check_homes_free_space_inner(view).with_blocks(ReadinessBlocks::homes("control_plane"))
+}
+
+fn check_homes_free_space_inner(view: &StorageView) -> ReadinessCheck {
     let Some(root) = &view.homes else {
         return super::skip(HOMES_FREE_SPACE_ID, HOMES_NOT_CONFIGURED);
     };

@@ -34,10 +34,10 @@ pub enum ChildEnd {
     SpawnFailed(String),
 }
 
-/// The wire status of an indeterminate result. `warn` until the #260 contract
-/// amendment adds `unknown`; #261 changes this one function.
+/// The wire status of an indeterminate result (amendment 11, #261): neither a failure
+/// nor a `skip` — a probe that could not be concluded.
 pub fn indeterminate_status() -> &'static str {
-    crate::readiness::WARN
+    crate::readiness::UNKNOWN
 }
 
 /// Signals a process raises against itself by crashing. Anything else (SIGKILL from the
@@ -156,6 +156,8 @@ pub fn record(
     observed_at: SystemTime,
 ) {
     let id = target.check_id();
+    // `blocks` rides on the check whatever the outcome: it says what a fail would block.
+    let blocks = target.blocks();
     match outcome {
         ProbeOutcome::Pass { summary } => report.retain(
             crate::messages::ReadinessCheck {
@@ -163,6 +165,9 @@ pub fn record(
                 status: crate::readiness::PASS.into(),
                 summary,
                 remediation: String::new(),
+                observed_at: None,
+                source: Some("host_probe".into()),
+                blocks,
             },
             observed_at,
         ),
@@ -175,6 +180,9 @@ pub fn record(
                 status: crate::readiness::FAIL.into(),
                 summary,
                 remediation,
+                observed_at: None,
+                source: Some("host_probe".into()),
+                blocks,
             },
             observed_at,
         ),
@@ -184,6 +192,9 @@ pub fn record(
                 status: crate::readiness::SKIP.into(),
                 summary,
                 remediation: String::new(),
+                observed_at: None,
+                source: Some("host_probe".into()),
+                blocks,
             },
             observed_at,
         ),
@@ -205,6 +216,9 @@ pub fn record(
                     remediation: "The agent will run the host probe again on the next input \
                         change, launch failure, or agent restart."
                         .into(),
+                    observed_at: None,
+                    source: Some("host_probe".into()),
+                    blocks,
                 },
                 observed_at,
             );
@@ -212,6 +226,7 @@ pub fn record(
     }
 }
 
+/// Kind-level skip for a host with no GPU: there is no index to scope a block to.
 pub fn record_not_applicable(report: &mut ReadinessReport, kind: ProbeKind, at: SystemTime) {
     report.retain(
         crate::messages::ReadinessCheck {
@@ -219,6 +234,9 @@ pub fn record_not_applicable(report: &mut ReadinessReport, kind: ProbeKind, at: 
             status: crate::readiness::SKIP.into(),
             summary: "This host has no GPU.".into(),
             remediation: String::new(),
+            observed_at: None,
+            source: Some("host_probe".into()),
+            blocks: None,
         },
         at,
     );

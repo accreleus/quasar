@@ -44,6 +44,16 @@ own; the two do not move together, and that is deliberate.
   only.
 - **Storage readiness checks (#253).** The host readiness card gains a Storage group: `homes_root_writable` performs a real write test (a test home created under `QUASAR_HOME_ROOT`, handed to the app identity, written and removed), and `homes_free_space` warns below a floor (`QUASAR_HOMES_FREE_SPACE_FLOOR_GIB`, default 5) and fails only when exhausted; `template_free_space` and `image_free_space` warn only. Advisory in this slice; blocking arrives with the RH-02 admission gate.
 - **Container runtime and CDI readiness checks (#254).** The readiness card gains a Container runtime group: `runtime_endpoint` (reachable, or why not, with the fix), `runtime_api_version` (the negotiated engine API and the engine's range), `runtime_capabilities` (what the engine states about itself) and `runtime_cdi` (whether CDI is enabled and which devices the engine discovered). Observed only: GPU injection is unchanged. The firewall check `media_reachability` keeps its id and is reworded as the host's inbound firewall posture, and the card states that readiness is host-local and never implies a browser can reach the host.
+- **Readiness checks say when and how they were observed, and which ones can block a launch
+  (#261).** The agent now reports, per readiness check, when the observation was made and
+  where it came from (host probe, local check, container runtime), and marks the
+  evidence-based checks — the host probes, the homes storage checks, and the runtime and
+  startup-cleanup safety checks — with what they would block if they failed; an
+  inconclusive host probe is now reported as `unknown` (shown as indeterminate) instead of
+  a warning, and never replaces the last definitive result; the console card shows the
+  observation time, the source, and a "blocks launches" marker; `nvidia_driver_mount` and
+  `host_container_mounts` moved out of the card's "Other" group. Nothing blocks a launch
+  yet (that arrives with #262). An older agent's report renders exactly as before.
 
 ### Removed
 - **The node agent no longer needs a `docker` or `podman` executable (#239).** Every

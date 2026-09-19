@@ -16,6 +16,9 @@ fn check(id: &str, status: &str, summary: &str) -> ReadinessCheck {
         status: status.into(),
         summary: summary.into(),
         remediation: String::new(),
+        observed_at: None,
+        source: None,
+        blocks: None,
     }
 }
 
@@ -36,11 +39,11 @@ fn root_without_uinput(name: &str) -> FakeRoot {
 fn a_retained_check_survives_a_refresh() {
     let root = root_without_uinput("report-survives");
     let mut report = ReadinessReport::default();
-    report.refreshed(probe(&root.env(false, "")));
+    report.refreshed(probe(&root.env(false, "")), at(0));
     report.retain(check("media_probe", FAIL, "GPU 0 cannot encode"), at(100));
 
-    report.refreshed(probe(&root.env(false, "")));
-    report.refreshed(probe(&root.env(false, "")));
+    report.refreshed(probe(&root.env(false, "")), at(0));
+    report.refreshed(probe(&root.env(false, "")), at(0));
 
     let merged = report.merged();
     assert_eq!(get(&merged, "media_probe").status, FAIL);
@@ -54,7 +57,7 @@ fn a_retained_check_survives_a_refresh() {
 fn a_refresh_error_keeps_every_earlier_check_and_adds_the_warning() {
     let root = root_without_uinput("report-error");
     let mut report = ReadinessReport::default();
-    report.refreshed(probe(&root.env(false, "")));
+    report.refreshed(probe(&root.env(false, "")), at(0));
     report.retain(check("startup_cleanup", FAIL, "cleanup pending"), at(100));
     let before = report.merged();
     assert_eq!(get(&before, "uinput").status, FAIL);
@@ -86,7 +89,7 @@ fn a_refresh_error_before_any_refresh_keeps_retained_checks() {
 #[test]
 fn repeated_refresh_errors_add_one_warning() {
     let mut report = ReadinessReport::default();
-    report.refreshed(vec![check("uinput", FAIL, "missing")]);
+    report.refreshed(vec![check("uinput", FAIL, "missing")], at(0));
 
     report.refresh_failed();
     report.refresh_failed();
@@ -97,11 +100,11 @@ fn repeated_refresh_errors_add_one_warning() {
 #[test]
 fn the_refresh_warning_clears_on_the_next_successful_refresh() {
     let mut report = ReadinessReport::default();
-    report.refreshed(vec![check("uinput", FAIL, "missing")]);
+    report.refreshed(vec![check("uinput", FAIL, "missing")], at(0));
     report.retain(check("media_probe", FAIL, "cannot encode"), at(1));
     report.refresh_failed();
 
-    report.refreshed(vec![check("uinput", PASS, "present")]);
+    report.refreshed(vec![check("uinput", PASS, "present")], at(2));
 
     let merged = report.merged();
     assert_eq!(ids(&merged), vec!["uinput", "media_probe"]);
@@ -114,11 +117,11 @@ fn local_checks_are_recomputed_by_every_refresh() {
     let root = root_without_uinput("report-recompute");
     let mut report = ReadinessReport::default();
     report.retain(check("media_probe", PASS, "encodes"), at(1));
-    report.refreshed(probe(&root.env(false, "")));
+    report.refreshed(probe(&root.env(false, "")), at(0));
     assert_eq!(get(&report.merged(), "uinput").status, FAIL);
 
     root.file("dev/uinput", "");
-    report.refreshed(probe(&root.env(false, "")));
+    report.refreshed(probe(&root.env(false, "")), at(0));
 
     assert_eq!(get(&report.merged(), "uinput").status, PASS);
 }
@@ -126,9 +129,9 @@ fn local_checks_are_recomputed_by_every_refresh() {
 #[test]
 fn a_local_check_the_refresh_no_longer_reports_is_gone() {
     let mut report = ReadinessReport::default();
-    report.refreshed(vec![check("a", PASS, ""), check("b", PASS, "")]);
+    report.refreshed(vec![check("a", PASS, ""), check("b", PASS, "")], at(0));
 
-    report.refreshed(vec![check("a", PASS, "")]);
+    report.refreshed(vec![check("a", PASS, "")], at(1));
 
     assert_eq!(ids(&report.merged()), vec!["a"]);
 }
@@ -162,10 +165,10 @@ fn merged_order_is_local_then_retained_then_the_warning() {
     let mut report = ReadinessReport::default();
     report.retain(check("z_probe", PASS, ""), at(1));
     report.retain(check("a_probe", PASS, ""), at(2));
-    report.refreshed(vec![
-        check("render_node", PASS, ""),
-        check("uinput", PASS, ""),
-    ]);
+    report.refreshed(
+        vec![check("render_node", PASS, ""), check("uinput", PASS, "")],
+        at(3),
+    );
     report.refresh_failed();
 
     assert_eq!(
@@ -186,21 +189,24 @@ fn merged_order_is_local_then_retained_then_the_warning() {
 fn a_shared_id_appears_once_and_never_hides_a_failure() {
     let mut report = ReadinessReport::default();
     report.retain(check("shared", FAIL, "retained fail"), at(1));
-    report.refreshed(vec![
-        check("first", PASS, ""),
-        check("shared", PASS, "local pass"),
-    ]);
+    report.refreshed(
+        vec![
+            check("first", PASS, ""),
+            check("shared", PASS, "local pass"),
+        ],
+        at(0),
+    );
     let merged = report.merged();
     assert_eq!(ids(&merged), vec!["first", "shared"]);
     assert_eq!(get(&merged, "shared").summary, "retained fail");
 
     let mut report = ReadinessReport::default();
     report.retain(check("shared", PASS, "retained pass"), at(1));
-    report.refreshed(vec![check("shared", FAIL, "local fail")]);
+    report.refreshed(vec![check("shared", FAIL, "local fail")], at(2));
     assert_eq!(get(&report.merged(), "shared").summary, "local fail");
 
     let mut report = ReadinessReport::default();
     report.retain(check("shared", FAIL, "retained fail"), at(1));
-    report.refreshed(vec![check("shared", FAIL, "local fail")]);
+    report.refreshed(vec![check("shared", FAIL, "local fail")], at(2));
     assert_eq!(get(&report.merged(), "shared").summary, "retained fail");
 }

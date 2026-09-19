@@ -3,7 +3,7 @@
 //! are the `check_*` functions, pure over the view. Nothing here mutates the engine, and
 //! GPU injection (device request + driver volume) is untouched: CDI is reported, not used.
 
-use crate::messages::ReadinessCheck;
+use crate::messages::{ReadinessBlocks, ReadinessCheck};
 use crate::runtime::{EngineFacts, ErrorKind, RuntimeError};
 
 pub const ENDPOINT_ID: &str = "runtime_endpoint";
@@ -95,6 +95,13 @@ impl RuntimeView {
 }
 
 pub fn check_runtime_endpoint(view: &RuntimeView) -> ReadinessCheck {
+    check_runtime_endpoint_inner(view)
+        .with_source("runtime")
+        // Agent-enforced: the agent refuses these launches itself, and no override lifts it.
+        .with_blocks(ReadinessBlocks::host("agent"))
+}
+
+fn check_runtime_endpoint_inner(view: &RuntimeView) -> ReadinessCheck {
     let RuntimeView::Observed { endpoint, outcome } = view else {
         return super::skip(ENDPOINT_ID, "The container engine was not asked");
     };
@@ -147,6 +154,10 @@ pub fn check_runtime_endpoint(view: &RuntimeView) -> ReadinessCheck {
 }
 
 pub fn check_runtime_api_version(view: &RuntimeView) -> ReadinessCheck {
+    check_runtime_api_version_inner(view).with_source("runtime")
+}
+
+fn check_runtime_api_version_inner(view: &RuntimeView) -> ReadinessCheck {
     let RuntimeView::Observed { outcome, .. } = view else {
         return super::skip(API_VERSION_ID, "The container engine was not asked");
     };
@@ -179,6 +190,10 @@ pub fn check_runtime_api_version(view: &RuntimeView) -> ReadinessCheck {
 }
 
 pub fn check_runtime_capabilities(view: &RuntimeView) -> ReadinessCheck {
+    check_runtime_capabilities_inner(view).with_source("runtime")
+}
+
+fn check_runtime_capabilities_inner(view: &RuntimeView) -> ReadinessCheck {
     let RuntimeView::Observed { outcome, .. } = view else {
         return super::skip(CAPABILITIES_ID, "The container engine was not asked");
     };
@@ -219,6 +234,10 @@ pub fn check_runtime_capabilities(view: &RuntimeView) -> ReadinessCheck {
 }
 
 pub fn check_runtime_cdi(view: &RuntimeView) -> ReadinessCheck {
+    check_runtime_cdi_inner(view).with_source("runtime")
+}
+
+fn check_runtime_cdi_inner(view: &RuntimeView) -> ReadinessCheck {
     let RuntimeView::Observed { outcome, .. } = view else {
         return super::skip(CDI_ID, "The container engine was not asked");
     };

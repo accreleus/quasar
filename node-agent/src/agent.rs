@@ -1514,7 +1514,10 @@ async fn connect_and_run(
         .await
     };
     crate::readiness::log_report(&readiness);
-    sessions.mgr.readiness.refreshed(readiness.clone());
+    sessions
+        .mgr
+        .readiness
+        .refreshed(readiness.clone(), SystemTime::now());
     // A host-probe result produced while disconnected: pure in-memory work, so it is
     // safe inside the handshake window, unlike everything above it.
     while let Ok(update) = sessions.probe_updates.try_recv() {
@@ -1725,7 +1728,7 @@ async fn connect_and_run(
                 match refresh {
                     ReadinessRefresh::Done(Ok(checks)) => {
                         readiness_busy = false;
-                        mgr.readiness.refreshed(checks);
+                        mgr.readiness.refreshed(checks, SystemTime::now());
                     }
                     ReadinessRefresh::Done(Err(error)) => {
                         readiness_busy = false;
@@ -4599,6 +4602,9 @@ mod tests {
             status: status.to_string(),
             summary: format!("{id} is {status}"),
             remediation: format!("fix {id}"),
+            observed_at: None,
+            source: None,
+            blocks: None,
         }
     }
 
@@ -5033,6 +5039,9 @@ mod tests {
             status: crate::readiness::PASS.into(),
             summary: String::new(),
             remediation: String::new(),
+            observed_at: None,
+            source: None,
+            blocks: None,
         }
     }
 

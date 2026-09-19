@@ -285,4 +285,242 @@ describe("ReadinessCard", () => {
       Object.assign(navigator, { clipboard: original });
     }
   });
+
+  describe("provenance (#261)", () => {
+    it.each([
+      ["host_probe", "host probe"],
+      ["local", "local check"],
+      ["runtime", "container runtime"],
+      ["operator", "operator configuration"],
+      ["telemetry_v2", "telemetry_v2"],
+    ])("shows provenance line with observed_at and source label for %s", (source, label) => {
+      const observedAt = "2026-09-19T10:00:00Z";
+      const expectedTimeString = new Date(observedAt).toLocaleString();
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              observed_at: observedAt,
+              source: source,
+            }),
+          ]}
+        />,
+      );
+      const row = screen.getByTestId("readiness-check-nvidia_egl_vendor_json");
+      const provenance = within(row).getByTestId("readiness-provenance-nvidia_egl_vendor_json");
+      expect(provenance).toHaveTextContent("Observed");
+      expect(provenance).toHaveTextContent(expectedTimeString);
+      expect(provenance).toHaveTextContent(label);
+    });
+
+    it("shows source label when only source is present, without Observed time", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              source: "host_probe",
+            }),
+          ]}
+        />,
+      );
+      const row = screen.getByTestId("readiness-check-nvidia_egl_vendor_json");
+      const provenance = within(row).getByTestId("readiness-provenance-nvidia_egl_vendor_json");
+      expect(provenance).toHaveTextContent("host probe");
+      expect(provenance).not.toHaveTextContent("Observed");
+    });
+
+    it("shows Observed time when only observed_at is present, without source label", () => {
+      const observedAt = "2026-09-19T10:00:00Z";
+      const expectedTimeString = new Date(observedAt).toLocaleString();
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              observed_at: observedAt,
+            }),
+          ]}
+        />,
+      );
+      const row = screen.getByTestId("readiness-check-nvidia_egl_vendor_json");
+      const provenance = within(row).getByTestId("readiness-provenance-nvidia_egl_vendor_json");
+      expect(provenance).toHaveTextContent("Observed");
+      expect(provenance).toHaveTextContent(expectedTimeString);
+    });
+
+    it("renders no provenance element for older agent without observed_at, source, or blocks", () => {
+      render(
+        <ReadinessCard
+          checks={[check()]}
+        />,
+      );
+      const row = screen.getByTestId("readiness-check-nvidia_egl_vendor_json");
+      expect(within(row).queryByTestId("readiness-provenance-nvidia_egl_vendor_json")).not.toBeInTheDocument();
+      expect(within(row).queryByTestId("readiness-blocks-nvidia_egl_vendor_json")).not.toBeInTheDocument();
+    });
+
+    it("does not render Invalid Date text for malformed observed_at", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              observed_at: "not-a-date",
+              source: "local",
+            }),
+          ]}
+        />,
+      );
+      const row = screen.getByTestId("readiness-check-nvidia_egl_vendor_json");
+      expect(row).not.toHaveTextContent("Invalid Date");
+      const provenance = within(row).getByTestId("readiness-provenance-nvidia_egl_vendor_json");
+      expect(provenance).toHaveTextContent("local check");
+    });
+
+    it("shows Blocks launches marker for fail status with blocks", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              status: "fail",
+              blocks: { scope: "gpu", gpu_index: 1, enforced_by: "control_plane" },
+            }),
+          ]}
+        />,
+      );
+      const row = screen.getByTestId("readiness-check-nvidia_egl_vendor_json");
+      const marker = within(row).getByTestId("readiness-blocks-nvidia_egl_vendor_json");
+      expect(marker).toHaveTextContent(/^Blocks launches$/);
+      expect(marker).toHaveAttribute("title", "Blocks launches placed on GPU 1");
+    });
+
+    it("shows Can block launches marker for warn status with blocks", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              status: "warn",
+              blocks: { scope: "host", enforced_by: "control_plane" },
+            }),
+          ]}
+        />,
+      );
+      const row = screen.getByTestId("readiness-check-nvidia_egl_vendor_json");
+      const marker = within(row).getByTestId("readiness-blocks-nvidia_egl_vendor_json");
+      expect(marker).toHaveTextContent(/^Can block launches$/);
+      expect(marker).toHaveAttribute("title", "Blocks every launch on this host");
+    });
+
+    it("shows Can block launches marker for unknown status with blocks", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              status: "unknown",
+              blocks: { scope: "homes", enforced_by: "control_plane" },
+            }),
+          ]}
+        />,
+      );
+      const row = screen.getByTestId("readiness-check-nvidia_egl_vendor_json");
+      const marker = within(row).getByTestId("readiness-blocks-nvidia_egl_vendor_json");
+      expect(marker).toHaveTextContent(/^Can block launches$/);
+      expect(marker).toHaveAttribute("title", "Blocks launches that use a managed home");
+    });
+
+    it("shows correct title for pass status with blocks", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              status: "pass",
+              blocks: { scope: "gpu", gpu_index: 0, enforced_by: "control_plane" },
+            }),
+          ]}
+        />,
+      );
+      const row = screen.getByTestId("readiness-check-nvidia_egl_vendor_json");
+      const marker = within(row).getByTestId("readiness-blocks-nvidia_egl_vendor_json");
+      expect(marker).toHaveAttribute("title", "Blocks launches placed on GPU 0");
+    });
+
+    it("shows agent-enforced title for host scope", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              status: "fail",
+              blocks: { scope: "host", enforced_by: "agent" },
+            }),
+          ]}
+        />,
+      );
+      const row = screen.getByTestId("readiness-check-nvidia_egl_vendor_json");
+      const marker = within(row).getByTestId("readiness-blocks-nvidia_egl_vendor_json");
+      expect(marker).toHaveAttribute("title", "Blocks every launch on this host. Enforced by the host agent; cannot be overridden.");
+    });
+
+    it("renders no blocks marker for unrecognised scope", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              status: "fail",
+              blocks: { scope: "rack", enforced_by: "control_plane" },
+            }),
+          ]}
+        />,
+      );
+      const row = screen.getByTestId("readiness-check-nvidia_egl_vendor_json");
+      expect(within(row).queryByTestId("readiness-blocks-nvidia_egl_vendor_json")).not.toBeInTheDocument();
+    });
+
+    it("renders unknown status with Indeterminate image, not Fail or Skipped", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              status: "unknown",
+              summary: "Host probe inconclusive",
+            }),
+          ]}
+        />,
+      );
+      const row = screen.getByTestId("readiness-check-nvidia_egl_vendor_json");
+      expect(within(row).getByRole("img", { name: "Indeterminate" })).toBeInTheDocument();
+      expect(within(row).queryByRole("img", { name: "Fail" })).not.toBeInTheDocument();
+      expect(within(row).queryByRole("img", { name: "Skipped" })).not.toBeInTheDocument();
+      expect(within(row).getByText("Host probe inconclusive")).toBeInTheDocument();
+    });
+
+    it("places unknown status check in a readiness group, not in not-applicable", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              id: "render_node",
+              status: "unknown",
+              summary: "Indeterminate result",
+            }),
+          ]}
+        />,
+      );
+      const checks = screen.getByTestId("readiness-checks");
+      const group = within(checks).getByTestId("readiness-group");
+      expect(group).toBeInTheDocument();
+      expect(within(group).getByTestId("readiness-check-render_node")).toBeInTheDocument();
+      expect(screen.queryByTestId("readiness-not-applicable")).not.toBeInTheDocument();
+    });
+
+    it("does not show Needs attention when only unknown status checks are present", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              status: "unknown",
+            }),
+          ]}
+        />,
+      );
+      expect(screen.queryByText("Needs attention")).not.toBeInTheDocument();
+    });
+  });
 });

@@ -20,7 +20,7 @@ export interface ReadinessGroupDef {
 export const READINESS_GROUPS: readonly ReadinessGroupDef[] = [
   // #254: the runtime is the most basic fault, so it comes first; startup_cleanup is
   // the agent's own safety state (#256).
-  { key: "runtime", label: "Container runtime", ids: ["startup_cleanup", "runtime_endpoint", "runtime_api_version", "runtime_capabilities", "runtime_cdi"] },
+  { key: "runtime", label: "Container runtime", ids: ["startup_cleanup", "runtime_endpoint", "runtime_api_version", "runtime_capabilities", "runtime_cdi", "host_container_mounts"] },
   {
     key: "gpu",
     label: "GPU & display",
@@ -29,7 +29,7 @@ export const READINESS_GROUPS: readonly ReadinessGroupDef[] = [
   {
     key: "nvidia",
     label: "NVIDIA driver",
-    ids: ["nvidia_egl_vendor_json", "nvidia_eglcore_library", "nvidia_lib32_gl", "driver_volume_version", "nvidia_vulkan_av1_compatibility"],
+    ids: ["nvidia_egl_vendor_json", "nvidia_eglcore_library", "nvidia_lib32_gl", "driver_volume_version", "nvidia_vulkan_av1_compatibility", "nvidia_driver_mount"],
   },
   { key: "input", label: "Input & sandbox", ids: ["input_probe", "uinput", "user_namespaces", "app_apparmor_profile"] },
   // #259: the audio sidecar host probe.

@@ -133,6 +133,11 @@ impl Phase {
                           agent's operation journals and managed homes in place. The agent \
                           retries the cleanup on its own and resumes without a restart."
                 .into(),
+            observed_at: None,
+            source: Some("runtime".into()),
+            // Agent-enforced: it refuses these launches itself, and no readiness
+            // override lifts them (protocol/agent-api.md `readiness`).
+            blocks: Some(crate::messages::ReadinessBlocks::host("agent")),
         })
     }
 }
@@ -342,7 +347,7 @@ impl Station {
     /// with what is retained.
     pub fn readiness(&self, local: Vec<ReadinessCheck>) -> Vec<ReadinessCheck> {
         let mut report = self.readiness.lock().unwrap();
-        report.refreshed(local);
+        report.refreshed(local, SystemTime::now());
         report.merged()
     }
 

@@ -416,18 +416,83 @@ pub struct CodecThroughput {
 /// (`hosts.readiness` JSONB) and the admin UI renders it generically, so adding
 /// a check is agent-only. `id` is the stable key the UI may special-case;
 /// `summary`/`remediation` are operator-facing prose.
+///
+/// `observed_at`/`source`/`blocks` are protocol amendment 11 (#261): optional so a
+/// check with none of them serialises byte-for-byte as before.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ReadinessCheck {
     /// Stable machine key, e.g. `"nvidia_egl_vendor_json"`.
     pub id: String,
-    /// `"pass" | "fail" | "skip"`. `skip` means "not applicable to this host"
-    /// (an NVIDIA check on an AMD box) — never "we could not tell".
+    /// `"pass" | "fail" | "skip" | "warn" | "provisioning" | "unknown"`. `skip` means
+    /// "not applicable to this host" (an NVIDIA check on an AMD box) — never "we could
+    /// not tell"; `unknown` is that case (an indeterminate host probe).
     pub status: String,
     /// One sentence an operator can act on, in plain language.
     pub summary: String,
     /// Exact commands to fix it, distro-aware where cheaply knowable. Empty
     /// for `pass`/`skip`.
     pub remediation: String,
+    /// RFC3339 UTC, when the observation behind this check was made. Absent ⇒ the
+    /// consumer may assume the report's own time (`protocol/agent-api.md` `readiness`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
+    /// `"host_probe" | "local" | "runtime" | "operator"` — open string, per the contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Present only on a check that rests on evidence, whatever its current status;
+    /// declares what a `fail` on it blocks. Never present on a proxy check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocks: Option<ReadinessBlocks>,
+}
+
+/// What a failing evidence-backed [`ReadinessCheck`] blocks (protocol amendment 11,
+/// ADR 0005). Known scopes: `host`, `homes`, `gpu` (with `gpu_index` set).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ReadinessBlocks {
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_index: Option<i32>,
+    /// `"control_plane" | "agent"`. `agent` marks the agent's own safety states: it
+    /// refuses those launches itself and no readiness override lifts them.
+    pub enforced_by: String,
+}
+
+impl ReadinessBlocks {
+    pub fn host(enforced_by: &str) -> Self {
+        ReadinessBlocks {
+            scope: "host".into(),
+            gpu_index: None,
+            enforced_by: enforced_by.into(),
+        }
+    }
+
+    pub fn homes(enforced_by: &str) -> Self {
+        ReadinessBlocks {
+            scope: "homes".into(),
+            gpu_index: None,
+            enforced_by: enforced_by.into(),
+        }
+    }
+
+    pub fn gpu(index: i32, enforced_by: &str) -> Self {
+        ReadinessBlocks {
+            scope: "gpu".into(),
+            gpu_index: Some(index),
+            enforced_by: enforced_by.into(),
+        }
+    }
+}
+
+impl ReadinessCheck {
+    pub fn with_source(mut self, source: &str) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    pub fn with_blocks(mut self, blocks: ReadinessBlocks) -> Self {
+        self.blocks = Some(blocks);
+        self
+    }
 }
 
 /// The auth credential in a `register` message.
@@ -1389,6 +1454,9 @@ mod tests {
                 status: "fail".to_string(),
                 summary: "no 32-bit NVIDIA GL libraries on the host".to_string(),
                 remediation: "sudo dnf install -y nvidia-driver-libs.i686".to_string(),
+                observed_at: None,
+                source: None,
+                blocks: None,
             }]),
         };
         let json = serde_json::to_value(&msg).unwrap();
