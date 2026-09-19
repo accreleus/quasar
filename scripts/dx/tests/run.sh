@@ -3562,6 +3562,77 @@ else
   fail "redeploy:every-cause-has-a-branch" "no branch for:$missing_branch"
 fi
 
+printf '\n== readiness fault-injection harness (#264) ==\n'
+# The override scenario needs a failing evidence check on a host that is really
+# healthy. That check is produced OUTSIDE the agent, by a relay under
+# scripts/harness/readiness-fixture that rewrites a report on the wire. These
+# guards are the proof that it cannot reach a shipped build: nothing under a
+# shipped tree knows the fixture exists, and no image build can copy it in.
+RF_HARNESS="$ROOT/scripts/harness/run-readiness-faults.sh"
+RF_FIXTURE="$ROOT/scripts/harness/readiness-fixture"
+if [ -f "$RF_HARNESS" ] && [ -f "$RF_FIXTURE/go.mod" ]; then
+  pass "readiness-faults:present" "harness and fixture module exist"
+else
+  fail "readiness-faults:present" "run-readiness-faults.sh or readiness-fixture/go.mod is missing"
+fi
+
+rf_scripts=("$RF_HARNESS")
+for f in "$ROOT"/scripts/harness/readiness-faults/*.sh; do
+  [ -f "$f" ] && rf_scripts+=("$f")
+done
+if ! bash -n "${rf_scripts[@]}" 2>/dev/null; then
+  fail "readiness-faults:bash-n" "a harness script has a syntax error"
+elif command -v shellcheck >/dev/null 2>&1; then
+  sc_out="$(shellcheck -x -S warning "${rf_scripts[@]}" 2>&1)"
+  if [ -z "$sc_out" ]; then
+    pass "readiness-faults:shellcheck" "clean at -S warning"
+  else
+    fail "readiness-faults:shellcheck" "$(printf '%s' "$sc_out" | head -n 20)"
+  fi
+else
+  warn "readiness-faults:shellcheck" "not installed — SKIPPED"
+fi
+
+# No shipped tree may mention the fixture, its synthetic check ids or its env names.
+rf_hits="$(grep -rIlE 'readiness-fixture|harness_synthetic_|RH02_FIXTURE_' \
+  "$ROOT/node-agent/src" "$ROOT/node-agent/Cargo.toml" "$ROOT/control-plane" \
+  "$ROOT/web/src" "$ROOT/deploy" 2>/dev/null | sed "s#^$ROOT/##" | head -n 5)"
+if [ -z "$rf_hits" ]; then
+  pass "readiness-faults:fixture-unreachable" "no shipped tree references the fixture or a synthetic check id"
+else
+  fail "readiness-faults:fixture-unreachable" "referenced from: $(printf '%s' "$rf_hits" | tr '\n' ' ')"
+fi
+
+# The fixture is its own Go module, so neither product build can import it.
+if grep -qx 'module quasar-readiness-fixture' "$RF_FIXTURE/go.mod" 2>/dev/null; then
+  pass "readiness-faults:separate-module" "quasar-readiness-fixture is not part of the control-plane module"
+else
+  fail "readiness-faults:separate-module" "readiness-fixture/go.mod does not declare its own module"
+fi
+
+# No image build may copy scripts/ (or the whole context) into a layer. Sources of
+# every COPY/ADD that is not --from=<stage> are checked, continuation lines joined.
+rf_copy_bad="$(for df in "$ROOT"/deploy/Dockerfile*; do
+  sed -e ':a' -e '/\\$/N; s/\\\n/ /; ta' "$df" \
+    | grep -E '^[[:space:]]*(COPY|ADD)[[:space:]]' | grep -v -- '--from=' \
+    | while read -r _ rest; do
+        # shellcheck disable=SC2086  # word-splitting the instruction is the point
+        set -- $rest
+        while [ "$#" -gt 1 ]; do
+          case "$1" in
+            --*) ;;
+            .|./|scripts|scripts/*|./scripts|./scripts/*) printf '%s:%s ' "$(basename "$df")" "$1" ;;
+          esac
+          shift
+        done
+      done
+done)"
+if [ -z "$rf_copy_bad" ]; then
+  pass "readiness-faults:no-image-copies-scripts" "no deploy/Dockerfile* COPY or ADD source can include scripts/"
+else
+  fail "readiness-faults:no-image-copies-scripts" "$rf_copy_bad"
+fi
+
 # ── summary ──────────────────────────────────────────────────────────────────
 printf '\n'
 STATUS=ok

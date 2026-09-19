@@ -77,6 +77,10 @@ own; the two do not move together, and that is deliberate.
   overridden. An override for a check the host no longer reports is shown as inert and can
   be withdrawn. Setting, withdrawing and lapsing are written to the activity log; setting
   is `warn`, the other two `info`.
+- **Readiness fault-injection acceptance harness (#264).** Tests readiness checks and
+  blocking by injecting faults (runtime, storage, input, GPU per vendor) on a disposable
+  stack and asserting `host_not_ready` refusals and the override lifecycle work correctly.
+  Contributor tooling only; no product behaviour change.
 
 ### Removed
 - **The node agent no longer needs a `docker` or `podman` executable (#239).** Every
