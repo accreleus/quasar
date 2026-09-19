@@ -454,7 +454,7 @@ func (e *HostNotReadyRejection) Unwrap() error { return e.err }
 // fail-open choice: a wrong code is worse than a coarse one.
 //
 // Two facts decide it. The gate excluded a GPU that would otherwise have been
-// picked (readinessDiagQuery), AND no GPU the gate leaves eligible could serve
+// picked (readinessDiagQuery), and no GPU the gate leaves eligible could serve
 // the request at all (readinessTotalsQuery). The second is what keeps "a ready
 // host is full while another is blocked" at capacity_exhausted.
 func readinessRejection(ctx context.Context, tx pgx.Tx, cand candidacy) error {

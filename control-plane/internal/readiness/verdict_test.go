@@ -272,6 +272,24 @@ func TestVerdictOverrideLifecycle(t *testing.T) {
 	}
 }
 
+// TestVerdictDuplicateIDNeverLapsesAFailingTwin: ids are agent-owned and stored
+// verbatim, so a report may repeat one. An override that is lifting a failing
+// entry must not lapse because a twin passes, or the scope would read unblocked
+// with no override stored.
+func TestVerdictDuplicateIDNeverLapsesAFailingTwin(t *testing.T) {
+	host := blk("host", "control_plane")
+	v := Evaluate(report(t, chk{"audio_probe", "pass", host}, chk{"audio_probe", "fail", host}), []string{"audio_probe"})
+	if len(v.Lapsed) != 0 {
+		t.Fatalf("lapsed = %v, want the override held while an entry with that id still fails", v.Lapsed)
+	}
+	if v.BlockHost {
+		t.Fatal("the held override must keep lifting the failing entry")
+	}
+	if len(v.Blocking) != 1 || !v.Blocking[0].Overridden {
+		t.Fatalf("blocking = %+v", v.Blocking)
+	}
+}
+
 func nilIfEmpty(s []string) []string {
 	if len(s) == 0 {
 		return nil

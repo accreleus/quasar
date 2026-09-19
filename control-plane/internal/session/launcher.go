@@ -631,7 +631,7 @@ func (c *Coordinator) logVramVetoRejection(userID, appID string, err error) {
 }
 
 // logHostNotReadyRejection makes a readiness refusal diagnosable: the response
-// deliberately names nothing, so this is the only place the excluded GPUs and
+// names nothing, so this is the only place the excluded GPUs and
 // the scope that excluded them appear. A nil or non-readiness error is a no-op.
 func (c *Coordinator) logHostNotReadyRejection(userID, appID string, err error) {
 	var rej *HostNotReadyRejection

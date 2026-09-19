@@ -26,9 +26,8 @@
   time, and judges `inert` on the same host snapshot as the gate's `blocking`.
 - The card: "Launch anyway", "Overridden by admin", "Withdraw override", a list of inert
   overrides, a stale-report notice. The host page wires them through `useAdminAction` and the
-  resource layer behind a confirmation. No shared confirm component exists in the console, so
-  the confirmation is `window.confirm`; none was invented. The Fleet row shows markers only;
-  the setup wizard is unchanged.
+  resource layer behind a confirmation in the console's shared `Modal`. The Fleet row shows
+  markers only; the setup wizard is unchanged.
 
 ## One reading of the contract
 
@@ -76,6 +75,35 @@ deadlock on the admission side is a `500` on a launch. It predates RH-02, this w
 edge to it, and no occurrence was observed. It is a placement-loop change that wants its own
 failing test.
 
+## Code review of the whole branch (standards and spec, two reviewers)
+
+Run on `56b0c76` after the slices were gated. Three findings were real and are fixed in the
+commit after this record's first version:
+
+- **A held override could become invisible.** Only a pass lapses an override, so one is
+  still stored while its check is `warn`, `unknown` or `skip`. Such a check is not in
+  `readiness_gate.blocking` and its override is not inert, and the card rendered the marker
+  and the withdraw control only from `blocking`. `homes_free_space` reaches it: exhausted,
+  overridden, then merely low. The override would have sat unseen and lifted the next
+  failure. The card now shows the marker and the withdraw control for any stored, non-inert
+  override on a check, and keeps "Can block launches" beside it. Three component tests,
+  written first.
+- **A repeated check id could lapse an override that was lifting a failing twin.** Ids are
+  agent-owned and stored verbatim. With one entry passing and one failing under the same id,
+  the override lapsed and the scope read unblocked with no override stored until the next
+  report. A lapse now needs a pass and no entry with that id still failing. One verdict test,
+  written first.
+- **`window.confirm` was a new idiom.** This record first said no shared confirm component
+  exists; that was wrong. The console's idiom is the shared `Modal` with a state flag and
+  `Button`s in its footer, as the session page's terminate confirmation does. The host page
+  now uses it, and `window.confirm` is gone from `web/src`.
+
+Also fixed from the standards pass: two comments that cited a function this slice had moved,
+a comment carrying change history, and shouted words. Left as they are, as judgement calls:
+the default window defined in three packages with a cross-reference, the thin `_inner`
+wrappers in the agent's runtime and storage checks, and the repeated `None` fields on
+`ReadinessCheck` literals.
+
 ## Gates at `b458c95` (rerun after the review fixes)
 
 | Gate | Result |
@@ -88,8 +116,9 @@ failing test.
 | the race test, `-count=3 -race` | pass |
 | leak scan (tree, operator patterns) | clean |
 
-After `4b8f15f` and `ac5c7ea`, which touch only the card, the card and host-page tests and the
-typecheck were rerun and pass.
+All six gates, `make test-rust` included (1715 passed), were run again on `56b0c76`, and
+`verify`, `test-go`, `test-db`, `test-web` and `preflight` once more on the code-review fixes.
+All pass.
 
 ## Live evidence: AMD test host, 2026-09-19
 

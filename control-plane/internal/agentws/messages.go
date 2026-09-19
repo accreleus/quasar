@@ -102,7 +102,7 @@ type CapacityMsg struct {
 	// drops every key a newer agent sends, and pass-through is the contract.
 	// Keep-if-absent; explicit [] is a real "no checks". Shape-checked by
 	// ValidReadiness. Admission never parses it: storing it derives the
-	// scheduling columns (recomputeReadinessVerdict), and those are what the
+	// scheduling columns (readinessgate.Recompute), and those are what the
 	// candidate query reads.
 	Readiness json.RawMessage `json:"readiness"`
 }

@@ -421,7 +421,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		"enabled", vramAdmission.MinFreeMB > 0)
 
 	// The evidence-gated readiness filter (amendment 11). The window reaches the
-	// host READ path too (crudHandler below): a host that reads `active` while
+	// host read path too (crudHandler below): a host that reads `active` while
 	// admission abstains is a console that contradicts the scheduler.
 	log.Info("scheduler readiness gate", "stale_secs", cfg.ReadinessStaleSecs)
 

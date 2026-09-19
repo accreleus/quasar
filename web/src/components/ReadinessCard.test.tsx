@@ -1022,6 +1022,49 @@ describe("ReadinessCard", () => {
       expect(screen.queryByTestId("readiness-gate-abstaining")).not.toBeInTheDocument();
     });
 
+    // A stored override is held through warn, unknown and skip (only a pass lapses
+    // it), so it is neither in `blocking` nor inert. It must still be visible and
+    // withdrawable, or it silently lifts the next failure.
+    it.each(["warn", "unknown", "skip"])(
+      "shows and can withdraw a held override on a check that is now %s",
+      (status) => {
+        const onClearOverride = vi.fn();
+        render(
+          <ReadinessCard
+            checks={[
+              check({
+                id: "homes_free_space",
+                status,
+                blocks: { scope: "homes", enforced_by: "control_plane" },
+              }),
+            ]}
+            gate={{ state: "active", blocking: [] }}
+            overrides={[
+              {
+                check_id: "homes_free_space",
+                created_by: "u1",
+                created_by_username: "alice",
+                created_at: "2026-09-19T10:00:00Z",
+                inert: false,
+              },
+            ]}
+            onSetOverride={vi.fn()}
+            onClearOverride={onClearOverride}
+          />,
+        );
+        const row = screen.getByTestId("readiness-check-homes_free_space");
+        const marker = within(row).getByTestId("readiness-overridden-homes_free_space");
+        expect(marker).toHaveTextContent(/^Overridden by admin$/);
+        expect(marker.getAttribute("title")).toContain("alice");
+        // It is not failing, so it still reads as a check that can block.
+        expect(within(row).getByTestId("readiness-blocks-homes_free_space")).toHaveTextContent(/^Can block launches$/);
+        expect(within(row).queryByTestId("readiness-override-set-homes_free_space")).not.toBeInTheDocument();
+        within(row).getByTestId("readiness-override-clear-homes_free_space").click();
+        expect(onClearOverride).toHaveBeenCalledWith("homes_free_space");
+        expect(screen.queryByTestId("readiness-inert-overrides")).not.toBeInTheDocument();
+      },
+    );
+
     it("shows the Needs attention chip for an overridden failing check", () => {
       render(
         <ReadinessCard

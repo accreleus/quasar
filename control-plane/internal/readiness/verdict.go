@@ -124,12 +124,18 @@ func Evaluate(report json.RawMessage, overrides []string) Verdict {
 	}
 	sort.Ints(v.BlockedGPUs)
 
+	// Ids are agent-owned and may repeat. A lapse needs a pass and no entry with
+	// that id still failing, or the override being lifted would vanish under it.
 	present := make(map[string]bool, len(checks))
 	passed := make(map[string]bool, len(checks))
+	stillBlocking := make(map[string]bool, len(checks))
 	for _, c := range checks {
 		present[c.id] = true
 		if c.status == statusPass {
 			passed[c.id] = true
+		}
+		if c.hasBlocks && c.status == statusFail {
+			stillBlocking[c.id] = true
 		}
 	}
 	seen := make(map[string]bool, len(overrides))
@@ -139,7 +145,7 @@ func Evaluate(report json.RawMessage, overrides []string) Verdict {
 		}
 		seen[id] = true
 		switch {
-		case passed[id]:
+		case passed[id] && !stillBlocking[id]:
 			v.Lapsed = append(v.Lapsed, id)
 		case !present[id]:
 			v.Inert = append(v.Inert, id)

@@ -4,7 +4,7 @@
  * session poll filtered to this host.
  */
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import * as adminApi from "../../api/admin";
 import { ApiError } from "../../api/client";
@@ -14,6 +14,7 @@ import { Breadcrumbs } from "../../components/Breadcrumbs";
 import { shortId } from "../../lib/format/shortId";
 import { Button } from "../../components/Button";
 import { Chip } from "../../components/Chip";
+import { Modal } from "../../components/Modal";
 import { PageHeader } from "../../components/PageHeader";
 import { ReadinessCard } from "../../components/ReadinessCard";
 import { ResourceStates } from "../../components/ResourceStates";
@@ -123,14 +124,14 @@ export function HostDetail() {
     },
     {
       success: (_r, checkId) => `The override for ${checkId} was withdrawn`,
-      failure: (e, checkId) =>
-        e instanceof ApiError && e.code === "conflict"
-          ? { title: "Could not withdraw the override", body: e.message }
-          : `Could not withdraw the override for ${checkId}`,
+      failure: (_e, checkId) => `Could not withdraw the override for ${checkId}`,
     },
   );
 
   const overridePending = setOverride.pending?.[0] ?? clearOverride.pending?.[0] ?? null;
+
+  // Awaiting confirmation in the Modal below; null when no "Launch anyway" is pending.
+  const [confirmOverrideCheckId, setConfirmOverrideCheckId] = useState<string | null>(null);
 
   const crumbs = (
     <Breadcrumbs
@@ -228,15 +229,7 @@ export function HostDetail() {
         reportedAt={host.readiness_reported_at}
         gate={host.readiness_gate}
         overrides={host.readiness_overrides}
-        onSetOverride={(checkId) => {
-          if (
-            window.confirm(
-              `Let sessions launch on ${host.node_name} although the "${checkId}" check is failing?`,
-            )
-          ) {
-            void setOverride.run(checkId);
-          }
-        }}
+        onSetOverride={(checkId) => setConfirmOverrideCheckId(checkId)}
         onClearOverride={(checkId) => void clearOverride.run(checkId)}
         overridePending={overridePending}
         footnote={
@@ -248,6 +241,36 @@ export function HostDetail() {
           </>
         }
       />
+
+      {confirmOverrideCheckId && (
+        <Modal
+          open
+          onClose={() => setConfirmOverrideCheckId(null)}
+          title="Launch despite a failing check"
+          footer={
+            <>
+              <Button variant="ghost" onClick={() => setConfirmOverrideCheckId(null)}>
+                Cancel
+              </Button>
+              <Button
+                variant="danger"
+                disabled={setOverride.pending != null}
+                onClick={() => {
+                  void setOverride.run(confirmOverrideCheckId);
+                  setConfirmOverrideCheckId(null);
+                }}
+              >
+                Launch anyway
+              </Button>
+            </>
+          }
+        >
+          <p className="sec">
+            Sessions will be placed on {host.node_name} although the "{confirmOverrideCheckId}"
+            check is failing. The check stays visible, and the override ends when it next passes.
+          </p>
+        </Modal>
+      )}
     </section>
   );
 }

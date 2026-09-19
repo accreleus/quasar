@@ -6,7 +6,7 @@
  * Hosts tab's test stubs it: this page must not open a second sessions poll.
  */
 
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -453,7 +453,6 @@ describe("HostDetail — readiness override (#263)", () => {
   });
 
   it("confirms, then sets an override and refetches the host", async () => {
-    vi.spyOn(window, "confirm").mockReturnValue(true);
     mocked.getHost.mockResolvedValue({
       host: host({
         readiness: [failingCheck],
@@ -469,16 +468,17 @@ describe("HostDetail — readiness override (#263)", () => {
 
     await waitFor(() => expect(screen.getByTestId("readiness-override-set-audio_probe")).toBeTruthy());
     fireEvent.click(screen.getByTestId("readiness-override-set-audio_probe"));
+    expect(mocked.setReadinessOverride).not.toHaveBeenCalled();
 
-    expect(window.confirm).toHaveBeenCalled();
-    await waitFor(() =>
-      expect(mocked.setReadinessOverride).toHaveBeenCalledWith("tok", "c2059601", "audio_probe"),
-    );
+    const dialog = screen.getByRole("dialog");
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Launch anyway" }));
+    });
+    expect(mocked.setReadinessOverride).toHaveBeenCalledWith("tok", "c2059601", "audio_probe");
     await waitFor(() => expect(mocked.getHost).toHaveBeenCalledTimes(2));
   });
 
   it("does not set an override when confirmation is declined", async () => {
-    vi.spyOn(window, "confirm").mockReturnValue(false);
     mocked.getHost.mockResolvedValue({
       host: host({
         readiness: [failingCheck],
@@ -494,6 +494,7 @@ describe("HostDetail — readiness override (#263)", () => {
 
     await waitFor(() => expect(screen.getByTestId("readiness-override-set-audio_probe")).toBeTruthy());
     fireEvent.click(screen.getByTestId("readiness-override-set-audio_probe"));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
 
     expect(mocked.setReadinessOverride).not.toHaveBeenCalled();
   });
@@ -525,7 +526,6 @@ describe("HostDetail — readiness override (#263)", () => {
   });
 
   it("shows the conflict copy on a 409 and leaves the page usable", async () => {
-    vi.spyOn(window, "confirm").mockReturnValue(true);
     mocked.getHost.mockResolvedValue({
       host: host({
         readiness: [failingCheck],
@@ -544,6 +544,10 @@ describe("HostDetail — readiness override (#263)", () => {
 
     await waitFor(() => expect(screen.getByTestId("readiness-override-set-audio_probe")).toBeTruthy());
     fireEvent.click(screen.getByTestId("readiness-override-set-audio_probe"));
+    const dialog = screen.getByRole("dialog");
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Launch anyway" }));
+    });
 
     await waitFor(() => expect(mocked.setReadinessOverride).toHaveBeenCalled());
     // The page is still usable: the failing check and its button are still there.

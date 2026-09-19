@@ -155,11 +155,15 @@ export function ReadinessCard({
   const renderCheck = (c: ReadinessCheck) => {
     const provenance = provenanceText(c);
     const blockingEntry = findBlockingEntry(gate, c.id);
-    const overridden = blockingEntry?.overridden === true;
-    const blocksLabel = !overridden && c.blocks && blocksTitle(c.blocks);
+    const gateOverridden = blockingEntry?.overridden === true;
+    const override = overrides?.find((o) => o.check_id === c.id && !o.inert);
+    // Only a pass lapses an override, so one is still stored while its check is
+    // warn, unknown or skip and absent from `gate.blocking`. It must stay visible
+    // and withdrawable, or it silently lifts the next failure.
+    const overridden = gateOverridden || !!override;
+    const blocksLabel = !(c.status === "fail" && overridden) && c.blocks && blocksTitle(c.blocks);
     const canSetOverride =
       !!blockingEntry && !overridden && blockingEntry.enforced_by !== "agent" && !!onSetOverride;
-    const override = overrides?.find((o) => o.check_id === c.id);
     return (
       <div key={c.id} className={rowClass} data-testid={`readiness-check-${c.id}`}>
         <div className="host-setting-copy">

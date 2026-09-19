@@ -454,11 +454,9 @@ func (s *agentStore) replaceHostIdentity(ctx context.Context, hostID string, id 
 // readiness_reported_at stamps every real report, not only changes, so a stale
 // set cannot present as live.
 //
-// Transactional since amendment 11: the UPDATE takes the host's row lock and
-// recomputeReadinessVerdict derives the scheduling columns under it, so an
-// override change and a report serialise and the columns can never describe a
-// state older than the stored report. A kept-if-absent or malformed report
-// writes nothing and derives nothing.
+// readinessgate.StoreReport writes it and derives the scheduling columns under
+// the host's row lock, so a report and an override change serialise. A
+// kept-if-absent or malformed report writes nothing and derives nothing.
 func (s *agentStore) upsertHostReadiness(ctx context.Context, hostID string, raw json.RawMessage) error {
 	if raw == nil {
 		return nil // keep-if-absent

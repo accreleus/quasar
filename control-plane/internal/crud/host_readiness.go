@@ -29,7 +29,7 @@ func (s *store) readinessWindow() time.Duration {
 	return time.Duration(s.readinessStaleSecs) * time.Second
 }
 
-// attachReadinessGates fills every host's verdict AND its served overrides
+// attachReadinessGates fills every host's verdict and its served overrides
 // from one read (Gate.Overrides), so the gate's `overridden` flags and
 // readiness_overrides can never disagree about which ids are stored.
 //
