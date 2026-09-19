@@ -209,6 +209,7 @@ services:
       QUASAR_HOMES_GC: ${QUASAR_HOMES_GC:-}
       QUASAR_HOMES_GC_RETENTION_HOURS: ${QUASAR_HOMES_GC_RETENTION_HOURS:-}
       QUASAR_HOMES_GC_DRY_RUN: ${QUASAR_HOMES_GC_DRY_RUN:-}
+      QUASAR_HOMES_FREE_SPACE_FLOOR_GIB: ${QUASAR_HOMES_FREE_SPACE_FLOOR_GIB:-}
       # Steam source policy enables preparation by default; explicit host
       # opt-outs below remain authoritative for their respective activity.
       QUASAR_HOME_TEMPLATES:
