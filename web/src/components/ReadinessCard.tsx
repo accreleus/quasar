@@ -134,7 +134,8 @@ export function ReadinessCard({
           </div>
           <p>{c.summary}</p>
           {provenance && (
-            <p className="muted" style={{ fontSize: "var(--t-xs)" }} data-testid={`readiness-provenance-${c.id}`}>
+            // .host-setting-copy p out-specifies .muted, so the small-print colour is set here.
+            <p style={{ fontSize: "var(--t-xs)", color: "var(--text-3)" }} data-testid={`readiness-provenance-${c.id}`}>
               {provenance}
             </p>
           )}
