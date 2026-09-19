@@ -4,10 +4,10 @@
  * operator would fix, skipped ones set aside as not applicable to the host —
  * the contract defines `skip` as exactly that, never "could not tell".
  *
- * The map is keyed on the agent's stable check ids (node-agent/src/readiness.rs);
- * groups.test.ts pins it against that list so a new or renamed check cannot
- * land in "Other" unnoticed. Other still exists so an unknown id is shown,
- * never dropped.
+ * The map is keyed on the agent's stable check ids (node-agent/src/readiness.rs,
+ * node-agent/src/diagnostic.rs); groups.test.ts pins it against that list so a
+ * new or renamed check cannot land in "Other" unnoticed. Other still exists so
+ * an unknown id is shown, never dropped.
  */
 import type { ReadinessCheck } from "../../api/types";
 
@@ -18,8 +18,9 @@ export interface ReadinessGroupDef {
 }
 
 export const READINESS_GROUPS: readonly ReadinessGroupDef[] = [
-  // #254: the runtime is the most basic fault, so it comes first; observed only.
-  { key: "runtime", label: "Container runtime", ids: ["runtime_endpoint", "runtime_api_version", "runtime_capabilities", "runtime_cdi"] },
+  // #254: the runtime is the most basic fault, so it comes first; startup_cleanup is
+  // the agent's own safety state (#256).
+  { key: "runtime", label: "Container runtime", ids: ["startup_cleanup", "runtime_endpoint", "runtime_api_version", "runtime_capabilities", "runtime_cdi"] },
   {
     key: "gpu",
     label: "GPU & display",

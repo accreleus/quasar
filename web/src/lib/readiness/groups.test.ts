@@ -7,7 +7,7 @@ function c(id: string, status = "pass", summary = id): ReadinessCheck {
 }
 
 // Every `const ID: &str = "…"` in node-agent/src/readiness.rs,
-// readiness/platform_update.rs, and node-agent/src/host_probe.rs. A check added
+// readiness/platform_update.rs, node-agent/src/host_probe.rs, and node-agent/src/diagnostic.rs. A check added
 // or renamed there must be placed here, or it lands in "Other" unnoticed.
 const AGENT_CHECK_IDS = [
   "updater_socket",
@@ -38,6 +38,8 @@ const AGENT_CHECK_IDS = [
   "runtime_api_version",
   "runtime_capabilities",
   "runtime_cdi",
+  // #256: the agent's own safety state (node-agent/src/diagnostic.rs).
+  "startup_cleanup",
   // #253: storage (readiness/storage.rs).
   "homes_root_writable",
   "homes_free_space",
@@ -62,7 +64,14 @@ describe("readiness groups (#102)", () => {
   it("puts the container runtime checks first, endpoint before what it negotiated", () => {
     expect(READINESS_GROUPS[0].key).toBe("runtime");
     expect(READINESS_GROUPS[0].label).toBe("Container runtime");
-    expect(READINESS_GROUPS[0].ids).toEqual(["runtime_endpoint", "runtime_api_version", "runtime_capabilities", "runtime_cdi"]);
+    expect(READINESS_GROUPS[0].ids).toEqual(["startup_cleanup", "runtime_endpoint", "runtime_api_version", "runtime_capabilities", "runtime_cdi"]);
+  });
+
+  // #256: diagnostic mode's safety check explains the refusal, so it leads the runtime group.
+  it("shows the startup-cleanup safety check under Container runtime, never Other", () => {
+    const { groups } = groupChecks([c("runtime_endpoint", "fail"), c("startup_cleanup", "fail")]);
+    expect(groups.map((g) => g.key)).toEqual(["runtime"]);
+    expect(groups[0].checks.map((check) => check.id)).toContain("startup_cleanup");
   });
 
   // #253: the storage checks sit together, homes first — the two that can block later.
