@@ -330,6 +330,31 @@ describe("presentLaunchError", () => {
     const result = presentLaunchError(family, gameA, "capacity_unavailable", "raw message");
     expect(result.body).toBe("No host available right now — try again shortly.");
   });
+
+  it("host_not_ready returns the standard title and body", () => {
+    const result = presentLaunchError(family, gameA, "host_not_ready", "any message");
+    expect(result.variant).toBe("info");
+    expect(result.title).toBe("This host isn't ready");
+    expect(result.body).toBe(
+      "The host that would run this needs its administrator's attention. Ask your admin to check the host's readiness, then try again."
+    );
+  });
+
+  it("host_not_ready ignores the server message and does not name any check", () => {
+    const result = presentLaunchError(
+      family,
+      gameA,
+      "host_not_ready",
+      "media_probe_gpu1 failed: device not found"
+    );
+    expect(result.body).not.toContain("media_probe");
+    expect(result.body).not.toContain("gpu1");
+  });
+
+  it("host_not_ready omits sessionId", () => {
+    const result = presentLaunchError(family, gameA, "host_not_ready", "some message", "sess-1");
+    expect(result.sessionId).toBeUndefined();
+  });
 });
 
 describe("formatRelativeTime", () => {

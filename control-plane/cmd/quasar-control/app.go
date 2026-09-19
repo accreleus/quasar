@@ -420,9 +420,15 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		"staleness_secs", vramAdmission.StalenessSecs,
 		"enabled", vramAdmission.MinFreeMB > 0)
 
+	// The evidence-gated readiness filter (amendment 11). The window reaches the
+	// host READ path too (crudHandler below): a host that reads `active` while
+	// admission abstains is a console that contradicts the scheduler.
+	log.Info("scheduler readiness gate", "stale_secs", cfg.ReadinessStaleSecs)
+
 	sessionStore := session.NewStore(pool,
 		session.WithPlacementPolicy(placementPolicy),
-		session.WithVramAdmission(vramAdmission))
+		session.WithVramAdmission(vramAdmission),
+		session.WithReadinessStaleSecs(int(cfg.ReadinessStaleSecs)))
 
 	// The only thing that deletes session telemetry. On the dispatcher rather than
 	// its own ticker so it is single-flight across control-plane instances.
@@ -537,6 +543,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		WithTrustedProxies(cfg.TrustedProxies)
 	crudHandler := crud.NewHandler(pool, auditStore)
 	crudHandler.SetRegistry(agentRegistry) // lets DELETE /v1/hosts/{id} check live connectivity
+	crudHandler.SetReadinessStaleSecs(int(cfg.ReadinessStaleSecs))
 	sessionHandler := session.NewHandler(coordinator, sessionStore, auditStore).
 		WithPublicBaseURL(cfg.PublicBaseURL).
 		WithICEServers(cfg.ICEServers)

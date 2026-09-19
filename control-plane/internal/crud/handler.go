@@ -15,6 +15,7 @@ import (
 
 	"github.com/accreleus/quasar/control-plane/internal/auth"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
+	"github.com/accreleus/quasar/control-plane/internal/readiness"
 )
 
 // RegistryChecker avoids an agentws import here (agentws imports session, which
@@ -53,6 +54,15 @@ func (h *Handler) recordActivity(r *http.Request, action, targetType, targetID s
 	user, _ := auth.UserFromContext(r.Context())
 	if err := h.auditor.Record(r.Context(), user.ID, action, targetType, targetID, details); err != nil {
 		slog.Warn("record admin activity failed", "action", action, "err", err)
+	}
+}
+
+// SetReadinessStaleSecs gives the host read path the same freshness window the
+// session store gates on (QUASAR_READINESS_STALE_SECS). Call once after
+// NewHandler; <= 0 keeps the default.
+func (h *Handler) SetReadinessStaleSecs(n int) {
+	if n > 0 {
+		h.store.readinessStaleSecs = int32(n)
 	}
 }
 
@@ -167,13 +177,17 @@ type hostResp struct {
 	Storage  json.RawMessage `json:"storage"`
 	CPUModel *string         `json:"cpu_model"`
 	// Readiness (openapi.yaml Host.readiness, required): opaque array of
-	// {id, status, summary, remediation} the agent owns end to end. Advisory —
-	// a failing check never blocked registration.
+	// {id, status, summary, remediation} the agent owns end to end.
+	// Registration is never gated by it; a launch may be (amendment 11).
 	Readiness json.RawMessage `json:"readiness"`
 	// ReadinessReportedAt: freshness of that set, so the UI can flag it stale.
 	ReadinessReportedAt *string `json:"readiness_reported_at"`
-	CapacityDetection   string  `json:"capacity_detection"`
-	CapacityReason      *string `json:"capacity_reason"`
+	// ReadinessGate/ReadinessOverrides (openapi.yaml Host, both required):
+	// always serialized, and the arrays are never null.
+	ReadinessGate      ReadinessGate       `json:"readiness_gate"`
+	ReadinessOverrides []ReadinessOverride `json:"readiness_overrides"`
+	CapacityDetection  string              `json:"capacity_detection"`
+	CapacityReason     *string             `json:"capacity_reason"`
 	// AgentConnectedSince/AgentRestartCount/AgentLastRestartAt (#429 follow-on):
 	// not yet in protocol/openapi.yaml (see store.go's Host doc comment).
 	// null/0 until the host's first connect.
@@ -305,6 +319,16 @@ func hostToResp(h Host) hostResp {
 		s := h.ReadinessReportedAt.Format("2006-01-02T15:04:05Z07:00")
 		readinessAt = &s
 	}
+	// A host built without the store's read path (a never-reported host, or a
+	// caller that did not go through getHost/listHosts) still serves the
+	// contract's shape rather than a null state and a null array.
+	gate := h.ReadinessGate
+	if gate.State == "" {
+		gate.State = readiness.StateAbstaining
+	}
+	if gate.Blocking == nil {
+		gate.Blocking = []readiness.Blocking{}
+	}
 	// Identity's built_at is served UTC: the agent sends RFC3339, the column is
 	// timestamptz, and a client rendering "built 3 days ago" should not have to
 	// reason about the control plane's local zone.
@@ -326,6 +350,9 @@ func hostToResp(h Host) hostResp {
 		CPUModel:            h.CPUModel,
 		Readiness:           h.Readiness,
 		ReadinessReportedAt: readinessAt,
+		ReadinessGate:       gate,
+		// #263 serves the stored rows; until then the field exists and is empty.
+		ReadinessOverrides:  []ReadinessOverride{},
 		CapacityDetection:   h.CapacityDetection,
 		CapacityReason:      h.CapacityReason,
 		Capacity:            h.Capacity,

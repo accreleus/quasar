@@ -23,7 +23,11 @@ var (
 	// not "everything is busy". 503 no_host_available.
 	ErrNoHostAvailable = errors.New("no host available")
 	// Totals suffice but derived availability does not. 503, retryable.
-	ErrCapacityExhausted    = errors.New("capacity exhausted")
+	ErrCapacityExhausted = errors.New("capacity exhausted")
+	// The evidence-gated readiness filter is the sole reason nothing could be
+	// placed (control-api.md "Evidence-gated readiness"). 503, retryable, with
+	// no Retry-After: it clears when an admin acts, not on a timer.
+	ErrHostNotReady         = errors.New("host not ready")
 	ErrSessionQuotaExceeded = errors.New("session quota exceeded") // 409, retryable
 	ErrProfileUnknown       = errors.New("unknown stream profile") // 400
 	// Hard eligibility failure, or a non-user-facing profile without an
@@ -116,6 +120,9 @@ type Store struct {
 	// vram is the live free-VRAM veto tuning (#383). The zero value has the veto
 	// OFF, so a Store built without WithVramAdmission is fail-open, slots-only.
 	vram VramAdmission
+	// readiness is the evidence-gated readiness filter's freshness window.
+	// NewStore always defaults it: unlike the veto, the gate has no off switch.
+	readiness ReadinessAdmission
 	// tel is a separate module on the same pool: this Store owns the sessions
 	// table and the trust boundary, internal/telemetry owns observability storage
 	// and its retention.
@@ -132,6 +139,9 @@ func NewStore(pool *pgxpool.Pool, opts ...StoreOption) *Store {
 	// ordering's freshness gate reads the staleness window even with the veto off,
 	// and `make_interval(secs => 0)` would mark every sample stale.
 	s.vram = s.vram.normalize()
+	if !s.readiness.enabled() {
+		s.readiness = ReadinessAdmission{StaleSecs: defaultReadinessStaleSecs}
+	}
 	return s
 }
 

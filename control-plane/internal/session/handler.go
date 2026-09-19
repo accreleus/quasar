@@ -482,6 +482,12 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable,
 			"no host is available to serve this launch")
 		return
+	// Names no check, scope, GPU or host: readiness detail is admin-only and
+	// lives on the host body. No Retry-After — an admin, not time, clears it.
+	case errors.Is(err, ErrHostNotReady):
+		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeHostNotReady,
+			"the host that would run this needs its administrator's attention; try again once they have looked at it")
+		return
 	case errors.Is(err, ErrCapacityExhausted):
 		// The encode-slot reservation holds through `stopping` (#489 overlap
 		// prevention; never shorten it to make this header smaller), so a relaunch

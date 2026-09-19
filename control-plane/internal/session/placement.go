@@ -161,10 +161,64 @@ func WithVramAdmission(v VramAdmission) StoreOption {
 	return func(s *Store) { s.vram = v.normalize() }
 }
 
+// ReadinessAdmission tunes the evidence-gated readiness filter: the freshness
+// window, from QUASAR_READINESS_STALE_SECS.
+//
+// The zero value renders no clause at all. That is not an operator-facing kill
+// switch — the contract defines none, and NewStore always defaults the window —
+// it is what keeps the pre-gate SQL anchors reachable from a test-built
+// candidacy (TestAdmissionSQLMatchesPreRefactor).
+type ReadinessAdmission struct {
+	StaleSecs int32
+}
+
+// defaultReadinessStaleSecs is the contract's default: four missed 15 s reports.
+const defaultReadinessStaleSecs = 60
+
+func (r ReadinessAdmission) enabled() bool { return r.StaleSecs > 0 }
+
+// WithReadinessStaleSecs sets the gate's freshness window in seconds; <= 0 is
+// the default, never "off".
+func WithReadinessStaleSecs(n int) StoreOption {
+	return func(s *Store) {
+		if n <= 0 {
+			n = defaultReadinessStaleSecs
+		}
+		s.readiness = ReadinessAdmission{StaleSecs: int32(n)}
+	}
+}
+
+// readinessGateSQL renders the evidence-gated readiness filter (control-api.md
+// "Evidence-gated readiness"). staleIdx is a placeholder index, not a value.
+//
+// Exactly one renderer, for the same reason as vramVetoSQL: a pick / re-check
+// divergence burns all 50 attempts and reports a spurious capacity error.
+//
+// Fails open on absent or stale evidence — a host that has gone quiet is
+// already excluded by not being `online`, and stale evidence must not strand a
+// fleet. `make_interval(secs => $n::int)` with an integer parameter, never
+// `$n::interval`: a NULL interval would make the clause NULL, which WHERE and
+// HAVING treat as false — fail-closed, the exact inversion.
+//
+// The homes term is rendered only for a launch that mounts a managed home, so
+// no parameter is bound that the statement does not reference.
+func readinessGateSQL(staleIdx int, managedHome bool) string {
+	homes := ""
+	if managedHome {
+		homes = " OR h.readiness_block_homes"
+	}
+	return fmt.Sprintf(`(
+	     h.readiness IS NULL
+	  OR h.readiness_reported_at IS NULL
+	  OR h.readiness_reported_at < now() - make_interval(secs => $%d::int)
+	  OR NOT (h.readiness_block_host OR g.readiness_blocked%s)
+	)`, staleIdx, homes)
+}
+
 // vramVetoSQL renders the live-VRAM veto (#383 §4.1). staleSecs/minFree/inflight
 // are placeholder indices, not values.
 //
-// Exactly ONE renderer: ScheduleAndCreate terminates only if the candidate query
+// Exactly one renderer: ScheduleAndCreate terminates only if the candidate query
 // and the under-lock re-check apply the same predicate, and a divergence picks
 // then rejects a GPU under its own lock forever, burning all 50 attempts for a
 // spurious capacity_exhausted on an idle fleet. Its single caller,
@@ -180,7 +234,7 @@ func WithVramAdmission(v VramAdmission) StoreOption {
 //
 // `make_interval(secs => $n::int)` with an integer parameter, never
 // `$n::interval`: a NULL interval makes the clause NULL, which HAVING treats as
-// false — fail-CLOSED, the exact inversion of the property above.
+// false — fail-closed, the exact inversion of the property above.
 //
 // The in-flight debit keys on started_at, not assigned_at: a session admitted at
 // t0 has allocated nothing when the t0+3s sample is taken, and an assigned_at

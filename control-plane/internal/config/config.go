@@ -17,6 +17,10 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/telemetry"
 )
 
+// defaultReadinessStaleSecs is the contract's default readiness-gate window:
+// four missed 15 s reports. It must match session.defaultReadinessStaleSecs.
+const defaultReadinessStaleSecs = 60
+
 // Config holds control-plane configuration read from the environment.
 // Defaults and accepted values: docs/configuration.md.
 type Config struct {
@@ -65,6 +69,12 @@ type Config struct {
 	// Freshness window (older sample => the veto abstains) and the in-flight
 	// debit's grace margin. 20s = 4x heartbeat, matching readDeadlineDur.
 	VramStalenessSecs int32 // QUASAR_VRAM_STALENESS_SECS (default 20)
+
+	// Freshness window of the evidence-gated readiness filter: an older report
+	// makes the gate abstain. Unparseable or <= 0 warns and keeps the default —
+	// the contract defines no way to switch the gate off, so this must never
+	// become one.
+	ReadinessStaleSecs int32 // QUASAR_READINESS_STALE_SECS (default 60)
 
 	// Seeds instance_settings.registration_mode on first boot only (LP-SEC-01).
 	RegistrationMode string // REGISTRATION_MODE
@@ -307,6 +317,17 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	c.VramStalenessSecs = staleness
+
+	c.ReadinessStaleSecs = defaultReadinessStaleSecs
+	if v := os.Getenv("QUASAR_READINESS_STALE_SECS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			slog.Warn("ignoring QUASAR_READINESS_STALE_SECS: not a positive integer",
+				"value", v, "using_default_secs", defaultReadinessStaleSecs)
+		} else {
+			c.ReadinessStaleSecs = int32(n)
+		}
+	}
 
 	c.RegistrationMode = os.Getenv("REGISTRATION_MODE")
 	c.PublicBaseURL = os.Getenv("PUBLIC_BASE_URL")

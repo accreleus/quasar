@@ -34,6 +34,10 @@ var ErrCoverURLOwnedByArtwork = errors.New("cover_url is owned by the artwork se
 // store is the CRUD data-access layer over the pgx pool.
 type store struct {
 	pool *pgxpool.Pool
+	// readinessStaleSecs is the readiness gate's freshness window; it must be
+	// the value the session store gates on, or a host reads `active` here while
+	// admission abstains. <= 0 means the default.
+	readinessStaleSecs int32
 }
 
 // App is the domain view of an app/library entry (public + admin views use the same shape).
@@ -119,13 +123,18 @@ type Host struct {
 	// CPUModel: agent-reported marketing name, null until reported.
 	CPUModel *string `json:"cpu_model"`
 	// Readiness: raw JSONB, stored and served opaquely (agent-owned) so a new
-	// check needs no control-plane change. Advisory — nothing schedules on it.
+	// check needs no control-plane change.
 	Readiness json.RawMessage `json:"readiness"`
 	// ReadinessReportedAt: freshness of that set (kept-if-absent, so it can go stale).
 	ReadinessReportedAt *time.Time `json:"readiness_reported_at"`
-	CapacityDetection   string     `json:"capacity_detection"`
-	CapacityReason      *string    `json:"capacity_reason"`
-	CreatedAt           time.Time  `json:"created_at"`
+	// ReadinessGate: the verdict, recomputed at read time from Readiness and the
+	// host's overrides by the same function that wrote the scheduling columns,
+	// so the two cannot disagree. `state` is judged against the database's clock
+	// and the window admission uses.
+	ReadinessGate     ReadinessGate `json:"readiness_gate"`
+	CapacityDetection string        `json:"capacity_detection"`
+	CapacityReason    *string       `json:"capacity_reason"`
+	CreatedAt         time.Time     `json:"created_at"`
 	// AgentConnectedSince/AgentRestartCount/AgentLastRestartAt (#429, migration
 	// 0067): surfaces a container silently revived by Docker's `unless-stopped`.
 	// Derived server-side in agentws.reconnectHost from WS timing, not
@@ -1136,7 +1145,7 @@ func (s *store) listHosts(ctx context.Context, cursor string, limit int32) ([]Ho
 	rows, err := s.pool.Query(ctx, `
 		SELECT id::text, node_name, status, agent_version, cpu_cores, mem_mb,
 		       last_registered_at, last_heartbeat_at, storage, cpu_model,
-		       readiness, readiness_reported_at,
+		       readiness, readiness_reported_at, now(),
 		       capacity_detection, capacity_reason, created_at,
 		       agent_process_started_at, agent_restart_count, agent_last_restart_at,
 		       source_commit, built_at, install_mode, updater_present
@@ -1150,12 +1159,13 @@ func (s *store) listHosts(ctx context.Context, cursor string, limit int32) ([]Ho
 	defer rows.Close()
 
 	var hosts []Host
+	var dbNow time.Time
 	for rows.Next() {
 		var h Host
 		var rawStorage, rawReadiness []byte
 		if err := rows.Scan(&h.ID, &h.NodeName, &h.Status, &h.AgentVersion,
 			&h.CPUCores, &h.MemMB, &h.LastRegistered, &h.LastHeartbeat, &rawStorage, &h.CPUModel,
-			&rawReadiness, &h.ReadinessReportedAt,
+			&rawReadiness, &h.ReadinessReportedAt, &dbNow,
 			&h.CapacityDetection, &h.CapacityReason, &h.CreatedAt,
 			&h.AgentConnectedSince, &h.AgentRestartCount, &h.AgentLastRestartAt,
 			&h.SourceCommit, &h.BuiltAt, &h.InstallMode, &h.UpdaterPresent); err != nil {
@@ -1178,6 +1188,9 @@ func (s *store) listHosts(ctx context.Context, cursor string, limit int32) ([]Ho
 	if err := s.attachCapacities(ctx, hosts); err != nil {
 		return nil, "", err
 	}
+	if err := s.attachReadinessGates(ctx, hosts, dbNow); err != nil {
+		return nil, "", err
+	}
 	return hosts, nextCursor, nil
 }
 
@@ -1185,17 +1198,18 @@ func (s *store) listHosts(ctx context.Context, cursor string, limit int32) ([]Ho
 func (s *store) getHost(ctx context.Context, id string) (Host, error) {
 	var h Host
 	var rawStorage, rawReadiness []byte
+	var dbNow time.Time
 	err := s.pool.QueryRow(ctx, `
 		SELECT id::text, node_name, status, agent_version, cpu_cores, mem_mb,
 		       last_registered_at, last_heartbeat_at, storage, cpu_model,
-		       readiness, readiness_reported_at,
+		       readiness, readiness_reported_at, now(),
 		       capacity_detection, capacity_reason, created_at,
 		       agent_process_started_at, agent_restart_count, agent_last_restart_at,
 		       source_commit, built_at, install_mode, updater_present
 		FROM hosts WHERE id::text = $1
 	`, id).Scan(&h.ID, &h.NodeName, &h.Status, &h.AgentVersion,
 		&h.CPUCores, &h.MemMB, &h.LastRegistered, &h.LastHeartbeat, &rawStorage, &h.CPUModel,
-		&rawReadiness, &h.ReadinessReportedAt,
+		&rawReadiness, &h.ReadinessReportedAt, &dbNow,
 		&h.CapacityDetection, &h.CapacityReason, &h.CreatedAt,
 		&h.AgentConnectedSince, &h.AgentRestartCount, &h.AgentLastRestartAt,
 		&h.SourceCommit, &h.BuiltAt, &h.InstallMode, &h.UpdaterPresent)
@@ -1214,7 +1228,11 @@ func (s *store) getHost(ctx context.Context, id string) (Host, error) {
 	if c, ok := caps[h.ID]; ok {
 		h.Capacity = &c
 	}
-	return h, nil
+	one := []Host{h}
+	if err := s.attachReadinessGates(ctx, one, dbNow); err != nil {
+		return Host{}, err
+	}
+	return one[0], nil
 }
 
 // deleteApp hard-deletes an app in one transaction: 404 if absent, 409 on any

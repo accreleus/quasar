@@ -21,6 +21,7 @@ const (
 	CodeRateLimited            = "rate_limited"             // 429
 	CodeNoHostAvailable        = "no_host_available"        // 503, retryable
 	CodeCapacityExhausted      = "capacity_exhausted"       // 503, retryable
+	CodeHostNotReady           = "host_not_ready"           // 503, retryable, no Retry-After
 	CodeSessionQuota           = "session_quota_exceeded"   // 409
 	CodeSessionNotSwappable    = "session_not_swappable"    // 409
 	CodeSwapExceedsReservation = "swap_exceeds_reservation" // 409

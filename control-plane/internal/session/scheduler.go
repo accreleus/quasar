@@ -261,7 +261,7 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	// indices come from `candidacy` (admission_query.go), the same object the
 	// under-lock re-check and the rejection classifier use.
 	veto := s.vramVeto(p)
-	cand := candidacy{p: p, veto: veto}
+	cand := candidacy{p: p, veto: veto, readiness: s.readiness}
 
 	candidateSQL, candidateArgs := cand.candidateQuery(s.policy)
 	var gpuID, hostID string
@@ -402,6 +402,15 @@ func classifyReject(ctx context.Context, tx pgx.Tx, cand candidacy) error {
 	if !totalsFit {
 		return ErrNoHostAvailable
 	}
+	// Readiness is diagnosed here, in the position of the veto diagnostic and
+	// never inside totalsQuery, and only claims the refusal when it is the sole
+	// reason: a ready host that is full is capacity_exhausted even when some
+	// other host is blocked, because the caller's remedy is still to retry.
+	if cand.readiness.enabled() {
+		if err := readinessRejection(ctx, tx, cand); err != nil {
+			return err
+		}
+	}
 	// Totals fit, so something transient refused it. If the veto did, attach the
 	// numbers: otherwise a misconfigured floor is indistinguishable from plain
 	// slot exhaustion and becomes an unexplainable 503.
@@ -411,6 +420,69 @@ func classifyReject(ctx context.Context, tx pgx.Tx, cand candidacy) error {
 		}
 	}
 	return ErrCapacityExhausted
+}
+
+// ReadinessBlockedCandidate is one GPU the readiness gate excluded that would
+// otherwise have been picked, with which scope did it.
+type ReadinessBlockedCandidate struct {
+	GPUID      string
+	HostID     string
+	GPUIndex   int32
+	BlockHost  bool
+	BlockHomes bool
+	GPUBlocked bool
+}
+
+// HostNotReadyRejection carries the per-GPU evidence for a readiness refusal. It
+// unwraps to ErrHostNotReady, so the status mapping is unchanged; the detail is
+// for the launcher's structured log and never for the response, which must name
+// no check, scope, GPU or host.
+type HostNotReadyRejection struct {
+	err        error
+	Candidates []ReadinessBlockedCandidate
+}
+
+func (e *HostNotReadyRejection) Error() string {
+	return fmt.Sprintf("%v (the readiness gate excluded %d otherwise-eligible GPU(s))", e.err, len(e.Candidates))
+}
+
+func (e *HostNotReadyRejection) Unwrap() error { return e.err }
+
+// readinessRejection returns the host_not_ready refusal when readiness is the
+// sole reason nothing was placed, and nil otherwise — including on its own
+// query failure, where falling through to the existing classification is the
+// fail-open choice: a wrong code is worse than a coarse one.
+//
+// Two facts decide it. The gate excluded a GPU that would otherwise have been
+// picked (readinessDiagQuery), AND no GPU the gate leaves eligible could serve
+// the request at all (readinessTotalsQuery). The second is what keeps "a ready
+// host is full while another is blocked" at capacity_exhausted.
+func readinessRejection(ctx context.Context, tx pgx.Tx, cand candidacy) error {
+	diagSQL, diagArgs := cand.readinessDiagQuery()
+	rows, err := tx.Query(ctx, diagSQL, diagArgs...)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var blocked []ReadinessBlockedCandidate
+	for rows.Next() {
+		var c ReadinessBlockedCandidate
+		if err := rows.Scan(&c.GPUID, &c.HostID, &c.GPUIndex,
+			&c.BlockHost, &c.BlockHomes, &c.GPUBlocked); err != nil {
+			return nil
+		}
+		blocked = append(blocked, c)
+	}
+	if rows.Err() != nil || len(blocked) == 0 {
+		return nil
+	}
+
+	totalsSQL, totalsArgs := cand.readinessTotalsQuery()
+	var eligibleFit bool
+	if err := tx.QueryRow(ctx, totalsSQL, totalsArgs...).Scan(&eligibleFit); err != nil || eligibleFit {
+		return nil
+	}
+	return &HostNotReadyRejection{err: ErrHostNotReady, Candidates: blocked}
 }
 
 // VramVetoCandidate is one GPU that had free encode slots and was refused by the

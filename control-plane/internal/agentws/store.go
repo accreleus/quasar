@@ -409,6 +409,13 @@ func (s *agentStore) upsertCapacityWithDetection(ctx context.Context, hostID str
 		return fmt.Errorf("remove stale gpus: %w", err)
 	}
 
+	// After the GPU set is settled: a GPU row that appears here starts
+	// readiness_blocked = false, and without this it would stay schedulable
+	// until the next readiness report even though the stored one names it.
+	if err := recomputeReadinessVerdict(ctx, tx, hostID); err != nil {
+		return err
+	}
+
 	return tx.Commit(ctx)
 }
 
@@ -444,7 +451,13 @@ func (s *agentStore) replaceHostIdentity(ctx context.Context, hostID string, id 
 // agent's raw bytes are stored verbatim, never re-encoded — re-encoding would
 // drop per-check fields a newer agent sends (see RegisterMsg.Readiness).
 // readiness_reported_at stamps every real report, not only changes, so a stale
-// set cannot present as live. Advisory; nothing schedules on it.
+// set cannot present as live.
+//
+// Transactional since amendment 11: the UPDATE takes the host's row lock and
+// recomputeReadinessVerdict derives the scheduling columns under it, so an
+// override change and a report serialise and the columns can never describe a
+// state older than the stored report. A kept-if-absent or malformed report
+// writes nothing and derives nothing.
 func (s *agentStore) upsertHostReadiness(ctx context.Context, hostID string, raw json.RawMessage) error {
 	if raw == nil {
 		return nil // keep-if-absent
@@ -452,12 +465,21 @@ func (s *agentStore) upsertHostReadiness(ctx context.Context, hostID string, raw
 	if _, ok := ValidReadiness(raw); !ok {
 		return fmt.Errorf("malformed readiness payload (%d bytes); not stored", len(raw))
 	}
-	if _, err := s.pool.Exec(ctx,
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if _, err := tx.Exec(ctx,
 		`UPDATE hosts SET readiness = $2, readiness_reported_at = now() WHERE id = $1`,
 		hostID, []byte(raw)); err != nil {
 		return fmt.Errorf("update host readiness: %w", err)
 	}
-	return nil
+	if err := recomputeReadinessVerdict(ctx, tx, hostID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // upsertHostCodecs writes hosts.codecs (multi-codec spec §3.1.2).

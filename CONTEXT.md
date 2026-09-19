@@ -351,6 +351,14 @@ despite one named failing readiness check. It never hides the check, applies to
 that check only, and ends when the check next passes. _Avoid_: "ignore",
 "suppress", "acknowledge".
 
+**Readiness gate** — the control plane's use of a host's readiness report at
+admission: a failing check that carries `blocks` excludes the host, the launches
+that mount a home, or one GPU, and only while the report is fresh. On a stale or
+absent report the gate *abstains* and excludes nothing. The blocked scopes are
+derived once per report and per override change, never parsed at launch time.
+_Avoid_: "readiness check" for the gate (a check is one verdict; the gate is
+what admission does with them), "health gate".
+
 **Diagnostic registration** — a host that is connected and visible in the
 console while it refuses every launch, because its container runtime is
 unusable or its startup cleanup has not yet succeeded.

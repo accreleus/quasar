@@ -271,6 +271,7 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	sess, err := c.store.ScheduleAndCreate(ctx, p)
 	if err != nil {
 		c.logVramVetoRejection(userID, app.ID, err)
+		c.logHostNotReadyRejection(userID, app.ID, err)
 		return LaunchResult{}, err
 	}
 	c.log.Info("session assigned", "session_id", sess.ID, "host_id", deref(sess.HostID), "gpu_index", derefI32(sess.GPUIndex),
@@ -626,6 +627,27 @@ func (c *Coordinator) logVramVetoRejection(userID, appID string, err error) {
 			attrs = append(attrs, "sample_age_ms", *g.SampleAgeMs)
 		}
 		c.log.Warn("admission: live free-VRAM veto refused a GPU with free encode slots", attrs...)
+	}
+}
+
+// logHostNotReadyRejection makes a readiness refusal diagnosable: the response
+// deliberately names nothing, so this is the only place the excluded GPUs and
+// the scope that excluded them appear. A nil or non-readiness error is a no-op.
+func (c *Coordinator) logHostNotReadyRejection(userID, appID string, err error) {
+	var rej *HostNotReadyRejection
+	if !errors.As(err, &rej) {
+		return
+	}
+	for _, g := range rej.Candidates {
+		c.log.Warn("admission: the readiness gate excluded a GPU that would otherwise have been picked",
+			"user_id", userID,
+			"app_id", appID,
+			"gpu_id", g.GPUID,
+			"host_id", g.HostID,
+			"gpu_index", g.GPUIndex,
+			"readiness_block_host", g.BlockHost,
+			"readiness_block_homes", g.BlockHomes,
+			"readiness_blocked_gpu", g.GPUBlocked)
 	}
 }
 

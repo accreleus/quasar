@@ -233,6 +233,13 @@ export function presentLaunchError<T extends HomeApp & { name: string }>(
       body: "No host available right now — try again shortly.",
     };
   }
+  if (code === "host_not_ready") {
+    return {
+      variant: "info",
+      title: "This host isn't ready",
+      body: "The host that would run this needs its administrator's attention. Ask your admin to check the host's readiness, then try again.",
+    };
+  }
   // #525: fallback body must never be empty — a "" body renders a titled toast
   // that says nothing. Every other code uses its server-authored message.
   return {

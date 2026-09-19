@@ -54,6 +54,18 @@ own; the two do not move together, and that is deliberate.
   observation time, the source, and a "blocks launches" marker; `nvidia_driver_mount` and
   `host_container_mounts` moved out of the card's "Other" group. Nothing blocks a launch
   yet (that arrives with #262). An older agent's report renders exactly as before.
+- **A failing evidence-based readiness check now blocks the launches it affects (#262).**
+  On each readiness report the control plane works out which scopes are blocked (the whole
+  host, launches that mount a managed home, or one GPU) and admission skips a blocked host
+  or GPU in favour of a ready one. Only a check that carries `blocks` and is failing can
+  block — proxy checks, warnings and `unknown` never do. The gate ignores a report older
+  than `QUASAR_READINESS_STALE_SECS` (default 60) or a host that has never reported, so
+  stale evidence cannot strand a fleet. When readiness is the only reason nothing qualified
+  the launch is refused with a new retryable `503 host_not_ready` and the user is told the
+  host needs its administrator's attention, without naming a check. The host body gains
+  `readiness_gate` and `readiness_overrides`. Migration 0085 adds the derived columns and
+  the (not yet used) override table; once applied, never roll the control plane back below
+  it. Swapping apps in a running session is not gated.
 
 ### Removed
 - **The node agent no longer needs a `docker` or `podman` executable (#239).** Every

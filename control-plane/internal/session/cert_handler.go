@@ -611,6 +611,7 @@ func (c *Coordinator) launchCertCell(
 	sess, schedErr := c.store.ScheduleAndCreate(ctx, p)
 	if schedErr != nil {
 		c.logVramVetoRejection(userID, diagAppID, schedErr)
+		c.logHostNotReadyRejection(userID, diagAppID, schedErr)
 		return certCellLaunchOut{}, fmt.Errorf("schedule failed: %w", schedErr)
 	}
 	sessionID := sess.ID
