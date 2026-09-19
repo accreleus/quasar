@@ -1,0 +1,7 @@
+install-a/host-body.json was read a few seconds after the stack was started again for final
+collection, before the host probes had reported on a later capacity report. It therefore
+lists five checks with `blocks` and no media_probe_gpu1 / application_gpu_probe_gpu1.
+That is capture timing, not a product fact: readiness-card-console.txt and
+readiness-card-wizard.txt, captured earlier on the same install, both show the two GPU
+probes passing with the "can block launches" marker (seven markers in all), and run C shows
+the same two probes passing under the VA encoder.

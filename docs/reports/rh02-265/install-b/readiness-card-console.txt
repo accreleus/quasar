@@ -1,0 +1,267 @@
+URL https://<addr>:8443/admin/fleet/hosts/<uuid>
+QUASAR
+Search hosts, sessions, apps, users…
+⌘K
+AD
+admin
+Overview
+Sessions
+Fleet
+Library
+Streaming
+People
+Audit log
+Settings
+Collapse
+Fleet
+ab9d766f
+quasar-node-1
+
+AMD Ryzen 9 9950X3D 16-Core Processor · 91.9 GB
+
+ONLINE
+Local console
+Drain
+Settings
+Capacity
+2 GPUS
+0 SESSIONS
+0%
+GeForce RTX 5090
+nvidia
+0 ACTIVE
+VRAM
+34 MB / 31.8 GB
+SLOTS
+0 / 2
+1%
+Granite Ridge [Radeon Graphics]
+amd
+0 ACTIVE
+VRAM
+15 MB / 2 GB
+SLOTS
+0 / 2
+n/a
+Memory
+91.9 GB
+USED
+—
+CPU
+—
+57%
+Storage
+agent-data
+Managed homes
+USED
+2.1 TB / 3.6 TB
+FREE
+1.6 TB
+Node ID	<uuid>
+CPU	AMD Ryzen 9 9950X3D 16-Core Processor · 32 cores
+Agent	dev
+Commit	97fd0d9b93e1
+Built	9h 31m
+Install	Registry
+Updater	Present
+Agent uptime	38m
+Heartbeat	3 seconds ago
+Uptime	n/a
+Scheduling	accepting sessions
+Sessions on this host
+0
+No sessions
+
+This host is not running anything right now.
+
+Readiness
+Last reported 9/19/2026, 2:03:32 PM
+
+Readiness is what this host can establish about itself. It does not show whether a browser can reach the host; that depends on the network between them.
+
+CONTAINER RUNTIME
+runtime endpoint
+CAN BLOCK LAUNCHES
+
+Docker Engine - Community 29.8.1 at unix:///var/run/docker.sock answers
+
+Observed 9/19/2026, 2:03:32 PM · container runtime
+
+runtime api version
+
+API 1.53 negotiated with Docker Engine - Community 29.8.1 (the engine offers 1.40-1.56; this agent needs at least 1.40)
+
+Observed 9/19/2026, 2:03:32 PM · container runtime
+
+runtime capabilities
+
+Docker Engine - Community 29.8.1 on Fedora Linux 43 (Container Image) (x86_64), cgroup v2; security options: name=seccomp,profile=builtin, name=cgroupns; runtimes: io.containerd.runc.v2, nvidia, runc (default runc); as stated by the engine, not exercised
+
+Observed 9/19/2026, 2:03:32 PM · container runtime
+
+runtime cdi
+
+CDI is enabled (spec dirs: /etc/cdi, /var/run/cdi); devices discovered: nvidia.com/gpu=0 (cdi), nvidia.com/gpu=GPU-<uuid> (cdi), nvidia.com/gpu=all (cdi); GPU injection does not use CDI
+
+Observed 9/19/2026, 2:03:32 PM · container runtime
+
+host container mounts
+
+Required sibling-container paths agree with their host bind mounts
+
+Observed 9/19/2026, 2:03:32 PM · local check
+
+GPU & DISPLAY
+media probe gpu0
+CAN BLOCK LAUNCHES
+
+GPU 0 composited and encoded frames: encoded 31 frames with vulkanh264enc on /dev/dri/renderD128
+
+Observed 9/19/2026, 2:03:06 PM · host probe
+
+application gpu probe gpu0
+CAN BLOCK LAUNCHES
+
+An application container opened GPU 0: /lib64/libEGL.so.1 (opened /dev/dri/renderD128)
+
+Observed 9/19/2026, 2:03:07 PM · host probe
+
+render node
+
+render node open-able (/dev/dri/renderD128)
+
+Observed 9/19/2026, 2:03:32 PM · local check
+
+host render node
+
+host kernel created 2 DRM render node(s)
+
+Observed 9/19/2026, 2:03:32 PM · local check
+
+dri node app access
+
+all 2 /dev/dri node(s) are openable by the app user
+
+Observed 9/19/2026, 2:03:32 PM · local check
+
+encoder codecs
+
+encoder advertises h264, h265, av1
+
+Observed 9/19/2026, 2:03:32 PM · local check
+
+NVIDIA DRIVER
+nvidia egl vendor json
+
+EGL vendor config present (/opt/quasar/nvidia-driver/glvnd/egl_vendor.d/10_nvidia.json) — provisioned by Quasar (driver volume, v610.57.04)
+
+Observed 9/19/2026, 2:03:32 PM · local check
+
+nvidia eglcore library
+
+libnvidia-eglcore resolvable (/opt/quasar/nvidia-driver/lib64/libnvidia-eglcore.so.610.57.04) — provisioned by Quasar (driver volume, v610.57.04)
+
+Observed 9/19/2026, 2:03:32 PM · local check
+
+nvidia lib32 gl
+
+32-bit NVIDIA GL present (/var/lib/docker/volumes/deploy_quasar-nvidia-driver/_data/lib32)
+
+Observed 9/19/2026, 2:03:32 PM · local check
+
+driver volume version
+
+driver volume matches the running kernel module (v610.57.04)
+
+Observed 9/19/2026, 2:03:32 PM · local check
+
+Vulkan AV1 compatibility
+
+RTX 5090 with NVIDIA 610.57.04: Vulkan AV1 was validated on this GPU/driver combination. Codec availability still depends on the configured encoder and installed elements.
+
+Observed 9/19/2026, 2:03:32 PM · local check
+
+INPUT & SANDBOX
+input probe
+CAN BLOCK LAUNCHES
+
+Virtual input devices were created: created keyboard, mouse and gamepad devices and wrote events
+
+Observed 9/19/2026, 2:03:02 PM · host probe
+
+uinput
+
+/dev/uinput present and writable
+
+Observed 9/19/2026, 2:03:32 PM · local check
+
+user namespaces
+
+user namespaces available (max 376055)
+
+Observed 9/19/2026, 2:03:32 PM · local check
+
+AUDIO
+audio probe
+CAN BLOCK LAUNCHES
+
+The audio sidecar started: its socket appeared
+
+Observed 9/19/2026, 2:03:03 PM · host probe
+
+STORAGE
+homes root writable
+CAN BLOCK LAUNCHES
+
+the agent (QUASAR_APP_PUID unset) created, wrote and removed a test home under /var/lib/quasar/homes
+
+Observed 9/19/2026, 2:03:32 PM · local check
+
+homes free space
+CAN BLOCK LAUNCHES
+
+1593.7 GiB free of 3726 GiB under /var/lib/quasar/homes (floor 5 GiB)
+
+Observed 9/19/2026, 2:03:32 PM · local check
+
+template free space
+
+1593.7 GiB free of 3726 GiB under /var/lib/quasar/templates (floor 5 GiB)
+
+Observed 9/19/2026, 2:03:32 PM · local check
+
+NETWORK
+media reachability
+
+this host's inbound firewall filters nothing (nft answered: no input hook chain in the ruleset) — the host itself would not block inbound WebRTC media
+
+Observed 9/19/2026, 2:03:32 PM · local check
+
+UPDATES
+updater socket
+
+Updater 7e5f85998448432f4067eb4a15a188b8effacc51 answered on its socket
+
+Observed 9/19/2026, 2:03:32 PM · local check
+
+updater stack dir
+
+Updater acts on /home/<user>/quasar/deploy (2 compose file(s))
+
+Observed 9/19/2026, 2:03:32 PM · local check
+
+updater overlays
+
+This agent was started with the updater's compose files
+
+Observed 9/19/2026, 2:03:32 PM · local check
+
+health addr bindable
+
+<addr>:9091 is answered by this agent
+
+Observed 9/19/2026, 2:03:32 PM · local check
+
+6 checks not applicable to this host
+
+The Restart agent action on this host's settings page re-runs these checks. Driver fixes (missing EGL or 32-bit libraries, for example) need the agent container recreated, not just restarted: redeploy the agent after a host-level fix, then restart to refresh this card.

@@ -1,0 +1,8 @@
+2026-09-19T14:04:32.153103Z  INFO quasar_node_agent::session::homes_gc: homes-gc: sweep of /var/lib/quasar/homes — scanned 1, candidates 0, deleted 0 (0.0 MiB, 0 empty), live 0, too-young 0, purged 0, errors 0
+2026-09-19T14:04:53.315135Z  INFO quasar_node_agent::session::homes_gc: homes-gc: sweep of /var/lib/quasar/homes — scanned 1, candidates 0, deleted 0 (0.0 MiB, 0 empty), live 0, too-young 0, purged 0, errors 0
+2026-09-19T23:22:39.466417Z  INFO quasar_node_agent::session::homes_gc: homes-gc: sweep of /var/lib/quasar/homes — scanned 1, candidates 0, deleted 0 (0.0 MiB, 0 empty), live 0, too-young 0, purged 0, errors 0
+deploy-quasar-postgres-1 sha256:81bd698b4594
+deploy-quasar-updater-1 sha256:4370cc08d578
+deploy-quasar-control-plane-1 sha256:949f566609ff
+deploy-quasar-node-agent-1 sha256:632e8e74498a
+85|f

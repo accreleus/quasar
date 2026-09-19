@@ -1,0 +1,24 @@
+deploy_quasar-nvidia-driver
+AGENT_UP_T0=2026-09-19T14:02:43Z
+ Container deploy-quasar-node-agent-1 Started 
+14:02:44 {"status":"offline","reg":"14:02:24","rep":"14:02:41","gate":"active","blocking":[],"prov":[]}
+14:02:45 {"status":"online","reg":"14:02:45","rep":"14:02:41","gate":"active","blocking":[],"prov":[]}
+14:02:46 {"status":"online","reg":"14:02:45","rep":"14:02:41","gate":"active","blocking":[],"prov":[]}
+14:02:47 {"status":"online","reg":"14:02:45","rep":"14:02:47","gate":"active","blocking":[],"prov":["nvidia_egl_vendor_json","nvidia_eglcore_library","nvidia_lib32_gl"]}
+14:02:49 {"status":"online","reg":"14:02:45","rep":"14:02:48","gate":"active","blocking":["media_probe_gpu0"],"prov":["nvidia_egl_vendor_json","nvidia_eglcore_library","nvidia_lib32_gl"]}
+14:02:50 {"status":"online","reg":"14:02:45","rep":"14:02:49","gate":"active","blocking":["media_probe_gpu0","application_gpu_probe_gpu0"],"prov":["nvidia_egl_vendor_json","nvidia_eglcore_library","nvidia_lib32_gl"]}
+14:02:51 {"status":"online","reg":"14:02:45","rep":"14:02:49","gate":"active","blocking":["media_probe_gpu0","application_gpu_probe_gpu0"],"prov":["nvidia_egl_vendor_json","nvidia_eglcore_library","nvidia_lib32_gl"]}
+14:02:52 {"status":"online","reg":"14:02:45","rep":"14:02:52","gate":"active","blocking":["media_probe_gpu0","application_gpu_probe_gpu0"],"prov":["nvidia_egl_vendor_json","nvidia_eglcore_library","nvidia_lib32_gl"]}
+14:02:53 {"status":"online","reg":"14:02:45","rep":"14:02:52","gate":"active","blocking":["media_probe_gpu0","application_gpu_probe_gpu0"],"prov":["nvidia_egl_vendor_json","nvidia_eglcore_library","nvidia_lib32_gl"]}
+14:02:54 {"status":"online","reg":"14:02:45","rep":"14:02:52","gate":"active","blocking":["media_probe_gpu0","application_gpu_probe_gpu0"],"prov":["nvidia_egl_vendor_json","nvidia_eglcore_library","nvidia_lib32_gl"]}
+14:02:55 {"status":"online","reg":"14:02:45","rep":"14:02:52","gate":"active","blocking":["media_probe_gpu0","application_gpu_probe_gpu0"],"prov":["nvidia_egl_vendor_json","nvidia_eglcore_library","nvidia_lib32_gl"]}
+14:02:56 {"status":"online","reg":"14:02:45","rep":"14:02:52","gate":"active","blocking":["media_probe_gpu0","application_gpu_probe_gpu0"],"prov":["nvidia_egl_vendor_json","nvidia_eglcore_library","nvidia_lib32_gl"]}
+14:02:57 {"status":"online","reg":"14:02:45","rep":"14:02:52","gate":"active","blocking":["media_probe_gpu0","application_gpu_probe_gpu0"],"prov":["nvidia_egl_vendor_json","nvidia_eglcore_library","nvidia_lib32_gl"]}
+14:02:58 {"status":"online","reg":"14:02:45","rep":"14:02:52","gate":"active","blocking":["media_probe_gpu0","application_gpu_probe_gpu0"],"prov":["nvidia_egl_vendor_json","nvidia_eglcore_library","nvidia_lib32_gl"]}
+14:02:59 {"status":"online","reg":"14:02:45","rep":"14:02:52","gate":"active","blocking":["media_probe_gpu0","application_gpu_probe_gpu0"],"prov":["nvidia_egl_vendor_json","nvidia_eglcore_library","nvidia_lib32_gl"]}
+14:03:00 {"status":"offline","reg":"14:02:45","rep":"14:02:52","gate":"active","blocking":["media_probe_gpu0","application_gpu_probe_gpu0"],"prov":["nvidia_egl_vendor_json","nvidia_eglcore_library","nvidia_lib32_gl"]}
+14:03:01 {"status":"online","reg":"14:03:00","rep":"14:02:52","gate":"active","blocking":["media_probe_gpu0","application_gpu_probe_gpu0"],"prov":["nvidia_egl_vendor_json","nvidia_eglcore_library","nvidia_lib32_gl"]}
+14:03:02 {"status":"online","reg":"14:03:00","rep":"14:02:52","gate":"active","blocking":["media_probe_gpu0","application_gpu_probe_gpu0"],"prov":["nvidia_egl_vendor_json","nvidia_eglcore_library","nvidia_lib32_gl"]}
+14:03:03 {"status":"online","reg":"14:03:00","rep":"14:03:02","gate":"active","blocking":[],"prov":[]}
+14:03:04 {"status":"online","reg":"14:03:00","rep":"14:03:03","gate":"active","blocking":[],"prov":[]}
+14:03:05 {"status":"online","reg":"14:03:00","rep":"14:03:03","gate":"active","blocking":[],"prov":[]}

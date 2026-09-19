@@ -1,0 +1,99 @@
+{
+  "installed": {
+    "control_plane": {
+      "version": "dev",
+      "source_commit": "901058fbb503382eed758c8f718fba5b4cffc912",
+      "built_at": "2026-09-19T07:26:56Z",
+      "schema_version": 85
+    },
+    "hosts": [
+      {
+        "host_id": "<uuid>",
+        "node_name": "quasar-node-1",
+        "status": "online",
+        "agent_version": "dev",
+        "source_commit": "97fd0d9b93e17933afd4f9e151c3bf44541800bd",
+        "built_at": "2026-09-19T04:32:30Z",
+        "install_mode": "registry",
+        "updater_present": true,
+        "identity_known": true
+      }
+    ]
+  },
+  "targets": [
+    {
+      "kind": "control_plane",
+      "name": null,
+      "eligible": false,
+      "reason": "no_release",
+      "preflight": {
+        "state": "unknown",
+        "checked_at": "2026-09-19T14:03:47Z",
+        "checks": [
+          {
+            "id": "updater_socket",
+            "status": "pass",
+            "detail": "updater 7e5f85998448432f4067eb4a15a188b8effacc51 answered on /run/quasar-updater/updater.sock"
+          },
+          {
+            "id": "updater_stack_dir",
+            "status": "pass",
+            "detail": "/home/<user>/quasar/deploy, 2 compose file(s)"
+          },
+          {
+            "id": "updater_overlays",
+            "status": "pass",
+            "detail": "every running service was started with the updater's compose files"
+          },
+          {
+            "id": "image_resolvable",
+            "status": "unknown",
+            "detail": "no release is listed to resolve"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "host",
+      "name": "quasar-node-1",
+      "eligible": false,
+      "reason": "no_release",
+      "preflight": {
+        "state": "unknown",
+        "checked_at": "2026-09-19T14:04:02Z",
+        "checks": [
+          {
+            "id": "agent_connected",
+            "status": "pass",
+            "detail": "the agent is connected"
+          },
+          {
+            "id": "updater_socket",
+            "status": "pass",
+            "detail": "Updater 7e5f85998448432f4067eb4a15a188b8effacc51 answered on its socket"
+          },
+          {
+            "id": "updater_stack_dir",
+            "status": "pass",
+            "detail": "Updater acts on /home/<user>/quasar/deploy (2 compose file(s))"
+          },
+          {
+            "id": "updater_overlays",
+            "status": "pass",
+            "detail": "This agent was started with the updater's compose files"
+          },
+          {
+            "id": "health_addr_bindable",
+            "status": "pass",
+            "detail": "<addr>:9091 is answered by this agent"
+          },
+          {
+            "id": "image_resolvable",
+            "status": "unknown",
+            "detail": "no release is listed to resolve"
+          }
+        ]
+      }
+    }
+  ]
+}

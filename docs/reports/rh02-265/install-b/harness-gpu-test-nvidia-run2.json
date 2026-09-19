@@ -1,0 +1,428 @@
+{
+  "name": "readiness-faults",
+  "timestamp": "2026-09-19T23:14:31Z",
+  "counts": {
+    "pass": 96,
+    "fail": 0,
+    "skip": 4
+  },
+  "checks": [
+    {
+      "result": "pass",
+      "message": "preflight: engine clear (foreign_quasar_projects=0, port 18080 free, /var/lib/rh02h-33073a71 free)"
+    },
+    {
+      "result": "pass",
+      "message": "image-clean: agent image carries no readiness-fixture path"
+    },
+    {
+      "result": "pass",
+      "message": "image-clean: agent binary has no harness_synthetic_ string"
+    },
+    {
+      "result": "pass",
+      "message": "fixture: readiness-fixture image built"
+    },
+    {
+      "result": "pass",
+      "message": "fixture: relay running, rule off (transparent)"
+    },
+    {
+      "result": "pass",
+      "message": "stack: control plane answering /health"
+    },
+    {
+      "result": "pass",
+      "message": "login: admin token obtained"
+    },
+    {
+      "result": "pass",
+      "message": "nonadmin: user provisioned"
+    },
+    {
+      "result": "pass",
+      "message": "seed: app 'rh02h-33073a71: app-nohome' ready (<uuid>)"
+    },
+    {
+      "result": "pass",
+      "message": "seed: app 'rh02h-33073a71: app-home' ready (<uuid>)"
+    },
+    {
+      "result": "pass",
+      "message": "baseline: input_probe passes before any fault"
+    },
+    {
+      "result": "pass",
+      "message": "baseline: audio_probe passes before any fault"
+    },
+    {
+      "result": "pass",
+      "message": "baseline: launch reached running"
+    },
+    {
+      "result": "pass",
+      "message": "1a: host is online while its runtime is down"
+    },
+    {
+      "result": "pass",
+      "message": "1a: runtime_endpoint fails with its fix text"
+    },
+    {
+      "result": "pass",
+      "message": "1a: runtime_endpoint carries blocks {scope: host, enforced_by: agent}"
+    },
+    {
+      "result": "pass",
+      "message": "1a: runtime_endpoint listed in readiness_gate.blocking, enforced_by agent"
+    },
+    {
+      "result": "pass",
+      "message": "1a: startup_cleanup fails with its fix text"
+    },
+    {
+      "result": "pass",
+      "message": "1a: startup_cleanup carries blocks {scope: host, enforced_by: agent}"
+    },
+    {
+      "result": "pass",
+      "message": "1a: startup_cleanup listed in readiness_gate.blocking, enforced_by agent"
+    },
+    {
+      "result": "pass",
+      "message": "1b: agent health answers 503 while the runtime is down"
+    },
+    {
+      "result": "pass",
+      "message": "1d: override PUT on runtime_endpoint refused 409"
+    },
+    {
+      "result": "pass",
+      "message": "1d: override PUT on startup_cleanup refused 409"
+    },
+    {
+      "result": "skip",
+      "message": "UNPERFORMED 1c: the nested host could not serve a launch before the fault on this host (a pre-fault launch got HTTP 503 code=no_host_available), so a refusal could not have readiness as its sole reason"
+    },
+    {
+      "result": "pass",
+      "message": "1a: runtime_endpoint recovers to pass"
+    },
+    {
+      "result": "pass",
+      "message": "1a: both checks left readiness_gate.blocking"
+    },
+    {
+      "result": "pass",
+      "message": "1b: agent health returns to 200"
+    },
+    {
+      "result": "pass",
+      "message": "1e: agent container never restarted (StartedAt and RestartCount unchanged)"
+    },
+    {
+      "result": "pass",
+      "message": "1e: the agent process that reported the fault is the one that resumed (pid unchanged)"
+    },
+    {
+      "result": "skip",
+      "message": "UNPERFORMED 1c: recovery launch \u2014 the nested host could not serve a launch before the fault either (a pre-fault launch got HTTP 503 code=no_host_available)"
+    },
+    {
+      "result": "pass",
+      "message": "1: nested host row deleted 204"
+    },
+    {
+      "result": "pass",
+      "message": "2a: homes_root_writable fails with scope homes"
+    },
+    {
+      "result": "pass",
+      "message": "2a: app-home launch refused 503 host_not_ready"
+    },
+    {
+      "result": "pass",
+      "message": "2a: app-nohome launch reaches running"
+    },
+    {
+      "result": "pass",
+      "message": "2a: homes_root_writable recovers to pass"
+    },
+    {
+      "result": "pass",
+      "message": "2a: app-home launch reaches running after recovery"
+    },
+    {
+      "result": "pass",
+      "message": "2b: homes_free_space fails with scope homes"
+    },
+    {
+      "result": "pass",
+      "message": "2b: app-home refused 503 host_not_ready"
+    },
+    {
+      "result": "pass",
+      "message": "2b: app-nohome runs"
+    },
+    {
+      "result": "pass",
+      "message": "2b: homes_free_space no longer fails after removing the fill file (status 'warn')"
+    },
+    {
+      "result": "pass",
+      "message": "2b: app-home launch reaches running after recovery"
+    },
+    {
+      "result": "pass",
+      "message": "3: input_probe fails with scope host"
+    },
+    {
+      "result": "pass",
+      "message": "3: launch refused 503 host_not_ready"
+    },
+    {
+      "result": "pass",
+      "message": "3: input_probe recovers to pass"
+    },
+    {
+      "result": "pass",
+      "message": "3: launch runs after recovery"
+    },
+    {
+      "result": "skip",
+      "message": "UNPERFORMED 4a: host GPU vendor is 'nvidia', not amd"
+    },
+    {
+      "result": "skip",
+      "message": "UNPERFORMED 4a': host GPU vendor is 'nvidia', not amd"
+    },
+    {
+      "result": "pass",
+      "message": "4b: media_probe_gpu0 fail carries blocks.scope=gpu gpu_index=0"
+    },
+    {
+      "result": "pass",
+      "message": "4b: application_gpu_probe_gpu0 fail carries blocks.scope=gpu gpu_index=0"
+    },
+    {
+      "result": "pass",
+      "message": "4b: media_probe_gpu0 is fail"
+    },
+    {
+      "result": "pass",
+      "message": "4b: launch refused host_not_ready"
+    },
+    {
+      "result": "pass",
+      "message": "4c (4b): launch placed on the free scripted host (session.host_id matches)"
+    },
+    {
+      "result": "pass",
+      "message": "4c (4b): scripted host row deleted 204"
+    },
+    {
+      "result": "pass",
+      "message": "4b: probes recover to pass"
+    },
+    {
+      "result": "pass",
+      "message": "4b: launch runs after recovery"
+    },
+    {
+      "result": "pass",
+      "message": "5a: dri_node_app_access fail carries no blocks"
+    },
+    {
+      "result": "pass",
+      "message": "5a: dri_node_app_access absent from blocking"
+    },
+    {
+      "result": "pass",
+      "message": "5a: launch still reaches running"
+    },
+    {
+      "result": "pass",
+      "message": "5b: audio_probe reports unknown"
+    },
+    {
+      "result": "pass",
+      "message": "5b: audio_probe absent from blocking"
+    },
+    {
+      "result": "pass",
+      "message": "5b: launch is placed (201)"
+    },
+    {
+      "result": "pass",
+      "message": "5b: audio_probe recovers to pass"
+    },
+    {
+      "result": "pass",
+      "message": "6a: the first launch fills the ready host"
+    },
+    {
+      "result": "pass",
+      "message": "6a: second launch refused 503 capacity_exhausted with the blocked host also online"
+    },
+    {
+      "result": "pass",
+      "message": "6b: launch refused 503 no_host_available with nothing online"
+    },
+    {
+      "result": "pass",
+      "message": "6c: launch refused host_not_ready with only the blocked host online"
+    },
+    {
+      "result": "pass",
+      "message": "6c: no Retry-After header"
+    },
+    {
+      "result": "pass",
+      "message": "6c: the message names none of the 36 check ids reported in this run"
+    },
+    {
+      "result": "pass",
+      "message": "6d: the message names none of the 36 check ids reported in this run"
+    },
+    {
+      "result": "pass",
+      "message": "6d: GET /v1/hosts is 403 for non-admin"
+    },
+    {
+      "result": "pass",
+      "message": "6d: GET /v1/hosts/{id} is 403 for non-admin"
+    },
+    {
+      "result": "pass",
+      "message": "7a: launch refused host_not_ready before the override"
+    },
+    {
+      "result": "pass",
+      "message": "7a: override PUT -> 200"
+    },
+    {
+      "result": "pass",
+      "message": "7a: repeat PUT -> 200, no second audit row"
+    },
+    {
+      "result": "pass",
+      "message": "7a: audit host.readiness_override.set severity warn"
+    },
+    {
+      "result": "pass",
+      "message": "7a: the audit detail carries check_id and node_name"
+    },
+    {
+      "result": "pass",
+      "message": "7b: still visible \u2014 blocking lists it, overridden true, readiness[] still fail"
+    },
+    {
+      "result": "pass",
+      "message": "7c: launch succeeds and reaches running with the override"
+    },
+    {
+      "result": "pass",
+      "message": "7d: check reads pass in readiness[]"
+    },
+    {
+      "result": "pass",
+      "message": "7d: override lapsed (gone from readiness_overrides)"
+    },
+    {
+      "result": "pass",
+      "message": "7d: audit .lapsed exists with actor null"
+    },
+    {
+      "result": "pass",
+      "message": "7e: override set again -> 200"
+    },
+    {
+      "result": "pass",
+      "message": "7e: DELETE -> 204"
+    },
+    {
+      "result": "pass",
+      "message": "7e: repeat DELETE -> 204 (idempotent)"
+    },
+    {
+      "result": "pass",
+      "message": "7e: exactly one .cleared audit row for this check (the idempotent repeat wrote none)"
+    },
+    {
+      "result": "pass",
+      "message": "7e: launch refused host_not_ready again after clearing"
+    },
+    {
+      "result": "pass",
+      "message": "7f: override set before the rename -> 200"
+    },
+    {
+      "result": "pass",
+      "message": "7f: old override listed inert"
+    },
+    {
+      "result": "pass",
+      "message": "7f: new id in blocking, overridden false"
+    },
+    {
+      "result": "pass",
+      "message": "7f: launch refused host_not_ready for the renamed check"
+    },
+    {
+      "result": "pass",
+      "message": "7f: blocking empty after rule off + override delete"
+    },
+    {
+      "result": "pass",
+      "message": "7f: launch runs after full clear"
+    },
+    {
+      "result": "pass",
+      "message": "7g: non-admin PUT on unknown host -> 403 (not 404)"
+    },
+    {
+      "result": "pass",
+      "message": "7h: bad check_id -> 400 validation_failed"
+    },
+    {
+      "result": "pass",
+      "message": "7h: 129-byte check_id -> 400 validation_failed"
+    },
+    {
+      "result": "pass",
+      "message": "8: no readiness check id/summary/remediation implies browser-reachability without an allow-listed negation"
+    },
+    {
+      "result": "pass",
+      "message": "9: host row rh02h-33073a71-real deleted 204"
+    },
+    {
+      "result": "pass",
+      "message": "9: ownership cleanup \u2014 zero labelled containers/volumes/networks, /var/lib/rh02h-33073a71 gone"
+    },
+    {
+      "result": "pass",
+      "message": "9: no volume exists that was not there at preflight (labelled or anonymous)"
+    },
+    {
+      "result": "pass",
+      "message": "9: zero quasar-sess-*/quasar-pulse-*/quasar-probe-* containers remain"
+    }
+  ],
+  "notes": {
+    "rid": "rh02h-33073a71",
+    "role": "gpu-test-nvidia",
+    "control_image": "<registry>/quasar-control-plane:dev-901058f",
+    "agent_image": "<registry>/quasar-node-agent:dev-97fd0d9",
+    "control_port": "18080",
+    "pre_detected_vendor": "nvidia",
+    "preflight_foreign_quasar_projects": "0",
+    "device_override": "true (no /dev/kmsg on this host)",
+    "control_image_commit": "901058fbb503382eed758c8f718fba5b4cffc912",
+    "agent_image_commit": "97fd0d9b93e17933afd4f9e151c3bf44541800bd",
+    "schema_migrations_version": "85",
+    "baseline_ok": "1",
+    "gpu_vendor": "nvidia",
+    "gpu_index": "0",
+    "verdict": "incomplete"
+  }
+}

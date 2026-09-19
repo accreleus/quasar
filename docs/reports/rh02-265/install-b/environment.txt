@@ -1,0 +1,10 @@
+Captured live during run B (read-only commands on the NVIDIA test host).
+kernel (shared with the Unraid host): 6.18.47-Unraid
+userspace: Fedora Linux 43 (Container Image)
+docker engine 29.8.1, API 1.56 (the agent negotiated 1.53); docker compose 5.5.1
+docker daemon configuration as found: overlay2, buildkit, one insecure local registry, the "nvidia" runtime registered (nvidia-container-runtime), default runtime runc, no live-restore; CDI spec dirs /etc/cdi and /var/run/cdi
+GPU: NVIDIA GeForce RTX 5090, PCI device id 0x2B8510DE, kernel module 610.57.04 (the Unraid host's, open kernel module)
+NVIDIA container toolkit 1.20.1; CDI specification generated the same day; nvidia-cdi-refresh service and path units enabled; three CDI devices listed
+device nodes: /dev/nvidia0, nvidiactl, nvidia-uvm, nvidia-uvm-tools, nvidia-modeset (world read-write); /dev/dri/card0 and renderD128; /dev/uinput root only; /dev/kmsg absent
+difference from the #262 record: that record found no container toolkit on this host
+tools absent on the host: openssl

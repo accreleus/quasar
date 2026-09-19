@@ -1,0 +1,16 @@
+23:28:27 before: {"status":"online","rep":"23:28:26","rt":[{"id":"runtime_endpoint","status":"pass","blocks":{"scope":"host","enforced_by":"agent"}}],"blocking":[]}
+FROZEN 23:28:27 dockerd state=Tsl
+23:30:22 blocked: {"status":"online","rep":"23:30:22","rt":[{"id":"runtime_endpoint","status":"fail","blocks":{"scope":"host","enforced_by":"agent"}}],"blocking":[{"check_id":"runtime_endpoint","scope":"host","enforced_by":"agent"}]}
+23:30:22 launch while engine frozen -> HTTP 503
+{"error":{"code":"host_not_ready","message":"the host that would run this needs its administrator's attention; try again once they have looked at it"}}
+retry-after headers: 0
+23:30:22 PUT override runtime_endpoint -> HTTP 409
+{"error":{"code":"conflict","message":"check \"runtime_endpoint\" is enforced by the agent itself; no override lifts it"}}
+23:30:22 health not ready? agent status in host body: {"status":"online"}
+THAWED 23:30:22 dockerd state=Ssl
+23:30:23 recovered: {"status":"online","rep":"23:30:22","rt":[{"id":"runtime_endpoint","status":"pass","blocks":{"scope":"host","enforced_by":"agent"}}],"blocking":[]}
+23:30:23 launch after thaw -> HTTP 201
+23:30:25 recovery session state: running
+23:30:31 recovery session still: running
+23:30:31 agent container restarts: 0 started=2026-09-19T23:22:39.331245977Z
+ONEC_DONE

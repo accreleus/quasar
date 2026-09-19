@@ -81,6 +81,7 @@ own; the two do not move together, and that is deliberate.
   blocking by injecting faults (runtime, storage, input, GPU per vendor) on a disposable
   stack and asserting `host_not_ready` refusals and the override lifecycle work correctly.
   Contributor tooling only; no product behaviour change.
+- RH-02 acceptance evidence (#265): fresh installs on the AMD test host, the NVIDIA test host and natively on an Unraid host, each with a captured readiness card, one real session, and the #264 harness rerun; the acceptance report is `docs/reports/2026-09-19-rh02-acceptance.md`. No product code changed.
 
 ### Removed
 - **The node agent no longer needs a `docker` or `podman` executable (#239).** Every

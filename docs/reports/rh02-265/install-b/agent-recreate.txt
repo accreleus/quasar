@@ -1,0 +1,4 @@
+before:
+{"id":"<uuid>","node_name":"quasar-node-1","status":"online","last_registered_at":"2026-09-19T13:26:39Z"}
+after:
+{"id":"<uuid>","node_name":"quasar-node-1","status":"online","last_registered_at":"2026-09-19T14:02:24Z"}

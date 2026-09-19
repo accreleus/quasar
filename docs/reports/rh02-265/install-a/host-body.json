@@ -1,0 +1,276 @@
+{
+  "host": {
+    "status": "online",
+    "node_name": "quasar-node-1",
+    "last_registered_at": "2026-09-19T23:31:32Z",
+    "readiness_reported_at": "2026-09-19T23:31:35Z",
+    "gpus": [],
+    "readiness_gate": {
+      "state": "active",
+      "blocking": []
+    },
+    "readiness_overrides": [],
+    "readiness": [
+      {
+        "id": "runtime_endpoint",
+        "blocks": {
+          "scope": "host",
+          "enforced_by": "agent"
+        },
+        "source": "runtime",
+        "status": "pass",
+        "summary": "Docker Engine - Community 29.8.1 at unix:///var/run/docker.sock answers",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "runtime_api_version",
+        "source": "runtime",
+        "status": "pass",
+        "summary": "API 1.53 negotiated with Docker Engine - Community 29.8.1 (the engine offers 1.40-1.56; this agent needs at least 1.40)",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "runtime_capabilities",
+        "source": "runtime",
+        "status": "pass",
+        "summary": "Docker Engine - Community 29.8.1 on Fedora Linux 43 (Container Image) (x86_64), cgroup v2; security options: name=seccomp,profile=builtin, name=cgroupns; runtimes: io.containerd.runc.v2, runc (default runc); as stated by the engine, not exercised",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "runtime_cdi",
+        "source": "runtime",
+        "status": "pass",
+        "summary": "CDI is enabled (spec dirs: /etc/cdi, /var/run/cdi) and the engine discovered no devices; GPU injection does not use CDI",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "nvidia_egl_vendor_json",
+        "source": "local",
+        "status": "skip",
+        "summary": "no NVIDIA GPU detected on this host",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "nvidia_eglcore_library",
+        "source": "local",
+        "status": "skip",
+        "summary": "no NVIDIA GPU detected on this host",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "nvidia_lib32_gl",
+        "source": "local",
+        "status": "skip",
+        "summary": "no NVIDIA GPU detected on this host",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "render_node",
+        "source": "local",
+        "status": "pass",
+        "summary": "render node open-able (/dev/dri/renderD129)",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "uinput",
+        "source": "local",
+        "status": "pass",
+        "summary": "/dev/uinput present and writable",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "user_namespaces",
+        "source": "local",
+        "status": "pass",
+        "summary": "user namespaces available (max 376055)",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "app_apparmor_profile",
+        "source": "local",
+        "status": "skip",
+        "summary": "this host does not enforce AppArmor — app containers carry no AppArmor profile and there is nothing to load",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "host_render_node",
+        "source": "local",
+        "status": "pass",
+        "summary": "host kernel created 2 DRM render node(s)",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "dri_node_app_access",
+        "source": "local",
+        "status": "pass",
+        "summary": "all 2 /dev/dri node(s) are openable by the app user",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "driver_volume_version",
+        "source": "local",
+        "status": "skip",
+        "summary": "no NVIDIA GPU detected on this host",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "nvidia_driver_mount",
+        "source": "local",
+        "status": "skip",
+        "summary": "No unresolved NVIDIA app driver mount",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "encoder_codecs",
+        "source": "local",
+        "status": "pass",
+        "summary": "encoder advertises h264, h265",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "nvidia_vulkan_av1_compatibility",
+        "source": "local",
+        "status": "skip",
+        "summary": "No recorded Vulkan AV1 compatibility result for this GPU/driver combination; this is not a visual-quality certification",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "xid_visibility",
+        "source": "local",
+        "status": "skip",
+        "summary": "/dev/kmsg is not readable (No such file or directory (os error 2)) — GPU faults will not appear in a session trace; an Xid can only be found by hand in the host's dmesg",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": "The shipped deploy/docker-compose.yml grants this, so a stack that cannot read it predates that or has the entry removed. Under the node-agent service add `/dev/kmsg:/dev/kmsg:r` to `devices:` — `:r` is the device-cgroup permission set, a bind mount's `:ro` is rejected there — and `SYSLOG` to `cap_add:`, which the device alone does not cover while kernel.dmesg_restrict=1 (the distro default). Then recreate the agent container. Optional, and nothing else changes — the tailer is read-only, off the media path, and reports only NVRM Xid and amdgpu fault lines."
+      },
+      {
+        "id": "media_reachability",
+        "source": "local",
+        "status": "pass",
+        "summary": "this host's inbound firewall filters nothing (nft answered: no input hook chain in the ruleset) — the host itself would not block inbound WebRTC media",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "host_container_mounts",
+        "source": "local",
+        "status": "pass",
+        "summary": "Required sibling-container paths agree with their host bind mounts",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "homes_root_writable",
+        "blocks": {
+          "scope": "homes",
+          "enforced_by": "control_plane"
+        },
+        "source": "local",
+        "status": "pass",
+        "summary": "the agent (QUASAR_APP_PUID unset) created, wrote and removed a test home under /var/lib/quasar/homes",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "homes_free_space",
+        "blocks": {
+          "scope": "homes",
+          "enforced_by": "control_plane"
+        },
+        "source": "local",
+        "status": "pass",
+        "summary": "1597.5 GiB free of 3726 GiB under /var/lib/quasar/homes (floor 5 GiB)",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "template_free_space",
+        "source": "local",
+        "status": "pass",
+        "summary": "1597.5 GiB free of 3726 GiB under /var/lib/quasar/templates (floor 5 GiB)",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "image_free_space",
+        "source": "local",
+        "status": "skip",
+        "summary": "The container engine's image storage is not visible to this agent",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "updater_socket",
+        "source": "local",
+        "status": "pass",
+        "summary": "Updater 7e5f85998448432f4067eb4a15a188b8effacc51 answered on its socket",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "updater_stack_dir",
+        "source": "local",
+        "status": "pass",
+        "summary": "Updater acts on /home/<user>/quasar/deploy (1 compose file(s))",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "updater_overlays",
+        "source": "local",
+        "status": "pass",
+        "summary": "This agent was started with the updater's compose files",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "health_addr_bindable",
+        "source": "local",
+        "status": "pass",
+        "summary": "<addr>:9091 is answered by this agent",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "input_probe",
+        "blocks": {
+          "scope": "host",
+          "enforced_by": "control_plane"
+        },
+        "source": "host_probe",
+        "status": "pass",
+        "summary": "Virtual input devices were created: created keyboard, mouse and gamepad devices and wrote events",
+        "observed_at": "2026-09-19T23:31:33Z",
+        "remediation": ""
+      },
+      {
+        "id": "audio_probe",
+        "blocks": {
+          "scope": "host",
+          "enforced_by": "control_plane"
+        },
+        "source": "host_probe",
+        "status": "pass",
+        "summary": "The audio sidecar started: its socket appeared",
+        "observed_at": "2026-09-19T23:31:35Z",
+        "remediation": ""
+      }
+    ]
+  }
+}

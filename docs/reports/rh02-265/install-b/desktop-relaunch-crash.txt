@@ -1,0 +1,60 @@
+> Warning:          Could not resolve keysym XF86MediaSelectHome
+> Warning:          Could not resolve keysym XF86MediaLanguageMenu
+> Warning:          Could not resolve keysym XF86MediaTitleMenu
+> Warning:          Could not resolve keysym XF86AudioChannelMode
+> Warning:          Could not resolve keysym XF86MediaSelectPC
+> Warning:          Could not resolve keysym XF86MediaSelectTV
+> Warning:          Could not resolve keysym XF86MediaSelectCable
+> Warning:          Could not resolve keysym XF86MediaSelectVCR
+> Warning:          Could not resolve keysym XF86MediaSelectVCRPlus
+> Warning:          Could not resolve keysym XF86MediaSelectSatellite
+> Warning:          Could not resolve keysym XF86MediaSelectTape
+> Warning:          Could not resolve keysym XF86MediaSelectRadio
+> Warning:          Could not resolve keysym XF86MediaSelectTuner
+> Warning:          Could not resolve keysym XF86MediaPlayer
+> Warning:          Could not resolve keysym XF86MediaSelectTeletext
+> Warning:          Could not resolve keysym XF86MediaSelectAuxiliary
+> Warning:          Could not resolve keysym XF86MediaPlaySlow
+> Warning:          Could not resolve keysym XF86NumberEntryMode
+> Warning:          Could not resolve keysym XF86RefreshRateToggle
+> Warning:          Could not resolve keysym XF86Accessibility
+> Warning:          Could not resolve keysym XF86DoNotDisturb
+Errors from xkbcomp are not fatal to the X server
+dbus-daemon[250]: [session uid=1000 pid=250 pidfd=5] Activating service name='ca.desrt.dconf' requested by ':1.9' (uid=1000 pid=319 comm="xfsettingsd")
+dbus-daemon[250]: [session uid=1000 pid=250 pidfd=5] Successfully activated service 'ca.desrt.dconf'
+
+(xfwm4:320): libxfce4ui-WARNING **: 13:43:04.212: ICE I/O Error
+
+(xfwm4:320): xfwm4-WARNING **: 13:43:04.212: Failed to connect to session manager: Failed to connect to the session manager: IO error occurred opening connection
+
+(xfsettingsd:319): libxfce4ui-WARNING **: 13:43:04.212: ICE I/O Error
+
+(xfsettingsd:319): libxfce4ui-WARNING **: 13:43:04.212: Disconnected from session manager.
+No provider of glXBindTexImageEXT found.  Requires one of:
+    GLX_EXT_texture_from_pixmap
+
+(xfconfd:272): xfconfd-WARNING **: 13:43:04.216: Name org.xfce.Xfconf lost on the message dbus, exiting.
+A connection to the bus can't be made
+xfsettingsd: Another instance took over. Leaving...
+
+(Thunar:346): thunar-WARNING **: 13:43:04.216: Name 'org.xfce.FileManager' lost on the message dbus.
+
+(Thunar:346): thunar-WARNING **: 13:43:04.216: Name 'org.freedesktop.FileManager1' lost on the message dbus.
+2026-09-19T13:43:04+00:00 quasar-xfce: XFCE session exited (rc=139)
+
+(wrapper-2.0:368): GLib-GIO-CRITICAL **: 13:43:04.217: Error while sending AddMatch() message: The connection is closed
+
+(wrapper-2.0:368): GVFS-WARNING **: 13:43:04.217: Error creating proxy: Error calling StartServiceByName for org.gtk.vfs.Daemon: The connection is closed (g-io-error-quark, 18)
+
+2026-09-19T13:43:04+00:00 quasar-xfce: session over; stopping Xwayland (pid 243)
+
+(xfce4-panel:336): libxfce4ui-WARNING **: 13:43:04.228: ICE I/O Error
+
+(xfce4-panel:336): libxfce4ui-WARNING **: 13:43:04.228: Disconnected from session manager.
+
+(xfce4-panel:336): xfce4-panel-CRITICAL **: 13:43:04.228: Name org.xfce.Panel lost on the message dbus, exiting.
+
+(xfdesktop:363): GLib-GIO-CRITICAL **: 13:43:04.233: Error while sending AddMatch() message: The connection is closed
+
+(xfdesktop:363): GVFS-WARNING **: 13:43:04.234: Error: Error calling StartServiceByName for org.gtk.vfs.Metadata: The connection is closed
+

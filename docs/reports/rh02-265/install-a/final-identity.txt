@@ -1,0 +1,6 @@
+deploy-quasar-postgres-1 sha256:81bd698b4594
+deploy-quasar-updater-1 sha256:4370cc08d578
+deploy-quasar-control-plane-1 sha256:949f566609ff
+deploy-quasar-node-agent-1 sha256:632e8e74498a
+85|f
+engine=29.8.1 api=1.56

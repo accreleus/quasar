@@ -1,0 +1,116 @@
+===== existing install, read-only baseline BEFORE run C
+/deploy-quasar-node-agent-1 id=45d95a72a6c4… image=3a4c6863c61f… state=exited started=2026-09-13T01:24:27.000380139Z finished=2026-09-15T10:35:35.587841752Z restarts=0 commit=eaf042c115d9ff8d84d47f17f609a8eced355b66 schema=<no value>
+/deploy-quasar-control-plane-1 id=d4d8db06b466… image=747820351c05… state=exited started=2026-09-13T01:24:21.372333178Z finished=2026-09-15T10:35:35.633686624Z restarts=0 commit=eaf042c115d9ff8d84d47f17f609a8eced355b66 schema=84
+/deploy-quasar-updater-1 id=97ef00fa914e… image=d9eae7d6a643… state=exited started=2026-09-13T01:24:15.7326818Z finished=2026-09-15T10:35:35.318468858Z restarts=0 commit=8a86cd24ac11639f7e05847395c2202a2b12a054 schema=<no value>
+/deploy-quasar-postgres-1 id=1230a817c6aa… image=75f5a96988cd… state=exited started=2026-09-13T01:24:15.737766376Z finished=2026-09-15T10:35:35.946540659Z restarts=0 commit=<no value> schema=<no value>
+--- volumes/networks of project deploy:
+deploy_quasar-agent-data
+deploy_quasar-control-tls
+deploy_quasar-nvidia-driver
+deploy_quasar-postgres-data
+deploy_quasar-updater-run
+deploy_default
+08847c7503345c84
+3d23d4ae7e18c0d5
+--- ports in .env (names only + port values):
+QUASAR_HOME_ROOT=/mnt/cache/appdata/quasar/homes
+QUASAR_STACK_DIR=/mnt/user/appdata/quasar/deploy
+CONTROL_PORT=18080
+QUASAR_TLS_PORT=18443
+
+===== isolation check on the Unraid host (read-only)
+--- /run/quasar-agent:
+total 0
+drwx------  2 root root   40 Sep 15 00:44 .
+drwxr-xr-x 22 root root 1140 Sep 20 03:40 ..
+--- ports:
+28080 free
+28443 free
+29091 free
+--- devices:
+crw-r--r-- root root /dev/kmsg
+crw------- root root /dev/uinput
+
+/dev/dri:
+total
+drwxrwxrwx root root
+crw-rw---- root video card0
+crwxrwxrwx root video card1
+crw-rw-rw- root video renderD128
+crwxrwxrwx root video renderD129
+--- paths:
+/mnt/cache/appdata
+/mnt/user/appdata
+ls: cannot access '/mnt/cache/appdata/quasar-rh02c': No such file or directory
+1.6T free
+VGA compatible controller [0300]: NVIDIA Corporation GB202 [GeForce RTX 5090] [10de:2b85] (rev a1)
+VGA compatible controller [0300]: Advanced Micro Devices, Inc. [AMD/ATI] Granite Ridge [Radeon Graphics] [1002:13c0] (rev c9)
+
+===== 02-image-load.txt
+Loaded image: <local-registry>/quasar-control-plane:dev-901058f
+Loaded image: <local-registry>/quasar-node-agent:dev-97fd0d9
+Loaded image: <local-registry>/quasar-updater:dev-7e5f859
+LOAD_DONE rc=0
+
+===== 05-install.txt
+7e5f85998448432f4067eb4a15a188b8effacc51
+seeded QUASAR_TLS_HOSTS=<redacted>
+--- rendered isolation check:
+project=quasar-rh02c
+volumes=quasar-rh02c_quasar-agent-data,quasar-rh02c_quasar-control-tls,quasar-rh02c_quasar-postgres-data,quasar-rh02c_quasar-updater-run
+networks=quasar-rh02c_default
+cp_ports=28080,28443
+pg_ports=0
+db_url_host=quasar-postgres
+agent_cp_url=ws://localhost:28080
+health=<addr>:29091
+render=/dev/dri/renderD129
+
+===== 06-up.txt
+deploy-quasar-control-plane-1 Exited (0) 4 days ago
+deploy-quasar-node-agent-1 Exited (143) 4 days ago
+deploy-quasar-postgres-1 Exited (0) 4 days ago
+deploy-quasar-updater-1 Exited (0) 4 days ago
+UP_T0=2026-09-19T23:32:28Z
+ Container quasar-rh02c-quasar-control-plane-1  Waiting
+ Container quasar-rh02c-quasar-control-plane-1  Healthy
+ Container quasar-rh02c-quasar-node-agent-1  Starting
+ Container quasar-rh02c-quasar-node-agent-1  Started
+SERVICE                STATUS
+quasar-control-plane   Up 15 seconds (healthy)
+quasar-node-agent      Up 10 seconds (healthy)
+quasar-postgres        Up 21 seconds (healthy)
+quasar-updater         Up 21 seconds
+{"status":"ok","db":"ok"}
+
+2026-09-19T23:32:41.106871Z  INFO quasar_node_agent::session::homes_gc: homes-gc: sweep of /mnt/cache/appdata/quasar-rh02c/homes — scanned 0, candidates 0, deleted 0 (0.0 MiB, 0 empty), live 0, too-young 0, purged 0, errors 0
+
+===== teardown.txt
+ Volume quasar-rh02c_quasar-control-tls  Removed
+ Network quasar-rh02c_default  Removed
+--- run C remains:
+containers=0 volumes=0 networks=0 sess=0 root=0 rundir=0
+loaded images still present: 3
+31
+0
+deploy-quasar-control-plane-1 Exited (0) 4 days ago
+deploy-quasar-node-agent-1 Exited (143) 4 days ago
+deploy-quasar-postgres-1 Exited (0) 4 days ago
+deploy-quasar-updater-1 Exited (0) 4 days ago
+
+===== existing install, read-only AFTER run C teardown
+/deploy-quasar-node-agent-1 id=45d95a72a6c4… image=3a4c6863c61f… state=exited started=2026-09-13T01:24:27.000380139Z finished=2026-09-15T10:35:35.587841752Z restarts=0
+/deploy-quasar-control-plane-1 id=d4d8db06b466… image=747820351c05… state=exited started=2026-09-13T01:24:21.372333178Z finished=2026-09-15T10:35:35.633686624Z restarts=0
+/deploy-quasar-updater-1 id=97ef00fa914e… image=d9eae7d6a643… state=exited started=2026-09-13T01:24:15.7326818Z finished=2026-09-15T10:35:35.318468858Z restarts=0
+/deploy-quasar-postgres-1 id=1230a817c6aa… image=75f5a96988cd… state=exited started=2026-09-13T01:24:15.737766376Z finished=2026-09-15T10:35:35.946540659Z restarts=0
+--- volumes/networks of project deploy:
+deploy_quasar-agent-data
+deploy_quasar-control-tls
+deploy_quasar-nvidia-driver
+deploy_quasar-postgres-data
+deploy_quasar-updater-run
+deploy_default
+08847c7503345c84
+3d23d4ae7e18c0d5
+
+comparison: container ids, image ids, states, start and finish times, restart counts, volumes, network and config-file hashes are identical before and after

@@ -1,0 +1,18 @@
+2026-09-19T23:36:32.131Z decode true after_ms 2005 sid <uuid>
+2026-09-19T23:36:46.309Z pointer lock after Capture input: true
+2026-09-19T23:37:18.640Z audio {"packets":4620,"energy":0,"level":0,"dur":46.18999999999938}
+2026-09-19T23:37:22.642Z audio {"packets":5020,"energy":0,"level":0,"dur":50.189999999998584}
+2026-09-19T23:37:25.047Z audio {"packets":5260,"energy":0.47795843610177685,"level":0.5023346659749138,"dur":52.589999999998106}
+2026-09-19T23:37:31.049Z audio {"packets":5860,"energy":1.9944214012627681,"level":0.5023346659749138,"dur":58.59999999999691}
+2026-09-19T23:37:31.050Z video {"frames":3603,"w":1920,"h":1080,"fps":60,"codec":"CITvideo01_96_level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"}
+
+== effective encoders seen (agent log)
+      1 VA hardware encoder: vah264enc (codec=h264, 8000 kbps, rate-control=cbr, b-frames=0, ref-frames=1, target-usage=6, num-slices=8, min-qp=20, aud=false, cpb-size=133 Kb (1-frame VBV), NV12 in)
+
+== timed normal stop
+delete_sent_epoch_ms=1789861053433
+http=202 total_s=0.012429
+delete_acked_epoch_ms=1789861053449
+t0_epoch_ms=1789861051435
+11ms epoch_ms=1789861051446 containers=2 dirs=2
+3389ms epoch_ms=1789861054825 containers=0 dirs=0

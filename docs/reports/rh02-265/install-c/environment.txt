@@ -1,0 +1,10 @@
+Captured live during run C (read-only commands on the Unraid host).
+kernel: 6.18.47-Unraid; OS as the engine reports it: Unraid OS 7.4 x86_64
+docker engine 29.7.1, API 1.55; docker compose 2.40.3; deployed with plain `docker compose -p`-style project naming (COMPOSE_PROJECT_NAME in deploy/.env), not Compose Manager and not a template
+GPUs present natively: NVIDIA GB202 [GeForce RTX 5090] 10de:2b85 (renderD128) and AMD Granite Ridge [Radeon Graphics] 1002:13c0 (renderD129). Run C pinned QUASAR_RENDER_NODE=/dev/dri/renderD129; leaving it unset was not tested.
+/dev/kmsg present (no compose edit needed); /dev/uinput present
+paths: one form throughout, /mnt/cache/appdata/<fresh root>/{quasar,homes,templates}; updater_stack_dir passed
+ports chosen after checking each was free: control 28080, TLS 28443, agent health 127.0.0.1:29091
+images: transferred with `docker save | docker load`, verified by org.quasar.source.commit label (901058f control, 97fd0d9 agent, 7e5f859 updater); no insecure registry configured; no Docker restart
+agent recreate: same host id, one host row, marker file in the managed home intact (RH02-PERSIST marker written before, read after)
+#264 harness: not run on this host, by decision (see the report)

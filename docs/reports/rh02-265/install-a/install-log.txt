@@ -1,0 +1,34 @@
+===== 01-install.txt
+recheck: containers=0 volumes=0 projects=0
+ls: cannot access '/dev/kmsg': No such file or directory
+DRIVER=amdgpu
+PCI_ID=1002:13C0
+7e5f85998448432f4067eb4a15a188b8effacc51
+seeded QUASAR_TLS_HOSTS=<redacted>
+ Image quasar-updater:latest Error pull access denied for quasar-updater, repository does not exist or may require 'docker login': denied: requested access to the resource is denied
+Error response from daemon: pull access denied for quasar-updater, repository does not exist or may require 'docker login': denied: requested access to the resource is denied
+pull rc=1
+
+===== 02-up.txt
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+ Image postgres:16-alpine Pulled 
+UP_T0=2026-09-19T23:13:16Z
+ Container deploy-quasar-control-plane-1 Healthy 
+ Container deploy-quasar-node-agent-1 Starting 
+ Container deploy-quasar-node-agent-1 Started 
+SERVICE                STATUS
+quasar-control-plane   Up 13 seconds (healthy)
+quasar-node-agent      Up 8 seconds (healthy)
+quasar-postgres        Up 19 seconds (healthy)
+quasar-updater         Up 19 seconds
+{"status":"ok","db":"ok"}
+
+
+===== teardown.txt
+ Network deploy_default Removed 
+run-dir before clean: 2
+--- remains:
+containers=0 volumes=0 networks=0 projects=0
+run-dir entries=0 /var/lib/quasar=0 clone=0
+cached images: Images 21 5.341GB
+

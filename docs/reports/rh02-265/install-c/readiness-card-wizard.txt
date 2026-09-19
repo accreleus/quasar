@@ -1,0 +1,203 @@
+URL https://<addr>:28443/setup
+QUASAR
+1. CREATE ADMIN
+2. INSTANCE BASICS
+3. HOST CHECK
+4. LIBRARIES
+5. FINISHING TOUCHES
+Host & GPU check
+
+What the control plane has actually heard from your node agents — not what was declared.
+
+Media (WebRTC) needs a reachable host. For remote players, configure STUN/TURN or use a shared VPN. A reverse proxy carries signaling but does not relay video.
+
+quasar-node-1
+ONLINE
+Registered 9/19/2026, 11:32:41 PM
+amd amd Granite Ridge [Radeon Graphics] — 2 encode slots, 0 active sessions
+Readiness
+Last reported 9/19/2026, 11:33:11 PM
+
+Readiness is what this host can establish about itself. It does not show whether a browser can reach the host; that depends on the network between them.
+
+CONTAINER RUNTIME
+runtime endpoint
+CAN BLOCK LAUNCHES
+
+Docker Engine - Community 29.7.1 at unix:///var/run/docker.sock answers
+
+Observed 9/19/2026, 11:33:11 PM · container runtime
+
+runtime api version
+
+API 1.53 negotiated with Docker Engine - Community 29.7.1 (the engine offers 1.40-1.55; this agent needs at least 1.40)
+
+Observed 9/19/2026, 11:33:11 PM · container runtime
+
+runtime capabilities
+
+Docker Engine - Community 29.7.1 on Unraid OS 7.4 x86_64 (x86_64), cgroup v2; security options: name=seccomp,profile=builtin, name=cgroupns; runtimes: io.containerd.runc.v2, nvidia, runc (default runc); as stated by the engine, not exercised
+
+Observed 9/19/2026, 11:33:11 PM · container runtime
+
+runtime cdi
+
+CDI is enabled (spec dirs: /etc/cdi, /var/run/cdi); devices discovered: nvidia.com/gpu=0 (cdi), nvidia.com/gpu=GPU-<uuid> (cdi), nvidia.com/gpu=all (cdi); GPU injection does not use CDI
+
+Observed 9/19/2026, 11:33:11 PM · container runtime
+
+host container mounts
+
+Required sibling-container paths agree with their host bind mounts
+
+Observed 9/19/2026, 11:33:11 PM · local check
+
+GPU & DISPLAY
+media probe gpu1
+CAN BLOCK LAUNCHES
+
+GPU 1 composited and encoded frames: encoded 32 frames with vulkanh264enc on /dev/dri/renderD129
+
+Observed 9/19/2026, 11:32:44 PM · host probe
+
+application gpu probe gpu1
+CAN BLOCK LAUNCHES
+
+An application container opened GPU 1: /lib64/libEGL.so.1 (opened /dev/dri/renderD129)
+
+Observed 9/19/2026, 11:32:44 PM · host probe
+
+render node
+
+render node open-able (/dev/dri/renderD128)
+
+Observed 9/19/2026, 11:33:11 PM · local check
+
+host render node
+
+host kernel created 2 DRM render node(s)
+
+Observed 9/19/2026, 11:33:11 PM · local check
+
+dri node app access
+
+all 4 /dev/dri node(s) are openable by the app user
+
+Observed 9/19/2026, 11:33:11 PM · local check
+
+xid visibility
+
+/dev/kmsg is readable — GPU Xid / amdgpu fault records are reported as `host.xid` / `host.gpu_fault` trace events
+
+Observed 9/19/2026, 11:33:11 PM · local check
+
+encoder codecs
+
+encoder advertises h264, h265
+
+Observed 9/19/2026, 11:33:11 PM · local check
+
+NVIDIA DRIVER
+Vulkan AV1 compatibility
+
+RTX 5090 with NVIDIA 610.57.04: Vulkan AV1 was validated on this GPU/driver combination. Codec availability still depends on the configured encoder and installed elements.
+
+Observed 9/19/2026, 11:33:11 PM · local check
+
+INPUT & SANDBOX
+input probe
+CAN BLOCK LAUNCHES
+
+Virtual input devices were created: created keyboard, mouse and gamepad devices and wrote events
+
+Observed 9/19/2026, 11:32:41 PM · host probe
+
+uinput
+
+/dev/uinput present and writable
+
+Observed 9/19/2026, 11:33:11 PM · local check
+
+user namespaces
+
+user namespaces available (max 376055)
+
+Observed 9/19/2026, 11:33:11 PM · local check
+
+AUDIO
+audio probe
+CAN BLOCK LAUNCHES
+
+The audio sidecar started: its socket appeared
+
+Observed 9/19/2026, 11:32:42 PM · host probe
+
+STORAGE
+homes root writable
+CAN BLOCK LAUNCHES
+
+the agent (QUASAR_APP_PUID unset) created, wrote and removed a test home under /mnt/cache/appdata/quasar-rh02c/homes
+
+Observed 9/19/2026, 11:33:11 PM · local check
+
+homes free space
+CAN BLOCK LAUNCHES
+
+1599 GiB free of 3726 GiB under /mnt/cache/appdata/quasar-rh02c/homes (floor 5 GiB)
+
+Observed 9/19/2026, 11:33:11 PM · local check
+
+template free space
+
+1599 GiB free of 3726 GiB under /mnt/cache/appdata/quasar-rh02c/templates (floor 5 GiB)
+
+Observed 9/19/2026, 11:33:11 PM · local check
+
+NETWORK
+media reachability
+
+this host's inbound firewall filters nothing (nft answered: no input hook chain in the ruleset) — the host itself would not block inbound WebRTC media
+
+Observed 9/19/2026, 11:33:11 PM · local check
+
+UPDATES
+updater socket
+
+Updater 7e5f85998448432f4067eb4a15a188b8effacc51 answered on its socket
+
+Observed 9/19/2026, 11:33:11 PM · local check
+
+updater stack dir
+
+Updater acts on /mnt/cache/appdata/quasar-rh02c/quasar/deploy (1 compose file(s))
+
+Observed 9/19/2026, 11:33:11 PM · local check
+
+updater overlays
+
+This agent was started with the updater's compose files
+
+Observed 9/19/2026, 11:33:11 PM · local check
+
+health addr bindable
+
+<addr>:29091 is answered by this agent
+
+Observed 9/19/2026, 11:33:11 PM · local check
+
+7 checks not applicable to this host
+
+Checks update automatically. Driver provisioning retries recoverable failures and restarts the agent when its new libraries require it. If a check requests container recreation, use Admin → Hosts.
+
+Codecs this host reports:
+H.264
+HEVC
+
+This host does not report AV1. The encoder or RTP payloader element for that codec may be unavailable, or a driver compatibility check may have disabled it. Check Readiness for the agent’s diagnosis. This is a host/driver capability gap, separate from the catalog (which already chains AV1 → HEVC → H.264 and will simply skip what this host cannot produce).
+
+Managed-home storage:
+LOCAL — /MNT/CACHE/APPDATA/QUASAR-RH02C/HOMES
+Use this host's reported path:
+/mnt/cache/appdata/quasar-rh02c/homes
+Advanced: set a different path
+Continue

@@ -1,0 +1,35 @@
+2026-09-19T13:58:01.394Z decode true after_ms 2005 sid <uuid>
+2026-09-19T13:58:15.631Z pointer lock after Capture input: true
+2026-09-19T13:59:03.599Z audio {"packets":6150,"energy":0,"level":0,"dur":61.47999999999634}
+2026-09-19T13:59:07.600Z audio {"packets":6550,"energy":0,"level":0,"dur":65.4799999999966}
+2026-09-19T13:59:15.603Z audio {"packets":7351,"energy":0,"level":0,"dur":73.49000000000069}
+2026-09-19T13:59:15.636Z video {"frames":4505,"w":2560,"h":1440,"fps":60,"codec":"CITvideo01_96_level-idx=5;profile=0;tier=0"}
+2026-09-19T14:00:07.862Z audio {"packets":12577,"energy":0,"level":0,"dur":125.75000000002743}
+2026-09-19T14:00:11.865Z audio {"packets":12977,"energy":0,"level":0,"dur":129.75000000002697}
+2026-09-19T14:00:18.867Z audio {"packets":13677,"energy":0,"level":0,"dur":136.7500000000206}
+2026-09-19T14:00:32.231Z audio {"packets":15013,"energy":0,"level":0,"dur":150.11000000000845}
+2026-09-19T14:00:36.232Z audio {"packets":15414,"energy":0,"level":0,"dur":154.1200000000048}
+2026-09-19T14:00:43.235Z audio {"packets":16114,"energy":0,"level":0,"dur":161.11999999999844}
+2026-09-19T14:00:54.133Z audio {"packets":17204,"energy":0,"level":0,"dur":172.01999999998853}
+2026-09-19T14:00:58.136Z audio {"packets":17604,"energy":0,"level":0,"dur":176.0199999999849}
+2026-09-19T14:01:05.139Z audio {"packets":18304,"energy":0,"level":0,"dur":183.01999999997852}
+2026-09-19T14:01:28.935Z audio {"packets":20684,"energy":0,"level":0,"dur":206.81999999995688}
+2026-09-19T14:01:32.937Z audio {"packets":21084,"energy":0,"level":0,"dur":210.81999999995324}
+2026-09-19T14:01:35.642Z audio {"packets":21354,"energy":0.5138661643854177,"level":0.5032502212591937,"dur":213.52999999995077}
+2026-09-19T14:01:42.277Z audio {"packets":22017,"energy":2.1452862279237905,"level":0.5036469618823817,"dur":219.95999999994493}
+
+== effective encoder (agent log, captured live)
+The real sessions on install B logged, at pipeline start:
+  session{id=<uuid> host="quasar-node-1"}: quasar_node_agent::session::pipeline::encoders: Vulkan hardware encoder: vulkanav1enc (codec=av1, 7000 kbps, rate-control=cbr, quality=0, num-ref-frames=1, ...
+  session{id=<uuid> host="quasar-node-1"}: quasar_node_agent::session::pipeline::encoders: VK-05: rearmed vulkanav1enc rate-control=cbr, bitrate=7000 kbps post-PLAYING
+The browser's inbound video track was AV1 (codec line above), 2560x1440 at 60 fps.
+These lines were read from the agent container at the time; that container was later recreated
+several times (persistence test, provisioning measurements), so its log is not in agent-final.
+
+== timed normal stop
+delete_sent_epoch_ms=1789825868778
+http=202 total_s=0.012840
+delete_acked_epoch_ms=1789825868795
+t0_epoch_ms=1789825866787
+17ms epoch_ms=1789825866805 containers=2 dirs=2
+3279ms epoch_ms=1789825870066 containers=0 dirs=0

@@ -1,0 +1,8 @@
+Captured live during run A (read-only commands on the AMD test host and inside its agent container).
+kernel (shared with the Unraid host): 6.18.47-Unraid
+userspace: Fedora Linux 43 (Container Image)
+docker engine 29.8.1, API 1.56; docker compose 5.5.1
+GPU: AMD Granite Ridge [Radeon Graphics], PCI id 1002:13c0, kernel driver amdgpu (the Unraid host's), render node /dev/dri/renderD129 (GPU index 1)
+userspace graphics in the agent image: RADV (RAPHAEL_MENDOCINO), Mesa 25.3.6; mesa-va-drivers 25.3.6
+/dev/kmsg: absent. /dev/uinput: present, root only. /dev/dri nodes: world read-write.
+tools absent on the host: openssl

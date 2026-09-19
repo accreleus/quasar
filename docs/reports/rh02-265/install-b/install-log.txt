@@ -1,0 +1,93 @@
+===== 00-preflight.txt
+recheck: containers=0 volumes=0 projects=0
+ls: cannot access '/dev/kmsg': No such file or directory
+NVIDIA GeForce RTX 5090, 610.57.04, 00000000:01:00.0, 0x2B8510DE
+610.57.04
+NVIDIA Container Toolkit CLI version 1.20.1
+time="2026-09-19T13:24:14Z" level=info msg="Found 3 CDI devices"
+nvidia.com/gpu=0
+nvidia.com/gpu=GPU-<uuid>
+nvidia.com/gpu=all
+ls: cannot access '/var/run/cdi': No such file or directory
+/etc/cdi:
+total 24
+drwxr-xr-x 1 root root    22 Sep 19 12:34 .
+drwxr-xr-x 1 root root  2250 Sep 19 12:34 ..
+-rw-r--r-- 1 root root 19253 Sep 19 12:34 nvidia.yaml
+nvidia-container-toolkit-1.20.1-1.x86_64
+enabled
+enabled
+
+===== 01-clone.txt
+Cloning into 'quasar'...
+7e5f85998448432f4067eb4a15a188b8effacc51
+deploy/.env.example
+deploy/docker-compose.nvidia.yml
+deploy/docker-compose.yml
+deploy/seed-tls-hosts.sh
+
+===== 02-env.txt
+-rw------- 1 quasar quasar 27123 Sep 19 13:24 deploy/.env
+91
+seeded QUASAR_TLS_HOSTS=<redacted>
+drwxr-xr-x 1 root root 0 Sep 19 13:24 /var/lib/quasar/homes
+
+===== 03-pull.txt
+2026-09-19T13:24:37Z
+ Image postgres:16-alpine Pulling 
+ Image quasar-updater:latest Pulling 
+ Image <local-registry>/quasar-control-plane@sha256:bfe15f9bbd35… Pulling 
+ Image <local-registry>/quasar-node-agent@sha256:10c43288d3ad… Pulling 
+ Image <local-registry>/quasar-control-plane@sha256:bfe15f9bbd35… Pulled 
+ Image <local-registry>/quasar-node-agent@sha256:10c43288d3ad… Pulled 
+ Image postgres:16-alpine Pulled 
+ Image quasar-updater:latest Error pull access denied for quasar-updater, repository does not exist or may require 'docker login': denied: requested access to the resource is denied
+Error response from daemon: pull access denied for quasar-updater, repository does not exist or may require 'docker login': denied: requested access to the resource is denied
+pull rc=1
+
+===== 04-up.txt
+ Image <local-registry>/quasar-updater:dev-7e5f859 Pulled 
+ Image postgres:16-alpine Pulled 
+pull rc=0
+UP_T0=2026-09-19T13:24:49Z
+ Container deploy-quasar-control-plane-1 Created 
+ Container deploy-quasar-node-agent-1 Creating 
+ Container deploy-quasar-node-agent-1 Created 
+ Container deploy-quasar-postgres-1 Starting 
+ Container deploy-quasar-updater-1 Starting 
+ Container deploy-quasar-postgres-1 Started 
+ Container deploy-quasar-postgres-1 Waiting 
+ Container deploy-quasar-updater-1 Started 
+ Container deploy-quasar-postgres-1 Healthy 
+ Container deploy-quasar-control-plane-1 Starting 
+ Container deploy-quasar-control-plane-1 Started 
+ Container deploy-quasar-control-plane-1 Waiting 
+ Container deploy-quasar-control-plane-1 Healthy 
+ Container deploy-quasar-node-agent-1 Starting 
+Error response from daemon: error gathering device information while adding custom device "/dev/kmsg": no such file or directory
+
+===== 05-up2.txt
+ deploy/docker-compose.yml | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+UP2_T0=2026-09-19T13:25:09Z
+ Container deploy-quasar-control-plane-1 Waiting 
+ Container deploy-quasar-control-plane-1 Healthy 
+ Container deploy-quasar-node-agent-1 Starting 
+ Container deploy-quasar-node-agent-1 Started 
+SERVICE                STATUS
+quasar-control-plane   Up 20 seconds (healthy)
+quasar-node-agent      Up 5 seconds (health: starting)
+quasar-postgres        Up 25 seconds (healthy)
+quasar-updater         Up 25 seconds
+{"status":"ok","db":"ok"}
+
+
+===== teardown.txt
+ Volume deploy_quasar-control-tls Removed 
+ Network deploy_default Removed 
+--- remains:
+containers=0 volumes=0 networks=0 projects=0
+run-dir entries=0 /var/lib/quasar=0 clone=0
+cached images=11 (Images 5.261GB)
+Ssl
+
