@@ -68,7 +68,7 @@ its own bridge network, Postgres, the control plane, a `docker:dind` engine on t
 
 ## Real-Docker evidence on the AMD test host: a live application left behind
 
-Run 2026-09-19 on `amd-test`, image from `e7da24c` pulled through the local registry.
+Run 2026-09-19 on the AMD test host, image from `e7da24c` pulled through the local registry.
 Preflight: no container of any kind on the host, so no stack and no session to disturb. The
 stack was disposable: Postgres, the control plane, and a `docker:dind` engine with
 `live-restore` on, whose dockerd was not PID 1 so it could be stopped alone. The agent ran
@@ -90,7 +90,7 @@ agent process could be SIGKILLed and come back while the engine was down.
 - **A managed home on disk.** The fixture application mounted no home, so "the home is
   preserved" was shown only as "the container that could hold one was never touched, and
   homes GC did not arm". The double's retirement tests cover the journal side.
-- **NVIDIA.** Nothing ran on `nvidia-test`. The ordering argument (no GStreamer or EGL
+- **NVIDIA.** Nothing ran on the NVIDIA test host. The ordering argument (no GStreamer or EGL
   in-process before the driver volume is adopted) rests on reading `capacity.rs` and
   `readiness.rs`.
 - **The console.** `web/` was out of scope. `startup_cleanup` is not in
