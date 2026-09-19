@@ -413,7 +413,11 @@ except Exception:
 host_reported_at_epoch() { host_json "$1" | jq -r '.host.readiness_reported_at // empty' | iso_to_epoch; }
 check_field() { host_json "$1" | jq -r --arg id "$2" --arg f "$3" '.host.readiness[]? | select(.id==$id) | (.[$f] // "" | tostring)'; } # $1 host $2 check_id $3 field
 gate_state() { host_json "$1" | jq -r '.host.readiness_gate.state // ""'; }
-blocking_len() { host_json "$1" | jq -r '.host.readiness_gate.blocking | length'; }
+# "absent" (never a number) when the host body carries no readiness_gate: a
+# control plane without the gate must not read as one with nothing blocking.
+blocking_len() { host_json "$1" | jq -r '.host.readiness_gate.blocking | if type == "array" then length else "absent" end'; }
+# blocking_count_of <host> <check_id> — entries for one check, "absent" without a gate
+blocking_count_of() { host_json "$1" | jq -r --arg id "$2" '.host.readiness_gate.blocking | if type == "array" then ([.[] | select(.check_id==$id)] | length) else "absent" end'; }
 
 # wait_check_status <host_id> <check_id> <status> <bound> [since_epoch]
 # Polls until the named check reports the given status AND (if since_epoch
@@ -1409,8 +1413,8 @@ YAML
     local has_blocks blocking
     has_blocks=$(host_json "$REAL_HOST_ID" | jq -r '.host.readiness[] | select(.id=="dri_node_app_access") | (.blocks == null)')
     if [ "$has_blocks" = "true" ]; then pass "5a: dri_node_app_access fail carries no blocks"; else fail "5a: dri_node_app_access carries blocks"; fi
-    blocking=$(host_json "$REAL_HOST_ID" | jq -r '[.host.readiness_gate.blocking[]? | select(.check_id=="dri_node_app_access")] | length')
-    if [ "$blocking" = "0" ]; then pass "5a: dri_node_app_access absent from blocking"; else fail "5a: dri_node_app_access present in blocking"; fi
+    blocking=$(blocking_count_of "$REAL_HOST_ID" dri_node_app_access)
+    if [ "$blocking" = "0" ]; then pass "5a: dri_node_app_access absent from blocking"; else fail "5a: dri_node_app_access in readiness_gate.blocking: $blocking (want 0)"; fi
   else
     unperformed "5a: dri_node_app_access never reported fail (the shadow node was not seen as unopenable by the app identity)"
   fi
@@ -1452,8 +1456,8 @@ YAML
     recreate_agent_with_override >/dev/null 2>&1 || true
     return
   fi
-  local blocking; blocking=$(host_json "$REAL_HOST_ID" | jq -r '[.host.readiness_gate.blocking[]? | select(.check_id=="audio_probe")] | length')
-  if [ "$blocking" = "0" ]; then pass "5b: audio_probe absent from blocking"; else fail "5b: audio_probe present in blocking"; fi
+  local blocking; blocking=$(blocking_count_of "$REAL_HOST_ID" audio_probe)
+  if [ "$blocking" = "0" ]; then pass "5b: audio_probe absent from blocking"; else fail "5b: audio_probe in readiness_gate.blocking: $blocking (want 0)"; fi
   local res st
   res=$(launch_app "$APP_NOHOME_ID" "$ADMIN_TOK"); st="${res%%$'\t'*}"
   if [ "$st" = "201" ]; then
@@ -1527,10 +1531,14 @@ scenario_6() {
           fail "6a: first launch (against the ready scripted host) got HTTP $st1 (want 201)$(launch_diag "$res1")"
         fi
       else
-        unperformed "6a: scripted host B never reached online+active-gate+blocking"
+        fail "6a: scripted host B is '$(host_status "${hid_b:-none}")' with gate '$(gate_state "${hid_b:-none}")' and never listed its failing check in blocking"
       fi
     else
-      unperformed "6a: scripted host A never reached online+active-gate"
+      if [ -z "$hid_a" ]; then
+        unperformed "6a: scripted host A never registered"
+      else
+        fail "6a: scripted host A is '$(host_status "$hid_a")' but its readiness gate never became active (state '$(gate_state "$hid_a")')"
+      fi
     fi
   fi
 
@@ -1588,7 +1596,11 @@ scenario_6() {
         fi
       fi
     else
-      unperformed "6c/6d: scripted host B never reached online+active-gate+blocking"
+      if [ -z "$hid_b" ]; then
+        unperformed "6c/6d: scripted host B never registered"
+      else
+        fail "6c/6d: scripted host B is '$(host_status "$hid_b")' with gate '$(gate_state "$hid_b")' and never listed its failing check in blocking"
+      fi
     fi
   fi
 
@@ -1645,7 +1657,7 @@ scenario_7() {
       audit_node=$(http_body "$(http_raw GET "admin/activity?action=host.readiness_override.set" "$ADMIN_TOK")" \
         | jq -r --arg cid "$check_id" '[.items[] | select((.details.check_id // "")==$cid)][0].details.node_name // ""')
       if [ "$audit_node" = "${RID}-real" ]; then pass "7a: the audit detail carries check_id and node_name"; else fail "7a: audit detail node_name='$audit_node' (want ${RID}-real)"; fi
-      override_was_set=1
+      if [ "$(http_status "$put1")" = "200" ]; then override_was_set=1; fi
     else
       unperformed "7a: relay rule never reached the control plane's stored readiness (diagnostic: $(relay_stats))"
     fi
