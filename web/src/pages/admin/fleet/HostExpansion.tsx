@@ -226,7 +226,14 @@ export function HostExpansion({ host, gpus, gpuError, actionError, now }: HostEx
 
       {(host.readiness?.length ?? 0) > 0 && (
         <div className="exp-readiness">
-          <ReadinessCard checks={host.readiness} reportedAt={host.readiness_reported_at} />
+          {/* Read-only summary row: no handlers, so the card shows markers but no
+              action buttons — acting on an override happens on the host detail page. */}
+          <ReadinessCard
+            checks={host.readiness}
+            reportedAt={host.readiness_reported_at}
+            gate={host.readiness_gate}
+            overrides={host.readiness_overrides}
+          />
         </div>
       )}
     </>

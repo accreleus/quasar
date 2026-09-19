@@ -61,8 +61,9 @@ func gateOf(t *testing.T, s *store, hostID string) (ReadinessGate, json.RawMessa
 	if !ok {
 		t.Fatal("readiness_overrides is omitted; openapi.yaml Host requires it")
 	}
-	if string(overrides) != "[]" {
-		t.Fatalf("readiness_overrides = %s, want [] (#263 fills it; it is never null)", overrides)
+	var overrideArray []json.RawMessage
+	if err := json.Unmarshal(overrides, &overrideArray); err != nil {
+		t.Fatalf("readiness_overrides is not an array: %s", overrides)
 	}
 	gateRaw, ok := body["readiness_gate"]
 	if !ok {
@@ -126,12 +127,19 @@ func TestHostBodyServesTheReadinessGate(t *testing.T) {
 			hostID); err != nil {
 			t.Fatalf("insert override: %v", err)
 		}
-		gate, _ := gateOf(t, s, hostID)
+		gate, overrides := gateOf(t, s, hostID)
 		if len(gate.Blocking) != 2 {
 			t.Fatalf("an override must never hide a failing check: %+v", gate.Blocking)
 		}
 		if !gate.Blocking[0].Overridden || gate.Blocking[1].Overridden {
 			t.Fatalf("overridden flags = %+v, want only input_probe", gate.Blocking)
+		}
+		var served []map[string]any
+		if err := json.Unmarshal(overrides, &served); err != nil {
+			t.Fatal(err)
+		}
+		if len(served) != 1 || served[0]["check_id"] != "input_probe" {
+			t.Fatalf("readiness_overrides = %+v, want the stored override (#263)", served)
 		}
 	})
 }

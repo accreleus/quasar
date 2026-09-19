@@ -21,6 +21,7 @@ vi.mock("../../lib/fleet/FleetContext", () => ({
 }));
 
 import * as adminApi from "../../api/admin";
+import { ApiError } from "../../api/client";
 import type { AdminSession, GPUAvailability, Host } from "../../api/types";
 import type { FleetContextValue } from "../../lib/fleet/FleetContext";
 import { HostDetail } from "./HostDetail";
@@ -48,6 +49,8 @@ function host(over: Partial<Host> = {}): Host {
     capacity_reason: null,
     readiness: [],
     readiness_reported_at: null,
+    readiness_gate: { state: "active", blocking: [] },
+    readiness_overrides: [],
     last_registered_at: "2026-08-01T00:00:00Z",
     last_heartbeat_at: new Date(NOW - 4000).toISOString(),
     storage: [{ label: "agent-data", path: "/var/lib/quasar", total_mb: 122880, available_mb: 24576 }],
@@ -136,6 +139,8 @@ beforeEach(() => {
   mocked.getPlatformReleases.mockResolvedValue({ faults: [] } as never);
   mocked.drainHost.mockResolvedValue({} as never);
   mocked.uncordonHost.mockResolvedValue({} as never);
+  mocked.setReadinessOverride.mockResolvedValue({} as never);
+  mocked.clearReadinessOverride.mockResolvedValue(undefined as never);
 });
 
 afterEach(() => {
@@ -415,6 +420,134 @@ describe("HostDetail — actions", () => {
 
     await waitFor(() => expect(screen.getByTestId("readiness-card")).toBeTruthy());
     expect(screen.getByTestId("readiness-check-nvidia_egl")).toBeTruthy();
+  });
+});
+
+describe("HostDetail — readiness override (#263)", () => {
+  const failingCheck = {
+    id: "audio_probe",
+    status: "fail",
+    summary: "No audio device detected",
+    remediation: "",
+    blocks: { scope: "host", enforced_by: "control_plane" },
+  };
+
+  it("passes the gate and overrides from the host body to the card", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({
+        readiness: [failingCheck],
+        readiness_gate: {
+          state: "active",
+          blocking: [
+            { check_id: "audio_probe", scope: "host", gpu_index: null, enforced_by: "control_plane", overridden: true },
+          ],
+        },
+        readiness_overrides: [
+          { check_id: "audio_probe", created_by: "u1", created_by_username: "alice", created_at: "2026-08-01T00:00:00Z", inert: false },
+        ],
+      }),
+    } as never);
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByTestId("readiness-overridden-audio_probe")).toBeTruthy());
+  });
+
+  it("confirms, then sets an override and refetches the host", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    mocked.getHost.mockResolvedValue({
+      host: host({
+        readiness: [failingCheck],
+        readiness_gate: {
+          state: "active",
+          blocking: [
+            { check_id: "audio_probe", scope: "host", gpu_index: null, enforced_by: "control_plane", overridden: false },
+          ],
+        },
+      }),
+    } as never);
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByTestId("readiness-override-set-audio_probe")).toBeTruthy());
+    fireEvent.click(screen.getByTestId("readiness-override-set-audio_probe"));
+
+    expect(window.confirm).toHaveBeenCalled();
+    await waitFor(() =>
+      expect(mocked.setReadinessOverride).toHaveBeenCalledWith("tok", "c2059601", "audio_probe"),
+    );
+    await waitFor(() => expect(mocked.getHost).toHaveBeenCalledTimes(2));
+  });
+
+  it("does not set an override when confirmation is declined", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+    mocked.getHost.mockResolvedValue({
+      host: host({
+        readiness: [failingCheck],
+        readiness_gate: {
+          state: "active",
+          blocking: [
+            { check_id: "audio_probe", scope: "host", gpu_index: null, enforced_by: "control_plane", overridden: false },
+          ],
+        },
+      }),
+    } as never);
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByTestId("readiness-override-set-audio_probe")).toBeTruthy());
+    fireEvent.click(screen.getByTestId("readiness-override-set-audio_probe"));
+
+    expect(mocked.setReadinessOverride).not.toHaveBeenCalled();
+  });
+
+  it("withdraws an override and refetches the host", async () => {
+    mocked.getHost.mockResolvedValue({
+      host: host({
+        readiness: [failingCheck],
+        readiness_gate: {
+          state: "active",
+          blocking: [
+            { check_id: "audio_probe", scope: "host", gpu_index: null, enforced_by: "control_plane", overridden: true },
+          ],
+        },
+        readiness_overrides: [
+          { check_id: "audio_probe", created_by: "u1", created_by_username: "alice", created_at: "2026-08-01T00:00:00Z", inert: false },
+        ],
+      }),
+    } as never);
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByTestId("readiness-override-clear-audio_probe")).toBeTruthy());
+    fireEvent.click(screen.getByTestId("readiness-override-clear-audio_probe"));
+
+    await waitFor(() =>
+      expect(mocked.clearReadinessOverride).toHaveBeenCalledWith("tok", "c2059601", "audio_probe"),
+    );
+    await waitFor(() => expect(mocked.getHost).toHaveBeenCalledTimes(2));
+  });
+
+  it("shows the conflict copy on a 409 and leaves the page usable", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    mocked.getHost.mockResolvedValue({
+      host: host({
+        readiness: [failingCheck],
+        readiness_gate: {
+          state: "active",
+          blocking: [
+            { check_id: "audio_probe", scope: "host", gpu_index: null, enforced_by: "control_plane", overridden: false },
+          ],
+        },
+      }),
+    } as never);
+    mocked.setReadinessOverride.mockRejectedValue(
+      new ApiError(409, "conflict", "audio_probe is not currently blocking launches on this host"),
+    );
+    renderDetail();
+
+    await waitFor(() => expect(screen.getByTestId("readiness-override-set-audio_probe")).toBeTruthy());
+    fireEvent.click(screen.getByTestId("readiness-override-set-audio_probe"));
+
+    await waitFor(() => expect(mocked.setReadinessOverride).toHaveBeenCalled());
+    // The page is still usable: the failing check and its button are still there.
+    expect(screen.getByTestId("readiness-override-set-audio_probe")).toBeTruthy();
   });
 });
 

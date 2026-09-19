@@ -324,3 +324,36 @@ func TestGateState(t *testing.T) {
 		t.Fatalf("wire values changed: %q %q", StateActive, StateAbstaining)
 	}
 }
+
+// TestFindBlocking: the override write path's only view of a report.
+func TestFindBlocking(t *testing.T) {
+	r := report(t,
+		chk{ID: "audio_probe", Status: "fail", Blocks: blk("host", "control_plane")},
+		chk{ID: "startup_cleanup", Status: "fail", Blocks: blk("host", "agent")},
+		chk{ID: "render_node", Status: "fail"},
+		chk{ID: "input_probe", Status: "pass", Blocks: blk("host", "control_plane")},
+	)
+	cases := []struct {
+		name       string
+		checkID    string
+		want       bool
+		enforcedBy string
+	}{
+		{"blocking and control-plane enforced", "audio_probe", true, "control_plane"},
+		{"blocking but agent enforced", "startup_cleanup", true, "agent"},
+		{"no blocks (a proxy)", "render_node", false, ""},
+		{"passing", "input_probe", false, ""},
+		{"absent", "no_such_check", false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := FindBlocking(r, tc.checkID)
+			if ok != tc.want {
+				t.Fatalf("FindBlocking(%q) ok = %v, want %v", tc.checkID, ok, tc.want)
+			}
+			if ok && got.EnforcedBy != tc.enforcedBy {
+				t.Fatalf("FindBlocking(%q).EnforcedBy = %q, want %q", tc.checkID, got.EnforcedBy, tc.enforcedBy)
+			}
+		})
+	}
+}

@@ -16,6 +16,7 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/auth"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
 	"github.com/accreleus/quasar/control-plane/internal/readiness"
+	"github.com/accreleus/quasar/control-plane/internal/readinessgate"
 )
 
 // RegistryChecker avoids an agentws import here (agentws imports session, which
@@ -37,7 +38,7 @@ type Handler struct {
 func NewHandler(pool *pgxpool.Pool, auditors ...interface {
 	Record(context.Context, string, string, string, string, map[string]any) error
 }) *Handler {
-	h := &Handler{store: &store{pool: pool}}
+	h := &Handler{store: &store{pool: pool, gate: readinessgate.New(pool)}}
 	if len(auditors) > 0 {
 		h.auditor = auditors[0]
 	}
@@ -92,6 +93,11 @@ func (h *Handler) Register(mux httpx.Router, requireAuth, requireAdmin func(http
 	mux.Handle("GET /v1/hosts", admin(http.HandlerFunc(h.handleListHosts)))
 	mux.Handle("GET /v1/hosts/{id}", admin(http.HandlerFunc(h.handleGetHost)))
 	mux.Handle("DELETE /v1/hosts/{id}", admin(http.HandlerFunc(h.handleDeleteHost)))
+
+	// Readiness override (control-api.md "Readiness override"): admin-gated at
+	// registration, before check_id validation or any host lookup.
+	mux.Handle("PUT /v1/admin/hosts/{id}/readiness-overrides/{check_id}", admin(http.HandlerFunc(h.handleSetReadinessOverride)))
+	mux.Handle("DELETE /v1/admin/hosts/{id}/readiness-overrides/{check_id}", admin(http.HandlerFunc(h.handleClearReadinessOverride)))
 
 	// Runtime presets (UI-P3). The admin UI's disabled Delete on an in-use preset
 	// is UX only; the 409 from DELETE is the enforcement (presets.go).
@@ -184,10 +190,10 @@ type hostResp struct {
 	ReadinessReportedAt *string `json:"readiness_reported_at"`
 	// ReadinessGate/ReadinessOverrides (openapi.yaml Host, both required):
 	// always serialized, and the arrays are never null.
-	ReadinessGate      ReadinessGate       `json:"readiness_gate"`
-	ReadinessOverrides []ReadinessOverride `json:"readiness_overrides"`
-	CapacityDetection  string              `json:"capacity_detection"`
-	CapacityReason     *string             `json:"capacity_reason"`
+	ReadinessGate      ReadinessGate            `json:"readiness_gate"`
+	ReadinessOverrides []readinessgate.Override `json:"readiness_overrides"`
+	CapacityDetection  string                   `json:"capacity_detection"`
+	CapacityReason     *string                  `json:"capacity_reason"`
 	// AgentConnectedSince/AgentRestartCount/AgentLastRestartAt (#429 follow-on):
 	// not yet in protocol/openapi.yaml (see store.go's Host doc comment).
 	// null/0 until the host's first connect.
@@ -329,6 +335,10 @@ func hostToResp(h Host) hostResp {
 	if gate.Blocking == nil {
 		gate.Blocking = []readiness.Blocking{}
 	}
+	overrides := h.ReadinessOverrides
+	if overrides == nil {
+		overrides = []readinessgate.Override{}
+	}
 	// Identity's built_at is served UTC: the agent sends RFC3339, the column is
 	// timestamptz, and a client rendering "built 3 days ago" should not have to
 	// reason about the control plane's local zone.
@@ -351,8 +361,7 @@ func hostToResp(h Host) hostResp {
 		Readiness:           h.Readiness,
 		ReadinessReportedAt: readinessAt,
 		ReadinessGate:       gate,
-		// #263 serves the stored rows; until then the field exists and is empty.
-		ReadinessOverrides:  []ReadinessOverride{},
+		ReadinessOverrides:  overrides,
 		CapacityDetection:   h.CapacityDetection,
 		CapacityReason:      h.CapacityReason,
 		Capacity:            h.Capacity,

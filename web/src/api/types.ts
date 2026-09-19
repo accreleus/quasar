@@ -492,6 +492,14 @@ export type HostsResponse = Omit<Schemas["HostList"], "items"> & { items: Host[]
  *  neutrally, never be rejected. */
 export type ReadinessCheck = Schemas["ReadinessCheck"];
 
+/** Amendment 11 (#260/#263, control-api.md "Readiness override — admin"). The
+ *  control plane's current verdict, always serialized on `Host`. */
+export type ReadinessGate = Schemas["ReadinessGate"];
+
+/** One admin override; `inert: true` means the host no longer reports this
+ *  check id, so the override currently excludes nothing. */
+export type ReadinessOverride = Schemas["ReadinessOverride"];
+
 // ── App-image catalog (Spec A P1: read + sync only) ───────────────────────────
 
 export type CatalogImage = Schemas["CatalogImage"];

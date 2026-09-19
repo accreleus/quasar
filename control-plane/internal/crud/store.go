@@ -11,6 +11,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/accreleus/quasar/control-plane/internal/readinessgate"
 )
 
 var ErrNotFound = errors.New("not found")
@@ -38,6 +40,20 @@ type store struct {
 	// the value the session store gates on, or a host reads `active` here while
 	// admission abstains. <= 0 means the default.
 	readinessStaleSecs int32
+	// gate is the write/read seam for readiness reports and overrides, shared
+	// with agentws (internal/readinessgate). May be nil — several tests build a
+	// store directly with just a pool — so always go through readinessGate().
+	gate *readinessgate.Gate
+}
+
+// readinessGate lazily constructs gate: Gate is a stateless wrapper over the
+// pool, so building it on demand costs nothing and keeps every `&store{pool:
+// pool}` test helper working without a NewHandler call.
+func (s *store) readinessGate() *readinessgate.Gate {
+	if s.gate == nil {
+		s.gate = readinessgate.New(s.pool)
+	}
+	return s.gate
 }
 
 // App is the domain view of an app/library entry (public + admin views use the same shape).
@@ -131,10 +147,13 @@ type Host struct {
 	// host's overrides by the same function that wrote the scheduling columns,
 	// so the two cannot disagree. `state` is judged against the database's clock
 	// and the window admission uses.
-	ReadinessGate     ReadinessGate `json:"readiness_gate"`
-	CapacityDetection string        `json:"capacity_detection"`
-	CapacityReason    *string       `json:"capacity_reason"`
-	CreatedAt         time.Time     `json:"created_at"`
+	ReadinessGate ReadinessGate `json:"readiness_gate"`
+	// ReadinessOverrides: same read as ReadinessGate's override ids (attachReadinessGates),
+	// so the gate's `overridden` flags and this list can never disagree.
+	ReadinessOverrides []readinessgate.Override `json:"readiness_overrides"`
+	CapacityDetection  string                   `json:"capacity_detection"`
+	CapacityReason     *string                  `json:"capacity_reason"`
+	CreatedAt          time.Time                `json:"created_at"`
 	// AgentConnectedSince/AgentRestartCount/AgentLastRestartAt (#429, migration
 	// 0067): surfaces a container silently revived by Docker's `unless-stopped`.
 	// Derived server-side in agentws.reconnectHost from WS timing, not

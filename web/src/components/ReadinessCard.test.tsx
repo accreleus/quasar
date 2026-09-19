@@ -523,4 +523,539 @@ describe("ReadinessCard", () => {
       expect(screen.queryByText("Needs attention")).not.toBeInTheDocument();
     });
   });
+
+  describe("readiness override (#263)", () => {
+    it("with no gate/overrides/handlers props, a failing check with blocks renders no override elements", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              id: "audio_probe",
+              status: "fail",
+              blocks: { scope: "host", enforced_by: "control_plane" },
+            }),
+          ]}
+        />,
+      );
+      expect(screen.queryByTestId("readiness-override-set-audio_probe")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("readiness-override-clear-audio_probe")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("readiness-overridden-audio_probe")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("readiness-inert-overrides")).not.toBeInTheDocument();
+    });
+
+    it("with gate.blocking entry and onSetOverride, renders a Launch anyway button", () => {
+      const onSetOverride = vi.fn();
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              id: "audio_probe",
+              status: "fail",
+              blocks: { scope: "host", enforced_by: "control_plane" },
+            }),
+          ]}
+          gate={{
+            state: "active",
+            blocking: [
+              {
+                check_id: "audio_probe",
+                scope: "host",
+                gpu_index: null,
+                enforced_by: "control_plane",
+                overridden: false,
+              },
+            ],
+          }}
+          onSetOverride={onSetOverride}
+        />,
+      );
+      const btn = screen.getByTestId("readiness-override-set-audio_probe");
+      expect(btn).toHaveAccessibleName("Launch anyway");
+      btn.click();
+      expect(onSetOverride).toHaveBeenCalledOnce();
+      expect(onSetOverride).toHaveBeenCalledWith("audio_probe");
+      expect(screen.getByTestId("readiness-blocks-audio_probe")).toHaveTextContent("Blocks launches");
+    });
+
+    it("without onSetOverride, no set button is rendered", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              id: "audio_probe",
+              status: "fail",
+              blocks: { scope: "host", enforced_by: "control_plane" },
+            }),
+          ]}
+          gate={{
+            state: "active",
+            blocking: [
+              {
+                check_id: "audio_probe",
+                scope: "host",
+                gpu_index: null,
+                enforced_by: "control_plane",
+                overridden: false,
+              },
+            ],
+          }}
+        />,
+      );
+      expect(screen.queryByTestId("readiness-override-set-audio_probe")).not.toBeInTheDocument();
+    });
+
+    it("with enforced_by: agent, no set button is rendered even with onSetOverride", () => {
+      const onSetOverride = vi.fn();
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              id: "runtime_endpoint",
+              status: "fail",
+              blocks: { scope: "host", enforced_by: "agent" },
+            }),
+          ]}
+          gate={{
+            state: "active",
+            blocking: [
+              {
+                check_id: "runtime_endpoint",
+                scope: "host",
+                gpu_index: null,
+                enforced_by: "agent",
+                overridden: false,
+              },
+            ],
+          }}
+          onSetOverride={onSetOverride}
+        />,
+      );
+      expect(screen.queryByTestId("readiness-override-set-runtime_endpoint")).not.toBeInTheDocument();
+    });
+
+    it("when check id is not in gate.blocking, no set button is rendered", () => {
+      const onSetOverride = vi.fn();
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              id: "audio_probe",
+              status: "fail",
+              blocks: { scope: "host", enforced_by: "control_plane" },
+            }),
+          ]}
+          gate={{ state: "active", blocking: [] }}
+          onSetOverride={onSetOverride}
+        />,
+      );
+      expect(screen.queryByTestId("readiness-override-set-audio_probe")).not.toBeInTheDocument();
+    });
+
+    it("when overridden, shows Overridden by admin marker with creator and date, no set button, and Withdraw override button", () => {
+      const onClearOverride = vi.fn();
+      const createdAt = "2026-09-19T10:00:00Z";
+      const expectedDateString = new Date(createdAt).toLocaleString();
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              id: "audio_probe",
+              status: "fail",
+              blocks: { scope: "host", enforced_by: "control_plane" },
+            }),
+          ]}
+          gate={{
+            state: "active",
+            blocking: [
+              {
+                check_id: "audio_probe",
+                scope: "host",
+                gpu_index: null,
+                enforced_by: "control_plane",
+                overridden: true,
+              },
+            ],
+          }}
+          overrides={[
+            {
+              check_id: "audio_probe",
+              created_by: "u1",
+              created_by_username: "alice",
+              created_at: createdAt,
+              inert: false,
+            },
+          ]}
+          onSetOverride={vi.fn()}
+          onClearOverride={onClearOverride}
+        />,
+      );
+      const row = screen.getByTestId("readiness-check-audio_probe");
+      expect(within(row).getByRole("img", { name: "Fail" })).toBeInTheDocument();
+      const marker = screen.getByTestId("readiness-overridden-audio_probe");
+      expect(marker).toHaveTextContent("Overridden by admin");
+      expect(marker).toHaveAttribute("title");
+      expect(marker.getAttribute("title")).toContain("alice");
+      expect(marker.getAttribute("title")).toContain(expectedDateString);
+      expect(screen.queryByTestId("readiness-blocks-audio_probe")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("readiness-override-set-audio_probe")).not.toBeInTheDocument();
+      const clearBtn = screen.getByTestId("readiness-override-clear-audio_probe");
+      expect(clearBtn).toHaveAccessibleName("Withdraw override");
+      clearBtn.click();
+      expect(onClearOverride).toHaveBeenCalledOnce();
+      expect(onClearOverride).toHaveBeenCalledWith("audio_probe");
+    });
+
+    it("with overridden and created_by_username: null, title does not contain null string", () => {
+      const createdAt = "2026-09-19T10:00:00Z";
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              id: "audio_probe",
+              status: "fail",
+              blocks: { scope: "host", enforced_by: "control_plane" },
+            }),
+          ]}
+          gate={{
+            state: "active",
+            blocking: [
+              {
+                check_id: "audio_probe",
+                scope: "host",
+                gpu_index: null,
+                enforced_by: "control_plane",
+                overridden: true,
+              },
+            ],
+          }}
+          overrides={[
+            {
+              check_id: "audio_probe",
+              created_by: "u1",
+              created_by_username: null,
+              created_at: createdAt,
+              inert: false,
+            },
+          ]}
+          onClearOverride={vi.fn()}
+        />,
+      );
+      const marker = screen.getByTestId("readiness-overridden-audio_probe");
+      const title = marker.getAttribute("title") || "";
+      expect(title).not.toContain("null");
+      expect(title).toContain(new Date(createdAt).toLocaleString());
+    });
+
+    it("when overridden but without onClearOverride, the Overridden marker is shown but no clear button", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              id: "audio_probe",
+              status: "fail",
+              blocks: { scope: "host", enforced_by: "control_plane" },
+            }),
+          ]}
+          gate={{
+            state: "active",
+            blocking: [
+              {
+                check_id: "audio_probe",
+                scope: "host",
+                gpu_index: null,
+                enforced_by: "control_plane",
+                overridden: true,
+              },
+            ],
+          }}
+          overrides={[
+            {
+              check_id: "audio_probe",
+              created_by: "u1",
+              created_by_username: "alice",
+              created_at: "2026-09-19T10:00:00Z",
+              inert: false,
+            },
+          ]}
+        />,
+      );
+      expect(screen.getByTestId("readiness-overridden-audio_probe")).toBeInTheDocument();
+      expect(screen.queryByTestId("readiness-override-clear-audio_probe")).not.toBeInTheDocument();
+    });
+
+    it("with overridePending matching the set button's check id, the set button is disabled", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              id: "audio_probe",
+              status: "fail",
+              blocks: { scope: "host", enforced_by: "control_plane" },
+            }),
+          ]}
+          gate={{
+            state: "active",
+            blocking: [
+              {
+                check_id: "audio_probe",
+                scope: "host",
+                gpu_index: null,
+                enforced_by: "control_plane",
+                overridden: false,
+              },
+            ],
+          }}
+          onSetOverride={vi.fn()}
+          overridePending="audio_probe"
+        />,
+      );
+      const btn = screen.getByTestId("readiness-override-set-audio_probe");
+      expect(btn).toBeDisabled();
+    });
+
+    it("with overridePending matching the clear button's check id, the clear button is disabled", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              id: "audio_probe",
+              status: "fail",
+              blocks: { scope: "host", enforced_by: "control_plane" },
+            }),
+          ]}
+          gate={{
+            state: "active",
+            blocking: [
+              {
+                check_id: "audio_probe",
+                scope: "host",
+                gpu_index: null,
+                enforced_by: "control_plane",
+                overridden: true,
+              },
+            ],
+          }}
+          overrides={[
+            {
+              check_id: "audio_probe",
+              created_by: "u1",
+              created_by_username: "alice",
+              created_at: "2026-09-19T10:00:00Z",
+              inert: false,
+            },
+          ]}
+          onClearOverride={vi.fn()}
+          overridePending="audio_probe"
+        />,
+      );
+      const btn = screen.getByTestId("readiness-override-clear-audio_probe");
+      expect(btn).toBeDisabled();
+    });
+
+    it("with a different overridePending id, buttons remain enabled", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              id: "audio_probe",
+              status: "fail",
+              blocks: { scope: "host", enforced_by: "control_plane" },
+            }),
+          ]}
+          gate={{
+            state: "active",
+            blocking: [
+              {
+                check_id: "audio_probe",
+                scope: "host",
+                gpu_index: null,
+                enforced_by: "control_plane",
+                overridden: false,
+              },
+            ],
+          }}
+          onSetOverride={vi.fn()}
+          overridePending="other_probe"
+        />,
+      );
+      const btn = screen.getByTestId("readiness-override-set-audio_probe");
+      expect(btn).not.toBeDisabled();
+    });
+
+    it("with inert overrides, shows a section with the check id, explanatory text, and a clear button", () => {
+      const onClearOverride = vi.fn();
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              id: "render_node",
+              status: "pass",
+            }),
+          ]}
+          overrides={[
+            {
+              check_id: "old_probe",
+              created_by: "u1",
+              created_by_username: "alice",
+              created_at: "2026-09-19T10:00:00Z",
+              inert: true,
+            },
+          ]}
+          onClearOverride={onClearOverride}
+        />,
+      );
+      const section = screen.getByTestId("readiness-inert-overrides");
+      expect(section).toBeInTheDocument();
+      expect(section).toHaveTextContent("old_probe");
+      expect(section).toHaveTextContent("This host no longer reports this check, so the override does nothing.");
+      const clearBtn = screen.getByTestId("readiness-override-clear-old_probe");
+      expect(clearBtn).toHaveAccessibleName("Withdraw override");
+      clearBtn.click();
+      expect(onClearOverride).toHaveBeenCalledWith("old_probe");
+    });
+
+    it("with no inert overrides, the readiness-inert-overrides element is absent", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              id: "render_node",
+              status: "pass",
+            }),
+          ]}
+          overrides={[]}
+        />,
+      );
+      expect(screen.queryByTestId("readiness-inert-overrides")).not.toBeInTheDocument();
+    });
+
+    it("with inert overrides but without onClearOverride, lists the check but has no button", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              id: "render_node",
+              status: "pass",
+            }),
+          ]}
+          overrides={[
+            {
+              check_id: "old_probe",
+              created_by: "u1",
+              created_by_username: "alice",
+              created_at: "2026-09-19T10:00:00Z",
+              inert: true,
+            },
+          ]}
+        />,
+      );
+      const section = screen.getByTestId("readiness-inert-overrides");
+      expect(section).toHaveTextContent("old_probe");
+      expect(screen.queryByTestId("readiness-override-clear-old_probe")).not.toBeInTheDocument();
+    });
+
+    it("with gate.state: abstaining, renders an abstaining marker", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              id: "audio_probe",
+              status: "fail",
+              blocks: { scope: "host", enforced_by: "control_plane" },
+            }),
+          ]}
+          gate={{
+            state: "abstaining",
+            blocking: [
+              {
+                check_id: "audio_probe",
+                scope: "host",
+                gpu_index: null,
+                enforced_by: "control_plane",
+                overridden: false,
+              },
+            ],
+          }}
+        />,
+      );
+      const marker = screen.getByTestId("readiness-gate-abstaining");
+      expect(marker).toHaveTextContent("This report is stale, so nothing is blocked until the host reports again.");
+    });
+
+    it("with gate.state: active (or no gate), the abstaining marker is absent", () => {
+      const { unmount } = render(
+        <ReadinessCard
+          checks={[
+            check({
+              id: "audio_probe",
+              status: "fail",
+              blocks: { scope: "host", enforced_by: "control_plane" },
+            }),
+          ]}
+          gate={{
+            state: "active",
+            blocking: [
+              {
+                check_id: "audio_probe",
+                scope: "host",
+                gpu_index: null,
+                enforced_by: "control_plane",
+                overridden: false,
+              },
+            ],
+          }}
+        />,
+      );
+      expect(screen.queryByTestId("readiness-gate-abstaining")).not.toBeInTheDocument();
+      unmount();
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              id: "audio_probe",
+              status: "fail",
+              blocks: { scope: "host", enforced_by: "control_plane" },
+            }),
+          ]}
+        />,
+      );
+      expect(screen.queryByTestId("readiness-gate-abstaining")).not.toBeInTheDocument();
+    });
+
+    it("shows the Needs attention chip for an overridden failing check", () => {
+      render(
+        <ReadinessCard
+          checks={[
+            check({
+              id: "audio_probe",
+              status: "fail",
+              blocks: { scope: "host", enforced_by: "control_plane" },
+            }),
+          ]}
+          gate={{
+            state: "active",
+            blocking: [
+              {
+                check_id: "audio_probe",
+                scope: "host",
+                gpu_index: null,
+                enforced_by: "control_plane",
+                overridden: true,
+              },
+            ],
+          }}
+          overrides={[
+            {
+              check_id: "audio_probe",
+              created_by: "u1",
+              created_by_username: "alice",
+              created_at: "2026-09-19T10:00:00Z",
+              inert: false,
+            },
+          ]}
+        />,
+      );
+      expect(screen.getByText("Needs attention")).toBeInTheDocument();
+    });
+  });
 });

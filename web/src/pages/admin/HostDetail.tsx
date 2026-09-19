@@ -7,6 +7,7 @@
 import { useMemo } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import * as adminApi from "../../api/admin";
+import { ApiError } from "../../api/client";
 import type { GPUAvailability, Host, PlatformReleaseFault } from "../../api/types";
 import { useAuth } from "../../auth/context";
 import { Breadcrumbs } from "../../components/Breadcrumbs";
@@ -96,6 +97,40 @@ export function HostDetail() {
         target.status === "draining" ? "could not resume scheduling" : "could not drain host",
     },
   );
+
+  // One shared pending id: the card disables whichever button (set or clear)
+  // matches, and only one override action is in flight for a given check.
+  const setOverride = useAdminAction<[string], void>(
+    async (checkId) => {
+      if (!token || !host) return;
+      await adminApi.setReadinessOverride(token, host.id, checkId);
+      await res.refresh({ silent: true });
+    },
+    {
+      success: (_r, checkId) => `Launches on this host may proceed despite ${checkId} failing`,
+      failure: (e, checkId) =>
+        e instanceof ApiError && e.code === "conflict"
+          ? { title: "Could not set the override", body: e.message }
+          : `Could not set an override for ${checkId}`,
+    },
+  );
+
+  const clearOverride = useAdminAction<[string], void>(
+    async (checkId) => {
+      if (!token || !host) return;
+      await adminApi.clearReadinessOverride(token, host.id, checkId);
+      await res.refresh({ silent: true });
+    },
+    {
+      success: (_r, checkId) => `The override for ${checkId} was withdrawn`,
+      failure: (e, checkId) =>
+        e instanceof ApiError && e.code === "conflict"
+          ? { title: "Could not withdraw the override", body: e.message }
+          : `Could not withdraw the override for ${checkId}`,
+    },
+  );
+
+  const overridePending = setOverride.pending?.[0] ?? clearOverride.pending?.[0] ?? null;
 
   const crumbs = (
     <Breadcrumbs
@@ -191,6 +226,19 @@ export function HostDetail() {
         layout="grid"
         checks={host.readiness}
         reportedAt={host.readiness_reported_at}
+        gate={host.readiness_gate}
+        overrides={host.readiness_overrides}
+        onSetOverride={(checkId) => {
+          if (
+            window.confirm(
+              `Let sessions launch on ${host.node_name} although the "${checkId}" check is failing?`,
+            )
+          ) {
+            void setOverride.run(checkId);
+          }
+        }}
+        onClearOverride={(checkId) => void clearOverride.run(checkId)}
+        overridePending={overridePending}
         footnote={
           <>
             The <strong>Restart agent</strong> action on this host's settings page re-runs

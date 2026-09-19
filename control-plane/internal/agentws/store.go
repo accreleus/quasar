@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/accreleus/quasar/control-plane/internal/hostenroll"
+	"github.com/accreleus/quasar/control-plane/internal/readinessgate"
 )
 
 var (
@@ -412,7 +413,7 @@ func (s *agentStore) upsertCapacityWithDetection(ctx context.Context, hostID str
 	// After the GPU set is settled: a GPU row that appears here starts
 	// readiness_blocked = false, and without this it would stay schedulable
 	// until the next readiness report even though the stored one names it.
-	if err := recomputeReadinessVerdict(ctx, tx, hostID); err != nil {
+	if err := readinessgate.New(s.pool).Recompute(ctx, tx, hostID); err != nil {
 		return err
 	}
 
@@ -465,21 +466,7 @@ func (s *agentStore) upsertHostReadiness(ctx context.Context, hostID string, raw
 	if _, ok := ValidReadiness(raw); !ok {
 		return fmt.Errorf("malformed readiness payload (%d bytes); not stored", len(raw))
 	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-
-	if _, err := tx.Exec(ctx,
-		`UPDATE hosts SET readiness = $2, readiness_reported_at = now() WHERE id = $1`,
-		hostID, []byte(raw)); err != nil {
-		return fmt.Errorf("update host readiness: %w", err)
-	}
-	if err := recomputeReadinessVerdict(ctx, tx, hostID); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
+	return readinessgate.New(s.pool).StoreReport(ctx, hostID, raw)
 }
 
 // upsertHostCodecs writes hosts.codecs (multi-codec spec §3.1.2).

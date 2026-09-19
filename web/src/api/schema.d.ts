@@ -5034,6 +5034,81 @@ export interface paths {
         };
         trace?: never;
     };
+    "/v1/admin/hosts/{id}/readiness-overrides/{check_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+                /** @description The agent-owned readiness check id, as it appears in the host's readiness report. */
+                check_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /** Launch on this host despite one named failing readiness check (amendment 11, */
+        put: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                    /** @description The agent-owned readiness check id, as it appears in the host's readiness report. */
+                    check_id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description The override (existing or new). */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ReadinessOverride"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                409: components["responses"]["Conflict"];
+            };
+        };
+        post?: never;
+        /** Withdraw a readiness override (amendment 11, */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                    /** @description The agent-owned readiness check id, as it appears in the host's readiness report. */
+                    check_id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description No override remains for this check. */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/admin/hosts/{id}/restart": {
         parameters: {
             query?: never;

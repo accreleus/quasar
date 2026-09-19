@@ -21,6 +21,7 @@ import type {
   ConsoleConfigEnvelope,
   HostRestartResponse,
   Host,
+  ReadinessOverride,
   ProfilePolicyResponse,
   AdminStreamProfilesResponse,
   StreamProfile,
@@ -562,6 +563,33 @@ export function uncordonHost(token: string, id: string): Promise<{ host: import(
     method: "POST",
     token,
   });
+}
+
+/** control-api.md "Readiness override — admin". Idempotent: repeating it
+ *  returns the existing override and writes no second audit row. `409
+ *  conflict` when the check is not currently blocking (agent-enforced, or
+ *  not reported as a failing `blocks` check); the server message says which. */
+export function setReadinessOverride(
+  token: string,
+  hostId: string,
+  checkId: string,
+): Promise<ReadinessOverride> {
+  return apiFetch<ReadinessOverride>(
+    `/admin/hosts/${encodeURIComponent(hostId)}/readiness-overrides/${encodeURIComponent(checkId)}`,
+    { method: "PUT", token },
+  );
+}
+
+/** `204`, idempotent (also `204` when no override exists). */
+export function clearReadinessOverride(
+  token: string,
+  hostId: string,
+  checkId: string,
+): Promise<void> {
+  return apiFetch<void>(
+    `/admin/hosts/${encodeURIComponent(hostId)}/readiness-overrides/${encodeURIComponent(checkId)}`,
+    { method: "DELETE", token },
+  );
 }
 
 // ── Session oversight (P2-10) ─────────────────────────────────────────────────

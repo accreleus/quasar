@@ -30,6 +30,8 @@ function host(over: Partial<Host> = {}): Host {
     capacity_reason: null,
     readiness: [],
     readiness_reported_at: null,
+    readiness_gate: { state: "active", blocking: [] },
+    readiness_overrides: [],
     last_registered_at: "2026-08-01T00:00:00Z",
     last_heartbeat_at: new Date(NOW - 4000).toISOString(),
     storage: [{ label: "agent-data", path: "/var/lib/quasar", total_mb: 122880, available_mb: 98304 }],

@@ -3,8 +3,9 @@
 // full by StepHosts, the Hosts tab's expanded row and the host detail page (as
 // a full-width grid). Host settings deliberately does not repeat it.
 
-import type { ReadinessCheck } from "../api/types";
+import type { ReadinessCheck, ReadinessGate, ReadinessOverride } from "../api/types";
 import { groupChecks } from "../lib/readiness/groups";
+import { Button } from "./Button";
 import { Chip } from "./Chip";
 import { CopyableCommand } from "./CopyableCommand";
 import { IconCheck, IconClose, IconWarning } from "./icons";
@@ -80,6 +81,22 @@ function blocksTitle(b: ReadinessBlocks): string | null {
   return b.enforced_by === "agent" ? `${base}. Enforced by the host agent; cannot be overridden.` : base;
 }
 
+type GateBlockingEntry = ReadinessGate["blocking"][number];
+
+function findBlockingEntry(gate: ReadinessGate | undefined, checkId: string): GateBlockingEntry | undefined {
+  return gate?.blocking.find((b) => b.check_id === checkId);
+}
+
+// Never the string "null": an override's creator can be unknown (a deleted
+// user), and the sentence must still read.
+function overriddenTitle(o: ReadinessOverride | undefined): string {
+  if (!o) return "Overridden by an admin.";
+  const created = new Date(o.created_at).toLocaleString();
+  return o.created_by_username
+    ? `Overridden by ${o.created_by_username} on ${created}.`
+    : `Overridden by an admin on ${created}.`;
+}
+
 export interface ReadinessCardProps {
   /** `Host.readiness`. `null` = never reported; `[]` = reported, nothing to check. */
   checks: ReadinessCheck[] | null;
@@ -95,6 +112,20 @@ export interface ReadinessCardProps {
    *  tiles them in an auto-fill grid for a full-width card, so a dozen checks
    *  take two rows on a wide screen instead of a column three screens tall. */
   layout?: "list" | "grid";
+  /** `Host.readiness_gate` (#263). Omitted entirely by a setup-wizard render
+   *  and by a pre-amendment control plane — the card then renders exactly as
+   *  before, with no override UI. */
+  gate?: ReadinessGate;
+  /** `Host.readiness_overrides`. */
+  overrides?: ReadinessOverride[];
+  /** Renders "Launch anyway" on a check the gate lists as blocking, not yet
+   *  overridden and not agent-enforced. Omit to hide the control entirely. */
+  onSetOverride?: (checkId: string) => void;
+  /** Renders "Withdraw override" wherever an override is shown (overridden
+   *  check or inert-overrides list). Omit to hide the control entirely. */
+  onClearOverride?: (checkId: string) => void;
+  /** check_id of the override currently being set/cleared; disables its button. */
+  overridePending?: string | null;
 }
 
 export function ReadinessCard({
@@ -103,6 +134,11 @@ export function ReadinessCard({
   footnote,
   advisoryNote,
   layout = "list",
+  gate,
+  overrides,
+  onSetOverride,
+  onClearOverride,
+  overridePending,
 }: ReadinessCardProps) {
   // `!= null` on purpose: a stale/pre-amendment fixture or agent may omit the
   // field entirely (undefined) rather than sending null, and both mean the
@@ -114,10 +150,16 @@ export function ReadinessCard({
   const { groups, notApplicable } = groupChecks(checks ?? []);
   const rowClass = layout === "grid" ? "readiness-check" : "host-setting-row";
   const listClass = layout === "grid" ? "readiness-grid" : "col gap3";
+  const inertOverrides = overrides?.filter((o) => o.inert) ?? [];
 
   const renderCheck = (c: ReadinessCheck) => {
     const provenance = provenanceText(c);
-    const blocksLabel = c.blocks && blocksTitle(c.blocks);
+    const blockingEntry = findBlockingEntry(gate, c.id);
+    const overridden = blockingEntry?.overridden === true;
+    const blocksLabel = !overridden && c.blocks && blocksTitle(c.blocks);
+    const canSetOverride =
+      !!blockingEntry && !overridden && blockingEntry.enforced_by !== "agent" && !!onSetOverride;
+    const override = overrides?.find((o) => o.check_id === c.id);
     return (
       <div key={c.id} className={rowClass} data-testid={`readiness-check-${c.id}`}>
         <div className="host-setting-copy">
@@ -130,6 +172,37 @@ export function ReadinessCard({
                   {c.status === "fail" ? "Blocks launches" : "Can block launches"}
                 </Chip>
               </span>
+            )}
+            {overridden && (
+              <span data-testid={`readiness-overridden-${c.id}`} title={overriddenTitle(override)}>
+                <Chip variant="warning" className="chip-sm">
+                  Overridden by admin
+                </Chip>
+              </span>
+            )}
+            {canSetOverride && (
+              <Button
+                variant="danger"
+                size="sm"
+                data-testid={`readiness-override-set-${c.id}`}
+                disabled={overridePending === c.id}
+                onClick={() => onSetOverride?.(c.id)}
+                title="Let sessions launch on this host although this check is failing. The check stays visible, and the override ends when the check next passes."
+              >
+                Launch anyway
+              </Button>
+            )}
+            {overridden && onClearOverride && (
+              <Button
+                variant="ghost"
+                size="sm"
+                data-testid={`readiness-override-clear-${c.id}`}
+                disabled={overridePending === c.id}
+                onClick={() => onClearOverride(c.id)}
+                title="Withdraw the override; this check goes back to blocking launches as normal."
+              >
+                Withdraw override
+              </Button>
             )}
           </div>
           <p>{c.summary}</p>
@@ -177,6 +250,12 @@ export function ReadinessCard({
 
       {advisoryNote}
 
+      {gate?.state === "abstaining" && gate.blocking.length > 0 && (
+        <p className="note warn" data-testid="readiness-gate-abstaining" style={{ marginBottom: 0 }}>
+          This report is stale, so nothing is blocked until the host reports again.
+        </p>
+      )}
+
       {!hasChecks && (
         <p className="muted" style={{ marginBottom: 0 }} data-testid="readiness-empty">
           {checks == null ? "This host has not reported readiness checks yet." : "No readiness checks reported."}
@@ -208,6 +287,31 @@ export function ReadinessCard({
             {notApplicable.map(renderCheck)}
           </div>
         </details>
+      )}
+
+      {inertOverrides.length > 0 && (
+        <div className="col gap3" data-testid="readiness-inert-overrides">
+          <div className="eyebrow">Inert overrides</div>
+          {inertOverrides.map((o) => (
+            <div key={o.check_id} className="row gap2" style={{ alignItems: "center" }}>
+              <span className="mono">{o.check_id}</span>
+              <span className="muted" style={{ fontSize: "var(--t-xs)" }}>
+                This host no longer reports this check, so the override does nothing.
+              </span>
+              {onClearOverride && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  data-testid={`readiness-override-clear-${o.check_id}`}
+                  disabled={overridePending === o.check_id}
+                  onClick={() => onClearOverride(o.check_id)}
+                >
+                  Withdraw override
+                </Button>
+              )}
+            </div>
+          ))}
+        </div>
       )}
 
       {footnote && (

@@ -148,6 +148,19 @@ func Evaluate(report json.RawMessage, overrides []string) Verdict {
 	return v
 }
 
+// FindBlocking returns the report's blocking entry for checkID — a check
+// carrying `blocks` with status `fail` — if any. The override write path uses
+// this instead of re-decoding the report to decide overridability, so the two
+// can never disagree on what counts as blocking.
+func FindBlocking(report json.RawMessage, checkID string) (Blocking, bool) {
+	for _, b := range Evaluate(report, nil).Blocking {
+		if b.CheckID == checkID {
+			return b, true
+		}
+	}
+	return Blocking{}, false
+}
+
 // check is one decoded report entry.
 type check struct {
 	id         string

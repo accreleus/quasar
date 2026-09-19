@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/readiness"
+	"github.com/accreleus/quasar/control-plane/internal/readinessgate"
 )
 
 // ReadinessGate is the served `readiness_gate` (openapi.yaml, control-api.md
@@ -15,16 +16,6 @@ import (
 type ReadinessGate struct {
 	State    string               `json:"state"`
 	Blocking []readiness.Blocking `json:"blocking"`
-}
-
-// ReadinessOverride is the served `readiness_overrides` entry. #263 fills the
-// array; #262 ships the shape so the host body is complete.
-type ReadinessOverride struct {
-	CheckID           string  `json:"check_id"`
-	CreatedBy         *string `json:"created_by"`
-	CreatedByUsername *string `json:"created_by_username"`
-	CreatedAt         string  `json:"created_at"`
-	Inert             bool    `json:"inert"`
 }
 
 // defaultReadinessStaleSecs mirrors the scheduler's default so a store built
@@ -38,8 +29,9 @@ func (s *store) readinessWindow() time.Duration {
 	return time.Duration(s.readinessStaleSecs) * time.Second
 }
 
-// attachReadinessGates fills every host's verdict from its stored report and
-// its overrides, by the same function that wrote the scheduling columns.
+// attachReadinessGates fills every host's verdict AND its served overrides
+// from one read (Gate.Overrides), so the gate's `overridden` flags and
+// readiness_overrides can never disagree about which ids are stored.
 //
 // dbNow is the database's clock, read in the same statement as the rows: the
 // served state must be the one the admission SQL would reach, not one the
@@ -52,31 +44,36 @@ func (s *store) attachReadinessGates(ctx context.Context, hosts []Host, dbNow ti
 	for i, h := range hosts {
 		ids[i] = h.ID
 	}
-	rows, err := s.pool.Query(ctx,
-		`SELECT host_id::text, check_id FROM host_readiness_overrides WHERE host_id::text = ANY($1)`, ids)
+	byHost, err := s.readinessGate().Overrides(ctx, ids)
 	if err != nil {
-		return fmt.Errorf("query readiness overrides: %w", err)
-	}
-	defer rows.Close()
-	byHost := map[string][]string{}
-	for rows.Next() {
-		var hostID, checkID string
-		if err := rows.Scan(&hostID, &checkID); err != nil {
-			return fmt.Errorf("scan readiness override: %w", err)
-		}
-		byHost[hostID] = append(byHost[hostID], checkID)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate readiness overrides: %w", err)
+		return fmt.Errorf("read readiness overrides: %w", err)
 	}
 
 	window := s.readinessWindow()
 	for i := range hosts {
-		v := readiness.Evaluate(hosts[i].Readiness, byHost[hosts[i].ID])
+		overrides := byHost[hosts[i].ID]
+		overrideIDs := make([]string, len(overrides))
+		for j, o := range overrides {
+			overrideIDs[j] = o.CheckID
+		}
+		v := readiness.Evaluate(hosts[i].Readiness, overrideIDs)
 		hosts[i].ReadinessGate = ReadinessGate{
 			State:    readiness.GateState(hosts[i].ReadinessReportedAt, dbNow, window),
 			Blocking: v.Blocking,
 		}
+		// Inert from this host snapshot, the one `blocking` was judged on: the
+		// override read is a later statement, and a report landing between the
+		// two would otherwise serve an entry as both overriding and inert.
+		inert := make(map[string]bool, len(v.Inert))
+		for _, id := range v.Inert {
+			inert[id] = true
+		}
+		served := make([]readinessgate.Override, len(overrides))
+		for j, o := range overrides {
+			o.Inert = inert[o.CheckID]
+			served[j] = o
+		}
+		hosts[i].ReadinessOverrides = served
 	}
 	return nil
 }

@@ -66,6 +66,17 @@ own; the two do not move together, and that is deliberate.
   `readiness_gate` and `readiness_overrides`. Migration 0085 adds the derived columns and
   the (not yet used) override table; once applied, never roll the control plane back below
   it. Swapping apps in a running session is not gated.
+- **An admin can launch on a host despite one named failing readiness check (#263).**
+  `PUT /v1/admin/hosts/{id}/readiness-overrides/{check_id}` records the override and `DELETE`
+  withdraws it; both are admin-only, enforced on the server. An override applies to that
+  check on that host only and never hides it: the card keeps showing the failing check, with
+  an "Overridden by admin" marker and a control to withdraw it. The control plane removes
+  the override when a later report shows the check passing, so it cannot hide a later
+  regression. It is refused (`409`) when the check is not currently a block, and the agent's
+  own safety states (container runtime unusable, startup cleanup unresolved) cannot be
+  overridden. An override for a check the host no longer reports is shown as inert and can
+  be withdrawn. Setting, withdrawing and lapsing are written to the activity log; setting
+  is `warn`, the other two `info`.
 
 ### Removed
 - **The node agent no longer needs a `docker` or `podman` executable (#239).** Every

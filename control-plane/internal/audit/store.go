@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -109,24 +110,50 @@ func (s *Store) Record(ctx context.Context, actorUserID, action, targetType, tar
 	if s == nil || s.pool == nil {
 		return nil
 	}
+	b, err := boundedDetails(details)
+	if err != nil {
+		return err
+	}
+	if _, err := s.pool.Exec(ctx, insertActivitySQL,
+		actorUserID, action, targetType, targetID, b); err != nil {
+		return fmt.Errorf("insert audit event: %w", err)
+	}
+	return nil
+}
+
+// RecordTx is Record inside a caller-owned transaction: a rolled-back change
+// leaves no row, and a committed one always has one. Used where the audit row
+// must land atomically with the change it describes (readinessgate).
+func RecordTx(ctx context.Context, tx pgx.Tx, actorUserID, action, targetType, targetID string, details map[string]any) error {
+	b, err := boundedDetails(details)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, insertActivitySQL,
+		actorUserID, action, targetType, targetID, b); err != nil {
+		return fmt.Errorf("insert audit event: %w", err)
+	}
+	return nil
+}
+
+const insertActivitySQL = `
+	INSERT INTO admin_activity (actor_user_id, action, target_type, target_id, details)
+	VALUES (NULLIF($1, '')::uuid, $2, $3, NULLIF($4, ''), $5::jsonb)
+`
+
+// boundedDetails marshals and bounds details, shared by Record and RecordTx.
+func boundedDetails(details map[string]any) ([]byte, error) {
 	if details == nil {
 		details = map[string]any{}
 	}
 	b, err := json.Marshal(details)
 	if err != nil {
-		return fmt.Errorf("marshal audit details: %w", err)
+		return nil, fmt.Errorf("marshal audit details: %w", err)
 	}
 	if n := renderedSize(b); n > maxDetailBytes {
-		return fmt.Errorf("audit details render to %d bytes, over the %d-byte limit", n, maxDetailBytes)
+		return nil, fmt.Errorf("audit details render to %d bytes, over the %d-byte limit", n, maxDetailBytes)
 	}
-	_, err = s.pool.Exec(ctx, `
-		INSERT INTO admin_activity (actor_user_id, action, target_type, target_id, details)
-		VALUES (NULLIF($1, '')::uuid, $2, $3, NULLIF($4, ''), $5::jsonb)
-	`, actorUserID, action, targetType, targetID, b)
-	if err != nil {
-		return fmt.Errorf("insert audit event: %w", err)
-	}
-	return nil
+	return b, nil
 }
 
 func (s *Store) List(ctx context.Context, cursor int64, limit int, f ListFilter) ([]Item, *int64, error) {
