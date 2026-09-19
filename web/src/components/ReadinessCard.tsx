@@ -197,7 +197,7 @@ export function ReadinessCard({
           )}
           {/* Below the text, not in the heading row: a narrow grid tile has no room for a button beside the title. */}
           {(canSetOverride || (overridden && onClearOverride)) && (
-            <div className="row gap2">
+            <div className="row gap2" style={{ marginTop: "var(--s2)" }}>
               {canSetOverride && (
                 <Button
                   variant="danger"
