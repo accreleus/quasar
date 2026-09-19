@@ -229,7 +229,7 @@ pub fn startup_cleanup(client: &RuntimeClient) -> CleanupAttempt {
         Ok(()) => Ok(()),
         Err(error) => {
             error!(token = "runtime-application-retirement-pending", %error,
-                "previous application retirement is unresolved; entering diagnostic mode to protect managed homes");
+                "previous application retirement is unresolved; managed homes stay protected until it completes");
             Err(error.to_string())
         }
     };

@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Ticket | #256, specification #252 "Diagnostic registration", ADR 0005 |
-| Source | `e7da24c` on `initiative/resilient-host-architecture` |
+| Source | `initiative/resilient-host-architecture`. Every run below used the image built from `e7da24c`; the one later code change rewords a log line. |
 | Not on | `develop`, `main`. No tag, no image publication, no Actions build, no deployed stack touched. |
 | Images | `quasar-node-agent` from `e7da24c` (`deploy/build-images.sh runtime --toolchain registry --no-prune`, contract 148 pass / 0 fail / 2 GPU-gated skips) and `quasar-control-plane` from `dd2c97b` (contract 23 / 0; no control-plane source changed). Local to the development host; rebuild elsewhere. |
 
@@ -66,21 +66,45 @@ its own bridge network, Postgres, the control plane, a `docker:dind` engine on t
 | Withheld work | Zero `homes-gc`, `drvvol-*`, `cudart-*`, `host-probe-*` or `image-*` lines before the resume. |
 | Engine restarted | `boot-diagnostic-resumed` on the next retry. Container `StartedAt`, pid and `RestartCount=0` unchanged; one process start in the whole window. Health 200; `runtime_endpoint` pass; `startup_cleanup` gone from the card. |
 
+## Real-Docker evidence on the AMD test host: a live application left behind
+
+Run 2026-09-19 on `amd-test`, image from `e7da24c` pulled through the local registry.
+Preflight: no container of any kind on the host, so no stack and no session to disturb. The
+stack was disposable: Postgres, the control plane, and a `docker:dind` engine with
+`live-restore` on, whose dockerd was not PID 1 so it could be stopped alone. The agent ran
+inside that engine, as production does, because a launch is refused unless the agent can
+inspect its own mounts through the engine it controls. Its PID 1 was a respawn loop so the
+agent process could be SIGKILLed and come back while the engine was down.
+
+| Step | Observed |
+|---|---|
+| Before | 28 of 28 readiness checks pass. A real session on the AMD GPU (VA encoder) is `running`: application container `c1ba7037…` and audio sidecar `c4dd7917…`, one application journal. |
+| dockerd stopped, agent SIGKILLed | Both containers keep running (live-restore). The respawned agent logs `runtime-application-retirement-pending` and `boot-diagnostic-mode`, and registers. |
+| Card, health, launch | `runtime_endpoint` fail, `startup_cleanup` fail, each with its fix; health 503; `POST /v1/sessions` ends `failed` with "agent rejected assign: host in diagnostic mode (runtime_unusable)…". |
+| While diagnostic | The leftover application's process is untouched. Zero homes-GC, provisioner, host-probe or image lines among the 21 log lines between `boot-diagnostic-mode` and `boot-diagnostic-resumed`. |
+| dockerd restarted | Resumed on the next retry, 15 s later, agent pid unchanged (1773), container `RestartCount=0`. Engine events: `stop`, `die`, `destroy` for exactly `c1ba7037…` and `c4dd7917…`. The journal reads `Completed`. No application container was created. |
+| After the resume | Homes GC arms 3 ms after `boot-diagnostic-resumed`, then host probes start (their own short-lived probe containers are the only creates). Health 200, runtime checks pass, `startup_cleanup` gone. |
+
 ## Not verified
 
-- **A journalled application on a real engine.** The development host has no usable GPU, so no
-  session could be left behind to retire. "The same obligation completes under the same
-  identity, and nothing new is created" is proven on the scripted Engine double only
-  (`runtime/helper_tests/diagnostic_registration.rs`).
-- **GPU hosts.** Nothing ran on `gpu-test` or an AMD host. The NVIDIA ordering argument (no
-  GStreamer or EGL in-process before the driver volume is adopted) rests on reading
-  `capacity.rs` and `readiness.rs`, not on a run.
+- **A managed home on disk.** The fixture application mounted no home, so "the home is
+  preserved" was shown only as "the container that could hold one was never touched, and
+  homes GC did not arm". The double's retirement tests cover the journal side.
+- **NVIDIA.** Nothing ran on `nvidia-test`. The ordering argument (no GStreamer or EGL
+  in-process before the driver volume is adopted) rests on reading `capacity.rs` and
+  `readiness.rs`.
 - **The console.** `web/` was out of scope. `startup_cleanup` is not in
   `web/src/lib/readiness/groups.ts`, so the card shows it under "Other" with no "blocks
   launches" marker.
 
 ## Handoff notes
 
+- **A separate finding, not #256.** With the Vulkan encoder the scheduler admits only GPU
+  `index = 0` (`schedulableBindingSQL`). On the AMD test host the one visible GPU is index 1,
+  because the kernel enumerates both of the machine's cards, so every launch there is
+  `no_host_available` until the encoder is set to `va`. The evidence run used `va`.
+- An agent only outlives its engine when dockerd restarts under `live-restore`, or when the
+  socket it was given is wrong. Stopping the engine that runs the agent stops the agent.
 - The boot sanity gate is unchanged and still runs on the first normal connection, so after a
   resume it can exit for retry exactly as it would have at boot. The development host shows
   this: its containers see the host's GPUs under `/sys/class/drm` with no `/dev/dri`. A fresh
