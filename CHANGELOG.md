@@ -67,7 +67,7 @@ own; the two do not move together, and that is deliberate.
   in the same process and reconnects normally. The health endpoint (`/health`) returns
   `503 {"status":"diagnostic","ready":false}` while in this mode. Withheld in diagnostic
   mode: managed-home garbage collection, NVIDIA driver and CUDA provisioners, image pulls
-  and pruning, and host probes.
+  and pruning, and host probes. The console shows `startup_cleanup` first in the readiness card's Container runtime group.
 - **The startup sweep of pre-API containers runs through the runtime API (#239).** A
   *legacy container* — a sibling from an older agent, identified only by this agent's
   owner label plus an allowed name prefix — is re-inspected by its immutable ID before
@@ -118,6 +118,7 @@ own; the two do not move together, and that is deliberate.
   60 s now counts as failed (`token=readiness-refresh-overdue`) instead of leaving the card
   silently stale, and no second refresh starts until it ends. Check ids and the wire shape
   are unchanged.
+- **The host installer's compose carries `QUASAR_HOMES_FREE_SPACE_FLOOR_GIB` (#253).** The knob was added to `deploy/docker-compose.yml` with the storage readiness checks but not to the copy `deploy/enroll-host.sh` prints, so a host installed with the script could not set the homes free-space floor, and the compose drift guard (`TestEnrollHostComposeMatchesBase`) failed `make test-go`.
 - **Codec eligibility and decode history now follow the device that asked, not the account's
   newest one** (#203). With a browser and the native client signed into one account, every read
   of a device's capability probe and of its decode-failure history was keyed on whichever
