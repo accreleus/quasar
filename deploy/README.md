@@ -1041,6 +1041,35 @@ adding the service to an existing install.
 It needs `QUASAR_STACK_DIR` set to this directory's absolute host path.
 `deploy/redeploy.sh` seeds it.
 
+## A second install on the same host
+
+A second, isolated Quasar beside an existing one on the same Docker engine
+works, but every value below has to differ from the first install's
+`deploy/.env` — none of it is optional:
+
+- **`COMPOSE_PROJECT_NAME`.** Nothing above sets it, so every install using
+  this layout is the Compose project `deploy` (Compose defaults the project
+  name to the directory it runs from). A second install that doesn't set its
+  own name adopts the first install's containers, volumes and network instead
+  of creating its own.
+- **`CONTROL_PORT`** and **`QUASAR_TLS_PORT`** — the control plane's two
+  published ports. Leaving these at the shared defaults (`8080` / `8443`)
+  collides on the host as soon as the second stack tries to publish them.
+- **`QUASAR_HEALTH_ADDR`** — the node agent runs with `network_mode: host`, so
+  its health port is a host-wide bind, not a per-container one. Two agents
+  both left at the default `127.0.0.1:9091` fight over the same address; give
+  the second one its own loopback port (e.g. `127.0.0.1:9191`).
+- **Its own `QUASAR_HOME_ROOT`, `QUASAR_TEMPLATE_ROOT`, and `QUASAR_STACK_DIR`**,
+  each a path distinct from the first install's, in one path form (e.g. on an
+  unraid-style host, both installs under the same persistent share:
+  `/mnt/user/appdata/quasar-a/homes` and `/mnt/user/appdata/quasar-b/homes`).
+
+**What cannot be separated:** the node agent's host runtime directory is
+bind-mounted at the fixed path `/run/quasar-agent` (not a variable). Two
+agents *running at the same time* on one engine would share that directory —
+this is untested and not a supported arrangement. Only one install's agent
+running while the other is stopped has been exercised.
+
 ## Upgrading, backups, and rollback
 
 Before pulling a new version onto a running stack, back up Postgres and read
