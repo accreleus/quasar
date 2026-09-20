@@ -273,6 +273,54 @@ The single run-1 failure was:
 
 It did not recur in run 2, nor in the two #264 runs, and the agent log covering run 1 was not retained. Recorded on #267 as a possibly related data point. It is carried forward as an unexplained single failure, not as a pass.
 
+### Rerun at the promotion tip, 2026-09-20
+
+The matrix above was run against the agent built from `97fd0d9`, before the defect fixes.
+It was run again at the branch tip that is being promoted, from the committed harness, on
+both test hosts, serially, each on a host with no other Quasar stack on it — the run A
+install had already been torn down, so neither run needed `--allow-cohabit` and both could
+attribute every artefact to themselves.
+
+Images: agent `dev-23e995d` (source commit `23e995d51e48…`, the last commit on this branch
+that touches any source — everything after it is documentation), control plane
+`dev-901058f` unchanged, both recorded in each report's header. Built with
+`deploy/build-images.sh runtime --no-prune`; contract 148 passed, 0 failed, 2 GPU-gated
+skips. Nothing published.
+
+| | AMD test host | NVIDIA test host |
+|---|---|---|
+| This rerun | **104 pass / 0 fail / 1 unperformed** ([report](rh02-265/rerun-23e995d/harness-gpu-test-amd.md), [json](rh02-265/rerun-23e995d/harness-gpu-test-amd.json)) | **97 pass / 0 fail / 4 unperformed** ([report](rh02-265/rerun-23e995d/harness-gpu-test-nvidia.md), [json](rh02-265/rerun-23e995d/harness-gpu-test-nvidia.json)) |
+| The table above | 103 / 0 / 1 | 96 / 0 / 4 (run 2) |
+
+**Every row keeps its earlier result.** No row that passed now fails, no row that was
+unperformed is now performed, and no row that was performed is now unperformed — the
+unperformed rows are the same ones, for the same reasons, quoted verbatim from the new
+reports:
+
+- AMD, row 4b: "host GPU vendor is 'amd', not nvidia".
+- NVIDIA, rows 4a and 4a': "host GPU vendor is 'nvidia', not amd".
+- NVIDIA, row 1c, both instances: the nested host could not serve a launch before the fault
+  (a pre-fault launch got `503 no_host_available`), so a refusal could not have readiness as
+  its sole reason.
+
+**The one difference is +1 pass on each host, and it is the #275 change.** Row 9 made four
+assertions before and makes five now; the fifth is the new one:
+
+> PASS 9: no entry under `/run/quasar-agent` that was not there at preflight (after removing
+> harness-attributable leftovers)
+
+104 = 103 + 1 and 97 = 96 + 1, with no other row moving, so the whole delta is accounted
+for. That also answers the question #275 left open — the addendum records that the harness
+was not rerun after that change. It has been now, and on both hosts the row **asserted
+rather than reporting unperformed**: neither run was in `--allow-cohabit` mode, so every
+entry appearing under the path since preflight was attributable to the run, was removed, and
+the post-check found nothing left. Both hosts were verified clean afterwards from outside the
+harness as well: zero containers, zero volumes, and an empty `/run/quasar-agent`.
+
+The single unexplained NVIDIA launch failure recorded against run 1 above did not recur.
+That is now three NVIDIA runs without it and one with; it stays an unexplained single
+failure on #267, not a pass.
+
 ### Row 1c on NVIDIA hardware against install B's own engine
 
 Row 1c was additionally performed on the NVIDIA test host against install B's
@@ -453,7 +501,7 @@ from the owner" above.
 | #272 | A VA-default flip was made and then **reverted at the owner's decision**: Vulkan is the AMD default again, by design. #272 is open; its fix is #281, which makes the compositor pick the linear encode-src path itself instead of the tiled one, so no encoder default and no knob has to change. | The frames below are history from the VA-default build that has since been reverted, kept for the record. AMD test host, that build, no encoder setting: `encoder="va"`, `vah264enc`, clean picture ([frame](rh02-265/fix-validation/272-amd-default-is-va-clean.png)). Still corrupt on Vulkan at 720p as well as 1080p, and with one slice ([frame](rh02-265/fix-validation/272-amd-vulkan-720p-corrupt.png)). On the branch as it now stands the AMD default is Vulkan again, so what an AMD operator sees without configuration is the corrupt picture of the second frame until #281 lands. |
 | #276 | A GPU the render-node pin excludes advertises no encode slots. Indices unchanged; fails open when the pin matches nothing. Admission was already correct, so this was a display defect. | Two hosts: advertised slots went from 4 to 2. |
 | #273 | Cause found by bisecting a used home: xfwm4 starts its own GLX compositor from saved settings on the second launch. Fix is a [patch for the images repository](rh02-265/fix-validation/273-quasar-images-xfwm4-compositor.patch): a system default of compositing off, plus the start script correcting homes that already hold `true`. A locked xfconf default was tried on hardware and did **not** heal an existing home, so it was dropped. | Native Unraid/NVIDIA, one-layer test image over the real one: ten launches in a row into one home ran, including a home forced back to the bad setting. **Not pushed**: it is another repository, and a fixed image needs a new catalog version. |
-| #275 | The harness snapshots `/run/quasar-agent` at preflight and row 9 removes and asserts on what the run added; under `--allow-cohabit` an entry it cannot attribute is unperformed. | `shellcheck` clean, `make verify` green. The harness itself was not rerun after this change. |
+| #275 | The harness snapshots `/run/quasar-agent` at preflight and row 9 removes and asserts on what the run added; under `--allow-cohabit` an entry it cannot attribute is unperformed. | `shellcheck` clean, `make verify` green. **Rerun on both test hosts on 2026-09-20** at the promotion tip (see "Rerun at the promotion tip" above): the new assertion fired rather than reporting unperformed, removed what the run left, and found nothing remaining. It is the whole of the +1 pass on each host. |
 | #277 to #279 | `deploy/README.md`: the release quick start sets the updater image and stack directory, makes its secrets without `openssl`, names the `/dev/kmsg` error, and documents a second install on one host. | Checked against what the four installs actually hit. |
 
 **Encoder paths.** Asked for at the same time: every encoder path that could be decoded was
