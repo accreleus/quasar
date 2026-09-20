@@ -80,7 +80,8 @@ in_go_container() {
         extra+=(--network "$GO_PG_NET" -e "TEST_DATABASE_URL=$TEST_DATABASE_URL")
     fi
     # ${extra[@]+...}: an empty array under `set -u` is "unbound" on bash 3.2 (macOS).
-    docker run --rm ${extra[@]+"${extra[@]}"} -v "$ROOT":/workspace -v quasar-go-mod:/go/pkg/mod \
+    # --ulimit core=0 for the same reason as docker_run_args above.
+    docker run --rm --ulimit core=0 ${extra[@]+"${extra[@]}"} -v "$ROOT":/workspace -v quasar-go-mod:/go/pkg/mod \
         -e GOFLAGS=-buildvcs=false -w /workspace/control-plane "$GO_IMAGE" "$@"
 }
 

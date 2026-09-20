@@ -9,6 +9,18 @@ services:
         DEVTOOLS_BUILD_DATE: ${DEVTOOLS_BUILD_DATE:-unknown}
     image: quasar-devtools:local
     working_dir: /workspace
+    # core 0: this container runs as root over the bind-mounted repo, and tests
+    # that crash a child on purpose (host_probe::child's `kill -SEGV $$`)
+    # otherwise drop a root-owned, mode-0600 `core` into the working tree. git
+    # can stat it but not read it, so any `git add -A` -- an editor or agent
+    # checkpoint, say -- dies with "Permission denied ... fatal: adding files
+    # failed" and exit 128, in a tree `git status` calls perfectly healthy.
+    # bc015d6 put --ulimit core=0 on scripts/dev/dev.sh, but `make test-rust`
+    # runs through THIS service, not that script, so the gap stayed open.
+    ulimits:
+      core:
+        soft: 0
+        hard: 0
     environment:
       HOME: /tmp/quasar-home
       TEST_DATABASE_URL: postgres://quasar_test:quasar_test@postgres:5432/quasar_test?sslmode=disable
