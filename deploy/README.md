@@ -75,14 +75,18 @@ release install has to name the published image; and it needs
 `QUASAR_STACK_DIR`, this directory's absolute host path, to find the compose
 project it is sitting beside (see [The updater](../docs/upgrading.md#the-updater)).
 
+The secrets below are read from `/dev/urandom` with `od` and `base64`
+(coreutils, always present) rather than `openssl`, which is not in this list
+and was missing on both hosts these steps were validated against.
+
 ```bash
 umask 077
 cp deploy/.env.example deploy/.env
 cat >> deploy/.env <<EOF
 
-POSTGRES_PASSWORD=$(openssl rand -hex 24)
-ENROLLMENT_TOKEN=$(openssl rand -hex 32)
-QUASAR_SECRET_KEY=$(openssl rand -base64 32)
+POSTGRES_PASSWORD=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+ENROLLMENT_TOKEN=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+QUASAR_SECRET_KEY=$(head -c 32 /dev/urandom | base64)
 QUASAR_HOME_ROOT=/var/lib/quasar/homes
 
 QUASAR_CONTROL_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@sha256:...
@@ -159,6 +163,16 @@ docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.nvidia.yml 
 > The pull is the long part — the node-agent image is large. `up -d` then
 > prints `Container deploy-quasar-postgres-1  Started` and the same for
 > `quasar-control-plane` and `quasar-node-agent`.
+
+**On a kernel view with no `/dev/kmsg`** (some system containers, including
+both hosts these steps were validated against), `up -d` fails after the control
+plane is already healthy with:
+
+> Error response from daemon: error gathering device information while adding
+> custom device "/dev/kmsg": no such file or directory
+
+See the `/dev/kmsg` row of [Prerequisites in detail](#prerequisites-in-detail)
+for the fix.
 
 ### 5. Check it came up
 
