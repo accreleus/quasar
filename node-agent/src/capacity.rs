@@ -725,13 +725,17 @@ fn apply_render_node_pin(gpus: &mut [GpuCapacity]) {
     };
     for (i, g) in gpus.iter_mut().enumerate() {
         if i != idx && g.encode_slots_total != 0 {
-            tracing::info!(
-                token = "gpu-slots-zeroed-render-node-pin",
-                gpu_index = g.index,
-                vendor = %g.vendor,
-                "GPU excluded from encode capacity: host is pinned to {configured}, so this \
-                 GPU is never placed onto"
-            );
+            // Detection runs on every capacity report; say this once per process.
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                tracing::info!(
+                    token = "gpu-slots-zeroed-render-node-pin",
+                    gpu_index = g.index,
+                    vendor = %g.vendor,
+                    "GPU excluded from encode capacity: host is pinned to {configured}, so this \
+                     GPU is never placed onto"
+                )
+            });
             g.encode_slots_total = 0;
         }
     }
