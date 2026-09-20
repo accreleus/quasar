@@ -54,7 +54,12 @@ PG_NET="${PG_NET:-quasar-p3-test}"
 TEST_DATABASE_URL="${TEST_DATABASE_URL:-postgres://postgres:test@quasar-pg3:5432/quasar?sslmode=disable}"
 
 # Common docker-run flags: mount the repo, work from /workspace.
-docker_run_args=(--rm -v "$ROOT":/workspace)
+# core=0: the container runs as root over the bind-mounted repo, and tests that
+# crash a child on purpose (host_probe::child's `kill -SEGV $$`) otherwise drop a
+# root-owned, mode-0600 `core` into the working tree. git can stat it but not read
+# it, so any `git add -A` -- an editor/agent checkpoint, say -- dies with
+# "Permission denied ... fatal: adding files failed" and exit 128.
+docker_run_args=(--rm --ulimit core=0 -v "$ROOT":/workspace)
 [ -n "${NET:-}" ] && docker_run_args+=(--network "$NET")
 
 # Run a command inside the container at a given workdir.
