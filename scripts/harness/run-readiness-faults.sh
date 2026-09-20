@@ -932,8 +932,12 @@ cleanup() {
         remaining=$(wc -l <"$post_runtime_dir_file.final")
         if [ "$remaining" = "0" ]; then
           pass "9: no entry under $AGENT_RUNTIME_DIR that was not there at preflight (after removing harness-attributable leftovers)"
+        elif [ "$ALLOW_COHABIT" = "1" ]; then
+          # Another Quasar stack shares this engine and this fixed path, so an
+          # entry this run cannot attribute to itself may be that stack's.
+          unperformed "9: $remaining new entry/entries under $AGENT_RUNTIME_DIR that this run cannot attribute to itself under --allow-cohabit"
         else
-          fail "9: $remaining entry/entries under $AGENT_RUNTIME_DIR not there at preflight and not attributable to this run"
+          fail "9: $remaining entry/entries under $AGENT_RUNTIME_DIR not there at preflight"
         fi
         rm -f "$post_runtime_dir_file.final"
       else

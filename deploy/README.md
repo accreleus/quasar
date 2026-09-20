@@ -76,8 +76,8 @@ release install has to name the published image; and it needs
 project it is sitting beside (see [The updater](../docs/upgrading.md#the-updater)).
 
 The secrets below are read from `/dev/urandom` with `od` and `base64`
-(coreutils, always present) rather than `openssl`, which is not in this list
-and was missing on both hosts these steps were validated against.
+(coreutils, always present) rather than `openssl`, which a minimal host may
+not have.
 
 ```bash
 umask 077
@@ -164,8 +164,7 @@ docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.nvidia.yml 
 > prints `Container deploy-quasar-postgres-1  Started` and the same for
 > `quasar-control-plane` and `quasar-node-agent`.
 
-**On a kernel view with no `/dev/kmsg`** (some system containers, including
-both hosts these steps were validated against), `up -d` fails after the control
+**On a kernel view with no `/dev/kmsg`** (some system containers), `up -d` fails after the control
 plane is already healthy with:
 
 > Error response from daemon: error gathering device information while adding
