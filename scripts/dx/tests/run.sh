@@ -807,7 +807,12 @@ fi
 
 # With no operator patterns the generic shapes still run: the home path is still
 # caught and the operator-only address is not, which proves the sets are separate.
-ls_generic="$(LEAK_SCAN_OPERATOR_PATTERNS='' LEAK_SCAN_PATTERNS_FILE="$LS_NO_FILE" LEAK_SCAN_ISSUES_JSON="$FIXTURES/leak-issues-dirty.json" bash "$LS" --issues 2>&1)"
+# LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS is pinned EMPTY, not merely left alone: an
+# operator who exports it (it is the documented way to refuse a generic-only scan,
+# and CI sets it too) would otherwise turn this case's expected rc=1 into the rc=2
+# refusal, and this test would fail on their machine and nowhere else. The
+# required-set case below pins it to 1 for the same reason, from the other side.
+ls_generic="$(LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS='' LEAK_SCAN_OPERATOR_PATTERNS='' LEAK_SCAN_PATTERNS_FILE="$LS_NO_FILE" LEAK_SCAN_ISSUES_JSON="$FIXTURES/leak-issues-dirty.json" bash "$LS" --issues 2>&1)"
 ls_generic_rc=$?
 if [ "$ls_generic_rc" -eq 1 ] &&
   printf '%s' "$ls_generic" | grep -q 'issue#102 comment\[1\]' &&

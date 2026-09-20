@@ -160,6 +160,7 @@ own; the two do not move together, and that is deliberate.
 - Operator docs: the release quick start now sets the updater image and stack directory, generates secrets without `openssl`, names the `/dev/kmsg` error, and documents a second install on the same host (#277, #278, #279).
 - Readiness fault harness: row 9 now verifies the agent runtime path `/run/quasar-agent` and removes what the run left there (#275).
 - Dev tooling: the containerized test suites no longer drop a root-owned `core` file into the working tree, which made `git add -A` fail with "Permission denied ... fatal: adding files failed" in a tree `git status` called clean. `core 0` now covers the `devtools` compose service that `make test-rust`/`test-go`/`test-web` run through, and the second `docker run` in `scripts/dev/dev.sh`; an earlier fix had only covered that script's shared flags.
+- Dev tooling: the DX test `leakscan:generic-without-operator-patterns` no longer fails on a machine that exports `LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS=1`. It exercises the no-operator-patterns path and expects the generic-only exit, but did not pin that variable, so an operator's standing configuration turned the expected result into the refusal exit and the test failed only for them.
 - **A host whose only GPU is not at index 0 can launch on the Vulkan encoder (#268).** Admission
   accepted only GPU index 0 on the Vulkan path, while the agent numbers GPUs by DRM card
   position, so such a host refused every launch with `no_host_available` on the default

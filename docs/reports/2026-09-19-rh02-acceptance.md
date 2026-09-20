@@ -475,39 +475,47 @@ now tracked as its own ticket, #283.
 
 ## Gates
 
-Run serially on the final commit of this branch. Two do not pass, for one reason that has
-nothing to do with this work, set out below.
+Run serially on the final commit of this branch. All six green.
 
 | Gate | rc | Result |
 |---|---|---|
-| `make verify` | 1 | 416 pass / 1 warn / 14 fail — every one of the 15 is the missing `qses` (below) |
+| `make verify` | 0 | 437 pass / 0 warn / 0 fail |
 | `make test-rust` | 0 | node-agent 1724 passed, 0 failed, 9 ignored; the smaller suites all ok |
 | `make test-go` | 0 | 43 packages ok, 0 failures, `TestOpenAPIDrift` included (submodule initialised) |
 | `make test-db` | 0 | 4 pass / 0 warn / 0 fail on a fresh ephemeral Postgres; the log confirms "DB tests actually ran, no cache" |
-| `make preflight` | 2 | `doctor` degraded 5/1/0, `config-check` degraded 10/3/0, then the same `verify` — **no failure of its own** |
+| `make preflight` | 0 | `doctor` degraded 5/1/0, `config-check` degraded 10/3/0, `verify` 437/0/0 — the same four machine-local advisories as before |
+| leak scan | 0 | `clean (tree)` and `clean (issues)`, **with the operator pattern set loaded** |
 
-**Why `verify` and `preflight` are not green.** All 14 failures and the 1 warn are in the
-`bench:*` group and every one of them shells out to
-`.claude/skills/quasar-session/scripts/qses`, which does not exist on this machine. That
-path is **untracked** — the directory is in this clone's `info/exclude` as operator-local
-tooling — so it is in no commit, and these assertions fail identically at any commit here.
-The failure sets of `verify` and `preflight` were diffed and are the same 14; `preflight`
-contributes nothing new. None of the changed files on this branch touch `.claude/`, the
-bench path or `scripts/dx/`.
+Two of these needed the machine fixed rather than the branch, and both are worth recording
+because they cost a full gate cycle each.
 
-`preflight`'s own warnings are the machine-local advisories this environment always
-reports: no `gpu-test` role in this clone's `hosts.json`, and `compose:hardened`,
-`compose:profiling` and `compose:cores` not configured here.
+**`qses` was not reachable from this worktree.** `scripts/dx/tests/run.sh` refers to
+`$ROOT/.claude/skills/quasar-session/scripts/qses` in five places with no override
+variable, so the DX tests require that skill to be resolvable inside the worktree. The
+operator keeps skills in their global agent configuration, not in the repository, so a
+fresh worktree does not have it and 14 `bench:*` assertions failed on a missing path.
+Linking the global skill in fixed all 14 at once. Nothing was added to the repository. Note
+for the next worktree: the ignore rule for it is written with a trailing slash, which
+matches a real directory but not a symlink, so a slashless entry is needed in the clone's
+`info/exclude` or `git add -A` will try to stage the link.
 
-**Leak scan.** `scripts/dev/leak-scan.sh` reports `clean (tree)` and the tracker scan
-(`--issues`) is recorded with it. One honest limitation: this machine has no
-`leak-patterns.local`, so the script prints "no operator patterns loaded; running the
-generic checks only" and the operator-specific half of the scan did not run. Every file
-added in this slice was therefore also grepped directly for the real tokens (registry
-hostname, host aliases, LAN addresses, operator paths); that check found and removed two in
-`install-d/agent-recreate.txt` — the registry hostname became `<local-registry>` and the
-stack path `<run-D-stack>` — and the harness reports proved already sanitised by the
-harness's own sanitizer.
+**One DX test could never pass on the operator's own machine (fixed here).**
+`leakscan:generic-without-operator-patterns` exercises the "no operator patterns loaded"
+path and expects `rc=1`. It pinned `LEAK_SCAN_OPERATOR_PATTERNS` and
+`LEAK_SCAN_PATTERNS_FILE` but not `LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS`, which the operator
+exports as standing configuration (it is the documented way to refuse a generic-only scan,
+and CI sets it too). The ambient value turned the expected `rc=1` into the `rc=2` refusal,
+so the test failed on a correctly configured machine and nowhere else. Verified both ways
+before changing anything: `rc=2` with the variable exported, `rc=1` with it pinned empty.
+The fix pins it empty, mirroring the test directly below which pins it to `1` to check the
+opposite side; both now pass, as do the other four `leakscan:*` cases.
+
+**Leak scan.** `clean (tree)` and `clean (issues)`, run with the operator pattern set
+loaded — not the generic-only fallback. Every file added in this slice was additionally
+grepped by hand for the real tokens while the pattern set was unavailable; that check found
+and removed two in `install-d/agent-recreate.txt`, where the registry hostname became
+`<local-registry>` and the stack path `<run-D-stack>`. The harness reports were already
+sanitised by the harness's own sanitizer.
 
 ## Models
 
