@@ -336,6 +336,15 @@ CREATED_DEV_INPUT=0
 PREFLIGHT_FOREIGN_NAMES_FILE="$WORKDIR/preflight-foreign-names.txt"
 PREFLIGHT_VOLUMES_FILE="$WORKDIR/preflight-volumes.txt"
 : >"$PREFLIGHT_FOREIGN_NAMES_FILE"
+# Agent host runtime path (compose line: - /run/quasar-agent:/run/quasar-agent,
+# a fixed bind mount, not a variable). Root-owned on every host seen so far —
+# reuse the sudo this script already runs everything else through rather than
+# adding a container-mount fallback. RUNTIME_DIR_READABLE tracks whether BOTH
+# the preflight and the post-teardown listing succeeded; row 9 reports
+# unperformed (never a pass) when either read fails.
+AGENT_RUNTIME_DIR="/run/quasar-agent"
+PREFLIGHT_RUNTIME_DIR_FILE="$WORKDIR/preflight-runtime-dir.txt"
+RUNTIME_DIR_READABLE=1
 
 # ── HTTP helpers (status+body split, header capture for the Retry-After
 #    assertions — same shape as run-admission.sh's http_json). ──────────────
@@ -678,6 +687,23 @@ preflight_cohabit_check() {
   # Volumes too: an anonymous volume (docker:dind declares one) carries no
   # owner label, so only a before/after comparison can prove none was left.
   docker volume ls -q 2>/dev/null | sort >"$PREFLIGHT_VOLUMES_FILE" || true
+  # Agent host runtime path: killed-agent scenarios (mid-session, mid-probe)
+  # can leave udev-<session id> / quasar-media-probe-* directories under the
+  # fixed bind mount that no label or volume-diff check sees. Snapshot its
+  # entries now so row 9 can tell what the run added. A host that has never
+  # run the agent may not have created the directory yet — that is a clean
+  # (empty) starting point, not an unreadable one; compose creates it on
+  # first `up`.
+  if [ ! -e "$AGENT_RUNTIME_DIR" ]; then
+    : >"$PREFLIGHT_RUNTIME_DIR_FILE"
+  elif sudo find "$AGENT_RUNTIME_DIR" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null \
+    | sort >"$PREFLIGHT_RUNTIME_DIR_FILE"; then
+    :
+  else
+    RUNTIME_DIR_READABLE=0
+    : >"$PREFLIGHT_RUNTIME_DIR_FILE"
+    harness_note "preflight_runtime_dir_unreadable" "$AGENT_RUNTIME_DIR exists but could not be listed at preflight (root required)"
+  fi
   pass "preflight: engine clear (foreign_quasar_projects=$foreign, port $CONTROL_PORT free, $RID_ROOT free)"
 }
 preflight_cohabit_check
@@ -866,6 +892,60 @@ cleanup() {
   fi
   local new_volumes
   new_volumes=$(docker volume ls -q 2>/dev/null | sort | comm -13 "$PREFLIGHT_VOLUMES_FILE" - 2>/dev/null | wc -l)
+
+  # ── Agent host runtime path (compose's fixed /run/quasar-agent bind mount,
+  # not a volume — no label or volume-diff check above reaches it). Killed-
+  # agent scenarios can leave udev-<session id> / quasar-media-probe-*
+  # directories there. Must run BEFORE $WORKDIR is removed: the preflight
+  # snapshot lives under it. Reads need root, like everything else this
+  # script mutates under $RID_ROOT — reuse sudo rather than adding a
+  # container-mount fallback.
+  if [ "$RUNTIME_DIR_READABLE" = "1" ]; then
+    local post_runtime_dir_file new_runtime_entries entry sid attributable created remaining
+    post_runtime_dir_file="$(mktemp "$WORKDIR/post-runtime-dir.XXXXXX" 2>/dev/null || mktemp)"
+    if sudo find "$AGENT_RUNTIME_DIR" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null \
+      | sort >"$post_runtime_dir_file"; then
+      mapfile -t new_runtime_entries < <(comm -13 "$PREFLIGHT_RUNTIME_DIR_FILE" "$post_runtime_dir_file")
+      for entry in "${new_runtime_entries[@]:-}"; do
+        [ -n "$entry" ] || continue
+        attributable=0
+        if [ "$ALLOW_COHABIT" != "1" ]; then
+          # preflight proved the harness's stack was the only Quasar stack on
+          # this engine, so every entry created since is ours.
+          attributable=1
+        else
+          case "$entry" in
+            udev-*)
+              sid="${entry#udev-}"
+              for created in "${CREATED_SESSION_IDS[@]:-}"; do
+                [ "$sid" = "$created" ] && attributable=1 && break
+              done
+              ;;
+          esac
+        fi
+        if [ "$attributable" = "1" ]; then
+          sudo rm -rf "${AGENT_RUNTIME_DIR:?}/${entry:?}" 2>/dev/null || true
+        fi
+      done
+      if sudo find "$AGENT_RUNTIME_DIR" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null \
+        | sort | comm -13 "$PREFLIGHT_RUNTIME_DIR_FILE" - >"$post_runtime_dir_file.final" 2>/dev/null; then
+        remaining=$(wc -l <"$post_runtime_dir_file.final")
+        if [ "$remaining" = "0" ]; then
+          pass "9: no entry under $AGENT_RUNTIME_DIR that was not there at preflight (after removing harness-attributable leftovers)"
+        else
+          fail "9: $remaining entry/entries under $AGENT_RUNTIME_DIR not there at preflight and not attributable to this run"
+        fi
+        rm -f "$post_runtime_dir_file.final"
+      else
+        unperformed "9: $AGENT_RUNTIME_DIR became unreadable while verifying cleanup"
+      fi
+    else
+      unperformed "9: $AGENT_RUNTIME_DIR could not be read to verify cleanup"
+    fi
+  else
+    unperformed "9: $AGENT_RUNTIME_DIR was not readable at preflight, cannot verify runtime-path cleanup"
+  fi
+
   rm -rf "$WORKDIR" >/dev/null 2>&1 || true
 
   # ── Scenario 9 verification ────────────────────────────────────────────
