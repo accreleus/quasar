@@ -1970,6 +1970,9 @@ pub fn probe_sibling_egl() -> EglRuntime {
         // application-GPU host probe, which takes the whole of `AppGpuAccess`.
         devices: Vec::new(),
         groups: Vec::new(),
+        // This gate only ever runs on an NVIDIA host, so it asks for the GPU exactly as
+        // a session's application container does.
+        nvidia_device_request: true,
         nvidia: crate::session::container::nvidia_driver_access(&info),
     };
     let helper = crate::runtime::DiagnosticHelper {

@@ -396,8 +396,11 @@ fn valid_gpu_probe(run: &GpuProbeRun, name: &str) -> bool {
         // Sorted and distinct, so one set of groups has one fingerprint.
         && run.groups.first().is_none_or(|first| *first != 0)
         && run.groups.windows(2).all(|pair| pair[0] < pair[1])
-        && (!run.devices.is_empty() || run.nvidia.is_some())
+        && (!run.devices.is_empty() || run.nvidia.is_some() || run.nvidia_device_request)
         && run.nvidia.as_ref().is_none_or(valid_driver_access)
+        // A driver volume is only ever given together with the device request, as a
+        // session's application container is given them.
+        && (run.nvidia.is_none() || run.nvidia_device_request)
 }
 fn valid_audio(run: &AudioRun, name: &str) -> bool {
     let socket = run.socket_dir.to_str();
@@ -548,6 +551,17 @@ fn intent_access(intent: &HelperIntent) -> Option<NvidiaDriverAccess> {
         .as_ref()
         .and_then(|probe| probe.nvidia.clone())
         .or_else(|| intent.nvidia_gpu.as_ref().map(legacy_access))
+}
+
+/// Whether this intent asks for the all-GPUs `nvidia` device request. The legacy
+/// NVIDIA profile and a driver volume both imply it; a GPU probe on an NVIDIA host
+/// with no Quasar volume asks for it on its own (#280).
+fn intent_device_request(intent: &HelperIntent) -> bool {
+    intent_access(intent).is_some()
+        || intent
+            .gpu_probe
+            .as_ref()
+            .is_some_and(|probe| probe.nvidia_device_request)
 }
 
 fn nvidia_mount(access: &NvidiaDriverAccess) -> Mount {
@@ -710,6 +724,7 @@ fn inspect_owned(
         _ => None,
     };
     let access = intent_access(intent);
+    let device_request = intent_device_request(intent);
     let host = info.host_config.ok_or(ErrorKind::Protocol)?;
     if host.network_mode.as_deref() != Some("none")
         || host.readonly_rootfs != Some(intent.profile != HelperProfile::Audio)
@@ -718,7 +733,7 @@ fn inspect_owned(
         || host.cap_add.as_ref().is_some_and(|v| !v.is_empty())
         || (probe.is_none() && host.devices.as_ref().is_some_and(|v| !v.is_empty()))
         || (probe.is_none() && host.group_add.as_ref().is_some_and(|v| !v.is_empty()))
-        || (access.is_none() && host.device_requests.as_ref().is_some_and(|v| !v.is_empty()))
+        || (!device_request && host.device_requests.as_ref().is_some_and(|v| !v.is_empty()))
         || host.volumes_from.as_ref().is_some_and(|v| !v.is_empty())
         || host.binds.as_ref().is_some_and(|v| !v.is_empty())
         || host.pid_mode.as_deref().is_some_and(|v| !v.is_empty())
@@ -768,12 +783,16 @@ fn inspect_owned(
             return Err(ErrorKind::Protocol.into());
         }
     }
+    if device_request
+        && !matches!(host.device_requests.as_deref(), Some([request]) if is_nvidia_all_request(request))
+    {
+        return Err(ErrorKind::Protocol.into());
+    }
     if let Some(access) = &access {
-        if !matches!(host.device_requests.as_deref(), Some([request]) if is_nvidia_all_request(request))
-            || !c
-                .env
-                .as_deref()
-                .is_some_and(|env| has_nvidia_env(env, access))
+        if !c
+            .env
+            .as_deref()
+            .is_some_and(|env| has_nvidia_env(env, access))
         {
             return Err(ErrorKind::Protocol.into());
         }
@@ -1194,7 +1213,7 @@ async fn create_or_adopt_inner(
             security_opt: Some(security_opt),
             devices: Some(devices),
             group_add,
-            device_requests: access.as_ref().map(|_| {
+            device_requests: intent_device_request(&intent).then(|| {
                 vec![DeviceRequest {
                     driver: Some("nvidia".into()),
                     count: Some(-1),

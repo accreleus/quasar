@@ -96,7 +96,9 @@ pub struct NvidiaDriverAccess {
 /// probes"). A probe container is given what a session's application
 /// container is given for GPU access, and nothing else: the DRM nodes and the
 /// groups owning them (AMD, Intel, and NVIDIA's render node), plus the NVIDIA
-/// device request and driver volume when the host has one. No network, a
+/// device request on an NVIDIA host and the Quasar driver volume when the host
+/// has one — the two are independent, since a toolkit host has the first and not
+/// the second. No network, a
 /// read-only root, no capabilities, no other mounts, and no caller-controlled
 /// environment. The container name carries
 /// [`crate::container_ownership::PROBE_NAME_PREFIX`].
@@ -114,7 +116,15 @@ pub struct GpuProbeRun {
     /// Numeric supplementary groups owning those nodes: never 0, sorted, no
     /// duplicates, so one request has one fingerprint.
     pub groups: Vec<u32>,
-    /// `None` on a host without NVIDIA driver access.
+    /// The all-GPUs `nvidia` device request, as a session's application container
+    /// gets it. True on every NVIDIA host, whether or not the host also has a
+    /// Quasar driver volume: where the driver userspace comes from the container
+    /// toolkit this request is the ONLY thing that carries it in (#280).
+    #[serde(default)]
+    pub nvidia_device_request: bool,
+    /// The Quasar driver volume's mount and loader environment. `None` on a host
+    /// that has no such volume — including an NVIDIA host running its own driver
+    /// packages, which is served by `nvidia_device_request` alone.
     pub nvidia: Option<NvidiaDriverAccess>,
 }
 

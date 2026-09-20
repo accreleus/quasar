@@ -4587,6 +4587,7 @@ fn nvidia_probe_request() -> (DiagnosticHelper, GpuProbeRun) {
             command: vec!["5s".into(), "/bin/sh".into(), "-c".into(), "exit 23".into()],
             devices: Vec::new(),
             groups: Vec::new(),
+            nvidia_device_request: true,
             nvidia: Some(nvidia_access()),
         },
     )
@@ -4602,6 +4603,7 @@ fn dri_probe_request(operation: &str) -> (DiagnosticHelper, GpuProbeRun) {
             command: vec!["5s".into(), "/bin/sh".into(), "-c".into(), "exit 23".into()],
             devices: vec!["/dev/dri".into()],
             groups: vec![44, 991],
+            nvidia_device_request: false,
             nvidia: None,
         },
     )
@@ -4619,6 +4621,59 @@ fn gpu_probe_nvidia_access_realizes_the_previous_nvidia_profile_byte_for_byte() 
     // code under test: any drift here is a change to what NVIDIA hosts run.
     let before: Value = serde_json::from_str(r#"{"Cmd":["5s","/bin/sh","-c","exit 23"],"Entrypoint":["/usr/bin/timeout"],"Env":["LD_LIBRARY_PATH=/opt/quasar/nvidia-driver/lib64:/image/lib","__EGL_VENDOR_LIBRARY_DIRS=/opt/quasar/nvidia-driver/glvnd/egl_vendor.d:/etc/glvnd/egl_vendor.d:/usr/share/glvnd/egl_vendor.d","__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS=/opt/quasar/nvidia-driver/egl_external_platform.d:/usr/share/egl/egl_external_platform.d","VK_ADD_DRIVER_FILES=/opt/quasar/nvidia-driver/vulkan/icd.d/nvidia_icd.json","GBM_BACKENDS_PATH=/opt/quasar/nvidia-driver/gbm"],"HostConfig":{"AutoRemove":false,"CapDrop":["ALL"],"DeviceRequests":[{"Capabilities":[["gpu"]],"Count":-1,"Driver":"nvidia"}],"Devices":[],"Mounts":[{"ReadOnly":true,"Source":"quasar-driver-fixture","Target":"/opt/quasar/nvidia-driver","Type":"volume"}],"NetworkMode":"none","Privileged":false,"ReadonlyRootfs":true,"SecurityOpt":["no-new-privileges"]},"Image":"quasar-agent:test","Labels":{"io.quasar.agent-owner":"fixture-owner","io.quasar.runtime-operation":"nvidia-fixture"},"User":"0:0"}"#).unwrap();
     assert_eq!(body, before);
+    assert_eq!(
+        client
+            .observe_gpu_probe(id.clone())
+            .wait()
+            .unwrap()
+            .exit_code,
+        Some(23)
+    );
+    client.cleanup_gpu_probe(id).wait().unwrap();
+    assert!(engine.state.lock().unwrap().body.is_none());
+}
+
+/// The #280 arm: an NVIDIA host whose driver userspace comes from the container
+/// toolkit. The device request is what carries that userspace in, so it is realized
+/// with no driver mount and no loader environment beside it.
+fn toolkit_probe_request() -> (DiagnosticHelper, GpuProbeRun) {
+    let (helper, mut run) = dri_probe_request("toolkit-fixture");
+    run.nvidia_device_request = true;
+    (helper, run)
+}
+
+#[test]
+fn gpu_probe_realizes_the_nvidia_device_request_without_a_driver_volume() {
+    let engine = Engine::new();
+    let client = engine.client();
+    let (helper, run) = toolkit_probe_request();
+    let id = client.run_gpu_probe(helper, run).wait().unwrap();
+    let body = engine.state.lock().unwrap().body.clone().unwrap();
+    assert_eq!(
+        body["HostConfig"]["DeviceRequests"],
+        json!([{"Capabilities":[["gpu"]],"Count":-1,"Driver":"nvidia"}]),
+        "an NVIDIA host without a Quasar driver volume still asks for the GPU"
+    );
+    assert_eq!(
+        body["HostConfig"]["Devices"],
+        json!([{"PathOnHost":"/dev/dri","PathInContainer":"/dev/dri","CgroupPermissions":"rwm"}])
+    );
+    assert_eq!(body["HostConfig"]["GroupAdd"], json!(["44", "991"]));
+    // Nothing else is widened: no mount, no caller environment, no network, no caps.
+    assert!(body["HostConfig"]["Mounts"]
+        .as_array()
+        .is_none_or(Vec::is_empty));
+    assert!(body["Env"].as_array().is_none_or(Vec::is_empty));
+    assert_eq!(body["HostConfig"]["NetworkMode"], json!("none"));
+    assert_eq!(body["HostConfig"]["ReadonlyRootfs"], json!(true));
+    assert_eq!(body["HostConfig"]["Privileged"], json!(false));
+    assert_eq!(body["HostConfig"]["CapDrop"], json!(["ALL"]));
+    assert_eq!(
+        body["HostConfig"]["SecurityOpt"],
+        json!(["no-new-privileges"])
+    );
+    assert_eq!(body["User"], json!("0:0"));
+    assert!(body["Labels"]["io.quasar.agent-owner"].is_string());
     assert_eq!(
         client
             .observe_gpu_probe(id.clone())
@@ -4720,6 +4775,7 @@ fn gpu_probe_refuses_unsupported_requirements_before_any_engine_request() {
         (
             "driver volume with a path separator",
             Box::new(|_, run| {
+                run.nvidia_device_request = true;
                 run.nvidia = Some(NvidiaDriverAccess {
                     driver_mount: NvidiaDriverMount::NamedVolume {
                         name: "../etc".into(),
@@ -4727,6 +4783,15 @@ fn gpu_probe_refuses_unsupported_requirements_before_any_engine_request() {
                     },
                     ..nvidia_access()
                 })
+            }),
+        ),
+        (
+            // A session's application container never mounts the driver volume without
+            // also asking for the GPU, so neither may a probe standing for one.
+            "driver volume without the device request",
+            Box::new(|_, run| {
+                run.nvidia_device_request = false;
+                run.nvidia = Some(nvidia_access());
             }),
         ),
     ];
@@ -5270,7 +5335,13 @@ fn gpu_probe_fingerprint_covers_devices_groups_and_driver_access() {
     let changes: Vec<ProbeChange> = vec![
         Box::new(|run| run.groups = vec![44]),
         Box::new(|run| run.devices = vec!["/dev/dri/renderD128".into()]),
-        Box::new(|run| run.nvidia = Some(nvidia_access())),
+        Box::new(|run| {
+            run.nvidia_device_request = true;
+            run.nvidia = Some(nvidia_access());
+        }),
+        // The device request alone is a different request: it is the whole of GPU
+        // access on a host whose driver userspace comes from the container toolkit.
+        Box::new(|run| run.nvidia_device_request = true),
         Box::new(|run| run.command.push("changed".into())),
     ];
     for change in changes {

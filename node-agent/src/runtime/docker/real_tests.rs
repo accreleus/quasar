@@ -457,6 +457,7 @@ fn real_docker_gpu_probe_profile_runs_with_dri_access_and_cleans_up() {
         ],
         devices: vec!["/dev/dri".into()],
         groups: groups.clone(),
+        nvidia_device_request: false,
         nvidia: None,
     };
     let id = runtime.run_gpu_probe(helper, run).wait().unwrap();

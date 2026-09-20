@@ -1626,11 +1626,14 @@ impl AppGpuAccess {
             .is_some()
     }
 
-    /// The same access as the closed GPU probe profile (#258).
+    /// The same access as the closed GPU probe profile (#258), field for field with
+    /// [`Self::session_args`]: `nvidia` drives the device request there and here, and the
+    /// driver volume is mounted in both only when the host provisioned one.
     ///
-    /// Known limit: that profile carries the NVIDIA device request only together with the
-    /// Quasar driver volume, so on an NVIDIA host running its own driver the probe gets
-    /// DRM access only.
+    /// #280: these two are independent. An NVIDIA host taking its driver userspace from
+    /// the container toolkit provisions no volume, and the device request is the only
+    /// thing that gives the container an EGL stack — a probe without it fails on a host
+    /// where a real session succeeds.
     pub fn probe_run(
         &self,
         entrypoint: Vec<String>,
@@ -1641,6 +1644,7 @@ impl AppGpuAccess {
             command,
             devices: vec![DRI_DIR.into()],
             groups: self.dri_groups.clone(),
+            nvidia_device_request: self.nvidia,
             nvidia: self.driver_volume.as_ref().and_then(nvidia_driver_access),
         }
     }
@@ -2580,10 +2584,17 @@ mod tests {
 
             let gpus_all = flag_values(&session, "--gpus") == ["all"];
             let mount = flag_values(&session, "--mount").into_iter().next();
+            // The two halves of NVIDIA access are asserted apart: a host whose driver
+            // userspace comes from the container toolkit gets the device request with no
+            // driver volume, and conflating them is exactly how #280 shipped.
             assert_eq!(
-                gpus_all && mount.is_some(),
+                gpus_all, probe.nvidia_device_request,
+                "{label}: NVIDIA device request"
+            );
+            assert_eq!(
+                mount.is_some(),
                 probe.nvidia.is_some(),
-                "{label}: NVIDIA driver access"
+                "{label}: Quasar driver volume"
             );
             let Some(nvidia_access) = probe.nvidia else {
                 continue;
@@ -2616,6 +2627,74 @@ mod tests {
                 "{label}: gbm backend"
             );
         }
+    }
+
+    /// #280: an NVIDIA host that takes its driver userspace from the container toolkit
+    /// provisions no Quasar driver volume. The application container still gets the
+    /// `nvidia` device request — that is where its EGL stack comes from — so the probe
+    /// standing for it must get one too, or it opens no GPU and blocks every launch.
+    #[test]
+    fn an_nvidia_host_without_a_driver_volume_still_gives_the_probe_the_device_request() {
+        let access = app_gpu_access(true, None, &[node("renderD128", 0o660, 991)]);
+        let probe = access.probe_run(vec!["/usr/bin/timeout".into()], vec!["20s".into()]);
+        assert!(
+            probe.nvidia_device_request,
+            "the toolkit path must still request the GPU"
+        );
+        assert!(
+            probe.nvidia.is_none(),
+            "there is no Quasar driver volume to mount on this host"
+        );
+        assert!(flag_values(&access.session_args("/image/lib", &[]), "--gpus") == ["all"]);
+    }
+
+    /// The driver-volume host keeps both halves: the device request and the volume.
+    #[test]
+    fn an_nvidia_host_with_a_driver_volume_gives_the_probe_both_halves() {
+        let dir = tempfile::tempdir().unwrap();
+        let access = app_gpu_access(
+            true,
+            Some(volume(dir.path(), Some("quasar-nvidia-driver"), None)),
+            &[node("renderD128", 0o660, 991)],
+        );
+        let probe = access.probe_run(vec!["/usr/bin/timeout".into()], vec!["20s".into()]);
+        assert!(probe.nvidia_device_request);
+        assert!(probe.nvidia.is_some());
+    }
+
+    /// A non-NVIDIA host asks for no device request at all, volume or not.
+    #[test]
+    fn a_non_nvidia_host_gives_the_probe_no_device_request() {
+        let dir = tempfile::tempdir().unwrap();
+        for volume_info in [None, Some(volume(dir.path(), Some("stale"), None))] {
+            let access = app_gpu_access(false, volume_info, &[node("renderD128", 0o660, 991)]);
+            let probe = access.probe_run(vec!["/usr/bin/timeout".into()], vec!["20s".into()]);
+            assert!(!probe.nvidia_device_request);
+            assert!(probe.nvidia.is_none());
+        }
+    }
+
+    /// Drift guard. Every field of `AppGpuAccess` is one injection the application path
+    /// applies; the exhaustive destructuring below stops compiling the moment a field is
+    /// added, so a new injection cannot land without saying how the probe mirrors it.
+    #[test]
+    fn every_app_gpu_injection_is_mirrored_into_the_probe_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let access = app_gpu_access(
+            true,
+            Some(volume(dir.path(), Some("quasar-nvidia-driver"), None)),
+            &[node("renderD128", 0o660, 991), node("card0", 0o660, 44)],
+        );
+        let AppGpuAccess {
+            nvidia,
+            driver_volume,
+            dri_groups,
+        } = &access;
+        let probe = access.probe_run(vec!["/usr/bin/timeout".into()], vec!["20s".into()]);
+        assert_eq!(*nvidia, probe.nvidia_device_request);
+        assert_eq!(driver_volume.is_some(), probe.nvidia.is_some());
+        assert_eq!(*dri_groups, probe.groups);
+        assert_eq!(probe.devices, vec![DRI_DIR.to_string()]);
     }
 
     /// The realized create body depends on argv order: the 32-bit bind must precede the
