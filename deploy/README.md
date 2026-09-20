@@ -69,6 +69,12 @@ The two image lines pin the stack to the release. Take the digests from the
 release body, or from the release's `platform-release-manifest.json` asset, which
 carries the same two digests in machine-readable form.
 
+The compose file also starts `quasar-updater`, the per-host actor that applies
+future releases. Its default is a bare local tag no registry serves, so a
+release install has to name the published image; and it needs
+`QUASAR_STACK_DIR`, this directory's absolute host path, to find the compose
+project it is sitting beside (see [The updater](../docs/upgrading.md#the-updater)).
+
 ```bash
 umask 077
 cp deploy/.env.example deploy/.env
@@ -81,6 +87,9 @@ QUASAR_HOME_ROOT=/var/lib/quasar/homes
 
 QUASAR_CONTROL_IMAGE=ghcr.io/accreleus/quasar/quasar-control-plane@sha256:...
 QUASAR_AGENT_IMAGE=ghcr.io/accreleus/quasar/quasar-node-agent@sha256:...
+
+QUASAR_UPDATER_IMAGE=ghcr.io/accreleus/quasar/quasar-updater:latest
+QUASAR_STACK_DIR=$(cd deploy && pwd)
 EOF
 chmod 600 deploy/.env
 ```
