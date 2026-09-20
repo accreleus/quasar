@@ -147,6 +147,12 @@ own; the two do not move together, and that is deliberate.
   configuration. There are no probe callers yet (#259).
 
 ### Fixed
+- Host readiness: the application GPU probe container now gets the same NVIDIA device request a real session gets, so a healthy NVIDIA host that takes its driver from the container toolkit (a native Unraid install, for one) no longer fails `application_gpu_probe_gpu<N>` and refuses every launch with `host_not_ready` (#280).
+- AMD hosts now auto-detect the VA encoder instead of Vulkan. Vulkan H.264 and HEVC encode was found corrupt on a Granite Ridge iGPU (RADV, Mesa 25.3.6); `QUASAR_ENCODER=vulkan` still selects it (#272).
+- Host readiness: a hung container engine reaches the readiness report sooner. The engine is asked first under a 5 s budget and the other engine calls are skipped when it does not answer (#274).
+- A GPU the agent is pinned away from by `QUASAR_RENDER_NODE` no longer counts toward the host's advertised encode slots (#276).
+- Operator docs: the release quick start now sets the updater image and stack directory, generates secrets without `openssl`, names the `/dev/kmsg` error, and documents a second install on the same host (#277, #278, #279).
+- Readiness fault harness: row 9 now verifies the agent runtime path `/run/quasar-agent` and removes what the run left there (#275).
 - **A host whose only GPU is not at index 0 can launch on the Vulkan encoder (#268).** Admission
   accepted only GPU index 0 on the Vulkan path, while the agent numbers GPUs by DRM card
   position, so such a host refused every launch with `no_host_available` on the default
