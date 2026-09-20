@@ -1,0 +1,71 @@
+Run D (native Unraid, NVIDIA GPU): agent-recreate identity check
+Branch tip at the time: 23e995d. Agent image dev-b199c30 (the #280/#274/#276 fix build);
+this check is about identity across a container recreate, not about the agent build.
+
+Method: snapshot -> docker compose up -d --force-recreate quasar-node-agent -> wait healthy -> snapshot.
+
+=== BEFORE (UTC 2026-09-20T13:53:44Z) ===
+host rows: 1
+id|node_name|status|created_at|last_registered_at|agent_restart_count
+aabe0ccc-6011-4442-8f8a-d5157427ff2a|quasar-node-1|online|2026-09-20 00:25:54.58453+00|2026-09-20 12:43:27.980982+00|0
+sessions: 27
+apps: 1
+schema version: 85|f
+node-secret sha256: 7559b35184d29b5418b4637ceaf3a08264acb989344e3be611b273636bbcc456
+container-owner: 3c271707a968bf13097bb05bae590bd20b14137f112695d39fb6a1811fb151eb
+--- managed homes ---
+<run-D-stack>/homes
+<run-D-stack>/homes/admin
+<run-D-stack>/homes/admin/xfce-lockfix-test-96e15b51
+homes files: 38
+homes listing sha256: f199ec8e9e173ae12f78b2bae61f57b4ed5f1f898a74ddb6e75dc09d9632a04e
+--- agent container ---
+id=ef8b173b0840abecba84516c6efe584e185d0750efe4664a975c0469c5e41097 image=<local-registry>/quasar-node-agent:dev-b199c30 started=2026-09-20T12:43:27.416863324Z restarts=0 health=healthy
+
+=== AFTER (UTC 2026-09-20T13:54:26Z) ===
+host rows: 1
+id|node_name|status|created_at|last_registered_at|agent_restart_count
+aabe0ccc-6011-4442-8f8a-d5157427ff2a|quasar-node-1|online|2026-09-20 00:25:54.58453+00|2026-09-20 13:53:51.316008+00|0
+sessions: 27
+apps: 1
+schema version: 85|f
+node-secret sha256: 7559b35184d29b5418b4637ceaf3a08264acb989344e3be611b273636bbcc456
+container-owner: 3c271707a968bf13097bb05bae590bd20b14137f112695d39fb6a1811fb151eb
+--- managed homes ---
+<run-D-stack>/homes
+<run-D-stack>/homes/admin
+<run-D-stack>/homes/admin/xfce-lockfix-test-96e15b51
+homes files: 38
+homes listing sha256: f199ec8e9e173ae12f78b2bae61f57b4ed5f1f898a74ddb6e75dc09d9632a04e
+--- agent container ---
+id=7f161a2222f19bfbb9871495e73c49bb3d4974789f1af87d56b83240671c8f7a image=<local-registry>/quasar-node-agent:dev-b199c30 started=2026-09-20T13:53:50.743945423Z restarts=0 health=healthy
+
+=== DIFF, before vs after ===
+1c1
+< === BEFORE (UTC 2026-09-20T13:53:44Z) ===
+---
+> === AFTER (UTC 2026-09-20T13:54:26Z) ===
+4c4
+< aabe0ccc-6011-4442-8f8a-d5157427ff2a|quasar-node-1|online|2026-09-20 00:25:54.58453+00|2026-09-20 12:43:27.980982+00|0
+---
+> aabe0ccc-6011-4442-8f8a-d5157427ff2a|quasar-node-1|online|2026-09-20 00:25:54.58453+00|2026-09-20 13:53:51.316008+00|0
+17c17
+< id=ef8b173b0840abecba84516c6efe584e185d0750efe4664a975c0469c5e41097 image=<local-registry>/quasar-node-agent:dev-b199c30 started=2026-09-20T12:43:27.416863324Z restarts=0 health=healthy
+---
+> id=7f161a2222f19bfbb9871495e73c49bb3d4974789f1af87d56b83240671c8f7a image=<local-registry>/quasar-node-agent:dev-b199c30 started=2026-09-20T13:53:50.743945423Z restarts=0 health=healthy
+
+=== VERDICT: PASS ===
+- Same host id: aabe0ccc-6011-4442-8f8a-d5157427ff2a, before and after.
+- One host row before and after (host rows: 1). No second registration.
+- Same node_name (quasar-node-1) and the same created_at.
+- Marker file intact: homes/admin/xfce-lockfix-test-96e15b51 still present, and the
+  whole managed-home tree is byte-identical by listing digest
+  (f199ec8e9e173ae12f78b2bae61f57b4ed5f1f898a74ddb6e75dc09d9632a04e, 38 files).
+- Data intact: 27 sessions, 1 app, schema 85 not dirty.
+- Node secret unchanged (sha256 7559b351...), container-owner id unchanged, so the agent
+  re-authenticated as itself rather than enrolling again.
+- agent_restart_count stayed 0: the recreate is not seen as an agent crash.
+
+The only two fields that moved are the two that must move:
+- last_registered_at 12:43:27 -> 13:53:51 (the new process registering), and
+- the container id ef8b173b -> 7f161a22 (the recreate itself).

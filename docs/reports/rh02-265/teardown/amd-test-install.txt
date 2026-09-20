@@ -1,0 +1,28 @@
+AMD test host: teardown of the run A install (compose project 'deploy')
+Branch tip 23e995d. Captured by this session, 2026-09-20.
+
+--- BEFORE ---
+containers: deploy-quasar-node-agent-1 (running, quasar-node-agent:dev-b199c30)
+            deploy-quasar-control-plane-1 (running)
+            deploy-quasar-updater-1 (running, quasar-updater:dev-7e5f859)
+            deploy-quasar-postgres-1 (running, postgres:16-alpine)
+volumes:    deploy_quasar-agent-data, deploy_quasar-control-tls,
+            deploy_quasar-postgres-data, deploy_quasar-updater-run
+networks:   bridge, deploy_default, host, none
+/run/quasar-agent: empty (only . and ..)
+stack dir:  <the clone's deploy/>, docker-compose.yml only (no NVIDIA overlay)
+
+--- COMMAND ---
+docker compose -p deploy -f docker-compose.yml down -v --remove-orphans
+  (2026-09-20T14:02:23Z; every container stopped+removed, all four volumes
+   removed, deploy_default removed)
+
+--- AFTER ---
+containers: 0   (docker ps -aq | wc -l == 0)
+volumes:    0   (docker volume ls -q | wc -l == 0)
+networks:   bridge, host, none   (the three docker built-ins only)
+/run/quasar-agent: empty (only . and ..), mode 0700 root:root
+
+VERDICT: the AMD test host holds nothing from any Quasar test project. No
+container, no volume, no non-default network, and nothing under the agent
+runtime path.

@@ -1,0 +1,38 @@
+=== captured (UTC) ===
+2026-09-20T13:52:02Z
+
+=== owner install: compose project deploy, containers ===
+deploy-quasar-node-agent-1|exited|Exited (143) 5 days ago|ghcr.io/accreleus/quasar/quasar-node-agent|2026-09-13 11:24:15 +1000 AEST|45d95a72a6c4
+deploy-quasar-control-plane-1|exited|Exited (0) 5 days ago|ghcr.io/accreleus/quasar/quasar-control-plane|2026-09-13 10:38:55 +1000 AEST|d4d8db06b466
+deploy-quasar-updater-1|exited|Exited (0) 5 days ago|ghcr.io/accreleus/quasar/quasar-updater:sha-8a86cd2|2026-09-12 14:18:20 +1000 AEST|97ef00fa914e
+deploy-quasar-postgres-1|exited|Exited (0) 5 days ago|postgres:16-alpine|2026-09-10 00:03:38 +1000 AEST|1230a817c6aa
+
+=== owner install: per-container immutable identity ===
+/deploy-quasar-node-agent-1 id=45d95a72a6c458dfda728ec89f43aa4a4e85763a90f2729774028fba75cbf21c image=sha256:3a4c6863c61fc708bc41d2823f331d6de9e69d8cf4a9f12236419ed63fa8e055 created=2026-09-13T01:24:15.560549477Z started=2026-09-13T01:24:27.000380139Z finished=2026-09-15T10:35:35.587841752Z restarts=0 exit=143
+/deploy-quasar-control-plane-1 id=d4d8db06b46638c1509839e3b39c316ff18b7cece8ddd17a310cdebdfee7e080 image=sha256:747820351c057a80337d580e2016e505c271496ea42deae117e6b0c0fb79c9ae created=2026-09-13T00:38:55.69159422Z started=2026-09-13T01:24:21.372333178Z finished=2026-09-15T10:35:35.633686624Z restarts=0 exit=0
+/deploy-quasar-updater-1 id=97ef00fa914e4454f9a4a598a5f8b862a1e1b18dfff78217beea212fd0a4d5d2 image=sha256:d9eae7d6a6439d7f36385628e4eb26e8990a0c3c8623dc8121049466e9c9a333 created=2026-09-12T04:18:20.452898579Z started=2026-09-13T01:24:15.7326818Z finished=2026-09-15T10:35:35.318468858Z restarts=0 exit=0
+/deploy-quasar-postgres-1 id=1230a817c6aa9bb9abbe53b4a38d711eaa7c791f170ff2cc37f621d4f4024dfa image=sha256:75f5a96988cdf694a215073c3e9c001b706b371e2f94df3967f2efdec2787f6b created=2026-09-09T14:03:38.372257712Z started=2026-09-13T01:24:15.737766376Z finished=2026-09-15T10:35:35.946540659Z restarts=0 exit=0
+
+=== owner install: volumes ===
+deploy_quasar-agent-data created=2026-09-06T14:20:16+10:00 mount=/var/lib/docker/volumes/deploy_quasar-agent-data/_data
+deploy_quasar-control-tls created=2026-09-06T14:20:17+10:00 mount=/var/lib/docker/volumes/deploy_quasar-control-tls/_data
+deploy_quasar-nvidia-driver created=2026-09-06T14:20:17+10:00 mount=/var/lib/docker/volumes/deploy_quasar-nvidia-driver/_data
+deploy_quasar-postgres-data created=2026-09-06T14:20:17+10:00 mount=/var/lib/docker/volumes/deploy_quasar-postgres-data/_data
+deploy_quasar-updater-run created=2026-09-06T14:20:17+10:00 mount=/var/lib/docker/volumes/deploy_quasar-updater-run/_data
+
+=== owner install: volume content digests ===
+deploy_quasar-agent-data files=3 bytes=707 listing_sha256=5b4ecc674f99e36212a8a23d14bd7cbdab485358b3a2e10c1e84d3eec3424375
+deploy_quasar-control-tls files=23 bytes=35058069 listing_sha256=418fb50b89724854566efeb5ac5a6d2490727aaa57c477e241684f8e628445e2
+deploy_quasar-postgres-data files=1585 bytes=74840326 listing_sha256=77f64c4ac39258a3cd7bc15b4454380572710974c5b035e4f8eef4409912f2d9
+deploy_quasar-updater-run files=34 bytes=61647 listing_sha256=085bdfae3fa334cd216b7f0112925ec835aa983e04677de4b132b7ea304919d3
+
+=== owner install: nvidia driver volume (large, listing only) ===
+deploy_quasar-nvidia-driver files=85 bytes=1559854538 listing_sha256=b233d3ffc21b1edeef463a3a2443a1ed353ac99b28fe7834bf4e3f44331d9af5
+
+=== owner install: network ===
+deploy_default id=61faaacd73c7a67d98f08ed38b2208e0f50c41597b9c89c4cb7bc2bdac74a838 created=2026-09-10T00:03:37.46992284+10:00
+
+=== shared host path /run/quasar-agent ===
+total 0
+drwx------  2 root root   40 Sep 20 22:43 .
+drwxr-xr-x 23 root root 1160 Sep 20 13:20 ..
