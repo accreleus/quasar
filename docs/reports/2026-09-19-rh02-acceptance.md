@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Ticket | #265. Parents #210 and #211, initiative #207, specification #252, ADR 0005 |
-| Source | `feature/rh-02-probe-first` = `initiative/resilient-host-architecture` at `7e5f859` when the runs were made. No production code changed in this slice. |
+| Source | `feature/rh-02-probe-first` = `initiative/resilient-host-architecture` at `7e5f859` when runs A to C were made, and at `b7afff6` (documentation only) for run D. No production code changed in this slice. |
 | Not on | `develop`, `main`. No tag, no image publication, no Actions build. |
 | Protocol pin | `7ecc596` (amendment 11). quasar-protocol#23 (wording-only clarifications) was still open, so the pin was left alone. |
 | Schema | 85 (`0085_evidence_gated_readiness`), one-way |
@@ -15,14 +15,17 @@ Nothing here merges into `develop`; #210, #211 and #207 stay open until the owne
 
 ## What ran
 
-Three fresh installs, each with a new Compose project, a new database and a new agent
-identity, each removed afterwards.
+Four fresh installs, each with a new Compose project, a new database and a new agent
+identity. A, B and C were removed afterwards. **Run D was added a day later**, after the owner
+confirmed the NVIDIA card was free, and at the owner's request it was left running for
+visual inspection when this was written.
 
 | Run | What it is | What it is not |
 |---|---|---|
 | **A** | A fresh Quasar install on the AMD test host: a Linux system container on the Unraid host, with Docker nested inside it and a standard-Linux userspace, under the Unraid host's kernel and amdgpu kernel driver. | Not a virtual machine, and not a native Unraid install. |
 | **B** | The same on the NVIDIA test host, under the Unraid host's kernel and NVIDIA kernel driver. The driver volume was provisioned from empty. | Not a native Unraid/NVIDIA install: Docker here is the container's own, with its own paths and its own NVIDIA container toolkit. |
 | **C** | A native install through the Unraid host's own Docker, with plain `docker compose`, on the AMD GPU, beside the owner's existing install, which was stopped throughout and was left byte-for-byte as found. | Not NVIDIA. The #264 harness was not run here: it starts privileged nested engines and shadows device nodes, and this engine also hosts the owner's other services. The owner authorised an isolated install, not fault injection. |
+| **D** | A native install through the Unraid host's own Docker with the NVIDIA overlay, on the RTX 5090, with the same isolation as run C. The NVIDIA test host was idle throughout. The host's Docker already had the `nvidia` runtime and a CDI specification; nothing on the host was changed. | The #264 harness was not run here, for the same reason as run C. No agent-recreate check was made. |
 
 Each run followed `deploy/README.md` Part 1, path A ("Install a release") as a self-hoster
 would, with the two image lines naming the locally built images instead of a published
@@ -38,7 +41,7 @@ what is missing.
 
 | # | Acceptance text | Verdict | Evidence and reason |
 |---|---|---|---|
-| 1 | "Probe GPU/compositor/encoder, audio, uinput, storage permissions/free space and relevant network prerequisites." | **Met** | All three installs report `media_probe_gpu<N>` (composite and encode on the real render node), `application_gpu_probe_gpu<N>`, `audio_probe`, `input_probe`, `homes_root_writable`, `homes_free_space`, `template_free_space` and `media_reachability`, each with observed-at and source: [`install-a/host-body.json`](rh02-265/install-a/host-body.json), [`install-b/host-body.json`](rh02-265/install-b/host-body.json), [`install-c/host-body.json`](rh02-265/install-c/host-body.json). Built in [#257/#259](2026-09-19-rh02-257-259-host-probes-acceptance.md). One limit is filed as #272: the media probe counts encoded frames and cannot see a corrupt picture. |
+| 1 | "Probe GPU/compositor/encoder, audio, uinput, storage permissions/free space and relevant network prerequisites." | **Met, with defect #280** | All four installs report `media_probe_gpu<N>` (composite and encode on the real render node), `application_gpu_probe_gpu<N>`, `audio_probe`, `input_probe`, `homes_root_writable`, `homes_free_space`, `template_free_space` and `media_reachability`, each with observed-at and source: [`install-a/host-body.json`](rh02-265/install-a/host-body.json), [`install-b/host-body.json`](rh02-265/install-b/host-body.json), [`install-c/host-body.json`](rh02-265/install-c/host-body.json). Built in [#257/#259](2026-09-19-rh02-257-259-host-probes-acceptance.md). Two limits are filed. #272: the media probe counts encoded frames and cannot see a corrupt picture. #280: on run D the application GPU probe fails on a healthy host, because the probe container is not given the GPU the way a real application container is. |
 | 2 | "Failure leaves diagnostic registration available but blocks affected workloads." | **Met** | Diagnostic registration: [#256](2026-09-18-rh02-256-diagnostic-registration-acceptance.md). Blocking by scope: [#262](2026-09-19-rh02-262-readiness-gate-acceptance.md) and the #264 matrix below (host, homes and gpu scopes; a launch that mounts no home is not refused by a homes failure; a second host takes the launch). Shown again here on a real install with real faults: a host that stays **online** while `runtime_endpoint` fails and launches are refused ([`1c-real-engine.txt`](rh02-265/install-b/1c-real-engine.txt)), and a first-boot NVIDIA host blocked only while its GPU probes fail ([`tls-real-block.txt`](rh02-265/install-b/tls-real-block.txt)). |
 | 3 | "Probe cleanup is ownership-scoped" | **Met, with one harness gap** | Probe containers carry the agent's ownership label and are removed; nine sessions and every probe on install B, including three app crashes, left no container and no socket directory. On run C the new agent left the existing install's four stopped containers untouched ([`install-c/install-log.txt`](rh02-265/install-c/install-log.txt)). The agent logs its legacy sweep only when it preserved or could not resolve something; there was nothing of that kind to consider, so the log is silent and the proof is the before/after comparison. The gap is in the test tooling, not the product: #275. |
 | 4 | "missing drivers are reported, not silently installed or bypassed" | **Met** | Run B from an empty driver volume: the card reported the three NVIDIA graphics checks as `provisioning` with the text "no action needed; the agent restarts itself when it finishes", the GPU probes failed and blocked launches meanwhile, nothing was written outside the volume, and the block cleared by itself ([`agent-firstboot-provisioning.txt`](rh02-265/install-b/agent-firstboot-provisioning.txt), [`provision-gate-timeline.txt`](rh02-265/install-b/provision-gate-timeline.txt)). With provisioning off and an empty volume the probes fail and stay failed (#264 row 4b). |
@@ -48,7 +51,7 @@ what is missing.
 
 | # | Acceptance text | Verdict | Evidence and reason |
 |---|---|---|---|
-| 1 | "Fresh Unraid/NVIDIA and standard Linux installs have recorded evidence." | **Partly met** | Standard Linux: runs A (AMD) and B (NVIDIA), both complete. Unraid: run C is a native Unraid install, on the **AMD** GPU. Run B is NVIDIA hardware on the Unraid host's kernel and driver, reached through a Linux system container. **A native Unraid/NVIDIA install was not run.** What B does not establish: Unraid's own Docker with the NVIDIA runtime, Unraid path forms, and the Unraid NVIDIA plugin's driver layout. What C does not establish: anything about NVIDIA. |
+| 1 | "Fresh Unraid/NVIDIA and standard Linux installs have recorded evidence." | **Met as to evidence; the evidence includes a blocking defect** | Standard Linux: runs A (AMD) and B (NVIDIA). Native Unraid: run C on the AMD GPU and **run D on the NVIDIA GPU**. Run D installed cleanly and its card rendered, but `application_gpu_probe_gpu0` failed and the gate refused every launch with `host_not_ready` ([`install-log.txt`](rh02-265/install-d/install-log.txt), [`host-body-blocked.json`](rh02-265/install-d/host-body-blocked.json)). With that one check overridden, a real session was correct in every respect ([`session.txt`](rh02-265/install-d/session.txt)), so the failure is a false positive: #280, cause in [`probe-vs-app-container.txt`](rh02-265/install-d/probe-vs-app-container.txt). The recorded evidence the line asks for exists. What it records is that RH-02, as it stands, blocks a healthy native Unraid/NVIDIA host until an admin overrides a wrong check. |
 | 2 | "Missing runtime, invalid storage, unavailable input and GPU failures appear before launch." | **Met** | #264 matrix, rerun in this slice on both test hosts (AMD 103 pass, 0 fail, 1 unperformed; NVIDIA 96, 0, 4). Row 1c, unperformed on NVIDIA in #264 because the nested engine cannot serve a launch there, was performed against install B's own engine and passed. |
 | 3 | "Host-local readiness never claims browser reachability; the browser probe supplies that evidence." | **Met** | #264 row 8 on both hosts. Every captured card carries the sentence "It does not show whether a browser can reach the host", and `media_reachability` speaks only of the host's own inbound firewall. |
 | 4 | "Reuse #158 and #149/#126 evidence boundaries; do not claim untested Intel support." | **Met** | Nothing is claimed for Intel. [`rh01-intel-external-validation.md`](rh01-intel-external-validation.md) remains the only Intel evidence, and it is external. |
@@ -132,6 +135,31 @@ into the session's own audio server from its sidecar container: that exercises c
 encode, WebRTC and the browser, and not the application's own socket connection, which
 `audio_probe` covers. And the typed text arrives in lower case because the test driver does
 not press Shift; the product was not at fault.
+
+## Run D: native Unraid on the NVIDIA GPU
+
+- The agent found the host's own NVIDIA graphics userspace, so it did **not** provision a
+  driver volume (`driver_volume_version`: skip, "host driver packages are in use"). The three
+  NVIDIA graphics checks and `media_probe_gpu0` passed; the media probe encoded with
+  `vulkanh264enc` ([`readiness-card-wizard.txt`](rh02-265/install-d/readiness-card-wizard.txt)).
+- `application_gpu_probe_gpu0` failed and never cleared: "the EGL stack loads but no GPU could
+  be opened: eglInitialize failed ... (egl error 0x3001)". The gate listed it and a launch was
+  refused `503 host_not_ready` ([`gate-timeline.txt`](rh02-265/install-d/gate-timeline.txt)).
+- The override was set through the API (`200`). The check stayed listed, marked overridden,
+  and the launch then succeeded. That is the #263 behaviour, seen here on a real, non-synthetic
+  block for the first time.
+- The session: XFCE desktop at 2560x1440 and 60 fps, AV1 on `vulkanav1enc`; the right-click
+  menu opened; a shortcut opened a terminal and a typed command ran; received audio energy was
+  0 while silent and level 0.50 during the tone; normal stop `202` to `stopped`, and containers
+  and socket directories gone 1.58 s after the acknowledgement
+  ([`frame-mouse-contextmenu.png`](rh02-265/install-d/frame-mouse-contextmenu.png),
+  [`frame-keyboard-terminal.png`](rh02-265/install-d/frame-keyboard-terminal.png)).
+- Why the probe is wrong: a real application container is created with an NVIDIA device
+  request, so the container toolkit injects the driver; the probe container is created with
+  none, and with no driver volume on this host it has no NVIDIA userspace at all. On a host
+  that uses the driver volume (run B) the same probe passes.
+- The owner's existing install was compared before the run and checked after the session
+  work: unchanged. The full before-and-after proof belongs to teardown, which is pending.
 
 ## Run B: the driver volume from empty
 
@@ -266,7 +294,7 @@ shows the preflight agreeing with the stored readiness; it does not prove the co
 
 ## Defects and observations filed
 
-None blocked a fresh install. None is in the RH-02 gate, refusal or override.
+None blocked a fresh install. One, #280, is in RH-02: a probe that is wrong on one kind of host. The gate, the refusal and the override all behaved correctly given that wrong answer.
 
 | Issue | What | Bearing on RH-02 |
 |---|---|---|
@@ -274,7 +302,8 @@ None blocked a fresh install. None is in the RH-02 gate, refusal or override.
 | #273 | The XFCE desktop image fails on relaunch into a used home: a crash on NVIDIA, a white desktop on the native AMD install. A fresh home always works. | None. The agent cleaned up every failed session. |
 | #274 | A hung engine takes about 115 s to reach the readiness report, longer than the gate's 60 s staleness window. | A real gap in "runtime failures appear before launch" for the hung, as opposed to dead, engine. |
 | #275 | The #264 harness leaves directories under the agent runtime path after killed-agent scenarios and does not check that path. The #264 record's "nothing remains" missed them. Removed by hand in this slice. | Test tooling only. |
-| #276 | The agent advertises a GPU seen in `/sys` whose render node is absent. | Readiness truthfulness, low priority, a system-container artefact. |
+| #276 | A GPU the agent is pinned away from still counts toward the host's advertised encode slots. | Readiness is truthful about it; the capacity display is not. Low priority, a system-container artefact. |
+| **#280** | `application_gpu_probe` fails on a healthy NVIDIA host that gets its driver from the container toolkit and not from the Quasar driver volume, and blocks every launch. Found on run D. | **The one defect here that is in RH-02 itself**, and in the configuration the operator docs recommend for NVIDIA. |
 | #267 (comment) | One of three NVIDIA harness runs failed its first launch after agent start; not diagnosable, log not retained. | Unknown. |
 
 Ruled out before filing, in the spirit of #264's false alarm: a "missing" app image that a
@@ -295,8 +324,9 @@ No other Unraid-specific step was needed: a single native install would follow t
 ## Limitations
 
 - **Intel** is externally validated only. Nothing is claimed for it.
-- **A native Unraid/NVIDIA install has not been run.** Run B is NVIDIA hardware under the
-  Unraid host's kernel through a system container; run C is native Unraid on AMD.
+- **A native Unraid/NVIDIA install was run (D) and launches only with an override**, because
+  of #280. It had no agent-recreate check and no harness run, and it was still running, not
+  torn down, when this was written.
 - **A host with more than one usable GPU is untested.**
 - **TLS:** the gate's refusal, recovery and the agent-enforced `409` were shown over HTTPS on
   a documented install. The classification rows and the override lifecycle were not.
@@ -317,7 +347,7 @@ No other Unraid-specific step was needed: a single native install would follow t
 #266 (review follow-ups from the storage and runtime checks), #267 (agent exits 255 on the
 first NVIDIA session after start), #269 (resume test flake), #270 (`make test-db`
 `pg_isready` race), #271 (admission recheck lock order), quasar-protocol#23 (amendment 11
-wording), and from this slice #272 to #276 plus #277 to #279 (documentation).
+wording), and from this slice #272 to #276, #277 to #279 (documentation) and #280.
 
 ## For the owner: promotion
 
@@ -357,12 +387,17 @@ overridden, and the audit log records each override at warn severity.
 - Look at the card before telling users the upgrade is done: a red marked check is now a
   refusal, not a warning.
 - On an AMD host, check the picture of the first stream (#272).
+- **On an NVIDIA host that uses the container toolkit and has no Quasar driver volume, expect
+  `application_gpu_probe_gpu<N>` to fail and every launch to be refused (#280).** The owner's
+  own install on the Unraid host is of this kind. Until #280 is fixed the way through is the
+  override on that check, which the audit log records at warn severity.
 
 ## What I need from the owner to accept RH-02
 
-1. Accept or reject "partly met" on #211 line 1: a native Unraid/NVIDIA install was not
-   run. Running one needs the NVIDIA card free on the Unraid host while the NVIDIA test
-   host is stopped; that is the owner's call and window.
+1. **A decision on #280 before promotion.** My recommendation is to fix it first: it turns a
+   working NVIDIA host into one that refuses every launch on upgrade day, and the fix is
+   contained (create the probe container with the same GPU injection a real session gets).
+   The alternative is to promote and tell NVIDIA operators to set the override.
 2. A decision on #272 before an AMD self-hoster meets it: flip `AMD_AUTO_DEFAULT` to VA, or
    accept it as known. It is not part of RH-02, but it sits in the first-install path this
    increment is about.

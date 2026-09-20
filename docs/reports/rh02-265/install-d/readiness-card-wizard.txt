@@ -1,0 +1,223 @@
+URL https://<addr>:28443/setup
+QUASAR
+1. CREATE ADMIN
+2. INSTANCE BASICS
+3. HOST CHECK
+4. LIBRARIES
+5. FINISHING TOUCHES
+Host & GPU check
+
+What the control plane has actually heard from your node agents — not what was declared.
+
+Media (WebRTC) needs a reachable host. For remote players, configure STUN/TURN or use a shared VPN. A reverse proxy carries signaling but does not relay video.
+
+quasar-node-1
+ONLINE
+Registered 9/20/2026, 12:26:08 AM
+nvidia NVIDIA GeForce RTX 5090 — 2 encode slots, 0 active sessions
+amd amd Granite Ridge [Radeon Graphics] — 2 encode slots, 0 active sessions
+Readiness
+Last reported 9/20/2026, 12:32:10 AM
+NEEDS ATTENTION
+
+Readiness is what this host can establish about itself. It does not show whether a browser can reach the host; that depends on the network between them.
+
+CONTAINER RUNTIME
+runtime endpoint
+CAN BLOCK LAUNCHES
+
+Docker Engine - Community 29.7.1 at unix:///var/run/docker.sock answers
+
+Observed 9/20/2026, 12:32:10 AM · container runtime
+
+runtime api version
+
+API 1.53 negotiated with Docker Engine - Community 29.7.1 (the engine offers 1.40-1.55; this agent needs at least 1.40)
+
+Observed 9/20/2026, 12:32:10 AM · container runtime
+
+runtime capabilities
+
+Docker Engine - Community 29.7.1 on Unraid OS 7.4 x86_64 (x86_64), cgroup v2; security options: name=seccomp,profile=builtin, name=cgroupns; runtimes: io.containerd.runc.v2, nvidia, runc (default runc); as stated by the engine, not exercised
+
+Observed 9/20/2026, 12:32:10 AM · container runtime
+
+runtime cdi
+
+CDI is enabled (spec dirs: /etc/cdi, /var/run/cdi); devices discovered: nvidia.com/gpu=0 (cdi), nvidia.com/gpu=GPU-<uuid> (cdi), nvidia.com/gpu=all (cdi); GPU injection does not use CDI
+
+Observed 9/20/2026, 12:32:10 AM · container runtime
+
+host container mounts
+
+Required sibling-container paths agree with their host bind mounts
+
+Observed 9/20/2026, 12:32:10 AM · local check
+
+GPU & DISPLAY
+application gpu probe gpu0
+BLOCKS LAUNCHES
+
+An application container could not open GPU 0: the EGL stack loads but no GPU could be opened: eglInitialize failed for /dev/dri/renderD128 (egl error 0x3001)
+
+Observed 9/20/2026, 12:26:13 AM · host probe
+
+Check /dev/dri permissions/groups (the dri_node_app_access check) and, on NVIDIA, the driver volume (driver_volume_version check).
+Copy
+media probe gpu0
+CAN BLOCK LAUNCHES
+
+GPU 0 composited and encoded frames: encoded 31 frames with vulkanh264enc on /dev/dri/renderD128
+
+Observed 9/20/2026, 12:26:13 AM · host probe
+
+render node
+
+render node open-able (/dev/dri/renderD128)
+
+Observed 9/20/2026, 12:32:10 AM · local check
+
+host render node
+
+host kernel created 2 DRM render node(s)
+
+Observed 9/20/2026, 12:32:10 AM · local check
+
+dri node app access
+
+all 4 /dev/dri node(s) are openable by the app user
+
+Observed 9/20/2026, 12:32:10 AM · local check
+
+xid visibility
+
+/dev/kmsg is readable — GPU Xid / amdgpu fault records are reported as `host.xid` / `host.gpu_fault` trace events
+
+Observed 9/20/2026, 12:32:10 AM · local check
+
+encoder codecs
+
+encoder advertises h264, h265, av1
+
+Observed 9/20/2026, 12:32:10 AM · local check
+
+NVIDIA DRIVER
+nvidia egl vendor json
+
+EGL vendor config present (/usr/share/glvnd/egl_vendor.d/10_nvidia.json)
+
+Observed 9/20/2026, 12:32:10 AM · local check
+
+nvidia eglcore library
+
+libnvidia-eglcore resolvable (/usr/lib64/libnvidia-eglcore.so.610.57.04)
+
+Observed 9/20/2026, 12:32:10 AM · local check
+
+nvidia lib32 gl
+
+32-bit NVIDIA GL present (/usr/lib)
+
+Observed 9/20/2026, 12:32:10 AM · local check
+
+Vulkan AV1 compatibility
+
+RTX 5090 with NVIDIA 610.57.04: Vulkan AV1 was validated on this GPU/driver combination. Codec availability still depends on the configured encoder and installed elements.
+
+Observed 9/20/2026, 12:32:10 AM · local check
+
+INPUT & SANDBOX
+input probe
+CAN BLOCK LAUNCHES
+
+Virtual input devices were created: created keyboard, mouse and gamepad devices and wrote events
+
+Observed 9/20/2026, 12:26:10 AM · host probe
+
+uinput
+
+/dev/uinput present and writable
+
+Observed 9/20/2026, 12:32:10 AM · local check
+
+user namespaces
+
+user namespaces available (max 376055)
+
+Observed 9/20/2026, 12:32:10 AM · local check
+
+AUDIO
+audio probe
+CAN BLOCK LAUNCHES
+
+The audio sidecar started: its socket appeared
+
+Observed 9/20/2026, 12:26:10 AM · host probe
+
+STORAGE
+homes root writable
+CAN BLOCK LAUNCHES
+
+the agent (QUASAR_APP_PUID unset) created, wrote and removed a test home under /mnt/cache/appdata/quasar-rh02d/homes
+
+Observed 9/20/2026, 12:32:10 AM · local check
+
+homes free space
+CAN BLOCK LAUNCHES
+
+1598.6 GiB free of 3726 GiB under /mnt/cache/appdata/quasar-rh02d/homes (floor 5 GiB)
+
+Observed 9/20/2026, 12:32:10 AM · local check
+
+template free space
+
+1598.6 GiB free of 3726 GiB under /mnt/cache/appdata/quasar-rh02d/templates (floor 5 GiB)
+
+Observed 9/20/2026, 12:32:10 AM · local check
+
+NETWORK
+media reachability
+
+this host's inbound firewall filters nothing (nft answered: no input hook chain in the ruleset) — the host itself would not block inbound WebRTC media
+
+Observed 9/20/2026, 12:32:10 AM · local check
+
+UPDATES
+updater socket
+
+Updater 7e5f85998448432f4067eb4a15a188b8effacc51 answered on its socket
+
+Observed 9/20/2026, 12:32:10 AM · local check
+
+updater stack dir
+
+Updater acts on /mnt/cache/appdata/quasar-rh02d/quasar/deploy (2 compose file(s))
+
+Observed 9/20/2026, 12:32:10 AM · local check
+
+updater overlays
+
+This agent was started with the updater's compose files
+
+Observed 9/20/2026, 12:32:10 AM · local check
+
+health addr bindable
+
+<addr>:29091 is answered by this agent
+
+Observed 9/20/2026, 12:32:10 AM · local check
+
+6 checks not applicable to this host
+
+Checks update automatically. Driver provisioning retries recoverable failures and restarts the agent when its new libraries require it. If a check requests container recreation, use Admin → Hosts.
+
+Codecs this host reports:
+H.264
+HEVC
+AV1
+Managed-home storage:
+LOCAL — /MNT/CACHE/APPDATA/QUASAR-RH02D/HOMES
+Use this host's reported path:
+/mnt/cache/appdata/quasar-rh02d/homes
+Advanced: set a different path
+Continue

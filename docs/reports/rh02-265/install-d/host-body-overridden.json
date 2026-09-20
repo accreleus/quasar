@@ -1,0 +1,342 @@
+{
+  "host": {
+    "status": "online",
+    "node_name": "quasar-node-1",
+    "readiness_reported_at": "2026-09-20T00:38:05Z",
+    "readiness_gate": {
+      "state": "active",
+      "blocking": [
+        {
+          "check_id": "application_gpu_probe_gpu0",
+          "scope": "gpu",
+          "gpu_index": 0,
+          "enforced_by": "control_plane",
+          "overridden": true
+        }
+      ]
+    },
+    "readiness_overrides": [
+      {
+        "check_id": "application_gpu_probe_gpu0",
+        "created_by": "<uuid>",
+        "created_by_username": "admin",
+        "created_at": "2026-09-20T00:32:09.659108Z",
+        "inert": false
+      }
+    ],
+    "readiness": [
+      {
+        "id": "runtime_endpoint",
+        "blocks": {
+          "scope": "host",
+          "enforced_by": "agent"
+        },
+        "source": "runtime",
+        "status": "pass",
+        "summary": "Docker Engine - Community 29.7.1 at unix:///var/run/docker.sock answers",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "runtime_api_version",
+        "source": "runtime",
+        "status": "pass",
+        "summary": "API 1.53 negotiated with Docker Engine - Community 29.7.1 (the engine offers 1.40-1.55; this agent needs at least 1.40)",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "runtime_capabilities",
+        "source": "runtime",
+        "status": "pass",
+        "summary": "Docker Engine - Community 29.7.1 on Unraid OS 7.4 x86_64 (x86_64), cgroup v2; security options: name=seccomp,profile=builtin, name=cgroupns; runtimes: io.containerd.runc.v2, nvidia, runc (default runc); as stated by the engine, not exercised",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "runtime_cdi",
+        "source": "runtime",
+        "status": "pass",
+        "summary": "CDI is enabled (spec dirs: /etc/cdi, /var/run/cdi); devices discovered: nvidia.com/gpu=0 (cdi), nvidia.com/gpu=GPU-<uuid> (cdi), nvidia.com/gpu=all (cdi); GPU injection does not use CDI",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "nvidia_egl_vendor_json",
+        "source": "local",
+        "status": "pass",
+        "summary": "EGL vendor config present (/usr/share/glvnd/egl_vendor.d/10_nvidia.json)",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "nvidia_eglcore_library",
+        "source": "local",
+        "status": "pass",
+        "summary": "libnvidia-eglcore resolvable (/usr/lib64/libnvidia-eglcore.so.610.57.04)",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "nvidia_lib32_gl",
+        "source": "local",
+        "status": "pass",
+        "summary": "32-bit NVIDIA GL present (/usr/lib)",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "render_node",
+        "source": "local",
+        "status": "pass",
+        "summary": "render node open-able (/dev/dri/renderD128)",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "uinput",
+        "source": "local",
+        "status": "pass",
+        "summary": "/dev/uinput present and writable",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "user_namespaces",
+        "source": "local",
+        "status": "pass",
+        "summary": "user namespaces available (max 376055)",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "app_apparmor_profile",
+        "source": "local",
+        "status": "skip",
+        "summary": "this host does not enforce AppArmor — app containers carry no AppArmor profile and there is nothing to load",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "host_render_node",
+        "source": "local",
+        "status": "pass",
+        "summary": "host kernel created 2 DRM render node(s)",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "dri_node_app_access",
+        "source": "local",
+        "status": "pass",
+        "summary": "all 4 /dev/dri node(s) are openable by the app user",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "driver_volume_version",
+        "source": "local",
+        "status": "skip",
+        "summary": "no Quasar NVIDIA driver volume on this host (host driver packages are in use)",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "nvidia_driver_mount",
+        "source": "local",
+        "status": "skip",
+        "summary": "No unresolved NVIDIA app driver mount",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "encoder_codecs",
+        "source": "local",
+        "status": "pass",
+        "summary": "encoder advertises h264, h265, av1",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "nvidia_vulkan_av1_compatibility",
+        "source": "local",
+        "status": "pass",
+        "summary": "RTX 5090 with NVIDIA 610.57.04: Vulkan AV1 was validated on this GPU/driver combination. Codec availability still depends on the configured encoder and installed elements.",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "xid_visibility",
+        "source": "local",
+        "status": "pass",
+        "summary": "/dev/kmsg is readable — GPU Xid / amdgpu fault records are reported as `host.xid` / `host.gpu_fault` trace events",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "media_reachability",
+        "source": "local",
+        "status": "pass",
+        "summary": "this host's inbound firewall filters nothing (nft answered: no input hook chain in the ruleset) — the host itself would not block inbound WebRTC media",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "host_container_mounts",
+        "source": "local",
+        "status": "pass",
+        "summary": "Required sibling-container paths agree with their host bind mounts",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "homes_root_writable",
+        "blocks": {
+          "scope": "homes",
+          "enforced_by": "control_plane"
+        },
+        "source": "local",
+        "status": "pass",
+        "summary": "the agent (QUASAR_APP_PUID unset) created, wrote and removed a test home under /mnt/cache/appdata/quasar-rh02d/homes",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "homes_free_space",
+        "blocks": {
+          "scope": "homes",
+          "enforced_by": "control_plane"
+        },
+        "source": "local",
+        "status": "pass",
+        "summary": "1598.4 GiB free of 3726 GiB under /mnt/cache/appdata/quasar-rh02d/homes (floor 5 GiB)",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "template_free_space",
+        "source": "local",
+        "status": "pass",
+        "summary": "1598.4 GiB free of 3726 GiB under /mnt/cache/appdata/quasar-rh02d/templates (floor 5 GiB)",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "image_free_space",
+        "source": "local",
+        "status": "skip",
+        "summary": "The container engine's image storage is not visible to this agent",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "updater_socket",
+        "source": "local",
+        "status": "pass",
+        "summary": "Updater 7e5f85998448432f4067eb4a15a188b8effacc51 answered on its socket",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "updater_stack_dir",
+        "source": "local",
+        "status": "pass",
+        "summary": "Updater acts on /mnt/cache/appdata/quasar-rh02d/quasar/deploy (2 compose file(s))",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "updater_overlays",
+        "source": "local",
+        "status": "pass",
+        "summary": "This agent was started with the updater's compose files",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "health_addr_bindable",
+        "source": "local",
+        "status": "pass",
+        "summary": "<addr>:29091 is answered by this agent",
+        "observed_at": "2026-09-20T00:38:05Z",
+        "remediation": ""
+      },
+      {
+        "id": "input_probe",
+        "blocks": {
+          "scope": "host",
+          "enforced_by": "control_plane"
+        },
+        "source": "host_probe",
+        "status": "pass",
+        "summary": "Virtual input devices were created: created keyboard, mouse and gamepad devices and wrote events",
+        "observed_at": "2026-09-20T00:34:20Z",
+        "remediation": ""
+      },
+      {
+        "id": "audio_probe",
+        "blocks": {
+          "scope": "host",
+          "enforced_by": "control_plane"
+        },
+        "source": "host_probe",
+        "status": "pass",
+        "summary": "The audio sidecar started: its socket appeared",
+        "observed_at": "2026-09-20T00:34:20Z",
+        "remediation": ""
+      },
+      {
+        "id": "media_probe_gpu0",
+        "blocks": {
+          "scope": "gpu",
+          "gpu_index": 0,
+          "enforced_by": "control_plane"
+        },
+        "source": "host_probe",
+        "status": "pass",
+        "summary": "GPU 0 composited and encoded frames: encoded 31 frames with vulkanh264enc on /dev/dri/renderD128",
+        "observed_at": "2026-09-20T00:34:23Z",
+        "remediation": ""
+      },
+      {
+        "id": "media_probe_gpu1",
+        "blocks": {
+          "scope": "gpu",
+          "gpu_index": 1,
+          "enforced_by": "control_plane"
+        },
+        "source": "host_probe",
+        "status": "skip",
+        "summary": "This host is pinned to /dev/dri/renderD128; sessions are never placed on GPU 1",
+        "observed_at": "2026-09-20T00:34:23Z",
+        "remediation": ""
+      },
+      {
+        "id": "application_gpu_probe_gpu0",
+        "blocks": {
+          "scope": "gpu",
+          "gpu_index": 0,
+          "enforced_by": "control_plane"
+        },
+        "source": "host_probe",
+        "status": "fail",
+        "summary": "An application container could not open GPU 0: the EGL stack loads but no GPU could be opened: eglInitialize failed for /dev/dri/renderD128 (egl error 0x3001)",
+        "observed_at": "2026-09-20T00:34:23Z",
+        "remediation": "Check /dev/dri permissions/groups (the dri_node_app_access check) and, on NVIDIA, the driver volume (driver_volume_version check)."
+      },
+      {
+        "id": "application_gpu_probe_gpu1",
+        "blocks": {
+          "scope": "gpu",
+          "gpu_index": 1,
+          "enforced_by": "control_plane"
+        },
+        "source": "host_probe",
+        "status": "skip",
+        "summary": "This host is pinned to /dev/dri/renderD128; sessions are never placed on GPU 1",
+        "observed_at": "2026-09-20T00:34:23Z",
+        "remediation": ""
+      }
+    ]
+  }
+}

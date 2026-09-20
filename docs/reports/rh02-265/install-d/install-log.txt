@@ -1,0 +1,59 @@
+===== existing install, read-only baseline BEFORE run D (last line: size in KiB of its own driver volume)
+/deploy-quasar-node-agent-1 id=45d95a72a6c4… image=3a4c6863c61f… state=exited started=2026-09-13T01:24:27.000380139Z finished=2026-09-15T10:35:35.587841752Z restarts=0
+/deploy-quasar-control-plane-1 id=d4d8db06b466… image=747820351c05… state=exited started=2026-09-13T01:24:21.372333178Z finished=2026-09-15T10:35:35.633686624Z restarts=0
+/deploy-quasar-updater-1 id=97ef00fa914e… image=d9eae7d6a643… state=exited started=2026-09-13T01:24:15.7326818Z finished=2026-09-15T10:35:35.318468858Z restarts=0
+/deploy-quasar-postgres-1 id=1230a817c6aa… image=75f5a96988cd… state=exited started=2026-09-13T01:24:15.737766376Z finished=2026-09-15T10:35:35.946540659Z restarts=0
+deploy_quasar-agent-data
+deploy_quasar-control-tls
+deploy_quasar-nvidia-driver
+deploy_quasar-postgres-data
+deploy_quasar-updater-run
+deploy_default
+08847c7503345c84
+3d23d4ae7e18c0d5
+1523664
+
+===== 02-image-load.txt
+Loaded image: <local-registry>/quasar-control-plane:dev-901058f
+Loaded image: <local-registry>/quasar-node-agent:dev-97fd0d9
+Loaded image: <local-registry>/quasar-updater:dev-7e5f859
+LOAD_DONE rc=0
+
+===== 05-install.txt
+b7afff6eb5b8cd49a351fd8a1ca95c6fec372c1d
+seeded QUASAR_TLS_HOSTS=<redacted>
+--- rendered isolation check:
+time="2026-09-20T10:25:42+10:00" level=warning msg="The \"LD_LIBRARY_PATH\" variable is not set. Defaulting to a blank string."
+project=quasar-rh02d
+volumes=quasar-rh02d_quasar-agent-data,quasar-rh02d_quasar-control-tls,quasar-rh02d_quasar-nvidia-driver,quasar-rh02d_quasar-postgres-data,quasar-rh02d_quasar-updater-run
+networks=quasar-rh02d_default
+cp_ports=28080,28443
+pg_ports=0
+agent_cp_url=ws://localhost:28080
+health=<addr>:29091
+render=/dev/dri/renderD128
+driver_volume_provisioning=1
+UP_T0=2026-09-20T00:25:42Z
+ Container quasar-rh02d-quasar-node-agent-1  Starting
+ Container quasar-rh02d-quasar-node-agent-1  Started
+time="2026-09-20T10:26:02+10:00" level=warning msg="The \"LD_LIBRARY_PATH\" variable is not set. Defaulting to a blank string."
+SERVICE                STATUS
+quasar-control-plane   Up 13 seconds (healthy)
+quasar-node-agent      Up 8 seconds (healthy)
+quasar-postgres        Up 19 seconds (healthy)
+quasar-updater         Up 19 seconds
+{"status":"ok","db":"ok"}
+
+
+===== launch while application_gpu_probe_gpu0 was blocking
+{"error":{"code":"host_not_ready","message":"the host that would run this needs its administrator's attention; try again once they have looked at it"}}
+ HTTP 503
+
+===== final identity, and the existing install afterwards
+engine=29.7.1 api=1.55
+85|f
+--- existing install:
+deploy-quasar-control-plane-1 Exited (0) 4 days ago
+deploy-quasar-node-agent-1 Exited (143) 4 days ago
+deploy-quasar-postgres-1 Exited (0) 4 days ago
+deploy-quasar-updater-1 Exited (0) 4 days ago

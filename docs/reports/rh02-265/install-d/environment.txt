@@ -1,0 +1,10 @@
+Captured live during run D (read-only commands on the Unraid host, then the install).
+What it is: a native install through the Unraid host's own Docker with plain docker compose and the NVIDIA overlay, on the RTX 5090.
+kernel 6.18.47-Unraid; Unraid OS 7.4; docker engine 29.7.1, API 1.55; docker compose 2.40.3
+GPU: NVIDIA GeForce RTX 5090 (10de:2b85), driver 610.57.04, idle before the run (34 MiB used, no compute apps)
+Docker as found, unchanged by this run: runtimes runc and nvidia (default runc); CDI spec dirs /etc/cdi and /var/run/cdi; /etc/cdi/nvidia.yaml present; three CDI devices listed
+The agent found the host's own NVIDIA graphics userspace and did not provision a driver volume (driver_volume_version: skip).
+Isolation: project quasar-rh02d, its own volumes, network, Postgres (unpublished), ports 28080 / 28443, agent health <addr>:29091, one fresh root under /mnt/cache/appdata. The NVIDIA test host was idle (0 containers) for the whole run.
+Source commit of the clone: b7afff6 (docs-only later than 7e5f859). Images as in runs A to C, loaded with docker save | docker load.
+Not done on this install: the #264 harness (production engine), an agent-recreate persistence check.
+State when recorded: left running at the owner's request for visual inspection; teardown pending.

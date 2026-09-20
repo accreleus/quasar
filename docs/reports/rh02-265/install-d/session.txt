@@ -1,0 +1,19 @@
+2026-09-20T00:37:10.864Z decode true after_ms 4009 sid <uuid>
+2026-09-20T00:37:25.096Z pointer lock after Capture input: true
+2026-09-20T00:37:36.774Z audio {"packets":2636,"energy":0,"level":0,"dur":26.720000000001377}
+2026-09-20T00:37:40.777Z audio {"packets":3037,"energy":0,"level":0,"dur":30.720000000002003}
+2026-09-20T00:37:43.183Z audio {"packets":3277,"energy":0.5121724486736804,"level":0.5035248878444777,"dur":33.13000000000198}
+2026-09-20T00:37:49.185Z audio {"packets":3876,"energy":2.0342501913814695,"level":0.5034638508255257,"dur":39.130000000000784}
+2026-09-20T00:37:49.185Z video {"frames":2393,"w":2560,"h":1440,"fps":60,"codec":"CITvideo01_96_level-idx=5;profile=0;tier=0"}
+
+== effective encoder (agent log)
+      2 Vulkan hardware encoder: vulkanav1enc (codec=av1, 7000 kbps, rate-control=cbr, quality=0, num-ref-frames=1, b-frames=0, aud=false, idr-period=60, num-slices=8, 
+      3 Vulkan hardware encoder: vulkanh264enc (codec=h264, 8000 kbps, rate-control=cbr, quality=0, num-ref-frames=1, b-frames=0, aud=false, idr-period=60, num-slices=8
+
+== timed normal stop
+delete_sent_epoch_ms=1789864684823
+http=202
+delete_acked_epoch_ms=1789864684837
+t0_epoch_ms=1789864682826
+10ms epoch_ms=1789864682836 containers=2 dirs=2
+3589ms epoch_ms=1789864686415 containers=0 dirs=0

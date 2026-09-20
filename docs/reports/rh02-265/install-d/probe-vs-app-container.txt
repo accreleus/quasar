@@ -1,0 +1,12 @@
+How the real application container and the application GPU probe container were created (docker inspect).
+
+== real app container
+runtime=runc devreq=[{"Driver":"nvidia","Count":-1,"DeviceIDs":null,"Capabilities":[["gpu"]],"Options":null}] devices=/dev/dri /dev/input/event11 /dev/input/event12 /dev/input/event13 /dev/fuse  env_nv=XDG_RUNTIME_DIR=/run/quasar-wayland
+/usr/lib -> /opt/quasar/nvidia-lib32
+== probe containers seen in 45 s
+
+== probe containers created at agent start
+NAME=/quasar-probe-app-gpu-57-1789864463583862565 runtime=runc devreq=null devices=/dev/dri 
+ENV=PATH=/opt/gst/bin:/usr/local/bin:/usr/bin | container=oci | HOME=/home/<user> | LANG=en_US.UTF-8 | LC_ALL=en_US.UTF-8 | PUID=1000 | PGID=1000 | UMASK=022 | UNAME=quasar | GST_PLUGIN_PATH=/opt/gst/lib64/gstreamer-1.0 | VK_LOADER_DRIVERS_DISABLE=*lvp_icd* | ANV_DEBUG=video-encode | QUASAR_HEALTH_ADDR=<addr>:9091 | NODE_SECRET_PATH=/var/lib/quasar-agent/node-secret | XDG_RUNTIME_DIR=/run/quasar-agent | NVIDIA_DRIVER_CAPABILITIES=all | 
+MOUNTS=
+CMD=["20s","/usr/local/bin/quasar-node-agent","egl-selftest","--open-device","--render-node","/dev/dri/renderD128"] IMAGE=sha256:632e8e74498a…
