@@ -439,6 +439,24 @@ impl RuntimeClient {
         self.submit(async move { docker::inspect_container(&config, &id).await })
     }
 
+    /// [`Self::inspect_container`] under a caller-chosen budget. The readiness refresh uses
+    /// it with [`ENGINE_INSPECTION_BUDGET`]: a refresh that straddles a daemon freeze has
+    /// already proved the engine answers, so it does not skip its remaining collectors —
+    /// and one full client deadline inside a refresh is a whole staleness window (#274).
+    pub fn inspect_container_within(
+        &self,
+        id: impl Into<String>,
+        budget: Duration,
+    ) -> Operation<Option<ContainerInspection>> {
+        let config = self.config.clone();
+        let id = id.into();
+        self.submit_owned(
+            async move { docker::inspect_container(&config, &id).await },
+            std::cmp::min(self.config.deadline, budget),
+            false,
+        )
+    }
+
     /// Snapshot every live container, including containers Quasar does not own.
     /// Every listed ID is re-inspected so an incomplete liveness fact fails closed.
     pub fn live_containers(&self) -> Operation<Vec<ContainerInspection>> {
@@ -452,6 +470,17 @@ impl RuntimeClient {
         self.submit(async move { docker::engine_storage(&config).await })
     }
 
+    /// [`Self::engine_storage`] under a caller-chosen budget; see
+    /// [`Self::inspect_container_within`] for why the readiness path needs one.
+    pub fn engine_storage_within(&self, budget: Duration) -> Operation<EngineStorage> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::engine_storage(&config).await },
+            std::cmp::min(self.config.deadline, budget),
+            false,
+        )
+    }
+
     /// One bounded, read-only inspection of the engine: discovery plus `/info`, folded
     /// into [`EngineFacts`]. Budgeted at [`ENGINE_INSPECTION_BUDGET`] so a readiness
     /// refresh on a wedged daemon reports it inside the control plane's staleness window
@@ -463,6 +492,12 @@ impl RuntimeClient {
             std::cmp::min(self.config.deadline, ENGINE_INSPECTION_BUDGET),
             false,
         )
+    }
+
+    /// This client's default per-operation deadline, for callers choosing between it and
+    /// an explicit budget.
+    pub fn deadline(&self) -> Duration {
+        self.config.deadline
     }
 
     /// The endpoint this client speaks to, for readiness wording.

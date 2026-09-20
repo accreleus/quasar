@@ -291,7 +291,7 @@ impl ProbeEnv {
                 (false, _) => crate::nvidia_volume::EglRuntime::Unknown,
             },
             // Vendor/GPU-independent: a firewall problem is as real on a GPU-less box.
-            firewall: detect_firewall_posture(),
+            firewall: detect_firewall_posture(engine_answered),
             updater: platform_update::collect_updater(&updater_socket_path()),
             updater_present: crate::buildinfo::install_facts().updater_present,
             health: platform_update::collect_health(crate::health::addr_from_env()),
@@ -389,7 +389,10 @@ pub(crate) fn sibling_mount_error() -> Option<String> {
     let Ok(runtime) = crate::runtime::configured() else {
         return Some(ENGINE_MOUNT_INSPECTION_FAILED.into());
     };
-    let Ok(Some(container)) = runtime.inspect_container(id).wait() else {
+    let Ok(Some(container)) = runtime
+        .inspect_container_within(id, crate::runtime::ENGINE_INSPECTION_BUDGET)
+        .wait()
+    else {
         return Some(ENGINE_MOUNT_INSPECTION_FAILED.into());
     };
     let mut paths =
@@ -1890,14 +1893,20 @@ fn media_port_range(root: &Path) -> Option<(u32, u32)> {
 /// Live, best-effort firewall detection: firewalld's CLI first, then nftables/iptables INPUT
 /// policy. Every step degrades to "no signal", never an error — a missing binary is the
 /// expected case on the stock image, and these probes must never hard-fail.
-fn detect_firewall_posture() -> FirewallPosture {
+fn detect_firewall_posture(engine_answered: bool) -> FirewallPosture {
     // A bridged container can have an empty local ruleset while the host filters
     // every packet. Only host-networked agents may report this as host evidence.
     if is_containerized() {
+        if !engine_answered {
+            // The engine has already said it cannot answer. The inspection below would
+            // spend its own budget to reach exactly this Unknown (#274): it was the last
+            // ungated engine call on the refresh path, worth a flat 30 s on hardware.
+            return FirewallPosture::Unknown;
+        }
         let network = crate::nvidia_volume::self_container_id().and_then(|id| {
             crate::runtime::configured()
                 .ok()?
-                .inspect_container(id)
+                .inspect_container_within(id, crate::runtime::ENGINE_INSPECTION_BUDGET)
                 .wait()
                 .ok()??
                 .network_mode

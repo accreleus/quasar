@@ -26,8 +26,12 @@ pub(crate) fn engine_root_visible_to_agent() -> Option<std::path::PathBuf> {
 }
 
 fn agent_visible_engine_root(_runtime: &ContainerRuntime) -> Option<std::path::PathBuf> {
+    // Budgeted, not the client's full deadline: this runs inside a readiness refresh, and
+    // a refresh that straddled a daemon freeze reaches here having seen the engine answer
+    // (#274).
+    let budget = crate::runtime::ENGINE_INSPECTION_BUDGET;
     let runtime = crate::runtime::configured().ok()?;
-    let root = runtime.engine_storage().wait().ok()?.root.0;
+    let root = runtime.engine_storage_within(budget).wait().ok()?.root.0;
     if !(std::path::Path::new("/.dockerenv").exists()
         || std::path::Path::new("/run/.containerenv").exists())
     {
@@ -35,7 +39,11 @@ fn agent_visible_engine_root(_runtime: &ContainerRuntime) -> Option<std::path::P
         return Some(root);
     }
     let self_id = crate::nvidia_volume::self_container_id()?;
-    let self_mounts = runtime.inspect_container(self_id).wait().ok()??.mounts;
+    let self_mounts = runtime
+        .inspect_container_within(self_id, budget)
+        .wait()
+        .ok()??
+        .mounts;
     crate::runtime::agent_path_for_daemon_path(&self_mounts, &root)
 }
 

@@ -751,10 +751,20 @@ impl ContainerRuntime {
 
     /// The exact locally running image, rather than a guessed development tag.
     pub fn own_image(&self) -> Result<String> {
+        let budget = crate::runtime::configured()
+            .map(|client| client.deadline())
+            .unwrap_or(crate::runtime::ENGINE_INSPECTION_BUDGET);
+        self.own_image_within(budget)
+    }
+
+    /// [`Self::own_image`] under an explicit budget. The readiness refresh's sibling EGL
+    /// probe calls it first, before its own result cache, so on a hung daemon it was worth
+    /// a full client deadline on the report path (#274).
+    pub fn own_image_within(&self, budget: std::time::Duration) -> Result<String> {
         let id = crate::nvidia_volume::self_container_id()
             .context("cannot determine the agent container identity")?;
         let image = crate::runtime::configured()?
-            .inspect_container(id)
+            .inspect_container_within(id, budget)
             .wait()?
             .ok_or_else(|| anyhow::anyhow!("agent container disappeared during image inspection"))?
             .image_id;

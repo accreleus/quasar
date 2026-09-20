@@ -1927,7 +1927,8 @@ pub fn probe_sibling_egl() -> EglRuntime {
         return EglRuntime::Unknown;
     }
     let runtime = crate::session::container::ContainerRuntime::from_env();
-    let image = match runtime.own_image() {
+    // Budgeted: this runs before the cache lookup below, on the readiness report path (#274).
+    let image = match runtime.own_image_within(crate::runtime::ENGINE_INSPECTION_BUDGET) {
         Ok(image) => image,
         Err(error) => {
             return EglRuntime::Indeterminate {

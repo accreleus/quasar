@@ -177,9 +177,20 @@ fn a_hung_engine_fails_the_endpoint_within_the_inspection_budget() {
 }
 
 /// The bound is only useful if a failing report reaches the control plane before it stops
-/// trusting the last one. One refresh interval of latency (the hang can land just after a
-/// refresh started) plus one inspection budget must stay well under the default
-/// `QUASAR_READINESS_STALE_SECS`, and inside the ~15 s #274 asks for.
+/// trusting the last one. Two cases, and the slower one is what the window must survive.
+///
+/// **Refresh starts after the freeze.** Its engine view is the first thing it builds and
+/// comes back failing within one budget; every other collector is then skipped. Cost: up
+/// to one refresh interval of tick latency, plus one budget.
+///
+/// **Refresh straddles the freeze.** Its engine view ran before the daemon stopped
+/// answering, so it saw a healthy engine, does NOT skip its collectors, and carries a
+/// stale `pass` when it finishes. Single-flight (`readiness_busy`) holds the next refresh
+/// behind it. The failing report is therefore the one after: the straddling refresh's own
+/// remaining engine calls, then a tick, then a fast refresh. Four budgeted calls bound the
+/// straddler — the agent's own mount inspection, the EGL probe's image lookup, the image
+/// root (two calls), and the firewall's network-mode read — which is what
+/// `readiness_engine_budget_convention.rs` enforces file by file.
 #[test]
 fn the_engine_budget_beats_the_control_planes_staleness_window() {
     use crate::agent::READINESS_REFRESH_INTERVAL;
@@ -188,16 +199,21 @@ fn the_engine_budget_beats_the_control_planes_staleness_window() {
 
     /// `QUASAR_READINESS_STALE_SECS`' default in the control plane's readiness gate.
     const STALE_DEFAULT: Duration = Duration::from_secs(60);
+    /// Budgeted engine calls a refresh that did NOT skip its collectors still makes.
+    const STRADDLER_ENGINE_CALLS: u32 = 5;
 
-    let worst_case = READINESS_REFRESH_INTERVAL + ENGINE_INSPECTION_BUDGET;
+    let fresh_refresh = READINESS_REFRESH_INTERVAL + ENGINE_INSPECTION_BUDGET;
     assert!(
-        worst_case <= Duration::from_secs(20),
-        "a hung engine must be reported within about 15 s of the hang: {worst_case:?}"
+        fresh_refresh <= Duration::from_secs(20),
+        "a hang that lands between refreshes must be reported within about 15 s: \
+         {fresh_refresh:?}"
     );
+
+    let straddling = ENGINE_INSPECTION_BUDGET * STRADDLER_ENGINE_CALLS + fresh_refresh;
     assert!(
-        worst_case * 2 < STALE_DEFAULT,
-        "the failing report must land with room to spare inside the staleness window: \
-         {worst_case:?} vs {STALE_DEFAULT:?}"
+        straddling < STALE_DEFAULT,
+        "even a refresh that straddled the freeze must get the failing report out before \
+         the gate stops trusting the last one: {straddling:?} vs {STALE_DEFAULT:?}"
     );
 }
 

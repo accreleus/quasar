@@ -1775,8 +1775,14 @@ has hung — its socket accepts the connection and never answers — fails
 `runtime_endpoint` on the next report rather than after the refresh has waited
 on it. When that inspection says the engine is unusable, the refresh skips the
 rest of its engine calls (the agent's own mount inspection, the sibling EGL
-test, the image-storage lookup): each would spend its own deadline reaching the
-same answer it already reports when the engine is unreachable.
+test, the image-storage lookup, the firewall's network-mode read): each would
+spend its own deadline reaching the same answer it already reports when the
+engine is unreachable. Every one of those calls also carries the same
+five-second budget in its own right, which is what bounds a refresh that was
+already running when the engine hung — that one saw a healthy engine, so it
+does not skip anything. Expect a failing `runtime_endpoint` within about 20
+seconds of a hang, and within about 45 in the straddling case; both are inside
+the default `QUASAR_READINESS_STALE_SECS`.
 
 Failed NVIDIA provisioning is reconsidered every minute, subject to the
 artifact downloader's persisted backoff and integrity rules. New provisioning locks use kernel-held locks, so a
