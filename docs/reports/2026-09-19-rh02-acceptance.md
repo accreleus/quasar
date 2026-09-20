@@ -475,8 +475,39 @@ now tracked as its own ticket, #283.
 
 ## Gates
 
-See the closing comment on #265 for the `make verify` and `make preflight` output on the
-final commit, and the leak scan of the tree and the tracker.
+Run serially on the final commit of this branch. Two do not pass, for one reason that has
+nothing to do with this work, set out below.
+
+| Gate | rc | Result |
+|---|---|---|
+| `make verify` | 1 | 416 pass / 1 warn / 14 fail — every one of the 15 is the missing `qses` (below) |
+| `make test-rust` | 0 | node-agent 1724 passed, 0 failed, 9 ignored; the smaller suites all ok |
+| `make test-go` | 0 | 43 packages ok, 0 failures, `TestOpenAPIDrift` included (submodule initialised) |
+| `make test-db` | 0 | 4 pass / 0 warn / 0 fail on a fresh ephemeral Postgres; the log confirms "DB tests actually ran, no cache" |
+| `make preflight` | 2 | `doctor` degraded 5/1/0, `config-check` degraded 10/3/0, then the same `verify` — **no failure of its own** |
+
+**Why `verify` and `preflight` are not green.** All 14 failures and the 1 warn are in the
+`bench:*` group and every one of them shells out to
+`.claude/skills/quasar-session/scripts/qses`, which does not exist on this machine. That
+path is **untracked** — the directory is in this clone's `info/exclude` as operator-local
+tooling — so it is in no commit, and these assertions fail identically at any commit here.
+The failure sets of `verify` and `preflight` were diffed and are the same 14; `preflight`
+contributes nothing new. None of the changed files on this branch touch `.claude/`, the
+bench path or `scripts/dx/`.
+
+`preflight`'s own warnings are the machine-local advisories this environment always
+reports: no `gpu-test` role in this clone's `hosts.json`, and `compose:hardened`,
+`compose:profiling` and `compose:cores` not configured here.
+
+**Leak scan.** `scripts/dev/leak-scan.sh` reports `clean (tree)` and the tracker scan
+(`--issues`) is recorded with it. One honest limitation: this machine has no
+`leak-patterns.local`, so the script prints "no operator patterns loaded; running the
+generic checks only" and the operator-specific half of the scan did not run. Every file
+added in this slice was therefore also grepped directly for the real tokens (registry
+hostname, host aliases, LAN addresses, operator paths); that check found and removed two in
+`install-d/agent-recreate.txt` — the registry hostname became `<local-registry>` and the
+stack path `<run-D-stack>` — and the harness reports proved already sanitised by the
+harness's own sanitizer.
 
 ## Models
 
