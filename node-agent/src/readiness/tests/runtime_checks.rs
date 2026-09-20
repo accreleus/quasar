@@ -127,6 +127,115 @@ fn an_unreachable_engine_fails_the_endpoint_and_skips_the_rest() {
     }
 }
 
+/// #274: a HUNG engine — a socket that accepts the connection and then never answers, the
+/// shape a SIGSTOPped dockerd has — must fail `runtime_endpoint` inside the inspection
+/// budget, with the same wording and the same remediation an absent engine gets. Driven at
+/// the runtime-client seam on a real silent socket, with the client deadline shrunk so the
+/// test costs milliseconds; the budget itself is guarded by
+/// `the_engine_budget_beats_the_control_planes_staleness_window`.
+#[test]
+fn a_hung_engine_fails_the_endpoint_within_the_inspection_budget() {
+    use crate::runtime::{RuntimeClient, RuntimeConfig};
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("hung.sock");
+    // Bound but never accepted: the connect succeeds from the kernel backlog and the
+    // request is never answered. Connection failure would be a different defect.
+    let _listener = UnixListener::bind(&socket).unwrap();
+    let mut config = RuntimeConfig::unix(socket);
+    config.deadline = Duration::from_millis(200);
+    let client = RuntimeClient::new(config).unwrap();
+
+    let started = Instant::now();
+    let view = RuntimeView::observe(&client);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the inspection was bounded, not left on the hung engine: {elapsed:?}"
+    );
+
+    assert!(
+        !view.engine_answered(),
+        "a hung engine did not answer, so the refresh must skip the other engine calls: {view:?}"
+    );
+
+    let check = check_runtime_endpoint(&view);
+    assert_eq!(check.status, FAIL, "{check:?}");
+    assert!(
+        check.summary.contains("unreachable")
+            && check
+                .summary
+                .contains("did not answer within the inspection budget"),
+        "the summary says the engine did not answer in time: {check:?}"
+    );
+    assert!(
+        check.remediation.contains("docker.sock") || check.remediation.contains("DOCKER_HOST"),
+        "the existing remediation is unchanged: {check:?}"
+    );
+}
+
+/// The bound is only useful if a failing report reaches the control plane before it stops
+/// trusting the last one. One refresh interval of latency (the hang can land just after a
+/// refresh started) plus one inspection budget must stay well under the default
+/// `QUASAR_READINESS_STALE_SECS`, and inside the ~15 s #274 asks for.
+#[test]
+fn the_engine_budget_beats_the_control_planes_staleness_window() {
+    use crate::agent::READINESS_REFRESH_INTERVAL;
+    use crate::runtime::ENGINE_INSPECTION_BUDGET;
+    use std::time::Duration;
+
+    /// `QUASAR_READINESS_STALE_SECS`' default in the control plane's readiness gate.
+    const STALE_DEFAULT: Duration = Duration::from_secs(60);
+
+    let worst_case = READINESS_REFRESH_INTERVAL + ENGINE_INSPECTION_BUDGET;
+    assert!(
+        worst_case <= Duration::from_secs(20),
+        "a hung engine must be reported within about 15 s of the hang: {worst_case:?}"
+    );
+    assert!(
+        worst_case * 2 < STALE_DEFAULT,
+        "the failing report must land with room to spare inside the staleness window: \
+         {worst_case:?} vs {STALE_DEFAULT:?}"
+    );
+}
+
+/// Which faults let the refresh skip the rest of its engine calls. Only a definitive
+/// "the engine is not usable" answer does; anything that proves an engine is there keeps
+/// the full refresh, because those collectors still have real work to do.
+#[test]
+fn only_a_definitive_engine_fault_skips_the_other_engine_calls() {
+    let observed = |outcome| RuntimeView::Observed {
+        endpoint: ENDPOINT.into(),
+        outcome,
+    };
+    for fault in [
+        RuntimeFault::Unreachable("no engine answered".into()),
+        RuntimeFault::PermissionDenied("refused".into()),
+        RuntimeFault::Unconfigured("bad DOCKER_HOST".into()),
+    ] {
+        assert!(
+            !observed(Err(fault.clone())).engine_answered(),
+            "{fault:?} is definitive"
+        );
+    }
+    for fault in [
+        RuntimeFault::IncompatibleApi("too old".into()),
+        RuntimeFault::Inconclusive("busy".into()),
+    ] {
+        assert!(
+            observed(Err(fault.clone())).engine_answered(),
+            "{fault:?} still proves an engine is there"
+        );
+    }
+    assert!(observed(Ok(facts(None))).engine_answered());
+    assert!(
+        RuntimeView::NotObserved.engine_answered(),
+        "fixtures must not disable the other collectors"
+    );
+}
+
 #[test]
 fn a_timeout_reads_as_unreachable() {
     let fault = RuntimeFault::from(RuntimeError::from(ErrorKind::Timeout));

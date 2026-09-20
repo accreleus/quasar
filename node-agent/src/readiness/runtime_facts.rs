@@ -76,13 +76,12 @@ pub enum RuntimeView {
 }
 
 impl RuntimeView {
-    /// Production: one bounded `inspect_engine` on the configured client.
+    /// Production: one bounded `inspect_engine` on the configured client. The bound is
+    /// [`crate::runtime::ENGINE_INSPECTION_BUDGET`]; a daemon that accepted the connection
+    /// and will not answer only reveals itself when it expires (#274).
     pub fn live() -> Self {
         match crate::runtime::configured() {
-            Ok(client) => RuntimeView::Observed {
-                endpoint: client.endpoint(),
-                outcome: client.inspect_engine().wait().map_err(RuntimeFault::from),
-            },
+            Ok(client) => RuntimeView::observe(client),
             Err(error) => RuntimeView::Observed {
                 endpoint: std::env::var("DOCKER_HOST")
                     .ok()
@@ -90,6 +89,38 @@ impl RuntimeView {
                     .unwrap_or_else(|| "unix:///var/run/docker.sock".into()),
                 outcome: Err(RuntimeFault::from(error)),
             },
+        }
+    }
+
+    /// One bounded inspection of `client`. [`Self::live`] is this on the configured
+    /// client; tests drive it with a stub engine on a real socket.
+    pub fn observe(client: &crate::runtime::RuntimeClient) -> Self {
+        RuntimeView::Observed {
+            endpoint: client.endpoint(),
+            outcome: client.inspect_engine().wait().map_err(RuntimeFault::from),
+        }
+    }
+
+    /// Did the engine answer this refresh? `false` only for a **definitive** fault: nothing
+    /// answered, the socket refused this agent, or the endpoint configuration is invalid.
+    ///
+    /// #274: a hung daemon (socket accepts, nothing replies) makes every other engine call
+    /// in the same refresh spend its own full client deadline to reach the same verdict —
+    /// measured at ~100 s serially, which pushed the failing `runtime_endpoint` past the
+    /// control plane's readiness staleness window. Those collectors already degrade to
+    /// exactly what they report on an engine error, so skipping them changes no verdict; it
+    /// only stops the refresh paying for them. An incompatible API, a busy client or an
+    /// unparseable reply all mean the engine is there, so they keep the full refresh.
+    pub fn engine_answered(&self) -> bool {
+        match self {
+            // Fixtures never carry engine faults, and must not disable the other collectors.
+            RuntimeView::NotObserved => true,
+            RuntimeView::Observed { outcome, .. } => !matches!(
+                outcome,
+                Err(RuntimeFault::Unreachable(_)
+                    | RuntimeFault::PermissionDenied(_)
+                    | RuntimeFault::Unconfigured(_))
+            ),
         }
     }
 }

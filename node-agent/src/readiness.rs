@@ -232,7 +232,16 @@ impl ProbeEnv {
     /// Production environment: probe the agent's own filesystem, read
     /// `/host/etc/os-release` when the compose mount is present.
     pub fn live(nvidia: bool, nvidia_lib32_path: &str) -> Self {
-        if nvidia {
+        // #274: the engine is asked FIRST, and under its own small budget. It used to be
+        // the last field built, behind the self-mount inspection, the sibling EGL probe
+        // and the image-storage lookup — each bounded only by the 30 s client deadline,
+        // ~100 s serially on a hung daemon, which put the failing `runtime_endpoint` past
+        // the control plane's readiness staleness window. When the engine gave a
+        // definitive "not usable" answer, every one of those calls would pay its full
+        // deadline to report exactly what it reports when skipped, so they are skipped.
+        let runtime = runtime_facts::RuntimeView::live();
+        let engine_answered = runtime.engine_answered();
+        if nvidia && engine_answered {
             crate::nvidia_volume::retry_mount_resolution();
         }
         let host_root =
@@ -255,7 +264,14 @@ impl ProbeEnv {
             host_codecs: CodecProbe::NotProbed,
             nvidia_lib32_path: nvidia_lib32_path.to_string(),
             nvidia_volume: VolumeView::live(),
-            container_mount_error: sibling_mount_error(),
+            // A native (non-containerized) agent has no sibling mounts to validate and
+            // must keep passing this check whatever the engine is doing — the skip stands
+            // in for the inspection, never for `is_containerized`.
+            container_mount_error: match (engine_answered, is_containerized()) {
+                (true, _) => sibling_mount_error(),
+                (false, true) => Some(ENGINE_MOUNT_INSPECTION_FAILED.into()),
+                (false, false) => None,
+            },
             driver_mount_error: crate::nvidia_volume::mount_resolution_error().or_else(|| crate::nvidia_volume::current().and_then(|info| {
                 if info.host.is_none() && info.name.is_none() {
                     Some(format!("The agent can read its NVIDIA driver volume but cannot resolve its Docker mount. App launches are blocked; check Docker socket and identity inspection, or set {} to the host directory already mounted at /opt/quasar/nvidia-driver.", crate::nvidia_volume::HOST_PATH_ENV))
@@ -263,12 +279,16 @@ impl ProbeEnv {
             })),
             // NVIDIA only: on AMD/Intel the EGL stack is Mesa's and none of this module's
             // remediation applies, so the subprocess (and a confusing red row) buys nothing.
-            egl_runtime: if nvidia {
-                crate::nvidia_volume::probe_egl_runtime(
+            egl_runtime: match (nvidia, engine_answered) {
+                (true, true) => crate::nvidia_volume::probe_egl_runtime(
                     crate::nvidia_volume::vendor_lib_for_selftest().as_deref(),
-                )
-            } else {
-                crate::nvidia_volume::EglRuntime::Unknown
+                ),
+                // The sibling probe needs the engine to launch a container; the engine
+                // just said it cannot. Same verdict it reaches the slow way.
+                (true, false) => crate::nvidia_volume::EglRuntime::Indeterminate {
+                    detail: "the container engine did not answer this refresh".into(),
+                },
+                (false, _) => crate::nvidia_volume::EglRuntime::Unknown,
             },
             // Vendor/GPU-independent: a firewall problem is as real on a GPU-less box.
             firewall: detect_firewall_posture(),
@@ -279,8 +299,8 @@ impl ProbeEnv {
                 node: crate::logging::host_name().to_string(),
                 pid: std::process::id(),
             },
-            storage: storage::StorageView::live(),
-            runtime: runtime_facts::RuntimeView::live(),
+            storage: storage::StorageView::live(engine_answered),
+            runtime,
         }
     }
 
@@ -351,6 +371,12 @@ fn is_containerized() -> bool {
     Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists()
 }
 
+/// What `host_container_mounts` says when the engine could not be asked. One string, so a
+/// refresh that skipped the inspection (#274) reads identically to one that tried and
+/// failed.
+pub(crate) const ENGINE_MOUNT_INSPECTION_FAILED: &str =
+    "Docker could not inspect the agent's mounts; check socket access";
+
 /// Docker resolves app bind sources in the host namespace, not the agent's.
 /// Validate that the directories the agent writes are the directories apps mount.
 pub(crate) fn sibling_mount_error() -> Option<String> {
@@ -361,10 +387,10 @@ pub(crate) fn sibling_mount_error() -> Option<String> {
         return Some("Cannot identify the agent container to validate app mounts".into());
     };
     let Ok(runtime) = crate::runtime::configured() else {
-        return Some("Docker could not inspect the agent's mounts; check socket access".into());
+        return Some(ENGINE_MOUNT_INSPECTION_FAILED.into());
     };
     let Ok(Some(container)) = runtime.inspect_container(id).wait() else {
-        return Some("Docker could not inspect the agent's mounts; check socket access".into());
+        return Some(ENGINE_MOUNT_INSPECTION_FAILED.into());
     };
     let mut paths =
         vec![std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/quasar-agent".into())];

@@ -65,8 +65,11 @@ impl Default for StorageView {
 
 impl StorageView {
     /// Production facts: the configured roots, `statvfs` on each, the floor from the
-    /// environment.
-    pub fn live() -> Self {
+    /// environment. `engine_answered` is false when this refresh already established that
+    /// the container engine is unusable (#274): the image root is only discoverable by
+    /// asking the engine, which would spend its own full deadline to return the same
+    /// `None` this skips straight to.
+    pub fn live(engine_answered: bool) -> Self {
         let homes = crate::session::home::configured_home_root().map(|path| StorageRoot {
             space: space_facts(&path),
             path,
@@ -78,10 +81,13 @@ impl StorageView {
                 path,
             }
         });
-        let images = crate::images::disk::engine_root_visible_to_agent().map(|path| StorageRoot {
-            space: space_facts(&path),
-            path,
-        });
+        let images = engine_answered
+            .then(crate::images::disk::engine_root_visible_to_agent)
+            .flatten()
+            .map(|path| StorageRoot {
+                space: space_facts(&path),
+                path,
+            });
         StorageView {
             homes,
             templates,

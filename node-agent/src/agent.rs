@@ -897,6 +897,12 @@ enum ReadinessRefresh {
 
 const READINESS_REFRESH_DEADLINE: Duration = Duration::from_secs(60);
 
+/// How often the connected agent re-probes host readiness. One capacity report leaves on
+/// each refresh, so this is also the report cadence — and the reason no engine call in a
+/// refresh may cost more than a small fraction of the control plane's staleness window
+/// (#274): a hung engine's failing check has to catch the very next report.
+pub(crate) const READINESS_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
 async fn run_readiness_refresh<F>(
     probe: F,
     deadline: Duration,
@@ -1702,7 +1708,7 @@ async fn connect_and_run(
 
     // Readiness observes filesystem and provisioning state, which can change while
     // connected. Keep probes off the WebSocket loop and allow only one in flight.
-    let mut readiness_timer = tokio::time::interval(Duration::from_secs(15));
+    let mut readiness_timer = tokio::time::interval(READINESS_REFRESH_INTERVAL);
     readiness_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let (readiness_tx, mut readiness_rx) = tokio::sync::mpsc::channel(1);
     let mut readiness_busy = false;

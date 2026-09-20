@@ -78,6 +78,15 @@ impl From<ErrorKind> for RuntimeError {
     }
 }
 
+/// How long one read-only engine inspection may take before the agent calls the engine
+/// unreachable (#274). It is deliberately far below the client deadline: the readiness
+/// refresh runs every [`crate::agent::READINESS_REFRESH_INTERVAL`] and the control plane
+/// abstains from a readiness verdict once a report is older than
+/// `QUASAR_READINESS_STALE_SECS` (default 60 s), so a hung daemon — one whose socket
+/// accepts the connection and then never answers — has to be visible in a report inside
+/// that window, not merely "eventually".
+pub const ENGINE_INSPECTION_BUDGET: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub socket: PathBuf,
@@ -444,13 +453,14 @@ impl RuntimeClient {
     }
 
     /// One bounded, read-only inspection of the engine: discovery plus `/info`, folded
-    /// into [`EngineFacts`]. Budgeted below the client deadline so a readiness refresh
-    /// on a wedged daemon does not spend the whole refresh window here.
+    /// into [`EngineFacts`]. Budgeted at [`ENGINE_INSPECTION_BUDGET`] so a readiness
+    /// refresh on a wedged daemon reports it inside the control plane's staleness window
+    /// instead of spending the whole refresh window here (#274).
     pub fn inspect_engine(&self) -> Operation<EngineFacts> {
         let config = self.config.clone();
         self.submit_owned(
             async move { docker::inspect_engine(&config).await },
-            std::cmp::min(self.config.deadline, Duration::from_secs(10)),
+            std::cmp::min(self.config.deadline, ENGINE_INSPECTION_BUDGET),
             false,
         )
     }

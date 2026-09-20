@@ -1769,9 +1769,17 @@ to `cap_add`, after checking that the host exposes `/dev/kmsg`. The generator's
 existing readiness check; it is not a prerequisite for streaming.
 
 Connected agents refresh readiness every 15 seconds with one background probe
-at a time; the setup page polls every five seconds. Failed NVIDIA provisioning
-is reconsidered every minute, subject to the artifact downloader's persisted
-backoff and integrity rules. New provisioning locks use kernel-held locks, so a
+at a time; the setup page polls every five seconds. The container engine is
+inspected first in each refresh, under a five-second budget, so an engine that
+has hung — its socket accepts the connection and never answers — fails
+`runtime_endpoint` on the next report rather than after the refresh has waited
+on it. When that inspection says the engine is unusable, the refresh skips the
+rest of its engine calls (the agent's own mount inspection, the sibling EGL
+test, the image-storage lookup): each would spend its own deadline reaching the
+same answer it already reports when the engine is unreachable.
+
+Failed NVIDIA provisioning is reconsidered every minute, subject to the
+artifact downloader's persisted backoff and integrity rules. New provisioning locks use kernel-held locks, so a
 killed writer releases ownership immediately. Legacy lock markers retain their
 conservative heartbeat/age timeout during upgrades.
 
