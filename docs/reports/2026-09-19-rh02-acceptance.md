@@ -417,3 +417,42 @@ Host work, preflights, evidence, judgments, the acceptance tables, the promotion
 issues and commits: Claude Fable 5.1. Drafting of the hardware matrix, the per-host #264
 table and the documentation findings from captured artifacts, reviewed line by line:
 Claude Sonnet. The `CHANGELOG.md` line and link checking: Claude Haiku.
+
+## Addendum, 2026-09-20: the defects were fixed, and the fixes were checked on hardware
+
+After reading this report the owner asked for the defects to be fixed. Each fix was made by
+a sub-agent in its own worktree (Claude Opus for the two agent-runtime defects, Claude
+Sonnet for the rest), reviewed line by line, integrated on this branch and then checked on
+the real hosts. Evidence: [`rh02-265/fix-validation/`](rh02-265/fix-validation/). This
+supersedes the "Defects and observations filed" table and items 1 to 3 of "What I need
+from the owner" above.
+
+| Issue | Fix | Checked on hardware |
+|---|---|---|
+| #280 | The application GPU probe container gets the same NVIDIA device request a session gets. Probe and session now read one field; a compile-time guard fails if the application path gains an injection the probe does not mirror. | Native Unraid/NVIDIA install, fixed agent, **override removed**: `application_gpu_probe_gpu0` passes, nothing blocks, launch `201`, clean picture ([frame](rh02-265/fix-validation/280-native-unraid-nvidia-no-override.png)). |
+| #274 | The engine is asked first under a 5 s budget; every other engine read on the readiness path is skipped on a definitive fault and budgeted otherwise; a convention test fails on an unbudgeted read. | Engine frozen with SIGSTOP on the NVIDIA test host: failing report after **15 s, 9 s and 22 s** (three trials), from about 115 s. Refusal `503`, override `409`, recovery and a successful launch each time, agent never restarted ([trials](rh02-265/fix-validation/274-hung-engine-trials.txt)). The first attempt alone gave 50 s and 44 s; the hardware result sent it back. Residual, not fixed: a refresh that straddles the freeze with a cold EGL-probe cache can still run to the refresh deadline. |
+| #272 | AMD auto-detects VA instead of Vulkan. Vulkan stays selectable. The Vulkan corruption itself is a platform problem on this GPU and kernel and stays open. | AMD test host, fixed agent, no encoder setting: `encoder="va"`, `vah264enc`, clean picture ([frame](rh02-265/fix-validation/272-amd-default-is-va-clean.png)). Still corrupt on Vulkan at 720p as well as 1080p, and with one slice ([frame](rh02-265/fix-validation/272-amd-vulkan-720p-corrupt.png)). |
+| #276 | A GPU the render-node pin excludes advertises no encode slots. Indices unchanged; fails open when the pin matches nothing. Admission was already correct, so this was a display defect. | Two hosts: advertised slots went from 4 to 2. |
+| #273 | Cause found by bisecting a used home: xfwm4 starts its own GLX compositor from saved settings on the second launch. Fix is a [patch for the images repository](rh02-265/fix-validation/273-quasar-images-xfwm4-compositor.patch): a system default of compositing off, plus the start script correcting homes that already hold `true`. A locked xfconf default was tried on hardware and did **not** heal an existing home, so it was dropped. | Native Unraid/NVIDIA, one-layer test image over the real one: ten launches in a row into one home ran, including a home forced back to the bad setting. **Not pushed**: it is another repository, and a fixed image needs a new catalog version. |
+| #275 | The harness snapshots `/run/quasar-agent` at preflight and row 9 removes and asserts on what the run added; under `--allow-cohabit` an entry it cannot attribute is unperformed. | `shellcheck` clean, `make verify` green. The harness itself was not rerun after this change. |
+| #277 to #279 | `deploy/README.md`: the release quick start sets the updater image and stack directory, makes its secrets without `openssl`, names the `/dev/kmsg` error, and documents a second install on one host. | Checked against what the four installs actually hit. |
+
+**Encoder paths.** Asked for at the same time: every encoder path that could be decoded was
+run as a real session and looked at
+([`encoder-matrix.jsonl`](rh02-265/fix-validation/encoder-matrix.jsonl)). Native
+Unraid/NVIDIA is clean on Vulkan H.264 (1080p, 720p), Vulkan AV1 (1080p, 1440p), NVENC
+H.264 and NVENC AV1, so it does not share the AMD problem. AMD is clean on VA and corrupt on
+Vulkan. AV1 on the AMD iGPU is refused up front, correctly. HEVC was not tested: the test
+browser cannot decode it.
+
+**Gates on the integrated branch:** `make test-rust` exit 0 (1724 library tests passed, 0
+failed); `make verify` 437 passed, 0 failed; `make preflight` exit 0 with the same four
+machine-local advisories; leak scan clean. No Go or web source changed. Agent images for
+the hardware checks were built through `deploy/build-images.sh runtime --no-prune`, contract
+148 passed, 0 failed, 2 GPU-gated skips; nothing published.
+
+**What this changes for promotion.** #280 no longer stands in the way: the configuration
+the operator docs recommend for NVIDIA now passes its probe. The proposed commit is the tip
+of `initiative/resilient-host-architecture` after this addendum. Still the owner's to
+decide: the promotion itself; whether the #273 image fix ships before RH-02 reaches users
+(it is independent of RH-02); and whether the #274 residual needs its own ticket.

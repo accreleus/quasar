@@ -1,0 +1,105 @@
+From d9c37b9be0ad9301c20438b500e497a9eae56a7a Mon Sep 17 00:00:00 2001
+From: Claude Sonnet <noreply@anthropic.com>
+Date: Sun, 20 Sep 2026 03:11:10 +0000
+Subject: [PATCH] fix(xfce): keep xfwm4's compositor off so a second launch
+ into a home works
+
+The first session in a new home runs with xfwm4's compiled-in default and
+writes use_compositing=true into the home on exit. The next launch starts
+xfwm4's GLX compositor under the rootful Xwayland: on NVIDIA the session dies
+with SIGSEGV (rc=139, no GLX_EXT_texture_from_pixmap) and the player sees
+"session not found or already ended"; on AMD the desktop is blank white. The
+Quasar host compositor already composites, so xfwm4's is redundant.
+
+Two parts, both needed:
+- a system xfconf default of use_compositing=false, which seeds new homes;
+- the start script turns the property off in a home that already holds true,
+  because xfconf lets the per-user value win (a locked="*" default was tested
+  on hardware and did not override it).
+
+Verified on a native NVIDIA host: ten consecutive launches into one home ran,
+including after forcing use_compositing=true back into the home; the unpatched
+image fails every relaunch. accreleus/quasar#273.
+---
+ images/quasar-xfce/Dockerfile                 |  7 +++++++
+ .../xfconf/xfce-perchannel-xml/xfwm4.xml      | 19 +++++++++++++++++++
+ images/quasar-xfce/quasar-xfce                | 12 ++++++++++++
+ 3 files changed, 38 insertions(+)
+ create mode 100644 images/quasar-xfce/overlay/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml
+
+diff --git a/images/quasar-xfce/Dockerfile b/images/quasar-xfce/Dockerfile
+index aff01ed..a105a55 100644
+--- a/images/quasar-xfce/Dockerfile
++++ b/images/quasar-xfce/Dockerfile
+@@ -95,6 +95,12 @@ RUN test -f /etc/xdg/autostart/xfce-polkit.desktop \
+ # the file header.
+ COPY images/quasar-xfce/overlay/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml
+ 
++# System default: xfwm4 compositing off (accreleus/quasar#273). The Quasar host
++# compositor already composites the stream; xfwm4's own compositor crashes the
++# second launch into a home on NVIDIA and blanks it on AMD. This seeds new homes;
++# the start script corrects homes that already hold use_compositing=true.
++COPY images/quasar-xfce/overlay/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml
++
+ # Branding: Quasar mark as the Whisker menu / application icon (scalable + 256px
+ # raster fallback), same hicolor paths and same source files as quasar-kde.
+ COPY images/quasar-xfce/overlay/usr/share/icons/hicolor/scalable/apps/quasar.svg /usr/share/icons/hicolor/scalable/apps/quasar.svg
+@@ -103,6 +109,7 @@ COPY images/quasar-xfce/overlay/usr/share/icons/hicolor/256x256/apps/quasar.png
+ COPY images/quasar-xfce/quasar-xfce /usr/local/bin/quasar-xfce
+ 
+ RUN chmod 0644 /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml \
++      /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml \
+       /usr/share/icons/hicolor/scalable/apps/quasar.svg \
+       /usr/share/icons/hicolor/256x256/apps/quasar.png \
+     && chmod 0755 /usr/local/bin/quasar-xfce \
+diff --git a/images/quasar-xfce/overlay/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml b/images/quasar-xfce/overlay/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml
+new file mode 100644
+index 0000000..b00367a
+--- /dev/null
++++ b/images/quasar-xfce/overlay/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml
+@@ -0,0 +1,19 @@
++<?xml version="1.1" encoding="UTF-8"?>
++<!--
++  System default: xfwm4's own compositor is off.
++
++  The Quasar host compositor already composites the stream. With xfwm4's
++  compositor on, the second launch into a home kills the session on NVIDIA
++  (SIGSEGV, rc=139: no GLX_EXT_texture_from_pixmap under this rootful Xwayland)
++  and blanks the desktop on AMD.
++
++  This seeds a NEW home. It cannot fix an existing one: xfconf lets the per-user
++  file win property by property, and a `locked="*"` here was tested and did not
++  override a user value of true. Homes that already hold use_compositing=true are
++  corrected by the start script (quasar-xfce) before the session starts.
++-->
++<channel name="xfwm4" version="1.0">
++  <property name="general" type="empty">
++    <property name="use_compositing" type="bool" value="false"/>
++  </property>
++</channel>
+diff --git a/images/quasar-xfce/quasar-xfce b/images/quasar-xfce/quasar-xfce
+index 8006d05..1a4de24 100755
+--- a/images/quasar-xfce/quasar-xfce
++++ b/images/quasar-xfce/quasar-xfce
+@@ -336,6 +336,18 @@ log "X display :0 ready (rootful Xwayland pid $xwayland_pid)"
+ # session_pid below is dbus-run-session itself, with xfce4-session as its direct
+ # child (see the shutdown relay above for the measured process tree and why a
+ # single TERM to this pid is the right relay).
++# xfwm4 must never start its own compositor here: the Quasar host compositor
++# already composites the stream, and under this rootful Xwayland xfwm4's GLX
++# compositor kills the session on NVIDIA (SIGSEGV, rc=139) and blanks the desktop
++# on AMD. The system default (/etc/xdg/.../xfwm4.xml) covers a new home, but
++# xfconf lets a per-user value win, and a home that ran an older image already
++# holds use_compositing=true. Correct that one property before xfconfd reads it.
++xfwm4_user="${XDG_CONFIG_HOME:-$HOME/.config}/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml"
++if [[ -f "$xfwm4_user" ]] && grep -q 'name="use_compositing" type="bool" value="true"' "$xfwm4_user"; then
++  sed -i 's/name="use_compositing" type="bool" value="true"/name="use_compositing" type="bool" value="false"/' "$xfwm4_user"
++  log "xfwm4 compositing was on in this home; turned it off (the host compositor composites)"
++fi
++
+ session=(dbus-run-session -- startxfce4)
+ 
+ if [[ "$shutting_down" == "1" ]]; then
+-- 
+2.55.0
+
