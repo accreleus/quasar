@@ -611,6 +611,14 @@ fn detect_gpus_at(
         apply_nvenc_override_to(&mut gpus, slots);
     }
 
+    // #276: `schedulableBindingSQL` (control-plane) denies placement on any GPU whose
+    // render_node/device_path does not match a configured `QUASAR_RENDER_NODE`, for every
+    // hardware encoder branch (va, nvenc, vulkan alike) — openh264 is the only branch that
+    // does not pin. Advertised capacity must agree, or the console counts encode slots on a
+    // GPU admission will never schedule onto. Runs last so it has the final say over the
+    // vendor stub and the nvenc/vulkan ceilings above, which know nothing of pinning.
+    apply_render_node_pin(&mut gpus);
+
     if gpus.is_empty() {
         detection_failure(
             "unavailable",
@@ -679,6 +687,52 @@ fn apply_vulkan_override_to(gpus: &mut [GpuCapacity], slots: i32, configured: Op
             for g in gpus.iter_mut() {
                 g.encode_slots_total = slots;
             }
+        }
+    }
+}
+
+/// #276: zero the encode slots of every detected GPU that a configured `QUASAR_RENDER_NODE`
+/// pin excludes from placement, for any hardware encoder (va/nvenc/vulkan all bind by render
+/// node — see `schedulableBindingSQL`). `openh264` never pins (any vendor-compatible GPU is
+/// schedulable), so it is skipped entirely: zeroing there would under-advertise a host that
+/// admission can in fact use.
+///
+/// Unmatched or unconfigured is left alone here exactly as in
+/// [`apply_vulkan_override_to`]'s fail-open branch — this pass only ever narrows an already
+/// resolved pin, never guesses at one.
+fn apply_render_node_pin(gpus: &mut [GpuCapacity]) {
+    if gpus.len() < 2 {
+        return;
+    }
+    if crate::session::settings::resolve_encoder_choice() == EncoderChoice::Openh264 {
+        return;
+    }
+    let Some(configured) = configured_vulkan_render_node() else {
+        return;
+    };
+    let Some(idx) = gpus
+        .iter()
+        .position(|g| g.device_path.as_deref() == Some(configured.as_str()))
+    else {
+        tracing::warn!(
+            token = "render-node-pin-unmatched",
+            configured_render_node = %configured,
+            "QUASAR_RENDER_NODE did not match any detected GPU's device_path; leaving \
+             advertised capacity as-is (fail-open — never advertise zero capacity on a \
+             pinned host we cannot positively identify)"
+        );
+        return;
+    };
+    for (i, g) in gpus.iter_mut().enumerate() {
+        if i != idx && g.encode_slots_total != 0 {
+            tracing::info!(
+                token = "gpu-slots-zeroed-render-node-pin",
+                gpu_index = g.index,
+                vendor = %g.vendor,
+                "GPU excluded from encode capacity: host is pinned to {configured}, so this \
+                 GPU is never placed onto"
+            );
+            g.encode_slots_total = 0;
         }
     }
 }
@@ -1896,6 +1950,85 @@ stepping\t: 2
         let render_dir = root.join(render_name);
         std::fs::create_dir_all(&render_dir).unwrap();
         std::os::unix::fs::symlink(&device_target, render_dir.join("device")).unwrap();
+    }
+
+    /// #276: a host pinned to one render node must not advertise encode slots on a second
+    /// GPU it can never place a session onto — `schedulableBindingSQL` denies it for every
+    /// hardware encoder branch. Exercises the seam at `detect_gpus_at`, so it also covers the
+    /// "render node absent" shape: the second GPU's sysfs entry resolves to a `renderD*` path
+    /// that was never actually opened as a device (this repo's sandbox cannot fabricate a
+    /// missing `/dev` node either way — `apply_render_node_pin` only ever compares
+    /// `device_path` strings, so a stale/absent node behaves identically to a live
+    /// non-matching one: neither equals the configured pin).
+    ///
+    /// Env-gated in one test (not `apply_render_node_pin` called directly): the function
+    /// reads `QUASAR_ENCODER`/`QUASAR_RENDER_NODE` from process env itself, so every case
+    /// must live together per the convention above.
+    #[test]
+    fn render_node_pin_zeroes_the_excluded_gpu_and_keeps_indices_stable() {
+        let keys = ["QUASAR_ENCODER", "QUASAR_RENDER_NODE"];
+        let saved: Vec<(&str, Option<String>)> =
+            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+
+        let dir = tempfile::tempdir().unwrap();
+        let drm_root = dir.path().join("class-drm");
+        std::fs::create_dir_all(&drm_root).unwrap();
+        fake_amd_card_with_render_node(&drm_root, "card0", "renderD128", "0000:01:00.0");
+        fake_amd_card_with_render_node(&drm_root, "card1", "renderD129", "0000:04:00.0");
+
+        // Pinned to card0's render node, on a hardware encoder branch (va): card1 is
+        // globally unschedulable under `schedulableBindingSQL` and must advertise 0 slots.
+        std::env::set_var("QUASAR_ENCODER", "va");
+        std::env::set_var("QUASAR_RENDER_NODE", "/dev/dri/renderD128");
+        let (gpus, _, status, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities());
+        assert_eq!(status, "ok");
+        assert_eq!(gpus.len(), 2);
+        let card0 = gpus
+            .iter()
+            .find(|g| g.device_path.as_deref() == Some("/dev/dri/renderD128"))
+            .unwrap();
+        let card1 = gpus
+            .iter()
+            .find(|g| g.device_path.as_deref() == Some("/dev/dri/renderD129"))
+            .unwrap();
+        assert_eq!(card0.index, 0, "pinned GPU keeps its detection-order index");
+        assert_eq!(
+            card1.index, 1,
+            "excluded GPU keeps its detection-order index"
+        );
+        assert_eq!(
+            card0.encode_slots_total, 2,
+            "pinned GPU keeps its vendor stub — it is still schedulable"
+        );
+        assert_eq!(
+            card1.encode_slots_total, 0,
+            "GPU excluded by the render-node pin advertises zero encode slots, matching \
+             admission's schedulableBindingSQL"
+        );
+
+        // openh264 never pins (schedulableBindingSQL's first branch matches any vendor GPU),
+        // so the same configured render node must NOT zero out card1 here.
+        std::env::set_var("QUASAR_ENCODER", "openh264");
+        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities());
+        assert!(
+            gpus.iter().all(|g| g.encode_slots_total == 2),
+            "openh264 does not pin by render node; both GPUs keep their vendor stub"
+        );
+
+        // A configured render node that matches no detected GPU (e.g. a stale by-path, or —
+        // per #276 — a `/sys/class/drm` entry the container's `/dev` never actually backed)
+        // fails open rather than zeroing every GPU's capacity down to nothing.
+        std::env::set_var("QUASAR_ENCODER", "va");
+        std::env::set_var("QUASAR_RENDER_NODE", "/dev/dri/renderD999");
+        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities());
+        assert!(
+            gpus.iter().all(|g| g.encode_slots_total == 2),
+            "an unmatched render-node pin fails open rather than advertising zero capacity"
+        );
+
+        for (k, v) in saved {
+            restore_env(k, v);
+        }
     }
 
     /// Must not touch `QUASAR_RENDER_NODE`/`QUASAR_ENCODER` or call `detect_gpus_at`: both
