@@ -96,9 +96,17 @@ fn parse_encoder_known(s: &str) -> Option<EncoderChoice> {
     }
 }
 
-/// Auto-detect default per vendor. `AMD_AUTO_DEFAULT` is the one-line flip point:
-/// Amd→Vulkan is being live-validated on an AMD host; set it to `Va` if that fails.
-const AMD_AUTO_DEFAULT: EncoderChoice = EncoderChoice::Vulkan;
+/// Auto-detect default per vendor. `AMD_AUTO_DEFAULT` is the one-line flip point.
+/// As of 2026-09-20 this is `Va`: live validation on a Granite Ridge iGPU
+/// (RADV, Mesa 25.3.6) found Vulkan H.264 corrupt at 1080p and 720p, with 8
+/// slices and with 1, and HEVC undecodable, while `vah264enc` on the same host
+/// was clean (#272). Vulkan was previously recorded working on a Ryzen 4500U
+/// (kernel 7.0), so this is a per-generation regression, not a blanket
+/// condemnation of AMD Vulkan encode — flip this back to `Vulkan` only after
+/// re-validating on the hardware that failed. `QUASAR_ENCODER=vulkan` (or an
+/// admin per-host override) still selects Vulkan explicitly; only the
+/// auto-detected default changed.
+const AMD_AUTO_DEFAULT: EncoderChoice = EncoderChoice::Va;
 
 fn encoder_default_for_vendor(v: Option<GpuVendor>) -> EncoderChoice {
     match v {
@@ -524,10 +532,14 @@ mod tests {
                 )
             );
         }
+        // #272: Vulkan encode is corrupt on AMD Granite Ridge/RADV 25.3.6, so the
+        // AMD auto-detected default is VA, not the AMD_AUTO_DEFAULT symbol's older
+        // value — pin the literal so a future flip has to be deliberate.
         assert_eq!(
             resolve_encoder_from("", Some((GpuVendor::Amd, DetectSource::DriScan))).0,
-            AMD_AUTO_DEFAULT
+            EncoderChoice::Va
         );
+        assert_eq!(AMD_AUTO_DEFAULT, EncoderChoice::Va);
         assert_eq!(
             resolve_encoder_from("", Some((GpuVendor::Intel, DetectSource::RenderNode))).0,
             EncoderChoice::Va
@@ -543,6 +555,13 @@ mod tests {
         assert_eq!(
             encoder_default_for_vendor(Some(GpuVendor::Nvidia)),
             EncoderChoice::Vulkan
+        );
+        // #272: AMD's auto-detected default is VA (Vulkan is corrupt on Granite
+        // Ridge/RADV 25.3.6); still equal to AMD_AUTO_DEFAULT, but pinned literally
+        // too so this test fails if the constant regresses to Vulkan.
+        assert_eq!(
+            encoder_default_for_vendor(Some(GpuVendor::Amd)),
+            EncoderChoice::Va
         );
         assert_eq!(
             encoder_default_for_vendor(Some(GpuVendor::Amd)),

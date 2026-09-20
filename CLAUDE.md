@@ -230,12 +230,19 @@ session memory `current-focus.md`, not this file.**
   outstanding.
 - **Encoders:** defaults are auto-detected per vendor. With `QUASAR_ENCODER`
   unset or empty the agent resolves the GPU vendor and defaults **NVIDIA →
-  Vulkan, AMD → Vulkan, Intel → VA (ZC-03 DMABuf zero-copy), no GPU →
+  Vulkan, AMD → VA, Intel → VA (ZC-03 DMABuf zero-copy), no GPU →
   openh264** (`encoder_default_for_vendor` in
   `node-agent/src/session/settings.rs`; the same table is in
-  `docs/configuration.md`). Compose passes an operator override through. AMD's
-  Vulkan default is provisional. `AMD_AUTO_DEFAULT` in that file is the one-line
-  flip back to VA if live validation on an AMD host fails.
+  `docs/configuration.md`). Compose passes an operator override through.
+  **The default is VA as of 2026-09-20** (`AMD_AUTO_DEFAULT` in that file):
+  live validation found Vulkan encode corrupt on a Granite Ridge iGPU (RADV,
+  Mesa 25.3.6) — H.264 at 1080p and 720p, with 8 slices and with 1, and an
+  undecodable HEVC stream, while `vah264enc` on the same host was clean (#272).
+  Vulkan was previously good on a Ryzen 4500U (kernel 7.0), so this is a
+  per-generation regression, not a blanket AMD verdict. Vulkan remains fully
+  selectable on AMD via `QUASAR_ENCODER=vulkan` or an admin per-host override —
+  only the auto-detected default changed. `AMD_AUTO_DEFAULT` is the one-line
+  flip back to `Vulkan` once re-validated on the hardware that failed.
   **NVIDIA = Vulkan by default** (2026-08-12), so H.264 and HEVC encode with
   `vulkanh264enc`/`vulkanh265enc`. Rationale:
   #489 is an NVIDIA-driver NVENC teardown UAF spanning the 595 **and** 610
