@@ -154,6 +154,7 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- AMD hosts no longer stream a corrupt picture on the default Vulkan encoder. The compositor (`gst-wayland-display` pin `631cebb`) now allocates its Vulkan encode-src image **LINEAR first** and falls back to tiled by itself on a driver that refuses it, so the scratch→encode-src copy no longer crosses a swizzle-mode boundary radv mishandles — the cause of the displaced columns and green edges seen on Raphael/Granite Ridge (GFX10.3) and, before it, on RDNA4. No encoder default changes, no host configuration is needed on any vendor, and `WOLF_VULKAN_LINEAR_ENCSRC` survives only as an inverted, diagnostic-only knob (#281, fixes #272).
 - Host readiness: the application GPU probe container now gets the same NVIDIA device request a real session gets, so a healthy NVIDIA host that takes its driver from the container toolkit (a native Unraid install, for one) no longer fails `application_gpu_probe_gpu<N>` and refuses every launch with `host_not_ready` (#280).
 - Host readiness: a hung container engine reaches the readiness report sooner. The engine is asked first under a 5 s budget and the other engine calls are skipped when it does not answer (#274).
 - A GPU the agent is pinned away from by `QUASAR_RENDER_NODE` no longer counts toward the host's advertised encode slots (#276).

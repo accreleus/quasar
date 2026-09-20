@@ -985,39 +985,73 @@ the pinned `smithay` / `gstreamer` versions.
 
 ### `gst-wayland-display-linear-encsrc-fallback.patch`
 
-**Latent-bug fix for the `WOLF_VULKAN_LINEAR_ENCSRC=1` opt-in knob** (the RX 9070 / GFX12
-swizzle-copy workaround). Patches gst-wayland-display
-(`wayland-display-core/src/utils/vulkan_share.rs::alloc_encode_src_buffer`), not GStreamer.
-Applied **last**, after `fail-closed-renderer`.
+**The encode-src allocator now tries LINEAR first, by default, with an automatic OPTIMAL
+fallback** (#281; supersedes the original `WOLF_VULKAN_LINEAR_ENCSRC=1` opt-in described
+below — the knob survives but its polarity is inverted, see below). Patches
+gst-wayland-display (`wayland-display-core/src/utils/vulkan_share.rs::alloc_encode_src_buffer`
+and its caller), not GStreamer. Applied after `fail-closed-renderer`; as of the 8th patch
+below it is no longer the *last* gst-wayland-display patch — `per-element-vulkan-device`
+applies after it (it touches the same function).
 
-Upstream's comment promises the knob is safe: "falls back to tiled if the linear alloc
-fails". The code did not deliver that — when
+**Why LINEAR-first is the default now, not just a knob for one card.** The compositor's
+RGBA→NV12 compute pass writes a LINEAR scratch image and then `vkCmdCopyImage`s that scratch
+into the encode-src image (this copy happens unconditionally — the compute shader never writes
+the encode-src image directly, there is no code path here with "no copy"). When the encode-src
+image is tiled (`OPTIMAL`), that copy crosses a swizzle-mode boundary that several radv
+generations mishandle: content displaced in vertical columns, bright green along the right and
+bottom edges. First hit on GFX12/RDNA4 (the RX 9070, #272's original report — hence the knob's
+name), and confirmed to recur on GFX10.3/RDNA2 (the AMD test host's Raphael/Granite Ridge iGPU,
+VCN 3.1.2). Allocating the encode-src image LINEAR makes the copy LINEAR→LINEAR, so the
+mishandled swizzle-boundary copy never runs. This is a destination-tiling change to a copy that
+was always going to happen, not a bandwidth win — expect no measured saving from it; a bandwidth
+number, if one is ever wanted, belongs in the live-exercise record, not here.
+
+**Automatic fallback, no configuration needed on any vendor.** If
 `gst_vulkan_image_memory_alloc_with_image_info` returns null for the LINEAR image, the
-function just returned `None`, which fails `VulkanNv12::new_on_shared` → "encode-src image
-allocation failed" → the session's whole Vulkan output fails to create. Verified live on
-the RTX 5090 (2026-07-24): NVIDIA's Vulkan-Video encoder rejects a LINEAR encode-src image,
-so setting the knob on an NVIDIA vulkan h265 host hard-failed every session instead of
-degrading gracefully.
+function logs a `tracing::warn!` and retries the identical allocation with
+`vk::ImageTiling::OPTIMAL`. Verified live on the RTX 5090 (2026-07-24): NVIDIA's Vulkan-Video
+encoder rejects a LINEAR encode-src image outright, so it always takes this fallback and lands
+on exactly the OPTIMAL image it always used — the retry is what makes LINEAR-first safe to
+default on for every vendor at once, not just the one it was fixed for.
 
-The patch implements the promised fallback: if the LINEAR alloc returns null while
-`WOLF_VULKAN_LINEAR_ENCSRC` is set, log a `tracing::warn!` and retry the identical
-allocation with `vk::ImageTiling::OPTIMAL` (the tiled default). The non-knob path is
-byte-identical (the retry branch is gated on `linear_encsrc`), and a genuine allocation
-failure still returns `None` after the retry. This makes the knob safe to leave on in
-mixed-GPU fleets: hosts whose encoder accepts LINEAR use it, hosts that reject it get the
-tiled default plus a warning, none hard-fail. Found while integrating the ring-slot tiling
-fix (`docs/design/plans/2026-07-24-vulkanh265enc-conformance-resolution-spec.md` §7 item 4).
+**Tiling-outer, flags-inner allocation ladder.** The allocation attempts are ordered by tiling
+first (LINEAR, then OPTIMAL), and within each tiling by usage-flag set, narrowest last. This
+ordering is load-bearing for NVIDIA: a naive flip to "flags-outer" would have let the first
+successful attempt on the fallback tiling settle for a narrower flag set than before, silently
+costing NVIDIA the `SAMPLED | TRANSFER_SRC | MUTABLE_FORMAT` "readable superset" image that
+`vulkanscale` (#501, the ABR external-resolution lever) depends on. Tiling-outer keeps the
+first OPTIMAL attempt on the same flag set NVIDIA always got.
+
+**Per-device tiling latch.** The allocator that picks LINEAR vs. OPTIMAL runs once per ring
+slot, at first allocation for that slot, and the chosen tiling is cached for the session — a
+ring must never end up split across two tilings for the same device, because the scratch→
+encode-src copy and any downstream code that reads the image's tiling assume one answer per
+slot for the session's life. A driver that rejects LINEAR on slot 0 and is then asked to
+allocate slot 1 takes the OPTIMAL path from the same latch, not a fresh LINEAR attempt per slot.
+
+**The knob: `WOLF_VULKAN_LINEAR_ENCSRC`, kept, inverted, diagnostic-only.** No operator needs
+to set it — the default (unset) already does the right thing on every vendor tested. Three
+cases:
+- unset → LINEAR-first with the automatic OPTIMAL fallback described above (the default).
+- `0` / `false` / `off` → OPTIMAL only, no LINEAR attempt. This reproduces the pre-#281
+  behaviour exactly and is how the corruption is deliberately reproduced for a regression
+  check.
+- any other value, **including `1` / `true`** → treated the same as unset. This is deliberate
+  backward compatibility: operators who were told to set `=1` as the interim #272 workaround
+  keep the same (now-default) behaviour rather than hitting a changed or rejected value.
+
+Found while integrating the ring-slot tiling fix
+(`docs/design/plans/2026-07-24-vulkanh265enc-conformance-resolution-spec.md` §7 item 4).
 
 | Field | Value |
 |---|---|
 | Origin | Quasar (this repo) — not vendored |
 | Patches | `games-on-whales/gst-wayland-display` (compositor), file `wayland-display-core/src/utils/vulkan_share.rs` |
-| Authored against | `43d4c25` (the `GST_WAYLAND_DISPLAY_REF` this image builds), on top of the other six `gst-wayland-display-*` patches (the `nvidia-sync` patch touches the same function, so this applies **after** the full stack) |
-| Upstream status | to be reported on [gst-wayland-display PR #37](https://github.com/games-on-whales/gst-wayland-display/pull/37) (comment/behavior mismatch is upstream's) |
+| Authored against | `631cebb` (the `GST_WAYLAND_DISPLAY_REF` this image builds), on top of the other six `gst-wayland-display-*` patches (the `nvidia-sync` patch touches the same function, so this applies **after** the full stack) |
+| Upstream status | to be reported on [gst-wayland-display PR #37](https://github.com/games-on-whales/gst-wayland-display/pull/37) |
 
-If `GST_WAYLAND_DISPLAY_REF` moves, first check whether upstream implemented its promised
-fallback (then drop this patch); otherwise re-diff against the new commit with the other
-six gst-wayland-display patches applied first, and update `docs/third-party-pins.md`.
+If `GST_WAYLAND_DISPLAY_REF` moves, re-diff against the new commit with the other six
+gst-wayland-display patches applied first, and update `docs/third-party-pins.md`.
 (Note: as of the 8th patch below, `linear-encsrc-fallback` is no longer the *last*
 gst-wayland-display patch — `per-element-vulkan-device` applies after it.)
 
