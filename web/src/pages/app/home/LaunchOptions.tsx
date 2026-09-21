@@ -11,6 +11,7 @@ import { Button } from "../../../components/Button";
 import { IconClose, IconPlayGlyph } from "../../../components/icons";
 import type { DraftCodec } from "../launchOptions";
 import type { LaunchSpec, OptionColumns, OptionRow, Verdict } from "./launchOptionRules";
+import type { WaitingReason } from "./useLaunch";
 
 export interface LaunchOptionsProps {
   id: string;
@@ -22,6 +23,8 @@ export interface LaunchOptionsProps {
   verdict: Verdict;
   launching: boolean;
   waitingForSlot: boolean;
+  /** "slot" (capacity_exhausted) vs "host" (no_host_available). */
+  waitingReason?: WaitingReason | null;
   onSelectCodec: (codec: DraftCodec) => void;
   onSelectFps: (fps: number) => void;
   onSelectHeight: (height: number) => void;
@@ -41,6 +44,7 @@ export function LaunchOptions({
   verdict,
   launching,
   waitingForSlot,
+  waitingReason = "slot",
   onSelectCodec,
   onSelectFps,
   onSelectHeight,
@@ -48,7 +52,13 @@ export function LaunchOptions({
   onPlay,
   closeRef,
 }: LaunchOptionsProps) {
-  const playLabel = waitingForSlot ? "Waiting for a slot…" : launching ? "Launching…" : "Play now";
+  const playLabel = waitingForSlot
+    ? waitingReason === "host"
+      ? "Waiting for a host…"
+      : "Waiting for a slot…"
+    : launching
+      ? "Launching…"
+      : "Play now";
   return (
     <div className={`lo${open ? " show" : ""}`} id={id} aria-label="Launch options">
       <div className="qp-head">

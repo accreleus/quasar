@@ -576,7 +576,12 @@ recreate_agent_with_override() {
   [ -n "${REAL_HOST_ID:-}" ] || return 0
   while [ "$waited" -lt 120 ]; do
     reg=$(host_json "$REAL_HOST_ID" | jq -r '.host.last_registered_at // empty' | iso_to_epoch)
-    if [ "${reg:-0}" -ge "$t0" ] && [ "$(host_status "$REAL_HOST_ID")" = "online" ]; then
+    # #288: registered != reported — capacity_detection only flips to "ok" once
+    # the new process's first capacity report lands, so a wait on registration
+    # alone can launch into the pre-report window and see a spurious
+    # no_host_available.
+    if [ "${reg:-0}" -ge "$t0" ] && [ "$(host_status "$REAL_HOST_ID")" = "online" ] \
+      && [ "$(host_json "$REAL_HOST_ID" | jq -r '.host.capacity_detection // empty')" = "ok" ]; then
       RECREATED_AT=$(now_epoch)
       return 0
     fi
@@ -595,7 +600,9 @@ start_real_agent() {
   compose_cmd start quasar-node-agent >/dev/null 2>&1 || true
   while [ "$waited" -lt 120 ]; do
     reg=$(host_json "$REAL_HOST_ID" | jq -r '.host.last_registered_at // empty' | iso_to_epoch)
-    if [ "${reg:-0}" -ge "$t0" ] && [ "$(host_status "$REAL_HOST_ID")" = "online" ]; then
+    # #288: registered != reported — see recreate_agent_with_override.
+    if [ "${reg:-0}" -ge "$t0" ] && [ "$(host_status "$REAL_HOST_ID")" = "online" ] \
+      && [ "$(host_json "$REAL_HOST_ID" | jq -r '.host.capacity_detection // empty')" = "ok" ]; then
       RECREATED_AT=$(now_epoch)
       break
     fi

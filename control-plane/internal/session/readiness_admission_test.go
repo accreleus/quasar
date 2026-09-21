@@ -443,3 +443,118 @@ func TestSwapIsNotReadinessGated(t *testing.T) {
 		t.Fatalf("new launch on the blocked host: got %v, want ErrHostNotReady", err)
 	}
 }
+
+// TestRegisterToCapacityWindowRefusesThenAdmits pins the transition a
+// reconnecting agent walks through: register leaves the host unplaceable
+// (capacity_detection='unavailable', gpus.reported=false — agentws/store.go's
+// markGPUsStaleAndClearVramSQL, enrollHost's upsert, and reconnectHostSQL all
+// set this on register/reconnect) until its first capacity report lands. A
+// launch inside that window must fail with ErrNoHostAvailable — retryable,
+// distinct from ErrHostNotReady/ErrCapacityExhausted — and admit again once
+// capacity is reported, honouring the readiness gate's own
+// stale/absent-abstains rule.
+func TestRegisterToCapacityWindowRefusesThenAdmits(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	ctx := context.Background()
+
+	registerWindow := func(t *testing.T) {
+		t.Helper()
+		// Mirrors agentws/store.go's register/reconnect SQL: capacity unknown
+		// until the agent's first `capacity` message lands.
+		_, err := pool.Exec(ctx, `UPDATE hosts SET capacity_detection = 'unavailable' WHERE id::text = $1`, s.hostID)
+		must(t, err)
+		_, err = pool.Exec(ctx, `UPDATE gpus SET reported = false WHERE host_id = $1`, s.hostID)
+		must(t, err)
+	}
+	capacityReceived := func(t *testing.T) {
+		t.Helper()
+		_, err := pool.Exec(ctx, `UPDATE hosts SET capacity_detection = 'ok' WHERE id::text = $1`, s.hostID)
+		must(t, err)
+		_, err = pool.Exec(ctx, `UPDATE gpus SET reported = true WHERE host_id = $1`, s.hostID)
+		must(t, err)
+	}
+
+	// (a) Register window: a readiness row left over from the host's prior
+	// life is fresh and would normally gate (ErrHostNotReady) — but
+	// capacity_detection='unavailable' makes totalsQuery fail first, so the
+	// refusal must be ErrNoHostAvailable, not the readiness gate's error.
+	registerWindow(t)
+	reportReadiness(t, pool, s.hostID, 5, true, false)
+	_, err := store.ScheduleAndCreate(ctx, launchParams(s))
+	if !errors.Is(err, ErrNoHostAvailable) {
+		t.Fatalf("register window: got %v, want ErrNoHostAvailable", err)
+	}
+	if errors.Is(err, ErrHostNotReady) || errors.Is(err, ErrCapacityExhausted) {
+		t.Fatalf("register window: %v must not also be ErrHostNotReady/ErrCapacityExhausted", err)
+	}
+
+	// (b) Capacity received, readiness never reported (NULL/NULL): the gate
+	// fails open on an absent report — the transition's whole point is that
+	// this now admits.
+	capacityReceived(t)
+	reportReadiness(t, pool, s.hostID, -1, true, false)
+	sess, err := store.ScheduleAndCreate(ctx, launchParams(s))
+	if err != nil {
+		t.Fatalf("capacity received, readiness absent: got %v, want success", err)
+	}
+	release(t, pool, sess)
+
+	// (c) Capacity received, a 90s-old blocking report: stale fails open too
+	// (default staleness window is 60s).
+	reportReadiness(t, pool, s.hostID, 90, true, false)
+	sess, err = store.ScheduleAndCreate(ctx, launchParams(s))
+	if err != nil {
+		t.Fatalf("capacity received, readiness stale: got %v, want success", err)
+	}
+	release(t, pool, sess)
+
+	// (d) Capacity received, a fresh 5s-old blocking report: the gate now
+	// applies for real.
+	reportReadiness(t, pool, s.hostID, 5, true, false)
+	if _, err := store.ScheduleAndCreate(ctx, launchParams(s)); !errors.Is(err, ErrHostNotReady) {
+		t.Fatalf("capacity received, readiness fresh: got %v, want ErrHostNotReady", err)
+	}
+}
+
+// TestNoHostRejectionCarriesFleetCounts pins the diagnostic attached to a
+// no_host_available refusal (the same register window as
+// TestRegisterToCapacityWindowRefusesThenAdmits): still errors.Is-compatible
+// with ErrNoHostAvailable, and its counts describe the register window
+// correctly.
+func TestNoHostRejectionCarriesFleetCounts(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	ctx := context.Background()
+
+	// Mirrors agentws/store.go's register/reconnect SQL (markGPUsStaleAndClearVramSQL,
+	// enrollHost's upsert, reconnectHostSQL): capacity unknown until the
+	// agent's first `capacity` message lands.
+	_, err := pool.Exec(ctx, `UPDATE hosts SET capacity_detection = 'unavailable', last_registered_at = now() WHERE id::text = $1`, s.hostID)
+	must(t, err)
+	_, err = pool.Exec(ctx, `UPDATE gpus SET reported = false WHERE host_id = $1`, s.hostID)
+	must(t, err)
+
+	_, err = store.ScheduleAndCreate(ctx, launchParams(s))
+	if !errors.Is(err, ErrNoHostAvailable) {
+		t.Fatalf("got %v, want ErrNoHostAvailable", err)
+	}
+	var rej *NoHostRejection
+	if !errors.As(err, &rej) {
+		t.Fatalf("got %v, want a *NoHostRejection", err)
+	}
+	if rej.OnlineHosts != 1 {
+		t.Fatalf("online_hosts: got %d, want 1", rej.OnlineHosts)
+	}
+	if rej.HostsCapacityNotOK != 1 {
+		t.Fatalf("hosts_capacity_not_ok: got %d, want 1", rej.HostsCapacityNotOK)
+	}
+	if rej.GPUsUnreported != 1 {
+		t.Fatalf("gpus_unreported: got %d, want 1", rej.GPUsUnreported)
+	}
+	if rej.HostsRecentlyRegistered != 1 {
+		t.Fatalf("hosts_recently_registered: got %d, want 1", rej.HostsRecentlyRegistered)
+	}
+}

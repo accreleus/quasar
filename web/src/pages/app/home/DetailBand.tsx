@@ -23,6 +23,7 @@ import { BandNotes } from "./BandNotes";
 import { LaunchOptions } from "./LaunchOptions";
 import { recommendation } from "./launchOptionRules";
 import { useHeroPalette } from "./useHeroPalette";
+import type { WaitingReason } from "./useLaunch";
 import { useLaunchDraft } from "./useLaunchDraft";
 
 const KIND_LABEL: Record<App["kind"], string> = {
@@ -35,8 +36,12 @@ export interface DetailBandProps {
   app: App;
   codecCaps: ReturnType<typeof probeCodecs>;
   launching: boolean;
-  /** #494: a capacity_exhausted bounce is being retried, not shown as failure. */
+  /** #494: a capacity_exhausted or no_host_available bounce is being retried,
+   *  not shown as failure. */
   waitingForSlot?: boolean;
+  /** Which bounce, so copy doesn't claim a slot when it's really a host
+   *  coming online. Defaults to "slot" — the original #494 case. */
+  waitingReason?: WaitingReason | null;
   /** null = evaluation in flight, string = error message, object = loaded. */
   profiles: ProfilesResponse | string | null;
   /** The overlay's open state — the page's one Escape handler owns it. */
@@ -67,6 +72,7 @@ export const DetailBand = forwardRef<HTMLDivElement, DetailBandProps>(function D
     codecCaps,
     launching,
     waitingForSlot = false,
+    waitingReason = "slot",
     profiles,
     optionsOpen,
     optionsToggleRef,
@@ -148,7 +154,9 @@ export const DetailBand = forwardRef<HTMLDivElement, DetailBandProps>(function D
   const playLabel = isLive
     ? "Resume session"
     : waitingForSlot
-      ? "Waiting for a slot…"
+      ? waitingReason === "host"
+        ? "Waiting for a host…"
+        : "Waiting for a slot…"
       : launching
         ? "Launching…"
         : "Play";
@@ -227,6 +235,7 @@ export const DetailBand = forwardRef<HTMLDivElement, DetailBandProps>(function D
           liveSessionId={liveSessionId}
           canDecodeH264={codecCaps.h264}
           waitingForSlot={waitingForSlot}
+          waitingReason={waitingReason}
           onRetryProfiles={onRetryProfiles}
         />
 
@@ -264,6 +273,7 @@ export const DetailBand = forwardRef<HTMLDivElement, DetailBandProps>(function D
           verdict={selection.draftVerdict}
           launching={launching}
           waitingForSlot={waitingForSlot}
+          waitingReason={waitingReason}
           closeRef={closeRef}
           onSelectCodec={(codec: DraftCodec) => selection.edit({ codec }, "codec")}
           onSelectFps={(fps) => selection.edit({ fps }, "fps")}

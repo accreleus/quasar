@@ -3,7 +3,9 @@ import {
   decideCapacityRetry,
   DEFAULT_RETRY_DELAY_MS,
   MAX_CAPACITY_RETRY_WAIT_MS,
+  MAX_NO_HOST_RETRY_WAIT_MS,
   MIN_RETRY_DELAY_MS,
+  NO_HOST_RETRY_DELAY_MS,
 } from "./capacityRetry";
 
 describe("decideCapacityRetry", () => {
@@ -82,6 +84,59 @@ describe("decideCapacityRetry", () => {
     expect(decideCapacityRetry({ elapsedMs: 0, retryAfterSeconds: 90 })).toEqual({
       kind: "retry",
       delayMs: MAX_CAPACITY_RETRY_WAIT_MS,
+    });
+  });
+
+  // no_host_available's own budget/delay, used via the caller-supplied
+  // maxWaitMs/defaultDelayMs params (useLaunch.ts wires these when the error
+  // code is no_host_available).
+  describe("no_host_available budget", () => {
+    it("uses NO_HOST_RETRY_DELAY_MS as the default delay, not capacity_exhausted's 5s", () => {
+      expect(
+        decideCapacityRetry(
+          { elapsedMs: 0, retryAfterSeconds: undefined },
+          MAX_NO_HOST_RETRY_WAIT_MS,
+          NO_HOST_RETRY_DELAY_MS,
+        ),
+      ).toEqual({ kind: "retry", delayMs: NO_HOST_RETRY_DELAY_MS });
+    });
+
+    it("gives up at the 20s no-host cap rather than capacity_exhausted's 60s", () => {
+      expect(
+        decideCapacityRetry(
+          { elapsedMs: MAX_NO_HOST_RETRY_WAIT_MS, retryAfterSeconds: undefined },
+          MAX_NO_HOST_RETRY_WAIT_MS,
+          NO_HOST_RETRY_DELAY_MS,
+        ),
+      ).toEqual({ kind: "give-up" });
+    });
+
+    it("still retries capacity_exhausted's full 60s budget when no override is passed", () => {
+      expect(
+        decideCapacityRetry({ elapsedMs: 59_000, retryAfterSeconds: undefined }),
+      ).toEqual({ kind: "retry", delayMs: 1_000 });
+    });
+
+    it("judges the same elapsed time against each code's own budget", () => {
+      // useLaunch.ts carries one elapsedMs across a no_host_available <->
+      // capacity_exhausted flip rather than resetting it; this only checks
+      // that decideCapacityRetry, given that same elapsedMs, applies whichever
+      // budget/delay the caller passes for the current code.
+      const elapsed = 18_000; // most of the 20s no-host budget already spent
+      const noHostDecision = decideCapacityRetry(
+        { elapsedMs: elapsed, retryAfterSeconds: undefined },
+        MAX_NO_HOST_RETRY_WAIT_MS,
+        NO_HOST_RETRY_DELAY_MS,
+      );
+      expect(noHostDecision).toEqual({ kind: "retry", delayMs: NO_HOST_RETRY_DELAY_MS });
+
+      // Same elapsedMs, now judged against capacity_exhausted's larger 60s
+      // budget/5s default delay — the 18s already spent is not given back.
+      const capacityDecision = decideCapacityRetry({
+        elapsedMs: elapsed,
+        retryAfterSeconds: undefined,
+      });
+      expect(capacityDecision).toEqual({ kind: "retry", delayMs: DEFAULT_RETRY_DELAY_MS });
     });
   });
 });
