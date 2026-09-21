@@ -1047,7 +1047,7 @@ Found while integrating the ring-slot tiling fix
 |---|---|
 | Origin | Quasar (this repo) — not vendored |
 | Patches | `games-on-whales/gst-wayland-display` (compositor), file `wayland-display-core/src/utils/vulkan_share.rs` |
-| Authored against | `631cebb` (the `GST_WAYLAND_DISPLAY_REF` this image builds), on top of the other six `gst-wayland-display-*` patches (the `nvidia-sync` patch touches the same function, so this applies **after** the full stack) |
+| Authored against | `631cebb` (the `GST_WAYLAND_DISPLAY_REF` when it was authored; unchanged by the #284 bump to `0b691b4`, which does not touch `vulkan_share.rs`), on top of the other six `gst-wayland-display-*` patches (the `nvidia-sync` patch touches the same function, so this applies **after** the full stack) |
 | Upstream status | to be reported on [gst-wayland-display PR #37](https://github.com/games-on-whales/gst-wayland-display/pull/37) |
 
 If `GST_WAYLAND_DISPLAY_REF` moves, re-diff against the new commit with the other six
