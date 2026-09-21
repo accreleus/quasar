@@ -24,10 +24,16 @@ pub enum ProbeOutcome {
     },
 }
 
-/// How a child-process probe ended. `stdout` is the child's one-line result.
+/// How a child-process probe ended. `stdout` is the child's one-line result;
+/// `remediation` is a child-supplied override of the per-kind default, from a
+/// `quasar-probe-remediation:` line — see `host_probe::child::drain_stdout`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChildEnd {
-    Exited { code: i32, stdout: String },
+    Exited {
+        code: i32,
+        stdout: String,
+        remediation: Option<String>,
+    },
     Signaled(i32),
     Deadline(Duration),
     Preempted,
@@ -108,16 +114,24 @@ pub fn remediation(kind: ProbeKind) -> String {
 pub fn child_outcome(target: ProbeTarget, end: ChildEnd) -> ProbeOutcome {
     let (passed, failed, exercising) = wording(target);
     match end {
-        ChildEnd::Exited { code: 0, stdout } => ProbeOutcome::Pass {
+        ChildEnd::Exited {
+            code: 0, stdout, ..
+        } => ProbeOutcome::Pass {
             summary: format!("{passed}: {stdout}"),
         },
-        ChildEnd::Exited { code: 1, stdout } => ProbeOutcome::Fail {
+        ChildEnd::Exited {
+            code: 1,
+            stdout,
+            remediation: child_remediation,
+        } => ProbeOutcome::Fail {
             summary: format!("{failed}: {stdout}"),
-            remediation: remediation(target.kind),
+            remediation: child_remediation.unwrap_or_else(|| remediation(target.kind)),
         },
         // The child's contract is 0 pass, 1 fail. Anything else (2 is bad argv) is
         // not a statement about the host.
-        ChildEnd::Exited { code, stdout } => ProbeOutcome::Indeterminate {
+        ChildEnd::Exited {
+            code, stdout, ..
+        } => ProbeOutcome::Indeterminate {
             reason: format!("The host probe of {exercising} exited {code}: {stdout}"),
         },
         ChildEnd::Signaled(signal) => match fault_signal(signal) {
@@ -244,4 +258,111 @@ pub fn record_not_applicable(report: &mut ReadinessReport, kind: ProbeKind, at: 
 
 pub fn forget(report: &mut ReadinessReport, target: ProbeTarget) {
     report.forget(&target.check_id());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KINDS: [ProbeKind; 4] = [
+        ProbeKind::Media,
+        ProbeKind::Input,
+        ProbeKind::Audio,
+        ProbeKind::ApplicationGpu,
+    ];
+
+    fn exited(code: i32, remediation: Option<&str>) -> ChildEnd {
+        ChildEnd::Exited {
+            code,
+            stdout: "x".into(),
+            remediation: remediation.map(str::to_string),
+        }
+    }
+
+    // ── `remediation(kind)` strings, pinned verbatim so they cannot drift ────────────
+
+    #[test]
+    fn remediation_text_is_verbatim_per_kind() {
+        assert_eq!(
+            remediation(ProbeKind::Media),
+            "Check the render node is passed to the agent container, the driver/driver \
+             volume, and the agent log for `token=\"host-probe-` lines."
+        );
+        assert_eq!(
+            remediation(ProbeKind::Input),
+            "Check /dev/uinput is passed to the container and \
+             `device_cgroup_rules: ['c 13:* rmw']` is set."
+        );
+        assert_eq!(
+            remediation(ProbeKind::Audio),
+            "Check the runtime lets the agent image start the audio sidecar as a sibling \
+             container: the runtime_endpoint check, and the agent logs."
+        );
+        assert_eq!(
+            remediation(ProbeKind::ApplicationGpu),
+            "Check /dev/dri permissions/groups (the dri_node_app_access check) and, on \
+             NVIDIA, the driver volume (driver_volume_version check)."
+        );
+    }
+
+    #[test]
+    fn a_fail_with_a_child_supplied_remediation_uses_it_over_the_per_kind_default() {
+        for kind in KINDS {
+            let outcome =
+                child_outcome(ProbeTarget::host(kind), exited(1, Some("do this instead")));
+            match outcome {
+                ProbeOutcome::Fail { remediation, .. } => {
+                    assert_eq!(remediation, "do this instead")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_fail_with_no_child_remediation_falls_back_to_the_per_kind_default_for_every_kind() {
+        for kind in KINDS {
+            let outcome = child_outcome(ProbeTarget::host(kind), exited(1, None));
+            match outcome {
+                ProbeOutcome::Fail {
+                    remediation: got, ..
+                } => assert_eq!(got, remediation(kind)),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_pass_ignores_a_supplied_remediation() {
+        let outcome = child_outcome(
+            ProbeTarget::host(ProbeKind::Media),
+            exited(0, Some("ignored")),
+        );
+        assert!(matches!(outcome, ProbeOutcome::Pass { .. }));
+    }
+
+    #[test]
+    fn an_indeterminate_exit_ignores_a_supplied_remediation() {
+        let outcome = child_outcome(
+            ProbeTarget::host(ProbeKind::Media),
+            exited(2, Some("ignored")),
+        );
+        assert!(matches!(outcome, ProbeOutcome::Indeterminate { .. }));
+    }
+
+    #[test]
+    fn a_signal_uses_the_per_kind_default_a_crash_is_not_the_child_speaking() {
+        let outcome = child_outcome(
+            ProbeTarget::host(ProbeKind::Media),
+            ChildEnd::Signaled(libc::SIGSEGV),
+        );
+        match outcome {
+            ProbeOutcome::Fail {
+                remediation: got, ..
+            } => {
+                assert_eq!(got, remediation(ProbeKind::Media))
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 }

@@ -58,6 +58,10 @@ impl Default for MediaProbeRequest {
 pub enum ProbeVerdict {
     Pass(String),
     Fail(String),
+    /// The GPU encoded fine but the decoded picture is wrong: same line shape
+    /// and exit code as `Fail`, kept distinct so `remediation()` can hand back
+    /// [`PIXEL_MISMATCH_REMEDIATION`] without sniffing the line text.
+    Mismatch(String),
     /// Bad argv — distinct from a fail, so a caller cannot read it as "this GPU cannot
     /// encode".
     Usage(String),
@@ -68,11 +72,22 @@ pub enum ProbeVerdict {
     Indeterminate(String),
 }
 
+/// Must not contain "WOLF_": it names QUASAR_ENCODER as a way to isolate the fault,
+/// never as the fix.
+const PIXEL_MISMATCH_REMEDIATION: &str = "The GPU is working — it composited and encoded \
+    every probe frame — but the picture that came out of the encoder is wrong, so this GPU \
+    is blocked for sessions. To isolate the fault, set QUASAR_ENCODER for this host to \
+    another encoder (va, nvenc or openh264) and recreate the agent: if this check then \
+    passes, the default encode path is at fault on this GPU and driver. That is a \
+    diagnostic step, not a fix. Please report the GPU model, the driver version and the \
+    planes named in the summary to the Quasar issue tracker.";
+
 impl ProbeVerdict {
     pub fn line(&self) -> &str {
         match self {
             ProbeVerdict::Pass(s)
             | ProbeVerdict::Fail(s)
+            | ProbeVerdict::Mismatch(s)
             | ProbeVerdict::Usage(s)
             | ProbeVerdict::Indeterminate(s) => s,
         }
@@ -81,9 +96,18 @@ impl ProbeVerdict {
     pub fn exit_code(&self) -> i32 {
         match self {
             ProbeVerdict::Pass(_) => 0,
-            ProbeVerdict::Fail(_) => 1,
+            ProbeVerdict::Fail(_) | ProbeVerdict::Mismatch(_) => 1,
             ProbeVerdict::Usage(_) => 2,
             ProbeVerdict::Indeterminate(_) => 3,
+        }
+    }
+
+    /// A remediation more specific than the per-kind default, printed as a
+    /// `quasar-probe-remediation:` line ahead of [`line`](Self::line).
+    pub fn remediation(&self) -> Option<&'static str> {
+        match self {
+            ProbeVerdict::Mismatch(_) => Some(PIXEL_MISMATCH_REMEDIATION),
+            _ => None,
         }
     }
 }
@@ -390,7 +414,7 @@ fn verdict(wanted: u64, seen: &Observed) -> ProbeVerdict {
             off,
             frames,
             planes,
-        } => ProbeVerdict::Fail(format!(
+        } => ProbeVerdict::Mismatch(format!(
             "{}: the picture did not survive: {:.2}% of the decoded {planes} samples do not \
              match the picture the compositor fed in on {} (worst plane over {frames} decoded \
              frames). The GPU is working — the frames encoded. The fault is in the \
@@ -872,7 +896,7 @@ mod tests {
             ),
         );
         assert_eq!(v.exit_code(), 1);
-        assert!(matches!(v, ProbeVerdict::Fail(_)));
+        assert!(matches!(v, ProbeVerdict::Mismatch(_)));
         let line = v.line();
         assert!(line.contains("25.33%"));
         assert!(line.contains("u,v"));
@@ -882,6 +906,39 @@ mod tests {
         // the fix — the wording must not claim it repairs anything by itself.
         assert!(line.contains("QUASAR_ENCODER"));
         assert!(!line.to_lowercase().contains("will fix"));
+    }
+
+    #[test]
+    fn a_mismatch_verdict_carries_the_isolation_remediation() {
+        let v = verdict(
+            30,
+            &observed_with_pixel(
+                30,
+                PixelCheck::Mismatch {
+                    off: 0.2533,
+                    frames: 20,
+                    planes: "u,v".into(),
+                },
+            ),
+        );
+        assert_eq!(v.exit_code(), 1);
+        let remediation = v.remediation().expect("a mismatch carries remediation");
+        assert!(remediation.contains("QUASAR_ENCODER"));
+        assert!(remediation.contains("GPU model"));
+        assert!(remediation.contains("driver version"));
+        assert!(remediation.contains("planes"));
+        assert!(!remediation.contains("WOLF_"));
+    }
+
+    #[test]
+    fn every_other_verdict_carries_no_remediation() {
+        assert_eq!(ProbeVerdict::Pass("ok".into()).remediation(), None);
+        assert_eq!(ProbeVerdict::Fail("boom".into()).remediation(), None);
+        assert_eq!(ProbeVerdict::Usage("bad".into()).remediation(), None);
+        assert_eq!(
+            ProbeVerdict::Indeterminate("dunno".into()).remediation(),
+            None
+        );
     }
 
     #[test]

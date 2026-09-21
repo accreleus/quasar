@@ -39,6 +39,7 @@ fn exited(code: i32, stdout: &str) -> ChildEnd {
     ChildEnd::Exited {
         code,
         stdout: stdout.into(),
+        remediation: None,
     }
 }
 

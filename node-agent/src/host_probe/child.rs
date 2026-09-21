@@ -19,9 +19,14 @@ pub struct ChildSpec {
     pub deadline: Duration,
 }
 
-/// Longest result line kept; the rest of an over-long line is dropped. The child's
-/// contract is one short line, so this only bounds a misbehaving one.
+/// Longest line kept (result or remediation); the rest of an over-long line is dropped.
+/// The child's contract is one short line, so this only bounds a misbehaving one.
 const MAX_LINE: usize = 4096;
+
+/// A probe child MAY print one line of this shape before its result line, to carry a
+/// remediation more specific than the per-kind default (#287). Never the result line
+/// itself — see `drain_stdout`.
+pub const REMEDIATION_PREFIX: &str = "quasar-probe-remediation: ";
 
 /// How long a kill waits for the group to be reaped before giving up on the wait (the
 /// SIGKILL itself cannot be refused, so this only bounds our own await).
@@ -72,21 +77,37 @@ async fn preempted(preempt: &mut watch::Receiver<bool>) {
     }
 }
 
-/// Drain `stdout` to EOF, keeping only the last non-empty line. Reading only after exit
-/// deadlocks a child that fills the 8 KiB pipe buffer (#194), so this runs concurrently
-/// with the wait.
-async fn last_nonempty_line(mut stdout: tokio::process::ChildStdout) -> String {
-    fn keep(line: &[u8], last: &mut String) {
+/// Drain `stdout` to EOF, keeping the last non-empty, non-prefixed line as the result and
+/// the last `REMEDIATION_PREFIX` line (trimmed, empty ⇒ None) separately — it is routed
+/// off and never becomes the result. Reading only after exit deadlocks a child that fills
+/// the 8 KiB pipe buffer (#194), so this runs concurrently with the wait.
+async fn drain_stdout(mut stdout: tokio::process::ChildStdout) -> (String, Option<String>) {
+    fn keep(line: &[u8], last: &mut String, remediation: &mut Option<String>) {
         let text = String::from_utf8_lossy(line);
-        let text = text.trim();
-        if !text.is_empty() {
-            *last = text.to_string();
+        // Only the leading edge is trimmed before the prefix check: a right-trim first
+        // would eat into a prefix that ends in a space, breaking the match on a
+        // remediation line whose text is empty/whitespace (the "clears it" case).
+        let text = text.trim_start();
+        if text.is_empty() {
+            return;
+        }
+        match text.strip_prefix(REMEDIATION_PREFIX) {
+            Some(rest) => {
+                let rest = rest.trim();
+                *remediation = if rest.is_empty() {
+                    None
+                } else {
+                    Some(rest.to_string())
+                };
+            }
+            None => *last = text.trim_end().to_string(),
         }
     }
 
     let mut buf = [0u8; 8192];
     let mut line: Vec<u8> = Vec::new();
     let mut last = String::new();
+    let mut remediation: Option<String> = None;
     loop {
         let n = match stdout.read(&mut buf).await {
             Ok(0) | Err(_) => break,
@@ -94,7 +115,7 @@ async fn last_nonempty_line(mut stdout: tokio::process::ChildStdout) -> String {
         };
         for &byte in &buf[..n] {
             if byte == b'\n' {
-                keep(&line, &mut last);
+                keep(&line, &mut last, &mut remediation);
                 line.clear();
             } else if line.len() < MAX_LINE {
                 line.push(byte);
@@ -102,8 +123,8 @@ async fn last_nonempty_line(mut stdout: tokio::process::ChildStdout) -> String {
         }
     }
     // A child that exits without a trailing newline still said something.
-    keep(&line, &mut last);
-    last
+    keep(&line, &mut last, &mut remediation);
+    (last, remediation)
 }
 
 /// `preempt` turning true stops the child at once. Dropping the returned future also
@@ -142,7 +163,7 @@ pub async fn run_child(spec: ChildSpec, mut preempt: watch::Receiver<bool>) -> C
     let drain = child
         .stdout
         .take()
-        .map(|out| tokio::spawn(last_nonempty_line(out)));
+        .map(|out| tokio::spawn(drain_stdout(out)));
 
     enum Stop {
         Exited(std::io::Result<std::process::ExitStatus>),
@@ -171,18 +192,22 @@ pub async fn run_child(spec: ChildSpec, mut preempt: watch::Receiver<bool>) -> C
     // Reaped, so the pgid may be recycled: no group kill from here on.
     group.disarm();
 
-    let stdout = match drain {
+    let (stdout, remediation) = match drain {
         Some(handle) => tokio::time::timeout(DRAIN_BOUND, handle)
             .await
             .ok()
             .and_then(|r| r.ok())
             .unwrap_or_default(),
-        None => String::new(),
+        None => (String::new(), None),
     };
 
     match status {
         Ok(status) => match (status.code(), status.signal()) {
-            (Some(code), _) => ChildEnd::Exited { code, stdout },
+            (Some(code), _) => ChildEnd::Exited {
+                code,
+                stdout,
+                remediation,
+            },
             (None, Some(signal)) => ChildEnd::Signaled(signal),
             (None, None) => ChildEnd::SpawnFailed("the child ended with no status".into()),
         },
@@ -255,7 +280,8 @@ mod tests {
             end,
             ChildEnd::Exited {
                 code: 0,
-                stdout: "encoded 30 frames".into()
+                stdout: "encoded 30 frames".into(),
+                remediation: None,
             }
         );
     }
@@ -268,7 +294,8 @@ mod tests {
             end,
             ChildEnd::Exited {
                 code: 3,
-                stdout: "no encoder".into()
+                stdout: "no encoder".into(),
+                remediation: None,
             }
         );
     }
@@ -282,7 +309,8 @@ mod tests {
             bounded(spec, rx).await,
             ChildEnd::Exited {
                 code: 0,
-                stdout: "/dev/dri/renderD129".into()
+                stdout: "/dev/dri/renderD129".into(),
+                remediation: None,
             }
         );
     }
@@ -309,9 +337,130 @@ mod tests {
             end,
             ChildEnd::Exited {
                 code: 0,
-                stdout: "done".into()
+                stdout: "done".into(),
+                remediation: None,
             }
         );
+    }
+
+    // ── the remediation line is routed off and never becomes the result ─────────────
+
+    #[tokio::test]
+    async fn a_remediation_line_before_the_result_is_routed_off_it() {
+        let (_tx, rx) = never();
+        let end = bounded(
+            sh(
+                "echo 'quasar-probe-remediation: check the thing'; echo 'the result line'",
+                Duration::from_secs(10),
+            ),
+            rx,
+        )
+        .await;
+        assert_eq!(
+            end,
+            ChildEnd::Exited {
+                code: 0,
+                stdout: "the result line".into(),
+                remediation: Some("check the thing".into()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_child_with_no_remediation_line_reports_none() {
+        let (_tx, rx) = never();
+        let end = bounded(sh("echo 'the result line'", Duration::from_secs(10)), rx).await;
+        assert_eq!(
+            end,
+            ChildEnd::Exited {
+                code: 0,
+                stdout: "the result line".into(),
+                remediation: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remediation_line_alone_leaves_stdout_empty() {
+        let (_tx, rx) = never();
+        let end = bounded(
+            sh(
+                "echo 'quasar-probe-remediation: check the thing'",
+                Duration::from_secs(10),
+            ),
+            rx,
+        )
+        .await;
+        assert_eq!(
+            end,
+            ChildEnd::Exited {
+                code: 0,
+                stdout: String::new(),
+                remediation: Some("check the thing".into()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn the_last_remediation_line_wins_and_an_empty_one_clears_it() {
+        let (_tx, rx) = never();
+        let end = bounded(
+            sh(
+                "echo 'quasar-probe-remediation: first'; \
+                 echo 'quasar-probe-remediation: second'; \
+                 echo done",
+                Duration::from_secs(10),
+            ),
+            rx,
+        )
+        .await;
+        assert_eq!(
+            end,
+            ChildEnd::Exited {
+                code: 0,
+                stdout: "done".into(),
+                remediation: Some("second".into()),
+            }
+        );
+
+        let (_tx, rx) = never();
+        let end = bounded(
+            sh(
+                "echo 'quasar-probe-remediation: first'; \
+                 echo 'quasar-probe-remediation:   '; \
+                 echo done",
+                Duration::from_secs(10),
+            ),
+            rx,
+        )
+        .await;
+        assert_eq!(
+            end,
+            ChildEnd::Exited {
+                code: 0,
+                stdout: "done".into(),
+                remediation: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remediation_line_longer_than_the_bound_is_capped_like_a_result_line() {
+        let (_tx, rx) = never();
+        let long = "a".repeat(MAX_LINE + 500);
+        let script = format!("printf 'quasar-probe-remediation: %s\\n' '{long}'; echo done");
+        let end = bounded(sh(&script, Duration::from_secs(10)), rx).await;
+        match end {
+            ChildEnd::Exited {
+                code: 0,
+                stdout,
+                remediation: Some(remediation),
+            } => {
+                assert_eq!(stdout, "done");
+                assert_eq!(remediation.len(), MAX_LINE - REMEDIATION_PREFIX.len());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[tokio::test]

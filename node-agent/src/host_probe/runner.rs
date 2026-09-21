@@ -501,6 +501,7 @@ mod tests {
         let (runner, exec) = runner_with(FakeExec::returning(ChildEnd::Exited {
             code: 0,
             stdout: "ok".into(),
+            remediation: None,
         }));
         let end = tokio::time::timeout(
             BOUND,
@@ -526,6 +527,7 @@ mod tests {
         let (runner, exec) = runner_with(FakeExec::returning(ChildEnd::Exited {
             code: 0,
             stdout: "ok".into(),
+            remediation: None,
         }));
         let mut s = settings();
         s.render_node = "/dev/dri/renderD128".into();
@@ -562,6 +564,7 @@ mod tests {
         let (runner, exec) = runner_with(FakeExec::returning(ChildEnd::Exited {
             code: 0,
             stdout: "ok".into(),
+            remediation: None,
         }));
         runner.set_context(ProbeContext {
             settings: settings(),
@@ -589,6 +592,7 @@ mod tests {
         let (runner, _exec) = runner_with(FakeExec::returning(ChildEnd::Exited {
             code: 0,
             stdout: "ok".into(),
+            remediation: None,
         }));
         let end = tokio::time::timeout(
             BOUND,
@@ -637,6 +641,7 @@ mod tests {
         let (runner, exec) = runner_with(FakeExec::returning(ChildEnd::Exited {
             code: 0,
             stdout: "ok".into(),
+            remediation: None,
         }));
         let mut s = settings();
         s.render_node = String::new();
@@ -674,6 +679,7 @@ mod tests {
         let (runner, _exec) = runner_with(FakeExec::returning(ChildEnd::Exited {
             code: 0,
             stdout: "ok".into(),
+            remediation: None,
         }));
         let end = tokio::time::timeout(
             BOUND,
@@ -697,6 +703,7 @@ mod tests {
         let (runner, _exec) = runner_with(FakeExec::returning(ChildEnd::Exited {
             code: 0,
             stdout: "ok".into(),
+            remediation: None,
         }));
         let end = tokio::time::timeout(
             BOUND,

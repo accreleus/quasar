@@ -577,6 +577,12 @@ fn run_input_probe() {
 fn run_media_probe(request: session::probe_media::MediaProbeRequest) {
     tracing::info!("quasar node-agent — media host probe");
     let verdict = session::probe_media::run(&request);
+    if let Some(remediation) = verdict.remediation() {
+        println!(
+            "{}{remediation}",
+            quasar_node_agent::host_probe::child::REMEDIATION_PREFIX
+        );
+    }
     println!("{}", verdict.line());
     std::process::exit(verdict.exit_code());
 }
