@@ -1409,18 +1409,23 @@ submission source.
 
 ### `vulkanh265enc-radv-coded-height.patch`
 
-Quasar-authored (#297). On RADV the HEVC SPS declared a picture VCN never coded. `vulkanh265enc.patch`
-aligns the SPS picture (`self->coded_width/height`) to the largest CTB the driver reports (64 on
-RADV) and crops with a conformance window, but RADV programs VCN from the encode's `codedExtent`
-(the display size) aligned to **64x16**, never from the SPS (`radv_video_enc.c`; radeonsi's VA path
-declares the same 64x16 picture). At 2560x1440 the SPS said 1472 rows while VCN coded 1440, so the
-last CTB row was encoded as a partial CTB and declared as a full one: measured against the source
-picture, rows 0-1343 decoded at 46-47 dB and rows 1408-1439 at 8 dB, and Apple's HEVC decoder
-refused the stream outright (Chrome on macOS: "This stream isn't supported on your device"). 1080
-escaped only because VCN's align(1080,16) = 1088 happens to equal the SPS's align(1080,64). On RADV
-(`VK_DRIVER_ID_MESA_RADV`, read through `vkGetPhysicalDeviceProperties2`) the coded height is now
-aligned to 16, so the SPS matches what VCN codes: 1440, 1200, 720 and 2160 carry no crop, 1080 keeps
-its 8-row crop. Width keeps the 64 CTB alignment (VCN aligns width to 64). Every other driver,
-NVIDIA included, is unchanged. The chosen alignment is logged at INFO (`coded size ... height
-alignment`).
+Quasar-authored (#297). On RADV the HEVC SPS declared a picture VCN never coded.
+`vulkanh265enc.patch` aligns the SPS picture (`self->coded_width/height`) to the largest CTB the
+driver reports (64 on RADV) and crops back with a conformance window. RADV, however, programs VCN
+from the encode's `codedExtent` (the display size) aligned to **64x16** (`radv_video_enc.c`;
+radeonsi's VA path declares the same picture). RADV does rewrite the uploaded SPS to 64x16, but a
+64-aligned height is a fixed point of that rewrite, so the driver could not repair it.
 
+At 2560x1440 the SPS said 1472 rows while VCN coded 1440, so the last CTB row was coded as a partial
+row and declared as a full one. Against the source picture, rows 0-1311 decoded at 46 dB and rows
+1408-1439 at 8 dB. Apple's HEVC decoder refused the stream outright (Chrome on macOS: "This stream
+isn't supported on your device"). 720, 1200 and 2160 were broken the same way. 1080 escaped only
+because VCN's align(1080,16) = 1088 happens to equal the SPS's align(1080,64).
+
+On RADV (`VK_DRIVER_ID_MESA_RADV`, read through `vkGetPhysicalDeviceProperties2`) the coded height
+is now aligned to 16, which holds for every VCN generation in Mesa 25.3. The SPS then matches what
+VCN codes: 720, 1200, 1440 and 2160 carry no crop, and the bottom rows decode at 43-49 dB. 1080 is
+byte-identical to before. Width keeps the 64 CTB alignment, which is what VCN uses. Every other
+driver, NVIDIA included, is unchanged. The chosen alignment is logged at INFO (`coded size ...
+height alignment`). The patch also corrects the `vulkanh265enc.patch` comment that says RADV reports
+no SPS override: Mesa 25.3 always flags one, and returns the SPS it was given.
