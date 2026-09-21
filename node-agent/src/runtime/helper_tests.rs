@@ -4,7 +4,8 @@ use crate::runtime::helpers::{HelperPhase, HelperProfile};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    io::{Read, Write},
+    collections::VecDeque,
+    io::{self, Read, Write},
     os::unix::net::{UnixListener, UnixStream},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -102,11 +103,30 @@ fn legacy(id: char, name: &str, labels: Value) -> LegacyContainer {
 fn owner_label(owner: &str) -> Value {
     json!({ crate::container_ownership::LABEL: owner })
 }
+/// EMFILE / ENFILE: the process is short of file descriptors, not the fixture
+/// broken. Bounded-retry transient (#290), never fatal.
+fn is_fd_exhaustion(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(24) | Some(23))
+}
+
 struct Engine {
     state: Arc<Mutex<State>>,
     config: RuntimeConfig,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
+    /// Cleared by the accept thread on exit (including on panic unwind), so a
+    /// test can check the fixture is still there instead of waiting out a bound
+    /// against a listener nobody is serving any more (#290).
+    alive: Arc<AtomicBool>,
+    /// The accept thread's fatal cause, if any, captured before it panics —
+    /// `Engine::drop` otherwise swallows it.
+    last_error: Arc<Mutex<Option<String>>>,
+    /// Test-only fault injection: accept errors to hand out before real ones.
+    injected_accept_errors: Arc<Mutex<VecDeque<io::Error>>>,
+    /// Set by `expect_death`: a test that deliberately kills the accept thread
+    /// asserts on `alive()`/`dead_cause()` itself, so `drop` must not also
+    /// re-raise the thread's panic.
+    expect_death: AtomicBool,
     _dir: tempfile::TempDir,
 }
 impl Engine {
@@ -121,21 +141,57 @@ impl Engine {
             ..Default::default()
         }));
         let stop = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(true));
+        let last_error = Arc::new(Mutex::new(None));
+        let injected_accept_errors = Arc::new(Mutex::new(VecDeque::new()));
         let server_state = state.clone();
         let stopped = stop.clone();
+        let thread_alive = alive.clone();
+        let thread_last_error = last_error.clone();
+        let thread_injected = injected_accept_errors.clone();
         let thread = thread::spawn(move || {
+            struct DeathGuard(Arc<AtomicBool>);
+            impl Drop for DeathGuard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            let _death = DeathGuard(thread_alive);
             let mut handlers = Vec::new();
             while !stopped.load(Ordering::SeqCst) {
-                match listener.accept() {
+                let outcome = thread_injected
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .map_or_else(|| listener.accept(), Err);
+                match outcome {
                     Ok((socket, _)) => {
                         assert!(handlers.len() < 2048, "fixture request bound");
                         let state = server_state.clone();
-                        handlers.push(thread::spawn(move || serve(socket, &state)));
+                        match thread::Builder::new().spawn(move || serve(socket, &state)) {
+                            Ok(handle) => handlers.push(handle),
+                            Err(error) => {
+                                // Thread exhaustion spawning a handler: same bounded-retry
+                                // transient as an accept EMFILE, drop this connection.
+                                *thread_last_error.lock().unwrap() =
+                                    Some(format!("fixture handler spawn: {error}"));
+                                thread::sleep(Duration::from_millis(10));
+                            }
+                        }
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2))
                     }
-                    Err(error) => panic!("fixture accept: {error}"),
+                    Err(error) if is_fd_exhaustion(&error) => {
+                        *thread_last_error.lock().unwrap() =
+                            Some(format!("fixture accept (transient): {error}"));
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => {
+                        let message = format!("fixture accept: {error}");
+                        *thread_last_error.lock().unwrap() = Some(message.clone());
+                        panic!("{message}");
+                    }
                 }
             }
             for handler in handlers {
@@ -151,8 +207,32 @@ impl Engine {
             config,
             stop,
             thread: Some(thread),
+            alive,
+            last_error,
+            injected_accept_errors,
+            expect_death: AtomicBool::new(false),
             _dir: dir,
         }
+    }
+    /// Test-only: this test deliberately kills the accept thread and checks
+    /// `alive()`/`dead_cause()` itself, so suppress the drop-time re-panic.
+    fn expect_death(&self) {
+        self.expect_death.store(true, Ordering::SeqCst);
+    }
+    /// Whether the accept thread is still running. Check this before waiting on
+    /// a bound so a dead fixture fails fast instead of looking like "engine
+    /// still unreachable" for the whole timeout (#290).
+    fn alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+    /// The accept thread's captured fatal cause, if it died.
+    fn dead_cause(&self) -> Option<String> {
+        self.last_error.lock().unwrap().clone()
+    }
+    /// Test-only: make the next accept(s) fail with `error` instead of calling
+    /// the real listener.
+    fn inject_accept_error(&self, error: io::Error) {
+        self.injected_accept_errors.lock().unwrap().push_back(error);
     }
     fn client(&self) -> RuntimeClient {
         RuntimeClient::new(self.config.clone()).unwrap()
@@ -176,7 +256,7 @@ impl Drop for Engine {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         let joined = self.thread.take().unwrap().join();
-        if !thread::panicking() {
+        if !thread::panicking() && !self.expect_death.load(Ordering::SeqCst) {
             joined.unwrap();
         }
     }
@@ -5617,6 +5697,43 @@ fn gpu_probe_stop_is_durable_across_an_unreachable_engine_and_recovery_finishes_
     assert_eq!(
         client.observe_gpu_probe(id).wait().unwrap().exit_code,
         Some(23)
+    );
+}
+
+// #290: fd exhaustion on accept must not kill the fixture, and a fixture that
+// does die must be diagnosable instead of just looking unreachable.
+#[test]
+fn an_emfile_and_enfile_accept_are_absorbed_and_the_fixture_keeps_serving() {
+    let engine = Engine::new();
+    engine.inject_accept_error(io::Error::from_raw_os_error(24)); // EMFILE
+    engine.inject_accept_error(io::Error::from_raw_os_error(23)); // ENFILE
+                                                                  // A request made after both injected errors still reaches a live fixture:
+                                                                  // the accept thread backed off and kept accepting instead of panicking.
+    engine.client().inspect_engine().wait().unwrap();
+    assert!(engine.alive(), "cause: {:?}", engine.dead_cause());
+}
+
+#[test]
+fn a_dead_fixture_reports_its_real_cause_instead_of_looking_unreachable() {
+    let engine = Engine::new();
+    engine.expect_death();
+    engine.inject_accept_error(io::Error::other("injected fixture death"));
+    // The listener is nonblocking and polled every 2ms, so the injected error
+    // is consumed and the thread has panicked well within this bound.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while engine.alive() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !engine.alive(),
+        "fixture did not die from the injected error"
+    );
+    assert!(
+        engine
+            .dead_cause()
+            .is_some_and(|cause| cause.contains("injected fixture death")),
+        "{:?}",
+        engine.dead_cause()
     );
 }
 

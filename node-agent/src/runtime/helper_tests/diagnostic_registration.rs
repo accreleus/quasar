@@ -255,6 +255,9 @@ async fn a_failing_retirement_sweep_registers_refuses_and_resumes_under_the_same
     // The engine returns: the same obligation finishes, under the identity it was
     // journalled with, and the connection ends so normal startup can take over.
     engine.state.lock().unwrap().unreachable = false;
+    // Fail fast on the fixture's own cause rather than waiting out the whole
+    // bound against a listener nobody is serving any more (#290).
+    assert!(engine.alive(), "fixture died: {:?}", engine.dead_cause());
     tokio::time::timeout(BOUND, retry)
         .await
         .expect("the retry did not resume within the bound")
