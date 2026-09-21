@@ -95,6 +95,7 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- Validation record for the follow-ups run: #281/#282 landing, #285 and #287 fixes, and the hardware evidence behind the #284, #286 and #288 branches awaiting the owner, in `docs/reports/2026-09-21-followups-validation/`.
 - **Diagnostic registration replaces exit on startup failure (#256).** When the agent's
   startup cleanup cannot retire applications from the previous agent, or the container
   runtime is missing, unreachable, refused, or misconfigured, the agent no longer exits.

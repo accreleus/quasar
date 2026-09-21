@@ -1,0 +1,849 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Follow-ups validation — #281–#288</title>
+<style>
+  :root {
+    --bg: #14181d;
+    --panel: #1b2026;
+    --panel-alt: #20262d;
+    --border: #2c333b;
+    --fg: #dfe4ea;
+    --fg-dim: #9aa5b1;
+    --fg-dimmer: #6b7684;
+    --green-bg: #16301f;
+    --green-fg: #6fd88a;
+    --green-border: #2e6b41;
+    --amber-bg: #332a12;
+    --amber-fg: #e0b155;
+    --amber-border: #6b5320;
+    --red-bg: #331616;
+    --red-fg: #e08a8a;
+    --red-border: #6b2c2c;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    background: var(--bg);
+    color: var(--fg);
+    margin: 0;
+    padding: 0;
+  }
+
+  body {
+    font-family: var(--sans);
+    line-height: 1.55;
+    font-size: 15.5px;
+  }
+
+  .wrap {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 32px 28px 80px;
+  }
+
+  h1 {
+    font-size: 1.7rem;
+    margin: 0 0 4px;
+    color: var(--fg);
+  }
+
+  h2 {
+    font-size: 1.25rem;
+    margin: 48px 0 14px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    color: var(--fg);
+  }
+
+  h3 {
+    font-size: 1.02rem;
+    margin: 28px 0 10px;
+    color: var(--fg-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-weight: 600;
+  }
+
+  p { margin: 0 0 12px; }
+
+  .subtitle {
+    color: var(--fg-dim);
+    margin: 0 0 6px;
+    font-size: 0.98rem;
+  }
+
+  .subtitle .date {
+    color: var(--fg-dimmer);
+  }
+
+  .record-note {
+    color: var(--fg-dimmer);
+    font-size: 0.92rem;
+    margin: 0 0 28px;
+  }
+
+  code, pre {
+    font-family: var(--mono);
+  }
+
+  code {
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.05em 0.35em;
+    font-size: 0.9em;
+  }
+
+  pre {
+    background: #0f1216;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-size: 0.86rem;
+    line-height: 1.5;
+    color: #c6ccd4;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  blockquote {
+    margin: 8px 0 16px;
+    padding: 10px 16px;
+    border-left: 3px solid var(--border);
+    background: var(--panel);
+    color: var(--fg-dim);
+    font-size: 0.92rem;
+  }
+
+  /* verdict table */
+  table.verdict-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 4px 0 8px;
+    font-size: 0.88rem;
+  }
+
+  table.verdict-table thead th {
+    text-align: left;
+    background: var(--panel-alt);
+    color: var(--fg-dim);
+    font-weight: 600;
+    padding: 9px 10px;
+    border-bottom: 2px solid var(--border);
+  }
+
+  table.verdict-table tbody td {
+    padding: 10px 10px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+
+  table.verdict-table tbody tr:nth-child(even) { background: var(--panel); }
+  table.verdict-table tbody tr:nth-child(odd) { background: var(--bg); }
+
+  .badge {
+    display: inline-block;
+    font-weight: 700;
+    font-size: 0.82rem;
+    letter-spacing: 0.02em;
+    border-radius: 6px;
+    padding: 3px 10px;
+    white-space: nowrap;
+  }
+
+  .badge-landed {
+    color: var(--green-fg);
+    background: rgba(111, 216, 138, 0.12);
+    border: 1px solid var(--green-border);
+  }
+
+  .badge-pushed {
+    color: var(--amber-fg);
+    background: rgba(224, 177, 85, 0.12);
+    border: 1px solid var(--amber-border);
+  }
+
+  .badge-parked, .badge-skipped {
+    color: var(--fg-dim);
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+  }
+
+  /* broken-check list */
+  ul.clean-list {
+    margin: 0 0 12px;
+    padding-left: 22px;
+  }
+
+  ul.clean-list li {
+    margin-bottom: 8px;
+  }
+
+  .emphasis-line {
+    background: var(--green-bg);
+    border: 1px solid var(--green-border);
+    border-left: 4px solid var(--green-fg);
+    border-radius: 4px;
+    padding: 10px 14px;
+    margin: 10px 0;
+    font-family: var(--mono);
+    font-size: 0.9rem;
+    color: var(--green-fg);
+  }
+
+  /* image pairs / grids */
+  .pair-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin: 10px 0 6px;
+  }
+
+  .pair-panel {
+    flex: 1 1 22%;
+    min-width: 200px;
+    max-width: 48%;
+  }
+
+  .pair-panel.quarter {
+    flex-basis: 22%;
+    max-width: 24%;
+  }
+
+  .pair-panel.single {
+    max-width: 100%;
+    flex-basis: 100%;
+  }
+
+  .pair-panel img {
+    width: 100%;
+    height: auto;
+    display: block;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: #000;
+  }
+
+  .pair-label {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--fg-dimmer);
+    margin: 0 0 6px;
+    font-weight: 600;
+  }
+
+  .pair-caption {
+    font-size: 0.85rem;
+    color: var(--fg-dim);
+    margin: 14px 0 34px;
+    font-family: var(--mono);
+    line-height: 1.6;
+  }
+
+  .pair-title {
+    font-weight: 600;
+    color: var(--fg);
+    font-size: 0.98rem;
+    margin: 30px 0 4px;
+    font-family: var(--sans);
+  }
+
+  @media (max-width: 700px) {
+    .pair-panel { max-width: 100%; flex-basis: 100%; }
+    .pair-panel.quarter { max-width: 100%; flex-basis: 100%; }
+  }
+
+  /* tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 4px 0 26px;
+    font-size: 0.88rem;
+  }
+
+  thead th {
+    text-align: left;
+    background: var(--panel-alt);
+    color: var(--fg-dim);
+    font-weight: 600;
+    padding: 8px 10px;
+    border-bottom: 2px solid var(--border);
+  }
+
+  tbody td, tbody th {
+    padding: 7px 10px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+
+  tbody tr:nth-child(even) {
+    background: var(--panel);
+  }
+
+  tbody tr:nth-child(odd) {
+    background: var(--bg);
+  }
+
+  td.num, th.num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    font-family: var(--mono);
+  }
+
+  .pill {
+    display: inline-block;
+    font-size: 0.78rem;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 10px;
+    letter-spacing: 0.02em;
+  }
+
+  .pill-unperformed {
+    background: var(--amber-bg);
+    color: var(--amber-fg);
+    border: 1px solid var(--amber-border);
+  }
+
+  .pill-fail {
+    background: var(--red-bg);
+    color: var(--red-fg);
+    border: 1px solid var(--red-border);
+  }
+
+  .pill-pass {
+    background: var(--green-bg);
+    color: var(--green-fg);
+    border: 1px solid var(--green-border);
+  }
+
+  /* not verified */
+  ul.plain-list {
+    padding-left: 22px;
+    margin: 0 0 12px;
+  }
+
+  ul.plain-list li {
+    margin-bottom: 8px;
+    color: var(--fg);
+  }
+
+  /* decisions */
+  ol.decisions {
+    padding-left: 24px;
+    margin: 0 0 12px;
+  }
+
+  ol.decisions li {
+    margin-bottom: 14px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 16px;
+    list-style: decimal;
+  }
+
+  footer.note {
+    color: var(--fg-dimmer);
+    font-size: 0.8rem;
+    margin-top: 60px;
+    border-top: 1px solid var(--border);
+    padding-top: 16px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Follow-ups validation — #281 through #288</h1>
+  <p class="subtitle"><span class="date">2026-09-21</span></p>
+  <p class="record-note">
+    This report covers six follow-up items from the prior overnight validation run: landing #281/#282
+    onto <code>develop</code>, and validating five further follow-ups (#285, #287, #288, #286, #284)
+    against the development container and both test hosts. Two items landed directly on
+    <code>develop</code>; three more are pushed as branches for the owner to land. Nothing was merged
+    to <code>main</code>, and the Unraid host was never connected to.
+  </p>
+
+  <h2>Verdicts</h2>
+  <table class="verdict-table">
+    <thead>
+      <tr><th>Part</th><th>Issue(s)</th><th>Verdict</th><th>Commits</th><th>One sentence</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="num">0</td>
+        <td>#281, #282 (and #272)</td>
+        <td><span class="badge badge-landed">LANDED</span></td>
+        <td><code>develop</code> <code>fcaaae9</code> → <code>034d9f9</code> (fast-forward, #281) → <code>12174ff</code> (one squash commit, #282)</td>
+        <td>#281 fast-forwarded; #282 landed as one squash whose tree is byte-identical to the gated <code>d4b11af</code> (<code>78a0aab</code> both), so its gate results carry over and were not rerun.</td>
+      </tr>
+      <tr>
+        <td class="num">1</td>
+        <td>#285</td>
+        <td><span class="badge badge-landed">LANDED</span></td>
+        <td><code>53fb5e0</code></td>
+        <td><code>make test-rust</code> is deterministic: three distinct flake causes fixed, a fourth (fixture fd exhaustion) diagnosed and filed as #290.</td>
+      </tr>
+      <tr>
+        <td class="num">2</td>
+        <td>#287</td>
+        <td><span class="badge badge-landed">LANDED</span></td>
+        <td><code>de42f01</code>, <code>e2c8e26</code></td>
+        <td>A pixel-mismatch failure now carries its own remediation; every other probe's text is byte-identical.</td>
+      </tr>
+      <tr>
+        <td class="num">3</td>
+        <td>#288</td>
+        <td><span class="badge badge-pushed">PUSHED FOR OWNER</span></td>
+        <td><code>fix/288-post-recreate-placement</code> @ <code>9066bf6</code> (<code>683b4d1</code> + <code>9066bf6</code>)</td>
+        <td>The refusal window is inherent (register → first capacity report, 498 ms on AMD); admission unchanged; the web client now retries it, the refusal is logged with fleet counts, and a DB test pins the transition.</td>
+      </tr>
+      <tr>
+        <td class="num">4</td>
+        <td>#286</td>
+        <td><span class="badge badge-pushed">PUSHED FOR OWNER</span></td>
+        <td><code>fix/286-udev-dir-cleanup</code> @ <code>64a0615</code> (<code>e66d432</code> + <code>64a0615</code>)</td>
+        <td>Normal stops already cleaned up (Drop); killed agents leaked one dir per session; now owner-marked and reclaimed at boot, unattributable dirs left alone.</td>
+      </tr>
+      <tr>
+        <td class="num">5</td>
+        <td>#284</td>
+        <td><span class="badge badge-pushed">PUSHED FOR OWNER</span></td>
+        <td>Quasar <code>chore/284-gwd-upstream-sync</code> @ <code>b2d8e51</code> (<code>9a88d63</code>, <code>39c172c</code>, <code>b2d8e51</code>); fork develop <code>631cebb</code> → <code>0b691b4</code></td>
+        <td>Live exercise passed on both vendors (cursor hotspot fixed, everything else unchanged); fork develop fast-forwarded to the tested SHA; the Quasar pin bump is the owner's landing.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Is anything broken?</h2>
+  <ul class="clean-list">
+    <li><code>develop</code> head: <code>e2c8e26</code>. Landed today on top of <code>fcaaae9</code>: <code>034d9f9</code>, <code>12174ff</code>, <code>53fb5e0</code>, <code>de42f01</code>, <code>e2c8e26</code>. The report commit will land on top as a docs-only commit.</li>
+    <li>Gates on develop's content:
+      <ul class="plain-list">
+        <li><code>12174ff</code>: tree identical to <code>d4b11af</code>, whose gates were green (test-rust 1735 passed, verify 437/0/0, test-go, test-web, preflight, leak scan) — carried over, not rerun.</li>
+        <li><code>53fb5e0</code> (#285): test-rust ×3 green (1762 passed, 0 failed each), verify, preflight, leak scan; only comments changed after the gates, and fmt + clippy were rerun clean.</li>
+        <li><code>de42f01</code>: test-rust (1775 passed, 0 failed), test-web, verify, preflight, leak scan. <code>e2c8e26</code> (test + comment follow-up): test-rust (1776 passed, 0 failed), verify, leak scan.</li>
+        <li>GitHub leak-scan workflow succeeded on <code>12174ff</code>, <code>53fb5e0</code>, <code>e2c8e26</code> (the <code>034d9f9</code> run was cancelled by concurrency, superseded by <code>12174ff</code>'s which contains it).</li>
+      </ul>
+    </li>
+    <li><code>main</code>: untouched. No tags, no published images, no Actions builds triggered by me (only the repository's own leak-scan workflow on push), no force-push. Images were built with <code>deploy/build-images.sh --no-prune</code>, validated against the image contract, and pushed only to the lab's local registry.</li>
+    <li>Fork (<code>salty2011/gst-wayland-display</code>): develop fast-forwarded <code>631cebb</code> → <code>0b691b4</code> after the #284 live exercise passed on both vendors. Feature branch <code>chore/284-upstream-sync</code> @ <code>0b691b4</code> pushed to the fork. Nothing pushed to games-on-whales; no upstream PR or issue opened or commented on.</li>
+  </ul>
+
+  <div class="emphasis-line">Both test hosts torn down. Final check: the AMD test host — containers 0, volumes 0, non-default networks 0, /run/quasar-agent entries 0, harness dirs 0, stack dirs 0; the NVIDIA test host — the same, all 0. The development container's visual-check stack: 0 containers/volumes/networks.</div>
+  <p class="record-note">Leftovers created by my own runs (two udev dirs from the #286 reproduction, Wayland pairs from killed sessions, three media-probe dirs from the 4b loops, a kept harness stack) were each removed by hand, by exact path, after being recorded.</p>
+  <div class="emphasis-line">The Unraid host was never connected to: no ssh, no command, no read. Docker was never restarted there.</div>
+
+  <h2>Proof per part</h2>
+
+  <h3>Part 0 — landing #281 and #282</h3>
+  <ul class="plain-list">
+    <li>Preconditions: origin/develop was <code>fcaaae9</code>, an ancestor of <code>034d9f9</code>.</li>
+    <li>#281: <code>git push origin 034d9f9:develop</code> — fast-forward, no merge commit.</li>
+    <li>#282: one squash commit <code>12174ff</code>, built with <code>git commit-tree d4b11af^{tree} -p 034d9f9</code>, so the tree is byte-identical by construction; <code>git rev-parse &lt;commit&gt;^{tree}</code> = <code>78a0aab</code> for both; <code>probe_media.rs</code> identical. The branch's wip/carry-over commits did not reach develop. Commit message keeps the co-author trailer.</li>
+    <li>#281, #282, #272 commented (landing commit, what was validated, not verified: native Unraid install, HEVC from a browser, Intel, multi-GPU) and closed (#272 as fixed by #281). Both fix branches remain on origin.</li>
+  </ul>
+
+  <h3>Part 1 — #285</h3>
+  <p>Baseline (untouched develop <code>12174ff</code>, <code>make test-rust</code> ×5): run 1 FAILED (3: <code>capacity::render_node_pin_zeroes_the_excluded_gpu_and_keeps_indices_stable</code>, <code>session::settings::default_matches_env_baseline</code>, <code>session::settings::effective_map_contains_encoder_and_render_node</code>); run 2 FAILED (1: <code>container_ownership::ownership_survives_restart_and_distinct_agents_are_isolated</code>, EAGAIN "another agent holds the state lease"); runs 3–5 ok.</p>
+
+  <p>Causes found, each shown before fixing:</p>
+  <ol class="decisions">
+    <li><b>Environment races</b> — tests <code>set_var</code> while other tests read the same variable. Fix: every env-reading function a test varies has a pure core (value or lookup closure); no non-ignored test mutates the environment; 43 test call sites of <code>RuntimeSettings::baseline()</code> made hermetic. No lock, no serial_test.</li>
+    <li><b>flock fork window</b> — ownership test 0/300 failures alone vs 25/150 beside the host_probe tests (which spawn children). A spawned child copies the lease fd until exec. Same pattern found in the artifact provisioning lock test. Fix: bounded re-acquire helper that retries only the lease-held error and panics with /proc/locks holders otherwise. After: 0/150.</li>
+    <li><b>A test sweeping the process-global pending-application map.</b> Fix: map-parameterised core, private map in the test.</li>
+    <li><b>Filed, not fixed: #290</b> — the helper-test fake engine dies on EMFILE; the containers' soft nofile limit is 1024. Discriminating run: nofile 256 → 20/20 failing runs; nofile 65536 → 0/20.</li>
+  </ol>
+
+  <p>Loop results (lib test binary, default thread count):</p>
+  <table>
+    <thead><tr><th>run</th><th class="num">lib ×30 failures</th><th class="num">ownership beside spawners</th><th class="num">hostile env ×10</th><th>notes</th></tr></thead>
+    <tbody>
+      <tr><td>after env fix only</td><td class="num">3/30</td><td class="num">0/150</td><td class="num">10/10</td><td>failures: artifact lock ×2, #290 hang ×1; hostile: one test still read env</td></tr>
+      <tr><td>+ flock/ladder fixes</td><td class="num">1/30</td><td class="num">0/150</td><td class="num">2/10 → 0/5 direct rerun</td><td>failure: pending-map sweep</td></tr>
+      <tr><td>final</td><td class="num">1/30</td><td class="num">0/150</td><td class="num">0/10</td><td>the one failure is #290 (diag-registration hang); that test alone: 0/200</td></tr>
+    </tbody>
+  </table>
+  <p class="record-note">Full gate: <code>make test-rust</code> ×3 → 1762 passed, 0 failed each. Hostile env = QUASAR_ENCODER=vulkan, QUASAR_RENDER_NODE=/dev/dri/renderD129, QUASAR_CODEC=av1, QUASAR_ABR_LADDER=0, QUASAR_CONTAINER_NETWORK=bridge.</p>
+
+  <h3>Part 2 — #287</h3>
+  <p>Wire field <code>remediation</code> already existed; no field added. Child may print one <code>quasar-probe-remediation:</code> line; only the pixel-mismatch verdict does. Readiness card text, AMD test host, diagnostic knob forcing the tiled (corrupt) path:</p>
+
+  <div class="pair-title">Before — agent at #282</div>
+  <div class="pair-row">
+    <div class="pair-panel single">
+      <img src="287-before-knob-card.png" alt="Readiness card before #287, AMD test host, knob forcing the tiled path">
+    </div>
+  </div>
+  <blockquote>"Check the render node is passed to the agent container, the driver/driver volume, and the agent log for <code>token="host-probe-</code> lines."</blockquote>
+  <div class="pair-caption">AMD test host · pin before <code>631cebb</code> / at #282 (<code>de42f01</code> not yet applied) · diagnostic knob forcing the tiled (corrupt) path · generic remediation text, unrelated to the actual fault</div>
+
+  <div class="pair-title">After — agent at <code>de42f01</code></div>
+  <div class="pair-row">
+    <div class="pair-panel single">
+      <img src="287-after-knob-card.png" alt="Readiness card after #287, AMD test host, knob forcing the tiled path">
+    </div>
+  </div>
+  <blockquote>"The GPU is working — it composited and encoded every probe frame — but the picture that came out of the encoder is wrong, so this GPU is blocked for sessions. To isolate the fault, set QUASAR_ENCODER for this host to another encoder (va, nvenc or openh264) and recreate the agent: if this check then passes, the default encode path is at fault on this GPU and driver. That is a diagnostic step, not a fix. Please report the GPU model, the driver version and the planes named in the summary to the Quasar issue tracker."</blockquote>
+  <div class="pair-caption">AMD test host · pin after <code>631cebb</code>, agent <code>de42f01</code> · same diagnostic knob forcing the tiled (corrupt) path · the pixel-mismatch failure now carries its own remediation</div>
+
+  <div class="pair-title">Knob cleared</div>
+  <div class="pair-row">
+    <div class="pair-panel single">
+      <img src="287-after-noknob-card.png" alt="Readiness card, knob cleared, AMD test host">
+    </div>
+  </div>
+  <div class="pair-caption">AMD test host · pin after <code>631cebb</code>, agent <code>de42f01</code> · knob cleared · check passes, worst plane 0.0003, no remediation shown</div>
+
+  <p class="record-note">Summary line unchanged across before/after: "…25.33% of the decoded u,v samples do not match…".</p>
+
+  <h3>Part 3 — #288</h3>
+  <p>Timeline, AMD test host, run 2 of 3 (all 3 identical in shape):</p>
+  <table>
+    <thead><tr><th>time (UTC)</th><th>source</th><th>event</th><th>admission predicates at that moment</th></tr></thead>
+    <tbody>
+      <tr><td class="num">04:31:58.7217</td><td>agent</td><td>sent register</td><td>—</td></tr>
+      <tr><td class="num">04:31:58.718</td><td>client</td><td>launch → 503 no_host_available</td><td>status online, capacity_detection unavailable, gpus.reported f, totals_fit f</td></tr>
+      <tr><td class="num">04:31:58.7265</td><td>control plane</td><td>agent registered</td><td>(register sets capacity_detection='unavailable', gpus.reported=false)</td></tr>
+      <tr><td class="num">04:31:58.852</td><td>client</td><td>launch → 503 no_host_available</td><td>same</td></tr>
+      <tr><td class="num">04:31:58.987</td><td>client</td><td>launch → 503 no_host_available</td><td>same</td></tr>
+      <tr><td class="num">04:31:59.122</td><td>client</td><td>launch → 503 no_host_available</td><td>same</td></tr>
+      <tr><td class="num">04:31:59.2169</td><td>agent</td><td>host readiness: all checks passed or skipped (28), then capacity report sent</td><td>—</td></tr>
+      <tr><td class="num">04:31:59.2245</td><td>control plane</td><td>agent capacity received</td><td>—</td></tr>
+      <tr><td class="num">04:31:59.257</td><td>client</td><td>launch → 201</td><td>online, ok, reported t, totals_fit t</td></tr>
+    </tbody>
+  </table>
+  <p class="record-note">Window register → capacity received: 498 ms (run 1: 33.572→34.090 = 517 ms by CP log; run 2: 498 ms; run 3: 23.912→24.410 = 498 ms). 4 refusals per run. Readiness gate never involved (no <code>host_not_ready</code>); no hang (not #271). The control plane logged NO admission diagnosis for <code>no_host_available</code> — the exclusion was read from the DB predicates snapshotted after each response. Fable sizing: up to 15 s (handshake cap), typically &lt; 3 s, recurs on every reconnect; readiness rides inside the capacity message by design.</p>
+
+  <p><b>Outcome:</b> inherent → web retries <code>no_host_available</code> up to 20 s at 1 s with its own copy; NoHostRejection logs fleet counts (response unchanged); DB test <code>TestRegisterToCapacityWindowRefusesThenAdmits</code> pins the transition and the fail-open rule; harness waits now require <code>capacity_detection == ok</code> (registered ≠ reported). Gates: test-web, test-go, test-db, verify, preflight, leak scan — green on <code>683b4d1</code> and again on <code>9066bf6</code>. Harness: AMD 104/0/1, NVIDIA 97/0/4 (= reference).</p>
+
+  <p class="record-note">Visual check (the copy is new UI text): the #288 control plane was run on the development container with NO host connected, so every launch is refused <code>no_host_available</code>.</p>
+
+  <div class="pair-title">Visual check — development container, no host connected</div>
+  <div class="pair-row">
+    <div class="pair-panel">
+      <div class="pair-label">Waiting</div>
+      <img src="288-waiting.png" alt="Waiting band and toast, no host available">
+    </div>
+    <div class="pair-panel">
+      <div class="pair-label">After 19.3s — final toast</div>
+      <img src="288-final-toast.png" alt="Final launch-failed toast after waiting">
+    </div>
+  </div>
+  <div class="pair-caption">
+    Development container, no host connected · band note "No host is available right now, waiting for one to come online…",
+    toast "Waiting for a host to come online… — Sleep will launch as soon as a host is ready." · after 19.3 s:
+    "Launch failed — No host is available right now. Try again shortly; if it persists, ask your admin to check the host."
+  </div>
+  <p class="record-note">No design-handoff mock covers the pre-launch wait; the copy reuses the existing toast/band components and mirrors the existing capacity_exhausted wording. That stack was torn down (0 containers/volumes/networks).</p>
+
+  <h3>Part 4 — #286</h3>
+  <p>Directory counts, AMD test host, <code>/run/quasar-agent</code>:</p>
+  <table>
+    <thead><tr><th>path</th><th>agent</th><th class="num">before</th><th>during</th><th>after stop / after agent restart</th></tr></thead>
+    <tbody>
+      <tr><td>normal stop</td><td>develop (pre-fix)</td><td class="num">0</td><td>4 (pulse, udev, wayland-1, wayland-1.lock)</td><td>0</td></tr>
+      <tr><td>killed while running</td><td>pre-fix</td><td class="num">0</td><td>4</td><td>3 (udev-&lt;sid&gt;, wayland-1, wayland-1.lock)</td></tr>
+      <tr><td>killed while starting (ends failed/host_lost)</td><td>pre-fix</td><td class="num">3</td><td>5</td><td>4 (both udev dirs + wayland pair)</td></tr>
+      <tr><td>normal stop</td><td>fix <code>64a0615</code></td><td class="num">0</td><td>5 (+ udev-&lt;sid&gt;.owner)</td><td>0</td></tr>
+      <tr><td>killed while running</td><td>fix</td><td class="num">0</td><td>5</td><td>2 (wayland-1, wayland-1.lock only)</td></tr>
+      <tr><td>killed while starting (failed/host_lost)</td><td>fix</td><td class="num">2</td><td>5</td><td>2 (wayland pair only)</td></tr>
+    </tbody>
+  </table>
+  <p class="record-note">Agent log after each fixed restart: <code>token="udev-export-retired" removed=1 unattributable=0 errors=0</code>.</p>
+  <p class="record-note">Planted a markerless <code>udev-*</code> dir and a foreign-owner marker, restarted the fixed agent: both survived; log <code>removed=0 unattributable=2</code>; removed by hand afterwards. Normal-stop cleanup existed all along: <code>Drop for VirtualDevices</code> (the earlier issue comment saying nothing removes it was wrong — corrected on the issue). Wayland socket leftovers are compositor-owned, reused by the next session, bounded — out of scope.</p>
+  <p class="record-note">Gates: test-rust (1777 passed, 0 failed), verify, preflight, leak scan. Harness: AMD 104/0/1 (= reference).</p>
+
+  <p>NVIDIA harness story: first full run 96/1/4 — row 4b's post-recovery launch ended <code>host_lost</code> ("host agent connection lost"); no agent logs survived. Then: <code>--only=4b</code> rerun 19/0/1; full rerun WITH agent/control-plane log capture 97/0/4 (= reference); three <code>--only=4b,4c</code> runs 25/0/1 each. Across those 5 runs: 0 udev-export warnings, 0 panics, and every run shows the pre-existing NVIDIA self-restart <code>cudart-agent-restart-now</code> (the control plane sees 1006 closes). Fable read the diff: no path in #286 can end the process or drop the connection. Verdict: the one failure is <b>UNATTRIBUTED</b> (its logs were not captured), consistent with the pre-existing self-restart race — filed <b>#292</b>. The loops also exposed <b>#291</b> (quasar-media-probe-* runtime dirs leak when the agent dies mid-probe — same class as #286, pre-existing code) and <b>#293</b> (harness scenario to encode the #286 proof).</p>
+
+  <h3>Part 5 — #284</h3>
+  <p>Fork: feature branch off develop <code>631cebb</code>, merge of <code>sync/upstream-stable</code> (upstream stable @ <code>016b4fc</code>, merged not rebased), plus the keymap test's re-sampling hardening (the fix itself was already on develop by content). Patch drift: the fork's five <code>patches/*.patch</code> are byte-identical to <code>deploy/patches/vulkan/</code>; Quasar's 11 <code>gst-wayland-display-*.patch</code> files are an authored record only (copied, never applied). Net production-code delta vs <code>631cebb</code>: <code>rendering.rs</code> cursor hotspot fix, <code>build.rs</code> no longer links libvulkan, <code>vulkan_bridge.c</code> resolves <code>vkDestroySemaphore</code> via proc-address.</p>
+
+  <p>Results (before = pin <code>631cebb</code>, after = <code>0b691b4</code>):</p>
+  <table>
+    <thead><tr><th>check</th><th>AMD before</th><th>AMD after</th><th>NVIDIA before</th><th>NVIDIA after</th></tr></thead>
+    <tbody>
+      <tr><td>H.264 1080p row_std (3 frames)</td><td>0.0,0.0,0.0</td><td>0.0,0.0,0.0</td><td>0.0,0.001,0.0</td><td>0.0,0.0,0.0</td></tr>
+      <tr><td>H.264 720p row_std</td><td>0.0,0.0,0.0</td><td>0.0,0.0,0.0</td><td>—</td><td>—</td></tr>
+      <tr><td>AV1 1440p row_std (vulkanav1enc)</td><td>—</td><td>—</td><td>0.0,0.0,0.0</td><td>0.0,0.0,0.0</td></tr>
+      <tr><td>cursor: crosshair centre − true pointer (px)</td><td>+10.5, +11.5</td><td>−0.5, +0.5</td><td>+8.5, +9.5 (and +7.5, +9.5)</td><td>−0.5, +0.5 (second run; first run −2.5,−1.5 and −3.5,−1.5, frame/query skew)</td></tr>
+      <tr><td>pointer focus on a newly mapped X window</td><td>enter + 12 motion + 2 button</td><td>same</td><td>same</td><td>same</td></tr>
+      <tr><td>keyboard (typed <code>echo keys-ok-284</code> echoed)</td><td>yes</td><td>yes</td><td>yes</td><td>yes</td></tr>
+      <tr><td>audio energy before → during tone</td><td>0 → 1.27</td><td>0 → 1.29</td><td>0 → 1.29</td><td>0 → 1.28</td></tr>
+      <tr><td>agent fds across 10 teardowns</td><td>24 steady</td><td>24 steady</td><td>—</td><td>50 steady</td></tr>
+      <tr><td>encoder</td><td>vulkanh264enc</td><td>vulkanh264enc</td><td>vulkanh264enc / vulkanav1enc</td><td>same</td></tr>
+    </tbody>
+  </table>
+  <p class="record-note">VRAM (NVIDIA, whole GPU): baseline 34 MiB; after sessions 39 MiB; during XFCE 938 / 933 MiB; after each 39 MiB (before-pin and after-pin alike, two after-pin XFCE sessions).</p>
+  <p class="record-note">NVENC fallback smoke (after pin): QUASAR_ENCODER=nvenc → agent "encoder resolved encoder=nvenc source=env", nvh264enc, 1080p 62 fps, row_std 0.0.</p>
+
+  <div class="pair-title">Decoded frames, before (pin <code>631cebb</code>) vs after (pin <code>0b691b4</code>)</div>
+  <div class="pair-row">
+    <div class="pair-panel quarter">
+      <div class="pair-label">AMD 1080p — before</div>
+      <img src="284-b-amd-1080p.png" alt="AMD 1080p decoded frame, before pin">
+    </div>
+    <div class="pair-panel quarter">
+      <div class="pair-label">AMD 1080p — after</div>
+      <img src="284-a-amd-1080p.png" alt="AMD 1080p decoded frame, after pin">
+    </div>
+    <div class="pair-panel quarter">
+      <div class="pair-label">AMD 720p — before</div>
+      <img src="284-b-amd-720p.png" alt="AMD 720p decoded frame, before pin">
+    </div>
+    <div class="pair-panel quarter">
+      <div class="pair-label">AMD 720p — after</div>
+      <img src="284-a-amd-720p.png" alt="AMD 720p decoded frame, after pin">
+    </div>
+  </div>
+  <div class="pair-caption">AMD test host · 1920x1080 and 1280x720 · H.264 · vulkanh264enc · pin before <code>631cebb</code> / after <code>0b691b4</code> · row_std 0.0,0.0,0.0 both sides on both resolutions</div>
+
+  <div class="pair-row">
+    <div class="pair-panel quarter">
+      <div class="pair-label">NVIDIA 1080p H.264 — before</div>
+      <img src="284-b-nv-1080p.png" alt="NVIDIA 1080p decoded frame, before pin">
+    </div>
+    <div class="pair-panel quarter">
+      <div class="pair-label">NVIDIA 1080p H.264 — after</div>
+      <img src="284-a-nv-1080p.png" alt="NVIDIA 1080p decoded frame, after pin">
+    </div>
+    <div class="pair-panel quarter">
+      <div class="pair-label">NVIDIA 1440p AV1 — before</div>
+      <img src="284-b-nv-1440p.png" alt="NVIDIA 1440p AV1 decoded frame, before pin">
+    </div>
+    <div class="pair-panel quarter">
+      <div class="pair-label">NVIDIA 1440p AV1 — after</div>
+      <img src="284-a-nv-1440p.png" alt="NVIDIA 1440p AV1 decoded frame, after pin">
+    </div>
+  </div>
+  <div class="pair-caption">
+    NVIDIA test host · 1920x1080 H.264 vulkanh264enc: row_std 0.0,0.001,0.0 → 0.0,0.0,0.0 ·
+    2560x1440 AV1 vulkanav1enc: row_std 0.0,0.0,0.0 both sides · pin before <code>631cebb</code> / after <code>0b691b4</code>
+  </div>
+
+  <div class="pair-row">
+    <div class="pair-panel single">
+      <div class="pair-label">NVIDIA — NVENC fallback smoke, after pin</div>
+      <img src="284-a-nv-nvenc.png" alt="NVIDIA NVENC fallback decoded frame, after pin">
+    </div>
+  </div>
+  <div class="pair-caption">NVIDIA test host · 1920x1080 · H.264 · nvh264enc (QUASAR_ENCODER=nvenc) · pin after <code>0b691b4</code> · 62 fps, row_std 0.0</div>
+
+  <div class="pair-title">Cursor hotspot crops — red cross vs black crosshair</div>
+  <p class="record-note">In each crop, the red cross marks the TRUE pointer position as read from <code>XQueryPointer</code>; the black crosshair is what the compositor actually drew. Before the fix the black crosshair is offset from the red cross; after the fix they coincide.</p>
+  <div class="pair-row">
+    <div class="pair-panel quarter">
+      <div class="pair-label">AMD — before</div>
+      <img src="284-hotspot-amd-before.png" alt="AMD cursor hotspot crop, before pin">
+    </div>
+    <div class="pair-panel quarter">
+      <div class="pair-label">AMD — after</div>
+      <img src="284-hotspot-amd-after.png" alt="AMD cursor hotspot crop, after pin">
+    </div>
+    <div class="pair-panel quarter">
+      <div class="pair-label">NVIDIA — before</div>
+      <img src="284-hotspot-nv-before.png" alt="NVIDIA cursor hotspot crop, before pin">
+    </div>
+    <div class="pair-panel quarter">
+      <div class="pair-label">NVIDIA — after</div>
+      <img src="284-hotspot-nv-after.png" alt="NVIDIA cursor hotspot crop, after pin">
+    </div>
+  </div>
+  <div class="pair-caption">
+    AMD: crosshair centre − true pointer +10.5,+11.5px before → −0.5,+0.5px after (pin <code>631cebb</code> → <code>0b691b4</code>).
+    NVIDIA: +8.5,+9.5px (and +7.5,+9.5px) before → −0.5,+0.5px after, second run (first run −2.5,−1.5 and −3.5,−1.5, frame/query skew).
+  </div>
+
+  <div class="pair-title">Pointer focus on a newly mapped X window</div>
+  <div class="pair-row">
+    <div class="pair-panel single">
+      <img src="284-focus-window-amd-after.png" alt="Focus window capture, AMD test host, after pin">
+    </div>
+  </div>
+  <div class="pair-caption">AMD test host · pin after <code>0b691b4</code> · enter + 12 motion + 2 button events observed on the newly mapped window · same on NVIDIA and on both pins</div>
+
+  <div class="pair-title">Keyboard — typed command echoed</div>
+  <div class="pair-row">
+    <div class="pair-panel quarter">
+      <div class="pair-label">AMD — before</div>
+      <img src="284-keyboard-b-amd-xfce.png" alt="Keyboard crop, AMD, before pin">
+    </div>
+    <div class="pair-panel quarter">
+      <div class="pair-label">AMD — after</div>
+      <img src="284-keyboard-a-amd-xfce.png" alt="Keyboard crop, AMD, after pin">
+    </div>
+    <div class="pair-panel quarter">
+      <div class="pair-label">NVIDIA — before</div>
+      <img src="284-keyboard-b-nv-xfce.png" alt="Keyboard crop, NVIDIA, before pin">
+    </div>
+    <div class="pair-panel quarter">
+      <div class="pair-label">NVIDIA — after</div>
+      <img src="284-keyboard-a-nv-xfce.png" alt="Keyboard crop, NVIDIA, after pin">
+    </div>
+  </div>
+  <div class="pair-caption">Typed <code>echo keys-ok-284</code>, echoed correctly in all four crops · pin before <code>631cebb</code> / after <code>0b691b4</code></div>
+
+  <p>fd-count series across 10 teardowns:</p>
+  <table>
+    <thead><tr><th>cycle</th><th class="num">0</th><th class="num">1</th><th class="num">2</th><th class="num">3</th><th class="num">4</th><th class="num">5</th><th class="num">6</th><th class="num">7</th><th class="num">8</th><th class="num">9</th><th class="num">10</th></tr></thead>
+    <tbody>
+      <tr><td>AMD, both pins (steady at 24)</td><td class="num">24</td><td class="num">24</td><td class="num">24</td><td class="num">24</td><td class="num">24</td><td class="num">24</td><td class="num">24</td><td class="num">24</td><td class="num">24</td><td class="num">24</td><td class="num">24</td></tr>
+      <tr><td>NVIDIA, after pin (steady at 50)</td><td class="num">50</td><td class="num">50</td><td class="num">50</td><td class="num">50</td><td class="num">50</td><td class="num">50</td><td class="num">50</td><td class="num">50</td><td class="num">50</td><td class="num">50</td><td class="num">50</td></tr>
+    </tbody>
+  </table>
+  <p class="record-note">NVIDIA before-pin fd count was not separately measured (see brief); the "—" cells in the results table above reflect that.</p>
+
+  <p>Fault-harness totals for every run this part touched:</p>
+  <table>
+    <thead><tr><th>run</th><th>AMD (pass/fail/unperformed)</th><th>NVIDIA (pass/fail/unperformed)</th></tr></thead>
+    <tbody>
+      <tr><td>#284</td><td>104/0/1</td><td>97/0/4</td></tr>
+      <tr><td>#288</td><td>104/0/1</td><td>97/0/4</td></tr>
+      <tr><td>#286</td><td>104/0/1</td><td>96/1/4, then 97/0/4</td></tr>
+      <tr><td>reference</td><td>104/0/1</td><td>97/0/4</td></tr>
+    </tbody>
+  </table>
+
+  <p><span class="pill pill-unperformed">UNPERFORMED</span> Bench run: nothing answers on port 9400 on either test host or the development container.</p>
+  <p class="record-note">Unverified (Fable): HEVC on Vulkan, resize/vulkanscale rung steps (heaviest user of the changed semaphore teardown), VA/DMABuf on AMD, CUDA paths beyond the smoke, multi-GPU, hotplug.</p>
+
+  <h2>What went wrong and what I did</h2>
+  <ul class="plain-list">
+    <li>#285 was not one flake but four; each was proven with a discriminating experiment before its fix; the fourth is out of scope and filed (#290).</li>
+    <li>A Sonnet worker skipped part of the #285 scope extension (43 <code>baseline()</code> test sites); caught in review by a hostile-env loop and converted.</li>
+    <li>An ad-hoc test run without <code>core=0</code> dropped a root-owned <code>node-agent/core</code>; removed before staging.</li>
+    <li>#288 first reproduction used http on a TLS stack (308s) — rerun over https.</li>
+    <li>#287/#284 card/cursor capture: first attempts missed (cursor only drawn within 5 s of motion; relative pointer moves are accelerated) — method fixed (near-full-screen probe window, frame right after motion, true pointer from XQueryPointer).</li>
+    <li>The first verify of #288 failed 14 bench checks because the git-excluded quasar-session skill was not linked in that worktree (environment, not code); rerun green after linking.</li>
+    <li>The fd series first read the docker-init wrapper (3 fds); corrected to the agent process.</li>
+    <li>A Haiku pin-consistency check read the wrong worktree; redone by hand.</li>
+    <li>My earlier #286 issue comment claimed nothing removes the udev dir on a normal stop — wrong (Drop does); corrected on the issue.</li>
+  </ul>
+
+  <h2>Not verified</h2>
+  <ul class="plain-list">
+    <li>A native Unraid install (the Unraid host was deliberately not touched).</li>
+    <li>HEVC from a browser (the test browser cannot decode HEVC); HEVC on Vulkan for #284.</li>
+    <li>Intel (no hardware). Multi-GPU hosts. Hotplug.</li>
+    <li>#284: resize/vulkanscale rung steps, VA on AMD, CUDA beyond the NVENC smoke.</li>
+    <li>#288 on NVIDIA (reproduced on AMD only, as the prompt allows).</li>
+    <li>#287 on NVIDIA (the knob is AMD-diagnostic; NVIDIA cannot produce the mismatch).</li>
+    <li>Bench run (quasar-bench unreachable).</li>
+  </ul>
+
+  <h2>Decisions waiting for the owner</h2>
+  <ol class="decisions">
+    <li><b><code>fix/288-post-recreate-placement</code></b> @ <code>9066bf6</code> — recommend land: client-only retry + log-only diagnosis; admission unchanged; open questions: 20 s budget; toast disappears at 4 s (pre-existing #494 behaviour).</li>
+    <li><b><code>fix/286-udev-dir-cleanup</code></b> @ <code>64a0615</code> — recommend land: boot-only, owner-scoped reclaim; follow-up issue for a harness scenario; pre-fix leftovers stay (reclaim by hand / reboot).</li>
+    <li><b><code>chore/284-gwd-upstream-sync</code></b> @ <code>b2d8e51</code> — recommend land (fork develop already = <code>0b691b4</code>); do not delete the fork branch before landing is irrelevant now (develop reaches it); note stale Dockerfile.vulkan comments (lines ~599–637) not edited because they sit in the toolchain stage whose text keys the image content hash.</li>
+    <li><b>#282 ticket wording vs amendment 11</b> (Indeterminate ⇒ keep last definitive result, not <code>warn</code>) — still waiting.</li>
+    <li><b>#290, #291, #292, #293 triage</b> (all filed this run, needs-triage).</li>
+  </ol>
+  <p class="record-note">Nothing from this run was parked.</p>
+
+  <h2>Issues filed this run</h2>
+  <ul class="plain-list">
+    <li>#290 node-agent tests: the helper-test fake engine dies on EMFILE (bug, needs-triage)</li>
+    <li>#291 node-agent: media-probe runtime dir leaks when the agent dies mid-probe (bug, needs-triage)</li>
+    <li>#292 fault harness: row 4b on NVIDIA can fail host_lost when the agent self-restarts after the recovery launch (bug, needs-triage)</li>
+    <li>#293 fault harness: encode the #286 kill-and-restart reclaim as a scenario (enhancement, needs-triage)</li>
+  </ul>
+  <p class="record-note">Tracker state: #281, #282, #272, #285, #287 CLOSED; #288, #286, #284 OPEN, labelled ready-for-human, each with an evidence comment.</p>
+
+  <h2>Fable consults</h2>
+  <table>
+    <thead><tr><th class="num">#</th><th>asked</th><th>said</th><th>what I did</th></tr></thead>
+    <tbody>
+      <tr>
+        <td class="num">1</td>
+        <td>#285 design + ownership flake</td>
+        <td>fork-inheritance diagnosis confirmed (posix_spawn copies the fd table); extend the rule to env READERS (43 baseline() sites) and capacity's internal reads; retry only the held error + /proc/locks on timeout</td>
+        <td>did all of it</td>
+      </tr>
+      <tr>
+        <td class="num">2</td>
+        <td>Two further flakes (pending-map sweep, diag-registration hang)</td>
+        <td>map-parameterised sweep is right and sufficient; the hang is a dead fixture engine under fd pressure — file, don't fix; experiment: nofile 256 vs 65536</td>
+        <td>confirmed 20/20 vs 0/20, filed #290</td>
+      </tr>
+      <tr>
+        <td class="num">3</td>
+        <td>#285 final diff</td>
+        <td>LAND after removing a stray root-owned core dump and trimming comments</td>
+        <td>did so, landed</td>
+      </tr>
+      <tr>
+        <td class="num">4</td>
+        <td>#288 diagnosis</td>
+        <td>inherent and bounded (≤15 s, typically &lt;3 s, every reconnect); readiness rides in capacity by design — do not split it; fail-open test already exists, add the transition test; web retry with its own 20 s budget, not the 60 s one; fix the harness wait</td>
+        <td>did all of it</td>
+      </tr>
+      <tr>
+        <td class="num">5</td>
+        <td>#286 design</td>
+        <td>sibling marker (not inside the untrusted mount), boot-only inside post-application-retirement, explicit teardown retire + Drop backstop, poisoned-mutex tolerance, no legacy journal reclaim required</td>
+        <td>did it (legacy journal reclaim deliberately left out and noted)</td>
+      </tr>
+      <tr>
+        <td class="num">6</td>
+        <td>#287 final diff</td>
+        <td>LAND with one should-fix (a remediation line after the result)</td>
+        <td>added the test, landed</td>
+      </tr>
+      <tr>
+        <td class="num">7</td>
+        <td>#288 final diff</td>
+        <td>HAND OVER; should-fixes: issue-tag sweep, stale line numbers in test comments, a misnamed anchor test, frozen toast copy on a code flip</td>
+        <td>all fixed in <code>9066bf6</code></td>
+      </tr>
+      <tr>
+        <td class="num">8</td>
+        <td>#286 final diff</td>
+        <td>HAND OVER; should-fixes: sid validation in publish/retire, symlinked/oversized marker tests, log retire errors, correct a doc line; follow-up harness issue</td>
+        <td>all fixed in <code>64a0615</code>; follow-up → #293</td>
+      </tr>
+      <tr>
+        <td class="num">9</td>
+        <td>#284 final review</td>
+        <td>HAND OVER; correction: the sync also carries build.rs + vulkan_bridge.c changes from the av1 branch's merge; stale Dockerfile comments; fast-forward (not merge) fork develop</td>
+        <td>corrected the pins doc (<code>b2d8e51</code>), left the Dockerfile comments for the owner, fast-forwarded</td>
+      </tr>
+      <tr>
+        <td class="num">10</td>
+        <td>#286 NVIDIA row-4b failure</td>
+        <td>no #286 path can drop the connection; host_lost is only the CP seeing the connection close; likely the pre-existing NVIDIA self-restart race; one pass is not enough — read captured logs and loop 4b,4c</td>
+        <td>did: 5 clean runs, every one shows the self-restart, 0 udev warnings, 0 panics; filed #292</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="record-note">No frozen-contract change was needed anywhere (Fable consult point 3 never triggered).</p>
+
+  <h2>Models used</h2>
+  <table>
+    <thead><tr><th>task</th><th>model</th></tr></thead>
+    <tbody>
+      <tr><td>Plan, every review, every gate decision, diagnosis, hardware runs, commits/pushes/landings, tracker</td><td>Opus 5 (primary)</td></tr>
+      <tr><td>#285 implementation (env seams)</td><td>Sonnet</td></tr>
+      <tr><td>#287 implementation</td><td>Sonnet</td></tr>
+      <tr><td>#288 implementation + review follow-ups</td><td>Sonnet</td></tr>
+      <tr><td>#286 implementation + review follow-ups</td><td>Sonnet</td></tr>
+      <tr><td>This report's HTML</td><td>Sonnet</td></tr>
+      <tr><td>#285 comment wording pass</td><td>Haiku</td></tr>
+      <tr><td>#284 pin-consistency check (it read the wrong worktree; redone by hand)</td><td>Haiku</td></tr>
+      <tr><td>The 10 consults/reviews above</td><td>Fable</td></tr>
+    </tbody>
+  </table>
+
+  <footer class="note">Generated from <code>report-brief.md</code>. Every figure above is taken verbatim from that brief; nothing here was computed, rounded, or added independently.</footer>
+
+</div>
+</body>
+</html>
