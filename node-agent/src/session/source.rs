@@ -105,7 +105,7 @@ pub struct SessionResources {
     runtime_dir: String,
     /// Set by an [`AppSource`] (any generation, via its clone of this `Arc`) when an app
     /// container's stop could not be confirmed. `SessionResources::drop` reads it to
-    /// decide whether the udev export is safe to retire : with a stop unconfirmed,
+    /// decide whether the udev export is safe to retire: with a stop unconfirmed,
     /// the bind mount's fate is uncertain, so the dir+marker are left for the boot sweep
     /// rather than optimistically removed. Sticky for the session's lifetime — once true,
     /// stays true, the conservative choice.
@@ -1057,7 +1057,7 @@ impl AppSource {
                     token = "application-teardown-pending",
                     "runtime application teardown remains durable: {error}"
                 );
-                // Unconfirmed: block the session-level udev retire  until the
+                // Unconfirmed: block the session-level udev retire until the
                 // boot sweep — see `SessionResources::drop`.
                 self.udev_retire_blocked.store(true, Ordering::Relaxed);
             } else {

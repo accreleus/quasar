@@ -264,7 +264,15 @@ pub fn startup_cleanup(client: &RuntimeClient) -> CleanupAttempt {
                         &crate::session::default_runtime_dir(),
                         &owner,
                     );
-                    if summary.removed > 0 || summary.unattributable > 0 {
+                    if summary.errors > 0 {
+                        warn!(
+                            token = "udev-export-reconcile-errors",
+                            removed = summary.removed,
+                            unattributable = summary.unattributable,
+                            errors = summary.errors,
+                            "boot udev-export reconciliation: {summary:?}"
+                        );
+                    } else if summary.removed > 0 || summary.unattributable > 0 {
                         info!(
                             token = "udev-export-retired",
                             removed = summary.removed,

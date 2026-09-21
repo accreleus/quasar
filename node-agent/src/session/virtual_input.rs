@@ -580,9 +580,12 @@ impl VirtualDevices {
     /// absent in games. World-readable (0755/0644): app containers run as
     /// arbitrary non-root UIDs.
     ///
-    /// Ownership-marked : records the export's `(runtime_dir, session_id)`
-    /// IMMEDIATELY once the directory exists, so a partial export still has a
-    /// path for [`Self::retire_udev_export`] / `Drop` to reclaim, in-process.
+    /// Ownership-marked: records the export's `(runtime_dir, session_id)` only
+    /// once `publish` returns `Ok(Some(_))`. A publish that fails after its
+    /// marker/directory already exist on disk leaves both in place with no
+    /// in-process record to reclaim them — the boot sweep
+    /// ([`super::udev_export::retire_all_owned`]) is what cleans those up, not
+    /// [`Self::retire_udev_export`] / `Drop`.
     pub fn export_udev_data(&self, runtime_dir: &str, session_id: &str) -> Result<()> {
         let owner = crate::container_ownership::token().map_err(|e| anyhow!("owner token: {e}"))?;
         let published =
@@ -1056,9 +1059,7 @@ impl Drop for VirtualDevices {
         if let Some(thread) = self.flush_thread.take() {
             let _ = thread.join();
         }
-        // A poisoned lock here means some other thread panicked while holding it;
-        // aborting the whole process during unwinding to protect that state would
-        // be strictly worse than reading it anyway (see `PoisonError::into_inner`).
+        // Reading a poisoned lock here is safer than aborting during unwinding.
         self.retire_udev_export();
     }
 }

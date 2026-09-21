@@ -158,14 +158,17 @@ fn remove_marker(path: &Path) -> Result<()> {
 /// or a retry of this same call). A missing directory still removes a lingering
 /// marker.
 pub fn retire(runtime_dir: &str, session_id: &str) -> Result<()> {
+    if malformed_session_id(session_id) {
+        return Err(anyhow!("refusing malformed session id {session_id:?}"));
+    }
     remove_export_dir(&export_dir(runtime_dir, session_id))?;
     remove_marker(&marker_path(runtime_dir, session_id))
 }
 
 /// Publish this session's fake-udev records under `runtime_dir`, marking
 /// ownership first. `records` are `(major, minor)` -> serialized udev-db body,
-/// written world-readable exactly as before (app containers run as arbitrary
-/// non-root UIDs).
+/// written world-readable, since app containers run as arbitrary non-root
+/// UIDs.
 ///
 /// Returns the export directory when published, or `None` when the export was
 /// skipped (a foreign/unreadable marker already claims this session id — the
@@ -177,6 +180,9 @@ pub fn publish(
     owner: &str,
     records: &[((u32, u32), String)],
 ) -> Result<Option<PathBuf>> {
+    if malformed_session_id(session_id) {
+        return Err(anyhow!("refusing malformed session id {session_id:?}"));
+    }
     let marker = marker_path(runtime_dir, session_id);
     match read_marker(&marker) {
         Ok(Some(existing)) if existing.owner == owner => {
@@ -477,5 +483,83 @@ mod tests {
             serde_json::from_slice(&std::fs::read(marker_path(runtime_dir, "sid1")).unwrap())
                 .unwrap();
         assert_eq!(marker_body.owner, "owner-a");
+    }
+
+    #[test]
+    fn publish_refuses_a_malformed_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_dir = tmp.path().to_str().unwrap();
+        for sid in ["", "../escape", "a/b", ".."] {
+            let result = publish(runtime_dir, sid, "owner-a", &records());
+            assert!(result.is_err(), "sid {sid:?} should be refused");
+        }
+        // No path traversal outside runtime_dir, and nothing created under it.
+        assert!(std::fs::read_dir(runtime_dir).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn retire_refuses_a_malformed_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_dir = tmp.path().to_str().unwrap();
+        for sid in ["", "../escape", "a/b", ".."] {
+            let result = retire(runtime_dir, sid);
+            assert!(result.is_err(), "sid {sid:?} should be refused");
+        }
+        assert!(std::fs::read_dir(runtime_dir).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn retire_all_owned_leaves_a_symlinked_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_dir = tmp.path().to_str().unwrap();
+        std::fs::create_dir(export_dir(runtime_dir, "sid1")).unwrap();
+        let target = tmp.path().join("elsewhere.owner");
+        std::fs::write(
+            &target,
+            serde_json::to_vec(&Marker {
+                owner: "owner-a".to_string(),
+                session: "sid1".to_string(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        symlink(&target, marker_path(runtime_dir, "sid1")).unwrap();
+
+        let summary = retire_all_owned(runtime_dir, "owner-a");
+        assert_eq!(
+            summary,
+            Summary {
+                removed: 0,
+                unattributable: 1,
+                errors: 0
+            }
+        );
+        assert!(export_dir(runtime_dir, "sid1").is_dir());
+        assert!(marker_path(runtime_dir, "sid1")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn retire_all_owned_leaves_an_oversized_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_dir = tmp.path().to_str().unwrap();
+        std::fs::create_dir(export_dir(runtime_dir, "sid1")).unwrap();
+        let oversized = vec![b'a'; MAX_MARKER_BYTES + 1];
+        std::fs::write(marker_path(runtime_dir, "sid1"), &oversized).unwrap();
+
+        let summary = retire_all_owned(runtime_dir, "owner-a");
+        assert_eq!(
+            summary,
+            Summary {
+                removed: 0,
+                unattributable: 1,
+                errors: 0
+            }
+        );
+        assert!(export_dir(runtime_dir, "sid1").is_dir());
+        assert!(marker_path(runtime_dir, "sid1").is_file());
     }
 }

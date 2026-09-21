@@ -135,7 +135,10 @@ plane is reachable. When successful, watch the logs for the
   that reconciles applications and audio sidecars, and only a marker this agent's
   persistent owner token wrote is ever removed. A directory from before this
   fix carries no marker and is left alone by the sweep — reclaim it by hand, or
-  it is gone at the next host reboot (`/run` is tmpfs). The Wayland socket
+  it is gone at the next host reboot (`/run` is tmpfs). A pair created under a
+  different runtime dir (e.g. `XDG_RUNTIME_DIR` changed between agent lives) is
+  outside the boot sweep's view entirely and is likewise left in place. The
+  Wayland socket
   leftovers (`wayland-N`, `wayland-N.lock`) are a separate, compositor-owned
   case: bounded to one reused name per session and not part of this
   reconciliation.
