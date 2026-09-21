@@ -24,7 +24,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -255,9 +255,10 @@ fn resolve_and_ensure_node(
 /// Host-shared directory holding this session's exported fake-udev records
 /// (`{runtime_dir}/udev-{session_id}`), bind-mounted by the app container at
 /// `/run/udev/data` so SDL/Steam (libudev discovery, not evdev scanning) see the
-/// `--device`-passed gamepad node.
+/// `--device`-passed gamepad node. Thin re-export of [`super::udev_export::export_dir`];
+/// see that module for the ownership-marker lifecycle around this path.
 pub fn udev_export_dir(runtime_dir: &str, session_id: &str) -> PathBuf {
-    PathBuf::from(runtime_dir).join(format!("udev-{session_id}"))
+    super::udev_export::export_dir(runtime_dir, session_id)
 }
 
 /// Read the `major:minor` of an input device's node from sysfs.
@@ -470,8 +471,12 @@ pub struct VirtualDevices {
     /// The devices' fake-udev records (`(major, minor)` + serialized body),
     /// exported for the app container via `export_udev_data`.
     udev_records: Vec<((u32, u32), String)>,
-    /// Where `export_udev_data` published the records (removed on Drop).
-    udev_export_dir: Mutex<Option<PathBuf>>,
+    /// `(runtime_dir, session_id)` once `export_udev_data` has published the
+    /// records — enough to find both the directory and its ownership marker
+    /// (see [`super::udev_export`]). `None` until published, or when publish was
+    /// skipped (foreign/unreadable marker). Retired explicitly by
+    /// [`Self::retire_udev_export`]; `Drop` is only the backstop.
+    udev_export_ids: Mutex<Option<(String, String)>>,
     /// Last gamepad snapshot, for state-on-change diffing (`gp` arrives at frame
     /// rate; only transitions are emitted).
     last_pad: Mutex<PadSnapshot>,
@@ -558,7 +563,7 @@ impl VirtualDevices {
             mouse_path,
             gamepad_path,
             udev_records,
-            udev_export_dir: Mutex::new(None),
+            udev_export_ids: Mutex::new(None),
             last_pad: Mutex::new(PadSnapshot::default()),
             last_abs: Mutex::new(None),
             rel_accum: Mutex::new((0.0, 0.0)),
@@ -568,23 +573,60 @@ impl VirtualDevices {
         })
     }
 
-    /// Publish this session's fake-udev records into `dir` (see `udev_export_dir`)
-    /// so the app container can bind-mount them at `/run/udev/data`: SDL/Steam
-    /// enumerate devices via libudev, not by scanning `/dev/input`, so without
-    /// this the `--device`-passed gamepad is silently absent in games.
-    /// World-readable (0755/0644): app containers run as arbitrary non-root UIDs.
-    pub fn export_udev_data(&self, dir: &Path) -> Result<()> {
-        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("open perms on {}", dir.display()))?;
-        for ((maj, min), body) in &self.udev_records {
-            let path = dir.join(format!("c{maj}:{min}"));
-            std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-                .with_context(|| format!("open perms on {}", path.display()))?;
+    /// Publish this session's fake-udev records under `runtime_dir` (see
+    /// [`udev_export_dir`]) so the app container can bind-mount them at
+    /// `/run/udev/data`: SDL/Steam enumerate devices via libudev, not by scanning
+    /// `/dev/input`, so without this the `--device`-passed gamepad is silently
+    /// absent in games. World-readable (0755/0644): app containers run as
+    /// arbitrary non-root UIDs.
+    ///
+    /// Ownership-marked : records the export's `(runtime_dir, session_id)`
+    /// IMMEDIATELY once the directory exists, so a partial export still has a
+    /// path for [`Self::retire_udev_export`] / `Drop` to reclaim, in-process.
+    pub fn export_udev_data(&self, runtime_dir: &str, session_id: &str) -> Result<()> {
+        let owner = crate::container_ownership::token().map_err(|e| anyhow!("owner token: {e}"))?;
+        let published =
+            super::udev_export::publish(runtime_dir, session_id, &owner, &self.udev_records)?;
+        if published.is_some() {
+            *self
+                .udev_export_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((runtime_dir.to_string(), session_id.to_string()));
         }
-        *self.udev_export_dir.lock().unwrap() = Some(dir.to_path_buf());
         Ok(())
+    }
+
+    /// Idempotent explicit retirement of this session's udev export, called from
+    /// session teardown once the app container's bind mount is confirmed gone —
+    /// see `session::host::SessionHost::teardown`. `Drop` calls the same path as
+    /// a backstop only: `VirtualDevices` is Arc-cloned into GStreamer signal
+    /// closures, so its `Drop` timing is not teardown timing.
+    pub fn retire_udev_export(&self) {
+        let ids = self
+            .udev_export_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((runtime_dir, session_id)) = ids {
+            if let Err(e) = super::udev_export::retire(&runtime_dir, &session_id) {
+                tracing::warn!(
+                    token = "udev-export-retire-failed",
+                    session = %session_id,
+                    "retire udev export dir failed: {e:#}"
+                );
+            }
+        }
+    }
+
+    /// Disarm the in-process retire when the app container's stop went unconfirmed: the
+    /// dir and its marker are then left for the boot sweep, and the `Drop` backstop must
+    /// not remove them early.
+    pub fn abandon_udev_export(&self) {
+        self.udev_export_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 
     fn create_keyboard(tag: &str) -> Result<UInputHandle<File>> {
@@ -1014,9 +1056,10 @@ impl Drop for VirtualDevices {
         if let Some(thread) = self.flush_thread.take() {
             let _ = thread.join();
         }
-        if let Some(dir) = self.udev_export_dir.lock().unwrap().take() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        // A poisoned lock here means some other thread panicked while holding it;
+        // aborting the whole process during unwinding to protect that state would
+        // be strictly worse than reading it anyway (see `PoisonError::into_inner`).
+        self.retire_udev_export();
     }
 }
 

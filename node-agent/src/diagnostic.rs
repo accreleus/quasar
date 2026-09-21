@@ -255,6 +255,28 @@ pub fn startup_cleanup(client: &RuntimeClient) -> CleanupAttempt {
                 warn!(token = "runtime-probe-retirement-pending", %error,
                     "previous host-probe cleanup remains journalled; the maintenance pass and the next probe retry it");
             }
+            // A killed agent never runs a session's udev-export Drop. "Ours"
+            // implies "dead" only here, right after application retirement — never
+            // the periodic maintenance tick.
+            match crate::container_ownership::token() {
+                Ok(owner) => {
+                    let summary = crate::session::udev_export::retire_all_owned(
+                        &crate::session::default_runtime_dir(),
+                        &owner,
+                    );
+                    if summary.removed > 0 || summary.unattributable > 0 {
+                        info!(
+                            token = "udev-export-retired",
+                            removed = summary.removed,
+                            unattributable = summary.unattributable,
+                            errors = summary.errors,
+                            "boot udev-export reconciliation: {summary:?}"
+                        );
+                    }
+                }
+                Err(error) => warn!(token = "udev-retire-no-owner", %error,
+                    "no owner token at boot; skipping udev-export reconciliation"),
+            }
         },
         || crate::agent::legacy_container_sweep(client),
     ) {

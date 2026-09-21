@@ -69,6 +69,8 @@ pub mod source;
 // #488: golden-home template store — path resolution, .meta.json, the reflink/copy
 // clone ladder, atomic publish/remove. Pure filesystem module (see module doc).
 pub mod template;
+// Per-session fake-udev export directory lifecycle (publish/retire/reconcile).
+pub mod udev_export;
 // #260: shared GstVaDisplay FFI. The VA analogue of cuda_share; dlopen's libgstva at
 // runtime, so it adds no link dependency.
 pub mod va_share;
