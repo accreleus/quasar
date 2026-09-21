@@ -256,7 +256,7 @@ pub fn startup_cleanup(client: &RuntimeClient) -> CleanupAttempt {
                     "previous host-probe cleanup remains journalled; the maintenance pass and the next probe retry it");
             }
             // A killed agent never runs a session's udev-export Drop, nor a
-            // media probe's runtime-dir Drop (#291 — the same failure mode, a
+            // media probe's runtime-dir Drop (the same failure mode, a
             // recreate or the NVIDIA agent's own self-restart mid-probe). "Ours"
             // implies "dead" only here, right after application retirement —
             // never the periodic maintenance tick.
@@ -284,7 +284,7 @@ pub fn startup_cleanup(client: &RuntimeClient) -> CleanupAttempt {
                         );
                     }
                     let media_summary = crate::host_probe::media_probe_dir::retire_all_owned(
-                        &crate::session::default_runtime_dir(),
+                        &crate::host_probe::media_probe_dir::probe_parent_dir(),
                         &owner,
                     );
                     if media_summary.errors > 0 {

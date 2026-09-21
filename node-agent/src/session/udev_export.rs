@@ -16,7 +16,7 @@
 //!
 //! The sibling-marker mechanics (write-marker-first, bounded symlink-refusing
 //! read, dir-then-marker retire, owner-scoped boot reconcile) live in
-//! `crate::owned_entry`, shared with `host_probe::media_probe_dir` (#291).
+//! `crate::owned_entry`, shared with `host_probe::media_probe_dir`.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -416,7 +416,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let runtime_dir = tmp.path().to_str().unwrap();
         std::fs::create_dir(export_dir(runtime_dir, "sid1")).unwrap();
-        let oversized = vec![b'a'; 4096 + 1];
+        let oversized = vec![b'a'; owned_entry::MAX_MARKER_BYTES + 1];
         std::fs::write(marker_path(runtime_dir, "sid1"), &oversized).unwrap();
 
         let summary = retire_all_owned(runtime_dir, "owner-a");

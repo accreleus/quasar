@@ -1,7 +1,7 @@
 //! Generic owner-marked runtime-dir entry: `{runtime_dir}/{prefix}{id}` (a
 //! directory) with a sibling ownership proof at `{runtime_dir}/{prefix}{id}.owner`
-//! (a small JSON file). Factored out of `session::udev_export` (#286) so the media
-//! probe's runtime dir (#291) reuses the same mechanics instead of a second copy.
+//! (a small JSON file). Shared by `session::udev_export` and
+//! `host_probe::media_probe_dir` rather than each keeping its own copy.
 //!
 //! The marker is written, synced, and fsynced to its parent BEFORE the entry
 //! directory exists: the durable obligation precedes the thing it obliges. A clean
@@ -21,7 +21,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-const MAX_MARKER_BYTES: usize = 4096;
+pub(crate) const MAX_MARKER_BYTES: usize = 4096;
 
 /// A marker body that carries this entry's owner token. `owner()` is all the
 /// generic reconcile logic needs; the rest of the shape (an id, a session, ...)

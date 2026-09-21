@@ -37,8 +37,8 @@ pub mod logging;
 pub mod memstat;
 pub mod messages;
 pub mod nvidia_volume;
-/// Shared owner-marked runtime-dir entry mechanics (#286 udev export, #291 media
-/// probe dir): see the module doc.
+/// Shared owner-marked runtime-dir entry mechanics (udev export, media probe
+/// dir): see the module doc.
 mod owned_entry;
 pub mod readiness;
 pub mod release;

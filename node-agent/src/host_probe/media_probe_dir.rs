@@ -36,6 +36,20 @@ fn malformed_id(id: &str) -> bool {
     id.is_empty() || id.contains('/') || id.contains("..")
 }
 
+/// Where a probe's runtime dir is acquired, and where the boot sweep must look for
+/// it: the ONE resolver both sides share. `$XDG_RUNTIME_DIR` if it names an
+/// existing directory (the compose path, unchanged); otherwise the fixed
+/// `/tmp/runtime-quasar` (matching `session::default_runtime_dir`'s off-compose
+/// fallback), so a set-but-missing `XDG_RUNTIME_DIR` can no longer make the writer
+/// and the sweep disagree on where a probe dir lives.
+pub fn probe_parent_dir() -> String {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "/tmp/runtime-quasar".to_string())
+}
+
 fn random_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);

@@ -98,11 +98,11 @@ pub fn child_spec(
     })
 }
 
-/// The child's private `XDG_RUNTIME_DIR`: owner-marked (#291) when this process
-/// holds a container-ownership token, so a killed agent's boot reconcile
+/// The child's private `XDG_RUNTIME_DIR`: owner-marked when this process holds a
+/// container-ownership token, so a killed agent's boot reconcile
 /// (`media_probe_dir::retire_all_owned`) can reclaim it; a bare (unmarked)
-/// tempdir otherwise — e.g. a standalone diagnostic invocation that never
-/// acquired ownership has nothing for that reconcile to attribute either.
+/// tempdir otherwise — e.g. when no ownership token can be obtained, there is
+/// nothing for that reconcile to attribute either.
 enum RuntimeDir {
     Owned(ProbeRuntimeDir),
     Bare(tempfile::TempDir),
@@ -124,7 +124,7 @@ impl RuntimeDir {
         if let RuntimeDir::Owned(dir) = self {
             if let Err(e) = dir.retire() {
                 tracing::warn!(
-                    token = "media-probe-runtime-dir-retire-failed",
+                    token = "media-probe-dir-retire-failed",
                     "media probe runtime dir retire failed: {e:#}"
                 );
             }
@@ -137,11 +137,17 @@ fn acquire_runtime_dir(parent: &std::path::Path) -> Result<RuntimeDir> {
         Ok(owner) => {
             media_probe_dir::acquire(&parent.to_string_lossy(), &owner).map(RuntimeDir::Owned)
         }
-        Err(_) => tempfile::Builder::new()
-            .prefix("quasar-media-probe-")
-            .tempdir_in(parent)
-            .map(RuntimeDir::Bare)
-            .context("create the media probe's runtime dir"),
+        Err(_) => {
+            // Unlike `media_probe_dir::acquire` (which creates `parent` itself via
+            // its marker write), `tempdir_in` requires it to exist already.
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+            tempfile::Builder::new()
+                .prefix("quasar-media-probe-")
+                .tempdir_in(parent)
+                .map(RuntimeDir::Bare)
+                .context("create the media probe's runtime dir")
+        }
     }
 }
 
@@ -160,10 +166,7 @@ pub async fn run(
         Some(control) => Some(control.try_acquire_probe()?),
         None => None,
     };
-    let parent = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .filter(|p| p.is_dir())
-        .unwrap_or_else(std::env::temp_dir);
+    let parent = std::path::PathBuf::from(media_probe_dir::probe_parent_dir());
     let mut runtime_dir = match acquire_runtime_dir(&parent) {
         Ok(dir) => dir,
         Err(e) => {
