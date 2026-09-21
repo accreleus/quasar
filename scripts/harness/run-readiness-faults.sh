@@ -44,6 +44,16 @@
 #     GET /v1/admin/activity wraps as {"items": [...]} with per-row
 #     "actor_user_id" (control-plane/internal/audit/store.go).
 #
+# Waits after an agent recreate/start (recreate_agent_with_override,
+# start_real_agent): both block until the new process has registered AND
+# reports capacity_detection == ok (#288), then — NVIDIA only — until the
+# driver-volume/CUDA-runtime provisioners have settled (wait_provisioners_settled,
+# defined just above recreate_agent_with_override), so a post-recovery launch
+# never lands in the window before those provisioners decide whether to
+# self-restart the agent process in place. RECREATED_AT is advanced after each
+# wait that passes; its final value — set only once the settle check itself
+# passes — is the freshness floor for every wait_check_status call.
+#
 # Ownership (spec "Fixtures"): run id RID=rh02h-<8 hex>; compose project $RID;
 # label quasar.harness.owner=$RID on everything the harness creates directly;
 # every host path under /var/lib/$RID; scripted/nested node names $RID-real /
@@ -559,30 +569,23 @@ dedupe_check_ids_file() {
   sort -u "$ALL_CHECK_IDS_FILE" -o "$ALL_CHECK_IDS_FILE" 2>/dev/null || true
 }
 
-# recreate_agent_with_override [override files...] — recreate ONLY the agent and
-# block until the NEW process has registered. RECREATED_AT is then the floor
-# for every freshness wait: the old agent can send one last report between a
-# caller's `since` and its own death, and a launch fired on that report lands
-# while no agent is connected (seen live as a spurious no_host_available).
-RECREATED_AT=0
-recreate_agent_with_override() {
-  local args=(-p "$RID" --env-file "$ENV_FILE" "${COMPOSE_FILES[@]}" -f "$BASE_OVERRIDE")
-  local f t0 waited=0 reg
-  for f in "$@"; do
-    args+=(-f "$f")
-  done
-  t0=$(now_epoch)
-  docker compose "${args[@]}" up -d --force-recreate --no-deps quasar-node-agent || return 1
+# wait_agent_capacity_ok <t0_epoch> <bound_secs> — block until the real agent
+# has (re)registered no earlier than t0 AND reports capacity_detection == ok.
+# Factored out of recreate_agent_with_override/start_real_agent so
+# wait_provisioners_settled (below) can reuse the exact same "is the CURRENT
+# process actually up and reporting" check after observing a self-restart.
+#
+# #288: registered != reported — capacity_detection only flips to "ok" once
+# the new process's first capacity report lands, so a wait on registration
+# alone can launch into the pre-report window and see a spurious
+# no_host_available.
+wait_agent_capacity_ok() {
+  local t0="$1" bound="$2" waited=0 reg
   [ -n "${REAL_HOST_ID:-}" ] || return 0
-  while [ "$waited" -lt 120 ]; do
+  while [ "$waited" -lt "$bound" ]; do
     reg=$(host_json "$REAL_HOST_ID" | jq -r '.host.last_registered_at // empty' | iso_to_epoch)
-    # #288: registered != reported — capacity_detection only flips to "ok" once
-    # the new process's first capacity report lands, so a wait on registration
-    # alone can launch into the pre-report window and see a spurious
-    # no_host_available.
     if [ "${reg:-0}" -ge "$t0" ] && [ "$(host_status "$REAL_HOST_ID")" = "online" ] \
       && [ "$(host_json "$REAL_HOST_ID" | jq -r '.host.capacity_detection // empty')" = "ok" ]; then
-      RECREATED_AT=$(now_epoch)
       return 0
     fi
     sleep 3
@@ -590,25 +593,151 @@ recreate_agent_with_override() {
   done
   return 1
 }
-# start_real_agent — bring the stopped real agent back and do not return until
-# the NEW process has registered and nothing blocks it, so the next scenario
-# never launches into an agent that is still booting (on NVIDIA the first
-# ~20 s are driver-volume adoption). Sets RECREATED_AT like a recreate does.
-start_real_agent() {
-  local t0 waited=0 reg
-  t0=$(now_epoch)
-  compose_cmd start quasar-node-agent >/dev/null 2>&1 || true
-  while [ "$waited" -lt 120 ]; do
-    reg=$(host_json "$REAL_HOST_ID" | jq -r '.host.last_registered_at // empty' | iso_to_epoch)
-    # #288: registered != reported — see recreate_agent_with_override.
-    if [ "${reg:-0}" -ge "$t0" ] && [ "$(host_status "$REAL_HOST_ID")" = "online" ] \
-      && [ "$(host_json "$REAL_HOST_ID" | jq -r '.host.capacity_detection // empty')" = "ok" ]; then
+
+# wait_provisioners_settled <bound_secs> — NVIDIA-only (#292). After a recreate
+# or start, the driver-volume and CUDA-runtime provisioners
+# (node-agent/src/agent.rs spawn_nvidia_volume_provisioner /
+# spawn_cuda_runtime_provisioner, which calls nvidia_volume.rs's restart_for_egl
+# for the driver-volume side) run on their own threads and may decide, AFTER
+# the agent has already registered and reported capacity_detection == ok, to
+# self-restart the process in place (`std::process::exit(0)`, brought back by
+# the container's own restart policy — same container id, new StartedAt). A
+# launch placed in that window can hit host_lost / "host agent connection
+# lost" when the control plane sees the connection close. Settled means ALL of:
+#   - every "-restart-scheduled" token the CURRENT process has logged
+#     (restart_for_egl, spawn_cuda_runtime_provisioner) is followed, later in
+#     that process's own log, by a same-prefix "-restart-deferred". Both
+#     provisioners emit "-restart-deferred" only when THEY lost the
+#     wait_for_quiescence race because the OTHER provision was still in
+#     flight — it is not a per-provisioner "I'm done", so a scheduled restart
+#     with no deferral after it (and no StartedAt change) is still pending:
+#     the other provision may yet finish and let this one through.
+#   - no readiness check on the real host currently reports status
+#     "provisioning" (VolumeView::Provisioning) — nothing is mid-provision
+#     right now, independent of what the log says.
+#   - the CURRENT process has been up for NVIDIA_PROVISIONER_QUIET_S with
+#     neither of the above pending, meaning the provisioner found nothing to
+#     do (`gap.any()` false, NVRTC already current). There is no explicit
+#     "nothing to do" token, so this leg is a bounded heuristic; a provision
+#     still downloading past the window is the case it can miss.
+# The log and StartedAt clock are always the CURRENT process's own: a
+# self-restart (StartedAt advances) is handled by waiting for the NEW process
+# to register and report capacity_detection ok again (wait_agent_capacity_ok,
+# the same thing the callers below already do after a fresh recreate/start),
+# then restarting the settle check from that process's own StartedAt — not by
+# grepping "-restart-now", which may not flush before exit(0). Just before
+# returning settled, the function calls wait_agent_capacity_ok once more
+# against the process it has been watching: it covers a restart that lands
+# between a caller's own capacity wait and this function first reading
+# StartedAt, which this function's own StartedAt-change check would not
+# otherwise catch. A `docker inspect` that yields no StartedAt at all is
+# unperformed (return 1), not a fallback to an unscoped whole-log grep.
+# On timeout this returns 1, exactly like the other bounded waits, so callers
+# turn it into `unperformed` rather than silently continuing into an unsettled
+# host.
+NVIDIA_PROVISIONER_QUIET_S=45
+agent_started_epoch() { # <cid> — the current process's start, epoch seconds
+  docker inspect -f '{{.State.StartedAt}}' "$1" 2>/dev/null | iso_to_epoch
+}
+# provisioners_settled_in_log <log text> — true iff every "<prefix>-agent-
+# restart-scheduled" line (restart_for_egl, spawn_cuda_runtime_provisioner) is
+# followed, later in the same log, by a same-prefix "-restart-deferred" line.
+provisioners_settled_in_log() {
+  local logs="$1" prefix last_sched last_defer
+  for prefix in drvvol cudart; do
+    last_sched=$(printf '%s\n' "$logs" | grep -n "token=\"\\?${prefix}-agent-restart-scheduled" | tail -1 | cut -d: -f1)
+    [ -n "$last_sched" ] || continue
+    last_defer=$(printf '%s\n' "$logs" | grep -n "token=\"\\?${prefix}-agent-restart-deferred" | tail -1 | cut -d: -f1)
+    if [ -z "$last_defer" ] || [ "$last_defer" -le "$last_sched" ]; then
+      return 1
+    fi
+  done
+  return 0
+}
+# any_check_provisioning — true iff the real host currently has a readiness
+# check reporting status "provisioning" (VolumeView::Provisioning, readiness.rs).
+any_check_provisioning() {
+  [ -n "${REAL_HOST_ID:-}" ] || return 1
+  host_json "$REAL_HOST_ID" | jq -e '.host.readiness[]? | select(.status=="provisioning")' >/dev/null 2>&1
+}
+wait_provisioners_settled() {
+  [ "$GPU_VENDOR" = "nvidia" ] || return 0
+  local bound="${1:-120}" waited=0 cid started now logs
+  cid=$(compose_cmd ps -q quasar-node-agent 2>/dev/null || echo "")
+  [ -n "$cid" ] || return 0 # no container to observe -> nothing to wait on
+  started=$(agent_started_epoch "$cid")
+  [ -n "$started" ] || return 1 # no StartedAt -> nothing to scope the log read to
+  while [ "$waited" -lt "$bound" ]; do
+    now=$(agent_started_epoch "$cid")
+    if [ -n "$now" ] && [ "$now" -gt "$started" ]; then
+      # Self-restarted: wait for the new process like a fresh recreate, then
+      # re-check it from its own start.
+      wait_agent_capacity_ok "$now" "$bound" || return 1
       RECREATED_AT=$(now_epoch)
-      break
+      started=$now
+      waited=0
+      continue
+    fi
+    logs=$(docker logs --since "$started" "$cid" 2>&1 || true)
+    if provisioners_settled_in_log "$logs" \
+      && ! any_check_provisioning \
+      && [ $(( $(now_epoch) - started )) -ge "$NVIDIA_PROVISIONER_QUIET_S" ]; then
+      # Re-confirm the process this loop has been watching is still the one
+      # registered and reporting capacity ok before declaring settled.
+      wait_agent_capacity_ok "$started" "$bound" || return 1
+      return 0
     fi
     sleep 3
     waited=$((waited + 3))
   done
+  return 1
+}
+
+# recreate_agent_with_override [override files...] — recreate ONLY the agent and
+# block until the NEW process has registered. RECREATED_AT is then the floor
+# for every freshness wait: the old agent can send one last report between a
+# caller's `since` and its own death, and a launch fired on that report lands
+# while no agent is connected (seen live as a spurious no_host_available).
+#
+# On the NVIDIA test host it also blocks until the driver-volume/
+# CUDA-runtime provisioners have settled (wait_provisioners_settled), so a
+# caller's post-recovery launch never lands in the window between "agent
+# registered + capacity ok" and "provisioner decided to self-restart the
+# process". AMD hosts are unaffected (wait_provisioners_settled is a no-op
+# there).
+RECREATED_AT=0
+recreate_agent_with_override() {
+  local args=(-p "$RID" --env-file "$ENV_FILE" "${COMPOSE_FILES[@]}" -f "$BASE_OVERRIDE")
+  local f t0
+  for f in "$@"; do
+    args+=(-f "$f")
+  done
+  t0=$(now_epoch)
+  docker compose "${args[@]}" up -d --force-recreate --no-deps quasar-node-agent || return 1
+  [ -n "${REAL_HOST_ID:-}" ] || return 0
+  wait_agent_capacity_ok "$t0" 120 || return 1
+  RECREATED_AT=$(now_epoch)
+  wait_provisioners_settled 120 || return 1
+  RECREATED_AT=$(now_epoch)
+  return 0
+}
+# start_real_agent — bring the stopped real agent back and do not return until
+# the NEW process has registered and nothing blocks it, so the next scenario
+# never launches into an agent that is still booting (on NVIDIA the first
+# ~20 s are driver-volume adoption). Sets RECREATED_AT like a recreate does,
+# and — on the NVIDIA test host — does not return until the driver-
+# volume/CUDA-runtime provisioners have settled either (see
+# wait_provisioners_settled above recreate_agent_with_override).
+start_real_agent() {
+  local t0
+  t0=$(now_epoch)
+  compose_cmd start quasar-node-agent >/dev/null 2>&1 || true
+  if wait_agent_capacity_ok "$t0" 120; then
+    RECREATED_AT=$(now_epoch)
+    if wait_provisioners_settled 120; then
+      RECREATED_AT=$(now_epoch)
+    fi
+  fi
   wait_blocking_empty "$REAL_HOST_ID" 180 || true
 }
 compose_cmd() { docker compose -p "$RID" --env-file "$ENV_FILE" "${COMPOSE_FILES[@]}" -f "$BASE_OVERRIDE" "$@"; }
