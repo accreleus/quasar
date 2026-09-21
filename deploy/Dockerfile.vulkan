@@ -338,7 +338,8 @@ RUN git clone --depth 1 --branch "${GST_VERSION}" \
     && git apply /tmp/gstreamer-vulkan-rc-retarget-no-reset.patch \
     && git apply /tmp/vulkanav1enc.patch \
     && git apply /tmp/vulkan-enc-output-state-on-resize.patch \
-    && git apply /tmp/vkenc-bitstream-buffer-pool.patch
+    && git apply /tmp/vkenc-bitstream-buffer-pool.patch \
+    && git apply /tmp/vulkanh265enc-radv-coded-height.patch
 
 # Upstream's docs/meson.build subdir_done() workaround (carried verbatim from
 # games-on-whales/gst-wayland-display's build recipe at the same pin) — with -Ddoc=disabled,

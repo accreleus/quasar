@@ -47,6 +47,7 @@ The remaining GStreamer patches are **Quasar-authored** (not from gst-wayland-di
 - `vulkanav1enc.patch`
 - `vulkan-enc-output-state-on-resize.patch`
 - `vkenc-bitstream-buffer-pool.patch`
+- `vulkanh265enc-radv-coded-height.patch`
 - `vkh265enc-profile-template.patch` (**candidate — not applied**, see below)
 
 They are applied — **in this order** — to a from-source GStreamer `1.28.4`
@@ -68,13 +69,16 @@ its rationale references the AV1 element the eighth patch introduces.
 `vkenc-bitstream-buffer-pool.patch` applies **tenth (last)**: it was diffed against
 `gst-libs/gst/vulkan/gstvkencoder-private.c` with all nine predecessors applied, and that file is
 shaped by the rc-fix, intra-refresh, rc-retarget and output-state-on-resize patches before it.
-None of the ten are upstreamed into GStreamer itself yet.
+`vulkanh265enc-radv-coded-height.patch` applies **eleventh (last)**: it edits the coded-size
+block of `new_sequence()` in `vkh265enc.c` that `vulkanh265enc.patch` and
+`vulkan-enc-output-state-on-resize.patch` shape first.
+None of the eleven are upstreamed into GStreamer itself yet.
 
-`vkh265enc-profile-template.patch` is an **eleventh candidate that is NOT wired into
+`vkh265enc-profile-template.patch` is a **candidate that is NOT wired into
 `deploy/Dockerfile.vulkan` and is therefore NOT applied to any image today.** It is a
 correctness fix for an upstream defect the Quasar encode path already sidesteps by pinning
 `profile=main` in its capsfilter, so it buys nothing for a Quasar image and everything for
-anyone driving `vulkanh265enc` by hand. When it is wired up it would apply **eleventh (last)**: it
+anyone driving `vulkanh265enc` by hand. When it is wired up it would apply **twelfth (last)**: it
 edits `gst_vulkan_h265_encoder_register()` in `vkh265enc.c`, a region no earlier patch
 touches, so its position is a convention rather than a constraint. See its section below.
 
@@ -1402,3 +1406,21 @@ The pointer-enter-refocus patch (Quasar-authored, patches gst-wayland-display �
 Like the other `gst-wayland-display-*` patches this is NOT applied at build time —
 the build compiles the fork branch; this file is the authored record and upstream
 submission source.
+
+### `vulkanh265enc-radv-coded-height.patch`
+
+Quasar-authored (#297). On RADV the HEVC SPS declared a picture VCN never coded. `vulkanh265enc.patch`
+aligns the SPS picture (`self->coded_width/height`) to the largest CTB the driver reports (64 on
+RADV) and crops with a conformance window, but RADV programs VCN from the encode's `codedExtent`
+(the display size) aligned to **64x16**, never from the SPS (`radv_video_enc.c`; radeonsi's VA path
+declares the same 64x16 picture). At 2560x1440 the SPS said 1472 rows while VCN coded 1440, so the
+last CTB row was encoded as a partial CTB and declared as a full one: measured against the source
+picture, rows 0-1343 decoded at 46-47 dB and rows 1408-1439 at 8 dB, and Apple's HEVC decoder
+refused the stream outright (Chrome on macOS: "This stream isn't supported on your device"). 1080
+escaped only because VCN's align(1080,16) = 1088 happens to equal the SPS's align(1080,64). On RADV
+(`VK_DRIVER_ID_MESA_RADV`, read through `vkGetPhysicalDeviceProperties2`) the coded height is now
+aligned to 16, so the SPS matches what VCN codes: 1440, 1200, 720 and 2160 carry no crop, 1080 keeps
+its 8-row crop. Width keeps the 64 CTB alignment (VCN aligns width to 64). Every other driver,
+NVIDIA included, is unchanged. The chosen alignment is logged at INFO (`coded size ... height
+alignment`).
+

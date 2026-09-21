@@ -1,0 +1,68 @@
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
+index 16832ab..9b072c6 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
++++ b/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
+@@ -827,6 +827,34 @@ _h265_get_chroma_subsampling (GstVideoInfo * info)
+   g_assert_not_reached ();
+ }
+ 
++static gboolean
++_vulkan_driver_is_radv (GstVulkanDevice * device)
++{
++  VkPhysicalDeviceDriverProperties driver = {
++    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
++  };
++  VkPhysicalDeviceProperties2 props = {
++    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
++    .pNext = &driver,
++  };
++
++  GstVulkanPhysicalDevice *phys;
++  PFN_vkGetPhysicalDeviceProperties2 get_props2;
++
++  if (!device || !device->physical_device)
++    return FALSE;
++  phys = device->physical_device;
++  if (!gst_vulkan_physical_device_check_api_version (phys, 1, 2, 0))
++    return FALSE;
++  get_props2 = (PFN_vkGetPhysicalDeviceProperties2)
++      gst_vulkan_instance_get_proc_address (phys->instance,
++      "vkGetPhysicalDeviceProperties2");
++  if (!get_props2)
++    return FALSE;
++  get_props2 (phys->device, &props);
++  return driver.driverID == VK_DRIVER_ID_MESA_RADV;
++}
++
+ static GstFlowReturn
+ gst_vulkan_h265_encoder_new_sequence (GstH265Encoder * encoder,
+     GstVideoCodecState * in_state, GstH265Profile profile, guint8 tier,
+@@ -1088,12 +1116,26 @@ gst_vulkan_h265_encoder_new_sequence (GstH265Encoder * encoder,
+     else if (vk_h265_caps->ctbSizes & VK_VIDEO_ENCODE_H265_CTB_SIZE_32_BIT_KHR)
+       ctb_size = 32;
+ 
++    guint align_h = MAX (ctb_size,
++        vk_caps.encoder.caps.encodeInputPictureGranularity.height);
++
++    /* RADV programs VCN from the encode's codedExtent aligned to 64x16, never
++     * from the SPS, so a 64-row SPS alignment declares a picture VCN did not
++     * code: at 1440 the SPS says 1472 while VCN codes 1440, the last CTB row
++     * decodes as garbage and strict decoders reject the stream. Declare what
++     * VCN codes (radeonsi does the same for VA). */
++    if (_vulkan_driver_is_radv (self->device))
++      align_h = 16;
++
+     self->coded_width = GST_ROUND_UP_N (GST_VIDEO_INFO_WIDTH (in_info),
+         MAX (ctb_size,
+             vk_caps.encoder.caps.encodeInputPictureGranularity.width));
+     self->coded_height = GST_ROUND_UP_N (GST_VIDEO_INFO_HEIGHT (in_info),
+-        MAX (ctb_size,
+-            vk_caps.encoder.caps.encodeInputPictureGranularity.height));
++        align_h);
++    GST_INFO_OBJECT (self, "coded size %ux%u for display %ux%u (height "
++        "alignment %u)", self->coded_width, self->coded_height,
++        GST_VIDEO_INFO_WIDTH (in_info), GST_VIDEO_INFO_HEIGHT (in_info),
++        align_h);
+   }
+ 
+   return GST_FLOW_OK;
