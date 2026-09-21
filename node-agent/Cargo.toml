@@ -56,6 +56,9 @@ gstreamer-rtp = { version = "0.25", features = ["v1_20"] }
 # Adaptive external resolution: the typed upstream force-key-unit event used to make
 # the encoder emit an IDR (with headers) right after a live resolution change.
 gstreamer-video = "0.25"
+# #282: the media probe's pixel-verification appsink leg (decodes the probe's own h264
+# output with openh264dec to score it against the compositor's known clear-colour field).
+gstreamer-app = "0.25"
 glib = "0.22"
 
 # P1-5 (container launch): virtual evdev input devices (uinput) so a

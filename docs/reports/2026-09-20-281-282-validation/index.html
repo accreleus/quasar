@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>#281 and #282 — overnight validation</title>
+<style>
+  :root {
+    --bg: #14181d;
+    --panel: #1b2026;
+    --panel-alt: #20262d;
+    --border: #2c333b;
+    --fg: #dfe4ea;
+    --fg-dim: #9aa5b1;
+    --fg-dimmer: #6b7684;
+    --green-bg: #16301f;
+    --green-fg: #6fd88a;
+    --green-border: #2e6b41;
+    --amber-bg: #332a12;
+    --amber-fg: #e0b155;
+    --amber-border: #6b5320;
+    --red-bg: #331616;
+    --red-fg: #e08a8a;
+    --red-border: #6b2c2c;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    background: var(--bg);
+    color: var(--fg);
+    margin: 0;
+    padding: 0;
+  }
+
+  body {
+    font-family: var(--sans);
+    line-height: 1.55;
+    font-size: 15.5px;
+  }
+
+  .wrap {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 32px 28px 80px;
+  }
+
+  h1 {
+    font-size: 1.7rem;
+    margin: 0 0 4px;
+    color: var(--fg);
+  }
+
+  h2 {
+    font-size: 1.25rem;
+    margin: 48px 0 14px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    color: var(--fg);
+  }
+
+  h3 {
+    font-size: 1.02rem;
+    margin: 28px 0 10px;
+    color: var(--fg-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-weight: 600;
+  }
+
+  p { margin: 0 0 12px; }
+
+  .subtitle {
+    color: var(--fg-dim);
+    margin: 0 0 6px;
+    font-size: 0.98rem;
+  }
+
+  .subtitle .date {
+    color: var(--fg-dimmer);
+  }
+
+  .record-note {
+    color: var(--fg-dimmer);
+    font-size: 0.92rem;
+    margin: 0 0 28px;
+  }
+
+  code, pre {
+    font-family: var(--mono);
+  }
+
+  code {
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.05em 0.35em;
+    font-size: 0.9em;
+  }
+
+  pre {
+    background: #0f1216;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 16px;
+    overflow-x: auto;
+    font-size: 0.86rem;
+    line-height: 1.5;
+    color: #c6ccd4;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  /* verdict boxes */
+  .verdicts {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+
+  .verdict-box {
+    flex: 1 1 420px;
+    background: var(--green-bg);
+    border: 1px solid var(--green-border);
+    border-radius: 10px;
+    padding: 20px 22px;
+  }
+
+  .verdict-box h3 {
+    margin: 0 0 10px;
+    color: var(--fg-dim);
+    font-size: 0.95rem;
+  }
+
+  .badge {
+    display: inline-block;
+    font-weight: 700;
+    font-size: 1.35rem;
+    letter-spacing: 0.03em;
+    color: var(--green-fg);
+    background: rgba(111, 216, 138, 0.12);
+    border: 1px solid var(--green-border);
+    border-radius: 6px;
+    padding: 3px 14px;
+    margin-bottom: 12px;
+  }
+
+  .verdict-box p {
+    margin: 0 0 10px;
+    color: var(--fg);
+  }
+
+  .verdict-meta {
+    font-size: 0.86rem;
+    color: var(--fg-dim);
+    margin: 0;
+  }
+
+  .verdict-meta div {
+    margin-bottom: 3px;
+  }
+
+  .verdict-meta b {
+    color: var(--fg);
+    font-weight: 600;
+  }
+
+  /* broken-check list */
+  ul.clean-list {
+    margin: 0 0 12px;
+    padding-left: 22px;
+  }
+
+  ul.clean-list li {
+    margin-bottom: 8px;
+  }
+
+  .emphasis-line {
+    background: var(--green-bg);
+    border: 1px solid var(--green-border);
+    border-left: 4px solid var(--green-fg);
+    border-radius: 4px;
+    padding: 10px 14px;
+    margin: 10px 0;
+    font-family: var(--mono);
+    font-size: 0.9rem;
+    color: var(--green-fg);
+  }
+
+  /* image pairs */
+  .pair-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin: 10px 0 6px;
+  }
+
+  .pair-panel {
+    flex: 1 1 46%;
+    min-width: 280px;
+    max-width: 48%;
+  }
+
+  .pair-panel.single {
+    max-width: 100%;
+    flex-basis: 100%;
+  }
+
+  .pair-panel img {
+    width: 100%;
+    height: auto;
+    display: block;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: #000;
+  }
+
+  .pair-label {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--fg-dimmer);
+    margin: 0 0 6px;
+    font-weight: 600;
+  }
+
+  .pair-caption {
+    font-size: 0.85rem;
+    color: var(--fg-dim);
+    margin: 14px 0 34px;
+    font-family: var(--mono);
+    line-height: 1.6;
+  }
+
+  .pair-title {
+    font-weight: 600;
+    color: var(--fg);
+    font-size: 0.98rem;
+    margin: 30px 0 4px;
+    font-family: var(--sans);
+  }
+
+  @media (max-width: 700px) {
+    .pair-panel { max-width: 100%; flex-basis: 100%; }
+  }
+
+  /* tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 4px 0 26px;
+    font-size: 0.9rem;
+  }
+
+  thead th {
+    text-align: left;
+    background: var(--panel-alt);
+    color: var(--fg-dim);
+    font-weight: 600;
+    padding: 8px 10px;
+    border-bottom: 2px solid var(--border);
+    position: sticky;
+    top: 0;
+  }
+
+  tbody td, tbody th {
+    padding: 7px 10px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+
+  tbody tr:nth-child(even) {
+    background: var(--panel);
+  }
+
+  tbody tr:nth-child(odd) {
+    background: var(--bg);
+  }
+
+  td.num, th.num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    font-family: var(--mono);
+  }
+
+  .pill {
+    display: inline-block;
+    font-size: 0.78rem;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 10px;
+    letter-spacing: 0.02em;
+  }
+
+  .pill-unperformed {
+    background: var(--amber-bg);
+    color: var(--amber-fg);
+    border: 1px solid var(--amber-border);
+  }
+
+  .pill-fail {
+    background: var(--red-bg);
+    color: var(--red-fg);
+    border: 1px solid var(--red-border);
+  }
+
+  .pill-pass {
+    background: var(--green-bg);
+    color: var(--green-fg);
+    border: 1px solid var(--green-border);
+  }
+
+  /* not verified */
+  ul.plain-list {
+    padding-left: 22px;
+    margin: 0 0 12px;
+  }
+
+  ul.plain-list li {
+    margin-bottom: 8px;
+    color: var(--fg);
+  }
+
+  /* decisions */
+  ol.decisions {
+    padding-left: 24px;
+    margin: 0 0 12px;
+  }
+
+  ol.decisions li {
+    margin-bottom: 14px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 16px;
+    list-style: decimal;
+  }
+
+  footer.note {
+    color: var(--fg-dimmer);
+    font-size: 0.8rem;
+    margin-top: 60px;
+    border-top: 1px solid var(--border);
+    padding-top: 16px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>#281 and #282 — overnight validation</h1>
+  <p class="subtitle"><span class="date">2026-09-20</span></p>
+  <p class="record-note">This is a record of overnight validation work. Nothing described here was merged to <code>develop</code>, <code>main</code>, or any other branch owned by this repository.</p>
+
+  <div class="verdicts">
+    <div class="verdict-box">
+      <h3>Part 1 — #281</h3>
+      <div class="badge">PASSED</div>
+      <p>The AMD test host now streams a correct picture on the default Vulkan encoder with nothing configured, and NVIDIA is unchanged in encoder, picture, startup time and VRAM.</p>
+      <div class="verdict-meta">
+        <div><b>Branch head:</b> <code>034d9f9</code> on <code>fix/281-linear-encsrc-default</code></div>
+        <div><b>Fork SHA:</b> <code>631cebb7318596e06de156010055219f4d61a9b3</code></div>
+        <div><b>Fork develop:</b> moved, <code>1ea8092</code> → <code>631cebb</code> (fast-forwarded only after the exercise passed on both vendors)</div>
+      </div>
+    </div>
+    <div class="verdict-box">
+      <h3>Part 2 — #282</h3>
+      <div class="badge">PASSED</div>
+      <p>The media probe now verifies pixels; healthy hosts score 0.0003 on 30 of 30 agent restarts and the reproduced corruption fails 10 of 10 at 0.2533, either side of a 0.01 floor.</p>
+      <div class="verdict-meta">
+        <div><b>Branch head:</b> <code>1ce4fb6</code> on <code>fix/282-media-probe-pixels</code></div>
+        <div><b>Fork SHA:</b> n/a — Part 2 is Quasar-side only</div>
+        <div><b>Fork develop:</b> unaffected by Part 2</div>
+      </div>
+    </div>
+  </div>
+
+  <h2>Is anything broken?</h2>
+  <ul class="clean-list">
+    <li><code>develop</code>: <b>untouched</b>, still <code>fcaaae9</code>. <code>main</code>: <b>untouched</b>. <code>initiative/resilient-host-architecture</code>: <b>untouched</b>. Nothing merged anywhere.</li>
+    <li>Fork <code>develop</code>: <b>moved, deliberately and conditionally</b>, <code>1ea8092</code> → <code>631cebb</code>, the single action the owner authorised on the condition that the live exercise passed on both vendors. It did. Fork branches <code>sync/upstream-stable</code>, <code>fix/keymap-memfd-teardown</code> and <code>patches/vulkan-av1-encode</code> were <b>not</b> touched. Nothing was pushed to <code>games-on-whales</code>, and no upstream PR or issue was opened or commented on.</li>
+    <li>No tags, no published images, no Actions builds, no force-push.</li>
+  </ul>
+
+  <div class="emphasis-line">Both test hosts torn down. Final check on each: containers: 0  volumes: 0  networks(non-default): 0  /run/quasar-agent entries: 0</div>
+  <div class="emphasis-line">The Unraid host was never connected to. No ssh session, no command, no read of the owner's install. No native install anywhere. Docker was never restarted on it.</div>
+
+  <h2>Before/after proof</h2>
+  <p class="record-note">All images are decoded video frames captured with canvas <code>drawImage(video)</code> at the video element's native resolution — not page screenshots. The AMD 1080p/720p "before" images show <code>videotestsrc pattern=smpte100</code> (vertical colour bars); corruption shows as a bright green band along the bottom edge and fine vertical striping inside each bar. The desktop pair is much easier to read by eye.</p>
+
+  <div class="pair-title">AMD desktop (the human-readable one)</div>
+  <div class="pair-row">
+    <div class="pair-panel">
+      <div class="pair-label">Before</div>
+      <img src="amd-desktop-before-corrupt.png" alt="AMD desktop before, corrupt">
+    </div>
+    <div class="pair-panel">
+      <div class="pair-label">After</div>
+      <img src="amd-desktop-after-clean.png" alt="AMD desktop after, clean">
+    </div>
+  </div>
+  <div class="pair-caption">AMD test host · 1920x1080 · H.264 · vulkanh264enc · the same right-click desktop menu before and after · row_std does not apply to a desktop picture, judged by eye</div>
+
+  <div class="pair-title">AMD 1080p default encoder</div>
+  <div class="pair-row">
+    <div class="pair-panel">
+      <div class="pair-label">Before</div>
+      <img src="amd-1080p-before-corrupt.png" alt="AMD 1080p before, corrupt">
+    </div>
+    <div class="pair-panel">
+      <div class="pair-label">After</div>
+      <img src="amd-1080p-after-clean.png" alt="AMD 1080p after, clean">
+    </div>
+  </div>
+  <div class="pair-caption">AMD test host · 1920x1080 · H.264 · vulkanh264enc · before pin 310c03e / after pin 631cebb · row_std 4.176 → 0.000</div>
+
+  <div class="pair-title">AMD 720p default encoder</div>
+  <div class="pair-row">
+    <div class="pair-panel">
+      <div class="pair-label">Before</div>
+      <img src="amd-720p-before-corrupt.png" alt="AMD 720p before, corrupt">
+    </div>
+    <div class="pair-panel">
+      <div class="pair-label">After</div>
+      <img src="amd-720p-after-clean.png" alt="AMD 720p after, clean">
+    </div>
+  </div>
+  <div class="pair-caption">AMD test host · 1280x720 · H.264 · vulkanh264enc · before 310c03e / after 631cebb · row_std 4.553 → 0.000</div>
+
+  <div class="pair-title">AMD, knob forcing tiled, AFTER (the reproduction)</div>
+  <div class="pair-row">
+    <div class="pair-panel single">
+      <div class="pair-label">After, knob-forced tiled</div>
+      <img src="amd-1080p-after-knob-forced-tiled-corrupt.png" alt="AMD 1080p after, knob-forced tiled, corrupt">
+    </div>
+  </div>
+  <div class="pair-caption">AMD test host · 1920x1080 · H.264 · vulkanh264enc · pin 631cebb with WOLF_VULKAN_LINEAR_ENCSRC=0 · row_std 4.494 · proves the knob and the reproduction (no before image — this is the reproduction)</div>
+
+  <div class="pair-title">AMD with VA</div>
+  <div class="pair-row">
+    <div class="pair-panel">
+      <div class="pair-label">Before</div>
+      <img src="amd-1080p-va-before-clean.png" alt="AMD VA before, clean">
+    </div>
+    <div class="pair-panel">
+      <div class="pair-label">After</div>
+      <img src="amd-1080p-va-after-clean.png" alt="AMD VA after, clean">
+    </div>
+  </div>
+  <div class="pair-caption">AMD test host · 1920x1080 · H.264 · vah264enc · before 310c03e / after 631cebb · row_std 0.002 → 0.002 · PSNR 99.0 dB between them: byte-identical</div>
+
+  <div class="pair-title">NVIDIA 1080p H.264</div>
+  <div class="pair-row">
+    <div class="pair-panel">
+      <div class="pair-label">Before</div>
+      <img src="nvidia-1080p-h264-before-clean.png" alt="NVIDIA 1080p H.264 before, clean">
+    </div>
+    <div class="pair-panel">
+      <div class="pair-label">After</div>
+      <img src="nvidia-1080p-h264-after-clean.png" alt="NVIDIA 1080p H.264 after, clean">
+    </div>
+  </div>
+  <div class="pair-caption">NVIDIA test host · 1920x1080 · H.264 · vulkanh264enc · before 310c03e / after 631cebb · row_std 0.000 → 0.000 · PSNR 78.3 dB between them</div>
+
+  <div class="pair-title">NVIDIA 1440p AV1</div>
+  <div class="pair-row">
+    <div class="pair-panel">
+      <div class="pair-label">Before</div>
+      <img src="nvidia-1440p-av1-before-clean.png" alt="NVIDIA 1440p AV1 before, clean">
+    </div>
+    <div class="pair-panel">
+      <div class="pair-label">After</div>
+      <img src="nvidia-1440p-av1-after-clean.png" alt="NVIDIA 1440p AV1 after, clean">
+    </div>
+  </div>
+  <div class="pair-caption">NVIDIA test host · 2560x1440 · AV1 · vulkanav1enc · before 310c03e / after 631cebb · row_std 0.000 → 0.000 · PSNR 99.0 dB: byte-identical</div>
+
+  <div class="pair-title">NVIDIA desktop</div>
+  <div class="pair-row">
+    <div class="pair-panel">
+      <div class="pair-label">Before</div>
+      <img src="nvidia-desktop-before-clean.png" alt="NVIDIA desktop before, clean">
+    </div>
+    <div class="pair-panel">
+      <div class="pair-label">After</div>
+      <img src="nvidia-desktop-after-clean.png" alt="NVIDIA desktop after, clean">
+    </div>
+  </div>
+  <div class="pair-caption">NVIDIA test host · 1920x1080 · H.264 · vulkanh264enc · a terminal opened by keyboard with the typed command echoed back · clean both sides</div>
+
+  <div class="pair-title">The probe's own picture, corrupt</div>
+  <div class="pair-row">
+    <div class="pair-panel single">
+      <img src="probe-picture-corrupt-black-field.png" alt="Probe's own picture, corrupt, flat black field with green corruption">
+    </div>
+  </div>
+  <div class="pair-caption">AMD test host · 1280x720 · H.264 · vulkanh264enc · tiled encode-src · this is what the media probe encodes: the compositor's flat black clear colour, with 25.33% of it flat green. Two distinct colours only: RGB(0,0,0) 74.67%, RGB(0,96,0) 25.33%</div>
+
+  <h2>The readiness card and the refused launch</h2>
+  <p>No UI screenshot was taken: the stacks were torn down before the report was built, and a page screenshot would have risked showing an address. The exact API strings are below.</p>
+
+  <h3>Healthy (AMD test host, after #282, nothing configured)</h3>
+  <pre>pass | GPU 1 composited and encoded frames: encoded 30 frames with vulkanh264enc on
+       /dev/dri/renderD129; the decoded picture matched what the compositor fed in
+       (worst plane 0.0003 over 25 frames)
+gate: {"state": "active", "blocking": []}</pre>
+
+  <h3>Corrupt (same host, WOLF_VULKAN_LINEAR_ENCSRC=0)</h3>
+  <pre>STATUS : fail
+SUMMARY: GPU 1 could not composite and encode: vulkanh264enc: the picture did not survive:
+         25.33% of the decoded u,v samples do not match the picture the compositor fed in on
+         /dev/dri/renderD129 (worst plane over 25 decoded frames). The GPU is working — the
+         frames encoded. The fault is in the compositor-to-encoder handoff or in the encoder
+         itself. Set QUASAR_ENCODER for this host to another encoder (va, nvenc or openh264)
+         and recreate the agent: if the picture is then correct, the encode path is at fault.
+BLOCKS : {"scope": "gpu", "gpu_index": 1, "enforced_by": "control_plane"}
+GATE   : {"state":"active","blocking":[{"check_id":"media_probe_gpu1","scope":"gpu",
+          "gpu_index":1,"enforced_by":"control_plane","overridden":false}]}</pre>
+
+  <h3>The launch that was then refused</h3>
+  <pre>{"error":{"code":"host_not_ready","message":"the host that would run this needs its
+ administrator's attention; try again once they have looked at it"}}</pre>
+
+  <h2>Table: live-exercise matrix (Part 1)</h2>
+  <table>
+    <thead><tr><th class="num">#</th><th>host</th><th>item</th><th>result</th></tr></thead>
+    <tbody>
+      <tr><td class="num">1</td><td>AMD</td><td>default encoder resolves to vulkanh264enc</td><td>performed</td></tr>
+      <tr><td class="num">2</td><td>AMD</td><td>compositor picks LINEAR itself, readable superset granted</td><td>performed</td></tr>
+      <tr><td class="num">3</td><td>AMD</td><td>1080p real browser session, decoded frame</td><td>performed — clean</td></tr>
+      <tr><td class="num">4</td><td>AMD</td><td>720p real browser session, decoded frame</td><td>performed — clean</td></tr>
+      <tr><td class="num">5</td><td>AMD</td><td>judged by eye AND numerically</td><td>performed</td></tr>
+      <tr><td class="num">6</td><td>AMD</td><td>≥2 consecutive sessions, clean teardown each</td><td>performed — three</td></tr>
+      <tr><td class="num">7</td><td>AMD</td><td>mouse, keyboard, audio</td><td>performed</td></tr>
+      <tr><td class="num">8</td><td>AMD</td><td>knob forcing tiled ⇒ corrupt again</td><td>performed</td></tr>
+      <tr><td class="num">9</td><td>AMD</td><td>QUASAR_ENCODER=va still clean</td><td>performed — byte-identical</td></tr>
+      <tr><td class="num">10</td><td>AMD</td><td>encode_ms linear vs tiled</td><td>performed</td></tr>
+      <tr><td class="num">11</td><td>NVIDIA</td><td>fallback warning once per session</td><td>performed</td></tr>
+      <tr><td class="num">12</td><td>NVIDIA</td><td>same encoder as baseline</td><td>performed</td></tr>
+      <tr><td class="num">13</td><td>NVIDIA</td><td>readable superset retained (external_resize_supported: true)</td><td>performed</td></tr>
+      <tr><td class="num">14</td><td>NVIDIA</td><td>clean 1080p H.264</td><td>performed</td></tr>
+      <tr><td class="num">15</td><td>NVIDIA</td><td>clean 1440p AV1</td><td>performed</td></tr>
+      <tr><td class="num">16</td><td>NVIDIA</td><td>mouse, keyboard, audio</td><td>performed</td></tr>
+      <tr><td class="num">17</td><td>NVIDIA</td><td>startup time not worse</td><td>performed — 1003 ms both</td></tr>
+      <tr><td class="num">18</td><td>NVIDIA</td><td>VRAM steady across ≥2 sessions</td><td>performed</td></tr>
+      <tr><td class="num">19</td><td>NVIDIA</td><td>NVENC fallback smoke</td><td>performed by equivalent procedure</td></tr>
+      <tr><td class="num">20</td><td>NVIDIA</td><td>bench run submitted to quasar-bench</td><td><span class="pill pill-unperformed">UNPERFORMED</span> — nothing answers on port 9400 on this workstation or any lab host, and there is no bench entry in the host config</td></tr>
+      <tr><td class="num">21</td><td>both</td><td>#264 fault harness, no row regression</td><td>performed</td></tr>
+      <tr><td class="num">22</td><td>both</td><td>HEVC from a browser</td><td><span class="pill pill-unperformed">UNPERFORMED</span> — the test browser cannot decode HEVC</td></tr>
+      <tr><td class="num">23</td><td>—</td><td>Intel</td><td><span class="pill pill-unperformed">UNPERFORMED</span> — no hardware; nothing claimed</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Table: encode_ms, AMD test host, 1080p60</h2>
+  <table>
+    <thead><tr><th>encode-src tiling</th><th class="num">run 1 p50</th><th class="num">run 2 p50</th><th class="num">p95 run 1</th><th class="num">p95 run 2</th></tr></thead>
+    <tbody>
+      <tr><td>LINEAR (new default)</td><td class="num">3.003 ms</td><td class="num">3.000 ms</td><td class="num">3.090 ms</td><td class="num">3.109 ms</td></tr>
+      <tr><td>OPTIMAL (forced tiled)</td><td class="num">3.365 ms</td><td class="num">3.353 ms</td><td class="num">3.475 ms</td><td class="num">3.466 ms</td></tr>
+    </tbody>
+  </table>
+  <p class="record-note">LINEAR is ~0.36 ms / ~11% FASTER. This contradicts the prediction the exercise started with. NVIDIA, unaffected (never gets a linear image): 1080p H.264 p50 1.266 → 1.159 ms; 1440p AV1 p50 1.693 → 1.659 ms.</p>
+
+  <h2>Table: startup time and VRAM, NVIDIA test host</h2>
+  <p>Browser time-to-decode: <b>1003 ms before, 1003 ms after.</b></p>
+  <table>
+    <thead><tr><th>point</th><th class="num">before</th><th class="num">after</th></tr></thead>
+    <tbody>
+      <tr><td>before session 1</td><td class="num">34 MiB</td><td class="num">34 MiB</td></tr>
+      <tr><td>during session 1 (1080p H.264)</td><td class="num">779 MiB</td><td class="num">779 MiB</td></tr>
+      <tr><td>after session 1 teardown</td><td class="num">39 MiB</td><td class="num">39 MiB</td></tr>
+      <tr><td>during session 2 (1440p AV1)</td><td class="num">812 MiB</td><td class="num">812 MiB</td></tr>
+      <tr><td>after session 2 teardown</td><td class="num">39 MiB</td><td class="num">39 MiB</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Table: probe score distributions and margins (Part 2)</h2>
+  <p class="record-note">Each population = 10 consecutive agent restarts, each triggering a fresh probe.</p>
+  <table>
+    <thead><tr><th>population</th><th>host</th><th class="num">n</th><th class="num">score (min = max, no variance)</th><th>verdict</th></tr></thead>
+    <tbody>
+      <tr><td>healthy, Vulkan (the #281 default)</td><td>AMD</td><td class="num">10</td><td class="num">0.0003</td><td><span class="pill pill-pass">pass ×10</span></td></tr>
+      <tr><td>healthy, VA</td><td>AMD</td><td class="num">10</td><td class="num">0.0003</td><td><span class="pill pill-pass">pass ×10</span></td></tr>
+      <tr><td>healthy, Vulkan</td><td>NVIDIA</td><td class="num">10</td><td class="num">0.0003</td><td><span class="pill pill-pass">pass ×10</span></td></tr>
+      <tr><td>corrupt (WOLF_VULKAN_LINEAR_ENCSRC=0)</td><td>AMD</td><td class="num">10</td><td class="num">0.2533</td><td><span class="pill pill-fail">fail ×10</span></td></tr>
+    </tbody>
+  </table>
+  <p class="record-note">Floor = <b>0.01</b>, pre-registered from the codec's properties BEFORE the campaign. Margins: healthy is <b>33× below</b> the floor; corrupt is <b>25× above</b> it; the two populations are <b>844×</b> apart.</p>
+
+  <h2>Table: restart loop</h2>
+  <table>
+    <thead><tr><th>configuration</th><th class="num">restarts</th><th class="num">passed</th><th class="num">failed</th><th class="num">false failures</th></tr></thead>
+    <tbody>
+      <tr><td>healthy AMD Vulkan</td><td class="num">10</td><td class="num">10</td><td class="num">0</td><td class="num">0</td></tr>
+      <tr><td>healthy AMD VA</td><td class="num">10</td><td class="num">10</td><td class="num">0</td><td class="num">0</td></tr>
+      <tr><td>healthy NVIDIA Vulkan</td><td class="num">10</td><td class="num">10</td><td class="num">0</td><td class="num">0</td></tr>
+      <tr><td>corrupt AMD (must fail)</td><td class="num">10</td><td class="num">0</td><td class="num">10</td><td>n/a — this is the intended result</td></tr>
+      <tr><td><b>total healthy</b></td><td class="num"><b>30</b></td><td class="num"><b>30</b></td><td class="num"><b>0</b></td><td class="num"><b>0</b></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Table: probe duration, against its 15 s deadline</h2>
+  <table>
+    <thead><tr><th>host</th><th class="num">before #282</th><th class="num">after #282</th><th class="num">delta</th><th class="num">% of budget used after</th></tr></thead>
+    <tbody>
+      <tr><td>AMD</td><td class="num">1.853 s</td><td class="num">1.896 s</td><td class="num">+43 ms (+2.3%)</td><td class="num">12.6%</td></tr>
+      <tr><td>NVIDIA</td><td class="num">2.864 s</td><td class="num">3.155 s</td><td class="num">+291 ms (+10.2%)</td><td class="num">21.0%</td></tr>
+    </tbody>
+  </table>
+  <p class="record-note">Agent log start → last probe finished: AMD 3.01 → 2.91 s; NVIDIA 5.08 → 6.17 s. These are single observations including ordinary start-up variance; report as measured, not as a trend.</p>
+
+  <h2>Table: fault harness totals against the reference</h2>
+  <p class="record-note">Reference is the run recorded at <code>23e995d</code> in <code>docs/reports/rh02-265/rerun-23e995d/</code>.</p>
+  <table>
+    <thead><tr><th>host</th><th>reference</th><th>Part 1 (image 8c5b716)</th><th>Part 2 (image 2cbc009)</th></tr></thead>
+    <tbody>
+      <tr><td>AMD</td><td>104 pass / 0 fail / 1 unperformed</td><td><b>104 / 0 / 1</b></td><td><b>104 / 0 / 1</b></td></tr>
+      <tr><td>NVIDIA</td><td>97 / 0 / 4</td><td><b>97 / 0 / 4</b></td><td><b>97 / 0 / 4</b></td></tr>
+    </tbody>
+  </table>
+  <p class="record-note">No row regression in either part. No harness expectation was edited.</p>
+
+  <h2>Table: gates against the baseline</h2>
+  <p class="record-note">Baseline taken on the untouched branch point <code>fcaaae9</code> before any work started.</p>
+  <table>
+    <thead><tr><th>gate</th><th>baseline</th><th>Part 1 (21524ec)</th><th>Part 2 (1ce4fb6)</th></tr></thead>
+    <tbody>
+      <tr><td>make verify</td><td>rc 0 — 437 / 0 / 0</td><td>rc 0 — 437 / 0 / 0</td><td>rc 0 — 437 / 0 / 0</td></tr>
+      <tr><td>make test-rust</td><td><span class="pill pill-fail">rc 2 — already flaky</span></td><td>rc 0 — 1724 passed, 0 failed, 9 ignored</td><td>rc 0 — 1735 passed, 0 failed, 9 ignored</td></tr>
+      <tr><td>make test-go</td><td><span class="pill pill-unperformed">not taken</span></td><td>rc 0 — 43 packages ok</td><td>rc 0 — 43 packages ok</td></tr>
+      <tr><td>make test-web</td><td><span class="pill pill-unperformed">not taken</span></td><td>rc 0 — 236 files, 3080 tests</td><td>rc 0</td></tr>
+      <tr><td>make preflight</td><td><span class="pill pill-unperformed">not taken</span></td><td>rc 0</td><td>rc 0</td></tr>
+      <tr><td>leak scan tree</td><td><span class="pill pill-unperformed">not taken</span></td><td>clean</td><td>clean</td></tr>
+      <tr><td>leak scan --issues</td><td><span class="pill pill-unperformed">not taken</span></td><td>clean</td><td>clean</td></tr>
+    </tbody>
+  </table>
+  <p class="record-note">The baseline <code>make test-rust</code> was <b>already red on the untouched branch point</b>, and flaky: five consecutive runs gave 3 failures, 1, 1, 1, then a clean pass, with a different test failing each time. Cause: <code>capacity.rs</code> tests call <code>std::env::set_var("QUASAR_ENCODER", …)</code> with no serialisation while <code>session::settings</code> tests read the same process-global value, and Rust runs tests in parallel threads. Filed as <b>#285</b>. Nothing to do with either branch — neither changes that code.</p>
+
+  <h2>What went wrong and what I did</h2>
+  <table>
+    <thead><tr><th class="num">#</th><th>defect</th><th>hypothesis</th><th>result</th><th>fix</th></tr></thead>
+    <tbody>
+      <tr>
+        <td class="num">1</td>
+        <td>Fork change would not compile: cannot borrow profile_list as mutable more than once</td>
+        <td>The new tiling loop keeps both ImageCreateInfo builders alive across iterations so their push_next(&amp;mut …) borrows overlap</td>
+        <td>Confirmed by the compiler</td>
+        <td>Gave the encode-only builder its own byte-identical profile chain; commented as duplication for the borrow checker</td>
+      </tr>
+      <tr>
+        <td class="num">2</td>
+        <td>Design would have shipped a check blind to the defect it exists for</td>
+        <td>A review pass claimed the #272 signature on a black field is chroma-only and my Y-only metric would score ~0</td>
+        <td>Confirmed independently by arithmetic: RGB(0,96,0) is Y 16, Cb 0, Cr 0 — luma identical to clean black, in both range conventions</td>
+        <td>Rewrote the metric to score all three planes and name the plane that tripped. On hardware every corrupt run named u,v</td>
+      </tr>
+      <tr>
+        <td class="num">3</td>
+        <td>My first Indeterminate ruling had a block-lifting hole</td>
+        <td>Run 1 fails (block set), run 2's decoder times out, "stay pass" would clear the block on no evidence</td>
+        <td>Confirmed against amendment 11, which forbids it in terms</td>
+        <td>Retain the last definitive result instead; the existing parent plumbing already does this for exit code 3, so no new code</td>
+      </tr>
+      <tr>
+        <td class="num">4</td>
+        <td>First fault-harness run on AMD failed 3 rows in scenario 2a (no_host_available, gpus=[])</td>
+        <td>Environment: daemon log showed CDI: … couldn't initialize inotify: too many open files; fs.inotify.max_user_instances is 128 and two stacks plus the harness's nested engines exhausted it</td>
+        <td>Confirmed</td>
+        <td>Tore down the cohabiting stack and reran clean: 104/0/1. The kernel limit belongs to the Unraid host and was <b>not</b> touched</td>
+      </tr>
+      <tr>
+        <td class="num">5</td>
+        <td>Two launches returned no_host_available right after an agent recreate</td>
+        <td>Transient; the host was online, unblocked and had free slots seconds later</td>
+        <td>Not root-caused</td>
+        <td>Added a settle wait after a recreate. Out of scope; recorded as an observation</td>
+      </tr>
+      <tr>
+        <td class="num">6</td>
+        <td>encode_ms tiled/linear gap looked like an outlier</td>
+        <td>—</td>
+        <td>Re-measured; both arms reproduced to within 0.012 ms</td>
+        <td>Believed it</td>
+      </tr>
+      <tr>
+        <td class="num">7</td>
+        <td>Accidentally pushed a temporary WIP commit as the #282 branch head</td>
+        <td>A failed rebase left a detached HEAD, so the real commit was not on the branch ref</td>
+        <td>Confirmed</td>
+        <td>Repaired without a force-push: carried the real tree forward and merged, so the accident stays visible in the history instead of being erased</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>Regression tests added: 11 net new tests in <code>probe_media.rs</code> — the metric on synthetic frames (identical / lossy-like noise / column displacement / flat green region / black / white, asserting the ordering), every Indeterminate path, the range-from-caps rule, and a guard that the check id and its <code>blocks</code> have not moved.</p>
+  <p>Issues filed: <b>#285</b> (flaky <code>make test-rust</code> from unserialised env mutation) and <b>#286</b> (a session that dies <code>host_lost</code> mid-start leaves its <code>udev-*</code> directory in <code>/run/quasar-agent</code> forever — found by looking, invisible to the harness by design; the specimen was removed at teardown).</p>
+
+  <h2>Not verified</h2>
+  <ul class="plain-list">
+    <li>A native Unraid install — the owner's machine was never connected to, by instruction.</li>
+    <li>HEVC in a browser — the test browser cannot decode it.</li>
+    <li>Intel — no hardware in the lab; nothing is claimed.</li>
+    <li>Multi-GPU placement.</li>
+    <li>The quasar-bench run (pins-policy item 2) — unreachable, see matrix row 20.</li>
+    <li>The pixel check verifies h264 only, because that is all the probe asks for. HEVC and AV1 corruption remain unverified by it on every vendor.</li>
+    <li>A driver that accepts a LINEAR encode-src and then corrupts at encode time — no allocation-time fallback can see that.</li>
+    <li>The luma half of #272 (column displacement) is invisible on the probe's flat black field by construction and always will be with this picture.</li>
+    <li>A picture that is uniformly wrong in a way the per-plane level check misses would still pass.</li>
+    <li>make nvenc-fallback-smoke itself was not run — its two load-bearing assertions were made directly instead, because the harness targets a host's standard stack and tonight's stacks were on isolated ports.</li>
+  </ul>
+
+  <h2>Decisions waiting for you</h2>
+  <ol class="decisions">
+    <li><b>Land fix/281-linear-encsrc-default</b> (head <code>034d9f9</code>) onto <code>develop</code>. The live exercise passed on both vendors; fork <code>develop</code> already carries the commit.</li>
+    <li><b>Land fix/282-media-probe-pixels</b> (head <code>1ce4fb6</code>, contains #281). It is a blocking check, so this is the one that changes what happens to a host that fails.</li>
+    <li><b>#282's contract discrepancy.</b> Its acceptance text says an Indeterminate verification maps to <code>warn</code>; the frozen contract makes <code>warn</code> unavailable to a check that carries <code>blocks</code>. The contract was followed and nothing frozen was touched. The ticket's text needs amending or the ruling needs confirming.</li>
+    <li><b>The generic remediation string on a pixel mismatch.</b> It still says "check the render node is passed to the agent container" when the frames demonstrably encoded. Fixing it properly widens the child probe's stdout contract; recorded rather than done.</li>
+    <li><b>#285</b> and <b>#286</b>, both filed tonight, both <code>needs-triage</code>.</li>
+    <li><b>#284</b>: sync/upstream-stable merges cleanly on top of #281, the keymap fix is already on fork develop by content (only the test hardening is missing), and merging the sync branch resolves the one drifted patch (vulkanh265enc.patch) in Quasar's favour by itself.</li>
+  </ol>
+
+  <h2>The Fable consults</h2>
+  <p class="record-note">Three consults, all with the question, the code, the evidence, the constraints, and what I would have done by default.</p>
+  <table>
+    <thead><tr><th class="num">#</th><th>asked</th><th>said</th><th>what I did</th></tr></thead>
+    <tbody>
+      <tr>
+        <td class="num">1</td>
+        <td>Is the #281 allocation-ladder reorder right, and does the encode-src path really always copy?</td>
+        <td>The regression is real; tiling-outer/flags-inner is the right shape; add a per-device latch so a ring cannot split across two tilings; agreed the encode-src path always copies; predicted no encode_ms win and a possible modest regression</td>
+        <td>Adopted the ladder and the latch. Declined its suggestion to probe capabilities up front (more code, more risk, the ladder is enough). Its encode_ms prediction was <b>wrong</b> — measured 11% faster — and the report says so</td>
+      </tr>
+      <tr>
+        <td class="num">2</td>
+        <td>Review the #282 tolerance design before any code</td>
+        <td>Caught that my Y-only metric would score ~0 on #272 (chroma-only on a flat field), that median-of-5 was too thin a sample, that my pass-on-Indeterminate ruling had a block-lifting hole, and that the tolerances should be pre-registered from the codec rather than tuned</td>
+        <td>Adopted all four, plus its implementation warnings (stride vs width, chroma plane geometry, range from caps, bus-error attribution, EOS/drain). Declined only its suggestion to give the compositor a background-colour property — a fork change that would have entangled #281's exercise with this one</td>
+      </tr>
+      <tr>
+        <td class="num">3</td>
+        <td>(not needed) A third consult on a surprising hardware result was not required</td>
+        <td>—</td>
+        <td>No hardware result contradicted the prompt's predictions except encode_ms, which was re-measured and believed</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="record-note">Everything either consult claimed about the code was re-read and confirmed before being acted on.</p>
+
+  <h2>Models used</h2>
+  <table>
+    <thead><tr><th>task</th><th>model</th></tr></thead>
+    <tbody>
+      <tr><td>Plan, every review, every gate, all hardware work, every commit, push and tracker action</td><td>Claude Opus 5 (1M context)</td></tr>
+      <tr><td>The fork change (vulkan_share.rs) against my written spec</td><td>Claude Sonnet — then compile-fixed and reviewed line by line by Opus</td></tr>
+      <tr><td>The #282 probe implementation against my written design</td><td>Claude Sonnet — then reviewed, with one dead metric removed, by Opus</td></tr>
+      <tr><td>The Quasar-side #281 documentation edits</td><td>Claude Sonnet</td></tr>
+      <tr><td>This HTML report, from this brief</td><td>Claude Sonnet</td></tr>
+      <tr><td>Design advice and higher-level planning (3 consults)</td><td>Claude Fable 5.1</td></tr>
+    </tbody>
+  </table>
+  <p class="record-note">No Haiku sub-agent was used: the link and pin-consistency checks it was earmarked for were single commands that were faster to run directly than to delegate.</p>
+
+  <footer class="note">Generated from <code>report-brief.md</code>. Every figure above is taken verbatim from that brief; nothing here was computed, rounded, or added independently.</footer>
+
+</div>
+</body>
+</html>
