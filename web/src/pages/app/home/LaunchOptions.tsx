@@ -22,6 +22,8 @@ export interface LaunchOptionsProps {
   verdict: Verdict;
   launching: boolean;
   waitingForSlot: boolean;
+  /** #288: "slot" (capacity_exhausted) vs "host" (no_host_available). */
+  waitingReason?: "slot" | "host" | null;
   onSelectCodec: (codec: DraftCodec) => void;
   onSelectFps: (fps: number) => void;
   onSelectHeight: (height: number) => void;
@@ -41,6 +43,7 @@ export function LaunchOptions({
   verdict,
   launching,
   waitingForSlot,
+  waitingReason = "slot",
   onSelectCodec,
   onSelectFps,
   onSelectHeight,
@@ -48,7 +51,13 @@ export function LaunchOptions({
   onPlay,
   closeRef,
 }: LaunchOptionsProps) {
-  const playLabel = waitingForSlot ? "Waiting for a slot…" : launching ? "Launching…" : "Play now";
+  const playLabel = waitingForSlot
+    ? waitingReason === "host"
+      ? "Waiting for a host…"
+      : "Waiting for a slot…"
+    : launching
+      ? "Launching…"
+      : "Play now";
   return (
     <div className={`lo${open ? " show" : ""}`} id={id} aria-label="Launch options">
       <div className="qp-head">

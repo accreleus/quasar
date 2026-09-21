@@ -11,7 +11,11 @@ import { ApiError } from "../../../api/client";
 import type { App, ProfilesResponse, Session } from "../../../api/types";
 import { useToast } from "../../../components/Toast";
 import { playoutOverride } from "../../../webrtc/playout";
-import { decideCapacityRetry } from "../capacityRetry";
+import {
+  MAX_NO_HOST_RETRY_WAIT_MS,
+  NO_HOST_RETRY_DELAY_MS,
+  decideCapacityRetry,
+} from "../capacityRetry";
 import { isRecommendationEligible } from "../launchOptions";
 import { presentLaunchError } from "../libraryGrid";
 
@@ -63,8 +67,13 @@ export interface UseLaunchOptions {
 
 export interface UseLaunch {
   launching: boolean;
-  /** #494: retrying a `capacity_exhausted` bounce rather than failing. */
+  /** #494/#288: retrying a `capacity_exhausted` or `no_host_available` bounce
+   *  rather than failing. */
   waitingForSlot: boolean;
+  /** Which bounce is being retried, so callers can render copy that doesn't
+   *  claim a slot is being freed when it's really a host coming online (#288).
+   *  `null` when not waiting. */
+  waitingReason: "slot" | "host" | null;
   /** The app whose profiles the one-click path is evaluating right now. */
   resolvingId: string | null;
   launchApp: (
@@ -87,6 +96,7 @@ export function useLaunch({
   const { addToast, removeToast } = useToast();
   const [launching, setLaunching] = useState(false);
   const [waitingForSlot, setWaitingForSlot] = useState(false);
+  const [waitingReason, setWaitingReason] = useState<"slot" | "host" | null>(null);
   const [resolvingId, setResolvingId] = useState<string | null>(null);
 
   // #494's retry loop schedules a setTimeout outliving a single render; this
@@ -119,6 +129,7 @@ export function useLaunch({
       if (!token || launching) return;
       setLaunching(true);
       setWaitingForSlot(false); // clear any stale copy from a previous attempt
+      setWaitingReason(null);
       const req: libraryApi.LaunchRequest = { app_id: app.id, mic: true };
       if (profileId) req.profile_id = profileId;
       if (streamCodec) req.stream = { codec: streamCodec };
@@ -169,21 +180,40 @@ export function useLaunch({
           });
           return;
         } catch (err) {
-          if (err instanceof ApiError && err.code === "capacity_exhausted") {
+          if (
+            err instanceof ApiError &&
+            (err.code === "capacity_exhausted" || err.code === "no_host_available")
+          ) {
+            const reason: "slot" | "host" =
+              err.code === "no_host_available" ? "host" : "slot";
             const now = Date.now();
+            // One anchor for the whole wait, even across a code flip (#288):
+            // a no_host_available bounce that turns into capacity_exhausted
+            // (or vice versa) must not reset the elapsed clock.
             if (firstBounceAt === null) firstBounceAt = now;
-            const decision = decideCapacityRetry({
-              elapsedMs: now - firstBounceAt,
-              retryAfterSeconds: err.retryAfterSeconds,
-            });
+            const decision = decideCapacityRetry(
+              {
+                elapsedMs: now - firstBounceAt,
+                retryAfterSeconds: err.retryAfterSeconds,
+              },
+              reason === "host" ? MAX_NO_HOST_RETRY_WAIT_MS : undefined,
+              reason === "host" ? NO_HOST_RETRY_DELAY_MS : undefined,
+            );
             if (decision.kind === "retry") {
               if (!mountedRef.current) return;
               setWaitingForSlot(true);
+              setWaitingReason(reason);
               if (waitingToastId === null) {
                 waitingToastId = addToast({
                   variant: "info",
-                  title: "Waiting for a slot to free up…",
-                  body: `${app.name} will launch as soon as one is free.`,
+                  title:
+                    reason === "host"
+                      ? "Waiting for a host to come online…"
+                      : "Waiting for a slot to free up…",
+                  body:
+                    reason === "host"
+                      ? `${app.name} will launch as soon as a host is ready.`
+                      : `${app.name} will launch as soon as one is free.`,
                 });
               }
               try {
@@ -222,6 +252,7 @@ export function useLaunch({
           }
           setLaunching(false);
           setWaitingForSlot(false);
+          setWaitingReason(null);
           return;
         }
       }
@@ -274,7 +305,7 @@ export function useLaunch({
   // Memoised: the page hands this object to `useCallback` dependency lists, and
   // a fresh object every render would make every one of them inert.
   return useMemo(
-    () => ({ launching, waitingForSlot, resolvingId, launchApp, quickLaunch }),
-    [launching, waitingForSlot, resolvingId, launchApp, quickLaunch],
+    () => ({ launching, waitingForSlot, waitingReason, resolvingId, launchApp, quickLaunch }),
+    [launching, waitingForSlot, waitingReason, resolvingId, launchApp, quickLaunch],
   );
 }

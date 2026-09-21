@@ -272,6 +272,7 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	if err != nil {
 		c.logVramVetoRejection(userID, app.ID, err)
 		c.logHostNotReadyRejection(userID, app.ID, err)
+		c.logNoHostRejection(userID, app.ID, err)
 		return LaunchResult{}, err
 	}
 	c.log.Info("session assigned", "session_id", sess.ID, "host_id", deref(sess.HostID), "gpu_index", derefI32(sess.GPUIndex),
@@ -649,6 +650,23 @@ func (c *Coordinator) logHostNotReadyRejection(userID, appID string, err error) 
 			"readiness_block_homes", g.BlockHomes,
 			"readiness_blocked_gpu", g.GPUBlocked)
 	}
+}
+
+// logNoHostRejection makes a no_host_available refusal diagnosable (#288): the
+// response names no host, so this is the only place the fleet counts behind
+// it appear. A nil or non-NoHostRejection error is a no-op.
+func (c *Coordinator) logNoHostRejection(userID, appID string, err error) {
+	var rej *NoHostRejection
+	if !errors.As(err, &rej) {
+		return
+	}
+	c.log.Info("launch refused: no host available",
+		"user_id", userID,
+		"app_id", appID,
+		"online_hosts", rej.OnlineHosts,
+		"hosts_capacity_not_ok", rej.HostsCapacityNotOK,
+		"gpus_unreported", rej.GPUsUnreported,
+		"hosts_recently_registered", rej.HostsRecentlyRegistered)
 }
 
 // dispatchAssignStart performs the two-step agent handshake: assign, then start.

@@ -105,6 +105,20 @@ without them).
 | `QUASAR_PLATFORM_WEBHOOK_HOSTS` | unset | Optional comma-separated host allowlist **narrowing** where a release notification may be POSTed (#123). Unset means "whatever host the admin configured", which is already contained: delivery is **https only**, refuses a URL carrying credentials, **follows no redirect**, **refuses at dial any host resolving to a loopback, private, link-local, multicast or unspecified address**, and bounds the response body — the same `internal/outbound` containment `QUASAR_IMAGE_REGISTRY_HOSTS` uses. Set it when the destination should be pinned independently of whoever holds an admin token; a URL whose host is not on the list is refused by name, and the refusal names this variable. **It cannot re-open the private-address guard:** a LAN or loopback receiver is unreachable by design, so a script on the same box needs a public https endpoint (a tunnel, a reverse proxy) in front of it. |
 | `QUASAR_TELEMETRY_RETAIN_INTERVAL` | unset; job default `5m` | How often the `telemetry.retain` job applies the two rules above. A standard job `EnvOverride`: a Go duration that is **authoritative over the admin Jobs page** while it is set (and shown as env-locked there), `0` is the kill switch that stops the job being scheduled at all, and a malformed value falls back to the job row rather than failing startup. One pass deletes in bounded batches, logs one `INFO` line with the counts, and `WARN`s if it took over 30s or could not drain its backlog. **This job is the only thing that deletes session telemetry** — no ingest path prunes, and reaching a terminal state prunes nothing, so with it disabled telemetry grows without bound. |
 
+### Launch admission right after an agent (re)connects (#288)
+
+Right after a host's node agent (re)connects — a recreate, an update, a control-plane
+restart, or a network blip — that host is not placeable until its first capacity report
+arrives, typically well under 3 seconds and never longer than the control plane's 15 s
+websocket handshake cap. A launch that lands in that window gets `503 no_host_available`,
+same as a fleet with genuinely no eligible host. It is **retryable**: the web client
+retries it automatically for up to 20 seconds before showing an error, which comfortably
+covers the window plus one retry. No action is needed unless the refusal persists past
+that — then check that the host's agent is connected. Each such refusal is logged by the
+control plane as `launch refused: no host available`, with the counts of online hosts,
+hosts still awaiting their capacity report, unreported GPUs and hosts registered in the
+last 15 s, so the log says which case it was.
+
 ### Platform release channel (`release_channel`, admin setting, not an env var)
 
 Which platform releases the admin console offers is an **instance setting**, not a

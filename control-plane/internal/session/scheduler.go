@@ -400,7 +400,7 @@ func classifyReject(ctx context.Context, tx pgx.Tx, cand candidacy) error {
 		return fmt.Errorf("classify rejection: %w", err)
 	}
 	if !totalsFit {
-		return ErrNoHostAvailable
+		return noHostRejection(ctx, tx)
 	}
 	// Readiness is diagnosed here, in the position of the veto diagnostic and
 	// never inside totalsQuery, and only claims the refusal when it is the sole
@@ -431,6 +431,48 @@ type ReadinessBlockedCandidate struct {
 	BlockHost  bool
 	BlockHomes bool
 	GPUBlocked bool
+}
+
+// NoHostRejection carries fleet counts for a no_host_available refusal (#288):
+// the window right after an agent (re)connects, where its host is registered
+// but not yet placeable (agentws/store.go marks capacity_detection='unavailable'
+// and gpus.reported=false on register/reconnect, cleared by the agent's first
+// capacity report). It unwraps to ErrNoHostAvailable, so errors.Is and the HTTP
+// status mapping are unchanged; the detail is for the launcher's structured log
+// only — the response must still name no host.
+type NoHostRejection struct {
+	err                     error
+	OnlineHosts             int
+	HostsCapacityNotOK      int // online hosts with capacity_detection != 'ok'
+	GPUsUnreported          int // online hosts' GPUs with reported = false
+	HostsRecentlyRegistered int // online hosts with last_registered_at within 15s
+}
+
+func (e *NoHostRejection) Error() string {
+	return fmt.Sprintf("%v (%d online host(s), %d awaiting capacity, %d unreported GPU(s), %d registered <15s ago)",
+		e.err, e.OnlineHosts, e.HostsCapacityNotOK, e.GPUsUnreported, e.HostsRecentlyRegistered)
+}
+
+func (e *NoHostRejection) Unwrap() error { return e.err }
+
+// noHostRejection attaches fleet counts to ErrNoHostAvailable so the launcher
+// can log why nothing fit. Fail-open on its own query failure: a wrong log
+// beats a wrong refusal, so a query error falls back to the plain error.
+func noHostRejection(ctx context.Context, tx pgx.Tx) error {
+	rej := &NoHostRejection{err: ErrNoHostAvailable}
+	err := tx.QueryRow(ctx, `
+		SELECT
+			(SELECT COUNT(*) FROM hosts WHERE status = 'online'),
+			(SELECT COUNT(*) FROM hosts WHERE status = 'online' AND capacity_detection != 'ok'),
+			(SELECT COUNT(*) FROM gpus g JOIN hosts h ON h.id = g.host_id
+			  WHERE h.status = 'online' AND NOT g.reported),
+			(SELECT COUNT(*) FROM hosts
+			  WHERE status = 'online' AND last_registered_at > now() - interval '15 seconds')
+	`).Scan(&rej.OnlineHosts, &rej.HostsCapacityNotOK, &rej.GPUsUnreported, &rej.HostsRecentlyRegistered)
+	if err != nil {
+		return ErrNoHostAvailable
+	}
+	return rej
 }
 
 // HostNotReadyRejection carries the per-GPU evidence for a readiness refusal. It

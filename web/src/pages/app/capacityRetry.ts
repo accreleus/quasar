@@ -16,9 +16,19 @@ export const DEFAULT_RETRY_DELAY_MS = 5_000;
 /** Total time a launch may sit retrying capacity_exhausted before giving up (#494). */
 export const MAX_CAPACITY_RETRY_WAIT_MS = 60_000;
 
+/** Total time a launch may sit retrying `no_host_available` (#288): the control
+ *  plane's handshake cap is 15s (a reconnecting agent's first `capacity` report
+ *  lands inside that window), so 20s covers the cap plus one extra retry. */
+export const MAX_NO_HOST_RETRY_WAIT_MS = 20_000;
+
 /** Floor between attempts — a `Retry-After: 0` or near-zero remainder must never
  *  become a busy loop against a host that is still full. */
 export const MIN_RETRY_DELAY_MS = 1_000;
+
+/** Default delay for `no_host_available` (no `Retry-After` on this code): the
+ *  window is usually under 3s, so retry sooner than capacity_exhausted's 5s
+ *  default — floored at {@link MIN_RETRY_DELAY_MS}. */
+export const NO_HOST_RETRY_DELAY_MS = MIN_RETRY_DELAY_MS;
 
 export interface CapacityRetryState {
   /** Elapsed since the FIRST capacity_exhausted response, not the most recent —
@@ -44,6 +54,7 @@ export type CapacityRetryDecision =
 export function decideCapacityRetry(
   state: CapacityRetryState,
   maxWaitMs: number = MAX_CAPACITY_RETRY_WAIT_MS,
+  defaultDelayMs: number = DEFAULT_RETRY_DELAY_MS,
 ): CapacityRetryDecision {
   const remainingMs = maxWaitMs - state.elapsedMs;
   if (remainingMs <= 0) {
@@ -53,7 +64,7 @@ export function decideCapacityRetry(
   const requestedMs =
     state.retryAfterSeconds !== undefined && state.retryAfterSeconds >= 0
       ? state.retryAfterSeconds * 1000
-      : DEFAULT_RETRY_DELAY_MS;
+      : defaultDelayMs;
 
   const delayMs = Math.max(Math.min(requestedMs, remainingMs), MIN_RETRY_DELAY_MS);
 
