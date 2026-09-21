@@ -444,14 +444,15 @@ func TestSwapIsNotReadinessGated(t *testing.T) {
 	}
 }
 
-// TestRegisterToCapacityWindowRefusesThenAdmits pins the #288 transition a
+// TestRegisterToCapacityWindowRefusesThenAdmits pins the transition a
 // reconnecting agent walks through: register leaves the host unplaceable
 // (capacity_detection='unavailable', gpus.reported=false — agentws/store.go's
-// markGPUsStaleAndClearVramSQL + the enrollHost/reconnectHost UPDATEs at
-// store.go:52/174/234) until its first capacity report lands. A launch inside
-// that window must fail with ErrNoHostAvailable — retryable, distinct from
-// ErrHostNotReady/ErrCapacityExhausted — and admit again once capacity is
-// reported, honouring the readiness gate's own stale/absent-abstains rule.
+// markGPUsStaleAndClearVramSQL, enrollHost's upsert, and reconnectHostSQL all
+// set this on register/reconnect) until its first capacity report lands. A
+// launch inside that window must fail with ErrNoHostAvailable — retryable,
+// distinct from ErrHostNotReady/ErrCapacityExhausted — and admit again once
+// capacity is reported, honouring the readiness gate's own
+// stale/absent-abstains rule.
 func TestRegisterToCapacityWindowRefusesThenAdmits(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool)
@@ -518,16 +519,19 @@ func TestRegisterToCapacityWindowRefusesThenAdmits(t *testing.T) {
 }
 
 // TestNoHostRejectionCarriesFleetCounts pins the diagnostic attached to a
-// no_host_available refusal (#288): still errors.Is-compatible with
-// ErrNoHostAvailable, and its counts describe the register window correctly.
+// no_host_available refusal (the same register window as
+// TestRegisterToCapacityWindowRefusesThenAdmits): still errors.Is-compatible
+// with ErrNoHostAvailable, and its counts describe the register window
+// correctly.
 func TestNoHostRejectionCarriesFleetCounts(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool)
 	s := seed(t, pool, 4)
 	ctx := context.Background()
 
-	// Mirrors agentws/store.go's register/reconnect SQL (store.go:52/174/234):
-	// capacity unknown until the agent's first `capacity` message lands.
+	// Mirrors agentws/store.go's register/reconnect SQL (markGPUsStaleAndClearVramSQL,
+	// enrollHost's upsert, reconnectHostSQL): capacity unknown until the
+	// agent's first `capacity` message lands.
 	_, err := pool.Exec(ctx, `UPDATE hosts SET capacity_detection = 'unavailable', last_registered_at = now() WHERE id::text = $1`, s.hostID)
 	must(t, err)
 	_, err = pool.Exec(ctx, `UPDATE gpus SET reported = false WHERE host_id = $1`, s.hostID)

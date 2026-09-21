@@ -652,7 +652,7 @@ func (c *Coordinator) logHostNotReadyRejection(userID, appID string, err error) 
 	}
 }
 
-// logNoHostRejection makes a no_host_available refusal diagnosable (#288): the
+// logNoHostRejection makes a no_host_available refusal diagnosable: the
 // response names no host, so this is the only place the fleet counts behind
 // it appear. A nil or non-NoHostRejection error is a no-op.
 func (c *Coordinator) logNoHostRejection(userID, appID string, err error) {

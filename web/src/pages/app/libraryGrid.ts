@@ -233,7 +233,7 @@ export function presentLaunchError<T extends HomeApp & { name: string }>(
       body: "No host available right now — try again shortly.",
     };
   }
-  // #288: reached only once the client's own no_host_available retry budget
+  // Reached only once the client's own no_host_available retry budget
   // (capacityRetry.ts) has run out — this is the final, not the transient, copy.
   if (code === "no_host_available") {
     return {

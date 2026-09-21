@@ -10,6 +10,7 @@ import { Button } from "../../../components/Button";
 import { IconInfo } from "../../../components/icons";
 import { reasonSentences } from "../launchOptions";
 import { UNEXPLAINED } from "./launchOptionRules";
+import type { WaitingReason } from "./useLaunch";
 
 export interface BandNotesProps {
   appName: string;
@@ -26,9 +27,9 @@ export interface BandNotesProps {
   liveSessionId: string | null;
   canDecodeH264: boolean;
   waitingForSlot: boolean;
-  /** #288: "slot" (capacity_exhausted) vs "host" (no_host_available) — the
-   *  latter must not claim a slot is being freed. */
-  waitingReason?: "slot" | "host" | null;
+  /** "slot" (capacity_exhausted) vs "host" (no_host_available) — the latter
+   *  must not claim a slot is being freed. */
+  waitingReason?: WaitingReason | null;
   onRetryProfiles: () => void;
 }
 

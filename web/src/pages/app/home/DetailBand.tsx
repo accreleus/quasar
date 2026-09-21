@@ -23,6 +23,7 @@ import { BandNotes } from "./BandNotes";
 import { LaunchOptions } from "./LaunchOptions";
 import { recommendation } from "./launchOptionRules";
 import { useHeroPalette } from "./useHeroPalette";
+import type { WaitingReason } from "./useLaunch";
 import { useLaunchDraft } from "./useLaunchDraft";
 
 const KIND_LABEL: Record<App["kind"], string> = {
@@ -35,12 +36,12 @@ export interface DetailBandProps {
   app: App;
   codecCaps: ReturnType<typeof probeCodecs>;
   launching: boolean;
-  /** #494/#288: a capacity_exhausted or no_host_available bounce is being
-   *  retried, not shown as failure. */
+  /** #494: a capacity_exhausted or no_host_available bounce is being retried,
+   *  not shown as failure. */
   waitingForSlot?: boolean;
-  /** #288: which bounce, so copy doesn't claim a slot when it's really a host
+  /** Which bounce, so copy doesn't claim a slot when it's really a host
    *  coming online. Defaults to "slot" — the original #494 case. */
-  waitingReason?: "slot" | "host" | null;
+  waitingReason?: WaitingReason | null;
   /** null = evaluation in flight, string = error message, object = loaded. */
   profiles: ProfilesResponse | string | null;
   /** The overlay's open state — the page's one Escape handler owns it. */

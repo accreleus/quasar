@@ -31,8 +31,8 @@ export const MIN_RETRY_DELAY_MS = 1_000;
 export const NO_HOST_RETRY_DELAY_MS = MIN_RETRY_DELAY_MS;
 
 export interface CapacityRetryState {
-  /** Elapsed since the FIRST capacity_exhausted response, not the most recent —
-   *  the budget covers the whole wait, not a per-attempt window. */
+  /** Elapsed since the FIRST retryable response for the current wait, not the
+   *  most recent — the budget covers the whole wait, not a per-attempt window. */
   elapsedMs: number;
   /** Server's `Retry-After` in seconds. `undefined` (no header) falls back to
    *  {@link DEFAULT_RETRY_DELAY_MS}; `0` (retry immediately) does not. */

@@ -331,7 +331,7 @@ describe("presentLaunchError", () => {
     expect(result.body).toBe("No host available right now — try again shortly.");
   });
 
-  it("no_host_available (#288) gets its own final message once the client's retry budget is spent", () => {
+  it("no_host_available gets its own final message once the client's retry budget is spent", () => {
     const result = presentLaunchError(family, gameA, "no_host_available", "raw message");
     expect(result.variant).toBe("danger");
     expect(result.title).toBe("Launch failed");
