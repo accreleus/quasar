@@ -101,7 +101,15 @@ pub struct SessionResources {
     /// swap, this state must not.
     pub input_state: Arc<InputState>,
     pulse: Option<PulseSidecar>,
+    session_id: String,
     runtime_dir: String,
+    /// Set by an [`AppSource`] (any generation, via its clone of this `Arc`) when an app
+    /// container's stop could not be confirmed. `SessionResources::drop` reads it to
+    /// decide whether the udev export is safe to retire: with a stop unconfirmed,
+    /// the bind mount's fate is uncertain, so the dir+marker are left for the boot sweep
+    /// rather than optimistically removed. Sticky for the session's lifetime — once true,
+    /// stays true, the conservative choice.
+    udev_retire_blocked: Arc<AtomicBool>,
     /// Set when the sidecar was WANTED but unusable, so the session is about to stream
     /// silence. `None` on the healthy path and under test audio — a caller must be able
     /// to tell "nobody asked for a sidecar" from "it broke". Surfaced on
@@ -127,12 +135,11 @@ impl SessionResources {
             // Publish the fake-udev records for the app container's /run/udev/data mount:
             // SDL/Steam discover controllers via libudev, so without these the gamepad
             // node is invisible to games. Best-effort.
-            let udev_dir = super::virtual_input::udev_export_dir(&cfg.runtime_dir, session_id);
-            if let Err(e) = d.export_udev_data(&udev_dir) {
+            if let Err(e) = d.export_udev_data(&cfg.runtime_dir, session_id) {
                 tracing::warn!(
                     token = "udev-export-failed",
-                    "udev export to {} failed: {e:#} — in-container gamepad discovery degraded",
-                    udev_dir.display()
+                    "udev export for session {session_id} failed: {e:#} — in-container gamepad \
+                     discovery degraded"
                 );
             }
             Some(d)
@@ -194,7 +201,9 @@ impl SessionResources {
                 devices,
                 input_state: Arc::new(InputState::new()),
                 pulse,
+                session_id: session_id.to_string(),
                 runtime_dir: cfg.runtime_dir.clone(),
+                udev_retire_blocked: Arc::new(AtomicBool::new(false)),
                 audio_degraded,
             },
             pulse_server,
@@ -228,6 +237,32 @@ impl SessionResources {
                 p.socket_dir().to_string_lossy().into_owned(),
             )
         })
+    }
+}
+
+impl Drop for SessionResources {
+    /// Retire the udev export deterministically at the moment this session-scoped
+    /// value goes out of scope — NOT when the last `Arc<VirtualDevices>` clone does
+    /// (that clone also lives in GStreamer signal closures, whose drop timing this
+    /// struct does not control). Skipped when any generation's app-container stop
+    /// went unconfirmed (`udev_retire_blocked`): the dir+marker then stay for the
+    /// boot sweep rather than being removed while a container's fate is uncertain.
+    fn drop(&mut self) {
+        if self.udev_retire_blocked.load(Ordering::Relaxed) {
+            tracing::warn!(
+                token = "udev-export-retire-skipped",
+                session = %self.session_id,
+                "an app container stop went unconfirmed this session — leaving the udev \
+                 export dir for the boot sweep"
+            );
+            if let Some(d) = self.devices.as_ref() {
+                d.abandon_udev_export();
+            }
+            return;
+        }
+        if let Some(d) = self.devices.as_ref() {
+            d.retire_udev_export();
+        }
     }
 }
 
@@ -393,6 +428,10 @@ pub struct AppSource {
     ///
     /// `None` when nothing has launched yet, or the compositor build lacks the counter.
     app_commits_at_launch: Option<u64>,
+    /// Shared with [`SessionResources`] (same `Arc`, cloned at construction): set when
+    /// this generation's app-container stop could not be confirmed, so the session-level
+    /// udev export is not retired out from under a container whose fate is uncertain.
+    udev_retire_blocked: Arc<AtomicBool>,
 }
 
 impl AppSource {
@@ -456,6 +495,7 @@ impl AppSource {
             launch_error: None,
             observation: GenerationObservation::new(),
             app_commits_at_launch: None,
+            udev_retire_blocked: res.udev_retire_blocked.clone(),
         })
     }
 
@@ -839,7 +879,12 @@ impl AppSource {
     pub fn stop_app_container(&mut self) -> Result<bool, String> {
         match self.container.as_mut() {
             Some(c) => {
-                c.stop().map_err(|error| error.to_string())?;
+                if let Err(error) = c.stop() {
+                    // Unconfirmed: this generation's bind mount may still be live.
+                    // Block the session-level udev retire until the boot sweep.
+                    self.udev_retire_blocked.store(true, Ordering::Relaxed);
+                    return Err(error.to_string());
+                }
                 self.container.take();
                 Ok(true)
             }
@@ -1012,6 +1057,9 @@ impl AppSource {
                     token = "application-teardown-pending",
                     "runtime application teardown remains durable: {error}"
                 );
+                // Unconfirmed: block the session-level udev retire until the
+                // boot sweep — see `SessionResources::drop`.
+                self.udev_retire_blocked.store(true, Ordering::Relaxed);
             } else {
                 self.container.take();
             }

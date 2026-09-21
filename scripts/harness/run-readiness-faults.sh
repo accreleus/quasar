@@ -923,7 +923,11 @@ cleanup() {
         else
           case "$entry" in
             udev-*)
+              # #286: an owned entry is either the export dir "udev-<sid>" or its
+              # sibling ownership marker "udev-<sid>.owner" — strip both the
+              # prefix and the (possibly absent) marker suffix to recover <sid>.
               sid="${entry#udev-}"
+              sid="${sid%.owner}"
               for created in "${CREATED_SESSION_IDS[@]:-}"; do
                 [ "$sid" = "$created" ] && attributable=1 && break
               done

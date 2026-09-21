@@ -127,6 +127,21 @@ plane is reachable. When successful, watch the logs for the
 - Interrupted-session runtime directories may need scoped operator cleanup after
   boot retirement. Use the affected session's recorded mounts and prove its owned
   containers are gone first. Never remove unrelated runtime paths or user homes.
+- The per-session udev export directory (`{runtime_dir}/udev-<session id>`,
+  bind-mounted read-only into the app container at `/run/udev/data`) carries a
+  sibling ownership marker, `udev-<session id>.owner` — never inside the
+  directory itself, since that is the untrusted container's view. A normal stop
+  retires both explicitly; a killed agent leaves them for the same startup sweep
+  that reconciles applications and audio sidecars, and only a marker this agent's
+  persistent owner token wrote is ever removed. A directory from before this
+  fix carries no marker and is left alone by the sweep — reclaim it by hand, or
+  it is gone at the next host reboot (`/run` is tmpfs). A pair created under a
+  different runtime dir (e.g. `XDG_RUNTIME_DIR` changed between agent lives) is
+  outside the boot sweep's view entirely and is likewise left in place. The
+  Wayland socket
+  leftovers (`wayland-N`, `wayland-N.lock`) are a separate, compositor-owned
+  case: bounded to one reused name per session and not part of this
+  reconciliation.
 
 Docker is the validated engine. Intel hardware validation follows the existing
 [external procedure](reports/rh01-intel-external-validation.md); unavailable hardware

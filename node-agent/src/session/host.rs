@@ -63,12 +63,11 @@ impl SessionHost {
             // Publish fake-udev records where the app container's /run/udev/data
             // bind-mount can see them (SDL/Steam discover via libudev). Best-effort:
             // a failure only degrades gamepad discovery, not the session.
-            let udev_dir = super::virtual_input::udev_export_dir(&cfg.runtime_dir, session_id);
-            if let Err(e) = d.export_udev_data(&udev_dir) {
+            if let Err(e) = d.export_udev_data(&cfg.runtime_dir, session_id) {
                 tracing::warn!(
                     token = "udev-export-failed",
-                    "udev export to {} failed: {e:#} — in-container gamepad discovery degraded",
-                    udev_dir.display()
+                    "udev export for session {session_id} failed: {e:#} — in-container gamepad \
+                     discovery degraded"
                 );
             }
             Some(d)
@@ -226,6 +225,10 @@ impl SessionHost {
 
     /// Tear everything down (idempotent). `Drop` is the backstop.
     /// Order: app container first (stops producing audio), then PulseAudio sidecar.
+    ///
+    /// The udev export is retired explicitly here, AFTER the container's stop is
+    /// confirmed — not on a failed/pending stop, which leaves the bind mount's
+    /// fate uncertain; the dir+marker then stay for the boot sweep.
     pub fn teardown(&mut self) {
         if let Some(c) = self.container.as_mut() {
             if let Err(error) = c.stop() {
@@ -233,9 +236,15 @@ impl SessionHost {
                     token = "application-host-teardown-pending",
                     "application teardown remains durable: {error}"
                 );
+                if let Some(d) = self.devices.as_ref() {
+                    d.abandon_udev_export();
+                }
                 return;
             }
             self.container.take();
+        }
+        if let Some(d) = self.devices.as_ref() {
+            d.retire_udev_export();
         }
         if let Some(mut p) = self.pulse.take() {
             p.stop();
