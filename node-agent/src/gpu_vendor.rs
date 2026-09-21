@@ -76,11 +76,25 @@ pub fn vendor_from_scan(nodes: &[(String, String)]) -> Option<GpuVendor> {
 
 /// Detect the host's GPU vendor. `None` means no GPU signal was found.
 pub fn detect() -> Option<(GpuVendor, DetectSource)> {
-    detect_at(Path::new("/dev"), Path::new("/sys/class/drm"))
+    detect_at(Path::new("/dev"), Path::new("/sys/class/drm"), &|k| {
+        std::env::var(k).ok()
+    })
 }
 
-fn detect_at(dev: &Path, drm_sysfs: &Path) -> Option<(GpuVendor, DetectSource)> {
-    if let Some(v) = vendor_for_configured_render_node(drm_sysfs) {
+/// Pure core of [`detect`]: `lookup` supplies `QUASAR_RENDER_NODE`'s raw value instead
+/// of reading process env directly, so a caller resolving an encoder choice from an
+/// injected lookup (`session::settings::resolve_encoder_choice_with`) never falls back
+/// to the real process env here either.
+pub fn detect_with(lookup: &dyn Fn(&str) -> Option<String>) -> Option<(GpuVendor, DetectSource)> {
+    detect_at(Path::new("/dev"), Path::new("/sys/class/drm"), lookup)
+}
+
+fn detect_at(
+    dev: &Path,
+    drm_sysfs: &Path,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Option<(GpuVendor, DetectSource)> {
+    if let Some(v) = vendor_for_configured_render_node(drm_sysfs, lookup) {
         return Some((v, DetectSource::RenderNode));
     }
     if has_nvidia_device_nodes(dev) {
@@ -89,8 +103,11 @@ fn detect_at(dev: &Path, drm_sysfs: &Path) -> Option<(GpuVendor, DetectSource)> 
     vendor_from_dri_scan(dev, drm_sysfs).map(|v| (v, DetectSource::DriScan))
 }
 
-fn vendor_for_configured_render_node(drm_sysfs: &Path) -> Option<GpuVendor> {
-    let raw = std::env::var("QUASAR_RENDER_NODE").ok()?;
+fn vendor_for_configured_render_node(
+    drm_sysfs: &Path,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Option<GpuVendor> {
+    let raw = lookup("QUASAR_RENDER_NODE")?;
     if raw.is_empty() || !raw.starts_with("/dev/dri/") {
         return None;
     }

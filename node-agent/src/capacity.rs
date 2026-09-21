@@ -41,6 +41,7 @@ pub fn detect() -> SystemCapacity {
         allow_synthetic,
         mem_mb,
         &DriverIdentities::detect(std::path::Path::new("/")),
+        &|k| std::env::var(k).ok(),
     );
     SystemCapacity {
         host: HostCapacity {
@@ -479,6 +480,7 @@ fn detect_gpus_at(
     allow_synthetic: bool,
     mem_mb: i32,
     identities: &DriverIdentities,
+    lookup: &dyn Fn(&str) -> Option<String>,
 ) -> (Vec<GpuCapacity>, Vec<VramTarget>, String, Option<String>) {
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
@@ -508,7 +510,7 @@ fn detect_gpus_at(
 
     // Resolved once per detect(), not per GPU, so a multi-GPU host does not re-warn on a bad
     // knob value once per card.
-    let vulkan_slots = vulkan_encode_slots_override();
+    let vulkan_slots = vulkan_encode_slots_override(lookup);
 
     let mut gpus = Vec::new();
     let mut vram_targets = Vec::new();
@@ -601,13 +603,13 @@ fn detect_gpus_at(
     }
 
     if let Some(slots) = vulkan_slots {
-        apply_vulkan_override(&mut gpus, slots);
+        apply_vulkan_override(&mut gpus, slots, lookup);
     }
 
     // #489: the NVIDIA driver has a UAF that SIGSEGVs the whole agent when one session's
     // NVENC teardown overlaps another live NVENC session. Setting the ceiling to 1 makes
     // that overlap unschedulable, since admission enforces encode_slots_total.
-    if let Some(slots) = nvenc_max_sessions_override() {
+    if let Some(slots) = nvenc_max_sessions_override(lookup) {
         apply_nvenc_override_to(&mut gpus, slots);
     }
 
@@ -617,7 +619,7 @@ fn detect_gpus_at(
     // does not pin. Advertised capacity must agree, or the console counts encode slots on a
     // GPU admission will never schedule onto. Runs last so it has the final say over the
     // vendor stub and the nvenc/vulkan ceilings above, which know nothing of pinning.
-    apply_render_node_pin(&mut gpus);
+    apply_render_node_pin(&mut gpus, lookup);
 
     if gpus.is_empty() {
         detection_failure(
@@ -633,9 +635,9 @@ fn detect_gpus_at(
 /// `Some(n)` only when the resolved encoder (explicit `QUASAR_ENCODER` or the
 /// vendor auto-detect) is vulkan; `n` is the `QUASAR_VULKAN_MAX_SESSIONS` ceiling
 /// replacing the vendor stub. Every other encoder leaves the stub untouched.
-fn vulkan_encode_slots_override() -> Option<i32> {
-    let choice = crate::session::settings::resolve_encoder_choice();
-    (choice == EncoderChoice::Vulkan).then(vulkan_max_sessions)
+fn vulkan_encode_slots_override(lookup: &dyn Fn(&str) -> Option<String>) -> Option<i32> {
+    let choice = crate::session::settings::resolve_encoder_choice_with(lookup);
+    (choice == EncoderChoice::Vulkan).then(|| vulkan_max_sessions(lookup))
 }
 
 /// Scopes the `QUASAR_VULKAN_MAX_SESSIONS` override to the one GPU vulkan renders through,
@@ -645,11 +647,15 @@ fn vulkan_encode_slots_override() -> Option<i32> {
 ///
 /// Fails open: an unresolvable or unmatched render node applies the override to every GPU
 /// with a warn, since a vulkan host must never advertise zero vulkan capacity.
-fn apply_vulkan_override(gpus: &mut [GpuCapacity], slots: i32) {
+fn apply_vulkan_override(
+    gpus: &mut [GpuCapacity],
+    slots: i32,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) {
     if gpus.is_empty() {
         return;
     }
-    let configured = configured_vulkan_render_node();
+    let configured = configured_vulkan_render_node(lookup);
     apply_vulkan_override_to(gpus, slots, configured.as_deref());
 }
 
@@ -700,14 +706,14 @@ fn apply_vulkan_override_to(gpus: &mut [GpuCapacity], slots: i32, configured: Op
 /// Unmatched or unconfigured is left alone here exactly as in
 /// [`apply_vulkan_override_to`]'s fail-open branch — this pass only ever narrows an already
 /// resolved pin, never guesses at one.
-fn apply_render_node_pin(gpus: &mut [GpuCapacity]) {
+fn apply_render_node_pin(gpus: &mut [GpuCapacity], lookup: &dyn Fn(&str) -> Option<String>) {
     if gpus.len() < 2 {
         return;
     }
-    if crate::session::settings::resolve_encoder_choice() == EncoderChoice::Openh264 {
+    if crate::session::settings::resolve_encoder_choice_with(lookup) == EncoderChoice::Openh264 {
         return;
     }
-    let Some(configured) = configured_vulkan_render_node() else {
+    let Some(configured) = configured_vulkan_render_node(lookup) else {
         return;
     };
     let Some(idx) = gpus
@@ -745,8 +751,8 @@ fn apply_render_node_pin(gpus: &mut [GpuCapacity]) {
 /// unlike the vulkan knob: NVENC is also the per-session vendor fallback on a vulkan host,
 /// so the ceiling applies to every NVIDIA GPU whenever it is set. Malformed or non-positive
 /// values warn and are ignored — never a silently zero or negative advertised capacity.
-fn nvenc_max_sessions_override() -> Option<i32> {
-    let raw = std::env::var("QUASAR_NVENC_MAX_SESSIONS").ok()?;
+fn nvenc_max_sessions_override(lookup: &dyn Fn(&str) -> Option<String>) -> Option<i32> {
+    let raw = lookup("QUASAR_NVENC_MAX_SESSIONS")?;
     match raw.trim().parse::<i32>() {
         Ok(n) if n > 0 => Some(n),
         Ok(n) => {
@@ -782,8 +788,8 @@ fn apply_nvenc_override_to(gpus: &mut [GpuCapacity], slots: i32) {
 /// `GpuCapacity::device_path`, via `session::settings::canonicalize_render_node` — never a
 /// second render-node resolution. `None` for the `"software"` default or anything outside
 /// `/dev/dri/`, which callers read as "no specific GPU configured".
-fn configured_vulkan_render_node() -> Option<String> {
-    let raw = std::env::var("QUASAR_RENDER_NODE").unwrap_or_else(|_| "software".to_string());
+fn configured_vulkan_render_node(lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let raw = lookup("QUASAR_RENDER_NODE").unwrap_or_else(|| "software".to_string());
     if !raw.starts_with("/dev/dri/") {
         return None;
     }
@@ -795,11 +801,11 @@ fn configured_vulkan_render_node() -> Option<String> {
 /// ~710 MiB VRAM/session), and a deeper soak gates raising the default. Spec
 /// `docs/design/plans/2026-07-25-vulkan-multisession-spec.md` §2d/§4. Non-numeric, zero and
 /// negative all warn and fall back: a malformed knob must never advertise zero capacity.
-fn vulkan_max_sessions() -> i32 {
+fn vulkan_max_sessions(lookup: &dyn Fn(&str) -> Option<String>) -> i32 {
     const DEFAULT: i32 = 2;
-    match std::env::var("QUASAR_VULKAN_MAX_SESSIONS") {
-        Err(_) => DEFAULT,
-        Ok(raw) => match raw.trim().parse::<i32>() {
+    match lookup("QUASAR_VULKAN_MAX_SESSIONS") {
+        None => DEFAULT,
+        Some(raw) => match raw.trim().parse::<i32>() {
             Ok(n) if n > 0 => n,
             Ok(n) => {
                 tracing::warn!(
@@ -1250,6 +1256,7 @@ mod tests {
             false,
             16384,
             &test_identities(),
+            &empty_lookup,
         );
         assert!(gpus.is_empty());
         assert!(vram_targets.is_empty());
@@ -1261,7 +1268,7 @@ mod tests {
     fn empty_drm_inventory_is_unavailable() {
         let dir = tempfile::tempdir().unwrap();
         let (gpus, vram_targets, status, _) =
-            detect_gpus_at(dir.path(), false, 16384, &test_identities());
+            detect_gpus_at(dir.path(), false, 16384, &test_identities(), &empty_lookup);
         assert!(gpus.is_empty());
         assert!(vram_targets.is_empty());
         assert_eq!(status, "unavailable");
@@ -1271,7 +1278,7 @@ mod tests {
     fn synthetic_capacity_requires_explicit_opt_in() {
         let dir = tempfile::tempdir().unwrap();
         let (gpus, vram_targets, status, reason) =
-            detect_gpus_at(dir.path(), true, 16384, &test_identities());
+            detect_gpus_at(dir.path(), true, 16384, &test_identities(), &empty_lookup);
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].vendor, "unknown");
         assert_eq!(vram_targets.len(), 1);
@@ -1608,6 +1615,11 @@ stepping\t: 2
         DriverIdentities::with(None, Vec::new())
     }
 
+    /// Every key unset: the case must not depend on the process environment.
+    fn empty_lookup(_: &str) -> Option<String> {
+        None
+    }
+
     fn fake_amd_card(root: &std::path::Path, card_name: &str) {
         let device_dir = root.join(card_name).join("device");
         std::fs::create_dir_all(&device_dir).unwrap();
@@ -1635,6 +1647,7 @@ stepping\t: 2
             false,
             16384,
             &DriverIdentities::with(None, vec![matched]),
+            &empty_lookup,
         );
         assert_eq!(
             gpus[0].driver_identity.as_deref(),
@@ -1643,7 +1656,8 @@ stepping\t: 2
 
         // No source can name this GPU's driver: the field is omitted rather than
         // filled with a placeholder, and the control plane's matching fails open.
-        let (gpus, _, _, _) = detect_gpus_at(dir.path(), false, 16384, &test_identities());
+        let (gpus, _, _, _) =
+            detect_gpus_at(dir.path(), false, 16384, &test_identities(), &empty_lookup);
         assert_eq!(gpus[0].driver_identity, None);
     }
 
@@ -1656,7 +1670,7 @@ stepping\t: 2
         std::fs::write(device.join("device"), "0x4692\n").unwrap();
 
         let (gpus, targets, status, reason) =
-            detect_gpus_at(dir.path(), false, 16384, &test_identities());
+            detect_gpus_at(dir.path(), false, 16384, &test_identities(), &empty_lookup);
         assert_eq!(status, "ok", "Intel iGPU discarded: {reason:?}");
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].vendor, "intel");
@@ -1745,8 +1759,13 @@ stepping\t: 2
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                 std::fs::write(path, value).unwrap();
             }
-            let (gpus, targets, status, _) =
-                detect_gpus_at(dir.path(), false, *mem_mb, &test_identities());
+            let (gpus, targets, status, _) = detect_gpus_at(
+                dir.path(),
+                false,
+                *mem_mb,
+                &test_identities(),
+                &empty_lookup,
+            );
             assert_eq!(gpus.first().map(|g| g.vram_mb_total), *expected, "{name}");
             assert_eq!(
                 status,
@@ -1770,7 +1789,7 @@ stepping\t: 2
         std::fs::remove_file(device.join("mem_info_vram_total")).unwrap();
         fake_amd_card(dir.path(), "card1");
         let (gpus, targets, status, _) =
-            detect_gpus_at(dir.path(), false, 8192, &test_identities());
+            detect_gpus_at(dir.path(), false, 8192, &test_identities(), &empty_lookup);
         assert_eq!(status, "ok");
         assert_eq!(gpus.len(), 2);
         assert_eq!(gpus[0].vendor, "intel");
@@ -1802,7 +1821,7 @@ stepping\t: 2
         fake_amd_card(&drm_root, "card0");
 
         let (gpus, vram_targets, status, _) =
-            detect_gpus_at(&drm_root, false, 16384, &test_identities());
+            detect_gpus_at(&drm_root, false, 16384, &test_identities(), &empty_lookup);
         assert_eq!(status, "ok");
         assert_eq!(gpus.len(), 1);
         assert_eq!(vram_targets.len(), 1);
@@ -1819,32 +1838,16 @@ stepping\t: 2
         );
     }
 
-    fn restore_env(key: &str, prior: Option<String>) {
-        match prior {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-    }
-
-    // These two vars are process-global env, so every case must live in ONE test that saves
-    // and restores them: there is no `serial_test` dep in this crate.
     #[test]
     fn vulkan_capacity_knob_env_gating() {
-        let keys = ["QUASAR_ENCODER", "QUASAR_VULKAN_MAX_SESSIONS"];
-        let saved: Vec<(&str, Option<String>)> =
-            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-        for k in &keys {
-            std::env::remove_var(k);
-        }
-
         let dir = tempfile::tempdir().unwrap();
         let drm_root = dir.path().join("class-drm");
         std::fs::create_dir_all(&drm_root).unwrap();
         fake_amd_card(&drm_root, "card0");
 
         // Non-vulkan host: the knob is inert off the vulkan path.
-        std::env::set_var("QUASAR_VULKAN_MAX_SESSIONS", "5");
-        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities());
+        let lookup = crate::test_env::lookup(&[("QUASAR_VULKAN_MAX_SESSIONS", "5")]);
+        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities(), &lookup);
         assert_eq!(gpus.len(), 1);
         assert_eq!(
             gpus[0].encode_slots_total, 2,
@@ -1852,16 +1855,18 @@ stepping\t: 2
         );
 
         // Vulkan host honors the knob.
-        std::env::set_var("QUASAR_ENCODER", "vulkan");
-        std::env::set_var("QUASAR_VULKAN_MAX_SESSIONS", "5");
-        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities());
+        let lookup = crate::test_env::lookup(&[
+            ("QUASAR_ENCODER", "vulkan"),
+            ("QUASAR_VULKAN_MAX_SESSIONS", "5"),
+        ]);
+        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities(), &lookup);
         assert_eq!(
             gpus[0].encode_slots_total, 5,
             "vulkan host honors QUASAR_VULKAN_MAX_SESSIONS"
         );
 
-        std::env::remove_var("QUASAR_VULKAN_MAX_SESSIONS");
-        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities());
+        let lookup = crate::test_env::lookup(&[("QUASAR_ENCODER", "vulkan")]);
+        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities(), &lookup);
         assert_eq!(
             gpus[0].encode_slots_total, 2,
             "vulkan host with the knob unset defaults to 2"
@@ -1869,16 +1874,16 @@ stepping\t: 2
 
         // Malformed or non-positive values must never advertise a zero or negative capacity.
         for bad in ["0", "-1", "not-a-number", ""] {
-            std::env::set_var("QUASAR_VULKAN_MAX_SESSIONS", bad);
-            let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities());
+            let lookup = crate::test_env::lookup(&[
+                ("QUASAR_ENCODER", "vulkan"),
+                ("QUASAR_VULKAN_MAX_SESSIONS", bad),
+            ]);
+            let (gpus, _, _, _) =
+                detect_gpus_at(&drm_root, false, 16384, &test_identities(), &lookup);
             assert_eq!(
                 gpus[0].encode_slots_total, 2,
                 "invalid QUASAR_VULKAN_MAX_SESSIONS={bad:?} falls back to default 2"
             );
-        }
-
-        for (k, v) in saved {
-            restore_env(k, v);
         }
     }
 
@@ -1907,31 +1912,35 @@ stepping\t: 2
     }
 
     /// Unset ⇒ None and the stub stands; malformed or non-positive ⇒ None, never a zero or
-    /// negative advertised capacity. One test, because the var is process-global env.
+    /// negative advertised capacity.
     #[test]
     fn nvenc_max_sessions_env_parsing() {
         let key = "QUASAR_NVENC_MAX_SESSIONS";
-        let saved = std::env::var(key).ok();
 
-        std::env::remove_var(key);
-        assert_eq!(nvenc_max_sessions_override(), None, "unset ⇒ stub stands");
+        assert_eq!(
+            nvenc_max_sessions_override(&empty_lookup),
+            None,
+            "unset ⇒ stub stands"
+        );
 
-        std::env::set_var(key, "1");
-        assert_eq!(nvenc_max_sessions_override(), Some(1));
+        assert_eq!(
+            nvenc_max_sessions_override(&crate::test_env::lookup(&[(key, "1")])),
+            Some(1)
+        );
 
-        std::env::set_var(key, " 2 ");
-        assert_eq!(nvenc_max_sessions_override(), Some(2), "whitespace trimmed");
+        assert_eq!(
+            nvenc_max_sessions_override(&crate::test_env::lookup(&[(key, " 2 ")])),
+            Some(2),
+            "whitespace trimmed"
+        );
 
         for bad in ["0", "-1", "not-a-number", ""] {
-            std::env::set_var(key, bad);
             assert_eq!(
-                nvenc_max_sessions_override(),
+                nvenc_max_sessions_override(&crate::test_env::lookup(&[(key, bad)])),
                 None,
                 "invalid QUASAR_NVENC_MAX_SESSIONS={bad:?} is ignored"
             );
         }
-
-        restore_env(key, saved);
     }
 
     /// Adds the symlink chain `fake_amd_card` lacks, so `GpuCapacity::device_path` is
@@ -1964,16 +1973,8 @@ stepping\t: 2
     /// missing `/dev` node either way — `apply_render_node_pin` only ever compares
     /// `device_path` strings, so a stale/absent node behaves identically to a live
     /// non-matching one: neither equals the configured pin).
-    ///
-    /// Env-gated in one test (not `apply_render_node_pin` called directly): the function
-    /// reads `QUASAR_ENCODER`/`QUASAR_RENDER_NODE` from process env itself, so every case
-    /// must live together per the convention above.
     #[test]
     fn render_node_pin_zeroes_the_excluded_gpu_and_keeps_indices_stable() {
-        let keys = ["QUASAR_ENCODER", "QUASAR_RENDER_NODE"];
-        let saved: Vec<(&str, Option<String>)> =
-            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-
         let dir = tempfile::tempdir().unwrap();
         let drm_root = dir.path().join("class-drm");
         std::fs::create_dir_all(&drm_root).unwrap();
@@ -1982,9 +1983,12 @@ stepping\t: 2
 
         // Pinned to card0's render node, on a hardware encoder branch (va): card1 is
         // globally unschedulable under `schedulableBindingSQL` and must advertise 0 slots.
-        std::env::set_var("QUASAR_ENCODER", "va");
-        std::env::set_var("QUASAR_RENDER_NODE", "/dev/dri/renderD128");
-        let (gpus, _, status, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities());
+        let lookup = crate::test_env::lookup(&[
+            ("QUASAR_ENCODER", "va"),
+            ("QUASAR_RENDER_NODE", "/dev/dri/renderD128"),
+        ]);
+        let (gpus, _, status, _) =
+            detect_gpus_at(&drm_root, false, 16384, &test_identities(), &lookup);
         assert_eq!(status, "ok");
         assert_eq!(gpus.len(), 2);
         let card0 = gpus
@@ -2012,8 +2016,11 @@ stepping\t: 2
 
         // openh264 never pins (schedulableBindingSQL's first branch matches any vendor GPU),
         // so the same configured render node must NOT zero out card1 here.
-        std::env::set_var("QUASAR_ENCODER", "openh264");
-        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities());
+        let lookup = crate::test_env::lookup(&[
+            ("QUASAR_ENCODER", "openh264"),
+            ("QUASAR_RENDER_NODE", "/dev/dri/renderD128"),
+        ]);
+        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities(), &lookup);
         assert!(
             gpus.iter().all(|g| g.encode_slots_total == 2),
             "openh264 does not pin by render node; both GPUs keep their vendor stub"
@@ -2022,24 +2029,20 @@ stepping\t: 2
         // A configured render node that matches no detected GPU (e.g. a stale by-path, or —
         // per #276 — a `/sys/class/drm` entry the container's `/dev` never actually backed)
         // fails open rather than zeroing every GPU's capacity down to nothing.
-        std::env::set_var("QUASAR_ENCODER", "va");
-        std::env::set_var("QUASAR_RENDER_NODE", "/dev/dri/renderD999");
-        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities());
+        let lookup = crate::test_env::lookup(&[
+            ("QUASAR_ENCODER", "va"),
+            ("QUASAR_RENDER_NODE", "/dev/dri/renderD999"),
+        ]);
+        let (gpus, _, _, _) = detect_gpus_at(&drm_root, false, 16384, &test_identities(), &lookup);
         assert!(
             gpus.iter().all(|g| g.encode_slots_total == 2),
             "an unmatched render-node pin fails open rather than advertising zero capacity"
         );
-
-        for (k, v) in saved {
-            restore_env(k, v);
-        }
     }
 
-    /// Must not touch `QUASAR_RENDER_NODE`/`QUASAR_ENCODER` or call `detect_gpus_at`: both
-    /// would race `session::settings`' unguarded readers and the sibling env test under the
-    /// default parallel runner. It resolves `device_path` through the same root-scoped sysfs
-    /// walk and drives the pure `apply_vulkan_override_to` with the render node as an
-    /// argument instead.
+    /// Exercises the render-node matching without `detect_gpus_at`: resolves `device_path`
+    /// through the same root-scoped sysfs walk and drives the pure `apply_vulkan_override_to`
+    /// with the render node as an argument instead.
     #[test]
     fn vulkan_capacity_override_scoped_to_configured_render_node() {
         let dir = tempfile::tempdir().unwrap();

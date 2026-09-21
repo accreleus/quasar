@@ -115,8 +115,14 @@ impl HomesGcSettings {
 /// A knob ON unless explicitly turned off (and vice versa) — `session::env_bool`
 /// cannot express a default-ON knob.
 fn env_flag(var: &str, default: bool) -> bool {
-    match std::env::var(var) {
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+    flag_from(var, std::env::var(var).ok().as_deref(), default)
+}
+
+/// Pure core of [`env_flag`]: `raw` is the env value as read (`None` for unset); `var`
+/// names the knob for the warn message.
+fn flag_from(var: &str, raw: Option<&str>, default: bool) -> bool {
+    match raw {
+        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
             "" => default,
             "1" | "true" | "yes" | "on" => true,
             "0" | "false" | "no" | "off" => false,
@@ -128,7 +134,7 @@ fn env_flag(var: &str, default: bool) -> bool {
                 default
             }
         },
-        Err(_) => default,
+        None => default,
     }
 }
 
@@ -867,16 +873,10 @@ mod tests {
 
     #[test]
     fn env_flag_defaults_and_overrides() {
-        // Serial within this test: env is process-global.
-        std::env::remove_var("QUASAR_TEST_FLAG");
-        assert!(env_flag("QUASAR_TEST_FLAG", true));
-        assert!(!env_flag("QUASAR_TEST_FLAG", false));
-        std::env::set_var("QUASAR_TEST_FLAG", "0");
-        assert!(!env_flag("QUASAR_TEST_FLAG", true));
-        std::env::set_var("QUASAR_TEST_FLAG", "yes");
-        assert!(env_flag("QUASAR_TEST_FLAG", false));
-        std::env::set_var("QUASAR_TEST_FLAG", "banana");
-        assert!(env_flag("QUASAR_TEST_FLAG", true));
-        std::env::remove_var("QUASAR_TEST_FLAG");
+        assert!(flag_from("QUASAR_TEST_FLAG", None, true));
+        assert!(!flag_from("QUASAR_TEST_FLAG", None, false));
+        assert!(!flag_from("QUASAR_TEST_FLAG", Some("0"), true));
+        assert!(flag_from("QUASAR_TEST_FLAG", Some("yes"), false));
+        assert!(flag_from("QUASAR_TEST_FLAG", Some("banana"), true));
     }
 }

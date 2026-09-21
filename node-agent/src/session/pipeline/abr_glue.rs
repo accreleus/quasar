@@ -1248,7 +1248,7 @@ mod tests {
     /// A config with a given WIRE floor (the profile's `stream.abr_floor_kbps`, 0 = none)
     /// and HOST floor (`abr_floor_kbps` / `QUASAR_ABR_FLOOR_KBPS`).
     fn cfg_with_floors(wire: u32, host: Option<u32>) -> SessionConfig {
-        let mut settings = crate::session::settings::RuntimeSettings::baseline();
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
         settings.encoder = EncoderChoice::Openh264;
         settings.abr_floor_kbps = host;
         let stream = crate::session::StreamParams {
@@ -1333,7 +1333,7 @@ mod tests {
 
     fn software_lever(launch: (i32, i32)) -> EncodeResolutionLever {
         init();
-        let mut settings = crate::session::settings::RuntimeSettings::baseline();
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
         settings.encoder = EncoderChoice::Openh264;
         let stream = crate::session::StreamParams {
             width: launch.0,
@@ -1402,7 +1402,7 @@ mod tests {
             );
             return;
         }
-        let mut settings = crate::session::settings::RuntimeSettings::baseline();
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
         settings.encoder = EncoderChoice::Vulkan;
         let stream = crate::session::StreamParams {
             width: 1920,

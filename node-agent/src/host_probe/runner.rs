@@ -442,7 +442,7 @@ mod tests {
     }
 
     fn settings() -> RuntimeSettings {
-        let mut s = RuntimeSettings::baseline();
+        let mut s = RuntimeSettings::baseline_with(&|_| None);
         s.encoder = crate::session::EncoderChoice::Vulkan;
         s.render_node = String::new();
         s

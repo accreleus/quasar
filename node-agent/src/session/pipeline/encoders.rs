@@ -96,13 +96,18 @@ pub(crate) struct EncoderKnobs {
 impl EncoderKnobs {
     /// Read all three knobs from the current process env.
     pub(crate) fn from_env() -> Self {
-        fn knob(var: &str) -> CodecKnob {
-            CodecKnob::parse(var, std::env::var(var).ok().as_deref())
+        Self::from_lookup(&|k| std::env::var(k).ok())
+    }
+
+    /// Pure core of [`EncoderKnobs::from_env`]: `lookup` supplies each var's raw value.
+    pub(crate) fn from_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
+        fn knob(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> CodecKnob {
+            CodecKnob::parse(var, lookup(var).as_deref())
         }
         Self {
-            h264: knob("QUASAR_VULKAN_H264"),
-            hevc: knob("QUASAR_VULKAN_HEVC"),
-            av1: knob("QUASAR_VULKAN_AV1"),
+            h264: knob("QUASAR_VULKAN_H264", lookup),
+            hevc: knob("QUASAR_VULKAN_HEVC", lookup),
+            av1: knob("QUASAR_VULKAN_AV1", lookup),
         }
     }
 
@@ -1591,41 +1596,23 @@ mod tests {
         }
     }
 
-    // The only test that touches these env vars, so save/restore needs no lock —
-    // every other knob test constructs `EncoderKnobs` directly. Keep it that way.
     #[test]
     fn encoder_knobs_from_env_reads_all_three_vars() {
-        const VARS: [&str; 3] = [
-            "QUASAR_VULKAN_H264",
-            "QUASAR_VULKAN_HEVC",
-            "QUASAR_VULKAN_AV1",
-        ];
-        let prior: Vec<_> = VARS.iter().map(|v| std::env::var(v).ok()).collect();
-
-        for v in VARS {
-            std::env::remove_var(v);
-        }
         assert_eq!(
-            EncoderKnobs::from_env(),
+            EncoderKnobs::from_lookup(&crate::test_env::lookup(&[])),
             EncoderKnobs::default(),
             "unset ⇒ all three enabled from the default"
         );
 
-        std::env::set_var(VARS[0], "0");
-        std::env::set_var(VARS[1], "off");
-        std::env::set_var(VARS[2], "1");
-        let k = EncoderKnobs::from_env();
+        let k = EncoderKnobs::from_lookup(&crate::test_env::lookup(&[
+            ("QUASAR_VULKAN_H264", "0"),
+            ("QUASAR_VULKAN_HEVC", "off"),
+            ("QUASAR_VULKAN_AV1", "1"),
+        ]));
         assert!(!k.allows(Codec::H264));
         assert!(!k.allows(Codec::H265));
         assert!(k.allows(Codec::Av1));
         assert_eq!(k.knob(Codec::Av1).source(), "env");
-
-        for (v, was) in VARS.iter().zip(prior) {
-            match was {
-                Some(val) => std::env::set_var(v, val),
-                None => std::env::remove_var(v),
-            }
-        }
     }
 
     #[test]

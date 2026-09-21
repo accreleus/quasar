@@ -163,9 +163,15 @@ impl Codec {
     /// Resolve the session codec. Precedence: `QUASAR_CODEC` (set + non-empty), else
     /// the wire value, else `H264`. An unrecognised string from either source errors.
     pub fn resolve(wire: Option<&str>) -> anyhow::Result<Codec> {
-        if let Ok(v) = std::env::var("QUASAR_CODEC") {
+        Codec::resolve_from(wire, std::env::var("QUASAR_CODEC").ok().as_deref())
+    }
+
+    /// Pure core of [`Codec::resolve`]: `env_override` is the `QUASAR_CODEC` value as
+    /// read from env, `None` for unset.
+    fn resolve_from(wire: Option<&str>, env_override: Option<&str>) -> anyhow::Result<Codec> {
+        if let Some(v) = env_override {
             if !v.trim().is_empty() {
-                return Codec::parse(&v);
+                return Codec::parse(v);
             }
         }
         match wire {
@@ -308,7 +314,13 @@ impl AbrMode {
 
     /// Resolve the ABR mode from the environment (see the type doc for precedence).
     pub fn from_env() -> Self {
-        let raw = std::env::var("QUASAR_ABR_MODE").ok();
+        Self::from_lookup(&|k| std::env::var(k).ok())
+    }
+
+    /// Pure core of [`AbrMode::from_env`]: `lookup` supplies each var's raw value instead
+    /// of reading process env directly.
+    pub fn from_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
+        let raw = lookup("QUASAR_ABR_MODE");
         match Self::classify_env(raw.as_deref()) {
             AbrModeEnv::Recognised(m) => return m,
             // Empty-after-trim is treated as unset: silent fall-through, no WARN.
@@ -324,9 +336,9 @@ impl AbrMode {
         }
         // Legacy disable flags.
         if matches!(
-            std::env::var("QUASAR_ABR").ok().as_deref(),
+            lookup("QUASAR_ABR").as_deref(),
             Some("0") | Some("false") | Some("FALSE")
-        ) || env_bool("QUASAR_ABR_DISABLED")
+        ) || env_bool_from("QUASAR_ABR_DISABLED", lookup)
         {
             return AbrMode::Off;
         }
@@ -718,11 +730,17 @@ impl SessionConfig {
     /// value is warned and ignored: it must never reject a valid assignment. Idempotent
     /// when the env matches.
     pub fn apply_codec_env_override(&mut self) {
-        let raw = match std::env::var("QUASAR_CODEC") {
-            Ok(v) if !v.trim().is_empty() => v,
+        self.apply_codec_override_from(std::env::var("QUASAR_CODEC").ok().as_deref());
+    }
+
+    /// Pure core of [`apply_codec_env_override`](Self::apply_codec_env_override): `raw`
+    /// is the `QUASAR_CODEC` value as read from env, `None` for unset.
+    fn apply_codec_override_from(&mut self, raw: Option<&str>) {
+        let raw = match raw {
+            Some(v) if !v.trim().is_empty() => v,
             _ => return,
         };
-        let forced = match Codec::parse(&raw) {
+        let forced = match Codec::parse(raw) {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(
@@ -1055,10 +1073,15 @@ fn env_u64(var: &str, default: u64) -> u64 {
 /// Parse `QUASAR_FEC_PERCENTAGE`: unset/empty ⇒ `0` (off, silently). Out of `0..=100`
 /// or unparseable ⇒ warn and `0`, never a nonsensical redundancy on the transceiver.
 fn env_fec_percentage(var: &str) -> u32 {
-    match std::env::var(var) {
-        Err(_) => 0,
-        Ok(s) if s.is_empty() => 0,
-        Ok(s) => match s.parse::<u32>() {
+    fec_percentage_from(var, std::env::var(var).ok().as_deref())
+}
+
+/// Pure core of [`env_fec_percentage`]: `raw` is the env value as read, `None` for
+/// unset; `var` names the knob for the warn message.
+fn fec_percentage_from(var: &str, raw: Option<&str>) -> u32 {
+    match raw {
+        None | Some("") => 0,
+        Some(s) => match s.parse::<u32>() {
             Ok(n) if n <= 100 => n,
             _ => {
                 tracing::warn!(
@@ -1075,11 +1098,16 @@ fn env_fec_percentage(var: &str) -> u32 {
 /// the default; a 0 ms jitter buffer turns any reorder or late arrival into an audible
 /// gap.
 fn env_mic_jitter_ms(var: &str) -> u32 {
+    mic_jitter_ms_from(var, std::env::var(var).ok().as_deref())
+}
+
+/// Pure core of [`env_mic_jitter_ms`]: `raw` is the env value as read, `None` for
+/// unset; `var` names the knob for the warn message.
+fn mic_jitter_ms_from(var: &str, raw: Option<&str>) -> u32 {
     const DEFAULT_MIC_JITTER_MS: u32 = 60;
-    match std::env::var(var) {
-        Err(_) => DEFAULT_MIC_JITTER_MS,
-        Ok(s) if s.is_empty() => DEFAULT_MIC_JITTER_MS,
-        Ok(s) => match s.parse::<u32>() {
+    match raw {
+        None | Some("") => DEFAULT_MIC_JITTER_MS,
+        Some(s) => match s.parse::<u32>() {
             Ok(n) if n > 0 => n,
             _ => {
                 tracing::warn!(
@@ -1132,8 +1160,14 @@ fn env_f64(var: &str, default: f64) -> f64 {
 /// Parse a boolean-ish env var: `"1"`/`"true"`/`"TRUE"` ⇒ true, anything else
 /// (including unset) ⇒ false.
 pub(crate) fn env_bool(var: &str) -> bool {
+    env_bool_from(var, &|k| std::env::var(k).ok())
+}
+
+/// Pure core of [`env_bool`]: `lookup` supplies the var's raw value instead of reading
+/// process env directly.
+pub(crate) fn env_bool_from(var: &str, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
     matches!(
-        std::env::var(var).ok().as_deref(),
+        lookup(var).as_deref(),
         Some("1") | Some("true") | Some("TRUE")
     )
 }
@@ -1251,39 +1285,35 @@ mod tests {
         }
     }
 
-    // Env is process-global; serialize + save/restore.
     #[test]
     fn codec_resolve_env_override_and_wire() {
-        const VAR: &str = "QUASAR_CODEC";
-        let prior = std::env::var(VAR).ok();
-
-        std::env::remove_var(VAR);
-        assert_eq!(Codec::resolve(None).unwrap(), Codec::H264, "absent ⇒ h264");
         assert_eq!(
-            Codec::resolve(Some("av1")).unwrap(),
+            Codec::resolve_from(None, None).unwrap(),
+            Codec::H264,
+            "absent ⇒ h264"
+        );
+        assert_eq!(
+            Codec::resolve_from(Some("av1"), None).unwrap(),
             Codec::Av1,
             "wire value used when no override"
         );
         assert!(
-            Codec::resolve(Some("bogus")).is_err(),
+            Codec::resolve_from(Some("bogus"), None).is_err(),
             "unknown wire value errors"
         );
 
-        std::env::set_var(VAR, "h265");
         assert_eq!(
-            Codec::resolve(Some("av1")).unwrap(),
+            Codec::resolve_from(Some("av1"), Some("h265")).unwrap(),
             Codec::H265,
             "QUASAR_CODEC force override beats the wire value"
         );
-        std::env::set_var(VAR, "");
         assert_eq!(
-            Codec::resolve(Some("av1")).unwrap(),
+            Codec::resolve_from(Some("av1"), Some("")).unwrap(),
             Codec::Av1,
             "empty QUASAR_CODEC is treated as unset (wire wins)"
         );
-        std::env::set_var(VAR, "junk");
         assert!(
-            Codec::resolve(None).is_err(),
+            Codec::resolve_from(None, Some("junk")).is_err(),
             "a junk QUASAR_CODEC force errors"
         );
 
@@ -1293,26 +1323,27 @@ mod tests {
         let assigned_h264 = || {
             let mut stream = stream_with_floor(0);
             stream.codec = Codec::H264;
-            SessionConfig::for_assignment_with(&settings::RuntimeSettings::baseline(), stream, None)
+            SessionConfig::for_assignment_with(
+                &settings::RuntimeSettings::baseline_with(&|_| None),
+                stream,
+                None,
+            )
         };
 
-        std::env::remove_var(VAR);
         let mut cfg = assigned_h264();
-        cfg.apply_codec_env_override();
+        cfg.apply_codec_override_from(None);
         assert_eq!(cfg.stream.codec, Codec::H264);
         assert!(!cfg.codec_env_override, "unset ⇒ no override");
 
-        std::env::set_var(VAR, "h264");
         let mut cfg = assigned_h264();
-        cfg.apply_codec_env_override();
+        cfg.apply_codec_override_from(Some("h264"));
         assert!(
             !cfg.codec_env_override,
             "env == assigned ⇒ no divergence recorded"
         );
 
-        std::env::set_var(VAR, "av1");
         let mut cfg = assigned_h264();
-        cfg.apply_codec_env_override();
+        cfg.apply_codec_override_from(Some("av1"));
         assert_eq!(cfg.stream.codec, Codec::Av1, "force override streams av1");
         assert_eq!(
             cfg.configured_codec,
@@ -1324,116 +1355,96 @@ mod tests {
             "divergence recorded for the snapshot"
         );
 
-        std::env::set_var(VAR, "vp9");
         let mut cfg = assigned_h264();
-        cfg.apply_codec_env_override();
+        cfg.apply_codec_override_from(Some("vp9"));
         assert_eq!(
             cfg.stream.codec,
             Codec::H264,
             "junk QUASAR_CODEC is ignored, not fatal, and does not disturb the assignment"
         );
         assert!(!cfg.codec_env_override);
-
-        match prior {
-            Some(v) => std::env::set_var(VAR, v),
-            None => std::env::remove_var(VAR),
-        }
     }
 
-    // Serialized in one test: std::env::set_var is not thread-safe against concurrent
-    // test readers.
     #[test]
     fn fec_percentage_env_parsing() {
         const VAR: &str = "QUASAR_FEC_PERCENTAGE";
-        let prior = std::env::var(VAR).ok();
 
-        std::env::remove_var(VAR);
-        assert_eq!(env_fec_percentage(VAR), 0, "unset ⇒ 0 (disabled)");
+        assert_eq!(fec_percentage_from(VAR, None), 0, "unset ⇒ 0 (disabled)");
 
-        std::env::set_var(VAR, "20");
-        assert_eq!(env_fec_percentage(VAR), 20, "\"20\" ⇒ 20");
+        assert_eq!(fec_percentage_from(VAR, Some("20")), 20, "\"20\" ⇒ 20");
 
-        std::env::set_var(VAR, "junk");
-        assert_eq!(env_fec_percentage(VAR), 0, "unparseable ⇒ 0 with warn");
-
-        std::env::set_var(VAR, "150");
         assert_eq!(
-            env_fec_percentage(VAR),
+            fec_percentage_from(VAR, Some("junk")),
+            0,
+            "unparseable ⇒ 0 with warn"
+        );
+
+        assert_eq!(
+            fec_percentage_from(VAR, Some("150")),
             0,
             "out-of-range (>100) ⇒ 0 with warn"
         );
 
-        std::env::set_var(VAR, "-5");
         assert_eq!(
-            env_fec_percentage(VAR),
+            fec_percentage_from(VAR, Some("-5")),
             0,
             "negative ⇒ 0 with warn (u32 parse fails)"
         );
 
-        std::env::set_var(VAR, "0");
-        assert_eq!(env_fec_percentage(VAR), 0, "explicit 0 ⇒ 0 (disabled)");
+        assert_eq!(
+            fec_percentage_from(VAR, Some("0")),
+            0,
+            "explicit 0 ⇒ 0 (disabled)"
+        );
 
-        std::env::set_var(VAR, "100");
-        assert_eq!(env_fec_percentage(VAR), 100, "100 is the max valid value");
-
-        match prior {
-            Some(v) => std::env::set_var(VAR, v),
-            None => std::env::remove_var(VAR),
-        }
+        assert_eq!(
+            fec_percentage_from(VAR, Some("100")),
+            100,
+            "100 is the max valid value"
+        );
     }
 
-    // Serialized in one test, same reasoning as fec_percentage_env_parsing above.
     #[test]
     fn mic_jitter_ms_env_parsing() {
         const VAR: &str = "QUASAR_MIC_JITTER_MS";
-        let prior = std::env::var(VAR).ok();
 
-        std::env::remove_var(VAR);
-        assert_eq!(env_mic_jitter_ms(VAR), 60, "unset ⇒ 60 ms default");
+        assert_eq!(mic_jitter_ms_from(VAR, None), 60, "unset ⇒ 60 ms default");
 
-        std::env::set_var(VAR, "");
-        assert_eq!(env_mic_jitter_ms(VAR), 60, "empty ⇒ 60 ms default");
-
-        std::env::set_var(VAR, "75");
-        assert_eq!(env_mic_jitter_ms(VAR), 75, "\"75\" ⇒ 75");
-
-        std::env::set_var(VAR, "50");
-        assert_eq!(env_mic_jitter_ms(VAR), 50, "\"50\" ⇒ 50");
-
-        std::env::set_var(VAR, "junk");
         assert_eq!(
-            env_mic_jitter_ms(VAR),
+            mic_jitter_ms_from(VAR, Some("")),
+            60,
+            "empty ⇒ 60 ms default"
+        );
+
+        assert_eq!(mic_jitter_ms_from(VAR, Some("75")), 75, "\"75\" ⇒ 75");
+
+        assert_eq!(mic_jitter_ms_from(VAR, Some("50")), 50, "\"50\" ⇒ 50");
+
+        assert_eq!(
+            mic_jitter_ms_from(VAR, Some("junk")),
             60,
             "unparseable ⇒ default with warn"
         );
 
-        std::env::set_var(VAR, "-5");
         assert_eq!(
-            env_mic_jitter_ms(VAR),
+            mic_jitter_ms_from(VAR, Some("-5")),
             60,
             "negative ⇒ default with warn (u32 parse fails)"
         );
 
-        std::env::set_var(VAR, "0");
         assert_eq!(
-            env_mic_jitter_ms(VAR),
+            mic_jitter_ms_from(VAR, Some("0")),
             60,
             "explicit 0 ⇒ default with warn (a 0 ms jitter buffer defeats its purpose)"
         );
 
         // Not clamped to the 50-75 ms target: a value outside it is an operator's
         // experiment, not junk.
-        std::env::set_var(VAR, "200");
         assert_eq!(
-            env_mic_jitter_ms(VAR),
+            mic_jitter_ms_from(VAR, Some("200")),
             200,
             "any positive value is accepted, including outside the suggested range"
         );
-
-        match prior {
-            Some(v) => std::env::set_var(VAR, v),
-            None => std::env::remove_var(VAR),
-        }
     }
 
     /// A `StreamParams` at a 10 Mbps ceiling with an explicit wire ABR floor (`0` ⇒ unset).
@@ -1453,7 +1464,7 @@ mod tests {
     /// A baseline `RuntimeSettings` with ABR armed and a known ratio, plus an optional
     /// `QUASAR_ABR_FLOOR_KBPS`-equivalent floor.
     fn abr_settings(env_floor: Option<u32>, ratio: f64) -> settings::RuntimeSettings {
-        let mut s = settings::RuntimeSettings::baseline();
+        let mut s = settings::RuntimeSettings::baseline_with(&|_| None);
         s.abr_mode = AbrMode::Protective;
         s.abr_floor_kbps = env_floor;
         s.abr_floor_ratio = ratio;
@@ -1532,42 +1543,25 @@ mod tests {
         assert_eq!(abr.floor_kbps, 3000, "ratio floor = 10000 × 0.3");
     }
 
-    // `ladder_config()` reads the process-global `QUASAR_ABR_LADDER*` vars, so every
-    // case runs inside ONE serialized test that saves/restores each var it touches
-    // (there is no `serial_test` dep in this crate).
+    // `ladder_config()` reads only the `ladder` snapshot on `self`, not the process env.
 
-    /// A config whose `abr_mode` is set explicitly (no env), so only the
-    /// `QUASAR_ABR_LADDER*` vars gate `ladder_config()`.
-    fn cfg_with_mode(mode: AbrMode) -> SessionConfig {
-        let mut s = settings::RuntimeSettings::baseline();
+    /// A config whose `abr_mode` is set explicitly and whose `ladder` snapshot is built
+    /// from `lookup`, so only the injected `QUASAR_ABR_LADDER*` values gate
+    /// `ladder_config()`.
+    fn cfg_with_mode_and_ladder(
+        mode: AbrMode,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> SessionConfig {
+        let mut s = settings::RuntimeSettings::baseline_with(&|_| None);
         s.abr_mode = mode;
+        s.ladder = ladder::LadderSettings::from_lookup(lookup);
         SessionConfig::for_assignment_with(&s, stream_with_floor(0), None)
-    }
-
-    /// Restore an env var to its prior value (unset if it was absent).
-    fn restore(key: &str, prior: Option<String>) {
-        match prior {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
     }
 
     #[test]
     fn ladder_config_env_gating() {
-        let keys = [
-            "QUASAR_ABR_LADDER",
-            "QUASAR_ABR_LADDER_FPS",
-            "QUASAR_ABR_LADDER_RESOLUTION",
-        ];
-        let saved: Vec<(&str, Option<String>)> =
-            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-        // Clean slate.
-        for k in &keys {
-            std::env::remove_var(k);
-        }
-
         // Smooth + all ladder vars unset → Some(default ladder config).
-        let lc = cfg_with_mode(AbrMode::Smooth)
+        let lc = cfg_with_mode_and_ladder(AbrMode::Smooth, &crate::test_env::lookup(&[]))
             .ladder_config()
             .expect("Smooth + unset ⇒ Some(default)");
         assert_eq!(lc.max_bias, ladder::LadderConfig::DEFAULT_MAX_BIAS);
@@ -1575,71 +1569,87 @@ mod tests {
         assert!(!lc.resolution_enabled, "resolution rung defaults OFF");
 
         // QUASAR_ABR_LADDER=0 with no other rung armed ⇒ nothing to build → None.
-        std::env::set_var("QUASAR_ABR_LADDER", "0");
         assert!(
-            cfg_with_mode(AbrMode::Smooth).ladder_config().is_none(),
+            cfg_with_mode_and_ladder(
+                AbrMode::Smooth,
+                &crate::test_env::lookup(&[("QUASAR_ABR_LADDER", "0")])
+            )
+            .ladder_config()
+            .is_none(),
             "QUASAR_ABR_LADDER=0 + no rung ⇒ None"
         );
-        std::env::set_var("QUASAR_ABR_LADDER", "false");
-        assert!(cfg_with_mode(AbrMode::Smooth).ladder_config().is_none());
+        assert!(cfg_with_mode_and_ladder(
+            AbrMode::Smooth,
+            &crate::test_env::lookup(&[("QUASAR_ABR_LADDER", "false")])
+        )
+        .ladder_config()
+        .is_none());
 
         // #502: with a rung armed, the master flag does not disarm it; the config is
         // built and only the speed-bias rung is retired (max_bias == 0).
-        std::env::set_var("QUASAR_ABR_LADDER_RESOLUTION", "1");
-        let lc = cfg_with_mode(AbrMode::Smooth)
-            .ladder_config()
-            .expect("QUASAR_ABR_LADDER=0 + resolution rung on ⇒ Some");
+        let lc = cfg_with_mode_and_ladder(
+            AbrMode::Smooth,
+            &crate::test_env::lookup(&[
+                ("QUASAR_ABR_LADDER", "0"),
+                ("QUASAR_ABR_LADDER_RESOLUTION", "1"),
+            ]),
+        )
+        .ladder_config()
+        .expect("QUASAR_ABR_LADDER=0 + resolution rung on ⇒ Some");
         assert_eq!(lc.max_bias, 0, "master flag off ⇒ speed-bias rung inert");
         assert!(
             lc.resolution_enabled,
             "resolution rung survives the master flag"
         );
-        std::env::remove_var("QUASAR_ABR_LADDER_RESOLUTION");
-        std::env::remove_var("QUASAR_ABR_LADDER");
 
         // Protective never engages the ladder regardless of env → None.
         assert!(
-            cfg_with_mode(AbrMode::Protective).ladder_config().is_none(),
+            cfg_with_mode_and_ladder(AbrMode::Protective, &crate::test_env::lookup(&[]))
+                .ladder_config()
+                .is_none(),
             "Protective ⇒ None"
         );
         // Off never engages the ladder → None.
         assert!(
-            cfg_with_mode(AbrMode::Off).ladder_config().is_none(),
+            cfg_with_mode_and_ladder(AbrMode::Off, &crate::test_env::lookup(&[]))
+                .ladder_config()
+                .is_none(),
             "Off ⇒ None"
         );
 
         // fps / resolution env flags map onto the config fields (Smooth, ladder on).
-        std::env::set_var("QUASAR_ABR_LADDER_FPS", "1");
-        std::env::set_var("QUASAR_ABR_LADDER_RESOLUTION", "true");
-        let lc = cfg_with_mode(AbrMode::Smooth)
-            .ladder_config()
-            .expect("Smooth + ladder on ⇒ Some");
+        let lc = cfg_with_mode_and_ladder(
+            AbrMode::Smooth,
+            &crate::test_env::lookup(&[
+                ("QUASAR_ABR_LADDER_FPS", "1"),
+                ("QUASAR_ABR_LADDER_RESOLUTION", "true"),
+            ]),
+        )
+        .ladder_config()
+        .expect("Smooth + ladder on ⇒ Some");
         assert!(lc.fps_enabled, "QUASAR_ABR_LADDER_FPS=1 ⇒ fps_enabled");
         assert!(
             lc.resolution_enabled,
             "QUASAR_ABR_LADDER_RESOLUTION=true ⇒ resolution_enabled"
         );
-        std::env::remove_var("QUASAR_ABR_LADDER_FPS");
-        std::env::remove_var("QUASAR_ABR_LADDER_RESOLUTION");
 
         // The Protective/Off short-circuit wins even with fps/resolution flags set.
-        std::env::set_var("QUASAR_ABR_LADDER_FPS", "1");
         assert!(
-            cfg_with_mode(AbrMode::Protective).ladder_config().is_none(),
+            cfg_with_mode_and_ladder(
+                AbrMode::Protective,
+                &crate::test_env::lookup(&[("QUASAR_ABR_LADDER_FPS", "1")])
+            )
+            .ladder_config()
+            .is_none(),
             "mode gate precedes the fps/resolution flags"
         );
-
-        // Restore every var to its pre-test value.
-        for (k, prior) in saved {
-            restore(k, prior);
-        }
     }
 
     // Ladder settings are snapshotted at assign time: a later config_update cannot
     // retune a running session's ladder.
     #[test]
     fn ladder_config_comes_from_the_settings_snapshot_not_env() {
-        let mut settings = settings::RuntimeSettings::baseline();
+        let mut settings = settings::RuntimeSettings::baseline_with(&|_| None);
         settings.abr_mode = AbrMode::Smooth;
         settings.ladder.resolution_enabled = true;
         settings.ladder.res.min_height = 1080;
@@ -1653,7 +1663,7 @@ mod tests {
     /// The master flag off with no other rung armed is the only "no ladder at all" case.
     #[test]
     fn ladder_config_is_none_when_no_rung_is_armed() {
-        let mut settings = settings::RuntimeSettings::baseline();
+        let mut settings = settings::RuntimeSettings::baseline_with(&|_| None);
         settings.abr_mode = AbrMode::Smooth;
         settings.ladder.enabled = false;
         settings.ladder.resolution_enabled = false;
@@ -1667,7 +1677,7 @@ mod tests {
     #[test]
     fn a_rung_survives_the_master_flag_being_off() {
         for (res, fps) in [(true, false), (false, true), (true, true)] {
-            let mut settings = settings::RuntimeSettings::baseline();
+            let mut settings = settings::RuntimeSettings::baseline_with(&|_| None);
             settings.abr_mode = AbrMode::Smooth;
             settings.ladder.enabled = false;
             settings.ladder.resolution_enabled = res;
@@ -1687,7 +1697,7 @@ mod tests {
     /// test above cannot perturb it.
     #[test]
     fn the_master_flag_on_is_unchanged() {
-        let mut settings = settings::RuntimeSettings::baseline();
+        let mut settings = settings::RuntimeSettings::baseline_with(&|_| None);
         settings.abr_mode = AbrMode::Smooth;
         settings.ladder.enabled = true;
         settings.ladder.max_bias = 3;
@@ -1704,7 +1714,7 @@ mod tests {
     #[test]
     fn ladder_gate_warning_covers_the_mode_gate_only() {
         let armed = |mode: AbrMode, res: bool, fps: bool| {
-            let mut s = settings::RuntimeSettings::baseline();
+            let mut s = settings::RuntimeSettings::baseline_with(&|_| None);
             s.abr_mode = mode;
             s.ladder.resolution_enabled = res;
             s.ladder.fps_enabled = fps;

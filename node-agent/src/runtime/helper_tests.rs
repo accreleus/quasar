@@ -3287,7 +3287,10 @@ fn definitive_rejection_directory_cleanup_retries_without_container_inspection()
 
 /// Exercises the caller's real socket-readiness fallback against the same
 /// public Unix-engine fixture. Run explicitly: it mutates process globals and
-/// waits for the two-second readiness budget twice.
+/// waits for the two-second readiness budget twice. It sets `DOCKER_HOST` /
+/// `NODE_SECRET_PATH` / `QUASAR_PULSE_IMAGE` on the real process env, so it must run
+/// alone — never with `--include-ignored` alongside the rest of the suite, which reads
+/// those same vars.
 #[test]
 #[ignore]
 fn pulse_sidecar_socket_readiness_fallback_keeps_final_evidence_and_cleans() {

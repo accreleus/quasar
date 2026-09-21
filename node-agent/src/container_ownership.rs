@@ -162,7 +162,12 @@ mod tests {
         );
         let saved = first.token.clone();
         drop(first);
-        assert_eq!(acquire(&first_path).unwrap().token, saved);
+        let again = crate::test_lease::reacquire(
+            &first_path,
+            || acquire(&first_path),
+            |e| e.contains("another agent holds the state lease"),
+        );
+        assert_eq!(again.token, saved);
     }
 
     #[test]

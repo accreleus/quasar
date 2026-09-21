@@ -1403,7 +1403,7 @@ mod source_interpipe_tests {
     use crate::session::{EncoderChoice, SessionConfig};
 
     fn cfg_for(encoder: EncoderChoice, codec: crate::session::Codec) -> SessionConfig {
-        let mut settings = crate::session::settings::RuntimeSettings::baseline();
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
         settings.encoder = encoder;
         let stream = crate::session::StreamParams {
             width: 1920,

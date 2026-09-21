@@ -528,7 +528,7 @@ mod tests {
         height: i32,
         fps_enabled: bool,
     ) -> SessionConfig {
-        let mut settings = crate::session::settings::RuntimeSettings::baseline();
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
         settings.encoder = encoder;
         settings.abr_mode = crate::session::AbrMode::Smooth;
         settings.ladder.enabled = true;

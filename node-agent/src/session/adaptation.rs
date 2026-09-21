@@ -142,23 +142,34 @@ impl ClassifierConfig {
     /// Read operator overrides from the environment. Each is validated to `(0, 1]`; an
     /// unparseable/out-of-range value warns once and falls back to the default.
     pub fn from_env() -> Self {
+        Self::from_lookup(&|k| std::env::var(k).ok())
+    }
+
+    /// Pure core of [`ClassifierConfig::from_env`]: `lookup` supplies each var's raw
+    /// value instead of reading process env directly.
+    pub fn from_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
         let d = Self::default();
         Self {
-            encode_budget_frac: env_frac("QUASAR_ADAPT_ENCODE_BUDGET_FRAC", d.encode_budget_frac),
-            fps_steady_frac: env_frac("QUASAR_ADAPT_FPS_STEADY_FRAC", d.fps_steady_frac),
+            encode_budget_frac: env_frac(
+                "QUASAR_ADAPT_ENCODE_BUDGET_FRAC",
+                d.encode_budget_frac,
+                lookup,
+            ),
+            fps_steady_frac: env_frac("QUASAR_ADAPT_FPS_STEADY_FRAC", d.fps_steady_frac, lookup),
             gcc_below_setpoint_frac: env_frac(
                 "QUASAR_ADAPT_GCC_BELOW_FRAC",
                 d.gcc_below_setpoint_frac,
+                lookup,
             ),
-            send_at_cap_frac: env_frac("QUASAR_ADAPT_SEND_AT_CAP_FRAC", d.send_at_cap_frac),
+            send_at_cap_frac: env_frac("QUASAR_ADAPT_SEND_AT_CAP_FRAC", d.send_at_cap_frac, lookup),
         }
     }
 }
 
 /// Parse a classifier fraction in `(0, 1]`. Junk/out-of-range WARNs once and returns
 /// `default`. A trimmed-empty value is treated as unset (silent fall-through).
-fn env_frac(var: &str, default: f64) -> f64 {
-    match std::env::var(var).ok().as_deref().map(str::trim) {
+fn env_frac(var: &str, default: f64, lookup: &dyn Fn(&str) -> Option<String>) -> f64 {
+    match lookup(var).as_deref().map(str::trim) {
         None | Some("") => default,
         Some(raw) => match raw.parse::<f64>() {
             Ok(v) if v.is_finite() && v > 0.0 && v <= 1.0 => v,
@@ -372,32 +383,11 @@ mod tests {
     }
 
     // ---- config exposure: QUASAR_ADAPT_* classifier thresholds ----------------------
-    // Process-global env vars; all cases in ONE serialized snapshot/restore test (no
-    // serial_test dep, no other adaptation test touches env vars).
-
-    fn restore(key: &str, prior: Option<String>) {
-        match prior {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-    }
 
     #[test]
     fn classifier_config_env_defaults_and_overrides() {
-        let keys = [
-            "QUASAR_ADAPT_ENCODE_BUDGET_FRAC",
-            "QUASAR_ADAPT_FPS_STEADY_FRAC",
-            "QUASAR_ADAPT_GCC_BELOW_FRAC",
-            "QUASAR_ADAPT_SEND_AT_CAP_FRAC",
-        ];
-        let saved: Vec<(&str, Option<String>)> =
-            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-        for k in &keys {
-            std::env::remove_var(k);
-        }
-
-        // (a) All unset ⇒ from_env EXACTLY equals the old hardcoded constants.
-        let d = ClassifierConfig::from_env();
+        // (a) All unset ⇒ from_lookup EXACTLY equals the old hardcoded constants.
+        let d = ClassifierConfig::from_lookup(&crate::test_env::lookup(&[]));
         assert_eq!(d.encode_budget_frac, ENCODE_BUDGET_FRAC);
         assert_eq!(d.fps_steady_frac, FPS_STEADY_FRAC);
         assert_eq!(d.gcc_below_setpoint_frac, GCC_BELOW_SETPOINT_FRAC);
@@ -409,34 +399,38 @@ mod tests {
         );
 
         // (b) Each var set to a valid value is picked up.
-        std::env::set_var("QUASAR_ADAPT_ENCODE_BUDGET_FRAC", "0.9");
-        std::env::set_var("QUASAR_ADAPT_FPS_STEADY_FRAC", "0.75");
-        std::env::set_var("QUASAR_ADAPT_GCC_BELOW_FRAC", "0.8");
-        std::env::set_var("QUASAR_ADAPT_SEND_AT_CAP_FRAC", "0.95");
-        let s = ClassifierConfig::from_env();
+        let s = ClassifierConfig::from_lookup(&crate::test_env::lookup(&[
+            ("QUASAR_ADAPT_ENCODE_BUDGET_FRAC", "0.9"),
+            ("QUASAR_ADAPT_FPS_STEADY_FRAC", "0.75"),
+            ("QUASAR_ADAPT_GCC_BELOW_FRAC", "0.8"),
+            ("QUASAR_ADAPT_SEND_AT_CAP_FRAC", "0.95"),
+        ]));
         assert_eq!(s.encode_budget_frac, 0.9);
         assert_eq!(s.fps_steady_frac, 0.75);
         assert_eq!(s.gcc_below_setpoint_frac, 0.8);
         assert_eq!(s.send_at_cap_frac, 0.95);
 
         // (c) Invalid / out-of-range values fall back to the default.
-        std::env::set_var("QUASAR_ADAPT_ENCODE_BUDGET_FRAC", "0"); // not in (0,1]
-        std::env::set_var("QUASAR_ADAPT_FPS_STEADY_FRAC", "1.5"); // > 1
-        std::env::set_var("QUASAR_ADAPT_GCC_BELOW_FRAC", "junk"); // unparseable
-        std::env::set_var("QUASAR_ADAPT_SEND_AT_CAP_FRAC", "-0.2"); // negative
-        let f = ClassifierConfig::from_env();
+        let f = ClassifierConfig::from_lookup(&crate::test_env::lookup(&[
+            ("QUASAR_ADAPT_ENCODE_BUDGET_FRAC", "0"),  // not in (0,1]
+            ("QUASAR_ADAPT_FPS_STEADY_FRAC", "1.5"),   // > 1
+            ("QUASAR_ADAPT_GCC_BELOW_FRAC", "junk"),   // unparseable
+            ("QUASAR_ADAPT_SEND_AT_CAP_FRAC", "-0.2"), // negative
+        ]));
         assert_eq!(f.encode_budget_frac, ENCODE_BUDGET_FRAC);
         assert_eq!(f.fps_steady_frac, FPS_STEADY_FRAC);
         assert_eq!(f.gcc_below_setpoint_frac, GCC_BELOW_SETPOINT_FRAC);
         assert_eq!(f.send_at_cap_frac, SEND_AT_CAP_FRAC);
 
         // 1.0 is a VALID upper bound (inclusive) for these fractions — not a fall-back.
-        std::env::set_var("QUASAR_ADAPT_FPS_STEADY_FRAC", "1");
-        assert_eq!(ClassifierConfig::from_env().fps_steady_frac, 1.0);
-
-        for (k, prior) in saved {
-            restore(k, prior);
-        }
+        assert_eq!(
+            ClassifierConfig::from_lookup(&crate::test_env::lookup(&[(
+                "QUASAR_ADAPT_FPS_STEADY_FRAC",
+                "1"
+            )]))
+            .fps_steady_frac,
+            1.0
+        );
     }
 
     #[test]

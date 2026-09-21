@@ -57,6 +57,9 @@ impl Drop for ForeignContainer {
     }
 }
 
+/// Sets `DOCKER_HOST` / `QUASAR_HOME_ROOT` / `NODE_SECRET_PATH` on the real process env;
+/// this binary's sole test, so it is safe alone but must never run with
+/// `--include-ignored` alongside another suite that shares these vars.
 #[test]
 #[ignore = "requires explicit local Docker endpoint, existing image and daemon-host checkout path"]
 fn docker_inspection_and_foreign_mounts() {

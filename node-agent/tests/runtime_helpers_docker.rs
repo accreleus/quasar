@@ -43,6 +43,9 @@ impl Drop for RecoverOnExit {
     }
 }
 
+/// Sets `NODE_SECRET_PATH` on the real process env; this binary's sole test, so it is
+/// safe alone but must never run with `--include-ignored` alongside another suite that
+/// shares this env var.
 #[test]
 #[ignore = "requires explicit local Docker socket, installed image and daemon-host checkout path"]
 fn docker_diagnostic_lifecycle() {

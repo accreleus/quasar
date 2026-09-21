@@ -173,7 +173,13 @@ fn is_unhealthy(consecutive_failures: usize) -> bool {
 /// is disabled (empty string, `"0"`, or unset-with-no-default — though the
 /// documented default is `127.0.0.1:9091`).
 pub fn addr_from_env() -> Option<String> {
-    let raw = std::env::var("QUASAR_HEALTH_ADDR").unwrap_or_else(|_| "127.0.0.1:9091".to_string());
+    addr_from(std::env::var("QUASAR_HEALTH_ADDR").ok().as_deref())
+}
+
+/// Pure core of [`addr_from_env`]: `raw` is the `QUASAR_HEALTH_ADDR` value as read from
+/// env, `None` for unset.
+fn addr_from(raw: Option<&str>) -> Option<String> {
+    let raw = raw.unwrap_or("127.0.0.1:9091");
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed == "0" {
         None
@@ -582,12 +588,11 @@ mod tests {
 
     #[test]
     fn addr_from_env_disabled_variants() {
-        std::env::set_var("QUASAR_HEALTH_ADDR", "");
-        assert_eq!(addr_from_env(), None);
-        std::env::set_var("QUASAR_HEALTH_ADDR", "0");
-        assert_eq!(addr_from_env(), None);
-        std::env::set_var("QUASAR_HEALTH_ADDR", "127.0.0.1:9999");
-        assert_eq!(addr_from_env(), Some("127.0.0.1:9999".to_string()));
-        std::env::remove_var("QUASAR_HEALTH_ADDR");
+        assert_eq!(addr_from(Some("")), None);
+        assert_eq!(addr_from(Some("0")), None);
+        assert_eq!(
+            addr_from(Some("127.0.0.1:9999")),
+            Some("127.0.0.1:9999".to_string())
+        );
     }
 }

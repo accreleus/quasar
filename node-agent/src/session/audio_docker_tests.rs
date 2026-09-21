@@ -54,6 +54,9 @@ impl Drop for Fixture {
     }
 }
 
+/// Sets `DOCKER_HOST` / `NODE_SECRET_PATH` / `QUASAR_PULSE_IMAGE` on the real process
+/// env, so this must run alone — never with `--include-ignored` alongside the rest of
+/// the suite, which reads those same vars.
 #[test]
 #[ignore = "requires explicit local Docker socket, existing Pulse image and same-path host bind"]
 fn pulse_caller_preserves_socket_until_daemon_cleanup_is_known() {

@@ -179,7 +179,15 @@ fn retain_pending_application_sources(
 }
 
 fn clear_pending_application(name: &str, operation: &str) {
-    if let Ok(mut pending) = pending_application_operations().lock() {
+    clear_pending_application_in(pending_application_operations(), name, operation);
+}
+
+fn clear_pending_application_in(
+    map: &Mutex<HashMap<String, PendingApplication>>,
+    name: &str,
+    operation: &str,
+) {
+    if let Ok(mut pending) = map.lock() {
         if pending
             .get(name)
             .is_some_and(|entry| entry.operation == operation)
@@ -256,8 +264,10 @@ where
 
 /// Snapshot explicit caller cleanup obligations without holding the mutex across Docker.
 /// A running container enters this set only after its caller requested abandonment or stop.
-fn pending_application_operation_snapshot() -> Result<Vec<(String, String)>> {
-    Ok(pending_application_operations()
+fn pending_application_operation_snapshot(
+    map: &Mutex<HashMap<String, PendingApplication>>,
+) -> Result<Vec<(String, String)>> {
+    Ok(map
         .lock()
         .map_err(|_| anyhow!("application pending-operation lock poisoned"))?
         .iter()
@@ -267,13 +277,25 @@ fn pending_application_operation_snapshot() -> Result<Vec<(String, String)>> {
 
 /// Retry each explicit caller obligation independently. A failed operation stays in the
 /// map for its exact identity, while a healthy later operation still gets its chance.
-pub(crate) fn recover_pending_application_operations<F>(mut retire: F) -> Result<()>
+pub(crate) fn recover_pending_application_operations<F>(retire: F) -> Result<()>
 where
     F: FnMut(&str) -> Result<()>,
 {
-    for (name, operation) in pending_application_operation_snapshot()? {
+    recover_pending_application_operations_in(pending_application_operations(), retire)
+}
+
+/// The sweep over `map`. It retires every entry, so a test must pass a private map: on
+/// the process-global one it would retire other tests' entries (#285).
+fn recover_pending_application_operations_in<F>(
+    map: &Mutex<HashMap<String, PendingApplication>>,
+    mut retire: F,
+) -> Result<()>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    for (name, operation) in pending_application_operation_snapshot(map)? {
         match retire(&operation) {
-            Ok(()) => clear_pending_application(&name, &operation),
+            Ok(()) => clear_pending_application_in(map, &name, &operation),
             Err(error) => tracing::warn!(
                 token = "application-pending-operation-retry",
                 operation = %operation,
@@ -1425,11 +1447,20 @@ fn privilege_optout_from(value: Option<&str>) -> bool {
 }
 
 fn resolve_network(spec_network: Option<&str>) -> Result<String> {
+    resolve_network_with(
+        spec_network,
+        std::env::var("QUASAR_CONTAINER_NETWORK").ok().as_deref(),
+    )
+}
+
+/// Pure core of [`resolve_network`]: `host_knob` is the `QUASAR_CONTAINER_NETWORK` value
+/// as read from env, `None` for unset.
+fn resolve_network_with(spec_network: Option<&str>, host_knob: Option<&str>) -> Result<String> {
     let (value, source, allowed): (String, &str, &[&str]) =
         match spec_network.map(str::trim).filter(|s| !s.is_empty()) {
             Some(v) => (v.to_string(), "the app spec", &APP_CONTAINER_NETWORKS),
-            None => match std::env::var("QUASAR_CONTAINER_NETWORK") {
-                Ok(v) if !v.trim().is_empty() => (
+            None => match host_knob {
+                Some(v) if !v.trim().is_empty() => (
                     v.trim().to_string(),
                     "QUASAR_CONTAINER_NETWORK",
                     &HOST_CONTAINER_NETWORKS,
@@ -2836,78 +2867,80 @@ mod tests {
     }
 
     /// §S2 container-network resolution + its defensive validation.
-    /// `QUASAR_CONTAINER_NETWORK` is process-global, so every case lives in ONE
-    /// serialized test that saves and restores it (no `serial_test` dep here).
     #[test]
     fn container_network_precedence_and_validation() {
-        const KEY: &str = "QUASAR_CONTAINER_NETWORK";
-        let saved = std::env::var(KEY).ok();
-        std::env::remove_var(KEY);
-
         // 1. Nothing stated anywhere ⇒ the hardened default.
-        assert_eq!(resolve_network(None).unwrap(), "none");
+        assert_eq!(resolve_network_with(None, None).unwrap(), "none");
         // An empty/whitespace app value is "unset", not a value.
-        assert_eq!(resolve_network(Some("")).unwrap(), "none");
-        assert_eq!(resolve_network(Some("  ")).unwrap(), "none");
+        assert_eq!(resolve_network_with(Some(""), None).unwrap(), "none");
+        assert_eq!(resolve_network_with(Some("  "), None).unwrap(), "none");
 
         // 2. The app spec wins outright (the #463 Steam case: the app declares bridge
         //    on a host that never set the knob).
-        assert_eq!(resolve_network(Some("bridge")).unwrap(), "bridge");
-        assert_eq!(resolve_network(Some("none")).unwrap(), "none");
+        assert_eq!(
+            resolve_network_with(Some("bridge"), None).unwrap(),
+            "bridge"
+        );
+        assert_eq!(resolve_network_with(Some("none"), None).unwrap(), "none");
 
         // 3. The host knob applies only when the app states nothing…
-        std::env::set_var(KEY, "bridge");
-        assert_eq!(resolve_network(None).unwrap(), "bridge");
+        assert_eq!(
+            resolve_network_with(None, Some("bridge")).unwrap(),
+            "bridge"
+        );
         //    …and an app that states one still overrides it, in BOTH directions:
         //    an app can also pin itself back to `none` on a bridged host.
-        assert_eq!(resolve_network(Some("bridge")).unwrap(), "bridge");
-        assert_eq!(resolve_network(Some("none")).unwrap(), "none");
+        assert_eq!(
+            resolve_network_with(Some("bridge"), Some("bridge")).unwrap(),
+            "bridge"
+        );
+        assert_eq!(
+            resolve_network_with(Some("none"), Some("bridge")).unwrap(),
+            "none"
+        );
 
         // 4. An out-of-set value fails the launch from EITHER source: the backstop that
         //    keeps `container:<id>` off the docker command line. (`"bridge "` is not
         //    here: whitespace is trimmed, so it is the legitimate value.)
-        std::env::remove_var(KEY);
         for bad in [
             "container:quasar-control-plane",
             "my-net",
             "NONE",
             "host;rm",
         ] {
-            let err = resolve_network(Some(bad))
+            let err = resolve_network_with(Some(bad), None)
                 .expect_err(&format!("{bad:?} from the app spec must be rejected"));
             assert!(
                 err.to_string().contains("not an allowed value"),
                 "unexpected error for {bad:?}: {err}"
             );
         }
-        std::env::set_var(KEY, "container:quasar-control-plane");
-        let err = resolve_network(None).expect_err("a bad host knob must be rejected too");
+        let err = resolve_network_with(None, Some("container:quasar-control-plane"))
+            .expect_err("a bad host knob must be rejected too");
         assert!(err.to_string().contains("QUASAR_CONTAINER_NETWORK"));
 
         // A blank host knob is "unset", not an invalid value.
-        std::env::set_var(KEY, "");
-        assert_eq!(resolve_network(None).unwrap(), "none");
+        assert_eq!(resolve_network_with(None, Some("")).unwrap(), "none");
 
         // 5. The asymmetry (#464): `host` removes the container's network namespace, so
         //    it is reachable ONLY from this host's operator knob, never from the wire,
         //    where the value may come from a portable manifest authored elsewhere.
-        std::env::set_var(KEY, "host");
         assert_eq!(
-            resolve_network(None).unwrap(),
+            resolve_network_with(None, Some("host")).unwrap(),
             "host",
             "an operator must still be able to select host networking on their own machine"
         );
         // Even with the operator knob set to host, an app asking for host is refused: a
         // permissive host must not become a permissive wire.
-        let err = resolve_network(Some("host"))
+        let err = resolve_network_with(Some("host"), Some("host"))
             .expect_err("`host` from the app spec must be rejected, always");
         assert!(
             err.to_string()
                 .contains("removes the container's network isolation"),
             "the rejection must explain the policy and name the operator knob: {err}"
         );
-        std::env::remove_var(KEY);
-        let err = resolve_network(Some("host")).expect_err("`host` from the wire is never allowed");
+        let err = resolve_network_with(Some("host"), None)
+            .expect_err("`host` from the wire is never allowed");
         assert!(err.to_string().contains("QUASAR_CONTAINER_NETWORK"));
         // The app-facing message must not advertise host as an option.
         assert!(
@@ -2915,11 +2948,6 @@ mod tests {
                 .contains("expected one of none, bridge, host"),
             "the app-facing error must not list host as available: {err}"
         );
-
-        match saved {
-            Some(v) => std::env::set_var(KEY, v),
-            None => std::env::remove_var(KEY),
-        }
     }
 
     /// The wire field is ADDITIVE and OPTIONAL: an assign from a control plane that
@@ -3129,18 +3157,8 @@ mod tests {
             operation: "application-pending-healthy".into(),
             writable_sources: BTreeSet::from(["/managed/pending-healthy".into()]),
         };
-        let active = PendingApplication {
-            operation: "application-active-unrequested".into(),
-            writable_sources: BTreeSet::new(),
-        };
-        let pending = pending_application_operations();
-        for (name, operation) in [
-            ("quasar-sess-pending-stuck", &stuck.operation),
-            ("quasar-sess-pending-healthy", &healthy.operation),
-            ("quasar-sess-active-unrequested", &active.operation),
-        ] {
-            clear_pending_application(name, operation);
-        }
+        let map = Mutex::new(HashMap::new());
+        let pending = &map;
         pending
             .lock()
             .unwrap()
@@ -3152,7 +3170,7 @@ mod tests {
         // This represents an active app absent from the caller's explicit-stop snapshot;
         // it must not be offered to abandonment at all.
         let calls = std::cell::RefCell::new(Vec::new());
-        recover_pending_application_operations(|operation| {
+        recover_pending_application_operations_in(pending, |operation| {
             calls.borrow_mut().push(operation.to_owned());
             if operation == stuck.operation {
                 anyhow::bail!("daemon busy")
@@ -3179,7 +3197,6 @@ mod tests {
             .lock()
             .unwrap()
             .contains_key("quasar-sess-active-unrequested"));
-        clear_pending_application("quasar-sess-pending-stuck", &stuck.operation);
     }
 
     #[test]

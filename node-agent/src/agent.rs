@@ -2238,8 +2238,13 @@ const HELD_SESSION_BACKOFF_CAP: Duration = Duration::from_secs(5);
 /// restoring the pre-#128 behaviour of stopping every session the moment the
 /// connection drops.
 fn session_grace() -> Duration {
-    let secs = std::env::var("QUASAR_SESSION_GRACE_SECS")
-        .ok()
+    session_grace_from(std::env::var("QUASAR_SESSION_GRACE_SECS").ok().as_deref())
+}
+
+/// Pure core of [`session_grace`]: `raw` is the `QUASAR_SESSION_GRACE_SECS` value as read
+/// from env, `None` for unset.
+fn session_grace_from(raw: Option<&str>) -> Duration {
+    let secs = raw
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_SESSION_GRACE_SECS);
     Duration::from_secs(secs)
@@ -5018,7 +5023,7 @@ mod tests {
         assert_offloadable(capacity::detect);
         assert_offloadable(crate::capacity::prewarm_nvidia_smi_rows);
 
-        let settings = crate::session::settings::RuntimeSettings::baseline();
+        let settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
         assert_offloadable(move || probe_host_codecs(&settings));
 
         let lib32 = String::new();
@@ -5584,7 +5589,7 @@ mod tests {
     }
 
     fn assignment_config(encoder: EncoderChoice, render_node: &str) -> SessionConfig {
-        let mut settings = crate::session::settings::RuntimeSettings::baseline();
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
         settings.encoder = encoder;
         settings.render_node = render_node.to_string();
         SessionConfig::for_assignment_with(
@@ -6484,6 +6489,9 @@ mod tests {
             test_release_mgr(),
         );
         mgr.runner = runner;
+        // SessionManager::new seeds these from the process env; pin them so tests stay hermetic.
+        mgr.runtime_settings.encoder = crate::session::EncoderChoice::Openh264;
+        mgr.runtime_settings.render_node = "software".to_string();
         (mgr, live_refs)
     }
 
@@ -6723,31 +6731,23 @@ mod tests {
     /// behaviour rather than meaning "no wait at all by accident".
     #[test]
     fn session_grace_reads_its_knob() {
-        let prev = std::env::var("QUASAR_SESSION_GRACE_SECS").ok();
-
-        std::env::remove_var("QUASAR_SESSION_GRACE_SECS");
         assert_eq!(
-            session_grace(),
+            session_grace_from(None),
             Duration::from_secs(DEFAULT_SESSION_GRACE_SECS)
         );
 
-        std::env::set_var("QUASAR_SESSION_GRACE_SECS", "5");
-        assert_eq!(session_grace(), Duration::from_secs(5));
+        assert_eq!(session_grace_from(Some("5")), Duration::from_secs(5));
 
-        std::env::set_var("QUASAR_SESSION_GRACE_SECS", "0");
-        assert!(session_grace().is_zero(), "0 must disable the hold");
+        assert!(
+            session_grace_from(Some("0")).is_zero(),
+            "0 must disable the hold"
+        );
 
         // Garbage falls back rather than disabling the hold silently.
-        std::env::set_var("QUASAR_SESSION_GRACE_SECS", "not-a-number");
         assert_eq!(
-            session_grace(),
+            session_grace_from(Some("not-a-number")),
             Duration::from_secs(DEFAULT_SESSION_GRACE_SECS)
         );
-
-        match prev {
-            Some(v) => std::env::set_var("QUASAR_SESSION_GRACE_SECS", v),
-            None => std::env::remove_var("QUASAR_SESSION_GRACE_SECS"),
-        }
     }
 
     /// A panicking runner must produce a terminal `Failed` carrying the panic payload.

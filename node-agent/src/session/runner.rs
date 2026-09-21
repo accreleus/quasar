@@ -4048,7 +4048,7 @@ mod tests {
         gst::init().unwrap();
 
         // A 1280x720 "launch" software session (openh264 arm: videoscale + capsfilter).
-        let mut settings = crate::session::settings::RuntimeSettings::baseline();
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
         settings.encoder = crate::session::EncoderChoice::Openh264;
         let stream = crate::session::StreamParams {
             width: 1280,
@@ -4136,7 +4136,7 @@ mod tests {
         launch: (i32, i32),
     ) -> Arc<pipeline::EncodeResolutionLever> {
         gst::init().unwrap();
-        let mut settings = crate::session::settings::RuntimeSettings::baseline();
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
         settings.encoder = crate::session::EncoderChoice::Openh264;
         let stream = crate::session::StreamParams {
             width: launch.0,

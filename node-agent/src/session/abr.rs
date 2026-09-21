@@ -150,6 +150,12 @@ impl AbrConfig {
         // that reads+validates these vars.
         AbrGovernorSettings::from_env().apply_to(self)
     }
+
+    /// Pure core of [`AbrConfig::with_env_overrides`]: `lookup` supplies each var's raw
+    /// value instead of reading process env directly.
+    pub fn with_overrides_from(self, lookup: &dyn Fn(&str) -> Option<String>) -> Self {
+        AbrGovernorSettings::from_lookup(lookup).apply_to(self)
+    }
 }
 
 /// The host's ABR governor hysteresis knobs (`QUASAR_ABR_EWMA_ALPHA`,
@@ -177,22 +183,47 @@ pub struct AbrGovernorSettings {
 
 impl AbrGovernorSettings {
     pub fn from_env() -> Self {
+        Self::from_lookup(&|k| std::env::var(k).ok())
+    }
+
+    /// Pure core of [`AbrGovernorSettings::from_env`]: `lookup` supplies each var's raw
+    /// value instead of reading process env directly.
+    pub fn from_lookup(lookup: &dyn Fn(&str) -> Option<String>) -> Self {
         Self {
-            ewma_alpha: env_frac_open_unit_incl("QUASAR_ABR_EWMA_ALPHA", AbrConfig::DEFAULT_ALPHA),
-            deadband: env_frac_open_unit_excl("QUASAR_ABR_DEADBAND", AbrConfig::DEFAULT_DEADBAND),
-            max_up_step: env_pos_f64("QUASAR_ABR_MAX_UP_STEP", AbrConfig::DEFAULT_MAX_UP_STEP),
+            ewma_alpha: env_frac_open_unit_incl(
+                "QUASAR_ABR_EWMA_ALPHA",
+                AbrConfig::DEFAULT_ALPHA,
+                lookup,
+            ),
+            deadband: env_frac_open_unit_excl(
+                "QUASAR_ABR_DEADBAND",
+                AbrConfig::DEFAULT_DEADBAND,
+                lookup,
+            ),
+            max_up_step: env_pos_f64(
+                "QUASAR_ABR_MAX_UP_STEP",
+                AbrConfig::DEFAULT_MAX_UP_STEP,
+                lookup,
+            ),
             min_interval_ms: env_ms_min1(
                 "QUASAR_ABR_MIN_INTERVAL_MS",
                 AbrConfig::DEFAULT_MIN_INTERVAL_MS,
+                lookup,
             ),
             max_down_step: env_frac_open_unit_excl(
                 "QUASAR_ABR_MAX_DOWN_STEP",
                 AbrConfig::DEFAULT_MAX_DOWN_STEP,
+                lookup,
             ),
-            down_dwell_ms: env_ms_ge0("QUASAR_ABR_DOWN_DWELL_MS", AbrConfig::DEFAULT_DOWN_DWELL_MS),
+            down_dwell_ms: env_ms_ge0(
+                "QUASAR_ABR_DOWN_DWELL_MS",
+                AbrConfig::DEFAULT_DOWN_DWELL_MS,
+                lookup,
+            ),
             cliff_guard_frac: env_frac_open_unit_excl(
                 "QUASAR_ABR_CLIFF_GUARD_FRAC",
                 AbrConfig::DEFAULT_CLIFF_GUARD_FRAC,
+                lookup,
             ),
         }
     }
@@ -276,26 +307,40 @@ impl Default for AbrGovernorSettings {
 
 /// Parse a fraction in the OPEN-CLOSED unit interval `(0, 1]` (e.g. an EWMA alpha).
 /// Junk/out-of-range WARNs once and returns `default`.
-fn env_frac_open_unit_incl(var: &str, default: f64) -> f64 {
-    parse_validated_f64(var, default, |v| v > 0.0 && v <= 1.0, "(0, 1]")
+fn env_frac_open_unit_incl(
+    var: &str,
+    default: f64,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> f64 {
+    parse_validated_f64(var, default, |v| v > 0.0 && v <= 1.0, "(0, 1]", lookup)
 }
 
 /// Parse a fraction in the OPEN unit interval `(0, 1)` (deadband / down-step / cliff-guard).
 /// Junk/out-of-range WARNs once and returns `default`.
-fn env_frac_open_unit_excl(var: &str, default: f64) -> f64 {
-    parse_validated_f64(var, default, |v| v > 0.0 && v < 1.0, "(0, 1)")
+fn env_frac_open_unit_excl(
+    var: &str,
+    default: f64,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> f64 {
+    parse_validated_f64(var, default, |v| v > 0.0 && v < 1.0, "(0, 1)", lookup)
 }
 
 /// Parse a strictly-positive fraction/multiplier `(0, ∞)` (e.g. max up-step).
 /// Junk/out-of-range WARNs once and returns `default`.
-fn env_pos_f64(var: &str, default: f64) -> f64 {
-    parse_validated_f64(var, default, |v| v > 0.0, "> 0")
+fn env_pos_f64(var: &str, default: f64, lookup: &dyn Fn(&str) -> Option<String>) -> f64 {
+    parse_validated_f64(var, default, |v| v > 0.0, "> 0", lookup)
 }
 
 /// Shared f64 env parser with range validation + warn-once-on-bad-value. A trimmed-empty
 /// value is treated as unset (silent fall-through), matching `AbrMode::from_env`.
-fn parse_validated_f64(var: &str, default: f64, ok: impl Fn(f64) -> bool, range: &str) -> f64 {
-    match std::env::var(var).ok().as_deref().map(str::trim) {
+fn parse_validated_f64(
+    var: &str,
+    default: f64,
+    ok: impl Fn(f64) -> bool,
+    range: &str,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> f64 {
+    match lookup(var).as_deref().map(str::trim) {
         None | Some("") => default,
         Some(raw) => match raw.parse::<f64>() {
             Ok(v) if v.is_finite() && ok(v) => v,
@@ -312,19 +357,25 @@ fn parse_validated_f64(var: &str, default: f64, ok: impl Fn(f64) -> bool, range:
 
 /// Parse a millisecond count that must be `>= 1` (a zero interval would defeat the
 /// anti-thrash gate). Junk/zero WARNs once and returns `default`.
-fn env_ms_min1(var: &str, default: u64) -> u64 {
-    parse_validated_ms(var, default, |v| v >= 1, ">= 1")
+fn env_ms_min1(var: &str, default: u64, lookup: &dyn Fn(&str) -> Option<String>) -> u64 {
+    parse_validated_ms(var, default, |v| v >= 1, ">= 1", lookup)
 }
 
 /// Parse a millisecond count that may be `>= 0` (0 = no dwell, a valid disable).
 /// Junk WARNs once and returns `default`.
-fn env_ms_ge0(var: &str, default: u64) -> u64 {
-    parse_validated_ms(var, default, |_| true, ">= 0")
+fn env_ms_ge0(var: &str, default: u64, lookup: &dyn Fn(&str) -> Option<String>) -> u64 {
+    parse_validated_ms(var, default, |_| true, ">= 0", lookup)
 }
 
 /// Shared millisecond env parser with range validation + warn-once-on-bad-value.
-fn parse_validated_ms(var: &str, default: u64, ok: impl Fn(u64) -> bool, range: &str) -> u64 {
-    match std::env::var(var).ok().as_deref().map(str::trim) {
+fn parse_validated_ms(
+    var: &str,
+    default: u64,
+    ok: impl Fn(u64) -> bool,
+    range: &str,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> u64 {
+    match lookup(var).as_deref().map(str::trim) {
         None | Some("") => default,
         Some(raw) => match raw.parse::<u64>() {
             Ok(v) if ok(v) => v,
@@ -849,35 +900,11 @@ mod tests {
     }
 
     // ---- config exposure: QUASAR_ABR_* hysteresis knobs -----------------------------
-    // Process-global env vars; all cases run inside ONE serialized test that snapshots
-    // + restores every var it touches (no serial_test dep; no other abr test touches env).
-
-    fn restore(key: &str, prior: Option<String>) {
-        match prior {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-    }
 
     #[test]
     fn env_overrides_default_to_the_old_constants_and_are_picked_up() {
-        let keys = [
-            "QUASAR_ABR_EWMA_ALPHA",
-            "QUASAR_ABR_DEADBAND",
-            "QUASAR_ABR_MAX_UP_STEP",
-            "QUASAR_ABR_MIN_INTERVAL_MS",
-            "QUASAR_ABR_MAX_DOWN_STEP",
-            "QUASAR_ABR_DOWN_DWELL_MS",
-            "QUASAR_ABR_CLIFF_GUARD_FRAC",
-        ];
-        let saved: Vec<(&str, Option<String>)> =
-            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-        for k in &keys {
-            std::env::remove_var(k);
-        }
-
         // (a) All unset ⇒ overlay is a no-op: every field EXACTLY equals its old constant.
-        let d = AbrConfig::new(2500, 8000, 60).with_env_overrides();
+        let d = AbrConfig::new(2500, 8000, 60).with_overrides_from(&crate::test_env::lookup(&[]));
         assert_eq!(d.ewma_alpha, AbrConfig::DEFAULT_ALPHA);
         assert_eq!(d.deadband, AbrConfig::DEFAULT_DEADBAND);
         assert_eq!(d.max_up_step, AbrConfig::DEFAULT_MAX_UP_STEP);
@@ -892,14 +919,16 @@ mod tests {
         assert_eq!(d.down_policy, DownPolicy::Protective);
 
         // (b) Each var set to a valid value is picked up verbatim.
-        std::env::set_var("QUASAR_ABR_EWMA_ALPHA", "0.5");
-        std::env::set_var("QUASAR_ABR_DEADBAND", "0.2");
-        std::env::set_var("QUASAR_ABR_MAX_UP_STEP", "0.25");
-        std::env::set_var("QUASAR_ABR_MIN_INTERVAL_MS", "3000");
-        std::env::set_var("QUASAR_ABR_MAX_DOWN_STEP", "0.2");
-        std::env::set_var("QUASAR_ABR_DOWN_DWELL_MS", "5000");
-        std::env::set_var("QUASAR_ABR_CLIFF_GUARD_FRAC", "0.4");
-        let s = AbrConfig::new_smooth(2500, 8000, 60).with_env_overrides();
+        let s =
+            AbrConfig::new_smooth(2500, 8000, 60).with_overrides_from(&crate::test_env::lookup(&[
+                ("QUASAR_ABR_EWMA_ALPHA", "0.5"),
+                ("QUASAR_ABR_DEADBAND", "0.2"),
+                ("QUASAR_ABR_MAX_UP_STEP", "0.25"),
+                ("QUASAR_ABR_MIN_INTERVAL_MS", "3000"),
+                ("QUASAR_ABR_MAX_DOWN_STEP", "0.2"),
+                ("QUASAR_ABR_DOWN_DWELL_MS", "5000"),
+                ("QUASAR_ABR_CLIFF_GUARD_FRAC", "0.4"),
+            ]));
         assert_eq!(s.ewma_alpha, 0.5);
         assert_eq!(s.deadband, 0.2);
         assert_eq!(s.max_up_step, 0.25);
@@ -914,13 +943,15 @@ mod tests {
         );
 
         // (c) Invalid / out-of-range values fall back to the default (warn + default).
-        std::env::set_var("QUASAR_ABR_EWMA_ALPHA", "1.5"); // > 1
-        std::env::set_var("QUASAR_ABR_DEADBAND", "0"); // not in (0,1)
-        std::env::set_var("QUASAR_ABR_MAX_UP_STEP", "-0.1"); // negative
-        std::env::set_var("QUASAR_ABR_MIN_INTERVAL_MS", "0"); // must be >= 1
-        std::env::set_var("QUASAR_ABR_MAX_DOWN_STEP", "junk"); // unparseable
-        std::env::set_var("QUASAR_ABR_CLIFF_GUARD_FRAC", "1"); // not in (0,1)
-        let f = AbrConfig::new_smooth(2500, 8000, 60).with_env_overrides();
+        let f =
+            AbrConfig::new_smooth(2500, 8000, 60).with_overrides_from(&crate::test_env::lookup(&[
+                ("QUASAR_ABR_EWMA_ALPHA", "1.5"),     // > 1
+                ("QUASAR_ABR_DEADBAND", "0"),         // not in (0,1)
+                ("QUASAR_ABR_MAX_UP_STEP", "-0.1"),   // negative
+                ("QUASAR_ABR_MIN_INTERVAL_MS", "0"),  // must be >= 1
+                ("QUASAR_ABR_MAX_DOWN_STEP", "junk"), // unparseable
+                ("QUASAR_ABR_CLIFF_GUARD_FRAC", "1"), // not in (0,1)
+            ]));
         assert_eq!(f.ewma_alpha, AbrConfig::DEFAULT_ALPHA);
         assert_eq!(f.deadband, AbrConfig::DEFAULT_DEADBAND);
         assert_eq!(f.max_up_step, AbrConfig::DEFAULT_MAX_UP_STEP);
@@ -929,13 +960,11 @@ mod tests {
         assert_eq!(f.cliff_guard_frac, AbrConfig::DEFAULT_CLIFF_GUARD_FRAC);
 
         // (d) A down-dwell of 0 is VALID (disables the dwell) — not a fall-back.
-        std::env::set_var("QUASAR_ABR_DOWN_DWELL_MS", "0");
-        let z = AbrConfig::new_smooth(2500, 8000, 60).with_env_overrides();
+        let z =
+            AbrConfig::new_smooth(2500, 8000, 60).with_overrides_from(&crate::test_env::lookup(&[
+                ("QUASAR_ABR_DOWN_DWELL_MS", "0"),
+            ]));
         assert_eq!(z.down_dwell, Duration::from_millis(0));
-
-        for (k, prior) in saved {
-            restore(k, prior);
-        }
     }
 
     // ---- the floor follows the ladder rung ------------------------------------------

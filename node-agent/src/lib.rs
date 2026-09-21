@@ -44,3 +44,9 @@ pub mod vram;
 
 pub mod runtime;
 pub mod source_policy;
+
+/// Lookup-closure builder for tests of env-reading pure cores.
+#[cfg(test)]
+pub(crate) mod test_env;
+#[cfg(test)]
+pub(crate) mod test_lease;

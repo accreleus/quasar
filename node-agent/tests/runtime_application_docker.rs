@@ -77,6 +77,9 @@ impl Drop for CleanupGuard {
     }
 }
 
+/// Sets `NODE_SECRET_PATH` on the real process env; this binary's sole test, so it is
+/// safe alone but must never run with `--include-ignored` alongside another suite that
+/// shares this env var.
 #[test]
 #[ignore = "requires QUASAR_TEST_RUNTIME_SOCKET, QUASAR_TEST_RUNTIME_IMAGE, and QUASAR_TEST_RUNTIME_HOST_ROOT"]
 fn docker_application_lifecycle() {

@@ -153,7 +153,7 @@ mod tests {
     }
 
     fn settings(encoder: EncoderChoice) -> RuntimeSettings {
-        let mut s = RuntimeSettings::baseline();
+        let mut s = RuntimeSettings::baseline_with(&|_| None);
         s.encoder = encoder;
         // Unpinned: `bind_gpu` adopts the scheduled GPU's node, as a session does.
         s.render_node = String::new();

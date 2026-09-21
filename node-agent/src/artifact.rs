@@ -654,7 +654,11 @@ mod tests {
         );
         drop(l);
         assert!(!p.exists());
-        let l2 = Lock::acquire(&p, "test").unwrap();
+        let l2 = crate::test_lease::reacquire(
+            &p.with_extension("guard"),
+            || Lock::acquire(&p, "test"),
+            |e| e.to_string().contains("waiting for its kernel lock"),
+        );
         drop(l2);
         let _ = std::fs::remove_dir_all(&dir);
     }
