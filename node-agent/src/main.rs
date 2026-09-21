@@ -573,7 +573,8 @@ fn run_input_probe() {
 
 /// `quasar-node-agent media-probe [--gpu N] [--codec h264|h265|av1] [--size WxH@FPS]
 /// [--frames N] [--budget-secs N]`. The GPU binding and encoder selection arrive as env
-/// from the parent (`host_probe::media`). One stdout line; exit 0 pass, 1 fail, 2 usage.
+/// from the parent (`host_probe::media`). One result line, preceded by a remediation line
+/// on a pixel mismatch; exit 0 pass, 1 fail, 2 usage, 3 indeterminate.
 fn run_media_probe(request: session::probe_media::MediaProbeRequest) {
     tracing::info!("quasar node-agent — media host probe");
     let verdict = session::probe_media::run(&request);

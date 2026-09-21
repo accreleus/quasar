@@ -20,12 +20,14 @@ pub struct ChildSpec {
 }
 
 /// Longest line kept (result or remediation); the rest of an over-long line is dropped.
-/// The child's contract is one short line, so this only bounds a misbehaving one.
+/// The child's contract is one short result line (plus an optional remediation line), so
+/// this only bounds a misbehaving one.
 const MAX_LINE: usize = 4096;
 
 /// A probe child MAY print one line of this shape before its result line, to carry a
 /// remediation more specific than the per-kind default (#287). Never the result line
-/// itself — see `drain_stdout`.
+/// itself — see `drain_stdout`. Trusted only because every probe child is this agent's own
+/// re-exec: never route app or container output through this pipe.
 pub const REMEDIATION_PREFIX: &str = "quasar-probe-remediation: ";
 
 /// How long a kill waits for the group to be reaped before giving up on the wait (the
@@ -362,6 +364,27 @@ mod tests {
                 code: 0,
                 stdout: "the result line".into(),
                 remediation: Some("check the thing".into()),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remediation_line_after_the_result_does_not_replace_the_result() {
+        let (_tx, rx) = never();
+        let end = bounded(
+            sh(
+                "echo 'the result line'; echo 'quasar-probe-remediation: late'",
+                Duration::from_secs(10),
+            ),
+            rx,
+        )
+        .await;
+        assert_eq!(
+            end,
+            ChildEnd::Exited {
+                code: 0,
+                stdout: "the result line".into(),
+                remediation: Some("late".into()),
             }
         );
     }
