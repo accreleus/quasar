@@ -8,6 +8,7 @@ pub mod container;
 pub mod decision;
 pub mod launch_failure;
 pub mod media;
+pub mod media_probe_dir;
 pub mod orchestrator;
 pub mod outcome;
 pub mod runner;

@@ -932,6 +932,16 @@ cleanup() {
                 [ "$sid" = "$created" ] && attributable=1 && break
               done
               ;;
+            quasar-media-probe-*)
+              # #291: same shape as udev-* above — an owned entry is either the
+              # probe's private runtime dir or its sibling ownership marker
+              # "quasar-media-probe-<rand>.owner". Strip the marker suffix so
+              # both count as the same probe artifact. Unlike a session id the
+              # random suffix is minted by the agent and never surfaces to this
+              # harness, so neither half can be proven ours here — both stay
+              # unattributable, same as before #291 (the agent's own boot
+              # reconcile, not this harness, is what retires it).
+              ;;
           esac
         fi
         if [ "$attributable" = "1" ]; then

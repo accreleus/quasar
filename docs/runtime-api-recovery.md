@@ -141,7 +141,12 @@ plane is reachable. When successful, watch the logs for the
   Wayland socket
   leftovers (`wayland-N`, `wayland-N.lock`) are a separate, compositor-owned
   case: bounded to one reused name per session and not part of this
-  reconciliation.
+  reconciliation. A media probe's private runtime dir
+  (`{runtime_dir}/quasar-media-probe-<rand>`, one per probe child) follows the
+  same pattern (#291) — its id is minted by the agent rather than caller-supplied,
+  its sibling marker precedes it the same way, and the same startup sweep
+  reconciles a dir left by an agent killed mid-probe (a recreate, or the NVIDIA
+  agent's own self-restart while provisioning the driver volume / CUDA runtime).
 
 Docker is the validated engine. Intel hardware validation follows the existing
 [external procedure](reports/rh01-intel-external-validation.md); unavailable hardware
