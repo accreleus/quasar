@@ -48,6 +48,8 @@ The remaining GStreamer patches are **Quasar-authored** (not from gst-wayland-di
 - `vulkan-enc-output-state-on-resize.patch`
 - `vkenc-bitstream-buffer-pool.patch`
 - `vulkanh265enc-radv-coded-height.patch`
+- `vulkanav1enc-exact-frame-size.patch`
+- `vulkanav1enc-min-qindex.patch`
 - `vkh265enc-profile-template.patch` (**candidate — not applied**, see below)
 
 They are applied — **in this order** — to a from-source GStreamer `1.28.4`
@@ -69,16 +71,19 @@ its rationale references the AV1 element the eighth patch introduces.
 `vkenc-bitstream-buffer-pool.patch` applies **tenth (last)**: it was diffed against
 `gst-libs/gst/vulkan/gstvkencoder-private.c` with all nine predecessors applied, and that file is
 shaped by the rc-fix, intra-refresh, rc-retarget and output-state-on-resize patches before it.
-`vulkanh265enc-radv-coded-height.patch` applies **eleventh (last)**: it edits the coded-size
+`vulkanh265enc-radv-coded-height.patch` applies **eleventh**: it edits the coded-size
 block of `new_sequence()` in `vkh265enc.c` that `vulkanh265enc.patch` and
 `vulkan-enc-output-state-on-resize.patch` shape first.
-None of the eleven are upstreamed into GStreamer itself yet.
+`vulkanav1enc-exact-frame-size.patch` (twelfth) and `vulkanav1enc-min-qindex.patch` (thirteenth,
+last) both edit `vkav1enc.c`, which `vulkanav1enc.patch` creates; the second was diffed on top of
+the first.
+None of the thirteen are upstreamed into GStreamer itself yet.
 
 `vkh265enc-profile-template.patch` is a **candidate that is NOT wired into
 `deploy/Dockerfile.vulkan` and is therefore NOT applied to any image today.** It is a
 correctness fix for an upstream defect the Quasar encode path already sidesteps by pinning
 `profile=main` in its capsfilter, so it buys nothing for a Quasar image and everything for
-anyone driving `vulkanh265enc` by hand. When it is wired up it would apply **twelfth (last)**: it
+anyone driving `vulkanh265enc` by hand. When it is wired up it would apply **fourteenth (last)**: it
 edits `gst_vulkan_h265_encoder_register()` in `vkh265enc.c`, a region no earlier patch
 touches, so its position is a convention rather than a constraint. See its section below.
 
@@ -1429,3 +1434,38 @@ byte-identical to before. Width keeps the 64 CTB alignment, which is what VCN us
 driver, NVIDIA included, is unchanged. The chosen alignment is logged at INFO (`coded size ...
 height alignment`). The patch also corrects the `vulkanh265enc.patch` comment that says RADV reports
 no SPS override: Mesa 25.3 always flags one, and returns the SPS it was given.
+
+### `vulkanav1enc-exact-frame-size.patch`
+
+Quasar-authored (#294). `vulkanav1enc.patch` rounded the AV1 frame size up to the driver's
+`codedPictureAlignment` (8x8 on NVIDIA) and signalled the display size only through the frame
+header's `render_width/height`. AV1 has no crop: `render_size` is advisory and Chrome displays the
+decoded frame, so a 1600x900 stream showed as 1600x904 with a padding strip at the bottom. The
+frame is now coded at the display size, rounded only to `encodeInputPictureGranularity` (2x2 on
+NVIDIA, floored at 2 so NV12 stays even).
+
+`codedPictureAlignment` is not a valid-usage constraint. Under the spec's "AV1 Encode Parameter
+Overrides", an 8x8 alignment means the driver never changes the size, and NVIDIA then emits the
+exact frame size with no `render_size`. A coarser alignment (RADV VCN4 reports 64x16, equal to its
+input granularity) is applied by the driver in its own sequence header, so RADV output is
+byte-for-byte what it was. The sequence header's `max_frame_*` must stay equal to the encode's
+`codedExtent` (VUID-vkCmdEncodeVideoKHR-flags-10323/10324). A padded size, which is only reachable
+on a driver with coarser granularity, logs a warning because the padding will be visible.
+
+Measured on the NVIDIA role: 1600x900 and 1366x768 decode at their exact size and are clean in the
+bottom rows (51 and 50 dB PSNR). 1080 and 720 are byte-identical to before.
+
+### `vulkanav1enc-min-qindex.patch`
+
+Quasar-authored (#294). Under CBR or VBR the NVIDIA driver (610, RTX 5090) drives flat or static
+content down to `base_q_idx` 1. A key frame coded at index 1 has corrupt tile data: dav1d rejects it
+with EINVAL and libaom reports "Failed to decode tile data". Inter frames at index 1 decode, so a
+live session plays until its next periodic key frame, then Chrome stalls with packets still
+arriving, and its keyframe requests only produce more corrupt key frames until the next resize.
+
+Offline, CBR 7000 kbps on a flat source corrupted every periodic key frame at 640x360, 854x480,
+1024x576, 1280x720 and 1366x768. 1080 and 2160 never reach index 1 on the same content. The patch
+floors the rate controller's minimum Q index at 2 whenever rate control is active (applied through
+`useMinQIndex`, which needs the driver's per-group Q index capability). Index 2 is visually identical
+to 1, and every key frame at index 2 or above decoded. A constant-QP request is left alone.
+
