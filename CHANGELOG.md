@@ -95,6 +95,7 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- The compositor pin moves to `gst-wayland-display` `0b691b4` (#284): the fork's sync with upstream `stable`, including the cursor-hotspot fix, so a client cursor with a non-zero hotspot is drawn where the client means it, plus upstream's input tests and allocator/video-info changes. The #281 linear-first encode-src behaviour is unchanged; Quasar's GStreamer patches are unchanged.
 - **Diagnostic registration replaces exit on startup failure (#256).** When the agent's
   startup cleanup cannot retire applications from the previous agent, or the container
   runtime is missing, unreachable, refused, or misconfigured, the agent no longer exits.
