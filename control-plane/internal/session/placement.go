@@ -260,3 +260,53 @@ func vramVetoSQL(staleSecs, minFree, inflight int) string {
 	     ) >= $%[2]d
 	)`, staleSecs, minFree, inflight)
 }
+
+// gpuCodecSetSQL renders the GPU codec set (#296 amendment 12, schema.md
+// gpus.codecs / hosts.codecs): a GPU's own reported set, or its host's when
+// the GPU reports none. g/h are the query's table aliases (gpus/hosts).
+//
+// Exactly one renderer, for the reason vramVetoSQL is: every read of a GPU's
+// codec set — the launch-side candidacy gate and preference (#303), the
+// profile menu union, the admin GPU list — must resolve the inheritance
+// identically or two call sites can disagree about what a GPU can encode.
+//
+// fallbackH264 selects the renderer's only two meanings, per the contract:
+// the launch-side read falls all the way to `["h264"]` when neither the GPU
+// nor its host has ever reported (an unencodable codec is a dead session, so
+// launch placement must never see "unknown" as "anything goes"); the admin
+// read (openapi.yaml GPUAvailability.codecs) stays NULL in that case, because
+// "never reported" and "reported h264 only" want different operator advice.
+//
+// COALESCE only treats SQL NULL as absent: a GPU that explicitly reports `[]`
+// (a zero-slot GPU, agent-api.md) is not NULL and does not inherit — it reads
+// back as codecs=[]. That is a placement no-op (zero slots is not a
+// candidate); the admin list renders it as an explicit empty set.
+func gpuCodecSetSQL(g, h string, fallbackH264 bool) string {
+	if fallbackH264 {
+		return fmt.Sprintf(`COALESCE(%s.codecs, %s.codecs, '["h264"]'::jsonb)`, g, h)
+	}
+	return fmt.Sprintf(`COALESCE(%s.codecs, %s.codecs)`, g, h)
+}
+
+// gpuCodecSet is gpuCodecSetSQL(fallbackH264=true)'s pure twin: the launch-side
+// read. nil means the column stored SQL NULL (never reported); a non-nil empty
+// slice is a real report of zero codecs and is returned as-is, never promoted
+// to the fallback. Guarded against the SQL by TestGPUCodecSetMatchesSQL.
+func gpuCodecSet(gpuCodecs, hostCodecs []string) []string {
+	if gpuCodecs != nil {
+		return gpuCodecs
+	}
+	if hostCodecs != nil {
+		return hostCodecs
+	}
+	return []string{wireCodecH264}
+}
+
+// gpuCodecSetNullable is gpuCodecSetSQL(fallbackH264=false)'s twin: the admin
+// read, nil only when neither this GPU nor its host has ever reported.
+func gpuCodecSetNullable(gpuCodecs, hostCodecs []string) []string {
+	if gpuCodecs != nil {
+		return gpuCodecs
+	}
+	return hostCodecs
+}

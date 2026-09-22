@@ -1196,6 +1196,33 @@ func (s *Store) HostCodecs(ctx context.Context, hostID string) ([]string, error)
 	return codecs, nil
 }
 
+// GPUCodecs is the wire codec set gpuCodecSetSQL resolves for one GPU (#296
+// amendment 12): its own reported set, or its host's when it reports none,
+// falling back to ["h264"] when neither ever has. Feeds the stream plan (#303);
+// SQL/Go twin is gpuCodecSetSQL/gpuCodecSet, guarded by TestGPUCodecSetMatchesSQL.
+func (s *Store) GPUCodecs(ctx context.Context, hostID string, gpuIndex int32) ([]string, error) {
+	if !isValidUUID(hostID) {
+		return []string{wireCodecH264}, nil
+	}
+	var raw []byte
+	err := s.pool.QueryRow(ctx, `
+		SELECT `+gpuCodecSetSQL("g", "h", true)+`
+		FROM gpus g JOIN hosts h ON h.id = g.host_id
+		WHERE g.host_id = $1::uuid AND g.index = $2
+	`, hostID, gpuIndex).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return []string{wireCodecH264}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query gpu codecs: %w", err)
+	}
+	var codecs []string
+	if err := json.Unmarshal(raw, &codecs); err != nil {
+		return []string{wireCodecH264}, nil
+	}
+	return codecs, nil
+}
+
 // HostCodecPixelRates is per-codec sustained encode throughput in Mpix/s, keyed
 // by wire codec (#506, hosts.codec_pixel_rates from agent-api.md
 // `capacity.codec_throughput`).
