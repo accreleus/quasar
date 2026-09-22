@@ -2754,7 +2754,7 @@ export interface paths {
                     };
                 };
                 404: components["responses"]["NotFound"];
-                /** @description session_quota_exceeded / home_in_use / profile_ineligible / profile_not_launchable_for_app / conflict (pre-existing), or (Phase 3) home_not_provisioned - a derived tile whose parent has no home on any host - or parent_app_disabled. */
+                /** @description session_quota_exceeded / home_in_use / profile_ineligible / profile_not_launchable_for_app / conflict (pre-existing), or (Phase 3) home_not_provisioned - a derived tile whose parent has no home on any host - or parent_app_disabled. Amendment 12 (#296): conflict is no longer returned for an explicit stream.codec the placed host cannot encode - that arm leaves the launch path (the codec is now a placement gate; see 503) and survives only on the certification bench. */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -7687,7 +7687,7 @@ export interface components {
                 fps?: number;
                 bitrate_kbps?: number;
                 h264_profile?: components["schemas"]["H264Profile"];
-                /** @description Multi-codec: optional admin/diagnostic codec override. Orthogonal to the resolution envelope (a codec-only override does not bypass the eligibility gate). Bypasses the device-decode and failure-history clamps (forced re-test path) but not the host-encoder clamp (409 conflict if the placed host cannot encode it). */
+                /** @description Multi-codec: optional admin/diagnostic codec override. Orthogonal to the resolution envelope (a codec-only override does not bypass the eligibility gate). Bypasses the device-decode and failure-history clamps (forced re-test path) but not the host-encoder clamp. Amendment 12 (#296): the explicit codec is a codec constraint applied at placement, so the session is placed only on a GPU that can encode it; no free capable GPU is 503 capacity_exhausted, no online capable GPU is 503 no_host_available (formerly 409 conflict if the placed host could not encode it). */
                 codec?: components["schemas"]["Codec"];
             };
         };
@@ -8759,6 +8759,8 @@ export interface components {
             slots_reserved: number;
             active_sessions: number;
             render_node: string | null;
+            /** @description Amendment 12 (#296), additive. ALWAYS SERIALIZED. The wire codecs this GPU can encode (agent-api.md capacity.gpus[].codecs, schema.md gpus.codecs), as the launch path reads them: the GPU's own reported set, or - for a GPU whose agent reports no per-GPU set - its host's codecs (inheritance). Null when neither this GPU nor its host has ever reported a codec set (a pre-multi-codec agent), which the launch path treats as h264-only; like HostSettingsResponse.codecs it is deliberately NOT normalised to ["h264"] here, because "never reported" and "reported h264 only" need different operator advice. HostSettingsResponse.codecs keeps serving the host union. */
+            codecs: components["schemas"]["Codec"][] | null;
         };
         GPUsResponse: {
             items: components["schemas"]["GPUAvailability"][];
@@ -10244,7 +10246,7 @@ export interface components {
                 "application/json": components["schemas"]["ClientTooOldError"];
             };
         };
-        /** @description no_host_available / capacity_exhausted / host_not_ready (amendment 11: a failing evidence-based readiness check is the only reason no host qualified) — well-formed but cannot be placed now (retryable). */
+        /** @description no_host_available / capacity_exhausted / host_not_ready (amendment 11: a failing evidence-based readiness check is the only reason no host qualified) — well-formed but cannot be placed now (retryable). Amendment 12 (#296): an explicit stream.codec is a codec constraint applied at placement; when a GPU that can encode it exists but none is free the answer is capacity_exhausted, and when no online usable GPU can encode it the answer is no_host_available, both with a message naming the codec. No new code. */
         Unavailable: {
             headers: {
                 [name: string]: unknown;
