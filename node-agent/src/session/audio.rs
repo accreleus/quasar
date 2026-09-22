@@ -169,20 +169,47 @@ impl PulseSidecar {
     }
 
     /// Tear the sidecar container down (idempotent). `Drop` is the backstop.
+    ///
+    /// A busy or cancelled client never wrote a stop into the journal, so it
+    /// does not latch: routine audio recovery ignores a sidecar still in
+    /// `Running`, and latching here would leave `quasar-pulse-<sid>` up for
+    /// the life of the agent. An unconfirmed stop did write durable intent
+    /// and must not be repeated on the way down.
     pub fn stop(&mut self) {
-        if self.removed {
+        if self.removed || self.cleanup_attempted {
             return;
         }
-        self.cleanup_attempted = true;
-        match self
-            .runtime
-            .abandon_audio_sidecar(self.operation.clone())
-            .wait()
-        {
-            Ok(()) => self.removed = true,
-            Err(error) => tracing::warn!(token = "audio-pulse-cleanup-pending", %error,
+        let report = super::teardown::retry_retryable(
+            || match self
+                .runtime
+                .abandon_audio_sidecar(self.operation.clone())
+                .wait()
+            {
+                Ok(()) => {
+                    self.removed = true;
+                    self.cleanup_attempted = true;
+                    super::teardown::StopAttempt::Confirmed
+                }
+                Err(error) if !super::teardown::pulse_stop_latches(error.kind) => {
+                    super::teardown::StopAttempt::Retryable
+                }
+                Err(error) => {
+                    self.cleanup_attempted = true;
+                    tracing::warn!(token = "audio-pulse-cleanup-pending", %error,
+                        operation = %self.operation,
+                        "audio cleanup could not be confirmed; preserve its socket directory and inspect runtime recovery state");
+                    super::teardown::StopAttempt::Unconfirmed
+                }
+            },
+            || std::thread::sleep(super::teardown::STOP_PAUSE),
+            super::teardown::STOP_ATTEMPTS,
+        );
+        if matches!(report, super::teardown::StopAttempt::Retryable) {
+            tracing::warn!(
+                token = "audio-pulse-cleanup-busy",
                 operation = %self.operation,
-                "audio cleanup could not be confirmed; preserve its socket directory and inspect runtime recovery state"),
+                "audio cleanup could not start; the runtime client stayed busy"
+            );
         }
     }
 }
