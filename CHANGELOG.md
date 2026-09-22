@@ -222,6 +222,15 @@ own; the two do not move together, and that is deliberate.
   sibling EGL self-test now runs through this profile with an identical container
   configuration. There are no probe callers yet (#259).
 
+### Fixed
+- **A busy container runtime no longer fails `host_container_mounts` (#315).** Under load the
+  runtime client can be busy or time out for one refresh. That used to report the mount
+  check as a failure ("Docker could not inspect the agent's mounts"), which marked the host
+  degraded until the next refresh. A busy or timed-out inspection now keeps the last
+  definitive pass or fail, or reports `unknown` when there is none, and a launch is not
+  refused on it. Permission denied, a missing socket, and a real mount mismatch still fail
+  with the same remediation. The check still blocks nothing.
+
 ### Known limitations
 - Vulkan H.264 and HEVC encode produces a corrupt picture on an AMD Granite Ridge iGPU
   (RADV, Mesa 25.3.6), while `vah264enc` on the same host is clean (#272). Vulkan remains

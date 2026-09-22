@@ -70,7 +70,26 @@ pub struct ReadinessReport {
 
 impl ReadinessReport {
     /// A local refresh succeeded, observed at `at`.
-    pub fn refreshed(&mut self, checks: Vec<ReadinessCheck>, at: SystemTime) {
+    pub fn refreshed(&mut self, mut checks: Vec<ReadinessCheck>, at: SystemTime) {
+        // A busy or timed-out mount inspection is `unknown`. It neither sets nor
+        // clears the last definitive `host_container_mounts` result. A pass or a
+        // fail replaces it, which is how the check recovers.
+        if let Some(incoming) = checks
+            .iter_mut()
+            .find(|check| check.id == "host_container_mounts")
+        {
+            if incoming.status == super::UNKNOWN {
+                if let Some(previous) = self
+                    .checks
+                    .iter()
+                    .find(|check| check.id == "host_container_mounts")
+                {
+                    if previous.status == super::PASS || previous.status == super::FAIL {
+                        *incoming = previous.clone();
+                    }
+                }
+            }
+        }
         self.checks = checks;
         self.checks_observed_at = Some(at);
         self.refresh_failed = false;
