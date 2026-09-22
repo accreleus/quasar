@@ -94,6 +94,9 @@ struct Running {
     /// Its GPU vanished or was replaced mid-run: whatever it reports describes a
     /// device that is no longer there.
     discard: bool,
+    /// An identity trigger landed mid-run: its result is still recorded, but a pass from
+    /// the old stack does not admit codec probes.
+    stale_evidence: bool,
 }
 
 #[derive(Debug)]
@@ -247,6 +250,10 @@ impl Scheduler {
                         self.unreconciled.insert(target.kind);
                     }
                     if !running.discard && self.exists(target) {
+                        let verdict = match verdict {
+                            Verdict::Passed if running.stale_evidence => Verdict::Indeterminate,
+                            other => other,
+                        };
                         self.media_verdict(target, verdict);
                     }
                 }
@@ -348,6 +355,24 @@ impl Scheduler {
         }
     }
 
+    /// The agent image, driver or media settings changed: a codec pass from the old stack
+    /// is not evidence for the new one, so every GPU's codec checks are forgotten and its
+    /// codec probes need a fresh floor pass. The floor check keeps its retained verdict.
+    fn forget_codec_evidence(&mut self, new: &ProbeInputs, actions: &mut Vec<Action>) {
+        self.media_passed.clear();
+        if let Some(running) = self.running.as_mut() {
+            running.stale_evidence = true;
+        }
+        if !self.kinds.contains(&ProbeKind::Media) {
+            return;
+        }
+        for (&index, codecs) in &new.codecs {
+            for &codec in codecs {
+                self.retire(ProbeTarget::codec(index, codec), actions);
+            }
+        }
+    }
+
     /// Stops tracking a target that no longer exists and removes its check.
     fn retire(&mut self, target: ProbeTarget, actions: &mut Vec<Action>) {
         self.pending.remove(&target);
@@ -399,12 +424,15 @@ impl Scheduler {
             }
         }
 
+        let identity_changed = new.agent_image != old.agent_image
+            || new.driver != old.driver
+            || new.settings != old.settings;
+        if identity_changed {
+            self.forget_codec_evidence(&new, actions);
+        }
         if new.agent_image != old.agent_image {
             self.queue_kinds(&ProbeKind::ALL, &new, actions);
-        } else if new.driver != old.driver
-            || new.settings != old.settings
-            || (new.gpus.is_empty() && !old.gpus.is_empty())
-        {
+        } else if identity_changed || (new.gpus.is_empty() && !old.gpus.is_empty()) {
             self.queue_kinds(&per_gpu, &new, actions);
         } else {
             for (index, identity) in &new.gpus {
@@ -464,6 +492,7 @@ impl Scheduler {
                 target,
                 preempted: false,
                 discard: false,
+                stale_evidence: false,
             });
             actions.push(Action::Start(target));
             return;
@@ -1328,8 +1357,107 @@ mod tests {
         assert_eq!(drain(&mut s, first), vec![gpu(Media, 0)]);
     }
 
-    /// The retained media verdict gates: an indeterminate re-run of a GPU that last
-    /// passed still lets its codec probe run.
+    /// Codec evidence must come from the current stack: an identity trigger forgets the
+    /// held codec checks and the codec probes wait for a fresh floor pass.
+    #[test]
+    fn an_identity_trigger_forgets_codec_checks_and_requeues_them_behind_the_floor() {
+        let changes: [fn(&mut ProbeInputs); 3] = [
+            |i| i.agent_image = "sha256:agent-b".into(),
+            |i| i.driver = "nvidia:610.10 volume:def".into(),
+            |i| i.settings = "encoder=nvenc".into(),
+        ];
+        for change in changes {
+            let mut s = settled_with(codec_gpu());
+            let mut changed = codec_gpu();
+            change(&mut changed);
+            let first = s.step(Event::InputsObserved(changed));
+            for forgotten in [codec(0, H265), codec(0, Av1)] {
+                assert!(first.contains(&Action::Forget(forgotten)), "{first:?}");
+            }
+            assert!(
+                !first.contains(&Action::Forget(gpu(Media, 0))),
+                "the floor keeps its retained verdict"
+            );
+            let order = drain(&mut s, first);
+            let floor = order.iter().position(|t| *t == gpu(Media, 0)).unwrap();
+            assert!(
+                order.ends_with(&[codec(0, H265), codec(0, Av1)]),
+                "{order:?}"
+            );
+            assert!(floor < order.len() - 2);
+        }
+    }
+
+    #[test]
+    fn after_an_identity_trigger_an_indeterminate_floor_runs_no_codec_probe() {
+        let mut s = settled_with(codec_gpu());
+        let mut changed = codec_gpu();
+        changed.driver = "nvidia:610.10 volume:def".into();
+        let first = s.step(Event::InputsObserved(changed));
+        let order = drain_with(&mut s, first, |t| {
+            if t == gpu(Media, 0) {
+                Verdict::Indeterminate
+            } else {
+                Verdict::Passed
+            }
+        });
+        assert!(!order.contains(&codec(0, H265)), "{order:?}");
+        assert!(!order.contains(&codec(0, Av1)), "{order:?}");
+        // A fresh pass later queues them all.
+        let first = s.step(Event::LaunchFailed {
+            gpu: 0,
+            explains: [Media].into(),
+            codec: None,
+        });
+        assert_eq!(
+            drain(&mut s, first),
+            vec![gpu(Media, 0), codec(0, H265), codec(0, Av1)]
+        );
+    }
+
+    /// A floor probe that was running on the old stack when the trigger arrived does not
+    /// count as the fresh pass.
+    #[test]
+    fn a_floor_pass_from_a_run_that_straddled_an_identity_trigger_is_not_fresh() {
+        let mut s = Scheduler::with_kinds(&[Media]);
+        s.step(Event::Registered(codec_gpu()));
+        assert_eq!(s.running(), Some(gpu(Media, 0)));
+        let mut changed = codec_gpu();
+        changed.driver = "nvidia:610.10 volume:def".into();
+        s.step(Event::InputsObserved(changed));
+        let after = s.step(finished(gpu(Media, 0)));
+        assert_eq!(
+            after,
+            vec![Action::Start(gpu(Media, 0))],
+            "re-run on the new stack"
+        );
+        assert_eq!(
+            s.step(Event::ProbeFinished {
+                target: gpu(Media, 0),
+                reconciled: true,
+                verdict: Verdict::Indeterminate,
+            }),
+            vec![],
+            "no fresh pass, no codec probe"
+        );
+    }
+
+    #[test]
+    fn a_pinned_out_gpu_not_applicable_floor_drops_its_codec_probes() {
+        let mut s = Scheduler::with_kinds(&[Media]);
+        let first = s.step(Event::Registered(codec_gpu()));
+        assert_eq!(
+            drain_with(&mut s, first, |_| super::super::orchestrator::verdict_of(
+                &super::super::outcome::ProbeOutcome::NotApplicable {
+                    summary: "pinned elsewhere".into(),
+                }
+            )),
+            vec![gpu(Media, 0)]
+        );
+    }
+
+    /// The retained media verdict gates: an indeterminate re-run not caused by an identity
+    /// trigger (here a launch failure) leaves the last pass standing for the codec probe.
     #[test]
     fn an_indeterminate_media_rerun_leaves_the_last_pass_standing_for_the_codec_probe() {
         let mut s = settled_with(codec_gpu());

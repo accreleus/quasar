@@ -22,6 +22,16 @@ use super::{ProbeCodec, ProbeKind, ProbeTarget};
 const INPUT_DEADLINE: Duration = Duration::from_secs(20);
 /// Must exceed the media child's own 15 s encode budget plus GStreamer init.
 const MEDIA_DEADLINE: Duration = Duration::from_secs(45);
+/// Must exceed the codec probe's own 10 s budget plus GStreamer init.
+const CODEC_DEADLINE: Duration = Duration::from_secs(25);
+
+fn media_deadline(codec: Option<ProbeCodec>) -> Duration {
+    if codec.is_some() {
+        CODEC_DEADLINE
+    } else {
+        MEDIA_DEADLINE
+    }
+}
 /// Must exceed the application-GPU probe's own 20 s in-container timeout.
 const APPLICATION_GPU_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -207,7 +217,7 @@ async fn run_media(
         };
     }
 
-    let spec = match media::child_spec(&settings, &inventory, gpu, codec, MEDIA_DEADLINE) {
+    let spec = match media::child_spec(&settings, &inventory, gpu, codec, media_deadline(codec)) {
         Ok(spec) => spec,
         Err(e) => {
             return RunEnd::Concluded {
@@ -710,6 +720,14 @@ mod tests {
             "{:?}",
             calls[0].args
         );
+        assert_eq!(calls[0].deadline, CODEC_DEADLINE);
+    }
+
+    #[test]
+    fn a_codec_probe_is_killed_sooner_than_the_media_probe() {
+        assert_eq!(media_deadline(None), MEDIA_DEADLINE);
+        assert_eq!(media_deadline(Some(ProbeCodec::H265)), CODEC_DEADLINE);
+        assert!(CODEC_DEADLINE < MEDIA_DEADLINE);
     }
 
     #[tokio::test]

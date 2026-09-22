@@ -66,6 +66,7 @@ function rank(status: string): number {
 
 // Per-GPU host-probe ids (<base>_gpu<N>, and a codec probe's <base>_gpu<N>_<codec>;
 // node-agent/src/host_probe.rs) group under their base id.
+// The codec alternation mirrors the agent's `ProbeCodec` (node-agent/src/host_probe.rs).
 export function baseCheckId(id: string): string {
   return id.replace(/_gpu\d+(?:_(?:h265|av1))?$/, "");
 }

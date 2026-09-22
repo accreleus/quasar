@@ -2487,7 +2487,8 @@ struct RunningHandle {
     /// The GPU this session is bound to, for the host-probe scheduler's live-GPU set
     /// and a launch failure's `launch_failed(gpu, ..)`.
     gpu_index: i32,
-    /// The session codec: a launch failure on it selects that GPU's codec probe.
+    /// The assigned codec, before any `QUASAR_CODEC` diagnostic override (the runner
+    /// applies that later): a launch failure on it selects that GPU's codec probe.
     codec: crate::session::Codec,
     /// Set by `SessionEvent::Running`. Until then the launch is in flight and no host
     /// probe starts.

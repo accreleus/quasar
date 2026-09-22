@@ -135,7 +135,7 @@ impl ProbeHandle {
     }
 }
 
-fn verdict_of(outcome: &ProbeOutcome) -> Verdict {
+pub(super) fn verdict_of(outcome: &ProbeOutcome) -> Verdict {
     match outcome {
         ProbeOutcome::Pass { .. } => Verdict::Passed,
         ProbeOutcome::Fail { .. } | ProbeOutcome::NotApplicable { .. } => Verdict::NotPassed,

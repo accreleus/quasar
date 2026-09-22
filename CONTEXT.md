@@ -336,10 +336,10 @@ input) where that path really runs, producing host facts. Distinct from a
 "self-test" (that is one process checking itself), bare "probe".
 
 **Codec probe** — the media host probe run on one GPU for one codec above the H.264
-floor (HEVC, AV1), after that GPU's own media probe has passed. A pass is the evidence
-that the GPU encodes the codec; a failure takes the codec off that GPU and never blocks
-the GPU. Its check is `media_probe_gpu<N>_<codec>`. It is a host probe, not a device
-probe.
+floor (HEVC, AV1), after that GPU's own media probe has passed on the current agent
+image, driver and media settings. Its pass is the evidence that admits the codec to the
+GPU's codec set (from #301). A failure never blocks the GPU. Its check is
+`media_probe_gpu<N>_<codec>`. It is a host probe, not a device probe.
 
 **Evidence** — a host fact that came from exercising the real path, or a
 definitive local observation such as an unreachable container runtime. Only

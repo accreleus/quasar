@@ -21,20 +21,16 @@ use crate::session::settings::RuntimeSettings;
 use crate::session::warmup::gate::{GateRefusal, WarmupControl};
 use crate::session::{SessionConfig, StreamParams};
 
-/// The stream params a media probe asks for: fixed and small, at the floor codec or the
-/// codec probe's codec, so the verdict is about the GPU and not about what a profile
-/// happened to configure.
-fn probe_stream(request: &MediaProbeRequest, codec: Option<ProbeCodec>) -> StreamParams {
-    let mut stream = StreamParams {
+/// The stream params a media probe asks for: fixed and small, at the request's codec, so
+/// the verdict is about the GPU and not about what a profile happened to configure.
+fn probe_stream(request: &MediaProbeRequest) -> Result<StreamParams> {
+    Ok(StreamParams {
         width: request.width,
         height: request.height,
         fps: request.fps,
+        codec: crate::session::Codec::parse(&request.codec)?,
         ..StreamParams::default()
-    };
-    if let Some(codec) = codec {
-        stream.codec = codec.codec();
-    }
-    stream
+    })
 }
 
 fn args_for(request: &MediaProbeRequest) -> Vec<String> {
@@ -96,7 +92,7 @@ pub fn child_spec(
             ..MediaProbeRequest::default()
         },
     };
-    let mut cfg = SessionConfig::for_assignment_with(settings, probe_stream(&request, codec), None);
+    let mut cfg = SessionConfig::for_assignment_with(settings, probe_stream(&request)?, None);
     crate::agent::bind_gpu(inventory, gpu_index, &mut cfg)
         .with_context(|| format!("GPU {gpu_index} cannot run a media probe"))?;
     let program = std::env::current_exe()

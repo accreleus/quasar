@@ -608,6 +608,17 @@ fn build_decode_leg(
     }))
 }
 
+/// The evidence for a failed state change: the encoder's own error over a downstream
+/// consequence (a not-negotiated from the parser), else the first posted.
+fn encoder_error_first(errors: Vec<(bool, String)>) -> Option<String> {
+    let first = errors.first().map(|(_, text)| text.clone());
+    errors
+        .into_iter()
+        .find(|(from_encoder, _)| *from_encoder)
+        .map(|(_, text)| text)
+        .or(first)
+}
+
 /// `<element path>: <error> (<debug>)` for an ERROR message; `None` for anything else.
 fn bus_error_text(msg: &gst::Message) -> Option<String> {
     let gst::MessageView::Error(e) = msg.view() else {
@@ -711,9 +722,21 @@ fn build_and_run(
         (gst::State::Playing, Reached::NotPlaying),
     ] {
         if pipeline.set_state(state).is_err() {
-            let error = bus
-                .pop_filtered(&[gst::MessageType::Error])
-                .and_then(|msg| bus_error_text(&msg));
+            // A streaming thread may post its ERROR just after the state change returns,
+            // so wait briefly for the first, then take whatever else is queued.
+            let mut errors = Vec::new();
+            let mut next = bus.timed_pop_filtered(
+                gst::ClockTime::from_mseconds(200),
+                &[gst::MessageType::Error],
+            );
+            while let Some(msg) = next {
+                let from_encoder = msg.src() == Some(encoder.upcast_ref::<gst::Object>());
+                if let Some(text) = bus_error_text(&msg) {
+                    errors.push((from_encoder, text));
+                }
+                next = bus.pop_filtered(&[gst::MessageType::Error]);
+            }
+            let error = encoder_error_first(errors);
             teardown(&pipeline);
             return Ok(Observed {
                 frames: 0,
@@ -1244,6 +1267,22 @@ mod tests {
         ] {
             assert_eq!(verdict(10, &seen).exit_code(), code);
         }
+    }
+
+    #[test]
+    fn the_encoders_own_error_is_the_evidence_over_a_downstream_one() {
+        assert_eq!(
+            encoder_error_first(vec![
+                (false, "h265parse0: not-negotiated".into()),
+                (true, "vulkanh265enc0: no encode profile".into()),
+            ]),
+            Some("vulkanh265enc0: no encode profile".into())
+        );
+        assert_eq!(
+            encoder_error_first(vec![(false, "first".into()), (false, "second".into())]),
+            Some("first".into())
+        );
+        assert_eq!(encoder_error_first(Vec::new()), None);
     }
 
     #[test]
