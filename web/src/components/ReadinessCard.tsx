@@ -26,6 +26,9 @@ const GLYPH: Record<string, { label: string; className: string; icon: React.Reac
   // Amendment 11: a host probe that ran but couldn't tell — distinct from
   // "not applicable" (skip) and never blocks (contract, ReadinessCheck.status).
   unknown: { label: "Indeterminate", className: "rdy-glyph rdy-off", icon: QUESTION },
+  // #311: the hardware lacks the capability (a codec the GPU cannot encode). Not a
+  // fault and never blocks, so it is muted and also named by a neutral chip.
+  unsupported: { label: "Unsupported", className: "rdy-glyph rdy-off", icon: DASH },
 };
 
 function ReadinessGlyph({ status }: { status: string }) {
@@ -174,6 +177,13 @@ export function ReadinessCard({
               <span data-testid={`readiness-blocks-${c.id}`} title={blocksLabel}>
                 <Chip variant={c.status === "fail" ? "danger" : "neutral"} className="chip-sm">
                   {c.status === "fail" ? "Blocks launches" : "Can block launches"}
+                </Chip>
+              </span>
+            )}
+            {c.status === "unsupported" && (
+              <span data-testid={`readiness-unsupported-${c.id}`}>
+                <Chip variant="neutral" className="chip-sm">
+                  Unsupported
                 </Chip>
               </span>
             )}

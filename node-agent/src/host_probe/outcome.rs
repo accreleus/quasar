@@ -16,6 +16,13 @@ pub enum ProbeOutcome {
         summary: String,
         remediation: String,
     },
+    /// A codec probe whose encoder could not open on the device (#311): the GPU has no
+    /// encoder for that codec. Definitive like `Fail` (the codec leaves the GPU codec
+    /// set) but a hardware fact, so the wire status is `unsupported` and there is no
+    /// remediation (protocol/agent-api.md `readiness`).
+    Unsupported {
+        summary: String,
+    },
     /// The path is never used on this host, so there is nothing to prove.
     NotApplicable {
         summary: String,
@@ -121,15 +128,15 @@ pub fn remediation(kind: ProbeKind) -> String {
     }
 }
 
-/// [`remediation`] for the target's kind, except a codec probe: its failure is often the
-/// hardware (a video engine with no encoder for that codec), which nothing on the host fixes.
+/// [`remediation`] for the target's kind, except a codec probe. A codec probe's fail is
+/// a fault past the encoder opening (a missing encoder is `Unsupported`), so it points at
+/// the driver.
 pub fn remediation_for(target: ProbeTarget) -> String {
     match target.codec {
         Some(codec) => {
             let codec = codec.as_str();
             format!(
-                "Nothing needs fixing if this GPU's video engine has no {codec} encoder: \
-                 sessions on it use another codec. If it should encode {codec}, check the \
+                "Sessions on this GPU use another codec until {codec} passes. Check the \
                  driver and the agent log for `token=\"host-probe-` lines."
             )
         }
@@ -138,14 +145,15 @@ pub fn remediation_for(target: ProbeTarget) -> String {
 }
 
 /// The retained verdict of the codec probe for (`gpu`, `codec`): `Some(true)` pass,
-/// `Some(false)` fail, `None` when no definitive run is held (absent, indeterminate, skip).
+/// `Some(false)` fail or unsupported, `None` when no definitive run is held (absent,
+/// indeterminate, skip).
 /// An indeterminate run never replaces a held verdict ([`record`]), so this is the last
 /// definitive one.
 pub fn codec_probe_verdict(report: &ReadinessReport, gpu: i32, codec: ProbeCodec) -> Option<bool> {
     let check = report.retained(&ProbeTarget::codec(gpu, codec).check_id())?;
     match check.status.as_str() {
         crate::readiness::PASS => Some(true),
-        crate::readiness::FAIL => Some(false),
+        crate::readiness::FAIL | crate::readiness::UNSUPPORTED => Some(false),
         _ => None,
     }
 }
@@ -156,8 +164,8 @@ pub fn codec_probe_verdict(report: &ReadinessReport, gpu: i32, codec: ProbeCodec
 pub struct CodecEvidence(BTreeMap<ProbeTarget, EvidenceStamp>);
 
 impl CodecEvidence {
-    /// Mirrors [`record`]: a pass takes the run's stamp, a fail or skip drops it, and an
-    /// indeterminate run leaves the held verdict — and its stamp — standing.
+    /// Mirrors [`record`]: a pass takes the run's stamp, a fail, unsupported or skip drops
+    /// it, and an indeterminate run leaves the held verdict — and its stamp — standing.
     pub fn note(
         &mut self,
         target: ProbeTarget,
@@ -213,8 +221,23 @@ pub fn child_outcome(target: ProbeTarget, end: ChildEnd) -> ProbeOutcome {
             summary: format!("{failed}: {stdout}"),
             remediation: child_remediation.unwrap_or_else(|| remediation_for(target)),
         },
-        // The child's contract is 0 pass, 1 fail. Anything else (2 is bad argv) is
-        // not a statement about the host.
+        // 4 is a codec probe whose encoder could not open (#311). Only a codec probe
+        // answers it; from the H.264 media probe it would be a fault, so it reads as one.
+        ChildEnd::Exited {
+            code: crate::session::probe_media::UNSUPPORTED_EXIT,
+            stdout,
+            ..
+        } => match target.codec {
+            Some(_) => ProbeOutcome::Unsupported {
+                summary: format!("{failed}: {stdout}"),
+            },
+            None => ProbeOutcome::Fail {
+                summary: format!("{failed}: {stdout}"),
+                remediation: remediation_for(target),
+            },
+        },
+        // The child's contract is 0 pass, 1 fail, 4 unsupported. Anything else (2 is bad
+        // argv) is not a statement about the host.
         ChildEnd::Exited {
             code, stdout, ..
         } => ProbeOutcome::Indeterminate {
@@ -248,7 +271,7 @@ pub fn child_outcome(target: ProbeTarget, end: ChildEnd) -> ProbeOutcome {
     }
 }
 
-/// Indeterminate never replaces a held pass, fail or skip.
+/// Indeterminate never replaces a held pass, fail, unsupported or skip.
 pub fn record(
     report: &mut ReadinessReport,
     target: ProbeTarget,
@@ -286,6 +309,18 @@ pub fn record(
             },
             observed_at,
         ),
+        ProbeOutcome::Unsupported { summary } => report.retain(
+            crate::messages::ReadinessCheck {
+                id,
+                status: crate::readiness::UNSUPPORTED.into(),
+                summary,
+                remediation: String::new(),
+                observed_at: None,
+                source: Some("host_probe".into()),
+                blocks,
+            },
+            observed_at,
+        ),
         ProbeOutcome::NotApplicable { summary } => report.retain(
             crate::messages::ReadinessCheck {
                 id,
@@ -303,6 +338,7 @@ pub fn record(
                 report.retained(&id).map(|c| c.status.as_str()),
                 Some(status) if status == crate::readiness::PASS
                     || status == crate::readiness::FAIL
+                    || status == crate::readiness::UNSUPPORTED
                     || status == crate::readiness::SKIP
             );
             if stands {
@@ -450,6 +486,78 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// #311: exit 4 is `Unsupported` for a codec probe, carrying the evidence; from the
+    /// H.264 media probe it is a `Fail`.
+    #[test]
+    fn exit_four_is_unsupported_for_a_codec_probe_and_a_fail_for_the_media_probe() {
+        let av1 = ProbeTarget::codec(1, ProbeCodec::Av1);
+        assert_eq!(
+            child_outcome(av1, exited(4, Some("ignored"))),
+            ProbeOutcome::Unsupported {
+                summary: "GPU 1 does not encode av1; sessions will not use av1 on this GPU: x"
+                    .into()
+            }
+        );
+        let media = ProbeTarget::gpu(ProbeKind::Media, 1);
+        assert!(matches!(
+            child_outcome(media, exited(4, None)),
+            ProbeOutcome::Fail { .. }
+        ));
+    }
+
+    /// #311: `unsupported` is definitive. It is retained, an indeterminate rerun does not
+    /// replace it, the codec verdict is `Some(false)` and the evidence stamp is dropped.
+    #[test]
+    fn unsupported_is_retained_like_a_fail_and_drops_the_evidence_stamp() {
+        use crate::host_probe::decision::ProbeInputs;
+        let stamp = ProbeInputs {
+            agent_image: "sha256:a".into(),
+            driver: "610".into(),
+            gpus: [(0, "pci-0".to_string())].into(),
+            settings: "encoder=vulkan".into(),
+            codecs: Default::default(),
+        }
+        .evidence_stamp(0);
+        let target = ProbeTarget::codec(0, ProbeCodec::Av1);
+        let mut report = ReadinessReport::default();
+        let mut evidence = CodecEvidence::default();
+        let at = SystemTime::UNIX_EPOCH;
+        let pass = ProbeOutcome::Pass {
+            summary: "ok".into(),
+        };
+        evidence.note(target, &pass, stamp.clone());
+        record(&mut report, target, pass, at);
+        assert!(evidence.proven(&report, 0, ProbeCodec::Av1, stamp.as_ref()));
+
+        let unsupported = child_outcome(target, exited(4, None));
+        evidence.note(target, &unsupported, stamp.clone());
+        record(&mut report, target, unsupported, at);
+        let check = report.retained("media_probe_gpu0_av1").unwrap();
+        assert_eq!(check.status, crate::readiness::UNSUPPORTED);
+        assert_eq!(check.blocks, None);
+        assert_eq!(
+            check.remediation, "",
+            "nothing to fix: the contract wants it empty"
+        );
+        assert_eq!(
+            codec_probe_verdict(&report, 0, ProbeCodec::Av1),
+            Some(false)
+        );
+        assert!(!evidence.proven(&report, 0, ProbeCodec::Av1, stamp.as_ref()));
+
+        let indeterminate = ProbeOutcome::Indeterminate {
+            reason: "pre-empted".into(),
+        };
+        evidence.note(target, &indeterminate, stamp.clone());
+        record(&mut report, target, indeterminate, at);
+        let check = report.retained("media_probe_gpu0_av1").unwrap();
+        assert_eq!(check.status, crate::readiness::UNSUPPORTED);
+        assert_eq!(
+            codec_probe_verdict(&report, 0, ProbeCodec::Av1),
+            Some(false)
+        );
     }
 
     /// #301: a pass counts only under the stack it was proven on; an indeterminate rerun

@@ -49,8 +49,10 @@ export const OTHER_GROUP: ReadinessGroupDef = { key: "other", label: "Other", id
 
 export const KNOWN_CHECK_IDS: readonly string[] = READINESS_GROUPS.flatMap((g) => g.ids);
 
-/** fail → warn → provisioning/unknown → pass. Unknown statuses are advisory:
- *  shown with the actionable ones, never hidden as not applicable. */
+/** fail → warn → provisioning/unknown → pass/unsupported. Unknown statuses are
+ *  advisory: shown with the actionable ones, never hidden as not applicable.
+ *  `unsupported` (hardware lacks the capability, #311) needs no action, so it sorts
+ *  with the passes. */
 function rank(status: string): number {
   switch (status) {
     case "fail":
@@ -58,6 +60,7 @@ function rank(status: string): number {
     case "warn":
       return 1;
     case "pass":
+    case "unsupported":
       return 3;
     default:
       return 2;

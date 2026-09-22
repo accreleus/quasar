@@ -102,6 +102,10 @@ func TestVerdictInertCases(t *testing.T) {
 		{"evidence check warn", report(t, chk{"homes_free_space", "warn", blk("homes", "control_plane")})},
 		{"evidence check skip", report(t, chk{"media_probe_gpu0", "skip", gpuBlk(0)})},
 		{"evidence check provisioning", report(t, chk{"input_probe", "provisioning", host})},
+		// #311: the agent sends a codec probe's `unsupported` without blocks; even
+		// with blocks it is not `fail`, so it blocks nothing.
+		{"codec probe unsupported", report(t, chk{"media_probe_gpu1_av1", "unsupported", nil})},
+		{"evidence check unsupported", report(t, chk{"media_probe_gpu1_av1", "unsupported", gpuBlk(1)})},
 		{"unrecognised status", report(t, chk{"input_probe", "degraded", host})},
 		{"status is not exactly fail", report(t, chk{"input_probe", "FAIL", host}, chk{"audio_probe", " fail", host}, chk{"x", "failed", host})},
 		{"status is not a string", report(t, chk{"input_probe", true, host}, chk{"audio_probe", 1, host}, chk{"x", nil, host})},
@@ -250,6 +254,7 @@ func TestVerdictOverrideLifecycle(t *testing.T) {
 		{"unknown: held", report(t, chk{"audio_probe", "unknown", host}), nil, nil, false},
 		{"warn: held", report(t, chk{"audio_probe", "warn", host}), nil, nil, false},
 		{"skip: held", report(t, chk{"audio_probe", "skip", host}), nil, nil, false},
+		{"unsupported: held", report(t, chk{"audio_probe", "unsupported", host}), nil, nil, false},
 		{"id vanished: inert, not lapsed", report(t, chk{"input_probe", "fail", host}), nil, []string{"audio_probe"}, true},
 		{"explicit empty report: inert, not lapsed", json.RawMessage(`[]`), nil, []string{"audio_probe"}, false},
 		{"never reported: inert, not lapsed", nil, nil, []string{"audio_probe"}, false},

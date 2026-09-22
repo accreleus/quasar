@@ -7822,11 +7822,11 @@ export interface components {
             /** @description Amendment 11, optional, OPEN STRING. Known values: host_probe, local, runtime, operator. */
             source?: string;
             blocks?: components["schemas"]["ReadinessBlocks"];
-            /** @description Known values: "pass", "fail", "warn", "skip", "provisioning", "unknown" — "skip" means "not applicable to this host" (an NVIDIA check on an AMD box), never "we could not tell"; that is "unknown" (amendment 11: an indeterminate host probe), which never blocks. Only "fail" on a check carrying `blocks` blocks. DELIBERATELY NOT AN ENUM: the check set (and its status vocabulary) is agent-owned and forward-compatible, so a closed schema type would force every generated client to reject a value the contract requires it to pass through. Consumers MUST render/store an unrecognized value rather than reject it. */
+            /** @description Known values: "pass", "fail", "warn", "skip", "provisioning", "unknown", "unsupported" (amendment 12 addendum, #311: observed, the hardware does not provide the capability - not a fault, definitive, never blocks; a consumer MUST NOT present it as a fault - agent-api.md readiness) — "skip" means "not applicable to this host" (an NVIDIA check on an AMD box), never "we could not tell"; that is "unknown" (amendment 11: an indeterminate host probe), which never blocks. Only "fail" on a check carrying `blocks` blocks. DELIBERATELY NOT AN ENUM: the check set (and its status vocabulary) is agent-owned and forward-compatible, so a closed schema type would force every generated client to reject a value the contract requires it to pass through. Consumers MUST render/store an unrecognized value rather than reject it. */
             status: string;
             /** @description One sentence an operator can act on, in plain language. */
             summary: string;
-            /** @description Exact commands to fix it, distro-aware where cheaply knowable. Empty unless the check asks the operator for something (so: empty for pass and skip, and usually for unknown and provisioning). */
+            /** @description Exact commands to fix it, distro-aware where cheaply knowable. Empty unless the check asks the operator for something (so: empty for pass, skip and unsupported - nothing to fix - and usually for unknown and provisioning). */
             remediation: string;
         };
         /** @description Amendment 11 (#260). Present only on a readiness check that rests on evidence (a host probe or a definitive local observation); declares what the check blocks when, and only when, its status is "fail". A proxy check never carries it. */

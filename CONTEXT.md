@@ -339,7 +339,11 @@ input) where that path really runs, producing host facts. Distinct from a
 **Codec probe** — the media host probe run on one GPU for one codec above the H.264
 floor (HEVC, AV1), after that GPU's own media probe has passed on the current agent
 image, driver and media settings. Its pass is the evidence that admits the codec to the
-GPU's codec set. A failure never blocks the GPU. Its check is
+GPU's codec set. A failure never blocks the GPU. When the encoder cannot open at all
+(the encoder element's own open failure: the GPU has no encoder for that codec) the check
+reports `unsupported`, a hardware fact that asks for no attention; any other failure reports
+`fail`. `unsupported` is sticky by design: it is re-proven only when the agent image, driver,
+media settings or GPU identity change, or the agent restarts. Its check is
 `media_probe_gpu<N>_<codec>`. It is a host probe, not a device probe.
 
 **GPU codec set** — the codecs one usable GPU has been shown to encode: H.264 always

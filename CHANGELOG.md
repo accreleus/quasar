@@ -123,6 +123,15 @@ own; the two do not move together, and that is deliberate.
   `~/.config/qbench/`: the localhost and host-derived default addresses, `QUASAR_BENCH_URL`
   and the ssh read of the bench service's `deploy/.env` are gone, and `make report-*` no
   longer takes `HOST`. The vendored client and CLI are now quasar-bench 1.7.0.
+- **A codec a GPU cannot encode reports Unsupported, not a failure (#311, amendment 12
+  addendum).** When a GPU's video engine has no encoder for a codec (its codec probe cannot
+  open the encoder), the readiness check `media_probe_gpu<N>_<codec>` now reports the new
+  status `unsupported` instead of `fail`, with the same evidence in its summary. The console
+  shows it as a neutral "Unsupported" chip sorted with the passes, and it no longer marks the
+  host as needing attention or degraded; a mixed-GPU host whose integrated GPU has no AV1
+  encoder now reads healthy. The codec still leaves that GPU's codec set, and nothing is
+  blocked, as before. A codec probe that opens the encoder and then fails is still `fail`, as
+  is the H.264 media probe, which is the floor.
 - **Auto prefers the GPU that gives the best codec (#305, amendment 12).** A launch left on
   Auto now ranks candidate GPUs by the best codec each can encode for this device, in the
   launch profile's own order, and only then by load. On a host where one GPU encodes AV1

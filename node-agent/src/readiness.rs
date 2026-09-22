@@ -37,6 +37,10 @@ pub const WARN: &str = "warn";
 /// Indeterminate: a host probe could not be concluded. Never blocks, never clears a block
 /// (protocol/agent-api.md `readiness`).
 pub const UNKNOWN: &str = "unknown";
+/// The hardware does not provide this capability (#311, amendment 12 addendum): a codec
+/// the GPU has no encoder for. Not a fault, never blocks, and definitive — retained like
+/// `pass`/`fail`, never replaced by an indeterminate run.
+pub const UNSUPPORTED: &str = "unsupported";
 
 /// Where the host's `/etc/os-release` is bind-mounted in the agent container
 /// (reference compose). Absent ⇒ generic remediation wording.

@@ -11,6 +11,7 @@ package agentws
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -262,6 +263,46 @@ func TestReadinessProxyAndUnknownNeverDerive(t *testing.T) {
 	if host || homes || len(blockedGPUs(t, pool, hostID)) != 0 {
 		t.Fatalf("a proxy / unknown / warn / skip report blocked something: host=%v homes=%v gpus=%v",
 			host, homes, blockedGPUs(t, pool, hostID))
+	}
+}
+
+// TestReadinessUnsupportedIsStoredVerbatimAndBlocksNothing (#311): a codec the GPU
+// has no encoder for reports `unsupported`. It reaches storage as sent and derives
+// no block, even beside a passing H.264 probe on the same GPU.
+func TestReadinessUnsupportedIsStoredVerbatimAndBlocksNothing(t *testing.T) {
+	pool := testPool(t)
+	s := &agentStore{pool: pool}
+	hostID := seedHost(t, pool)
+	addGPURow(t, pool, hostID, 0)
+	addGPURow(t, pool, hostID, 1)
+	ctx := context.Background()
+
+	report := `[
+		{"id":"media_probe_gpu1","status":"pass","summary":"encoded","remediation":"",
+		 "source":"host_probe","blocks":{"scope":"gpu","gpu_index":1,"enforced_by":"control_plane"}},
+		{"id":"media_probe_gpu1_av1","status":"unsupported",
+		 "summary":"GPU 1 does not encode av1; sessions will not use av1 on this GPU: vulkanav1enc: the encode pipeline could not reach READY",
+		 "remediation":"","source":"host_probe"}
+	]`
+	if err := s.upsertHostReadiness(ctx, hostID, json.RawMessage(report)); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	host, homes := hostBlocks(t, pool, hostID)
+	if host || homes || len(blockedGPUs(t, pool, hostID)) != 0 {
+		t.Fatalf("an unsupported check blocked something: host=%v homes=%v gpus=%v",
+			host, homes, blockedGPUs(t, pool, hostID))
+	}
+
+	raw, _ := rawReadiness(t, pool, hostID)
+	var got []map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal readiness: %v", err)
+	}
+	if len(got) != 2 || got[1]["id"] != "media_probe_gpu1_av1" || got[1]["status"] != "unsupported" {
+		t.Fatalf("stored readiness = %s, want the unsupported check verbatim", raw)
+	}
+	if summary, _ := got[1]["summary"].(string); !strings.Contains(summary, "could not reach READY") {
+		t.Errorf("the unsupported check's evidence was not stored verbatim: %+v", got[1])
 	}
 }
 
