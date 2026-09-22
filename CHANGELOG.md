@@ -210,6 +210,7 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- The fleet Hosts table's GPU column no longer names a mixed-GPU host by its first GPU's model times the total GPU count (#310). A host with, say, an RTX 5090 and an AMD iGPU read "GeForce RTX 5090 ×2"; it now groups GPUs by vendor+model and shows each distinct model, with `×N` only within a group that actually has N of that model (e.g. "GeForce RTX 5090 ×2 + Radeon Graphics").
 - On a host whose GPUs differ, a session resolves its codec against the GPU it was placed on, so a session placed on a GPU without AV1 gets HEVC or H.264 instead of failing (#303). The "rung resolved" log line shows `gpu_codecs` beside `host_codecs`; a failed read of the GPU's set falls back to H.264.
 - A launch with an explicit codec that no rung of the chosen launch profile uses is refused `400 validation_failed` naming the codec and the launch profile, as `control-api.md` documents, instead of `500 internal` (#298).
 - AV1 streams from an NVIDIA GPU no longer freeze at small sizes or show a padding strip (#294). At 1280x720 and below, a quiet scene pushed the encoder to its finest quantizer, where the driver writes corrupt key frames; Chrome then stopped decoding until the next resize. The quantizer is now kept one step coarser, which looks the same. A 1600x900 stream also decoded as 1600x904 with a green strip along the bottom; AV1 is now coded at exactly the requested size.

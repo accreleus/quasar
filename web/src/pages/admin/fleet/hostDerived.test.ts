@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  distinctGpuVendors,
+  groupGpusByModel,
   heartbeatTone,
   hostStateChip,
   hostStateDot,
@@ -11,6 +13,7 @@ import {
   toneColor,
   uptimeSince,
   utilisation,
+  type GpuGroupInput,
   type UtilisationGpu,
   type UtilisationHost,
 } from "./hostDerived";
@@ -197,5 +200,57 @@ describe("percentOf", () => {
   it("rounds, and reads a zero total as zero rather than NaN", () => {
     expect(percentOf(1, 3)).toBe(33);
     expect(percentOf(0, 0)).toBe(0);
+  });
+});
+
+// ── #310: a mixed-GPU host must not read "<first model> ×<total count>" ─────
+
+function gpuOf(vendor: string, model: string): GpuGroupInput {
+  return { vendor, model };
+}
+
+describe("groupGpusByModel", () => {
+  it("returns one group of one for a single GPU", () => {
+    expect(groupGpusByModel([gpuOf("NVIDIA", "GeForce RTX 5090")])).toEqual([
+      { vendor: "NVIDIA", model: "GeForce RTX 5090", count: 1 },
+    ]);
+  });
+
+  it("counts two identical GPUs as one group of two", () => {
+    const gpus = [gpuOf("NVIDIA", "GeForce RTX 5090"), gpuOf("NVIDIA", "GeForce RTX 5090")];
+    expect(groupGpusByModel(gpus)).toEqual([{ vendor: "NVIDIA", model: "GeForce RTX 5090", count: 2 }]);
+  });
+
+  it("keeps a mixed host as distinct one-count groups instead of ×N on the first model", () => {
+    const gpus = [gpuOf("NVIDIA", "GeForce RTX 5090"), gpuOf("AMD", "Radeon Graphics")];
+    expect(groupGpusByModel(gpus)).toEqual([
+      { vendor: "NVIDIA", model: "GeForce RTX 5090", count: 1 },
+      { vendor: "AMD", model: "Radeon Graphics", count: 1 },
+    ]);
+  });
+
+  it("groups two identical plus one different into a ×2 group and a ×1 group", () => {
+    const gpus = [
+      gpuOf("NVIDIA", "GeForce RTX 5090"),
+      gpuOf("NVIDIA", "GeForce RTX 5090"),
+      gpuOf("AMD", "Radeon Graphics"),
+    ];
+    expect(groupGpusByModel(gpus)).toEqual([
+      { vendor: "NVIDIA", model: "GeForce RTX 5090", count: 2 },
+      { vendor: "AMD", model: "Radeon Graphics", count: 1 },
+    ]);
+  });
+});
+
+describe("distinctGpuVendors", () => {
+  it("names one vendor once for a single-vendor host", () => {
+    expect(distinctGpuVendors(groupGpusByModel([gpuOf("NVIDIA", "GeForce RTX 5090")]))).toEqual([
+      "NVIDIA",
+    ]);
+  });
+
+  it("names both vendors, first-seen order, for a mixed host", () => {
+    const gpus = [gpuOf("NVIDIA", "GeForce RTX 5090"), gpuOf("AMD", "Radeon Graphics")];
+    expect(distinctGpuVendors(groupGpusByModel(gpus))).toEqual(["NVIDIA", "AMD"]);
   });
 });
