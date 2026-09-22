@@ -113,8 +113,9 @@ func (c candidacy) readinessGate(a *argset, lead string) string {
 // unlocked read over `online` hosts only, so draining/offline are never chosen.
 //
 // Parameter order is load-bearing: slots, freshness window, veto floor and
-// debit, policy args, pin, image. The freshness window is always bound even with
-// the veto off, because the spread ordering references it.
+// debit, policy args (then the codec preference), pin, image. The freshness
+// window is always bound even with the veto off, because the spread ordering
+// references it.
 func (c candidacy) candidateQuery(policy PlacementPolicy) (string, []any) {
 	a := &argset{}
 	slotsIdx := a.add(c.p.NeedEncodeSlots)

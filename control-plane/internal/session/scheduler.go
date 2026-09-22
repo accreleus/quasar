@@ -71,6 +71,11 @@ type CreateParams struct {
 	// control" gate (c)), wire vocabulary, "" for none. Not what the row is
 	// inserted with; that is Codec.
 	RequireCodec string
+	// CodecPreference is an Auto launch's codec preference (#305;
+	// codecPreference in rung.go), wire vocabulary, best first. An ORDER BY key
+	// in the candidate query only: never a filter, never in the re-check, the
+	// totals probe or a diagnostic. Empty renders nothing.
+	CodecPreference []string
 }
 
 // homeAppID is the storage key for this launch. Every storage-keyed site on this

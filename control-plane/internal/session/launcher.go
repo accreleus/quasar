@@ -248,6 +248,9 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	if p.RequireCodec, err = codecConstraint(launchProfile, ov); err != nil {
 		return LaunchResult{}, err
 	}
+	if p.RequireCodec == "" {
+		p.CodecPreference = c.launchCodecPreference(ctx, userID, lp.DeviceID, launchProfile)
+	}
 
 	// §5: a derived tile is placed with a HARD host pin, not an affinity. Locality
 	// is only a sort preference, and a tile provisions nothing (RequireHome
@@ -280,7 +283,8 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	}
 	c.log.Info("session assigned", "session_id", sess.ID, "host_id", deref(sess.HostID), "gpu_index", derefI32(sess.GPUIndex),
 		"reserved_encode_slots", sess.ReservedSlots,
-		"stream_source", source, "playout0_ms", playout0Ms)
+		"stream_source", source, "playout0_ms", playout0Ms,
+		"codec_preference", p.CodecPreference)
 	c.health.logGPUUtilization(ctx, deref(sess.HostID), deref(sess.GPUID))
 
 	// Post-placement: rung resolution, cert cap, re-resolve, one write. Placement
@@ -365,6 +369,28 @@ func (c *Coordinator) applyPostPlacement(
 	}
 	plan.applyTo(sess)
 	return nil
+}
+
+// launchCodecPreference reads the device scope for an Auto launch's codec
+// preference (codecPreference). A failed scope read is an empty preference,
+// never a refusal; a failed history read resolves without history, as
+// gatherStreamInputs does. No chain (the legacy tier path) is no preference.
+func (c *Coordinator) launchCodecPreference(ctx context.Context, userID, deviceID string, chain profile.LaunchProfile) []string {
+	if len(chain.Rungs) == 0 {
+		return nil
+	}
+	scope, err := c.store.ResolveDeviceScope(ctx, userID, deviceID, scopeSitePreference)
+	if err != nil {
+		c.log.Warn("codec preference: device scope load failed, placing without one", "user_id", userID, "err", err)
+		return nil
+	}
+	failed, err := c.store.RungFailures(ctx, userID, scope.DeviceKey, chain)
+	if err != nil {
+		c.log.Warn("codec preference: decode-failure history load failed, ranking without it",
+			"user_id", userID, "profile_id", chain.ID, "err", err)
+		failed = nil
+	}
+	return codecPreference(chain.Rungs, scope.Probe, failed)
 }
 
 // gatherStreamInputs performs every read the post-placement decision needs and

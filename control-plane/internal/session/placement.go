@@ -63,7 +63,12 @@ func spreadOrderBySQL(staleIdx int) string {
 // extraArgs in order. Both placeholder indices are passed in and must never be
 // hard-coded: that couples this file to the scheduler's argument layout, and a
 // layout change then sends the wrong type into `$n::uuid` on every launch.
+//
+// Key order is control-api.md "Admission control" (amendment 12): locality, then
+// the codec preference, then spread. The preference renders and binds only when
+// set, so a launch without one sends the statement it always did.
 func (p PlacementPolicy) policyOrderSQL(cp CreateParams, staleIdx, firstExtraIdx int) (orderBy string, extraArgs []any) {
+	next := firstExtraIdx
 	switch p {
 	case PolicyLocality:
 		// last_used_at DESC: after a locality miss a (user, app) can hold homes on
@@ -71,16 +76,36 @@ func (p PlacementPolicy) policyOrderSQL(cp CreateParams, staleIdx, firstExtraIdx
 		// cp.homeAppID(), never cp.AppID — a tile has no user_homes row, so the
 		// tile id would silently degrade to spread. What actually lands a tile is
 		// CreateParams.PinHostID, under both policies.
-		return fmt.Sprintf(`CASE WHEN g.host_id = (
+		orderBy = fmt.Sprintf(`CASE WHEN g.host_id = (
 				SELECT host_id FROM user_homes
 				WHERE user_id = $%d::uuid AND app_id = $%d::uuid AND gc_after IS NULL
 				ORDER BY last_used_at DESC
 				LIMIT 1
-			) THEN 0 ELSE 1 END ASC,`, firstExtraIdx, firstExtraIdx+1) + spreadOrderBySQL(staleIdx),
-			[]any{cp.UserID, cp.homeAppID()}
+			) THEN 0 ELSE 1 END ASC,`, next, next+1)
+		extraArgs = []any{cp.UserID, cp.homeAppID()}
+		next += 2
 	default: // spread, and any future policy, falls through to spread
-		return spreadOrderBySQL(staleIdx), nil
 	}
+	if len(cp.CodecPreference) > 0 {
+		orderBy += codecPreferenceOrderSQL(next)
+		extraArgs = append(extraArgs, cp.CodecPreference)
+	}
+	return orderBy + spreadOrderBySQL(staleIdx), extraArgs
+}
+
+// codecPreferenceOrderSQL ranks a GPU by the preference position of the best
+// codec in its set; a GPU with none of them ranks after every GPU with any. An
+// ORDER BY key only, never a filter. prefIdx binds the preference as text[].
+//
+// It joins hosts itself because the candidate query groups by g.id, so the
+// outer h.codecs is not referenceable here.
+func codecPreferenceOrderSQL(prefIdx int) string {
+	return fmt.Sprintf(`
+			COALESCE((
+				SELECT MIN(w.ord)
+				FROM hosts ph, unnest($%[1]d::text[]) WITH ORDINALITY AS w(codec, ord)
+				WHERE ph.id = g.host_id AND %[2]s ? w.codec
+			), cardinality($%[1]d::text[]) + 1) ASC,`, prefIdx, gpuCodecSetSQL("g", "ph", true))
 }
 
 // imageReadySQL drops hosts where the app's managed image is not `ready`.

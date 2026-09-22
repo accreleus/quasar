@@ -520,6 +520,21 @@ func TestPickAndRecheckAgree(t *testing.T) {
 	if maxAttempt != 0 {
 		t.Fatalf("a codec-refused launch burned %d retries; the gate must reject at the PICK", maxAttempt+1)
 	}
+
+	// The codec preference (#305) orders the pick and is absent from the
+	// re-check. It must not make them disagree, including when the GPU has none
+	// of the preferred codecs.
+	for _, pref := range [][]string{{"av1", "h264"}, {"h265"}} {
+		maxAttempt = 0
+		p := launchParams(s)
+		p.CodecPreference = pref
+		if _, err := store.ScheduleAndCreate(ctx, p); err != nil {
+			t.Fatalf("launch preferring %v: %v", pref, err)
+		}
+		if maxAttempt != 0 {
+			t.Fatalf("a launch preferring %v retried %d times: the pick and the re-check disagree", pref, maxAttempt)
+		}
+	}
 }
 
 // --- swap fit ---------------------------------------------------------------

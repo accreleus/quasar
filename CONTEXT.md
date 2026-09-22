@@ -24,10 +24,10 @@ does not. _Avoid_: "stream profile" in prose (it is the table name, not the
 concept), "quality level".
 
 **Rung resolution** — the post-placement walk that picks which rung of the
-selected chain a placed session actually starts at, given the host's encoder
+selected chain a placed session actually starts at, given the placed GPU's codec
 set, the device's decode capability, and the failure history. The GPU is still
 chosen first and the rung second; an explicit codec is a *codec constraint* on
-that choice.
+that choice, and an Auto launch's *codec preference* orders it.
 
 **Cert cap** — the encoder-certification downgrade. A host's measured verdict
 for the resolved rung can be `unsafe` (or `capped` without stable live writes),
@@ -362,6 +362,16 @@ the pick, the re-check, the totals probe and every refusal diagnosis alike. All 
 GPUs busy is `capacity_exhausted`; none online is `no_host_available`; nothing is ever
 downgraded to another codec. An Auto launch carries no constraint. _Avoid_: "codec
 override" for the placement meaning.
+
+**Codec preference** — what an Auto launch brings to placement instead of a constraint:
+the distinct codecs of the chain's rungs in chain order, keeping only rungs the launching
+device can take (decode capability, decode height, decode-failure history). It is the
+order rung resolution would follow if every GPU could encode everything. Placement uses it
+as a sort key only, after home locality and before load spread, so a free GPU that
+encodes a better codec beats a freer one that does not; it never excludes a GPU. A
+preference of H.264 alone (every usable GPU encodes it, and it is all a device with no
+probe can take) is empty, and an empty preference orders nothing. The legacy tier launch
+has none. _Avoid_: "codec priority", or calling it a constraint.
 
 **Evidence** — a host fact that came from exercising the real path, or a
 definitive local observation such as an unreachable container runtime. Only

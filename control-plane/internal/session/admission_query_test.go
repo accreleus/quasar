@@ -43,30 +43,36 @@ func admissionMatrix() map[string][]string {
 					// Readiness on is the production default (NewStore), so the
 					// #304 anchors, captured from the DB suite, carry its clause.
 					for _, ready := range []ReadinessAdmission{{}, {StaleSecs: defaultReadinessStaleSecs}} {
-						p := CreateParams{
-							UserID: user, AppID: app,
-							NeedEncodeSlots: 1,
-							PinHostID:       pin,
-							AppImage:        img,
-							PinGPUIndex:     cons.gpuPin,
-							RequireCodec:    cons.codec,
-						}
-						c := candidacy{p: p, veto: veto, readiness: ready}
-						for _, policy := range []PlacementPolicy{PolicySpread, PolicyLocality} {
-							sql, _ := c.candidateQuery(policy)
-							add("candidate", sql)
-						}
-						sql, _ := c.recheckQuery(gpuID)
-						add("recheck", sql)
-						sql, _ = c.totalsQuery()
-						add("totals", sql)
-						sql, _ = c.vetoDiagQuery()
-						add("vetodiag", sql)
-						if ready.enabled() {
-							sql, _ = c.readinessDiagQuery()
-							add("readinessdiag", sql)
-							sql, _ = c.readinessTotalsQuery()
-							add("readinesstotals", sql)
+						// A managed home adds the readiness gate's homes term; the
+						// #305 locality anchor is a managed-home launch.
+						for _, home := range []bool{false, true} {
+							p := CreateParams{
+								UserID: user, AppID: app,
+								NeedEncodeSlots: 1,
+								PinHostID:       pin,
+								AppImage:        img,
+								PinGPUIndex:     cons.gpuPin,
+								RequireCodec:    cons.codec,
+								CodecPreference: cons.pref,
+								ManagedHome:     home,
+							}
+							c := candidacy{p: p, veto: veto, readiness: ready}
+							for _, policy := range []PlacementPolicy{PolicySpread, PolicyLocality} {
+								sql, _ := c.candidateQuery(policy)
+								add("candidate", sql)
+							}
+							sql, _ := c.recheckQuery(gpuID)
+							add("recheck", sql)
+							sql, _ = c.totalsQuery()
+							add("totals", sql)
+							sql, _ = c.vetoDiagQuery()
+							add("vetodiag", sql)
+							if ready.enabled() {
+								sql, _ = c.readinessDiagQuery()
+								add("readinessdiag", sql)
+								sql, _ = c.readinessTotalsQuery()
+								add("readinesstotals", sql)
+							}
 						}
 					}
 				}
@@ -76,16 +82,18 @@ func admissionMatrix() map[string][]string {
 	return out
 }
 
-// constraint is one combination of the #304 gates: the codec constraint and the
-// GPU pin, which is only ever set beside a host pin.
+// constraint is one combination of the #304 gates (the codec constraint and the
+// GPU pin, which is only ever set beside a host pin) and the #305 codec
+// preference, which only an Auto launch carries, so never beside a codec.
 type constraint struct {
 	codec  string
 	gpuPin *int32
+	pref   []string
 }
 
 func constraintVariants(hostPin string) []constraint {
 	one := int32(1)
-	out := []constraint{{}, {codec: "av1"}}
+	out := []constraint{{}, {codec: "av1"}, {pref: []string{"av1", "h265", "h264"}}}
 	if hostPin != "" {
 		out = append(out, constraint{gpuPin: &one}, constraint{codec: "av1", gpuPin: &one})
 	}
@@ -121,6 +129,12 @@ func constraintVariants(hostPin string) []constraint {
 // gained the host/GPU pin (a pinned launch cannot be served by another host),
 // so a pinned launch's totals SQL is new; an unpinned one is byte-identical,
 // which is why every earlier totals anchor still matches.
+//
+// Lines 31-33 are #305's codec preference, captured the same way and filtered
+// to statements carrying `WITH ORDINALITY`: candidate queries only, since only
+// the pick orders (spread; spread with the veto; locality for a managed-home
+// launch, which is why admissionMatrix has a managed-home dimension). The key
+// renders and binds only when a preference is set, so lines 1-30 are unchanged.
 //
 // If this fails, the extraction changed what the scheduler asks Postgres. That
 // is the failure mode the whole exercise exists to prevent: the divergence class
@@ -185,7 +199,7 @@ func TestAdmissionSQLMatchesPreRefactor(t *testing.T) {
 	// pass while proving less than it claims. The counts are the capture's, and
 	// they only ever grow — if you re-capture and get fewer, something stopped
 	// being exercised by the DB suite and the proof got weaker without saying so.
-	want := map[string]int{"candidate": 11, "recheck": 5, "totals": 7, "vetodiag": 3,
+	want := map[string]int{"candidate": 14, "recheck": 5, "totals": 7, "vetodiag": 3,
 		"readinessdiag": 3, "readinesstotals": 1}
 	for shape, n := range want {
 		if seen[shape] != n {
@@ -375,6 +389,7 @@ func TestAdmissionArgCountsMatchPlaceholders(t *testing.T) {
 						UserID: "u", AppID: "a", NeedEncodeSlots: 1,
 						PinHostID: pin, AppImage: img,
 						PinGPUIndex: cons.gpuPin, RequireCodec: cons.codec,
+						CodecPreference: cons.pref,
 					}
 					c := candidacy{p: p, veto: veto, readiness: ReadinessAdmission{StaleSecs: 60}}
 
@@ -414,7 +429,8 @@ func TestAdmissionArgCountsMatchPlaceholders(t *testing.T) {
 						}
 						desc := tc.name + " veto=" + boolStr(veto.enabled()) +
 							" pin=" + boolStr(pin != "") + " image=" + boolStr(img != "") +
-							" codec=" + cons.codec + " gpupin=" + boolStr(cons.gpuPin != nil)
+							" codec=" + cons.codec + " gpupin=" + boolStr(cons.gpuPin != nil) +
+							" pref=" + strings.Join(cons.pref, ",")
 						if max != len(tc.args) {
 							t.Errorf("%s: highest placeholder $%d but %d args bound", desc, max, len(tc.args))
 						}
