@@ -157,6 +157,22 @@ describe("readiness groups (#102)", () => {
     ]);
   });
 
+  it("sorts an unsupported check with the passes, never as not-applicable (#311)", () => {
+    const { groups, notApplicable } = groupChecks([
+      c("media_probe_gpu1_av1", "unsupported"),
+      c("render_node", "pass"),
+      c("xid_visibility", "unknown"),
+      c("dri_node_app_access", "fail"),
+    ]);
+    expect(notApplicable).toEqual([]);
+    expect(groups[0].checks.map((x) => x.id)).toEqual([
+      "dri_node_app_access",
+      "xid_visibility",
+      "media_probe_gpu1_av1",
+      "render_node",
+    ]);
+  });
+
   // Per-GPU host-probe ids land in their base id's group.
   it("places per-GPU media_probe checks in the gpu group alongside their base id", () => {
     const { groups } = groupChecks([c("media_probe_gpu0"), c("media_probe_gpu1"), c("render_node")]);

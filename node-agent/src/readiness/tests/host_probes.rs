@@ -349,13 +349,46 @@ const AV1_GPU0: ProbeTarget = ProbeTarget {
 const READY_EVIDENCE: &str = "vulkanav1enc: the encode pipeline could not reach READY on \
     /dev/dri/renderD128: vulkanav1enc0: no AV1 encode profile";
 
+const PLAYING_EVIDENCE: &str = "vulkanav1enc: vulkanav1enc0: device lost";
+
+/// #311: the encoder could not open (exit 4) — the GPU has no such encoder. Reported as
+/// `unsupported`, not `fail`, with the same evidence; still blocks nothing.
+#[test]
+fn a_codec_probe_that_cannot_reach_ready_is_unsupported_and_blocks_nothing() {
+    let (root, mut report) = refreshed_report("hp-codec-unsupported");
+    record(
+        &mut report,
+        AV1_GPU0,
+        child_outcome(AV1_GPU0, exited(4, READY_EVIDENCE)),
+        at(100),
+    );
+    report.refreshed(probe(&root.env(false, "")), at(200));
+
+    let merged = report.merged();
+    let check = find(&merged, "media_probe_gpu0_av1").expect("codec check");
+    assert_eq!(check.status, UNSUPPORTED);
+    assert_eq!(check.blocks, None);
+    assert_eq!(check.source.as_deref(), Some("host_probe"));
+    assert!(
+        check.summary.contains("GPU 0 does not encode av1"),
+        "{}",
+        check.summary
+    );
+    assert!(check.summary.contains("could not reach READY"));
+    assert_eq!(check.remediation, "");
+    assert_eq!(
+        codec_probe_verdict(&report, 0, ProbeCodec::Av1),
+        Some(false)
+    );
+}
+
 #[test]
 fn a_failing_codec_probe_is_a_fail_that_blocks_nothing_and_says_the_codec_is_not_used() {
     let (root, mut report) = refreshed_report("hp-codec-fail");
     record(
         &mut report,
         AV1_GPU0,
-        child_outcome(AV1_GPU0, exited(1, READY_EVIDENCE)),
+        child_outcome(AV1_GPU0, exited(1, PLAYING_EVIDENCE)),
         at(100),
     );
     report.refreshed(probe(&root.env(false, "")), at(200));
@@ -375,7 +408,7 @@ fn a_failing_codec_probe_is_a_fail_that_blocks_nothing_and_says_the_codec_is_not
         "{}",
         check.summary
     );
-    assert!(check.summary.contains("could not reach READY"));
+    assert!(check.summary.contains("device lost"));
     assert!(!check.remediation.is_empty());
 }
 
@@ -402,7 +435,7 @@ fn a_passing_codec_probe_carries_no_blocks_either() {
 
 #[test]
 fn an_indeterminate_codec_probe_leaves_the_retained_verdict_unchanged() {
-    for (code, verdict) in [(0, Some(true)), (1, Some(false))] {
+    for (code, verdict) in [(0, Some(true)), (1, Some(false)), (4, Some(false))] {
         let (root, mut report) = refreshed_report("hp-codec-stands");
         record(
             &mut report,
@@ -452,8 +485,8 @@ fn a_codec_probe_that_never_concluded_has_no_verdict() {
     assert_eq!(codec_probe_verdict(&report, 0, ProbeCodec::Av1), None);
 }
 
-/// The child's exit-code mapping for a codec target: 0 pass, 1 fail, anything else
-/// indeterminate, exactly as for the media probe.
+/// The child's exit-code mapping for a codec target: 0 pass, 1 fail, 4 unsupported,
+/// anything else indeterminate.
 #[test]
 fn the_codec_childs_exit_codes_map_like_the_media_probes() {
     assert!(matches!(
@@ -461,8 +494,12 @@ fn the_codec_childs_exit_codes_map_like_the_media_probes() {
         ProbeOutcome::Pass { .. }
     ));
     assert!(matches!(
-        child_outcome(AV1_GPU0, exited(1, READY_EVIDENCE)),
+        child_outcome(AV1_GPU0, exited(1, PLAYING_EVIDENCE)),
         ProbeOutcome::Fail { .. }
+    ));
+    assert!(matches!(
+        child_outcome(AV1_GPU0, exited(4, READY_EVIDENCE)),
+        ProbeOutcome::Unsupported { .. }
     ));
     for code in [2, 3] {
         assert!(matches!(

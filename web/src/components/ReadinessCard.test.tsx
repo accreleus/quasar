@@ -189,6 +189,40 @@ describe("ReadinessCard", () => {
     expect(screen.getByText("1 check not applicable to this host")).toBeInTheDocument();
   });
 
+  // #311: a codec the GPU has no encoder for is a hardware fact, not a fault.
+  it("renders an unsupported check with a neutral Unsupported chip and no Needs attention badge", () => {
+    render(
+      <ReadinessCard
+        checks={[
+          check({ id: "render_node" }),
+          check({ id: "xid_visibility", status: "unknown" as ReadinessCheck["status"], summary: "Could not tell." }),
+          check({
+            id: "media_probe_gpu1_av1",
+            status: "unsupported" as ReadinessCheck["status"],
+            summary: "GPU 1 does not encode av1; sessions will not use av1 on this GPU: vulkanav1enc: the encode pipeline could not reach READY",
+            remediation: "Nothing needs fixing: this GPU's video engine has no av1 encoder, so sessions on it use another codec.",
+          }),
+        ]}
+      />,
+    );
+    const row = screen.getByTestId("readiness-check-media_probe_gpu1_av1");
+    expect(within(row).getByRole("img", { name: "Unsupported" })).toBeInTheDocument();
+    const chip = within(screen.getByTestId("readiness-unsupported-media_probe_gpu1_av1")).getByText("Unsupported");
+    expect(chip).toHaveClass("chip");
+    expect(chip).not.toHaveClass("chip-danger");
+    expect(within(row).getByText(/GPU 1 does not encode av1/)).toBeInTheDocument();
+    expect(within(row).queryByRole("button", { name: /copy/i })).not.toBeInTheDocument();
+    expect(screen.queryByText("Needs attention")).not.toBeInTheDocument();
+    // Sorted with the passes (after an indeterminate check), not set aside as not applicable.
+    expect(screen.queryByTestId("readiness-not-applicable")).not.toBeInTheDocument();
+    const group = screen.getByTestId("readiness-group");
+    expect(within(group).getAllByTestId(/^readiness-check-/).map((el) => el.dataset.testid)).toEqual([
+      "readiness-check-xid_visibility",
+      "readiness-check-media_probe_gpu1_av1",
+      "readiness-check-render_node",
+    ]);
+  });
+
   it("passes an unrecognized status through instead of crashing", () => {
     render(
       <ReadinessCard

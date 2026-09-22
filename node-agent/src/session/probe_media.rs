@@ -90,7 +90,16 @@ pub enum ProbeVerdict {
     /// result (`host_probe::outcome::record`), which is what amendment 11 requires: an
     /// indeterminate probe neither sets nor clears a block.
     Indeterminate(String),
+    /// A codec probe (#311): the encode pipeline could not reach READY, i.e. the device
+    /// has no encoder for this codec. A hardware fact, not a fault — definitive like
+    /// `Fail`, but reported as readiness status `unsupported`. The H.264 media probe never
+    /// answers this: H.264 is the floor, so its READY failure stays `Fail`.
+    Unsupported(String),
 }
+
+/// The child's exit code for [`ProbeVerdict::Unsupported`]; the parent reads it in
+/// `host_probe::outcome::child_outcome`.
+pub const UNSUPPORTED_EXIT: i32 = 4;
 
 /// Must not contain "WOLF_": it names QUASAR_ENCODER as a way to isolate the fault,
 /// never as the fix.
@@ -109,7 +118,8 @@ impl ProbeVerdict {
             | ProbeVerdict::Fail(s)
             | ProbeVerdict::Mismatch(s)
             | ProbeVerdict::Usage(s)
-            | ProbeVerdict::Indeterminate(s) => s,
+            | ProbeVerdict::Indeterminate(s)
+            | ProbeVerdict::Unsupported(s) => s,
         }
     }
 
@@ -119,6 +129,7 @@ impl ProbeVerdict {
             ProbeVerdict::Fail(_) | ProbeVerdict::Mismatch(_) => 1,
             ProbeVerdict::Usage(_) => 2,
             ProbeVerdict::Indeterminate(_) => 3,
+            ProbeVerdict::Unsupported(_) => UNSUPPORTED_EXIT,
         }
     }
 
@@ -417,6 +428,9 @@ enum Reached {
 
 /// What the run observed, so the verdict wording is decided in one pure place.
 struct Observed {
+    /// The codec asked for: a READY failure is `Unsupported` for a codec probe, `Fail`
+    /// for the H.264 floor.
+    codec: Codec,
     frames: u64,
     encoder: String,
     render_node: String,
@@ -441,10 +455,16 @@ fn verdict(wanted: u64, seen: &Observed) -> ProbeVerdict {
             .error
             .as_deref()
             .unwrap_or("no error message was posted");
-        return ProbeVerdict::Fail(format!(
+        let line = format!(
             "{}: the encode pipeline could not reach {state} on {}: {why}",
             seen.encoder, seen.render_node
-        ));
+        );
+        // NULL→READY is where the encoder opens its codec on the device; a codec probe
+        // stuck there means the device has no such encoder (#311).
+        if seen.reached == Reached::NotReady && seen.codec != Codec::H264 {
+            return ProbeVerdict::Unsupported(line);
+        }
+        return ProbeVerdict::Fail(line);
     }
     if let Some(error) = &seen.error {
         return ProbeVerdict::Fail(format!("{}: {error}", seen.encoder));
@@ -739,6 +759,7 @@ fn build_and_run(
             let error = encoder_error_first(errors);
             teardown(&pipeline);
             return Ok(Observed {
+                codec,
                 frames: 0,
                 encoder: resolved.factory.clone(),
                 render_node: cfg.render_node.clone(),
@@ -870,6 +891,7 @@ fn build_and_run(
     };
 
     let seen = Observed {
+        codec,
         frames: frames.load(Ordering::Relaxed),
         encoder: resolved.factory.clone(),
         render_node: cfg.render_node.clone(),
@@ -887,6 +909,7 @@ mod tests {
 
     fn observed(frames: u64, error: Option<&str>) -> Observed {
         Observed {
+            codec: Codec::H264,
             frames,
             encoder: "vulkanh264enc".into(),
             render_node: "/dev/dri/renderD128".into(),
@@ -901,6 +924,7 @@ mod tests {
 
     fn observed_with_pixel(frames: u64, pixel: PixelCheck) -> Observed {
         Observed {
+            codec: Codec::H264,
             frames,
             encoder: "vulkanh264enc".into(),
             render_node: "/dev/dri/renderD128".into(),
@@ -1069,6 +1093,7 @@ mod tests {
             verdict(
                 30,
                 &Observed {
+                    codec: Codec::H264,
                     frames: 30,
                     encoder: "vulkanh264enc".into(),
                     render_node: "/dev/dri/renderD128".into(),
@@ -1210,6 +1235,7 @@ mod tests {
 
     fn observed_hevc(frames: u64, reached: Reached, error: Option<&str>) -> Observed {
         Observed {
+            codec: Codec::H265,
             frames,
             encoder: "vulkanh265enc".into(),
             render_node: "/dev/dri/renderD129".into(),
@@ -1228,11 +1254,14 @@ mod tests {
         assert!(v.line().contains("h264 only"), "{}", v.line());
     }
 
+    /// #311: the device has no encoder for the codec — a hardware fact, reported as
+    /// `unsupported` (exit 4) with the same evidence a fail would carry.
     #[test]
-    fn a_pipeline_that_cannot_reach_ready_is_a_definitive_fail_carrying_the_evidence() {
+    fn a_codec_probe_that_cannot_reach_ready_is_unsupported_carrying_the_evidence() {
         let v = verdict(
             10,
             &Observed {
+                codec: Codec::Av1,
                 encoder: "vulkanav1enc".into(),
                 ..observed_hevc(
                     0,
@@ -1241,11 +1270,46 @@ mod tests {
                 )
             },
         );
-        assert!(matches!(v, ProbeVerdict::Fail(_)), "{v:?}");
-        assert_eq!(v.exit_code(), 1);
+        assert!(matches!(v, ProbeVerdict::Unsupported(_)), "{v:?}");
+        assert_eq!(v.exit_code(), UNSUPPORTED_EXIT);
+        assert_eq!(v.exit_code(), 4);
         assert!(v.line().contains("could not reach READY"), "{}", v.line());
         assert!(v.line().contains("no AV1 encode profile"), "{}", v.line());
         assert!(!v.line().contains('\n'));
+        assert_eq!(v.remediation(), None);
+    }
+
+    /// H.264 is the floor: its media probe stuck at READY is a real fault that blocks
+    /// the GPU, so it stays `Fail` (#311).
+    #[test]
+    fn the_h264_media_probe_that_cannot_reach_ready_stays_a_fail() {
+        let v = verdict(
+            30,
+            &Observed {
+                reached: Reached::NotReady,
+                frames: 0,
+                pixel: PixelCheck::NotRun("the encode pipeline never started".into()),
+                ..observed(0, Some("vulkanh264enc0: no encode profile"))
+            },
+        );
+        assert!(matches!(v, ProbeVerdict::Fail(_)), "{v:?}");
+        assert_eq!(v.exit_code(), 1);
+        assert!(v.line().contains("could not reach READY"), "{}", v.line());
+    }
+
+    /// A codec probe that got past READY and then failed is a real problem, not a
+    /// missing encoder: it stays `Fail` (#311).
+    #[test]
+    fn a_codec_probe_failing_after_ready_stays_a_fail() {
+        for seen in [
+            observed_hevc(0, Reached::NotPlaying, Some("vulkanh265enc0: device lost")),
+            observed_hevc(10, Reached::Playing, Some("vulkanh265enc0: device lost")),
+            observed_hevc(3, Reached::Playing, None),
+        ] {
+            let v = verdict(10, &seen);
+            assert!(matches!(v, ProbeVerdict::Fail(_)), "{v:?}");
+            assert_eq!(v.exit_code(), 1);
+        }
     }
 
     #[test]
@@ -1256,14 +1320,16 @@ mod tests {
     }
 
     /// The exit-code mapping for a non-H.264 request: the pixel check's absence is no
-    /// longer indeterminate (3), so the child answers pass (0) or fail (1).
+    /// longer indeterminate (3), so the child answers pass (0), fail (1) or, when the
+    /// encoder cannot open, unsupported (4).
     #[test]
-    fn a_non_h264_request_exits_zero_or_one_never_indeterminate() {
+    fn a_non_h264_request_is_never_indeterminate() {
         for (seen, code) in [
             (observed_hevc(10, Reached::Playing, None), 0),
             (observed_hevc(3, Reached::Playing, None), 1),
             (observed_hevc(10, Reached::Playing, Some("boom")), 1),
-            (observed_hevc(0, Reached::NotReady, None), 1),
+            (observed_hevc(0, Reached::NotPlaying, None), 1),
+            (observed_hevc(0, Reached::NotReady, None), 4),
         ] {
             assert_eq!(verdict(10, &seen).exit_code(), code);
         }

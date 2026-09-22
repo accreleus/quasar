@@ -175,4 +175,15 @@ describe("needsAttention", () => {
     ).toBe(true);
     expect(needsAttention({ ...online, readiness: null })).toBe(false);
   });
+
+  // #311: a codec the GPU has no encoder for is a hardware fact, not a fault.
+  it("is false for a host whose only non-pass check is unsupported, true once a real fail joins it", () => {
+    const unsupported = { id: "media_probe_gpu1_av1", status: "unsupported", summary: "GPU 1 does not encode av1" };
+    const host = { ...online, storage: [], readiness: [{ id: "render_node", status: "pass", summary: "ok" }, unsupported] };
+    expect(needsAttention(host)).toBe(false);
+    expect(deriveAlerts([host], [], NOW)).toEqual([]);
+    expect(
+      needsAttention({ ...host, readiness: [...host.readiness, { id: "media_probe_gpu1", status: "fail", summary: "no" }] }),
+    ).toBe(true);
+  });
 });

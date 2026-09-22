@@ -140,7 +140,9 @@ impl ProbeHandle {
 pub(super) fn verdict_of(outcome: &ProbeOutcome) -> Verdict {
     match outcome {
         ProbeOutcome::Pass { .. } => Verdict::Passed,
-        ProbeOutcome::Fail { .. } | ProbeOutcome::NotApplicable { .. } => Verdict::NotPassed,
+        ProbeOutcome::Fail { .. }
+        | ProbeOutcome::Unsupported { .. }
+        | ProbeOutcome::NotApplicable { .. } => Verdict::NotPassed,
         ProbeOutcome::Indeterminate { .. } => Verdict::Indeterminate,
     }
 }
