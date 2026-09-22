@@ -33,10 +33,22 @@ func TestProfileMenuUnionOverMixedGPUCodecSets(t *testing.T) {
 	setGPUCodecsRaw(t, pool, s.hostID, 0, `["h264","h265","av1"]`)
 	setGPUCodecsRaw(t, pool, s.hostID, 1, `["h264","h265"]`)
 
+	// Reserve every one of gpu 0's slots with a running session: the union is a
+	// totals question, like totalsQuery, not an availability one — a fully busy
+	// GPU still counts, only the free-slot term is dropped.
+	var filler string
+	must(t, pool.QueryRow(ctx, `INSERT INTO users (email, username, password_hash)
+		VALUES ('menu-union-filler@test.local','menu-union-filler','x') RETURNING id::text`).Scan(&filler))
+	must(t, exec(t, pool, `INSERT INTO sessions
+		(user_id, app_id, host_id, gpu_id, state, width, height, fps, bitrate_kbps,
+		 h264_profile, reserved_vram_mb, reserved_encode_slots)
+		VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, 'running', 1280, 720, 30, 2000,
+		        'constrained-baseline', 0, 4)`, filler, s.appID, s.hostID, s.gpuID))
+
 	url := srv.URL + "/v1/me/profiles?app_id=" + s.appID
 	_, body := getProfiles(t, url, tok)
 	if av1 := rungByID(body, "1440p60-av1"); av1 == nil || av1.Eligibility != "eligible" {
-		t.Fatalf("av1 must be offered from the union (gpu 0 reports it): %+v", av1)
+		t.Fatalf("av1 must be offered from the union (gpu 0 reports it, busy or not): %+v", av1)
 	}
 }
 
@@ -170,5 +182,127 @@ func TestProfileMenuNonAdminBodyCarriesOnlyReasons(t *testing.T) {
 	}
 	if !strings.Contains(text, "host_encoder_not_supported") {
 		t.Fatalf("expected the av1 exclusion reason in the body: %s", text)
+	}
+}
+
+// TestProfileMenuReadinessHomesTermAppliesOnlyToManagedHomeApps: the readiness
+// gate's homes term (readinessGateSQL's `OR h.readiness_block_homes`) only
+// engages when the resolved app is managed-home — CreateParams.ManagedHome,
+// set from LaunchApp.ManagedHome the same way launcher.go does. A plain app
+// must not be gated by a homes-only block.
+func TestProfileMenuReadinessHomesTermAppliesOnlyToManagedHomeApps(t *testing.T) {
+	pool := testDB(t)
+	s := seed(t, pool, 4)
+	managedApp := seedSteamApp(t, pool, `{"image":"steam:1"}`)
+	setGPUCodecsRaw(t, pool, s.hostID, 0, `["h264","h265","av1"]`)
+
+	// A second, non-av1 host: proves a homes-block excludes av1 specifically
+	// rather than emptying the whole union into advisory-unknown.
+	hostB, _ := addHost(t, pool, "host-2", 4)
+	setGPUCodecsRaw(t, pool, hostB, 0, `["h264","h265"]`)
+
+	// Fresh homes-only block, host-level flag stays false.
+	reportReadiness(t, pool, s.hostID, 5, false, true)
+
+	srv, authSvc, _ := newMetricsServer(t, pool)
+	ctx := context.Background()
+	u, err := authSvc.Register(ctx, "menu-homes@test.local", "menu-homes", "quasar-fixture-pw-08")
+	must(t, err)
+	tok := loginTok(t, authSvc, "menu-homes@test.local", "quasar-fixture-pw-08")
+	enableChainCodecs(t, pool, "1440p60", "av1", "hevc", "h264")
+	upsertCodecProbe(t, pool, u.ID, true, true)
+
+	managedURL := srv.URL + "/v1/me/profiles?app_id=" + managedApp
+	_, body := getProfiles(t, managedURL, tok)
+	if av1 := rungByID(body, "1440p60-av1"); av1 == nil || av1.Eligibility != "ineligible" || !hasReasonCode(av1.Reasons, "host_encoder_not_supported") {
+		t.Fatalf("a managed-home app must be gated by readiness_block_homes: %+v", av1)
+	}
+
+	plainURL := srv.URL + "/v1/me/profiles?app_id=" + s.appID
+	_, body = getProfiles(t, plainURL, tok)
+	if av1 := rungByID(body, "1440p60-av1"); av1 == nil || av1.Eligibility != "eligible" {
+		t.Fatalf("a plain (non-managed-home) app must ignore readiness_block_homes: %+v", av1)
+	}
+}
+
+// TestProfileMenuSlotsTermUsesTheAppsOwnEncodeSlots: the slots term is the
+// app's own default_encode_slots (as totalsQuery/readinessTotalsQuery use),
+// not a bare "> 0" — a GPU whose total sits below the app's ask is excluded
+// even though it would satisfy a smaller app.
+func TestProfileMenuSlotsTermUsesTheAppsOwnEncodeSlots(t *testing.T) {
+	pool := testDB(t)
+	s := seed(t, pool, 1) // gpu 0: 1 slot total, below the app's ask
+	setGPUCodecsRaw(t, pool, s.hostID, 0, `["h264","h265","av1"]`)
+
+	// A second, adequately-provisioned but non-av1 host: proves the small GPU's
+	// exclusion drops av1 specifically rather than emptying the whole union.
+	hostB, _ := addHost(t, pool, "host-2", 4)
+	setGPUCodecsRaw(t, pool, hostB, 0, `["h264","h265"]`)
+
+	twoSlotApp := insertApp(t, pool, "two-slot-app", 1024, 2)
+
+	srv, authSvc, _ := newMetricsServer(t, pool)
+	ctx := context.Background()
+	u, err := authSvc.Register(ctx, "menu-slots@test.local", "menu-slots", "quasar-fixture-pw-08")
+	must(t, err)
+	tok := loginTok(t, authSvc, "menu-slots@test.local", "quasar-fixture-pw-08")
+	enableChainCodecs(t, pool, "1440p60", "av1", "hevc", "h264")
+	upsertCodecProbe(t, pool, u.ID, true, true)
+
+	url := srv.URL + "/v1/me/profiles?app_id=" + twoSlotApp
+	_, body := getProfiles(t, url, tok)
+	if av1 := rungByID(body, "1440p60-av1"); av1 == nil || av1.Eligibility != "ineligible" || !hasReasonCode(av1.Reasons, "host_encoder_not_supported") {
+		t.Fatalf("a 1-slot GPU must not satisfy a 2-slot app's totals: %+v", av1)
+	}
+}
+
+// TestProfileMenuStaleReadinessBlockDoesNotHideCodec: past the staleness
+// window the gate abstains, same as at launch — a block never turns into a
+// standing menu exclusion once its evidence goes stale.
+func TestProfileMenuStaleReadinessBlockDoesNotHideCodec(t *testing.T) {
+	pool := testDB(t)
+	s := seed(t, pool, 4)
+	setGPUCodecsRaw(t, pool, s.hostID, 0, `["h264","h265","av1"]`)
+
+	reportReadiness(t, pool, s.hostID, 65, false, false) // past the default 60s window
+	blockGPU(t, pool, s.gpuID, true)
+
+	srv, authSvc, _ := newMetricsServer(t, pool)
+	ctx := context.Background()
+	u, err := authSvc.Register(ctx, "menu-stale@test.local", "menu-stale", "quasar-fixture-pw-08")
+	must(t, err)
+	tok := loginTok(t, authSvc, "menu-stale@test.local", "quasar-fixture-pw-08")
+	enableChainCodecs(t, pool, "1440p60", "av1", "hevc", "h264")
+	upsertCodecProbe(t, pool, u.ID, true, true)
+
+	url := srv.URL + "/v1/me/profiles?app_id=" + s.appID
+	_, body := getProfiles(t, url, tok)
+	if av1 := rungByID(body, "1440p60-av1"); av1 == nil || av1.Eligibility != "eligible" {
+		t.Fatalf("a stale readiness block must abstain, not hide the codec: %+v", av1)
+	}
+}
+
+// TestProfileMenuZeroSlotGPUContributesNothing: a zero-slot GPU fails the
+// slots term outright, so it must not leak the host's wider set into the
+// union through NULL-codec inheritance.
+func TestProfileMenuZeroSlotGPUContributesNothing(t *testing.T) {
+	pool := testDB(t)
+	s := seed(t, pool, 4)
+	setGPUCodecsRaw(t, pool, s.hostID, 0, `["h264","h265"]`)
+	setHostCodecs(t, pool, s.hostID, `["h264","h265","av1"]`)
+	addGPU(t, pool, s.hostID, 1, 0) // zero slots, codecs never reported (NULL)
+
+	srv, authSvc, _ := newMetricsServer(t, pool)
+	ctx := context.Background()
+	u, err := authSvc.Register(ctx, "menu-zero-slot@test.local", "menu-zero-slot", "quasar-fixture-pw-08")
+	must(t, err)
+	tok := loginTok(t, authSvc, "menu-zero-slot@test.local", "quasar-fixture-pw-08")
+	enableChainCodecs(t, pool, "1440p60", "av1", "hevc", "h264")
+	upsertCodecProbe(t, pool, u.ID, true, true)
+
+	url := srv.URL + "/v1/me/profiles?app_id=" + s.appID
+	_, body := getProfiles(t, url, tok)
+	if av1 := rungByID(body, "1440p60-av1"); av1 == nil || av1.Eligibility != "ineligible" || !hasReasonCode(av1.Reasons, "host_encoder_not_supported") {
+		t.Fatalf("a zero-slot GPU must not contribute the host's av1 via inheritance: %+v", av1)
 	}
 }

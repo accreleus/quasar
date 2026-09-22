@@ -12,16 +12,24 @@ import (
 // capacity: the union of GPU codec sets (#296 amendment 12, control-api.md
 // "host_encoder_not_supported is computed over GPU codec sets") over the GPUs
 // that pass the launch's candidacy without the free-slot term — a busy GPU
-// still counts, but the readiness gate, the derived-tile host pin and the image
-// gate all apply, same as at launch. Placement remains the authoritative check.
+// still counts, but the readiness gate, the derived-tile host pin, the image
+// gate and the app's own encode-slot totals all apply, same as at launch. No
+// VRAM veto: like totalsQuery, that gate is a LOAD term (§4.1 abstains whenever
+// vram_mb_total <= floor, so such a GPU is still servable) and this is a totals
+// question, not an availability one. Placement remains the authoritative check.
 func (s *Store) profileHostCaps(ctx context.Context, userID, appID string) (profile.HostCaps, error) {
-	p := CreateParams{}
+	p := CreateParams{NeedEncodeSlots: 1}
 	if appID != "" {
 		app, err := s.GetLaunchApp(ctx, appID)
 		if err != nil {
 			return profile.HostCaps{}, err
 		}
 		p.AppImage = app.Image()
+		// The PARENT's managed_home for a tile (LaunchApp.ManagedHome already
+		// resolves it, see launcher.go), so the readiness gate's homes term
+		// engages for a tile exactly as it does at launch.
+		p.ManagedHome = app.ManagedHome
+		p.NeedEncodeSlots = app.DefaultEncodeSlots
 		if app.IsDerived() {
 			p.PinHostID, err = s.HomeHostForApp(ctx, userID, homeAppID(app))
 			if err != nil || p.PinHostID == "" {
@@ -31,13 +39,14 @@ func (s *Store) profileHostCaps(ctx context.Context, userID, appID string) (prof
 	}
 	a := &argset{}
 	c := candidacy{p: p, readiness: s.readiness}
+	slotsIdx := a.add(p.NeedEncodeSlots)
 	pin := c.pinGate(a)
 	image := c.imageGate(a, " AND ")
 	gate := c.readinessGate(a, " AND ")
 	rows, err := s.pool.Query(ctx, `SELECT `+gpuCodecSetSQL("g", "h", true)+`
 		FROM gpus g JOIN hosts h ON h.id = g.host_id
 		WHERE h.status = 'online' AND h.capacity_detection = 'ok'
-		AND g.reported AND g.encode_slots_total > 0`+schedulableBindingSQL+pin+image+gate, a.args()...)
+		AND g.reported AND g.encode_slots_total >= $`+fmt.Sprint(slotsIdx)+schedulableBindingSQL+pin+image+gate, a.args()...)
 	if err != nil {
 		return profile.HostCaps{}, fmt.Errorf("query profile host codecs: %w", err)
 	}
@@ -56,7 +65,9 @@ func (s *Store) profileHostCaps(ctx context.Context, userID, appID string) (prof
 	return profile.HostCaps{Codecs: profileCodecUnion(reports)}, nil
 }
 
-// nil means the available host set is not fully reported. A non-nil map is a
+// nil means no candidate GPU rows at all (every GPU blocked, or the fleet down)
+// or a malformed report — both advisory-unknown. A row itself is never nil:
+// gpuCodecSetSQL(fallbackH264=true) floors it at h264. A non-nil map is a
 // measured union: absence is then a real codec exclusion, not missing telemetry.
 func profileCodecUnion(reports [][]byte) map[profile.Codec]bool {
 	if len(reports) == 0 {
