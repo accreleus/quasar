@@ -524,15 +524,25 @@ impl CodecSupport {
     }
 }
 
-/// Probe the registry for the codecs `choice`'s encoder path can produce. Requires
-/// `gst::init` to have run against the runtime GPU's registry — the agent forces a
-/// fresh scan for hardware encoders (`session::init_gstreamer`), since a registry
-/// baked without a GPU carries no VA/HW encoder factories.
-pub fn probe_codec_support(choice: EncoderChoice, knobs: EncoderKnobs) -> CodecSupport {
+/// Probe the registry for the codecs `choice`'s encoder path can produce on
+/// `render_node`. Requires `gst::init` to have run against the runtime GPU's registry —
+/// the agent forces a fresh scan for hardware encoders (`session::init_gstreamer`),
+/// since a registry baked without a GPU carries no VA/HW encoder factories.
+///
+/// Pass `"software"` for the host-wide support question (`agent::probe_host_codecs`,
+/// which no single GPU answers) and a GPU's own render node for its per-GPU plan
+/// (#301 layer 1) — VA then resolves the device-prefixed element name
+/// (`va_encoder_candidates`); Vulkan and NVENC are device-agnostic in the registry and
+/// resolve the same either way.
+pub fn probe_codec_support(
+    choice: EncoderChoice,
+    knobs: EncoderKnobs,
+    render_node: &str,
+) -> CodecSupport {
     let (codecs, elements) = [Codec::H264, Codec::H265, Codec::Av1]
         .into_iter()
         .filter_map(|codec| {
-            let resolved = effective_encoder(choice, codec, knobs, "software")?;
+            let resolved = effective_encoder(choice, codec, knobs, render_node)?;
             gst::ElementFactory::find(codec.rtp_payloader())?;
             Some((codec, resolved.factory))
         })
@@ -1216,6 +1226,66 @@ mod tests {
         assert_eq!(
             encoder_candidates(EncoderChoice::Vulkan, Codec::Av1, knobs, "software"),
             ["vulkanav1enc"]
+        );
+    }
+
+    // #301 layer 1: the per-GPU registry plan is `effective_encoder`/`probe_codec_support`
+    // evaluated on that GPU's own render node instead of the literal "software" — VA
+    // then resolves a device-prefixed factory per GPU, while Vulkan (device-agnostic in
+    // the registry) resolves the same factory regardless of which GPU asked.
+    #[test]
+    fn per_gpu_plan_names_va_by_device_but_not_vulkan() {
+        let knobs = EncoderKnobs::default();
+        let registered = |names: &[String]| {
+            names.iter().any(|n| {
+                matches!(
+                    n.as_str(),
+                    "varenderD128h264enc" | "varenderD129h264enc" | "vulkanh264enc"
+                )
+            })
+        };
+        let gpu0 = effective_encoder_with(
+            EncoderChoice::Va,
+            Codec::H264,
+            knobs,
+            "/dev/dri/renderD128",
+            registered,
+        )
+        .unwrap();
+        let gpu1 = effective_encoder_with(
+            EncoderChoice::Va,
+            Codec::H264,
+            knobs,
+            "/dev/dri/renderD129",
+            registered,
+        )
+        .unwrap();
+        assert_eq!(gpu0.factory, "varenderD128h264enc");
+        assert_eq!(gpu1.factory, "varenderD129h264enc");
+        assert_ne!(
+            gpu0.factory, gpu1.factory,
+            "VA must be device-prefixed per GPU"
+        );
+
+        let vk0 = effective_encoder_with(
+            EncoderChoice::Vulkan,
+            Codec::H264,
+            knobs,
+            "/dev/dri/renderD128",
+            registered,
+        )
+        .unwrap();
+        let vk1 = effective_encoder_with(
+            EncoderChoice::Vulkan,
+            Codec::H264,
+            knobs,
+            "/dev/dri/renderD129",
+            registered,
+        )
+        .unwrap();
+        assert_eq!(
+            vk0.factory, vk1.factory,
+            "Vulkan candidates are device-agnostic in the registry"
         );
     }
 

@@ -104,6 +104,16 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **The host advertises only codecs some usable GPU has proven (#301).** The agent derives
+  a codec set per GPU — the encoder-candidate plan resolved on that GPU's own render node,
+  minus any driver-compatibility exclusion, minus every codec above H.264 without a passing
+  codec probe on that GPU — and `capacity.codecs` becomes the union over GPUs with
+  `encode_slots_total > 0`; a GPU zeroed by a render-node pin drops out of it. H.264 is
+  always advertised when a GPU's plan builds it; HEVC/AV1 need an explicit codec-probe pass,
+  so a freshly started host is H.264-only for the tens of seconds its codec probes take to
+  run (measured ~19 s on a two-GPU host). `capacity.gpus[].codecs` is not on the wire yet
+  (#302); codec-probe scheduling now targets each GPU's own plan too, so an excluded GPU is
+  never probed for a codec it cannot produce.
 - The `protocol/` pin moves to quasar-protocol `f20683e`, amendment 12 (#299, for #296): per-GPU codec sets on `capacity.gpus[].codecs` (host `codecs` becomes their union over usable GPUs), `gpus.codecs` (migration 0086, NULL inherits the host set), `GPUAvailability.codecs`, codec probe checks that never block, and codec-aware placement: an explicit codec is a candidacy gate refused `503 capacity_exhausted` / `503 no_host_available` instead of `409`, and an Auto launch's codec preference orders candidate GPUs. Contract text only; the implementation follows in #300–#306.
 - Specification for per-GPU codec sets and codec-aware placement (#296), the design the #298–#307 slices are built against, in `docs/superpowers/specs/2026-09-22-296-per-gpu-codecs-spec.md`.
 - Validation record for the follow-ups run: #281/#282 landing, #285 and #287 fixes, and the hardware evidence behind the #284, #286 and #288 branches awaiting the owner, in `docs/reports/2026-09-21-followups-validation/`.

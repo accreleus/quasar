@@ -338,8 +338,18 @@ input) where that path really runs, producing host facts. Distinct from a
 **Codec probe** — the media host probe run on one GPU for one codec above the H.264
 floor (HEVC, AV1), after that GPU's own media probe has passed on the current agent
 image, driver and media settings. Its pass is the evidence that admits the codec to the
-GPU's codec set (from #301). A failure never blocks the GPU. Its check is
+GPU's codec set. A failure never blocks the GPU. Its check is
 `media_probe_gpu<N>_<codec>`. It is a host probe, not a device probe.
+
+**GPU codec set** — the codecs one GPU has been shown to encode: H.264 whenever its
+registry plan builds it (the encoder-candidate resolution run on that GPU's own render
+node), never a codec its driver-compatibility exclusion rules out, and every other
+codec only after a passing codec probe on that GPU. The **host codec set**
+(`capacity.codecs`, `hosts.codecs`) is the union of every *usable* GPU's set (one with
+`encode_slots_total > 0` — a render-node pin zeroes every other GPU, dropping it from
+the union). Not yet its own wire field: `capacity.gpus[].codecs` is future work, so
+today only the host union is reported. _Avoid_: "host codec set" for a single GPU's
+set, or vice versa.
 
 **Evidence** — a host fact that came from exercising the real path, or a
 definitive local observation such as an unreachable container runtime. Only

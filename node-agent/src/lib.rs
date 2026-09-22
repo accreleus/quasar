@@ -23,6 +23,9 @@ pub mod ddc;
 pub mod diagnostic;
 mod encoder_compatibility;
 pub mod enrollment;
+/// The per-GPU codec advertisement rule (#301): registry plan × driver-compatibility
+/// exclusion × codec-probe verdict → each GPU's codec set, and the host union.
+mod gpu_codecs;
 /// `host.xid` / `host.gpu_fault`: the kernel's own GPU fault records, off `/dev/kmsg`.
 pub mod gpu_identity;
 pub mod gpu_kmsg;

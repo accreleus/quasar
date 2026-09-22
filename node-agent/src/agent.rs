@@ -6,7 +6,7 @@
 //! This loop is outside the per-session tracing span (see `.claude/rules/agent-logging.md`),
 //! so lines here carry an explicit `session_id` field.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -39,7 +39,7 @@ use crate::session::runner::{
 };
 use crate::session::signaling::SignalMsg;
 use crate::session::vulkan_fault::{self, GpuGlobalFaultDetector};
-use crate::session::{EncoderChoice, SessionConfig, StreamParams};
+use crate::session::{Codec, EncoderChoice, SessionConfig, StreamParams};
 use crate::vram::{VramCache, VramTarget};
 
 const CRITICAL_EVENT_CAPACITY: usize = 256;
@@ -974,7 +974,8 @@ fn probe_host_codecs(
     // One of the `EncoderKnobs` ambient edges (see its doc): the knobs are read fresh
     // here and threaded as data from this point on.
     let knobs = crate::session::pipeline::EncoderKnobs::from_env();
-    let support = crate::session::pipeline::probe_codec_support(settings.encoder, knobs);
+    let support =
+        crate::session::pipeline::probe_codec_support(settings.encoder, knobs, "software");
     let codecs = support.codec_strings();
     let throughput: BTreeMap<String, CodecThroughput> = support
         .pixel_rates_mpix_s()
@@ -1030,6 +1031,93 @@ fn probe_host_codecs(
             .collect::<Vec<_>>()
     );
     Some(HostCodecReport { codecs, throughput })
+}
+
+/// The render node whose registry plan (#301 layer 1) speaks for this GPU: the
+/// in-container `renderD*` form when reported — what makes a VA candidate
+/// device-prefixed (`pipeline::encoders::va_device_element_prefix`) — else the by-path
+/// identity, else `"software"` (no reported node, so the plan degrades to the
+/// vendor-generic candidates).
+fn gpu_render_node_for_plan(gpu: &crate::messages::GpuCapacity) -> &str {
+    gpu.device_path
+        .as_deref()
+        .or(gpu.render_node.as_deref())
+        .unwrap_or("software")
+}
+
+/// [`probe_host_codecs`] plus, only once that call has confirmed `gst::init` succeeded,
+/// each GPU's registry plan (#301 layer 1) evaluated on its own render node. A second
+/// `gst::init` is not safe to attempt independently here: `ensure_gst_init` only runs
+/// its closure once, so a prior failure would otherwise be masked as success and a
+/// registry query into an uninitialized GStreamer would panic — gating on the host
+/// probe's own `Some`/`None` is what keeps this safe.
+fn probe_host_and_gpu_codecs(
+    settings: &crate::session::settings::RuntimeSettings,
+    gpus: &[crate::messages::GpuCapacity],
+) -> (Option<HostCodecReport>, BTreeMap<i32, BTreeSet<Codec>>) {
+    let host = probe_host_codecs(settings);
+    if host.is_none() {
+        return (host, BTreeMap::new());
+    }
+    let knobs = crate::session::pipeline::EncoderKnobs::from_env();
+    let per_gpu = gpus
+        .iter()
+        .map(|gpu| {
+            let render_node = gpu_render_node_for_plan(gpu);
+            let plan: BTreeSet<Codec> =
+                crate::session::pipeline::probe_codec_support(settings.encoder, knobs, render_node)
+                    .codecs
+                    .into_iter()
+                    .collect();
+            (gpu.index, plan)
+        })
+        .collect();
+    (host, per_gpu)
+}
+
+/// The advertisement rule (#301): each GPU's cached registry plan (layer 1) minus the
+/// driver-compatibility exclusion (layer 2, read live — it is a cheap sysfs read, not
+/// gst-registry-dependent) minus every codec without a passing codec probe (layer 3,
+/// `host_probe::outcome::codec_probe_verdict`), unioned over GPUs with
+/// `encode_slots_total > 0` for `capacity.codecs` (agent-api.md amendment 12). Falls
+/// back to the flat host-level probe (`advertised_codecs`) when there is no per-GPU
+/// plan to reason from — a software-only host with no GPU, or the host-level probe
+/// never ran (`gst::init` failed) — the same "absent" wire behaviour a legacy agent had.
+fn advertised_host_codecs(
+    gpus: &[crate::messages::GpuCapacity],
+    gpu_codec_plan: &BTreeMap<i32, BTreeSet<Codec>>,
+    report: &crate::readiness::report::ReadinessReport,
+    host_codec_report: &Option<HostCodecReport>,
+) -> Option<Vec<String>> {
+    if gpu_codec_plan.is_empty() || gpus.is_empty() {
+        return advertised_codecs(host_codec_report);
+    }
+    let sets: Vec<BTreeSet<Codec>> = gpus
+        .iter()
+        .map(|gpu| {
+            let plan = gpu_codec_plan.get(&gpu.index).cloned().unwrap_or_default();
+            let render_node = gpu_render_node_for_plan(gpu);
+            let excluded = crate::encoder_compatibility::excluded_codecs(
+                std::path::Path::new("/"),
+                render_node,
+            );
+            crate::gpu_codecs::gpu_codec_set(
+                &plan,
+                &excluded,
+                |codec| {
+                    let probe_codec = crate::host_probe::ProbeCodec::above_floor(codec)?;
+                    crate::host_probe::outcome::codec_probe_verdict(report, gpu.index, probe_codec)
+                },
+                gpu.encode_slots_total > 0,
+            )
+        })
+        .collect();
+    Some(
+        crate::gpu_codecs::host_codec_union(sets.iter())
+            .into_iter()
+            .map(|c| c.as_str().to_string())
+            .collect(),
+    )
 }
 
 /// Poll a `select!` arm's receiver without ever resolving `Ready(None)` twice (#530).
@@ -1498,9 +1586,10 @@ async fn connect_and_run(
     seed_nvidia_lib32(&mut first_settings, nvidia_lib32_probed);
     // Probed once (the gst registry is process-stable) and reused in every capacity
     // re-send below.
-    let host_codec_report = {
+    let (host_codec_report, gpu_codec_plan) = {
         let settings = first_settings.clone();
-        offload_probe(move || probe_host_codecs(&settings)).await
+        let gpus = gpu_inventory.clone();
+        offload_probe(move || probe_host_and_gpu_codecs(&settings, &gpus)).await
     };
     // The host readiness check set: advisory only, reported and logged, never gating.
     // Every input is already paid for (the vendor read, the #375 lib32 probe, the
@@ -1537,7 +1626,12 @@ async fn connect_and_run(
         gpu_detection_reason: cap.gpu_detection_reason,
         console_capabilities: Some(cap.console),
         effective_settings: Some(first_settings.effective_map()),
-        codecs: advertised_codecs(&host_codec_report),
+        codecs: advertised_host_codecs(
+            &gpu_inventory,
+            &gpu_codec_plan,
+            &sessions.mgr.readiness,
+            &host_codec_report,
+        ),
         codec_throughput: advertised_codec_throughput(&host_codec_report),
         readiness: Some(sessions.mgr.readiness.merged()),
     };
@@ -1586,6 +1680,7 @@ async fn connect_and_run(
     // Cached with the encoder it was probed for, so capacity re-sends reuse it unless
     // a config_update flips the effective encoder and marks it stale.
     mgr.host_codec_report = host_codec_report.clone();
+    mgr.gpu_codec_plan = gpu_codec_plan;
     mgr.probed_encoder = Some(first_settings.encoder);
 
     // #488: the golden-home warm-up. Scheduled by the control plane and claimed over
@@ -1833,8 +1928,12 @@ async fn connect_and_run(
                             // host whose live encoder cannot produce it, which fails it.
                             if mgr.host_codecs_stale() {
                                 let settings = mgr.runtime_settings.clone();
-                                mgr.host_codec_report =
-                                    offload_probe(move || probe_host_codecs(&settings)).await;
+                                let gpus = mgr.gpu_inventory.clone();
+                                let (host_codec_report, gpu_codec_plan) =
+                                    offload_probe(move || probe_host_and_gpu_codecs(&settings, &gpus))
+                                        .await;
+                                mgr.host_codec_report = host_codec_report;
+                                mgr.gpu_codec_plan = gpu_codec_plan;
                                 mgr.probed_encoder = Some(mgr.runtime_settings.encoder);
                                 info!(
                                     "effective encoder changed by config_update; re-probed codecs: {:?}",
@@ -1863,7 +1962,12 @@ async fn connect_and_run(
                                 gpu_detection_reason: cap.gpu_detection_reason,
                                 console_capabilities: Some(cap.console),
                                 effective_settings: Some(mgr.runtime_settings.effective_map()),
-                                codecs: advertised_codecs(&mgr.host_codec_report),
+                                codecs: advertised_host_codecs(
+                                    &mgr.gpu_inventory,
+                                    &mgr.gpu_codec_plan,
+                                    &mgr.readiness,
+                                    &mgr.host_codec_report,
+                                ),
                                 codec_throughput: advertised_codec_throughput(&mgr.host_codec_report),
                                 readiness: Some(mgr.readiness.merged()),
                             };
@@ -1919,7 +2023,12 @@ async fn connect_and_run(
                         gpu_detection_reason: cap.gpu_detection_reason,
                         console_capabilities: Some(cap.console),
                         effective_settings: Some(mgr.runtime_settings.effective_map()),
-                        codecs: advertised_codecs(&mgr.host_codec_report),
+                        codecs: advertised_host_codecs(
+                            &mgr.gpu_inventory,
+                            &mgr.gpu_codec_plan,
+                            &mgr.readiness,
+                            &mgr.host_codec_report,
+                        ),
                         codec_throughput: advertised_codec_throughput(&mgr.host_codec_report),
                         readiness: Some(mgr.readiness.merged()),
                     };
@@ -2388,6 +2497,12 @@ struct SessionManager {
     /// overlay is live-class. `None` ⇒ probe skipped/failed, so the control plane
     /// defaults the host to `["h264"]`.
     host_codec_report: Option<HostCodecReport>,
+    /// #301 layer 1: each GPU's registry plan (what `probe_codec_support` builds on
+    /// that GPU's own render node), keyed by `gpus[].index`. Shares
+    /// `host_codec_report`'s ambient edges (registration, an encoder-flipping
+    /// `config_update`) and its `None`-on-`gst::init`-failure discipline: empty here
+    /// means the per-GPU plan is unknown, not that no GPU can encode anything.
+    gpu_codec_plan: BTreeMap<i32, BTreeSet<Codec>>,
     /// Every capacity message carries `merged()`. Outlives a connection, so retained
     /// checks survive a control-plane restart; registration and the 15 s refresh only
     /// replace the locally computed set.
@@ -2519,6 +2634,7 @@ impl SessionManager {
             health,
             nvidia_lib32_probed,
             host_codec_report: None,
+            gpu_codec_plan: BTreeMap::new(),
             readiness: Default::default(),
             probed_encoder: None,
             draining: false,
@@ -3641,21 +3757,25 @@ fn probe_inputs(
         })
         .collect();
 
-    // Every GPU is planned the host's codec set until the per-render-node plan (#301).
-    let host_codecs: std::collections::BTreeSet<crate::host_probe::ProbeCodec> = mgr
-        .host_codec_report
+    // Codec-probe targets come from each GPU's own registry plan (layer 1) minus its
+    // driver-compatibility exclusion (layer 2, #301) — never the host set, and never
+    // gated on a verdict (the verdict is what a codec probe produces, not an input to
+    // scheduling one). A GPU absent from `gpu_codec_plan` (no per-GPU plan yet — the
+    // host-level probe never ran) gets no targets.
+    let codecs: BTreeMap<i32, std::collections::BTreeSet<crate::host_probe::ProbeCodec>> = mgr
+        .gpu_inventory
         .iter()
-        .flat_map(|r| r.codecs.iter())
-        .filter_map(|c| crate::host_probe::ProbeCodec::from_wire(c))
+        .filter_map(|g| {
+            let plan = mgr.gpu_codec_plan.get(&g.index)?;
+            let render_node = gpu_render_node_for_plan(g);
+            let excluded = crate::encoder_compatibility::excluded_codecs(
+                std::path::Path::new("/"),
+                render_node,
+            );
+            let targets = crate::gpu_codecs::probeable_codecs(plan, &excluded);
+            (!targets.is_empty()).then_some((g.index, targets))
+        })
         .collect();
-    let codecs = if host_codecs.is_empty() {
-        BTreeMap::new()
-    } else {
-        mgr.gpu_inventory
-            .iter()
-            .map(|g| (g.index, host_codecs.clone()))
-            .collect()
-    };
 
     crate::host_probe::decision::ProbeInputs {
         agent_image: agent_image.to_string(),
@@ -4373,7 +4493,12 @@ where
         gpu_detection_reason: cap.gpu_detection_reason,
         console_capabilities: Some(cap.console),
         effective_settings: Some(mgr.runtime_settings.effective_map()),
-        codecs: advertised_codecs(&mgr.host_codec_report),
+        codecs: advertised_host_codecs(
+            &mgr.gpu_inventory,
+            &mgr.gpu_codec_plan,
+            &mgr.readiness,
+            &mgr.host_codec_report,
+        ),
         codec_throughput: advertised_codec_throughput(&mgr.host_codec_report),
         readiness: Some(mgr.readiness.merged()),
     };
@@ -5973,6 +6098,39 @@ mod tests {
         assert_eq!(advertised_codec_throughput(&None), None);
     }
 
+    /// #301 wiring: `advertised_host_codecs` unions each GPU's admitted set — H.264
+    /// only, since neither GPU has a codec-probe verdict yet — and a GPU zeroed by a
+    /// render-node pin (`encode_slots_total == 0`) drops out regardless of its plan.
+    #[test]
+    fn advertised_host_codecs_unions_over_usable_gpus_and_drops_a_pinned_out_gpu() {
+        let gpu0 = gpu(0, "nvidia", Some("/dev/dri/renderD128"));
+        let mut gpu1 = gpu(1, "amd", Some("/dev/dri/renderD129"));
+        gpu1.encode_slots_total = 0;
+
+        let plan = BTreeMap::from([
+            (0, BTreeSet::from([Codec::H264, Codec::H265])),
+            (1, BTreeSet::from([Codec::H264, Codec::H265, Codec::Av1])),
+        ]);
+        let report = crate::readiness::report::ReadinessReport::default();
+        let advertised = advertised_host_codecs(&[gpu0, gpu1], &plan, &report, &None);
+        assert_eq!(advertised, Some(vec!["h264".to_string()]));
+    }
+
+    /// A software-only host reports no GPUs at all — the per-GPU model does not apply,
+    /// so `advertised_host_codecs` falls back to the flat host-level probe.
+    #[test]
+    fn advertised_host_codecs_falls_back_to_the_flat_probe_with_no_gpu() {
+        let host_codec_report = Some(HostCodecReport {
+            codecs: vec!["h264".into()],
+            throughput: BTreeMap::new(),
+        });
+        let report = crate::readiness::report::ReadinessReport::default();
+        assert_eq!(
+            advertised_host_codecs(&[], &BTreeMap::new(), &report, &host_codec_report),
+            Some(vec!["h264".to_string()])
+        );
+    }
+
     #[test]
     fn config_update_encoder_flip_marks_host_codecs_stale() {
         // The advertised hosts.codecs set must track the EFFECTIVE encoder, not the env
@@ -7323,27 +7481,37 @@ mod tests {
         let inputs = probe_inputs("sha256:agent", &mgr);
         assert_eq!(inputs.agent_image, "sha256:agent");
         assert_eq!(inputs.gpus.len(), 2);
-        assert!(inputs.codecs.is_empty(), "no codec report, no codec probes");
+        assert!(
+            inputs.codecs.is_empty(),
+            "no per-GPU codec plan yet, no codec probes"
+        );
 
-        // The host's codec set above the floor is every GPU's codec-probe plan for now.
-        mgr.host_codec_report = Some(HostCodecReport {
-            codecs: vec!["h264".into(), "h265".into(), "av1".into()],
-            throughput: BTreeMap::new(),
-        });
+        // #301: codec-probe targets come from each GPU's OWN registry plan, not a
+        // host-wide set — GPU 0 and GPU 1 are given different plans here to prove it.
+        mgr.gpu_codec_plan = BTreeMap::from([
+            (0, BTreeSet::from([Codec::H264, Codec::H265, Codec::Av1])),
+            (1, BTreeSet::from([Codec::H264, Codec::H265])),
+        ]);
         let with_codecs = probe_inputs("sha256:agent", &mgr);
-        let above_floor: std::collections::BTreeSet<_> = [
-            crate::host_probe::ProbeCodec::H265,
-            crate::host_probe::ProbeCodec::Av1,
-        ]
-        .into();
-        assert_eq!(with_codecs.codecs.get(&0), Some(&above_floor));
-        assert_eq!(with_codecs.codecs.get(&1), Some(&above_floor));
-        mgr.host_codec_report = Some(HostCodecReport {
-            codecs: vec!["h264".into()],
-            throughput: BTreeMap::new(),
-        });
+        assert_eq!(
+            with_codecs.codecs.get(&0),
+            Some(&std::collections::BTreeSet::from([
+                crate::host_probe::ProbeCodec::H265,
+                crate::host_probe::ProbeCodec::Av1,
+            ]))
+        );
+        assert_eq!(
+            with_codecs.codecs.get(&1),
+            Some(&std::collections::BTreeSet::from([
+                crate::host_probe::ProbeCodec::H265
+            ]))
+        );
+
+        // A GPU whose plan is h264-only has no above-floor target; a GPU absent from
+        // the plan (no per-GPU probe yet) gets none either.
+        mgr.gpu_codec_plan = BTreeMap::from([(0, BTreeSet::from([Codec::H264]))]);
         assert!(probe_inputs("sha256:agent", &mgr).codecs.is_empty());
-        mgr.host_codec_report = None;
+        mgr.gpu_codec_plan = BTreeMap::new();
         assert_eq!(
             inputs.gpus.get(&0).map(String::as_str),
             Some("/dev/dri/renderD128")
