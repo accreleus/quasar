@@ -601,20 +601,39 @@ so merging changes nothing until an admin flips a profile's codec status.
 them in exactly one place (`control-plane/internal/session/codec.go`
 `catalogToWire`):
 - **Wire / session / host** vocabulary: `h264` \| `h265` \| `av1` — the
-  `sessions.codec` column, the `stream.codec` field, the host's reported codec
-  set, and the `stream.codec` launch override.
+  `sessions.codec` column, the `stream.codec` field, the host's and each GPU's
+  reported codec set, and the `stream.codec` launch override.
 - **Catalog** vocabulary (the profile catalog and its admin write path): `h264` \|
   `hevc` \| `av1`. Catalog `hevc` maps to wire `h265`.
 
+**What a GPU can encode (agent).** Each GPU reports its own **GPU codec set**
+(`capacity.gpus[].codecs`, stored in `gpus.codecs`): H.264 whenever the host's
+encoder path builds it on that GPU's render node, and HEVC or AV1 only after a
+**codec probe** (the media host probe run on that GPU for that codec, 10 frames within
+10 s) has passed on the current agent image, driver and settings. A codec the GPU
+cannot open at all is reported on the readiness card as `media_probe_gpu<N>_<codec>`
+with status `unsupported` — a hardware fact, never a fault, and it blocks nothing.
+Unknown is not advertised: after an agent start a GPU offers H.264 only until its
+codec probes have run (measured 9–25 s, including NVIDIA first-boot provisioning).
+The host-level `codecs` is the union over usable GPUs. A GPU that reports no set (an
+older agent) inherits the host's.
+
 **Resolution (control plane, at launch).** Candidates = the profile's codecs whose
-status is `launchable`, in catalog (preference) order. They are clamped by (1) the
-placed host's reported encoder codec set, (2) the launching device's decode probe
+status is `launchable`, in catalog (preference) order. The GPU is chosen first:
+a codec picked by hand (`stream.codec`) is a **codec constraint**, so only a GPU
+whose set contains it is a candidate; a launch left on Auto carries a **codec
+preference** (the codecs the device can decode, in chain order) that ranks GPUs
+after home locality and before load spread, so a free GPU that can give the client
+AV1 is preferred. Then the rung is clamped by (1) the **placed GPU's** codec set,
+(2) the launching device's decode probe
 (`hevc`/`av1` are hard-gated on `capabilities.codecs.<codec> == true` — a
 stale/absent probe means **no** HEVC/AV1: an undecodable codec is a black stream,
 not a quality drop). The first surviving candidate wins; the fallback is always
-`h264`, so a session can never fail to resolve a codec. Preference when enabled:
-`av1 > hevc > h264` on AV1-capable hosts, `hevc > h264` otherwise. The decision
-(candidates, clamps, result) is logged (`"codec resolved"`).
+`h264`, so a session can never fail to resolve a codec, and its codec is always in
+its GPU's set. Preference when enabled: `av1 > hevc > h264` on AV1-capable GPUs,
+`hevc > h264` otherwise. The decision is logged (`"rung resolved"`, with
+`gpu_codecs` beside `host_codecs`; `"session assigned"` carries the
+`codec_preference`).
 
 **Enabling a codec (operator).** Flip a profile's codec status future→launchable
 through the existing admin write path
@@ -623,13 +642,18 @@ catalog vocabulary). Stored in `stream_profiles.codecs` (JSONB; NULL ⇒ the in-
 default). **H.264 is the unconditional resolution floor and cannot be disabled**:
 a non-empty `codecs` list must keep `h264` `launchable` (and may not repeat a
 codec), else the write is rejected `400` — a session always falls back to H.264,
-so the catalog must never present it as disabled. Start with `1080p60` on hosts that report the codec. Hosts advertise
-what their active encoder path can produce (element + payloader both present) in
-the additive `codecs` field of the capacity report → `hosts.codecs` (NULL ⇒ the
-control plane assumes `h264` only, so old agents keep working).
+so the catalog must never present it as disabled. Start with `1080p60` on hosts that
+report the codec. The launch panel offers a codec only when some GPU that could take
+the user's launch (readiness gate applied) has it in its set. The fleet view shows
+each GPU's codecs beside its slots. `hosts.codecs` NULL ⇒ the control plane assumes
+`h264` only, so old agents keep working.
 
-**Overrides / escape hatches.** `stream.codec` on the launch request (admin/
-diagnostic, wire vocabulary, validated) forces the codec authoritatively;
+**Overrides / escape hatches.** `stream.codec` on the launch request (the launch
+panel's Adjust, or an admin/diagnostic caller; wire vocabulary, validated) forces the
+codec authoritatively and is never downgraded: no rung with that codec ⇒ `400
+validation_failed`; a GPU that can encode it exists but none is free ⇒ `503
+capacity_exhausted` (retryable; the web client waits); no online GPU can encode it ⇒
+`503 no_host_available`. Both messages name the codec;
 `QUASAR_CODEC` forces it agent-side (harness/diag); `QUASAR_VULKAN_HEVC=0`
 disables H.265 on a Vulkan host's own encoder (it then falls back to the vendor
 HW encoder, or drops out of the host's codec set if there is none). HEVC end-to-end decode requires a hardware
