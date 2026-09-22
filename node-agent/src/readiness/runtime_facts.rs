@@ -14,12 +14,6 @@ pub const CDI_ID: &str = "runtime_cdi";
 /// The lowest engine API this agent speaks (docker.rs discovery floor).
 pub const API_FLOOR: &str = "1.40";
 
-/// The `Unreachable` detail for [`ErrorKind::Timeout`]. A missing socket uses a
-/// different sentence, so `host_container_mounts` can tell "the client ran out of
-/// time" from "the socket is not there" without a second engine call.
-pub const INSPECTION_TIMEOUT_DETAIL: &str =
-    "the engine did not answer within the inspection budget";
-
 /// Why the engine could not be inspected, folded from the runtime layer's error kinds so
 /// the verdict reads the failure class, not the transport detail.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +39,9 @@ impl From<RuntimeError> for RuntimeFault {
             ErrorKind::Unavailable => RuntimeFault::Unreachable(
                 "no engine answered at the socket (missing, refused or reset)".into(),
             ),
-            ErrorKind::Timeout => RuntimeFault::Unreachable(INSPECTION_TIMEOUT_DETAIL.into()),
+            ErrorKind::Timeout => RuntimeFault::Unreachable(
+                "the engine did not answer within the inspection budget".into(),
+            ),
             ErrorKind::PermissionDenied => {
                 RuntimeFault::PermissionDenied("the socket refused this agent's identity".into())
             }
@@ -103,19 +99,6 @@ impl RuntimeView {
             endpoint: client.endpoint(),
             outcome: client.inspect_engine().wait().map_err(RuntimeFault::from),
         }
-    }
-
-    /// A timeout is still [`RuntimeFault::Unreachable`], so `runtime_endpoint` fails
-    /// and the other collectors are skipped. The detail sentence is what separates
-    /// it from a missing socket for `host_container_mounts`.
-    pub fn is_inspection_timeout(&self) -> bool {
-        matches!(
-            self,
-            RuntimeView::Observed {
-                outcome: Err(RuntimeFault::Unreachable(reason)),
-                ..
-            } if reason == INSPECTION_TIMEOUT_DETAIL
-        )
     }
 
     /// Did the engine answer this refresh? `false` only for a **definitive** fault: nothing

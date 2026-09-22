@@ -223,13 +223,6 @@ own; the two do not move together, and that is deliberate.
   configuration. There are no probe callers yet (#259).
 
 ### Fixed
-- **A busy container runtime no longer fails `host_container_mounts` (#315).** Under load the
-  runtime client can be busy or time out for one refresh. That used to report the mount
-  check as a failure ("Docker could not inspect the agent's mounts"), which marked the host
-  degraded until the next refresh. A busy or timed-out inspection now keeps the last
-  definitive pass or fail, or reports `unknown` when there is none, and a launch is not
-  refused on it. Permission denied, a missing socket, and a real mount mismatch still fail
-  with the same remediation. The check still blocks nothing.
 - **An idle reap releases the pulse sidecar and the fake-udev export (#314).** A busy
   runtime client never asked the engine, but the session treated that as an unconfirmed
   stop: the sidecar latched itself in `Running` (recovery will not remove a live sidecar),

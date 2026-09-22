@@ -171,9 +171,7 @@ pub struct ProbeEnv {
     pub nvidia_volume: VolumeView,
     /// Can the runtime pass the provisioned driver into sibling app containers?
     pub driver_mount_error: Option<String>,
-    /// This refresh's sibling-mount inspection. Indeterminate is a busy or timed-out
-    /// client, not evidence the mounts are wrong.
-    pub container_mounts: MountObservation,
+    pub container_mount_error: Option<String>,
     /// Does the EGL stack this container loads actually WORK, as opposed to being present on
     /// disk? A file-presence pass that is green while the compositor cannot init EGL sends the
     /// operator elsewhere, so this runtime verdict VETOES it (loop-3 guard).
@@ -273,7 +271,11 @@ impl ProbeEnv {
             // A native (non-containerized) agent has no sibling mounts to validate and
             // must keep passing this check whatever the engine is doing — the skip stands
             // in for the inspection, never for `is_containerized`.
-            container_mounts: live_mount_observation(&runtime),
+            container_mount_error: match (engine_answered, is_containerized()) {
+                (true, _) => sibling_mount_error(),
+                (false, true) => Some(ENGINE_MOUNT_INSPECTION_FAILED.into()),
+                (false, false) => None,
+            },
             driver_mount_error: crate::nvidia_volume::mount_resolution_error().or_else(|| crate::nvidia_volume::current().and_then(|info| {
                 if info.host.is_none() && info.name.is_none() {
                     Some(format!("The agent can read its NVIDIA driver volume but cannot resolve its Docker mount. App launches are blocked; check Docker socket and identity inspection, or set {} to the host directory already mounted at /opt/quasar/nvidia-driver.", crate::nvidia_volume::HOST_PATH_ENV))
@@ -373,84 +375,29 @@ fn is_containerized() -> bool {
     Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists()
 }
 
-/// What `host_container_mounts` says when the engine refused the inspection for a
-/// reason that is evidence: permission denied, a missing socket, a bad endpoint.
-/// A busy client or a timeout is not this string.
+/// What `host_container_mounts` says when the engine could not be asked. One string, so a
+/// refresh that skipped the inspection (#274) reads identically to one that tried and
+/// failed.
 pub(crate) const ENGINE_MOUNT_INSPECTION_FAILED: &str =
     "Docker could not inspect the agent's mounts; check socket access";
 
-const MOUNT_CHECK_REMEDIATION: &str = "Use the generated bind mounts at identical host/container paths. Fix the Docker socket or mount configuration, then recreate the agent; checks refresh automatically.";
-
-const MOUNT_INDETERMINATE_SUMMARY: &str =
-    "The runtime client was busy or timed out this refresh; the last mount result stands";
-
-/// One sibling-mount inspection. [`MountObservation::Indeterminate`] is not evidence
-/// the mounts are wrong, so a launch does not refuse on it (ADR 0005).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MountObservation {
-    /// Mounts agree, or this agent is not a container.
-    Agree,
-    /// A mismatch, or an engine refusal that is evidence.
-    Fail(String),
-    /// Busy, cancelled, or timed out. Not evidence.
-    Indeterminate,
-}
-
-pub(crate) fn classify_mount_runtime(kind: crate::runtime::ErrorKind) -> MountObservation {
-    match kind {
-        crate::runtime::ErrorKind::Busy
-        | crate::runtime::ErrorKind::Cancelled
-        | crate::runtime::ErrorKind::Timeout => MountObservation::Indeterminate,
-        _ => MountObservation::Fail(ENGINE_MOUNT_INSPECTION_FAILED.into()),
-    }
-}
-
-fn live_mount_observation(runtime: &runtime_facts::RuntimeView) -> MountObservation {
-    if !is_containerized() {
-        return MountObservation::Agree;
-    }
-    // The endpoint inspection already spent the budget. A timeout must not start
-    // another one, and it is not evidence the mounts are wrong.
-    if !runtime.engine_answered() {
-        return if runtime.is_inspection_timeout() {
-            MountObservation::Indeterminate
-        } else {
-            MountObservation::Fail(ENGINE_MOUNT_INSPECTION_FAILED.into())
-        };
-    }
-    sibling_mount_observation()
-}
-
 /// Docker resolves app bind sources in the host namespace, not the agent's.
-/// `Some` only when this inspection is evidence of a problem. A busy or timed-out
-/// client returns `None`, so a launch is not refused on it.
+/// Validate that the directories the agent writes are the directories apps mount.
 pub(crate) fn sibling_mount_error() -> Option<String> {
-    match sibling_mount_observation() {
-        MountObservation::Fail(error) => Some(error),
-        MountObservation::Agree | MountObservation::Indeterminate => None,
-    }
-}
-
-fn sibling_mount_observation() -> MountObservation {
     if !is_containerized() {
-        return MountObservation::Agree;
+        return None;
     }
     let Some(id) = crate::nvidia_volume::self_container_id() else {
-        return MountObservation::Fail(
-            "Cannot identify the agent container to validate app mounts".into(),
-        );
+        return Some("Cannot identify the agent container to validate app mounts".into());
     };
-    let runtime = match crate::runtime::configured() {
-        Ok(runtime) => runtime,
-        Err(error) => return classify_mount_runtime(error.kind),
+    let Ok(runtime) = crate::runtime::configured() else {
+        return Some(ENGINE_MOUNT_INSPECTION_FAILED.into());
     };
-    let container = match runtime
+    let Ok(Some(container)) = runtime
         .inspect_container_within(id, crate::runtime::ENGINE_INSPECTION_BUDGET)
         .wait()
-    {
-        Ok(Some(container)) => container,
-        Ok(None) => return MountObservation::Fail(ENGINE_MOUNT_INSPECTION_FAILED.into()),
-        Err(error) => return classify_mount_runtime(error.kind),
+    else {
+        return Some(ENGINE_MOUNT_INSPECTION_FAILED.into());
     };
     let mut paths =
         vec![std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/quasar-agent".into())];
@@ -463,10 +410,7 @@ fn sibling_mount_observation() -> MountObservation {
                 .into_owned(),
         );
     }
-    match validate_sibling_mounts(&container.mounts, &paths) {
-        None => MountObservation::Agree,
-        Some(error) => MountObservation::Fail(error),
-    }
+    validate_sibling_mounts(&container.mounts, &paths)
 }
 
 /// `QUASAR_TEMPLATE_ROOT`, or the sibling-of-homes default (`{home}/../templates`).
@@ -535,7 +479,10 @@ pub fn probe(env: &ProbeEnv) -> Vec<ReadinessCheck> {
         check_xid_visibility(env),
         // Applies to every host, GPU or not — not part of the sanity family.
         check_media_reachability(env, distro),
-        host_container_mounts_check(&env.container_mounts),
+        match &env.container_mount_error {
+            Some(error) => fail("host_container_mounts", error.clone(), "Use the generated bind mounts at identical host/container paths. Fix the Docker socket or mount configuration, then recreate the agent; checks refresh automatically.".to_string()),
+            None => pass("host_container_mounts", "Required sibling-container paths agree with their host bind mounts".to_string()),
+        },
         storage::check_homes_root_writable(&env.storage, storage::WriteIdentity::from_env_pair(env.app_uid, env.app_gid)),
         storage::check_homes_free_space(&env.storage),
         storage::check_template_free_space(&env.storage),
@@ -905,42 +852,6 @@ fn fail(id: &str, summary: String, remediation: String) -> ReadinessCheck {
         status: FAIL.to_string(),
         summary,
         remediation,
-        observed_at: None,
-        source: Some("local".to_string()),
-        blocks: None,
-    }
-}
-
-/// Advisory but actionable: carries a remediation, because the exact command is the whole
-/// point of a check whose finding is "look at this, but it might be fine".
-fn host_container_mounts_check(observation: &MountObservation) -> ReadinessCheck {
-    let check = match observation {
-        MountObservation::Agree => pass(
-            "host_container_mounts",
-            "Required sibling-container paths agree with their host bind mounts".to_string(),
-        ),
-        MountObservation::Fail(error) => fail(
-            "host_container_mounts",
-            error.clone(),
-            MOUNT_CHECK_REMEDIATION.to_string(),
-        ),
-        MountObservation::Indeterminate => {
-            unknown("host_container_mounts", MOUNT_INDETERMINATE_SUMMARY)
-        }
-    };
-    debug_assert!(
-        check.blocks.is_none(),
-        "host_container_mounts is a local check"
-    );
-    check
-}
-
-fn unknown(id: &str, summary: &str) -> ReadinessCheck {
-    ReadinessCheck {
-        id: id.to_string(),
-        status: UNKNOWN.to_string(),
-        summary: summary.to_string(),
-        remediation: "The agent retries on the next refresh.".to_string(),
         observed_at: None,
         source: Some("local".to_string()),
         blocks: None,
@@ -2657,7 +2568,7 @@ mod tests {
                 nvidia_lib32_path: lib32.to_string(),
                 nvidia_volume: VolumeView::None,
                 driver_mount_error: None,
-                container_mounts: MountObservation::Agree,
+                container_mount_error: None,
                 // `Unknown` means "not probed" and must never influence a verdict on its own.
                 egl_runtime: crate::nvidia_volume::EglRuntime::Unknown,
                 firewall: FirewallPosture::Unknown,
@@ -5125,7 +5036,6 @@ table ip raw {
     }
 
     mod host_probes;
-    mod mounts;
     mod provenance;
     mod report;
     mod runtime_checks;
