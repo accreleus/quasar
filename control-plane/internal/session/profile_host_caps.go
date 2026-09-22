@@ -9,9 +9,11 @@ import (
 )
 
 // profileHostCaps previews the codecs available for this app without reserving
-// capacity. Busy hosts still count; offline/draining, unreported GPUs, incompatible
-// bindings and hosts without the managed image do not. Placement remains the
-// authoritative check at launch. Unknown legacy reports preserve advisory behavior.
+// capacity: the union of GPU codec sets (#296 amendment 12, control-api.md
+// "host_encoder_not_supported is computed over GPU codec sets") over the GPUs
+// that pass the launch's candidacy without the free-slot term — a busy GPU
+// still counts, but the readiness gate, the derived-tile host pin and the image
+// gate all apply, same as at launch. Placement remains the authoritative check.
 func (s *Store) profileHostCaps(ctx context.Context, userID, appID string) (profile.HostCaps, error) {
 	p := CreateParams{}
 	if appID != "" {
@@ -28,22 +30,22 @@ func (s *Store) profileHostCaps(ctx context.Context, userID, appID string) (prof
 		}
 	}
 	a := &argset{}
-	c := candidacy{p: p}
+	c := candidacy{p: p, readiness: s.readiness}
 	pin := c.pinGate(a)
 	image := c.imageGate(a, " AND ")
-	rows, err := s.pool.Query(ctx, `SELECT DISTINCT h.id, h.codecs
-		FROM hosts h JOIN gpus g ON g.host_id = h.id
+	gate := c.readinessGate(a, " AND ")
+	rows, err := s.pool.Query(ctx, `SELECT `+gpuCodecSetSQL("g", "h", true)+`
+		FROM gpus g JOIN hosts h ON h.id = g.host_id
 		WHERE h.status = 'online' AND h.capacity_detection = 'ok'
-		AND g.reported AND g.encode_slots_total > 0`+schedulableBindingSQL+pin+image, a.args()...)
+		AND g.reported AND g.encode_slots_total > 0`+schedulableBindingSQL+pin+image+gate, a.args()...)
 	if err != nil {
 		return profile.HostCaps{}, fmt.Errorf("query profile host codecs: %w", err)
 	}
 	defer rows.Close()
 	var reports [][]byte
 	for rows.Next() {
-		var id string
 		var raw []byte
-		if err := rows.Scan(&id, &raw); err != nil {
+		if err := rows.Scan(&raw); err != nil {
 			return profile.HostCaps{}, err
 		}
 		reports = append(reports, raw)
