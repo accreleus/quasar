@@ -25,6 +25,13 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Per-GPU codec sets, control-plane storage (#302).** Migration 0086 adds
+  `gpus.codecs` (NULL means inherit the host's set); the capacity ingest stores
+  the agent's `capacity.gpus[].codecs` wholesale with the GPU row. One SQL
+  renderer (`gpuCodecSetSQL`) and its Go twin (`gpuCodecSet`) are the only
+  places the GPU/host inheritance is computed; `GET /v1/hosts/{id}/gpus` gains
+  `codecs` per GPU, null only when neither the GPU nor its host has ever
+  reported.
 - **Codec probes (#300).** After a GPU's H.264 media probe passes, the agent runs the same
   probe on that GPU for each codec above the floor its encoder can build (HEVC, AV1): 10
   frames within 10 s, passing when the encoder reaches PLAYING and produces them. The result
