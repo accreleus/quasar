@@ -1,7 +1,9 @@
 //! From a probe's end to the readiness check the operator reads.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
+use super::decision::EvidenceStamp;
 use super::{ProbeCodec, ProbeKind, ProbeTarget};
 use crate::readiness::report::ReadinessReport;
 
@@ -145,6 +147,53 @@ pub fn codec_probe_verdict(report: &ReadinessReport, gpu: i32, codec: ProbeCodec
         crate::readiness::PASS => Some(true),
         crate::readiness::FAIL => Some(false),
         _ => None,
+    }
+}
+
+/// Which stack each held codec-probe pass was proven under (#301), kept beside the
+/// report and fed by the same updates. Agent-side only: the check on the wire is unchanged.
+#[derive(Debug, Default)]
+pub struct CodecEvidence(BTreeMap<ProbeTarget, EvidenceStamp>);
+
+impl CodecEvidence {
+    /// Mirrors [`record`]: a pass takes the run's stamp, a fail or skip drops it, and an
+    /// indeterminate run leaves the held verdict — and its stamp — standing.
+    pub fn note(
+        &mut self,
+        target: ProbeTarget,
+        outcome: &ProbeOutcome,
+        stamp: Option<EvidenceStamp>,
+    ) {
+        if target.codec.is_none() {
+            return;
+        }
+        match (outcome, stamp) {
+            (ProbeOutcome::Indeterminate { .. }, _) => {}
+            (ProbeOutcome::Pass { .. }, Some(stamp)) => {
+                self.0.insert(target, stamp);
+            }
+            _ => {
+                self.0.remove(&target);
+            }
+        }
+    }
+
+    pub fn forget(&mut self, target: ProbeTarget) {
+        self.0.remove(&target);
+    }
+
+    /// The held codec-probe verdict for (`gpu`, `codec`) is a pass proven under
+    /// `current`, the stamp the current stack gives that GPU index.
+    pub fn proven(
+        &self,
+        report: &ReadinessReport,
+        gpu: i32,
+        codec: ProbeCodec,
+        current: Option<&EvidenceStamp>,
+    ) -> bool {
+        codec_probe_verdict(report, gpu, codec) == Some(true)
+            && current.is_some()
+            && self.0.get(&ProbeTarget::codec(gpu, codec)) == current
     }
 }
 
@@ -401,5 +450,51 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// #301: a pass counts only under the stack it was proven on; an indeterminate rerun
+    /// keeps it, a fail or a `Forget` drops it.
+    #[test]
+    fn codec_evidence_counts_a_pass_only_under_its_own_stamp() {
+        use crate::host_probe::decision::ProbeInputs;
+        let inputs = |driver: &str| ProbeInputs {
+            agent_image: "sha256:a".into(),
+            driver: driver.into(),
+            gpus: [(0, "pci-0".to_string())].into(),
+            settings: "encoder=vulkan".into(),
+            codecs: Default::default(),
+        };
+        let old = inputs("595").evidence_stamp(0);
+        let new = inputs("610").evidence_stamp(0);
+        let target = ProbeTarget::codec(0, ProbeCodec::H265);
+        let pass = ProbeOutcome::Pass {
+            summary: "ok".into(),
+        };
+        let mut report = ReadinessReport::default();
+        let mut evidence = CodecEvidence::default();
+        let at = SystemTime::UNIX_EPOCH;
+
+        evidence.note(target, &pass, old.clone());
+        record(&mut report, target, pass.clone(), at);
+        assert!(evidence.proven(&report, 0, ProbeCodec::H265, old.as_ref()));
+        assert!(!evidence.proven(&report, 0, ProbeCodec::H265, new.as_ref()));
+        assert!(!evidence.proven(&report, 0, ProbeCodec::H265, None));
+        assert!(!evidence.proven(&report, 0, ProbeCodec::Av1, old.as_ref()));
+
+        let indeterminate = ProbeOutcome::Indeterminate {
+            reason: "pre-empted".into(),
+        };
+        evidence.note(target, &indeterminate, new.clone());
+        record(&mut report, target, indeterminate, at);
+        assert!(evidence.proven(&report, 0, ProbeCodec::H265, old.as_ref()));
+
+        // A pass with no stamp is never evidence.
+        evidence.note(target, &pass, None);
+        assert!(!evidence.proven(&report, 0, ProbeCodec::H265, old.as_ref()));
+
+        evidence.note(target, &pass, new.clone());
+        assert!(evidence.proven(&report, 0, ProbeCodec::H265, new.as_ref()));
+        evidence.forget(target);
+        assert!(!evidence.proven(&report, 0, ProbeCodec::H265, new.as_ref()));
     }
 }

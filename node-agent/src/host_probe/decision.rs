@@ -22,6 +22,29 @@ pub struct ProbeInputs {
     pub codecs: BTreeMap<i32, BTreeSet<ProbeCodec>>,
 }
 
+/// The slice of [`ProbeInputs`] a codec probe on one GPU ran under (#301): agent-side
+/// state, never on the wire. A codec-probe pass counts only while the current stack's
+/// stamp for that GPU index equals the one it was proven under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceStamp {
+    agent_image: String,
+    driver: String,
+    settings: String,
+    gpu: String,
+}
+
+impl ProbeInputs {
+    /// `None` when `gpu` is not in the inventory: nothing can be proven for it.
+    pub fn evidence_stamp(&self, gpu: i32) -> Option<EvidenceStamp> {
+        Some(EvidenceStamp {
+            agent_image: self.agent_image.clone(),
+            driver: self.driver.clone(),
+            settings: self.settings.clone(),
+            gpu: self.gpus.get(&gpu)?.clone(),
+        })
+    }
+}
+
 /// What a finished probe concluded, as far as scheduling cares: a codec probe runs only
 /// on a GPU whose media probe last concluded `Passed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +174,11 @@ impl Scheduler {
 
     pub fn running(&self) -> Option<ProbeTarget> {
         self.running.map(|r| r.target)
+    }
+
+    /// What a codec probe starting now on `gpu` runs under: stamped on its result.
+    pub fn evidence_stamp(&self, gpu: i32) -> Option<EvidenceStamp> {
+        self.inputs.as_ref()?.evidence_stamp(gpu)
     }
 
     /// False once the target's GPU is gone: a late result must not be recorded.
@@ -1529,5 +1557,32 @@ mod tests {
             vec![codec(0, H265), codec(0, Av1)],
             "the pre-empted codec probe runs again"
         );
+    }
+
+    /// #301: every identity a codec pass depends on is in the stamp; the codec plan is
+    /// not (a codec dropped from the plan loses its check through `Forget` instead).
+    #[test]
+    fn evidence_stamp_changes_with_every_identity_it_depends_on() {
+        let base = one_gpu();
+        let stamp = base.evidence_stamp(0).unwrap();
+        assert_eq!(base.evidence_stamp(1), None, "no GPU, nothing proven");
+
+        let mut planned = base.clone();
+        planned.codecs.insert(0, [ProbeCodec::H265].into());
+        assert_eq!(planned.evidence_stamp(0), Some(stamp.clone()));
+
+        let changes: [fn(&mut ProbeInputs); 4] = [
+            |i| i.agent_image = "sha256:agent-b".into(),
+            |i| i.driver = "nvidia:610.57.04 volume:def".into(),
+            |i| i.settings = "encoder=nvenc".into(),
+            |i| {
+                i.gpus.insert(0, "pci-0000:02:00.0".into());
+            },
+        ];
+        for change in changes {
+            let mut other = base.clone();
+            change(&mut other);
+            assert_ne!(other.evidence_stamp(0), Some(stamp.clone()), "{other:?}");
+        }
     }
 }

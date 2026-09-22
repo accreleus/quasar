@@ -94,7 +94,7 @@ pub const PROFILE_CONSTRAINED_BASELINE: &str = "constrained-baseline";
 /// (vendor × codec) resolves to a concrete encoder element at build time via
 /// [`pipeline::encoder_candidates`]; `EncoderChoice` is not widened. Browser HEVC
 /// decode is per-device (probed client-side); AV1 decodes everywhere in Chrome.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Codec {
     H264,
     H265,
