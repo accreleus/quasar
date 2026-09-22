@@ -1297,8 +1297,8 @@ belong in the operator's shell, never in `deploy/.env` and never in the repo.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `BENCH_URL` | `http://localhost:9400` | Base URL of the quasar-bench results service (dashboard on the same URL). |
-| `BENCH_KEY` | — (**required**) | A `BENCH_API_KEYS` secret from the quasar-bench deployment's own `deploy/.env`. **Never commit it**; `make verify` fails if a literal key value appears under `scripts/dx/` or in the `Makefile`. Read it from the service host, e.g. `sed -n 's/^BENCH_API_KEYS=harness://p' ~/quasar-bench/deploy/.env`. |
+| `BENCH_URL` | unset; qbench's config (`~/.config/qbench/url`) is used | Your bench server (the quasar-bench results service; dashboard on the same URL). There is **no default address**: with neither set, every bench script stops and says to run `qbench doctor`. The server's `install.sh` writes the config file. Honours `XDG_CONFIG_HOME`. |
+| `BENCH_KEY` | unset; qbench's config (`~/.config/qbench/key`, mode 600) is used — **required** from one or the other | An API key issued by the bench server's operator. A key file readable by group/other is refused. **Never commit it, echo it, or put it on a command line**; `make verify` fails if a literal key value appears under `scripts/dx/` or in the `Makefile`. `qbench doctor` checks the URL, the key and its permissions. |
 
 `bench-run` and `bench-suite` additionally need `QSES_ADMIN_TOKEN` (and usually
 `QSES_DEV_KEY`) exactly as `.claude/skills/quasar-session/SKILL.md` documents —

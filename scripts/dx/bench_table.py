@@ -22,7 +22,8 @@ Window (quasar-bench 1.1)
   from is printed with the table and in the API URL beneath it.
   `--window run` (or `--window ''`) restores the whole-run aggregate.
 
-Environment: BENCH_URL, BENCH_KEY (never committed).
+Environment: BENCH_URL / BENCH_KEY, else qbench's own config
+(~/.config/qbench/{url,key}); see scripts/dx/bench_config.py. Never committed.
 """
 
 from __future__ import annotations
@@ -34,7 +35,9 @@ import sys
 DX_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(DX_DIR, "vendor"))
 
+sys.path.insert(0, DX_DIR)  # bench_config.py, same directory
 from bench import Bench, BenchError  # noqa: E402
+from bench_config import bench_env, bench_url  # noqa: E402  (same directory)
 
 
 def fmt(v) -> str:
@@ -101,7 +104,8 @@ def main(argv=None) -> int:
         k, v = f.split("=", 1)
         base_tags[k] = v
 
-    b = Bench(args.url, args.key)
+    bench_env()  # BENCH_URL / BENCH_KEY, else qbench's ~/.config/qbench
+    b = Bench(bench_url(args.url), args.key)
     window, why = resolve_window(b, args, base_tags)
 
     for metric in args.metric:

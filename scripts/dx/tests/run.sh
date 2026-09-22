@@ -32,6 +32,15 @@ export WORK   # visible to PATH-shim subprocesses (e.g. the crontab stub's defau
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT INT TERM
 
+# The operator's real bench server and key (BENCH_URL / BENCH_KEY, or qbench's
+# ~/.config/qbench/{url,key}) must never reach this suite: every bench script now
+# falls back to that config, and leak-scan reads it. Point XDG_CONFIG_HOME at an
+# empty dir so nothing here can read, print or post to the real server; a test
+# that wants a config builds its own under $WORK.
+export XDG_CONFIG_HOME="$WORK/xdg-config"
+mkdir -p "$XDG_CONFIG_HOME"
+unset BENCH_URL BENCH_KEY QBENCH
+
 DX_SCRIPTS=("$DX"/*.sh "$TESTS_DIR"/*.sh)
 
 # ── PATH shims ───────────────────────────────────────────────────────────────
@@ -1748,9 +1757,11 @@ PY
   fi
 
   # Assert on what the SERVER received, not on what the client printed.
-  check="$(python3 - "$BENCH_LOG" <<'PY'
+  HEAD_FULL="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+  check="$(python3 - "$BENCH_LOG" "$HEAD_FULL" <<'PY'
 import json, sys
 posts = [json.loads(l) for l in open(sys.argv[1])]
+head_full = sys.argv[2]
 by = {}
 for p in posts:
     by.setdefault(p["path"].split("/")[-1], []).append(p)
@@ -1773,6 +1784,16 @@ else:
     if tags.get("bench_ext_id"):
         problems.append("the bench_ext_id TAG is still posted — the tag-lookup "
                         "dedupe path was supposed to go with it")
+    # repo + commit are how `qbench check` finds a run; without them the run is
+    # invisible to every commit-to-commit verdict. The commit is the FULL sha
+    # of the tree under test (here: this worktree's HEAD, via git_quasar).
+    if create.get("repo") != "accreleus/quasar":
+        problems.append("create repo=%r, want 'accreleus/quasar'" % (create.get("repo"),))
+    if create.get("commit") != head_full:
+        problems.append("create commit=%r, want this worktree's full HEAD %r"
+                        % (create.get("commit"), head_full))
+    if tags.get("git_quasar") and not head_full.startswith(tags["git_quasar"]):
+        problems.append("git_quasar tag %r does not match HEAD" % tags["git_quasar"])
     # ...and the run must record what the host was actually doing.
     cond = create.get("conditions") or {}
     if not cond.get("git"):
@@ -1942,6 +1963,39 @@ PY
     pass "bench:submit-idempotent" "a second submission upserted onto the same run"
   else
     fail "bench:submit-idempotent" "$idem"
+  fi
+
+  # --repo / --commit override the defaults, and a `git_quasar` tag (what a retro
+  # manifest and the nightly job carry) is the commit when --commit is absent.
+  env BENCH_URL="http://127.0.0.1:$BENCH_PORT" BENCH_KEY=test-key \
+    python3 "$DX/bench_submit.py" --dir "$FIXTURES/bench-run" --suite selftest \
+    --scenario override-cell --new --repo someorg/elsewhere \
+    --commit 0123456789abcdef0123456789abcdef01234567 >/dev/null 2>&1 || true
+  env BENCH_URL="http://127.0.0.1:$BENCH_PORT" BENCH_KEY=test-key \
+    python3 "$DX/bench_submit.py" --dir "$FIXTURES/bench-run" --suite selftest \
+    --scenario retro-cell --new --tag git_quasar=feedf00d >/dev/null 2>&1 || true
+  rc_check="$(python3 - "$BENCH_LOG" <<'PY'
+import json, sys
+creates = [json.loads(l)["body"] for l in open(sys.argv[1])
+           if json.loads(l)["path"] == "/v1/runs"]
+by = {c.get("scenario"): c for c in creates}
+p = []
+o = by.get("override-cell") or {}
+if (o.get("repo"), o.get("commit")) != ("someorg/elsewhere", "0123456789abcdef0123456789abcdef01234567"):
+    p.append("override-cell posted repo=%r commit=%r" % (o.get("repo"), o.get("commit")))
+if o.get("external_id"):
+    p.append("--new still posted an external_id")
+r = by.get("retro-cell") or {}
+# a sha this checkout does not know is sent as given (bench resolves prefixes)
+if (r.get("repo"), r.get("commit")) != ("accreleus/quasar", "feedf00d"):
+    p.append("retro-cell posted repo=%r commit=%r, want the git_quasar tag" % (r.get("repo"), r.get("commit")))
+print("OK" if not p else "; ".join(p))
+PY
+)"
+  if [ "$rc_check" = OK ]; then
+    pass "bench:submit-repo-commit-override" "--repo/--commit win; a git_quasar tag is the commit otherwise"
+  else
+    fail "bench:submit-repo-commit-override" "$rc_check"
   fi
 
   # A tag that disagrees with conditions.effective is a MISLABELLED cell: the run
@@ -2195,6 +2249,53 @@ if [ -f "$DX/vendor/bench.py" ]; then
   else
     fail "bench:vendor-provenance" "vendor/bench.py has no '# Commit: <sha>' header"
   fi
+  # bench.py and qbench are vendored as a PAIR (qbench imports bench.py from its
+  # own directory): same upstream commit, same version, and everything after
+  # each header is the upstream file verbatim — its git blob id starts with the
+  # one the header records. A hand-patched vendor file fails here.
+  pair_check="$(python3 - "$DX/vendor" <<'PY'
+import hashlib, os, re, subprocess, sys
+d = sys.argv[1]
+p, commits = [], {}
+for name in ("bench.py", "qbench"):
+    raw = open(os.path.join(d, name), "rb").read()
+    head, sep, body = raw.partition("# ── END-OF-HEADER ──\n".encode())
+    if not sep:
+        p.append("%s has no END-OF-HEADER line" % name); continue
+    m = re.search(rb"^# Commit: ([0-9a-f]{40})", head, re.M)
+    b = re.search(rb"git blob ([0-9a-f]{7,40})", head)
+    if not m or not b:
+        p.append("%s header lacks a Commit or git blob line" % name); continue
+    commits[name] = m.group(1)
+    blob = hashlib.sha1(b"blob %d\0" % len(body) + body).hexdigest()
+    if not blob.startswith(b.group(1).decode()):
+        p.append("%s body is not the recorded upstream blob (%s, header says %s)"
+                 % (name, blob[:12], b.group(1).decode()))
+if len(set(commits.values())) > 1:
+    p.append("bench.py and qbench were vendored from different commits")
+sys.path.insert(0, d)
+import bench
+ver = subprocess.run([sys.executable, os.path.join(d, "qbench"), "--version"],
+                     capture_output=True, text=True).stdout.strip()
+if ver != "qbench %s" % bench.__version__:
+    p.append("qbench --version says %r, bench.py is %s" % (ver, bench.__version__))
+print("OK" if not p else "; ".join(p))
+PY
+)"
+  if [ "$pair_check" = OK ]; then
+    pass "bench:vendor-verbatim-pair" "bench.py + qbench: one upstream commit, one version, bodies verbatim"
+  else
+    fail "bench:vendor-verbatim-pair" "$pair_check"
+  fi
+  # The repo never relies on the vendored client's localhost DEFAULT_URL, and
+  # no bench script or doc carries a default bench address of its own.
+  if grep -rnE '(localhost|127\.0\.0\.1):9400|QUASAR_BENCH_URL|https?://<[^>]*bench[^>]*>' \
+       "$DX"/*.sh "$DX"/*.py "$ROOT/Makefile" "$ROOT/AGENTS.md" "$ROOT/CLAUDE.md" \
+       "$ROOT/docs/configuration.md" "$ROOT/docs/agents" 2>/dev/null; then
+    fail "bench:no-default-address" "a default/placeholder bench address is back (above)"
+  else
+    pass "bench:no-default-address" "no :9400 default, no QUASAR_BENCH_URL, no <bench-host> placeholder URL"
+  fi
   # The vendored copy must be new enough to speak the endpoints the harness now
   # depends on. A silently stale vendor is how the harness ends up re-implementing
   # a capability the service already has.
@@ -2256,6 +2357,189 @@ print("OK" if not p else "; ".join(p))' "$DX/bench_submit.py" "$DX/vendor")
   if [ "$rg_check" = OK ]; then pass "bench:replace-guard" "re-fold uses replace+expected_count, gated on service >= 1.2"; else fail "bench:replace-guard" "$rg_check"; fi
 else
   fail "bench:vendor-provenance" "scripts/dx/vendor/bench.py is missing"
+fi
+
+# ── bench server + key resolution: qbench's own config, never a default ──────
+# bench_config.py (Python) and dx_bench_env (common.sh) must resolve exactly as
+# qbench does: env first, then $XDG_CONFIG_HOME/qbench/{url,key}; a key file
+# readable by others is refused; nothing is ever printed but the SOURCE.
+printf '\n== bench config (qbench url/key resolution) ==\n'
+QBCFG="$WORK/qbcfg"
+mkdir -p "$QBCFG/good/qbench" "$QBCFG/loose/qbench" "$QBCFG/none"
+printf 'http://127.0.0.1:1/\n' > "$QBCFG/good/qbench/url"
+printf 'planted-fixture-key-9f3a\n' > "$QBCFG/good/qbench/key"
+chmod 600 "$QBCFG/good/qbench/key"
+cp "$QBCFG/good/qbench/url" "$QBCFG/loose/qbench/url"
+printf 'planted-fixture-key-9f3a\n' > "$QBCFG/loose/qbench/key"
+chmod 644 "$QBCFG/loose/qbench/key"
+
+cfg_good="$(XDG_CONFIG_HOME="$QBCFG/good" python3 "$DX/bench_config.py" 2>&1)"; cfg_good_rc=$?
+if [ "$cfg_good_rc" = 0 ] && printf '%s' "$cfg_good" | grep -q "url   $QBCFG/good/qbench/url" \
+   && ! printf '%s' "$cfg_good" | grep -qE 'planted-fixture-key|127\.0\.0\.1'; then
+  pass "benchcfg:py-reads-qbench-config" "url + mode-600 key resolved from the config dir; neither value printed"
+else
+  fail "benchcfg:py-reads-qbench-config" "rc=$cfg_good_rc $(printf '%s' "$cfg_good" | tr '\n' ' ')"
+fi
+cfg_loose="$(XDG_CONFIG_HOME="$QBCFG/loose" python3 "$DX/bench_config.py" 2>&1)"; cfg_loose_rc=$?
+if [ "$cfg_loose_rc" = 1 ] && printf '%s' "$cfg_loose" | grep -q 'mode 644' \
+   && printf '%s' "$cfg_loose" | grep -q '^key   none'; then
+  pass "benchcfg:py-refuses-loose-key" "a group/other-readable key file is refused, like qbench"
+else
+  fail "benchcfg:py-refuses-loose-key" "rc=$cfg_loose_rc $(printf '%s' "$cfg_loose" | tr '\n' ' ')"
+fi
+cfg_env="$(XDG_CONFIG_HOME="$QBCFG/good" BENCH_URL=http://127.0.0.1:2 BENCH_KEY=from-env \
+  python3 -c 'import os, sys; sys.path.insert(0, sys.argv[1]); import bench_config as c
+w = c.bench_env(); print(w["url"], w["key"], os.environ["BENCH_URL"], os.environ["BENCH_KEY"])' "$DX" 2>&1)"
+if [ "$cfg_env" = "BENCH_URL BENCH_KEY http://127.0.0.1:2 from-env" ]; then
+  pass "benchcfg:env-wins" "BENCH_URL / BENCH_KEY win over the config files"
+else
+  fail "benchcfg:env-wins" "$cfg_env"
+fi
+# No server anywhere: every Bench() caller stops with the next step instead of
+# falling back to the vendored client's localhost default.
+for s in bench_table.py bench_baseline.py bench_budget.py; do
+  case "$s" in
+    bench_table.py) s_args=(--suite s --rows tag.x --cols tag.y --metric m) ;;
+    *)              s_args=(--run r1) ;;
+  esac
+  nosrv_rc=0
+  nosrv="$(XDG_CONFIG_HOME="$QBCFG/none" BENCH_KEY=k python3 "$DX/$s" "${s_args[@]}" 2>&1)" || nosrv_rc=$?
+  if [ "$nosrv_rc" = 2 ] && printf '%s' "$nosrv" | grep -q 'no bench server configured.*qbench doctor'; then
+    pass "benchcfg:no-server-$s" "no BENCH_URL and no config -> rc 2 naming qbench doctor"
+  else
+    fail "benchcfg:no-server-$s" "rc=$nosrv_rc $(printf '%s' "$nosrv" | tail -n 2 | tr '\n' ' ')"
+  fi
+done
+sub_nosrv_rc=0
+sub_nosrv="$(XDG_CONFIG_HOME="$QBCFG/none" BENCH_KEY=k python3 "$DX/bench_submit.py" \
+  --dir "$FIXTURES/bench-run" --suite s --scenario c 2>&1)" || sub_nosrv_rc=$?
+if [ "$sub_nosrv_rc" = 2 ] && printf '%s' "$sub_nosrv" | grep -q 'no bench server configured'; then
+  pass "benchcfg:no-server-bench_submit" "bench_submit refuses rather than post to localhost"
+else
+  fail "benchcfg:no-server-bench_submit" "rc=$sub_nosrv_rc $(printf '%s' "$sub_nosrv" | tail -n 2 | tr '\n' ' ')"
+fi
+# The shell twin, used by report.sh / nightly_budget.sh / bench_suite.sh.
+sh_good="$(env -u BENCH_URL -u BENCH_KEY XDG_CONFIG_HOME="$QBCFG/good" bash -c \
+  'source "$1/common.sh"; dx_bench_env && [ "$BENCH_URL" = http://127.0.0.1:1 ] && [ "$BENCH_KEY" = planted-fixture-key-9f3a ] && echo OK' _ "$DX" 2>&1)"
+sh_loose="$(env -u BENCH_URL -u BENCH_KEY XDG_CONFIG_HOME="$QBCFG/loose" bash -c \
+  'source "$1/common.sh"; r=0; dx_bench_env || r=$?; echo "rc=$r key=${BENCH_KEY:-unset}"' _ "$DX" 2>&1)"
+if [ "$sh_good" = OK ] && printf '%s' "$sh_loose" | grep -q 'rc=1 key=unset' \
+   && printf '%s' "$sh_loose" | grep -q 'mode 644'; then
+  pass "benchcfg:sh-twin" "dx_bench_env reads the same files and refuses the same loose key"
+else
+  fail "benchcfg:sh-twin" "good=[$sh_good] loose=[$(printf '%s' "$sh_loose" | tr '\n' ' ')]"
+fi
+
+# ── report.sh: qbench (installed or vendored), server only from env/config ────
+printf '\n== report.sh (qbench) ==\n'
+QB_STUB="$WORK/qbench-stub"
+cat > "$QB_STUB" <<'EOF'
+#!/usr/bin/env bash
+# records its argv, answers like qbench: `report url` prints a URL, `check`
+# exits with $QB_STUB_RC, everything else prints a line and exits 0.
+printf '%s\n' "$*" >> "${QB_STUB_LOG:-/dev/null}"
+case "$1 $2" in
+  "report url") printf 'http://127.0.0.1:1/reports/stub\n' ;;
+  "report put") printf 'http://127.0.0.1:1/reports/stub\n' ;;
+  check*) printf 'stub verdict text\n'; exit "${QB_STUB_RC:-0}" ;;
+  *) printf 'stub %s\n' "$*" ;;
+esac
+EOF
+chmod +x "$QB_STUB"
+rep_nosrv_rc=0
+rep_nosrv="$(env -u BENCH_URL -u BENCH_KEY XDG_CONFIG_HOME="$QBCFG/none" QBENCH="$QB_STUB" \
+  PATH="$STUB_BIN:$PATH" HOST=gpu-test COMMIT=HEAD bash "$DX/report.sh" url 2>&1)" || rep_nosrv_rc=$?
+if [ "$rep_nosrv_rc" = 2 ] && printf '%s' "$rep_nosrv" | grep -q 'qbench doctor' \
+   && ! printf '%s' "$rep_nosrv" | grep -qiE ':9400|LAN address|deploy/.env'; then
+  pass "report:no-server-refuses" "no BENCH_URL/config -> rc 2 naming qbench doctor; no host-derived fallback"
+else
+  fail "report:no-server-refuses" "rc=$rep_nosrv_rc $(printf '%s' "$rep_nosrv" | tail -n 2 | tr '\n' ' ')"
+fi
+: > "$WORK/qb-stub.log"
+rep_url="$(env -u BENCH_URL -u BENCH_KEY XDG_CONFIG_HOME="$QBCFG/none" BENCH_URL=http://127.0.0.1:1 \
+  QBENCH="$QB_STUB" QB_STUB_LOG="$WORK/qb-stub.log" COMMIT=HEAD bash "$DX/report.sh" url 2>&1)"; rep_url_rc=$?
+if [ "$rep_url_rc" = 0 ] && printf '%s' "$rep_url" | grep -q 'RESULT status=ok target=report-url .*url=http://127.0.0.1:1/reports/stub' \
+   && grep -qE "^report url --repo accreleus/quasar --commit [0-9a-f]{40}$" "$WORK/qb-stub.log"; then
+  pass "report:url-needs-only-server" "report url: server only (no key, no HOST), full sha, no --url passed"
+else
+  fail "report:url-needs-only-server" "rc=$rep_url_rc $(printf '%s' "$rep_url" | tail -n 2 | tr '\n' ' ') log=$(tr '\n' ' ' < "$WORK/qb-stub.log")"
+fi
+printf '# r\n' > "$WORK/report.md"
+: > "$WORK/qb-stub.log"
+rep_pub="$(env XDG_CONFIG_HOME="$QBCFG/good" QBENCH="$QB_STUB" QB_STUB_LOG="$WORK/qb-stub.log" \
+  REPORT="$WORK/report.md" TITLE=t COMMIT=HEAD ISSUES=12 bash "$DX/report.sh" publish 2>&1)"; rep_pub_rc=$?
+if [ "$rep_pub_rc" = 0 ] && grep -q '^report put --repo accreleus/quasar --commit [0-9a-f]\{40\} --title t --body .*report.md --body-mime text/markdown.* --issue 12' "$WORK/qb-stub.log"; then
+  pass "report:publish-via-qbench-config" "publish resolves the key from qbench's config and passes the documented flags"
+else
+  fail "report:publish-via-qbench-config" "rc=$rep_pub_rc $(printf '%s' "$rep_pub" | tail -n 2 | tr '\n' ' ') log=$(tr '\n' ' ' < "$WORK/qb-stub.log")"
+fi
+# The vendored CLI itself works as a drop-in (`report url` makes no request).
+vend_url="$(env -u BENCH_KEY XDG_CONFIG_HOME="$QBCFG/none" BENCH_URL=http://127.0.0.1:1 \
+  python3 "$DX/vendor/qbench" report url --repo accreleus/quasar --commit 0123abcd 2>&1)"
+if printf '%s' "$vend_url" | grep -q '^http://127.0.0.1:1/'; then
+  pass "report:vendored-qbench-runs" "python3 scripts/dx/vendor/qbench works without an installed qbench"
+else
+  fail "report:vendored-qbench-runs" "$vend_url"
+fi
+
+# ── bench_check.sh: qbench check's exit codes pass straight through ──────────
+printf '\n== bench-check (landing gate) ==\n'
+for pair in "0:clean" "3:regressed" "4:nothing_comparable" "5:key" "1:error"; do
+  want_rc="${pair%%:*}"; want_res="${pair#*:}"
+  bc_rc=0
+  bc_out="$(env QBENCH="$QB_STUB" QB_STUB_RC="$want_rc" bash "$DX/bench_check.sh" check 2>&1)" || bc_rc=$?
+  if [ "$bc_rc" = "$want_rc" ] && printf '%s' "$bc_out" | grep -q "RESULT .*target=bench-check .*result=$want_res rc=$want_rc"; then
+    pass "benchcheck:rc-$want_rc" "qbench check rc $want_rc -> bench-check rc $want_rc ($want_res)"
+  else
+    fail "benchcheck:rc-$want_rc" "rc=$bc_rc $(printf '%s' "$bc_out" | tail -n 2 | tr '\n' ' ')"
+  fi
+done
+bc4="$(env QBENCH="$QB_STUB" QB_STUB_RC=4 bash "$DX/bench_check.sh" check 2>&1 || true)"
+if printf '%s' "$bc4" | grep -q 'NOT a pass' && printf '%s' "$bc4" | grep -q 'summary MUST say'; then
+  pass "benchcheck:nothing-comparable-is-loud" "rc 4 says it is not a pass and must be stated in the summary"
+else
+  fail "benchcheck:nothing-comparable-is-loud" "$(printf '%s' "$bc4" | tail -n 3 | tr '\n' ' ')"
+fi
+: > "$WORK/qb-stub.log"
+env QBENCH="$QB_STUB" QB_STUB_LOG="$WORK/qb-stub.log" BASE=abc1234 WINDOW=impaired \
+  bash "$DX/bench_check.sh" check >/dev/null 2>&1 || true
+if grep -qx 'check --repo accreleus/quasar --base abc1234 --window impaired' "$WORK/qb-stub.log"; then
+  pass "benchcheck:knobs-forwarded" "BASE / WINDOW become --base / --window"
+else
+  fail "benchcheck:knobs-forwarded" "$(tr '\n' ' ' < "$WORK/qb-stub.log")"
+fi
+rc_of 2 "benchcheck:bad-window-refused" -- env QBENCH="$QB_STUB" WINDOW='impaired;id' bash "$DX/bench_check.sh" check
+rc_of 2 "benchcheck:bad-base-refused" -- env QBENCH="$QB_STUB" BASE='$(id)' bash "$DX/bench_check.sh" check
+: > "$WORK/qb-stub.log"
+env QBENCH="$QB_STUB" QB_STUB_LOG="$WORK/qb-stub.log" SPRINT=c15 bash "$DX/bench_check.sh" status >/dev/null 2>&1 || true
+if grep -qx 'sprint status --repo accreleus/quasar --sprint c15' "$WORK/qb-stub.log"; then
+  pass "benchcheck:status-sprint" "bench-status SPRINT=c15 -> qbench sprint status (read-only)"
+else
+  fail "benchcheck:status-sprint" "$(tr '\n' ' ' < "$WORK/qb-stub.log")"
+fi
+if grep -nE '(sprint|report) (put|review|attach|comments|resolve)|run (new|samples|event|validity)' \
+     "$DX/bench_check.sh" | grep -v '^[0-9]*:#' >/dev/null; then
+  fail "benchcheck:read-only" "bench_check.sh calls a qbench write verb"
+else
+  pass "benchcheck:read-only" "bench_check.sh calls no qbench write verb"
+fi
+
+# ── leak-scan: the bench host from qbench's config is a fingerprint ──────────
+LSB_URL="$WORK/lsb-url"
+printf 'https://qb-leaktest.bench-lab.invalid\n' > "$LSB_URL"
+printf '[{"number":1,"title":"bench run","body":"see https://qb-leaktest.bench-lab.invalid/runs/1","comments":[]}]\n' \
+  > "$WORK/lsb-issues.json"
+lsb_rc=0
+LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS='' LEAK_SCAN_OPERATOR_PATTERNS='' LEAK_SCAN_PATTERNS_FILE="$WORK/none" LEAK_SCAN_BENCH_URL_FILE="$LSB_URL" \
+  LEAK_SCAN_ISSUES_JSON="$WORK/lsb-issues.json" bash "$LS" --issues >/dev/null 2>&1 || lsb_rc=$?
+printf 'http://127.0.0.1:1\n' > "$WORK/lsb-loop"
+lsb_loop_rc=0
+LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS='' LEAK_SCAN_OPERATOR_PATTERNS='' LEAK_SCAN_PATTERNS_FILE="$WORK/none" LEAK_SCAN_BENCH_URL_FILE="$WORK/lsb-loop" \
+  LEAK_SCAN_ISSUES_JSON="$FIXTURES/leak-issues-clean.json" bash "$LS" --issues >/dev/null 2>&1 || lsb_loop_rc=$?
+if [ "$lsb_rc" = 1 ] && [ "$lsb_loop_rc" = 0 ]; then
+  pass "leakscan:bench-host-from-qbench-config" "the configured bench host is caught; a loopback URL adds nothing"
+else
+  fail "leakscan:bench-host-from-qbench-config" "host rc=$lsb_rc (want 1), loopback rc=$lsb_loop_rc (want 0)"
 fi
 
 # ── no API key may ever be committed ─────────────────────────────────────────
@@ -2389,27 +2673,41 @@ mkdir -p "$NBWORK"
 rc_of 0 "nightly:help" -- bash "$NB" --help
 rc_of 2 "nightly:bad-arg" -- bash "$NB" --bogus
 
-# ── BENCH_KEY unreadable is a clean skip, not a crash ─────────────────────────
+# ── no bench key anywhere is a clean skip, not a crash ───────────────────────
 nb_skip_key="$(NIGHTLY_BENCH_ENV="$NBWORK/nope.env" NIGHTLY_LOG_DIR="$NBWORK/log1" \
   bash "$NB" --dry-run 2>&1)"
 if printf '%s' "$nb_skip_key" | grep -q 'status=skipped .*reason=bench-key-unavailable'; then
-  pass "nightly:skip-no-key" "no BENCH_API_KEYS -> clean skip"
+  pass "nightly:skip-no-key" "no BENCH_KEY, no qbench key file, no BENCH_API_KEYS -> clean skip"
 else
   fail "nightly:skip-no-key" "$nb_skip_key"
 fi
 
-# ── a valid env file + --dry-run prints the plan and does not touch anything ─
+# ── a key but no server is a clean skip too: there is no default bench address ─
 cat > "$NBWORK/bench.env" <<'EOF'
 BENCH_API_KEYS=harness:test-secret-value
-BENCH_PORT=9401
 EOF
-nb_plan="$(NIGHTLY_BENCH_ENV="$NBWORK/bench.env" NIGHTLY_LOG_DIR="$NBWORK/log2" \
+nb_skip_url="$(NIGHTLY_BENCH_ENV="$NBWORK/bench.env" NIGHTLY_LOG_DIR="$NBWORK/log1b" \
+  bash "$NB" --dry-run 2>&1)"
+if printf '%s' "$nb_skip_url" | grep -q 'status=skipped .*reason=bench-url-unavailable'; then
+  pass "nightly:skip-no-url" "key but no BENCH_URL / qbench url file -> clean skip, never localhost"
+else
+  fail "nightly:skip-no-url" "$nb_skip_url"
+fi
+
+# ── qbench's own config + --dry-run prints the plan and does not touch anything ─
+NB_XDG="$NBWORK/xdg"
+mkdir -p "$NB_XDG/qbench"
+printf 'http://127.0.0.1:9/\n' > "$NB_XDG/qbench/url"
+printf 'nightly-fixture-key\n' > "$NB_XDG/qbench/key"
+chmod 600 "$NB_XDG/qbench/key"
+nb_plan="$(XDG_CONFIG_HOME="$NB_XDG" NIGHTLY_LOG_DIR="$NBWORK/log2" \
   bash "$NB" --dry-run 2>&1)"
 if printf '%s' "$nb_plan" | grep -q 'status=ok .*dry_run=1' \
    && printf '%s' "$nb_plan" | grep -q 'suite     nightly-budget' \
    && printf '%s' "$nb_plan" | grep -q 'scenario  1080p60-h264-local' \
-   && printf '%s' "$nb_plan" | grep -q 'bench_url http://localhost:9401'; then
-  pass "nightly:dry-run-plan" "prints the plan, derives BENCH_URL from BENCH_PORT"
+   && printf '%s' "$nb_plan" | grep -q 'bench_url (from qbench config)' \
+   && ! printf '%s' "$nb_plan" | grep -q '127.0.0.1:9'; then
+  pass "nightly:dry-run-plan" "prints the plan; server + key from qbench's config, the URL itself never printed"
 else
   fail "nightly:dry-run-plan" "$(printf '%s' "$nb_plan" | tail -n 8 | tr '\n' ' ')"
 fi
@@ -2473,7 +2771,7 @@ chmod +x "$HEALTHY_CURL_BIN/curl"
 nb_run() { # nb_run <logdir> <qses-stub> <bench_run-stub> <budget-stub-with-interpreter...>
   local logdir="$1" qses="$2" run="$3"; shift 3
   PATH="$HEALTHY_CURL_BIN:$STUB_BIN:$PATH" \
-  NIGHTLY_BENCH_ENV="$NBWORK/bench.env" NIGHTLY_LOG_DIR="$logdir" \
+  NIGHTLY_BENCH_ENV="$NBWORK/bench.env" NIGHTLY_BENCH_URL=http://127.0.0.1:9 NIGHTLY_LOG_DIR="$logdir" \
   NIGHTLY_DEV_KEY=fake-dev-key NIGHTLY_ADMIN_TOKEN=fake-admin-token NIGHTLY_QSES="$qses" NIGHTLY_BENCH_RUN="$run" \
   NIGHTLY_BENCH_BUDGET="$*" \
     bash "$NB" 2>&1
@@ -2542,7 +2840,7 @@ mkdir -p "$CURL_STUB"
 printf '#!/usr/bin/env bash\necho 000\n' > "$CURL_STUB/curl"
 chmod +x "$CURL_STUB/curl"
 nb_unhealthy="$(PATH="$CURL_STUB:$STUB_BIN:$PATH" \
-  NIGHTLY_BENCH_ENV="$NBWORK/bench.env" NIGHTLY_LOG_DIR="$NBWORK/log-unhealthy" \
+  NIGHTLY_BENCH_ENV="$NBWORK/bench.env" NIGHTLY_BENCH_URL=http://127.0.0.1:9 NIGHTLY_LOG_DIR="$NBWORK/log-unhealthy" \
   NIGHTLY_QSES="$NBWORK/fake_qses_idle.sh" NIGHTLY_BENCH_RUN="$NBWORK/fake_bench_run_ok.sh" \
   NIGHTLY_BENCH_BUDGET="python3 $NBWORK/fake_budget_ok.py" \
     bash "$NB" 2>&1)"
@@ -2555,7 +2853,7 @@ fi
 # ── admin-token mint failure is a clean skip too (bench_run.sh needs its own
 # QSES_ADMIN_TOKEN, distinct from the dev-agent key) ─────────────────────────
 nb_no_admin="$(PATH="$HEALTHY_CURL_BIN:$STUB_BIN:$PATH" \
-  NIGHTLY_BENCH_ENV="$NBWORK/bench.env" NIGHTLY_LOG_DIR="$NBWORK/log-noadmin" \
+  NIGHTLY_BENCH_ENV="$NBWORK/bench.env" NIGHTLY_BENCH_URL=http://127.0.0.1:9 NIGHTLY_LOG_DIR="$NBWORK/log-noadmin" \
   NIGHTLY_DEV_KEY=fake-dev-key NIGHTLY_QSES="$NBWORK/fake_qses_idle.sh" \
   NIGHTLY_BENCH_RUN="$NBWORK/fake_bench_run_ok.sh" \
   NIGHTLY_BENCH_BUDGET="python3 $NBWORK/fake_budget_ok.py" \

@@ -152,10 +152,47 @@ make session-soak    SID=latest ARGS='--duration 180' HOST=gpu-test
 | `session-display` | `scripts/dx/session_display.sh` | one `PATCH /v1/sessions/{id}/display` (stream / render / ui-scale), then prints the resulting `stream.external_*` / `render_*` / `rungs` |
 | `session-soak` | `scripts/dx/session_soak.sh` (+ `session_soak_driver.py`, `session_soak_report.py`) | on-demand **bad-connection soak**: walks the EXTERNAL size down the rung ladder and back up over `--duration` (default 180 s) against a session someone is already playing, samples agent + browser telemetry, and writes `REPORT.md` + `summary.json` under `.diagnostics/soak/`. Never sends `render_*`; restores the launch size on every exit path including Ctrl-C. `SID=latest` picks the newest `running` session. Nothing is wired into ABR — manual only. |
 
+## Performance evidence (quasar-bench)
+
+quasar-bench stores harness runs, judges commits against each other and holds the
+sprint reports the operator reviews. The `qbench` CLI talks to it; the
+`quasar-bench*` skills cover HOW (install them with the server's `install.sh`).
+Harnesses without skill support: [`docs/agents/quasar-bench.md`](docs/agents/quasar-bench.md).
+This section is WHEN.
+
+- **Before landing a streaming-path change** (encoder, capture, ABR/ladder,
+  transport, client presentation): make sure the harness has posted runs for the
+  new commit, then run `make bench-check` (`qbench check` from the repo root;
+  `WINDOW=impaired` for an impairment experiment, `BASE=<sha>` to pick the base).
+  Exit 3 (regressed) blocks landing until each regressed metric is explained or
+  fixed. Exit 4 (nothing comparable) is not a pass: say so in the summary.
+- **Every harness run carries `--repo accreleus/quasar --commit <sha>`**, the sha
+  the host actually ran. `bench_submit.py` and everything built on it (`bench-run`,
+  `bench-suite`, `bench-retro`, the nightly job) send both; a run without them is
+  invisible to `qbench check`. Mark a bad run `contaminated` with a reason; never
+  delete it.
+- **At sprint end**, publish a sprint report (`qbench sprint put`) with the
+  before/after runs, the evidence and the board issues it closes. In the final
+  commit body and the issue, cite it by report path, not by host name, for example
+  "bench sprint accreleus/quasar c15". A single landing can instead publish a commit
+  report (`make report-publish`).
+- **When resuming work**, run `make bench-status` (`qbench sprint status` for one
+  sprint with `SPRINT=<slug>`). Address every open comment on a `changes_requested`
+  report before starting new work. Never set a review status yourself.
+- **Quote bench verdicts verbatim.** Don't restate numbers from memory.
+
 ## Benchmarks (quasar-bench results service)
 
+The server and key are wherever `qbench` finds them: `BENCH_URL` / `BENCH_KEY`, else
+qbench's own config (`~/.config/qbench/url`, `~/.config/qbench/key` at mode 600, which
+the server's `install.sh` writes). Every script here reads the same two places through
+`scripts/dx/bench_config.py` (the shell twin is `dx_bench_env` in `common.sh`). There is
+no default address. `qbench doctor` checks the URL, the key and its permissions.
+
 ```
-export BENCH_URL=https://<your-bench-host>:9400 BENCH_KEY=<a BENCH_API_KEYS secret>   # never commit the key
+qbench doctor                        # your bench server ($BENCH_URL), key, CLI version
+make bench-check                     # landing gate: HEAD vs the last benched ancestor
+make bench-status [SPRINT=c15]       # reports waiting on you (read-only)
 make bench-submit DIR=.diagnostics/soak/<run> ARGS='--suite abr-ladder --scenario 1080p120-h264-netem-moderate'
 make bench-run   HOST=gpu-test ARGS="--app 'KDE Desktop' --profile 1080p60-h264 --secs 240"
 make bench-suite HOST=gpu-test ARGS='--profiles 720p60-h264,1080p60-h264 --abr-modes off,smooth --dry-run'
@@ -178,11 +215,12 @@ there for exactly this, and a filter that changes neither did not apply.
 
 | Target | Script | What it does |
 |---|---|---|
-| `bench-submit` | `scripts/dx/bench_submit.py` | posts ONE soak/observe run directory (the shape `session_soak.sh` writes) as a quasar-bench run: samples from `metrics.jsonl`, events from `trace.json` + `marks.jsonl` + `steps.jsonl` + `harness.mark` phase boundaries, artifacts, `summary.json` as the run summary, and `conditions` (`--conditions FILE`, default `<DIR>/conditions.json`). Tags are derived from `session.json` + the worktree's git shas and overridden by `--tag k=v`. **Idempotent** — a deterministic first-class `external_id` makes the service upsert onto the same run (200) instead of creating a second (201). **Exit 3** = posted but MISLABELLED (see mismatches below). |
-| `bench-run` | `scripts/dx/bench_run.sh` | ONE live iteration: self-launch a session at a **pinned** `--profile` with the headless peer attached, observe for `--secs` (optionally under `--netem <level>`, which delegates to `abr_ladder_netem.sh`), optionally pull app-side files out of the managed home, then submit. Captures the host's `effective` settings **at launch** into `<out>/conditions.json`. Stops its own session on every exit path. |
+| `bench-check` / `bench-status` | `scripts/dx/bench_check.sh` | `bench-check` runs `qbench check --repo accreleus/quasar` from the repo root (`BASE=<sha>`, `WINDOW=<phase>`, extra flags via `ARGS`) and passes its exit code through: 0 clean, 3 regressed, 4 nothing comparable (**not a pass**; the message says so), 5 key missing/rejected (run `qbench doctor`), 1 error. `make` itself exits 2 on any of the non-zero codes; the `RESULT` line's `result=` / `rc=` say which. `bench-status` is `qbench sprint status` with `SPRINT=<slug>`, else the repo's recent sprint reports plus every commit report at `changes_requested`. Both are read-only. The CLI is an installed `qbench` (`command -v qbench`), else the vendored `scripts/dx/vendor/qbench`. |
+| `bench-submit` | `scripts/dx/bench_submit.py` | posts ONE soak/observe run directory (the shape `session_soak.sh` writes) as a quasar-bench run: samples from `metrics.jsonl`, events from `trace.json` + `marks.jsonl` + `steps.jsonl` + `harness.mark` phase boundaries, artifacts, `summary.json` as the run summary, and `conditions` (`--conditions FILE`, default `<DIR>/conditions.json`). Tags are derived from `session.json` + the worktree's git shas and overridden by `--tag k=v`. The run is created with `repo` (`--repo`, default `accreleus/quasar`) and `commit` (`--commit`, else the `git_quasar` tag, else HEAD; the full sha when this checkout knows it), the same body `qbench run new` posts, so `qbench check` can find it. **Idempotent** — a deterministic first-class `external_id` makes the service upsert onto the same run (200) instead of creating a second (201). **Exit 3** = posted but MISLABELLED (see mismatches below). |
+| `bench-run` | `scripts/dx/bench_run.sh` | ONE live iteration (`--commit <sha>` = the commit the HOST runs, when it is not this worktree's HEAD): self-launch a session at a **pinned** `--profile` with the headless peer attached, observe for `--secs` (optionally under `--netem <level>`, which delegates to `abr_ladder_netem.sh`), optionally pull app-side files out of the managed home, then submit. Captures the host's `effective` settings **at launch** into `<out>/conditions.json`. Stops its own session on every exit path. |
 | `bench-suite` | `scripts/dx/bench_suite.sh` | the matrix: profiles × abr_mode × ladder × netem × `--iterations`, one run per cell. PATCHes the host's ABR settings per cell and **restores the original overrides on every exit path** (snapshot kept at `<out>/host-settings-before.json`). Tags each cell's INTENT so the mismatch check is not vacuous. Resumable via a state file; `--only` filters cells; `--baseline` pins each ok cell as its scenario's baseline afterwards (default OFF); `--dry-run` prints the plan. |
 | — | `scripts/dx/bench_app_samples.py` | folds a quasar-benchapp run's `frames.jsonl` (60 Hz) into one `app` sample per wall-clock second (carrying `frame_index_min/max` so browser-side `missing_indices` stays attributable), its `events.jsonl` into `app.event` events, and the bench-mode `bench-windows.json` into `browser` samples + `bench.window` events — all written back into the `metrics.jsonl` / `trace.json` that `bench_submit.py` already reads. Also writes the per-frame ring to `bench-frames.json` as an artifact. Windows are joined on **their own** timestamps (`last_host_time_ms` → `t_end_host_ms` → `t_end_ms`); a readout carrying none is ordinal-stamped and loudly warned about. Idempotent; MERGES into `trace.json` rather than replacing it. |
-| `report-publish` / `report-attach` / `report-url` | `scripts/dx/report.sh` | completion reports + evidence on quasar-bench (C11, spec in `quasar-bench/docs/design/2026-08-23-c11-reports-evidence-spec.md`). A report is keyed by `REPO` + `COMMIT` (the merge SHA; `COMMIT=HEAD`/branch resolves locally). `report-publish REPORT=<md|html> TITLE=… [SUMMARY ISSUES PRS RUNS TAGS PIN=1]` creates or replaces the body; `report-attach COMMIT=… FILE=… [ROLE=screenshot\|video\|log\|bundle\|other CAPTION=…]` uploads evidence (role inferred from the extension; video and bundles are pruned after 90 d unless pinned, screenshots and the report never). The `RESULT` line carries the stable URL — paste it into the commit body, the issue, and memory. Credentials: `BENCH_URL`+`BENCH_KEY` if exported, else the service's own `deploy/.env` on `HOST` over ssh. The bench base URL comes from `BENCH_URL`, else `QUASAR_BENCH_URL` — **there is no built-in default address**; export `QUASAR_BENCH_URL` as the deployment's stable DNS name, because a report URL pasted into a commit body has to outlive an IP. Unset or unreachable, the URL is derived as `http://<HOST>:9400` with a WARN that published links will rot. The CLI underneath is `scripts/dx/vendor/qbench` (vendored from quasar-bench `client/`, same provenance rule as `bench.py`). |
+| `report-publish` / `report-attach` / `report-url` | `scripts/dx/report.sh` | commit completion reports + evidence on quasar-bench. A report is keyed by `REPO` + `COMMIT` (the merge SHA; `COMMIT=HEAD`/branch resolves locally). `report-publish REPORT=<md|html> TITLE=… [SUMMARY ISSUES PRS RUNS TAGS PIN=1]` creates or replaces the body; `report-attach COMMIT=… FILE=… [ROLE=screenshot\|video\|log\|bundle\|other CAPTION=…]` uploads evidence (role inferred from the extension; video and bundles are pruned after 90 d unless pinned, screenshots and the report never); `report-url COMMIT=…` prints the stable page URL without a request. `HOST` is not used: the server and key come only from `BENCH_URL` / `BENCH_KEY` or qbench's config, and with neither the script stops and says to run `qbench doctor`. The `RESULT` line carries the page URL for your own use; in a commit body or an issue cite the report by path ("bench report accreleus/quasar <sha>"), never by host name. The CLI is an installed `qbench`, else the vendored `scripts/dx/vendor/qbench` (`QBENCH=<path>` overrides). Sprint reports go through `qbench sprint put` directly (the `quasar-bench-sprint-report` skill). |
 | `bench-retro` | `scripts/dx/bench_retro.sh` | replays an archived run manifest (`--manifest FILE`) into the service. The script's default manifest path, `docs/reports/2026-08-16-abr-ladder/bench-retro-manifest.json`, does not exist in this repo — it held the archived runs that predate the service, and is not in the public repository — so `--manifest` is effectively required here. |
 | — | `scripts/dx/bench_table.py` | renders a `/v1/stats` cross-tab as markdown. `--window` defaults to `auto`: it probes `GET /v1/runs/{id}/phases` and scopes to `impaired` when the runs have one. `--window run` for the whole run. |
 
@@ -197,9 +235,12 @@ there for exactly this, and a filter that changes neither did not apply.
 
 `bench-run` and `bench-suite` launch sessions and mutate host settings, so they
 carry the same **typed** `HOST=<host>` guard as `up/down/restart/rebuild/abr-ladder`.
-The vendored quasar-bench client is `scripts/dx/vendor/bench.py`; it records its
-source commit in a header and is a verbatim copy — re-vendor, don't patch.
-`bench_submit.py` warns when it is older than the version the service publishes.
+The vendored quasar-bench client is the pair `scripts/dx/vendor/bench.py` +
+`scripts/dx/vendor/qbench` (qbench 1.7.0, text form: `python3 scripts/dx/vendor/qbench …`).
+Each records its upstream commit and git blob in a header and is otherwise a verbatim
+copy; `make verify` checks both. Re-vendor, don't patch. `bench_submit.py` warns when it
+is older than the CLI version the server ships (`/cli/version`). The client's own
+localhost `DEFAULT_URL` is upstream's; no repo script ever reaches it.
 
 **A whole-run aggregate cannot answer "was the stream better under impairment"** —
 the clean baseline and recovery holds outvote the impaired window (over the ladder
@@ -241,13 +282,23 @@ does not agree with; do the same in anything else that writes host settings.
 | Rust code | + `make test-rust` (runs in the `quasar-agent-dev` container) |
 | Web code | + `make test-web` — includes a `web/src/api/schema.d.ts` drift check against `protocol/openapi.yaml` (the `npm run gen:api` output; Go's `TestOpenAPIDrift` counterpart); UI surfaces additionally need the design-handoff visual check (CLAUDE.md) |
 | Pre-merge to develop | `make preflight` |
-| Pipeline / encoder / streaming | remote validation on the gpu-test host (`quasar-host`, `quasar-session` skills) — a compiling pipeline is not a working pipeline |
+| Pipeline / encoder / streaming | remote validation on the gpu-test host (`quasar-host`, `quasar-session` skills) — a compiling pipeline is not a working pipeline — **+ `make bench-check`** on runs posted for the new commit before it merges into `develop` (exit 3 blocks; exit 4 is stated in the summary, never called a pass). See "Performance evidence" above |
 | Images / deploy | `quasar-image` skill; contract must pass 150/150 |
 | A candidate app image (steam/kde/xfce/gnome) | `make qa IMAGE=<tag> PROFILE=<name> HOST=<role>` — launches real sessions on a GPU stack and emits one self-contained `report.html` (launch/decode, oracle screenshot, per-device input, clean shutdown, teardown). Repoints the app at the candidate and restores it on exit. |
 
 A ticket is DONE only when its build + tests pass at the level above. Test before commit;
 commit per unit of work (see CLAUDE.md git contract; branches come off `develop` and merge
 back to `develop` — no PR; only `develop → main` is sign-off-gated).
+
+Landing a branch into `develop`, in order:
+
+1. The verification level above is green, and `CHANGELOG.md` `## Unreleased` has its line.
+2. **Streaming-path change:** runs for the branch head are posted, then `make bench-check`.
+   Exit 0: quote the verdict. Exit 3: stop, explain or fix each regressed metric. Exit 4:
+   you may land, but the summary says "qbench check: nothing comparable".
+3. Merge into `develop` and push.
+4. Close out: publish or update the report — `make report-publish` for this landing, or
+   `qbench sprint put` at sprint end — and cite it by report path in the issue.
 
 ## Destructive operations — explicit authorization required
 

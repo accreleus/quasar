@@ -23,8 +23,8 @@ upsert, so re-running this is always safe.
 Usage:
     BENCH_URL=... BENCH_KEY=... scripts/dx/bench_register_budget_metrics.py [--dry-run]
 
-Environment: BENCH_URL, BENCH_KEY (never committed — pull the harness key from
-the stack's own deploy/.env at run time, per docs/testing-bench-mode.md).
+Environment: BENCH_URL / BENCH_KEY, else qbench's own config
+(~/.config/qbench/{url,key}); see scripts/dx/bench_config.py. Never committed.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.join(DX_DIR, "vendor"))
 sys.path.insert(0, DX_DIR)  # thresholds.py — see bench_submit.py's comment on this
 
 from bench import Bench, BenchError  # noqa: E402
+from bench_config import bench_env, bench_url  # noqa: E402  (same directory)
 import thresholds  # noqa: E402  (scripts/dx/thresholds.py, same directory)
 
 # (key, better, unit, regression_pct)
@@ -177,7 +178,8 @@ def main(argv=None) -> int:
         print("\n%d metric keys (dry-run, nothing POSTed)" % len(METRICS))
         return 0
 
-    b = Bench(args.url, args.key)
+    bench_env()  # BENCH_URL / BENCH_KEY, else qbench's ~/.config/qbench
+    b = Bench(bench_url(args.url), args.key)
     ok, failed = 0, []
     for key, better, unit, pct in METRICS:
         try:

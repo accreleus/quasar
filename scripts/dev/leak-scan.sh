@@ -133,6 +133,35 @@ while IFS= read -r line || [ -n "$line" ]; do
   fi
 done <<<"$operator_raw"
 
+# --- the bench server, from qbench's own config --------------------------------
+#
+# The quasar-bench server's address is operator-local too: qbench keeps it in
+# ${XDG_CONFIG_HOME:-~/.config}/qbench/url, outside every repository, and the
+# repo's scripts only ever read BENCH_URL or that file. When the file exists at
+# scan time, its host — and, for a dotted name of three or more labels, the
+# parent domain — join the operator patterns, so a commit or an issue that pastes
+# the real bench address fails. Loopback is skipped (test fixtures use it). The
+# value is never printed. LEAK_SCAN_BENCH_URL_FILE points elsewhere (tests).
+bench_url_file="${LEAK_SCAN_BENCH_URL_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/qbench/url}"
+if [ -r "$bench_url_file" ]; then
+  bench_host="$(sed -n '1{s#^[A-Za-z][A-Za-z0-9+.-]*://##;s#^[^@/]*@##;s#[:/?].*$##;p;}' "$bench_url_file" | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
+  case "$bench_host" in
+    '' | localhost | 127.* | '[::1]') ;;
+    *)
+      bench_names=("$bench_host")
+      if ! [[ "$bench_host" =~ ^[0-9.]+$ ]]; then
+        IFS=. read -r -a bench_labels <<<"$bench_host"
+        if [ "${#bench_labels[@]}" -ge 3 ]; then
+          bench_names+=("${bench_host#*.}")
+        fi
+      fi
+      for bench_name in "${bench_names[@]}"; do
+        OPERATOR_TREE_PATTERNS+=("$(printf '%s' "$bench_name" | sed 's/[][\.*^$()+?{}|]/\\&/g')")
+      done
+      ;;
+  esac
+fi
+
 if [ $((${#OPERATOR_TREE_PATTERNS[@]} + ${#OPERATOR_ISSUE_PATTERNS[@]})) -eq 0 ]; then
   if [ "${LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS:-0}" = 1 ]; then
     echo "leak-scan: operator patterns are required (LEAK_SCAN_REQUIRE_OPERATOR_PATTERNS=1) but none were loaded — refusing to report a generic-only scan as clean." >&2
@@ -290,7 +319,8 @@ network. Fix the file — do not weaken this script:
   LAN address     -> a role name, or an RFC 5737 documentation address
                      (192.0.2.x / 198.51.100.x / 203.0.113.x), or <your-host-ip>
   absolute path   -> a repo-relative path
-  personal domain -> an env var (BENCH_URL / QUASAR_BENCH_URL) with no default
+  personal domain -> an env var with no default (the bench server: BENCH_URL,
+                     else qbench's own ~/.config/qbench/url)
   ssh key / alias -> a lookup in .claude/skills/_shared/hosts.json (untracked)
 
 Real addresses and keys belong in .claude/skills/_shared/hosts.json, which is

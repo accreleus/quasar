@@ -109,7 +109,7 @@ export VERSION DRY_RUN
         nightly-budget-install nightly-budget-run nightly-budget-status qa \
         admin-token session-list session-verdict session-metrics session-trace \
         session-bundle session-capture session-logs session-diagnose \
-        report-publish report-attach report-url
+        report-publish report-attach report-url bench-check bench-status
 
 ## ── Getting started ─────────────────────────────────────────────────────────
 
@@ -123,6 +123,7 @@ help: ## Show this help (default target)
 	@printf '       LEVEL=ui|api|session|all  TARGET=local|<base-url>  KEEP=1 (validate — leave the local stack up)\n'
 	@printf '       URL=<base-url>  ROUTES=all|id,id,...  KEY=<dev-agent-key>  BEFORE=<dir>  AFTER=<dir>  OUT=<dir> (ui-audit)\n'
 	@printf '       RUN=<run-id>|latest  NAME=<suite/scenario> (bench-budget, bench-baseline)\n'
+	@printf '       BASE=<sha>  WINDOW=impaired|baseline|recovery|<phase> (bench-check)  SPRINT=<slug> (bench-status)\n'
 	@printf '       SID=<uuid>|latest  WINDOW=<from_ms>,<to_ms>  SINCE=10m  N=<rows>  GREP=<pat>  JSON=1 (session-*)\n'
 	@printf '       KIND=pipeline_dot|encoder_props|burst_stats|all  WINDOWS=<n>  WINDOW_MS=<ms>  (session-capture)\n'
 	@printf 'Instance: %s\n\n' "$$($(DX)/common.sh instance)"
@@ -241,15 +242,23 @@ homes-gc: ## Sweep throwaway (agent-*) managed homes on a host NOW — HOST=devb
 	@bash $(DX)/homes_gc.sh
 
 ## ── Benchmarks (quasar-bench results service) ───────────────────────────────
-# BENCH_URL + BENCH_KEY come from the environment — never commit the key.
+# The server and key resolve the way qbench does: BENCH_URL / BENCH_KEY, else
+# ~/.config/qbench/{url,key} (`qbench doctor` checks both). No default server;
+# never commit either value.
 
-report-publish: ## Publish a completion report to quasar-bench — REPORT=<file> TITLE=<text> [COMMIT=HEAD ISSUES="" RUNS="" TAGS="" PIN=1] HOST=devbox
+bench-check: ## Landing gate: `qbench check` HEAD vs the last benched ancestor (0 clean, 3 regressed, 4 nothing comparable = NOT a pass) — [BASE=<sha> WINDOW=impaired]
+	@bash $(DX)/bench_check.sh check
+
+bench-status: ## Review status of your bench reports when resuming work (read-only) — [SPRINT=<slug>]
+	@bash $(DX)/bench_check.sh status
+
+report-publish: ## Publish a completion report to quasar-bench — REPORT=<file> TITLE=<text> [COMMIT=HEAD ISSUES="" RUNS="" TAGS="" PIN=1]
 	@bash $(DX)/report.sh publish
 
-report-attach: ## Attach evidence (screenshot/video/log/bundle) to a report — COMMIT=<sha> FILE=<path> [ROLE= CAPTION=] HOST=devbox
+report-attach: ## Attach evidence (screenshot/video/log/bundle) to a report — COMMIT=<sha> FILE=<path> [ROLE= CAPTION=]
 	@bash $(DX)/report.sh attach
 
-report-url: ## Print the stable report URL for a commit — COMMIT=<sha> HOST=devbox
+report-url: ## Print the stable report URL for a commit (no request) — COMMIT=<sha>
 	@bash $(DX)/report.sh url
 
 bench-submit: ## Submit an existing soak/observe run dir — DIR=<dir> ARGS='--suite ... --scenario ...'
