@@ -495,6 +495,31 @@ func TestPickAndRecheckAgree(t *testing.T) {
 	if maxAttempt != 0 {
 		t.Fatalf("a vetoed launch burned %d retries; the veto must reject at the PICK, not the re-check", maxAttempt+1)
 	}
+
+	// The codec constraint (#304) is a gate in both queries too: a constrained
+	// launch must land, and a refused one be refused, on the first attempt.
+	sampleVram(t, pool, s.gpuID, 4096, 12288, 0)
+	setGPUCodecsRaw(t, pool, s.hostID, 0, `["h264","av1"]`)
+	for i := 0; i < 2; i++ {
+		maxAttempt = 0
+		p := launchParams(s)
+		p.RequireCodec = "av1"
+		if _, err := store.ScheduleAndCreate(ctx, p); err != nil {
+			t.Fatalf("constrained launch %d: %v", i+1, err)
+		}
+		if maxAttempt != 0 {
+			t.Fatalf("a codec-constrained launch retried %d times: the pick and the re-check disagree on the codec gate", maxAttempt)
+		}
+	}
+	maxAttempt = 0
+	p := launchParams(s)
+	p.RequireCodec = "h265"
+	if _, err := store.ScheduleAndCreate(ctx, p); !errors.Is(err, ErrNoHostAvailable) {
+		t.Fatalf("h265 on an h264+av1 GPU: got %v want ErrNoHostAvailable", err)
+	}
+	if maxAttempt != 0 {
+		t.Fatalf("a codec-refused launch burned %d retries; the gate must reject at the PICK", maxAttempt+1)
+	}
 }
 
 // --- swap fit ---------------------------------------------------------------

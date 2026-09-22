@@ -245,6 +245,9 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 		// it is an installed catalog entry.
 		AppImage: app.Image(),
 	}
+	if p.RequireCodec, err = codecConstraint(launchProfile, ov); err != nil {
+		return LaunchResult{}, err
+	}
 
 	// §5: a derived tile is placed with a HARD host pin, not an affinity. Locality
 	// is only a sort preference, and a tile provisions nothing (RequireHome
@@ -281,11 +284,11 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	c.health.logGPUUtilization(ctx, deref(sess.HostID), deref(sess.GPUID))
 
 	// Post-placement: rung resolution, cert cap, re-resolve, one write. Placement
-	// is codec-blind (§3.1), so the rung resolves here, where the host is known.
+	// picks the GPU, not the rung, so the rung resolves here, where the GPU is known.
 	if err := c.applyPostPlacement(ctx, &sess, launchProfile, lp, ov, env, source); err != nil {
-		// A stream.codec override named a codec no rung uses, or one the placed
-		// host cannot encode. Fail the session, releasing its reservation, rather
-		// than dispatching a doomed assignment.
+		// The codec constraint pre-empts both codec refusals; this stays the
+		// backstop. Fail the session, releasing its reservation, rather than
+		// dispatching a doomed assignment.
 		c.failSession(sess.ID, fmt.Sprintf("rung resolution failed: %v", err))
 		return LaunchResult{}, err
 	}

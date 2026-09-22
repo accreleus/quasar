@@ -64,6 +64,13 @@ type CreateParams struct {
 	// PinHostID restricts the scheduler to one host's GPUs. Placement policy and
 	// capacity within it are unchanged.
 	PinHostID string
+	// PinGPUIndex narrows PinHostID to one GPU (the cert bench); ignored without
+	// a host pin, since an index is per host.
+	PinGPUIndex *int32
+	// RequireCodec is the codec constraint (#304; control-api.md "Admission
+	// control" gate (c)), wire vocabulary, "" for none. Not what the row is
+	// inserted with; that is Codec.
+	RequireCodec string
 }
 
 // homeAppID is the storage key for this launch. Every storage-keyed site on this
@@ -154,7 +161,7 @@ func (s *Store) ScheduleAndCreate(ctx context.Context, p CreateParams) (Session,
 	}
 	// Retry budget exhausted under sustained same-GPU contention: report the
 	// retryable "busy" code.
-	return Session{}, ErrCapacityExhausted
+	return Session{}, withCodecConstraint(p, ErrCapacityExhausted)
 }
 
 // scheduleAttempt runs one placement transaction. It returns retry=true (with a
@@ -381,16 +388,46 @@ func (s *Store) vramVeto(p CreateParams) VramAdmission {
 	return s.vram
 }
 
-// classifyReject splits the contract's two 503s: no online GPU whose TOTALS fit
+// CodecConstraintRejection lets a codec-constrained no_host_available or
+// capacity_exhausted name its codec. It unwraps to the refusal it wraps, so
+// errors.Is/As and the status mapping are unchanged.
+type CodecConstraintRejection struct {
+	err   error
+	Codec string // wire vocabulary
+}
+
+func (e *CodecConstraintRejection) Error() string {
+	return fmt.Sprintf("%v (codec constraint %s)", e.err, e.Codec)
+}
+
+func (e *CodecConstraintRejection) Unwrap() error { return e.err }
+
+// withCodecConstraint wraps only the two refusals that name the codec; a
+// readiness refusal must name nothing (control-api.md "Evidence-gated readiness").
+func withCodecConstraint(p CreateParams, err error) error {
+	if p.RequireCodec == "" ||
+		!(errors.Is(err, ErrNoHostAvailable) || errors.Is(err, ErrCapacityExhausted)) {
+		return err
+	}
+	return &CodecConstraintRejection{err: err, Codec: p.RequireCodec}
+}
+
+func classifyReject(ctx context.Context, tx pgx.Tx, cand candidacy) error {
+	return withCodecConstraint(cand.p, classifyRejectPlain(ctx, tx, cand))
+}
+
+// classifyRejectPlain splits the contract's two 503s: no online GPU whose TOTALS fit
 // ⇒ ErrNoHostAvailable, vs totals fit but availability does not ⇒
-// ErrCapacityExhausted (retryable).
+// ErrCapacityExhausted (retryable). The codec constraint is in the totals probe,
+// so every capable GPU busy is capacity_exhausted and none at all is
+// no_host_available.
 //
 // The totals check must stay slots-only. The VRAM floor here contradicts §4.1's
 // structural abstain (a GPU with vram_mb_total <= floor is never vetoed, so it
 // is servable) and was proved wrong live on an APU host reporting a 512 MB UMA
 // carve-out against the 1024 MB default floor: ordinary slot exhaustion came
 // back as a non-retryable no_host_available.
-func classifyReject(ctx context.Context, tx pgx.Tx, cand candidacy) error {
+func classifyRejectPlain(ctx context.Context, tx pgx.Tx, cand candidacy) error {
 	// The image gate DOES belong here, unlike the VRAM floor: a fleet where no
 	// host has the app's managed image ready genuinely cannot serve the launch.
 	// totalsQuery encodes both that inclusion and the veto's exclusion.

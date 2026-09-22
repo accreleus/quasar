@@ -25,8 +25,9 @@ concept), "quality level".
 
 **Rung resolution** — the post-placement walk that picks which rung of the
 selected chain a placed session actually starts at, given the host's encoder
-set, the device's decode capability, and the failure history. Codec-blind
-placement is deliberate: the host is chosen first, the rung second.
+set, the device's decode capability, and the failure history. The GPU is still
+chosen first and the rung second; an explicit codec is a *codec constraint* on
+that choice.
 
 **Cert cap** — the encoder-certification downgrade. A host's measured verdict
 for the resolved rung can be `unsafe` (or `capped` without stable live writes),
@@ -354,6 +355,13 @@ dropping it from the union), and is never empty: H.264 with no usable GPU or no
 registry. Each GPU's set is reported as `capacity.gpus[].codecs` and stored as `gpus.codecs`;
 a GPU with none stored (an older agent) inherits its host's set. _Avoid_: "host codec set" for a single GPU's set, or
 vice versa.
+
+**Codec constraint** — an explicit codec on a launch (`stream.codec`), applied at
+placement as a candidacy gate: only a GPU whose codec set contains it is a candidate, in
+the pick, the re-check, the totals probe and every refusal diagnosis alike. All capable
+GPUs busy is `capacity_exhausted`; none online is `no_host_available`; nothing is ever
+downgraded to another codec. An Auto launch carries no constraint. _Avoid_: "codec
+override" for the placement meaning.
 
 **Evidence** — a host fact that came from exercising the real path, or a
 definitive local observation such as an unreachable container runtime. Only

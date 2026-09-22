@@ -6,7 +6,32 @@ import {
   MAX_NO_HOST_RETRY_WAIT_MS,
   MIN_RETRY_DELAY_MS,
   NO_HOST_RETRY_DELAY_MS,
+  waitingToastCopy,
 } from "./capacityRetry";
+
+describe("waitingToastCopy", () => {
+  it("names the hand-picked codec: the wait is for a GPU that can encode it (#304)", () => {
+    expect(waitingToastCopy("slot", "Portal", "av1")).toEqual({
+      title: "Waiting for a GPU that can encode AV1…",
+      body: "Portal will launch as soon as one is free.",
+    });
+    expect(waitingToastCopy("host", "Portal", "h265")).toEqual({
+      title: "Waiting for a GPU that can encode HEVC to come online…",
+      body: "Portal will launch as soon as one is ready.",
+    });
+  });
+
+  it("keeps the slot and host copy for a launch without a codec", () => {
+    expect(waitingToastCopy("slot", "Portal")).toEqual({
+      title: "Waiting for a slot to free up…",
+      body: "Portal will launch as soon as one is free.",
+    });
+    expect(waitingToastCopy("host", "Portal", undefined)).toEqual({
+      title: "Waiting for a host to come online…",
+      body: "Portal will launch as soon as a host is ready.",
+    });
+  });
+});
 
 describe("decideCapacityRetry", () => {
   it("honours the server's Retry-After over the default delay", () => {

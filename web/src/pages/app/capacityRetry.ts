@@ -9,6 +9,8 @@
  * or give-up. No I/O/timers — caller (AppHomeNext's launchApp) owns the `setTimeout`.
  */
 
+import { codecDisplayName } from "../../lib/codecDisplay";
+
 /** Retry-After to assume when the server sent none (matches the control
  *  plane's own default — handler.go's `capacityExhaustedRetryAfterSeconds`). */
 export const DEFAULT_RETRY_DELAY_MS = 5_000;
@@ -72,4 +74,34 @@ export function decideCapacityRetry(
     return { kind: "give-up" };
   }
   return { kind: "retry", delayMs };
+}
+
+/** The toast a quietly retrying launch shows. A hand-picked codec is a
+ *  placement gate (#304), so the wait is for a GPU that can encode it. */
+export function waitingToastCopy(
+  reason: "slot" | "host",
+  appName: string,
+  codec?: string,
+): { title: string; body: string } {
+  const label = codecDisplayName(codec);
+  if (label) {
+    return reason === "host"
+      ? {
+          title: `Waiting for a GPU that can encode ${label} to come online…`,
+          body: `${appName} will launch as soon as one is ready.`,
+        }
+      : {
+          title: `Waiting for a GPU that can encode ${label}…`,
+          body: `${appName} will launch as soon as one is free.`,
+        };
+  }
+  return reason === "host"
+    ? {
+        title: "Waiting for a host to come online…",
+        body: `${appName} will launch as soon as a host is ready.`,
+      }
+    : {
+        title: "Waiting for a slot to free up…",
+        body: `${appName} will launch as soon as one is free.`,
+      };
 }

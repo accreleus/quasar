@@ -285,9 +285,9 @@ func TestSessionCodecOverride(t *testing.T) {
 	}
 }
 
-// TestSessionCodecOverrideHostUnsupported: an override for a codec the placed
-// host cannot encode fails the launch cleanly (ErrCodecUnsupportedByHost) rather
-// than dispatching a doomed assignment.
+// TestSessionCodecOverrideHostUnsupported: an override for a codec no GPU can
+// encode is refused at placement (#304), no_host_available naming the codec,
+// rather than reserved and then failed with the old 409.
 func TestSessionCodecOverrideHostUnsupported(t *testing.T) {
 	pool := testDB(t)
 	userID, appID, hostID := seed1080pApp(t, pool)
@@ -301,8 +301,12 @@ func TestSessionCodecOverrideHostUnsupported(t *testing.T) {
 		AppID: appID, ProfileID: "1080p60", IsAdmin: true,
 		Override: StreamOverride{Codec: &av1},
 	})
-	if !errors.Is(err, ErrCodecUnsupportedByHost) {
-		t.Fatalf("override av1 on h264-only host: got err=%v, want ErrCodecUnsupportedByHost", err)
+	if !errors.Is(err, ErrNoHostAvailable) || constrainedCodec(err) != "av1" {
+		t.Fatalf("override av1 on h264-only host: got err=%v, want ErrNoHostAvailable naming av1", err)
+	}
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM sessions`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("a refused launch persisted %d session row(s) (err %v)", n, err)
 	}
 }
 

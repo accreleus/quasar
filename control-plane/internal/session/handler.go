@@ -439,6 +439,8 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, ErrRungCodecNotAvailable):
 		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, err.Error())
 		return
+	// Unreachable while the codec constraint gates placement; kept as the
+	// invariant's backstop.
 	case errors.Is(err, ErrCodecUnsupportedByHost):
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict,
 			"the requested codec is not supported by the assigned host's encoder")
@@ -484,9 +486,14 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, ErrParentDisabled):
 		writeParentDisabled(w, err)
 		return
+	// A codec-constrained refusal names the codec, and nothing else.
+	// semantics: control-api.md §Admission control
 	case errors.Is(err, ErrNoHostAvailable):
-		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable,
-			"no host is available to serve this launch")
+		msg := "no host is available to serve this launch"
+		if codec := constrainedCodec(err); codec != "" {
+			msg = "no host has a GPU that can encode " + codec
+		}
+		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable, msg)
 		return
 	// Names no check, scope, GPU or host: readiness detail is admin-only and
 	// lives on the host body. No Retry-After — an admin, not time, clears it.
@@ -500,8 +507,11 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		// right after a peer's DELETE bounces here for the ~15 s that teardown
 		// takes. Retry-After lets a polling client wait rather than error (#494).
 		w.Header().Set("Retry-After", capacityExhaustedRetryAfterSeconds)
-		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeCapacityExhausted,
-			"all capacity is in use; try again shortly")
+		msg := "all capacity is in use; try again shortly"
+		if codec := constrainedCodec(err); codec != "" {
+			msg = "no free GPU can encode " + codec + "; try again shortly"
+		}
+		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeCapacityExhausted, msg)
 		return
 	case err != nil:
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not launch session")
