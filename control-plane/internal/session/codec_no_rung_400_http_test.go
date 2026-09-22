@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -83,20 +84,10 @@ func TestPostSessionsExplicitCodecNoRungReturns400(t *testing.T) {
 		t.Error("error.message is empty")
 	}
 	// Message should mention the codec override (av1) and the profile (h264-only).
-	if !hasSubstring(msg, "av1") {
+	if !strings.Contains(msg, "av1") {
 		t.Errorf("message does not mention codec av1: %q", msg)
 	}
-	if !hasSubstring(msg, "h264-only") {
+	if !strings.Contains(msg, "h264-only") {
 		t.Errorf("message does not mention profile h264-only: %q", msg)
 	}
-}
-
-// hasSubstring checks if a string contains a substring.
-func hasSubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }
