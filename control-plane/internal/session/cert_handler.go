@@ -561,15 +561,15 @@ func (c *Coordinator) launchCertCell(
 		"codec", wire, "bitrate_kbps", bitrateKbps)
 
 	// The bench must stream the codec it labels (0041): refuse up front when
-	// the host can't encode it, rather than an opaque "never reached running".
-	hostCodecs, hcErr := c.store.HostCodecs(ctx, hostID)
-	if hcErr != nil {
-		c.log.Warn("SPT-06: host codec set load failed, assuming h264-only",
-			"host_id", hostID, "err", hcErr)
-		hostCodecs = nil
+	// the pinned GPU can't encode it, rather than an opaque "never reached running".
+	gpuCodecs, gcErr := c.store.GPUCodecs(ctx, hostID, int32(gpuIndex))
+	if gcErr != nil {
+		c.log.Warn("SPT-06: GPU codec set load failed, assuming h264-only",
+			"host_id", hostID, "gpu_index", gpuIndex, "err", gcErr)
+		gpuCodecs = nil
 	}
-	if !codecSet(hostCodecs)[wire] {
-		return certCellLaunchOut{}, fmt.Errorf("host cannot encode %s (rung %s): %w", wire, prof.ID, ErrCodecUnsupportedByHost)
+	if !codecSet(gpuCodecs)[wire] {
+		return certCellLaunchOut{}, fmt.Errorf("GPU %d cannot encode %s (rung %s): %w", gpuIndex, wire, prof.ID, ErrCodecUnsupportedByHost)
 	}
 
 	userID, err := c.store.EnsureBenchUser(ctx)

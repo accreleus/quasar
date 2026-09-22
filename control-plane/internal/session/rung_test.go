@@ -313,6 +313,41 @@ func TestFloorWithNoH264RungDispatchesTheLastRung(t *testing.T) {
 	}
 }
 
+// TestResolveRungAgainstGPUSet: clamp 1's set is the placed GPU's (#303).
+func TestResolveRungAgainstGPUSet(t *testing.T) {
+	high := []profile.Profile{
+		r("1440p60-av1", profile.CodecAV1, 1440),
+		r("1440p60-hevc", profile.CodecHEVC, 1440),
+		r("1080p60-h264", profile.CodecH264, 1080),
+	}
+	cases := []struct {
+		name     string
+		gpu      []string
+		wantRung string
+		wantWire string
+	}{
+		{"GPU without av1 lands on hevc", []string{"h264", "h265"}, "1440p60-hevc", "h265"},
+		{"GPU with av1 lands on av1", []string{"h264", "h265", "av1"}, "1440p60-av1", "av1"},
+		{"h264-only GPU lands on the h264 rung", []string{"h264"}, "1080p60-h264", "h264"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, dec, err := resolveRung(high, tc.gpu, hostEncoderCaps{}, probeAt(true, true, 2160), nil, StreamOverride{})
+			if err != nil {
+				t.Fatalf("err = %v", err)
+			}
+			if got.ID != tc.wantRung || dec.Result != tc.wantWire {
+				t.Errorf("rung/wire = %q/%q, want %q/%q", got.ID, dec.Result, tc.wantRung, tc.wantWire)
+			}
+			for _, v := range dec.Considered {
+				if !v.Selected && v.Reject != rejectHostEncoder {
+					t.Errorf("%s rejected_by = %q, want %q", v.ID, v.Reject, rejectHostEncoder)
+				}
+			}
+		})
+	}
+}
+
 // TestResolveRungEmptyChain: a rung-less chain is a refusal, not a silent
 // dispatch of nothing.
 func TestResolveRungEmptyChain(t *testing.T) {

@@ -402,11 +402,22 @@ func (c *Coordinator) gatherStreamInputs(
 	if sess.HostID != nil {
 		hc, err := c.store.HostCodecs(ctx, *sess.HostID)
 		if err != nil {
-			c.log.Warn("rung: host codec set load failed, assuming h264-only",
+			c.log.Warn("rung: host codec set load failed, logging it as h264-only",
 				"host_id", *sess.HostID, "err", err)
 			in.HostCodecs = []string{wireCodecH264}
 		} else {
 			in.HostCodecs = hc
+		}
+		// Clamp 1's set. A failed read floors at h264, never the host union: the
+		// union is what dispatched AV1 to a GPU that cannot encode it (#303).
+		in.GPUCodecs = []string{wireCodecH264}
+		if sess.GPUIndex != nil {
+			if gc, err := c.store.GPUCodecs(ctx, *sess.HostID, *sess.GPUIndex); err != nil {
+				c.log.Warn("rung: GPU codec set load failed, assuming h264-only",
+					"host_id", *sess.HostID, "gpu_index", *sess.GPUIndex, "err", err)
+			} else {
+				in.GPUCodecs = gc
+			}
 		}
 		known, hw, encName, err := c.store.HostHardwareEncoder(ctx, *sess.HostID)
 		if err != nil {
@@ -516,6 +527,7 @@ func (c *Coordinator) logStreamPlan(in StreamInputs, plan StreamPlan) {
 			"override", w.Decision.Override,
 			"considered", formatRungVerdicts(w.Decision.Considered),
 			"host_codecs", in.HostCodecs,
+			"gpu_codecs", in.GPUCodecs,
 			"host_hw_encoder_known", in.HostEncoder.Known,
 			"host_hw_encoder", in.HostEncoder.HardwareEncoder,
 			// Raw map, so a clamp-6 rejection can be read against the number that
@@ -568,16 +580,16 @@ func (c *Coordinator) applyLegacyCodecOverride(ctx context.Context, sess *Sessio
 	if override == "" || override == sess.Codec {
 		return nil
 	}
-	hostCodecs := []string{wireCodecH264}
-	if sess.HostID != nil {
-		if hc, err := c.store.HostCodecs(ctx, *sess.HostID); err != nil {
-			c.log.Warn("codec: host codec set load failed, assuming h264-only",
-				"host_id", *sess.HostID, "err", err)
+	gpuCodecs := []string{wireCodecH264}
+	if sess.HostID != nil && sess.GPUIndex != nil {
+		if gc, err := c.store.GPUCodecs(ctx, *sess.HostID, *sess.GPUIndex); err != nil {
+			c.log.Warn("codec: GPU codec set load failed, assuming h264-only",
+				"host_id", *sess.HostID, "gpu_index", *sess.GPUIndex, "err", err)
 		} else {
-			hostCodecs = hc
+			gpuCodecs = gc
 		}
 	}
-	if !codecSet(hostCodecs)[override] {
+	if !codecSet(gpuCodecs)[override] {
 		return ErrCodecUnsupportedByHost
 	}
 	c.log.Info("codec resolved", "session_source", source, "override", override, "result", override)
