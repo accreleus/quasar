@@ -13,6 +13,7 @@ import { LOW_STORAGE_PCT } from "../../../lib/fleet/deriveAlerts";
 import { bytesFromMb } from "../../../lib/format/bytes";
 import { relativeTime } from "../../../lib/format/relativeTime";
 import { primaryGpuLabel } from "../../../lib/gpu";
+import { GpuCodecChips } from "./GpuCodecChips";
 import { percentOf, storageTotals, tone, uptimeSince, utilisation } from "./hostDerived";
 import {
   installModeHint,
@@ -138,8 +139,15 @@ export function HostExpansion({ host, gpus, gpuError, actionError, now }: HostEx
               key={gpu.gpu_id}
               label={`${primaryGpuLabel(gpu.vendor, gpu.model)} #${gpu.gpu_index}`}
               value={
-                <span className="num">
-                  {gpu.slots_reserved}/{gpu.slots_total} slots · {vramText(gpu)}
+                <span
+                  style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}
+                >
+                  <span className="num">
+                    {gpu.slots_reserved}/{gpu.slots_total} slots · {vramText(gpu)}
+                  </span>
+                  <span style={{ display: "flex", gap: "var(--s2)", flexWrap: "wrap", justifyContent: "flex-end" }}>
+                    <GpuCodecChips codecs={gpu.codecs} />
+                  </span>
                 </span>
               }
             />

@@ -25,6 +25,9 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Per-GPU codec chips (#302).** The fleet host expansion and the host-detail capacity card
+  show each GPU's codec set as chips beside its slots, in fixed order (H.264, HEVC, AV1); a GPU
+  inheriting a host that has never reported codecs shows a muted "Not reported" chip instead.
 - **Codec probes (#300).** After a GPU's H.264 media probe passes, the agent runs the same
   probe on that GPU for each codec above the floor its encoder can build (HEVC, AV1): 10
   frames within 10 s, passing when the encoder reaches PLAYING and produces them. The result

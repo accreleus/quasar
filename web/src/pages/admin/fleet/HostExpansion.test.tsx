@@ -11,7 +11,7 @@ import { render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it } from "vitest";
 
-import type { Host } from "../../../api/types";
+import type { GPUAvailability, Host } from "../../../api/types";
 import { HostExpansion } from "./HostExpansion";
 
 const NOW = Date.parse("2026-08-29T12:00:00Z");
@@ -47,10 +47,30 @@ function host(over: Partial<Host> = {}): Host {
   } as Host;
 }
 
-function renderDrawer(over: Partial<Host> = {}) {
+function gpu(over: Partial<GPUAvailability> = {}): GPUAvailability {
+  return {
+    gpu_id: "g1",
+    gpu_index: 0,
+    vendor: "NVIDIA",
+    model: "NVIDIA GeForce RTX 5090",
+    vram_mb_total: 32768,
+    vram_mb_reserved: 0,
+    vram_mb_used: 21504,
+    vram_mb_free: 11264,
+    vram_sampled_at: new Date(NOW).toISOString(),
+    slots_total: 3,
+    slots_reserved: 2,
+    active_sessions: 2,
+    render_node: "/dev/dri/renderD128",
+    codecs: ["h264", "h265", "av1"],
+    ...over,
+  } as GPUAvailability;
+}
+
+function renderDrawer(over: Partial<Host> = {}, gpus: GPUAvailability[] | null | undefined = []) {
   return render(
     <MemoryRouter>
-      <HostExpansion host={host(over)} gpus={[]} gpuError={null} now={NOW} />
+      <HostExpansion host={host(over)} gpus={gpus} gpuError={null} now={NOW} />
     </MemoryRouter>,
   );
 }
@@ -101,5 +121,23 @@ describe("HostExpansion — the Build column", () => {
     for (const label of ["Commit", "Built", "Install", "Updater"]) {
       expect(within(fact(label)).getByText("Unknown")).toBeTruthy();
     }
+  });
+});
+
+describe("HostExpansion — GPUs and slots codec chips (#302)", () => {
+  it("shows a GPU's codecs beside its slots", () => {
+    renderDrawer({}, [gpu()]);
+
+    const row = fact(`GeForce RTX 5090 #0`);
+    expect(within(row).getByText("H.264")).toBeTruthy();
+    expect(within(row).getByText("HEVC")).toBeTruthy();
+    expect(within(row).getByText("AV1")).toBeTruthy();
+  });
+
+  it("shows a muted 'Not reported' chip for a GPU inheriting an unreported host set", () => {
+    renderDrawer({}, [gpu({ codecs: null })]);
+
+    const row = fact(`GeForce RTX 5090 #0`);
+    expect(within(row).getByText("Not reported")).toBeTruthy();
   });
 });
