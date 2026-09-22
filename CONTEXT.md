@@ -371,7 +371,9 @@ as a sort key only, after home locality and before load spread, so a free GPU th
 encodes a better codec beats a freer one that does not; it never excludes a GPU. A
 preference of H.264 alone (every usable GPU encodes it, and it is all a device with no
 probe can take) is empty, and an empty preference orders nothing. The legacy tier launch
-has none. _Avoid_: "codec priority", or calling it a constraint.
+has none. It weighs only the device side: a GPU whose host clamps (hardware encoder
+required, encoder throughput) rule out its best codec still ranks by that codec, so the
+result can be a lesser codec than another GPU offered, never a failure. _Avoid_: "codec priority", or calling it a constraint.
 
 **Evidence** — a host fact that came from exercising the real path, or a
 definitive local observation such as an unreachable container runtime. Only
