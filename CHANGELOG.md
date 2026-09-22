@@ -95,6 +95,7 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- Specification for per-GPU codec sets and codec-aware placement (#296), the design the #298–#307 slices are built against, in `docs/superpowers/specs/2026-09-22-296-per-gpu-codecs-spec.md`.
 - Validation record for the follow-ups run: #281/#282 landing, #285 and #287 fixes, and the hardware evidence behind the #284, #286 and #288 branches awaiting the owner, in `docs/reports/2026-09-21-followups-validation/`.
 - The compositor pin moves to `gst-wayland-display` `0b691b4` (#284): the fork's sync with upstream `stable`, including the cursor-hotspot fix, so a client cursor with a non-zero hotspot is drawn where the client means it, plus upstream's input tests and allocator/video-info changes. The #281 linear-first encode-src behaviour is unchanged; Quasar's GStreamer patches are unchanged.
 - **Diagnostic registration replaces exit on startup failure (#256).** When the agent's
