@@ -549,6 +549,16 @@ pub struct GpuCapacity {
     /// one. Additive — absent means unknown, and matching then fails open.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub driver_identity: Option<String>,
+    /// The GPU codec set (`agent-api.md` amendment 12, #302): wire codecs this GPU has
+    /// been shown to encode, `h264` always present when the GPU is usable
+    /// (`encode_slots_total > 0`). Sorted deterministically (wire vocabulary order).
+    /// Stamped by `crate::agent::apply_gpu_codecs` from the same per-GPU computation
+    /// `capacity.codecs` (the host union) derives from — never a second pass. Absent for
+    /// a zero-slot (pinned-out) GPU, which the control plane reads as "inherits the
+    /// host set". Replaced wholesale with the `gpus` set, like `render_node` and
+    /// `driver_identity` — no keep-if-absent rule of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codecs: Option<Vec<String>>,
 }
 
 /// Per-session stream parameters in a `session_assign` (mirrors the sessions
@@ -1371,6 +1381,7 @@ mod tests {
                 render_node: None,
                 device_path: None,
                 driver_identity: None,
+                codecs: None,
             }],
             gpu_detection: "ok".to_string(),
             gpu_detection_reason: None,
@@ -1387,6 +1398,7 @@ mod tests {
             .as_object()
             .unwrap()
             .contains_key("render_node"));
+        assert!(!json["gpus"][0].as_object().unwrap().contains_key("codecs"));
         assert!(!json
             .as_object()
             .unwrap()
@@ -1421,6 +1433,7 @@ mod tests {
                 render_node: Some("/dev/dri/by-path/pci-0000:04:00.0-render".to_string()),
                 device_path: Some("/dev/dri/renderD128".to_string()),
                 driver_identity: None,
+                codecs: Some(vec!["h264".to_string(), "h265".to_string()]),
             }],
             gpu_detection: "ok".to_string(),
             gpu_detection_reason: None,
@@ -1469,6 +1482,7 @@ mod tests {
             json["gpus"][0]["render_node"],
             "/dev/dri/by-path/pci-0000:04:00.0-render"
         );
+        assert_eq!(json["gpus"][0]["codecs"][1], "h265");
         assert_eq!(json["effective_settings"]["encoder"], "nvenc");
         assert_eq!(json["codecs"][1], "h265");
         // #506: the hint is an OBJECT per codec, extensible without a second amendment.
