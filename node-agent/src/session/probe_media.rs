@@ -437,8 +437,28 @@ struct Observed {
     /// The first bus ERROR not attributed to the decode leg, already formatted with its
     /// debug text.
     error: Option<String>,
+    /// `error` was posted by the encoder element itself, not another pipeline element.
+    error_from_encoder: bool,
     reached: Reached,
     pixel: PixelCheck,
+}
+
+/// The encoder element's own open failure, the signature of a device with no encoder for
+/// the codec (AMD VCN 3.x AV1). Deliberately narrow: `unsupported` is sticky (nothing
+/// re-probes it until the stack's identity changes), so a READY failure posted by any other
+/// element, or with no error, or with other text (a transient device loss, an unopenable
+/// render node) must stay `fail`.
+const ENCODER_OPEN_FAILURE_SIGNATURES: &[&str] = &["Failed to retrieve vulkan encoder"];
+
+/// #311: the codec probe stopped at NULL→READY because the encoder itself could not open.
+fn encoder_could_not_open(seen: &Observed) -> bool {
+    seen.reached == Reached::NotReady
+        && seen.error_from_encoder
+        && seen.error.as_deref().is_some_and(|e| {
+            ENCODER_OPEN_FAILURE_SIGNATURES
+                .iter()
+                .any(|sig| e.contains(sig))
+        })
 }
 
 /// Pass iff the pipeline reached PLAYING, the wanted frames arrived with no bus error, and
@@ -459,9 +479,7 @@ fn verdict(wanted: u64, seen: &Observed) -> ProbeVerdict {
             "{}: the encode pipeline could not reach {state} on {}: {why}",
             seen.encoder, seen.render_node
         );
-        // NULL→READY is where the encoder opens its codec on the device; a codec probe
-        // stuck there means the device has no such encoder (#311).
-        if seen.reached == Reached::NotReady && seen.codec != Codec::H264 {
+        if seen.codec != Codec::H264 && encoder_could_not_open(seen) {
             return ProbeVerdict::Unsupported(line);
         }
         return ProbeVerdict::Fail(line);
@@ -629,13 +647,13 @@ fn build_decode_leg(
 }
 
 /// The evidence for a failed state change: the encoder's own error over a downstream
-/// consequence (a not-negotiated from the parser), else the first posted.
-fn encoder_error_first(errors: Vec<(bool, String)>) -> Option<String> {
-    let first = errors.first().map(|(_, text)| text.clone());
+/// consequence (a not-negotiated from the parser), else the first posted. The flag says
+/// whether the chosen one came from the encoder.
+fn encoder_error_first(errors: Vec<(bool, String)>) -> Option<(bool, String)> {
+    let first = errors.first().cloned();
     errors
         .into_iter()
         .find(|(from_encoder, _)| *from_encoder)
-        .map(|(_, text)| text)
         .or(first)
 }
 
@@ -756,7 +774,10 @@ fn build_and_run(
                 }
                 next = bus.pop_filtered(&[gst::MessageType::Error]);
             }
-            let error = encoder_error_first(errors);
+            let (error_from_encoder, error) = match encoder_error_first(errors) {
+                Some((from_encoder, text)) => (from_encoder, Some(text)),
+                None => (false, None),
+            };
             teardown(&pipeline);
             return Ok(Observed {
                 codec,
@@ -764,6 +785,7 @@ fn build_and_run(
                 encoder: resolved.factory.clone(),
                 render_node: cfg.render_node.clone(),
                 error,
+                error_from_encoder,
                 reached: stuck,
                 pixel: PixelCheck::NotRun("the encode pipeline never started".into()),
             });
@@ -896,6 +918,8 @@ fn build_and_run(
         encoder: resolved.factory.clone(),
         render_node: cfg.render_node.clone(),
         error: failure,
+        // Only read at NotReady.
+        error_from_encoder: false,
         reached: Reached::Playing,
         pixel,
     };
@@ -914,6 +938,7 @@ mod tests {
             encoder: "vulkanh264enc".into(),
             render_node: "/dev/dri/renderD128".into(),
             error: error.map(str::to_string),
+            error_from_encoder: false,
             reached: Reached::Playing,
             pixel: PixelCheck::Ok {
                 off: 0.0001,
@@ -929,6 +954,7 @@ mod tests {
             encoder: "vulkanh264enc".into(),
             render_node: "/dev/dri/renderD128".into(),
             error: None,
+            error_from_encoder: false,
             reached: Reached::Playing,
             pixel,
         }
@@ -1098,6 +1124,7 @@ mod tests {
                     encoder: "vulkanh264enc".into(),
                     render_node: "/dev/dri/renderD128".into(),
                     error: Some("boom".into()),
+                    error_from_encoder: false,
                     reached: Reached::Playing,
                     pixel: PixelCheck::Mismatch {
                         off: 0.9,
@@ -1240,6 +1267,7 @@ mod tests {
             encoder: "vulkanh265enc".into(),
             render_node: "/dev/dri/renderD129".into(),
             error: error.map(str::to_string),
+            error_from_encoder: false,
             reached,
             pixel: PixelCheck::NotCovered(Codec::H265),
         }
@@ -1254,29 +1282,60 @@ mod tests {
         assert!(v.line().contains("h264 only"), "{}", v.line());
     }
 
+    /// The live AMD VCN 3.x AV1 evidence (#300): the encoder's own open failure.
+    const AV1_OPEN_FAILURE: &str = "/GstPipeline:pipeline0/GstVulkanAV1Encoder:quasar-vulkan-encoder: Failed to retrieve vulkan encoder (../ext/vulkan/vkav1enc.c(1759): gst_vulkan_av1_encoder_open ())";
+
+    fn av1_not_ready(error: Option<&str>, from_encoder: bool) -> Observed {
+        Observed {
+            codec: Codec::Av1,
+            encoder: "vulkanav1enc".into(),
+            error_from_encoder: from_encoder,
+            ..observed_hevc(0, Reached::NotReady, error)
+        }
+    }
+
     /// #311: the device has no encoder for the codec — a hardware fact, reported as
     /// `unsupported` (exit 4) with the same evidence a fail would carry.
     #[test]
     fn a_codec_probe_that_cannot_reach_ready_is_unsupported_carrying_the_evidence() {
-        let v = verdict(
-            10,
-            &Observed {
-                codec: Codec::Av1,
-                encoder: "vulkanav1enc".into(),
-                ..observed_hevc(
-                    0,
-                    Reached::NotReady,
-                    Some("vulkanav1enc0: Could not open the encoder (no AV1 encode profile)"),
-                )
-            },
-        );
+        let v = verdict(10, &av1_not_ready(Some(AV1_OPEN_FAILURE), true));
         assert!(matches!(v, ProbeVerdict::Unsupported(_)), "{v:?}");
         assert_eq!(v.exit_code(), UNSUPPORTED_EXIT);
         assert_eq!(v.exit_code(), 4);
         assert!(v.line().contains("could not reach READY"), "{}", v.line());
-        assert!(v.line().contains("no AV1 encode profile"), "{}", v.line());
+        assert!(
+            v.line().contains("Failed to retrieve vulkan encoder"),
+            "{}",
+            v.line()
+        );
         assert!(!v.line().contains('\n'));
         assert_eq!(v.remediation(), None);
+    }
+
+    /// `unsupported` is sticky, so a READY failure that is not the encoder's own open
+    /// failure stays `fail`: another element's error (the compositor source, the upload,
+    /// the render node), no error at all, or other text from the encoder.
+    #[test]
+    fn a_ready_failure_that_is_not_the_encoders_open_failure_stays_a_fail() {
+        for seen in [
+            av1_not_ready(
+                Some("/GstPipeline:pipeline0/GstWaylandDisplaySrc:src: Failed to open render node /dev/dri/renderD129"),
+                false,
+            ),
+            av1_not_ready(
+                Some("/GstPipeline:pipeline0/GstVulkanUpload:vulkanupload0: Failed to create vulkan device (VK_ERROR_DEVICE_LOST)"),
+                false,
+            ),
+            // The encoder's text, but posted by another element.
+            av1_not_ready(Some(AV1_OPEN_FAILURE), false),
+            av1_not_ready(None, false),
+            av1_not_ready(None, true),
+            av1_not_ready(Some("quasar-vulkan-encoder: device lost (VK_ERROR_DEVICE_LOST)"), true),
+        ] {
+            let v = verdict(10, &seen);
+            assert!(matches!(v, ProbeVerdict::Fail(_)), "{v:?}");
+            assert_eq!(v.exit_code(), 1);
+        }
     }
 
     /// H.264 is the floor: its media probe stuck at READY is a real fault that blocks
@@ -1289,7 +1348,11 @@ mod tests {
                 reached: Reached::NotReady,
                 frames: 0,
                 pixel: PixelCheck::NotRun("the encode pipeline never started".into()),
-                ..observed(0, Some("vulkanh264enc0: no encode profile"))
+                error_from_encoder: true,
+                ..observed(
+                    0,
+                    Some("quasar-vulkan-encoder: Failed to retrieve vulkan encoder"),
+                )
             },
         );
         assert!(matches!(v, ProbeVerdict::Fail(_)), "{v:?}");
@@ -1329,7 +1392,8 @@ mod tests {
             (observed_hevc(3, Reached::Playing, None), 1),
             (observed_hevc(10, Reached::Playing, Some("boom")), 1),
             (observed_hevc(0, Reached::NotPlaying, None), 1),
-            (observed_hevc(0, Reached::NotReady, None), 4),
+            (observed_hevc(0, Reached::NotReady, None), 1),
+            (av1_not_ready(Some(AV1_OPEN_FAILURE), true), 4),
         ] {
             assert_eq!(verdict(10, &seen).exit_code(), code);
         }
@@ -1342,11 +1406,11 @@ mod tests {
                 (false, "h265parse0: not-negotiated".into()),
                 (true, "vulkanh265enc0: no encode profile".into()),
             ]),
-            Some("vulkanh265enc0: no encode profile".into())
+            Some((true, "vulkanh265enc0: no encode profile".into()))
         );
         assert_eq!(
             encoder_error_first(vec![(false, "first".into()), (false, "second".into())]),
-            Some("first".into())
+            Some((false, "first".into()))
         );
         assert_eq!(encoder_error_first(Vec::new()), None);
     }

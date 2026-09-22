@@ -195,10 +195,10 @@ describe("ReadinessCard", () => {
       <ReadinessCard
         checks={[
           check({ id: "render_node" }),
-          check({ id: "xid_visibility", status: "unknown" as ReadinessCheck["status"], summary: "Could not tell." }),
+          check({ id: "xid_visibility", status: "unknown", summary: "Could not tell." }),
           check({
             id: "media_probe_gpu1_av1",
-            status: "unsupported" as ReadinessCheck["status"],
+            status: "unsupported",
             summary: "GPU 1 does not encode av1; sessions will not use av1 on this GPU: vulkanav1enc: the encode pipeline could not reach READY",
             remediation: "Nothing needs fixing: this GPU's video engine has no av1 encoder, so sessions on it use another codec.",
           }),
