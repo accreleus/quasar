@@ -66,6 +66,8 @@ pub mod sdp_answer;
 pub mod server;
 pub mod signaling;
 pub mod source;
+/// Session-end release of the app container, pulse sidecar and udev export.
+pub mod teardown;
 // #488: golden-home template store — path resolution, .meta.json, the reflink/copy
 // clone ladder, atomic publish/remove. Pure filesystem module (see module doc).
 pub mod template;
