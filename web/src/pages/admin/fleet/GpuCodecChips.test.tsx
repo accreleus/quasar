@@ -1,6 +1,7 @@
 /**
- * The shared per-GPU codec chip row (#296/#302): fixed display order and the
- * null ("neither this GPU nor its host has reported") case. HostExpansion.test.tsx
+ * The shared per-GPU codec chip row (#296/#302): fixed display order, the
+ * null ("neither this GPU nor its host has reported") case, and the distinct
+ * empty-array ("this GPU has zero usable encode slots") case. HostExpansion.test.tsx
  * and CapacityCard.test.tsx each add one integration assertion that this
  * component is actually wired in; the exhaustive cases live here.
  */
@@ -31,8 +32,11 @@ describe("GpuCodecChips", () => {
     expect(chip.title).toMatch(/has reported/);
   });
 
-  it("treats an empty list the same as null — never zero chips with no explanation", () => {
+  it("renders a distinct muted 'None' chip for an explicit empty set (a zero-slot GPU), not 'Not reported'", () => {
     render(<GpuCodecChips codecs={[]} />);
-    expect(screen.getByText("Not reported")).toBeTruthy();
+    expect(screen.queryByText("Not reported")).toBeNull();
+    const chip = screen.getByText("None");
+    expect(chip.className).toContain("chip-neutral");
+    expect(chip.title).toMatch(/no usable encode slots/);
   });
 });

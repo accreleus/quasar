@@ -553,10 +553,13 @@ pub struct GpuCapacity {
     /// been shown to encode, `h264` always present when the GPU is usable
     /// (`encode_slots_total > 0`). Sorted deterministically (wire vocabulary order).
     /// Stamped by `crate::agent::apply_gpu_codecs` from the same per-GPU computation
-    /// `capacity.codecs` (the host union) derives from — never a second pass. Absent for
-    /// a zero-slot (pinned-out) GPU, which the control plane reads as "inherits the
-    /// host set". Replaced wholesale with the `gpus` set, like `render_node` and
-    /// `driver_identity` — no keep-if-absent rule of its own.
+    /// `capacity.codecs` (the host union) derives from — never a second pass. A
+    /// zero-slot (pinned-out) GPU sends an explicit `[]` (it encodes nothing usable);
+    /// the control plane stores `[]` as-is, never inheriting the host set for it.
+    /// `None` is reserved for a GPU this agent has no codec knowledge of at all, which
+    /// the control plane reads as "inherits the host set" — replaced wholesale with the
+    /// `gpus` set, like `render_node` and `driver_identity`, no keep-if-absent rule of
+    /// its own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codecs: Option<Vec<String>>,
 }
@@ -1502,6 +1505,33 @@ mod tests {
             json["readiness"][0]["remediation"],
             "sudo dnf install -y nvidia-driver-libs.i686"
         );
+    }
+
+    /// #302 review: a zero-slot GPU's `codecs` is `Some(vec![])` (from
+    /// `crate::agent::apply_gpu_codecs`), which must serialize as the JSON array
+    /// `[]` and stay present — not vanish under `skip_serializing_if`, which only
+    /// applies to `None`. Distinguishing `[]` (this GPU encodes nothing) from an
+    /// absent field (no codec knowledge, inherit the host set) is the whole point
+    /// of the fix.
+    #[test]
+    fn a_zero_slot_gpus_empty_codec_set_serializes_present_not_omitted() {
+        let gpu = GpuCapacity {
+            index: 1,
+            vendor: "amd".to_string(),
+            model: "Radeon Pro V520".to_string(),
+            vram_mb_total: 16384,
+            encode_slots_total: 0,
+            render_node: None,
+            device_path: None,
+            driver_identity: None,
+            codecs: Some(vec![]),
+        };
+        let json = serde_json::to_value(&gpu).unwrap();
+        assert!(
+            json.as_object().unwrap().contains_key("codecs"),
+            "an explicit empty codec set must not be omitted like None is"
+        );
+        assert_eq!(json["codecs"], serde_json::json!([]));
     }
 
     /// `reason_code`/`app_log_tail` must be ABSENT (not null) on every ordinary

@@ -142,11 +142,26 @@ func TestGPUCodecsUnknownGPUFallsBackToH264(t *testing.T) {
 	}
 }
 
+// gpuCodecSetNullableSQL reads gpuCodecSetSQL(fallbackH264=false) — the admin
+// renderer — directly, the way GPUAvailability's query embeds it. nil means
+// the SQL rendered NULL (neither the GPU nor its host has ever reported).
+func gpuCodecSetNullableSQL(t *testing.T, pool *pgxpool.Pool, hostID string, gpuIndex int) []string {
+	t.Helper()
+	raw := rawColumn(t, pool, `
+		SELECT `+gpuCodecSetSQL("g", "h", false)+`
+		FROM gpus g JOIN hosts h ON h.id = g.host_id
+		WHERE g.host_id = $1::uuid AND g.index = $2
+	`, hostID, gpuIndex)
+	return mustParseCodecs(t, raw)
+}
+
 // TestGPUCodecSetMatchesSQL is the twin-agreement test (spec "Testing
 // Decisions" item 4, in the manner of TestCertForRungMatchesPickCert):
-// gpuCodecSetSQL (read via Store.GPUCodecs, fallbackH264=true) and its pure Go
-// twin gpuCodecSet must agree for every inheritance case, computed from the
-// SAME raw column reads so neither side can cheat by sharing state.
+// gpuCodecSetSQL and its pure Go twins — gpuCodecSet (fallbackH264=true, the
+// launch-side read, via Store.GPUCodecs) and gpuCodecSetNullable
+// (fallbackH264=false, the admin read) — must each agree with their own SQL
+// rendering for every inheritance case, computed from the SAME raw column
+// reads so neither side can cheat by sharing state.
 func TestGPUCodecSetMatchesSQL(t *testing.T) {
 	pool := testDB(t)
 	store := NewStore(pool)
@@ -171,21 +186,40 @@ func TestGPUCodecSetMatchesSQL(t *testing.T) {
 			setGPUCodecsRaw(t, pool, s.hostID, 0, in.gpuRaw)
 			setHostCodecsRaw(t, pool, s.hostID, in.hostRaw)
 
-			sqlSide, err := store.GPUCodecs(ctx, s.hostID, 0)
-			if err != nil {
-				t.Fatalf("GPUCodecs: %v", err)
-			}
-
 			gpuParsed := mustParseCodecs(t, rawColumn(t, pool,
 				`SELECT codecs FROM gpus WHERE id::text = $1`, s.gpuID))
 			hostParsed := mustParseCodecs(t, rawColumn(t, pool,
 				`SELECT codecs FROM hosts WHERE id::text = $1`, s.hostID))
-			goSide := gpuCodecSet(gpuParsed, hostParsed)
 
-			if !strSliceEqual(sqlSide, goSide) {
-				t.Errorf("SQL chose %v, gpuCodecSet chose %v (gpu raw=%q host raw=%q)",
-					sqlSide, goSide, in.gpuRaw, in.hostRaw)
-			}
+			t.Run("fallbackH264=true (launch)", func(t *testing.T) {
+				sqlSide, err := store.GPUCodecs(ctx, s.hostID, 0)
+				if err != nil {
+					t.Fatalf("GPUCodecs: %v", err)
+				}
+				goSide := gpuCodecSet(gpuParsed, hostParsed)
+				if !strSliceEqual(sqlSide, goSide) {
+					t.Errorf("SQL chose %v, gpuCodecSet chose %v (gpu raw=%q host raw=%q)",
+						sqlSide, goSide, in.gpuRaw, in.hostRaw)
+				}
+			})
+
+			t.Run("fallbackH264=false (admin)", func(t *testing.T) {
+				sqlSide := gpuCodecSetNullableSQL(t, pool, s.hostID, 0)
+				goSide := gpuCodecSetNullable(gpuParsed, hostParsed)
+				if !strSliceEqual(sqlSide, goSide) {
+					t.Errorf("SQL chose %v, gpuCodecSetNullable chose %v (gpu raw=%q host raw=%q)",
+						sqlSide, goSide, in.gpuRaw, in.hostRaw)
+				}
+				wantNil := in.gpuRaw == "" && in.hostRaw == ""
+				if wantNil != (sqlSide == nil) {
+					t.Errorf("SQL nullness = %v, want nil==%v (gpu raw=%q host raw=%q)",
+						sqlSide, wantNil, in.gpuRaw, in.hostRaw)
+				}
+				if wantNil != (goSide == nil) {
+					t.Errorf("gpuCodecSetNullable nullness = %v, want nil==%v (gpu raw=%q host raw=%q)",
+						goSide, wantNil, in.gpuRaw, in.hostRaw)
+				}
+			})
 		})
 	}
 

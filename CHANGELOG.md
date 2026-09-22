@@ -27,7 +27,7 @@ own; the two do not move together, and that is deliberate.
 ### Added
 - **Per-GPU codec sets, end to end (#302, amendment 12).** Each GPU reports the codecs it has
   been shown to encode (`capacity.gpus[].codecs`, the same per-GPU sets the host-level `codecs`
-  union is derived from, so the two cannot disagree; a zero-slot GPU omits the field). The control
+  union is derived from, so the two cannot disagree; a zero-slot GPU reports an empty set). The control
   plane stores it in `gpus.codecs` (migration 0086; NULL means the GPU inherits its host's set, which
   is what an older agent produces), and `GET /v1/hosts/{id}/gpus` returns `codecs` per GPU (null only
   when neither the GPU nor its host has ever reported). The fleet host expansion and the host

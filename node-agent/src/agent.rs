@@ -1187,15 +1187,17 @@ fn host_codecs_from_sets(sets: &[(i32, BTreeSet<Codec>)]) -> Vec<String> {
 /// `capacity.gpus[].codecs` (#302, agent-api.md amendment 12): stamps each GPU's own
 /// wire codec set from the SAME per-GPU sets the host union is derived from — never a
 /// second, possibly-diverging pass. A zero-slot (pinned-out) GPU's set is empty
-/// (`gpu_codec_set`'s unusable case), which stores as an omitted field: the wire
-/// contract's "may omit `codecs` or send `[]`" for a GPU the control plane already
-/// never places on.
+/// (`gpu_codec_set`'s unusable case) and is sent as `[]`, not omitted: the control
+/// plane stores an explicit `[]` as-is (never inherited), so this is the only way to
+/// tell an operator "this GPU encodes nothing" apart from "this GPU never reported,
+/// go by the host set". Omission is left to the case this stack never actually
+/// produces — a GPU present in inventory but absent from `sets` — rather than
+/// collapsed into the zero-slot case.
 fn apply_gpu_codecs(gpus: &mut [crate::messages::GpuCapacity], sets: &[(i32, BTreeSet<Codec>)]) {
     for gpu in gpus.iter_mut() {
         gpu.codecs = sets
             .iter()
             .find(|(index, _)| *index == gpu.index)
-            .filter(|(_, set)| !set.is_empty())
             .map(|(_, set)| set.iter().map(|c| c.as_str().to_string()).collect());
     }
 }
@@ -6347,6 +6349,12 @@ mod tests {
         prove(&mut mgr, 0, ProbeCodec::H265);
         mgr.host_codec_report = None;
         assert_eq!(mgr.advertised_codecs(), wire(&["h264"]));
+        // Per-GPU consistency (#302 review): gst-init failure is "no codec knowledge
+        // beyond the floor", not "no knowledge at all" — a usable GPU still gets an
+        // explicit ["h264"], never an omitted field.
+        let mut gpus = vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))];
+        apply_gpu_codecs(&mut gpus, &mgr.gpu_codec_sets());
+        assert_eq!(gpus[0].codecs, Some(vec!["h264".to_string()]));
     }
 
     #[test]
@@ -6362,16 +6370,28 @@ mod tests {
         prove(&mut mgr, 0, ProbeCodec::Av1);
         prove(&mut mgr, 1, ProbeCodec::H265);
         assert_eq!(mgr.advertised_codecs(), wire(&["h264"]));
+        let mut pinned_out_again = gpu(1, "amd", Some("/dev/dri/renderD129"));
+        pinned_out_again.encode_slots_total = 0;
+        let mut gpus = vec![
+            gpu(0, "nvidia", Some("/dev/dri/renderD128")),
+            pinned_out_again,
+        ];
+        apply_gpu_codecs(&mut gpus, &mgr.gpu_codec_sets());
+        assert_eq!(
+            gpus[1].codecs,
+            Some(Vec::<String>::new()),
+            "the pinned-out GPU reports [] on the wire, not an omitted field"
+        );
     }
 
     // ---- #302: capacity.gpus[].codecs, and the assign-time belt ----
 
     /// `apply_gpu_codecs` and the host union it derives from must read the SAME
     /// per-GPU sets: a usable GPU's wire field always carries h264, a zero-slot GPU
-    /// omits the field entirely (never `[]`), and the union is exactly what the
-    /// per-GPU fields say.
+    /// reports an explicit `[]` (never omits the field), and the union is exactly
+    /// what the per-GPU fields say.
     #[test]
-    fn apply_gpu_codecs_stamps_each_gpu_and_omits_a_zero_slot_gpu() {
+    fn apply_gpu_codecs_stamps_each_gpu_including_an_empty_set_for_a_zero_slot_gpu() {
         let mut gpus = vec![
             gpu(0, "nvidia", Some("/dev/dri/renderD128")),
             gpu(1, "amd", Some("/dev/dri/renderD129")),
@@ -6387,8 +6407,9 @@ mod tests {
             Some(vec!["h264".to_string(), "h265".to_string()])
         );
         assert_eq!(
-            gpus[1].codecs, None,
-            "a zero-slot GPU omits codecs, never []"
+            gpus[1].codecs,
+            Some(Vec::<String>::new()),
+            "a zero-slot GPU reports an explicit empty codec set, never an omitted field"
         );
         assert_eq!(
             host_codecs_from_sets(&sets),
@@ -6465,6 +6486,82 @@ mod tests {
             }
             other => panic!("expected ack{{ok:false}}, got {other:?}"),
         }
+    }
+
+    /// `token = "..."` fields off every WARN/ERROR emitted while `f` runs. The crate
+    /// keeps no general log-capture harness (`.claude/rules/agent-logging.md` covers
+    /// the convention, not a test helper for it), so this is scoped to the one
+    /// assertion that needs it: proving the refusal log carries its token, not just
+    /// its ack text.
+    fn tokens_emitted_during<F: FnOnce()>(f: F) -> Vec<String> {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Visitor<'a>(&'a mut Option<String>);
+        impl tracing::field::Visit for Visitor<'_> {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "token" {
+                    *self.0 = Some(value.to_string());
+                }
+            }
+            fn record_debug(
+                &mut self,
+                _field: &tracing::field::Field,
+                _value: &dyn std::fmt::Debug,
+            ) {
+            }
+        }
+
+        struct TokenLayer(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TokenLayer {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut token = None;
+                event.record(&mut Visitor(&mut token));
+                if let Some(token) = token {
+                    self.0.lock().unwrap().push(token);
+                }
+            }
+        }
+
+        let tokens = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(TokenLayer(tokens.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            // Every other test in this binary calls the same warn! callsites with no
+            // subscriber installed, which caches their tracing `Interest` as `never`
+            // — a cache that setting a new default alone does not invalidate. Without
+            // this, `f` below would silently emit nothing regardless of the
+            // subscriber just installed.
+            tracing::callsite::rebuild_interest_cache();
+            f();
+        });
+        tracing::callsite::rebuild_interest_cache();
+        Arc::try_unwrap(tokens).unwrap().into_inner().unwrap()
+    }
+
+    /// The belt's ack text names the refused codec (asserted above), but an operator
+    /// greps by token (`.claude/rules/agent-logging.md`) — this proves the warn! at
+    /// the refusal site actually carries `token = "assign-codec-not-in-gpu-set"`.
+    #[test]
+    fn assign_refusal_emits_the_codec_not_in_gpu_set_token() {
+        let mut mgr = codec_mgr(
+            vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))],
+            plan_all,
+        );
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+        let tokens = tokens_emitted_during(|| {
+            mgr.handle_control(
+                session_assign_msg_codec("s1", 0, "h265"),
+                &evt_tx,
+                &diagnostic_sender(),
+            );
+        });
+        assert!(
+            tokens.contains(&"assign-codec-not-in-gpu-set".to_string()),
+            "expected the assign-codec-not-in-gpu-set token among {tokens:?}"
+        );
     }
 
     /// A codec-probe pass on the bound GPU lifts the belt.

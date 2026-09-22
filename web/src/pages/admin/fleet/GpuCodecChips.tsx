@@ -5,9 +5,11 @@
  * (`pages/setup/StepHosts.tsx` `CodecSection`) — no mock covers a per-GPU
  * chip, so that is the idiom this reuses rather than a new one.
  *
- * `codecs === null` means this GPU inherits a host that has never reported a
- * codec set either (`GPUAvailability.codecs`, amendment 12) — distinct from
- * an empty list, and rendered as a muted chip rather than nothing.
+ * `codecs === null`/`undefined` means neither this GPU nor its host has ever
+ * reported a codec set (`GPUAvailability.codecs`, amendment 12) — rendered as
+ * a muted "Not reported" chip. `codecs === []` is a real, distinct report: a
+ * zero-slot GPU explicitly encoding nothing — rendered as a muted "None" chip
+ * so an operator never reads it as the inherited host set (#302 review).
  */
 import { Chip } from "../../../components/Chip";
 import { codecDisplayName } from "../../../lib/codecDisplay";
@@ -24,10 +26,21 @@ function codecRank(codec: Codec): number {
 }
 
 export function GpuCodecChips({ codecs }: { codecs: GPUAvailability["codecs"] }) {
-  if (codecs == null || codecs.length === 0) {
+  if (codecs == null) {
     return (
       <Chip variant="neutral" title="Neither this GPU nor its host has reported a codec set yet.">
         Not reported
+      </Chip>
+    );
+  }
+
+  if (codecs.length === 0) {
+    return (
+      <Chip
+        variant="neutral"
+        title="This GPU has no usable encode slots here, so it encodes nothing."
+      >
+        None
       </Chip>
     );
   }
