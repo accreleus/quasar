@@ -2043,7 +2043,10 @@ async fn connect_and_run(
                                 }
                                 _ => None,
                             };
-                            let failed_gpu = mgr.running.get(&session_id).map(|h| h.gpu_index);
+                            let failed_on = mgr
+                                .running
+                                .get(&session_id)
+                                .map(|h| (h.gpu_index, h.codec));
                             // #503: same pre-terminal flush as the `Stopped` arm —
                             // `webrtc.remote_description_failed` is emitted by the
                             // runner immediately before this very event.
@@ -2056,14 +2059,14 @@ async fn connect_and_run(
                                 send_fresh_capacity(&mut tx, &mut *mgr).await?;
                                 info!("re-sent capacity after session failure for console reconciliation");
                             }
-                            if let (Some((reason, app_failed)), Some(gpu)) =
-                                (launch_failure, failed_gpu)
+                            if let (Some((reason, app_failed)), Some((gpu, codec))) =
+                                (launch_failure, failed_on)
                             {
                                 let explains =
                                     host_probe::launch_failure::explains(&reason, app_failed);
                                 if !explains.is_empty() {
                                     if let Some(handle) = &mgr.probe_handle {
-                                        handle.launch_failed(gpu, explains);
+                                        handle.launch_failed(gpu, explains, codec);
                                     }
                                 }
                             }
@@ -2484,6 +2487,9 @@ struct RunningHandle {
     /// The GPU this session is bound to, for the host-probe scheduler's live-GPU set
     /// and a launch failure's `launch_failed(gpu, ..)`.
     gpu_index: i32,
+    /// The assigned codec, before any `QUASAR_CODEC` diagnostic override (the runner
+    /// applies that later): a launch failure on it selects that GPU's codec probe.
+    codec: crate::session::Codec,
     /// Set by `SessionEvent::Running`. Until then the launch is in flight and no host
     /// probe starts.
     reached_running: bool,
@@ -2894,6 +2900,7 @@ impl SessionManager {
                     let home_refs = Self::home_refs_of(&cfg);
                     self.add_live_refs(&home_refs);
                     let video_topology = cfg.video_topology;
+                    let codec = cfg.stream.codec;
                     // Snapshotted before `cfg` moves into the runner thread, because the
                     // ack must be produced before the runner has built the encode
                     // pipeline that owns the real `ScaleStage`. Both sides go through
@@ -2999,6 +3006,7 @@ impl SessionManager {
                             thread: Some(thread),
                             finished_seen_at: None,
                             gpu_index,
+                            codec,
                             reached_running: false,
                         },
                     );
@@ -3633,11 +3641,28 @@ fn probe_inputs(
         })
         .collect();
 
+    // Every GPU is planned the host's codec set until the per-render-node plan (#301).
+    let host_codecs: std::collections::BTreeSet<crate::host_probe::ProbeCodec> = mgr
+        .host_codec_report
+        .iter()
+        .flat_map(|r| r.codecs.iter())
+        .filter_map(|c| crate::host_probe::ProbeCodec::from_wire(c))
+        .collect();
+    let codecs = if host_codecs.is_empty() {
+        BTreeMap::new()
+    } else {
+        mgr.gpu_inventory
+            .iter()
+            .map(|g| (g.index, host_codecs.clone()))
+            .collect()
+    };
+
     crate::host_probe::decision::ProbeInputs {
         agent_image: agent_image.to_string(),
         driver: driver_parts.join(","),
         gpus,
         settings: probe_relevant_settings(&mgr.runtime_settings.effective_map()),
+        codecs,
     }
 }
 
@@ -6050,6 +6075,7 @@ mod tests {
                 thread: None,
                 finished_seen_at: None,
                 gpu_index: 0,
+                codec: crate::session::Codec::H264,
                 reached_running: true,
             },
             stop,
@@ -6099,6 +6125,7 @@ mod tests {
                 thread: None,
                 finished_seen_at: None,
                 gpu_index: 0,
+                codec: crate::session::Codec::H264,
                 reached_running: true,
             },
             display_rx,
@@ -6911,6 +6938,7 @@ mod tests {
                 thread: None,
                 finished_seen_at: None,
                 gpu_index: 0,
+                codec: crate::session::Codec::H264,
                 reached_running: true,
             },
             capture_rx,
@@ -7295,6 +7323,27 @@ mod tests {
         let inputs = probe_inputs("sha256:agent", &mgr);
         assert_eq!(inputs.agent_image, "sha256:agent");
         assert_eq!(inputs.gpus.len(), 2);
+        assert!(inputs.codecs.is_empty(), "no codec report, no codec probes");
+
+        // The host's codec set above the floor is every GPU's codec-probe plan for now.
+        mgr.host_codec_report = Some(HostCodecReport {
+            codecs: vec!["h264".into(), "h265".into(), "av1".into()],
+            throughput: BTreeMap::new(),
+        });
+        let with_codecs = probe_inputs("sha256:agent", &mgr);
+        let above_floor: std::collections::BTreeSet<_> = [
+            crate::host_probe::ProbeCodec::H265,
+            crate::host_probe::ProbeCodec::Av1,
+        ]
+        .into();
+        assert_eq!(with_codecs.codecs.get(&0), Some(&above_floor));
+        assert_eq!(with_codecs.codecs.get(&1), Some(&above_floor));
+        mgr.host_codec_report = Some(HostCodecReport {
+            codecs: vec!["h264".into()],
+            throughput: BTreeMap::new(),
+        });
+        assert!(probe_inputs("sha256:agent", &mgr).codecs.is_empty());
+        mgr.host_codec_report = None;
         assert_eq!(
             inputs.gpus.get(&0).map(String::as_str),
             Some("/dev/dri/renderD128")

@@ -5,10 +5,10 @@ use super::super::report::ReadinessReport;
 use super::super::*;
 use super::FakeRoot;
 use crate::host_probe::outcome::{
-    child_outcome, forget, indeterminate_status, record, record_not_applicable, ChildEnd,
-    ProbeOutcome,
+    child_outcome, codec_probe_verdict, forget, indeterminate_status, record,
+    record_not_applicable, ChildEnd, ProbeOutcome,
 };
-use crate::host_probe::{ProbeKind, ProbeTarget};
+use crate::host_probe::{ProbeCodec, ProbeKind, ProbeTarget};
 use std::time::{Duration, SystemTime};
 
 fn at(secs: u64) -> SystemTime {
@@ -33,6 +33,7 @@ fn find<'a>(checks: &'a [ReadinessCheck], id: &str) -> Option<&'a ReadinessCheck
 const MEDIA_GPU0: ProbeTarget = ProbeTarget {
     kind: ProbeKind::Media,
     gpu: Some(0),
+    codec: None,
 };
 
 fn exited(code: i32, stdout: &str) -> ChildEnd {
@@ -335,4 +336,138 @@ fn a_forgotten_check_can_be_recorded_again_with_an_older_time() {
         find(&report.merged(), "media_probe_gpu0").unwrap().status,
         PASS
     );
+}
+
+// ── #300: the codec probe's check ────────────────────────────────────────────────
+
+const AV1_GPU0: ProbeTarget = ProbeTarget {
+    kind: ProbeKind::Media,
+    gpu: Some(0),
+    codec: Some(ProbeCodec::Av1),
+};
+
+const READY_EVIDENCE: &str = "vulkanav1enc: the encode pipeline could not reach READY on \
+    /dev/dri/renderD128: vulkanav1enc0: no AV1 encode profile";
+
+#[test]
+fn a_failing_codec_probe_is_a_fail_that_blocks_nothing_and_says_the_codec_is_not_used() {
+    let (root, mut report) = refreshed_report("hp-codec-fail");
+    record(
+        &mut report,
+        AV1_GPU0,
+        child_outcome(AV1_GPU0, exited(1, READY_EVIDENCE)),
+        at(100),
+    );
+    report.refreshed(probe(&root.env(false, "")), at(200));
+
+    let merged = report.merged();
+    let check = find(&merged, "media_probe_gpu0_av1").expect("codec check");
+    assert_eq!(check.status, FAIL);
+    assert_eq!(check.blocks, None);
+    assert_eq!(check.source.as_deref(), Some("host_probe"));
+    assert!(
+        check.summary.contains("GPU 0 does not encode av1"),
+        "{}",
+        check.summary
+    );
+    assert!(
+        check.summary.contains("sessions will not use av1"),
+        "{}",
+        check.summary
+    );
+    assert!(check.summary.contains("could not reach READY"));
+    assert!(!check.remediation.is_empty());
+}
+
+#[test]
+fn a_passing_codec_probe_carries_no_blocks_either() {
+    let (_root, mut report) = refreshed_report("hp-codec-pass");
+    let hevc = ProbeTarget::codec(0, ProbeCodec::H265);
+    record(
+        &mut report,
+        hevc,
+        child_outcome(hevc, exited(0, "encoded 10 frames with vulkanh265enc")),
+        at(100),
+    );
+    let merged = report.merged();
+    let check = find(&merged, "media_probe_gpu0_h265").expect("codec check");
+    assert_eq!(check.status, PASS);
+    assert_eq!(check.blocks, None);
+    assert!(
+        check.summary.contains("GPU 0 encoded h265"),
+        "{}",
+        check.summary
+    );
+}
+
+#[test]
+fn an_indeterminate_codec_probe_leaves_the_retained_verdict_unchanged() {
+    for (code, verdict) in [(0, Some(true)), (1, Some(false))] {
+        let (root, mut report) = refreshed_report("hp-codec-stands");
+        record(
+            &mut report,
+            AV1_GPU0,
+            child_outcome(AV1_GPU0, exited(code, "the definitive run")),
+            at(100),
+        );
+        for end in [
+            ChildEnd::Preempted,
+            ChildEnd::Deadline(Duration::from_secs(45)),
+            exited(3, "could not tell"),
+        ] {
+            record(&mut report, AV1_GPU0, child_outcome(AV1_GPU0, end), at(200));
+        }
+        report.refreshed(probe(&root.env(false, "")), at(300));
+
+        let merged = report.merged();
+        let check = find(&merged, "media_probe_gpu0_av1").unwrap();
+        assert!(check.summary.contains("the definitive run"));
+        assert_eq!(check.blocks, None);
+        assert_eq!(codec_probe_verdict(&report, 0, ProbeCodec::Av1), verdict);
+    }
+}
+
+#[test]
+fn a_codec_probe_that_never_concluded_has_no_verdict() {
+    let (_root, mut report) = refreshed_report("hp-codec-unknown");
+    assert_eq!(codec_probe_verdict(&report, 0, ProbeCodec::Av1), None);
+    record(
+        &mut report,
+        AV1_GPU0,
+        child_outcome(AV1_GPU0, ChildEnd::Preempted),
+        at(100),
+    );
+    let merged = report.merged();
+    let check = find(&merged, "media_probe_gpu0_av1").unwrap();
+    assert_eq!(check.status, indeterminate_status());
+    assert_eq!(check.blocks, None);
+    assert_eq!(codec_probe_verdict(&report, 0, ProbeCodec::Av1), None);
+    // The H.264 media probe's own check is a different verdict.
+    record(
+        &mut report,
+        MEDIA_GPU0,
+        child_outcome(MEDIA_GPU0, exited(0, "encoded")),
+        at(100),
+    );
+    assert_eq!(codec_probe_verdict(&report, 0, ProbeCodec::Av1), None);
+}
+
+/// The child's exit-code mapping for a codec target: 0 pass, 1 fail, anything else
+/// indeterminate, exactly as for the media probe.
+#[test]
+fn the_codec_childs_exit_codes_map_like_the_media_probes() {
+    assert!(matches!(
+        child_outcome(AV1_GPU0, exited(0, "ok")),
+        ProbeOutcome::Pass { .. }
+    ));
+    assert!(matches!(
+        child_outcome(AV1_GPU0, exited(1, READY_EVIDENCE)),
+        ProbeOutcome::Fail { .. }
+    ));
+    for code in [2, 3] {
+        assert!(matches!(
+            child_outcome(AV1_GPU0, exited(code, "x")),
+            ProbeOutcome::Indeterminate { .. }
+        ));
+    }
 }

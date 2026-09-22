@@ -14,21 +14,23 @@ use tokio::sync::watch;
 use super::child::{run_child, ChildSpec};
 use super::media_probe_dir::{self, ProbeRuntimeDir};
 use super::outcome::ChildEnd;
+use super::ProbeCodec;
 use crate::messages::GpuCapacity;
 use crate::session::probe_media::MediaProbeRequest;
 use crate::session::settings::RuntimeSettings;
 use crate::session::warmup::gate::{GateRefusal, WarmupControl};
 use crate::session::{SessionConfig, StreamParams};
 
-/// The stream params a media probe asks for: fixed, small, and at the floor codec, so the
-/// verdict is about the GPU and not about what a profile happened to configure.
-fn probe_stream(request: &MediaProbeRequest) -> StreamParams {
-    StreamParams {
+/// The stream params a media probe asks for: fixed and small, at the request's codec, so
+/// the verdict is about the GPU and not about what a profile happened to configure.
+fn probe_stream(request: &MediaProbeRequest) -> Result<StreamParams> {
+    Ok(StreamParams {
         width: request.width,
         height: request.height,
         fps: request.fps,
+        codec: crate::session::Codec::parse(&request.codec)?,
         ..StreamParams::default()
-    }
+    })
 }
 
 fn args_for(request: &MediaProbeRequest) -> Vec<String> {
@@ -72,20 +74,25 @@ fn env_for(settings: &RuntimeSettings, cfg: &SessionConfig) -> Vec<(String, Stri
     ]
 }
 
-/// The child process that probes `gpu_index`, bound through the production
-/// [`crate::agent::bind_gpu`]. `Err` means this GPU cannot be probed at all (no render
-/// node, vendor/encoder mismatch) — the caller reports it as a failing check.
+/// The child process that probes `gpu_index` (for `codec`, a codec probe; otherwise the
+/// H.264 media probe), bound through the production [`crate::agent::bind_gpu`]. `Err`
+/// means this GPU cannot be probed at all (no render node, vendor/encoder mismatch) —
+/// the caller reports it as a failing check.
 pub fn child_spec(
     settings: &RuntimeSettings,
     inventory: &[GpuCapacity],
     gpu_index: i32,
+    codec: Option<ProbeCodec>,
     deadline: Duration,
 ) -> Result<ChildSpec> {
-    let request = MediaProbeRequest {
-        gpu: gpu_index,
-        ..MediaProbeRequest::default()
+    let request = match codec {
+        Some(codec) => MediaProbeRequest::codec_probe(gpu_index, codec.codec()),
+        None => MediaProbeRequest {
+            gpu: gpu_index,
+            ..MediaProbeRequest::default()
+        },
     };
-    let mut cfg = SessionConfig::for_assignment_with(settings, probe_stream(&request), None);
+    let mut cfg = SessionConfig::for_assignment_with(settings, probe_stream(&request)?, None);
     crate::agent::bind_gpu(inventory, gpu_index, &mut cfg)
         .with_context(|| format!("GPU {gpu_index} cannot run a media probe"))?;
     let program = std::env::current_exe()
@@ -227,6 +234,7 @@ mod tests {
             &settings(EncoderChoice::Vulkan),
             &inventory,
             1,
+            None,
             Duration::from_secs(30),
         )
         .expect("GPU 1 is bindable");
@@ -255,6 +263,7 @@ mod tests {
             &settings(EncoderChoice::Vulkan),
             &inventory,
             0,
+            None,
             Duration::from_secs(30),
         )
         .unwrap();
@@ -269,12 +278,35 @@ mod tests {
     }
 
     #[test]
+    fn a_codec_probe_asks_for_its_codec_and_ten_frames_in_ten_seconds() {
+        let inventory = [gpu(0, "amd", Some("/dev/dri/renderD128"))];
+        let spec = child_spec(
+            &settings(EncoderChoice::Vulkan),
+            &inventory,
+            0,
+            Some(ProbeCodec::Av1),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        for pair in [
+            ["--gpu", "0"],
+            ["--codec", "av1"],
+            ["--size", "1280x720@60"],
+            ["--frames", "10"],
+            ["--budget-secs", "10"],
+        ] {
+            assert!(spec.args.windows(2).any(|w| w == pair), "{:?}", spec.args);
+        }
+    }
+
+    #[test]
     fn a_gpu_absent_from_the_inventory_is_an_error() {
         let inventory = [gpu(0, "amd", Some("/dev/dri/renderD128"))];
         let e = child_spec(
             &settings(EncoderChoice::Vulkan),
             &inventory,
             7,
+            None,
             Duration::from_secs(30),
         )
         .expect_err("GPU 7 does not exist");
@@ -293,6 +325,7 @@ mod tests {
             &settings(EncoderChoice::Vulkan),
             &inventory,
             0,
+            None,
             Duration::from_secs(30),
         )
         .expect_err("a hardware encoder needs a render node");
@@ -306,7 +339,7 @@ mod tests {
         let inventory = [gpu(0, "nvidia", Some("/dev/dri/renderD128"))];
         let mut s = settings(EncoderChoice::Vulkan);
         s.render_node = "software".into();
-        let e = child_spec(&s, &inventory, 0, Duration::from_secs(30))
+        let e = child_spec(&s, &inventory, 0, None, Duration::from_secs(30))
             .expect_err("software render node with a hardware encoder");
         assert!(format!("{e:#}").contains("render_node=software"));
     }

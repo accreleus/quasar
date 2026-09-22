@@ -32,10 +32,7 @@ fn exited(code: i32, stdout: &str) -> ChildEnd {
 }
 
 fn gpu(kind: ProbeKind, index: i32) -> ProbeTarget {
-    ProbeTarget {
-        kind,
-        gpu: Some(index),
-    }
+    ProbeTarget::gpu(kind, index)
 }
 
 fn blocks(scope: &str, gpu_index: Option<i32>, enforced_by: &str) -> Option<ReadinessBlocks> {

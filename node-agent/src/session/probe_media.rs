@@ -9,6 +9,9 @@
 //! `openh264dec` and scores the decoded picture against the compositor's known flat
 //! clear-colour field, so the check verifies the picture survived, not just that frames
 //! arrived. Design: `docs/superpowers/plans/2026-09-20-282-media-probe-pixel-check.md`.
+//!
+//! A non-h264 request is a codec probe (#300): no pixel check, so reaching PLAYING and
+//! producing the frames without a bus error is its pass.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -24,6 +27,10 @@ use super::{Codec, SessionConfig};
 
 pub const DEFAULT_FRAMES: u64 = 30;
 pub const DEFAULT_BUDGET_SECS: u64 = 15;
+/// A codec probe proves the encoder starts and produces frames; it scores no pixels, so
+/// it needs fewer frames than the H.264 media probe.
+pub const CODEC_PROBE_FRAMES: u64 = 10;
+pub const CODEC_PROBE_BUDGET_SECS: u64 = 10;
 
 /// What the child was asked to prove. Every field arrives on argv; the binding and
 /// encoder selection arrive as env (see `host_probe::media`).
@@ -49,6 +56,19 @@ impl Default for MediaProbeRequest {
             fps: 60,
             frames: DEFAULT_FRAMES,
             budget: Duration::from_secs(DEFAULT_BUDGET_SECS),
+        }
+    }
+}
+
+impl MediaProbeRequest {
+    /// The codec probe for `codec` on `gpu` (CONTEXT.md "Codec probe").
+    pub fn codec_probe(gpu: i32, codec: Codec) -> Self {
+        MediaProbeRequest {
+            gpu,
+            codec: codec.as_str().into(),
+            frames: CODEC_PROBE_FRAMES,
+            budget: Duration::from_secs(CODEC_PROBE_BUDGET_SECS),
+            ..MediaProbeRequest::default()
         }
     }
 }
@@ -120,6 +140,9 @@ enum PixelCheck {
     /// encode verdict this run already has still stands — this only ever demotes the
     /// overall result to Indeterminate, never to Fail.
     NotRun(String),
+    /// The pixel check verifies h264 only. For another codec the encode verdict alone
+    /// decides: frames arriving without a bus error is the codec probe's pass.
+    NotCovered(Codec),
     Ok {
         off: f64,
         frames: usize,
@@ -383,6 +406,15 @@ impl DecodeLeg {
     }
 }
 
+/// How far the pipeline got. A device whose video engine lacks the codec fails opening
+/// the encoder at NULL→READY (the AMD VCN 3.x AV1 signature).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reached {
+    NotReady,
+    NotPlaying,
+    Playing,
+}
+
 /// What the run observed, so the verdict wording is decided in one pure place.
 struct Observed {
     frames: u64,
@@ -391,12 +423,29 @@ struct Observed {
     /// The first bus ERROR not attributed to the decode leg, already formatted with its
     /// debug text.
     error: Option<String>,
+    reached: Reached,
     pixel: PixelCheck,
 }
 
-/// Pass iff the wanted frames arrived with no bus error and the decoded picture matched
-/// the compositor's known flat field. Pure: unit-tested without a GPU.
+/// Pass iff the pipeline reached PLAYING, the wanted frames arrived with no bus error, and
+/// (h264 only) the decoded picture matched the compositor's known flat field. Pure:
+/// unit-tested without a GPU.
 fn verdict(wanted: u64, seen: &Observed) -> ProbeVerdict {
+    let state = match seen.reached {
+        Reached::NotReady => Some("READY"),
+        Reached::NotPlaying => Some("PLAYING"),
+        Reached::Playing => None,
+    };
+    if let Some(state) = state {
+        let why = seen
+            .error
+            .as_deref()
+            .unwrap_or("no error message was posted");
+        return ProbeVerdict::Fail(format!(
+            "{}: the encode pipeline could not reach {state} on {}: {why}",
+            seen.encoder, seen.render_node
+        ));
+    }
     if let Some(error) = &seen.error {
         return ProbeVerdict::Fail(format!("{}: {error}", seen.encoder));
     }
@@ -424,6 +473,13 @@ fn verdict(wanted: u64, seen: &Observed) -> ProbeVerdict {
             seen.encoder,
             off * 100.0,
             seen.render_node
+        )),
+        PixelCheck::NotCovered(codec) => ProbeVerdict::Pass(format!(
+            "encoded {} frames with {} on {} ({}; the pixel check covers h264 only)",
+            seen.frames,
+            seen.encoder,
+            seen.render_node,
+            codec.as_str()
         )),
         PixelCheck::NotRun(reason) => ProbeVerdict::Indeterminate(format!(
             "{}: encoded {} frames on {}, but the picture could not be verified: {reason}",
@@ -552,6 +608,30 @@ fn build_decode_leg(
     }))
 }
 
+/// The evidence for a failed state change: the encoder's own error over a downstream
+/// consequence (a not-negotiated from the parser), else the first posted.
+fn encoder_error_first(errors: Vec<(bool, String)>) -> Option<String> {
+    let first = errors.first().map(|(_, text)| text.clone());
+    errors
+        .into_iter()
+        .find(|(from_encoder, _)| *from_encoder)
+        .map(|(_, text)| text)
+        .or(first)
+}
+
+/// `<element path>: <error> (<debug>)` for an ERROR message; `None` for anything else.
+fn bus_error_text(msg: &gst::Message) -> Option<String> {
+    let gst::MessageView::Error(e) = msg.view() else {
+        return None;
+    };
+    let from = msg
+        .src()
+        .map(|s| s.path_string().to_string())
+        .unwrap_or_else(|| "pipeline".into());
+    // The verdict is one stdout line: a newline in the debug text would cut it short.
+    Some(format!("{from}: {} ({})", e.error(), e.debug().unwrap_or_default()).replace('\n', " "))
+}
+
 fn build_and_run(
     cfg: &mut SessionConfig,
     codec: Codec,
@@ -627,13 +707,6 @@ fn build_and_run(
         let _ = pipeline.set_state(gst::State::Null);
     };
 
-    if let Err(e) = pipeline.set_state(gst::State::Playing) {
-        teardown(&pipeline);
-        return Err(anyhow::anyhow!(
-            "the probe pipeline never reached PLAYING: {e}"
-        ));
-    }
-
     let bus = match pipeline.bus() {
         Some(bus) => bus,
         None => {
@@ -641,6 +714,40 @@ fn build_and_run(
             anyhow::bail!("the probe pipeline has no bus");
         }
     };
+
+    // Stepped through READY so the verdict names the state the encoder could not reach,
+    // with the element's own error message as the evidence.
+    for (state, stuck) in [
+        (gst::State::Ready, Reached::NotReady),
+        (gst::State::Playing, Reached::NotPlaying),
+    ] {
+        if pipeline.set_state(state).is_err() {
+            // A streaming thread may post its ERROR just after the state change returns,
+            // so wait briefly for the first, then take whatever else is queued.
+            let mut errors = Vec::new();
+            let mut next = bus.timed_pop_filtered(
+                gst::ClockTime::from_mseconds(200),
+                &[gst::MessageType::Error],
+            );
+            while let Some(msg) = next {
+                let from_encoder = msg.src() == Some(encoder.upcast_ref::<gst::Object>());
+                if let Some(text) = bus_error_text(&msg) {
+                    errors.push((from_encoder, text));
+                }
+                next = bus.pop_filtered(&[gst::MessageType::Error]);
+            }
+            let error = encoder_error_first(errors);
+            teardown(&pipeline);
+            return Ok(Observed {
+                frames: 0,
+                encoder: resolved.factory.clone(),
+                render_node: cfg.render_node.clone(),
+                error,
+                reached: stuck,
+                pixel: PixelCheck::NotRun("the encode pipeline never started".into()),
+            });
+        }
+    }
 
     let dump = DumpSink::from_env(request.gpu);
     let mut decoded_seen: usize = 0;
@@ -708,12 +815,12 @@ fn build_and_run(
             gst::MessageView::Eos(_) => {
                 eos_seen = true;
             }
-            gst::MessageView::Error(e) => {
+            gst::MessageView::Error(_) => {
                 let from = msg
                     .src()
                     .map(|s| s.path_string().to_string())
                     .unwrap_or_else(|| "pipeline".into());
-                let text = format!("{from}: {} ({})", e.error(), e.debug().unwrap_or_default());
+                let text = bus_error_text(&msg).unwrap_or_default();
                 // Attribute by source element (design §5): an error from the decode leg
                 // says nothing about the host's encode path, so it must not fail a
                 // healthy host.
@@ -730,15 +837,10 @@ fn build_and_run(
 
     let pixel = if let Some(reason) = pixel_not_run {
         PixelCheck::NotRun(reason)
+    } else if codec != Codec::H264 {
+        PixelCheck::NotCovered(codec)
     } else if decode.is_none() {
-        PixelCheck::NotRun(if codec != Codec::H264 {
-            format!(
-                "the pixel check only verifies h264, and this probe ran {}",
-                codec.as_str()
-            )
-        } else {
-            "openh264dec is not registered on this image".into()
-        })
+        PixelCheck::NotRun("openh264dec is not registered on this image".into())
     } else if !eos_seen && Instant::now() >= deadline {
         PixelCheck::NotRun(format!(
             "the probe's budget expired before the decode leg drained ({} of {} frames \
@@ -772,6 +874,7 @@ fn build_and_run(
         encoder: resolved.factory.clone(),
         render_node: cfg.render_node.clone(),
         error: failure,
+        reached: Reached::Playing,
         pixel,
     };
     teardown(&pipeline);
@@ -788,6 +891,7 @@ mod tests {
             encoder: "vulkanh264enc".into(),
             render_node: "/dev/dri/renderD128".into(),
             error: error.map(str::to_string),
+            reached: Reached::Playing,
             pixel: PixelCheck::Ok {
                 off: 0.0001,
                 frames: 20,
@@ -801,6 +905,7 @@ mod tests {
             encoder: "vulkanh264enc".into(),
             render_node: "/dev/dri/renderD128".into(),
             error: None,
+            reached: Reached::Playing,
             pixel,
         }
     }
@@ -968,6 +1073,7 @@ mod tests {
                     encoder: "vulkanh264enc".into(),
                     render_node: "/dev/dri/renderD128".into(),
                     error: Some("boom".into()),
+                    reached: Reached::Playing,
                     pixel: PixelCheck::Mismatch {
                         off: 0.9,
                         frames: 20,
@@ -1098,6 +1204,93 @@ mod tests {
         assert_eq!(pixel::luma_reference(pixel::Range::Unknown, 7), 0);
         assert_eq!(pixel::luma_reference(pixel::Range::Unknown, 8), 16);
         assert_eq!(pixel::luma_reference(pixel::Range::Unknown, 16), 16);
+    }
+
+    // ── #300: the codec probe (a non-H.264 request) ──────────────────────────────────
+
+    fn observed_hevc(frames: u64, reached: Reached, error: Option<&str>) -> Observed {
+        Observed {
+            frames,
+            encoder: "vulkanh265enc".into(),
+            render_node: "/dev/dri/renderD129".into(),
+            error: error.map(str::to_string),
+            reached,
+            pixel: PixelCheck::NotCovered(Codec::H265),
+        }
+    }
+
+    #[test]
+    fn an_hevc_request_with_a_passing_encode_passes_without_the_pixel_check() {
+        let v = verdict(10, &observed_hevc(10, Reached::Playing, None));
+        assert!(matches!(v, ProbeVerdict::Pass(_)), "{v:?}");
+        assert_eq!(v.exit_code(), 0);
+        assert!(v.line().contains("encoded 10 frames with vulkanh265enc"));
+        assert!(v.line().contains("h264 only"), "{}", v.line());
+    }
+
+    #[test]
+    fn a_pipeline_that_cannot_reach_ready_is_a_definitive_fail_carrying_the_evidence() {
+        let v = verdict(
+            10,
+            &Observed {
+                encoder: "vulkanav1enc".into(),
+                ..observed_hevc(
+                    0,
+                    Reached::NotReady,
+                    Some("vulkanav1enc0: Could not open the encoder (no AV1 encode profile)"),
+                )
+            },
+        );
+        assert!(matches!(v, ProbeVerdict::Fail(_)), "{v:?}");
+        assert_eq!(v.exit_code(), 1);
+        assert!(v.line().contains("could not reach READY"), "{}", v.line());
+        assert!(v.line().contains("no AV1 encode profile"), "{}", v.line());
+        assert!(!v.line().contains('\n'));
+    }
+
+    #[test]
+    fn a_pipeline_that_reached_ready_but_not_playing_is_a_fail_naming_playing() {
+        let v = verdict(10, &observed_hevc(0, Reached::NotPlaying, None));
+        assert_eq!(v.exit_code(), 1);
+        assert!(v.line().contains("could not reach PLAYING"), "{}", v.line());
+    }
+
+    /// The exit-code mapping for a non-H.264 request: the pixel check's absence is no
+    /// longer indeterminate (3), so the child answers pass (0) or fail (1).
+    #[test]
+    fn a_non_h264_request_exits_zero_or_one_never_indeterminate() {
+        for (seen, code) in [
+            (observed_hevc(10, Reached::Playing, None), 0),
+            (observed_hevc(3, Reached::Playing, None), 1),
+            (observed_hevc(10, Reached::Playing, Some("boom")), 1),
+            (observed_hevc(0, Reached::NotReady, None), 1),
+        ] {
+            assert_eq!(verdict(10, &seen).exit_code(), code);
+        }
+    }
+
+    #[test]
+    fn the_encoders_own_error_is_the_evidence_over_a_downstream_one() {
+        assert_eq!(
+            encoder_error_first(vec![
+                (false, "h265parse0: not-negotiated".into()),
+                (true, "vulkanh265enc0: no encode profile".into()),
+            ]),
+            Some("vulkanh265enc0: no encode profile".into())
+        );
+        assert_eq!(
+            encoder_error_first(vec![(false, "first".into()), (false, "second".into())]),
+            Some("first".into())
+        );
+        assert_eq!(encoder_error_first(Vec::new()), None);
+    }
+
+    #[test]
+    fn a_codec_probe_request_asks_for_ten_frames_within_ten_seconds() {
+        let r = MediaProbeRequest::codec_probe(1, Codec::Av1);
+        assert_eq!((r.gpu, r.codec.as_str(), r.frames), (1, "av1", 10));
+        assert_eq!(r.budget, Duration::from_secs(10));
+        assert_eq!((r.width, r.height, r.fps), (1280, 720, 60));
     }
 
     // ── #282 §8: the check id and its `blocks` are unchanged ─────────────────────────

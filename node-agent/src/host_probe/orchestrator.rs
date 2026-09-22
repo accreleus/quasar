@@ -9,9 +9,9 @@ use std::time::SystemTime;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info};
 
-use super::decision::{Action, Event, ProbeInputs, Scheduler};
+use super::decision::{Action, Event, ProbeInputs, Scheduler, Verdict};
 use super::outcome::ProbeOutcome;
-use super::{ProbeKind, ProbeTarget};
+use super::{ProbeCodec, ProbeKind, ProbeTarget};
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
@@ -95,8 +95,19 @@ impl ProbeHandle {
         });
     }
 
-    pub fn launch_failed(&self, gpu: i32, explains: std::collections::BTreeSet<ProbeKind>) {
-        self.send(Event::LaunchFailed { gpu, explains });
+    /// `codec` is the failed session's codec; above the floor it selects that codec probe
+    /// when `explains` names the media kind.
+    pub fn launch_failed(
+        &self,
+        gpu: i32,
+        explains: std::collections::BTreeSet<ProbeKind>,
+        codec: crate::session::Codec,
+    ) {
+        self.send(Event::LaunchFailed {
+            gpu,
+            explains,
+            codec: ProbeCodec::above_floor(codec),
+        });
     }
 
     pub fn encode_gate_freed(&self) {
@@ -121,6 +132,14 @@ impl ProbeHandle {
             }
         });
         (ProbeHandle { tx }, erx)
+    }
+}
+
+pub(super) fn verdict_of(outcome: &ProbeOutcome) -> Verdict {
+    match outcome {
+        ProbeOutcome::Pass { .. } => Verdict::Passed,
+        ProbeOutcome::Fail { .. } | ProbeOutcome::NotApplicable { .. } => Verdict::NotPassed,
+        ProbeOutcome::Indeterminate { .. } => Verdict::Indeterminate,
     }
 }
 
@@ -182,6 +201,7 @@ pub fn spawn_with_kinds(
                                 target = %target.check_id(),
                                 "host probe finished"
                             );
+                            let verdict = verdict_of(&outcome);
                             // Checked against the scheduler's current inputs: a GPU that
                             // vanished mid-run must not have its late result recorded.
                             if scheduler.accepts_result(target) {
@@ -191,7 +211,11 @@ pub fn spawn_with_kinds(
                                     observed_at: SystemTime::now(),
                                 });
                             }
-                            scheduler.step(Event::ProbeFinished { target, reconciled })
+                            scheduler.step(Event::ProbeFinished {
+                                target,
+                                reconciled,
+                                verdict,
+                            })
                         }
                         Ok(RunEnd::Deferred) => scheduler.step(Event::ProbeDeferred(target)),
                         Err(panic_text) => {
@@ -218,6 +242,7 @@ pub fn spawn_with_kinds(
                             scheduler.step(Event::ProbeFinished {
                                 target,
                                 reconciled: !target.kind.is_container(),
+                                verdict: Verdict::Indeterminate,
                             })
                         }
                     }
@@ -400,6 +425,7 @@ mod tests {
                 .map(|g| (*g, format!("pci-{g}")))
                 .collect::<BTreeMap<_, _>>(),
             settings: "s".into(),
+            codecs: BTreeMap::new(),
         }
     }
 
@@ -576,10 +602,59 @@ mod tests {
         rig.next_update().await;
         assert!(rig.runner.reconciles.lock().unwrap().is_empty());
 
-        rig.handle.launch_failed(0, [Audio].into());
+        rig.handle
+            .launch_failed(0, [Audio].into(), crate::session::Codec::H264);
         let again = rig.next_start().await;
         assert_eq!(again.target, ProbeTarget::host(Audio));
         assert_eq!(*rig.runner.reconciles.lock().unwrap(), vec![Audio]);
+    }
+
+    /// A media probe's outcome reaches the scheduler: a failing one leaves its GPU's codec
+    /// probe unrun, a passing one lets it run and records it under its own check id.
+    #[tokio::test]
+    async fn the_media_outcome_decides_whether_the_gpus_codec_probe_runs() {
+        let (started_tx, mut started) = mpsc::unbounded_channel();
+        let runner = Arc::new(FakeRunner {
+            started: started_tx,
+            reconciles: Mutex::new(Vec::new()),
+        });
+        let (handle, mut updates) = spawn_with_kinds(runner, &[Media]);
+        let mut with_codec = inputs(&[0, 1]);
+        with_codec.codecs = [0, 1]
+            .into_iter()
+            .map(|g| (g, [ProbeCodec::Av1].into()))
+            .collect();
+        handle.registered(with_codec);
+
+        let fail = RunEnd::Concluded {
+            outcome: ProbeOutcome::Fail {
+                summary: "no".into(),
+                remediation: "fix".into(),
+            },
+            reconciled: true,
+        };
+        for (target, end) in [
+            (ProbeTarget::gpu(Media, 0), fail),
+            (ProbeTarget::gpu(Media, 1), pass("ok")),
+            (ProbeTarget::codec(1, ProbeCodec::Av1), pass("av1 ok")),
+        ] {
+            let run = tokio::time::timeout(BOUND, started.recv())
+                .await
+                .expect("no probe started")
+                .unwrap();
+            assert_eq!(run.target, target);
+            run.finish.send(end).unwrap();
+            assert!(matches!(
+                tokio::time::timeout(BOUND, updates.recv()).await.unwrap().unwrap(),
+                ReportUpdate::Record { target: t, .. } if t == target
+            ));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), started.recv())
+                .await
+                .is_err(),
+            "the codec probe of the GPU whose media probe failed ran"
+        );
     }
 
     #[test]
