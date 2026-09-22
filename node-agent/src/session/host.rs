@@ -43,14 +43,6 @@ pub struct SessionHost {
     /// `None` under `use_test_audio` or when start failed (socket timeout). The
     /// sidecar's `Drop` removes its container.
     pulse: Option<PulseSidecar>,
-    /// A previous app-container stop was unconfirmed. Cleared when a later stop
-    /// proves removal.
-    udev_blocked: bool,
-    /// An app container was launched and has not been proven gone.
-    mount_live: bool,
-    /// Last container-stop outcome. An unconfirmed result is not asked again
-    /// from `Drop`; a busy result is, because the engine was never called.
-    ended: Option<super::teardown::StopAttempt>,
     /// Why there is no sidecar despite wanting one (session streams silence), or
     /// `None`. Mirrors `SessionResources::audio_degraded` (see source.rs).
     audio_degraded: Option<String>,
@@ -130,9 +122,6 @@ impl SessionHost {
                 container: None,
                 launched: false,
                 pulse,
-                udev_blocked: false,
-                mount_live: false,
-                ended: None,
                 audio_degraded,
             },
             pulse_server,
@@ -226,7 +215,6 @@ impl SessionHost {
                     wl_display
                 );
                 self.container = Some(c);
-                self.mount_live = true;
             }
             Err(e) => tracing::error!(
                 token = "app-container-launch-failed",
@@ -235,95 +223,38 @@ impl SessionHost {
         }
     }
 
-    /// Tear everything down (idempotent). `Drop` is the final chance.
-    /// Order: app container, then udev export, then PulseAudio sidecar — and the
-    /// sidecar is stopped even when the app stop is unconfirmed. A busy client
-    /// is retried; it is not treated as a failed stop.
+    /// Tear everything down (idempotent). `Drop` is the backstop.
+    /// Order: app container first (stops producing audio), then PulseAudio sidecar.
+    ///
+    /// The udev export is retired explicitly here, AFTER the container's stop is
+    /// confirmed — not on a failed/pending stop, which leaves the bind mount's
+    /// fate uncertain; the dir+marker then stay for the boot sweep.
     pub fn teardown(&mut self) {
-        self.release(false);
-    }
-
-    fn release(&mut self, final_chance: bool) {
-        let report = self.finish_container_stop();
-        let already_blocked = self.udev_blocked;
-        let mount_live = self.mount_live;
-        self.udev_blocked = super::teardown::blocked_after(report, already_blocked);
-        if matches!(report, super::teardown::StopAttempt::Confirmed) {
-            self.mount_live = false;
-        }
-        let action = super::teardown::action_this_chance(
-            super::teardown::udev_action(report, already_blocked, mount_live),
-            final_chance,
-            mount_live,
-        );
-        if matches!(action, super::teardown::UdevAction::Abandon) {
-            tracing::warn!(
-                token = "udev-export-retire-skipped",
-                session = %self.session_id,
-                "an app container stop was not proven — leaving the udev export \
-                 dir for the boot sweep"
-            );
-        }
-        super::teardown::on_udev(
-            action,
-            || {
-                if let Some(devices) = self.devices.as_ref() {
-                    devices.retire_udev_export();
+        if let Some(c) = self.container.as_mut() {
+            if let Err(error) = c.stop() {
+                tracing::warn!(
+                    token = "application-host-teardown-pending",
+                    "application teardown remains durable: {error}"
+                );
+                if let Some(d) = self.devices.as_ref() {
+                    d.abandon_udev_export();
                 }
-            },
-            || {
-                if let Some(devices) = self.devices.as_ref() {
-                    devices.abandon_udev_export();
-                }
-            },
-        );
-        if let Some(pulse) = self.pulse.as_mut() {
-            pulse.stop();
-        }
-    }
-
-    fn finish_container_stop(&mut self) -> super::teardown::StopAttempt {
-        if let Some(report) = self.ended {
-            if !matches!(report, super::teardown::StopAttempt::Retryable) {
-                return report;
+                return;
             }
+            self.container.take();
         }
-        let report = super::teardown::retry_retryable(
-            || self.stop_container_once(),
-            || std::thread::sleep(super::teardown::STOP_PAUSE),
-            super::teardown::STOP_ATTEMPTS,
-        );
-        self.ended = Some(report);
-        report
-    }
-
-    fn stop_container_once(&mut self) -> super::teardown::StopAttempt {
-        if self.container.is_none() {
-            return super::teardown::StopAttempt::Absent;
+        if let Some(d) = self.devices.as_ref() {
+            d.retire_udev_export();
         }
-        let stopped = self.container.as_mut().unwrap().stop();
-        match stopped {
-            Ok(()) => {
-                self.container.take();
-                super::teardown::StopAttempt::Confirmed
-            }
-            Err(error) => {
-                let report = super::teardown::classify_stop(super::teardown::error_kind(&error));
-                if !matches!(report, super::teardown::StopAttempt::Retryable) {
-                    tracing::warn!(
-                        token = "application-host-teardown-pending",
-                        "application teardown remains durable: {error}"
-                    );
-                }
-                report
-            }
+        if let Some(mut p) = self.pulse.take() {
+            p.stop();
         }
     }
 }
 
 impl Drop for SessionHost {
     fn drop(&mut self) {
-        self.release(true);
+        self.teardown();
     }
 }
 

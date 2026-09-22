@@ -222,17 +222,6 @@ own; the two do not move together, and that is deliberate.
   sibling EGL self-test now runs through this profile with an identical container
   configuration. There are no probe callers yet (#259).
 
-### Fixed
-- **An idle reap releases the pulse sidecar and the fake-udev export (#314).** A busy
-  runtime client never asked the engine, but the session treated that as an unconfirmed
-  stop: the sidecar latched itself in `Running` (recovery will not remove a live sidecar),
-  and the udev export was abandoned even after a later stop proved the app container gone.
-  Session end retries a busy or cancelled client, releases the sidecar and `udev-<sid>`
-  (directory, then owner marker) before the source pipeline is set to NULL, and leaves
-  the export for the boot sweep only when removal was not proven. An intentional stop, a
-  peer disconnect, an app exit, an encode failure, and a live agent's grace-window stop
-  use that same decision.
-
 ### Known limitations
 - Vulkan H.264 and HEVC encode produces a corrupt picture on an AMD Granite Ridge iGPU
   (RADV, Mesa 25.3.6), while `vah264enc` on the same host is clean (#272). Vulkan remains
