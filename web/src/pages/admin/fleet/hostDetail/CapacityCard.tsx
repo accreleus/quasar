@@ -12,6 +12,7 @@ import { Chip } from "../../../../components/Chip";
 import { bytesFromMb } from "../../../../lib/format/bytes";
 import { relativeTime } from "../../../../lib/format/relativeTime";
 import { primaryGpuLabel } from "../../../../lib/gpu";
+import { GpuCodecChips } from "../GpuCodecChips";
 import {
   percentOf,
   schedulingLabel,
@@ -249,6 +250,12 @@ function GpuRow({ gpu }: { gpu: GPUAvailability }) {
           value={`${gpu.slots_reserved} / ${gpu.slots_total}`}
           variant={tone(slotPct)}
         />
+        <div className="bar-row" style={{ flexWrap: "wrap", rowGap: 4 }}>
+          <span className="lbl">CODECS</span>
+          <span style={{ display: "flex", gap: "var(--s2)", flexWrap: "wrap" }}>
+            <GpuCodecChips codecs={gpu.codecs} />
+          </span>
+        </div>
       </div>
     </div>
   );
