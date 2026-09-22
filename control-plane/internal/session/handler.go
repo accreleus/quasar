@@ -922,6 +922,10 @@ func (h *Handler) handleHostGPUs(w http.ResponseWriter, r *http.Request) {
 		ActiveSessions int32   `json:"active_sessions"`
 		RenderNode     *string `json:"render_node"`
 		DevicePath     *string `json:"device_path"`
+		// Codecs (#296 amendment 12): this GPU's codec set, or its host's when it
+		// reports none. Null only when neither has ever reported — deliberately
+		// not normalised to ["h264"] (openapi.yaml GPUAvailability.codecs).
+		Codecs []string `json:"codecs"`
 	}
 	items := make([]gpuResp, 0, len(avail))
 	for _, g := range avail {
@@ -939,6 +943,7 @@ func (h *Handler) handleHostGPUs(w http.ResponseWriter, r *http.Request) {
 			ActiveSessions: g.ActiveSessions,
 			RenderNode:     g.RenderNode,
 			DevicePath:     g.DevicePath,
+			Codecs:         g.Codecs,
 		})
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": items})

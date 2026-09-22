@@ -183,6 +183,12 @@ type GPUCapacity struct {
 	// row, which is refused at launch when it names a different one. Absent means
 	// unknown and matching then fails open. Wholesale-replaced with the gpus set.
 	DriverIdentity *string `json:"driver_identity"`
+	// Codecs (amendment 12, #296, agent-api.md `capacity.gpus[].codecs`): the wire
+	// codec set this GPU has been shown to encode. Absent ⇒ nil ⇒ stored NULL,
+	// read as inheriting the host's `codecs` (session.gpuCodecSetSQL). Like
+	// RenderNode/DriverIdentity it is wholesale-replaced with the gpus set, no
+	// keep-if-absent rule.
+	Codecs []string `json:"codecs"`
 }
 
 // HeartbeatMsg is sent periodically by the agent.

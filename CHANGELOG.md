@@ -25,6 +25,15 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Per-GPU codec sets, end to end (#302, amendment 12).** Each GPU reports the codecs it has
+  been shown to encode (`capacity.gpus[].codecs`, the same per-GPU sets the host-level `codecs`
+  union is derived from, so the two cannot disagree; a zero-slot GPU reports an empty set). The control
+  plane stores it in `gpus.codecs` (migration 0086; NULL means the GPU inherits its host's set, which
+  is what an older agent produces), and `GET /v1/hosts/{id}/gpus` returns `codecs` per GPU (null only
+  when neither the GPU nor its host has ever reported). The fleet host expansion and the host
+  capacity card show each GPU's codecs as chips beside its slots. At `session_assign` the agent
+  refuses a codec outside the bound GPU's current set with `ack{ok:false}` (log token
+  `assign-codec-not-in-gpu-set`), a check behind the control plane's own; H.264 is never refused.
 - **Codec probes (#300).** After a GPU's H.264 media probe passes, the agent runs the same
   probe on that GPU for each codec above the floor its encoder can build (HEVC, AV1): 10
   frames within 10 s, passing when the encoder reaches PLAYING and produces them. The result

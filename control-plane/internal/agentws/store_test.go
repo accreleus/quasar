@@ -419,6 +419,87 @@ func TestUpsertCapacityGPUDriverIdentityPersists(t *testing.T) {
 	}
 }
 
+// rawGPUCodecs reads gpus.codecs by (host, index) as stored — nil is the
+// column's SQL NULL, distinct from a scanned empty JSON array.
+func rawGPUCodecs(t *testing.T, pool *pgxpool.Pool, hostID string, index int) []byte {
+	t.Helper()
+	var raw []byte
+	if err := pool.QueryRow(context.Background(),
+		`SELECT codecs FROM gpus WHERE host_id::text = $1 AND index = $2`, hostID, index).Scan(&raw); err != nil {
+		t.Fatalf("query gpu codecs: %v", err)
+	}
+	return raw
+}
+
+// TestUpsertCapacityGPUCodecsPersists (#296 amendment 12): gpus.codecs rides
+// the same wholesale-replace GPU upsert as render_node/driver_identity. A GPU
+// that omits the field stores NULL (inherit hosts.codecs), never a keep-if-
+// absent read of a prior report — the whole gpus set is wholesale-replaced.
+func TestUpsertCapacityGPUCodecsPersists(t *testing.T) {
+	pool := testPool(t)
+	s := &agentStore{pool: pool}
+	hostID := seedHost(t, pool)
+	ctx := context.Background()
+
+	gpus := []GPUCapacity{
+		{Index: 0, Vendor: "nvidia", Model: "RTX 5090", VRAMMBTotal: 32768, EncodeSlotsTotal: 3,
+			Codecs: []string{"h264", "h265", "av1"}},
+		{Index: 1, Vendor: "amd", Model: "Radeon Pro V520", VRAMMBTotal: 16384, EncodeSlotsTotal: 2},
+	}
+	if err := s.upsertCapacity(ctx, hostID, HostCapacity{}, nil, gpus); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	var got []string
+	if err := json.Unmarshal(rawGPUCodecs(t, pool, hostID, 0), &got); err != nil {
+		t.Fatalf("unmarshal gpu 0 codecs: %v", err)
+	}
+	if len(got) != 3 || got[0] != "h264" || got[1] != "h265" || got[2] != "av1" {
+		t.Fatalf("gpu 0 codecs: got %v, want [h264 h265 av1]", got)
+	}
+	if raw := rawGPUCodecs(t, pool, hostID, 1); raw != nil {
+		t.Errorf("gpu 1 codecs = %s, want NULL (not reported)", raw)
+	}
+
+	// A re-report that stops carrying a set clears it — wholesale replace, not
+	// keep-if-absent, exactly like driver_identity above.
+	gpus[0].Codecs = nil
+	if err := s.upsertCapacity(ctx, hostID, HostCapacity{}, nil, gpus); err != nil {
+		t.Fatalf("re-upsert: %v", err)
+	}
+	if raw := rawGPUCodecs(t, pool, hostID, 0); raw != nil {
+		t.Errorf("gpu 0 codecs = %s after a report without one, want NULL", raw)
+	}
+}
+
+// TestUpsertCapacityGPUCodecsEmptyArrayStoredAsIs: an explicit `[]` (a
+// zero-slot GPU may report one, agent-api.md) is a real report and is NOT the
+// same as NULL — it must not inherit the host's set.
+func TestUpsertCapacityGPUCodecsEmptyArrayStoredAsIs(t *testing.T) {
+	pool := testPool(t)
+	s := &agentStore{pool: pool}
+	hostID := seedHost(t, pool)
+	ctx := context.Background()
+
+	gpus := []GPUCapacity{
+		{Index: 0, Vendor: "amd", Model: "iGPU", VRAMMBTotal: 512, EncodeSlotsTotal: 0, Codecs: []string{}},
+	}
+	if err := s.upsertCapacity(ctx, hostID, HostCapacity{}, nil, gpus); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	raw := rawGPUCodecs(t, pool, hostID, 0)
+	if raw == nil {
+		t.Fatal("gpu 0 codecs = NULL, want the stored empty array")
+	}
+	var got []string
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal gpu 0 codecs: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("gpu 0 codecs: got %v, want []", got)
+	}
+}
+
 func TestFailedCapacityReportRetainsHistoryButUnschedulesGPU(t *testing.T) {
 	pool := testPool(t)
 	s := &agentStore{pool: pool}

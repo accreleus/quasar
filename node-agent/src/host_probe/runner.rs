@@ -452,6 +452,7 @@ mod tests {
             render_node: render_node.map(str::to_string),
             device_path: render_node.map(str::to_string),
             driver_identity: None,
+            codecs: None,
         }
     }
 
