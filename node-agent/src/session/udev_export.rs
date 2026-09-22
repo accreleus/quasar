@@ -13,15 +13,21 @@
 //! `session::source`); on a killed agent neither `Drop` nor an explicit call
 //! ever runs, so [`retire_all_owned`] reconciles at boot — only removing a
 //! marker+directory pair this agent's persistent owner token wrote.
+//!
+//! The sibling-marker mechanics (write-marker-first, bounded symlink-refusing
+//! read, dir-then-marker retire, owner-scoped boot reconcile) live in
+//! `crate::owned_entry`, shared with `host_probe::media_probe_dir`.
 
-use std::fs::OpenOptions;
-use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 
-const MAX_MARKER_BYTES: usize = 4096;
+use crate::owned_entry::{self, OwnedMarker};
+
+pub use crate::owned_entry::Summary;
+
+const PREFIX: &str = "udev-";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Marker {
@@ -29,128 +35,30 @@ struct Marker {
     session: String,
 }
 
-/// Reconciliation counts from [`retire_all_owned`].
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct Summary {
-    /// Owned marker+directory pairs retired.
-    pub removed: usize,
-    /// Entries left alone: a foreign/malformed marker, or a directory with no
-    /// marker at all (a pre-fix leftover).
-    pub unattributable: usize,
-    /// Retire attempts that failed (marker/dir left in place, logged by caller).
-    pub errors: usize,
+impl OwnedMarker for Marker {
+    fn owner(&self) -> &str {
+        &self.owner
+    }
 }
 
 /// `{runtime_dir}/udev-{session_id}`, bind-mounted into the app container.
 pub fn export_dir(runtime_dir: &str, session_id: &str) -> PathBuf {
-    PathBuf::from(runtime_dir).join(format!("udev-{session_id}"))
+    owned_entry::entry_dir(runtime_dir, PREFIX, session_id)
 }
 
 /// `{runtime_dir}/udev-{session_id}.owner`, the sibling ownership marker.
 pub fn marker_path(runtime_dir: &str, session_id: &str) -> PathBuf {
-    PathBuf::from(runtime_dir).join(format!("udev-{session_id}.owner"))
+    owned_entry::marker_path(runtime_dir, PREFIX, session_id)
 }
 
-fn fsync_parent(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("{} has no parent", path.display()))?;
-    std::fs::File::open(parent)
-        .and_then(|f| f.sync_all())
-        .with_context(|| format!("fsync parent of {}", path.display()))
-}
-
-/// Bounded, symlink-refusing marker read. `Ok(None)` = no marker. `Err` = present
-/// but unreadable/malformed — the caller treats that as unattributable, not fatal.
-fn read_marker(path: &Path) -> Result<Option<Marker>> {
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).context("open udev export marker"),
-    };
-    let metadata = file.metadata().context("stat udev export marker")?;
-    if !metadata.is_file() {
-        return Err(anyhow!(
-            "udev export marker at {} is not a regular file",
-            path.display()
-        ));
-    }
-    let mut bytes = Vec::new();
-    file.take((MAX_MARKER_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .context("read udev export marker")?;
-    if bytes.len() > MAX_MARKER_BYTES {
-        return Err(anyhow!(
-            "udev export marker at {} exceeds bound",
-            path.display()
-        ));
-    }
-    let marker: Marker = serde_json::from_slice(&bytes).context("parse udev export marker")?;
-    Ok(Some(marker))
-}
-
-fn write_marker(path: &Path, owner: &str, session_id: &str) -> Result<()> {
-    let body = serde_json::to_vec(&Marker {
-        owner: owner.to_string(),
-        session: session_id.to_string(),
-    })
-    .context("serialize udev export marker")?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .with_context(|| format!("create {}", path.display()))?;
-    file.write_all(&body)
-        .and_then(|_| file.sync_all())
-        .with_context(|| format!("write {}", path.display()))?;
-    fsync_parent(path)
-}
-
-/// Remove the export directory content-first: refuse a symlink or non-directory
-/// outright (leave it untouched), otherwise remove its (plain-file) entries then
-/// the directory itself. Missing is success.
-fn remove_export_dir(dir: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(dir) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                return Err(anyhow!(
-                    "refusing to remove non-directory at {}",
-                    dir.display()
-                ));
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("stat {}", dir.display())),
-    }
-    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
-        let entry = entry.with_context(|| format!("read entry under {}", dir.display()))?;
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("stat {}", entry.path().display()))?;
-        if file_type.is_symlink() || file_type.is_dir() {
-            return Err(anyhow!(
-                "unexpected non-file entry {} in udev export dir",
-                entry.path().display()
-            ));
-        }
-        std::fs::remove_file(entry.path())
-            .with_context(|| format!("remove {}", entry.path().display()))?;
-    }
-    std::fs::remove_dir(dir).with_context(|| format!("remove {}", dir.display()))
-}
-
-fn remove_marker(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("remove {}", path.display())),
-    }
+fn write_marker(path: &std::path::Path, owner: &str, session_id: &str) -> Result<()> {
+    owned_entry::write_marker(
+        path,
+        &Marker {
+            owner: owner.to_string(),
+            session: session_id.to_string(),
+        },
+    )
 }
 
 /// Idempotent: remove the export directory, THEN its marker — marker last, so an
@@ -161,8 +69,7 @@ pub fn retire(runtime_dir: &str, session_id: &str) -> Result<()> {
     if malformed_session_id(session_id) {
         return Err(anyhow!("refusing malformed session id {session_id:?}"));
     }
-    remove_export_dir(&export_dir(runtime_dir, session_id))?;
-    remove_marker(&marker_path(runtime_dir, session_id))
+    owned_entry::retire_entry(runtime_dir, PREFIX, session_id)
 }
 
 /// Publish this session's fake-udev records under `runtime_dir`, marking
@@ -184,7 +91,7 @@ pub fn publish(
         return Err(anyhow!("refusing malformed session id {session_id:?}"));
     }
     let marker = marker_path(runtime_dir, session_id);
-    match read_marker(&marker) {
+    match owned_entry::read_marker::<Marker>(&marker) {
         Ok(Some(existing)) if existing.owner == owner => {
             // A stale marker from an earlier life of this exact agent (e.g. the
             // standalone harness's fixed sid "demo"). Reclaim it inline.
@@ -244,45 +151,7 @@ fn malformed_session_id(sid: &str) -> bool {
 /// follows a symlink. Must run only where "ours" implies "dead" (boot, after
 /// application retirement) — never the periodic maintenance tick.
 pub fn retire_all_owned(runtime_dir: &str, owner: &str) -> Summary {
-    let mut summary = Summary::default();
-    let entries = match std::fs::read_dir(runtime_dir) {
-        Ok(entries) => entries,
-        Err(_) => return summary,
-    };
-    let mut marker_sids: Vec<String> = Vec::new();
-    let mut dir_sids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for entry in entries.flatten() {
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let Some(rest) = name.strip_prefix("udev-") else {
-            continue;
-        };
-        if let Some(sid) = rest.strip_suffix(".owner") {
-            marker_sids.push(sid.to_string());
-        } else if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            dir_sids.insert(rest.to_string());
-        }
-    }
-    for sid in marker_sids {
-        dir_sids.remove(&sid);
-        if malformed_session_id(&sid) {
-            summary.unattributable += 1;
-            continue;
-        }
-        match read_marker(&marker_path(runtime_dir, &sid)) {
-            Ok(Some(marker)) if marker.owner == owner => match retire(runtime_dir, &sid) {
-                Ok(()) => summary.removed += 1,
-                Err(_) => summary.errors += 1,
-            },
-            Ok(Some(_)) => summary.unattributable += 1,
-            Ok(None) => {} // Raced away between listing and reading; nothing to do.
-            Err(_) => summary.unattributable += 1,
-        }
-    }
-    // `udev-*` directories with no marker at all: pre-fix leftovers. Leave them.
-    summary.unattributable += dir_sids.len();
-    summary
+    owned_entry::retire_all_owned::<Marker>(runtime_dir, PREFIX, owner, malformed_session_id)
 }
 
 #[cfg(test)]
@@ -547,7 +416,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let runtime_dir = tmp.path().to_str().unwrap();
         std::fs::create_dir(export_dir(runtime_dir, "sid1")).unwrap();
-        let oversized = vec![b'a'; MAX_MARKER_BYTES + 1];
+        let oversized = vec![b'a'; owned_entry::MAX_MARKER_BYTES + 1];
         std::fs::write(marker_path(runtime_dir, "sid1"), &oversized).unwrap();
 
         let summary = retire_all_owned(runtime_dir, "owner-a");

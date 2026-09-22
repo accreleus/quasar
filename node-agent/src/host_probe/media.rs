@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use tokio::sync::watch;
 
 use super::child::{run_child, ChildSpec};
+use super::media_probe_dir::{self, ProbeRuntimeDir};
 use super::outcome::ChildEnd;
 use crate::messages::GpuCapacity;
 use crate::session::probe_media::MediaProbeRequest;
@@ -97,6 +98,59 @@ pub fn child_spec(
     })
 }
 
+/// The child's private `XDG_RUNTIME_DIR`: owner-marked when this process holds a
+/// container-ownership token, so a killed agent's boot reconcile
+/// (`media_probe_dir::retire_all_owned`) can reclaim it; a bare (unmarked)
+/// tempdir otherwise — e.g. when no ownership token can be obtained, there is
+/// nothing for that reconcile to attribute either.
+enum RuntimeDir {
+    Owned(ProbeRuntimeDir),
+    Bare(tempfile::TempDir),
+}
+
+impl RuntimeDir {
+    fn path(&self) -> &std::path::Path {
+        match self {
+            RuntimeDir::Owned(dir) => dir.path(),
+            RuntimeDir::Bare(dir) => dir.path(),
+        }
+    }
+
+    /// Best-effort explicit removal so a normal-completion run doesn't wait on
+    /// `Drop`; `Drop` (on both variants) remains the backstop for a path this
+    /// misses. Errors are logged, not propagated — the probe's own result must
+    /// still return.
+    fn retire(&mut self) {
+        if let RuntimeDir::Owned(dir) = self {
+            if let Err(e) = dir.retire() {
+                tracing::warn!(
+                    token = "media-probe-dir-retire-failed",
+                    "media probe runtime dir retire failed: {e:#}"
+                );
+            }
+        }
+    }
+}
+
+fn acquire_runtime_dir(parent: &std::path::Path) -> Result<RuntimeDir> {
+    match crate::container_ownership::token() {
+        Ok(owner) => {
+            media_probe_dir::acquire(&parent.to_string_lossy(), &owner).map(RuntimeDir::Owned)
+        }
+        Err(_) => {
+            // Unlike `media_probe_dir::acquire` (which creates `parent` itself via
+            // its marker write), `tempdir_in` requires it to exist already.
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+            tempfile::Builder::new()
+                .prefix("quasar-media-probe-")
+                .tempdir_in(parent)
+                .map(RuntimeDir::Bare)
+                .context("create the media probe's runtime dir")
+        }
+    }
+}
+
 /// Hold the probe gate for exactly the child's life. `Err(GateRefusal)` means a warm-up
 /// (or another probe) holds it and nothing was spawned.
 ///
@@ -112,18 +166,12 @@ pub async fn run(
         Some(control) => Some(control.try_acquire_probe()?),
         None => None,
     };
-    let parent = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .filter(|p| p.is_dir())
-        .unwrap_or_else(std::env::temp_dir);
-    let runtime_dir = match tempfile::Builder::new()
-        .prefix("quasar-media-probe-")
-        .tempdir_in(parent)
-    {
+    let parent = std::path::PathBuf::from(media_probe_dir::probe_parent_dir());
+    let mut runtime_dir = match acquire_runtime_dir(&parent) {
         Ok(dir) => dir,
         Err(e) => {
             return Ok(ChildEnd::SpawnFailed(format!(
-                "cannot create a runtime directory for the media probe: {e}"
+                "cannot create a runtime directory for the media probe: {e:#}"
             )))
         }
     };
@@ -131,7 +179,9 @@ pub async fn run(
         "XDG_RUNTIME_DIR".into(),
         runtime_dir.path().to_string_lossy().into_owned(),
     ));
-    Ok(run_child(spec, preempt).await)
+    let end = run_child(spec, preempt).await;
+    runtime_dir.retire();
+    Ok(end)
 }
 
 #[cfg(test)]

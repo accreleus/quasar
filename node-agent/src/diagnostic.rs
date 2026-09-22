@@ -255,9 +255,11 @@ pub fn startup_cleanup(client: &RuntimeClient) -> CleanupAttempt {
                 warn!(token = "runtime-probe-retirement-pending", %error,
                     "previous host-probe cleanup remains journalled; the maintenance pass and the next probe retry it");
             }
-            // A killed agent never runs a session's udev-export Drop. "Ours"
-            // implies "dead" only here, right after application retirement — never
-            // the periodic maintenance tick.
+            // A killed agent never runs a session's udev-export Drop, nor a
+            // media probe's runtime-dir Drop (the same failure mode, a
+            // recreate or the NVIDIA agent's own self-restart mid-probe). "Ours"
+            // implies "dead" only here, right after application retirement —
+            // never the periodic maintenance tick.
             match crate::container_ownership::token() {
                 Ok(owner) => {
                     let summary = crate::session::udev_export::retire_all_owned(
@@ -281,9 +283,30 @@ pub fn startup_cleanup(client: &RuntimeClient) -> CleanupAttempt {
                             "boot udev-export reconciliation: {summary:?}"
                         );
                     }
+                    let media_summary = crate::host_probe::media_probe_dir::retire_all_owned(
+                        &crate::host_probe::media_probe_dir::probe_parent_dir(),
+                        &owner,
+                    );
+                    if media_summary.errors > 0 {
+                        warn!(
+                            token = "media-probe-dir-reconcile-errors",
+                            removed = media_summary.removed,
+                            unattributable = media_summary.unattributable,
+                            errors = media_summary.errors,
+                            "boot media-probe-dir reconciliation: {media_summary:?}"
+                        );
+                    } else if media_summary.removed > 0 || media_summary.unattributable > 0 {
+                        info!(
+                            token = "media-probe-dir-retired",
+                            removed = media_summary.removed,
+                            unattributable = media_summary.unattributable,
+                            errors = media_summary.errors,
+                            "boot media-probe-dir reconciliation: {media_summary:?}"
+                        );
+                    }
                 }
-                Err(error) => warn!(token = "udev-retire-no-owner", %error,
-                    "no owner token at boot; skipping udev-export reconciliation"),
+                Err(error) => warn!(token = "owned-entry-retire-no-owner", %error,
+                    "no owner token at boot; skipping udev-export and media-probe-dir reconciliation"),
             }
         },
         || crate::agent::legacy_container_sweep(client),

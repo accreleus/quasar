@@ -1061,6 +1061,12 @@ cleanup() {
                 [ "$sid" = "$created" ] && attributable=1 && break
               done
               ;;
+            quasar-media-probe-*)
+              # No-op: the random suffix is minted by the agent and never surfaces
+              # here, so neither the dir nor its ".owner" marker can be attributed
+              # to this harness — both stay unattributable, for the agent's own
+              # boot reconcile to retire.
+              ;;
           esac
         fi
         if [ "$attributable" = "1" ]; then
