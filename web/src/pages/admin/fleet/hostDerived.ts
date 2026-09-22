@@ -204,3 +204,46 @@ export function hostStateChip(host: HostLike): "success" | "warning" | "danger" 
   if (state === "offline" || state === "degraded") return "danger";
   return "neutral";
 }
+
+// ── GPU summary (row) ────────────────────────────────────────────────────────
+
+export interface GpuGroupInput {
+  vendor: string;
+  model: string;
+}
+
+/** One distinct vendor+model among a host's GPUs, and how many it has. */
+export interface GpuGroup {
+  vendor: string;
+  model: string;
+  count: number;
+}
+
+/**
+ * Groups a host's GPUs by vendor+model, first-seen order preserved. A `×N`
+ * count is only ever truthful within a group — a mixed host (#310, e.g. one
+ * RTX 5090 + one AMD iGPU) yields two one-count groups instead of collapsing
+ * into "<first model> ×<total>".
+ */
+export function groupGpusByModel(gpus: readonly GpuGroupInput[]): GpuGroup[] {
+  const groups: GpuGroup[] = [];
+  for (const g of gpus) {
+    const existing = groups.find((group) => group.vendor === g.vendor && group.model === g.model);
+    if (existing) {
+      existing.count++;
+    } else {
+      groups.push({ vendor: g.vendor, model: g.model, count: 1 });
+    }
+  }
+  return groups;
+}
+
+/** Distinct vendors across a host's GPUs, first-seen order preserved — the
+ *  row's vendor sub-line, truthful for a mixed-vendor host too. */
+export function distinctGpuVendors(groups: readonly GpuGroup[]): string[] {
+  const vendors: string[] = [];
+  for (const g of groups) {
+    if (!vendors.includes(g.vendor)) vendors.push(g.vendor);
+  }
+  return vendors;
+}

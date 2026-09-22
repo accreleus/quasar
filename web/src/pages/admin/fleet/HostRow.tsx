@@ -4,6 +4,7 @@
  * so every control inside it stops propagation.
  */
 
+import { Fragment } from "react";
 import type { GPUAvailability, Host } from "../../../api/types";
 import { ActionsMenu, type ActionsMenuEntry } from "../../../components/ActionsMenu";
 import { Bar } from "../../../components/Bar";
@@ -15,6 +16,8 @@ import { shortId } from "../../../lib/format/shortId";
 import { primaryGpuLabel } from "../../../lib/gpu";
 import { HostExpansion } from "./HostExpansion";
 import {
+  distinctGpuVendors,
+  groupGpusByModel,
   heartbeatTone,
   hostStateDot,
   hostStateLabel,
@@ -181,20 +184,28 @@ export function HostRow(props: HostRowProps) {
   );
 }
 
-/** The first GPU names the host; the rest are a count, as the mock renders it.
- *  "Reading GPUs" and "no GPUs" are different facts, so they read differently. */
+/** Groups of the same model get the mock's `×N`; a mixed host (#310) names
+ *  each distinct model instead of the first GPU's model times the total
+ *  count. "Reading GPUs" and "no GPUs" are different facts, so they read
+ *  differently. */
 function GpuCell({ gpus }: { gpus: GPUAvailability[] | null | undefined }) {
   if (gpus === undefined) return <span className="sub">…</span>;
   if (gpus === null) return <span className="sub">n/a</span>;
   if (gpus.length === 0) return <span className="sub">No GPUs reported</span>;
-  const first = gpus[0];
+  const groups = groupGpusByModel(gpus);
+  const vendors = distinctGpuVendors(groups);
   return (
     <div className="stack">
       <span>
-        {primaryGpuLabel(first.vendor, first.model)}
-        {gpus.length > 1 && <span className="sub"> ×{gpus.length}</span>}
+        {groups.map((g, i) => (
+          <Fragment key={`${g.vendor}:${g.model}`}>
+            {i > 0 && " + "}
+            {primaryGpuLabel(g.vendor, g.model)}
+            {g.count > 1 && <span className="sub"> ×{g.count}</span>}
+          </Fragment>
+        ))}
       </span>
-      <span className="sub">{first.vendor}</span>
+      <span className="sub">{vendors.join(" + ")}</span>
     </div>
   );
 }
