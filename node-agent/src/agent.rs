@@ -1174,6 +1174,49 @@ fn gpu_codec_sets(
         .collect()
 }
 
+/// A `session_assign` the codec belt refuses: the log line and the ack error, decided
+/// without I/O so tests assert on it rather than capture `tracing` events, whose
+/// process-global interest cache races parallel tests (#313).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssignCodecRefusal {
+    log: String,
+    ack_error: String,
+}
+
+/// The #302 belt's decision: refuse `codec` on `gpu_index` unless that GPU's current
+/// set (from [`gpu_codec_sets`]) carries it. H.264 is exempt — it is the floor of
+/// every usable GPU's set by construction (`gpu_codecs::gpu_codec_set`) and never
+/// fails to resolve. A GPU absent from `sets` has an empty set.
+fn assign_codec_refusal(
+    session_id: &str,
+    gpu_index: i32,
+    codec: Codec,
+    sets: &[(i32, BTreeSet<Codec>)],
+) -> Option<AssignCodecRefusal> {
+    if codec == Codec::H264 {
+        return None;
+    }
+    let empty = BTreeSet::new();
+    let gpu_codecs = sets
+        .iter()
+        .find(|(index, _)| *index == gpu_index)
+        .map_or(&empty, |(_, set)| set);
+    if gpu_codecs.contains(&codec) {
+        return None;
+    }
+    Some(AssignCodecRefusal {
+        log: format!(
+            "session {session_id} assignment rejected: gpu={gpu_index} codec={} not in \
+             this GPU's current codec set {gpu_codecs:?}",
+            codec.as_str()
+        ),
+        ack_error: format!(
+            "gpu {gpu_index} cannot encode {}: not in its current codec set",
+            codec.as_str()
+        ),
+    })
+}
+
 /// The host union (`capacity.codecs`, #301, agent-api.md amendment 12) as wire strings,
 /// from already-computed per-GPU sets: H.264 plus every codec any usable GPU's set
 /// carries. Always non-empty.
@@ -3076,33 +3119,17 @@ impl SessionManager {
                 // (it can shrink faster than a report reaches the control plane, e.g.
                 // right after an agent restart) must refuse here rather than let
                 // `pipeline::resolve_effective_encoder` build a pipeline that fails later.
-                // H.264 is exempt: it is the floor of every usable GPU's set by
-                // construction (`gpu_codecs::gpu_codec_set`) and never fails to resolve.
-                let codec = cfg.stream.codec;
-                if codec != Codec::H264 {
-                    let gpu_codecs = self
-                        .gpu_codec_sets()
-                        .into_iter()
-                        .find(|(index, _)| *index == gpu_index)
-                        .map(|(_, set)| set)
-                        .unwrap_or_default();
-                    if !gpu_codecs.contains(&codec) {
-                        warn!(
-                            token = "assign-codec-not-in-gpu-set",
-                            "session {session_id} assignment rejected: gpu={gpu_index} \
-                             codec={} not in this GPU's current codec set {gpu_codecs:?}",
-                            codec.as_str()
-                        );
-                        self.note_session_count();
-                        return Some(ack(
-                            id,
-                            false,
-                            Some(format!(
-                                "gpu {gpu_index} cannot encode {}: not in its current codec set",
-                                codec.as_str()
-                            )),
-                        ));
-                    }
+                // The decision (incl. the H.264 exemption) is `assign_codec_refusal`.
+                if let Some(refusal) = assign_codec_refusal(
+                    &session_id,
+                    gpu_index,
+                    cfg.stream.codec,
+                    &self.gpu_codec_sets(),
+                ) {
+                    // guarded by assign_refusal_logs_the_codec_not_in_gpu_set_token
+                    warn!(token = "assign-codec-not-in-gpu-set", "{}", refusal.log);
+                    self.note_session_count();
+                    return Some(ack(id, false, Some(refusal.ack_error)));
                 }
                 cfg.console_config = self.console_config.clone();
                 cfg.video_topology = video_topology;
@@ -6488,79 +6515,76 @@ mod tests {
         }
     }
 
-    /// `token = "..."` fields off every WARN/ERROR emitted while `f` runs. The crate
-    /// keeps no general log-capture harness (`.claude/rules/agent-logging.md` covers
-    /// the convention, not a test helper for it), so this is scoped to the one
-    /// assertion that needs it: proving the refusal log carries its token, not just
-    /// its ack text.
-    fn tokens_emitted_during<F: FnOnce()>(f: F) -> Vec<String> {
-        use tracing_subscriber::layer::SubscriberExt;
-
-        struct Visitor<'a>(&'a mut Option<String>);
-        impl tracing::field::Visit for Visitor<'_> {
-            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                if field.name() == "token" {
-                    *self.0 = Some(value.to_string());
-                }
-            }
-            fn record_debug(
-                &mut self,
-                _field: &tracing::field::Field,
-                _value: &dyn std::fmt::Debug,
-            ) {
-            }
-        }
-
-        struct TokenLayer(Arc<Mutex<Vec<String>>>);
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TokenLayer {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                let mut token = None;
-                event.record(&mut Visitor(&mut token));
-                if let Some(token) = token {
-                    self.0.lock().unwrap().push(token);
-                }
-            }
-        }
-
-        let tokens = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry().with(TokenLayer(tokens.clone()));
-        tracing::subscriber::with_default(subscriber, || {
-            // Every other test in this binary calls the same warn! callsites with no
-            // subscriber installed, which caches their tracing `Interest` as `never`
-            // — a cache that setting a new default alone does not invalidate. Without
-            // this, `f` below would silently emit nothing regardless of the
-            // subscriber just installed.
-            tracing::callsite::rebuild_interest_cache();
-            f();
-        });
-        tracing::callsite::rebuild_interest_cache();
-        Arc::try_unwrap(tokens).unwrap().into_inner().unwrap()
+    /// The refusal decision: codec, GPU and session in the log line, the ack error
+    /// naming the codec; a GPU absent from the sets proves nothing.
+    #[test]
+    fn assign_codec_refusal_refuses_a_codec_outside_the_gpus_set() {
+        let h264_only = vec![(0, BTreeSet::from([Codec::H264]))];
+        let refusal = assign_codec_refusal("s1", 0, Codec::H265, &h264_only)
+            .expect("h265 is outside GPU 0's h264-only set");
+        assert!(refusal.log.contains("session s1 "), "{refusal:?}");
+        assert!(refusal.log.contains("gpu=0 codec=h265"), "{refusal:?}");
+        assert_eq!(
+            refusal.ack_error,
+            "gpu 0 cannot encode h265: not in its current codec set"
+        );
+        assert!(assign_codec_refusal("s1", 7, Codec::Av1, &h264_only).is_some());
     }
 
-    /// The belt's ack text names the refused codec (asserted above), but an operator
-    /// greps by token (`.claude/rules/agent-logging.md`) — this proves the warn! at
-    /// the refusal site actually carries `token = "assign-codec-not-in-gpu-set"`.
+    /// H.264 is the floor, and a codec in the GPU's set passes.
     #[test]
-    fn assign_refusal_emits_the_codec_not_in_gpu_set_token() {
+    fn assign_codec_refusal_passes_h264_and_codecs_in_the_set() {
+        let sets = vec![(0, BTreeSet::from([Codec::H264, Codec::H265]))];
+        assert_eq!(assign_codec_refusal("s1", 0, Codec::H264, &sets), None);
+        assert_eq!(assign_codec_refusal("s1", 9, Codec::H264, &[]), None);
+        assert_eq!(assign_codec_refusal("s1", 0, Codec::H265, &sets), None);
+    }
+
+    /// The handler takes the refusal path: its ack{ok:false} error is exactly the
+    /// decision's, so the refusal's `warn!` (token checked below) is what it logged.
+    #[test]
+    fn assign_refusal_ack_is_the_refusal_decisions() {
         let mut mgr = codec_mgr(
             vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))],
             plan_all,
         );
+        let expected = assign_codec_refusal("s1", 0, Codec::H265, &mgr.gpu_codec_sets())
+            .expect("GPU 0 has proven nothing yet");
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
-        let tokens = tokens_emitted_during(|| {
-            mgr.handle_control(
-                session_assign_msg_codec("s1", 0, "h265"),
-                &evt_tx,
-                &diagnostic_sender(),
-            );
-        });
+        match mgr.handle_control(
+            session_assign_msg_codec("s1", 0, "h265"),
+            &evt_tx,
+            &diagnostic_sender(),
+        ) {
+            Some(AgentMsg::Ack {
+                ok: false, error, ..
+            }) => assert_eq!(error, Some(expected.ack_error)),
+            other => panic!("expected ack{{ok:false}}, got {other:?}"),
+        }
+    }
+
+    /// An operator greps the refusal by token (`.claude/rules/agent-logging.md`). The
+    /// token must be a literal (`tests/log_convention.rs`), so this checks the one
+    /// `warn!` that logs the refusal in source rather than capturing `tracing` events,
+    /// whose process-global interest cache made a capture flake under parallel tests.
+    #[test]
+    fn assign_refusal_logs_the_codec_not_in_gpu_set_token() {
+        // Split literals so this test's own text never matches what it searches for.
+        let logged = concat!("refusal.", "log);");
+        let site = concat!(
+            "warn!(token = \"assign-codec-not-in-gpu-set\", \"{}\", ",
+            "refusal.",
+            "log);"
+        );
+        let source = include_str!("agent.rs");
+        assert_eq!(
+            source.matches(logged).count(),
+            1,
+            "exactly one site logs the refusal"
+        );
         assert!(
-            tokens.contains(&"assign-codec-not-in-gpu-set".to_string()),
-            "expected the assign-codec-not-in-gpu-set token among {tokens:?}"
+            source.contains(site),
+            "the refusal's warn! must be `{site}`"
         );
     }
 
