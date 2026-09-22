@@ -1734,8 +1734,8 @@ pub fn run_blocking(
                 "encode pipeline READY transition (Vulkan device verification) failed"
             );
             emit(SessionEvent::Failed(reason));
-            super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             current_source.teardown();
+            super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             return;
         }
         if let Err(e) = assert_vulkan_encoder_device(&encode_pipe, expected) {
@@ -1749,8 +1749,8 @@ pub fn run_blocking(
                 "verify Vulkan context identity failed"
             );
             emit(SessionEvent::Failed(reason));
-            super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             current_source.teardown();
+            super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
             return;
         }
     }
@@ -1761,6 +1761,7 @@ pub fn run_blocking(
             "encode pipeline PLAYING transition failed"
         );
         emit(SessionEvent::Failed(format!("encode set PLAYING: {e}")));
+        current_source.teardown();
         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
         return;
     }
@@ -2022,6 +2023,7 @@ pub fn run_blocking(
             "encode pipeline has no bus"
         );
         emit(SessionEvent::Failed("encode pipeline has no bus".into()));
+        current_source.teardown();
         super::nvenc_defer::finish_encode(&encode_pipe, defer_encode_teardown);
         audio_pipeline.finish();
         return;
