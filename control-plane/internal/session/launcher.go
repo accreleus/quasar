@@ -344,6 +344,11 @@ func (c *Coordinator) applyPostPlacement(
 	plan, err := planStream(in)
 	c.logStreamPlan(in, plan)
 	if err != nil {
+		// Wrap ErrRungCodecNotAvailable with profile context so the handler can
+		// report it back with the profile name in the message.
+		if errors.Is(err, ErrRungCodecNotAvailable) {
+			return fmt.Errorf("%w (launch profile %q)", err, launchProfile.ID)
+		}
 		return err
 	}
 

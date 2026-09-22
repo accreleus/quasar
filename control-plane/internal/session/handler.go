@@ -433,6 +433,10 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeProfileIneligible,
 			"the selected stream profile is not eligible for this device")
 		return
+	case errors.Is(err, ErrRungCodecNotAvailable):
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed,
+			err.Error())
+		return
 	case errors.Is(err, ErrCodecUnsupportedByHost):
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict,
 			"the requested codec is not supported by the assigned host's encoder")
