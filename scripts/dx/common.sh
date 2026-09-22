@@ -558,6 +558,54 @@ PY
 
 dx_timestamp() { date -u +%Y%m%dT%H%M%SZ; }
 
+# ── quasar-bench server + key (the shell twin of scripts/dx/bench_config.py) ──
+# dx_bench_env — export BENCH_URL / BENCH_KEY from qbench's own config where they
+# are unset: $XDG_CONFIG_HOME/qbench/{url,key} (XDG_CONFIG_HOME defaults to
+# ~/.config). A key file readable by group/other is refused with a WARN, exactly
+# as qbench refuses it. There is NO default server. Never prints either value.
+# Returns 0 when both resolved, 1 otherwise (the caller decides whether that is
+# fatal — see dx_bench_require).
+dx_bench_env() {
+  local dir="${XDG_CONFIG_HOME:-$HOME/.config}/qbench" v mode
+  if [ -z "${BENCH_URL:-}" ] && [ -r "$dir/url" ]; then
+    v="$(tr -d '[:space:]' < "$dir/url")"
+    [ -z "$v" ] || export BENCH_URL="${v%/}"
+  fi
+  if [ -z "${BENCH_KEY:-}" ] && [ -f "$dir/key" ]; then
+    mode="$(stat -c '%a' "$dir/key" 2>/dev/null || stat -f '%Lp' "$dir/key" 2>/dev/null || echo 777)"
+    case "$mode" in
+      ?00|00|0) v="$(tr -d '[:space:]' < "$dir/key")"; [ -z "$v" ] || export BENCH_KEY="$v" ;;
+      *) printf 'WARN  bench key file %s has mode %s; it must not be readable by others (chmod 600) — not using it\n' \
+           "$dir/key" "$mode" >&2 ;;
+    esac
+  fi
+  [ -n "${BENCH_URL:-}" ] && [ -n "${BENCH_KEY:-}" ]
+}
+
+# dx_bench_require <target> — dx_bench_env, or stop with the next step.
+dx_bench_require() {
+  dx_bench_env && return 0
+  if [ -z "${BENCH_URL:-}" ]; then
+    dx_guard "$1" "no bench server configured: set BENCH_URL, or run \`qbench doctor\` (the bench server's install.sh records the server in \${XDG_CONFIG_HOME:-~/.config}/qbench/url)"
+  fi
+  dx_guard "$1" "no bench key: set BENCH_KEY, or put it in \${XDG_CONFIG_HOME:-~/.config}/qbench/key (chmod 600); \`qbench doctor\` checks it"
+}
+
+# dx_qbench — set DX_QBENCH to the qbench command: an installed `qbench` (the
+# bench server's install.sh puts one on PATH), else the vendored copy.
+# QBENCH=<path> overrides both (the DX tests point it at a stub).
+# DX_QBENCH is read by the scripts that source this file:
+# shellcheck disable=SC2034
+dx_qbench() {
+  if [ -n "${QBENCH:-}" ]; then
+    DX_QBENCH=("$QBENCH")
+  elif dx_have qbench; then
+    DX_QBENCH=(qbench)
+  else
+    DX_QBENCH=(python3 "$DX_DIR/vendor/qbench")
+  fi
+}
+
 # Local compose invocation, always project-scoped to this instance.
 dx_local_compose() {
   docker compose -p "$QUASAR_INSTANCE" -f "$DX_LOCAL_COMPOSE" "$@"

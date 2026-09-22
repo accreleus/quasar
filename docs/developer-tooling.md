@@ -43,6 +43,8 @@ ephemeral test database) so parallel checkouts and agents never collide.
 | `make docs-metrics-sync` | Copy `docs/session-trace/metrics.json` (the metric manifest) to its Go embed and web bundle copies | Both copies are byte-equality tested; a stale copy fails `go test ./...` |
 | `make docs-trace` | Sync the manifest, then regenerate the `trace-format.md` §2 metric table from it | Edit the manifest, never the table; `make verify` fails if the table is stale |
 | `make preflight` | doctor + config-check + verify | The pre-merge-to-develop gate |
+| `make bench-check` | `qbench check`: HEAD vs the last benched ancestor — `[BASE=<sha> WINDOW=impaired]` | The streaming-path landing gate. Exit 0 clean, 3 regressed (blocks), 4 nothing comparable (**not a pass**), 5 key. Read-only |
+| `make bench-status` | Bench reports waiting on review — `[SPRINT=<slug>]` | Read-only; run it when resuming work. Server + key from `BENCH_URL`/`BENCH_KEY` or `~/.config/qbench/` |
 | `make up` / `down` / `restart` | Local agentless stack (postgres + control-plane + web) | No node-agent locally (needs a Linux GPU host); volumes survive `down` |
 | `make rebuild` | Local: compose build. Remote (`HOST=<role-or-host>`): delegates to `build-images.sh` + `redeploy.sh` | Remote requires typing `HOST=<role-or-host>`, e.g. `HOST=gpu-test` |
 | `make status` / `health` | Container state (healthy/degraded/stopped/failed) / endpoint probes | Read-only; safe with a remote `HOST=<role-or-host>` |

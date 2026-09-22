@@ -69,9 +69,19 @@ Idempotency
   run (samples and events are idempotent on (run, source, ts) server-side).
   `--run-id <id>` targets a specific run; `--new` forces a fresh run.
 
+Repo and commit
+  Every run is created with `repo` (default accreleus/quasar, `--repo`) and the
+  `commit` under test — `--commit SHA`, else the `git_quasar` tag (a retro
+  manifest or the nightly job sets it to the sha the run actually used), else
+  this worktree's HEAD — resolved to the full sha when this checkout knows it.
+  Those two fields are how `qbench check` / `commits compare` find the run; a run
+  without them is invisible to every commit-to-commit verdict.
+
 Environment
-  BENCH_URL   base URL of the quasar-bench service (e.g. http://bench.example.internal:9400)
-  BENCH_KEY   API key (a `BENCH_API_KEYS` secret).  Never commit either.
+  The server and key resolve the way qbench does (scripts/dx/bench_config.py):
+  --url / --key, else BENCH_URL / BENCH_KEY, else ~/.config/qbench/{url,key}
+  (XDG_CONFIG_HOME-aware; the key file must be mode 600). There is no default
+  server. Never commit either value.
 
 Exit: 0 submitted (or --dry-run planned), 1 failure, 2 usage,
       3 submitted but the run's tags disagree with what the host actually did.
@@ -100,6 +110,9 @@ sys.path.insert(0, DX_DIR)
 import bench as bench_client  # noqa: E402  (vendored client, path set above)
 from bench import Bench, BenchError  # noqa: E402
 import thresholds  # noqa: E402  (scripts/dx/thresholds.py, same directory)
+from bench_config import bench_env, bench_url  # noqa: E402  (same directory)
+
+DEFAULT_REPO = "accreleus/quasar"
 
 MISMATCH_RC = 3
 
@@ -185,16 +198,34 @@ def server_version(url: str) -> str:
     return m.group(1) if m else ""
 
 
+def server_cli_version(url: str) -> str:
+    """The client version the server ships (GET /cli/version, unauthenticated —
+    the same number `qbench doctor` compares against), or "" when it publishes
+    none. Best-effort and short-timeout, like server_version()."""
+    if not url:
+        return ""
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/cli/version", timeout=5) as res:
+            return str(json.loads(res.read(4096).decode("utf-8", "replace")).get("version") or "")
+    except Exception:
+        return ""
+
+
 def check_client_version(url: str) -> None:
+    """Warn when the vendored client is older than the server's.
+
+    Compares against the CLI version the server ships (/cli/version) when it
+    publishes one, else the service's own openapi info.version.
+    """
     mine = getattr(bench_client, "__version__", "0")
-    theirs = server_version(url)
+    theirs = server_cli_version(url) or server_version(url)
     if not theirs:
         print("     client    vendored bench.py %s (service publishes no version)" % mine)
         return
     if _ver_tuple(mine) < _ver_tuple(theirs):
-        print("WARN client — vendored bench.py is %s but the service is %s; re-vendor "
-              "scripts/dx/vendor/bench.py from quasar-bench client/bench.py" % (mine, theirs),
-              file=sys.stderr)
+        print("WARN client — vendored bench.py is %s but the service ships %s; re-vendor "
+              "scripts/dx/vendor/bench.py (and vendor/qbench) from quasar-bench client/"
+              % (mine, theirs), file=sys.stderr)
     print("     client    vendored bench.py %s / service %s" % (mine, theirs))
 
 
@@ -586,6 +617,41 @@ def git_sha(root: str) -> str:
     return _git(root, "rev-parse", "--short=8", "HEAD")
 
 
+def full_sha(root: str, ref: str) -> str:
+    """`ref` as a full sha when this checkout knows it, else `ref` unchanged
+    (a retro run's sha may predate this clone; bench resolves unique prefixes)."""
+    if not ref:
+        return ""
+    return _git(root, "rev-parse", "--verify", "--quiet", ref + "^{commit}") or ref
+
+
+def run_commit(tags: dict, root: str, explicit) -> str:
+    """The commit under test: --commit, else the git_quasar tag, else HEAD."""
+    return full_sha(root, explicit or tags.get("git_quasar") or git_sha(root))
+
+
+def create_run(b, suite: str, scenario: str, host: str, tags: dict, notes: str,
+               repo: str, commit: str, conditions, external_id) -> str:
+    """POST /v1/runs with repo + commit — the body `qbench run new` sends.
+
+    The vendored client's new_run() posts neither, which leaves the run
+    invisible to `qbench check`; this mirrors qbench's own create instead.
+    The service still UPSERTS on external_id (200 update / 201 create).
+    """
+    body = {"suite": suite, "scenario": scenario, "host": host,
+            "tags": {k: str(v) for k, v in (tags or {}).items()}, "notes": notes}
+    if repo:
+        body["repo"] = repo
+    if commit:
+        body["commit"] = commit
+    if external_id:
+        body["external_id"] = external_id
+    if conditions is not None:
+        body["conditions"] = conditions
+    _status, res = b._post_status("/v1/runs", body)
+    return res["id"]
+
+
 def protocol_sha(root: str) -> str:
     """The `protocol/` submodule PIN — read from the tree, not from the submodule
     working copy. A fresh worktree has no `protocol/` checkout at all, and
@@ -786,6 +852,8 @@ def build_payload(rundir: str, root: str, args) -> dict:
     return {"tags": tags, "samples": samples, "events": events, "verdict": verdict,
             "summary": final_summary, "artifacts": artifacts, "session": session,
             "external_id": external_id, "conditions": conditions,
+            "repo": args.repo,
+            "commit": run_commit(tags, root, args.commit),
             "session_verdict": session_verdict,
             "session_verdict_evidence": session_verdict_evidence}
 
@@ -950,6 +1018,11 @@ def main(argv=None) -> int:
     p.add_argument("--suite", required=True)
     p.add_argument("--scenario", required=True)
     p.add_argument("--host", default="devbox", help="which Quasar host produced the run")
+    p.add_argument("--repo", default=DEFAULT_REPO,
+                   help="the repo the commit belongs to (default %s)" % DEFAULT_REPO)
+    p.add_argument("--commit", default=None, metavar="SHA",
+                   help="the commit under test (default: the git_quasar tag, else "
+                        "this worktree's HEAD). Without it `qbench check` cannot find the run")
     p.add_argument("--tag", action="append", default=[], metavar="K=V",
                    help="repeatable; wins over any derived tag")
     p.add_argument("--notes", default="")
@@ -1008,6 +1081,8 @@ def main(argv=None) -> int:
     print("     suite     %s" % args.suite)
     print("     scenario  %s" % args.scenario)
     print("     host      %s" % args.host)
+    print("     repo      %s" % plan["repo"])
+    print("     commit    %s" % (plan["commit"] or "(none — invisible to qbench check)"))
     print("     samples   %d" % len(plan["samples"]))
     print("     events    %d" % len(plan["events"]))
     print("     artifacts %s" % (", ".join(os.path.basename(a) for a in plan["artifacts"]) or "none"))
@@ -1017,6 +1092,8 @@ def main(argv=None) -> int:
     print("     conditions %s" % json.dumps(plan["conditions"], sort_keys=True))
     print("     session_verdict %s" % (plan.get("session_verdict") or "n/a"))
 
+    # Server + key the way qbench resolves them: flags, env, then its config.
+    bench_env()
     if args.dry_run and not (args.url or os.environ.get("BENCH_URL")):
         print("PASS plan — dry run, no service contacted")
         print("RESULT status=ok target=bench-submit dry_run=1 samples=%d events=%d"
@@ -1025,17 +1102,11 @@ def main(argv=None) -> int:
 
     key = args.key if args.key is not None else os.environ.get("BENCH_KEY")
     key = normalize_bench_key(key, "--key" if args.key is not None else "BENCH_KEY")
-    # #508 same-issue spirit: neither --url nor $BENCH_URL was given, so the
-    # vendored client silently falls back to bench_client.DEFAULT_URL
-    # (http://localhost:9400). That is correct for a local quasar-bench, but
-    # when the intended target is a remote service the first sign of trouble
-    # is a bare "Connection refused" against localhost with no mention of
-    # BENCH_URL anywhere — confusing exactly like the QSES_ADMIN_TOKEN case
-    # above. Remember whether the URL was explicit so a connection failure
-    # below can name the actual cause instead.
-    bench_url_explicit = bool(args.url or os.environ.get("BENCH_URL"))
+    # No server configured anywhere is a usage error, never a silent fall-back
+    # to the vendored client's localhost DEFAULT_URL.
+    server = bench_url(args.url)
     try:
-        b = Bench(args.url, key)
+        b = Bench(server, key)
     except BenchError as exc:
         die(str(exc), 2)
     check_client_version(b.url)
@@ -1055,10 +1126,10 @@ def main(argv=None) -> int:
             # when it updated the previous submission of the same cell. The client
             # returns the id either way, and a re-submission converging onto the
             # same run is the point — so the two are not distinguished here.
-            run_id = b.new_run(args.suite, args.scenario, args.host,
-                               plan["tags"], args.notes,
-                               conditions=plan["conditions"],
-                               external_id=None if args.new else plan["external_id"])
+            run_id = create_run(b, args.suite, args.scenario, args.host,
+                                plan["tags"], args.notes, plan["repo"], plan["commit"],
+                                plan["conditions"],
+                                None if args.new else plan["external_id"])
             created = run_id
             print("PASS run — %s (external_id %s)" % (run_id, plan["external_id"]))
         # Guard BEFORE writing. On bench >= 1.2 the write itself is safe:
@@ -1086,19 +1157,10 @@ def main(argv=None) -> int:
                        plan["tags"], conditions=plan["conditions"])
     except BenchError as exc:
         msg = str(exc)
-        # A raw connection failure (refused/unreachable/no route/timed out)
-        # against the un-overridden DEFAULT_URL almost always means the
-        # caller forgot to set BENCH_URL for a remote submit, not that the
-        # local service is actually down — name the real cause.
-        if not bench_url_explicit and any(
-            s in msg for s in ("Connection refused", "Errno 61", "Errno 111",
-                                "No route to host", "Name or service not known",
-                                "timed out")
-        ):
-            msg = ("%s — BENCH_URL is unset, so this defaulted to %s. "
-                   "If the target quasar-bench service is remote, set BENCH_URL "
-                   "(e.g. BENCH_URL=http://bench.example.internal:9400, per this script's own "
-                   "docstring) and retry." % (msg, b.url))
+        if any(s in msg for s in ("Connection refused", "Errno 61", "Errno 111",
+                                  "No route to host", "Name or service not known",
+                                  "timed out")):
+            msg += " — is the bench server up? `qbench doctor` checks its URL, key and reachability"
         die(msg)
 
     # Session verdict (C11 #2): control-plane/internal/session/verdict.go's
@@ -1156,8 +1218,8 @@ def main(argv=None) -> int:
               % (run_id, url, n_s, n_e, plan["verdict"], len(mismatches)))
         return MISMATCH_RC
 
-    print("RESULT status=ok target=bench-submit run_id=%s url=%s samples=%d events=%d verdict=%s"
-          % (run_id, url, n_s, n_e, plan["verdict"]))
+    print("RESULT status=ok target=bench-submit run_id=%s url=%s samples=%d events=%d verdict=%s "
+          "commit=%s" % (run_id, url, n_s, n_e, plan["verdict"], (plan["commit"] or "-")[:12]))
     return 0
 
 

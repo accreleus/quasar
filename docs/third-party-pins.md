@@ -170,7 +170,9 @@ issue:
    step exists because a hand-typed build can silently take the wrong `--target` or skip a
    `deploy/pins.env` cross-check that catches a doc/Dockerfile pin drift before it ships.
 2. **One bench run submitted to `quasar-bench`** (`make bench-run HOST=devbox`) with verdict
-   `nominal` and `regressed=0`. This exists because it is the only step in this list that catches
+   `nominal` and `regressed=0`, then `make bench-check` against the previous pin's runs
+   (`BASE=<sha>` if the nearest benched ancestor is not it) with its verdict quoted verbatim —
+   exit 4 "nothing comparable" is not a pass and is stated as such. This exists because it is the only step in this list that catches
    a per-frame cost regression — nothing else here asserts on latency or smoothness at all.
 3. **VRAM steady-state across at least two consecutive sessions** — `nvidia-smi --query-gpu=
    memory.used --format=csv` (or the admin host-observability panel) read after each teardown,

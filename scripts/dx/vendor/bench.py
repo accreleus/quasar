@@ -1,17 +1,22 @@
 # VENDORED FILE — DO NOT EDIT HERE.
 #
 # Source: quasar-bench client/bench.py
-# Commit: e0e81952bdee7f6206fb3b5cf7448f06c64b3607 (2026-08-24)  __version__ 1.3.0
-# Repo:   git@github.com:salty2011/quasar-bench.git
+# Commit: d55c43808dbde9eb9140a01580b16eb848ee960f (2026-09-22)  __version__ 1.7.0
+# Fetched: 2026-09-22, as the bench.py inside the qbench 1.7.0 zipapp your bench
+#          server publishes (GET $BENCH_URL/cli/qbench); byte-identical to the
+#          file at the commit above (git blob 6edf2cb99c6d).
 #
-# Re-vendor with:
+# Re-vendor with (from a quasar-bench checkout, or unzip the zipapp):
 #   cp ../quasar-bench/client/bench.py scripts/dx/vendor/bench.py
-# then re-add this header and update the commit line above.
+# then re-add this header and update the commit line above. Everything after
+# the END-OF-HEADER line is the upstream file verbatim; scripts/dx/tests/run.sh
+# checks that.
 #
-# bench_submit.py compares this file's __version__ against the SERVER's
-# openapi info.version on every submission and warns when they drift.
-
-
+# bench_submit.py compares this file's __version__ against the version the
+# SERVER publishes on every submission and warns when this copy is older.
+# The upstream DEFAULT_URL (localhost) is never relied on: every repo script
+# resolves the server through scripts/dx/bench_config.py first.
+# ── END-OF-HEADER ──
 #!/usr/bin/env python3
 """quasar-bench client — vendor this file into a harness.
 
@@ -44,7 +49,7 @@ The same flow from a shell is the `qbench` CLI next to this file.
 
 CLI use:
 
-    export BENCH_URL=http://bench.example.internal:9400 BENCH_KEY=...
+    export BENCH_URL=https://bench.example BENCH_KEY=...
     bench.py new  --suite abr-ladder --scenario 1080p120 --tag abr_mode=smooth
     bench.py samples  <run-id> --file samples.jsonl
     bench.py events   <run-id> --file events.jsonl
@@ -74,7 +79,7 @@ from typing import Any, Iterable
 
 # Bump on every change to this file so a vendoring harness can detect drift:
 #   python3 -c "import bench; print(bench.__version__)"
-__version__ = "1.3.0"
+__version__ = "1.7.0"
 
 DEFAULT_URL = "http://localhost:9400"
 GZIP_THRESHOLD = 64 * 1024
@@ -82,65 +87,93 @@ CHUNK = 5000  # samples per request; the server handles 20k, this keeps retries 
 
 
 class BenchError(RuntimeError):
-    pass
+    """A failed call. status is the HTTP status (0 when the server was never
+    reached) and server_message is the server's own `error` text, if any."""
+
+    def __init__(self, message: str, status: int = 0, server_message: str = "",
+                 method: str = "", path: str = ""):
+        super().__init__(message)
+        self.status, self.server_message = status, server_message
+        self.method, self.path = method, path
 
 
 class CountMismatch(BenchError):
     """A sample write was rejected because a source ended up the wrong length."""
 
     def __init__(self, message: str, source: str = "", expected: int = 0, actual: int = 0):
-        super().__init__(message)
+        super().__init__(message, status=409, server_message=message)
         self.source, self.expected, self.actual = source, expected, actual
 
 
 class Bench:
-    def __init__(self, url: str | None = None, key: str | None = None, timeout: int = 120):
+    def __init__(self, url: str | None = None, key: str | None = None, timeout: int = 120,
+                 require_key: bool = True):
         self.url = (url or os.environ.get("BENCH_URL") or DEFAULT_URL).rstrip("/")
         self.key = key or os.environ.get("BENCH_KEY") or ""
         self.timeout = timeout
-        if not self.key:
+        # require_key=False is for the public endpoints (/v1/health, /cli/...):
+        # the request then goes out without an Authorization header.
+        if not self.key and require_key:
             raise BenchError("no API key: set BENCH_KEY or pass key=")
 
     # ---------------------------------------------------------------- http
 
     def _request(self, method: str, path: str, *, body: bytes | None = None,
                  headers: dict[str, str] | None = None) -> Any:
+        return self._request_status(method, path, body=body, headers=headers)[1]
+
+    def _request_status(self, method: str, path: str, *, body: bytes | None = None,
+                        headers: dict[str, str] | None = None) -> tuple[int, Any]:
+        """Same as _request, but also returns the HTTP status code — callers
+        that need to tell a plain 200 (upsert matched something existing)
+        from a 201 (freshly created) use this instead."""
         req = urllib.request.Request(self.url + path, data=body, method=method)
-        req.add_header("Authorization", f"Bearer {self.key}")
+        if self.key:
+            req.add_header("Authorization", f"Bearer {self.key}")
+        req.add_header("User-Agent", f"quasar-bench-client/{__version__}")
         for k, v in (headers or {}).items():
             req.add_header(k, v)
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as res:
                 raw = res.read()
+                status = res.status
         except urllib.error.HTTPError as e:
             raw_err = e.read()
-            detail = raw_err.decode("utf-8", "replace")[:400]
-            if e.code == 409:
-                try:
-                    body = json.loads(raw_err)
-                except json.JSONDecodeError:
-                    body = {}
-                if "expected" in body:
-                    raise CountMismatch(body.get("error", detail), body.get("source", ""),
-                                        int(body.get("expected", 0)),
-                                        int(body.get("actual", 0))) from None
-            raise BenchError(f"{method} {path} -> {e.code}: {detail}") from None
+            detail = raw_err.decode("utf-8", "replace")[:400].strip()
+            try:
+                body = json.loads(raw_err)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                body = {}
+            if not isinstance(body, dict):
+                body = {}
+            if e.code == 409 and "expected" in body:
+                raise CountMismatch(body.get("error", detail), body.get("source", ""),
+                                    int(body.get("expected", 0)),
+                                    int(body.get("actual", 0))) from None
+            msg = str(body.get("error") or detail or e.reason)
+            raise BenchError(f"{method} {path} -> {e.code}: {msg}", status=e.code,
+                             server_message=msg, method=method, path=path) from None
         except urllib.error.URLError as e:
-            raise BenchError(f"{method} {path} -> {e.reason}") from None
+            raise BenchError(f"{method} {path} -> {e.reason}", method=method, path=path) from None
+        except OSError as e:
+            raise BenchError(f"{method} {path} -> {e}", method=method, path=path) from None
         if not raw:
-            return None
+            return status, None
         try:
-            return json.loads(raw)
+            return status, json.loads(raw)
         except json.JSONDecodeError:
-            return raw
+            return status, raw
 
     def _post(self, path: str, payload: dict) -> Any:
+        return self._post_status(path, payload)[1]
+
+    def _post_status(self, path: str, payload: dict) -> tuple[int, Any]:
         body = json.dumps(payload).encode()
         headers = {"Content-Type": "application/json"}
         if len(body) > GZIP_THRESHOLD:
             body = gzip.compress(body, 6)
             headers["Content-Encoding"] = "gzip"
-        return self._request("POST", path, body=body, headers=headers)
+        return self._request_status("POST", path, body=body, headers=headers)
 
     def _get(self, path: str, params: dict | None = None) -> Any:
         if params:
@@ -153,7 +186,21 @@ class Bench:
     def new_run(self, suite: str, scenario: str, host: str = "",
                 tags: dict[str, str] | None = None, notes: str = "",
                 conditions: dict | None = None, external_id: str | None = None) -> str:
-        """Create (or upsert, with external_id) a run and return its id.
+        """Create (or upsert, with external_id) a run and return its id."""
+        return self.new_run_created(suite, scenario, host, tags, notes,
+                                    conditions, external_id)[0]
+
+    def new_run_created(self, suite: str, scenario: str, host: str = "",
+                        tags: dict[str, str] | None = None, notes: str = "",
+                        conditions: dict | None = None,
+                        external_id: str | None = None) -> tuple[str, bool]:
+        """Same as new_run, but also reports whether this call actually
+        created the run (True, HTTP 201) or upserted an existing row that
+        already carried this external_id (False, HTTP 200).
+
+        Use the flag to keep a re-run of a seed/harness script idempotent:
+        events have no upsert key, so post them only when the run is new,
+        rather than appending a second copy onto a run that already has them.
 
         conditions is what the host was ACTUALLY doing — effective settings,
         negotiated encoder/codec, concurrent sessions, netem state, git shas.
@@ -168,7 +215,8 @@ class Bench:
             body["conditions"] = conditions
         if external_id:
             body["external_id"] = external_id
-        return self._post("/v1/runs", body)["id"]
+        status, res = self._post_status("/v1/runs", body)
+        return res["id"], status == 201
 
     def samples(self, run_id: str, samples: Iterable[dict], chunk: int = CHUNK,
                 replace: bool = False, expected_count: dict[str, int] | None = None) -> int:
@@ -273,9 +321,34 @@ class Bench:
         return self._request("POST", path, body=b"".join(parts),
                              headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
 
-    def artifact(self, run_id: str, path: str, name: str | None = None, mime: str | None = None) -> dict:
-        return self._upload(f"/v1/runs/{run_id}/artifacts", path,
-                            {"name": name or "", "mime": mime or ""})
+    def artifact(self, run_id: str, path: str, name: str | None = None, mime: str | None = None,
+                role: str = "", caption: str = "", started_at_ms: int | None = None) -> dict:
+        """Upload a run artifact.
+
+        role is screenshot | video | log | bundle | other (inferred from the
+        file when omitted) and drives the retention job's prune order the
+        same way it does for report evidence. started_at_ms is the
+        wall-clock ms of a capture's first frame, so the run page can sync
+        the video playhead to the charts.
+        """
+        fields = {"name": name or "", "mime": mime or "", "role": role, "caption": caption}
+        if started_at_ms is not None:
+            fields["started_at_ms"] = str(started_at_ms)
+        return self._upload(f"/v1/runs/{run_id}/artifacts", path, fields)
+
+    def artifact_patch(self, run_id: str, name: str, *, caption: str | None = None,
+                       role: str | None = None, started_at_ms: int | None = None) -> dict:
+        """Update a run artifact's role/caption/started_at_ms after the fact."""
+        fields: dict[str, Any] = {}
+        if caption is not None:
+            fields["caption"] = caption
+        if role is not None:
+            fields["role"] = role
+        if started_at_ms is not None:
+            fields["started_at_ms"] = started_at_ms
+        return self._request("PATCH", f"/v1/runs/{run_id}/artifacts/{urllib.parse.quote(name)}",
+                             body=json.dumps(fields).encode(),
+                             headers={"Content-Type": "application/json"})
 
     def finish(self, run_id: str, status: str = "finished", verdict: str | None = None,
                summary: dict | None = None, tags: dict[str, str] | None = None,
@@ -397,6 +470,122 @@ class Bench:
     def report_delete(self, repo: str, commit: str) -> None:
         self._request("DELETE", _report_api(repo, commit))
 
+    # ---------------------------------------------------------------- sprints
+
+    def sprint_url(self, repo: str, sprint: str) -> str:
+        """The stable page URL for a sprint report."""
+        return f"{self.url}{_sprint_page(repo, sprint)}"
+
+    def sprint_put(self, repo: str, sprint: str, title: str, *, sprint_label: str = "",
+                   branch: str = "", summary: str = "", body: str | None = None,
+                   body_path: str | None = None, body_mime: str | None = None,
+                   issues: Iterable[int] | None = None, prs: Iterable[int] | None = None,
+                   runs: Iterable[str] | None = None, tags: dict | None = None,
+                   pinned: bool | None = None, commit: str = "",
+                   started_at: str | None = None, ended_at: str | None = None,
+                   commits: list | None = None, sections: dict | None = None,
+                   author: str = "") -> dict:
+        """Create or replace the sprint report for repo + lower(sprint).
+
+        Idempotent on repo + lower(sprint): re-publishing updates the row in
+        place and bumps revision; if the report was changes_requested it
+        resets to submitted. sections is the structured write-up (see
+        client/examples/sprint.json for the shape); author defaults
+        server-side to the caller's API key name when omitted.
+        """
+        if body_path:
+            with open(body_path) as fh:
+                body = fh.read()
+            body_mime = body_mime or _body_mime(body_path)
+        payload: dict[str, Any] = {"title": title, "branch": branch, "summary": summary}
+        if sprint_label:
+            payload["sprint_label"] = sprint_label
+        if body is not None:
+            payload["body"] = body
+            payload["body_mime"] = body_mime or "text/markdown"
+        if issues is not None:
+            payload["issues"] = [int(i) for i in issues]
+        if prs is not None:
+            payload["prs"] = [int(i) for i in prs]
+        if runs is not None:
+            payload["runs"] = list(runs)
+        if tags is not None:
+            payload["tags"] = tags
+        if pinned is not None:
+            payload["pinned"] = pinned
+        if commit:
+            payload["commit"] = commit
+        if started_at:
+            payload["started_at"] = started_at
+        if ended_at:
+            payload["ended_at"] = ended_at
+        if commits is not None:
+            payload["commits"] = commits
+        if sections is not None:
+            payload["sections"] = sections
+        if author:
+            payload["author"] = author
+        return self._request("PUT", _sprint_api(repo, sprint),
+                             body=json.dumps(payload).encode(),
+                             headers={"Content-Type": "application/json"})
+
+    def sprint_get(self, repo: str, sprint: str, agg: str = "") -> dict:
+        """One sprint report with its sections, artifacts, linked runs,
+        deltas, review status and comments."""
+        return self._get(_sprint_api(repo, sprint), {"agg": agg})
+
+    def sprint_list(self, **filters) -> list[dict]:
+        """List sprint reports newest first (same filters as report_list)."""
+        filters.setdefault("kind", "sprint")
+        return self._get("/v1/reports", filters)["reports"]
+
+    def sprint_attach(self, repo: str, sprint: str, path: str, role: str = "",
+                      caption: str = "", name: str | None = None, mime: str | None = None) -> dict:
+        """Attach evidence to a sprint report — same roles as report_attach."""
+        return self._upload(_sprint_api(repo, sprint) + "/artifacts", path,
+                            {"name": name or "", "mime": mime or "",
+                             "role": role, "caption": caption})
+
+    def sprint_pin(self, repo: str, sprint: str, pinned: bool = True) -> dict:
+        verb = "pin" if pinned else "unpin"
+        return self._request("POST", _sprint_api(repo, sprint) + "/" + verb)
+
+    def sprint_delete(self, repo: str, sprint: str) -> None:
+        self._request("DELETE", _sprint_api(repo, sprint))
+
+    # ------------------------------------------------------- review & comments
+
+    def _review_api(self, repo: str, ref: str, kind: str) -> str:
+        return _sprint_api(repo, ref) if kind == "sprint" else _report_api(repo, ref)
+
+    def review(self, repo: str, ref: str, status: str, note: str = "", kind: str = "commit") -> dict:
+        """Set the review verdict on a report of either kind.
+
+        kind is "commit" (ref = commit sha) or "sprint" (ref = sprint slug).
+        status is submitted | approved | changes_requested | acknowledged.
+        Re-publishing a report while it is changes_requested resets it to
+        submitted automatically.
+        """
+        return self._request("POST", self._review_api(repo, ref, kind) + "/review",
+                             body=json.dumps({"status": status, "note": note}).encode(),
+                             headers={"Content-Type": "application/json"})
+
+    def comment(self, repo: str, ref: str, body: str, anchor: str = "", kind: str = "commit") -> dict:
+        """Add a comment, optionally anchored to a section/item (e.g. "goals.2")."""
+        return self._request("POST", self._review_api(repo, ref, kind) + "/comments",
+                             body=json.dumps({"anchor": anchor, "body": body}).encode(),
+                             headers={"Content-Type": "application/json"})
+
+    def comments(self, repo: str, ref: str, kind: str = "commit") -> list[dict]:
+        """List a report's comments, oldest first."""
+        return self._get(self._review_api(repo, ref, kind) + "/comments")["comments"]
+
+    def comment_resolve(self, repo: str, ref: str, comment_id: int, resolved: bool = True,
+                        kind: str = "commit") -> dict:
+        return self._request("PATCH", self._review_api(repo, ref, kind) + f"/comments/{comment_id}",
+                             body=json.dumps({"resolved": resolved}).encode(),
+                             headers={"Content-Type": "application/json"})
+
     # ---------------------------------------------------------------- read
 
     def runs(self, **filters) -> list[dict]:
@@ -484,6 +673,90 @@ class Bench:
     def health(self) -> dict:
         return self._get("/v1/health")
 
+    def me(self) -> dict:
+        """Who the key authenticates as: kind, name, role, read_only."""
+        return self._get("/v1/me")
+
+    def summary(self, run_id: str) -> dict:
+        """The agent view of one run: header strip, windowed aggregates,
+        citing reports and baseline_delta."""
+        return self._get(f"/v1/runs/{run_id}/summary")
+
+    def baseline(self, suite: str, scenario: str, name: str = "default") -> dict:
+        """The pinned baseline for suite+scenario ({"run_id": ...}); 404 if none."""
+        return self._get(f"/v1/baselines/{urllib.parse.quote(suite, safe='')}/"
+                         f"{urllib.parse.quote(scenario, safe='')}", {"name": name})
+
+    # ---------------------------------------------------------- commit compare
+
+    def commits(self, repo: str, limit: int = 50) -> list[dict]:
+        """Commits that have runs in repo, newest first."""
+        return self._get("/v1/commits", {"repo": repo, "limit": limit})["commits"]
+
+    def compare_commits(self, base: str, head: str, repo: str = "", window: str = "",
+                        stat: str = "", keys: Iterable[str] | None = None) -> dict:
+        """Judge commit `head` against commit `base` (short prefixes read as
+        long as they are unique; a 409 means the prefix is ambiguous).
+
+        For every (suite, scenario) with a valid run at both commits: the
+        latest run at each, a direction-aware delta table and a verdict
+        (regressed | improved | mixed | unchanged). Plus only_base/only_head
+        (scenarios that ran at only one commit) and excluded_invalid runs.
+        repo defaults to BENCH_DEFAULT_REPO server-side when omitted.
+        """
+        return self._get("/v1/commits/compare", {
+            "repo": repo, "base": base, "head": head, "window": window,
+            "stat": stat, "keys": ",".join(keys) if keys else ""})
+
+    # ---------------------------------------------------------- github board
+
+    def config_links(self) -> dict:
+        """github_url, project_url, default_repo, board_configured."""
+        return self._get("/v1/config/links")
+
+    def github_sync_status(self) -> dict:
+        return self._get("/v1/github/sync")
+
+    def github_sync(self) -> dict:
+        """Force an immediate board sync. 409 if BENCH_GITHUB_TOKEN is unset."""
+        return self._request("POST", "/v1/github/sync")
+
+    def board_items(self, repo: str = "", status: str = "", evidence: str = "",
+                    level: str = "", state: str = "", cited: bool | None = None) -> list[dict]:
+        """Synced GitHub project board items, each with cited_by."""
+        params: dict[str, Any] = {"repo": repo, "status": status, "evidence": evidence,
+                                  "level": level, "state": state}
+        if cited is not None:
+            params["cited"] = "1" if cited else "0"
+        return self._get("/v1/github/items", params)["items"]
+
+    def evidence_gaps(self) -> list[dict]:
+        """Open board items that need bench evidence and do not have any
+        from an approved report — each row says why (uncited |
+        cited_unapproved) and, if cited, by which reports."""
+        return self._get("/v1/evidence/gaps")["gaps"]
+
+    # ---------------------------------------------------------- snippets
+
+    def report_snippet(self, repo: str, commit: str, agg: str = "") -> str:
+        """A short markdown block for a GitHub issue/PR comment: the bench
+        link, review status, before/after verdict and evidence summary."""
+        rep = self.report_get(repo, commit, agg)
+        return _report_snippet(self._absolute(rep))
+
+    def sprint_snippet(self, repo: str, sprint: str, agg: str = "") -> str:
+        """Same as report_snippet, for a sprint report."""
+        rep = self.sprint_get(repo, sprint, agg)
+        return _report_snippet(self._absolute(rep))
+
+    def _absolute(self, rep: dict) -> dict:
+        """The server returns page URLs as paths; a snippet pasted into
+        GitHub needs the full URL."""
+        url = rep.get("url") or ""
+        if url.startswith("/"):
+            rep = dict(rep, url=self.url + url)
+        return rep
+
 
 def now_ms() -> int:
     return int(time.time() * 1000)
@@ -498,6 +771,14 @@ def _report_page(repo: str, commit: str) -> str:
     return f"/reports/{urllib.parse.quote(repo, safe='')}/{urllib.parse.quote(commit)}"
 
 
+def _sprint_api(repo: str, sprint: str) -> str:
+    return f"/v1/sprints/{urllib.parse.quote(repo, safe='')}/{urllib.parse.quote(sprint)}"
+
+
+def _sprint_page(repo: str, sprint: str) -> str:
+    return f"/sprints/{urllib.parse.quote(repo, safe='')}/{urllib.parse.quote(sprint)}"
+
+
 def _body_mime(path: str) -> str:
     lower = path.lower()
     if lower.endswith((".html", ".htm")):
@@ -505,6 +786,43 @@ def _body_mime(path: str) -> str:
     if lower.endswith((".md", ".markdown")):
         return "text/markdown"
     return "text/plain"
+
+
+def _report_snippet(rep: dict) -> str:
+    """Render a report/sprint detail (as returned by report_get/sprint_get)
+    as a short markdown block, for pasting into a GitHub issue comment."""
+    title = rep.get("title") or rep.get("sprint_label") or "bench report"
+    lines = [f"**Bench:** [{title}]({rep.get('url', '')})"]
+
+    review = rep.get("review") or {}
+    status = review.get("status") or "not reviewed"
+    by = f" by {review['by']}" if review.get("by") else ""
+    lines.append(f"**Review:** {status}{by}")
+
+    deltas = rep.get("run_deltas") or []
+    if deltas:
+        regressed = [d["metric"] for d in deltas if d.get("regressed")]
+        improved = [d["metric"] for d in deltas if d.get("improved")]
+        bits = []
+        if improved:
+            bits.append(f"better on {', '.join(improved)}")
+        if regressed:
+            bits.append(f"worse on {', '.join(regressed)}")
+        lines.append("**Runs:** " + ("; ".join(bits) if bits else f"{len(deltas)} metric(s) compared, none beyond threshold"))
+
+    if "goal_counts" in rep and rep["goal_counts"]:
+        gc = rep["goal_counts"]
+        lines.append("**Goals:** " + ", ".join(f"{v} {k}" for k, v in sorted(gc.items())))
+    if "test_counts" in rep and rep["test_counts"]:
+        tc = rep["test_counts"]
+        lines.append("**Tests:** " + ", ".join(f"{v} {k}" for k, v in sorted(tc.items())))
+
+    n = rep.get("artifact_count", 0)
+    role_counts = rep.get("role_counts") or {}
+    roles = ", ".join(f"{v} {k}" for k, v in sorted(role_counts.items())) if role_counts else ""
+    lines.append(f"**Evidence:** {n} attachment(s)" + (f" ({roles})" if roles else ""))
+
+    return "\n".join(lines)
 
 
 def _read_records(path: str) -> list[dict]:
@@ -578,6 +896,12 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("run_id")
     a.add_argument("path")
     a.add_argument("--name", default=None)
+    a.add_argument("--role", default="",
+                   choices=["", "screenshot", "video", "log", "bundle", "other"],
+                   help="drives prune order; inferred from the file when omitted")
+    a.add_argument("--caption", default="")
+    a.add_argument("--started-at-ms", dest="started_at_ms", type=int, default=None,
+                   help="wall-clock ms of a capture's first frame")
 
     f = sub.add_parser("finish", help="close a run out")
     f.add_argument("run_id")
@@ -650,7 +974,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "events":
         print(b.events(args.run_id, _read_records(args.file)))
     elif args.cmd == "artifact":
-        print(json.dumps(b.artifact(args.run_id, args.path, args.name)))
+        print(json.dumps(b.artifact(args.run_id, args.path, args.name,
+                                    role=args.role, caption=args.caption,
+                                    started_at_ms=args.started_at_ms)))
     elif args.cmd == "finish":
         summary = json.load(open(args.summary)) if args.summary else None
         tags = dict(t.split("=", 1) for t in args.tag)
