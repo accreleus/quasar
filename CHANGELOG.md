@@ -25,6 +25,14 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Each GPU reports its own codec set to the control plane (#302).** `capacity.gpus[].codecs`
+  (amendment 12) carries the same per-GPU set `capacity.codecs` was already derived from
+  (#301), so the host union and each GPU's own field can never disagree; a zero-slot
+  (pinned-out) GPU omits the field rather than sending `[]`. At `session_assign`, an
+  assignment for a codec outside the bound GPU's current set is refused with
+  `ack{ok:false}` (log token `assign-codec-not-in-gpu-set`) rather than building a pipeline
+  that would fail — a belt behind the control plane's own placement guarantee, exempting
+  H.264, which is always the floor.
 - **Codec probes (#300).** After a GPU's H.264 media probe passes, the agent runs the same
   probe on that GPU for each codec above the floor its encoder can build (HEVC, AV1): 10
   frames within 10 s, passing when the encoder reaches PLAYING and produces them. The result

@@ -599,6 +599,9 @@ fn detect_gpus_at(
             render_node,
             device_path: resolved_device_path,
             driver_identity,
+            // Stamped later from the codec-probe evidence (`agent::apply_gpu_codecs`);
+            // this detection pass only builds the base inventory.
+            codecs: None,
         });
     }
 
@@ -1220,6 +1223,7 @@ fn detection_failure(
             render_node: None,
             device_path: None,
             driver_identity: None,
+            codecs: None,
         }],
         vec![VramTarget {
             index: 0,
@@ -1899,6 +1903,7 @@ stepping\t: 2
             render_node: None,
             device_path: None,
             driver_identity: None,
+            codecs: None,
         }
     }
 
@@ -2069,6 +2074,7 @@ stepping\t: 2
             render_node: None,
             device_path: Some(device_path),
             driver_identity: None,
+            codecs: None,
         };
         let base_gpus = vec![amd_gpu(card0_path), amd_gpu(card1_path)];
 

@@ -1144,21 +1144,22 @@ impl CodecStack<'_> {
     }
 }
 
-/// `capacity.codecs` (#301, agent-api.md amendment 12): the union over usable GPUs of
-/// H.264 plus every codec in that GPU's plan, outside its exclusion, whose codec-probe
-/// pass was proven under the stack this GPU index has NOW. Always `Some` and never empty.
-fn advertised_host_codecs(
+/// Per-GPU codec sets under the current stack, indexed like `stack.gpus` — the ONE
+/// computation both `capacity.gpus[].codecs` (#302, `apply_gpu_codecs`) and the
+/// host-level union `capacity.codecs` (#301, `host_codecs_from_sets`) derive from.
+/// Never recompute the rule a second time from the same stack.
+fn gpu_codec_sets(
     stack: &CodecStack<'_>,
     report: &crate::readiness::report::ReadinessReport,
     evidence: &crate::host_probe::outcome::CodecEvidence,
-) -> Option<Vec<String>> {
+) -> Vec<(i32, BTreeSet<Codec>)> {
     let identity = stack.identity();
-    let sets: Vec<BTreeSet<Codec>> = stack
+    stack
         .gpus
         .iter()
         .map(|gpu| {
             let current = identity.evidence_stamp(gpu.index);
-            crate::gpu_codecs::gpu_codec_set(
+            let set = crate::gpu_codecs::gpu_codec_set(
                 &stack.plan(gpu),
                 &(stack.layers.excluded)(gpu),
                 |codec| {
@@ -1167,15 +1168,36 @@ fn advertised_host_codecs(
                     })
                 },
                 gpu.encode_slots_total > 0,
-            )
+            );
+            (gpu.index, set)
         })
-        .collect();
-    Some(
-        crate::gpu_codecs::host_codec_set(&sets)
-            .into_iter()
-            .map(|c| c.as_str().to_string())
-            .collect(),
-    )
+        .collect()
+}
+
+/// The host union (`capacity.codecs`, #301, agent-api.md amendment 12) as wire strings,
+/// from already-computed per-GPU sets: H.264 plus every codec any usable GPU's set
+/// carries. Always non-empty.
+fn host_codecs_from_sets(sets: &[(i32, BTreeSet<Codec>)]) -> Vec<String> {
+    crate::gpu_codecs::host_codec_set(sets.iter().map(|(_, s)| s))
+        .into_iter()
+        .map(|c| c.as_str().to_string())
+        .collect()
+}
+
+/// `capacity.gpus[].codecs` (#302, agent-api.md amendment 12): stamps each GPU's own
+/// wire codec set from the SAME per-GPU sets the host union is derived from — never a
+/// second, possibly-diverging pass. A zero-slot (pinned-out) GPU's set is empty
+/// (`gpu_codec_set`'s unusable case), which stores as an omitted field: the wire
+/// contract's "may omit `codecs` or send `[]`" for a GPU the control plane already
+/// never places on.
+fn apply_gpu_codecs(gpus: &mut [crate::messages::GpuCapacity], sets: &[(i32, BTreeSet<Codec>)]) {
+    for gpu in gpus.iter_mut() {
+        gpu.codecs = sets
+            .iter()
+            .find(|(index, _)| *index == gpu.index)
+            .filter(|(_, set)| !set.is_empty())
+            .map(|(_, set)| set.iter().map(|c| c.as_str().to_string()).collect());
+    }
 }
 
 /// Poll a `select!` arm's receiver without ever resolving `Ready(None)` twice (#530).
@@ -1608,7 +1630,7 @@ async fn connect_and_run(
     health.record_registered();
 
     // --- Step 3: send capacity ---
-    let cap = offload_probe(detect_capacity_blocking).await;
+    let mut cap = offload_probe(detect_capacity_blocking).await;
     info!(
         "detected capacity: {} cores, {} MB RAM, {} GPU(s)",
         cap.host.cpu_cores,
@@ -1682,7 +1704,7 @@ async fn connect_and_run(
     sessions.mgr.agent_image_identity = agent_image_identity.to_string();
     // Not yet `mgr`'s stack (`begin_connection` adopts it below), so built from the same
     // locals this message reports.
-    let first_codecs = advertised_host_codecs(
+    let first_gpu_codec_sets = gpu_codec_sets(
         &CodecStack {
             agent_image: agent_image_identity,
             gpus: &gpu_inventory,
@@ -1693,6 +1715,8 @@ async fn connect_and_run(
         &sessions.mgr.readiness,
         &sessions.mgr.codec_evidence,
     );
+    let first_codecs = Some(host_codecs_from_sets(&first_gpu_codec_sets));
+    apply_gpu_codecs(&mut cap.gpus, &first_gpu_codec_sets);
     let capacity_msg = AgentMsg::Capacity {
         source_preparation: None,
         host: cap.host,
@@ -2018,6 +2042,8 @@ async fn connect_and_run(
                                 &mut cap_gpus,
                                 mgr.warmup_reserved(),
                             );
+                            let gpu_sets = mgr.gpu_codec_sets();
+                            apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
                             let capacity_msg = AgentMsg::Capacity {
             source_preparation: mgr.source_policy.as_ref().and_then(|p| p.report()),
                                 host: cap.host,
@@ -2026,7 +2052,7 @@ async fn connect_and_run(
                                 gpu_detection_reason: cap.gpu_detection_reason,
                                 console_capabilities: Some(cap.console),
                                 effective_settings: Some(mgr.runtime_settings.effective_map()),
-                                codecs: mgr.advertised_codecs(),
+                                codecs: Some(host_codecs_from_sets(&gpu_sets)),
                                 codec_throughput: advertised_codec_throughput(&mgr.host_codec_report),
                                 readiness: Some(mgr.readiness.merged()),
                             };
@@ -2071,6 +2097,8 @@ async fn connect_and_run(
                         &mut cap_gpus,
                         mgr.warmup_reserved(),
                     );
+                    let gpu_sets = mgr.gpu_codec_sets();
+                    apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
                     let capacity_msg = AgentMsg::Capacity {
             source_preparation: mgr.source_policy.as_ref().and_then(|p| p.report()),
                         host: cap.host,
@@ -2079,7 +2107,7 @@ async fn connect_and_run(
                         gpu_detection_reason: cap.gpu_detection_reason,
                         console_capabilities: Some(cap.console),
                         effective_settings: Some(mgr.runtime_settings.effective_map()),
-                        codecs: mgr.advertised_codecs(),
+                        codecs: Some(host_codecs_from_sets(&gpu_sets)),
                         codec_throughput: advertised_codec_throughput(&mgr.host_codec_report),
                         readiness: Some(mgr.readiness.merged()),
                     };
@@ -2787,9 +2815,20 @@ impl SessionManager {
         }
     }
 
-    /// `capacity.codecs` for the current stack (#301).
+    /// Per-GPU codec sets for the current stack (#301/#302) — the one computation
+    /// `advertised_codecs` (the host union) and `apply_gpu_codecs` (the per-GPU wire
+    /// field) both derive from.
+    fn gpu_codec_sets(&self) -> Vec<(i32, BTreeSet<Codec>)> {
+        gpu_codec_sets(&self.codec_stack(), &self.readiness, &self.codec_evidence)
+    }
+
+    /// `capacity.codecs` for the current stack (#301). Test-only: a real capacity send
+    /// needs `gpu_codec_sets()` anyway (to stamp `apply_gpu_codecs`), so production call
+    /// sites derive the union from that same value with `host_codecs_from_sets` instead
+    /// of computing it twice through this wrapper.
+    #[cfg(test)]
     fn advertised_codecs(&self) -> Option<Vec<String>> {
-        advertised_host_codecs(&self.codec_stack(), &self.readiness, &self.codec_evidence)
+        Some(host_codecs_from_sets(&self.gpu_codec_sets()))
     }
 
     /// Built per assign/swap rather than cached: `settings.home_root` is a live-class
@@ -3028,6 +3067,40 @@ impl SessionManager {
                     );
                     self.note_session_count();
                     return Some(ack(id, false, Some(error.to_string())));
+                }
+                // #302 belt: the control plane guarantees `stream.codec` is in the
+                // assigned GPU's codec set (agent-api.md amendment 12), but this is the
+                // check behind that guarantee — a stale control-plane read of a GPU's set
+                // (it can shrink faster than a report reaches the control plane, e.g.
+                // right after an agent restart) must refuse here rather than let
+                // `pipeline::resolve_effective_encoder` build a pipeline that fails later.
+                // H.264 is exempt: it is the floor of every usable GPU's set by
+                // construction (`gpu_codecs::gpu_codec_set`) and never fails to resolve.
+                let codec = cfg.stream.codec;
+                if codec != Codec::H264 {
+                    let gpu_codecs = self
+                        .gpu_codec_sets()
+                        .into_iter()
+                        .find(|(index, _)| *index == gpu_index)
+                        .map(|(_, set)| set)
+                        .unwrap_or_default();
+                    if !gpu_codecs.contains(&codec) {
+                        warn!(
+                            token = "assign-codec-not-in-gpu-set",
+                            "session {session_id} assignment rejected: gpu={gpu_index} \
+                             codec={} not in this GPU's current codec set {gpu_codecs:?}",
+                            codec.as_str()
+                        );
+                        self.note_session_count();
+                        return Some(ack(
+                            id,
+                            false,
+                            Some(format!(
+                                "gpu {gpu_index} cannot encode {}: not in its current codec set",
+                                codec.as_str()
+                            )),
+                        ));
+                    }
                 }
                 cfg.console_config = self.console_config.clone();
                 cfg.video_topology = video_topology;
@@ -4522,6 +4595,8 @@ where
     // validated against the hardware that exists.
     let mut cap_gpus = cap.gpus;
     crate::session::warmup::apply_encode_slot_reservation(&mut cap_gpus, mgr.warmup_reserved());
+    let gpu_sets = mgr.gpu_codec_sets();
+    apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
     let msg = AgentMsg::Capacity {
         source_preparation: mgr.source_policy.as_ref().and_then(|p| p.report()),
         host: cap.host,
@@ -4530,7 +4605,7 @@ where
         gpu_detection_reason: cap.gpu_detection_reason,
         console_capabilities: Some(cap.console),
         effective_settings: Some(mgr.runtime_settings.effective_map()),
-        codecs: mgr.advertised_codecs(),
+        codecs: Some(host_codecs_from_sets(&gpu_sets)),
         codec_throughput: advertised_codec_throughput(&mgr.host_codec_report),
         readiness: Some(mgr.readiness.merged()),
     };
@@ -5767,6 +5842,7 @@ mod tests {
             render_node: render_node.map(str::to_string),
             device_path: render_node.map(crate::session::settings::canonicalize_render_node),
             driver_identity: None,
+            codecs: None,
         }
     }
 
@@ -6286,6 +6362,146 @@ mod tests {
         prove(&mut mgr, 0, ProbeCodec::Av1);
         prove(&mut mgr, 1, ProbeCodec::H265);
         assert_eq!(mgr.advertised_codecs(), wire(&["h264"]));
+    }
+
+    // ---- #302: capacity.gpus[].codecs, and the assign-time belt ----
+
+    /// `apply_gpu_codecs` and the host union it derives from must read the SAME
+    /// per-GPU sets: a usable GPU's wire field always carries h264, a zero-slot GPU
+    /// omits the field entirely (never `[]`), and the union is exactly what the
+    /// per-GPU fields say.
+    #[test]
+    fn apply_gpu_codecs_stamps_each_gpu_and_omits_a_zero_slot_gpu() {
+        let mut gpus = vec![
+            gpu(0, "nvidia", Some("/dev/dri/renderD128")),
+            gpu(1, "amd", Some("/dev/dri/renderD129")),
+        ];
+        gpus[1].encode_slots_total = 0;
+        let sets = vec![
+            (0, BTreeSet::from([Codec::H264, Codec::H265])),
+            (1, BTreeSet::new()),
+        ];
+        apply_gpu_codecs(&mut gpus, &sets);
+        assert_eq!(
+            gpus[0].codecs,
+            Some(vec!["h264".to_string(), "h265".to_string()])
+        );
+        assert_eq!(
+            gpus[1].codecs, None,
+            "a zero-slot GPU omits codecs, never []"
+        );
+        assert_eq!(
+            host_codecs_from_sets(&sets),
+            vec!["h264".to_string(), "h265".to_string()],
+            "the host union is derived from the same per-GPU sets, not recomputed"
+        );
+    }
+
+    /// `SessionManager::gpu_codec_sets` is the single computation `advertised_codecs`
+    /// (the host union) and a capacity send's `apply_gpu_codecs` (the per-GPU field)
+    /// both read — proving a codec on one GPU must not appear on the other's set even
+    /// though it appears in the union.
+    #[test]
+    fn gpu_codec_sets_are_per_gpu_and_the_union_matches_advertised_codecs() {
+        use crate::host_probe::ProbeCodec;
+        let mut mgr = codec_mgr(
+            vec![
+                gpu(0, "nvidia", Some("/dev/dri/renderD128")),
+                gpu(1, "nvidia", Some("/dev/dri/renderD129")),
+            ],
+            plan_all,
+        );
+        prove(&mut mgr, 0, ProbeCodec::H265);
+        prove(&mut mgr, 1, ProbeCodec::Av1);
+        let sets = mgr.gpu_codec_sets();
+        let gpu0 = sets.iter().find(|(i, _)| *i == 0).unwrap();
+        let gpu1 = sets.iter().find(|(i, _)| *i == 1).unwrap();
+        assert_eq!(gpu0.1, BTreeSet::from([Codec::H264, Codec::H265]));
+        assert_eq!(gpu1.1, BTreeSet::from([Codec::H264, Codec::Av1]));
+        assert_eq!(
+            mgr.advertised_codecs(),
+            wire(&["h264", "h265", "av1"]),
+            "the host union is the per-GPU sets' union"
+        );
+    }
+
+    fn session_assign_msg_codec(session_id: &str, gpu_index: i32, codec: &str) -> ControlMsg {
+        serde_json::from_value(serde_json::json!({
+            "type": "session_assign",
+            "id": "c1",
+            "session_id": session_id,
+            "gpu_index": gpu_index,
+            "stream": {"width": 1920, "height": 1080, "fps": 60,
+                "bitrate_kbps": 15000, "h264_profile": "constrained-baseline",
+                "codec": codec}
+        }))
+        .unwrap()
+    }
+
+    /// The belt: `session_assign` must refuse a codec the bound GPU has not (yet, or
+    /// ever) proven, even though nothing upstream of it caught the mistake.
+    #[test]
+    fn assign_refuses_a_codec_outside_the_bound_gpus_set() {
+        let mut mgr = codec_mgr(
+            vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))],
+            plan_all,
+        );
+        // Nothing proven yet: GPU 0's set is h264-only, even though the flat probe
+        // and the plan both claim h265/av1.
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+        let reply = mgr.handle_control(
+            session_assign_msg_codec("s1", 0, "h265"),
+            &evt_tx,
+            &diagnostic_sender(),
+        );
+        match reply {
+            Some(AgentMsg::Ack {
+                ok: false, error, ..
+            }) => {
+                assert!(
+                    error.unwrap().contains("h265"),
+                    "the ack error should name the refused codec"
+                );
+            }
+            other => panic!("expected ack{{ok:false}}, got {other:?}"),
+        }
+    }
+
+    /// A codec-probe pass on the bound GPU lifts the belt.
+    #[test]
+    fn assign_accepts_a_codec_once_the_bound_gpu_has_proven_it() {
+        use crate::host_probe::ProbeCodec;
+        let mut mgr = codec_mgr(
+            vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))],
+            plan_all,
+        );
+        prove(&mut mgr, 0, ProbeCodec::H265);
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+        let reply = mgr.handle_control(
+            session_assign_msg_codec("s1", 0, "h265"),
+            &evt_tx,
+            &diagnostic_sender(),
+        );
+        assert!(
+            matches!(reply, Some(AgentMsg::Ack { ok: true, .. })),
+            "{reply:?}"
+        );
+    }
+
+    /// H.264 is exempt from the belt: it is the floor of every usable GPU's set by
+    /// construction, so a plan/probe gap must never refuse it.
+    #[test]
+    fn assign_never_refuses_h264_even_with_no_plan_and_nothing_proven() {
+        let mut mgr = codec_mgr(
+            vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))],
+            plan_none,
+        );
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+        let reply = mgr.handle_control(session_assign_msg("s1", 0), &evt_tx, &diagnostic_sender());
+        assert!(
+            matches!(reply, Some(AgentMsg::Ack { ok: true, .. })),
+            "{reply:?}"
+        );
     }
 
     #[tokio::test]
@@ -7625,6 +7841,7 @@ mod tests {
             render_node: None,
             device_path: None,
             driver_identity: None,
+            codecs: None,
         }];
         let (handle, mut rx) = ProbeHandle::detached();
         mgr.probe_handle = Some(handle);
@@ -7664,6 +7881,7 @@ mod tests {
                 render_node: Some("/dev/dri/renderD128".into()),
                 device_path: None,
                 driver_identity: Some("amd:1.2.3".into()),
+                codecs: None,
             },
             crate::messages::GpuCapacity {
                 index: 1,
@@ -7674,6 +7892,7 @@ mod tests {
                 render_node: Some("/dev/dri/renderD129".into()),
                 device_path: None,
                 driver_identity: Some("amd:1.2.3".into()),
+                codecs: None,
             },
         ];
         mgr.agent_image_identity = "sha256:agent".into();
