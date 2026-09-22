@@ -433,6 +433,12 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeProfileIneligible,
 			"the selected stream profile is not eligible for this device")
 		return
+	// Verbatim on a positive sentinel match: only text this package composed
+	// reaches ErrRungCodecNotAvailable (the codec from rung.go, the launch
+	// profile id from launcher.go), so the message leaks nothing.
+	case errors.Is(err, ErrRungCodecNotAvailable):
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, err.Error())
+		return
 	case errors.Is(err, ErrCodecUnsupportedByHost):
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict,
 			"the requested codec is not supported by the assigned host's encoder")
