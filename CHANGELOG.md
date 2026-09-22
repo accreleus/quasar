@@ -132,6 +132,7 @@ own; the two do not move together, and that is deliberate.
   encoder now reads healthy. The codec still leaves that GPU's codec set, and nothing is
   blocked, as before. A codec probe that opens the encoder and then fails is still `fail`, as
   is the H.264 media probe, which is the floor.
+- `docs/configuration.md` "Multi-codec" describes per-GPU codec sets, codec probes and the `unsupported` status, codec-aware placement (the hand-picked codec constraint and Auto's codec preference), and the explicit-codec refusals (#307, #296).
 - **Auto prefers the GPU that gives the best codec (#305, amendment 12).** A launch left on
   Auto now ranks candidate GPUs by the best codec each can encode for this device, in the
   launch profile's own order, and only then by load. On a host where one GPU encodes AV1
