@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{ProbeKind, ProbeTarget};
+use super::{ProbeCodec, ProbeKind, ProbeTarget};
 
 /// What a probe result depends on. A change re-runs the probes it could affect.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -17,6 +17,20 @@ pub struct ProbeInputs {
     pub gpus: BTreeMap<i32, String>,
     /// The host settings that select the media path, as one comparable string.
     pub settings: String,
+    /// Per GPU, the codecs above the floor its encoder plan can build: each gets a codec
+    /// probe. A GPU absent here gets none.
+    pub codecs: BTreeMap<i32, BTreeSet<ProbeCodec>>,
+}
+
+/// What a finished probe concluded, as far as scheduling cares: a codec probe runs only
+/// on a GPU whose media probe last concluded `Passed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Passed,
+    /// Failed, or not applicable to this GPU.
+    NotPassed,
+    /// Leaves the last definitive verdict standing.
+    Indeterminate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,16 +50,19 @@ pub enum Event {
         live_gpus: BTreeSet<i32>,
         launching: bool,
     },
-    /// A launch failed in a way these probe kinds could explain.
+    /// A launch failed in a way these probe kinds could explain. `codec` is the failed
+    /// session's codec when above the floor: with `Media` it selects that codec probe.
     LaunchFailed {
         gpu: i32,
         explains: BTreeSet<ProbeKind>,
+        codec: Option<ProbeCodec>,
     },
     /// `reconciled` is false when a container probe's stop or cleanup outcome is not
     /// known. Always true for a child-process probe.
     ProbeFinished {
         target: ProbeTarget,
         reconciled: bool,
+        verdict: Verdict,
     },
     Reconciled {
         kind: ProbeKind,
@@ -97,6 +114,9 @@ pub struct Scheduler {
     reconciling: Option<ProbeKind>,
     /// Deferred at the encode gate; pending again once it is free.
     gate_waiting: BTreeSet<ProbeTarget>,
+    /// GPUs whose media probe last concluded with a pass. A codec target waits while its
+    /// GPU's media probe is outstanding and is dropped if that GPU is not in here.
+    media_passed: BTreeSet<i32>,
 }
 
 impl Default for Scheduler {
@@ -122,6 +142,7 @@ impl Scheduler {
             unreconciled: BTreeSet::new(),
             reconciling: None,
             gate_waiting: BTreeSet::new(),
+            media_passed: BTreeSet::new(),
         }
     }
 
@@ -134,10 +155,12 @@ impl Scheduler {
         match target.gpu {
             _ if !self.kinds.contains(&target.kind) => false,
             None => !target.kind.per_gpu(),
-            Some(index) => self
-                .inputs
-                .as_ref()
-                .is_some_and(|i| i.gpus.contains_key(&index)),
+            Some(index) => self.inputs.as_ref().is_some_and(|i| {
+                i.gpus.contains_key(&index)
+                    && target.codec.is_none_or(|codec| {
+                        i.codecs.get(&index).is_some_and(|c| c.contains(&codec))
+                    })
+            }),
         }
     }
 
@@ -187,7 +210,14 @@ impl Scheduler {
                 self.live_gpus = live_gpus;
                 self.launching = launching;
             }
-            Event::LaunchFailed { gpu, explains } => {
+            Event::LaunchFailed {
+                gpu,
+                explains,
+                codec,
+            } => {
+                let codec_target = codec
+                    .filter(|_| explains.contains(&ProbeKind::Media))
+                    .map(|codec| ProbeTarget::codec(gpu, codec));
                 for kind in explains {
                     let target = if kind.per_gpu() {
                         ProbeTarget::gpu(kind, gpu)
@@ -198,8 +228,16 @@ impl Scheduler {
                         self.pending.insert(target);
                     }
                 }
+                // Queued behind the media probe just queued, so it runs only if that passes.
+                if let Some(target) = codec_target.filter(|t| self.exists(*t)) {
+                    self.pending.insert(target);
+                }
             }
-            Event::ProbeFinished { target, reconciled } => {
+            Event::ProbeFinished {
+                target,
+                reconciled,
+                verdict,
+            } => {
                 if let Some(running) = self.running.filter(|r| r.target == target) {
                     self.running = None;
                     if running.preempted && self.exists(target) {
@@ -207,6 +245,9 @@ impl Scheduler {
                     }
                     if !reconciled {
                         self.unreconciled.insert(target.kind);
+                    }
+                    if !running.discard && self.exists(target) {
+                        self.media_verdict(target, verdict);
                     }
                 }
             }
@@ -247,6 +288,44 @@ impl Scheduler {
         }
     }
 
+    /// A media probe's verdict gates its GPU's codec probes. A pass after anything else
+    /// queues them all, so a GPU that recovers is not left without codec verdicts until
+    /// the next input change.
+    fn media_verdict(&mut self, target: ProbeTarget, verdict: Verdict) {
+        let (ProbeKind::Media, Some(gpu), None) = (target.kind, target.gpu, target.codec) else {
+            return;
+        };
+        match verdict {
+            Verdict::Passed => {
+                if self.media_passed.insert(gpu) {
+                    self.queue_codecs(gpu);
+                }
+            }
+            Verdict::NotPassed => {
+                self.media_passed.remove(&gpu);
+                let drop = |t: &ProbeTarget| t.gpu == Some(gpu) && t.codec.is_some();
+                self.pending.retain(|t| !drop(t));
+                self.gate_waiting.retain(|t| !drop(t));
+            }
+            Verdict::Indeterminate => {}
+        }
+    }
+
+    fn queue_codecs(&mut self, gpu: i32) {
+        if !self.kinds.contains(&ProbeKind::Media) {
+            return;
+        }
+        let codecs = self
+            .inputs
+            .as_ref()
+            .and_then(|i| i.codecs.get(&gpu))
+            .cloned()
+            .unwrap_or_default();
+        for codec in codecs {
+            self.pending.insert(ProbeTarget::codec(gpu, codec));
+        }
+    }
+
     fn queue_kinds(&mut self, kinds: &[ProbeKind], inputs: &ProbeInputs, out: &mut Vec<Action>) {
         for &kind in kinds {
             if !self.kinds.contains(&kind) {
@@ -259,9 +338,25 @@ impl Scheduler {
             } else {
                 for &index in inputs.gpus.keys() {
                     self.pending.insert(ProbeTarget::gpu(kind, index));
+                    if kind == ProbeKind::Media {
+                        for &codec in inputs.codecs.get(&index).into_iter().flatten() {
+                            self.pending.insert(ProbeTarget::codec(index, codec));
+                        }
+                    }
                 }
             }
         }
+    }
+
+    /// Stops tracking a target that no longer exists and removes its check.
+    fn retire(&mut self, target: ProbeTarget, actions: &mut Vec<Action>) {
+        self.pending.remove(&target);
+        self.gate_waiting.remove(&target);
+        if let Some(running) = self.running.as_mut().filter(|r| r.target == target) {
+            running.discard = true;
+            self.preempt(actions);
+        }
+        actions.push(Action::Forget(target));
     }
 
     fn observe(&mut self, new: ProbeInputs, actions: &mut Vec<Action>) {
@@ -270,19 +365,32 @@ impl Scheduler {
         };
         let per_gpu: Vec<ProbeKind> = self.kinds.iter().copied().filter(|k| k.per_gpu()).collect();
 
+        let media = self.kinds.contains(&ProbeKind::Media);
+        let no_codecs = BTreeSet::new();
         for (index, identity) in &old.gpus {
+            let old_codecs = old.codecs.get(index).unwrap_or(&no_codecs);
             if new.gpus.get(index) == Some(identity) {
+                // Same GPU: a codec its plan no longer builds loses its check; a new one
+                // is probed (behind the media probe, as always).
+                let new_codecs = new.codecs.get(index).unwrap_or(&no_codecs);
+                if media {
+                    for &codec in old_codecs.difference(new_codecs) {
+                        self.retire(ProbeTarget::codec(*index, codec), actions);
+                    }
+                    for &codec in new_codecs.difference(old_codecs) {
+                        self.pending.insert(ProbeTarget::codec(*index, codec));
+                    }
+                }
                 continue;
             }
+            self.media_passed.remove(index);
             for &kind in &per_gpu {
-                let target = ProbeTarget::gpu(kind, *index);
-                self.pending.remove(&target);
-                self.gate_waiting.remove(&target);
-                if let Some(running) = self.running.as_mut().filter(|r| r.target == target) {
-                    running.discard = true;
-                    self.preempt(actions);
+                self.retire(ProbeTarget::gpu(kind, *index), actions);
+            }
+            if media {
+                for &codec in old_codecs {
+                    self.retire(ProbeTarget::codec(*index, codec), actions);
                 }
-                actions.push(Action::Forget(target));
             }
         }
         if old.gpus.is_empty() && !new.gpus.is_empty() {
@@ -304,6 +412,11 @@ impl Scheduler {
                     for &kind in &per_gpu {
                         self.pending.insert(ProbeTarget::gpu(kind, *index));
                     }
+                    if media {
+                        for &codec in new.codecs.get(index).into_iter().flatten() {
+                            self.pending.insert(ProbeTarget::codec(*index, codec));
+                        }
+                    }
                 }
             }
         }
@@ -317,10 +430,26 @@ impl Scheduler {
         {
             return;
         }
-        let candidates: Vec<ProbeTarget> = self.pending.iter().copied().collect();
-        for target in candidates {
+        // Codec probes last: they only add codecs, so every probe that can block a launch
+        // concludes first.
+        let (floors, codecs): (Vec<ProbeTarget>, Vec<ProbeTarget>) = self
+            .pending
+            .iter()
+            .copied()
+            .partition(|t| t.codec.is_none());
+        for target in floors.into_iter().chain(codecs) {
             if target.gpu.is_some_and(|g| self.live_gpus.contains(&g)) {
                 continue;
+            }
+            if let (Some(gpu), Some(_)) = (target.gpu, target.codec) {
+                let floor = target.media_floor();
+                if self.pending.contains(&floor) || self.gate_waiting.contains(&floor) {
+                    continue;
+                }
+                if !self.media_passed.contains(&gpu) {
+                    self.pending.remove(&target);
+                    continue;
+                }
             }
             if self.unreconciled.contains(&target.kind) {
                 if reconcile_failed == Some(target.kind) {
@@ -353,6 +482,7 @@ mod tests {
             driver: "nvidia:595.99.02 volume:abc".into(),
             gpus: gpus.iter().map(|(i, id)| (*i, id.to_string())).collect(),
             settings: "encoder=vulkan".into(),
+            codecs: BTreeMap::new(),
         }
     }
 
@@ -372,6 +502,7 @@ mod tests {
         Event::ProbeFinished {
             target,
             reconciled: true,
+            verdict: Verdict::Passed,
         }
     }
 
@@ -636,6 +767,7 @@ mod tests {
         let first = s.step(Event::LaunchFailed {
             gpu: 1,
             explains: [Media, Audio].into(),
+            codec: None,
         });
         assert_eq!(drain(&mut s, first), vec![host(Audio), gpu(Media, 1)]);
     }
@@ -647,6 +779,7 @@ mod tests {
             s.step(Event::LaunchFailed {
                 gpu: 0,
                 explains: BTreeSet::new(),
+                codec: None,
             }),
             vec![]
         );
@@ -659,6 +792,7 @@ mod tests {
             s.step(Event::LaunchFailed {
                 gpu: 7,
                 explains: [Media].into(),
+                codec: None,
             }),
             vec![]
         );
@@ -691,6 +825,7 @@ mod tests {
             s.step(Event::LaunchFailed {
                 gpu: 0,
                 explains: [Media].into(),
+                codec: None,
             }),
             vec![],
             "the failed session still holds the GPU"
@@ -706,6 +841,7 @@ mod tests {
             s.step(Event::LaunchFailed {
                 gpu: 0,
                 explains: [Input].into(),
+                codec: None,
             }),
             vec![Action::Start(host(Input))]
         );
@@ -808,6 +944,7 @@ mod tests {
         let after = s.step(Event::ProbeFinished {
             target: host(Audio),
             reconciled: false,
+            verdict: Verdict::Passed,
         });
         // Other kinds carry on.
         assert_eq!(after, vec![Action::Start(gpu(Media, 0))]);
@@ -816,6 +953,7 @@ mod tests {
         let retry = s.step(Event::LaunchFailed {
             gpu: 0,
             explains: [Audio].into(),
+            codec: None,
         });
         assert_eq!(retry, vec![Action::Reconcile(Audio)]);
         // Reconciliation is inside the single flight.
@@ -823,6 +961,7 @@ mod tests {
             s.step(Event::LaunchFailed {
                 gpu: 0,
                 explains: [Input].into(),
+                codec: None,
             }),
             vec![]
         );
@@ -845,15 +984,18 @@ mod tests {
         s.step(Event::LaunchFailed {
             gpu: 0,
             explains: [ApplicationGpu].into(),
+            codec: None,
         });
         s.step(Event::ProbeFinished {
             target: gpu(ApplicationGpu, 0),
             reconciled: false,
+            verdict: Verdict::Passed,
         });
         assert_eq!(
             s.step(Event::LaunchFailed {
                 gpu: 0,
                 explains: [ApplicationGpu, Media].into(),
+                codec: None,
             }),
             vec![Action::Start(gpu(Media, 0))]
         );
@@ -902,6 +1044,7 @@ mod tests {
             s.step(Event::LaunchFailed {
                 gpu: 0,
                 explains: [Audio, ApplicationGpu].into(),
+                codec: None,
             }),
             vec![]
         );
@@ -929,5 +1072,334 @@ mod tests {
         s.step(Event::Registered(one_gpu()));
         assert_eq!(s.step(finished(gpu(Media, 0))), vec![]);
         assert_eq!(s.running(), Some(host(Input)));
+    }
+
+    // ── #300: codec probes ───────────────────────────────────────────────────────────
+
+    use ProbeCodec::{Av1, H265};
+
+    fn codec(index: i32, c: ProbeCodec) -> ProbeTarget {
+        ProbeTarget::codec(index, c)
+    }
+
+    fn with_codecs(mut inputs: ProbeInputs, codecs: &[(i32, &[ProbeCodec])]) -> ProbeInputs {
+        inputs.codecs = codecs
+            .iter()
+            .map(|(i, c)| (*i, c.iter().copied().collect()))
+            .collect();
+        inputs
+    }
+
+    /// One GPU whose plan builds HEVC and AV1 above the floor.
+    fn codec_gpu() -> ProbeInputs {
+        with_codecs(one_gpu(), &[(0, &[H265, Av1])])
+    }
+
+    /// Like [`drain`], but each probe concludes with `verdict(target)`.
+    fn drain_with(
+        s: &mut Scheduler,
+        first: Vec<Action>,
+        verdict: impl Fn(ProbeTarget) -> Verdict,
+    ) -> Vec<ProbeTarget> {
+        let mut started = Vec::new();
+        let mut actions = first;
+        while let Some(target) = actions.iter().find_map(|a| match a {
+            Action::Start(t) => Some(*t),
+            _ => None,
+        }) {
+            started.push(target);
+            actions = s.step(Event::ProbeFinished {
+                target,
+                reconciled: true,
+                verdict: verdict(target),
+            });
+        }
+        started
+    }
+
+    fn settled_with(inputs: ProbeInputs) -> Scheduler {
+        let mut s = Scheduler::new();
+        let first = s.step(Event::Registered(inputs));
+        drain(&mut s, first);
+        assert_eq!(s.running(), None);
+        s
+    }
+
+    fn media_failed(s: &mut Scheduler, index: i32) {
+        let first = s.step(Event::LaunchFailed {
+            gpu: index,
+            explains: [Media].into(),
+            codec: None,
+        });
+        drain_with(s, first, |t| {
+            if t == gpu(Media, index) {
+                Verdict::NotPassed
+            } else {
+                Verdict::Passed
+            }
+        });
+    }
+
+    #[test]
+    fn codec_probes_queue_behind_a_passing_media_probe_and_after_every_blocking_probe() {
+        let mut s = Scheduler::new();
+        let first = s.step(Event::Registered(with_codecs(
+            inputs(&[(0, "a"), (1, "b")]),
+            &[(0, &[H265, Av1]), (1, &[H265])],
+        )));
+        assert_eq!(
+            drain(&mut s, first),
+            vec![
+                host(Input),
+                host(Audio),
+                gpu(Media, 0),
+                gpu(Media, 1),
+                gpu(ApplicationGpu, 0),
+                gpu(ApplicationGpu, 1),
+                codec(0, H265),
+                codec(0, Av1),
+                codec(1, H265),
+            ]
+        );
+        assert_eq!(
+            s.step(live(&[])),
+            vec![],
+            "nothing re-runs without a trigger"
+        );
+    }
+
+    #[test]
+    fn codec_probes_are_dropped_after_a_failing_media_probe() {
+        let mut s = Scheduler::new();
+        let first = s.step(Event::Registered(with_codecs(
+            inputs(&[(0, "a"), (1, "b")]),
+            &[(0, &[H265, Av1]), (1, &[H265, Av1])],
+        )));
+        let order = drain_with(&mut s, first, |t| {
+            if t == gpu(Media, 0) {
+                Verdict::NotPassed
+            } else {
+                Verdict::Passed
+            }
+        });
+        assert!(!order.contains(&codec(0, H265)), "{order:?}");
+        assert!(!order.contains(&codec(0, Av1)), "{order:?}");
+        assert!(order.contains(&codec(1, H265)) && order.contains(&codec(1, Av1)));
+    }
+
+    #[test]
+    fn a_media_probe_that_never_concluded_runs_no_codec_probe() {
+        let mut s = Scheduler::with_kinds(&[Media]);
+        let first = s.step(Event::Registered(codec_gpu()));
+        assert_eq!(
+            drain_with(&mut s, first, |_| Verdict::Indeterminate),
+            vec![gpu(Media, 0)]
+        );
+    }
+
+    #[test]
+    fn a_codec_probe_waits_while_its_media_probe_is_deferred() {
+        let mut s = Scheduler::with_kinds(&[Media, ApplicationGpu]);
+        s.step(Event::Registered(codec_gpu()));
+        assert_eq!(s.running(), Some(gpu(Media, 0)));
+        let after = s.step(Event::ProbeDeferred(gpu(Media, 0)));
+        assert_eq!(after, vec![Action::Start(gpu(ApplicationGpu, 0))]);
+        assert_eq!(
+            s.step(finished(gpu(ApplicationGpu, 0))),
+            vec![],
+            "the codec probes wait for the media probe"
+        );
+        let freed = s.step(Event::EncodeGateFreed);
+        assert_eq!(
+            drain(&mut s, freed),
+            vec![gpu(Media, 0), codec(0, H265), codec(0, Av1)]
+        );
+    }
+
+    #[test]
+    fn codec_probes_rerun_on_every_media_trigger() {
+        let changes: [fn(&mut ProbeInputs); 3] = [
+            |i| i.agent_image = "sha256:agent-b".into(),
+            |i| i.driver = "nvidia:610.10 volume:def".into(),
+            |i| i.settings = "encoder=nvenc".into(),
+        ];
+        for change in changes {
+            let mut s = settled_with(codec_gpu());
+            let mut changed = codec_gpu();
+            change(&mut changed);
+            let first = s.step(Event::InputsObserved(changed));
+            let order = drain(&mut s, first);
+            let at = order.iter().position(|t| *t == gpu(Media, 0)).unwrap();
+            assert_eq!(
+                &order[order.len() - 2..],
+                &[codec(0, H265), codec(0, Av1)],
+                "{order:?}"
+            );
+            assert!(at < order.len() - 2);
+        }
+    }
+
+    #[test]
+    fn a_replaced_gpu_forgets_its_codec_checks_and_is_probed_again() {
+        let mut s = settled_with(codec_gpu());
+        let first = s.step(Event::InputsObserved(with_codecs(
+            inputs(&[(0, "pci-0000:09:00.0")]),
+            &[(0, &[H265, Av1])],
+        )));
+        for forgotten in [
+            gpu(Media, 0),
+            gpu(ApplicationGpu, 0),
+            codec(0, H265),
+            codec(0, Av1),
+        ] {
+            assert!(first.contains(&Action::Forget(forgotten)), "{first:?}");
+        }
+        assert_eq!(
+            drain(&mut s, first),
+            vec![
+                gpu(Media, 0),
+                gpu(ApplicationGpu, 0),
+                codec(0, H265),
+                codec(0, Av1)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_vanished_gpu_forgets_its_codec_checks() {
+        let mut s = settled_with(with_codecs(
+            inputs(&[(0, "a"), (1, "b")]),
+            &[(0, &[Av1]), (1, &[Av1])],
+        ));
+        let actions = s.step(Event::InputsObserved(with_codecs(
+            inputs(&[(0, "a")]),
+            &[(0, &[Av1])],
+        )));
+        assert_eq!(
+            actions,
+            vec![
+                Action::Forget(gpu(Media, 1)),
+                Action::Forget(gpu(ApplicationGpu, 1)),
+                Action::Forget(codec(1, Av1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_launch_failure_naming_a_gpu_and_codec_requeues_that_codec_probe_only() {
+        let mut s = settled_with(with_codecs(
+            inputs(&[(0, "a"), (1, "b")]),
+            &[(0, &[H265, Av1]), (1, &[H265, Av1])],
+        ));
+        let first = s.step(Event::LaunchFailed {
+            gpu: 1,
+            explains: [Media].into(),
+            codec: Some(Av1),
+        });
+        assert_eq!(drain(&mut s, first), vec![gpu(Media, 1), codec(1, Av1)]);
+    }
+
+    #[test]
+    fn a_launch_failure_selects_no_codec_probe_unless_media_explains_it() {
+        let mut s = settled_with(codec_gpu());
+        let first = s.step(Event::LaunchFailed {
+            gpu: 0,
+            explains: [ApplicationGpu].into(),
+            codec: Some(Av1),
+        });
+        assert_eq!(drain(&mut s, first), vec![gpu(ApplicationGpu, 0)]);
+
+        let first = s.step(Event::LaunchFailed {
+            gpu: 0,
+            explains: [Media].into(),
+            codec: None,
+        });
+        assert_eq!(drain(&mut s, first), vec![gpu(Media, 0)]);
+    }
+
+    #[test]
+    fn a_launch_failure_for_a_codec_the_gpu_does_not_plan_queues_no_codec_probe() {
+        let mut s = settled_with(with_codecs(one_gpu(), &[(0, &[H265])]));
+        let first = s.step(Event::LaunchFailed {
+            gpu: 0,
+            explains: [Media].into(),
+            codec: Some(Av1),
+        });
+        assert_eq!(drain(&mut s, first), vec![gpu(Media, 0)]);
+    }
+
+    /// The retained media verdict gates: an indeterminate re-run of a GPU that last
+    /// passed still lets its codec probe run.
+    #[test]
+    fn an_indeterminate_media_rerun_leaves_the_last_pass_standing_for_the_codec_probe() {
+        let mut s = settled_with(codec_gpu());
+        let first = s.step(Event::LaunchFailed {
+            gpu: 0,
+            explains: [Media].into(),
+            codec: Some(Av1),
+        });
+        let order = drain_with(&mut s, first, |t| {
+            if t == gpu(Media, 0) {
+                Verdict::Indeterminate
+            } else {
+                Verdict::Passed
+            }
+        });
+        assert_eq!(order, vec![gpu(Media, 0), codec(0, Av1)]);
+    }
+
+    #[test]
+    fn a_gpu_whose_media_probe_recovers_has_all_its_codec_probes_queued() {
+        let mut s = settled_with(codec_gpu());
+        media_failed(&mut s, 0);
+        let first = s.step(Event::LaunchFailed {
+            gpu: 0,
+            explains: [Media].into(),
+            codec: None,
+        });
+        assert_eq!(
+            drain(&mut s, first),
+            vec![gpu(Media, 0), codec(0, H265), codec(0, Av1)]
+        );
+    }
+
+    #[test]
+    fn a_codec_the_plan_newly_builds_is_probed_and_one_it_dropped_is_forgotten() {
+        let mut s = settled_with(with_codecs(one_gpu(), &[(0, &[H265])]));
+        let first = s.step(Event::InputsObserved(with_codecs(
+            one_gpu(),
+            &[(0, &[Av1])],
+        )));
+        assert!(first.contains(&Action::Forget(codec(0, H265))), "{first:?}");
+        assert_eq!(drain(&mut s, first), vec![codec(0, Av1)]);
+    }
+
+    #[test]
+    fn a_codec_probe_never_runs_on_a_gpu_with_a_live_session_and_a_launch_preempts_it() {
+        let mut s = Scheduler::with_kinds(&[Media]);
+        s.step(Event::Registered(codec_gpu()));
+        assert_eq!(
+            s.step(finished(gpu(Media, 0))),
+            vec![Action::Start(codec(0, H265))]
+        );
+        assert_eq!(
+            s.step(Event::LaunchArrived { gpu: 0 }),
+            vec![Action::Preempt(codec(0, H265))]
+        );
+        assert_eq!(
+            s.step(Event::ProbeFinished {
+                target: codec(0, H265),
+                reconciled: true,
+                verdict: Verdict::Indeterminate,
+            }),
+            vec![]
+        );
+        assert_eq!(s.step(live(&[0])), vec![], "the GPU has a live session");
+        let after = s.step(live(&[]));
+        assert_eq!(
+            drain(&mut s, after),
+            vec![codec(0, H265), codec(0, Av1)],
+            "the pre-empted codec probe runs again"
+        );
     }
 }

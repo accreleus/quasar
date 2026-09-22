@@ -2,7 +2,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use super::{ProbeKind, ProbeTarget};
+use super::{ProbeCodec, ProbeKind, ProbeTarget};
 use crate::readiness::report::ReadinessReport;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +66,14 @@ pub(super) fn wording(target: ProbeTarget) -> (String, String, String) {
     let gpu = target
         .gpu
         .map_or("The GPU".to_string(), |i| format!("GPU {i}"));
+    if let Some(codec) = target.codec {
+        let codec = codec.as_str();
+        return (
+            format!("{gpu} encoded {codec}"),
+            format!("{gpu} does not encode {codec}; sessions will not use {codec} on this GPU"),
+            format!("{codec} encoding on {gpu}"),
+        );
+    }
     match target.kind {
         ProbeKind::Media => (
             format!("{gpu} composited and encoded frames"),
@@ -111,6 +119,35 @@ pub fn remediation(kind: ProbeKind) -> String {
     }
 }
 
+/// [`remediation`] for the target's kind, except a codec probe: its failure is often the
+/// hardware (a video engine with no encoder for that codec), which nothing on the host fixes.
+pub fn remediation_for(target: ProbeTarget) -> String {
+    match target.codec {
+        Some(codec) => {
+            let codec = codec.as_str();
+            format!(
+                "Nothing needs fixing if this GPU's video engine has no {codec} encoder: \
+                 sessions on it use another codec. If it should encode {codec}, check the \
+                 driver and the agent log for `token=\"host-probe-` lines."
+            )
+        }
+        None => remediation(target.kind),
+    }
+}
+
+/// The retained verdict of the codec probe for (`gpu`, `codec`): `Some(true)` pass,
+/// `Some(false)` fail, `None` when no definitive run is held (absent, indeterminate, skip).
+/// An indeterminate run never replaces a held verdict ([`record`]), so this is the last
+/// definitive one.
+pub fn codec_probe_verdict(report: &ReadinessReport, gpu: i32, codec: ProbeCodec) -> Option<bool> {
+    let check = report.retained(&ProbeTarget::codec(gpu, codec).check_id())?;
+    match check.status.as_str() {
+        crate::readiness::PASS => Some(true),
+        crate::readiness::FAIL => Some(false),
+        _ => None,
+    }
+}
+
 pub fn child_outcome(target: ProbeTarget, end: ChildEnd) -> ProbeOutcome {
     let (passed, failed, exercising) = wording(target);
     match end {
@@ -125,7 +162,7 @@ pub fn child_outcome(target: ProbeTarget, end: ChildEnd) -> ProbeOutcome {
             remediation: child_remediation,
         } => ProbeOutcome::Fail {
             summary: format!("{failed}: {stdout}"),
-            remediation: child_remediation.unwrap_or_else(|| remediation(target.kind)),
+            remediation: child_remediation.unwrap_or_else(|| remediation_for(target)),
         },
         // The child's contract is 0 pass, 1 fail. Anything else (2 is bad argv) is
         // not a statement about the host.
@@ -137,7 +174,7 @@ pub fn child_outcome(target: ProbeTarget, end: ChildEnd) -> ProbeOutcome {
         ChildEnd::Signaled(signal) => match fault_signal(signal) {
             Some(name) => ProbeOutcome::Fail {
                 summary: format!("The host probe of {exercising} crashed with {name}"),
-                remediation: remediation(target.kind),
+                remediation: remediation_for(target),
             },
             None => ProbeOutcome::Indeterminate {
                 reason: format!(

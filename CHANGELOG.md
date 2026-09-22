@@ -25,6 +25,15 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Codec probes (#300).** After a GPU's H.264 media probe passes, the agent runs the same
+  probe on that GPU for each codec above the floor its encoder can build (HEVC, AV1): 10
+  frames within 10 s, passing when the encoder reaches PLAYING and produces them. The result
+  is the readiness check `media_probe_gpu<N>_<codec>` (`h265`, `av1`), shown on the host
+  readiness card under GPU & display with the media probe. A failure says the GPU does not
+  encode that codec, with the encoder's own error as evidence (an AMD VCN 3.x iGPU's AV1
+  encoder never reaches READY), and blocks nothing: the GPU stays placeable. The probes re-run
+  on the media probe's triggers and after a launch failure in that codec on that GPU. What the
+  host advertises is unchanged in this release.
 - **Host probes, first slice (#257).** After it registers, the agent creates virtual input
   devices and, per GPU, composites and encodes a few frames in a bounded child process, and
   reports the results as the `input_probe` and `media_probe_gpu<N>` readiness checks. They run

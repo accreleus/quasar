@@ -16,8 +16,8 @@ use super::child::{run_child, ChildSpec};
 use super::container::{ContainerProbeEnd, Observed};
 use super::media;
 use super::orchestrator::{BoxFuture, ProbeRunner, RunEnd};
-use super::outcome::{child_outcome, remediation, ChildEnd, ProbeOutcome};
-use super::{ProbeKind, ProbeTarget};
+use super::outcome::{child_outcome, remediation_for, ChildEnd, ProbeOutcome};
+use super::{ProbeCodec, ProbeKind, ProbeTarget};
 
 const INPUT_DEADLINE: Duration = Duration::from_secs(20);
 /// Must exceed the media child's own 15 s encode budget plus GStreamer init.
@@ -182,9 +182,13 @@ async fn run_media(
         Option<Arc<WarmupControl>>,
     )>,
     gpu: i32,
+    codec: Option<ProbeCodec>,
     preempt: watch::Receiver<bool>,
 ) -> RunEnd {
-    let target = ProbeTarget::gpu(ProbeKind::Media, gpu);
+    let target = ProbeTarget {
+        codec,
+        ..ProbeTarget::gpu(ProbeKind::Media, gpu)
+    };
     let Some((settings, inventory, warmup)) = snapshot else {
         return RunEnd::Concluded {
             outcome: ProbeOutcome::Indeterminate {
@@ -203,13 +207,13 @@ async fn run_media(
         };
     }
 
-    let spec = match media::child_spec(&settings, &inventory, gpu, MEDIA_DEADLINE) {
+    let spec = match media::child_spec(&settings, &inventory, gpu, codec, MEDIA_DEADLINE) {
         Ok(spec) => spec,
         Err(e) => {
             return RunEnd::Concluded {
                 outcome: ProbeOutcome::Fail {
                     summary: format!("GPU {gpu} cannot be bound for encoding: {e:#}"),
-                    remediation: remediation(ProbeKind::Media),
+                    remediation: remediation_for(target),
                 },
                 reconciled: true,
             };
@@ -388,7 +392,7 @@ impl ProbeRunner for HostProbeRunner {
                     .expect("a Media ProbeTarget always carries a GPU index");
                 let exec = self.exec.clone();
                 let snapshot = self.snapshot();
-                Box::pin(run_media(exec, snapshot, gpu, preempt))
+                Box::pin(run_media(exec, snapshot, gpu, target.codec, preempt))
             }
             ProbeKind::ApplicationGpu => {
                 let gpu = target
@@ -672,6 +676,40 @@ mod tests {
             .env
             .iter()
             .any(|(k, v)| k == "QUASAR_RENDER_NODE" && v == "/dev/dri/renderD129"));
+    }
+
+    #[tokio::test]
+    async fn a_codec_target_runs_the_media_child_for_its_codec_and_words_the_result_for_it() {
+        let (runner, exec) = runner_with(FakeExec::returning(ChildEnd::Exited {
+            code: 1,
+            stdout: "vulkanav1enc: the encode pipeline could not reach READY".into(),
+            remediation: None,
+        }));
+        runner.set_context(ProbeContext {
+            settings: settings(),
+            inventory: vec![gpu(0, "amd", Some("/dev/dri/renderD128"))],
+            warmup: None,
+        });
+        let end = tokio::time::timeout(
+            BOUND,
+            runner.run(ProbeTarget::codec(0, ProbeCodec::Av1), never()),
+        )
+        .await
+        .unwrap();
+        match end {
+            RunEnd::Concluded {
+                outcome: ProbeOutcome::Fail { summary, .. },
+                reconciled: true,
+            } => assert!(summary.contains("GPU 0 does not encode av1"), "{summary}"),
+            other => panic!("{other:?}"),
+        }
+        let calls = exec.media_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].args.windows(2).any(|w| w == ["--codec", "av1"]),
+            "{:?}",
+            calls[0].args
+        );
     }
 
     #[tokio::test]
