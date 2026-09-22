@@ -55,9 +55,9 @@ var (
 	// existence-leak: the caller already named a specific app. The authorization
 	// boundary — the filtered GET /v1/apps is UX, and no role skips this (§6.5).
 	ErrNotEntitled = errors.New("not entitled to this app")
-	// A stream.codec override naming a codec the placed host cannot produce. The
-	// client-decode clamp is overridable; host encoder capability is not, and a
-	// doomed assignment must fail at launch rather than late at the agent.
+	// A codec the placed GPU cannot produce. 409. Unreachable from a launch, where
+	// the codec constraint gates placement; kept as the invariant's backstop and
+	// for the cert bench's up-front check. Do not delete.
 	ErrCodecUnsupportedByHost = errors.New("codec not supported by host encoder")
 )
 

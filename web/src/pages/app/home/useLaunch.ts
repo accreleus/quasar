@@ -15,6 +15,7 @@ import {
   MAX_NO_HOST_RETRY_WAIT_MS,
   NO_HOST_RETRY_DELAY_MS,
   decideCapacityRetry,
+  waitingToastCopy,
 } from "../capacityRetry";
 import { isRecommendationEligible } from "../launchOptions";
 import { presentLaunchError } from "../libraryGrid";
@@ -220,14 +221,7 @@ export function useLaunch({
               if (waitingToastId === null) {
                 waitingToastId = addToast({
                   variant: "info",
-                  title:
-                    reason === "host"
-                      ? "Waiting for a host to come online…"
-                      : "Waiting for a slot to free up…",
-                  body:
-                    reason === "host"
-                      ? `${app.name} will launch as soon as a host is ready.`
-                      : `${app.name} will launch as soon as one is free.`,
+                  ...waitingToastCopy(reason, app.name, streamCodec),
                 });
                 waitingToastReason = reason;
               }

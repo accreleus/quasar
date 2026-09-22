@@ -39,25 +39,55 @@ func admissionMatrix() map[string][]string {
 	for _, veto := range []VramAdmission{vetoOff, vetoOn} {
 		for _, pin := range []string{"", host} {
 			for _, img := range []string{"", image} {
-				p := CreateParams{
-					UserID: user, AppID: app,
-					NeedEncodeSlots: 1,
-					PinHostID:       pin,
-					AppImage:        img,
+				for _, cons := range constraintVariants(pin) {
+					// Readiness on is the production default (NewStore), so the
+					// #304 anchors, captured from the DB suite, carry its clause.
+					for _, ready := range []ReadinessAdmission{{}, {StaleSecs: defaultReadinessStaleSecs}} {
+						p := CreateParams{
+							UserID: user, AppID: app,
+							NeedEncodeSlots: 1,
+							PinHostID:       pin,
+							AppImage:        img,
+							PinGPUIndex:     cons.gpuPin,
+							RequireCodec:    cons.codec,
+						}
+						c := candidacy{p: p, veto: veto, readiness: ready}
+						for _, policy := range []PlacementPolicy{PolicySpread, PolicyLocality} {
+							sql, _ := c.candidateQuery(policy)
+							add("candidate", sql)
+						}
+						sql, _ := c.recheckQuery(gpuID)
+						add("recheck", sql)
+						sql, _ = c.totalsQuery()
+						add("totals", sql)
+						sql, _ = c.vetoDiagQuery()
+						add("vetodiag", sql)
+						if ready.enabled() {
+							sql, _ = c.readinessDiagQuery()
+							add("readinessdiag", sql)
+							sql, _ = c.readinessTotalsQuery()
+							add("readinesstotals", sql)
+						}
+					}
 				}
-				c := candidacy{p: p, veto: veto}
-				for _, policy := range []PlacementPolicy{PolicySpread, PolicyLocality} {
-					sql, _ := c.candidateQuery(policy)
-					add("candidate", sql)
-				}
-				sql, _ := c.recheckQuery(gpuID)
-				add("recheck", sql)
-				sql, _ = c.totalsQuery()
-				add("totals", sql)
-				sql, _ = c.vetoDiagQuery()
-				add("vetodiag", sql)
 			}
 		}
+	}
+	return out
+}
+
+// constraint is one combination of the #304 gates: the codec constraint and the
+// GPU pin, which is only ever set beside a host pin.
+type constraint struct {
+	codec  string
+	gpuPin *int32
+}
+
+func constraintVariants(hostPin string) []constraint {
+	one := int32(1)
+	out := []constraint{{}, {codec: "av1"}}
+	if hostPin != "" {
+		out = append(out, constraint{gpuPin: &one}, constraint{codec: "av1", gpuPin: &one})
 	}
 	return out
 }
@@ -76,6 +106,21 @@ func admissionMatrix() map[string][]string {
 // the Vulkan arm of schedulableBindingSQL, and that exact fragment — nothing
 // else — was removed from all 15 statements here. The file is therefore a
 // byte-pure pre-refactor capture except for that one condition.
+//
+// #304 appended 11 statements (lines 16-26) and changed none of the first 15.
+// The codec constraint and the GPU pin are new candidacy terms, so the new
+// anchors are the only statements that carry them: captured the same way, from
+// a `log_statement=all` run of this package's DB suite, filtered to statements
+// containing `? $n::text` (the codec gate) or `g.index = $n::int` (the GPU pin).
+// Because the terms render only when set and bind after every older parameter,
+// the original 15 are still produced byte for byte. The capture ran with the
+// readiness gate on (NewStore's default), which is why admissionMatrix has a
+// readiness dimension and the two readiness shapes.
+//
+// Lines 27-30 are the pinned totals probe, captured the same way. totalsQuery
+// gained the host/GPU pin (a pinned launch cannot be served by another host),
+// so a pinned launch's totals SQL is new; an unpinned one is byte-identical,
+// which is why every earlier totals anchor still matches.
 //
 // If this fails, the extraction changed what the scheduler asks Postgres. That
 // is the failure mode the whole exercise exists to prevent: the divergence class
@@ -140,7 +185,8 @@ func TestAdmissionSQLMatchesPreRefactor(t *testing.T) {
 	// pass while proving less than it claims. The counts are the capture's, and
 	// they only ever grow — if you re-capture and get fewer, something stopped
 	// being exercised by the DB suite and the proof got weaker without saying so.
-	want := map[string]int{"candidate": 8, "recheck": 3, "totals": 2, "vetodiag": 2}
+	want := map[string]int{"candidate": 11, "recheck": 5, "totals": 7, "vetodiag": 3,
+		"readinessdiag": 3, "readinesstotals": 1}
 	for shape, n := range want {
 		if seen[shape] != n {
 			t.Errorf("anchor file carries %d %s statements, expected %d — "+
@@ -171,6 +217,11 @@ func TestAdmissionArgValues(t *testing.T) {
 		PinHostID: host, AppImage: image,
 	}
 	c := candidacy{p: p, veto: veto}
+	gp := p
+	gpu := int32(3)
+	gp.PinGPUIndex, gp.RequireCodec = &gpu, "av1"
+	gated := candidacy{p: gp, veto: veto}
+	gatedReady := candidacy{p: gp, veto: veto, readiness: ReadinessAdmission{StaleSecs: 90}}
 
 	// Every value is distinct, so a swapped pair cannot coincidentally match.
 	cases := []struct {
@@ -198,11 +249,11 @@ func TestAdmissionArgValues(t *testing.T) {
 			want: []any{gpuID, int32(2), int32(20), int32(1024), int32(512), image},
 		},
 		{
-			// Slots-only plus the image gate: the veto is deliberately absent
-			// from the totals check (see totalsQuery).
+			// Slots, pin and image: the veto is deliberately absent from the
+			// totals check (see totalsQuery).
 			name: "totals",
 			args: argsOf(func() (string, []any) { return c.totalsQuery() }),
-			want: []any{int32(2), image},
+			want: []any{int32(2), host, image},
 		},
 		{
 			// Binds only what the statement references — the debit estimate is
@@ -210,6 +261,43 @@ func TestAdmissionArgValues(t *testing.T) {
 			name: "vetodiag",
 			args: argsOf(func() (string, []any) { return c.vetoDiagQuery() }),
 			want: []any{int32(2), int32(20), host, image},
+		},
+		// #304: the GPU index rides right after the host pin, the codec last.
+		{
+			name: "gated/candidate/spread",
+			args: argsOf(func() (string, []any) { return gated.candidateQuery(PolicySpread) }),
+			want: []any{int32(2), int32(20), int32(1024), int32(512), host, int32(3), image, "av1"},
+		},
+		{
+			name: "gated/candidate/locality",
+			args: argsOf(func() (string, []any) { return gated.candidateQuery(PolicyLocality) }),
+			want: []any{int32(2), int32(20), int32(1024), int32(512), user, app, host, int32(3), image, "av1"},
+		},
+		{
+			// No pin at all here, GPU or host: the re-check is keyed on one gpu.
+			name: "gated/recheck",
+			args: argsOf(func() (string, []any) { return gated.recheckQuery(gpuID) }),
+			want: []any{gpuID, int32(2), int32(20), int32(1024), int32(512), image, "av1"},
+		},
+		{
+			name: "gated/totals",
+			args: argsOf(func() (string, []any) { return gated.totalsQuery() }),
+			want: []any{int32(2), host, int32(3), image, "av1"},
+		},
+		{
+			name: "gated/vetodiag",
+			args: argsOf(func() (string, []any) { return gated.vetoDiagQuery() }),
+			want: []any{int32(2), int32(20), host, int32(3), image, "av1"},
+		},
+		{
+			name: "gated/readinessdiag",
+			args: argsOf(func() (string, []any) { return gatedReady.readinessDiagQuery() }),
+			want: []any{int32(2), int32(20), int32(1024), int32(512), host, int32(3), image, int32(90), "av1"},
+		},
+		{
+			name: "gated/readinesstotals",
+			args: argsOf(func() (string, []any) { return gatedReady.readinessTotalsQuery() }),
+			want: []any{int32(2), host, int32(3), image, int32(90), "av1"},
 		},
 	}
 
@@ -282,50 +370,58 @@ func TestAdmissionArgCountsMatchPlaceholders(t *testing.T) {
 	for _, veto := range []VramAdmission{vetoOff, vetoOn} {
 		for _, pin := range []string{"", host} {
 			for _, img := range []string{"", image} {
-				p := CreateParams{
-					UserID: "u", AppID: "a", NeedEncodeSlots: 1,
-					PinHostID: pin, AppImage: img,
-				}
-				c := candidacy{p: p, veto: veto}
-
-				type q struct {
-					name string
-					sql  string
-					args []any
-				}
-				var qs []q
-				for _, policy := range []PlacementPolicy{PolicySpread, PolicyLocality} {
-					sql, args := c.candidateQuery(policy)
-					qs = append(qs, q{"candidate/" + policy.String(), sql, args})
-				}
-				sql, args := c.recheckQuery(gpuID)
-				qs = append(qs, q{"recheck", sql, args})
-				sql, args = c.totalsQuery()
-				qs = append(qs, q{"totals", sql, args})
-				sql, args = c.vetoDiagQuery()
-				qs = append(qs, q{"vetodiag", sql, args})
-
-				for _, tc := range qs {
-					used := map[int]bool{}
-					max := 0
-					for _, m := range placeholder.FindAllStringSubmatch(tc.sql, -1) {
-						n := 0
-						for _, r := range m[1] {
-							n = n*10 + int(r-'0')
-						}
-						used[n] = true
-						if n > max {
-							max = n
-						}
+				for _, cons := range constraintVariants(pin) {
+					p := CreateParams{
+						UserID: "u", AppID: "a", NeedEncodeSlots: 1,
+						PinHostID: pin, AppImage: img,
+						PinGPUIndex: cons.gpuPin, RequireCodec: cons.codec,
 					}
-					desc := tc.name + " veto=" + boolStr(veto.enabled()) +
-						" pin=" + boolStr(pin != "") + " image=" + boolStr(img != "")
-					if max != len(tc.args) {
-						t.Errorf("%s: highest placeholder $%d but %d args bound", desc, max, len(tc.args))
+					c := candidacy{p: p, veto: veto, readiness: ReadinessAdmission{StaleSecs: 60}}
+
+					type q struct {
+						name string
+						sql  string
+						args []any
 					}
-					for n := 1; n <= max; n++ {
-						if !used[n] {
-							t.Errorf("%s: $%d is never referenced — Postgres rejects a bind with a gap", desc, n)
+					var qs []q
+					for _, policy := range []PlacementPolicy{PolicySpread, PolicyLocality} {
+						sql, args := c.candidateQuery(policy)
+						qs = append(qs, q{"candidate/" + policy.String(), sql, args})
+					}
+					sql, args := c.recheckQuery(gpuID)
+					qs = append(qs, q{"recheck", sql, args})
+					sql, args = c.totalsQuery()
+					qs = append(qs, q{"totals", sql, args})
+					sql, args = c.vetoDiagQuery()
+					qs = append(qs, q{"vetodiag", sql, args})
+					sql, args = c.readinessDiagQuery()
+					qs = append(qs, q{"readinessdiag", sql, args})
+					sql, args = c.readinessTotalsQuery()
+					qs = append(qs, q{"readinesstotals", sql, args})
+
+					for _, tc := range qs {
+						used := map[int]bool{}
+						max := 0
+						for _, m := range placeholder.FindAllStringSubmatch(tc.sql, -1) {
+							n := 0
+							for _, r := range m[1] {
+								n = n*10 + int(r-'0')
+							}
+							used[n] = true
+							if n > max {
+								max = n
+							}
+						}
+						desc := tc.name + " veto=" + boolStr(veto.enabled()) +
+							" pin=" + boolStr(pin != "") + " image=" + boolStr(img != "") +
+							" codec=" + cons.codec + " gpupin=" + boolStr(cons.gpuPin != nil)
+						if max != len(tc.args) {
+							t.Errorf("%s: highest placeholder $%d but %d args bound", desc, max, len(tc.args))
+						}
+						for n := 1; n <= max; n++ {
+							if !used[n] {
+								t.Errorf("%s: $%d is never referenced — Postgres rejects a bind with a gap", desc, n)
+							}
 						}
 					}
 				}

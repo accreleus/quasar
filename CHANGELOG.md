@@ -113,6 +113,14 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **A hand-picked codec only launches on a GPU that can encode it (#304, amendment 12).** An
+  explicit `stream.codec` is now a placement gate, so the session is never placed on a GPU
+  without that codec and never downgraded to another. When every capable GPU is busy the launch
+  is refused `503 capacity_exhausted` with `Retry-After`; when no online GPU can encode it,
+  `503 no_host_available`. Both messages name the codec, and the `409 conflict` this used to
+  produce no longer comes from a launch. The launch panel's waiting notice says it is waiting
+  for a GPU that can encode the chosen codec. The certification bench now runs each cell on the
+  GPU its certificate is recorded for.
 - **The profile menu offers only codecs a candidate GPU can encode (#306).** `GET
   /v1/me/profiles`'s `host_encoder_not_supported` verdict now unions GPU codec sets — the
   existing launch candidacy without the free-slot term (a busy GPU still counts), with the

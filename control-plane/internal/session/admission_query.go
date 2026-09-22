@@ -9,9 +9,9 @@
 //	readinessTotalsQuery could a gate-eligible GPU ever serve this?  (readinessRejection)
 //
 // They project different shapes and are not unified. What they share is the
-// definition of a candidate: encoder/render-node binding, the optional host pin,
-// managed-image readiness, free encode slots, the live free-VRAM veto, and the
-// evidence-gated readiness filter.
+// definition of a candidate: encoder/render-node binding, the optional host (and
+// GPU) pin, managed-image readiness, free encode slots, the live free-VRAM veto,
+// the evidence-gated readiness filter, and the codec constraint.
 //
 // Placeholder indices must never be worked out by hand at a call site. Two
 // failures came from that arithmetic: a hard-coded `$3` that sent an int into
@@ -54,12 +54,28 @@ type candidacy struct {
 }
 
 // pinGate restricts candidates to one host (cert bench; a derived tile's hard
-// pin). Empty when no pin is set.
+// pin) and, beside a host pin only, to one GPU on it (cert bench). Empty when no
+// pin is set.
 func (c candidacy) pinGate(a *argset) string {
 	if c.p.PinHostID == "" {
 		return ""
 	}
-	return fmt.Sprintf(" AND h.id = $%d::uuid", a.add(c.p.PinHostID))
+	pin := fmt.Sprintf(" AND h.id = $%d::uuid", a.add(c.p.PinHostID))
+	if c.p.PinGPUIndex != nil {
+		pin += fmt.Sprintf(" AND g.index = $%d::int", a.add(*c.p.PinGPUIndex))
+	}
+	return pin
+}
+
+// codecGate is the codec constraint (control-api.md "Admission control" gate
+// (c)); jsonb `?` on an array tests for a top-level string element. A statement
+// about capability, not load, so unlike the veto it is in the totals probes too.
+// Rendered last everywhere, so an unconstrained launch binds what it always did.
+func (c candidacy) codecGate(a *argset, lead string) string {
+	if c.p.RequireCodec == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s(%s ? $%d::text)", lead, gpuCodecSetSQL("g", "h", true), a.add(c.p.RequireCodec))
 }
 
 // imageGate excludes hosts that do not have the app's MANAGED image ready.
@@ -114,13 +130,14 @@ func (c candidacy) candidateQuery(policy PlacementPolicy) (string, []any) {
 	// In the WHERE, not the HAVING: the query groups by g.id, and the host's
 	// columns are not functionally dependent on it.
 	gate := c.readinessGate(a, "\n\t\t  AND ")
+	codec := c.codecGate(a, "\n\t\t  AND ")
 
 	return `
 		SELECT g.id::text, g.host_id::text, g.index
 		FROM gpus g
 		JOIN hosts h ON h.id = g.host_id
 		LEFT JOIN sessions s ON s.gpu_id = g.id AND s.state IN ` + activeStatesSQL + `
-		WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND g.reported` + schedulableBindingSQL + pin + image + gate + `
+		WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND g.reported` + schedulableBindingSQL + pin + image + gate + codec + `
 		GROUP BY g.id
 		HAVING g.encode_slots_total - COALESCE(SUM(s.reserved_encode_slots), 0) >= $` + fmt.Sprint(slotsIdx) + vetoClause + `
 		ORDER BY ` + policyOrder + `
@@ -148,12 +165,13 @@ func (c candidacy) recheckQuery(gpuID string) (string, []any) {
 	}
 	image := c.imageGate(a, "\n\t\t   AND ")
 	gate := c.readinessGate(a, "\n\t\t   AND ")
+	codec := c.codecGate(a, "\n\t\t   AND ")
 
 	return `
 		SELECT h.status = 'online' AND h.capacity_detection = 'ok' AND g.reported
 		   AND g.encode_slots_total
 		         - COALESCE((SELECT SUM(x.reserved_encode_slots) FROM sessions x
-		                     WHERE x.gpu_id = g.id AND x.state IN ` + activeStatesSQL + `), 0) >= $` + fmt.Sprint(slotsIdx) + vetoClause + image + gate + `
+		                     WHERE x.gpu_id = g.id AND x.state IN ` + activeStatesSQL + `), 0) >= $` + fmt.Sprint(slotsIdx) + vetoClause + image + gate + codec + `
 		FROM gpus g
 		JOIN hosts h ON h.id = g.host_id
 		WHERE g.id = $` + fmt.Sprint(gpuIdx) + `::uuid` + schedulableBindingSQL + `
@@ -167,16 +185,20 @@ func (c candidacy) recheckQuery(gpuID string) (string, []any) {
 // Slots-only, no veto gate: §4.1 abstains whenever vram_mb_total <= floor, so
 // such a GPU is servable, and gating here turned ordinary slot exhaustion into a
 // non-retryable no_host_available on an APU host. See classifyReject. The image
-// gate does belong here.
+// gate does belong here, and so does the pin: a pinned launch cannot be served
+// by another host, so counting one would make an unservable launch a
+// capacity_exhausted the client retries forever.
 func (c candidacy) totalsQuery() (string, []any) {
 	a := &argset{}
 	slotsIdx := a.add(c.p.NeedEncodeSlots)
+	pin := c.pinGate(a)
 	image := c.imageGate(a, "\n\t\t\t  AND ")
+	codec := c.codecGate(a, "\n\t\t\t  AND ")
 
 	return `
 		SELECT EXISTS (
 			SELECT 1 FROM gpus g JOIN hosts h ON h.id = g.host_id
-			WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND g.reported` + schedulableBindingSQL + image + `
+			WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND g.reported` + schedulableBindingSQL + pin + image + codec + `
 			  AND g.encode_slots_total >= $` + fmt.Sprint(slotsIdx) + `
 		)
 	`, a.args()
@@ -196,6 +218,7 @@ func (c candidacy) vetoDiagQuery() (string, []any) {
 	pin := c.pinGate(a)
 	image := c.imageGate(a, "\n\t\t  AND ")
 	gate := c.readinessGate(a, "\n\t\t  AND ")
+	codec := c.codecGate(a, "\n\t\t  AND ")
 
 	return `
 		SELECT g.id::text, g.host_id::text, g.index, g.vram_mb_total, g.vram_mb_free,
@@ -209,7 +232,7 @@ func (c candidacy) vetoDiagQuery() (string, []any) {
 		FROM gpus g
 		JOIN hosts h ON h.id = g.host_id
 		LEFT JOIN sessions s ON s.gpu_id = g.id AND s.state IN ` + activeStatesSQL + `
-		WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND g.reported` + schedulableBindingSQL + pin + image + gate + `
+		WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND g.reported` + schedulableBindingSQL + pin + image + gate + codec + `
 		GROUP BY g.id
 		HAVING g.encode_slots_total - COALESCE(SUM(s.reserved_encode_slots), 0) >= $` + fmt.Sprint(slotsIdx) + `
 		ORDER BY g.id
@@ -237,6 +260,7 @@ func (c candidacy) readinessDiagQuery() (string, []any) {
 	pin := c.pinGate(a)
 	image := c.imageGate(a, "\n\t\t  AND ")
 	blocked := "\n\t\t  AND NOT " + readinessGateSQL(a.add(c.readiness.StaleSecs), c.p.ManagedHome)
+	codec := c.codecGate(a, "\n\t\t  AND ")
 
 	return `
 		SELECT g.id::text, g.host_id::text, g.index,
@@ -244,7 +268,7 @@ func (c candidacy) readinessDiagQuery() (string, []any) {
 		FROM gpus g
 		JOIN hosts h ON h.id = g.host_id
 		LEFT JOIN sessions s ON s.gpu_id = g.id AND s.state IN ` + activeStatesSQL + `
-		WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND g.reported` + schedulableBindingSQL + pin + image + blocked + `
+		WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND g.reported` + schedulableBindingSQL + pin + image + blocked + codec + `
 		GROUP BY g.id, h.readiness_block_host, h.readiness_block_homes
 		HAVING g.encode_slots_total - COALESCE(SUM(s.reserved_encode_slots), 0) >= $` + fmt.Sprint(slotsIdx) + vetoClause + `
 		ORDER BY g.id
@@ -257,20 +281,20 @@ func (c candidacy) readinessDiagQuery() (string, []any) {
 // readiness is the sole reason nothing was placed; true means a ready GPU is
 // merely full or vetoed, which is capacity_exhausted and retryable.
 //
-// Slots-only like totalsQuery, and for the same reason (§4.1's structural
-// abstain), but it carries the host pin: a pinned launch cannot be served by
-// another host, so another host's eligibility is not an answer here.
+// Slots-only and pinned like totalsQuery, for the same reasons (§4.1's
+// structural abstain; a pinned launch cannot be served by another host).
 func (c candidacy) readinessTotalsQuery() (string, []any) {
 	a := &argset{}
 	slotsIdx := a.add(c.p.NeedEncodeSlots)
 	pin := c.pinGate(a)
 	image := c.imageGate(a, "\n\t\t\t  AND ")
 	gate := "\n\t\t\t  AND " + readinessGateSQL(a.add(c.readiness.StaleSecs), c.p.ManagedHome)
+	codec := c.codecGate(a, "\n\t\t\t  AND ")
 
 	return `
 		SELECT EXISTS (
 			SELECT 1 FROM gpus g JOIN hosts h ON h.id = g.host_id
-			WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND g.reported` + schedulableBindingSQL + pin + image + gate + `
+			WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND g.reported` + schedulableBindingSQL + pin + image + gate + codec + `
 			  AND g.encode_slots_total >= $` + fmt.Sprint(slotsIdx) + `
 		)
 	`, a.args()

@@ -590,24 +590,7 @@ func (c *Coordinator) launchCertCell(
 		return certCellLaunchOut{}, fmt.Errorf("signaling token failed: %w", err)
 	}
 
-	p := CreateParams{
-		UserID:          userID,
-		AppID:           diagAppID,
-		Width:           prof.Width,
-		Height:          prof.Height,
-		FPS:             prof.FPS,
-		BitrateKbps:     int32(bitrateKbps),
-		H264Profile:     "constrained-baseline",
-		Codec:           wire, // set, not left to the h264 default: cert must match its filed codec (0041)
-		ProfileID:       target.LaunchProfileID,
-		NeedEncodeSlots: 1,
-		// SkipVramVeto stays false (#383 §4.4): a VRAM-pressured pinned host is a
-		// real finding. AppImage stays empty: the bench app isn't catalog-managed.
-		TokenHash:    tok.Hash,
-		TokenExpires: tok.ExpiresAt,
-		PinHostID:    hostID, // SPT-06: force to the host being certified
-	}
-
+	p := certCellParams(userID, diagAppID, hostID, gpuIndex, target, wire, bitrateKbps, tok)
 	sess, schedErr := c.store.ScheduleAndCreate(ctx, p)
 	if schedErr != nil {
 		c.logVramVetoRejection(userID, diagAppID, schedErr)
@@ -624,6 +607,36 @@ func (c *Coordinator) launchCertCell(
 	}
 
 	return certCellLaunchOut{sessionID: sessionID, signToken: tok.Plaintext}, nil
+}
+
+// certCellParams is the bench cell's placement request.
+func certCellParams(
+	userID, diagAppID, hostID string, gpuIndex int,
+	target CertTarget, wire string, bitrateKbps int, tok signalingToken,
+) CreateParams {
+	prof := target.Rung
+	pinGPU := int32(gpuIndex)
+	return CreateParams{
+		UserID:          userID,
+		AppID:           diagAppID,
+		Width:           prof.Width,
+		Height:          prof.Height,
+		FPS:             prof.FPS,
+		BitrateKbps:     int32(bitrateKbps),
+		H264Profile:     "constrained-baseline",
+		Codec:           wire, // set, not left to the h264 default: cert must match its filed codec (0041)
+		ProfileID:       target.LaunchProfileID,
+		NeedEncodeSlots: 1,
+		// SkipVramVeto stays false (#383 §4.4): a VRAM-pressured pinned host is a
+		// real finding. AppImage stays empty: the bench app isn't catalog-managed.
+		TokenHash:    tok.Hash,
+		TokenExpires: tok.ExpiresAt,
+		PinHostID:    hostID, // SPT-06: force to the host being certified
+		// The cert row is keyed on gpu_index, so the session must run on that GPU,
+		// and that GPU must encode the codec the row is filed under.
+		PinGPUIndex:  &pinGPU,
+		RequireCodec: wire,
+	}
 }
 
 // finalizeCertCell reads the bench session's agent metrics, derives the
