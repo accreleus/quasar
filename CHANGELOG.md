@@ -113,6 +113,14 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **Auto prefers the GPU that gives the best codec (#305, amendment 12).** A launch left on
+  Auto now ranks candidate GPUs by the best codec each can encode for this device, in the
+  launch profile's own order, and only then by load. On a host where one GPU encodes AV1
+  and another only HEVC, an AV1-capable client lands on the AV1 GPU while it has a slot,
+  even when the other GPU is less loaded, and gets AV1; once it is full the session goes
+  to the other GPU and gets HEVC. The preference never refuses a launch, a user's home
+  host still comes first, and a device with no probe (or one that decodes only H.264)
+  places exactly as before.
 - **A hand-picked codec only launches on a GPU that can encode it (#304, amendment 12).** An
   explicit `stream.codec` is now a placement gate, so the session is never placed on a GPU
   without that codec and never downgraded to another. When every capable GPU is busy the launch

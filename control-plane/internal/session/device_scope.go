@@ -18,6 +18,7 @@ const (
 	scopeSiteEnvelope    = "launch.envelope"
 	scopeSiteTier        = "launch.tier"
 	scopeSiteRung        = "launch.rung"
+	scopeSitePreference  = "launch.codec_preference"
 	scopeSiteHealth      = "health.outcome"
 )
 
