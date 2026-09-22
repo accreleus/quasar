@@ -489,11 +489,9 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	// A codec-constrained refusal names the codec, and nothing else.
 	// semantics: control-api.md §Admission control
 	case errors.Is(err, ErrNoHostAvailable):
-		msg := "no host is available to serve this launch"
-		if codec := constrainedCodec(err); codec != "" {
-			msg = "no host has a GPU that can encode " + codec
-		}
-		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable, msg)
+		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable,
+			refusalMessage(err, "no host is available to serve this launch",
+				"no host has a GPU that can encode %s"))
 		return
 	// Names no check, scope, GPU or host: readiness detail is admin-only and
 	// lives on the host body. No Retry-After — an admin, not time, clears it.
@@ -507,11 +505,9 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 		// right after a peer's DELETE bounces here for the ~15 s that teardown
 		// takes. Retry-After lets a polling client wait rather than error (#494).
 		w.Header().Set("Retry-After", capacityExhaustedRetryAfterSeconds)
-		msg := "all capacity is in use; try again shortly"
-		if codec := constrainedCodec(err); codec != "" {
-			msg = "no free GPU can encode " + codec + "; try again shortly"
-		}
-		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeCapacityExhausted, msg)
+		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeCapacityExhausted,
+			refusalMessage(err, "all capacity is in use; try again shortly",
+				"no free GPU can encode %s; try again shortly"))
 		return
 	case err != nil:
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not launch session")

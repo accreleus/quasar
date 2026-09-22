@@ -185,17 +185,20 @@ func (c candidacy) recheckQuery(gpuID string) (string, []any) {
 // Slots-only, no veto gate: §4.1 abstains whenever vram_mb_total <= floor, so
 // such a GPU is servable, and gating here turned ordinary slot exhaustion into a
 // non-retryable no_host_available on an APU host. See classifyReject. The image
-// gate does belong here.
+// gate does belong here, and so does the pin: a pinned launch cannot be served
+// by another host, so counting one would make an unservable launch a
+// capacity_exhausted the client retries forever.
 func (c candidacy) totalsQuery() (string, []any) {
 	a := &argset{}
 	slotsIdx := a.add(c.p.NeedEncodeSlots)
+	pin := c.pinGate(a)
 	image := c.imageGate(a, "\n\t\t\t  AND ")
 	codec := c.codecGate(a, "\n\t\t\t  AND ")
 
 	return `
 		SELECT EXISTS (
 			SELECT 1 FROM gpus g JOIN hosts h ON h.id = g.host_id
-			WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND g.reported` + schedulableBindingSQL + image + codec + `
+			WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND g.reported` + schedulableBindingSQL + pin + image + codec + `
 			  AND g.encode_slots_total >= $` + fmt.Sprint(slotsIdx) + `
 		)
 	`, a.args()
@@ -278,9 +281,8 @@ func (c candidacy) readinessDiagQuery() (string, []any) {
 // readiness is the sole reason nothing was placed; true means a ready GPU is
 // merely full or vetoed, which is capacity_exhausted and retryable.
 //
-// Slots-only like totalsQuery, and for the same reason (§4.1's structural
-// abstain), but it carries the host pin: a pinned launch cannot be served by
-// another host, so another host's eligibility is not an answer here.
+// Slots-only and pinned like totalsQuery, for the same reasons (§4.1's
+// structural abstain; a pinned launch cannot be served by another host).
 func (c candidacy) readinessTotalsQuery() (string, []any) {
 	a := &argset{}
 	slotsIdx := a.add(c.p.NeedEncodeSlots)

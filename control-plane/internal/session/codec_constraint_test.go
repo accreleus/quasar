@@ -149,3 +149,13 @@ func TestWithCodecConstraintNamesOnlyTheTwoPlacementRefusals(t *testing.T) {
 		t.Errorf("an unconstrained launch must not be wrapped, got %v", got)
 	}
 }
+
+func TestRefusalMessage(t *testing.T) {
+	wrapped := withCodecConstraint(CreateParams{RequireCodec: "av1"}, ErrCapacityExhausted)
+	if got := refusalMessage(wrapped, "plain", "no free GPU can encode %s"); got != "no free GPU can encode av1" {
+		t.Errorf("constrained: %q", got)
+	}
+	if got := refusalMessage(ErrCapacityExhausted, "plain", "no free GPU can encode %s"); got != "plain" {
+		t.Errorf("unconstrained: %q", got)
+	}
+}

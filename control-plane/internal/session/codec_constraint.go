@@ -17,6 +17,15 @@ func constrainedCodec(err error) string {
 	return ""
 }
 
+// refusalMessage is plain, or withCodec (one %s) filled with the codec when the
+// refusal was codec-constrained.
+func refusalMessage(err error, plain, withCodec string) string {
+	if codec := constrainedCodec(err); codec != "" {
+		return fmt.Sprintf(withCodec, codec)
+	}
+	return plain
+}
+
 // codecConstraint returns the launch's codec constraint (CreateParams.RequireCodec):
 // the explicit stream.codec, or "" for an Auto launch.
 //

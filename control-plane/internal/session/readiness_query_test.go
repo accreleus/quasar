@@ -189,7 +189,7 @@ func TestReadinessArgValues(t *testing.T) {
 		{"readinesstotals", argsOf(func() (string, []any) { return c.readinessTotalsQuery() }),
 			[]any{int32(2), host, image, int32(90)}},
 		{"totals", argsOf(func() (string, []any) { return c.totalsQuery() }),
-			[]any{int32(2), image}},
+			[]any{int32(2), host, image}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

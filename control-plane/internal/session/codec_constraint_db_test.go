@@ -203,6 +203,54 @@ func TestCodecConstraintInTheDiagnostics(t *testing.T) {
 	})
 }
 
+// TestPinnedLaunchTotalsAreThePinnedHosts: a derived tile is hard-pinned to its
+// home host (launcher.go), so another host that could serve the launch is no
+// answer. Classifying it capacity_exhausted would have the client retry a
+// condition that never clears.
+func TestPinnedLaunchTotalsAreThePinnedHosts(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 1) // the pinned host: one slot, h264 only
+	setHostCodecsRaw(t, pool, s.hostID, `["h264"]`)
+	setQuota(t, pool, s.userID, 20)
+	ctx := context.Background()
+
+	var otherHost string
+	must(t, pool.QueryRow(ctx, `INSERT INTO hosts (node_name, status, capacity_detection, codecs)
+		VALUES ('host-2','online','ok','["h264","av1"]'::jsonb) RETURNING id::text`).Scan(&otherHost))
+	must(t, pool.QueryRow(ctx, `INSERT INTO gpus (host_id, index, vram_mb_total, encode_slots_total)
+		VALUES ($1, 0, 16384, 4) RETURNING id::text`, otherHost).Scan(new(string)))
+
+	t.Run("a codec only another host encodes", func(t *testing.T) {
+		p := constrainedTo(s, "av1")
+		p.PinHostID = s.hostID
+		_, err := store.ScheduleAndCreate(ctx, p)
+		if !errors.Is(err, ErrNoHostAvailable) || constrainedCodec(err) != "av1" {
+			t.Fatalf("got %v, want ErrNoHostAvailable naming av1", err)
+		}
+	})
+
+	t.Run("an ask only another host's totals fit", func(t *testing.T) {
+		p := launchParams(s)
+		p.PinHostID = s.hostID
+		p.NeedEncodeSlots = 2
+		if _, err := store.ScheduleAndCreate(ctx, p); !errors.Is(err, ErrNoHostAvailable) {
+			t.Fatalf("got %v, want ErrNoHostAvailable", err)
+		}
+	})
+
+	t.Run("the pinned host full is still capacity_exhausted", func(t *testing.T) {
+		p := launchParams(s)
+		p.PinHostID = s.hostID
+		if _, err := store.ScheduleAndCreate(ctx, p); err != nil {
+			t.Fatalf("first pinned launch: %v", err)
+		}
+		if _, err := store.ScheduleAndCreate(ctx, p); !errors.Is(err, ErrCapacityExhausted) {
+			t.Fatalf("got %v, want ErrCapacityExhausted", err)
+		}
+	})
+}
+
 // TestCertBenchLandsOnItsPinnedGPU: the cert row is keyed on gpu_index, so the
 // bench session must run on that GPU even where spread would choose another.
 func TestCertBenchLandsOnItsPinnedGPU(t *testing.T) {
@@ -225,10 +273,11 @@ func TestCertBenchLandsOnItsPinnedGPU(t *testing.T) {
 	}
 	releaseSession(t, pool, sess.ID)
 
-	// GPU 1 cannot encode av1: its cell is refused, never moved to GPU 0.
+	// GPU 1 cannot encode av1: its cell is refused, never moved to GPU 0, and
+	// not as a retryable wait on GPU 0's capacity.
 	_, err = store.ScheduleAndCreate(ctx, certCellParams(s.userID, s.appID, s.hostID, 1, av1, "av1", 5000, tok))
-	if !errors.Is(err, ErrNoHostAvailable) && !errors.Is(err, ErrCapacityExhausted) {
-		t.Fatalf("av1 bench cell pinned to GPU 1: got %v, want a placement refusal", err)
+	if !errors.Is(err, ErrNoHostAvailable) {
+		t.Fatalf("av1 bench cell pinned to GPU 1: got %v, want ErrNoHostAvailable", err)
 	}
 	if n := sessionsOnGPU(t, pool, s.gpuID); n != 1 {
 		t.Fatalf("GPU 0 holds %d session rows, want only the released h264 cell", n)

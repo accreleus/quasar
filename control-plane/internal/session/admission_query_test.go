@@ -117,6 +117,11 @@ func constraintVariants(hostPin string) []constraint {
 // readiness gate on (NewStore's default), which is why admissionMatrix has a
 // readiness dimension and the two readiness shapes.
 //
+// Lines 27-30 are the pinned totals probe, captured the same way. totalsQuery
+// gained the host/GPU pin (a pinned launch cannot be served by another host),
+// so a pinned launch's totals SQL is new; an unpinned one is byte-identical,
+// which is why every earlier totals anchor still matches.
+//
 // If this fails, the extraction changed what the scheduler asks Postgres. That
 // is the failure mode the whole exercise exists to prevent: the divergence class
 // here is silent in production (50 burned retries and a spurious capacity error
@@ -180,7 +185,7 @@ func TestAdmissionSQLMatchesPreRefactor(t *testing.T) {
 	// pass while proving less than it claims. The counts are the capture's, and
 	// they only ever grow — if you re-capture and get fewer, something stopped
 	// being exercised by the DB suite and the proof got weaker without saying so.
-	want := map[string]int{"candidate": 11, "recheck": 5, "totals": 3, "vetodiag": 3,
+	want := map[string]int{"candidate": 11, "recheck": 5, "totals": 7, "vetodiag": 3,
 		"readinessdiag": 3, "readinesstotals": 1}
 	for shape, n := range want {
 		if seen[shape] != n {
@@ -244,11 +249,11 @@ func TestAdmissionArgValues(t *testing.T) {
 			want: []any{gpuID, int32(2), int32(20), int32(1024), int32(512), image},
 		},
 		{
-			// Slots-only plus the image gate: the veto is deliberately absent
-			// from the totals check (see totalsQuery).
+			// Slots, pin and image: the veto is deliberately absent from the
+			// totals check (see totalsQuery).
 			name: "totals",
 			args: argsOf(func() (string, []any) { return c.totalsQuery() }),
-			want: []any{int32(2), image},
+			want: []any{int32(2), host, image},
 		},
 		{
 			// Binds only what the statement references — the debit estimate is
@@ -277,7 +282,7 @@ func TestAdmissionArgValues(t *testing.T) {
 		{
 			name: "gated/totals",
 			args: argsOf(func() (string, []any) { return gated.totalsQuery() }),
-			want: []any{int32(2), image, "av1"},
+			want: []any{int32(2), host, int32(3), image, "av1"},
 		},
 		{
 			name: "gated/vetodiag",
