@@ -9,8 +9,8 @@ use std::time::SystemTime;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info};
 
-use super::decision::{Action, Event, ProbeInputs, Scheduler, Verdict};
-use super::outcome::ProbeOutcome;
+use super::decision::{Action, Event, EvidenceStamp, ProbeInputs, Scheduler, Verdict};
+use super::outcome::{CodecEvidence, ProbeOutcome};
 use super::{ProbeCodec, ProbeKind, ProbeTarget};
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -40,6 +40,8 @@ pub enum ReportUpdate {
         target: ProbeTarget,
         outcome: ProbeOutcome,
         observed_at: SystemTime,
+        /// A codec probe's inputs when it started (#301); `None` for every other probe.
+        evidence: Option<EvidenceStamp>,
     },
     NotApplicable {
         kind: ProbeKind,
@@ -153,18 +155,30 @@ async fn await_run(fut: BoxFuture<RunEnd>) -> Result<RunEnd, String> {
 }
 
 /// What the agent loop's connection code applies a [`ReportUpdate`] as, folding a host
-/// probe's result into the report every capacity message reads.
-pub fn apply(report: &mut crate::readiness::report::ReadinessReport, update: ReportUpdate) {
+/// probe's result into the report every capacity message reads, and a codec probe's
+/// stamp into the agent-side `evidence` ledger beside it.
+pub fn apply(
+    report: &mut crate::readiness::report::ReadinessReport,
+    evidence: &mut CodecEvidence,
+    update: ReportUpdate,
+) {
     match update {
         ReportUpdate::Record {
             target,
             outcome,
             observed_at,
-        } => super::outcome::record(report, target, outcome, observed_at),
+            evidence: stamp,
+        } => {
+            evidence.note(target, &outcome, stamp);
+            super::outcome::record(report, target, outcome, observed_at)
+        }
         ReportUpdate::NotApplicable { kind, observed_at } => {
             super::outcome::record_not_applicable(report, kind, observed_at)
         }
-        ReportUpdate::Forget(target) => super::outcome::forget(report, target),
+        ReportUpdate::Forget(target) => {
+            evidence.forget(target);
+            super::outcome::forget(report, target)
+        }
     }
 }
 
@@ -185,12 +199,15 @@ pub fn spawn_with_kinds(
         let mut scheduler = Scheduler::with_kinds(&kinds);
         // The current run's pre-empt flag. Single-flight, so at most one at a time.
         let mut preempt: Option<watch::Sender<bool>> = None;
+        // The current codec run's stamp, taken at `Start`: what its result was proven under.
+        let mut run_stamp: Option<EvidenceStamp> = None;
 
         while let Some(msg) = rx.recv().await {
             let actions = match msg {
                 Msg::External(event) => scheduler.step(event),
                 Msg::RunEnded { target, end } => {
                     preempt = None;
+                    let evidence = run_stamp.take();
                     match end {
                         Ok(RunEnd::Concluded {
                             outcome,
@@ -209,6 +226,7 @@ pub fn spawn_with_kinds(
                                     target,
                                     outcome,
                                     observed_at: SystemTime::now(),
+                                    evidence,
                                 });
                             }
                             scheduler.step(Event::ProbeFinished {
@@ -234,6 +252,7 @@ pub fn spawn_with_kinds(
                                             .into(),
                                     },
                                     observed_at: SystemTime::now(),
+                                    evidence,
                                 });
                             }
                             // A container probe that died mid-way may have left a
@@ -260,6 +279,10 @@ pub fn spawn_with_kinds(
                         );
                         let (ptx, prx) = watch::channel(false);
                         preempt = Some(ptx);
+                        run_stamp = target
+                            .codec
+                            .and(target.gpu)
+                            .and_then(|gpu| scheduler.evidence_stamp(gpu));
                         let runner = runner.clone();
                         let tx = tx.clone();
                         tokio::spawn(async move {
@@ -455,8 +478,10 @@ mod tests {
                     target,
                     outcome,
                     observed_at,
+                    evidence,
                 } => {
                     assert_eq!(target, run.target);
+                    assert_eq!(evidence, None, "only a codec probe carries a stamp");
                     assert!(matches!(outcome, ProbeOutcome::Pass { .. }));
                     assert!(observed_at >= before);
                 }
@@ -657,18 +682,78 @@ mod tests {
         );
     }
 
+    /// #301: a codec probe's result carries the inputs it started under, even when the
+    /// scheduler has seen newer inputs by the time it finishes.
+    #[tokio::test]
+    async fn a_codec_result_is_stamped_with_the_inputs_it_started_under() {
+        let (started_tx, mut started) = mpsc::unbounded_channel();
+        let runner = Arc::new(FakeRunner {
+            started: started_tx,
+            reconciles: Mutex::new(Vec::new()),
+        });
+        let (handle, mut updates) = spawn_with_kinds(runner, &[Media]);
+        let mut first = inputs(&[0]);
+        first.codecs = [(0, [ProbeCodec::H265].into())].into();
+        handle.registered(first.clone());
+
+        let media = tokio::time::timeout(BOUND, started.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        media.finish.send(pass("ok")).unwrap();
+        let media_update = tokio::time::timeout(BOUND, updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            media_update,
+            ReportUpdate::Record { evidence: None, .. }
+        ));
+
+        let run = tokio::time::timeout(BOUND, started.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.target, ProbeTarget::codec(0, ProbeCodec::H265));
+        // A GPU appears mid-run: GPU 0's identity is unchanged, so its run stands.
+        let mut second = first.clone();
+        second.gpus.insert(1, "pci-1".into());
+        handle.inputs_observed(second);
+        run.finish.send(pass("hevc ok")).unwrap();
+        loop {
+            match tokio::time::timeout(BOUND, updates.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                ReportUpdate::Record {
+                    target, evidence, ..
+                } => {
+                    assert_eq!(target, ProbeTarget::codec(0, ProbeCodec::H265));
+                    assert_eq!(evidence, first.evidence_stamp(0));
+                    break;
+                }
+                ReportUpdate::Forget(_) => continue,
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn apply_maps_each_update_kind_onto_the_report() {
         let mut report = crate::readiness::report::ReadinessReport::default();
+        let mut evidence = CodecEvidence::default();
         let now = SystemTime::now();
         apply(
             &mut report,
+            &mut evidence,
             ReportUpdate::Record {
                 target: ProbeTarget::host(Input),
                 outcome: ProbeOutcome::Pass {
                     summary: "ok".into(),
                 },
                 observed_at: now,
+                evidence: None,
             },
         );
         assert_eq!(
@@ -678,6 +763,7 @@ mod tests {
 
         apply(
             &mut report,
+            &mut evidence,
             ReportUpdate::NotApplicable {
                 kind: Media,
                 observed_at: now,
@@ -688,7 +774,11 @@ mod tests {
             Some(crate::readiness::SKIP)
         );
 
-        apply(&mut report, ReportUpdate::Forget(ProbeTarget::host(Input)));
+        apply(
+            &mut report,
+            &mut evidence,
+            ReportUpdate::Forget(ProbeTarget::host(Input)),
+        );
         assert!(report.retained("input_probe").is_none());
     }
 

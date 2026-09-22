@@ -525,15 +525,10 @@ impl CodecSupport {
 }
 
 /// Probe the registry for the codecs `choice`'s encoder path can produce on
-/// `render_node`. Requires `gst::init` to have run against the runtime GPU's registry —
-/// the agent forces a fresh scan for hardware encoders (`session::init_gstreamer`),
-/// since a registry baked without a GPU carries no VA/HW encoder factories.
-///
-/// Pass `"software"` for the host-wide support question (`agent::probe_host_codecs`,
-/// which no single GPU answers) and a GPU's own render node for its per-GPU plan
-/// (#301 layer 1) — VA then resolves the device-prefixed element name
-/// (`va_encoder_candidates`); Vulkan and NVENC are device-agnostic in the registry and
-/// resolve the same either way.
+/// `render_node` (`"software"` for the host-wide question; a GPU's own node for its
+/// #301 plan, where VA resolves device-prefixed names). Requires `gst::init` against the
+/// runtime GPU's registry (`session::init_gstreamer` forces a fresh scan). AV1 still
+/// honours the host-wide `av1_blocked()` here, as sessions are built.
 pub fn probe_codec_support(
     choice: EncoderChoice,
     knobs: EncoderKnobs,

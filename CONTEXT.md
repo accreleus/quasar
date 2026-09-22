@@ -341,15 +341,19 @@ image, driver and media settings. Its pass is the evidence that admits the codec
 GPU's codec set. A failure never blocks the GPU. Its check is
 `media_probe_gpu<N>_<codec>`. It is a host probe, not a device probe.
 
-**GPU codec set** — the codecs one GPU has been shown to encode: H.264 whenever its
-registry plan builds it (the encoder-candidate resolution run on that GPU's own render
-node), never a codec its driver-compatibility exclusion rules out, and every other
-codec only after a passing codec probe on that GPU. The **host codec set**
-(`capacity.codecs`, `hosts.codecs`) is the union of every *usable* GPU's set (one with
-`encode_slots_total > 0` — a render-node pin zeroes every other GPU, dropping it from
-the union). Not yet its own wire field: `capacity.gpus[].codecs` is future work, so
-today only the host union is reported. _Avoid_: "host codec set" for a single GPU's
-set, or vice versa.
+**GPU codec set** — the codecs one usable GPU has been shown to encode: H.264 always
+(the floor), and every other codec only when its registry plan builds it (the
+encoder-candidate resolution run on that GPU's own render node), no driver-compatibility
+exclusion rules it out, and a codec probe on that GPU passed under the current agent
+image, driver, media settings and GPU identity. The AV1 exclusion is still host-wide in
+practice: one known-corrupt GPU keeps AV1 out of every GPU's Vulkan/NVENC plan, as
+sessions are built.
+The **host codec set** (`capacity.codecs`, `hosts.codecs`) is the union of every *usable*
+GPU's set (one with `encode_slots_total > 0` — a render-node pin zeroes every other GPU,
+dropping it from the union), and is never empty: H.264 with no usable GPU or no
+registry. Not yet its own wire field: `capacity.gpus[].codecs` is future work, so today
+only the host union is reported. _Avoid_: "host codec set" for a single GPU's set, or
+vice versa.
 
 **Evidence** — a host fact that came from exercising the real path, or a
 definitive local observation such as an unreachable container runtime. Only

@@ -33,12 +33,11 @@ fn classify(vendor: &str, device: &str, driver: &str) -> Av1Compatibility {
     }
 }
 
-/// Host codec advertisements are host-wide today (for the `nvidia_vulkan_av1_compatibility`
-/// readiness check — the per-GPU codec plan, #301, uses [`classify_render_node`]
-/// instead). Conservatively exclude AV1 when any accessible render GPU matches the bad
-/// combination; never claim that a second, untested GPU is validated because the first
-/// one is. No cached decision: readiness and codec discovery read the new identity
-/// after a driver/agent restart.
+/// Host-wide: exclude AV1 when any accessible render GPU matches the bad combination;
+/// never claim a second, untested GPU is validated because the first one is. Feeds the
+/// readiness check and, through `effective_encoder`, every session and per-GPU plan —
+/// so AV1 stays host-wide off even where [`classify_render_node`] clears a GPU. No
+/// cached decision: a driver/agent restart reads the new identity.
 pub(crate) fn inspect(root: &Path) -> Av1Compatibility {
     let Some(driver) = crate::nvidia_volume::kernel_driver_version(root) else {
         return Av1Compatibility::Unknown;
@@ -86,11 +85,8 @@ fn inspect_render_node(root: &Path, render_node: &str, driver: &str) -> Av1Compa
     classify(&read("vendor"), &read("device"), driver)
 }
 
-/// Per-GPU classification (#301 layer 2): `render_node` (a bare `renderD*` name or a
-/// full `/dev/dri/renderD*` path) against the known-corrupt combination, independent of
-/// every other GPU on the host — unlike [`inspect`]/[`av1_blocked`], which fold every
-/// render node and must not let a validated GPU clear an untested sibling for the
-/// host-wide readiness check.
+/// Per-GPU classification (#301 layer 2) of `render_node` (`renderD*` or a full path),
+/// independent of every sibling — unlike the host-wide fold in [`inspect`].
 pub(crate) fn classify_render_node(root: &Path, render_node: &str) -> Av1Compatibility {
     let Some(driver) = crate::nvidia_volume::kernel_driver_version(root) else {
         return Av1Compatibility::Unknown;

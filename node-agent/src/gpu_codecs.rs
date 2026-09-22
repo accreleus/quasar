@@ -3,47 +3,46 @@
 //! layers feed the rule from elsewhere — the registry plan
 //! (`session::pipeline::probe_codec_support` on this GPU's own render node), the
 //! driver-compatibility exclusion (`encoder_compatibility::excluded_codecs`), and the
-//! retained codec-probe verdict (`host_probe::outcome::codec_probe_verdict`, #300) —
-//! composed here as pure functions so the safety property (only a proven codec is
-//! advertised) is unit-tested without a GPU, a registry or a live probe.
+//! codec-probe verdict held under the current stack (`host_probe::outcome::CodecEvidence`) —
+//! composed here as pure functions so the safety property (only a codec proven on the
+//! current stack is advertised above H.264) is unit-tested without a GPU or a registry.
 
 use std::collections::BTreeSet;
 
 use crate::host_probe::ProbeCodec;
 use crate::session::Codec;
 
-/// The advertisement rule. H.264 is the floor: admitted whenever the registry `plan`
-/// builds it. Every other codec needs an explicit `Some(true)` from `verdict` — `None`
-/// (no probe yet, or indeterminate) and `Some(false)` are not advertised, so a GPU
-/// stays h264-only until its codec probes have run. `excluded` (the driver-
-/// compatibility layer) removes a codec before `verdict` is even consulted, so a
-/// passing probe can never override a known-corrupt combination. `usable` is
-/// `encode_slots_total > 0`: a render-node pin zeroes every other GPU, and a zeroed
-/// GPU advertises nothing, dropping it out of the host union.
+/// The advertisement rule. A usable GPU (`encode_slots_total > 0`) always has H.264,
+/// the floor, whatever its plan says. Every other codec needs to be in the registry
+/// `plan`, outside the driver-compatibility `excluded` set, and `proven` — a codec-probe
+/// pass on this GPU under the current stack. An unusable GPU advertises nothing.
 pub(crate) fn gpu_codec_set(
     plan: &BTreeSet<Codec>,
     excluded: &BTreeSet<Codec>,
-    verdict: impl Fn(Codec) -> Option<bool>,
+    proven: impl Fn(Codec) -> bool,
     usable: bool,
 ) -> BTreeSet<Codec> {
     if !usable {
         return BTreeSet::new();
     }
-    plan.iter()
-        .filter(|codec| !excluded.contains(codec))
-        .filter(|&&codec| codec == Codec::H264 || verdict(codec) == Some(true))
-        .copied()
-        .collect()
+    let above_floor = plan
+        .iter()
+        .filter(|&&codec| codec != Codec::H264 && !excluded.contains(&codec) && proven(codec))
+        .copied();
+    std::iter::once(Codec::H264).chain(above_floor).collect()
 }
 
-/// The host-level `capacity.codecs` union over usable GPUs (agent-api.md amendment 12).
-pub(crate) fn host_codec_union<'a>(
+/// `capacity.codecs`: the union over usable GPUs, never empty — H.264 is the floor even
+/// for a host with no usable GPU (agent-api.md amendment 12, "never empty in practice").
+pub(crate) fn host_codec_set<'a>(
     gpu_sets: impl IntoIterator<Item = &'a BTreeSet<Codec>>,
 ) -> BTreeSet<Codec> {
-    gpu_sets.into_iter().fold(BTreeSet::new(), |mut acc, set| {
-        acc.extend(set.iter().copied());
-        acc
-    })
+    gpu_sets
+        .into_iter()
+        .fold(BTreeSet::from([Codec::H264]), |mut acc, set| {
+            acc.extend(set.iter().copied());
+            acc
+        })
 }
 
 /// The above-floor codecs a codec probe should target on this GPU: the registry plan
@@ -69,40 +68,32 @@ mod tests {
     }
 
     #[test]
-    fn h264_admitted_whenever_the_plan_builds_it() {
-        let plan = set(&[Codec::H264]);
-        assert_eq!(
-            gpu_codec_set(&plan, &BTreeSet::new(), |_| None, true),
-            set(&[Codec::H264])
-        );
+    fn a_usable_gpu_always_has_the_h264_floor() {
+        for plan in [set(&[Codec::H264]), BTreeSet::new(), set(&[Codec::H265])] {
+            assert_eq!(
+                gpu_codec_set(&plan, &BTreeSet::new(), |_| false, true),
+                set(&[Codec::H264]),
+                "{plan:?}"
+            );
+        }
     }
 
     #[test]
-    fn every_other_codec_needs_an_explicit_pass() {
+    fn every_other_codec_needs_a_proven_pass_and_the_plan() {
         let plan = set(&[Codec::H264, Codec::H265]);
         assert_eq!(
-            gpu_codec_set(&plan, &BTreeSet::new(), |_| None, true),
+            gpu_codec_set(&plan, &BTreeSet::new(), |_| false, true),
             set(&[Codec::H264]),
-            "no verdict yet ⇒ h264-only"
+            "no pass on this stack ⇒ h264-only"
         );
         assert_eq!(
-            gpu_codec_set(
-                &plan,
-                &BTreeSet::new(),
-                |c| (c == Codec::H265).then_some(false),
-                true
-            ),
-            set(&[Codec::H264]),
-            "a failed probe is not advertised"
-        );
-        assert_eq!(
-            gpu_codec_set(
-                &plan,
-                &BTreeSet::new(),
-                |c| (c == Codec::H265).then_some(true),
-                true
-            ),
+            gpu_codec_set(&plan, &BTreeSet::new(), |c| c == Codec::H265, true),
             set(&[Codec::H264, Codec::H265])
+        );
+        assert_eq!(
+            gpu_codec_set(&plan, &BTreeSet::new(), |_| true, true),
+            set(&[Codec::H264, Codec::H265]),
+            "a pass for a codec outside the plan is not advertised"
         );
     }
 
@@ -110,10 +101,8 @@ mod tests {
     fn compatibility_exclusion_precedes_the_probe() {
         let plan = set(&[Codec::H264, Codec::Av1]);
         let excluded = set(&[Codec::Av1]);
-        // Even a passing probe cannot override a layer-2 exclusion — the rule never
-        // calls `verdict` for an excluded codec.
         assert_eq!(
-            gpu_codec_set(&plan, &excluded, |_| Some(true), true),
+            gpu_codec_set(&plan, &excluded, |_| true, true),
             set(&[Codec::H264])
         );
     }
@@ -121,27 +110,24 @@ mod tests {
     #[test]
     fn an_unusable_gpu_advertises_nothing() {
         let plan = set(&[Codec::H264, Codec::H265, Codec::Av1]);
-        assert!(gpu_codec_set(&plan, &BTreeSet::new(), |_| Some(true), false).is_empty());
+        assert!(gpu_codec_set(&plan, &BTreeSet::new(), |_| true, false).is_empty());
     }
 
     #[test]
-    fn host_union_drops_a_pinned_out_gpu() {
-        let gpu0 = set(&[Codec::H264, Codec::H265]);
-        let gpu1 = BTreeSet::new(); // zeroed by a render-node pin
-        assert_eq!(
-            host_codec_union([&gpu0, &gpu1]),
-            set(&[Codec::H264, Codec::H265])
-        );
-    }
-
-    #[test]
-    fn host_union_is_the_union_over_usable_gpus() {
+    fn host_set_is_the_union_over_usable_gpus() {
         let gpu0 = set(&[Codec::H264, Codec::H265]);
         let gpu1 = set(&[Codec::H264, Codec::Av1]);
+        let pinned_out = BTreeSet::new();
         assert_eq!(
-            host_codec_union([&gpu0, &gpu1]),
+            host_codec_set([&gpu0, &gpu1, &pinned_out]),
             set(&[Codec::H264, Codec::H265, Codec::Av1])
         );
+    }
+
+    #[test]
+    fn host_set_is_never_empty() {
+        assert_eq!(host_codec_set([]), set(&[Codec::H264]));
+        assert_eq!(host_codec_set([&BTreeSet::new()]), set(&[Codec::H264]));
     }
 
     #[test]
