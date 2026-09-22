@@ -81,7 +81,7 @@ renumbered to their public issues.
 ## Git branching & environments (operator policy — 2026-07-07)
 - **`main` = production.** Any merge INTO `main` requires **explicit human sign-off from the operator**. Never merge to `main` autonomously — not even a green feature branch.
 - **`develop` = persistent, unstable integration branch.** All day-to-day work targets it.
-- **Workflow:** branch off `develop` → do the work → merge **back into `develop`** with **no PR required**. Feature-branch → `develop` is self-serve; `develop` → `main` is the only sign-off gate. Default: `git checkout develop && git pull && git checkout -b <feature>`; land with `git checkout develop && git merge <feature>`.
+- **Workflow:** branch off `develop` → do the work → merge **back into `develop`** with **no PR required**. Feature-branch → `develop` is self-serve; `develop` → `main` is the only sign-off gate. Default: `git checkout develop && git pull && git checkout -b <feature>`; land with `git checkout develop && git merge <feature>`. **A streaming-path change runs `make bench-check` before that merge** and closes out by publishing or updating its bench report (`make report-publish`, or `qbench sprint put` at sprint end) — see "Performance evidence (quasar-bench)" below and the landing sequence in `AGENTS.md`.
 - **Push branches to origin as you go — "no PR required" does not mean "no push".** Origin is
   how concurrent agents and other machines see in-flight work; a local-only branch is invisible
   to all of them. The 2026-08-31 develop merge is the cautionary tale: a multi-day local-only
@@ -151,6 +151,26 @@ docker run --rm -v "$PWD":/workspace -w /workspace/node-agent quasar-agent-dev:l
   DB-touching control-plane PR therefore keeps its stack on the branch until merge — it converges
   to main on merge (main then embeds the migration), it cannot be reverted to main beforehand
   without running the down-migration and resetting `schema_migrations` first.
+
+## Performance evidence (quasar-bench)
+quasar-bench (your bench server, `$BENCH_URL`) holds harness runs, commit verdicts and the
+sprint reports the operator reviews; `qbench` is its CLI and the `quasar-bench*` skills
+cover how to use it. `AGENTS.md` "Performance evidence (quasar-bench)" is the
+harness-neutral statement of these rules; keep the two identical in meaning.
+- **Before landing a streaming-path change** (encoder, capture, ABR/ladder, transport,
+  client presentation): runs for the new commit are posted, then `make bench-check`
+  (`qbench check`). Exit 3 blocks landing until each regressed metric is explained or
+  fixed. Exit 4 (nothing comparable) is not a pass and is said so in the summary.
+- **Every harness run carries `--repo accreleus/quasar --commit <sha>`** (the repo's
+  bench scripts send both). Mark a bad run `contaminated` with a reason; never delete it.
+- **At sprint end**, publish a sprint report (`qbench sprint put`) with before/after runs,
+  evidence and the board issues it closes; cite it in the final commit body and the issue
+  by report path ("bench sprint accreleus/quasar c15"), never by host name.
+- **When resuming work**, `make bench-status` (`qbench sprint status`) first; address every
+  open comment on a `changes_requested` report before new work. Never set a review status.
+- **Quote bench verdicts verbatim**; don't restate numbers from memory.
+- The server and key come from `BENCH_URL` / `BENCH_KEY` or qbench's `~/.config/qbench/`
+  — never write the address anywhere in this public repo. `qbench doctor` checks setup.
 
 ## GStreamer / WebRTC / encoder gotchas — moved to path-scoped rules
 Load-bearing gotchas now live in `.claude/rules/` and auto-load when working with matching files:

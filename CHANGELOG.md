@@ -113,6 +113,16 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **Bench evidence is part of the agent workflow, and the bench tooling finds its server the
+  way `qbench` does.** `make bench-check` runs `qbench check` as the landing gate for a
+  streaming-path change (0 clean, 3 regressed blocks, 4 nothing comparable is not a pass) and
+  `make bench-status` shows reports waiting on review; `AGENTS.md` and `CLAUDE.md` say when
+  each applies, and `docs/agents/quasar-bench.md` carries the guide for harnesses without skill
+  support. Every run the bench scripts post now carries `repo` and `commit`, so `qbench check`
+  can find it. The server and key come only from `BENCH_URL` / `BENCH_KEY` or qbench's
+  `~/.config/qbench/`: the localhost and host-derived default addresses, `QUASAR_BENCH_URL`
+  and the ssh read of the bench service's `deploy/.env` are gone, and `make report-*` no
+  longer takes `HOST`. The vendored client and CLI are now quasar-bench 1.7.0.
 - **Auto prefers the GPU that gives the best codec (#305, amendment 12).** A launch left on
   Auto now ranks candidate GPUs by the best codec each can encode for this device, in the
   launch profile's own order, and only then by load. On a host where one GPU encodes AV1
