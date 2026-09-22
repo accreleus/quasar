@@ -54,7 +54,7 @@ use super::host::wayland_display_from_message;
 use super::input::InputState;
 use super::metrics::SessionMetrics;
 use super::pipeline;
-use super::teardown::{self, StopAttempt, UdevAction};
+use super::teardown::{self, StopAttempt};
 use super::virtual_input::VirtualDevices;
 use super::SessionConfig;
 use crate::messages::AppExitPolicy;
@@ -93,69 +93,98 @@ fn retry_application_observation(_kind: crate::runtime::ErrorKind) -> bool {
 /// generation so session end has one release path. The runner calls
 /// [`AppSource::teardown`] on every terminal exit; that calls [`SharedSessionRuntime::apply`]
 /// before the source pipeline is set to NULL.
+///
+/// The sidecar and the export are held behind [`teardown::Sidecar`] and
+/// [`teardown::UdevExport`] rather than as their concrete types, so the release
+/// is exercisable without a runtime client or a uinput device (see this module's
+/// tests). The production values are [`PulseSidecar`] and [`VirtualDevices`].
 struct SharedSessionRuntime {
     session_id: String,
+    /// `teardown::ReleaseState::blocked`. An atomic because this value is shared
+    /// through an `Arc`, not because it is contended: every read and write is on
+    /// the session thread, which is also where every generation is dropped.
     udev_blocked: AtomicBool,
     /// Set when an app container is launched; cleared only when its stop is confirmed.
     mount_live: AtomicBool,
     /// The last container-stop outcome. `None` until a generation records one.
     last_stop: Mutex<Option<StopAttempt>>,
-    pulse: Mutex<Option<PulseSidecar>>,
-    devices: Option<Arc<VirtualDevices>>,
+    pulse: Mutex<Option<Box<dyn teardown::Sidecar>>>,
+    udev: Option<Arc<dyn teardown::UdevExport + Send + Sync>>,
+    /// The whole session end's retry allowance, shared with the sidecar (see
+    /// [`teardown::STOP_RETRY_BUDGET`]).
+    budget: teardown::RetryBudget,
 }
 
 impl SharedSessionRuntime {
-    /// Record a container-stop outcome without touching the sidecar or the
-    /// udev export. A swap drops the outgoing [`AppSource`] while the session,
-    /// and the replacement generation, are still using both.
-    fn note_container_stop(&self, report: StopAttempt) {
-        let already_blocked = self.udev_blocked.load(Ordering::Relaxed);
-        self.udev_blocked.store(
-            teardown::blocked_after(report, already_blocked),
-            Ordering::Relaxed,
-        );
-        if matches!(report, StopAttempt::Confirmed) {
-            self.mount_live.store(false, Ordering::Relaxed);
+    /// Take ownership of the session's sidecar and export, and join the sidecar
+    /// to this session end's shared retry allowance — so releasing the app
+    /// container and releasing the sidecar cannot each spend a full
+    /// [`teardown::STOP_RETRY_BUDGET`].
+    fn new(
+        session_id: &str,
+        pulse: Option<Box<dyn teardown::Sidecar>>,
+        udev: Option<Arc<dyn teardown::UdevExport + Send + Sync>>,
+        budget: teardown::RetryBudget,
+    ) -> Self {
+        let mut pulse = pulse;
+        if let Some(sidecar) = pulse.as_mut() {
+            sidecar.adopt_budget(budget.clone());
         }
+        SharedSessionRuntime {
+            session_id: session_id.to_string(),
+            udev_blocked: AtomicBool::new(false),
+            mount_live: AtomicBool::new(false),
+            last_stop: Mutex::new(None),
+            pulse: Mutex::new(pulse),
+            udev,
+            budget,
+        }
+    }
+
+    fn state(&self) -> teardown::ReleaseState {
+        teardown::ReleaseState {
+            blocked: self.udev_blocked.load(Ordering::Relaxed),
+            mount_live: self.mount_live.load(Ordering::Relaxed),
+        }
+    }
+
+    fn store(&self, state: teardown::ReleaseState, report: StopAttempt) {
+        self.udev_blocked.store(state.blocked, Ordering::Relaxed);
+        self.mount_live.store(state.mount_live, Ordering::Relaxed);
         *self
             .last_stop
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report);
     }
 
+    /// Record a container-stop outcome without touching the sidecar or the
+    /// udev export. A swap drops the outgoing [`AppSource`] while the session,
+    /// and the replacement generation, are still using both.
+    fn note_container_stop(&self, report: StopAttempt) {
+        let state = self.state();
+        self.store(
+            teardown::ReleaseState {
+                blocked: teardown::blocked_after(report, state.blocked),
+                mount_live: state.mount_live && !matches!(report, StopAttempt::Confirmed),
+            },
+            report,
+        );
+    }
+
     fn apply(&self, report: StopAttempt, final_chance: bool) {
-        let already_blocked = self.udev_blocked.load(Ordering::Relaxed);
-        let mount_live = self.mount_live.load(Ordering::Relaxed);
-        self.note_container_stop(report);
-        let action = teardown::action_this_chance(
-            teardown::udev_action(report, already_blocked, mount_live),
+        let next = teardown::settle_udev(
+            &self.session_id,
+            report,
+            self.state(),
             final_chance,
-            mount_live,
+            self.udev
+                .as_ref()
+                .map(|u| &**u as &dyn teardown::UdevExport),
         );
-        if matches!(action, UdevAction::Abandon) {
-            tracing::warn!(
-                token = "udev-export-retire-skipped",
-                session = %self.session_id,
-                "an app container stop was not proven — leaving the udev export \
-                 dir for the boot sweep"
-            );
-        }
-        teardown::on_udev(
-            action,
-            || {
-                if let Some(devices) = &self.devices {
-                    devices.retire_udev_export();
-                }
-            },
-            || {
-                if let Some(devices) = &self.devices {
-                    devices.abandon_udev_export();
-                }
-            },
-        );
+        self.store(next, report);
         // Leave the sidecar in place when a busy client could not start the stop:
-        // the next release, and the sidecar's own Drop, try again. Taking it out
-        // here would spend the only remaining attempt inside this call.
+        // the next release, and the sidecar's own Drop, try again. Both draw on
+        // the same `budget`, so "try again" cannot become an unbounded wait.
         let mut guard = self
             .pulse
             .lock()
@@ -246,14 +275,16 @@ impl SessionResources {
             );
         }
         let pulse_server = pulse.as_ref().map(|p| p.server_uri());
-        let shared = Arc::new(SharedSessionRuntime {
-            session_id: session_id.to_string(),
-            udev_blocked: AtomicBool::new(false),
-            mount_live: AtomicBool::new(false),
-            last_stop: Mutex::new(None),
-            pulse: Mutex::new(pulse),
-            devices: devices.clone(),
-        });
+        // One allowance for the whole session end: the app container's retries and
+        // the sidecar's draw down the same pool (see `teardown::STOP_RETRY_BUDGET`).
+        let shared = Arc::new(SharedSessionRuntime::new(
+            session_id,
+            pulse.map(|sidecar| Box::new(sidecar) as Box<dyn teardown::Sidecar>),
+            devices
+                .clone()
+                .map(|d| d as Arc<dyn teardown::UdevExport + Send + Sync>),
+            teardown::RetryBudget::new(teardown::STOP_RETRY_BUDGET),
+        ));
         // Pre-create any bind-mount host paths under QUASAR_HOME_ROOT so Docker does not
         // create them root:root 755. No-op when unset or no mount matches; never fails
         // the session.
@@ -327,8 +358,12 @@ impl Drop for SessionResources {
     /// Final chance. [`AppSource::teardown`] already applied a non-final release
     /// on the normal paths; this catches an early return that never built a
     /// source, and abandons an export whose container was never proved gone.
-    /// The recorded stop is kept as-is: a busy client is not rewritten into an
-    /// unconfirmed stop.
+    ///
+    /// It asks the engine nothing: the source's own `Drop` already spent this
+    /// session end's last observed app-container attempt and recorded what it
+    /// learned, so this reads that record. A refused stop is kept as a refused
+    /// stop and never rewritten into an unconfirmed one. What it may still do
+    /// is retry the SIDECAR, on whatever is left of the shared budget.
     fn drop(&mut self) {
         let report = self
             .shared
@@ -505,10 +540,9 @@ pub struct AppSource {
     /// Shared with [`SessionResources`]. Session end releases the sidecar and the
     /// udev export from here, before this pipeline is set to NULL.
     shared: Arc<SharedSessionRuntime>,
-    /// Set once this generation has asked the runtime to stop its container.
-    /// A later drop must not spend another app-stop timeout on an unconfirmed
-    /// result. A busy result is not cached: the client never accepted the call,
-    /// so the next release may try again.
+    /// The last stop outcome this generation observed, and the one input to
+    /// "may the next release ask the engine again?" — see
+    /// [`AppSource::finish_app_stop`].
     ended: Option<StopAttempt>,
 }
 
@@ -955,26 +989,49 @@ impl AppSource {
     /// Returns `true` if a container was running and has now been reaped. The waiter
     /// thread's observation of this exit is discarded (the shared `removed` flag is set
     /// first), so it is never misreported as an app-liveness failure.
+    ///
+    /// A refused stop is retried (on this swap's own budget, not the session
+    /// end's — see below): a transient busy client is not a reason to end a live
+    /// session, which is what it used to be. What is still fatal to the
+    /// swap is an UNCONFIRMED stop, and a refusal that outlives the budget —
+    /// the engine was never asked, so the outgoing app may still be running and
+    /// the replacement must not take its managed home. That fatality is also
+    /// what makes `teardown::blocked_after(Confirmed) == false` safe: a live
+    /// later generation implies every earlier one was proven gone.
     pub fn stop_app_container(&mut self) -> Result<bool, String> {
         if self.container.is_none() {
             return Ok(false);
         }
-        let stopped = self.container.as_mut().unwrap().stop();
-        match stopped {
-            Err(error) => {
-                // A busy client never asked the engine, so it must not disarm
-                // the export. An unconfirmed stop might still have a live bind.
-                // This is a swap's outgoing generation: record the outcome and
-                // leave the sidecar alone.
-                let report = teardown::classify_stop(teardown::error_kind(&error));
-                self.shared.note_container_stop(report);
-                Err(error.to_string())
-            }
-            Ok(()) => {
+        // A swap's OWN allowance, not the session end's. The session-end budget
+        // is armed the first time a release pauses and runs from there; a swap
+        // an hour earlier that shared it would leave the session end with
+        // nothing. One swap gets one `STOP_RETRY_BUDGET`.
+        let budget = teardown::RetryBudget::new(teardown::STOP_RETRY_BUDGET);
+        let mut last: Option<String> = None;
+        let report = teardown::retry_with_budget(
+            || {
+                let stopped = self.container.as_mut().unwrap().stop();
+                match stopped {
+                    Ok(()) => StopAttempt::Confirmed,
+                    Err(error) => {
+                        let report = teardown::classify_stop(teardown::error_kind(&error));
+                        last = Some(error.to_string());
+                        report
+                    }
+                }
+            },
+            &budget,
+        );
+        // A swap's outgoing generation: record the outcome and leave the sidecar
+        // and the export alone — the replacement still needs both.
+        self.shared.note_container_stop(report);
+        match report {
+            StopAttempt::Confirmed => {
                 self.container.take();
-                self.shared.note_container_stop(StopAttempt::Confirmed);
                 Ok(true)
             }
+            StopAttempt::Absent => Ok(false),
+            _ => Err(last.unwrap_or_else(|| "app container stop was refused".to_string())),
         }
     }
 
@@ -1144,31 +1201,37 @@ impl AppSource {
     /// only: a swap drops the outgoing source while the replacement still needs
     /// the sidecar and the udev export.
     pub fn teardown(&mut self) {
-        let report = self.finish_app_stop();
+        let report = self.finish_app_stop(false);
         self.shared.apply(report, false);
         let _ = self.pipeline.set_state(gst::State::Null);
     }
 
-    /// One engine attempt per unconfirmed outcome. Busy is retried here and
-    /// again from [`Drop`] if this call exhausted its budget, because that
-    /// failure never reached the engine.
-    fn finish_app_stop(&mut self) -> StopAttempt {
+    /// Every engine attempt this source makes is OBSERVED, and there is at most
+    /// one settled outcome outstanding at a time.
+    ///
+    /// - A refused stop never reached the engine, so the next release may ask again.
+    /// - A confirmed or absent stop is final; nothing is re-asked.
+    /// - An unconfirmed stop is not spun — but `last_chance` (this source's own
+    ///   `Drop`) spends exactly one more attempt on it. That attempt is not an
+    ///   extra one: it REPLACES the blind stop `RunningContainer::drop` used to
+    ///   make while discarding its answer. Observing it is the point — a stop
+    ///   that finally proves the container gone has to retire the udev export
+    ///   and stop the sidecar, and a discarded success did neither (#314).
+    fn finish_app_stop(&mut self, last_chance: bool) -> StopAttempt {
         if let Some(report) = self.ended {
-            if !matches!(report, StopAttempt::Retryable) {
+            let ask_again = match report {
+                StopAttempt::Retryable => true,
+                StopAttempt::Unconfirmed => last_chance,
+                StopAttempt::Confirmed | StopAttempt::Absent => false,
+            };
+            if !ask_again {
                 return report;
             }
         }
-        let report = self.stop_app_for_session_end();
+        let budget = self.shared.budget.clone();
+        let report = teardown::retry_with_budget(|| self.stop_app_once(), &budget);
         self.ended = Some(report);
         report
-    }
-
-    fn stop_app_for_session_end(&mut self) -> StopAttempt {
-        teardown::retry_retryable(
-            || self.stop_app_once(),
-            || std::thread::sleep(teardown::STOP_PAUSE),
-            teardown::STOP_ATTEMPTS,
-        )
     }
 
     fn stop_app_once(&mut self) -> StopAttempt {
@@ -1275,7 +1338,16 @@ fn observe_until_exit(
 
 impl Drop for AppSource {
     fn drop(&mut self) {
-        let report = self.finish_app_stop();
+        let report = self.finish_app_stop(true);
+        // The container's own `Drop` is a blind stop whose result is thrown
+        // away. `finish_app_stop(true)` has just made that attempt for real and
+        // recorded what it learned, so letting the field drop repeat it would
+        // only spend another stop timeout and then throw away an answer the
+        // session needed — that discarded success is #314. Whatever is still
+        // unproven is a durable obligation `recover_application_cleanup` owns.
+        if let Some(container) = self.container.as_mut() {
+            container.disarm_drop();
+        }
         // SessionResources plus this source is 2. A swap holds the outgoing and
         // incoming generations at once; releasing the sidecar or the udev
         // export from that drop would strand the replacement. `strong_count`
@@ -1296,12 +1368,210 @@ impl Drop for AppSource {
 mod tests {
     use super::{
         app_presented_since_launch, observe_until_exit, retry_application_observation,
-        source_commit_advanced, GenerationObservation,
+        source_commit_advanced, teardown, GenerationObservation, SharedSessionRuntime, StopAttempt,
     };
     use crate::runtime::{ApplicationResult, ErrorKind, RuntimeError};
     use crate::session::container::AppExitStatus;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// What the session end did to the fake-udev export.
+    #[derive(Default)]
+    struct SpyExport {
+        log: Mutex<Vec<&'static str>>,
+    }
+    impl teardown::UdevExport for SpyExport {
+        fn retire(&self) {
+            self.log.lock().unwrap().push("retire");
+        }
+        fn abandon(&self) {
+            self.log.lock().unwrap().push("abandon");
+        }
+    }
+    impl SpyExport {
+        fn log(&self) -> Vec<&'static str> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    /// A sidecar whose engine is permanently busy, so every release call spins
+    /// its retry loop exactly as `PulseSidecar::stop` does. It records what it
+    /// was handed, which is how the shared-budget wiring is observable.
+    #[derive(Default)]
+    struct SpySidecarLog {
+        stops: usize,
+        attempts: usize,
+    }
+    struct SpySidecar {
+        log: Arc<Mutex<SpySidecarLog>>,
+        now: Arc<Mutex<Duration>>,
+        budget: Option<teardown::RetryBudget>,
+    }
+    impl teardown::Sidecar for SpySidecar {
+        fn server_uri(&self) -> String {
+            "unix:/nonexistent/native".into()
+        }
+        fn socket_dir(&self) -> std::path::PathBuf {
+            std::path::PathBuf::from("/nonexistent")
+        }
+        fn adopt_budget(&mut self, budget: teardown::RetryBudget) {
+            self.budget = Some(budget);
+        }
+        fn stop(&mut self) {
+            self.log.lock().unwrap().stops += 1;
+            let budget = self
+                .budget
+                .clone()
+                .expect("the session must hand its sidecar the shared budget");
+            let log = self.log.clone();
+            let now = self.now.clone();
+            teardown::retry_retryable(
+                || {
+                    log.lock().unwrap().attempts += 1;
+                    StopAttempt::Retryable
+                },
+                || *now.lock().unwrap() += teardown::STOP_PAUSE,
+                teardown::STOP_ATTEMPTS,
+                || budget.live(),
+            );
+        }
+    }
+
+    struct Session {
+        shared: Arc<SharedSessionRuntime>,
+        export: Arc<SpyExport>,
+        sidecar: Arc<Mutex<SpySidecarLog>>,
+        now: Arc<Mutex<Duration>>,
+    }
+
+    impl Session {
+        /// A session that launched an app container, so its bind mount is live.
+        fn launched() -> Self {
+            let export = Arc::new(SpyExport::default());
+            let sidecar = Arc::new(Mutex::new(SpySidecarLog::default()));
+            let now = Arc::new(Mutex::new(Duration::ZERO));
+            let shared = Arc::new(SharedSessionRuntime::new(
+                "s1",
+                Some(Box::new(SpySidecar {
+                    log: sidecar.clone(),
+                    now: now.clone(),
+                    budget: None,
+                })),
+                Some(export.clone()),
+                teardown::RetryBudget::fake(teardown::STOP_RETRY_BUDGET, now.clone()),
+            ));
+            shared.mount_live.store(true, Ordering::Relaxed);
+            Session {
+                shared,
+                export,
+                sidecar,
+                now,
+            }
+        }
+
+        fn sidecar_stops(&self) -> usize {
+            self.sidecar.lock().unwrap().stops
+        }
+
+        fn sidecar_attempts(&self) -> usize {
+            self.sidecar.lock().unwrap().attempts
+        }
+    }
+
+    // #314, live: the idle reap raced a busy runtime client, and a later stop
+    // proved the app container gone. The refused attempt must change nothing,
+    // and the confirmed one must release everything.
+    #[test]
+    fn a_refused_stop_then_a_confirmed_one_retires_the_export_and_keeps_the_sidecar_stoppable() {
+        let session = Session::launched();
+        session.shared.apply(StopAttempt::Retryable, false);
+        assert_eq!(
+            session.export.log(),
+            Vec::<&str>::new(),
+            "a call the engine never saw must not disarm the export"
+        );
+        assert!(!session.shared.udev_blocked.load(Ordering::Relaxed));
+        assert_eq!(session.sidecar_stops(), 1, "the sidecar is asked anyway");
+
+        session.shared.apply(StopAttempt::Confirmed, false);
+        assert_eq!(session.export.log(), vec!["retire"]);
+        assert!(!session.shared.mount_live.load(Ordering::Relaxed));
+        assert_eq!(session.sidecar_stops(), 2);
+    }
+
+    // The drop-path hazard: teardown ended unconfirmed, then the source's own
+    // `Drop` made one more OBSERVED attempt and it succeeded. Before that
+    // attempt was observed its success was discarded, `last_stop` stayed
+    // unconfirmed, and `SessionResources::drop` abandoned a live export under a
+    // container that was genuinely gone.
+    #[test]
+    fn a_confirmed_drop_path_stop_retires_the_export_instead_of_abandoning_it() {
+        let session = Session::launched();
+        session.shared.apply(StopAttempt::Unconfirmed, false);
+        assert_eq!(
+            session.export.log(),
+            Vec::<&str>::new(),
+            "abandoning waits for the last chance"
+        );
+        assert!(session.shared.udev_blocked.load(Ordering::Relaxed));
+
+        // AppSource::drop, having spent its one extra attempt and observed it.
+        session.shared.apply(StopAttempt::Confirmed, false);
+        // SessionResources::drop reads the recorded outcome; nothing is re-asked.
+        let recorded = session
+            .shared
+            .last_stop
+            .lock()
+            .unwrap()
+            .expect("a release recorded its outcome");
+        assert_eq!(recorded, StopAttempt::Confirmed);
+        session.shared.apply(recorded, true);
+        // Retiring is idempotent (`VirtualDevices::retire_udev_export` takes the
+        // ids), so the last chance repeating it is harmless; abandoning is not.
+        let log = session.export.log();
+        assert!(log.contains(&"retire"), "{log:?}");
+        assert!(
+            !log.contains(&"abandon"),
+            "a proven-gone container must never leave its export to the boot sweep: {log:?}"
+        );
+        assert!(!session.shared.udev_blocked.load(Ordering::Relaxed));
+    }
+
+    // The same session end with the drop-path attempt still unproven: that is
+    // the case the boot sweep owns, and only then.
+    #[test]
+    fn an_unproven_stop_leaves_the_export_for_the_boot_sweep_on_the_last_chance() {
+        let session = Session::launched();
+        session.shared.apply(StopAttempt::Unconfirmed, false);
+        session.shared.apply(StopAttempt::Unconfirmed, true);
+        assert_eq!(session.export.log(), vec!["abandon"]);
+    }
+
+    // Finding 3: `apply` runs up to three times per session end (teardown,
+    // AppSource::drop, SessionResources::drop) and the sidecar's own Drop can
+    // add a fourth. They share one allowance, so the total wait is bounded once
+    // per session end rather than once per call.
+    #[test]
+    fn every_release_call_in_one_session_end_draws_on_the_same_budget() {
+        let session = Session::launched();
+        session.shared.apply(StopAttempt::Retryable, false);
+        let first = session.sidecar_attempts();
+        assert!(first > 1, "the first release does retry a refused stop");
+        session.shared.apply(StopAttempt::Retryable, false);
+        session.shared.apply(StopAttempt::Retryable, true);
+        let total = session.sidecar_attempts();
+        assert!(
+            total < 3 * first,
+            "later releases must inherit a drawn-down budget, not a fresh one: \
+             {first} then {total} attempts"
+        );
+        let waited = *session.now.lock().unwrap();
+        assert!(
+            waited < teardown::STOP_RETRY_BUDGET + teardown::STOP_PAUSE,
+            "one session end waited {waited:?}"
+        );
+    }
 
     // One observation record per launched generation. The observer thread of a
     // generation holds only that generation's handles, so nothing it publishes late can

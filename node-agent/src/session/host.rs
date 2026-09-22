@@ -43,14 +43,15 @@ pub struct SessionHost {
     /// `None` under `use_test_audio` or when start failed (socket timeout). The
     /// sidecar's `Drop` removes its container.
     pulse: Option<PulseSidecar>,
-    /// A previous app-container stop was unconfirmed. Cleared when a later stop
-    /// proves removal.
-    udev_blocked: bool,
-    /// An app container was launched and has not been proven gone.
-    mount_live: bool,
-    /// Last container-stop outcome. An unconfirmed result is not asked again
-    /// from `Drop`; a busy result is, because the engine was never called.
+    /// The sticky "a previous stop was unconfirmed" / "a mount may still be
+    /// live" pair, carried between this host's release calls.
+    release_state: super::teardown::ReleaseState,
+    /// Last container-stop outcome. See `SessionHost::finish_container_stop`.
     ended: Option<super::teardown::StopAttempt>,
+    /// This session end's whole retry allowance. Deliberately much smaller than
+    /// the production session's: `Drop` runs on a Tokio worker (see
+    /// [`super::teardown::DEMO_STOP_RETRY_BUDGET`]).
+    budget: super::teardown::RetryBudget,
     /// Why there is no sidecar despite wanting one (session streams silence), or
     /// `None`. Mirrors `SessionResources::audio_degraded` (see source.rs).
     audio_degraded: Option<String>,
@@ -113,6 +114,12 @@ impl SessionHost {
             );
         }
         let pulse_server = pulse.as_ref().map(|p| p.server_uri());
+        // One allowance for this host's whole session end, shared with the sidecar.
+        let budget = super::teardown::RetryBudget::new(super::teardown::DEMO_STOP_RETRY_BUDGET);
+        let mut pulse = pulse;
+        if let Some(sidecar) = pulse.as_mut() {
+            sidecar.adopt_budget(budget.clone());
+        }
 
         Ok((
             SessionHost {
@@ -130,9 +137,9 @@ impl SessionHost {
                 container: None,
                 launched: false,
                 pulse,
-                udev_blocked: false,
-                mount_live: false,
+                release_state: super::teardown::ReleaseState::IDLE,
                 ended: None,
+                budget,
                 audio_degraded,
             },
             pulse_server,
@@ -226,7 +233,7 @@ impl SessionHost {
                     wl_display
                 );
                 self.container = Some(c);
-                self.mount_live = true;
+                self.release_state.mount_live = true;
             }
             Err(e) => tracing::error!(
                 token = "app-container-launch-failed",
@@ -244,55 +251,48 @@ impl SessionHost {
     }
 
     fn release(&mut self, final_chance: bool) {
-        let report = self.finish_container_stop();
-        let already_blocked = self.udev_blocked;
-        let mount_live = self.mount_live;
-        self.udev_blocked = super::teardown::blocked_after(report, already_blocked);
-        if matches!(report, super::teardown::StopAttempt::Confirmed) {
-            self.mount_live = false;
+        let report = self.finish_container_stop(final_chance);
+        if final_chance {
+            // The observed attempt above replaces the container's blind `Drop`
+            // stop; see `RunningContainer::disarm_drop`. It also keeps this
+            // release's blocking on the Tokio worker no worse than the single
+            // stop+cleanup `SessionHost::teardown` already cost before #314.
+            if let Some(container) = self.container.as_mut() {
+                container.disarm_drop();
+            }
         }
-        let action = super::teardown::action_this_chance(
-            super::teardown::udev_action(report, already_blocked, mount_live),
+        self.release_state = super::teardown::settle_udev(
+            &self.session_id,
+            report,
+            self.release_state,
             final_chance,
-            mount_live,
-        );
-        if matches!(action, super::teardown::UdevAction::Abandon) {
-            tracing::warn!(
-                token = "udev-export-retire-skipped",
-                session = %self.session_id,
-                "an app container stop was not proven — leaving the udev export \
-                 dir for the boot sweep"
-            );
-        }
-        super::teardown::on_udev(
-            action,
-            || {
-                if let Some(devices) = self.devices.as_ref() {
-                    devices.retire_udev_export();
-                }
-            },
-            || {
-                if let Some(devices) = self.devices.as_ref() {
-                    devices.abandon_udev_export();
-                }
-            },
+            self.devices
+                .as_ref()
+                .map(|d| &**d as &dyn super::teardown::UdevExport),
         );
         if let Some(pulse) = self.pulse.as_mut() {
             pulse.stop();
         }
     }
 
-    fn finish_container_stop(&mut self) -> super::teardown::StopAttempt {
+    /// Same rule as `AppSource::finish_app_stop`: every engine attempt is
+    /// observed, a refused one may be asked again, and an unconfirmed one is
+    /// asked exactly once more — on the last chance, in place of the container's
+    /// blind `Drop`.
+    fn finish_container_stop(&mut self, last_chance: bool) -> super::teardown::StopAttempt {
+        use super::teardown::StopAttempt;
         if let Some(report) = self.ended {
-            if !matches!(report, super::teardown::StopAttempt::Retryable) {
+            let ask_again = match report {
+                StopAttempt::Retryable => true,
+                StopAttempt::Unconfirmed => last_chance,
+                StopAttempt::Confirmed | StopAttempt::Absent => false,
+            };
+            if !ask_again {
                 return report;
             }
         }
-        let report = super::teardown::retry_retryable(
-            || self.stop_container_once(),
-            || std::thread::sleep(super::teardown::STOP_PAUSE),
-            super::teardown::STOP_ATTEMPTS,
-        );
+        let budget = self.budget.clone();
+        let report = super::teardown::retry_with_budget(|| self.stop_container_once(), &budget);
         self.ended = Some(report);
         report
     }
@@ -305,6 +305,7 @@ impl SessionHost {
         match stopped {
             Ok(()) => {
                 self.container.take();
+                self.release_state.mount_live = false;
                 super::teardown::StopAttempt::Confirmed
             }
             Err(error) => {

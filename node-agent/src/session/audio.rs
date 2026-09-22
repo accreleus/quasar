@@ -81,6 +81,11 @@ pub struct PulseSidecar {
     operation: String,
     removed: bool,
     cleanup_attempted: bool,
+    /// The session end's shared retry allowance (`teardown::RetryBudget`). A
+    /// sidecar starts with its own so a failed start can still release it; the
+    /// session replaces it with the shared one via [`Self::adopt_budget`], so
+    /// the sidecar's retries and the app container's draw down one pool.
+    budget: super::teardown::RetryBudget,
 }
 
 /// `QUASAR_PULSE_IMAGE`, or the running agent's own image. Shared by the per-session
@@ -139,6 +144,7 @@ impl PulseSidecar {
             operation,
             removed: false,
             cleanup_attempted: false,
+            budget: super::teardown::RetryBudget::new(super::teardown::STOP_RETRY_BUDGET),
         };
         if let Err(error) = sidecar.runtime.run_audio_sidecar(helper, request).wait() {
             sidecar.stop();
@@ -156,6 +162,13 @@ impl PulseSidecar {
             sidecar.socket_dir.join("native").display()
         );
         Ok(Some(sidecar))
+    }
+
+    /// Join this sidecar's retries to the session end's shared allowance, so
+    /// releasing the app container and releasing the sidecar cannot each spend a
+    /// full [`super::teardown::STOP_RETRY_BUDGET`].
+    pub fn adopt_budget(&mut self, budget: super::teardown::RetryBudget) {
+        self.budget = budget;
     }
 
     /// The `unix:…` URI pulsesrc and PULSE_SERVER clients use to connect.
@@ -179,7 +192,9 @@ impl PulseSidecar {
         if self.removed || self.cleanup_attempted {
             return;
         }
-        let report = super::teardown::retry_retryable(
+        // Cloned out first: the attempt closure borrows `self` mutably.
+        let budget = self.budget.clone();
+        let report = super::teardown::retry_with_budget(
             || match self
                 .runtime
                 .abandon_audio_sidecar(self.operation.clone())
@@ -201,8 +216,7 @@ impl PulseSidecar {
                     super::teardown::StopAttempt::Unconfirmed
                 }
             },
-            || std::thread::sleep(super::teardown::STOP_PAUSE),
-            super::teardown::STOP_ATTEMPTS,
+            &budget,
         );
         if matches!(report, super::teardown::StopAttempt::Retryable) {
             tracing::warn!(
@@ -211,6 +225,24 @@ impl PulseSidecar {
                 "audio cleanup could not start; the runtime client stayed busy"
             );
         }
+    }
+}
+
+impl super::teardown::Sidecar for PulseSidecar {
+    fn server_uri(&self) -> String {
+        PulseSidecar::server_uri(self)
+    }
+
+    fn socket_dir(&self) -> PathBuf {
+        PulseSidecar::socket_dir(self).to_path_buf()
+    }
+
+    fn adopt_budget(&mut self, budget: super::teardown::RetryBudget) {
+        PulseSidecar::adopt_budget(self, budget)
+    }
+
+    fn stop(&mut self) {
+        PulseSidecar::stop(self)
     }
 }
 
@@ -482,6 +514,12 @@ fn card_spec_from_device(device: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::teardown::RetryBudget;
+    use crate::runtime::{RuntimeClient, RuntimeConfig};
+    use sha2::{Digest, Sha256};
+    use std::os::unix::net::UnixListener;
+    use std::time::Duration;
+
     #[test]
     fn socket_readiness_is_bounded_when_the_listener_backlog_is_full() {
         use std::os::fd::AsRawFd;
@@ -555,6 +593,117 @@ mod tests {
         assert!(pulse_socket_dir(rt, a)
             .to_string_lossy()
             .contains(&format!("pulse-{a}")));
+    }
+
+    /// A runtime client bounded to ONE in-flight call, talking to a socket that
+    /// accepts and never answers, with a journal root of our own. No Docker, no
+    /// process env: the two things the release path needs to be driven through
+    /// are a refused admission and a journal that already says `Completed`.
+    struct Bench {
+        _dir: tempfile::TempDir,
+        _listener: UnixListener,
+        client: RuntimeClient,
+        state: std::path::PathBuf,
+    }
+
+    impl Bench {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("engine.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let state = dir.path().join("state");
+            std::fs::create_dir_all(&state).unwrap();
+            let mut config = RuntimeConfig::unix(&socket);
+            config.deadline = Duration::from_secs(2);
+            config.max_in_flight = 1;
+            config.image_state_path = Some(state.clone());
+            let client = RuntimeClient::new(config).unwrap();
+            Bench {
+                _dir: dir,
+                _listener: listener,
+                client,
+                state,
+            }
+        }
+
+        /// A helper journal whose audio operation is already proven terminal, so
+        /// `abandon_audio_sidecar` answers `Ok` without opening Docker.
+        fn completed_audio_journal(&self, operation: &str) {
+            let key = Sha256::digest(operation.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let helpers = self.state.join("helpers");
+            std::fs::create_dir_all(&helpers).unwrap();
+            let intent = serde_json::json!({
+                "operation": operation,
+                "name": pulse_container_name("wiring"),
+                "image": "quasar-node-agent:test",
+                "owner": "wiring-owner",
+                "socket": "/run/quasar-agent/engine.sock",
+                "id": null,
+                "profile": "Audio",
+                "phase": "Completed",
+            });
+            std::fs::write(helpers.join(key), serde_json::to_vec(&intent).unwrap()).unwrap();
+        }
+
+        fn sidecar(&self, operation: &str) -> PulseSidecar {
+            PulseSidecar {
+                socket_dir: self.state.join("pulse-wiring"),
+                runtime: self.client.clone(),
+                operation: operation.to_string(),
+                removed: false,
+                cleanup_attempted: false,
+                budget: RetryBudget::spent(),
+            }
+        }
+    }
+
+    // #314 as it actually happened: the idle reap raced a busy runtime client.
+    // The refused call wrote nothing, so it must leave the sidecar stoppable —
+    // the pre-fix code latched `cleanup_attempted` before ever calling, and
+    // routine audio recovery will not remove a sidecar whose journal still says
+    // `Running`, so `quasar-pulse-<sid>` survived until the agent restarted.
+    #[test]
+    fn a_busy_client_does_not_latch_the_sidecar_and_a_later_stop_removes_it() {
+        let bench = Bench::new();
+        let operation = "audio-wiring-busy-then-confirmed";
+        bench.completed_audio_journal(operation);
+        let mut sidecar = bench.sidecar(operation);
+
+        // `submit_owned` takes the admission permit on the CALLING thread, so the
+        // slot is held the moment this returns — no sleep, no race.
+        let hold = bench.client.discover();
+        sidecar.stop();
+        assert!(
+            !sidecar.cleanup_attempted,
+            "a refused call left no durable intent, so it must not disarm the retry"
+        );
+        assert!(!sidecar.removed, "and it certainly did not remove anything");
+
+        hold.cancel();
+        let _ = hold.wait();
+        // The real budget: cancellation releases admission a moment after the
+        // caller's wait returns, and the retry loop is what rides that out.
+        sidecar.adopt_budget(RetryBudget::new(Duration::from_secs(5)));
+        sidecar.stop();
+        assert!(sidecar.removed, "the sidecar container is released");
+        assert!(sidecar.cleanup_attempted);
+    }
+
+    #[test]
+    fn an_unconfirmed_pulse_stop_latches_so_the_way_down_does_not_repeat_it() {
+        // No journal for this operation: the acquire fails before Docker is
+        // opened, which is an unconfirmed stop, which DID record durable intent.
+        let bench = Bench::new();
+        let mut sidecar = bench.sidecar("audio-wiring-unconfirmed");
+        sidecar.stop();
+        assert!(!sidecar.removed);
+        assert!(
+            sidecar.cleanup_attempted,
+            "an unconfirmed stop must not be spun on the way down"
+        );
     }
 
     // The daemon's runtime path must be a PRIVATE subdir (PulseAudio force-chmods it

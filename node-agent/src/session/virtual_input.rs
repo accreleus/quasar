@@ -1048,6 +1048,16 @@ impl VirtualDevices {
     }
 }
 
+impl super::teardown::UdevExport for VirtualDevices {
+    fn retire(&self) {
+        self.retire_udev_export();
+    }
+
+    fn abandon(&self) {
+        self.abandon_udev_export();
+    }
+}
+
 impl Drop for VirtualDevices {
     fn drop(&mut self) {
         // Stop the flush thread so it doesn't outlive the devices; it drains any

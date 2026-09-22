@@ -222,6 +222,13 @@ own; the two do not move together, and that is deliberate.
   sibling EGL self-test now runs through this profile with an identical container
   configuration. There are no probe callers yet (#259).
 
+### Known limitations
+- Vulkan H.264 and HEVC encode produces a corrupt picture on an AMD Granite Ridge iGPU
+  (RADV, Mesa 25.3.6), while `vah264enc` on the same host is clean (#272). Vulkan remains
+  the AMD auto-detected default; the fix is #281, where the compositor picks the linear
+  encode-src path itself. Set `QUASAR_ENCODER=va` (or the equivalent admin per-host
+  override) on an affected host until #281 lands.
+
 ### Fixed
 - **A busy container runtime no longer fails `host_container_mounts` (#315).** Under load the
   runtime client can be busy or time out for one refresh. That used to report the mount
@@ -234,20 +241,16 @@ own; the two do not move together, and that is deliberate.
   runtime client never asked the engine, but the session treated that as an unconfirmed
   stop: the sidecar latched itself in `Running` (recovery will not remove a live sidecar),
   and the udev export was abandoned even after a later stop proved the app container gone.
-  Session end retries a busy or cancelled client, releases the sidecar and `udev-<sid>`
+  Session end retries a refused stop, releases the sidecar and `udev-<sid>`
   (directory, then owner marker) before the source pipeline is set to NULL, and leaves
   the export for the boot sweep only when removal was not proven. An intentional stop, a
   peer disconnect, an app exit, an encode failure, and a live agent's grace-window stop
-  use that same decision.
-
-### Known limitations
-- Vulkan H.264 and HEVC encode produces a corrupt picture on an AMD Granite Ridge iGPU
-  (RADV, Mesa 25.3.6), while `vah264enc` on the same host is clean (#272). Vulkan remains
-  the AMD auto-detected default; the fix is #281, where the compositor picks the linear
-  encode-src path itself. Set `QUASAR_ENCODER=va` (or the equivalent admin per-host
-  override) on an affected host until #281 lands.
-
-### Fixed
+  use that same decision. The retry is bounded by wall clock, not by an attempt count —
+  one 12-second allowance shared by every release call in a session end, because a
+  refusal from `cleanup` (as opposed to one from admission) costs a whole `docker stop`
+  timeout per attempt. The last stop a session makes on its way down is now observed
+  instead of being left to the container handle's blind `Drop`, so a stop that finally
+  proves the container gone retires the export rather than abandoning it.
 - The node-agent unit suite no longer fails intermittently on `assign_refusal_emits_the_codec_not_in_gpu_set_token` (#313). The test captured `tracing` events, whose process-global callsite interest cache raced sibling tests under the parallel runner. The assign-time codec refusal is now a pure decision the tests assert on directly, and the refusal's `assign-codec-not-in-gpu-set` token is checked at its one log site. Tests only; no behaviour change.
 - The fleet Hosts table's GPU column no longer names a mixed-GPU host by its first GPU's model times the total GPU count (#310). A host with, say, an RTX 5090 and an AMD iGPU read "GeForce RTX 5090 ×2"; it now groups GPUs by vendor+model and shows each distinct model, with `×N` only within a group that actually has N of that model (e.g. "GeForce RTX 5090 ×2 + Radeon Graphics").
 - On a host whose GPUs differ, a session resolves its codec against the GPU it was placed on, so a session placed on a GPU without AV1 gets HEVC or H.264 instead of failing (#303). The "rung resolved" log line shows `gpu_codecs` beside `host_codecs`; a failed read of the GPU's set falls back to H.264.
