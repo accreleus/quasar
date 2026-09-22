@@ -351,8 +351,8 @@ sessions are built.
 The **host codec set** (`capacity.codecs`, `hosts.codecs`) is the union of every *usable*
 GPU's set (one with `encode_slots_total > 0` — a render-node pin zeroes every other GPU,
 dropping it from the union), and is never empty: H.264 with no usable GPU or no
-registry. Not yet its own wire field: `capacity.gpus[].codecs` is future work, so today
-only the host union is reported. _Avoid_: "host codec set" for a single GPU's set, or
+registry. Each GPU's set is reported as `capacity.gpus[].codecs` and stored as `gpus.codecs`;
+a GPU with none stored (an older agent) inherits its host's set. _Avoid_: "host codec set" for a single GPU's set, or
 vice versa.
 
 **Evidence** — a host fact that came from exercising the real path, or a
