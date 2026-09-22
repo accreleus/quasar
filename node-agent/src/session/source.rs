@@ -54,6 +54,7 @@ use super::host::wayland_display_from_message;
 use super::input::InputState;
 use super::metrics::SessionMetrics;
 use super::pipeline;
+use super::teardown::{self, StopAttempt, UdevAction};
 use super::virtual_input::VirtualDevices;
 use super::SessionConfig;
 use crate::messages::AppExitPolicy;
@@ -88,10 +89,89 @@ fn retry_application_observation(_kind: crate::runtime::ErrorKind) -> bool {
     true
 }
 
+/// App container, pulse sidecar and udev export, shared by every [`AppSource`]
+/// generation so session end has one release path. The runner calls
+/// [`AppSource::teardown`] on every terminal exit; that calls [`SharedSessionRuntime::apply`]
+/// before the source pipeline is set to NULL.
+struct SharedSessionRuntime {
+    session_id: String,
+    udev_blocked: AtomicBool,
+    /// Set when an app container is launched; cleared only when its stop is confirmed.
+    mount_live: AtomicBool,
+    /// The last container-stop outcome. `None` until a generation records one.
+    last_stop: Mutex<Option<StopAttempt>>,
+    pulse: Mutex<Option<PulseSidecar>>,
+    devices: Option<Arc<VirtualDevices>>,
+}
+
+impl SharedSessionRuntime {
+    /// Record a container-stop outcome without touching the sidecar or the
+    /// udev export. A swap drops the outgoing [`AppSource`] while the session,
+    /// and the replacement generation, are still using both.
+    fn note_container_stop(&self, report: StopAttempt) {
+        let already_blocked = self.udev_blocked.load(Ordering::Relaxed);
+        self.udev_blocked.store(
+            teardown::blocked_after(report, already_blocked),
+            Ordering::Relaxed,
+        );
+        if matches!(report, StopAttempt::Confirmed) {
+            self.mount_live.store(false, Ordering::Relaxed);
+        }
+        *self
+            .last_stop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(report);
+    }
+
+    fn apply(&self, report: StopAttempt, final_chance: bool) {
+        let already_blocked = self.udev_blocked.load(Ordering::Relaxed);
+        let mount_live = self.mount_live.load(Ordering::Relaxed);
+        self.note_container_stop(report);
+        let action = teardown::action_this_chance(
+            teardown::udev_action(report, already_blocked, mount_live),
+            final_chance,
+            mount_live,
+        );
+        if matches!(action, UdevAction::Abandon) {
+            tracing::warn!(
+                token = "udev-export-retire-skipped",
+                session = %self.session_id,
+                "an app container stop was not proven — leaving the udev export \
+                 dir for the boot sweep"
+            );
+        }
+        teardown::on_udev(
+            action,
+            || {
+                if let Some(devices) = &self.devices {
+                    devices.retire_udev_export();
+                }
+            },
+            || {
+                if let Some(devices) = &self.devices {
+                    devices.abandon_udev_export();
+                }
+            },
+        );
+        // Leave the sidecar in place when a busy client could not start the stop:
+        // the next release, and the sidecar's own Drop, try again. Taking it out
+        // here would spend the only remaining attempt inside this call.
+        let mut guard = self
+            .pulse
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pulse) = guard.as_mut() {
+            pulse.stop();
+        }
+    }
+}
+
 /// Session-level resources shared across app swaps: the virtual input devices and the
 /// PulseAudio sidecar. Each [`AppSource`] borrows the device node paths and the pulse
 /// socket (mounted into its container; the encode pipeline's `pulsesrc` captures from the
-/// same sidecar). Dropping releases the sidecar.
+/// same sidecar). Session end releases the sidecar and the udev export through
+/// [`SharedSessionRuntime::apply`], not through a later `Drop` of this struct: pipeline
+/// teardown can block, and a busy runtime client must not latch the release off.
 pub struct SessionResources {
     /// Shared with the encode pipeline's DataChannel input sink.
     pub devices: Option<Arc<VirtualDevices>>,
@@ -100,16 +180,8 @@ pub struct SessionResources {
     /// the swap path can re-arm it per app process: the DataChannel persists across a
     /// swap, this state must not.
     pub input_state: Arc<InputState>,
-    pulse: Option<PulseSidecar>,
-    session_id: String,
+    shared: Arc<SharedSessionRuntime>,
     runtime_dir: String,
-    /// Set by an [`AppSource`] (any generation, via its clone of this `Arc`) when an app
-    /// container's stop could not be confirmed. `SessionResources::drop` reads it to
-    /// decide whether the udev export is safe to retire: with a stop unconfirmed,
-    /// the bind mount's fate is uncertain, so the dir+marker are left for the boot sweep
-    /// rather than optimistically removed. Sticky for the session's lifetime — once true,
-    /// stays true, the conservative choice.
-    udev_retire_blocked: Arc<AtomicBool>,
     /// Set when the sidecar was WANTED but unusable, so the session is about to stream
     /// silence. `None` on the healthy path and under test audio — a caller must be able
     /// to tell "nobody asked for a sidecar" from "it broke". Surfaced on
@@ -174,6 +246,14 @@ impl SessionResources {
             );
         }
         let pulse_server = pulse.as_ref().map(|p| p.server_uri());
+        let shared = Arc::new(SharedSessionRuntime {
+            session_id: session_id.to_string(),
+            udev_blocked: AtomicBool::new(false),
+            mount_live: AtomicBool::new(false),
+            last_stop: Mutex::new(None),
+            pulse: Mutex::new(pulse),
+            devices: devices.clone(),
+        });
         // Pre-create any bind-mount host paths under QUASAR_HOME_ROOT so Docker does not
         // create them root:root 755. No-op when unset or no mount matches; never fails
         // the session.
@@ -200,10 +280,8 @@ impl SessionResources {
             SessionResources {
                 devices,
                 input_state: Arc::new(InputState::new()),
-                pulse,
-                session_id: session_id.to_string(),
+                shared,
                 runtime_dir: cfg.runtime_dir.clone(),
-                udev_retire_blocked: Arc::new(AtomicBool::new(false)),
                 audio_degraded,
             },
             pulse_server,
@@ -231,38 +309,34 @@ impl SessionResources {
     /// `(pulse_server_uri, socket_dir)` to inject into an app container, or `None`
     /// when no sidecar is running.
     fn pulse_mount(&self) -> Option<(String, String)> {
-        self.pulse.as_ref().map(|p| {
-            (
-                p.server_uri(),
-                p.socket_dir().to_string_lossy().into_owned(),
-            )
-        })
+        self.shared
+            .pulse
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|p| {
+                (
+                    p.server_uri(),
+                    p.socket_dir().to_string_lossy().into_owned(),
+                )
+            })
     }
 }
 
 impl Drop for SessionResources {
-    /// Retire the udev export deterministically at the moment this session-scoped
-    /// value goes out of scope — NOT when the last `Arc<VirtualDevices>` clone does
-    /// (that clone also lives in GStreamer signal closures, whose drop timing this
-    /// struct does not control). Skipped when any generation's app-container stop
-    /// went unconfirmed (`udev_retire_blocked`): the dir+marker then stay for the
-    /// boot sweep rather than being removed while a container's fate is uncertain.
+    /// Final chance. [`AppSource::teardown`] already applied a non-final release
+    /// on the normal paths; this catches an early return that never built a
+    /// source, and abandons an export whose container was never proved gone.
+    /// The recorded stop is kept as-is: a busy client is not rewritten into an
+    /// unconfirmed stop.
     fn drop(&mut self) {
-        if self.udev_retire_blocked.load(Ordering::Relaxed) {
-            tracing::warn!(
-                token = "udev-export-retire-skipped",
-                session = %self.session_id,
-                "an app container stop went unconfirmed this session — leaving the udev \
-                 export dir for the boot sweep"
-            );
-            if let Some(d) = self.devices.as_ref() {
-                d.abandon_udev_export();
-            }
-            return;
-        }
-        if let Some(d) = self.devices.as_ref() {
-            d.retire_udev_export();
-        }
+        let report = self
+            .shared
+            .last_stop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or(StopAttempt::Absent);
+        self.shared.apply(report, true);
     }
 }
 
@@ -428,10 +502,14 @@ pub struct AppSource {
     ///
     /// `None` when nothing has launched yet, or the compositor build lacks the counter.
     app_commits_at_launch: Option<u64>,
-    /// Shared with [`SessionResources`] (same `Arc`, cloned at construction): set when
-    /// this generation's app-container stop could not be confirmed, so the session-level
-    /// udev export is not retired out from under a container whose fate is uncertain.
-    udev_retire_blocked: Arc<AtomicBool>,
+    /// Shared with [`SessionResources`]. Session end releases the sidecar and the
+    /// udev export from here, before this pipeline is set to NULL.
+    shared: Arc<SharedSessionRuntime>,
+    /// Set once this generation has asked the runtime to stop its container.
+    /// A later drop must not spend another app-stop timeout on an unconfirmed
+    /// result. A busy result is not cached: the client never accepted the call,
+    /// so the next release may try again.
+    ended: Option<StopAttempt>,
 }
 
 impl AppSource {
@@ -495,7 +573,8 @@ impl AppSource {
             launch_error: None,
             observation: GenerationObservation::new(),
             app_commits_at_launch: None,
-            udev_retire_blocked: res.udev_retire_blocked.clone(),
+            shared: res.shared.clone(),
+            ended: None,
         })
     }
 
@@ -877,18 +956,25 @@ impl AppSource {
     /// thread's observation of this exit is discarded (the shared `removed` flag is set
     /// first), so it is never misreported as an app-liveness failure.
     pub fn stop_app_container(&mut self) -> Result<bool, String> {
-        match self.container.as_mut() {
-            Some(c) => {
-                if let Err(error) = c.stop() {
-                    // Unconfirmed: this generation's bind mount may still be live.
-                    // Block the session-level udev retire until the boot sweep.
-                    self.udev_retire_blocked.store(true, Ordering::Relaxed);
-                    return Err(error.to_string());
-                }
+        if self.container.is_none() {
+            return Ok(false);
+        }
+        let stopped = self.container.as_mut().unwrap().stop();
+        match stopped {
+            Err(error) => {
+                // A busy client never asked the engine, so it must not disarm
+                // the export. An unconfirmed stop might still have a live bind.
+                // This is a swap's outgoing generation: record the outcome and
+                // leave the sidecar alone.
+                let report = teardown::classify_stop(teardown::error_kind(&error));
+                self.shared.note_container_stop(report);
+                Err(error.to_string())
+            }
+            Ok(()) => {
                 self.container.take();
+                self.shared.note_container_stop(StopAttempt::Confirmed);
                 Ok(true)
             }
-            None => Ok(false),
         }
     }
 
@@ -990,6 +1076,7 @@ impl AppSource {
                 let observer = self.observation.observer(c.removed_flag());
                 self.spawn_exit_waiter(c.application_id(), observer);
                 self.container = Some(c);
+                self.shared.mount_live.store(true, Ordering::Relaxed);
             }
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -1048,23 +1135,64 @@ impl AppSource {
         }
     }
 
-    /// Tear down (idempotent): remove the app container, then NULL the pipeline.
-    /// `Drop` is the backstop.
+    /// Tear down (idempotent): stop the app container, release the pulse sidecar
+    /// and the udev export, then NULL the pipeline. The release happens before
+    /// the state change so a pipeline NULL that blocks — the idle-reap case,
+    /// where the encode consumer is still PLAYING — cannot skip it.
+    ///
+    /// This is the session-end path. [`Drop`] stops this generation's container
+    /// only: a swap drops the outgoing source while the replacement still needs
+    /// the sidecar and the udev export.
     pub fn teardown(&mut self) {
-        if let Some(c) = self.container.as_mut() {
-            if let Err(error) = c.stop() {
-                tracing::warn!(
-                    token = "application-teardown-pending",
-                    "runtime application teardown remains durable: {error}"
-                );
-                // Unconfirmed: block the session-level udev retire until the
-                // boot sweep — see `SessionResources::drop`.
-                self.udev_retire_blocked.store(true, Ordering::Relaxed);
-            } else {
-                self.container.take();
+        let report = self.finish_app_stop();
+        self.shared.apply(report, false);
+        let _ = self.pipeline.set_state(gst::State::Null);
+    }
+
+    /// One engine attempt per unconfirmed outcome. Busy is retried here and
+    /// again from [`Drop`] if this call exhausted its budget, because that
+    /// failure never reached the engine.
+    fn finish_app_stop(&mut self) -> StopAttempt {
+        if let Some(report) = self.ended {
+            if !matches!(report, StopAttempt::Retryable) {
+                return report;
             }
         }
-        let _ = self.pipeline.set_state(gst::State::Null);
+        let report = self.stop_app_for_session_end();
+        self.ended = Some(report);
+        report
+    }
+
+    fn stop_app_for_session_end(&mut self) -> StopAttempt {
+        teardown::retry_retryable(
+            || self.stop_app_once(),
+            || std::thread::sleep(teardown::STOP_PAUSE),
+            teardown::STOP_ATTEMPTS,
+        )
+    }
+
+    fn stop_app_once(&mut self) -> StopAttempt {
+        if self.container.is_none() {
+            return StopAttempt::Absent;
+        }
+        let stopped = self.container.as_mut().unwrap().stop();
+        match stopped {
+            Ok(()) => {
+                self.container.take();
+                self.shared.mount_live.store(false, Ordering::Relaxed);
+                StopAttempt::Confirmed
+            }
+            Err(error) => {
+                let report = teardown::classify_stop(teardown::error_kind(&error));
+                if !matches!(report, StopAttempt::Retryable) {
+                    tracing::warn!(
+                        token = "application-teardown-pending",
+                        "runtime application teardown remains durable: {error}"
+                    );
+                }
+                report
+            }
+        }
     }
 }
 
@@ -1147,7 +1275,20 @@ fn observe_until_exit(
 
 impl Drop for AppSource {
     fn drop(&mut self) {
-        self.teardown();
+        let report = self.finish_app_stop();
+        // SessionResources plus this source is 2. A swap holds the outgoing and
+        // incoming generations at once; releasing the sidecar or the udev
+        // export from that drop would strand the replacement. `strong_count`
+        // is exact here: every clone is taken on this thread.
+        if Arc::strong_count(&self.shared) > 2 {
+            self.shared.note_container_stop(report);
+        } else {
+            // Before NULL. A source NULL can block while an interpipe listener
+            // is still PLAYING, and that must not skip the release. Covers
+            // terminal returns that never reached `teardown`.
+            self.shared.apply(report, false);
+        }
+        let _ = self.pipeline.set_state(gst::State::Null);
     }
 }
 

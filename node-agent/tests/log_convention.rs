@@ -34,6 +34,9 @@ const SHARED_TOKENS: &[&str] = &[
     // container's teardown could not be proven after the exact operation was retried.
     "template-warmup-teardown-unproven",
     "udev-export-failed",
+    // Same condition on the production session and the demo host: the app
+    // container stop was not proven, so the udev export stays for the boot sweep.
+    "udev-export-retire-skipped",
     // Same condition, two causes (a foreign marker vs. one that fails to parse):
     // both mean "cannot prove this export is ours", so the publish is skipped.
     "udev-export-unattributable",

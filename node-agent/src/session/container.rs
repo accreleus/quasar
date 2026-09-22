@@ -2139,13 +2139,13 @@ impl RunningContainer {
             .and_then(|v| v.parse().ok())
             .unwrap_or(10);
         self.stop_with(|application| {
-            let api = crate::runtime::configured().map_err(|error| anyhow!(error))?;
+            let api = crate::runtime::configured().map_err(anyhow::Error::from)?;
             api.stop_application(application.clone(), Duration::from_secs(seconds))
                 .wait()
-                .map_err(|error| anyhow!(error))?;
+                .map_err(anyhow::Error::from)?;
             api.cleanup_application(application.clone())
                 .wait()
-                .map_err(|error| anyhow!(error))
+                .map_err(anyhow::Error::from)
         })
     }
 
