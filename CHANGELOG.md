@@ -113,6 +113,12 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **The profile menu offers only codecs a candidate GPU can encode (#306).** `GET
+  /v1/me/profiles`'s `host_encoder_not_supported` verdict now unions GPU codec sets — the
+  existing launch candidacy without the free-slot term (a busy GPU still counts), with the
+  derived-tile host pin, the image gate and, new, the readiness gate — instead of host codec
+  sets, so a codec only a readiness-blocked GPU offers is not offered. The reason vocabulary
+  is unchanged and a non-admin still sees only the reason, never a host or GPU.
 - **The host advertises only codecs some usable GPU has proven (#301).** The agent derives
   a codec set per GPU — the encoder-candidate plan resolved on that GPU's own render node,
   minus any driver-compatibility exclusion (for AV1 still host-wide, as sessions are

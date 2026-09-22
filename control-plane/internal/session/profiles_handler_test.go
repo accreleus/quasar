@@ -496,10 +496,15 @@ func TestProfilesEndpointUsesReportedHostCodecs(t *testing.T) {
 	if r := rungByID(body, "1440p60-av1"); r == nil || r.Eligibility != "eligible" {
 		t.Fatalf("AV1 did not return after host re-report: %+v", r)
 	}
+	// #306 amendment 12: the union now reads GPU codec sets (fallbackH264=true),
+	// which floor at h264 rather than going advisory-unknown when nothing has
+	// ever reported (control-api.md "a host reporting nothing is h264-only") —
+	// unlike the old host-level union, which read the raw column and treated a
+	// NULL report as "unknown, allow everything".
 	_, err = pool.Exec(ctx, `UPDATE hosts SET codecs = NULL WHERE id = $1`, s.hostID)
 	must(t, err)
 	_, body = getProfiles(t, url, tok)
-	if r := rungByID(body, "1440p60-av1"); r == nil || r.Eligibility != "eligible" {
-		t.Fatalf("legacy unreported capability should remain advisory: %+v", r)
+	if r := rungByID(body, "1440p60-av1"); r == nil || r.Eligibility != "ineligible" || !hasReasonCode(r.Reasons, "host_encoder_not_supported") {
+		t.Fatalf("never-reported capability now floors at h264: %+v", r)
 	}
 }
