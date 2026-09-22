@@ -1324,6 +1324,7 @@ impl ContainerRuntime {
             application,
             removed: Arc::new(AtomicBool::new(false)),
             cleanup_proven: false,
+            drop_disarmed: false,
             writable_sources: writable_application_sources(&request),
         })
     }
@@ -2123,6 +2124,10 @@ pub struct RunningContainer {
     /// misclassified as an app failure (spec §3 G5 swap safety).
     removed: Arc<AtomicBool>,
     cleanup_proven: bool,
+    /// Set by [`RunningContainer::disarm_drop`] once an owner has made an
+    /// OBSERVED stop attempt and recorded its outcome. `Drop`'s blind attempt
+    /// then has nothing to add — see that method.
+    drop_disarmed: bool,
     /// Normalized writable sources retained so an uncertain stop survives this
     /// handle being dropped and blocks a later generation's shared-home launch.
     writable_sources: BTreeSet<String>,
@@ -2194,10 +2199,29 @@ impl RunningContainer {
     pub fn removed_flag(&self) -> Arc<AtomicBool> {
         self.removed.clone()
     }
+
+    /// Give up this handle's blind `Drop` stop.
+    ///
+    /// `Drop` exists so an early return or a panic cannot leak a container. It
+    /// is the right backstop for a handle nobody ever tried to stop, and the
+    /// wrong one afterwards: it spends another `stop` timeout plus a cleanup
+    /// and then DISCARDS the answer, so a session that already recorded an
+    /// unconfirmed stop keeps that record even when this second attempt proved
+    /// removal (#314 — the export was then abandoned under a container that was
+    /// genuinely gone). A session-end owner calls this after making that attempt
+    /// itself and routing the outcome through its release. What remains
+    /// unproven is a durable obligation, and `recover_application_cleanup`
+    /// owns it.
+    pub fn disarm_drop(&mut self) {
+        self.drop_disarmed = true;
+    }
 }
 
 impl Drop for RunningContainer {
     fn drop(&mut self) {
+        if self.drop_disarmed {
+            return;
+        }
         if let Err(error) = self.stop() {
             tracing::warn!(
                 token = "application-drop-cleanup-pending",
@@ -3107,6 +3131,7 @@ mod tests {
             },
             removed: Arc::new(AtomicBool::new(false)),
             cleanup_proven: false,
+            drop_disarmed: false,
             writable_sources: BTreeSet::from(["/managed/home-stop".into()]),
         };
         clear_pending_application("quasar-sess-stop-retry", "operation-stop-retry");

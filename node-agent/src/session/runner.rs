@@ -3530,6 +3530,12 @@ fn perform_swap(
     // ── Step 2: stop the outgoing app and WAIT for it to exit ────────────────
     // Past this line a failure costs the previous app's process state, so everything
     // cheaply validatable must already have been validated above.
+    //
+    // `stop_app_container` rides out a runtime client that refuses the call on its
+    // own retry budget (`session::teardown`), so a transient busy client does not
+    // end a live session here. What stays fatal is a stop that was ASKED and not
+    // proven, and a refusal that outlives the budget: either way the outgoing app
+    // may still hold its managed home, and the replacement must not write into it.
     let stopped_previous_app =
         current_source
             .stop_app_container()
