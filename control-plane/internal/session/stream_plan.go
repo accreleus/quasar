@@ -5,7 +5,7 @@
 //	                 evaluated against the chain's TOP rung so admission sees the
 //	                 worst case (launcher.go).
 //	  ── ScheduleAndCreate ── the host and GPU are unknown until this returns ──
-//	post-placement : chain + host caps + probe + failure history + certs →
+//	post-placement : chain + GPU codecs + host caps + probe + failure history + certs →
 //	                 the rung the session actually starts at. This file.
 //
 // The second decision's facts are gathered once into StreamInputs; planStream
@@ -26,7 +26,7 @@ import (
 
 // StreamInputs is every fact the post-placement decision reads, gathered once.
 // Every zero value means "degrade, do not fail" — a nil Probe hard-gates
-// HEVC/AV1 off, an empty HostCodecs is an h264-only host, an unset
+// HEVC/AV1 off, an empty GPUCodecs is an h264-only GPU, an unset
 // HostEncoder.Known skips clamp 5, a nil PixelRates clamp 6, a nil FailedRungs
 // clamp 4, an empty LowerChain stops the cap hopping. A launch is never refused
 // for an input that failed to load.
@@ -56,7 +56,10 @@ type StreamInputs struct {
 	LowerChainID  string
 	LowerChainErr error
 
-	// Placed-host encoder capability.
+	// GPUCodecs is the placed GPU's codec set (Store.GPUCodecs), which clamp 1
+	// reads (control-api.md "Rung resolution", amendment 12). HostCodecs is the
+	// host's union, logged beside it and never decided on.
+	GPUCodecs   []string
 	HostCodecs  []string
 	HostEncoder hostEncoderCaps
 
@@ -164,7 +167,7 @@ type StreamPlan struct {
 // resolution: turning a downgrade into a dead session is worse.
 func planStream(in StreamInputs) (StreamPlan, error) {
 	rung, decision, err := resolveRung(
-		in.Chain.Rungs, in.HostCodecs, in.HostEncoder, in.Probe, in.FailedRungs, in.Override,
+		in.Chain.Rungs, in.GPUCodecs, in.HostEncoder, in.Probe, in.FailedRungs, in.Override,
 	)
 	plan := StreamPlan{Walks: []rungWalk{{
 		ChainID: in.Chain.ID, Decision: decision, Failed: in.FailedRungs, Err: err,
@@ -254,7 +257,7 @@ func (in StreamInputs) applyCertCap(
 	}
 
 	lowerRung, lowerDecision, err := resolveRung(
-		in.LowerChain.Rungs, in.HostCodecs, in.HostEncoder, in.Probe, in.LowerFailed, in.Override,
+		in.LowerChain.Rungs, in.GPUCodecs, in.HostEncoder, in.Probe, in.LowerFailed, in.Override,
 	)
 	plan.Walks = append(plan.Walks, rungWalk{
 		ChainID: in.LowerChain.ID, Decision: lowerDecision, Failed: in.LowerFailed, Err: err,

@@ -140,11 +140,12 @@ type hostEncoderCaps struct {
 // first that survives every clamp.
 //
 //	clamp 0 : stream.codec override — takes the FIRST rung with that codec; none
-//	          ⇒ ErrRungCodecNotAvailable (400); host cannot encode it ⇒
+//	          ⇒ ErrRungCodecNotAvailable (400); the placed GPU cannot encode it ⇒
 //	          ErrCodecUnsupportedByHost (409, never overridable). It bypasses
 //	          clamps 2/3, 4, 5 and 6, honouring only clamp 1 — that is the forced
 //	          re-test path for a previously-failed codec on a since-fixed encoder.
-//	clamp 1 : host encoder set (an agent reporting nothing is h264-only).
+//	clamp 1 : the placed GPU's codec set (Store.GPUCodecs; h264-only when nothing is
+//	          reported). Its reason string stays host_encoder.
 //	clamp 2/3: client decode probe — h265/av1 need an explicit true (stale or
 //	          absent probe means no); also rejects a rung whose MinDecodeHeight
 //	          exceeds the probe's measured decode height, since a chain may hold
@@ -175,7 +176,7 @@ type hostEncoderCaps struct {
 // rather than bypassing it.
 func resolveRung(
 	rungs []profile.Profile,
-	hostCodecs []string,
+	gpuCodecs []string,
 	host hostEncoderCaps,
 	dp *DeviceProbe,
 	failedRungs map[string]bool,
@@ -185,7 +186,7 @@ func resolveRung(
 		return profile.Profile{}, rungDecision{}, ErrLaunchProfileEmpty
 	}
 	override := ov.codecOverride()
-	hostSet := codecSet(hostCodecs)
+	gpuSet := codecSet(gpuCodecs)
 	dec := rungDecision{Override: override, Considered: make([]rungVerdict, 0, len(rungs))}
 
 	// --- clamp 0: explicit admin/diagnostic codec override -------------------
@@ -195,7 +196,7 @@ func resolveRung(
 			if !ok || wire != override {
 				continue
 			}
-			if !hostSet[wire] {
+			if !gpuSet[wire] {
 				dec.Considered = append(dec.Considered, rungVerdict{ID: r.ID, Codec: wire, Reject: rejectHostEncoder})
 				return profile.Profile{}, dec, ErrCodecUnsupportedByHost
 			}
@@ -216,7 +217,7 @@ func resolveRung(
 		}
 		v := rungVerdict{ID: r.ID, Codec: wire}
 		switch {
-		case !hostSet[wire]:
+		case !gpuSet[wire]:
 			v.Reject = rejectHostEncoder
 		case !deviceAccepts(wire, dp):
 			v.Reject = rejectClientDecode

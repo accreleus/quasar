@@ -11,6 +11,49 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// TestAutoLaunchOnNarrowerGPUResolvesHEVC (#303): a two-GPU host where only GPU 0
+// encodes AV1. GPU 0 has no free slot, so an Auto launch lands on GPU 1 and must
+// resolve its rung against GPU 1's set, not the host's union.
+func TestAutoLaunchOnNarrowerGPUResolvesHEVC(t *testing.T) {
+	pool := testDB(t)
+	userID, appID, hostID := seed1080pApp(t, pool)
+	store := NewStore(pool)
+	coord := newTestCoordinator(t, store, newFakeDispatcher(true), testLogger())
+	ctx := context.Background()
+
+	seedSecondGPU(t, pool, hostID, 16384, 4)
+	setHostCodecsRaw(t, pool, hostID, `["h264","h265","av1"]`)
+	setGPUCodecsRaw(t, pool, hostID, 0, `["h264","h265","av1"]`)
+	setGPUCodecsRaw(t, pool, hostID, 1, `["h264","h265"]`)
+	if _, err := pool.Exec(ctx, `UPDATE gpus SET encode_slots_total = 0 WHERE host_id::text = $1 AND index = 0`, hostID); err != nil {
+		t.Fatalf("fill gpu 0: %v", err)
+	}
+	enableChainCodecs(t, pool, "1080p60", "av1", "hevc", "h264")
+	upsertCodecProbe(t, pool, userID, true, true)
+
+	res, err := coord.LaunchByProfile(ctx, userID, LaunchParams{AppID: appID, ProfileID: "1080p60", IsAdmin: true})
+	if err != nil {
+		t.Fatalf("launch: %v", err)
+	}
+	if res.Session.GPUIndex == nil || *res.Session.GPUIndex != 1 {
+		t.Fatalf("placed gpu index = %v, want 1", res.Session.GPUIndex)
+	}
+	if res.Session.Codec != "h265" {
+		t.Errorf("session codec = %q, want h265 (GPU 1 has no av1)", res.Session.Codec)
+	}
+	got, err := store.Get(ctx, res.Session.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	gpu1, err := store.GPUCodecs(ctx, hostID, 1)
+	if err != nil {
+		t.Fatalf("GPUCodecs: %v", err)
+	}
+	if got.Codec != "h265" || !codecSet(gpu1)[got.Codec] {
+		t.Errorf("stored codec = %q, want h265 and in GPU 1's set %v", got.Codec, gpu1)
+	}
+}
+
 // seedSecondGPU adds a second GPU (index 1) on the same host as s, so a test
 // can exercise a GPU with its own codecs distinct from index 0 / the host.
 func seedSecondGPU(t *testing.T, pool *pgxpool.Pool, hostID string, vramMBTotal, encodeSlots int) (gpuID string) {
