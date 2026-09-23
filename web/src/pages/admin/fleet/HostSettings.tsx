@@ -26,6 +26,7 @@ import { RestartNote } from "./settings/RestartNote";
 import { SettingsRail } from "./settings/SettingsRail";
 import { useHostSettings } from "./settings/useHostSettings";
 import { IdleTimeoutPolicy } from "./settings/IdleTimeoutPolicy";
+import { IdleApplyPolicy } from "./settings/IdleApplyPolicy";
 import type { SettingValue } from "./settings/knobs";
 
 export function HostSettings() {
@@ -110,6 +111,7 @@ export function HostSettings() {
           <div className="split" style={{ marginTop: "var(--s4)", gridTemplateColumns: "minmax(0,1fr) 300px" }}>
             <div>
               <IdleTimeoutPolicy hostId={id} onAvailable={onTypedIdleAvailable} />
+              <IdleApplyPolicy hostId={id} />
               <KnobPanel title="Runtime defaults" hint="Changes affect new sessions after the host applies them.">
                 {s.grouped.runtime.filter((knob) => typedIdleAvailable === false || knob.key !== "idle_timeout_secs").map(renderKnob)}
               </KnobPanel>

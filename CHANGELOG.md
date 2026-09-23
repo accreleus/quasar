@@ -25,6 +25,8 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+
+- RH05 #338: reviewed idle-apply approvals now wait under an owner-scoped admission hold, expose current session and preparation blockers, and support safe cancellation; execution remains gated on the recovery executor.
 - **Owner-scoped host admission restrictions (#337).** Manual drains and platform
   applies now hold independent, durable scheduling restrictions. Session
   reservations serialize with new holds, and reconnect preserves them. An apply

@@ -355,7 +355,7 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 		}
 	}
 	for group, snapshot := range page.ActiveSnapshots {
-		if group != "idle_timeout_secs" {
+		if group != "idle_timeout_secs" && group != "hardware" {
 			c.policyInventoryUnknown = true
 			c.policyInventoryBlocked.Store(true)
 		}
@@ -388,6 +388,19 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 			return err
 		}
 		if !fresh {
+			continue
+		}
+		if entry.Scope == "restart" {
+			if entry.HostID != c.hostID {
+				c.policyInventoryUnknown = true
+				c.policyInventoryBlocked.Store(true)
+				continue
+			}
+			c.rh05RestartEntries = append(c.rh05RestartEntries, hostcfg.JournalInventoryEntry{
+				AttemptID: entry.AttemptID, HostID: entry.HostID, Group: entry.Group,
+				Digest: entry.ContentSHA256, Scope: entry.Scope, Phase: entry.Phase,
+				Sequence: entry.JournalSequence,
+			})
 			continue
 		}
 		if entry.HostID != c.hostID || entry.Group != "idle_timeout_secs" {
@@ -439,7 +452,16 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 			return err
 		}
 	}
+	c.rh05Snapshots = make(map[string]hostcfg.PolicySnapshot)
+	if snapshot, ok := page.ActiveSnapshots["hardware"]; ok {
+		c.rh05Snapshots["hardware"] = hostcfg.PolicySnapshot{Kind: snapshot.Kind, Digest: snapshot.Digest}
+	}
 	c.policyInventoryDone.Store(true)
+	if !c.policyInventoryBlocked.Load() {
+		if err := h.cfgStore.CompleteJournalReconciliation(ctx, c.hostID, c.connectionIncarnation, c.rh05RestartEntries, c.rh05Snapshots); err != nil {
+			return err
+		}
+	}
 	return h.maybeSendInitialPolicyMap(ctx, c)
 }
 
@@ -461,6 +483,8 @@ func (h *Handler) restartPolicyInventory(ctx context.Context, c *conn) error {
 	c.policyInventorySnapshotID = ""
 	c.policyInventoryCursor = nil
 	c.policyInventoryHeader = nil
+	c.rh05RestartEntries = nil
+	c.rh05Snapshots = nil
 	c.policyOutstanding = nil
 	c.policySequence = nil
 	c.policySequenceContent = nil
@@ -591,6 +615,9 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	h.registry.add(ac)
 	go ac.runWriter(h.log)
 	if policyTyped && h.cfgStore != nil {
+		if err := h.cfgStore.BeginJournalReconciliation(bg, hostID, ac.connectionIncarnation); err != nil {
+			return fmt.Errorf("begin RH05 journal reconciliation: %w", err)
+		}
 		if err := h.cfgStore.InvalidatePolicyEvidenceOnReconnect(bg, hostID); err != nil {
 			h.log.Warn("policy reconnect reconciliation failed", "host_id", hostID, "err", err)
 		}
@@ -604,6 +631,11 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 		h.registry.removeWithLifecycle(ac, func() {
 			ctx, cancel := context.WithTimeout(bg, agentDBCallTimeout)
 			defer cancel()
+			if ac.policyTyped && h.cfgStore != nil {
+				if err := h.cfgStore.EndJournalConnection(ctx, hostID, ac.connectionIncarnation); err != nil {
+					h.log.Warn("RH05 journal disconnect fence failed", "host_id", hostID, "err", err)
+				}
+			}
 			h.events.HostDisconnected(ctx, hostID)
 			// Bounds the rate-limiter map by the live connection set.
 			h.imageLimiter.evict(hostID)
@@ -716,6 +748,14 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 				h.log.Error("heartbeat update failed", "host_id", hostID, "err", err)
 			} else {
 				h.log.Debug("heartbeat", "host_id", hostID, "running_sessions", len(hb.RunningSessions))
+				if ac.policyTyped && h.cfgStore != nil {
+					idleCtx, idleCancel := context.WithTimeout(bg, agentDBCallTimeout)
+					idleErr := h.cfgStore.ObserveIdleHeartbeat(idleCtx, hostID, ac.connectionIncarnation, hb.RunningSessions)
+					idleCancel()
+					if err := idleErr; err != nil {
+						h.log.Warn("RH05 idle inventory heartbeat rejected", "host_id", hostID, "err", err)
+					}
+				}
 			}
 			// #128: the agent's own list is ground truth for this host. Same
 			// connection-lifetime ctx + deadline as the heartbeat write above, so
@@ -1228,6 +1268,9 @@ func (h *Handler) processCapacity(ctx context.Context, ac *conn, raw []byte) err
 				return err
 			} else if ok {
 				ac.policyInitialMapApplied.Store(true)
+				if err := h.cfgStore.CompleteJournalReconciliation(ctx, hostID, ac.connectionIncarnation, ac.rh05RestartEntries, ac.rh05Snapshots); err != nil {
+					return err
+				}
 				h.offerNextSessionPolicy(ctx, ac)
 			}
 		}
@@ -1261,8 +1304,22 @@ func (h *Handler) processCapacity(ctx context.Context, ac *conn, raw []byte) err
 	if err := h.store.upsertHostCodecPixelRates(ctx, hostID, cap.CodecThroughput); err != nil {
 		h.log.Warn("host codec throughput upsert failed", "host_id", hostID, "err", err)
 	}
-	if err := h.store.upsertHostReadiness(ctx, hostID, cap.Readiness); err != nil {
-		h.log.Warn("host readiness upsert failed", "host_id", hostID, "err", err)
+	readinessErr := h.store.upsertHostReadiness(ctx, hostID, cap.Readiness)
+	if readinessErr != nil {
+		h.log.Warn("host readiness upsert failed", "host_id", hostID, "err", readinessErr)
+	}
+	if ac.policyTyped && h.cfgStore != nil {
+		gpuRaw, err := json.Marshal(gpus)
+		if err != nil {
+			return err
+		}
+		readinessRaw := cap.Readiness
+		if readinessErr != nil {
+			readinessRaw = nil
+		}
+		if err := h.cfgStore.ObserveHardwareReport(ctx, hostID, ac.connectionIncarnation, gpuRaw, readinessRaw); err != nil {
+			return err
+		}
 	}
 	if h.consoleStore != nil && cap.ConsoleCapabilities != nil {
 		if err := h.consoleStore.UpsertCapabilities(ctx, hostID, *cap.ConsoleCapabilities); err != nil {

@@ -44,6 +44,7 @@ type PolicyGroup struct {
 	ObservedAt         *time.Time `json:"observed_at"`
 	Remedy             *string    `json:"remedy"`
 	ApprovalPreview    any        `json:"approval_preview"`
+	AttemptID          *string    `json:"attempt_id,omitempty"`
 	EvidenceConnection *string    `json:"-"`
 }
 
@@ -404,6 +405,29 @@ func (s *Store) GetPolicy(ctx context.Context, hostID string) (PolicyView, error
 		}
 		view.Resolved[knob.Key] = map[string]any{"value": value, "source": choice.Source, "observed_at": nil, "evidence_id": nil}
 	}
+	for key, group := range view.Groups {
+		if group.Scope != "restart" {
+			continue
+		}
+		preview, err := s.PreviewIdleApply(ctx, hostID, key)
+		if err != nil {
+			return view, err
+		}
+		if preview == nil && group.Status == "pending" {
+			remedy := "Idle approval awaits complete current host inventory, a resolved configuration candidate, and any open disruptive operation."
+			group.Remedy = &remedy
+		}
+		group.ApprovalPreview = preview
+		var attemptID string
+		err = s.pool.QueryRow(ctx, `SELECT id::text FROM host_config_approvals
+			WHERE host_id=$1::uuid AND group_key=$2 ORDER BY created_at DESC,id DESC LIMIT 1`, hostID, key).Scan(&attemptID)
+		if err == nil {
+			group.AttemptID = &attemptID
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return view, err
+		}
+		view.Groups[key] = group
+	}
 	return view, nil
 }
 
@@ -559,9 +583,49 @@ func (s *Store) savePolicy(ctx context.Context, hostID, expected string, changes
 		if _, err := tx.Exec(ctx, `INSERT INTO host_setting_groups(host_id,group_key,desired_revision,desired_digest,scope,status) VALUES($1::uuid,$2,$3,$4,$5,$6) ON CONFLICT(host_id,group_key) DO UPDATE SET desired_revision=excluded.desired_revision,desired_digest=excluded.desired_digest,scope=excluded.scope,status=excluded.status`, hostID, group, next, digest, scope, status); err != nil {
 			return empty, err
 		}
+		if scope == "restart" {
+			if _, err := tx.Exec(ctx, `INSERT INTO host_approval_review_tokens(host_id,group_key,review_id)
+				VALUES($1::uuid,$2,gen_random_uuid()) ON CONFLICT(host_id,group_key) DO NOTHING`, hostID, group); err != nil {
+				return empty, err
+			}
+			// A changed disruptive group invalidates only its own unstarted
+			// approval. An offered grant keeps protection until the agent's
+			// complete journal proves it never accepted the command.
+			var approvalID, approvalState string
+			approvalErr := tx.QueryRow(ctx, `SELECT id::text,state FROM host_config_approvals
+				WHERE host_id=$1::uuid AND group_key=$2 AND state IN ('approved','offered')`, hostID, group).Scan(&approvalID, &approvalState)
+			if approvalErr != nil && !errors.Is(approvalErr, pgx.ErrNoRows) {
+				return empty, approvalErr
+			}
+			if approvalErr == nil {
+				if err := rotateHostReviewTokens(ctx, tx, hostID); err != nil {
+					return empty, err
+				}
+				if err := tx.QueryRow(ctx, `SELECT state FROM host_config_approvals WHERE id=$1::uuid FOR UPDATE`, approvalID).Scan(&approvalState); err != nil {
+					return empty, err
+				}
+				if approvalState == "approved" {
+					if _, err := tx.Exec(ctx, `UPDATE host_config_approvals SET state='superseded' WHERE id=$1::uuid`, approvalID); err != nil {
+						return empty, err
+					}
+					if _, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions
+						WHERE host_id=$1::uuid AND owner_kind='idle_apply' AND owner_id=$2::uuid`, hostID, approvalID); err != nil {
+						return empty, err
+					}
+				} else {
+					if _, err := tx.Exec(ctx, `UPDATE host_config_approvals SET state='cancel_pending' WHERE id=$1::uuid`, approvalID); err != nil {
+						return empty, err
+					}
+				}
+			}
+		}
 		if _, err := tx.Exec(ctx, `INSERT INTO host_reconcile_obligations(host_id,kind,resource_key,revision,next_attempt_at) VALUES($1::uuid,'setting',$2,$3,now()) ON CONFLICT(host_id,kind,resource_key) DO UPDATE SET revision=excluded.revision,next_attempt_at=now(),retry_count=0`, hostID, group, next); err != nil {
 			return empty, err
 		}
+	}
+	if _, err := tx.Exec(ctx, `UPDATE hosts SET status='online' WHERE id=$1::uuid AND status='draining'
+		AND NOT EXISTS(SELECT 1 FROM host_admission_restrictions WHERE host_id=$1::uuid)`, hostID); err != nil {
+		return empty, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return empty, err

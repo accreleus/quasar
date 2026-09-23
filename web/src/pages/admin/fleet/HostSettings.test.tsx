@@ -158,8 +158,8 @@ describe("HostSettings", () => {
   });
 
   it("uses revisioned policy save for the first owned idle edit", async () => {
-    let resolvePolicy!: (value: unknown) => void;
-    vi.mocked(adminApi.getHostPolicy).mockImplementation(() => new Promise((resolve) => { resolvePolicy = resolve; }) as never);
+    const resolvePolicies: Array<(value: unknown) => void> = [];
+    vi.mocked(adminApi.getHostPolicy).mockImplementation(() => new Promise((resolve) => { resolvePolicies.push(resolve); }) as never);
     const initial = {
       revision: "0", choices: { idle_timeout_secs: { source: "deployment" } }, resolved: {},
       groups: { idle_timeout_secs: {
@@ -175,7 +175,7 @@ describe("HostSettings", () => {
     await screen.findByRole("heading", { name: "Host settings" });
     await waitFor(() => expect(adminApi.getHostPolicy).toHaveBeenCalled());
     expect(screen.queryByText("QUASAR_IDLE_TIMEOUT_SECS")).toBeNull();
-    await act(async () => resolvePolicy(initial));
+    await act(async () => { for (const resolve of resolvePolicies) resolve(initial); });
     expect(await screen.findByRole("button", { name: "Save idle timeout" })).toBeTruthy();
     expect(screen.queryByText("QUASAR_IDLE_TIMEOUT_SECS")).toBeNull();
     fireEvent.change(screen.getByLabelText("Source"), { target: { value: "explicit" } });

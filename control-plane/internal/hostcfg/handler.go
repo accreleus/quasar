@@ -74,6 +74,9 @@ func (h *Handler) Register(mux httpx.Router, requireAuth func(http.Handler) http
 	mux.Handle("POST /v1/admin/hosts/{id}/restart", admin(http.HandlerFunc(h.handleRestart)))
 	mux.Handle("GET /v1/admin/hosts/{id}/policy", admin(http.HandlerFunc(h.handleGetPolicy)))
 	mux.Handle("PATCH /v1/admin/hosts/{id}/policy", admin(http.HandlerFunc(h.handlePatchPolicy)))
+	mux.Handle("POST /v1/admin/hosts/{id}/idle-apply", admin(http.HandlerFunc(h.handleIdleApply)))
+	mux.Handle("GET /v1/admin/hosts/{id}/idle-apply/{attempt_id}", admin(http.HandlerFunc(h.handleGetIdleApply)))
+	mux.Handle("POST /v1/admin/hosts/{id}/idle-apply/{attempt_id}/cancel", admin(http.HandlerFunc(h.handleCancelIdleApply)))
 }
 
 func (h *Handler) handleGetPolicy(w http.ResponseWriter, r *http.Request) {
