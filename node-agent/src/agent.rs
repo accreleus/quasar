@@ -2021,13 +2021,12 @@ async fn connect_and_run(
 
     loop {
         if policy_identity.is_some()
-            && advertised.is_empty()
             && !mgr.policy_seed_reconnect_used
             && mgr.policy_delivery_ack.is_some()
             && mgr
                 .policy_agent
                 .as_ref()
-                .is_some_and(|agent| agent.has_idle_seed())
+                .is_some_and(|agent| agent.has_seed() && agent.has_unadvertised_groups(&advertised))
             && mgr.pending.is_empty()
             && mgr.running.is_empty()
             && !mgr.warmup_reserved()
@@ -2145,7 +2144,14 @@ async fn connect_and_run(
                         // before handle_control consumes ctrl.
                         let was_config_update = matches!(ctrl, ControlMsg::ConfigUpdate { .. });
                         if let Some(reply) = mgr.handle_control(ctrl, evt_tx, diagnostic_tx) {
+                            let typed_applied = matches!(&reply,
+                                AgentMsg::ConfigPolicyState { phase, .. } if phase == "applied");
                             send(&mut tx, &reply).await?;
+                            // A typed apply can withdraw probe-proven codecs (`zerocopy`);
+                            // the control plane must not keep routing on the old set.
+                            if typed_applied {
+                                send_fresh_capacity(&mut tx, &mut *mgr).await?;
+                            }
                         }
                         if was_config_update {
                             // The overlay may have flipped the effective encoder live, so
@@ -3744,7 +3750,7 @@ impl SessionManager {
                                     Some(groups) => {
                                         self.policy_inventory_complete
                                             && policy.sticky_groups_accepted(groups)
-                                            && (!groups.is_empty() || !policy.has_idle_seed())
+                                            && (!groups.is_empty() || !policy.has_seed())
                                     }
                                     None => !policy.has_sticky_ownership(),
                                 };
@@ -3841,9 +3847,21 @@ impl SessionManager {
                     settings,
                     resolved_settings,
                 };
-                self.policy_agent
+                let reply = self
+                    .policy_agent
                     .as_mut()
-                    .map(|policy| policy.accept(offer, &mut self.runtime_settings))
+                    .map(|policy| policy.accept(offer, &mut self.runtime_settings));
+                if matches!(&reply, Some(AgentMsg::ConfigPolicyState { phase, .. }) if phase == "applied")
+                {
+                    // The same launch boundary as the legacy map path: new homes
+                    // seed from the new root's templates, and a probe input
+                    // (`zerocopy`) withdraws its evidence until re-probed.
+                    if let Some(policy) = &self.source_policy {
+                        policy.update_root(&self.runtime_settings.home_root);
+                    }
+                    self.notify_probe_inputs_if_changed();
+                }
+                reply
             }
             ControlMsg::ConfigPolicyJournalInventoryRequest {
                 inventory_id,
@@ -8328,5 +8346,161 @@ mod tests {
             &diagnostic_sender(),
         );
         assert!(matches!(reply, Some(AgentMsg::Ack { ok: false, .. })));
+    }
+
+    // ---- RH05 #336: a typed next-session apply reaches the next launch ----
+
+    fn typed_offer_msg(offer: crate::policy::Offer) -> ControlMsg {
+        ControlMsg::ConfigPolicyOffer {
+            attempt_id: offer.attempt_id,
+            host_id: offer.host_id,
+            boot_incarnation: offer.boot_incarnation,
+            connection_incarnation: offer.connection_incarnation,
+            group: offer.group,
+            revision: offer.revision,
+            content_sha256: offer.content_sha256,
+            scope: offer.scope,
+            expires_at: offer.expires_at,
+            prerequisites_sha256: offer.prerequisites_sha256,
+            prerequisites: offer.prerequisites,
+            settings: offer.settings,
+            resolved_settings: offer.resolved_settings,
+        }
+    }
+
+    /// Owns `group` on a durable temp journal and applies `value` to it through
+    /// `handle_control`, as the connection loop does.
+    fn apply_typed(
+        mgr: &mut SessionManager,
+        dir: &std::path::Path,
+        group: &str,
+        value: serde_json::Value,
+    ) -> Option<AgentMsg> {
+        use crate::policy::test_support::{explicit, owned_agent};
+        let agent = owned_agent(dir, &[group], &mut mgr.runtime_settings);
+        let offer = explicit(&agent, "attempt", "1", group, value);
+        mgr.policy_agent = Some(agent);
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+        mgr.handle_control(typed_offer_msg(offer), &evt_tx, &diagnostic_sender())
+    }
+
+    fn applied(reply: &Option<AgentMsg>) -> bool {
+        matches!(reply, Some(AgentMsg::ConfigPolicyState { phase, .. }) if phase == "applied")
+    }
+
+    /// `zerocopy` stays next-session, but it is a host-probe input: a typed
+    /// change must withdraw codecs proven under the old value and ask the
+    /// scheduler for a fresh probe, exactly as a legacy `config_update` does.
+    #[tokio::test]
+    async fn a_typed_zerocopy_apply_withdraws_probe_proven_codecs_and_requests_a_probe() {
+        use crate::host_probe::decision::Event;
+        use crate::host_probe::orchestrator::ProbeHandle;
+        use crate::host_probe::ProbeCodec;
+        let mut mgr = codec_mgr(
+            vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))],
+            plan_all,
+        );
+        let (handle, mut rx) = ProbeHandle::detached();
+        mgr.probe_handle = Some(handle);
+        mgr.notify_probe_inputs();
+        next_probe_event(&mut rx).await;
+        prove(&mut mgr, 0, ProbeCodec::H265);
+        assert_eq!(mgr.advertised_codecs(), wire(&["h264", "h265"]));
+
+        let dir = tempfile::tempdir().unwrap();
+        let flipped = !mgr.runtime_settings.zerocopy;
+        let reply = apply_typed(&mut mgr, dir.path(), "zerocopy", serde_json::json!(flipped));
+        assert!(applied(&reply), "{reply:?}");
+        assert_eq!(mgr.runtime_settings.zerocopy, flipped);
+        assert_eq!(
+            mgr.advertised_codecs(),
+            wire(&["h264"]),
+            "h265 was proven under the old zerocopy value"
+        );
+        match next_probe_event(&mut rx).await {
+            Event::InputsObserved(inputs) => {
+                assert!(
+                    inputs.settings.contains(&format!("zerocopy={flipped}")),
+                    "{}",
+                    inputs.settings
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The warm-up template store follows a typed `home_root` at the same
+    /// boundary the next launch does; existing homes stay where they are.
+    #[test]
+    fn a_typed_home_root_apply_rebinds_template_seeding_for_the_next_launch() {
+        let (fixture, source_policy) = crate::source_policy::tests::fixture();
+        let mount = fixture.path().join("homes");
+        let existing = mount.join("existing-user");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::write(existing.join("save.dat"), "kept").unwrap();
+        let mut mgr = manager_with(Vec::new());
+        mgr.runtime_settings.home_root = mount.to_str().unwrap().into();
+        mgr.source_policy = Some(source_policy.clone());
+        assert_eq!(source_policy.store().unwrap().home_root(), mount.as_path());
+        let running = SessionConfig::for_assignment_with(
+            &mgr.runtime_settings,
+            StreamParams::default(),
+            None,
+        );
+
+        let next_root = mount.join("v2");
+        let dir = tempfile::tempdir().unwrap();
+        let reply = apply_typed(
+            &mut mgr,
+            dir.path(),
+            "home_root",
+            serde_json::json!(next_root.to_str().unwrap()),
+        );
+        assert!(applied(&reply), "{reply:?}");
+        let next = SessionConfig::for_assignment_with(
+            &mgr.runtime_settings,
+            StreamParams::default(),
+            None,
+        );
+        assert_eq!(next.home_root, next_root.to_str().unwrap());
+        // `session::source` seeds only when the store's root equals the launch's.
+        assert_eq!(
+            source_policy.store().unwrap().home_root(),
+            std::path::Path::new(&next.home_root)
+        );
+        assert_eq!(
+            running.home_root,
+            mount.to_str().unwrap(),
+            "running session keeps its root"
+        );
+        assert_eq!(
+            std::fs::read_to_string(existing.join("save.dat")).unwrap(),
+            "kept"
+        );
+    }
+
+    #[test]
+    fn a_typed_app_boot_timeout_apply_reaches_the_next_launch_only() {
+        let mut mgr = manager_with(Vec::new());
+        let running = SessionConfig::for_assignment_with(
+            &mgr.runtime_settings,
+            StreamParams::default(),
+            None,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let reply = apply_typed(
+            &mut mgr,
+            dir.path(),
+            "app_boot_timeout_secs",
+            serde_json::json!(42),
+        );
+        assert!(applied(&reply), "{reply:?}");
+        let next = SessionConfig::for_assignment_with(
+            &mgr.runtime_settings,
+            StreamParams::default(),
+            None,
+        );
+        assert_eq!(next.app_boot_timeout, Some(Duration::from_secs(42)));
+        assert_ne!(running.app_boot_timeout, next.app_boot_timeout);
     }
 }
