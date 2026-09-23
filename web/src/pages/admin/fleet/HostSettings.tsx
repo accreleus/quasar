@@ -31,8 +31,12 @@ import type { SettingValue } from "./settings/knobs";
 export function HostSettings() {
   const { id } = useParams();
   const s = useHostSettings(id);
-  const [typedIdleAvailable, setTypedIdleAvailable] = useState(false);
-  const onTypedIdleAvailable = useCallback((available: boolean) => setTypedIdleAvailable(available), []);
+  // Resolve writer ownership before exposing either editor. An owned first
+  // edit must use the policy endpoint's expected revision even before a group
+  // row exists; the legacy editor has no client CAS token.
+  const [idleOwnership, setIdleOwnership] = useState<{ hostId: string | undefined; available: boolean } | null>(null);
+  const typedIdleAvailable = idleOwnership?.hostId === id ? idleOwnership?.available : null;
+  const onTypedIdleAvailable = useCallback((available: boolean) => setIdleOwnership({ hostId: id, available }), [id]);
 
   const renderKnob = (k: ConfigKnob) => {
     const v = s.valueOf(k);
@@ -107,7 +111,7 @@ export function HostSettings() {
             <div>
               <IdleTimeoutPolicy hostId={id} onAvailable={onTypedIdleAvailable} />
               <KnobPanel title="Runtime defaults" hint="Changes affect new sessions after the host applies them.">
-                {s.grouped.runtime.filter((knob) => !typedIdleAvailable || knob.key !== "idle_timeout_secs").map(renderKnob)}
+                {s.grouped.runtime.filter((knob) => typedIdleAvailable === false || knob.key !== "idle_timeout_secs").map(renderKnob)}
               </KnobPanel>
 
               <KnobPanel

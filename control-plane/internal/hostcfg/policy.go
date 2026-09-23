@@ -281,11 +281,12 @@ func (s *Store) GetPolicy(ctx context.Context, hostID string) (PolicyView, error
 		return view, err
 	}
 	view.Revision = strconv.FormatInt(revision, 10)
-	var everOwnedRaw []byte
-	if err := tx.QueryRow(ctx, `SELECT config_policy_ever_owned_groups FROM hosts WHERE id=$1::uuid`, hostID).Scan(&everOwnedRaw); err != nil {
+	var everOwnedRaw, confirmedRaw []byte
+	if err := tx.QueryRow(ctx, `SELECT config_policy_ever_owned_groups,config_policy_confirmed_groups FROM hosts WHERE id=$1::uuid`, hostID).Scan(&everOwnedRaw, &confirmedRaw); err != nil {
 		return view, err
 	}
 	everOwned := decodeGroupSet(everOwnedRaw)
+	confirmed := decodeGroupSet(confirmedRaw)
 	rows, err := tx.Query(ctx, `SELECT key,source,explicit_value FROM host_setting_choices WHERE host_id=$1::uuid`, hostID)
 	if err != nil {
 		return view, err
@@ -355,6 +356,24 @@ func (s *Store) GetPolicy(ctx context.Context, hostID string) (PolicyView, error
 		return view, err
 	}
 	rows.Close()
+	// The first typed edit has no persisted group row yet. Project its current
+	// writer and pending status so the UI can use the revisioned policy PATCH
+	// from revision zero, without exposing the legacy editor on an owned group.
+	if _, exists := view.Groups["idle_timeout_secs"]; !exists {
+		group := PolicyGroup{DesiredRevision: view.Revision, Scope: "next_session", Status: "upgrade_required"}
+		if confirmed["idle_timeout_secs"] {
+			group.Status = "pending"
+			remedy := "Waiting for the host to verify the next-session setting."
+			group.Remedy = &remedy
+		} else {
+			remedy := "The legacy writer remains active for this group. Upgrade the agent to enable RH05 verification."
+			if everOwned["idle_timeout_secs"] {
+				remedy = "Typed ownership remains protected after agent downgrade. Re-upgrade the agent or repair ownership; the legacy value is not sent."
+			}
+			group.Remedy = &remedy
+		}
+		view.Groups["idle_timeout_secs"] = group
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return view, err
 	}

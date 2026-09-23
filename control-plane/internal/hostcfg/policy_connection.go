@@ -220,7 +220,12 @@ func (s *Store) SetInitialDelivery(ctx context.Context, hostID, connectionID, de
 }
 
 func (s *Store) AcknowledgeInitialDelivery(ctx context.Context, hostID, connectionID, deliveryID string) (bool, error) {
-	cmd, err := s.pool.Exec(ctx, `UPDATE hosts SET config_policy_gate_connection=NULL,config_policy_delivery_id=NULL
+	// A fresh v2 agent first advertises no groups while it durably seeds its
+	// legacy overlay. Its exact map acknowledgement stops retransmission, but
+	// admission remains gated until it reconnects advertising the seeded group.
+	cmd, err := s.pool.Exec(ctx, `UPDATE hosts SET
+		config_policy_gate_connection=CASE WHEN config_policy_confirmed_groups ? 'idle_timeout_secs' THEN NULL ELSE config_policy_gate_connection END,
+		config_policy_delivery_id=CASE WHEN config_policy_confirmed_groups ? 'idle_timeout_secs' THEN NULL ELSE config_policy_delivery_id END
 		WHERE id=$1::uuid AND config_policy_gate_connection=$2::uuid AND config_policy_delivery_id=$3::uuid AND config_policy_confirmed_groups IS NOT NULL`, hostID, connectionID, deliveryID)
 	return cmd.RowsAffected() == 1, err
 }

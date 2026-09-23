@@ -4,16 +4,78 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"github.com/accreleus/quasar/control-plane/internal/httpx"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/accreleus/quasar/control-plane/internal/httpx"
 )
 
 type policyIdentityDispatcher struct {
 	fakeDispatcher
 	connection string
+}
+
+func TestInitialIdlePolicyEditorsRaceAtRevisionZero(t *testing.T) {
+	pool := testPool(t)
+	hostID := seedHost(t, pool)
+	confirmPolicyGroups(t, pool, hostID, "idle_timeout_secs")
+	h := NewHandler(NewStore(pool), &fakeDispatcher{}, nil)
+	mux := http.NewServeMux()
+	h.Register(mux, func(next http.Handler) http.Handler { return next }, func(next http.Handler) http.Handler { return next })
+	url := "/v1/admin/hosts/" + hostID + "/policy"
+	get := httptest.NewRecorder()
+	mux.ServeHTTP(get, httptest.NewRequest(http.MethodGet, url, nil))
+	if get.Code != http.StatusOK {
+		t.Fatalf("initial read: %d %s", get.Code, get.Body.String())
+	}
+	var initial PolicyView
+	if err := json.Unmarshal(get.Body.Bytes(), &initial); err != nil {
+		t.Fatal(err)
+	}
+	group := initial.Groups["idle_timeout_secs"]
+	if initial.Revision != "0" || group.Status != "pending" || group.DesiredDigest != nil {
+		t.Fatalf("initial revisioned typed editor unavailable: %+v", initial)
+	}
+	start := make(chan struct{})
+	results := make([]*httptest.ResponseRecorder, 2)
+	var wg sync.WaitGroup
+	for i, seconds := range []int{900, 1200} {
+		wg.Add(1)
+		go func(i, seconds int) {
+			defer wg.Done()
+			<-start
+			body := fmt.Sprintf(`{"expected_revision":"0","changes":{"idle_timeout_secs":{"source":"explicit","value":%d}}}`, seconds)
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPatch, url, strings.NewReader(body)))
+			results[i] = rr
+		}(i, seconds)
+	}
+	close(start)
+	wg.Wait()
+	var winners, stale int
+	for _, rr := range results {
+		switch rr.Code {
+		case http.StatusOK:
+			winners++
+		case http.StatusConflict:
+			stale++
+			var conflict struct {
+				Current PolicyView `json:"current"`
+			}
+			if err := json.Unmarshal(rr.Body.Bytes(), &conflict); err != nil || conflict.Current.Revision != "1" {
+				t.Fatalf("stale editor lacks current view: %s err=%v", rr.Body.String(), err)
+			}
+		default:
+			t.Fatalf("unexpected race response: %d %s", rr.Code, rr.Body.String())
+		}
+	}
+	if winners != 1 || stale != 1 {
+		t.Fatalf("revision-zero race: winners=%d stale=%d", winners, stale)
+	}
 }
 
 func TestLegacyRestartIsAtomicWhileRH05JournalGateIsOpen(t *testing.T) {

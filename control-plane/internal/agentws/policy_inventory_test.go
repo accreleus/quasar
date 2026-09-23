@@ -5,11 +5,102 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/hostcfg"
+	"github.com/gorilla/websocket"
 )
+
+func TestFreshV2EmptyGroupSeedMapAckKeepsAdmissionClosed(t *testing.T) {
+	pool := testPool(t)
+	store := hostcfg.NewStore(pool)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := NewHandler(pool, "test-token", log, nil, nil, nil, store, nil)
+	t.Cleanup(h.Close)
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	ws, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ws.Close() })
+	_ = ws.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if err := ws.WriteJSON(map[string]any{
+		"type": "register", "node_name": "fresh-v2-seed-test", "agent_version": "test",
+		"auth":                   map[string]string{"enrollment_token": "test-token"},
+		"config_policy_versions": map[string]int{"typed_settings": 2, "execution_journal": 1, "deployment_baseline": 1},
+		"config_policy_groups":   []string{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var registered map[string]any
+	if err := ws.ReadJSON(&registered); err != nil {
+		t.Fatal(err)
+	}
+	hostID, _ := registered["host_id"].(string)
+	if hostID == "" {
+		t.Fatalf("registered without host id: %+v", registered)
+	}
+	capacity := map[string]any{
+		"type": "capacity", "host": map[string]any{"cpu_cores": 8, "mem_mb": 32000},
+		"gpus":                          []map[string]any{{"index": 0, "vendor": "nvidia", "model": "test", "vram_mb_total": 16384, "encode_slots_total": 2}},
+		"config_policy_accepted_groups": []string{},
+	}
+	if err := ws.WriteJSON(capacity); err != nil {
+		t.Fatal(err)
+	}
+	var request map[string]any
+	for {
+		if err := ws.ReadJSON(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request["type"] == "config_policy_journal_inventory_request" {
+			break
+		}
+	}
+	if err := ws.WriteJSON(map[string]any{
+		"type": "config_policy_journal_inventory_page", "inventory_id": request["inventory_id"],
+		"snapshot_id": "00000000-0000-4000-8000-000000000255", "cursor": nil, "next_cursor": nil,
+		"revision_high_water": map[string]string{}, "active_snapshots": map[string]any{}, "entries": []any{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var delivery map[string]any
+	for {
+		if err := ws.ReadJSON(&delivery); err != nil {
+			t.Fatal(err)
+		}
+		if delivery["type"] == "config_update" && delivery["settings_delivery_id"] != nil {
+			break
+		}
+	}
+	capacity["config_policy_legacy_map_applied_id"] = delivery["settings_delivery_id"]
+	capacity["host"] = map[string]any{"cpu_cores": 9, "mem_mb": 32000}
+	if err := ws.WriteJSON(capacity); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var cores int
+		if err := pool.QueryRow(context.Background(), `SELECT cpu_cores FROM hosts WHERE id=$1::uuid`, hostID).Scan(&cores); err != nil {
+			t.Fatal(err)
+		}
+		if cores == 9 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("seed-map acknowledgement capacity not processed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var gated bool
+	if err := pool.QueryRow(context.Background(), `SELECT config_policy_gate_connection IS NOT NULL FROM hosts WHERE id=$1::uuid`, hostID).Scan(&gated); err != nil || !gated {
+		t.Fatalf("fresh v2 admitted after seed-map acknowledgement: gated=%v err=%v", gated, err)
+	}
+}
 
 func TestPolicyInventoryMatchingHistoricalAttemptPermitsInitialMap(t *testing.T) {
 	pool := testPool(t)

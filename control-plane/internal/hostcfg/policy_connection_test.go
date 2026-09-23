@@ -49,6 +49,48 @@ func TestPolicyDeliveryGateAndLegacyWriterRemainSeparate(t *testing.T) {
 	}
 }
 
+func TestFreshV2SeedRequiresReconnectBeforeAdmission(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	ctx := context.Background()
+	first := "00000000-0000-4000-8000-000000000151"
+	if gated, err := store.BeginPolicyConnection(ctx, hostID, first, map[string]int{"typed_settings": 2}, []string{}, true); err != nil || !gated {
+		t.Fatalf("first connection: gated=%v err=%v", gated, err)
+	}
+	if ok, err := store.ConfirmPolicyGroups(ctx, hostID, first, []string{}); err != nil || !ok {
+		t.Fatalf("empty group echo: ok=%v err=%v", ok, err)
+	}
+	id := "00000000-0000-4000-8000-000000000152"
+	if _, ok, err := store.PrepareLegacyDelivery(ctx, hostID, first, id, nil); err != nil || !ok {
+		t.Fatalf("full seed map: ok=%v err=%v", ok, err)
+	}
+	if ok, err := store.AcknowledgeInitialDelivery(ctx, hostID, first, id); err != nil || !ok {
+		t.Fatalf("seed map ack: ok=%v err=%v", ok, err)
+	}
+	var available bool
+	if err := pool.QueryRow(ctx, `SELECT config_policy_gate_connection IS NULL FROM hosts WHERE id=$1::uuid`, hostID).Scan(&available); err != nil || available {
+		t.Fatalf("first connection admitted before seed reconnect: available=%v err=%v", available, err)
+	}
+	second := "00000000-0000-4000-8000-000000000153"
+	if gated, err := store.BeginPolicyConnection(ctx, hostID, second, map[string]int{"typed_settings": 2}, []string{"idle_timeout_secs"}, true); err != nil || !gated {
+		t.Fatalf("seeded reconnect: gated=%v err=%v", gated, err)
+	}
+	if ok, err := store.ConfirmPolicyGroups(ctx, hostID, second, []string{"idle_timeout_secs"}); err != nil || !ok {
+		t.Fatalf("seeded group echo: ok=%v err=%v", ok, err)
+	}
+	secondID := "00000000-0000-4000-8000-000000000154"
+	if _, ok, err := store.PrepareLegacyDelivery(ctx, hostID, second, secondID, []string{"idle_timeout_secs"}); err != nil || !ok {
+		t.Fatalf("seeded map: ok=%v err=%v", ok, err)
+	}
+	if ok, err := store.AcknowledgeInitialDelivery(ctx, hostID, second, secondID); err != nil || !ok {
+		t.Fatalf("seeded map ack: ok=%v err=%v", ok, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT config_policy_gate_connection IS NULL FROM hosts WHERE id=$1::uuid`, hostID).Scan(&available); err != nil || !available {
+		t.Fatalf("seeded reconnect remained gated: available=%v err=%v", available, err)
+	}
+}
+
 func TestUpgradeRequiredRemedyDistinguishesLegacyWriterFromStickyOwnership(t *testing.T) {
 	pool := testPool(t)
 	store := NewStore(pool)
