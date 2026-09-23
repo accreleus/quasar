@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/accreleus/quasar/control-plane/internal/telemetry"
@@ -48,6 +49,9 @@ var (
 	// host. A refusal, never a provision: creating one would mount an empty
 	// directory and reach `running` looking healthy.
 	ErrHomeNotProvisioned = errors.New("home not provisioned for this app")
+	// Known locations disagree or the canonical owner is uncertain. Operator
+	// repair is required; retrying elsewhere could create a second home.
+	ErrHomeConflict = errors.New("managed home location requires repair")
 	// A tile borrows the parent's image, runtime, mounts and home, so launching
 	// one IS running the parent and `enabled = false` must stop it.
 	ErrParentDisabled = errors.New("the provider app this tile launches through is disabled")
@@ -615,6 +619,26 @@ func (s *Store) ListAll(ctx context.Context, cursor string, limit int32, filter 
 // failed. ErrInvalidTransition if the move is not permitted, ErrNotFound if the
 // row is gone; a same-state report is an idempotent no-op.
 func (s *Store) Transition(ctx context.Context, id string, to State, detail, errMsg *string) (Session, error) {
+	return s.transition(ctx, id, "", to, detail, errMsg)
+}
+
+// TransitionFromHost is the authenticated agent variant. It checks the
+// reporting host while the session row is locked, so a different agent cannot
+// supply lifecycle or managed-home materialization evidence for this session.
+func (s *Store) TransitionFromHost(ctx context.Context, id, hostID string, to State, detail, errMsg *string) (Session, error) {
+	var sess Session
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		sess, err = s.transition(ctx, id, hostID, to, detail, errMsg)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "40P01" {
+			return sess, err
+		}
+	}
+	return sess, err
+}
+
+func (s *Store) transition(ctx context.Context, id, reportHostID string, to State, detail, errMsg *string) (Session, error) {
 	if !isValidUUID(id) {
 		return Session{}, ErrNotFound
 	}
@@ -625,12 +649,29 @@ func (s *Store) Transition(ctx context.Context, id string, to State, detail, err
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	var cur State
-	err = tx.QueryRow(ctx, `SELECT state FROM sessions WHERE id = $1::uuid FOR UPDATE`, id).Scan(&cur)
+	var curDetail *string
+	var assignedHost *string
+	var sessionUser, sessionApp string
+	var boundHome, boundDigest *string
+	err = tx.QueryRow(ctx, `SELECT state,state_detail,host_id::text,user_id::text,app_id::text,
+		managed_home_id::text,managed_home_mount_sha256 FROM sessions WHERE id = $1::uuid FOR UPDATE`, id).
+		Scan(&cur, &curDetail, &assignedHost, &sessionUser, &sessionApp, &boundHome, &boundDigest)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Session{}, ErrNotFound
 	}
 	if err != nil {
 		return Session{}, fmt.Errorf("lock session: %w", err)
+	}
+	if reportHostID != "" && (assignedHost == nil || *assignedHost != reportHostID) {
+		return Session{}, ErrNotFound
+	}
+	// A restart loses swapper.pendingSwaps but not this durable guard. A stop
+	// request or any nonterminal agent detail cannot clear it: the target may
+	// remain mounted through stopping while app_id still names the old app.
+	// Terminal reports release protection through the GC state predicate;
+	// explicit rollback/commit is handled by swapper while its target is known.
+	if curDetail != nil && *curDetail == swapDetailInProgress && !to.IsTerminal() {
+		detail = nil
 	}
 
 	// Teardown-race coercion (see CoerceReport): a `failed` report on an already
@@ -668,6 +709,11 @@ func (s *Store) Transition(ctx context.Context, id string, to State, detail, err
 		`, id, string(to), detail, errMsg)
 		if err != nil {
 			return Session{}, fmt.Errorf("update state: %w", err)
+		}
+	}
+	if reportHostID != "" && cur != StateRunning && to == StateRunning {
+		if err := materializeRunningHome(ctx, tx, sessionUser, sessionApp, reportHostID, boundHome, boundDigest); err != nil {
+			return Session{}, err
 		}
 	}
 
@@ -1045,19 +1091,9 @@ func (s *Store) HasLiveUserAppSession(ctx context.Context, userID, homeAppID, ex
 	return conflictID, nil
 }
 
-// homeHostSQL resolves the host holding a user's live (non-tombstoned) home for
-// an app: §5's hard placement pin, and the same subquery policyOrderSQL uses for
-// locality ordering, tie-break included. `ORDER BY last_used_at DESC` is
-// load-bearing — after a locality miss a (user, app) can hold homes on two
-// hosts, and the tile must land on the one with the current install.
-const homeHostSQL = `
-	SELECT host_id::text FROM user_homes
-	WHERE user_id = $1::uuid AND app_id = $2::uuid AND gc_after IS NULL AND host_id IS NOT NULL
-	ORDER BY last_used_at DESC
-	LIMIT 1`
-
-// HomeHostForApp returns the host id holding userID's live home for homeAppID, or
-// "" when there is none.
+// HomeHostForApp returns the canonical owner for the pre-schedule tile pin, or
+// "" when no home was ever recorded. The reservation transaction repeats this
+// read; this first answer is only an early refusal/UX aid.
 //
 // It is the pre-schedule half of §5: a derived tile provisions nothing, so a host
 // with no home for (user, parent) has literally nothing to mount, and placing it
@@ -1065,15 +1101,40 @@ const homeHostSQL = `
 // the launch must be refused BEFORE placement with 409 home_not_provisioned —
 // never fall back to letting the scheduler pick.
 func (s *Store) HomeHostForApp(ctx context.Context, userID, homeAppID string) (string, error) {
-	var hostID string
-	err := s.pool.QueryRow(ctx, homeHostSQL, userID, homeAppID).Scan(&hostID)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("begin home owner read: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	p := CreateParams{UserID: userID, AppID: homeAppID, ManagedHome: true}
+	owner, err := homeClaimOwner(ctx, tx, p)
+	if errors.Is(err, ErrHomeConflict) {
+		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil {
+			return "", fmt.Errorf("rollback home owner read: %w", rollbackErr)
+		}
+		if diagnosisErr := s.persistHomeConflict(ctx, p); diagnosisErr != nil {
+			return "", diagnosisErr
+		}
+	}
+	return owner, err
+}
+
+// CanonicalAppName resolves the caller's requested app to the parent whose
+// managed home it uses. Call only after the entitlement gate has passed.
+func (s *Store) CanonicalAppName(ctx context.Context, appID string) (string, error) {
+	if !isValidUUID(appID) {
+		return "", ErrNotFound
+	}
+	var name string
+	err := s.pool.QueryRow(ctx, `SELECT root.name FROM apps a JOIN apps root
+		ON root.id=COALESCE(a.parent_app_id,a.id) WHERE a.id=$1::uuid`, appID).Scan(&name)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", nil
+		return "", ErrNotFound
 	}
 	if err != nil {
-		return "", fmt.Errorf("resolve home host: %w", err)
+		return "", fmt.Errorf("resolve canonical app name: %w", err)
 	}
-	return hostID, nil
+	return name, nil
 }
 
 // probeMaxAgeDays is the staleness cut for user_devices probes (AS-02). A probe

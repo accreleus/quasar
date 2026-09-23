@@ -494,6 +494,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 				return cfgStore.HomeRootTx(ctx, tx, hostID, homeRootEnv)
 			},
 		})
+	homeProvider.SetHomeCleanupCapability(agentRegistry.CurrentHomeCleanupCapability)
 	jobRegistry.MustRegister(jobs.Definition{
 		ID:          "storage.home_janitor",
 		Name:        "Home janitor",
@@ -889,6 +890,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 			return jobs.Succeeded(jobs.Summary{
 				"deleted":      rep.Deleted,
 				"in_session":   rep.InSession,
+				"pending_home": rep.PendingHome,
 				"failed":       rep.Failed,
 				"hosts_nudged": rep.HostsNudged,
 			}), nil

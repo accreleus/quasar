@@ -38,6 +38,25 @@ func (c *Coordinator) AgentState(ctx context.Context, hostID string, m agentws.S
 		c.log.Warn("ignoring unknown agent session state", "state", m.State, "session_id", m.SessionID)
 		return
 	}
+	if to.IsTerminal() && m.HomeCleanupQualified {
+		// A qualified late terminal is useful even after a synthetic reaper or
+		// session-row deletion. The store checks the reporting host and clears
+		// only matching hold columns; it never changes public session history.
+		if err := c.store.ClearQualifiedHomeHolds(ctx, hostID, m.SessionID); err != nil {
+			c.log.Error("apply home cleanup proof failed", "err", err)
+		}
+	}
+	hs, err := c.store.GetSessionHostState(ctx, m.SessionID)
+	if err != nil || hs.HostID == nil || *hs.HostID != hostID {
+		c.log.Warn("ignoring session state from non-owner host", "session_id", m.SessionID)
+		return
+	}
+	// A terminal row may still have a held home awaiting cleanup proof. That
+	// proof was handled above; replaying the lifecycle transition would repeat
+	// audit, console and home-usage side effects for an already-ended session.
+	if hs.State.IsTerminal() {
+		return
+	}
 
 	// A swap in flight rides within `running` via state_detail, so it must be
 	// handled before the generic transition, which treats running→running as a
@@ -54,7 +73,7 @@ func (c *Coordinator) AgentState(ctx context.Context, hostID string, m agentws.S
 		errMsg = m.Error
 	}
 
-	sess, err := c.store.Transition(ctx, m.SessionID, to, detail, errMsg)
+	sess, err := c.store.TransitionFromHost(ctx, m.SessionID, hostID, to, detail, errMsg)
 	if errors.Is(err, ErrInvalidTransition) {
 		c.log.Warn("agent reported illegal transition", "session_id", m.SessionID, "to", to, "err", err)
 		return

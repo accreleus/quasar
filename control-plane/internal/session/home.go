@@ -150,6 +150,9 @@ func (c *Coordinator) resolveHomeSpec(ctx context.Context, app LaunchApp, userID
 		}
 	} else {
 		mount, err = c.homes.EnsureHome(ctx, userID, homeAppID(app), hostID, app.HomeContainerPath)
+		if errors.Is(err, storage.ErrHomeConflict) {
+			return nil, ErrHomeConflict
+		}
 		if err != nil {
 			return nil, fmt.Errorf("ensure home: %w", err)
 		}

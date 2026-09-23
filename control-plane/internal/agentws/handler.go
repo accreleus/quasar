@@ -611,7 +611,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 
 	// Step 1 — register
 	registerCtx, cancelRegister := context.WithTimeout(bg, handshakeTimeout)
-	hostID, regImages, regCommit, policyTyped, acceptedGroups, connectionID, err := h.handleRegister(registerCtx, conn, clientIP)
+	hostID, regImages, regCommit, terminalHomeCleanupV1, policyTyped, acceptedGroups, connectionID, err := h.handleRegister(registerCtx, conn, clientIP)
 	cancelRegister()
 	h.failures.Release(clientIP)
 	if err != nil {
@@ -641,6 +641,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	// skips the local-display leg. Queuing config_update first guarantees it
 	// precedes any assign on the single writer.
 	ac := newConn(hostID, conn)
+	ac.terminalHomeCleanupV1 = terminalHomeCleanupV1
 	ac.policyTyped = policyTyped
 	ac.policyAccepted = acceptedGroups
 	ac.bootIncarnation = h.bootIncarnation
@@ -734,6 +735,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 		return fmt.Errorf("capacity: %w", err)
 	}
 	h.log.Info("agent capacity received", "host_id", hostID)
+	h.startHomeCleanupRetry(hostID, ac)
 	if ac.policyTyped {
 		ac.policyInventoryID = newPolicyUUID()
 		if err := h.registry.Send(hostID, ConfigPolicyInventoryRequest{Type: "config_policy_journal_inventory_request", InventoryID: ac.policyInventoryID, BootIncarnation: ac.bootIncarnation, ConnectionIncarnation: ac.connectionIncarnation}); err != nil {
@@ -813,14 +815,17 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			if a.Error != nil {
 				res.Error = *a.Error
 			}
-			h.registry.resolveAck(hostID, a.ID, res)
+			h.registry.resolveAckFromConn(ac, a.ID, res)
 		case "session_state":
 			var m SessionStateMsg
 			if err := json.Unmarshal(raw, &m); err != nil {
 				return fmt.Errorf("decode session_state: %w", err)
 			}
 			stateCtx, stateCancel := context.WithTimeout(bg, agentDBCallTimeout)
-			h.registry.withCurrent(ac, func() { h.events.AgentState(stateCtx, hostID, m) })
+			h.registry.withCurrent(ac, func() {
+				m.HomeCleanupQualified = ac.terminalHomeCleanupV1
+				h.events.AgentState(stateCtx, hostID, m)
+			})
 			stateCancel()
 		case "session_metrics":
 			// Fire-and-forget; malformed drops the message, never the connection
@@ -1105,10 +1110,10 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 // The third return value is the identity commit the agent reported (nil when it
 // reported none or one this build refused), which the caller hands to the
 // platform-apply success-evidence hook.
-func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clientIP string) (string, []RegisterImage, *string, bool, []string, string, error) {
-	fail := func(err error) (string, []RegisterImage, *string, bool, []string, string, error) {
+func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clientIP string) (string, []RegisterImage, *string, bool, bool, []string, string, error) {
+	fail := func(err error) (string, []RegisterImage, *string, bool, bool, []string, string, error) {
 		h.failures.Failure(clientIP)
-		return "", nil, nil, false, nil, "", err
+		return "", nil, nil, false, false, nil, "", err
 	}
 	conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	raw, err := readTextMessage(conn)
@@ -1235,9 +1240,9 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		}
 	}
 	if err := conn.WriteJSON(resp); err != nil {
-		return "", nil, nil, false, nil, "", fmt.Errorf("write registered: %w", err)
+		return "", nil, nil, false, false, nil, "", fmt.Errorf("write registered: %w", err)
 	}
-	return result.HostID, reg.Images, identity.SourceCommit, policyTyped, acceptedGroups, connectionID, nil
+	return result.HostID, reg.Images, identity.SourceCommit, reg.TerminalHomeCleanupV1, policyTyped, acceptedGroups, connectionID, nil
 }
 
 func (h *Handler) handleCapacity(ctx context.Context, conn *websocket.Conn, ac *conn) error {

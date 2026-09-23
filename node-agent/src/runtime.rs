@@ -615,6 +615,19 @@ impl RuntimeClient {
         )
     }
 
+    /// Prove that every API-owned source generation for one historical session
+    /// is absent before a cleanup-qualified terminal report. Other sessions
+    /// remain untouched. A malformed journal makes the proof uncertain.
+    pub fn retire_session_applications(&self, session_id: impl Into<String>) -> Operation<()> {
+        let config = self.config.clone();
+        let session_id = session_id.into();
+        self.submit_owned(
+            async move { docker::application::retire_session(&config, &session_id).await },
+            self.config.deadline.saturating_mul(4),
+            true,
+        )
+    }
+
     /// Boot-only retirement of LEGACY containers — pre-API siblings an older
     /// agent shell-launched, which carry this agent's owner label and an
     /// allowed name prefix but no operation journal. Each candidate is

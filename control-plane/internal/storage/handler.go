@@ -45,6 +45,7 @@ func (h *Handler) recordActivity(ctx context.Context, actor, action, targetType,
 func (h *Handler) Register(mux httpx.Router, requireAuth func(http.Handler) http.Handler, requireAdmin func(http.Handler) http.Handler) {
 	admin := func(next http.Handler) http.Handler { return requireAuth(requireAdmin(next)) }
 	mux.Handle("GET /v1/admin/storage/homes", admin(http.HandlerFunc(h.handleList)))
+	mux.Handle("GET /v1/admin/storage/home-claims", admin(http.HandlerFunc(h.handleListHomeClaims)))
 	mux.Handle("DELETE /v1/admin/storage/homes/{id}", admin(http.HandlerFunc(h.handleTombstone)))
 	mux.Handle("GET /v1/me/storage", requireAuth(http.HandlerFunc(h.handleMyStorage)))
 
@@ -53,6 +54,37 @@ func (h *Handler) Register(mux httpx.Router, requireAuth func(http.Handler) http
 	// its node_secret (see authAgent). control-api.md §Agent storage GC.
 	mux.Handle("GET /v1/agent/storage/gc-pending", http.HandlerFunc(h.handleGCPending))
 	mux.Handle("POST /v1/agent/storage/gc-confirm", http.HandlerFunc(h.handleGCConfirm))
+}
+
+// GET /v1/admin/storage/home-claims includes claim-only uncertainty that the
+// legacy homes list cannot represent. No backing-store refs or paths leave here.
+func (h *Handler) handleListHomeClaims(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	opts := ListHomeClaimsOpts{UserID: q.Get("user_id"), AppID: q.Get("app_id"),
+		HostID: q.Get("host_id"), State: q.Get("state"), Cursor: q.Get("cursor")}
+	if q.Has("limit") {
+		raw := q.Get("limit")
+		limit, err := strconv.Atoi(raw)
+		if err != nil || limit < 1 || limit > 100 {
+			httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "limit must be from 1 to 100")
+			return
+		}
+		opts.Limit = limit
+	}
+	items, next, err := h.mgr.ListHomeClaims(r.Context(), opts)
+	if errors.Is(err, ErrInvalidHomeClaimFilter) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid home claim filter or cursor")
+		return
+	}
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not list home claims")
+		return
+	}
+	var nextCursor *string
+	if next != "" {
+		nextCursor = &next
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": nextCursor})
 }
 
 // authAgent verifies the agent bearer (node_secret) + X-Quasar-Node header and

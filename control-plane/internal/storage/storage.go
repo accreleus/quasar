@@ -192,9 +192,17 @@ func (r fixedRoot) HomeRootTx(context.Context, pgx.Tx, string) (string, error) {
 // session host's effective home root (roots) — storage-config. This is what lets an
 // admin flip the provider in the UI and different hosts use different roots.
 type Manager struct {
-	pool     *pgxpool.Pool
-	settings SettingsReader
-	roots    HostRootResolver
+	pool                  *pgxpool.Pool
+	settings              SettingsReader
+	roots                 HostRootResolver
+	homeCleanupCapability func(string) string
+}
+
+// SetHomeCleanupCapability supplies the current authenticated agent-connection
+// capability for admin diagnosis. Without a live connection the answer remains
+// unknown; a past capable registration is never treated as current proof.
+func (m *Manager) SetHomeCleanupCapability(read func(string) string) {
+	m.homeCleanupCapability = read
 }
 
 // New builds the runtime Manager wired to the live settings + host-root resolvers
@@ -338,8 +346,9 @@ func validateMount(m string) error {
 }
 
 // EnsureHome synthesizes the home mount string for (user, app) on host and
-// upserts the bookkeeping row (clearing any pending tombstone — launching into
-// a home un-marks it for GC). Returns the validated mount string.
+// upserts the bookkeeping row. A pending tombstone is never revived under
+// RH05; it must be reaped or repaired before a new launch can use this home.
+// Returns the validated mount string.
 //
 // containerPath comes from apps.home_container_path and must be absolute.
 func (m *Manager) EnsureHome(ctx context.Context, userID, appID, hostID, containerPath string) (string, error) {
@@ -429,9 +438,13 @@ func (m *Manager) EnsureHome(ctx context.Context, userID, appID, hostID, contain
 		    SET provider = EXCLUDED.provider,
 		        ref = CASE WHEN user_homes.provider = EXCLUDED.provider
 		                   THEN user_homes.ref ELSE EXCLUDED.ref END,
-		        last_used_at = now(), gc_after = NULL
+		        last_used_at = now()
+		    WHERE user_homes.gc_after IS NULL
 		RETURNING provider, ref
 	`, userID, appID, hostID, drv.name(), ref).Scan(&provider, &storedRef); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrHomeConflict
+		}
 		return "", fmt.Errorf("upsert user_home: %w", err)
 	}
 	mount := fmt.Sprintf("%s:%s:rw", storedRef, path.Clean(containerPath))
@@ -617,7 +630,44 @@ type TombstonedHome struct {
 // The UPDATE returns the owning username and app name via RETURNING, so the
 // caller can audit a destructive action without a second round trip.
 func (m *Manager) TombstoneHome(ctx context.Context, id string) (TombstonedHome, error) {
-	live, err := m.hasLiveSessionForHome(ctx, id)
+	tx, err := m.pool.Begin(ctx)
+	if err != nil {
+		return TombstonedHome{}, fmt.Errorf("begin tombstone: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	// The same user lock used by launch serializes the live-session check,
+	// tombstone and claim transition with a first home reservation.
+	var preUser, preApp, preHost *string
+	err = tx.QueryRow(ctx, `SELECT user_id::text,app_id::text,host_id::text FROM user_homes WHERE id::text=$1`, id).
+		Scan(&preUser, &preApp, &preHost)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return TombstonedHome{}, ErrHomeNotFound
+	}
+	if err != nil {
+		return TombstonedHome{}, fmt.Errorf("read home for tombstone: %w", err)
+	}
+	if preUser != nil {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(1,hashtext($1::text))`, *preUser); err != nil {
+			return TombstonedHome{}, fmt.Errorf("lock home user: %w", err)
+		}
+		if preApp != nil {
+			if err := lockClaimBeforeHome(ctx, tx, *preUser, *preApp, preHost, true); err != nil {
+				return TombstonedHome{}, err
+			}
+		}
+	}
+	var userID, appID, hostID *string
+	err = tx.QueryRow(ctx, `SELECT user_id::text,app_id::text,host_id::text FROM user_homes WHERE id::text=$1 FOR UPDATE`, id).Scan(&userID, &appID, &hostID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return TombstonedHome{}, ErrHomeNotFound
+	}
+	if err != nil {
+		return TombstonedHome{}, fmt.Errorf("lock home: %w", err)
+	}
+	if !sameHomeIdentity(userID, preUser) || !sameHomeIdentity(appID, preApp) || !sameHomeIdentity(hostID, preHost) {
+		return TombstonedHome{}, ErrHomeConflict
+	}
+	live, err := m.hasLiveSessionForHomeTx(ctx, tx, id)
 	if err != nil {
 		return TombstonedHome{}, err
 	}
@@ -626,20 +676,24 @@ func (m *Manager) TombstoneHome(ctx context.Context, id string) (TombstonedHome,
 	}
 	var out TombstonedHome
 	var appName *string
-	err = m.pool.QueryRow(ctx, `
-		UPDATE user_homes SET gc_after = now() WHERE id::text = $1
-		RETURNING
-			(SELECT username FROM users WHERE users.id = user_homes.user_id),
-			(SELECT name FROM apps WHERE apps.id = user_homes.app_id)
+	err = tx.QueryRow(ctx, `
+		UPDATE user_homes SET gc_after=now() WHERE id::text=$1
+		RETURNING COALESCE((SELECT username FROM users WHERE users.id=user_homes.user_id),''),
+		          (SELECT name FROM apps WHERE apps.id=user_homes.app_id)
 	`, id).Scan(&out.Username, &appName)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return TombstonedHome{}, ErrHomeNotFound
-	}
 	if err != nil {
 		return TombstonedHome{}, fmt.Errorf("tombstone home: %w", err)
 	}
+	if userID != nil && appID != nil {
+		if err := markTombstonedClaim(ctx, tx, *userID, *appID, hostID); err != nil {
+			return TombstonedHome{}, err
+		}
+	}
 	if appName != nil {
 		out.AppName = *appName
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return TombstonedHome{}, fmt.Errorf("commit tombstone: %w", err)
 	}
 	return out, nil
 }
@@ -650,19 +704,33 @@ func (m *Manager) TombstoneHome(ctx context.Context, id string) (TombstonedHome,
 // COALESCE(parent_app_id, id): a derived-tile session has no home row of its
 // own, and joining on s.app_id once let an admin tombstone a live Steam
 // library mid-write. Any family member's session counts — they all mount it.
-func (m *Manager) hasLiveSessionForHome(ctx context.Context, homeID string) (bool, error) {
+func (m *Manager) hasLiveSessionForHomeTx(ctx context.Context, tx pgx.Tx, homeID string) (bool, error) {
 	var n int
-	err := m.pool.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		SELECT COUNT(*)
 		FROM sessions s
 		JOIN apps a ON a.id = s.app_id
 		JOIN user_homes uh ON uh.user_id = s.user_id
 		                  AND uh.app_id  = COALESCE(a.parent_app_id, a.id)
 		WHERE uh.id::text = $1
-		  AND s.state IN ('pending','assigned','starting','running')
+		  AND s.state NOT IN ('stopped','failed')
 	`, homeID).Scan(&n)
 	if err != nil {
 		return false, fmt.Errorf("check live session for home: %w", err)
+	}
+	if n > 0 {
+		return true, nil
+	}
+	// A managed-home swap keeps sessions.app_id on the old app until the agent
+	// confirms the target. GuardHomeForSwap stores this durable detail before
+	// mount resolution. With no durable target ID, protect every home on the
+	// same user and host until rejection, rollback, commit or terminal state.
+	err = tx.QueryRow(ctx, `SELECT COUNT(*) FROM sessions s JOIN user_homes uh
+		ON uh.user_id=s.user_id AND uh.host_id=s.host_id
+		WHERE uh.id::text=$1 AND s.state_detail='swapping'
+		  AND s.state NOT IN ('stopped','failed')`, homeID).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("check pending swap for home: %w", err)
 	}
 	return n > 0, nil
 }

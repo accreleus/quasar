@@ -23,13 +23,14 @@ func peekType(raw []byte) (string, error) {
 
 // RegisterMsg is the first message the agent sends after every connect.
 type RegisterMsg struct {
-	SourcePolicyVersions map[string]int  `json:"source_policy_versions,omitempty"`
-	ConfigPolicyVersions map[string]int  `json:"config_policy_versions,omitempty"`
-	ConfigPolicyGroups   []string        `json:"config_policy_groups"`
-	Type                 string          `json:"type"`
-	NodeName             string          `json:"node_name"`
-	AgentVersion         string          `json:"agent_version"`
-	Auth                 json.RawMessage `json:"auth"`
+	SourcePolicyVersions  map[string]int  `json:"source_policy_versions,omitempty"`
+	TerminalHomeCleanupV1 bool            `json:"terminal_home_cleanup_v1,omitempty"`
+	ConfigPolicyVersions  map[string]int  `json:"config_policy_versions,omitempty"`
+	ConfigPolicyGroups    []string        `json:"config_policy_groups"`
+	Type                  string          `json:"type"`
+	NodeName              string          `json:"node_name"`
+	AgentVersion          string          `json:"agent_version"`
+	Auth                  json.RawMessage `json:"auth"`
 	// Images (image-management P2) is a wholesale snapshot of the agent's managed
 	// images. Keep-if-absent: nil ⇒ key absent, stored host_images rows untouched;
 	// an explicit [] is a real "I have none" and flips ready rows to absent.
