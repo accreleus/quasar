@@ -603,6 +603,22 @@ impl PolicyAgent {
                 Some(evidence(offer, &existing.resolved_settings)),
             ));
         }
+        // The baseline fact is checked against this process's current
+        // pre-policy baseline before resolving: an unstarted grant resolved
+        // from any other baseline is stale evidence, not the offer's fault.
+        let offered_baseline = offer
+            .prerequisites
+            .iter()
+            .find(|fact| fact["kind"] == "deployment_baseline")
+            .and_then(|fact| fact["id"].as_str());
+        if let Some(offered) = offered_baseline {
+            let current = Map::from_iter(self.deployment_baseline.deployment_map());
+            if policy_catalog::deployment_fact(&offer.settings, &current).as_deref()
+                != Some(offered)
+            {
+                return Err("deployment_baseline_changed".into());
+            }
+        }
         let resolved =
             policy_catalog::resolve_group(group, &offer.settings, &self.deployment_baseline)?;
         if !same_resolution(&offer.resolved_settings, &resolved) {
@@ -1593,5 +1609,68 @@ mod tests {
             assert_eq!(active_snapshots["gop"]["kind"], "verified");
             assert_eq!(active_snapshots["gop"]["digest"], o.content_sha256.as_str());
         }
+    }
+
+    /// agent-api.md §RH05: an unstarted grant resolved from a baseline this
+    /// process no longer has is `deployment_baseline_changed` — transient, so
+    /// the control plane re-resolves — checked before resolution, and leaves
+    /// the journal, high-water and last verified snapshot untouched.
+    #[test]
+    fn a_changed_deployment_baseline_rejects_before_acceptance() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = RuntimeSettings::baseline_with(&|_| None);
+        let mut agent = owned_agent(dir.path(), &["gop", "slices"], &mut runtime);
+        let reply = agent.accept(explicit(&agent, "v", "1", "slices", json!(3)), &mut runtime);
+        assert_eq!(phase_of(&reply).0, "applied");
+        let before = runtime.deployment_map();
+        let journal_before = serde_json::to_value(&agent.journal).unwrap();
+
+        let current = runtime.deployment_map()["gop"].as_u64().unwrap();
+        let stale = offer(
+            &agent,
+            "s",
+            "2",
+            "gop",
+            json!({"source":"deployment"}),
+            json!(current + 30),
+        );
+        let reply = agent.accept(stale, &mut runtime);
+        assert_eq!(
+            phase_of(&reply),
+            ("failed", Some("deployment_baseline_changed"))
+        );
+        assert!(!INVALID_REJECTIONS.contains(&"deployment_baseline_changed"));
+        assert_eq!(runtime.deployment_map(), before, "no next-session effect");
+        assert_eq!(
+            serde_json::to_value(&agent.journal).unwrap(),
+            journal_before,
+            "no durable acceptance, high-water or snapshot change"
+        );
+
+        // A current fact with a wrong resolution is still the offer's fault.
+        let mut wrong = offer(
+            &agent,
+            "w",
+            "2",
+            "gop",
+            json!({"source":"deployment"}),
+            json!(current),
+        );
+        wrong.resolved_settings = json!({"gop": current + 30});
+        wrong.content_sha256 = content_digest(&wrong);
+        let reply = agent.accept(wrong, &mut runtime);
+        assert_eq!(phase_of(&reply), ("failed", Some("resolved_mismatch")));
+
+        // Re-resolved from the current baseline, the group applies.
+        let fresh = offer(
+            &agent,
+            "f",
+            "2",
+            "gop",
+            json!({"source":"deployment"}),
+            json!(current),
+        );
+        let reply = agent.accept(fresh, &mut runtime);
+        assert_eq!(phase_of(&reply).0, "applied");
     }
 }

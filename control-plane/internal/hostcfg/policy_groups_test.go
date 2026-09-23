@@ -340,3 +340,90 @@ func TestPolicyEditContextReadsMountAndExistingHomes(t *testing.T) {
 	}
 	assertPolicyCode(t, ValidatePolicyEdit(map[string]PolicyChoice{"home_root": {Source: "explicit", Value: "/srv/homes/u2"}}, policyCtx), "home_conflict")
 }
+
+// agent-api.md §RH05: on deployment_baseline_changed the agent's fresh
+// capacity precedes the rejection. When the stored baseline still resolves
+// the group to the rejected offer's fact, it is invalidated; the rejection
+// never spends the retry budget; an independent group is untouched.
+func TestBaselineChangedRejectionInvalidatesAMatchingStoredBaseline(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	ctx := context.Background()
+	host := newTypedHost(t, pool, "gop", "slices")
+	save(t, store, host.id, map[string]PolicyChoice{"gop": {Source: "deployment"}, "slices": {Source: "explicit", Value: float64(4)}})
+	if _, err := pool.Exec(ctx, `UPDATE host_reconcile_obligations SET retry_count=$2 WHERE host_id=$1::uuid AND resource_key='gop'`, host.id, policyRetryBudget-1); err != nil {
+		t.Fatal(err)
+	}
+	offers := host.offers(t, store)
+	gop, slices := offers["gop"], offers["slices"]
+	if gop == nil || slices == nil {
+		t.Fatalf("offers = %v", offers)
+	}
+	if ok, err := store.ObservePolicyApplied(ctx, host.id, "slices", slices.Revision, slices.ContentSHA256, "next_session", host.connection); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	// The fresh report changes only an unrelated key: gop's projection still
+	// hashes to the rejected fact, so the report cannot be what the agent had.
+	fresh := deploymentBaseline()
+	fresh["slices"] = float64(3)
+	if err := store.ObserveDeploymentSettings(ctx, host.id, host.connection, mustJSON(t, fresh)); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := store.ObservePolicyRejected(ctx, host.id, "gop", gop.Revision, gop.ContentSHA256, "deployment_baseline_changed"); err != nil || !changed {
+		t.Fatalf("rejection = %v %v", changed, err)
+	}
+	if baseline, err := store.DeploymentSettingsForConnection(ctx, host.id, host.connection); err != nil || baseline != nil {
+		t.Fatalf("matching stored baseline survived: %v %v", baseline, err)
+	}
+	expireObligations(t, pool, host.id)
+	if again := host.offers(t, store); len(again) != 0 {
+		t.Fatalf("offered from invalidated evidence: %v", again)
+	}
+	view, err := store.GetPolicy(ctx, host.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Groups["gop"].Status != "pending" || view.Groups["slices"].Status != "applied" {
+		t.Fatalf("status gop=%s slices=%s", view.Groups["gop"].Status, view.Groups["slices"].Status)
+	}
+	// The agent's baseline flips back: the same projection re-resolves the
+	// same candidate, and the rejected attempt did not exhaust the budget.
+	if err := store.ObserveDeploymentSettings(ctx, host.id, host.connection, mustJSON(t, deploymentBaseline())); err != nil {
+		t.Fatal(err)
+	}
+	resumed := host.offers(t, store)["gop"]
+	if resumed == nil || resumed.ContentSHA256 != gop.ContentSHA256 {
+		t.Fatalf("re-offer after fresh evidence = %+v", resumed)
+	}
+}
+
+// A newer capacity already ingested before the rejection is authoritative:
+// it is kept, and the group re-offers from it at once without spending budget.
+func TestBaselineChangedRejectionKeepsANewerIngestedBaseline(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	ctx := context.Background()
+	host := newTypedHost(t, pool, "gop")
+	save(t, store, host.id, map[string]PolicyChoice{"gop": {Source: "deployment"}})
+	if _, err := pool.Exec(ctx, `UPDATE host_reconcile_obligations SET retry_count=$2 WHERE host_id=$1::uuid AND resource_key='gop'`, host.id, policyRetryBudget-1); err != nil {
+		t.Fatal(err)
+	}
+	stale := host.offers(t, store)["gop"]
+	if stale == nil {
+		t.Fatal("no offer")
+	}
+	newer := deploymentBaseline()
+	newer["gop"] = float64(90)
+	if err := store.ObserveDeploymentSettings(ctx, host.id, host.connection, mustJSON(t, newer)); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := store.ObservePolicyRejected(ctx, host.id, "gop", stale.Revision, stale.ContentSHA256, "deployment_baseline_changed"); err != nil || changed {
+		t.Fatalf("stale rejection changed state: %v %v", changed, err)
+	}
+	if baseline, err := store.DeploymentSettingsForConnection(ctx, host.id, host.connection); err != nil || baseline["gop"] != float64(90) {
+		t.Fatalf("newer baseline lost: %v %v", baseline, err)
+	}
+	if offer := host.offers(t, store)["gop"]; offer == nil || offer.ResolvedSettings["gop"] != float64(90) {
+		t.Fatalf("re-offer from newer baseline = %+v", offer)
+	}
+}

@@ -269,6 +269,10 @@ func (s *Store) ObservePolicyRejected(ctx context.Context, hostID, group, revisi
 		return false, err
 	}
 	defer tx.Rollback(ctx)
+	// Host before group, as offers and baseline ingestion lock them.
+	if _, err := tx.Exec(ctx, `SELECT id FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID); err != nil {
+		return false, err
+	}
 	var status string
 	err = tx.QueryRow(ctx, `SELECT status FROM host_setting_groups WHERE host_id=$1::uuid AND group_key=$2 AND desired_revision=$3 AND desired_digest=$4 AND scope='next_session' FOR UPDATE`, hostID, group, n, digest).Scan(&status)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -294,12 +298,40 @@ func (s *Store) ObservePolicyRejected(ctx context.Context, hostID, group, revisi
 			return false, err
 		}
 	case code == "deployment_baseline_changed":
-		// The fresh baseline precedes this report on the socket; re-resolve now.
-		if _, err := tx.Exec(ctx, `UPDATE host_reconcile_obligations SET next_attempt_at=now() WHERE host_id=$1::uuid AND kind='setting' AND resource_key=$2`, hostID, group); err != nil {
+		// The fresh baseline precedes this report; a newer one already moved
+		// desired_digest past this row. semantics: agent-api.md §RH05.
+		if err := invalidateRejectedBaseline(ctx, tx, hostID, group, n, digest); err != nil {
+			return false, err
+		}
+		// Stale evidence is not a failed attempt: return the offer's claim.
+		if _, err := tx.Exec(ctx, `UPDATE host_reconcile_obligations SET retry_count=GREATEST(retry_count-1,0),next_attempt_at=now() WHERE host_id=$1::uuid AND kind='setting' AND resource_key=$2`, hostID, group); err != nil {
 			return false, err
 		}
 	}
 	return true, tx.Commit(ctx)
+}
+
+// invalidateRejectedBaseline clears the stored deployment baseline only while
+// group's projection of it still resolves to the rejected content digest.
+func invalidateRejectedBaseline(ctx context.Context, tx pgx.Tx, hostID, group string, revision int64, digest string) error {
+	var raw []byte
+	if err := tx.QueryRow(ctx, `SELECT deployment_settings FROM hosts WHERE id=$1::uuid`, hostID).Scan(&raw); err != nil || raw == nil {
+		return err
+	}
+	baseline, err := ParseDeploymentSettings(raw)
+	if err != nil {
+		return nil
+	}
+	choices, err := loadPolicyChoices(ctx, tx, hostID)
+	if err != nil {
+		return err
+	}
+	candidate, reason, err := resolveGroupCandidate(group, revision, choices, baseline)
+	if err != nil || reason != "" || candidate.Digest != digest {
+		return err
+	}
+	_, err = tx.Exec(ctx, `UPDATE hosts SET deployment_settings=NULL,deployment_settings_connection=NULL,deployment_settings_reported_at=NULL WHERE id=$1::uuid`, hostID)
+	return err
 }
 
 // RetryPolicyGroup re-arms a next-session group whose transient retry budget

@@ -2144,14 +2144,7 @@ async fn connect_and_run(
                         // before handle_control consumes ctrl.
                         let was_config_update = matches!(ctrl, ControlMsg::ConfigUpdate { .. });
                         if let Some(reply) = mgr.handle_control(ctrl, evt_tx, diagnostic_tx) {
-                            let typed_applied = matches!(&reply,
-                                AgentMsg::ConfigPolicyState { phase, .. } if phase == "applied");
-                            send(&mut tx, &reply).await?;
-                            // A typed apply can withdraw probe-proven codecs (`zerocopy`);
-                            // the control plane must not keep routing on the old set.
-                            if typed_applied {
-                                send_fresh_capacity(&mut tx, &mut *mgr).await?;
-                            }
+                            send_control_reply(&mut tx, &mut *mgr, reply).await?;
                         }
                         if was_config_update {
                             // The overlay may have flipped the effective encoder live, so
@@ -4876,6 +4869,34 @@ where
         readiness: Some(mgr.readiness.merged()),
     };
     send(sink, &msg).await
+}
+
+/// Send a `handle_control` reply with the capacity reports it needs.
+async fn send_control_reply<S>(
+    sink: &mut S,
+    mgr: &mut SessionManager,
+    reply: AgentMsg,
+) -> anyhow::Result<()>
+where
+    S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    let typed_applied =
+        matches!(&reply, AgentMsg::ConfigPolicyState { phase, .. } if phase == "applied");
+    // agent-api.md §RH05: the fresh baseline precedes a
+    // `deployment_baseline_changed` rejection on this ordered socket, so the
+    // control plane reads the rejection against current evidence.
+    if matches!(&reply, AgentMsg::ConfigPolicyState { error: Some(code), .. }
+        if code == "deployment_baseline_changed")
+    {
+        send_fresh_capacity(sink, mgr).await?;
+    }
+    send(sink, &reply).await?;
+    // A typed apply can withdraw probe-proven codecs (`zerocopy`); the control
+    // plane must not keep routing on the old set.
+    if typed_applied {
+        send_fresh_capacity(sink, mgr).await?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn send<S>(sink: &mut S, msg: &AgentMsg) -> anyhow::Result<()>
@@ -8382,6 +8403,56 @@ mod tests {
         mgr.policy_agent = Some(agent);
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
         mgr.handle_control(typed_offer_msg(offer), &evt_tx, &diagnostic_sender())
+    }
+
+    /// agent-api.md §RH05: a `deployment_baseline_changed` rejection is
+    /// preceded on the same ordered socket by a fresh capacity baseline, so
+    /// the control plane never reads the rejection against stale evidence.
+    #[tokio::test]
+    async fn a_baseline_changed_rejection_follows_a_fresh_capacity_baseline() {
+        use crate::policy::test_support::{offer, owned_agent};
+        let (mut mgr, _live_refs) = manager_with_runner(default_runner());
+        let dir = tempfile::tempdir().unwrap();
+        let agent = owned_agent(dir.path(), &["gop"], &mut mgr.runtime_settings);
+        let current = mgr.deployment_baseline.deployment_map()["gop"]
+            .as_u64()
+            .unwrap();
+        let stale = offer(
+            &agent,
+            "stale",
+            "1",
+            "gop",
+            serde_json::json!({"source":"deployment"}),
+            serde_json::json!(current + 30),
+        );
+        mgr.policy_agent = Some(agent);
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+        let reply = mgr
+            .handle_control(typed_offer_msg(stale), &evt_tx, &diagnostic_sender())
+            .unwrap();
+
+        let mut wire: Vec<Message> = Vec::new();
+        let mut sink = (&mut wire).sink_map_err(
+            |never: std::convert::Infallible| -> tokio_tungstenite::tungstenite::Error {
+                match never {}
+            },
+        );
+        send_control_reply(&mut sink, &mut mgr, reply)
+            .await
+            .unwrap();
+        let sent: Vec<serde_json::Value> = wire
+            .iter()
+            .map(|m| serde_json::from_str(m.to_text().unwrap()).unwrap())
+            .collect();
+        let types: Vec<&str> = sent.iter().map(|m| m["type"].as_str().unwrap()).collect();
+        assert_eq!(types, ["capacity", "config_policy_state"], "{sent:?}");
+        assert_eq!(
+            sent[0]["deployment_settings"]["gop"],
+            serde_json::json!(current),
+            "the capacity carries the agent's current baseline"
+        );
+        assert_eq!(sent[1]["phase"], "failed");
+        assert_eq!(sent[1]["error"], "deployment_baseline_changed");
     }
 
     fn applied(reply: &Option<AgentMsg>) -> bool {
