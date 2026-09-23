@@ -715,6 +715,98 @@ func TestFleetCompletionReleasesOnlyItsOwnAdmissionRestriction(t *testing.T) {
 	}
 }
 
+// A run that finished before its cordon cleanup resumes on the next boot.
+// Historical was_cordoned is a snapshot, not authority to re-impose a manual
+// drain or clear one that an operator added while the run was active.
+func TestTerminalUnrestoredRunReleasesOnlyOwnedRows(t *testing.T) {
+	h := newFleetHarness(t, commitA, parkedDrivers{})
+	ctx := context.Background()
+	holds := admission.NewStore(h.pool)
+	run, err := h.store.CreateRun(ctx, h.release.ID, false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previouslyDrainedHost := seedHost(t, h.pool, "fleet-restore-previous-drain", commitA, "online")
+	if err := h.store.SetCordonedHosts(ctx, run.ID, []HostCordon{
+		{HostID: h.hostID, WasCordoned: false},
+		{HostID: previouslyDrainedHost, WasCordoned: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holds.Acquire(ctx, h.hostID, admission.Owner{Kind: admission.Platform, ID: run.ID}, admission.ReasonPlatformApply); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holds.Acquire(ctx, h.hostID, admission.LegacyOwner, admission.ReasonLegacyDrain); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `UPDATE platform_apply_runs SET state='failed', finished_at=now()
+		WHERE id=$1::uuid`, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	h.fleet.cordons = FleetCordons{
+		ReleaseOwned: func(ctx context.Context, runID, hostID string) error {
+			_, err := holds.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: runID}, true)
+			return err
+		},
+	}
+	h.fleet.ResumeCordonRestores(ctx)
+	var restored bool
+	if err := h.pool.QueryRow(ctx, `SELECT cordons_restored_at IS NOT NULL FROM platform_apply_runs
+		WHERE id=$1::uuid`, run.ID).Scan(&restored); err != nil || !restored {
+		t.Fatalf("restore marker = %v (%v), want stamped", restored, err)
+	}
+	remaining, err := holds.List(ctx, h.hostID)
+	if err != nil || len(remaining) != 1 || remaining[0].OwnerKind != admission.Legacy {
+		t.Fatalf("new drain after run cleanup = %+v (%v), want legacy only", remaining, err)
+	}
+	if status, err := h.store.HostStatus(ctx, h.hostID); err != nil || status != "draining" {
+		t.Fatalf("legacy host status = %q (%v), want draining", status, err)
+	}
+	if status, err := h.store.HostStatus(ctx, previouslyDrainedHost); err != nil || status != "online" {
+		t.Fatalf("was_cordoned=true host status = %q (%v), want unchanged online", status, err)
+	}
+}
+
+func TestNewFleetRunOwnsRestrictionOnAlreadyDrainedHost(t *testing.T) {
+	h := newFleetHarness(t, commitA, parkedDrivers{})
+	ctx := context.Background()
+	holds := admission.NewStore(h.pool)
+	if _, err := holds.Acquire(ctx, h.hostID, admission.ManualOwner, admission.ReasonManualDrain); err != nil {
+		t.Fatal(err)
+	}
+	h.fleet.cordons = FleetCordons{
+		AcquireOwned: func(ctx context.Context, runID, hostID string) error {
+			_, err := holds.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: runID}, admission.ReasonPlatformApply)
+			return err
+		},
+		ReleaseOwned: func(ctx context.Context, runID, hostID string) error {
+			_, err := holds.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: runID}, true)
+			return err
+		},
+	}
+	code, raw := h.do(t, http.MethodPost, "/v1/admin/platform/apply", h.admin,
+		FleetApplyRequest{ReleaseID: h.release.ID})
+	if code != http.StatusAccepted {
+		t.Fatalf("POST apply = %d %s", code, raw)
+	}
+	run := decodeRun(t, raw)
+	waitFor(t, "fleet hold on previously drained host", func() bool {
+		states, err := h.store.CordonedHosts(ctx, run.ID)
+		if err != nil || len(states) != 1 || !states[0].WasCordoned {
+			return false
+		}
+		rs, err := holds.List(ctx, h.hostID)
+		return err == nil && len(rs) == 2
+	})
+	if status, err := holds.ReleaseManual(ctx, h.hostID, true); err != nil || status != "draining" {
+		t.Fatalf("manual release during active run = %q (%v), want draining", status, err)
+	}
+	rs, err := holds.List(ctx, h.hostID)
+	if err != nil || len(rs) != 1 || rs[0].OwnerKind != admission.Platform {
+		t.Fatalf("remaining restriction = %+v (%v), want platform", rs, err)
+	}
+}
+
 // The other half: a release carrying a migration still drains the whole fleet
 // first, and waits rather than stopping anything.
 func TestFleetStillDrainsWhenTheReleaseCarriesAMigration(t *testing.T) {

@@ -139,9 +139,7 @@ func (c *Coordinator) UncordonHost(ctx context.Context, hostID string) (Host, er
 		return Host{}, err
 	}
 	switch h.Status {
-	case "offline":
-		return Host{}, ErrHostNotResumable
-	case "online", "draining":
+	case "offline", "online", "draining":
 		// A nil seam means unwired, not disconnected: reading it as disconnected
 		// would strand a host whose agent is connected and so never reconnects to
 		// flip the row back.

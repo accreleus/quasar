@@ -1,19 +1,21 @@
 -- RH05 #337: independently owned admission restrictions.
 CREATE TABLE host_admission_restrictions (
     host_id UUID NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
-    owner_kind TEXT NOT NULL CHECK (owner_kind IN ('manual','platform','idle_apply','recovery','legacy')),
+    owner_kind TEXT NOT NULL CHECK (owner_kind IN ('manual','platform','idle_apply','recovery','legacy','reconciliation')),
     owner_id UUID NOT NULL,
-    reason TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK (reason IN ('manual_drain','legacy_drain','platform_apply',
+        'idle_configuration','configuration_recovery','journal_reconciliation','journal_quarantine')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (owner_kind <> 'manual' OR owner_id = '00000000-0000-0000-0000-000000000000'::uuid),
     CHECK (owner_kind <> 'legacy' OR owner_id = '00000000-0000-0000-0000-000000000001'::uuid),
+    CHECK (owner_kind <> 'reconciliation' OR owner_id = '00000000-0000-0000-0000-000000000002'::uuid),
     PRIMARY KEY (host_id, owner_kind, owner_id)
 );
 
 -- Preserve active fleet runs whose own cordons were recorded. A terminal run
 -- still awaiting restoration retains its protection across the migration.
 INSERT INTO host_admission_restrictions (host_id, owner_kind, owner_id, reason)
-SELECT DISTINCT (item->>'host_id')::uuid, 'platform', r.id, 'Platform apply'
+SELECT DISTINCT (item->>'host_id')::uuid, 'platform', r.id, 'platform_apply'
 FROM platform_apply_runs r
 CROSS JOIN LATERAL jsonb_array_elements(r.cordoned_hosts) item
 JOIN hosts h ON h.id = (item->>'host_id')::uuid
@@ -27,7 +29,7 @@ ON CONFLICT DO NOTHING;
 -- after upgrade. This can require one extra resume, but never reopens work.
 INSERT INTO host_admission_restrictions (host_id, owner_kind, owner_id, reason)
 SELECT h.id, 'legacy', '00000000-0000-0000-0000-000000000001'::uuid,
-       'Existing drain; review before resuming'
+       'legacy_drain'
 FROM hosts h
 WHERE h.status = 'draining'
 ON CONFLICT DO NOTHING;

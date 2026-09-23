@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/accreleus/quasar/control-plane/internal/readinessgate"
 )
 
@@ -125,14 +126,15 @@ type App struct {
 
 // Host is the domain view of a host (agent).
 type Host struct {
-	ID             string     `json:"id"`
-	NodeName       string     `json:"node_name"`
-	Status         string     `json:"status"` // online|offline|draining
-	AgentVersion   *string    `json:"agent_version"`
-	CPUCores       *int32     `json:"cpu_cores"`
-	MemMB          *int32     `json:"mem_mb"`
-	LastRegistered *time.Time `json:"last_registered_at"`
-	LastHeartbeat  *time.Time `json:"last_heartbeat_at"`
+	ID                    string                  `json:"id"`
+	NodeName              string                  `json:"node_name"`
+	Status                string                  `json:"status"` // online|offline|draining
+	AdmissionRestrictions []admission.Restriction `json:"admission_restrictions"`
+	AgentVersion          *string                 `json:"agent_version"`
+	CPUCores              *int32                  `json:"cpu_cores"`
+	MemMB                 *int32                  `json:"mem_mb"`
+	LastRegistered        *time.Time              `json:"last_registered_at"`
+	LastHeartbeat         *time.Time              `json:"last_heartbeat_at"`
 	// Storage: agent-reported volumes (schema.md hosts.storage), null until
 	// an amendment-aware agent reports.
 	Storage json.RawMessage `json:"storage"`
@@ -1210,6 +1212,9 @@ func (s *store) listHosts(ctx context.Context, cursor string, limit int32) ([]Ho
 	if err := s.attachReadinessGates(ctx, hosts, dbNow); err != nil {
 		return nil, "", err
 	}
+	if err := s.attachAdmissionRestrictions(ctx, hosts); err != nil {
+		return nil, "", err
+	}
 	return hosts, nextCursor, nil
 }
 
@@ -1251,7 +1256,31 @@ func (s *store) getHost(ctx context.Context, id string) (Host, error) {
 	if err := s.attachReadinessGates(ctx, one, dbNow); err != nil {
 		return Host{}, err
 	}
+	if err := s.attachAdmissionRestrictions(ctx, one); err != nil {
+		return Host{}, err
+	}
 	return one[0], nil
+}
+
+func (s *store) attachAdmissionRestrictions(ctx context.Context, hosts []Host) error {
+	if len(hosts) == 0 {
+		return nil
+	}
+	ids := make([]string, len(hosts))
+	for i := range hosts {
+		ids[i] = hosts[i].ID
+	}
+	byHost, err := admission.NewStore(s.pool).ListForHosts(ctx, ids)
+	if err != nil {
+		return fmt.Errorf("read host admission restrictions: %w", err)
+	}
+	for i := range hosts {
+		hosts[i].AdmissionRestrictions = byHost[hosts[i].ID]
+		if hosts[i].AdmissionRestrictions == nil {
+			hosts[i].AdmissionRestrictions = []admission.Restriction{}
+		}
+	}
+	return nil
 }
 
 // deleteApp hard-deletes an app in one transaction: 404 if absent, 409 on any

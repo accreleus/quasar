@@ -282,7 +282,7 @@ func TestAdmissionRestrictionWinsReservationRace(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO host_admission_restrictions (host_id,owner_kind,owner_id,reason)
-		VALUES ($1::uuid,'platform','00000000-0000-0000-0000-000000000123'::uuid,'Platform apply')`, s.hostID); err != nil {
+		VALUES ($1::uuid,'platform','00000000-0000-0000-0000-000000000123'::uuid,'platform_apply')`, s.hostID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tx.Exec(ctx, `UPDATE hosts SET status='draining' WHERE id=$1::uuid`, s.hostID); err != nil {
@@ -344,6 +344,24 @@ func TestUncordonOfflineConflict(t *testing.T) {
 	}
 	if st := hostStatus(t, pool, s.hostID); st != "offline" {
 		t.Fatalf("status after refused uncordon: got %q want offline", st)
+	}
+}
+
+func TestUncordonOfflineHostReleasesItsManualHold(t *testing.T) {
+	pool := testDB(t)
+	_, coord, _ := newCoord(t, pool)
+	s := seed(t, pool, 4)
+	ctx := context.Background()
+	if _, err := coord.DrainHost(ctx, s.hostID, false); err != nil {
+		t.Fatal(err)
+	}
+	setHostStatusRaw(t, pool, s.hostID, "offline")
+	h, err := coord.UncordonHost(ctx, s.hostID)
+	if err != nil || h.Status != "offline" {
+		t.Fatalf("uncordon offline hold = %+v (%v), want 200 with offline status", h, err)
+	}
+	if restrictions, err := admission.NewStore(pool).List(ctx, s.hostID); err != nil || len(restrictions) != 0 {
+		t.Fatalf("offline hold after uncordon = %+v (%v), want none", restrictions, err)
 	}
 }
 

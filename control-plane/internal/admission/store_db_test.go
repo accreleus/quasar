@@ -137,3 +137,41 @@ func TestMigrationKeepsAmbiguousDrainAfterPlatformRelease(t *testing.T) {
 		t.Fatalf("after uncordon = %+v (%v), want no holds", remaining, err)
 	}
 }
+
+func TestRestrictionSchemaBoundsReasonAndReconciliationOwner(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var hostID string
+	if err := tx.QueryRow(ctx, `INSERT INTO hosts (node_name,status)
+		VALUES ('rh05-admission-code-check','offline') RETURNING id::text`).Scan(&hostID); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, ownerID, reason string
+	}{
+		{"non-fixed reconciliation owner", "00000000-0000-0000-0000-000000000123", ReasonJournalReconciliation},
+		{"free-form reason", ReconciliationOwner.ID, "private host details"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := tx.Exec(ctx, `SAVEPOINT invalid_restriction`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO host_admission_restrictions
+				(host_id,owner_kind,owner_id,reason) VALUES ($1::uuid,'reconciliation',$2::uuid,$3)`,
+				hostID, tc.ownerID, tc.reason); err == nil {
+				t.Fatal("schema accepted invalid admission restriction")
+			}
+			if _, err := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT invalid_restriction`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `RELEASE SAVEPOINT invalid_restriction`); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}

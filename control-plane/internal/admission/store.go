@@ -15,19 +15,30 @@ import (
 type Kind string
 
 const (
-	Manual    Kind = "manual"
-	Platform  Kind = "platform"
-	IdleApply Kind = "idle_apply"
-	Recovery  Kind = "recovery"
-	Legacy    Kind = "legacy"
+	Manual         Kind = "manual"
+	Platform       Kind = "platform"
+	IdleApply      Kind = "idle_apply"
+	Recovery       Kind = "recovery"
+	Legacy         Kind = "legacy"
+	Reconciliation Kind = "reconciliation"
+
+	ReasonManualDrain           = "manual_drain"
+	ReasonLegacyDrain           = "legacy_drain"
+	ReasonPlatformApply         = "platform_apply"
+	ReasonIdleConfiguration     = "idle_configuration"
+	ReasonConfigurationRecovery = "configuration_recovery"
+	ReasonJournalReconciliation = "journal_reconciliation"
+	ReasonJournalQuarantine     = "journal_quarantine"
 )
 
 // These two owners have fixed IDs; run and attempt owners use their durable ID.
 var (
-	ManualOwner     = Owner{Kind: Manual, ID: "00000000-0000-0000-0000-000000000000"}
-	LegacyOwner     = Owner{Kind: Legacy, ID: "00000000-0000-0000-0000-000000000001"}
-	ErrHostNotFound = errors.New("host not found")
-	ErrHostOffline  = errors.New("host offline")
+	ManualOwner         = Owner{Kind: Manual, ID: "00000000-0000-0000-0000-000000000000"}
+	LegacyOwner         = Owner{Kind: Legacy, ID: "00000000-0000-0000-0000-000000000001"}
+	ReconciliationOwner = Owner{Kind: Reconciliation, ID: "00000000-0000-0000-0000-000000000002"}
+	ErrHostNotFound     = errors.New("host not found")
+	ErrHostOffline      = errors.New("host offline")
+	ErrInvalidReason    = errors.New("invalid admission reason for owner")
 )
 
 type Owner struct {
@@ -58,6 +69,11 @@ func (s *Store) AcquireOnline(ctx context.Context, hostID string, owner Owner, r
 }
 
 func (s *Store) acquire(ctx context.Context, hostID string, owner Owner, reason string, onlineOnly bool) (string, error) {
+	var err error
+	reason, err = safeReason(owner.Kind, reason)
+	if err != nil {
+		return "", err
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return "", err
@@ -151,13 +167,14 @@ func (s *Store) ReleaseManual(ctx context.Context, hostID string, connected bool
 		}
 		return "", err
 	}
-	if status == "offline" {
-		return "", ErrHostOffline
-	}
-	if _, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions WHERE host_id=$1::uuid
+	deleted, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions WHERE host_id=$1::uuid
 		AND ((owner_kind='manual' AND owner_id='00000000-0000-0000-0000-000000000000'::uuid)
-		  OR (owner_kind='legacy' AND owner_id='00000000-0000-0000-0000-000000000001'::uuid))`, hostID); err != nil {
+		  OR (owner_kind='legacy' AND owner_id='00000000-0000-0000-0000-000000000001'::uuid))`, hostID)
+	if err != nil {
 		return "", err
+	}
+	if status == "offline" && deleted.RowsAffected() == 0 {
+		return "", ErrHostOffline
 	}
 	var held bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM host_admission_restrictions WHERE host_id=$1::uuid)`, hostID).Scan(&held); err != nil {
@@ -183,19 +200,66 @@ func (s *Store) ReleaseManual(ctx context.Context, hostID string, connected bool
 }
 
 func (s *Store) List(ctx context.Context, hostID string) ([]Restriction, error) {
-	rows, err := s.pool.Query(ctx, `SELECT owner_kind,reason,created_at FROM host_admission_restrictions
-		WHERE host_id=$1::uuid ORDER BY created_at,owner_kind,owner_id`, hostID)
+	byHost, err := s.ListForHosts(ctx, []string{hostID})
+	if err != nil {
+		return nil, err
+	}
+	if restrictions, ok := byHost[hostID]; ok {
+		return restrictions, nil
+	}
+	return []Restriction{}, nil
+}
+
+// ListForHosts reads one Host page in a single round trip. Internal owner IDs
+// are used only for stable ordering and are never included in the returned
+// restriction. The public reason is derived from owner kind and gate state.
+func (s *Store) ListForHosts(ctx context.Context, hostIDs []string) (map[string][]Restriction, error) {
+	out := make(map[string][]Restriction, len(hostIDs))
+	if len(hostIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.pool.Query(ctx, `SELECT host_id::text,owner_kind,reason,created_at FROM host_admission_restrictions
+		WHERE host_id::text=ANY($1) ORDER BY owner_kind,created_at,owner_id`, hostIDs)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := make([]Restriction, 0)
 	for rows.Next() {
+		var hostID string
 		var r Restriction
-		if err := rows.Scan(&r.OwnerKind, &r.Reason, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&hostID, &r.OwnerKind, &r.Reason, &r.CreatedAt); err != nil {
 			return nil, err
 		}
-		out = append(out, r)
+		r.Reason, err = safeReason(r.OwnerKind, r.Reason)
+		if err != nil {
+			return nil, err
+		}
+		out[hostID] = append(out[hostID], r)
 	}
 	return out, rows.Err()
+}
+
+// safeReason enforces the bounded public vocabulary. The table's historical
+// reason value is never forwarded for fixed owner kinds; reconciliation is the
+// only owner whose reason tracks a pending/quarantined gate transition.
+func safeReason(kind Kind, stored string) (string, error) {
+	switch kind {
+	case Manual:
+		return ReasonManualDrain, nil
+	case Legacy:
+		return ReasonLegacyDrain, nil
+	case Platform:
+		return ReasonPlatformApply, nil
+	case IdleApply:
+		return ReasonIdleConfiguration, nil
+	case Recovery:
+		return ReasonConfigurationRecovery, nil
+	case Reconciliation:
+		if stored == ReasonJournalQuarantine || stored == ReasonJournalReconciliation {
+			return stored, nil
+		}
+		return "", ErrInvalidReason
+	default:
+		return "", ErrInvalidReason
+	}
 }
