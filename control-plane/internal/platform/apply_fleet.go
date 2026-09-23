@@ -55,6 +55,7 @@ type fleetStore interface {
 	SetCordonedHosts(ctx context.Context, runID string, states []HostCordon) error
 	CordonedHosts(ctx context.Context, runID string) ([]HostCordon, error)
 	MarkCordonsRestored(ctx context.Context, runID string) error
+	RestoreOwnedCordons(ctx context.Context, runID string, connected func(string) bool) error
 	ClaimUnrestoredCordons(ctx context.Context, limit int) ([]string, error)
 	FleetNonTerminalSessions(ctx context.Context) (int, error)
 	FleetInFlightSessions(ctx context.Context) (int, error)
@@ -74,6 +75,7 @@ type FleetCordons struct {
 	// Manual, idle and recovery owners survive the run's release.
 	AcquireOwned func(ctx context.Context, runID, hostID string) error
 	ReleaseOwned func(ctx context.Context, runID, hostID string) error
+	IsConnected  func(hostID string) bool
 	DrainOwned   func(ctx context.Context, runID, hostID string) error
 	Cordon       func(ctx context.Context, hostID string) error
 	Uncordon     func(ctx context.Context, hostID string) error
@@ -1028,6 +1030,15 @@ func (f *FleetRunner) ResumeCordonRestores(parent context.Context) {
 // The unfinished case is a recovery requirement rather than a log line: the
 // marker stays unset, and the next start's ResumeCordonRestores retries it (#176).
 func (f *FleetRunner) settleCordons(parent context.Context, runID string) {
+	if f.cordons.ReleaseOwned != nil {
+		ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+		defer cancel()
+		if err := f.store.RestoreOwnedCordons(ctx, runID, f.cordons.IsConnected); err != nil {
+			f.log.Error("fleet apply: owned scheduling cleanup is unfinished; it will be retried on the next control-plane start",
+				"run_id", runID, "err", err, "token", "cordon-restore-unfinished")
+		}
+		return
+	}
 	if !f.restoreCordons(parent, runID) {
 		f.log.Error("fleet apply: this run's scheduling cleanup is UNFINISHED; it will be retried on the next control-plane start",
 			"run_id", runID, "token", "cordon-restore-unfinished")
@@ -1054,16 +1065,6 @@ func (f *FleetRunner) restoreCordons(parent context.Context, runID string) bool 
 		f.log.Error("fleet apply: could not read what to restore; hosts may be left out of scheduling",
 			"run_id", runID, "err", err)
 		return false
-	}
-	if f.cordons.ReleaseOwned != nil {
-		allReleased := true
-		for _, st := range states {
-			if err := f.cordons.ReleaseOwned(ctx, runID, st.HostID); err != nil {
-				f.log.Error("fleet apply: could not release own restriction", "run_id", runID, "host_id", st.HostID, "err", err)
-				allReleased = false
-			}
-		}
-		return allReleased
 	}
 	restored := true
 	for _, st := range states {

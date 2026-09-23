@@ -1041,6 +1041,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 			}
 			return err
 		},
+		IsConnected: agentRegistry.IsConnected,
 		DrainOwned: func(ctx context.Context, _, hostID string) error {
 			return coordinator.StopHostSessions(ctx, hostID)
 		},

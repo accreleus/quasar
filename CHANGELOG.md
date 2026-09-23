@@ -30,7 +30,9 @@ own; the two do not move together, and that is deliberate.
   reservations serialize with new holds, and reconnect preserves them. An apply
   that delivers migration 0088 may leave conservative `legacy_drain` holds on
   the fleet; review each Host's active reasons and explicitly release an
-  operator drain where it is safe to resume assignments.
+  operator drain where it is safe to resume assignments. Terminal platform
+  cleanup commits its own hold releases, host status projection and completion
+  marker together, so a failed cleanup can retry without a partial release.
 - **RH05 host policy and selected-app preparation contracts (#334).** Defined typed
   host setting sources, independent application evidence, scoped idle approval and
   recovery, owner-scoped admission, placement and managed-home claims, image

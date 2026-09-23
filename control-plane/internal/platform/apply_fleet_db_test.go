@@ -767,6 +767,79 @@ func TestTerminalUnrestoredRunReleasesOnlyOwnedRows(t *testing.T) {
 	}
 }
 
+func TestTerminalOwnedRestoreCommitsRowsStatusAndMarkerTogether(t *testing.T) {
+	h := newFleetHarness(t, commitA, parkedDrivers{})
+	ctx := context.Background()
+	holds := admission.NewStore(h.pool)
+	run, err := h.store.CreateRun(ctx, h.release.ID, false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherHost := seedHost(t, h.pool, "fleet-atomic-restore", commitA, "online")
+	if err := h.store.SetCordonedHosts(ctx, run.ID, []HostCordon{
+		{HostID: h.hostID, WasCordoned: false},
+		{HostID: otherHost, WasCordoned: false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, hostID := range []string{h.hostID, otherHost} {
+		if _, err := holds.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: run.ID}, admission.ReasonPlatformApply); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := holds.Acquire(ctx, h.hostID, admission.LegacyOwner, admission.ReasonLegacyDrain); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.pool.Exec(ctx, `UPDATE platform_apply_runs SET state='failed',finished_at=now() WHERE id=$1::uuid`, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Force the final marker write to fail after the deletes and projections.
+	// The public restore operation must leave all three effects uncommitted.
+	if _, err := h.pool.Exec(ctx, `ALTER TABLE platform_apply_runs ADD CONSTRAINT test_restore_stamp_failure
+		CHECK (cordons_restored_at IS NULL) NOT VALID`); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.RestoreOwnedCordons(ctx, run.ID, func(string) bool { return true }); err == nil {
+		t.Fatal("restore succeeded despite refused completion marker")
+	}
+	for _, hostID := range []string{h.hostID, otherHost} {
+		rs, err := holds.List(ctx, hostID)
+		if err != nil || len(rs) == 0 || rs[len(rs)-1].OwnerKind != admission.Platform {
+			t.Fatalf("host %s restrictions after failed restore = %+v (%v), platform hold must remain", hostID, rs, err)
+		}
+		if status, err := h.store.HostStatus(ctx, hostID); err != nil || status != "draining" {
+			t.Fatalf("host %s status after failed restore = %q (%v)", hostID, status, err)
+		}
+	}
+	var restored bool
+	if err := h.pool.QueryRow(ctx, `SELECT cordons_restored_at IS NOT NULL FROM platform_apply_runs WHERE id=$1::uuid`, run.ID).Scan(&restored); err != nil || restored {
+		t.Fatalf("marker after failed restore = %v (%v)", restored, err)
+	}
+	if _, err := h.pool.Exec(ctx, `ALTER TABLE platform_apply_runs DROP CONSTRAINT test_restore_stamp_failure`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ { // a repeated delivery is idempotent
+		if err := h.store.RestoreOwnedCordons(ctx, run.ID, func(string) bool { return true }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rs, err := holds.List(ctx, h.hostID); err != nil || len(rs) != 1 || rs[0].OwnerKind != admission.Legacy {
+		t.Fatalf("legacy host after retry = %+v (%v)", rs, err)
+	}
+	if status, err := h.store.HostStatus(ctx, h.hostID); err != nil || status != "draining" {
+		t.Fatalf("legacy host status after retry = %q (%v)", status, err)
+	}
+	if rs, err := holds.List(ctx, otherHost); err != nil || len(rs) != 0 {
+		t.Fatalf("run-only host after retry = %+v (%v)", rs, err)
+	}
+	if status, err := h.store.HostStatus(ctx, otherHost); err != nil || status != "online" {
+		t.Fatalf("run-only host status after retry = %q (%v)", status, err)
+	}
+	if err := h.pool.QueryRow(ctx, `SELECT cordons_restored_at IS NOT NULL FROM platform_apply_runs WHERE id=$1::uuid`, run.ID).Scan(&restored); err != nil || !restored {
+		t.Fatalf("marker after retry = %v (%v)", restored, err)
+	}
+}
+
 func TestNewFleetRunOwnsRestrictionOnAlreadyDrainedHost(t *testing.T) {
 	h := newFleetHarness(t, commitA, parkedDrivers{})
 	ctx := context.Background()
