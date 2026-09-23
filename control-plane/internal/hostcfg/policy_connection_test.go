@@ -125,7 +125,7 @@ func TestDeploymentBaselineIsCurrentConnectionEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	view, err := store.SavePolicy(ctx, hostID, "0", map[string]PolicyChoice{"idle_timeout_secs": {Source: "deployment"}}, nil)
-	if err != nil || view.Groups["idle_timeout_secs"].DesiredDigest != nil {
+	if err != nil || view.Groups["idle_timeout_secs"].DesiredDigest != nil || view.Groups["idle_timeout_secs"].Remedy == nil || !strings.Contains(*view.Groups["idle_timeout_secs"].Remedy, "baseline_unavailable") {
 		t.Fatalf("offline deployment intent = %+v, err=%v", view.Groups["idle_timeout_secs"], err)
 	}
 	if err := store.ObserveDeploymentSettings(ctx, hostID, connection, json.RawMessage(`{"idle_timeout_secs":120,"abr_floor_kbps":null}`)); err != nil {

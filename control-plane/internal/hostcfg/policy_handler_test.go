@@ -78,6 +78,43 @@ func TestInitialIdlePolicyEditorsRaceAtRevisionZero(t *testing.T) {
 	}
 }
 
+func TestInitialIdlePolicyReadDoesNotClaimMissingDeploymentBaseline(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	ctx := context.Background()
+	connection := "00000000-0000-4000-8000-000000000161"
+	if _, err := store.BeginPolicyConnection(ctx, hostID, connection, map[string]int{"typed_settings": 2, "deployment_baseline": 1}, []string{"idle_timeout_secs"}, true); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := store.ConfirmPolicyGroups(ctx, hostID, connection, []string{"idle_timeout_secs"}); err != nil || !ok {
+		t.Fatalf("group echo: ok=%v err=%v", ok, err)
+	}
+	if err := store.ObserveDeploymentSettings(ctx, hostID, connection, json.RawMessage(`{"idle_timeout_secs":120}`)); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(store, &fakeDispatcher{}, nil)
+	r := httptest.NewRequest(http.MethodGet, "/v1/admin/hosts/"+hostID+"/policy", nil)
+	r.SetPathValue("id", hostID)
+	w := httptest.NewRecorder()
+	h.handleGetPolicy(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("policy read: %d %s", w.Code, w.Body.String())
+	}
+	var view PolicyView
+	if err := json.Unmarshal(w.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	group := view.Groups["idle_timeout_secs"]
+	if view.Revision != "0" || group.Status != "pending" || group.DesiredDigest != nil || group.Remedy == nil || !strings.Contains(*group.Remedy, "No RH05 idle policy change has been saved") || strings.Contains(*group.Remedy, "baseline_unavailable") {
+		t.Fatalf("initial policy read falsely requests baseline refresh: %+v", group)
+	}
+	var rowCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM host_setting_groups WHERE host_id=$1::uuid`, hostID).Scan(&rowCount); err != nil || rowCount != 0 {
+		t.Fatalf("initial read persisted a group: count=%d err=%v", rowCount, err)
+	}
+}
+
 func TestLegacyRestartIsAtomicWhileRH05JournalGateIsOpen(t *testing.T) {
 	pool := testPool(t)
 	store := NewStore(pool)

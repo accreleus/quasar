@@ -359,11 +359,12 @@ func (s *Store) GetPolicy(ctx context.Context, hostID string) (PolicyView, error
 	// The first typed edit has no persisted group row yet. Project its current
 	// writer and pending status so the UI can use the revisioned policy PATCH
 	// from revision zero, without exposing the legacy editor on an owned group.
-	if _, exists := view.Groups["idle_timeout_secs"]; !exists {
+	_, idleGroupPersisted := view.Groups["idle_timeout_secs"]
+	if !idleGroupPersisted {
 		group := PolicyGroup{DesiredRevision: view.Revision, Scope: "next_session", Status: "upgrade_required"}
 		if confirmed["idle_timeout_secs"] {
 			group.Status = "pending"
-			remedy := "Waiting for the host to verify the next-session setting."
+			remedy := "No RH05 idle policy change has been saved. Current host behavior has not been verified through this policy."
 			group.Remedy = &remedy
 		} else {
 			remedy := "The legacy writer remains active for this group. Upgrade the agent to enable RH05 verification."
@@ -382,7 +383,7 @@ func (s *Store) GetPolicy(ctx context.Context, hostID string) (PolicyView, error
 			view.Choices[knob.Key] = PolicyChoice{Source: "deployment"}
 		}
 	}
-	if group, ok := view.Groups["idle_timeout_secs"]; ok && group.Status == "pending" && group.DesiredDigest == nil && view.Choices["idle_timeout_secs"].Source == "deployment" {
+	if group, ok := view.Groups["idle_timeout_secs"]; ok && idleGroupPersisted && group.Status == "pending" && group.DesiredDigest == nil && view.Choices["idle_timeout_secs"].Source == "deployment" {
 		remedy := "baseline_unavailable: request a fresh agent capacity report or reconnect before verification."
 		group.Remedy = &remedy
 		view.Groups["idle_timeout_secs"] = group
