@@ -78,7 +78,7 @@ type conn struct {
 	policyInventoryHeader     []byte
 	rh05RestartEntries        []hostcfg.JournalInventoryEntry
 	rh05Snapshots             map[string]hostcfg.PolicySnapshot
-	policyActiveSnapshot      atomic.Pointer[hostcfg.PolicySnapshot]
+	policyActiveSnapshots     atomic.Pointer[map[string]hostcfg.PolicySnapshot]
 	policyOutstanding         map[string]ConfigPolicyStateMsg
 	policySequence            map[string]uint64
 	policySequenceContent     map[string][]byte
@@ -111,14 +111,33 @@ func (r *Registry) PolicyIdentity(hostID string) (string, string, bool) {
 	return c.bootIncarnation, c.connectionIncarnation, true
 }
 
-// PolicyActiveSnapshot returns only the authenticated current connection's
-// completed journal inventory snapshot.
-func (r *Registry) PolicyActiveSnapshot(hostID, connectionID string) *hostcfg.PolicySnapshot {
+// PolicyActiveSnapshots returns only the authenticated current connection's
+// completed journal inventory snapshots, keyed by group. The map is never
+// mutated after publication.
+func (r *Registry) PolicyActiveSnapshots(hostID, connectionID string) map[string]hostcfg.PolicySnapshot {
 	c, ok := r.get(hostID)
 	if !ok || !c.policyTyped || c.connectionIncarnation != connectionID || !c.policyInventoryDone.Load() || c.policyInventoryBlocked.Load() || c.policyAttemptOutstanding.Load() {
 		return nil
 	}
-	return c.policyActiveSnapshot.Load()
+	return c.activePolicySnapshots()
+}
+
+func (c *conn) activePolicySnapshots() map[string]hostcfg.PolicySnapshot {
+	if snapshots := c.policyActiveSnapshots.Load(); snapshots != nil {
+		return *snapshots
+	}
+	return nil
+}
+
+// setActivePolicySnapshot publishes a copy with group replaced; readers on
+// other goroutines keep the map they loaded.
+func (c *conn) setActivePolicySnapshot(group string, snapshot hostcfg.PolicySnapshot) {
+	next := map[string]hostcfg.PolicySnapshot{}
+	for key, value := range c.activePolicySnapshots() {
+		next[key] = value
+	}
+	next[group] = snapshot
+	c.policyActiveSnapshots.Store(&next)
 }
 
 func (r *Registry) PolicyRestartConflict(hostID string) bool {

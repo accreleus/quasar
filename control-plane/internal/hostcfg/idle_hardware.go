@@ -42,10 +42,10 @@ type hardwareReportGPU struct {
 // automaticHardwareEvidence uses reports received after this host registered.
 // The agent still checks the actual device and its most recent probe at offer
 // acceptance; a database report is never treated as proof of application.
-func (s *Store) automaticHardwareEvidence(ctx context.Context, hostID string, selectedNode string) (*hardwareGPU, []ApprovalFact, error) {
+func automaticHardwareEvidence(ctx context.Context, db idleQueryDB, hostID string, selectedNode string) (*hardwareGPU, []ApprovalFact, error) {
 	var readiness, gpuRaw []byte
 	var connectionID string
-	err := s.pool.QueryRow(ctx, `SELECT e.gpus,e.readiness,e.connection_incarnation::text
+	err := db.QueryRow(ctx, `SELECT e.gpus,e.readiness,e.connection_incarnation::text
 		FROM host_hardware_evidence e JOIN hosts h ON h.id=e.host_id
 		JOIN host_journal_reconciliation j ON j.host_id=e.host_id
 		WHERE e.host_id=$1::uuid AND j.state='complete'

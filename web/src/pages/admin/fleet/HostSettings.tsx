@@ -25,19 +25,31 @@ import { KnobRow } from "./settings/KnobRow";
 import { RestartNote } from "./settings/RestartNote";
 import { SettingsRail } from "./settings/SettingsRail";
 import { useHostSettings } from "./settings/useHostSettings";
-import { IdleTimeoutPolicy } from "./settings/IdleTimeoutPolicy";
 import { IdleApplyPolicy } from "./settings/IdleApplyPolicy";
+import { SafeSettingsPolicy } from "./settings/SafeSettingsPolicy";
 import type { SettingValue } from "./settings/knobs";
+
+/** The restart-scope hardware group; typed next-session policy never owns it. */
+const RESTART_GROUP_KEYS = new Set(["encoder", "render_node", "cuda_device"]);
 
 export function HostSettings() {
   const { id } = useParams();
   const s = useHostSettings(id);
   // Resolve writer ownership before exposing either editor. An owned first
   // edit must use the policy endpoint's expected revision even before a group
-  // row exists; the legacy editor has no client CAS token.
-  const [idleOwnership, setIdleOwnership] = useState<{ hostId: string | undefined; available: boolean } | null>(null);
-  const typedIdleAvailable = idleOwnership?.hostId === id ? idleOwnership?.available : null;
-  const onTypedIdleAvailable = useCallback((available: boolean) => setIdleOwnership({ hostId: id, available }), [id]);
+  // row exists; the legacy editor has no client CAS token. Until the typed
+  // panel reports, every key it could own stays hidden here.
+  const [ownership, setOwnership] = useState<{ hostId: string | undefined; keys: Set<string> } | null>(null);
+  const typedKeys = ownership && ownership.hostId === id ? ownership.keys : null;
+  const onOwnedKeys = useCallback((keys: Set<string>) => setOwnership({ hostId: id, keys }), [id]);
+  const legacyOwns = (k: ConfigKnob) => (typedKeys ? !typedKeys.has(k.key) : RESTART_GROUP_KEYS.has(k.key));
+
+  const legacy = {
+    runtime: s.grouped.runtime.filter(legacyOwns),
+    adaptation: s.grouped.adaptation.filter(legacyOwns),
+    encoder: s.grouped.encoder.filter(legacyOwns),
+    advanced: s.grouped.advanced.filter(legacyOwns),
+  };
 
   const renderKnob = (k: ConfigKnob) => {
     const v = s.valueOf(k);
@@ -110,27 +122,27 @@ export function HostSettings() {
 
           <div className="split" style={{ marginTop: "var(--s4)", gridTemplateColumns: "minmax(0,1fr) 300px" }}>
             <div>
-              <IdleTimeoutPolicy hostId={id} onAvailable={onTypedIdleAvailable} />
+              <SafeSettingsPolicy hostId={id} knobs={s.knobs} renderNodeOptions={s.renderNodeOptions} onOwnedKeys={onOwnedKeys} />
               <IdleApplyPolicy hostId={id} />
               <KnobPanel title="Runtime defaults" hint="Changes affect new sessions after the host applies them.">
-                {s.grouped.runtime.filter((knob) => typedIdleAvailable === false || knob.key !== "idle_timeout_secs").map(renderKnob)}
+                {legacy.runtime.map(renderKnob)}
               </KnobPanel>
 
-              <KnobPanel
+              {legacy.adaptation.length > 0 && <KnobPanel
                 title="Adaptation"
                 hint="How a session degrades when the network cannot carry it. Changes apply to the next session launched on this host."
               >
-                {s.grouped.adaptation.map(renderKnob)}
-              </KnobPanel>
+                {legacy.adaptation.map(renderKnob)}
+              </KnobPanel>}
 
               <KnobPanel
                 title="Encoder and GPU"
                 hint="Read by new agent processes. Changing these requires an agent restart."
               >
-                {s.grouped.encoder.map(renderKnob)}
+                {legacy.encoder.map(renderKnob)}
               </KnobPanel>
 
-              <KnobPanel
+              {legacy.advanced.length > 0 && <KnobPanel
                 title="Advanced streaming tuning"
                 hint="Rarely changed. Wrong values here degrade every session on the host."
                 actions={
@@ -139,12 +151,12 @@ export function HostSettings() {
                   </Button>
                 }
               >
-                {s.showAdvanced ? s.grouped.advanced.map(renderKnob) : (
+                {s.showAdvanced ? legacy.advanced.map(renderKnob) : (
                   <p className="hint" style={{ padding: "0 var(--card-pad) var(--s5)" }}>
-                    {s.grouped.advanced.length} advanced controls hidden.
+                    {legacy.advanced.length} advanced controls hidden.
                   </p>
                 )}
-              </KnobPanel>
+              </KnobPanel>}
             </div>
 
             <SettingsRail

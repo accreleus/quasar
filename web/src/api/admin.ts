@@ -711,6 +711,12 @@ export function getHostIdleApply(token: string, hostId: string, attemptId: strin
 export function cancelHostIdleApply(token: string, hostId: string, attemptId: string): Promise<IdleApplyAttempt> {
   return apiFetch<IdleApplyAttempt>(`/admin/hosts/${hostId}/idle-apply/${attemptId}/cancel`, { token, method: "POST" });
 }
+/** Re-arm one next-session group whose transient retry budget is exhausted.
+ *  A control plane that does not serve the route yet answers 404. */
+export function retryHostPolicyGroup(token: string, hostId: string, group: string): Promise<HostPolicyView> {
+  const body: components["schemas"]["HostPolicyRetryRequest"] = { group };
+  return apiFetch<HostPolicyView>(`/admin/hosts/${hostId}/policy/retry`, { token, method: "POST", body });
+}
 
 /** A null value clears that key back to the catalog default. 409
  *  "restart_required" when a restart-class knob changed with live sessions

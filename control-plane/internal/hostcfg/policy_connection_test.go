@@ -141,8 +141,12 @@ func TestDeploymentBaselineIsCurrentConnectionEvidence(t *testing.T) {
 	if ok, err := store.AcknowledgeInitialDelivery(ctx, hostID, connection, id); err != nil || !ok {
 		t.Fatalf("ack: %v %v", ok, err)
 	}
-	snapshot := &PolicySnapshot{Kind: "seeded", Digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
-	offer, err := store.NextSessionOffer(ctx, hostID, "00000000-0000-4000-8000-000000000114", "00000000-0000-4000-8000-000000000115", connection, snapshot)
+	snapshots := map[string]PolicySnapshot{"idle_timeout_secs": {Kind: "seeded", Digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
+	offers, err := store.NextSessionOffers(ctx, hostID, "00000000-0000-4000-8000-000000000115", connection, snapshots, func() string { return "00000000-0000-4000-8000-000000000114" })
+	var offer *PolicyOffer
+	if len(offers) == 1 {
+		offer = offers[0]
+	}
 	if err != nil || offer == nil || offer.ResolvedSettings["idle_timeout_secs"] != float64(120) || len(offer.Prerequisites) != 2 {
 		t.Fatalf("deployment offer = %+v, err=%v", offer, err)
 	}
@@ -174,28 +178,28 @@ func TestCompleteInventorySnapshotSeparatesSeedFromVerifiedApplication(t *testin
 		t.Fatal(err)
 	}
 	digest := *view.Groups["idle_timeout_secs"].DesiredDigest
-	if err := store.ReconcilePolicySnapshot(ctx, hostID, connection, &PolicySnapshot{Kind: "seeded", Digest: digest}); err != nil {
+	if err := store.ReconcilePolicySnapshots(ctx, hostID, connection, map[string]PolicySnapshot{"idle_timeout_secs": {Kind: "seeded", Digest: digest}}); err != nil {
 		t.Fatal(err)
 	}
 	view, err = store.GetPolicy(ctx, hostID)
 	if err != nil || view.Groups["idle_timeout_secs"].Status == "applied" {
 		t.Fatalf("seed counted as applied: %+v, err=%v", view.Groups["idle_timeout_secs"], err)
 	}
-	if err := store.ReconcilePolicySnapshot(ctx, hostID, "00000000-0000-4000-8000-000000000122", &PolicySnapshot{Kind: "verified", Digest: digest}); err != nil {
+	if err := store.ReconcilePolicySnapshots(ctx, hostID, "00000000-0000-4000-8000-000000000122", map[string]PolicySnapshot{"idle_timeout_secs": {Kind: "verified", Digest: digest}}); err != nil {
 		t.Fatal(err)
 	}
 	view, err = store.GetPolicy(ctx, hostID)
 	if err != nil || view.Groups["idle_timeout_secs"].Status == "applied" {
 		t.Fatalf("wrong connection applied: %+v, err=%v", view.Groups["idle_timeout_secs"], err)
 	}
-	if err := store.ReconcilePolicySnapshot(ctx, hostID, connection, &PolicySnapshot{Kind: "verified", Digest: digest}); err != nil {
+	if err := store.ReconcilePolicySnapshots(ctx, hostID, connection, map[string]PolicySnapshot{"idle_timeout_secs": {Kind: "verified", Digest: digest}}); err != nil {
 		t.Fatal(err)
 	}
 	view, err = store.GetPolicy(ctx, hostID)
 	if err != nil || view.Groups["idle_timeout_secs"].Status != "applied" {
 		t.Fatalf("verified active snapshot not applied: %+v, err=%v", view.Groups["idle_timeout_secs"], err)
 	}
-	if err := store.ReconcilePolicySnapshot(ctx, hostID, connection, &PolicySnapshot{Kind: "verified", Digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}); err != nil {
+	if err := store.ReconcilePolicySnapshots(ctx, hostID, connection, map[string]PolicySnapshot{"idle_timeout_secs": {Kind: "verified", Digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}); err != nil {
 		t.Fatal(err)
 	}
 	view, err = store.GetPolicy(ctx, hostID)

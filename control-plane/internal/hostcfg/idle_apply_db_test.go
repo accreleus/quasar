@@ -14,6 +14,7 @@ import (
 
 	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func reviewedIdleApply(p *ApprovalPreview) ApprovalReview {
@@ -21,6 +22,44 @@ func reviewedIdleApply(p *ApprovalPreview) ApprovalReview {
 		PrerequisitesSHA256: p.PrerequisitesSHA256, Prerequisites: p.Prerequisites,
 		ApprovalBootIncarnation: p.ApprovalBootIncarnation, ApprovalReviewID: p.ApprovalReviewID,
 		ExpiresAt: time.Now().UTC().Add(time.Hour)}
+}
+
+func TestIdleApprovalUsesOneConnectionForLockedReview(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	confirmPolicyGroups(t, pool, hostID, "hardware")
+	ctx := context.Background()
+	if _, err := store.SavePolicy(ctx, hostID, "0", map[string]PolicyChoice{
+		"encoder": {Source: "deployment"},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartRH05Boot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	completeEmptyHostJournal(t, store, hostID)
+	if err := store.ObserveDeploymentSettings(ctx, hostID, "00000000-0000-4000-8000-000000000338", json.RawMessage(`{"encoder":"va"}`)); err != nil {
+		t.Fatal(err)
+	}
+	config := pool.Config()
+	config.MaxConns = 1
+	one, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(one.Close)
+	limited := NewStore(one)
+	deadline, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	preview, err := limited.PreviewIdleApply(deadline, hostID, "hardware")
+	if err != nil || preview == nil || !preview.Available {
+		t.Fatalf("single-connection preview failed: %+v %v", preview, err)
+	}
+	approved, err := limited.ApproveIdleApply(deadline, hostID, "hardware", reviewedIdleApply(preview))
+	if err != nil || approved.Phase != "waiting" || !approved.AdmissionRestricted {
+		t.Fatalf("locked review borrowed a second connection or missed the grant: %+v %v", approved, err)
+	}
 }
 
 func TestIdleApplyDeploymentUsesCurrentTypedBaseline(t *testing.T) {
@@ -56,6 +95,15 @@ func TestIdleApplyDeploymentUsesCurrentTypedBaseline(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("deployment fact absent: %+v", preview.Prerequisites)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET status='offline' WHERE id=$1::uuid`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	if unavailable, err := store.PreviewIdleApply(ctx, hostID, "hardware"); err != nil || unavailable != nil {
+		t.Fatalf("offline host offered an approval candidate: %+v %v", unavailable, err)
+	}
+	if _, err := store.ApproveIdleApply(ctx, hostID, "hardware", reviewedIdleApply(preview)); !errors.Is(err, ErrApprovalSuperseded) {
+		t.Fatalf("offline host accepted a reviewed approval: %v", err)
 	}
 }
 
@@ -535,6 +583,13 @@ func TestIdleApplyWaitingReportsCurrentSessionAndPreparationBlockers(t *testing.
 	status, err = store.GetIdleApply(ctx, hostID, approved.AttemptID)
 	if err != nil || status.Remedy == nil || !strings.Contains(*status.Remedy, "no active sessions or preparation") {
 		t.Fatalf("confirmed cleanup did not clear wait reasons: %+v %v", status, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET source_preparation_reported_at=now()-interval '31 seconds' WHERE id=$1::uuid`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	status, err = store.GetIdleApply(ctx, hostID, approved.AttemptID)
+	if err != nil || status.Remedy == nil || !strings.Contains(*status.Remedy, "preparation inventory is unknown") {
+		t.Fatalf("stale preparation report was treated as idle: %+v %v", status, err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE hosts SET source_preparation='{"steam":{"images":{}}}'::jsonb WHERE id=$1::uuid`, hostID); err != nil {
 		t.Fatal(err)

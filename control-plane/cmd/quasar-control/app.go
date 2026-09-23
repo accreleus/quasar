@@ -486,9 +486,14 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// launch, so a UI flip needs no restart.
 	homeRootEnv := strings.TrimSpace(os.Getenv("QUASAR_HOME_ROOT"))
 	homeProvider := storage.New(pool, settingsStore,
-		storage.HostRootResolverFunc(func(ctx context.Context, hostID string) (string, error) {
-			return cfgStore.HomeRoot(ctx, hostID, homeRootEnv)
-		}))
+		storage.HostRootResolverFuncs{
+			Read: func(ctx context.Context, hostID string) (string, error) {
+				return cfgStore.HomeRoot(ctx, hostID, homeRootEnv)
+			},
+			Locked: func(ctx context.Context, tx pgx.Tx, hostID string) (string, error) {
+				return cfgStore.HomeRootTx(ctx, tx, hostID, homeRootEnv)
+			},
+		})
 	jobRegistry.MustRegister(jobs.Definition{
 		ID:          "storage.home_janitor",
 		Name:        "Home janitor",

@@ -62,14 +62,26 @@ type ApprovalReview struct {
 	ExpiresAt               time.Time      `json:"expires_at"`
 }
 
+// idleQueryDB lets the reviewed candidate use the approval transaction's
+// connection. No preview query may borrow another pooled connection while the
+// approval holds the host lock.
+type idleQueryDB interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}
+
 // PreviewIdleApply projects a restart group's already-saved content through
 // its current source choices. An unresolved deployment or Automatic choice is
 // not guessed from a catalog default or sysfs. Such a candidate has no grant.
 func (s *Store) PreviewIdleApply(ctx context.Context, hostID, group string) (*ApprovalPreview, error) {
+	return s.previewIdleApply(ctx, s.pool, hostID, group)
+}
+
+func (s *Store) previewIdleApply(ctx context.Context, db idleQueryDB, hostID, group string) (*ApprovalPreview, error) {
 	var revision int64
 	var digest *string
 	var scope, status string
-	err := s.pool.QueryRow(ctx, `SELECT desired_revision,desired_digest,scope,status FROM host_setting_groups
+	err := db.QueryRow(ctx, `SELECT desired_revision,desired_digest,scope,status FROM host_setting_groups
 		WHERE host_id=$1::uuid AND group_key=$2`, hostID, group).Scan(&revision, &digest, &scope, &status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -85,24 +97,25 @@ func (s *Store) PreviewIdleApply(ctx context.Context, hostID, group string) (*Ap
 	if digest != nil {
 		preview.ContentSHA256 = *digest
 	}
-	if err := s.pool.QueryRow(ctx, `SELECT incarnation::text FROM rh05_control_boot WHERE id=true`).Scan(&preview.ApprovalBootIncarnation); errors.Is(err, pgx.ErrNoRows) {
+	if err := db.QueryRow(ctx, `SELECT incarnation::text FROM rh05_control_boot WHERE id=true`).Scan(&preview.ApprovalBootIncarnation); errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	} else if err != nil {
 		return nil, err
 	}
-	var gateState string
+	var gateState, hostStatus string
 	var gateBoot string
 	var gateConnection *string
-	err = s.pool.QueryRow(ctx, `SELECT state,boot_incarnation::text,connection_incarnation::text
-		FROM host_journal_reconciliation WHERE host_id=$1::uuid`, hostID).Scan(&gateState, &gateBoot, &gateConnection)
-	if errors.Is(err, pgx.ErrNoRows) || gateState != "complete" || gateBoot != preview.ApprovalBootIncarnation || gateConnection == nil {
+	err = db.QueryRow(ctx, `SELECT j.state,j.boot_incarnation::text,j.connection_incarnation::text,h.status
+		FROM host_journal_reconciliation j JOIN hosts h ON h.id=j.host_id WHERE j.host_id=$1::uuid`, hostID).
+		Scan(&gateState, &gateBoot, &gateConnection, &hostStatus)
+	if errors.Is(err, pgx.ErrNoRows) || gateState != "complete" || gateBoot != preview.ApprovalBootIncarnation || gateConnection == nil || hostStatus == "offline" {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	var snapshotKind, snapshotDigest string
-	err = s.pool.QueryRow(ctx, `SELECT kind,digest FROM host_journal_active_snapshots
+	err = db.QueryRow(ctx, `SELECT kind,digest FROM host_journal_active_snapshots
 		WHERE host_id=$1::uuid AND group_key=$2 AND connection_incarnation=$3::uuid`, hostID, group, *gateConnection).Scan(&snapshotKind, &snapshotDigest)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -115,12 +128,12 @@ func (s *Store) PreviewIdleApply(ctx context.Context, hostID, group string) (*Ap
 		factKind = "last_verified_group_digest"
 	}
 	preview.Prerequisites = append(preview.Prerequisites, ApprovalFact{Kind: factKind, ID: snapshotDigest})
-	acceptedDigest, err := s.acceptedAttemptSetDigest(ctx, hostID, group)
+	acceptedDigest, err := acceptedAttemptSetDigest(ctx, db, hostID, group)
 	if err != nil {
 		return nil, err
 	}
 	preview.Prerequisites = append(preview.Prerequisites, ApprovalFact{Kind: "accepted_attempts", ID: acceptedDigest})
-	err = s.pool.QueryRow(ctx, `SELECT review_id::text FROM host_approval_review_tokens
+	err = db.QueryRow(ctx, `SELECT review_id::text FROM host_approval_review_tokens
 		WHERE host_id=$1::uuid AND group_key=$2`, hostID, group).Scan(&preview.ApprovalReviewID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -129,7 +142,7 @@ func (s *Store) PreviewIdleApply(ctx context.Context, hostID, group string) (*Ap
 		return nil, err
 	}
 	var disruptiveOpen bool
-	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(
+	if err := db.QueryRow(ctx, `SELECT EXISTS(
 		SELECT 1 FROM host_config_approvals WHERE host_id=$1::uuid AND state IN ('approved','offered','cancel_pending')
 		UNION ALL
 		SELECT 1 FROM host_config_attempts t WHERE t.host_id=$1::uuid AND t.scope='restart'
@@ -144,22 +157,35 @@ func (s *Store) PreviewIdleApply(ctx context.Context, hostID, group string) (*Ap
 	if status != "pending" && status != "failed" {
 		return nil, nil
 	}
-	rows, err := s.pool.Query(ctx, `SELECT key,source,explicit_value FROM host_setting_choices
+	rows, err := db.Query(ctx, `SELECT key,source,explicit_value FROM host_setting_choices
 		WHERE host_id=$1::uuid AND revision<=$2 ORDER BY key`, hostID, revision)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	type choiceRow struct {
+		key, source string
+		raw         []byte
+	}
+	var choices []choiceRow
+	for rows.Next() {
+		var row choiceRow
+		if err := rows.Scan(&row.key, &row.source, &row.raw); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		choices = append(choices, row)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
 	settings := map[string]PolicyChoice{}
 	deploymentValues := map[string]any{}
 	automaticKeys := []string{}
 	var baseline map[string]any
-	for rows.Next() {
-		var key, source string
-		var raw []byte
-		if err := rows.Scan(&key, &source, &raw); err != nil {
-			return nil, err
-		}
+	for _, row := range choices {
+		key, source, raw := row.key, row.source, row.raw
 		selected, _ := policyGroup(key)
 		if selected != group {
 			continue
@@ -174,7 +200,7 @@ func (s *Store) PreviewIdleApply(ctx context.Context, hostID, group string) (*Ap
 			choice.Value = value
 		case "deployment":
 			if baseline == nil {
-				baseline, err = s.DeploymentSettingsForConnection(ctx, hostID, *gateConnection)
+				baseline, err = deploymentSettingsForConnection(ctx, db, hostID, *gateConnection)
 				if err != nil {
 					return nil, err
 				}
@@ -195,9 +221,6 @@ func (s *Store) PreviewIdleApply(ctx context.Context, hostID, group string) (*Ap
 			preview.Resolved[key] = value
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
 	if len(settings) == 0 {
 		return nil, nil
 	}
@@ -210,7 +233,7 @@ func (s *Store) PreviewIdleApply(ctx context.Context, hostID, group string) (*Ap
 	}
 	if len(automaticKeys) != 0 {
 		selectedNode, _ := preview.Resolved["render_node"].(string)
-		gpu, hardwareFacts, err := s.automaticHardwareEvidence(ctx, hostID, selectedNode)
+		gpu, hardwareFacts, err := automaticHardwareEvidence(ctx, db, hostID, selectedNode)
 		if err != nil {
 			return nil, err
 		}
@@ -258,8 +281,8 @@ func (s *Store) PreviewIdleApply(ctx context.Context, hostID, group string) (*Ap
 	return preview, nil
 }
 
-func (s *Store) acceptedAttemptSetDigest(ctx context.Context, hostID, group string) (string, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id::text,phase FROM host_config_attempts
+func acceptedAttemptSetDigest(ctx context.Context, db idleQueryDB, hostID, group string) (string, error) {
+	rows, err := db.Query(ctx, `SELECT id::text,phase FROM host_config_attempts
 		WHERE host_id=$1::uuid AND group_key=$2 AND started_at IS NOT NULL ORDER BY id::text`, hostID, group)
 	if err != nil {
 		return "", err
@@ -578,7 +601,7 @@ func (s *Store) ApproveIdleApply(ctx context.Context, hostID, group string, revi
 	if currentReviewID != review.ApprovalReviewID {
 		return empty, ErrApprovalSuperseded
 	}
-	preview, err := s.PreviewIdleApply(ctx, hostID, group)
+	preview, err := s.previewIdleApply(ctx, tx, hostID, group)
 	if err != nil {
 		return empty, err
 	}

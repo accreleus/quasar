@@ -49,7 +49,8 @@ func (s *Store) idleWaitRemedy(ctx context.Context, hostID string) (string, erro
 			WHERE image->>'state' IN ('queued','preparing','waiting_image','deferred','failed')),
 		(SELECT COUNT(*) FROM job_runs r WHERE r.host_id=h.id AND r.state IN ('pending','running')),
 		COALESCE(jsonb_typeof(h.source_preparation->'steam'->'images')='array'
-			AND h.source_preparation_reported_at >= h.last_registered_at,false)
+			AND h.source_preparation_reported_at >= h.last_registered_at
+			AND h.source_preparation_reported_at >= now()-interval '30 seconds',false)
 		FROM hosts h WHERE h.id=$1::uuid`, hostID).Scan(&preparing, &runningJobs, &preparationCurrent)
 	if err != nil {
 		return "", err
