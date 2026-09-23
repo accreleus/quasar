@@ -130,6 +130,12 @@ impl Phase {
         matches!(self, Phase::Normal)
     }
 
+    /// A journal fault can still register for independent image work, but it
+    /// must not advertise a configuration writer until a later safe boot.
+    pub fn policy_available(&self) -> bool {
+        !matches!(self, Phase::Diagnostic(fault) if fault.is_policy_journal())
+    }
+
     /// `Some` refuses every launch. Carried on the existing `session_assign` nack.
     pub fn launch_refusal(&self) -> Option<String> {
         match self {
@@ -1075,30 +1081,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_policy_journal_refuses_restart_and_policy_offers_on_the_wire() {
-        let station = Station::policy_journal_corrupt();
-        let mut outbound = Outbound::default();
-        answer(
-            &mut outbound,
-            &station,
-            None,
-            r#"{"type":"restart","id":"restart-1"}"#,
-        )
-        .await
-        .unwrap();
-        answer(&mut outbound, &station, None, r#"{"type":"config_policy_offer","attempt_id":"a","host_id":"h","boot_incarnation":"b","connection_incarnation":"c","group":"hardware","revision":"r","content_sha256":"s","scope":"host","expires_at":"now","prerequisites_sha256":"p","prerequisites":[],"settings":{},"resolved_settings":{}}"#)
-            .await.unwrap();
-        let replies: Vec<serde_json::Value> = outbound
-            .0
-            .iter()
-            .map(|message| serde_json::from_str(message.to_text().unwrap()).unwrap())
-            .collect();
-        assert_eq!(replies.len(), 2);
-        assert_eq!(replies[0]["type"], "ack");
-        assert_eq!(replies[0]["ok"], false);
-        assert_eq!(replies[1]["type"], "config_policy_state");
-        assert_eq!(replies[1]["phase"], "failed");
-        assert_eq!(replies[1]["error"], "diagnostic_mode");
+    async fn policy_journal_faults_refuse_restart_and_policy_offers_on_the_wire() {
+        for station in [
+            Station::policy_journal_corrupt(),
+            Station::policy_journal_write_failed(),
+        ] {
+            let mut outbound = Outbound::default();
+            answer(
+                &mut outbound,
+                &station,
+                None,
+                r#"{"type":"restart","id":"restart-1"}"#,
+            )
+            .await
+            .unwrap();
+            answer(&mut outbound, &station, None, r#"{"type":"config_policy_offer","attempt_id":"a","host_id":"h","boot_incarnation":"b","connection_incarnation":"c","group":"hardware","revision":"r","content_sha256":"s","scope":"host","expires_at":"now","prerequisites_sha256":"p","prerequisites":[],"settings":{},"resolved_settings":{}}"#)
+                .await.unwrap();
+            let replies: Vec<serde_json::Value> = outbound
+                .0
+                .iter()
+                .map(|message| serde_json::from_str(message.to_text().unwrap()).unwrap())
+                .collect();
+            assert_eq!(replies.len(), 2);
+            assert_eq!(replies[0]["type"], "ack");
+            assert_eq!(replies[0]["ok"], false);
+            assert_eq!(replies[1]["type"], "config_policy_state");
+            assert_eq!(replies[1]["phase"], "failed");
+            assert_eq!(replies[1]["error"], "diagnostic_mode");
+        }
     }
 
     #[tokio::test]

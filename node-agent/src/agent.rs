@@ -1749,12 +1749,7 @@ async fn diagnostic_connection(
                 images,
                 &install,
                 false,
-                !matches!(
-                    station.phase(),
-                    crate::diagnostic::Phase::Diagnostic(
-                        crate::diagnostic::Fault::PolicyJournalCorrupt
-                    )
-                ),
+                station.phase().policy_available(),
             )?,
         )
         .await?;
@@ -5687,19 +5682,10 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_policy_diagnostic_registers_without_journal_capability() {
+    fn journal_diagnostics_register_without_policy_capability() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("secret");
         let cfg = test_cfg(path.to_str().unwrap(), Some("enrollment-token"));
-        let diagnostic = register_message(
-            &cfg,
-            false,
-            Vec::new(),
-            &crate::buildinfo::InstallFacts::default(),
-            false,
-            false,
-        )
-        .unwrap();
         let normal = register_message(
             &cfg,
             false,
@@ -5709,10 +5695,24 @@ mod tests {
             true,
         )
         .unwrap();
-        let diagnostic = serde_json::to_value(diagnostic).unwrap();
         let normal = serde_json::to_value(normal).unwrap();
-        assert!(diagnostic.get("config_policy_versions").is_none());
-        assert!(diagnostic.get("config_policy_groups").is_none());
+        for station in [
+            crate::diagnostic::Station::policy_journal_corrupt(),
+            crate::diagnostic::Station::policy_journal_write_failed(),
+        ] {
+            let diagnostic = register_message(
+                &cfg,
+                false,
+                Vec::new(),
+                &crate::buildinfo::InstallFacts::default(),
+                false,
+                station.phase().policy_available(),
+            )
+            .unwrap();
+            let diagnostic = serde_json::to_value(diagnostic).unwrap();
+            assert!(diagnostic.get("config_policy_versions").is_none());
+            assert!(diagnostic.get("config_policy_groups").is_none());
+        }
         assert!(normal.get("config_policy_versions").is_some());
         assert!(normal.get("config_policy_groups").is_some());
     }
