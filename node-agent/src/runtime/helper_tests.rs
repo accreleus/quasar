@@ -5743,3 +5743,46 @@ fn a_dead_fixture_reports_its_real_cause_instead_of_looking_unreachable() {
 
 mod diagnostic_registration;
 mod host_probes;
+
+/// #283: the sibling EGL probe's container lifecycle — recover, create and start, wait,
+/// stop, remove — was bounded only by the client's per-operation deadline, once per
+/// operation, so a wedged daemon could be paid for five times over. The lifecycle takes
+/// ONE budget end to end.
+///
+/// Stalled here at the wait, with the engine still answering — create and start succeed
+/// and the probe container never exits — which is the shape a daemon that wedges after a
+/// readiness refresh already proved it answers (`engine_answered`) presents.
+#[test]
+fn a_stalled_gpu_probe_lifecycle_is_bounded_by_one_budget() {
+    let engine = Engine::new();
+    // The probe container never exits, so `observe` polls until something bounds it.
+    engine.state.lock().unwrap().keep_running = true;
+    let client = engine.client();
+    let (helper, run) = nvidia_probe_request();
+
+    let budget = Duration::from_millis(500);
+    let started = std::time::Instant::now();
+    let error = client
+        .gpu_probe_within(helper, run, budget)
+        .expect_err("a probe container that never exits cannot produce a result");
+    let elapsed = started.elapsed();
+
+    // The engine answered create and start: this is the straddling case, not the
+    // "engine did not answer" arm #274 already made fast.
+    assert_eq!(engine.requests("POST /containers/create"), 1);
+    assert_eq!(engine.requests(&format!("POST /containers/{ID}/start")), 1);
+    assert_eq!(
+        error.kind,
+        ErrorKind::Timeout,
+        "a spent budget is a timeout of the observation, not a verdict about the probe: \
+         {error:?}"
+    );
+    assert!(
+        // Well under the fixture's 2 s per-operation deadline (the pre-fix lifecycle took
+        // just over one of those), with headroom for a loaded full-suite run.
+        elapsed < Duration::from_millis(1500),
+        "the whole lifecycle must be bounded by its {budget:?} budget, not by one client \
+         deadline ({:?}) per operation: took {elapsed:?}",
+        engine.config.deadline
+    );
+}

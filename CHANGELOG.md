@@ -113,6 +113,14 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **Readiness follow-ups from the storage and runtime checks (#266).** The outcome that could
+  not be concluded is now the glossary's `Indeterminate` (was `Inconclusive`) in both the
+  storage write test and the runtime facts — a rename only; both still warn. The engine API
+  floor lives once, in `crate::runtime::API_FLOOR`, which discovery enforces and the
+  `runtime_api_version` wording renders from, so the two cannot quote different numbers (the
+  floor itself is unchanged). The `media_reachability` remediation now says what this host's
+  firewall must accept inbound instead of claiming what is reachable from a client device —
+  the check id, its commands, the port range and the README pointer are unchanged.
 - **Bench evidence is part of the agent workflow, and the bench tooling finds its server the
   way `qbench` does.** `make bench-check` runs `qbench check` as the landing gate for a
   streaming-path change (0 clean, 3 regressed blocks, 4 nothing comparable is not a pass) and
@@ -240,6 +248,15 @@ own; the two do not move together, and that is deliberate.
   on reporting the blocking check and refusing every launch until it was restarted. The
   resume is now retained on the channel, so a waiter that subscribes afterwards still sees
   it.
+- **The sibling EGL probe's container lifecycle is bounded end to end (#283).** After the
+  probe's 60-second result cache missed, it created, started, waited on and removed a real
+  container with each of those steps carrying the runtime client's full deadline on its own
+  — five of them on a daemon that wedged mid-probe. The whole lifecycle now runs under one
+  30-second budget (comfortably clear of the probe container's own 20-second self-limit, so
+  a healthy probe cannot trip it) and reports the same inconclusive result a probe on an
+  unreachable engine already did. An outcome that only says the lifecycle could not run is
+  no longer cached for a minute as if the probe had answered. Verdicts, check ids and the
+  launch gate's behaviour are unchanged.
 - **A busy container runtime no longer fails `host_container_mounts` (#315).** Under load the
   runtime client can be busy or time out for one refresh. That used to report the mount
   check as a failure ("Docker could not inspect the agent's mounts"), which marked the host

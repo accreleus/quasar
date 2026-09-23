@@ -6,7 +6,9 @@
 use super::super::runtime_facts::*;
 use super::super::*;
 use super::{get, FakeRoot};
-use crate::runtime::{ApiVersion, CdiFacts, EngineFacts, EngineInfo, ErrorKind, RuntimeError};
+use crate::runtime::{
+    ApiVersion, CdiFacts, EngineFacts, EngineInfo, ErrorKind, RuntimeError, API_FLOOR,
+};
 
 const ENDPOINT: &str = "unix:///var/run/docker.sock";
 
@@ -238,7 +240,7 @@ fn only_a_definitive_engine_fault_skips_the_other_engine_calls() {
     }
     for fault in [
         RuntimeFault::IncompatibleApi("too old".into()),
-        RuntimeFault::Inconclusive("busy".into()),
+        RuntimeFault::Indeterminate("busy".into()),
     ] {
         assert!(
             observed(Err(fault.clone())).engine_answered(),
@@ -273,7 +275,7 @@ fn a_timeout_reads_as_unreachable() {
     // A busy client is not a broken engine.
     assert!(matches!(
         RuntimeFault::from(RuntimeError::from(ErrorKind::Busy)),
-        RuntimeFault::Inconclusive(_)
+        RuntimeFault::Indeterminate(_)
     ));
 }
 
@@ -291,13 +293,39 @@ fn an_incompatible_api_fails_the_api_check_with_the_floor_and_keeps_the_endpoint
     assert_eq!(endpoint.status, PASS, "the engine answered: {endpoint:?}");
     let api = get(&checks, API_VERSION_ID);
     assert_eq!(api.status, FAIL, "{api:?}");
-    assert!(api.summary.contains(API_FLOOR), "{api:?}");
+    assert!(api.summary.contains(&API_FLOOR.to_string()), "{api:?}");
     assert!(
         api.remediation.to_lowercase().contains("upgrade"),
         "{api:?}"
     );
     assert_eq!(get(&checks, CAPABILITIES_ID).status, SKIP);
     assert_eq!(get(&checks, CDI_ID).status, SKIP);
+}
+
+/// #266: the floor lives once, in the runtime module that enforces it. Every arm of
+/// `runtime_api_version` that names a floor must therefore name THAT one — a bump in
+/// discovery cannot leave the operator reading the retired number.
+#[test]
+fn the_api_version_wording_quotes_the_floor_discovery_enforces() {
+    let floor = API_FLOOR.to_string();
+    let root = FakeRoot::new("runtime-floor-wording");
+
+    let incompatible = probe(&observed(
+        &root,
+        Err(RuntimeFault::IncompatibleApi(
+            "engine offers 1.20-1.38".into(),
+        )),
+    ));
+    let failing = get(&incompatible, API_VERSION_ID);
+    assert!(failing.summary.contains(&floor), "{failing:?}");
+    assert!(failing.remediation.contains(&floor), "{failing:?}");
+
+    let negotiated = probe(&observed(&root, Ok(facts(None))));
+    let passing = get(&negotiated, API_VERSION_ID);
+    assert!(passing.summary.contains(&floor), "{passing:?}");
+
+    // And the one the agent really refuses below, spelled out so a bump has to come here.
+    assert_eq!(API_FLOOR, api(1, 40));
 }
 
 #[test]
@@ -317,11 +345,11 @@ fn a_denied_socket_fails_the_endpoint_with_a_permission_fix() {
 }
 
 #[test]
-fn an_inconclusive_inspection_warns_and_never_fails() {
+fn an_indeterminate_inspection_warns_and_never_fails() {
     let root = FakeRoot::new("runtime-busy");
     let checks = probe(&observed(
         &root,
-        Err(RuntimeFault::Inconclusive("busy".into())),
+        Err(RuntimeFault::Indeterminate("busy".into())),
     ));
     let endpoint = get(&checks, ENDPOINT_ID);
     assert_eq!(endpoint.status, WARN, "{endpoint:?}");
