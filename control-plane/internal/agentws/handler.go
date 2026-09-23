@@ -285,7 +285,7 @@ func (h *Handler) offerNextSessionPolicy(ctx context.Context, c *conn) {
 
 func (h *Handler) offerIdlePolicy(ctx context.Context, c *conn) {
 	if !c.policyIdle || !c.policyAcknowledged.Load() || !c.policyInventoryDone.Load() ||
-		c.policyInventoryBlocked.Load() || c.policyDeliveryID == "" || !c.policyInitialMapApplied.Load() || h.cfgStore == nil {
+		c.policyInventoryBlocked.Load() || h.cfgStore == nil {
 		return
 	}
 	boot, connection, current := h.registry.PolicyIdentity(c.hostID)
