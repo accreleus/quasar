@@ -4992,7 +4992,10 @@ export interface paths {
         delete?: never;
         options?: never;
         head?: never;
-        /** Update per-host overrides (body is {overrides, restart_confirm} — 'settings' is ignored). */
+        /**
+         * Update per-host overrides (body is {overrides, restart_confirm} — 'settings' is ignored).
+         * @description RH05 legacy compatibility exception: this revisionless write serializes under the host settings row and increments the same policy revision. A non-null value chooses explicit; null chooses deployment, even if the prior source was automatic. Relevant unstarted approval is superseded. For an RH05-capable agent a valid disruptive edit returns 200 with restart_triggered:false regardless of live sessions; restart_confirm is accepted but does not approve or start an RH05 restart. The typed group remains pending and pending_restart remains false until an approved restart actually begins. For an older agent the previous restart_required guard and restart_confirm immediate-restart behavior remain; its effective-settings map is not RH05 application proof.
+         */
         patch: {
             parameters: {
                 query?: never;
@@ -5021,7 +5024,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description restart_required — a restart-class knob changed with live sessions and restart_confirm != true (body carries live_sessions). */
+                /** @description Old agents only: restart_required when a restart-class knob changed with live sessions and restart_confirm != true (body carries live_sessions). RH05-capable agents save the edit with 200 instead. */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -5120,7 +5123,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Restart the host's agent without changing overrides (host-observability-2). */
+        /**
+         * Restart the host's agent without changing overrides (host-observability-2).
+         * @description Retains its 200/409 live-session confirm guard on old and RH05-capable agents. An RH05-capable agent restarts only the last verified active configuration; it never activates an unapproved pending candidate. A pending policy group remains pending. pending_restart reflects an actual restart in flight and clears on verified reconnect.
+         */
         post: {
             parameters: {
                 query?: never;
@@ -7144,7 +7150,7 @@ export interface components {
         /** @enum {string} */
         SessionState: "pending" | "assigned" | "starting" | "running" | "stopping" | "stopped" | "failed";
         Error: {
-            /** @description e.g. validation_failed, unauthorized, forbidden, not_found, conflict, session_quota_exceeded, home_in_use, home_not_provisioned, parent_app_disabled, profile_ineligible, profile_not_launchable_for_app, no_host_available, capacity_exhausted, host_not_ready, restart_required, rate_limited, internal. Open string, not an enum: new codes are additive and an unknown one falls through to a client's generic per-status branch. */
+            /** @description e.g. validation_failed, unauthorized, forbidden, not_found, conflict, session_quota_exceeded, home_in_use, home_not_provisioned, parent_app_disabled, profile_ineligible, profile_not_launchable_for_app, no_host_available, capacity_exhausted, host_not_ready, restart_required, stale_revision, unsupported_source, approval_superseded, approval_expired, attempt_conflict, cancel_too_late, retry_exhausted, home_conflict, placement_ineligible, inherited_placement, recovery_uncertain, rate_limited, internal. Open string, not an enum: new codes are additive and an unknown one falls through to a client's generic per-status branch. */
             code: string;
             message: string;
             /** @description Present on restart_required. */
@@ -7873,7 +7879,7 @@ export interface components {
             items: components["schemas"]["Host"][];
             next_cursor: string | null;
         };
-        /** @description GET returns pending_restart; PATCH returns restart_triggered — otherwise same shape. */
+        /** @description GET returns pending_restart; PATCH returns restart_triggered — otherwise same shape. On RH05 agents pending_restart indicates an actual approved or standalone restart in flight, not unapplied intent; PATCH returns restart_triggered:false for disruptive changes and its effective map is informational rather than application proof. */
         HostSettings: {
             resolved?: {
                 [key: string]: unknown;
@@ -7900,8 +7906,214 @@ export interface components {
             overrides: {
                 [key: string]: unknown;
             };
-            /** @description Required true to apply a restart-class knob while the host has live sessions. */
+            /** @description Old agents: required to apply a restart-class knob while live sessions exist. RH05 agents accept this field for compatibility but it grants no idle-apply approval and triggers no restart. */
             restart_confirm?: boolean;
+        };
+        /** @description Canonical nonnegative decimal string; no sign, whitespace or leading zeros. */
+        RH05Revision: string;
+        /** @description Lowercase SHA-256 hex digest of canonical content. */
+        RH05Digest: string;
+        HostPolicyChoice: {
+            /** @enum {string} */
+            source: "automatic" | "deployment" | "explicit";
+            /** @description Required for explicit; forbidden for automatic or deployment. Validated against the frozen hostcfg catalog, including cross-key groups. */
+            value?: unknown;
+        };
+        HostPolicyResolvedValue: {
+            /** @description Resolved JSON value for this setting. */
+            value: unknown;
+            /** @enum {string} */
+            source: "automatic" | "deployment" | "explicit";
+            /**
+             * Format: date-time
+             * @description Null when no reliable resolution evidence exists.
+             */
+            observed_at: string | null;
+            evidence_id?: string | null;
+        };
+        HostPolicyGroup: {
+            desired_revision: components["schemas"]["RH05Revision"];
+            applied_revision: components["schemas"]["RH05Revision"] | null;
+            desired_digest: components["schemas"]["RH05Digest"];
+            applied_digest?: components["schemas"]["RH05Digest"] | null;
+            /** @enum {string} */
+            scope: "next_session" | "restart";
+            /** @enum {string} */
+            status: "pending" | "applied" | "failed" | "upgrade_required" | "uncertain";
+            /** @description Whether the evidence still matches the current agent and prerequisites. */
+            fresh: boolean;
+            /** Format: date-time */
+            observed_at?: string | null;
+            /** @description Actionable reason when pending */
+            remedy: string | null;
+            /** Format: date-time */
+            next_retry_at?: string | null;
+            /** Format: uuid */
+            attempt_id?: string | null;
+            /** @description Server-derived reviewed restart candidate; null for next-session groups or when evidence is unavailable. */
+            approval_preview: components["schemas"]["HostPolicyApprovalPreview"] | null;
+        };
+        /** @description Independent evidence status. Preparation, configuration application and readiness do not imply one another. */
+        HostPolicyEvidenceView: {
+            /** @description Open evidence state; consumers retain unknown values. */
+            status: string;
+            /** Format: date-time */
+            observed_at: string | null;
+            remedy: string | null;
+            detail?: {
+                [key: string]: unknown;
+            };
+        };
+        HostPolicy: {
+            revision: components["schemas"]["RH05Revision"];
+            choices: {
+                [key: string]: components["schemas"]["HostPolicyChoice"];
+            };
+            resolved: {
+                [key: string]: components["schemas"]["HostPolicyResolvedValue"];
+            };
+            groups: {
+                [key: string]: components["schemas"]["HostPolicyGroup"];
+            };
+            image_preparation: components["schemas"]["HostPolicyEvidenceView"];
+            readiness: components["schemas"]["HostPolicyEvidenceView"];
+        };
+        HostPolicyPatch: {
+            expected_revision: components["schemas"]["RH05Revision"];
+            changes: {
+                [key: string]: components["schemas"]["HostPolicyChoice"];
+            };
+        };
+        HostPolicyConflict: {
+            error: components["schemas"]["Error"];
+            current: components["schemas"]["HostPolicy"];
+            /** @description Keys changed since expected_revision. */
+            changed_keys: string[];
+        };
+        HostPolicyRetryRequest: {
+            group: string;
+        };
+        RH05Prerequisite: {
+            kind: string;
+            id: string;
+        };
+        HostPolicyApprovalPreview: {
+            available: boolean;
+            revision: components["schemas"]["RH05Revision"];
+            content_sha256: components["schemas"]["RH05Digest"];
+            /** @description Exact resolved values proposed for this group. */
+            resolved: {
+                [key: string]: unknown;
+            };
+            prerequisites_sha256: components["schemas"]["RH05Digest"];
+            prerequisites: components["schemas"]["RH05Prerequisite"][];
+            remedy: string | null;
+        };
+        IdleApplyRequest: {
+            group: string;
+            expected_revision: components["schemas"]["RH05Revision"];
+            content_sha256: components["schemas"]["RH05Digest"];
+            prerequisites_sha256: components["schemas"]["RH05Digest"];
+            /** @description Exact group-specific facts sorted bytewise by (kind,id): agent image digest, driver, accessible device, passing probe IDs and last verified group digest as relevant. Digest input is each UTF-8 kind, NUL, id, LF. NUL and LF are forbidden within either field. Agent rechecks these facts before durable acceptance. */
+            prerequisites: components["schemas"]["RH05Prerequisite"][];
+            /** Format: date-time */
+            expires_at: string;
+        };
+        IdleApplyAttempt: {
+            /** Format: uuid */
+            attempt_id: string;
+            group: string;
+            revision: components["schemas"]["RH05Revision"];
+            content_sha256: components["schemas"]["RH05Digest"];
+            prerequisites_sha256: components["schemas"]["RH05Digest"];
+            /** @enum {string} */
+            phase: "waiting" | "offered" | "accepted" | "activating" | "awaiting_startup" | "verifying" | "applied" | "failed" | "recovery_verifying" | "recovery_awaiting_startup" | "recovered" | "uncertain" | "cancel_pending" | "revoked_unstarted";
+            /** @description True only after durable agent acceptance is proven; unknown acceptance retains the admission hold. */
+            started: boolean;
+            admission_restricted: boolean;
+            remedy?: string | null;
+            /** Format: date-time */
+            next_retry_at?: string | null;
+        };
+        IdleApplyConflict: {
+            error: components["schemas"]["Error"];
+            current: components["schemas"]["IdleApplyAttempt"];
+        };
+        AppPlacement: {
+            /**
+             * Format: uuid
+             * @description Canonical parent app ID.
+             */
+            app_id: string;
+            /**
+             * Format: uuid
+             * @description Canonical parent ID for a derived tile; null on the parent itself.
+             */
+            inherited_from: string | null;
+            /** @enum {string} */
+            mode: "all_eligible" | "fixed";
+            /** @description Fixed selection; empty is valid and allows no host. */
+            host_ids: string[];
+            revision: components["schemas"]["RH05Revision"];
+            /** @description Selection, preparation and readiness are distinct per-host observations. */
+            hosts: components["schemas"]["AppPlacementHost"][];
+        };
+        AppPlacementHost: {
+            /** Format: uuid */
+            host_id: string;
+            selected: boolean;
+            /** @description Null when preparation evidence is unknown. */
+            prepared: boolean | null;
+            /** @description Null when readiness evidence is unknown. */
+            ready: boolean | null;
+            reason?: string | null;
+        };
+        AppPlacementPatch: {
+            expected_revision: components["schemas"]["RH05Revision"];
+            /** @enum {string} */
+            mode: "all_eligible" | "fixed";
+            /** @description Must be empty for all_eligible. */
+            host_ids: string[];
+        };
+        PlacementConflict: {
+            error: components["schemas"]["Error"];
+            current?: components["schemas"]["AppPlacement"];
+            changed_host_ids?: string[];
+            /**
+             * Format: uuid
+             * @description Present on inherited_placement.
+             */
+            parent_app_id?: string;
+        };
+        HostImageCleanupView: {
+            /** Format: uuid */
+            host_id: string;
+            /** Format: date-time */
+            observed_at: string;
+            images: components["schemas"]["HostImageCleanupCandidate"][];
+        };
+        HostImageCleanupCandidate: {
+            image_id: string;
+            version: string;
+            eligible: boolean;
+            /** @description Current blockers */
+            reasons: string[];
+            generation: components["schemas"]["RH05Revision"];
+        };
+        HostImageCleanupRequest: {
+            image_id: string;
+            version: string;
+            expected_generation: components["schemas"]["RH05Revision"];
+        };
+        HostImageCleanupAttempt: {
+            /** Format: uuid */
+            attempt_id: string;
+            image_id: string;
+            version: string;
+            generation: components["schemas"]["RH05Revision"];
+            /** @enum {string} */
+            state: "pending" | "removing" | "removed" | "failed" | "cancelled";
+            reason?: string | null;
         };
         /**
          * @description Managed-home backing store: auto = local when the session host has an effective home root, volume otherwise. Affects new homes only.

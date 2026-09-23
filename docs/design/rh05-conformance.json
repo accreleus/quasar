@@ -5,58 +5,1048 @@
     {
       "id": "legacy_clear_preserves_agent_detection",
       "seam": "operator",
-      "given": [{"host": "h1", "agent": "rh05", "encoder_env": null, "detected_encoder": "nvenc", "choice": {"encoder": {"source": "explicit", "value": "va"}}}],
-      "when": [{"legacy_patch": {"overrides": {"encoder": null}}}, {"approve_idle_apply": "encoder"}, {"report_verified_post_restart": "nvenc"}],
-      "expect": [{"setting_source": {"encoder": "deployment"}}, {"setting_applied_value": {"encoder": "nvenc"}}]
+      "given": [
+        {
+          "host": "h1",
+          "agent": "rh05",
+          "encoder_env": null,
+          "detected_encoder": "$agent_detected_encoder",
+          "choice": {
+            "encoder": {
+              "source": "explicit",
+              "value": "va"
+            }
+          }
+        }
+      ],
+      "when": [
+        {
+          "legacy_patch": {
+            "overrides": {
+              "encoder": null
+            }
+          }
+        },
+        {
+          "approve_idle_apply": "encoder"
+        },
+        {
+          "report_verified_post_restart": "$agent_detected_encoder"
+        }
+      ],
+      "expect": [
+        {
+          "setting_source": {
+            "encoder": "deployment"
+          }
+        },
+        {
+          "setting_applied_value": {
+            "encoder": "$agent_detected_encoder"
+          }
+        }
+      ]
     },
     {
       "id": "concurrent_edit_rejects_stale_snapshot",
       "seam": "operator",
-      "given": [{"host": "h1", "policy_revision": 7}],
-      "when": [{"save": {"expected_revision": 7, "changes": {"gop": {"source": "explicit", "value": 90}}}}, {"save": {"expected_revision": 7, "changes": {"slices": {"source": "explicit", "value": 4}}}}],
-      "expect": [{"last_result": {"code": "stale_revision", "current_revision": 8, "changed_keys": ["gop"]}}, {"setting_source": {"slices": "deployment"}}]
+      "given": [
+        {
+          "host": "h1",
+          "policy_revision": "7"
+        }
+      ],
+      "when": [
+        {
+          "save": {
+            "expected_revision": "7",
+            "changes": {
+              "gop": {
+                "source": "explicit",
+                "value": 90
+              }
+            }
+          }
+        },
+        {
+          "save": {
+            "expected_revision": "7",
+            "changes": {
+              "slices": {
+                "source": "explicit",
+                "value": 4
+              }
+            }
+          }
+        }
+      ],
+      "expect": [
+        {
+          "last_result": {
+            "code": "stale_revision",
+            "current_revision": "8",
+            "changed_keys": [
+              "gop"
+            ]
+          }
+        },
+        {
+          "setting_source": {
+            "slices": "deployment"
+          }
+        }
+      ]
     },
     {
       "id": "old_agent_does_not_claim_application",
       "seam": "operator",
-      "given": [{"host": "h1", "agent": "legacy"}],
-      "when": [{"save": {"changes": {"encoder": {"source": "automatic"}}}}, {"agent_report": {"legacy_effective_settings": {"encoder": "va"}}}],
-      "expect": [{"setting_status": {"encoder": "upgrade_required"}}, {"configuration_applied": false}]
+      "given": [
+        {
+          "host": "h1",
+          "agent": "legacy"
+        }
+      ],
+      "when": [
+        {
+          "save": {
+            "changes": {
+              "encoder": {
+                "source": "automatic"
+              }
+            }
+          }
+        },
+        {
+          "agent_report": {
+            "legacy_effective_settings": {
+              "encoder": "va"
+            }
+          }
+        }
+      ],
+      "expect": [
+        {
+          "setting_status": {
+            "encoder": "upgrade_required"
+          }
+        },
+        {
+          "configuration_applied": false
+        }
+      ]
     },
     {
       "id": "offline_reconnect_duplicate_and_old_report",
       "seam": "operator",
-      "given": [{"host": "h1", "agent": "rh05", "connected": false}],
-      "when": [{"save": {"revision": 11, "changes": {"gop": {"source": "explicit", "value": 90}}}}, {"save": {"revision": 12, "changes": {"gop": {"source": "explicit", "value": 120}}}}, {"reconnect": "h1"}, {"deliver_revision": 12}, {"deliver_revision": 12}, {"report_revision": 11}, {"report_revision": 12}],
-      "expect": [{"setting_applied_revision": {"gop": 12}}, {"execution_count": {"gop": 1}}]
+      "given": [
+        {
+          "host": "h1",
+          "agent": "rh05",
+          "connected": false,
+          "policy_revision": "10"
+        }
+      ],
+      "when": [
+        {
+          "save": {
+            "expected_revision": "10",
+            "changes": {
+              "gop": {
+                "source": "explicit",
+                "value": 90
+              }
+            }
+          }
+        },
+        {
+          "save": {
+            "expected_revision": "11",
+            "changes": {
+              "gop": {
+                "source": "explicit",
+                "value": 120
+              }
+            }
+          }
+        },
+        {
+          "reconnect": "h1"
+        },
+        {
+          "deliver_revision": "12"
+        },
+        {
+          "deliver_revision": "12"
+        },
+        {
+          "report_revision": "11"
+        },
+        {
+          "report_revision": "12"
+        }
+      ],
+      "expect": [
+        {
+          "setting_applied_revision": {
+            "gop": "12"
+          }
+        },
+        {
+          "execution_count": {
+            "gop": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "config_applies_independently_of_image_failure",
+      "seam": "operator",
+      "given": [
+        {
+          "host": "h1",
+          "agent": "rh05",
+          "policy_revision": "3",
+          "selected_app_image": "app-image"
+        }
+      ],
+      "when": [
+        {
+          "save": {
+            "expected_revision": "3",
+            "changes": {
+              "gop": {
+                "source": "explicit",
+                "value": 90
+              }
+            }
+          }
+        },
+        {
+          "report_verified_next_session": {
+            "revision": "4",
+            "gop": 90
+          }
+        },
+        {
+          "image_preparation_failed": {
+            "image": "app-image",
+            "reason": "pull_failed"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "setting_status": {
+            "gop": "applied"
+          }
+        },
+        {
+          "setting_applied_value": {
+            "gop": 90
+          }
+        },
+        {
+          "preparation_status": {
+            "app-image": "failed"
+          }
+        }
+      ]
+    },
+    {
+      "id": "unrelated_edit_preserves_scoped_approval",
+      "seam": "operator",
+      "given": [
+        {
+          "host": "h1",
+          "agent": "rh05",
+          "policy_revision": "7",
+          "choice": {
+            "render_node": {
+              "source": "automatic"
+            }
+          },
+          "unstarted_approval": {
+            "attempt_id": "a1",
+            "group": "hardware",
+            "content_digest": "H",
+            "prerequisites_digest": "P",
+            "boot_incarnation": "b1"
+          }
+        }
+      ],
+      "when": [
+        {
+          "save": {
+            "expected_revision": "7",
+            "changes": {
+              "gop": {
+                "source": "explicit",
+                "value": 90
+              }
+            }
+          }
+        }
+      ],
+      "expect": [
+        {
+          "approval_status": {
+            "a1": "valid"
+          }
+        },
+        {
+          "policy_revision": "8"
+        }
+      ]
+    },
+    {
+      "id": "relevant_edit_supersedes_approval_and_stale_grant",
+      "seam": "operator",
+      "given": [
+        {
+          "host": "h1",
+          "agent": "rh05",
+          "policy_revision": "7",
+          "choice": {
+            "render_node": {
+              "source": "automatic"
+            }
+          },
+          "unstarted_approval": {
+            "attempt_id": "a1",
+            "group": "hardware",
+            "content_digest": "H",
+            "prerequisites_digest": "P",
+            "boot_incarnation": "b1"
+          }
+        }
+      ],
+      "when": [
+        {
+          "save": {
+            "expected_revision": "7",
+            "changes": {
+              "render_node": {
+                "source": "explicit",
+                "value": "/dev/dri/renderD128"
+              }
+            }
+          }
+        },
+        {
+          "deliver_stale_grant": {
+            "attempt_id": "a1",
+            "content_digest": "H",
+            "prerequisites_digest": "P",
+            "boot_incarnation": "b1"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "approval_status": {
+            "a1": "superseded"
+          }
+        },
+        {
+          "grant_accepted": {
+            "a1": false
+          }
+        },
+        {
+          "restart_count": 0
+        }
+      ]
+    },
+    {
+      "id": "changed_device_evidence_rejects_stale_grant",
+      "seam": "operator",
+      "given": [
+        {
+          "host": "h1",
+          "agent": "rh05",
+          "unstarted_approval": {
+            "attempt_id": "a1",
+            "group": "hardware",
+            "content_digest": "H",
+            "prerequisites_digest": "P",
+            "boot_incarnation": "b1"
+          }
+        }
+      ],
+      "when": [
+        {
+          "accessible_device_identity_changed": "P2"
+        },
+        {
+          "deliver_stale_grant": {
+            "attempt_id": "a1",
+            "content_digest": "H",
+            "prerequisites_digest": "P",
+            "boot_incarnation": "b1"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "approval_status": {
+            "a1": "superseded"
+          }
+        },
+        {
+          "grant_accepted": {
+            "a1": false
+          }
+        },
+        {
+          "restart_count": 0
+        }
+      ]
+    },
+    {
+      "id": "idle_release_preserves_manual_and_platform_restrictions",
+      "seam": "launch",
+      "given": [
+        {
+          "host": "h1",
+          "admission_restrictions": [
+            {
+              "owner_kind": "manual",
+              "owner_id": "m1"
+            },
+            {
+              "owner_kind": "platform",
+              "owner_id": "p1"
+            },
+            {
+              "owner_kind": "idle_apply",
+              "owner_id": "a1"
+            }
+          ]
+        }
+      ],
+      "when": [
+        {
+          "cancel_idle_apply": "a1"
+        },
+        {
+          "agent_confirms_nonacceptance": "a1"
+        },
+        {
+          "request_launch": {
+            "host": "h1"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "admission_restrictions": [
+            {
+              "owner_kind": "manual",
+              "owner_id": "m1"
+            },
+            {
+              "owner_kind": "platform",
+              "owner_id": "p1"
+            }
+          ]
+        },
+        {
+          "admission_restricted": true
+        },
+        {
+          "reservation_created": false
+        }
+      ]
+    },
+    {
+      "id": "legacy_disruptive_patch_requires_separate_approval",
+      "seam": "operator",
+      "given": [
+        {
+          "host": "h1",
+          "agent": "rh05",
+          "policy_revision": "7",
+          "choice": {
+            "encoder": {
+              "source": "explicit",
+              "value": "va"
+            }
+          }
+        }
+      ],
+      "when": [
+        {
+          "legacy_patch": {
+            "overrides": {
+              "encoder": null
+            },
+            "restart_confirm": true
+          }
+        }
+      ],
+      "expect": [
+        {
+          "policy_revision": "8"
+        },
+        {
+          "setting_source": {
+            "encoder": "deployment"
+          }
+        },
+        {
+          "setting_status": {
+            "encoder": "pending"
+          }
+        },
+        {
+          "idle_approval_created": false
+        },
+        {
+          "restart_count": 0
+        },
+        {
+          "http_status": 200
+        },
+        {
+          "legacy_response": {
+            "restart_triggered": false,
+            "pending_restart": false
+          }
+        }
+      ]
     },
     {
       "id": "cancel_delayed_grant_requires_agent_nonacceptance",
       "seam": "operator",
-      "given": [{"host": "h1", "agent": "rh05", "idle_apply": "waiting"}],
-      "when": [{"offer_grant": "a1"}, {"cancel": "a1"}, {"lose_revoke_reply": "a1"}],
-      "expect": [{"idle_apply_status": "cancelling"}, {"admission_restricted": true}, {"restart_count": 0}]
+      "given": [
+        {
+          "host": "h1",
+          "agent": "rh05",
+          "idle_apply": "waiting"
+        }
+      ],
+      "when": [
+        {
+          "offer_grant": "a1"
+        },
+        {
+          "cancel": "a1"
+        },
+        {
+          "lose_revoke_reply": "a1"
+        }
+      ],
+      "expect": [
+        {
+          "idle_apply_status": "cancelling"
+        },
+        {
+          "admission_restricted": true
+        },
+        {
+          "restart_count": 0
+        }
+      ]
     },
     {
       "id": "restore_discovers_orphan_journal_attempt",
       "seam": "operator",
-      "given": [{"host": "h1", "agent": "rh05", "journal_accepted_attempt": "a1", "database_backup_before_attempt": "a1"}],
-      "when": [{"stop_stack": true}, {"restore_database_backup": true}, {"start_control_plane": true}, {"reconnect": "h1"}],
-      "expect": [{"unstarted_approval_replayed": false}, {"orphan_attempt_visible": "a1"}, {"admission_restricted_until_reconciled": true}, {"duplicate_execution": false}]
+      "given": [
+        {
+          "host": "h1",
+          "agent": "rh05",
+          "journal_accepted_attempt": "a1",
+          "database_backup_before_attempt": "a1"
+        }
+      ],
+      "when": [
+        {
+          "stop_stack": true
+        },
+        {
+          "restore_database_backup": true
+        },
+        {
+          "start_control_plane": true
+        },
+        {
+          "reconnect": "h1"
+        }
+      ],
+      "expect": [
+        {
+          "unstarted_approval_replayed": false
+        },
+        {
+          "orphan_attempt_visible": "a1"
+        },
+        {
+          "admission_restricted_until_reconciled": true
+        },
+        {
+          "duplicate_execution": false
+        }
+      ]
     },
     {
       "id": "home_first_claim_and_conflict",
       "seam": "launch",
-      "given": [{"user": "u1", "canonical_app": "steam", "eligible_hosts": ["h1", "h2"]}],
-      "when": [{"concurrent_launches": [{"host": "h1"}, {"host": "h2"}]}],
-      "expect": [{"unique_home_owner_count": 1}, {"second_blank_home_created": false}]
+      "given": [
+        {
+          "user": "u1",
+          "canonical_app": "steam",
+          "eligible_hosts": [
+            "h1",
+            "h2"
+          ]
+        }
+      ],
+      "when": [
+        {
+          "concurrent_launches": [
+            {
+              "host": "h1"
+            },
+            {
+              "host": "h2"
+            }
+          ]
+        }
+      ],
+      "expect": [
+        {
+          "unique_home_owner_count": 1
+        },
+        {
+          "second_blank_home_created": false
+        }
+      ]
     },
     {
       "id": "cleanup_racing_new_reference",
       "seam": "preparation",
-      "given": [{"host": "h1", "managed_image": "app-image", "cached": true, "required": false}],
-      "when": [{"preview_cleanup": "app-image"}, {"add_placement_requirement": "app-image"}, {"request_cleanup": "app-image"}],
-      "expect": [{"required_image_removed": false}, {"preparation_status": "ready"}]
+      "given": [
+        {
+          "host": "h1",
+          "managed_image": "app-image",
+          "cached": true,
+          "required": false
+        }
+      ],
+      "when": [
+        {
+          "preview_cleanup": "app-image"
+        },
+        {
+          "add_placement_requirement": "app-image"
+        },
+        {
+          "request_cleanup": "app-image"
+        }
+      ],
+      "expect": [
+        {
+          "required_image_removed": false
+        },
+        {
+          "preparation_status": "ready"
+        }
+      ]
+    },
+    {
+      "id": "config_update_preserves_settings_while_rh05_applies",
+      "seam": "operator",
+      "given": [
+        {
+          "host": "h1",
+          "agent": "rh05",
+          "policy_revision": "12",
+          "current_settings": {
+            "gop": 60
+          }
+        }
+      ],
+      "when": [
+        {
+          "config_update": {
+            "settings": null,
+            "console_config": {
+              "enabled": true
+            },
+            "source_policies": {
+              "revision": "4"
+            }
+          }
+        },
+        {
+          "deliver_config_policy_offer": {
+            "group": "gop",
+            "revision": "12",
+            "settings": {
+              "gop": {
+                "source": "explicit",
+                "value": 90
+              }
+            }
+          }
+        },
+        {
+          "report_verified_next_session": {
+            "group": "gop",
+            "revision": "12",
+            "gop": 90
+          }
+        }
+      ],
+      "expect": [
+        {
+          "console_config_preserved": true
+        },
+        {
+          "source_policy_revision": "4"
+        },
+        {
+          "legacy_settings_writer_used": false
+        },
+        {
+          "setting_applied_revision": {
+            "gop": "12"
+          }
+        }
+      ]
+    },
+    {
+      "id": "intentional_restart_resumes_verification_once",
+      "seam": "operator",
+      "given": [
+        {
+          "host": "h1",
+          "agent": "rh05",
+          "journal_attempt": {
+            "attempt_id": "a1",
+            "phase": "awaiting_startup",
+            "revision": "12",
+            "candidate_digest": "D"
+          }
+        }
+      ],
+      "when": [
+        {
+          "agent_process_restart": true
+        },
+        {
+          "report_post_restart_readback": {
+            "attempt_id": "a1",
+            "revision": "12",
+            "content_digest": "D"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "attempt_phase": {
+            "a1": "applied"
+          }
+        },
+        {
+          "candidate_activation_count": {
+            "a1": 1
+          }
+        },
+        {
+          "recovery_activation_count": {
+            "a1": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "crash_during_activation_recovers_last_verified_once",
+      "seam": "operator",
+      "given": [
+        {
+          "host": "h1",
+          "agent": "rh05",
+          "journal_attempt": {
+            "attempt_id": "a1",
+            "phase": "activating",
+            "revision": "12",
+            "candidate_digest": "D",
+            "last_verified_digest": "L"
+          }
+        }
+      ],
+      "when": [
+        {
+          "agent_process_crash": true
+        },
+        {
+          "agent_process_restart": true
+        },
+        {
+          "report_recovery_readback": {
+            "attempt_id": "a1",
+            "content_digest": "L"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "attempt_phase": {
+            "a1": "recovered"
+          }
+        },
+        {
+          "original_failure_retained": {
+            "a1": true
+          }
+        },
+        {
+          "recovery_activation_count": {
+            "a1": 1
+          }
+        },
+        {
+          "setting_applied_revision": {
+            "hardware": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "crash_during_recovery_never_reactivates",
+      "seam": "operator",
+      "given": [
+        {
+          "host": "h1",
+          "agent": "rh05",
+          "journal_attempt": {
+            "attempt_id": "a1",
+            "phase": "recovery_verifying",
+            "revision": "12",
+            "last_verified_digest": "L",
+            "recovery_activation_count": 1
+          }
+        }
+      ],
+      "when": [
+        {
+          "agent_process_crash": true
+        },
+        {
+          "agent_process_restart": true
+        }
+      ],
+      "expect": [
+        {
+          "attempt_phase": {
+            "a1": "uncertain"
+          }
+        },
+        {
+          "original_failure_retained": {
+            "a1": true
+          }
+        },
+        {
+          "recovery_activation_count": {
+            "a1": 1
+          }
+        },
+        {
+          "admission_restricted": true
+        }
+      ]
+    },
+    {
+      "id": "restore_reseeds_revision_and_recomputes_digest",
+      "seam": "operator",
+      "given": [
+        {
+          "host": "h1",
+          "agent": "rh05",
+          "database_policy_revision": "8",
+          "agent_revision_high_water": {
+            "hardware": "12"
+          },
+          "desired_group": {
+            "hardware": {
+              "revision": "8",
+              "content_digest": "old-digest",
+              "choice": {
+                "encoder": {
+                  "source": "explicit",
+                  "value": "va"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "when": [
+        {
+          "start_control_plane": true
+        },
+        {
+          "reconnect_and_reconcile_journal": "h1"
+        },
+        {
+          "report_revision": {
+            "group": "hardware",
+            "revision": "8",
+            "content_digest": "old-digest"
+          }
+        }
+      ],
+      "expect": [
+        {
+          "policy_revision": "13"
+        },
+        {
+          "desired_group_revision": {
+            "hardware": "13"
+          }
+        },
+        {
+          "desired_digest_recomputed": {
+            "hardware": true
+          }
+        },
+        {
+          "old_report_applied": false
+        },
+        {
+          "unstarted_approval_replayed": false
+        }
+      ]
+    },
+    {
+      "id": "revision_above_javascript_safe_integer_is_exact",
+      "seam": "operator",
+      "given": [
+        {
+          "host": "h1",
+          "agent": "rh05",
+          "policy_revision": "9007199254740993"
+        }
+      ],
+      "when": [
+        {
+          "save": {
+            "expected_revision": "9007199254740993",
+            "changes": {
+              "gop": {
+                "source": "explicit",
+                "value": 90
+              }
+            }
+          }
+        },
+        {
+          "deliver_revision": "9007199254740994"
+        },
+        {
+          "report_revision": "9007199254740994"
+        }
+      ],
+      "expect": [
+        {
+          "policy_revision": "9007199254740994"
+        },
+        {
+          "setting_applied_revision": {
+            "gop": "9007199254740994"
+          }
+        },
+        {
+          "revision_rounded": false
+        }
+      ]
+    },
+    {
+      "id": "crash_during_candidate_initialization_consumes_startup_marker",
+      "seam": "operator",
+      "given": [
+        {
+          "host": "h1",
+          "agent": "rh05",
+          "journal_attempt": {
+            "attempt_id": "a1",
+            "phase": "awaiting_startup",
+            "revision": "12",
+            "candidate_digest": "D",
+            "last_verified_digest": "L"
+          }
+        }
+      ],
+      "when": [
+        {
+          "agent_process_restart_with_crash": "during_candidate_runtime_initialization"
+        },
+        {
+          "agent_process_restart": true
+        }
+      ],
+      "expect": [
+        {
+          "attempt_phase": {
+            "a1": "failed"
+          }
+        },
+        {
+          "candidate_activation_count": {
+            "a1": 1
+          }
+        },
+        {
+          "second_candidate_activation": false
+        },
+        {
+          "recovery_activation_count": {
+            "a1": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "crash_during_recovery_initialization_consumes_startup_marker",
+      "seam": "operator",
+      "given": [
+        {
+          "host": "h1",
+          "agent": "rh05",
+          "journal_attempt": {
+            "attempt_id": "a1",
+            "phase": "recovery_awaiting_startup",
+            "revision": "12",
+            "last_verified_digest": "L",
+            "recovery_activation_count": 1
+          }
+        }
+      ],
+      "when": [
+        {
+          "agent_process_restart_with_crash": "during_recovery_runtime_initialization"
+        },
+        {
+          "agent_process_restart": true
+        }
+      ],
+      "expect": [
+        {
+          "attempt_phase": {
+            "a1": "uncertain"
+          }
+        },
+        {
+          "recovery_activation_count": {
+            "a1": 1
+          }
+        },
+        {
+          "admission_restricted": true
+        }
+      ]
     }
   ]
 }

@@ -25,6 +25,12 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **RH05 host policy and selected-app preparation contracts (#334).** Defined typed
+  host setting sources, independent application evidence, scoped idle approval and
+  recovery, owner-scoped admission, placement and managed-home claims, image
+  preparation and cleanup rules, migration reservations, and compatibility for
+  older agents and the existing settings endpoint. Runtime delivery follows in
+  the dependent tickets.
 - **Per-GPU codec sets, end to end (#302, amendment 12).** Each GPU reports the codecs it has
   been shown to encode (`capacity.gpus[].codecs`, the same per-GPU sets the host-level `codecs`
   union is derived from, so the two cannot disagree; a zero-slot GPU reports an empty set). The control
