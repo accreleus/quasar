@@ -61,15 +61,30 @@ impl HomeCleanupLedger {
     /// Load the durable inventory. Active IDs are retained until their exact
     /// source cleanup has been proved by `recover_active`.
     pub(crate) fn open_after_startup_cleanup(root: PathBuf) -> std::io::Result<Self> {
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&root)?;
+        Self::open_with_parent_sync(root, |parent| File::open(parent)?.sync_all())
+    }
+
+    fn open_with_parent_sync(
+        root: PathBuf,
+        sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> std::io::Result<Self> {
+        let parent = root
+            .parent()
+            .ok_or_else(|| std::io::Error::other("ledger has no parent"))?;
+        match DirBuilder::new().mode(0o700).create(&root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
         if fs::symlink_metadata(&root)?.file_type().is_symlink() {
             return Err(std::io::Error::other(
                 "home cleanup ledger directory is a symlink",
             ));
         }
+        // Persist the directory entry before any session ID is accepted. A
+        // crash after the first record fsync must not lose its parent folder.
+        sync_parent(parent)?;
+        File::open(&root)?.sync_all()?;
         let mut ledger = Self {
             root,
             records: BTreeMap::new(),
@@ -210,6 +225,14 @@ pub(crate) fn ledger_path(secret_path: &str) -> PathBuf {
     Path::new(&format!("{secret_path}.home-ledger")).to_path_buf()
 }
 
+pub(crate) fn ledger_truly_absent(secret_path: &str) -> std::io::Result<bool> {
+    match fs::symlink_metadata(ledger_path(secret_path)) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
 /// A sibling of the node secret is durable only when its parent is an
 /// explicitly mounted persistent filesystem. The default /tmp secret and a
 /// path inside the container overlay do not qualify. This is intentionally
@@ -287,6 +310,47 @@ mod tests {
         fs::create_dir(&path).unwrap();
         fs::write(path.join("unknown"), b"not json").unwrap();
         assert!(HomeCleanupLedger::open_after_startup_cleanup(path).is_err());
+    }
+
+    #[test]
+    fn corrupt_restart_cannot_forget_a_retired_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger");
+        let mut first = HomeCleanupLedger::open_after_startup_cleanup(path.clone()).unwrap();
+        first
+            .retire("retired-session", TerminalKind::Stopped)
+            .unwrap();
+        fs::write(path.join("corrupt"), b"not json").unwrap();
+        assert!(HomeCleanupLedger::open_after_startup_cleanup(path.clone()).is_err());
+        fs::remove_file(path.join("corrupt")).unwrap();
+        let mut recovered = HomeCleanupLedger::open_after_startup_cleanup(path).unwrap();
+        assert_eq!(
+            recovered.state("retired-session"),
+            Some(TerminalKind::Stopped)
+        );
+        assert!(!recovered.record_active("retired-session").unwrap());
+    }
+
+    #[test]
+    fn failed_parent_sync_prevents_ledger_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger");
+        assert!(HomeCleanupLedger::open_with_parent_sync(path.clone(), |_| {
+            Err(std::io::Error::other("injected fsync failure"))
+        })
+        .is_err());
+        let ledger = HomeCleanupLedger::open_after_startup_cleanup(path).unwrap();
+        assert!(!ledger.has_record("never-accepted"));
+    }
+
+    #[test]
+    fn legacy_mode_requires_a_truly_absent_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("node-secret");
+        let secret = secret.to_str().unwrap();
+        assert!(ledger_truly_absent(secret).unwrap());
+        let _ledger = HomeCleanupLedger::open_after_startup_cleanup(ledger_path(secret)).unwrap();
+        assert!(!ledger_truly_absent(secret).unwrap());
     }
 
     #[test]

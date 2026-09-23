@@ -175,6 +175,35 @@ func TestManagedHomeBindingRejectsChangedPayloadAndUnboundRunning(t *testing.T) 
 	assertClaimState(t, pool, s.userID, appID, "reserved")
 }
 
+func TestManagedHomeDispatchRejectsPolicyToggleAfterResolvedMount(t *testing.T) {
+	pool := testDB(t)
+	s := seed(t, pool, 2)
+	appID := seedManagedApp(t, pool, `{}`)
+	seedHome(t, pool, s.userID, appID, s.hostID)
+	store := NewStore(pool)
+	ctx := context.Background()
+	app, err := store.GetLaunchApp(ctx, appID)
+	must(t, err)
+	expected := expectedHomeDispatch(app)
+	p := managedLaunchParams(s, appID)
+	p.PinHostID = s.hostID
+	sess, err := store.ScheduleAndCreate(ctx, p)
+	must(t, err)
+	var ref string
+	must(t, pool.QueryRow(ctx, `SELECT ref FROM user_homes WHERE user_id=$1::uuid AND app_id=$2::uuid`, s.userID, appID).Scan(&ref))
+	spec := []byte(`{"mounts":["` + ref + `:/home/quasar:rw"]}`)
+	_, err = pool.Exec(ctx, `UPDATE apps SET managed_home=false WHERE id=$1::uuid`, appID)
+	must(t, err)
+	if _, err = store.bindManagedHomeDispatchWithHold(ctx, sess.ID, spec, true, &expected); err == nil {
+		t.Fatal("policy toggle allowed a resolved managed mount to dispatch unbound")
+	}
+	var bound bool
+	must(t, pool.QueryRow(ctx, `SELECT managed_home_id IS NOT NULL FROM sessions WHERE id=$1::uuid`, sess.ID).Scan(&bound))
+	if bound {
+		t.Fatal("rejected dispatch changed session home binding")
+	}
+}
+
 func TestManagedHomeDigestCanonicalObject(t *testing.T) {
 	digest, mount, err := managedHomeDigest("local", "/a<\u2028", "/home/quasar")
 	must(t, err)

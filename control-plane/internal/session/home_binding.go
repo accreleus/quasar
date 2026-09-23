@@ -95,6 +95,23 @@ func (s *Store) BindManagedHomeDispatch(ctx context.Context, sessionID string, s
 // command epoch, durably holds the original home before any socket handoff.
 // The returned token is internal command correlation, never a wire field.
 func (s *Store) BindManagedHomeDispatchWithHold(ctx context.Context, sessionID string, spec []byte, capable bool) (*HomeHoldDecision, error) {
+	return s.bindManagedHomeDispatchWithHold(ctx, sessionID, spec, capable, nil)
+}
+
+// homeDispatchExpectation is captured before mount resolution. A later app or
+// preset edit may not turn an already resolved managed mount into an unbound
+// assignment.
+type homeDispatchExpectation struct {
+	canonical string
+	managed   bool
+	target    string
+}
+
+func expectedHomeDispatch(app LaunchApp) homeDispatchExpectation {
+	return homeDispatchExpectation{canonical: homeAppID(app), managed: app.ManagedHome, target: app.HomeContainerPath}
+}
+
+func (s *Store) bindManagedHomeDispatchWithHold(ctx context.Context, sessionID string, spec []byte, capable bool, expected *homeDispatchExpectation) (*HomeHoldDecision, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin home dispatch binding: %w", err)
@@ -114,6 +131,9 @@ func (s *Store) BindManagedHomeDispatchWithHold(ctx context.Context, sessionID s
 	canonical, managed, target, err := resolvedDispatchHome(ctx, tx, appID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve dispatch home app: %w", err)
+	}
+	if expected != nil && (canonical != expected.canonical || managed != expected.managed || target != expected.target) {
+		return nil, errors.New("managed home policy changed before dispatch")
 	}
 	if !managed {
 		return nil, nil

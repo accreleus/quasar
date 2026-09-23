@@ -67,6 +67,9 @@ func TestManagedHomeAssignDeliveryKeepsOnlyUncertainHold(t *testing.T) {
 			})
 			store := NewStore(pool)
 			ctx := context.Background()
+			app, err := store.GetLaunchApp(ctx, appID)
+			must(t, err)
+			expected := expectedHomeDispatch(app)
 			p := managedLaunchParams(s, appID)
 			p.PinHostID = s.hostID
 			sess, err := store.ScheduleAndCreate(ctx, p)
@@ -75,7 +78,7 @@ func TestManagedHomeAssignDeliveryKeepsOnlyUncertainHold(t *testing.T) {
 			must(t, pool.QueryRow(ctx, `SELECT ref FROM user_homes WHERE user_id=$1::uuid AND app_id=$2::uuid`, s.userID, appID).Scan(&ref))
 			d := &homeEpochDispatcher{fakeDispatcher: newFakeDispatcher(true), epochs: tc.epochs}
 			coord := newTestCoordinator(t, store, d, testLogger())
-			ok := coord.sendHomeBoundAssign(s.hostID, sess.ID, []byte(`{"mounts":["`+ref+`:/home/quasar:rw"]}`), agentws.SessionAssignCmd{Type: "session_assign", ID: "test-command", SessionID: sess.ID})
+			ok := coord.sendHomeBoundAssign(s.hostID, sess.ID, []byte(`{"mounts":["`+ref+`:/home/quasar:rw"]}`), agentws.SessionAssignCmd{Type: "session_assign", ID: "test-command", SessionID: sess.ID}, &expected)
 			if ok != (tc.name == "epoch replaced before queue") {
 				t.Fatalf("assign accepted = %t", ok)
 			}

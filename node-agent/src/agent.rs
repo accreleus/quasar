@@ -298,25 +298,34 @@ pub async fn run(cfg: Config) {
         release_mgr.clone(),
     );
     match crate::home_cleanup::verified_ledger_path(&cfg.node_secret_path) {
-        Some(path) => match crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(path) {
-            Ok(mut ledger) => {
-                if ledger.recover_active(|id| {
-                    crate::runtime::configured()
-                        .map_err(std::io::Error::other)?
-                        .retire_session_applications(id)
-                        .wait()
-                        .map_err(std::io::Error::other)
-                }).is_ok() {
-                    sessions.mgr.home_cleanup = Some(ledger);
-                } else {
-                    warn!(token = "home-cleanup-proof-unavailable", "startup home cleanup proof unavailable; capability withheld");
+        Some(path) => {
+            let result = crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(path)
+                .and_then(|mut ledger| {
+                    ledger.recover_active(|id| {
+                        crate::runtime::configured()
+                            .map_err(std::io::Error::other)?
+                            .retire_session_applications(id)
+                            .wait()
+                            .map_err(std::io::Error::other)
+                    })?;
+                    Ok(ledger)
+                });
+            match result {
+                Ok(ledger) => sessions.mgr.home_cleanup = Some(ledger),
+                Err(_) => {
+                    error!(token = "home-cleanup-proof-unavailable",
+                        "persistent home cleanup state is uncertain; refusing agent admission");
+                    sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
+                    std::process::exit(1);
                 }
             }
-            Err(_) => warn!(
-                token = "home-cleanup-ledger-unavailable",
-                "durable home cleanup ledger unavailable; cleanup proof capability withheld"
-            ),
-        },
+        }
+        None if !matches!(crate::home_cleanup::ledger_truly_absent(&cfg.node_secret_path), Ok(true)) => {
+            error!(token = "home-cleanup-existing-ledger-unverified",
+                "existing home cleanup ledger lacks verified persistence; refusing agent admission");
+            sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
+            std::process::exit(1);
+        }
         None => warn!(
             token = "home-cleanup-ledger-unverified",
             "node identity directory is not a verified persistent mount; cleanup proof capability withheld"

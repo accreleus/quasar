@@ -116,7 +116,8 @@ func (c *Coordinator) LaunchConsoleSession(ctx context.Context, hostID, userID, 
 		}
 	}
 
-	go c.dispatchAssignStartWithTopology(sess, dispatchSpec, videoTopology)
+	expectedHome := expectedHomeDispatch(app)
+	go c.dispatchAssignStartWithTopology(sess, dispatchSpec, videoTopology, &expectedHome)
 
 	return sess.ID, nil
 }

@@ -318,7 +318,8 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	}
 
 	// Async, so the HTTP response returns immediately with the assigned session.
-	go c.dispatchAssignStart(sess, dispatchSpec)
+	expectedHome := expectedHomeDispatch(app)
+	go c.dispatchAssignStart(sess, dispatchSpec, &expectedHome)
 
 	return LaunchResult{Session: sess, SignalingToken: tok.Plaintext, TokenExpiresAt: tok.ExpiresAt}, nil
 }
@@ -718,11 +719,11 @@ func (c *Coordinator) logNoHostRejection(userID, appID string, err error) {
 // dispatchAssignStart performs the two-step agent handshake: assign, then start.
 // Either step failing (reject, timeout, agent not connected) fails the session
 // and releases its reservation. starting→running then arrives via AgentState.
-func (c *Coordinator) dispatchAssignStart(sess Session, runtimeSpec []byte) {
-	c.dispatchAssignStartWithTopology(sess, runtimeSpec, "stream_only")
+func (c *Coordinator) dispatchAssignStart(sess Session, runtimeSpec []byte, expected *homeDispatchExpectation) {
+	c.dispatchAssignStartWithTopology(sess, runtimeSpec, "stream_only", expected)
 }
 
-func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec []byte, videoTopology string) {
+func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec []byte, videoTopology string, expected *homeDispatchExpectation) {
 	if sess.HostID == nil || sess.GPUIndex == nil {
 		c.failSession(sess.ID, "session missing host/gpu placement")
 		return
@@ -767,7 +768,7 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 		Resources:     agentws.ResourceSpec{VRAMMB: sess.ReservedVram, EncodeSlots: sess.ReservedSlots},
 		VideoTopology: videoTopology,
 	}
-	if !c.sendHomeBoundAssign(hostID, sess.ID, app, assign) {
+	if !c.sendHomeBoundAssign(hostID, sess.ID, app, assign, expected) {
 		return
 	}
 
@@ -785,7 +786,7 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 // sendHomeBoundAssign uses the exact authenticated command epoch for both the
 // cleanup-capability decision and socket queue handoff. An epoch replaced
 // before enqueue causes a fresh decision; an enqueued frame remains uncertain.
-func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, assign agentws.SessionAssignCmd) bool {
+func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, assign agentws.SessionAssignCmd, expected *homeDispatchExpectation) bool {
 	provider, epochAware := c.dispatcher.(interface {
 		CurrentHomeCommandEpoch(string) (agentws.HomeCommandEpoch, bool)
 	})
@@ -800,7 +801,7 @@ func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, 
 			}
 		}
 		capable := epoch != nil && epoch.SupportsHomeCleanup()
-		hold, err := c.store.BindManagedHomeDispatchWithHold(c.ctx, sessionID, app, capable)
+		hold, err := c.store.bindManagedHomeDispatchWithHold(c.ctx, sessionID, app, capable, expected)
 		if err != nil {
 			c.log.Error("managed home dispatch binding failed", "session_id", sessionID, "err", err)
 			c.failSession(sessionID, "managed home dispatch binding failed")
