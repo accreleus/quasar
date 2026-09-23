@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::messages::AgentMsg;
+use crate::messages::{GpuCapacity, ReadinessCheck};
 use crate::policy_catalog::{self, group_for_key};
 use crate::session::settings::RuntimeSettings;
 
@@ -52,8 +53,17 @@ pub struct Offer {
     pub resolved_settings: Value,
 }
 
+pub struct HardwareEvidence<'a> {
+    pub gpus: &'a [GpuCapacity],
+    pub readiness: &'a [ReadinessCheck],
+}
+
 fn idle_group() -> String {
     IDLE.into()
+}
+
+fn next_session_scope() -> String {
+    "next_session".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +72,8 @@ struct Record {
     host_id: String,
     #[serde(default = "idle_group")]
     group: String,
+    #[serde(default = "next_session_scope")]
+    scope: String,
     revision: String,
     digest: String,
     phase: String,
@@ -77,6 +89,14 @@ struct Record {
     connection_incarnation: String,
     #[serde(default)]
     settings: Value,
+    #[serde(default)]
+    known_good: Option<ActiveGroup>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    verified_at: Option<String>,
+    #[serde(default)]
+    verified_process_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +203,17 @@ struct InventorySnapshot {
     active_snapshots: BTreeMap<String, Value>,
 }
 
+/// The one durable restart transition consumed before any runtime startup.
+/// `Recovery` requests one fresh process for the known-good snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootOutcome {
+    None,
+    Candidate(String),
+    Recovery(String),
+    RecoveryVerify(String),
+    Uncertain(String),
+}
+
 pub struct PolicyAgent {
     path: PathBuf,
     host_id: String,
@@ -200,6 +231,102 @@ pub struct PolicyAgent {
 type ApplyOutcome = (&'static str, u64, Option<&'static str>, Option<Value>);
 
 impl PolicyAgent {
+    pub fn has_open_restart(&self) -> bool {
+        self.journal.records.values().any(|record| {
+            record.scope == "restart"
+                && matches!(
+                    record.phase.as_str(),
+                    "accepted"
+                        | "activating"
+                        | "awaiting_startup"
+                        | "verifying"
+                        | "failed"
+                        | "recovery_verifying"
+                        | "recovery_awaiting_startup"
+                        | "uncertain"
+                )
+        })
+    }
+
+    pub fn has_uncertain_restart(&self) -> bool {
+        self.journal
+            .records
+            .values()
+            .any(|record| record.scope == "restart" && record.phase == "uncertain")
+    }
+    pub fn bootstrap(path: &Path) -> std::io::Result<BootOutcome> {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(BootOutcome::None),
+            Err(err) => return Err(err),
+        };
+        let mut journal = Journal::load(&bytes).map_err(std::io::Error::other)?;
+        let open: Vec<String> = journal
+            .records
+            .iter()
+            .filter(|(_, record)| {
+                record.scope == "restart"
+                    && matches!(
+                        record.phase.as_str(),
+                        "accepted"
+                            | "activating"
+                            | "awaiting_startup"
+                            | "verifying"
+                            | "failed"
+                            | "recovery_verifying"
+                            | "recovery_awaiting_startup"
+                            | "uncertain"
+                    )
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        if open.len() > 1 {
+            return Err(std::io::Error::other("multiple open restart attempts"));
+        }
+        let Some(id) = open.into_iter().next() else {
+            return Ok(BootOutcome::None);
+        };
+        let record = journal.records.get_mut(&id).unwrap();
+        let outcome = match record.phase.as_str() {
+            "awaiting_startup" => {
+                record.phase = "verifying".into();
+                record.sequence += 1;
+                BootOutcome::Candidate(id)
+            }
+            "accepted" | "activating" | "verifying" | "failed" => {
+                if record.known_good.is_none() {
+                    record.phase = "uncertain".into();
+                    record.sequence += 1;
+                    BootOutcome::Uncertain(id)
+                } else {
+                    if record.phase != "failed" {
+                        record.error = Some("candidate_startup_interrupted".into());
+                        record.phase = "failed".into();
+                        record.sequence += 1;
+                    }
+                    record.phase = "recovery_verifying".into();
+                    record.sequence += 1;
+                    persist_journal(path, &journal)?;
+                    record_restart_phase(path, &mut journal, &id, "recovery_awaiting_startup")?;
+                    return Ok(BootOutcome::Recovery(id));
+                }
+            }
+            "recovery_awaiting_startup" => {
+                record.phase = "recovery_verifying".into();
+                record.sequence += 1;
+                BootOutcome::RecoveryVerify(id)
+            }
+            "recovery_verifying" => {
+                record.phase = "uncertain".into();
+                record.sequence += 1;
+                BootOutcome::Uncertain(id)
+            }
+            "uncertain" => BootOutcome::Uncertain(id),
+            _ => BootOutcome::None,
+        };
+        persist_journal(path, &journal)?;
+        Ok(outcome)
+    }
     pub fn advertised_groups(path: &PathBuf) -> Vec<String> {
         match fs::read(path).ok().and_then(|raw| Journal::load(&raw).ok()) {
             Some(journal) => journal.groups().into_iter().collect(),
@@ -320,6 +447,28 @@ impl PolicyAgent {
                 },
             );
         }
+        if !self.journal.ever_accepted_typed.contains("hardware")
+            && !self.journal.active_groups.contains_key("hardware")
+        {
+            let resolved = Value::Object(Map::from_iter(
+                policy_catalog::HARDWARE_KEYS.iter().filter_map(|key| {
+                    latched
+                        .get(*key)
+                        .cloned()
+                        .map(|value| ((*key).into(), value))
+                }),
+            ));
+            if resolved.as_object().is_some_and(|values| values.len() == 3) {
+                self.journal.active_groups.insert(
+                    "hardware".into(),
+                    ActiveGroup {
+                        kind: "seeded".into(),
+                        digest: policy_catalog::snapshot_digest("hardware", &resolved),
+                        resolved_settings: resolved,
+                    },
+                );
+            }
+        }
         if let Err(err) = self.persist() {
             self.journal = previous;
             return Err(format!("legacy_journal_write_failed: {err}"));
@@ -388,21 +537,21 @@ impl PolicyAgent {
                     "group":record.group,
                     "revision":record.revision,
                     "content_sha256":record.digest,
-                    "scope":"next_session",
+                    "scope":record.scope,
                     "grant_boot_incarnation":record.boot_incarnation,
                     "grant_connection_incarnation":record.connection_incarnation,
                     "journal_sequence":record.sequence.to_string(),
                     "phase":record.phase,
-                    "active_scope":if applied {Some("next_session")} else {None},
+                    "active_scope":if applied {Some(record.scope.as_str())} else {None},
                     "evidence":if applied {Some(json!({
                         "revision":record.revision,
                         "content_sha256":record.digest,
                         "resolved_settings":record.resolved_settings,
-                        "agent_process_id":std::process::id().to_string(),
-                        "observed_at":OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default(),
+                        "agent_process_id":record.verified_process_id.clone().unwrap_or_else(||std::process::id().to_string()),
+                        "observed_at":record.verified_at.clone().unwrap_or_else(||OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default()),
                         "evidence_ids":[]
                     }))} else {None},
-                    "error":null
+                    "error":record.error
                 })
             }).collect();
             self.inventory = Some(InventorySnapshot {
@@ -473,7 +622,7 @@ impl PolicyAgent {
         // Next-session activation is local and safe to finish idempotently.
         let mut accepted: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (id, record) in &agent.journal.records {
-            if record.phase == "accepted" {
+            if record.phase == "accepted" && record.scope == "next_session" {
                 accepted
                     .entry(record.group.clone())
                     .or_default()
@@ -505,20 +654,102 @@ impl PolicyAgent {
         Ok(agent)
     }
 
-    fn persist(&self) -> std::io::Result<()> {
-        let tmp = self.path.with_extension("policy.tmp");
-        let bytes = serde_json::to_vec(&self.journal.on_disk()).map_err(std::io::Error::other)?;
-        let mut f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
-        fs::rename(&tmp, &self.path)?;
-        if let Some(parent) = self.path.parent() {
-            OpenOptions::new().read(true).open(parent)?.sync_all()?;
+    /// A fresh process may finish the marker consumed by `bootstrap` only
+    /// after its startup baseline and durable overlay have been loaded. A
+    /// reconnect in the same process sees the already terminal record.
+    pub fn finalize_boot(
+        &mut self,
+        outcome: &BootOutcome,
+        settings: &mut RuntimeSettings,
+    ) -> std::io::Result<BootOutcome> {
+        let (id, recovering) = match outcome {
+            BootOutcome::Candidate(id) => (id, false),
+            BootOutcome::RecoveryVerify(id) => (id, true),
+            other => return Ok(other.clone()),
+        };
+        let Some(record) = self.journal.records.get(id).cloned() else {
+            return Err(std::io::Error::other("boot attempt disappeared"));
+        };
+        let expected_phase = if recovering {
+            "recovery_verifying"
+        } else {
+            "verifying"
+        };
+        if record.phase != expected_phase {
+            return Ok(BootOutcome::None);
         }
+        let target = if recovering {
+            record
+                .known_good
+                .as_ref()
+                .ok_or(std::io::Error::other("recovery target missing"))?
+                .resolved_settings
+                .clone()
+        } else {
+            record.resolved_settings.clone()
+        };
+        let mut next = settings.clone();
+        let result = compose_candidate(&mut next, &record.group, &target);
+        let readback_ok = result.is_ok()
+            && target.as_object().is_some_and(|values| {
+                let actual = next.deployment_map();
+                values.iter().all(|(key, expected)| {
+                    actual
+                        .get(key)
+                        .is_some_and(|got| policy_catalog::json_equal(got, expected))
+                })
+            });
+        if readback_ok {
+            *settings = next;
+            let current = self.journal.records.get_mut(id).unwrap();
+            current.phase = if recovering { "recovered" } else { "applied" }.into();
+            current.sequence += 1;
+            current.verified_at = Some(
+                OffsetDateTime::now_utc()
+                    .format(&Rfc3339)
+                    .unwrap_or_default(),
+            );
+            current.verified_process_id = Some(std::process::id().to_string());
+            let active = if recovering {
+                current.known_good.clone().unwrap()
+            } else {
+                ActiveGroup {
+                    kind: "verified".into(),
+                    digest: current.digest.clone(),
+                    resolved_settings: target,
+                }
+            };
+            self.journal.active_groups.insert(record.group, active);
+            self.persist()?;
+            return Ok(BootOutcome::None);
+        }
+        if recovering {
+            let current = self.journal.records.get_mut(id).unwrap();
+            current.phase = "uncertain".into();
+            current.sequence += 1;
+            current
+                .error
+                .get_or_insert_with(|| "recovery_verification_failed".into());
+            self.persist()?;
+            return Ok(BootOutcome::Uncertain(id.clone()));
+        }
+        let current = self.journal.records.get_mut(id).unwrap();
+        current.phase = "failed".into();
+        current.sequence += 1;
+        current.error = Some("candidate_verification_failed".into());
+        self.persist()?;
+        record_restart_phase(&self.path, &mut self.journal, id, "recovery_verifying")?;
+        record_restart_phase(
+            &self.path,
+            &mut self.journal,
+            id,
+            "recovery_awaiting_startup",
+        )?;
+        Ok(BootOutcome::Recovery(id.clone()))
+    }
+
+    fn persist(&self) -> std::io::Result<()> {
+        persist_journal(&self.path, &self.journal)?;
         #[cfg(test)]
         {
             use std::sync::atomic::Ordering;
@@ -541,6 +772,244 @@ impl PolicyAgent {
             }
             Err(reason) => state(&offer, "failed", 0, None, None, Some(reason)),
         }
+    }
+
+    /// Accept a restart grant only after the caller has excluded local launches
+    /// and checked assigned, starting, running, stopping and preparation work.
+    /// The runtime is deliberately not changed in this process: an
+    /// `awaiting_startup` result requests an orderly process restart.
+    pub fn accept_restart(
+        &mut self,
+        offer: Offer,
+        settings: &RuntimeSettings,
+        is_idle: bool,
+        hardware: Option<HardwareEvidence<'_>>,
+    ) -> AgentMsg {
+        let result = self.accept_restart_inner(&offer, settings, is_idle, hardware);
+        match result {
+            Ok((phase, sequence)) => state(&offer, phase, sequence, None, None, None),
+            Err(reason) => state(&offer, "failed", 0, None, None, Some(reason)),
+        }
+    }
+
+    fn accept_restart_inner(
+        &mut self,
+        offer: &Offer,
+        settings: &RuntimeSettings,
+        is_idle: bool,
+        hardware: Option<HardwareEvidence<'_>>,
+    ) -> Result<(&'static str, u64), String> {
+        if offer.host_id != self.host_id
+            || offer.boot_incarnation != self.boot_incarnation
+            || offer.connection_incarnation != self.connection_incarnation
+        {
+            return Err("stale_grant".into());
+        }
+        if !policy_catalog::is_restart_group(&offer.group) || offer.scope != "restart" {
+            return Err("unsupported_group".into());
+        }
+        let expires =
+            OffsetDateTime::parse(&offer.expires_at, &Rfc3339).map_err(|_| "invalid_expiry")?;
+        if expires <= OffsetDateTime::now_utc() {
+            return Err("grant_expired".into());
+        }
+        let revision = parse_revision(&offer.revision)?;
+        if let Some(record) = self.journal.records.get(&offer.attempt_id) {
+            if record.group != offer.group
+                || record.scope != offer.scope
+                || record.digest != offer.content_sha256
+                || record.revision != offer.revision
+                || record.boot_incarnation != offer.boot_incarnation
+                || record.connection_incarnation != offer.connection_incarnation
+            {
+                return Err("attempt_conflict".into());
+            }
+            return Ok((
+                match record.phase.as_str() {
+                    "accepted" => "accepted",
+                    "awaiting_startup" => "awaiting_startup",
+                    "verifying" => "verifying",
+                    "applied" => "applied",
+                    "failed" => "failed",
+                    "recovery_verifying" => "recovery_verifying",
+                    "recovery_awaiting_startup" => "recovery_awaiting_startup",
+                    "recovered" => "recovered",
+                    _ => "uncertain",
+                },
+                record.sequence,
+            ));
+        }
+        if !is_idle {
+            return Err("host_busy".into());
+        }
+        if self.journal.records.values().any(|record| {
+            record.scope == "restart"
+                && matches!(
+                    record.phase.as_str(),
+                    "accepted"
+                        | "activating"
+                        | "awaiting_startup"
+                        | "verifying"
+                        | "failed"
+                        | "recovery_verifying"
+                        | "recovery_awaiting_startup"
+                        | "uncertain"
+                )
+        }) {
+            return Err("attempt_conflict".into());
+        }
+        let high_water = self
+            .journal
+            .high_water
+            .get(&offer.group)
+            .copied()
+            .unwrap_or(0);
+        if revision < high_water {
+            return Err("stale_revision".into());
+        }
+        if !self.journal.ever_accepted_typed.contains(&offer.group) {
+            return Err("group_execution_unavailable".into());
+        }
+        let content = json!({"group":offer.group,"scope":offer.scope,"revision":offer.revision,
+            "settings":offer.settings,"resolved_settings":offer.resolved_settings});
+        if policy_catalog::digest(&content) != offer.content_sha256 {
+            return Err("content_mismatch".into());
+        }
+        let automatic = offer.settings.as_object().is_some_and(|choices| {
+            choices
+                .values()
+                .any(|choice| choice["source"] == "automatic")
+        });
+        let hardware = if automatic {
+            Some(hardware_facts(
+                offer,
+                hardware.ok_or("hardware_evidence_missing")?,
+            )?)
+        } else {
+            None
+        };
+        let mut resolved_choices = offer.settings.clone();
+        if automatic {
+            for (key, choice) in resolved_choices.as_object_mut().ok_or("missing_setting")? {
+                if choice["source"] == "automatic" {
+                    *choice = json!({"source":"explicit","value":offer.resolved_settings[key]});
+                }
+            }
+        }
+        let resolved = policy_catalog::resolve_group(
+            &offer.group,
+            &resolved_choices,
+            &self.deployment_baseline,
+        )?;
+        if !same_resolution(&offer.resolved_settings, &resolved) {
+            return Err("resolved_mismatch".into());
+        }
+        let mut candidate = settings.clone();
+        compose_candidate(&mut candidate, &offer.group, &offer.resolved_settings)?;
+        let known_good = self
+            .journal
+            .active_groups
+            .get(&offer.group)
+            .ok_or("active_snapshot_missing")?
+            .clone();
+        let snapshot_kind = match known_good.kind.as_str() {
+            "verified" => "last_verified_group_digest",
+            "seeded" => "seeded_group_digest",
+            _ => return Err("active_snapshot_invalid".into()),
+        };
+        let mut facts = vec![
+            json!({"kind":"accepted_attempts","id":self.accepted_attempts_digest(&offer.group)}),
+            json!({"kind":snapshot_kind,"id":known_good.digest}),
+        ];
+        if let Some(baseline) = policy_catalog::deployment_fact(&offer.settings, &resolved) {
+            facts.push(json!({"kind":"deployment_baseline","id":baseline}));
+        }
+        if let Some(hardware_facts) = hardware {
+            facts.extend(hardware_facts);
+        }
+        facts.sort_by(|a, b| {
+            (a["kind"].as_str(), a["id"].as_str()).cmp(&(b["kind"].as_str(), b["id"].as_str()))
+        });
+        if facts != offer.prerequisites || facts_digest(&facts)? != offer.prerequisites_sha256 {
+            return Err("prerequisite_mismatch".into());
+        }
+        if revision == high_water
+            && !self.journal.records.values().any(|record| {
+                record.group == offer.group
+                    && record.revision == offer.revision
+                    && record.settings == offer.settings
+            })
+        {
+            return Err("revision_conflict".into());
+        }
+        let record = Record {
+            host_id: offer.host_id.clone(),
+            group: offer.group.clone(),
+            scope: offer.scope.clone(),
+            revision: offer.revision.clone(),
+            digest: offer.content_sha256.clone(),
+            phase: "accepted".into(),
+            sequence: 1,
+            resolved_settings: offer.resolved_settings.clone(),
+            resolved_idle_timeout_secs: None,
+            boot_incarnation: offer.boot_incarnation.clone(),
+            connection_incarnation: offer.connection_incarnation.clone(),
+            settings: offer.settings.clone(),
+            known_good: Some(known_good),
+            error: None,
+            verified_at: None,
+            verified_process_id: None,
+        };
+        let prior = self.journal.clone();
+        self.journal
+            .records
+            .insert(offer.attempt_id.clone(), record);
+        self.journal
+            .high_water
+            .insert(offer.group.clone(), revision);
+        if self.persist().is_err() {
+            self.journal = prior;
+            return Err("journal_write_failed".into());
+        }
+        self.journal
+            .records
+            .get_mut(&offer.attempt_id)
+            .unwrap()
+            .phase = "awaiting_startup".into();
+        self.journal
+            .records
+            .get_mut(&offer.attempt_id)
+            .unwrap()
+            .sequence = 2;
+        if self.persist().is_err() {
+            // Durable acceptance may have succeeded even if the marker did not.
+            // Do not start a restart unless the marker was proven persisted.
+            self.journal
+                .records
+                .get_mut(&offer.attempt_id)
+                .unwrap()
+                .phase = "accepted".into();
+            self.journal
+                .records
+                .get_mut(&offer.attempt_id)
+                .unwrap()
+                .sequence = 1;
+            return Ok(("accepted", 1));
+        }
+        Ok(("awaiting_startup", 2))
+    }
+
+    fn accepted_attempts_digest(&self, group: &str) -> String {
+        let mut bytes = Vec::new();
+        for (id, record) in &self.journal.records {
+            if record.group == group && record.scope == "restart" {
+                bytes.extend_from_slice(id.as_bytes());
+                bytes.push(0);
+                bytes.extend_from_slice(record.phase.as_bytes());
+                bytes.push(b'\n');
+            }
+        }
+        hex_digest(&bytes)
     }
 
     fn accept_inner(
@@ -675,6 +1144,7 @@ impl PolicyAgent {
         let record = Record {
             host_id: offer.host_id.clone(),
             group: offer.group.clone(),
+            scope: offer.scope.clone(),
             revision: offer.revision.clone(),
             digest,
             phase: "accepted".into(),
@@ -686,6 +1156,10 @@ impl PolicyAgent {
             boot_incarnation: offer.boot_incarnation.clone(),
             connection_incarnation: offer.connection_incarnation.clone(),
             settings: offer.settings.clone(),
+            known_good: None,
+            error: None,
+            verified_at: None,
+            verified_process_id: None,
         };
         let durable = self.journal.clone();
         self.journal
@@ -733,6 +1207,38 @@ impl PolicyAgent {
             }
         }
     }
+}
+
+fn persist_journal(path: &Path, journal: &Journal) -> std::io::Result<()> {
+    let tmp = path.with_extension("policy.tmp");
+    let bytes = serde_json::to_vec(&journal.on_disk()).map_err(std::io::Error::other)?;
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp)?;
+    f.write_all(&bytes)?;
+    f.sync_all()?;
+    fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        OpenOptions::new().read(true).open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn record_restart_phase(
+    path: &Path,
+    journal: &mut Journal,
+    id: &str,
+    phase: &str,
+) -> std::io::Result<()> {
+    let record = journal
+        .records
+        .get_mut(id)
+        .ok_or(std::io::Error::other("restart attempt missing"))?;
+    record.phase = phase.into();
+    record.sequence += 1;
+    persist_journal(path, journal)
 }
 
 // The catalog checks lexical containment. Before accepting a new home root,
@@ -835,6 +1341,74 @@ fn facts_digest(facts: &[Value]) -> Result<String, String> {
         bytes.push(b'\n');
     }
     Ok(hex_digest(&bytes))
+}
+
+fn hardware_facts(offer: &Offer, evidence: HardwareEvidence<'_>) -> Result<Vec<Value>, String> {
+    let node = offer.resolved_settings["render_node"]
+        .as_str()
+        .ok_or("hardware_evidence_missing")?;
+    let mut matched = evidence.gpus.iter().filter(|gpu| {
+        gpu.render_node.as_deref() == Some(node)
+            && gpu.encode_slots_total > 0
+            && gpu
+                .driver_identity
+                .as_ref()
+                .is_some_and(|id| !id.is_empty())
+    });
+    let gpu = matched.next().ok_or("hardware_evidence_missing")?;
+    if matched.next().is_some() {
+        return Err("hardware_evidence_ambiguous".into());
+    }
+    if offer.settings["encoder"]["source"] == "automatic" {
+        let encoder = match gpu.vendor.trim().to_ascii_lowercase().as_str() {
+            "amd" | "nvidia" => "vulkan",
+            "intel" => "va",
+            _ => return Err("hardware_vendor_unavailable".into()),
+        };
+        if offer.resolved_settings["encoder"] != encoder {
+            return Err("resolved_mismatch".into());
+        }
+    }
+    // Capacity reports can contain sysfs paths visible across container
+    // boundaries. Opening the actual node is the admission evidence.
+    let path = gpu.device_path.as_deref().unwrap_or(node);
+    std::fs::File::open(path).map_err(|_| "hardware_device_inaccessible")?;
+    let driver = gpu
+        .driver_identity
+        .as_deref()
+        .ok_or("hardware_evidence_missing")?;
+    let probe_id = format!("media_probe_gpu{}", gpu.index);
+    let check = evidence
+        .readiness
+        .iter()
+        .find(|check| check.id == probe_id)
+        .ok_or("hardware_probe_unavailable")?;
+    if check.status != "pass"
+        || check.source.as_deref() != Some("host_probe")
+        || check
+            .observed_at
+            .as_deref()
+            .is_none_or(|at| OffsetDateTime::parse(at, &Rfc3339).is_err())
+        || check
+            .blocks
+            .as_ref()
+            .is_some_and(|blocks| blocks.gpu_index != Some(gpu.index))
+    {
+        return Err("hardware_probe_unavailable".into());
+    }
+    let device = hex_digest(format!("gpu\0{}\0{}\0{}\n", gpu.index, node, driver).as_bytes());
+    let probe = hex_digest(
+        format!(
+            "{probe_id}\0{device}\0{}\0host_probe\0pass\n",
+            offer.connection_incarnation
+        )
+        .as_bytes(),
+    );
+    Ok(vec![
+        json!({"kind":"accessible_device","id":device}),
+        json!({"kind":"driver_identity","id":driver}),
+        json!({"kind":"host_probe_result","id":probe}),
+    ])
 }
 
 fn state(
@@ -1008,6 +1582,7 @@ mod tests {
         Record {
             host_id: "host".into(),
             group: group.into(),
+            scope: "next_session".into(),
             revision: revision.into(),
             digest: "a".repeat(64),
             phase: phase.into(),
@@ -1017,6 +1592,10 @@ mod tests {
             boot_incarnation: "boot".into(),
             connection_incarnation: "conn".into(),
             settings: Value::Null,
+            known_good: None,
+            error: None,
+            verified_at: None,
+            verified_process_id: None,
         }
     }
 
@@ -1036,6 +1615,296 @@ mod tests {
             runtime,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn hardware_offer_is_durable_before_restart_and_never_claims_prestart_application() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.json");
+        let mut runtime = RuntimeSettings::baseline_with(&|_| None);
+        let baseline = runtime.clone();
+        let mut agent = open_at(&path, &mut runtime);
+        agent
+            .apply_legacy_overlay(&baseline, &mut runtime, &json!({}), Some("delivery"))
+            .unwrap();
+        assert!(agent.journal.active_groups.contains_key("hardware"));
+        let advertised: Vec<String> = agent.journal.groups().into_iter().collect();
+        agent
+            .confirm_groups(&advertised, &["hardware".into()])
+            .unwrap();
+        let active = agent.journal.active_groups["hardware"].clone();
+        let live = runtime.deployment_map();
+        let resolved = json!({"encoder":live["encoder"],"render_node":live["render_node"],"cuda_device":live["cuda_device"]});
+        let settings = json!({
+            "encoder":{"source":"explicit","value":resolved["encoder"]},
+            "render_node":{"source":"explicit","value":resolved["render_node"]},
+            "cuda_device":{"source":"explicit","value":resolved["cuda_device"]}
+        });
+        let prerequisites = vec![
+            json!({"kind":"accepted_attempts","id":hex_digest(&[])}),
+            json!({"kind":"seeded_group_digest","id":active.digest}),
+        ];
+        let offer = Offer {
+            attempt_id: "00000000-0000-4000-8000-000000000101".into(),
+            host_id: "host".into(),
+            boot_incarnation: "boot".into(),
+            connection_incarnation: "conn".into(),
+            group: "hardware".into(),
+            revision: "1".into(),
+            content_sha256: policy_catalog::digest(&json!({
+                "group":"hardware","scope":"restart","revision":"1",
+                "settings":settings,"resolved_settings":resolved
+            })),
+            scope: "restart".into(),
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            prerequisites_sha256: facts_digest(&prerequisites).unwrap(),
+            prerequisites,
+            settings,
+            resolved_settings: resolved,
+        };
+        let before = runtime.deployment_map();
+        let state = agent.accept_restart(offer.clone(), &runtime, true, None);
+        assert_eq!(phase_of(&state).0, "awaiting_startup");
+        assert_eq!(runtime.deployment_map(), before);
+        let disk = fs::read(&path).unwrap();
+        let journal = Journal::load(&disk).unwrap();
+        assert_eq!(journal.records[&offer.attempt_id].phase, "awaiting_startup");
+        assert_eq!(
+            journal.records[&offer.attempt_id].resolved_settings,
+            offer.resolved_settings
+        );
+        assert_eq!(
+            phase_of(&agent.accept_restart(offer, &runtime, true, None)).0,
+            "awaiting_startup"
+        );
+    }
+
+    #[test]
+    fn automatic_hardware_checks_exact_current_device_probe_and_deployment_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device");
+        fs::write(&path, b"device-access").unwrap();
+        let node = path.to_str().unwrap();
+        let mut runtime = RuntimeSettings::baseline();
+        let mut agent = test_support::owned_agent(dir.path(), &["hardware"], &mut runtime);
+        let resolved = json!({"encoder":"vulkan","render_node":node,
+            "cuda_device":runtime.deployment_map()["cuda_device"]});
+        let settings = json!({
+            "encoder":{"source":"automatic"},
+            "render_node":{"source":"automatic"},
+            "cuda_device":{"source":"deployment"}
+        });
+        let gpu = GpuCapacity {
+            index: 0,
+            vendor: "amd".into(),
+            model: "test".into(),
+            vram_mb_total: 1,
+            encode_slots_total: 1,
+            render_node: Some(node.into()),
+            device_path: Some(node.into()),
+            driver_identity: Some("driver:test".into()),
+            codecs: None,
+        };
+        let check = ReadinessCheck {
+            id: "media_probe_gpu0".into(),
+            status: "pass".into(),
+            summary: String::new(),
+            remediation: String::new(),
+            observed_at: Some("2026-09-23T00:00:00Z".into()),
+            source: Some("host_probe".into()),
+            blocks: None,
+        };
+        let gpus = [gpu];
+        let readiness = [check];
+        let mut offer = Offer {
+            attempt_id: "00000000-0000-4000-8000-000000000102".into(),
+            host_id: "host".into(),
+            boot_incarnation: "boot".into(),
+            connection_incarnation: "conn".into(),
+            group: "hardware".into(),
+            revision: "1".into(),
+            content_sha256: String::new(),
+            scope: "restart".into(),
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            prerequisites_sha256: String::new(),
+            prerequisites: Vec::new(),
+            settings,
+            resolved_settings: resolved,
+        };
+        offer.content_sha256 =
+            policy_catalog::digest(&json!({"group":"hardware","scope":"restart",
+            "revision":"1","settings":offer.settings,"resolved_settings":offer.resolved_settings}));
+        let active = &agent.journal.active_groups["hardware"];
+        let mut facts = hardware_facts(
+            &offer,
+            HardwareEvidence {
+                gpus: &gpus,
+                readiness: &readiness,
+            },
+        )
+        .unwrap();
+        facts.push(json!({"kind":"accepted_attempts","id":hex_digest(&[])}));
+        facts.push(json!({"kind":"seeded_group_digest","id":active.digest}));
+        let baseline = policy_catalog::deployment_fact(
+            &offer.settings,
+            offer.resolved_settings.as_object().unwrap(),
+        )
+        .unwrap();
+        facts.push(json!({"kind":"deployment_baseline","id":baseline}));
+        facts.sort_by(|a, b| {
+            (a["kind"].as_str(), a["id"].as_str()).cmp(&(b["kind"].as_str(), b["id"].as_str()))
+        });
+        assert_eq!(facts.len(), 6); // no fabricated agent-image digest
+        assert!(!facts
+            .iter()
+            .any(|fact| fact["kind"] == "agent_image_digest"));
+        offer.prerequisites_sha256 = facts_digest(&facts).unwrap();
+        offer.prerequisites = facts;
+        assert_eq!(
+            phase_of(&agent.accept_restart(
+                offer,
+                &runtime,
+                true,
+                Some(HardwareEvidence {
+                    gpus: &gpus,
+                    readiness: &readiness
+                })
+            ))
+            .0,
+            "awaiting_startup"
+        );
+    }
+
+    #[test]
+    fn boot_consumes_candidate_marker_once_and_second_boot_never_retries_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.json");
+        let mut journal = Journal::default();
+        let mut attempt = record(
+            "hardware",
+            "3",
+            "awaiting_startup",
+            2,
+            json!({"encoder":"openh264","render_node":"software","cuda_device":0}),
+        );
+        attempt.scope = "restart".into();
+        attempt.known_good = Some(ActiveGroup {
+            kind: "seeded".into(),
+            digest: "b".repeat(64),
+            resolved_settings: json!({"encoder":"va","render_node":"/dev/dri/renderD128","cuda_device":0}),
+        });
+        journal
+            .records
+            .insert("00000000-0000-4000-8000-000000000102".into(), attempt);
+        fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+        let first = PolicyAgent::bootstrap(&path).unwrap();
+        assert_eq!(
+            first,
+            BootOutcome::Candidate("00000000-0000-4000-8000-000000000102".into())
+        );
+        assert_eq!(
+            Journal::load(&fs::read(&path).unwrap())
+                .unwrap()
+                .records
+                .values()
+                .next()
+                .unwrap()
+                .phase,
+            "verifying"
+        );
+
+        let second = PolicyAgent::bootstrap(&path).unwrap();
+        assert_eq!(
+            second,
+            BootOutcome::Recovery("00000000-0000-4000-8000-000000000102".into())
+        );
+        let after = Journal::load(&fs::read(&path).unwrap()).unwrap();
+        let record = after.records.values().next().unwrap();
+        assert_eq!(record.phase, "recovery_awaiting_startup");
+        assert!(
+            record.error.is_some(),
+            "original candidate failure remains visible"
+        );
+
+        let third = PolicyAgent::bootstrap(&path).unwrap();
+        assert_eq!(
+            third,
+            BootOutcome::RecoveryVerify("00000000-0000-4000-8000-000000000102".into())
+        );
+        let fourth = PolicyAgent::bootstrap(&path).unwrap();
+        assert_eq!(
+            fourth,
+            BootOutcome::Uncertain("00000000-0000-4000-8000-000000000102".into())
+        );
+        let after = Journal::load(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after.records.values().next().unwrap().phase, "uncertain");
+    }
+
+    #[test]
+    fn candidate_startup_failure_restores_only_the_known_good_and_keeps_original_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.json");
+        let baseline = RuntimeSettings::baseline();
+        let good =
+            Value::Object(Map::from_iter(policy_catalog::HARDWARE_KEYS.iter().map(
+                |key| ((*key).to_string(), baseline.deployment_map()[*key].clone()),
+            )));
+        let active = ActiveGroup {
+            kind: "verified".into(),
+            digest: policy_catalog::snapshot_digest("hardware", &good),
+            resolved_settings: good.clone(),
+        };
+        let id = "00000000-0000-4000-8000-000000000103";
+        let mut journal = Journal::default();
+        journal.ever_accepted_typed.insert("hardware".into());
+        journal
+            .active_groups
+            .insert("hardware".into(), active.clone());
+        let mut attempt = record(
+            "hardware",
+            "3",
+            "awaiting_startup",
+            2,
+            json!({"encoder":"not-an-encoder","render_node":"software","cuda_device":0}),
+        );
+        attempt.scope = "restart".into();
+        attempt.known_good = Some(active.clone());
+        journal.records.insert(id.into(), attempt);
+        fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        let candidate = PolicyAgent::bootstrap(&path).unwrap();
+        let mut runtime = RuntimeSettings::baseline();
+        let mut agent = open_at(&path, &mut runtime);
+        assert_eq!(
+            agent.finalize_boot(&candidate, &mut runtime).unwrap(),
+            BootOutcome::Recovery(id.into())
+        );
+        assert_eq!(
+            agent.journal.records[id].error.as_deref(),
+            Some("candidate_verification_failed")
+        );
+        assert_eq!(
+            agent.journal.active_groups["hardware"].digest,
+            active.digest
+        );
+        drop(agent);
+        let recovery = PolicyAgent::bootstrap(&path).unwrap();
+        assert_eq!(recovery, BootOutcome::RecoveryVerify(id.into()));
+        let mut runtime = RuntimeSettings::baseline();
+        let mut agent = open_at(&path, &mut runtime);
+        assert_eq!(
+            agent.finalize_boot(&recovery, &mut runtime).unwrap(),
+            BootOutcome::None
+        );
+        assert_eq!(agent.journal.records[id].phase, "recovered");
+        assert_eq!(
+            agent.journal.records[id].error.as_deref(),
+            Some("candidate_verification_failed")
+        );
+        assert_eq!(
+            agent.journal.active_groups["hardware"].digest,
+            active.digest
+        );
     }
 
     #[test]
@@ -1253,10 +2122,12 @@ mod tests {
         assert_eq!(runtime.gop, 90);
         assert_eq!(agent.legacy_map_applied_id().as_deref(), Some("second"));
         drop(agent);
-        assert_eq!(
-            PolicyAgent::advertised_groups(&path),
-            policy_catalog::NEXT_SESSION_GROUPS.to_vec()
-        );
+        assert_eq!(PolicyAgent::advertised_groups(&path), {
+            let mut groups = policy_catalog::NEXT_SESSION_GROUPS.to_vec();
+            groups.push("hardware");
+            groups.sort();
+            groups
+        });
         let mut restarted = baseline;
         let reopened = PolicyAgent::open(
             path,
@@ -1376,9 +2247,14 @@ mod tests {
         assert!(agent.has_seed());
         assert_eq!(
             PolicyAgent::advertised_groups(&dir.path().join("policy.json")),
-            groups.to_vec()
+            {
+                let mut seeded = groups.to_vec();
+                seeded.push("hardware");
+                seeded.sort();
+                seeded
+            }
         );
-        assert!(!agent
+        assert!(agent
             .has_unadvertised_groups(&groups.iter().map(|g| g.to_string()).collect::<Vec<_>>()));
         assert!(agent.has_unadvertised_groups(&[IDLE.into()]));
         let deployed = runtime.deployment_map();

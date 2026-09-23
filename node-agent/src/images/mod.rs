@@ -336,6 +336,12 @@ impl Drop for UpstreamGuard {
 }
 
 impl ImageManager {
+    /// A host configuration restart cannot interrupt an image preparation or
+    /// removal that still owns an operation slot.
+    pub fn has_in_flight_operations(&self) -> bool {
+        !self.ops.lock().unwrap().is_empty()
+    }
+
     /// Load persisted state, then verify each record against the live docker daemon
     /// (agent-api.md). Blocking, N docker round-trips: call it ONCE at process start,
     /// off the async connect path, so a reconnect storm never pays it repeatedly.

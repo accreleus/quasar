@@ -37,18 +37,18 @@ describe("idle apply policy", () => {
     vi.mocked(api.getHostPolicy).mockResolvedValue(missing as never);
     render(<IdleApplyPolicy hostId="host-1" />);
     expect(await screen.findByText("Current authenticated inventory is unavailable.")).toBeTruthy();
-    expect((screen.getByRole("button", { name: "Approve idle wait" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Approve idle apply" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("approves the reviewed tuple and shows waiting without claiming application", async () => {
     vi.mocked(api.approveHostIdleApply).mockResolvedValue(waiting as never);
     render(<IdleApplyPolicy hostId="host-1" />);
-    expect(await screen.findByText(/Execution is unavailable/)).toBeTruthy();
+    expect(await screen.findByText(/Approval never ends a running session/)).toBeTruthy();
     expect(screen.getByText("openh264")).toBeTruthy();
     expect(screen.getByText("explicit")).toBeTruthy();
     expect(screen.getByText("last_verified_group_digest")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Review this configuration" }));
-    fireEvent.click(screen.getByRole("button", { name: "Approve idle wait" }));
+    fireEvent.click(screen.getByRole("button", { name: "Approve idle apply" }));
     await waitFor(() => expect(api.approveHostIdleApply).toHaveBeenCalledWith(
       "admin-token", "host-1", "hardware", preview, expect.any(String),
     ));
@@ -82,12 +82,12 @@ describe("idle apply policy", () => {
     expect(screen.getByText("openh264")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Refresh status" }));
     expect(await screen.findByRole("alert")).toHaveProperty("textContent", expect.stringContaining("reviewed configuration changed"));
-    expect((screen.getByRole("button", { name: "Approve idle wait" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Approve idle apply" }) as HTMLButtonElement).disabled).toBe(true);
     expect(api.approveHostIdleApply).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Review current configuration" }));
     expect(screen.getByText("nvenc")).toBeTruthy();
     expect(screen.queryByText("openh264")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Approve idle wait" }));
+    fireEvent.click(screen.getByRole("button", { name: "Approve idle apply" }));
     await waitFor(() => expect(api.approveHostIdleApply).toHaveBeenCalledWith(
       "admin-token", "host-1", "hardware", changed.groups.hardware.approval_preview, expect.any(String),
     ));
@@ -97,9 +97,9 @@ describe("idle apply policy", () => {
     vi.mocked(api.approveHostIdleApply).mockRejectedValue(new ApiError(409, "approval_superseded", "Review changed"));
     render(<IdleApplyPolicy hostId="host-1" />);
     fireEvent.click(await screen.findByRole("button", { name: "Review this configuration" }));
-    fireEvent.click(screen.getByRole("button", { name: "Approve idle wait" }));
+    fireEvent.click(screen.getByRole("button", { name: "Approve idle apply" }));
     expect(await screen.findByText(/This review was superseded/)).toBeTruthy();
-    expect((screen.getByRole("button", { name: "Approve idle wait" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Approve idle apply" }) as HTMLButtonElement).disabled).toBe(true);
     expect(api.approveHostIdleApply).toHaveBeenCalledTimes(1);
   });
 
@@ -112,7 +112,7 @@ describe("idle apply policy", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Review this configuration" }));
     fireEvent.click(screen.getByRole("button", { name: "Refresh status" }));
     await waitFor(() => expect(api.getHostPolicy).toHaveBeenCalledTimes(2));
-    fireEvent.click(screen.getByRole("button", { name: "Approve idle wait" }));
+    fireEvent.click(screen.getByRole("button", { name: "Approve idle apply" }));
     expect(await screen.findByText(/Approval: waiting/)).toBeTruthy();
     finishOldRead(view());
     await waitFor(() => expect(screen.getByText(/Approval: waiting/)).toBeTruthy());

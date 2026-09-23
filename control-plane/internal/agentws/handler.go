@@ -283,6 +283,27 @@ func (h *Handler) offerNextSessionPolicy(ctx context.Context, c *conn) {
 	}
 }
 
+func (h *Handler) offerIdlePolicy(ctx context.Context, c *conn) {
+	if !c.policyIdle || !c.policyAcknowledged.Load() || !c.policyInventoryDone.Load() ||
+		c.policyInventoryBlocked.Load() || c.policyDeliveryID != "" || h.cfgStore == nil {
+		return
+	}
+	boot, connection, current := h.registry.PolicyIdentity(c.hostID)
+	if !current || boot != c.bootIncarnation || connection != c.connectionIncarnation {
+		return
+	}
+	offer, err := h.cfgStore.NextIdleOffer(ctx, c.hostID, boot, connection)
+	if err != nil {
+		h.log.Warn("idle policy offer load failed", "host_id", c.hostID, "err", err)
+		return
+	}
+	if offer != nil {
+		if err := h.registry.Send(c.hostID, offer); err != nil {
+			h.log.Warn("idle policy offer send failed; durable offer awaits reconciliation", "host_id", c.hostID, "err", err)
+		}
+	}
+}
+
 // Historical grants stay bound to their original identity across reconnects.
 // The current socket authenticates the report; inventory binds its attempt.
 func policyGrantMatches(c *conn, state ConfigPolicyStateMsg) bool {
@@ -430,10 +451,20 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 				c.policyInventoryBlocked.Store(true)
 				continue
 			}
+			var verifiedAt *time.Time
+			if entry.Phase == "applied" && entry.ActiveScope != nil && *entry.ActiveScope == "restart" &&
+				entry.Evidence != nil && entry.Evidence.Revision == entry.Revision &&
+				entry.Evidence.ContentSHA256 == entry.ContentSHA256 && entry.Evidence.AgentProcessID != "" {
+				if at, err := time.Parse(time.RFC3339Nano, entry.Evidence.ObservedAt); err == nil {
+					verifiedAt = &at
+				}
+			}
 			c.rh05RestartEntries = append(c.rh05RestartEntries, hostcfg.JournalInventoryEntry{
 				AttemptID: entry.AttemptID, HostID: entry.HostID, Group: entry.Group,
 				Digest: entry.ContentSHA256, Scope: entry.Scope, Phase: entry.Phase,
-				Sequence: entry.JournalSequence,
+				Sequence: entry.JournalSequence, Revision: entry.Revision,
+				GrantBoot: entry.GrantBootIncarnation, GrantConnection: entry.GrantConnectionIncarnation,
+				ErrorCode: policyStateErrorCode(entry.Error), VerifiedAt: verifiedAt,
 			})
 			continue
 		}
@@ -643,6 +674,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	ac := newConn(hostID, conn)
 	ac.policyTyped = policyTyped
 	ac.policyAccepted = acceptedGroups
+	ac.policyIdle = slices.Contains(acceptedGroups, "hardware")
 	ac.bootIncarnation = h.bootIncarnation
 	ac.connectionIncarnation = connectionID
 	h.registry.add(ac)
@@ -712,6 +744,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 		}
 	}
 	h.offerNextSessionPolicy(bg, ac)
+	h.offerIdlePolicy(bg, ac)
 
 	// Reconcile before processing capacity: handleCapacity may auto-start a
 	// console session, and reaping after that launch would mark it stale and
@@ -804,6 +837,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			// gpu_vram key is a no-op — the stored sample ages out.
 			h.vram.enqueue(vramSampleBatch{hostID: hostID, agentMs: hb.TsUnixMs, samples: hb.GPUVram})
 			h.offerNextSessionPolicy(bg, ac)
+			h.offerIdlePolicy(bg, ac)
 		case "ack":
 			var a AckMsg
 			if err := json.Unmarshal(raw, &a); err != nil {
@@ -918,7 +952,56 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 				h.log.Warn("invalid config policy state", "host_id", hostID, "err", err)
 				continue
 			}
-			if state.HostID != hostID || !policyGrantMatches(ac, state) {
+			if state.HostID != hostID {
+				continue
+			}
+			if state.Scope == "restart" {
+				if !ac.policyIdle {
+					continue
+				}
+				fresh, err := ac.acceptPolicySequence(state)
+				if err != nil {
+					ac.policyInventoryBlocked.Store(true)
+					if holdErr := h.cfgStore.HoldPolicyConnection(bg, hostID, ac.connectionIncarnation); holdErr != nil {
+						return holdErr
+					}
+					return err
+				}
+				if !fresh {
+					continue
+				}
+				if state.Phase == "failed" && state.JournalSequence == "0" && policyStateErrorCode(state.Error) == "journal_write_failed" {
+					// The write may have reached the atomic journal before the error.
+					// Keep admission protected until a fresh complete inventory proves it.
+					if err := h.cfgStore.HoldPolicyConnection(bg, hostID, ac.connectionIncarnation); err != nil {
+						return err
+					}
+					ac.policyInventoryBlocked.Store(true)
+					continue
+				}
+				var observedAt *time.Time
+				if state.Phase == "applied" {
+					if state.ActiveScope == nil || *state.ActiveScope != "restart" || state.Evidence == nil ||
+						state.Evidence.Revision != state.Revision || state.Evidence.ContentSHA256 != state.ContentSHA256 ||
+						state.Evidence.AgentProcessID == "" {
+						continue
+					}
+					at, err := time.Parse(time.RFC3339Nano, state.Evidence.ObservedAt)
+					if err != nil {
+						continue
+					}
+					observedAt = &at
+				}
+				idle := hostcfg.IdleJournalState{AttemptID: state.AttemptID, Group: state.Group,
+					Revision: state.Revision, Digest: state.ContentSHA256,
+					GrantBoot: state.GrantBootIncarnation, GrantConnection: state.GrantConnectionIncarnation,
+					Phase: state.Phase, Sequence: state.JournalSequence, ErrorCode: policyStateErrorCode(state.Error), VerifiedAt: observedAt}
+				if _, err := h.cfgStore.ObserveIdleState(bg, hostID, ac.connectionIncarnation, idle); err != nil {
+					h.log.Warn("idle policy journal state rejected", "host_id", hostID, "attempt_id", state.AttemptID, "err", err)
+				}
+				continue
+			}
+			if !policyGrantMatches(ac, state) {
 				continue
 			}
 			if scope, known := hostcfg.PolicyGroupScope(state.Group); !known || scope != "next_session" || state.Scope != scope {
@@ -1214,13 +1297,14 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 			}
 		}
 		if validGroups && reg.ConfigPolicyVersions["execution_journal"] == 1 && reg.ConfigPolicyVersions["deployment_baseline"] == 1 {
-			// Only next-session groups are echoed; no typed restart executor exists.
+			// Restart ownership is negotiated only with the idle executor capability.
 			nextSession := map[string]bool{}
 			for _, group := range hostcfg.NextSessionPolicyGroups() {
 				nextSession[group] = true
 			}
 			for _, group := range reg.ConfigPolicyGroups {
-				if nextSession[group] {
+				scope, known := hostcfg.PolicyGroupScope(group)
+				if nextSession[group] || reg.ConfigPolicyVersions["idle_apply"] == 1 && known && scope == "restart" {
 					acceptedGroups = append(acceptedGroups, group)
 				}
 			}
@@ -1322,6 +1406,7 @@ func (h *Handler) processCapacity(ctx context.Context, ac *conn, raw []byte) err
 					return err
 				}
 				h.offerNextSessionPolicy(ctx, ac)
+				h.offerIdlePolicy(ctx, ac)
 			}
 		}
 	}

@@ -133,12 +133,15 @@ export function IdleApplyPolicy({ hostId }: { hostId: string | undefined }) {
         <div>
           <h3>Restart configuration</h3>
           <p className="hint">Saved configuration: {group.status.replaceAll("_", " ")}. {attempt ? `Approval: ${attempt.phase.replaceAll("_", " ")}.` : "No approval is active."}</p>
+          {attempt && <p className="hint">Execution {attempt.started ? "started" : "has not started"}; admission {attempt.admission_restricted ? "protected" : "open"}.</p>}
+          {attempt?.phase === "recovered" && <p className="form-error" role="alert">The requested configuration failed. The agent restored its last verified configuration; review the failure before retrying.</p>}
+          {attempt?.phase === "uncertain" && <p className="form-error" role="alert">Recovery could not be verified. Admission remains protected until an operator repairs this host.</p>}
           {attempt?.remedy && <p className="hint">{attempt.remedy}</p>}
           {preview?.remedy && !waiting && <p className="hint">{preview.remedy}</p>}
           {!preview && group.remedy && !waiting && <p className="hint">{group.remedy}</p>}
           {stale && <p className="form-error" role="alert">The reviewed configuration changed. Review the current values before approving.</p>}
           {actionError && <p className="form-error" role="alert">{actionError}</p>}
-          <p className="hint">Execution is unavailable until the recovery executor is installed. No waiting approval restarts the agent or ends a session.</p>
+          <p className="hint">The agent starts only after current idle and preparation checks pass. Approval never ends a running session.</p>
         </div>
         <div className="acts">
           <Button variant="ghost" disabled={busy} onClick={() => void resource.refresh()}>Refresh status</Button>
@@ -149,7 +152,7 @@ export function IdleApplyPolicy({ hostId }: { hostId: string | undefined }) {
               setSelected(current); setReviewRejected(false); setActionError(null);
             }}>{reviewed ? "Review current configuration" : "Review this configuration"}</Button>}
             <Button variant="primary" disabled={busy || !reviewed || stale || !preview?.available || Boolean(resource.errorMessage)}
-              onClick={() => { if (reviewed) void approve.run(reviewed); }}>Approve idle wait</Button>
+              onClick={() => { if (reviewed) void approve.run(reviewed); }}>Approve idle apply</Button>
           </>}
         </div>
         {displayed && reviewDetails(displayed)}

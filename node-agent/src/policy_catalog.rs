@@ -63,11 +63,18 @@ pub fn is_next_session_group(group: &str) -> bool {
     NEXT_SESSION_GROUPS.binary_search(&group).is_ok()
 }
 
+pub const HARDWARE_KEYS: &[&str] = &["cuda_device", "encoder", "render_node"];
+
+pub fn is_restart_group(group: &str) -> bool {
+    group == "hardware"
+}
+
 enum Kind {
     Bool,
     Int(f64, Option<f64>),
     Float(f64, Option<f64>),
     Enum(&'static [&'static str]),
+    String,
     AbsPathOrEmpty,
 }
 
@@ -91,6 +98,7 @@ fn kind_of(key: &str) -> Option<Kind> {
         "abr_ladder_res_min_step_s" => Int(5.0, Some(120.0)),
         "abr_ladder_res_min_height" => Int(360.0, Some(2160.0)),
         "target_usage" => Int(1.0, Some(7.0)),
+        "cuda_device" => Int(0.0, None),
         "abr_floor_ratio" => Float(0.0, Some(1.0)),
         "abr_ewma_alpha" => Float(0.000001, Some(1.0)),
         "abr_deadband" | "abr_max_down_step" | "abr_cliff_guard_frac" => {
@@ -101,7 +109,9 @@ fn kind_of(key: &str) -> Option<Kind> {
         "abr_ladder_res_engage_frac" => Float(0.2, Some(0.95)),
         "abr_ladder_res_recover_frac" => Float(0.3, Some(1.0)),
         "abr_mode" => Enum(&["off", "protective", "smooth"]),
+        "encoder" => Enum(&["openh264", "va", "nvenc", "vulkan"]),
         "abr_ladder_order" => Enum(&["res_first", "fps_first", "hybrid"]),
+        "render_node" => String,
         "home_root" | "nvidia_lib32_path" => AbsPathOrEmpty,
         _ => return None,
     })
@@ -117,6 +127,7 @@ pub fn validate_value(key: &str, value: &Value) -> Result<(), &'static str> {
             .is_some_and(|n| n.fract() == 0.0 && in_range(n, min, max)),
         Kind::Float(min, max) => value.as_f64().is_some_and(|n| in_range(n, min, max)),
         Kind::Enum(allowed) => value.as_str().is_some_and(|s| allowed.contains(&s)),
+        Kind::String => value.is_string(),
         Kind::AbsPathOrEmpty => value
             .as_str()
             .is_some_and(|s| s.is_empty() || s.starts_with('/')),
@@ -131,27 +142,36 @@ pub fn resolve_group(
     choices: &Value,
     baseline: &RuntimeSettings,
 ) -> Result<Map<String, Value>, &'static str> {
-    if !is_next_session_group(group) {
+    if !is_next_session_group(group) && !is_restart_group(group) {
         return Err("unsupported_group");
     }
     let choices = choices.as_object().ok_or("missing_setting")?;
-    if choices.len() != 1 || !choices.contains_key(group) {
+    let keys: &[&str] = if is_restart_group(group) {
+        HARDWARE_KEYS
+    } else {
+        std::slice::from_ref(&group)
+    };
+    if choices.len() != keys.len() || keys.iter().any(|key| !choices.contains_key(*key)) {
         return Err("missing_setting");
     }
-    let choice = &choices[group];
-    let value = match choice.get("source").and_then(Value::as_str) {
-        Some("explicit") => {
-            let value = choice.get("value").ok_or("invalid_value")?;
-            validate_value(group, value)?;
-            value.clone()
-        }
-        Some("deployment") if choice.get("value").is_none() => baseline
-            .deployment_map()
-            .remove(group)
-            .ok_or("missing_setting")?,
-        _ => return Err("unsupported_source"),
-    };
-    Ok(Map::from_iter([(group.to_string(), value)]))
+    let mut resolved = Map::new();
+    let mut deployment = baseline.deployment_map();
+    for key in keys {
+        let choice = &choices[*key];
+        let value = match choice.get("source").and_then(Value::as_str) {
+            Some("explicit") => {
+                let value = choice.get("value").ok_or("invalid_value")?;
+                validate_value(key, value)?;
+                value.clone()
+            }
+            Some("deployment") if choice.get("value").is_none() => {
+                deployment.remove(*key).ok_or("missing_setting")?
+            }
+            _ => return Err("unsupported_source"),
+        };
+        resolved.insert((*key).to_string(), value);
+    }
+    Ok(resolved)
 }
 
 /// The `deployment_baseline` fact ID for a group, or `None` when no choice in

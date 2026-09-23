@@ -65,6 +65,7 @@ func NewRegistry(log *slog.Logger) *Registry {
 type conn struct {
 	hostID                    string
 	policyTyped               bool
+	policyIdle                bool
 	policyAccepted            []string
 	policyAcknowledged        atomic.Bool
 	policyInitialMapApplied   atomic.Bool

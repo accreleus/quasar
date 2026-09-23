@@ -139,6 +139,25 @@ pub async fn run(cfg: Config) {
         std::process::exit(1);
     }
 
+    // Consume a restart journal marker once per process, before probes or
+    // session runtime initialization can observe the affected hardware group.
+    let policy_path = std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path));
+    let policy_boot = match crate::policy::PolicyAgent::bootstrap(&policy_path) {
+        Ok(crate::policy::BootOutcome::Recovery(id)) => {
+            info!(token = "policy-recovery-restart", attempt_id = %id,
+                "restarting once to activate the last verified hardware configuration");
+            std::process::exit(0);
+        }
+        Ok(outcome) => outcome,
+        Err(error) => {
+            error!(
+                token = "policy-journal-corrupt",
+                "host configuration journal cannot be loaded: {error}"
+            );
+            return;
+        }
+    };
+
     crate::runtime::initialize_image_state(
         format!("{}.runtime-images", cfg.node_secret_path).into(),
     );
@@ -297,6 +316,7 @@ pub async fn run(cfg: Config) {
         image_mgr.clone(),
         release_mgr.clone(),
     );
+    sessions.policy_boot = policy_boot;
     let grace = session_grace();
 
     // Only records that already asked for terminal cleanup are eligible here.
@@ -1337,7 +1357,7 @@ fn register_message(
     Ok(AgentMsg::Register {
         source_policy_versions: Some(serde_json::json!({"steam_preparation": 1})),
         config_policy_versions: Some(
-            serde_json::json!({"typed_settings":2,"execution_journal":1,"deployment_baseline":1}),
+            serde_json::json!({"typed_settings":2,"execution_journal":1,"deployment_baseline":1,"idle_apply":1}),
         ),
         config_policy_groups: Some(crate::policy::PolicyAgent::advertised_groups(
             &std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path)),
@@ -1696,6 +1716,18 @@ async fn connect_and_run(
         connection.clone(),
         &mut sessions.mgr.runtime_settings,
     )?;
+    match policy.finalize_boot(&sessions.policy_boot, &mut sessions.mgr.runtime_settings)? {
+        crate::policy::BootOutcome::Recovery(id) => {
+            info!(token = "policy-recovery-restart", attempt_id = %id,
+                "candidate failed startup verification; restarting once to restore the last verified hardware configuration");
+            std::process::exit(0);
+        }
+        crate::policy::BootOutcome::Uncertain(id) => {
+            warn!(token = "policy-recovery-uncertain", attempt_id = %id,
+                "hardware configuration recovery is unverified; admission remains protected");
+        }
+        _ => {}
+    }
     if let Some(groups) = &policy_groups {
         if let Err(code) = policy.confirm_groups(&advertised, groups) {
             send(
@@ -1710,7 +1742,9 @@ async fn connect_and_run(
             anyhow::bail!("RH05 ownership echo invalid");
         }
     }
-    sessions.mgr.policy_session_ready = policy_identity.is_none() && !policy.has_sticky_ownership();
+    sessions.mgr.policy_session_ready = policy_identity.is_none()
+        && !policy.has_sticky_ownership()
+        && !policy.has_uncertain_restart();
     sessions.mgr.policy_accepted_groups = policy_groups;
     sessions.mgr.policy_delivery_ack = None;
     sessions.mgr.policy_inventory_complete = false;
@@ -1880,6 +1914,7 @@ async fn connect_and_run(
         probe_updates,
         registered_this_connection: _,
         grace_timer: _,
+        policy_boot: _,
     } = sessions;
     mgr.begin_connection(gpu_inventory, vram_targets);
     // #175: home refs mounted by live sessions. The GC reaper consults it so it
@@ -2134,6 +2169,11 @@ async fn connect_and_run(
                         // Handled here, not in handle_control, so the ack flushes before
                         // the process exits. The restart policy brings us back.
                         if let ControlMsg::Restart { id } = &ctrl {
+                            if mgr.policy_agent.as_ref().is_some_and(|policy| policy.has_open_restart()) {
+                                send(&mut tx, &AgentMsg::Ack { id: id.clone(), ok: false,
+                                    error: Some("attempt_conflict".into()) }).await?;
+                                continue;
+                            }
                             info!("restart requested (cmd {id}); acking then exiting for config reload");
                             let reply = AgentMsg::Ack { id: id.clone(), ok: true, error: None };
                             let _ = send(&mut tx, &reply).await;
@@ -2144,7 +2184,23 @@ async fn connect_and_run(
                         // before handle_control consumes ctrl.
                         let was_config_update = matches!(ctrl, ControlMsg::ConfigUpdate { .. });
                         if let Some(reply) = mgr.handle_control(ctrl, evt_tx, diagnostic_tx) {
+                            let restart_accepted = matches!(&reply, AgentMsg::ConfigPolicyState {
+                                scope, phase, ..
+                            } if scope == "restart" && phase == "awaiting_startup");
+                            let journal_uncertain = matches!(&reply, AgentMsg::ConfigPolicyState {
+                                scope, phase, error, ..
+                            } if scope == "restart" && phase == "failed" && error.as_deref() == Some("journal_write_failed"));
                             send_control_reply(&mut tx, &mut *mgr, reply).await?;
+                            if journal_uncertain {
+                                warn!(token = "policy-journal-write-uncertain", "journal write failed; restarting to reconcile durable execution before another offer");
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                std::process::exit(1);
+                            }
+                            if restart_accepted {
+                                info!(token = "policy-candidate-restart", "durable hardware candidate accepted; restarting for startup verification");
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                std::process::exit(0);
+                            }
                         }
                         if was_config_update {
                             // The overlay may have flipped the effective encoder live, so
@@ -2617,6 +2673,7 @@ struct HostSessions {
     /// it — a result produced while disconnected is applied when the next
     /// connection's loop runs.
     probe_updates: mpsc::UnboundedReceiver<crate::host_probe::orchestrator::ReportUpdate>,
+    policy_boot: crate::policy::BootOutcome,
 }
 
 impl HostSessions {
@@ -2661,6 +2718,7 @@ impl HostSessions {
             probe_updates,
             registered_this_connection: false,
             grace_timer: None,
+            policy_boot: crate::policy::BootOutcome::None,
         }
     }
 
@@ -2833,6 +2891,30 @@ struct RunningHandle {
 }
 
 impl SessionManager {
+    fn restart_idle(&self) -> bool {
+        if !self.policy_session_ready
+            || !self.policy_inventory_complete
+            || !self.pending.is_empty()
+            || !self.running.is_empty()
+            || self.warmup_reserved()
+            || self.image_mgr.has_in_flight_operations()
+        {
+            return false;
+        }
+        self.source_policy
+            .as_ref()
+            .and_then(|policy| policy.report())
+            .and_then(|report| report.pointer("/steam/images").cloned())
+            .and_then(|images| images.as_array().cloned())
+            .is_some_and(|images| {
+                images.iter().all(|image| {
+                    !matches!(
+                        image["state"].as_str(),
+                        Some("queued" | "preparing" | "waiting_image" | "deferred" | "failed")
+                    )
+                })
+            })
+    }
     fn new(
         live_refs: LiveRefs,
         health: Arc<HealthState>,
@@ -3747,8 +3829,12 @@ impl SessionManager {
                                         self.policy_inventory_complete
                                             && policy.sticky_groups_accepted(groups)
                                             && (!groups.is_empty() || !policy.has_seed())
+                                            && !policy.has_uncertain_restart()
                                     }
-                                    None => !policy.has_sticky_ownership(),
+                                    None => {
+                                        !policy.has_sticky_ownership()
+                                            && !policy.has_uncertain_restart()
+                                    }
                                 };
                                 if let Some(group) = conflict {
                                     feature_error = Some(AgentMsg::ConfigPolicyFeatureError {
@@ -3843,10 +3929,24 @@ impl SessionManager {
                     settings,
                     resolved_settings,
                 };
-                let reply = self
-                    .policy_agent
-                    .as_mut()
-                    .map(|policy| policy.accept(offer, &mut self.runtime_settings));
+                let restart_idle = self.restart_idle();
+                let readiness = self.readiness.merged();
+                let hardware = crate::policy::HardwareEvidence {
+                    gpus: &self.gpu_inventory,
+                    readiness: &readiness,
+                };
+                let reply = self.policy_agent.as_mut().map(|policy| {
+                    if offer.scope == "restart" {
+                        policy.accept_restart(
+                            offer,
+                            &self.runtime_settings,
+                            restart_idle,
+                            Some(hardware),
+                        )
+                    } else {
+                        policy.accept(offer, &mut self.runtime_settings)
+                    }
+                });
                 if matches!(&reply, Some(AgentMsg::ConfigPolicyState { phase, .. }) if phase == "applied")
                 {
                     // The same launch boundary as the legacy map path: new homes
