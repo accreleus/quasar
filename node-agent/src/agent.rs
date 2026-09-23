@@ -350,22 +350,30 @@ pub async fn run(cfg: Config) {
     // remains the fail-closed policy for applications left by a previous agent.
     let _application_cleanup_guard = spawn_application_cleanup_recovery();
 
-    let policy_boot =
-        match policy_boot {
-            Ok(crate::policy::BootOutcome::Recovery(id)) => {
-                info!(token = "policy-recovery-restart", attempt_id = %id,
+    let policy_boot = match policy_boot {
+        Ok(crate::policy::BootOutcome::Recovery(id)) => {
+            info!(token = "policy-recovery-restart", attempt_id = %id,
                 "restarting once to activate the last verified hardware configuration");
-                std::process::exit(0);
-            }
-            Ok(outcome) => outcome,
-            Err(error) => {
-                error!(token = "policy-journal-corrupt",
-                "host configuration journal cannot be loaded after independent cleanup: {error}");
-                let station = crate::diagnostic::Station::policy_journal_corrupt();
-                run_diagnostic_mode(&cfg, &health, &station, false, Some(&image_mgr)).await;
-                return;
-            }
-        };
+            std::process::exit(0);
+        }
+        Ok(outcome) => outcome,
+        Err(crate::policy::BootError::Write(error)) => {
+            error!(token = "policy-journal-write-failed",
+                    "host configuration journal could not be updated after independent cleanup: {error}");
+            let station = crate::diagnostic::Station::policy_journal_write_failed();
+            run_diagnostic_mode(&cfg, &health, &station, false, Some(&image_mgr)).await;
+            return;
+        }
+        Err(error) => {
+            error!(
+                token = "policy-journal-corrupt",
+                "host configuration journal cannot be loaded after independent cleanup: {error}"
+            );
+            let station = crate::diagnostic::Station::policy_journal_corrupt();
+            run_diagnostic_mode(&cfg, &health, &station, false, Some(&image_mgr)).await;
+            return;
+        }
+    };
     if matches!(
         policy_boot,
         crate::policy::BootOutcome::Candidate(_) | crate::policy::BootOutcome::RecoveryVerify(_)

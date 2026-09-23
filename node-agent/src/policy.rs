@@ -214,6 +214,26 @@ pub enum BootOutcome {
     Uncertain(String),
 }
 
+/// Keeps an unsafe journal payload distinct from a storage failure while
+/// startup admission is held. A write failure must never suggest replacing a
+/// valid journal with an older backup.
+#[derive(Debug)]
+pub enum BootError {
+    Read(std::io::Error),
+    Invalid(String),
+    Write(std::io::Error),
+}
+
+impl std::fmt::Display for BootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read(err) => write!(f, "journal read failed: {err}"),
+            Self::Invalid(err) => write!(f, "journal content invalid: {err}"),
+            Self::Write(err) => write!(f, "journal write failed: {err}"),
+        }
+    }
+}
+
 /// A consumed restart marker has selected one exact group snapshot. The caller
 /// must prove this composed runtime against fresh host evidence before it can
 /// become an active snapshot or be reported to the control plane.
@@ -274,13 +294,14 @@ impl PolicyAgent {
             .values()
             .any(|record| record.scope == "restart" && record.phase == "uncertain")
     }
-    pub fn bootstrap(path: &Path) -> std::io::Result<BootOutcome> {
+    pub fn bootstrap(path: &Path) -> Result<BootOutcome, BootError> {
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(BootOutcome::None),
-            Err(err) => return Err(err),
+            Err(err) => return Err(BootError::Read(err)),
         };
-        let mut journal = Journal::load(&bytes).map_err(std::io::Error::other)?;
+        let mut journal =
+            Journal::load(&bytes).map_err(|err| BootError::Invalid(err.to_string()))?;
         let open: Vec<String> = journal
             .records
             .iter()
@@ -301,7 +322,7 @@ impl PolicyAgent {
             .map(|(id, _)| id.clone())
             .collect();
         if open.len() > 1 {
-            return Err(std::io::Error::other("multiple open restart attempts"));
+            return Err(BootError::Invalid("multiple open restart attempts".into()));
         }
         let Some(id) = open.into_iter().next() else {
             return Ok(BootOutcome::None);
@@ -326,8 +347,9 @@ impl PolicyAgent {
                     }
                     record.phase = "recovery_verifying".into();
                     record.sequence += 1;
-                    persist_journal(path, &journal)?;
-                    record_restart_phase(path, &mut journal, &id, "recovery_awaiting_startup")?;
+                    persist_journal(path, &journal).map_err(BootError::Write)?;
+                    record_restart_phase(path, &mut journal, &id, "recovery_awaiting_startup")
+                        .map_err(BootError::Write)?;
                     return Ok(BootOutcome::Recovery(id));
                 }
             }
@@ -344,7 +366,7 @@ impl PolicyAgent {
             "uncertain" => BootOutcome::Uncertain(id),
             _ => BootOutcome::None,
         };
-        persist_journal(path, &journal)?;
+        persist_journal(path, &journal).map_err(BootError::Write)?;
         Ok(outcome)
     }
     pub fn advertised_groups(path: &PathBuf) -> Vec<String> {
@@ -2026,6 +2048,40 @@ mod tests {
         );
         let after = Journal::load(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(after.records.values().next().unwrap().phase, "uncertain");
+    }
+
+    #[test]
+    fn bootstrap_distinguishes_write_failure_from_invalid_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.json");
+        let mut journal = Journal::default();
+        let mut attempt = record(
+            "hardware",
+            "3",
+            "awaiting_startup",
+            2,
+            json!({"encoder":"openh264","render_node":"software","cuda_device":0}),
+        );
+        attempt.scope = "restart".into();
+        journal.records.insert("attempt".into(), attempt);
+        fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        fs::create_dir(path.with_extension("policy.tmp")).unwrap();
+
+        assert!(matches!(
+            PolicyAgent::bootstrap(&path),
+            Err(BootError::Write(_))
+        ));
+        assert_eq!(
+            Journal::load(&fs::read(&path).unwrap()).unwrap().records["attempt"].phase,
+            "awaiting_startup",
+            "a failed write must preserve the durable marker"
+        );
+
+        fs::write(&path, b"not json").unwrap();
+        assert!(matches!(
+            PolicyAgent::bootstrap(&path),
+            Err(BootError::Invalid(_))
+        ));
     }
 
     #[test]

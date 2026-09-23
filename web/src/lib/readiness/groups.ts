@@ -20,7 +20,7 @@ export interface ReadinessGroupDef {
 export const READINESS_GROUPS: readonly ReadinessGroupDef[] = [
   // #254: the runtime is the most basic fault, so it comes first; startup_cleanup is
   // the agent's own safety state (#256).
-  { key: "runtime", label: "Container runtime", ids: ["startup_cleanup", "runtime_endpoint", "runtime_api_version", "runtime_capabilities", "runtime_cdi", "host_container_mounts"] },
+  { key: "runtime", label: "Container runtime", ids: ["startup_cleanup", "policy_journal", "runtime_endpoint", "runtime_api_version", "runtime_capabilities", "runtime_cdi", "host_container_mounts"] },
   {
     key: "gpu",
     label: "GPU & display",

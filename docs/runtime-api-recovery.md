@@ -109,6 +109,23 @@ plane is reachable. When successful, watch the logs for the
 
 ## Uncertainty and failure handling
 
+### Host-configuration journal diagnostic mode (RH05)
+
+The host-configuration journal is `<NODE_SECRET_PATH>.policy.json` on the
+agent's persistent state mount. A malformed journal or multiple open restart
+attempts produces the `policy_journal` readiness failure and refuses launches
+and configuration changes. Keep the admission hold in place. Inspect the
+journal and mount offline; restore invalid contents only from a verified backup
+that includes the current attempt history. Do not discard a started attempt.
+
+If startup can read the journal but cannot durably update it, the same readiness
+check reports `policy_journal_write_failed` with a storage remedy. Restore free
+space and write access on the persistent mount, preserve the existing journal,
+then restart the agent. Replacing this intact journal with an older backup can
+erase a started attempt. In either fault, independent managed-image work may
+continue, but session and configuration commands stay refused until a fresh
+startup reconciles the journal. No readiness override lifts this protection.
+
 - Losing observation, a log consumer or the control-plane connection does not stop
   a workload. Stop is an explicit operation.
 - An unreachable engine is not a missing container. A lost create/start/remove reply

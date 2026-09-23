@@ -57,6 +57,16 @@ pub enum Fault {
     RuntimeUnusable(String),
     CleanupUnresolved(String),
     PolicyJournalCorrupt,
+    PolicyJournalWriteFailed,
+}
+
+impl Fault {
+    fn is_policy_journal(&self) -> bool {
+        matches!(
+            self,
+            Self::PolicyJournalCorrupt | Self::PolicyJournalWriteFailed
+        )
+    }
 }
 
 impl Fault {
@@ -66,6 +76,7 @@ impl Fault {
             Fault::RuntimeUnusable(_) => "runtime_unusable",
             Fault::CleanupUnresolved(_) => "startup_cleanup_unresolved",
             Fault::PolicyJournalCorrupt => "policy_journal_unavailable",
+            Fault::PolicyJournalWriteFailed => "policy_journal_write_failed",
         }
     }
 
@@ -79,6 +90,9 @@ impl Fault {
             ),
             Fault::PolicyJournalCorrupt => {
                 "the host configuration journal cannot be read safely".into()
+            }
+            Fault::PolicyJournalWriteFailed => {
+                "the host configuration journal cannot be updated safely".into()
             }
         }
     }
@@ -105,7 +119,7 @@ impl Phase {
     pub fn may_start(&self, work: Work) -> bool {
         match self {
             Phase::Normal => true,
-            Phase::Diagnostic(Fault::PolicyJournalCorrupt) => {
+            Phase::Diagnostic(Fault::PolicyJournalCorrupt | Fault::PolicyJournalWriteFailed) => {
                 matches!(work, Work::ImagePulls | Work::ImagePruning)
             }
             Phase::Diagnostic(_) => false,
@@ -123,6 +137,9 @@ impl Phase {
             Phase::Diagnostic(Fault::PolicyJournalCorrupt) => Some(
                 "host in diagnostic mode (policy_journal_unavailable): the host configuration journal cannot be read safely. Every launch remains refused until an operator repairs the journal and restarts the agent; no readiness override lifts this.".into(),
             ),
+            Phase::Diagnostic(Fault::PolicyJournalWriteFailed) => Some(
+                "host in diagnostic mode (policy_journal_write_failed): the host configuration journal cannot be updated safely. Every launch remains refused until an operator repairs journal storage and restarts the agent; no readiness override lifts this.".into(),
+            ),
             Phase::Diagnostic(fault) => Some(format!(
                 "host in diagnostic mode ({}): {}. This host refuses every launch until its \
                  startup cleanup succeeds; the agent retries on its own and no override lifts \
@@ -139,7 +156,11 @@ impl Phase {
         };
         let (id, remediation, source) = if matches!(fault, Fault::PolicyJournalCorrupt) {
             (POLICY_JOURNAL_ID,
-             "Inspect the agent's host configuration journal and its persistent mount. Repair it from a verified backup, then restart the agent. Keep operation journals and managed homes in place; do not clear admission protection to bypass this failure.",
+             "Inspect the agent's host configuration journal and its persistent mount. If its contents are invalid, repair it from a verified backup, then restart the agent. Keep operation journals and managed homes in place; do not clear admission protection to bypass this failure.",
+             "agent")
+        } else if matches!(fault, Fault::PolicyJournalWriteFailed) {
+            (POLICY_JOURNAL_ID,
+             "Restore write access and free space on the agent's persistent journal mount, then restart the agent. Preserve the existing journal and managed homes; do not restore an older journal or clear admission protection to bypass this failure.",
              "agent")
         } else {
             (STARTUP_CLEANUP_ID,
@@ -193,7 +214,7 @@ impl Startup {
         if self.phase == Phase::Normal {
             return Transition::AlreadyNormal;
         }
-        if matches!(self.phase, Phase::Diagnostic(Fault::PolicyJournalCorrupt)) {
+        if matches!(&self.phase, Phase::Diagnostic(fault) if fault.is_policy_journal()) {
             return Transition::StillDiagnostic;
         }
         match retry.fault() {
@@ -398,6 +419,13 @@ impl Station {
             phase: Phase::Diagnostic(Fault::PolicyJournalCorrupt),
         })
         .expect("policy journal fault is diagnostic")
+    }
+
+    pub fn policy_journal_write_failed() -> Arc<Station> {
+        Self::from_startup(Startup {
+            phase: Phase::Diagnostic(Fault::PolicyJournalWriteFailed),
+        })
+        .expect("policy journal write fault is diagnostic")
     }
 
     fn from_startup(startup: Startup) -> Option<Arc<Station>> {
@@ -758,7 +786,8 @@ where
         ok: false,
         error: refusal.clone(),
     };
-    let image_commands_allowed = matches!(&phase, Phase::Diagnostic(Fault::PolicyJournalCorrupt));
+    let image_commands_allowed =
+        matches!(&phase, Phase::Diagnostic(fault) if fault.is_policy_journal());
     match control {
         ControlMsg::SessionAssign { id, session_id, .. } => {
             warn!(
@@ -829,7 +858,7 @@ where
             crate::agent::send(sink, &reply).await?;
         }
         ControlMsg::Restart { id } => {
-            if matches!(phase, Phase::Diagnostic(Fault::PolicyJournalCorrupt)) {
+            if matches!(&phase, Phase::Diagnostic(fault) if fault.is_policy_journal()) {
                 crate::agent::send(sink, &nack(id)).await?;
                 return Ok(());
             }
@@ -1014,6 +1043,35 @@ mod tests {
             station.phase(),
             Phase::Diagnostic(Fault::PolicyJournalCorrupt)
         ));
+    }
+
+    #[test]
+    fn unwritable_policy_journal_preserves_it_and_names_storage_remedy() {
+        let station = Station::policy_journal_write_failed();
+        let phase = station.phase();
+        assert!(!phase.health_ready());
+        assert!(phase
+            .launch_refusal()
+            .unwrap()
+            .contains("policy_journal_write_failed"));
+        let check = station
+            .readiness(Vec::new())
+            .into_iter()
+            .find(|check| check.id == POLICY_JOURNAL_ID)
+            .unwrap();
+        assert!(check.remediation.contains("free space"));
+        assert!(check.remediation.contains("Preserve the existing journal"));
+        assert!(!check.remediation.contains("verified backup"));
+        for work in WITHHELD {
+            assert_eq!(
+                phase.may_start(work),
+                matches!(work, Work::ImagePulls | Work::ImagePruning)
+            );
+        }
+        assert_eq!(
+            station.observe(&attempt(Ok(()), Ok(()))),
+            Transition::StillDiagnostic
+        );
     }
 
     #[tokio::test]
