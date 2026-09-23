@@ -38,6 +38,11 @@ func (c *Coordinator) AgentState(ctx context.Context, hostID string, m agentws.S
 		c.log.Warn("ignoring unknown agent session state", "state", m.State, "session_id", m.SessionID)
 		return
 	}
+	hs, err := c.store.GetSessionHostState(ctx, m.SessionID)
+	if err != nil || hs.HostID == nil || *hs.HostID != hostID {
+		c.log.Warn("ignoring session state from non-owner host", "session_id", m.SessionID)
+		return
+	}
 
 	// A swap in flight rides within `running` via state_detail, so it must be
 	// handled before the generic transition, which treats running→running as a
@@ -54,7 +59,7 @@ func (c *Coordinator) AgentState(ctx context.Context, hostID string, m agentws.S
 		errMsg = m.Error
 	}
 
-	sess, err := c.store.Transition(ctx, m.SessionID, to, detail, errMsg)
+	sess, err := c.store.TransitionFromHost(ctx, m.SessionID, hostID, to, detail, errMsg)
 	if errors.Is(err, ErrInvalidTransition) {
 		c.log.Warn("agent reported illegal transition", "session_id", m.SessionID, "to", to, "err", err)
 		return

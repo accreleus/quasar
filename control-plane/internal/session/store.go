@@ -48,6 +48,9 @@ var (
 	// host. A refusal, never a provision: creating one would mount an empty
 	// directory and reach `running` looking healthy.
 	ErrHomeNotProvisioned = errors.New("home not provisioned for this app")
+	// Known locations disagree or the canonical owner is uncertain. Operator
+	// repair is required; retrying elsewhere could create a second home.
+	ErrHomeConflict = errors.New("managed home location requires repair")
 	// A tile borrows the parent's image, runtime, mounts and home, so launching
 	// one IS running the parent and `enabled = false` must stop it.
 	ErrParentDisabled = errors.New("the provider app this tile launches through is disabled")
@@ -615,6 +618,17 @@ func (s *Store) ListAll(ctx context.Context, cursor string, limit int32, filter 
 // failed. ErrInvalidTransition if the move is not permitted, ErrNotFound if the
 // row is gone; a same-state report is an idempotent no-op.
 func (s *Store) Transition(ctx context.Context, id string, to State, detail, errMsg *string) (Session, error) {
+	return s.transition(ctx, id, "", to, detail, errMsg)
+}
+
+// TransitionFromHost is the authenticated agent variant. It checks the
+// reporting host while the session row is locked, so a different agent cannot
+// supply lifecycle or managed-home materialization evidence for this session.
+func (s *Store) TransitionFromHost(ctx context.Context, id, hostID string, to State, detail, errMsg *string) (Session, error) {
+	return s.transition(ctx, id, hostID, to, detail, errMsg)
+}
+
+func (s *Store) transition(ctx context.Context, id, reportHostID string, to State, detail, errMsg *string) (Session, error) {
 	if !isValidUUID(id) {
 		return Session{}, ErrNotFound
 	}
@@ -625,12 +639,16 @@ func (s *Store) Transition(ctx context.Context, id string, to State, detail, err
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	var cur State
-	err = tx.QueryRow(ctx, `SELECT state FROM sessions WHERE id = $1::uuid FOR UPDATE`, id).Scan(&cur)
+	var assignedHost *string
+	err = tx.QueryRow(ctx, `SELECT state, host_id::text FROM sessions WHERE id = $1::uuid FOR UPDATE`, id).Scan(&cur, &assignedHost)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Session{}, ErrNotFound
 	}
 	if err != nil {
 		return Session{}, fmt.Errorf("lock session: %w", err)
+	}
+	if reportHostID != "" && (assignedHost == nil || *assignedHost != reportHostID) {
+		return Session{}, ErrNotFound
 	}
 
 	// Teardown-race coercion (see CoerceReport): a `failed` report on an already
@@ -1043,19 +1061,9 @@ func (s *Store) HasLiveUserAppSession(ctx context.Context, userID, homeAppID, ex
 	return conflictID, nil
 }
 
-// homeHostSQL resolves the host holding a user's live (non-tombstoned) home for
-// an app: §5's hard placement pin, and the same subquery policyOrderSQL uses for
-// locality ordering, tie-break included. `ORDER BY last_used_at DESC` is
-// load-bearing — after a locality miss a (user, app) can hold homes on two
-// hosts, and the tile must land on the one with the current install.
-const homeHostSQL = `
-	SELECT host_id::text FROM user_homes
-	WHERE user_id = $1::uuid AND app_id = $2::uuid AND gc_after IS NULL AND host_id IS NOT NULL
-	ORDER BY last_used_at DESC
-	LIMIT 1`
-
-// HomeHostForApp returns the host id holding userID's live home for homeAppID, or
-// "" when there is none.
+// HomeHostForApp returns the canonical owner for the pre-schedule tile pin, or
+// "" when no home was ever recorded. The reservation transaction repeats this
+// read; this first answer is only an early refusal/UX aid.
 //
 // It is the pre-schedule half of §5: a derived tile provisions nothing, so a host
 // with no home for (user, parent) has literally nothing to mount, and placing it
@@ -1063,15 +1071,12 @@ const homeHostSQL = `
 // the launch must be refused BEFORE placement with 409 home_not_provisioned —
 // never fall back to letting the scheduler pick.
 func (s *Store) HomeHostForApp(ctx context.Context, userID, homeAppID string) (string, error) {
-	var hostID string
-	err := s.pool.QueryRow(ctx, homeHostSQL, userID, homeAppID).Scan(&hostID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", nil
-	}
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return "", fmt.Errorf("resolve home host: %w", err)
+		return "", fmt.Errorf("begin home owner read: %w", err)
 	}
-	return hostID, nil
+	defer tx.Rollback(ctx) //nolint:errcheck
+	return homeClaimOwner(ctx, tx, CreateParams{UserID: userID, AppID: homeAppID, ManagedHome: true})
 }
 
 // probeMaxAgeDays is the staleness cut for user_devices probes (AS-02). A probe

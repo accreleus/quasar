@@ -320,6 +320,14 @@ describe("presentLaunchError", () => {
     expect(result.body).not.toContain("failed");
   });
 
+  it("home_conflict asks for operator repair without disclosing locations", () => {
+    const result = presentLaunchError(family, gameA, "home_conflict", "private server detail");
+    expect(result.title).toBe("Steam needs storage repair");
+    expect(result.body).toContain("operator");
+    expect(result.body).not.toContain("private server detail");
+    expect(result.body).not.toContain("host");
+  });
+
   it("falls back to the generic message for anything else", () => {
     const result = presentLaunchError(family, gameA, "profile_ineligible", "not eligible on this device");
     expect(result.title).toBe("Launch failed");

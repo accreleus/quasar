@@ -25,6 +25,10 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Managed-home ownership during launch (#341).** A canonical per-user, per-app
+  claim keeps existing homes on their recorded host, serializes concurrent first
+  launches, and reports uncertain or divergent locations for operator repair
+  without creating another home.
 - **RH05 host policy and selected-app preparation contracts (#334).** Defined typed
   host setting sources, independent application evidence, scoped idle approval and
   recovery, owner-scoped admission, placement and managed-home claims, image

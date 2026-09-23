@@ -474,6 +474,10 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, ErrHomeInUse):
 		writeHomeInUse(w, err, "you already have a live session backed by this app's storage; go to it or stop it before launching another")
 		return
+	case errors.Is(err, ErrHomeConflict):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeHomeConflict,
+			"this app's saved home location needs operator repair before it can launch")
+		return
 	// Names the PARENT app and the one action that fixes it. 409 rather than 503:
 	// nothing is busy, and retrying changes nothing.
 	case errors.Is(err, ErrHomeNotProvisioned):
@@ -702,6 +706,10 @@ func (h *Handler) handleSwap(w http.ResponseWriter, r *http.Request) {
 		return
 	case errors.Is(err, ErrHomeInUse):
 		writeHomeInUse(w, err, "you already have a live session backed by that app's storage; stop it before swapping")
+		return
+	case errors.Is(err, ErrHomeConflict):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeHomeConflict,
+			"that app's saved home location needs operator repair before it can run here")
 		return
 	// A swap is pinned to the LIVE session's host with no placement step to
 	// re-pin it, so swapping into a tile whose library lives elsewhere is an

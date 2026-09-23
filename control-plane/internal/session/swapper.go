@@ -94,6 +94,9 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 		if conflictID != "" {
 			return Session{}, &HomeInUseError{SessionID: conflictID}
 		}
+		if err := s.store.GuardHomeForSwap(ctx, sess.UserID, app, *sess.HostID); err != nil {
+			return Session{}, fmt.Errorf("swap home location: %w", err)
+		}
 	}
 
 	// A managed-home swap target gets its home injected exactly like a launch.

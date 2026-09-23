@@ -187,6 +187,20 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		return Session{}, false, fmt.Errorf("lock user: %w", err)
 	}
 
+	// Keep the parent and launched tile alive through entitlement and
+	// reservation. Parent first prevents an app-delete cascade from reversing
+	// the lock order against an entitlement held FOR SHARE below.
+	appIDs := []string{p.homeAppID()}
+	if p.AppID != p.homeAppID() {
+		appIDs = append(appIDs, p.AppID)
+	}
+	for _, appID := range appIDs {
+		var lockedID string
+		if err := tx.QueryRow(ctx, `SELECT id::text FROM apps WHERE id=$1::uuid FOR KEY SHARE`, appID).Scan(&lockedID); err != nil {
+			return Session{}, false, fmt.Errorf("lock launch app: %w", err)
+		}
+	}
+
 	// (1b) Entitlement: the authorization boundary. A hand-copy of entitledSQL
 	// (internal/crud/store.go, the definition of record) plus FOR SHARE, copied
 	// because session cannot import crud. LaunchByProfile's pre-check is only for
@@ -223,6 +237,18 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	}
 	if err != nil {
 		return Session{}, false, fmt.Errorf("check entitlement: %w", err)
+	}
+	if p.ManagedHome {
+		owner, err := homeClaimOwner(ctx, tx, p)
+		if err != nil {
+			return Session{}, false, err
+		}
+		if owner != "" {
+			if p.PinHostID != "" && p.PinHostID != owner {
+				return Session{}, false, ErrHomeConflict
+			}
+			p.PinHostID = owner
+		}
 	}
 
 	// (2) Per-user concurrent-session quota (contract gate #1, before capacity).
@@ -311,6 +337,9 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	}
 	if !fits {
 		return Session{}, true, nil // raced; retry from scratch
+	}
+	if err := claimSelectedHome(ctx, tx, p, hostID); err != nil {
+		return Session{}, false, err
 	}
 
 	// A malformed device id is dropped, not fatal: it scopes later reads and is
