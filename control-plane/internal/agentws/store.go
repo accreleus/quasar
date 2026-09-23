@@ -246,7 +246,9 @@ func (s *agentStore) reconnectHost(ctx context.Context, nodeName, agentVersion, 
 // column keeps its value — still carries the admin's or a fleet run's intent.
 // session.UncordonHost is what lifts it, and it already handles a connected
 // draining host. A fresh INSERT has no prior status and starts 'online'.
-const registerStatusSQL = `CASE WHEN hosts.status = 'draining' THEN 'draining' ELSE 'online' END`
+const registerStatusSQL = `CASE WHEN hosts.status = 'draining'
+    OR EXISTS (SELECT 1 FROM host_admission_restrictions ar WHERE ar.host_id = hosts.id)
+    THEN 'draining' ELSE 'online' END`
 
 // Reconnect UPDATE with #429 restart classification (rationale at
 // agentRestartMinGap). The `old` CTE snapshots the pre-reconnect values under
@@ -604,13 +606,18 @@ func (s *agentStore) updateHeartbeat(ctx context.Context, hostID string) error {
 	return nil
 }
 
-// markOffline sets a host offline on WS disconnect (every path that ends the
-// read loop). Also stamps agent_disconnected_at = now(), the anchor for
+// markOffline stamps a WS disconnect (every path that ends the read loop).
+// An owned restriction keeps the compatibility status draining; the connection
+// stamp remains the source of liveness. Also stamps agent_disconnected_at =
+// now(), the anchor for
 // reconnectHost's blip-vs-restart classification — see agentRestartMinGap for
 // why a control-plane restart cannot misattribute its own downtime.
 func (s *agentStore) markOffline(ctx context.Context, hostID string) error {
 	_, err := s.pool.Exec(ctx, `
-		UPDATE hosts SET status='offline', agent_disconnected_at=now() WHERE id=$1
+		UPDATE hosts SET status=CASE WHEN EXISTS (
+		    SELECT 1 FROM host_admission_restrictions ar WHERE ar.host_id=hosts.id
+		) THEN 'draining' ELSE 'offline' END,
+		agent_disconnected_at=now() WHERE id=$1
 	`, hostID)
 	if err != nil {
 		return fmt.Errorf("mark offline: %w", err)

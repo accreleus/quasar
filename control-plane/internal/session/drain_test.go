@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
 )
 
@@ -230,6 +231,80 @@ func TestUncordonDrainingHost(t *testing.T) {
 	}
 	if h.Status != "online" || hostStatus(t, pool, s.hostID) != "online" {
 		t.Fatalf("status: got %q want online", hostStatus(t, pool, s.hostID))
+	}
+}
+
+// An operator's resume releases only their hold. A platform operation that
+// began while the manual drain was active still protects the host.
+func TestManualResumePreservesPlatformHold(t *testing.T) {
+	pool := testDB(t)
+	store, coord, _ := newCoord(t, pool)
+	s := seed(t, pool, 4)
+	ctx := context.Background()
+	if _, err := coord.DrainHost(ctx, s.hostID, false); err != nil {
+		t.Fatal(err)
+	}
+	holds := admission.NewStore(pool)
+	platform := admission.Owner{Kind: admission.Platform, ID: "00000000-0000-0000-0000-000000000123"}
+	if _, err := holds.Acquire(ctx, s.hostID, platform, "platform apply"); err != nil {
+		t.Fatal(err)
+	}
+	h, err := coord.UncordonHost(ctx, s.hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Status != "draining" {
+		t.Fatalf("resume status = %s, want draining while platform holds", h.Status)
+	}
+	if _, err := store.ScheduleAndCreate(ctx, launchParams(s)); !errors.Is(err, ErrNoHostAvailable) {
+		t.Fatalf("launch while platform holds: %v, want no host", err)
+	}
+	if _, err := holds.Release(ctx, s.hostID, platform, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ScheduleAndCreate(ctx, launchParams(s)); err != nil {
+		t.Fatalf("launch after platform completion: %v", err)
+	}
+}
+
+func TestAdmissionRestrictionWinsReservationRace(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT status FROM hosts WHERE id=$1::uuid FOR UPDATE`, s.hostID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO host_admission_restrictions (host_id,owner_kind,owner_id,reason)
+		VALUES ($1::uuid,'platform','00000000-0000-0000-0000-000000000123'::uuid,'Platform apply')`, s.hostID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE hosts SET status='draining' WHERE id=$1::uuid`, s.hostID); err != nil {
+		t.Fatal(err)
+	}
+
+	result := make(chan error, 1)
+	go func() { _, err := store.ScheduleAndCreate(ctx, launchParams(s)); result <- err }()
+	// The reservation either saw the old online candidate and waits on the
+	// host lock, or sees the committed restriction below. Neither may commit
+	// a session after the hold becomes durable.
+	time.Sleep(50 * time.Millisecond)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrNoHostAvailable) {
+			t.Fatalf("launch after restriction committed: %v, want no host", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reservation did not settle after restriction commit")
 	}
 }
 

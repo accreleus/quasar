@@ -18,6 +18,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
@@ -432,6 +433,84 @@ func TestRegisterOnTheRequestedCommitResolvesTheAttempt(t *testing.T) {
 	if attempts[0].State != AttemptSucceeded || attempts[0].FinishedAt == nil {
 		t.Errorf("attempt = %+v, want succeeded with a finished_at", attempts[0])
 	}
+}
+
+func TestStandaloneApplyReleasesOnlyItsOwnHoldOnSuccessOrFailure(t *testing.T) {
+	for _, outcome := range []string{"success", "failure"} {
+		t.Run(outcome, func(t *testing.T) {
+			h := newApplyHarness(t)
+			ctx := context.Background()
+			holds := admission.NewStore(h.pool)
+			if _, err := holds.Acquire(ctx, h.hostID, admission.ManualOwner, "Manual drain"); err != nil {
+				t.Fatal(err)
+			}
+			h.runner.deps.AcquireOwned = func(ctx context.Context, attemptID, hostID string) error {
+				_, err := holds.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, "Platform apply")
+				return err
+			}
+			h.runner.deps.ReleaseOwned = func(ctx context.Context, attemptID, hostID string) error {
+				_, err := holds.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, true)
+				return err
+			}
+			if outcome == "failure" {
+				h.agent.ack = Ack{OK: false, Error: "refused"}
+			}
+			code, body := h.post(t, h.applyURL(), h.adminToken, HostApplyRequest{ReleaseID: h.release.ID, Force: true})
+			if code != http.StatusAccepted {
+				t.Fatalf("apply = %d %s", code, body)
+			}
+			if outcome == "success" {
+				waitFor(t, "release_apply to be sent", func() bool { return h.agent.sentCount() == 1 })
+				commit := h.release.SourceCommit
+				h.runner.HandleRegister(ctx, h.hostID, &commit)
+			}
+			waitFor(t, "terminal apply and own hold released", func() bool {
+				attempts, err := h.store.ListAttempts(ctx, h.hostID, 10)
+				if err != nil || len(attempts) != 1 || !TerminalAttemptState(attempts[0].State) {
+					return false
+				}
+				rs, err := holds.List(ctx, h.hostID)
+				return err == nil && len(rs) == 1 && rs[0].OwnerKind == admission.Manual
+			})
+			status, err := h.store.HostStatus(ctx, h.hostID)
+			if err != nil || status != "draining" {
+				t.Fatalf("status = %q (%v), want draining", status, err)
+			}
+		})
+	}
+}
+
+func TestStandaloneApplyKeepsItsHoldAcrossControlPlaneRestart(t *testing.T) {
+	h := newApplyHarness(t)
+	ctx := context.Background()
+	holds := admission.NewStore(h.pool)
+	h.runner.deps.AcquireOwned = func(ctx context.Context, attemptID, hostID string) error {
+		_, err := holds.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, "Platform apply")
+		return err
+	}
+	h.runner.deps.ReleaseOwned = func(ctx context.Context, attemptID, hostID string) error {
+		_, err := holds.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, true)
+		return err
+	}
+	code, body := h.post(t, h.applyURL(), h.adminToken, HostApplyRequest{ReleaseID: h.release.ID, Force: true})
+	if code != http.StatusAccepted {
+		t.Fatalf("apply = %d %s", code, body)
+	}
+	waitFor(t, "release_apply to be sent", func() bool { return h.agent.sentCount() == 1 })
+	h.runner.Close()
+	rs, err := holds.List(ctx, h.hostID)
+	if err != nil || len(rs) != 1 || rs[0].OwnerKind != admission.Platform {
+		t.Fatalf("restart protection = %+v (%v), want platform hold", rs, err)
+	}
+	next := testRunner(h.store, h.runner.deps)
+	t.Cleanup(next.Close)
+	next.Adopt(ctx)
+	commit := h.release.SourceCommit
+	next.HandleRegister(ctx, h.hostID, &commit)
+	waitFor(t, "adopted attempt to release its own hold", func() bool {
+		rs, err := holds.List(ctx, h.hostID)
+		return err == nil && len(rs) == 0
+	})
 }
 
 // A relayed release_state writes the previous digests — in every state, not

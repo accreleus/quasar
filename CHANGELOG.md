@@ -25,6 +25,9 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Owner-scoped host admission restrictions (#337).** Manual drains and platform
+  applies now hold independent, durable scheduling restrictions. Session
+  reservations serialize with new holds, and reconnect preserves them.
 - **RH05 host policy and selected-app preparation contracts (#334).** Defined typed
   host setting sources, independent application evidence, scoped idle approval and
   recovery, owner-scoped admission, placement and managed-home claims, image

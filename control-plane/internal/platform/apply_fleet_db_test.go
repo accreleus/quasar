@@ -10,11 +10,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
@@ -664,6 +666,52 @@ func TestFleetHoldsRunningSessionsWhenTheReleaseRunsNoMigration(t *testing.T) {
 	if as[0].SessionsRemaining != nil {
 		t.Fatalf("sessions_remaining = %d, want null: the step waited on nothing and ended nothing",
 			*as[0].SessionsRemaining)
+	}
+}
+
+func TestFleetCompletionReleasesOnlyItsOwnAdmissionRestriction(t *testing.T) {
+	drivers := &succeedingDrivers{}
+	h := newFleetHarness(t, commitA, drivers)
+	drivers.store = h.store
+	ctx := context.Background()
+	holds := admission.NewStore(h.pool)
+	var acquired atomic.Int32
+	if _, err := holds.Acquire(ctx, h.hostID, admission.ManualOwner, "Manual drain"); err != nil {
+		t.Fatal(err)
+	}
+	h.fleet.cordons = FleetCordons{
+		AcquireOwned: func(ctx context.Context, runID, hostID string) error {
+			_, err := holds.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: runID}, "Platform apply")
+			if err == nil {
+				acquired.Add(1)
+			}
+			return err
+		},
+		ReleaseOwned: func(ctx context.Context, runID, hostID string) error {
+			_, err := holds.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: runID}, true)
+			return err
+		},
+	}
+	code, raw := h.do(t, http.MethodPost, "/v1/admin/platform/apply", h.admin,
+		FleetApplyRequest{ReleaseID: h.release.ID})
+	if code != http.StatusAccepted {
+		t.Fatalf("POST apply = %d %s", code, raw)
+	}
+	run := decodeRun(t, raw)
+	waitFor(t, "the run to finish", func() bool {
+		r, err := h.store.Run(ctx, run.ID)
+		return err == nil && TerminalRunState(r.State)
+	})
+	waitFor(t, "the run to release its restriction", func() bool {
+		rs, err := holds.List(ctx, h.hostID)
+		return err == nil && len(rs) == 1 && rs[0].OwnerKind == admission.Manual
+	})
+	if acquired.Load() == 0 {
+		t.Fatal("platform run never acquired its owner restriction")
+	}
+	status, err := h.store.HostStatus(ctx, h.hostID)
+	if err != nil || status != "draining" {
+		t.Fatalf("status = %q (%v), want draining", status, err)
 	}
 }
 

@@ -948,7 +948,9 @@ func (s *Store) SetHostStatus(ctx context.Context, hostID, status string) error 
 		return nil // no such host row to update
 	}
 	if _, err := s.pool.Exec(ctx,
-		`UPDATE hosts SET status = $2 WHERE id = $1::uuid`, hostID, status,
+		`UPDATE hosts SET status = CASE WHEN $2='offline' AND EXISTS (
+			SELECT 1 FROM host_admission_restrictions ar WHERE ar.host_id=hosts.id
+		) THEN 'draining' ELSE $2 END WHERE id = $1::uuid`, hostID, status,
 	); err != nil {
 		return fmt.Errorf("set host status: %w", err)
 	}
