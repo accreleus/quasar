@@ -1919,6 +1919,12 @@ static SIBLING_EGL: Mutex<Option<(String, Instant, EglRuntime)>> = Mutex::new(No
 /// Validate the driver through Docker's sibling-container namespace using the
 /// same mount/environment arguments as an app. Cached for one minute per image
 /// and driver digest; failures are retried without re-downloading the driver.
+///
+/// Every engine call is budgeted: the image lookup before the cache by
+/// [`crate::runtime::ENGINE_INSPECTION_BUDGET`] (#274), and the container lifecycle after
+/// a cache MISS by [`crate::runtime::GPU_PROBE_LIFECYCLE_BUDGET`] end to end (#283). An
+/// outcome that only says the lifecycle could not run is not cached — a minute of
+/// answering "probe done" with a non-answer would outlast the freeze that caused it.
 pub fn probe_sibling_egl() -> EglRuntime {
     let Some(info) = current() else {
         return EglRuntime::Unknown;
@@ -1962,7 +1968,9 @@ pub fn probe_sibling_egl() -> EglRuntime {
     let run = crate::runtime::GpuProbeRun {
         entrypoint: vec!["/usr/bin/timeout".into()],
         command: vec![
-            "20s".into(),
+            // Same allowance the in-process self-test gets, and the number the probe's
+            // lifecycle budget is sized against (#283).
+            format!("{}s", EGL_SELFTEST_TIMEOUT.as_secs()),
             "/usr/local/bin/quasar-node-agent".into(),
             EGL_SELFTEST_ARG.into(),
             format!("{VOLUME_MOUNT}/lib64/libEGL_nvidia.so.0"),
@@ -1981,33 +1989,63 @@ pub fn probe_sibling_egl() -> EglRuntime {
         name,
         image,
     };
+    // Budgeted end to end (#283): create, start, wait and remove used to carry one
+    // client deadline EACH, so a daemon that wedged after the cache missed could hold
+    // this call for five of them. `Indeterminate` on a spent budget is the same verdict
+    // the engine-did-not-answer arm reaches, just without the wait.
     let output = crate::runtime::configured().and_then(|api| {
-        api.recover_diagnostics().wait()?;
-        let id = api.run_gpu_probe(helper, run).wait()?;
-        let observed = api.observe_gpu_probe(id.clone()).wait();
-        if observed.is_err() {
-            let _ = api.stop_gpu_probe(id.clone()).wait();
-        }
-        let cleanup = api.cleanup_gpu_probe(id).wait();
-        observed.and_then(|value| cleanup.map(|()| value))
+        api.gpu_probe_within(helper, run, crate::runtime::GPU_PROBE_LIFECYCLE_BUDGET)
     });
-    let result = match output {
-        Ok(body) if body.exit_code == Some(0) => parse_egl_selftest(&body.stdout),
-        Ok(body) => EglRuntime::Indeterminate {
-            detail: format!(
-                "sibling EGL test exited {:?}: {}",
-                body.exit_code,
-                body.stderr.trim()
-            ),
-        },
-        Err(error) => EglRuntime::Indeterminate {
-            detail: format!(
-                "sibling EGL test could not complete through owned runtime lifecycle: {error}"
-            ),
-        },
-    };
-    *cached = Some((key, Instant::now(), result.clone()));
+    let (result, cacheable) = sibling_egl_verdict(output);
+    if cacheable == SiblingEglCache::Keep {
+        *cached = Some((key, Instant::now(), result.clone()));
+    }
     result
+}
+
+/// Whether a sibling-probe outcome may be remembered for the cache's minute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SiblingEglCache {
+    /// The probe ran and said something about this host.
+    Keep,
+    /// The probe never produced a verdict: a busy, unreachable or wedged engine, or a
+    /// spent lifecycle budget. Caching a non-answer for a minute would make the next
+    /// caller re-read it as "probe done" and hide a real answer behind it (#283).
+    Discard,
+}
+
+/// Fold one probe lifecycle outcome into a verdict, and say whether it is one. Pure so
+/// the cache rule is testable without an engine.
+fn sibling_egl_verdict(
+    output: Result<crate::runtime::HelperResult, crate::runtime::RuntimeError>,
+) -> (EglRuntime, SiblingEglCache) {
+    match output {
+        // The probe ran to a clean exit: whatever it printed is this host's answer,
+        // including a self-test that crashed before printing a verdict line.
+        Ok(body) if body.exit_code == Some(0) => {
+            (parse_egl_selftest(&body.stdout), SiblingEglCache::Keep)
+        }
+        // It ran and exited non-zero: also an observation of this host.
+        Ok(body) => (
+            EglRuntime::Indeterminate {
+                detail: format!(
+                    "sibling EGL test exited {:?}: {}",
+                    body.exit_code,
+                    body.stderr.trim()
+                ),
+            },
+            SiblingEglCache::Keep,
+        ),
+        // The lifecycle itself failed — nothing was learned about the driver.
+        Err(error) => (
+            EglRuntime::Indeterminate {
+                detail: format!(
+                    "sibling EGL test could not complete through owned runtime lifecycle: {error}"
+                ),
+            },
+            SiblingEglCache::Discard,
+        ),
+    }
 }
 
 /// Run the self-test as a CHILD of this binary (`/proc/self/exe egl-selftest`).
@@ -3920,5 +3958,101 @@ mod tests {
         let d = describe(&manifest("610.57.04"));
         assert!(d.contains("driver volume"));
         assert!(d.contains("610.57.04"));
+    }
+
+    // ── sibling EGL probe: budget and cache (#283) ───────────────────────────
+
+    /// A lifecycle that could not run is `Indeterminate` — never `Broken`, which would
+    /// refuse launches — and it is NOT remembered. The cache exists to stop a healthy
+    /// host paying for a container every minute; holding a spent budget or a busy client
+    /// in it for a minute would answer "probe done" with a non-answer long after the
+    /// engine recovered.
+    #[test]
+    fn a_lifecycle_that_could_not_run_is_indeterminate_and_is_not_cached() {
+        use crate::runtime::{ErrorKind, RuntimeError};
+        for kind in [
+            ErrorKind::Timeout,
+            ErrorKind::UnknownOutcome,
+            ErrorKind::Busy,
+            ErrorKind::Cancelled,
+            ErrorKind::Unavailable,
+        ] {
+            let (verdict, cacheable) = sibling_egl_verdict(Err(RuntimeError::from(kind)));
+            assert!(
+                verdict.is_indeterminate() && !verdict.is_broken(),
+                "{kind:?}: a probe that never ran says nothing about the driver: {verdict:?}"
+            );
+            assert_eq!(
+                cacheable,
+                SiblingEglCache::Discard,
+                "{kind:?}: a non-answer must not be cached as a verdict"
+            );
+        }
+    }
+
+    /// What the probe actually reports is still cached, including a bad verdict: that is
+    /// the minute of relief the cache is for.
+    #[test]
+    fn an_answer_from_a_probe_that_ran_is_cached() {
+        use crate::runtime::HelperResult;
+        let ran = |exit, stdout: &str| HelperResult {
+            exit_code: Some(exit),
+            stdout: stdout.into(),
+            stderr: String::new(),
+        };
+        let (ok, cacheable) = sibling_egl_verdict(Ok(ran(
+            0,
+            "LOADED=/usr/lib64/libEGL.so.1\nEXTENSIONS=EGL_EXT_device_base EGL_EXT_device_enumeration\n",
+        )));
+        assert!(matches!(ok, EglRuntime::Ok { .. }), "{ok:?}");
+        assert_eq!(cacheable, SiblingEglCache::Keep);
+
+        let (broken, cacheable) = sibling_egl_verdict(Ok(ran(0, "EXTENSIONS=\n")));
+        assert!(broken.is_broken(), "{broken:?}");
+        assert_eq!(cacheable, SiblingEglCache::Keep);
+
+        let (exited, cacheable) = sibling_egl_verdict(Ok(ran(1, "")));
+        assert!(exited.is_indeterminate(), "{exited:?}");
+        assert_eq!(
+            cacheable,
+            SiblingEglCache::Keep,
+            "a probe that ran and exited non-zero observed this host"
+        );
+    }
+
+    /// The budget may not be tight enough to turn a HEALTHY probe indeterminate. The
+    /// probe container self-limits with `timeout 20s`; everything else in the lifecycle
+    /// is one engine round-trip, for which `ENGINE_INSPECTION_BUDGET` is already the
+    /// agreed allowance (#274). The budget must clear both with room to spare.
+    #[test]
+    fn the_probe_budget_cannot_trip_a_healthy_probe() {
+        let ceiling = EGL_SELFTEST_TIMEOUT + crate::runtime::ENGINE_INSPECTION_BUDGET;
+        assert!(
+            crate::runtime::GPU_PROBE_LIFECYCLE_BUDGET >= ceiling,
+            "a healthy probe costs at most the container's own {EGL_SELFTEST_TIMEOUT:?} \
+             self-limit plus engine round-trips: {:?} vs {ceiling:?}",
+            crate::runtime::GPU_PROBE_LIFECYCLE_BUDGET
+        );
+    }
+
+    /// The probe runs from the launch gate today (#259), but the budget is sized so that a
+    /// whole refresh's engine work would still land inside the agent's readiness-refresh
+    /// deadline if the probe ever returned to that path: a refresh that straddles a freeze
+    /// must report a verdict rather than be abandoned as `readiness-refresh-overdue` (#283).
+    /// The five budgeted reads #274 left on that path, plus one probe lifecycle.
+    #[test]
+    fn a_probe_and_the_refresh_paths_engine_reads_fit_inside_the_refresh_deadline() {
+        /// `READINESS_REFRESH_DEADLINE` in `agent.rs`.
+        const REFRESH_DEADLINE: Duration = Duration::from_secs(60);
+        /// Budgeted engine reads on the refresh path after #274: the engine inspection,
+        /// the agent's own mount inspection, the firewall read, the image-root lookup and
+        /// the probe's own image lookup.
+        const BUDGETED_READS: u32 = 5;
+        let worst = crate::runtime::ENGINE_INSPECTION_BUDGET * BUDGETED_READS
+            + crate::runtime::GPU_PROBE_LIFECYCLE_BUDGET;
+        assert!(
+            worst < REFRESH_DEADLINE,
+            "{worst:?} of engine work in one refresh does not fit in {REFRESH_DEADLINE:?}"
+        );
     }
 }

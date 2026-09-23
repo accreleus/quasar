@@ -87,6 +87,24 @@ impl From<ErrorKind> for RuntimeError {
 /// that window, not merely "eventually".
 pub const ENGINE_INSPECTION_BUDGET: Duration = Duration::from_secs(5);
 
+/// How long ONE owned GPU probe may take end to end — recover, create and start, wait,
+/// stop, remove — before [`RuntimeClient::gpu_probe_within`] stops waiting on the engine
+/// and reports that it learned nothing (#283).
+///
+/// Sized from what a HEALTHY probe costs, not from what a wedged daemon may take. The
+/// probe container self-limits (`timeout 20s` is its entrypoint), and every other step is
+/// a single engine round-trip, so ~21 s is the theoretical ceiling of a good run and
+/// hardware measures a few seconds. 30 s therefore cannot turn a healthy probe
+/// indeterminate, and it replaces a worst case of five operations each on the client's
+/// full deadline — 150 s at the default 30 s — with one bound.
+///
+/// Today the only production caller is the session launch gate (#259 moved the sibling
+/// probe off the readiness refresh and onto `application_gpu_probe_gpu<N>`), so the bound
+/// is what a launch pays on a wedged engine. It is also sized to fit a refresh should the
+/// probe ever return there: 30 s on top of the five [`ENGINE_INSPECTION_BUDGET`] reads
+/// #274 left on that path is 55 s, under the agent's 60 s `READINESS_REFRESH_DEADLINE`.
+pub const GPU_PROBE_LIFECYCLE_BUDGET: Duration = Duration::from_secs(30);
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub socket: PathBuf,
@@ -675,6 +693,135 @@ impl RuntimeClient {
     /// Preserve exit and log evidence, then remove the owned probe container.
     pub fn cleanup_gpu_probe(&self, id: OwnedHelperId) -> Operation<()> {
         self.cleanup_diagnostic(id)
+    }
+
+    /// One owned GPU probe end to end — recover, create and start, wait, then stop and
+    /// remove — under a single wall-clock `budget` (#283).
+    ///
+    /// Each of those five steps used to be submitted on its own, so each carried the
+    /// client's full per-operation deadline and a wedged daemon could be paid for five
+    /// times over (measured: one full deadline for the create whose reply never comes,
+    /// another for the wait on a container that never exits). Callers on a deadline —
+    /// the readiness refresh, the launch gate — need the LIFECYCLE bounded, not each
+    /// request, so the budget is spent once and apportioned here. (Since #259 the
+    /// sibling probe runs from the launch gate, not the refresh; the bound serves both.)
+    ///
+    /// The four engine round-trips get [`ENGINE_INSPECTION_BUDGET`] or whatever is left,
+    /// whichever is smaller; they are one request and one reply each and cost
+    /// milliseconds on a healthy engine. The observation gets everything that remains,
+    /// because it is the only step with real work behind it: it waits for the probe
+    /// container to exit.
+    ///
+    /// A spent budget is [`ErrorKind::Timeout`] — a timeout of the observation, never a
+    /// verdict about the probe. Teardown past the budget is left undone deliberately:
+    /// the helper journal already records this probe, so the next probe's
+    /// `recover_diagnostics` reconciles it, which is the same path a lost mutation reply
+    /// takes. Nothing is force-removed and no unowned container is touched.
+    pub fn gpu_probe_within(
+        &self,
+        helper: DiagnosticHelper,
+        run: GpuProbeRun,
+        budget: Duration,
+    ) -> Result<HelperResult, RuntimeError> {
+        let Some(deadline) = std::time::Instant::now().checked_add(budget) else {
+            return Err(ErrorKind::InvalidConfiguration.into());
+        };
+        let left = move || deadline.saturating_duration_since(std::time::Instant::now());
+        // One engine round-trip's share, or `None` once the budget is spent. Never more
+        // than the client's own deadline: a caller may not buy time the client will not
+        // wait for.
+        let deadline_cap = self.config.deadline;
+        let hop = move || {
+            let left = left();
+            (!left.is_zero())
+                .then(|| std::cmp::min(left, ENGINE_INSPECTION_BUDGET))
+                .map(|share| std::cmp::min(share, deadline_cap))
+                .filter(|share| !share.is_zero())
+        };
+
+        let spent = || RuntimeError::from(ErrorKind::Timeout);
+        self.recover_diagnostics_within(hop().ok_or_else(spent)?)
+            .wait()?;
+        let id = self
+            .run_gpu_probe_within(helper, run, hop().ok_or_else(spent)?)
+            .wait()?;
+        let watch = std::cmp::min(left(), deadline_cap);
+        let observed = if watch.is_zero() {
+            Err(spent())
+        } else {
+            self.observe_gpu_probe_within(id.clone(), watch).wait()
+        };
+        if observed.is_err() {
+            if let Some(share) = hop() {
+                let _ = self.stop_gpu_probe_within(id.clone(), share).wait();
+            }
+        }
+        let cleanup = match hop() {
+            Some(share) => self.cleanup_gpu_probe_within(id, share).wait(),
+            None => Err(spent()),
+        };
+        observed.and_then(|value| cleanup.map(|()| value))
+    }
+
+    /// [`Self::recover_diagnostics`] under a caller-chosen budget; see
+    /// [`Self::gpu_probe_within`], the only caller, for why the lifecycle needs one.
+    fn recover_diagnostics_within(&self, budget: Duration) -> Operation<()> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::helpers::recover(&config).await },
+            std::cmp::min(self.config.deadline, budget),
+            true,
+        )
+    }
+
+    /// [`Self::run_gpu_probe`] under a caller-chosen budget.
+    fn run_gpu_probe_within(
+        &self,
+        helper: DiagnosticHelper,
+        run: GpuProbeRun,
+        budget: Duration,
+    ) -> Operation<OwnedHelperId> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::helpers::run_gpu_probe(&config, helper, run).await },
+            std::cmp::min(self.config.deadline, budget),
+            true,
+        )
+    }
+
+    /// [`Self::observe_gpu_probe`] under a caller-chosen budget. A timeout here is a
+    /// timeout of the observation, never the probe's outcome.
+    fn observe_gpu_probe_within(
+        &self,
+        id: OwnedHelperId,
+        budget: Duration,
+    ) -> Operation<HelperResult> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::helpers::observe(&config, id).await },
+            std::cmp::min(self.config.deadline, budget),
+            false,
+        )
+    }
+
+    /// [`Self::stop_gpu_probe`] under a caller-chosen budget.
+    fn stop_gpu_probe_within(&self, id: OwnedHelperId, budget: Duration) -> Operation<()> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::helpers::stop(&config, id).await },
+            std::cmp::min(self.config.deadline, budget),
+            true,
+        )
+    }
+
+    /// [`Self::cleanup_gpu_probe`] under a caller-chosen budget.
+    fn cleanup_gpu_probe_within(&self, id: OwnedHelperId, budget: Duration) -> Operation<()> {
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::helpers::cleanup(&config, id).await },
+            std::cmp::min(self.config.deadline, budget),
+            true,
+        )
     }
 
     /// Boot-only: finish every probe a previous agent process left behind,
