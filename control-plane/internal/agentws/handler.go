@@ -647,15 +647,9 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	ac.connectionIncarnation = connectionID
 	h.registry.add(ac)
 	go ac.runWriter(h.log)
-	if policyTyped && h.cfgStore != nil {
-		if err := h.cfgStore.BeginJournalReconciliation(bg, hostID, ac.connectionIncarnation); err != nil {
-			return fmt.Errorf("begin RH05 journal reconciliation: %w", err)
-		}
-		if err := h.cfgStore.InvalidatePolicyEvidenceOnReconnect(bg, hostID); err != nil {
-			h.log.Warn("policy reconnect reconciliation failed", "host_id", hostID, "err", err)
-		}
-	}
-
+	// Every path after add, including a rejected reconciliation start, must
+	// remove this socket before registration can be retried. The lifecycle gate
+	// ensures a displaced socket never reaps its newer owner.
 	defer func() {
 		// schema.md invariant #3: a lost agent connection reaps the host's
 		// non-terminal sessions to failed — but only if this connection is
@@ -674,6 +668,14 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			h.imageLimiter.evict(hostID)
 		})
 	}()
+	if policyTyped && h.cfgStore != nil {
+		if err := h.cfgStore.BeginJournalReconciliation(bg, hostID, ac.connectionIncarnation); err != nil {
+			return fmt.Errorf("begin RH05 journal reconciliation: %w", err)
+		}
+		if err := h.cfgStore.InvalidatePolicyEvidenceOnReconnect(bg, hostID); err != nil {
+			h.log.Warn("policy reconnect reconciliation failed", "host_id", hostID, "err", err)
+		}
+	}
 
 	// Push settings + console config (agent-api.md `config_update`) before the
 	// capacity handshake can assign a session (see above). Fire-and-forget: a

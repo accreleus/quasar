@@ -1,83 +1,159 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import * as adminApi from "../../../../api/admin";
 import { ApiError } from "../../../../api/client";
-import { useAuth } from "../../../../auth/context";
 import { Button } from "../../../../components/Button";
+import { ResourceStates } from "../../../../components/ResourceStates";
+import { useAdminAction } from "../../../../lib/resource/action";
+import { useResource } from "../../../../lib/resource/react";
 import { KnobPanel } from "./KnobPanel";
+
+type IdleData = { policy: adminApi.HostPolicyView | null; attempt: adminApi.IdleApplyAttempt | null };
+type Reviewed = {
+  hostId: string;
+  preview: adminApi.IdleApplyPreview;
+  sources: Record<string, string>;
+  signature: string;
+};
+
+function reviewSignature(preview: adminApi.IdleApplyPreview, policy: adminApi.HostPolicyView): string {
+  const settings = Object.keys(preview.resolved).sort().map((key) =>
+    [key, preview.resolved[key], policy.choices[key]?.source ?? "unknown"]);
+  return JSON.stringify({
+    boot: preview.approval_boot_incarnation, review: preview.approval_review_id,
+    revision: preview.revision, content: preview.content_sha256,
+    prerequisites: preview.prerequisites_sha256, facts: preview.prerequisites,
+    settings,
+  });
+}
+
+function snapshot(hostId: string, preview: adminApi.IdleApplyPreview, policy: adminApi.HostPolicyView): Reviewed {
+  // Keep displayed values and the submitted request in one immutable snapshot.
+  // A later poll can mark it stale but cannot silently replace it.
+  const values = Object.fromEntries(Object.entries(preview.resolved).map(([key, value]) => [key, value]));
+  const facts = preview.prerequisites.map((fact) => ({ ...fact }));
+  const frozenPreview = { ...preview, resolved: values, prerequisites: facts };
+  const sources = Object.fromEntries(Object.keys(values).map((key) => [key, policy.choices[key]?.source ?? "unknown"]));
+  return { hostId, preview: frozenPreview, sources, signature: reviewSignature(frozenPreview, policy) };
+}
+
+function valueText(value: unknown): string {
+  return typeof value === "string" ? value : JSON.stringify(value) ?? "undefined";
+}
+
+function reviewDetails(reviewed: Reviewed) {
+  return <div style={{ gridColumn: "1 / -1" }}>
+    <p className="hint">Review revision <code>{reviewed.preview.revision}</code>, content digest <code>{reviewed.preview.content_sha256}</code>.</p>
+    <h4>Resolved settings and sources</h4>
+    <ul>
+      {Object.keys(reviewed.preview.resolved).sort().map((key) => <li key={key}>
+        <code>{key}</code>: <code>{valueText(reviewed.preview.resolved[key])}</code> (<span>{reviewed.sources[key]}</span>)
+      </li>)}
+    </ul>
+    <h4>Prerequisites</h4>
+    <p className="hint">Facts digest: <code>{reviewed.preview.prerequisites_sha256}</code></p>
+    <ul>
+      {reviewed.preview.prerequisites.map((fact) => <li key={`${fact.kind}:${fact.id}`}>
+        <code>{fact.kind}</code>: <code style={{ overflowWrap: "anywhere" }}>{fact.id}</code>
+      </li>)}
+    </ul>
+  </div>;
+}
 
 /** Operator approval and observation for the saved restart group. */
 export function IdleApplyPolicy({ hostId }: { hostId: string | undefined }) {
-  const { token } = useAuth();
-  const [view, setView] = useState<adminApi.HostPolicyView | null>(null);
-  const [attempt, setAttempt] = useState<adminApi.IdleApplyAttempt | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!token || !hostId) return;
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const policy = await adminApi.getHostPolicy(token, hostId);
-        if (cancelled) return;
-        setView(policy);
-        const id = policy.groups.hardware?.attempt_id;
-        if (id) {
-          const current = await adminApi.getHostIdleApply(token, hostId, id);
-          if (!cancelled) setAttempt(current);
-        } else setAttempt(null);
-      } catch (e) {
-        if (!cancelled) setError(e instanceof ApiError ? e.message : "Could not load idle apply status.");
+  const resource = useResource<IdleData>({
+    label: "idle apply status",
+    pollMs: 5000,
+    fetch: async ({ token }) => {
+      if (!hostId) return { policy: null, attempt: null };
+      let policy: adminApi.HostPolicyView;
+      try { policy = await adminApi.getHostPolicy(token, hostId); }
+      catch (error) {
+        if (error instanceof ApiError && error.status === 404) return { policy: null, attempt: null };
+        throw error;
       }
-    };
-    void load();
-    const poll = window.setInterval(() => { if (!cancelled) void load(); }, 5000);
-    return () => { cancelled = true; window.clearInterval(poll); };
-  }, [token, hostId]);
-
-  const group = view?.groups.hardware;
-  if (!group || group.scope !== "restart") return null;
-  const preview = group.approval_preview as adminApi.IdleApplyPreview | null;
+      const id = policy.groups.hardware?.attempt_id;
+      const attempt = id ? await adminApi.getHostIdleApply(token, hostId, id) : null;
+      return { policy, attempt };
+    },
+  }, [hostId]);
+  const [selected, setSelected] = useState<Reviewed | null>(null);
+  const [reviewRejected, setReviewRejected] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const policy = resource.data?.policy;
+  const group = policy?.groups.hardware;
+  const preview = group?.approval_preview as adminApi.IdleApplyPreview | null | undefined;
+  const current = hostId && policy && preview?.available ? snapshot(hostId, preview, policy) : null;
+  const reviewed = selected?.hostId === hostId ? selected : null;
+  const stale = Boolean(reviewed && (!current || reviewed.signature !== current.signature || reviewRejected));
+  const displayed = reviewed ?? current;
+  const attempt = resource.data?.attempt;
   const waiting = attempt?.phase === "waiting" || attempt?.phase === "offered" || attempt?.phase === "cancel_pending";
 
-  const approve = async () => {
-    if (!token || !hostId || !preview?.available) return;
-    setBusy(true); setError(null);
-    try {
-      const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-      setAttempt(await adminApi.approveHostIdleApply(token, hostId, "hardware", preview, expiresAt));
-    } catch (e) {
-      setError(e instanceof ApiError && e.code === "approval_superseded"
-        ? "Host facts changed. Review the refreshed settings before approving again."
-        : e instanceof ApiError ? e.message : "Could not approve idle apply.");
-    } finally { setBusy(false); }
-  };
-  const cancel = async () => {
-    if (!token || !hostId || !attempt) return;
-    setBusy(true); setError(null);
-    try { setAttempt(await adminApi.cancelHostIdleApply(token, hostId, attempt.attempt_id)); }
-    catch (e) { setError(e instanceof ApiError ? e.message : "Could not cancel idle apply."); }
-    finally { setBusy(false); }
-  };
+  const approve = useAdminAction<[Reviewed], adminApi.IdleApplyAttempt>(
+    (selection) => resource.mutate(
+      ({ token }) => adminApi.approveHostIdleApply(token, selection.hostId, "hardware", selection.preview,
+        new Date(Date.now() + 60 * 60 * 1000).toISOString()),
+      (data, result) => ({ ...data, attempt: result }),
+    ),
+    {
+      failure: (error) => error instanceof ApiError && error.code === "approval_superseded"
+        ? "Host facts changed. Review the refreshed configuration before approving again."
+        : error instanceof ApiError ? error.message : "Could not approve idle apply.",
+      onSuccess: () => { setActionError(null); setReviewRejected(false); },
+      onFailure: (error) => {
+        setActionError(error instanceof ApiError && error.code === "approval_superseded"
+          ? "This review was superseded. Refresh and review the current configuration."
+          : error instanceof ApiError ? error.message : "Could not approve idle apply.");
+        if (error instanceof ApiError && error.code === "approval_superseded") {
+          setReviewRejected(true);
+          void resource.refresh();
+        }
+      },
+    },
+  );
+  const cancel = useAdminAction<[string, string], adminApi.IdleApplyAttempt>(
+    (id, owner) => resource.mutate(
+      ({ token }) => adminApi.cancelHostIdleApply(token, owner, id),
+      (data, result) => ({ ...data, attempt: result }),
+    ),
+    {
+      failure: "Could not cancel idle apply.",
+      onSuccess: () => setActionError(null),
+      onFailure: (error) => setActionError(error instanceof ApiError ? error.message : "Could not cancel idle apply."),
+    },
+  );
+  if (!hostId || (resource.data && (!group || group.scope !== "restart"))) return null;
+  const busy = approve.pending !== null || cancel.pending !== null;
 
   return <KnobPanel title="Idle apply" hint="Approve a reviewed host configuration for an idle window. Saving settings alone does not apply them.">
     <div className="cset">
-      <div>
-        <h3>Restart configuration</h3>
-        <p className="hint">Saved configuration: {group.status.replaceAll("_", " ")}. {attempt ? `Approval: ${attempt.phase.replaceAll("_", " ")}.` : "No approval is active."}</p>
-        {attempt?.remedy && <p className="hint">{attempt.remedy}</p>}
-        {preview?.remedy && !waiting && <p className="hint">{preview.remedy}</p>}
-        {!preview && group.remedy && !waiting && <p className="hint">{group.remedy}</p>}
-        <p className="hint">Execution is unavailable until the recovery executor is installed. No waiting approval restarts the agent or ends a session.</p>
-        {error && <p role="alert" className="form-error">{error}</p>}
-      </div>
-      <div>
-        {waiting ? <Button variant="ghost" disabled={busy || attempt?.phase === "cancel_pending"} onClick={() => void cancel()}>
-          {attempt?.phase === "cancel_pending" ? "Cancellation pending" : busy ? "Cancelling…" : "Cancel approval"}
-        </Button> : <Button variant="primary" disabled={busy || !preview?.available} onClick={() => void approve()}>
-          {busy ? "Approving…" : "Approve idle wait"}
-        </Button>}
-      </div>
+      <ResourceStates loading={resource.loading} error={resource.errorMessage} loadingLabel="Loading idle apply status…" />
+      {group && <>
+        <div>
+          <h3>Restart configuration</h3>
+          <p className="hint">Saved configuration: {group.status.replaceAll("_", " ")}. {attempt ? `Approval: ${attempt.phase.replaceAll("_", " ")}.` : "No approval is active."}</p>
+          {attempt?.remedy && <p className="hint">{attempt.remedy}</p>}
+          {preview?.remedy && !waiting && <p className="hint">{preview.remedy}</p>}
+          {!preview && group.remedy && !waiting && <p className="hint">{group.remedy}</p>}
+          {stale && <p className="form-error" role="alert">The reviewed configuration changed. Review the current values before approving.</p>}
+          {actionError && <p className="form-error" role="alert">{actionError}</p>}
+          <p className="hint">Execution is unavailable until the recovery executor is installed. No waiting approval restarts the agent or ends a session.</p>
+        </div>
+        <div className="acts">
+          <Button variant="ghost" disabled={busy} onClick={() => void resource.refresh()}>Refresh status</Button>
+          {waiting ? <Button variant="ghost" disabled={busy || attempt?.phase === "cancel_pending"} onClick={() => { if (attempt) void cancel.run(attempt.attempt_id, hostId); }}>
+            {attempt?.phase === "cancel_pending" ? "Cancellation pending" : "Cancel approval"}
+          </Button> : <>
+            {current && (!reviewed || stale) && <Button variant="ghost" disabled={busy} onClick={() => {
+              setSelected(current); setReviewRejected(false); setActionError(null);
+            }}>{reviewed ? "Review current configuration" : "Review this configuration"}</Button>}
+            <Button variant="primary" disabled={busy || !reviewed || stale || !preview?.available || Boolean(resource.errorMessage)}
+              onClick={() => { if (reviewed) void approve.run(reviewed); }}>Approve idle wait</Button>
+          </>}
+        </div>
+        {displayed && reviewDetails(displayed)}
+      </>}
     </div>
   </KnobPanel>;
 }

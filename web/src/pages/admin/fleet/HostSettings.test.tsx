@@ -7,6 +7,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../../../auth/context", () => ({ useAuth: () => ({ token: "token" }) }));
+vi.mock("../../../components/Toast", () => ({ useToast: () => ({ addToast: vi.fn(), removeToast: vi.fn() }) }));
 vi.mock("../../../api/admin", () => ({
   getHost: vi.fn(),
   getConfigCatalog: vi.fn(),
