@@ -230,6 +230,15 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **The sibling EGL probe's container lifecycle is bounded end to end (#283).** After the
+  probe's 60-second result cache missed, it created, started, waited on and removed a real
+  container with each of those steps carrying the runtime client's full deadline on its own
+  — five of them on a daemon that wedged mid-probe. The whole lifecycle now runs under one
+  30-second budget (comfortably clear of the probe container's own 20-second self-limit, so
+  a healthy probe cannot trip it) and reports the same inconclusive result a probe on an
+  unreachable engine already did. An outcome that only says the lifecycle could not run is
+  no longer cached for a minute as if the probe had answered. Verdicts, check ids and the
+  launch gate's behaviour are unchanged.
 - **A busy container runtime no longer fails `host_container_mounts` (#315).** Under load the
   runtime client can be busy or time out for one refresh. That used to report the mount
   check as a failure ("Docker could not inspect the agent's mounts"), which marked the host

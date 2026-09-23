@@ -36,9 +36,21 @@ const REFRESH_PATH: &[&str] = &[
 
 /// The one function on the refresh path that lives outside those files: the sibling
 /// EGL probe, whose `own_image` call runs BEFORE its own 60 s result cache, so the
-/// cache does not protect it. Checked by line rather than by file, because the rest
-/// of `nvidia_volume.rs` is provisioning, not the report path.
+/// cache does not protect it — and whose container lifecycle runs AFTER a cache MISS,
+/// which the cache does not protect either (#283). Checked by line rather than by file,
+/// because the rest of `nvidia_volume.rs` is provisioning, not the report path.
 const EGL_PROBE_FILE: &str = "nvidia_volume.rs";
+
+/// Owned-probe lifecycle operations that default to the client's full deadline, one
+/// deadline EACH. `RuntimeClient::gpu_probe_within` runs the whole lifecycle under one
+/// caller-chosen budget; on this path, name that or don't drive a probe.
+const UNBUDGETED_PROBE_LIFECYCLE: &[&str] = &[
+    ".recover_diagnostics(",
+    ".run_gpu_probe(",
+    ".observe_gpu_probe(",
+    ".stop_gpu_probe(",
+    ".cleanup_gpu_probe(",
+];
 
 /// Engine reads that default to the client's full deadline. Each has a `_within`
 /// twin taking an explicit budget; the refresh path must use that one.
@@ -100,6 +112,51 @@ fn the_sibling_egl_probes_own_image_lookup_is_budgeted() {
         "the EGL probe runs inside a readiness refresh; use \
          `own_image_within(ENGINE_INSPECTION_BUDGET)`:\n{}",
         bad.join("\n")
+    );
+}
+
+/// #283: after the cache MISSES, the probe creates, starts, waits on and removes a real
+/// container. Each of those was submitted on its own, so each carried the client's full
+/// deadline and a daemon that wedged mid-refresh could be paid for five of them — one
+/// measured full deadline for a create whose reply never comes, another for a wait on a
+/// container that never exits. `own_image` being budgeted (above) does not help here: it
+/// has already returned by the time the cache misses.
+#[test]
+fn the_sibling_egl_probes_container_lifecycle_is_budgeted() {
+    let text = production(EGL_PROBE_FILE);
+    let mut bad = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        for call in UNBUDGETED_PROBE_LIFECYCLE {
+            if line.contains(call) {
+                bad.push(format!("{EGL_PROBE_FILE}:{}: {}", i + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "the EGL probe's container lifecycle must run under ONE budget — use \
+         `gpu_probe_within(.., crate::runtime::GPU_PROBE_LIFECYCLE_BUDGET)`:\n{}",
+        bad.join("\n")
+    );
+    assert!(
+        text.contains("gpu_probe_within("),
+        "the EGL probe no longer drives an owned probe at all; if that is deliberate, \
+         retire this test with the call rather than leaving it passing vacuously"
+    );
+}
+
+/// The lifecycle budget is the number that bound is worth, and it is sized so a HEALTHY
+/// probe cannot trip it: the probe container self-limits with `timeout 20s`, so anything
+/// at or below that turns slow-but-working hosts indeterminate. `nvidia_volume.rs` holds
+/// the arithmetic tests; this one guards the constant against a silent edit.
+#[test]
+fn the_gpu_probe_lifecycle_budget_stays_where_the_arithmetic_put_it() {
+    let text = production("runtime.rs");
+    assert!(
+        text.contains("pub const GPU_PROBE_LIFECYCLE_BUDGET: Duration = Duration::from_secs(30)"),
+        "GPU_PROBE_LIFECYCLE_BUDGET must clear the probe container's own 20 s self-limit \
+         and still leave the refresh path inside its 60 s deadline; changing it needs the \
+         arithmetic in nvidia_volume.rs revisited in the same commit"
     );
 }
 
