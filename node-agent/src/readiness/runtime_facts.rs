@@ -4,15 +4,15 @@
 //! GPU injection (device request + driver volume) is untouched: CDI is reported, not used.
 
 use crate::messages::{ReadinessBlocks, ReadinessCheck};
-use crate::runtime::{EngineFacts, ErrorKind, RuntimeError};
+// `API_FLOOR` is owned by the runtime module, which is the code that enforces it; the
+// checks below only render it (#266), so the wording cannot drift from what discovery
+// refuses.
+use crate::runtime::{EngineFacts, ErrorKind, RuntimeError, API_FLOOR};
 
 pub const ENDPOINT_ID: &str = "runtime_endpoint";
 pub const API_VERSION_ID: &str = "runtime_api_version";
 pub const CAPABILITIES_ID: &str = "runtime_capabilities";
 pub const CDI_ID: &str = "runtime_cdi";
-
-/// The lowest engine API this agent speaks (docker.rs discovery floor).
-pub const API_FLOOR: &str = "1.40";
 
 /// The `Unreachable` detail for [`ErrorKind::Timeout`]. A missing socket uses a
 /// different sentence, so `host_container_mounts` can tell "the client ran out of
