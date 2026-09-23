@@ -825,7 +825,8 @@ func TestOfferedApprovalBootAndCancelKeepProtectionUntilJournalProof(t *testing.
 		t.Fatal(err)
 	}
 	current, err := store.GetIdleApply(ctx, hostID, approved.AttemptID)
-	if err != nil || current.Phase != "cancel_pending" || !current.AdmissionRestricted {
+	if err != nil || current.Phase != "cancel_pending" || !current.AdmissionRestricted ||
+		current.Remedy == nil || !strings.Contains(*current.Remedy, "authenticated agent journal") {
 		t.Fatalf("offered boot must protect: %+v %v", current, err)
 	}
 	repeat, err := store.CancelIdleApply(ctx, hostID, approved.AttemptID, true)

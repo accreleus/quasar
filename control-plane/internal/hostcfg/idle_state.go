@@ -68,10 +68,11 @@ func (s *Store) ObserveIdleState(ctx context.Context, hostID, connectionID strin
 	var group, digest, grantBoot, grantConnection, phase string
 	var revision, oldSeq int64
 	var started *time.Time
+	var previousError *string
 	err = tx.QueryRow(ctx, `SELECT group_key,approved_digest,approved_revision,boot_incarnation::text,
-		grant_connection::text,phase,COALESCE(journal_sequence,-1),started_at
+		grant_connection::text,phase,COALESCE(journal_sequence,-1),started_at,error_code
 		FROM host_config_attempts WHERE host_id=$1::uuid AND id=$2::uuid FOR UPDATE`, hostID, state.AttemptID).
-		Scan(&group, &digest, &revision, &grantBoot, &grantConnection, &phase, &oldSeq, &started)
+		Scan(&group, &digest, &revision, &grantBoot, &grantConnection, &phase, &oldSeq, &started, &previousError)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, ErrIdleAttemptNotFound
 	}
@@ -81,9 +82,40 @@ func (s *Store) ObserveIdleState(ctx context.Context, hostID, connectionID strin
 	if group != state.Group || digest != state.Digest || strconv.FormatInt(revision, 10) != state.Revision || grantBoot != state.GrantBoot || grantConnection != state.GrantConnection {
 		return false, ErrApprovalSuperseded
 	}
-	if state.Phase == "failed" && seq == 0 && state.ErrorCode == "host_busy" {
-		// The agent's final local check found work absent from the last DB
-		// heartbeat. Keep the same protected grant eligible for bounded retry.
+	if state.Phase == "failed" && seq == 0 {
+		// A sequence-zero reply describes one delivery, not the attempt. A
+		// later delivery with this ID may already have been accepted and its
+		// report may still be in flight. Only a complete journal or durable
+		// revocation can release admission for this attempt.
+		if phase != "offered" || started != nil {
+			return false, tx.Commit(ctx)
+		}
+		if state.ErrorCode == "host_busy" {
+			var approvalState string
+			var expiry time.Time
+			if err := tx.QueryRow(ctx, `SELECT state,expires_at FROM host_config_approvals
+				WHERE host_id=$1::uuid AND id=$2::uuid`, hostID, state.AttemptID).Scan(&approvalState, &expiry); err != nil {
+				return false, err
+			}
+			if previousError == nil && approvalState == "offered" && expiry.After(time.Now().UTC()) {
+				// Busy is an authenticated response, so it resets the lost-delivery
+				// budget while the reviewed grant is still eligible for retry.
+				if _, err := tx.Exec(ctx, `UPDATE host_reconcile_obligations
+					SET retry_count=0,next_attempt_at=now()+interval '10 seconds'
+					WHERE host_id=$1::uuid AND kind='idle_apply' AND resource_key=$2`, hostID, state.AttemptID); err != nil {
+					return false, err
+				}
+			}
+			return false, tx.Commit(ctx)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE host_config_attempts SET error_code=$3
+			WHERE host_id=$1::uuid AND id=$2::uuid AND error_code IS NULL`, hostID, state.AttemptID, safeIdleErrorCode(state.ErrorCode)); err != nil {
+			return false, err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE host_reconcile_obligations SET retry_count=3
+			WHERE host_id=$1::uuid AND kind='idle_apply' AND resource_key=$2`, hostID, state.AttemptID); err != nil {
+			return false, err
+		}
 		return false, tx.Commit(ctx)
 	}
 	if seq < oldSeq {

@@ -85,6 +85,7 @@ type conn struct {
 	policySequence            map[string]uint64
 	policySequenceContent     map[string][]byte
 	policyUncertain           bool
+	policyRefreshPending      bool
 	policyDeliveryID          string
 	policyDeliverySentAt      time.Time
 	bootIncarnation           string

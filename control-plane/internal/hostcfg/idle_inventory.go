@@ -120,6 +120,58 @@ func (s *Store) BeginJournalReconciliation(ctx context.Context, hostID, connecti
 	return tx.Commit(ctx)
 }
 
+// BeginCurrentJournalRefresh fences an unstarted offer on the authenticated
+// current socket and opens a fresh complete inventory without disconnecting
+// sessions. A quarantined or already pending inventory cannot be reset here.
+func (s *Store) BeginCurrentJournalRefresh(ctx context.Context, hostID, connectionID string) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT status FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&status); err != nil {
+		return false, err
+	}
+	var current *string
+	var gate string
+	if err := tx.QueryRow(ctx, `SELECT connection_incarnation::text,state FROM host_journal_reconciliation
+		WHERE host_id=$1::uuid FOR UPDATE`, hostID).Scan(&current, &gate); err != nil {
+		return false, err
+	}
+	if current == nil || *current != connectionID || gate != "complete" {
+		return false, tx.Commit(ctx)
+	}
+	if err := rotateHostReviewTokens(ctx, tx, hostID); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE host_config_approvals SET state='cancel_pending'
+		WHERE host_id=$1::uuid AND state='offered'`, hostID); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE host_journal_reconciliation SET state='pending',completed_at=NULL,
+		continuation_cursor=NULL WHERE host_id=$1::uuid`, hostID); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM host_idle_inventory WHERE host_id=$1::uuid`, hostID); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM host_journal_active_snapshots WHERE host_id=$1::uuid`, hostID); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO host_admission_restrictions(host_id,owner_kind,owner_id,reason)
+		VALUES($1::uuid,'reconciliation','00000000-0000-0000-0000-000000000002'::uuid,'journal_reconciliation')
+		ON CONFLICT(host_id,owner_kind,owner_id) DO UPDATE SET reason='journal_reconciliation'`, hostID); err != nil {
+		return false, err
+	}
+	if status == "online" {
+		if _, err := tx.Exec(ctx, `UPDATE hosts SET status='draining' WHERE id=$1::uuid`, hostID); err != nil {
+			return false, err
+		}
+	}
+	return true, tx.Commit(ctx)
+}
+
 // EndJournalConnection closes the authority of the disconnected authenticated
 // socket. A queued capacity write cannot recreate its hardware evidence after
 // this transaction, even if it was decoded before the socket closed.
@@ -380,11 +432,18 @@ func validateRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID string
 	var grantConnection *string
 	var oldRevision, oldSeq int64
 	var phase string
+	var terminalAt *time.Time
 	err = tx.QueryRow(ctx, `SELECT group_key,approved_digest,approved_revision,boot_incarnation::text,
-		grant_connection::text,phase,COALESCE(journal_sequence,-1) FROM host_config_attempts
+		grant_connection::text,phase,COALESCE(journal_sequence,-1),terminal_at FROM host_config_attempts
 		WHERE host_id=$1::uuid AND id=$2::uuid`, hostID, entry.AttemptID).
-		Scan(&group, &digest, &oldRevision, &grantBoot, &grantConnection, &phase, &oldSeq)
+		Scan(&group, &digest, &oldRevision, &grantBoot, &grantConnection, &phase, &oldSeq, &terminalAt)
 	if err == nil {
+		if phase == "revoked_unstarted" && terminalAt != nil {
+			// An absent complete journal closed this attempt. A later started
+			// entry contradicts that proof; quarantine rather than resurrect it
+			// under a still-terminal row with an already released hold.
+			return false, nil
+		}
 		return group == entry.Group && digest == entry.Digest && oldRevision == revision && grantBoot == entry.GrantBoot &&
 			grantConnection != nil && *grantConnection == entry.GrantConnection &&
 			seq >= oldSeq && (seq != oldSeq || phase == entry.Phase), nil
@@ -439,6 +498,23 @@ func applyRestartInventoryEntry(ctx context.Context, tx pgx.Tx, hostID, connecti
 			return err
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM host_reconcile_obligations WHERE host_id=$1::uuid AND kind='idle_apply' AND resource_key=$2`, hostID, entry.AttemptID); err != nil {
+			return err
+		}
+	} else if entry.Phase == "failed" {
+		// A complete authenticated inventory can prove this offered grant never
+		// started even if its live rejection report was lost before reconnect.
+		changed, err := tx.Exec(ctx, `UPDATE host_config_approvals SET state='revoked_unstarted'
+			WHERE host_id=$1::uuid AND id=$2::uuid AND state IN ('offered','cancel_pending')`, hostID, entry.AttemptID)
+		if err != nil {
+			return err
+		}
+		if changed.RowsAffected() > 0 {
+			if err := rotateHostReviewTokens(ctx, tx, hostID); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM host_reconcile_obligations
+			WHERE host_id=$1::uuid AND kind='idle_apply' AND resource_key=$2`, hostID, entry.AttemptID); err != nil {
 			return err
 		}
 	}

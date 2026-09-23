@@ -19,6 +19,11 @@ func (s *Store) NextIdleOffer(ctx context.Context, hostID, bootID, connectionID 
 		return nil, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	// Serialize an offer with the jobs dispatcher. A future cleanup may become
+	// due (or be pulled forward) immediately after this admission check.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text,339))`, hostID); err != nil {
+		return nil, err
+	}
 	var hostStatus string
 	if err := tx.QueryRow(ctx, `SELECT status FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&hostStatus); err != nil {
 		return nil, err
@@ -63,8 +68,37 @@ func (s *Store) NextIdleOffer(ctx context.Context, hostID, bootID, connectionID 
 	if err != nil {
 		return nil, err
 	}
-	if approvalBoot != bootID || !expiry.After(time.Now().UTC()) {
+	if approvalBoot != bootID {
 		return nil, nil
+	}
+	if !expiry.After(time.Now().UTC()) {
+		// This approval has never been offered, so the write-before-send rule
+		// proves there is no agent execution to reconcile. Expire only its own
+		// hold; an offered attempt still needs authenticated nonacceptance.
+		if approvalState == "approved" {
+			if err := rotateHostReviewTokens(ctx, tx, hostID); err != nil {
+				return nil, err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE host_config_approvals SET state='expired'
+				WHERE host_id=$1::uuid AND id=$2::uuid`, hostID, approvalID); err != nil {
+				return nil, err
+			}
+			if _, err := tx.Exec(ctx, `DELETE FROM host_admission_restrictions
+				WHERE host_id=$1::uuid AND owner_kind='idle_apply' AND owner_id=$2::uuid`, hostID, approvalID); err != nil {
+				return nil, err
+			}
+			var held bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM host_admission_restrictions
+				WHERE host_id=$1::uuid)`, hostID).Scan(&held); err != nil {
+				return nil, err
+			}
+			if !held && hostStatus == "draining" {
+				if _, err := tx.Exec(ctx, `UPDATE hosts SET status='online' WHERE id=$1::uuid`, hostID); err != nil {
+					return nil, err
+				}
+			}
+		}
+		return nil, tx.Commit(ctx)
 	}
 	if approvalState == "offered" {
 		if retryCount == nil || retryAt == nil || *retryCount >= 3 || retryAt.After(time.Now().UTC()) {
@@ -156,18 +190,20 @@ func idleExecutionReady(ctx context.Context, tx pgx.Tx, hostID, connectionID str
 	var ready bool
 	err := tx.QueryRow(ctx, `SELECT
 		COALESCE(i.connection_incarnation=$2::uuid AND i.reported_at>=h.last_registered_at
-			AND i.reported_at>=now()-interval '30 seconds'
+			AND i.reported_at>=clock_timestamp()-interval '30 seconds'
 			AND jsonb_array_length(i.running_sessions)=0,false)
 		AND NOT EXISTS(SELECT 1 FROM sessions s WHERE s.host_id=h.id
 			AND s.state IN ('assigned','starting','running','stopping'))
 		AND COALESCE(h.source_preparation_reported_at>=h.last_registered_at
-			AND h.source_preparation_reported_at>=now()-interval '30 seconds'
+			AND h.source_preparation_reported_at>=clock_timestamp()-interval '30 seconds'
 			AND jsonb_typeof(h.source_preparation->'steam'->'images')='array',false)
 		AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(CASE
 			WHEN jsonb_typeof(h.source_preparation->'steam'->'images')='array'
 			THEN h.source_preparation->'steam'->'images' ELSE '[]'::jsonb END) image
 			WHERE image->>'state' IN ('queued','preparing','waiting_image','deferred','failed'))
-		AND NOT EXISTS(SELECT 1 FROM job_runs r WHERE r.host_id=h.id AND r.state IN ('pending','running'))
+		AND NOT EXISTS(SELECT 1 FROM job_runs r JOIN jobs j ON j.id=r.job_id
+			WHERE r.host_id=h.id AND (r.state='running' OR
+				(r.state='pending' AND r.scheduled_for<=clock_timestamp() AND j.enabled AND j.managed)))
 		FROM hosts h LEFT JOIN host_idle_inventory i ON i.host_id=h.id WHERE h.id=$1::uuid`,
 		hostID, connectionID).Scan(&ready)
 	return ready, err

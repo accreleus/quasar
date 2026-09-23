@@ -393,12 +393,13 @@ func (s *Store) GetIdleApply(ctx context.Context, hostID, attemptID string) (Idl
 	var startedAt *time.Time
 	var errorCode *string
 	var held bool
+	var expiry time.Time
 	err := s.pool.QueryRow(ctx, `SELECT a.id::text,a.group_key,a.revision,a.approved_digest,a.prerequisites_digest,
-		a.state,t.phase,t.started_at,t.error_code,
+		a.state,t.phase,t.started_at,t.error_code,a.expires_at,
 		EXISTS(SELECT 1 FROM host_admission_restrictions r WHERE r.host_id=a.host_id AND r.owner_id=a.id AND r.owner_kind IN ('idle_apply','recovery'))
 		FROM host_config_approvals a LEFT JOIN host_config_attempts t ON t.id=a.id
 		WHERE a.host_id=$1::uuid AND a.id=$2::uuid`, hostID, attemptID).
-		Scan(&result.AttemptID, &result.Group, &revision, &result.ContentSHA256, &result.PrerequisitesSHA256, &state, &attemptPhase, &startedAt, &errorCode, &held)
+		Scan(&result.AttemptID, &result.Group, &revision, &result.ContentSHA256, &result.PrerequisitesSHA256, &state, &attemptPhase, &startedAt, &errorCode, &expiry, &held)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return result, ErrIdleAttemptNotFound
 	}
@@ -416,7 +417,13 @@ func (s *Store) GetIdleApply(ctx context.Context, hostID, attemptID string) (Idl
 		}
 		return result, nil
 	}
-	if attemptPhase != nil && *attemptPhase == "offered" {
+	if attemptPhase != nil && *attemptPhase == "offered" && state == "offered" && errorCode != nil && *errorCode != "" {
+		remedy := "Agent rejected one delivery: " + safeIdleErrorCode(*errorCode) + ". Admission remains protected while a complete authenticated journal checks whether another delivery began."
+		result.Remedy = &remedy
+	} else if attemptPhase != nil && *attemptPhase == "offered" && state == "offered" && !expiry.After(time.Now().UTC()) {
+		remedy := "Offer deadline passed. Admission remains protected while a complete authenticated agent journal checks whether execution began."
+		result.Remedy = &remedy
+	} else if attemptPhase != nil && *attemptPhase == "offered" && state == "offered" {
 		var retries int
 		var next time.Time
 		if err := s.pool.QueryRow(ctx, `SELECT retry_count,next_attempt_at FROM host_reconcile_obligations
@@ -424,7 +431,7 @@ func (s *Store) GetIdleApply(ctx context.Context, hostID, attemptID string) (Idl
 			if retries < 3 {
 				result.NextRetryAt = &next
 			} else {
-				remedy := "Delivery retry budget exhausted. Admission remains protected until a complete agent journal proves whether execution began; reconnect or request operator repair."
+				remedy := "Delivery retry budget exhausted. Admission remains protected while a complete agent journal checks whether execution began."
 				result.Remedy = &remedy
 			}
 		} else if !errors.Is(err, pgx.ErrNoRows) {
@@ -443,6 +450,8 @@ func (s *Store) GetIdleApply(ctx context.Context, hostID, attemptID string) (Idl
 		result.Phase = "revoked_unstarted"
 	case "cancel_pending":
 		result.Phase = "cancel_pending"
+		remedy := "Cancellation awaits a complete authenticated agent journal proving nonacceptance. Admission remains protected."
+		result.Remedy = &remedy
 	default:
 		result.Phase = state
 	}

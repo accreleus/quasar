@@ -6,8 +6,8 @@ import (
 	"strings"
 )
 
-// idleWaitRemedy is an operator observation. The executor in #339 must make
-// its own atomic admission and agent-side idle decision before starting.
+// idleWaitRemedy is an operator observation. The executor makes its own
+// atomic admission and the agent checks local idleness before starting.
 func (s *Store) idleWaitRemedy(ctx context.Context, hostID string) (string, error) {
 	var gateComplete, currentHeartbeat bool
 	err := s.pool.QueryRow(ctx, `SELECT
@@ -21,7 +21,7 @@ func (s *Store) idleWaitRemedy(ctx context.Context, hostID string) (string, erro
 		return "", err
 	}
 	if !gateComplete || !currentHeartbeat {
-		return "Waiting for a complete current-connection journal and fresh authenticated session inventory. Execution support is unavailable.", nil
+		return "Waiting for a complete current-connection journal and fresh authenticated session inventory.", nil
 	}
 	var assigned, starting, running, stopping int
 	err = s.pool.QueryRow(ctx, `SELECT
@@ -47,7 +47,9 @@ func (s *Store) idleWaitRemedy(ctx context.Context, hostID string) (string, erro
 			WHEN jsonb_typeof(h.source_preparation->'steam'->'images')='array'
 			THEN h.source_preparation->'steam'->'images' ELSE '[]'::jsonb END) AS image
 			WHERE image->>'state' IN ('queued','preparing','waiting_image','deferred','failed')),
-		(SELECT COUNT(*) FROM job_runs r WHERE r.host_id=h.id AND r.state IN ('pending','running')),
+		(SELECT COUNT(*) FROM job_runs r JOIN jobs j ON j.id=r.job_id
+			WHERE r.host_id=h.id AND (r.state='running' OR
+				(r.state='pending' AND r.scheduled_for<=now() AND j.enabled AND j.managed))),
 		COALESCE(jsonb_typeof(h.source_preparation->'steam'->'images')='array'
 			AND h.source_preparation_reported_at >= h.last_registered_at
 			AND h.source_preparation_reported_at >= now()-interval '30 seconds',false)
@@ -78,7 +80,7 @@ func (s *Store) idleWaitRemedy(ctx context.Context, hostID string) (string, erro
 		parts = append(parts, "preparation inventory is unknown")
 	}
 	if len(parts) > 0 {
-		return "Waiting for " + strings.Join(parts, ", ") + ". No waiting deadline ends a session. Execution support is unavailable.", nil
+		return "Waiting for " + strings.Join(parts, ", ") + ". No waiting deadline ends a session.", nil
 	}
-	return "Current inventory reports no active sessions or preparation. Execution support is unavailable until recovery support is installed.", nil
+	return "Current inventory reports no active sessions or preparation. Waiting for the next idle execution check.", nil
 }
