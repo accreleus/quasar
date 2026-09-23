@@ -1,0 +1,62 @@
+{
+  "format": 1,
+  "adapter_interface": "A test adapter provides reset(given), act(step), and observe(assertion) at the named seam. observe returns true only when the assertion holds.",
+  "scenarios": [
+    {
+      "id": "legacy_clear_preserves_agent_detection",
+      "seam": "operator",
+      "given": [{"host": "h1", "agent": "rh05", "encoder_env": null, "detected_encoder": "nvenc", "choice": {"encoder": {"source": "explicit", "value": "va"}}}],
+      "when": [{"legacy_patch": {"overrides": {"encoder": null}}}, {"report_verified_next_start": "nvenc"}],
+      "expect": [{"setting_source": {"encoder": "deployment"}}, {"setting_applied_value": {"encoder": "nvenc"}}]
+    },
+    {
+      "id": "concurrent_edit_rejects_stale_snapshot",
+      "seam": "operator",
+      "given": [{"host": "h1", "policy_revision": 7}],
+      "when": [{"save": {"expected_revision": 7, "changes": {"gop": {"source": "explicit", "value": 90}}}}, {"save": {"expected_revision": 7, "changes": {"slices": {"source": "explicit", "value": 4}}}}],
+      "expect": [{"last_result": {"code": "stale_revision", "current_revision": 8, "changed_keys": ["gop"]}}, {"setting_source": {"slices": "deployment"}}]
+    },
+    {
+      "id": "old_agent_does_not_claim_application",
+      "seam": "operator",
+      "given": [{"host": "h1", "agent": "legacy"}],
+      "when": [{"save": {"changes": {"encoder": {"source": "automatic"}}}}, {"agent_report": {"legacy_effective_settings": {"encoder": "va"}}}],
+      "expect": [{"setting_status": {"encoder": "upgrade_required"}}, {"configuration_applied": false}]
+    },
+    {
+      "id": "offline_reconnect_duplicate_and_old_report",
+      "seam": "operator",
+      "given": [{"host": "h1", "agent": "rh05", "connected": false}],
+      "when": [{"save": {"revision": 11, "changes": {"gop": {"source": "explicit", "value": 90}}}}, {"save": {"revision": 12, "changes": {"gop": {"source": "explicit", "value": 120}}}}, {"reconnect": "h1"}, {"deliver_revision": 12}, {"deliver_revision": 12}, {"report_revision": 11}, {"report_revision": 12}],
+      "expect": [{"setting_applied_revision": {"gop": 12}}, {"execution_count": {"gop": 1}}]
+    },
+    {
+      "id": "cancel_delayed_grant_requires_agent_nonacceptance",
+      "seam": "operator",
+      "given": [{"host": "h1", "agent": "rh05", "idle_apply": "waiting"}],
+      "when": [{"offer_grant": "a1"}, {"cancel": "a1"}, {"lose_revoke_reply": "a1"}],
+      "expect": [{"idle_apply_status": "cancelling"}, {"admission_restricted": true}, {"restart_count": 0}]
+    },
+    {
+      "id": "restore_discovers_orphan_journal_attempt",
+      "seam": "operator",
+      "given": [{"host": "h1", "agent": "rh05", "journal_accepted_attempt": "a1", "database_backup_before_attempt": "a1"}],
+      "when": [{"stop_stack": true}, {"restore_database_backup": true}, {"start_control_plane": true}, {"reconnect": "h1"}],
+      "expect": [{"unstarted_approval_replayed": false}, {"orphan_attempt_visible": "a1"}, {"admission_restricted_until_reconciled": true}, {"duplicate_execution": false}]
+    },
+    {
+      "id": "home_first_claim_and_conflict",
+      "seam": "launch",
+      "given": [{"user": "u1", "canonical_app": "steam", "eligible_hosts": ["h1", "h2"]}],
+      "when": [{"concurrent_launches": [{"host": "h1"}, {"host": "h2"}]}],
+      "expect": [{"unique_home_owner_count": 1}, {"second_blank_home_created": false}]
+    },
+    {
+      "id": "cleanup_racing_new_reference",
+      "seam": "preparation",
+      "given": [{"host": "h1", "managed_image": "app-image", "cached": true, "required": false}],
+      "when": [{"preview_cleanup": "app-image"}, {"add_placement_requirement": "app-image"}, {"request_cleanup": "app-image"}],
+      "expect": [{"required_image_removed": false}, {"preparation_status": "ready"}]
+    }
+  ]
+}
