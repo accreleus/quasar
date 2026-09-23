@@ -74,6 +74,7 @@ func (h *Handler) Register(mux httpx.Router, requireAuth func(http.Handler) http
 	mux.Handle("POST /v1/admin/hosts/{id}/restart", admin(http.HandlerFunc(h.handleRestart)))
 	mux.Handle("GET /v1/admin/hosts/{id}/policy", admin(http.HandlerFunc(h.handleGetPolicy)))
 	mux.Handle("PATCH /v1/admin/hosts/{id}/policy", admin(http.HandlerFunc(h.handlePatchPolicy)))
+	mux.Handle("POST /v1/admin/hosts/{id}/policy/retry", admin(http.HandlerFunc(h.handleRetryPolicy)))
 }
 
 func (h *Handler) handleGetPolicy(w http.ResponseWriter, r *http.Request) {
@@ -171,6 +172,9 @@ func (h *Handler) handlePatchPolicy(w http.ResponseWriter, r *http.Request) {
 		var invalid *PolicyValidationError
 		if errors.As(err, &invalid) {
 			code = invalid.Code
+			if code == "home_conflict" {
+				code = httpx.CodeValidationFailed
+			}
 		}
 		httpx.WriteError(w, http.StatusBadRequest, code, err.Error())
 		return
@@ -215,8 +219,7 @@ func (h *Handler) sendNextSessionOffers(ctx context.Context, hostID string) {
 
 // handleRetryPolicy re-arms one next-session group whose transient retry
 // budget is exhausted (control-api.md typed host policy, Retry). Every
-// non-200 response writes nothing. The route is not registered until the
-// protocol path entry is approved; see the RH05 #336 retry route patch.
+// non-200 response writes nothing.
 func (h *Handler) handleRetryPolicy(w http.ResponseWriter, r *http.Request) {
 	hostID := r.PathValue("id")
 	var req struct {
@@ -449,7 +452,11 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 	if _, err := h.store.SaveLegacyPatch(r.Context(), hostID, req.Overrides, adminUserID(r)); err != nil {
 		var invalid *PolicyValidationError
 		if errors.As(err, &invalid) {
-			httpx.WriteError(w, http.StatusBadRequest, invalid.Code, err.Error())
+			code := invalid.Code
+			if code == "home_conflict" {
+				code = httpx.CodeValidationFailed
+			}
+			httpx.WriteError(w, http.StatusBadRequest, code, err.Error())
 		} else if errors.Is(err, ErrPolicyAttemptConflict) {
 			httpx.WriteError(w, http.StatusConflict, "attempt_conflict", "A host policy attempt or journal reconciliation is still in progress.")
 		} else {

@@ -232,8 +232,8 @@ func TestHomeRootStaysInsideMountAndNeverStrandsExistingHomes(t *testing.T) {
 	}{
 		{"/other/homes", "validation_failed"},
 		{"/srv/homes-evil", "validation_failed"},
-		{"/srv/homes/u2", "home_conflict"},
-		{"", "home_conflict"},
+		{"/srv/homes/u2", "validation_failed"},
+		{"", "validation_failed"},
 	} {
 		rr := patchPolicy(t, mux, host.id, "0", homeRoot(tc.value))
 		if rr.Code != http.StatusBadRequest || errorCode(t, rr) != tc.code {
@@ -241,7 +241,7 @@ func TestHomeRootStaysInsideMountAndNeverStrandsExistingHomes(t *testing.T) {
 		}
 		legacy := httptest.NewRecorder()
 		mux.ServeHTTP(legacy, httptest.NewRequest(http.MethodPatch, "/v1/admin/hosts/"+host.id+"/settings", strings.NewReader(fmt.Sprintf(`{"overrides":{"home_root":%q}}`, tc.value))))
-		if legacy.Code != http.StatusBadRequest || (tc.code == "home_conflict" && errorCode(t, legacy) != tc.code) {
+		if legacy.Code != http.StatusBadRequest || errorCode(t, legacy) != tc.code {
 			t.Fatalf("legacy home_root %q: %d %s", tc.value, legacy.Code, legacy.Body.String())
 		}
 	}
@@ -419,9 +419,8 @@ func policyRows(t *testing.T, pool *pgxpool.Pool, hostID string) string {
 
 func retryRequest(h *Handler, hostID, body string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(http.MethodPost, "/v1/admin/hosts/"+hostID+"/policy/retry", strings.NewReader(body))
-	r.SetPathValue("id", hostID)
 	rr := httptest.NewRecorder()
-	h.handleRetryPolicy(rr, r)
+	policyMux(h).ServeHTTP(rr, r)
 	return rr
 }
 
