@@ -33,6 +33,8 @@ own; the two do not move together, and that is deliberate.
   operator drain where it is safe to resume assignments. Terminal platform
   cleanup commits its own hold releases, host status projection and completion
   marker together, so a failed cleanup can retry without a partial release.
+  Boot adoption also retries terminal standalone apply and revert holds left
+  behind by a crash or failed release.
 - **RH05 host policy and selected-app preparation contracts (#334).** Defined typed
   host setting sources, independent application evidence, scoped idle approval and
   recovery, owner-scoped admission, placement and managed-home claims, image

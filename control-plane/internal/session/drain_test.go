@@ -390,6 +390,9 @@ func TestUncordonDrainingAgentDisconnected(t *testing.T) {
 	s := seed(t, pool, 4)
 	ctx := context.Background()
 
+	if _, err := admission.NewStore(pool).Acquire(ctx, s.hostID, admission.ManualOwner, admission.ReasonManualDrain); err != nil {
+		t.Fatal(err)
+	}
 	setHostStatusRaw(t, pool, s.hostID, "draining")
 	h, err := coord.UncordonHost(ctx, s.hostID)
 	if err != nil {
@@ -401,6 +404,27 @@ func TestUncordonDrainingAgentDisconnected(t *testing.T) {
 	// The whole point: the scheduler must not pick it up.
 	if _, err := store.ScheduleAndCreate(ctx, launchParams(s)); !errors.Is(err, ErrNoHostAvailable) {
 		t.Fatalf("launch after uncordon with no agent: got %v want ErrNoHostAvailable", err)
+	}
+}
+
+func TestUncordonDisconnectedPlatformOnlyHostIsRefused(t *testing.T) {
+	pool := testDB(t)
+	_, coord := newCoordWithAgents(t, pool, false)
+	s := seed(t, pool, 4)
+	ctx := context.Background()
+	holds := admission.NewStore(pool)
+	owner := admission.Owner{Kind: admission.Platform, ID: "33700000-0000-4000-8000-000000000077"}
+	if _, err := holds.Acquire(ctx, s.hostID, owner, admission.ReasonPlatformApply); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coord.UncordonHost(ctx, s.hostID); !errors.Is(err, ErrHostNotResumable) {
+		t.Fatalf("disconnected platform-only uncordon = %v, want 409 refusal", err)
+	}
+	if status := hostStatus(t, pool, s.hostID); status != "draining" {
+		t.Fatalf("status after refused uncordon = %q, want draining", status)
+	}
+	if rs, err := holds.List(ctx, s.hostID); err != nil || len(rs) != 1 || rs[0].OwnerKind != admission.Platform {
+		t.Fatalf("platform hold after refused uncordon = %+v (%v)", rs, err)
 	}
 }
 
@@ -431,6 +455,9 @@ func TestUncordonHTTPAgentDisconnected(t *testing.T) {
 	tok := loginTok(t, authSvc, "drainadmin@test.local", "unrelated-pw-16")
 
 	s := seed(t, pool, 4)
+	if _, err := admission.NewStore(pool).Acquire(ctx, s.hostID, admission.ManualOwner, admission.ReasonManualDrain); err != nil {
+		t.Fatal(err)
+	}
 	setHostStatusRaw(t, pool, s.hostID, "draining")
 
 	resp := doJSON(t, http.MethodPost, srv.URL+"/v1/hosts/"+s.hostID+"/uncordon", tok, nil)

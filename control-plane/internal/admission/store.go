@@ -173,7 +173,7 @@ func (s *Store) ReleaseManual(ctx context.Context, hostID string, connected bool
 	if err != nil {
 		return "", err
 	}
-	if status == "offline" && deleted.RowsAffected() == 0 {
+	if (status == "offline" || !connected) && deleted.RowsAffected() == 0 {
 		return "", ErrHostOffline
 	}
 	var held bool

@@ -58,6 +58,7 @@ type applyStore interface {
 	CreateAutoRevertAttempt(ctx context.Context, in NewAutoRevert) (Attempt, error)
 	OpenHostAttempt(ctx context.Context, hostID string) (Attempt, string, error)
 	OpenAttempts(ctx context.Context) ([]Attempt, error)
+	TerminalStandaloneAttemptsWithOwnedHolds(ctx context.Context) ([]Attempt, error)
 	Release(ctx context.Context, id string) (Release, error)
 }
 
@@ -148,6 +149,22 @@ func NewRunner(store applyStore, deps ApplyDeps, log *slog.Logger) *Runner {
 // its deadline from started_at. An orphaned open attempt would block its target
 // forever through the single-flight index.
 func (r *Runner) Adopt(ctx context.Context) {
+	if r.deps.ReleaseOwned != nil {
+		stranded, err := r.store.TerminalStandaloneAttemptsWithOwnedHolds(ctx)
+		if err != nil {
+			r.log.Error("could not find terminal platform holds awaiting release", "err", err)
+		} else {
+			for _, a := range stranded {
+				if a.HostID == nil {
+					continue
+				}
+				if err := r.deps.ReleaseOwned(ctx, a.ID, *a.HostID); err != nil {
+					r.log.Warn("terminal platform hold remains for next boot retry",
+						"attempt_id", a.ID, "host_id", *a.HostID, "err", err)
+				}
+			}
+		}
+	}
 	open, err := r.store.OpenAttempts(ctx)
 	if err != nil {
 		r.log.Error("could not re-adopt in-flight applies", "err", err)

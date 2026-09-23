@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -511,6 +512,72 @@ func TestStandaloneApplyKeepsItsHoldAcrossControlPlaneRestart(t *testing.T) {
 		rs, err := holds.List(ctx, h.hostID)
 		return err == nil && len(rs) == 0
 	})
+}
+
+func TestAdoptRetriesTerminalStandaloneHoldRelease(t *testing.T) {
+	for _, kind := range []string{KindApply, KindRevert} {
+		t.Run(kind, func(t *testing.T) {
+			h := newApplyHarness(t)
+			ctx := context.Background()
+			holds := admission.NewStore(h.pool)
+			attempt, err := h.store.CreateHostAttempt(ctx, NewHostAttempt{
+				Kind: kind, HostID: h.hostID, ReleaseID: &h.release.ID,
+				Requested: []ComponentDigest{}, Previous: []PreviousDigest{},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := holds.Acquire(ctx, h.hostID, admission.Owner{Kind: admission.Platform, ID: attempt.ID}, admission.ReasonPlatformApply); err != nil {
+				t.Fatal(err)
+			}
+			if kind == KindApply {
+				if _, err := holds.Acquire(ctx, h.hostID, admission.ManualOwner, admission.ReasonManualDrain); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := h.store.FailAttempt(ctx, attempt.ID, ReasonPullFailed, ""); err != nil {
+				t.Fatal(err)
+			}
+			// Simulate a crash or failed DB call after terminalization: the
+			// attempt is absent from OpenAttempts but its restriction remains.
+			if open, err := h.store.OpenAttempts(ctx); err != nil || len(open) != 0 {
+				t.Fatalf("open attempts after terminalization = %+v (%v)", open, err)
+			}
+			failedBoot := testRunner(h.store, ApplyDeps{
+				ReleaseOwned: func(context.Context, string, string) error { return errors.New("transient release failure") },
+			})
+			failedBoot.Adopt(ctx)
+			failedBoot.Close()
+			rs, err := holds.List(ctx, h.hostID)
+			if err != nil || len(rs) == 0 || rs[len(rs)-1].OwnerKind != admission.Platform {
+				t.Fatalf("hold after failed boot cleanup = %+v (%v)", rs, err)
+			}
+			nextBoot := testRunner(h.store, ApplyDeps{
+				ReleaseOwned: func(ctx context.Context, attemptID, hostID string) error {
+					_, err := holds.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, kind == KindApply)
+					return err
+				},
+			})
+			nextBoot.Adopt(ctx)
+			nextBoot.Adopt(ctx) // repeated boot delivery is idempotent
+			nextBoot.Close()
+			rs, err = holds.List(ctx, h.hostID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := 0
+			status := "offline"
+			if kind == KindApply {
+				want, status = 1, "draining"
+			}
+			if len(rs) != want || (want == 1 && rs[0].OwnerKind != admission.Manual) {
+				t.Fatalf("holds after retry = %+v, want %d other-owner holds", rs, want)
+			}
+			if got, err := h.store.HostStatus(ctx, h.hostID); err != nil || got != status {
+				t.Fatalf("status after retry = %q (%v), want %q", got, err, status)
+			}
+		})
+	}
 }
 
 // A relayed release_state writes the previous digests — in every state, not
