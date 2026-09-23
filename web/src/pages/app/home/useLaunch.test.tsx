@@ -1,4 +1,4 @@
-import { act, renderHook, screen } from "@testing-library/react";
+import { act, renderHook, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -49,7 +49,7 @@ describe("useLaunch waiting toast", () => {
     });
 
     expect(await screen.findByText("Waiting for a GPU that can encode AV1…")).toBeTruthy();
-    expect(result.current.waitingReason).toBe("slot");
+    await waitFor(() => expect(result.current.waitingReason).toBe("slot"));
     unmount(); // aborts the pending retry wait
   });
 

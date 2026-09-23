@@ -80,9 +80,9 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 	}
 }
 
-// collectOffers sends heartbeats, with no other event, until want offers have
-// arrived. Each pass sends at most hostcfg.PolicyOffersPerPass; the claimed
-// obligations say how many offers a pass sent.
+// collectOffers sends heartbeats until every group has one offer. Startup map
+// acknowledgement can also dispatch while the first heartbeat is in flight,
+// so claims observed between polls do not identify one dispatch pass.
 func (a typedAgent) collectOffers(t *testing.T, pool *pgxpool.Pool, want int) map[string]map[string]any {
 	t.Helper()
 	offers := map[string]map[string]any{}
@@ -99,12 +99,19 @@ func (a typedAgent) collectOffers(t *testing.T, pool *pgxpool.Pool, want int) ma
 		a.send(t, map[string]any{"type": "heartbeat", "running_sessions": []string{}, "ts_unix_ms": time.Now().UnixMilli()})
 		var sent int
 		waitUntil(t, "an offer pass", func() bool { sent = claimed() - before; return sent > 0 })
-		if sent > hostcfg.PolicyOffersPerPass {
-			t.Fatalf("one pass sent %d offers", sent)
-		}
 		for i := 0; i < sent; i++ {
 			offer := a.readUntil(t, "config_policy_offer")
-			offers[offer["group"].(string)] = offer
+			group := offer["group"].(string)
+			if scope, ok := hostcfg.PolicyGroupScope(group); !ok || scope != "next_session" {
+				t.Fatalf("unexpected group offer %q", group)
+			}
+			if _, duplicate := offers[group]; duplicate {
+				t.Fatalf("duplicate offer for group %q", group)
+			}
+			offers[group] = offer
+			if len(offers) > want {
+				t.Fatalf("received %d groups, expected %d", len(offers), want)
+			}
 		}
 	}
 	return offers

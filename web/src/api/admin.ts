@@ -692,6 +692,25 @@ export function getHostPolicy(token: string, hostId: string): Promise<HostPolicy
 export function updateHostPolicy(token: string, hostId: string, expectedRevision: string, changes: Record<string, components["schemas"]["HostPolicyChoice"]>): Promise<HostPolicyView> {
   return apiFetch<HostPolicyView>(`/admin/hosts/${hostId}/policy`, { token, method: "PATCH", body: { expected_revision: expectedRevision, changes } });
 }
+export type IdleApplyPreview = components["schemas"]["HostPolicyApprovalPreview"] & {
+  approval_boot_incarnation: string;
+  approval_review_id: string;
+};
+export type IdleApplyAttempt = components["schemas"]["IdleApplyAttempt"];
+export function approveHostIdleApply(token: string, hostId: string, group: string, preview: IdleApplyPreview, expiresAt: string): Promise<IdleApplyAttempt> {
+  return apiFetch<IdleApplyAttempt>(`/admin/hosts/${hostId}/idle-apply`, { token, method: "POST", body: {
+    group, expected_revision: preview.revision, content_sha256: preview.content_sha256,
+    prerequisites_sha256: preview.prerequisites_sha256, prerequisites: preview.prerequisites,
+    approval_boot_incarnation: preview.approval_boot_incarnation,
+    approval_review_id: preview.approval_review_id, expires_at: expiresAt,
+  } });
+}
+export function getHostIdleApply(token: string, hostId: string, attemptId: string): Promise<IdleApplyAttempt> {
+  return apiFetch<IdleApplyAttempt>(`/admin/hosts/${hostId}/idle-apply/${attemptId}`, { token });
+}
+export function cancelHostIdleApply(token: string, hostId: string, attemptId: string): Promise<IdleApplyAttempt> {
+  return apiFetch<IdleApplyAttempt>(`/admin/hosts/${hostId}/idle-apply/${attemptId}/cancel`, { token, method: "POST" });
+}
 /** Re-arm one next-session group whose transient retry budget is exhausted.
  *  A control plane that does not serve the route yet answers 404. */
 export function retryHostPolicyGroup(token: string, hostId: string, group: string): Promise<HostPolicyView> {

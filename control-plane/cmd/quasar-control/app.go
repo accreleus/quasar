@@ -467,6 +467,15 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		},
 	})
 	cfgStore := hostcfg.NewStore(pool)
+	// Fence unstarted RH05 approvals and journal inventory before HTTP admission
+	// or agent registration can observe this control-plane incarnation.
+	idleBootCtx, idleBootCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	_, bootErr := cfgStore.StartRH05Boot(idleBootCtx)
+	idleBootCancel()
+	if bootErr != nil {
+		janitorStop()
+		return nil, fmt.Errorf("start RH05 approval boot: %w", bootErr)
+	}
 	consoleStore := console.NewStore(pool)
 	auditStore := audit.NewStore(pool)
 	agentRegistry := agentws.NewRegistry(log)

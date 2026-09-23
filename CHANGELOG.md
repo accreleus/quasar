@@ -25,6 +25,8 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+
+- RH05 #338: reviewed idle-apply approvals now wait under an owner-scoped admission hold, expose current session and preparation blockers, and support safe cancellation; execution remains gated on the recovery executor.
 - **RH05 agent policy hooks (#336).** Added agent-side prepare and apply policy
   handling with durable execution acceptance, bounded retry and explicit
   outcomes. Managed-home mounts are checked against the selected root and its
