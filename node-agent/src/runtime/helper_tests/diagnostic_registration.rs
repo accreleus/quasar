@@ -313,6 +313,54 @@ async fn a_failing_retirement_sweep_registers_refuses_and_resumes_under_the_same
     assert_eq!(station.resumes(), 1);
 }
 
+/// The resume lands while the connection is inside its blocking `observe`, which is
+/// exactly where every `serve_registered` arm body sits: the select has returned, so the
+/// `station.resumed()` future — and with it the only watch receiver — is dropped for the
+/// whole body. A resume published into that window and not retained is lost for good,
+/// because a process resumes exactly once and nothing re-publishes it; the connection
+/// then serves a host that has already resumed until the control plane hangs up (#269).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_published_inside_the_blocking_observe_still_ends_the_connection() {
+    let station = Station::enter(&diagnostic::CleanupAttempt {
+        engine: Err("refused".into()),
+        retirement: Err("unavailable".into()),
+    })
+    .expect("an unreachable engine is diagnostic mode");
+
+    // Held, not dropped: a hung-up control plane would end the connection for the
+    // wrong reason.
+    let (_control_plane, mut sink, mut stream) = connection();
+    let served = {
+        let (station, resuming) = (station.clone(), station.clone());
+        tokio::spawn(async move {
+            diagnostic::serve_registered(
+                &mut sink,
+                &mut stream,
+                60_000,
+                &station,
+                move || {
+                    resuming.observe(&diagnostic::CleanupAttempt {
+                        engine: Ok(()),
+                        retirement: Ok(()),
+                    });
+                    (capacity_template(), Vec::new())
+                },
+                Duration::from_millis(10),
+            )
+            .await
+        })
+    };
+
+    let end = tokio::time::timeout(BOUND, served)
+        .await
+        .expect("the connection outlived a resume published while no waiter was alive")
+        .unwrap()
+        .unwrap();
+    assert_eq!(end, diagnostic::ConnectionEnd::Resumed);
+    assert_eq!(station.resumes(), 1);
+    assert_eq!(station.phase(), Phase::Normal);
+}
+
 /// Losing the control plane changes nothing about the retry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_retry_needs_no_control_plane_connection() {

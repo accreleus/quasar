@@ -238,6 +238,16 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **A host no longer stays in diagnostic mode after its startup cleanup succeeds (#269).**
+  The resume was published on a `watch` channel with `Sender::send`, which discards the
+  value outright when no receiver happens to exist at that instant — and every waiter is a
+  `Station::resumed()` future that lives only while its `select!` is being polled, so none
+  exists for the whole of any arm body (a heartbeat, the blocking capacity observe, a
+  refused command, the reconnect bookkeeping). A resume landing in that window was lost for
+  good, because a process resumes exactly once and nothing re-publishes it: the agent went
+  on reporting the blocking check and refusing every launch until it was restarted. The
+  resume is now retained on the channel, so a waiter that subscribes afterwards still sees
+  it.
 - **The sibling EGL probe's container lifecycle is bounded end to end (#283).** After the
   probe's 60-second result cache missed, it created, started, waited on and removed a real
   container with each of those steps carrying the runtime client's full deadline on its own
