@@ -732,6 +732,13 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 	if len(app) == 0 {
 		app = []byte("{}")
 	}
+	// The binding commits before the first assign send. A crash here leaves no
+	// running evidence, and a retry cannot substitute a different home payload.
+	if err := c.store.BindManagedHomeDispatch(c.ctx, sess.ID, app); err != nil {
+		c.log.Error("managed home dispatch binding failed", "session_id", sess.ID, "err", err)
+		c.failSession(sess.ID, "managed home dispatch binding failed")
+		return
+	}
 
 	// The resolved RUNG's ABR floor, for the agent's in-session governor. It must
 	// read the rung, not the launch profile: a chain has no single floor, and one

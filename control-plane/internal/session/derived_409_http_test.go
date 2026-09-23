@@ -109,6 +109,9 @@ func TestLaunchHomeConflict409KeepsLocationsPrivate(t *testing.T) {
 	if len(body.Raw) != 2 {
 		t.Fatalf("conflict disclosed extra fields: %v", body.Raw)
 	}
+	if body.Error.Message != "Managed home for managed-app needs operator review" {
+		t.Fatalf("conflict message = %q", body.Error.Message)
+	}
 	for _, private := range []string{s.hostID, h2, userID, "quasar-"} {
 		if strings.Contains(body.Error.Message, private) {
 			t.Fatalf("conflict message disclosed private location or identity")

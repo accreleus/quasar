@@ -18,18 +18,19 @@ func homeClaimOwner(ctx context.Context, tx pgx.Tx, p CreateParams) (string, err
 	}
 	var hostCount int
 	var unknown bool
+	var tombstoned bool
 	var soleHost *string
 	err := tx.QueryRow(ctx, `
 		SELECT COUNT(DISTINCT uh.host_id), COALESCE(BOOL_OR(uh.host_id IS NULL), false),
-		       MIN(uh.host_id::text)
+		       COALESCE(BOOL_OR(uh.gc_after IS NOT NULL), false), MIN(uh.host_id::text)
 		FROM user_homes uh
 		JOIN apps a ON a.id=uh.app_id
 		WHERE uh.user_id=$1::uuid AND COALESCE(a.parent_app_id,a.id)=$2::uuid
-	`, p.UserID, p.homeAppID()).Scan(&hostCount, &unknown, &soleHost)
+	`, p.UserID, p.homeAppID()).Scan(&hostCount, &unknown, &tombstoned, &soleHost)
 	if err != nil {
 		return "", fmt.Errorf("read legacy home locations: %w", err)
 	}
-	if hostCount > 1 || unknown {
+	if hostCount > 1 || unknown || tombstoned {
 		return "", ErrHomeConflict
 	}
 	var hostID *string
@@ -67,7 +68,7 @@ func claimSelectedHome(ctx context.Context, tx pgx.Tx, p CreateParams, hostID st
 	// and GC writers then serialize with this decision; a stale unlocked hint
 	// cannot authorize a second host while a legacy row changes underneath it.
 	rows, err := tx.Query(ctx, `
-		SELECT uh.host_id::text
+		SELECT uh.host_id::text,uh.gc_after IS NOT NULL
 		FROM user_homes uh JOIN apps a ON a.id=uh.app_id
 		WHERE uh.user_id=$1::uuid AND COALESCE(a.parent_app_id,a.id)=$2::uuid
 		FOR UPDATE OF uh
@@ -78,9 +79,11 @@ func claimSelectedHome(ctx context.Context, tx pgx.Tx, p CreateParams, hostID st
 	defer rows.Close()
 	legacyHosts := make(map[string]struct{})
 	var unknown bool
+	var tombstoned bool
 	for rows.Next() {
 		var legacyHost *string
-		if err := rows.Scan(&legacyHost); err != nil {
+		var rowTombstoned bool
+		if err := rows.Scan(&legacyHost, &rowTombstoned); err != nil {
 			return fmt.Errorf("scan legacy home location: %w", err)
 		}
 		if legacyHost == nil {
@@ -88,11 +91,12 @@ func claimSelectedHome(ctx context.Context, tx pgx.Tx, p CreateParams, hostID st
 		} else {
 			legacyHosts[*legacyHost] = struct{}{}
 		}
+		tombstoned = tombstoned || rowTombstoned
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("read legacy home locations: %w", err)
 	}
-	if len(legacyHosts) > 1 || unknown || (len(legacyHosts) == 1 && !hasHomeHost(legacyHosts, hostID)) {
+	if len(legacyHosts) > 1 || unknown || tombstoned || (len(legacyHosts) == 1 && !hasHomeHost(legacyHosts, hostID)) {
 		return ErrHomeConflict
 	}
 	_, err = tx.Exec(ctx, `
@@ -160,7 +164,7 @@ func (s *Store) GuardHomeForSwap(ctx context.Context, userID string, app LaunchA
 		return ErrHomeNotProvisioned
 	}
 	if owner != "" && owner != hostID {
-		return ErrHomeConflict
+		return ErrHomeNotProvisioned
 	}
 	if err := claimSelectedHome(ctx, tx, p, hostID); err != nil {
 		return err

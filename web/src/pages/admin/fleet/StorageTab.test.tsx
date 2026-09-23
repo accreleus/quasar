@@ -13,6 +13,7 @@ vi.mock("../../../lib/fleet/FleetContext", () => ({
 }));
 vi.mock("../../../api/admin", () => ({
   listAdminHomes: vi.fn(),
+  listAdminHomeClaims: vi.fn(),
   listHosts: vi.fn(),
   tombstoneHome: vi.fn(),
   runJobNow: vi.fn(),
@@ -80,6 +81,7 @@ function makeHost(overrides: Partial<Host> = {}): Host {
 describe("StorageTab", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(adminApi.listAdminHomeClaims).mockResolvedValue({ items: [], next_cursor: null } as never);
     addToastMock.mockClear();
     fleetHosts = [makeHost()];
   });
@@ -91,6 +93,20 @@ describe("StorageTab", () => {
       expect(screen.getByText(/No managed homes yet\. Enable/)).toBeTruthy(),
     );
     expect(screen.queryByText("alice")).toBeNull();
+  });
+
+  it("shows a claim-only conflict for admin diagnosis without a home row", async () => {
+    vi.mocked(adminApi.listAdminHomes).mockResolvedValue({ items: [], next_cursor: null } as never);
+    vi.mocked(adminApi.listAdminHomeClaims).mockResolvedValue({
+      items: [{ user_id: "u-alice", username: "alice", canonical_app_id: "a-steam", app_name: "Steam",
+        host_id: null, host_name: null, state: "conflict", conflict_reason: "claim_owner_missing",
+        materialized_at: null, recorded_host_ids: [] }], next_cursor: null,
+    } as never);
+    renderPage();
+    await waitFor(() => expect(screen.getByText("Home ownership")).toBeTruthy());
+    expect(screen.getByText("Claimed host was deleted")).toBeTruthy();
+    expect(screen.getByText("Steam")).toBeTruthy();
+    expect(screen.getByText(/No managed homes yet/)).toBeTruthy();
   });
 
   it("publishes the section head sub-line and storage count", async () => {

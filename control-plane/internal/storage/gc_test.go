@@ -391,6 +391,11 @@ func TestAdminEndpoints_RequireAdmin(t *testing.T) {
 	if rr.Code != http.StatusUnauthorized {
 		t.Errorf("unauthenticated list: want 401, got %d", rr.Code)
 	}
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest("GET", "/v1/admin/storage/home-claims", nil))
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("unauthenticated claim list: want 401, got %d", rr.Code)
+	}
 
 	// Unauthenticated → 401 on DELETE /v1/admin/storage/homes/{id}.
 	rr = httptest.NewRecorder()
@@ -417,6 +422,13 @@ func TestAdminEndpoints_RequireAdmin(t *testing.T) {
 	mux.ServeHTTP(rr, req)
 	if rr.Code != http.StatusForbidden {
 		t.Errorf("non-admin list: want 403, got %d", rr.Code)
+	}
+	req = httptest.NewRequest("GET", "/v1/admin/storage/home-claims", nil)
+	req.Header.Set("Authorization", "Bearer "+tok.Plaintext)
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusForbidden {
+		t.Errorf("non-admin claim list: want 403, got %d", rr.Code)
 	}
 
 	req = httptest.NewRequest("DELETE", "/v1/admin/storage/homes/some-id", nil)

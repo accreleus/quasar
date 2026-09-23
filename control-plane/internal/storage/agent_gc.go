@@ -71,8 +71,8 @@ func (m *Manager) AuthAgentHost(ctx context.Context, nodeName, nodeSecret string
 // gcReapable is the predicate for "this tombstone may be reaped now", shared by
 // GCPending and GCConfirm so a row can never be offered and then refused.
 //
-// The 24h grace exists so a launch can revive a tombstoned home (EnsureHome
-// clears gc_after). An ORPHANED home — user_id NULL, i.e. the owning users row
+// The 24h grace remains a minimum age before agent reaping. RH05 launch never
+// revives a tombstone. An ORPHANED home — user_id NULL, i.e. the owning users row
 // is gone (ON DELETE SET NULL, migration 0009) — can never be revived, so the
 // grace protects nothing and only costs disk: a harness minting an identity per
 // login filled a host to 100% inside it (#92). Orphans are reapable at once.
@@ -123,16 +123,82 @@ func (m *Manager) GCConfirm(ctx context.Context, hostID string, homeIDs []string
 	}
 	var deleted int
 	for _, id := range homeIDs {
-		tag, err := m.pool.Exec(ctx, `
-			DELETE FROM user_homes
-			WHERE id::text = $1
-			  AND host_id = $2::uuid
-			  AND `+gcReapable+`
-		`, id, hostID)
+		n, err := m.gcConfirmOne(ctx, hostID, id)
 		if err != nil {
 			return deleted, fmt.Errorf("gc confirm %s: %w", id, err)
 		}
-		deleted += int(tag.RowsAffected())
+		deleted += n
 	}
 	return deleted, nil
+}
+
+func (m *Manager) gcConfirmOne(ctx context.Context, hostID, id string) (int, error) {
+	tx, err := m.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	// Read only to learn the user lock key. Recheck the exact row under the
+	// lock, because a stale GC delivery has no authority over a revived/moved row.
+	var preUser, preApp, preHost *string
+	err = tx.QueryRow(ctx, `SELECT user_id::text,app_id::text,host_id::text FROM user_homes WHERE id::text=$1`, id).
+		Scan(&preUser, &preApp, &preHost)
+	if err == pgx.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if preUser != nil {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(1,hashtext($1::text))`, *preUser); err != nil {
+			return 0, err
+		}
+		if preApp != nil {
+			if err := lockClaimBeforeHome(ctx, tx, *preUser, *preApp, preHost, false); err != nil {
+				return 0, err
+			}
+		}
+	}
+	var userID, appID, deletedHost *string
+	err = tx.QueryRow(ctx, `
+		DELETE FROM user_homes WHERE id::text=$1 AND host_id=$2::uuid AND `+gcReapable+`
+		RETURNING user_id::text,app_id::text,host_id::text
+	`, id, hostID).Scan(&userID, &appID, &deletedHost)
+	if err == pgx.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !sameHomeIdentity(userID, preUser) || !sameHomeIdentity(appID, preApp) || !sameHomeIdentity(deletedHost, preHost) {
+		return 0, ErrHomeConflict
+	}
+	if userID != nil && appID != nil {
+		var canonical string
+		err = tx.QueryRow(ctx, `SELECT COALESCE(parent_app_id,id)::text FROM apps WHERE id=$1::uuid`, *appID).Scan(&canonical)
+		if err != nil && err != pgx.ErrNoRows {
+			return 0, err
+		}
+		if err == nil {
+			_, err = tx.Exec(ctx, `
+				DELETE FROM managed_home_claims c
+				WHERE c.user_id=$1::uuid AND c.canonical_app_id=$2::uuid
+				  AND c.host_id=$3::uuid AND c.state='conflict' AND c.conflict_reason='gc_pending'
+				  AND NOT EXISTS (
+				      SELECT 1 FROM user_homes uh JOIN apps a ON a.id=uh.app_id
+				      WHERE uh.user_id=c.user_id AND COALESCE(a.parent_app_id,a.id)=c.canonical_app_id)
+				  AND NOT EXISTS (
+				      SELECT 1 FROM sessions s JOIN apps a ON a.id=s.app_id
+				      WHERE s.user_id=c.user_id AND COALESCE(a.parent_app_id,a.id)=c.canonical_app_id
+				        AND s.state NOT IN ('stopped','failed'))
+			`, *userID, canonical, hostID)
+			if err != nil {
+				return 0, err
+			}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return 1, nil
 }

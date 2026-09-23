@@ -2754,7 +2754,7 @@ export interface paths {
                     };
                 };
                 404: components["responses"]["NotFound"];
-                /** @description session_quota_exceeded / home_in_use / profile_ineligible / profile_not_launchable_for_app / conflict (pre-existing), or (Phase 3) home_not_provisioned - a derived tile whose parent has no home on any host - or parent_app_disabled. Amendment 12 (#296): conflict is no longer returned for an explicit stream.codec the placed host cannot encode - that arm leaves the launch path (the codec is now a placement gate; see 503) and survives only on the certification bench. */
+                /** @description session_quota_exceeded / home_in_use / profile_ineligible / profile_not_launchable_for_app / conflict (pre-existing), or (Phase 3) home_not_provisioned - a derived tile whose parent has no home on any host - or parent_app_disabled. RH05: home_conflict takes precedence over home_not_provisioned when a conflicting canonical claim (including gc_pending) or known tombstoned row exists, including on derived tiles. Amendment 12 (#296): conflict is no longer returned for an explicit stream.codec the placed host cannot encode - that arm leaves the launch path (the codec is now a placement gate; see 503) and survives only on the certification bench. */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -3017,7 +3017,9 @@ export interface paths {
          *     STEAM LIBRARY DISCOVERY PHASE 3 ADDS TWO 409 CONDITIONS HERE, both additive (409 was
          *     already declared on this endpoint and Error.code is an open string).
          *
-         *     409 home_not_provisioned - the swap target is a DERIVED TILE and THIS SESSION'S HOST holds
+         *     RH05 home_conflict takes precedence when the canonical parent has a
+         *     conflicting claim or known tombstoned row. Otherwise, 409
+         *     home_not_provisioned - the swap target is a DERIVED TILE and THIS SESSION'S HOST holds
          *     no live user_homes row for its parent. A swap is pinned to the live session's host and has
          *     NO PLACEMENT STEP, so unlike a launch there is nowhere to re-pin it to: a tile whose
          *     library lives on another host, or does not exist yet, cannot be swapped into. Launch it
@@ -3067,7 +3069,7 @@ export interface paths {
                     };
                 };
                 404: components["responses"]["NotFound"];
-                /** @description session_not_swappable / swap_exceeds_reservation / conflict (pre-existing), or (Phase 3) home_not_provisioned - the target tile's parent has no home on THIS session's host - or parent_app_disabled. */
+                /** @description session_not_swappable / swap_exceeds_reservation / conflict (pre-existing), or (Phase 3) home_not_provisioned - the target tile's parent has no home on THIS session's host - or parent_app_disabled. RH05 home_conflict takes precedence for a conflicting claim or known tombstone. */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -4861,6 +4863,55 @@ export interface paths {
                         "application/json": components["schemas"]["AdminHomesResponse"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/storage/home-claims": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Diagnose canonical managed-home claims, including claim-only reservations and conflicts. */
+        get: {
+            parameters: {
+                query?: {
+                    user_id?: string;
+                    /** @description A derived tile resolves to its canonical parent app. */
+                    app_id?: string;
+                    /** @description Filter by the claim owner host, not recorded locations. */
+                    host_id?: string;
+                    state?: "reserved" | "materialized" | "conflict";
+                    limit?: number;
+                    /** @description Opaque exclusive keyset cursor bound to the filters. */
+                    cursor?: string;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["AdminHomeClaimsResponse"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
             };
@@ -9697,6 +9748,32 @@ export interface components {
             };
             /** @description session-capture: every capture belonging to this session, REGARDLESS of the bundle's window (captures are sparse, explicitly requested, and exempt from the rolling trace prune). Always present; empty when there are none. */
             captures?: components["schemas"]["Capture"][];
+        };
+        AdminHomeClaim: {
+            /** Format: uuid */
+            user_id: string;
+            username: string | null;
+            /** Format: uuid */
+            canonical_app_id: string;
+            app_name: string | null;
+            /** Format: uuid */
+            host_id: string | null;
+            host_name: string | null;
+            /**
+             * @description Materialized means an authenticated running session used this claimed managed-home mount; it does not attest to home contents.
+             * @enum {string}
+             */
+            state: "reserved" | "materialized" | "conflict";
+            /** @enum {string|null} */
+            conflict_reason: "legacy_location_uncertain" | "claim_owner_missing" | "location_mismatch" | "gc_pending" | null;
+            /** Format: date-time */
+            materialized_at: string | null;
+            /** @description Distinct sorted host IDs from known bookkeeping rows, including tombstones; not physical inventory evidence. */
+            recorded_host_ids: string[];
+        };
+        AdminHomeClaimsResponse: {
+            items: components["schemas"]["AdminHomeClaim"][];
+            next_cursor: string | null;
         };
         /** @description One managed-home row from GET /v1/admin/storage/homes (storage/handler.go homeResp). */
         AdminHome: {

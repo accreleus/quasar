@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/accreleus/quasar/control-plane/internal/telemetry"
@@ -625,7 +626,16 @@ func (s *Store) Transition(ctx context.Context, id string, to State, detail, err
 // reporting host while the session row is locked, so a different agent cannot
 // supply lifecycle or managed-home materialization evidence for this session.
 func (s *Store) TransitionFromHost(ctx context.Context, id, hostID string, to State, detail, errMsg *string) (Session, error) {
-	return s.transition(ctx, id, hostID, to, detail, errMsg)
+	var sess Session
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		sess, err = s.transition(ctx, id, hostID, to, detail, errMsg)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "40P01" {
+			return sess, err
+		}
+	}
+	return sess, err
 }
 
 func (s *Store) transition(ctx context.Context, id, reportHostID string, to State, detail, errMsg *string) (Session, error) {
@@ -640,7 +650,11 @@ func (s *Store) transition(ctx context.Context, id, reportHostID string, to Stat
 
 	var cur State
 	var assignedHost *string
-	err = tx.QueryRow(ctx, `SELECT state, host_id::text FROM sessions WHERE id = $1::uuid FOR UPDATE`, id).Scan(&cur, &assignedHost)
+	var sessionUser, sessionApp string
+	var boundHome, boundDigest *string
+	err = tx.QueryRow(ctx, `SELECT state, host_id::text,user_id::text,app_id::text,
+		managed_home_id::text,managed_home_mount_sha256 FROM sessions WHERE id = $1::uuid FOR UPDATE`, id).
+		Scan(&cur, &assignedHost, &sessionUser, &sessionApp, &boundHome, &boundDigest)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Session{}, ErrNotFound
 	}
@@ -686,6 +700,11 @@ func (s *Store) transition(ctx context.Context, id, reportHostID string, to Stat
 		`, id, string(to), detail, errMsg)
 		if err != nil {
 			return Session{}, fmt.Errorf("update state: %w", err)
+		}
+	}
+	if reportHostID != "" && cur != StateRunning && to == StateRunning {
+		if err := materializeRunningHome(ctx, tx, sessionUser, sessionApp, reportHostID, boundHome, boundDigest); err != nil {
+			return Session{}, err
 		}
 	}
 
@@ -1077,6 +1096,24 @@ func (s *Store) HomeHostForApp(ctx context.Context, userID, homeAppID string) (s
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	return homeClaimOwner(ctx, tx, CreateParams{UserID: userID, AppID: homeAppID, ManagedHome: true})
+}
+
+// CanonicalAppName resolves the caller's requested app to the parent whose
+// managed home it uses. Call only after the entitlement gate has passed.
+func (s *Store) CanonicalAppName(ctx context.Context, appID string) (string, error) {
+	if !isValidUUID(appID) {
+		return "", ErrNotFound
+	}
+	var name string
+	err := s.pool.QueryRow(ctx, `SELECT root.name FROM apps a JOIN apps root
+		ON root.id=COALESCE(a.parent_app_id,a.id) WHERE a.id=$1::uuid`, appID).Scan(&name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("resolve canonical app name: %w", err)
+	}
+	return name, nil
 }
 
 // probeMaxAgeDays is the staleness cut for user_devices probes (AS-02). A probe
