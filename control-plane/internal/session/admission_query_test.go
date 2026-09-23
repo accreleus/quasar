@@ -21,8 +21,14 @@ var wsRun = regexp.MustCompile(`\s+`)
 func normSQL(s string) string { return strings.TrimSpace(wsRun.ReplaceAllString(s, " ")) }
 
 func withoutRH05Restriction(s string) string {
-	return normSQL(strings.ReplaceAll(s, normSQL(unrestrictedHostSQL), ""))
+	s = strings.ReplaceAll(s, normSQL(unrestrictedHostSQL), "")
+	return normSQL(placementAnchorGate.ReplaceAllString(s, ""))
 }
+
+// 0091 adds a final canonical-app bind to each admission query. Strip exactly
+// that additive predicate when comparing with the pre-placement SQL capture;
+// its presence and bind value are asserted separately below.
+var placementAnchorGate = regexp.MustCompile(` AND EXISTS \( SELECT 1 FROM app_placement ap WHERE ap.app_id = \$[0-9]+::uuid AND \(ap.mode = 'all_eligible' OR EXISTS \( SELECT 1 FROM app_placement_hosts aph WHERE aph.app_id = ap.app_id AND aph.host_id = h.id\)\)\)`)
 
 // admissionMatrix renders every admission query across the full configuration
 // space, keyed by shape. Each entry is the normalized SQL.
@@ -170,6 +176,9 @@ func TestAdmissionSQLMatchesPreRefactor(t *testing.T) {
 		for _, s := range sqls {
 			if !strings.Contains(s, normSQL(unrestrictedHostSQL)) {
 				t.Fatalf("%s query omitted the RH05 owner restriction", shape)
+			}
+			if !placementAnchorGate.MatchString(s) {
+				t.Fatalf("%s query omitted the app placement predicate", shape)
 			}
 			if !strings.Contains(s, "h.config_policy_gate_connection IS NULL") {
 				t.Fatalf("%s query omitted the RH05 settings delivery gate", shape)
@@ -335,6 +344,9 @@ func TestAdmissionArgValues(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// The canonical parent app is bound last, leaving every historical
+			// gate's placeholder and value stable.
+			tc.want = append(tc.want, app)
 			if len(tc.args) != len(tc.want) {
 				t.Fatalf("bound %d args, want %d\n got: %#v\nwant: %#v",
 					len(tc.args), len(tc.want), tc.args, tc.want)

@@ -25,6 +25,11 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **RH05 app placement (#342).** Admins can set dynamic or fixed host eligibility
+  per canonical app with revision-checked edits and separate selected, prepared,
+  and ready status. Derived tiles inherit their parent's placement. Session
+  admission rechecks placement before reservation and preserves managed-home
+  locality, including when a host is removed during launch.
 - **Managed-home ownership during launch (#341).** A canonical per-user, per-app
   claim keeps existing homes on their recorded host, serializes concurrent first
   launches, and reports uncertain or divergent locations for operator repair
