@@ -696,7 +696,41 @@ func (s *Store) ClaimDue(ctx context.Context, o ClaimOptions) ([]Run, error) {
 	if o.Plane == PlaneAgent && o.HostID == "" {
 		return nil, ErrHostRequired
 	}
-	rows, err := s.pool.Query(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin due claim: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	// Acquire host fences before taking the claim statement's READ COMMITTED
+	// snapshot. An idle offer may have committed while this transaction waited;
+	// the following statement must see it before deciding to run a job.
+	locks, err := tx.Query(ctx, `SELECT candidate.host_id::text,
+		pg_try_advisory_xact_lock(hashtextextended(candidate.host_id::text,339))
+		FROM (SELECT DISTINCT r.host_id FROM job_runs r JOIN jobs j ON j.id=r.job_id
+			WHERE r.state='pending' AND r.scheduled_for<=$1 AND r.host_id IS NOT NULL
+			AND j.enabled AND j.managed AND j.plane=$2
+			AND ($3='' OR r.host_id=$3::uuid)) candidate`, o.Now, string(o.Plane), o.HostID)
+	if err != nil {
+		return nil, fmt.Errorf("lock due hosts: %w", err)
+	}
+	lockedHosts := []string{}
+	for locks.Next() {
+		var hostID string
+		var locked bool
+		if err := locks.Scan(&hostID, &locked); err != nil {
+			locks.Close()
+			return nil, err
+		}
+		if locked {
+			lockedHosts = append(lockedHosts, hostID)
+		}
+	}
+	if err := locks.Err(); err != nil {
+		locks.Close()
+		return nil, err
+	}
+	locks.Close()
+	rows, err := tx.Query(ctx, `
 		WITH due AS (
 			SELECT r.id
 			FROM job_runs r
@@ -706,26 +740,45 @@ func (s *Store) ClaimDue(ctx context.Context, o ClaimOptions) ([]Run, error) {
 			  AND j.enabled AND j.managed
 			  AND j.plane = $2
 			  AND ($3 = '' OR r.host_id = $3::uuid)
+			  AND (r.host_id IS NULL OR r.host_id=ANY($5::uuid[]))
+			  -- An offered attempt may have reached the agent even without an ack.
+			  -- Hold conflicting jobs until journal reconciliation or cancellation
+			  -- proves it did not start. A merely approved request does not hold
+			  -- jobs, so a due job can finish and unblock admission.
+			  AND NOT EXISTS (SELECT 1 FROM host_config_attempts a
+			      WHERE a.host_id=r.host_id AND a.scope='restart'
+			      AND (a.terminal_at IS NULL OR (a.phase='uncertain' AND EXISTS (
+			          SELECT 1 FROM host_admission_restrictions ar
+			          WHERE ar.host_id=a.host_id AND ar.owner_id=a.id
+			            AND ar.owner_kind='recovery'))))
 			ORDER BY r.scheduled_for
 			LIMIT $4
 			FOR UPDATE OF r SKIP LOCKED
 		)
 		UPDATE job_runs SET state = 'running', claimed_at = now(), started_at = now()
 		WHERE id IN (SELECT id FROM due)
-		RETURNING`+runColumns, o.Now, string(o.Plane), o.HostID, o.Limit)
+		RETURNING`+runColumns, o.Now, string(o.Plane), o.HostID, o.Limit, lockedHosts)
 	if err != nil {
 		return nil, fmt.Errorf("claim due runs: %w", err)
 	}
-	defer rows.Close()
 	var out []Run
 	for rows.Next() {
 		r, err := scanRun(rows)
 		if err != nil {
+			rows.Close()
 			return nil, err
 		}
 		out = append(out, r)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit due claims: %w", err)
+	}
+	return out, nil
 }
 
 // Report closes a running run.

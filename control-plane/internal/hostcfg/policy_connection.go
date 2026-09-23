@@ -209,6 +209,15 @@ func (s *Store) HoldPolicyConnection(ctx context.Context, hostID, connectionID s
 	return err
 }
 
+// PolicyDeliveryGate reports whether this socket currently owes a legacy map
+// acknowledgement. A journal refresh preserves an already acknowledged map
+// only while that durable gate is closed.
+func (s *Store) PolicyDeliveryGate(ctx context.Context, hostID, connectionID string) (bool, error) {
+	var active bool
+	err := s.pool.QueryRow(ctx, `SELECT COALESCE(config_policy_gate_connection=$2::uuid,false) FROM hosts WHERE id=$1::uuid`, hostID, connectionID).Scan(&active)
+	return active, err
+}
+
 func (s *Store) ParkPolicyGroupUpgradeRequired(ctx context.Context, hostID, group string) error {
 	_, err := s.pool.Exec(ctx, `UPDATE host_setting_groups SET status='upgrade_required' WHERE host_id=$1::uuid AND group_key=$2 AND status IN ('pending','failed')`, hostID, group)
 	return err

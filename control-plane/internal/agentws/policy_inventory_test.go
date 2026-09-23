@@ -102,6 +102,56 @@ func TestFreshV2EmptyGroupSeedMapAckKeepsAdmissionClosed(t *testing.T) {
 	}
 }
 
+func TestBlockedPolicyInventoryRefreshesOnCurrentConnection(t *testing.T) {
+	pool := testPool(t)
+	store := hostcfg.NewStore(pool)
+	hostID := seedHost(t, pool)
+	ctx := context.Background()
+	if _, err := store.StartRH05Boot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	connection := "00000000-0000-4000-8000-000000000209"
+	if err := store.BeginJournalReconciliation(ctx, hostID, connection); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET config_policy_versions='{"typed_settings":2}'::jsonb WHERE id=$1::uuid`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.HoldPolicyConnection(ctx, hostID, connection); err != nil {
+		t.Fatal(err)
+	}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	registry := NewRegistry(log)
+	h := NewHandler(pool, "test-token", log, registry, nil, nil, store, nil)
+	t.Cleanup(h.Close)
+	c := newConn(hostID, nil)
+	c.policyTyped = true
+	c.connectionIncarnation = connection
+	c.bootIncarnation = "00000000-0000-4000-8000-000000000210"
+	c.policyInventoryDone.Store(true)
+	c.policyInventoryBlocked.Store(true)
+	c.policyDeliveryID = "00000000-0000-4000-8000-000000000212"
+	c.policyInitialMapApplied.Store(true)
+	registry.add(c)
+	t.Cleanup(func() { registry.remove(c) })
+	if err := h.restartPolicyInventory(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	if c.policyInventoryID == "" || c.policyInventoryBlocked.Load() || c.policyRefreshPending ||
+		c.policyDeliveryID != "" || c.policyInitialMapApplied.Load() {
+		t.Fatal("blocked pending inventory did not request a fresh snapshot")
+	}
+	select {
+	case raw := <-c.out:
+		var request ConfigPolicyInventoryRequest
+		if err := json.Unmarshal(raw, &request); err != nil || request.Type != "config_policy_journal_inventory_request" || request.InventoryID != c.policyInventoryID {
+			t.Fatalf("refresh request = %+v, err=%v", request, err)
+		}
+	default:
+		t.Fatal("blocked pending inventory remained stranded")
+	}
+}
+
 func TestPolicyInventoryMatchingHistoricalAttemptPermitsInitialMap(t *testing.T) {
 	pool := testPool(t)
 	store := hostcfg.NewStore(pool)
@@ -190,6 +240,17 @@ func TestPolicyInventoryMatchingHistoricalAttemptPermitsInitialMap(t *testing.T)
 	if _, err := c.acceptPolicySequence(conflict); err == nil {
 		t.Fatal("conflicting equal journal sequence was accepted")
 	}
+	firstReject := entry
+	firstReject.JournalSequence = "0"
+	firstReject.Phase = "failed"
+	firstReject.Error = json.RawMessage(`"host_busy"`)
+	secondReject := firstReject
+	secondReject.Error = json.RawMessage(`"prerequisite_mismatch"`)
+	for _, rejection := range []ConfigPolicyStateMsg{firstReject, secondReject} {
+		if fresh, err := c.acceptPolicySequence(rejection); err != nil || !fresh {
+			t.Fatalf("delivery rejection was mistaken for journal sequence: fresh=%v err=%v", fresh, err)
+		}
+	}
 	select {
 	case raw := <-c.out:
 		var sent ConfigUpdateCmd
@@ -201,5 +262,84 @@ func TestPolicyInventoryMatchingHistoricalAttemptPermitsInitialMap(t *testing.T)
 	}
 	if ok, err := store.AcknowledgeInitialDelivery(ctx, hostID, connection, c.policyDeliveryID); err != nil || !ok {
 		t.Fatalf("current map could not lift gate: ok=%v err=%v", ok, err)
+	}
+	c.policyInitialMapApplied.Store(true)
+	if err := store.CompleteJournalReconciliation(ctx, hostID, connection, c.rh05RestartEntries, c.rh05Snapshots); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.restartPolicyInventory(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case raw := <-c.out:
+		var request ConfigPolicyInventoryRequest
+		if err := json.Unmarshal(raw, &request); err != nil || request.Type != "config_policy_journal_inventory_request" {
+			t.Fatalf("refresh request = %+v, err=%v", request, err)
+		}
+	default:
+		t.Fatal("current connection did not request fresh journal")
+	}
+	refreshPage, err := json.Marshal(ConfigPolicyInventoryPage{
+		Type: "config_policy_journal_inventory_page", InventoryID: c.policyInventoryID,
+		SnapshotID:        "00000000-0000-4000-8000-000000000208",
+		RevisionHighWater: map[string]string{"idle_timeout_secs": group.DesiredRevision},
+		ActiveSnapshots: map[string]struct {
+			Kind   string `json:"kind"`
+			Digest string `json:"digest"`
+		}{"idle_timeout_secs": {Kind: "seeded", Digest: strings.Repeat("a", 64)}},
+		Entries: []ConfigPolicyStateMsg{entry},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.acceptPolicyInventoryPage(ctx, c, refreshPage); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case raw := <-c.out:
+		t.Fatalf("refresh resent initial map after acknowledged gate: %s", raw)
+	default:
+	}
+	if !c.policyInitialMapApplied.Load() {
+		t.Fatal("refresh forgot already acknowledged map")
+	}
+	if err := store.HoldPolicyConnection(ctx, hostID, connection); err != nil {
+		t.Fatal(err)
+	}
+	priorDelivery := c.policyDeliveryID
+	if err := h.restartPolicyInventory(ctx, c); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case raw := <-c.out:
+		var request ConfigPolicyInventoryRequest
+		if err := json.Unmarshal(raw, &request); err != nil || request.Type != "config_policy_journal_inventory_request" {
+			t.Fatalf("gated refresh request = %+v, err=%v", request, err)
+		}
+	default:
+		t.Fatal("open delivery gate did not request a fresh journal")
+	}
+	var refreshDoc map[string]any
+	if err := json.Unmarshal(refreshPage, &refreshDoc); err != nil {
+		t.Fatal(err)
+	}
+	refreshDoc["inventory_id"] = c.policyInventoryID
+	refreshDoc["snapshot_id"] = "00000000-0000-4000-8000-000000000211"
+	gatedPage, err := json.Marshal(refreshDoc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.acceptPolicyInventoryPage(ctx, c, gatedPage); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case raw := <-c.out:
+		var sent ConfigUpdateCmd
+		if err := json.Unmarshal(raw, &sent); err != nil || sent.Type != "config_update" ||
+			sent.SettingsDeliveryID == "" || sent.SettingsDeliveryID == priorDelivery {
+			t.Fatalf("reopened gate did not get fresh map: %+v, err=%v", sent, err)
+		}
+	default:
+		t.Fatal("reopened delivery gate stranded without map")
 	}
 }

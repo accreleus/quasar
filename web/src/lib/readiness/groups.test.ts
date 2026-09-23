@@ -40,6 +40,7 @@ const AGENT_CHECK_IDS = [
   "runtime_cdi",
   // #256: the agent's own safety state (node-agent/src/diagnostic.rs).
   "startup_cleanup",
+  "policy_journal",
   // #253: storage (readiness/storage.rs).
   "homes_root_writable",
   "homes_free_space",
@@ -67,7 +68,7 @@ describe("readiness groups (#102)", () => {
   it("puts the container runtime checks first, endpoint before what it negotiated", () => {
     expect(READINESS_GROUPS[0].key).toBe("runtime");
     expect(READINESS_GROUPS[0].label).toBe("Container runtime");
-    expect(READINESS_GROUPS[0].ids).toEqual(["startup_cleanup", "runtime_endpoint", "runtime_api_version", "runtime_capabilities", "runtime_cdi", "host_container_mounts"]);
+    expect(READINESS_GROUPS[0].ids).toEqual(["startup_cleanup", "policy_journal", "runtime_endpoint", "runtime_api_version", "runtime_capabilities", "runtime_cdi", "host_container_mounts"]);
   });
 
   // #256: diagnostic mode's safety check explains the refusal, so it leads the runtime group.
@@ -75,6 +76,12 @@ describe("readiness groups (#102)", () => {
     const { groups } = groupChecks([c("runtime_endpoint", "fail"), c("startup_cleanup", "fail")]);
     expect(groups.map((g) => g.key)).toEqual(["runtime"]);
     expect(groups[0].checks.map((check) => check.id)).toContain("startup_cleanup");
+  });
+
+  it("shows a policy-journal fault beside runtime safety checks, never Other", () => {
+    const { groups } = groupChecks([c("policy_journal", "fail"), c("runtime_endpoint", "pass")]);
+    expect(groups.map((g) => g.key)).toEqual(["runtime"]);
+    expect(groups[0].checks[0].id).toBe("policy_journal");
   });
 
   // #261: host_container_mounts and nvidia_driver_mount.
