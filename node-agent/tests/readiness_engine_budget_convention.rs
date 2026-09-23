@@ -43,7 +43,8 @@ const EGL_PROBE_FILE: &str = "nvidia_volume.rs";
 
 /// Owned-probe lifecycle operations that default to the client's full deadline, one
 /// deadline EACH. `RuntimeClient::gpu_probe_within` runs the whole lifecycle under one
-/// caller-chosen budget; on this path, name that or don't drive a probe.
+/// caller-chosen budget; in this function (the launch gate's driver check since #259,
+/// and a refresh-path call before it), name that or don't drive a probe.
 const UNBUDGETED_PROBE_LIFECYCLE: &[&str] = &[
     ".recover_diagnostics(",
     ".run_gpu_probe(",

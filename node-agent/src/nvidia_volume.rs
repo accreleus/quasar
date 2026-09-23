@@ -4035,9 +4035,10 @@ mod tests {
         );
     }
 
-    /// The bound is only worth having if a whole refresh's engine work still lands inside
-    /// the agent's readiness-refresh deadline: a refresh that straddles a freeze must
-    /// report a verdict rather than be abandoned as `readiness-refresh-overdue` (#283).
+    /// The probe runs from the launch gate today (#259), but the budget is sized so that a
+    /// whole refresh's engine work would still land inside the agent's readiness-refresh
+    /// deadline if the probe ever returned to that path: a refresh that straddles a freeze
+    /// must report a verdict rather than be abandoned as `readiness-refresh-overdue` (#283).
     /// The five budgeted reads #274 left on that path, plus one probe lifecycle.
     #[test]
     fn a_probe_and_the_refresh_paths_engine_reads_fit_inside_the_refresh_deadline() {

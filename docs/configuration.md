@@ -1831,9 +1831,10 @@ cached for 60 seconds per image/driver/mount combination, with a 20-second
 in-container timeout. When the cache misses, the whole container lifecycle —
 create, start, wait, stop, remove — runs under one 30-second budget rather than a
 separate engine deadline per step, so an engine that hangs during the probe
-reports an inconclusive result instead of holding the caller. An outcome that
+reports an inconclusive result instead of holding the launch. An outcome that
 only says the probe could not run is not cached: the next caller retries rather
 than reading a non-answer as a finished probe. A confirmed EGL failure blocks
-launch; an inconclusive probe appears as a warning. This checks driver loading, not a custom app's full
-renderer or the browser's video, audio and input path. The final setup step offers
+launch; an inconclusive probe appears as a warning. This checks driver loading,
+not a custom app's full renderer or the browser's video, audio and input path.
+The final setup step offers
 a manual streaming checklist; those confirmations are not a stored certification.

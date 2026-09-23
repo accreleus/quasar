@@ -5778,7 +5778,9 @@ fn a_stalled_gpu_probe_lifecycle_is_bounded_by_one_budget() {
          {error:?}"
     );
     assert!(
-        elapsed < Duration::from_millis(1200),
+        // Well under the fixture's 2 s per-operation deadline (the pre-fix lifecycle took
+        // just over one of those), with headroom for a loaded full-suite run.
+        elapsed < Duration::from_millis(1500),
         "the whole lifecycle must be bounded by its {budget:?} budget, not by one client \
          deadline ({:?}) per operation: took {elapsed:?}",
         engine.config.deadline

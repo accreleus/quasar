@@ -98,10 +98,11 @@ pub const ENGINE_INSPECTION_BUDGET: Duration = Duration::from_secs(5);
 /// indeterminate, and it replaces a worst case of five operations each on the client's
 /// full deadline — 150 s at the default 30 s — with one bound.
 ///
-/// It is also what keeps a probe inside a readiness refresh: 30 s on top of the five
-/// [`ENGINE_INSPECTION_BUDGET`] reads #274 left on that path is 55 s, under the agent's
-/// 60 s `READINESS_REFRESH_DEADLINE`, so a refresh that straddles a freeze reports a
-/// verdict instead of being abandoned as `readiness-refresh-overdue`.
+/// Today the only production caller is the session launch gate (#259 moved the sibling
+/// probe off the readiness refresh and onto `application_gpu_probe_gpu<N>`), so the bound
+/// is what a launch pays on a wedged engine. It is also sized to fit a refresh should the
+/// probe ever return there: 30 s on top of the five [`ENGINE_INSPECTION_BUDGET`] reads
+/// #274 left on that path is 55 s, under the agent's 60 s `READINESS_REFRESH_DEADLINE`.
 pub const GPU_PROBE_LIFECYCLE_BUDGET: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
@@ -693,7 +694,8 @@ impl RuntimeClient {
     /// times over (measured: one full deadline for the create whose reply never comes,
     /// another for the wait on a container that never exits). Callers on a deadline —
     /// the readiness refresh, the launch gate — need the LIFECYCLE bounded, not each
-    /// request, so the budget is spent once and apportioned here.
+    /// request, so the budget is spent once and apportioned here. (Since #259 the
+    /// sibling probe runs from the launch gate, not the refresh; the bound serves both.)
     ///
     /// The four engine round-trips get [`ENGINE_INSPECTION_BUDGET`] or whatever is left,
     /// whichever is smaller; they are one request and one reply each and cost
