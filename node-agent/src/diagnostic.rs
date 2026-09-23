@@ -385,7 +385,14 @@ impl Station {
             Transition::Resumed => {
                 self.readiness.lock().unwrap().forget(STARTUP_CLEANUP_ID);
                 self.resumes.fetch_add(1, Ordering::SeqCst);
-                let _ = self.resumed.send(true);
+                // `send_replace`, never `send`: a resume is a fact about this process,
+                // not a notification. `Sender::send` discards the value outright when no
+                // receiver happens to exist, and every waiter here is a `resumed()`
+                // future that lives only while its `select!` is polling — dropped for the
+                // whole of each arm body. A `send` landing in that window would be lost
+                // for good, because a process resumes exactly once and nothing
+                // re-publishes it (#269).
+                self.resumed.send_replace(true);
             }
             Transition::AlreadyNormal => {}
         }
@@ -408,7 +415,8 @@ impl Station {
         matches!(self.phase(), Phase::Diagnostic(_))
     }
 
-    /// Resolves once this process has resumed, immediately if it already has.
+    /// Resolves once this process has resumed, immediately if it already has — including
+    /// when the resume was published before this waiter existed ([`Station::observe`]).
     pub async fn resumed(&self) {
         let mut rx = self.resumed.subscribe();
         loop {
@@ -551,7 +559,9 @@ where
 
 /// The diagnostic connection after `registered`: report, heartbeat, refuse, and end the
 /// moment this process resumes. Every wait on the peer is in the select with the resume
-/// arm, so a dead control plane can never delay a resume.
+/// arm, so a dead control plane can never delay a resume. The arm bodies themselves run
+/// with no waiter subscribed; what keeps them from swallowing a resume that lands there
+/// is that [`Station::observe`] retains it for the next waiter, not this select (#269).
 pub async fn serve_registered<S, R, F>(
     sink: &mut S,
     stream: &mut R,
@@ -816,6 +826,24 @@ mod tests {
             Transition::AlreadyNormal
         );
         assert_eq!(startup.phase(), &Phase::Normal);
+    }
+
+    /// A resume is a fact about the process, not a notification: it has to survive
+    /// being published while nothing is subscribed. Every `serve_registered` arm body
+    /// runs with the select's `resumed()` future — and so the only watch receiver —
+    /// dropped, so this is the window a real resume lands in (#269).
+    #[tokio::test]
+    async fn a_resume_published_with_no_waiter_is_still_seen_by_the_next_one() {
+        let station = Station::enter(&attempt(Err("refused"), Err("unavailable")))
+            .expect("an unresolved first pass is diagnostic mode");
+        assert_eq!(
+            station.observe(&attempt(Ok(()), Ok(()))),
+            Transition::Resumed
+        );
+        tokio::time::timeout(Duration::from_secs(5), station.resumed())
+            .await
+            .expect("a resume published with no waiter alive was lost");
+        assert_eq!(station.resumes(), 1);
     }
 
     #[test]
