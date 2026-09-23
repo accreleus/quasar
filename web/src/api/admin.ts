@@ -563,6 +563,14 @@ export function updateImage(token: string, id: string): Promise<ImageUpdateResul
   });
 }
 
+/** Re-arm one selected host's failed adopted image; 202 means scheduled. */
+export function retryHostImage(token: string, hostId: string, imageId: string): Promise<void> {
+  return apiFetch<void>(`/admin/hosts/${encodeURIComponent(hostId)}/images/${encodeURIComponent(imageId)}/retry`, {
+    method: "POST",
+    token,
+  });
+}
+
 // ── Hosts / capacity (P2-09, P3-07) ─────────────────────────────────────────
 
 export function listHosts(token: string, cursor?: string): Promise<HostsResponse> {

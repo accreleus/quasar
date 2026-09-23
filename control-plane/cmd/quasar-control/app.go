@@ -788,6 +788,10 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	imagesHandler := images.NewHandler(imagesStore, auditStore)
 	imagesEnsurer := images.NewEnsurer(pool, agentRegistry, log)
 	imagesStore.SetEnsurer(imagesEnsurer)
+	imagesHandler.SetRetryEnsurer(imagesEnsurer)
+	crudHandler.SetImageReconciler(imagesEnsurer.EnsureAll)
+	crudHandler.SetImageEvidence(imagesEnsurer.CurrentImageEvidence)
+	go imagesEnsurer.RunRequirementReconcile(janitorCtx)
 	preparationStore := preparation.New(pool)
 	agentHandler.SetPreparation(preparationStore)
 	agentHandler.OnPreparationReport = imagesEnsurer.ReconcilePreparation

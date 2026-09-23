@@ -320,7 +320,7 @@ describe("app editor — placement saves on its own", () => {
     const hostId = "aaaaaaaa-0000-0000-0000-000000000001";
     mocked.listAllHosts.mockResolvedValue([{ id: hostId, node_name: "gpu-test" }] as never);
     mocked.getAppPlacement.mockResolvedValue({
-      app_id: "app-1", inherited_from: null, mode: "all_eligible", host_ids: [], revision: "0",
+      app_id: "app-1", inherited_from: null, managed_image_id: null, mode: "all_eligible", host_ids: [], revision: "0",
       hosts: [{ host_id: hostId, selected: true, prepared: true, ready: true, reason: null }],
     });
     renderEditor();
@@ -338,7 +338,7 @@ describe("app editor — placement saves on its own", () => {
     const hostId = "aaaaaaaa-0000-0000-0000-000000000001";
     mocked.listAllHosts.mockResolvedValue([{ id: hostId, node_name: "gpu-test" }] as never);
     const before = {
-      app_id: "app-1", inherited_from: null, mode: "all_eligible" as const,
+      app_id: "app-1", inherited_from: null, managed_image_id: null, mode: "all_eligible" as const,
       host_ids: [], revision: "3",
       hosts: [{ host_id: hostId, selected: true, prepared: null, ready: null, reason: null }],
     };
@@ -363,6 +363,7 @@ describe("app editor — placement saves on its own", () => {
     mocked.getAppPlacement.mockResolvedValue({
       app_id: "app-1",
       inherited_from: null,
+      managed_image_id: null,
       mode: "all_eligible",
       host_ids: [],
       revision: "0",
@@ -371,6 +372,7 @@ describe("app editor — placement saves on its own", () => {
     mocked.updateAppPlacement.mockResolvedValue({
       app_id: "app-1",
       inherited_from: null,
+      managed_image_id: null,
       mode: "fixed",
       host_ids: [hostId],
       revision: "1",
@@ -390,6 +392,52 @@ describe("app editor — placement saves on its own", () => {
     expect(mocked.updateApp).not.toHaveBeenCalled();
     // The unsaved rename is still pending on the page's own Save.
     expect(screen.getByRole("button", { name: "Save changes" })).toBeEnabled();
+  });
+
+  it("reports preparation for the saved image, not an unsaved image edit", async () => {
+    const hostId = "aaaaaaaa-0000-0000-0000-000000000001";
+    mocked.listAllHosts.mockResolvedValue([{ id: hostId, node_name: "gpu-test" }] as never);
+    mocked.getAppPlacement.mockResolvedValue({
+      app_id: "app-1", inherited_from: null, managed_image_id: "img-1", mode: "all_eligible", host_ids: [], revision: "0",
+      hosts: [{ host_id: hostId, selected: true, prepared: false, ready: true, reason: "awaiting_preparation" }],
+    });
+    mocked.listImages.mockResolvedValue({
+      images: [{
+        id: "img-1", display_name: "Proton", kind: "prebuilt", version: "9.0",
+        registry_ref: "ghcr.io/quasar/proton:9.0", installed: true, installed_version: "9.0",
+        hosts: [{ host_id: hostId, state: "pulling" }],
+      }],
+    } as never);
+    renderEditor("/admin/library/apps/app-1/runtime");
+    fireEvent.change(await screen.findByLabelText("Image"), {
+      target: { value: "registry.example/unsaved:1" },
+    });
+    fireEvent.click(screen.getByRole("tab", { name: "Placement" }));
+    expect(await screen.findByText(/Downloading…/)).toBeInTheDocument();
+    expect(screen.queryByText(/not installed from the image catalog/)).toBeNull();
+  });
+
+  it("shows a derived tile the preparation of its parent's image", async () => {
+    const hostId = "aaaaaaaa-0000-0000-0000-000000000001";
+    mocked.getApp.mockImplementation(async (_t, id) =>
+      id === "parent-1"
+        ? { app: app({ id: "parent-1", name: "Steam" }) }
+        : { app: app({ id: "app-1", parent_app_id: "parent-1", runtime_spec: {}, runtime_preset_id: null }) },
+    );
+    mocked.listAllHosts.mockResolvedValue([{ id: hostId, node_name: "gpu-test" }] as never);
+    mocked.getAppPlacement.mockResolvedValue({
+      app_id: "parent-1", inherited_from: "parent-1", managed_image_id: "img-1", mode: "all_eligible", host_ids: [], revision: "0",
+      hosts: [{ host_id: hostId, selected: true, prepared: false, ready: true, reason: "awaiting_preparation" }],
+    });
+    mocked.listImages.mockResolvedValue({
+      images: [{
+        id: "img-1", display_name: "Proton", kind: "prebuilt", version: "9.0",
+        registry_ref: "ghcr.io/quasar/proton:9.0", installed: true, installed_version: "9.0",
+        hosts: [{ host_id: hostId, state: "failed", error: "no space left on device" }],
+      }],
+    } as never);
+    renderEditor("/admin/library/apps/app-1/placement");
+    expect(await screen.findByText(/no space left on device/)).toBeInTheDocument();
   });
 
   it("offers no Placement tab before the app exists", async () => {

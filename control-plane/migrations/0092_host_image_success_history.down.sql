@@ -1,0 +1,1 @@
+DROP TABLE host_image_success_history;

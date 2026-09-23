@@ -3805,6 +3805,54 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/admin/hosts/{id}/images/{image_id}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+                image_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry one failed selected managed-image preparation on an online host (RH05).
+         * @description Admin-only. Re-arms only a current selected non-lazy adopted image whose reported host state is failed at that adopted version (empty legacy version matches). Repeated concurrent requests return 202 merged into one pending host/image operation and one bounded budget. The 202 writes image.retry audit metadata and is process-local, not durable across a control-plane restart before dispatch. Acceptance is not proof of preparation; read image and placement views for progress. A current authenticated pulling/building state is not retryable. Once migration 0093 lands, removing fences refuse Retry and delayed dispatch rechecks the fence. Other images and active sessions are unaffected. Non-202 writes nothing. Failure reasons and exact safe messages are frozen in control-api.md RH05 #343.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                    image_id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Retry scheduled through the existing image Ensurer; no body. */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                409: components["responses"]["Conflict"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/admin/settings": {
         parameters: {
             query?: never;
@@ -8571,6 +8619,8 @@ export interface components {
             /** @description Fixed selection; empty is valid and allows no host. */
             host_ids: string[];
             revision: components["schemas"]["RH05Revision"];
+            /** @description RH05 #343. Catalog ID matched to the canonical app's effective image (runtime_spec.image, else linked preset image) using the immutable adopted registry ref or local tag; null for an unmanaged or image-free app. Independent of the catalog's current upstream digest and preparation status. */
+            managed_image_id: string | null;
             /** @description Selection, preparation and readiness are distinct per-host observations. */
             hosts: components["schemas"]["AppPlacementHost"][];
         };
@@ -8582,6 +8632,7 @@ export interface components {
             prepared: boolean | null;
             /** @description Null when readiness evidence is unknown. */
             ready: boolean | null;
+            /** @description Safe open code: unmanaged_image, no_image, on_demand, not_required, awaiting_preparation, preparing, preparation_failed, inventory_unknown, removing (after 0093); unknown future codes render generically. Prepared on an unselected host is observation only. */
             reason?: string | null;
         };
         AppPlacementPatch: {

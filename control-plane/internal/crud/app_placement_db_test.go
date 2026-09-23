@@ -3,8 +3,100 @@ package crud
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 )
+
+func TestPlacementReportsFrozenAdoptedImageAndSafePreparationReason(t *testing.T) {
+	pool := testDB(t)
+	srv, authSvc := newTestServer(t, pool)
+	ctx := context.Background()
+	admin := adminBearer(t, ctx, pool, authSvc, "placement-image@test.local", "placement-image")
+	oldRef := "registry.example.test/app@sha256:" + strings.Repeat("a", 64)
+	newRef := "registry.example.test/app@sha256:" + strings.Repeat("b", 64)
+	if _, err := pool.Exec(ctx, `INSERT INTO image_catalog(id,manifest_version,display_name,kind,version,registry_ref,registry_digest,raw)
+		VALUES('steam',1,'Steam','prebuilt','v2',$1,$1,'{}'::jsonb)`, newRef); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO installed_images(image_id,version,registry_ref,pinned,lazy)
+		VALUES('steam','v1',$1,true,false)`, oldRef); err != nil {
+		t.Fatal(err)
+	}
+	var preset, parent, tile, host string
+	if err := pool.QueryRow(ctx, `INSERT INTO runtime_presets(name,image) VALUES('frozen placement image',$1)
+		RETURNING id::text`, oldRef).Scan(&preset); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO apps(name,runtime_preset_id) VALUES('preset parent',$1::uuid)
+		RETURNING id::text`, preset).Scan(&parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO apps(name,parent_app_id,external_source,external_id)
+		VALUES('derived tile',$1::uuid,'steam','12') RETURNING id::text`, parent).Scan(&tile); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO hosts(node_name,status,capacity_detection)
+		VALUES('frozen-image-host','online','ok') RETURNING id::text`).Scan(&host); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO host_images(host_id,image_id,version,state,error)
+		VALUES($1::uuid,'steam','v1','failed','registry denied')`, host); err != nil {
+		t.Fatal(err)
+	}
+	read := func(id string) map[string]any {
+		t.Helper()
+		resp, body := getReq(t, srv.URL+"/v1/admin/apps/"+id+"/placement", admin)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("placement read %s = %d %+v", id, resp.StatusCode, body)
+		}
+		return body
+	}
+	for _, id := range []string{parent, tile} {
+		view := read(id)
+		if view["managed_image_id"] != "steam" {
+			t.Fatalf("pinned adopted image lost for %s: %+v", id, view)
+		}
+		row := view["hosts"].([]any)[0].(map[string]any)
+		if row["prepared"] != false || row["reason"] != "preparation_failed" {
+			t.Fatalf("failed image preparation status %+v", row)
+		}
+	}
+	// Launch's preset merge treats a non-string app image as absent. The
+	// preparation read must resolve the same preset-backed adopted image.
+	if _, err := pool.Exec(ctx, `UPDATE apps SET runtime_spec='{"image":42}'::jsonb WHERE id=$1::uuid`, parent); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{parent, tile} {
+		if view := read(id); view["managed_image_id"] != "steam" {
+			t.Fatalf("preset fallback diverged from launch for %s: %+v", id, view)
+		}
+	}
+	var custom string
+	if err := pool.QueryRow(ctx, `INSERT INTO apps(name,runtime_spec)
+		VALUES('custom shared',jsonb_build_object('image',$1::text)) RETURNING id::text`, oldRef).Scan(&custom); err != nil {
+		t.Fatal(err)
+	}
+	if view := read(custom); view["managed_image_id"] != "steam" {
+		t.Fatalf("custom adopted image lost: %+v", view)
+	}
+	var unmanaged string
+	if err := pool.QueryRow(ctx, `INSERT INTO apps(name,runtime_spec)
+		VALUES('unmanaged custom','{"image":"custom/private:v1"}'::jsonb) RETURNING id::text`).Scan(&unmanaged); err != nil {
+		t.Fatal(err)
+	}
+	view := read(unmanaged)
+	row := view["hosts"].([]any)[0].(map[string]any)
+	if view["managed_image_id"] != nil || row["prepared"] != nil || row["reason"] != "unmanaged_image" {
+		t.Fatalf("unmanaged image claimed preparation: %+v", view)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE apps SET enabled=false WHERE id=$1::uuid`, parent); err != nil {
+		t.Fatal(err)
+	}
+	view = read(tile)
+	if row := view["hosts"].([]any)[0].(map[string]any); row["reason"] != "not_required" {
+		t.Fatalf("disabled parent tile claimed preparation: %+v", row)
+	}
+}
 
 func TestAppPlacementParentTransitions(t *testing.T) {
 	pool := testDB(t)
@@ -166,5 +258,73 @@ func TestAppPlacementOperatorContract(t *testing.T) {
 	}
 	if resp, _ := patch(t, url, map[string]any{"expected_revision": "1", "mode": "fixed", "host_ids": []string{"00000000-0000-4000-8000-000000000099"}}, admin.Plaintext); resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("unknown host edit = %d", resp.StatusCode)
+	}
+}
+
+func TestPlacementPreparationRequiresCurrentConnectionInventory(t *testing.T) {
+	pool := testDB(t)
+	connected, observed, snapshot := false, false, false
+	srv, authSvc := newTestServer(t, pool, func(_, _ string) (bool, bool, bool) {
+		return connected, observed, snapshot
+	})
+	ctx := context.Background()
+	admin := adminBearer(t, ctx, pool, authSvc, "placement-inventory@test.local", "placement-inventory")
+	ref := "registry.example.test/prepared@sha256:" + strings.Repeat("c", 64)
+	if _, err := pool.Exec(ctx, `INSERT INTO image_catalog(id,manifest_version,display_name,kind,version,registry_ref,registry_digest,raw)
+      VALUES('prepared',1,'Prepared','prebuilt','v1',$1,$1,'{}'::jsonb)`, ref); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO installed_images(image_id,version,registry_ref,lazy)
+      VALUES('prepared','v1',$1,false)`, ref); err != nil {
+		t.Fatal(err)
+	}
+	var app, host string
+	if err := pool.QueryRow(ctx, `INSERT INTO apps(name,runtime_spec)
+      VALUES('prepared app',jsonb_build_object('image',$1::text)) RETURNING id::text`, ref).Scan(&app); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO hosts(node_name,status,capacity_detection)
+      VALUES('prepared host','online','ok') RETURNING id::text`).Scan(&host); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO host_images(host_id,image_id,version,state,error)
+      VALUES($1::uuid,'prepared','v1','ready','')`, host); err != nil {
+		t.Fatal(err)
+	}
+	read := func() map[string]any {
+		t.Helper()
+		resp, body := getReq(t, srv.URL+"/v1/admin/apps/"+app+"/placement", admin)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("placement read: %d %+v", resp.StatusCode, body)
+		}
+		return body["hosts"].([]any)[0].(map[string]any)
+	}
+	if row := read(); row["prepared"] != nil || row["reason"] != "inventory_unknown" {
+		t.Fatalf("offline stale ready looked prepared: %+v", row)
+	}
+	connected = true
+	if row := read(); row["prepared"] != nil || row["reason"] != "inventory_unknown" {
+		t.Fatalf("connected with no current evidence: %+v", row)
+	}
+	snapshot = true
+	if row := read(); row["prepared"] != false || row["reason"] != "awaiting_preparation" {
+		t.Fatalf("full inventory omitted image: %+v", row)
+	}
+	observed = true
+	if row := read(); row["prepared"] != true || row["reason"] != nil {
+		t.Fatalf("current authenticated ready report: %+v", row)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE host_images SET state='failed',error='pull rejected' WHERE host_id=$1::uuid AND image_id='prepared'`, host); err != nil {
+		t.Fatal(err)
+	}
+	connected, observed, snapshot = false, false, false
+	if row := read(); row["prepared"] != nil || row["reason"] != "preparation_failed" {
+		t.Fatalf("durable current-version failure lost Retry affordance after reconnect: %+v", row)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE apps SET enabled=false WHERE id=$1::uuid`, app); err != nil {
+		t.Fatal(err)
+	}
+	if row := read(); row["reason"] != "not_required" {
+		t.Fatalf("disabled app claimed requirement: %+v", row)
 	}
 }

@@ -30,8 +30,29 @@ type RegistryChecker interface {
 type Handler struct {
 	store    *store
 	registry RegistryChecker // nil until SetRegistry is called
-	auditor  interface {
+	// A committed app or placement edit nudges the existing image Ensurer. The
+	// callback is advisory; its periodic/reconnect scan reads durable policy.
+	reconcileImages func(context.Context) error
+	imageEvidence   func(hostID, imageID string) (connected, observed, snapshot bool)
+	auditor         interface {
 		Record(context.Context, string, string, string, string, map[string]any) error
+	}
+}
+
+func (h *Handler) SetImageReconciler(reconcile func(context.Context) error) {
+	h.reconcileImages = reconcile
+}
+
+func (h *Handler) SetImageEvidence(read func(hostID, imageID string) (connected, observed, snapshot bool)) {
+	h.imageEvidence = read
+}
+
+func (h *Handler) nudgeImages(ctx context.Context) {
+	if h.reconcileImages == nil {
+		return
+	}
+	if err := h.reconcileImages(ctx); err != nil {
+		slog.Warn("image requirement reconcile deferred", "err", err)
 	}
 }
 
@@ -639,6 +660,7 @@ func (h *Handler) handleCreateApp(w http.ResponseWriter, r *http.Request) {
 		app.LaunchableProfileIDs = allowList.ids
 	}
 
+	h.nudgeImages(r.Context())
 	httpx.WriteJSON(w, http.StatusCreated, map[string]any{"app": appToAdminResp(app)})
 }
 
@@ -902,6 +924,7 @@ func (h *Handler) handleUpdateApp(w http.ResponseWriter, r *http.Request) {
 		app.LaunchableProfileIDs = nil
 	}
 
+	h.nudgeImages(r.Context())
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"app": appToAdminResp(app)})
 }
 
@@ -1180,6 +1203,7 @@ func (h *Handler) handleDeleteApp(w http.ResponseWriter, r *http.Request) {
 	name, err := h.store.deleteApp(r.Context(), id, deleteDerived)
 	switch {
 	case err == nil:
+		h.nudgeImages(r.Context())
 		h.recordActivity(r, "app.delete", "app", id, map[string]any{
 			"name": name, "delete_derived": deleteDerived,
 		})
