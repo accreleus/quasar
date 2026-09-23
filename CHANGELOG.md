@@ -259,6 +259,9 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **GPU image validation recognizes accessible render nodes beyond `renderD128`.**
+  The contract now runs its GPU assertions on hosts whose usable DRM node has a
+  different number, while ignoring sysfs-only or inaccessible nodes.
 - **A host no longer stays in diagnostic mode after its startup cleanup succeeds (#269).**
   The resume was published on a `watch` channel with `Sender::send`, which discards the
   value outright when no receiver happens to exist at that instant — and every waiter is a
