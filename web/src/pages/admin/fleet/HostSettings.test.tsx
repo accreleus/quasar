@@ -154,7 +154,26 @@ describe("HostSettings", () => {
     renderPage();
     expect(await screen.findByText(/The legacy writer remains active/)).toBeTruthy();
     expect(screen.getByText("QUASAR_IDLE_TIMEOUT_SECS")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Save idle timeout" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save next-session settings" })).toBeNull();
+  });
+
+  it("hides every typed-owned key from the legacy editor, keeps restart-scope keys there", async () => {
+    const group = { desired_revision: "2", applied_revision: "2", desired_digest: null, scope: "next_session", status: "applied", fresh: true, observed_at: null, remedy: null, approval_preview: null };
+    vi.mocked(adminApi.getHostPolicy).mockResolvedValue({
+      revision: "2",
+      choices: { idle_timeout_secs: { source: "deployment" }, gop: { source: "explicit", value: 90 } },
+      resolved: { idle_timeout_secs: { value: 1800, source: "deployment", observed_at: null }, gop: { value: 90, source: "explicit", observed_at: null } },
+      groups: { idle_timeout_secs: group, gop: group },
+      image_preparation: { status: "unknown", observed_at: null, remedy: null },
+      readiness: { status: "unknown", observed_at: null, remedy: null },
+    } as never);
+    renderPage();
+    expect(await screen.findByRole("group", { name: "GOP length" })).toBeTruthy();
+    expect(screen.getByRole("group", { name: "Idle timeout" })).toBeTruthy();
+    expect(screen.queryByText("QUASAR_IDLE_TIMEOUT_SECS")).toBeNull();
+    expect(screen.queryByText("QUASAR_GOP")).toBeNull();
+    expect(screen.getByRole("combobox", { name: "encoder" })).toBeTruthy();
+    expect(screen.queryByRole("group", { name: "Encoder" })).toBeNull();
   });
 
   it("uses revisioned policy save for the first owned idle edit", async () => {
@@ -176,11 +195,11 @@ describe("HostSettings", () => {
     await waitFor(() => expect(adminApi.getHostPolicy).toHaveBeenCalled());
     expect(screen.queryByText("QUASAR_IDLE_TIMEOUT_SECS")).toBeNull();
     await act(async () => resolvePolicy(initial));
-    expect(await screen.findByRole("button", { name: "Save idle timeout" })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: "Save next-session settings" })).toBeTruthy();
     expect(screen.queryByText("QUASAR_IDLE_TIMEOUT_SECS")).toBeNull();
-    fireEvent.change(screen.getByLabelText("Source"), { target: { value: "explicit" } });
-    fireEvent.change(screen.getByLabelText("Seconds"), { target: { value: "900" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save idle timeout" }));
+    fireEvent.change(screen.getByLabelText("Idle timeout source"), { target: { value: "explicit" } });
+    fireEvent.change(screen.getByLabelText("Idle timeout value"), { target: { value: "900" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save next-session settings" }));
     await waitFor(() => expect(adminApi.updateHostPolicy).toHaveBeenCalledWith(
       "token", "host-1", "0", { idle_timeout_secs: { source: "explicit", value: 900 } },
     ));

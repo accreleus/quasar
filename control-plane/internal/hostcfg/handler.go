@@ -74,6 +74,7 @@ func (h *Handler) Register(mux httpx.Router, requireAuth func(http.Handler) http
 	mux.Handle("POST /v1/admin/hosts/{id}/restart", admin(http.HandlerFunc(h.handleRestart)))
 	mux.Handle("GET /v1/admin/hosts/{id}/policy", admin(http.HandlerFunc(h.handleGetPolicy)))
 	mux.Handle("PATCH /v1/admin/hosts/{id}/policy", admin(http.HandlerFunc(h.handlePatchPolicy)))
+	mux.Handle("POST /v1/admin/hosts/{id}/policy/retry", admin(http.HandlerFunc(h.handleRetryPolicy)))
 }
 
 func (h *Handler) handleGetPolicy(w http.ResponseWriter, r *http.Request) {
@@ -167,26 +168,105 @@ func (h *Handler) handlePatchPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, err.Error())
-		return
-	}
-	if target, ok := h.dispatcher.(interface {
-		PolicyIdentity(string) (string, string, bool)
-	}); ok {
-		if boot, connection, capable := target.PolicyIdentity(r.PathValue("id")); capable {
-			var snapshot *PolicySnapshot
-			if source, ok := h.dispatcher.(interface {
-				PolicyActiveSnapshot(string, string) *PolicySnapshot
-			}); ok {
-				snapshot = source.PolicyActiveSnapshot(r.PathValue("id"), connection)
-			}
-			offer, offerErr := h.store.NextSessionOffer(r.Context(), r.PathValue("id"), newPolicyAttemptID(), boot, connection, snapshot)
-			if offerErr == nil && offer != nil {
-				_ = h.dispatcher.Send(r.PathValue("id"), offer)
+		code := httpx.CodeValidationFailed
+		var invalid *PolicyValidationError
+		if errors.As(err, &invalid) {
+			code = invalid.Code
+			if code == "home_conflict" {
+				code = httpx.CodeValidationFailed
 			}
 		}
+		httpx.WriteError(w, http.StatusBadRequest, code, err.Error())
+		return
 	}
+	h.sendNextSessionOffers(r.Context(), r.PathValue("id"))
 	httpx.WriteJSON(w, http.StatusOK, h.policyViewForConnection(r.Context(), r.PathValue("id"), view))
+}
+
+// sendNextSessionOffers sends one offer per ready next-session group to the
+// current typed connection. Offers need that connection's complete active
+// snapshots; the durable obligation, not this send, carries the intent.
+func (h *Handler) sendNextSessionOffers(ctx context.Context, hostID string) {
+	target, ok := h.dispatcher.(interface {
+		PolicyIdentity(string) (string, string, bool)
+	})
+	if !ok {
+		return
+	}
+	boot, connection, capable := target.PolicyIdentity(hostID)
+	if !capable {
+		return
+	}
+	source, ok := h.dispatcher.(interface {
+		PolicyActiveSnapshots(string, string) map[string]PolicySnapshot
+	})
+	if !ok {
+		return
+	}
+	snapshots := source.PolicyActiveSnapshots(hostID, connection)
+	if len(snapshots) == 0 {
+		return
+	}
+	offers, err := h.store.NextSessionOfferBatch(ctx, hostID, boot, connection, snapshots, newPolicyAttemptID)
+	if err != nil {
+		slog.Warn("host policy offer load failed", "host_id", hostID, "err", err)
+		return
+	}
+	for _, offer := range offers {
+		_ = h.dispatcher.Send(hostID, offer)
+	}
+}
+
+// handleRetryPolicy re-arms one next-session group whose transient retry
+// budget is exhausted (control-api.md typed host policy, Retry). Every
+// non-200 response writes nothing.
+func (h *Handler) handleRetryPolicy(w http.ResponseWriter, r *http.Request) {
+	hostID := r.PathValue("id")
+	var req struct {
+		Group string `json:"group"`
+	}
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil || req.Group == "" {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid retry request: body must be {\"group\":\"<group>\"}")
+		return
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid retry request: body must be {\"group\":\"<group>\"}")
+		return
+	}
+	if !IsPolicyGroup(req.Group) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "group is not a catalog policy group")
+		return
+	}
+	err := h.store.RetryPolicyGroup(r.Context(), hostID, req.Group)
+	switch {
+	case errors.Is(err, ErrHostNotFound):
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "host not found")
+		return
+	case errors.Is(err, ErrPolicyApprovalRequired):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "A restart-scope group is never re-armed by Retry; it proceeds only through a fresh idle approval.")
+		return
+	case errors.Is(err, ErrPolicyNotRetryable):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "This group is not waiting for Retry. Only a group whose retry budget is exhausted can be retried; change the setting to replace a rejected value.")
+		return
+	case err != nil:
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not retry host policy group")
+		return
+	}
+	view, err := h.store.GetPolicy(r.Context(), hostID)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not load host policy")
+		return
+	}
+	if h.audit != nil {
+		if err := h.audit.Record(r.Context(), actorID(r), "host.policy.retry", "host", hostID, map[string]any{"group": req.Group}); err != nil {
+			slog.Warn("record admin activity failed", "action", "host.policy.retry", "err", err)
+		}
+	}
+	h.sendNextSessionOffers(r.Context(), hostID)
+	httpx.WriteJSON(w, http.StatusOK, h.policyViewForConnection(r.Context(), hostID, view))
 }
 
 func (h *Handler) handleCatalog(w http.ResponseWriter, _ *http.Request) {
@@ -321,9 +401,9 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 	policyTarget, typedTarget := h.dispatcher.(interface {
 		PolicyIdentity(string) (string, string, bool)
 	})
-	bootID, connectionID, typed := "", "", false
+	connectionID, typed := "", false
 	if typedTarget {
-		bootID, connectionID, typed = policyTarget.PolicyIdentity(hostID)
+		_, connectionID, typed = policyTarget.PolicyIdentity(hostID)
 	}
 	provisional := []string{}
 	mapReady := false
@@ -370,7 +450,14 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := h.store.SaveLegacyPatch(r.Context(), hostID, req.Overrides, adminUserID(r)); err != nil {
-		if errors.Is(err, ErrPolicyAttemptConflict) {
+		var invalid *PolicyValidationError
+		if errors.As(err, &invalid) {
+			code := invalid.Code
+			if code == "home_conflict" {
+				code = httpx.CodeValidationFailed
+			}
+			httpx.WriteError(w, http.StatusBadRequest, code, err.Error())
+		} else if errors.Is(err, ErrPolicyAttemptConflict) {
 			httpx.WriteError(w, http.StatusConflict, "attempt_conflict", "A host policy attempt or journal reconciliation is still in progress.")
 		} else {
 			httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not save host settings")
@@ -388,16 +475,7 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 	// overlays them on its env baseline — a cleared override reverts to env,
 	// not the catalog default.
 	if typed {
-		var snapshot *PolicySnapshot
-		if source, ok := h.dispatcher.(interface {
-			PolicyActiveSnapshot(string, string) *PolicySnapshot
-		}); ok {
-			snapshot = source.PolicyActiveSnapshot(hostID, connectionID)
-		}
-		offer, offerErr := h.store.NextSessionOffer(r.Context(), hostID, newPolicyAttemptID(), bootID, connectionID, snapshot)
-		if offerErr == nil && offer != nil {
-			_ = h.dispatcher.Send(hostID, offer)
-		}
+		h.sendNextSessionOffers(r.Context(), hostID)
 		if mapReady {
 			id := newPolicyAttemptID()
 			if settings, ok, err := h.store.PrepareLegacyDelivery(r.Context(), hostID, connectionID, id, provisional); err == nil && ok {

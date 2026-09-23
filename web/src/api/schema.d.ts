@@ -5130,6 +5130,68 @@ export interface paths {
         };
         trace?: never;
     };
+    "/v1/admin/hosts/{id}/policy/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Re-arm a next-session policy group whose transient retry budget is exhausted (RH05).
+         * @description Only a next-session group with status failed and a remedy whose code before the first colon is exactly retry_exhausted is retryable. The status check and budget reset are one transaction; concurrent requests cannot each reset the budget. It returns to pending at the current desired revision with a fresh bounded backoff budget. Retry grants no approval and proves no application. Invalid intent the host rejected (remedy code validation_failed) is never retried; change the setting instead. A restart-scope group is never re-armed by Retry, whatever its status; it proceeds only through a fresh scoped approval via POST /v1/admin/hosts/{id}/idle-apply. Every non-200 response writes nothing.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["HostPolicyRetryRequest"];
+                };
+            };
+            responses: {
+                /** @description Updated policy view; the group is pending again at the current desired revision. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostPolicy"];
+                    };
+                };
+                /** @description validation_failed: malformed body, or group is not a catalog policy group. No write. */
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                /** @description not_found: unknown host. No write. */
+                404: components["responses"]["NotFound"];
+                /** @description conflict: the group is not waiting for Retry. Its status is pending, applied, upgrade_required or uncertain; or it is failed with a remedy code other than retry_exhausted (validation_failed for rejected invalid intent); or it is a restart-scope group. No write. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/admin/hosts/{id}/readiness-overrides/{check_id}": {
         parameters: {
             query?: never;

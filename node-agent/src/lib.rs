@@ -44,6 +44,7 @@ pub mod nvidia_volume;
 /// dir): see the module doc.
 mod owned_entry;
 pub mod policy;
+pub mod policy_catalog;
 pub mod readiness;
 pub mod release;
 pub mod session;
