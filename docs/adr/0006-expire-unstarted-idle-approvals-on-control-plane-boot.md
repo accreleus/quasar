@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 date: 2026-09-23
 ---
 # Unstarted idle-apply approvals expire on every control-plane boot
@@ -17,7 +17,7 @@ admission remains protected during uncertainty.
 - Keep approval across restart with a separate durable restore fence. This
   preserves convenience but adds an external authority and a more complex
   backup protocol.
-- Expire on boot (proposed): the operator reapproves an unstarted disruptive
+- Expire on boot (accepted): the operator reapproves an unstarted disruptive
   action. This follows the owner's RH05 Q27 decision and avoids treating a
   restored database row as authorization.
 
@@ -27,4 +27,6 @@ Reconnection within one control-plane boot can preserve a still-matching
 approval. A delivered grant cannot be treated as revoked merely because its
 database row changed; the agent must confirm nonacceptance or reveal a started
 attempt. A restore under a running control plane is not a supported guarantee.
-The frozen wire/schema amendment and its prescribed review remain required.
+The frozen wire/schema amendment was owner-approved by explicit override of
+an Opus `CHANGES REQUIRED` verdict; that verdict is recorded in #334 rather
+than represented as reviewer sign-off.
