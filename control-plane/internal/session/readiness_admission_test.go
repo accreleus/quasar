@@ -518,6 +518,31 @@ func TestRegisterToCapacityWindowRefusesThenAdmits(t *testing.T) {
 	}
 }
 
+// A reported GPU cannot admit a launch until the settings map accepted on
+// this connection has been durably applied. This gate is independent of GPU
+// detection and applies to pinned launches as well as ordinary placement.
+func TestRH05SettingsDeliveryGateRefusesSessionLaunch(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	ctx := context.Background()
+	gate := "00000000-0000-4000-8000-000000000101"
+	must(t, pool.QueryRow(ctx, `UPDATE hosts SET config_policy_gate_connection=$2::uuid WHERE id=$1::uuid RETURNING id`, s.hostID, gate).Scan(new(string)))
+	if _, err := store.ScheduleAndCreate(ctx, launchParams(s)); !errors.Is(err, ErrNoHostAvailable) {
+		t.Fatalf("gated host accepted launch: %v", err)
+	}
+	pinned := launchParams(s)
+	pinned.PinHostID = s.hostID
+	if _, err := store.ScheduleAndCreate(ctx, pinned); !errors.Is(err, ErrNoHostAvailable) {
+		t.Fatalf("gated pinned host accepted launch: %v", err)
+	}
+	_, err := pool.Exec(ctx, `UPDATE hosts SET config_policy_gate_connection=NULL WHERE id=$1::uuid`, s.hostID)
+	must(t, err)
+	if _, err := store.ScheduleAndCreate(ctx, launchParams(s)); err != nil {
+		t.Fatalf("delivery acknowledgement should admit launch: %v", err)
+	}
+}
+
 // TestNoHostRejectionCarriesFleetCounts pins the diagnostic attached to a
 // no_host_available refusal (the same register window as
 // TestRegisterToCapacityWindowRefusesThenAdmits): still errors.Is-compatible

@@ -143,7 +143,7 @@ func (c candidacy) candidateQuery(policy PlacementPolicy) (string, []any) {
 		FROM gpus g
 		JOIN hosts h ON h.id = g.host_id
 		LEFT JOIN sessions s ON s.gpu_id = g.id AND s.state IN ` + activeStatesSQL + `
-		WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND g.reported` + unrestrictedHostSQL + schedulableBindingSQL + pin + image + gate + codec + `
+		WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported` + unrestrictedHostSQL + schedulableBindingSQL + pin + image + gate + codec + `
 		GROUP BY g.id
 		HAVING g.encode_slots_total - COALESCE(SUM(s.reserved_encode_slots), 0) >= $` + fmt.Sprint(slotsIdx) + vetoClause + `
 		ORDER BY ` + policyOrder + `
@@ -174,7 +174,7 @@ func (c candidacy) recheckQuery(gpuID string) (string, []any) {
 	codec := c.codecGate(a, "\n\t\t   AND ")
 
 	return `
-		SELECT h.status = 'online' AND h.capacity_detection = 'ok' AND g.reported` + unrestrictedHostSQL + `
+		SELECT h.status = 'online' AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported` + unrestrictedHostSQL + `
 		   AND g.encode_slots_total
 		         - COALESCE((SELECT SUM(x.reserved_encode_slots) FROM sessions x
 		                     WHERE x.gpu_id = g.id AND x.state IN ` + activeStatesSQL + `), 0) >= $` + fmt.Sprint(slotsIdx) + vetoClause + image + gate + codec + `
@@ -204,7 +204,7 @@ func (c candidacy) totalsQuery() (string, []any) {
 	return `
 		SELECT EXISTS (
 			SELECT 1 FROM gpus g JOIN hosts h ON h.id = g.host_id
-			WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND g.reported` + unrestrictedHostSQL + schedulableBindingSQL + pin + image + codec + `
+			WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported` + unrestrictedHostSQL + schedulableBindingSQL + pin + image + codec + `
 			  AND g.encode_slots_total >= $` + fmt.Sprint(slotsIdx) + `
 		)
 	`, a.args()
@@ -238,7 +238,7 @@ func (c candidacy) vetoDiagQuery() (string, []any) {
 		FROM gpus g
 		JOIN hosts h ON h.id = g.host_id
 		LEFT JOIN sessions s ON s.gpu_id = g.id AND s.state IN ` + activeStatesSQL + `
-		WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND g.reported` + unrestrictedHostSQL + schedulableBindingSQL + pin + image + gate + codec + `
+		WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported` + unrestrictedHostSQL + schedulableBindingSQL + pin + image + gate + codec + `
 		GROUP BY g.id
 		HAVING g.encode_slots_total - COALESCE(SUM(s.reserved_encode_slots), 0) >= $` + fmt.Sprint(slotsIdx) + `
 		ORDER BY g.id
@@ -274,7 +274,7 @@ func (c candidacy) readinessDiagQuery() (string, []any) {
 		FROM gpus g
 		JOIN hosts h ON h.id = g.host_id
 		LEFT JOIN sessions s ON s.gpu_id = g.id AND s.state IN ` + activeStatesSQL + `
-		WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND g.reported` + unrestrictedHostSQL + schedulableBindingSQL + pin + image + blocked + codec + `
+		WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported` + unrestrictedHostSQL + schedulableBindingSQL + pin + image + blocked + codec + `
 		GROUP BY g.id, h.readiness_block_host, h.readiness_block_homes
 		HAVING g.encode_slots_total - COALESCE(SUM(s.reserved_encode_slots), 0) >= $` + fmt.Sprint(slotsIdx) + vetoClause + `
 		ORDER BY g.id
@@ -300,7 +300,7 @@ func (c candidacy) readinessTotalsQuery() (string, []any) {
 	return `
 		SELECT EXISTS (
 			SELECT 1 FROM gpus g JOIN hosts h ON h.id = g.host_id
-			WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND g.reported` + unrestrictedHostSQL + schedulableBindingSQL + pin + image + gate + codec + `
+			WHERE h.status = 'online' AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported` + unrestrictedHostSQL + schedulableBindingSQL + pin + image + gate + codec + `
 			  AND g.encode_slots_total >= $` + fmt.Sprint(slotsIdx) + `
 		)
 	`, a.args()

@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/accreleus/quasar/control-plane/internal/hostcfg"
 	"github.com/gorilla/websocket"
 )
 
@@ -61,15 +63,76 @@ func NewRegistry(log *slog.Logger) *Registry {
 // conn is one live agent connection. A single writer goroutine drains out; all
 // sends enqueue onto it (gorilla allows only one concurrent writer).
 type conn struct {
-	hostID                string
-	terminalHomeCleanupV1 bool
-	ws                    *websocket.Conn
-	out                   chan []byte
-	done                  chan struct{}
+	hostID                    string
+	terminalHomeCleanupV1     bool
+	policyTyped               bool
+	policyAccepted            []string
+	policyAcknowledged        atomic.Bool
+	policyInitialMapApplied   atomic.Bool
+	policyInventoryDone       atomic.Bool
+	policyInventoryBlocked    atomic.Bool
+	policyInventoryUnknown    bool
+	policyAttemptOutstanding  atomic.Bool
+	policyInventoryID         string
+	policyInventorySnapshotID string
+	policyInventoryCursor     *string
+	policyInventoryHeader     []byte
+	policyActiveSnapshot      atomic.Pointer[hostcfg.PolicySnapshot]
+	policyOutstanding         map[string]ConfigPolicyStateMsg
+	policySequence            map[string]uint64
+	policySequenceContent     map[string][]byte
+	policyUncertain           bool
+	policyDeliveryID          string
+	policyDeliverySentAt      time.Time
+	bootIncarnation           string
+	connectionIncarnation     string
+	ws                        *websocket.Conn
+	out                       chan []byte
+	done                      chan struct{}
 
 	mu     sync.Mutex
 	closed bool
 	acks   map[string]chan AckResult
+}
+
+// SupportsTypedSettings describes the current authenticated connection only.
+// A reconnect with an older agent replaces the capability immediately.
+func (r *Registry) SupportsTypedSettings(hostID string) bool {
+	c, ok := r.get(hostID)
+	return ok && c.policyTyped
+}
+
+func (r *Registry) PolicyIdentity(hostID string) (string, string, bool) {
+	c, ok := r.get(hostID)
+	if !ok || !c.policyTyped {
+		return "", "", false
+	}
+	return c.bootIncarnation, c.connectionIncarnation, true
+}
+
+// PolicyActiveSnapshot returns only the authenticated current connection's
+// completed journal inventory snapshot.
+func (r *Registry) PolicyActiveSnapshot(hostID, connectionID string) *hostcfg.PolicySnapshot {
+	c, ok := r.get(hostID)
+	if !ok || !c.policyTyped || c.connectionIncarnation != connectionID || !c.policyInventoryDone.Load() || c.policyInventoryBlocked.Load() || c.policyAttemptOutstanding.Load() {
+		return nil
+	}
+	return c.policyActiveSnapshot.Load()
+}
+
+func (r *Registry) PolicyRestartConflict(hostID string) bool {
+	c, ok := r.get(hostID)
+	return ok && c.policyTyped && (!c.policyInventoryDone.Load() || c.policyInventoryBlocked.Load() || c.policyAttemptOutstanding.Load())
+}
+
+// PolicyLegacyDelivery exposes only current-connection writer ownership and
+// whether the initial full-map inventory handshake permits later maps.
+func (r *Registry) PolicyLegacyDelivery(hostID string) (string, []string, bool, bool) {
+	c, ok := r.get(hostID)
+	if !ok || !c.policyTyped {
+		return "", nil, false, false
+	}
+	return c.connectionIncarnation, append([]string(nil), c.policyAccepted...), c.policyAcknowledged.Load() && c.policyInventoryDone.Load() && !c.policyInventoryBlocked.Load(), true
 }
 
 func newConn(hostID string, ws *websocket.Conn) *conn {

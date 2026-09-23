@@ -173,7 +173,15 @@ detect_gpu() {
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
     printf 'nvidia'; return
   fi
-  if [ -e /dev/dri/renderD128 ]; then printf 'dri'; return; fi
+  # Render-node numbering is not stable across hosts. In particular, a host
+  # exposing only renderD129 still has a usable GPU. Check an accessible device
+  # node, not a sysfs entry that may be visible without device access.
+  local node
+  for node in /dev/dri/renderD*; do
+    if [ -c "$node" ] && [ -r "$node" ] && [ -w "$node" ]; then
+      printf 'dri'; return
+    fi
+  done
   printf 'none'
 }
 case "$GPU_MODE" in

@@ -2,6 +2,7 @@
 // RequireAdmin; hiding a call from a non-admin UI is not the access control.
 
 import { ApiError, apiFetch } from "./client";
+import type { components } from "./schema";
 import type {
   AdminAppsResponse,
   AdminApp,
@@ -698,6 +699,14 @@ export function getConfigCatalog(token: string): Promise<ConfigCatalogResponse> 
 
 export function getHostSettings(token: string, hostId: string): Promise<HostSettingsResponse> {
   return apiFetch<HostSettingsResponse>(`/admin/hosts/${hostId}/settings`, { token });
+}
+
+export type HostPolicyView = components["schemas"]["HostPolicy"];
+export function getHostPolicy(token: string, hostId: string): Promise<HostPolicyView> {
+  return apiFetch<HostPolicyView>(`/admin/hosts/${hostId}/policy`, { token });
+}
+export function updateHostPolicy(token: string, hostId: string, expectedRevision: string, changes: Record<string, components["schemas"]["HostPolicyChoice"]>): Promise<HostPolicyView> {
+  return apiFetch<HostPolicyView>(`/admin/hosts/${hostId}/policy`, { token, method: "PATCH", body: { expected_revision: expectedRevision, changes } });
 }
 
 /** A null value clears that key back to the catalog default. 409

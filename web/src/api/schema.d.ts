@@ -5054,7 +5054,7 @@ export interface paths {
         head?: never;
         /**
          * Update per-host overrides (body is {overrides, restart_confirm} — 'settings' is ignored).
-         * @description RH05 legacy compatibility exception: this revisionless write serializes under the host settings row and increments the same policy revision. A non-null value chooses explicit; null chooses deployment, even if the prior source was automatic. Relevant unstarted approval is superseded. For an RH05-capable agent a valid disruptive edit returns 200 with restart_triggered:false regardless of live sessions; restart_confirm is accepted but does not approve or start an RH05 restart. The typed group remains pending and pending_restart remains false until an approved restart actually begins. For an older agent the previous restart_required guard and restart_confirm immediate-restart behavior remain; its effective-settings map is not RH05 application proof.
+         * @description RH05 legacy compatibility exception: this revisionless write serializes under the host settings row and increments the same policy revision. A non-null value chooses explicit; null chooses deployment, even if the prior source was automatic. Relevant unstarted approval is superseded. A typed-owned group (current provisional or confirmed echo, or durable ever-owned set while online; confirmed echo or ever-owned set while offline) returns 200 with restart_triggered:false for disruptive edits; restart_confirm cannot approve RH05 idle apply. A never-owned group retains the legacy restart_required guard and restart_confirm immediate-restart behavior. An open or uncertain RH05 attempt of either scope blocks an unowned restart edit. The effective-settings map is not RH05 application proof.
          */
         patch: {
             parameters: {
@@ -5084,13 +5084,106 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description Old agents only: restart_required when a restart-class knob changed with live sessions and restart_confirm != true (body carries live_sessions). RH05-capable agents save the edit with 200 instead. */
+                /** @description restart_required for a never-owned restart-class key with live sessions and no confirmation, or attempt_conflict while an RH05 attempt/reconciliation gate blocks legacy restart. Typed-owned keys save without immediate restart. */
                 409: {
                     headers: {
                         [name: string]: unknown;
                     };
                     content: {
                         "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        trace?: never;
+    };
+    "/v1/admin/hosts/{id}/policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        /** Read typed host configuration policy and independent evidence views (RH05). */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Policy view. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostPolicy"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Atomically edit typed policy choices by expected revision (RH05).
+         * @description Validates the whole edit before persistence. A successful edit commits choices, a monotone revision and reconciliation obligation in one transaction; offline intent is saved as pending. A stale edit does not write and returns the current view and changed keys. A relevant edit supersedes an unstarted idle approval. A group without confirmed typed ownership returns upgrade_required without writing anything.
+         */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["HostPolicyPatch"];
+                };
+            };
+            responses: {
+                /** @description Saved policy view. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostPolicy"];
+                    };
+                };
+                /** @description validation_failed or unsupported_source. */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description stale_revision with current view and changed keys, or upgrade_required with no write. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostPolicyConflict"] | components["schemas"]["ErrorEnvelope"];
                     };
                 };
             };
@@ -5185,7 +5278,7 @@ export interface paths {
         put?: never;
         /**
          * Restart the host's agent without changing overrides (host-observability-2).
-         * @description Retains its 200/409 live-session confirm guard on old and RH05-capable agents. An RH05-capable agent restarts only the last verified active configuration; it never activates an unapproved pending candidate. A pending policy group remains pending. pending_restart reflects an actual restart in flight and clears on verified reconnect.
+         * @description Retains its 200/409 live-session confirm guard on old and RH05-capable agents. An RH05-capable agent restarts only the last verified or durably seeded active configuration; it never activates an unapproved pending candidate. A pending policy group remains pending. pending_restart reflects an actual restart in flight and clears on verified reconnect. A started nonterminal or uncertain RH05 attempt of either scope, or incomplete journal reconciliation (0087 gate before 0089, then the 0089 row), refuses the restart with attempt_conflict.
          */
         post: {
             parameters: {
@@ -5214,7 +5307,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description restart_required (live sessions, confirm != true — body carries live_sessions) or conflict (host offline). */
+                /** @description restart_required (live sessions, confirm != true), conflict (host offline), or attempt_conflict (open/uncertain RH05 attempt or incomplete journal reconciliation). */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -7979,7 +8072,7 @@ export interface components {
             overrides: {
                 [key: string]: unknown;
             };
-            /** @description Old agents: required to apply a restart-class knob while live sessions exist. RH05 agents accept this field for compatibility but it grants no idle-apply approval and triggers no restart. */
+            /** @description For never-owned restart-class keys, permits legacy restart with live sessions. For typed-owned groups it is accepted for compatibility but grants no idle-apply approval or immediate restart. */
             restart_confirm?: boolean;
         };
         /** @description Canonical nonnegative decimal string; no sign, whitespace or leading zeros. */
@@ -8007,7 +8100,8 @@ export interface components {
         HostPolicyGroup: {
             desired_revision: components["schemas"]["RH05Revision"];
             applied_revision: components["schemas"]["RH05Revision"] | null;
-            desired_digest: components["schemas"]["RH05Digest"];
+            /** @description Null while an offline or baseline-unavailable deployment choice has not resolved to a candidate. */
+            desired_digest: components["schemas"]["RH05Digest"] | null;
             applied_digest?: components["schemas"]["RH05Digest"] | null;
             /** @enum {string} */
             scope: "next_session" | "restart";
@@ -8017,7 +8111,7 @@ export interface components {
             fresh: boolean;
             /** Format: date-time */
             observed_at?: string | null;
-            /** @description Actionable reason when pending */
+            /** @description Actionable reason when pending, failed, upgrade required or uncertain; baseline_unavailable names missing current-connection deployment evidence. */
             remedy: string | null;
             /** Format: date-time */
             next_retry_at?: string | null;
