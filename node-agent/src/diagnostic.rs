@@ -722,9 +722,41 @@ where
             tokio::time::sleep(Duration::from_millis(250)).await;
             std::process::exit(0);
         }
+        ControlMsg::ConfigPolicyOffer {
+            attempt_id,
+            host_id,
+            boot_incarnation,
+            connection_incarnation,
+            group,
+            revision,
+            content_sha256,
+            scope,
+            ..
+        } => {
+            crate::agent::send(
+                sink,
+                &AgentMsg::ConfigPolicyState {
+                    attempt_id,
+                    host_id,
+                    group,
+                    revision,
+                    content_sha256,
+                    scope,
+                    grant_boot_incarnation: boot_incarnation,
+                    grant_connection_incarnation: connection_incarnation,
+                    journal_sequence: "0".into(),
+                    phase: "failed".into(),
+                    active_scope: None,
+                    evidence: None,
+                    error: Some("diagnostic_mode".into()),
+                },
+            )
+            .await?;
+        }
         // No ack, and nothing to apply while every launch is refused.
         ControlMsg::Registered { .. }
         | ControlMsg::ConfigUpdate { .. }
+        | ControlMsg::ConfigPolicyJournalInventoryRequest { .. }
         | ControlMsg::Signaling { .. }
         | ControlMsg::Error { .. }
         | ControlMsg::Unknown => {

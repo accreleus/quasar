@@ -43,6 +43,7 @@ pub mod nvidia_volume;
 /// Shared owner-marked runtime-dir entry mechanics (udev export, media probe
 /// dir): see the module doc.
 mod owned_entry;
+pub mod policy;
 pub mod readiness;
 pub mod release;
 pub mod session;

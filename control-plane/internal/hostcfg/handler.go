@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"sort"
 
 	"github.com/accreleus/quasar/control-plane/internal/auth"
@@ -31,8 +32,9 @@ type LiveSessionCounter interface {
 // `config_update`). Defined locally to avoid an import cycle; only the JSON
 // shape is load-bearing since Dispatcher.Send marshals it.
 type configUpdateCmd struct {
-	Type     string         `json:"type"` // "config_update"
-	Settings map[string]any `json:"settings"`
+	Type               string         `json:"type"` // "config_update"
+	Settings           map[string]any `json:"settings"`
+	SettingsDeliveryID string         `json:"settings_delivery_id,omitempty"`
 }
 
 // restartCmd mirrors agentws.RestartCmd on the wire (agent-api.md `restart`).
@@ -70,6 +72,121 @@ func (h *Handler) Register(mux httpx.Router, requireAuth func(http.Handler) http
 	mux.Handle("GET /v1/admin/hosts/{id}/settings", admin(http.HandlerFunc(h.handleGet)))
 	mux.Handle("PATCH /v1/admin/hosts/{id}/settings", admin(http.HandlerFunc(h.handlePatch)))
 	mux.Handle("POST /v1/admin/hosts/{id}/restart", admin(http.HandlerFunc(h.handleRestart)))
+	mux.Handle("GET /v1/admin/hosts/{id}/policy", admin(http.HandlerFunc(h.handleGetPolicy)))
+	mux.Handle("PATCH /v1/admin/hosts/{id}/policy", admin(http.HandlerFunc(h.handlePatchPolicy)))
+}
+
+func (h *Handler) handleGetPolicy(w http.ResponseWriter, r *http.Request) {
+	view, err := h.store.GetPolicy(r.Context(), r.PathValue("id"))
+	if errors.Is(err, ErrHostNotFound) {
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "host not found")
+		return
+	}
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not load host policy")
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, h.policyViewForConnection(r.Context(), r.PathValue("id"), view))
+}
+
+func (h *Handler) policyViewForConnection(ctx context.Context, hostID string, view PolicyView) PolicyView {
+	connected, hasConnection := h.dispatcher.(interface{ IsConnected(string) bool })
+	typed, hasCapability := h.dispatcher.(interface{ SupportsTypedSettings(string) bool })
+	identity, hasIdentity := h.dispatcher.(interface {
+		PolicyIdentity(string) (string, string, bool)
+	})
+	if hasIdentity {
+		_, connection, current := identity.PolicyIdentity(hostID)
+		if current {
+			if baseline, err := h.store.DeploymentSettingsForConnection(ctx, hostID, connection); err == nil && baseline != nil {
+				for key, choice := range view.Choices {
+					if choice.Source != "deployment" {
+						continue
+					}
+					if value, ok := baseline[key]; ok {
+						view.Resolved[key] = map[string]any{"value": value, "source": "deployment", "observed_at": nil, "evidence_id": connection}
+					}
+				}
+			}
+			for key, group := range view.Groups {
+				group.Fresh = group.Status == "applied" && group.EvidenceConnection != nil && *group.EvidenceConnection == connection
+				view.Groups[key] = group
+			}
+		}
+	}
+	if hasConnection && hasCapability && connected.IsConnected(hostID) && !typed.SupportsTypedSettings(hostID) {
+		for key, group := range view.Groups {
+			if group.Status == "pending" {
+				group.Status = "upgrade_required"
+				reason := "This agent cannot verify RH05 policy; upgrade the agent to apply this choice."
+				group.Remedy = &reason
+				view.Groups[key] = group
+			}
+		}
+	}
+	return view
+}
+
+func (h *Handler) handlePatchPolicy(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ExpectedRevision string                  `json:"expected_revision"`
+		Changes          map[string]PolicyChoice `json:"changes"`
+	}
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid policy edit")
+		return
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid policy edit")
+		return
+	}
+	view, err := h.store.SavePolicy(r.Context(), r.PathValue("id"), req.ExpectedRevision, req.Changes, adminUserID(r))
+	if errors.Is(err, ErrHostNotFound) {
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "host not found")
+		return
+	}
+	if errors.Is(err, ErrStaleRevision) {
+		current, loadErr := h.store.GetPolicy(r.Context(), r.PathValue("id"))
+		if loadErr != nil {
+			httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not load current policy")
+			return
+		}
+		changed, changeErr := h.store.ChangedPolicyKeysSince(r.Context(), r.PathValue("id"), req.ExpectedRevision)
+		if changeErr != nil {
+			httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not load changed policy keys")
+			return
+		}
+		httpx.WriteJSON(w, http.StatusConflict, map[string]any{"error": map[string]any{"code": "stale_revision", "message": "policy changed since this view"}, "current": h.policyViewForConnection(r.Context(), r.PathValue("id"), current), "changed_keys": changed})
+		return
+	}
+	if errors.Is(err, ErrUpgradeRequired) {
+		httpx.WriteError(w, http.StatusConflict, "upgrade_required", "The agent has not confirmed typed ownership of this setting group.")
+		return
+	}
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, err.Error())
+		return
+	}
+	if target, ok := h.dispatcher.(interface {
+		PolicyIdentity(string) (string, string, bool)
+	}); ok {
+		if boot, connection, capable := target.PolicyIdentity(r.PathValue("id")); capable {
+			var snapshot *PolicySnapshot
+			if source, ok := h.dispatcher.(interface {
+				PolicyActiveSnapshot(string, string) *PolicySnapshot
+			}); ok {
+				snapshot = source.PolicyActiveSnapshot(r.PathValue("id"), connection)
+			}
+			offer, offerErr := h.store.NextSessionOffer(r.Context(), r.PathValue("id"), newPolicyAttemptID(), boot, connection, snapshot)
+			if offerErr == nil && offer != nil {
+				_ = h.dispatcher.Send(r.PathValue("id"), offer)
+			}
+		}
+	}
+	httpx.WriteJSON(w, http.StatusOK, h.policyViewForConnection(r.Context(), r.PathValue("id"), view))
 }
 
 func (h *Handler) handleCatalog(w http.ResponseWriter, _ *http.Request) {
@@ -201,7 +318,47 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	d := decide(old, req, h.counter.LiveSessions(hostID))
-	if d.blocked {
+	policyTarget, typedTarget := h.dispatcher.(interface {
+		PolicyIdentity(string) (string, string, bool)
+	})
+	bootID, connectionID, typed := "", "", false
+	if typedTarget {
+		bootID, connectionID, typed = policyTarget.PolicyIdentity(hostID)
+	}
+	provisional := []string{}
+	mapReady := false
+	if delivery, ok := h.dispatcher.(interface {
+		PolicyLegacyDelivery(string) (string, []string, bool, bool)
+	}); ok {
+		if conn, groups, ready, v2 := delivery.PolicyLegacyDelivery(hostID); v2 && conn == connectionID {
+			provisional, mapReady = groups, ready
+		}
+	}
+	owned, err := h.store.PolicyOwnedGroups(r.Context(), hostID, provisional)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not load setting ownership")
+		return
+	}
+	legacyRestart := false
+	for key := range req.Overrides {
+		knob := byKey()[key]
+		group, _ := policyGroup(key)
+		if knob.Class == ClassRestart && !owned[group] && !reflect.DeepEqual(old[key], d.merged[key]) {
+			legacyRestart = true
+		}
+	}
+	if legacyRestart {
+		blocked, err := h.policyRestartConflict(r.Context(), hostID)
+		if err != nil {
+			httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not check policy attempts")
+			return
+		}
+		if blocked {
+			httpx.WriteError(w, http.StatusConflict, "attempt_conflict", "A host policy attempt or journal reconciliation is still in progress.")
+			return
+		}
+	}
+	if d.blocked && legacyRestart {
 		writeConflictBody(w, d.liveSessions)
 		return
 	}
@@ -212,19 +369,50 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.Upsert(r.Context(), hostID, d.merged, adminUserID(r)); err != nil {
-		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not save host settings")
+	if _, err := h.store.SaveLegacyPatch(r.Context(), hostID, req.Overrides, adminUserID(r)); err != nil {
+		if errors.Is(err, ErrPolicyAttemptConflict) {
+			httpx.WriteError(w, http.StatusConflict, "attempt_conflict", "A host policy attempt or journal reconciliation is still in progress.")
+		} else {
+			httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not save host settings")
+		}
 		return
 	}
+	d.merged, err = h.store.Get(r.Context(), hostID)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not load saved host settings")
+		return
+	}
+	resolved = Resolve(d.merged)
 
 	// #194: send the sparse overrides, not the resolved map, so the agent
 	// overlays them on its env baseline — a cleared override reverts to env,
 	// not the catalog default.
-	_ = h.dispatcher.Send(hostID, configUpdateCmd{Type: "config_update", Settings: AgentOverrides(d.merged)})
+	if typed {
+		var snapshot *PolicySnapshot
+		if source, ok := h.dispatcher.(interface {
+			PolicyActiveSnapshot(string, string) *PolicySnapshot
+		}); ok {
+			snapshot = source.PolicyActiveSnapshot(hostID, connectionID)
+		}
+		offer, offerErr := h.store.NextSessionOffer(r.Context(), hostID, newPolicyAttemptID(), bootID, connectionID, snapshot)
+		if offerErr == nil && offer != nil {
+			_ = h.dispatcher.Send(hostID, offer)
+		}
+		if mapReady {
+			id := newPolicyAttemptID()
+			if settings, ok, err := h.store.PrepareLegacyDelivery(r.Context(), hostID, connectionID, id, provisional); err == nil && ok {
+				_ = h.dispatcher.Send(hostID, configUpdateCmd{Type: "config_update", Settings: settings, SettingsDeliveryID: id})
+			}
+		}
+	} else {
+		if settings, err := h.store.LegacyOwnedOverrides(r.Context(), hostID, nil); err == nil {
+			_ = h.dispatcher.Send(hostID, configUpdateCmd{Type: "config_update", Settings: settings})
+		}
+	}
 	// Send before marking pending_restart: if the agent dropped since the
 	// online-check, Send fails and pending_restart must not stick true with no
 	// restart in flight. The overrides above stay persisted either way.
-	if d.needsRestart {
+	if legacyRestart && (!typed || mapReady) {
 		if err := h.dispatcher.Send(hostID, restartCmd{Type: "restart", ID: "settings-change"}); err != nil {
 			slog.Warn("restart dispatch failed; not marking pending_restart", "host_id", hostID, "err", err)
 			httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "settings saved but the host agent is unreachable; restart not sent")
@@ -241,7 +429,7 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 			keys = append(keys, key)
 		}
 		sort.Strings(keys)
-		if err := h.audit.Record(r.Context(), actorID(r), "host.settings.update", "host", hostID, map[string]any{"keys": keys, "restart_triggered": d.needsRestart}); err != nil {
+		if err := h.audit.Record(r.Context(), actorID(r), "host.settings.update", "host", hostID, map[string]any{"keys": keys, "restart_triggered": legacyRestart && (!typed || mapReady)}); err != nil {
 			slog.Warn("record admin activity failed", "action", "host.settings.update", "err", err)
 		}
 	}
@@ -259,7 +447,7 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 		"resolved":          resolved,
 		"overrides":         d.merged,
 		"effective":         effective,
-		"restart_triggered": d.needsRestart,
+		"restart_triggered": legacyRestart && (!typed || mapReady),
 	})
 }
 
@@ -299,6 +487,15 @@ func (h *Handler) handleRestart(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "host is offline; agent not connected")
 		return
 	}
+	blocked, err := h.policyRestartConflict(r.Context(), hostID)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not check policy attempts")
+		return
+	}
+	if blocked {
+		httpx.WriteError(w, http.StatusConflict, "attempt_conflict", "A host policy attempt or journal reconciliation is still in progress.")
+		return
+	}
 
 	liveSessions := h.counter.LiveSessions(hostID)
 	if liveSessionRestartBlocked(liveSessions, req.Confirm) {
@@ -323,6 +520,17 @@ func (h *Handler) handleRestart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"restart_triggered": true})
+}
+
+func (h *Handler) policyRestartConflict(ctx context.Context, hostID string) (bool, error) {
+	blocked, err := h.store.PolicyRestartConflict(ctx, hostID)
+	if err != nil || blocked {
+		return blocked, err
+	}
+	if target, ok := h.dispatcher.(interface{ PolicyRestartConflict(string) bool }); ok {
+		return target.PolicyRestartConflict(hostID), nil
+	}
+	return false, nil
 }
 
 // writeConflictBody writes HTTP 409 with the restart_required error shape

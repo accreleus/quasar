@@ -13,6 +13,7 @@
 // under each knob's control — see KnobRow.tsx.
 
 import { useParams } from "react-router-dom";
+import { useCallback, useState } from "react";
 import type { ConfigKnob } from "../../../api/types";
 import { Breadcrumbs } from "../../../components/Breadcrumbs";
 import { shortId } from "../../../lib/format/shortId";
@@ -24,11 +25,18 @@ import { KnobRow } from "./settings/KnobRow";
 import { RestartNote } from "./settings/RestartNote";
 import { SettingsRail } from "./settings/SettingsRail";
 import { useHostSettings } from "./settings/useHostSettings";
+import { IdleTimeoutPolicy } from "./settings/IdleTimeoutPolicy";
 import type { SettingValue } from "./settings/knobs";
 
 export function HostSettings() {
   const { id } = useParams();
   const s = useHostSettings(id);
+  // Resolve writer ownership before exposing either editor. An owned first
+  // edit must use the policy endpoint's expected revision even before a group
+  // row exists; the legacy editor has no client CAS token.
+  const [idleOwnership, setIdleOwnership] = useState<{ hostId: string | undefined; available: boolean } | null>(null);
+  const typedIdleAvailable = idleOwnership?.hostId === id ? idleOwnership?.available : null;
+  const onTypedIdleAvailable = useCallback((available: boolean) => setIdleOwnership({ hostId: id, available }), [id]);
 
   const renderKnob = (k: ConfigKnob) => {
     const v = s.valueOf(k);
@@ -64,7 +72,7 @@ export function HostSettings() {
       />
       <PageHeader
         title="Host settings"
-        sub={`Runtime configuration for ${s.host ? s.host.node_name : "this host"}. Unset values fall back to the instance default.`}
+        sub={`Runtime configuration for ${s.host ? s.host.node_name : "this host"}. Unset values use the host's deployment setting.`}
         actions={
           <>
             <Button variant="ghost" disabled={s.loading || s.saving || !s.dirty} onClick={s.discard}>
@@ -101,8 +109,9 @@ export function HostSettings() {
 
           <div className="split" style={{ marginTop: "var(--s4)", gridTemplateColumns: "minmax(0,1fr) 300px" }}>
             <div>
-              <KnobPanel title="Runtime defaults" hint="Applies to new sessions immediately.">
-                {s.grouped.runtime.map(renderKnob)}
+              <IdleTimeoutPolicy hostId={id} onAvailable={onTypedIdleAvailable} />
+              <KnobPanel title="Runtime defaults" hint="Changes affect new sessions after the host applies them.">
+                {s.grouped.runtime.filter((knob) => typedIdleAvailable === false || knob.key !== "idle_timeout_secs").map(renderKnob)}
               </KnobPanel>
 
               <KnobPanel

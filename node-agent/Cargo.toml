@@ -94,6 +94,7 @@ base64 = "0.23"
 # signature to verify, so the sha256 of exactly what was fetched is recorded in
 # the volume's manifest. Pure Rust, no C toolchain.
 sha2 = "0.11"
+time = { version = "0.3", features = ["parsing", "formatting"] }
 
 # Console-mode local audio: enable the `IEC958 Playback Switch` ALSA mixer
 # control before starting the local-audio pipeline. HDA codec state (incl.
