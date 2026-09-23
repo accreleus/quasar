@@ -24,6 +24,34 @@ func reviewedIdleApply(p *ApprovalPreview) ApprovalReview {
 		ExpiresAt: time.Now().UTC().Add(time.Hour)}
 }
 
+func TestIdlePreviewUsesWholeGroupAfterPartialHardwareEdit(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	confirmPolicyGroups(t, pool, hostID, "hardware")
+	ctx := context.Background()
+	if _, err := store.SavePolicy(ctx, hostID, "0", map[string]PolicyChoice{
+		"encoder":     {Source: "explicit", Value: "vulkan"},
+		"render_node": {Source: "explicit", Value: "/dev/dri/renderD129"},
+		"cuda_device": {Source: "explicit", Value: float64(0)},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartRH05Boot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	completeEmptyHostJournal(t, store, hostID)
+	if _, err := store.SavePolicy(ctx, hostID, "1", map[string]PolicyChoice{
+		"render_node": {Source: "explicit", Value: "/dev/dri/renderD999"},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := store.PreviewIdleApply(ctx, hostID, "hardware")
+	if err != nil || preview == nil || !preview.Available || preview.Revision != "2" {
+		t.Fatalf("partial group edit lost the reviewable candidate: %+v %v", preview, err)
+	}
+}
+
 func TestIdleApprovalUsesOneConnectionForLockedReview(t *testing.T) {
 	pool := testPool(t)
 	store := NewStore(pool)

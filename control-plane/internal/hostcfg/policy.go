@@ -447,13 +447,20 @@ func (s *Store) savePolicy(ctx context.Context, hostID, expected string, changes
 	if _, err := tx.Exec(ctx, `INSERT INTO host_settings(host_id,overrides,updated_by,updated_at) VALUES($1::uuid,$2,$3,now()) ON CONFLICT(host_id) DO UPDATE SET overrides=excluded.overrides,updated_by=excluded.updated_by,updated_at=now()`, hostID, encoded, updatedBy); err != nil {
 		return empty, err
 	}
+	// The desired digest covers the entire persisted group, including keys
+	// retained from earlier revisions. A one-key edit must still describe the
+	// same candidate that the approval preview will reconstruct.
+	allChoices, err := loadPolicyChoices(ctx, tx, hostID)
+	if err != nil {
+		return empty, err
+	}
 	for group, scope := range groups {
 		// A deployment candidate has no digest until current-connection baseline
 		// evidence resolves it. Non-owned groups retain intent for later upgrade
 		// but cannot claim typed execution through the legacy writer.
 		settings := map[string]PolicyChoice{}
 		resolvedSettings := map[string]any{}
-		for key, choice := range changes {
+		for key, choice := range allChoices {
 			selected, _ := policyGroup(key)
 			if selected == group {
 				settings[key] = choice
