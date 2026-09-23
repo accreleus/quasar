@@ -170,7 +170,7 @@ fn indeterminate_is_reported_as_unknown() {
 }
 
 #[test]
-fn an_inconclusive_probe_keeps_the_last_definitive_result_and_its_observation_time() {
+fn an_indeterminate_probe_keeps_the_last_definitive_result_and_its_observation_time() {
     let target = gpu(ProbeKind::Media, 0);
     let mut report = ReadinessReport::default();
     record(

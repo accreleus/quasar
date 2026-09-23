@@ -113,6 +113,14 @@ own; the two do not move together, and that is deliberate.
   `DOCKER_HOST` instead.
 
 ### Changed
+- **Readiness follow-ups from the storage and runtime checks (#266).** The outcome that could
+  not be concluded is now the glossary's `Indeterminate` (was `Inconclusive`) in both the
+  storage write test and the runtime facts — a rename only; both still warn. The engine API
+  floor lives once, in `crate::runtime::API_FLOOR`, which discovery enforces and the
+  `runtime_api_version` wording renders from, so the two cannot quote different numbers (the
+  floor itself is unchanged). The `media_reachability` remediation now says what this host's
+  firewall must accept inbound instead of claiming what is reachable from a client device —
+  the check id, its commands, the port range and the README pointer are unchanged.
 - **Bench evidence is part of the agent workflow, and the bench tooling finds its server the
   way `qbench` does.** `make bench-check` runs `qbench check` as the landing gate for a
   streaming-path change (0 clean, 3 regressed blocks, 4 nothing comparable is not a pass) and

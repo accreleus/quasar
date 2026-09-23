@@ -1922,11 +1922,12 @@ fn firewall_remediation(env: &ProbeEnv, tool: FirewallTool, distro: Distro) -> S
     };
 
     let lead = format!(
-        "Two things must be reachable, inbound to this host, from client devices on your \
+        "This host's firewall must accept two things inbound, from client devices on your \
          LAN/VPN subnet — never from `0.0.0.0/0`: UDP {port_range} (the node agent's WebRTC \
          media port range — ICE and RTP both ride on it{range_note}) and UDP/5353 (mDNS — \
-         Chrome sends `.local` hostnames as ICE candidates, and without mDNS reachable there is \
-         no fallback). Full writeup: deploy/README.md §\"Host firewall blocking WebRTC media\"."
+         Chrome sends `.local` hostnames as ICE candidates, and the agent has no fallback when \
+         this host drops them). Full writeup: deploy/README.md §\"Host firewall blocking WebRTC \
+         media\"."
     );
 
     let command = match tool {
@@ -4511,7 +4512,8 @@ table ip raw {
     }
 
     /// #254: every arm describes the host's own inbound firewall posture and none claims a
-    /// browser can reach the host — the host cannot know that.
+    /// browser can reach the host — the host cannot know that. Summary AND remediation
+    /// (#266): the fix text an operator acts on is as much a claim as the verdict.
     #[test]
     fn media_reachability_wording_is_host_local_in_every_arm() {
         let root = FakeRoot::new("firewall-wording");
@@ -4530,6 +4532,14 @@ table ip raw {
             FirewallPosture::Filtering {
                 tool: FirewallTool::Nftables,
                 detail: "nftables input policy=drop".to_string(),
+                media_allow: MediaAllow::Partial {
+                    evidence: "udp dport 5353 accept".to_string(),
+                    gap: "no rule covers UDP 32768-60999".to_string(),
+                },
+            },
+            FirewallPosture::Filtering {
+                tool: FirewallTool::Nftables,
+                detail: "nftables input policy=drop".to_string(),
                 media_allow: MediaAllow::Covered {
                     evidence: "udp dport 32768-60999 accept".to_string(),
                 },
@@ -4537,17 +4547,21 @@ table ip raw {
         ];
         for posture in postures {
             let c = check_media_reachability(&root.env_firewall(posture.clone()), Distro::Fedora);
-            let text = c.summary.to_lowercase();
-            assert!(
-                text.contains("this host's") || text.contains("the host itself"),
-                "{posture:?}: {}",
-                c.summary
-            );
-            assert!(
-                !text.contains("reachab") && !text.contains("browser can"),
-                "{posture:?} must not imply browser reachability: {}",
-                c.summary
-            );
+            // A pass/skip arm carries no remediation, so an empty one is nothing to judge.
+            for (field, raw) in [("summary", &c.summary), ("remediation", &c.remediation)] {
+                if raw.is_empty() {
+                    continue;
+                }
+                let text = raw.to_lowercase();
+                assert!(
+                    text.contains("this host's") || text.contains("the host itself"),
+                    "{posture:?} {field}: {raw}"
+                );
+                assert!(
+                    !text.contains("reachab") && !text.contains("browser can"),
+                    "{posture:?} {field} must not imply browser reachability: {raw}"
+                );
+            }
         }
     }
 

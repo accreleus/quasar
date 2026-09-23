@@ -277,12 +277,9 @@ pub(super) async fn discover(config: &RuntimeConfig) -> Result<(Docker, EngineIn
     let reported = docker.version().await.map_err(classify)?;
     let min = version(reported.min_api_version.as_deref())?;
     let max = version(reported.api_version.as_deref())?;
-    // This slice uses the v1.40 discovery/inspection contract. Higher capability
-    // floors must be established by the caller migrations that need them.
-    let floor = ApiVersion {
-        major: 1,
-        minor: 40,
-    };
+    // This slice uses the discovery/inspection contract at the module's API floor,
+    // which is also what the readiness wording quotes (#266).
+    let floor = super::API_FLOOR;
     let ceiling = ApiVersion {
         major: bollard::API_DEFAULT_VERSION.major_version,
         minor: bollard::API_DEFAULT_VERSION.minor_version,
