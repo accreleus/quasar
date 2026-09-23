@@ -4,15 +4,15 @@
 //! GPU injection (device request + driver volume) is untouched: CDI is reported, not used.
 
 use crate::messages::{ReadinessBlocks, ReadinessCheck};
-use crate::runtime::{EngineFacts, ErrorKind, RuntimeError};
+// `API_FLOOR` is owned by the runtime module, which is the code that enforces it; the
+// checks below only render it (#266), so the wording cannot drift from what discovery
+// refuses.
+use crate::runtime::{EngineFacts, ErrorKind, RuntimeError, API_FLOOR};
 
 pub const ENDPOINT_ID: &str = "runtime_endpoint";
 pub const API_VERSION_ID: &str = "runtime_api_version";
 pub const CAPABILITIES_ID: &str = "runtime_capabilities";
 pub const CDI_ID: &str = "runtime_cdi";
-
-/// The lowest engine API this agent speaks (docker.rs discovery floor).
-pub const API_FLOOR: &str = "1.40";
 
 /// The `Unreachable` detail for [`ErrorKind::Timeout`]. A missing socket uses a
 /// different sentence, so `host_container_mounts` can tell "the client ran out of
@@ -36,7 +36,7 @@ pub enum RuntimeFault {
     Unconfigured(String),
     /// The runtime client could not ask this refresh (busy, cancelled) or the reply made no
     /// sense; the verdict warns and the next refresh tries again.
-    Inconclusive(String),
+    Indeterminate(String),
 }
 
 impl From<RuntimeError> for RuntimeFault {
@@ -58,9 +58,9 @@ impl From<RuntimeError> for RuntimeFault {
                     .into(),
             ),
             ErrorKind::Busy | ErrorKind::Cancelled => {
-                RuntimeFault::Inconclusive("the runtime client was busy this refresh".into())
+                RuntimeFault::Indeterminate("the runtime client was busy this refresh".into())
             }
-            _ => RuntimeFault::Inconclusive(error.to_string()),
+            _ => RuntimeFault::Indeterminate(error.to_string()),
         }
     }
 }
@@ -191,7 +191,7 @@ fn check_runtime_endpoint_inner(view: &RuntimeView) -> ReadinessCheck {
              the agent speaks to one explicit Unix endpoint (docs/configuration.md)."
                 .into(),
         ),
-        Err(RuntimeFault::Inconclusive(reason)) => super::warn_check(
+        Err(RuntimeFault::Indeterminate(reason)) => super::warn_check(
             ENDPOINT_ID,
             format!(
                 "the container runtime at {endpoint} could not be inspected this refresh: {reason}"

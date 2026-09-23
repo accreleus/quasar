@@ -6,7 +6,7 @@
 //! The write test mirrors the launch path: the agent (root) creates a home leaf under the
 //! homes root, the leaf is handed to the app identity (`QUASAR_APP_PUID`/`PGID`), and the
 //! app identity writes into it. It never opens an existing entry: the leaf name is unique
-//! and created with `create_dir` (EEXIST is inconclusive, never a reuse), and the leaf is
+//! and created with `create_dir` (EEXIST is indeterminate, never a reuse), and the leaf is
 //! removed on every exit path, including a failure part-way.
 
 use std::path::{Path, PathBuf};
@@ -170,7 +170,7 @@ pub enum WriteOutcome {
     Exhausted { stage: WriteStage, reason: String },
     /// Could not be concluded (any other error, or the identity could not be assumed);
     /// the verdict warns with the reason.
-    Inconclusive { stage: WriteStage, reason: String },
+    Indeterminate { stage: WriteStage, reason: String },
 }
 
 /// Classifies an I/O error by its OS errno. `reason` is `error.to_string()` — it carries
@@ -184,7 +184,7 @@ fn classify_io_error(error: &std::io::Error, stage: WriteStage) -> WriteOutcome 
         Some(libc::ENOSPC) | Some(libc::EDQUOT) => WriteOutcome::Exhausted { stage, reason },
         // Includes ENOTDIR/EEXIST/EIO and no-errno cases: none of them are a definitive
         // permission or space verdict.
-        _ => WriteOutcome::Inconclusive { stage, reason },
+        _ => WriteOutcome::Indeterminate { stage, reason },
     }
 }
 
@@ -248,7 +248,7 @@ fn assume_identity(guard: &mut CleanupGuard, identity: WriteIdentity) -> Result<
         return Ok(());
     }
     if euid != 0 {
-        return Err(WriteOutcome::Inconclusive {
+        return Err(WriteOutcome::Indeterminate {
             stage: WriteStage::AssumeIdentity,
             reason: format!("the agent runs as uid {euid} and cannot write as uid {uid}"),
         });
@@ -260,7 +260,7 @@ fn assume_identity(guard: &mut CleanupGuard, identity: WriteIdentity) -> Result<
     // SAFETY: same as above; called again purely to read back the previous (now current) fsuid.
     let check = unsafe { libc::setfsuid(uid) } as u32;
     if check != uid {
-        return Err(WriteOutcome::Inconclusive {
+        return Err(WriteOutcome::Indeterminate {
             stage: WriteStage::AssumeIdentity,
             reason: format!("could not assume uid {uid}"),
         });
@@ -286,7 +286,7 @@ fn write_probe_on_thread(
         std::process::id()
     ));
 
-    // Never create_dir_all, never reuse an existing path: EEXIST must stay inconclusive.
+    // Never create_dir_all, never reuse an existing path: EEXIST must stay indeterminate.
     if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&leaf) {
         return classify_io_error(&e, WriteStage::CreateLeaf);
     }
@@ -295,7 +295,7 @@ fn write_probe_on_thread(
 
     let result: Result<WriteIdentity, WriteOutcome> = (|| {
         if let WriteIdentity::App { uid, gid } = identity {
-            chown(&leaf, Some(uid), Some(gid)).map_err(|e| WriteOutcome::Inconclusive {
+            chown(&leaf, Some(uid), Some(gid)).map_err(|e| WriteOutcome::Indeterminate {
                 stage: WriteStage::AssignOwner,
                 reason: e.to_string(),
             })?;
@@ -318,7 +318,7 @@ fn write_probe_on_thread(
             Err(outcome) => outcome,
         },
         // Residue must be visible, never silent: cleanup failure wins over any other outcome.
-        Err(reason) => WriteOutcome::Inconclusive {
+        Err(reason) => WriteOutcome::Indeterminate {
             stage: WriteStage::Cleanup,
             reason,
         },
@@ -342,7 +342,7 @@ pub fn write_probe(
         scope
             .spawn(move || write_probe_on_thread(&root, identity, payload))
             .join()
-            .unwrap_or_else(|_| WriteOutcome::Inconclusive {
+            .unwrap_or_else(|_| WriteOutcome::Indeterminate {
                 stage: WriteStage::WriteFile,
                 reason: "the write test thread panicked".to_string(),
             })
@@ -444,7 +444,7 @@ fn check_homes_root_writable_inner(view: &StorageView, identity: WriteIdentity) 
                 "Free space on the filesystem holding {path} (remove unused homes with the homes GC or move QUASAR_HOME_ROOT to a larger filesystem)."
             ),
         ),
-        WriteOutcome::Inconclusive { stage, reason } => super::warn_check(
+        WriteOutcome::Indeterminate { stage, reason } => super::warn_check(
             HOMES_WRITABLE_ID,
             format!("the write test under {path} could not be concluded ({}): {reason}", stage_words(stage)),
             format!("Check the filesystem holding {path} and the agent's logs; the test runs again on the next refresh."),
