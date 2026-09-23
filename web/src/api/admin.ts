@@ -6,6 +6,8 @@ import type { components } from "./schema";
 import type {
   AdminAppsResponse,
   AdminApp,
+  AppPlacement,
+  AppPlacementPatch,
   CreateAppRequest,
   UpdateAppRequest,
   HostsResponse,
@@ -310,6 +312,34 @@ export function updateApp(
 // ── Entitlements (steam-library-discovery spec §6.6, Phase 2) ────────────────
 
 /** 'all' rows first. */
+/** RH05 #342. A derived tile's id answers with its parent's placement. */
+export function getAppPlacement(token: string, appId: string): Promise<AppPlacement> {
+  return apiFetch<AppPlacement>(`/admin/apps/${appId}/placement`, { token });
+}
+
+/** Replaces the whole selection at `expected_revision`. `409 stale_revision`
+ *  when another edit landed first; `409 inherited_placement` on a derived tile.
+ *  The 409's `current` body is not surfaced by ApiError, so callers re-read. */
+export function updateAppPlacement(
+  token: string,
+  appId: string,
+  body: AppPlacementPatch,
+): Promise<AppPlacement> {
+  return apiFetch<AppPlacement>(`/admin/apps/${appId}/placement`, { token, method: "PATCH", body });
+}
+
+/** Every host, following `next_cursor`: the placement read carries host ids only. */
+export async function listAllHosts(token: string): Promise<Host[]> {
+  const items: Host[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await listHosts(token, cursor);
+    items.push(...page.items);
+    cursor = page.next_cursor ?? undefined;
+  } while (cursor);
+  return items;
+}
+
 export function listAppEntitlements(token: string, appId: string): Promise<EntitlementsResponse> {
   return apiFetch<EntitlementsResponse>(`/admin/apps/${appId}/entitlements`, { token });
 }
