@@ -6,7 +6,7 @@
       "id": "legacy_clear_preserves_agent_detection",
       "seam": "operator",
       "given": [{"host": "h1", "agent": "rh05", "encoder_env": null, "detected_encoder": "nvenc", "choice": {"encoder": {"source": "explicit", "value": "va"}}}],
-      "when": [{"legacy_patch": {"overrides": {"encoder": null}}}, {"report_verified_next_start": "nvenc"}],
+      "when": [{"legacy_patch": {"overrides": {"encoder": null}}}, {"approve_idle_apply": "encoder"}, {"report_verified_post_restart": "nvenc"}],
       "expect": [{"setting_source": {"encoder": "deployment"}}, {"setting_applied_value": {"encoder": "nvenc"}}]
     },
     {
