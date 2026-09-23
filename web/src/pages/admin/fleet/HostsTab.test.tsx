@@ -37,6 +37,7 @@ function host(over: Partial<Host> = {}): Host {
     id: "c2059601",
     node_name: "quasar-node-1",
     status: "online",
+    admission_restrictions: [],
     agent_version: "0.1.0",
     cpu_cores: 16,
     cpu_model: "AMD Ryzen 9 9950X3D",
@@ -357,13 +358,28 @@ describe("HostsTab — the row menu", () => {
     await waitFor(() => expect(reload).toHaveBeenCalled());
   });
 
-  it("offers resume scheduling instead of drain once the host is draining", async () => {
-    setFleet([host({ status: "draining" })]);
+  it("releases an operator drain without claiming every scheduling hold is gone", async () => {
+    setFleet([host({ status: "draining", admission_restrictions: [{
+      owner_kind: "manual", reason: "manual_drain", created_at: "2026-08-29T11:00:00Z",
+    }] })]);
     renderTab();
     await openMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: "Resume scheduling" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Release operator drain" }));
 
     await waitFor(() => expect(mocked.uncordonHost).toHaveBeenCalledWith("tok", "c2059601"));
+  });
+
+  it("explains a platform hold and offers only to add an operator drain", async () => {
+    setFleet([host({ status: "draining", admission_restrictions: [{
+      owner_kind: "platform", reason: "platform_apply", created_at: "2026-08-29T11:00:00Z",
+    }] })]);
+    renderTab();
+    await openMenu();
+    expect(screen.queryByRole("menuitem", { name: /Resume scheduling|Release operator drain/ })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Add operator drain" }));
+    await waitFor(() => expect(mocked.drainHost).toHaveBeenCalledWith("tok", "c2059601"));
+    fireEvent.click(screen.getByRole("button", { name: "Show capacity and storage for quasar-node-1" }));
+    expect(screen.getByText("Platform apply")).toBeTruthy();
   });
 
   it("reports a failed drain in the row's own drawer", async () => {

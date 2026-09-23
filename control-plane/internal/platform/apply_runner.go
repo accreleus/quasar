@@ -58,6 +58,7 @@ type applyStore interface {
 	CreateAutoRevertAttempt(ctx context.Context, in NewAutoRevert) (Attempt, error)
 	OpenHostAttempt(ctx context.Context, hostID string) (Attempt, string, error)
 	OpenAttempts(ctx context.Context) ([]Attempt, error)
+	TerminalStandaloneAttemptsWithOwnedHolds(ctx context.Context) ([]Attempt, error)
 	Release(ctx context.Context, id string) (Release, error)
 }
 
@@ -79,6 +80,10 @@ type Ack struct {
 // ApplyDeps are the machine's effects. Function fields as in Deps:
 // internal/session sits above this package.
 type ApplyDeps struct {
+	// Owned callbacks are the RH05 path. They acquire/release this attempt's
+	// restriction even when another owner already has the host draining.
+	AcquireOwned func(ctx context.Context, attemptID, hostID string) error
+	ReleaseOwned func(ctx context.Context, attemptID, hostID string) error
 	// Cordon takes the host out of scheduling (the existing drain, force=false:
 	// this never stops a session).
 	Cordon func(ctx context.Context, hostID string) error
@@ -144,6 +149,22 @@ func NewRunner(store applyStore, deps ApplyDeps, log *slog.Logger) *Runner {
 // its deadline from started_at. An orphaned open attempt would block its target
 // forever through the single-flight index.
 func (r *Runner) Adopt(ctx context.Context) {
+	if r.deps.ReleaseOwned != nil {
+		stranded, err := r.store.TerminalStandaloneAttemptsWithOwnedHolds(ctx)
+		if err != nil {
+			r.log.Error("could not find terminal platform holds awaiting release", "err", err)
+		} else {
+			for _, a := range stranded {
+				if a.HostID == nil {
+					continue
+				}
+				if err := r.deps.ReleaseOwned(ctx, a.ID, *a.HostID); err != nil {
+					r.log.Warn("terminal platform hold remains for next boot retry",
+						"attempt_id", a.ID, "host_id", *a.HostID, "err", err)
+				}
+			}
+		}
+	}
 	open, err := r.store.OpenAttempts(ctx)
 	if err != nil {
 		r.log.Error("could not re-adopt in-flight applies", "err", err)
@@ -236,7 +257,16 @@ func (r *Runner) drive(ctx context.Context, a Attempt) {
 	// restore — leaving a host nobody cordoned out of scheduling (#170, the same
 	// conflation as the fleet run's).
 	wasCordoned := status == "draining"
-	if !wasCordoned {
+	if r.deps.AcquireOwned != nil {
+		ownerID := a.ID
+		if a.RunID != nil {
+			ownerID = *a.RunID
+		}
+		if err := r.deps.AcquireOwned(dctx, ownerID, hostID); err != nil {
+			r.fail(a.ID, ReasonUpdaterUnreachable, "")
+			return
+		}
+	} else if !wasCordoned {
 		if err := r.deps.Cordon(dctx, hostID); err != nil {
 			// A host that cannot be cordoned cannot be drained, and applying
 			// without draining is the thing this whole path exists to avoid.
@@ -255,7 +285,7 @@ func (r *Runner) drive(ctx context.Context, a Attempt) {
 	// an admin's and re-applied it milliseconds after the run had lifted it
 	// (#140).
 	if a.RunID == nil {
-		defer r.restoreCordon(hostID, wasCordoned)
+		defer r.restoreCordon(a.ID, hostID, wasCordoned)
 	}
 
 	// A re-adopted attempt that was already sent skips straight to watching:
@@ -472,9 +502,22 @@ func (r *Runner) fail(attemptID, reason, output string) {
 // restoreCordon puts the host's scheduling status back to what this apply
 // found. Runs on every terminal path, including a failed one: a host left
 // draining by a failed apply would silently drop out of scheduling.
-func (r *Runner) restoreCordon(hostID string, wasCordoned bool) {
+func (r *Runner) restoreCordon(attemptID, hostID string, wasCordoned bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	if r.deps.ReleaseOwned != nil {
+		// A control-plane restart cancels this goroutine while the durable
+		// attempt stays open. Keep its admission protection for Adopt.
+		attempt, err := r.store.Attempt(ctx, attemptID)
+		if err != nil || !TerminalAttemptState(attempt.State) {
+			r.log.Info("apply: retaining admission restriction for open attempt", "attempt_id", attemptID, "host_id", hostID, "err", err)
+			return
+		}
+		if err := r.deps.ReleaseOwned(ctx, attemptID, hostID); err != nil {
+			r.log.Warn("apply: could not release own admission restriction", "attempt_id", attemptID, "host_id", hostID, "err", err)
+		}
+		return
+	}
 	if wasCordoned {
 		// An admin's cordon is restored, not lifted. The new agent's register
 		// keeps a draining row draining (#140), so this is usually a no-op —

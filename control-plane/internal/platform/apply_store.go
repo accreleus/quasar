@@ -229,6 +229,18 @@ func (s *Store) OpenAttempts(ctx context.Context) ([]Attempt, error) {
 		ORDER BY a.created_at DESC, a.id DESC`)
 }
 
+// TerminalStandaloneAttemptsWithOwnedHolds finds cleanup stranded after a
+// terminal write but before its deferred owner release. The restriction row is
+// the durable retry marker; fleet attempts have their separate run restore.
+func (s *Store) TerminalStandaloneAttemptsWithOwnedHolds(ctx context.Context) ([]Attempt, error) {
+	return s.queryAttempts(ctx, `
+		SELECT `+attemptColumns+attemptFrom+`
+		JOIN host_admission_restrictions ar ON ar.host_id=a.host_id
+			AND ar.owner_kind='platform' AND ar.owner_id=a.id
+		WHERE a.run_id IS NULL AND a.target='host' AND a.state IN `+terminalStatesSQL+`
+		ORDER BY a.created_at,a.id`)
+}
+
 // ActiveRunExists reports whether a fleet run owns the fleet right now, which
 // is the `409 run_active` refusal. This build creates no run; the read is here
 // so a standalone apply is refused the moment #117 can create one.

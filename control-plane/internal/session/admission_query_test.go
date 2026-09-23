@@ -20,6 +20,10 @@ var wsRun = regexp.MustCompile(`\s+`)
 // the statement reads in a log — while a changed `$N` is a behaviour change.
 func normSQL(s string) string { return strings.TrimSpace(wsRun.ReplaceAllString(s, " ")) }
 
+func withoutRH05Restriction(s string) string {
+	return normSQL(strings.ReplaceAll(s, normSQL(unrestrictedHostSQL), ""))
+}
+
 // admissionMatrix renders every admission query across the full configuration
 // space, keyed by shape. Each entry is the normalized SQL.
 func admissionMatrix() map[string][]string {
@@ -164,7 +168,15 @@ func TestAdmissionSQLMatchesPreRefactor(t *testing.T) {
 	for shape, sqls := range generated {
 		index[shape] = map[string]bool{}
 		for _, s := range sqls {
-			index[shape][s] = true
+			if !strings.Contains(s, normSQL(unrestrictedHostSQL)) {
+				t.Fatalf("%s query omitted the RH05 owner restriction", shape)
+			}
+			if !strings.Contains(s, "h.config_policy_gate_connection IS NULL") {
+				t.Fatalf("%s query omitted the RH05 settings delivery gate", shape)
+			}
+			// The captured statements predate RH05. Compare every other token
+			// while separately requiring the new restriction above.
+			index[shape][withoutRH05Restriction(s)] = true
 		}
 	}
 
