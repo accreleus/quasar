@@ -51,6 +51,12 @@ func (c *Coordinator) AgentState(ctx context.Context, hostID string, m agentws.S
 		c.log.Warn("ignoring session state from non-owner host", "session_id", m.SessionID)
 		return
 	}
+	// A terminal row may still have a held home awaiting cleanup proof. That
+	// proof was handled above; replaying the lifecycle transition would repeat
+	// audit, console and home-usage side effects for an already-ended session.
+	if hs.State.IsTerminal() {
+		return
+	}
 
 	// A swap in flight rides within `running` via state_detail, so it must be
 	// handled before the generic transition, which treats running→running as a

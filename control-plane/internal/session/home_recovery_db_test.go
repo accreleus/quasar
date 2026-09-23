@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
+	"github.com/accreleus/quasar/control-plane/internal/audit"
 )
 
 type homeRecoveryEpoch struct{ commands []agentws.SessionStopCmd }
@@ -44,7 +45,7 @@ func TestHeldHomeRecoveryRetriesAfterSyntheticReapUntilQualifiedTerminal(t *test
 			t.Errorf("clear test hold: %v", cleanupErr)
 		}
 	})
-	coord := newTestCoordinator(t, store, newFakeDispatcher(true), testLogger())
+	coord := newTestCoordinator(t, store, newFakeDispatcher(true), testLogger(), WithAuditor(audit.NewStore(pool)))
 	epoch := &homeRecoveryEpoch{}
 	coord.ReconcilePendingHomes(ctx, s.hostID, epoch)
 	if len(epoch.commands) != 0 {
@@ -58,7 +59,7 @@ func TestHeldHomeRecoveryRetriesAfterSyntheticReapUntilQualifiedTerminal(t *test
 		t.Fatalf("terminal held session retries = %+v", epoch.commands)
 	}
 	coord.AgentState(ctx, s.hostID, agentws.SessionStateMsg{
-		SessionID: sess.ID, State: "stopped", HomeCleanupQualified: true,
+		SessionID: sess.ID, State: "failed", HomeCleanupQualified: true,
 	})
 	coord.ReconcilePendingHomes(ctx, s.hostID, epoch)
 	if len(epoch.commands) != 2 {
@@ -68,5 +69,14 @@ func TestHeldHomeRecoveryRetriesAfterSyntheticReapUntilQualifiedTerminal(t *test
 	must(t, err)
 	if got.State != StateFailed {
 		t.Fatalf("late cleanup changed public session state: %s", got.State)
+	}
+	var failureAudits int
+	for _, row := range sessionAuditRows(t, pool) {
+		if row.Action == "session.failed" && row.Target == sess.ID {
+			failureAudits++
+		}
+	}
+	if failureAudits != 0 {
+		t.Fatalf("late cleanup emitted %d session.failed audit rows", failureAudits)
 	}
 }
