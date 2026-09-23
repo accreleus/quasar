@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -13,6 +14,9 @@ import (
 // Store is the host_settings data-access layer.
 type Store struct {
 	pool *pgxpool.Pool
+	// policyErrors holds the last agent rejection code per host/group for the
+	// typed remedy. Display-only: durable retry state lives in the obligation.
+	policyErrors sync.Map
 }
 
 func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }

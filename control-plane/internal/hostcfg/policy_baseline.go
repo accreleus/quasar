@@ -98,7 +98,7 @@ func (s *Store) ObserveDeploymentSettings(ctx context.Context, hostID, connectio
 }
 
 func digestJSON(value any) (string, error) {
-	b, err := json.Marshal(value)
+	b, err := canonicalJSON(value)
 	if err != nil {
 		return "", err
 	}
