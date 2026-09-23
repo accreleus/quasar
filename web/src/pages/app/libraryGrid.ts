@@ -226,6 +226,13 @@ export function presentLaunchError<T extends HomeApp & { name: string }>(
       body: `Launch ${rootName} once on a host to set up your library, then try again.`,
     };
   }
+  if (code === "home_conflict") {
+    return {
+      variant: "danger",
+      title: `${rootName} needs storage repair`,
+      body: "Ask an operator to resolve the saved home location before launching again.",
+    };
+  }
   if (code === "capacity_unavailable") {
     return {
       variant: "danger",

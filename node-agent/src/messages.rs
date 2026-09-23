@@ -91,6 +91,8 @@ pub enum AgentMsg {
         config_policy_versions: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         config_policy_groups: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        terminal_home_cleanup_v1: Option<bool>,
     },
     ConfigPolicyState {
         attempt_id: String,
@@ -1843,6 +1845,7 @@ mod tests {
             source_policy_versions: None,
             config_policy_versions: None,
             config_policy_groups: None,
+            terminal_home_cleanup_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Enrollment {
@@ -1867,6 +1870,7 @@ mod tests {
             source_policy_versions: None,
             config_policy_versions: None,
             config_policy_groups: None,
+            terminal_home_cleanup_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {
@@ -1895,6 +1899,7 @@ mod tests {
             source_policy_versions: None,
             config_policy_versions: None,
             config_policy_groups: None,
+            terminal_home_cleanup_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {
@@ -1923,6 +1928,7 @@ mod tests {
             source_policy_versions: None,
             config_policy_versions: None,
             config_policy_groups: None,
+            terminal_home_cleanup_v1: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {

@@ -599,7 +599,7 @@ func (c *Coordinator) launchCertCell(
 	}
 	sessionID := sess.ID
 
-	go c.dispatchAssignStart(sess, nil)
+	go c.dispatchAssignStart(sess, nil, nil)
 
 	if !c.waitForRunning(ctx, sessionID, benchRunToRunningTimeout) {
 		c.teardownCertSession(sessionID)

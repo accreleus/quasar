@@ -10,12 +10,111 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+func TestDeleteUserHeldHomeRefusesWithoutTombstone(t *testing.T) {
+	pool := testDB(t)
+	svc := testService(t, pool)
+	ctx := context.Background()
+	u, err := svc.Register(ctx, "held-delete@test.invalid", "held-delete", "quasar held home passphrase")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := seedAppRow(t, pool, t.Name()+"-app")
+	h := seedHostRow(t, pool, t.Name()+"-host")
+	homeID := seedHomeRow(t, pool, u.ID, a, h)
+	_, err = pool.Exec(ctx, `INSERT INTO managed_home_claims
+		(user_id,canonical_app_id,host_id,state,pending_home_session_id,pending_home_token,pending_home_started_at)
+		VALUES ($1::uuid,$2::uuid,$3::uuid,'reserved',$4::uuid,$5::uuid,now())`,
+		u.ID, a, h, "00000000-0000-4000-8000-000000000071", "00000000-0000-4000-8000-000000000072")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, cleanupErr := pool.Exec(context.Background(), `UPDATE managed_home_claims SET
+			pending_home_session_id=NULL,pending_home_token=NULL,pending_home_started_at=NULL
+			WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, u.ID, a)
+		if cleanupErr != nil {
+			t.Errorf("clear test hold: %v", cleanupErr)
+		}
+	})
+	_, err = svc.DeleteUser(ctx, u.ID)
+	if !errors.Is(err, ErrHomeCleanupPending) {
+		t.Fatalf("held user delete = %v", err)
+	}
+	var count int
+	var tombstoned bool
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE id=$1::uuid`, u.ID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatal("held user was deleted")
+	}
+	if err := pool.QueryRow(ctx, `SELECT gc_after IS NOT NULL FROM user_homes WHERE id=$1::uuid`, homeID).Scan(&tombstoned); err != nil {
+		t.Fatal(err)
+	}
+	if tombstoned {
+		t.Fatal("refused deletion partially tombstoned home")
+	}
+}
+
+func TestEphemeralReaperSkipsHeldUserAndContinuesBatch(t *testing.T) {
+	pool := testDB(t)
+	svc := testService(t, pool)
+	ctx := context.Background()
+	var heldUser, freeUser string
+	if err := pool.QueryRow(ctx, `INSERT INTO users (email,username,password_hash,ephemeral_expires_at)
+		VALUES ('held-ephemeral@test.invalid','held-ephemeral','x',now()-interval '1 hour') RETURNING id::text`).Scan(&heldUser); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO users (email,username,password_hash,ephemeral_expires_at)
+		VALUES ('free-ephemeral@test.invalid','free-ephemeral','x',now()-interval '1 hour') RETURNING id::text`).Scan(&freeUser); err != nil {
+		t.Fatal(err)
+	}
+	a := seedAppRow(t, pool, t.Name()+"-app")
+	h := seedHostRow(t, pool, t.Name()+"-host")
+	_, err := pool.Exec(ctx, `INSERT INTO managed_home_claims
+		(user_id,canonical_app_id,host_id,state,pending_home_session_id,pending_home_token,pending_home_started_at)
+		VALUES ($1::uuid,$2::uuid,$3::uuid,'reserved',$4::uuid,$5::uuid,now())`,
+		heldUser, a, h, "00000000-0000-4000-8000-000000000091", "00000000-0000-4000-8000-000000000092")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, cleanupErr := pool.Exec(context.Background(), `UPDATE managed_home_claims SET
+			pending_home_session_id=NULL,pending_home_token=NULL,pending_home_started_at=NULL
+			WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, heldUser, a)
+		if cleanupErr != nil {
+			t.Errorf("clear test hold: %v", cleanupErr)
+		}
+	})
+	rep, err := svc.ReapEphemeral(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Deleted != 1 || rep.Failed != 0 {
+		t.Fatalf("reap report = %+v", rep)
+	}
+	var remaining int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE id=$1::uuid`, heldUser).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 1 {
+		t.Fatal("held ephemeral identity was reaped")
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE id=$1::uuid`, freeUser).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatal("unheld expired identity was not reaped")
+	}
+}
 
 // fakeReaper records the hosts it was nudged with.
 type fakeReaper struct{ hosts [][]string }

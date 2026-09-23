@@ -88,6 +88,10 @@ func ReapOnce(ctx context.Context, minter Minter, log *slog.Logger) (auth.ReapRe
 		log.Info("dev agent reaper: expired identities still in session, retrying next sweep",
 			"in_session", rep.InSession)
 	}
+	if rep.PendingHome > 0 {
+		log.Info("dev agent reaper: managed home cleanup pending, retrying next sweep",
+			"pending_home", rep.PendingHome)
+	}
 	return rep, err
 }
 

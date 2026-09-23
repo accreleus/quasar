@@ -1186,6 +1186,8 @@ func (h *Handler) handleDeleteApp(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "app not found")
 	case errors.Is(err, ErrAppHasActiveSessions):
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "app is in use by an active session — stop it first")
+	case errors.Is(err, ErrHomeCleanupPending):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "Managed home cleanup is pending")
 	case errors.Is(err, ErrAppHasDerivedTiles):
 		// List the tiles, not just a count, so the admin sees what they'd
 		// destroy. Nested in the error object, mirroring the restart_required /

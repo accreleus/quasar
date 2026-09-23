@@ -461,6 +461,10 @@ export type AdminHome = Schemas["AdminHome"];
 
 export type AdminHomesResponse = Schemas["AdminHomesResponse"];
 
+export type AdminHomeClaim = Schemas["AdminHomeClaim"];
+
+export type AdminHomeClaimsResponse = Schemas["AdminHomeClaimsResponse"];
+
 export type MyStorageItem = Schemas["MyStorageItem"];
 
 export type MyStorageResponse = Schemas["MyStorageResponse"];

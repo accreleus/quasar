@@ -64,6 +64,7 @@ func NewRegistry(log *slog.Logger) *Registry {
 // sends enqueue onto it (gorilla allows only one concurrent writer).
 type conn struct {
 	hostID                    string
+	terminalHomeCleanupV1     bool
 	policyTyped               bool
 	policyIdle                bool
 	policyAccepted            []string
@@ -264,6 +265,105 @@ func (r *Registry) IsConnected(hostID string) bool {
 	return ok
 }
 
+// CurrentHomeCleanupCapability describes only the authenticated connection
+// serving this host right now. A disconnected host has no known capability.
+func (r *Registry) CurrentHomeCleanupCapability(hostID string) string {
+	c, ok := r.get(hostID)
+	if !ok {
+		return "unknown"
+	}
+	if c.terminalHomeCleanupV1 {
+		return "supported"
+	}
+	return "unsupported"
+}
+
+// HomeCommandEpoch binds a managed-home command to the exact authenticated
+// agent connection whose cleanup capability was used for the DB decision.
+// The boolean from SendWithAck says a frame entered the socket writer queue;
+// from that point delivery is uncertain even on timeout or disconnect.
+type HomeCommandEpoch interface {
+	SupportsHomeCleanup() bool
+	Send(any) (bool, error)
+	SendWithAck(context.Context, string, any) (AckResult, bool, error)
+}
+
+type homeCommandEpoch struct {
+	registry *Registry
+	conn     *conn
+}
+
+func (e *homeCommandEpoch) SupportsHomeCleanup() bool { return e.conn.terminalHomeCleanupV1 }
+
+func (r *Registry) CurrentHomeCommandEpoch(hostID string) (HomeCommandEpoch, bool) {
+	c, ok := r.get(hostID)
+	if !ok {
+		return nil, false
+	}
+	return &homeCommandEpoch{registry: r, conn: c}, true
+}
+
+func (e *homeCommandEpoch) Send(v any) (bool, error) {
+	var queued bool
+	var sendErr error
+	current := e.registry.withCurrent(e.conn, func() {
+		sendErr = e.conn.enqueue(v)
+		queued = sendErr == nil
+	})
+	if !current {
+		return false, ErrAgentNotConnected
+	}
+	return queued, sendErr
+}
+
+func (e *homeCommandEpoch) SendWithAck(ctx context.Context, id string, v any) (AckResult, bool, error) {
+	c := e.conn
+	r := e.registry
+	ch := make(chan AckResult, 1)
+	var queued bool
+	var enqueueErr error
+	current := r.withCurrent(c, func() {
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			enqueueErr = ErrAgentNotConnected
+			return
+		}
+		c.acks[id] = ch
+		c.mu.Unlock()
+		if err := c.enqueue(v); err != nil {
+			c.mu.Lock()
+			delete(c.acks, id)
+			c.mu.Unlock()
+			enqueueErr = err
+			return
+		}
+		queued = true
+	})
+	if !current {
+		return AckResult{}, false, ErrAgentNotConnected
+	}
+	if enqueueErr != nil {
+		return AckResult{}, false, enqueueErr
+	}
+	defer func() {
+		c.mu.Lock()
+		delete(c.acks, id)
+		c.mu.Unlock()
+	}()
+	select {
+	case result := <-ch:
+		if got, ok := r.get(c.hostID); !ok || got != c {
+			return AckResult{}, queued, ErrAgentNotConnected
+		}
+		return result, queued, nil
+	case <-ctx.Done():
+		return AckResult{}, queued, fmt.Errorf("ack wait for %s: %w", id, ctx.Err())
+	case <-c.done:
+		return AckResult{}, queued, ErrAgentNotConnected
+	}
+}
+
 // Send marshals v and enqueues it to the host's agent (fire-and-forget).
 func (r *Registry) Send(hostID string, v any) error {
 	c, ok := r.get(hostID)
@@ -314,6 +414,13 @@ func (r *Registry) SendWithAck(ctx context.Context, hostID, id string, v any) (A
 func (r *Registry) resolveAck(hostID, id string, res AckResult) {
 	c, ok := r.get(hostID)
 	if !ok {
+		return
+	}
+	r.resolveAckFromConn(c, id, res)
+}
+
+func (r *Registry) resolveAckFromConn(c *conn, id string, res AckResult) {
+	if current, ok := r.get(c.hostID); !ok || current != c {
 		return
 	}
 	c.mu.Lock()

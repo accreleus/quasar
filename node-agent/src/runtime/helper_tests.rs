@@ -387,10 +387,8 @@ fn serve(mut socket: UnixStream, state: &Mutex<State>) {
             route.contains("all=true"),
             "the legacy sweep must see stopped containers too: {route}"
         );
-        assert!(
-            route.contains("label") && route.contains("agent-owner"),
-            "the legacy listing must be filtered by this agent's owner label: {route}"
-        );
+        // The legacy sweep filters by owner; home terminal proof lists every
+        // source so an unjournaled matching container still blocks proof.
         if s.refuse_legacy_list {
             code = 500;
             response = json!({"message":"fixture list failure"});
@@ -2141,6 +2139,72 @@ fn application_startup_retirement_reconciles_lost_create_without_adopting_active
         .unwrap();
     assert_eq!(engine.requests(&format!("POST /containers/{ID}/stop")), 0);
     assert_eq!(engine.requests("DELETE /containers/"), 1);
+}
+
+#[test]
+fn home_terminal_retirement_removes_only_the_named_sessions_source_generations() {
+    let engine = Engine::new();
+    // This fake engine holds one container at a time. The exact-name filter
+    // can still prove that an unrelated live session is left alone.
+    engine
+        .client()
+        .start_application(ApplicationRequest {
+            operation: "home-proof-b0".into(),
+            name: "quasar-sess-home-b-g0".into(),
+            image: "quasar-app:test".into(),
+            ..Default::default()
+        })
+        .wait()
+        .unwrap();
+    engine
+        .client()
+        .retire_session_applications("home-a")
+        .wait()
+        .unwrap();
+    assert_eq!(engine.requests("DELETE /containers/"), 0);
+    engine
+        .client()
+        .retire_session_applications("home-b")
+        .wait()
+        .unwrap();
+    assert_eq!(engine.requests("DELETE /containers/"), 1);
+    // A repeated proof sees the completed durable journal, not a new remove.
+    engine
+        .client()
+        .retire_session_applications("home-b")
+        .wait()
+        .unwrap();
+    assert_eq!(engine.requests("DELETE /containers/"), 1);
+    for (generation, expected_removes) in [(0, 2), (1, 3)] {
+        engine
+            .client()
+            .start_application(ApplicationRequest {
+                operation: format!("home-proof-a{generation}"),
+                name: format!("quasar-sess-home-a-g{generation}"),
+                image: "quasar-app:test".into(),
+                ..Default::default()
+            })
+            .wait()
+            .unwrap();
+        engine
+            .client()
+            .retire_session_applications("home-a")
+            .wait()
+            .unwrap();
+        assert_eq!(engine.requests("DELETE /containers/"), expected_removes);
+    }
+}
+
+#[test]
+fn home_terminal_refuses_proof_when_matching_source_has_no_journal() {
+    let engine = Engine::new();
+    engine.state.lock().unwrap().legacy = vec![legacy('c', "/quasar-sess-home-a-g1", json!({}))];
+    assert!(engine
+        .client()
+        .retire_session_applications("home-a")
+        .wait()
+        .is_err());
+    assert_eq!(engine.requests("DELETE /containers/"), 0);
 }
 
 #[test]

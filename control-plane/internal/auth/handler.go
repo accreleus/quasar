@@ -364,6 +364,8 @@ func (h *Handler) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "cannot delete the last admin")
 	case errors.Is(err, ErrUserHasActiveSessions):
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "user has active sessions — stop them first")
+	case errors.Is(err, ErrHomeCleanupPending):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "Managed home cleanup is pending")
 	default:
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not delete user")
 	}

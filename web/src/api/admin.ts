@@ -15,6 +15,7 @@ import type {
   AdminUser,
   MetricsResponse,
   AdminHomesResponse,
+  AdminHomeClaimsResponse,
   ConfigCatalogResponse,
   HostSettingsResponse,
   UpdateHostSettingsResponse,
@@ -673,6 +674,21 @@ export function listAdminHomes(
   if (opts.cursor) params.set("cursor", opts.cursor);
   const qs = params.toString();
   return apiFetch<AdminHomesResponse>(`/admin/storage/homes${qs ? `?${qs}` : ""}`, { token });
+}
+
+export function listAdminHomeClaims(
+  token: string,
+  opts: { userId?: string; appId?: string; hostId?: string; state?: string; limit?: number; cursor?: string } = {},
+): Promise<AdminHomeClaimsResponse> {
+  const params = new URLSearchParams();
+  if (opts.userId) params.set("user_id", opts.userId);
+  if (opts.appId) params.set("app_id", opts.appId);
+  if (opts.hostId) params.set("host_id", opts.hostId);
+  if (opts.state) params.set("state", opts.state);
+  if (opts.limit) params.set("limit", String(opts.limit));
+  if (opts.cursor) params.set("cursor", opts.cursor);
+  const qs = params.toString();
+  return apiFetch<AdminHomeClaimsResponse>(`/admin/storage/home-claims${qs ? `?${qs}` : ""}`, { token });
 }
 
 // ── Host runtime settings (host-settings admin UI) ────────────────────────────

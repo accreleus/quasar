@@ -187,11 +187,14 @@ type AckMsg struct {
 
 // SessionStateMsg is the agent's authoritative lifecycle-progress callback.
 type SessionStateMsg struct {
-	Type      string  `json:"type"` // "session_state"
-	SessionID string  `json:"session_id"`
-	State     string  `json:"state"` // starting|running|stopping|stopped|failed
-	Detail    string  `json:"detail"`
-	Error     *string `json:"error"`
+	Type      string `json:"type"` // "session_state"
+	SessionID string `json:"session_id"`
+	// Set only by the authenticated WebSocket handler for the current reporting
+	// connection. Incoming JSON cannot assert cleanup capability.
+	HomeCleanupQualified bool    `json:"-"`
+	State                string  `json:"state"` // starting|running|stopping|stopped|failed
+	Detail               string  `json:"detail"`
+	Error                *string `json:"error"`
 	// ReasonCode (agent-api.md `session_state.reason_code`) classifies a
 	// terminal failure for the UI. Never load-bearing for the state machine —
 	// the transition is driven by State alone.

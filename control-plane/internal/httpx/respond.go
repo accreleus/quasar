@@ -31,6 +31,7 @@ const (
 	// command it was sent): the host encoder cannot change the encoded size live.
 	CodeExternalResizeUnsupported = "external_resize_unsupported" // 409
 	CodeHomeInUse                 = "home_in_use"                 // 409
+	CodeHomeConflict              = "home_conflict"               // 409
 	// home_not_provisioned and parent_app_disabled are the only two refusals whose
 	// remedy lies outside the caller's reach; never fold either into `conflict`.
 	CodeHomeNotProvisioned   = "home_not_provisioned"           // 409

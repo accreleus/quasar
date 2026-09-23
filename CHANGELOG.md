@@ -25,6 +25,14 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **Managed-home ownership during launch (#341).** A canonical per-user, per-app
+  claim keeps existing homes on their recorded host, serializes concurrent first
+  launches, and reports uncertain or divergent locations for operator repair
+  without creating another home. Tombstones block launch until exact confirmed
+  cleanup or repair; admins can inspect claim-only uncertainty in Fleet storage.
+  Capable agents retain a durable home hold across delivery loss and control-plane
+  restart until authenticated cleanup proof; older agents remain supported with
+  their unprotected-dispatch status visible to operators.
 
 - RH05 #339: reviewed idle approvals now dispatch one hardware group after final idle checks, journal startup and one recovery attempt, reconcile lost reports after restart, and show execution and recovery status in the console.
 - RH05 #338: reviewed idle-apply approvals now wait under an owner-scoped admission hold, expose current session and preparation blockers, and support safe cancellation.
