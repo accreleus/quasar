@@ -77,6 +77,8 @@ type conn struct {
 	policyInventorySnapshotID string
 	policyInventoryCursor     *string
 	policyInventoryHeader     []byte
+	rh05RestartEntries        []hostcfg.JournalInventoryEntry
+	rh05Snapshots             map[string]hostcfg.PolicySnapshot
 	policyActiveSnapshots     atomic.Pointer[map[string]hostcfg.PolicySnapshot]
 	policyOutstanding         map[string]ConfigPolicyStateMsg
 	policySequence            map[string]uint64

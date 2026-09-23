@@ -43,8 +43,12 @@ func ParseDeploymentSettings(raw json.RawMessage) (map[string]any, error) {
 // DeploymentSettingsForConnection never falls back to the previous socket's
 // report. The caller supplies the live registry identity.
 func (s *Store) DeploymentSettingsForConnection(ctx context.Context, hostID, connectionID string) (map[string]any, error) {
+	return deploymentSettingsForConnection(ctx, s.pool, hostID, connectionID)
+}
+
+func deploymentSettingsForConnection(ctx context.Context, db idleQueryDB, hostID, connectionID string) (map[string]any, error) {
 	var raw []byte
-	err := s.pool.QueryRow(ctx, `SELECT deployment_settings FROM hosts WHERE id=$1::uuid AND deployment_settings_connection=$2::uuid`, hostID, connectionID).Scan(&raw)
+	err := db.QueryRow(ctx, `SELECT deployment_settings FROM hosts WHERE id=$1::uuid AND deployment_settings_connection=$2::uuid`, hostID, connectionID).Scan(&raw)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}

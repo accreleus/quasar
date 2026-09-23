@@ -25,6 +25,7 @@ import { KnobRow } from "./settings/KnobRow";
 import { RestartNote } from "./settings/RestartNote";
 import { SettingsRail } from "./settings/SettingsRail";
 import { useHostSettings } from "./settings/useHostSettings";
+import { IdleApplyPolicy } from "./settings/IdleApplyPolicy";
 import { SafeSettingsPolicy } from "./settings/SafeSettingsPolicy";
 import type { SettingValue } from "./settings/knobs";
 
@@ -122,6 +123,7 @@ export function HostSettings() {
           <div className="split" style={{ marginTop: "var(--s4)", gridTemplateColumns: "minmax(0,1fr) 300px" }}>
             <div>
               <SafeSettingsPolicy hostId={id} knobs={s.knobs} renderNodeOptions={s.renderNodeOptions} onOwnedKeys={onOwnedKeys} />
+              <IdleApplyPolicy hostId={id} />
               <KnobPanel title="Runtime defaults" hint="Changes affect new sessions after the host applies them.">
                 {legacy.runtime.map(renderKnob)}
               </KnobPanel>

@@ -119,6 +119,12 @@ func TestPolicyInventoryMatchingHistoricalAttemptPermitsInitialMap(t *testing.T)
 		t.Fatal(err)
 	}
 	group := view.Groups["idle_timeout_secs"]
+	if _, err := store.StartRH05Boot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginJournalReconciliation(ctx, hostID, connection); err != nil {
+		t.Fatal(err)
+	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	registry := NewRegistry(log)
 	h := NewHandler(pool, "test-token", log, registry, nil, nil, store, nil)
