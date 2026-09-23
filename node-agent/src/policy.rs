@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::messages::AgentMsg;
@@ -627,6 +627,13 @@ impl PolicyAgent {
         policy_catalog::check_host_effects(&resolved, &self.deployment_baseline, &|path| {
             fs::read_dir(path).is_ok()
         })?;
+        if let Some(root) = resolved.get("home_root").and_then(Value::as_str) {
+            if !root.is_empty()
+                && !real_path_within_mount(root, &self.deployment_baseline.home_root)
+            {
+                return Err("home_root_outside_mount".into());
+            }
+        }
         let resolved = Value::Object(resolved);
         let mut next = settings.clone();
         compose_candidate(&mut next, group, &resolved)?;
@@ -724,6 +731,32 @@ impl PolicyAgent {
                 record.phase = "applied".into();
                 record.sequence += 1;
             }
+        }
+    }
+}
+
+// The catalog checks lexical containment. Before accepting a new home root,
+// resolve its deepest existing component so a symlink cannot send future
+// homes outside the deployment mount. A not-yet-created child is valid only
+// when that existing ancestor is inside the real mount.
+fn real_path_within_mount(candidate: &str, mount: &str) -> bool {
+    let Ok(real_mount) = fs::canonicalize(mount) else {
+        return false;
+    };
+    let mut ancestor = Path::new(candidate);
+    loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                return fs::canonicalize(ancestor)
+                    .is_ok_and(|real_candidate| real_candidate.starts_with(&real_mount))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let Some(parent) = ancestor.parent() else {
+                    return false;
+                };
+                ancestor = parent;
+            }
+            Err(_) => return false,
         }
     }
 }
@@ -1423,6 +1456,53 @@ mod tests {
             phase_of(&reopened.accept(other, &mut restarted)),
             ("applied", None)
         );
+    }
+
+    /// A rejection that describes the offer is never-retry, has no effect on
+    /// the journal or the next session, and is distinguishable from a
+    /// transient failure.
+    #[test]
+    fn a_home_root_symlink_cannot_escape_the_deployment_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let mount = dir.path().join("homes");
+        let outside = dir.path().join("outside");
+        fs::create_dir(&mount).unwrap();
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, mount.join("link")).unwrap();
+        let mut runtime = RuntimeSettings::baseline_with(&|_| None);
+        runtime.home_root = mount.to_str().unwrap().into();
+        let mut agent = owned_agent(dir.path(), &["home_root"], &mut runtime);
+        let before = serde_json::to_value(&agent.journal).unwrap();
+        let escaped = mount.join("link").join("new");
+        let reply = agent.accept(
+            explicit(
+                &agent,
+                "escape",
+                "1",
+                "home_root",
+                json!(escaped.to_str().unwrap()),
+            ),
+            &mut runtime,
+        );
+        assert_eq!(
+            phase_of(&reply),
+            ("failed", Some("home_root_outside_mount"))
+        );
+        assert_eq!(runtime.home_root, mount.to_str().unwrap());
+        assert_eq!(serde_json::to_value(&agent.journal).unwrap(), before);
+
+        let valid = mount.join("new");
+        let reply = agent.accept(
+            explicit(
+                &agent,
+                "inside",
+                "1",
+                "home_root",
+                json!(valid.to_str().unwrap()),
+            ),
+            &mut runtime,
+        );
+        assert_eq!(phase_of(&reply), ("applied", None));
     }
 
     /// A rejection that describes the offer is never-retry, has no effect on

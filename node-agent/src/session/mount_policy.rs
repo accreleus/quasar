@@ -11,11 +11,10 @@
 //! own home provisioning owns it; everything else must be named by the operator in
 //! `QUASAR_APP_MOUNT_ALLOW` and is read-only unless that entry says `:rw`.
 //!
-//! Symlink resolution is advisory, never an approval: the agent runs in a
+//! Symlink resolution can only reject, never approve: the agent runs in a
 //! container, so `/etc` or `/proc/1/root` resolve against ITS rootfs while dockerd
-//! binds the source from the HOST's. A canonical path is therefore only ever used
-//! to reject; acceptance rests on the lexical path, which `..` rejection keeps
-//! honest.
+//! binds the source from the HOST's. Acceptance requires lexical containment
+//! and rejects a visible symlink escape from the selected allowed root.
 
 use anyhow::{bail, Result};
 use std::path::{Component, Path, PathBuf};
@@ -179,6 +178,17 @@ impl MountPolicy {
                 lexical.display()
             );
         };
+        // A source that is lexically inside an allowed tree can resolve through
+        // a symlink to an ordinary path outside it. The later Docker bind would
+        // then mount data the operator never allowed. This canonical check only
+        // adds a refusal; it cannot make an unlisted lexical source acceptable.
+        let canonical_rule = resolve_existing_prefix(&rule.path);
+        if !is_under(&canonical_rule, &canonical) {
+            bail!(
+                "mount {mount:?}: host path resolves outside its allowed root {}",
+                rule.path.display()
+            );
+        }
 
         let opts = normalize_opts(mount, opts_raw, rule.writable)?;
         Ok(if opts.is_empty() {
@@ -309,6 +319,22 @@ mod tests {
             .check("/var/lib/quasar/homes/alice/steam:/home/quasar")
             .expect("managed home must launch");
         assert_eq!(m, "/var/lib/quasar/homes/alice/steam:/home/quasar");
+    }
+
+    #[test]
+    fn managed_home_mount_refuses_a_symlink_outside_its_allowed_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let homes = dir.path().join("homes");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&homes).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, homes.join("link")).unwrap();
+        let policy = MountPolicy::new(homes.to_str().unwrap(), "");
+        let mount = format!("{}:/home/quasar:rw", homes.join("link/new").display());
+        assert!(
+            policy.check(&mount).is_err(),
+            "escaped home mount was accepted"
+        );
     }
 
     #[test]

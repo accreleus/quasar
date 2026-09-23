@@ -325,6 +325,19 @@ func (m *Manager) EnsureHome(ctx context.Context, userID, appID, hostID, contain
 	if !path.IsAbs(containerPath) {
 		return "", fmt.Errorf("home_container_path %q is not absolute", containerPath)
 	}
+	// A host policy save takes this row lock before checking existing homes.
+	// Hold it through root resolution and insertion: otherwise a first launch
+	// can read the old root, let the edit validate an empty home set, then
+	// create a sticky home outside the newly selected root.
+	tx, err := m.pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx)
+	var lockedHost string
+	if err := tx.QueryRow(ctx, `SELECT id::text FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&lockedHost); err != nil {
+		return "", fmt.Errorf("lock home host: %w", err)
+	}
 	// Read fresh per launch so an admin PATCH / per-host home_root applies on
 	// the next launch with no restart.
 	drv, err := m.resolveDriver(ctx, hostID)
@@ -335,7 +348,7 @@ func (m *Manager) EnsureHome(ctx context.Context, userID, appID, hostID, contain
 	// Resolve display names for the human-navigable local layout; a lookup miss
 	// (test fixtures, deleted rows) falls back to the UUIDs.
 	var uname, aname string
-	if err := m.pool.QueryRow(ctx, `
+	if err := tx.QueryRow(ctx, `
 		SELECT COALESCE((SELECT username FROM users WHERE id = $1::uuid), ''),
 		       COALESCE((SELECT name     FROM apps  WHERE id = $2::uuid), '')
 	`, userID, appID).Scan(&uname, &aname); err == nil {
@@ -354,7 +367,7 @@ func (m *Manager) EnsureHome(ctx context.Context, userID, appID, hostID, contain
 	// invisible to bookkeeping (accepted: driver switches are rare, operator-
 	// initiated).
 	var provider, storedRef string
-	if err := m.pool.QueryRow(ctx, `
+	if err := tx.QueryRow(ctx, `
 		INSERT INTO user_homes (user_id, app_id, host_id, provider, ref)
 		VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5)
 		ON CONFLICT (user_id, app_id, host_id) DO UPDATE
@@ -369,6 +382,9 @@ func (m *Manager) EnsureHome(ctx context.Context, userID, appID, hostID, contain
 	mount := fmt.Sprintf("%s:%s:rw", storedRef, path.Clean(containerPath))
 	if err := validateMount(mount); err != nil {
 		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("commit user_home: %w", err)
 	}
 	return mount, nil
 }

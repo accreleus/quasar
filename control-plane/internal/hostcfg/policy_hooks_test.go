@@ -8,9 +8,17 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/accreleus/quasar/control-plane/internal/storage"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+type localStorageProvider struct{}
+
+func (localStorageProvider) StorageProvider(context.Context) (string, error) {
+	return "local", nil
+}
 
 // offerDispatcher is a current typed connection with complete inventory: it
 // reports the connection identity and its per-group active snapshots.
@@ -258,6 +266,63 @@ func TestHomeRootStaysInsideMountAndNeverStrandsExistingHomes(t *testing.T) {
 	var ref string
 	if err := pool.QueryRow(ctx, `SELECT ref FROM user_homes WHERE host_id=$1::uuid`, host.id).Scan(&ref); err != nil || ref != "/srv/homes/u1/app" {
 		t.Fatalf("existing home moved to %q err=%v", ref, err)
+	}
+}
+
+// A first launch racing an operator root edit must become visible to the edit
+// before it validates existing homes. The saved root may not strand that home.
+func TestHomeRootEditRacingFirstHomeClaimIsRefused(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	host := newTypedHost(t, pool, "home_root")
+	var userID, appID string
+	if err := pool.QueryRow(context.Background(), `INSERT INTO users(email,username,password_hash) VALUES('root-race@test.local','root-race','x') RETURNING id::text`).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(), `INSERT INTO apps(name,default_vram_mb,default_encode_slots,default_width,default_height,default_fps,default_bitrate_kbps,runtime_spec) VALUES('Root Race',512,1,1280,720,30,2000,'{}') RETURNING id::text`).Scan(&appID); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	homes := storage.New(pool, localStorageProvider{}, storage.HostRootResolverFunc(func(context.Context, string) (string, error) {
+		close(entered)
+		<-release
+		return "/srv/homes", nil
+	}))
+	launchDone := make(chan error, 1)
+	go func() {
+		_, err := homes.EnsureHome(context.Background(), userID, appID, host.id, "/home/quasar")
+		launchDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first home claim did not reach root resolution")
+	}
+	dispatcher := &offerDispatcher{connection: host.connection, snapshots: host.snapshots}
+	mux := policyMux(NewHandler(store, dispatcher, stubCounter{}))
+	editDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		editDone <- patchPolicy(t, mux, host.id, "0", map[string]PolicyChoice{
+			"home_root": {Source: "explicit", Value: "/srv/homes/new"},
+		})
+	}()
+	select {
+	case edit := <-editDone:
+		close(release)
+		t.Fatalf("root edit completed before first home claim: %d %s", edit.Code, edit.Body.String())
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	if err := <-launchDone; err != nil {
+		t.Fatal(err)
+	}
+	edit := <-editDone
+	if edit.Code != http.StatusBadRequest || errorCode(t, edit) != "validation_failed" {
+		t.Fatalf("root edit after home claim = %d %s", edit.Code, edit.Body.String())
+	}
+	if revision := currentRevision(t, store, host.id); revision != "0" {
+		t.Fatalf("refused root edit wrote revision %s", revision)
 	}
 }
 
