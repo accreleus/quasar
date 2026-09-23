@@ -267,14 +267,18 @@ func (h *Handler) offerNextSessionPolicy(ctx context.Context, c *conn) {
 	if !current || boot != c.bootIncarnation || connection != c.connectionIncarnation {
 		return
 	}
-	offer, err := h.cfgStore.NextSessionOffer(ctx, c.hostID, newPolicyUUID(), boot, connection, c.policyActiveSnapshot.Load())
+	snapshots := c.activePolicySnapshots()
+	if len(snapshots) == 0 {
+		return
+	}
+	offers, err := h.cfgStore.NextSessionOfferBatch(ctx, c.hostID, boot, connection, snapshots, newPolicyUUID)
 	if err != nil {
 		h.log.Warn("host policy offer load failed", "host_id", c.hostID, "err", err)
 		return
 	}
-	if offer != nil {
+	for _, offer := range offers {
 		if err := h.registry.Send(c.hostID, offer); err != nil {
-			h.log.Warn("host policy offer failed", "host_id", c.hostID, "err", err)
+			h.log.Warn("host policy offer failed", "host_id", c.hostID, "group", offer.Group, "err", err)
 		}
 	}
 }
@@ -289,7 +293,36 @@ func policyGrantMatches(c *conn, state ConfigPolicyStateMsg) bool {
 }
 
 func policyEntryMatchesDesired(group hostcfg.PolicyGroup, entry ConfigPolicyStateMsg) bool {
-	return entry.Group == "idle_timeout_secs" && entry.Scope == "next_session" && group.DesiredDigest != nil && group.DesiredRevision == entry.Revision && *group.DesiredDigest == entry.ContentSHA256
+	scope, known := hostcfg.PolicyGroupScope(entry.Group)
+	return known && entry.Scope == scope && group.Scope == scope && group.DesiredDigest != nil && group.DesiredRevision == entry.Revision && *group.DesiredDigest == entry.ContentSHA256
+}
+
+// policyStateErrorCode reads the typed reason of a `config_policy_state`
+// error: a bare code string, or an object carrying `code`.
+func policyStateErrorCode(raw json.RawMessage) string {
+	var code string
+	if json.Unmarshal(raw, &code) == nil {
+		return code
+	}
+	var typed struct {
+		Code string `json:"code"`
+	}
+	if json.Unmarshal(raw, &typed) == nil {
+		return typed.Code
+	}
+	return ""
+}
+
+// policyEvidenceMatches requires the readback to carry exactly the expected
+// value for every key of the group.
+func policyEvidenceMatches(expected, evidence map[string]any) bool {
+	for key, value := range expected {
+		got, present := evidence[key]
+		if !present || !reflect.DeepEqual(got, value) {
+			return false
+		}
+	}
+	return len(expected) > 0
 }
 
 // Journal sequence survives terminal handling on a connection so delayed
@@ -355,7 +388,7 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 		}
 	}
 	for group, snapshot := range page.ActiveSnapshots {
-		if group != "idle_timeout_secs" {
+		if !hostcfg.IsPolicyGroup(group) {
 			c.policyInventoryUnknown = true
 			c.policyInventoryBlocked.Store(true)
 		}
@@ -390,7 +423,7 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 		if !fresh {
 			continue
 		}
-		if entry.HostID != c.hostID || entry.Group != "idle_timeout_secs" {
+		if entry.HostID != c.hostID || !hostcfg.IsPolicyGroup(entry.Group) {
 			c.policyInventoryUnknown = true
 			c.policyInventoryBlocked.Store(true)
 			continue
@@ -426,16 +459,15 @@ func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []
 		c.policyInventoryCursor = page.NextCursor
 		return h.registry.Send(c.hostID, ConfigPolicyInventoryRequest{Type: "config_policy_journal_inventory_request", InventoryID: c.policyInventoryID, BootIncarnation: c.bootIncarnation, ConnectionIncarnation: c.connectionIncarnation, Cursor: page.NextCursor})
 	}
-	if snapshot, ok := page.ActiveSnapshots["idle_timeout_secs"]; ok {
-		active := &hostcfg.PolicySnapshot{Kind: snapshot.Kind, Digest: snapshot.Digest}
-		c.policyActiveSnapshot.Store(active)
-		if !c.policyInventoryBlocked.Load() {
-			if err := h.cfgStore.ReconcilePolicySnapshot(ctx, c.hostID, c.connectionIncarnation, active); err != nil {
-				return err
-			}
+	active := map[string]hostcfg.PolicySnapshot{}
+	for group, snapshot := range page.ActiveSnapshots {
+		if hostcfg.IsPolicyGroup(group) {
+			active[group] = hostcfg.PolicySnapshot{Kind: snapshot.Kind, Digest: snapshot.Digest}
 		}
-	} else if !c.policyInventoryBlocked.Load() {
-		if err := h.cfgStore.ReconcilePolicySnapshot(ctx, c.hostID, c.connectionIncarnation, nil); err != nil {
+	}
+	c.policyActiveSnapshots.Store(&active)
+	if !c.policyInventoryBlocked.Load() {
+		if err := h.cfgStore.ReconcilePolicySnapshots(ctx, c.hostID, c.connectionIncarnation, active); err != nil {
 			return err
 		}
 	}
@@ -465,7 +497,7 @@ func (h *Handler) restartPolicyInventory(ctx context.Context, c *conn) error {
 	c.policySequence = nil
 	c.policySequenceContent = nil
 	c.policyAttemptOutstanding.Store(false)
-	c.policyActiveSnapshot.Store(nil)
+	c.policyActiveSnapshots.Store(nil)
 	c.policyDeliveryID = ""
 	c.policyDeliverySentAt = time.Time{}
 	c.policyInitialMapApplied.Store(false)
@@ -809,7 +841,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			if err := json.Unmarshal(raw, &report); err != nil || report.ConnectionIncarnation != ac.connectionIncarnation {
 				continue
 			}
-			if report.Code == "group_execution_unavailable" && report.Group != nil && *report.Group == "idle_timeout_secs" {
+			if report.Code == "group_execution_unavailable" && report.Group != nil && hostcfg.IsPolicyGroup(*report.Group) {
 				var parkErr error
 				h.registry.withCurrent(ac, func() { parkErr = h.cfgStore.ParkPolicyGroupUpgradeRequired(bg, hostID, *report.Group) })
 				if parkErr != nil {
@@ -846,7 +878,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			if state.HostID != hostID || !policyGrantMatches(ac, state) {
 				continue
 			}
-			if state.Group != "idle_timeout_secs" || state.Scope != "next_session" {
+			if scope, known := hostcfg.PolicyGroupScope(state.Group); !known || scope != "next_session" || state.Scope != scope {
 				continue
 			}
 			view, err := h.cfgStore.GetPolicy(bg, hostID)
@@ -900,6 +932,17 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 				}
 				continue
 			case "failed", "recovered", "revoked_unstarted":
+				if state.Phase == "failed" && matching {
+					// Invalid intent fails without retry; a transient failure
+					// keeps the backoff its offer already claimed.
+					var rejectErr error
+					h.registry.withCurrent(ac, func() {
+						_, rejectErr = h.cfgStore.ObservePolicyRejected(bg, hostID, state.Group, state.Revision, state.ContentSHA256, policyStateErrorCode(state.Error))
+					})
+					if rejectErr != nil {
+						h.log.Warn("config policy rejection record failed", "host_id", hostID, "group", state.Group, "err", rejectErr)
+					}
+				}
 				if historical {
 					if err := h.restartPolicyInventory(bg, ac); err != nil {
 						return err
@@ -919,20 +962,12 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 				}
 				continue
 			}
-			choice := view.Choices[state.Group]
-			var expected any
-			if choice.Source == "explicit" {
-				expected = choice.Value
-			} else if choice.Source == "deployment" {
-				baseline, err := h.cfgStore.DeploymentSettingsForConnection(bg, hostID, ac.connectionIncarnation)
-				if err != nil || baseline == nil {
-					continue
-				}
-				expected = baseline[state.Group]
-			} else {
+			expected, resolvable, err := h.cfgStore.ExpectedPolicyResolved(bg, hostID, ac.connectionIncarnation, state.Group)
+			if err != nil {
+				h.log.Warn("config policy expectation load failed", "host_id", hostID, "group", state.Group, "err", err)
 				continue
 			}
-			if expected == nil || !reflect.DeepEqual(state.Evidence.ResolvedSettings[state.Group], expected) {
+			if !resolvable || !policyEvidenceMatches(expected, state.Evidence.ResolvedSettings) {
 				continue
 			}
 			var observeErr error
@@ -943,7 +978,14 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			if err := observeErr; err != nil {
 				h.log.Warn("config policy observation failed", "host_id", hostID, "err", err)
 			} else if applied {
-				ac.policyActiveSnapshot.Store(&hostcfg.PolicySnapshot{Kind: "verified", Digest: state.ContentSHA256})
+				if state.Group == "zerocopy" {
+					// Probe-proven codecs were measured under the old value; withdraw
+					// them until the agent re-probes and re-reports capacity.
+					if err := h.store.withdrawStaleProbeCodecs(bg, hostID, "zerocopy", expected["zerocopy"]); err != nil {
+						h.log.Warn("stale probe codec withdrawal failed", "host_id", hostID, "err", err)
+					}
+				}
+				ac.setActivePolicySnapshot(state.Group, hostcfg.PolicySnapshot{Kind: "verified", Digest: state.ContentSHA256})
 				delete(ac.policyOutstanding, state.AttemptID)
 				ac.policyAttemptOutstanding.Store(len(ac.policyOutstanding) != 0)
 				if len(ac.policyOutstanding) == 0 && !ac.policyUncertain && !ac.policyInventoryUnknown {
@@ -1129,8 +1171,13 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 			}
 		}
 		if validGroups && reg.ConfigPolicyVersions["execution_journal"] == 1 && reg.ConfigPolicyVersions["deployment_baseline"] == 1 {
+			// Only next-session groups are echoed; no typed restart executor exists.
+			nextSession := map[string]bool{}
+			for _, group := range hostcfg.NextSessionPolicyGroups() {
+				nextSession[group] = true
+			}
 			for _, group := range reg.ConfigPolicyGroups {
-				if group == "idle_timeout_secs" {
+				if nextSession[group] {
 					acceptedGroups = append(acceptedGroups, group)
 				}
 			}

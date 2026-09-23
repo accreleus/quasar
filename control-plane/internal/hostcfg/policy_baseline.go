@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -82,16 +81,10 @@ func (s *Store) ObserveDeploymentSettings(ctx context.Context, hostID, connectio
 		return err
 	}
 	if parseErr == nil {
-		candidate, err := idleCandidateForConnection(ctx, tx, hostID, connectionID)
-		if err != nil {
+		// A new current-connection baseline re-resolves every deployment-source
+		// next-session group; a changed digest is a relevant condition change.
+		if err := refreshDeploymentDigests(ctx, tx, hostID, connectionID); err != nil {
 			return err
-		}
-		if candidate != nil && candidate.Choice.Source == "deployment" {
-			if _, err := tx.Exec(ctx, `UPDATE host_setting_groups SET desired_digest=$2,
-				status=CASE WHEN status IN ('applied','failed','pending') AND desired_digest IS DISTINCT FROM $2 THEN 'pending' ELSE status END
-				WHERE host_id=$1::uuid AND group_key='idle_timeout_secs'`, hostID, candidate.Digest); err != nil {
-				return err
-			}
 		}
 	}
 	return tx.Commit(ctx)
@@ -148,80 +141,4 @@ func digestPolicyFacts(facts []any) (string, error) {
 	}
 	sum := sha256.Sum256(bytes)
 	return hex.EncodeToString(sum[:]), nil
-}
-
-type idleCandidate struct {
-	Choice        PolicyChoice
-	Value         any
-	Digest        string
-	Prerequisites []any
-	PrereqDigest  string
-}
-
-// idleCandidateForConnection resolves only the idle group. A deployment
-// choice requires a valid baseline from the same live connection as the offer.
-func idleCandidateForConnection(ctx context.Context, tx pgx.Tx, hostID, connectionID string) (*idleCandidate, error) {
-	var revision int64
-	var source string
-	var raw []byte
-	var scope string
-	err := tx.QueryRow(ctx, `SELECT g.desired_revision,g.scope,c.source,c.explicit_value FROM host_setting_groups g JOIN host_setting_choices c ON c.host_id=g.host_id AND c.key='idle_timeout_secs' WHERE g.host_id=$1::uuid AND g.group_key='idle_timeout_secs'`, hostID).Scan(&revision, &scope, &source, &raw)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if scope != "next_session" {
-		return nil, nil
-	}
-	choice := PolicyChoice{Source: source}
-	var value any
-	prereqs := []any{}
-	if source == "explicit" {
-		if err := json.Unmarshal(raw, &value); err != nil {
-			return nil, err
-		}
-		choice.Value = value
-	} else if source == "deployment" {
-		var baseline []byte
-		err := tx.QueryRow(ctx, `SELECT deployment_settings FROM hosts WHERE id=$1::uuid AND deployment_settings_connection=$2::uuid`, hostID, connectionID).Scan(&baseline)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-		values, err := ParseDeploymentSettings(baseline)
-		if err != nil {
-			return nil, nil
-		}
-		var ok bool
-		value, ok = values["idle_timeout_secs"]
-		if !ok || value == nil {
-			return nil, nil
-		}
-		fact, err := digestJSON(map[string]any{"idle_timeout_secs": value})
-		if err != nil {
-			return nil, err
-		}
-		prereqs = append(prereqs, map[string]any{"kind": "deployment_baseline", "id": fact})
-	} else {
-		return nil, nil
-	}
-	content := map[string]any{
-		"group": "idle_timeout_secs", "scope": scope,
-		"revision":          strconv.FormatInt(revision, 10),
-		"settings":          map[string]PolicyChoice{"idle_timeout_secs": choice},
-		"resolved_settings": map[string]any{"idle_timeout_secs": value},
-	}
-	digest, err := digestJSON(content)
-	if err != nil {
-		return nil, err
-	}
-	prereqDigest, err := digestPolicyFacts(prereqs)
-	if err != nil {
-		return nil, err
-	}
-	return &idleCandidate{Choice: choice, Value: value, Digest: digest, Prerequisites: prereqs, PrereqDigest: prereqDigest}, nil
 }

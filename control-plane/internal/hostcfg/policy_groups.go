@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -147,6 +148,21 @@ func ValidateStoredPolicyEdit(ctx context.Context, q policyQuerier, hostID strin
 // next-session group. Each claims its own obligation under the host lock, so
 // groups progress and back off independently.
 func (s *Store) NextSessionOffers(ctx context.Context, hostID, bootID, connectionID string, snapshots map[string]PolicySnapshot, newID func() string) ([]*PolicyOffer, error) {
+	return s.nextSessionOffers(ctx, hostID, bootID, connectionID, snapshots, newID, 0)
+}
+
+// PolicyOffersPerPass bounds one dispatch pass. The agent socket's send queue
+// is shorter than the catalog, and a dropped send still spends a retry; the
+// remaining groups go out on the next heartbeat.
+const PolicyOffersPerPass = 8
+
+// NextSessionOfferBatch is NextSessionOffers for a live socket: at most
+// PolicyOffersPerPass groups are claimed and returned.
+func (s *Store) NextSessionOfferBatch(ctx context.Context, hostID, bootID, connectionID string, snapshots map[string]PolicySnapshot, newID func() string) ([]*PolicyOffer, error) {
+	return s.nextSessionOffers(ctx, hostID, bootID, connectionID, snapshots, newID, PolicyOffersPerPass)
+}
+
+func (s *Store) nextSessionOffers(ctx context.Context, hostID, bootID, connectionID string, snapshots map[string]PolicySnapshot, newID func() string, limit int) ([]*PolicyOffer, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -171,6 +187,9 @@ func (s *Store) NextSessionOffers(ctx context.Context, hostID, bootID, connectio
 	}
 	var offers []*PolicyOffer
 	for _, group := range NextSessionPolicyGroups() {
+		if limit > 0 && len(offers) >= limit {
+			break
+		}
 		snapshot, ok := snapshots[group]
 		if !confirmed[group] || !ok || (snapshot.Kind != "seeded" && snapshot.Kind != "verified") || !validPolicyDigest(snapshot.Digest) {
 			continue
@@ -285,14 +304,8 @@ func (s *Store) ObservePolicyRejected(ctx context.Context, hostID, group, revisi
 
 // RetryPolicyGroup re-arms a next-session group whose transient retry budget
 // is exhausted. Invalid requests and pending groups are not retryable.
+// An unknown host is ErrHostNotFound before any group check.
 func (s *Store) RetryPolicyGroup(ctx context.Context, hostID, group string) error {
-	scope, ok := PolicyGroupScope(group)
-	if !ok {
-		return ErrPolicyNotRetryable
-	}
-	if scope != "next_session" {
-		return ErrPolicyApprovalRequired
-	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -303,6 +316,13 @@ func (s *Store) RetryPolicyGroup(ctx context.Context, hostID, group string) erro
 			return ErrHostNotFound
 		}
 		return err
+	}
+	scope, ok := PolicyGroupScope(group)
+	if !ok {
+		return ErrPolicyNotRetryable
+	}
+	if scope != "next_session" {
+		return ErrPolicyApprovalRequired
 	}
 	cmd, err := tx.Exec(ctx, `UPDATE host_setting_groups g SET status='pending' FROM host_reconcile_obligations o
 		WHERE g.host_id=o.host_id AND g.group_key=o.resource_key AND o.kind='setting' AND g.host_id=$1::uuid AND g.group_key=$2
@@ -320,6 +340,28 @@ func (s *Store) RetryPolicyGroup(ctx context.Context, hostID, group string) erro
 	return tx.Commit(ctx)
 }
 
+// ExpectedPolicyResolved is what a next-session group's applied readback must
+// show on connectionID: explicit values, and deployment values only from that
+// connection's baseline. ok is false while the group cannot be resolved.
+func (s *Store) ExpectedPolicyResolved(ctx context.Context, hostID, connectionID, group string) (map[string]any, bool, error) {
+	if scope, known := PolicyGroupScope(group); !known || scope != "next_session" {
+		return nil, false, nil
+	}
+	choices, err := loadPolicyChoices(ctx, s.pool, hostID)
+	if err != nil {
+		return nil, false, err
+	}
+	baseline, err := connectionBaseline(ctx, s.pool, hostID, connectionID)
+	if err != nil {
+		return nil, false, err
+	}
+	candidate, reason, err := resolveGroupCandidate(group, 0, choices, baseline)
+	if err != nil || reason != "" {
+		return nil, false, err
+	}
+	return candidate.Resolved, true, nil
+}
+
 // PolicyGroupDetail is the retry state behind a group's typed view.
 type PolicyGroupDetail struct {
 	NextRetryAt *time.Time
@@ -330,8 +372,13 @@ type PolicyGroupDetail struct {
 // reason: retry_exhausted (Retry offered) or validation_failed (never
 // retried). Durable state distinguishes them: an exhausted group keeps its
 // obligation, an invalid one has none.
+// GetPolicy already applies it; the method stays for callers holding a view.
 func (s *Store) DecoratePolicyGroups(ctx context.Context, hostID string, view *PolicyView) (map[string]PolicyGroupDetail, error) {
-	rows, err := s.pool.Query(ctx, `SELECT resource_key,revision,retry_count,next_attempt_at FROM host_reconcile_obligations WHERE host_id=$1::uuid AND kind='setting'`, hostID)
+	return decoratePolicyGroups(ctx, s.pool, &s.policyErrors, hostID, view)
+}
+
+func decoratePolicyGroups(ctx context.Context, q policyQuerier, policyErrors *sync.Map, hostID string, view *PolicyView) (map[string]PolicyGroupDetail, error) {
+	rows, err := q.Query(ctx, `SELECT resource_key,revision,retry_count,next_attempt_at FROM host_reconcile_obligations WHERE host_id=$1::uuid AND kind='setting'`, hostID)
 	if err != nil {
 		return nil, err
 	}
@@ -360,7 +407,7 @@ func (s *Store) DecoratePolicyGroups(ctx context.Context, hostID string, view *P
 			continue
 		}
 		last := ""
-		if code, ok := s.policyErrors.Load(policyErrorKey(hostID, key)); ok {
+		if code, ok := policyErrors.Load(policyErrorKey(hostID, key)); ok {
 			last = fmt.Sprintf(" Last host error: %s.", code)
 		}
 		o, hasObligation := obligations[key]
@@ -462,6 +509,17 @@ func (s *Store) InvalidateNextSessionEvidenceOnReconnect(ctx context.Context, ho
 	return tx.Commit(ctx)
 }
 
+// policyGroupUsesDeployment reports whether any of group's keys resolves from
+// the deployment baseline (an absent choice is deployment).
+func policyGroupUsesDeployment(group string, choices map[string]PolicyChoice) bool {
+	for _, key := range PolicyGroupKeys(group) {
+		if choice, ok := choices[key]; !ok || choice.Source == "deployment" {
+			return true
+		}
+	}
+	return false
+}
+
 // refreshDeploymentDigests re-resolves deployment-source next-session groups
 // after a new current-connection baseline. A changed digest is a relevant
 // condition change: the group returns to pending with a fresh retry budget.
@@ -497,13 +555,7 @@ func refreshDeploymentDigests(ctx context.Context, tx pgx.Tx, hostID, connection
 		return err
 	}
 	for group, d := range groups {
-		usesDeployment := false
-		for _, key := range PolicyGroupKeys(group) {
-			if choice, ok := choices[key]; !ok || choice.Source == "deployment" {
-				usesDeployment = true
-			}
-		}
-		if !usesDeployment {
+		if !policyGroupUsesDeployment(group, choices) {
 			continue
 		}
 		candidate, reason, err := resolveGroupCandidate(group, d.revision, choices, baseline)
