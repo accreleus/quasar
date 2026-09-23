@@ -41,6 +41,7 @@ function host(over: Partial<Host> = {}): Host {
     id: "c2059601",
     node_name: "quasar-node-1",
     status: "online",
+    admission_restrictions: [],
     agent_version: "0.1.0",
     cpu_cores: 16,
     cpu_model: "AMD Ryzen 9 9950X3D",
@@ -393,12 +394,37 @@ describe("HostDetail — actions", () => {
     await waitFor(() => expect(mocked.drainHost).toHaveBeenCalledWith("tok", "c2059601"));
   });
 
-  it("offers to resume scheduling on a draining host", async () => {
-    mocked.getHost.mockResolvedValue({ host: host({ status: "draining" }) } as never);
+  it("releases only the operator's drain on a draining host", async () => {
+    mocked.getHost.mockResolvedValue({ host: host({ status: "draining", admission_restrictions: [{
+      owner_kind: "manual", reason: "manual_drain", created_at: "2026-08-29T11:00:00Z",
+    }] }) } as never);
     renderDetail();
-    await waitFor(() => expect(screen.getByRole("button", { name: "Resume scheduling" })).toBeTruthy());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Release operator drain" })).toBeTruthy());
 
-    fireEvent.click(screen.getByRole("button", { name: "Resume scheduling" }));
+    fireEvent.click(screen.getByRole("button", { name: "Release operator drain" }));
+    await waitFor(() => expect(mocked.uncordonHost).toHaveBeenCalledWith("tok", "c2059601"));
+  });
+
+  it("explains a platform hold without a universal resume action", async () => {
+    mocked.getHost.mockResolvedValue({ host: host({ status: "draining", admission_restrictions: [{
+      owner_kind: "platform", reason: "platform_apply", created_at: "2026-08-29T11:00:00Z",
+    }] }) } as never);
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("Platform apply")).toBeTruthy());
+    expect(screen.queryByRole("button", { name: /Resume scheduling|Release operator drain/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Add operator drain" }));
+    await waitFor(() => expect(mocked.drainHost).toHaveBeenCalledWith("tok", "c2059601"));
+  });
+
+  it("lets an offline host release its operator hold and renders future reasons safely", async () => {
+    mocked.getHost.mockResolvedValue({ host: host({ status: "offline", admission_restrictions: [
+      { owner_kind: "legacy", reason: "legacy_drain", created_at: "2026-08-29T11:00:00Z" },
+      { owner_kind: "platform", reason: "future_reason" as never, created_at: "2026-08-29T11:01:00Z" },
+    ] }) } as never);
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("Admission hold")).toBeTruthy());
+    expect(screen.getByText(/recorded during upgrade/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Release operator drain" }));
     await waitFor(() => expect(mocked.uncordonHost).toHaveBeenCalledWith("tok", "c2059601"));
   });
 

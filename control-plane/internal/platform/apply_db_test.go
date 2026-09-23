@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
 	"github.com/accreleus/quasar/control-plane/internal/buildinfo"
@@ -431,6 +433,150 @@ func TestRegisterOnTheRequestedCommitResolvesTheAttempt(t *testing.T) {
 	}
 	if attempts[0].State != AttemptSucceeded || attempts[0].FinishedAt == nil {
 		t.Errorf("attempt = %+v, want succeeded with a finished_at", attempts[0])
+	}
+}
+
+func TestStandaloneApplyReleasesOnlyItsOwnHoldOnSuccessOrFailure(t *testing.T) {
+	for _, outcome := range []string{"success", "failure"} {
+		t.Run(outcome, func(t *testing.T) {
+			h := newApplyHarness(t)
+			ctx := context.Background()
+			holds := admission.NewStore(h.pool)
+			if _, err := holds.Acquire(ctx, h.hostID, admission.ManualOwner, "Manual drain"); err != nil {
+				t.Fatal(err)
+			}
+			h.runner.deps.AcquireOwned = func(ctx context.Context, attemptID, hostID string) error {
+				_, err := holds.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, "Platform apply")
+				return err
+			}
+			h.runner.deps.ReleaseOwned = func(ctx context.Context, attemptID, hostID string) error {
+				_, err := holds.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, true)
+				return err
+			}
+			if outcome == "failure" {
+				h.agent.ack = Ack{OK: false, Error: "refused"}
+			}
+			code, body := h.post(t, h.applyURL(), h.adminToken, HostApplyRequest{ReleaseID: h.release.ID, Force: true})
+			if code != http.StatusAccepted {
+				t.Fatalf("apply = %d %s", code, body)
+			}
+			if outcome == "success" {
+				waitFor(t, "release_apply to be sent", func() bool { return h.agent.sentCount() == 1 })
+				commit := h.release.SourceCommit
+				h.runner.HandleRegister(ctx, h.hostID, &commit)
+			}
+			waitFor(t, "terminal apply and own hold released", func() bool {
+				attempts, err := h.store.ListAttempts(ctx, h.hostID, 10)
+				if err != nil || len(attempts) != 1 || !TerminalAttemptState(attempts[0].State) {
+					return false
+				}
+				rs, err := holds.List(ctx, h.hostID)
+				return err == nil && len(rs) == 1 && rs[0].OwnerKind == admission.Manual
+			})
+			status, err := h.store.HostStatus(ctx, h.hostID)
+			if err != nil || status != "draining" {
+				t.Fatalf("status = %q (%v), want draining", status, err)
+			}
+		})
+	}
+}
+
+func TestStandaloneApplyKeepsItsHoldAcrossControlPlaneRestart(t *testing.T) {
+	h := newApplyHarness(t)
+	ctx := context.Background()
+	holds := admission.NewStore(h.pool)
+	h.runner.deps.AcquireOwned = func(ctx context.Context, attemptID, hostID string) error {
+		_, err := holds.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, "Platform apply")
+		return err
+	}
+	h.runner.deps.ReleaseOwned = func(ctx context.Context, attemptID, hostID string) error {
+		_, err := holds.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, true)
+		return err
+	}
+	code, body := h.post(t, h.applyURL(), h.adminToken, HostApplyRequest{ReleaseID: h.release.ID, Force: true})
+	if code != http.StatusAccepted {
+		t.Fatalf("apply = %d %s", code, body)
+	}
+	waitFor(t, "release_apply to be sent", func() bool { return h.agent.sentCount() == 1 })
+	h.runner.Close()
+	rs, err := holds.List(ctx, h.hostID)
+	if err != nil || len(rs) != 1 || rs[0].OwnerKind != admission.Platform {
+		t.Fatalf("restart protection = %+v (%v), want platform hold", rs, err)
+	}
+	next := testRunner(h.store, h.runner.deps)
+	t.Cleanup(next.Close)
+	next.Adopt(ctx)
+	commit := h.release.SourceCommit
+	next.HandleRegister(ctx, h.hostID, &commit)
+	waitFor(t, "adopted attempt to release its own hold", func() bool {
+		rs, err := holds.List(ctx, h.hostID)
+		return err == nil && len(rs) == 0
+	})
+}
+
+func TestAdoptRetriesTerminalStandaloneHoldRelease(t *testing.T) {
+	for _, kind := range []string{KindApply, KindRevert} {
+		t.Run(kind, func(t *testing.T) {
+			h := newApplyHarness(t)
+			ctx := context.Background()
+			holds := admission.NewStore(h.pool)
+			attempt, err := h.store.CreateHostAttempt(ctx, NewHostAttempt{
+				Kind: kind, HostID: h.hostID, ReleaseID: &h.release.ID,
+				Requested: []ComponentDigest{}, Previous: []PreviousDigest{},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := holds.Acquire(ctx, h.hostID, admission.Owner{Kind: admission.Platform, ID: attempt.ID}, admission.ReasonPlatformApply); err != nil {
+				t.Fatal(err)
+			}
+			if kind == KindApply {
+				if _, err := holds.Acquire(ctx, h.hostID, admission.ManualOwner, admission.ReasonManualDrain); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := h.store.FailAttempt(ctx, attempt.ID, ReasonPullFailed, ""); err != nil {
+				t.Fatal(err)
+			}
+			// Simulate a crash or failed DB call after terminalization: the
+			// attempt is absent from OpenAttempts but its restriction remains.
+			if open, err := h.store.OpenAttempts(ctx); err != nil || len(open) != 0 {
+				t.Fatalf("open attempts after terminalization = %+v (%v)", open, err)
+			}
+			failedBoot := testRunner(h.store, ApplyDeps{
+				ReleaseOwned: func(context.Context, string, string) error { return errors.New("transient release failure") },
+			})
+			failedBoot.Adopt(ctx)
+			failedBoot.Close()
+			rs, err := holds.List(ctx, h.hostID)
+			if err != nil || len(rs) == 0 || rs[len(rs)-1].OwnerKind != admission.Platform {
+				t.Fatalf("hold after failed boot cleanup = %+v (%v)", rs, err)
+			}
+			nextBoot := testRunner(h.store, ApplyDeps{
+				ReleaseOwned: func(ctx context.Context, attemptID, hostID string) error {
+					_, err := holds.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, kind == KindApply)
+					return err
+				},
+			})
+			nextBoot.Adopt(ctx)
+			nextBoot.Adopt(ctx) // repeated boot delivery is idempotent
+			nextBoot.Close()
+			rs, err = holds.List(ctx, h.hostID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := 0
+			status := "offline"
+			if kind == KindApply {
+				want, status = 1, "draining"
+			}
+			if len(rs) != want || (want == 1 && rs[0].OwnerKind != admission.Manual) {
+				t.Fatalf("holds after retry = %+v, want %d other-owner holds", rs, want)
+			}
+			if got, err := h.store.HostStatus(ctx, h.hostID); err != nil || got != status {
+				t.Fatalf("status after retry = %q (%v), want %q", got, err, status)
+			}
+		})
 	}
 }
 

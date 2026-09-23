@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/access"
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
 	"github.com/accreleus/quasar/control-plane/internal/artwork"
 	"github.com/accreleus/quasar/control-plane/internal/audit"
@@ -960,13 +961,17 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// session, because the recreate does that and doing it twice can only fail
 	// halfway. Uncordon's ErrHostNotResumable on an offline host is expected —
 	// a host mid-recreate has no agent, and its register brings it back online.
+	admissionStore := admission.NewStore(pool)
 	applyRunner := platform.NewRunner(platformStore, platform.ApplyDeps{
-		Cordon: func(ctx context.Context, hostID string) error {
-			_, err := coordinator.DrainHost(ctx, hostID, false)
+		AcquireOwned: func(ctx context.Context, attemptID, hostID string) error {
+			_, err := admissionStore.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, "Platform apply")
 			return err
 		},
-		Uncordon: func(ctx context.Context, hostID string) error {
-			_, err := coordinator.UncordonHost(ctx, hostID)
+		ReleaseOwned: func(ctx context.Context, attemptID, hostID string) error {
+			_, err := admissionStore.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, agentRegistry.IsConnected(hostID))
+			if errors.Is(err, admission.ErrHostNotFound) {
+				return nil
+			}
 			return err
 		},
 		Send: func(ctx context.Context, hostID string, cmd platform.ApplyCommand) (platform.Ack, error) {
@@ -1025,19 +1030,20 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// it is about to be recreated at its own step. Whether the control-plane step
 	// also DRAINS is a per-release decision (#153) that lives in the sequencer.
 	fleetCordons := platform.FleetCordons{
-		Cordon: func(ctx context.Context, hostID string) error {
-			_, err := coordinator.DrainHost(ctx, hostID, false)
+		AcquireOwned: func(ctx context.Context, runID, hostID string) error {
+			_, err := admissionStore.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: runID}, "Platform apply")
 			return err
 		},
-		Uncordon: func(ctx context.Context, hostID string) error {
-			_, err := coordinator.UncordonHost(ctx, hostID)
+		ReleaseOwned: func(ctx context.Context, runID, hostID string) error {
+			_, err := admissionStore.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: runID}, agentRegistry.IsConnected(hostID))
+			if errors.Is(err, admission.ErrHostNotFound) {
+				return nil
+			}
 			return err
 		},
-		// force=true: stop the sessions, do not merely stop new placement. Used
-		// only by a migrating control-plane step under `force` (#153).
-		Drain: func(ctx context.Context, hostID string) error {
-			_, err := coordinator.DrainHost(ctx, hostID, true)
-			return err
+		IsConnected: agentRegistry.IsConnected,
+		DrainOwned: func(ctx context.Context, _, hostID string) error {
+			return coordinator.StopHostSessions(ctx, hostID)
 		},
 	}
 	// Outbound release notification (#123). The webhook is resolved per pass and

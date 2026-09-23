@@ -7,6 +7,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -19,6 +20,30 @@ func hostStatus(t *testing.T, pool *pgxpool.Pool, hostID string) string {
 		t.Fatalf("read status: %v", err)
 	}
 	return status
+}
+
+func TestReconnectPreservesOwnedRestrictionAfterOfflineProjection(t *testing.T) {
+	pool := testPool(t)
+	s := &agentStore{pool: pool}
+	hostID := seedHostWithSecret(t, pool, "owned-reconnect-host", "secret-rh05")
+	holds := admission.NewStore(pool)
+	ctx := context.Background()
+	if _, err := holds.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform,
+		ID: "00000000-0000-0000-0000-000000000123"}, "Platform apply"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.markOffline(ctx, hostID); err != nil {
+		t.Fatal(err)
+	}
+	if got := hostStatus(t, pool, hostID); got != "draining" {
+		t.Fatalf("disconnect status = %q, want draining while owner holds", got)
+	}
+	if _, err := s.reconnectHost(ctx, "owned-reconnect-host", "0.3.0", "secret-rh05"); err != nil {
+		t.Fatal(err)
+	}
+	if got := hostStatus(t, pool, hostID); got != "draining" {
+		t.Fatalf("reconnect status = %q, want draining while owner holds", got)
+	}
 }
 
 func setHostStatus(t *testing.T, pool *pgxpool.Pool, hostID, status string) {

@@ -1476,6 +1476,18 @@ Nothing prompts. `make session-verdict` is safe in a script or a cron line.
 
 ## Per-host runtime overrides (admin UI)
 
+### Host drains after the RH05 admission migration
+
+Migration 0088 conservatively records a `legacy_drain` restriction for every
+host it finds draining. This includes a host already cordoned by a platform
+apply: the previous single status column cannot reveal whether an operator
+also requested a drain during that apply. A platform apply that delivers the
+migration can therefore finish while one or more hosts remain draining. Check
+each host's `admission_restrictions` in the Fleet console or Host read, confirm
+that its remaining work may resume, then use **Release operator drain** on that
+host. This releases the legacy/manual restriction only; a platform, recovery
+or configuration operation retains its own restriction until it completes.
+
 Most node-agent runtime knobs above are also settable **per host** from the admin
 UI (`/admin/hosts` → **Settings**), so an operator can adjust them without editing
 a host's `.env` and restarting the container by hand. The value is stored in the

@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
 	"github.com/accreleus/quasar/control-plane/internal/readiness"
@@ -170,14 +171,15 @@ type streamDefaultsResp struct {
 }
 
 type hostResp struct {
-	ID             string  `json:"id"`
-	NodeName       string  `json:"node_name"`
-	Status         string  `json:"status"`
-	AgentVersion   *string `json:"agent_version"`
-	CPUCores       *int32  `json:"cpu_cores"`
-	MemMB          *int32  `json:"mem_mb"`
-	LastRegistered *string `json:"last_registered_at"`
-	LastHeartbeat  *string `json:"last_heartbeat_at"`
+	ID                    string                  `json:"id"`
+	NodeName              string                  `json:"node_name"`
+	Status                string                  `json:"status"`
+	AdmissionRestrictions []admission.Restriction `json:"admission_restrictions"`
+	AgentVersion          *string                 `json:"agent_version"`
+	CPUCores              *int32                  `json:"cpu_cores"`
+	MemMB                 *int32                  `json:"mem_mb"`
+	LastRegistered        *string                 `json:"last_registered_at"`
+	LastHeartbeat         *string                 `json:"last_heartbeat_at"`
 	// Storage, CPUModel: always serialized, null until an amendment-aware agent
 	// reports (openapi.yaml Host.storage/cpu_model, both required).
 	Storage  json.RawMessage `json:"storage"`
@@ -339,6 +341,10 @@ func hostToResp(h Host) hostResp {
 	if overrides == nil {
 		overrides = []readinessgate.Override{}
 	}
+	restrictions := h.AdmissionRestrictions
+	if restrictions == nil {
+		restrictions = []admission.Restriction{}
+	}
 	// Identity's built_at is served UTC: the agent sends RFC3339, the column is
 	// timestamptz, and a client rendering "built 3 days ago" should not have to
 	// reason about the control plane's local zone.
@@ -348,30 +354,31 @@ func hostToResp(h Host) hostResp {
 		builtAt = &s
 	}
 	return hostResp{
-		ID:                  h.ID,
-		NodeName:            h.NodeName,
-		Status:              h.Status,
-		AgentVersion:        h.AgentVersion,
-		CPUCores:            h.CPUCores,
-		MemMB:               h.MemMB,
-		LastRegistered:      lastReg,
-		LastHeartbeat:       lastHb,
-		Storage:             h.Storage,
-		CPUModel:            h.CPUModel,
-		Readiness:           h.Readiness,
-		ReadinessReportedAt: readinessAt,
-		ReadinessGate:       gate,
-		ReadinessOverrides:  overrides,
-		CapacityDetection:   h.CapacityDetection,
-		CapacityReason:      h.CapacityReason,
-		Capacity:            h.Capacity,
-		AgentConnectedSince: connectedSince,
-		AgentRestartCount:   h.AgentRestartCount,
-		AgentLastRestartAt:  lastRestart,
-		SourceCommit:        h.SourceCommit,
-		BuiltAt:             builtAt,
-		InstallMode:         h.InstallMode,
-		UpdaterPresent:      h.UpdaterPresent,
+		ID:                    h.ID,
+		NodeName:              h.NodeName,
+		Status:                h.Status,
+		AdmissionRestrictions: restrictions,
+		AgentVersion:          h.AgentVersion,
+		CPUCores:              h.CPUCores,
+		MemMB:                 h.MemMB,
+		LastRegistered:        lastReg,
+		LastHeartbeat:         lastHb,
+		Storage:               h.Storage,
+		CPUModel:              h.CPUModel,
+		Readiness:             h.Readiness,
+		ReadinessReportedAt:   readinessAt,
+		ReadinessGate:         gate,
+		ReadinessOverrides:    overrides,
+		CapacityDetection:     h.CapacityDetection,
+		CapacityReason:        h.CapacityReason,
+		Capacity:              h.Capacity,
+		AgentConnectedSince:   connectedSince,
+		AgentRestartCount:     h.AgentRestartCount,
+		AgentLastRestartAt:    lastRestart,
+		SourceCommit:          h.SourceCommit,
+		BuiltAt:               builtAt,
+		InstallMode:           h.InstallMode,
+		UpdaterPresent:        h.UpdaterPresent,
 	}
 }
 
