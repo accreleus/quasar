@@ -36,7 +36,7 @@ pub enum RuntimeFault {
     Unconfigured(String),
     /// The runtime client could not ask this refresh (busy, cancelled) or the reply made no
     /// sense; the verdict warns and the next refresh tries again.
-    Inconclusive(String),
+    Indeterminate(String),
 }
 
 impl From<RuntimeError> for RuntimeFault {
@@ -58,9 +58,9 @@ impl From<RuntimeError> for RuntimeFault {
                     .into(),
             ),
             ErrorKind::Busy | ErrorKind::Cancelled => {
-                RuntimeFault::Inconclusive("the runtime client was busy this refresh".into())
+                RuntimeFault::Indeterminate("the runtime client was busy this refresh".into())
             }
-            _ => RuntimeFault::Inconclusive(error.to_string()),
+            _ => RuntimeFault::Indeterminate(error.to_string()),
         }
     }
 }
@@ -191,7 +191,7 @@ fn check_runtime_endpoint_inner(view: &RuntimeView) -> ReadinessCheck {
              the agent speaks to one explicit Unix endpoint (docs/configuration.md)."
                 .into(),
         ),
-        Err(RuntimeFault::Inconclusive(reason)) => super::warn_check(
+        Err(RuntimeFault::Indeterminate(reason)) => super::warn_check(
             ENDPOINT_ID,
             format!(
                 "the container runtime at {endpoint} could not be inspected this refresh: {reason}"

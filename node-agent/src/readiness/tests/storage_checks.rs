@@ -242,14 +242,14 @@ fn a_missing_homes_root_fails_naming_the_mount() {
         c.remediation.contains("mount"),
         "a root absent inside the container is a mount problem: {c:?}"
     );
-    // Space could not be read either: inconclusive, never a failure of its own.
+    // Space could not be read either: indeterminate, never a failure of its own.
     let free = get(&checks, HOMES_FREE_SPACE_ID);
     assert_eq!(free.status, WARN, "{free:?}");
 }
 
 #[test]
-fn an_inconclusive_io_error_warns_with_its_reason() {
-    let root = FakeRoot::new("storage-inconclusive");
+fn an_indeterminate_io_error_warns_with_its_reason() {
+    let root = FakeRoot::new("storage-indeterminate");
     // The configured root is a regular file: the write test cannot start, and that is
     // neither a permission nor a space problem.
     root.file("var/lib/quasar/homes", "");
@@ -291,17 +291,17 @@ fn the_probe_leaf_is_removed_even_when_the_write_fails_part_way() {
     });
 
     match outcome {
-        WriteOutcome::Inconclusive { stage, reason } => {
+        WriteOutcome::Indeterminate { stage, reason } => {
             assert_eq!(stage, WriteStage::WriteFile);
             assert!(reason.contains("disk went away"), "{reason}");
         }
-        other => panic!("expected an inconclusive outcome, got {other:?}"),
+        other => panic!("expected an indeterminate outcome, got {other:?}"),
     }
     assert_eq!(entries(&homes), Vec::<String>::new(), "the leaf is gone");
 }
 
 #[test]
-fn a_write_that_runs_out_of_space_is_exhausted_not_inconclusive() {
+fn a_write_that_runs_out_of_space_is_exhausted_not_indeterminate() {
     let root = FakeRoot::new("storage-enospc");
     let homes = root.dir.join("homes");
     fs::create_dir_all(&homes).unwrap();

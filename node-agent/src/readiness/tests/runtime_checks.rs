@@ -238,7 +238,7 @@ fn only_a_definitive_engine_fault_skips_the_other_engine_calls() {
     }
     for fault in [
         RuntimeFault::IncompatibleApi("too old".into()),
-        RuntimeFault::Inconclusive("busy".into()),
+        RuntimeFault::Indeterminate("busy".into()),
     ] {
         assert!(
             observed(Err(fault.clone())).engine_answered(),
@@ -273,7 +273,7 @@ fn a_timeout_reads_as_unreachable() {
     // A busy client is not a broken engine.
     assert!(matches!(
         RuntimeFault::from(RuntimeError::from(ErrorKind::Busy)),
-        RuntimeFault::Inconclusive(_)
+        RuntimeFault::Indeterminate(_)
     ));
 }
 
@@ -317,11 +317,11 @@ fn a_denied_socket_fails_the_endpoint_with_a_permission_fix() {
 }
 
 #[test]
-fn an_inconclusive_inspection_warns_and_never_fails() {
+fn an_indeterminate_inspection_warns_and_never_fails() {
     let root = FakeRoot::new("runtime-busy");
     let checks = probe(&observed(
         &root,
-        Err(RuntimeFault::Inconclusive("busy".into())),
+        Err(RuntimeFault::Indeterminate("busy".into())),
     ));
     let endpoint = get(&checks, ENDPOINT_ID);
     assert_eq!(endpoint.status, WARN, "{endpoint:?}");
