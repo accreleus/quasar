@@ -180,6 +180,12 @@ func TestAdmissionSQLMatchesPreRefactor(t *testing.T) {
 		if !ok {
 			t.Fatalf("anchor line %d is not <shape>\\t<sql>", line)
 		}
+		// RH05 adds an independent settings-delivery gate to every place a
+		// reported GPU can be admitted. Keep the historical capture intact and
+		// compare it after this single mechanical predicate insertion.
+		sql = strings.ReplaceAll(sql,
+			"AND h.capacity_detection = 'ok' AND g.reported",
+			"AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported")
 		seen[shape]++
 		if index[shape] == nil {
 			t.Errorf("anchor line %d names unknown shape %q", line, shape)

@@ -156,9 +156,10 @@ type CaptureParams struct {
 // (hostcfg.Resolve); the agent overlays it and applies live knobs on the next
 // session. Older agents ignore unknown message types.
 type ConfigUpdateCmd struct {
-	SourcePolicies *preparation.Policies `json:"source_policies,omitempty"`
-	Type           string                `json:"type"` // "config_update"
-	Settings       map[string]any        `json:"settings"`
+	SourcePolicies     *preparation.Policies `json:"source_policies,omitempty"`
+	Type               string                `json:"type"` // "config_update"
+	Settings           map[string]any        `json:"settings"`
+	SettingsDeliveryID string                `json:"settings_delivery_id,omitempty"`
 	// Resolved console-mode config (CM-01, agent-api.md
 	// `config_update.console_config`). Typed `any` rather than importing
 	// internal/console — only the JSON shape is load-bearing.

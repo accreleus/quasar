@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -61,14 +62,53 @@ func NewRegistry(log *slog.Logger) *Registry {
 // conn is one live agent connection. A single writer goroutine drains out; all
 // sends enqueue onto it (gorilla allows only one concurrent writer).
 type conn struct {
-	hostID string
-	ws     *websocket.Conn
-	out    chan []byte
-	done   chan struct{}
+	hostID                    string
+	policyTyped               bool
+	policyAccepted            []string
+	policyAcknowledged        atomic.Bool
+	policyInventoryDone       atomic.Bool
+	policyInventoryBlocked    atomic.Bool
+	policyInventoryID         string
+	policyInventorySnapshotID string
+	policyInventoryCursor     *string
+	policyInventoryHeader     []byte
+	policyOutstanding         map[string]ConfigPolicyStateMsg
+	policyUncertain           bool
+	policyDeliveryID          string
+	bootIncarnation           string
+	connectionIncarnation     string
+	ws                        *websocket.Conn
+	out                       chan []byte
+	done                      chan struct{}
 
 	mu     sync.Mutex
 	closed bool
 	acks   map[string]chan AckResult
+}
+
+// SupportsTypedSettings describes the current authenticated connection only.
+// A reconnect with an older agent replaces the capability immediately.
+func (r *Registry) SupportsTypedSettings(hostID string) bool {
+	c, ok := r.get(hostID)
+	return ok && c.policyTyped
+}
+
+func (r *Registry) PolicyIdentity(hostID string) (string, string, bool) {
+	c, ok := r.get(hostID)
+	if !ok || !c.policyTyped {
+		return "", "", false
+	}
+	return c.bootIncarnation, c.connectionIncarnation, true
+}
+
+// PolicyLegacyDelivery exposes only current-connection writer ownership and
+// whether the initial full-map inventory handshake permits later maps.
+func (r *Registry) PolicyLegacyDelivery(hostID string) (string, []string, bool, bool) {
+	c, ok := r.get(hostID)
+	if !ok || !c.policyTyped {
+		return "", nil, false, false
+	}
+	return c.connectionIncarnation, append([]string(nil), c.policyAccepted...), c.policyAcknowledged.Load() && c.policyInventoryDone.Load() && !c.policyInventoryBlocked.Load(), true
 }
 
 func newConn(hostID string, ws *websocket.Conn) *conn {
