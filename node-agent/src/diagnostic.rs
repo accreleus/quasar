@@ -10,6 +10,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::{self, Message};
 use tracing::{debug, error, info, warn};
 
+use crate::images::ImageManager;
 use crate::messages::{AgentMsg, ControlMsg, ReadinessCheck};
 use crate::readiness::report::ReadinessReport;
 use crate::runtime::RuntimeClient;
@@ -17,6 +18,7 @@ use crate::runtime::RuntimeClient;
 /// The agent's own safety state on the readiness card. Retained through
 /// `ReadinessReport`, so no local refresh can drop it; no override lifts the refusal.
 pub const STARTUP_CLEANUP_ID: &str = "startup_cleanup";
+pub const POLICY_JOURNAL_ID: &str = "policy_journal";
 
 /// Work that must not start while the startup cleanup is unresolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -54,6 +56,7 @@ pub struct CleanupAttempt {
 pub enum Fault {
     RuntimeUnusable(String),
     CleanupUnresolved(String),
+    PolicyJournalCorrupt,
 }
 
 impl Fault {
@@ -62,6 +65,7 @@ impl Fault {
         match self {
             Fault::RuntimeUnusable(_) => "runtime_unusable",
             Fault::CleanupUnresolved(_) => "startup_cleanup_unresolved",
+            Fault::PolicyJournalCorrupt => "policy_journal_unavailable",
         }
     }
 
@@ -73,6 +77,9 @@ impl Fault {
             Fault::CleanupUnresolved(detail) => format!(
                 "cleanup of applications left by the previous agent has not finished ({detail})"
             ),
+            Fault::PolicyJournalCorrupt => {
+                "the host configuration journal cannot be read safely".into()
+            }
         }
     }
 }
@@ -95,8 +102,14 @@ pub enum Phase {
 }
 
 impl Phase {
-    pub fn may_start(&self, _work: Work) -> bool {
-        matches!(self, Phase::Normal)
+    pub fn may_start(&self, work: Work) -> bool {
+        match self {
+            Phase::Normal => true,
+            Phase::Diagnostic(Fault::PolicyJournalCorrupt) => {
+                matches!(work, Work::ImagePulls | Work::ImagePruning)
+            }
+            Phase::Diagnostic(_) => false,
+        }
     }
 
     pub fn health_ready(&self) -> bool {
@@ -107,6 +120,9 @@ impl Phase {
     pub fn launch_refusal(&self) -> Option<String> {
         match self {
             Phase::Normal => None,
+            Phase::Diagnostic(Fault::PolicyJournalCorrupt) => Some(
+                "host in diagnostic mode (policy_journal_unavailable): the host configuration journal cannot be read safely. Every launch remains refused until an operator repairs the journal and restarts the agent; no readiness override lifts this.".into(),
+            ),
             Phase::Diagnostic(fault) => Some(format!(
                 "host in diagnostic mode ({}): {}. This host refuses every launch until its \
                  startup cleanup succeeds; the agent retries on its own and no override lifts \
@@ -121,20 +137,25 @@ impl Phase {
         let Phase::Diagnostic(fault) = self else {
             return None;
         };
+        let (id, remediation, source) = if matches!(fault, Fault::PolicyJournalCorrupt) {
+            (POLICY_JOURNAL_ID,
+             "Inspect the agent's host configuration journal and its persistent mount. Repair it from a verified backup, then restart the agent. Keep operation journals and managed homes in place; do not clear admission protection to bypass this failure.",
+             "agent")
+        } else {
+            (STARTUP_CLEANUP_ID,
+             "Start or repair the container runtime on the endpoint this agent is configured for (see the Container runtime checks), and leave the agent's operation journals and managed homes in place. The agent retries the cleanup on its own and resumes without a restart.",
+             "runtime")
+        };
         Some(ReadinessCheck {
-            id: STARTUP_CLEANUP_ID.into(),
+            id: id.into(),
             status: crate::readiness::FAIL.into(),
             summary: format!(
                 "Diagnostic mode: {}. Every launch on this host is refused.",
                 fault.sentence()
             ),
-            remediation: "Start or repair the container runtime on the endpoint this agent is \
-                          configured for (see the Container runtime checks), and leave the \
-                          agent's operation journals and managed homes in place. The agent \
-                          retries the cleanup on its own and resumes without a restart."
-                .into(),
+            remediation: remediation.into(),
             observed_at: None,
-            source: Some("runtime".into()),
+            source: Some(source.into()),
             // Agent-enforced: it refuses these launches itself, and no readiness
             // override lifts them (protocol/agent-api.md `readiness`).
             blocks: Some(crate::messages::ReadinessBlocks::host("agent")),
@@ -172,6 +193,9 @@ impl Startup {
         if self.phase == Phase::Normal {
             return Transition::AlreadyNormal;
         }
+        if matches!(self.phase, Phase::Diagnostic(Fault::PolicyJournalCorrupt)) {
+            return Transition::StillDiagnostic;
+        }
         match retry.fault() {
             Some(fault) => {
                 self.phase = Phase::Diagnostic(fault);
@@ -185,21 +209,31 @@ impl Startup {
     }
 }
 
-static PROCESS_STATION: std::sync::OnceLock<std::sync::Arc<Station>> = std::sync::OnceLock::new();
+// Startup cleanup may resume before an independently corrupt policy journal is
+// discovered. Retain both stations: a later safety refusal must still gate work.
+static PROCESS_STATIONS: std::sync::OnceLock<Mutex<Vec<Arc<Station>>>> = std::sync::OnceLock::new();
 
 /// Whether `work` may start in this process: always, unless it is in diagnostic mode.
 pub fn may_start(work: Work) -> bool {
-    PROCESS_STATION
-        .get()
-        .is_none_or(|station| station.phase().may_start(work))
+    PROCESS_STATIONS.get().is_none_or(|stations| {
+        stations
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|station| station.phase().may_start(work))
+    })
 }
 
 /// The one flag the host-probe orchestrator reads before starting a probe. False when
 /// this process never entered diagnostic mode.
 pub fn host_probes_withheld() -> bool {
-    PROCESS_STATION
-        .get()
-        .is_some_and(|station| station.host_probes_withheld())
+    PROCESS_STATIONS.get().is_some_and(|stations| {
+        stations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|station| station.host_probes_withheld())
+    })
 }
 
 /// One boot cleanup pass: discovery, then every journalled obligation a previous agent
@@ -354,6 +388,19 @@ impl Station {
     /// `None` when the first pass was clean: that process never enters diagnostic mode.
     pub fn enter(first: &CleanupAttempt) -> Option<Arc<Station>> {
         let startup = Startup::begin(first);
+        Self::from_startup(startup)
+    }
+
+    /// A corrupt policy journal is a fixed diagnostic state. Cleanup retries
+    /// cannot repair it or authorize resumed admission in this process.
+    pub fn policy_journal_corrupt() -> Arc<Station> {
+        Self::from_startup(Startup {
+            phase: Phase::Diagnostic(Fault::PolicyJournalCorrupt),
+        })
+        .expect("policy journal fault is diagnostic")
+    }
+
+    fn from_startup(startup: Startup) -> Option<Arc<Station>> {
         let check = startup.phase().safety_check()?;
         let mut readiness = ReadinessReport::default();
         readiness.retain(check, SystemTime::now());
@@ -432,10 +479,19 @@ impl Station {
     }
 }
 
-/// Makes `station` the process's, so the free [`host_probes_withheld`] answers for it.
-/// Idempotent; a second call is ignored.
+/// Retains every process safety station so a later independent fault remains
+/// enforced after an earlier startup cleanup resumed.
 pub(crate) fn install_process_wide(station: &Arc<Station>) {
-    let _ = PROCESS_STATION.set(station.clone());
+    let mut stations = PROCESS_STATIONS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    if !stations
+        .iter()
+        .any(|existing| Arc::ptr_eq(existing, station))
+    {
+        stations.push(station.clone());
+    }
 }
 
 /// How a retry loop paces itself. A plain [`Duration`] is a fixed interval; production
@@ -553,6 +609,7 @@ where
         station,
         observe,
         refresh,
+        None,
     )
     .await
 }
@@ -569,12 +626,16 @@ pub async fn serve_registered<S, R, F>(
     station: &Arc<Station>,
     mut observe: F,
     refresh: Duration,
+    image_mgr: Option<&Arc<ImageManager>>,
 ) -> anyhow::Result<ConnectionEnd>
 where
     S: SinkExt<Message, Error = tungstenite::Error> + Unpin,
     R: StreamExt<Item = Result<Message, tungstenite::Error>> + Unpin,
     F: FnMut() -> (AgentMsg, Vec<ReadinessCheck>) + Send,
 {
+    let (image_tx, image_rx) = tokio::sync::mpsc::channel(64);
+    let _image_guard = image_mgr.map(|manager| manager.attach_upstream(image_tx));
+    let mut image_rx = image_mgr.map(|_| image_rx);
     report_capacity(sink, station, &mut observe).await?;
 
     let mut heartbeat = tokio::time::interval(Duration::from_millis(heartbeat_interval_ms.max(1)));
@@ -599,6 +660,18 @@ where
                 }).await?;
             }
             _ = refresher.tick() => report_capacity(sink, station, &mut observe).await?,
+            image = async {
+                match &mut image_rx {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(image) = image {
+                    crate::agent::send(sink, &image).await?;
+                } else {
+                    image_rx = None;
+                }
+            },
             inbound = stream.next() => {
                 let raw = match inbound {
                     None | Some(Ok(Message::Close(_))) => {
@@ -608,7 +681,7 @@ where
                     Some(Ok(Message::Text(text))) => text.to_string(),
                     Some(Ok(_)) => continue,
                 };
-                answer(sink, station, &raw).await?;
+                answer(sink, station, image_mgr, &raw).await?;
             }
         }
     }
@@ -643,9 +716,14 @@ fn ack_id(raw: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Answer one control message. Every variant carrying an ack `id` is decided here:
-/// anything that asks this host to do or mutate something is nacked with the refusal.
-async fn answer<S>(sink: &mut S, station: &Arc<Station>, raw: &str) -> anyhow::Result<()>
+/// Answer one control message. Image work remains independent of a corrupt policy
+/// journal; commands tied to host configuration or sessions are refused.
+async fn answer<S>(
+    sink: &mut S,
+    station: &Arc<Station>,
+    image_mgr: Option<&Arc<ImageManager>>,
+    raw: &str,
+) -> anyhow::Result<()>
 where
     S: SinkExt<Message, Error = tungstenite::Error> + Unpin,
 {
@@ -680,6 +758,7 @@ where
         ok: false,
         error: refusal.clone(),
     };
+    let image_commands_allowed = matches!(&phase, Phase::Diagnostic(Fault::PolicyJournalCorrupt));
     match control {
         ControlMsg::SessionAssign { id, session_id, .. } => {
             warn!(
@@ -695,9 +774,6 @@ where
         | ControlMsg::SessionSwapApp { id, .. }
         | ControlMsg::SessionDisplayUpdate { id, .. }
         | ControlMsg::SessionCapture { id, .. }
-        | ControlMsg::ImageEnsure { id, .. }
-        | ControlMsg::ImageRemove { id, .. }
-        | ControlMsg::ImageBuild { id, .. }
         | ControlMsg::ReleaseApply { id, .. } => {
             warn!(
                 token = "control-command-refused-diagnostic",
@@ -706,9 +782,58 @@ where
             );
             crate::agent::send(sink, &nack(id)).await?;
         }
-        // An operator must still be able to restart the agent, so this behaves
-        // exactly as the normal loop does.
+        ControlMsg::ImageEnsure {
+            id,
+            image_id,
+            registry_ref,
+            version,
+        } => {
+            let reply = image_mgr
+                .filter(|_| image_commands_allowed)
+                .map(|manager| manager.handle_ensure(id.clone(), image_id, registry_ref, version))
+                .unwrap_or_else(|| nack(id));
+            crate::agent::send(sink, &reply).await?;
+        }
+        ControlMsg::ImageRemove { id, image_id } => {
+            let reply = image_mgr
+                .filter(|_| image_commands_allowed)
+                .map(|manager| manager.handle_remove(id.clone(), image_id))
+                .unwrap_or_else(|| nack(id));
+            crate::agent::send(sink, &reply).await?;
+        }
+        ControlMsg::ImageBuild {
+            id,
+            image_id,
+            context_url,
+            context_subdir,
+            dockerfile,
+            build_args,
+            local_tag,
+            version,
+        } => {
+            let reply = image_mgr
+                .filter(|_| image_commands_allowed)
+                .map(|manager| {
+                    manager.handle_build(
+                        id.clone(),
+                        image_id,
+                        context_url,
+                        context_subdir,
+                        dockerfile,
+                        build_args,
+                        local_tag,
+                        version,
+                    )
+                })
+                .unwrap_or_else(|| nack(id));
+            crate::agent::send(sink, &reply).await?;
+        }
         ControlMsg::Restart { id } => {
+            if matches!(phase, Phase::Diagnostic(Fault::PolicyJournalCorrupt)) {
+                crate::agent::send(sink, &nack(id)).await?;
+                return Ok(());
+            }
+            // Cleanup diagnostic mode still lets an operator restart the agent.
             info!("restart requested (cmd {id}); acking then exiting for config reload");
             let _ = crate::agent::send(
                 sink,
@@ -772,6 +897,29 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    #[derive(Default)]
+    struct Outbound(Vec<Message>);
+
+    impl futures_util::Sink<Message> for Outbound {
+        type Error = tungstenite::Error;
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            self.get_mut().0.push(item);
+            Ok(())
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     fn attempt(engine: Result<(), &str>, retirement: Result<(), &str>) -> CleanupAttempt {
         CleanupAttempt {
@@ -829,6 +977,108 @@ mod tests {
         assert!(Phase::Normal.health_ready());
         assert_eq!(Phase::Normal.launch_refusal(), None);
         assert_eq!(Phase::Normal.safety_check(), None);
+    }
+
+    #[test]
+    fn corrupt_policy_journal_stays_in_operator_repair_diagnostic_mode() {
+        let station = Station::policy_journal_corrupt();
+        let phase = station.phase();
+        assert!(!phase.health_ready());
+        let refusal = phase.launch_refusal().expect("launch must be refused");
+        assert!(refusal.contains("policy_journal_unavailable"));
+        assert!(refusal.contains("repairs the journal"));
+        let checks = station.readiness(Vec::new());
+        let check = checks
+            .iter()
+            .find(|check| check.id == POLICY_JOURNAL_ID)
+            .expect("agent must report a durable-journal readiness failure");
+        assert_eq!(check.status, crate::readiness::FAIL);
+        assert_eq!(
+            check.blocks,
+            Some(crate::messages::ReadinessBlocks::host("agent"))
+        );
+        assert!(check.remediation.contains("verified backup"));
+        for work in WITHHELD {
+            assert_eq!(
+                phase.may_start(work),
+                matches!(work, Work::ImagePulls | Work::ImagePruning),
+                "{work:?} has the wrong policy-journal dependency"
+            );
+        }
+        assert_eq!(
+            station.observe(&attempt(Ok(()), Ok(()))),
+            Transition::StillDiagnostic
+        );
+        assert_eq!(station.resumes(), 0);
+        assert!(matches!(
+            station.phase(),
+            Phase::Diagnostic(Fault::PolicyJournalCorrupt)
+        ));
+    }
+
+    #[tokio::test]
+    async fn corrupt_policy_journal_refuses_restart_and_policy_offers_on_the_wire() {
+        let station = Station::policy_journal_corrupt();
+        let mut outbound = Outbound::default();
+        answer(
+            &mut outbound,
+            &station,
+            None,
+            r#"{"type":"restart","id":"restart-1"}"#,
+        )
+        .await
+        .unwrap();
+        answer(&mut outbound, &station, None, r#"{"type":"config_policy_offer","attempt_id":"a","host_id":"h","boot_incarnation":"b","connection_incarnation":"c","group":"hardware","revision":"r","content_sha256":"s","scope":"host","expires_at":"now","prerequisites_sha256":"p","prerequisites":[],"settings":{},"resolved_settings":{}}"#)
+            .await.unwrap();
+        let replies: Vec<serde_json::Value> = outbound
+            .0
+            .iter()
+            .map(|message| serde_json::from_str(message.to_text().unwrap()).unwrap())
+            .collect();
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0]["type"], "ack");
+        assert_eq!(replies[0]["ok"], false);
+        assert_eq!(replies[1]["type"], "config_policy_state");
+        assert_eq!(replies[1]["phase"], "failed");
+        assert_eq!(replies[1]["error"], "diagnostic_mode");
+    }
+
+    #[tokio::test]
+    async fn corrupt_policy_journal_keeps_independent_image_removal_available() {
+        let station = Station::policy_journal_corrupt();
+        let manager = ImageManager::new(
+            crate::session::container::ContainerRuntime::from_env(),
+            String::new(),
+        );
+        let mut outbound = Outbound::default();
+        answer(
+            &mut outbound,
+            &station,
+            Some(&manager),
+            r#"{"type":"image_remove","id":"remove-1","image_id":"absent-image"}"#,
+        )
+        .await
+        .unwrap();
+        answer(
+            &mut outbound,
+            &station,
+            Some(&manager),
+            r#"{"type":"restart","id":"restart-1"}"#,
+        )
+        .await
+        .unwrap();
+        let replies: Vec<serde_json::Value> = outbound
+            .0
+            .iter()
+            .map(|message| serde_json::from_str(message.to_text().unwrap()).unwrap())
+            .collect();
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0]["type"], "ack");
+        assert_eq!(
+            replies[0]["ok"], true,
+            "independent image work remains available"
+        );
+        assert_eq!(replies[1]["ok"], false, "policy restart remains refused");
     }
 
     #[test]

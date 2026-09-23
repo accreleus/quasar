@@ -214,6 +214,26 @@ pub enum BootOutcome {
     Uncertain(String),
 }
 
+/// A consumed restart marker has selected one exact group snapshot. The caller
+/// must prove this composed runtime against fresh host evidence before it can
+/// become an active snapshot or be reported to the control plane.
+pub enum BootPreparation {
+    Complete(BootOutcome),
+    Verify(Box<BootReadback>),
+}
+
+pub struct BootReadback {
+    attempt_id: String,
+    recovering: bool,
+    settings: RuntimeSettings,
+}
+
+impl BootReadback {
+    pub fn settings(&self) -> &RuntimeSettings {
+        &self.settings
+    }
+}
+
 pub struct PolicyAgent {
     path: PathBuf,
     host_id: String,
@@ -657,15 +677,15 @@ impl PolicyAgent {
     /// A fresh process may finish the marker consumed by `bootstrap` only
     /// after its startup baseline and durable overlay have been loaded. A
     /// reconnect in the same process sees the already terminal record.
-    pub fn finalize_boot(
+    pub fn prepare_boot(
         &mut self,
         outcome: &BootOutcome,
-        settings: &mut RuntimeSettings,
-    ) -> std::io::Result<BootOutcome> {
+        settings: &RuntimeSettings,
+    ) -> std::io::Result<BootPreparation> {
         let (id, recovering) = match outcome {
             BootOutcome::Candidate(id) => (id, false),
             BootOutcome::RecoveryVerify(id) => (id, true),
-            other => return Ok(other.clone()),
+            other => return Ok(BootPreparation::Complete(other.clone())),
         };
         let Some(record) = self.journal.records.get(id).cloned() else {
             return Err(std::io::Error::other("boot attempt disappeared"));
@@ -676,7 +696,26 @@ impl PolicyAgent {
             "verifying"
         };
         if record.phase != expected_phase {
-            return Ok(BootOutcome::None);
+            return Ok(BootPreparation::Complete(BootOutcome::None));
+        }
+        if !recovering {
+            let baseline = self.deployment_baseline.deployment_map();
+            let changed = record.settings.as_object().is_some_and(|choices| {
+                choices.iter().any(|(key, choice)| {
+                    choice["source"] == "deployment"
+                        && !baseline.get(key).is_some_and(|value| {
+                            record
+                                .resolved_settings
+                                .get(key)
+                                .is_some_and(|approved| policy_catalog::json_equal(value, approved))
+                        })
+                })
+            });
+            if changed {
+                return self
+                    .fail_boot(id, false, "deployment_baseline_changed")
+                    .map(BootPreparation::Complete);
+            }
         }
         let target = if recovering {
             record
@@ -699,10 +738,47 @@ impl PolicyAgent {
                         .is_some_and(|got| policy_catalog::json_equal(got, expected))
                 })
             });
-        if readback_ok {
-            *settings = next;
+        if !readback_ok {
+            return self
+                .fail_boot(id, recovering, "candidate_verification_failed")
+                .map(BootPreparation::Complete);
+        }
+        Ok(BootPreparation::Verify(Box::new(BootReadback {
+            attempt_id: id.clone(),
+            recovering,
+            settings: next,
+        })))
+    }
+
+    pub fn complete_boot(
+        &mut self,
+        readback: BootReadback,
+        proved: bool,
+        settings: &mut RuntimeSettings,
+    ) -> std::io::Result<BootOutcome> {
+        let id = &readback.attempt_id;
+        if !proved {
+            return self.fail_boot(id, readback.recovering, "candidate_verification_failed");
+        }
+        let Some(record) = self.journal.records.get(id).cloned() else {
+            return Err(std::io::Error::other("boot attempt disappeared"));
+        };
+        let expected_phase = if readback.recovering {
+            "recovery_verifying"
+        } else {
+            "verifying"
+        };
+        if record.phase != expected_phase {
+            return Err(std::io::Error::other("boot attempt phase changed"));
+        }
+        {
             let current = self.journal.records.get_mut(id).unwrap();
-            current.phase = if recovering { "recovered" } else { "applied" }.into();
+            current.phase = if readback.recovering {
+                "recovered"
+            } else {
+                "applied"
+            }
+            .into();
             current.sequence += 1;
             current.verified_at = Some(
                 OffsetDateTime::now_utc()
@@ -710,19 +786,28 @@ impl PolicyAgent {
                     .unwrap_or_default(),
             );
             current.verified_process_id = Some(std::process::id().to_string());
-            let active = if recovering {
+            let active = if readback.recovering {
                 current.known_good.clone().unwrap()
             } else {
                 ActiveGroup {
                     kind: "verified".into(),
                     digest: current.digest.clone(),
-                    resolved_settings: target,
+                    resolved_settings: current.resolved_settings.clone(),
                 }
             };
             self.journal.active_groups.insert(record.group, active);
             self.persist()?;
-            return Ok(BootOutcome::None);
         }
+        *settings = readback.settings;
+        Ok(BootOutcome::None)
+    }
+
+    fn fail_boot(
+        &mut self,
+        id: &str,
+        recovering: bool,
+        reason: &str,
+    ) -> std::io::Result<BootOutcome> {
         if recovering {
             let current = self.journal.records.get_mut(id).unwrap();
             current.phase = "uncertain".into();
@@ -731,12 +816,12 @@ impl PolicyAgent {
                 .error
                 .get_or_insert_with(|| "recovery_verification_failed".into());
             self.persist()?;
-            return Ok(BootOutcome::Uncertain(id.clone()));
+            return Ok(BootOutcome::Uncertain(id.into()));
         }
         let current = self.journal.records.get_mut(id).unwrap();
         current.phase = "failed".into();
         current.sequence += 1;
-        current.error = Some("candidate_verification_failed".into());
+        current.error = Some(reason.into());
         self.persist()?;
         record_restart_phase(&self.path, &mut self.journal, id, "recovery_verifying")?;
         record_restart_phase(
@@ -745,7 +830,7 @@ impl PolicyAgent {
             id,
             "recovery_awaiting_startup",
         )?;
-        Ok(BootOutcome::Recovery(id.clone()))
+        Ok(BootOutcome::Recovery(id.into()))
     }
 
     fn persist(&self) -> std::io::Result<()> {
@@ -982,19 +1067,11 @@ impl PolicyAgent {
             .unwrap()
             .sequence = 2;
         if self.persist().is_err() {
-            // Durable acceptance may have succeeded even if the marker did not.
-            // Do not start a restart unless the marker was proven persisted.
-            self.journal
-                .records
-                .get_mut(&offer.attempt_id)
-                .unwrap()
-                .phase = "accepted".into();
-            self.journal
-                .records
-                .get_mut(&offer.attempt_id)
-                .unwrap()
-                .sequence = 1;
-            return Ok(("accepted", 1));
+            // The marker may or may not have reached durable storage. Exit
+            // instead of leaving an accepted attempt parked in this process:
+            // bootstrap distinguishes the two states, and reconnect inventory
+            // tells the control plane which one survived.
+            return Err("journal_write_failed".into());
         }
         Ok(("awaiting_startup", 2))
     }
@@ -1617,6 +1694,20 @@ mod tests {
         .unwrap()
     }
 
+    fn finish_test_boot(
+        agent: &mut PolicyAgent,
+        outcome: &BootOutcome,
+        runtime: &mut RuntimeSettings,
+        proved: bool,
+    ) -> BootOutcome {
+        match agent.prepare_boot(outcome, runtime).unwrap() {
+            BootPreparation::Complete(result) => result,
+            BootPreparation::Verify(readback) => {
+                agent.complete_boot(*readback, proved, runtime).unwrap()
+            }
+        }
+    }
+
     #[test]
     fn hardware_offer_is_durable_before_restart_and_never_claims_prestart_application() {
         let dir = tempfile::tempdir().unwrap();
@@ -1676,6 +1767,102 @@ mod tests {
         assert_eq!(
             phase_of(&agent.accept_restart(offer, &runtime, true, None)).0,
             "awaiting_startup"
+        );
+    }
+
+    #[test]
+    fn ambiguous_restart_marker_write_forces_boot_reconciliation() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.json");
+        let mut runtime = RuntimeSettings::baseline_with(&|_| None);
+        let baseline = runtime.clone();
+        let mut agent = open_at(&path, &mut runtime);
+        agent
+            .apply_legacy_overlay(&baseline, &mut runtime, &json!({}), Some("delivery"))
+            .unwrap();
+        let advertised: Vec<String> = agent.journal.groups().into_iter().collect();
+        agent
+            .confirm_groups(&advertised, &["hardware".into()])
+            .unwrap();
+        let live = runtime.deployment_map();
+        let resolved = json!({"encoder":live["encoder"],"render_node":live["render_node"],"cuda_device":live["cuda_device"]});
+        let settings = json!({
+            "encoder":{"source":"explicit","value":resolved["encoder"]},
+            "render_node":{"source":"explicit","value":resolved["render_node"]},
+            "cuda_device":{"source":"explicit","value":resolved["cuda_device"]}
+        });
+        let active = &agent.journal.active_groups["hardware"];
+        let prerequisites = vec![
+            json!({"kind":"accepted_attempts","id":hex_digest(&[])}),
+            json!({"kind":"seeded_group_digest","id":active.digest}),
+        ];
+        let offer = Offer {
+            attempt_id: "00000000-0000-4000-8000-000000000104".into(),
+            host_id: "host".into(),
+            boot_incarnation: "boot".into(),
+            connection_incarnation: "conn".into(),
+            group: "hardware".into(),
+            revision: "1".into(),
+            content_sha256: policy_catalog::digest(&json!({"group":"hardware","scope":"restart",
+                "revision":"1","settings":settings,"resolved_settings":resolved})),
+            scope: "restart".into(),
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            prerequisites_sha256: facts_digest(&prerequisites).unwrap(),
+            prerequisites,
+            settings,
+            resolved_settings: resolved,
+        };
+        agent.crash_after_writes.store(2, Ordering::SeqCst);
+        let reply = agent.accept_restart(offer.clone(), &runtime, true, None);
+        assert_eq!(phase_of(&reply), ("failed", Some("journal_write_failed")));
+        assert_eq!(runtime.deployment_map(), baseline.deployment_map());
+        drop(agent);
+        let disk = Journal::load(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk.records[&offer.attempt_id].phase, "awaiting_startup");
+        assert_eq!(
+            PolicyAgent::bootstrap(&path).unwrap(),
+            BootOutcome::Candidate(offer.attempt_id)
+        );
+    }
+
+    #[test]
+    fn accepted_restart_without_marker_recovers_known_good_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.json");
+        let baseline = RuntimeSettings::baseline_with(&|_| None);
+        let good = json!({"encoder":baseline.deployment_map()["encoder"],
+            "render_node":baseline.deployment_map()["render_node"],
+            "cuda_device":baseline.deployment_map()["cuda_device"]});
+        let active = ActiveGroup {
+            kind: "verified".into(),
+            digest: policy_catalog::snapshot_digest("hardware", &good),
+            resolved_settings: good.clone(),
+        };
+        let id = "00000000-0000-4000-8000-000000000107";
+        let mut journal = Journal::default();
+        journal
+            .active_groups
+            .insert("hardware".into(), active.clone());
+        let mut attempt = record("hardware", "2", "accepted", 1, good);
+        attempt.scope = "restart".into();
+        attempt.known_good = Some(active);
+        journal.records.insert(id.into(), attempt);
+        fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+        assert_eq!(
+            PolicyAgent::bootstrap(&path).unwrap(),
+            BootOutcome::Recovery(id.into())
+        );
+        let after = Journal::load(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after.records[id].phase, "recovery_awaiting_startup");
+        assert_eq!(
+            after.records[id].error.as_deref(),
+            Some("candidate_startup_interrupted")
+        );
+        assert_eq!(
+            PolicyAgent::bootstrap(&path).unwrap(),
+            BootOutcome::RecoveryVerify(id.into())
         );
     }
 
@@ -1876,7 +2063,7 @@ mod tests {
         let mut runtime = RuntimeSettings::baseline();
         let mut agent = open_at(&path, &mut runtime);
         assert_eq!(
-            agent.finalize_boot(&candidate, &mut runtime).unwrap(),
+            finish_test_boot(&mut agent, &candidate, &mut runtime, true),
             BootOutcome::Recovery(id.into())
         );
         assert_eq!(
@@ -1893,7 +2080,7 @@ mod tests {
         let mut runtime = RuntimeSettings::baseline();
         let mut agent = open_at(&path, &mut runtime);
         assert_eq!(
-            agent.finalize_boot(&recovery, &mut runtime).unwrap(),
+            finish_test_boot(&mut agent, &recovery, &mut runtime, true),
             BootOutcome::None
         );
         assert_eq!(agent.journal.records[id].phase, "recovered");
@@ -1905,6 +2092,172 @@ mod tests {
             agent.journal.active_groups["hardware"].digest,
             active.digest
         );
+    }
+
+    #[test]
+    fn accepted_hardware_candidate_losing_its_device_after_restart_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.json");
+        let device = dir.path().join("render-node");
+        fs::write(&device, b"accessible at acceptance").unwrap();
+        let baseline = RuntimeSettings::baseline_with(&|_| None);
+        let good = json!({"encoder":"openh264","render_node":"software","cuda_device":0});
+        let active = ActiveGroup {
+            kind: "verified".into(),
+            digest: policy_catalog::snapshot_digest("hardware", &good),
+            resolved_settings: good,
+        };
+        let id = "00000000-0000-4000-8000-000000000105";
+        let candidate =
+            json!({"encoder":"va","render_node":device.to_str().unwrap(),"cuda_device":0});
+        let mut journal = Journal::default();
+        journal.ever_accepted_typed.insert("hardware".into());
+        journal
+            .active_groups
+            .insert("hardware".into(), active.clone());
+        let mut attempt = record("hardware", "2", "awaiting_startup", 2, candidate);
+        attempt.scope = "restart".into();
+        attempt.known_good = Some(active);
+        journal.records.insert(id.into(), attempt);
+        fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        fs::remove_file(&device).unwrap();
+
+        let boot = PolicyAgent::bootstrap(&path).unwrap();
+        let mut runtime = baseline;
+        let mut agent = open_at(&path, &mut runtime);
+        assert_eq!(
+            finish_test_boot(&mut agent, &boot, &mut runtime, false),
+            BootOutcome::Recovery(id.into())
+        );
+        let disk = Journal::load(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            disk.records[id].error.as_deref(),
+            Some("candidate_verification_failed")
+        );
+        assert_eq!(disk.active_groups["hardware"].kind, "verified");
+    }
+
+    #[test]
+    fn successful_startup_probe_is_durable_before_connection_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.json");
+        let baseline = RuntimeSettings::baseline_with(&|_| None);
+        let hardware = json!({"encoder":"openh264","render_node":"software","cuda_device":0});
+        let active = ActiveGroup {
+            kind: "seeded".into(),
+            digest: policy_catalog::snapshot_digest("hardware", &hardware),
+            resolved_settings: hardware.clone(),
+        };
+        let id = "00000000-0000-4000-8000-000000000108";
+        let mut journal = Journal::default();
+        journal
+            .active_groups
+            .insert("hardware".into(), active.clone());
+        let mut attempt = record("hardware", "2", "awaiting_startup", 2, hardware);
+        attempt.scope = "restart".into();
+        attempt.known_good = Some(active);
+        journal.records.insert(id.into(), attempt);
+        fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+        let boot = PolicyAgent::bootstrap(&path).unwrap();
+        let mut runtime = baseline;
+        let mut agent = open_at(&path, &mut runtime);
+        let BootPreparation::Verify(readback) = agent.prepare_boot(&boot, &runtime).unwrap() else {
+            panic!("valid candidate must require a fresh startup probe");
+        };
+        assert_eq!(
+            agent.complete_boot(*readback, true, &mut runtime).unwrap(),
+            BootOutcome::None
+        );
+        let disk = Journal::load(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk.records[id].phase, "applied");
+        assert_eq!(
+            disk.active_groups["hardware"].digest,
+            disk.records[id].digest
+        );
+        assert!(disk.records[id].verified_at.is_some());
+    }
+
+    #[test]
+    fn failed_recovery_probe_stays_uncertain_and_keeps_original_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.json");
+        let baseline = RuntimeSettings::baseline_with(&|_| None);
+        let hardware = json!({"encoder":"openh264","render_node":"software","cuda_device":0});
+        let active = ActiveGroup {
+            kind: "verified".into(),
+            digest: policy_catalog::snapshot_digest("hardware", &hardware),
+            resolved_settings: hardware.clone(),
+        };
+        let id = "00000000-0000-4000-8000-000000000109";
+        let mut journal = Journal::default();
+        journal
+            .active_groups
+            .insert("hardware".into(), active.clone());
+        let mut attempt = record("hardware", "2", "recovery_awaiting_startup", 5, hardware);
+        attempt.scope = "restart".into();
+        attempt.known_good = Some(active);
+        attempt.error = Some("candidate_verification_failed".into());
+        journal.records.insert(id.into(), attempt);
+        fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+        let boot = PolicyAgent::bootstrap(&path).unwrap();
+        let mut runtime = baseline;
+        let mut agent = open_at(&path, &mut runtime);
+        assert_eq!(
+            finish_test_boot(&mut agent, &boot, &mut runtime, false),
+            BootOutcome::Uncertain(id.into())
+        );
+        let disk = Journal::load(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk.records[id].phase, "uncertain");
+        assert_eq!(
+            disk.records[id].error.as_deref(),
+            Some("candidate_verification_failed")
+        );
+    }
+
+    #[test]
+    fn startup_baseline_change_fails_deployment_sourced_candidate_before_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.json");
+        let old_baseline = RuntimeSettings::baseline_with(&|_| None);
+        let old = old_baseline.deployment_map();
+        let good = json!({"encoder":old["encoder"],"render_node":old["render_node"],"cuda_device":old["cuda_device"]});
+        let active = ActiveGroup {
+            kind: "verified".into(),
+            digest: policy_catalog::snapshot_digest("hardware", &good),
+            resolved_settings: good.clone(),
+        };
+        let id = "00000000-0000-4000-8000-000000000106";
+        let mut journal = Journal::default();
+        journal.ever_accepted_typed.insert("hardware".into());
+        journal
+            .active_groups
+            .insert("hardware".into(), active.clone());
+        let mut attempt = record("hardware", "2", "awaiting_startup", 2, good);
+        attempt.scope = "restart".into();
+        attempt.settings = json!({
+            "encoder":{"source":"explicit","value":old["encoder"]},
+            "render_node":{"source":"explicit","value":old["render_node"]},
+            "cuda_device":{"source":"deployment"}
+        });
+        attempt.known_good = Some(active);
+        journal.records.insert(id.into(), attempt);
+        fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+        let boot = PolicyAgent::bootstrap(&path).unwrap();
+        let mut runtime = RuntimeSettings::baseline_with(&|key| {
+            (key == "QUASAR_CUDA_DEVICE").then(|| "1".into())
+        });
+        let mut agent = open_at(&path, &mut runtime);
+        assert!(matches!(agent.prepare_boot(&boot, &runtime).unwrap(),
+            BootPreparation::Complete(BootOutcome::Recovery(recovery)) if recovery == id));
+        let disk = Journal::load(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            disk.records[id].error.as_deref(),
+            Some("deployment_baseline_changed")
+        );
+        assert_ne!(disk.records[id].phase, "applied");
     }
 
     #[test]
