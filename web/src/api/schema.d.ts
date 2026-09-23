@@ -5190,6 +5190,182 @@ export interface paths {
         };
         trace?: never;
     };
+    "/v1/admin/hosts/{id}/idle-apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Approve one reviewed disruptive host-policy group and wait for idle (RH05).
+         * @description Binds the reviewed revision, content, resolved values and prerequisite facts to this control-plane boot and the current agent connection at grant time. Acquires only this attempt's admission restriction. Waiting never terminates a session; missing or uncertain session/preparation inventory never establishes idle. An identical replay in waiting or offered with the same full request, including expires_at, returns 202 with the same attempt_id and current phase. A replay in cancel_pending or revoked_unstarted, after expiry, or after a control-plane boot returns approval_superseded. A replay during accepted, activating, awaiting_startup, verifying, failed before recovery is decided, recovery_verifying, recovery_awaiting_startup or uncertain returns attempt_conflict with that attempt. A replay after applied, recovered, resolved uncertain or terminal failed returns approval_superseded. Neither replay revives an old attempt. The request's boot incarnation and approval_review_id fence a delayed retry even when policy content is unchanged. A request with expires_at in the past also returns approval_superseded without a hold. A same-boot unoffered attempt expired by time can become revoked_unstarted and release only its own restriction. After a process boot, even a restored approved row becomes cancel_pending and stays protected until complete authenticated current-connection inventory proves no journal record under its ID. The approval ID is the public attempt_id; at offer the server inserts an offered attempt with that ID and changes the approval to offered atomically before sending. Authenticated acceptance advances both rows together. Confirmed nonacceptance terminalizes the offered attempt and approval together; a restored accepted journal record reconstructs a missing attempt under the approval ID and advances a restored cancel_pending approval to accepted in the same transaction before the inventory gate opens; the attempt takes the authenticated journal phase and sequence. The approval decides public phase until acceptance or terminal nonacceptance; the attempt decides thereafter. A same-boot reconnect revokes unoffered waiting locally and moves offered to cancel_pending. A current review ID with a different body while a live approval exists returns attempt_conflict with current. Host-wide unique-index conflicts also return attempt_conflict. A terminal uncertain attempt with an unresolved protective restriction blocks grants. Every restart-group review token rotates when an approval exits approved or offered for cancel_pending or a terminal state, or exits cancel_pending for a terminal state; an accepted restart attempt reaches a terminal outcome, an unresolved disruptive admission hold resolves, connection/journal authority changes, or complete authenticated reconciliation opens disruptive availability. Unrelated safe next-session edits, ordinary sessions and unrelated owner holds preserve it; rotation alone does not revoke another live approval. An offered attempt becomes cancel_pending and stays protected until authenticated nonacceptance or complete journal inventory proves no acceptance. Only then does it become revoked_unstarted; an accepted journal record instead resumes accepted or later execution. Therefore revoked_unstarted always means started false and admission_restricted false. Neither expiry nor boot ends a session. A grant from an old boot or agent connection is rejected. An open disruptive attempt includes waiting, offered, cancel_pending, accepted, activating, awaiting_startup, verifying, failed while recovery remains possible, recovery_verifying, recovery_awaiting_startup and uncertain while protection is unresolved. Normative behavior: control-api.md section "Idle apply, cancellation and recovery".
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["IdleApplyRequest"];
+                };
+            };
+            responses: {
+                /** @description Approval saved or identically replayed; current phase waiting or offered. This is not application proof. */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["IdleApplyAttempt"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description Check boot token and request expiry first. Identical waiting/offered replay returns 202; replay in cancel_pending/revoked_unstarted returns approval_superseded; any other open disruptive phase returns attempt_conflict with current. A new grant then locks and checks the review token, rechecks availability and inserts atomically. approval_superseded has ErrorEnvelope and requires a fresh review. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["IdleApplyConflict"] | components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/hosts/{id}/idle-apply/{attempt_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+                attempt_id: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a current or terminal idle-apply attempt (RH05).
+         * @description Read-only durable status for refresh after reload; no admission or execution side effect. An unswept expiry can still show waiting with a hold, while replay and dispatch refuse expiry synchronously. An attempt belonging to another host is not found.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                    attempt_id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Current or terminal attempt status. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["IdleApplyAttempt"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/hosts/{id}/idle-apply/{attempt_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+                attempt_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel an idle apply before durable acceptance without discarding saved policy (RH05).
+         * @description The server fences further grants first. It releases only this attempt's restriction after confirmed nonacceptance; an unoffered waiting approval has confirmed nonacceptance locally and needs no agent response. Uncertain revocation remains protected. A repeated cancel after revoked_unstarted is idempotent. An attempt belonging to another host is not found. Durable acceptance and its later execution/recovery phases make cancellation too late. Waiting and offered return 200 after confirmed nonacceptance or 202 while revocation proof is pending. Repeated cancel_pending returns 202; repeated revoked_unstarted returns 200. Normative behavior: control-api.md section "Idle apply, cancellation and recovery".
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                    attempt_id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Confirmed cancelled: phase revoked_unstarted, started false, admission_restricted false. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["IdleApplyAttempt"];
+                    };
+                };
+                /** @description Cancellation awaits authenticated nonacceptance: phase cancel_pending, admission_restricted true. */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["IdleApplyAttempt"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description cancel_too_late for accepted, activating, awaiting_startup, verifying, applied, failed, recovery_verifying, recovery_awaiting_startup, recovered or uncertain; current names that phase. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["IdleApplyConflict"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/admin/hosts/{id}/policy/retry": {
         parameters: {
             query?: never;
@@ -8188,6 +8364,7 @@ export interface components {
             status: string;
             /** Format: date-time */
             observed_at: string | null;
+            /** @description For waiting, names current sessions (including local-only console), untracked managed sessions, preparation or unknown-inventory blockers; an empty observation never proves application. */
             remedy: string | null;
             detail?: {
                 [key: string]: unknown;
@@ -8227,6 +8404,7 @@ export interface components {
             id: string;
         };
         HostPolicyApprovalPreview: {
+            /** @description False for unavailable conditions including a live disruptive grant/attempt, unresolved disruptive admission hold, incomplete authenticated current-connection journal reconciliation or active group snapshot, missing current review-token row, or missing current-connection Automatic hardware evidence. Every condition is bound by the prerequisite digest or rotates the review ID when availability opens. Identical replay of an existing grant uses its original request and may still return 202. */
             available: boolean;
             revision: components["schemas"]["RH05Revision"];
             content_sha256: components["schemas"]["RH05Digest"];
@@ -8236,6 +8414,16 @@ export interface components {
             };
             prerequisites_sha256: components["schemas"]["RH05Digest"];
             prerequisites: components["schemas"]["RH05Prerequisite"][];
+            /**
+             * Format: uuid
+             * @description Persisted token for the current process boot.
+             */
+            approval_boot_incarnation: string;
+            /**
+             * Format: uuid
+             * @description Present even when unavailable but grants nothing then. Stable during a live waiting/offered grant; all restart-group IDs on the host rotate when an approval exits approved or offered for cancel_pending or a terminal state or exits cancel_pending for a terminal state
+             */
+            approval_review_id: string;
             remedy: string | null;
         };
         IdleApplyRequest: {
@@ -8243,8 +8431,18 @@ export interface components {
             expected_revision: components["schemas"]["RH05Revision"];
             content_sha256: components["schemas"]["RH05Digest"];
             prerequisites_sha256: components["schemas"]["RH05Digest"];
-            /** @description Exact group-specific facts sorted bytewise by (kind,id): agent image digest, driver, accessible device, passing probe IDs and last verified group digest as relevant. Digest input is each UTF-8 kind, NUL, id, LF. NUL and LF are forbidden within either field. Agent rechecks these facts before durable acceptance. */
+            /** @description Exact group-specific facts sorted bytewise by (kind,id): agent image digest, driver, accessible device, passing probe IDs and last verified group digest as relevant, plus the mandatory accepted_attempts set digest for restart scope. Digest input is each UTF-8 kind, NUL, id, LF. NUL and LF are forbidden within either field. Agent rechecks these facts before durable acceptance. */
             prerequisites: components["schemas"]["RH05Prerequisite"][];
+            /**
+             * Format: uuid
+             * @description Must match the reviewed preview and persisted current process boot.
+             */
+            approval_boot_incarnation: string;
+            /**
+             * Format: uuid
+             * @description Must match the current server-issued token for a new grant; all restart-group IDs on the host rotate when an approval exits approved or offered for cancel_pending or a terminal state or exits cancel_pending for a terminal state
+             */
+            approval_review_id: string;
             /** Format: date-time */
             expires_at: string;
         };
