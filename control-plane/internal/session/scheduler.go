@@ -161,6 +161,11 @@ func (s *Store) ScheduleAndCreate(ctx context.Context, p CreateParams) (Session,
 		}
 		sess, retry, err := s.scheduleAttempt(ctx, p)
 		if !retry {
+			if p.ManagedHome && errors.Is(err, ErrHomeConflict) {
+				if diagnosisErr := s.persistHomeConflict(ctx, p); diagnosisErr != nil {
+					return Session{}, diagnosisErr
+				}
+			}
 			return sess, err
 		}
 	}

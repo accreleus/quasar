@@ -634,10 +634,24 @@ func (m *Manager) hasLiveSessionForHomeTx(ctx context.Context, tx pgx.Tx, homeID
 		JOIN user_homes uh ON uh.user_id = s.user_id
 		                  AND uh.app_id  = COALESCE(a.parent_app_id, a.id)
 		WHERE uh.id::text = $1
-		  AND s.state IN ('pending','assigned','starting','running')
+		  AND s.state NOT IN ('stopped','failed')
 	`, homeID).Scan(&n)
 	if err != nil {
 		return false, fmt.Errorf("check live session for home: %w", err)
+	}
+	if n > 0 {
+		return true, nil
+	}
+	// A managed-home swap keeps sessions.app_id on the old app until the agent
+	// confirms the target. GuardHomeForSwap stores this durable detail before
+	// mount resolution. With no durable target ID, protect every home on the
+	// same user and host until rejection, rollback, commit or terminal state.
+	err = tx.QueryRow(ctx, `SELECT COUNT(*) FROM sessions s JOIN user_homes uh
+		ON uh.user_id=s.user_id AND uh.host_id=s.host_id
+		WHERE uh.id::text=$1 AND s.state_detail='swapping'
+		  AND s.state NOT IN ('stopped','failed')`, homeID).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("check pending swap for home: %w", err)
 	}
 	return n > 0, nil
 }

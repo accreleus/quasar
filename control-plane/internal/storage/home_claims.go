@@ -46,24 +46,32 @@ func sameHomeIdentity(a, b *string) bool {
 	return *a == *b
 }
 
+// canonicalManagedHome uses the same effective parent/preset managed-home
+// policy as session.GetLaunchApp. A preset can enable managed home even when
+// apps.managed_home is false; storage must still lock and tombstone its claim.
+func canonicalManagedHome(ctx context.Context, tx pgx.Tx, appID string) (string, bool, error) {
+	var canonical string
+	var managed bool
+	err := tx.QueryRow(ctx, `SELECT root.id::text,
+		(root.managed_home OR COALESCE(rp.managed_home,false))
+		FROM apps a JOIN apps root ON root.id=COALESCE(a.parent_app_id,a.id)
+		LEFT JOIN runtime_presets rp ON rp.id=root.runtime_preset_id
+		WHERE a.id=$1::uuid`, appID).Scan(&canonical, &managed)
+	return canonical, managed, err
+}
+
 // lockClaimBeforeHome preserves the RH05 claim → user_homes lock order for
 // tombstone and GC paths. Tombstoning a pre-RH05 row creates its conservative
 // claim before taking the home row lock; GC never invents one.
 func lockClaimBeforeHome(ctx context.Context, tx pgx.Tx, userID, appID string, hostID *string, create bool) error {
-	var canonical string
-	var managed bool
-	err := tx.QueryRow(ctx, `SELECT root.id::text,root.managed_home FROM apps a
-		JOIN apps root ON root.id=COALESCE(a.parent_app_id,a.id) WHERE a.id=$1::uuid`, appID).Scan(&canonical, &managed)
+	canonical, managed, err := canonicalManagedHome(ctx, tx, appID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("resolve home claim app: %w", err)
 	}
-	if !managed {
-		return nil
-	}
-	if create {
+	if create && managed {
 		reason := "gc_pending"
 		if hostID == nil {
 			reason = "legacy_location_uncertain"
@@ -89,10 +97,7 @@ func lockClaimBeforeHome(ctx context.Context, tx pgx.Tx, userID, appID string, h
 }
 
 func markTombstonedClaim(ctx context.Context, tx pgx.Tx, userID, appID string, tombstoneHost *string) error {
-	var canonical string
-	var managed bool
-	err := tx.QueryRow(ctx, `SELECT root.id::text,root.managed_home FROM apps a
-		JOIN apps root ON root.id=COALESCE(a.parent_app_id,a.id) WHERE a.id=$1::uuid`, appID).Scan(&canonical, &managed)
+	canonical, managed, err := canonicalManagedHome(ctx, tx, appID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
@@ -100,7 +105,14 @@ func markTombstonedClaim(ctx context.Context, tx pgx.Tx, userID, appID string, t
 		return fmt.Errorf("resolve tombstoned app: %w", err)
 	}
 	if !managed {
-		return nil
+		var existing bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM managed_home_claims
+			WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid)`, userID, canonical).Scan(&existing); err != nil {
+			return fmt.Errorf("check existing tombstone claim: %w", err)
+		}
+		if !existing {
+			return nil
+		}
 	}
 	var count int
 	var unknown bool

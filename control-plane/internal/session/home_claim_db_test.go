@@ -5,8 +5,10 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
+	"github.com/accreleus/quasar/control-plane/internal/storage"
 )
 
 // A known home is a placement constraint even when its host cannot run a
@@ -44,6 +46,31 @@ func TestLaunchRefusesDivergentLegacyHomes(t *testing.T) {
 	}
 	if got := sessionsOnHost(t, pool, s.hostID) + sessionsOnHost(t, pool, h2); got != 0 {
 		t.Fatalf("conflicted launch reserved %d sessions", got)
+	}
+}
+
+func TestLaterLocationMismatchPersistsAfterRefusedLaunch(t *testing.T) {
+	pool := testDB(t)
+	s := seed(t, pool, 2)
+	h2, _ := seedSecondHost(t, pool, 16384, 2)
+	appID := seedManagedApp(t, pool, `{}`)
+	seedHome(t, pool, s.userID, appID, s.hostID)
+	ctx := context.Background()
+	_, err := pool.Exec(ctx, `INSERT INTO managed_home_claims (user_id,canonical_app_id,host_id,state,materialized_at)
+		VALUES ($1::uuid,$2::uuid,$3::uuid,'materialized',now())`, s.userID, appID, s.hostID)
+	must(t, err)
+	seedHome(t, pool, s.userID, appID, h2) // later recorded location
+	_, err = NewStore(pool).ScheduleAndCreate(ctx, managedLaunchParams(s, appID))
+	if !errors.Is(err, ErrHomeConflict) {
+		t.Fatalf("divergent launch: %v, want home_conflict", err)
+	}
+	claims, _, err := storage.NewLocal(pool, t.TempDir()).ListHomeClaims(ctx,
+		storage.ListHomeClaimsOpts{UserID: s.userID, AppID: appID})
+	must(t, err)
+	if len(claims) != 1 || claims[0].State != "conflict" ||
+		claims[0].ConflictReason == nil || *claims[0].ConflictReason != "location_mismatch" ||
+		claims[0].MaterializedAt == nil {
+		t.Fatalf("admin diagnosis after refusal = %+v, want persisted location_mismatch with use history", claims)
 	}
 }
 
@@ -131,6 +158,57 @@ func TestConcurrentFirstHomesClaimOneHost(t *testing.T) {
 	}
 	if n := sessionsOnHost(t, pool, s.hostID) + sessionsOnHost(t, pool, h2); n != 1 {
 		t.Fatalf("session reservations = %d, want one", n)
+	}
+}
+
+// An accepted running callback locks claim then home. A concurrent reservation
+// must wait on that same claim before taking a legacy home row lock, otherwise
+// the two transactions can deadlock in opposite directions.
+func TestHomeReservationLocksClaimBeforeLegacyHome(t *testing.T) {
+	pool := testDB(t)
+	s := seed(t, pool, 2)
+	appID := seedManagedApp(t, pool, `{}`)
+	seedHome(t, pool, s.userID, appID, s.hostID)
+	ctx := context.Background()
+	_, err := pool.Exec(ctx, `INSERT INTO managed_home_claims (user_id,canonical_app_id,host_id,state)
+		VALUES ($1::uuid,$2::uuid,$3::uuid,'reserved')`, s.userID, appID, s.hostID)
+	must(t, err)
+	callbackTx, err := pool.Begin(ctx)
+	must(t, err)
+	defer callbackTx.Rollback(ctx) //nolint:errcheck
+	var locked string
+	must(t, callbackTx.QueryRow(ctx, `SELECT canonical_app_id::text FROM managed_home_claims
+		WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid FOR UPDATE`, s.userID, appID).Scan(&locked))
+	reservationTx, err := pool.Begin(ctx)
+	must(t, err)
+	defer reservationTx.Rollback(ctx) //nolint:errcheck
+	var reservationPID int
+	must(t, reservationTx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&reservationPID))
+	result := make(chan error, 1)
+	go func() { result <- claimSelectedHome(ctx, reservationTx, managedLaunchParams(s, appID), s.hostID) }()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var waiting bool
+		must(t, pool.QueryRow(ctx, `SELECT wait_event_type='Lock' AND query LIKE '%managed_home_claims%'
+			FROM pg_stat_activity WHERE pid=$1`, reservationPID).Scan(&waiting))
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("reservation never reached the claim lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// A callback holding claim may now lock the home row without waiting on the
+	// reservation. The previous home→claim order fails NOWAIT here.
+	must(t, callbackTx.QueryRow(ctx, `SELECT id::text FROM user_homes
+		WHERE user_id=$1::uuid AND app_id=$2::uuid FOR UPDATE NOWAIT`, s.userID, appID).Scan(&locked))
+	must(t, callbackTx.Rollback(ctx))
+	select {
+	case err := <-result:
+		must(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("reservation did not resume after claim release")
 	}
 }
 

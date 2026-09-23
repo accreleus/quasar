@@ -77,7 +77,10 @@ func (m *Manager) AuthAgentHost(ctx context.Context, nodeName, nodeSecret string
 // grace protects nothing and only costs disk: a harness minting an identity per
 // login filled a host to 100% inside it (#92). Orphans are reapable at once.
 const gcReapable = `gc_after IS NOT NULL
-	  AND (user_id IS NULL OR gc_after + interval '24 hours' < now())`
+	  AND (user_id IS NULL OR gc_after + interval '24 hours' < now())
+	  AND NOT EXISTS (SELECT 1 FROM sessions s
+	      WHERE s.user_id=user_homes.user_id AND s.host_id=user_homes.host_id
+	        AND s.state_detail='swapping' AND s.state NOT IN ('stopped','failed'))`
 
 // GCPending returns up to gcPendingLimit homes pinned to hostID that are ready
 // for backing-store reaping. NULL-host rows are never returned here (no agent
@@ -113,10 +116,9 @@ func (m *Manager) GCPending(ctx context.Context, hostID string) ([]PendingHome, 
 // GCConfirm hard-deletes the homes whose ids the agent reaped on hostID. The
 // per-row guard (still reapable by the same gcReapable predicate GCPending
 // offered, AND on this host) makes a
-// confirm a no-op for any home that was revived (gc_after cleared by a launch)
-// or relocated to another host between the pull and the confirm — the agent's
-// reap of a now-stale backing store is harmless (idempotent at the agent), and
-// the live row survives. Returns the count actually deleted.
+// confirm a no-op for any home whose tombstone or host no longer matches the
+// authenticated delivery. RH05 launch cannot revive a tombstone; stale or
+// repeated confirmations leave the row unchanged. Returns the count deleted.
 func (m *Manager) GCConfirm(ctx context.Context, hostID string, homeIDs []string) (int, error) {
 	if len(homeIDs) == 0 {
 		return 0, nil
@@ -139,7 +141,7 @@ func (m *Manager) gcConfirmOne(ctx context.Context, hostID, id string) (int, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	// Read only to learn the user lock key. Recheck the exact row under the
-	// lock, because a stale GC delivery has no authority over a revived/moved row.
+	// lock, because a stale GC delivery has no authority over a changed row.
 	var preUser, preApp, preHost *string
 	err = tx.QueryRow(ctx, `SELECT user_id::text,app_id::text,host_id::text FROM user_homes WHERE id::text=$1`, id).
 		Scan(&preUser, &preApp, &preHost)

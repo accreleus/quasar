@@ -649,12 +649,13 @@ func (s *Store) transition(ctx context.Context, id, reportHostID string, to Stat
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	var cur State
+	var curDetail *string
 	var assignedHost *string
 	var sessionUser, sessionApp string
 	var boundHome, boundDigest *string
-	err = tx.QueryRow(ctx, `SELECT state, host_id::text,user_id::text,app_id::text,
+	err = tx.QueryRow(ctx, `SELECT state,state_detail,host_id::text,user_id::text,app_id::text,
 		managed_home_id::text,managed_home_mount_sha256 FROM sessions WHERE id = $1::uuid FOR UPDATE`, id).
-		Scan(&cur, &assignedHost, &sessionUser, &sessionApp, &boundHome, &boundDigest)
+		Scan(&cur, &curDetail, &assignedHost, &sessionUser, &sessionApp, &boundHome, &boundDigest)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Session{}, ErrNotFound
 	}
@@ -663,6 +664,15 @@ func (s *Store) transition(ctx context.Context, id, reportHostID string, to Stat
 	}
 	if reportHostID != "" && (assignedHost == nil || *assignedHost != reportHostID) {
 		return Session{}, ErrNotFound
+	}
+	// A restart loses swapper.pendingSwaps but not this durable guard. An
+	// unproven running detail (including a late app-boot callback) cannot clear
+	// it and expose a possible swap target to tombstone/GC. Terminal reports
+	// release the guard through the state predicate; explicit rollback/commit
+	// is handled by swapper when its target is still known.
+	if reportHostID != "" && cur == StateRunning && to == StateRunning &&
+		curDetail != nil && *curDetail == swapDetailInProgress {
+		detail = nil
 	}
 
 	// Teardown-race coercion (see CoerceReport): a `failed` report on an already
@@ -1097,7 +1107,17 @@ func (s *Store) HomeHostForApp(ctx context.Context, userID, homeAppID string) (s
 		return "", fmt.Errorf("begin home owner read: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	return homeClaimOwner(ctx, tx, CreateParams{UserID: userID, AppID: homeAppID, ManagedHome: true})
+	p := CreateParams{UserID: userID, AppID: homeAppID, ManagedHome: true}
+	owner, err := homeClaimOwner(ctx, tx, p)
+	if errors.Is(err, ErrHomeConflict) {
+		if rollbackErr := tx.Rollback(ctx); rollbackErr != nil {
+			return "", fmt.Errorf("rollback home owner read: %w", rollbackErr)
+		}
+		if diagnosisErr := s.persistHomeConflict(ctx, p); diagnosisErr != nil {
+			return "", diagnosisErr
+		}
+	}
+	return owner, err
 }
 
 // CanonicalAppName resolves the caller's requested app to the parent whose

@@ -134,6 +134,41 @@ func TestHomeTombstoneAndExactGCConfirmReleaseClaim(t *testing.T) {
 	}
 }
 
+func TestPresetOnlyManagedHomeTombstoneAndGC(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	u := seedUser(t, pool, "preset-claim-gc@test.local")
+	a := seedApp(t, pool, "Preset Claim GC")
+	var presetID string
+	must(t, pool.QueryRow(ctx, `INSERT INTO runtime_presets (name,managed_home,home_container_path)
+		VALUES ('preset-claim-gc',true,'/alternate/home') RETURNING id::text`).Scan(&presetID))
+	_, err := pool.Exec(ctx, `UPDATE apps SET runtime_preset_id=$2::uuid WHERE id=$1::uuid`, a, presetID)
+	must(t, err)
+	h := seedHost(t, pool)
+	homeID := insertHome(t, pool, u, a, h)
+	mgr := NewLocal(pool, t.TempDir())
+	_, err = mgr.TombstoneHome(ctx, homeID)
+	must(t, err)
+	var state, reason string
+	must(t, pool.QueryRow(ctx, `SELECT state,conflict_reason FROM managed_home_claims
+		WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, u, a).Scan(&state, &reason))
+	if state != "conflict" || reason != "gc_pending" {
+		t.Fatalf("preset-only tombstone claim = (%s,%s), want conflict/gc_pending", state, reason)
+	}
+	setGCAfter(t, pool, homeID, "interval '25 hours'")
+	deleted, err := mgr.GCConfirm(ctx, h, []string{homeID})
+	must(t, err)
+	if deleted != 1 {
+		t.Fatalf("preset-only GC deleted %d homes, want one", deleted)
+	}
+	var claims int
+	must(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM managed_home_claims
+		WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, u, a).Scan(&claims))
+	if claims != 0 {
+		t.Fatalf("preset-only claim retained after exact GC: %d", claims)
+	}
+}
+
 func TestGCConfirmKeepsClaimWhenAnotherLocationIsKnown(t *testing.T) {
 	pool := testDB(t)
 	ctx := context.Background()
