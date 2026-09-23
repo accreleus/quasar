@@ -392,6 +392,16 @@ export type ProviderEntitlementModeSet = Schemas["ProviderEntitlementModeSet"];
 /** Replaces the whole entitlement set — `items` is the result, not a delta. */
 export type ProviderEntitlementModeEnvelope = Schemas["ProviderEntitlementModeEnvelope"];
 
+// ── App placement (RH05 #342, control-api.md "App placement, homes and explicit image cleanup") ──
+// Which hosts may run a canonical app. A derived tile has no placement of its
+// own: GET answers with the parent's, `inherited_from` set.
+
+export type AppPlacement = Schemas["AppPlacement"];
+export type AppPlacementMode = AppPlacement["mode"];
+/** Selected, prepared and ready are three separate observations; null = unknown. */
+export type AppPlacementHost = Schemas["AppPlacementHost"];
+export type AppPlacementPatch = Schemas["AppPlacementPatch"];
+
 // ── Library discovery (steam-library-discovery §7/§8/§11, Phase 4) ───────────
 
 /** `"other"` means rungs 1-4 would have published the appid yet no enabled tile

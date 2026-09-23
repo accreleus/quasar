@@ -252,6 +252,19 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 			if p.PinHostID != "" && p.PinHostID != owner {
 				return Session{}, false, ErrHomeConflict
 			}
+			// A fixed selection that excludes the only safe home location needs
+			// the repair-required home explanation, rather than a generic empty
+			// fleet message. The final placement lock below still decides the race.
+			var selected bool
+			if err := tx.QueryRow(ctx, `SELECT mode='all_eligible' OR EXISTS (
+				SELECT 1 FROM app_placement_hosts
+				WHERE app_id=ap.app_id AND host_id=$2::uuid)
+				FROM app_placement ap WHERE app_id=$1::uuid`, p.homeAppID(), owner).Scan(&selected); err != nil {
+				return Session{}, false, fmt.Errorf("check home owner placement: %w", err)
+			}
+			if !selected {
+				return Session{}, false, ErrHomeConflict
+			}
 			p.PinHostID = owner
 		}
 	}
@@ -342,6 +355,16 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	}
 	if !fits {
 		return Session{}, true, nil // raced; retry from scratch
+	}
+	// A placement edit takes this same row FOR UPDATE. Holding FOR SHARE through
+	// reservation means removal can commit either before this check (and we
+	// refuse) or after this session commits (already accepted sessions finish).
+	placementAllowed, err := placementSelectedForHost(ctx, tx, p.homeAppID(), hostID)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !placementAllowed) {
+		return Session{}, true, nil
+	}
+	if err != nil {
+		return Session{}, false, fmt.Errorf("lock app placement: %w", err)
 	}
 	if err := claimSelectedHome(ctx, tx, p, hostID); err != nil {
 		return Session{}, false, err

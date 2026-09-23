@@ -87,6 +87,8 @@ func (h *Handler) Register(mux httpx.Router, requireAuth, requireAdmin func(http
 
 	// Admin app list — all apps including disabled, with runtime_spec (P2-08).
 	mux.Handle("GET /v1/admin/apps", admin(http.HandlerFunc(h.handleAdminListApps)))
+	mux.Handle("GET /v1/admin/apps/{id}/placement", admin(http.HandlerFunc(h.handleGetAppPlacement)))
+	mux.Handle("PATCH /v1/admin/apps/{id}/placement", admin(http.HandlerFunc(h.handlePatchAppPlacement)))
 
 	mux.Handle("POST /v1/apps", admin(http.HandlerFunc(h.handleCreateApp)))
 	mux.Handle("PATCH /v1/apps/{id}", admin(http.HandlerFunc(h.handleUpdateApp)))

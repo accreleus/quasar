@@ -1488,6 +1488,95 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/admin/apps/{id}/placement": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read canonical app host selection and observed preparation/readiness.
+         * @description Derived tiles return the parent placement with inherited_from set.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Placement. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["AppPlacement"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Replace canonical app host selection at an expected revision.
+         * @description Invalid selection is 400 validation_failed. A stale revision is 409 stale_revision with the current placement. A derived tile is 409 inherited_placement with its parent ID. Removal immediately excludes new reservations while existing sessions finish and homes/images stay.
+         */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["AppPlacementPatch"];
+                };
+            };
+            responses: {
+                /** @description Updated placement. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["AppPlacement"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description Stale revision or inherited placement. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["PlacementConflict"];
+                    };
+                };
+            };
+        };
+        trace?: never;
+    };
     "/v1/admin/apps/{id}/entitlements": {
         parameters: {
             query?: never;

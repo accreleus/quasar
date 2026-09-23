@@ -270,6 +270,13 @@ func (s *Store) GuardHomeForSwapWithHold(ctx context.Context, sessionID, userID 
 			return nil, fmt.Errorf("lock swap app: %w", err)
 		}
 	}
+	selected, err := placementSelectedForHost(ctx, tx, p.homeAppID(), hostID)
+	if err != nil {
+		return nil, fmt.Errorf("check swap placement: %w", err)
+	}
+	if !selected {
+		return nil, ErrHomeConflict
+	}
 	owner, err := homeClaimOwner(ctx, tx, p, sessionID)
 	if err != nil {
 		return nil, s.finishRefusedSwapHome(ctx, tx, p, err)
