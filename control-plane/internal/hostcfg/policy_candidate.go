@@ -81,8 +81,10 @@ func resolveGroupCandidate(group string, revision int64, choices map[string]Poli
 }
 
 // canonicalJSON is RFC 8785 serialization for the catalog value space: sorted
-// object keys, ES6 number form (Go's encoder already matches it) and no HTML
-// escaping. The agent's twin is policy_catalog::canonical_json.
+// object keys, ES6 number form (Go's encoder already matches it), no HTML
+// escaping, and U+2028/U+2029 emitted literally (encoding/json escapes them;
+// RFC 8785 does not). The agent's twin is policy_catalog::canonical_json, and
+// TestCanonicalJSONCrossLanguageVector pins the two byte-for-byte.
 func canonicalJSON(value any) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
@@ -90,5 +92,34 @@ func canonicalJSON(value any) ([]byte, error) {
 	if err := enc.Encode(value); err != nil {
 		return nil, err
 	}
-	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
+	return unescapeLineSeparators(bytes.TrimSuffix(buf.Bytes(), []byte("\n"))), nil
+}
+
+// unescapeLineSeparators rewrites the \u2028 and \u2029 escapes encoding/json
+// writes inside strings as their literal UTF-8. It walks escapes pairwise, so
+// an escaped backslash followed by the text "u2028" is left alone.
+func unescapeLineSeparators(b []byte) []byte {
+	if !bytes.Contains(b, []byte(`\u202`)) {
+		return b
+	}
+	out := make([]byte, 0, len(b))
+	for i := 0; i < len(b); i++ {
+		if b[i] != '\\' || i+1 >= len(b) {
+			out = append(out, b[i])
+			continue
+		}
+		switch string(b[i:min(i+6, len(b))]) {
+		case `\u2028`:
+			out = append(out, "\u2028"...)
+			i += 5
+			continue
+		case `\u2029`:
+			out = append(out, "\u2029"...)
+			i += 5
+			continue
+		}
+		out = append(out, b[i], b[i+1])
+		i++
+	}
+	return out
 }

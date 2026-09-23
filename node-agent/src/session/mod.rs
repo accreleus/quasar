@@ -445,6 +445,9 @@ pub struct SessionConfig {
     /// session down and reports `failed` so its reservation is reclaimed.
     /// `Duration::ZERO` disables. Knob: `QUASAR_IDLE_TIMEOUT_SECS`.
     pub idle_timeout: std::time::Duration,
+    /// #484 app-boot watchdog budget; `None` disables it. Knob:
+    /// `QUASAR_APP_BOOT_TIMEOUT_SECS` (hostcfg `app_boot_timeout_secs`).
+    pub app_boot_timeout: Option<std::time::Duration>,
     /// ZC-03 full zero-copy VA: the compositor emits `memory:DMABuf` in a
     /// `vapostproc`-importable DRM modifier and `vapostproc` imports it, no system-memory
     /// hop. Knob: `QUASAR_ZEROCOPY`; gated by [`SessionConfig::dmabuf_zerocopy`].
@@ -560,6 +563,9 @@ impl SessionConfig {
             audio_degraded_reason: None,
             audio_required: env_bool("QUASAR_AUDIO_REQUIRED"),
             idle_timeout: std::time::Duration::from_secs(env_u64("QUASAR_IDLE_TIMEOUT_SECS", 120)),
+            app_boot_timeout: settings::app_boot_budget(settings::app_boot_timeout_from(
+                std::env::var("QUASAR_APP_BOOT_TIMEOUT_SECS").ok(),
+            )),
             zerocopy: env_bool("QUASAR_ZEROCOPY"),
             abr_mode: AbrMode::from_env(),
             abr_floor_kbps: std::env::var("QUASAR_ABR_FLOOR_KBPS")
@@ -807,6 +813,7 @@ impl SessionConfig {
             audio_degraded_reason: None,
             audio_required: env_bool("QUASAR_AUDIO_REQUIRED"),
             idle_timeout: std::time::Duration::from_secs(settings.idle_timeout_secs),
+            app_boot_timeout: settings::app_boot_budget(settings.app_boot_timeout_secs),
             zerocopy: settings.zerocopy,
             abr_mode: settings.abr_mode,
             // A non-zero wire floor takes precedence; 0 means the env/ratio fallback
@@ -1287,6 +1294,26 @@ mod tests {
         for c in [Codec::H264, Codec::H265, Codec::Av1] {
             assert_eq!(Codec::parse(c.as_str()).unwrap(), c);
         }
+    }
+
+    #[test]
+    fn assignment_latches_the_app_boot_budget_from_runtime_settings() {
+        // A typed or legacy app_boot_timeout_secs reaches the next launch's watchdog.
+        let mut settings = settings::RuntimeSettings::baseline_with(&|_| None);
+        let launch = |s: &settings::RuntimeSettings| {
+            SessionConfig::for_assignment_with(s, stream_with_floor(0), None).app_boot_timeout
+        };
+        assert_eq!(launch(&settings), Some(std::time::Duration::from_secs(300)));
+        settings.apply_json(&serde_json::json!({"app_boot_timeout_secs": 45}));
+        let running = launch(&settings);
+        assert_eq!(running, Some(std::time::Duration::from_secs(45)));
+        settings.apply_json(&serde_json::json!({"app_boot_timeout_secs": 0}));
+        assert_eq!(launch(&settings), None, "0 disables the watchdog");
+        assert_eq!(
+            running,
+            Some(std::time::Duration::from_secs(45)),
+            "a launched session keeps its copy"
+        );
     }
 
     #[test]

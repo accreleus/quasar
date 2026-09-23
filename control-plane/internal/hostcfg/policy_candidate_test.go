@@ -108,3 +108,34 @@ func TestCanonicalJSONDoesNotEscapeHTML(t *testing.T) {
 		t.Fatalf("canonical = %s", got)
 	}
 }
+
+// canonicalVector is the cross-language RFC 8785 digest vector; the agent's
+// twin is policy_catalog.rs canonical_json_cross_language_vector. RFC 8785
+// emits U+2028/U+2029 literally, where encoding/json escapes them.
+var canonicalVector = struct {
+	value     map[string]any
+	canonical string
+	digest    string
+}{
+	value: map[string]any{"group": "home_root", "resolved_settings": map[string]any{
+		"abr_floor_ratio": 0.3,
+		"home_root":       "/srv/a b c&<>\"\\u2028\\\n\x01\x7fé😀",
+	}},
+	canonical: "{\"group\":\"home_root\",\"resolved_settings\":{\"abr_floor_ratio\":0.3," +
+		"\"home_root\":\"/srv/a b c&<>\\\"\\\\u2028\\\\\\n\\u0001\x7fé😀\"}}",
+	digest: "d1522a0da765589b9e42f0c8062e42bfcbc2d3bd6475d6910ec0a182a65ed86b",
+}
+
+func TestCanonicalJSONCrossLanguageVector(t *testing.T) {
+	b, err := canonicalJSON(canonicalVector.value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != canonicalVector.canonical {
+		t.Fatalf("canonical\n got %q\nwant %q", b, canonicalVector.canonical)
+	}
+	got, err := digestJSON(canonicalVector.value)
+	if err != nil || got != canonicalVector.digest {
+		t.Fatalf("digest = %s, %v; want %s", got, err, canonicalVector.digest)
+	}
+}
