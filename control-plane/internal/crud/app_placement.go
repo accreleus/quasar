@@ -77,7 +77,10 @@ func (h *Handler) appPlacementView(ctx context.Context, id string) (appPlacement
 	rows, err = h.store.pool.Query(ctx, `
 		SELECT h.id::text,
 		       CASE WHEN NOT prep.managed THEN NULL::boolean ELSE prep.prepared END,
-		       CASE WHEN h.status='offline' THEN false
+		       CASE WHEN h.readiness IS NULL OR h.readiness_reported_at IS NULL
+		              OR h.readiness_reported_at < now()-make_interval(secs => $2::int)
+		            THEN NULL::boolean
+		            WHEN h.status='offline' THEN false
 		            WHEN h.status='online' AND h.capacity_detection='ok'
 		              AND NOT h.readiness_block_host AND NOT h.readiness_block_homes
 		              AND h.config_policy_gate_connection IS NULL THEN true
@@ -92,7 +95,7 @@ func (h *Handler) appPlacementView(ctx context.Context, id string) (appPlacement
 			LEFT JOIN host_images hi ON hi.host_id=h.id AND hi.image_id=ii.image_id
 			WHERE ii.registry_ref=a.runtime_spec->>'image' OR ii.local_tag=a.runtime_spec->>'image'
 		) prep ON true
-		WHERE a.id=$1::uuid ORDER BY h.node_name,h.id`, canonical)
+		WHERE a.id=$1::uuid ORDER BY h.node_name,h.id`, canonical, int(h.store.readinessWindow().Seconds()))
 	if err != nil {
 		return v, err
 	}

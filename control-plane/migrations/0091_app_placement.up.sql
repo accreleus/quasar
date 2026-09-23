@@ -39,4 +39,23 @@ $$;
 CREATE TRIGGER rh05_app_placement_default
     AFTER INSERT ON apps FOR EACH ROW EXECUTE FUNCTION rh05_app_placement_default_fn();
 
+-- The supported app editor can detach a derived tile or assign a parent to
+-- a standalone app. Keep its independent placement in the same transaction as
+-- that identity change, so no committed canonical app lacks a policy row.
+CREATE FUNCTION rh05_app_placement_parent_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.parent_app_id IS DISTINCT FROM NEW.parent_app_id THEN
+        IF NEW.parent_app_id IS NULL THEN
+            INSERT INTO app_placement (app_id, mode) VALUES (NEW.id, 'all_eligible')
+                ON CONFLICT (app_id) DO NOTHING;
+        ELSE
+            DELETE FROM app_placement WHERE app_id = NEW.id;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER rh05_app_placement_parent
+    AFTER UPDATE OF parent_app_id ON apps FOR EACH ROW EXECUTE FUNCTION rh05_app_placement_parent_fn();
+
 COMMIT;

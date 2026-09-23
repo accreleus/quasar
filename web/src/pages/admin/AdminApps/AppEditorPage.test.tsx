@@ -334,6 +334,29 @@ describe("app editor — placement saves on its own", () => {
     expect(mocked.updateAppPlacement).not.toHaveBeenCalled();
   });
 
+  it("keeps the edit's original revision when another admin saves during a tab switch", async () => {
+    const hostId = "aaaaaaaa-0000-0000-0000-000000000001";
+    mocked.listAllHosts.mockResolvedValue([{ id: hostId, node_name: "gpu-test" }] as never);
+    const before = {
+      app_id: "app-1", inherited_from: null, mode: "all_eligible" as const,
+      host_ids: [], revision: "3",
+      hosts: [{ host_id: hostId, selected: true, prepared: null, ready: null, reason: null }],
+    };
+    mocked.getAppPlacement.mockResolvedValueOnce(before);
+    renderEditor();
+    fireEvent.click(await screen.findByRole("tab", { name: "Placement" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "Only these hosts" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "gpu-test" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Identity" }));
+    mocked.getAppPlacement.mockResolvedValue({ ...before, revision: "4" });
+    fireEvent.click(screen.getByRole("tab", { name: "Placement" }));
+    await waitFor(() => expect(mocked.getAppPlacement).toHaveBeenCalledTimes(2));
+    fireEvent.click(await screen.findByRole("button", { name: "Save placement" }));
+    await waitFor(() => expect(mocked.updateAppPlacement).toHaveBeenCalledWith(
+      "tok", "app-1", { expected_revision: "3", mode: "fixed", host_ids: [hostId] },
+    ));
+  });
+
   it("keeps a placement save out of the app draft, and the draft out of it", async () => {
     const hostId = "aaaaaaaa-0000-0000-0000-000000000001";
     mocked.listAllHosts.mockResolvedValue([{ id: hostId, node_name: "gpu-test" }] as never);

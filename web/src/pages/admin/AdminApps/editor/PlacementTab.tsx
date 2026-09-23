@@ -10,7 +10,7 @@
 // makes per host. They are never folded into one verdict here: a selected host
 // can be unprepared, and a ready host can be unselected.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import * as adminApi from "../../../../api/admin";
 import { ApiError } from "../../../../api/client";
@@ -26,6 +26,8 @@ import { Section } from "./primitives";
 export interface PlacementDraft {
   mode: AppPlacementMode;
   hostIds: string[];
+  /** Revision observed when this edit began. It survives tab unmounts. */
+  revision: string;
 }
 
 interface PlacementTabProps {
@@ -47,7 +49,7 @@ function sameSet(a: string[], b: string[]): boolean {
 }
 
 function saved(p: AppPlacement): PlacementDraft {
-  return { mode: p.mode, hostIds: p.mode === "fixed" ? p.host_ids : [] };
+  return { mode: p.mode, hostIds: p.mode === "fixed" ? p.host_ids : [], revision: p.revision };
 }
 
 /** One row per host the server reports on, plus any selected or registered
@@ -120,6 +122,13 @@ export function PlacementTab({ appId, parent, draft, setDraft }: PlacementTabPro
 
   const data = placement.data;
   const current = data ? (draft ?? saved(data)) : null;
+  // A 409 requires a fresh read and a second explicit Save. Only that
+  // conflict path rebases the surviving edit; ordinary tab remounts do not.
+  useEffect(() => {
+    if (conflict && data && draft && draft.revision !== data.revision) {
+      setDraft({ ...draft, revision: data.revision });
+    }
+  }, [conflict, data, draft, setDraft]);
   const dirty =
     !!data &&
     !!draft &&
@@ -221,12 +230,12 @@ export function PlacementTab({ appId, parent, draft, setDraft }: PlacementTabPro
     const ids = current.hostIds.includes(hostId)
       ? current.hostIds.filter((id) => id !== hostId)
       : [...current.hostIds, hostId];
-    setDraft({ mode: "fixed", hostIds: ids });
+    setDraft({ mode: "fixed", hostIds: ids, revision: current.revision });
   };
   const setMode = (mode: AppPlacementMode) => {
     setConflict(null);
     // Returning to fixed starts from the saved list, not an empty one.
-    setDraft({ mode, hostIds: mode === "fixed" ? (draft?.hostIds ?? data.host_ids) : [] });
+    setDraft({ mode, hostIds: mode === "fixed" ? (draft?.hostIds ?? data.host_ids) : [], revision: current.revision });
   };
   const pending = save.pending != null;
 
@@ -307,7 +316,7 @@ export function PlacementTab({ appId, parent, draft, setDraft }: PlacementTabPro
         <Button
           variant="primary"
           disabled={!dirty || pending}
-          onClick={() => void save.run(current, data.revision)}
+          onClick={() => void save.run(current, current.revision)}
         >
           {pending ? "Saving…" : "Save placement"}
         </Button>
