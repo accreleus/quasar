@@ -665,13 +665,12 @@ func (s *Store) transition(ctx context.Context, id, reportHostID string, to Stat
 	if reportHostID != "" && (assignedHost == nil || *assignedHost != reportHostID) {
 		return Session{}, ErrNotFound
 	}
-	// A restart loses swapper.pendingSwaps but not this durable guard. An
-	// unproven running detail (including a late app-boot callback) cannot clear
-	// it and expose a possible swap target to tombstone/GC. Terminal reports
-	// release the guard through the state predicate; explicit rollback/commit
-	// is handled by swapper when its target is still known.
-	if reportHostID != "" && cur == StateRunning && to == StateRunning &&
-		curDetail != nil && *curDetail == swapDetailInProgress {
+	// A restart loses swapper.pendingSwaps but not this durable guard. A stop
+	// request or any nonterminal agent detail cannot clear it: the target may
+	// remain mounted through stopping while app_id still names the old app.
+	// Terminal reports release protection through the GC state predicate;
+	// explicit rollback/commit is handled by swapper while its target is known.
+	if curDetail != nil && *curDetail == swapDetailInProgress && !to.IsTerminal() {
 		detail = nil
 	}
 

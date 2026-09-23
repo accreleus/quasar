@@ -65,6 +65,53 @@ func TestPendingManagedSwapProtectsTargetHomeAcrossRestart(t *testing.T) {
 	}
 }
 
+// A stop request can race the pending swap's agent callback. The target may
+// still be mounted until teardown reaches a terminal state, even though the
+// session's app_id still names the old app.
+func TestStopDuringPendingManagedSwapKeepsTargetHomeProtected(t *testing.T) {
+	pool := testDB(t)
+	s := seed(t, pool, 4)
+	store := NewStore(pool)
+	sess := runningSession(t, store, s)
+	target := seedManagedApp(t, pool, `{"image":"target:1"}`)
+	seedHome(t, pool, s.userID, target, s.hostID)
+	var homeID string
+	ctx := context.Background()
+	must(t, pool.QueryRow(ctx, `SELECT id::text FROM user_homes
+		WHERE user_id=$1::uuid AND app_id=$2::uuid AND host_id=$3::uuid`, s.userID, target, s.hostID).Scan(&homeID))
+	app, err := store.GetLaunchApp(ctx, target)
+	must(t, err)
+	must(t, store.GuardHomeForSwap(ctx, sess.ID, s.userID, app, s.hostID))
+	coord := newTestCoordinator(t, store, newFakeDispatcher(true), testLogger())
+	stopping, err := coord.Stop(ctx, sess.ID, "user_requested")
+	must(t, err)
+	if stopping.State != StateStopping || stopping.StateDetail == nil || *stopping.StateDetail != swapDetailInProgress {
+		t.Fatalf("stop erased durable target guard: state=%s detail=%v", stopping.State, stopping.StateDetail)
+	}
+	mgr := storage.NewLocal(pool, testHomeRoot)
+	if _, err := mgr.TombstoneHome(ctx, homeID); !errors.Is(err, storage.ErrHomeInUse) {
+		t.Fatalf("stopping swap target tombstone = %v, want home in use", err)
+	}
+	_, err = pool.Exec(ctx, `UPDATE user_homes SET gc_after=now()-interval '25 hours' WHERE id=$1::uuid`, homeID)
+	must(t, err)
+	pending, err := mgr.GCPending(ctx, s.hostID)
+	must(t, err)
+	if len(pending) != 0 {
+		t.Fatalf("stopping swap target offered to GC: %+v", pending)
+	}
+	deleted, err := mgr.GCConfirm(ctx, s.hostID, []string{homeID})
+	must(t, err)
+	if deleted != 0 {
+		t.Fatalf("stopping swap target GC confirmed %d homes", deleted)
+	}
+	coord.AgentState(ctx, s.hostID, agentws.SessionStateMsg{SessionID: sess.ID, State: "stopped"})
+	deleted, err = mgr.GCConfirm(ctx, s.hostID, []string{homeID})
+	must(t, err)
+	if deleted != 1 {
+		t.Fatalf("terminal callback did not release GC hold: deleted=%d", deleted)
+	}
+}
+
 func TestUncertainManagedSwapAckRetainsHomeHold(t *testing.T) {
 	pool := testDB(t)
 	s := seed(t, pool, 4)
