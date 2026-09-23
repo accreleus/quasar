@@ -32,6 +32,7 @@ pub mod gpu_kmsg;
 /// GPU-vendor detection backing the `QUASAR_ENCODER` auto-default.
 pub mod gpu_vendor;
 pub mod health;
+mod home_cleanup;
 pub mod host_probe;
 pub mod images;
 pub mod jobs;

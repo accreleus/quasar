@@ -297,6 +297,31 @@ pub async fn run(cfg: Config) {
         image_mgr.clone(),
         release_mgr.clone(),
     );
+    match crate::home_cleanup::verified_ledger_path(&cfg.node_secret_path) {
+        Some(path) => match crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(path) {
+            Ok(mut ledger) => {
+                if ledger.recover_active(|id| {
+                    crate::runtime::configured()
+                        .map_err(std::io::Error::other)?
+                        .retire_session_applications(id)
+                        .wait()
+                        .map_err(std::io::Error::other)
+                }).is_ok() {
+                    sessions.mgr.home_cleanup = Some(ledger);
+                } else {
+                    warn!(token = "home-cleanup-proof-unavailable", "startup home cleanup proof unavailable; capability withheld");
+                }
+            }
+            Err(_) => warn!(
+                token = "home-cleanup-ledger-unavailable",
+                "durable home cleanup ledger unavailable; cleanup proof capability withheld"
+            ),
+        },
+        None => warn!(
+            token = "home-cleanup-ledger-unverified",
+            "node identity directory is not a verified persistent mount; cleanup proof capability withheld"
+        ),
+    }
     let grace = session_grace();
 
     // Only records that already asked for terminal cleanup are eligible here.
@@ -1333,6 +1358,7 @@ fn register_message(
     prefer_enrollment_token: bool,
     images: Vec<crate::messages::RegisterImageEntry>,
     install: &crate::buildinfo::InstallFacts,
+    home_cleanup_capable: bool,
 ) -> anyhow::Result<AgentMsg> {
     Ok(AgentMsg::Register {
         source_policy_versions: Some(serde_json::json!({"steam_preparation": 1})),
@@ -1342,6 +1368,7 @@ fn register_message(
         config_policy_groups: Some(crate::policy::PolicyAgent::advertised_groups(
             &std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path)),
         )),
+        terminal_home_cleanup_v1: home_cleanup_capable.then_some(true),
         node_name: cfg.node_name.clone(),
         agent_version: crate::buildinfo::version().to_string(),
         auth: choose_auth(cfg, prefer_enrollment_token)?,
@@ -1532,7 +1559,7 @@ async fn diagnostic_connection(
             cfg,
             &mut tx,
             &mut rx,
-            register_message(cfg, prefer_enrollment_token, images, &install)?,
+            register_message(cfg, prefer_enrollment_token, images, &install, false)?,
         )
         .await?;
     health.set_connected(true);
@@ -1679,7 +1706,13 @@ async fn connect_and_run(
             cfg,
             &mut tx,
             &mut rx,
-            register_message(cfg, prefer_enrollment_token, images, &install)?,
+            register_message(
+                cfg,
+                prefer_enrollment_token,
+                images,
+                &install,
+                sessions.mgr.home_cleanup.is_some(),
+            )?,
         )
         .await?;
     let path = std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path));
@@ -1847,6 +1880,15 @@ async fn connect_and_run(
     };
     send(&mut tx, &capacity_msg).await?;
     info!("capacity report sent");
+    if let Some(ledger) = sessions.mgr.home_cleanup.as_mut() {
+        for session_id in ledger.take_recovered() {
+            send(
+                &mut tx,
+                &qualified_home_terminal(&session_id, crate::home_cleanup::TerminalKind::Failed),
+            )
+            .await?;
+        }
+    }
 
     // Sent first on purpose: the card carries the remediation, and the gate below may end
     // the process a few seconds later.
@@ -2147,6 +2189,9 @@ async fn connect_and_run(
                         if let Some(reply) = mgr.handle_control(ctrl, evt_tx, diagnostic_tx) {
                             send(&mut tx, &reply).await?;
                         }
+                        for report in mgr.home_cleanup_reports.drain(..) {
+                            send(&mut tx, &report).await?;
+                        }
                         if was_config_update {
                             // The overlay may have flipped the effective encoder live, so
                             // re-probe before re-sending capacity: a stale hosts.codecs
@@ -2299,14 +2344,15 @@ async fn connect_and_run(
                             // #503: get pending trace events out before the terminal
                             // state — the control plane drops them afterwards.
                             flush_pending_diagnostics(&mut tx, &mut *diagnostic_rx).await?;
-                            let msg =
-                                mgr.on_event(&session_id, SessionEvent::Stopped { bytes_used, detail });
-                            send(&mut tx, &msg).await?;
-                            // Console auto-start is level-triggered by capacity, so
-                            // re-send immediately after a terminal state rather than
-                            // waiting on an unrelated connector/input/storage poll.
-                            send_fresh_capacity(&mut tx, &mut *mgr).await?;
-                            info!("re-sent capacity after session stopped for console reconciliation");
+                            if let Some(msg) = mgr.prove_home_terminal(
+                                &session_id,
+                                SessionEvent::Stopped { bytes_used, detail },
+                            ) {
+                                send(&mut tx, &msg).await?;
+                                // Console auto-start is level-triggered by capacity.
+                                send_fresh_capacity(&mut tx, &mut *mgr).await?;
+                                info!("re-sent capacity after session stopped for console reconciliation");
+                            }
                         }
                         SessionEvent::EffectiveMedia(payload) => {
                             let ts_unix_ms = SystemTime::now()
@@ -2380,11 +2426,17 @@ async fn connect_and_run(
                             if terminal {
                                 flush_pending_diagnostics(&mut tx, &mut *diagnostic_rx).await?;
                             }
-                            let msg = mgr.on_event(&session_id, other);
-                            send(&mut tx, &msg).await?;
-                            if terminal {
-                                send_fresh_capacity(&mut tx, &mut *mgr).await?;
-                                info!("re-sent capacity after session failure for console reconciliation");
+                            let msg = if terminal {
+                                mgr.prove_home_terminal(&session_id, other)
+                            } else {
+                                Some(mgr.on_event(&session_id, other))
+                            };
+                            if let Some(msg) = msg {
+                                send(&mut tx, &msg).await?;
+                                if terminal {
+                                    send_fresh_capacity(&mut tx, &mut *mgr).await?;
+                                    info!("re-sent capacity after session failure for console reconciliation");
+                                }
                             }
                             if let (Some((reason, app_failed)), Some((gpu, codec))) =
                                 (launch_failure, failed_on)
@@ -2675,6 +2727,8 @@ impl HostSessions {
     }
 }
 
+type HomeSourceRetire = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 struct SessionManager {
     /// Assigned but not yet started. Aged out by the heartbeat sweep — see
     /// [`PENDING_ASSIGNMENT_TTL`].
@@ -2752,6 +2806,15 @@ struct SessionManager {
     /// `release_apply` dispatch target. Process-wide for the same reason as
     /// `image_mgr`: its poller outlives this connection.
     release_mgr: Arc<ReleaseManager>,
+    /// Present only after startup proved prior API-owned source cleanup and
+    /// opened the durable session-ID ledger. This is the advertised capability.
+    home_cleanup: Option<crate::home_cleanup::HomeCleanupLedger>,
+    /// Ack-less qualified terminals emitted after a repeated or never-recorded
+    /// session_stop. The control loop drains these after the command ack.
+    home_cleanup_reports: Vec<AgentMsg>,
+    /// A deterministic runtime seam for cleanup-proof tests. Production uses
+    /// the durable application journal adapter when this is absent.
+    home_source_retire: Option<HomeSourceRetire>,
     /// Connection-scoped source policy shared with workers and session seeding.
     /// Its authorization is invalidated on disconnect even if sessions retain an Arc.
     source_policy: Option<Arc<crate::source_policy::SourcePolicy>>,
@@ -2831,6 +2894,9 @@ struct RunningHandle {
     /// Set by `SessionEvent::Running`. Until then the launch is in flight and no host
     /// probe starts.
     reached_running: bool,
+    /// A runner-reported terminal waits here until its thread has exited and
+    /// every source generation has been retired and verified absent.
+    pending_home_terminal: Option<SessionEvent>,
 }
 
 impl SessionManager {
@@ -2876,6 +2942,9 @@ impl SessionManager {
             warmup_control: None,
             image_mgr,
             release_mgr,
+            home_cleanup: None,
+            home_cleanup_reports: Vec::new(),
+            home_source_retire: None,
             source_policy: None,
             probe_handle: None,
             probe_runner: None,
@@ -3177,6 +3246,17 @@ impl SessionManager {
                         Some("agent draining for restart".to_string()),
                     ));
                 }
+                if self
+                    .home_cleanup
+                    .as_ref()
+                    .is_some_and(|ledger| ledger.has_record(&session_id))
+                {
+                    return Some(ack(
+                        id,
+                        false,
+                        Some("session id already recorded".to_string()),
+                    ));
+                }
                 // Raised BEFORE anything else in the assign path: a warm-up's NVENC
                 // teardown must never overlap the encoder this session is about to
                 // create (#489). The assign→start gap is the abort's budget.
@@ -3263,6 +3343,25 @@ impl SessionManager {
                      image={image}, reserved vram={vram}MB slots={slots}",
                     cfg.stream.width, cfg.stream.height, cfg.stream.fps
                 );
+                if let Some(ledger) = self.home_cleanup.as_mut() {
+                    match ledger.record_active(&session_id) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Some(ack(
+                                id,
+                                false,
+                                Some("session id already recorded".to_string()),
+                            ))
+                        }
+                        Err(_) => {
+                            return Some(ack(
+                                id,
+                                false,
+                                Some("durable session admission unavailable".to_string()),
+                            ))
+                        }
+                    }
+                }
                 // Preparation belongs to the runtime executor, not this connection.
                 // Retain its observation so session_start cannot race or ignore it.
                 let preparation = if let Some(spec) = container {
@@ -3429,6 +3528,7 @@ impl SessionManager {
                             gpu_index,
                             codec,
                             reached_running: false,
+                            pending_home_terminal: None,
                         },
                     );
                     self.health.set_sessions(self.running.len());
@@ -3456,6 +3556,36 @@ impl SessionManager {
                 session_id,
                 reason,
             } => {
+                if let Some(ledger) = self.home_cleanup.as_mut() {
+                    if let Some(terminal) = ledger.state(&session_id) {
+                        self.home_cleanup_reports
+                            .push(qualified_home_terminal(&session_id, terminal));
+                        return Some(ack(id, true, None));
+                    }
+                    if !self.running.contains_key(&session_id) {
+                        // No runner can still create a source. This includes a
+                        // lost assign frame and a never-recorded ID. Persist
+                        // retirement before reporting a terminal state.
+                        let terminal = match ledger
+                            .retire(&session_id, crate::home_cleanup::TerminalKind::Stopped)
+                        {
+                            Ok(value) => value,
+                            Err(_) => {
+                                return Some(ack(
+                                    id,
+                                    false,
+                                    Some("durable session retirement unavailable".to_string()),
+                                ))
+                            }
+                        };
+                        if self.pending.remove(&session_id).is_some() {
+                            self.note_session_count();
+                        }
+                        self.home_cleanup_reports
+                            .push(qualified_home_terminal(&session_id, terminal));
+                        return Some(ack(id, true, None));
+                    }
+                }
                 if self.pending.remove(&session_id).is_some() {
                     self.note_session_count();
                 }
@@ -3470,6 +3600,11 @@ impl SessionManager {
                 session_id,
                 app,
             } => {
+                if self.home_cleanup.as_ref().is_some_and(|ledger| {
+                    ledger.state(&session_id).is_some() || !ledger.has_record(&session_id)
+                }) {
+                    return Some(ack(id, false, Some("session id is not active".to_string())));
+                }
                 // A rejected swap is a no-op: ack{ok:false} and the session keeps its
                 // previous app. Unlike assign/start, a rejected swap never fails the
                 // session (agent-api.md).
@@ -3959,6 +4094,10 @@ impl SessionManager {
                 h.finished_seen_at = None;
                 continue;
             }
+            if self.home_cleanup.is_some() && h.pending_home_terminal.is_some() {
+                abandoned.push(sid.clone());
+                continue;
+            }
             match h.finished_seen_at {
                 None => h.finished_seen_at = Some(now),
                 Some(seen) => {
@@ -3970,6 +4109,21 @@ impl SessionManager {
         }
         let mut out = Vec::with_capacity(abandoned.len());
         for sid in abandoned {
+            if self.home_cleanup.is_some() {
+                let event = self
+                    .running
+                    .get_mut(&sid)
+                    .and_then(|h| h.pending_home_terminal.take())
+                    .unwrap_or_else(|| {
+                        SessionEvent::Failed(
+                            "runner thread ended without reporting a terminal state".to_string(),
+                        )
+                    });
+                if let Some(message) = self.prove_home_terminal(&sid, event) {
+                    out.push(message);
+                }
+                continue;
+            }
             error!(
                 token = "session-runner-no-terminal-event",
                 "session {sid}: runner thread ended without a terminal event \
@@ -4001,6 +4155,20 @@ impl SessionManager {
             .collect();
         if !stale.is_empty() {
             for sid in &stale {
+                if let Some(ledger) = self.home_cleanup.as_mut() {
+                    if ledger
+                        .retire(sid, crate::home_cleanup::TerminalKind::Failed)
+                        .is_err()
+                    {
+                        warn!(token = "home-pending-retirement-unavailable",
+                            "stale assignment retirement could not be persisted; terminal proof withheld");
+                        continue;
+                    }
+                    out.push(qualified_home_terminal(
+                        sid,
+                        crate::home_cleanup::TerminalKind::Failed,
+                    ));
+                }
                 warn!(
                     token = "session-assign-never-started",
                     "session {sid}: assignment never started within {pending_ttl:?}; \
@@ -4025,6 +4193,66 @@ impl SessionManager {
             // heap, otherwise the memory is genuinely still reachable.
             crate::memstat::on_session_teardown(session_id);
         }
+    }
+
+    /// A cleanup-capable terminal waits for its runner to finish, then uses
+    /// the runtime's durable operation journals to stop/remove every source
+    /// generation and verify absence. On any uncertainty the terminal stays
+    /// pending and home refs remain live for a later retry.
+    fn prove_home_terminal(&mut self, session_id: &str, event: SessionEvent) -> Option<AgentMsg> {
+        if self.home_cleanup.is_none() {
+            return Some(self.on_event(session_id, event));
+        }
+        let handle = self.running.get_mut(session_id)?;
+        if !handle
+            .thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished())
+        {
+            handle.pending_home_terminal = Some(event);
+            return None;
+        }
+        let cleaned = self.home_source_retire.as_ref().map_or_else(
+            || {
+                crate::runtime::configured()
+                    .and_then(|runtime| runtime.retire_session_applications(session_id).wait())
+                    .is_ok()
+            },
+            |retire| retire(session_id),
+        );
+        if !cleaned {
+            handle.pending_home_terminal = Some(event);
+            warn!(
+                token = "home-terminal-cleanup-unverified",
+                "session source cleanup could not be verified; terminal proof withheld"
+            );
+            return None;
+        }
+        let terminal = match &event {
+            SessionEvent::Stopped { .. } => crate::home_cleanup::TerminalKind::Stopped,
+            SessionEvent::Failed(_) | SessionEvent::AppFailed { .. } => {
+                crate::home_cleanup::TerminalKind::Failed
+            }
+            _ => return None,
+        };
+        if self
+            .home_cleanup
+            .as_mut()
+            .unwrap()
+            .retire(session_id, terminal)
+            .is_err()
+        {
+            handle.pending_home_terminal = Some(event);
+            warn!(
+                token = "home-terminal-retirement-unavailable",
+                "session identity retirement could not be persisted; terminal proof withheld"
+            );
+            return None;
+        }
+        if let Some(thread) = handle.thread.take() {
+            let _ = thread.join();
+        }
+        Some(self.on_event(session_id, event))
     }
 
     /// Map a runner lifecycle event onto a session_state message.
@@ -4190,6 +4418,20 @@ fn stream_to_params(s: StreamSpec) -> anyhow::Result<StreamParams> {
 
 fn ack(id: String, ok: bool, error: Option<String>) -> AgentMsg {
     AgentMsg::Ack { id, ok, error }
+}
+
+fn qualified_home_terminal(
+    session_id: &str,
+    terminal: crate::home_cleanup::TerminalKind,
+) -> AgentMsg {
+    AgentMsg::SessionState {
+        session_id: session_id.to_owned(),
+        state: terminal.as_str().to_owned(),
+        detail: None,
+        error: None,
+        reason_code: None,
+        app_log_tail: None,
+    }
 }
 
 /// Run startup work which is only safe after API-owned applications have retired.
@@ -7002,6 +7244,7 @@ mod tests {
                 gpu_index: 0,
                 codec: crate::session::Codec::H264,
                 reached_running: true,
+                pending_home_terminal: None,
             },
             stop,
         )
@@ -7052,6 +7295,7 @@ mod tests {
                 gpu_index: 0,
                 codec: crate::session::Codec::H264,
                 reached_running: true,
+                pending_home_terminal: None,
             },
             display_rx,
         )
@@ -7511,6 +7755,84 @@ mod tests {
     }
 
     #[test]
+    fn capable_terminal_waits_for_source_absence_and_preserves_home_refs() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut mgr, live_refs) = manager_with_runner(Arc::new(|_, _, _, _, _, _, _, _, _, _| {}));
+        let mut ledger = crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(
+            directory.path().join("ledger"),
+        )
+        .unwrap();
+        assert!(ledger.record_active("held").unwrap());
+        mgr.home_cleanup = Some(ledger);
+        let clean = Arc::new(AtomicBool::new(false));
+        let observed = clean.clone();
+        mgr.home_source_retire = Some(Arc::new(move |_| observed.load(Ordering::SeqCst)));
+        let (tx, _rx) = mpsc::channel(8);
+        start_seam_session(&mut mgr, "held", &tx);
+        wait_for_finished_thread(&mgr, "held");
+        mgr.running
+            .get_mut("held")
+            .unwrap()
+            .home_refs
+            .push("managed-home".into());
+        mgr.add_live_refs(&["managed-home".into()]);
+        assert!(mgr
+            .prove_home_terminal("held", SessionEvent::Failed("runner failed".into()))
+            .is_none());
+        assert!(mgr.running.contains_key("held"));
+        assert!(live_refs.lock().unwrap().contains("managed-home"));
+        assert_eq!(mgr.home_cleanup.as_ref().unwrap().state("held"), None);
+        clean.store(true, Ordering::SeqCst);
+        let reports = mgr.reconcile(Instant::now(), Duration::ZERO, Duration::from_secs(60));
+        assert!(
+            matches!(reports.as_slice(), [AgentMsg::SessionState { state, .. }] if state == "failed")
+        );
+        assert!(!mgr.running.contains_key("held"));
+        assert!(!live_refs.lock().unwrap().contains("managed-home"));
+        assert_eq!(
+            mgr.home_cleanup.as_ref().unwrap().state("held"),
+            Some(crate::home_cleanup::TerminalKind::Failed)
+        );
+    }
+
+    #[test]
+    fn repeated_stop_retires_a_lost_assign_before_terminal_and_blocks_reuse() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut mgr = manager_with(Vec::new());
+        mgr.home_cleanup = Some(
+            crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(
+                directory.path().join("ledger"),
+            )
+            .unwrap(),
+        );
+        let (tx, _rx) = mpsc::channel(8);
+        for _ in 0..2 {
+            let ack = mgr.handle_control(
+                ControlMsg::SessionStop {
+                    id: "stop".into(),
+                    session_id: "lost-assign".into(),
+                    reason: "error".into(),
+                },
+                &tx,
+                &diagnostic_sender(),
+            );
+            assert!(matches!(ack, Some(AgentMsg::Ack { ok: true, .. })));
+            assert!(matches!(mgr.home_cleanup_reports.pop(),
+                Some(AgentMsg::SessionState { state, .. }) if state == "stopped"));
+            assert_eq!(
+                mgr.home_cleanup.as_ref().unwrap().state("lost-assign"),
+                Some(crate::home_cleanup::TerminalKind::Stopped)
+            );
+        }
+        let refused = mgr.handle_control(
+            session_assign_msg("lost-assign", 0),
+            &tx,
+            &diagnostic_sender(),
+        );
+        assert!(matches!(refused, Some(AgentMsg::Ack { ok: false, .. })));
+    }
+
+    #[test]
     fn verified_assignment_preparation_requires_a_local_image_at_launch() {
         use std::io::{Read, Write};
         let directory = tempfile::tempdir().unwrap();
@@ -7867,6 +8189,7 @@ mod tests {
                 gpu_index: 0,
                 codec: crate::session::Codec::H264,
                 reached_running: true,
+                pending_home_terminal: None,
             },
             capture_rx,
         )
