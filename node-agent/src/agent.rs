@@ -2983,7 +2983,10 @@ impl SessionManager {
     /// setting a `config_update` can move under a long-lived connection, and a stale
     /// root would refuse the managed home it just relocated to.
     fn mount_policy(&self) -> MountPolicy {
-        MountPolicy::from_env(&self.runtime_settings.home_root)
+        MountPolicy::from_env_with_deployment_mount(
+            &self.runtime_settings.home_root,
+            &self.deployment_baseline.home_root,
+        )
     }
 
     /// A user launch always wins. Raised on `session_assign`, the earliest point the

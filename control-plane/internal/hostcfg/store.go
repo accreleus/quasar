@@ -93,6 +93,35 @@ func (s *Store) HomeRoot(ctx context.Context, hostID, envFallback string) (strin
 	return envFallback, nil
 }
 
+// HomeRootTx resolves the same precedence on the caller's host-locked
+// transaction. Home creation must not acquire a second pooled connection.
+func (s *Store) HomeRootTx(ctx context.Context, tx pgx.Tx, hostID, envFallback string) (string, error) {
+	var overridesRaw, effectiveRaw []byte
+	err := tx.QueryRow(ctx, `SELECT (SELECT overrides FROM host_settings WHERE host_id=$1::uuid), effective_settings FROM hosts WHERE id=$1::uuid`, hostID).Scan(&overridesRaw, &effectiveRaw)
+	if err != nil {
+		return "", fmt.Errorf("query home root: %w", err)
+	}
+	if len(overridesRaw) > 0 {
+		var overrides map[string]any
+		if err := json.Unmarshal(overridesRaw, &overrides); err != nil {
+			return "", fmt.Errorf("decode overrides: %w", err)
+		}
+		if root, ok := overrides["home_root"].(string); ok && root != "" {
+			return root, nil
+		}
+	}
+	if len(effectiveRaw) > 0 {
+		var effective map[string]string
+		if err := json.Unmarshal(effectiveRaw, &effective); err != nil {
+			return "", fmt.Errorf("decode effective_settings: %w", err)
+		}
+		if root := effective["home_root"]; root != "" {
+			return root, nil
+		}
+	}
+	return envFallback, nil
+}
+
 // GetCodecs returns the host's last-reported wire codec set (hosts.codecs, from
 // `capacity.codecs`) for the read-only `codecs` field (control-api.md, §S5).
 // nil means "never reported"; never normalise it to ["h264"] the way

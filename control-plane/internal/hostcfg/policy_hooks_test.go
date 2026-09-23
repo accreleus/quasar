@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/storage"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -284,11 +285,15 @@ func TestHomeRootEditRacingFirstHomeClaimIsRefused(t *testing.T) {
 	}
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	homes := storage.New(pool, localStorageProvider{}, storage.HostRootResolverFunc(func(context.Context, string) (string, error) {
+	root := func() (string, error) {
 		close(entered)
 		<-release
 		return "/srv/homes", nil
-	}))
+	}
+	homes := storage.New(pool, localStorageProvider{}, storage.HostRootResolverFuncs{
+		Read:   func(context.Context, string) (string, error) { return root() },
+		Locked: func(context.Context, pgx.Tx, string) (string, error) { return root() },
+	})
 	launchDone := make(chan error, 1)
 	go func() {
 		_, err := homes.EnsureHome(context.Background(), userID, appID, host.id, "/home/quasar")

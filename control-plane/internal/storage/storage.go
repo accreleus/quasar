@@ -144,6 +144,26 @@ type HostRootResolver interface {
 	HomeRoot(ctx context.Context, hostID string) (string, error)
 }
 
+// LockedHomeRootResolver reads the root on the home-claim transaction. A
+// resolver used for launches must implement this so the host lock and root
+// lookup share one connection and one database snapshot.
+type LockedHomeRootResolver interface {
+	HomeRootTx(ctx context.Context, tx pgx.Tx, hostID string) (string, error)
+}
+
+type HostRootResolverFuncs struct {
+	Read   func(context.Context, string) (string, error)
+	Locked func(context.Context, pgx.Tx, string) (string, error)
+}
+
+func (r HostRootResolverFuncs) HomeRoot(ctx context.Context, hostID string) (string, error) {
+	return r.Read(ctx, hostID)
+}
+
+func (r HostRootResolverFuncs) HomeRootTx(ctx context.Context, tx pgx.Tx, hostID string) (string, error) {
+	return r.Locked(ctx, tx, hostID)
+}
+
 // HostRootResolverFunc adapts a plain function to HostRootResolver — the wiring
 // point that binds hostcfg.Store.HomeRoot's env fallback (app.go).
 type HostRootResolverFunc func(ctx context.Context, hostID string) (string, error)
@@ -163,7 +183,8 @@ func (p fixedProvider) StorageProvider(context.Context) (string, error) { return
 // host — used by the env/test constructors (v1 uniform-root behaviour).
 type fixedRoot string
 
-func (r fixedRoot) HomeRoot(context.Context, string) (string, error) { return string(r), nil }
+func (r fixedRoot) HomeRoot(context.Context, string) (string, error)           { return string(r), nil }
+func (r fixedRoot) HomeRootTx(context.Context, pgx.Tx, string) (string, error) { return string(r), nil }
 
 // Manager synthesizes home mounts and owns the user_homes bookkeeping. The
 // managed-home provider is resolved PER EnsureHome call (not fixed at
@@ -325,6 +346,13 @@ func (m *Manager) EnsureHome(ctx context.Context, userID, appID, hostID, contain
 	if !path.IsAbs(containerPath) {
 		return "", fmt.Errorf("home_container_path %q is not absolute", containerPath)
 	}
+	prov, err := m.settings.StorageProvider(ctx)
+	if err != nil {
+		return "", fmt.Errorf("read storage_provider: %w", err)
+	}
+	if prov == "" {
+		prov = "auto"
+	}
 	// A host policy save takes this row lock before checking existing homes.
 	// Hold it through root resolution and insertion: otherwise a first launch
 	// can read the old root, let the edit validate an empty home set, then
@@ -334,16 +362,43 @@ func (m *Manager) EnsureHome(ctx context.Context, userID, appID, hostID, contain
 		return "", err
 	}
 	defer tx.Rollback(ctx)
-	var lockedHost string
-	if err := tx.QueryRow(ctx, `SELECT id::text FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&lockedHost); err != nil {
+	var lockedHost, hostName string
+	if err := tx.QueryRow(ctx, `SELECT id::text, node_name FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&lockedHost, &hostName); err != nil {
 		return "", fmt.Errorf("lock home host: %w", err)
 	}
-	// Read fresh per launch so an admin PATCH / per-host home_root applies on
-	// the next launch with no restart.
-	drv, err := m.resolveDriver(ctx, hostID)
-	if err != nil {
-		return "", err
+	root := ""
+	if m.roots != nil {
+		locked, ok := m.roots.(LockedHomeRootResolver)
+		if !ok {
+			return "", fmt.Errorf("home root resolver has no transactional read")
+		}
+		root, err = locked.HomeRootTx(ctx, tx, hostID)
+		if err != nil {
+			return "", fmt.Errorf("resolve home root for host %s: %w", hostID, err)
+		}
 	}
+	root = strings.TrimSpace(root)
+	if root != "" && !path.IsAbs(root) {
+		return "", fmt.Errorf("effective home root %q for host %s is not absolute", root, hostID)
+	}
+	if prov == "volume" {
+		return "", ErrVolumeDriverRemoved
+	}
+	if prov != "auto" && prov != "local" {
+		return "", fmt.Errorf("unknown storage_provider %q (auto|local)", prov)
+	}
+	if root == "" {
+		label := hostID
+		if hostName != "" {
+			short := hostID
+			if len(short) > 8 {
+				short = short[:8]
+			}
+			label = fmt.Sprintf("%q (%s)", hostName, short)
+		}
+		return "", fmt.Errorf("%w: no managed-home storage root is set for host %s, so its games have nowhere to keep their save data and the session cannot start. Set a storage root for this host under Admin → Hosts (or in the setup wizard's host-check step)", ErrNoHomeRoot, label)
+	}
+	drv := localDriver{root: path.Clean(root)}
 	key := homeKey{userID: userID, appID: appID, userSlug: userID, appSlug: appID}
 	// Resolve display names for the human-navigable local layout; a lookup miss
 	// (test fixtures, deleted rows) falls back to the UUIDs.
