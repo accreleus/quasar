@@ -213,7 +213,9 @@ func (s *consoleAutoState) finishLaunch(hostID, sessionID string, launched bool)
 // agent→browser signaling; consoleStore backs the CM-01 console-config
 // snapshot push + reported-capabilities upsert. Any nil argument uses a safe
 // no-op default (consoleStore nil simply skips console_config / capabilities).
-func NewHandler(pool *pgxpool.Pool, enrollmentToken string, log *slog.Logger, registry *Registry, events Events, relay *RelayBus, cfgStore *hostcfg.Store, consoleStore *console.Store) *Handler {
+// approvalBoot is the durable RH05 boot written before admission starts; tests
+// without that lifecycle may omit it.
+func NewHandler(pool *pgxpool.Pool, enrollmentToken string, log *slog.Logger, registry *Registry, events Events, relay *RelayBus, cfgStore *hostcfg.Store, consoleStore *console.Store, approvalBoot ...string) *Handler {
 	if registry == nil {
 		registry = NewRegistry(log)
 	}
@@ -223,8 +225,12 @@ func NewHandler(pool *pgxpool.Pool, enrollmentToken string, log *slog.Logger, re
 	if relay == nil {
 		relay = NewRelayBus(log)
 	}
+	bootIncarnation := newPolicyUUID()
+	if len(approvalBoot) != 0 && approvalBoot[0] != "" {
+		bootIncarnation = approvalBoot[0]
+	}
 	h := &Handler{
-		bootIncarnation: newPolicyUUID(),
+		bootIncarnation: bootIncarnation,
 		store: &agentStore{
 			pool: pool,
 			// The local half of the #96 liveness answer; the DB half is in enrollHost.

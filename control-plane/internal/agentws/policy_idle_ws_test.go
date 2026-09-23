@@ -70,14 +70,14 @@ func TestIdleOfferAfterCompletedCurrentJournal(t *testing.T) {
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	registry := NewRegistry(log)
-	h := NewHandler(pool, "test-token", log, registry, nil, nil, store, nil)
+	h := NewHandler(pool, "test-token", log, registry, nil, nil, store, nil, boot)
 	t.Cleanup(h.Close)
 	c := newConn(hostID, nil)
 	c.policyTyped = true
 	c.policyIdle = true
 	c.policyAcknowledged.Store(true)
 	c.policyInventoryDone.Store(true)
-	c.bootIncarnation = boot
+	c.bootIncarnation = h.bootIncarnation
 	c.connectionIncarnation = connection
 	registry.add(c)
 	t.Cleanup(func() { registry.remove(c) })

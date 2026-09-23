@@ -470,7 +470,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// Fence unstarted RH05 approvals and journal inventory before HTTP admission
 	// or agent registration can observe this control-plane incarnation.
 	idleBootCtx, idleBootCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	_, bootErr := cfgStore.StartRH05Boot(idleBootCtx)
+	idleBoot, bootErr := cfgStore.StartRH05Boot(idleBootCtx)
 	idleBootCancel()
 	if bootErr != nil {
 		janitorStop()
@@ -587,7 +587,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	originResolver := origins.NewResolver(cfg.AllowedOrigins, cfg.AllowedOriginsSet, settingsStore, log)
 	signalHandler := signalpkg.NewHandler(sessionStore, agentRegistry, relayBus, log, originResolver).
 		WithTrustedProxies(cfg.TrustedProxies)
-	agentHandler := agentws.NewHandler(pool, cfg.EnrollmentToken, log, agentRegistry, coordinator, relayBus, cfgStore, consoleStore).
+	agentHandler := agentws.NewHandler(pool, cfg.EnrollmentToken, log, agentRegistry, coordinator, relayBus, cfgStore, consoleStore, idleBoot).
 		WithTrustedProxies(cfg.TrustedProxies)
 	// CM-09 item 2: console re-eval hook, set after both exist. A plain func value
 	// because session must not import agentws.Handler, only its agentws.Events subset.
