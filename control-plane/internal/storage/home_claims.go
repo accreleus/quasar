@@ -15,16 +15,19 @@ import (
 // HomeClaim is the admin diagnosis of canonical ownership. Recorded hosts are
 // bookkeeping locations, not an assertion that files exist on those hosts.
 type HomeClaim struct {
-	UserID          string     `json:"user_id"`
-	Username        *string    `json:"username"`
-	CanonicalAppID  string     `json:"canonical_app_id"`
-	AppName         *string    `json:"app_name"`
-	HostID          *string    `json:"host_id"`
-	HostName        *string    `json:"host_name"`
-	State           string     `json:"state"`
-	ConflictReason  *string    `json:"conflict_reason"`
-	MaterializedAt  *time.Time `json:"materialized_at"`
-	RecordedHostIDs []string   `json:"recorded_host_ids"`
+	UserID                    string     `json:"user_id"`
+	Username                  *string    `json:"username"`
+	CanonicalAppID            string     `json:"canonical_app_id"`
+	AppName                   *string    `json:"app_name"`
+	HostID                    *string    `json:"host_id"`
+	HostName                  *string    `json:"host_name"`
+	State                     string     `json:"state"`
+	ConflictReason            *string    `json:"conflict_reason"`
+	MaterializedAt            *time.Time `json:"materialized_at"`
+	RecordedHostIDs           []string   `json:"recorded_host_ids"`
+	PendingHomeOperation      bool       `json:"pending_home_operation"`
+	HomeCleanupCapability     string     `json:"home_cleanup_capability"`
+	LegacyUnprotectedDispatch bool       `json:"legacy_unprotected_dispatch"`
 }
 
 type ListHomeClaimsOpts struct {
@@ -85,13 +88,17 @@ func lockClaimBeforeHome(ctx context.Context, tx pgx.Tx, userID, appID string, h
 		}
 	}
 	var id string
-	err = tx.QueryRow(ctx, `SELECT canonical_app_id::text FROM managed_home_claims
-		WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid FOR UPDATE`, userID, canonical).Scan(&id)
+	var held bool
+	err = tx.QueryRow(ctx, `SELECT canonical_app_id::text,pending_home_token IS NOT NULL FROM managed_home_claims
+		WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid FOR UPDATE`, userID, canonical).Scan(&id, &held)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("lock home claim: %w", err)
+	}
+	if create && held {
+		return ErrHomeInUse
 	}
 	return nil
 }
@@ -247,7 +254,8 @@ func (m *Manager) ListHomeClaims(ctx context.Context, opts ListHomeClaimsOpts) (
 	rows, err := m.pool.Query(ctx, `
 		SELECT c.user_id::text, u.username, c.canonical_app_id::text, a.name,
 		       c.host_id::text, h.node_name, c.state, c.conflict_reason,
-		       c.materialized_at,
+	       c.materialized_at, c.pending_home_token IS NOT NULL,
+	       c.legacy_unprotected_dispatch,
 		       COALESCE((SELECT array_agg(DISTINCT uh.host_id::text ORDER BY uh.host_id::text)
 		                 FROM user_homes uh JOIN apps ha ON ha.id=uh.app_id
 		                 WHERE uh.user_id=c.user_id AND COALESCE(ha.parent_app_id,ha.id)=c.canonical_app_id
@@ -273,8 +281,17 @@ func (m *Manager) ListHomeClaims(ctx context.Context, opts ListHomeClaimsOpts) (
 		var item HomeClaim
 		if err := rows.Scan(&item.UserID, &item.Username, &item.CanonicalAppID, &item.AppName,
 			&item.HostID, &item.HostName, &item.State, &item.ConflictReason, &item.MaterializedAt,
+			&item.PendingHomeOperation, &item.LegacyUnprotectedDispatch,
 			&item.RecordedHostIDs); err != nil {
 			return nil, "", fmt.Errorf("scan home claim: %w", err)
+		}
+		item.HomeCleanupCapability = "unknown"
+		if item.HostID != nil && m.homeCleanupCapability != nil {
+			capability := m.homeCleanupCapability(*item.HostID)
+			switch capability {
+			case "supported", "unsupported":
+				item.HomeCleanupCapability = capability
+			}
 		}
 		items = append(items, item)
 	}

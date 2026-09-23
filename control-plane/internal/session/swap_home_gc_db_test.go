@@ -65,6 +65,72 @@ func TestPendingManagedSwapProtectsTargetHomeAcrossRestart(t *testing.T) {
 	}
 }
 
+func TestCapableSwapTargetHoldOutlivesSyntheticTerminal(t *testing.T) {
+	pool := testDB(t)
+	s := seed(t, pool, 4)
+	store := NewStore(pool)
+	sess := runningSession(t, store, s)
+	target := seedManagedApp(t, pool, `{"image":"target:1"}`)
+	seedHome(t, pool, s.userID, target, s.hostID)
+	ctx := context.Background()
+	app, err := store.GetLaunchApp(ctx, target)
+	must(t, err)
+	hold, err := store.GuardHomeForSwapWithHold(ctx, sess.ID, s.userID, app, s.hostID, true)
+	must(t, err)
+	if hold == nil || !hold.Created {
+		t.Fatalf("capable target hold = %+v", hold)
+	}
+	t.Cleanup(func() { _ = store.ClearNewHomeHold(context.Background(), hold) })
+	var homeID string
+	must(t, pool.QueryRow(ctx, `SELECT id::text FROM user_homes WHERE user_id=$1::uuid AND app_id=$2::uuid`,
+		s.userID, target).Scan(&homeID))
+	_, err = store.Transition(ctx, sess.ID, StateFailed, nil, nil)
+	must(t, err)
+	mgr := storage.NewLocal(pool, testHomeRoot)
+	if _, err := mgr.TombstoneHome(ctx, homeID); !errors.Is(err, storage.ErrHomeInUse) {
+		t.Fatalf("synthetic terminal exposed target: %v", err)
+	}
+	_, err = store.ScheduleAndCreate(ctx, managedLaunchParams(s, target))
+	if !errors.Is(err, ErrHomeConflict) {
+		t.Fatalf("new launch reused held target: %v", err)
+	}
+}
+
+func TestUnqueuedSwapEpochRefreshUsesNewCapability(t *testing.T) {
+	pool := testDB(t)
+	s := seed(t, pool, 4)
+	store := NewStore(pool)
+	sess := runningSession(t, store, s)
+	target := seedManagedApp(t, pool, `{"image":"target:1"}`)
+	seedHome(t, pool, s.userID, target, s.hostID)
+	ctx := context.Background()
+	app, err := store.GetLaunchApp(ctx, target)
+	must(t, err)
+	hold, err := store.GuardHomeForSwapWithHold(ctx, sess.ID, s.userID, app, s.hostID, true)
+	must(t, err)
+	if hold == nil || !hold.Created {
+		t.Fatalf("first epoch hold = %+v", hold)
+	}
+	decision, err := store.RefreshSwapHomeHold(ctx, sess.ID, s.userID, target, s.hostID, hold, false)
+	must(t, err)
+	if decision != nil {
+		t.Fatalf("unsupported replacement epoch kept new hold: %+v", decision)
+	}
+	var pending, warning bool
+	must(t, pool.QueryRow(ctx, `SELECT pending_home_token IS NOT NULL,legacy_unprotected_dispatch
+		FROM managed_home_claims WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, s.userID, target).
+		Scan(&pending, &warning))
+	if pending || !warning {
+		t.Fatalf("epoch refresh: pending=%t warning=%t", pending, warning)
+	}
+	decision, err = store.RefreshSwapHomeHold(ctx, sess.ID, s.userID, target, s.hostID, nil, true)
+	must(t, err)
+	if decision == nil || !decision.Created {
+		t.Fatalf("later capable epoch hold = %+v", decision)
+	}
+	must(t, store.ClearNewHomeHold(ctx, decision))
+}
+
 // A stop request can race the pending swap's agent callback. The target may
 // still be mounted until teardown reaches a terminal state, even though the
 // session's app_id still names the old app.
@@ -129,7 +195,7 @@ func TestUncertainManagedSwapAckRetainsHomeHold(t *testing.T) {
 	swap := newSwapper(store, disp, testLogger(), nil)
 	swap.pendingSwaps[sess.ID] = target
 	swap.pendingHome[sess.ID] = true
-	swap.dispatchSwap(s.hostID, sess.ID, []byte(`{}`), true)
+	swap.dispatchSwap(s.hostID, sess.ID, []byte(`{}`), true, s.userID, target, nil, nil)
 	if _, pending := swap.pendingSwaps[sess.ID]; !pending {
 		t.Fatal("uncertain ack removed pending target")
 	}

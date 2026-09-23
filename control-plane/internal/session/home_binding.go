@@ -87,9 +87,17 @@ func finalMount(spec []byte) (string, error) {
 // BindManagedHomeDispatch persists the exact home identity before assignment
 // leaves the control plane. A retry may bind only the same immutable payload.
 func (s *Store) BindManagedHomeDispatch(ctx context.Context, sessionID string, spec []byte) error {
+	_, err := s.BindManagedHomeDispatchWithHold(ctx, sessionID, spec, false)
+	return err
+}
+
+// BindManagedHomeDispatchWithHold binds the mount and, for a cleanup-capable
+// command epoch, durably holds the original home before any socket handoff.
+// The returned token is internal command correlation, never a wire field.
+func (s *Store) BindManagedHomeDispatchWithHold(ctx context.Context, sessionID string, spec []byte, capable bool) (*HomeHoldDecision, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("begin home dispatch binding: %w", err)
+		return nil, fmt.Errorf("begin home dispatch binding: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	var userID, appID string
@@ -101,61 +109,72 @@ func (s *Store) BindManagedHomeDispatch(ctx context.Context, sessionID string, s
 		managed_home_id::text,managed_home_mount_sha256 FROM sessions WHERE id=$1::uuid FOR UPDATE`, sessionID).
 		Scan(&userID, &appID, &hostID, &state, &oldHome, &oldDigest)
 	if err != nil {
-		return fmt.Errorf("lock session for home binding: %w", err)
+		return nil, fmt.Errorf("lock session for home binding: %w", err)
 	}
 	canonical, managed, target, err := resolvedDispatchHome(ctx, tx, appID)
 	if err != nil {
-		return fmt.Errorf("resolve dispatch home app: %w", err)
+		return nil, fmt.Errorf("resolve dispatch home app: %w", err)
 	}
 	if !managed {
-		return nil
+		return nil, nil
 	}
 	if state != StateAssigned || hostID == nil {
-		return errors.New("session is not assigned to a host")
+		return nil, errors.New("session is not assigned to a host")
 	}
 	var claimHost *string
 	var claimState string
-	err = tx.QueryRow(ctx, `SELECT host_id::text,state FROM managed_home_claims
-		WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid FOR UPDATE`, userID, canonical).Scan(&claimHost, &claimState)
+	var pendingSession, pendingToken *string
+	err = tx.QueryRow(ctx, `SELECT host_id::text,state,pending_home_session_id::text,pending_home_token::text
+		FROM managed_home_claims
+		WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid FOR UPDATE`, userID, canonical).
+		Scan(&claimHost, &claimState, &pendingSession, &pendingToken)
 	if err != nil {
-		return fmt.Errorf("lock dispatch home claim: %w", err)
+		return nil, fmt.Errorf("lock dispatch home claim: %w", err)
 	}
-	if claimState == "conflict" || claimHost == nil || *claimHost != *hostID {
-		return ErrHomeConflict
+	if claimState == "conflict" || claimHost == nil || *claimHost != *hostID ||
+		(pendingSession != nil && *pendingSession != sessionID) {
+		return nil, ErrHomeConflict
 	}
 	var homeID, provider, ref string
 	err = tx.QueryRow(ctx, `SELECT id::text,provider,ref FROM user_homes
 		WHERE user_id=$1::uuid AND app_id=$2::uuid AND host_id=$3::uuid AND gc_after IS NULL
 		FOR SHARE`, userID, canonical, *hostID).Scan(&homeID, &provider, &ref)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrHomeConflict
+		return nil, ErrHomeConflict
 	}
 	if err != nil {
-		return fmt.Errorf("lock dispatch home row: %w", err)
+		return nil, fmt.Errorf("lock dispatch home row: %w", err)
 	}
 	digest, expectedMount, err := managedHomeDigest(provider, ref, target)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	injectedMount, err := finalMount(spec)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if injectedMount != expectedMount {
-		return errors.New("resolved managed home mount changed before dispatch")
+		return nil, errors.New("resolved managed home mount changed before dispatch")
 	}
 	if oldHome != nil || oldDigest != nil {
 		if oldHome == nil || oldDigest == nil || *oldHome != homeID || *oldDigest != digest {
-			return errors.New("managed home dispatch binding changed")
+			return nil, errors.New("managed home dispatch binding changed")
 		}
-		return tx.Commit(ctx)
+	} else {
+		_, err = tx.Exec(ctx, `UPDATE sessions SET managed_home_id=$2::uuid,
+			managed_home_mount_sha256=$3 WHERE id=$1::uuid`, sessionID, homeID, digest)
+		if err != nil {
+			return nil, fmt.Errorf("persist home dispatch binding: %w", err)
+		}
 	}
-	_, err = tx.Exec(ctx, `UPDATE sessions SET managed_home_id=$2::uuid,
-		managed_home_mount_sha256=$3 WHERE id=$1::uuid`, sessionID, homeID, digest)
+	decision, err := setHomeDispatchHold(ctx, tx, userID, canonical, sessionID, capable, pendingToken)
 	if err != nil {
-		return fmt.Errorf("persist home dispatch binding: %w", err)
+		return nil, err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return decision, nil
 }
 
 // materializeRunningHome is called only on the first accepted agent running

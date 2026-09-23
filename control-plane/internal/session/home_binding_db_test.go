@@ -45,6 +45,91 @@ func TestManagedHomeDispatchBindingMaterializesOnlyFirstVerifiedRunning(t *testi
 	must(t, err)
 }
 
+func TestCapableHomeDispatchHoldSurvivesTerminalUntilQualifiedCleanup(t *testing.T) {
+	pool := testDB(t)
+	s := seed(t, pool, 2)
+	appID := seedManagedApp(t, pool, `{}`)
+	seedHome(t, pool, s.userID, appID, s.hostID)
+	store := NewStore(pool)
+	ctx := context.Background()
+	p := managedLaunchParams(s, appID)
+	p.PinHostID = s.hostID
+	sess, err := store.ScheduleAndCreate(ctx, p)
+	must(t, err)
+	var ref string
+	must(t, pool.QueryRow(ctx, `SELECT ref FROM user_homes WHERE user_id=$1::uuid AND app_id=$2::uuid`, s.userID, appID).Scan(&ref))
+	spec := []byte(`{"mounts":["` + ref + `:/home/quasar:rw"]}`)
+	hold, err := store.BindManagedHomeDispatchWithHold(ctx, sess.ID, spec, true)
+	must(t, err)
+	if hold == nil || !hold.Created || hold.Token == "" {
+		t.Fatalf("first capable binding hold = %+v", hold)
+	}
+	retry, err := store.BindManagedHomeDispatchWithHold(ctx, sess.ID, spec, true)
+	must(t, err)
+	if retry == nil || retry.Created || retry.Token != hold.Token {
+		t.Fatalf("binding retry replaced hold: %+v / %+v", hold, retry)
+	}
+	_, err = store.Transition(ctx, sess.ID, StateFailed, nil, nil)
+	must(t, err)
+	_, err = store.ScheduleAndCreate(ctx, p)
+	if !errors.Is(err, ErrHomeConflict) {
+		t.Fatalf("terminal row authorized held-home relaunch: %v", err)
+	}
+	// A reused token cannot be released by a later failed retry.
+	must(t, store.ClearNewHomeHold(ctx, retry))
+	var pending bool
+	must(t, pool.QueryRow(ctx, `SELECT pending_home_token IS NOT NULL FROM managed_home_claims
+		WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, s.userID, appID).Scan(&pending))
+	if !pending {
+		t.Fatal("reused hold cleared by non-owner retry")
+	}
+	must(t, store.ClearNewHomeHold(ctx, hold))
+}
+
+func TestQualifiedHomeCleanupRequiresOwnerAndSurvivesSessionDeletion(t *testing.T) {
+	pool := testDB(t)
+	s := seed(t, pool, 2)
+	otherHost, _ := seedSecondHost(t, pool, 16384, 2)
+	appID := seedManagedApp(t, pool, `{}`)
+	seedHome(t, pool, s.userID, appID, s.hostID)
+	store := NewStore(pool)
+	ctx := context.Background()
+	p := managedLaunchParams(s, appID)
+	p.PinHostID = s.hostID
+	sess, err := store.ScheduleAndCreate(ctx, p)
+	must(t, err)
+	var ref string
+	must(t, pool.QueryRow(ctx, `SELECT ref FROM user_homes WHERE user_id=$1::uuid AND app_id=$2::uuid`, s.userID, appID).Scan(&ref))
+	_, err = store.BindManagedHomeDispatchWithHold(ctx, sess.ID,
+		[]byte(`{"mounts":["`+ref+`:/home/quasar:rw"]}`), true)
+	must(t, err)
+	t.Cleanup(func() {
+		_, cleanupErr := pool.Exec(context.Background(), `UPDATE managed_home_claims SET
+			pending_home_session_id=NULL,pending_home_token=NULL,pending_home_started_at=NULL
+			WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, s.userID, appID)
+		if cleanupErr != nil {
+			t.Errorf("clear test hold: %v", cleanupErr)
+		}
+	})
+	assertHeld := func(want bool) {
+		t.Helper()
+		var held bool
+		must(t, pool.QueryRow(ctx, `SELECT pending_home_token IS NOT NULL FROM managed_home_claims
+			WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, s.userID, appID).Scan(&held))
+		if held != want {
+			t.Fatalf("home hold = %t, want %t", held, want)
+		}
+	}
+	must(t, store.ClearQualifiedHomeHolds(ctx, otherHost, sess.ID))
+	assertHeld(true)
+	_, err = pool.Exec(ctx, `DELETE FROM sessions WHERE id=$1::uuid`, sess.ID)
+	must(t, err)
+	must(t, store.ClearQualifiedHomeHolds(ctx, otherHost, sess.ID))
+	assertHeld(true)
+	must(t, store.ClearQualifiedHomeHolds(ctx, s.hostID, sess.ID))
+	assertHeld(false)
+}
+
 func TestManagedHomeBindingRejectsChangedPayloadAndUnboundRunning(t *testing.T) {
 	pool := testDB(t)
 	s := seed(t, pool, 2)

@@ -38,6 +38,14 @@ func (c *Coordinator) AgentState(ctx context.Context, hostID string, m agentws.S
 		c.log.Warn("ignoring unknown agent session state", "state", m.State, "session_id", m.SessionID)
 		return
 	}
+	if to.IsTerminal() && m.HomeCleanupQualified {
+		// A qualified late terminal is useful even after a synthetic reaper or
+		// session-row deletion. The store checks the reporting host and clears
+		// only matching hold columns; it never changes public session history.
+		if err := c.store.ClearQualifiedHomeHolds(ctx, hostID, m.SessionID); err != nil {
+			c.log.Error("apply home cleanup proof failed", "err", err)
+		}
+	}
 	hs, err := c.store.GetSessionHostState(ctx, m.SessionID)
 	if err != nil || hs.HostID == nil || *hs.HostID != hostID {
 		c.log.Warn("ignoring session state from non-owner host", "session_id", m.SessionID)

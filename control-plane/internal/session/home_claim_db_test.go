@@ -32,6 +32,38 @@ func TestLaunchRefusesReplacementForOfflineHomeOwner(t *testing.T) {
 	}
 }
 
+func TestLaunchRefusesHomeHeldByTerminalSession(t *testing.T) {
+	pool := testDB(t)
+	s := seed(t, pool, 2)
+	appID := seedManagedApp(t, pool, `{}`)
+	seedHome(t, pool, s.userID, appID, s.hostID)
+	store := NewStore(pool)
+	ctx := context.Background()
+	p := managedLaunchParams(s, appID)
+	p.PinHostID = s.hostID
+	first, err := store.ScheduleAndCreate(ctx, p)
+	must(t, err)
+	_, err = store.Transition(ctx, first.ID, StateFailed, nil, nil)
+	must(t, err)
+	_, err = pool.Exec(ctx, `UPDATE managed_home_claims SET
+		pending_home_session_id=$3::uuid,pending_home_token=$4::uuid,pending_home_started_at=now()
+		WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`,
+		s.userID, appID, first.ID, "00000000-0000-4000-8000-000000000049")
+	must(t, err)
+	t.Cleanup(func() {
+		_, cleanupErr := pool.Exec(context.Background(), `UPDATE managed_home_claims SET
+			pending_home_session_id=NULL,pending_home_token=NULL,pending_home_started_at=NULL
+			WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, s.userID, appID)
+		if cleanupErr != nil {
+			t.Errorf("clear test hold: %v", cleanupErr)
+		}
+	})
+	_, err = store.ScheduleAndCreate(ctx, p)
+	if !errors.Is(err, ErrHomeConflict) {
+		t.Fatalf("launch against uncertain terminal-session home = %v, want home_conflict", err)
+	}
+}
+
 func TestLaunchRefusesDivergentLegacyHomes(t *testing.T) {
 	pool := testDB(t)
 	s := seed(t, pool, 2)

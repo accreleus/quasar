@@ -74,6 +74,9 @@ type ReapReport struct {
 	// session. Those are LEFT ALONE and retried next sweep — deleting them would
 	// orphan a live session on a node agent (see ReapEphemeral).
 	InSession int
+	// PendingHome is a racing cleanup hold discovered after the candidate
+	// prefilter. This identity is retained and retried on a later sweep.
+	PendingHome int
 	// Failed is how many hit some other error. The sweep continues past each one.
 	Failed int
 	// HostsNudged is how many distinct hosts were asked to reap the homes those
@@ -117,6 +120,10 @@ func (s *Service) ReapEphemeral(ctx context.Context) (ReapReport, error) {
 		case errors.Is(err, ErrUserHasActiveSessions):
 			// Expected and correct: try again next sweep.
 			rep.InSession++
+		case errors.Is(err, ErrHomeCleanupPending):
+			// A hold appeared after the candidate prefilter. The per-user
+			// transaction rolled back its tombstones; continue the batch.
+			rep.PendingHome++
 		case errors.Is(err, ErrUserNotFound):
 			// Raced with another control-plane instance's sweep. Not a failure.
 		default:
@@ -165,6 +172,8 @@ func (s *store) expiredEphemeralUserIDs(ctx context.Context) ([]string, error) {
 		SELECT id::text FROM users
 		WHERE ephemeral_expires_at IS NOT NULL
 		  AND ephemeral_expires_at < now()
+		  AND NOT EXISTS (SELECT 1 FROM managed_home_claims c
+		      WHERE c.user_id=users.id AND c.pending_home_token IS NOT NULL)
 		ORDER BY ephemeral_expires_at
 		LIMIT $1
 	`, reapBatch)

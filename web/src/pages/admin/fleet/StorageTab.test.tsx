@@ -109,6 +109,20 @@ describe("StorageTab", () => {
     expect(screen.getByText(/No managed homes yet/)).toBeTruthy();
   });
 
+  it("shows pending cleanup proof and unsupported older-agent coverage", async () => {
+    vi.mocked(adminApi.listAdminHomes).mockResolvedValue({ items: [], next_cursor: null } as never);
+    vi.mocked(adminApi.listAdminHomeClaims).mockResolvedValue({
+      items: [{ user_id: "u-alice", username: "alice", canonical_app_id: "a-steam", app_name: "Steam",
+        host_id: "host-role", host_name: "test role", state: "reserved", conflict_reason: null,
+        materialized_at: null, recorded_host_ids: [], pending_home_operation: true,
+        home_cleanup_capability: "unsupported", legacy_unprotected_dispatch: true }], next_cursor: null,
+    } as never);
+    renderPage();
+    await waitFor(() => expect(screen.getByText("Cleanup proof pending; this home remains protected")).toBeTruthy());
+    expect(screen.getByText("Earlier dispatch lacked cleanup proof")).toBeTruthy();
+    expect(screen.getByText("Agent cleanup capability: unsupported")).toBeTruthy();
+  });
+
   it("publishes the section head sub-line and storage count", async () => {
     vi.mocked(adminApi.listAdminHomes).mockResolvedValue({
       items: [makeHome({ id: "h1", bytes_used: 500 })],

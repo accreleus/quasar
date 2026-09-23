@@ -8,6 +8,10 @@ CREATE TABLE managed_home_claims (
     host_id UUID REFERENCES hosts(id) ON DELETE SET NULL,
     state TEXT NOT NULL CHECK (state IN ('reserved', 'materialized', 'conflict')),
     materialized_at TIMESTAMPTZ,
+    legacy_unprotected_dispatch BOOLEAN NOT NULL DEFAULT false,
+    pending_home_session_id UUID,
+    pending_home_token UUID,
+    pending_home_started_at TIMESTAMPTZ,
     conflict_reason TEXT CHECK (conflict_reason IS NULL OR conflict_reason IN
         ('legacy_location_uncertain', 'claim_owner_missing', 'location_mismatch', 'gc_pending')),
     PRIMARY KEY (user_id, canonical_app_id),
@@ -16,8 +20,56 @@ CREATE TABLE managed_home_claims (
     CONSTRAINT managed_home_claims_owner_ck
         CHECK (state = 'conflict' OR host_id IS NOT NULL),
     CONSTRAINT managed_home_claims_materialized_ck
-        CHECK (state <> 'materialized' OR materialized_at IS NOT NULL)
+        CHECK (state <> 'materialized' OR materialized_at IS NOT NULL),
+    CONSTRAINT managed_home_claims_pending_home_ck
+        CHECK ((pending_home_session_id IS NULL AND pending_home_token IS NULL AND pending_home_started_at IS NULL)
+            OR (pending_home_session_id IS NOT NULL AND pending_home_token IS NOT NULL AND pending_home_started_at IS NOT NULL))
 );
+
+CREATE INDEX managed_home_claims_pending_home_session_idx
+    ON managed_home_claims (pending_home_session_id)
+    WHERE pending_home_session_id IS NOT NULL;
+
+CREATE FUNCTION rh05_guard_managed_home_claim_delete_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.pending_home_token IS NOT NULL THEN
+        RAISE EXCEPTION USING ERRCODE='QH001', MESSAGE='managed home operation pending';
+    END IF;
+    RETURN OLD;
+END;
+$$;
+CREATE TRIGGER rh05_guard_managed_home_claim_delete
+    BEFORE DELETE ON managed_home_claims FOR EACH ROW EXECUTE FUNCTION rh05_guard_managed_home_claim_delete_fn();
+
+CREATE FUNCTION rh05_guard_user_delete_home_hold_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE claim RECORD;
+BEGIN
+    FOR claim IN SELECT pending_home_token FROM managed_home_claims
+                 WHERE user_id=OLD.id ORDER BY user_id, canonical_app_id FOR UPDATE LOOP
+        IF claim.pending_home_token IS NOT NULL THEN
+            RAISE EXCEPTION USING ERRCODE='QH001', MESSAGE='managed home operation pending';
+        END IF;
+    END LOOP;
+    RETURN OLD;
+END;
+$$;
+CREATE TRIGGER rh05_guard_user_delete_home_hold
+    BEFORE DELETE ON users FOR EACH ROW EXECUTE FUNCTION rh05_guard_user_delete_home_hold_fn();
+
+CREATE FUNCTION rh05_guard_parent_app_delete_home_hold_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE claim RECORD;
+BEGIN
+    FOR claim IN SELECT pending_home_token FROM managed_home_claims
+                 WHERE canonical_app_id=OLD.id ORDER BY user_id, canonical_app_id FOR UPDATE LOOP
+        IF claim.pending_home_token IS NOT NULL THEN
+            RAISE EXCEPTION USING ERRCODE='QH001', MESSAGE='managed home operation pending';
+        END IF;
+    END LOOP;
+    RETURN OLD;
+END;
+$$;
+CREATE TRIGGER rh05_guard_parent_app_delete_home_hold
+    BEFORE DELETE ON apps FOR EACH ROW EXECUTE FUNCTION rh05_guard_parent_app_delete_home_hold_fn();
 
 -- Host deletion must preserve a repair-required claim before the FK clears
 -- its owner. A pre-existing location disagreement outranks a missing owner;
@@ -62,13 +114,14 @@ WITH locations AS (
     GROUP BY uh.user_id, COALESCE(a.parent_app_id, uh.app_id)
 )
 INSERT INTO managed_home_claims
-    (user_id, canonical_app_id, host_id, state, materialized_at, conflict_reason)
+    (user_id, canonical_app_id, host_id, state, materialized_at, conflict_reason, legacy_unprotected_dispatch)
 SELECT user_id, canonical_app_id,
        CASE WHEN hosts = 1 AND NOT unknown THEN sole_host ELSE NULL END,
        CASE WHEN hosts = 1 AND NOT unknown AND NOT tombstoned THEN 'reserved' ELSE 'conflict' END,
        NULL,
        CASE WHEN hosts <> 1 OR unknown THEN 'legacy_location_uncertain'
-            WHEN tombstoned THEN 'gc_pending' ELSE NULL END
+            WHEN tombstoned THEN 'gc_pending' ELSE NULL END,
+       true
 FROM locations;
 
 COMMIT;

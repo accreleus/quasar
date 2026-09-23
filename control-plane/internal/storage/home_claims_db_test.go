@@ -24,7 +24,26 @@ func TestHomeClaimsDiagnosisIncludesClaimOnlyAndBindsCursor(t *testing.T) {
 	}
 	_, err = pool.Exec(ctx, `INSERT INTO managed_home_claims (user_id,canonical_app_id,host_id,state,conflict_reason) VALUES ($1::uuid,$2::uuid,$4::uuid,'reserved',NULL),($1::uuid,$3::uuid,NULL,'conflict','legacy_location_uncertain')`, u, a1, a2, h)
 	must(t, err)
+	_, err = pool.Exec(ctx, `UPDATE managed_home_claims SET pending_home_session_id=$3::uuid,
+		pending_home_token=$4::uuid,pending_home_started_at=now(),legacy_unprotected_dispatch=true
+		WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`,
+		u, a1, "00000000-0000-4000-8000-000000000061", "00000000-0000-4000-8000-000000000062")
+	must(t, err)
+	t.Cleanup(func() {
+		_, cleanupErr := pool.Exec(context.Background(), `UPDATE managed_home_claims SET
+			pending_home_session_id=NULL,pending_home_token=NULL,pending_home_started_at=NULL
+			WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, u, a1)
+		if cleanupErr != nil {
+			t.Errorf("clear test hold: %v", cleanupErr)
+		}
+	})
 	mgr := NewLocal(pool, t.TempDir())
+	mgr.SetHomeCleanupCapability(func(hostID string) string {
+		if hostID == h {
+			return "supported"
+		}
+		return "unknown"
+	})
 	first, cursor, err := mgr.ListHomeClaims(ctx, ListHomeClaimsOpts{UserID: u, Limit: 1})
 	must(t, err)
 	if len(first) != 1 || cursor == "" {
@@ -40,7 +59,8 @@ func TestHomeClaimsDiagnosisIncludesClaimOnlyAndBindsCursor(t *testing.T) {
 	}
 	byHost, _, err := mgr.ListHomeClaims(ctx, ListHomeClaimsOpts{HostID: h})
 	must(t, err)
-	if len(byHost) != 1 || byHost[0].CanonicalAppID != a1 || len(byHost[0].RecordedHostIDs) != 0 {
+	if len(byHost) != 1 || byHost[0].CanonicalAppID != a1 || len(byHost[0].RecordedHostIDs) != 0 ||
+		!byHost[0].PendingHomeOperation || !byHost[0].LegacyUnprotectedDispatch || byHost[0].HomeCleanupCapability != "supported" {
 		t.Fatalf("claim-only host filter = %+v", byHost)
 	}
 	for _, bad := range []ListHomeClaimsOpts{{UserID: "bad"}, {State: "unknown"}, {Cursor: "not-a-cursor"}, {Limit: 101}} {
@@ -131,6 +151,48 @@ func TestHomeTombstoneAndExactGCConfirmReleaseClaim(t *testing.T) {
 	must(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM managed_home_claims WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, u, a).Scan(&claims))
 	if claims != 0 {
 		t.Fatalf("reaped unique claim remains: %d", claims)
+	}
+}
+
+func TestPendingHomeHoldBlocksTombstoneAndAgentGC(t *testing.T) {
+	pool := testDB(t)
+	ctx := context.Background()
+	u := seedUser(t, pool, "pending-claim-gc@test.local")
+	a := seedApp(t, pool, "Pending Claim GC")
+	_, err := pool.Exec(ctx, `UPDATE apps SET managed_home=true,home_container_path='/home/quasar' WHERE id=$1::uuid`, a)
+	must(t, err)
+	h := seedHost(t, pool)
+	homeID := insertHome(t, pool, u, a, h)
+	_, err = pool.Exec(ctx, `INSERT INTO managed_home_claims
+		(user_id,canonical_app_id,host_id,state,pending_home_session_id,pending_home_token,pending_home_started_at)
+		VALUES ($1::uuid,$2::uuid,$3::uuid,'reserved',$4::uuid,$5::uuid,now())`,
+		u, a, h, "00000000-0000-4000-8000-000000000051", "00000000-0000-4000-8000-000000000052")
+	must(t, err)
+	t.Cleanup(func() {
+		_, cleanupErr := pool.Exec(context.Background(), `UPDATE managed_home_claims SET
+			pending_home_session_id=NULL,pending_home_token=NULL,pending_home_started_at=NULL
+			WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, u, a)
+		if cleanupErr != nil {
+			t.Errorf("clear test hold: %v", cleanupErr)
+		}
+	})
+	mgr := NewLocal(pool, t.TempDir())
+	if _, err := mgr.TombstoneHome(ctx, homeID); !errors.Is(err, ErrHomeInUse) {
+		t.Fatalf("held home tombstone = %v, want in use", err)
+	}
+	// A previously tombstoned row can still gain an uncertain dispatch hold.
+	// Neither the agent pull nor a stale confirmation may reap its backing data.
+	_, err = pool.Exec(ctx, `UPDATE user_homes SET gc_after=now()-interval '25 hours' WHERE id=$1::uuid`, homeID)
+	must(t, err)
+	pending, err := mgr.GCPending(ctx, h)
+	must(t, err)
+	if len(pending) != 0 {
+		t.Fatalf("held home offered to agent GC: %+v", pending)
+	}
+	deleted, err := mgr.GCConfirm(ctx, h, []string{homeID})
+	must(t, err)
+	if deleted != 0 {
+		t.Fatalf("held home GC confirm deleted %d rows", deleted)
 	}
 }
 

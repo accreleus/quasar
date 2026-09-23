@@ -1157,7 +1157,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description In use by an active session (pre-existing), OR (Phase 3) the app has derived tiles and ?delete_derived=true was not sent - the body then carries `derived_tiles`. */
+                /** @description In use by an active session (pre-existing), OR (Phase 3) the app has derived tiles and ?delete_derived=true was not sent - the body then carries `derived_tiles`, OR (RH05) deleting the canonical parent would cascade a pending-home hold. The RH05 refusal uses ErrorEnvelope code `conflict` and a fixed managed-home-pending message. */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -3381,7 +3381,7 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** Delete a user (admin). (Not yet in control-api.md prose.) */
+        /** Delete a user (admin); RH05 refuses while a pending-home hold exists. */
         delete: {
             parameters: {
                 query?: never;
@@ -3403,6 +3403,15 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
+                /** @description RH05 held managed-home claim blocks user deletion; ErrorEnvelope code conflict and fixed message Managed home cleanup is pending. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
             };
         };
         options?: never;
@@ -9781,6 +9790,15 @@ export interface components {
             conflict_reason: "legacy_location_uncertain" | "claim_owner_missing" | "location_mismatch" | "gc_pending" | null;
             /** Format: date-time */
             materialized_at: string | null;
+            /** @description An unresolved original assignment or managed-home swap may have mounted this canonical target; this is not proof of a current mount. */
+            pending_home_operation: boolean;
+            /**
+             * @description Current authenticated owner connection's terminal cleanup capability; unknown when offline or owner is null. Not proof of historical cleanup.
+             * @enum {string}
+             */
+            home_cleanup_capability: "supported" | "unsupported" | "unknown";
+            /** @description Sticky warning for a legacy-backfilled home or managed-home dispatch without RH05 hold coverage; false does not prove physical absence. */
+            legacy_unprotected_dispatch: boolean;
             /** @description Distinct sorted host IDs from known bookkeeping rows, including tombstones; not physical inventory evidence. */
             recorded_host_ids: string[];
         };

@@ -345,6 +345,9 @@ export function StorageTab() {
     { key: "evidence", header: "Evidence", render: (c) => (
       <div className="qtable-stack">
         <span>{c.conflict_reason ? CLAIM_REASONS[c.conflict_reason] ?? c.conflict_reason : c.state === "materialized" ? "Running mount observed" : "Ownership reserved"}</span>
+        {c.pending_home_operation && <span className="sub">Cleanup proof pending; this home remains protected</span>}
+        {c.legacy_unprotected_dispatch && <span className="sub">Earlier dispatch lacked cleanup proof</span>}
+        <span className="sub">Agent cleanup capability: {c.home_cleanup_capability ?? "unknown"}</span>
         <span className="sub">Recorded hosts: {c.recorded_host_ids.length ? c.recorded_host_ids.join(", ") : "none"}</span>
         {c.materialized_at && <span className="sub">Last mounted {relativeTime(c.materialized_at)}</span>}
       </div>

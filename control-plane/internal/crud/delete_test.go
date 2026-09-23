@@ -104,6 +104,37 @@ func insertHome(t *testing.T, pool *pgxpool.Pool, ids basicIDs) string {
 
 // --- app-delete tests -------------------------------------------------------
 
+func TestDeleteAppHeldHomeRefusesWithoutTombstone(t *testing.T) {
+	pool := testPool(t)
+	s := &store{pool: pool}
+	ids := seedBasic(t, pool)
+	homeID := insertHome(t, pool, ids)
+	ctx := context.Background()
+	_, err := pool.Exec(ctx, `INSERT INTO managed_home_claims
+		(user_id,canonical_app_id,host_id,state,pending_home_session_id,pending_home_token,pending_home_started_at)
+		VALUES ($1::uuid,$2::uuid,$3::uuid,'reserved',$4::uuid,$5::uuid,now())`,
+		ids.userID, ids.appID, ids.hostID,
+		"00000000-0000-4000-8000-000000000081", "00000000-0000-4000-8000-000000000082")
+	mustExec(t, err)
+	t.Cleanup(func() {
+		_, cleanupErr := pool.Exec(context.Background(), `UPDATE managed_home_claims SET
+			pending_home_session_id=NULL,pending_home_token=NULL,pending_home_started_at=NULL
+			WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, ids.userID, ids.appID)
+		if cleanupErr != nil {
+			t.Errorf("clear test hold: %v", cleanupErr)
+		}
+	})
+	_, err = s.deleteApp(ctx, ids.appID, false)
+	if !errors.Is(err, ErrHomeCleanupPending) {
+		t.Fatalf("held app delete = %v", err)
+	}
+	var tombstoned bool
+	mustExec(t, pool.QueryRow(ctx, `SELECT gc_after IS NOT NULL FROM user_homes WHERE id=$1::uuid`, homeID).Scan(&tombstoned))
+	if tombstoned {
+		t.Fatal("refused app deletion partially tombstoned home")
+	}
+}
+
 // TestDeleteApp_RefusedWhileActive: app-delete must return ErrAppHasActiveSessions
 // when a non-terminal session references the app.
 func TestDeleteApp_RefusedWhileActive(t *testing.T) {

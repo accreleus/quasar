@@ -78,6 +78,9 @@ func (m *Manager) AuthAgentHost(ctx context.Context, nodeName, nodeSecret string
 // login filled a host to 100% inside it (#92). Orphans are reapable at once.
 const gcReapable = `gc_after IS NOT NULL
 	  AND (user_id IS NULL OR gc_after + interval '24 hours' < now())
+	  AND NOT EXISTS (SELECT 1 FROM managed_home_claims c JOIN apps a
+	      ON a.id=user_homes.app_id AND c.canonical_app_id=COALESCE(a.parent_app_id,a.id)
+	      WHERE c.user_id=user_homes.user_id AND c.pending_home_token IS NOT NULL)
 	  AND NOT EXISTS (SELECT 1 FROM sessions s
 	      WHERE s.user_id=user_homes.user_id AND s.host_id=user_homes.host_id
 	        AND s.state_detail='swapping' AND s.state NOT IN ('stopped','failed'))`
@@ -186,6 +189,7 @@ func (m *Manager) gcConfirmOne(ctx context.Context, hostID, id string) (int, err
 				DELETE FROM managed_home_claims c
 				WHERE c.user_id=$1::uuid AND c.canonical_app_id=$2::uuid
 				  AND c.host_id=$3::uuid AND c.state='conflict' AND c.conflict_reason='gc_pending'
+				  AND c.pending_home_token IS NULL
 				  AND NOT EXISTS (
 				      SELECT 1 FROM user_homes uh JOIN apps a ON a.id=uh.app_id
 				      WHERE uh.user_id=c.user_id AND COALESCE(a.parent_app_id,a.id)=c.canonical_app_id)

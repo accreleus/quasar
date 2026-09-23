@@ -21,6 +21,16 @@ var ErrNotFound = errors.New("not found")
 // ErrAppHasActiveSessions: stop the sessions first; only terminal history cascades.
 var ErrAppHasActiveSessions = errors.New("app has active sessions")
 
+var ErrHomeCleanupPending = errors.New("managed home cleanup is pending")
+
+func homeCleanupDeleteError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "QH001" {
+		return ErrHomeCleanupPending
+	}
+	return err
+}
+
 // ErrAppHasDerivedTiles: deleting a provider app whose tiles weren't opted into
 // (spec §4.1). See deleteApp for why the FK cascade alone isn't enough.
 var ErrAppHasDerivedTiles = errors.New("app has derived tiles")
@@ -1303,7 +1313,8 @@ func (s *store) deleteApp(ctx context.Context, id string, deleteDerived bool) (s
 	defer tx.Rollback(ctx) //nolint:errcheck — no-op after commit
 
 	var name string
-	err = tx.QueryRow(ctx, `SELECT name FROM apps WHERE id::text = $1`, id).Scan(&name)
+	var parentID *string
+	err = tx.QueryRow(ctx, `SELECT name,parent_app_id::text FROM apps WHERE id::text = $1`, id).Scan(&name, &parentID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrNotFound
 	}
@@ -1327,16 +1338,57 @@ func (s *store) deleteApp(ctx context.Context, id string, deleteDerived bool) (s
 	// Also refuses on a session against a derived tile: without this,
 	// deleteDerived=true would cascade a tile out from under a running session.
 	var active int
-	if err := tx.QueryRow(ctx, `
-		SELECT COUNT(*) FROM sessions s
+	sessionRows, err := tx.Query(ctx, `
+		SELECT s.id::text,s.state FROM sessions s
 		JOIN apps a ON a.id = s.app_id
 		WHERE (a.id::text = $1 OR a.parent_app_id::text = $1)
-		  AND s.state NOT IN ('stopped','failed')
-	`, id).Scan(&active); err != nil {
-		return "", fmt.Errorf("count active sessions for app: %w", err)
+		ORDER BY s.id FOR UPDATE OF s
+	`, id)
+	if err != nil {
+		return "", fmt.Errorf("lock app sessions: %w", err)
+	}
+	for sessionRows.Next() {
+		var sessionID, state string
+		if err := sessionRows.Scan(&sessionID, &state); err != nil {
+			sessionRows.Close()
+			return "", err
+		}
+		if state != "stopped" && state != "failed" {
+			active++
+		}
+	}
+	err = sessionRows.Err()
+	sessionRows.Close()
+	if err != nil {
+		return "", fmt.Errorf("read app sessions: %w", err)
 	}
 	if active > 0 {
 		return "", ErrAppHasActiveSessions
+	}
+	if parentID == nil {
+		claimRows, err := tx.Query(ctx, `SELECT pending_home_token IS NOT NULL
+			FROM managed_home_claims WHERE canonical_app_id=$1::uuid
+			ORDER BY user_id,canonical_app_id FOR UPDATE`, id)
+		if err != nil {
+			return "", fmt.Errorf("lock app home claims: %w", err)
+		}
+		var held bool
+		for claimRows.Next() {
+			var pending bool
+			if err := claimRows.Scan(&pending); err != nil {
+				claimRows.Close()
+				return "", err
+			}
+			held = held || pending
+		}
+		err = claimRows.Err()
+		claimRows.Close()
+		if err != nil {
+			return "", fmt.Errorf("read app home claims: %w", err)
+		}
+		if held {
+			return "", ErrHomeCleanupPending
+		}
 	}
 
 	if _, err := tx.Exec(ctx,
@@ -1347,7 +1399,7 @@ func (s *store) deleteApp(ctx context.Context, id string, deleteDerived bool) (s
 	// Delete the app; terminal sessions cascade (migration 0014).
 	tag, err := tx.Exec(ctx, `DELETE FROM apps WHERE id::text = $1`, id)
 	if err != nil {
-		return "", fmt.Errorf("delete app: %w", err)
+		return "", fmt.Errorf("delete app: %w", homeCleanupDeleteError(err))
 	}
 	if tag.RowsAffected() == 0 {
 		return "", ErrNotFound

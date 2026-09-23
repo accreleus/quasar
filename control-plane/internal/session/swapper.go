@@ -89,7 +89,19 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 	//
 	// app.ManagedHome is the PARENT's for a tile (GetLaunchApp resolved it), so
 	// the gate fires; the tile's own column is false by CHECK.
+	var homeEpoch agentws.HomeCommandEpoch
+	var homeHold *HomeHoldDecision
 	if app.ManagedHome {
+		var epoch agentws.HomeCommandEpoch
+		if provider, ok := s.dispatcher.(interface {
+			CurrentHomeCommandEpoch(string) (agentws.HomeCommandEpoch, bool)
+		}); ok {
+			var connected bool
+			epoch, connected = provider.CurrentHomeCommandEpoch(*sess.HostID)
+			if !connected {
+				return Session{}, ErrSessionNotSwappable
+			}
+		}
 		conflictID, err := s.store.HasLiveUserAppSession(ctx, sess.UserID, homeAppID(app), sessionID)
 		if err != nil {
 			return Session{}, fmt.Errorf("home in use check: %w", err)
@@ -97,9 +109,13 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 		if conflictID != "" {
 			return Session{}, &HomeInUseError{SessionID: conflictID}
 		}
-		if err := s.store.GuardHomeForSwap(ctx, sessionID, sess.UserID, app, *sess.HostID); err != nil {
+		hold, err := s.store.GuardHomeForSwapWithHold(ctx, sessionID, sess.UserID, app,
+			*sess.HostID, epoch != nil && epoch.SupportsHomeCleanup())
+		if err != nil {
 			return Session{}, fmt.Errorf("swap home location: %w", err)
 		}
+		homeEpoch = epoch
+		homeHold = hold
 	}
 
 	// A managed-home swap target gets its home injected exactly like a launch.
@@ -107,6 +123,7 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 	dispatchSpec, err := s.resolveHome(ctx, app, sess.UserID, *sess.HostID)
 	if err != nil {
 		if app.ManagedHome {
+			_ = s.store.ClearNewHomeHold(ctx, homeHold)
 			// No target payload has left the control plane. Clearing here is
 			// safe; a failed clear retains conservative GC protection.
 			_ = s.store.SetStateDetail(ctx, sessionID, swapDetailRejected)
@@ -125,7 +142,8 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 	s.pendingHome[sessionID] = app.ManagedHome
 	s.mu.Unlock()
 
-	go s.dispatchSwap(*sess.HostID, sessionID, dispatchSpec, app.ManagedHome)
+	go s.dispatchSwap(*sess.HostID, sessionID, dispatchSpec, app.ManagedHome,
+		sess.UserID, homeAppID(app), homeEpoch, homeHold)
 
 	sess.StateDetail = strptr(swapDetailInProgress)
 	return sess, nil
@@ -135,25 +153,62 @@ func (s *swapper) Swap(ctx context.Context, sessionID, newAppID string) (Session
 // rejection clears the pending target. A managed-home transport error leaves
 // the guard in place: the agent may have accepted a command whose ack was lost.
 // On accept, progress arrives via AgentState.
-func (s *swapper) dispatchSwap(hostID, sessionID string, runtimeSpec []byte, managedHome bool) {
+func (s *swapper) dispatchSwap(hostID, sessionID string, runtimeSpec []byte, managedHome bool,
+	userID, canonicalAppID string, epoch agentws.HomeCommandEpoch, hold *HomeHoldDecision) {
 	app := runtimeSpec
 	if len(app) == 0 {
 		app = []byte("{}")
 	}
 	cmd := agentws.SessionSwapAppCmd{Type: "session_swap_app", ID: newCmdID(), SessionID: sessionID, App: app}
-	ctx, cancel := context.WithTimeout(context.Background(), swapAckTimeout)
-	defer cancel()
-	res, err := s.dispatcher.SendWithAck(ctx, hostID, cmd.ID, cmd)
+	var res agentws.AckResult
+	var err error
+	var queued bool
+	for attempt := 0; attempt < 3; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), swapAckTimeout)
+		if epoch != nil {
+			res, queued, err = epoch.SendWithAck(ctx, cmd.ID, cmd)
+		} else {
+			res, err = s.dispatcher.SendWithAck(ctx, hostID, cmd.ID, cmd)
+			queued = err == nil
+		}
+		cancel()
+		if !managedHome || epoch == nil || err == nil || queued {
+			break
+		}
+		provider, ok := s.dispatcher.(interface {
+			CurrentHomeCommandEpoch(string) (agentws.HomeCommandEpoch, bool)
+		})
+		if !ok {
+			break
+		}
+		next, connected := provider.CurrentHomeCommandEpoch(hostID)
+		if !connected {
+			break
+		}
+		refreshed, refreshErr := s.store.RefreshSwapHomeHold(context.Background(), sessionID,
+			userID, canonicalAppID, hostID, hold, next.SupportsHomeCleanup())
+		if refreshErr != nil {
+			s.log.Warn("swap home epoch refresh failed", "err", refreshErr)
+			break
+		}
+		hold, epoch = refreshed, next
+	}
 	if err != nil || !res.OK {
 		reason := "agent unreachable"
 		if err == nil {
 			reason = res.Error
 		}
 		s.log.Warn("swap rejected/undeliverable", "session_id", sessionID, "reason", reason)
-		if err != nil && managedHome {
+		if err != nil && managedHome && (epoch == nil || queued) {
 			// A timeout/lost ack does not prove that the agent never accepted
-			// the swap. Retain both pending target and durable GC guard.
+			// the swap. Retain the hold after queue handoff or when a legacy
+			// dispatcher cannot prove the frame stayed out of its queue.
 			return
+		}
+		if err == nil && !res.OK || err != nil && !queued {
+			if clearErr := s.store.ClearNewHomeHold(context.Background(), hold); clearErr != nil {
+				s.log.Warn("unstarted swap home hold release failed", "err", clearErr)
+			}
 		}
 		s.clearPendingSwap(sessionID)
 		if e := s.store.SetStateDetail(context.Background(), sessionID, swapDetailRejected); e != nil {

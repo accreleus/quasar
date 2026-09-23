@@ -2,8 +2,10 @@ package session
 
 import (
 	"context"
+	"errors"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -37,6 +39,11 @@ func TestMigration0090PreservesLegacyLocations(t *testing.T) {
 	if owner != host1 || state != "conflict" || uniqueReason == nil || *uniqueReason != "gc_pending" || materializedAt != nil {
 		t.Fatalf("unique tombstoned legacy claim = (%s,%s,%v,%v), want known owner conflict/gc_pending with no physical proof", owner, state, uniqueReason, materializedAt)
 	}
+	var legacyUnprotected bool
+	must(t, pool.QueryRow(ctx, `SELECT legacy_unprotected_dispatch FROM managed_home_claims WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, uniqueUser, appID).Scan(&legacyUnprotected))
+	if !legacyUnprotected {
+		t.Fatal("legacy backfill must disclose absence of RH05 hold coverage")
+	}
 	var conflictOwner *string
 	var reason string
 	must(t, pool.QueryRow(ctx, `SELECT host_id::text, state, conflict_reason FROM managed_home_claims WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, conflictUser, appID).Scan(&conflictOwner, &state, &reason))
@@ -52,6 +59,44 @@ func TestMigration0090PreservesLegacyLocations(t *testing.T) {
 	must(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM sessions WHERE managed_home_id IS NULL AND managed_home_mount_sha256 IS NULL`).Scan(&unbound))
 	if unbound != 0 {
 		t.Fatalf("pre-RH05 bindings: %d unexpected sessions", unbound)
+	}
+}
+
+func TestMigration0090HeldClaimCannotCascadeAway(t *testing.T) {
+	pool := testDB(t)
+	s := seed(t, pool, 2)
+	appID := seedManagedApp(t, pool, `{}`)
+	ctx := context.Background()
+	_, err := pool.Exec(ctx, `INSERT INTO managed_home_claims
+		(user_id,canonical_app_id,host_id,state,pending_home_session_id,pending_home_token,pending_home_started_at)
+		VALUES ($1::uuid,$2::uuid,$3::uuid,'reserved',$4::uuid,$5::uuid,now())`,
+		s.userID, appID, s.hostID, "00000000-0000-4000-8000-000000000041", "00000000-0000-4000-8000-000000000042")
+	must(t, err)
+	t.Cleanup(func() {
+		_, cleanupErr := pool.Exec(context.Background(), `UPDATE managed_home_claims
+			SET pending_home_session_id=NULL,pending_home_token=NULL,pending_home_started_at=NULL
+			WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, s.userID, appID)
+		if cleanupErr != nil {
+			t.Errorf("clear test hold: %v", cleanupErr)
+		}
+	})
+	for _, tc := range []struct{ name, sql, id string }{
+		{"claim", `DELETE FROM managed_home_claims WHERE user_id=$1::uuid`, s.userID},
+		{"user", `DELETE FROM users WHERE id=$1::uuid`, s.userID},
+		{"app", `DELETE FROM apps WHERE id=$1::uuid`, appID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := pool.Exec(ctx, tc.sql, tc.id)
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) || pgErr.Code != "QH001" {
+				t.Fatalf("held %s delete error = %v, want QH001", tc.name, err)
+			}
+			var n int
+			must(t, pool.QueryRow(ctx, `SELECT COUNT(*) FROM managed_home_claims WHERE user_id=$1::uuid AND canonical_app_id=$2::uuid`, s.userID, appID).Scan(&n))
+			if n != 1 {
+				t.Fatalf("held claim count after refused %s delete = %d", tc.name, n)
+			}
+		})
 	}
 }
 

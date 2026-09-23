@@ -171,9 +171,17 @@ func (r fixedRoot) HomeRoot(context.Context, string) (string, error) { return st
 // session host's effective home root (roots) — storage-config. This is what lets an
 // admin flip the provider in the UI and different hosts use different roots.
 type Manager struct {
-	pool     *pgxpool.Pool
-	settings SettingsReader
-	roots    HostRootResolver
+	pool                  *pgxpool.Pool
+	settings              SettingsReader
+	roots                 HostRootResolver
+	homeCleanupCapability func(string) string
+}
+
+// SetHomeCleanupCapability supplies the current authenticated agent-connection
+// capability for admin diagnosis. Without a live connection the answer remains
+// unknown; a past capable registration is never treated as current proof.
+func (m *Manager) SetHomeCleanupCapability(read func(string) string) {
+	m.homeCleanupCapability = read
 }
 
 // New builds the runtime Manager wired to the live settings + host-root resolvers

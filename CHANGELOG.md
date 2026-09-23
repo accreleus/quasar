@@ -30,6 +30,9 @@ own; the two do not move together, and that is deliberate.
   launches, and reports uncertain or divergent locations for operator repair
   without creating another home. Tombstones block launch until exact confirmed
   cleanup or repair; admins can inspect claim-only uncertainty in Fleet storage.
+  Capable agents retain a durable home hold across delivery loss and control-plane
+  restart until authenticated cleanup proof; older agents remain supported with
+  their unprotected-dispatch status visible to operators.
 - **Owner-scoped host admission restrictions (#337).** Manual drains and platform
   applies now hold independent, durable scheduling restrictions. Session
   reservations serialize with new holds, and reconnect preserves them. An apply
