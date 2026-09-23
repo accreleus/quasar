@@ -11,6 +11,8 @@ vi.mock("../../../api/admin", () => ({
   getHost: vi.fn(),
   getConfigCatalog: vi.fn(),
   getHostSettings: vi.fn(),
+  getHostPolicy: vi.fn(),
+  updateHostPolicy: vi.fn(),
   getHostGPUs: vi.fn(),
   updateHostSettings: vi.fn(),
   restartHost: vi.fn(),
@@ -97,6 +99,7 @@ describe("HostSettings", () => {
     vi.mocked(adminApi.getHost).mockResolvedValue({ host: HOST } as never);
     vi.mocked(adminApi.getConfigCatalog).mockResolvedValue({ knobs: KNOBS } as never);
     vi.mocked(adminApi.getHostSettings).mockResolvedValue(settingsResponse() as never);
+    vi.mocked(adminApi.getHostPolicy).mockRejectedValue(new ApiError(404, "not_found", "unsupported"));
     vi.mocked(adminApi.getHostGPUs).mockResolvedValue({ items: [] } as never);
   });
 
@@ -132,6 +135,26 @@ describe("HostSettings", () => {
     await screen.findByText("Idle timeout");
     expect(screen.getByRole("button", { name: "Discard" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+  });
+
+  it("keeps the legacy idle control on an upgrade-required agent and shows the typed remedy", async () => {
+    vi.mocked(adminApi.getHostPolicy).mockResolvedValue({
+      revision: "1",
+      choices: { idle_timeout_secs: { source: "deployment" } },
+      resolved: {},
+      groups: { idle_timeout_secs: {
+        desired_revision: "1", applied_revision: null, desired_digest: null,
+        scope: "next_session", status: "upgrade_required", fresh: false,
+        observed_at: null, remedy: "The legacy writer remains active for this group. Upgrade the agent to enable RH05 verification.",
+        approval_preview: null,
+      } },
+      image_preparation: { status: "unknown", observed_at: null, remedy: null },
+      readiness: { status: "unknown", observed_at: null, remedy: null },
+    } as never);
+    renderPage();
+    expect(await screen.findByText(/The legacy writer remains active/)).toBeTruthy();
+    expect(screen.getByText("QUASAR_IDLE_TIMEOUT_SECS")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Save idle timeout" })).toBeNull();
   });
 
   it("edits a live knob, saves it as a PATCH override, and shows no restart confirm", async () => {

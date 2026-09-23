@@ -3,6 +3,7 @@ package hostcfg
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -48,6 +49,27 @@ func TestPolicyDeliveryGateAndLegacyWriterRemainSeparate(t *testing.T) {
 	}
 }
 
+func TestUpgradeRequiredRemedyDistinguishesLegacyWriterFromStickyOwnership(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	ctx := context.Background()
+	if _, err := store.SaveLegacyPatch(ctx, hostID, map[string]any{"idle_timeout_secs": float64(900)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.GetPolicy(ctx, hostID)
+	if err != nil || !strings.Contains(*view.Groups["idle_timeout_secs"].Remedy, "legacy writer remains active") {
+		t.Fatalf("never-owned remedy = %+v, err=%v", view.Groups["idle_timeout_secs"], err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET config_policy_ever_owned_groups='["idle_timeout_secs"]'::jsonb WHERE id=$1::uuid`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	view, err = store.GetPolicy(ctx, hostID)
+	if err != nil || !strings.Contains(*view.Groups["idle_timeout_secs"].Remedy, "legacy value is not sent") {
+		t.Fatalf("sticky downgrade remedy = %+v, err=%v", view.Groups["idle_timeout_secs"], err)
+	}
+}
+
 func TestDeploymentBaselineIsCurrentConnectionEvidence(t *testing.T) {
 	pool := testPool(t)
 	store := NewStore(pool)
@@ -77,14 +99,65 @@ func TestDeploymentBaselineIsCurrentConnectionEvidence(t *testing.T) {
 	if ok, err := store.AcknowledgeInitialDelivery(ctx, hostID, connection, id); err != nil || !ok {
 		t.Fatalf("ack: %v %v", ok, err)
 	}
-	offer, err := store.NextSessionOffer(ctx, hostID, "00000000-0000-4000-8000-000000000114", "00000000-0000-4000-8000-000000000115", connection)
-	if err != nil || offer == nil || offer.ResolvedSettings["idle_timeout_secs"] != float64(120) || len(offer.Prerequisites) != 1 {
+	snapshot := &PolicySnapshot{Kind: "seeded", Digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	offer, err := store.NextSessionOffer(ctx, hostID, "00000000-0000-4000-8000-000000000114", "00000000-0000-4000-8000-000000000115", connection, snapshot)
+	if err != nil || offer == nil || offer.ResolvedSettings["idle_timeout_secs"] != float64(120) || len(offer.Prerequisites) != 2 {
 		t.Fatalf("deployment offer = %+v, err=%v", offer, err)
+	}
+	if offer.PrerequisitesSHA256 != "d4a0cfe061b90e2aa8833c78fb62528c750b0d780a60122efbb4ac621ae6b7df" {
+		t.Fatalf("prerequisite digest = %s", offer.PrerequisitesSHA256)
 	}
 	if err := store.ObserveDeploymentSettings(ctx, hostID, connection, json.RawMessage(`{"idle_timeout_secs":null}`)); err != nil {
 		t.Fatal(err)
 	}
 	if baseline, err := store.DeploymentSettingsForConnection(ctx, hostID, connection); err != nil || baseline != nil {
 		t.Fatalf("malformed report retained old baseline: %+v, err=%v", baseline, err)
+	}
+}
+
+func TestCompleteInventorySnapshotSeparatesSeedFromVerifiedApplication(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	ctx := context.Background()
+	connection := "00000000-0000-4000-8000-000000000121"
+	if _, err := store.BeginPolicyConnection(ctx, hostID, connection, map[string]int{"typed_settings": 2}, []string{"idle_timeout_secs"}, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ConfirmPolicyGroups(ctx, hostID, connection, []string{"idle_timeout_secs"}); err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.SavePolicy(ctx, hostID, "0", map[string]PolicyChoice{"idle_timeout_secs": {Source: "explicit", Value: float64(900)}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := *view.Groups["idle_timeout_secs"].DesiredDigest
+	if err := store.ReconcilePolicySnapshot(ctx, hostID, connection, &PolicySnapshot{Kind: "seeded", Digest: digest}); err != nil {
+		t.Fatal(err)
+	}
+	view, err = store.GetPolicy(ctx, hostID)
+	if err != nil || view.Groups["idle_timeout_secs"].Status == "applied" {
+		t.Fatalf("seed counted as applied: %+v, err=%v", view.Groups["idle_timeout_secs"], err)
+	}
+	if err := store.ReconcilePolicySnapshot(ctx, hostID, "00000000-0000-4000-8000-000000000122", &PolicySnapshot{Kind: "verified", Digest: digest}); err != nil {
+		t.Fatal(err)
+	}
+	view, err = store.GetPolicy(ctx, hostID)
+	if err != nil || view.Groups["idle_timeout_secs"].Status == "applied" {
+		t.Fatalf("wrong connection applied: %+v, err=%v", view.Groups["idle_timeout_secs"], err)
+	}
+	if err := store.ReconcilePolicySnapshot(ctx, hostID, connection, &PolicySnapshot{Kind: "verified", Digest: digest}); err != nil {
+		t.Fatal(err)
+	}
+	view, err = store.GetPolicy(ctx, hostID)
+	if err != nil || view.Groups["idle_timeout_secs"].Status != "applied" {
+		t.Fatalf("verified active snapshot not applied: %+v, err=%v", view.Groups["idle_timeout_secs"], err)
+	}
+	if err := store.ReconcilePolicySnapshot(ctx, hostID, connection, &PolicySnapshot{Kind: "verified", Digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}); err != nil {
+		t.Fatal(err)
+	}
+	view, err = store.GetPolicy(ctx, hostID)
+	if err != nil || view.Groups["idle_timeout_secs"].Status != "pending" {
+		t.Fatalf("different active snapshot retained proof: %+v, err=%v", view.Groups["idle_timeout_secs"], err)
 	}
 }

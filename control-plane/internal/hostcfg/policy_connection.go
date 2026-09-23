@@ -194,6 +194,26 @@ func (s *Store) PolicyOwnedGroups(ctx context.Context, hostID string, provisiona
 	return owned, nil
 }
 
+// PolicyRestartConflict protects a legacy restart while the initial RH05
+// inventory/delivery fence is open or a policy outcome is uncertain.
+func (s *Store) PolicyRestartConflict(ctx context.Context, hostID string) (bool, error) {
+	var blocked bool
+	err := s.pool.QueryRow(ctx, `SELECT h.config_policy_gate_connection IS NOT NULL OR EXISTS (
+		SELECT 1 FROM host_setting_groups g WHERE g.host_id=h.id AND g.status='uncertain'
+	) FROM hosts h WHERE h.id=$1::uuid`, hostID).Scan(&blocked)
+	return blocked, err
+}
+
+func (s *Store) HoldPolicyConnection(ctx context.Context, hostID, connectionID string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE hosts SET config_policy_gate_connection=$2::uuid,config_policy_delivery_id=NULL WHERE id=$1::uuid AND config_policy_versions->>'typed_settings'='2'`, hostID, connectionID)
+	return err
+}
+
+func (s *Store) ParkPolicyGroupUpgradeRequired(ctx context.Context, hostID, group string) error {
+	_, err := s.pool.Exec(ctx, `UPDATE host_setting_groups SET status='upgrade_required' WHERE host_id=$1::uuid AND group_key=$2 AND status IN ('pending','failed')`, hostID, group)
+	return err
+}
+
 func (s *Store) SetInitialDelivery(ctx context.Context, hostID, connectionID, deliveryID string) (bool, error) {
 	cmd, err := s.pool.Exec(ctx, `UPDATE hosts SET config_policy_delivery_id=$3::uuid WHERE id=$1::uuid AND config_policy_gate_connection=$2::uuid AND config_policy_confirmed_groups IS NOT NULL`, hostID, connectionID, deliveryID)
 	return cmd.RowsAffected() == 1, err

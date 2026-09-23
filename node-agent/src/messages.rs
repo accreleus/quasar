@@ -87,8 +87,47 @@ pub enum AgentMsg {
         updater_present: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         source_policy_versions: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        config_policy_versions: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        config_policy_groups: Option<Vec<String>>,
+    },
+    ConfigPolicyState {
+        attempt_id: String,
+        host_id: String,
+        group: String,
+        revision: String,
+        content_sha256: String,
+        scope: String,
+        grant_boot_incarnation: String,
+        grant_connection_incarnation: String,
+        journal_sequence: String,
+        phase: String,
+        active_scope: Option<String>,
+        evidence: Option<serde_json::Value>,
+        error: Option<String>,
+    },
+    ConfigPolicyJournalInventoryPage {
+        inventory_id: String,
+        snapshot_id: String,
+        cursor: Option<String>,
+        next_cursor: Option<String>,
+        revision_high_water: std::collections::BTreeMap<String, String>,
+        active_snapshots: std::collections::BTreeMap<String, serde_json::Value>,
+        entries: Vec<serde_json::Value>,
+    },
+    ConfigPolicyFeatureError {
+        code: String,
+        group: Option<String>,
+        connection_incarnation: String,
     },
     Capacity {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        deployment_settings: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        config_policy_accepted_groups: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        config_policy_legacy_map_applied_id: Option<String>,
         host: HostCapacity,
         gpus: Vec<GpuCapacity>,
         gpu_detection: String,
@@ -914,6 +953,12 @@ pub enum ControlMsg {
         host_id: String,
         node_secret: Option<String>,
         heartbeat_interval_ms: u64,
+        #[serde(default)]
+        boot_incarnation: Option<String>,
+        #[serde(default)]
+        connection_incarnation: Option<String>,
+        #[serde(default)]
+        config_policy_groups: Option<Vec<String>>,
     },
     /// Reserve + prepare a placed session (P1-6).
     SessionAssign {
@@ -1020,12 +1065,35 @@ pub enum ControlMsg {
     ConfigUpdate {
         #[serde(default)]
         settings: serde_json::Value,
+        #[serde(default)]
+        settings_delivery_id: Option<String>,
         /// Host's resolved console-mode config. Absent ⇒ console mode disabled
         /// (falls back to `QUASAR_LOCAL_DISPLAY` for dev).
         #[serde(default)]
         console_config: Option<ConsoleConfig>,
         #[serde(default)]
         source_policies: Option<serde_json::Value>,
+    },
+    ConfigPolicyOffer {
+        attempt_id: String,
+        host_id: String,
+        boot_incarnation: String,
+        connection_incarnation: String,
+        group: String,
+        revision: String,
+        content_sha256: String,
+        scope: String,
+        expires_at: String,
+        prerequisites_sha256: String,
+        prerequisites: Vec<serde_json::Value>,
+        settings: serde_json::Value,
+        resolved_settings: serde_json::Value,
+    },
+    ConfigPolicyJournalInventoryRequest {
+        inventory_id: String,
+        boot_incarnation: String,
+        connection_incarnation: String,
+        cursor: Option<String>,
     },
     /// Restart request: ack, then exit so the container restart policy
     /// restarts us with fresh config.
@@ -1368,6 +1436,10 @@ mod tests {
     #[test]
     fn capacity_json_omits_absent_additive_fields() {
         let msg = AgentMsg::Capacity {
+            deployment_settings: None,
+            config_policy_accepted_groups: None,
+            config_policy_legacy_map_applied_id: None,
+
             source_preparation: None,
             host: HostCapacity {
                 cpu_cores: 16,
@@ -1415,6 +1487,10 @@ mod tests {
     #[test]
     fn capacity_json_includes_present_additive_fields() {
         let msg = AgentMsg::Capacity {
+            deployment_settings: None,
+            config_policy_accepted_groups: None,
+            config_policy_legacy_map_applied_id: None,
+
             source_preparation: None,
             host: HostCapacity {
                 cpu_cores: 16,
@@ -1765,6 +1841,8 @@ mod tests {
         // pre-amendment agent, so the control plane never demotes stale rows.
         let msg = AgentMsg::Register {
             source_policy_versions: None,
+            config_policy_versions: None,
+            config_policy_groups: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Enrollment {
@@ -1787,6 +1865,8 @@ mod tests {
     fn register_omits_every_unknown_identity_field() {
         let msg = AgentMsg::Register {
             source_policy_versions: None,
+            config_policy_versions: None,
+            config_policy_groups: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {
@@ -1813,6 +1893,8 @@ mod tests {
     fn register_sends_identity_flat_beside_agent_version() {
         let msg = AgentMsg::Register {
             source_policy_versions: None,
+            config_policy_versions: None,
+            config_policy_groups: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {
@@ -1839,6 +1921,8 @@ mod tests {
     fn register_includes_images_when_present() {
         let msg = AgentMsg::Register {
             source_policy_versions: None,
+            config_policy_versions: None,
+            config_policy_groups: None,
             node_name: "gpu-host-01".to_string(),
             agent_version: "0.1.0".to_string(),
             auth: Auth::Reconnect {

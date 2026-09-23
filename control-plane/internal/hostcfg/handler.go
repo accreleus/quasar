@@ -174,7 +174,13 @@ func (h *Handler) handlePatchPolicy(w http.ResponseWriter, r *http.Request) {
 		PolicyIdentity(string) (string, string, bool)
 	}); ok {
 		if boot, connection, capable := target.PolicyIdentity(r.PathValue("id")); capable {
-			offer, offerErr := h.store.NextSessionOffer(r.Context(), r.PathValue("id"), newPolicyAttemptID(), boot, connection)
+			var snapshot *PolicySnapshot
+			if source, ok := h.dispatcher.(interface {
+				PolicyActiveSnapshot(string, string) *PolicySnapshot
+			}); ok {
+				snapshot = source.PolicyActiveSnapshot(r.PathValue("id"), connection)
+			}
+			offer, offerErr := h.store.NextSessionOffer(r.Context(), r.PathValue("id"), newPolicyAttemptID(), boot, connection, snapshot)
 			if offerErr == nil && offer != nil {
 				_ = h.dispatcher.Send(r.PathValue("id"), offer)
 			}
@@ -341,6 +347,17 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 			legacyRestart = true
 		}
 	}
+	if legacyRestart {
+		blocked, err := h.policyRestartConflict(r.Context(), hostID)
+		if err != nil {
+			httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not check policy attempts")
+			return
+		}
+		if blocked {
+			httpx.WriteError(w, http.StatusConflict, "attempt_conflict", "A host policy attempt or journal reconciliation is still in progress.")
+			return
+		}
+	}
 	if d.blocked && legacyRestart {
 		writeConflictBody(w, d.liveSessions)
 		return
@@ -353,7 +370,11 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := h.store.SaveLegacyPatch(r.Context(), hostID, req.Overrides, adminUserID(r)); err != nil {
-		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not save host settings")
+		if errors.Is(err, ErrPolicyAttemptConflict) {
+			httpx.WriteError(w, http.StatusConflict, "attempt_conflict", "A host policy attempt or journal reconciliation is still in progress.")
+		} else {
+			httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not save host settings")
+		}
 		return
 	}
 	d.merged, err = h.store.Get(r.Context(), hostID)
@@ -367,7 +388,13 @@ func (h *Handler) handlePatch(w http.ResponseWriter, r *http.Request) {
 	// overlays them on its env baseline — a cleared override reverts to env,
 	// not the catalog default.
 	if typed {
-		offer, offerErr := h.store.NextSessionOffer(r.Context(), hostID, newPolicyAttemptID(), bootID, connectionID)
+		var snapshot *PolicySnapshot
+		if source, ok := h.dispatcher.(interface {
+			PolicyActiveSnapshot(string, string) *PolicySnapshot
+		}); ok {
+			snapshot = source.PolicyActiveSnapshot(hostID, connectionID)
+		}
+		offer, offerErr := h.store.NextSessionOffer(r.Context(), hostID, newPolicyAttemptID(), bootID, connectionID, snapshot)
 		if offerErr == nil && offer != nil {
 			_ = h.dispatcher.Send(hostID, offer)
 		}
@@ -460,6 +487,15 @@ func (h *Handler) handleRestart(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "host is offline; agent not connected")
 		return
 	}
+	blocked, err := h.policyRestartConflict(r.Context(), hostID)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not check policy attempts")
+		return
+	}
+	if blocked {
+		httpx.WriteError(w, http.StatusConflict, "attempt_conflict", "A host policy attempt or journal reconciliation is still in progress.")
+		return
+	}
 
 	liveSessions := h.counter.LiveSessions(hostID)
 	if liveSessionRestartBlocked(liveSessions, req.Confirm) {
@@ -484,6 +520,17 @@ func (h *Handler) handleRestart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"restart_triggered": true})
+}
+
+func (h *Handler) policyRestartConflict(ctx context.Context, hostID string) (bool, error) {
+	blocked, err := h.store.PolicyRestartConflict(ctx, hostID)
+	if err != nil || blocked {
+		return blocked, err
+	}
+	if target, ok := h.dispatcher.(interface{ PolicyRestartConflict(string) bool }); ok {
+		return target.PolicyRestartConflict(hostID), nil
+	}
+	return false, nil
 }
 
 // writeConflictBody writes HTTP 409 with the restart_required error shape

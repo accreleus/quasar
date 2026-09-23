@@ -470,6 +470,25 @@ impl RuntimeSettings {
         );
         m
     }
+
+    /// RH05 pre-policy baseline, in catalog JSON types. Call this only on a
+    /// fresh env/device baseline before composing legacy or typed overlays.
+    pub fn deployment_map(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
+        let mut values = std::collections::BTreeMap::new();
+        for (key, raw) in self.effective_map() {
+            let value = match key.as_str() {
+                "abr_mode" | "abr_ladder_order" | "encoder" | "render_node" | "home_root"
+                | "nvidia_lib32_path" => serde_json::Value::String(raw),
+                _ => serde_json::from_str(&raw)
+                    .expect("runtime settings serialize every catalog number and boolean"),
+            };
+            values.insert(key, value);
+        }
+        values
+            .entry("abr_floor_kbps".to_string())
+            .or_insert(serde_json::Value::Null);
+        values
+    }
 }
 
 /// The hostcfg catalog's `encoder` enum string for an `EncoderChoice`.

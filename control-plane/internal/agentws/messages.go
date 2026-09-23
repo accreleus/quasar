@@ -74,18 +74,19 @@ type RegisteredMsg struct {
 }
 
 type ConfigPolicyStateMsg struct {
-	Type                       string  `json:"type"`
-	AttemptID                  string  `json:"attempt_id"`
-	HostID                     string  `json:"host_id"`
-	Group                      string  `json:"group"`
-	Revision                   string  `json:"revision"`
-	ContentSHA256              string  `json:"content_sha256"`
-	Scope                      string  `json:"scope"`
-	GrantBootIncarnation       string  `json:"grant_boot_incarnation"`
-	GrantConnectionIncarnation string  `json:"grant_connection_incarnation"`
-	JournalSequence            string  `json:"journal_sequence"`
-	Phase                      string  `json:"phase"`
-	ActiveScope                *string `json:"active_scope"`
+	Type                       string          `json:"type"`
+	AttemptID                  string          `json:"attempt_id"`
+	HostID                     string          `json:"host_id"`
+	Group                      string          `json:"group"`
+	Revision                   string          `json:"revision"`
+	ContentSHA256              string          `json:"content_sha256"`
+	Scope                      string          `json:"scope"`
+	GrantBootIncarnation       string          `json:"grant_boot_incarnation"`
+	GrantConnectionIncarnation string          `json:"grant_connection_incarnation"`
+	JournalSequence            string          `json:"journal_sequence"`
+	Phase                      string          `json:"phase"`
+	Error                      json.RawMessage `json:"error"`
+	ActiveScope                *string         `json:"active_scope"`
 	Evidence                   *struct {
 		Revision         string         `json:"revision"`
 		ContentSHA256    string         `json:"content_sha256"`

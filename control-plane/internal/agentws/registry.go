@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/accreleus/quasar/control-plane/internal/hostcfg"
 	"github.com/gorilla/websocket"
 )
 
@@ -66,15 +67,22 @@ type conn struct {
 	policyTyped               bool
 	policyAccepted            []string
 	policyAcknowledged        atomic.Bool
+	policyInitialMapApplied   atomic.Bool
 	policyInventoryDone       atomic.Bool
 	policyInventoryBlocked    atomic.Bool
+	policyInventoryUnknown    bool
+	policyAttemptOutstanding  atomic.Bool
 	policyInventoryID         string
 	policyInventorySnapshotID string
 	policyInventoryCursor     *string
 	policyInventoryHeader     []byte
+	policyActiveSnapshot      atomic.Pointer[hostcfg.PolicySnapshot]
 	policyOutstanding         map[string]ConfigPolicyStateMsg
+	policySequence            map[string]uint64
+	policySequenceContent     map[string][]byte
 	policyUncertain           bool
 	policyDeliveryID          string
+	policyDeliverySentAt      time.Time
 	bootIncarnation           string
 	connectionIncarnation     string
 	ws                        *websocket.Conn
@@ -99,6 +107,21 @@ func (r *Registry) PolicyIdentity(hostID string) (string, string, bool) {
 		return "", "", false
 	}
 	return c.bootIncarnation, c.connectionIncarnation, true
+}
+
+// PolicyActiveSnapshot returns only the authenticated current connection's
+// completed journal inventory snapshot.
+func (r *Registry) PolicyActiveSnapshot(hostID, connectionID string) *hostcfg.PolicySnapshot {
+	c, ok := r.get(hostID)
+	if !ok || !c.policyTyped || c.connectionIncarnation != connectionID || !c.policyInventoryDone.Load() || c.policyInventoryBlocked.Load() || c.policyAttemptOutstanding.Load() {
+		return nil
+	}
+	return c.policyActiveSnapshot.Load()
+}
+
+func (r *Registry) PolicyRestartConflict(hostID string) bool {
+	c, ok := r.get(hostID)
+	return ok && c.policyTyped && (!c.policyInventoryDone.Load() || c.policyInventoryBlocked.Load() || c.policyAttemptOutstanding.Load())
 }
 
 // PolicyLegacyDelivery exposes only current-connection writer ownership and

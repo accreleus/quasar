@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -104,6 +106,50 @@ func digestJSON(value any) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
+func validPolicyDigest(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, c := range value {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func sortPolicyFacts(facts []any) {
+	sort.Slice(facts, func(i, j int) bool {
+		a := facts[i].(map[string]any)
+		b := facts[j].(map[string]any)
+		if a["kind"] != b["kind"] {
+			return a["kind"].(string) < b["kind"].(string)
+		}
+		return a["id"].(string) < b["id"].(string)
+	})
+}
+
+func digestPolicyFacts(facts []any) (string, error) {
+	var bytes []byte
+	for _, item := range facts {
+		fact, ok := item.(map[string]any)
+		if !ok {
+			return "", errors.New("invalid prerequisite fact")
+		}
+		kind, kindOK := fact["kind"].(string)
+		id, idOK := fact["id"].(string)
+		if !kindOK || !idOK || kind == "" || id == "" || strings.ContainsAny(kind, "\x00\n") || strings.ContainsAny(id, "\x00\n") {
+			return "", errors.New("invalid prerequisite fact")
+		}
+		bytes = append(bytes, kind...)
+		bytes = append(bytes, 0)
+		bytes = append(bytes, id...)
+		bytes = append(bytes, '\n')
+	}
+	sum := sha256.Sum256(bytes)
+	return hex.EncodeToString(sum[:]), nil
+}
+
 type idleCandidate struct {
 	Choice        PolicyChoice
 	Value         any
@@ -173,7 +219,7 @@ func idleCandidateForConnection(ctx context.Context, tx pgx.Tx, hostID, connecti
 	if err != nil {
 		return nil, err
 	}
-	prereqDigest, err := digestJSON(prereqs)
+	prereqDigest, err := digestPolicyFacts(prereqs)
 	if err != nil {
 		return nil, err
 	}

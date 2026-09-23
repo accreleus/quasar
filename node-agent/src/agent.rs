@@ -336,6 +336,12 @@ pub async fn run(cfg: Config) {
                     handle.disconnected();
                 }
                 health.set_connected(false);
+                if e.downcast_ref::<PolicySeedReconnect>().is_some() {
+                    sessions.registered_this_connection = false;
+                    info!(token = "policy-seed-reconnect", "durable legacy seed applied; reconnecting once to negotiate typed ownership");
+                    sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
                 // #128: hold the running sessions instead of stopping them. The
                 // media path is agent-to-browser and needs nothing from the
                 // control plane while it is away, and on reconnect the control
@@ -1289,6 +1295,17 @@ type CpStream = futures_util::stream::SplitStream<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 >;
 
+#[derive(Debug)]
+struct PolicySeedReconnect;
+
+impl std::fmt::Display for PolicySeedReconnect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RH05 seed reconnect")
+    }
+}
+
+impl std::error::Error for PolicySeedReconnect {}
+
 /// Open the control-plane socket and split it.
 ///
 /// #12: the connector is chosen by policy, never by tokio-tungstenite's default — a
@@ -1319,6 +1336,12 @@ fn register_message(
 ) -> anyhow::Result<AgentMsg> {
     Ok(AgentMsg::Register {
         source_policy_versions: Some(serde_json::json!({"steam_preparation": 1})),
+        config_policy_versions: Some(
+            serde_json::json!({"typed_settings":2,"execution_journal":1,"deployment_baseline":1}),
+        ),
+        config_policy_groups: Some(crate::policy::PolicyAgent::advertised_groups(
+            &std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path)),
+        )),
         node_name: cfg.node_name.clone(),
         agent_version: crate::buildinfo::version().to_string(),
         auth: choose_auth(cfg, prefer_enrollment_token)?,
@@ -1338,7 +1361,7 @@ async fn register_and_await_registered<S, R>(
     tx: &mut S,
     rx: &mut R,
     register_msg: AgentMsg,
-) -> anyhow::Result<(String, u64)>
+) -> anyhow::Result<(String, u64, Option<(String, String)>, Option<Vec<String>>)>
 where
     S: SinkExt<Message, Error = tungstenite::Error> + Unpin,
     R: StreamExt<Item = Result<Message, tungstenite::Error>> + Unpin,
@@ -1361,6 +1384,9 @@ where
             host_id,
             node_secret,
             heartbeat_interval_ms,
+            boot_incarnation,
+            connection_incarnation,
+            config_policy_groups,
         } => {
             // A returned node_secret IS the enrollment signal: reconnect never mints one.
             let enrolled = node_secret.is_some();
@@ -1376,7 +1402,12 @@ where
             // #12: the pin that just verified this connection outlives the enrollment
             // string, so the operator can delete QUASAR_ENROLLMENT from the environment.
             persist_pin_if_new(cfg, enrolled);
-            Ok((host_id, heartbeat_interval_ms))
+            Ok((
+                host_id,
+                heartbeat_interval_ms,
+                boot_incarnation.zip(connection_incarnation),
+                config_policy_groups,
+            ))
         }
         ControlMsg::Error { code, message } => Err(register_reject_error(
             cfg,
@@ -1496,13 +1527,14 @@ async fn diagnostic_connection(
     crate::buildinfo::set_install_facts(install.clone());
 
     let (mut tx, mut rx) = dial(cfg).await?;
-    let (_host_id, heartbeat_interval_ms) = register_and_await_registered(
-        cfg,
-        &mut tx,
-        &mut rx,
-        register_message(cfg, prefer_enrollment_token, images, &install)?,
-    )
-    .await?;
+    let (_host_id, heartbeat_interval_ms, _policy_identity, _policy_groups) =
+        register_and_await_registered(
+            cfg,
+            &mut tx,
+            &mut rx,
+            register_message(cfg, prefer_enrollment_token, images, &install)?,
+        )
+        .await?;
     health.set_connected(true);
     // Clear the failure streak before a stale count can flip /health unhealthy; the
     // diagnostic not-ready state is separate and stays.
@@ -1549,6 +1581,9 @@ fn diagnostic_observe() -> (AgentMsg, Vec<crate::messages::ReadinessCheck>) {
     (
         AgentMsg::Capacity {
             source_preparation: None,
+            deployment_settings: None,
+            config_policy_accepted_groups: None,
+            config_policy_legacy_map_applied_id: None,
             host: cap.host,
             gpus: cap.gpus,
             gpu_detection: cap.gpu_detection,
@@ -1639,13 +1674,47 @@ async fn connect_and_run(
     let _release_upstream_guard = release_mgr.attach_upstream(release_tx);
 
     // --- Steps 1 and 2: send register, receive registered ---
-    let (host_id, heartbeat_interval_ms) = register_and_await_registered(
-        cfg,
-        &mut tx,
-        &mut rx,
-        register_message(cfg, prefer_enrollment_token, images, &install)?,
-    )
-    .await?;
+    let (host_id, heartbeat_interval_ms, policy_identity, policy_groups) =
+        register_and_await_registered(
+            cfg,
+            &mut tx,
+            &mut rx,
+            register_message(cfg, prefer_enrollment_token, images, &install)?,
+        )
+        .await?;
+    let path = std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path));
+    let advertised = crate::policy::PolicyAgent::advertised_groups(&path);
+    let mut baseline = crate::session::settings::RuntimeSettings::baseline();
+    seed_nvidia_lib32(&mut baseline, nvidia_lib32_probed);
+    sessions.mgr.deployment_baseline = baseline.clone();
+    sessions.mgr.runtime_settings = baseline;
+    let (boot, connection) = policy_identity.clone().unwrap_or_default();
+    let mut policy = crate::policy::PolicyAgent::open(
+        path,
+        host_id.clone(),
+        boot,
+        connection.clone(),
+        &mut sessions.mgr.runtime_settings,
+    )?;
+    if let Some(groups) = &policy_groups {
+        if let Err(code) = policy.confirm_groups(&advertised, groups) {
+            send(
+                &mut tx,
+                &AgentMsg::ConfigPolicyFeatureError {
+                    code,
+                    group: None,
+                    connection_incarnation: connection,
+                },
+            )
+            .await?;
+            anyhow::bail!("RH05 ownership echo invalid");
+        }
+    }
+    sessions.mgr.policy_session_ready = policy_identity.is_none() && !policy.has_sticky_ownership();
+    sessions.mgr.policy_accepted_groups = policy_groups;
+    sessions.mgr.policy_delivery_ack = None;
+    sessions.mgr.policy_inventory_complete = false;
+    sessions.mgr.policy_agent = Some(policy);
     health.set_connected(true);
     // #128: the control plane is back, so the sessions held across the outage are
     // safe. Disarmed HERE rather than at the top of the reconnect loop: doing it
@@ -1707,8 +1776,7 @@ async fn connect_and_run(
     // The env baseline with the startup-probed lib32 path seeded in, so the very first
     // capacity report already carries the auto-detected value. Matches what
     // `SessionManager::new` seeds; the first config_update re-sends the overlay view.
-    let mut first_settings = crate::session::settings::RuntimeSettings::baseline();
-    seed_nvidia_lib32(&mut first_settings, nvidia_lib32_probed);
+    let first_settings = sessions.mgr.runtime_settings.clone();
     // Probed once (the gst registry is process-stable) and reused in every capacity
     // re-send below.
     let host_codec_report = {
@@ -1764,6 +1832,9 @@ async fn connect_and_run(
     apply_gpu_codecs(&mut cap.gpus, &first_gpu_codec_sets);
     let capacity_msg = AgentMsg::Capacity {
         source_preparation: None,
+        deployment_settings: Some(sessions.mgr.deployment_baseline.deployment_map()),
+        config_policy_accepted_groups: sessions.mgr.policy_accepted_groups.clone(),
+        config_policy_legacy_map_applied_id: None,
         host: cap.host,
         gpus: cap.gpus,
         gpu_detection: cap.gpu_detection,
@@ -1949,6 +2020,21 @@ async fn connect_and_run(
     let mut readiness_busy = false;
 
     loop {
+        if policy_identity.is_some()
+            && advertised.is_empty()
+            && !mgr.policy_seed_reconnect_used
+            && mgr.policy_delivery_ack.is_some()
+            && mgr
+                .policy_agent
+                .as_ref()
+                .is_some_and(|agent| agent.has_idle_seed())
+            && mgr.pending.is_empty()
+            && mgr.running.is_empty()
+            && !mgr.warmup_reserved()
+        {
+            mgr.policy_seed_reconnect_used = true;
+            return Err(PolicySeedReconnect.into());
+        }
         tokio::select! {
             _ = readiness_timer.tick(), if !readiness_busy => {
                 readiness_busy = true;
@@ -2090,6 +2176,10 @@ async fn connect_and_run(
                             let gpu_sets = mgr.gpu_codec_sets();
                             apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
                             let capacity_msg = AgentMsg::Capacity {
+            deployment_settings: Some(mgr.deployment_baseline.deployment_map()),
+            config_policy_accepted_groups: mgr.policy_accepted_groups.clone(),
+            config_policy_legacy_map_applied_id: mgr.policy_delivery_ack.clone(),
+
             source_preparation: mgr.source_policy.as_ref().and_then(|p| p.report()),
                                 host: cap.host,
                                 gpus: cap_gpus,
@@ -2145,6 +2235,10 @@ async fn connect_and_run(
                     let gpu_sets = mgr.gpu_codec_sets();
                     apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
                     let capacity_msg = AgentMsg::Capacity {
+            deployment_settings: Some(mgr.deployment_baseline.deployment_map()),
+            config_policy_accepted_groups: mgr.policy_accepted_groups.clone(),
+            config_policy_legacy_map_applied_id: mgr.policy_delivery_ack.clone(),
+
             source_preparation: mgr.source_policy.as_ref().and_then(|p| p.report()),
                         host: cap.host,
                         gpus: cap_gpus,
@@ -2589,6 +2683,13 @@ struct SessionManager {
     /// Agent-local runtime knobs, starting at the env baseline and overlaid by
     /// `config_update` pushes. Read when building each session's SessionConfig.
     runtime_settings: crate::session::settings::RuntimeSettings,
+    deployment_baseline: crate::session::settings::RuntimeSettings,
+    policy_agent: Option<crate::policy::PolicyAgent>,
+    policy_accepted_groups: Option<Vec<String>>,
+    policy_session_ready: bool,
+    policy_delivery_ack: Option<String>,
+    policy_inventory_complete: bool,
+    policy_seed_reconnect_used: bool,
     /// Latest capacity inventory on this connection. An assignment's `gpu_index` is
     /// resolved against this exact inventory, never treated as an alias for a
     /// host-wide render/CUDA setting.
@@ -2612,10 +2713,6 @@ struct SessionManager {
     live_refs: LiveRefs,
     /// Shared with the health endpoint: the running-session count.
     health: Arc<HealthState>,
-    /// #375: the 32-bit NVIDIA driver-lib dir auto-detected at startup, seeded into
-    /// `runtime_settings.nvidia_lib32_path` whenever the configured value is empty.
-    /// Empty on non-NVIDIA hosts and when nothing was detected.
-    nvidia_lib32_probed: String,
     /// The codec set + throughput hint the host's active encoder path can produce.
     /// Re-probed whenever a `config_update` flips the effective encoder, since that
     /// overlay is live-class. `None` ⇒ `gst::init` failed: no registry to plan from,
@@ -2748,17 +2845,24 @@ impl SessionManager {
     ) -> Self {
         let mut runtime_settings = crate::session::settings::RuntimeSettings::baseline();
         seed_nvidia_lib32(&mut runtime_settings, &nvidia_lib32_probed);
+        let deployment_baseline = runtime_settings.clone();
         SessionManager {
             pending: HashMap::new(),
             running: HashMap::new(),
             runtime_settings,
+            deployment_baseline,
+            policy_agent: None,
+            policy_accepted_groups: None,
+            policy_session_ready: true,
+            policy_delivery_ack: None,
+            policy_inventory_complete: false,
+            policy_seed_reconnect_used: false,
             gpu_inventory,
             vram_targets,
             vram_cache: Arc::new(VramCache::new()),
             console_config: None,
             live_refs,
             health,
-            nvidia_lib32_probed,
             host_codec_report: None,
             agent_image_identity: String::new(),
             codec_layers: CodecLayers::default(),
@@ -3054,6 +3158,13 @@ impl SessionManager {
                 resources,
                 video_topology,
             } => {
+                if !self.policy_session_ready {
+                    return Some(ack(
+                        id,
+                        false,
+                        Some("settings delivery not yet applied".to_string()),
+                    ));
+                }
                 // A draining agent accepts no new sessions.
                 if self.draining {
                     warn!(
@@ -3602,9 +3713,11 @@ impl SessionManager {
             }
             ControlMsg::ConfigUpdate {
                 settings,
+                settings_delivery_id,
                 console_config,
                 source_policies,
             } => {
+                let mut feature_error = None;
                 if let (Some(policy), Some(snapshot)) =
                     (&self.source_policy, source_policies.as_ref())
                 {
@@ -3617,10 +3730,48 @@ impl SessionManager {
                 // A console-only PATCH sends settings as JSON null; that must NOT
                 // rebaseline and silently undo a persisted encoder override.
                 if !settings.is_null() {
-                    let mut next = crate::session::settings::RuntimeSettings::baseline();
-                    next.apply_json(&settings);
-                    seed_nvidia_lib32(&mut next, &self.nvidia_lib32_probed);
-                    self.runtime_settings = next;
+                    if let Some(policy) = self.policy_agent.as_mut() {
+                        let result = policy.apply_legacy_overlay(
+                            &self.deployment_baseline,
+                            &mut self.runtime_settings,
+                            &settings,
+                            settings_delivery_id.as_deref(),
+                        );
+                        match result {
+                            Ok(conflict) => {
+                                self.policy_delivery_ack = settings_delivery_id;
+                                self.policy_session_ready = match &self.policy_accepted_groups {
+                                    Some(groups) => {
+                                        self.policy_inventory_complete
+                                            && policy.sticky_groups_accepted(groups)
+                                            && (!groups.is_empty() || !policy.has_idle_seed())
+                                    }
+                                    None => !policy.has_sticky_ownership(),
+                                };
+                                if let Some(group) = conflict {
+                                    feature_error = Some(AgentMsg::ConfigPolicyFeatureError {
+                                        code: "attempt_conflict".into(),
+                                        group: Some(group),
+                                        connection_incarnation: policy
+                                            .connection_incarnation()
+                                            .into(),
+                                    });
+                                }
+                            }
+                            Err(code) => {
+                                self.policy_session_ready = false;
+                                feature_error = Some(AgentMsg::ConfigPolicyFeatureError {
+                                    code,
+                                    group: None,
+                                    connection_incarnation: policy.connection_incarnation().into(),
+                                });
+                            }
+                        }
+                    } else {
+                        let mut next = self.deployment_baseline.clone();
+                        next.apply_json(&settings);
+                        self.runtime_settings = next;
+                    }
                     if let Some(policy) = &self.source_policy {
                         policy.update_root(&self.runtime_settings.home_root);
                     }
@@ -3658,8 +3809,73 @@ impl SessionManager {
                     }
                     self.console_config = Some(cc);
                 }
-                None // fire-and-forget, no ack
+                feature_error // no ordinary config_update ack
             }
+            ControlMsg::ConfigPolicyOffer {
+                attempt_id,
+                host_id,
+                boot_incarnation,
+                connection_incarnation,
+                group,
+                revision,
+                content_sha256,
+                scope,
+                expires_at,
+                prerequisites_sha256,
+                prerequisites,
+                settings,
+                resolved_settings,
+            } => {
+                let offer = crate::policy::Offer {
+                    attempt_id,
+                    host_id,
+                    boot_incarnation,
+                    connection_incarnation,
+                    group,
+                    revision,
+                    content_sha256,
+                    scope,
+                    expires_at,
+                    prerequisites_sha256,
+                    prerequisites,
+                    settings,
+                    resolved_settings,
+                };
+                self.policy_agent
+                    .as_mut()
+                    .map(|policy| policy.accept(offer, &mut self.runtime_settings))
+            }
+            ControlMsg::ConfigPolicyJournalInventoryRequest {
+                inventory_id,
+                boot_incarnation,
+                connection_incarnation,
+                cursor,
+            } => self.policy_agent.as_mut().map(|policy| {
+                match policy.inventory_page(
+                    &inventory_id,
+                    &boot_incarnation,
+                    &connection_incarnation,
+                    cursor.as_deref(),
+                ) {
+                    Ok(page) => {
+                        if matches!(
+                            &page,
+                            AgentMsg::ConfigPolicyJournalInventoryPage {
+                                next_cursor: None,
+                                ..
+                            }
+                        ) {
+                            self.policy_inventory_complete = true;
+                        }
+                        page
+                    }
+                    Err(code) => AgentMsg::ConfigPolicyFeatureError {
+                        code,
+                        group: None,
+                        connection_incarnation,
+                    },
+                }
+            }),
             // `restart` is intercepted in the receive loop (so the ack flushes
             // before the process exits); it never reaches here in practice.
             ControlMsg::Restart { .. } => None,
@@ -4628,6 +4844,9 @@ where
     apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
     let msg = AgentMsg::Capacity {
         source_preparation: mgr.source_policy.as_ref().and_then(|p| p.report()),
+        deployment_settings: Some(mgr.deployment_baseline.deployment_map()),
+        config_policy_accepted_groups: mgr.policy_accepted_groups.clone(),
+        config_policy_legacy_map_applied_id: mgr.policy_delivery_ack.clone(),
         host: cap.host,
         gpus: cap_gpus,
         gpu_detection: cap.gpu_detection,
@@ -6086,6 +6305,7 @@ mod tests {
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
         let msg = ControlMsg::ConfigUpdate {
             source_policies: None,
+            settings_delivery_id: None,
             settings: serde_json::json!({ "gop": 120, "abr_enabled": true, "encoder": "va" }),
             console_config: None,
         };
@@ -6121,6 +6341,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::json!({ "encoder": "va", "gop": 120 }),
                 console_config: None,
             },
@@ -6134,6 +6355,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::json!({ "gop": 90 }),
                 console_config: None,
             },
@@ -6150,6 +6372,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::json!({}),
                 console_config: None,
             },
@@ -6180,6 +6403,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::Value::Null,
                 console_config: None,
             },
@@ -6208,6 +6432,10 @@ mod tests {
              explicit clear, not 'nothing to say'"
         );
         let json = serde_json::to_value(AgentMsg::Capacity {
+            deployment_settings: None,
+            config_policy_accepted_groups: None,
+            config_policy_legacy_map_applied_id: None,
+
             source_preparation: None,
             host: crate::messages::HostCapacity {
                 cpu_cores: 1,
@@ -6692,6 +6920,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::Value::Null,
                 console_config: None,
             },
@@ -6704,6 +6933,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::json!({}),
                 console_config: None,
             },
@@ -6721,6 +6951,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::json!({ "encoder": flip }),
                 console_config: None,
             },
@@ -6736,6 +6967,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::json!({ "encoder": flip }),
                 console_config: None,
             },
@@ -7168,6 +7400,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::Value::Null,
                 console_config: Some(
                     serde_json::from_value(serde_json::json!({ "enabled": true })).unwrap(),
@@ -7183,6 +7416,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::Value::Null,
                 console_config: Some(
                     serde_json::from_value(serde_json::json!({ "enabled": false })).unwrap(),

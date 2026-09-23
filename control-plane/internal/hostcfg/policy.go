@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"time"
 
@@ -25,6 +26,7 @@ func newPolicyAttemptID() string {
 var ErrStaleRevision = errors.New("stale policy revision")
 var ErrHostNotFound = errors.New("host not found")
 var ErrUpgradeRequired = errors.New("typed policy group is not owned by this host")
+var ErrPolicyAttemptConflict = errors.New("policy attempt or journal reconciliation is in progress")
 
 type PolicyChoice struct {
 	Source string `json:"source"`
@@ -98,10 +100,21 @@ type PolicyOffer struct {
 	ResolvedSettings      map[string]any          `json:"resolved_settings"`
 }
 
+// PolicySnapshot is the active group digest from a complete journal inventory
+// on the authenticated current connection. A seed is a recovery target, not
+// application proof.
+type PolicySnapshot struct {
+	Kind   string
+	Digest string
+}
+
 // NextSessionOffer builds the current idle-timeout offer from the durable
 // obligation. Deployment resolution waits for authenticated agent evidence;
 // a guessed catalog default is never sent as the effective value.
-func (s *Store) NextSessionOffer(ctx context.Context, hostID, attemptID, bootID, connectionID string) (*PolicyOffer, error) {
+func (s *Store) NextSessionOffer(ctx context.Context, hostID, attemptID, bootID, connectionID string, snapshot *PolicySnapshot) (*PolicyOffer, error) {
+	if snapshot == nil || (snapshot.Kind != "seeded" && snapshot.Kind != "verified") || !validPolicyDigest(snapshot.Digest) {
+		return nil, nil
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -127,6 +140,16 @@ func (s *Store) NextSessionOffer(ctx context.Context, hostID, attemptID, bootID,
 	}
 	candidate, err := idleCandidateForConnection(ctx, tx, hostID, connectionID)
 	if err != nil || candidate == nil {
+		return nil, err
+	}
+	factKind := "seeded_group_digest"
+	if snapshot.Kind == "verified" {
+		factKind = "last_verified_group_digest"
+	}
+	candidate.Prerequisites = append(candidate.Prerequisites, map[string]any{"kind": factKind, "id": snapshot.Digest})
+	sortPolicyFacts(candidate.Prerequisites)
+	candidate.PrereqDigest, err = digestPolicyFacts(candidate.Prerequisites)
+	if err != nil {
 		return nil, err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE host_setting_groups SET desired_digest=$3 WHERE host_id=$1::uuid AND group_key='idle_timeout_secs' AND desired_revision=$2 AND desired_digest IS DISTINCT FROM $3`, hostID, revision, candidate.Digest); err != nil {
@@ -157,6 +180,42 @@ func (s *Store) InvalidatePolicyEvidenceOnReconnect(ctx context.Context, hostID 
 		return err
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO host_reconcile_obligations(host_id,kind,resource_key,revision,next_attempt_at) SELECT host_id,'setting',group_key,desired_revision,now() FROM host_setting_groups WHERE host_id=$1::uuid AND group_key='idle_timeout_secs' ON CONFLICT(host_id,kind,resource_key) DO UPDATE SET revision=excluded.revision,next_attempt_at=now(),retry_count=0`, hostID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// ReconcilePolicySnapshot compares the completed, current-connection active
+// journal snapshot with the desired candidate. A terminal history row alone
+// never establishes application after reconnect.
+func (s *Store) ReconcilePolicySnapshot(ctx context.Context, hostID, connectionID string, snapshot *PolicySnapshot) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var gated *string
+	if err := tx.QueryRow(ctx, `SELECT config_policy_gate_connection::text FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&gated); err != nil {
+		return err
+	}
+	if gated == nil || *gated != connectionID {
+		return nil
+	}
+	var revision int64
+	var desired *string
+	err = tx.QueryRow(ctx, `SELECT desired_revision,desired_digest FROM host_setting_groups WHERE host_id=$1::uuid AND group_key='idle_timeout_secs' FOR UPDATE`, hostID).Scan(&revision, &desired)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return tx.Commit(ctx)
+	}
+	if err != nil {
+		return err
+	}
+	if snapshot != nil && snapshot.Kind == "verified" && validPolicyDigest(snapshot.Digest) && desired != nil && snapshot.Digest == *desired {
+		_, err = tx.Exec(ctx, `UPDATE host_setting_groups SET status='applied',applied_revision=$2,applied_digest=$3,evidence_connection=$4::uuid,evidence_at=now() WHERE host_id=$1::uuid AND group_key='idle_timeout_secs' AND status IN ('pending','applied')`, hostID, revision, snapshot.Digest, connectionID)
+	} else {
+		_, err = tx.Exec(ctx, `UPDATE host_setting_groups SET status='pending',evidence_connection=NULL WHERE host_id=$1::uuid AND group_key='idle_timeout_secs' AND status='applied'`, hostID)
+	}
+	if err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -222,6 +281,11 @@ func (s *Store) GetPolicy(ctx context.Context, hostID string) (PolicyView, error
 		return view, err
 	}
 	view.Revision = strconv.FormatInt(revision, 10)
+	var everOwnedRaw []byte
+	if err := tx.QueryRow(ctx, `SELECT config_policy_ever_owned_groups FROM hosts WHERE id=$1::uuid`, hostID).Scan(&everOwnedRaw); err != nil {
+		return view, err
+	}
+	everOwned := decodeGroupSet(everOwnedRaw)
 	rows, err := tx.Query(ctx, `SELECT key,source,explicit_value FROM host_setting_choices WHERE host_id=$1::uuid`, hostID)
 	if err != nil {
 		return view, err
@@ -276,6 +340,9 @@ func (s *Store) GetPolicy(ctx context.Context, hostID string) (PolicyView, error
 			group.Remedy = &remedy
 		} else if status == "upgrade_required" {
 			remedy := "The legacy writer remains active for this group. Upgrade the agent to enable RH05 verification."
+			if everOwned[key] {
+				remedy = "Typed ownership remains protected after agent downgrade. Re-upgrade the agent or repair ownership; the legacy value is not sent."
+			}
 			group.Remedy = &remedy
 		} else if status == "uncertain" {
 			remedy := "Execution state is uncertain. Keep the host protected and reconcile its durable journal before new work."
@@ -343,7 +410,8 @@ func (s *Store) savePolicy(ctx context.Context, hostID, expected string, changes
 	defer tx.Rollback(ctx)
 	var id string
 	var confirmed, everOwned []byte
-	if err := tx.QueryRow(ctx, `SELECT id::text,config_policy_confirmed_groups,config_policy_ever_owned_groups FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&id, &confirmed, &everOwned); err != nil {
+	var settingsGate bool
+	if err := tx.QueryRow(ctx, `SELECT id::text,config_policy_confirmed_groups,config_policy_ever_owned_groups,config_policy_gate_connection IS NOT NULL FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&id, &confirmed, &everOwned, &settingsGate); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return empty, ErrHostNotFound
 		}
@@ -381,6 +449,26 @@ func (s *Store) savePolicy(ctx context.Context, hostID, expected string, changes
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &overrides); err != nil {
 			return empty, err
+		}
+	}
+	if !requireOwned {
+		for key, choice := range changes {
+			group, scope := policyGroup(key)
+			if scope != "restart" || owned[group] {
+				continue
+			}
+			old, hadOld := overrides[key]
+			changed := choice.Source == "explicit" && (!hadOld || !reflect.DeepEqual(old, choice.Value)) || choice.Source == "deployment" && hadOld
+			if !changed {
+				continue
+			}
+			var uncertain bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM host_setting_groups WHERE host_id=$1::uuid AND status='uncertain')`, hostID).Scan(&uncertain); err != nil {
+				return empty, err
+			}
+			if settingsGate || uncertain {
+				return empty, ErrPolicyAttemptConflict
+			}
 		}
 	}
 	for key, choice := range changes {

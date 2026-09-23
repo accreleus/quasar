@@ -7,12 +7,56 @@ import (
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
 type policyIdentityDispatcher struct {
 	fakeDispatcher
 	connection string
+}
+
+func TestLegacyRestartIsAtomicWhileRH05JournalGateIsOpen(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	connection := "00000000-0000-4000-8000-000000000131"
+	if _, err := store.BeginPolicyConnection(context.Background(), hostID, connection, map[string]int{"typed_settings": 2}, []string{"idle_timeout_secs"}, true); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(store, &fakeDispatcher{}, fakeCounter(0))
+	r := httptest.NewRequest(http.MethodPatch, "/v1/admin/hosts/"+hostID+"/settings", strings.NewReader(`{"overrides":{"encoder":"va","gop":90},"restart_confirm":true}`))
+	r.SetPathValue("id", hostID)
+	w := httptest.NewRecorder()
+	h.handlePatch(w, r)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "attempt_conflict") {
+		t.Fatalf("legacy restart while gate open: %d %s", w.Code, w.Body.String())
+	}
+	overrides, err := store.Get(context.Background(), hostID)
+	if err != nil || len(overrides) != 0 {
+		t.Fatalf("mixed edit partially saved: %+v, err=%v", overrides, err)
+	}
+}
+
+func TestLegacyOwnedRestartSettingReturnsNoImmediateRestart(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	confirmPolicyGroups(t, pool, hostID, "hardware")
+	dispatcher := &fakeDispatcher{}
+	h := NewHandler(store, dispatcher, fakeCounter(2))
+	r := httptest.NewRequest(http.MethodPatch, "/v1/admin/hosts/"+hostID+"/settings", strings.NewReader(`{"overrides":{"encoder":"va"}}`))
+	r.SetPathValue("id", hostID)
+	w := httptest.NewRecorder()
+	h.handlePatch(w, r)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"restart_triggered":false`) {
+		t.Fatalf("typed-owned restart response: %d %s", w.Code, w.Body.String())
+	}
+	for _, command := range dispatcher.sent {
+		if _, restart := command.(restartCmd); restart {
+			t.Fatal("typed-owned setting sent a legacy restart")
+		}
+	}
 }
 
 func (d *policyIdentityDispatcher) PolicyIdentity(string) (string, string, bool) {

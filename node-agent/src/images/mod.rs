@@ -1708,6 +1708,8 @@ mod tests {
         assert!(m.register_images().is_empty());
         let msg = AgentMsg::Register {
             source_policy_versions: None,
+            config_policy_versions: None,
+            config_policy_groups: None,
             node_name: "n".to_string(),
             agent_version: "v".to_string(),
             auth: crate::messages::Auth::Enrollment {
