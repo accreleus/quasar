@@ -33,6 +33,11 @@ own; the two do not move together, and that is deliberate.
   Capable agents retain a durable home hold across delivery loss and control-plane
   restart until authenticated cleanup proof; older agents remain supported with
   their unprotected-dispatch status visible to operators.
+- **RH05 agent policy hooks (#336).** Added agent-side prepare and apply policy
+  handling with durable execution acceptance, bounded retry and explicit
+  outcomes. Managed-home mounts are checked against the selected root and its
+  deployment mount at assign and swap, and first-home creation serializes with
+  root edits without exhausting the database pool.
 - **Owner-scoped host admission restrictions (#337).** Manual drains and platform
   applies now hold independent, durable scheduling restrictions. Session
   reservations serialize with new holds, and reconnect preserves them. An apply

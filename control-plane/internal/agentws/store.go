@@ -497,6 +497,35 @@ func (s *agentStore) upsertHostCodecs(ctx context.Context, hostID string, codecs
 	return nil
 }
 
+// withdrawStaleProbeCodecs drops every codec above the h264 floor from the host
+// and per-GPU claims when they were reported under a different value of a
+// host-probe input key (the agent's PROBE_SETTINGS_KEYS). The capacity that
+// reported them carried that value in effective_settings; the next capacity
+// report replaces both. Fail-closed: a missing effective value withdraws.
+func (s *agentStore) withdrawStaleProbeCodecs(ctx context.Context, hostID, key string, value any) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var stale bool
+	err = tx.QueryRow(ctx, `SELECT (effective_settings->>$2) IS DISTINCT FROM $3 FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID, key, fmt.Sprint(value)).Scan(&stale)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !stale) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	floor := `CASE WHEN codecs ? 'h264' THEN '["h264"]'::jsonb ELSE '[]'::jsonb END`
+	if _, err := tx.Exec(ctx, `UPDATE hosts SET codecs=`+floor+` WHERE id=$1::uuid AND codecs IS NOT NULL`, hostID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE gpus SET codecs=`+floor+` WHERE host_id=$1::uuid AND codecs IS NOT NULL AND jsonb_typeof(codecs)='array'`, hostID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // upsertHostCodecPixelRates writes hosts.codec_pixel_rates (#506) verbatim,
 // keep-if-absent. Stored as received — agent-owned and forward-extensible (see
 // CapacityMsg.CodecThroughput); validated only as "a JSON object", refusing

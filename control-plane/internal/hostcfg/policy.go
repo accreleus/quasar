@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strconv"
 	"time"
 
@@ -43,6 +44,7 @@ type PolicyGroup struct {
 	Fresh              bool       `json:"fresh"`
 	ObservedAt         *time.Time `json:"observed_at"`
 	Remedy             *string    `json:"remedy"`
+	NextRetryAt        *time.Time `json:"next_retry_at"`
 	ApprovalPreview    any        `json:"approval_preview"`
 	EvidenceConnection *string    `json:"-"`
 }
@@ -100,168 +102,44 @@ type PolicyOffer struct {
 	ResolvedSettings      map[string]any          `json:"resolved_settings"`
 }
 
-// PolicySnapshot is the active group digest from a complete journal inventory
-// on the authenticated current connection. A seed is a recovery target, not
-// application proof.
+// PolicySnapshot is one group's active digest from a complete journal
+// inventory on the authenticated current connection; callers key them by
+// group. A seed is a recovery target, not application proof.
 type PolicySnapshot struct {
 	Kind   string
 	Digest string
 }
 
-// NextSessionOffer builds the current idle-timeout offer from the durable
-// obligation. Deployment resolution waits for authenticated agent evidence;
-// a guessed catalog default is never sent as the effective value.
-func (s *Store) NextSessionOffer(ctx context.Context, hostID, attemptID, bootID, connectionID string, snapshot *PolicySnapshot) (*PolicyOffer, error) {
-	if snapshot == nil || (snapshot.Kind != "seeded" && snapshot.Kind != "verified") || !validPolicyDigest(snapshot.Digest) {
-		return nil, nil
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback(ctx)
-	var owned bool
-	var gated bool
-	if err := tx.QueryRow(ctx, `SELECT COALESCE(config_policy_confirmed_groups ? 'idle_timeout_secs',false),config_policy_gate_connection IS NOT NULL FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&owned, &gated); err != nil {
-		return nil, err
-	}
-	if !owned || gated {
-		return nil, nil
-	}
-	var revision int64
-	var scope, status string
-	if err := tx.QueryRow(ctx, `SELECT desired_revision,scope,status FROM host_setting_groups WHERE host_id=$1::uuid AND group_key='idle_timeout_secs'`, hostID).Scan(&revision, &scope, &status); errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
-	} else if err != nil {
-		return nil, err
-	}
-	if status != "pending" || scope != "next_session" {
-		return nil, nil
-	}
-	candidate, err := idleCandidateForConnection(ctx, tx, hostID, connectionID)
-	if err != nil || candidate == nil {
-		return nil, err
-	}
-	factKind := "seeded_group_digest"
-	if snapshot.Kind == "verified" {
-		factKind = "last_verified_group_digest"
-	}
-	candidate.Prerequisites = append(candidate.Prerequisites, map[string]any{"kind": factKind, "id": snapshot.Digest})
-	sortPolicyFacts(candidate.Prerequisites)
-	candidate.PrereqDigest, err = digestPolicyFacts(candidate.Prerequisites)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := tx.Exec(ctx, `UPDATE host_setting_groups SET desired_digest=$3 WHERE host_id=$1::uuid AND group_key='idle_timeout_secs' AND desired_revision=$2 AND desired_digest IS DISTINCT FROM $3`, hostID, revision, candidate.Digest); err != nil {
-		return nil, err
-	}
-	claimed, err := tx.Exec(ctx, `UPDATE host_reconcile_obligations SET retry_count=retry_count+1,next_attempt_at=now()+interval '10 seconds' WHERE host_id=$1::uuid AND kind='setting' AND resource_key='idle_timeout_secs' AND revision=$2 AND next_attempt_at<=now() AND retry_count<5`, hostID, revision)
-	if err != nil {
-		return nil, err
-	}
-	if claimed.RowsAffected() == 0 {
-		_, _ = tx.Exec(ctx, `UPDATE host_setting_groups g SET status='failed' FROM host_reconcile_obligations o WHERE g.host_id=o.host_id AND g.group_key=o.resource_key AND g.host_id=$1::uuid AND g.group_key='idle_timeout_secs' AND o.kind='setting' AND o.retry_count>=5 AND o.next_attempt_at<=now() AND g.desired_revision=o.revision AND g.status='pending'`, hostID)
-		_ = tx.Commit(ctx)
-		return nil, nil
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return &PolicyOffer{Type: "config_policy_offer", AttemptID: attemptID, HostID: hostID, BootIncarnation: bootID, ConnectionIncarnation: connectionID, Group: "idle_timeout_secs", Revision: strconv.FormatInt(revision, 10), ContentSHA256: candidate.Digest, Scope: scope, ExpiresAt: time.Now().UTC().Add(30 * time.Second), PrerequisitesSHA256: candidate.PrereqDigest, Prerequisites: candidate.Prerequisites, Settings: map[string]PolicyChoice{"idle_timeout_secs": candidate.Choice}, ResolvedSettings: map[string]any{"idle_timeout_secs": candidate.Value}}, nil
-}
-
+// InvalidatePolicyEvidenceOnReconnect returns every next-session group's
+// last observation to pending with a fresh retry budget. Old-connection
+// evidence is not current; the journal inventory restores applied.
 func (s *Store) InvalidatePolicyEvidenceOnReconnect(ctx context.Context, hostID string) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `UPDATE host_setting_groups SET status='pending',evidence_connection=NULL WHERE host_id=$1::uuid AND group_key='idle_timeout_secs' AND status IN ('applied','failed')`, hostID); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO host_reconcile_obligations(host_id,kind,resource_key,revision,next_attempt_at) SELECT host_id,'setting',group_key,desired_revision,now() FROM host_setting_groups WHERE host_id=$1::uuid AND group_key='idle_timeout_secs' ON CONFLICT(host_id,kind,resource_key) DO UPDATE SET revision=excluded.revision,next_attempt_at=now(),retry_count=0`, hostID); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
+	return s.InvalidateNextSessionEvidenceOnReconnect(ctx, hostID)
 }
 
-// ReconcilePolicySnapshot compares the completed, current-connection active
-// journal snapshot with the desired candidate. A terminal history row alone
-// never establishes application after reconnect.
-func (s *Store) ReconcilePolicySnapshot(ctx context.Context, hostID, connectionID string, snapshot *PolicySnapshot) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	var gated *string
-	if err := tx.QueryRow(ctx, `SELECT config_policy_gate_connection::text FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID).Scan(&gated); err != nil {
-		return err
-	}
-	if gated == nil || *gated != connectionID {
-		return nil
-	}
-	var revision int64
-	var desired *string
-	err = tx.QueryRow(ctx, `SELECT desired_revision,desired_digest FROM host_setting_groups WHERE host_id=$1::uuid AND group_key='idle_timeout_secs' FOR UPDATE`, hostID).Scan(&revision, &desired)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return tx.Commit(ctx)
-	}
-	if err != nil {
-		return err
-	}
-	if snapshot != nil && snapshot.Kind == "verified" && validPolicyDigest(snapshot.Digest) && desired != nil && snapshot.Digest == *desired {
-		_, err = tx.Exec(ctx, `UPDATE host_setting_groups SET status='applied',applied_revision=$2,applied_digest=$3,evidence_connection=$4::uuid,evidence_at=now() WHERE host_id=$1::uuid AND group_key='idle_timeout_secs' AND status IN ('pending','applied')`, hostID, revision, snapshot.Digest, connectionID)
-	} else {
-		_, err = tx.Exec(ctx, `UPDATE host_setting_groups SET status='pending',evidence_connection=NULL WHERE host_id=$1::uuid AND group_key='idle_timeout_secs' AND status='applied'`, hostID)
-	}
-	if err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
-}
-
+// validatePolicyChanges is the context-free part of ValidatePolicyEdit: every
+// key, source and catalog value. Cross-key and storage checks need the host
+// and run inside the save transaction.
 func validatePolicyChanges(changes map[string]PolicyChoice) error {
 	if len(changes) == 0 {
-		return errors.New("changes must not be empty")
+		return policyInvalid("validation_failed", "changes must not be empty")
 	}
-	for key, choice := range changes {
-		knob, ok := byKey()[key]
-		if !ok {
-			return fmt.Errorf("unknown setting %q", key)
-		}
-		switch choice.Source {
-		case "explicit":
-			if choice.Value == nil {
-				return fmt.Errorf("%q requires a value", key)
-			}
-			if err := validateValue(knob, choice.Value); err != nil {
-				return err
-			}
-		case "deployment":
-			if choice.Value != nil {
-				return fmt.Errorf("%q deployment forbids a value", key)
-			}
-		case "automatic":
-			if key != "encoder" && key != "render_node" {
-				return fmt.Errorf("%q does not support automatic", key)
-			}
-			if choice.Value != nil {
-				return fmt.Errorf("%q automatic forbids a value", key)
-			}
-		default:
-			return fmt.Errorf("%q has invalid source", key)
+	keys := make([]string, 0, len(changes))
+	for key := range changes {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if err := validatePolicyChoice(key, changes[key]); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
 func policyGroup(key string) (string, string) {
-	if key == "encoder" || key == "render_node" || key == "cuda_device" {
-		return "hardware", "restart"
-	}
-	if byKey()[key].Class == ClassRestart {
-		return key, "restart"
+	if spec, ok := PolicySpec(key); ok {
+		return spec.Group, spec.Scope
 	}
 	return key, "next_session"
 }
@@ -356,24 +234,35 @@ func (s *Store) GetPolicy(ctx context.Context, hostID string) (PolicyView, error
 		return view, err
 	}
 	rows.Close()
-	// The first typed edit has no persisted group row yet. Project its current
-	// writer and pending status so the UI can use the revisioned policy PATCH
-	// from revision zero, without exposing the legacy editor on an owned group.
-	_, idleGroupPersisted := view.Groups["idle_timeout_secs"]
-	if !idleGroupPersisted {
+	// A group's first typed edit has no persisted row yet. Project each
+	// next-session group's current writer and pending status so the UI can use
+	// the revisioned policy PATCH from revision zero, without exposing the
+	// legacy editor on an owned group.
+	persisted := map[string]bool{}
+	for key := range view.Groups {
+		persisted[key] = true
+	}
+	for _, key := range NextSessionPolicyGroups() {
+		if persisted[key] {
+			continue
+		}
 		group := PolicyGroup{DesiredRevision: view.Revision, Scope: "next_session", Status: "upgrade_required"}
-		if confirmed["idle_timeout_secs"] {
+		if confirmed[key] {
 			group.Status = "pending"
-			remedy := "No RH05 idle policy change has been saved. Current host behavior has not been verified through this policy."
+			remedy := "No RH05 policy change has been saved for this group. Current host behavior has not been verified through this policy."
 			group.Remedy = &remedy
 		} else {
 			remedy := "The legacy writer remains active for this group. Upgrade the agent to enable RH05 verification."
-			if everOwned["idle_timeout_secs"] {
+			if everOwned[key] {
 				remedy = "Typed ownership remains protected after agent downgrade. Re-upgrade the agent or repair ownership; the legacy value is not sent."
 			}
 			group.Remedy = &remedy
 		}
-		view.Groups["idle_timeout_secs"] = group
+		view.Groups[key] = group
+	}
+	details, err := decoratePolicyGroups(ctx, tx, &s.policyErrors, hostID, &view)
+	if err != nil {
+		return view, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return view, err
@@ -383,10 +272,13 @@ func (s *Store) GetPolicy(ctx context.Context, hostID string) (PolicyView, error
 			view.Choices[knob.Key] = PolicyChoice{Source: "deployment"}
 		}
 	}
-	if group, ok := view.Groups["idle_timeout_secs"]; ok && idleGroupPersisted && group.Status == "pending" && group.DesiredDigest == nil && view.Choices["idle_timeout_secs"].Source == "deployment" {
-		remedy := "baseline_unavailable: request a fresh agent capacity report or reconnect before verification."
-		group.Remedy = &remedy
-		view.Groups["idle_timeout_secs"] = group
+	for key, group := range view.Groups {
+		group.NextRetryAt = details[key].NextRetryAt
+		if persisted[key] && group.Scope == "next_session" && group.Status == "pending" && group.DesiredDigest == nil && policyGroupUsesDeployment(key, view.Choices) {
+			remedy := "baseline_unavailable: request a fresh agent capacity report or reconnect before verification."
+			group.Remedy = &remedy
+		}
+		view.Groups[key] = group
 	}
 	effective, err := s.GetEffective(ctx, hostID)
 	if err != nil {
@@ -498,7 +390,10 @@ func (s *Store) savePolicy(ctx context.Context, hostID, expected string, changes
 			delete(overrides, key)
 		}
 	}
-	if err := ValidateResolved(Resolve(overrides)); err != nil {
+	// Cross-key and storage rules judge the whole resulting choice set against
+	// the agent-reported baseline, mount and existing managed homes, never a
+	// catalog default. Existing homes are never relocated by a root change.
+	if err := ValidateStoredPolicyEdit(ctx, tx, hostID, changes); err != nil {
 		return empty, err
 	}
 	next := current + 1

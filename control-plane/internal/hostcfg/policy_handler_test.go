@@ -106,7 +106,7 @@ func TestInitialIdlePolicyReadDoesNotClaimMissingDeploymentBaseline(t *testing.T
 		t.Fatal(err)
 	}
 	group := view.Groups["idle_timeout_secs"]
-	if view.Revision != "0" || group.Status != "pending" || group.DesiredDigest != nil || group.Remedy == nil || !strings.Contains(*group.Remedy, "No RH05 idle policy change has been saved") || strings.Contains(*group.Remedy, "baseline_unavailable") {
+	if view.Revision != "0" || group.Status != "pending" || group.DesiredDigest != nil || group.Remedy == nil || !strings.Contains(*group.Remedy, "No RH05 policy change has been saved") || strings.Contains(*group.Remedy, "baseline_unavailable") {
 		t.Fatalf("initial policy read falsely requests baseline refresh: %+v", group)
 	}
 	var rowCount int

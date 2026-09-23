@@ -708,6 +708,12 @@ export function getHostPolicy(token: string, hostId: string): Promise<HostPolicy
 export function updateHostPolicy(token: string, hostId: string, expectedRevision: string, changes: Record<string, components["schemas"]["HostPolicyChoice"]>): Promise<HostPolicyView> {
   return apiFetch<HostPolicyView>(`/admin/hosts/${hostId}/policy`, { token, method: "PATCH", body: { expected_revision: expectedRevision, changes } });
 }
+/** Re-arm one next-session group whose transient retry budget is exhausted.
+ *  A control plane that does not serve the route yet answers 404. */
+export function retryHostPolicyGroup(token: string, hostId: string, group: string): Promise<HostPolicyView> {
+  const body: components["schemas"]["HostPolicyRetryRequest"] = { group };
+  return apiFetch<HostPolicyView>(`/admin/hosts/${hostId}/policy/retry`, { token, method: "POST", body });
+}
 
 /** A null value clears that key back to the catalog default. 409
  *  "restart_required" when a restart-class knob changed with live sessions
