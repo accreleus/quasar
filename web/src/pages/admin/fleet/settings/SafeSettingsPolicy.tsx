@@ -75,12 +75,20 @@ export function SafeSettingsPolicy({
     () => (view ? knobs.filter((k) => typedOwned(view.groups[k.key])) : []),
     [view, knobs],
   );
+  // Saved typed intent the agent cannot run yet: the legacy editor keeps the key,
+  // and this panel shows only the remedy.
+  const awaitingUpgrade = view
+    ? knobs.filter((k) => view.groups[k.key]?.scope === "next_session" && view.groups[k.key]?.status === "upgrade_required")
+    : [];
+  const loaded = policy.data !== undefined;
   const ownedKey = owned.map((k) => k.key).join(",");
   useEffect(() => {
-    onOwnedKeys(new Set(ownedKey ? ownedKey.split(",") : []));
-  }, [ownedKey, onOwnedKeys]);
+    // Report only once ownership is known; until then the caller hides every
+    // candidate key rather than expose a legacy control the typed writer owns.
+    if (loaded) onOwnedKeys(new Set(ownedKey ? ownedKey.split(",") : []));
+  }, [loaded, ownedKey, onOwnedKeys]);
 
-  if (!hostId || !view || owned.length === 0) return null;
+  if (!hostId || !view || owned.length + awaitingUpgrade.length === 0) return null;
 
   const saved = (key: string): Draft => {
     const choice = view.choices[key];
@@ -138,10 +146,20 @@ export function SafeSettingsPolicy({
   return <KnobPanel
     title="Next-session settings"
     hint="Saved as one edit. Each setting applies to new sessions once the host confirms it; running sessions keep their launch values."
-    actions={<Button variant="primary" disabled={!dirty || saving} onClick={() => void save()}>{saving ? "Saving…" : "Save next-session settings"}</Button>}
+    actions={owned.length > 0 && <Button variant="primary" disabled={!dirty || saving} onClick={() => void save()}>{saving ? "Saving…" : "Save next-session settings"}</Button>}
   >
     {message && <p role="status" className="hint">{message}</p>}
     {error && <p role="alert" className="form-error">{error}</p>}
+    {awaitingUpgrade.map((knob) => <div key={knob.key} className="cset">
+      <div>
+        <h3 className="row gap2 center">
+          {knobLabel(knob)}
+          <Chip variant="warning" className="chip-sm">upgrade required</Chip>
+        </h3>
+        {view.groups[knob.key].remedy && <p className="hint">{remedyText(view.groups[knob.key].remedy ?? "")}</p>}
+      </div>
+      <div><p className="hint">Edit this setting in the panels below until the agent is upgraded.</p></div>
+    </div>)}
     {owned.map((knob) => {
       const label = knobLabel(knob);
       const group = view.groups[knob.key];
