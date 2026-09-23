@@ -172,6 +172,10 @@ func (f *fakeFleetStore) MarkCordonsRestored(_ context.Context, runID string) er
 	return nil
 }
 
+func (f *fakeFleetStore) RestoreOwnedCordons(ctx context.Context, runID string, _ func(string) bool) error {
+	return f.MarkCordonsRestored(ctx, runID)
+}
+
 // ClaimUnrestoredCordons mirrors the real store's predicate: terminal, with
 // something recorded in cordoned_hosts, and never stamped. The claim is counted
 // so a test can tell a sweep that ran from one that refused.

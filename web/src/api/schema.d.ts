@@ -7804,12 +7804,25 @@ export interface components {
             /** Format: int64 */
             next_cursor: number | null;
         };
+        HostAdmissionRestriction: {
+            /** @enum {string} */
+            owner_kind: "manual" | "legacy" | "platform" | "idle_apply" | "recovery" | "reconciliation";
+            /**
+             * @description Stable safe display code; never a free-form host, user or operation identifier.
+             * @enum {string}
+             */
+            reason: "manual_drain" | "legacy_drain" | "platform_apply" | "idle_configuration" | "configuration_recovery" | "journal_reconciliation" | "journal_quarantine";
+            /** Format: date-time */
+            created_at: string;
+        };
         Host: {
             /** Format: uuid */
             id: string;
             node_name: string;
             /** @enum {string} */
             status: "online" | "offline" | "draining";
+            /** @description RH05 active owner-scoped admission holds, always serialized; [] means no hold. This explains draining without exposing owner IDs or implying that an offline host is schedulable. The server derives reason from a bounded code set, never from private host or user data. */
+            admission_restrictions: components["schemas"]["HostAdmissionRestriction"][];
             agent_version: string | null;
             cpu_cores: number | null;
             mem_mb: number | null;

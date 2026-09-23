@@ -30,6 +30,20 @@ func TestHostRespAlwaysSerializesTheIdentityFields(t *testing.T) {
 	}
 }
 
+func TestHostRespAlwaysSerializesEmptyAdmissionRestrictions(t *testing.T) {
+	raw, err := json.Marshal(hostToResp(Host{ID: "h1", NodeName: "n1", Status: "online"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got["admission_restrictions"]) != "[]" {
+		t.Fatalf("admission_restrictions = %s, want always-present []", got["admission_restrictions"])
+	}
+}
+
 func TestHostRespServesBuiltAtAsRFC3339UTC(t *testing.T) {
 	// A non-UTC zone in, UTC out: a client rendering a build age should not have
 	// to reason about the control plane's local zone.

@@ -30,6 +30,16 @@ own; the two do not move together, and that is deliberate.
   launches, and reports uncertain or divergent locations for operator repair
   without creating another home. Tombstones block launch until exact confirmed
   cleanup or repair; admins can inspect claim-only uncertainty in Fleet storage.
+- **Owner-scoped host admission restrictions (#337).** Manual drains and platform
+  applies now hold independent, durable scheduling restrictions. Session
+  reservations serialize with new holds, and reconnect preserves them. An apply
+  that delivers migration 0088 may leave conservative `legacy_drain` holds on
+  the fleet; review each Host's active reasons and explicitly release an
+  operator drain where it is safe to resume assignments. Terminal platform
+  cleanup commits its own hold releases, host status projection and completion
+  marker together, so a failed cleanup can retry without a partial release.
+  Boot adoption also retries terminal standalone apply and revert holds left
+  behind by a crash or failed release.
 - **RH05 host policy and selected-app preparation contracts (#334).** Defined typed
   host setting sources, independent application evidence, scoped idle approval and
   recovery, owner-scoped admission, placement and managed-home claims, image

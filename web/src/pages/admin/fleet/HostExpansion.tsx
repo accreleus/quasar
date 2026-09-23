@@ -13,6 +13,7 @@ import { LOW_STORAGE_PCT } from "../../../lib/fleet/deriveAlerts";
 import { bytesFromMb } from "../../../lib/format/bytes";
 import { relativeTime } from "../../../lib/format/relativeTime";
 import { primaryGpuLabel } from "../../../lib/gpu";
+import { AdmissionReasons } from "./AdmissionReasons";
 import { GpuCodecChips } from "./GpuCodecChips";
 import { percentOf, storageTotals, tone, uptimeSince, utilisation } from "./hostDerived";
 import {
@@ -41,7 +42,6 @@ export function HostExpansion({ host, gpus, gpuError, actionError, now }: HostEx
   const util = utilisation(host, gpus);
   const storage = storageTotals(host.storage);
   const volumes = host.storage ?? [];
-  const activeSessions = host.capacity?.active_sessions ?? 0;
 
   return (
     <>
@@ -59,12 +59,7 @@ export function HostExpansion({ host, gpus, gpuError, actionError, now }: HostEx
         </p>
       )}
 
-      {host.status === "draining" && (
-        <p className="note warn">
-          <b>Draining.</b> No new sessions are placed here. {activeSessions} running{" "}
-          {activeSessions === 1 ? "session finishes" : "sessions finish"}, then the host parks.
-        </p>
-      )}
+      <AdmissionReasons host={host} />
 
       <div className="exp-in">
         <div>
