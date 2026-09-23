@@ -83,6 +83,43 @@ func TestHomeCommandEpochRefusesDisplacedConnectionBeforeQueue(t *testing.T) {
 	}
 }
 
+func TestHomeCommandEpochRetainsQueuedUncertaintyAcrossTimeoutAndReconnect(t *testing.T) {
+	r := NewRegistry(quietLogger())
+	first := newConn("host-1", nil)
+	first.terminalHomeCleanupV1 = true
+	r.add(first)
+	epoch, ok := r.CurrentHomeCommandEpoch("host-1")
+	if !ok {
+		t.Fatal("command epoch missing")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, queued, err := epoch.SendWithAck(ctx, "command-id", map[string]string{"type": "session_assign"})
+	if err == nil || !queued {
+		t.Fatalf("cancelled wait after queue = (queued=%t, err=%v), want uncertain queued delivery", queued, err)
+	}
+	if got := len(first.out); got != 1 {
+		t.Fatalf("queued frames = %d, want one", got)
+	}
+	second := newConn("host-1", nil)
+	r.add(second)
+	// A late ack from the displaced epoch cannot satisfy any current command.
+	currentAck := make(chan AckResult, 1)
+	second.mu.Lock()
+	second.acks["command-id"] = currentAck
+	second.mu.Unlock()
+	r.resolveAckFromConn(first, "command-id", AckResult{OK: false})
+	select {
+	case <-currentAck:
+		t.Fatal("old epoch ack reached current epoch waiter")
+	default:
+	}
+	_, queued, err = epoch.SendWithAck(context.Background(), "next-id", map[string]string{"type": "session_assign"})
+	if err != ErrAgentNotConnected || queued {
+		t.Fatalf("displaced epoch retry = (queued=%t, err=%v), want proven no queue", queued, err)
+	}
+}
+
 func waitFor(t *testing.T, what string, ready func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)
