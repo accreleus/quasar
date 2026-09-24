@@ -182,6 +182,12 @@ func (r *Registry) SendImageCleanup(ctx context.Context, hostID string, cmd Imag
 
 func (r *Registry) SendImageInventoryReconcile(hostID string, cmd ImageInventoryReconcileCmd) error {
 	cmd.Type = "image_inventory_reconcile"
+	// The agent's wire contract requires an array even before any managed image
+	// has been adopted. A nil Go slice would encode as JSON null and prevent
+	// the initial inventory scan from ever being accepted.
+	if cmd.Identities == nil {
+		cmd.Identities = []ImageInventoryIdentity{}
+	}
 	c, ok := r.get(hostID)
 	if !ok {
 		return ErrAgentNotConnected

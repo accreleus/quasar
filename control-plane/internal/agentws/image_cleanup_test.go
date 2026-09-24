@@ -1,6 +1,26 @@
 package agentws
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
+
+func TestImageInventoryReconcileSendsEmptyIdentityArray(t *testing.T) {
+	r := NewRegistry(nil)
+	c := newConn("host", nil)
+	c.imageCleanupV1 = true
+	r.add(c)
+	if err := r.SendImageInventoryReconcile("host", ImageInventoryReconcileCmd{ID: "empty-managed-set"}); err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal(<-c.out, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if string(wire["identities"]) != "[]" {
+		t.Fatalf("reconcile identities on wire = %s, want []", wire["identities"])
+	}
+}
 
 func TestImageCleanupInventoryUsesOnlyCurrentAuthenticatedConnection(t *testing.T) {
 	r := NewRegistry(nil)
