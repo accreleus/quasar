@@ -126,6 +126,29 @@ func TestImageReadyEnqueuesTheWarmUp(t *testing.T) {
 	}
 }
 
+func TestUnselectedSteamImageDoesNotStartOptionalWarmup(t *testing.T) {
+	pool := ensureDB(t)
+	seedPreparationImage(t, pool, false)
+	hostID := seedHost(t, pool, "unselected-steam")
+	acknowledgePreparation(t, pool, hostID)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `UPDATE app_placement SET mode='fixed' WHERE app_id=(SELECT id FROM apps WHERE name='ensure fixture managed app')`); err != nil {
+		t.Fatal(err)
+	}
+	e := NewEnsurer(pool, newFleet(hostID), testLog())
+	defer e.Close()
+	q := newEnqueuer()
+	e.SetJobEnqueuer(q)
+	e.AgentImageState(ctx, hostID, agentws.ImageStateMsg{ImageID: imgID, Version: imgVer, State: "ready"})
+	e.wg.Wait()
+	if q.count() != 0 {
+		t.Fatal("unselected Steam image triggered optional template production")
+	}
+	if _, err := e.WarmupParamsForHost(ctx, hostID); err == nil {
+		t.Fatal("manual warmup admitted an unselected Steam image")
+	}
+}
+
 func TestUnsupportedReadyImagesDoNotPrepareEvenWithHomeMetadata(t *testing.T) {
 	for _, kind := range []string{"custom-repository", "template"} {
 		t.Run(kind, func(t *testing.T) {

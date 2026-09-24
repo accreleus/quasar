@@ -125,6 +125,7 @@ describe("ImageDetail", () => {
     const image: CatalogImage = { ...steam, hosts: [{
       host_id: "h1", state: "ready", version: "2026.08.07",
       steam_preparation: {
+        publication_protection: "limited_protection",
         eligible: true, supported: true, desired_enabled: true, desired_revision: "1", applied_revision: "1",
         policy_pending: false, preparation_enabled: true, consumption_enabled: true,
         state: "preparing", reason: "none", detail: "", template: null, clone_mode: "copy",

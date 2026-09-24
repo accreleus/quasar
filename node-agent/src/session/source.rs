@@ -202,6 +202,7 @@ impl SharedSessionRuntime {
 /// [`SharedSessionRuntime::apply`], not through a later `Drop` of this struct: pipeline
 /// teardown can block, and a busy runtime client must not latch the release off.
 pub struct SessionResources {
+    pub home_seed: Option<super::home::HomeSeedOutcome>,
     /// Shared with the encode pipeline's DataChannel input sink.
     pub devices: Option<Arc<VirtualDevices>>,
     /// Per-session controller-first pointer-nudge state (BPM focus heal), shared with the
@@ -286,11 +287,13 @@ impl SessionResources {
             teardown::RetryBudget::new(teardown::STOP_RETRY_BUDGET),
         ));
         // Pre-create any bind-mount host paths under QUASAR_HOME_ROOT so Docker does not
-        // create them root:root 755. No-op when unset or no mount matches; never fails
-        // the session.
+        // create them root:root 755. No-op when unset or no mount matches.
+        // Steam's managed-home path fails safely if destination or cleanup
+        // state is uncertain; ordinary non-Steam provisioning stays best-effort.
         //
         // An authoritative source policy and matching adopted template are both
         // required. Unknown/custom images and disconnected sessions launch cold.
+        let mut home_seed = None;
         if let Some(c) = cfg.container.as_ref() {
             let seed = cfg
                 .source_policy
@@ -305,10 +308,24 @@ impl SessionResources {
                         seed,
                         authorization: Some(authorization),
                     });
-            super::home::provision_home_dirs(&c.mounts, &cfg.home_root, template);
+            if crate::source_policy::is_official_steam_image(cfg.image_id.as_deref(), &c.image) {
+                let reason = cfg
+                    .source_policy
+                    .as_ref()
+                    .map_or("policy_unavailable", |policy| policy.seed_absence_reason());
+                home_seed = super::home::provision_home_dirs_with_result(
+                    &c.mounts,
+                    &cfg.home_root,
+                    template,
+                    reason,
+                )?;
+            } else {
+                super::home::provision_home_dirs(&c.mounts, &cfg.home_root, template);
+            }
         }
         Ok((
             SessionResources {
+                home_seed,
                 devices,
                 input_state: Arc::new(InputState::new()),
                 shared,

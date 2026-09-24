@@ -23,12 +23,13 @@ type appPlacementHost struct {
 }
 
 type appPlacementView struct {
-	AppID         string             `json:"app_id"`
-	InheritedFrom *string            `json:"inherited_from"`
-	Mode          string             `json:"mode"`
-	HostIDs       []string           `json:"host_ids"`
-	Revision      string             `json:"revision"`
-	Hosts         []appPlacementHost `json:"hosts"`
+	AppID          string             `json:"app_id"`
+	InheritedFrom  *string            `json:"inherited_from"`
+	ManagedImageID *string            `json:"managed_image_id"`
+	Mode           string             `json:"mode"`
+	HostIDs        []string           `json:"host_ids"`
+	Revision       string             `json:"revision"`
+	Hosts          []appPlacementHost `json:"hosts"`
 }
 
 type placementPatch struct {
@@ -42,13 +43,39 @@ type placementPatch struct {
 func (h *Handler) appPlacementView(ctx context.Context, id string) (appPlacementView, error) {
 	v := appPlacementView{HostIDs: []string{}, Hosts: []appPlacementHost{}}
 	var canonical string
+	var enabled, parentEnabled bool
 	err := h.store.pool.QueryRow(ctx, `
-		SELECT COALESCE(parent_app_id,id)::text, parent_app_id::text
-		FROM apps WHERE id=$1::uuid`, id).Scan(&canonical, &v.InheritedFrom)
+		SELECT COALESCE(a.parent_app_id,a.id)::text, a.parent_app_id::text,
+		       a.enabled,COALESCE(parent.enabled,true)
+		FROM apps a LEFT JOIN apps parent ON parent.id=a.parent_app_id
+		WHERE a.id=$1::uuid`, id).Scan(&canonical, &v.InheritedFrom, &enabled, &parentEnabled)
 	if err != nil {
 		return v, err
 	}
 	v.AppID = canonical
+	var effectiveImageRef *string
+	// Keep this effective-image expression aligned with images.requiredImagesForHost:
+	// both operator status and preparation must resolve runtime overrides first.
+	err = h.store.pool.QueryRow(ctx, `
+		SELECT ii.image_id,effective_image.image_ref
+		FROM apps a
+		LEFT JOIN runtime_presets rp ON rp.id=a.runtime_preset_id
+		CROSS JOIN LATERAL (SELECT CASE
+			WHEN jsonb_typeof(a.runtime_spec->'image')='string' AND a.runtime_spec->>'image'<>''
+			THEN a.runtime_spec->>'image' ELSE NULLIF(rp.image,'') END AS image_ref) effective_image
+		LEFT JOIN LATERAL (
+			SELECT image_id FROM installed_images ii
+			WHERE ii.registry_ref=effective_image.image_ref
+			   OR ii.local_tag=effective_image.image_ref
+			ORDER BY CASE WHEN a.runtime_preset_id IS NOT NULL
+			   AND ii.runtime_preset_id=a.runtime_preset_id THEN 0 ELSE 1 END,
+			   ii.image_id
+			LIMIT 1
+		) ii ON true
+		WHERE a.id=$1::uuid`, canonical).Scan(&v.ManagedImageID, &effectiveImageRef)
+	if err != nil {
+		return v, err
+	}
 	err = h.store.pool.QueryRow(ctx, `SELECT mode, revision::text FROM app_placement WHERE app_id=$1::uuid`, canonical).Scan(&v.Mode, &v.Revision)
 	if err != nil {
 		return v, err
@@ -76,26 +103,21 @@ func (h *Handler) appPlacementView(ctx context.Context, id string) (appPlacement
 	// current host observation, never inferred from selection alone.
 	rows, err = h.store.pool.Query(ctx, `
 		SELECT h.id::text,
-		       CASE WHEN NOT prep.managed THEN NULL::boolean ELSE prep.prepared END,
+		       CASE WHEN ii.image_id IS NULL OR hi.state IS NULL THEN NULL::boolean
+		            ELSE hi.state='ready' AND (hi.version='' OR hi.version=ii.version) END,
 		       CASE WHEN h.readiness IS NULL OR h.readiness_reported_at IS NULL
-		              OR h.readiness_reported_at < now()-make_interval(secs => $2::int)
+		              OR h.readiness_reported_at < now()-make_interval(secs => $1::int)
 		            THEN NULL::boolean
 		            WHEN h.status='offline' THEN false
 		            WHEN h.status='online' AND h.capacity_detection='ok'
 		              AND NOT h.readiness_block_host AND NOT h.readiness_block_homes
 		              AND h.config_policy_gate_connection IS NULL THEN true
-		            ELSE false END
+		            ELSE false END,
+		       ii.lazy,hi.state,hi.version,ii.version
 		FROM hosts h
-		CROSS JOIN apps a
-		LEFT JOIN LATERAL (
-			SELECT count(*) > 0 AS managed,
-			       bool_and(CASE WHEN hi.state IS NULL THEN NULL::boolean
-			            ELSE hi.state='ready' AND (hi.version='' OR hi.version=ii.version) END) AS prepared
-			FROM installed_images ii
-			LEFT JOIN host_images hi ON hi.host_id=h.id AND hi.image_id=ii.image_id
-			WHERE ii.registry_ref=a.runtime_spec->>'image' OR ii.local_tag=a.runtime_spec->>'image'
-		) prep ON true
-		WHERE a.id=$1::uuid ORDER BY h.node_name,h.id`, canonical, int(h.store.readinessWindow().Seconds()))
+		LEFT JOIN installed_images ii ON ii.image_id=$2
+		LEFT JOIN host_images hi ON hi.host_id=h.id AND hi.image_id=ii.image_id
+		ORDER BY h.node_name,h.id`, int(h.store.readinessWindow().Seconds()), v.ManagedImageID)
 	if err != nil {
 		return v, err
 	}
@@ -106,12 +128,50 @@ func (h *Handler) appPlacementView(ctx context.Context, id string) (appPlacement
 	}
 	for rows.Next() {
 		var host appPlacementHost
-		if err := rows.Scan(&host.HostID, &host.Prepared, &host.Ready); err != nil {
+		var lazy *bool
+		var state, observedVersion, adoptedVersion *string
+		if err := rows.Scan(&host.HostID, &host.Prepared, &host.Ready, &lazy, &state, &observedVersion, &adoptedVersion); err != nil {
 			return v, err
 		}
 		host.Selected = v.Mode == "all_eligible" || selected[host.HostID]
-		if host.Selected && host.Prepared != nil && !*host.Prepared {
-			reason := "awaiting_preparation"
+		inventoryKnown, currentState := state != nil, state != nil
+		if h.imageEvidence != nil && v.ManagedImageID != nil {
+			connected, observed, snapshot := h.imageEvidence(host.HostID, *v.ManagedImageID)
+			inventoryKnown, currentState = connected && (observed || snapshot), connected && observed
+			if !inventoryKnown {
+				host.Prepared = nil
+			} else if !observed {
+				absent := false
+				host.Prepared = &absent
+			}
+		}
+		reason := ""
+		switch {
+		case !host.Selected || !enabled || !parentEnabled:
+			reason = "not_required"
+		case effectiveImageRef == nil:
+			reason = "no_image"
+		case v.ManagedImageID == nil:
+			reason = "unmanaged_image"
+		case lazy != nil && *lazy:
+			reason = "on_demand"
+		case state != nil && *state == "failed" && observedVersion != nil && adoptedVersion != nil &&
+			(*observedVersion == "" || *observedVersion == *adoptedVersion):
+			// Failure is durable until a fresh absent report, a new adoption,
+			// or explicit Retry. A reconnect without a current inventory must
+			// not hide the operator's recovery action.
+			reason = "preparation_failed"
+		case !inventoryKnown:
+			reason = "inventory_unknown"
+		case currentState && state != nil && (*state == "pulling" || *state == "building") && observedVersion != nil && adoptedVersion != nil &&
+			(*observedVersion == "" || *observedVersion == *adoptedVersion):
+			reason = "preparing"
+		case host.Prepared == nil:
+			reason = "inventory_unknown"
+		case !*host.Prepared:
+			reason = "awaiting_preparation"
+		}
+		if reason != "" {
 			host.Reason = &reason
 		}
 		v.Hosts = append(v.Hosts, host)
@@ -241,6 +301,7 @@ func (h *Handler) handlePatchAppPlacement(w http.ResponseWriter, r *http.Request
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not commit placement")
 		return
 	}
+	h.nudgeImages(ctx)
 	v, err := h.appPlacementView(ctx, id)
 	if err != nil {
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "placement saved but could not load it")

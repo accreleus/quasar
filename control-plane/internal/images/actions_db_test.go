@@ -76,7 +76,9 @@ func newActionsEnv(t *testing.T, hostNames ...string) (*actionsEnv, []string) {
 	mux := http.NewServeMux()
 	// Real audit store: the action routes were built without one, and
 	// images_audit_test.go reads the rows back out of admin_activity.
-	NewHandler(store, audit.NewStore(pool)).Register(mux, func(next http.Handler) http.Handler {
+	imageHandler := NewHandler(store, audit.NewStore(pool))
+	imageHandler.SetRetryEnsurer(ens)
+	imageHandler.Register(mux, func(next http.Handler) http.Handler {
 		return authHandler.RequireAuth(authHandler.RequireAdmin(next))
 	})
 	srv := httptest.NewServer(mux)
@@ -110,6 +112,17 @@ func seedCatalogDigest(t *testing.T, pool *pgxpool.Pool, version, digest string)
 		ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, registry_digest = EXCLUDED.registry_digest
 	`, imgID, version, imgRef, digest); err != nil {
 		t.Fatalf("seed image_catalog: %v", err)
+	}
+	// RH05 dispatch follows a selected app, not a fleetwide installed-image
+	// row. This fixture app deliberately selects the test's current digest.
+	if _, err := pool.Exec(context.Background(), `INSERT INTO apps(name,runtime_spec)
+		SELECT 'image actions selected fixture',jsonb_build_object('image',$1::text)
+		WHERE NOT EXISTS (SELECT 1 FROM apps WHERE name='image actions selected fixture')`, digest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(context.Background(), `UPDATE apps SET runtime_spec=jsonb_build_object('image',$1::text)
+		WHERE name='image actions selected fixture'`, digest); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -295,6 +308,16 @@ func seedCatalogTemplate(t *testing.T, pool *pgxpool.Pool, version, contextSHA s
 		ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, context_sha = EXCLUDED.context_sha
 	`, tplID, version, contextSHA); err != nil {
 		t.Fatalf("seed template image_catalog: %v", err)
+	}
+	ref := tplLocalTag(version)
+	if _, err := pool.Exec(context.Background(), `INSERT INTO apps(name,runtime_spec)
+		SELECT 'template actions selected fixture',jsonb_build_object('image',$1::text)
+		WHERE NOT EXISTS (SELECT 1 FROM apps WHERE name='template actions selected fixture')`, ref); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(context.Background(), `UPDATE apps SET runtime_spec=jsonb_build_object('image',$1::text)
+		WHERE name='template actions selected fixture'`, ref); err != nil {
+		t.Fatal(err)
 	}
 }
 

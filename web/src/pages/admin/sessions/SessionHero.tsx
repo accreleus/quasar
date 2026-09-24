@@ -29,6 +29,19 @@ function fact(label: string, value: string) {
   return { label, value };
 }
 
+export function homeSeedLabel(seed: AdminSession["home_seed"]): string {
+  if (!seed) return "No verified initial home outcome";
+  switch (seed.mode) {
+    case "reflink": return seed.reason === "seeded" ? "Reflink clone completed" : "Unknown home outcome";
+    case "copy": return seed.reason === "seeded" ? "Full copy completed · no reflink storage saving" : "Unknown home outcome";
+    case "existing": return seed.reason === "existing_home" ? "Existing home preserved" : "Unknown home outcome";
+    case "cold": return ["template_unavailable", "source_disabled", "host_templates_disabled", "host_setting_invalid", "policy_unavailable", "storage_unavailable", "clone_failed", "policy_changed"].includes(seed.reason)
+      ? `Cold start · ${seed.reason.replaceAll("_", " ")} · no reflink storage saving`
+      : "Unknown home outcome";
+    default: return "Unknown home outcome";
+  }
+}
+
 export function SessionHero({
   session,
   now,
@@ -109,6 +122,9 @@ export function SessionHero({
             </div>
           </div>
         ))}
+      </div>
+      <div className="sub" style={{ padding: "0 var(--card-pad) var(--card-pad)" }}>
+        Initial managed home · {homeSeedLabel(session.home_seed)}
       </div>
     </div>
   );

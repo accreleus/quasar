@@ -1,16 +1,20 @@
 package images
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 
 	"github.com/accreleus/quasar/control-plane/internal/audit"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
 	"github.com/accreleus/quasar/control-plane/internal/httpx"
 )
+
+var hostUUID = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // Handler serves the app-image admin surface (protocol/control-api.md
 // "App-image catalog + management"): catalog reads and the install/uninstall
@@ -20,6 +24,9 @@ import (
 type Handler struct {
 	store   *Store
 	auditor audit.Recorder
+	retry   interface {
+		RetryHostImage(context.Context, string, string) error
+	}
 }
 
 // NewHandler builds the images HTTP handler.
@@ -29,6 +36,14 @@ func NewHandler(store *Store, auditors ...audit.Recorder) *Handler {
 		h.auditor = auditors[0]
 	}
 	return h
+}
+
+// SetRetryEnsurer supplies the operator retry action after the Ensurer is
+// constructed. Catalog CRUD and retry use the same dispatcher.
+func (h *Handler) SetRetryEnsurer(e interface {
+	RetryHostImage(context.Context, string, string) error
+}) {
+	h.retry = e
 }
 
 // actor is the acting admin's id for an audit row.
@@ -47,6 +62,41 @@ func (h *Handler) Register(mux httpx.Router, admin func(http.Handler) http.Handl
 	mux.Handle("POST /v1/admin/images/{id}/pin", admin(http.HandlerFunc(h.handlePin)))
 	mux.Handle("DELETE /v1/admin/images/{id}/pin", admin(http.HandlerFunc(h.handleUnpin)))
 	mux.Handle("POST /v1/admin/images/{id}/update", admin(http.HandlerFunc(h.handleUpdate)))
+	mux.Handle("POST /v1/admin/hosts/{id}/images/{image_id}/retry", admin(http.HandlerFunc(h.handleRetry)))
+}
+
+func (h *Handler) handleRetry(w http.ResponseWriter, r *http.Request) {
+	hostID, imageID := r.PathValue("id"), r.PathValue("image_id")
+	if !hostUUID.MatchString(hostID) || len(imageID) < 1 || len(imageID) > 128 {
+		httpx.WriteError(w, http.StatusBadRequest, httpx.CodeValidationFailed, "invalid host or image ID")
+		return
+	}
+	if h.retry == nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "image retry unavailable")
+		return
+	}
+	err := h.retry.RetryHostImage(r.Context(), hostID, imageID)
+	switch {
+	case err == nil:
+		audit.TryRecord(r.Context(), h.auditor, actor(r), "image.retry", "image", imageID,
+			map[string]any{"host_id": hostID})
+		w.WriteHeader(http.StatusAccepted)
+	case errors.Is(err, ErrNotFound):
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotFound, "host or image not found")
+	case errors.Is(err, ErrNotInstalled):
+		httpx.WriteError(w, http.StatusNotFound, httpx.CodeNotInstalled, "image is not installed")
+	case errors.Is(err, ErrRetryOffline):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "Host is offline; retry after reconnect")
+	case errors.Is(err, ErrRetryNotRequired):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "Image is not required on this host")
+	case errors.Is(err, ErrRetryLazy):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "Lazy image downloads at first launch")
+	case errors.Is(err, ErrRetryNotFailed):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "Image is not failed for the adopted version")
+	default:
+		slog.Error("retry image", "host_id", hostID, "image_id", imageID, "err", err)
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not schedule image retry")
+	}
 }
 
 func (h *Handler) handleGet(w http.ResponseWriter, r *http.Request) {
