@@ -27,6 +27,10 @@ func withoutRH05Restriction(s string) string {
 	// historical SQL capture predates that gate; its exact predicate is checked
 	// separately below before removing it for the legacy comparison.
 	s = strings.ReplaceAll(s, normSQL(imageCleanupFencePredicate), "")
+	// #346 lets lazy adoptions reach the agent's on-demand preparation path.
+	// The historical capture predates that intentional extra filter; the
+	// operator launch DB tests assert its behavior for eager and lazy images.
+	s = strings.ReplaceAll(s, normSQL("AND ii.lazy = false"), "")
 	for idx := 1; idx <= 32; idx++ {
 		s = strings.ReplaceAll(s, normSQL(imageCleanupIdentityFenceSQL(idx)), "")
 		s = strings.ReplaceAll(s, normSQL("AND NOT "+removedManagedImageUnreadySQL("g.host_id", "$"+strconv.Itoa(idx))), "")

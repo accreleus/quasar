@@ -108,7 +108,10 @@ func codecPreferenceOrderSQL(prefIdx int) string {
 			), cardinality($%[1]d::text[]) + 1) ASC,`, prefIdx, gpuCodecSetSQL("g", "ph", true))
 }
 
-// imageReadySQL drops hosts where the app's managed image is not `ready`.
+// imageReadySQL drops hosts where an eagerly adopted managed image is not
+// `ready`. A lazy adoption prepares on the first assigned launch; requiring a
+// prior ready report would prevent that assignment from ever reaching the
+// agent. Exact-identity cleanup fences apply to both adoption modes.
 // refIdx carries the app's runtime_spec image reference.
 //
 // The adoption readiness check engages only for an installed managed image.
@@ -133,6 +136,7 @@ func imageReadySQL(refIdx int) string {
 		    SELECT 1
 		      FROM installed_images ii
 		     WHERE (ii.registry_ref = $%[1]d OR ii.local_tag = $%[1]d)
+		       AND ii.lazy = false
 		       AND NOT EXISTS (
 		           SELECT 1 FROM host_images hi
 		            WHERE hi.host_id = g.host_id
