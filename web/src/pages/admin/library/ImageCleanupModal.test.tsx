@@ -84,6 +84,20 @@ describe("ImageCleanupModal", () => {
     expect(screen.queryByText(/Removal confirmed/i)).toBeNull();
   });
 
+  it("refreshes candidate protection when a removal finishes", async () => {
+    vi.mocked(adminApi.getHostImageCleanup)
+      .mockResolvedValueOnce({ host_id: "h1", inventory_status: "current", observed_at: "2026-09-24T00:00:00Z", remedy: null, images: [candidate] } as never)
+      .mockResolvedValueOnce({ host_id: "h1", inventory_status: "current", observed_at: "2026-09-24T00:00:01Z", remedy: null, images: [{ ...candidate, eligible: false, reasons: ["removing"] }] } as never)
+      .mockResolvedValue({ host_id: "h1", inventory_status: "current", observed_at: "2026-09-24T00:00:02Z", remedy: null, images: [{ ...candidate, eligible: false, reasons: ["container_reference"] }] } as never);
+    vi.mocked(adminApi.getHostImageCleanupAttempt).mockResolvedValue({ ...attempt, state: "failed", reason: "reference_in_use" } as never);
+
+    renderModal();
+    await requestRemoval();
+    expect(await screen.findByText(/Removal failed/i)).toBeTruthy();
+    expect(await screen.findByText(/Used by a container, including a stopped container/i)).toBeTruthy();
+    expect(screen.queryByText(/Removal is already in progress/i)).toBeNull();
+  });
+
   it("does not infer success when the attempt read has been pruned", async () => {
     vi.mocked(adminApi.getHostImageCleanupAttempt).mockRejectedValue(
       new ApiError(404, "not_found", "not found"),

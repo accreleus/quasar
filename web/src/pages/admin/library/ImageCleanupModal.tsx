@@ -65,6 +65,11 @@ export function ImageCleanupModal({ token, hostID, hostName, imageID, onClose }:
       attemptStatus.resume();
     }
   }, [requested, attemptUnavailable, attempt?.state, attemptStatus.pause, attemptStatus.resume]);
+  useEffect(() => {
+    if (attempt?.state === "removed" || attempt?.state === "failed") {
+      void inventory.refresh({ silent: true });
+    }
+  }, [attempt?.attempt_id, attempt?.state, inventory.refresh]);
   const pendingState = attempt ?? requested;
   const attemptPending = !!pendingState && (pendingState.state === "removing" || pendingState.state === "unknown");
 
