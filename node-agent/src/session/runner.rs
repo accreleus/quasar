@@ -317,6 +317,7 @@ fn fail_dualoutput_console<F: Fn(SessionEvent)>(
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     Starting,
+    HomeSeed(super::home::HomeSeedOutcome),
     /// Fine-grained launch progress while the top-level state remains starting.
     Progress(&'static str),
     Running,
@@ -1372,6 +1373,9 @@ pub fn run_blocking(
             return;
         }
     };
+    if let Some(outcome) = res.home_seed {
+        emit(SessionEvent::HomeSeed(outcome));
+    }
     cfg.pulse_server = pulse_server;
     if cfg.pulse_server.is_none() && !cfg.use_test_audio {
         // The sidecar was wanted and is not there: this session will stream SILENCE. A

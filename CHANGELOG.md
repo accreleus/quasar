@@ -25,6 +25,10 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **RH05 Steam templates and initial-home evidence (#344).** Optional Steam
+  preparation now requires a currently selected adopted image; initial launches
+  preserve nonempty homes and expose authenticated reflink, copy, cold, or
+  existing-home outcomes without claiming reflink savings for copy or cold.
 - **RH05 selected-app image preparation (#343).** Selected hosts reconcile the
   immutable adopted managed image required by their apps, with per-app
   preparation status, bounded failure retry, and durable successful-version

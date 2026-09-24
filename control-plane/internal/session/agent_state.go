@@ -57,6 +57,14 @@ func (c *Coordinator) AgentState(ctx context.Context, hostID string, m agentws.S
 	if hs.State.IsTerminal() {
 		return
 	}
+	if to == StateStarting && len(m.HomeSeed) != 0 {
+		seed, valid := canonicalHomeSeed(m.HomeSeed)
+		if !valid {
+			c.log.Warn("invalid_home_seed", "session_id", m.SessionID)
+		} else if err := c.store.SetInitialHomeSeed(ctx, m.SessionID, hostID, seed); err != nil {
+			c.log.Error("record home seed failed", "session_id", m.SessionID, "err", err)
+		}
+	}
 
 	// A swap in flight rides within `running` via state_detail, so it must be
 	// handled before the generic transition, which treats running→running as a

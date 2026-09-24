@@ -2942,7 +2942,7 @@ export interface paths {
          * Server-sent session lifecycle events (owner or admin). NOT CURRENTLY SERVED — see x-unimplemented.
          * @description NOT IMPLEMENTED AS OF 2026-08-07. The Steam game-exit lifecycle arc that introduced this endpoint was parked and its control-plane implementation reverted; this contract text was deliberately left in place so the agreed shape survives for a future resurrection. `x-unimplemented: true` marks that: the route-coverage drift test skips such operations, because a documented-but-unserved route would otherwise fail every branch as a phantom. Remove the marker in the same change that registers the route. Original amendment text follows.
          *
-         *     Session-events amendment (2026-08-02): SSE stream (text/event-stream) replacing Session-events amendment (2026-08-02): SSE stream (text/event-stream) replacing lifecycle polling for clients that support it. One event type, `session`, whose data is the same envelope as GET /v1/sessions/{id} — sent once on subscribe (snapshot) and on every change to state / state_detail / app_launch_state / health_state; the event for a terminal state is final and the server then closes the stream. Comment lines (`:`) are keep-alives (~25s). Best-effort latency optimization, never an authority: the GET remains canonical, and a client MUST retain polling as fallback (older control plane -> 404; dropped stream -> re-subscribe or poll). Bearer-authenticated like every session read (browsers use fetch-streaming, not EventSource, so the Authorization header carries as normal).
+         *     Session-events amendment (2026-08-02): SSE stream (text/event-stream) replacing Session-events amendment (2026-08-02): SSE stream (text/event-stream) replacing lifecycle polling for clients that support it. One event type, `session`, whose data is the same envelope as GET /v1/sessions/{id} — sent once on subscribe (snapshot) and on every change to state / state_detail / app_launch_state / home_seed / health_state; the event for a terminal state is final and the server then closes the stream. Comment lines (`:`) are keep-alives (~25s). Best-effort latency optimization, never an authority: the GET remains canonical, and a client MUST retain polling as fallback (older control plane -> 404; dropped stream -> re-subscribe or poll). Bearer-authenticated like every session read (browsers use fetch-streaming, not EventSource, so the Authorization header carries as normal).
          */
         get: {
             parameters: {
@@ -3819,7 +3819,7 @@ export interface paths {
         put?: never;
         /**
          * Retry one failed selected managed-image preparation on an online host (RH05).
-         * @description Admin-only. Re-arms only a current selected non-lazy adopted image whose reported host state is failed at that adopted version (empty legacy version matches). Repeated concurrent requests return 202 merged into one pending host/image operation and one bounded budget. The 202 writes image.retry audit metadata and is process-local, not durable across a control-plane restart before dispatch. Acceptance is not proof of preparation; read image and placement views for progress. A current authenticated pulling/building state is not retryable. Once migration 0093 lands, removing fences refuse Retry and delayed dispatch rechecks the fence. Other images and active sessions are unaffected. Non-202 writes nothing. Failure reasons and exact safe messages are frozen in control-api.md RH05 #343.
+         * @description Admin-only. Re-arms only a current selected non-lazy adopted image whose reported host state is failed at that adopted version (empty legacy version matches). Repeated concurrent requests return 202 merged into one pending host/image operation and one bounded budget. The 202 writes image.retry audit metadata and is process-local, not durable across a control-plane restart before dispatch. Acceptance is not proof of preparation; read image and placement views for progress. A current authenticated pulling/building state is not retryable. Once migration 0094 lands, removing fences refuse Retry and delayed dispatch rechecks the fence. Other images and active sessions are unaffected. Non-202 writes nothing. Failure reasons and exact safe messages are frozen in control-api.md RH05 #343.
          */
         post: {
             parameters: {
@@ -7491,7 +7491,7 @@ export interface paths {
         put?: never;
         /**
          * Node-agent internal: close a claimed job run with its outcome. (Not operator-facing.)
-         * @description IDEMPOTENT BY CONTRACT: a report for a run that is already terminal is a 200 no-op, so an agent retrying after a network blip is safe — the alternative, a 409 the agent cannot act on, would turn a run that actually succeeded into a permanent error in an operator's face. `state` is the closed set {succeeded, failed, deferred, skipped}; `aborted` is deliberately ABSENT, because it is the reaper's verdict on a host that said nothing and a host claiming it would be describing a decision it does not get to make. Ownership is checked BEFORE anything is written and a failure is a 401, never a 404: an unknown run id, a run belonging to another host, and a bad node secret are one indistinguishable answer, so these routes never become an oracle for run ids. A `deferred` report is a normal outcome (the runner's own gate refused) and the dispatcher schedules the retry on the persisted backoff ladder.
+         * @description IDEMPOTENT BY CONTRACT: a report for a run that is already terminal is a 200 no-op, so an agent retrying after a network blip is safe — the alternative, a 409 the agent cannot act on, would turn a run that actually succeeded into a permanent error in an operator's face. `state` is the closed set {succeeded, failed, deferred, skipped}; `aborted` is deliberately ABSENT, because it is the reaper's verdict on a host that said nothing and a host claiming it would be describing a decision it does not get to make. Ownership is checked BEFORE anything is written and a failure is a 401, never a 404: an unknown run id, a run belonging to another host, and a bad node secret are one indistinguishable answer, so these routes never become an oracle for run ids. A `deferred` report is a normal outcome (the runner's own gate refused) and the dispatcher schedules the retry on the persisted backoff ladder. For a capable template.warmup claim, every nonterminal report must carry its publish_claim_token; the atomic transition rejects a missing or stale token with 409 and never gives verified credit to another claim's report. An already-terminal retry remains a 200 no-op.
          */
         post: {
             parameters: {
@@ -7517,7 +7517,7 @@ export interface paths {
                 };
                 400: components["responses"]["ValidationFailed"];
                 401: components["responses"]["Unauthorized"];
-                /** @description Could not record the report (the run moved under the caller */
+                /** @description Could not record the report (the claim token or state moved under the caller */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -7527,6 +7527,71 @@ export interface paths {
                     };
                 };
                 /** @description Could not record the job report. */
+                500: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/agent/jobs/template.warmup/{run_id}/publish-permit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Node-agent internal: final selected Steam template publication check.
+         * @description RH05 #344. Existing node-secret agent job authentication. One conditional SQL statement checks the exact running claim token and current connection epoch, digest-pinned run params, current source/adoption/ack/ready image and selected app placement, and stamps publish_permit_accepted_at only on acceptance. Its database snapshot is the authorization linearization point. A placement removal before the snapshot denies; a later removal may leave a cached template but grants no current requirement or launch permission. No network or template-content copy is allowed between a 200 and local lease commit plus atomic publication. Every unavailable/malformed/denied response fails closed for optional publication and leaves ordinary cold launch available.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    run_id: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["SteamPublishPermitRequest"];
+                };
+            };
+            responses: {
+                /** @description Current publication check accepted. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["SteamPublishPermitAccepted"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                /** @description Not current; same closed answer for unknown */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                /** @description Publication check unavailable. */
                 500: {
                     headers: {
                         [name: string]: unknown;
@@ -7887,6 +7952,11 @@ export interface components {
             policy_pending: boolean;
             preparation_enabled: boolean | null;
             consumption_enabled: boolean | null;
+            /**
+             * @description Verified requires a capable agent's successful claimed warmup run with an accepted final permit; older agents remain visibly limited even if template ready.
+             * @enum {string}
+             */
+            publication_protection: "verified" | "limited_protection";
             /** @enum {string} */
             state: "waiting_image" | "queued" | "preparing" | "ready" | "deferred" | "failed" | "disabled" | "unsupported" | "unknown" | "pending_policy";
             reason: string;
@@ -8123,6 +8193,13 @@ export interface components {
                 items: components["schemas"]["Entitlement"][];
             };
         };
+        /** @description Valid pairs: reflink/seeded, copy/seeded, cold/{template_unavailable,source_disabled,host_templates_disabled,host_setting_invalid,policy_unavailable,storage_unavailable,clone_failed,policy_changed}, existing/existing_home. Only reflink proves reflink storage saving. */
+        HomeSeedOutcome: {
+            /** @enum {string} */
+            mode: "reflink" | "copy" | "cold" | "existing";
+            /** @enum {string} */
+            reason: "seeded" | "template_unavailable" | "source_disabled" | "host_templates_disabled" | "host_setting_invalid" | "policy_unavailable" | "storage_unavailable" | "clone_failed" | "policy_changed" | "existing_home";
+        };
         Session: {
             /** Format: uuid */
             id: string;
@@ -8139,6 +8216,8 @@ export interface components {
             failure_code: string | null;
             /** @description First-run-experience §S5. The app container's own captured log tail (newline-joined, oldest first, ~100 lines bound) - the only surviving copy, since app containers run --rm. Always serialized; null unless a failure warranted capturing it. Rendered preformatted, distinct from error_message's prose rendering. */
             app_log_tail: string | null;
+            /** @description RH05 #344. Actual initial managed-home seeding outcome. Null means no authenticated evidence, including an older agent, a non-managed home or failure before provisioning. No inference of cold or storage savings from null. Swaps do not change the initial outcome. Never contains paths or free-form diagnostics. */
+            home_seed: null | components["schemas"]["HomeSeedOutcome"];
             /** @description The profile the session was launched from; null for a legacy/tier/override launch. UI-P4: this is now a LAUNCH PROFILE id, i.e. the USER'S PICK. The rung it resolved to is stream_profile_id. */
             profile_id: string | null;
             /** @description UI-P4: the RUNG this launch resolved to (e.g. "1080p60-h264"). Always serialized; null for every pre-UI-P4 session and for any legacy/tier/override/console launch. profile_id answers "what did the user pick", this answers "what did they get" - and because a rung carries its own resolution, the two can legitimately disagree about width/height/fps/ bitrate. The `stream` block below is always the truth for the running session. */
@@ -8632,7 +8711,7 @@ export interface components {
             prepared: boolean | null;
             /** @description Null when readiness evidence is unknown. */
             ready: boolean | null;
-            /** @description Safe open code: unmanaged_image, no_image, on_demand, not_required, awaiting_preparation, preparing, preparation_failed, inventory_unknown, removing (after 0093); unknown future codes render generically. Prepared on an unselected host is observation only. */
+            /** @description Safe open code: unmanaged_image, no_image, on_demand, not_required, awaiting_preparation, preparing, preparation_failed, inventory_unknown, removing (after 0094); unknown future codes render generically. Prepared on an unselected host is observation only. */
             reason?: string | null;
         };
         AppPlacementPatch: {
@@ -10960,6 +11039,11 @@ export interface components {
         AgentJobPendingRun: {
             /** Format: uuid */
             run_id: string;
+            /**
+             * Format: uuid
+             * @description Opaque per-claim token on capable template.warmup runs only; omit for legacy agents and other jobs. Internal, never in public job reads or logs.
+             */
+            publish_claim_token?: string;
             /** @description The registry job id, e.g. "template.warmup". */
             job_id: string;
             /** @description The opaque per-job JSON the control plane stored when it materialized the run (for an event trigger, whatever the event carried). The framework NEVER interprets it; the agent hands it to the runner. `{}` rather than null when there is none. Bounded at 4096 bytes by a CHECK. */
@@ -10973,12 +11057,31 @@ export interface components {
             /** @description Capped at 5 per poll; [] is the steady state and also the answer when the jobs master switch is off. */
             runs: components["schemas"]["AgentJobPendingRun"][];
         };
+        SteamPublishPermitRequest: {
+            /** Format: uuid */
+            publish_claim_token: string;
+            /** @enum {string} */
+            image_id: "steam";
+            /** @description Exact digest-pinned ref; server matches current adopted Steam identity and persisted run params. The grammar does not authorize new sources or pins. */
+            registry_ref: string;
+            version: string;
+            policy_revision: string;
+        };
+        SteamPublishPermitAccepted: {
+            /** @enum {boolean} */
+            authorized: true;
+        };
         AgentJobReportRequest: {
             /**
              * Format: uuid
              * @description The claimed run being closed. Unknown, or owned by another host: 401, indistinguishable from a bad secret.
              */
             run_id: string;
+            /**
+             * Format: uuid
+             * @description Required for a nonterminal capable template.warmup run; omitted for older agents and other jobs. Must match this exact claim atomically with the report.
+             */
+            publish_claim_token?: string;
             /**
              * @description The closed set a HOST may report. `aborted` is absent on purpose - it is the reaper's verdict on a host that said nothing, and a host claiming it would be describing a decision it does not get to make. Sending it is 400 validation_failed, exactly like any other unrecognised value.
              * @enum {string}

@@ -217,7 +217,8 @@ type sessionResp struct {
 	// The app container's last ~100 log lines, oldest first, captured while it
 	// ran: containers use `--rm`, so the daemon has discarded them by the time
 	// anyone looks (#463).
-	AppLogTail *string `json:"app_log_tail"`
+	AppLogTail *string         `json:"app_log_tail"`
+	HomeSeed   json.RawMessage `json:"home_seed"`
 	// The launch profile the session came from, null for a legacy/tier/override
 	// launch. Resolved values are in Stream; metadata at GET /v1/me/profiles.
 	ProfileID *string `json:"profile_id"`
@@ -331,6 +332,7 @@ func sessionRespWithStream(s Session, stream streamResp) sessionResp {
 		ErrorMessage:    s.ErrorMessage,
 		FailureCode:     s.FailureCode,
 		AppLogTail:      s.AppLogTail,
+		HomeSeed:        s.HomeSeed,
 		ProfileID:       s.ProfileID,
 		StreamProfileID: s.StreamProfileID,
 		CodecDecision:   s.CodecDecision,

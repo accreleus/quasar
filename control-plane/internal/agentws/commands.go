@@ -203,4 +203,7 @@ type SessionStateMsg struct {
 	// The only copy: app containers run `--rm`, so the daemon has already
 	// discarded the logs by the time anyone looks (#463).
 	AppLogTail *string `json:"app_log_tail"`
+	// RawMessage isolates optional seed evidence from lifecycle decoding. A
+	// malformed seed field cannot drop an otherwise valid session_state.
+	HomeSeed json.RawMessage `json:"home_seed"`
 }

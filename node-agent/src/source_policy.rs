@@ -9,6 +9,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
+#[derive(Debug)]
+pub(crate) struct PolicyRevoked;
+impl std::fmt::Display for PolicyRevoked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Steam source policy changed before commit")
+    }
+}
+impl std::error::Error for PolicyRevoked {}
+
+pub(crate) fn is_policy_revoked(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<PolicyRevoked>())
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ImageIdentity {
@@ -47,6 +62,18 @@ fn valid_image(image: &ImageIdentity) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._-+".contains(&b))
         && image
             .registry_ref
+            .strip_prefix("ghcr.io/accreleus/quasar-steam@sha256:")
+            .is_some_and(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            })
+}
+
+pub(crate) fn is_official_steam_image(image_id: Option<&str>, registry_ref: &str) -> bool {
+    image_id == Some("steam")
+        && registry_ref
             .strip_prefix("ghcr.io/accreleus/quasar-steam@sha256:")
             .is_some_and(|digest| {
                 digest.len() == 64
@@ -315,6 +342,30 @@ impl SourcePolicy {
         let seed = store.seed(image_id)?;
         Some((store, seed, lease))
     }
+    /// Closed, path-free reason for an otherwise safe empty Steam home when
+    /// this connection cannot provide a matching template.
+    pub fn seed_absence_reason(&self) -> &'static str {
+        let state = self.state.lock().unwrap();
+        if state.snapshot.as_ref().is_some_and(|s| !s.enabled) {
+            return "source_disabled";
+        }
+        if self.consumption == Permission::Invalid {
+            return "host_setting_invalid";
+        }
+        if self.consumption == Permission::Disabled {
+            return "host_templates_disabled";
+        }
+        if !state.authorized || state.snapshot.is_none() {
+            return "policy_unavailable";
+        }
+        let Some(store) = &state.store else {
+            return "storage_unavailable";
+        };
+        if store.clone_mode() == CloneMode::Off {
+            return "host_templates_disabled";
+        }
+        "template_unavailable"
+    }
     pub fn status(&self, phase: &str, reason: &str, detail: &str) {
         let mut state = self.state.lock().unwrap();
         state.phase = phase.into();
@@ -374,8 +425,9 @@ impl PolicyLease {
         if state.generation != self.generation
             || !self.policy.allowed(&state, &self.image, None, self.consume)
         {
-            return Err(std::io::Error::other(
-                "Steam source policy changed before commit",
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                PolicyRevoked,
             ));
         }
         action()
@@ -432,6 +484,32 @@ pub(crate) mod tests {
             images,
         );
         (dir, policy)
+    }
+    #[test]
+    fn steam_seed_absence_reports_source_and_policy_before_template_state() {
+        let (_dir, policy) = fixture();
+        assert_eq!(policy.seed_absence_reason(), "policy_unavailable");
+        policy.apply(&snapshot("1", false));
+        assert_eq!(policy.seed_absence_reason(), "source_disabled");
+        policy.apply(&snapshot("2", true));
+        assert_eq!(policy.seed_absence_reason(), "template_unavailable");
+        policy.invalidate();
+        assert_eq!(policy.seed_absence_reason(), "policy_unavailable");
+    }
+    #[test]
+    fn revoked_lease_is_distinct_from_install_io_failure() {
+        let (_dir, policy) = fixture();
+        policy.apply(&snapshot("1", true));
+        let lease = policy.authorize(&identity(), None, false).unwrap();
+        let install_error = lease
+            .commit(|| -> std::io::Result<()> {
+                Err(std::io::Error::other("injected rename failure"))
+            })
+            .unwrap_err();
+        assert!(!is_policy_revoked(&install_error));
+        policy.invalidate();
+        let revoked = lease.commit(|| Ok(())).unwrap_err();
+        assert!(is_policy_revoked(&revoked));
     }
     #[test]
     fn absent_and_compose_empty_permissions_default_enabled_but_explicit_false_and_invalid_do_not()
