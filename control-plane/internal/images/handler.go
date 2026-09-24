@@ -93,6 +93,8 @@ func (h *Handler) handleRetry(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "Lazy image downloads at first launch")
 	case errors.Is(err, ErrRetryNotFailed):
 		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "Image is not failed for the adopted version")
+	case errors.Is(err, ErrRetryRemoving):
+		httpx.WriteError(w, http.StatusConflict, httpx.CodeConflict, "Image cleanup is in progress; retry after it finishes")
 	default:
 		slog.Error("retry image", "host_id", hostID, "image_id", imageID, "err", err)
 		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not schedule image retry")

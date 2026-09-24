@@ -499,6 +499,17 @@ func (e *Ensurer) runEnsure(hostID, imageID string, _ installedImage, force bool
 		e.closeRetry(hostID + "|" + imageID)
 		return
 	}
+	// A queued ensure may have waited behind another image operation. The
+	// durable fence, rather than the queue's old snapshot, decides whether it
+	// may be sent now. A failed lookup also defers the command.
+	removing, fenceErr := imageRemoving(checkCtx, e.pool, hostID, imageID)
+	if fenceErr != nil || removing {
+		if fenceErr != nil {
+			e.log.Warn("ensure: image fence lookup failed; deferring dispatch", "host_id", hostID, "image_id", imageID, "err", fenceErr)
+		}
+		e.closeRetry(hostID + "|" + imageID)
+		return
+	}
 	e.sendEnsure(hostID, cur)
 	// Coalesce requests through dispatch acceptance, then permit another
 	// explicit Retry if an accepted agent never reports image_state.
@@ -822,6 +833,13 @@ func (e *Ensurer) RetryHostImage(ctx context.Context, hostID, imageID string) er
 	if !required {
 		return ErrRetryNotRequired
 	}
+	removing, err := imageRemoving(ctx, e.pool, hostID, imageID)
+	if err != nil {
+		return err
+	}
+	if removing {
+		return ErrRetryRemoving
+	}
 	var state, version string
 	err = e.pool.QueryRow(ctx, `SELECT state,version FROM host_images WHERE host_id=$1::uuid AND image_id=$2`, hostID, imageID).Scan(&state, &version)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -863,6 +881,7 @@ var (
 	ErrRetryNotRequired = errors.New("image retry: not required")
 	ErrRetryLazy        = errors.New("image retry: lazy")
 	ErrRetryNotFailed   = errors.New("image retry: not failed at adopted version")
+	ErrRetryRemoving    = errors.New("image retry: cleanup in progress")
 )
 
 // WarmupParamsForHost resolves `template.warmup` params for a MANUAL run on

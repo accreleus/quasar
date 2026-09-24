@@ -1,0 +1,1 @@
+DROP TABLE host_image_operation_fences;

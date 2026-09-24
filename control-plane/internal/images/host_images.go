@@ -185,6 +185,19 @@ func hostHasImage(ctx context.Context, db dbExecutor, hostID, imageID, version s
 	return ok, nil
 }
 
+// imageRemoving is the durable gate shared by operator Retry and delayed
+// preparation dispatch. Missing rows are idle until a cleanup attempt creates
+// its fence; a database error fails closed.
+func imageRemoving(ctx context.Context, db dbExecutor, hostID, imageID string) (bool, error) {
+	var removing bool
+	err := db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM host_image_operation_fences
+		WHERE host_id=$1::uuid AND image_id=$2 AND state='removing')`, hostID, imageID).Scan(&removing)
+	if err != nil {
+		return false, fmt.Errorf("read image operation fence host=%s image=%s: %w", hostID, imageID, err)
+	}
+	return removing, nil
+}
+
 // A normal reconciliation never restarts a failed current-version pull. Its
 // bounded retry ladder owns that work; after exhaustion only an explicit
 // operator Retry may re-arm it. A newer adopted version is new work and may
