@@ -36,12 +36,15 @@ type PolicyChoice struct {
 }
 
 type PolicyGroup struct {
-	DesiredRevision    string     `json:"desired_revision"`
-	AppliedRevision    *string    `json:"applied_revision"`
-	DesiredDigest      *string    `json:"desired_digest"`
-	AppliedDigest      *string    `json:"applied_digest"`
-	Scope              string     `json:"scope"`
-	Status             string     `json:"status"`
+	DesiredRevision string  `json:"desired_revision"`
+	AppliedRevision *string `json:"applied_revision"`
+	DesiredDigest   *string `json:"desired_digest"`
+	AppliedDigest   *string `json:"applied_digest"`
+	Scope           string  `json:"scope"`
+	Status          string  `json:"status"`
+	// Saved is false for a group projected from deployment or legacy behaviour
+	// because no RH05 revision was persisted (control-api.md #346 amendment).
+	Saved              bool       `json:"saved"`
 	Fresh              bool       `json:"fresh"`
 	ObservedAt         *time.Time `json:"observed_at"`
 	Remedy             *string    `json:"remedy"`
@@ -253,7 +256,7 @@ func (s *Store) GetPolicy(ctx context.Context, hostID string) (PolicyView, error
 			rows.Close()
 			return view, err
 		}
-		group := PolicyGroup{DesiredRevision: strconv.FormatInt(desired, 10), DesiredDigest: digest, AppliedDigest: appliedDigest, Scope: scope, Status: status, ObservedAt: observed, EvidenceConnection: evidenceConnection}
+		group := PolicyGroup{DesiredRevision: strconv.FormatInt(desired, 10), DesiredDigest: digest, AppliedDigest: appliedDigest, Scope: scope, Status: status, Saved: true, ObservedAt: observed, EvidenceConnection: evidenceConnection}
 		if applied != nil {
 			str := strconv.FormatInt(*applied, 10)
 			group.AppliedRevision = &str

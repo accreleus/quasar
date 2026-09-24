@@ -319,9 +319,65 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 
 	// Async, so the HTTP response returns immediately with the assigned session.
 	expectedHome := expectedHomeDispatch(app)
-	go c.dispatchAssignStart(sess, dispatchSpec, &expectedHome)
+	go c.prepareAndDispatch(sess, dispatchSpec, app.Image(), &expectedHome)
 
 	return LaunchResult{Session: sess, SignalingToken: tok.Plaintext, TokenExpiresAt: tok.ExpiresAt}, nil
+}
+
+func (c *Coordinator) prepareAndDispatch(sess Session, runtimeSpec []byte, imageRef string, expected *homeDispatchExpectation) {
+	if c.lazyImages == nil && imageRef != "" {
+		// Placement admits a lazy template before any host built it. Without a
+		// preparer nothing would build it, so fail closed rather than assign an
+		// unbuilt local tag.
+		var lazyTemplate bool
+		err := c.store.pool.QueryRow(c.ctx, `SELECT EXISTS(SELECT 1 FROM installed_images
+			WHERE lazy AND registry_ref = '' AND local_tag = $1)`, imageRef).Scan(&lazyTemplate)
+		if err != nil || lazyTemplate {
+			c.failSession(sess.ID, "image preparation unavailable for lazy template")
+			return
+		}
+	}
+	if c.lazyImages != nil && sess.HostID != nil {
+		// A template build may take minutes. It is owned by the coordinator's
+		// lifecycle, not the HTTP request which has already returned 201.
+		ctx, cancel := context.WithCancel(c.ctx)
+		finished := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(500 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-finished:
+					return
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					current, err := c.store.Get(ctx, sess.ID)
+					if err == nil && current.State != StateAssigned {
+						cancel()
+						return
+					}
+				}
+			}
+		}()
+		err := c.lazyImages.PrepareLazyImage(ctx, *sess.HostID, imageRef)
+		close(finished)
+		cancel()
+		if err != nil {
+			// A stop or reconnect reap that ended the wait already owns the
+			// session's outcome; only a still-assigned launch fails here.
+			if current, getErr := c.store.Get(c.ctx, sess.ID); getErr == nil && current.State == StateAssigned {
+				c.failSession(sess.ID, fmt.Sprintf("image preparation failed: %v", err))
+			}
+			return
+		}
+	}
+	// An operator may have stopped the session while preparation was pending.
+	current, err := c.store.Get(c.ctx, sess.ID)
+	if err != nil || current.State != StateAssigned {
+		return
+	}
+	c.dispatchAssignStart(sess, runtimeSpec, expected)
 }
 
 // applyPostPlacement resolves which rung a placed session starts at and writes

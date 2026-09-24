@@ -787,6 +787,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	imagesStore.SetProviderAllowlist(os.Getenv("QUASAR_LIBRARY_PROVIDERS"))
 	imagesHandler := images.NewHandler(imagesStore, auditStore)
 	imagesEnsurer := images.NewEnsurer(pool, agentRegistry, log)
+	coordinator.SetLazyImagePreparer(imagesEnsurer)
 	imagesStore.SetEnsurer(imagesEnsurer)
 	imagesHandler.SetRetryEnsurer(imagesEnsurer)
 	imagesCleanup := images.NewCleanupService(janitorCtx, pool, agentRegistry)

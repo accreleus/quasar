@@ -87,7 +87,8 @@ type Coordinator struct {
 
 	// homes is the P5-02 storage seam; nil means no provider, and managed-home
 	// launches then fail loudly (WithHomeProvider).
-	homes HomeProvider
+	homes      HomeProvider
+	lazyImages LazyImagePreparer
 
 	// micSettings is the mic-capture instance gate (migration 0049). Unlike
 	// HomeProvider, nil is NOT loud: it resolves fail-closed to "never granted",

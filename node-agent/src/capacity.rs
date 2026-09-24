@@ -36,12 +36,19 @@ pub fn detect() -> SystemCapacity {
     let allow_synthetic = std::env::var("QUASAR_SYNTHETIC_GPU_CAPACITY")
         .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
     let mem_mb = detect_mem_mb();
-    let (gpus, vram_targets, gpu_detection, gpu_detection_reason) = detect_gpus_at(
+    let (gpus, vram_targets, gpu_detection, gpu_detection_reason) = detect_gpus_at_with_access(
         std::path::Path::new("/sys/class/drm"),
         allow_synthetic,
         mem_mb,
         &DriverIdentities::detect(std::path::Path::new("/")),
         &|k| std::env::var(k).ok(),
+        &|node| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(node)
+                .is_ok()
+        },
     );
     SystemCapacity {
         host: HostCapacity {
@@ -475,12 +482,24 @@ fn detect_mem_mb() -> i32 {
     0
 }
 
+#[cfg(test)]
 fn detect_gpus_at(
     root: &std::path::Path,
     allow_synthetic: bool,
     mem_mb: i32,
     identities: &DriverIdentities,
     lookup: &dyn Fn(&str) -> Option<String>,
+) -> (Vec<GpuCapacity>, Vec<VramTarget>, String, Option<String>) {
+    detect_gpus_at_with_access(root, allow_synthetic, mem_mb, identities, lookup, &|_| true)
+}
+
+fn detect_gpus_at_with_access(
+    root: &std::path::Path,
+    allow_synthetic: bool,
+    mem_mb: i32,
+    identities: &DriverIdentities,
+    lookup: &dyn Fn(&str) -> Option<String>,
+    render_node_accessible: &dyn Fn(&std::path::Path) -> bool,
 ) -> (Vec<GpuCapacity>, Vec<VramTarget>, String, Option<String>) {
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
@@ -531,6 +550,26 @@ fn detect_gpus_at(
             _ => continue,
         };
 
+        // /sys/class/drm can include cards from the host that are not exposed to this
+        // container. A render-node name alone is not evidence that this agent can use it.
+        // Check the same read/write access needed for a real DRM render-node open before
+        // probing the vendor or advertising capacity.
+        // The stable by-path identity does not itself need to be mounted in the container.
+        let (render_node, resolved_device_path) = pci_address(&device_path)
+            .and_then(|addr| {
+                renderd_node_for_pci_addr_root(&addr, root)
+                    .map(|device| (format!("/dev/dri/by-path/pci-{addr}-render"), device))
+            })
+            .map_or((None, None), |(stable, device)| {
+                (Some(stable), Some(device))
+            });
+        if !resolved_device_path
+            .as_deref()
+            .is_some_and(|node| render_node_accessible(std::path::Path::new(node)))
+        {
+            continue;
+        }
+
         let model = read_model(&device_path, vendor);
         let vram_mb_total = if vendor == "intel" {
             read_intel_memory_mb(card_path, mem_mb)
@@ -552,18 +591,6 @@ fn detect_gpus_at(
             "intel" => 2,
             _ => 1,
         };
-
-        // The by-path form is constructed, not read off disk, so it survives a container
-        // with no /dev/dri/by-path bind — but only when this GPU has a render node at all
-        // (a display-only iGPU may not).
-        let (render_node, resolved_device_path) = pci_address(&device_path)
-            .and_then(|addr| {
-                renderd_node_for_pci_addr_root(&addr, root)
-                    .map(|device| (format!("/dev/dri/by-path/pci-{addr}-render"), device))
-            })
-            .map_or((None, None), |(stable, device)| {
-                (Some(stable), Some(device))
-            });
 
         // `pci_addr` matters only on the NVIDIA path; the AMD sampler reads `sysfs_device`
         // directly and never matches by bus id.
@@ -1629,6 +1656,18 @@ stepping\t: 2
         std::fs::create_dir_all(&device_dir).unwrap();
         std::fs::write(device_dir.join("vendor"), "0x1002\n").unwrap();
         std::fs::write(device_dir.join("mem_info_vram_total"), "8589934592\n").unwrap();
+        let card_index: u32 = card_name.strip_prefix("card").unwrap().parse().unwrap();
+        fake_render_node_for_card(root, card_name, &format!("renderD{}", 128 + card_index));
+    }
+
+    fn fake_render_node_for_card(root: &std::path::Path, card_name: &str, render_name: &str) {
+        let render_dir = root.join(render_name);
+        std::fs::create_dir_all(&render_dir).unwrap();
+        std::os::unix::fs::symlink(
+            root.join(card_name).join("device"),
+            render_dir.join("device"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1639,6 +1678,7 @@ stepping\t: 2
         std::fs::write(device.join("vendor"), "0x1002\n").unwrap();
         std::fs::write(device.join("device"), "0x1636\n").unwrap();
         std::fs::write(device.join("mem_info_vram_total"), "8589934592\n").unwrap();
+        fake_render_node_for_card(dir.path(), "card0", "renderD128");
 
         let matched = crate::gpu_identity::VulkanDriver {
             vendor_id: 0x1002,
@@ -1672,6 +1712,7 @@ stepping\t: 2
         std::fs::create_dir_all(&device).unwrap();
         std::fs::write(device.join("vendor"), "0x8086\n").unwrap();
         std::fs::write(device.join("device"), "0x4692\n").unwrap();
+        fake_render_node_for_card(dir.path(), "card0", "renderD128");
 
         let (gpus, targets, status, reason) =
             detect_gpus_at(dir.path(), false, 16384, &test_identities(), &empty_lookup);
@@ -1758,6 +1799,7 @@ stepping\t: 2
             let card = dir.path().join("card0");
             std::fs::create_dir_all(card.join("device")).unwrap();
             std::fs::write(card.join("device/vendor"), "0x8086").unwrap();
+            fake_render_node_for_card(dir.path(), "card0", "renderD128");
             for (path, value) in *files {
                 let path = card.join(path);
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1970,14 +2012,50 @@ stepping\t: 2
         std::os::unix::fs::symlink(&device_target, render_dir.join("device")).unwrap();
     }
 
+    #[test]
+    fn host_inventory_omits_sysfs_gpu_without_accessible_render_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let drm_root = dir.path().join("class-drm");
+        std::fs::create_dir_all(&drm_root).unwrap();
+        fake_amd_card_with_render_node(&drm_root, "card0", "renderD128", "0000:01:00.0");
+        fake_amd_card_with_render_node(&drm_root, "card1", "renderD129", "0000:04:00.0");
+
+        // Both cards exist in the shared sysfs view. This agent can open only one
+        // render node in its private /dev, as on the GPU test containers.
+        let (gpus, targets, status, reason) = detect_gpus_at_with_access(
+            &drm_root,
+            false,
+            16384,
+            &test_identities(),
+            &empty_lookup,
+            &|node| node == std::path::Path::new("/dev/dri/renderD128"),
+        );
+        assert_eq!(status, "ok", "{reason:?}");
+        assert_eq!(gpus.len(), 1);
+        assert_eq!(gpus[0].device_path.as_deref(), Some("/dev/dri/renderD128"));
+        assert_eq!(
+            targets.len(),
+            1,
+            "VRAM sampling must use the same accessible inventory"
+        );
+
+        let (gpus, targets, status, _) = detect_gpus_at_with_access(
+            &drm_root,
+            false,
+            16384,
+            &test_identities(),
+            &empty_lookup,
+            &|_| false,
+        );
+        assert_eq!(status, "unavailable");
+        assert!(gpus.is_empty());
+        assert!(targets.is_empty());
+    }
+
     /// #276: a host pinned to one render node must not advertise encode slots on a second
     /// GPU it can never place a session onto — `schedulableBindingSQL` denies it for every
-    /// hardware encoder branch. Exercises the seam at `detect_gpus_at`, so it also covers the
-    /// "render node absent" shape: the second GPU's sysfs entry resolves to a `renderD*` path
-    /// that was never actually opened as a device (this repo's sandbox cannot fabricate a
-    /// missing `/dev` node either way — `apply_render_node_pin` only ever compares
-    /// `device_path` strings, so a stale/absent node behaves identically to a live
-    /// non-matching one: neither equals the configured pin).
+    /// hardware encoder branch. The permissive test access seam isolates pin behavior;
+    /// production inventory filters inaccessible render nodes before pinning.
     #[test]
     fn render_node_pin_zeroes_the_excluded_gpu_and_keeps_indices_stable() {
         let dir = tempfile::tempdir().unwrap();
@@ -2031,8 +2109,7 @@ stepping\t: 2
             "openh264 does not pin by render node; both GPUs keep their vendor stub"
         );
 
-        // A configured render node that matches no detected GPU (e.g. a stale by-path, or —
-        // per #276 — a `/sys/class/drm` entry the container's `/dev` never actually backed)
+        // A configured render node that matches no detected GPU (e.g. a stale by-path)
         // fails open rather than zeroing every GPU's capacity down to nothing.
         let lookup = crate::test_env::lookup(&[
             ("QUASAR_ENCODER", "va"),

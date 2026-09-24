@@ -30,6 +30,23 @@ type HomeProvider interface {
 // CoordinatorOption customizes NewCoordinator without breaking existing callers.
 type CoordinatorOption func(*Coordinator)
 
+// LazyImagePreparer prepares a lazy managed image (a catalog template to
+// build, or a prebuilt pinned to a digest to pull) on the reserved host before
+// the session is assigned to the agent. Eager and unmanaged images are no-ops.
+// A successful return requires a current authenticated ready observation, not
+// merely a command acceptance ack.
+type LazyImagePreparer interface {
+	PrepareLazyImage(ctx context.Context, hostID, imageRef string) error
+}
+
+func WithLazyImagePreparer(p LazyImagePreparer) CoordinatorOption {
+	return func(c *Coordinator) { c.lazyImages = p }
+}
+
+// SetLazyImagePreparer completes composition after the Ensurer is created.
+// The composition root calls it before accepting operator requests.
+func (c *Coordinator) SetLazyImagePreparer(p LazyImagePreparer) { c.lazyImages = p }
+
 // MicCaptureProvider is the mic-capture instance gate (migration 0049),
 // implemented by internal/settings.Store.MicCaptureEnabled. Read PER LAUNCH,
 // never cached, as LibraryDiscoveryEnabled is.

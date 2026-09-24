@@ -202,6 +202,12 @@ pub(super) async fn ensure_image(
     if let Some(info) = existing {
         return Ok(info);
     }
+    // Managed build tags are host-local outputs, not registry references. A
+    // missing tag must fail here rather than letting Docker resolve it as a
+    // remote repository.
+    if image.starts_with("quasar-local/") {
+        return Err(ErrorKind::Missing.into());
+    }
     let credentials = credentials::load(config, image).await?;
     journal.begin(Intent {
         image: image.into(),

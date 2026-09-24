@@ -25,6 +25,11 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **RH05 operator handoff and acceptance map (#346).** `docs/rh05/operator-handoff.md`
+  walks an operator through enrolled-host configuration, idle apply, placement, homes,
+  preparation and explicit cleanup, including the remedy when a failed Steam warmup holds
+  a hardware apply. `docs/rh05/acceptance-map.md` records the fixed-build result and the
+  remaining limits for every RH05 story.
 - **RH05 explicit managed-image cleanup (#345).** Admins can preview exact cached
   versions and protection reasons, then request generation-checked removal on a
   capable host. Durable attempts and per-host image fences block conflicting
@@ -298,9 +303,33 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **RH05 lazy managed-image first launch (#346).** A lazy adoption now launches
+  before any host reports it ready. After the launch is accepted, the control
+  plane prepares the image on the selected host with the adopted, frozen
+  inputs — a pull for a lazy prebuilt pinned to an image digest (including
+  after a confirmed cleanup of that digest), a build for a lazy template — and
+  assigns the session only after that host's current connection reports the
+  exact version ready. A lazy Steam image is therefore a managed image on the
+  host: its first home reports its seed outcome, and Steam template
+  preparation can proceed instead of waiting for an image report forever. A build failure, timeout, host reconnect or adoption change
+  fails only that session. A stop during the build ends it without a launch.
+  Eager images, tag references and templates without a resolved build context
+  still require prior readiness. A host whose earlier on-demand preparation
+  failed stays eligible, because the launch's own preparation is its only
+  retry. An active removal on the host blocks placement, and a pruned or
+  uninstalled image stays blocked after removal.
 - **GPU image validation recognizes accessible render nodes beyond `renderD128`.**
   The contract now runs its GPU assertions on hosts whose usable DRM node has a
   different number, while ignoring sysfs-only or inaccessible nodes.
+- **Host settings no longer show untouched settings as pending (#346).** A policy
+  group that has never been saved now reads "not saved · in effect" with its
+  deployment value instead of a PENDING badge. Saved groups awaiting verification and
+  hardware groups needing review still show pending with their remedy. The host policy
+  response gains an optional `saved` flag (additive protocol amendment).
+- **Missing local build tags are never pulled from a registry (#346).** The
+  agent refuses to pull an absent `quasar-local/` managed build tag, and the
+  launch fails instead. Previously Docker could resolve the name as a public
+  registry repository and run whatever it found there.
 - **A host no longer stays in diagnostic mode after its startup cleanup succeeds (#269).**
   The resume was published on a `watch` channel with `Sender::send`, which discards the
   value outright when no receiver happens to exist at that instant — and every waiter is a

@@ -172,6 +172,7 @@ type buildCall struct {
 type fakeFleet struct {
 	mu      sync.Mutex
 	hosts   []string
+	epoch   string
 	calls   []ensureCall
 	removes []removeCall
 	builds  []buildCall
@@ -190,9 +191,20 @@ type removeCall struct {
 
 func newFleet(hosts ...string) *fakeFleet {
 	return &fakeFleet{
-		hosts: hosts, ch: make(chan ensureCall, 64), rmCh: make(chan removeCall, 64),
+		hosts: hosts, epoch: "test-epoch-1", ch: make(chan ensureCall, 64), rmCh: make(chan removeCall, 64),
 		buildCh: make(chan buildCall, 64),
 	}
+}
+
+func (f *fakeFleet) ImageConnectionIdentity(hostID string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, id := range f.hosts {
+		if id == hostID {
+			return f.epoch, true
+		}
+	}
+	return "", false
 }
 
 func (f *fakeFleet) ConnectedHosts() []string {
