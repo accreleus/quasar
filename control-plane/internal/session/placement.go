@@ -109,9 +109,9 @@ func codecPreferenceOrderSQL(prefIdx int) string {
 }
 
 // imageReadySQL drops hosts where the app's managed image is not `ready`.
-// The one exception is a lazy on-demand adoption (lazyOnDemandSQL): the agent
-// pulls its pinned digest on the first assigned launch, so requiring a prior
-// ready report would prevent that assignment from ever reaching the agent.
+// The one exception is a lazy on-demand adoption (lazyOnDemandSQL): it is
+// prepared on its first launch, so requiring a prior ready report would
+// prevent that launch from ever being prepared.
 // A removing fence on the host still excludes it, even before the cleanup
 // attempt row exists; lockRequiredImageFence rechecks the same predicate.
 // refIdx carries the app's runtime_spec image reference.
@@ -157,19 +157,26 @@ func imageReadySQL(refIdx int) string {
 		removedManagedImageUnreadySQL("g.host_id", fmt.Sprintf("$%d", refIdx)))
 }
 
-// lazyOnDemandSQL is true when adoption row `alias` is a lazy prebuilt pinned
-// to an immutable digest and that digest is exactly the launch ref. Only such
-// a row may launch without a prior ready report. The agent's on-assignment
-// ensure re-pulls exactly those bits, so no readiness proof is skipped for
-// content that could differ. Lazy templates and tag refs are excluded: nothing
-// on the assignment path builds a template, and a tag can move.
+// lazyOnDemandSQL is true when adoption row `alias` is lazy and its first
+// launch prepares exactly the adopted content, so a prior ready report is not
+// required. Two shapes qualify:
+//   - a prebuilt whose registry_ref is an immutable digest equal to the launch
+//     ref: the agent's on-assignment ensure re-pulls exactly those bits;
+//   - a buildable template whose local_tag is the launch ref: the coordinator
+//     builds its frozen context and waits for a current authenticated ready
+//     report before assignment (images.Ensurer.PrepareLazyTemplate).
+//
+// A lazy tag ref is excluded because a tag can move.
 //
 // The host's reported state is deliberately ignored, `failed` included. Retry
-// refuses lazy images (ErrRetryLazy), so the assignment's own ensure is the
-// only thing that can recover a host whose earlier on-demand pull failed.
+// refuses lazy images (ErrRetryLazy), so the launch's own preparation is the
+// only thing that can recover a host whose earlier on-demand attempt failed.
 func lazyOnDemandSQL(alias, refExpr string) string {
-	return fmt.Sprintf(`(%[1]s.lazy AND %[1]s.registry_ref = %[2]s
-		AND %[1]s.registry_ref ~ '@sha256:[0-9a-f]{64}$')`, alias, refExpr)
+	return fmt.Sprintf(`(%[1]s.lazy AND (
+		(%[1]s.registry_ref = %[2]s AND %[1]s.registry_ref ~ '@sha256:[0-9a-f]{64}$')
+		OR (%[1]s.registry_ref = '' AND %[1]s.local_tag = %[2]s AND %[1]s.context_sha <> ''
+			AND EXISTS (SELECT 1 FROM image_catalog lc WHERE lc.id = %[1]s.image_id AND lc.kind = 'template'))))`,
+		alias, refExpr)
 }
 
 // lazyOnDemandAdmissionSQL filters the readiness subquery's adoption row `ii`:

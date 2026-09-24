@@ -116,6 +116,16 @@ func (r *Registry) SupportsTypedSettings(hostID string) bool {
 	return ok && c.policyTyped
 }
 
+// ImageConnectionIdentity identifies the current authenticated agent socket.
+// Image readiness from an earlier socket cannot authorize a new launch.
+func (r *Registry) ImageConnectionIdentity(hostID string) (string, bool) {
+	c, ok := r.get(hostID)
+	if !ok {
+		return "", false
+	}
+	return c.connectionIncarnation, true
+}
+
 func (r *Registry) PolicyIdentity(hostID string) (string, string, bool) {
 	c, ok := r.get(hostID)
 	if !ok || !c.policyTyped {

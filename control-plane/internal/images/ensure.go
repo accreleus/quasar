@@ -154,12 +154,48 @@ type Ensurer struct {
 	retryOpen map[string]bool
 	// Current-connection evidence is intentionally volatile. A stored ready or
 	// progress row from a previous connection cannot claim present preparation.
-	inventory map[string]*imageInventoryEvidence
+	inventory        map[string]*imageInventoryEvidence
+	lazyBuilds       map[string]*lazyBuild
+	lazyMu           sync.Mutex
+	lazyBuildTimeout time.Duration
 }
 
 type imageInventoryEvidence struct {
 	snapshot bool
 	observed map[string]bool
+	epoch    string
+	ready    map[string]string // image_id -> version, current authenticated connection only
+	failed   map[string]string // image_id -> version, current authenticated failure only
+	// live marks images with an image_state report on this connection. The
+	// register snapshot predates every live report, so it never overrides one.
+	live map[string]bool
+}
+
+func newImageInventoryEvidence(epoch string) *imageInventoryEvidence {
+	return &imageInventoryEvidence{epoch: epoch, observed: make(map[string]bool),
+		ready: make(map[string]string), failed: make(map[string]string), live: make(map[string]bool)}
+}
+
+// imageConnectionIdentity is deliberately optional on the test dispatcher;
+// production's Registry always supplies the authenticated socket incarnation.
+func (e *Ensurer) imageConnectionIdentity(hostID string) (string, bool) {
+	if e.disp == nil {
+		return "", false
+	}
+	if p, ok := e.disp.(interface{ ImageConnectionIdentity(string) (string, bool) }); ok {
+		return p.ImageConnectionIdentity(hostID)
+	}
+	for _, id := range e.disp.ConnectedHosts() {
+		if id == hostID {
+			return "test-connection", true
+		}
+	}
+	return "", false
+}
+
+type lazyBuild struct {
+	done chan struct{}
+	err  error
 }
 
 // SetJobEnqueuer wires the dispatcher so an image reaching `ready` enqueues a
@@ -222,6 +258,8 @@ func newEnsurer(pool dbPool, disp Dispatcher, log *slog.Logger, opts ...EnsureOp
 		unsupportedLogged: make(map[string]bool),
 		retryOpen:         make(map[string]bool),
 		inventory:         make(map[string]*imageInventoryEvidence),
+		lazyBuilds:        make(map[string]*lazyBuild),
+		lazyBuildTimeout:  defaultLazyBuildTimeout,
 	}
 	for _, o := range opts {
 		o(e)
@@ -245,8 +283,12 @@ func (e *Ensurer) CurrentImageEvidence(hostID, imageID string) (connected, obser
 	if !connected {
 		return false, false, false
 	}
+	epoch, current := e.imageConnectionIdentity(hostID)
+	if !current {
+		return false, false, false
+	}
 	e.mu.Lock()
-	if inv := e.inventory[hostID]; inv != nil {
+	if inv := e.inventory[hostID]; inv != nil && inv.epoch == epoch {
 		observed, snapshot = inv.observed[imageID], inv.snapshot
 	}
 	e.mu.Unlock()
@@ -254,26 +296,76 @@ func (e *Ensurer) CurrentImageEvidence(hostID, imageID string) (connected, obser
 }
 
 func (e *Ensurer) observeImage(hostID, imageID string) {
+	e.observeImageState(hostID, imageID, "", "")
+}
+
+func (e *Ensurer) observeImageState(hostID, imageID, version, state string) {
+	epoch, current := e.imageConnectionIdentity(hostID)
+	if !current {
+		return
+	}
 	e.mu.Lock()
 	inv := e.inventory[hostID]
-	if inv == nil {
-		inv = &imageInventoryEvidence{observed: make(map[string]bool)}
+	if inv == nil || inv.epoch != epoch {
+		inv = newImageInventoryEvidence(epoch)
 		e.inventory[hostID] = inv
 	}
 	inv.observed[imageID] = true
+	if state != "" {
+		inv.live[imageID] = true
+	}
+	if state == "ready" {
+		inv.ready[imageID] = version
+	} else if state != "" {
+		delete(inv.ready, imageID)
+	}
+	if state == "failed" {
+		inv.failed[imageID] = version
+	} else if state != "" {
+		delete(inv.failed, imageID)
+	}
 	e.mu.Unlock()
 }
 
 func (e *Ensurer) observeSnapshot(hostID string, imageIDs []string) {
+	e.observeSnapshotStates(hostID, nil, imageIDs, "")
+}
+
+func (e *Ensurer) observeSnapshotStates(hostID string, imgs []agentws.RegisterImage, imageIDs []string, expectedEpoch string) {
+	epoch, current := e.imageConnectionIdentity(hostID)
+	if !current || expectedEpoch != "" && epoch != expectedEpoch {
+		return
+	}
 	e.mu.Lock()
 	inv := e.inventory[hostID]
-	if inv == nil {
-		inv = &imageInventoryEvidence{observed: make(map[string]bool)}
+	if inv == nil || inv.epoch != epoch {
+		inv = newImageInventoryEvidence(epoch)
 		e.inventory[hostID] = inv
 	}
 	inv.snapshot = true
+	for id := range inv.ready {
+		if !inv.live[id] {
+			delete(inv.ready, id)
+		}
+	}
+	for id := range inv.failed {
+		if !inv.live[id] {
+			delete(inv.failed, id)
+		}
+	}
 	for _, imageID := range imageIDs {
 		inv.observed[imageID] = true
+	}
+	for _, img := range imgs {
+		if inv.live[img.ImageID] {
+			continue
+		}
+		if inv.observed[img.ImageID] && img.State == "ready" {
+			inv.ready[img.ImageID] = img.Version
+		}
+		if inv.observed[img.ImageID] && img.State == "failed" {
+			inv.failed[img.ImageID] = img.Version
+		}
 	}
 	e.mu.Unlock()
 }
@@ -712,7 +804,7 @@ func (e *Ensurer) AgentImageState(ctx context.Context, hostID string, m agentws.
 	if historyChanged && e.cleanup != nil {
 		e.cleanup.ManagedIdentityChanged(hostID)
 	}
-	e.observeImage(hostID, m.ImageID)
+	e.observeImageState(hostID, m.ImageID, m.Version, m.State)
 
 	key := hostID + "|" + m.ImageID
 	e.mu.Lock()
@@ -987,6 +1079,7 @@ func (e *Ensurer) AgentImagesRegistered(_ context.Context, hostID string, imgs [
 	if hostID == "" {
 		return
 	}
+	epoch, _ := e.imageConnectionIdentity(hostID)
 	// A fresh register clears the unsupported mark: a redeployed/upgraded agent
 	// must not stay branded forever over one pre-upgrade timeout.
 	e.mu.Lock()
@@ -1006,7 +1099,7 @@ func (e *Ensurer) AgentImagesRegistered(_ context.Context, hostID string, imgs [
 	go func() {
 		defer e.wg.Done()
 		if reported {
-			if err := e.reconcile(e.ctx, hostID, imgs); err != nil {
+			if err := e.reconcile(e.ctx, hostID, imgs, epoch); err != nil {
 				// A failed reconcile must not leave EnsureHost trusting stale
 				// host_images rows (a host reporting absent, whose demote never
 				// committed, would stay schedulable). Bypass the readiness check
@@ -1058,7 +1151,7 @@ func (e *Ensurer) dispatchAllAdopted(ctx context.Context, hostID string) {
 // commit together. A savepoint around each reported image lets an independent
 // valid image complete even if another image's history or inventory write
 // fails. The failed image is omitted from seen and cannot appear ready.
-func (e *Ensurer) reconcile(ctx context.Context, hostID string, imgs []agentws.RegisterImage) error {
+func (e *Ensurer) reconcile(ctx context.Context, hostID string, imgs []agentws.RegisterImage, expectedEpoch ...string) error {
 	tx, err := e.pool.Begin(ctx)
 	if err != nil {
 		e.log.Error("register images: begin transaction failed", "host_id", hostID, "err", err)
@@ -1155,7 +1248,11 @@ func (e *Ensurer) reconcile(ctx context.Context, hostID string, imgs []agentws.R
 	if historyChanged && e.cleanup != nil {
 		e.cleanup.ManagedIdentityChanged(hostID)
 	}
-	e.observeSnapshot(hostID, seen)
+	epoch := ""
+	if len(expectedEpoch) != 0 {
+		epoch = expectedEpoch[0]
+	}
+	e.observeSnapshotStates(hostID, imgs, seen, epoch)
 	for _, key := range clearKeys {
 		e.clearFailures(key)
 	}
