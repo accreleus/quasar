@@ -93,17 +93,18 @@ func (s *Store) ConfirmPolicyGroups(ctx context.Context, hostID, connectionID st
 	}
 	for _, group := range accepted {
 		if group == "hardware" {
-			// The zero-revision upgrade-required hardware row is a durable
-			// fresh-enrollment marker. Migration 0087 never backfills group rows,
-			// and a legacy edit increments the revision. Only confirmed RH05
-			// hardware ownership may turn this new installation's supported
-			// choices Automatic; existing hosts retain deployment intent.
+			// The untouched zero-revision upgrade-required hardware row is a
+			// durable fresh-enrollment marker. An unrelated typed edit may advance
+			// the global revision and persist other choices before hardware is
+			// confirmed; neither changes this group's install-time intent. A
+			// deliberate hardware edit advances this row and keeps its choices.
 			seeded, err := tx.Exec(ctx, `INSERT INTO host_setting_choices(host_id,key,source,revision)
 				SELECT $1::uuid,k.key,'automatic',0 FROM (VALUES ('encoder'),('render_node')) AS k(key)
-				WHERE EXISTS (SELECT 1 FROM host_setting_groups g JOIN host_policy_revisions r ON r.host_id=g.host_id
+				WHERE EXISTS (SELECT 1 FROM host_setting_groups g
 					WHERE g.host_id=$1::uuid AND g.group_key='hardware' AND g.desired_revision=0
-					AND g.scope='restart' AND g.status='upgrade_required' AND r.revision=0)
-				AND NOT EXISTS (SELECT 1 FROM host_setting_choices c WHERE c.host_id=$1::uuid)`, hostID)
+					AND g.scope='restart' AND g.status='upgrade_required')
+				AND NOT EXISTS (SELECT 1 FROM host_setting_choices c WHERE c.host_id=$1::uuid
+					AND c.key IN ('encoder','render_node','cuda_device'))`, hostID)
 			if err != nil {
 				return false, err
 			}

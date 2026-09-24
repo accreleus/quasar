@@ -69,6 +69,52 @@ func TestNewEnrollmentDefaultsSupportedHardwareToAutomatic(t *testing.T) {
 	}
 }
 
+func TestNewEnrollmentSeedsUntouchedHardwareAfterUnrelatedTypedEdit(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	store := &agentStore{pool: pool}
+	policy := hostcfg.NewStore(pool)
+	host, err := store.enrollHost(ctx, "automatic-after-idle-edit", "0.3.0", "token", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := "00000000-0000-4000-8000-000000000342"
+	if _, err := policy.BeginPolicyConnection(ctx, host.HostID, connection, map[string]int{"typed_settings": 2}, []string{"hardware", "idle_timeout_secs"}, true); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := policy.ConfirmPolicyGroups(ctx, host.HostID, connection, []string{"idle_timeout_secs"}); err != nil || !ok {
+		t.Fatalf("idle capability echo: ok=%v err=%v", ok, err)
+	}
+	if _, err := policy.SavePolicy(ctx, host.HostID, "0", map[string]hostcfg.PolicyChoice{
+		"idle_timeout_secs": {Source: "explicit", Value: float64(900)},
+	}, nil); err != nil {
+		t.Fatalf("unrelated typed policy edit: %v", err)
+	}
+	before, err := policy.GetPolicy(ctx, host.HostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Revision != "1" || before.Groups["hardware"].Status != "upgrade_required" ||
+		before.Choices["encoder"].Source != "deployment" {
+		t.Fatalf("hardware marker before echo: global revision=%s group=%+v encoder=%+v",
+			before.Revision, before.Groups["hardware"], before.Choices["encoder"])
+	}
+	if ok, err := policy.ConfirmPolicyGroups(ctx, host.HostID, connection, []string{"hardware", "idle_timeout_secs"}); err != nil || !ok {
+		t.Fatalf("hardware capability echo: ok=%v err=%v", ok, err)
+	}
+	after, err := policy.GetPolicy(ctx, host.HostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Revision != "1" || after.Choices["idle_timeout_secs"].Source != "explicit" ||
+		after.Choices["encoder"].Source != "automatic" || after.Choices["render_node"].Source != "automatic" ||
+		after.Choices["cuda_device"].Source != "deployment" || after.Groups["hardware"].Status != "pending" {
+		t.Fatalf("hardware after unrelated edit: global revision=%s group=%+v idle=%+v encoder=%+v render=%+v cuda=%+v",
+			after.Revision, after.Groups["hardware"], after.Choices["idle_timeout_secs"],
+			after.Choices["encoder"], after.Choices["render_node"], after.Choices["cuda_device"])
+	}
+}
+
 func TestCapabilityEchoDoesNotInferAutomaticOnExistingOrEditedHost(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
