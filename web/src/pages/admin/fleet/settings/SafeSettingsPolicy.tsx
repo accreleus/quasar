@@ -168,24 +168,34 @@ export function SafeSettingsPolicy({
       const resolved = view.resolved[knob.key];
       const draft = draftFor(knob.key);
       const verified = group.status === "applied" && group.fresh;
+      // A projected next-session group with no saved revision (#346) is the
+      // host's current deployment behaviour, not pending work. Restart groups
+      // keep their status and remedy: a projected hardware group still needs
+      // review and approval. An absent field means saved.
+      const unsaved = group.saved === false && group.status === "pending" && group.scope === "next_session"
+        && resolved?.source === "deployment";
       return <div key={knob.key} className="cset" role="group" aria-label={label}>
         <div>
           <h3 className="row gap2 center">
             {label}
-            <Chip variant={STATUS_CHIP[group.status] ?? "neutral"} className="chip-sm">{group.status.replaceAll("_", " ")}</Chip>
+            {unsaved
+              ? <Chip variant="neutral" className="chip-sm">not saved</Chip>
+              : <Chip variant={STATUS_CHIP[group.status] ?? "neutral"} className="chip-sm">{group.status.replaceAll("_", " ")}</Chip>}
           </h3>
           <p className="hint">{knobHelp(knob)}</p>
           <p className="hint" style={{ marginTop: 4 }}>
             {`${resolved?.source === "explicit" ? "Explicit value" : resolved?.source === "automatic" ? "Automatic choice" : "Deployment setting"} ${valueLabel((resolved?.value ?? undefined) as SettingValue | undefined)} · `}
             {verified
               ? `Verified on the current connection${group.observed_at ? ` at ${new Date(group.observed_at).toLocaleString()}` : ""}`
-              : "Not yet verified"}
+              : unsaved ? "In effect · not saved as a host policy" : "Not yet verified"}
           </p>
           <p className="hint">
-            Desired revision {group.desired_revision} · applied revision {group.applied_revision ?? "none"} · {group.scope.replaceAll("_", " ")}
+            {unsaved
+              ? `No policy revision saved · ${group.scope.replaceAll("_", " ")}`
+              : `Desired revision ${group.desired_revision} · applied revision ${group.applied_revision ?? "none"} · ${group.scope.replaceAll("_", " ")}`}
           </p>
           {group.scope === "restart" && group.approval_preview?.available && <p className="hint">Current hardware evidence supports {Object.entries(group.approval_preview.resolved).map(([key, value]) => `${key}: ${valueLabel(value as SettingValue)}`).join(", ")}. Review the evidence below before idle approval.</p>}
-          {group.remedy && <p className="hint" style={{ marginTop: 4 }}>{remedyText(group.remedy)}</p>}
+          {group.remedy && !unsaved && <p className="hint" style={{ marginTop: 4 }}>{remedyText(group.remedy)}</p>}
           {group.next_retry_at && <p className="hint">Next retry {new Date(group.next_retry_at).toLocaleTimeString()}</p>}
         </div>
         <div>

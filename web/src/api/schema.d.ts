@@ -8701,6 +8701,8 @@ export interface components {
             scope: "next_session" | "restart";
             /** @enum {string} */
             status: "pending" | "applied" | "failed" | "upgrade_required" | "uncertain";
+            /** @description True when a group record is persisted for this host (including the install-time hardware record). False when projected; status, remedy and approval_preview are unchanged. Absent from older servers: treat as true. */
+            saved?: boolean;
             /** @description Whether the evidence still matches the current agent and prerequisites. */
             fresh: boolean;
             /** Format: date-time */

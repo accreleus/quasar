@@ -44,6 +44,25 @@ function renderPolicy(onOwnedKeys = vi.fn()) {
 describe("safe next-session settings", () => {
   beforeEach(() => { vi.clearAllMocks(); vi.mocked(api.getHostPolicy).mockResolvedValue(view() as never); });
 
+  it("presents a never-saved group as in-effect deployment behaviour, not pending work (#346)", async () => {
+    vi.mocked(api.getHostPolicy).mockResolvedValue(view({
+      abr_mode: group("pending", { saved: false, desired_revision: "0", desired_digest: null,
+        remedy: "No RH05 policy change has been saved for this group. Current host behavior has not been verified through this policy." }),
+      zerocopy: group("pending", { saved: true, remedy: "Waiting for the host to verify the next-session setting." }),
+    }) as never);
+    renderPolicy();
+    const mode = await screen.findByRole("group", { name: "Adaptation mode" });
+    expect(within(mode).getByText("not saved")).toBeTruthy();
+    expect(within(mode).queryByText("pending")).toBeNull();
+    expect(within(mode).getByText(/Deployment setting smooth · In effect · not saved as a host policy/)).toBeTruthy();
+    expect(within(mode).getByText(/No policy revision saved · next session/)).toBeTruthy();
+    expect(within(mode).queryByText(/No RH05 policy change has been saved/)).toBeNull();
+    // A saved group awaiting verification is still genuinely pending.
+    const zerocopy = screen.getByRole("group", { name: /zero-copy/i });
+    expect(within(zerocopy).getByText("pending")).toBeTruthy();
+    expect(within(zerocopy).getByText(/Waiting for the host to verify/)).toBeTruthy();
+  });
+
   it("shows provenance, freshness and desired/applied scope per typed group, excluding restart and unowned keys", async () => {
     const onOwnedKeys = renderPolicy();
     const gop = await screen.findByRole("group", { name: "GOP length" });
@@ -59,6 +78,19 @@ describe("safe next-session settings", () => {
     expect(screen.queryByRole("group", { name: "Encoder slices" })).toBeNull();
     expect(screen.queryByRole("option", { name: /Automatic/ })).toBeNull();
     await waitFor(() => expect(onOwnedKeys).toHaveBeenLastCalledWith(new Set(["gop", "abr_mode", "zerocopy"])));
+  });
+
+  it("keeps a projected hardware group pending with its approval remedy (#346)", async () => {
+    const hardware = group("pending", { scope: "restart", saved: false, desired_digest: null, approval_preview: {
+      available: true, resolved: { encoder: "vulkan", render_node: "/dev/dri/renderD129" },
+    }, remedy: "Review the resolved hardware candidate and its evidence, then approve an idle restart." });
+    vi.mocked(api.getHostPolicy).mockResolvedValue(view({ hardware }) as never);
+    renderPolicy();
+    const encoder = await screen.findByRole("group", { name: "Encoder" });
+    expect(within(encoder).getByText("pending")).toBeTruthy();
+    expect(within(encoder).queryByText("not saved")).toBeNull();
+    expect(within(encoder).getByText(/approve an idle restart/)).toBeTruthy();
+    expect(within(encoder).getByText(/Desired revision 4 · applied revision none · restart/)).toBeTruthy();
   });
 
   it("lets an operator save Automatic hardware through the revisioned writer", async () => {

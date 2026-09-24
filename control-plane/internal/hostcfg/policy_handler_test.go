@@ -69,6 +69,11 @@ func TestInitialIdlePolicyEditorsRaceAtRevisionZero(t *testing.T) {
 			if err := json.Unmarshal(rr.Body.Bytes(), &conflict); err != nil || conflict.Current.Revision != "1" {
 				t.Fatalf("stale editor lacks current view: %s err=%v", rr.Body.String(), err)
 			}
+			// The winner persisted a revision, so the group is no longer a
+			// projection of deployment behaviour (#346 saved field).
+			if !conflict.Current.Groups["idle_timeout_secs"].Saved {
+				t.Fatalf("saved group still reported unsaved: %+v", conflict.Current.Groups["idle_timeout_secs"])
+			}
 		default:
 			t.Fatalf("unexpected race response: %d %s", rr.Code, rr.Body.String())
 		}
@@ -106,7 +111,7 @@ func TestInitialIdlePolicyReadDoesNotClaimMissingDeploymentBaseline(t *testing.T
 		t.Fatal(err)
 	}
 	group := view.Groups["idle_timeout_secs"]
-	if view.Revision != "0" || group.Status != "pending" || group.DesiredDigest != nil || group.Remedy == nil || !strings.Contains(*group.Remedy, "No RH05 policy change has been saved") || strings.Contains(*group.Remedy, "baseline_unavailable") {
+	if view.Revision != "0" || group.Status != "pending" || group.Saved || group.DesiredDigest != nil || group.Remedy == nil || !strings.Contains(*group.Remedy, "No RH05 policy change has been saved") || strings.Contains(*group.Remedy, "baseline_unavailable") {
 		t.Fatalf("initial policy read falsely requests baseline refresh: %+v", group)
 	}
 	var rowCount int

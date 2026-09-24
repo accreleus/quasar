@@ -321,6 +321,11 @@ own; the two do not move together, and that is deliberate.
 - **GPU image validation recognizes accessible render nodes beyond `renderD128`.**
   The contract now runs its GPU assertions on hosts whose usable DRM node has a
   different number, while ignoring sysfs-only or inaccessible nodes.
+- **Host settings no longer show untouched settings as pending (#346).** A policy
+  group that has never been saved now reads "not saved · in effect" with its
+  deployment value instead of a PENDING badge. Saved groups awaiting verification and
+  hardware groups needing review still show pending with their remedy. The host policy
+  response gains an optional `saved` flag (additive protocol amendment).
 - **Missing local build tags are never pulled from a registry (#346).** The
   agent refuses to pull an absent `quasar-local/` managed build tag, and the
   launch fails instead. Previously Docker could resolve the name as a public
