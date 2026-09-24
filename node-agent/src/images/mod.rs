@@ -46,6 +46,7 @@ struct CleanupState {
     snapshot_lock: Mutex<()>,
     connection_epoch: AtomicU64,
     reconcile_lock: Mutex<()>,
+    reconcile_request_sequence: AtomicU64,
     scanner: Arc<InventoryScanner>,
 }
 
@@ -415,6 +416,7 @@ impl ImageManager {
                     snapshot_lock: Mutex::new(()),
                     connection_epoch: AtomicU64::new(0),
                     reconcile_lock: Mutex::new(()),
+                    reconcile_request_sequence: AtomicU64::new(0),
                     scanner: Arc::new(scan_inventory),
                 })),
                 (journal, inventory) => {
@@ -1059,7 +1061,18 @@ impl ImageManager {
         let Some(cleanup) = &self.cleanup else {
             return Some(ack(id, false, Some("unsupported".into())));
         };
-        let epoch = cleanup.connection_epoch.load(Ordering::SeqCst);
+        // Issuing and applying requests share this short critical section. A
+        // completed older scan cannot apply after a newer request is issued.
+        let (epoch, request_sequence) = {
+            let _guard = cleanup.reconcile_lock.lock().unwrap();
+            (
+                cleanup.connection_epoch.load(Ordering::SeqCst),
+                cleanup
+                    .reconcile_request_sequence
+                    .fetch_add(1, Ordering::SeqCst)
+                    + 1,
+            )
+        };
         // Pin the reply to the socket that received this command. A scan which
         // outlives reconnect cannot publish a stale snapshot into the new epoch.
         let sender = self.upstream.read().unwrap().clone();
@@ -1069,26 +1082,36 @@ impl ImageManager {
                 return;
             };
             let scanned = (cleanup.scanner)();
-            let (image_versions_complete, image_versions, revision) = {
+            let snapshot = {
                 let _reconcile_guard = cleanup.reconcile_lock.lock().unwrap();
                 if cleanup.connection_epoch.load(Ordering::SeqCst) != epoch {
                     return;
                 }
-                cleanup.inventory.mark_authority_received();
-                let result = scanned.and_then(|(daemon, containers)| {
-                    cleanup
-                        .inventory
-                        .reconcile(&identities, &daemon, &containers)
-                        .map_err(|e| e.to_string())
-                });
-                if let Err(error) = result {
-                    warn!(token = "image-inventory-reconcile-failed", "{error}");
-                    cleanup.inventory.revoke();
+                if cleanup.reconcile_request_sequence.load(Ordering::SeqCst) != request_sequence {
+                    None
+                } else {
+                    cleanup.inventory.mark_authority_received();
+                    let result = scanned.and_then(|(daemon, containers)| {
+                        cleanup
+                            .inventory
+                            .reconcile(&identities, &daemon, &containers)
+                            .map_err(|e| e.to_string())
+                    });
+                    if let Err(error) = result {
+                        warn!(token = "image-inventory-reconcile-failed", "{error}");
+                        cleanup.inventory.revoke();
+                    }
+                    let _snapshot_guard = cleanup.snapshot_lock.lock().unwrap();
+                    let (complete, versions) = cleanup.inventory.snapshot();
+                    let revision = cleanup.revision.fetch_add(1, Ordering::SeqCst) + 1;
+                    Some((complete, versions, revision))
                 }
-                let _snapshot_guard = cleanup.snapshot_lock.lock().unwrap();
-                let (complete, versions) = cleanup.inventory.snapshot();
-                let revision = cleanup.revision.fetch_add(1, Ordering::SeqCst) + 1;
-                (complete, versions, revision)
+            };
+            let Some((image_versions_complete, image_versions, revision)) = snapshot else {
+                if let Some(sender) = sender {
+                    let _ = sender.blocking_send(ack(id, false, Some("superseded".into())));
+                }
+                return;
             };
             // A full or stalled old socket must not block begin_connection.
             if let Some(sender) = sender {
@@ -1928,6 +1951,7 @@ mod tests {
             snapshot_lock: Mutex::new(()),
             connection_epoch: AtomicU64::new(0),
             reconcile_lock: Mutex::new(()),
+            reconcile_request_sequence: AtomicU64::new(0),
             scanner: Arc::new(scanner),
         }));
         let (tx, mut rx) = mpsc::channel(8);
@@ -2005,6 +2029,7 @@ mod tests {
             snapshot_lock: Mutex::new(()),
             connection_epoch: AtomicU64::new(0),
             reconcile_lock: Mutex::new(()),
+            reconcile_request_sequence: AtomicU64::new(0),
             scanner: Arc::new(|| Ok((Vec::new(), Vec::new()))),
         }));
         let (tx, mut rx) = mpsc::channel(8);
@@ -2033,6 +2058,7 @@ mod tests {
             snapshot_lock: Mutex::new(()),
             connection_epoch: AtomicU64::new(0),
             reconcile_lock: Mutex::new(()),
+            reconcile_request_sequence: AtomicU64::new(0),
             scanner: Arc::new(|| Ok((Vec::new(), Vec::new()))),
         }));
         let (tx, rx) = mpsc::channel(1);
@@ -2056,6 +2082,104 @@ mod tests {
         drop(rx); // release any blocked sender before failing the assertion
         assert!(returned.is_ok());
         reconnect.join().unwrap();
+    }
+
+    #[test]
+    fn older_overlapping_scan_cannot_replace_newer_verified_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let image_ref = "ghcr.io/x/steam:sha-1234567";
+        let identity = ImageIdentity {
+            image_id: "steam".into(),
+            version: "v1".into(),
+            image_ref: image_ref.into(),
+        };
+        let (first_entered_tx, first_entered_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let release_first_rx = Mutex::new(release_first_rx);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let scanner = move || {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                first_entered_tx.send(()).unwrap();
+                release_first_rx.lock().unwrap().recv().unwrap();
+                Ok((Vec::new(), Vec::new()))
+            } else {
+                Ok((
+                    vec![crate::runtime::DaemonImage {
+                        id: "sha256:newer".into(),
+                        refs: vec![image_ref.into()],
+                    }],
+                    Vec::new(),
+                ))
+            }
+        };
+        let mut manager = mgr();
+        Arc::get_mut(&mut manager).unwrap().cleanup = Some(Arc::new(CleanupState {
+            journal: CleanupJournal::open(dir.path().join("cleanup.json")).unwrap(),
+            inventory: VersionInventory::open(dir.path().join("versions.json")).unwrap(),
+            revision: AtomicU64::new(0),
+            snapshot_lock: Mutex::new(()),
+            connection_epoch: AtomicU64::new(0),
+            reconcile_lock: Mutex::new(()),
+            reconcile_request_sequence: AtomicU64::new(0),
+            scanner: Arc::new(scanner),
+        }));
+        let (tx, mut rx) = mpsc::channel(8);
+        let _guard = manager.attach_upstream(tx);
+        let _initial = rx.try_recv().unwrap();
+        assert!(manager
+            .handle_inventory_reconcile("first".into(), vec![identity.clone()])
+            .is_none());
+        first_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(manager
+            .handle_inventory_reconcile("second".into(), vec![identity])
+            .is_none());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut messages = Vec::new();
+        while messages.len() < 2 && Instant::now() < deadline {
+            if let Ok(msg) = rx.try_recv() {
+                messages.push(serde_json::to_value(msg).unwrap());
+            } else {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        release_first_tx.send(()).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["type"], "ack");
+        assert_eq!(messages[0]["id"], "second");
+        assert_eq!(messages[0]["ok"], true);
+        assert_eq!(messages[1]["type"], "image_versions_state");
+        assert_eq!(messages[1]["inventory_revision"], "2");
+        assert_eq!(messages[1]["image_versions_complete"], true);
+        assert_eq!(messages[1]["image_versions"][0]["state"], "present");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let old_ack = loop {
+            if let Ok(msg) = rx.try_recv() {
+                break serde_json::to_value(msg).unwrap();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "superseded command must be acked"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(old_ack["type"], "ack");
+        assert_eq!(old_ack["id"], "first");
+        assert_eq!(old_ack["ok"], false);
+        assert!(rx.try_recv().is_err(), "old scan must not emit a snapshot");
+        let (complete, entries) = manager.version_snapshot();
+        assert!(complete);
+        assert_eq!(entries[0].state, "present");
+        assert_eq!(
+            manager
+                .cleanup
+                .as_ref()
+                .unwrap()
+                .revision
+                .load(Ordering::SeqCst),
+            2
+        );
     }
 
     fn ensure(version: &str, registry_ref: &str) -> ImageOp {
