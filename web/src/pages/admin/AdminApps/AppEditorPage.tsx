@@ -47,6 +47,7 @@ import {
   type DraftErrors,
 } from "./editor/appDraft";
 import { activeEditorTab, editorSubtitle, editorTabs, imagePresence } from "./editor/editorTabs";
+import { parseSpec } from "./runtimeSpec";
 
 const TAB_LABEL: Record<string, string> = {
   identity: "Identity",
@@ -155,6 +156,16 @@ export function AppEditorPage() {
     setPlacementDraft(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadedId]);
+
+  // A derived tile launches with its parent's runtime, so that is the image
+  // its hosts prepare; null until the parent is loaded.
+  const placementSource = parentId ? (parent.data ?? null) : app;
+  const placementImage = placementSource
+    ? {
+        ref: parseSpec(placementSource.runtime_spec ?? {}).image,
+        runtimePresetId: placementSource.runtime_preset_id ?? "",
+      }
+    : null;
 
   const grants = (entitlements.data ?? []).filter((e) => e.subject_type === "user");
   const tabs = editorTabs({
@@ -323,6 +334,7 @@ export function AppEditorPage() {
               <PlacementTab
                 appId={app.id}
                 parent={parent.data ? { id: parent.data.id, name: parent.data.name } : null}
+                image={placementImage}
                 draft={placementDraft}
                 setDraft={setPlacementDraft}
               />

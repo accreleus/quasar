@@ -14,14 +14,34 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import * as adminApi from "../../../../api/admin";
 import { ApiError } from "../../../../api/client";
-import type { AppPlacement, AppPlacementHost, AppPlacementMode, Host } from "../../../../api/types";
+import { useAuth } from "../../../../auth/context";
+import type {
+  AppPlacement,
+  AppPlacementHost,
+  AppPlacementMode,
+  CatalogImage,
+  Host,
+} from "../../../../api/types";
 import { Button } from "../../../../components/Button";
 import { Chip, type ChipVariant } from "../../../../components/Chip";
 import { ResourceStates } from "../../../../components/ResourceStates";
 import { SegmentedControl } from "../../../../components/SegmentedControl";
 import { useAdminAction } from "../../../../lib/resource/action";
 import { useResource } from "../../../../lib/resource/react";
+import {
+  AWAITING_PREPARATION,
+  hostImageLine,
+  placementImage,
+  placementReason,
+  type PlacementImage,
+  type PlacementImageRef,
+} from "./placementImage";
 import { Section } from "./primitives";
+
+export type { PlacementImageRef } from "./placementImage";
+
+/** Preparation is progress, so both reads refresh while the tab is open. */
+const POLL_MS = 5000;
 
 export interface PlacementDraft {
   mode: AppPlacementMode;
@@ -37,6 +57,8 @@ interface PlacementTabProps {
   /** The parent tile when this app is derived; used for its name and link.
    *  The placement read's `inherited_from` is what decides read-only. */
   parent: { id: string; name: string } | null;
+  /** Null while unknown; no managed/unmanaged claim is made without it. */
+  image?: PlacementImageRef | null;
 }
 
 const STALE_COPY =
@@ -79,14 +101,83 @@ function stateChip(label: string, value: boolean | null | undefined, noVariant: 
   );
 }
 
-function HostStates({ obs }: { obs: AppPlacementHost | null }) {
+function HostStates({ obs, unmanaged }: { obs: AppPlacementHost | null; unmanaged: boolean }) {
   return (
     <div className="row gap2" aria-label="Host state">
       {stateChip("Selected", obs?.selected ?? null, "neutral")}
-      {stateChip("Prepared", obs?.prepared ?? null, "warning")}
+      {unmanaged ? (
+        <Chip variant="neutral" className="chip-sm">
+          not managed
+        </Chip>
+      ) : (
+        stateChip("Prepared", obs?.prepared ?? null, "warning")
+      )}
       {stateChip("Ready", obs?.ready ?? null, "warning")}
     </div>
   );
+}
+
+function HostDetail({ obs, prep, retry, retrying }: { obs: AppPlacementHost | null; prep: PlacementImage; retry: (hostId: string, imageId: string) => void; retrying: boolean }) {
+  // Only a host that may start the app needs the image; elsewhere it is noise.
+  const line = prep.kind === "managed" && obs?.selected ? hostImageLine(prep.image, obs.host_id) : null;
+  // The image line says more than the generic "not prepared" reason; any other
+  // reason is its own fact and stays.
+  const reason =
+    obs?.reason && !(line && obs.reason === AWAITING_PREPARATION) ? placementReason(obs.reason) : null;
+  return (
+    <>
+      {line && prep.kind === "managed" && (
+        <div className="ae-item-m">
+          {line.text}
+          {line.error ? `: ${line.error}` : ""}
+          {line.actionable && (
+            <>
+              {" "}
+              <Link to={`/admin/library/images/${prep.image.id}`}>
+                Open {prep.image.display_name}
+              </Link>
+            </>
+          )}
+          {obs?.selected && obs.reason === "preparation_failed" && (
+            <Button variant="ghost" disabled={retrying} onClick={() => retry(obs.host_id, prep.image.id)}>
+              {retrying ? "Scheduling…" : "Retry preparation"}
+            </Button>
+          )}
+        </div>
+      )}
+      {reason && <div className="ae-item-m">{reason}</div>}
+    </>
+  );
+}
+
+function ImageNote({ prep }: { prep: PlacementImage }) {
+  if (prep.kind === "managed") {
+    const { image } = prep;
+    return (
+      <span className="hint">
+        Prepared follows the catalog image{" "}
+        <Link to={`/admin/library/images/${image.id}`}>{image.display_name}</Link>
+        {image.installed_version ? ` (version ${image.installed_version})` : ""} on each selected
+        host.
+        {image.lazy ? " It is installed to download on first launch, not ahead of time." : ""}
+      </span>
+    );
+  }
+  if (prep.kind === "unmanaged") {
+    return (
+      <div className="note">
+        <div>
+          This app&rsquo;s image{prep.ref && " "}
+          {prep.ref && <span className="mono">{prep.ref}</span>} is not installed from the image
+          catalog, so Quasar does not prepare it on hosts and Prepared reads not managed rather
+          than a failure. A selected host fetches it itself when a session starts there, and that
+          launch fails if the host cannot. To have Quasar prepare it ahead of time, install it
+          from <Link to="/admin/library/images">Images</Link> and use that image for this app.
+        </div>
+      </div>
+    );
+  }
+  return null;
 }
 
 const STATES_NOTE = (
@@ -108,14 +199,28 @@ const LOCALITY_NOTE = (
   </div>
 );
 
-export function PlacementTab({ appId, parent, draft, setDraft }: PlacementTabProps) {
+export function PlacementTab({ appId, parent, image = null, draft, setDraft }: PlacementTabProps) {
+  const { token } = useAuth();
   const placement = useResource<AppPlacement>(
-    { label: "placement", fetch: (ctx) => adminApi.getAppPlacement(ctx.token, appId) },
+    {
+      label: "placement",
+      fetch: (ctx) => adminApi.getAppPlacement(ctx.token, appId),
+      pollMs: POLL_MS,
+    },
     [appId],
   );
   const hosts = useResource<Host[]>(
     { label: "hosts", initialData: [], fetch: (ctx) => adminApi.listAllHosts(ctx.token) },
     [],
+  );
+  const hasImage = image != null;
+  const images = useResource<CatalogImage[]>(
+    {
+      label: "images",
+      fetch: async (ctx) => (hasImage ? (await adminApi.listImages(ctx.token)).images : []),
+      pollMs: hasImage ? POLL_MS : undefined,
+    },
+    [hasImage],
   );
   // null = untouched, so a refreshed read shows through until the first edit.
   const [conflict, setConflict] = useState<string | null>(null);
@@ -174,6 +279,21 @@ export function PlacementTab({ appId, parent, draft, setDraft }: PlacementTabPro
     },
   );
 
+  const retryAction = useAdminAction<[string, string], void>(
+    async (hostId, imageId) => {
+      if (!token) throw new Error("Sign in to retry image preparation.");
+      await adminApi.retryHostImage(token, hostId, imageId);
+      // The 202 already accepted the retry. A following read failure must
+      // not report that the retry itself failed; polling will converge.
+      void images.refresh({ silent: true });
+      void placement.refresh({ silent: true });
+    },
+    {
+      success: "Image retry scheduled",
+      failure: (e) => e instanceof ApiError ? e.message : "Could not retry image preparation.",
+    },
+  );
+
   if (!data || !current) {
     return (
       <Section title="Placement" desc="Which hosts may start new sessions of this app.">
@@ -183,6 +303,20 @@ export function PlacementTab({ appId, parent, draft, setDraft }: PlacementTabPro
   }
 
   const rows = hostRows(data, hosts.data ?? []);
+  // A failed catalog read leaves `data` undefined, or stale from an earlier
+  // tick; only a current read may call the image unmanaged.
+  const prep = placementImage(image, images.errorMessage ? undefined : images.data, data);
+  const unmanaged = prep.kind === "unmanaged";
+  const imageStates = (
+    <>
+      <ImageNote prep={prep} />
+      {hasImage && <ResourceStates loading={false} error={images.errorMessage} />}
+    </>
+  );
+  const retry = (hostId: string, imageId: string) => {
+    if (retryAction.pending) return;
+    void retryAction.run(hostId, imageId);
+  };
 
   if (data.inherited_from) {
     const parentId = data.inherited_from;
@@ -209,14 +343,15 @@ export function PlacementTab({ appId, parent, draft, setDraft }: PlacementTabPro
               ? "The parent allows no host, so this tile cannot be launched."
               : `The parent allows only the ${data.host_ids.length === 1 ? "host" : `${data.host_ids.length} hosts`} marked Selected below.`}
         </p>
+        {imageStates}
         <div className="ae-list">
           {rows.map((r) => (
             <div key={r.id} className="ae-item">
               <div>
                 <div className="ae-item-t">{r.name}</div>
-                {r.obs?.reason && <div className="ae-item-m">{r.obs.reason}</div>}
+                <HostDetail obs={r.obs} prep={prep} retry={retry} retrying={retryAction.pending?.[0] === r.id} />
               </div>
-              <HostStates obs={r.obs} />
+              <HostStates obs={r.obs} unmanaged={unmanaged} />
             </div>
           ))}
         </div>
@@ -265,6 +400,7 @@ export function PlacementTab({ appId, parent, draft, setDraft }: PlacementTabPro
           : "Fixed: only the ticked hosts. A host added later is not used until you tick it."}
       </span>
       <ResourceStates loading={false} error={hosts.errorMessage} />
+      {imageStates}
       <div className="ae-list">
         {rows.length === 0 ? (
           <span className="hint">No hosts are registered yet.</span>
@@ -285,9 +421,9 @@ export function PlacementTab({ appId, parent, draft, setDraft }: PlacementTabPro
                 ) : (
                   <div className="ae-item-t">{r.name}</div>
                 )}
-                {r.obs?.reason && <div className="ae-item-m">{r.obs.reason}</div>}
+                <HostDetail obs={r.obs} prep={prep} retry={retry} retrying={retryAction.pending?.[0] === r.id} />
               </div>
-              <HostStates obs={r.obs} />
+              <HostStates obs={r.obs} unmanaged={unmanaged} />
             </div>
           ))
         )}

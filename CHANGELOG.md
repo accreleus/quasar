@@ -25,6 +25,10 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **RH05 selected-app image preparation (#343).** Selected hosts reconcile the
+  immutable adopted managed image required by their apps, with per-app
+  preparation status, bounded failure retry, and durable successful-version
+  identity for later cleanup.
 - **RH05 app placement (#342).** Admins can set dynamic or fixed host eligibility
   per canonical app with revision-checked edits and separate selected, prepared,
   and ready status. Derived tiles inherit their parent's placement. Session
