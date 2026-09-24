@@ -48,7 +48,6 @@ const (
 type Dispatcher interface {
 	ConnectedHosts() []string
 	SendImageEnsure(ctx context.Context, hostID, id, imageID, registryRef, version string) (agentws.AckResult, error)
-	SendImageRemove(ctx context.Context, hostID, id, imageID string) (agentws.AckResult, error)
 	// SendImageBuild is the template analogue of image_ensure (P4).
 	SendImageBuild(ctx context.Context, hostID, id, imageID, contextURL, contextSubdir, dockerfile string, buildArgs map[string]string, localTag, version string) (agentws.AckResult, error)
 }
@@ -137,10 +136,9 @@ type Ensurer struct {
 	// Epoch invalidates old automatic backoff timers when an operator retries,
 	// the image succeeds, or a newer failure starts another timer.
 	retryEpoch map[string]uint64
-	// pending/active serialize ensure and remove for one (host|image) target
+	// pending/active serialize ensures for one (host|image) target
 	// through a single worker (`pending` = latest desired op, `active` = a
-	// worker is draining it) — otherwise a remove could overtake an in-flight
-	// ensure and leave the image present post-uninstall.
+	// worker is draining it) so retries cannot overtake an in-flight ensure.
 	pending map[string]*pendingOp
 	active  map[string]bool
 	// unsupported marks a host whose agent let an image_ensure ack time out.
@@ -356,60 +354,15 @@ func (e *Ensurer) EnsureImage(_ context.Context, imageID string) {
 	}
 }
 
-// RemoveImage dispatches a best-effort image_remove to each connected host in
-// hostIDs (P3 uninstall — `DELETE /v1/admin/images/{id}/install`). Best effort
-// by contract: the agent never force-removes an image backing a live
-// container, and an offline host just keeps it until reaped later.
-func (e *Ensurer) RemoveImage(_ context.Context, imageID string, hostIDs []string) {
-	if e.disp == nil || imageID == "" {
-		return
-	}
-	// A just-accepted ensure may not have emitted image_state yet, so the DB
-	// inventory snapshot alone misses it. Serialize a remove behind every
-	// active/queued ensure for this image as well as every known cached host.
-	targets := make(map[string]bool, len(hostIDs))
-	for _, hostID := range hostIDs {
-		targets[hostID] = true
-	}
-	e.mu.Lock()
-	for key := range e.active {
-		if strings.HasSuffix(key, "|"+imageID) {
-			targets[strings.TrimSuffix(key, "|"+imageID)] = true
-		}
-	}
-	e.mu.Unlock()
-	connected := make(map[string]bool)
-	for _, h := range e.disp.ConnectedHosts() {
-		connected[h] = true
-	}
-	for hostID := range targets {
-		if !connected[hostID] {
-			continue
-		}
-		e.clearFailures(hostID + "|" + imageID) // image no longer adopted; drop its retry budget
-		e.dispatchRemove(hostID, imageID)
-	}
-}
-
 // pendingOp is the latest desired action for one (host|image) target.
-// remove=false is an ensure carrying the adopted image; remove=true is an
-// uninstall's image_remove.
 type pendingOp struct {
-	remove bool
-	force  bool           // explicit or bounded retry may resume a current failed row
-	img    installedImage // valid when !remove
-}
-
-// dispatchRemove enqueues an image_remove, serialized behind any in-flight
-// ensure for the same target so a remove can never overtake it.
-func (e *Ensurer) dispatchRemove(hostID, imageID string) {
-	e.enqueue(hostID, imageID, pendingOp{remove: true})
+	force bool // explicit or bounded retry may resume a current failed row
+	img   installedImage
 }
 
 // enqueue records op as the latest desired action for (host|image) and starts a
-// worker if one isn't already running. Latest-write-wins lets an uninstall
-// supersede a queued ensure; the worker re-reads `pending` after each op, so a
-// remove enqueued mid-ensure still runs right after.
+// worker if one isn't already running. Latest-write-wins lets a retry
+// supersede queued ordinary work; the worker re-reads `pending` after each op.
 func (e *Ensurer) enqueue(hostID, imageID string, op pendingOp) {
 	key := hostID + "|" + imageID
 	e.mu.Lock()
@@ -451,11 +404,7 @@ func (e *Ensurer) drainTarget(hostID, imageID, key string) {
 		delete(e.pending, key)
 		e.mu.Unlock()
 
-		if op.remove {
-			e.runRemove(hostID, imageID)
-		} else {
-			e.runEnsure(hostID, imageID, op.img, op.force)
-		}
+		e.runEnsure(hostID, imageID, op.img, op.force)
 	}
 }
 
@@ -520,36 +469,6 @@ func (e *Ensurer) closeRetry(key string) {
 	e.mu.Lock()
 	delete(e.retryOpen, key)
 	e.mu.Unlock()
-}
-
-// runRemove sends one image_remove. Best effort by contract (agent-api.md):
-// undeliverable or unacked is logged, never retried — an offline host's stale
-// image is a disk-space nuisance, not a correctness bug.
-func (e *Ensurer) runRemove(hostID, imageID string) {
-	if e.disp == nil {
-		return
-	}
-	cmdID, err := newCmdID()
-	if err != nil {
-		e.log.Error("remove: command id generation failed; skipping dispatch",
-			"host_id", hostID, "image_id", imageID, "err", err)
-		return
-	}
-	ctx, cancel := context.WithTimeout(e.ctx, e.ackTimeout)
-	defer cancel()
-	res, err := e.disp.SendImageRemove(ctx, hostID, cmdID, imageID)
-	if err != nil {
-		e.log.Warn("remove: dispatch failed", "host_id", hostID, "image_id", imageID, "err", err)
-		if errors.Is(err, context.DeadlineExceeded) {
-			e.markUnsupported(hostID)
-		}
-		return
-	}
-	if !res.OK {
-		e.log.Warn("remove: agent rejected", "host_id", hostID, "image_id", imageID, "err", res.Error)
-		return
-	}
-	e.log.Info("remove: accepted", "host_id", hostID, "image_id", imageID)
 }
 
 // EnsureHost is EnsureAll narrowed to one host — the reconnect path, and the

@@ -789,6 +789,11 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	imagesEnsurer := images.NewEnsurer(pool, agentRegistry, log)
 	imagesStore.SetEnsurer(imagesEnsurer)
 	imagesHandler.SetRetryEnsurer(imagesEnsurer)
+	imagesCleanup := images.NewCleanupService(pool, agentRegistry)
+	imagesCleanup.SetEnsurer(imagesEnsurer)
+	imagesCleanup.SetAuditor(auditStore)
+	go imagesCleanup.RunRetention(janitorCtx)
+	imagesHandler.SetCleanupService(imagesCleanup)
 	crudHandler.SetImageReconciler(imagesEnsurer.EnsureAll)
 	crudHandler.SetImageEvidence(imagesEnsurer.CurrentImageEvidence)
 	go imagesEnsurer.RunRequirementReconcile(janitorCtx)
@@ -796,6 +801,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	agentHandler.SetPreparation(preparationStore)
 	agentHandler.OnPreparationReport = imagesEnsurer.ReconcilePreparation
 	agentHandler.SetImageEvents(imagesEnsurer)
+	agentHandler.SetImageCleanupEvents(imagesCleanup)
 
 	// Provider reconciliation. semantics: control-api.md §"P5 side effect".
 	//

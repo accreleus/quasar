@@ -94,9 +94,14 @@ type conn struct {
 	out                       chan []byte
 	done                      chan struct{}
 
-	mu     sync.Mutex
-	closed bool
-	acks   map[string]chan AckResult
+	mu                      sync.Mutex
+	closed                  bool
+	acks                    map[string]chan AckResult
+	imageCleanupV1          bool
+	imageVersionsComplete   bool
+	imageVersionsRevision   uint64
+	imageVersionsObservedAt time.Time
+	imageVersions           []ImageVersionEntry
 }
 
 // SupportsTypedSettings describes the current authenticated connection only.

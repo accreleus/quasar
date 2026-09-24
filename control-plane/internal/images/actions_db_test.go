@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,10 +37,12 @@ const (
 // actionsEnv is one wired P3 test environment: a Store with a real Ensurer over
 // a fake fleet, served behind the real admin gate.
 type actionsEnv struct {
-	pool  *pgxpool.Pool
-	store *Store
-	fleet *fakeFleet
-	ens   *Ensurer
+	pool        *pgxpool.Pool
+	store       *Store
+	fleet       *fakeFleet
+	ens         *Ensurer
+	cleanupWire *fakeCleanupWire
+	cleanup     *CleanupService
 	// do performs an authenticated admin request and returns status + body.
 	do func(t *testing.T, method, path, body string) (int, []byte)
 }
@@ -78,6 +81,9 @@ func newActionsEnv(t *testing.T, hostNames ...string) (*actionsEnv, []string) {
 	// images_audit_test.go reads the rows back out of admin_activity.
 	imageHandler := NewHandler(store, audit.NewStore(pool))
 	imageHandler.SetRetryEnsurer(ens)
+	cleanupWire := &fakeCleanupWire{snapshots: make(map[string]agentws.ImageCleanupSnapshot)}
+	cleanup := NewCleanupService(pool, cleanupWire)
+	imageHandler.SetCleanupService(cleanup)
 	imageHandler.Register(mux, func(next http.Handler) http.Handler {
 		return authHandler.RequireAuth(authHandler.RequireAdmin(next))
 	})
@@ -100,7 +106,7 @@ func newActionsEnv(t *testing.T, hostNames ...string) (*actionsEnv, []string) {
 		return resp.StatusCode, buf.Bytes()
 	}
 
-	return &actionsEnv{pool: pool, store: store, fleet: fleet, ens: ens, do: do}, hostIDs
+	return &actionsEnv{pool: pool, store: store, fleet: fleet, ens: ens, cleanupWire: cleanupWire, cleanup: cleanup, do: do}, hostIDs
 }
 
 // seedCatalogDigest inserts/updates the catalog row at (version, digest).
@@ -421,10 +427,10 @@ func TestPolicyAutoRebuildsUnpinnedTemplate(t *testing.T) {
 
 // --- uninstall ----------------------------------------------------------------
 
-// TestUninstallDispatchesRemoveAndCleansRows — P2's untested half: uninstall
-// sends image_remove to every connected host that has the image, deletes that
-// image's host_images rows, and drops the adoption row.
-func TestUninstallDispatchesRemoveAndCleansRows(t *testing.T) {
+// Legacy uninstall drops adoption while retaining cached bits for explicit
+// exact-version cleanup. An old/unknown agent's ID-only removal has no proof
+// that it is not removing the current or recovery version.
+func TestUninstallRetainsCacheWithoutLegacyRemove(t *testing.T) {
 	env, hostIDs := newActionsEnv(t, "host-a")
 	seedCatalogDigest(t, env.pool, imgVer, imgDigest)
 
@@ -444,10 +450,7 @@ func TestUninstallDispatchesRemoveAndCleansRows(t *testing.T) {
 		t.Fatalf("uninstall: status %d body %s, want 204", code, body)
 	}
 
-	rm := env.fleet.waitRemove(t)
-	if rm.HostID != hostIDs[0] || rm.ImageID != imgID {
-		t.Fatalf("image_remove dispatched to the wrong target: %+v", rm)
-	}
+	env.fleet.noMoreRemoves(t, 50*time.Millisecond)
 
 	var installed, hostRows int
 	if err := env.pool.QueryRow(context.Background(),
@@ -467,6 +470,25 @@ func TestUninstallDispatchesRemoveAndCleansRows(t *testing.T) {
 	if got := errCode(t, body2); got != "not_installed" {
 		t.Fatalf("error code: got %q want not_installed", got)
 	}
+}
+
+func TestUninstallDuringInflightEnsureNeverQueuesLegacyRemove(t *testing.T) {
+	env, _ := newActionsEnv(t, "uninstall-inflight-host")
+	seedCatalogDigest(t, env.pool, imgVer, imgDigest)
+	env.fleet.gate = make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(env.fleet.gate) }) }
+	defer release()
+	if code, body := env.do(t, http.MethodPost, "/v1/admin/images/"+imgID+"/install", `{"lazy":false}`); code != http.StatusCreated {
+		t.Fatalf("install = %d %s", code, body)
+	}
+	env.fleet.waitEnsure(t)
+	if code, body := env.do(t, http.MethodDelete, "/v1/admin/images/"+imgID+"/install", ""); code != http.StatusNoContent {
+		t.Fatalf("uninstall = %d %s", code, body)
+	}
+	release()
+	env.ens.Wait()
+	env.fleet.noMoreRemoves(t, 50*time.Millisecond)
 }
 
 // --- pin / unpin --------------------------------------------------------------

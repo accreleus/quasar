@@ -77,6 +77,9 @@ import type {
   CatalogImage,
   ImageInstallRequest,
   ImageUpdateResult,
+  HostImageCleanupView,
+  HostImageCleanupRequest,
+  HostImageCleanupAttempt,
   ImageUpdatePolicy,
   Job,
   JobsResponse,
@@ -531,11 +534,21 @@ export function installImage(
   });
 }
 
-/** Best-effort `image_remove` to every host that has it, then drops the adoption row. */
+/** Drops the adoption row; cached versions remain until explicit host cleanup. */
 export function uninstallImage(token: string, id: string): Promise<void> {
   return apiFetch<void>(`/admin/images/${encodeURIComponent(id)}/install`, {
     method: "DELETE",
     token,
+  });
+}
+
+export function getHostImageCleanup(token: string, hostID: string, signal?: AbortSignal): Promise<HostImageCleanupView> {
+  return apiFetch<HostImageCleanupView>(`/admin/hosts/${encodeURIComponent(hostID)}/images/cleanup`, { token, signal });
+}
+
+export function requestHostImageCleanup(token: string, hostID: string, req: HostImageCleanupRequest): Promise<HostImageCleanupAttempt> {
+  return apiFetch<HostImageCleanupAttempt>(`/admin/hosts/${encodeURIComponent(hostID)}/images/cleanup`, {
+    method: "POST", body: req, token,
   });
 }
 

@@ -56,14 +56,11 @@ func (e *ProviderEnabledError) Unwrap() error { return ErrProviderEnabled }
 
 // Ensure is the narrow seam onto the ensure orchestrator (*Ensurer in
 // production) — a behaviour, not the orchestrator's internals, so a test can
-// assert what was dispatched with no fleet. Both methods are non-blocking: a
+// assert what was dispatched with no fleet. Ensures are non-blocking: a
 // pull takes minutes and is reported over image_state, so no admin request
 // waits on one.
 type Ensure interface {
 	EnsureImage(ctx context.Context, imageID string)
-	// hostIDs must be captured before the caller deletes host_images rows —
-	// reading them here would race the delete and dispatch nothing.
-	RemoveImage(ctx context.Context, imageID string, hostIDs []string)
 }
 
 // localTag renders the CP-assigned build tag for a template adoption:
@@ -186,8 +183,10 @@ func (s *Store) Install(ctx context.Context, id string, lazy bool) (CatalogImage
 	return s.ImageByID(ctx, id)
 }
 
-// Uninstall drops the adoption: dispatches a best-effort image_remove to every
-// connected host with the image, deletes host_images rows, then installed_images.
+// Uninstall drops the adoption and current host_images rows. Physical cache
+// removal is explicit RH05 cleanup, which verifies exact version, reference,
+// daemon identity, and current-connection inventory. An ID-only legacy remove
+// is unsafe on older agents and with retained recovery versions.
 //
 // host_images is deleted here rather than by an FK cascade because those rows
 // FK image_catalog, not the adoption row (migration 0055) — the image stays in
@@ -236,10 +235,6 @@ func (s *Store) Uninstall(ctx context.Context, id string) error {
 		return ErrNotInstalled
 	}
 
-	hostIDs, err := imageHostIDs(ctx, tx, id) // captured before the delete removes it
-	if err != nil {
-		return err
-	}
 	if _, err := tx.Exec(ctx, `DELETE FROM host_images WHERE image_id = $1`, id); err != nil {
 		return fmt.Errorf("delete host_images id=%q: %w", id, err)
 	}
@@ -247,11 +242,6 @@ func (s *Store) Uninstall(ctx context.Context, id string) error {
 		return fmt.Errorf("commit uninstall id=%q: %w", id, err)
 	}
 
-	// After commit, same reason as Install: a rolled-back uninstall must not
-	// have told the fleet to delete the image.
-	if s.ensure != nil {
-		s.ensure.RemoveImage(ctx, id, hostIDs)
-	}
 	return nil
 }
 
@@ -402,25 +392,4 @@ func (s *Store) ImageByID(ctx context.Context, id string) (CatalogImage, error) 
 		}
 	}
 	return CatalogImage{}, ErrNotFound
-}
-
-// imageHostIDs lists the hosts holding a host_images row for this image.
-func imageHostIDs(ctx context.Context, db dbExecutor, id string) ([]string, error) {
-	rows, err := db.Query(ctx, `SELECT host_id::text FROM host_images WHERE image_id = $1`, id)
-	if err != nil {
-		return nil, fmt.Errorf("query host_images id=%q: %w", id, err)
-	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var hostID string
-		if err := rows.Scan(&hostID); err != nil {
-			return nil, fmt.Errorf("scan host_images host_id: %w", err)
-		}
-		out = append(out, hostID)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate host_images id=%q: %w", id, err)
-	}
-	return out, nil
 }

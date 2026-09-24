@@ -25,9 +25,11 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
-- **RH05 managed-image cleanup fence (#345).** Explicit cache cleanup tracks a
-  per-host image-operation generation and blocks retry or delayed preparation
-  while removal is active.
+- **RH05 explicit managed-image cleanup (#345).** Admins can preview exact cached
+  versions and protection reasons, then request generation-checked removal on a
+  capable host. Durable attempts and per-host image fences block conflicting
+  preparation and launch until the agent confirms the result; uninstall retains
+  cache for explicit cleanup.
 - **RH05 Steam templates and initial-home evidence (#344).** Optional Steam
   preparation now requires a currently selected adopted image; initial launches
   preserve nonempty homes and expose authenticated reflink, copy, cold, or
