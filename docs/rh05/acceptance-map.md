@@ -1,52 +1,52 @@
 # RH05 acceptance map
 
-Baseline: `07b8a4d62af97edf3a959a09e0c3e68ee707a1ce`, the #345 integration commit on `initiative/resilient-host-architecture`. This is a **traceability draft for #346**, not a completion verdict. The authoritative [specification](https://github.com/accreleus/quasar/issues/333) has 41 numbered stories and 17 numbered implementation decisions; [#346](https://github.com/accreleus/quasar/issues/346) requires a fixed-commit combined journey. Ticket numbers below refer to their accepted issue criteria and completion comments. Their individual checks do not by themselves prove the combined journey on this baseline.
+Fixed integration commit: **`7bd1234bd0dd6603634d5b0308c3205dca5fb6bc`** on `feat/rh05-346-operator-journey` (protocol `0a9019e9280738c9b0ad106c13ce54c0ed3dc449`, schema version 94). It contains the #334–#345 integration (`07b8a4d`) plus the #346 fixes found during this acceptance: lazy digest admission, lazy template and lazy digest preparation before assignment, and the agent's refusal to pull a missing local build tag. The authoritative [specification](https://github.com/accreleus/quasar/issues/333) has 41 numbered stories and 17 numbered implementation decisions; [#346](https://github.com/accreleus/quasar/issues/346) requires the combined journey on one fixed commit.
 
-Evidence abbreviations: `R<n>` means the completion report cited in issue #<n> (quasar-bench report keyed by that issue's initiative merge); `T` names a repository test file; `C` names a review vector in [`rh05-conformance.json`](../design/rh05-conformance.json). `C` is a **structural contract vector only**: `scripts/verify/rh05-conformance.py` without `--adapter` does not execute behavior. All ticket reports and tests require a fresh #346 run on one fixed source, protocol, image and schema identity before milestone acceptance. A report citation is evidence of what that ticket recorded, not a new claim that this draft reran it.
+**Gate** means the containerized suites on the fixed commit: `make verify` (465/0/0), `make test-go`, `TESTDB_CONTAINERISED=1 make test-db` (real ephemeral PostgreSQL), `make test-rust`, `make test-web` and `make preflight`. **Live** means the isolated AMD or NVIDIA acceptance stack running images built from the fixed commit with `deploy/build-images.sh` and served from the local registry, driven through the real web client or admin API. **Limit** names what this run did not prove. Ticket reports (`R<n>`, the completion report cited on issue #<n>) remain supporting evidence from their own commits. `C` vectors in [`rh05-conformance.json`](../design/rh05-conformance.json) are structural review vectors only.
 
-| Story in #333 | Owning accepted criterion and existing evidence | #346 integrated check or limit |
-| --- | --- | --- |
-| 1. Evidence-based automatic hardware | #340 R340; `T: control-plane/internal/hostcfg/policy_candidate_test.go` | Recheck actual accessible device and probe on both GPU roles; record unavailable vendors. |
-| 2. Preserve deliberate settings | #334 contract, #335 R335, #336 R336; `C: legacy_clear_preserves_agent_detection` | Upgrade/migration example with deployment baseline and existing override. |
-| 3. Source choice | #335–#336, #340; `T: control-plane/internal/hostcfg/policy_catalog_test.go` | Exercise Automatic, deployment and explicit at operator interface. |
-| 4. Resolved provenance | #336 R336, #340 R340; Fleet tests | Capture live Fleet source, resolved value and evidence. |
-| 5. Unsafe automatic pending | #340 R340; policy candidate tests | Wrong or inaccessible device must remain pending with remedy. |
-| 6. Offline durable edit | #335 R335; `C: offline_reconnect_duplicate_and_old_report` | Offline save, reconnect and final read on same stack. |
-| 7. Stale edit refusal | #335 R335; `T: control-plane/internal/hostcfg/policy_handler_test.go`; `C: concurrent_edit_rejects_stale_snapshot` | Two operator revisions; show intervening field and no partial write. |
-| 8. Three separate outcomes | #335, #343, #340 reports; `C: config_applies_independently_of_image_failure` | Combined Fleet/Placement visual with divergent configuration, preparation and readiness states. |
-| 9. Running session preserved | #335 R335; hostcfg/agent next-session tests | Session before and after safe edit; original launch snapshot unchanged. |
-| 10. Independent valid work | #336 R336, #343 R343; `C: config_applies_independently_of_image_failure` | One image failure while unrelated setting and image succeed. |
-| 11. Older agent truth | #335 R335, #338 R338; `C: old_agent_does_not_claim_application` | Mixed-version operator status; no false applied state. |
-| 12. Bounded retry | #336 R336, #343 R343; `T: control-plane/internal/images/rh05_retry_db_test.go` | Exhaustion and explicit Retry without infinite restart/pull loop. |
-| 13. Scoped approval | #338 R338; `C: unrelated_edit_preserves_scoped_approval`, `relevant_edit_supersedes_approval_and_stale_grant` | Safe edit preserves; relevant change forces reapproval. |
-| 14. Wait without killing sessions | #338–#339; `T: control-plane/internal/hostcfg/idle_apply_db_test.go` | Live session remains until normal stop; admission blocks new assignment. |
-| 15. All idle blockers | #338 R338; idle/agent inventory tests | Assigned, starting, stopping, local and preparation cases; unknown remains blocked. |
-| 16. Cancel waiting apply | #338 R338; `C: cancel_delayed_grant_requires_agent_nonacceptance` | Saved intent survives cancellation; own restriction releases after proof. |
-| 17. Overlapping admission | #337 R337; `T: control-plane/internal/admission/store_db_test.go`; `C: idle_release_preserves_manual_and_platform_restrictions` | Manual/platform/idle overlap and owner-scoped release under real Postgres. |
-| 18. One safe recovery | #339 R339; `C: crash_during_activation_recovers_last_verified_once` | Durable journal failure and at-most-one restore on combined build. |
-| 19. Original failure visible | #339 R339; idle executor tests | Show failed request and verified recovered configuration together. |
-| 20. Uncertain recovery protected | #339 R339; `C: crash_during_recovery_never_reactivates` | Admission stays restricted with actionable remedy. |
-| 21. Boot expires unstarted approval | #338 R338, ADR 0006; `C: restore_discovers_orphan_journal_attempt` | Restart and stopped-stack restore both require reapproval. |
-| 22. Started attempt reconciliation | #339 R339; durable journal tests | Lost ack, reconnect and crash do not repeat disruptive execution. |
-| 23. Dynamic or fixed placement | #342 R342; `T: control-plane/internal/crud/app_placement_db_test.go` | Both modes through app editor and launch. |
-| 24. Dynamic new host | #342 R342; placement DB tests | New eligible host appears without edit; fixed set stays fixed. |
-| 25. Derived inheritance | #342 R342; `T: control-plane/internal/session/app_placement_db_test.go` | Parent and tile resolve same placement, including launch. |
-| 26. Removal blocks new launch | #342 R342; placement/reservation DB tests | Race removal against launch; preserve accepted session and data. |
-| 27. Existing home owner | #341 R341; `T: control-plane/internal/session/home_claim_db_test.go` | Launch elsewhere refuses without a second home. |
-| 28. Concurrent first home | #341 R341; `C: home_first_claim_and_conflict` | Real-Postgres simultaneous claims with one owner. |
-| 29. Conflicting legacy homes | #341 R341; `T: control-plane/internal/storage/home_claims_db_test.go` | Admin claim view shows protected repair conflict; no merge/delete. |
-| 30. Selected managed preparation | #343 R343; `T: control-plane/internal/images/rh05_requirements_db_test.go` | Selected/unselected app on enrolled GPU host. |
-| 31. Shared requirements | #343 R343, #345 R345; requirements/cleanup DB tests | Removing one app retains another app's image dependency. |
-| 32. Adopted custom image | #343 R343; requirements DB tests | Custom app sharing adopted image participates in preparation. |
-| 33. Unmanaged image | #343 R343; Placement UI tests | Explicit unmanaged status, with launch subject to placement. |
-| 34. Pins and adoption policy | #343 R343; `T: control-plane/internal/images/provider_db_test.go` | Manual/notify/auto and pinned version remain authoritative. |
-| 35. Steam seeding | #344 R344; `T: control-plane/internal/session/home_seed_db_test.go` | Real first launch using pinned official Steam image. |
-| 36. Reflink/copy/cold visibility | #344 R344; agent template/home tests | Retain distinct live outcomes and visual proof; only reflink claims sharing. |
-| 37. Cold fallback | #344 R344; agent template/home tests | Compatible-template absence permits launch. |
-| 38. Existing home intact | #344 R344; home seed DB tests | Repeated launch preserves an existing marker/content byte for byte. |
-| 39. Explicit protected cleanup | #345 R345; `T: control-plane/internal/images/rh05_cleanup_fence_db_test.go`, `control-plane/internal/agentws/image_cleanup_test.go`; `C: cleanup_racing_new_reference` | Current requirement, stopped container, pending work, previous version, stale preview and confirmed removal. |
-| 40. Actionable console | #335–#345 reports and UI tests | One final visual audit of Fleet, Settings, Placement, Homes, Steam and Cleanup states. |
-| 41. Enrollment/mount boundary | #333 D2 and [operator handoff](operator-handoff.md) | Confirm documentation against final image/compose state; RH06 remains separate. |
+| Story in #333 | Fixed-build result on `7bd1234` |
+| --- | --- |
+| 1. Evidence-based automatic hardware | **Live.** AMD: Automatic encoder and render node resolved from the accessible device and host probe, approved in the console and applied by the agent's post-restart probe. NVIDIA: the Automatic hardware applied on this isolated stack before the final build remains `applied` and fresh on the final agent's current connection, and the final agent image passed the NVIDIA GPU contract (147/0). Intel unavailable (**Limit**). |
+| 2. Preserve deliberate settings | **Gate** (hostcfg migration and legacy-clear tests). **Live:** `cuda_device` stayed on its deployment source through the AMD apply. |
+| 3. Source choice | **Live:** Automatic and deployment sources shown and applied; an explicit `home_root` that would strand existing homes was refused with `400 validation_failed` and no write. **Gate** for the remaining combinations. |
+| 4. Resolved provenance | **Live:** Fleet settings show the resolved value, source and "verified on the current connection". |
+| 5. Unsafe automatic pending | **Gate.** **Live:** the AMD hardware group stayed `pending` with a remedy until approval. |
+| 6. Offline durable edit | **Gate** only (**Limit**: not repeated live on this commit). |
+| 7. Stale edit refusal | **Gate** only. |
+| 8. Three separate outcomes | **Live:** the Placement tab shows Selected, Prepared and Ready separately; idle apply shows saved configuration apart from approval and execution. |
+| 9. Running session preserved | **Live:** a Steam session kept decoding at 60 fps through a waiting approval and a control-plane restart. **Gate** for next-session snapshots. |
+| 10. Independent valid work | **Gate** only. |
+| 11. Older agent truth | **Gate** only (no older agent was deployed live). |
+| 12. Bounded retry | **Gate.** A failed lazy preparation is retried only by the next launch (Retry refuses lazy images). |
+| 13. Scoped approval | **Live:** approval bound to a reviewed revision and content digest. **Gate** for supersession. |
+| 14. Wait without killing sessions | **Live:** approval `waiting`, host `draining` with one `idle_apply` restriction, a new launch refused `503 no_host_available`, the running session untouched. |
+| 15. All idle blockers | **Live:** running session and conflicting preparation named as blockers. **Gate** for assigned, starting, stopping and local cases. See the preparation deadlock under Remaining limits. |
+| 16. Cancel waiting apply | **Gate** only. |
+| 17. Overlapping admission | **Gate** only. |
+| 18. One safe recovery | **Gate** only (durable journal tests). |
+| 19. Original failure visible | **Gate** only. |
+| 20. Uncertain recovery protected | **Gate** only. |
+| 21. Boot expires unstarted approval | **Live:** after a control-plane restart the waiting approval became `revoked_unstarted`, no attempt had started, admission reopened and the session survived. Stopped-stack restore: **Gate** only. |
+| 22. Started attempt reconciliation | **Gate.** **Live:** the re-approved AMD attempt reached `applied` once, with no recovery. |
+| 23. Dynamic or fixed placement | **Live:** dynamic (all eligible) on both stacks. Fixed set: **Gate**. |
+| 24. Dynamic new host | **Gate** only. |
+| 25. Derived inheritance | **Gate** only. |
+| 26. Removal blocks new launch | **Gate** only. |
+| 27. Existing home owner | **Gate.** **Live:** the agent refused a mount outside its deployment home root rather than creating a second home. |
+| 28. Concurrent first home | **Gate** only. |
+| 29. Conflicting legacy homes | **Gate** only. |
+| 30. Selected managed preparation | **Live:** the selected lazy Steam image was prepared on the placed host before assignment; cold pull on NVIDIA, cached image on AMD. |
+| 31. Shared requirements | **Gate** only. |
+| 32. Adopted custom image | **Gate** only. |
+| 33. Unmanaged image | **Gate** only. |
+| 34. Pins and adoption policy | **Live:** the pinned official Steam digest was used unchanged. **Gate** for policy modes. |
+| 35. Steam seeding | **Live:** real browser launches of the pinned official Steam image on both GPU roles. |
+| 36. Reflink/copy/cold visibility | **Live:** `reflink` (AMD, new user after template publication) and `cold` (NVIDIA, `template_unavailable`). **Limit:** `copy` was not re-exercised on this commit; see #344's accepted report. |
+| 37. Cold fallback | **Live:** NVIDIA first launch reported `cold` and streamed. |
+| 38. Existing home intact | **Live:** AMD relaunch reported `existing`; a 64 KiB marker kept its SHA-256 while a newer template existed. |
+| 39. Explicit protected cleanup | **Live:** the Steam image is listed as managed and refused as `required` (`409`). Confirmed removal: **Gate** and #345's report. |
+| 40. Actionable console | **Live:** Fleet, Settings, Placement, idle apply and loader captures in the #346 report. |
+| 41. Enrollment/mount boundary | Documented in the [operator handoff](operator-handoff.md); RH06 remains separate. |
 
 ## Q1–Q27 decision aliases
 
@@ -82,8 +82,10 @@ The owner-approved design discussion recorded Q1–Q27 (and a Steam clarificatio
 | Q26 cleanup retention | Story 39; D15 | #345 R345 |
 | Q27 restart/restore expiry | Stories 21–22; D11; ADR 0006 | #338 R338, #339 R339 |
 
-## Remaining #346 proof on a fixed commit
+## Remaining limits recorded by #346
 
-The 22 contract vectors cover review intent, but no repository adapter executes them end to end. The required proof is therefore the actual operator/launch/preparation tests, real ephemeral Postgres transaction tests, durable agent-journal tests and live role-based acceptance. Record each test command, source and protocol SHA, schema version, local image digest, stack identity, active-session ownership, result and limitation in the completion report. Recheck the tracker and report links when #346 chooses its fixed integration SHA. The individual ticket reports include live evidence from differing commits and are **not** interchangeable with a combined fixed-build run.
-
-The most consequential integration cases are: offline and stale edits; mixed agents; overlapping holds; approval supersession, cancel, restart and stopped-stack restore; started-attempt recovery; first-home and placement races; requirement/cleanup races; and Steam seed and fallback paths. Capture browser views of configuration, preparation and readiness separately. Real GPU evidence is required for hardware conclusions; unavailable Intel remains a limit. Do not mark #346 complete or promote any branch based on this map alone.
+- **Preparation can hold idle apply.** The frozen idle-apply contract treats Steam preparation `waiting_image`, `deferred` and `failed` as conflicting work. On the AMD role, Steam template warmup failed because the Automatic render node was not yet applied, so preparation blocked the very apply that fixes it. The operator remedy used here was to turn **Prepare Steam for faster first launch** off, apply, then turn it back on; warmup then succeeded. A contract change that stops non-running preparation from blocking a restart needs the prescribed review and owner sign-off.
+- **`copy` not repeated live** (story 36). Changing a host's deployment home root is correctly refused while it would strand existing managed homes, and the isolated stack could not put homes and templates on a non-reflink filesystem without moving homes.
+- **A cached lazy digest is subject to the agent's 2 GiB free-disk guard**, like eager images. An agent that echoes an empty `image_state.version` would time out lazy preparation after 15 minutes. A same-version re-adoption to a different digest re-acknowledges without a pull.
+- **No bench verdict.** `make bench-check` returned nothing comparable (rc 4); this change is not on the streaming path.
+- Intel hardware was unavailable.

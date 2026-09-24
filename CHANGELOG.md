@@ -25,6 +25,11 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **RH05 operator handoff and acceptance map (#346).** `docs/rh05/operator-handoff.md`
+  walks an operator through enrolled-host configuration, idle apply, placement, homes,
+  preparation and explicit cleanup, including the remedy when a failed Steam warmup holds
+  a hardware apply. `docs/rh05/acceptance-map.md` records the fixed-build result and the
+  remaining limits for every RH05 story.
 - **RH05 explicit managed-image cleanup (#345).** Admins can preview exact cached
   versions and protection reasons, then request generation-checked removal on a
   capable host. Durable attempts and per-host image fences block conflicting
