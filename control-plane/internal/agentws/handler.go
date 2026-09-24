@@ -832,7 +832,9 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	// so the snapshot must be bounded/sanitized before it reaches ImageEvents
 	// (one DB op per entry).
 	sanitizedImages, imagesReported := sanitizeRegisterImages(regImages, h.log, hostID)
-	h.imageEvents.AgentImagesRegistered(bg, hostID, sanitizedImages, imagesReported)
+	h.registry.withCurrent(ac, func() {
+		h.imageEvents.AgentImagesRegistered(bg, hostID, sanitizedImages, imagesReported)
+	})
 	if ac.imageCleanupV1 && h.cleanupEvents != nil {
 		h.cleanupEvents.ImageCleanupRegistered(bg, hostID)
 	}
@@ -1230,7 +1232,9 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			// Throttled by contract (≤ every 2 s per image during a pull), so a
 			// synchronous bounded upsert cannot congest the read loop.
 			imgCtx, imgCancel := context.WithTimeout(bg, agentDBCallTimeout)
-			h.imageEvents.AgentImageState(imgCtx, hostID, m)
+			h.registry.withCurrent(ac, func() {
+				h.imageEvents.AgentImageState(imgCtx, hostID, m)
+			})
 			imgCancel()
 		case "image_versions_state":
 			var m ImageVersionsStateMsg

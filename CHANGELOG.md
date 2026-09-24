@@ -298,13 +298,19 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
-- **RH05 lazy managed-image first launch (#346).** Session admission now lets a
-  lazy prebuilt adoption pinned to an image digest reach the agent's on-demand
-  pull before any host reports it ready, including after a confirmed cleanup of
-  that digest. Eager images, lazy templates and tag references still require
-  prior readiness. A host whose earlier on-demand pull failed stays eligible,
-  because the launch's own pull is its only retry. An active removal on the host
-  blocks placement, and a pruned or uninstalled image stays blocked after removal.
+- **RH05 lazy managed-image first launch (#346).** A lazy adoption now launches
+  before any host reports it ready. A lazy prebuilt pinned to an image digest
+  is pulled by the agent on assignment, including after a confirmed cleanup of
+  that digest. A lazy template is built on the selected host after the launch
+  is accepted: the control plane sends the adopted, frozen build and assigns
+  the session only after that host's current connection reports the exact
+  version ready. A build failure, timeout, host reconnect or adoption change
+  fails only that session. A stop during the build ends it without a launch.
+  Eager images, tag references and templates without a resolved build context
+  still require prior readiness. A host whose earlier on-demand preparation
+  failed stays eligible, because the launch's own preparation is its only
+  retry. An active removal on the host blocks placement, and a pruned or
+  uninstalled image stays blocked after removal.
 - **GPU image validation recognizes accessible render nodes beyond `renderD128`.**
   The contract now runs its GPU assertions on hosts whose usable DRM node has a
   different number, while ignoring sysfs-only or inaccessible nodes.

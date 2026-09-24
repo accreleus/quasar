@@ -49,8 +49,41 @@ func TestOperatorLaunchKeepsEagerManagedImageReadyGate(t *testing.T) {
 	}
 }
 
+// A buildable lazy template is admitted without a prior ready report. The
+// coordinator's lazy-template preparation builds it before assignment
+// (images.Ensurer.PrepareLazyTemplate; lazy_template_launch_db_test.go).
+func TestOperatorLaunchAdmitsBuildableLazyTemplate(t *testing.T) {
+	pool := testDB(t)
+	f := newEntLaunchFixture(t, pool)
+	installCatalogImage(t, pool, true)
+	ctx := context.Background()
+	_, err := pool.Exec(ctx, `UPDATE image_catalog SET kind='template' WHERE id=$1`, testImageID)
+	must(t, err)
+	_, err = pool.Exec(ctx, `UPDATE installed_images SET registry_ref='',local_tag='quasar-local/steam:test',context_sha='0123456789abcdef0123456789abcdef01234567' WHERE image_id=$1`, testImageID)
+	must(t, err)
+	setAppImage(t, pool, f.openAppID, "quasar-local/steam:test")
+	if status, code := launchStatus(t, f.base, f.userTok, f.openAppID); status != http.StatusCreated {
+		t.Fatalf("POST /v1/sessions for buildable lazy template = %d (%s), want 201", status, code)
+	}
+	// This fixture wires no preparer, so nothing can build the template. The
+	// accepted session must fail rather than be assigned an unbuilt tag.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var state string
+		must(t, pool.QueryRow(ctx, `SELECT state FROM sessions WHERE app_id=$1::uuid`, f.openAppID).Scan(&state))
+		if state == "failed" {
+			return
+		}
+		if state != "assigned" || time.Now().After(deadline) {
+			t.Fatalf("lazy template without a preparer reached %q, want failed", state)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func TestOperatorLaunchRequiresPriorReadyForLazyTemplateAndUnpinnedRef(t *testing.T) {
-	t.Run("template", func(t *testing.T) {
+	// An unresolved build context cannot be prepared on demand.
+	t.Run("unbuildable template", func(t *testing.T) {
 		pool := testDB(t)
 		f := newEntLaunchFixture(t, pool)
 		installCatalogImage(t, pool, true)
