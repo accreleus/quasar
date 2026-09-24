@@ -789,7 +789,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	imagesEnsurer := images.NewEnsurer(pool, agentRegistry, log)
 	imagesStore.SetEnsurer(imagesEnsurer)
 	imagesHandler.SetRetryEnsurer(imagesEnsurer)
-	imagesCleanup := images.NewCleanupService(pool, agentRegistry)
+	imagesCleanup := images.NewCleanupService(janitorCtx, pool, agentRegistry)
 	imagesCleanup.SetEnsurer(imagesEnsurer)
 	imagesCleanup.SetAuditor(auditStore)
 	imagesStore.SetCleanupService(imagesCleanup)

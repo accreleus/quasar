@@ -30,6 +30,7 @@ type CleanupTransport interface {
 }
 
 type CleanupService struct {
+	ctx     context.Context
 	pool    *pgxpool.Pool
 	wire    CleanupTransport
 	ensurer interface {
@@ -47,6 +48,7 @@ type CleanupService struct {
 	hostTriggerDirty   map[string]bool
 	sweepRunning       bool
 	sweepDirty         bool
+	scanRetryAfter     time.Duration
 }
 
 type cleanupReconcileFlight struct {
@@ -56,6 +58,7 @@ type cleanupReconcileFlight struct {
 	startedAt    time.Time
 	retries      int
 	followup     bool
+	done         chan struct{}
 }
 
 type cleanupReconcileGate struct {
@@ -80,11 +83,12 @@ type pendingCleanupJournal struct {
 	gateEpoch     uint64
 }
 
-func NewCleanupService(pool *pgxpool.Pool, wire CleanupTransport) *CleanupService {
-	return &CleanupService{pool: pool, wire: wire, journalRequests: make(map[string]pendingCleanupJournal),
+func NewCleanupService(ctx context.Context, pool *pgxpool.Pool, wire CleanupTransport) *CleanupService {
+	return &CleanupService{ctx: ctx, pool: pool, wire: wire, journalRequests: make(map[string]pendingCleanupJournal),
 		inventorySnapshots: make(map[string]trackedCleanupInventory), freshReconcile: make(map[string]cleanupReconcileGate),
 		reconcileEpoch: make(map[string]uint64), reconcileFlights: make(map[string]cleanupReconcileFlight),
-		hostTriggerRunning: make(map[string]bool), hostTriggerDirty: make(map[string]bool)}
+		hostTriggerRunning: make(map[string]bool), hostTriggerDirty: make(map[string]bool),
+		scanRetryAfter: 30 * time.Second}
 }
 
 func (s *CleanupService) SetEnsurer(e interface {
@@ -622,6 +626,10 @@ func (s *CleanupService) bumpInventoryFences(ctx context.Context, hostID string)
 // commits. Repeated actions coalesce; offline hosts refresh on registration.
 func (s *CleanupService) ManagedIdentitiesChanged() {
 	s.mu.Lock()
+	if s.ctx.Err() != nil {
+		s.mu.Unlock()
+		return
+	}
 	if s.sweepRunning {
 		s.sweepDirty = true
 		s.mu.Unlock()
@@ -632,7 +640,7 @@ func (s *CleanupService) ManagedIdentitiesChanged() {
 	go func() {
 		retryDelay := 100 * time.Millisecond
 		for {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
 			rows, err := s.pool.Query(ctx, `SELECT id::text FROM hosts`)
 			queryOK := err == nil
 			if err == nil {
@@ -657,11 +665,21 @@ func (s *CleanupService) ManagedIdentitiesChanged() {
 			}
 			cancel()
 			if !queryOK {
-				waitCleanupTriggerRetry(&retryDelay)
+				if !waitCleanupTriggerRetry(s.ctx, &retryDelay) {
+					s.mu.Lock()
+					s.sweepRunning, s.sweepDirty = false, false
+					s.mu.Unlock()
+					return
+				}
 				continue
 			}
 			retryDelay = 100 * time.Millisecond
 			s.mu.Lock()
+			if s.ctx.Err() != nil {
+				s.sweepRunning, s.sweepDirty = false, false
+				s.mu.Unlock()
+				return
+			}
 			if !s.sweepDirty {
 				s.sweepRunning = false
 				s.mu.Unlock()
@@ -678,6 +696,10 @@ func (s *CleanupService) ManagedIdentitiesChanged() {
 func (s *CleanupService) ManagedIdentityChanged(hostID string) {
 	snap, _ := s.wire.ImageCleanupSnapshot(hostID)
 	s.mu.Lock()
+	if s.ctx.Err() != nil {
+		s.mu.Unlock()
+		return
+	}
 	// An adoption or success-history commit makes the previous scan's managed
 	// identity set stale immediately, before the asynchronous query can run.
 	s.invalidateReconcileLocked(hostID, snap, "")
@@ -691,18 +713,30 @@ func (s *CleanupService) ManagedIdentityChanged(hostID string) {
 	go func() {
 		retryDelay := 100 * time.Millisecond
 		for {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
 			sent := true
 			if snap, connected := s.wire.ImageCleanupSnapshot(hostID); connected && snap.Capable {
 				sent = s.sendImageInventoryReconcile(ctx, hostID)
 			}
 			cancel()
 			if !sent {
-				waitCleanupTriggerRetry(&retryDelay)
+				if !waitCleanupTriggerRetry(s.ctx, &retryDelay) {
+					s.mu.Lock()
+					delete(s.hostTriggerRunning, hostID)
+					delete(s.hostTriggerDirty, hostID)
+					s.mu.Unlock()
+					return
+				}
 				continue
 			}
 			retryDelay = 100 * time.Millisecond
 			s.mu.Lock()
+			if s.ctx.Err() != nil {
+				delete(s.hostTriggerRunning, hostID)
+				delete(s.hostTriggerDirty, hostID)
+				s.mu.Unlock()
+				return
+			}
 			if !s.hostTriggerDirty[hostID] {
 				delete(s.hostTriggerRunning, hostID)
 				s.mu.Unlock()
@@ -716,14 +750,70 @@ func (s *CleanupService) ManagedIdentityChanged(hostID string) {
 
 // Retry only failed DB work or command enqueue. Once queued, the reconcile
 // flight still limits each cleanup attempt to one timed scan retry.
-func waitCleanupTriggerRetry(delay *time.Duration) {
-	time.Sleep(*delay)
+func waitCleanupTriggerRetry(ctx context.Context, delay *time.Duration) bool {
+	timer := time.NewTimer(*delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+	}
 	if *delay < 30*time.Second {
 		*delay *= 2
 		if *delay > 30*time.Second {
 			*delay = 30 * time.Second
 		}
 	}
+	return true
+}
+
+// Call with s.mu held. A completed or superseded flight releases its timer.
+func (s *CleanupService) clearReconcileFlightLocked(hostID string) {
+	if flight, ok := s.reconcileFlights[hostID]; ok {
+		if flight.done != nil {
+			close(flight.done)
+		}
+		delete(s.reconcileFlights, hostID)
+	}
+}
+
+// Every accepted scan has one deadline, even when no later POST or inventory
+// event arrives. The matching flight check prevents an old timer from acting
+// on a newer connection or scan; the service context stops it on shutdown.
+func (s *CleanupService) watchReconcileFlight(hostID string, flight cleanupReconcileFlight) {
+	go func() {
+		wait := time.Until(flight.startedAt.Add(s.scanRetryAfter))
+		if wait < 0 {
+			wait = 0
+		}
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-flight.done:
+			return
+		case <-timer.C:
+		}
+		s.mu.Lock()
+		current, ok := s.reconcileFlights[hostID]
+		stillCurrent := ok && current.requestID == flight.requestID && current.connectionID == flight.connectionID
+		s.mu.Unlock()
+		if !stillCurrent {
+			return
+		}
+		ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
+		defer cancel()
+		snap, connected := s.wire.ImageCleanupSnapshot(hostID)
+		if !connected || !snap.Capable || snap.ConnectionID != flight.connectionID {
+			return // a capable registration starts the next connection's scan
+		}
+		if snap.Complete && snap.ReconciledRequestID == flight.requestID {
+			s.ImageVersionsChanged(ctx, hostID)
+			return
+		}
+		s.ImageCleanupRegistered(ctx, hostID)
+	}()
 }
 
 func (s *CleanupService) ImageCleanupRegistered(ctx context.Context, hostID string) {
@@ -805,7 +895,7 @@ func (s *CleanupService) sendImageInventoryReconcile(ctx context.Context, hostID
 	retries := 0
 	if flight, inFlight := s.reconcileFlights[hostID]; inFlight && flight.connectionID == snap.ConnectionID &&
 		(!snap.Complete || snap.ReconciledRequestID != flight.requestID) {
-		if time.Since(flight.startedAt) < 30*time.Second || flight.retries >= 1 {
+		if time.Since(flight.startedAt) < s.scanRetryAfter || flight.retries >= 1 {
 			// The scan is already running on this connection. A new attempt
 			// needs a follow-up scan after it completes, but repeated HTTP
 			// retries must not spawn unbounded daemon scans.
@@ -813,14 +903,16 @@ func (s *CleanupService) sendImageInventoryReconcile(ctx context.Context, hostID
 				flight.followup = true
 				s.reconcileFlights[hostID] = flight
 			}
-			exhausted := flight.retries >= 1 && time.Since(flight.startedAt) >= 30*time.Second
+			exhausted := flight.retries >= 1 && time.Since(flight.startedAt) >= s.scanRetryAfter
 			s.mu.Unlock()
 			if exhausted {
 				// Keep the fence, but make the uncertainty and reconnect remedy
 				// visible through the persisted attempt status.
-				_, _ = s.pool.Exec(ctx, `UPDATE host_image_cleanup_attempts
+				if _, err := s.pool.Exec(ctx, `UPDATE host_image_cleanup_attempts
 					SET state='unknown',reason='inventory_unknown',updated_at=now()
-					WHERE host_id=$1::uuid AND state='removing'`, hostID)
+					WHERE host_id=$1::uuid AND state='removing'`, hostID); err != nil {
+					return false
+				}
 			}
 			return true // the active flight or its one retry owns this trigger
 		}
@@ -831,13 +923,15 @@ func (s *CleanupService) sendImageInventoryReconcile(ctx context.Context, hostID
 	// A newer reconcile supersedes any journal snapshot requested against an
 	// older daemon scan on this same connection.
 	s.invalidateReconcileLocked(hostID, snap, id)
-	s.reconcileFlights[hostID] = cleanupReconcileFlight{connectionID: snap.ConnectionID,
-		requestID: id, identities: identitySet, startedAt: time.Now(), retries: retries}
+	s.clearReconcileFlightLocked(hostID)
+	flight := cleanupReconcileFlight{connectionID: snap.ConnectionID,
+		requestID: id, identities: identitySet, startedAt: time.Now(), retries: retries, done: make(chan struct{})}
+	s.reconcileFlights[hostID] = flight
 	// Lock order invariant: Registry enqueue must remain nonblocking and must
 	// never call back into CleanupService while s.mu is held. Keep gate and
 	// enqueue in one critical section so an older query cannot send last.
 	if s.wire.SendImageInventoryReconcile(hostID, agentws.ImageInventoryReconcileCmd{ID: id, Identities: identities}) != nil {
-		delete(s.reconcileFlights, hostID)
+		s.clearReconcileFlightLocked(hostID)
 		s.invalidateReconcileLocked(hostID, snap, "")
 		s.mu.Unlock()
 		// Keep the gate fail closed until a later successful reconcile. An
@@ -845,6 +939,7 @@ func (s *CleanupService) sendImageInventoryReconcile(ctx context.Context, hostID
 		return false
 	}
 	s.mu.Unlock()
+	s.watchReconcileFlight(hostID, flight)
 	s.requestCleanupJournal(ctx, hostID)
 	return true
 }
@@ -923,7 +1018,7 @@ func (s *CleanupService) ImageVersionsChanged(ctx context.Context, hostID string
 	s.mu.Lock()
 	if flight, ok := s.reconcileFlights[hostID]; ok && connected && snap.Complete &&
 		flight.connectionID == snap.ConnectionID && flight.requestID == snap.ReconciledRequestID {
-		delete(s.reconcileFlights, hostID)
+		s.clearReconcileFlightLocked(hostID)
 		followup = flight.followup || s.freshReconcile[hostID].requestID == ""
 	}
 	s.mu.Unlock()

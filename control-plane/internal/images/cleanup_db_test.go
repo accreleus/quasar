@@ -1067,6 +1067,171 @@ func TestCleanupFleetIdentityTriggerRetriesFailedHostQuery(t *testing.T) {
 	}
 }
 
+func TestCleanupHostTriggerStopsOnServiceCancel(t *testing.T) {
+	env, hosts := newActionsEnv(t, "cleanup-host-trigger-stop")
+	host := hosts[0]
+	seedCatalog(t, env.pool)
+	install(t, env.pool, false)
+	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "same", Capable: true, Complete: true})
+	firstSend := make(chan struct{}, 1)
+	env.cleanupWire.mu.Lock()
+	env.cleanupWire.inventorySendErr = errors.New("persistent send failure")
+	env.cleanupWire.inventorySendHook = func() {
+		select {
+		case firstSend <- struct{}{}:
+		default:
+		}
+	}
+	env.cleanupWire.mu.Unlock()
+	env.cleanup.ManagedIdentityChanged(host)
+	select {
+	case <-firstSend:
+	case <-time.After(3 * time.Second):
+		t.Fatal("host trigger did not try the send")
+	}
+	env.cleanupStop()
+	deadline := time.After(2 * time.Second)
+	for {
+		env.cleanup.mu.Lock()
+		running := env.cleanup.hostTriggerRunning[host]
+		dirty := env.cleanup.hostTriggerDirty[host]
+		env.cleanup.mu.Unlock()
+		if !running && !dirty {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("host trigger survived service cancellation")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestCleanupFleetTriggerStopsOnServiceCancel(t *testing.T) {
+	env, _ := newActionsEnv(t, "cleanup-fleet-trigger-stop")
+	ctx := context.Background()
+	lock, err := env.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lock.Rollback(ctx) }()
+	if _, err := lock.Exec(ctx, `LOCK TABLE hosts IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+	env.cleanup.ManagedIdentitiesChanged()
+	env.cleanupStop()
+	deadline := time.After(2 * time.Second)
+	for {
+		env.cleanup.mu.Lock()
+		running, dirty := env.cleanup.sweepRunning, env.cleanup.sweepDirty
+		env.cleanup.mu.Unlock()
+		if !running && !dirty {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("fleet trigger survived service cancellation")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestCleanupInitialIncompleteScanRetriesOnceWithoutNewEvent(t *testing.T) {
+	env, hosts := newActionsEnv(t, "cleanup-incomplete-timer-host")
+	host := hosts[0]
+	seedCatalog(t, env.pool)
+	install(t, env.pool, false)
+	env.cleanup.scanRetryAfter = 300 * time.Millisecond
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 3)
+	entry := agentws.ImageVersionEntry{ImageID: imgID, Version: imgVer2, ImageRef: imgDigest2,
+		RuntimeImageID: "sha256:timer", State: "present"}
+	snapshot := agentws.ImageCleanupSnapshot{ConnectionID: "same", Capable: true, Complete: true,
+		Versions: []agentws.ImageVersionEntry{entry}}
+	env.cleanupWire.set(host, snapshot)
+	path := "/v1/admin/hosts/" + host + "/images/cleanup"
+	request := `{"image_id":"` + imgID + `","version":"` + imgVer2 + `","image_ref":"` + imgDigest2 + `","runtime_image_id":"sha256:timer","expected_generation":"0"}`
+	if code, body := env.do(t, http.MethodPost, path, request); code != 202 {
+		t.Fatalf("cleanup request = %d %s", code, body)
+	}
+	var first agentws.ImageInventoryReconcileCmd
+	select {
+	case first = <-env.cleanupWire.inventoryRequests:
+	case <-time.After(3 * time.Second):
+		t.Fatal("initial scan was not sent")
+	}
+	snapshot.Complete, snapshot.ReconciledRevision, snapshot.ReconciledRequestID = false, 1, first.ID
+	env.cleanupWire.set(host, snapshot)
+	env.cleanup.ImageVersionsChanged(context.Background(), host)
+	var second agentws.ImageInventoryReconcileCmd
+	select {
+	case second = <-env.cleanupWire.inventoryRequests:
+	case <-time.After(3 * time.Second):
+		t.Fatal("incomplete initial scan did not retry without a new event")
+	}
+	if second.ID == first.ID {
+		t.Fatal("retry reused first reconcile ID")
+	}
+	snapshot.ReconciledRevision, snapshot.ReconciledRequestID = 2, second.ID
+	env.cleanupWire.set(host, snapshot)
+	env.cleanup.ImageVersionsChanged(context.Background(), host)
+	deadline := time.After(3 * time.Second)
+	for {
+		var state, reason string
+		err := env.pool.QueryRow(context.Background(), `SELECT state,COALESCE(reason,'') FROM host_image_cleanup_attempts
+			WHERE host_id=$1::uuid`, host).Scan(&state, &reason)
+		if err == nil && state == "unknown" && reason == "inventory_unknown" {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("second incomplete scan did not surface unknown remedy: state=%s reason=%s err=%v", state, reason, err)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	select {
+	case extra := <-env.cleanupWire.inventoryRequests:
+		t.Fatalf("exhausted scan sent a third request: %+v", extra)
+	default:
+	}
+}
+
+func TestCleanupChangedIdentityKeepsPendingFlightTimer(t *testing.T) {
+	env, hosts := newActionsEnv(t, "cleanup-history-timer-host")
+	host := hosts[0]
+	seedCatalog(t, env.pool)
+	install(t, env.pool, false)
+	env.cleanup.scanRetryAfter = 500 * time.Millisecond
+	env.cleanupWire.inventoryRequests = make(chan agentws.ImageInventoryReconcileCmd, 2)
+	env.cleanupWire.set(host, agentws.ImageCleanupSnapshot{ConnectionID: "same", Capable: true, Complete: true})
+	env.cleanup.ImageCleanupRegistered(context.Background(), host)
+	select {
+	case <-env.cleanupWire.inventoryRequests:
+	case <-time.After(3 * time.Second):
+		t.Fatal("first scan missing")
+	}
+	if _, err := env.pool.Exec(context.Background(), `INSERT INTO host_image_success_history
+		(host_id,image_id,current_version,current_identity,previous_version,previous_identity,verified_at)
+		VALUES($1::uuid,$2,$3,jsonb_build_object('registry_ref',$4::text),$5,jsonb_build_object('registry_ref',$6::text),now())`,
+		host, imgID, imgVer2, imgDigest2, imgVer, imgRef); err != nil {
+		t.Fatal(err)
+	}
+	env.cleanup.ManagedIdentityChanged(host)
+	select {
+	case retry := <-env.cleanupWire.inventoryRequests:
+		found := false
+		for _, identity := range retry.Identities {
+			if identity.ImageID == imgID && identity.Version == imgVer && identity.ImageRef == imgRef {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("timed retry omitted newly retained identity: %+v", retry.Identities)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("changed identity lost its retry when the first scan ack was lost")
+	}
+}
+
 func TestCleanupIncompleteRepliesKeepBoundedSameAttemptFlight(t *testing.T) {
 	env, hosts := newActionsEnv(t, "cleanup-incomplete-flight-host")
 	host := hosts[0]

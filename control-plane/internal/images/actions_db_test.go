@@ -43,6 +43,7 @@ type actionsEnv struct {
 	ens         *Ensurer
 	cleanupWire *fakeCleanupWire
 	cleanup     *CleanupService
+	cleanupStop context.CancelFunc
 	// do performs an authenticated admin request and returns status + body.
 	do func(t *testing.T, method, path, body string) (int, []byte)
 }
@@ -82,7 +83,9 @@ func newActionsEnv(t *testing.T, hostNames ...string) (*actionsEnv, []string) {
 	imageHandler := NewHandler(store, audit.NewStore(pool))
 	imageHandler.SetRetryEnsurer(ens)
 	cleanupWire := &fakeCleanupWire{snapshots: make(map[string]agentws.ImageCleanupSnapshot)}
-	cleanup := NewCleanupService(pool, cleanupWire)
+	cleanupCtx, cleanupStop := context.WithCancel(context.Background())
+	t.Cleanup(cleanupStop)
+	cleanup := NewCleanupService(cleanupCtx, pool, cleanupWire)
 	imageHandler.SetCleanupService(cleanup)
 	imageHandler.Register(mux, func(next http.Handler) http.Handler {
 		return authHandler.RequireAuth(authHandler.RequireAdmin(next))
@@ -106,7 +109,7 @@ func newActionsEnv(t *testing.T, hostNames ...string) (*actionsEnv, []string) {
 		return resp.StatusCode, buf.Bytes()
 	}
 
-	return &actionsEnv{pool: pool, store: store, fleet: fleet, ens: ens, cleanupWire: cleanupWire, cleanup: cleanup, do: do}, hostIDs
+	return &actionsEnv{pool: pool, store: store, fleet: fleet, ens: ens, cleanupWire: cleanupWire, cleanup: cleanup, cleanupStop: cleanupStop, do: do}, hostIDs
 }
 
 // seedCatalogDigest inserts/updates the catalog row at (version, digest).
