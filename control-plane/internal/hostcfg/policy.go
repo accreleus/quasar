@@ -323,6 +323,9 @@ func (s *Store) GetPolicy(ctx context.Context, hostID string) (PolicyView, error
 				}
 			}
 			group.Remedy = &remedy
+		} else if key == "hardware" && preview != nil && preview.Available && group.Status == "pending" {
+			remedy := "Review the resolved hardware candidate and its evidence, then approve an idle restart. The agent verifies the selected media path before reporting it applied."
+			group.Remedy = &remedy
 		}
 		group.ApprovalPreview = preview
 		var attemptID string

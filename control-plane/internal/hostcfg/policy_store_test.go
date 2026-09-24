@@ -103,9 +103,16 @@ func TestPolicyReadSeparatesObservedValueFromAutomaticHardwarePreview(t *testing
 	hostID := seedHost(t, pool)
 	confirmPolicyGroups(t, pool, hostID, "hardware", "gop")
 	ctx := context.Background()
-	if _, err := store.SavePolicy(ctx, hostID, "0", map[string]PolicyChoice{
-		"encoder": {Source: "automatic"}, "render_node": {Source: "automatic"},
-	}, nil); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO host_setting_groups(host_id,group_key,desired_revision,scope,status)
+		VALUES($1::uuid,'hardware',0,'restart','pending')`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO host_setting_choices(host_id,key,source,revision)
+		VALUES($1::uuid,'encoder','automatic',0),($1::uuid,'render_node','automatic',0)`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO host_approval_review_tokens(host_id,group_key,review_id)
+		VALUES($1::uuid,'hardware',gen_random_uuid())`, hostID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.StartRH05Boot(ctx); err != nil {
@@ -150,8 +157,11 @@ func TestPolicyReadSeparatesObservedValueFromAutomaticHardwarePreview(t *testing
 		t.Fatalf("unapproved Automatic candidate appeared effective: %v", current)
 	}
 	preview, ok := view.Groups["hardware"].ApprovalPreview.(*ApprovalPreview)
-	if !ok || !preview.Available || preview.Resolved["encoder"] != "vulkan" {
+	if !ok || !preview.Available || view.Revision != "0" || preview.Revision != "0" || preview.Resolved["encoder"] != "vulkan" {
 		t.Fatalf("Automatic candidate absent from review preview: %+v", view.Groups["hardware"].ApprovalPreview)
+	}
+	if view.Groups["hardware"].Remedy == nil || !strings.Contains(*view.Groups["hardware"].Remedy, "approve an idle restart") || strings.Contains(*view.Groups["hardware"].Remedy, "next-session") {
+		t.Fatalf("ready Automatic preview gave the wrong next action: %+v", view.Groups["hardware"])
 	}
 }
 
