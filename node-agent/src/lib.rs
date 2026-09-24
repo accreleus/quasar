@@ -32,6 +32,7 @@ pub mod gpu_kmsg;
 /// GPU-vendor detection backing the `QUASAR_ENCODER` auto-default.
 pub mod gpu_vendor;
 pub mod health;
+mod home_cleanup;
 pub mod host_probe;
 pub mod images;
 pub mod jobs;
@@ -43,6 +44,8 @@ pub mod nvidia_volume;
 /// Shared owner-marked runtime-dir entry mechanics (udev export, media probe
 /// dir): see the module doc.
 mod owned_entry;
+pub mod policy;
+pub mod policy_catalog;
 pub mod readiness;
 pub mod release;
 pub mod session;

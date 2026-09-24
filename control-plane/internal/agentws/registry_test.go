@@ -1,6 +1,7 @@
 package agentws
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"testing"
@@ -37,6 +38,85 @@ func TestRemoveReportsCurrent(t *testing.T) {
 	}
 	if got := r.remove(c3); !got {
 		t.Fatal("remove of the current connection: got false, want true")
+	}
+}
+
+func TestHomeCleanupCapabilityFollowsCurrentAuthenticatedConnection(t *testing.T) {
+	r := NewRegistry(quietLogger())
+	if got := r.CurrentHomeCleanupCapability("host-1"); got != "unknown" {
+		t.Fatalf("disconnected capability = %q", got)
+	}
+	old := newConn("host-1", nil)
+	r.add(old)
+	if got := r.CurrentHomeCleanupCapability("host-1"); got != "unsupported" {
+		t.Fatalf("older agent capability = %q", got)
+	}
+	capable := newConn("host-1", nil)
+	capable.terminalHomeCleanupV1 = true
+	r.add(capable)
+	if got := r.CurrentHomeCleanupCapability("host-1"); got != "supported" {
+		t.Fatalf("current capable agent capability = %q", got)
+	}
+	r.remove(old)
+	if got := r.CurrentHomeCleanupCapability("host-1"); got != "supported" {
+		t.Fatalf("displaced teardown changed current capability = %q", got)
+	}
+	r.remove(capable)
+	if got := r.CurrentHomeCleanupCapability("host-1"); got != "unknown" {
+		t.Fatalf("post-disconnect capability = %q", got)
+	}
+}
+
+func TestHomeCommandEpochRefusesDisplacedConnectionBeforeQueue(t *testing.T) {
+	r := NewRegistry(quietLogger())
+	first := newConn("host-1", nil)
+	first.terminalHomeCleanupV1 = true
+	r.add(first)
+	epoch, ok := r.CurrentHomeCommandEpoch("host-1")
+	if !ok || !epoch.SupportsHomeCleanup() {
+		t.Fatal("capable command epoch missing")
+	}
+	r.add(newConn("host-1", nil))
+	_, queued, err := epoch.SendWithAck(context.Background(), "command-id", map[string]string{"type": "session_assign"})
+	if err != ErrAgentNotConnected || queued {
+		t.Fatalf("stale epoch send = (queued=%t, err=%v), want proven no queue", queued, err)
+	}
+}
+
+func TestHomeCommandEpochRetainsQueuedUncertaintyAcrossTimeoutAndReconnect(t *testing.T) {
+	r := NewRegistry(quietLogger())
+	first := newConn("host-1", nil)
+	first.terminalHomeCleanupV1 = true
+	r.add(first)
+	epoch, ok := r.CurrentHomeCommandEpoch("host-1")
+	if !ok {
+		t.Fatal("command epoch missing")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, queued, err := epoch.SendWithAck(ctx, "command-id", map[string]string{"type": "session_assign"})
+	if err == nil || !queued {
+		t.Fatalf("cancelled wait after queue = (queued=%t, err=%v), want uncertain queued delivery", queued, err)
+	}
+	if got := len(first.out); got != 1 {
+		t.Fatalf("queued frames = %d, want one", got)
+	}
+	second := newConn("host-1", nil)
+	r.add(second)
+	// A late ack from the displaced epoch cannot satisfy any current command.
+	currentAck := make(chan AckResult, 1)
+	second.mu.Lock()
+	second.acks["command-id"] = currentAck
+	second.mu.Unlock()
+	r.resolveAckFromConn(first, "command-id", AckResult{OK: false})
+	select {
+	case <-currentAck:
+		t.Fatal("old epoch ack reached current epoch waiter")
+	default:
+	}
+	_, queued, err = epoch.SendWithAck(context.Background(), "next-id", map[string]string{"type": "session_assign"})
+	if err != ErrAgentNotConnected || queued {
+		t.Fatalf("displaced epoch retry = (queued=%t, err=%v), want proven no queue", queued, err)
 	}
 }
 

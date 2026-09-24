@@ -7,10 +7,13 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../../../auth/context", () => ({ useAuth: () => ({ token: "token" }) }));
+vi.mock("../../../components/Toast", () => ({ useToast: () => ({ addToast: vi.fn(), removeToast: vi.fn() }) }));
 vi.mock("../../../api/admin", () => ({
   getHost: vi.fn(),
   getConfigCatalog: vi.fn(),
   getHostSettings: vi.fn(),
+  getHostPolicy: vi.fn(),
+  updateHostPolicy: vi.fn(),
   getHostGPUs: vi.fn(),
   updateHostSettings: vi.fn(),
   restartHost: vi.fn(),
@@ -97,6 +100,7 @@ describe("HostSettings", () => {
     vi.mocked(adminApi.getHost).mockResolvedValue({ host: HOST } as never);
     vi.mocked(adminApi.getConfigCatalog).mockResolvedValue({ knobs: KNOBS } as never);
     vi.mocked(adminApi.getHostSettings).mockResolvedValue(settingsResponse() as never);
+    vi.mocked(adminApi.getHostPolicy).mockRejectedValue(new ApiError(404, "not_found", "unsupported"));
     vi.mocked(adminApi.getHostGPUs).mockResolvedValue({ items: [] } as never);
   });
 
@@ -120,7 +124,7 @@ describe("HostSettings", () => {
     expect(screen.getByText(/Runtime configuration for Tower/)).toBeTruthy();
     expect(screen.getByText("Runtime defaults")).toBeTruthy();
     expect(screen.getByText("Encoder and GPU")).toBeTruthy();
-    expect(screen.getByText("Idle timeout")).toBeTruthy();
+    expect(await screen.findByText("Idle timeout")).toBeTruthy();
     // Encoder is restart-class: its row carries the "restart" chip.
     const encoderRow = screen.getByText("Encoder").closest(".cset") as HTMLElement;
     expect(encoderRow.textContent).toMatch(/restart/);
@@ -132,6 +136,75 @@ describe("HostSettings", () => {
     await screen.findByText("Idle timeout");
     expect(screen.getByRole("button", { name: "Discard" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+  });
+
+  it("keeps the legacy idle control on an upgrade-required agent and shows the typed remedy", async () => {
+    vi.mocked(adminApi.getHostPolicy).mockResolvedValue({
+      revision: "1",
+      choices: { idle_timeout_secs: { source: "deployment" } },
+      resolved: {},
+      groups: { idle_timeout_secs: {
+        desired_revision: "1", applied_revision: null, desired_digest: null,
+        scope: "next_session", status: "upgrade_required", fresh: false,
+        observed_at: null, remedy: "The legacy writer remains active for this group. Upgrade the agent to enable RH05 verification.",
+        approval_preview: null,
+      } },
+      image_preparation: { status: "unknown", observed_at: null, remedy: null },
+      readiness: { status: "unknown", observed_at: null, remedy: null },
+    } as never);
+    renderPage();
+    expect(await screen.findByText(/The legacy writer remains active/)).toBeTruthy();
+    expect(screen.getByText("QUASAR_IDLE_TIMEOUT_SECS")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Save next-session settings" })).toBeNull();
+  });
+
+  it("hides every typed-owned key from the legacy editor, keeps restart-scope keys there", async () => {
+    const group = { desired_revision: "2", applied_revision: "2", desired_digest: null, scope: "next_session", status: "applied", fresh: true, observed_at: null, remedy: null, approval_preview: null };
+    vi.mocked(adminApi.getHostPolicy).mockResolvedValue({
+      revision: "2",
+      choices: { idle_timeout_secs: { source: "deployment" }, gop: { source: "explicit", value: 90 } },
+      resolved: { idle_timeout_secs: { value: 1800, source: "deployment", observed_at: null }, gop: { value: 90, source: "explicit", observed_at: null } },
+      groups: { idle_timeout_secs: group, gop: group },
+      image_preparation: { status: "unknown", observed_at: null, remedy: null },
+      readiness: { status: "unknown", observed_at: null, remedy: null },
+    } as never);
+    renderPage();
+    expect(await screen.findByRole("group", { name: "GOP length" })).toBeTruthy();
+    expect(screen.getByRole("group", { name: "Idle timeout" })).toBeTruthy();
+    expect(screen.queryByText("QUASAR_IDLE_TIMEOUT_SECS")).toBeNull();
+    expect(screen.queryByText("QUASAR_GOP")).toBeNull();
+    expect(screen.getByRole("combobox", { name: "encoder" })).toBeTruthy();
+    expect(screen.queryByRole("group", { name: "Encoder" })).toBeNull();
+  });
+
+  it("uses revisioned policy save for the first owned idle edit", async () => {
+    const resolvePolicies: Array<(value: unknown) => void> = [];
+    vi.mocked(adminApi.getHostPolicy).mockImplementation(() => new Promise((resolve) => { resolvePolicies.push(resolve); }) as never);
+    const initial = {
+      revision: "0", choices: { idle_timeout_secs: { source: "deployment" } }, resolved: {},
+      groups: { idle_timeout_secs: {
+        desired_revision: "0", applied_revision: null, desired_digest: null,
+        scope: "next_session", status: "pending", fresh: false,
+        observed_at: null, remedy: "Waiting for the host to verify the next-session setting.", approval_preview: null,
+      } },
+      image_preparation: { status: "unknown", observed_at: null, remedy: null },
+      readiness: { status: "unknown", observed_at: null, remedy: null },
+    };
+    vi.mocked(adminApi.updateHostPolicy).mockResolvedValue({ ...initial, revision: "1" } as never);
+    renderPage();
+    await screen.findByRole("heading", { name: "Host settings" });
+    await waitFor(() => expect(adminApi.getHostPolicy).toHaveBeenCalled());
+    expect(screen.queryByText("QUASAR_IDLE_TIMEOUT_SECS")).toBeNull();
+    await act(async () => { for (const resolve of resolvePolicies) resolve(initial); });
+    expect(await screen.findByRole("button", { name: "Save next-session settings" })).toBeTruthy();
+    expect(screen.queryByText("QUASAR_IDLE_TIMEOUT_SECS")).toBeNull();
+    fireEvent.change(screen.getByLabelText("Idle timeout source"), { target: { value: "explicit" } });
+    fireEvent.change(screen.getByLabelText("Idle timeout value"), { target: { value: "900" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save next-session settings" }));
+    await waitFor(() => expect(adminApi.updateHostPolicy).toHaveBeenCalledWith(
+      "token", "host-1", "0", { idle_timeout_secs: { source: "explicit", value: 900 } },
+    ));
+    expect(adminApi.updateHostSettings).not.toHaveBeenCalled();
   });
 
   it("edits a live knob, saves it as a PATCH override, and shows no restart confirm", async () => {

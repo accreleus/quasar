@@ -25,6 +25,71 @@ own; the two do not move together, and that is deliberate.
 ## Unreleased
 
 ### Added
+- **RH05 operator handoff and acceptance map (#346).** `docs/rh05/operator-handoff.md`
+  walks an operator through enrolled-host configuration, idle apply, placement, homes,
+  preparation and explicit cleanup, including the remedy when a failed Steam warmup holds
+  a hardware apply. `docs/rh05/acceptance-map.md` records the fixed-build result and the
+  remaining limits for every RH05 story.
+- **RH05 explicit managed-image cleanup (#345).** Admins can preview exact cached
+  versions and protection reasons, then request generation-checked removal on a
+  capable host. Durable attempts and per-host image fences block conflicting
+  preparation and launch until the agent confirms the result; uninstall retains
+  cache for explicit cleanup.
+- **RH05 Steam templates and initial-home evidence (#344).** Optional Steam
+  preparation now requires a currently selected adopted image; initial launches
+  preserve nonempty homes and expose authenticated reflink, copy, cold, or
+  existing-home outcomes without claiming reflink savings for copy or cold.
+- **RH05 selected-app image preparation (#343).** Selected hosts reconcile the
+  immutable adopted managed image required by their apps, with per-app
+  preparation status, bounded failure retry, and durable successful-version
+  identity for later cleanup.
+- **RH05 app placement (#342).** Admins can set dynamic or fixed host eligibility
+  per canonical app with revision-checked edits and separate selected, prepared,
+  and ready status. Derived tiles inherit their parent's placement. Session
+  admission rechecks placement before reservation and preserves managed-home
+  locality, including when a host is removed during launch.
+- **Managed-home ownership during launch (#341).** A canonical per-user, per-app
+  claim keeps existing homes on their recorded host, serializes concurrent first
+  launches, and reports uncertain or divergent locations for operator repair
+  without creating another home. Tombstones block launch until exact confirmed
+  cleanup or repair; admins can inspect claim-only uncertainty in Fleet storage.
+  Capable agents retain a durable home hold across delivery loss and control-plane
+  restart until authenticated cleanup proof; older agents remain supported with
+  their unprotected-dispatch status visible to operators.
+
+- RH05 #339: reviewed idle approvals now dispatch one hardware group after final idle checks, verify the restarted device and media path before registration, journal startup and one recovery attempt, reconcile lost reports after restart, and show execution and recovery status in the console. An unreadable policy journal reports an agent-enforced diagnostic remedy while independent image work remains available.
+- **RH05 Automatic hardware choice (#340).** New hosts select Automatic encoder
+  and render node after typed capability confirmation. Fleet shows the reviewed
+  accessible-device candidate and its evidence; an approved idle restart
+  verifies the selected media path before reporting it applied. Existing hosts
+  retain deployment intent until an operator changes it.
+- RH05 #338: reviewed idle-apply approvals now wait under an owner-scoped admission hold, expose current session and preparation blockers, and support safe cancellation.
+- **RH05 agent policy hooks (#336).** Added agent-side prepare and apply policy
+  handling with durable execution acceptance, bounded retry and explicit
+  outcomes. Managed-home mounts are checked against the selected root and its
+  deployment mount at assign and swap, and first-home creation serializes with
+  root edits without exhausting the database pool.
+- **Owner-scoped host admission restrictions (#337).** Manual drains and platform
+  applies now hold independent, durable scheduling restrictions. Session
+  reservations serialize with new holds, and reconnect preserves them. An apply
+  that delivers migration 0088 may leave conservative `legacy_drain` holds on
+  the fleet; review each Host's active reasons and explicitly release an
+  operator drain where it is safe to resume assignments. Terminal platform
+  cleanup commits its own hold releases, host status projection and completion
+  marker together, so a failed cleanup can retry without a partial release.
+  Boot adoption also retries terminal standalone apply and revert holds left
+  behind by a crash or failed release.
+- **RH05 next-session host policy delivery (#335).** Added typed, revisioned host
+  setting choices and a durable next-session idle-timeout offer journal, with
+  operator status for pending and verified application. Existing settings PATCH
+  clients retain merge and null-clear behavior; older agents retain their
+  legacy settings path.
+- **RH05 host policy and selected-app preparation contracts (#334).** Defined typed
+  host setting sources, independent application evidence, scoped idle approval and
+  recovery, owner-scoped admission, placement and managed-home claims, image
+  preparation and cleanup rules, migration reservations, and compatibility for
+  older agents and the existing settings endpoint. Runtime delivery follows in
+  the dependent tickets.
 - **Per-GPU codec sets, end to end (#302, amendment 12).** Each GPU reports the codecs it has
   been shown to encode (`capacity.gpus[].codecs`, the same per-GPU sets the host-level `codecs`
   union is derived from, so the two cannot disagree; a zero-slot GPU reports an empty set). The control
@@ -238,6 +303,33 @@ own; the two do not move together, and that is deliberate.
   override) on an affected host until #281 lands.
 
 ### Fixed
+- **RH05 lazy managed-image first launch (#346).** A lazy adoption now launches
+  before any host reports it ready. After the launch is accepted, the control
+  plane prepares the image on the selected host with the adopted, frozen
+  inputs — a pull for a lazy prebuilt pinned to an image digest (including
+  after a confirmed cleanup of that digest), a build for a lazy template — and
+  assigns the session only after that host's current connection reports the
+  exact version ready. A lazy Steam image is therefore a managed image on the
+  host: its first home reports its seed outcome, and Steam template
+  preparation can proceed instead of waiting for an image report forever. A build failure, timeout, host reconnect or adoption change
+  fails only that session. A stop during the build ends it without a launch.
+  Eager images, tag references and templates without a resolved build context
+  still require prior readiness. A host whose earlier on-demand preparation
+  failed stays eligible, because the launch's own preparation is its only
+  retry. An active removal on the host blocks placement, and a pruned or
+  uninstalled image stays blocked after removal.
+- **GPU image validation recognizes accessible render nodes beyond `renderD128`.**
+  The contract now runs its GPU assertions on hosts whose usable DRM node has a
+  different number, while ignoring sysfs-only or inaccessible nodes.
+- **Host settings no longer show untouched settings as pending (#346).** A policy
+  group that has never been saved now reads "not saved · in effect" with its
+  deployment value instead of a PENDING badge. Saved groups awaiting verification and
+  hardware groups needing review still show pending with their remedy. The host policy
+  response gains an optional `saved` flag (additive protocol amendment).
+- **Missing local build tags are never pulled from a registry (#346).** The
+  agent refuses to pull an absent `quasar-local/` managed build tag, and the
+  launch fails instead. Previously Docker could resolve the name as a public
+  registry repository and run whatever it found there.
 - **A host no longer stays in diagnostic mode after its startup cleanup succeeds (#269).**
   The resume was published on a `watch` channel with `Sender::send`, which discards the
   value outright when no receiver happens to exist at that instant — and every waiter is a

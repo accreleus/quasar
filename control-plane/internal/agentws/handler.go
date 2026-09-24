@@ -4,13 +4,19 @@
 package agentws
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"reflect"
+	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -54,6 +60,7 @@ var upgrader = websocket.Upgrader{
 
 // Handler is the HTTP handler for the agent WebSocket endpoint (GET /agent/ws).
 type Handler struct {
+	bootIncarnation     string
 	preparation         *preparation.Store
 	OnPreparationReport func(string)
 	store               *agentStore
@@ -70,7 +77,8 @@ type Handler struct {
 	vram                *vramQueue
 	// Image-management P2 callback surface (images.go). Never nil — NewHandler
 	// installs a no-op — so dispatch needs no guard.
-	imageEvents ImageEvents
+	imageEvents   ImageEvents
+	cleanupEvents ImageCleanupEvents
 	// Platform-release apply callback surface (release.go, amendment 2). Never
 	// nil — NewHandler installs a no-op — so dispatch needs no guard.
 	releaseEvents ReleaseEvents
@@ -206,7 +214,9 @@ func (s *consoleAutoState) finishLaunch(hostID, sessionID string, launched bool)
 // agent→browser signaling; consoleStore backs the CM-01 console-config
 // snapshot push + reported-capabilities upsert. Any nil argument uses a safe
 // no-op default (consoleStore nil simply skips console_config / capabilities).
-func NewHandler(pool *pgxpool.Pool, enrollmentToken string, log *slog.Logger, registry *Registry, events Events, relay *RelayBus, cfgStore *hostcfg.Store, consoleStore *console.Store) *Handler {
+// approvalBoot is the durable RH05 boot written before admission starts; tests
+// without that lifecycle may omit it.
+func NewHandler(pool *pgxpool.Pool, enrollmentToken string, log *slog.Logger, registry *Registry, events Events, relay *RelayBus, cfgStore *hostcfg.Store, consoleStore *console.Store, approvalBoot ...string) *Handler {
 	if registry == nil {
 		registry = NewRegistry(log)
 	}
@@ -216,7 +226,12 @@ func NewHandler(pool *pgxpool.Pool, enrollmentToken string, log *slog.Logger, re
 	if relay == nil {
 		relay = NewRelayBus(log)
 	}
+	bootIncarnation := newPolicyUUID()
+	if len(approvalBoot) != 0 && approvalBoot[0] != "" {
+		bootIncarnation = approvalBoot[0]
+	}
 	h := &Handler{
+		bootIncarnation: bootIncarnation,
 		store: &agentStore{
 			pool: pool,
 			// The local half of the #96 liveness answer; the DB half is in enrollHost.
@@ -241,6 +256,372 @@ func NewHandler(pool *pgxpool.Pool, enrollmentToken string, log *slog.Logger, re
 	return h
 }
 
+func newPolicyUUID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic("cannot generate RH05 incarnation: " + err.Error())
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+func (h *Handler) offerNextSessionPolicy(ctx context.Context, c *conn) {
+	if !c.policyTyped || !c.policyInventoryDone.Load() || c.policyInventoryBlocked.Load() || len(c.policyOutstanding) != 0 || c.policyDeliveryID == "" || h.cfgStore == nil {
+		return
+	}
+	boot, connection, current := h.registry.PolicyIdentity(c.hostID)
+	if !current || boot != c.bootIncarnation || connection != c.connectionIncarnation {
+		return
+	}
+	snapshots := c.activePolicySnapshots()
+	if len(snapshots) == 0 {
+		return
+	}
+	offers, err := h.cfgStore.NextSessionOfferBatch(ctx, c.hostID, boot, connection, snapshots, newPolicyUUID)
+	if err != nil {
+		h.log.Warn("host policy offer load failed", "host_id", c.hostID, "err", err)
+		return
+	}
+	for _, offer := range offers {
+		if err := h.registry.Send(c.hostID, offer); err != nil {
+			h.log.Warn("host policy offer failed", "host_id", c.hostID, "group", offer.Group, "err", err)
+		}
+	}
+}
+
+func (h *Handler) offerIdlePolicy(ctx context.Context, c *conn) {
+	if !c.policyIdle || !c.policyAcknowledged.Load() || !c.policyInventoryDone.Load() ||
+		c.policyInventoryBlocked.Load() || h.cfgStore == nil {
+		return
+	}
+	boot, connection, current := h.registry.PolicyIdentity(c.hostID)
+	if !current || boot != c.bootIncarnation || connection != c.connectionIncarnation {
+		return
+	}
+	offer, err := h.cfgStore.NextIdleOffer(ctx, c.hostID, boot, connection)
+	if err != nil {
+		h.log.Warn("idle policy offer load failed", "host_id", c.hostID, "err", err)
+		return
+	}
+	if offer != nil {
+		if err := h.registry.Send(c.hostID, offer); err != nil {
+			h.log.Warn("idle policy offer send failed; durable offer awaits reconciliation", "host_id", c.hostID, "err", err)
+		}
+		return
+	}
+	// A cancellation, expired offer, or exhausted/rejected delivery keeps its
+	// own admission hold until a complete journal proves nonacceptance. Ask for
+	// that proof on the current connection instead of waiting for a reconnect.
+	status, err := h.cfgStore.CurrentIdleApply(ctx, c.hostID)
+	if err == nil && !status.Started && status.AdmissionRestricted &&
+		(status.Phase == "cancel_pending" || status.Phase == "offered" && status.Remedy != nil) {
+		if err := h.restartPolicyInventory(ctx, c); err != nil {
+			h.log.Warn("idle policy journal refresh failed", "host_id", c.hostID, "err", err)
+		}
+	}
+}
+
+// Historical grants stay bound to their original identity across reconnects.
+// The current socket authenticates the report; inventory binds its attempt.
+func policyGrantMatches(c *conn, state ConfigPolicyStateMsg) bool {
+	if prior, ok := c.policyOutstanding[state.AttemptID]; ok {
+		return prior.HostID == state.HostID && prior.Group == state.Group && prior.Revision == state.Revision && prior.ContentSHA256 == state.ContentSHA256 && prior.Scope == state.Scope && prior.GrantBootIncarnation == state.GrantBootIncarnation && prior.GrantConnectionIncarnation == state.GrantConnectionIncarnation
+	}
+	return state.GrantBootIncarnation == c.bootIncarnation && state.GrantConnectionIncarnation == c.connectionIncarnation
+}
+
+func policyEntryMatchesDesired(group hostcfg.PolicyGroup, entry ConfigPolicyStateMsg) bool {
+	scope, known := hostcfg.PolicyGroupScope(entry.Group)
+	return known && entry.Scope == scope && group.Scope == scope && group.DesiredDigest != nil && group.DesiredRevision == entry.Revision && *group.DesiredDigest == entry.ContentSHA256
+}
+
+// policyStateErrorCode reads the typed reason of a `config_policy_state`
+// error: a bare code string, or an object carrying `code`.
+func policyStateErrorCode(raw json.RawMessage) string {
+	var code string
+	if json.Unmarshal(raw, &code) == nil {
+		return code
+	}
+	var typed struct {
+		Code string `json:"code"`
+	}
+	if json.Unmarshal(raw, &typed) == nil {
+		return typed.Code
+	}
+	return ""
+}
+
+// policyEvidenceMatches requires the readback to carry exactly the expected
+// value for every key of the group.
+func policyEvidenceMatches(expected, evidence map[string]any) bool {
+	for key, value := range expected {
+		got, present := evidence[key]
+		if !present || !reflect.DeepEqual(got, value) {
+			return false
+		}
+	}
+	return len(expected) > 0
+}
+
+// Journal sequence survives terminal handling on a connection so delayed
+// accepted/retry frames cannot reopen an already completed attempt.
+func (c *conn) acceptPolicySequence(state ConfigPolicyStateMsg) (bool, error) {
+	sequence, err := strconv.ParseUint(state.JournalSequence, 10, 64)
+	if err != nil || strconv.FormatUint(sequence, 10) != state.JournalSequence {
+		return false, errors.New("invalid policy journal sequence")
+	}
+	if sequence == 0 && state.Phase == "failed" {
+		// This is one delivery's rejection, not a durable journal entry.
+		// Several deliveries may reject with different reasons before one
+		// accepts, so the per-attempt sequence cache must not consume it.
+		return true, nil
+	}
+	content, err := json.Marshal(state)
+	if err != nil {
+		return false, err
+	}
+	if previous, ok := c.policySequence[state.AttemptID]; ok {
+		if sequence < previous {
+			return false, nil
+		}
+		if sequence == previous {
+			if !bytes.Equal(c.policySequenceContent[state.AttemptID], content) {
+				return false, errors.New("conflicting policy journal sequence")
+			}
+			return false, nil
+		}
+	}
+	if c.policySequence == nil {
+		c.policySequence = map[string]uint64{}
+		c.policySequenceContent = map[string][]byte{}
+	}
+	c.policySequence[state.AttemptID] = sequence
+	c.policySequenceContent[state.AttemptID] = content
+	return true, nil
+}
+
+func (h *Handler) maybeSendInitialPolicyMap(ctx context.Context, c *conn) error {
+	if !c.policyTyped || !c.policyAcknowledged.Load() || !c.policyInventoryDone.Load() || c.policyInventoryBlocked.Load() || c.policyDeliveryID != "" || h.cfgStore == nil {
+		return nil
+	}
+	deliveryID := newPolicyUUID()
+	settings, ok, err := h.cfgStore.PrepareLegacyDelivery(ctx, c.hostID, c.connectionIncarnation, deliveryID, c.policyAccepted)
+	if err != nil || !ok {
+		return err
+	}
+	c.policyDeliveryID = deliveryID
+	c.policyDeliverySentAt = time.Now()
+	return h.registry.Send(c.hostID, ConfigUpdateCmd{Type: "config_update", Settings: settings, SettingsDeliveryID: deliveryID})
+}
+
+func (h *Handler) acceptPolicyInventoryPage(ctx context.Context, c *conn, raw []byte) error {
+	if !c.policyTyped || h.cfgStore == nil || c.policyInventoryDone.Load() || c.policyInventoryID == "" {
+		return errors.New("unexpected policy inventory page")
+	}
+	var page ConfigPolicyInventoryPage
+	if err := json.Unmarshal(raw, &page); err != nil {
+		return err
+	}
+	if page.InventoryID != c.policyInventoryID || page.SnapshotID == "" || !sameCursor(page.Cursor, c.policyInventoryCursor) || len(page.Entries) > 256 || page.RevisionHighWater == nil || page.ActiveSnapshots == nil {
+		return errors.New("invalid policy inventory page")
+	}
+	for _, revision := range page.RevisionHighWater {
+		parsed, err := strconv.ParseUint(revision, 10, 64)
+		if err != nil || strconv.FormatUint(parsed, 10) != revision {
+			return errors.New("invalid policy inventory revision")
+		}
+	}
+	for group, snapshot := range page.ActiveSnapshots {
+		if !hostcfg.IsPolicyGroup(group) {
+			c.policyInventoryUnknown = true
+			c.policyInventoryBlocked.Store(true)
+		}
+		if (snapshot.Kind != "seeded" && snapshot.Kind != "verified") || len(snapshot.Digest) != 64 {
+			return errors.New("invalid policy inventory active snapshot")
+		}
+		for _, char := range snapshot.Digest {
+			if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+				return errors.New("invalid policy inventory active digest")
+			}
+		}
+	}
+	header, err := json.Marshal([]any{page.RevisionHighWater, page.ActiveSnapshots})
+	if err != nil {
+		return err
+	}
+	if c.policyInventorySnapshotID == "" {
+		c.policyInventorySnapshotID = page.SnapshotID
+		c.policyInventoryHeader = header
+	} else if c.policyInventorySnapshotID != page.SnapshotID || !bytes.Equal(c.policyInventoryHeader, header) {
+		return errors.New("policy inventory snapshot changed mid-page")
+	}
+	view, err := h.cfgStore.GetPolicy(ctx, c.hostID)
+	if err != nil {
+		return err
+	}
+	for _, entry := range page.Entries {
+		fresh, err := c.acceptPolicySequence(entry)
+		if err != nil {
+			return err
+		}
+		if !fresh {
+			continue
+		}
+		if entry.Scope == "restart" {
+			groupScope, known := hostcfg.PolicyGroupScope(entry.Group)
+			if entry.HostID != c.hostID || !known || groupScope != "restart" {
+				c.policyInventoryUnknown = true
+				c.policyInventoryBlocked.Store(true)
+				continue
+			}
+			var verifiedAt *time.Time
+			if entry.Phase == "applied" && entry.ActiveScope != nil && *entry.ActiveScope == "restart" &&
+				entry.Evidence != nil && entry.Evidence.Revision == entry.Revision &&
+				entry.Evidence.ContentSHA256 == entry.ContentSHA256 && entry.Evidence.AgentProcessID != "" {
+				if at, err := time.Parse(time.RFC3339Nano, entry.Evidence.ObservedAt); err == nil {
+					verifiedAt = &at
+				}
+			}
+			c.rh05RestartEntries = append(c.rh05RestartEntries, hostcfg.JournalInventoryEntry{
+				AttemptID: entry.AttemptID, HostID: entry.HostID, Group: entry.Group,
+				Digest: entry.ContentSHA256, Scope: entry.Scope, Phase: entry.Phase,
+				Sequence: entry.JournalSequence, Revision: entry.Revision,
+				GrantBoot: entry.GrantBootIncarnation, GrantConnection: entry.GrantConnectionIncarnation,
+				ErrorCode: policyStateErrorCode(entry.Error), VerifiedAt: verifiedAt,
+			})
+			continue
+		}
+		if entry.HostID != c.hostID || !hostcfg.IsPolicyGroup(entry.Group) {
+			c.policyInventoryUnknown = true
+			c.policyInventoryBlocked.Store(true)
+			continue
+		}
+		switch entry.Phase {
+		case "applied":
+			// A historical terminal record is not active readback. Reconcile
+			// only the inventory's current active snapshot after the last page.
+		case "recovered", "revoked_unstarted", "failed":
+			// Terminal history; its high-water still fences future offers.
+		case "uncertain":
+			c.policyUncertain = true
+			c.policyInventoryBlocked.Store(true)
+		default:
+			if c.policyOutstanding == nil {
+				c.policyOutstanding = map[string]ConfigPolicyStateMsg{}
+			}
+			c.policyOutstanding[entry.AttemptID] = entry
+			c.policyAttemptOutstanding.Store(true)
+			if !policyEntryMatchesDesired(view.Groups[entry.Group], entry) {
+				c.policyInventoryBlocked.Store(true)
+			}
+		}
+	}
+	if page.NextCursor != nil {
+		start := 0
+		if page.Cursor != nil {
+			start, _ = strconv.Atoi(*page.Cursor)
+		}
+		if len(page.Entries) != 256 || *page.NextCursor != strconv.Itoa(start+len(page.Entries)) {
+			return errors.New("policy inventory cursor did not advance")
+		}
+		c.policyInventoryCursor = page.NextCursor
+		return h.registry.Send(c.hostID, ConfigPolicyInventoryRequest{Type: "config_policy_journal_inventory_request", InventoryID: c.policyInventoryID, BootIncarnation: c.bootIncarnation, ConnectionIncarnation: c.connectionIncarnation, Cursor: page.NextCursor})
+	}
+	active := map[string]hostcfg.PolicySnapshot{}
+	for group, snapshot := range page.ActiveSnapshots {
+		if hostcfg.IsPolicyGroup(group) {
+			active[group] = hostcfg.PolicySnapshot{Kind: snapshot.Kind, Digest: snapshot.Digest}
+		}
+	}
+	c.policyActiveSnapshots.Store(&active)
+	if !c.policyInventoryBlocked.Load() {
+		if err := h.cfgStore.ReconcilePolicySnapshots(ctx, c.hostID, c.connectionIncarnation, active); err != nil {
+			return err
+		}
+	}
+	c.rh05Snapshots = make(map[string]hostcfg.PolicySnapshot)
+	if snapshot, ok := page.ActiveSnapshots["hardware"]; ok {
+		c.rh05Snapshots["hardware"] = hostcfg.PolicySnapshot{Kind: snapshot.Kind, Digest: snapshot.Digest}
+	}
+	c.policyInventoryDone.Store(true)
+	if !c.policyInventoryBlocked.Load() {
+		if err := h.cfgStore.CompleteJournalReconciliation(ctx, c.hostID, c.connectionIncarnation, c.rh05RestartEntries, c.rh05Snapshots); err != nil {
+			return err
+		}
+	}
+	if err := h.maybeSendInitialPolicyMap(ctx, c); err != nil {
+		return err
+	}
+	return h.maybeRunDeferredPolicyRefresh(ctx, c)
+}
+
+func sameCursor(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func (h *Handler) restartPolicyInventory(ctx context.Context, c *conn) error {
+	opened, err := h.cfgStore.BeginCurrentJournalRefresh(ctx, c.hostID, c.connectionIncarnation)
+	if err != nil {
+		return err
+	}
+	if !opened {
+		gate, err := h.cfgStore.JournalGate(ctx, c.hostID)
+		if err != nil {
+			return err
+		}
+		if gate == "pending" && c.policyInventoryDone.Load() && c.policyInventoryBlocked.Load() {
+			// A terminal report can resolve the historical entry that blocked
+			// the just-finished inventory. Its DB gate is already pending and
+			// held, so request a new snapshot on this socket immediately.
+		} else if gate == "pending" {
+			c.policyRefreshPending = true
+			return nil
+		} else {
+			return nil
+		}
+	}
+	deliveryGate, err := h.cfgStore.PolicyDeliveryGate(ctx, c.hostID, c.connectionIncarnation)
+	if err != nil {
+		return err
+	}
+	if deliveryGate {
+		c.policyDeliveryID = ""
+		c.policyDeliverySentAt = time.Time{}
+		c.policyInitialMapApplied.Store(false)
+	}
+	c.policyRefreshPending = false
+	c.policyInventoryDone.Store(false)
+	c.policyInventoryBlocked.Store(false)
+	c.policyInventoryUnknown = false
+	c.policyInventoryID = newPolicyUUID()
+	c.policyInventorySnapshotID = ""
+	c.policyInventoryCursor = nil
+	c.policyInventoryHeader = nil
+	c.rh05RestartEntries = nil
+	c.rh05Snapshots = nil
+	c.policyOutstanding = nil
+	c.policySequence = nil
+	c.policySequenceContent = nil
+	c.policyAttemptOutstanding.Store(false)
+	c.policyActiveSnapshots.Store(nil)
+	return h.registry.Send(c.hostID, ConfigPolicyInventoryRequest{Type: "config_policy_journal_inventory_request", InventoryID: c.policyInventoryID, BootIncarnation: c.bootIncarnation, ConnectionIncarnation: c.connectionIncarnation})
+}
+
+func (h *Handler) maybeRunDeferredPolicyRefresh(ctx context.Context, c *conn) error {
+	if !c.policyRefreshPending || !c.policyInventoryDone.Load() || c.policyInventoryBlocked.Load() {
+		return nil
+	}
+	gate, err := h.cfgStore.JournalGate(ctx, c.hostID)
+	if err != nil || gate != "complete" {
+		return err
+	}
+	return h.restartPolicyInventory(ctx, c)
+}
+
 // SetImageEvents wires the image-management P2 callback surface (image_state
 // ingest + register reconciliation + ensure-on-connect). A setter rather than a
 // NewHandler parameter — the constructor already carries eight, and the ensure
@@ -251,6 +632,10 @@ func (h *Handler) SetImageEvents(ev ImageEvents) {
 		ev = noopImageEvents{}
 	}
 	h.imageEvents = ev
+}
+
+func (h *Handler) SetImageCleanupEvents(ev ImageCleanupEvents) {
+	h.cleanupEvents = ev
 }
 
 // SetReleaseEvents wires the platform-apply callback surface (release_state
@@ -323,7 +708,7 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 
 	// Step 1 — register
 	registerCtx, cancelRegister := context.WithTimeout(bg, handshakeTimeout)
-	hostID, regImages, regCommit, err := h.handleRegister(registerCtx, conn, clientIP)
+	hostID, regImages, regCommit, terminalHomeCleanupV1, policyTyped, acceptedGroups, connectionID, cleanupRegister, err := h.handleRegister(registerCtx, conn, clientIP)
 	cancelRegister()
 	h.failures.Release(clientIP)
 	if err != nil {
@@ -353,9 +738,23 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	// skips the local-display leg. Queuing config_update first guarantees it
 	// precedes any assign on the single writer.
 	ac := newConn(hostID, conn)
+	ac.terminalHomeCleanupV1 = terminalHomeCleanupV1
+	ac.policyTyped = policyTyped
+	ac.policyAccepted = acceptedGroups
+	ac.policyIdle = slices.Contains(acceptedGroups, "hardware")
+	ac.bootIncarnation = h.bootIncarnation
+	ac.connectionIncarnation = connectionID
+	ac.imageCleanupV1 = cleanupRegister.Capable
+	ac.imageVersionsComplete = cleanupRegister.Complete
+	ac.imageVersions = cleanupRegister.Versions
+	if cleanupRegister.Capable {
+		ac.imageVersionsObservedAt = time.Now().UTC()
+	}
 	h.registry.add(ac)
 	go ac.runWriter(h.log)
-
+	// Every path after add, including a rejected reconciliation start, must
+	// remove this socket before registration can be retried. The lifecycle gate
+	// ensures a displaced socket never reaps its newer owner.
 	defer func() {
 		// schema.md invariant #3: a lost agent connection reaps the host's
 		// non-terminal sessions to failed — but only if this connection is
@@ -364,11 +763,24 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 		h.registry.removeWithLifecycle(ac, func() {
 			ctx, cancel := context.WithTimeout(bg, agentDBCallTimeout)
 			defer cancel()
+			if ac.policyTyped && h.cfgStore != nil {
+				if err := h.cfgStore.EndJournalConnection(ctx, hostID, ac.connectionIncarnation); err != nil {
+					h.log.Warn("RH05 journal disconnect fence failed", "host_id", hostID, "err", err)
+				}
+			}
 			h.events.HostDisconnected(ctx, hostID)
 			// Bounds the rate-limiter map by the live connection set.
 			h.imageLimiter.evict(hostID)
 		})
 	}()
+	if policyTyped && h.cfgStore != nil {
+		if err := h.cfgStore.BeginJournalReconciliation(bg, hostID, ac.connectionIncarnation); err != nil {
+			return fmt.Errorf("begin RH05 journal reconciliation: %w", err)
+		}
+		if err := h.cfgStore.InvalidatePolicyEvidenceOnReconnect(bg, hostID); err != nil {
+			h.log.Warn("policy reconnect reconciliation failed", "host_id", hostID, "err", err)
+		}
+	}
 
 	// Push settings + console config (agent-api.md `config_update`) before the
 	// capacity handshake can assign a session (see above). Fire-and-forget: a
@@ -383,13 +795,11 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 				cmd.SourcePolicies = snapshot
 			}
 		}
-		if h.cfgStore != nil {
-			if overrides, err := h.cfgStore.Get(bg, hostID); err != nil {
+		if h.cfgStore != nil && !policyTyped {
+			if overrides, err := h.cfgStore.LegacyOwnedOverrides(bg, hostID, nil); err != nil {
 				h.log.Warn("config_update snapshot: load host settings failed", "host_id", hostID, "err", err)
 			} else {
-				// #194: only explicit overrides — the full resolved map silently
-				// clobbered a host's QUASAR_ENCODER with the catalog default.
-				cmd.Settings = hostcfg.AgentOverrides(overrides)
+				cmd.Settings = overrides
 			}
 		}
 		if h.consoleStore != nil {
@@ -406,6 +816,8 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			h.log.Warn("config_update snapshot: send failed", "host_id", hostID, "err", err)
 		}
 	}
+	h.offerNextSessionPolicy(bg, ac)
+	h.offerIdlePolicy(bg, ac)
 
 	// Reconcile before processing capacity: handleCapacity may auto-start a
 	// console session, and reaping after that launch would mark it stale and
@@ -420,14 +832,26 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 	// so the snapshot must be bounded/sanitized before it reaches ImageEvents
 	// (one DB op per entry).
 	sanitizedImages, imagesReported := sanitizeRegisterImages(regImages, h.log, hostID)
-	h.imageEvents.AgentImagesRegistered(bg, hostID, sanitizedImages, imagesReported)
+	h.registry.withCurrent(ac, func() {
+		h.imageEvents.AgentImagesRegistered(bg, hostID, sanitizedImages, imagesReported)
+	})
+	if ac.imageCleanupV1 && h.cleanupEvents != nil {
+		h.cleanupEvents.ImageCleanupRegistered(bg, hostID)
+	}
 
 	// Step 3 — capacity (protocol requires it next). Its console auto-start
 	// runs only after config_update is queued and stale sessions reconciled.
-	if err := h.handleCapacity(bg, conn, hostID); err != nil {
+	if err := h.handleCapacity(bg, conn, ac); err != nil {
 		return fmt.Errorf("capacity: %w", err)
 	}
 	h.log.Info("agent capacity received", "host_id", hostID)
+	h.startHomeCleanupRetry(hostID, ac)
+	if ac.policyTyped {
+		ac.policyInventoryID = newPolicyUUID()
+		if err := h.registry.Send(hostID, ConfigPolicyInventoryRequest{Type: "config_policy_journal_inventory_request", InventoryID: ac.policyInventoryID, BootIncarnation: ac.bootIncarnation, ConnectionIncarnation: ac.connectionIncarnation}); err != nil {
+			return fmt.Errorf("request policy inventory: %w", err)
+		}
+	}
 
 	// Step 4 — message loop: heartbeats, acks, and session_state callbacks.
 	for {
@@ -436,6 +860,12 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 		case <-reqCtx.Done():
 			return nil
 		default:
+		}
+		// A lost initial map or acknowledgement must not leave an apparently
+		// connected host gated forever. Renegotiate after a bounded wait; the
+		// durable gate remains closed until a current-connection exact-ID ack.
+		if ac.policyDeliveryID != "" && !ac.policyDeliverySentAt.IsZero() && time.Since(ac.policyDeliverySentAt) > readDeadlineDur && !ac.policyInitialMapApplied.Load() {
+			return errors.New("policy initial settings map acknowledgement timed out")
 		}
 
 		conn.SetReadDeadline(time.Now().Add(readDeadlineDur))
@@ -465,6 +895,14 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 				h.log.Error("heartbeat update failed", "host_id", hostID, "err", err)
 			} else {
 				h.log.Debug("heartbeat", "host_id", hostID, "running_sessions", len(hb.RunningSessions))
+				if ac.policyTyped && h.cfgStore != nil {
+					idleCtx, idleCancel := context.WithTimeout(bg, agentDBCallTimeout)
+					idleErr := h.cfgStore.ObserveIdleHeartbeat(idleCtx, hostID, ac.connectionIncarnation, hb.RunningSessions)
+					idleCancel()
+					if err := idleErr; err != nil {
+						h.log.Warn("RH05 idle inventory heartbeat rejected", "host_id", hostID, "err", err)
+					}
+				}
 			}
 			// #128: the agent's own list is ground truth for this host. Same
 			// connection-lifetime ctx + deadline as the heartbeat write above, so
@@ -477,6 +915,8 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			// #383: VRAM telemetry, off the read loop (vramQueue). An absent
 			// gpu_vram key is a no-op — the stored sample ages out.
 			h.vram.enqueue(vramSampleBatch{hostID: hostID, agentMs: hb.TsUnixMs, samples: hb.GPUVram})
+			h.offerNextSessionPolicy(bg, ac)
+			h.offerIdlePolicy(bg, ac)
 		case "ack":
 			var a AckMsg
 			if err := json.Unmarshal(raw, &a); err != nil {
@@ -486,14 +926,17 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			if a.Error != nil {
 				res.Error = *a.Error
 			}
-			h.registry.resolveAck(hostID, a.ID, res)
+			h.registry.resolveAckFromConn(ac, a.ID, res)
 		case "session_state":
 			var m SessionStateMsg
 			if err := json.Unmarshal(raw, &m); err != nil {
 				return fmt.Errorf("decode session_state: %w", err)
 			}
 			stateCtx, stateCancel := context.WithTimeout(bg, agentDBCallTimeout)
-			h.registry.withCurrent(ac, func() { h.events.AgentState(stateCtx, hostID, m) })
+			h.registry.withCurrent(ac, func() {
+				m.HomeCleanupQualified = ac.terminalHomeCleanupV1
+				h.events.AgentState(stateCtx, hostID, m)
+			})
 			stateCancel()
 		case "session_metrics":
 			// Fire-and-forget; malformed drops the message, never the connection
@@ -530,10 +973,239 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			// CM-06/07 hotplug re-report. Fire-and-forget — a decode/upsert
 			// failure must never drop the connection.
 			capCtx, capCancel := context.WithTimeout(bg, agentDBCallTimeout)
-			err := h.processCapacity(capCtx, hostID, raw)
+			var err error
+			h.registry.withCurrent(ac, func() { err = h.processCapacity(capCtx, ac, raw) })
 			capCancel()
 			if err != nil {
 				h.log.Warn("capacity re-report failed", "host_id", hostID, "err", err)
+			}
+		case "config_policy_journal_inventory_page":
+			var inventoryErr error
+			if !h.registry.withCurrent(ac, func() { inventoryErr = h.acceptPolicyInventoryPage(bg, ac, raw) }) {
+				continue
+			}
+			if err := inventoryErr; err != nil {
+				h.log.Warn("policy inventory rejected", "host_id", hostID, "err", err)
+				return err
+			}
+		case "config_policy_feature_error":
+			if !ac.policyTyped || h.cfgStore == nil {
+				continue
+			}
+			var report struct {
+				Code                  string  `json:"code"`
+				Group                 *string `json:"group"`
+				ConnectionIncarnation string  `json:"connection_incarnation"`
+			}
+			if err := json.Unmarshal(raw, &report); err != nil || report.ConnectionIncarnation != ac.connectionIncarnation {
+				continue
+			}
+			if report.Code == "group_execution_unavailable" && report.Group != nil && hostcfg.IsPolicyGroup(*report.Group) {
+				var parkErr error
+				h.registry.withCurrent(ac, func() { parkErr = h.cfgStore.ParkPolicyGroupUpgradeRequired(bg, hostID, *report.Group) })
+				if parkErr != nil {
+					return parkErr
+				}
+				continue
+			}
+			if report.Code == "ownership_echo_invalid" || report.Code == "attempt_conflict" {
+				var holdErr error
+				if h.registry.withCurrent(ac, func() {
+					ac.policyInventoryBlocked.Store(true)
+					holdErr = h.cfgStore.HoldPolicyConnection(bg, hostID, ac.connectionIncarnation)
+				}) {
+					if holdErr != nil {
+						return holdErr
+					}
+					h.log.Warn("agent reported policy feature conflict", "host_id", hostID, "code", report.Code, "group", report.Group)
+					return errors.New("policy feature conflict requires reconnect")
+				}
+			}
+		case "config_policy_state":
+			if !ac.policyTyped || h.cfgStore == nil {
+				continue
+			}
+			boot, connection, current := h.registry.PolicyIdentity(hostID)
+			if !current || boot != ac.bootIncarnation || connection != ac.connectionIncarnation {
+				continue
+			}
+			var state ConfigPolicyStateMsg
+			if err := json.Unmarshal(raw, &state); err != nil {
+				h.log.Warn("invalid config policy state", "host_id", hostID, "err", err)
+				continue
+			}
+			if state.HostID != hostID {
+				continue
+			}
+			if state.Scope == "restart" {
+				if !ac.policyIdle {
+					continue
+				}
+				fresh, err := ac.acceptPolicySequence(state)
+				if err != nil {
+					ac.policyInventoryBlocked.Store(true)
+					if holdErr := h.cfgStore.HoldPolicyConnection(bg, hostID, ac.connectionIncarnation); holdErr != nil {
+						return holdErr
+					}
+					return err
+				}
+				if !fresh {
+					continue
+				}
+				if state.Phase == "failed" && state.JournalSequence == "0" && policyStateErrorCode(state.Error) == "journal_write_failed" {
+					// The write may have reached the atomic journal before the error.
+					// Keep admission protected and request complete proof now.
+					if !ac.policyInventoryDone.Load() {
+						continue
+					}
+					if err := h.restartPolicyInventory(bg, ac); err != nil {
+						return err
+					}
+					continue
+				}
+				var observedAt *time.Time
+				if state.Phase == "applied" {
+					if state.ActiveScope == nil || *state.ActiveScope != "restart" || state.Evidence == nil ||
+						state.Evidence.Revision != state.Revision || state.Evidence.ContentSHA256 != state.ContentSHA256 ||
+						state.Evidence.AgentProcessID == "" {
+						continue
+					}
+					at, err := time.Parse(time.RFC3339Nano, state.Evidence.ObservedAt)
+					if err != nil {
+						continue
+					}
+					observedAt = &at
+				}
+				idle := hostcfg.IdleJournalState{AttemptID: state.AttemptID, Group: state.Group,
+					Revision: state.Revision, Digest: state.ContentSHA256,
+					GrantBoot: state.GrantBootIncarnation, GrantConnection: state.GrantConnectionIncarnation,
+					Phase: state.Phase, Sequence: state.JournalSequence, ErrorCode: policyStateErrorCode(state.Error), VerifiedAt: observedAt}
+				if _, err := h.cfgStore.ObserveIdleState(bg, hostID, ac.connectionIncarnation, idle); err != nil {
+					h.log.Warn("idle policy journal state rejected", "host_id", hostID, "attempt_id", state.AttemptID, "err", err)
+				} else if state.Phase == "failed" && state.JournalSequence == "0" {
+					h.offerIdlePolicy(bg, ac)
+				}
+				continue
+			}
+			if !policyGrantMatches(ac, state) {
+				continue
+			}
+			if scope, known := hostcfg.PolicyGroupScope(state.Group); !known || scope != "next_session" || state.Scope != scope {
+				continue
+			}
+			view, err := h.cfgStore.GetPolicy(bg, hostID)
+			if err != nil {
+				h.log.Warn("config policy status load failed", "host_id", hostID, "err", err)
+				continue
+			}
+			matching := policyEntryMatchesDesired(view.Groups[state.Group], state)
+			_, historical := ac.policyOutstanding[state.AttemptID]
+			if !matching && !historical {
+				continue
+			}
+			switch state.Phase {
+			case "accepted", "activating", "awaiting_startup", "verifying", "recovery_verifying", "recovery_awaiting_startup", "uncertain", "failed", "recovered", "revoked_unstarted", "applied":
+			default:
+				continue
+			}
+			if state.Phase == "applied" && (state.ActiveScope == nil || *state.ActiveScope != "next_session" || state.Evidence == nil || state.Evidence.Revision != state.Revision || state.Evidence.ContentSHA256 != state.ContentSHA256 || state.Evidence.AgentProcessID == "" || state.Evidence.ObservedAt == "") {
+				continue
+			}
+			fresh, err := ac.acceptPolicySequence(state)
+			if err != nil {
+				ac.policyInventoryBlocked.Store(true)
+				if holdErr := h.cfgStore.HoldPolicyConnection(bg, hostID, ac.connectionIncarnation); holdErr != nil {
+					return holdErr
+				}
+				return err
+			}
+			if !fresh {
+				continue
+			}
+			switch state.Phase {
+			case "accepted", "activating", "awaiting_startup", "verifying", "recovery_verifying", "recovery_awaiting_startup":
+				if ac.policyOutstanding == nil {
+					ac.policyOutstanding = map[string]ConfigPolicyStateMsg{}
+				}
+				ac.policyOutstanding[state.AttemptID] = state
+				ac.policyAttemptOutstanding.Store(true)
+				if !matching {
+					ac.policyInventoryBlocked.Store(true)
+					if err := h.cfgStore.HoldPolicyConnection(bg, hostID, ac.connectionIncarnation); err != nil {
+						return err
+					}
+				}
+				continue
+			case "uncertain":
+				ac.policyUncertain = true
+				ac.policyInventoryBlocked.Store(true)
+				if err := h.cfgStore.HoldPolicyConnection(bg, hostID, ac.connectionIncarnation); err != nil {
+					return err
+				}
+				continue
+			case "failed", "recovered", "revoked_unstarted":
+				if state.Phase == "failed" && matching {
+					// Invalid intent fails without retry; a transient failure
+					// keeps the backoff its offer already claimed.
+					var rejectErr error
+					h.registry.withCurrent(ac, func() {
+						_, rejectErr = h.cfgStore.ObservePolicyRejected(bg, hostID, state.Group, state.Revision, state.ContentSHA256, policyStateErrorCode(state.Error))
+					})
+					if rejectErr != nil {
+						h.log.Warn("config policy rejection record failed", "host_id", hostID, "group", state.Group, "err", rejectErr)
+					}
+				}
+				if historical {
+					if err := h.restartPolicyInventory(bg, ac); err != nil {
+						return err
+					}
+				}
+				continue
+			case "applied":
+			default:
+				continue
+			}
+			if !matching {
+				// A historical attempt may finish after the operator changed the
+				// desired choice. Re-inventory its active readback before admitting
+				// new work; its old result never applies the new choice.
+				if err := h.restartPolicyInventory(bg, ac); err != nil {
+					return err
+				}
+				continue
+			}
+			expected, resolvable, err := h.cfgStore.ExpectedPolicyResolved(bg, hostID, ac.connectionIncarnation, state.Group)
+			if err != nil {
+				h.log.Warn("config policy expectation load failed", "host_id", hostID, "group", state.Group, "err", err)
+				continue
+			}
+			if !resolvable || !policyEvidenceMatches(expected, state.Evidence.ResolvedSettings) {
+				continue
+			}
+			var observeErr error
+			var applied bool
+			h.registry.withCurrent(ac, func() {
+				applied, observeErr = h.cfgStore.ObservePolicyApplied(bg, hostID, state.Group, state.Revision, state.ContentSHA256, state.Scope, ac.connectionIncarnation)
+			})
+			if err := observeErr; err != nil {
+				h.log.Warn("config policy observation failed", "host_id", hostID, "err", err)
+			} else if applied {
+				if state.Group == "zerocopy" {
+					// Probe-proven codecs were measured under the old value; withdraw
+					// them until the agent re-probes and re-reports capacity.
+					if err := h.store.withdrawStaleProbeCodecs(bg, hostID, "zerocopy", expected["zerocopy"]); err != nil {
+						h.log.Warn("stale probe codec withdrawal failed", "host_id", hostID, "err", err)
+					}
+				}
+				ac.setActivePolicySnapshot(state.Group, hostcfg.PolicySnapshot{Kind: "verified", Digest: state.ContentSHA256})
+				delete(ac.policyOutstanding, state.AttemptID)
+				ac.policyAttemptOutstanding.Store(len(ac.policyOutstanding) != 0)
+				if len(ac.policyOutstanding) == 0 && !ac.policyUncertain && !ac.policyInventoryUnknown {
+					ac.policyInventoryBlocked.Store(false)
+					if err := h.maybeSendInitialPolicyMap(bg, ac); err != nil {
+						h.log.Warn("policy map after recovery failed", "host_id", hostID, "err", err)
+					}
+				}
 			}
 		case "image_state":
 			// Image-management P2, fire-and-forget. Malformed drops the message,
@@ -560,8 +1232,37 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 			// Throttled by contract (≤ every 2 s per image during a pull), so a
 			// synchronous bounded upsert cannot congest the read loop.
 			imgCtx, imgCancel := context.WithTimeout(bg, agentDBCallTimeout)
-			h.imageEvents.AgentImageState(imgCtx, hostID, m)
+			h.registry.withCurrent(ac, func() {
+				h.imageEvents.AgentImageState(imgCtx, hostID, m)
+			})
 			imgCancel()
+		case "image_versions_state":
+			var m ImageVersionsStateMsg
+			var changed bool
+			if json.Unmarshal(raw, &m) == nil {
+				changed = h.registry.updateImageVersions(ac, m)
+			} else {
+				// Decode the revision independently: a non-Boolean reference field
+				// rejects the typed payload, but must revoke any newer complete scan.
+				var header struct {
+					InventoryRevision string `json:"inventory_revision"`
+				}
+				_ = json.Unmarshal(raw, &header)
+				changed = h.registry.invalidateImageVersions(ac, header.InventoryRevision)
+			}
+			if changed && h.cleanupEvents != nil {
+				h.cleanupEvents.ImageVersionsChanged(bg, hostID)
+			}
+		case "image_cleanup_state":
+			var m ImageCleanupStateMsg
+			if ac.imageCleanupV1 && h.cleanupEvents != nil && json.Unmarshal(raw, &m) == nil {
+				h.registry.withCurrent(ac, func() { h.cleanupEvents.ImageCleanupState(bg, hostID, m) })
+			}
+		case "image_cleanup_journal":
+			var m ImageCleanupJournalMsg
+			if ac.imageCleanupV1 && h.cleanupEvents != nil && json.Unmarshal(raw, &m) == nil {
+				h.registry.withCurrent(ac, func() { h.cleanupEvents.ImageCleanupJournal(bg, hostID, m) })
+			}
 		case "release_state":
 			// Fire-and-forget apply progress. No token bucket: the contract
 			// throttles it to one message per 2 s and the database allows at
@@ -602,10 +1303,10 @@ func (h *Handler) handleConn(reqCtx context.Context, conn *websocket.Conn, clien
 // The third return value is the identity commit the agent reported (nil when it
 // reported none or one this build refused), which the caller hands to the
 // platform-apply success-evidence hook.
-func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clientIP string) (string, []RegisterImage, *string, error) {
-	fail := func(err error) (string, []RegisterImage, *string, error) {
+func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clientIP string) (string, []RegisterImage, *string, bool, bool, []string, string, ImageCleanupRegister, error) {
+	fail := func(err error) (string, []RegisterImage, *string, bool, bool, []string, string, ImageCleanupRegister, error) {
 		h.failures.Failure(clientIP)
-		return "", nil, nil, err
+		return "", nil, nil, false, false, nil, "", ImageCleanupRegister{}, err
 	}
 	conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	raw, err := readTextMessage(conn)
@@ -700,13 +1401,53 @@ func (h *Handler) handleRegister(ctx context.Context, conn *websocket.Conn, clie
 		NodeSecret:          result.NodeSecret,
 		HeartbeatIntervalMs: heartbeatIntervalMs,
 	}
-	if err := conn.WriteJSON(resp); err != nil {
-		return "", nil, nil, fmt.Errorf("write registered: %w", err)
+	policyTyped := reg.ConfigPolicyVersions["typed_settings"] == 2
+	connectionID := newPolicyUUID()
+	acceptedGroups := []string{}
+	if policyTyped {
+		validGroups := reg.ConfigPolicyGroups != nil && sort.StringsAreSorted(reg.ConfigPolicyGroups)
+		for i, group := range reg.ConfigPolicyGroups {
+			if i > 0 && reg.ConfigPolicyGroups[i-1] == group {
+				validGroups = false
+			}
+		}
+		if validGroups && reg.ConfigPolicyVersions["execution_journal"] == 1 && reg.ConfigPolicyVersions["deployment_baseline"] == 1 {
+			// Restart ownership is negotiated only with the idle executor capability.
+			nextSession := map[string]bool{}
+			for _, group := range hostcfg.NextSessionPolicyGroups() {
+				nextSession[group] = true
+			}
+			for _, group := range reg.ConfigPolicyGroups {
+				scope, known := hostcfg.PolicyGroupScope(group)
+				if nextSession[group] || reg.ConfigPolicyVersions["idle_apply"] == 1 && known && scope == "restart" {
+					acceptedGroups = append(acceptedGroups, group)
+				}
+			}
+		}
+		resp.BootIncarnation = h.bootIncarnation
+		resp.ConnectionIncarnation = connectionID
+		resp.ConfigPolicyGroups = &acceptedGroups
 	}
-	return result.HostID, reg.Images, identity.SourceCommit, nil
+	if h.cfgStore != nil {
+		if _, err := h.cfgStore.BeginPolicyConnection(ctx, result.HostID, connectionID, reg.ConfigPolicyVersions, reg.ConfigPolicyGroups, policyTyped); err != nil {
+			return fail(fmt.Errorf("register policy connection: %w", err))
+		}
+	}
+	if err := conn.WriteJSON(resp); err != nil {
+		return "", nil, nil, false, false, nil, "", ImageCleanupRegister{}, fmt.Errorf("write registered: %w", err)
+	}
+	cleanupRegister := ImageCleanupRegister{Capable: reg.ImageCleanupV1}
+	if reg.ImageCleanupV1 {
+		var versions []ImageVersionEntry
+		if json.Unmarshal(reg.ImageVersions, &versions) == nil && validImageVersions(versions, reg.ImageVersionsComplete) {
+			cleanupRegister.Complete = reg.ImageVersionsComplete
+			cleanupRegister.Versions = versions
+		}
+	}
+	return result.HostID, reg.Images, identity.SourceCommit, reg.TerminalHomeCleanupV1, policyTyped, acceptedGroups, connectionID, cleanupRegister, nil
 }
 
-func (h *Handler) handleCapacity(ctx context.Context, conn *websocket.Conn, hostID string) error {
+func (h *Handler) handleCapacity(ctx context.Context, conn *websocket.Conn, ac *conn) error {
 	conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	raw, err := readTextMessage(conn)
 	if err != nil {
@@ -721,7 +1462,9 @@ func (h *Handler) handleCapacity(ctx context.Context, conn *websocket.Conn, host
 		return fmt.Errorf("expected capacity, got %q", msgType)
 	}
 
-	return h.processCapacity(ctx, hostID, raw)
+	var processErr error
+	h.registry.withCurrent(ac, func() { processErr = h.processCapacity(ctx, ac, raw) })
+	return processErr
 }
 
 // describeHandshakeRead names the one register-read failure operators meet in the
@@ -758,10 +1501,40 @@ func readTextMessage(conn *websocket.Conn) ([]byte, error) {
 // console capabilities, CM-06 auto-start diffing). Called once at the
 // handshake (handleCapacity) and again on every re-sent "capacity" message in
 // the connection's message loop (CM-06/07 hotplug re-report).
-func (h *Handler) processCapacity(ctx context.Context, hostID string, raw []byte) error {
+func (h *Handler) processCapacity(ctx context.Context, ac *conn, raw []byte) error {
+	hostID := ac.hostID
 	var cap CapacityMsg
 	if err := json.Unmarshal(raw, &cap); err != nil {
 		return fmt.Errorf("decode: %w", err)
+	}
+	if ac.policyTyped && h.cfgStore != nil {
+		if cap.ConfigPolicyAcceptedGroups != nil && slices.Equal(*cap.ConfigPolicyAcceptedGroups, ac.policyAccepted) {
+			if ok, err := h.cfgStore.ConfirmPolicyGroups(ctx, hostID, ac.connectionIncarnation, ac.policyAccepted); err != nil {
+				return err
+			} else if ok {
+				ac.policyAcknowledged.Store(true)
+			}
+		}
+		if len(cap.DeploymentSettings) > 0 {
+			if err := h.cfgStore.ObserveDeploymentSettings(ctx, hostID, ac.connectionIncarnation, cap.DeploymentSettings); err != nil {
+				return err
+			}
+		}
+		if ac.policyAcknowledged.Load() && ac.policyInventoryDone.Load() && !ac.policyInventoryBlocked.Load() && cap.ConfigPolicyLegacyMapAppliedID != nil {
+			if ok, err := h.cfgStore.AcknowledgeInitialDelivery(ctx, hostID, ac.connectionIncarnation, *cap.ConfigPolicyLegacyMapAppliedID); err != nil {
+				return err
+			} else if ok {
+				ac.policyInitialMapApplied.Store(true)
+				if err := h.cfgStore.CompleteJournalReconciliation(ctx, hostID, ac.connectionIncarnation, ac.rh05RestartEntries, ac.rh05Snapshots); err != nil {
+					return err
+				}
+				if err := h.maybeRunDeferredPolicyRefresh(ctx, ac); err != nil {
+					return err
+				}
+				h.offerNextSessionPolicy(ctx, ac)
+				h.offerIdlePolicy(ctx, ac)
+			}
+		}
 	}
 	detection, reason, gpus, err := normalizeCapacityReport(cap)
 	if err != nil {
@@ -769,6 +1542,11 @@ func (h *Handler) processCapacity(ctx context.Context, hostID string, raw []byte
 	}
 	if err := h.store.upsertCapacityWithDetection(ctx, hostID, cap.Host, cap.EffectiveSettings, gpus, detection, reason); err != nil {
 		return err
+	}
+	if ac.policyTyped {
+		if err := h.maybeSendInitialPolicyMap(ctx, ac); err != nil {
+			return err
+		}
 	}
 	if h.preparation != nil && cap.SourcePreparation != nil {
 		if changed, err := h.preparation.AcceptReport(ctx, hostID, cap.SourcePreparation); err != nil {
@@ -787,8 +1565,22 @@ func (h *Handler) processCapacity(ctx context.Context, hostID string, raw []byte
 	if err := h.store.upsertHostCodecPixelRates(ctx, hostID, cap.CodecThroughput); err != nil {
 		h.log.Warn("host codec throughput upsert failed", "host_id", hostID, "err", err)
 	}
-	if err := h.store.upsertHostReadiness(ctx, hostID, cap.Readiness); err != nil {
-		h.log.Warn("host readiness upsert failed", "host_id", hostID, "err", err)
+	readinessErr := h.store.upsertHostReadiness(ctx, hostID, cap.Readiness)
+	if readinessErr != nil {
+		h.log.Warn("host readiness upsert failed", "host_id", hostID, "err", readinessErr)
+	}
+	if ac.policyTyped && h.cfgStore != nil {
+		gpuRaw, err := json.Marshal(gpus)
+		if err != nil {
+			return err
+		}
+		readinessRaw := cap.Readiness
+		if readinessErr != nil {
+			readinessRaw = nil
+		}
+		if err := h.cfgStore.ObserveHardwareReport(ctx, hostID, ac.connectionIncarnation, gpuRaw, readinessRaw); err != nil {
+			return err
+		}
 	}
 	if h.consoleStore != nil && cap.ConsoleCapabilities != nil {
 		if err := h.consoleStore.UpsertCapabilities(ctx, hostID, *cap.ConsoleCapabilities); err != nil {

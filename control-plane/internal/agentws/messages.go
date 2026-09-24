@@ -23,15 +23,23 @@ func peekType(raw []byte) (string, error) {
 
 // RegisterMsg is the first message the agent sends after every connect.
 type RegisterMsg struct {
-	SourcePolicyVersions map[string]int  `json:"source_policy_versions,omitempty"`
-	Type                 string          `json:"type"`
-	NodeName             string          `json:"node_name"`
-	AgentVersion         string          `json:"agent_version"`
-	Auth                 json.RawMessage `json:"auth"`
+	SourcePolicyVersions  map[string]int  `json:"source_policy_versions,omitempty"`
+	TerminalHomeCleanupV1 bool            `json:"terminal_home_cleanup_v1,omitempty"`
+	ConfigPolicyVersions  map[string]int  `json:"config_policy_versions,omitempty"`
+	ConfigPolicyGroups    []string        `json:"config_policy_groups"`
+	Type                  string          `json:"type"`
+	NodeName              string          `json:"node_name"`
+	AgentVersion          string          `json:"agent_version"`
+	Auth                  json.RawMessage `json:"auth"`
 	// Images (image-management P2) is a wholesale snapshot of the agent's managed
 	// images. Keep-if-absent: nil ⇒ key absent, stored host_images rows untouched;
 	// an explicit [] is a real "I have none" and flips ready rows to absent.
-	Images []RegisterImage `json:"images"`
+	Images                []RegisterImage `json:"images"`
+	ImageCleanupV1        bool            `json:"image_cleanup_v1"`
+	ImageVersionsComplete bool            `json:"image_versions_complete"`
+	// Decode cleanup inventory after registration authentication. Malformed
+	// optional inventory must not reject an otherwise healthy host reconnect.
+	ImageVersions json.RawMessage `json:"image_versions"`
 
 	// Platform-release identity (amendment 1, agent-api.md §register): four
 	// OPTIONAL flat fields describing the build the agent IS. Pointers, so
@@ -62,18 +70,69 @@ type AuthReconnect struct {
 
 // RegisteredMsg is the control-plane reply to register.
 type RegisteredMsg struct {
-	Type                string `json:"type"`
-	HostID              string `json:"host_id"`
-	NodeSecret          string `json:"node_secret,omitempty"`
-	HeartbeatIntervalMs int    `json:"heartbeat_interval_ms"`
+	Type                  string    `json:"type"`
+	HostID                string    `json:"host_id"`
+	NodeSecret            string    `json:"node_secret,omitempty"`
+	HeartbeatIntervalMs   int       `json:"heartbeat_interval_ms"`
+	BootIncarnation       string    `json:"boot_incarnation,omitempty"`
+	ConnectionIncarnation string    `json:"connection_incarnation,omitempty"`
+	ConfigPolicyGroups    *[]string `json:"config_policy_groups,omitempty"`
+}
+
+type ConfigPolicyStateMsg struct {
+	Type                       string          `json:"type"`
+	AttemptID                  string          `json:"attempt_id"`
+	HostID                     string          `json:"host_id"`
+	Group                      string          `json:"group"`
+	Revision                   string          `json:"revision"`
+	ContentSHA256              string          `json:"content_sha256"`
+	Scope                      string          `json:"scope"`
+	GrantBootIncarnation       string          `json:"grant_boot_incarnation"`
+	GrantConnectionIncarnation string          `json:"grant_connection_incarnation"`
+	JournalSequence            string          `json:"journal_sequence"`
+	Phase                      string          `json:"phase"`
+	Error                      json.RawMessage `json:"error"`
+	ActiveScope                *string         `json:"active_scope"`
+	Evidence                   *struct {
+		Revision         string         `json:"revision"`
+		ContentSHA256    string         `json:"content_sha256"`
+		ResolvedSettings map[string]any `json:"resolved_settings"`
+		AgentProcessID   string         `json:"agent_process_id"`
+		ObservedAt       string         `json:"observed_at"`
+	} `json:"evidence"`
+}
+
+type ConfigPolicyInventoryRequest struct {
+	Type                  string  `json:"type"`
+	InventoryID           string  `json:"inventory_id"`
+	BootIncarnation       string  `json:"boot_incarnation"`
+	ConnectionIncarnation string  `json:"connection_incarnation"`
+	Cursor                *string `json:"cursor"`
+}
+
+type ConfigPolicyInventoryPage struct {
+	Type              string            `json:"type"`
+	InventoryID       string            `json:"inventory_id"`
+	SnapshotID        string            `json:"snapshot_id"`
+	Cursor            *string           `json:"cursor"`
+	NextCursor        *string           `json:"next_cursor"`
+	RevisionHighWater map[string]string `json:"revision_high_water"`
+	ActiveSnapshots   map[string]struct {
+		Kind   string `json:"kind"`
+		Digest string `json:"digest"`
+	} `json:"active_snapshots"`
+	Entries []ConfigPolicyStateMsg `json:"entries"`
 }
 
 // CapacityMsg is a full capacity report from the agent.
 type CapacityMsg struct {
-	SourcePreparation *preparation.Reports `json:"source_preparation,omitempty"`
-	Type              string               `json:"type"`
-	Host              HostCapacity         `json:"host"`
-	GPUs              []GPUCapacity        `json:"gpus"`
+	DeploymentSettings             json.RawMessage      `json:"deployment_settings"`
+	ConfigPolicyAcceptedGroups     *[]string            `json:"config_policy_accepted_groups"`
+	ConfigPolicyLegacyMapAppliedID *string              `json:"config_policy_legacy_map_applied_id"`
+	SourcePreparation              *preparation.Reports `json:"source_preparation,omitempty"`
+	Type                           string               `json:"type"`
+	Host                           HostCapacity         `json:"host"`
+	GPUs                           []GPUCapacity        `json:"gpus"`
 	// GPUDetection is additive and fail-closed. Older agents omit it; a non-empty
 	// GPU list is then treated as ok, while an empty list is unavailable.
 	GPUDetection string `json:"gpu_detection,omitempty"`

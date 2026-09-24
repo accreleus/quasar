@@ -58,6 +58,21 @@ impl<T> ImageOperation<T> {
 }
 
 impl RuntimeClient {
+    pub fn remove_exact_image(
+        &self,
+        image_ref: impl Into<String>,
+        expected_id: impl Into<String>,
+        deadline: Duration,
+    ) -> Operation<super::ExactRemoval> {
+        let image_ref = image_ref.into();
+        let expected_id = expected_id.into();
+        let config = self.config.clone();
+        self.submit_owned(
+            async move { docker::remove_exact_image(&config, &image_ref, &expected_id).await },
+            deadline,
+            true,
+        )
+    }
     pub fn build_image(
         &self,
         request: BuildRequest,

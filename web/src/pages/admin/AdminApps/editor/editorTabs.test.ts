@@ -28,8 +28,14 @@ function app(over: Partial<AdminApp> = {}): AdminApp {
 }
 
 describe("editorTabs", () => {
-  it("gives a plain app five tabs, in the mock's order", () => {
-    expect(ids(base)).toEqual(["identity", "artwork", "access", "quality", "runtime"]);
+  it("gives a plain app the mock's five tabs, then Placement", () => {
+    expect(ids(base)).toEqual(["identity", "artwork", "access", "quality", "runtime", "placement"]);
+  });
+
+  it("routes Placement under the app and puts it before Library", () => {
+    const tabs = editorTabs({ ...base, isProvider: true });
+    expect(tabs.find((t) => t.id === "placement")?.to).toBe("/admin/library/apps/app-1/placement");
+    expect(tabs.map((t) => t.id).slice(-2)).toEqual(["placement", "library"]);
   });
 
   // Routes are keyed on the provider's app id, and a derived tile can never be

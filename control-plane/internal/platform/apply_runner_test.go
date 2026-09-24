@@ -225,6 +225,10 @@ func (f *fakeStore) OpenAttempts(context.Context) ([]Attempt, error) {
 	return out, nil
 }
 
+func (f *fakeStore) TerminalStandaloneAttemptsWithOwnedHolds(context.Context) ([]Attempt, error) {
+	return nil, nil // the fake has no durable admission table
+}
+
 func (f *fakeStore) Release(context.Context, string) (Release, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

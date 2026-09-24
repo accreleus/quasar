@@ -16,7 +16,14 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use super::template::CloneMode;
 use super::template::{TemplateSeed, TemplateStore};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct HomeSeedOutcome {
+    pub mode: &'static str,
+    pub reason: &'static str,
+}
 
 /// How long the du walk is allowed to run before returning whatever it has.
 const DU_TIMEOUT: Duration = Duration::from_secs(10);
@@ -91,9 +98,10 @@ pub(crate) fn configured_home_root() -> Option<PathBuf> {
     home_root()
 }
 
-/// Pre-launch: create any bind-mount host paths under `QUASAR_HOME_ROOT`.
-/// Called from `SessionResources::prepare` before the container launches.
-/// Never fails the session: errors are logged at warn.
+/// Legacy/non-Steam pre-launch provisioning under `QUASAR_HOME_ROOT`.
+/// Errors remain best-effort here. Steam uses
+/// [`provision_home_dirs_with_result`] so an uncertain managed home fails
+/// safely instead of being silently called cold.
 ///
 /// Docker creates a missing bind-mount source as `root:root 755`, unwritable by
 /// a non-root container user; pre-creating it as the agent user lets the
@@ -106,14 +114,44 @@ pub(crate) fn configured_home_root() -> Option<PathBuf> {
 /// cold (absent or empty) — a warm or non-empty home is never touched. Every
 /// seeding failure (clone, chown) is fail-open: logged, partial writes deleted,
 /// leaf left empty, session pays today's cold-boot cost. This function's
-/// never-fails-a-session contract is unchanged.
+/// best-effort contract applies to this compatibility wrapper only.
 pub fn provision_home_dirs(
     mounts: &[String],
     home_root: &str,
     template: Option<TemplateSeeder<'_>>,
 ) {
+    if let Some(root) = resolve_root(home_root) {
+        let candidates: Vec<PathBuf> = mounts
+            .iter()
+            .filter_map(|m| host_path_of(m))
+            .filter(|h| is_under_root(&root, h))
+            .collect();
+        if candidates.len() > 1 {
+            for host in candidates {
+                if let Err(error) = std::fs::create_dir_all(&host) {
+                    tracing::warn!(
+                        token = "home-provision-compat-failed",
+                        "provision home dir {}: {error:#}",
+                        host.display()
+                    );
+                }
+            }
+            return;
+        }
+    }
+    let _ = provision_home_dirs_with_result(mounts, home_root, template, "template_unavailable");
+}
+
+/// Provision an initial managed home and report only what this launch proved.
+/// An uncertain partial clone is an error so it cannot be mislabeled cold.
+pub fn provision_home_dirs_with_result(
+    mounts: &[String],
+    home_root: &str,
+    template: Option<TemplateSeeder<'_>>,
+    cold_reason: &'static str,
+) -> std::io::Result<Option<HomeSeedOutcome>> {
     let Some(root) = resolve_root(home_root) else {
-        return;
+        return Ok(None);
     };
 
     // §3.5: collect every host path strictly under the home root BEFORE
@@ -123,6 +161,10 @@ pub fn provision_home_dirs(
         .filter_map(|m| host_path_of(m))
         .filter(|h| is_under_root(&root, h))
         .collect();
+
+    if candidates.len() > 1 {
+        return Err(std::io::Error::other("ambiguous managed-home mounts"));
+    }
 
     let seed_target: Option<&Path> = match (&template, candidates.as_slice()) {
         (Some(_), [only]) => Some(only.as_path()),
@@ -139,14 +181,12 @@ pub fn provision_home_dirs(
         _ => None,
     };
 
+    let mut outcome = None;
     for host in &candidates {
         // §3.5 step 1: check the leaf BEFORE create_dir_all, which is
         // idempotent and cannot itself tell cold from warm.
-        let pre_existed = host.try_exists().unwrap_or(false);
-        let pre_empty = !pre_existed
-            || std::fs::read_dir(host)
-                .map(|mut d| d.next().is_none())
-                .unwrap_or(false);
+        let pre_existed = host.try_exists()?;
+        let pre_empty = !pre_existed || std::fs::read_dir(host)?.next().is_none();
 
         match std::fs::create_dir_all(host) {
             Ok(()) => tracing::info!("provisioned home dir: {}", host.display()),
@@ -156,52 +196,70 @@ pub fn provision_home_dirs(
                     "provision home dir {}: {e:#}",
                     host.display()
                 );
-                continue;
+                return Err(e);
             }
         }
 
         // §3.5 steps 3-5: seed only a cold leaf that is THE unambiguous match.
-        if pre_empty && seed_target == Some(host.as_path()) {
-            if let Some(seeder) = &template {
-                seed_home(seeder, host);
-            }
+        if candidates.len() == 1 {
+            outcome = Some(if !pre_empty {
+                HomeSeedOutcome {
+                    mode: "existing",
+                    reason: "existing_home",
+                }
+            } else if seed_target == Some(host.as_path()) {
+                match template.as_ref() {
+                    Some(seeder) => seed_home(seeder, host)?,
+                    None => cold_if_empty(host, cold_reason)?,
+                }
+            } else {
+                cold_if_empty(host, cold_reason)?
+            });
         }
     }
+    Ok(outcome)
 }
 
-/// #488 WP3 §3.5 steps 4-5: clone the template into `dest`, then normalize
-/// ownership to `QUASAR_APP_PUID`/`QUASAR_APP_PGID` (belt-and-braces — `cp -a`
-/// as root already preserves build-time ownership). Any failure (clone or
-/// chown) is fail-open: log at warn, delete partial writes, leave `dest` as an
-/// empty directory — the same state a template-less provision leaves it in.
-fn seed_home(seeder: &TemplateSeeder<'_>, dest: &Path) {
+/// A cold report requires a currently empty destination; a writer racing
+/// provisioning must not be mislabeled cold.
+fn cold_if_empty(dest: &Path, reason: &'static str) -> std::io::Result<HomeSeedOutcome> {
+    if std::fs::read_dir(dest)?.next().is_some() {
+        return Err(std::io::Error::other(
+            "managed home changed during provisioning",
+        ));
+    }
+    Ok(HomeSeedOutcome {
+        mode: "cold",
+        reason,
+    })
+}
+
+/// Clone into staging, then install only while the real destination is empty.
+/// Optional clone failure may proceed cold only after safe cleanup is proven.
+fn seed_home(seeder: &TemplateSeeder<'_>, dest: &Path) -> std::io::Result<HomeSeedOutcome> {
     let started = Instant::now();
     // Clone outside the destination, then atomically install only while the
     // current policy lease is held. A live disable leaves a cold empty home.
-    let staging = if seeder.authorization.is_some() {
-        match tempfile::Builder::new()
-            .prefix(".quasar-seed-")
-            .tempdir_in(dest.parent().unwrap_or(dest))
-        {
-            Ok(dir) => Some(dir),
-            Err(error) => {
-                tracing::warn!(token = "template-seed-staging-failed", "{error}");
-                return;
-            }
+    let staging = match tempfile::Builder::new()
+        .prefix(".quasar-seed-")
+        .tempdir_in(dest.parent().unwrap_or(dest))
+    {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::warn!(token = "template-seed-staging-failed", "{error}");
+            return cold_if_empty(dest, "storage_unavailable");
         }
-    } else {
-        None
     };
     let original_dest = dest;
-    let dest = staging.as_ref().map_or(dest, |dir| dir.path());
+    let dest = staging.path();
     if let Err(e) = seeder.store.clone_home_into(&seeder.seed.home_path, dest) {
         tracing::warn!(
             token = "template-seed-failed",
             "template: seed FAILED for {}: {e:#} — falling back to empty home",
             dest.display()
         );
-        reset_to_empty_dir(dest);
-        return;
+        reset_to_empty_dir(dest)?;
+        return cold_if_empty(original_dest, "clone_failed");
     }
     if let Some((uid, gid)) = crate::agent::app_uid_gid() {
         if let Err(e) = chown_recursive(dest, uid, gid) {
@@ -211,23 +269,29 @@ fn seed_home(seeder: &TemplateSeeder<'_>, dest: &Path) {
                  falling back to empty home",
                 dest.display()
             );
-            reset_to_empty_dir(dest);
-            return;
+            reset_to_empty_dir(dest)?;
+            return cold_if_empty(original_dest, "clone_failed");
         }
     }
-    if let Some(authorization) = seeder.authorization {
-        if let Err(error) = authorization.commit(|| {
-            if original_dest.read_dir()?.next().is_some() {
-                return Err(std::io::Error::other("home is no longer empty"));
-            }
-            std::fs::rename(dest, original_dest)
-        }) {
-            tracing::warn!(
-                token = "template-seed-policy-changed",
-                "{error}; leaving home unseeded"
-            );
-            return;
+    let install = || {
+        if original_dest.read_dir()?.next().is_some() {
+            return Err(std::io::Error::other("home is no longer empty"));
         }
+        std::fs::rename(dest, original_dest)
+    };
+    if let Some(authorization) = seeder.authorization {
+        if let Err(error) = authorization.commit(install) {
+            if crate::source_policy::is_policy_revoked(&error) {
+                tracing::warn!(
+                    token = "template-seed-policy-changed",
+                    "{error}; leaving home unseeded"
+                );
+                return cold_if_empty(original_dest, "policy_changed");
+            }
+            return Err(error);
+        }
+    } else {
+        install()?;
     }
     tracing::info!(
         "template: seeded home {} from {} in {} ms ({:?})",
@@ -236,25 +300,29 @@ fn seed_home(seeder: &TemplateSeeder<'_>, dest: &Path) {
         started.elapsed().as_millis(),
         seeder.store.clone_mode(),
     );
+    Ok(HomeSeedOutcome {
+        mode: match seeder.store.clone_mode() {
+            CloneMode::Reflink => "reflink",
+            CloneMode::Copy => "copy",
+            CloneMode::Off => {
+                return Err(std::io::Error::other(
+                    "clone mode off after successful clone",
+                ))
+            }
+        },
+        reason: "seeded",
+    })
 }
 
-/// Delete `dest`'s contents (best-effort) and recreate it empty — the
-/// fail-open cleanup step of [`seed_home`].
-fn reset_to_empty_dir(dest: &Path) {
-    if let Err(e) = std::fs::remove_dir_all(dest) {
-        tracing::warn!(
-            token = "template-seed-cleanup-failed",
-            "template: cleanup of partially-seeded home {} failed: {e:#}",
-            dest.display()
-        );
+/// Delete a failed staging clone and prove it is empty. Any uncertain cleanup
+/// fails the Steam launch rather than reporting a cold home.
+fn reset_to_empty_dir(dest: &Path) -> std::io::Result<()> {
+    std::fs::remove_dir_all(dest)?;
+    std::fs::create_dir_all(dest)?;
+    if std::fs::read_dir(dest)?.next().is_some() {
+        return Err(std::io::Error::other("partial seed cleanup uncertain"));
     }
-    if let Err(e) = std::fs::create_dir_all(dest) {
-        tracing::warn!(
-            token = "template-seed-recreate-failed",
-            "template: could not recreate empty home {} after a failed seed: {e:#}",
-            dest.display()
-        );
-    }
+    Ok(())
 }
 
 /// Recursively `chown` every entry under (and including) `root` to `uid:gid`.
@@ -522,7 +590,21 @@ mod tests {
             seed: &seed,
             authorization: None,
         };
-        provision_home_dirs(&mounts, home_root.to_str().unwrap(), Some(seeder));
+        let outcome = provision_home_dirs_with_result(
+            &mounts,
+            home_root.to_str().unwrap(),
+            Some(seeder),
+            "template_unavailable",
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            Some(HomeSeedOutcome {
+                mode: "copy",
+                reason: "seeded"
+            })
+        );
 
         assert!(
             leaf.join("marker.txt").is_file(),
@@ -544,7 +626,21 @@ mod tests {
             seed: &seed,
             authorization: None,
         };
-        provision_home_dirs(&mounts, home_root.to_str().unwrap(), Some(seeder));
+        let outcome = provision_home_dirs_with_result(
+            &mounts,
+            home_root.to_str().unwrap(),
+            Some(seeder),
+            "template_unavailable",
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            Some(HomeSeedOutcome {
+                mode: "existing",
+                reason: "existing_home"
+            })
+        );
 
         assert!(leaf.join("registry.vdf").is_file());
         assert_eq!(
@@ -586,7 +682,21 @@ mod tests {
         let (_dest, leaf, mounts) = scratch_mount();
         let home_root = leaf.parent().unwrap().parent().unwrap().to_path_buf();
 
-        provision_home_dirs(&mounts, home_root.to_str().unwrap(), None);
+        let outcome = provision_home_dirs_with_result(
+            &mounts,
+            home_root.to_str().unwrap(),
+            None,
+            "template_unavailable",
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            Some(HomeSeedOutcome {
+                mode: "cold",
+                reason: "template_unavailable"
+            })
+        );
 
         assert!(leaf.is_dir());
         assert_eq!(std::fs::read_dir(&leaf).unwrap().count(), 0);
@@ -607,7 +717,21 @@ mod tests {
             seed: &seed,
             authorization: None,
         };
-        provision_home_dirs(&mounts, home_root.to_str().unwrap(), Some(seeder));
+        let outcome = provision_home_dirs_with_result(
+            &mounts,
+            home_root.to_str().unwrap(),
+            Some(seeder),
+            "template_unavailable",
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            Some(HomeSeedOutcome {
+                mode: "cold",
+                reason: "clone_failed"
+            })
+        );
 
         assert!(leaf.is_dir(), "the session must still get a home directory");
         assert_eq!(
@@ -635,13 +759,55 @@ mod tests {
             seed: &seed,
             authorization: None,
         };
-        provision_home_dirs(&mounts, home_root.to_str().unwrap(), Some(seeder));
+        let outcome = provision_home_dirs_with_result(
+            &mounts,
+            home_root.to_str().unwrap(),
+            Some(seeder),
+            "template_unavailable",
+        );
 
-        assert!(leaf_a.is_dir());
-        assert!(leaf_b.is_dir());
+        assert!(
+            outcome.is_err(),
+            "ambiguous mounts must fail before provisioning"
+        );
+        assert!(!leaf_a.exists());
+        assert!(!leaf_b.exists());
         assert!(
             !leaf_a.join("marker.txt").exists() && !leaf_b.join("marker.txt").exists(),
             "an ambiguous (multi-mount) match must seed nothing"
+        );
+    }
+
+    #[test]
+    fn cold_outcome_refuses_a_writer_after_initial_empty_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        assert!(std::fs::read_dir(&home).unwrap().next().is_none());
+        std::fs::write(home.join("written-during-provision"), b"owned").unwrap();
+        assert!(cold_if_empty(&home, "template_unavailable").is_err());
+        assert_eq!(
+            std::fs::read(home.join("written-during-provision")).unwrap(),
+            b"owned"
+        );
+    }
+
+    #[test]
+    fn install_conflict_preserves_existing_content_and_is_not_policy_changed() {
+        let (_tpl, store) = published_store(TemplateCloneMode::Copy);
+        let seed = store.seed("steam").unwrap();
+        let (_dest, leaf, _) = scratch_mount();
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(leaf.join("concurrent-write"), b"owned").unwrap();
+        let seeder = TemplateSeeder {
+            store: &store,
+            seed: &seed,
+            authorization: None,
+        };
+        assert!(seed_home(&seeder, &leaf).is_err());
+        assert_eq!(
+            std::fs::read(leaf.join("concurrent-write")).unwrap(),
+            b"owned"
         );
     }
 }

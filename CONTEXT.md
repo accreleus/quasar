@@ -317,6 +317,42 @@ signature" and "manifest verification" (nothing is verified), "manifest digest"
 on its own when the ref/commit/URL are also meant (the digest is one field of
 the record).
 
+## Host management (RH05 proposal)
+
+**Setting source** — how a supported host setting is chosen: Automatic,
+deployment baseline or explicit value. Clearing a legacy override selects the
+deployment baseline; it does not request Automatic. _Avoid_: "default" without
+naming the source.
+
+**Configuration applied** — verified evidence that a requested setting group is
+active for its declared scope. A saved edit or accepted command is not application.
+Next-session application leaves existing sessions on their previous values.
+_Avoid_: "saved" or "received" as synonyms.
+
+**Idle apply** — an operator-approved disruptive setting group that bars new
+assignments, waits for active and local work to finish, then applies and verifies.
+Waiting never authorizes ending a session. _Avoid_: "automatic restart".
+
+**Admission restriction** — one named owner's reason a host cannot take new
+assignments. Several owners can restrict the same host; each releases only its
+own restriction. _Avoid_: "the cordon" when ownership matters.
+
+**Canonical home claim** — one user's location for a managed app home, keyed by
+the executable parent app when a derived tile is launched. It may be reserved,
+materialized or in conflict; uncertainty never licenses a second home. _Avoid_:
+"preferred host" (an existing home is a constraint).
+
+**App placement** — the operator's selection of hosts where a canonical app may
+run and be prepared. Derived tiles inherit it. A cached image does not grant
+eligibility. _Avoid_: "image cache policy".
+
+**App prepared** — required local image and preparation work have completed on a
+host. It does not establish placement, readiness or browser reachability.
+_Avoid_: "downloaded" when additional preparation is required.
+
+**Home template** — an authorized prepared app home from which a new empty user
+home can be initialized. Existing user homes are preserved. _Avoid_: "backup".
+
 ## Host readiness
 
 **Host fact** — something observed about a host, carried with where the

@@ -1157,7 +1157,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description In use by an active session (pre-existing), OR (Phase 3) the app has derived tiles and ?delete_derived=true was not sent - the body then carries `derived_tiles`. */
+                /** @description In use by an active session (pre-existing), OR (Phase 3) the app has derived tiles and ?delete_derived=true was not sent - the body then carries `derived_tiles`, OR (RH05) deleting the canonical parent would cascade a pending-home hold. The RH05 refusal uses ErrorEnvelope code `conflict` and a fixed managed-home-pending message. */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -1486,6 +1486,95 @@ export interface paths {
         options?: never;
         head?: never;
         patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/apps/{id}/placement": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read canonical app host selection and observed preparation/readiness.
+         * @description Derived tiles return the parent placement with inherited_from set.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Placement. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["AppPlacement"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Replace canonical app host selection at an expected revision.
+         * @description Invalid selection is 400 validation_failed. A stale revision is 409 stale_revision with the current placement. A derived tile is 409 inherited_placement with its parent ID. Removal immediately excludes new reservations while existing sessions finish and homes/images stay.
+         */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["AppPlacementPatch"];
+                };
+            };
+            responses: {
+                /** @description Updated placement. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["AppPlacement"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description Stale revision or inherited placement. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["PlacementConflict"];
+                    };
+                };
+            };
+        };
         trace?: never;
     };
     "/v1/admin/apps/{id}/entitlements": {
@@ -2754,7 +2843,7 @@ export interface paths {
                     };
                 };
                 404: components["responses"]["NotFound"];
-                /** @description session_quota_exceeded / home_in_use / profile_ineligible / profile_not_launchable_for_app / conflict (pre-existing), or (Phase 3) home_not_provisioned - a derived tile whose parent has no home on any host - or parent_app_disabled. Amendment 12 (#296): conflict is no longer returned for an explicit stream.codec the placed host cannot encode - that arm leaves the launch path (the codec is now a placement gate; see 503) and survives only on the certification bench. */
+                /** @description session_quota_exceeded / home_in_use / profile_ineligible / profile_not_launchable_for_app / conflict (pre-existing), or (Phase 3) home_not_provisioned - a derived tile whose parent has no home on any host - or parent_app_disabled. RH05: home_conflict takes precedence over home_not_provisioned when a conflicting canonical claim (including gc_pending) or known tombstoned row exists, including on derived tiles. Amendment 12 (#296): conflict is no longer returned for an explicit stream.codec the placed host cannot encode - that arm leaves the launch path (the codec is now a placement gate; see 503) and survives only on the certification bench. */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -2853,7 +2942,7 @@ export interface paths {
          * Server-sent session lifecycle events (owner or admin). NOT CURRENTLY SERVED — see x-unimplemented.
          * @description NOT IMPLEMENTED AS OF 2026-08-07. The Steam game-exit lifecycle arc that introduced this endpoint was parked and its control-plane implementation reverted; this contract text was deliberately left in place so the agreed shape survives for a future resurrection. `x-unimplemented: true` marks that: the route-coverage drift test skips such operations, because a documented-but-unserved route would otherwise fail every branch as a phantom. Remove the marker in the same change that registers the route. Original amendment text follows.
          *
-         *     Session-events amendment (2026-08-02): SSE stream (text/event-stream) replacing Session-events amendment (2026-08-02): SSE stream (text/event-stream) replacing lifecycle polling for clients that support it. One event type, `session`, whose data is the same envelope as GET /v1/sessions/{id} — sent once on subscribe (snapshot) and on every change to state / state_detail / app_launch_state / health_state; the event for a terminal state is final and the server then closes the stream. Comment lines (`:`) are keep-alives (~25s). Best-effort latency optimization, never an authority: the GET remains canonical, and a client MUST retain polling as fallback (older control plane -> 404; dropped stream -> re-subscribe or poll). Bearer-authenticated like every session read (browsers use fetch-streaming, not EventSource, so the Authorization header carries as normal).
+         *     Session-events amendment (2026-08-02): SSE stream (text/event-stream) replacing Session-events amendment (2026-08-02): SSE stream (text/event-stream) replacing lifecycle polling for clients that support it. One event type, `session`, whose data is the same envelope as GET /v1/sessions/{id} — sent once on subscribe (snapshot) and on every change to state / state_detail / app_launch_state / home_seed / health_state; the event for a terminal state is final and the server then closes the stream. Comment lines (`:`) are keep-alives (~25s). Best-effort latency optimization, never an authority: the GET remains canonical, and a client MUST retain polling as fallback (older control plane -> 404; dropped stream -> re-subscribe or poll). Bearer-authenticated like every session read (browsers use fetch-streaming, not EventSource, so the Authorization header carries as normal).
          */
         get: {
             parameters: {
@@ -3017,7 +3106,9 @@ export interface paths {
          *     STEAM LIBRARY DISCOVERY PHASE 3 ADDS TWO 409 CONDITIONS HERE, both additive (409 was
          *     already declared on this endpoint and Error.code is an open string).
          *
-         *     409 home_not_provisioned - the swap target is a DERIVED TILE and THIS SESSION'S HOST holds
+         *     RH05 home_conflict takes precedence when the canonical parent has a
+         *     conflicting claim or known tombstoned row. Otherwise, 409
+         *     home_not_provisioned - the swap target is a DERIVED TILE and THIS SESSION'S HOST holds
          *     no live user_homes row for its parent. A swap is pinned to the live session's host and has
          *     NO PLACEMENT STEP, so unlike a launch there is nowhere to re-pin it to: a tile whose
          *     library lives on another host, or does not exist yet, cannot be swapped into. Launch it
@@ -3067,7 +3158,7 @@ export interface paths {
                     };
                 };
                 404: components["responses"]["NotFound"];
-                /** @description session_not_swappable / swap_exceeds_reservation / conflict (pre-existing), or (Phase 3) home_not_provisioned - the target tile's parent has no home on THIS session's host - or parent_app_disabled. */
+                /** @description session_not_swappable / swap_exceeds_reservation / conflict (pre-existing), or (Phase 3) home_not_provisioned - the target tile's parent has no home on THIS session's host - or parent_app_disabled. RH05 home_conflict takes precedence for a conflicting claim or known tombstone. */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -3379,7 +3470,7 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** Delete a user (admin). (Not yet in control-api.md prose.) */
+        /** Delete a user (admin); RH05 refuses while a pending-home hold exists. */
         delete: {
             parameters: {
                 query?: never;
@@ -3401,6 +3492,15 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
+                /** @description RH05 held managed-home claim blocks user deletion; ErrorEnvelope code conflict and fixed message Managed home cleanup is pending. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
             };
         };
         options?: never;
@@ -3693,6 +3793,194 @@ export interface paths {
                         "application/json": components["schemas"]["ImageUpdateResult"];
                     };
                 };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                409: components["responses"]["Conflict"];
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/hosts/{id}/images/cleanup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        /** Preview exact managed-image versions eligible for explicit cleanup (RH05). */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Current preview. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostImageCleanupView"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        /** Request exact-version image cleanup after current generation and reference recheck (RH05). */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["HostImageCleanupRequest"];
+                };
+            };
+            responses: {
+                /** @description Exact version already confirmed removed. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostImageCleanupAttempt"];
+                    };
+                };
+                /** @description Cleanup accepted or identical attempt in flight. */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostImageCleanupAttempt"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description Current cleanup blocker and remedy. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostImageCleanupConflict"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/hosts/{id}/images/cleanup/attempts/{attempt_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+                attempt_id: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Read one durable exact-version cleanup attempt (RH05).
+         * @description Reads persisted state only; it does not infer removal from a preview, contact an agent, or retry dispatch. An attempt on another host or a pruned attempt is 404. The reason is a safe operator code, never a raw runtime error.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                    attempt_id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Current persisted attempt. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostImageCleanupAttempt"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/hosts/{id}/images/{image_id}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+                image_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry one failed selected managed-image preparation on an online host (RH05).
+         * @description Admin-only. Re-arms only a current selected non-lazy adopted image whose reported host state is failed at that adopted version (empty legacy version matches). Repeated concurrent requests return 202 merged into one pending host/image operation and one bounded budget. The 202 writes image.retry audit metadata and is process-local, not durable across a control-plane restart before dispatch. Acceptance is not proof of preparation; read image and placement views for progress. A current authenticated pulling/building state is not retryable. Once migration 0094 lands, removing fences refuse Retry and delayed dispatch rechecks the fence. Other images and active sessions are unaffected. Non-202 writes nothing. Failure reasons and exact safe messages are frozen in control-api.md RH05 #343.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                    image_id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Retry scheduled through the existing image Ensurer; no body. */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                400: components["responses"]["ValidationFailed"];
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
@@ -4873,6 +5161,55 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/admin/storage/home-claims": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Diagnose canonical managed-home claims, including claim-only reservations and conflicts. */
+        get: {
+            parameters: {
+                query?: {
+                    user_id?: string;
+                    /** @description A derived tile resolves to its canonical parent app. */
+                    app_id?: string;
+                    /** @description Filter by the claim owner host, not recorded locations. */
+                    host_id?: string;
+                    state?: "reserved" | "materialized" | "conflict";
+                    limit?: number;
+                    /** @description Opaque exclusive keyset cursor bound to the filters. */
+                    cursor?: string;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description OK. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["AdminHomeClaimsResponse"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/admin/storage/homes/{id}": {
         parameters: {
             query?: never;
@@ -4992,7 +5329,10 @@ export interface paths {
         delete?: never;
         options?: never;
         head?: never;
-        /** Update per-host overrides (body is {overrides, restart_confirm} — 'settings' is ignored). */
+        /**
+         * Update per-host overrides (body is {overrides, restart_confirm} — 'settings' is ignored).
+         * @description RH05 legacy compatibility exception: this revisionless write serializes under the host settings row and increments the same policy revision. A non-null value chooses explicit; null chooses deployment, even if the prior source was automatic. Relevant unstarted approval is superseded. A typed-owned group (current provisional or confirmed echo, or durable ever-owned set while online; confirmed echo or ever-owned set while offline) returns 200 with restart_triggered:false for disruptive edits; restart_confirm cannot approve RH05 idle apply. A never-owned group retains the legacy restart_required guard and restart_confirm immediate-restart behavior. An open or uncertain RH05 attempt of either scope blocks an unowned restart edit. The effective-settings map is not RH05 application proof.
+         */
         patch: {
             parameters: {
                 query?: never;
@@ -5021,7 +5361,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description restart_required — a restart-class knob changed with live sessions and restart_confirm != true (body carries live_sessions). */
+                /** @description restart_required for a never-owned restart-class key with live sessions and no confirmation, or attempt_conflict while an RH05 attempt/reconciliation gate blocks legacy restart. Typed-owned keys save without immediate restart. */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -5032,6 +5372,337 @@ export interface paths {
                 };
             };
         };
+        trace?: never;
+    };
+    "/v1/admin/hosts/{id}/policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        /** Read typed host configuration policy and independent evidence views (RH05). */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Policy view. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostPolicy"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Atomically edit typed policy choices by expected revision (RH05).
+         * @description Validates the whole edit before persistence. A successful edit commits choices, a monotone revision and reconciliation obligation in one transaction; offline intent is saved as pending. A stale edit does not write and returns the current view and changed keys. A relevant edit supersedes an unstarted idle approval. A group without confirmed typed ownership returns upgrade_required without writing anything.
+         */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["HostPolicyPatch"];
+                };
+            };
+            responses: {
+                /** @description Saved policy view. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostPolicy"];
+                    };
+                };
+                /** @description validation_failed or unsupported_source. */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description stale_revision with current view and changed keys, or upgrade_required with no write. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostPolicyConflict"] | components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        trace?: never;
+    };
+    "/v1/admin/hosts/{id}/idle-apply": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Approve one reviewed disruptive host-policy group and wait for idle (RH05).
+         * @description Binds the reviewed revision, content, resolved values and prerequisite facts to this control-plane boot and the current agent connection at grant time. Acquires only this attempt's admission restriction. Waiting never terminates a session; missing or uncertain session/preparation inventory never establishes idle. An identical replay in waiting or offered with the same full request, including expires_at, returns 202 with the same attempt_id and current phase. A replay in cancel_pending or revoked_unstarted, after expiry, or after a control-plane boot returns approval_superseded. A replay during accepted, activating, awaiting_startup, verifying, failed before recovery is decided, recovery_verifying, recovery_awaiting_startup or uncertain returns attempt_conflict with that attempt. A replay after applied, recovered, resolved uncertain or terminal failed returns approval_superseded. Neither replay revives an old attempt. The request's boot incarnation and approval_review_id fence a delayed retry even when policy content is unchanged. A request with expires_at in the past also returns approval_superseded without a hold. A same-boot unoffered attempt expired by time can become revoked_unstarted and release only its own restriction. After a process boot, even a restored approved row becomes cancel_pending and stays protected until complete authenticated current-connection inventory proves no journal record under its ID. The approval ID is the public attempt_id; at offer the server inserts an offered attempt with that ID and changes the approval to offered atomically before sending. Authenticated acceptance advances both rows together. Confirmed nonacceptance terminalizes the offered attempt and approval together; a restored accepted journal record reconstructs a missing attempt under the approval ID and advances a restored cancel_pending approval to accepted in the same transaction before the inventory gate opens; the attempt takes the authenticated journal phase and sequence. The approval decides public phase until acceptance or terminal nonacceptance; the attempt decides thereafter. A same-boot reconnect revokes unoffered waiting locally and moves offered to cancel_pending. A current review ID with a different body while a live approval exists returns attempt_conflict with current. Host-wide unique-index conflicts also return attempt_conflict. A terminal uncertain attempt with an unresolved protective restriction blocks grants. Every restart-group review token rotates when an approval exits approved or offered for cancel_pending or a terminal state, or exits cancel_pending for a terminal state; an accepted restart attempt reaches a terminal outcome, an unresolved disruptive admission hold resolves, connection/journal authority changes, or complete authenticated reconciliation opens disruptive availability. Unrelated safe next-session edits, ordinary sessions and unrelated owner holds preserve it; rotation alone does not revoke another live approval. An offered attempt becomes cancel_pending and stays protected until authenticated nonacceptance or complete journal inventory proves no acceptance. Only then does it become revoked_unstarted; an accepted journal record instead resumes accepted or later execution. Therefore revoked_unstarted always means started false and admission_restricted false. Neither expiry nor boot ends a session. A grant from an old boot or agent connection is rejected. An open disruptive attempt includes waiting, offered, cancel_pending, accepted, activating, awaiting_startup, verifying, failed while recovery remains possible, recovery_verifying, recovery_awaiting_startup and uncertain while protection is unresolved. Normative behavior: control-api.md section "Idle apply, cancellation and recovery".
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["IdleApplyRequest"];
+                };
+            };
+            responses: {
+                /** @description Approval saved or identically replayed; current phase waiting or offered. This is not application proof. */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["IdleApplyAttempt"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description Check boot token and request expiry first. Identical waiting/offered replay returns 202; replay in cancel_pending/revoked_unstarted returns approval_superseded; any other open disruptive phase returns attempt_conflict with current. A new grant then locks and checks the review token, rechecks availability and inserts atomically. approval_superseded has ErrorEnvelope and requires a fresh review. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["IdleApplyConflict"] | components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/hosts/{id}/idle-apply/{attempt_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+                attempt_id: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Read a current or terminal idle-apply attempt (RH05).
+         * @description Read-only durable status for refresh after reload; no admission or execution side effect. An unswept expiry can still show waiting with a hold, while replay and dispatch refuse expiry synchronously. An attempt belonging to another host is not found.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                    attempt_id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Current or terminal attempt status. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["IdleApplyAttempt"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/hosts/{id}/idle-apply/{attempt_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+                attempt_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel an idle apply before durable acceptance without discarding saved policy (RH05).
+         * @description The server fences further grants first. It releases only this attempt's restriction after confirmed nonacceptance; an unoffered waiting approval has confirmed nonacceptance locally and needs no agent response. Uncertain revocation remains protected. A repeated cancel after revoked_unstarted is idempotent. An attempt belonging to another host is not found. Durable acceptance and its later execution/recovery phases make cancellation too late. Waiting and offered return 200 after confirmed nonacceptance or 202 while revocation proof is pending. Repeated cancel_pending returns 202; repeated revoked_unstarted returns 200. Normative behavior: control-api.md section "Idle apply, cancellation and recovery".
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                    attempt_id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Confirmed cancelled: phase revoked_unstarted, started false, admission_restricted false. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["IdleApplyAttempt"];
+                    };
+                };
+                /** @description Cancellation awaits authenticated nonacceptance: phase cancel_pending, admission_restricted true. */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["IdleApplyAttempt"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                404: components["responses"]["NotFound"];
+                /** @description cancel_too_late for accepted, activating, awaiting_startup, verifying, applied, failed, recovery_verifying, recovery_awaiting_startup, recovered or uncertain; current names that phase. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["IdleApplyConflict"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/hosts/{id}/policy/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Re-arm a next-session policy group whose transient retry budget is exhausted (RH05).
+         * @description Only a next-session group with status failed and a remedy whose code before the first colon is exactly retry_exhausted is retryable. The status check and budget reset are one transaction; concurrent requests cannot each reset the budget. It returns to pending at the current desired revision with a fresh bounded backoff budget. Retry grants no approval and proves no application. Invalid intent the host rejected (remedy code validation_failed) is never retried; change the setting instead. A restart-scope group is never re-armed by Retry, whatever its status; it proceeds only through a fresh scoped approval via POST /v1/admin/hosts/{id}/idle-apply. Every non-200 response writes nothing.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: components["parameters"]["PathId"];
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["HostPolicyRetryRequest"];
+                };
+            };
+            responses: {
+                /** @description Updated policy view; the group is pending again at the current desired revision. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["HostPolicy"];
+                    };
+                };
+                /** @description validation_failed: malformed body, or group is not a catalog policy group. No write. */
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                403: components["responses"]["Forbidden"];
+                /** @description not_found: unknown host. No write. */
+                404: components["responses"]["NotFound"];
+                /** @description conflict: the group is not waiting for Retry. Its status is pending, applied, upgrade_required or uncertain; or it is failed with a remedy code other than retry_exhausted (validation_failed for rejected invalid intent); or it is a restart-scope group. No write. */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/v1/admin/hosts/{id}/readiness-overrides/{check_id}": {
@@ -5120,7 +5791,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Restart the host's agent without changing overrides (host-observability-2). */
+        /**
+         * Restart the host's agent without changing overrides (host-observability-2).
+         * @description Retains its 200/409 live-session confirm guard on old and RH05-capable agents. An RH05-capable agent restarts only the last verified or durably seeded active configuration; it never activates an unapproved pending candidate. A pending policy group remains pending. pending_restart reflects an actual restart in flight and clears on verified reconnect. A started nonterminal or uncertain RH05 attempt of either scope, or incomplete journal reconciliation (0087 gate before 0089, then the 0089 row), refuses the restart with attempt_conflict.
+         */
         post: {
             parameters: {
                 query?: never;
@@ -5148,7 +5822,7 @@ export interface paths {
                 401: components["responses"]["Unauthorized"];
                 403: components["responses"]["Forbidden"];
                 404: components["responses"]["NotFound"];
-                /** @description restart_required (live sessions, confirm != true — body carries live_sessions) or conflict (host offline). */
+                /** @description restart_required (live sessions, confirm != true), conflict (host offline), or attempt_conflict (open/uncertain RH05 attempt or incomplete journal reconciliation). */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -6957,7 +7631,7 @@ export interface paths {
         put?: never;
         /**
          * Node-agent internal: close a claimed job run with its outcome. (Not operator-facing.)
-         * @description IDEMPOTENT BY CONTRACT: a report for a run that is already terminal is a 200 no-op, so an agent retrying after a network blip is safe — the alternative, a 409 the agent cannot act on, would turn a run that actually succeeded into a permanent error in an operator's face. `state` is the closed set {succeeded, failed, deferred, skipped}; `aborted` is deliberately ABSENT, because it is the reaper's verdict on a host that said nothing and a host claiming it would be describing a decision it does not get to make. Ownership is checked BEFORE anything is written and a failure is a 401, never a 404: an unknown run id, a run belonging to another host, and a bad node secret are one indistinguishable answer, so these routes never become an oracle for run ids. A `deferred` report is a normal outcome (the runner's own gate refused) and the dispatcher schedules the retry on the persisted backoff ladder.
+         * @description IDEMPOTENT BY CONTRACT: a report for a run that is already terminal is a 200 no-op, so an agent retrying after a network blip is safe — the alternative, a 409 the agent cannot act on, would turn a run that actually succeeded into a permanent error in an operator's face. `state` is the closed set {succeeded, failed, deferred, skipped}; `aborted` is deliberately ABSENT, because it is the reaper's verdict on a host that said nothing and a host claiming it would be describing a decision it does not get to make. Ownership is checked BEFORE anything is written and a failure is a 401, never a 404: an unknown run id, a run belonging to another host, and a bad node secret are one indistinguishable answer, so these routes never become an oracle for run ids. A `deferred` report is a normal outcome (the runner's own gate refused) and the dispatcher schedules the retry on the persisted backoff ladder. For a capable template.warmup claim, every nonterminal report must carry its publish_claim_token; the atomic transition rejects a missing or stale token with 409 and never gives verified credit to another claim's report. An already-terminal retry remains a 200 no-op.
          */
         post: {
             parameters: {
@@ -6983,7 +7657,7 @@ export interface paths {
                 };
                 400: components["responses"]["ValidationFailed"];
                 401: components["responses"]["Unauthorized"];
-                /** @description Could not record the report (the run moved under the caller */
+                /** @description Could not record the report (the claim token or state moved under the caller */
                 409: {
                     headers: {
                         [name: string]: unknown;
@@ -6993,6 +7667,71 @@ export interface paths {
                     };
                 };
                 /** @description Could not record the job report. */
+                500: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/agent/jobs/template.warmup/{run_id}/publish-permit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Node-agent internal: final selected Steam template publication check.
+         * @description RH05 #344. Existing node-secret agent job authentication. One conditional SQL statement checks the exact running claim token and current connection epoch, digest-pinned run params, current source/adoption/ack/ready image and selected app placement, and stamps publish_permit_accepted_at only on acceptance. Its database snapshot is the authorization linearization point. A placement removal before the snapshot denies; a later removal may leave a cached template but grants no current requirement or launch permission. No network or template-content copy is allowed between a 200 and local lease commit plus atomic publication. Every unavailable/malformed/denied response fails closed for optional publication and leaves ordinary cold launch available.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    run_id: string;
+                };
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["SteamPublishPermitRequest"];
+                };
+            };
+            responses: {
+                /** @description Current publication check accepted. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["SteamPublishPermitAccepted"];
+                    };
+                };
+                400: components["responses"]["ValidationFailed"];
+                401: components["responses"]["Unauthorized"];
+                /** @description Not current; same closed answer for unknown */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ErrorEnvelope"];
+                    };
+                };
+                /** @description Publication check unavailable. */
                 500: {
                     headers: {
                         [name: string]: unknown;
@@ -7144,7 +7883,7 @@ export interface components {
         /** @enum {string} */
         SessionState: "pending" | "assigned" | "starting" | "running" | "stopping" | "stopped" | "failed";
         Error: {
-            /** @description e.g. validation_failed, unauthorized, forbidden, not_found, conflict, session_quota_exceeded, home_in_use, home_not_provisioned, parent_app_disabled, profile_ineligible, profile_not_launchable_for_app, no_host_available, capacity_exhausted, host_not_ready, restart_required, rate_limited, internal. Open string, not an enum: new codes are additive and an unknown one falls through to a client's generic per-status branch. */
+            /** @description e.g. validation_failed, unauthorized, forbidden, not_found, conflict, session_quota_exceeded, home_in_use, home_not_provisioned, parent_app_disabled, profile_ineligible, profile_not_launchable_for_app, no_host_available, capacity_exhausted, host_not_ready, restart_required, stale_revision, unsupported_source, approval_superseded, approval_expired, attempt_conflict, cancel_too_late, retry_exhausted, home_conflict, placement_ineligible, inherited_placement, recovery_uncertain, rate_limited, internal. Open string, not an enum: new codes are additive and an unknown one falls through to a client's generic per-status branch. */
             code: string;
             message: string;
             /** @description Present on restart_required. */
@@ -7353,6 +8092,11 @@ export interface components {
             policy_pending: boolean;
             preparation_enabled: boolean | null;
             consumption_enabled: boolean | null;
+            /**
+             * @description Verified requires a capable agent's successful claimed warmup run with an accepted final permit; older agents remain visibly limited even if template ready.
+             * @enum {string}
+             */
+            publication_protection: "verified" | "limited_protection";
             /** @enum {string} */
             state: "waiting_image" | "queued" | "preparing" | "ready" | "deferred" | "failed" | "disabled" | "unsupported" | "unknown" | "pending_policy";
             reason: string;
@@ -7589,6 +8333,13 @@ export interface components {
                 items: components["schemas"]["Entitlement"][];
             };
         };
+        /** @description Valid pairs: reflink/seeded, copy/seeded, cold/{template_unavailable,source_disabled,host_templates_disabled,host_setting_invalid,policy_unavailable,storage_unavailable,clone_failed,policy_changed}, existing/existing_home. Only reflink proves reflink storage saving. */
+        HomeSeedOutcome: {
+            /** @enum {string} */
+            mode: "reflink" | "copy" | "cold" | "existing";
+            /** @enum {string} */
+            reason: "seeded" | "template_unavailable" | "source_disabled" | "host_templates_disabled" | "host_setting_invalid" | "policy_unavailable" | "storage_unavailable" | "clone_failed" | "policy_changed" | "existing_home";
+        };
         Session: {
             /** Format: uuid */
             id: string;
@@ -7605,6 +8356,8 @@ export interface components {
             failure_code: string | null;
             /** @description First-run-experience §S5. The app container's own captured log tail (newline-joined, oldest first, ~100 lines bound) - the only surviving copy, since app containers run --rm. Always serialized; null unless a failure warranted capturing it. Rendered preformatted, distinct from error_message's prose rendering. */
             app_log_tail: string | null;
+            /** @description RH05 #344. Actual initial managed-home seeding outcome. Null means no authenticated evidence, including an older agent, a non-managed home or failure before provisioning. No inference of cold or storage savings from null. Swaps do not change the initial outcome. Never contains paths or free-form diagnostics. */
+            home_seed: null | components["schemas"]["HomeSeedOutcome"];
             /** @description The profile the session was launched from; null for a legacy/tier/override launch. UI-P4: this is now a LAUNCH PROFILE id, i.e. the USER'S PICK. The rung it resolved to is stream_profile_id. */
             profile_id: string | null;
             /** @description UI-P4: the RUNG this launch resolved to (e.g. "1080p60-h264"). Always serialized; null for every pre-UI-P4 session and for any legacy/tier/override/console launch. profile_id answers "what did the user pick", this answers "what did they get" - and because a rung carries its own resolution, the two can legitimately disagree about width/height/fps/ bitrate. The `stream` block below is always the truth for the running session. */
@@ -7747,12 +8500,25 @@ export interface components {
             /** Format: int64 */
             next_cursor: number | null;
         };
+        HostAdmissionRestriction: {
+            /** @enum {string} */
+            owner_kind: "manual" | "legacy" | "platform" | "idle_apply" | "recovery" | "reconciliation";
+            /**
+             * @description Stable safe display code; never a free-form host, user or operation identifier.
+             * @enum {string}
+             */
+            reason: "manual_drain" | "legacy_drain" | "platform_apply" | "idle_configuration" | "configuration_recovery" | "journal_reconciliation" | "journal_quarantine";
+            /** Format: date-time */
+            created_at: string;
+        };
         Host: {
             /** Format: uuid */
             id: string;
             node_name: string;
             /** @enum {string} */
             status: "online" | "offline" | "draining";
+            /** @description RH05 active owner-scoped admission holds, always serialized; [] means no hold. This explains draining without exposing owner IDs or implying that an offline host is schedulable. The server derives reason from a bounded code set, never from private host or user data. */
+            admission_restrictions: components["schemas"]["HostAdmissionRestriction"][];
             agent_version: string | null;
             cpu_cores: number | null;
             mem_mb: number | null;
@@ -7873,7 +8639,7 @@ export interface components {
             items: components["schemas"]["Host"][];
             next_cursor: string | null;
         };
-        /** @description GET returns pending_restart; PATCH returns restart_triggered — otherwise same shape. */
+        /** @description GET returns pending_restart; PATCH returns restart_triggered — otherwise same shape. On RH05 agents pending_restart indicates an actual approved or standalone restart in flight, not unapplied intent; PATCH returns restart_triggered:false for disruptive changes and its effective map is informational rather than application proof. */
         HostSettings: {
             resolved?: {
                 [key: string]: unknown;
@@ -7900,8 +8666,263 @@ export interface components {
             overrides: {
                 [key: string]: unknown;
             };
-            /** @description Required true to apply a restart-class knob while the host has live sessions. */
+            /** @description For never-owned restart-class keys, permits legacy restart with live sessions. For typed-owned groups it is accepted for compatibility but grants no idle-apply approval or immediate restart. */
             restart_confirm?: boolean;
+        };
+        /** @description Canonical nonnegative decimal string; no sign, whitespace or leading zeros. */
+        RH05Revision: string;
+        /** @description Lowercase SHA-256 hex digest of canonical content. */
+        RH05Digest: string;
+        HostPolicyChoice: {
+            /** @enum {string} */
+            source: "automatic" | "deployment" | "explicit";
+            /** @description Required for explicit; forbidden for automatic or deployment. Validated against the frozen hostcfg catalog, including cross-key groups. */
+            value?: unknown;
+        };
+        HostPolicyResolvedValue: {
+            /** @description Resolved JSON value for this setting. */
+            value: unknown;
+            /** @enum {string} */
+            source: "automatic" | "deployment" | "explicit";
+            /**
+             * Format: date-time
+             * @description Null when no reliable resolution evidence exists.
+             */
+            observed_at: string | null;
+            evidence_id?: string | null;
+        };
+        HostPolicyGroup: {
+            desired_revision: components["schemas"]["RH05Revision"];
+            applied_revision: components["schemas"]["RH05Revision"] | null;
+            /** @description Null while an offline or baseline-unavailable deployment choice has not resolved to a candidate. */
+            desired_digest: components["schemas"]["RH05Digest"] | null;
+            applied_digest?: components["schemas"]["RH05Digest"] | null;
+            /** @enum {string} */
+            scope: "next_session" | "restart";
+            /** @enum {string} */
+            status: "pending" | "applied" | "failed" | "upgrade_required" | "uncertain";
+            /** @description True when a group record is persisted for this host (including the install-time hardware record). False when projected; status, remedy and approval_preview are unchanged. Absent from older servers: treat as true. */
+            saved?: boolean;
+            /** @description Whether the evidence still matches the current agent and prerequisites. */
+            fresh: boolean;
+            /** Format: date-time */
+            observed_at?: string | null;
+            /** @description Actionable reason when pending, failed, upgrade required or uncertain; baseline_unavailable names missing current-connection deployment evidence. */
+            remedy: string | null;
+            /** Format: date-time */
+            next_retry_at?: string | null;
+            /** Format: uuid */
+            attempt_id?: string | null;
+            /** @description Server-derived reviewed restart candidate; null for next-session groups or when evidence is unavailable. */
+            approval_preview: components["schemas"]["HostPolicyApprovalPreview"] | null;
+        };
+        /** @description Independent evidence status. Preparation, configuration application and readiness do not imply one another. */
+        HostPolicyEvidenceView: {
+            /** @description Open evidence state; consumers retain unknown values. */
+            status: string;
+            /** Format: date-time */
+            observed_at: string | null;
+            /** @description For waiting, names current sessions (including local-only console), untracked managed sessions, preparation or unknown-inventory blockers; an empty observation never proves application. */
+            remedy: string | null;
+            detail?: {
+                [key: string]: unknown;
+            };
+        };
+        HostPolicy: {
+            revision: components["schemas"]["RH05Revision"];
+            choices: {
+                [key: string]: components["schemas"]["HostPolicyChoice"];
+            };
+            resolved: {
+                [key: string]: components["schemas"]["HostPolicyResolvedValue"];
+            };
+            groups: {
+                [key: string]: components["schemas"]["HostPolicyGroup"];
+            };
+            image_preparation: components["schemas"]["HostPolicyEvidenceView"];
+            readiness: components["schemas"]["HostPolicyEvidenceView"];
+        };
+        HostPolicyPatch: {
+            expected_revision: components["schemas"]["RH05Revision"];
+            changes: {
+                [key: string]: components["schemas"]["HostPolicyChoice"];
+            };
+        };
+        HostPolicyConflict: {
+            error: components["schemas"]["Error"];
+            current: components["schemas"]["HostPolicy"];
+            /** @description Keys changed since expected_revision. */
+            changed_keys: string[];
+        };
+        HostPolicyRetryRequest: {
+            group: string;
+        };
+        RH05Prerequisite: {
+            kind: string;
+            id: string;
+        };
+        HostPolicyApprovalPreview: {
+            /** @description False for unavailable conditions including a live disruptive grant/attempt, unresolved disruptive admission hold, incomplete authenticated current-connection journal reconciliation or active group snapshot, missing current review-token row, or missing current-connection Automatic hardware evidence. Every condition is bound by the prerequisite digest or rotates the review ID when availability opens. Identical replay of an existing grant uses its original request and may still return 202. */
+            available: boolean;
+            revision: components["schemas"]["RH05Revision"];
+            content_sha256: components["schemas"]["RH05Digest"];
+            /** @description Exact resolved values proposed for this group. */
+            resolved: {
+                [key: string]: unknown;
+            };
+            prerequisites_sha256: components["schemas"]["RH05Digest"];
+            prerequisites: components["schemas"]["RH05Prerequisite"][];
+            /**
+             * Format: uuid
+             * @description Persisted token for the current process boot.
+             */
+            approval_boot_incarnation: string;
+            /**
+             * Format: uuid
+             * @description Present even when unavailable but grants nothing then. Stable during a live waiting/offered grant; all restart-group IDs on the host rotate when an approval exits approved or offered for cancel_pending or a terminal state or exits cancel_pending for a terminal state
+             */
+            approval_review_id: string;
+            remedy: string | null;
+        };
+        IdleApplyRequest: {
+            group: string;
+            expected_revision: components["schemas"]["RH05Revision"];
+            content_sha256: components["schemas"]["RH05Digest"];
+            prerequisites_sha256: components["schemas"]["RH05Digest"];
+            /** @description Exact group-specific facts sorted bytewise by (kind,id): agent image digest, driver, accessible device, passing probe IDs and last verified group digest as relevant, plus the mandatory accepted_attempts set digest for restart scope. Digest input is each UTF-8 kind, NUL, id, LF. NUL and LF are forbidden within either field. Agent rechecks these facts before durable acceptance. */
+            prerequisites: components["schemas"]["RH05Prerequisite"][];
+            /**
+             * Format: uuid
+             * @description Must match the reviewed preview and persisted current process boot.
+             */
+            approval_boot_incarnation: string;
+            /**
+             * Format: uuid
+             * @description Must match the current server-issued token for a new grant; all restart-group IDs on the host rotate when an approval exits approved or offered for cancel_pending or a terminal state or exits cancel_pending for a terminal state
+             */
+            approval_review_id: string;
+            /** Format: date-time */
+            expires_at: string;
+        };
+        IdleApplyAttempt: {
+            /** Format: uuid */
+            attempt_id: string;
+            group: string;
+            revision: components["schemas"]["RH05Revision"];
+            content_sha256: components["schemas"]["RH05Digest"];
+            prerequisites_sha256: components["schemas"]["RH05Digest"];
+            /** @enum {string} */
+            phase: "waiting" | "offered" | "accepted" | "activating" | "awaiting_startup" | "verifying" | "applied" | "failed" | "recovery_verifying" | "recovery_awaiting_startup" | "recovered" | "uncertain" | "cancel_pending" | "revoked_unstarted";
+            /** @description True only after durable agent acceptance is proven; unknown acceptance retains the admission hold. */
+            started: boolean;
+            admission_restricted: boolean;
+            remedy?: string | null;
+            /** Format: date-time */
+            next_retry_at?: string | null;
+        };
+        IdleApplyConflict: {
+            error: components["schemas"]["Error"];
+            current: components["schemas"]["IdleApplyAttempt"];
+        };
+        AppPlacement: {
+            /**
+             * Format: uuid
+             * @description Canonical parent app ID.
+             */
+            app_id: string;
+            /**
+             * Format: uuid
+             * @description Canonical parent ID for a derived tile; null on the parent itself.
+             */
+            inherited_from: string | null;
+            /** @enum {string} */
+            mode: "all_eligible" | "fixed";
+            /** @description Fixed selection; empty is valid and allows no host. */
+            host_ids: string[];
+            revision: components["schemas"]["RH05Revision"];
+            /** @description RH05 #343. Catalog ID matched to the canonical app's effective image (runtime_spec.image, else linked preset image) using the immutable adopted registry ref or local tag; null for an unmanaged or image-free app. Independent of the catalog's current upstream digest and preparation status. */
+            managed_image_id: string | null;
+            /** @description Selection, preparation and readiness are distinct per-host observations. */
+            hosts: components["schemas"]["AppPlacementHost"][];
+        };
+        AppPlacementHost: {
+            /** Format: uuid */
+            host_id: string;
+            selected: boolean;
+            /** @description Null when preparation evidence is unknown. */
+            prepared: boolean | null;
+            /** @description Null when readiness evidence is unknown. */
+            ready: boolean | null;
+            /** @description Safe open code: unmanaged_image, no_image, on_demand, not_required, awaiting_preparation, preparing, preparation_failed, inventory_unknown, removing (after 0094); unknown future codes render generically. Prepared on an unselected host is observation only. */
+            reason?: string | null;
+        };
+        AppPlacementPatch: {
+            expected_revision: components["schemas"]["RH05Revision"];
+            /** @enum {string} */
+            mode: "all_eligible" | "fixed";
+            /** @description Must be empty for all_eligible. */
+            host_ids: string[];
+        };
+        PlacementConflict: {
+            error: components["schemas"]["Error"];
+            current?: components["schemas"]["AppPlacement"];
+            changed_host_ids?: string[];
+            /**
+             * Format: uuid
+             * @description Present on inherited_placement.
+             */
+            parent_app_id?: string;
+        };
+        HostImageCleanupView: {
+            /** Format: uuid */
+            host_id: string;
+            /** @enum {string} */
+            inventory_status: "current" | "unknown" | "offline";
+            /**
+             * Format: date-time
+             * @description Null when no current complete observation exists.
+             */
+            observed_at: string | null;
+            /** @description Safe next action when inventory is not current. */
+            remedy: string | null;
+            images: components["schemas"]["HostImageCleanupCandidate"][];
+        };
+        HostImageCleanupCandidate: {
+            image_id: string;
+            version: string;
+            /** @description Exact frozen adopted reference */
+            image_ref: string;
+            /** @description Daemon image ID verified for that reference. */
+            runtime_image_id: string;
+            eligible: boolean;
+            reasons: ("required" | "container_reference" | "pending_launch" | "pending_image_operation" | "pending_template_work" | "retained_previous_success" | "unknown_inventory" | "offline" | "removing")[];
+            /** @description Safe next action for an ineligible candidate. */
+            remedy?: string | null;
+            generation: components["schemas"]["RH05Revision"];
+        };
+        HostImageCleanupRequest: {
+            image_id: string;
+            version: string;
+            image_ref: string;
+            runtime_image_id: string;
+            expected_generation: components["schemas"]["RH05Revision"];
+        };
+        HostImageCleanupConflict: {
+            error: components["schemas"]["Error"];
+            current: components["schemas"]["HostImageCleanupCandidate"] | null;
+            remedy: string;
+        };
+        HostImageCleanupAttempt: {
+            /** Format: uuid */
+            attempt_id: string;
+            image_id: string;
+            version: string;
+            image_ref: string;
+            runtime_image_id: string;
+            generation: components["schemas"]["RH05Revision"];
+            /** @enum {string} */
+            state: "removing" | "removed" | "failed" | "unknown";
+            reason?: string | null;
         };
         /**
          * @description Managed-home backing store: auto = local when the session host has an effective home root, volume otherwise. Affects new homes only.
@@ -9486,6 +10507,41 @@ export interface components {
             /** @description session-capture: every capture belonging to this session, REGARDLESS of the bundle's window (captures are sparse, explicitly requested, and exempt from the rolling trace prune). Always present; empty when there are none. */
             captures?: components["schemas"]["Capture"][];
         };
+        AdminHomeClaim: {
+            /** Format: uuid */
+            user_id: string;
+            username: string | null;
+            /** Format: uuid */
+            canonical_app_id: string;
+            app_name: string | null;
+            /** Format: uuid */
+            host_id: string | null;
+            host_name: string | null;
+            /**
+             * @description Materialized means an authenticated running session used this claimed managed-home mount; it does not attest to home contents.
+             * @enum {string}
+             */
+            state: "reserved" | "materialized" | "conflict";
+            /** @enum {string|null} */
+            conflict_reason: "legacy_location_uncertain" | "claim_owner_missing" | "location_mismatch" | "gc_pending" | null;
+            /** Format: date-time */
+            materialized_at: string | null;
+            /** @description An unresolved original assignment or managed-home swap may have mounted this canonical target; this is not proof of a current mount. */
+            pending_home_operation: boolean;
+            /**
+             * @description Current authenticated owner connection's terminal cleanup capability; unknown when offline or owner is null. Not proof of historical cleanup.
+             * @enum {string}
+             */
+            home_cleanup_capability: "supported" | "unsupported" | "unknown";
+            /** @description Sticky warning for a legacy-backfilled home or managed-home dispatch without RH05 hold coverage; false does not prove physical absence. */
+            legacy_unprotected_dispatch: boolean;
+            /** @description Distinct sorted host IDs from known bookkeeping rows, including tombstones; not physical inventory evidence. */
+            recorded_host_ids: string[];
+        };
+        AdminHomeClaimsResponse: {
+            items: components["schemas"]["AdminHomeClaim"][];
+            next_cursor: string | null;
+        };
         /** @description One managed-home row from GET /v1/admin/storage/homes (storage/handler.go homeResp). */
         AdminHome: {
             /** Format: uuid */
@@ -10146,6 +11202,11 @@ export interface components {
         AgentJobPendingRun: {
             /** Format: uuid */
             run_id: string;
+            /**
+             * Format: uuid
+             * @description Opaque per-claim token on capable template.warmup runs only; omit for legacy agents and other jobs. Internal, never in public job reads or logs.
+             */
+            publish_claim_token?: string;
             /** @description The registry job id, e.g. "template.warmup". */
             job_id: string;
             /** @description The opaque per-job JSON the control plane stored when it materialized the run (for an event trigger, whatever the event carried). The framework NEVER interprets it; the agent hands it to the runner. `{}` rather than null when there is none. Bounded at 4096 bytes by a CHECK. */
@@ -10159,12 +11220,31 @@ export interface components {
             /** @description Capped at 5 per poll; [] is the steady state and also the answer when the jobs master switch is off. */
             runs: components["schemas"]["AgentJobPendingRun"][];
         };
+        SteamPublishPermitRequest: {
+            /** Format: uuid */
+            publish_claim_token: string;
+            /** @enum {string} */
+            image_id: "steam";
+            /** @description Exact digest-pinned ref; server matches current adopted Steam identity and persisted run params. The grammar does not authorize new sources or pins. */
+            registry_ref: string;
+            version: string;
+            policy_revision: string;
+        };
+        SteamPublishPermitAccepted: {
+            /** @enum {boolean} */
+            authorized: true;
+        };
         AgentJobReportRequest: {
             /**
              * Format: uuid
              * @description The claimed run being closed. Unknown, or owned by another host: 401, indistinguishable from a bad secret.
              */
             run_id: string;
+            /**
+             * Format: uuid
+             * @description Required for a nonterminal capable template.warmup run; omitted for older agents and other jobs. Must match this exact claim atomically with the report.
+             */
+            publish_claim_token?: string;
             /**
              * @description The closed set a HOST may report. `aborted` is absent on purpose - it is the reaper's verdict on a host that said nothing, and a host claiming it would be describing a decision it does not get to make. Sending it is 400 validation_failed, exactly like any other unrecognised value.
              * @enum {string}

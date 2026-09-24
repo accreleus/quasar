@@ -14,6 +14,7 @@ import { bytesFromMb } from "../../../lib/format/bytes";
 import { relativeTime, relativeTimeCompact } from "../../../lib/format/relativeTime";
 import { shortId } from "../../../lib/format/shortId";
 import { primaryGpuLabel } from "../../../lib/gpu";
+import { admissionActionLabel, canChangeOperatorDrain, hasOperatorDrain } from "./AdmissionReasons";
 import { HostExpansion } from "./HostExpansion";
 import {
   distinctGpuVendors,
@@ -219,18 +220,18 @@ function menuItems(props: HostRowProps): ActionsMenuEntry[] {
     { key: "sep", separator: true },
   ];
 
-  if (host.status === "draining") {
+  if (hasOperatorDrain(host)) {
     items.push({
       key: "resume",
-      label: "Resume scheduling",
+      label: admissionActionLabel(host),
       disabled: actionPending,
       onClick: props.onResume,
     });
   } else {
     items.push({
       key: "drain",
-      label: "Drain",
-      disabled: actionPending || host.status !== "online",
+      label: admissionActionLabel(host),
+      disabled: actionPending || !canChangeOperatorDrain(host),
       onClick: props.onDrain,
     });
   }

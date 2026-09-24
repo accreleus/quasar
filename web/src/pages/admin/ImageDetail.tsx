@@ -25,6 +25,7 @@ import { useFleetContext } from "../../lib/fleet/FleetContext";
 import { useResource } from "../../lib/resource/react";
 import { SteamPreparationStatus } from "./library/SteamPreparationStatus";
 import { hostImageState, imgRollout, POLICY_COPY } from "./library/imageRollout";
+import { ImageCleanupModal } from "./library/ImageCleanupModal";
 import { dominantInFlightState, HOST_STATE_COPY } from "./library/imageStatus";
 
 interface DetailData {
@@ -87,6 +88,7 @@ export function ImageDetail() {
 
   const [pending, setPending] = useState<"install" | "update" | "uninstall" | "pin" | null>(null);
   const [uninstallOpen, setUninstallOpen] = useState(false);
+  const [cleanupHost, setCleanupHost] = useState<Host | null>(null);
   // "Pull on first launch" beside the lead Install action — eager (false) by
   // default, matching ImagesTab's gbar install. Re-ensuring an already
   // installed image always goes eager; the switch only governs a fresh install.
@@ -176,7 +178,7 @@ export function ImageDetail() {
       await resource.mutate((ctx) => adminApi.uninstallImage(ctx.token, img.id));
       setUninstallOpen(false);
       resource.refresh({ silent: true });
-      addToast({ variant: "success", title: `${img.display_name} uninstalled` });
+      addToast({ variant: "success", title: `${img.display_name} uninstalled`, body: "Cached versions remain on hosts. Use Cached versions for explicit removal." });
     });
   }
 
@@ -226,6 +228,13 @@ export function ImageDetail() {
           key: "preparation",
           header: "Steam preparation",
           render: (h) => <SteamPreparationStatus status={img.hosts?.find((host) => host.host_id === h.id)?.steam_preparation} />,
+        },
+        {
+          key: "cleanup",
+          header: "Cached versions",
+          render: (h) => <Button size="sm" variant="ghost" onClick={(event) => { event.stopPropagation(); setCleanupHost(h); }}>
+            Manage cache
+          </Button>,
         },
         {
           key: "sessions",
@@ -368,7 +377,7 @@ export function ImageDetail() {
                 ) : (
                   <div className="card-pad">
                     <div className="note">
-                      Nothing points at this image.{img.installed ? " Uninstalling it reclaims the space on every host." : ""}
+                      Nothing points at this image. Cached versions can be reviewed per host.
                     </div>
                   </div>
                 )}
@@ -405,10 +414,10 @@ export function ImageDetail() {
                 <>
                   <Button variant="danger" style={{ width: "100%", justifyContent: "center" }} onClick={() => setUninstallOpen(true)}>
                     <IconTrash />
-                    Uninstall everywhere
+                    Uninstall image
                   </Button>
                   <p className="hint">
-                    Removes the image from every connected host. Presets and apps that point at it stop launching until it is reinstalled.
+                    Removes the adoption record. Cached versions remain on hosts until you explicitly remove them. Presets and apps that point at it stop launching until it is reinstalled.
                   </p>
                 </>
               )}
@@ -432,10 +441,9 @@ export function ImageDetail() {
           }
         >
           <p className="sec">
-            This removes <strong>{img.display_name}</strong> from every connected host
-            that has it and drops the adoption record. It is best effort. A host that never confirms
-            the removal keeps the image on disk. Any app relying on this image will fail to launch
-            until it is reinstalled.
+            This drops the adoption record for <strong>{img.display_name}</strong>. Cached versions remain
+            on hosts. Review each host's cached versions and protection reasons before requesting
+            explicit removal. Apps relying on this image will fail to launch until it is reinstalled.
           </p>
           <p className="sec muted" style={{ fontSize: "var(--t-xs)" }}>
             Reinstalling later re-fetches whatever digest the catalog currently has pinned for this
@@ -444,6 +452,8 @@ export function ImageDetail() {
           </p>
         </Modal>
       )}
+      {cleanupHost && token && <ImageCleanupModal token={token} hostID={cleanupHost.id}
+        hostName={cleanupHost.node_name} imageID={img?.id} onClose={() => setCleanupHost(null)} />}
     </section>
   );
 }

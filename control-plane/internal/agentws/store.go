@@ -162,6 +162,7 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 	// agent_disconnected_at is cleared so a re-enrolling node never carries a
 	// stale pending disconnect into its first reconnect.
 	var hostID string
+	var newlyCreated bool
 	err = tx.QueryRow(ctx, `
 		INSERT INTO hosts (node_name, agent_version, node_secret_hash, status, last_registered_at, capacity_detection, agent_process_started_at)
 		VALUES ($1, $2, $3, 'online', now(), 'unavailable', now())
@@ -177,10 +178,19 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 		        ,agent_restart_count      = 0
 		        ,agent_last_restart_at    = NULL
 		        ,agent_disconnected_at    = NULL
-		RETURNING id::text
-	`, nodeName, agentVersion, secretHash).Scan(&hostID)
+		RETURNING id::text, (xmax = 0)
+	`, nodeName, agentVersion, secretHash).Scan(&hostID, &newlyCreated)
 	if err != nil {
 		return registerResult{}, fmt.Errorf("upsert host: %w", err)
+	}
+	if newlyCreated {
+		// Only a genuinely new installation carries this unedited marker.
+		// Automatic choices are inserted after this host proves RH05 hardware
+		// capability on its authenticated connection, never on enrollment alone.
+		if _, err := tx.Exec(ctx, `INSERT INTO host_setting_groups(host_id,group_key,desired_revision,scope,status)
+			VALUES ($1::uuid,'hardware',0,'restart','upgrade_required')`, hostID); err != nil {
+			return registerResult{}, fmt.Errorf("mark new host hardware initialization: %w", err)
+		}
 	}
 	if _, err := tx.Exec(ctx, markGPUsStaleAndClearVramSQL, hostID); err != nil {
 		return registerResult{}, fmt.Errorf("mark enrollment inventory stale: %w", err)
@@ -246,7 +256,9 @@ func (s *agentStore) reconnectHost(ctx context.Context, nodeName, agentVersion, 
 // column keeps its value — still carries the admin's or a fleet run's intent.
 // session.UncordonHost is what lifts it, and it already handles a connected
 // draining host. A fresh INSERT has no prior status and starts 'online'.
-const registerStatusSQL = `CASE WHEN hosts.status = 'draining' THEN 'draining' ELSE 'online' END`
+const registerStatusSQL = `CASE WHEN hosts.status = 'draining'
+    OR EXISTS (SELECT 1 FROM host_admission_restrictions ar WHERE ar.host_id = hosts.id)
+    THEN 'draining' ELSE 'online' END`
 
 // Reconnect UPDATE with #429 restart classification (rationale at
 // agentRestartMinGap). The `old` CTE snapshots the pre-reconnect values under
@@ -495,6 +507,35 @@ func (s *agentStore) upsertHostCodecs(ctx context.Context, hostID string, codecs
 	return nil
 }
 
+// withdrawStaleProbeCodecs drops every codec above the h264 floor from the host
+// and per-GPU claims when they were reported under a different value of a
+// host-probe input key (the agent's PROBE_SETTINGS_KEYS). The capacity that
+// reported them carried that value in effective_settings; the next capacity
+// report replaces both. Fail-closed: a missing effective value withdraws.
+func (s *agentStore) withdrawStaleProbeCodecs(ctx context.Context, hostID, key string, value any) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	var stale bool
+	err = tx.QueryRow(ctx, `SELECT (effective_settings->>$2) IS DISTINCT FROM $3 FROM hosts WHERE id=$1::uuid FOR UPDATE`, hostID, key, fmt.Sprint(value)).Scan(&stale)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !stale) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	floor := `CASE WHEN codecs ? 'h264' THEN '["h264"]'::jsonb ELSE '[]'::jsonb END`
+	if _, err := tx.Exec(ctx, `UPDATE hosts SET codecs=`+floor+` WHERE id=$1::uuid AND codecs IS NOT NULL`, hostID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE gpus SET codecs=`+floor+` WHERE host_id=$1::uuid AND codecs IS NOT NULL AND jsonb_typeof(codecs)='array'`, hostID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // upsertHostCodecPixelRates writes hosts.codec_pixel_rates (#506) verbatim,
 // keep-if-absent. Stored as received — agent-owned and forward-extensible (see
 // CapacityMsg.CodecThroughput); validated only as "a JSON object", refusing
@@ -604,13 +645,18 @@ func (s *agentStore) updateHeartbeat(ctx context.Context, hostID string) error {
 	return nil
 }
 
-// markOffline sets a host offline on WS disconnect (every path that ends the
-// read loop). Also stamps agent_disconnected_at = now(), the anchor for
+// markOffline stamps a WS disconnect (every path that ends the read loop).
+// An owned restriction keeps the compatibility status draining; the connection
+// stamp remains the source of liveness. Also stamps agent_disconnected_at =
+// now(), the anchor for
 // reconnectHost's blip-vs-restart classification — see agentRestartMinGap for
 // why a control-plane restart cannot misattribute its own downtime.
 func (s *agentStore) markOffline(ctx context.Context, hostID string) error {
 	_, err := s.pool.Exec(ctx, `
-		UPDATE hosts SET status='offline', agent_disconnected_at=now() WHERE id=$1
+		UPDATE hosts SET status=CASE WHEN EXISTS (
+		    SELECT 1 FROM host_admission_restrictions ar WHERE ar.host_id=hosts.id
+		) THEN 'draining' ELSE 'offline' END,
+		agent_disconnected_at=now() WHERE id=$1
 	`, hostID)
 	if err != nil {
 		return fmt.Errorf("mark offline: %w", err)

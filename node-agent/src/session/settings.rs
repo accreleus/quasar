@@ -35,6 +35,8 @@ pub struct RuntimeSettings {
     /// `docs/superpowers/specs/2026-08-18-latency-probe-design.md`.
     pub latency_probe: bool,
     pub idle_timeout_secs: u64,
+    /// #484 app-boot watchdog (`QUASAR_APP_BOOT_TIMEOUT_SECS`); 0 disables it.
+    pub app_boot_timeout_secs: u64,
     /// SPT-02: ABR mode. The deprecated `abr_enabled` hostcfg key (bool) maps
     /// `false` to `Off`; `true` defers to the current/env-baseline mode (see
     /// `apply_json`) rather than forcing `Protective`. The 3-way `abr_mode`
@@ -284,6 +286,7 @@ impl RuntimeSettings {
             idle_timeout_secs: lookup("QUASAR_IDLE_TIMEOUT_SECS")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(120),
+            app_boot_timeout_secs: app_boot_timeout_from(lookup("QUASAR_APP_BOOT_TIMEOUT_SECS")),
             // SPT-02: ABR mode — resolved from QUASAR_ABR_MODE, legacy QUASAR_ABR /
             // QUASAR_ABR_DISABLED, then default Protective. See AbrMode::from_lookup().
             abr_mode: AbrMode::from_lookup(lookup),
@@ -339,6 +342,9 @@ impl RuntimeSettings {
         }
         if let Some(x) = v.get("idle_timeout_secs").and_then(|x| x.as_u64()) {
             self.idle_timeout_secs = x;
+        }
+        if let Some(x) = v.get("app_boot_timeout_secs").and_then(|x| x.as_u64()) {
+            self.app_boot_timeout_secs = x;
         }
         // `abr_enabled` (bool) is the DEPRECATED lossy projection kept for older
         // control planes: `false` forces `Off`; `true` must NOT force `Protective`
@@ -452,6 +458,10 @@ impl RuntimeSettings {
             "idle_timeout_secs".to_string(),
             self.idle_timeout_secs.to_string(),
         );
+        m.insert(
+            "app_boot_timeout_secs".to_string(),
+            self.app_boot_timeout_secs.to_string(),
+        );
         m.insert("encoder".to_string(), encoder_str(self.encoder).to_string());
         m.insert(
             "render_node".to_string(),
@@ -470,6 +480,25 @@ impl RuntimeSettings {
         );
         m
     }
+
+    /// RH05 pre-policy baseline, in catalog JSON types. Call this only on a
+    /// fresh env/device baseline before composing legacy or typed overlays.
+    pub fn deployment_map(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
+        let mut values = std::collections::BTreeMap::new();
+        for (key, raw) in self.effective_map() {
+            let value = match key.as_str() {
+                "abr_mode" | "abr_ladder_order" | "encoder" | "render_node" | "home_root"
+                | "nvidia_lib32_path" => serde_json::Value::String(raw),
+                _ => serde_json::from_str(&raw)
+                    .expect("runtime settings serialize every catalog number and boolean"),
+            };
+            values.insert(key, value);
+        }
+        values
+            .entry("abr_floor_kbps".to_string())
+            .or_insert(serde_json::Value::Null);
+        values
+    }
 }
 
 /// The hostcfg catalog's `encoder` enum string for an `EncoderChoice`.
@@ -480,6 +509,29 @@ fn encoder_str(e: EncoderChoice) -> &'static str {
         EncoderChoice::Nvenc => "nvenc",
         EncoderChoice::Vulkan => "vulkan",
     }
+}
+
+/// Default #484 app-boot budget: 300 s covers a cold managed home plus a cold image
+/// pull. A non-numeric env value keeps it rather than silently disabling the watchdog.
+pub(crate) const APP_BOOT_TIMEOUT_DEFAULT_SECS: u64 = 300;
+
+pub(crate) fn app_boot_timeout_from(raw: Option<String>) -> u64 {
+    match raw {
+        Some(v) => v.trim().parse::<u64>().unwrap_or_else(|_| {
+            tracing::warn!(
+                token = "knob-invalid-app-boot-timeout",
+                "QUASAR_APP_BOOT_TIMEOUT_SECS={v:?} is not a number; \
+                 using the default {APP_BOOT_TIMEOUT_DEFAULT_SECS}s"
+            );
+            APP_BOOT_TIMEOUT_DEFAULT_SECS
+        }),
+        None => APP_BOOT_TIMEOUT_DEFAULT_SECS,
+    }
+}
+
+/// The watchdog budget for a resolved `app_boot_timeout_secs`; 0 disables it.
+pub(crate) fn app_boot_budget(secs: u64) -> Option<std::time::Duration> {
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
 }
 
 fn env_pos_u32(var: &str, default: u32, lookup: &dyn Fn(&str) -> Option<String>) -> u32 {
@@ -955,5 +1007,48 @@ mod tests {
             m.get("render_node").map(String::as_str),
             Some(s.render_node.as_str())
         );
+    }
+
+    #[test]
+    fn app_boot_timeout_is_a_runtime_setting() {
+        let base = RuntimeSettings::baseline_with(&|_| None);
+        assert_eq!(base.app_boot_timeout_secs, 300);
+        let env = RuntimeSettings::baseline_with(&|k| {
+            (k == "QUASAR_APP_BOOT_TIMEOUT_SECS").then(|| "0".to_string())
+        });
+        assert_eq!(env.app_boot_timeout_secs, 0, "0 disables the watchdog");
+        let typo = RuntimeSettings::baseline_with(&|k| {
+            (k == "QUASAR_APP_BOOT_TIMEOUT_SECS").then(|| "5m".to_string())
+        });
+        assert_eq!(
+            typo.app_boot_timeout_secs, 300,
+            "a typo must not disable it"
+        );
+
+        let mut pushed = base.clone();
+        pushed.apply_json(&serde_json::json!({"app_boot_timeout_secs": 45}));
+        assert_eq!(pushed.app_boot_timeout_secs, 45);
+        assert_eq!(
+            pushed
+                .effective_map()
+                .get("app_boot_timeout_secs")
+                .map(String::as_str),
+            Some("45")
+        );
+        assert_eq!(
+            base.deployment_map().get("app_boot_timeout_secs"),
+            Some(&serde_json::json!(300))
+        );
+    }
+
+    #[test]
+    fn deployment_map_covers_every_next_session_catalog_key() {
+        let map = RuntimeSettings::baseline_with(&|_| None).deployment_map();
+        for group in crate::policy_catalog::NEXT_SESSION_GROUPS {
+            assert!(
+                map.contains_key(*group),
+                "{group} missing from deployment_map"
+            );
+        }
     }
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/accreleus/quasar/control-plane/internal/access"
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/accreleus/quasar/control-plane/internal/agentws"
 	"github.com/accreleus/quasar/control-plane/internal/artwork"
 	"github.com/accreleus/quasar/control-plane/internal/audit"
@@ -466,6 +467,15 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 		},
 	})
 	cfgStore := hostcfg.NewStore(pool)
+	// Fence unstarted RH05 approvals and journal inventory before HTTP admission
+	// or agent registration can observe this control-plane incarnation.
+	idleBootCtx, idleBootCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	idleBoot, bootErr := cfgStore.StartRH05Boot(idleBootCtx)
+	idleBootCancel()
+	if bootErr != nil {
+		janitorStop()
+		return nil, fmt.Errorf("start RH05 approval boot: %w", bootErr)
+	}
 	consoleStore := console.NewStore(pool)
 	auditStore := audit.NewStore(pool)
 	agentRegistry := agentws.NewRegistry(log)
@@ -476,9 +486,15 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// launch, so a UI flip needs no restart.
 	homeRootEnv := strings.TrimSpace(os.Getenv("QUASAR_HOME_ROOT"))
 	homeProvider := storage.New(pool, settingsStore,
-		storage.HostRootResolverFunc(func(ctx context.Context, hostID string) (string, error) {
-			return cfgStore.HomeRoot(ctx, hostID, homeRootEnv)
-		}))
+		storage.HostRootResolverFuncs{
+			Read: func(ctx context.Context, hostID string) (string, error) {
+				return cfgStore.HomeRoot(ctx, hostID, homeRootEnv)
+			},
+			Locked: func(ctx context.Context, tx pgx.Tx, hostID string) (string, error) {
+				return cfgStore.HomeRootTx(ctx, tx, hostID, homeRootEnv)
+			},
+		})
+	homeProvider.SetHomeCleanupCapability(agentRegistry.CurrentHomeCleanupCapability)
 	jobRegistry.MustRegister(jobs.Definition{
 		ID:          "storage.home_janitor",
 		Name:        "Home janitor",
@@ -571,7 +587,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	originResolver := origins.NewResolver(cfg.AllowedOrigins, cfg.AllowedOriginsSet, settingsStore, log)
 	signalHandler := signalpkg.NewHandler(sessionStore, agentRegistry, relayBus, log, originResolver).
 		WithTrustedProxies(cfg.TrustedProxies)
-	agentHandler := agentws.NewHandler(pool, cfg.EnrollmentToken, log, agentRegistry, coordinator, relayBus, cfgStore, consoleStore).
+	agentHandler := agentws.NewHandler(pool, cfg.EnrollmentToken, log, agentRegistry, coordinator, relayBus, cfgStore, consoleStore, idleBoot).
 		WithTrustedProxies(cfg.TrustedProxies)
 	// CM-09 item 2: console re-eval hook, set after both exist. A plain func value
 	// because session must not import agentws.Handler, only its agentws.Events subset.
@@ -771,11 +787,24 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	imagesStore.SetProviderAllowlist(os.Getenv("QUASAR_LIBRARY_PROVIDERS"))
 	imagesHandler := images.NewHandler(imagesStore, auditStore)
 	imagesEnsurer := images.NewEnsurer(pool, agentRegistry, log)
+	coordinator.SetLazyImagePreparer(imagesEnsurer)
 	imagesStore.SetEnsurer(imagesEnsurer)
+	imagesHandler.SetRetryEnsurer(imagesEnsurer)
+	imagesCleanup := images.NewCleanupService(janitorCtx, pool, agentRegistry)
+	imagesCleanup.SetEnsurer(imagesEnsurer)
+	imagesCleanup.SetAuditor(auditStore)
+	imagesStore.SetCleanupService(imagesCleanup)
+	imagesEnsurer.SetCleanupService(imagesCleanup)
+	go imagesCleanup.RunRetention(janitorCtx)
+	imagesHandler.SetCleanupService(imagesCleanup)
+	crudHandler.SetImageReconciler(imagesEnsurer.EnsureAll)
+	crudHandler.SetImageEvidence(imagesEnsurer.CurrentImageEvidence)
+	go imagesEnsurer.RunRequirementReconcile(janitorCtx)
 	preparationStore := preparation.New(pool)
 	agentHandler.SetPreparation(preparationStore)
 	agentHandler.OnPreparationReport = imagesEnsurer.ReconcilePreparation
 	agentHandler.SetImageEvents(imagesEnsurer)
+	agentHandler.SetImageCleanupEvents(imagesCleanup)
 
 	// Provider reconciliation. semantics: control-api.md §"P5 side effect".
 	//
@@ -874,6 +903,7 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 			return jobs.Succeeded(jobs.Summary{
 				"deleted":      rep.Deleted,
 				"in_session":   rep.InSession,
+				"pending_home": rep.PendingHome,
 				"failed":       rep.Failed,
 				"hosts_nudged": rep.HostsNudged,
 			}), nil
@@ -960,13 +990,17 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// session, because the recreate does that and doing it twice can only fail
 	// halfway. Uncordon's ErrHostNotResumable on an offline host is expected —
 	// a host mid-recreate has no agent, and its register brings it back online.
+	admissionStore := admission.NewStore(pool)
 	applyRunner := platform.NewRunner(platformStore, platform.ApplyDeps{
-		Cordon: func(ctx context.Context, hostID string) error {
-			_, err := coordinator.DrainHost(ctx, hostID, false)
+		AcquireOwned: func(ctx context.Context, attemptID, hostID string) error {
+			_, err := admissionStore.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, "Platform apply")
 			return err
 		},
-		Uncordon: func(ctx context.Context, hostID string) error {
-			_, err := coordinator.UncordonHost(ctx, hostID)
+		ReleaseOwned: func(ctx context.Context, attemptID, hostID string) error {
+			_, err := admissionStore.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: attemptID}, agentRegistry.IsConnected(hostID))
+			if errors.Is(err, admission.ErrHostNotFound) {
+				return nil
+			}
 			return err
 		},
 		Send: func(ctx context.Context, hostID string, cmd platform.ApplyCommand) (platform.Ack, error) {
@@ -1025,19 +1059,20 @@ func NewServices(cfg *config.Config, pool *pgxpool.Pool, log *slog.Logger, certM
 	// it is about to be recreated at its own step. Whether the control-plane step
 	// also DRAINS is a per-release decision (#153) that lives in the sequencer.
 	fleetCordons := platform.FleetCordons{
-		Cordon: func(ctx context.Context, hostID string) error {
-			_, err := coordinator.DrainHost(ctx, hostID, false)
+		AcquireOwned: func(ctx context.Context, runID, hostID string) error {
+			_, err := admissionStore.Acquire(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: runID}, "Platform apply")
 			return err
 		},
-		Uncordon: func(ctx context.Context, hostID string) error {
-			_, err := coordinator.UncordonHost(ctx, hostID)
+		ReleaseOwned: func(ctx context.Context, runID, hostID string) error {
+			_, err := admissionStore.Release(ctx, hostID, admission.Owner{Kind: admission.Platform, ID: runID}, agentRegistry.IsConnected(hostID))
+			if errors.Is(err, admission.ErrHostNotFound) {
+				return nil
+			}
 			return err
 		},
-		// force=true: stop the sessions, do not merely stop new placement. Used
-		// only by a migrating control-plane step under `force` (#153).
-		Drain: func(ctx context.Context, hostID string) error {
-			_, err := coordinator.DrainHost(ctx, hostID, true)
-			return err
+		IsConnected: agentRegistry.IsConnected,
+		DrainOwned: func(ctx context.Context, _, hostID string) error {
+			return coordinator.StopHostSessions(ctx, hostID)
 		},
 	}
 	// Outbound release notification (#123). The webhook is resolved per pass and

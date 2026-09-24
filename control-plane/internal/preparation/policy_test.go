@@ -61,12 +61,12 @@ func TestDesiredAndObservedAreDistinct(t *testing.T) {
 	p := testPolicy()
 	r := Reports{Steam: Report{PolicyRevision: "1", Images: []ImageReport{{Image: p.Images[0], PreparationEnabled: true, ConsumptionEnabled: true, State: "ready", Reason: "none"}}}}
 	raw, _ := json.Marshal(r)
-	legacy := Project(p, "steam", nil, raw, nil, true)
+	legacy := Project(p, "steam", nil, raw, nil, true, false)
 	if legacy.Supported || legacy.PreparationEnabled != nil || legacy.Reason != "agent_upgrade_required" {
 		t.Fatalf("legacy falsely acknowledged: %+v", legacy)
 	}
 	p.Enabled = false
-	out := Project(p, "steam", []byte(`{"steam_preparation":1}`), raw, nil, true)
+	out := Project(p, "steam", []byte(`{"steam_preparation":1}`), raw, nil, true, false)
 	if !out.PolicyPending || out.DesiredEnabled || out.PreparationEnabled == nil || !*out.PreparationEnabled || out.State != "pending_policy" {
 		t.Fatalf("desired confused with effective: %+v", out)
 	}
@@ -75,9 +75,35 @@ func TestDesiredAndObservedAreDistinct(t *testing.T) {
 	r.Steam.Images[0].ConsumptionEnabled = false
 	r.Steam.Images[0].State = "disabled"
 	raw, _ = json.Marshal(r)
-	out = Project(p, "steam", []byte(`{"steam_preparation":1}`), raw, nil, false)
+	out = Project(p, "steam", []byte(`{"steam_preparation":1}`), raw, nil, false, false)
 	if !out.PolicyPending || out.Reason != "host_offline" {
 		t.Fatal("offline status presented current")
+	}
+}
+
+func TestReadySteamPublicationProtectionRequiresMatchedCapableRun(t *testing.T) {
+	p := testPolicy()
+	r := Reports{Steam: Report{PolicyRevision: p.Revision, Images: []ImageReport{{Image: p.Images[0], PreparationEnabled: true, ConsumptionEnabled: true, State: "ready", Reason: "none", Template: &Template{RegistryRef: p.Images[0].RegistryRef, Version: p.Images[0].Version}}}}}
+	raw, _ := json.Marshal(r)
+	legacy := Project(p, "steam", []byte(`{"steam_preparation":1}`), raw, nil, true, true)
+	if legacy.PublicationProtection != "limited_protection" {
+		t.Fatalf("legacy ready status falsely verified: %+v", legacy)
+	}
+	capable := []byte(`{"steam_preparation":1,"template_publish_permit":1}`)
+	withoutRun := Project(p, "steam", capable, raw, nil, true, false)
+	if withoutRun.PublicationProtection != "limited_protection" {
+		t.Fatalf("capability alone falsely verified: %+v", withoutRun)
+	}
+	verified := Project(p, "steam", capable, raw, nil, true, true)
+	if verified.PublicationProtection != "verified" {
+		t.Fatalf("successful permit-backed ready template not verified: %+v", verified)
+	}
+	r.Steam.Images[0].State = "preparing"
+	r.Steam.Images[0].Template = nil
+	raw, _ = json.Marshal(r)
+	unfinished := Project(p, "steam", capable, raw, nil, true, true)
+	if unfinished.PublicationProtection != "limited_protection" {
+		t.Fatalf("unfinished report falsely verified: %+v", unfinished)
 	}
 }
 

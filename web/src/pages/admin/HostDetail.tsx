@@ -23,8 +23,10 @@ import { bytesFromMb } from "../../lib/format/bytes";
 import { elapsedWords, relativeTime } from "../../lib/format/relativeTime";
 import { useAdminAction } from "../../lib/resource/action";
 import { useResource } from "../../lib/resource/react";
+import { ImageCleanupModal } from "./library/ImageCleanupModal";
 import { CapacityCard } from "./fleet/hostDetail/CapacityCard";
 import { SessionsCard } from "./fleet/hostDetail/SessionsCard";
+import { AdmissionReasons, admissionActionLabel, canChangeOperatorDrain, hasOperatorDrain } from "./fleet/AdmissionReasons";
 import { hostStateChip, hostStateLabel } from "./fleet/hostDerived";
 import { faultText } from "./fleet/releasesCopy";
 import "../../styles/admin/fleet.css";
@@ -84,18 +86,18 @@ export function HostDetail() {
   const drain = useAdminAction<[Host], void>(
     async (target) => {
       if (!token) return;
-      if (target.status === "draining") await adminApi.uncordonHost(token, target.id);
+      if (hasOperatorDrain(target)) await adminApi.uncordonHost(token, target.id);
       else await adminApi.drainHost(token, target.id);
       await res.refresh({ silent: true });
       await fleet.reload();
     },
     {
       success: (_r, target) =>
-        target.status === "draining"
-          ? `${target.node_name} is accepting sessions again`
-          : `${target.node_name} is draining`,
+        hasOperatorDrain(target)
+          ? `Operator drain released for ${target.node_name}`
+          : `Operator drain added for ${target.node_name}`,
       failure: (_e, target) =>
-        target.status === "draining" ? "could not resume scheduling" : "could not drain host",
+        hasOperatorDrain(target) ? "could not release operator drain" : "could not drain host",
     },
   );
 
@@ -132,6 +134,7 @@ export function HostDetail() {
 
   // Awaiting confirmation in the Modal below; null when no "Launch anyway" is pending.
   const [confirmOverrideCheckId, setConfirmOverrideCheckId] = useState<string | null>(null);
+  const [cleanupOpen, setCleanupOpen] = useState(false);
 
   const crumbs = (
     <Breadcrumbs
@@ -152,7 +155,6 @@ export function HostDetail() {
   }
 
   const state = hostStateLabel(host);
-  const draining = host.status === "draining";
 
   return (
     <section className="page host-detail-page">
@@ -174,12 +176,15 @@ export function HostDetail() {
             >
               Local console
             </Button>
+            <Button variant="ghost" onClick={() => setCleanupOpen(true)}>
+              Manage cached images
+            </Button>
             <Button
               variant="ghost"
-              disabled={drain.pending != null || (!draining && host.status !== "online")}
+              disabled={drain.pending != null || !canChangeOperatorDrain(host)}
               onClick={() => void drain.run(host)}
             >
-              {draining ? "Resume scheduling" : "Drain"}
+              {admissionActionLabel(host)}
             </Button>
             <Button onClick={() => navigate(`/admin/fleet/hosts/${host.id}/settings`)}>
               Settings
@@ -202,6 +207,8 @@ export function HostDetail() {
             : " It has never sent one."}
         </p>
       )}
+
+      <AdmissionReasons host={host} className="note warn host-note" />
 
       {faults.map((fault) => (
         <p className="note warn host-note" key={fault.kind}>
@@ -270,6 +277,10 @@ export function HostDetail() {
             check is failing. The check stays visible, and the override ends when it next passes.
           </p>
         </Modal>
+      )}
+      {cleanupOpen && token && (
+        <ImageCleanupModal token={token} hostID={host.id} hostName={host.node_name}
+          onClose={() => setCleanupOpen(false)} />
       )}
     </section>
   );

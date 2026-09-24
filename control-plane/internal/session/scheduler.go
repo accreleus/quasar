@@ -161,6 +161,11 @@ func (s *Store) ScheduleAndCreate(ctx context.Context, p CreateParams) (Session,
 		}
 		sess, retry, err := s.scheduleAttempt(ctx, p)
 		if !retry {
+			if p.ManagedHome && errors.Is(err, ErrHomeConflict) {
+				if diagnosisErr := s.persistHomeConflict(ctx, p); diagnosisErr != nil {
+					return Session{}, diagnosisErr
+				}
+			}
 			return sess, err
 		}
 	}
@@ -185,6 +190,20 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 		`SELECT pg_advisory_xact_lock($1, hashtext($2::text))`, lockNamespaceUser, p.UserID,
 	); err != nil {
 		return Session{}, false, fmt.Errorf("lock user: %w", err)
+	}
+
+	// Keep the parent and launched tile alive through entitlement and
+	// reservation. Parent first prevents an app-delete cascade from reversing
+	// the lock order against an entitlement held FOR SHARE below.
+	appIDs := []string{p.homeAppID()}
+	if p.AppID != p.homeAppID() {
+		appIDs = append(appIDs, p.AppID)
+	}
+	for _, appID := range appIDs {
+		var lockedID string
+		if err := tx.QueryRow(ctx, `SELECT id::text FROM apps WHERE id=$1::uuid FOR KEY SHARE`, appID).Scan(&lockedID); err != nil {
+			return Session{}, false, fmt.Errorf("lock launch app: %w", err)
+		}
 	}
 
 	// (1b) Entitlement: the authorization boundary. A hand-copy of entitledSQL
@@ -223,6 +242,31 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	}
 	if err != nil {
 		return Session{}, false, fmt.Errorf("check entitlement: %w", err)
+	}
+	if p.ManagedHome {
+		owner, err := homeClaimOwner(ctx, tx, p)
+		if err != nil {
+			return Session{}, false, err
+		}
+		if owner != "" {
+			if p.PinHostID != "" && p.PinHostID != owner {
+				return Session{}, false, ErrHomeConflict
+			}
+			// A fixed selection that excludes the only safe home location needs
+			// the repair-required home explanation, rather than a generic empty
+			// fleet message. The final placement lock below still decides the race.
+			var selected bool
+			if err := tx.QueryRow(ctx, `SELECT mode='all_eligible' OR EXISTS (
+				SELECT 1 FROM app_placement_hosts
+				WHERE app_id=ap.app_id AND host_id=$2::uuid)
+				FROM app_placement ap WHERE app_id=$1::uuid`, p.homeAppID(), owner).Scan(&selected); err != nil {
+				return Session{}, false, fmt.Errorf("check home owner placement: %w", err)
+			}
+			if !selected {
+				return Session{}, false, ErrHomeConflict
+			}
+			p.PinHostID = owner
+		}
 	}
 
 	// (2) Per-user concurrent-session quota (contract gate #1, before capacity).
@@ -311,6 +355,26 @@ func (s *Store) scheduleAttempt(ctx context.Context, p CreateParams) (_ Session,
 	}
 	if !fits {
 		return Session{}, true, nil // raced; retry from scratch
+	}
+	// A placement edit takes this same row FOR UPDATE. Holding FOR SHARE through
+	// reservation means removal can commit either before this check (and we
+	// refuse) or after this session commits (already accepted sessions finish).
+	placementAllowed, err := placementSelectedForHost(ctx, tx, p.homeAppID(), hostID)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !placementAllowed) {
+		return Session{}, true, nil
+	}
+	if err != nil {
+		return Session{}, false, fmt.Errorf("lock app placement: %w", err)
+	}
+	imageAvailable, err := lockRequiredImageFence(ctx, tx, hostID, p.AppImage)
+	if err != nil {
+		return Session{}, false, err
+	}
+	if !imageAvailable {
+		return Session{}, true, nil
+	}
+	if err := claimSelectedHome(ctx, tx, p, hostID); err != nil {
+		return Session{}, false, err
 	}
 
 	// A malformed device id is dropped, not fatal: it scopes later reads and is

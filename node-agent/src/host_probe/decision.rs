@@ -385,7 +385,9 @@ impl Scheduler {
 
     /// The agent image, driver or media settings changed: a codec pass from the old stack
     /// is not evidence for the new one, so every GPU's codec checks are forgotten and its
-    /// codec probes need a fresh floor pass. The floor check keeps its retained verdict.
+    /// codec probes need a fresh floor pass. The old floor verdict is also
+    /// retired: it describes the previous encoder/settings and cannot prove a
+    /// proposed Automatic hardware choice while the replacement probe waits.
     fn forget_codec_evidence(&mut self, new: &ProbeInputs, actions: &mut Vec<Action>) {
         self.media_passed.clear();
         if let Some(running) = self.running.as_mut() {
@@ -393,6 +395,10 @@ impl Scheduler {
         }
         if !self.kinds.contains(&ProbeKind::Media) {
             return;
+        }
+        let indices: Vec<i32> = new.gpus.keys().copied().collect();
+        for index in indices {
+            self.retire(ProbeTarget::gpu(ProbeKind::Media, index), actions);
         }
         for (&index, codecs) in &new.codecs {
             for &codec in codecs {
@@ -661,7 +667,10 @@ mod tests {
         assert_eq!(s.running(), Some(host(Input)));
         let mut changed = one_gpu();
         changed.agent_image = "sha256:agent-b".into();
-        assert_eq!(s.step(Event::InputsObserved(changed)), vec![]);
+        assert_eq!(
+            s.step(Event::InputsObserved(changed)),
+            vec![Action::Forget(gpu(Media, 0))]
+        );
         assert_eq!(s.step(live(&[])), vec![]);
         assert_eq!(s.running(), Some(host(Input)));
     }
@@ -701,6 +710,10 @@ mod tests {
         let mut changed = one_gpu();
         changed.settings = "encoder=nvenc".into();
         let first = s.step(Event::InputsObserved(changed));
+        assert!(
+            first.contains(&Action::Forget(gpu(Media, 0))),
+            "old encoder's media pass must be retired: {first:?}"
+        );
         assert_eq!(
             drain(&mut s, first),
             vec![gpu(Media, 0), gpu(ApplicationGpu, 0)]
@@ -1403,8 +1416,8 @@ mod tests {
                 assert!(first.contains(&Action::Forget(forgotten)), "{first:?}");
             }
             assert!(
-                !first.contains(&Action::Forget(gpu(Media, 0))),
-                "the floor keeps its retained verdict"
+                first.contains(&Action::Forget(gpu(Media, 0))),
+                "the old floor verdict cannot prove the new encoder or driver"
             );
             let order = drain(&mut s, first);
             let floor = order.iter().position(|t| *t == gpu(Media, 0)).unwrap();

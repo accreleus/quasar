@@ -37,6 +37,10 @@ fn runtime_checks(client: &RuntimeClient) -> Vec<ReadinessCheck> {
 
 fn capacity_template() -> AgentMsg {
     AgentMsg::Capacity {
+        deployment_settings: None,
+        config_policy_accepted_groups: None,
+        config_policy_legacy_map_applied_id: None,
+
         source_preparation: None,
         host: HostCapacity {
             cpu_cores: 1,
@@ -58,12 +62,18 @@ fn capacity_template() -> AgentMsg {
 fn register() -> AgentMsg {
     AgentMsg::Register {
         source_policy_versions: None,
+        config_policy_versions: None,
+        config_policy_groups: None,
+        terminal_home_cleanup_v1: None,
         node_name: "fixture".into(),
         agent_version: "test".into(),
         auth: crate::messages::Auth::Reconnect {
             node_secret: "secret".into(),
         },
         images: Vec::new(),
+        image_cleanup_v1: true,
+        image_versions_complete: false,
+        image_versions: Vec::new(),
         source_commit: None,
         built_at: None,
         install_mode: None,
@@ -346,6 +356,7 @@ async fn a_resume_published_inside_the_blocking_observe_still_ends_the_connectio
                     (capacity_template(), Vec::new())
                 },
                 Duration::from_millis(10),
+                None,
             )
             .await
         })

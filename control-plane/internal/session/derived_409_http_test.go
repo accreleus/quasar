@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -88,6 +89,34 @@ func launchHTTP(t *testing.T, srv, token, appID string) (*http.Response, derived
 		typed.Raw = errObj
 	}
 	return resp, typed
+}
+
+func TestLaunchHomeConflict409KeepsLocationsPrivate(t *testing.T) {
+	pool := testDB(t)
+	srv, authSvc := newDerived409Server(t, pool)
+	ctx := context.Background()
+	s := seed(t, pool, 2)
+	h2, _ := seedSecondHost(t, pool, 16384, 2)
+	token, userID := registerUser(t, ctx, authSvc, "conflict@test.local", "conflictuser")
+	appID := seedManagedApp(t, pool, `{}`)
+	seedHome(t, pool, userID, appID, s.hostID)
+	seedHome(t, pool, userID, appID, h2)
+
+	resp, body := launchHTTP(t, srv.URL, token, appID)
+	if resp.StatusCode != http.StatusConflict || body.Error.Code != "home_conflict" {
+		t.Fatalf("conflicted home launch: status=%d code=%q", resp.StatusCode, body.Error.Code)
+	}
+	if len(body.Raw) != 2 {
+		t.Fatalf("conflict disclosed extra fields: %v", body.Raw)
+	}
+	if body.Error.Message != "Managed home for managed-app needs operator review" {
+		t.Fatalf("conflict message = %q", body.Error.Message)
+	}
+	for _, private := range []string{s.hostID, h2, userID, "quasar-"} {
+		if strings.Contains(body.Error.Message, private) {
+			t.Fatalf("conflict message disclosed private location or identity")
+		}
+	}
 }
 
 // registerUser registers a user and returns a bearer token plus the user id.

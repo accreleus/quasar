@@ -109,11 +109,17 @@ func codecPreferenceOrderSQL(prefIdx int) string {
 }
 
 // imageReadySQL drops hosts where the app's managed image is not `ready`.
+// The one exception is a lazy on-demand adoption (lazyOnDemandSQL): it is
+// prepared on its first launch, so requiring a prior ready report would
+// prevent that launch from ever being prepared.
+// A removing fence on the host still excludes it, even before the cleanup
+// attempt row exists; lockRequiredImageFence rechecks the same predicate.
 // refIdx carries the app's runtime_spec image reference.
 //
-// It engages only for a catalog-managed image: otherwise the inner SELECT
-// matches nothing, NOT EXISTS is vacuously true, and no existing launch can
-// become unplaceable.
+// The adoption readiness check engages only for an installed managed image.
+// A separate durable-attempt check keeps an exact ref unavailable after a
+// catalog-pruned managed version was removed, until later verified readiness.
+// A genuinely unmanaged ref remains launchable under its existing rules.
 //
 // Match installed_images.registry_ref (or .local_tag for a template app;
 // adoption populates exactly one), never image_catalog.registry_ref — that is
@@ -132,14 +138,95 @@ func imageReadySQL(refIdx int) string {
 		    SELECT 1
 		      FROM installed_images ii
 		     WHERE (ii.registry_ref = $%[1]d OR ii.local_tag = $%[1]d)
+		       %[2]s
 		       AND NOT EXISTS (
 		           SELECT 1 FROM host_images hi
 		            WHERE hi.host_id = g.host_id
 		              AND hi.image_id = ii.image_id
 		              AND hi.state = 'ready'
 		              AND (hi.version = '' OR hi.version = ii.version)
+		              AND NOT EXISTS (
+		                  SELECT 1 FROM host_image_operation_fences f
+		                   WHERE f.host_id = hi.host_id
+		                     AND f.image_id = hi.image_id
+		                     AND f.state = 'removing'
+		              )
 		       )
-		)`, refIdx)
+		) %[3]s AND NOT %[4]s`, refIdx, lazyOnDemandAdmissionSQL("g.host_id", fmt.Sprintf("$%d", refIdx)),
+		imageCleanupIdentityFenceSQL(refIdx),
+		removedManagedImageUnreadySQL("g.host_id", fmt.Sprintf("$%d", refIdx)))
+}
+
+// lazyOnDemandSQL is true when adoption row `alias` is lazy and its first
+// launch prepares exactly the adopted content, so a prior ready report is not
+// required. Two shapes qualify:
+//   - a prebuilt whose registry_ref is an immutable digest equal to the launch
+//     ref: the coordinator pulls exactly those bits through the managed
+//     image_ensure and waits for a current authenticated ready report before
+//     assignment (images.Ensurer.PrepareLazyImage);
+//   - a buildable template whose local_tag is the launch ref: the coordinator
+//     builds its frozen context and waits for a current authenticated ready
+//     report before assignment (images.Ensurer.PrepareLazyImage).
+//
+// A lazy tag ref is excluded because a tag can move.
+//
+// The host's reported state is deliberately ignored, `failed` included. Retry
+// refuses lazy images (ErrRetryLazy), so the launch's own preparation is the
+// only thing that can recover a host whose earlier on-demand attempt failed.
+func lazyOnDemandSQL(alias, refExpr string) string {
+	return fmt.Sprintf(`(%[1]s.lazy AND (
+		(%[1]s.registry_ref = %[2]s AND %[1]s.registry_ref ~ '@sha256:[0-9a-f]{64}$')
+		OR (%[1]s.registry_ref = '' AND %[1]s.local_tag = %[2]s AND %[1]s.context_sha <> ''
+			AND EXISTS (SELECT 1 FROM image_catalog lc WHERE lc.id = %[1]s.image_id AND lc.kind = 'template'))))`,
+		alias, refExpr)
+}
+
+// lazyOnDemandAdmissionSQL filters the readiness subquery's adoption row `ii`:
+// a lazy on-demand row stops blocking unless a removing fence holds this host.
+func lazyOnDemandAdmissionSQL(hostExpr, refExpr string) string {
+	return fmt.Sprintf(`AND NOT (%[2]s AND NOT EXISTS (
+		SELECT 1 FROM host_image_operation_fences lf
+		WHERE lf.host_id = %[1]s AND lf.image_id = ii.image_id AND lf.state = 'removing'))`,
+		hostExpr, lazyOnDemandSQL("ii", refExpr))
+}
+
+// A successfully removed exact ref stays unavailable after catalog/adoption
+// pruning. Only a later managed adoption plus a ready report for that same
+// ref proves it was prepared again. The report must be newer than the
+// terminal attempt; a ready row retained from before deletion is no proof.
+// A current lazy on-demand adoption of the ref is the exception: it cannot
+// report ready before its first launch, and that launch prepares it again.
+func removedManagedImageUnreadySQL(hostExpr, refExpr string) string {
+	return fmt.Sprintf(`EXISTS (
+		SELECT 1 FROM host_image_cleanup_attempts a
+		WHERE a.host_id=%[1]s AND a.image_ref=%[2]s AND a.state='removed'
+		AND NOT EXISTS (SELECT 1 FROM installed_images lz WHERE %[3]s)
+		AND NOT EXISTS (
+			SELECT 1 FROM installed_images ii JOIN host_images hi
+			ON hi.image_id=ii.image_id AND hi.host_id=a.host_id
+			WHERE (ii.registry_ref=%[2]s OR ii.local_tag=%[2]s)
+			AND hi.state='ready' AND (hi.version='' OR hi.version=ii.version)
+			AND hi.updated_at>a.updated_at
+		)
+	)`, hostExpr, refExpr, lazyOnDemandSQL("lz", refExpr))
+}
+
+// Active cleanup of a catalog-pruned/uninstalled managed version is still an
+// image availability gate. Its exact ref survives in the durable attempt or
+// successful-version history, even after installed_images disappears. This is
+// rendered in every candidacy query, including the totals probe that decides
+// no_host_available versus capacity_exhausted.
+func imageCleanupIdentityFenceSQL(refIdx int) string {
+	return fmt.Sprintf(`AND NOT EXISTS (
+		SELECT 1 FROM host_image_operation_fences f
+		WHERE f.host_id=g.host_id AND f.state='removing'
+		AND (EXISTS(SELECT 1 FROM host_image_cleanup_attempts a
+			WHERE a.host_id=f.host_id AND a.image_id=f.image_id AND a.image_ref=$%[1]d)
+		OR EXISTS(SELECT 1 FROM host_image_success_history h
+			WHERE h.host_id=f.host_id AND h.image_id=f.image_id
+			AND (COALESCE(NULLIF(h.current_identity->>'registry_ref',''),NULLIF(h.current_identity->>'local_tag',''))=$%[1]d
+				OR COALESCE(NULLIF(h.previous_identity->>'registry_ref',''),NULLIF(h.previous_identity->>'local_tag',''))=$%[1]d)))
+	)`, refIdx)
 }
 
 // StoreOption configures a Store at construction.

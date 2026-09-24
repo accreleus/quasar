@@ -155,6 +155,12 @@ pub trait JobRunner: Send + Sync {
     /// Execute one run. `params` is the opaque blob the control plane stored
     /// when it materialized the run (`{}` for a plain scheduled run).
     fn run(&self, params: &Value, abort: &AbortFlag) -> JobOutcome;
+
+    /// The claimed context is needed only by runners with a run-scoped final
+    /// authority check. Legacy jobs continue through run unchanged.
+    fn run_claimed(&self, claimed: &PendingRun, abort: &AbortFlag) -> JobOutcome {
+        self.run(&claimed.params, abort)
+    }
 }
 
 /// The set of runners this agent can execute. A job id with no registered
@@ -210,6 +216,8 @@ impl JobRegistry {
 pub struct PendingRun {
     pub run_id: String,
     pub job_id: String,
+    #[serde(default)]
+    pub publish_claim_token: Option<String>,
     /// Opaque per-job blob; the agent never interprets it, it hands it to the
     /// runner verbatim.
     #[serde(default)]
@@ -231,6 +239,8 @@ struct PendingResponse {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct JobReport {
     pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publish_claim_token: Option<String>,
     pub state: String,
     pub summary: Value,
     pub error: Option<String>,
@@ -405,7 +415,7 @@ impl JobPoller {
         let abort = self.abort.clone();
         let started = std::time::Instant::now();
         let outcome =
-            match std::panic::catch_unwind(AssertUnwindSafe(|| runner.run(&run.params, &abort))) {
+            match std::panic::catch_unwind(AssertUnwindSafe(|| runner.run_claimed(run, &abort))) {
                 Ok(o) => o,
                 Err(payload) => {
                     let msg = panic_message(&payload);
@@ -457,6 +467,7 @@ impl JobPoller {
         }
         let report = JobReport {
             run_id: run.run_id.clone(),
+            publish_claim_token: run.publish_claim_token.clone(),
             state: outcome.state().to_string(),
             summary: outcome.summary(),
             error: outcome.error(),
@@ -699,6 +710,7 @@ mod tests {
         PendingRun {
             run_id: run_id.into(),
             job_id: job_id.into(),
+            publish_claim_token: None,
             params,
             deadline_secs: 3600,
         }
@@ -1035,6 +1047,7 @@ mod tests {
     fn report_serializes_the_control_plane_shape() {
         let r = JobReport {
             run_id: "1f4a".into(),
+            publish_claim_token: None,
             state: "succeeded".into(),
             summary: json!({"files": 23701}),
             error: None,

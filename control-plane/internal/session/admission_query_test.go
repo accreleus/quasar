@@ -5,6 +5,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -19,6 +20,35 @@ var wsRun = regexp.MustCompile(`\s+`)
 // numbering, not indentation. Indentation is cosmetic here — it only affects how
 // the statement reads in a log — while a changed `$N` is a behaviour change.
 func normSQL(s string) string { return strings.TrimSpace(wsRun.ReplaceAllString(s, " ")) }
+
+func withoutRH05Restriction(s string) string {
+	s = strings.ReplaceAll(s, normSQL(unrestrictedHostSQL), "")
+	// RH05 #345 adds a managed-image cleanup gate inside imageReadySQL. The
+	// historical SQL capture predates that gate; its exact predicate is checked
+	// separately below before removing it for the legacy comparison.
+	s = strings.ReplaceAll(s, normSQL(imageCleanupFencePredicate), "")
+	for idx := 1; idx <= 32; idx++ {
+		// #346 lets a lazy pinned digest reach the agent's on-demand pull. The
+		// historical capture predates that filter; the operator launch DB
+		// tests assert its behavior for eager, lazy digest and lazy template.
+		s = strings.ReplaceAll(s, normSQL(lazyOnDemandAdmissionSQL("g.host_id", "$"+strconv.Itoa(idx))), "")
+		s = strings.ReplaceAll(s, normSQL(imageCleanupIdentityFenceSQL(idx)), "")
+		s = strings.ReplaceAll(s, normSQL("AND NOT "+removedManagedImageUnreadySQL("g.host_id", "$"+strconv.Itoa(idx))), "")
+	}
+	return normSQL(placementAnchorGate.ReplaceAllString(s, ""))
+}
+
+const imageCleanupFencePredicate = `AND NOT EXISTS (
+	SELECT 1 FROM host_image_operation_fences f
+	WHERE f.host_id = hi.host_id
+	  AND f.image_id = hi.image_id
+	  AND f.state = 'removing'
+)`
+
+// 0091 adds a final canonical-app bind to each admission query. Strip exactly
+// that additive predicate when comparing with the pre-placement SQL capture;
+// its presence and bind value are asserted separately below.
+var placementAnchorGate = regexp.MustCompile(` AND EXISTS \( SELECT 1 FROM app_placement ap WHERE ap.app_id = \$[0-9]+::uuid AND \(ap.mode = 'all_eligible' OR EXISTS \( SELECT 1 FROM app_placement_hosts aph WHERE aph.app_id = ap.app_id AND aph.host_id = h.id\)\)\)`)
 
 // admissionMatrix renders every admission query across the full configuration
 // space, keyed by shape. Each entry is the normalized SQL.
@@ -164,7 +194,30 @@ func TestAdmissionSQLMatchesPreRefactor(t *testing.T) {
 	for shape, sqls := range generated {
 		index[shape] = map[string]bool{}
 		for _, s := range sqls {
-			index[shape][s] = true
+			if strings.Contains(s, "host_images hi") && !strings.Contains(s, normSQL(imageCleanupFencePredicate)) {
+				t.Fatalf("%s managed-image query omitted the cleanup fence", shape)
+			}
+			if strings.Contains(s, "host_images hi") && !strings.Contains(s, "FROM host_image_cleanup_attempts a") {
+				t.Fatalf("%s managed-image query omitted durable exact-ref cleanup fence", shape)
+			}
+			if strings.Contains(s, "host_images hi") && !strings.Contains(s, "lf.state = 'removing'") {
+				t.Fatalf("%s managed-image query omitted the lazy on-demand digest gate", shape)
+			}
+			if strings.Contains(s, "host_images hi") && !strings.Contains(s, "hi.updated_at>a.updated_at") {
+				t.Fatalf("%s managed-image query omitted verified re-ensure after terminal removal", shape)
+			}
+			if !strings.Contains(s, normSQL(unrestrictedHostSQL)) {
+				t.Fatalf("%s query omitted the RH05 owner restriction", shape)
+			}
+			if !placementAnchorGate.MatchString(s) {
+				t.Fatalf("%s query omitted the app placement predicate", shape)
+			}
+			if !strings.Contains(s, "h.config_policy_gate_connection IS NULL") {
+				t.Fatalf("%s query omitted the RH05 settings delivery gate", shape)
+			}
+			// The captured statements predate RH05. Compare every other token
+			// while separately requiring the new restriction above.
+			index[shape][withoutRH05Restriction(s)] = true
 		}
 	}
 
@@ -180,6 +233,12 @@ func TestAdmissionSQLMatchesPreRefactor(t *testing.T) {
 		if !ok {
 			t.Fatalf("anchor line %d is not <shape>\\t<sql>", line)
 		}
+		// RH05 adds an independent settings-delivery gate to every place a
+		// reported GPU can be admitted. Keep the historical capture intact and
+		// compare it after this single mechanical predicate insertion.
+		sql = strings.ReplaceAll(sql,
+			"AND h.capacity_detection = 'ok' AND g.reported",
+			"AND h.capacity_detection = 'ok' AND h.config_policy_gate_connection IS NULL AND g.reported")
 		seen[shape]++
 		if index[shape] == nil {
 			t.Errorf("anchor line %d names unknown shape %q", line, shape)
@@ -317,6 +376,9 @@ func TestAdmissionArgValues(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// The canonical parent app is bound last, leaving every historical
+			// gate's placeholder and value stable.
+			tc.want = append(tc.want, app)
 			if len(tc.args) != len(tc.want) {
 				t.Fatalf("bound %d args, want %d\n got: %#v\nwant: %#v",
 					len(tc.args), len(tc.want), tc.args, tc.want)

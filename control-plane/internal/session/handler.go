@@ -217,7 +217,8 @@ type sessionResp struct {
 	// The app container's last ~100 log lines, oldest first, captured while it
 	// ran: containers use `--rm`, so the daemon has discarded them by the time
 	// anyone looks (#463).
-	AppLogTail *string `json:"app_log_tail"`
+	AppLogTail *string         `json:"app_log_tail"`
+	HomeSeed   json.RawMessage `json:"home_seed"`
 	// The launch profile the session came from, null for a legacy/tier/override
 	// launch. Resolved values are in Stream; metadata at GET /v1/me/profiles.
 	ProfileID *string `json:"profile_id"`
@@ -331,6 +332,7 @@ func sessionRespWithStream(s Session, stream streamResp) sessionResp {
 		ErrorMessage:    s.ErrorMessage,
 		FailureCode:     s.FailureCode,
 		AppLogTail:      s.AppLogTail,
+		HomeSeed:        s.HomeSeed,
 		ProfileID:       s.ProfileID,
 		StreamProfileID: s.StreamProfileID,
 		CodecDecision:   s.CodecDecision,
@@ -473,6 +475,9 @@ func (h *Handler) handleLaunch(w http.ResponseWriter, r *http.Request) {
 	// not click. Absent rather than empty when the guard named none.
 	case errors.Is(err, ErrHomeInUse):
 		writeHomeInUse(w, err, "you already have a live session backed by this app's storage; go to it or stop it before launching another")
+		return
+	case errors.Is(err, ErrHomeConflict):
+		h.writeHomeConflict(w, r.Context(), req.AppID)
 		return
 	// Names the PARENT app and the one action that fixes it. 409 rather than 503:
 	// nothing is busy, and retrying changes nothing.
@@ -703,6 +708,13 @@ func (h *Handler) handleSwap(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, ErrHomeInUse):
 		writeHomeInUse(w, err, "you already have a live session backed by that app's storage; stop it before swapping")
 		return
+	case errors.Is(err, ErrHomeConflict):
+		h.writeHomeConflict(w, r.Context(), req.AppID)
+		return
+	case errors.Is(err, ErrNoHostAvailable):
+		httpx.WriteError(w, http.StatusServiceUnavailable, httpx.CodeNoHostAvailable,
+			"this app is not selected for the current session's host")
+		return
 	// A swap is pinned to the LIVE session's host with no placement step to
 	// re-pin it, so swapping into a tile whose library lives elsewhere is an
 	// ordinary user-correctable condition, not a 500.
@@ -812,6 +824,16 @@ func writeHomeInUse(w http.ResponseWriter, err error, message string) {
 		body["session_id"] = id
 	}
 	httpx.WriteJSON(w, http.StatusConflict, map[string]any{"error": body})
+}
+
+func (h *Handler) writeHomeConflict(w http.ResponseWriter, ctx context.Context, appID string) {
+	name, err := h.store.CanonicalAppName(ctx, appID)
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, httpx.CodeInternal, "could not resolve managed home app")
+		return
+	}
+	httpx.WriteError(w, http.StatusConflict, httpx.CodeHomeConflict,
+		fmt.Sprintf("Managed home for %s needs operator review", name))
 }
 
 // writeParentDisabled emits the 409 parent_app_disabled envelope, naming the

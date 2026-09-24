@@ -106,8 +106,8 @@ func TestReadinessGateIsNotInTheTotalsProbe(t *testing.T) {
 	if strings.Contains(sql, "readiness") {
 		t.Fatalf("the totals probe carries the readiness gate:\n%s", sql)
 	}
-	if len(args) != 1 {
-		t.Fatalf("totals args = %#v, want slots only", args)
+	if len(args) != 2 || args[1] != "" {
+		t.Fatalf("totals args = %#v, want slots plus canonical placement app", args)
 	}
 	// Its readiness-aware sibling, used only to classify a refusal, does carry it.
 	sql, _ = c.readinessTotalsQuery()
@@ -193,6 +193,7 @@ func TestReadinessArgValues(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			tc.want = append(tc.want, app) // RH05 canonical placement binds last.
 			if len(tc.args) != len(tc.want) {
 				t.Fatalf("bound %d args, want %d\n got: %#v\nwant: %#v", len(tc.args), len(tc.want), tc.args, tc.want)
 			}

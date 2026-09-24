@@ -317,6 +317,7 @@ fn fail_dualoutput_console<F: Fn(SessionEvent)>(
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     Starting,
+    HomeSeed(super::home::HomeSeedOutcome),
     /// Fine-grained launch progress while the top-level state remains starting.
     Progress(&'static str),
     Running,
@@ -1194,35 +1195,8 @@ fn swap_app_ready_timeout() -> Duration {
 /// Poll interval for both swap wait loops.
 const SWAP_POLL: Duration = Duration::from_millis(20);
 
-/// #484 boot budget: how long a launched app may take to present its first frame before
-/// the session fails `app_never_presented`. 300 s covers a cold managed home plus a cold
-/// image pull; a false "your game is broken" would be a new defect. Knob:
-/// `QUASAR_APP_BOOT_TIMEOUT_SECS`.
-const APP_BOOT_TIMEOUT_DEFAULT_SECS: u64 = 300;
-
 /// How often the boot watcher logs that it is still waiting.
 const APP_BOOT_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(15);
-
-/// [`APP_BOOT_TIMEOUT_DEFAULT_SECS`] with its env override. `0` disables the watchdog
-/// (`None`), leaving the idle reaper unchanged; a non-numeric value falls back to the
-/// default rather than silently disabling it.
-fn app_boot_timeout() -> Option<Duration> {
-    let secs = match std::env::var("QUASAR_APP_BOOT_TIMEOUT_SECS") {
-        Ok(v) => match v.trim().parse::<u64>() {
-            Ok(n) => n,
-            Err(_) => {
-                tracing::warn!(
-                    token = "knob-invalid-app-boot-timeout",
-                    "QUASAR_APP_BOOT_TIMEOUT_SECS={v:?} is not a number; \
-                     using the default {APP_BOOT_TIMEOUT_DEFAULT_SECS}s"
-                );
-                APP_BOOT_TIMEOUT_DEFAULT_SECS
-            }
-        },
-        Err(_) => APP_BOOT_TIMEOUT_DEFAULT_SECS,
-    };
-    (secs > 0).then(|| Duration::from_secs(secs))
-}
 
 /// The gen-0 (session launch) app-presented gate, pure so the latch is unit tested (#484).
 ///
@@ -1399,6 +1373,9 @@ pub fn run_blocking(
             return;
         }
     };
+    if let Some(outcome) = res.home_seed {
+        emit(SessionEvent::HomeSeed(outcome));
+    }
     cfg.pulse_server = pulse_server;
     if cfg.pulse_server.is_none() && !cfg.use_test_audio {
         // The sidecar was wanted and is not there: this session will stream SILENCE. A
@@ -2050,7 +2027,7 @@ pub fn run_blocking(
     // #484 gen-0 app-boot gate. `AppBooting` follows `Running` for any generation that
     // launches an app container; `AppPresented` latches the first genuine draw. Both are
     // single-shot.
-    let app_boot_budget = app_boot_timeout();
+    let app_boot_budget = cfg.app_boot_timeout;
     let mut app_boot_started_at: Option<Instant> = None;
     let mut app_presented_at: Option<Instant> = None;
     let mut app_boot_counter_warned = false;
@@ -4750,15 +4727,6 @@ mod tests {
             Duration::from_secs(9999),
             false
         ));
-    }
-
-    #[test]
-    fn app_boot_timeout_defaults_when_unset() {
-        // A typo'd value must not silently disable the watchdog.
-        assert_eq!(
-            super::app_boot_timeout(),
-            Some(Duration::from_secs(super::APP_BOOT_TIMEOUT_DEFAULT_SECS))
-        );
     }
 
     // ---- #408: audio pipeline guard ----

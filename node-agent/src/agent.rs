@@ -139,6 +139,14 @@ pub async fn run(cfg: Config) {
         std::process::exit(1);
     }
 
+    // Consume a restart journal marker once per process, before probes or
+    // session runtime initialization can observe the affected hardware group.
+    let policy_path = std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path));
+    // Consume any restart marker before loading runtime policy. A corrupt
+    // journal or a requested recovery restart is handled after the independent
+    // startup container and managed-home cleanup has run.
+    let policy_boot = crate::policy::PolicyAgent::bootstrap(&policy_path);
+
     crate::runtime::initialize_image_state(
         format!("{}.runtime-images", cfg.node_secret_path).into(),
     );
@@ -180,7 +188,7 @@ pub async fn run(cfg: Config) {
 
     // Returns only once the cleanup has succeeded; everything below is withheld until then.
     if let Some(station) = crate::diagnostic::Station::enter(&first_cleanup) {
-        run_diagnostic_mode(&cfg, &health, &station).await;
+        run_diagnostic_mode(&cfg, &health, &station, true, None).await;
     }
 
     // Install mode + updater presence, for the startup identity banner;
@@ -203,7 +211,7 @@ pub async fn run(cfg: Config) {
     // (the ephemeral-username shape) that no live container mounts and that are
     // past the retention window — a real account's home is never a candidate.
     // Process-level: it must run whether or not this agent reaches the control plane.
-    if crate::diagnostic::may_start(crate::diagnostic::Work::HomesGc) {
+    if policy_boot.is_ok() && crate::diagnostic::may_start(crate::diagnostic::Work::HomesGc) {
         crate::session::homes_gc::spawn_sweeper();
     }
 
@@ -266,7 +274,9 @@ pub async fn run(cfg: Config) {
     // Materialise a missing NVIDIA graphics userspace into the driver volume. The
     // trigger is the readiness check set itself, so what provisions and what the
     // admin card shows can never disagree.
-    if crate::diagnostic::may_start(crate::diagnostic::Work::DriverVolumeProvisioner) {
+    if policy_boot.is_ok()
+        && crate::diagnostic::may_start(crate::diagnostic::Work::DriverVolumeProvisioner)
+    {
         spawn_nvidia_volume_provisioner(&runtime, &nvidia_lib32_probed);
     }
 
@@ -274,7 +284,9 @@ pub async fn run(cfg: Config) {
     // immediately on a CDI-injected host, and NVRTC is needed on those too. The two
     // share the volume and nothing else (separate lock, manifest, backoff), so
     // running them concurrently is safe.
-    if crate::diagnostic::may_start(crate::diagnostic::Work::CudaRuntimeProvisioner) {
+    if policy_boot.is_ok()
+        && crate::diagnostic::may_start(crate::diagnostic::Work::CudaRuntimeProvisioner)
+    {
         spawn_cuda_runtime_provisioner(&runtime);
     }
 
@@ -297,12 +309,133 @@ pub async fn run(cfg: Config) {
         image_mgr.clone(),
         release_mgr.clone(),
     );
+    match crate::home_cleanup::verified_ledger_path(&cfg.node_secret_path) {
+        Some(path) => {
+            let result = crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(path)
+                .and_then(|mut ledger| {
+                    ledger.recover_active(|id| {
+                        crate::runtime::configured()
+                            .map_err(std::io::Error::other)?
+                            .retire_session_applications(id)
+                            .wait()
+                            .map_err(std::io::Error::other)
+                    })?;
+                    Ok(ledger)
+                });
+            match result {
+                Ok(ledger) => sessions.mgr.home_cleanup = Some(ledger),
+                Err(_) => {
+                    error!(token = "home-cleanup-proof-unavailable",
+                        "persistent home cleanup state is uncertain; refusing agent admission");
+                    sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
+                    std::process::exit(1);
+                }
+            }
+        }
+        None if !matches!(crate::home_cleanup::ledger_truly_absent(&cfg.node_secret_path), Ok(true)) => {
+            error!(token = "home-cleanup-existing-ledger-unverified",
+                "existing home cleanup ledger lacks verified persistence; refusing agent admission");
+            sleep(ENROLLMENT_UNCONFIGURED_EXIT_DELAY).await;
+            std::process::exit(1);
+        }
+        None => warn!(
+            token = "home-cleanup-ledger-unverified",
+            "node identity directory is not a verified persistent mount; cleanup proof capability withheld"
+        ),
+    }
     let grace = session_grace();
 
     // Only records that already asked for terminal cleanup are eligible here.
     // This task never adopts or stops a running application; boot retirement above
     // remains the fail-closed policy for applications left by a previous agent.
     let _application_cleanup_guard = spawn_application_cleanup_recovery();
+
+    let policy_boot = match policy_boot {
+        Ok(crate::policy::BootOutcome::Recovery(id)) => {
+            info!(token = "policy-recovery-restart", attempt_id = %id,
+                "restarting once to activate the last verified hardware configuration");
+            std::process::exit(0);
+        }
+        Ok(outcome) => outcome,
+        Err(crate::policy::BootError::Write(error)) => {
+            error!(token = "policy-journal-write-failed",
+                    "host configuration journal could not be updated after independent cleanup: {error}");
+            let station = crate::diagnostic::Station::policy_journal_write_failed();
+            run_diagnostic_mode(&cfg, &health, &station, false, Some(&image_mgr)).await;
+            return;
+        }
+        Err(error) => {
+            error!(
+                token = "policy-journal-corrupt",
+                "host configuration journal cannot be loaded after independent cleanup: {error}"
+            );
+            let station = crate::diagnostic::Station::policy_journal_corrupt();
+            run_diagnostic_mode(&cfg, &health, &station, false, Some(&image_mgr)).await;
+            return;
+        }
+    };
+    if matches!(
+        policy_boot,
+        crate::policy::BootOutcome::Candidate(_) | crate::policy::BootOutcome::RecoveryVerify(_)
+    ) {
+        let mut settings = crate::session::settings::RuntimeSettings::baseline();
+        seed_nvidia_lib32(&mut settings, &nvidia_lib32_probed);
+        let mut verifier = match crate::policy::PolicyAgent::open(
+            policy_path,
+            String::new(),
+            String::new(),
+            String::new(),
+            &mut settings,
+        ) {
+            Ok(agent) => agent,
+            Err(error) => {
+                error!(
+                    token = "policy-boot-open-failed",
+                    "cannot load policy for startup verification: {error}"
+                );
+                health.set_not_ready(Some("configuration verification unavailable".into()));
+                return;
+            }
+        };
+        let prepared = match verifier.prepare_boot(&policy_boot, &settings) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                error!(
+                    token = "policy-boot-prepare-failed",
+                    "cannot prepare startup verification: {error}"
+                );
+                health.set_not_ready(Some("configuration verification unavailable".into()));
+                return;
+            }
+        };
+        let result = match prepared {
+            crate::policy::BootPreparation::Complete(result) => Ok(result),
+            crate::policy::BootPreparation::Verify(readback) => {
+                let proved = verify_hardware_boot(readback.settings().clone()).await;
+                verifier.complete_boot(*readback, proved, &mut settings)
+            }
+        };
+        match result {
+            Ok(crate::policy::BootOutcome::Recovery(id)) => {
+                info!(token = "policy-recovery-restart", attempt_id = %id,
+                    "candidate failed startup verification; restarting once to restore the last verified hardware configuration");
+                std::process::exit(0);
+            }
+            Ok(crate::policy::BootOutcome::Uncertain(id)) => {
+                warn!(token = "policy-recovery-uncertain", attempt_id = %id,
+                    "hardware recovery is unverified; admission remains protected");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                error!(
+                    token = "policy-boot-verification-failed",
+                    "cannot persist startup verification: {error}"
+                );
+                health.set_not_ready(Some("configuration verification unavailable".into()));
+                return;
+            }
+        }
+    }
 
     let mut backoff = Duration::from_secs(1);
     // #199: see `EnrollmentFallback` — one token attempt per stale-secret reject.
@@ -336,6 +469,12 @@ pub async fn run(cfg: Config) {
                     handle.disconnected();
                 }
                 health.set_connected(false);
+                if e.downcast_ref::<PolicySeedReconnect>().is_some() {
+                    sessions.registered_this_connection = false;
+                    info!(token = "policy-seed-reconnect", "durable legacy seed applied; reconnecting once to negotiate typed ownership");
+                    sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
                 // #128: hold the running sessions instead of stopping them. The
                 // media path is agent-to-browser and needs nothing from the
                 // control plane while it is away, and on reconnect the control
@@ -929,6 +1068,75 @@ fn detect_capacity_blocking() -> capacity::SystemCapacity {
     cap
 }
 
+/// A restart marker is proved before registration. This uses fresh device
+/// inventory and a bounded media child in the new process; prior connection
+/// probe results are deliberately not reused as startup proof.
+async fn verify_hardware_boot(settings: crate::session::settings::RuntimeSettings) -> bool {
+    if settings.render_node == "software" {
+        if settings.encoder != EncoderChoice::Openh264 {
+            return false;
+        }
+        let probed = offload_probe(move || probe_host_codecs(&settings)).await;
+        return probed.is_some_and(|report| report.codecs.iter().any(|codec| codec == "h264"));
+    }
+    let inventory = offload_probe(detect_capacity_blocking).await.gpus;
+    verify_boot_device_with(&settings, &inventory, |spec| async move {
+        let (_sender, preempt) = tokio::sync::watch::channel(false);
+        matches!(
+            crate::host_probe::media::run(None, spec, preempt).await,
+            Ok(crate::host_probe::outcome::ChildEnd::Exited { code: 0, .. })
+        )
+    })
+    .await
+}
+
+async fn verify_boot_device_with<F, Fut>(
+    settings: &crate::session::settings::RuntimeSettings,
+    inventory: &[crate::messages::GpuCapacity],
+    probe: F,
+) -> bool
+where
+    F: FnOnce(crate::host_probe::child::ChildSpec) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut matching = inventory.iter().filter(|gpu| {
+        (gpu.render_node.as_deref() == Some(settings.render_node_configured.as_str())
+            || gpu.render_node.as_deref() == Some(settings.render_node.as_str())
+            || gpu.device_path.as_deref() == Some(settings.render_node.as_str()))
+            && gpu.encode_slots_total > 0
+            && gpu
+                .driver_identity
+                .as_ref()
+                .is_some_and(|id| !id.is_empty())
+    });
+    let Some(gpu) = matching.next() else {
+        return false;
+    };
+    if matching.next().is_some() {
+        return false;
+    }
+    if std::fs::File::open(gpu.device_path.as_deref().unwrap_or(&settings.render_node)).is_err() {
+        return false;
+    }
+    let spec = match crate::host_probe::media::child_spec(
+        settings,
+        inventory,
+        gpu.index,
+        None,
+        Duration::from_secs(45),
+    ) {
+        Ok(spec) => spec,
+        Err(error) => {
+            warn!(
+                token = "policy-boot-probe-unavailable",
+                "cannot construct hardware startup probe: {error:#}"
+            );
+            return false;
+        }
+    };
+    probe(spec).await
+}
+
 /// Is a degraded vulkan codec plan the expected first-boot shape (driver volume still
 /// provisioning, so the Vulkan ICD is invisible to the registry scan) or an image
 /// defect? Pure so it is testable without the module's process-global state;
@@ -1289,6 +1497,17 @@ type CpStream = futures_util::stream::SplitStream<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 >;
 
+#[derive(Debug)]
+struct PolicySeedReconnect;
+
+impl std::fmt::Display for PolicySeedReconnect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RH05 seed reconnect")
+    }
+}
+
+impl std::error::Error for PolicySeedReconnect {}
+
 /// Open the control-plane socket and split it.
 ///
 /// #12: the connector is chosen by policy, never by tokio-tungstenite's default — a
@@ -1316,13 +1535,27 @@ fn register_message(
     prefer_enrollment_token: bool,
     images: Vec<crate::messages::RegisterImageEntry>,
     install: &crate::buildinfo::InstallFacts,
+    home_cleanup_capable: bool,
+    policy_available: bool,
+    image_mgr: Option<&ImageManager>,
 ) -> anyhow::Result<AgentMsg> {
+    let (image_versions_complete, image_versions) = image_mgr
+        .map(ImageManager::version_snapshot)
+        .unwrap_or((false, Vec::new()));
     Ok(AgentMsg::Register {
-        source_policy_versions: Some(serde_json::json!({"steam_preparation": 1})),
+        source_policy_versions: Some(serde_json::json!({"steam_preparation": 1, "template_publish_permit": 1})),
+        config_policy_versions: policy_available.then(||
+            serde_json::json!({"typed_settings":2,"execution_journal":1,"deployment_baseline":1,"idle_apply":1})),
+        config_policy_groups: policy_available.then(|| crate::policy::PolicyAgent::advertised_groups(
+            &std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path)))),
+        terminal_home_cleanup_v1: home_cleanup_capable.then_some(true),
         node_name: cfg.node_name.clone(),
         agent_version: crate::buildinfo::version().to_string(),
         auth: choose_auth(cfg, prefer_enrollment_token)?,
         images,
+        image_cleanup_v1: image_mgr.is_some_and(ImageManager::cleanup_capable),
+        image_versions_complete,
+        image_versions,
         source_commit: crate::buildinfo::source_commit().map(str::to_string),
         built_at: crate::buildinfo::built_at().map(str::to_string),
         install_mode: install.install_mode.map(|m| m.as_str().to_string()),
@@ -1338,7 +1571,7 @@ async fn register_and_await_registered<S, R>(
     tx: &mut S,
     rx: &mut R,
     register_msg: AgentMsg,
-) -> anyhow::Result<(String, u64)>
+) -> anyhow::Result<(String, u64, Option<(String, String)>, Option<Vec<String>>)>
 where
     S: SinkExt<Message, Error = tungstenite::Error> + Unpin,
     R: StreamExt<Item = Result<Message, tungstenite::Error>> + Unpin,
@@ -1361,6 +1594,9 @@ where
             host_id,
             node_secret,
             heartbeat_interval_ms,
+            boot_incarnation,
+            connection_incarnation,
+            config_policy_groups,
         } => {
             // A returned node_secret IS the enrollment signal: reconnect never mints one.
             let enrolled = node_secret.is_some();
@@ -1376,7 +1612,12 @@ where
             // #12: the pin that just verified this connection outlives the enrollment
             // string, so the operator can delete QUASAR_ENROLLMENT from the environment.
             persist_pin_if_new(cfg, enrolled);
-            Ok((host_id, heartbeat_interval_ms))
+            Ok((
+                host_id,
+                heartbeat_interval_ms,
+                boot_incarnation.zip(connection_incarnation),
+                config_policy_groups,
+            ))
         }
         ControlMsg::Error { code, message } => Err(register_reject_error(
             cfg,
@@ -1393,12 +1634,14 @@ where
 /// itself, and every pass forks the same probes a normal refresh does.
 const DIAGNOSTIC_CAPACITY_REFRESH: Duration = Duration::from_secs(60);
 
-/// Hold this process in diagnostic registration until its startup cleanup succeeds
-/// (CONTEXT.md). Returns only on resume, after which normal startup continues in `run`.
+/// Hold this process in diagnostic registration. Startup cleanup retries can
+/// resume normal startup; a corrupt policy journal remains here for operator repair.
 async fn run_diagnostic_mode(
     cfg: &Config,
     health: &Arc<HealthState>,
     station: &Arc<crate::diagnostic::Station>,
+    cleanup_retry: bool,
+    image_mgr: Option<&Arc<ImageManager>>,
 ) {
     crate::diagnostic::install_process_wide(station);
     let phase = station.phase();
@@ -1406,25 +1649,26 @@ async fn run_diagnostic_mode(
         crate::diagnostic::Phase::Diagnostic(fault) => fault.code(),
         crate::diagnostic::Phase::Normal => "none",
     };
-    error!(
-        token = "boot-diagnostic-mode",
-        fault,
-        "the startup cleanup did not resolve, so this host enters DIAGNOSTIC MODE: it \
-         registers and reports, and refuses every launch. Withheld until it resumes: \
-         managed-home GC, the NVIDIA driver-volume and CUDA-runtime provisioners, image \
-         pulls and pruning, and host probes. {} The agent retries the cleanup on its own \
-         and resumes without a restart.",
-        phase.launch_refusal().unwrap_or_default()
-    );
+    if cleanup_retry {
+        error!(token = "boot-diagnostic-mode", fault,
+            "startup cleanup is unresolved; diagnostic registration refuses every launch and retries cleanup. {}",
+            phase.launch_refusal().unwrap_or_default());
+    } else {
+        error!(token = "boot-policy-journal-diagnostic", fault,
+            "host configuration journal is unreadable; diagnostic registration refuses every launch until operator repair and agent restart. {}",
+            phase.launch_refusal().unwrap_or_default());
+    }
     health.set_not_ready(phase.launch_refusal());
 
     // Independent of the control plane by construction: this task is what resumes the
     // host, and it never reads a connection.
-    let retry = tokio::spawn(crate::diagnostic::retry_until_resumed(
-        station.clone(),
-        crate::diagnostic::startup_cleanup_configured,
-        crate::diagnostic::RetryPace::PRODUCTION,
-    ));
+    let retry = cleanup_retry.then(|| {
+        tokio::spawn(crate::diagnostic::retry_until_resumed(
+            station.clone(),
+            crate::diagnostic::startup_cleanup_configured,
+            crate::diagnostic::RetryPace::PRODUCTION,
+        ))
+    });
 
     let mut backoff = Duration::from_secs(1);
     // #199: see `EnrollmentFallback` — one token attempt per stale-secret reject.
@@ -1434,7 +1678,7 @@ async fn run_diagnostic_mode(
             biased;
             () = station.resumed() => break,
             attempt = diagnostic_connection(
-                cfg, health, station, enrollment_fallback.take_for_attempt(),
+                cfg, health, station, enrollment_fallback.take_for_attempt(), image_mgr,
             ) => attempt,
         };
         let Err(error) = attempt else { break };
@@ -1468,13 +1712,17 @@ async fn run_diagnostic_mode(
         }
         backoff = (wait * 2).min(Duration::from_secs(30));
     }
-    retry.abort();
-    info!(
-        token = "boot-diagnostic-resumed",
-        "the startup cleanup succeeded; leaving diagnostic mode and continuing normal startup"
-    );
-    health.set_ready();
-    health.set_connected(false);
+    if let Some(retry) = retry {
+        retry.abort();
+    }
+    if cleanup_retry {
+        info!(
+            token = "boot-diagnostic-resumed",
+            "the startup cleanup succeeded; leaving diagnostic mode and continuing normal startup"
+        );
+        health.set_ready();
+        health.set_connected(false);
+    }
 }
 
 /// One diagnostic control-plane connection. Reads nothing from the container runtime it
@@ -1485,6 +1733,7 @@ async fn diagnostic_connection(
     health: &Arc<HealthState>,
     station: &Arc<crate::diagnostic::Station>,
     prefer_enrollment_token: bool,
+    image_mgr: Option<&Arc<ImageManager>>,
 ) -> anyhow::Result<crate::diagnostic::ConnectionEnd> {
     log_connect_intent(cfg);
     let images = crate::images::register_images_from_state(&cfg.image_state_path());
@@ -1496,13 +1745,22 @@ async fn diagnostic_connection(
     crate::buildinfo::set_install_facts(install.clone());
 
     let (mut tx, mut rx) = dial(cfg).await?;
-    let (_host_id, heartbeat_interval_ms) = register_and_await_registered(
-        cfg,
-        &mut tx,
-        &mut rx,
-        register_message(cfg, prefer_enrollment_token, images, &install)?,
-    )
-    .await?;
+    let (_host_id, heartbeat_interval_ms, _policy_identity, _policy_groups) =
+        register_and_await_registered(
+            cfg,
+            &mut tx,
+            &mut rx,
+            register_message(
+                cfg,
+                prefer_enrollment_token,
+                images,
+                &install,
+                false,
+                station.phase().policy_available(),
+                None,
+            )?,
+        )
+        .await?;
     health.set_connected(true);
     // Clear the failure streak before a stale count can flip /health unhealthy; the
     // diagnostic not-ready state is separate and stays.
@@ -1524,6 +1782,7 @@ async fn diagnostic_connection(
             }
         },
         DIAGNOSTIC_CAPACITY_REFRESH,
+        image_mgr,
     )
     .await
 }
@@ -1549,6 +1808,9 @@ fn diagnostic_observe() -> (AgentMsg, Vec<crate::messages::ReadinessCheck>) {
     (
         AgentMsg::Capacity {
             source_preparation: None,
+            deployment_settings: None,
+            config_policy_accepted_groups: None,
+            config_policy_legacy_map_applied_id: None,
             host: cap.host,
             gpus: cap.gpus,
             gpu_detection: cap.gpu_detection,
@@ -1588,6 +1850,7 @@ async fn connect_and_run(
     // agent wrote `register` into a dead connection, and every reconnect repeated
     // the same probes into the same wall.
     let prep_started = Instant::now();
+    image_mgr.begin_connection();
 
     // agent-api.md: recorded images are verified against the docker daemon on startup
     // AND reconnect — an image `docker rmi`'d out from under a long-lived agent must
@@ -1639,13 +1902,57 @@ async fn connect_and_run(
     let _release_upstream_guard = release_mgr.attach_upstream(release_tx);
 
     // --- Steps 1 and 2: send register, receive registered ---
-    let (host_id, heartbeat_interval_ms) = register_and_await_registered(
-        cfg,
-        &mut tx,
-        &mut rx,
-        register_message(cfg, prefer_enrollment_token, images, &install)?,
-    )
-    .await?;
+    let (host_id, heartbeat_interval_ms, policy_identity, policy_groups) =
+        register_and_await_registered(
+            cfg,
+            &mut tx,
+            &mut rx,
+            register_message(
+                cfg,
+                prefer_enrollment_token,
+                images,
+                &install,
+                sessions.mgr.home_cleanup.is_some(),
+                true,
+                Some(image_mgr),
+            )?,
+        )
+        .await?;
+    let path = std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path));
+    let advertised = crate::policy::PolicyAgent::advertised_groups(&path);
+    let mut baseline = crate::session::settings::RuntimeSettings::baseline();
+    seed_nvidia_lib32(&mut baseline, nvidia_lib32_probed);
+    sessions.mgr.deployment_baseline = baseline.clone();
+    sessions.mgr.runtime_settings = baseline;
+    let (boot, connection) = policy_identity.clone().unwrap_or_default();
+    let mut policy = crate::policy::PolicyAgent::open(
+        path,
+        host_id.clone(),
+        boot,
+        connection.clone(),
+        &mut sessions.mgr.runtime_settings,
+    )?;
+    if let Some(groups) = &policy_groups {
+        if let Err(code) = policy.confirm_groups(&advertised, groups) {
+            send(
+                &mut tx,
+                &AgentMsg::ConfigPolicyFeatureError {
+                    code,
+                    group: None,
+                    connection_incarnation: connection,
+                },
+            )
+            .await?;
+            anyhow::bail!("RH05 ownership echo invalid");
+        }
+    }
+    sessions.mgr.policy_session_ready = policy_identity.is_none()
+        && !policy.has_sticky_ownership()
+        && !policy.has_uncertain_restart();
+    sessions.mgr.policy_accepted_groups = policy_groups;
+    sessions.mgr.policy_delivery_ack = None;
+    sessions.mgr.policy_inventory_complete = false;
+    sessions.mgr.policy_agent = Some(policy);
     health.set_connected(true);
     // #128: the control plane is back, so the sessions held across the outage are
     // safe. Disarmed HERE rather than at the top of the reconnect loop: doing it
@@ -1707,8 +2014,7 @@ async fn connect_and_run(
     // The env baseline with the startup-probed lib32 path seeded in, so the very first
     // capacity report already carries the auto-detected value. Matches what
     // `SessionManager::new` seeds; the first config_update re-sends the overlay view.
-    let mut first_settings = crate::session::settings::RuntimeSettings::baseline();
-    seed_nvidia_lib32(&mut first_settings, nvidia_lib32_probed);
+    let first_settings = sessions.mgr.runtime_settings.clone();
     // Probed once (the gst registry is process-stable) and reused in every capacity
     // re-send below.
     let host_codec_report = {
@@ -1764,6 +2070,9 @@ async fn connect_and_run(
     apply_gpu_codecs(&mut cap.gpus, &first_gpu_codec_sets);
     let capacity_msg = AgentMsg::Capacity {
         source_preparation: None,
+        deployment_settings: Some(sessions.mgr.deployment_baseline.deployment_map()),
+        config_policy_accepted_groups: sessions.mgr.policy_accepted_groups.clone(),
+        config_policy_legacy_map_applied_id: None,
         host: cap.host,
         gpus: cap.gpus,
         gpu_detection: cap.gpu_detection,
@@ -1776,6 +2085,15 @@ async fn connect_and_run(
     };
     send(&mut tx, &capacity_msg).await?;
     info!("capacity report sent");
+    if let Some(ledger) = sessions.mgr.home_cleanup.as_mut() {
+        for session_id in ledger.take_recovered() {
+            send(
+                &mut tx,
+                &qualified_home_terminal(&session_id, crate::home_cleanup::TerminalKind::Failed),
+            )
+            .await?;
+        }
+    }
 
     // Sent first on purpose: the card carries the remediation, and the gate below may end
     // the process a few seconds later.
@@ -1829,6 +2147,7 @@ async fn connect_and_run(
     let warmup_store = crate::session::warmup::resolve_store(&mgr.runtime_settings.home_root);
     let warmup_activity = Arc::new(crate::session::warmup::HostActivity::new());
     let warmup_control = Arc::new(crate::session::warmup::WarmupControl::new());
+    image_mgr.track_warmup_control(&warmup_control);
     if let Some(handle) = mgr.probe_handle.clone() {
         // A probe's own release fires this too; the scheduler ignores it when
         // nothing waits on the gate.
@@ -1841,20 +2160,18 @@ async fn connect_and_run(
     );
     let _source_policy_guard = crate::source_policy::ConnectionGuard(source_policy.clone());
     mgr.source_policy = Some(source_policy.clone());
-    let warmup_runner = Arc::new(
-        crate::session::warmup::WarmupJobRunner::new(
-            crate::session::warmup::WarmupConfig::from_env(),
-            warmup_store.clone(),
-            Arc::new(crate::session::warmup::host::AgentWarmupHost::new(
-                ContainerRuntime::from_env(),
-                mgr.runtime_settings.clone(),
-            )),
-            warmup_control.clone(),
-            warmup_activity.clone(),
-            app_uid_gid(),
-        )
-        .with_policy(source_policy.clone()),
-    );
+    let warmup_runner = crate::session::warmup::WarmupJobRunner::new(
+        crate::session::warmup::WarmupConfig::from_env(),
+        warmup_store.clone(),
+        Arc::new(crate::session::warmup::host::AgentWarmupHost::new(
+            ContainerRuntime::from_env(),
+            mgr.runtime_settings.clone(),
+        )),
+        warmup_control.clone(),
+        warmup_activity.clone(),
+        app_uid_gid(),
+    )
+    .with_policy(source_policy.clone());
     mgr.warmup_activity = Some(warmup_activity);
     mgr.warmup_control = Some(warmup_control.clone());
     mgr.note_session_count();
@@ -1925,7 +2242,7 @@ async fn connect_and_run(
         }
         Some(Ok(cp)) => {
             let mut registry = crate::jobs::JobRegistry::new();
-            registry.register(warmup_runner);
+            registry.register(Arc::new(warmup_runner.with_publish_client(cp.clone())));
             registry.register(std::sync::Arc::new(
                 crate::session::gc::HomeGcJobRunner::new(cp.clone(), live_refs.clone()),
             ));
@@ -1949,6 +2266,20 @@ async fn connect_and_run(
     let mut readiness_busy = false;
 
     loop {
+        if policy_identity.is_some()
+            && !mgr.policy_seed_reconnect_used
+            && mgr.policy_delivery_ack.is_some()
+            && mgr
+                .policy_agent
+                .as_ref()
+                .is_some_and(|agent| agent.has_seed() && agent.has_unadvertised_groups(&advertised))
+            && mgr.pending.is_empty()
+            && mgr.running.is_empty()
+            && !mgr.warmup_reserved()
+        {
+            mgr.policy_seed_reconnect_used = true;
+            return Err(PolicySeedReconnect.into());
+        }
         tokio::select! {
             _ = readiness_timer.tick(), if !readiness_busy => {
                 readiness_busy = true;
@@ -1987,6 +2318,7 @@ async fn connect_and_run(
 
             _ = hb_timer.tick() => {
                 image_mgr.flush_terminal_states();
+                image_mgr.maybe_refresh_version_inventory();
                 let ts_unix_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -2049,6 +2381,11 @@ async fn connect_and_run(
                         // Handled here, not in handle_control, so the ack flushes before
                         // the process exits. The restart policy brings us back.
                         if let ControlMsg::Restart { id } = &ctrl {
+                            if mgr.policy_agent.as_ref().is_some_and(|policy| policy.has_open_restart()) {
+                                send(&mut tx, &AgentMsg::Ack { id: id.clone(), ok: false,
+                                    error: Some("attempt_conflict".into()) }).await?;
+                                continue;
+                            }
                             info!("restart requested (cmd {id}); acking then exiting for config reload");
                             let reply = AgentMsg::Ack { id: id.clone(), ok: true, error: None };
                             let _ = send(&mut tx, &reply).await;
@@ -2059,7 +2396,35 @@ async fn connect_and_run(
                         // before handle_control consumes ctrl.
                         let was_config_update = matches!(ctrl, ControlMsg::ConfigUpdate { .. });
                         if let Some(reply) = mgr.handle_control(ctrl, evt_tx, diagnostic_tx) {
-                            send(&mut tx, &reply).await?;
+                            let restart_accepted = matches!(&reply, AgentMsg::ConfigPolicyState {
+                                scope, phase, ..
+                            } if scope == "restart" && phase == "awaiting_startup");
+                            let restart_requires_reconcile = matches!(&reply, AgentMsg::ConfigPolicyState {
+                                scope, phase, ..
+                            } if scope == "restart" && phase == "accepted");
+                            let journal_uncertain = matches!(&reply, AgentMsg::ConfigPolicyState {
+                                scope, phase, error, ..
+                            } if scope == "restart" && phase == "failed" && error.as_deref() == Some("journal_write_failed"));
+                            let reply_result = send_control_reply(&mut tx, &mut *mgr, reply).await;
+                            if journal_uncertain {
+                                warn!(token = "policy-journal-write-uncertain", "journal write failed; restarting to reconcile durable execution before another offer");
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                std::process::exit(1);
+                            }
+                            if restart_requires_reconcile {
+                                warn!(token = "policy-accepted-reconcile", "restart attempt is durably accepted without an activation marker; restarting for bounded reconciliation");
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                std::process::exit(1);
+                            }
+                            if restart_accepted {
+                                info!(token = "policy-candidate-restart", "durable hardware candidate accepted; restarting for startup verification");
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                std::process::exit(0);
+                            }
+                            reply_result?;
+                        }
+                        for report in mgr.home_cleanup_reports.drain(..) {
+                            send(&mut tx, &report).await?;
                         }
                         if was_config_update {
                             // The overlay may have flipped the effective encoder live, so
@@ -2090,6 +2455,10 @@ async fn connect_and_run(
                             let gpu_sets = mgr.gpu_codec_sets();
                             apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
                             let capacity_msg = AgentMsg::Capacity {
+            deployment_settings: Some(mgr.deployment_baseline.deployment_map()),
+            config_policy_accepted_groups: mgr.policy_accepted_groups.clone(),
+            config_policy_legacy_map_applied_id: mgr.policy_delivery_ack.clone(),
+
             source_preparation: mgr.source_policy.as_ref().and_then(|p| p.report()),
                                 host: cap.host,
                                 gpus: cap_gpus,
@@ -2145,6 +2514,10 @@ async fn connect_and_run(
                     let gpu_sets = mgr.gpu_codec_sets();
                     apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
                     let capacity_msg = AgentMsg::Capacity {
+            deployment_settings: Some(mgr.deployment_baseline.deployment_map()),
+            config_policy_accepted_groups: mgr.policy_accepted_groups.clone(),
+            config_policy_legacy_map_applied_id: mgr.policy_delivery_ack.clone(),
+
             source_preparation: mgr.source_policy.as_ref().and_then(|p| p.report()),
                         host: cap.host,
                         gpus: cap_gpus,
@@ -2205,14 +2578,15 @@ async fn connect_and_run(
                             // #503: get pending trace events out before the terminal
                             // state — the control plane drops them afterwards.
                             flush_pending_diagnostics(&mut tx, &mut *diagnostic_rx).await?;
-                            let msg =
-                                mgr.on_event(&session_id, SessionEvent::Stopped { bytes_used, detail });
-                            send(&mut tx, &msg).await?;
-                            // Console auto-start is level-triggered by capacity, so
-                            // re-send immediately after a terminal state rather than
-                            // waiting on an unrelated connector/input/storage poll.
-                            send_fresh_capacity(&mut tx, &mut *mgr).await?;
-                            info!("re-sent capacity after session stopped for console reconciliation");
+                            if let Some(msg) = mgr.prove_home_terminal(
+                                &session_id,
+                                SessionEvent::Stopped { bytes_used, detail },
+                            ) {
+                                send(&mut tx, &msg).await?;
+                                // Console auto-start is level-triggered by capacity.
+                                send_fresh_capacity(&mut tx, &mut *mgr).await?;
+                                info!("re-sent capacity after session stopped for console reconciliation");
+                            }
                         }
                         SessionEvent::EffectiveMedia(payload) => {
                             let ts_unix_ms = SystemTime::now()
@@ -2286,11 +2660,17 @@ async fn connect_and_run(
                             if terminal {
                                 flush_pending_diagnostics(&mut tx, &mut *diagnostic_rx).await?;
                             }
-                            let msg = mgr.on_event(&session_id, other);
-                            send(&mut tx, &msg).await?;
-                            if terminal {
-                                send_fresh_capacity(&mut tx, &mut *mgr).await?;
-                                info!("re-sent capacity after session failure for console reconciliation");
+                            let msg = if terminal {
+                                mgr.prove_home_terminal(&session_id, other)
+                            } else {
+                                Some(mgr.on_event(&session_id, other))
+                            };
+                            if let Some(msg) = msg {
+                                send(&mut tx, &msg).await?;
+                                if terminal {
+                                    send_fresh_capacity(&mut tx, &mut *mgr).await?;
+                                    info!("re-sent capacity after session failure for console reconciliation");
+                                }
                             }
                             if let (Some((reason, app_failed)), Some((gpu, codec))) =
                                 (launch_failure, failed_on)
@@ -2581,6 +2961,8 @@ impl HostSessions {
     }
 }
 
+type HomeSourceRetire = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 struct SessionManager {
     /// Assigned but not yet started. Aged out by the heartbeat sweep — see
     /// [`PENDING_ASSIGNMENT_TTL`].
@@ -2589,6 +2971,13 @@ struct SessionManager {
     /// Agent-local runtime knobs, starting at the env baseline and overlaid by
     /// `config_update` pushes. Read when building each session's SessionConfig.
     runtime_settings: crate::session::settings::RuntimeSettings,
+    deployment_baseline: crate::session::settings::RuntimeSettings,
+    policy_agent: Option<crate::policy::PolicyAgent>,
+    policy_accepted_groups: Option<Vec<String>>,
+    policy_session_ready: bool,
+    policy_delivery_ack: Option<String>,
+    policy_inventory_complete: bool,
+    policy_seed_reconnect_used: bool,
     /// Latest capacity inventory on this connection. An assignment's `gpu_index` is
     /// resolved against this exact inventory, never treated as an alias for a
     /// host-wide render/CUDA setting.
@@ -2612,10 +3001,6 @@ struct SessionManager {
     live_refs: LiveRefs,
     /// Shared with the health endpoint: the running-session count.
     health: Arc<HealthState>,
-    /// #375: the 32-bit NVIDIA driver-lib dir auto-detected at startup, seeded into
-    /// `runtime_settings.nvidia_lib32_path` whenever the configured value is empty.
-    /// Empty on non-NVIDIA hosts and when nothing was detected.
-    nvidia_lib32_probed: String,
     /// The codec set + throughput hint the host's active encoder path can produce.
     /// Re-probed whenever a `config_update` flips the effective encoder, since that
     /// overlay is live-class. `None` ⇒ `gst::init` failed: no registry to plan from,
@@ -2655,6 +3040,15 @@ struct SessionManager {
     /// `release_apply` dispatch target. Process-wide for the same reason as
     /// `image_mgr`: its poller outlives this connection.
     release_mgr: Arc<ReleaseManager>,
+    /// Present only after startup proved prior API-owned source cleanup and
+    /// opened the durable session-ID ledger. This is the advertised capability.
+    home_cleanup: Option<crate::home_cleanup::HomeCleanupLedger>,
+    /// Ack-less qualified terminals emitted after a repeated or never-recorded
+    /// session_stop. The control loop drains these after the command ack.
+    home_cleanup_reports: Vec<AgentMsg>,
+    /// A deterministic runtime seam for cleanup-proof tests. Production uses
+    /// the durable application journal adapter when this is absent.
+    home_source_retire: Option<HomeSourceRetire>,
     /// Connection-scoped source policy shared with workers and session seeding.
     /// Its authorization is invalidated on disconnect even if sessions retain an Arc.
     source_policy: Option<Arc<crate::source_policy::SourcePolicy>>,
@@ -2734,9 +3128,36 @@ struct RunningHandle {
     /// Set by `SessionEvent::Running`. Until then the launch is in flight and no host
     /// probe starts.
     reached_running: bool,
+    /// A runner-reported terminal waits here until its thread has exited and
+    /// every source generation has been retired and verified absent.
+    pending_home_terminal: Option<SessionEvent>,
 }
 
 impl SessionManager {
+    fn restart_idle(&self) -> bool {
+        if !self.policy_session_ready
+            || !self.policy_inventory_complete
+            || !self.pending.is_empty()
+            || !self.running.is_empty()
+            || self.warmup_reserved()
+            || self.image_mgr.has_in_flight_operations()
+        {
+            return false;
+        }
+        self.source_policy
+            .as_ref()
+            .and_then(|policy| policy.report())
+            .and_then(|report| report.pointer("/steam/images").cloned())
+            .and_then(|images| images.as_array().cloned())
+            .is_some_and(|images| {
+                images.iter().all(|image| {
+                    !matches!(
+                        image["state"].as_str(),
+                        Some("queued" | "preparing" | "waiting_image" | "deferred" | "failed")
+                    )
+                })
+            })
+    }
     fn new(
         live_refs: LiveRefs,
         health: Arc<HealthState>,
@@ -2748,17 +3169,24 @@ impl SessionManager {
     ) -> Self {
         let mut runtime_settings = crate::session::settings::RuntimeSettings::baseline();
         seed_nvidia_lib32(&mut runtime_settings, &nvidia_lib32_probed);
+        let deployment_baseline = runtime_settings.clone();
         SessionManager {
             pending: HashMap::new(),
             running: HashMap::new(),
             runtime_settings,
+            deployment_baseline,
+            policy_agent: None,
+            policy_accepted_groups: None,
+            policy_session_ready: true,
+            policy_delivery_ack: None,
+            policy_inventory_complete: false,
+            policy_seed_reconnect_used: false,
             gpu_inventory,
             vram_targets,
             vram_cache: Arc::new(VramCache::new()),
             console_config: None,
             live_refs,
             health,
-            nvidia_lib32_probed,
             host_codec_report: None,
             agent_image_identity: String::new(),
             codec_layers: CodecLayers::default(),
@@ -2772,6 +3200,9 @@ impl SessionManager {
             warmup_control: None,
             image_mgr,
             release_mgr,
+            home_cleanup: None,
+            home_cleanup_reports: Vec::new(),
+            home_source_retire: None,
             source_policy: None,
             probe_handle: None,
             probe_runner: None,
@@ -2880,7 +3311,10 @@ impl SessionManager {
     /// setting a `config_update` can move under a long-lived connection, and a stale
     /// root would refuse the managed home it just relocated to.
     fn mount_policy(&self) -> MountPolicy {
-        MountPolicy::from_env(&self.runtime_settings.home_root)
+        MountPolicy::from_env_with_deployment_mount(
+            &self.runtime_settings.home_root,
+            &self.deployment_baseline.home_root,
+        )
     }
 
     /// A user launch always wins. Raised on `session_assign`, the earliest point the
@@ -3054,6 +3488,13 @@ impl SessionManager {
                 resources,
                 video_topology,
             } => {
+                if !self.policy_session_ready {
+                    return Some(ack(
+                        id,
+                        false,
+                        Some("settings delivery not yet applied".to_string()),
+                    ));
+                }
                 // A draining agent accepts no new sessions.
                 if self.draining {
                     warn!(
@@ -3064,6 +3505,17 @@ impl SessionManager {
                         id,
                         false,
                         Some("agent draining for restart".to_string()),
+                    ));
+                }
+                if self
+                    .home_cleanup
+                    .as_ref()
+                    .is_some_and(|ledger| ledger.has_record(&session_id))
+                {
+                    return Some(ack(
+                        id,
+                        false,
+                        Some("session id already recorded".to_string()),
                     ));
                 }
                 // Raised BEFORE anything else in the assign path: a warm-up's NVENC
@@ -3152,6 +3604,25 @@ impl SessionManager {
                      image={image}, reserved vram={vram}MB slots={slots}",
                     cfg.stream.width, cfg.stream.height, cfg.stream.fps
                 );
+                if let Some(ledger) = self.home_cleanup.as_mut() {
+                    match ledger.record_active(&session_id) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Some(ack(
+                                id,
+                                false,
+                                Some("session id already recorded".to_string()),
+                            ))
+                        }
+                        Err(_) => {
+                            return Some(ack(
+                                id,
+                                false,
+                                Some("durable session admission unavailable".to_string()),
+                            ))
+                        }
+                    }
+                }
                 // Preparation belongs to the runtime executor, not this connection.
                 // Retain its observation so session_start cannot race or ignore it.
                 let preparation = if let Some(spec) = container {
@@ -3318,6 +3789,7 @@ impl SessionManager {
                             gpu_index,
                             codec,
                             reached_running: false,
+                            pending_home_terminal: None,
                         },
                     );
                     self.health.set_sessions(self.running.len());
@@ -3345,6 +3817,36 @@ impl SessionManager {
                 session_id,
                 reason,
             } => {
+                if let Some(ledger) = self.home_cleanup.as_mut() {
+                    if let Some(terminal) = ledger.state(&session_id) {
+                        self.home_cleanup_reports
+                            .push(qualified_home_terminal(&session_id, terminal));
+                        return Some(ack(id, true, None));
+                    }
+                    if !self.running.contains_key(&session_id) {
+                        // No runner can still create a source. This includes a
+                        // lost assign frame and a never-recorded ID. Persist
+                        // retirement before reporting a terminal state.
+                        let terminal = match ledger
+                            .retire(&session_id, crate::home_cleanup::TerminalKind::Stopped)
+                        {
+                            Ok(value) => value,
+                            Err(_) => {
+                                return Some(ack(
+                                    id,
+                                    false,
+                                    Some("durable session retirement unavailable".to_string()),
+                                ))
+                            }
+                        };
+                        if self.pending.remove(&session_id).is_some() {
+                            self.note_session_count();
+                        }
+                        self.home_cleanup_reports
+                            .push(qualified_home_terminal(&session_id, terminal));
+                        return Some(ack(id, true, None));
+                    }
+                }
                 if self.pending.remove(&session_id).is_some() {
                     self.note_session_count();
                 }
@@ -3359,6 +3861,11 @@ impl SessionManager {
                 session_id,
                 app,
             } => {
+                if self.home_cleanup.as_ref().is_some_and(|ledger| {
+                    ledger.state(&session_id).is_some() || !ledger.has_record(&session_id)
+                }) {
+                    return Some(ack(id, false, Some("session id is not active".to_string())));
+                }
                 // A rejected swap is a no-op: ack{ok:false} and the session keeps its
                 // previous app. Unlike assign/start, a rejected swap never fails the
                 // session (agent-api.md).
@@ -3602,9 +4109,11 @@ impl SessionManager {
             }
             ControlMsg::ConfigUpdate {
                 settings,
+                settings_delivery_id,
                 console_config,
                 source_policies,
             } => {
+                let mut feature_error = None;
                 if let (Some(policy), Some(snapshot)) =
                     (&self.source_policy, source_policies.as_ref())
                 {
@@ -3617,10 +4126,52 @@ impl SessionManager {
                 // A console-only PATCH sends settings as JSON null; that must NOT
                 // rebaseline and silently undo a persisted encoder override.
                 if !settings.is_null() {
-                    let mut next = crate::session::settings::RuntimeSettings::baseline();
-                    next.apply_json(&settings);
-                    seed_nvidia_lib32(&mut next, &self.nvidia_lib32_probed);
-                    self.runtime_settings = next;
+                    if let Some(policy) = self.policy_agent.as_mut() {
+                        let result = policy.apply_legacy_overlay(
+                            &self.deployment_baseline,
+                            &mut self.runtime_settings,
+                            &settings,
+                            settings_delivery_id.as_deref(),
+                        );
+                        match result {
+                            Ok(conflict) => {
+                                self.policy_delivery_ack = settings_delivery_id;
+                                self.policy_session_ready = match &self.policy_accepted_groups {
+                                    Some(groups) => {
+                                        self.policy_inventory_complete
+                                            && policy.sticky_groups_accepted(groups)
+                                            && (!groups.is_empty() || !policy.has_seed())
+                                            && !policy.has_uncertain_restart()
+                                    }
+                                    None => {
+                                        !policy.has_sticky_ownership()
+                                            && !policy.has_uncertain_restart()
+                                    }
+                                };
+                                if let Some(group) = conflict {
+                                    feature_error = Some(AgentMsg::ConfigPolicyFeatureError {
+                                        code: "attempt_conflict".into(),
+                                        group: Some(group),
+                                        connection_incarnation: policy
+                                            .connection_incarnation()
+                                            .into(),
+                                    });
+                                }
+                            }
+                            Err(code) => {
+                                self.policy_session_ready = false;
+                                feature_error = Some(AgentMsg::ConfigPolicyFeatureError {
+                                    code,
+                                    group: None,
+                                    connection_incarnation: policy.connection_incarnation().into(),
+                                });
+                            }
+                        }
+                    } else {
+                        let mut next = self.deployment_baseline.clone();
+                        next.apply_json(&settings);
+                        self.runtime_settings = next;
+                    }
                     if let Some(policy) = &self.source_policy {
                         policy.update_root(&self.runtime_settings.home_root);
                     }
@@ -3658,8 +4209,99 @@ impl SessionManager {
                     }
                     self.console_config = Some(cc);
                 }
-                None // fire-and-forget, no ack
+                feature_error // no ordinary config_update ack
             }
+            ControlMsg::ConfigPolicyOffer {
+                attempt_id,
+                host_id,
+                boot_incarnation,
+                connection_incarnation,
+                group,
+                revision,
+                content_sha256,
+                scope,
+                expires_at,
+                prerequisites_sha256,
+                prerequisites,
+                settings,
+                resolved_settings,
+            } => {
+                let offer = crate::policy::Offer {
+                    attempt_id,
+                    host_id,
+                    boot_incarnation,
+                    connection_incarnation,
+                    group,
+                    revision,
+                    content_sha256,
+                    scope,
+                    expires_at,
+                    prerequisites_sha256,
+                    prerequisites,
+                    settings,
+                    resolved_settings,
+                };
+                let restart_idle = self.restart_idle();
+                let readiness = self.readiness.merged();
+                let hardware = crate::policy::HardwareEvidence {
+                    gpus: &self.gpu_inventory,
+                    readiness: &readiness,
+                };
+                let reply = self.policy_agent.as_mut().map(|policy| {
+                    if offer.scope == "restart" {
+                        policy.accept_restart(
+                            offer,
+                            &self.runtime_settings,
+                            restart_idle,
+                            Some(hardware),
+                        )
+                    } else {
+                        policy.accept(offer, &mut self.runtime_settings)
+                    }
+                });
+                if matches!(&reply, Some(AgentMsg::ConfigPolicyState { phase, .. }) if phase == "applied")
+                {
+                    // The same launch boundary as the legacy map path: new homes
+                    // seed from the new root's templates, and a probe input
+                    // (`zerocopy`) withdraws its evidence until re-probed.
+                    if let Some(policy) = &self.source_policy {
+                        policy.update_root(&self.runtime_settings.home_root);
+                    }
+                    self.notify_probe_inputs_if_changed();
+                }
+                reply
+            }
+            ControlMsg::ConfigPolicyJournalInventoryRequest {
+                inventory_id,
+                boot_incarnation,
+                connection_incarnation,
+                cursor,
+            } => self.policy_agent.as_mut().map(|policy| {
+                match policy.inventory_page(
+                    &inventory_id,
+                    &boot_incarnation,
+                    &connection_incarnation,
+                    cursor.as_deref(),
+                ) {
+                    Ok(page) => {
+                        if matches!(
+                            &page,
+                            AgentMsg::ConfigPolicyJournalInventoryPage {
+                                next_cursor: None,
+                                ..
+                            }
+                        ) {
+                            self.policy_inventory_complete = true;
+                        }
+                        page
+                    }
+                    Err(code) => AgentMsg::ConfigPolicyFeatureError {
+                        code,
+                        group: None,
+                        connection_incarnation,
+                    },
+                }
+            }),
             // `restart` is intercepted in the receive loop (so the ack flushes
             // before the process exits); it never reaches here in practice.
             ControlMsg::Restart { .. } => None,
@@ -3676,6 +4318,40 @@ impl SessionManager {
             ControlMsg::ImageRemove { id, image_id } => {
                 Some(self.image_mgr.handle_remove(id, image_id))
             }
+            ControlMsg::ImageInventoryReconcile { id, identities } => {
+                self.image_mgr.handle_inventory_reconcile(id, identities)
+            }
+            ControlMsg::ImageCleanup {
+                id,
+                attempt_id,
+                image_id,
+                version,
+                image_ref,
+                runtime_image_id,
+                expected_generation,
+            } => self.image_mgr.handle_cleanup(
+                id,
+                crate::images::cleanup_attempt(
+                    attempt_id,
+                    image_id,
+                    version,
+                    image_ref,
+                    runtime_image_id,
+                    expected_generation,
+                ),
+            ),
+            ControlMsg::ImageCleanupJournalRequest { id, attempt_ids } => Some(
+                self.image_mgr
+                    .handle_cleanup_journal_request(id, attempt_ids),
+            ),
+            ControlMsg::ImageCleanupStateAck {
+                id,
+                attempt_id,
+                generation,
+            } => Some(
+                self.image_mgr
+                    .handle_cleanup_state_ack(id, attempt_id, generation),
+            ),
             // Same shape as ImageEnsure: acks immediately, then downloads the context
             // and runs `docker build` on its own thread.
             ControlMsg::ImageBuild {
@@ -3743,6 +4419,10 @@ impl SessionManager {
                 h.finished_seen_at = None;
                 continue;
             }
+            if self.home_cleanup.is_some() && h.pending_home_terminal.is_some() {
+                abandoned.push(sid.clone());
+                continue;
+            }
             match h.finished_seen_at {
                 None => h.finished_seen_at = Some(now),
                 Some(seen) => {
@@ -3754,6 +4434,21 @@ impl SessionManager {
         }
         let mut out = Vec::with_capacity(abandoned.len());
         for sid in abandoned {
+            if self.home_cleanup.is_some() {
+                let event = self
+                    .running
+                    .get_mut(&sid)
+                    .and_then(|h| h.pending_home_terminal.take())
+                    .unwrap_or_else(|| {
+                        SessionEvent::Failed(
+                            "runner thread ended without reporting a terminal state".to_string(),
+                        )
+                    });
+                if let Some(message) = self.prove_home_terminal(&sid, event) {
+                    out.push(message);
+                }
+                continue;
+            }
             error!(
                 token = "session-runner-no-terminal-event",
                 "session {sid}: runner thread ended without a terminal event \
@@ -3772,6 +4467,7 @@ impl SessionManager {
                 error: Some("runner thread ended without reporting a terminal state".to_string()),
                 reason_code: None,
                 app_log_tail: None,
+                home_seed: None,
             });
         }
         self.health.set_sessions(self.running.len());
@@ -3785,6 +4481,20 @@ impl SessionManager {
             .collect();
         if !stale.is_empty() {
             for sid in &stale {
+                if let Some(ledger) = self.home_cleanup.as_mut() {
+                    if ledger
+                        .retire(sid, crate::home_cleanup::TerminalKind::Failed)
+                        .is_err()
+                    {
+                        warn!(token = "home-pending-retirement-unavailable",
+                            "stale assignment retirement could not be persisted; terminal proof withheld");
+                        continue;
+                    }
+                    out.push(qualified_home_terminal(
+                        sid,
+                        crate::home_cleanup::TerminalKind::Failed,
+                    ));
+                }
                 warn!(
                     token = "session-assign-never-started",
                     "session {sid}: assignment never started within {pending_ttl:?}; \
@@ -3811,6 +4521,66 @@ impl SessionManager {
         }
     }
 
+    /// A cleanup-capable terminal waits for its runner to finish, then uses
+    /// the runtime's durable operation journals to stop/remove every source
+    /// generation and verify absence. On any uncertainty the terminal stays
+    /// pending and home refs remain live for a later retry.
+    fn prove_home_terminal(&mut self, session_id: &str, event: SessionEvent) -> Option<AgentMsg> {
+        if self.home_cleanup.is_none() {
+            return Some(self.on_event(session_id, event));
+        }
+        let handle = self.running.get_mut(session_id)?;
+        if !handle
+            .thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished())
+        {
+            handle.pending_home_terminal = Some(event);
+            return None;
+        }
+        let cleaned = self.home_source_retire.as_ref().map_or_else(
+            || {
+                crate::runtime::configured()
+                    .and_then(|runtime| runtime.retire_session_applications(session_id).wait())
+                    .is_ok()
+            },
+            |retire| retire(session_id),
+        );
+        if !cleaned {
+            handle.pending_home_terminal = Some(event);
+            warn!(
+                token = "home-terminal-cleanup-unverified",
+                "session source cleanup could not be verified; terminal proof withheld"
+            );
+            return None;
+        }
+        let terminal = match &event {
+            SessionEvent::Stopped { .. } => crate::home_cleanup::TerminalKind::Stopped,
+            SessionEvent::Failed(_) | SessionEvent::AppFailed { .. } => {
+                crate::home_cleanup::TerminalKind::Failed
+            }
+            _ => return None,
+        };
+        if self
+            .home_cleanup
+            .as_mut()
+            .unwrap()
+            .retire(session_id, terminal)
+            .is_err()
+        {
+            handle.pending_home_terminal = Some(event);
+            warn!(
+                token = "home-terminal-retirement-unavailable",
+                "session identity retirement could not be persisted; terminal proof withheld"
+            );
+            return None;
+        }
+        if let Some(thread) = handle.thread.take() {
+            let _ = thread.join();
+        }
+        Some(self.on_event(session_id, event))
+    }
+
     /// Map a runner lifecycle event onto a session_state message.
     fn on_event(&mut self, session_id: &str, event: SessionEvent) -> AgentMsg {
         // Handled ahead of the generic mapping so `reason_code`/`app_log_tail` need not
@@ -3831,10 +4601,17 @@ impl SessionManager {
                 // Omitted entirely when empty: an empty array renders as an empty
                 // log panel that reads as a broken feature rather than a silent app.
                 app_log_tail: (!app_log_tail.is_empty()).then(|| app_log_tail.join("\n")),
+                home_seed: None,
             };
         }
+        let home_seed = if let SessionEvent::HomeSeed(outcome) = &event {
+            Some(*outcome)
+        } else {
+            None
+        };
         let (state, detail, error) = match event {
             SessionEvent::Starting => ("starting", Some("building pipeline".to_string()), None),
+            SessionEvent::HomeSeed(_) => ("starting", None, None),
             SessionEvent::Progress(detail) => ("starting", Some(detail.to_string()), None),
             SessionEvent::Running => {
                 if let Some(handle) = self.running.get_mut(session_id) {
@@ -3890,6 +4667,7 @@ impl SessionManager {
             error,
             reason_code: None,
             app_log_tail: None,
+            home_seed,
         }
     }
 }
@@ -3974,6 +4752,21 @@ fn stream_to_params(s: StreamSpec) -> anyhow::Result<StreamParams> {
 
 fn ack(id: String, ok: bool, error: Option<String>) -> AgentMsg {
     AgentMsg::Ack { id, ok, error }
+}
+
+fn qualified_home_terminal(
+    session_id: &str,
+    terminal: crate::home_cleanup::TerminalKind,
+) -> AgentMsg {
+    AgentMsg::SessionState {
+        session_id: session_id.to_owned(),
+        state: terminal.as_str().to_owned(),
+        detail: None,
+        error: None,
+        reason_code: None,
+        app_log_tail: None,
+        home_seed: None,
+    }
 }
 
 /// Run startup work which is only safe after API-owned applications have retired.
@@ -4628,6 +5421,9 @@ where
     apply_gpu_codecs(&mut cap_gpus, &gpu_sets);
     let msg = AgentMsg::Capacity {
         source_preparation: mgr.source_policy.as_ref().and_then(|p| p.report()),
+        deployment_settings: Some(mgr.deployment_baseline.deployment_map()),
+        config_policy_accepted_groups: mgr.policy_accepted_groups.clone(),
+        config_policy_legacy_map_applied_id: mgr.policy_delivery_ack.clone(),
         host: cap.host,
         gpus: cap_gpus,
         gpu_detection: cap.gpu_detection,
@@ -4639,6 +5435,34 @@ where
         readiness: Some(mgr.readiness.merged()),
     };
     send(sink, &msg).await
+}
+
+/// Send a `handle_control` reply with the capacity reports it needs.
+async fn send_control_reply<S>(
+    sink: &mut S,
+    mgr: &mut SessionManager,
+    reply: AgentMsg,
+) -> anyhow::Result<()>
+where
+    S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    let typed_applied =
+        matches!(&reply, AgentMsg::ConfigPolicyState { phase, .. } if phase == "applied");
+    // agent-api.md §RH05: the fresh baseline precedes a
+    // `deployment_baseline_changed` rejection on this ordered socket, so the
+    // control plane reads the rejection against current evidence.
+    if matches!(&reply, AgentMsg::ConfigPolicyState { error: Some(code), .. }
+        if code == "deployment_baseline_changed")
+    {
+        send_fresh_capacity(sink, mgr).await?;
+    }
+    send(sink, &reply).await?;
+    // A typed apply can withdraw probe-proven codecs (`zerocopy`); the control
+    // plane must not keep routing on the old set.
+    if typed_applied {
+        send_fresh_capacity(sink, mgr).await?;
+    }
+    Ok(())
 }
 
 pub(crate) async fn send<S>(sink: &mut S, msg: &AgentMsg) -> anyhow::Result<()>
@@ -4757,6 +5581,43 @@ mod tests {
     use super::*;
     use crate::session::{AbrMode, EncoderChoice};
 
+    #[tokio::test]
+    async fn restart_readback_requires_open_device_and_fresh_passing_media_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("render-node");
+        std::fs::write(&device, b"device").unwrap();
+        let path = device.to_str().unwrap();
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
+        settings.apply_json(&serde_json::json!({"encoder":"va","render_node":path}));
+        let gpu = crate::messages::GpuCapacity {
+            index: 0,
+            vendor: "amd".into(),
+            model: "test".into(),
+            vram_mb_total: 1,
+            encode_slots_total: 1,
+            render_node: Some(path.into()),
+            device_path: Some(path.into()),
+            driver_identity: Some("driver:test".into()),
+            codecs: None,
+        };
+        let inventory = [gpu];
+        assert!(verify_boot_device_with(&settings, &inventory, |_| async { true }).await);
+        assert!(!verify_boot_device_with(&settings, &inventory, |_| async { false }).await);
+        std::fs::remove_file(device).unwrap();
+        let called = std::cell::Cell::new(false);
+        assert!(
+            !verify_boot_device_with(&settings, &inventory, |_| {
+                called.set(true);
+                async { true }
+            })
+            .await
+        );
+        assert!(
+            !called.get(),
+            "an inaccessible device must not spawn a media child"
+        );
+    }
+
     #[test]
     fn failed_application_retirement_prevents_audio_and_legacy_sweep_before_admission() {
         let calls = std::cell::RefCell::new(Vec::new());
@@ -4872,6 +5733,44 @@ mod tests {
             webpki_from_blob: false,
             startup_warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn journal_diagnostics_register_without_policy_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        let cfg = test_cfg(path.to_str().unwrap(), Some("enrollment-token"));
+        let normal = register_message(
+            &cfg,
+            false,
+            Vec::new(),
+            &crate::buildinfo::InstallFacts::default(),
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+        let normal = serde_json::to_value(normal).unwrap();
+        for station in [
+            crate::diagnostic::Station::policy_journal_corrupt(),
+            crate::diagnostic::Station::policy_journal_write_failed(),
+        ] {
+            let diagnostic = register_message(
+                &cfg,
+                false,
+                Vec::new(),
+                &crate::buildinfo::InstallFacts::default(),
+                false,
+                station.phase().policy_available(),
+                None,
+            )
+            .unwrap();
+            let diagnostic = serde_json::to_value(diagnostic).unwrap();
+            assert!(diagnostic.get("config_policy_versions").is_none());
+            assert!(diagnostic.get("config_policy_groups").is_none());
+        }
+        assert!(normal.get("config_policy_versions").is_some());
+        assert!(normal.get("config_policy_groups").is_some());
     }
 
     /// A pinned `Config` for the pin-file tests.
@@ -6086,6 +6985,7 @@ mod tests {
         let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
         let msg = ControlMsg::ConfigUpdate {
             source_policies: None,
+            settings_delivery_id: None,
             settings: serde_json::json!({ "gop": 120, "abr_enabled": true, "encoder": "va" }),
             console_config: None,
         };
@@ -6121,6 +7021,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::json!({ "encoder": "va", "gop": 120 }),
                 console_config: None,
             },
@@ -6134,6 +7035,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::json!({ "gop": 90 }),
                 console_config: None,
             },
@@ -6150,6 +7052,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::json!({}),
                 console_config: None,
             },
@@ -6180,6 +7083,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::Value::Null,
                 console_config: None,
             },
@@ -6208,6 +7112,10 @@ mod tests {
              explicit clear, not 'nothing to say'"
         );
         let json = serde_json::to_value(AgentMsg::Capacity {
+            deployment_settings: None,
+            config_policy_accepted_groups: None,
+            config_policy_legacy_map_applied_id: None,
+
             source_preparation: None,
             host: crate::messages::HostCapacity {
                 cpu_cores: 1,
@@ -6692,6 +7600,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::Value::Null,
                 console_config: None,
             },
@@ -6704,6 +7613,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::json!({}),
                 console_config: None,
             },
@@ -6721,6 +7631,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::json!({ "encoder": flip }),
                 console_config: None,
             },
@@ -6736,6 +7647,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::json!({ "encoder": flip }),
                 console_config: None,
             },
@@ -6770,6 +7682,7 @@ mod tests {
                 gpu_index: 0,
                 codec: crate::session::Codec::H264,
                 reached_running: true,
+                pending_home_terminal: None,
             },
             stop,
         )
@@ -6820,6 +7733,7 @@ mod tests {
                 gpu_index: 0,
                 codec: crate::session::Codec::H264,
                 reached_running: true,
+                pending_home_terminal: None,
             },
             display_rx,
         )
@@ -7168,6 +8082,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::Value::Null,
                 console_config: Some(
                     serde_json::from_value(serde_json::json!({ "enabled": true })).unwrap(),
@@ -7183,6 +8098,7 @@ mod tests {
         mgr.handle_control(
             ControlMsg::ConfigUpdate {
                 source_policies: None,
+                settings_delivery_id: None,
                 settings: serde_json::Value::Null,
                 console_config: Some(
                     serde_json::from_value(serde_json::json!({ "enabled": false })).unwrap(),
@@ -7274,6 +8190,84 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn capable_terminal_waits_for_source_absence_and_preserves_home_refs() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut mgr, live_refs) = manager_with_runner(Arc::new(|_, _, _, _, _, _, _, _, _, _| {}));
+        let mut ledger = crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(
+            directory.path().join("ledger"),
+        )
+        .unwrap();
+        assert!(ledger.record_active("held").unwrap());
+        mgr.home_cleanup = Some(ledger);
+        let clean = Arc::new(AtomicBool::new(false));
+        let observed = clean.clone();
+        mgr.home_source_retire = Some(Arc::new(move |_| observed.load(Ordering::SeqCst)));
+        let (tx, _rx) = mpsc::channel(8);
+        start_seam_session(&mut mgr, "held", &tx);
+        wait_for_finished_thread(&mgr, "held");
+        mgr.running
+            .get_mut("held")
+            .unwrap()
+            .home_refs
+            .push("managed-home".into());
+        mgr.add_live_refs(&["managed-home".into()]);
+        assert!(mgr
+            .prove_home_terminal("held", SessionEvent::Failed("runner failed".into()))
+            .is_none());
+        assert!(mgr.running.contains_key("held"));
+        assert!(live_refs.lock().unwrap().contains("managed-home"));
+        assert_eq!(mgr.home_cleanup.as_ref().unwrap().state("held"), None);
+        clean.store(true, Ordering::SeqCst);
+        let reports = mgr.reconcile(Instant::now(), Duration::ZERO, Duration::from_secs(60));
+        assert!(
+            matches!(reports.as_slice(), [AgentMsg::SessionState { state, .. }] if state == "failed")
+        );
+        assert!(!mgr.running.contains_key("held"));
+        assert!(!live_refs.lock().unwrap().contains("managed-home"));
+        assert_eq!(
+            mgr.home_cleanup.as_ref().unwrap().state("held"),
+            Some(crate::home_cleanup::TerminalKind::Failed)
+        );
+    }
+
+    #[test]
+    fn repeated_stop_retires_a_lost_assign_before_terminal_and_blocks_reuse() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut mgr = manager_with(Vec::new());
+        mgr.home_cleanup = Some(
+            crate::home_cleanup::HomeCleanupLedger::open_after_startup_cleanup(
+                directory.path().join("ledger"),
+            )
+            .unwrap(),
+        );
+        let (tx, _rx) = mpsc::channel(8);
+        for _ in 0..2 {
+            let ack = mgr.handle_control(
+                ControlMsg::SessionStop {
+                    id: "stop".into(),
+                    session_id: "lost-assign".into(),
+                    reason: "error".into(),
+                },
+                &tx,
+                &diagnostic_sender(),
+            );
+            assert!(matches!(ack, Some(AgentMsg::Ack { ok: true, .. })));
+            assert!(matches!(mgr.home_cleanup_reports.pop(),
+                Some(AgentMsg::SessionState { state, .. }) if state == "stopped"));
+            assert_eq!(
+                mgr.home_cleanup.as_ref().unwrap().state("lost-assign"),
+                Some(crate::home_cleanup::TerminalKind::Stopped)
+            );
+        }
+        let refused = mgr.handle_control(
+            session_assign_msg("lost-assign", 0),
+            &tx,
+            &diagnostic_sender(),
+        );
+        assert!(matches!(refused, Some(AgentMsg::Ack { ok: false, .. })));
     }
 
     #[test]
@@ -7633,6 +8627,7 @@ mod tests {
                 gpu_index: 0,
                 codec: crate::session::Codec::H264,
                 reached_running: true,
+                pending_home_terminal: None,
             },
             capture_rx,
         )
@@ -8094,5 +9089,211 @@ mod tests {
             &diagnostic_sender(),
         );
         assert!(matches!(reply, Some(AgentMsg::Ack { ok: false, .. })));
+    }
+
+    // ---- RH05 #336: a typed next-session apply reaches the next launch ----
+
+    fn typed_offer_msg(offer: crate::policy::Offer) -> ControlMsg {
+        ControlMsg::ConfigPolicyOffer {
+            attempt_id: offer.attempt_id,
+            host_id: offer.host_id,
+            boot_incarnation: offer.boot_incarnation,
+            connection_incarnation: offer.connection_incarnation,
+            group: offer.group,
+            revision: offer.revision,
+            content_sha256: offer.content_sha256,
+            scope: offer.scope,
+            expires_at: offer.expires_at,
+            prerequisites_sha256: offer.prerequisites_sha256,
+            prerequisites: offer.prerequisites,
+            settings: offer.settings,
+            resolved_settings: offer.resolved_settings,
+        }
+    }
+
+    /// Owns `group` on a durable temp journal and applies `value` to it through
+    /// `handle_control`, as the connection loop does.
+    fn apply_typed(
+        mgr: &mut SessionManager,
+        dir: &std::path::Path,
+        group: &str,
+        value: serde_json::Value,
+    ) -> Option<AgentMsg> {
+        use crate::policy::test_support::{explicit, owned_agent};
+        let agent = owned_agent(dir, &[group], &mut mgr.runtime_settings);
+        let offer = explicit(&agent, "attempt", "1", group, value);
+        mgr.policy_agent = Some(agent);
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+        mgr.handle_control(typed_offer_msg(offer), &evt_tx, &diagnostic_sender())
+    }
+
+    /// agent-api.md §RH05: a `deployment_baseline_changed` rejection is
+    /// preceded on the same ordered socket by a fresh capacity baseline, so
+    /// the control plane never reads the rejection against stale evidence.
+    #[tokio::test]
+    async fn a_baseline_changed_rejection_follows_a_fresh_capacity_baseline() {
+        use crate::policy::test_support::{offer, owned_agent};
+        let (mut mgr, _live_refs) = manager_with_runner(default_runner());
+        let dir = tempfile::tempdir().unwrap();
+        let agent = owned_agent(dir.path(), &["gop"], &mut mgr.runtime_settings);
+        let current = mgr.deployment_baseline.deployment_map()["gop"]
+            .as_u64()
+            .unwrap();
+        let stale = offer(
+            &agent,
+            "stale",
+            "1",
+            "gop",
+            serde_json::json!({"source":"deployment"}),
+            serde_json::json!(current + 30),
+        );
+        mgr.policy_agent = Some(agent);
+        let (evt_tx, _evt_rx) = mpsc::channel::<(String, SessionEvent)>(1);
+        let reply = mgr
+            .handle_control(typed_offer_msg(stale), &evt_tx, &diagnostic_sender())
+            .unwrap();
+
+        let mut wire: Vec<Message> = Vec::new();
+        let mut sink = (&mut wire).sink_map_err(
+            |never: std::convert::Infallible| -> tokio_tungstenite::tungstenite::Error {
+                match never {}
+            },
+        );
+        send_control_reply(&mut sink, &mut mgr, reply)
+            .await
+            .unwrap();
+        let sent: Vec<serde_json::Value> = wire
+            .iter()
+            .map(|m| serde_json::from_str(m.to_text().unwrap()).unwrap())
+            .collect();
+        let types: Vec<&str> = sent.iter().map(|m| m["type"].as_str().unwrap()).collect();
+        assert_eq!(types, ["capacity", "config_policy_state"], "{sent:?}");
+        assert_eq!(
+            sent[0]["deployment_settings"]["gop"],
+            serde_json::json!(current),
+            "the capacity carries the agent's current baseline"
+        );
+        assert_eq!(sent[1]["phase"], "failed");
+        assert_eq!(sent[1]["error"], "deployment_baseline_changed");
+    }
+
+    fn applied(reply: &Option<AgentMsg>) -> bool {
+        matches!(reply, Some(AgentMsg::ConfigPolicyState { phase, .. }) if phase == "applied")
+    }
+
+    /// `zerocopy` stays next-session, but it is a host-probe input: a typed
+    /// change must withdraw codecs proven under the old value and ask the
+    /// scheduler for a fresh probe, exactly as a legacy `config_update` does.
+    #[tokio::test]
+    async fn a_typed_zerocopy_apply_withdraws_probe_proven_codecs_and_requests_a_probe() {
+        use crate::host_probe::decision::Event;
+        use crate::host_probe::orchestrator::ProbeHandle;
+        use crate::host_probe::ProbeCodec;
+        let mut mgr = codec_mgr(
+            vec![gpu(0, "nvidia", Some("/dev/dri/renderD128"))],
+            plan_all,
+        );
+        let (handle, mut rx) = ProbeHandle::detached();
+        mgr.probe_handle = Some(handle);
+        mgr.notify_probe_inputs();
+        next_probe_event(&mut rx).await;
+        prove(&mut mgr, 0, ProbeCodec::H265);
+        assert_eq!(mgr.advertised_codecs(), wire(&["h264", "h265"]));
+
+        let dir = tempfile::tempdir().unwrap();
+        let flipped = !mgr.runtime_settings.zerocopy;
+        let reply = apply_typed(&mut mgr, dir.path(), "zerocopy", serde_json::json!(flipped));
+        assert!(applied(&reply), "{reply:?}");
+        assert_eq!(mgr.runtime_settings.zerocopy, flipped);
+        assert_eq!(
+            mgr.advertised_codecs(),
+            wire(&["h264"]),
+            "h265 was proven under the old zerocopy value"
+        );
+        match next_probe_event(&mut rx).await {
+            Event::InputsObserved(inputs) => {
+                assert!(
+                    inputs.settings.contains(&format!("zerocopy={flipped}")),
+                    "{}",
+                    inputs.settings
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The warm-up template store follows a typed `home_root` at the same
+    /// boundary the next launch does; existing homes stay where they are.
+    #[test]
+    fn a_typed_home_root_apply_rebinds_template_seeding_for_the_next_launch() {
+        let (fixture, source_policy) = crate::source_policy::tests::fixture();
+        let mount = fixture.path().join("homes");
+        let existing = mount.join("existing-user");
+        std::fs::create_dir(&existing).unwrap();
+        std::fs::write(existing.join("save.dat"), "kept").unwrap();
+        let mut mgr = manager_with(Vec::new());
+        mgr.runtime_settings.home_root = mount.to_str().unwrap().into();
+        mgr.source_policy = Some(source_policy.clone());
+        assert_eq!(source_policy.store().unwrap().home_root(), mount.as_path());
+        let running = SessionConfig::for_assignment_with(
+            &mgr.runtime_settings,
+            StreamParams::default(),
+            None,
+        );
+
+        let next_root = mount.join("v2");
+        let dir = tempfile::tempdir().unwrap();
+        let reply = apply_typed(
+            &mut mgr,
+            dir.path(),
+            "home_root",
+            serde_json::json!(next_root.to_str().unwrap()),
+        );
+        assert!(applied(&reply), "{reply:?}");
+        let next = SessionConfig::for_assignment_with(
+            &mgr.runtime_settings,
+            StreamParams::default(),
+            None,
+        );
+        assert_eq!(next.home_root, next_root.to_str().unwrap());
+        // `session::source` seeds only when the store's root equals the launch's.
+        assert_eq!(
+            source_policy.store().unwrap().home_root(),
+            std::path::Path::new(&next.home_root)
+        );
+        assert_eq!(
+            running.home_root,
+            mount.to_str().unwrap(),
+            "running session keeps its root"
+        );
+        assert_eq!(
+            std::fs::read_to_string(existing.join("save.dat")).unwrap(),
+            "kept"
+        );
+    }
+
+    #[test]
+    fn a_typed_app_boot_timeout_apply_reaches_the_next_launch_only() {
+        let mut mgr = manager_with(Vec::new());
+        let running = SessionConfig::for_assignment_with(
+            &mgr.runtime_settings,
+            StreamParams::default(),
+            None,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let reply = apply_typed(
+            &mut mgr,
+            dir.path(),
+            "app_boot_timeout_secs",
+            serde_json::json!(42),
+        );
+        assert!(applied(&reply), "{reply:?}");
+        let next = SessionConfig::for_assignment_with(
+            &mgr.runtime_settings,
+            StreamParams::default(),
+            None,
+        );
+        assert_eq!(next.app_boot_timeout, Some(Duration::from_secs(42)));
+        assert_ne!(running.app_boot_timeout, next.app_boot_timeout);
     }
 }

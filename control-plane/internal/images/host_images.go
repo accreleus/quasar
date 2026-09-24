@@ -87,27 +87,93 @@ func upsertHostImage(ctx context.Context, db dbExecutor, hostID, imageID, versio
 	return tag.RowsAffected() > 0, nil
 }
 
-// demoteUnreportedReady: an image this host was believed ready on, but its
-// wholesale report omits, is flipped to absent — a reconnected agent that lost
-// an image must never keep reading as ready, or the scheduler would place a
-// session with no image.
-//
-// Only 'ready' rows are demoted; a 'pulling' row not yet re-reported is left
-// alone (already not-ready, and clobbering would erase progress). Version is
-// kept — every readiness test is `state='ready' AND version=…`, so a stale
-// version on an absent row can't be mistaken for presence.
+// successfulVersionWouldChange reports whether a ready current adoption would
+// advance this host's retained version set. Call it in the same transaction as
+// recordSuccessfulVersion, then publish the identity change after commit.
+func successfulVersionWouldChange(ctx context.Context, db dbExecutor, hostID, imageID, version string) (bool, error) {
+	var currentVersion string
+	err := db.QueryRow(ctx, `SELECT current_version FROM host_image_success_history
+		WHERE host_id=$1::uuid AND image_id=$2`, hostID, imageID).Scan(&currentVersion)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return false, err
+	}
+	if err == nil && currentVersion == version {
+		return false, nil
+	}
+	var matchingAdoption bool
+	if err := db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM installed_images
+		WHERE image_id=$1 AND version=$2)`, imageID, version).Scan(&matchingAdoption); err != nil {
+		return false, err
+	}
+	return matchingAdoption, nil
+}
+
+// recordSuccessfulVersion advances retention history only for a current,
+// adopted immutable version the authenticated agent reports ready. The
+// identity includes frozen registry or template build inputs. A same-version
+// reinstall with different bits is ambiguous on the agent wire and therefore
+// cannot replace verified history. The caller uses the same transaction as inventory
+// ingestion so history cannot advance if that observation rolls back.
+func recordSuccessfulVersion(ctx context.Context, db dbExecutor, hostID, imageID, version string) error {
+	if version == "" {
+		return nil
+	}
+	_, err := db.Exec(ctx, `
+		INSERT INTO host_image_success_history
+		    (host_id,image_id,current_version,current_identity,previous_version,previous_identity,verified_at)
+		SELECT $1::uuid, ii.image_id, ii.version,
+		       jsonb_build_object('registry_ref',ii.registry_ref,'local_tag',ii.local_tag,
+		         'context_repo',ii.context_repo,'context_sha',ii.context_sha,
+		         'dockerfile',ii.dockerfile,'build_args',ii.build_args),
+		       NULL, NULL, now()
+		FROM installed_images ii
+		WHERE ii.image_id=$2 AND ii.version=$3
+		ON CONFLICT (host_id,image_id) DO UPDATE SET
+		  previous_version=CASE
+		    WHEN host_image_success_history.current_version<>EXCLUDED.current_version
+		    THEN host_image_success_history.current_version
+		    ELSE host_image_success_history.previous_version END,
+		  previous_identity=CASE
+		    WHEN host_image_success_history.current_version<>EXCLUDED.current_version
+		    THEN host_image_success_history.current_identity
+		    ELSE host_image_success_history.previous_identity END,
+		  current_version=CASE
+		    WHEN host_image_success_history.current_version<>EXCLUDED.current_version
+		    THEN EXCLUDED.current_version ELSE host_image_success_history.current_version END,
+		  current_identity=CASE
+		    WHEN host_image_success_history.current_version<>EXCLUDED.current_version
+		    THEN EXCLUDED.current_identity ELSE host_image_success_history.current_identity END,
+		  verified_at=CASE
+		    WHEN host_image_success_history.current_version<>EXCLUDED.current_version
+		      OR host_image_success_history.current_identity=EXCLUDED.current_identity
+		    THEN EXCLUDED.verified_at ELSE host_image_success_history.verified_at END
+	`, hostID, imageID, version)
+	if err != nil {
+		return fmt.Errorf("record successful image version host=%s image=%s: %w", hostID, imageID, err)
+	}
+	return nil
+}
+
+// demoteUnreportedImages makes a new connection's inventory authoritative for
+// the states named by the caller. An omitted ready image is absent for launch;
+// omitted pulling/building is no longer current-connection progress and must
+// be dispatchable again. Older agents without inventory demote only progress,
+// retaining their signed legacy ready behavior. Version is kept for diagnosis.
 //
 // Returns the demoted ids so the caller can also clear their retry-failure
 // counters.
-func demoteUnreportedReady(ctx context.Context, db dbExecutor, hostID string, reported []string) ([]string, error) {
+func demoteUnreportedImages(ctx context.Context, db dbExecutor, hostID string, reported, states []string) ([]string, error) {
+	if reported == nil {
+		reported = []string{}
+	}
 	rows, err := db.Query(ctx, `
 		UPDATE host_images
 		   SET state = 'absent', error = '', updated_at = now()
 		 WHERE host_id = $1::uuid
-		   AND state = 'ready'
+		   AND state = ANY($3::text[])
 		   AND image_id <> ALL($2::text[])
 		RETURNING image_id
-	`, hostID, reported)
+	`, hostID, reported, states)
 	if err != nil {
 		return nil, fmt.Errorf("demote unreported host_images for host=%s: %w", hostID, err)
 	}
@@ -138,6 +204,45 @@ func hostHasImage(ctx context.Context, db dbExecutor, hostID, imageID, version s
 		return false, fmt.Errorf("read host_images host=%s image=%s: %w", hostID, imageID, err)
 	}
 	return ok, nil
+}
+
+// imageRemoving is the durable gate shared by operator Retry and delayed
+// preparation dispatch. Missing rows are idle until a cleanup attempt creates
+// its fence; a database error fails closed.
+func imageRemoving(ctx context.Context, db dbExecutor, hostID, imageID string) (bool, error) {
+	var removing bool
+	err := db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM host_image_operation_fences
+		WHERE host_id=$1::uuid AND image_id=$2 AND state='removing')`, hostID, imageID).Scan(&removing)
+	if err != nil {
+		return false, fmt.Errorf("read image operation fence host=%s image=%s: %w", hostID, imageID, err)
+	}
+	return removing, nil
+}
+
+// A normal reconciliation never restarts a failed current-version pull. Its
+// bounded retry ladder owns that work; after exhaustion only an explicit
+// operator Retry may re-arm it. A newer adopted version is new work and may
+// proceed independently of the old failure.
+func hostNeedsImage(ctx context.Context, db dbExecutor, hostID, imageID, version string) (bool, error) {
+	var state, currentVersion string
+	err := db.QueryRow(ctx, `SELECT state,version FROM host_images
+		WHERE host_id=$1::uuid AND image_id=$2`, hostID, imageID).Scan(&state, &currentVersion)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read host image requirement host=%s image=%s: %w", hostID, imageID, err)
+	}
+	if currentVersion == "" && (state == "ready" || state == "failed" || state == "pulling" || state == "building") {
+		// A legacy agent cannot label its progress with a version. Treat it as
+		// current only on this connection; register reconciliation demotes old
+		// progress before the next connection's ensure scan.
+		return false, nil
+	}
+	if currentVersion == version && (state == "ready" || state == "pulling" || state == "building" || state == "failed") {
+		return false, nil
+	}
+	return true, nil
 }
 
 // installedImage is one row of the ensure set: an adopted image plus what the
@@ -219,6 +324,67 @@ func installedNonLazy(ctx context.Context, db dbExecutor) ([]installedImage, err
 		return nil, fmt.Errorf("iterate installed_images: %w", err)
 	}
 	return out, nil
+}
+
+// requiredImagesForHost derives RH05 preparation intent from committed app
+// placement and the immutable adoption reference. The DISTINCT/EXISTS form is
+// the union across canonical and derived apps sharing one adopted image. A
+// custom app participates by referring to the same adopted image; an image
+// not in installed_images is unmanaged and receives no command. Offline hosts
+// retain the same durable requirement for their next authenticated reconnect.
+func requiredImagesForHost(ctx context.Context, db dbExecutor, hostID string) ([]installedImage, error) {
+	// The effective-image expression is also used by crud.appPlacementView;
+	// status and dispatch must choose the same app override/preset fallback.
+	rows, err := db.Query(ctx, installedNonLazyQuery+`
+		WHERE ii.lazy = false
+		  AND EXISTS (SELECT 1 FROM hosts h WHERE h.id=$1::uuid)
+		  AND ((ii.registry_ref IS NOT NULL AND ii.registry_ref <> '')
+		    OR (ii.local_tag IS NOT NULL AND ii.local_tag <> ''))
+		  AND EXISTS (
+		    SELECT 1 FROM apps a
+		    JOIN apps effective ON effective.id=COALESCE(a.parent_app_id,a.id)
+		    JOIN app_placement ap ON ap.app_id=effective.id
+		    LEFT JOIN runtime_presets rp ON rp.id=effective.runtime_preset_id
+		    CROSS JOIN LATERAL (SELECT CASE
+		      WHEN jsonb_typeof(effective.runtime_spec->'image')='string'
+		        AND effective.runtime_spec->>'image'<>''
+		      THEN effective.runtime_spec->>'image' ELSE NULLIF(rp.image,'') END AS image_ref) effective_image
+		    WHERE a.enabled AND effective.enabled
+		      AND (effective_image.image_ref=ii.registry_ref
+		        OR effective_image.image_ref=ii.local_tag)
+		      AND (ap.mode='all_eligible' OR EXISTS (
+		        SELECT 1 FROM app_placement_hosts aph
+		        WHERE aph.app_id=ap.app_id AND aph.host_id=$1::uuid)))
+		ORDER BY ii.image_id`, hostID)
+	if err != nil {
+		return nil, fmt.Errorf("query required images for host=%s: %w", hostID, err)
+	}
+	defer rows.Close()
+	var out []installedImage
+	for rows.Next() {
+		img, err := scanInstalledImage(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan required image host=%s: %w", hostID, err)
+		}
+		out = append(out, img)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate required images host=%s: %w", hostID, err)
+	}
+	return out, nil
+}
+
+func requiredAdoptionForHost(ctx context.Context, db dbExecutor, hostID, imageID string) (installedImage, bool, error) {
+	images, err := requiredImagesForHost(ctx, db, hostID)
+	if err != nil {
+		return installedImage{}, false, err
+	}
+	for _, img := range images {
+		if img.ImageID == imageID {
+			return img, true, nil
+		}
+	}
+	return installedImage{}, false, nil
 }
 
 // adoptionState is what adoptionFor reports about one image's current adoption.

@@ -318,9 +318,66 @@ func (c *Coordinator) LaunchByProfile(ctx context.Context, userID string, lp Lau
 	}
 
 	// Async, so the HTTP response returns immediately with the assigned session.
-	go c.dispatchAssignStart(sess, dispatchSpec)
+	expectedHome := expectedHomeDispatch(app)
+	go c.prepareAndDispatch(sess, dispatchSpec, app.Image(), &expectedHome)
 
 	return LaunchResult{Session: sess, SignalingToken: tok.Plaintext, TokenExpiresAt: tok.ExpiresAt}, nil
+}
+
+func (c *Coordinator) prepareAndDispatch(sess Session, runtimeSpec []byte, imageRef string, expected *homeDispatchExpectation) {
+	if c.lazyImages == nil && imageRef != "" {
+		// Placement admits a lazy template before any host built it. Without a
+		// preparer nothing would build it, so fail closed rather than assign an
+		// unbuilt local tag.
+		var lazyTemplate bool
+		err := c.store.pool.QueryRow(c.ctx, `SELECT EXISTS(SELECT 1 FROM installed_images
+			WHERE lazy AND registry_ref = '' AND local_tag = $1)`, imageRef).Scan(&lazyTemplate)
+		if err != nil || lazyTemplate {
+			c.failSession(sess.ID, "image preparation unavailable for lazy template")
+			return
+		}
+	}
+	if c.lazyImages != nil && sess.HostID != nil {
+		// A template build may take minutes. It is owned by the coordinator's
+		// lifecycle, not the HTTP request which has already returned 201.
+		ctx, cancel := context.WithCancel(c.ctx)
+		finished := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(500 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-finished:
+					return
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					current, err := c.store.Get(ctx, sess.ID)
+					if err == nil && current.State != StateAssigned {
+						cancel()
+						return
+					}
+				}
+			}
+		}()
+		err := c.lazyImages.PrepareLazyImage(ctx, *sess.HostID, imageRef)
+		close(finished)
+		cancel()
+		if err != nil {
+			// A stop or reconnect reap that ended the wait already owns the
+			// session's outcome; only a still-assigned launch fails here.
+			if current, getErr := c.store.Get(c.ctx, sess.ID); getErr == nil && current.State == StateAssigned {
+				c.failSession(sess.ID, fmt.Sprintf("image preparation failed: %v", err))
+			}
+			return
+		}
+	}
+	// An operator may have stopped the session while preparation was pending.
+	current, err := c.store.Get(c.ctx, sess.ID)
+	if err != nil || current.State != StateAssigned {
+		return
+	}
+	c.dispatchAssignStart(sess, runtimeSpec, expected)
 }
 
 // applyPostPlacement resolves which rung a placed session starts at and writes
@@ -718,11 +775,11 @@ func (c *Coordinator) logNoHostRejection(userID, appID string, err error) {
 // dispatchAssignStart performs the two-step agent handshake: assign, then start.
 // Either step failing (reject, timeout, agent not connected) fails the session
 // and releases its reservation. starting→running then arrives via AgentState.
-func (c *Coordinator) dispatchAssignStart(sess Session, runtimeSpec []byte) {
-	c.dispatchAssignStartWithTopology(sess, runtimeSpec, "stream_only")
+func (c *Coordinator) dispatchAssignStart(sess Session, runtimeSpec []byte, expected *homeDispatchExpectation) {
+	c.dispatchAssignStartWithTopology(sess, runtimeSpec, "stream_only", expected)
 }
 
-func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec []byte, videoTopology string) {
+func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec []byte, videoTopology string, expected *homeDispatchExpectation) {
 	if sess.HostID == nil || sess.GPUIndex == nil {
 		c.failSession(sess.ID, "session missing host/gpu placement")
 		return
@@ -732,7 +789,6 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 	if len(app) == 0 {
 		app = []byte("{}")
 	}
-
 	// The resolved RUNG's ABR floor, for the agent's in-session governor. It must
 	// read the rung, not the launch profile: a chain has no single floor, and one
 	// that fell through to a lower rung has a lower floor. No rung resolved ⇒ 0,
@@ -768,7 +824,7 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 		Resources:     agentws.ResourceSpec{VRAMMB: sess.ReservedVram, EncodeSlots: sess.ReservedSlots},
 		VideoTopology: videoTopology,
 	}
-	if !c.commandOK(hostID, assign.ID, assign, assignAckTimeout, sess.ID, "assign") {
+	if !c.sendHomeBoundAssign(hostID, sess.ID, app, assign, expected) {
 		return
 	}
 
@@ -781,6 +837,61 @@ func (c *Coordinator) dispatchAssignStartWithTopology(sess Session, runtimeSpec 
 	// stuck-start watchdog: the agent acked start, so it must reach running
 	// within the window or be reaped.
 	go c.watchStartToRunning(sess.ID, hostID)
+}
+
+// sendHomeBoundAssign uses the exact authenticated command epoch for both the
+// cleanup-capability decision and socket queue handoff. An epoch replaced
+// before enqueue causes a fresh decision; an enqueued frame remains uncertain.
+func (c *Coordinator) sendHomeBoundAssign(hostID, sessionID string, app []byte, assign agentws.SessionAssignCmd, expected *homeDispatchExpectation) bool {
+	provider, epochAware := c.dispatcher.(interface {
+		CurrentHomeCommandEpoch(string) (agentws.HomeCommandEpoch, bool)
+	})
+	for attempt := 0; attempt < 3; attempt++ {
+		var epoch agentws.HomeCommandEpoch
+		if epochAware {
+			var ok bool
+			epoch, ok = provider.CurrentHomeCommandEpoch(hostID)
+			if !ok {
+				c.failSession(sessionID, "assign dispatch failed: agent not connected")
+				return false
+			}
+		}
+		capable := epoch != nil && epoch.SupportsHomeCleanup()
+		hold, err := c.store.bindManagedHomeDispatchWithHold(c.ctx, sessionID, app, capable, expected)
+		if err != nil {
+			c.log.Error("managed home dispatch binding failed", "session_id", sessionID, "err", err)
+			c.failSession(sessionID, "managed home dispatch binding failed")
+			return false
+		}
+		if epoch == nil {
+			return c.commandOK(hostID, assign.ID, assign, assignAckTimeout, sessionID, "assign")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), assignAckTimeout)
+		res, queued, sendErr := epoch.SendWithAck(ctx, assign.ID, assign)
+		cancel()
+		if sendErr != nil && !queued {
+			if clearErr := c.store.ClearNewHomeHold(c.ctx, hold); clearErr != nil {
+				c.log.Error("unstarted home hold release failed", "err", clearErr)
+			}
+			// The chosen epoch vanished before enqueue. Re-read its capability
+			// and bind a new decision; do not send under the stale one.
+			continue
+		}
+		if sendErr == nil && !res.OK {
+			if clearErr := c.store.ClearNewHomeHold(c.ctx, hold); clearErr != nil {
+				c.log.Error("rejected home hold release failed", "err", clearErr)
+			}
+			c.failSession(sessionID, fmt.Sprintf("agent rejected assign: %s", res.Error))
+			return false
+		}
+		if sendErr != nil {
+			c.failSession(sessionID, fmt.Sprintf("assign dispatch failed: %v", sendErr))
+			return false
+		}
+		return true
+	}
+	c.failSession(sessionID, "assign dispatch failed: connection changed")
+	return false
 }
 
 // watchStartToRunning is the stuck-start watchdog (P2-06). A session still

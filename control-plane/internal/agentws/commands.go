@@ -156,9 +156,10 @@ type CaptureParams struct {
 // (hostcfg.Resolve); the agent overlays it and applies live knobs on the next
 // session. Older agents ignore unknown message types.
 type ConfigUpdateCmd struct {
-	SourcePolicies *preparation.Policies `json:"source_policies,omitempty"`
-	Type           string                `json:"type"` // "config_update"
-	Settings       map[string]any        `json:"settings"`
+	SourcePolicies     *preparation.Policies `json:"source_policies,omitempty"`
+	Type               string                `json:"type"` // "config_update"
+	Settings           map[string]any        `json:"settings"`
+	SettingsDeliveryID string                `json:"settings_delivery_id,omitempty"`
 	// Resolved console-mode config (CM-01, agent-api.md
 	// `config_update.console_config`). Typed `any` rather than importing
 	// internal/console — only the JSON shape is load-bearing.
@@ -186,11 +187,14 @@ type AckMsg struct {
 
 // SessionStateMsg is the agent's authoritative lifecycle-progress callback.
 type SessionStateMsg struct {
-	Type      string  `json:"type"` // "session_state"
-	SessionID string  `json:"session_id"`
-	State     string  `json:"state"` // starting|running|stopping|stopped|failed
-	Detail    string  `json:"detail"`
-	Error     *string `json:"error"`
+	Type      string `json:"type"` // "session_state"
+	SessionID string `json:"session_id"`
+	// Set only by the authenticated WebSocket handler for the current reporting
+	// connection. Incoming JSON cannot assert cleanup capability.
+	HomeCleanupQualified bool    `json:"-"`
+	State                string  `json:"state"` // starting|running|stopping|stopped|failed
+	Detail               string  `json:"detail"`
+	Error                *string `json:"error"`
 	// ReasonCode (agent-api.md `session_state.reason_code`) classifies a
 	// terminal failure for the UI. Never load-bearing for the state machine —
 	// the transition is driven by State alone.
@@ -199,4 +203,7 @@ type SessionStateMsg struct {
 	// The only copy: app containers run `--rm`, so the daemon has already
 	// discarded the logs by the time anyone looks (#463).
 	AppLogTail *string `json:"app_log_tail"`
+	// RawMessage isolates optional seed evidence from lifecycle decoding. A
+	// malformed seed field cannot drop an otherwise valid session_state.
+	HomeSeed json.RawMessage `json:"home_seed"`
 }

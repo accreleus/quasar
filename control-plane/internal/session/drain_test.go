@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/accreleus/quasar/control-plane/internal/auth"
 )
 
@@ -233,6 +234,80 @@ func TestUncordonDrainingHost(t *testing.T) {
 	}
 }
 
+// An operator's resume releases only their hold. A platform operation that
+// began while the manual drain was active still protects the host.
+func TestManualResumePreservesPlatformHold(t *testing.T) {
+	pool := testDB(t)
+	store, coord, _ := newCoord(t, pool)
+	s := seed(t, pool, 4)
+	ctx := context.Background()
+	if _, err := coord.DrainHost(ctx, s.hostID, false); err != nil {
+		t.Fatal(err)
+	}
+	holds := admission.NewStore(pool)
+	platform := admission.Owner{Kind: admission.Platform, ID: "00000000-0000-0000-0000-000000000123"}
+	if _, err := holds.Acquire(ctx, s.hostID, platform, "platform apply"); err != nil {
+		t.Fatal(err)
+	}
+	h, err := coord.UncordonHost(ctx, s.hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Status != "draining" {
+		t.Fatalf("resume status = %s, want draining while platform holds", h.Status)
+	}
+	if _, err := store.ScheduleAndCreate(ctx, launchParams(s)); !errors.Is(err, ErrNoHostAvailable) {
+		t.Fatalf("launch while platform holds: %v, want no host", err)
+	}
+	if _, err := holds.Release(ctx, s.hostID, platform, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ScheduleAndCreate(ctx, launchParams(s)); err != nil {
+		t.Fatalf("launch after platform completion: %v", err)
+	}
+}
+
+func TestAdmissionRestrictionWinsReservationRace(t *testing.T) {
+	pool := testDB(t)
+	store := NewStore(pool)
+	s := seed(t, pool, 4)
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT status FROM hosts WHERE id=$1::uuid FOR UPDATE`, s.hostID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO host_admission_restrictions (host_id,owner_kind,owner_id,reason)
+		VALUES ($1::uuid,'platform','00000000-0000-0000-0000-000000000123'::uuid,'platform_apply')`, s.hostID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE hosts SET status='draining' WHERE id=$1::uuid`, s.hostID); err != nil {
+		t.Fatal(err)
+	}
+
+	result := make(chan error, 1)
+	go func() { _, err := store.ScheduleAndCreate(ctx, launchParams(s)); result <- err }()
+	// The reservation either saw the old online candidate and waits on the
+	// host lock, or sees the committed restriction below. Neither may commit
+	// a session after the hold becomes durable.
+	time.Sleep(50 * time.Millisecond)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrNoHostAvailable) {
+			t.Fatalf("launch after restriction committed: %v, want no host", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reservation did not settle after restriction commit")
+	}
+}
+
 // TestUncordonOnlineIdempotent: uncordoning an online host is a no-op success.
 func TestUncordonOnlineIdempotent(t *testing.T) {
 	pool := testDB(t)
@@ -272,6 +347,24 @@ func TestUncordonOfflineConflict(t *testing.T) {
 	}
 }
 
+func TestUncordonOfflineHostReleasesItsManualHold(t *testing.T) {
+	pool := testDB(t)
+	_, coord, _ := newCoord(t, pool)
+	s := seed(t, pool, 4)
+	ctx := context.Background()
+	if _, err := coord.DrainHost(ctx, s.hostID, false); err != nil {
+		t.Fatal(err)
+	}
+	setHostStatusRaw(t, pool, s.hostID, "offline")
+	h, err := coord.UncordonHost(ctx, s.hostID)
+	if err != nil || h.Status != "offline" {
+		t.Fatalf("uncordon offline hold = %+v (%v), want 200 with offline status", h, err)
+	}
+	if restrictions, err := admission.NewStore(pool).List(ctx, s.hostID); err != nil || len(restrictions) != 0 {
+		t.Fatalf("offline hold after uncordon = %+v (%v), want none", restrictions, err)
+	}
+}
+
 // TestUncordonDrainingAgentConnected: the live check passes ⇒ draining → online.
 func TestUncordonDrainingAgentConnected(t *testing.T) {
 	pool := testDB(t)
@@ -297,6 +390,9 @@ func TestUncordonDrainingAgentDisconnected(t *testing.T) {
 	s := seed(t, pool, 4)
 	ctx := context.Background()
 
+	if _, err := admission.NewStore(pool).Acquire(ctx, s.hostID, admission.ManualOwner, admission.ReasonManualDrain); err != nil {
+		t.Fatal(err)
+	}
 	setHostStatusRaw(t, pool, s.hostID, "draining")
 	h, err := coord.UncordonHost(ctx, s.hostID)
 	if err != nil {
@@ -308,6 +404,27 @@ func TestUncordonDrainingAgentDisconnected(t *testing.T) {
 	// The whole point: the scheduler must not pick it up.
 	if _, err := store.ScheduleAndCreate(ctx, launchParams(s)); !errors.Is(err, ErrNoHostAvailable) {
 		t.Fatalf("launch after uncordon with no agent: got %v want ErrNoHostAvailable", err)
+	}
+}
+
+func TestUncordonDisconnectedPlatformOnlyHostIsRefused(t *testing.T) {
+	pool := testDB(t)
+	_, coord := newCoordWithAgents(t, pool, false)
+	s := seed(t, pool, 4)
+	ctx := context.Background()
+	holds := admission.NewStore(pool)
+	owner := admission.Owner{Kind: admission.Platform, ID: "33700000-0000-4000-8000-000000000077"}
+	if _, err := holds.Acquire(ctx, s.hostID, owner, admission.ReasonPlatformApply); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coord.UncordonHost(ctx, s.hostID); !errors.Is(err, ErrHostNotResumable) {
+		t.Fatalf("disconnected platform-only uncordon = %v, want 409 refusal", err)
+	}
+	if status := hostStatus(t, pool, s.hostID); status != "draining" {
+		t.Fatalf("status after refused uncordon = %q, want draining", status)
+	}
+	if rs, err := holds.List(ctx, s.hostID); err != nil || len(rs) != 1 || rs[0].OwnerKind != admission.Platform {
+		t.Fatalf("platform hold after refused uncordon = %+v (%v)", rs, err)
 	}
 }
 
@@ -338,6 +455,9 @@ func TestUncordonHTTPAgentDisconnected(t *testing.T) {
 	tok := loginTok(t, authSvc, "drainadmin@test.local", "unrelated-pw-16")
 
 	s := seed(t, pool, 4)
+	if _, err := admission.NewStore(pool).Acquire(ctx, s.hostID, admission.ManualOwner, admission.ReasonManualDrain); err != nil {
+		t.Fatal(err)
+	}
 	setHostStatusRaw(t, pool, s.hostID, "draining")
 
 	resp := doJSON(t, http.MethodPost, srv.URL+"/v1/hosts/"+s.hostID+"/uncordon", tok, nil)

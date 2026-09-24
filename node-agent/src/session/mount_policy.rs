@@ -11,11 +11,10 @@
 //! own home provisioning owns it; everything else must be named by the operator in
 //! `QUASAR_APP_MOUNT_ALLOW` and is read-only unless that entry says `:rw`.
 //!
-//! Symlink resolution is advisory, never an approval: the agent runs in a
+//! Symlink resolution can only reject, never approve: the agent runs in a
 //! container, so `/etc` or `/proc/1/root` resolve against ITS rootfs while dockerd
-//! binds the source from the HOST's. A canonical path is therefore only ever used
-//! to reject; acceptance rests on the lexical path, which `..` rejection keeps
-//! honest.
+//! binds the source from the HOST's. Acceptance requires lexical containment
+//! and rejects a visible symlink escape from the selected allowed root.
 
 use anyhow::{bail, Result};
 use std::path::{Component, Path, PathBuf};
@@ -73,11 +72,13 @@ const ALLOWED_OPTS: &[&str] = &[
 struct AllowedRoot {
     path: PathBuf,
     writable: bool,
+    managed_home: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct MountPolicy {
     allowed: Vec<AllowedRoot>,
+    deployment_mount: Option<PathBuf>,
 }
 
 impl MountPolicy {
@@ -89,6 +90,26 @@ impl MountPolicy {
         )
     }
 
+    /// Live assign/swap policy: retain the immutable pre-policy mount so a
+    /// selected home root that becomes a symlink cannot escape it later.
+    pub fn from_env_with_deployment_mount(home_root: &str, deployment_mount: &str) -> Self {
+        Self::new_with_deployment_mount(
+            home_root,
+            deployment_mount,
+            &std::env::var("QUASAR_APP_MOUNT_ALLOW").unwrap_or_default(),
+        )
+    }
+
+    pub fn new_with_deployment_mount(
+        home_root: &str,
+        deployment_mount: &str,
+        allow_spec: &str,
+    ) -> Self {
+        let mut policy = Self::new(home_root, allow_spec);
+        policy.deployment_mount = Some(PathBuf::from(deployment_mount));
+        policy
+    }
+
     /// `allow_spec` is comma-separated `path` or `path:rw`; `home_root` (empty when
     /// the host configures none) is always allowed read-write.
     pub fn new(home_root: &str, allow_spec: &str) -> Self {
@@ -98,6 +119,7 @@ impl MountPolicy {
             allowed.push(AllowedRoot {
                 path: lexical_normalize(Path::new(home)),
                 writable: true,
+                managed_home: true,
             });
         }
         for entry in allow_spec.split(',') {
@@ -120,9 +142,13 @@ impl MountPolicy {
             allowed.push(AllowedRoot {
                 path: lexical_normalize(p),
                 writable,
+                managed_home: false,
             });
         }
-        Self { allowed }
+        Self {
+            allowed,
+            deployment_mount: None,
+        }
     }
 
     /// Vet every wire mount, returning the arguments to hand `docker run -v`.
@@ -179,6 +205,30 @@ impl MountPolicy {
                 lexical.display()
             );
         };
+        // A source that is lexically inside an allowed tree can resolve through
+        // a symlink to an ordinary path outside it. The later Docker bind would
+        // then mount data the operator never allowed. This canonical check only
+        // adds a refusal; it cannot make an unlisted lexical source acceptable.
+        let canonical_rule = resolve_existing_prefix(&rule.path);
+        if !is_under(&canonical_rule, &canonical) {
+            bail!(
+                "mount {mount:?}: host path resolves outside its allowed root {}",
+                rule.path.display()
+            );
+        }
+        if rule.managed_home {
+            if let Some(deployment_mount) = &self.deployment_mount {
+                if !deployment_mount.is_absolute()
+                    || !is_under(deployment_mount, &rule.path)
+                    || !is_under(&resolve_existing_prefix(deployment_mount), &canonical_rule)
+                {
+                    bail!(
+                        "mount {mount:?}: selected home root escaped its deployment mount {}",
+                        deployment_mount.display()
+                    );
+                }
+            }
+        }
 
         let opts = normalize_opts(mount, opts_raw, rule.writable)?;
         Ok(if opts.is_empty() {
@@ -309,6 +359,44 @@ mod tests {
             .check("/var/lib/quasar/homes/alice/steam:/home/quasar")
             .expect("managed home must launch");
         assert_eq!(m, "/var/lib/quasar/homes/alice/steam:/home/quasar");
+    }
+
+    #[test]
+    fn managed_home_mount_refuses_a_symlink_outside_its_allowed_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let homes = dir.path().join("homes");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&homes).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, homes.join("link")).unwrap();
+        let policy = MountPolicy::new(homes.to_str().unwrap(), "");
+        let mount = format!("{}:/home/quasar:rw", homes.join("link/new").display());
+        assert!(
+            policy.check(&mount).is_err(),
+            "escaped home mount was accepted"
+        );
+    }
+
+    #[test]
+    fn managed_home_mount_rechecks_the_selected_root_against_the_deployment_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let mount = dir.path().join("homes");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&mount).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let selected = mount.join("new");
+        let policy = MountPolicy::new_with_deployment_mount(
+            selected.to_str().unwrap(),
+            mount.to_str().unwrap(),
+            "",
+        );
+        // The policy may have been accepted while `new` did not exist.
+        std::os::unix::fs::symlink(&outside, &selected).unwrap();
+        let home = format!("{}:/home/quasar:rw", selected.join("user/app").display());
+        assert!(
+            policy.check(&home).is_err(),
+            "selected root escaped after acceptance"
+        );
     }
 
     #[test]

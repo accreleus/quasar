@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/accreleus/quasar/control-plane/internal/hostcfg"
 	"github.com/gorilla/websocket"
 )
 
@@ -61,14 +63,119 @@ func NewRegistry(log *slog.Logger) *Registry {
 // conn is one live agent connection. A single writer goroutine drains out; all
 // sends enqueue onto it (gorilla allows only one concurrent writer).
 type conn struct {
-	hostID string
-	ws     *websocket.Conn
-	out    chan []byte
-	done   chan struct{}
+	hostID                    string
+	terminalHomeCleanupV1     bool
+	policyTyped               bool
+	policyIdle                bool
+	policyAccepted            []string
+	policyAcknowledged        atomic.Bool
+	policyInitialMapApplied   atomic.Bool
+	policyInventoryDone       atomic.Bool
+	policyInventoryBlocked    atomic.Bool
+	policyInventoryUnknown    bool
+	policyAttemptOutstanding  atomic.Bool
+	policyInventoryID         string
+	policyInventorySnapshotID string
+	policyInventoryCursor     *string
+	policyInventoryHeader     []byte
+	rh05RestartEntries        []hostcfg.JournalInventoryEntry
+	rh05Snapshots             map[string]hostcfg.PolicySnapshot
+	policyActiveSnapshots     atomic.Pointer[map[string]hostcfg.PolicySnapshot]
+	policyOutstanding         map[string]ConfigPolicyStateMsg
+	policySequence            map[string]uint64
+	policySequenceContent     map[string][]byte
+	policyUncertain           bool
+	policyRefreshPending      bool
+	policyDeliveryID          string
+	policyDeliverySentAt      time.Time
+	bootIncarnation           string
+	connectionIncarnation     string
+	ws                        *websocket.Conn
+	out                       chan []byte
+	done                      chan struct{}
 
-	mu     sync.Mutex
-	closed bool
-	acks   map[string]chan AckResult
+	mu                       sync.Mutex
+	closed                   bool
+	acks                     map[string]chan AckResult
+	imageCleanupV1           bool
+	imageVersionsComplete    bool
+	imageVersionsRevision    uint64
+	imageVersionsObservedAt  time.Time
+	imageVersions            []ImageVersionEntry
+	imageReconcilePending    map[string]bool
+	imageReconcileAwaiting   bool
+	imageReconcileAwaitingID string
+	imageReconciledRevision  uint64
+	imageReconciledRequestID string
+}
+
+// SupportsTypedSettings describes the current authenticated connection only.
+// A reconnect with an older agent replaces the capability immediately.
+func (r *Registry) SupportsTypedSettings(hostID string) bool {
+	c, ok := r.get(hostID)
+	return ok && c.policyTyped
+}
+
+// ImageConnectionIdentity identifies the current authenticated agent socket.
+// Image readiness from an earlier socket cannot authorize a new launch.
+func (r *Registry) ImageConnectionIdentity(hostID string) (string, bool) {
+	c, ok := r.get(hostID)
+	if !ok {
+		return "", false
+	}
+	return c.connectionIncarnation, true
+}
+
+func (r *Registry) PolicyIdentity(hostID string) (string, string, bool) {
+	c, ok := r.get(hostID)
+	if !ok || !c.policyTyped {
+		return "", "", false
+	}
+	return c.bootIncarnation, c.connectionIncarnation, true
+}
+
+// PolicyActiveSnapshots returns only the authenticated current connection's
+// completed journal inventory snapshots, keyed by group. The map is never
+// mutated after publication.
+func (r *Registry) PolicyActiveSnapshots(hostID, connectionID string) map[string]hostcfg.PolicySnapshot {
+	c, ok := r.get(hostID)
+	if !ok || !c.policyTyped || c.connectionIncarnation != connectionID || !c.policyInventoryDone.Load() || c.policyInventoryBlocked.Load() || c.policyAttemptOutstanding.Load() {
+		return nil
+	}
+	return c.activePolicySnapshots()
+}
+
+func (c *conn) activePolicySnapshots() map[string]hostcfg.PolicySnapshot {
+	if snapshots := c.policyActiveSnapshots.Load(); snapshots != nil {
+		return *snapshots
+	}
+	return nil
+}
+
+// setActivePolicySnapshot publishes a copy with group replaced; readers on
+// other goroutines keep the map they loaded.
+func (c *conn) setActivePolicySnapshot(group string, snapshot hostcfg.PolicySnapshot) {
+	next := map[string]hostcfg.PolicySnapshot{}
+	for key, value := range c.activePolicySnapshots() {
+		next[key] = value
+	}
+	next[group] = snapshot
+	c.policyActiveSnapshots.Store(&next)
+}
+
+func (r *Registry) PolicyRestartConflict(hostID string) bool {
+	c, ok := r.get(hostID)
+	return ok && c.policyTyped && (!c.policyInventoryDone.Load() || c.policyInventoryBlocked.Load() || c.policyAttemptOutstanding.Load())
+}
+
+// PolicyLegacyDelivery exposes only current-connection writer ownership and
+// whether the initial full-map inventory handshake permits later maps.
+func (r *Registry) PolicyLegacyDelivery(hostID string) (string, []string, bool, bool) {
+	c, ok := r.get(hostID)
+	if !ok || !c.policyTyped {
+		return "", nil, false, false
+	}
+	return c.connectionIncarnation, append([]string(nil), c.policyAccepted...), c.policyAcknowledged.Load() && c.policyInventoryDone.Load() && !c.policyInventoryBlocked.Load(), true
 }
 
 func newConn(hostID string, ws *websocket.Conn) *conn {
@@ -179,6 +286,105 @@ func (r *Registry) IsConnected(hostID string) bool {
 	return ok
 }
 
+// CurrentHomeCleanupCapability describes only the authenticated connection
+// serving this host right now. A disconnected host has no known capability.
+func (r *Registry) CurrentHomeCleanupCapability(hostID string) string {
+	c, ok := r.get(hostID)
+	if !ok {
+		return "unknown"
+	}
+	if c.terminalHomeCleanupV1 {
+		return "supported"
+	}
+	return "unsupported"
+}
+
+// HomeCommandEpoch binds a managed-home command to the exact authenticated
+// agent connection whose cleanup capability was used for the DB decision.
+// The boolean from SendWithAck says a frame entered the socket writer queue;
+// from that point delivery is uncertain even on timeout or disconnect.
+type HomeCommandEpoch interface {
+	SupportsHomeCleanup() bool
+	Send(any) (bool, error)
+	SendWithAck(context.Context, string, any) (AckResult, bool, error)
+}
+
+type homeCommandEpoch struct {
+	registry *Registry
+	conn     *conn
+}
+
+func (e *homeCommandEpoch) SupportsHomeCleanup() bool { return e.conn.terminalHomeCleanupV1 }
+
+func (r *Registry) CurrentHomeCommandEpoch(hostID string) (HomeCommandEpoch, bool) {
+	c, ok := r.get(hostID)
+	if !ok {
+		return nil, false
+	}
+	return &homeCommandEpoch{registry: r, conn: c}, true
+}
+
+func (e *homeCommandEpoch) Send(v any) (bool, error) {
+	var queued bool
+	var sendErr error
+	current := e.registry.withCurrent(e.conn, func() {
+		sendErr = e.conn.enqueue(v)
+		queued = sendErr == nil
+	})
+	if !current {
+		return false, ErrAgentNotConnected
+	}
+	return queued, sendErr
+}
+
+func (e *homeCommandEpoch) SendWithAck(ctx context.Context, id string, v any) (AckResult, bool, error) {
+	c := e.conn
+	r := e.registry
+	ch := make(chan AckResult, 1)
+	var queued bool
+	var enqueueErr error
+	current := r.withCurrent(c, func() {
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			enqueueErr = ErrAgentNotConnected
+			return
+		}
+		c.acks[id] = ch
+		c.mu.Unlock()
+		if err := c.enqueue(v); err != nil {
+			c.mu.Lock()
+			delete(c.acks, id)
+			c.mu.Unlock()
+			enqueueErr = err
+			return
+		}
+		queued = true
+	})
+	if !current {
+		return AckResult{}, false, ErrAgentNotConnected
+	}
+	if enqueueErr != nil {
+		return AckResult{}, false, enqueueErr
+	}
+	defer func() {
+		c.mu.Lock()
+		delete(c.acks, id)
+		c.mu.Unlock()
+	}()
+	select {
+	case result := <-ch:
+		if got, ok := r.get(c.hostID); !ok || got != c {
+			return AckResult{}, queued, ErrAgentNotConnected
+		}
+		return result, queued, nil
+	case <-ctx.Done():
+		return AckResult{}, queued, fmt.Errorf("ack wait for %s: %w", id, ctx.Err())
+	case <-c.done:
+		return AckResult{}, queued, ErrAgentNotConnected
+	}
+}
+
 // Send marshals v and enqueues it to the host's agent (fire-and-forget).
 func (r *Registry) Send(hostID string, v any) error {
 	c, ok := r.get(hostID)
@@ -231,7 +437,23 @@ func (r *Registry) resolveAck(hostID, id string, res AckResult) {
 	if !ok {
 		return
 	}
+	r.resolveAckFromConn(c, id, res)
+}
+
+func (r *Registry) resolveAckFromConn(c *conn, id string, res AckResult) {
+	if current, ok := r.get(c.hostID); !ok || current != c {
+		return
+	}
 	c.mu.Lock()
+	if c.imageReconcilePending[id] {
+		delete(c.imageReconcilePending, id)
+		if res.OK {
+			// The agent updates its scanned inventory before sending this ack.
+			// Its following image_versions_state is ordered on this connection.
+			c.imageReconcileAwaiting = true
+			c.imageReconcileAwaitingID = id
+		}
+	}
 	ch := c.acks[id]
 	c.mu.Unlock()
 	if ch != nil {

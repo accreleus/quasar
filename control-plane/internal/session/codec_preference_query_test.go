@@ -95,8 +95,8 @@ func TestCodecPreferenceArgValues(t *testing.T) {
 		idx    int
 		want   []any
 	}{
-		{PolicySpread, 5, []any{int32(2), int32(20), int32(1024), int32(512), pref, host, image}},
-		{PolicyLocality, 7, []any{int32(2), int32(20), int32(1024), int32(512), user, app, pref, host, image}},
+		{PolicySpread, 5, []any{int32(2), int32(20), int32(1024), int32(512), pref, host, image, app}},
+		{PolicyLocality, 7, []any{int32(2), int32(20), int32(1024), int32(512), user, app, pref, host, image, app}},
 	} {
 		sql, args := c.candidateQuery(tc.policy)
 		if !reflect.DeepEqual(args, tc.want) {

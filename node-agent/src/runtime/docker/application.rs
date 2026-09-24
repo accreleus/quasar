@@ -10,8 +10,8 @@ use bollard::{
         Mount, MountBindOptions, MountType, MountVolumeOptions,
     },
     query_parameters::{
-        CreateContainerOptions, LogsOptions, RemoveContainerOptions, StartContainerOptions,
-        StopContainerOptions,
+        CreateContainerOptions, ListContainersOptions, LogsOptions, RemoveContainerOptions,
+        StartContainerOptions, StopContainerOptions,
     },
 };
 use futures_util::StreamExt;
@@ -1048,10 +1048,15 @@ pub(crate) async fn start(
     let docker = open(config).await?;
     let journal = ApplicationJournal::acquire(config, &request.operation).await?;
     let recovered = journal.read()?;
+    let mut launch_guard = None;
     let mut intent = match recovered.as_ref() {
         Some(intent) if owns(intent, config, &owner) && intent.request == request => intent.clone(),
         Some(_) => return Err(ErrorKind::UnknownOutcome.into()),
         None => {
+            // Exact cleanup holds this same daemon-scoped lock through its
+            // final ref/container checks and rmi. A fresh launch holds it from
+            // image resolution until its container exists.
+            launch_guard = Some(super::image_launch_lock(config).lock_owned().await);
             let image = match docker.inspect_image(&request.image).await {
                 Ok(image) => image,
                 Err(Error::DockerResponseServerError {
@@ -1156,6 +1161,7 @@ pub(crate) async fn start(
             }
         }
     }
+    drop(launch_guard);
     let id = identity(&intent)?;
     let (state, learned_volumes) = inspect_owned(&docker, &intent).await?;
     if intent.image_volume_identities.is_none() && intent.image_volumes.is_some() {
@@ -1794,4 +1800,86 @@ pub(crate) async fn retire(config: &RuntimeConfig) -> Result<(), RuntimeError> {
         }
     }
     failure.map_or(Ok(()), |kind| Err(kind.into()))
+}
+
+fn belongs_to_session(name: &str, session_id: &str) -> bool {
+    let base = format!("quasar-sess-{session_id}");
+    name == base
+        || name
+            .strip_prefix(&format!("{base}-g"))
+            .is_some_and(|generation| {
+                !generation.is_empty() && generation.bytes().all(|b| b.is_ascii_digit())
+            })
+}
+
+/// Retire all source generations recorded for one session. The journal scan
+/// is intentionally conservative: an unreadable record could be this
+/// session's container, so no terminal cleanup proof is emitted in that case.
+pub(crate) async fn retire_session(
+    config: &RuntimeConfig,
+    session_id: &str,
+) -> Result<(), RuntimeError> {
+    let (operations, failure) = scanned_operations(config)?;
+    if let Some(kind) = failure {
+        return Err(kind.into());
+    }
+    let mut targets = Vec::new();
+    for operation in operations {
+        let journal = ApplicationJournal::acquire(config, &operation).await?;
+        let intent = journal.read()?.ok_or(ErrorKind::UnknownOutcome)?;
+        if belongs_to_session(&intent.request.name, session_id) {
+            targets.push(operation);
+        }
+    }
+    for operation in &targets {
+        abandon(config, operation).await?;
+    }
+    for operation in targets {
+        let journal = ApplicationJournal::acquire(config, &operation).await?;
+        let intent = journal.read()?.ok_or(ErrorKind::UnknownOutcome)?;
+        if intent.phase != ApplicationPhase::Completed {
+            return Err(ErrorKind::UnknownOutcome.into());
+        }
+    }
+    // The journal is the authority for deletion, but not sufficient evidence
+    // of absence: a crash or lost journal may leave an unrecorded source.
+    let docker = open(config).await?;
+    let listed = docker
+        .list_containers(Some(ListContainersOptions {
+            all: true,
+            ..Default::default()
+        }))
+        .await
+        .map_err(super::classify)?;
+    for container in listed {
+        let names = container.names.ok_or(ErrorKind::UnknownOutcome)?;
+        if names
+            .iter()
+            .any(|name| belongs_to_session(name.trim_start_matches('/'), session_id))
+        {
+            return Err(ErrorKind::UnknownOutcome.into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod home_cleanup_tests {
+    use super::belongs_to_session;
+
+    #[test]
+    fn source_generation_match_is_exact_to_the_session() {
+        assert!(belongs_to_session("quasar-sess-session-a-g0", "session-a"));
+        assert!(belongs_to_session("quasar-sess-session-a-g12", "session-a"));
+        assert!(belongs_to_session("quasar-sess-session-a", "session-a"));
+        assert!(!belongs_to_session("quasar-sess-session-a-gx", "session-a"));
+        assert!(!belongs_to_session(
+            "quasar-sess-session-a-other",
+            "session-a"
+        ));
+        assert!(!belongs_to_session(
+            "quasar-sess-session-ab-g0",
+            "session-a"
+        ));
+    }
 }

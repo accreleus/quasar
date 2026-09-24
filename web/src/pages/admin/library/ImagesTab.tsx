@@ -383,9 +383,7 @@ export function ImagesTab() {
         const ui = uiFor(img.id);
         const pending = ui.pending !== null;
         const v = imgVersion(img);
-        // A pinned image 409s "image is pinned" on update — the refresh gbtn
-        // falls back to a plain re-ensure rather than offering an update that
-        // can only fail.
+        // A pinned image cannot update. A refresh leaves the adoption intact.
         const isUpdate = img.installed && img.update_available && !img.pinned;
         // The resolver skips non-prebuilt entries, so Install on a template
         // could only ever 409 digest_unresolved. Dim the buttons with an
@@ -402,11 +400,11 @@ export function ImagesTab() {
                   ? notInstallableTitle
                   : isUpdate
                     ? `Update to ${v.version}`
-                    : "Re-ensure on every host"
+                    : "Refresh adoption status"
               }
-              aria-label={isUpdate ? `Update to ${v.version}` : "Re-ensure on every host"}
+              aria-label={isUpdate ? `Update to ${v.version}` : "Refresh adoption status"}
               disabled={pending || !installable}
-              onClick={() => void (isUpdate ? handleUpdate(img) : handleInstall(img))}
+              onClick={() => void (isUpdate ? handleUpdate(img) : img.installed ? catalog.refresh({ silent: true }) : handleInstall(img))}
             >
               <IconRefresh />
             </button>
@@ -425,8 +423,8 @@ export function ImagesTab() {
               <button
                 type="button"
                 className={`gbtn${installable ? " todo" : " dim"}`}
-                title={installable ? "Install on every host" : notInstallableTitle}
-                aria-label="Install on every host"
+                title={installable ? "Install for selected apps" : notInstallableTitle}
+                aria-label="Install for selected apps"
                 disabled={pending || !installable}
                 onClick={() => void handleInstall(img)}
               >
@@ -460,7 +458,7 @@ export function ImagesTab() {
 
   // The head is the Library section's (../Library.tsx); this tab fills it in.
   useSectionHead({
-    sub: "Container images mirrored from the quasar-images catalog. Installs, updates and uninstalls apply to every connected host.",
+    sub: "Container images mirrored from the quasar-images catalog. Installed images prepare on hosts selected for apps that use them.",
     actions: (
       <Button variant="primary" disabled={syncing || !token} onClick={() => void handleSync()}>
         <IconRefresh />
@@ -484,7 +482,7 @@ export function ImagesTab() {
           )}
 
           {/* #548: the manifest is fetched unauthenticated at a MUTABLE ref, so an
-              upstream force-push silently changes what every host installs. Signing
+              upstream force-push silently changes what selected hosts prepare. Signing
               was ruled out (operator decision 2026-08-28); this alert is the whole
               mitigation, so a changed digest must be impossible to miss. */}
           {catalog.data.provenance?.changed && (

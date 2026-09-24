@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/accreleus/quasar/control-plane/internal/admission"
 	"github.com/accreleus/quasar/control-plane/internal/readinessgate"
 )
 
@@ -19,6 +20,16 @@ var ErrNotFound = errors.New("not found")
 
 // ErrAppHasActiveSessions: stop the sessions first; only terminal history cascades.
 var ErrAppHasActiveSessions = errors.New("app has active sessions")
+
+var ErrHomeCleanupPending = errors.New("managed home cleanup is pending")
+
+func homeCleanupDeleteError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "QH001" {
+		return ErrHomeCleanupPending
+	}
+	return err
+}
 
 // ErrAppHasDerivedTiles: deleting a provider app whose tiles weren't opted into
 // (spec §4.1). See deleteApp for why the FK cascade alone isn't enough.
@@ -125,14 +136,15 @@ type App struct {
 
 // Host is the domain view of a host (agent).
 type Host struct {
-	ID             string     `json:"id"`
-	NodeName       string     `json:"node_name"`
-	Status         string     `json:"status"` // online|offline|draining
-	AgentVersion   *string    `json:"agent_version"`
-	CPUCores       *int32     `json:"cpu_cores"`
-	MemMB          *int32     `json:"mem_mb"`
-	LastRegistered *time.Time `json:"last_registered_at"`
-	LastHeartbeat  *time.Time `json:"last_heartbeat_at"`
+	ID                    string                  `json:"id"`
+	NodeName              string                  `json:"node_name"`
+	Status                string                  `json:"status"` // online|offline|draining
+	AdmissionRestrictions []admission.Restriction `json:"admission_restrictions"`
+	AgentVersion          *string                 `json:"agent_version"`
+	CPUCores              *int32                  `json:"cpu_cores"`
+	MemMB                 *int32                  `json:"mem_mb"`
+	LastRegistered        *time.Time              `json:"last_registered_at"`
+	LastHeartbeat         *time.Time              `json:"last_heartbeat_at"`
 	// Storage: agent-reported volumes (schema.md hosts.storage), null until
 	// an amendment-aware agent reports.
 	Storage json.RawMessage `json:"storage"`
@@ -563,11 +575,26 @@ func (s *store) createApp(ctx context.Context, name, desc string, coverURL, kind
 	var id string
 	query := fmt.Sprintf(`INSERT INTO apps (%s) VALUES (%s) RETURNING id::text`,
 		strings.Join(cols, ", "), strings.Join(placeholders, ", "))
-	if err := s.pool.QueryRow(ctx, query, args...).Scan(&id); err != nil {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return App{}, fmt.Errorf("begin app create: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := tx.QueryRow(ctx, query, args...).Scan(&id); err != nil {
 		if translated := appConstraintError(err); translated != nil {
 			return App{}, translated
 		}
 		return App{}, fmt.Errorf("insert app: %w", err)
+	}
+	newRef, err := imageRefForApp(ctx, tx, id)
+	if err != nil {
+		return App{}, fmt.Errorf("read created app image: %w", err)
+	}
+	if err := fenceImageRequirementWrite(ctx, tx, newRef); err != nil {
+		return App{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return App{}, fmt.Errorf("commit app create: %w", err)
 	}
 	return s.getAppFull(ctx, callerID, id)
 }
@@ -817,7 +844,19 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 
 	args = append(args, id)
 	var a App
-	err := s.pool.QueryRow(ctx, query, args...).
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return App{}, fmt.Errorf("begin app update: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	oldRef := ""
+	if enabled != nil || len(runtimeSpec) > 0 || runtimePresetID != nil || parentAppID != nil {
+		oldRef, err = imageRefForApp(ctx, tx, id)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return App{}, fmt.Errorf("read old app image: %w", err)
+		}
+	}
+	err = tx.QueryRow(ctx, query, args...).
 		Scan(&a.ID, &a.Name, &a.Description, &a.CoverURL, &a.HeroURL, &a.Kind,
 			&a.ExternalSource, &a.ExternalID,
 			&a.ParentAppID, &a.Origin, &a.LibraryProvider,
@@ -833,6 +872,18 @@ func (s *store) updateApp(ctx context.Context, id string, name, desc *string, co
 			return App{}, translated
 		}
 		return App{}, fmt.Errorf("update app: %w", err)
+	}
+	if enabled != nil || len(runtimeSpec) > 0 || runtimePresetID != nil || parentAppID != nil {
+		newRef, err := imageRefForApp(ctx, tx, id)
+		if err != nil {
+			return App{}, fmt.Errorf("read new app image: %w", err)
+		}
+		if err := fenceImageRequirementWrite(ctx, tx, oldRef, newRef); err != nil {
+			return App{}, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return App{}, fmt.Errorf("commit app update: %w", err)
 	}
 	return s.getAppFull(ctx, callerID, a.ID)
 }
@@ -1210,6 +1261,9 @@ func (s *store) listHosts(ctx context.Context, cursor string, limit int32) ([]Ho
 	if err := s.attachReadinessGates(ctx, hosts, dbNow); err != nil {
 		return nil, "", err
 	}
+	if err := s.attachAdmissionRestrictions(ctx, hosts); err != nil {
+		return nil, "", err
+	}
 	return hosts, nextCursor, nil
 }
 
@@ -1251,7 +1305,31 @@ func (s *store) getHost(ctx context.Context, id string) (Host, error) {
 	if err := s.attachReadinessGates(ctx, one, dbNow); err != nil {
 		return Host{}, err
 	}
+	if err := s.attachAdmissionRestrictions(ctx, one); err != nil {
+		return Host{}, err
+	}
 	return one[0], nil
+}
+
+func (s *store) attachAdmissionRestrictions(ctx context.Context, hosts []Host) error {
+	if len(hosts) == 0 {
+		return nil
+	}
+	ids := make([]string, len(hosts))
+	for i := range hosts {
+		ids[i] = hosts[i].ID
+	}
+	byHost, err := admission.NewStore(s.pool).ListForHosts(ctx, ids)
+	if err != nil {
+		return fmt.Errorf("read host admission restrictions: %w", err)
+	}
+	for i := range hosts {
+		hosts[i].AdmissionRestrictions = byHost[hosts[i].ID]
+		if hosts[i].AdmissionRestrictions == nil {
+			hosts[i].AdmissionRestrictions = []admission.Restriction{}
+		}
+	}
+	return nil
 }
 
 // deleteApp hard-deletes an app in one transaction: 404 if absent, 409 on any
@@ -1274,7 +1352,8 @@ func (s *store) deleteApp(ctx context.Context, id string, deleteDerived bool) (s
 	defer tx.Rollback(ctx) //nolint:errcheck — no-op after commit
 
 	var name string
-	err = tx.QueryRow(ctx, `SELECT name FROM apps WHERE id::text = $1`, id).Scan(&name)
+	var parentID *string
+	err = tx.QueryRow(ctx, `SELECT name,parent_app_id::text FROM apps WHERE id::text = $1`, id).Scan(&name, &parentID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrNotFound
 	}
@@ -1298,16 +1377,57 @@ func (s *store) deleteApp(ctx context.Context, id string, deleteDerived bool) (s
 	// Also refuses on a session against a derived tile: without this,
 	// deleteDerived=true would cascade a tile out from under a running session.
 	var active int
-	if err := tx.QueryRow(ctx, `
-		SELECT COUNT(*) FROM sessions s
+	sessionRows, err := tx.Query(ctx, `
+		SELECT s.id::text,s.state FROM sessions s
 		JOIN apps a ON a.id = s.app_id
 		WHERE (a.id::text = $1 OR a.parent_app_id::text = $1)
-		  AND s.state NOT IN ('stopped','failed')
-	`, id).Scan(&active); err != nil {
-		return "", fmt.Errorf("count active sessions for app: %w", err)
+		ORDER BY s.id FOR UPDATE OF s
+	`, id)
+	if err != nil {
+		return "", fmt.Errorf("lock app sessions: %w", err)
+	}
+	for sessionRows.Next() {
+		var sessionID, state string
+		if err := sessionRows.Scan(&sessionID, &state); err != nil {
+			sessionRows.Close()
+			return "", err
+		}
+		if state != "stopped" && state != "failed" {
+			active++
+		}
+	}
+	err = sessionRows.Err()
+	sessionRows.Close()
+	if err != nil {
+		return "", fmt.Errorf("read app sessions: %w", err)
 	}
 	if active > 0 {
 		return "", ErrAppHasActiveSessions
+	}
+	if parentID == nil {
+		claimRows, err := tx.Query(ctx, `SELECT pending_home_token IS NOT NULL
+			FROM managed_home_claims WHERE canonical_app_id=$1::uuid
+			ORDER BY user_id,canonical_app_id FOR UPDATE`, id)
+		if err != nil {
+			return "", fmt.Errorf("lock app home claims: %w", err)
+		}
+		var held bool
+		for claimRows.Next() {
+			var pending bool
+			if err := claimRows.Scan(&pending); err != nil {
+				claimRows.Close()
+				return "", err
+			}
+			held = held || pending
+		}
+		err = claimRows.Err()
+		claimRows.Close()
+		if err != nil {
+			return "", fmt.Errorf("read app home claims: %w", err)
+		}
+		if held {
+			return "", ErrHomeCleanupPending
+		}
 	}
 
 	if _, err := tx.Exec(ctx,
@@ -1318,7 +1438,7 @@ func (s *store) deleteApp(ctx context.Context, id string, deleteDerived bool) (s
 	// Delete the app; terminal sessions cascade (migration 0014).
 	tag, err := tx.Exec(ctx, `DELETE FROM apps WHERE id::text = $1`, id)
 	if err != nil {
-		return "", fmt.Errorf("delete app: %w", err)
+		return "", fmt.Errorf("delete app: %w", homeCleanupDeleteError(err))
 	}
 	if tag.RowsAffected() == 0 {
 		return "", ErrNotFound
@@ -1343,7 +1463,7 @@ func (s *store) deleteHost(ctx context.Context, id string) (string, error) {
 	defer tx.Rollback(ctx) //nolint:errcheck — no-op after commit
 
 	var nodeName string
-	err = tx.QueryRow(ctx, `SELECT node_name FROM hosts WHERE id::text = $1`, id).Scan(&nodeName)
+	err = tx.QueryRow(ctx, `SELECT node_name FROM hosts WHERE id::text = $1 FOR UPDATE`, id).Scan(&nodeName)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrNotFound
 	}
@@ -1351,16 +1471,53 @@ func (s *store) deleteHost(ctx context.Context, id string) (string, error) {
 		return "", fmt.Errorf("check host exists: %w", err)
 	}
 
-	var active int
-	if err := tx.QueryRow(ctx, `
-		SELECT COUNT(*) FROM sessions
-		WHERE host_id::text = $1 AND state NOT IN ('stopped','failed')
-	`, id).Scan(&active); err != nil {
-		return "", fmt.Errorf("count active sessions for host: %w", err)
+	// The running callback takes session → claim → home locks. Lock every
+	// nonterminal session in ID order before tombstoning this host's homes;
+	// checking a count without row locks would race the callback's transition.
+	rows, err := tx.Query(ctx, `SELECT id::text FROM sessions
+		WHERE host_id::text=$1 AND state NOT IN ('stopped','failed')
+		ORDER BY id FOR UPDATE`, id)
+	if err != nil {
+		return "", fmt.Errorf("lock host sessions: %w", err)
 	}
-	if active > 0 {
+	var active bool
+	for rows.Next() {
+		var sessionID string
+		if err := rows.Scan(&sessionID); err != nil {
+			rows.Close()
+			return "", fmt.Errorf("scan host session: %w", err)
+		}
+		active = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return "", fmt.Errorf("read host sessions: %w", err)
+	}
+	rows.Close()
+	if active {
 		return "", ErrHostHasActiveSessions
 	}
+	// Home operations take claim before user_homes. The host row lock blocks
+	// new references while these claims are locked, and the delete trigger
+	// marks them conflict before the FK clears host_id.
+	claimRows, err := tx.Query(ctx, `SELECT user_id::text,canonical_app_id::text
+		FROM managed_home_claims WHERE host_id::text=$1
+		ORDER BY user_id,canonical_app_id FOR UPDATE`, id)
+	if err != nil {
+		return "", fmt.Errorf("lock host home claims: %w", err)
+	}
+	for claimRows.Next() {
+		var userID, appID string
+		if err := claimRows.Scan(&userID, &appID); err != nil {
+			claimRows.Close()
+			return "", fmt.Errorf("scan host home claim: %w", err)
+		}
+	}
+	if err := claimRows.Err(); err != nil {
+		claimRows.Close()
+		return "", fmt.Errorf("read host home claims: %w", err)
+	}
+	claimRows.Close()
 
 	if _, err := tx.Exec(ctx,
 		`UPDATE user_homes SET gc_after = now() WHERE host_id::text = $1 AND gc_after IS NULL`, id); err != nil {

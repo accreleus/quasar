@@ -20,11 +20,11 @@
 
 use std::sync::Arc;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
-use crate::jobs::{AbortFlag, JobOutcome, JobRunner};
+use crate::jobs::{AbortFlag, JobOutcome, JobRunner, PendingRun};
 
 use super::{
     log_outcome, AbortCause, GateRefusal, HostActivity, SystemClock, TemplateStoreApi,
@@ -50,6 +50,33 @@ fn allow_cross_filesystem() -> bool {
 /// job-id vocabulary.
 pub const JOB_ID: &str = "template.warmup";
 
+#[derive(Clone, Serialize)]
+struct PermitClaim {
+    publish_claim_token: String,
+    image_id: String,
+    registry_ref: String,
+    version: String,
+    policy_revision: String,
+}
+
+trait TemplatePublishPermit: Send + Sync {
+    fn authorize(&self, run_id: &str, claim: &PermitClaim) -> Result<bool, String>;
+}
+
+struct HttpTemplatePublishPermit(crate::cp_http::CpClient);
+
+impl TemplatePublishPermit for HttpTemplatePublishPermit {
+    fn authorize(&self, run_id: &str, claim: &PermitClaim) -> Result<bool, String> {
+        #[derive(Deserialize)]
+        struct Accepted {
+            authorized: bool,
+        }
+        let path = format!("/v1/agent/jobs/template.warmup/{run_id}/publish-permit");
+        let answer: Accepted = self.0.post_json(&path, claim)?;
+        Ok(answer.authorized)
+    }
+}
+
 /// The `params` blob the control plane stored when it materialized the run,
 /// built at `Ensurer.AgentImageState` from the row that just reached `ready` —
 /// carries exactly the three fields [`WarmupRequest`] needs. A run with no
@@ -70,6 +97,7 @@ struct WarmupParams {
 pub struct WarmupJobRunner {
     cfg: WarmupConfig,
     policy: Option<Arc<crate::source_policy::SourcePolicy>>,
+    permit: Option<Arc<dyn TemplatePublishPermit>>,
     /// `None` when this host has no usable template store (feature off or
     /// `QUASAR_TEMPLATE_ROOT` misconfigured). Still registered, reporting
     /// `skipped` with the reason — "not configured" must not be
@@ -96,6 +124,7 @@ impl WarmupJobRunner {
         WarmupJobRunner {
             cfg,
             policy: None,
+            permit: None,
             store,
             host,
             control,
@@ -107,6 +136,11 @@ impl WarmupJobRunner {
 
     pub fn with_policy(mut self, policy: Arc<crate::source_policy::SourcePolicy>) -> Self {
         self.policy = Some(policy);
+        self
+    }
+
+    pub fn with_publish_client(mut self, cp: crate::cp_http::CpClient) -> Self {
+        self.permit = Some(Arc::new(HttpTemplatePublishPermit(cp)));
         self
     }
 
@@ -124,6 +158,21 @@ impl JobRunner for WarmupJobRunner {
     }
 
     fn run(&self, params: &Value, abort: &AbortFlag) -> JobOutcome {
+        self.run_with_claim(params, abort, None)
+    }
+
+    fn run_claimed(&self, claimed: &PendingRun, abort: &AbortFlag) -> JobOutcome {
+        self.run_with_claim(&claimed.params, abort, Some(claimed))
+    }
+}
+
+impl WarmupJobRunner {
+    fn run_with_claim(
+        &self,
+        params: &Value,
+        abort: &AbortFlag,
+        claimed: Option<&PendingRun>,
+    ) -> JobOutcome {
         // The connection-scoped flag the poller hands every runner, raised only
         // when the poller's connection ends (#492, `JobPollerGuard::drop`). A
         // warm-up also has its own older primitive,
@@ -140,6 +189,27 @@ impl JobRunner for WarmupJobRunner {
             Ok(r) => r,
             Err(e) => return JobOutcome::Failed(e),
         };
+        let publish_claim = claimed.and_then(|run| {
+            run.publish_claim_token.as_ref().map(|token| {
+                (
+                    run.run_id.clone(),
+                    PermitClaim {
+                        publish_claim_token: token.clone(),
+                        image_id: req.image_id.clone(),
+                        registry_ref: req.registry_ref.clone(),
+                        version: req.version.clone(),
+                        policy_revision: params
+                            .get("policy_revision")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    },
+                )
+            })
+        });
+        if publish_claim.is_some() && (self.permit.is_none() || self.policy.is_none()) {
+            return JobOutcome::Deferred("Steam publication authority unavailable".into());
+        }
         let lease = if let Some(policy) = &self.policy {
             let Some(revision) = params.get("policy_revision").and_then(Value::as_str) else {
                 return JobOutcome::Deferred("missing Steam source policy revision".into());
@@ -241,6 +311,7 @@ impl JobRunner for WarmupJobRunner {
             Some(lease) => Arc::new(PolicyStore {
                 inner: store,
                 lease,
+                permit: publish_claim.zip(self.permit.clone()),
             }),
             None => store,
         };
@@ -427,6 +498,7 @@ impl Drop for WarmupConnectionGuard {
 struct PolicyStore {
     inner: Arc<dyn TemplateStoreApi>,
     lease: crate::source_policy::PolicyLease,
+    permit: Option<((String, PermitClaim), Arc<dyn TemplatePublishPermit>)>,
 }
 impl TemplateStoreApi for PolicyStore {
     fn phase(&self, detail: &str) {
@@ -452,12 +524,14 @@ impl TemplateStoreApi for PolicyStore {
         Ok(Box::new(PolicyStaging {
             inner: self.inner.begin_build(id, version)?,
             lease: self.lease.clone(),
+            permit: self.permit.clone(),
         }))
     }
 }
 struct PolicyStaging {
     inner: Box<dyn super::StagingBuildApi>,
     lease: crate::source_policy::PolicyLease,
+    permit: Option<((String, PermitClaim), Arc<dyn TemplatePublishPermit>)>,
 }
 impl super::StagingBuildApi for PolicyStaging {
     fn path(&self) -> &std::path::Path {
@@ -470,8 +544,30 @@ impl super::StagingBuildApi for PolicyStaging {
         self.inner.discard()
     }
     fn publish(self: Box<Self>, meta: super::TemplateMeta) -> std::io::Result<std::path::PathBuf> {
-        let mut inner = Some(self.inner);
-        let result = self.lease.commit(|| inner.take().unwrap().publish(meta));
+        let PolicyStaging {
+            inner,
+            lease,
+            permit,
+        } = *self;
+        let mut inner = Some(inner);
+        if let Some(((run_id, claim), checker)) = &permit {
+            let refusal = match checker.authorize(run_id, claim) {
+                Ok(true) => None,
+                Ok(false) => Some(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "current Steam publication authority refused",
+                )),
+                Err(_) => Some(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "current Steam publication authority unavailable",
+                )),
+            };
+            if let Some(err) = refusal {
+                let _ = inner.take().unwrap().discard();
+                return Err(err);
+            }
+        }
+        let result = lease.commit(|| inner.take().unwrap().publish(meta));
         if let Some(inner) = inner {
             let _ = inner.discard();
         }
@@ -482,6 +578,59 @@ impl super::StagingBuildApi for PolicyStaging {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+
+    struct RefusedPermit;
+    impl TemplatePublishPermit for RefusedPermit {
+        fn authorize(&self, _run_id: &str, _claim: &PermitClaim) -> Result<bool, String> {
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn denied_final_permit_does_not_publish_or_leave_staging() {
+        let (_dir, policy) = crate::source_policy::tests::fixture();
+        let image = crate::source_policy::tests::identity();
+        policy.apply(&crate::source_policy::tests::snapshot("1", true));
+        let store = policy.store().unwrap();
+        let lease = policy.authorize(&image, Some("1"), false).unwrap();
+        let checked = PolicyStore {
+            inner: Arc::new(super::super::StoreAdapter(store.clone())),
+            lease,
+            permit: Some((
+                (
+                    "run".into(),
+                    PermitClaim {
+                        publish_claim_token: "token".into(),
+                        image_id: image.image_id.clone(),
+                        registry_ref: image.registry_ref.clone(),
+                        version: image.version.clone(),
+                        policy_revision: "1".into(),
+                    },
+                ),
+                Arc::new(RefusedPermit),
+            )),
+        };
+        let staging = checked.begin_build("steam", "1").unwrap();
+        let staging_path = staging.path().to_path_buf();
+        std::fs::write(staging.home_dir().join("steam.sh"), "sanitized").unwrap();
+        let result = staging.publish(super::super::TemplateMeta {
+            image_id: image.image_id,
+            registry_ref: image.registry_ref,
+            version: image.version,
+            digest: String::new(),
+            built_at: 1,
+            bytes: 9,
+            files: 1,
+            agent_version: "test".into(),
+            schema: 1,
+        });
+        assert!(result.is_err());
+        assert!(!staging_path.exists(), "refused staging must be discarded");
+        assert!(
+            store.meta("steam").is_none(),
+            "refused template became visible"
+        );
+    }
     #[test]
     fn disabled_revision_cannot_publish_a_finished_staging_tree() {
         let (_dir, policy) = crate::source_policy::tests::fixture();
@@ -492,6 +641,7 @@ mod policy_tests {
         let checked = PolicyStore {
             inner: Arc::new(super::super::StoreAdapter(store.clone())),
             lease,
+            permit: None,
         };
         let staging = checked.begin_build("steam", "1").unwrap();
         let path = staging.path().to_path_buf();

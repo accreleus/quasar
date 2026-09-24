@@ -31,6 +31,9 @@ vi.mock("../../api/admin", () => ({
   unpinImage: vi.fn(),
   updateImage: vi.fn(),
   getSettings: vi.fn(),
+  getHostImageCleanup: vi.fn(),
+  getHostImageCleanupAttempt: vi.fn(),
+  requestHostImageCleanup: vi.fn(),
 }));
 
 import * as adminApi from "../../api/admin";
@@ -109,6 +112,10 @@ function app(over: Partial<AdminApp> = {}): AdminApp {
 
 beforeEach(() => {
   fleetHosts = hosts;
+  vi.mocked(adminApi.getHostImageCleanupAttempt).mockResolvedValue({
+    attempt_id: "a1", image_id: "steam", version: "older", image_ref: "ref-older",
+    runtime_image_id: "sha256:older", generation: "3", state: "removing", reason: null,
+  });
   vi.mocked(adminApi.listRuntimePresets).mockResolvedValue({ items: [] });
   vi.mocked(adminApi.listAdminApps).mockResolvedValue({ items: [], next_cursor: null } as never);
   vi.mocked(adminApi.getSettings).mockResolvedValue({
@@ -125,6 +132,7 @@ describe("ImageDetail", () => {
     const image: CatalogImage = { ...steam, hosts: [{
       host_id: "h1", state: "ready", version: "2026.08.07",
       steam_preparation: {
+        publication_protection: "limited_protection",
         eligible: true, supported: true, desired_enabled: true, desired_revision: "1", applied_revision: "1",
         policy_pending: false, preparation_enabled: true, consumption_enabled: true,
         state: "preparing", reason: "none", detail: "", template: null, clone_mode: "copy",
@@ -194,7 +202,35 @@ describe("ImageDetail", () => {
 
     await waitFor(() => screen.getAllByText("Steam")[0]);
     expect(screen.getByText(/Nothing points at this image/)).toBeInTheDocument();
-    expect(screen.getByText(/Uninstalling it reclaims the space on every host/)).toBeInTheDocument();
+    expect(screen.getByText(/Cached versions can be reviewed per host/)).toBeInTheDocument();
+  });
+
+  it("shows verified protected reasons and requires confirmation before cached removal", async () => {
+    vi.mocked(adminApi.listImages).mockResolvedValue({ images: [steam] } as never);
+    vi.mocked(adminApi.getHostImageCleanup).mockResolvedValue({
+      host_id: "h1", inventory_status: "current", observed_at: "2026-09-24T00:00:00Z", remedy: null,
+      images: [
+        { image_id: "steam", version: "old", image_ref: "ref-old", runtime_image_id: "sha256:old", generation: "2", eligible: false, reasons: ["retained_previous_success"], remedy: "Keep the last working version." },
+        { image_id: "steam", version: "older", image_ref: "ref-older", runtime_image_id: "sha256:older", generation: "2", eligible: true, reasons: [], remedy: null },
+      ],
+    });
+    vi.mocked(adminApi.requestHostImageCleanup).mockResolvedValue({
+      attempt_id: "a1", image_id: "steam", version: "older", image_ref: "ref-older",
+      runtime_image_id: "sha256:older", generation: "3", state: "removing", reason: null,
+    });
+    renderDetail();
+    const row = (await screen.findByText("node-1")).closest("tr")!;
+    fireEvent.click(within(row).getByRole("button", { name: "Manage cache" }));
+    expect(await screen.findByText("Retained as the previous working version")).toBeInTheDocument();
+    expect(screen.getByText("Keep the last working version.")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "Review removal" })).toHaveLength(1);
+    expect(adminApi.requestHostImageCleanup).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Review removal" }));
+    expect(screen.getByText(/Confirm removal of/)).toHaveTextContent("steam older");
+    fireEvent.click(screen.getByRole("button", { name: "Remove this cached version" }));
+    await waitFor(() => expect(adminApi.requestHostImageCleanup).toHaveBeenCalledWith("test-token", "h1", {
+      image_id: "steam", version: "older", image_ref: "ref-older", runtime_image_id: "sha256:older", expected_generation: "2",
+    }));
   });
 
   it("lead action is 'Update to {version}' when installed and an update is available", async () => {
@@ -321,7 +357,7 @@ describe("ImageDetail", () => {
     renderDetail();
 
     await waitFor(() => screen.getAllByText("Steam")[0]);
-    fireEvent.click(screen.getByRole("button", { name: "Uninstall everywhere" }));
+    fireEvent.click(screen.getByRole("button", { name: "Uninstall image" }));
 
     const dialog = await screen.findByRole("dialog");
     expect(adminApi.uninstallImage).not.toHaveBeenCalled();

@@ -17,7 +17,7 @@
 import { useMemo, useState } from "react";
 import * as adminApi from "../../../api/admin";
 import { ApiError } from "../../../api/client";
-import type { AdminHome, StorageProvider } from "../../../api/types";
+import type { AdminHome, AdminHomeClaim, AdminHomeClaimsResponse, StorageProvider } from "../../../api/types";
 import { useAuth } from "../../../auth/context";
 import { ActionsMenu, type ActionsMenuItem } from "../../../components/ActionsMenu";
 import { Bar } from "../../../components/Bar";
@@ -46,6 +46,13 @@ import {
 } from "./storageGroups";
 
 const HOME_GC_JOB_ID = "home.gc";
+
+const CLAIM_REASONS: Record<string, string> = {
+  legacy_location_uncertain: "Recorded locations disagree",
+  claim_owner_missing: "Claimed host was deleted",
+  location_mismatch: "Recorded location differs from claim",
+  gc_pending: "Home pending confirmed cleanup",
+};
 
 const PROVIDER_LABELS: Partial<Record<StorageProvider, string>> = {
   auto: "Automatic",
@@ -76,6 +83,21 @@ export function StorageTab() {
     },
   });
   const homes = res.data ?? [];
+  const [claimCursors, setClaimCursors] = useState<string[]>([""]);
+  const claimCursor = claimCursors[claimCursors.length - 1];
+  const claimsRes = useResource<AdminHomeClaimsResponse & { unsupported?: boolean }>({
+    label: "home ownership",
+    initialData: { items: [], next_cursor: null },
+    fetch: async (ctx) => {
+      try {
+        return await adminApi.listAdminHomeClaims(ctx.token, { limit: 100, cursor: claimCursor });
+      } catch (e: unknown) {
+        if (e instanceof ApiError && e.status === 404) return { items: [], next_cursor: null, unsupported: true };
+        throw e;
+      }
+    },
+  }, [claimCursor]);
+  const claims = claimsRes.data;
   // Feeds the "allocated" KPI sub-line only, off the fleet poll above this page
   // (lib/fleet) rather than a second read that could disagree with it.
   const { hosts } = useFleetContext();
@@ -137,6 +159,7 @@ export function StorageTab() {
       await res.mutate((ctx) => adminApi.tombstoneHome(ctx.token, tombstoning.id));
       setTombstoning(null);
       await res.refresh({ silent: true });
+      await claimsRes.refresh({ silent: true });
     } catch (e: unknown) {
       if (e instanceof ApiError && e.code === "home_in_use") {
         setTombstoneError("Cannot delete. A live session is currently using this home.");
@@ -314,12 +337,29 @@ export function StorageTab() {
     <Table columns={homeColumns} rows={g.homes} rowKey={(h) => h.id} />
   );
 
+  const claimColumns: TableColumn<AdminHomeClaim>[] = [
+    { key: "user", header: "User", render: (c) => <span className="primary" title={c.user_id}>{c.username ?? c.user_id.slice(0, 8)}</span> },
+    { key: "app", header: "App", render: (c) => <span title={c.canonical_app_id}>{c.app_name ?? c.canonical_app_id.slice(0, 8)}</span> },
+    { key: "owner", header: "Claimed host", render: (c) => <span title={c.host_id ?? undefined}>{c.host_name ?? (c.host_id ? c.host_id.slice(0, 8) : "Unknown")}</span> },
+    { key: "state", header: "State", render: (c) => <Chip variant={c.state === "conflict" ? "warning" : c.state === "materialized" ? "success" : "neutral"}>{c.state}</Chip> },
+    { key: "evidence", header: "Evidence", render: (c) => (
+      <div className="qtable-stack">
+        <span>{c.conflict_reason ? CLAIM_REASONS[c.conflict_reason] ?? c.conflict_reason : c.state === "materialized" ? "Running mount observed" : "Ownership reserved"}</span>
+        {c.pending_home_operation && <span className="sub">Cleanup proof pending; this home remains protected</span>}
+        {c.legacy_unprotected_dispatch && <span className="sub">Earlier dispatch lacked cleanup proof</span>}
+        <span className="sub">Agent cleanup capability: {c.home_cleanup_capability ?? "unknown"}</span>
+        <span className="sub">Recorded hosts: {c.recorded_host_ids.length ? c.recorded_host_ids.join(", ") : "none"}</span>
+        {c.materialized_at && <span className="sub">Last mounted {relativeTime(c.materialized_at)}</span>}
+      </div>
+    ) },
+  ];
+
   // The head is the Fleet section's (../Fleet.tsx); this tab fills it in.
   useSectionHead({
     sub: `${homes.length} managed home${homes.length === 1 ? "" : "s"} · ${bytes(totalBytes)} provisioned`,
     actions: (
       <>
-        <Button variant="ghost" onClick={() => void res.refresh()}>Refresh</Button>
+        <Button variant="ghost" onClick={() => { void res.refresh(); void claimsRes.refresh(); }}>Refresh</Button>
         <Button
           onClick={() => setReclaimOpen(true)}
           disabled={pendingHostIds.length === 0}
@@ -413,6 +453,29 @@ export function StorageTab() {
             isExpanded={(g) => expandedKeys.has(g.key)}
             onToggleExpand={(g) => toggleExpand(g.key)}
           />
+          <div className="card" style={{ marginTop: "var(--s5)" }}>
+            <div className="panel-head">
+              <span className="panel-title">Home ownership</span>
+              <span className="hint">Claims can remain after a failed launch. Recorded hosts are bookkeeping, not proof of files.</span>
+            </div>
+            {claims?.unsupported ? (
+              <p className="hint" style={{ padding: "var(--s4)" }}>Ownership diagnosis is unavailable on this control plane.</p>
+            ) : (
+              <>
+                <ResourceStates loading={claimsRes.loading} error={claimsRes.errorMessage} />
+                {!claimsRes.loading && <Table columns={claimColumns} rows={claims?.items ?? []}
+                  rowKey={(c) => `${c.user_id}:${c.canonical_app_id}`}
+                  empty="No home ownership claims on this page." />}
+                <div className="row gap3" style={{ padding: "var(--s4)" }}>
+                  <Button variant="ghost" disabled={claimCursors.length === 1}
+                    onClick={() => setClaimCursors((current) => current.slice(0, -1))}>Previous</Button>
+                  <span className="hint">Page {claimCursors.length}</span>
+                  <Button variant="ghost" disabled={!claims?.next_cursor}
+                    onClick={() => { if (claims?.next_cursor) setClaimCursors((current) => [...current, claims.next_cursor!]); }}>Next</Button>
+                </div>
+              </>
+            )}
+          </div>
         </>
       )}
 

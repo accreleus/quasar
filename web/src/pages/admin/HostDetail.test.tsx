@@ -41,6 +41,7 @@ function host(over: Partial<Host> = {}): Host {
     id: "c2059601",
     node_name: "quasar-node-1",
     status: "online",
+    admission_restrictions: [],
     agent_version: "0.1.0",
     cpu_cores: 16,
     cpu_model: "AMD Ryzen 9 9950X3D",
@@ -148,6 +149,37 @@ afterEach(() => {
 });
 
 describe("HostDetail — head and facts", () => {
+  it("opens managed cached versions from the host even when the catalog image was removed", async () => {
+    mocked.getHostImageCleanup.mockResolvedValue({
+      host_id: "c2059601", inventory_status: "current", observed_at: "2026-09-24T00:00:00Z", remedy: null,
+      images: [{ image_id: "retired-image", version: "old", image_ref: "example/retired@sha256:old",
+        runtime_image_id: "sha256:old", generation: "3", eligible: false,
+        reasons: ["retained_previous_success"], remedy: "Keep the last working version." }],
+    } as never);
+    renderDetail();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Manage cached images" }));
+    expect(await screen.findByText("retired-image")).toBeTruthy();
+    expect(screen.getByText("Retained as the previous working version")).toBeTruthy();
+    expect(mocked.getHostImageCleanup).toHaveBeenCalledWith("tok", "c2059601", expect.any(AbortSignal));
+  });
+
+  it("shows a failed inventory read and recovers when the operator refreshes", async () => {
+    mocked.getHostImageCleanup.mockRejectedValueOnce(new Error("temporary read failure"));
+    mocked.getHostImageCleanup.mockResolvedValue({
+      host_id: "c2059601", inventory_status: "offline", observed_at: null,
+      remedy: "Reconnect the host before cleanup.", images: [],
+    } as never);
+    renderDetail();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Manage cached images" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("could not load cached versions");
+    fireEvent.click(screen.getByRole("button", { name: "Refresh inventory" }));
+    expect(await screen.findByText(/Reconnect the host before cleanup/)).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Review removal" })).toBeNull();
+  });
+
   it("names the host, its hardware and where it came from", async () => {
     renderDetail();
 
@@ -393,12 +425,37 @@ describe("HostDetail — actions", () => {
     await waitFor(() => expect(mocked.drainHost).toHaveBeenCalledWith("tok", "c2059601"));
   });
 
-  it("offers to resume scheduling on a draining host", async () => {
-    mocked.getHost.mockResolvedValue({ host: host({ status: "draining" }) } as never);
+  it("releases only the operator's drain on a draining host", async () => {
+    mocked.getHost.mockResolvedValue({ host: host({ status: "draining", admission_restrictions: [{
+      owner_kind: "manual", reason: "manual_drain", created_at: "2026-08-29T11:00:00Z",
+    }] }) } as never);
     renderDetail();
-    await waitFor(() => expect(screen.getByRole("button", { name: "Resume scheduling" })).toBeTruthy());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Release operator drain" })).toBeTruthy());
 
-    fireEvent.click(screen.getByRole("button", { name: "Resume scheduling" }));
+    fireEvent.click(screen.getByRole("button", { name: "Release operator drain" }));
+    await waitFor(() => expect(mocked.uncordonHost).toHaveBeenCalledWith("tok", "c2059601"));
+  });
+
+  it("explains a platform hold without a universal resume action", async () => {
+    mocked.getHost.mockResolvedValue({ host: host({ status: "draining", admission_restrictions: [{
+      owner_kind: "platform", reason: "platform_apply", created_at: "2026-08-29T11:00:00Z",
+    }] }) } as never);
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("Platform apply")).toBeTruthy());
+    expect(screen.queryByRole("button", { name: /Resume scheduling|Release operator drain/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Add operator drain" }));
+    await waitFor(() => expect(mocked.drainHost).toHaveBeenCalledWith("tok", "c2059601"));
+  });
+
+  it("lets an offline host release its operator hold and renders future reasons safely", async () => {
+    mocked.getHost.mockResolvedValue({ host: host({ status: "offline", admission_restrictions: [
+      { owner_kind: "legacy", reason: "legacy_drain", created_at: "2026-08-29T11:00:00Z" },
+      { owner_kind: "platform", reason: "future_reason" as never, created_at: "2026-08-29T11:01:00Z" },
+    ] }) } as never);
+    renderDetail();
+    await waitFor(() => expect(screen.getByText("Admission hold")).toBeTruthy());
+    expect(screen.getByText(/recorded during upgrade/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Release operator drain" }));
     await waitFor(() => expect(mocked.uncordonHost).toHaveBeenCalledWith("tok", "c2059601"));
   });
 
