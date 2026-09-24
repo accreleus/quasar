@@ -32,6 +32,7 @@ vi.mock("../../api/admin", () => ({
   updateImage: vi.fn(),
   getSettings: vi.fn(),
   getHostImageCleanup: vi.fn(),
+  getHostImageCleanupAttempt: vi.fn(),
   requestHostImageCleanup: vi.fn(),
 }));
 
@@ -111,6 +112,10 @@ function app(over: Partial<AdminApp> = {}): AdminApp {
 
 beforeEach(() => {
   fleetHosts = hosts;
+  vi.mocked(adminApi.getHostImageCleanupAttempt).mockResolvedValue({
+    attempt_id: "a1", image_id: "steam", version: "older", image_ref: "ref-older",
+    runtime_image_id: "sha256:older", generation: "3", state: "removing", reason: null,
+  });
   vi.mocked(adminApi.listRuntimePresets).mockResolvedValue({ items: [] });
   vi.mocked(adminApi.listAdminApps).mockResolvedValue({ items: [], next_cursor: null } as never);
   vi.mocked(adminApi.getSettings).mockResolvedValue({

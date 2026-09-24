@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import * as adminApi from "../../../api/admin";
 import { ApiError } from "../../../api/client";
-import type { HostImageCleanupCandidate, HostImageCleanupView } from "../../../api/types";
+import type { HostImageCleanupAttempt, HostImageCleanupCandidate, HostImageCleanupView } from "../../../api/types";
 import { Button } from "../../../components/Button";
 import { Modal } from "../../../components/Modal";
+import { ResourceStates } from "../../../components/ResourceStates";
+import { useResource } from "../../../lib/resource/react";
 
 const reasonCopy: Record<HostImageCleanupCandidate["reasons"][number], string> = {
   required: "Required by an app or host",
@@ -17,6 +19,15 @@ const reasonCopy: Record<HostImageCleanupCandidate["reasons"][number], string> =
   removing: "Removal is already in progress",
 };
 
+const failureCopy: Record<string, string> = {
+  identity_mismatch: "The verified image identity changed. Refresh the inventory before retrying.",
+  inventory_unknown: "The host inventory is incomplete. Reconnect the host and refresh before retrying.",
+  reference_in_use: "A container reference still uses this image. Stop or remove that reference before retrying.",
+  operation_busy: "Another image operation is active. Wait for it to finish before retrying.",
+  unsupported: "This host does not support exact-version cleanup. Update its agent before retrying.",
+  image_still_present: "The image remains in the daemon. Refresh its inventory before retrying.",
+};
+
 interface Props {
   token: string;
   hostID: string;
@@ -26,32 +37,27 @@ interface Props {
 }
 
 export function ImageCleanupModal({ token, hostID, hostName, imageID, onClose }: Props) {
-  const [view, setView] = useState<HostImageCleanupView | null>(null);
-  const [loading, setLoading] = useState(true);
+  const inventory = useResource<HostImageCleanupView>({
+    label: "cached versions",
+    fetch: (ctx) => adminApi.getHostImageCleanup(ctx.token, hostID, ctx.signal),
+  }, [hostID]);
+  const view = inventory.data;
+  const loading = inventory.loading;
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<HostImageCleanupCandidate | null>(null);
   const [removing, setRemoving] = useState(false);
-  const [result, setResult] = useState<string | null>(null);
-
-  const refresh = useCallback(async (signal?: AbortSignal) => {
-    setLoading(true);
-    try {
-      const next = await adminApi.getHostImageCleanup(token, hostID, signal);
-      setView(next);
-      setError(null);
-    } catch (e) {
-      if (signal?.aborted) return;
-      setError(e instanceof ApiError ? e.message : "Could not load cached versions.");
-    } finally {
-      if (!signal?.aborted) setLoading(false);
-    }
-  }, [hostID, token]);
-
-  useEffect(() => {
-    const ctrl = new AbortController();
-    void refresh(ctrl.signal);
-    return () => ctrl.abort();
-  }, [refresh]);
+  const [requested, setRequested] = useState<HostImageCleanupAttempt | null>(null);
+  const attemptStatus = useResource<HostImageCleanupAttempt | null>({
+    label: "cleanup status",
+    fetch: (ctx) => requested
+      ? adminApi.getHostImageCleanupAttempt(ctx.token, hostID, requested.attempt_id, ctx.signal)
+      : Promise.resolve(null),
+    pollMs: (attempt) => attempt && (attempt.state === "removing" || attempt.state === "unknown") ? 3000 : null,
+  }, [hostID, requested?.attempt_id]);
+  const attempt = attemptStatus.errorMessage ? null : attemptStatus.data ?? requested;
+  const attemptUnavailable = attemptStatus.error instanceof ApiError && attemptStatus.error.status === 404;
+  const pendingState = attempt ?? requested;
+  const attemptPending = !!pendingState && (pendingState.state === "removing" || pendingState.state === "unknown");
 
   async function remove() {
     if (!selected) return;
@@ -64,13 +70,13 @@ export function ImageCleanupModal({ token, hostID, hostName, imageID, onClose }:
         runtime_image_id: selected.runtime_image_id,
         expected_generation: selected.generation,
       });
-      setResult(attempt.state === "removed" ? "Already removed." : "Removal requested. The host will confirm the result.");
+      setRequested(attempt);
       setError(null);
       setSelected(null);
-      await refresh();
+      await inventory.refresh({ silent: true });
     } catch (e) {
       setSelected(null);
-      await refresh();
+      await inventory.refresh({ silent: true });
       setError(e instanceof ApiError && e.status === 409
         ? "The host or image changed. Review the refreshed protection reasons before trying again."
         : e instanceof ApiError ? e.message : "Could not request removal.");
@@ -88,9 +94,24 @@ export function ImageCleanupModal({ token, hostID, hostName, imageID, onClose }:
         {removing ? "Requesting…" : "Remove this cached version"}
       </Button>
     </> : <Button variant="secondary" onClick={onClose}>Close</Button>}>
-    {loading && !view && <p className="hint">Checking the host inventory…</p>}
+    <ResourceStates loading={loading} error={inventory.errorMessage}
+      loadingLabel="Checking the host inventory…" />
     {error && <p className="note" role="alert">{error}</p>}
-    {result && <p className="note" role="status">{result}</p>}
+    {requested && (attemptUnavailable ?
+      <p className="note" role="alert">The prior cleanup outcome is unavailable. Refresh the inventory; absence from the preview does not prove removal.</p> :
+      attemptStatus.errorMessage ?
+        <p className="note" role="alert">Could not check the cleanup outcome. It remains unconfirmed. Check again after reconnecting the host.</p> :
+        <p className="note" role="status">{attempt?.state === "removed"
+          ? "Removal confirmed by the host inventory."
+          : attempt?.state === "failed"
+            ? `Removal failed. ${failureCopy[attempt.reason ?? ""] ?? "Refresh the inventory and inspect the current blocker before retrying."}`
+            : attempt?.state === "unknown"
+              ? "The removal outcome is uncertain. Reconnect the host and restore its cleanup journal, then check again."
+              : "Removal requested. Waiting for the host to confirm the outcome."}</p>)}
+    {requested && (attemptPending || attemptStatus.errorMessage) &&
+      <Button variant="ghost" size="sm" onClick={() => void attemptStatus.refresh()}>
+        Check removal status
+      </Button>}
     {view && <>
       {current ? <p className="hint">Only versions verified on this current host connection are listed.</p> :
         <p className="note" role="status">Inventory {view.inventory_status}. {view.remedy ?? "Reconnect the host and wait for a complete inventory before cleanup."} An empty list does not mean the cache is empty.</p>}
@@ -104,8 +125,8 @@ export function ImageCleanupModal({ token, hostID, hostName, imageID, onClose }:
           {candidate.reasons.map((reason) => <div key={reason}>{reasonCopy[reason]}</div>)}
           {candidate.remedy && <div>{candidate.remedy}</div>}
         </div>}
-        {candidate.eligible && <Button variant="danger" size="sm" disabled={removing || loading}
-          onClick={() => { setSelected(candidate); setResult(null); }}>
+        {candidate.eligible && <Button variant="danger" size="sm" disabled={removing || loading || attemptPending}
+          onClick={() => { setSelected(candidate); }}>
           Review removal
         </Button>}
       </div>)}
@@ -113,7 +134,9 @@ export function ImageCleanupModal({ token, hostID, hostName, imageID, onClose }:
         Confirm removal of <strong>{selected.image_id} {selected.version}</strong> from <strong>{hostName}</strong>.
         The server will recheck references and the host inventory before deletion.
       </p>}
-      <Button variant="ghost" size="sm" disabled={loading || removing} onClick={() => void refresh()}>Refresh inventory</Button>
     </>}
+    <Button variant="ghost" size="sm" disabled={loading || removing} onClick={() => void inventory.refresh()}>
+      Refresh inventory
+    </Button>
   </Modal>;
 }

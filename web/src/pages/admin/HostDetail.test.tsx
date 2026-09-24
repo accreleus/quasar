@@ -149,6 +149,37 @@ afterEach(() => {
 });
 
 describe("HostDetail — head and facts", () => {
+  it("opens managed cached versions from the host even when the catalog image was removed", async () => {
+    mocked.getHostImageCleanup.mockResolvedValue({
+      host_id: "c2059601", inventory_status: "current", observed_at: "2026-09-24T00:00:00Z", remedy: null,
+      images: [{ image_id: "retired-image", version: "old", image_ref: "example/retired@sha256:old",
+        runtime_image_id: "sha256:old", generation: "3", eligible: false,
+        reasons: ["retained_previous_success"], remedy: "Keep the last working version." }],
+    } as never);
+    renderDetail();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Manage cached images" }));
+    expect(await screen.findByText("retired-image")).toBeTruthy();
+    expect(screen.getByText("Retained as the previous working version")).toBeTruthy();
+    expect(mocked.getHostImageCleanup).toHaveBeenCalledWith("tok", "c2059601", expect.any(AbortSignal));
+  });
+
+  it("shows a failed inventory read and recovers when the operator refreshes", async () => {
+    mocked.getHostImageCleanup.mockRejectedValueOnce(new Error("temporary read failure"));
+    mocked.getHostImageCleanup.mockResolvedValue({
+      host_id: "c2059601", inventory_status: "offline", observed_at: null,
+      remedy: "Reconnect the host before cleanup.", images: [],
+    } as never);
+    renderDetail();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Manage cached images" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("could not load cached versions");
+    fireEvent.click(screen.getByRole("button", { name: "Refresh inventory" }));
+    expect(await screen.findByText(/Reconnect the host before cleanup/)).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Review removal" })).toBeNull();
+  });
+
   it("names the host, its hardware and where it came from", async () => {
     renderDetail();
 
