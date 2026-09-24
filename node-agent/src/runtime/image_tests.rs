@@ -100,6 +100,66 @@ fn serve(
 }
 
 #[test]
+fn absent_managed_local_tag_fails_without_asking_docker_to_pull() {
+    let tag = "quasar-local/steam-template:one";
+    let inspect = format!("GET /v1.48/images/{tag}/json");
+    let (_dir, config, server) = serve(vec![discovery(), reply(&inspect, 404, ABSENT)]);
+    let runtime = RuntimeClient::new(config).unwrap();
+    assert_eq!(
+        runtime
+            .ensure_image(tag, Duration::from_secs(2))
+            .wait(|_| {})
+            .unwrap_err()
+            .kind,
+        ErrorKind::Missing
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn present_managed_local_tag_is_reused_without_a_pull() {
+    let tag = "quasar-local/steam-template:one";
+    let inspect = format!("GET /v1.48/images/{tag}/json");
+    let (_dir, config, server) = serve(vec![discovery(), reply(&inspect, 200, PRESENT)]);
+    let runtime = RuntimeClient::new(config).unwrap();
+    assert_eq!(
+        runtime
+            .ensure_image(tag, Duration::from_secs(2))
+            .wait(|_| {})
+            .unwrap()
+            .id,
+        "sha256:fixture"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn absent_registry_digest_still_requests_a_pull() {
+    let reference = "registry.example/app@sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    let inspect = format!("GET /v1.48/images/{reference}/json");
+    let pull = format!(
+        "POST /v1.48/images/create?fromImage=registry.example%2Fapp%40sha256%3A{}&platform=",
+        "1".repeat(64)
+    );
+    let (_dir, config, server) = serve(vec![
+        discovery(),
+        reply(&inspect, 404, ABSENT),
+        reply(&pull, 200, ""),
+        reply(&inspect, 200, PRESENT),
+    ]);
+    let runtime = RuntimeClient::new(config).unwrap();
+    assert_eq!(
+        runtime
+            .ensure_image(reference, Duration::from_secs(2))
+            .wait(|_| {})
+            .unwrap()
+            .id,
+        "sha256:fixture"
+    );
+    server.join().unwrap();
+}
+
+#[test]
 fn server_failure_after_pull_submission_is_an_unknown_outcome() {
     let (_dir, config, server) = serve(vec![
         discovery(),
