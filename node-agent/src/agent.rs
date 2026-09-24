@@ -139,6 +139,14 @@ pub async fn run(cfg: Config) {
         std::process::exit(1);
     }
 
+    // Consume a restart journal marker once per process, before probes or
+    // session runtime initialization can observe the affected hardware group.
+    let policy_path = std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path));
+    // Consume any restart marker before loading runtime policy. A corrupt
+    // journal or a requested recovery restart is handled after the independent
+    // startup container and managed-home cleanup has run.
+    let policy_boot = crate::policy::PolicyAgent::bootstrap(&policy_path);
+
     crate::runtime::initialize_image_state(
         format!("{}.runtime-images", cfg.node_secret_path).into(),
     );
@@ -180,7 +188,7 @@ pub async fn run(cfg: Config) {
 
     // Returns only once the cleanup has succeeded; everything below is withheld until then.
     if let Some(station) = crate::diagnostic::Station::enter(&first_cleanup) {
-        run_diagnostic_mode(&cfg, &health, &station).await;
+        run_diagnostic_mode(&cfg, &health, &station, true, None).await;
     }
 
     // Install mode + updater presence, for the startup identity banner;
@@ -203,7 +211,7 @@ pub async fn run(cfg: Config) {
     // (the ephemeral-username shape) that no live container mounts and that are
     // past the retention window — a real account's home is never a candidate.
     // Process-level: it must run whether or not this agent reaches the control plane.
-    if crate::diagnostic::may_start(crate::diagnostic::Work::HomesGc) {
+    if policy_boot.is_ok() && crate::diagnostic::may_start(crate::diagnostic::Work::HomesGc) {
         crate::session::homes_gc::spawn_sweeper();
     }
 
@@ -266,7 +274,9 @@ pub async fn run(cfg: Config) {
     // Materialise a missing NVIDIA graphics userspace into the driver volume. The
     // trigger is the readiness check set itself, so what provisions and what the
     // admin card shows can never disagree.
-    if crate::diagnostic::may_start(crate::diagnostic::Work::DriverVolumeProvisioner) {
+    if policy_boot.is_ok()
+        && crate::diagnostic::may_start(crate::diagnostic::Work::DriverVolumeProvisioner)
+    {
         spawn_nvidia_volume_provisioner(&runtime, &nvidia_lib32_probed);
     }
 
@@ -274,7 +284,9 @@ pub async fn run(cfg: Config) {
     // immediately on a CDI-injected host, and NVRTC is needed on those too. The two
     // share the volume and nothing else (separate lock, manifest, backoff), so
     // running them concurrently is safe.
-    if crate::diagnostic::may_start(crate::diagnostic::Work::CudaRuntimeProvisioner) {
+    if policy_boot.is_ok()
+        && crate::diagnostic::may_start(crate::diagnostic::Work::CudaRuntimeProvisioner)
+    {
         spawn_cuda_runtime_provisioner(&runtime);
     }
 
@@ -337,6 +349,93 @@ pub async fn run(cfg: Config) {
     // This task never adopts or stops a running application; boot retirement above
     // remains the fail-closed policy for applications left by a previous agent.
     let _application_cleanup_guard = spawn_application_cleanup_recovery();
+
+    let policy_boot = match policy_boot {
+        Ok(crate::policy::BootOutcome::Recovery(id)) => {
+            info!(token = "policy-recovery-restart", attempt_id = %id,
+                "restarting once to activate the last verified hardware configuration");
+            std::process::exit(0);
+        }
+        Ok(outcome) => outcome,
+        Err(crate::policy::BootError::Write(error)) => {
+            error!(token = "policy-journal-write-failed",
+                    "host configuration journal could not be updated after independent cleanup: {error}");
+            let station = crate::diagnostic::Station::policy_journal_write_failed();
+            run_diagnostic_mode(&cfg, &health, &station, false, Some(&image_mgr)).await;
+            return;
+        }
+        Err(error) => {
+            error!(
+                token = "policy-journal-corrupt",
+                "host configuration journal cannot be loaded after independent cleanup: {error}"
+            );
+            let station = crate::diagnostic::Station::policy_journal_corrupt();
+            run_diagnostic_mode(&cfg, &health, &station, false, Some(&image_mgr)).await;
+            return;
+        }
+    };
+    if matches!(
+        policy_boot,
+        crate::policy::BootOutcome::Candidate(_) | crate::policy::BootOutcome::RecoveryVerify(_)
+    ) {
+        let mut settings = crate::session::settings::RuntimeSettings::baseline();
+        seed_nvidia_lib32(&mut settings, &nvidia_lib32_probed);
+        let mut verifier = match crate::policy::PolicyAgent::open(
+            policy_path,
+            String::new(),
+            String::new(),
+            String::new(),
+            &mut settings,
+        ) {
+            Ok(agent) => agent,
+            Err(error) => {
+                error!(
+                    token = "policy-boot-open-failed",
+                    "cannot load policy for startup verification: {error}"
+                );
+                health.set_not_ready(Some("configuration verification unavailable".into()));
+                return;
+            }
+        };
+        let prepared = match verifier.prepare_boot(&policy_boot, &settings) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                error!(
+                    token = "policy-boot-prepare-failed",
+                    "cannot prepare startup verification: {error}"
+                );
+                health.set_not_ready(Some("configuration verification unavailable".into()));
+                return;
+            }
+        };
+        let result = match prepared {
+            crate::policy::BootPreparation::Complete(result) => Ok(result),
+            crate::policy::BootPreparation::Verify(readback) => {
+                let proved = verify_hardware_boot(readback.settings().clone()).await;
+                verifier.complete_boot(*readback, proved, &mut settings)
+            }
+        };
+        match result {
+            Ok(crate::policy::BootOutcome::Recovery(id)) => {
+                info!(token = "policy-recovery-restart", attempt_id = %id,
+                    "candidate failed startup verification; restarting once to restore the last verified hardware configuration");
+                std::process::exit(0);
+            }
+            Ok(crate::policy::BootOutcome::Uncertain(id)) => {
+                warn!(token = "policy-recovery-uncertain", attempt_id = %id,
+                    "hardware recovery is unverified; admission remains protected");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                error!(
+                    token = "policy-boot-verification-failed",
+                    "cannot persist startup verification: {error}"
+                );
+                health.set_not_ready(Some("configuration verification unavailable".into()));
+                return;
+            }
+        }
+    }
 
     let mut backoff = Duration::from_secs(1);
     // #199: see `EnrollmentFallback` — one token attempt per stale-secret reject.
@@ -969,6 +1068,75 @@ fn detect_capacity_blocking() -> capacity::SystemCapacity {
     cap
 }
 
+/// A restart marker is proved before registration. This uses fresh device
+/// inventory and a bounded media child in the new process; prior connection
+/// probe results are deliberately not reused as startup proof.
+async fn verify_hardware_boot(settings: crate::session::settings::RuntimeSettings) -> bool {
+    if settings.render_node == "software" {
+        if settings.encoder != EncoderChoice::Openh264 {
+            return false;
+        }
+        let probed = offload_probe(move || probe_host_codecs(&settings)).await;
+        return probed.is_some_and(|report| report.codecs.iter().any(|codec| codec == "h264"));
+    }
+    let inventory = offload_probe(detect_capacity_blocking).await.gpus;
+    verify_boot_device_with(&settings, &inventory, |spec| async move {
+        let (_sender, preempt) = tokio::sync::watch::channel(false);
+        matches!(
+            crate::host_probe::media::run(None, spec, preempt).await,
+            Ok(crate::host_probe::outcome::ChildEnd::Exited { code: 0, .. })
+        )
+    })
+    .await
+}
+
+async fn verify_boot_device_with<F, Fut>(
+    settings: &crate::session::settings::RuntimeSettings,
+    inventory: &[crate::messages::GpuCapacity],
+    probe: F,
+) -> bool
+where
+    F: FnOnce(crate::host_probe::child::ChildSpec) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut matching = inventory.iter().filter(|gpu| {
+        (gpu.render_node.as_deref() == Some(settings.render_node_configured.as_str())
+            || gpu.render_node.as_deref() == Some(settings.render_node.as_str())
+            || gpu.device_path.as_deref() == Some(settings.render_node.as_str()))
+            && gpu.encode_slots_total > 0
+            && gpu
+                .driver_identity
+                .as_ref()
+                .is_some_and(|id| !id.is_empty())
+    });
+    let Some(gpu) = matching.next() else {
+        return false;
+    };
+    if matching.next().is_some() {
+        return false;
+    }
+    if std::fs::File::open(gpu.device_path.as_deref().unwrap_or(&settings.render_node)).is_err() {
+        return false;
+    }
+    let spec = match crate::host_probe::media::child_spec(
+        settings,
+        inventory,
+        gpu.index,
+        None,
+        Duration::from_secs(45),
+    ) {
+        Ok(spec) => spec,
+        Err(error) => {
+            warn!(
+                token = "policy-boot-probe-unavailable",
+                "cannot construct hardware startup probe: {error:#}"
+            );
+            return false;
+        }
+    };
+    probe(spec).await
+}
+
 /// Is a degraded vulkan codec plan the expected first-boot shape (driver volume still
 /// provisioning, so the Vulkan ICD is invisible to the registry scan) or an image
 /// defect? Pure so it is testable without the module's process-global state;
@@ -1368,15 +1536,14 @@ fn register_message(
     images: Vec<crate::messages::RegisterImageEntry>,
     install: &crate::buildinfo::InstallFacts,
     home_cleanup_capable: bool,
+    policy_available: bool,
 ) -> anyhow::Result<AgentMsg> {
     Ok(AgentMsg::Register {
         source_policy_versions: Some(serde_json::json!({"steam_preparation": 1})),
-        config_policy_versions: Some(
-            serde_json::json!({"typed_settings":2,"execution_journal":1,"deployment_baseline":1}),
-        ),
-        config_policy_groups: Some(crate::policy::PolicyAgent::advertised_groups(
-            &std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path)),
-        )),
+        config_policy_versions: policy_available.then(||
+            serde_json::json!({"typed_settings":2,"execution_journal":1,"deployment_baseline":1,"idle_apply":1})),
+        config_policy_groups: policy_available.then(|| crate::policy::PolicyAgent::advertised_groups(
+            &std::path::PathBuf::from(format!("{}.policy.json", cfg.node_secret_path)))),
         terminal_home_cleanup_v1: home_cleanup_capable.then_some(true),
         node_name: cfg.node_name.clone(),
         agent_version: crate::buildinfo::version().to_string(),
@@ -1460,12 +1627,14 @@ where
 /// itself, and every pass forks the same probes a normal refresh does.
 const DIAGNOSTIC_CAPACITY_REFRESH: Duration = Duration::from_secs(60);
 
-/// Hold this process in diagnostic registration until its startup cleanup succeeds
-/// (CONTEXT.md). Returns only on resume, after which normal startup continues in `run`.
+/// Hold this process in diagnostic registration. Startup cleanup retries can
+/// resume normal startup; a corrupt policy journal remains here for operator repair.
 async fn run_diagnostic_mode(
     cfg: &Config,
     health: &Arc<HealthState>,
     station: &Arc<crate::diagnostic::Station>,
+    cleanup_retry: bool,
+    image_mgr: Option<&Arc<ImageManager>>,
 ) {
     crate::diagnostic::install_process_wide(station);
     let phase = station.phase();
@@ -1473,25 +1642,26 @@ async fn run_diagnostic_mode(
         crate::diagnostic::Phase::Diagnostic(fault) => fault.code(),
         crate::diagnostic::Phase::Normal => "none",
     };
-    error!(
-        token = "boot-diagnostic-mode",
-        fault,
-        "the startup cleanup did not resolve, so this host enters DIAGNOSTIC MODE: it \
-         registers and reports, and refuses every launch. Withheld until it resumes: \
-         managed-home GC, the NVIDIA driver-volume and CUDA-runtime provisioners, image \
-         pulls and pruning, and host probes. {} The agent retries the cleanup on its own \
-         and resumes without a restart.",
-        phase.launch_refusal().unwrap_or_default()
-    );
+    if cleanup_retry {
+        error!(token = "boot-diagnostic-mode", fault,
+            "startup cleanup is unresolved; diagnostic registration refuses every launch and retries cleanup. {}",
+            phase.launch_refusal().unwrap_or_default());
+    } else {
+        error!(token = "boot-policy-journal-diagnostic", fault,
+            "host configuration journal is unreadable; diagnostic registration refuses every launch until operator repair and agent restart. {}",
+            phase.launch_refusal().unwrap_or_default());
+    }
     health.set_not_ready(phase.launch_refusal());
 
     // Independent of the control plane by construction: this task is what resumes the
     // host, and it never reads a connection.
-    let retry = tokio::spawn(crate::diagnostic::retry_until_resumed(
-        station.clone(),
-        crate::diagnostic::startup_cleanup_configured,
-        crate::diagnostic::RetryPace::PRODUCTION,
-    ));
+    let retry = cleanup_retry.then(|| {
+        tokio::spawn(crate::diagnostic::retry_until_resumed(
+            station.clone(),
+            crate::diagnostic::startup_cleanup_configured,
+            crate::diagnostic::RetryPace::PRODUCTION,
+        ))
+    });
 
     let mut backoff = Duration::from_secs(1);
     // #199: see `EnrollmentFallback` — one token attempt per stale-secret reject.
@@ -1501,7 +1671,7 @@ async fn run_diagnostic_mode(
             biased;
             () = station.resumed() => break,
             attempt = diagnostic_connection(
-                cfg, health, station, enrollment_fallback.take_for_attempt(),
+                cfg, health, station, enrollment_fallback.take_for_attempt(), image_mgr,
             ) => attempt,
         };
         let Err(error) = attempt else { break };
@@ -1535,13 +1705,17 @@ async fn run_diagnostic_mode(
         }
         backoff = (wait * 2).min(Duration::from_secs(30));
     }
-    retry.abort();
-    info!(
-        token = "boot-diagnostic-resumed",
-        "the startup cleanup succeeded; leaving diagnostic mode and continuing normal startup"
-    );
-    health.set_ready();
-    health.set_connected(false);
+    if let Some(retry) = retry {
+        retry.abort();
+    }
+    if cleanup_retry {
+        info!(
+            token = "boot-diagnostic-resumed",
+            "the startup cleanup succeeded; leaving diagnostic mode and continuing normal startup"
+        );
+        health.set_ready();
+        health.set_connected(false);
+    }
 }
 
 /// One diagnostic control-plane connection. Reads nothing from the container runtime it
@@ -1552,6 +1726,7 @@ async fn diagnostic_connection(
     health: &Arc<HealthState>,
     station: &Arc<crate::diagnostic::Station>,
     prefer_enrollment_token: bool,
+    image_mgr: Option<&Arc<ImageManager>>,
 ) -> anyhow::Result<crate::diagnostic::ConnectionEnd> {
     log_connect_intent(cfg);
     let images = crate::images::register_images_from_state(&cfg.image_state_path());
@@ -1568,7 +1743,14 @@ async fn diagnostic_connection(
             cfg,
             &mut tx,
             &mut rx,
-            register_message(cfg, prefer_enrollment_token, images, &install, false)?,
+            register_message(
+                cfg,
+                prefer_enrollment_token,
+                images,
+                &install,
+                false,
+                station.phase().policy_available(),
+            )?,
         )
         .await?;
     health.set_connected(true);
@@ -1592,6 +1774,7 @@ async fn diagnostic_connection(
             }
         },
         DIAGNOSTIC_CAPACITY_REFRESH,
+        image_mgr,
     )
     .await
 }
@@ -1721,6 +1904,7 @@ async fn connect_and_run(
                 images,
                 &install,
                 sessions.mgr.home_cleanup.is_some(),
+                true,
             )?,
         )
         .await?;
@@ -1752,7 +1936,9 @@ async fn connect_and_run(
             anyhow::bail!("RH05 ownership echo invalid");
         }
     }
-    sessions.mgr.policy_session_ready = policy_identity.is_none() && !policy.has_sticky_ownership();
+    sessions.mgr.policy_session_ready = policy_identity.is_none()
+        && !policy.has_sticky_ownership()
+        && !policy.has_uncertain_restart();
     sessions.mgr.policy_accepted_groups = policy_groups;
     sessions.mgr.policy_delivery_ack = None;
     sessions.mgr.policy_inventory_complete = false;
@@ -2185,6 +2371,11 @@ async fn connect_and_run(
                         // Handled here, not in handle_control, so the ack flushes before
                         // the process exits. The restart policy brings us back.
                         if let ControlMsg::Restart { id } = &ctrl {
+                            if mgr.policy_agent.as_ref().is_some_and(|policy| policy.has_open_restart()) {
+                                send(&mut tx, &AgentMsg::Ack { id: id.clone(), ok: false,
+                                    error: Some("attempt_conflict".into()) }).await?;
+                                continue;
+                            }
                             info!("restart requested (cmd {id}); acking then exiting for config reload");
                             let reply = AgentMsg::Ack { id: id.clone(), ok: true, error: None };
                             let _ = send(&mut tx, &reply).await;
@@ -2195,7 +2386,32 @@ async fn connect_and_run(
                         // before handle_control consumes ctrl.
                         let was_config_update = matches!(ctrl, ControlMsg::ConfigUpdate { .. });
                         if let Some(reply) = mgr.handle_control(ctrl, evt_tx, diagnostic_tx) {
-                            send_control_reply(&mut tx, &mut *mgr, reply).await?;
+                            let restart_accepted = matches!(&reply, AgentMsg::ConfigPolicyState {
+                                scope, phase, ..
+                            } if scope == "restart" && phase == "awaiting_startup");
+                            let restart_requires_reconcile = matches!(&reply, AgentMsg::ConfigPolicyState {
+                                scope, phase, ..
+                            } if scope == "restart" && phase == "accepted");
+                            let journal_uncertain = matches!(&reply, AgentMsg::ConfigPolicyState {
+                                scope, phase, error, ..
+                            } if scope == "restart" && phase == "failed" && error.as_deref() == Some("journal_write_failed"));
+                            let reply_result = send_control_reply(&mut tx, &mut *mgr, reply).await;
+                            if journal_uncertain {
+                                warn!(token = "policy-journal-write-uncertain", "journal write failed; restarting to reconcile durable execution before another offer");
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                std::process::exit(1);
+                            }
+                            if restart_requires_reconcile {
+                                warn!(token = "policy-accepted-reconcile", "restart attempt is durably accepted without an activation marker; restarting for bounded reconciliation");
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                std::process::exit(1);
+                            }
+                            if restart_accepted {
+                                info!(token = "policy-candidate-restart", "durable hardware candidate accepted; restarting for startup verification");
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                std::process::exit(0);
+                            }
+                            reply_result?;
                         }
                         for report in mgr.home_cleanup_reports.drain(..) {
                             send(&mut tx, &report).await?;
@@ -2908,6 +3124,30 @@ struct RunningHandle {
 }
 
 impl SessionManager {
+    fn restart_idle(&self) -> bool {
+        if !self.policy_session_ready
+            || !self.policy_inventory_complete
+            || !self.pending.is_empty()
+            || !self.running.is_empty()
+            || self.warmup_reserved()
+            || self.image_mgr.has_in_flight_operations()
+        {
+            return false;
+        }
+        self.source_policy
+            .as_ref()
+            .and_then(|policy| policy.report())
+            .and_then(|report| report.pointer("/steam/images").cloned())
+            .and_then(|images| images.as_array().cloned())
+            .is_some_and(|images| {
+                images.iter().all(|image| {
+                    !matches!(
+                        image["state"].as_str(),
+                        Some("queued" | "preparing" | "waiting_image" | "deferred" | "failed")
+                    )
+                })
+            })
+    }
     fn new(
         live_refs: LiveRefs,
         health: Arc<HealthState>,
@@ -3891,8 +4131,12 @@ impl SessionManager {
                                         self.policy_inventory_complete
                                             && policy.sticky_groups_accepted(groups)
                                             && (!groups.is_empty() || !policy.has_seed())
+                                            && !policy.has_uncertain_restart()
                                     }
-                                    None => !policy.has_sticky_ownership(),
+                                    None => {
+                                        !policy.has_sticky_ownership()
+                                            && !policy.has_uncertain_restart()
+                                    }
                                 };
                                 if let Some(group) = conflict {
                                     feature_error = Some(AgentMsg::ConfigPolicyFeatureError {
@@ -3987,10 +4231,24 @@ impl SessionManager {
                     settings,
                     resolved_settings,
                 };
-                let reply = self
-                    .policy_agent
-                    .as_mut()
-                    .map(|policy| policy.accept(offer, &mut self.runtime_settings));
+                let restart_idle = self.restart_idle();
+                let readiness = self.readiness.merged();
+                let hardware = crate::policy::HardwareEvidence {
+                    gpus: &self.gpu_inventory,
+                    readiness: &readiness,
+                };
+                let reply = self.policy_agent.as_mut().map(|policy| {
+                    if offer.scope == "restart" {
+                        policy.accept_restart(
+                            offer,
+                            &self.runtime_settings,
+                            restart_idle,
+                            Some(hardware),
+                        )
+                    } else {
+                        policy.accept(offer, &mut self.runtime_settings)
+                    }
+                });
                 if matches!(&reply, Some(AgentMsg::ConfigPolicyState { phase, .. }) if phase == "applied")
                 {
                     // The same launch boundary as the legacy map path: new homes
@@ -5269,6 +5527,43 @@ mod tests {
     use super::*;
     use crate::session::{AbrMode, EncoderChoice};
 
+    #[tokio::test]
+    async fn restart_readback_requires_open_device_and_fresh_passing_media_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("render-node");
+        std::fs::write(&device, b"device").unwrap();
+        let path = device.to_str().unwrap();
+        let mut settings = crate::session::settings::RuntimeSettings::baseline_with(&|_| None);
+        settings.apply_json(&serde_json::json!({"encoder":"va","render_node":path}));
+        let gpu = crate::messages::GpuCapacity {
+            index: 0,
+            vendor: "amd".into(),
+            model: "test".into(),
+            vram_mb_total: 1,
+            encode_slots_total: 1,
+            render_node: Some(path.into()),
+            device_path: Some(path.into()),
+            driver_identity: Some("driver:test".into()),
+            codecs: None,
+        };
+        let inventory = [gpu];
+        assert!(verify_boot_device_with(&settings, &inventory, |_| async { true }).await);
+        assert!(!verify_boot_device_with(&settings, &inventory, |_| async { false }).await);
+        std::fs::remove_file(device).unwrap();
+        let called = std::cell::Cell::new(false);
+        assert!(
+            !verify_boot_device_with(&settings, &inventory, |_| {
+                called.set(true);
+                async { true }
+            })
+            .await
+        );
+        assert!(
+            !called.get(),
+            "an inaccessible device must not spawn a media child"
+        );
+    }
+
     #[test]
     fn failed_application_retirement_prevents_audio_and_legacy_sweep_before_admission() {
         let calls = std::cell::RefCell::new(Vec::new());
@@ -5384,6 +5679,42 @@ mod tests {
             webpki_from_blob: false,
             startup_warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn journal_diagnostics_register_without_policy_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        let cfg = test_cfg(path.to_str().unwrap(), Some("enrollment-token"));
+        let normal = register_message(
+            &cfg,
+            false,
+            Vec::new(),
+            &crate::buildinfo::InstallFacts::default(),
+            true,
+            true,
+        )
+        .unwrap();
+        let normal = serde_json::to_value(normal).unwrap();
+        for station in [
+            crate::diagnostic::Station::policy_journal_corrupt(),
+            crate::diagnostic::Station::policy_journal_write_failed(),
+        ] {
+            let diagnostic = register_message(
+                &cfg,
+                false,
+                Vec::new(),
+                &crate::buildinfo::InstallFacts::default(),
+                false,
+                station.phase().policy_available(),
+            )
+            .unwrap();
+            let diagnostic = serde_json::to_value(diagnostic).unwrap();
+            assert!(diagnostic.get("config_policy_versions").is_none());
+            assert!(diagnostic.get("config_policy_groups").is_none());
+        }
+        assert!(normal.get("config_policy_versions").is_some());
+        assert!(normal.get("config_policy_groups").is_some());
     }
 
     /// A pinned `Config` for the pin-file tests.

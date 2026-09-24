@@ -66,6 +66,7 @@ type conn struct {
 	hostID                    string
 	terminalHomeCleanupV1     bool
 	policyTyped               bool
+	policyIdle                bool
 	policyAccepted            []string
 	policyAcknowledged        atomic.Bool
 	policyInitialMapApplied   atomic.Bool
@@ -84,6 +85,7 @@ type conn struct {
 	policySequence            map[string]uint64
 	policySequenceContent     map[string][]byte
 	policyUncertain           bool
+	policyRefreshPending      bool
 	policyDeliveryID          string
 	policyDeliverySentAt      time.Time
 	bootIncarnation           string

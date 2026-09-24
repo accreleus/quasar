@@ -353,6 +353,7 @@ async fn a_resume_published_inside_the_blocking_observe_still_ends_the_connectio
                     (capacity_template(), Vec::new())
                 },
                 Duration::from_millis(10),
+                None,
             )
             .await
         })
