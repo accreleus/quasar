@@ -689,7 +689,17 @@ func (s *Store) hostStates(ctx context.Context) (map[string][]ImageHostState, er
 		return nil, err
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT hi.image_id, hi.host_id::text, h.node_name, hi.version, hi.state, hi.error, hi.bytes, h.source_policy_versions, h.source_preparation, h.source_preparation_reported_at, (h.status='online' AND h.agent_disconnected_at IS NULL)
+		SELECT hi.image_id, hi.host_id::text, h.node_name, hi.version, hi.state, hi.error, hi.bytes, h.source_policy_versions, h.source_preparation, h.source_preparation_reported_at, (h.status='online' AND h.agent_disconnected_at IS NULL),
+		 COALESCE((SELECT jr.state='succeeded' AND jr.publish_permit_accepted_at IS NOT NULL
+		   AND jr.template_publish_claim_token IS NOT NULL
+		   FROM job_runs jr JOIN instance_settings s ON s.id=true
+		   WHERE jr.job_id='template.warmup' AND jr.host_id=hi.host_id
+		   AND jr.claimed_at IS NOT NULL
+		   AND jr.params->>'image_id'=hi.image_id
+		   AND jr.params->>'version'=hi.version
+		   AND jr.params->>'policy_revision'=s.steam_preparation_revision::text
+		   AND jr.params->>'registry_ref'=s.steam_preparation_image->>'registry_ref'
+		   ORDER BY jr.claimed_at DESC,jr.id DESC LIMIT 1),false)
 		FROM host_images hi
 		JOIN hosts h ON h.id = hi.host_id
 		ORDER BY h.node_name, hi.host_id
@@ -708,8 +718,9 @@ func (s *Store) hostStates(ctx context.Context) (map[string][]ImageHostState, er
 			hs               ImageHostState
 			version, eMsg    string
 			bytes            *int64
+			permitSucceeded  bool
 		)
-		if err := rows.Scan(&imageID, &hs.HostID, &hs.NodeName, &version, &hs.State, &eMsg, &bytes, &versions, &report, &reportedAt, &online); err != nil {
+		if err := rows.Scan(&imageID, &hs.HostID, &hs.NodeName, &version, &hs.State, &eMsg, &bytes, &versions, &report, &reportedAt, &online, &permitSucceeded); err != nil {
 			return nil, fmt.Errorf("scan host_images row: %w", err)
 		}
 		if version != "" {
@@ -721,7 +732,7 @@ func (s *Store) hostStates(ctx context.Context) (map[string][]ImageHostState, er
 			hs.Error = &e
 		}
 		hs.Bytes = bytes
-		projection := preparation.Project(policy, imageID, versions, report, reportedAt, online)
+		projection := preparation.Project(policy, imageID, versions, report, reportedAt, online, permitSucceeded)
 		hs.SteamPreparation = &projection
 		out[imageID] = append(out[imageID], hs)
 	}

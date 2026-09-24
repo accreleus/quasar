@@ -203,6 +203,9 @@ pub enum AgentMsg {
         /// with the `--rm` container and are unrecoverable.
         #[serde(skip_serializing_if = "Option::is_none")]
         app_log_tail: Option<String>,
+        /// Actual initial Steam managed-home provisioning outcome, when known.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        home_seed: Option<crate::session::home::HomeSeedOutcome>,
     },
     /// P1-7 signaling relay: wrap a Phase 0 inner message (offer/ice/…) for the
     /// control-plane relay, which unwraps and forwards it to the browser.
@@ -1623,12 +1626,35 @@ mod tests {
             error: None,
             reason_code: None,
             app_log_tail: None,
+            home_seed: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         let obj = json.as_object().unwrap();
         assert!(!obj.contains_key("reason_code"));
         assert!(!obj.contains_key("app_log_tail"));
         assert!(!obj.contains_key("error"));
+        assert!(!obj.contains_key("home_seed"));
+    }
+
+    #[test]
+    fn initial_home_seed_uses_only_closed_codes_on_the_wire() {
+        let msg = AgentMsg::SessionState {
+            session_id: "s1".to_string(),
+            state: "starting".to_string(),
+            detail: None,
+            error: None,
+            reason_code: None,
+            app_log_tail: None,
+            home_seed: Some(crate::session::home::HomeSeedOutcome {
+                mode: "copy",
+                reason: "seeded",
+            }),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            json["home_seed"],
+            serde_json::json!({"mode":"copy","reason":"seeded"})
+        );
     }
 
     #[test]
@@ -1640,6 +1666,7 @@ mod tests {
             error: Some("the app exited with code 0 before producing any video.".to_string()),
             reason_code: Some("app_exited_early".to_string()),
             app_log_tail: Some("Steam needs to be online to update\nexiting".to_string()),
+            home_seed: None,
         };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["reason_code"], "app_exited_early");

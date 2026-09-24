@@ -52,21 +52,22 @@ type Reports struct {
 	Steam Report `json:"steam"`
 }
 type Projection struct {
-	Detail             string     `json:"detail"`
-	Eligible           bool       `json:"eligible"`
-	Supported          bool       `json:"supported"`
-	DesiredEnabled     bool       `json:"desired_enabled"`
-	DesiredRevision    string     `json:"desired_revision"`
-	AppliedRevision    *string    `json:"applied_revision"`
-	PolicyPending      bool       `json:"policy_pending"`
-	PreparationEnabled *bool      `json:"preparation_enabled"`
-	ConsumptionEnabled *bool      `json:"consumption_enabled"`
-	State              string     `json:"state"`
-	Reason             string     `json:"reason"`
-	Template           *Template  `json:"template"`
-	CloneMode          *string    `json:"clone_mode"`
-	CloneReason        *string    `json:"clone_reason"`
-	ReportedAt         *time.Time `json:"reported_at"`
+	Detail                string     `json:"detail"`
+	Eligible              bool       `json:"eligible"`
+	Supported             bool       `json:"supported"`
+	DesiredEnabled        bool       `json:"desired_enabled"`
+	DesiredRevision       string     `json:"desired_revision"`
+	AppliedRevision       *string    `json:"applied_revision"`
+	PolicyPending         bool       `json:"policy_pending"`
+	PreparationEnabled    *bool      `json:"preparation_enabled"`
+	ConsumptionEnabled    *bool      `json:"consumption_enabled"`
+	PublicationProtection string     `json:"publication_protection"`
+	State                 string     `json:"state"`
+	Reason                string     `json:"reason"`
+	Template              *Template  `json:"template"`
+	CloneMode             *string    `json:"clone_mode"`
+	CloneReason           *string    `json:"clone_reason"`
+	ReportedAt            *time.Time `json:"reported_at"`
 }
 
 // ConnectionContext binds reports to one authenticated websocket generation.
@@ -119,7 +120,11 @@ func (s *Store) Register(ctx context.Context, host string, versions map[string]i
 	}
 	var value any
 	if versions["steam_preparation"] == 1 {
-		value = map[string]int{"steam_preparation": 1}
+		capabilities := map[string]int{"steam_preparation": 1}
+		if versions["template_publish_permit"] == 1 {
+			capabilities["template_publish_permit"] = 1
+		}
+		value = capabilities
 	}
 	_, err := s.pool.Exec(ctx, `UPDATE hosts SET source_policy_versions=$2,source_preparation=NULL,source_preparation_reported_at=NULL,source_preparation_connection_id=$3 WHERE id=$1::uuid`, host, value, connectionID(ctx))
 	return err
@@ -251,12 +256,23 @@ func Params(ctx context.Context, db DB, host string) (map[string]any, error) {
  AND h.source_preparation->'steam'->>'policy_revision'=$2
  AND hi.image_id=$3 AND hi.version=$4 AND hi.state='ready'
  AND EXISTS (SELECT 1 FROM jsonb_array_elements(h.source_preparation->'steam'->'images') r
- WHERE r->>'image_id'=$3 AND r->>'registry_ref'=$5 AND r->>'version'=$4 AND r->>'preparation_enabled'='true'))`, host, p.Revision, i.ImageID, i.Version, i.RegistryRef).Scan(&ready)
+ WHERE r->>'image_id'=$3 AND r->>'registry_ref'=$5 AND r->>'version'=$4 AND r->>'preparation_enabled'='true')
+ AND EXISTS (SELECT 1 FROM apps a
+ JOIN apps effective ON effective.id=COALESCE(a.parent_app_id,a.id)
+ JOIN app_placement ap ON ap.app_id=effective.id
+ LEFT JOIN runtime_presets rp ON rp.id=effective.runtime_preset_id
+ WHERE a.enabled AND effective.enabled
+ AND (CASE WHEN jsonb_typeof(effective.runtime_spec->'image')='string'
+           AND effective.runtime_spec->>'image'<>''
+       THEN effective.runtime_spec->>'image' ELSE NULLIF(rp.image,'') END)=$5
+ AND (ap.mode='all_eligible' OR EXISTS (
+   SELECT 1 FROM app_placement_hosts aph
+   WHERE aph.app_id=ap.app_id AND aph.host_id=$1::uuid))))`, host, p.Revision, i.ImageID, i.Version, i.RegistryRef).Scan(&ready)
 	if err != nil {
 		return nil, err
 	}
 	if !ready {
-		return nil, errors.New("Steam preparation awaits a ready image and current host policy acknowledgement")
+		return nil, errors.New("Steam preparation awaits a selected ready image and current host policy acknowledgement")
 	}
 	return map[string]any{"image_id": i.ImageID, "registry_ref": i.RegistryRef, "version": i.Version, "policy_revision": p.Revision}, nil
 }
@@ -279,8 +295,8 @@ func (s *Store) AllowJob(ctx context.Context, host string, raw json.RawMessage) 
 	}
 	return nil
 }
-func Project(p Policy, imageID string, versions []byte, raw []byte, at *time.Time, online bool) Projection {
-	out := Projection{DesiredEnabled: p.Enabled, DesiredRevision: p.Revision, State: "unknown", Reason: "agent_upgrade_required", ReportedAt: at}
+func Project(p Policy, imageID string, versions []byte, raw []byte, at *time.Time, online bool, permitSucceeded bool) Projection {
+	out := Projection{DesiredEnabled: p.Enabled, DesiredRevision: p.Revision, State: "unknown", Reason: "agent_upgrade_required", ReportedAt: at, PublicationProtection: "limited_protection"}
 	var v map[string]int
 	_ = json.Unmarshal(versions, &v)
 	out.Supported = v["steam_preparation"] == 1
@@ -312,6 +328,9 @@ func Project(p Policy, imageID string, versions []byte, raw []byte, at *time.Tim
 			out.ConsumptionEnabled = &i.ConsumptionEnabled
 			out.Detail = i.Detail
 			out.Template = i.Template
+			if v["template_publish_permit"] == 1 && permitSucceeded && i.State == "ready" && i.Template != nil && i.Template.RegistryRef == p.Images[0].RegistryRef && i.Template.Version == p.Images[0].Version && !out.PolicyPending {
+				out.PublicationProtection = "verified"
+			}
 			out.CloneMode = i.CloneMode
 			out.CloneReason = i.CloneReason
 			if !out.PolicyPending {

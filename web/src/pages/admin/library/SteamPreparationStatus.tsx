@@ -55,6 +55,11 @@ export function SteamPreparationStatus({ status, desiredEnabled }: { status?: St
       {state === "queued" && <p className="hint" style={{ margin: 0 }}>Waiting for this host to start preparation.</p>}
       {status.detail && !pending && <p className="hint" style={{ margin: 0, overflowWrap: "anywhere" }}>{status.detail}</p>}
       {ready && <p className="hint" style={{ margin: 0 }}>Prepared version: {status.template!.version}</p>}
+      {ready && <p className="hint" style={{ margin: 0 }}>
+        {status.publication_protection === "verified"
+          ? "Selected-requirement publication check verified for this prepared version."
+          : "Prepared template reported; its selected-requirement publication check is unverified. Older agents retain preparation with limited protection."}
+      </p>}
       {pending && status.reported_at && <p className="hint" style={{ margin: 0 }}>Last observed {new Date(status.reported_at).toLocaleString()}; this report does not confirm the current setting.</p>}
       {status.clone_mode && (
         <p className="hint" style={{ margin: 0 }}>

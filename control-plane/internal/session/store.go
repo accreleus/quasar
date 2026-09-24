@@ -207,6 +207,7 @@ type Session struct {
 	// AppLogTail (migration 0062) is the app container's last ~100 log lines,
 	// newline-joined. The ONLY copy: app containers run with `--rm` (#463).
 	AppLogTail  *string
+	HomeSeed    json.RawMessage
 	Width       int32
 	Height      int32
 	FPS         int32
@@ -1409,7 +1410,7 @@ func (s *Store) UpdateSessionNegotiatedCodec(ctx context.Context, id, codec stri
 // RETURNING, kept in lockstep with scanSessionRow's Scan order.
 const sessionCols = `id::text, user_id::text, app_id::text, host_id::text, gpu_id::text,
 	state, state_detail, error_message,
-	failure_code, app_log_tail,
+	failure_code, app_log_tail, home_seed,
 	width, height, fps, bitrate_kbps, h264_profile,
 	codec,
 	profile_id,
@@ -1466,7 +1467,7 @@ func scanSessionRow(r row, extra ...any) (Session, error) {
 	dest := []any{
 		&s.ID, &s.UserID, &s.AppID, &s.HostID, &s.GPUID,
 		&st, &s.StateDetail, &s.ErrorMessage,
-		&s.FailureCode, &s.AppLogTail,
+		&s.FailureCode, &s.AppLogTail, &s.HomeSeed,
 		&s.Width, &s.Height, &s.FPS, &s.BitrateKbps, &s.H264Profile,
 		&s.Codec,
 		&s.ProfileID,

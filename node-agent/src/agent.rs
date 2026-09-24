@@ -1539,7 +1539,7 @@ fn register_message(
     policy_available: bool,
 ) -> anyhow::Result<AgentMsg> {
     Ok(AgentMsg::Register {
-        source_policy_versions: Some(serde_json::json!({"steam_preparation": 1})),
+        source_policy_versions: Some(serde_json::json!({"steam_preparation": 1, "template_publish_permit": 1})),
         config_policy_versions: policy_available.then(||
             serde_json::json!({"typed_settings":2,"execution_journal":1,"deployment_baseline":1,"idle_apply":1})),
         config_policy_groups: policy_available.then(|| crate::policy::PolicyAgent::advertised_groups(
@@ -2149,20 +2149,18 @@ async fn connect_and_run(
     );
     let _source_policy_guard = crate::source_policy::ConnectionGuard(source_policy.clone());
     mgr.source_policy = Some(source_policy.clone());
-    let warmup_runner = Arc::new(
-        crate::session::warmup::WarmupJobRunner::new(
-            crate::session::warmup::WarmupConfig::from_env(),
-            warmup_store.clone(),
-            Arc::new(crate::session::warmup::host::AgentWarmupHost::new(
-                ContainerRuntime::from_env(),
-                mgr.runtime_settings.clone(),
-            )),
-            warmup_control.clone(),
-            warmup_activity.clone(),
-            app_uid_gid(),
-        )
-        .with_policy(source_policy.clone()),
-    );
+    let warmup_runner = crate::session::warmup::WarmupJobRunner::new(
+        crate::session::warmup::WarmupConfig::from_env(),
+        warmup_store.clone(),
+        Arc::new(crate::session::warmup::host::AgentWarmupHost::new(
+            ContainerRuntime::from_env(),
+            mgr.runtime_settings.clone(),
+        )),
+        warmup_control.clone(),
+        warmup_activity.clone(),
+        app_uid_gid(),
+    )
+    .with_policy(source_policy.clone());
     mgr.warmup_activity = Some(warmup_activity);
     mgr.warmup_control = Some(warmup_control.clone());
     mgr.note_session_count();
@@ -2233,7 +2231,7 @@ async fn connect_and_run(
         }
         Some(Ok(cp)) => {
             let mut registry = crate::jobs::JobRegistry::new();
-            registry.register(warmup_runner);
+            registry.register(Arc::new(warmup_runner.with_publish_client(cp.clone())));
             registry.register(std::sync::Arc::new(
                 crate::session::gc::HomeGcJobRunner::new(cp.clone(), live_refs.clone()),
             ));
@@ -4423,6 +4421,7 @@ impl SessionManager {
                 error: Some("runner thread ended without reporting a terminal state".to_string()),
                 reason_code: None,
                 app_log_tail: None,
+                home_seed: None,
             });
         }
         self.health.set_sessions(self.running.len());
@@ -4556,10 +4555,17 @@ impl SessionManager {
                 // Omitted entirely when empty: an empty array renders as an empty
                 // log panel that reads as a broken feature rather than a silent app.
                 app_log_tail: (!app_log_tail.is_empty()).then(|| app_log_tail.join("\n")),
+                home_seed: None,
             };
         }
+        let home_seed = if let SessionEvent::HomeSeed(outcome) = &event {
+            Some(*outcome)
+        } else {
+            None
+        };
         let (state, detail, error) = match event {
             SessionEvent::Starting => ("starting", Some("building pipeline".to_string()), None),
+            SessionEvent::HomeSeed(_) => ("starting", None, None),
             SessionEvent::Progress(detail) => ("starting", Some(detail.to_string()), None),
             SessionEvent::Running => {
                 if let Some(handle) = self.running.get_mut(session_id) {
@@ -4615,6 +4621,7 @@ impl SessionManager {
             error,
             reason_code: None,
             app_log_tail: None,
+            home_seed,
         }
     }
 }
@@ -4712,6 +4719,7 @@ fn qualified_home_terminal(
         error: None,
         reason_code: None,
         app_log_tail: None,
+        home_seed: None,
     }
 }
 

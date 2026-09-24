@@ -414,7 +414,22 @@ func (d *Dispatcher) finish(parent context.Context, run Run, out Outcome, runErr
 // in-process executor and the agent pull channel's report endpoint take, so
 // "what happens after a run ends" has one implementation.
 func (d *Dispatcher) Report(ctx context.Context, runID string, state State, summary any, errText string) (Run, error) {
-	run, applied, err := d.store.Report(ctx, runID, state, summary, errText)
+	return d.report(ctx, runID, state, summary, errText, nil, true)
+}
+
+func (d *Dispatcher) ReportAgent(ctx context.Context, runID string, state State, summary any, errText string, token *string) (Run, error) {
+	return d.report(ctx, runID, state, summary, errText, token, false)
+}
+
+func (d *Dispatcher) report(ctx context.Context, runID string, state State, summary any, errText string, token *string, internal bool) (Run, error) {
+	var run Run
+	var applied bool
+	var err error
+	if internal {
+		run, applied, err = d.store.Report(ctx, runID, state, summary, errText)
+	} else {
+		run, applied, err = d.store.ReportAgent(ctx, runID, state, summary, errText, token)
+	}
 	if err != nil {
 		return Run{}, err
 	}
