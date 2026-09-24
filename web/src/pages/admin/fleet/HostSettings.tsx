@@ -29,7 +29,7 @@ import { IdleApplyPolicy } from "./settings/IdleApplyPolicy";
 import { SafeSettingsPolicy } from "./settings/SafeSettingsPolicy";
 import type { SettingValue } from "./settings/knobs";
 
-/** The restart-scope hardware group; typed next-session policy never owns it. */
+/** Hardware stays on the legacy editor until this host confirms typed ownership. */
 const RESTART_GROUP_KEYS = new Set(["encoder", "render_node", "cuda_device"]);
 
 export function HostSettings() {

@@ -61,6 +61,23 @@ describe("safe next-session settings", () => {
     await waitFor(() => expect(onOwnedKeys).toHaveBeenLastCalledWith(new Set(["gop", "abr_mode", "zerocopy"])));
   });
 
+  it("lets an operator save Automatic hardware through the revisioned writer", async () => {
+    const hardware = group("pending", { scope: "restart", approval_preview: {
+      available: true, resolved: { encoder: "vulkan", render_node: "/dev/dri/renderD129" },
+    } });
+    vi.mocked(api.getHostPolicy).mockResolvedValue(view({ hardware }) as never);
+    vi.mocked(api.updateHostPolicy).mockResolvedValue(view({ hardware }) as never);
+    const onOwnedKeys = renderPolicy();
+    const encoder = await screen.findByRole("group", { name: "Encoder" });
+    expect(within(encoder).getByText(/Current hardware evidence supports encoder: vulkan/)).toBeTruthy();
+    fireEvent.change(within(encoder).getByLabelText("Encoder source"), { target: { value: "automatic" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save policy settings" }));
+    await waitFor(() => expect(api.updateHostPolicy).toHaveBeenCalledWith("admin-token", "host-1", "4", {
+      encoder: { source: "automatic" },
+    }));
+    await waitFor(() => expect(onOwnedKeys).toHaveBeenLastCalledWith(new Set(["gop", "abr_mode", "zerocopy", "encoder"])));
+  });
+
   it("saves several groups as one revisioned edit and leaves application to each group", async () => {
     vi.mocked(api.updateHostPolicy).mockResolvedValue(view({ gop: group("pending"), abr_mode: group("pending") }) as never);
     renderPolicy();

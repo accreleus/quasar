@@ -92,6 +92,28 @@ func (s *Store) ConfirmPolicyGroups(ctx context.Context, hostID, connectionID st
 		return false, err
 	}
 	for _, group := range accepted {
+		if group == "hardware" {
+			// The zero-revision upgrade-required hardware row is a durable
+			// fresh-enrollment marker. Migration 0087 never backfills group rows,
+			// and a legacy edit increments the revision. Only confirmed RH05
+			// hardware ownership may turn this new installation's supported
+			// choices Automatic; existing hosts retain deployment intent.
+			seeded, err := tx.Exec(ctx, `INSERT INTO host_setting_choices(host_id,key,source,revision)
+				SELECT $1::uuid,k.key,'automatic',0 FROM (VALUES ('encoder'),('render_node')) AS k(key)
+				WHERE EXISTS (SELECT 1 FROM host_setting_groups g JOIN host_policy_revisions r ON r.host_id=g.host_id
+					WHERE g.host_id=$1::uuid AND g.group_key='hardware' AND g.desired_revision=0
+					AND g.scope='restart' AND g.status='upgrade_required' AND r.revision=0)
+				AND NOT EXISTS (SELECT 1 FROM host_setting_choices c WHERE c.host_id=$1::uuid)`, hostID)
+			if err != nil {
+				return false, err
+			}
+			if seeded.RowsAffected() > 0 {
+				if _, err := tx.Exec(ctx, `INSERT INTO host_approval_review_tokens(host_id,group_key,review_id)
+					VALUES ($1::uuid,'hardware',gen_random_uuid()) ON CONFLICT (host_id,group_key) DO NOTHING`, hostID); err != nil {
+					return false, err
+				}
+			}
+		}
 		cmd, err := tx.Exec(ctx, `UPDATE host_setting_groups SET status='pending' WHERE host_id=$1::uuid AND group_key=$2 AND status='upgrade_required'`, hostID, group)
 		if err != nil {
 			return false, err

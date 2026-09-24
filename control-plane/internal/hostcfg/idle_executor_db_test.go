@@ -2,6 +2,7 @@ package hostcfg
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -408,6 +409,10 @@ func TestIdleExecutorReconnectClosesUnstartedFailureAndApprovalTogether(t *testi
 		ErrorCode: "prerequisite_mismatch"}
 	if err := store.CompleteJournalReconciliation(ctx, hostID, second, []JournalInventoryEntry{entry},
 		map[string]PolicySnapshot{"hardware": {Kind: "seeded", Digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ObserveDeploymentSettings(ctx, hostID, second,
+		json.RawMessage(`{"encoder":"openh264","render_node":"","cuda_device":0}`)); err != nil {
 		t.Fatal(err)
 	}
 	status, err := store.GetIdleApply(ctx, hostID, approved.AttemptID)

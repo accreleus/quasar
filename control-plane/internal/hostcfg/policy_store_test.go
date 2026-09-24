@@ -62,6 +62,80 @@ func TestPolicySaveIdleTimeoutCASAndDurableObligation(t *testing.T) {
 	}
 }
 
+func TestExistingHostCanChooseAutomaticOnlyAfterTypedHardwareOwnership(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	ctx := context.Background()
+	before, err := store.GetPolicy(ctx, hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Choices["encoder"].Source != "deployment" || before.Groups["hardware"].Status != "upgrade_required" {
+		t.Fatalf("legacy hardware policy = %+v", before)
+	}
+	confirmPolicyGroups(t, pool, hostID, "hardware")
+	owned, err := store.GetPolicy(ctx, hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owned.Groups["hardware"].Scope != "restart" || owned.Groups["hardware"].Status != "pending" {
+		t.Fatalf("typed hardware group missing before first edit: %+v", owned.Groups["hardware"])
+	}
+	saved, err := store.SavePolicy(ctx, hostID, owned.Revision, map[string]PolicyChoice{
+		"encoder": {Source: "automatic"}, "render_node": {Source: "automatic"},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Choices["encoder"].Source != "automatic" || saved.Choices["render_node"].Source != "automatic" || saved.Groups["hardware"].Status != "pending" {
+		t.Fatalf("automatic hardware edit = %+v", saved)
+	}
+	if resolved := saved.Resolved["encoder"].(map[string]any); resolved["value"] != nil {
+		t.Fatalf("unobserved automatic candidate was presented as resolved: %+v", resolved)
+	}
+}
+
+func TestPolicyReadSeparatesObservedValueFromAutomaticHardwarePreview(t *testing.T) {
+	pool := testPool(t)
+	store := NewStore(pool)
+	hostID := seedHost(t, pool)
+	confirmPolicyGroups(t, pool, hostID, "hardware", "gop")
+	ctx := context.Background()
+	if _, err := store.SavePolicy(ctx, hostID, "0", map[string]PolicyChoice{
+		"encoder": {Source: "automatic"}, "render_node": {Source: "automatic"},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartRH05Boot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	completeEmptyHostJournal(t, store, hostID)
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET effective_settings='{"encoder":"va","gop":"90"}'::jsonb,
+		last_registered_at=now()-interval '1 minute' WHERE id=$1::uuid`, hostID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ObserveHardwareReport(ctx, hostID, "00000000-0000-4000-8000-000000000338",
+		json.RawMessage(`[{"index":0,"vendor":"AMD","render_node":"/dev/dri/renderD129","driver_identity":"amdgpu:test","encode_slots_total":1}]`),
+		json.RawMessage(`[{"id":"media_probe_gpu0","status":"pass","source":"host_probe","observed_at":"2026-09-23T16:00:00Z"}]`)); err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.GetPolicy(ctx, hostID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed := view.Resolved["gop"].(map[string]any)["value"]; observed != "90" {
+		t.Fatalf("deployment-sourced setting lost observed value: %v", observed)
+	}
+	if current := view.Resolved["encoder"].(map[string]any)["value"]; current != nil {
+		t.Fatalf("unapproved Automatic candidate appeared effective: %v", current)
+	}
+	preview, ok := view.Groups["hardware"].ApprovalPreview.(*ApprovalPreview)
+	if !ok || !preview.Available || preview.Resolved["encoder"] != "vulkan" {
+		t.Fatalf("Automatic candidate absent from review preview: %+v", view.Groups["hardware"].ApprovalPreview)
+	}
+}
+
 func TestConcurrentPolicyEditsOnlyOneWins(t *testing.T) {
 	pool := testPool(t)
 	store := NewStore(pool)

@@ -162,6 +162,7 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 	// agent_disconnected_at is cleared so a re-enrolling node never carries a
 	// stale pending disconnect into its first reconnect.
 	var hostID string
+	var newlyCreated bool
 	err = tx.QueryRow(ctx, `
 		INSERT INTO hosts (node_name, agent_version, node_secret_hash, status, last_registered_at, capacity_detection, agent_process_started_at)
 		VALUES ($1, $2, $3, 'online', now(), 'unavailable', now())
@@ -177,10 +178,19 @@ func (s *agentStore) enrollHost(ctx context.Context, nodeName, agentVersion, tok
 		        ,agent_restart_count      = 0
 		        ,agent_last_restart_at    = NULL
 		        ,agent_disconnected_at    = NULL
-		RETURNING id::text
-	`, nodeName, agentVersion, secretHash).Scan(&hostID)
+		RETURNING id::text, (xmax = 0)
+	`, nodeName, agentVersion, secretHash).Scan(&hostID, &newlyCreated)
 	if err != nil {
 		return registerResult{}, fmt.Errorf("upsert host: %w", err)
+	}
+	if newlyCreated {
+		// Only a genuinely new installation carries this unedited marker.
+		// Automatic choices are inserted after this host proves RH05 hardware
+		// capability on its authenticated connection, never on enrollment alone.
+		if _, err := tx.Exec(ctx, `INSERT INTO host_setting_groups(host_id,group_key,desired_revision,scope,status)
+			VALUES ($1::uuid,'hardware',0,'restart','upgrade_required')`, hostID); err != nil {
+			return registerResult{}, fmt.Errorf("mark new host hardware initialization: %w", err)
+		}
 	}
 	if _, err := tx.Exec(ctx, markGPUsStaleAndClearVramSQL, hostID); err != nil {
 		return registerResult{}, fmt.Errorf("mark enrollment inventory stale: %w", err)

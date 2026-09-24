@@ -164,8 +164,16 @@ func TestGetPolicyProjectsEveryNextSessionGroupBeforeFirstEdit(t *testing.T) {
 				t.Fatalf("%s projection = %+v (present %v), want %s", group, g, ok, want)
 			}
 		}
-		if _, ok := view.Groups["hardware"]; ok {
-			t.Fatal("restart-scope hardware is not part of #336 and must not be projected")
+		if hardware, ok := view.Groups["hardware"]; !ok || hardware.Scope != "restart" || hardware.Status != "upgrade_required" {
+			t.Fatalf("unconfirmed hardware projection = %+v (present %v)", hardware, ok)
+		}
+		for _, key := range PolicyGroupKeys("hardware") {
+			if view.Choices[key].Source != "deployment" {
+				t.Fatalf("existing or unconfirmed host %s inferred hardware choice: %+v", key, view.Choices[key])
+			}
+		}
+		if view.Groups["hardware"].AppliedRevision != nil {
+			t.Fatalf("unconfirmed hardware falsely appeared applied: %+v", view.Groups["hardware"])
 		}
 	}
 }

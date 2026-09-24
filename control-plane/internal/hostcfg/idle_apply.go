@@ -189,6 +189,22 @@ func (s *Store) previewIdleApplyExcept(ctx context.Context, db idleQueryDB, host
 	if err != nil {
 		return nil, err
 	}
+	// A saved hardware edit may mention only one key. The executor resolves the
+	// whole dependent group, so every omitted member remains deployment-source
+	// and must come from this connection's baseline. Include those members in
+	// the reviewed content rather than offering a partial group the agent will
+	// reject (or silently inherit from a stale active snapshot).
+	if group == "hardware" {
+		seen := map[string]bool{}
+		for _, row := range choices {
+			seen[row.key] = true
+		}
+		for _, key := range PolicyGroupKeys(group) {
+			if !seen[key] {
+				choices = append(choices, choiceRow{key: key, source: "deployment"})
+			}
+		}
+	}
 	settings := map[string]PolicyChoice{}
 	deploymentValues := map[string]any{}
 	automaticKeys := []string{}
@@ -263,6 +279,9 @@ func (s *Store) previewIdleApplyExcept(ctx context.Context, db idleQueryDB, host
 				return nil, ErrApprovalSuperseded
 			}
 		}
+		// This current media pass proves a usable device path. The candidate
+		// encoder may differ from the current one; the restart verifier probes
+		// the exact resolved candidate before recording application.
 		preview.Prerequisites = append(preview.Prerequisites, hardwareFacts...)
 	}
 	sort.Slice(preview.Prerequisites, func(i, j int) bool {
@@ -647,6 +666,19 @@ func (s *Store) ApproveIdleApply(ctx context.Context, hostID, group string, revi
 		preview.ContentSHA256 != review.ContentSHA256 || preview.PrerequisitesSHA256 != review.PrerequisitesSHA256 ||
 		preview.ApprovalReviewID != review.ApprovalReviewID || preview.ApprovalBootIncarnation != boot ||
 		!reflect.DeepEqual(preview.Prerequisites, review.Prerequisites) {
+		return empty, ErrApprovalSuperseded
+	}
+	// A partial hardware edit (including a fresh Automatic default) has no
+	// durable desired digest until this reviewed, current-connection preview
+	// resolves its deployment members. Bind the complete candidate now so the
+	// eventual verified journal can advance the group to applied.
+	cmd, err := tx.Exec(ctx, `UPDATE host_setting_groups SET desired_digest=$4
+		WHERE host_id=$1::uuid AND group_key=$2 AND desired_revision=$3 AND scope='restart'
+		AND status IN ('pending','failed')`, hostID, group, revision, preview.ContentSHA256)
+	if err != nil {
+		return empty, err
+	}
+	if cmd.RowsAffected() != 1 {
 		return empty, ErrApprovalSuperseded
 	}
 	id := newPolicyAttemptID()
