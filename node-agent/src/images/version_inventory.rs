@@ -217,6 +217,12 @@ impl VersionInventory {
     }
 
     pub fn begin_connection(&self) {
+        self.revoke_authority();
+    }
+
+    /// Require a new accepted managed-identity reconcile before any ordinary
+    /// daemon refresh can assert complete inventory again.
+    pub fn revoke_authority(&self) {
         *self.authority_received.lock().unwrap() = false;
         self.revoke();
     }

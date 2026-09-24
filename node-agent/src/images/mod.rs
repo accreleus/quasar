@@ -1326,6 +1326,7 @@ impl ImageManager {
             return;
         };
         const RETRY_WAIT: Duration = Duration::from_millis(10);
+        let mut stale_retries = 0;
         loop {
             let scan_sequence = cleanup.scan_sequence.fetch_add(1, Ordering::SeqCst) + 1;
             let scanned = (cleanup.scanner)();
@@ -1350,7 +1351,15 @@ impl ImageManager {
                 if epoch != batch.epoch || slot.pending.is_some() {
                     needs_followup = true;
                 } else if scan_sequence < cleanup.applied_scan_sequence.load(Ordering::SeqCst) {
-                    retry_scan = true;
+                    if stale_retries == 0 {
+                        retry_scan = true;
+                    } else {
+                        // Repeated newer observations can otherwise starve an
+                        // accepted command forever. Reply with an unknown
+                        // snapshot and let a later reconcile regain authority.
+                        cleanup.inventory.revoke_authority();
+                        applied = true;
+                    }
                 } else {
                     cleanup.inventory.mark_authority_received();
                     if batch.sequence < cleanup.reconcile_overflow_sequence.load(Ordering::SeqCst) {
@@ -1388,10 +1397,12 @@ impl ImageManager {
                     return;
                 };
                 batch = followup;
+                stale_retries = 0;
                 continue;
             }
             if retry_scan {
                 drop(reply_guard);
+                stale_retries += 1;
                 continue;
             }
             if !applied {
@@ -1418,6 +1429,7 @@ impl ImageManager {
                 return;
             };
             batch = next_batch;
+            stale_retries = 0;
         }
     }
 
@@ -1660,27 +1672,36 @@ impl ImageManager {
             {
                 return;
             }
-            // An overflow has already revoked authority. No scan may briefly
-            // restore complete inventory until an accepted reconcile clears it.
-            if cleanup.applied_reconcile_sequence.load(Ordering::SeqCst)
-                < cleanup.reconcile_overflow_sequence.load(Ordering::SeqCst)
-            {
+            if cleanup.reconcile_slot.lock().unwrap().running {
+                // A refresh may outrun a reconcile scan, but it has no right
+                // to publish complete authority while that command is open.
                 cleanup.inventory.revoke();
+                cleanup
+                    .applied_scan_sequence
+                    .store(scan_sequence, Ordering::SeqCst);
             } else {
-                let result = scanned.and_then(|(daemon, containers)| {
-                    cleanup
-                        .inventory
-                        .reconcile(&[], &daemon, &containers)
-                        .map_err(|error| error.to_string())
-                });
-                if let Err(error) = result {
-                    warn!(token = "image-inventory-refresh-failed", "{error}");
+                // An overflow has already revoked authority. No scan may briefly
+                // restore complete inventory until an accepted reconcile clears it.
+                if cleanup.applied_reconcile_sequence.load(Ordering::SeqCst)
+                    < cleanup.reconcile_overflow_sequence.load(Ordering::SeqCst)
+                {
                     cleanup.inventory.revoke();
+                } else {
+                    let result = scanned.and_then(|(daemon, containers)| {
+                        cleanup
+                            .inventory
+                            .reconcile(&[], &daemon, &containers)
+                            .map_err(|error| error.to_string())
+                    });
+                    if let Err(error) = result {
+                        warn!(token = "image-inventory-refresh-failed", "{error}");
+                        cleanup.inventory.revoke();
+                    }
                 }
+                cleanup
+                    .applied_scan_sequence
+                    .store(scan_sequence, Ordering::SeqCst);
             }
-            cleanup
-                .applied_scan_sequence
-                .store(scan_sequence, Ordering::SeqCst);
         }
         self.emit_version_snapshot();
     }
@@ -3165,6 +3186,88 @@ mod tests {
         let (complete, versions) = manager.version_snapshot();
         assert!(complete);
         assert_eq!(versions[0].state, "present");
+    }
+
+    #[test]
+    fn repeated_refreshes_cannot_starve_accepted_reconcile_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let scanner = move || {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            if call.is_multiple_of(2) {
+                entered_tx.send(call).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+            Ok((Vec::new(), Vec::new()))
+        };
+        let manager = cleanup_mgr(dir.path(), Arc::new(scanner), None);
+        let (tx, mut rx) = mpsc::channel(8);
+        let _guard = manager.attach_upstream(tx);
+        rx.try_recv().unwrap();
+        // Model a connection that previously received authoritative identities.
+        manager
+            .cleanup
+            .as_ref()
+            .unwrap()
+            .inventory
+            .mark_authority_received();
+        assert!(manager
+            .handle_inventory_reconcile("accepted".into(), Vec::new())
+            .is_none());
+        assert_eq!(entered_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 0);
+        manager.refresh_version_inventory();
+        rx.try_recv().unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(entered_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
+        manager.refresh_version_inventory();
+        rx.try_recv().unwrap();
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let mut replies = Vec::new();
+        while replies.len() < 2 && Instant::now() < deadline {
+            if let Ok(message) = rx.try_recv() {
+                let value = serde_json::to_value(message).unwrap();
+                if value["type"] == "ack" || value["type"] == "image_versions_state" {
+                    replies.push(value);
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        // An old implementation starts a third scan and waits indefinitely.
+        // Unblock it before asserting, so a red test does not strand a worker.
+        release_tx.send(()).unwrap();
+        assert_eq!(replies.len(), 2, "accepted reconcile never replied");
+        assert_eq!(replies[0]["id"], "accepted");
+        assert_eq!(replies[1]["image_versions_complete"], false);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while manager
+            .cleanup
+            .as_ref()
+            .unwrap()
+            .reconcile_slot
+            .lock()
+            .unwrap()
+            .running
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            !manager
+                .cleanup
+                .as_ref()
+                .unwrap()
+                .reconcile_slot
+                .lock()
+                .unwrap()
+                .running
+        );
+        manager.refresh_version_inventory();
+        assert!(!manager.version_snapshot().0);
     }
 
     #[test]
